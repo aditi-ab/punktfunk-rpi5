@@ -111,16 +111,22 @@ struct ContentView: View {
     /// The stats-OFF tier's touch-exit disc window (see the overlay in `stream(captureEnabled:)`
     /// — the disc must LEAVE the hierarchy so nothing composites over the metal layer).
     @State private var showTouchExit = false
-    #if os(iOS)
-    /// The quick-action ring (design/touch-client-overlay.md §2), one per session.
+    #endif
+    /// The quick-action ring (design/touch-client-overlay.md §2), one per session. iOS opens it
+    /// with the two-finger twist or the exit disc, tvOS with a short Back on the remote, macOS
+    /// with ⌃⌥⇧O or the Stream menu; a pad opens it with `Select+A` on all three (§2.5, §2.6).
     @StateObject private var ring = RingState()
-    #endif
-    #endif
-    #if os(tvOS)
-    /// The same ring on the Apple TV: a short Back on the remote or `Select+A` opens it, the
-    /// pad drives it (§2.5, §2.6).
-    @StateObject private var ring = RingState()
-    #endif
+
+    /// The ring this platform draws. macOS takes the DESKTOP default (end stream, disconnect,
+    /// statistics, microphone — no soft keyboard, no on-screen pad), the touch clients the touch
+    /// one; a configured blob overrides both.
+    private var ringConfig: OverlayConfig {
+        #if os(macOS)
+        OverlayConfig.parse(SessionSettings.current.overlayActions, platform: .desktop)
+        #else
+        OverlayConfig.parse(SessionSettings.current.overlayActions)
+        #endif
+    }
     #if !os(macOS)
     @State private var showSettings = false
     #endif
@@ -397,36 +403,24 @@ struct ContentView: View {
             case .streaming:
                 #if os(iOS)
                 showTouchExit = true // the off-tier exit disc's 8 s window, per session start
-                #if os(iOS)
+                #endif
                 ring.close()
                 // Host-action slots are pre-fetched here, never when the ring opens (§3.1).
                 if let host = model.activeHost { HostPowerStore.shared.refresh(host) }
-                // `Select+A` on a pad opens the ring at the screen centre; while it is up the
-                // pad belongs to it.
+                // `Select+A` on a pad opens the ring in the middle of the stage; while it is up
+                // the pad belongs to it. On tvOS the remote's short Back arrives here too, and on
+                // macOS the chord and the menu item do — on both, a second press closes it again,
+                // because on neither is there a finger to tap the scrim with. iOS opens only: the
+                // twist that opened it also winds it back.
                 model.onRingChord = { [ring] in
+                    #if os(tvOS) || os(macOS)
+                    ring.toggleCentred()
+                    #else
                     ring.pressTick &+= 1
-                    let b = UIScreen.main.bounds
-                    ring.openAt(CGPoint(x: b.midX, y: b.midY))
+                    ring.openCentred()
+                    #endif
                 }
                 model.onRingNav = { [ring] nav in ring.nav(nav) }
-                #endif
-                #endif
-                #if os(tvOS)
-                ring.close()
-                if let host = model.activeHost { HostPowerStore.shared.refresh(host) }
-                // A short Back on the remote (or `Select+A`) toggles the ring at the screen
-                // centre; B or a second short Back closes it.
-                model.onRingChord = { [ring] in
-                    if ring.committed {
-                        ring.close()
-                    } else {
-                        ring.pressTick &+= 1
-                        let b = UIScreen.main.bounds
-                        ring.openAt(CGPoint(x: b.midX, y: b.midY))
-                    }
-                }
-                model.onRingNav = { [ring] nav in ring.nav(nav) }
-                #endif
                 // A session actually started — remember it on the card ("Connected … ago"
                 // plus the accent ring on the most recent host).
                 guard let host = model.activeHost else { break }
@@ -1324,25 +1318,40 @@ struct ContentView: View {
                 // the disc above. Mounted only while open — a closed overlay costs nothing.
                 .overlay {
                     if captureEnabled, ring.visible {
-                        RingOverlay(
-                            state: ring,
-                            cfg: OverlayConfig.parse(SessionSettings.current.overlayActions),
-                            actions: ringActions(conn))
+                        RingOverlay(state: ring, cfg: ringConfig, actions: ringActions(conn))
                     }
                 }
                 .onChange(of: ring.committed) { _, open in model.setRingOpen(open) }
                 #endif
-                #if os(tvOS)
-                // The ring on the Apple TV: mounted only while open, like iOS.
+                #if os(tvOS) || os(macOS)
+                // The ring on the Apple TV and the Mac: mounted only while open, like iOS.
                 .overlay {
                     if captureEnabled, ring.visible {
-                        RingOverlay(
-                            state: ring,
-                            cfg: OverlayConfig.parse(SessionSettings.current.overlayActions),
-                            actions: ringActions(conn))
+                        RingOverlay(state: ring, cfg: ringConfig, actions: ringActions(conn))
                     }
                 }
-                .onChange(of: ring.committed) { _, open in model.setRingOpen(open) }
+                .onChange(of: ring.committed) { _, open in
+                    model.setRingOpen(open)
+                    #if os(macOS)
+                    // The Mac's pointer is grabbed while streaming, so the stream layer hands it
+                    // back for as long as the ring is up (nothing else can click a button above
+                    // the video) and takes it again on close.
+                    NotificationCenter.default.post(
+                        name: .punktfunkRingOpen, object: NSNumber(value: open))
+                    #endif
+                }
+                #endif
+                #if os(macOS)
+                // ⌃⌥⇧O and the Stream menu's Quick Actions item, which post the same notification
+                // whether input is captured (InputCapture's monitor sees the chord first) or not
+                // (the menu's key equivalent fires). Guarded on the phase: the menu item is
+                // disabled off-session, but the chord's monitor is app-wide.
+                .onReceive(NotificationCenter.default.publisher(
+                    for: .punktfunkToggleQuickActions
+                )) { _ in
+                    guard captureEnabled, model.phase == .streaming else { return }
+                    ring.toggleCentred()
+                }
                 #endif
             }
         }
@@ -1353,7 +1362,7 @@ struct ContentView: View {
     private var dialSink: ((DialEvent) -> Void)? { { [ring] event in ring.handle(event) } }
     #endif
 
-    #if os(iOS) || os(tvOS)
+    #if os(iOS) || os(tvOS) || os(macOS)
     /// The session's live state and commands behind each ring slot.
     private func ringActions(_ conn: PunktfunkConnection) -> RingActions {
         RingActions(

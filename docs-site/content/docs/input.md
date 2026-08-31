@@ -22,6 +22,7 @@ the host. In the default mouse mode the pointer is also locked to the window —
 | **Ctrl+Alt+Shift+D** | Disconnect |
 | **Ctrl+Alt+Shift+S** | Cycle the [stats overlay](/docs/stats) — off · compact · normal · detailed |
 | **Ctrl+Alt+Shift+V** | Mute or unmute your microphone |
+| **Ctrl+Alt+Shift+O** | Open the [quick-action ring](#the-quick-action-ring) |
 | **F11** or **Alt+Enter** | Toggle fullscreen |
 
 While input is released the session window prints the shortest list over the stream:
@@ -63,7 +64,8 @@ microphone mute; the in-stream hint over the video doesn't, to stay one readable
 ### On the other clients
 
 - **macOS** honours the release, mouse-mode, disconnect and stats combos, written
-  **⌃⌥⇧Q / M / D / S** — but not the microphone mute. **⌘⎋** also toggles capture, **⌃⌘F** toggles
+  **⌃⌥⇧Q / M / D / S**, plus **⌃⌥⇧A** for the microphone mute and **⌃⌥⇧O** for the
+  [quick-action ring](#the-quick-action-ring). **⌘⎋** also toggles capture, **⌃⌘F** toggles
   fullscreen, and **⌃⌥⇧C** starts or stops [clipboard sharing](/docs/clipboard). The **Stream** menu
   lists them all except the mouse-mode combo, which works but has no menu item. Every *other* ⌘
   chord goes to the host while input is captured — ⌘Q reaches the host's compositor rather than
@@ -217,9 +219,15 @@ your fingers: about 10° starts it opening, 30° commits it, and lifting short o
 in and sends nothing. The centre button opens a sheet with the whole catalogue and the resolution
 presets. On Android the **Back** gesture opens the same ring at the screen centre instead of ending
 the session; on iPhone and iPad the corner disc does; on Apple TV a short press of the remote's
-Back; with a controller, **Select+A** (Select first) on every client, and the host never sees the
-two presses. What the six buttons hold is the **Quick actions** setting — on the phones the editor
-is the ring itself.
+Back; on macOS, Linux and Windows **Ctrl+Alt+Shift+O** (**⌃⌥⇧O** on a Mac, also the **Stream** menu's
+Quick Actions item); with a controller, **Select+A** (Select first) on every client, and the host
+never sees the two presses. What the six buttons hold is the **Quick actions** setting, and the
+editor is the ring itself — on every client but Apple TV, which takes whatever the profile carries.
+
+A Mac hands your pointer back for as long as the ring is up, so you can click a button, and takes
+capture again when it closes. Buttons a platform cannot serve are dimmed and say why: **Touch
+mode**, **Virtual controller** and **Keyboard** on a Mac, which has no touch screen and no software
+keyboard.
 
 ### Virtual controller
 

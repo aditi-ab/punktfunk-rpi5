@@ -210,6 +210,9 @@ public final class StreamLayerView: NSView {
     /// Whether input capture is currently engaged (cursor hidden+frozen, mouse/keyboard
     /// forwarded). Main-thread only.
     public private(set) var captured = false
+    /// The ring released a captured mouse (see the `.punktfunkRingOpen` observer) and owes it back
+    /// when the ring closes. False whenever capture was already released before it opened.
+    private var ringHeldCapture = false
 
     /// Desktop (absolute) mouse model — remote-desktop-sweep M1: when true the pointer is
     /// never disassociated (it enters and leaves the stream freely) and the mouse monitor
@@ -310,6 +313,26 @@ public final class StreamLayerView: NSView {
             guard let self, self.window?.isKeyWindow == true else { return }
             self.releaseCapture()
         })
+        // The quick-action ring is SwiftUI ABOVE this layer, so a grabbed pointer can never click
+        // one of its buttons — release for as long as it is up, and take capture back when it
+        // closes. Without the second half a glance at the ring would cost the game its pointer
+        // lock and a click to get it back, which is the cost the ring exists to avoid.
+        appObservers.append(NotificationCenter.default.addObserver(
+            forName: .punktfunkRingOpen, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, self.window?.isKeyWindow == true else { return }
+            if (note.object as? NSNumber)?.boolValue == true {
+                guard self.captured else { return }
+                self.ringHeldCapture = true
+                self.releaseCapture()
+            } else if self.ringHeldCapture {
+                self.ringHeldCapture = false
+                // Guarded inside: a ring closed BY "End stream" has no session to capture for,
+                // and engageCapture's own `connection != nil` gate declines it.
+                self.engageCapture(fromClick: false)
+            }
+        }
+        )
     }
 
     public required init?(coder: NSCoder) { fatalError("not used") }
@@ -914,6 +937,13 @@ public final class StreamLayerView: NSView {
             // fullscreen chord), so the captured and released paths end at one toggle.
             guard self?.window?.isKeyWindow == true else { return }
             NotificationCenter.default.post(name: .punktfunkToggleMicMute, object: nil)
+        }
+        capture.onQuickActions = { [weak self] in
+            // The quick-action ring is the session VIEW's, not this layer's — post it (the same
+            // routing as the fullscreen and mic chords), so the captured chord and the Stream
+            // menu's identical equivalent end at one toggle.
+            guard self?.window?.isKeyWindow == true else { return }
+            NotificationCenter.default.post(name: .punktfunkToggleQuickActions, object: nil)
         }
         capture.onCycleStats = { [weak self] in
             guard self?.window?.isKeyWindow == true else { return }

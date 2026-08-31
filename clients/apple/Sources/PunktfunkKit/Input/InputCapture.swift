@@ -160,6 +160,12 @@ public final class InputCapture {
     /// (cross-client), so A ("audio in") is the mic's. Main queue.
     public var onToggleMicMute: (() -> Void)?
 
+    /// Fired on ⌃⌥⇧O (macOS) — open or close the quick-action ring, the desktop clients' own
+    /// chord for it ("O" for overlay; see `pf-presenter`'s key path). Same delivery rule as the
+    /// combos above: only WHILE FORWARDING, because that is when the Stream menu's identical key
+    /// equivalent cannot fire. Main queue.
+    public var onQuickActions: (() -> Void)?
+
     /// Fired on ⌃⌘F (macOS) — toggle the streaming window in/out of fullscreen. Detected in the
     /// monitor only WHILE FORWARDING, for the same reason as the ⌃⌥⇧ combos: a captured stream view
     /// swallows keys, so the Stream menu's identical ⌃⌘F equivalent never reaches it; released, the
@@ -277,7 +283,7 @@ public final class InputCapture {
         // client-side or forwarded to the host from inside this block, because nothing downstream
         // will get a second chance at it.
         //
-        // ⌘⎋ (capture toggle) and ⌃⌥⇧M (mouse model) are client-side in BOTH states; ⌃⌥⇧Q/D/S/A
+        // ⌘⎋ (capture toggle) and ⌃⌥⇧M (mouse model) are client-side in BOTH states; ⌃⌥⇧Q/D/S/A/O
         // and ⌃⌘F are client-side only while forwarding (released, the events pass through and the
         // menu's identical key equivalents handle them). Every OTHER ⌘ chord is the HOST's while
         // captured — see `forwardsCommandChord`. (On iOS there is no NSEvent monitor — the GC key
@@ -303,7 +309,7 @@ public final class InputCapture {
                 self.onToggleMouseMode?()
                 return nil
             }
-            // The cross-client combos (Ctrl+Alt+Shift+Q/D/S — the same set every other
+            // The cross-client combos (Ctrl+Alt+Shift+Q/D/S/O — the same set every other
             // punktfunk client reserves), intercepted only while forwarding so the host never
             // sees the letter (the ⌃⌥⇧ modifiers were already forwarded as they went down;
             // they're flushed by the release path / released by the user as usual). The letter
@@ -328,6 +334,10 @@ public final class InputCapture {
                 case 0 /* A */:
                     self.suppressedVK = 0x41
                     self.onToggleMicMute?()
+                    return nil
+                case 31 /* O */:
+                    self.suppressedVK = 0x4F
+                    self.onQuickActions?()
                     return nil
                 default:
                     break
