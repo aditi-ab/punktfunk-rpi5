@@ -9,6 +9,7 @@
 //! must port verbatim are listed in §4 of the design and each has a named test here.
 
 pub mod choices;
+pub mod demo;
 pub mod exec;
 pub mod facts;
 pub mod plan;

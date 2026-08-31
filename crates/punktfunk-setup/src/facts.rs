@@ -341,7 +341,7 @@ fn detect_family(os: &OsRelease, run: &dyn CommandRunner) -> Result<(Family, &'s
 }
 
 /// Version floors the package cannot express, plus the Fedora RPM group they share a check with.
-fn floors(os: &OsRelease, family: Family) -> (Option<String>, Option<Floor>) {
+pub fn floors(os: &OsRelease, family: Family) -> (Option<String>, Option<Floor>) {
     let floor = match os.id.as_str() {
         "debian" if os.major() < 13 => Some(Floor::Die(format!(
             "Debian {} is below the glibc floor — Debian 13+ or build from source: {DOCS}/build-from-source",
