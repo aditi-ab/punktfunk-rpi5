@@ -9,8 +9,8 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-/// Embedded PNG per icon token: the families the chain walk can land on, plus the gaming
-/// distros that earn their own mark because "a Bazzite box" and "a Fedora box" are
+/// Embedded PNG per icon token: the families the chain walk can land on, plus the distro
+/// leaves that earn their own mark because "a Bazzite box" and "a Fedora box" are
 /// different machines to the person reading the tile. A distro with no mark of its own
 /// still degrades to its family's and finally to Tux.
 const ICONS: &[(&str, &[u8])] = &[
@@ -27,6 +27,7 @@ const ICONS: &[(&str, &[u8])] = &[
     ("bazzite", include_bytes!("../../assets/os/bazzite.png")),
     ("cachyos", include_bytes!("../../assets/os/cachyos.png")),
     ("nobara", include_bytes!("../../assets/os/nobara.png")),
+    ("omarchy", include_bytes!("../../assets/os/omarchy.png")),
 ];
 
 fn dir() -> Option<PathBuf> {

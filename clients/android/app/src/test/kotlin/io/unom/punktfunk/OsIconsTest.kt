@@ -49,11 +49,12 @@ class OsIconsTest {
     }
 
     @Test
-    fun gamingDistrosResolveToTheirOwnMark() {
-        // The whole reason these three ship art: without it they'd draw their family's mark.
+    fun distroLeavesResolveToTheirOwnMark() {
+        // The whole reason these four ship art: without it they'd draw their family's mark.
         assertEquals("bazzite", markOf("linux/fedora/bazzite"))
         assertEquals("cachyos", markOf("linux/arch/cachyos"))
         assertEquals("nobara", markOf("linux/rhel/nobara"))
+        assertEquals("omarchy", markOf("linux/arch/omarchy"))
     }
 
     @Test
