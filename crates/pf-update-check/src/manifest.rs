@@ -76,6 +76,15 @@ pub struct WindowsHostAsset {
     /// edit instead of a lockstep host release.
     #[serde(default)]
     pub authenticode_sha256: Vec<String>,
+    /// Expected Authenticode signing-certificate subject (its simple display name — the CN).
+    /// When present, the installer must chain to a TRUSTED root (WinVerifyTrust `S_OK`; the
+    /// untrusted-root tolerance for self-signed canary builds no longer applies) and the
+    /// signing certificate's subject must equal this value. This is the publisher property
+    /// that stays stable across Azure Artifact Signing's per-request leaf rotation, which the
+    /// leaf pins above cannot express (security-review 2026-08-31 H-3). Stable manifests
+    /// carry it; an empty value keeps the legacy validity-only behavior.
+    #[serde(default)]
+    pub authenticode_subject: String,
     /// Minimum Windows build (display/preflight only).
     #[serde(default)]
     pub min_os: String,
@@ -148,6 +157,7 @@ mod tests {
                 "url": "https://git.unom.io/unom/punktfunk/releases/download/v0.23.0/punktfunk-host-setup-0.23.0.exe",
                 "sha256": "aa".repeat(32),
                 "authenticode_sha256": ["bb".repeat(32)],
+                "authenticode_subject": "unom UG",
                 "min_os": "10.0.22621"
             }
         })
@@ -174,6 +184,12 @@ mod tests {
         assert_eq!(
             m.windows_host.as_ref().unwrap().authenticode_sha256.len(),
             1
+        );
+        // The publisher binding the stable channel carries (security-review 2026-08-31 H-3);
+        // absent → empty per serde default, and the Windows verifier then runs its legacy lane.
+        assert_eq!(
+            m.windows_host.as_ref().unwrap().authenticode_subject,
+            "unom UG"
         );
 
         // One flipped byte ⇒ refused before parse.

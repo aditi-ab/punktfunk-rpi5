@@ -41,10 +41,19 @@ jobs:
       # fleet-wide "update available". Fails the announce loudly if the key is missing (fail-closed)
       # or the installer's live bytes don't match their .sha256 sidecar. Pre-release tags are
       # ALWAYS skipped — an -rc must never enter the stable feed, even with allow_prerelease.
+      # Reads the installer's Authenticode signer for the publisher cross-check below — a plain
+      # Ubuntu package on the plain ubuntu-24.04 runner.
+      - name: Install osslsigncode
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends osslsigncode
+
       - name: Publish the stable update manifest
         env:
           REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
           UPDATE_MANIFEST_KEY: ${{ secrets.UPDATE_MANIFEST_KEY }}
+          # The Azure Artifact Signing certificate's subject CN — the publisher identity every
+          # stable manifest binds (security-review 2026-08-31 H-3). A repo VARIABLE, not a
+          # secret: it is public knowledge (it is in every signed installer).
+          AUTHENTICODE_SUBJECT: ${{ vars.AUTHENTICODE_SUBJECT }}
           # Through the ENVIRONMENT, never interpolated into the script body. A `${{ }}` expansion
           # is a raw textual substitution performed BEFORE the shell sees the line, so a
           # workflow_dispatch input containing shell syntax executes as this step — and this is the
@@ -75,8 +84,30 @@ jobs:
             echo "ERROR: installer sha256 $SHA does not match the release's .sha256 sidecar" >&2
             exit 1
           }
+          # The sidecar lives NEXT TO the exe, so agreeing with it proves nothing about who
+          # built the bytes — an actor who can replace the release asset replaces both
+          # (security-review 2026-08-31 H-3). Independently read the installer's Authenticode
+          # signer subject and require the expected publisher BEFORE the manifest key blesses
+          # the hash; the same subject goes into the signed manifest, where the host demands a
+          # trusted chain (S_OK) plus this subject. AUTHENTICODE_SUBJECT is the repo variable
+          # holding the Azure Artifact Signing certificate's subject CN. (Chain trust itself is
+          # enforced on the host against the Windows root program — this runner's Linux CA
+          # bundle cannot reproduce that, so the check here is signer identity, fail-closed.)
+          if [ -z "$AUTHENTICODE_SUBJECT" ]; then
+            echo "ERROR: the AUTHENTICODE_SUBJECT repo variable is not set — set it to the" >&2
+            echo "signing certificate's subject CN so stable updates bind their publisher" >&2
+            exit 1
+          fi
+          SIGNER="$(osslsigncode verify -in /tmp/installer.exe 2>/dev/null \
+            | grep -m1 'Subject:' | sed -n 's#.*CN=\([^/]*\).*#\1#p')"
+          if [ -z "$SIGNER" ] || [ "$SIGNER" != "$AUTHENTICODE_SUBJECT" ]; then
+            echo "ERROR: installer Authenticode signer CN '$SIGNER' is not the expected" >&2
+            echo "publisher '$AUTHENTICODE_SUBJECT' — refusing to bless this installer" >&2
+            exit 1
+          fi
           CHANNEL=stable VERSION="$VER" REQUIRE_KEY=1 \
             WINDOWS_URL="$URL" WINDOWS_SHA256="$SHA" \
+            AUTHENTICODE_SUBJECT="$AUTHENTICODE_SUBJECT" \
             NOTES_URL="https://git.unom.io/unom/punktfunk/releases/tag/${TAG}" \
             bash scripts/ci/publish-update-manifest.sh
 

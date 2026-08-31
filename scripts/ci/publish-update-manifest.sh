@@ -22,6 +22,9 @@
 #   WINDOWS_URL          immutable per-version installer URL               (required for stable)
 #   WINDOWS_SHA256       hex sha256 of that installer                      (paired with WINDOWS_URL)
 #   AUTHENTICODE_SHA256  comma-separated accepted signing-leaf sha256s     (optional)
+#   AUTHENTICODE_SUBJECT expected signing-cert subject CN — the host then  (required for stable)
+#                        demands a trusted chain (S_OK) + this subject
+#                        (security-review 2026-08-31 H-3)
 #   NOTES_URL            release-notes link (git.unom.io only)             (optional)
 #   UPDATE_MANIFEST_KEY  PKCS#8 PEM, the Ed25519 private key               (required to sign)
 #   REQUIRE_KEY=1        missing key is a hard failure (announce/stable)   (optional)
@@ -41,6 +44,11 @@ if [ "$CHANNEL" = canary ] && [ -z "${CI_RUN:-}" ]; then
 fi
 if [ "$CHANNEL" = stable ] && [ -z "${WINDOWS_URL:-}" ]; then
   echo "stable manifests need WINDOWS_URL/WINDOWS_SHA256 (the U1 apply leg)" >&2; exit 1
+fi
+if [ "$CHANNEL" = stable ] && [ -z "${AUTHENTICODE_SUBJECT:-}" ]; then
+  # A stable manifest without a bound publisher would let a replaced, attacker-self-signed
+  # installer ride the legitimately signed manifest (security-review 2026-08-31 H-3).
+  echo "stable manifests need AUTHENTICODE_SUBJECT (the signing-cert subject the host must see)" >&2; exit 1
 fi
 if [ -n "${WINDOWS_URL:-}" ] && ! printf '%s' "${WINDOWS_SHA256:-}" | grep -Eq '^[0-9a-f]{64}$'; then
   echo "WINDOWS_SHA256 must be 64 hex chars when WINDOWS_URL is set" >&2; exit 1
@@ -103,12 +111,14 @@ jq -n \
   --arg win_url "${WINDOWS_URL:-}" \
   --arg win_sha "${WINDOWS_SHA256:-}" \
   --argjson auth "$AUTH_JSON" \
+  --arg auth_subject "${AUTHENTICODE_SUBJECT:-}" \
   --arg ci_run "${CI_RUN:-}" \
   '
   {schema: 1, channel: $channel, serial: $serial, published_at: $published_at, version: $version}
   + (if $notes_url != "" then {notes_url: $notes_url} else {} end)
   + (if $ci_run != "" then {ci_run: ($ci_run | tonumber)} else {} end)
-  + (if $win_url != "" then {windows_host: {url: $win_url, sha256: $win_sha, authenticode_sha256: $auth}} else {} end)
+  + (if $win_url != "" then {windows_host: ({url: $win_url, sha256: $win_sha, authenticode_sha256: $auth}
+      + (if $auth_subject != "" then {authenticode_subject: $auth_subject} else {} end))} else {} end)
   ' > "$MANIFEST"
 echo "manifest:"; cat "$MANIFEST"
 

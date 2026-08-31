@@ -6,21 +6,23 @@
 //! Verification order and rules:
 //! 1. **SHA-256 == the signed manifest's** — the primary integrity gate (the manifest is the
 //!    Ed25519-verified document; this check makes the downloaded bytes those exact bytes).
-//! 2. **Authenticode**: the embedded signature must be cryptographically valid, tolerating
-//!    `CERT_E_UNTRUSTEDROOT` (canary and local builds still sign with a self-signed cert, and
-//!    releases moved to Azure Artifact Signing without needing this to tighten); when the
-//!    manifest carries leaf pins, the signing leaf's SHA-256 must match one. The leaf is taken
+//! 2. **Authenticode**: when the manifest names the publisher (`authenticode_subject`, the
+//!    stable channel's shape), the signature must verify against a TRUSTED root (`S_OK` — no
+//!    untrusted-root tolerance) and the signing certificate's subject must equal that value.
+//!    Without a subject (canary/local builds, still self-signed) the signature must be
+//!    cryptographically valid, tolerating `CERT_E_UNTRUSTEDROOT`; when the manifest carries
+//!    leaf pins, the signing leaf's SHA-256 must additionally match one. The leaf is taken
 //!    from the SAME `WinVerifyTrust` state (`WTHelperGetProvSignerFromChain`), never a second
-//!    parse — no verify-vs-inspect gap. An empty pin list skips only the pin comparison (the
-//!    manifest hash already binds content).
+//!    parse — no verify-vs-inspect gap.
 //!
 //!    **Leaf pinning cannot be used with Azure Artifact Signing.** That service mints a fresh leaf
 //!    per signing request, valid ~3 days, so an `AUTHENTICODE_SHA256` pin would go stale within days
-//!    of publishing and reject every subsequent release. (An earlier note here assumed the opposite —
-//!    that the pin field made Trusted Signing "a manifest edit". It does not.) If pinning is wanted
-//!    against the Azure-signed artifacts, pin something stable instead: the issuing intermediate, or
-//!    the certificate subject. Leave the list empty until then; the Ed25519-signed manifest hash is
-//!    what actually binds the downloaded bytes.
+//!    of publishing and reject every subsequent release. The certificate SUBJECT is the property
+//!    that stays stable across that rotation, which is exactly what `authenticode_subject` binds —
+//!    combined with the trusted-chain requirement it stops a replaced, attacker-self-signed
+//!    installer from riding a legitimately signed manifest (security-review 2026-08-31 H-3; the
+//!    manifest hash alone authenticated only "whatever the release URL served when the announce
+//!    job ran").
 //!
 //! The spawn uses `CREATE_BREAKAWAY_FROM_JOB`: the service worker's job object is kill-on-close
 //! (a stopping service would otherwise take the installer down with it) and was created
@@ -80,7 +82,14 @@ pub(super) fn run_apply(
         quarantine(&part_path);
         ("verifying", e)
     })?;
-    verify_authenticode(&part_path, &asset.authenticode_sha256).map_err(|e| {
+    verify_authenticode(
+        &part_path,
+        &asset.authenticode_sha256,
+        Some(&asset.authenticode_subject)
+            .filter(|s| !s.is_empty())
+            .map(String::as_str),
+    )
+    .map_err(|e| {
         quarantine(&part_path);
         ("verifying", e)
     })?;
@@ -274,13 +283,19 @@ fn preflight_disk(at: &Path, needed: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// Authenticode: valid embedded signature (untrusted root tolerated — canary/local builds are still
-/// self-signed), signing-leaf SHA-256 ∈ `pins` when pins are present — but see the module docs: a
-/// leaf pin is unusable against Azure-signed releases, whose leaf rotates every few days. The leaf
-/// comes out of the same
-/// `WinVerifyTrust` state via `WTHelperGetProvSignerFromChain`. (`pub(crate)`: the service
-/// supervisor's boot-loop rollback re-checks the cached previous installer with it.)
-pub(crate) fn verify_authenticode(path: &Path, pins: &[String]) -> Result<(), String> {
+/// Authenticode. With `subject` (the stable channel): the signature must chain to a TRUSTED
+/// root (`S_OK`) and the signing certificate's simple display name must equal it — the
+/// publisher property that survives Azure's per-request leaf rotation (security-review
+/// 2026-08-31 H-3). Without: valid embedded signature (untrusted root tolerated — canary/local
+/// builds are still self-signed), signing-leaf SHA-256 ∈ `pins` when pins are present. The leaf
+/// comes out of the same `WinVerifyTrust` state via `WTHelperGetProvSignerFromChain`.
+/// (`pub(crate)`: the service supervisor's boot-loop rollback re-checks the cached previous
+/// installer with it.)
+pub(crate) fn verify_authenticode(
+    path: &Path,
+    pins: &[String],
+    subject: Option<&str>,
+) -> Result<(), String> {
     use windows::core::{GUID, PCWSTR};
     use windows::Win32::Foundation::{CERT_E_UNTRUSTEDROOT, S_OK};
     use windows::Win32::Security::WinTrust::{
@@ -325,16 +340,25 @@ pub(crate) fn verify_authenticode(path: &Path, pins: &[String]) -> Result<(), St
         )
     };
     let verdict = (|| {
-        let ok = status == S_OK.0 || status == CERT_E_UNTRUSTEDROOT.0;
+        // A manifest that names the publisher demands the REAL chain verdict: `S_OK` means
+        // "signed by a certificate chaining to a root this machine trusts". The untrusted-root
+        // tolerance exists only for the subject-less legacy lanes — canary and local builds,
+        // still self-signed (security-review 2026-08-31 H-3).
+        let ok = status == S_OK.0 || (subject.is_none() && status == CERT_E_UNTRUSTEDROOT.0);
         if !ok {
             return Err(format!(
-                "installer Authenticode signature is invalid (WinVerifyTrust 0x{status:08x})"
+                "installer Authenticode signature is invalid{} (WinVerifyTrust 0x{status:08x})",
+                if subject.is_some() {
+                    " or does not chain to a trusted root"
+                } else {
+                    ""
+                }
             ));
         }
-        if pins.is_empty() {
+        if pins.is_empty() && subject.is_none() {
             tracing::warn!(
-                "update manifest carries no Authenticode leaf pins — accepting on the \
-                 manifest sha256 + signature validity alone"
+                "update manifest carries no Authenticode subject or leaf pins — accepting on \
+                 the manifest sha256 + signature validity alone"
             );
             return Ok(());
         }
@@ -363,17 +387,52 @@ pub(crate) fn verify_authenticode(path: &Path, pins: &[String]) -> Result<(), St
             // pasCertChain[0] is the SIGNING cert (leaf → root order).
             &*(*s.pasCertChain).pCert
         };
-        // SAFETY: `pbCertEncoded`/`cbCertEncoded` describe the DER buffer owned by the live
-        // cert context above; the slice is consumed (hashed) before the state is closed.
-        let der =
-            unsafe { std::slice::from_raw_parts(leaf.pbCertEncoded, leaf.cbCertEncoded as usize) };
-        let fp = hex(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der).as_ref());
-        if !pins.iter().any(|p| p.eq_ignore_ascii_case(&fp)) {
-            return Err(format!(
-                "installer signing-leaf fingerprint {fp} matches none of the manifest's \
-                 {} pin(s)",
-                pins.len()
-            ));
+        if let Some(expected) = subject {
+            use windows::Win32::Security::Cryptography::{
+                CertGetNameStringW, CERT_CONTEXT, CERT_NAME_SIMPLE_DISPLAY_TYPE,
+            };
+            let leaf_ptr: *const CERT_CONTEXT = leaf;
+            // The signing certificate's simple display name (its subject CN) — the publisher
+            // value the Ed25519-signed manifest binds. Two-call pattern: required length
+            // (including the NUL), then the string itself.
+            // SAFETY: `leaf` borrows the live verification state checked above; the API only
+            // reads the context on the length call.
+            let len = unsafe {
+                CertGetNameStringW(leaf_ptr, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, None, None)
+            } as usize;
+            let mut buf = vec![0u16; len.max(1)];
+            // SAFETY: same live context; `buf` is a valid mutable u16 buffer whose length the
+            // slice itself carries.
+            let n = unsafe {
+                CertGetNameStringW(
+                    leaf_ptr,
+                    CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                    0,
+                    None,
+                    Some(&mut buf),
+                )
+            } as usize;
+            let name = String::from_utf16_lossy(&buf[..n.saturating_sub(1)]);
+            if !name.eq_ignore_ascii_case(expected) {
+                return Err(format!(
+                    "installer signing subject {name:?} does not match the manifest's {expected:?}"
+                ));
+            }
+        }
+        if !pins.is_empty() {
+            // SAFETY: `pbCertEncoded`/`cbCertEncoded` describe the DER buffer owned by the live
+            // cert context above; the slice is consumed (hashed) before the state is closed.
+            let der = unsafe {
+                std::slice::from_raw_parts(leaf.pbCertEncoded, leaf.cbCertEncoded as usize)
+            };
+            let fp = hex(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der).as_ref());
+            if !pins.iter().any(|p| p.eq_ignore_ascii_case(&fp)) {
+                return Err(format!(
+                    "installer signing-leaf fingerprint {fp} matches none of the manifest's \
+                     {} pin(s)",
+                    pins.len()
+                ));
+            }
         }
         Ok(())
     })();
