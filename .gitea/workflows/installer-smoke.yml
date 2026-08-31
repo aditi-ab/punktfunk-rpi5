@@ -1,12 +1,17 @@
-# Smoke test for the guided installer (scripts/install.sh, docs-and-onboarding overhaul WP4).
-# Runs the script unattended inside a clean container per package family against the REAL
-# package registry — the one path a textual gate can't cover: does the repo line, the key import
-# and the install actually work today on a fresh box. `--no-start` because a container has no
-# user systemd; the script degrades to printing the enable command, which is also under test.
+# Smoke test for the guided installer. Runs it unattended inside a clean container per package
+# family against the REAL package registry — the one path a textual gate can't cover: does the
+# repo line, the key import and the install actually work today on a fresh box. `--no-start`
+# because a container has no user systemd; it degrades to printing the enable command, which is
+# also under test.
 #
-# Path-filtered on purpose: it pulls ~100 MB of packages per family, so it runs when the script
-# or its fact source changes, not on every push (check-docs-drift.sh gate 6 covers the cheap
-# half — the install lines in the script must match data/platforms.json verbatim — on every push).
+# TWO installers are under test until WP4.3 (design/installer-v2.md): `entry: sh` is today's
+# shipped scripts/install.sh, `entry: binary` is crates/punktfunk-setup built FROM THIS TREE —
+# never the published binary, which only the M4 probe job touches. The matrix doubling is
+# deliberate and temporary; the sh entry retires with the script body.
+#
+# Path-filtered on purpose: it pulls ~100 MB of packages per family, so it runs when an installer
+# or its fact source changes, not on every push (ci.yml runs the cheap halves — the goldens and
+# the sh-vs-binary parity check — on every push).
 name: installer-smoke
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -19,6 +24,7 @@ on:
       - scripts/install.sh
       - data/platforms.json
       - scripts/ci/check-install-defaults.sh
+      - crates/punktfunk-setup/**
       - packaging/linux/omarchy/punktfunk-omarchy
       - packaging/linux/omarchy/selftest.sh
       - .gitea/workflows/installer-smoke.yml
@@ -27,11 +33,39 @@ on:
       - scripts/install.sh
       - data/platforms.json
       - scripts/ci/check-install-defaults.sh
+      - crates/punktfunk-setup/**
       - packaging/linux/omarchy/punktfunk-omarchy
       - packaging/linux/omarchy/selftest.sh
       - .gitea/workflows/installer-smoke.yml
 
 jobs:
+  # One static binary the family containers can all run, built from the PR's tree. musl needs no
+  # C cross-toolchain here: the crate is pure Rust, so rust-lld plus the target's self-contained
+  # crt objects link it (measured: 984 KB static-pie, seconds to build).
+  setup-binary:
+    name: build punktfunk-setup (musl)
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: -C linker=rust-lld -C link-self-contained=yes
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the static installer from this tree
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked -p punktfunk-setup \
+            --target x86_64-unknown-linux-musl
+      - name: It is actually static
+        run: |
+          file target/x86_64-unknown-linux-musl/release/punktfunk-setup | grep -q 'static-pie'
+      # v3: Gitea's API rejects upload-artifact@v4 (see apple.yml). Download is a zip.
+      - uses: actions/upload-artifact@v3
+        with:
+          name: punktfunk-setup-musl
+          path: target/x86_64-unknown-linux-musl/release/punktfunk-setup
+
   defaults:
     name: derived defaults
     runs-on: ubuntu-24.04
@@ -54,12 +88,19 @@ jobs:
         run: bash packaging/linux/omarchy/selftest.sh
 
   smoke:
-    name: smoke (${{ matrix.family }})
+    name: smoke (${{ matrix.family }}, ${{ matrix.entry }})
     runs-on: ubuntu-24.04
+    needs: setup-binary
     timeout-minutes: 25
+    env:
+      # The one installer this leg drives. Both take the same flags — that is the D5
+      # compatibility contract, and running the identical scenario steps is what proves it.
+      PF: ${{ matrix.entry == 'binary' && '/usr/local/bin/punktfunk-setup' || 'sh scripts/install.sh' }}
     strategy:
       fail-fast: false
       matrix:
+        family: [debian-13, fedora-44, arch]
+        entry: [sh, binary]
         include:
           # actions/checkout needs git + node + CA certs in the container; curl is the
           # script's own prerequisite (it says so and stops without it).
@@ -87,10 +128,19 @@ jobs:
       - name: Prepare the container (${{ matrix.family }})
         run: ${{ matrix.prep }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # No tty → the script runs as --yes; --no-start because there is no user systemd here.
-      # Root without sudo → the script's sudo shim, another path under test.
+      - name: Fetch the installer binary built from this tree
+        if: matrix.entry == 'binary'
+        uses: actions/download-artifact@v3
+        with:
+          name: punktfunk-setup-musl
+          path: /usr/local/bin
+      - name: Make it executable
+        if: matrix.entry == 'binary'
+        run: chmod +x /usr/local/bin/punktfunk-setup
+      # No tty → the installer runs as --yes; --no-start because there is no user systemd here.
+      # Root without sudo → the sudo shim, another path under test.
       - name: Run the installer unattended
-        run: sh scripts/install.sh --yes --no-start
+        run: $PF --yes --no-start
       - name: The host is installed and conflict-free
         run: |
           punktfunk-host --version
@@ -103,7 +153,7 @@ jobs:
           command -v punktfunk-web-server
           test -f /usr/lib/systemd/user/punktfunk-web.service
       - name: Re-running is a no-op install
-        run: sh scripts/install.sh --yes --no-start | grep -q 'already installed'
+        run: $PF --yes --no-start | grep -q 'already installed'
       # The reported Fedora failure, as a test: a box that has the host but lost (or never got)
       # the console must get one back from a re-run. Before the per-package check, the installer
       # saw punktfunk-host on PATH, declared itself done, and left the box without a console
@@ -112,7 +162,7 @@ jobs:
         run: |
           ${{ matrix.rmweb }}
           ! command -v punktfunk-web-server
-          sh scripts/install.sh --yes --no-start
+          $PF --yes --no-start
           command -v punktfunk-web-server
       # The channel switch, both ways, against the real registries — the half no textual gate can
       # reach. Two things are actually at risk here and nowhere else: that the canary repo resolves
@@ -125,13 +175,13 @@ jobs:
         run: |
           set -eu
           stable_v=$(punktfunk-host --version | head -1)
-          sh scripts/install.sh --yes --no-start --channel canary
+          $PF --yes --no-start --channel canary
           ${{ matrix.oncanary }}
           canary_v=$(punktfunk-host --version | head -1)
           test "$canary_v" != "$stable_v" \
             || { echo "switch to canary left the version at $stable_v"; exit 1; }
           command -v punktfunk-web-server
-          sh scripts/install.sh --yes --no-start --channel stable
+          $PF --yes --no-start --channel stable
           ${{ matrix.onstable }}
           back_v=$(punktfunk-host --version | head -1)
           test "$back_v" = "$stable_v" \
@@ -140,16 +190,16 @@ jobs:
       - name: A bare re-run does not drag a canary box back to stable
         run: |
           set -eu
-          sh scripts/install.sh --yes --no-start --channel canary
+          $PF --yes --no-start --channel canary
           canary_v=$(punktfunk-host --version | head -1)
-          sh scripts/install.sh --yes --no-start
+          $PF --yes --no-start
           ${{ matrix.oncanary }}
           test "$(punktfunk-host --version | head -1)" = "$canary_v" \
             || { echo "a bare re-run moved a canary box off $canary_v"; exit 1; }
-          sh scripts/install.sh --yes --no-start --channel stable
+          $PF --yes --no-start --channel stable
       - name: --uninstall takes the packages and the repo off again
         run: |
-          sh scripts/install.sh --yes --uninstall
+          $PF --yes --uninstall
           ! command -v punktfunk-host
           ! test -e /etc/apt/sources.list.d/punktfunk.list -o -e /etc/yum.repos.d/punktfunk.repo
           ! grep -q '^\[punktfunk\]' /etc/pacman.conf 2>/dev/null
