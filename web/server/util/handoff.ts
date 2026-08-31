@@ -93,10 +93,16 @@ export async function verifyHandoff(
 	if (!Number.isFinite(issued) || Math.abs(now - issued) > HANDOFF_TTL_MS) {
 		return { ok: false, reason: "expired" };
 	}
+	// Reserve BEFORE the first await: the event loop can interleave two redemptions of one
+	// ticket while the HMAC is in flight, and both would pass a check-then-record written the
+	// obvious way round (security-review 2026-08-31 M-1). A failed signature releases the
+	// reservation; that cannot burn someone else's ticket, because a wrong-mac guess is a
+	// different map key than the real ticket.
 	if (seen.has(ticket)) return { ok: false, reason: "replayed" };
+	seen.set(ticket, now);
 	if (!safeEqualHex(mac, await macFor(key, ts, nonce))) {
+		seen.delete(ticket);
 		return { ok: false, reason: "bad-signature" };
 	}
-	seen.set(ticket, now);
 	return { ok: true };
 }
