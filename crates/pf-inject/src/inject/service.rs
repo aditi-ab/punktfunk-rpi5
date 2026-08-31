@@ -24,10 +24,24 @@ impl InjectorService {
         #[cfg(target_os = "windows")]
         super::mouse_windows::ensure_resident();
 
+        Self::start_inner(None)
+    }
+
+    /// A SESSION-lifetime injector pinned to one gamescope EIS relay file
+    /// (`design/gamescope-multiuser.md`): same thread/channel/lazy-open/reopen discipline as the
+    /// shared service, but the backend never follows the published session backend — it is this
+    /// session's own gamescope, full stop. The owner drops the service (and every sender clone)
+    /// at session end, which ends the thread and closes the EIS connection.
+    #[cfg(target_os = "linux")]
+    pub fn start_at(relay: std::path::PathBuf) -> InjectorService {
+        Self::start_inner(Some(relay))
+    }
+
+    fn start_inner(pin: Option<std::path::PathBuf>) -> InjectorService {
         let (tx, rx) = std::sync::mpsc::channel::<InputEvent>();
         if let Err(e) = std::thread::Builder::new()
             .name("punktfunk-injector".into())
-            .spawn(move || injector_service_thread(rx))
+            .spawn(move || injector_service_thread(rx, pin))
         {
             tracing::error!(error = %e, "injector service thread spawn failed — pointer/keyboard input disabled");
         }
@@ -45,15 +59,21 @@ impl InjectorService {
 /// persistently-unavailable portal isn't hammered once per event.
 const INJECTOR_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The host-lifetime injector worker: lazily open the pointer/keyboard backend, then inject every
-/// forwarded event. Reopen (after [`INJECTOR_REOPEN_BACKOFF`]) on open failure, on a backend change
-/// (input follows the active session), or if the backend's worker dies mid-stream. Exits only when
-/// every sender has dropped (host shutdown), which drops the injector and closes its portal session.
+/// The injector worker: lazily open the pointer/keyboard backend, then inject every forwarded
+/// event. Reopen (after [`INJECTOR_REOPEN_BACKOFF`]) on open failure, on a backend change
+/// (input follows the active session — unpinned only), or if the backend's worker dies mid-stream.
+/// Exits only when every sender has dropped (host shutdown for the shared service; session end for
+/// a pinned one), which drops the injector and closes its portal session / EIS connection.
+/// `pin` = the per-session gamescope relay file ([`InjectorService::start_at`]); `None` = the
+/// shared host-lifetime service following [`default_backend`].
 ///
 /// Each wake drains the whole backlog and [`coalesce`]s redundant motion before injecting, so a slow
 /// backend never builds up a queue of stale relative-mouse/scroll events (latency) — while button,
 /// key, and absolute-move ordering is preserved exactly.
-fn injector_service_thread(rx: std::sync::mpsc::Receiver<InputEvent>) {
+fn injector_service_thread(
+    rx: std::sync::mpsc::Receiver<InputEvent>,
+    pin: Option<std::path::PathBuf>,
+) {
     let mut injector: Option<Box<dyn InputInjector>> = None;
     let mut open_backend: Option<Backend> = None;
     let mut last_failed: Option<std::time::Instant> = None;
@@ -72,26 +92,50 @@ fn injector_service_thread(rx: std::sync::mpsc::Receiver<InputEvent>) {
         // This runs once per BATCH, which is why the published value is a `RwLock` read and not a
         // `getenv`: the old `PUNKTFUNK_INPUT_BACKEND` round-trip made this hot path a data race
         // against the connect path's `setenv` (security-review 2026-08-25).
-        let want = default_backend();
-        if injector.is_some() && open_backend != Some(want) {
-            tracing::info!(
-                ?open_backend,
-                ?want,
-                "input: backend changed — reopening injector for the active session"
-            );
-            injector = None;
-            last_failed = None; // re-resolve immediately
-        }
+        //
+        // A PINNED service (`start_at` — one session's own gamescope) never follows the published
+        // backend: its target cannot change, only die, and death is the reopen arm below.
+        let want = if pin.is_none() {
+            let want = default_backend();
+            if injector.is_some() && open_backend != Some(want) {
+                tracing::info!(
+                    ?open_backend,
+                    ?want,
+                    "input: backend changed — reopening injector for the active session"
+                );
+                injector = None;
+                last_failed = None; // re-resolve immediately
+            }
+            Some(want)
+        } else {
+            None
+        };
         if injector.is_none() {
             // Open on the first event; after a failure wait out the backoff before retrying (a few
-            // events drop during setup — acceptable, input is lossy).
+            // events drop during setup — acceptable, input is lossy). The lazy open is also what
+            // solves the pinned service's ordering: it is created before its gamescope spawns, and
+            // by the first event the relay file exists (the libei worker polls it besides).
             let ready = last_failed.is_none_or(|t| t.elapsed() >= INJECTOR_REOPEN_BACKOFF);
             if ready {
-                match open(want) {
+                let opened = match (&pin, want) {
+                    #[cfg(target_os = "linux")]
+                    (Some(relay), _) => crate::open_gamescope_at(relay.clone()),
+                    #[cfg(not(target_os = "linux"))]
+                    (Some(_), _) => unreachable!("pinned injector is Linux-only (start_at)"),
+                    (None, Some(want)) => open(want),
+                    (None, None) => unreachable!("unpinned resolve always yields a backend"),
+                };
+                match opened {
                     Ok(i) => {
-                        tracing::info!(backend = ?want, "input injector ready (host-lifetime)");
+                        match &pin {
+                            Some(relay) => tracing::info!(relay = %relay.display(),
+                                "input injector ready (session-pinned gamescope)"),
+                            None => {
+                                tracing::info!(backend = ?want, "input injector ready (host-lifetime)")
+                            }
+                        }
                         injector = Some(i);
-                        open_backend = Some(want);
+                        open_backend = want;
                         last_failed = None;
                     }
                     Err(e) => {
