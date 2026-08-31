@@ -2404,8 +2404,10 @@ mod tests {
     /// its own thread, so the display tests can't be split). Gamescope mode: activating the
     /// row pushes the in-window selection subpage; activating an option updates the
     /// selection + suffix label, fires the change callback, and pops the subpage. Combo
-    /// mode: cell sync + change callback. Needs a display — run manually with
-    /// `cargo test -p punktfunk-client-linux -- --ignored` on a session box.
+    /// mode: cell sync + change callback. Needs a display AND its own process: `--ignored` alone
+    /// starts every display test in one process, and GTK refuses a second init from a second
+    /// thread. Run it by name on a session box:
+    /// `cargo test -p punktfunk-client-linux -- --ignored choice_row_modes`.
     #[test]
     #[ignore = "needs a Wayland/X display"]
     fn choice_row_modes() {
