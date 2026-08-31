@@ -94,6 +94,7 @@ punktfunk-host ctl approve 3
 |---|---|
 | `status` | Host state, live session count, paired-device counts. |
 | `sessions` | The active session(s) and any launched game. |
+| `summary` | One call for a status surface: host version, what is streaming, the streaming client's name, paired counts, and any conflicting host on this box. The **only** verb that names a connected device — `status` exposes no device names by design. |
 | `pair status` | Is a pairing window open, and is a PIN waiting? |
 | `pair arm` | Open a native pairing window and print the PIN. `--ttl <s>` how long the window stays open, `--expires-in <s>` how long the device's access lasts, `--preset <full\|controller\|view>`, `--fingerprint <fp>` to bind the window to **one** device. |
 | `pair disarm` | Close it. |
@@ -107,7 +108,31 @@ punktfunk-host ctl approve 3
 | `unpair <FP>` | Remove one device. `unpair --all` removes every device on both planes (asks first; needs `--yes` with `--json`). |
 | `stop-session` | Stop the active session. |
 | `end-game` | End the launched game. |
+| `display` | The virtual-display policy, every preset (built-in and saved), and the live displays. |
+| `display preset <ID>` | Switch the policy to a preset. Reads the stored policy and edits it, so the axes a preset does not own — the streamed screen, the experimental Windows ones — survive the switch. |
+| `display release [SLOT]` | Tear down **kept** displays now, so a physical-screen user gets their screen back without waiting out the linger. Omit `SLOT` for all. Never touches a display that is actively streaming. |
+| `stats` | The live stream: mode, codec and the adaptive bitrate, plus frame timings and drops while a capture is recording. |
+| `stats record start\|stop` | Arm or disarm the performance capture. `stop` writes the recording to disk. The capture is one host-wide slot the web console shares. |
 | `watch` | Stream host events as line-JSON on stdout, one object per line. `--kinds stream.*,pairing.pending` filters; `--since <seq>` resumes. |
+
+**`display` reports an empty `displays` list on wlroots compositors** — Hyprland, Sway, and so
+everything Omarchy runs. That is not "nothing is streaming". A wlroots capture arrives over a
+sandboxed portal handle the host cannot re-open per attach, so the display is passed through rather
+than entered in the registry that `display` lists. Read an empty list as *this host does not track
+them*. The same limit means a display cannot outlive a disconnect there, whatever a preset's
+lifetime says.
+
+### Reading `stats`
+
+Two numbers named alike measure different things, and the gap between them is large:
+
+- **Target** is the encoder's bitrate, where adaptive bitrate has settled. It is always available.
+- **Sent** is what actually left the box. It only exists while a capture is recording.
+
+A still desktop shows 300 Mbps of target against 11 Mbps sent, because capture is damage-driven:
+nothing changed, so nothing was encoded. For the same reason `stats` prints **new** frames per
+second beside **repeated** ones. A healthy 240 Hz stream of a motionless screen reads `0.0 fps new ·
+157.2 fps repeated`; reading only the first number would say the stream was dead.
 
 Add `--json` to any verb for machine-readable output: `{"v":1,"data":…}` on success,
 `{"v":1,"error":{"code":…,"message":…}}` on failure, both on stdout. That envelope is the contract —

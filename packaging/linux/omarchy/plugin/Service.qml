@@ -32,6 +32,60 @@ Item {
   property var gamestreamClients: []
   property var games: []
 
+  // ── displays ─────────────────────────────────────────────────────────────────────────────────
+  // The stored policy's preset id, the resolved policy it expands to, and the two preset
+  // catalogues (built-in and saved presets share one id space). Deliberately NOT the live display
+  // list `ctl display` also carries: on wlroots the registry passes displays through rather than
+  // owning them, so that list is always empty here — see the Panel's DISPLAYS section.
+  property string displayPreset: ""
+  property var displayEffective: ({})
+  property var displayPresets: []
+  property var customPresets: []
+
+  // ── summary ──────────────────────────────────────────────────────────────────────────────────
+  // `/status` exposes no device names by design, so it cannot say WHO is streaming. This is the one
+  // endpoint that names the connected client, and it carries the host version with it.
+  property var summary: ({})
+
+  // ── stats ────────────────────────────────────────────────────────────────────────────────────
+  // `stream` is free and live: its `bitrate_kbps` is the encoder's current target, so it moves with
+  // every adaptive-bitrate change. The rest only exists while a capture is armed, because that is
+  // when the streaming loops emit samples at all.
+  property var stream: null
+  property var sessionMode: null
+  property bool audioStreaming: false
+  property bool captureArmed: false
+  property int captureSamples: 0
+  property var statsSample: null
+  property var statsMeta: null
+
+  // A rolling window of what the Stats poll saw, so the panel can draw the SHAPE of a number and
+  // not just its current value — a bitrate sitting at 300 and a bitrate that just collapsed from
+  // 300 read identically as one figure. Client-side because the host publishes no periodic event
+  // and the alternative, shipping the capture's whole time-series through a process spawn every
+  // two seconds, would cost far more than it shows. Filled only while the Stats tab is open, which
+  // is the only time anything reads it.
+  property var history: []
+  readonly property int historyMax: 90        // ≈ 3 minutes at the 2 s poll
+
+  function pushHistory() {
+    var p = {
+      target: root.stream ? Number(root.stream.bitrate_kbps || 0) / 1000 : null,
+      sent: null, fps: null, encode: null
+    }
+    if (root.statsSample) {
+      p.sent = Number(root.statsSample.mbps || 0)
+      p.fps = Number(root.statsSample.fps || 0)
+      for (var i = 0; i < (root.statsSample.stages || []).length; i++) {
+        var st = root.statsSample.stages[i]
+        if (st.name === "encode") p.encode = Number(st.p99_us || 0) / 1000
+      }
+    }
+    root.history = root.history.concat([p]).slice(-root.historyMax)
+  }
+
+  function clearHistory() { root.history = [] }
+
   // A certificate mismatch is NOT "the host is down": something that is not our host answered on
   // the management port, and ctl refused to send the token. Surfaced separately so the panel can
   // say so instead of showing a plausible-looking "not running".
@@ -123,12 +177,17 @@ Item {
   // ── snapshots ────────────────────────────────────────────────────────────────────────────────
   function refresh() {
     run(["status"], function (data, err) {
-      if (err) { root.state = "stopped"; root.sessions = 0; return }
+      if (err) { root.state = "stopped"; root.sessions = 0; root.stream = null; return }
       root.sessions = data.active_sessions || 0
       root.pinPending = !!data.pin_pending
       root.games = data.games || []
       root.state = root.sessions > 0 ? "streaming" : "idle"
+      // The Now tab shows the negotiated mode and codec, so `stream` is read here too and not only
+      // by the Stats poll — otherwise the tab is blank until someone visits Stats.
+      root.stream = data.stream || null
+      root.audioStreaming = !!data.audio_streaming
     })
+    refreshSummary()
     run(["pending"], function (data, err) {
       root.pendingDevices = (!err && data) ? data : []
       root.pending = root.pendingDevices.length
@@ -146,6 +205,52 @@ Item {
       root.nativeClients = data.native || []
       root.gamestreamClients = data.gamestream || []
     })
+  }
+
+  function refreshDisplays() {
+    run(["display"], function (data, err) {
+      if (err || !data) return
+      root.displayPreset = (data.settings && data.settings.preset) || ""
+      root.displayEffective = data.effective || {}
+      root.displayPresets = data.presets || []
+      root.customPresets = data.custom_presets || []
+    })
+  }
+
+  // Re-reads afterwards rather than assuming: the host validates and clamps the policy it stores,
+  // so what came back is the only trustworthy answer to "what is in force now".
+  function setDisplayPreset(id) {
+    run(["display", "preset", id], function () { root.refreshDisplays() })
+  }
+
+  // Polled, not evented: the host publishes no periodic stats event, and a bitrate that only moved
+  // on a lifecycle event would be a still photograph labelled "live". `ctl status --json` measured
+  // 116 ms on the Omarchy testbox — under the 150 ms threshold `ctl.rs` sets for itself — and the
+  // Panel only runs this timer while the Stats tab is the one being looked at.
+  function refreshStats() {
+    run(["stats"], function (data, err) {
+      if (err || !data) { root.stream = null; return }
+      root.stream = data.stream || null
+      root.sessionMode = data.session || null
+      root.captureArmed = !!(data.capture && data.capture.armed)
+      root.captureSamples = (data.capture && data.capture.sample_count) || 0
+      root.statsSample = data.sample || null
+      root.statsMeta = data.meta || null
+      // After the assignments, never before: the point appended is the one just read.
+      root.pushHistory()
+    })
+  }
+
+  function refreshSummary() {
+    run(["summary"], function (data, err) {
+      root.summary = (!err && data) ? data : {}
+    })
+  }
+
+  // The capture is ONE host-wide slot the web console also drives, and stopping it writes a
+  // recording to disk — so it is never armed as a side effect of opening a tab.
+  function setCapture(on) {
+    run(["stats", "record", on ? "start" : "stop"], function () { root.refreshStats() })
   }
 
   // ── the event stream ─────────────────────────────────────────────────────────────────────────
@@ -186,7 +291,9 @@ Item {
     var ev
     try { ev = JSON.parse(line) } catch (e) { return }
 
-    if (ev.kind === "ctl.resync") { refresh(); refreshClients(); return }
+    // The display policy is not evented — it only changes when a person edits it, here or in the
+    // console — so a resync re-reads it and the Displays tab re-reads it on arrival. Nothing polls.
+    if (ev.kind === "ctl.resync") { refresh(); refreshClients(); refreshDisplays(); return }
     if (ev.kind === "ctl.disconnected") { root.state = "stopped"; return }
 
     if (ev.kind === "pairing.pending") {
@@ -204,6 +311,9 @@ Item {
       refresh(); refreshClients(); return
     }
     if (ev.kind === "host.stopping") { root.state = "stopped"; root.sessions = 0; return }
+    // A graph that spans the gap between two sessions draws a line between numbers that were never
+    // related. The window belongs to one stream.
+    if (ev.kind === "stream.stopped" || ev.kind === "session.ended") clearHistory()
     refresh()
   }
 

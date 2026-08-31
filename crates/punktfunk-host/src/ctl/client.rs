@@ -151,6 +151,19 @@ impl Client {
         self.finish(sent, path)
     }
 
+    /// Whole-object replace. `PUT /display/settings` is the only route shaped this way, and it is
+    /// why `ctl display preset` reads the stored policy before writing one: a PUT built from the
+    /// verb's arguments alone would default every axis the caller did not name.
+    pub fn put(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        let sent = self
+            .agent
+            .put(self.url(path))
+            .header("Authorization", &self.bearer)
+            .header("Content-Type", "application/json")
+            .send(body.to_string());
+        self.finish(sent, path)
+    }
+
     pub fn patch(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
         let sent = self
             .agent

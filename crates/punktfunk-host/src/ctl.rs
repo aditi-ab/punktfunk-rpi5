@@ -92,6 +92,14 @@ fn run(args: &[&str], json: bool) -> Result<()> {
             out(json, &slice, render_sessions);
             Ok(())
         }
+        // `/status` deliberately exposes no device names, so it cannot answer "who is streaming".
+        // `/local/summary` is the one endpoint that does — one label, the streaming client's — and
+        // it folds in the host version and the conflicting-host warning a status surface wants.
+        "summary" => {
+            let v = Client::connect(None)?.get("/api/v1/local/summary")?;
+            out(json, &v, render_summary);
+            Ok(())
+        }
         "stop-session" => {
             let v = Client::connect(None)?.delete("/api/v1/session")?;
             out(json, &v, |_| println!("session stopped"));
@@ -146,6 +154,8 @@ fn run(args: &[&str], json: bool) -> Result<()> {
         "rename" => rename(rest, json),
         "unpair" => unpair(rest, json),
         "access" => access(rest, json),
+        "display" => display(rest, json),
+        "stats" => stats(rest, json),
         "watch" => {
             let kinds = flag_value(rest, "--kinds");
             let since = flag_value(rest, "--since")
@@ -312,6 +322,333 @@ fn access(args: &[&str], json: bool) -> Result<()> {
     Ok(())
 }
 
+// ── displays ───────────────────────────────────────────────────────────────────────────────────
+
+/// The virtual-display policy and what is live right now, in one answer.
+///
+/// Two GETs rather than one because the API keeps them apart on purpose — `/display/settings` is
+/// the stored policy and its preset catalogue, `/display/state` is the displays that exist this
+/// second — and a caller that had to make two calls to answer one question would show them at two
+/// different instants.
+///
+/// ⚠ `displays` is EMPTY on wlroots, and not because nothing is streaming: a wlroots capture
+/// arrives over a sandboxed xdp portal fd the host cannot re-open per attach, so
+/// `vdisplay::registry` passes those displays through rather than owning them (its own module docs
+/// say so) and never lists them. Measured on an Omarchy box: a live 2414x1188@240 head,
+/// `displays: []`. Read an empty list as "this host does not track them", never as "there are
+/// none" — the Omarchy panel shows no live-display section for exactly this reason.
+fn display(args: &[&str], json: bool) -> Result<()> {
+    let c = Client::connect(None)?;
+    match args.first().copied() {
+        Some("preset") => {
+            let id = args
+                .get(1)
+                .copied()
+                .ok_or_else(|| Failure::usage("display preset: <ID> (see `ctl display`)"))?;
+            let v = display_apply_preset(&c, id)?;
+            out(json, &v, move |_| println!("display preset set to {id}"));
+            Ok(())
+        }
+        Some("release") => {
+            // The slot is optional and releases exactly one head; omitting it releases every KEPT
+            // display. Never an active one — that is `stop-session`, and conflating the two would
+            // make "give me my screen back" able to kill somebody's stream.
+            let mut body = json!({});
+            if let Some(slot) = args.get(1) {
+                let n: u32 = slot
+                    .parse()
+                    .map_err(|_| Failure::usage("display release: SLOT must be a number"))?;
+                body["slot"] = json!(n);
+            }
+            let v = c.post("/api/v1/display/release", &body)?;
+            out(json, &v, |v| {
+                println!(
+                    "released {} kept display(s)",
+                    v["released"].as_i64().unwrap_or(0)
+                )
+            });
+            Ok(())
+        }
+        None | Some("status") => {
+            let mut v = c.get("/api/v1/display/settings")?;
+            // `/display/state` is unavailable on a build with no vdisplay backend; the policy half
+            // is still worth answering, so an empty list beats failing the whole verb.
+            let live = c
+                .get("/api/v1/display/state")
+                .map(|s| s["displays"].clone())
+                .unwrap_or(Value::Null);
+            v["displays"] = if live.is_array() { live } else { json!([]) };
+            out(json, &v, render_display);
+            Ok(())
+        }
+        Some(other) => Err(Failure::usage(format!(
+            "display: expected status | preset | release, got '{other}'"
+        ))),
+    }
+}
+
+/// Switch the stored policy to `id`, preserving every axis a preset does not own.
+///
+/// `PUT /display/settings` replaces the whole object, so this reads the stored policy first and
+/// edits it — the console does exactly this (`web/src/sections/Displays/DisplayCard.tsx`), and for
+/// the same reason: `capture_monitor` and the experimental Windows axes are NOT preset behavior,
+/// and a PUT that dropped them would swap the streamed screen out from under the operator because
+/// they picked a different lifecycle.
+///
+/// A saved custom preset has no apply route of its own: applying it means writing a `Custom` policy
+/// carrying its saved fields. That asymmetry is the API's, mirrored here so both kinds of id work.
+fn display_apply_preset(c: &Client, id: &str) -> Result<Value> {
+    let state = c.get("/api/v1/display/settings")?;
+    let policy = policy_with_preset(&state, id)?;
+    c.put("/api/v1/display/settings", &policy)
+}
+
+/// The edit itself, split from the two HTTP calls so it can be checked against a settings body
+/// without a running host. Everything that can go wrong here — dropping an orthogonal axis,
+/// accepting an id no preset has — is in this function, not in the transport around it.
+fn policy_with_preset(state: &Value, id: &str) -> Result<Value> {
+    let mut policy = state["settings"].clone();
+    if !policy.is_object() {
+        return Err(Failure::api("display: the host returned no stored policy"));
+    }
+
+    let custom = state["custom_presets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|p| p["id"].as_str() == Some(id))
+        .cloned();
+
+    if let Some(p) = custom {
+        policy["preset"] = json!("custom");
+        for (k, val) in p["fields"].as_object().into_iter().flatten() {
+            policy[k.as_str()] = val.clone();
+        }
+        // `game_session` is the one orthogonal axis a saved preset does carry.
+        if let Some(gs) = p.get("game_session") {
+            policy["game_session"] = gs.clone();
+        }
+    } else {
+        let known = state["presets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|p| p["id"].as_str() == Some(id));
+        if !known {
+            // Listing what exists beats "invalid preset": the built-ins and the operator's saved
+            // ones share one id space, and only the host knows the saved half.
+            return Err(Failure::usage(format!(
+                "display preset: no preset '{id}' — run `ctl display` for the list"
+            )));
+        }
+        policy["preset"] = json!(id);
+    }
+    Ok(policy)
+}
+
+fn render_display(v: &Value) {
+    let cur = v["settings"]["preset"].as_str().unwrap_or("custom");
+    println!("preset    {cur}");
+    let eff = &v["effective"];
+    println!(
+        "policy    topology {} · identity {} · conflict {} · max {}",
+        eff["topology"].as_str().unwrap_or("—"),
+        eff["identity"].as_str().unwrap_or("—"),
+        eff["mode_conflict"].as_str().unwrap_or("—"),
+        eff["max_displays"].as_i64().unwrap_or(0)
+    );
+    for p in v["presets"].as_array().into_iter().flatten() {
+        let id = p["id"].as_str().unwrap_or("");
+        println!(
+            "  {}{:<16} {}",
+            if id == cur { "*" } else { " " },
+            id,
+            trunc(p["summary"].as_str().unwrap_or(""), 60)
+        );
+    }
+    for p in v["custom_presets"].as_array().into_iter().flatten() {
+        println!(
+            "  {:<17} {} (saved)",
+            p["id"].as_str().unwrap_or(""),
+            trunc(p["name"].as_str().unwrap_or(""), 50)
+        );
+    }
+    let live = v["displays"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if live.is_empty() {
+        println!("live      none");
+        return;
+    }
+    for d in live {
+        println!(
+            "live      slot {} · {} · {} · {} session(s){}",
+            d["slot"].as_i64().unwrap_or(0),
+            d["mode"].as_str().unwrap_or("—"),
+            d["state"].as_str().unwrap_or("—"),
+            d["sessions"].as_i64().unwrap_or(0),
+            d["client"]
+                .as_str()
+                .map(|c| format!(" · {}", trunc(c, 24)))
+                .unwrap_or_default()
+        );
+    }
+}
+
+// ── stats ──────────────────────────────────────────────────────────────────────────────────────
+
+/// What the stream is doing right now.
+///
+/// Two layers, because they cost different things. The **free** layer is `/status`: the negotiated
+/// mode and codec plus `bitrate_kbps`, which is the live encoder target and moves with every
+/// adaptive-bitrate change — so it is a real read-out, not a copy of the handshake. The **detail**
+/// layer (per-frame drops and stage percentiles) only exists while a performance capture is armed,
+/// because that is when the streaming loops emit samples at all.
+///
+/// This verb never arms a capture as a side effect of being read. Arming has a consequence a reader
+/// did not ask for — `stats record stop` writes a recording to disk, and the capture is a single
+/// host-wide slot the web console also drives — so it stays an explicit verb.
+fn stats(args: &[&str], json: bool) -> Result<()> {
+    let c = Client::connect(None)?;
+    match args.first().copied() {
+        Some("record") => match args.get(1).copied() {
+            Some("start") => {
+                let v = c.post("/api/v1/stats/capture/start", &json!({}))?;
+                out(json, &v, |_| println!("capture armed"));
+                Ok(())
+            }
+            Some("stop") => {
+                let v = c.post("/api/v1/stats/capture/stop", &json!({}))?;
+                out(json, &v, |v| {
+                    // 204 when nothing was recording — `finish` gives that back as a null body.
+                    match v["id"].as_str() {
+                        Some(id) => println!("capture saved as {id}"),
+                        None => println!("nothing was recording"),
+                    }
+                });
+                Ok(())
+            }
+            _ => Err(Failure::usage("stats record: expected start | stop")),
+        },
+        None | Some("status") => {
+            let status = c.get("/api/v1/status")?;
+            let capture = c
+                .get("/api/v1/stats/capture/status")
+                .unwrap_or_else(|_| json!({ "armed": false }));
+            // The live capture holds its WHOLE time-series (up to 5400 samples). A read-out wants
+            // the newest one, so the tail is taken here rather than shipping the series to every
+            // caller that only ever renders one row of numbers.
+            let mut sample = Value::Null;
+            let mut meta = Value::Null;
+            if capture["armed"].as_bool().unwrap_or(false) {
+                if let Ok(live) = c.get("/api/v1/stats/capture/live") {
+                    meta = live["meta"].clone();
+                    sample = live["samples"]
+                        .as_array()
+                        .and_then(|s| s.last())
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                }
+            }
+            let v = json!({
+                "video_streaming": status["video_streaming"],
+                "active_sessions": status["active_sessions"],
+                "session": status["session"],
+                "stream": status["stream"],
+                "games": status["games"],
+                "capture": capture,
+                "sample": sample,
+                "meta": meta,
+            });
+            out(json, &v, render_stats);
+            Ok(())
+        }
+        Some(other) => Err(Failure::usage(format!(
+            "stats: expected status | record, got '{other}'"
+        ))),
+    }
+}
+
+/// A stage duration in the unit that shows it. Encode lands around 2 300 µs and `send` around
+/// 15 µs, so one fixed unit loses an end: printing everything in ms flattens `send` to `0.0`, and
+/// printing everything in µs makes encode a five-digit number to squint at.
+fn dur_us(us: f64) -> String {
+    if us >= 1000.0 {
+        format!("{:.1} ms", us / 1000.0)
+    } else {
+        format!("{} µs", us.round() as i64)
+    }
+}
+
+fn render_stats(v: &Value) {
+    let s = &v["stream"];
+    if s.is_null() {
+        println!("stream    nothing is streaming");
+    } else {
+        println!(
+            "stream    {}x{}@{} {}",
+            s["width"].as_i64().unwrap_or(0),
+            s["height"].as_i64().unwrap_or(0),
+            s["fps"].as_i64().unwrap_or(0),
+            s["codec"].as_str().unwrap_or("—")
+        );
+        // The ENCODER TARGET, which is where adaptive bitrate has settled — not the throughput.
+        // Labelled as a target because the two differ by an order of magnitude on a still screen,
+        // and a single "300 Mbps" next to 11 Mbps of actual traffic is the kind of number that
+        // sends someone hunting a bandwidth problem that does not exist.
+        println!(
+            "target    {:.1} Mbps",
+            s["bitrate_kbps"].as_f64().unwrap_or(0.0) / 1000.0
+        );
+        if let Some(ms) = s["time_to_first_frame_ms"].as_i64() {
+            println!("bring-up  {ms} ms to first frame");
+        }
+    }
+    if let Some(backend) = v["meta"]["encoder_backend"].as_str() {
+        println!(
+            "encoder   {backend}{}",
+            v["meta"]["gpu"]
+                .as_str()
+                .map(|g| format!(" · {g}"))
+                .unwrap_or_default()
+        );
+    }
+    if !v["capture"]["armed"].as_bool().unwrap_or(false) {
+        println!("capture   idle — run `ctl stats record start` for frame timings");
+        return;
+    }
+    println!(
+        "capture   recording · {} samples",
+        v["capture"]["sample_count"].as_i64().unwrap_or(0)
+    );
+    let p = &v["sample"];
+    if p.is_null() {
+        return;
+    }
+    println!("sent      {:.1} Mbps", p["mbps"].as_f64().unwrap_or(0.0));
+    // `fps` counts NEW frames and `repeat_fps` the re-sent last one. Capture is damage-driven, so a
+    // still desktop legitimately reads 0 new fps while the stream is perfectly healthy — printing
+    // only `fps` there says "the stream is dead" about a stream that is not.
+    let new_fps = p["fps"].as_f64().unwrap_or(0.0);
+    let repeat_fps = p["repeat_fps"].as_f64().unwrap_or(0.0);
+    println!("frames    {new_fps:.1} fps new · {repeat_fps:.1} fps repeated");
+    if new_fps < 1.0 && repeat_fps > 1.0 {
+        println!("          (nothing on screen is changing — the last frame is being repeated)");
+    }
+    println!(
+        "loss      {} frames dropped · {} packets lost · {} recovered by FEC",
+        p["frames_dropped"].as_i64().unwrap_or(0),
+        p["packets_dropped"].as_i64().unwrap_or(0),
+        p["fec_recovered"].as_i64().unwrap_or(0)
+    );
+    for st in p["stages"].as_array().into_iter().flatten() {
+        println!(
+            "  {:<12} p50 {} · p99 {}",
+            st["name"].as_str().unwrap_or("—"),
+            dur_us(st["p50_us"].as_f64().unwrap_or(0.0)),
+            dur_us(st["p99_us"].as_f64().unwrap_or(0.0))
+        );
+    }
+}
+
 /// A one-shot console URL carrying a ticket that logs the operator straight in.
 ///
 /// **What is being trusted, and what is not.** The console binds all interfaces so it can be
@@ -449,6 +786,46 @@ fn render_sessions(v: &Value) {
     render_games(v);
 }
 
+fn render_summary(v: &Value) {
+    println!("version   {}", v["version"].as_str().unwrap_or("—"));
+    println!(
+        "state     {}",
+        if v["video_streaming"].as_bool().unwrap_or(false) {
+            match v["audio_streaming"].as_bool().unwrap_or(false) {
+                true => "streaming video + audio",
+                false => "streaming video",
+            }
+        } else {
+            "idle"
+        }
+    );
+    if let Some(name) = v["client_name"].as_str() {
+        println!("client    {name}");
+    }
+    if let Some(s) = v["session"].as_object() {
+        println!(
+            "mode      {}x{} @ {}",
+            s.get("width").and_then(Value::as_i64).unwrap_or(0),
+            s.get("height").and_then(Value::as_i64).unwrap_or(0),
+            s.get("fps").and_then(Value::as_i64).unwrap_or(0)
+        );
+    }
+    println!(
+        "paired    {} native, {} gamestream",
+        v["native_paired_clients"].as_i64().unwrap_or(0),
+        v["paired_clients"].as_i64().unwrap_or(0)
+    );
+    let waiting = v["pending_approvals"].as_i64().unwrap_or(0);
+    if waiting > 0 {
+        println!("pending   {waiting} awaiting approval");
+    }
+    // Another Moonlight-compatible host on this box binds the same ports, and the symptom is a
+    // client that pairs with the wrong one. Worth a line whenever it is true.
+    for c in v["conflicts"].as_array().into_iter().flatten() {
+        println!("conflict  {}", c.as_str().unwrap_or(""));
+    }
+}
+
 fn render_games(v: &Value) {
     let Some(games) = v["games"].as_array().filter(|g| !g.is_empty()) else {
         return;
@@ -566,6 +943,9 @@ USAGE:
 STATE
     status                       host state, session count, paired counts
     sessions                     the active session(s) and any launched game
+    summary                      one call for a status surface: host version, what is streaming,
+                                 the streaming client's name, paired counts, and any conflicting
+                                 host on this box. The only verb that names a connected device.
     watch [--kinds K,..] [--since N]
                                  the host event stream as line-JSON on stdout, one object per
                                  line; reconnects by itself and emits {"kind":"ctl.resync"}
@@ -592,6 +972,24 @@ DEVICES
     rename <FP> <NAME>
     access <FP> <full|controller|view>
     unpair <FP> | unpair --all [--yes]
+
+DISPLAYS
+    display                      the virtual-display policy, every preset, and the live displays.
+                                 `displays` is always empty on wlroots — the registry passes those
+                                 through rather than owning them, so read it as "not tracked here".
+    display preset <ID>          switch the policy to a preset — a built-in id or a saved one.
+                                 Reads the stored policy and edits it, so the axes a preset does
+                                 not own (the streamed screen, the experimental Windows ones)
+                                 survive the switch.
+    display release [SLOT]       tear down KEPT displays now, so a physical-screen user gets their
+                                 screen back without waiting out the linger. Omit SLOT for all.
+                                 Never touches a display that is actively streaming.
+
+STATS
+    stats                        the live stream: mode, codec and the adaptive bitrate, plus frame
+                                 timings and drops while a capture is recording
+    stats record start|stop      arm or disarm the performance capture. `stop` writes the recording
+                                 to disk; the capture is one host-wide slot the web console shares.
 
 OPTIONS
     --json                       versioned JSON on stdout (the contract; the tables are for humans)
@@ -649,5 +1047,68 @@ mod tests {
         assert!(one_id(&["--expires-in", "3600"], "approve").is_err());
         assert!(one_id(&["newest"], "approve").is_err());
         assert!(one_id(&[], "approve").is_err());
+    }
+
+    /// A settings body shaped like `GET /display/settings`: a stored policy carrying axes no preset
+    /// owns, one built-in preset and one saved one.
+    fn display_state() -> Value {
+        json!({
+            "settings": {
+                "version": 1,
+                "preset": "default",
+                "topology": "auto",
+                "max_displays": 4,
+                "game_session": "auto",
+                "capture_monitor": "DP-2",
+                "ddc_power_off": true,
+            },
+            "presets": [{ "id": "gaming-rig", "summary": "…" }],
+            "custom_presets": [{
+                "id": "p-couch",
+                "name": "Couch",
+                "game_session": "dedicated",
+                "fields": { "topology": "exclusive", "max_displays": 2 },
+            }],
+        })
+    }
+
+    #[test]
+    fn a_preset_switch_keeps_the_axes_no_preset_owns() {
+        let p = policy_with_preset(&display_state(), "gaming-rig").unwrap();
+        assert_eq!(p["preset"], "gaming-rig");
+        // The streamed screen is not display BEHAVIOR. A whole-object PUT that rebuilt the policy
+        // from the verb's arguments would drop this and silently move the stream to a virtual
+        // display — the on-glass regression the console carries the same guard against.
+        assert_eq!(p["capture_monitor"], "DP-2");
+        assert_eq!(p["ddc_power_off"], true);
+    }
+
+    #[test]
+    fn a_saved_preset_is_applied_as_a_custom_policy_carrying_its_fields() {
+        // Saved presets have no apply route of their own — the API expects `custom` plus the
+        // fields. Getting this wrong stores the id in a field that only accepts the built-in names.
+        let p = policy_with_preset(&display_state(), "p-couch").unwrap();
+        assert_eq!(p["preset"], "custom");
+        assert_eq!(p["topology"], "exclusive");
+        assert_eq!(p["max_displays"], 2);
+        assert_eq!(p["game_session"], "dedicated");
+        assert_eq!(p["capture_monitor"], "DP-2");
+    }
+
+    #[test]
+    fn stage_durations_keep_the_small_stages_visible() {
+        // Real numbers off an Omarchy box: `send` p50 15 µs against `encode` p50 2321 µs. One
+        // fixed unit loses an end of that range — ms prints send as "0.0 ms".
+        assert_eq!(dur_us(15.0), "15 µs");
+        assert_eq!(dur_us(0.0), "0 µs");
+        assert_eq!(dur_us(999.0), "999 µs");
+        assert_eq!(dur_us(2321.0), "2.3 ms");
+    }
+
+    #[test]
+    fn an_unknown_preset_is_refused_rather_than_stored() {
+        assert!(policy_with_preset(&display_state(), "hologram").is_err());
+        // No stored policy at all is the host's answer, not a preset the caller can fix.
+        assert!(policy_with_preset(&json!({}), "gaming-rig").is_err());
     }
 }
