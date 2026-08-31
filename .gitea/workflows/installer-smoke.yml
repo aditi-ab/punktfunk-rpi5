@@ -4,14 +4,14 @@
 # because a container has no user systemd; it degrades to printing the enable command, which is
 # also under test.
 #
-# TWO installers are under test until WP4.3 (design/installer-v2.md): `entry: sh` is today's
-# shipped scripts/install.sh, `entry: binary` is crates/punktfunk-setup built FROM THIS TREE —
-# never the published binary, which only the M4 probe job touches. The matrix doubling is
-# deliberate and temporary; the sh entry retires with the script body.
+# It drives the SHIPPED path end to end: scripts/install.sh, the stub, with
+# PUNKTFUNK_SETUP_BIN pointed at a punktfunk-setup built FROM THIS TREE. So the stub's argument
+# passing is under test alongside the installer, and the published binary is never involved —
+# only the probe job touches that (design/installer-v2.md WP4.3).
 #
-# Path-filtered on purpose: it pulls ~100 MB of packages per family, so it runs when an installer
-# or its fact source changes, not on every push (ci.yml runs the cheap halves — the goldens and
-# the sh-vs-binary parity check — on every push).
+# Path-filtered on purpose: it pulls ~100 MB of packages per family, so it runs when the
+# installer or its fact source changes, not on every push. The cheap halves run in ci.yml on
+# every push: the plan goldens, and check-installer-behavior.sh's detection and channel gates.
 name: installer-smoke
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,7 +23,6 @@ on:
     paths:
       - scripts/install.sh
       - data/platforms.json
-      - scripts/ci/check-install-defaults.sh
       - crates/punktfunk-setup/**
       - packaging/linux/omarchy/punktfunk-omarchy
       - packaging/linux/omarchy/selftest.sh
@@ -32,7 +31,6 @@ on:
     paths:
       - scripts/install.sh
       - data/platforms.json
-      - scripts/ci/check-install-defaults.sh
       - crates/punktfunk-setup/**
       - packaging/linux/omarchy/punktfunk-omarchy
       - packaging/linux/omarchy/selftest.sh
@@ -66,15 +64,6 @@ jobs:
           name: punktfunk-setup-musl
           path: target/x86_64-unknown-linux-musl/release/punktfunk-setup
 
-  defaults:
-    name: derived defaults
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Assert per-family installer defaults
-        run: sh scripts/ci/check-install-defaults.sh
-
   omarchy:
     name: omarchy integration self-check
     runs-on: ubuntu-24.04
@@ -88,19 +77,18 @@ jobs:
         run: bash packaging/linux/omarchy/selftest.sh
 
   smoke:
-    name: smoke (${{ matrix.family }}, ${{ matrix.entry }})
+    name: smoke (${{ matrix.family }})
     runs-on: ubuntu-24.04
     needs: setup-binary
     timeout-minutes: 25
     env:
-      # The one installer this leg drives. Both take the same flags — that is the D5
-      # compatibility contract, and running the identical scenario steps is what proves it.
-      PF: ${{ matrix.entry == 'binary' && '/usr/local/bin/punktfunk-setup' || 'sh scripts/install.sh' }}
+      # The stub is the entry point users get, so it is the entry point under test. It execs
+      # whatever PUNKTFUNK_SETUP_BIN names, which is this pull request's own build.
+      PF: sh scripts/install.sh
+      PUNKTFUNK_SETUP_BIN: /usr/local/bin/punktfunk-setup
     strategy:
       fail-fast: false
       matrix:
-        family: [debian-13, fedora-44, arch]
-        entry: [sh, binary]
         include:
           # actions/checkout needs git + node + CA certs in the container; curl is the
           # script's own prerequisite (it says so and stops without it).
@@ -131,13 +119,11 @@ jobs:
         run: ${{ matrix.prep }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Fetch the installer binary built from this tree
-        if: matrix.entry == 'binary'
         uses: actions/download-artifact@v3
         with:
           name: punktfunk-setup-musl
           path: /usr/local/bin
       - name: Make it executable
-        if: matrix.entry == 'binary'
         run: chmod +x /usr/local/bin/punktfunk-setup
       # No tty → the installer runs as --yes; --no-start because there is no user systemd here.
       # Root without sudo → the sudo shim, another path under test.
