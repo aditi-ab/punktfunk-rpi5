@@ -281,8 +281,12 @@ setup_webapp() {
     || icon=punktfunk-tray   # older package: the tray mark is the only one installed
   # Migrate a pre-rename install: an entry with the OLD name is ours only when it lives in the
   # USER's applications dir — the client package's identically-named /usr entry is not ours.
+  # ⚠ `|| true` is load-bearing on every `x=$(… | …)` below. Finding nothing is the NORMAL case
+  # here, but a bare assignment carries the pipeline's status, and under `set -e` + `pipefail` a
+  # no-match grep (1), an unreadable directory (2) or a SIGPIPE from `head` (141) kills the whole
+  # script — silently, right after the step header, with the empty-case handler never reached.
   local old
-  old=$(grep -rl "^Name=$WEBAPP_OLD$" "$HOME/.local/share/applications" 2>/dev/null | head -1)
+  old=$(grep -rl "^Name=$WEBAPP_OLD$" "$HOME/.local/share/applications" 2>/dev/null | head -1) || true
   if [[ -n "$old" ]]; then
     omarchy-webapp-remove "$WEBAPP_OLD" >/dev/null 2>&1 || rm -f "$old"
   fi
@@ -292,7 +296,7 @@ setup_webapp() {
     # launcher lands logged in. `ctl console-url` signs it with the management token, which only
     # this uid can read — a LAN visitor still gets the login page.
     local entry
-    entry=$(grep -rl "^Name=$WEBAPP$" "$HOME/.local/share/applications" 2>/dev/null | head -1)
+    entry=$(grep -rl "^Name=$WEBAPP$" "$HOME/.local/share/applications" 2>/dev/null | head -1) || true
     if [[ -n "$entry" ]] && have punktfunk-host; then
       # `|| echo`: a stopped host makes `ctl console-url` fail, and an EMPTY `--app=` opens a
       # plain browser window instead of an app window — the bare URL keeps the shape right and
@@ -404,7 +408,7 @@ setup_menu() {
   # a newline inside a -v assignment ("newline in string"), so the rows silently never landed and
   # the file came back unchanged while this reported success.
   local close
-  close=$(grep -n '^[[:space:]]*}[[:space:]]*$' "$tmp" | tail -1 | cut -d: -f1)
+  close=$(grep -n '^[[:space:]]*}[[:space:]]*$' "$tmp" | tail -1 | cut -d: -f1) || true
   if [[ -z "$close" ]]; then
     rm -f "$tmp"
     warn "could not find the closing brace in $MENU_FILE — leaving it alone"

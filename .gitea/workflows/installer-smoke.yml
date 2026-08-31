@@ -19,12 +19,16 @@ on:
       - scripts/install.sh
       - data/platforms.json
       - scripts/ci/check-install-defaults.sh
+      - packaging/linux/omarchy/punktfunk-omarchy
+      - packaging/linux/omarchy/selftest.sh
       - .gitea/workflows/installer-smoke.yml
   pull_request:
     paths:
       - scripts/install.sh
       - data/platforms.json
       - scripts/ci/check-install-defaults.sh
+      - packaging/linux/omarchy/punktfunk-omarchy
+      - packaging/linux/omarchy/selftest.sh
       - .gitea/workflows/installer-smoke.yml
 
 jobs:
@@ -36,6 +40,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Assert per-family installer defaults
         run: sh scripts/ci/check-install-defaults.sh
+
+  omarchy:
+    name: omarchy integration self-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # `punktfunk-omarchy` only ever runs on an Omarchy box, so nothing else can exercise the
+      # parts of it that edit a file the user owns — or that simply have to REACH the end under
+      # `set -euo pipefail`. It needs no container: bash and python3 are all the checks use.
+      - name: Run the Omarchy integration self-check
+        run: bash packaging/linux/omarchy/selftest.sh
 
   smoke:
     name: smoke (${{ matrix.family }})
