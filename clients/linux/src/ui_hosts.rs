@@ -675,13 +675,13 @@ const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(12);
 /// at a glance is the whole reason the chip exists. No colour set keeps the neutral pill, so
 /// the palette stays opt-in.
 /// The OS-icon tokens this shell ships symbolic art for (`data/icons/.../pf-os-<t>-symbolic.svg`,
-/// embedded via gresource): the families a chain can land on, plus the gaming distros that earn
+/// embedded via gresource): the families a chain can land on, plus the distro leaves that earn
 /// their own mark because "a Bazzite box" and "a Fedora box" are different machines to the person
 /// reading the card. Chains walk most-specific-first, so a distro without a mark of its own still
 /// lands on its family's and finally on plain Tux.
 const OS_ICON_TOKENS: &[&str] = &[
     "windows", "apple", "linux", "steam", "ubuntu", "fedora", "arch", "debian", "nixos",
-    "opensuse", "bazzite", "cachyos", "nobara",
+    "opensuse", "bazzite", "cachyos", "nobara", "omarchy",
 ];
 
 /// The symbolic icon name for an advertised chain, or `None` when the host doesn't advertise

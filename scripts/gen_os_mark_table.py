@@ -6,8 +6,8 @@
 The console parses SVG path data at runtime, so unlike the GTK/Windows/Apple clients it needs
 no baked raster or PDF — it needs the path string. And unlike the three hand-kept inline
 registries (web, Decky, Android), it is generated outright for the same reason the
-launcher-icon tables are: thirteen paths of up to 3.5 kB each, where one mangled character is a
-silently wrong logo that no test would catch.
+launcher-icon tables are: a dozen-odd paths of up to 3.5 kB each, where one mangled character
+is a silently wrong logo that no test would catch.
 
 Always emits EVERY master, whatever tokens gen-os-icons.sh was invoked with — this is one file,
 and a partial rewrite would drop the rest.
@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import pathlib
 import re
+import shutil
+import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -182,4 +184,11 @@ mod tests {{
 
 path = ROOT / OUT
 path.write_text(body)
-print(f"  {OUT} ({len(body):,} bytes, {len(MARKS)} marks)")
+
+# CI fmt-gates the whole tree, so a generator that emits anything rustfmt would rewrite leaves
+# every regeneration one dirty file away from a blocked commit. Formatting the output here is
+# what keeps this template from having to stay hand-wrapped to rustfmt's taste.
+if shutil.which("rustfmt"):
+    subprocess.run(["rustfmt", "--edition", "2024", str(path)], check=True)
+
+print(f"  {OUT} ({path.stat().st_size:,} bytes, {len(MARKS)} marks)")

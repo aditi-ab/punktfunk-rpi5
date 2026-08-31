@@ -20,13 +20,14 @@ Android `ImageVector`s). One file per **icon token** of the host's OS-identity c
 | `bazzite` | Bazzite | ublue-os/bazzite (Apache-2.0) |
 | `cachyos` | CachyOS | Simple Icons (CC0 1.0) |
 | `nobara` | Nobara | Simple Icons (CC0 1.0, slug `nobaralinux`) |
+| `omarchy` | Omarchy | Simple Icons (CC0 1.0) |
 
-The last three are **distro leaves, not families**: a chain walks most-specific-first, so
-`linux/fedora/bazzite` would otherwise draw the Fedora mark. They earn their own art because
-"a Bazzite box" and "a Fedora box" are different machines to the person reading the card, and
-they are what this project's hosts actually run. Every other distro with no file here (Pop!_OS,
-Mint, …) still degrades to its family's mark and finally to Tux — that fallback is the design,
-not a gap.
+The last four are **distro leaves, not families**: a chain walks most-specific-first, so
+`linux/fedora/bazzite` would otherwise draw the Fedora mark, and `linux/arch/omarchy` the Arch
+one. They earn their own art because "a Bazzite box" and "a Fedora box" are different machines
+to the person reading the card, and they are what this project's hosts actually run. Every other
+distro with no file here (Pop!_OS, Mint, …) still degrades to its family's mark and finally to
+Tux — that fallback is the design, not a gap.
 
 Windows is the one mark drawn here rather than sourced: every icon set that ships a "Windows"
 brand glyph still carries the **Windows 8/10 flag with the perspective skew**, which reads as

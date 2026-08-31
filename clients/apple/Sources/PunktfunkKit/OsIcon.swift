@@ -8,12 +8,12 @@ import PunktfunkShared
 import SwiftUI
 
 /// The icon tokens this client ships art for: the families a chain can land on, plus the
-/// gaming distros that earn their own mark because "a Bazzite box" and "a Fedora box" are
+/// distro leaves that earn their own mark because "a Bazzite box" and "a Fedora box" are
 /// different machines to the person reading the card. A distro with no mark of its own
 /// still degrades to its family's and finally to Tux via the chain walk.
 private let osIconTokensShipped: Set<String> = [
     "windows", "apple", "linux", "steam", "ubuntu", "fedora", "arch", "debian", "nixos",
-    "opensuse", "bazzite", "cachyos", "nobara",
+    "opensuse", "bazzite", "cachyos", "nobara", "omarchy",
 ]
 
 /// The mark for an OS-identity chain (`linux/fedora/bazzite`, ...), or nil — no view at

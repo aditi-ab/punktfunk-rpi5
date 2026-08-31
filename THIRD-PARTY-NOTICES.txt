@@ -13487,8 +13487,8 @@ https://github.com/simple-icons/simple-icons/blob/develop/DISCLAIMER.md.
 ----------------------------------------------------------------------------
 The following license (simple-icons.txt) applies to: Simple Icons (vendored, assets/os-icons)
 ----------------------------------------------------------------------------
-Simple Icons — brand icons (arch, nixos, debian, cachyos, nobara in assets/os-icons/)
-are from Simple Icons
+Simple Icons — brand icons (arch, nixos, debian, cachyos, nobara, omarchy in
+assets/os-icons/) are from Simple Icons
 (https://simpleicons.org, https://github.com/simple-icons/simple-icons).
 
 The Simple Icons SVG path data is released under CC0 1.0 Universal (public domain
