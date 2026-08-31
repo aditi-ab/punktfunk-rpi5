@@ -94,6 +94,7 @@ punktfunk-host ctl approve 3
 |---|---|
 | `status` | Host state, live session count, paired-device counts. |
 | `sessions` | The active session(s) and any launched game. |
+| `summary` | One call for a status surface: host version, what is streaming, the streaming client's name, paired counts, and any conflicting host on this box. The **only** verb that names a connected device — `status` exposes no device names by design. |
 | `pair status` | Is a pairing window open, and is a PIN waiting? |
 | `pair arm` | Open a native pairing window and print the PIN. `--ttl <s>` how long the window stays open, `--expires-in <s>` how long the device's access lasts, `--preset <full\|controller\|view>`, `--fingerprint <fp>` to bind the window to **one** device. |
 | `pair disarm` | Close it. |

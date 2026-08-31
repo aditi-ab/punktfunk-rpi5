@@ -92,6 +92,14 @@ fn run(args: &[&str], json: bool) -> Result<()> {
             out(json, &slice, render_sessions);
             Ok(())
         }
+        // `/status` deliberately exposes no device names, so it cannot answer "who is streaming".
+        // `/local/summary` is the one endpoint that does — one label, the streaming client's — and
+        // it folds in the host version and the conflicting-host warning a status surface wants.
+        "summary" => {
+            let v = Client::connect(None)?.get("/api/v1/local/summary")?;
+            out(json, &v, render_summary);
+            Ok(())
+        }
         "stop-session" => {
             let v = Client::connect(None)?.delete("/api/v1/session")?;
             out(json, &v, |_| println!("session stopped"));
@@ -778,6 +786,46 @@ fn render_sessions(v: &Value) {
     render_games(v);
 }
 
+fn render_summary(v: &Value) {
+    println!("version   {}", v["version"].as_str().unwrap_or("—"));
+    println!(
+        "state     {}",
+        if v["video_streaming"].as_bool().unwrap_or(false) {
+            match v["audio_streaming"].as_bool().unwrap_or(false) {
+                true => "streaming video + audio",
+                false => "streaming video",
+            }
+        } else {
+            "idle"
+        }
+    );
+    if let Some(name) = v["client_name"].as_str() {
+        println!("client    {name}");
+    }
+    if let Some(s) = v["session"].as_object() {
+        println!(
+            "mode      {}x{} @ {}",
+            s.get("width").and_then(Value::as_i64).unwrap_or(0),
+            s.get("height").and_then(Value::as_i64).unwrap_or(0),
+            s.get("fps").and_then(Value::as_i64).unwrap_or(0)
+        );
+    }
+    println!(
+        "paired    {} native, {} gamestream",
+        v["native_paired_clients"].as_i64().unwrap_or(0),
+        v["paired_clients"].as_i64().unwrap_or(0)
+    );
+    let waiting = v["pending_approvals"].as_i64().unwrap_or(0);
+    if waiting > 0 {
+        println!("pending   {waiting} awaiting approval");
+    }
+    // Another Moonlight-compatible host on this box binds the same ports, and the symptom is a
+    // client that pairs with the wrong one. Worth a line whenever it is true.
+    for c in v["conflicts"].as_array().into_iter().flatten() {
+        println!("conflict  {}", c.as_str().unwrap_or(""));
+    }
+}
+
 fn render_games(v: &Value) {
     let Some(games) = v["games"].as_array().filter(|g| !g.is_empty()) else {
         return;
@@ -895,6 +943,9 @@ USAGE:
 STATE
     status                       host state, session count, paired counts
     sessions                     the active session(s) and any launched game
+    summary                      one call for a status surface: host version, what is streaming,
+                                 the streaming client's name, paired counts, and any conflicting
+                                 host on this box. The only verb that names a connected device.
     watch [--kinds K,..] [--since N]
                                  the host event stream as line-JSON on stdout, one object per
                                  line; reconnects by itself and emits {"kind":"ctl.resync"}
