@@ -12,7 +12,7 @@ use crate::choices::Choices;
 use crate::facts::{Channel, Facts, DOCS};
 use crate::plan::{Level, Plan, StepAction};
 use crate::seam::{BasePaths, CommandRunner, Stdin};
-use crate::ui::Plain;
+use crate::ui::Reporter;
 
 /// Under `--yes` a package manager must not stop for its own confirmation. Ported verbatim
 /// from the sh installer's rewrite table; `-Syu` is tested before `-S` so it wins.
@@ -61,7 +61,7 @@ pub struct Failed(pub String);
 pub struct Executor<'a> {
     pub paths: &'a BasePaths,
     pub run: &'a dyn CommandRunner,
-    pub ui: &'a Plain,
+    pub ui: &'a dyn Reporter,
     pub opts: Opts,
 }
 

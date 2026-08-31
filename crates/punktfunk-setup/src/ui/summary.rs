@@ -1,0 +1,482 @@
+//! The settings-list screen, as pure state. No terminal, no cliclack, no I/O.
+//!
+//! §2 of `design/installer-v2.md`: every resolved choice visible at once, Enter installs,
+//! ↑↓ + Enter edits one row. Keeping the row model and the transitions here — rather than
+//! inside the prompt library — is what lets the whole screen be driven by injected key events
+//! in a test, and is why swapping cliclack for a hand-rolled widget stays a rendering change.
+//!
+//! Re-resolution is free by construction: the screen owns `Choices`, and the plan is rebuilt
+//! from `(Facts, Choices)` whenever it is asked for. Toggling Moonlight compat therefore adds
+//! the gamestream firewall line with no cache to invalidate.
+//!
+//! The row descriptions carry the sh installer's prompt texts verbatim — the usbip-attach
+//! grant, "each client still opts in" — so accepting a default never hides what it grants.
+
+use crate::choices::{Action, Choices};
+use crate::facts::{Channel, Facts};
+use crate::plan::{self, Plan};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    Components,
+    Channel,
+    Group,
+    Gamestream,
+    Clipboard,
+    Linger,
+    Start,
+}
+
+/// A line the cursor can land on. The separators in the mockup are drawn, never selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Item {
+    /// The default action, at the top so Enter on arrival installs.
+    Go,
+    Row(Field),
+    Uninstall,
+    DryRun,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Up,
+    Down,
+    Enter,
+    Cancel,
+    /// A key the screen has no meaning for. It must not move the cursor.
+    Ignored,
+}
+
+/// What the caller should do after a key. `Edit` is where the renderer opens its own prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Idle,
+    Edit(Field),
+    Run(Action),
+    DryRun,
+    Cancel,
+}
+
+pub struct Screen {
+    pub facts: Facts,
+    pub choices: Choices,
+    pub items: Vec<Item>,
+    pub cursor: usize,
+}
+
+impl Screen {
+    pub fn new(facts: Facts, choices: Choices) -> Screen {
+        let mut items = vec![Item::Go];
+        items.push(Item::Row(Field::Components));
+        items.push(Item::Row(Field::Channel));
+        // A client listens on nothing fixed, so none of the host wiring rows apply to it.
+        if choices.components.host {
+            items.extend([
+                Item::Row(Field::Group),
+                Item::Row(Field::Gamestream),
+                Item::Row(Field::Clipboard),
+                Item::Row(Field::Linger),
+                Item::Row(Field::Start),
+            ]);
+        }
+        items.push(Item::DryRun);
+        if facts.fully_installed() {
+            items.push(Item::Uninstall);
+        }
+        Screen {
+            facts,
+            choices,
+            items,
+            cursor: 0,
+        }
+    }
+
+    /// True when the box already has the host — the screen re-titles and gains Uninstall.
+    pub fn manage_mode(&self) -> bool {
+        self.facts.fully_installed()
+    }
+
+    pub fn title(&self) -> String {
+        if self.manage_mode() {
+            let version = self
+                .facts
+                .host_version
+                .clone()
+                .unwrap_or_else(|| "punktfunk".into());
+            let channel = self
+                .facts
+                .current_channel
+                .map_or("no repo", Channel::as_str);
+            format!("{version} · {channel}")
+        } else {
+            format!("punktfunk setup{}", self.suffix())
+        }
+    }
+
+    fn suffix(&self) -> String {
+        format!(
+            "  ·  {} · {}",
+            self.facts.os.pretty,
+            self.facts.family.as_str()
+        )
+    }
+
+    pub fn selected(&self) -> Item {
+        self.items[self.cursor]
+    }
+
+    /// Movement wraps, the way every clack select does.
+    pub fn key(&mut self, key: Key) -> Step {
+        match key {
+            Key::Up => {
+                self.cursor = (self.cursor + self.items.len() - 1) % self.items.len();
+                Step::Idle
+            }
+            Key::Down => {
+                self.cursor = (self.cursor + 1) % self.items.len();
+                Step::Idle
+            }
+            Key::Ignored => Step::Idle,
+            Key::Cancel => Step::Cancel,
+            Key::Enter => match self.selected() {
+                Item::Go => Step::Run(Action::Install),
+                Item::Uninstall => Step::Run(Action::Uninstall),
+                Item::DryRun => Step::DryRun,
+                Item::Row(field) => Step::Edit(field),
+            },
+        }
+    }
+
+    /// Apply an edit the renderer collected, then re-derive everything that depends on it.
+    pub fn set_bool(&mut self, field: Field, on: bool) {
+        match field {
+            Field::Group => self.choices.punktfunk_group = on,
+            Field::Gamestream => self.choices.gamestream = on,
+            Field::Clipboard => self.choices.clipboard = on,
+            Field::Linger => self.choices.linger = on,
+            Field::Start => self.choices.start = on,
+            _ => return,
+        }
+        self.rederive();
+    }
+
+    pub fn set_channel(&mut self, channel: Channel) {
+        self.choices.channel = channel;
+        self.choices.switch_from = match self.facts.current_channel {
+            Some(current) if current != channel => Some(current),
+            _ => None,
+        };
+    }
+
+    pub fn set_components(&mut self, host: bool, client: bool) {
+        // Neither selected is not a thing to install; keep the host rather than do nothing.
+        self.choices.components.host = host || !client;
+        self.choices.components.client = client;
+        let rebuilt = Screen::new(self.facts.clone(), self.choices.clone());
+        self.items = rebuilt.items;
+        self.cursor = self.cursor.min(self.items.len() - 1);
+    }
+
+    /// Why-texts follow the value, so a row that is off never explains a grant it is not making.
+    fn rederive(&mut self) {
+        if !self.choices.punktfunk_group {
+            self.choices.group_why = None;
+        }
+        if !self.choices.gamestream {
+            self.choices.gamestream_why = None;
+        }
+        if !self.choices.linger {
+            self.choices.linger_why = None;
+        }
+    }
+
+    pub fn plan(&self) -> Plan {
+        plan::build(&self.facts, &self.choices)
+    }
+
+    pub fn label(field: Field) -> &'static str {
+        match field {
+            Field::Components => "Components",
+            Field::Channel => "Channel",
+            Field::Group => "Full controller",
+            Field::Gamestream => "Moonlight compat",
+            Field::Clipboard => "Shared clipboard",
+            Field::Linger => "Start at boot",
+            Field::Start => "Start services",
+        }
+    }
+
+    pub fn value(&self, field: Field) -> String {
+        let c = &self.choices;
+        let yn = |on: bool| if on { "yes" } else { "no " };
+        match field {
+            Field::Components => format!(
+                "Host {} · Client {}",
+                tick(c.components.host),
+                tick(c.components.client)
+            ),
+            Field::Channel => match c.switch_from {
+                Some(from) => format!("{} → {}", from.as_str(), c.channel.as_str()),
+                None => c.channel.as_str().to_string(),
+            },
+            Field::Group => match (&c.group_why, c.punktfunk_group) {
+                (Some(why), true) => format!("yes — {why}"),
+                (_, true) => "yes — joins the punktfunk group (grants usbip attach)".into(),
+                _ => "no  — the pad arrives as a plain Xbox 360 controller".into(),
+            },
+            Field::Gamestream => match (&c.gamestream_why, c.gamestream) {
+                (Some(why), true) => format!("yes — {why}"),
+                (_, true) => "yes".into(),
+                _ => "no  — punktfunk's own apps don't need it".into(),
+            },
+            Field::Clipboard => yn(c.clipboard).trim_end().to_string(),
+            Field::Linger => match (&c.linger_why, c.linger) {
+                (Some(why), true) => format!("yes — {why}"),
+                (_, true) => "yes".into(),
+                _ => "no  — this box has a graphical session".into(),
+            },
+            Field::Start => yn(c.start).trim_end().to_string(),
+        }
+    }
+
+    /// The prompt text the editor for this row shows — the sh installer's, verbatim.
+    pub fn why(field: Field) -> &'static str {
+        match field {
+            Field::Components => "The host streams this box. The client watches another one.",
+            Field::Channel => "canary is the latest main build; stable is the released one.",
+            Field::Group => "Joins the punktfunk group for paddles, trackpads and gyro. It grants usbip attach, so only on a machine you trust.",
+            Field::Gamestream => "Serve Moonlight, Artemis, or another third-party client. Punktfunk's own apps don't need this.",
+            Field::Clipboard => "Share the clipboard between this host and your clients. Each client still opts in per host.",
+            Field::Linger => "Start the host at boot with nobody logged in.",
+            Field::Start => "Enable and start the services once the install finishes.",
+        }
+    }
+
+    /// The screen as text — what the goldens pin and what plain mode would show.
+    pub fn lines(&self) -> Vec<String> {
+        let mut out = vec![self.title()];
+        let rule = "─".repeat(63);
+        out.push(rule.clone());
+        for item in &self.items {
+            if let Item::Row(field) = item {
+                out.push(format!(
+                    "  {:<18}{}",
+                    Screen::label(*field),
+                    self.value(*field)
+                ));
+            }
+        }
+        out.push(rule);
+        let actions: Vec<&str> = self
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::DryRun => Some("Dry run"),
+                Item::Uninstall => Some("Uninstall"),
+                _ => None,
+            })
+            .collect();
+        out.push(format!("  {}", actions.join(" · ")));
+        out
+    }
+}
+
+fn tick(on: bool) -> &'static str {
+    if on {
+        "✓"
+    } else {
+        "✗"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::choices::Pins;
+    use crate::facts::{Family, Firewall, Nvidia, OsRelease};
+
+    fn facts(id: &str, family: Family) -> Facts {
+        Facts {
+            os: OsRelease {
+                id: id.into(),
+                id_like: String::new(),
+                version_id: String::new(),
+                pretty: id.into(),
+            },
+            family,
+            omarchy: false,
+            docs_page: String::new(),
+            rpm_group: None,
+            floor: None,
+            couch_box: false,
+            graphical_seat: true,
+            sunshine_active: false,
+            current_channel: None,
+            installed_pf: vec![],
+            missing: vec!["host".into()],
+            host_version: None,
+            has_web_server: false,
+            has_omarchy_bin: false,
+            has_ujust: false,
+            in_input_group: false,
+            in_punktfunk_group: false,
+            has_input_group: true,
+            nvidia: Nvidia::Absent,
+            has_rpmfusion_ffmpeg: false,
+            firewall: Firewall::Ufw,
+            systemd_pid1: true,
+            user_manager: true,
+            web_unit_present: true,
+            scripting_unit_disabled: false,
+            ip: None,
+            user: "pf".into(),
+        }
+    }
+
+    fn screen() -> Screen {
+        let f = facts("arch", Family::Pacman);
+        let c = Choices::derive(&f, &Pins::default());
+        Screen::new(f, c)
+    }
+
+    #[test]
+    fn enter_on_arrival_installs() {
+        let mut s = screen();
+        assert_eq!(s.selected(), Item::Go);
+        assert_eq!(s.key(Key::Enter), Step::Run(Action::Install));
+    }
+
+    #[test]
+    fn the_cursor_moves_and_wraps() {
+        let mut s = screen();
+        let last = s.items.len() - 1;
+        assert_eq!(s.key(Key::Up), Step::Idle);
+        assert_eq!(s.cursor, last, "up from the top wraps to the bottom");
+        assert_eq!(s.key(Key::Down), Step::Idle);
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn enter_on_a_row_asks_the_renderer_to_edit_it() {
+        let mut s = screen();
+        s.key(Key::Down);
+        s.key(Key::Down);
+        assert_eq!(s.key(Key::Enter), Step::Edit(Field::Channel));
+    }
+
+    #[test]
+    fn cancel_leaves_without_running_anything() {
+        let mut s = screen();
+        assert_eq!(s.key(Key::Cancel), Step::Cancel);
+    }
+
+    /// The re-resolution the design calls out by name.
+    #[test]
+    fn turning_moonlight_compat_on_adds_the_gamestream_firewall_line() {
+        let mut s = screen();
+        assert!(!s
+            .plan()
+            .commands()
+            .iter()
+            .any(|c| c.contains("punktfunk-gamestream")));
+        s.set_bool(Field::Gamestream, true);
+        assert!(
+            s.plan()
+                .commands()
+                .iter()
+                .any(|c| c == "sudo ufw allow punktfunk-gamestream"),
+            "the firewall step did not appear: {:?}",
+            s.plan().commands()
+        );
+    }
+
+    #[test]
+    fn turning_the_group_off_drops_the_usermod_and_its_why_text() {
+        let mut s = screen();
+        assert!(s
+            .plan()
+            .commands()
+            .iter()
+            .any(|c| c.contains("usermod -aG punktfunk")));
+        s.set_bool(Field::Group, false);
+        assert!(!s
+            .plan()
+            .commands()
+            .iter()
+            .any(|c| c.contains("usermod -aG punktfunk")));
+        assert!(s.choices.group_why.is_none());
+    }
+
+    /// A row that is on must never stop naming what it grants.
+    #[test]
+    fn the_group_row_always_states_the_usbip_grant() {
+        let s = screen();
+        assert!(s.value(Field::Group).contains("usbip attach"));
+        assert!(Screen::why(Field::Group).contains("usbip attach"));
+    }
+
+    #[test]
+    fn choosing_a_channel_the_box_is_not_on_shows_it_as_a_switch() {
+        let mut f = facts("arch", Family::Pacman);
+        f.current_channel = Some(Channel::Stable);
+        let c = Choices::derive(&f, &Pins::default());
+        let mut s = Screen::new(f, c);
+        s.set_channel(Channel::Canary);
+        assert_eq!(s.value(Field::Channel), "stable → canary");
+        s.set_channel(Channel::Stable);
+        assert_eq!(
+            s.value(Field::Channel),
+            "stable",
+            "back where it started is not a switch"
+        );
+    }
+
+    /// Client-only asks almost nothing — no groups, gamestream, linger or firewall rows.
+    #[test]
+    fn a_client_only_screen_drops_every_host_row() {
+        let f = facts("debian", Family::Apt);
+        let c = Choices::derive(
+            &f,
+            &Pins {
+                client: true,
+                ..Pins::default()
+            },
+        );
+        let s = Screen::new(f, c);
+        let fields: Vec<Field> = s
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Row(f) => Some(*f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fields, [Field::Components, Field::Channel]);
+    }
+
+    #[test]
+    fn switching_components_to_client_only_reshapes_the_screen() {
+        let mut s = screen();
+        s.set_components(false, true);
+        assert!(!s.items.contains(&Item::Row(Field::Group)));
+        assert!(s.cursor < s.items.len(), "the cursor was left past the end");
+    }
+
+    #[test]
+    fn an_installed_box_re_titles_and_offers_uninstall() {
+        let mut f = facts("arch", Family::Pacman);
+        f.missing = vec![];
+        f.host_version = Some("punktfunk-host 0.34.0".into());
+        f.current_channel = Some(Channel::Canary);
+        let c = Choices::derive(&f, &Pins::default());
+        let s = Screen::new(f, c);
+        assert!(s.manage_mode());
+        assert_eq!(s.title(), "punktfunk-host 0.34.0 · canary");
+        assert!(s.items.contains(&Item::Uninstall));
+    }
+
+    #[test]
+    fn a_fresh_box_offers_no_uninstall() {
+        assert!(!screen().items.contains(&Item::Uninstall));
+    }
+}

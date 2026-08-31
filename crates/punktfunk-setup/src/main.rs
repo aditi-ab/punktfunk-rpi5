@@ -16,7 +16,21 @@ use punktfunk_setup::facts::{Facts, Floor, DOCS};
 use punktfunk_setup::plan;
 use punktfunk_setup::report;
 use punktfunk_setup::seam::{BasePaths, CommandRunner, Env, SystemRunner};
-use punktfunk_setup::ui::Plain;
+use punktfunk_setup::ui::logo;
+use punktfunk_setup::ui::summary::{Screen, Step};
+use punktfunk_setup::ui::term::{ConsoleTerm, Terminal};
+use punktfunk_setup::ui::theme::Caps;
+use punktfunk_setup::ui::tui::Tui;
+use punktfunk_setup::ui::{Plain, Reporter};
+
+/// Long enough that a demo step reads as work happening, short enough to sit through.
+const DEMO_LATENCY_MS: u64 = 140;
+
+/// The mark needs a width to decide whether it fits; 80 is the safe assumption when the
+/// terminal will not say.
+fn terminal_width() -> u16 {
+    ConsoleTerm::open().map_or(80, |t| t.width())
+}
 
 const USAGE: &str = r#"punktfunk guided installer (preview)
 
@@ -54,6 +68,7 @@ struct Cli {
     dry: bool,
     facts_file: Option<PathBuf>,
     demo: Option<String>,
+    fail: Option<String>,
 }
 
 fn env_flag(env: &Env, key: &str) -> Option<bool> {
@@ -82,6 +97,7 @@ fn parse(args: Vec<String>, env: &Env) -> Result<Cli, (u8, String)> {
         dry: env.get("PUNKTFUNK_INSTALL_DRY_RUN") == Some("1"),
         facts_file: None,
         demo: None,
+        fail: None,
     };
     if env.get("PUNKTFUNK_INSTALL_CHANNEL").is_some() && cli.pins.channel.is_none() {
         return Err((BAD_USAGE, "--channel must be stable or canary".into()));
@@ -127,9 +143,7 @@ fn parse(args: Vec<String>, env: &Env) -> Result<Cli, (u8, String)> {
             "--dry-run" => cli.dry = true,
             "--facts" => cli.facts_file = value().map(PathBuf::from),
             "--demo" => cli.demo = value(),
-            "--fail" => {
-                let _ = value();
-            }
+            "--fail" => cli.fail = value(),
             "-h" | "--help" => return Err((0, USAGE.to_string())),
             other => {
                 return Err((BAD_USAGE, format!("unknown option: {other}\n\n{USAGE}")));
@@ -163,9 +177,14 @@ fn main() -> ExitCode {
         .write(true)
         .open("/dev/tty")
         .is_ok();
+    let demo = cli.demo.clone();
     let yes = cli.yes || !tty;
-    let ui = Plain::stdio(env.get("NO_COLOR").is_none());
-    let paths = BasePaths::from_env();
+    let plain = Plain::stdio(env.get("NO_COLOR").is_none());
+    let paths = match &demo {
+        Some(_) => punktfunk_setup::demo::sandbox_paths(),
+        None => BasePaths::from_env(),
+    };
+    let caps = Caps::detect(&env, tty, terminal_width());
 
     let mut runner = SystemRunner::new();
     let user = env
@@ -175,31 +194,61 @@ fn main() -> ExitCode {
         .unwrap_or_default();
     runner.exports.push(("USER".to_string(), user));
 
-    report::banner(&ui);
-    if let Err(msg) = preflight(&env, &paths, &mut runner) {
-        ui.die(&msg);
-        return ExitCode::FAILURE;
-    }
-
-    let facts = match load_facts(&cli, &paths, &runner, &env) {
-        Ok(facts) => facts,
-        Err(msg) => {
-            ui.die(&msg);
+    // A demo box is canned, so none of the preflight applies — and nothing may be probed.
+    let facts = if let Some(name) = &demo {
+        match punktfunk_setup::demo::preset(name) {
+            Some(facts) => facts,
+            None => {
+                plain.die(&format!(
+                    "unknown --demo preset '{name}'. Try: {}",
+                    punktfunk_setup::demo::PRESETS.join(", ")
+                ));
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        if let Err(msg) = preflight(&env, &paths, &mut runner) {
+            report::banner(&plain);
+            plain.die(&msg);
             return ExitCode::FAILURE;
         }
+        match load_facts(&cli, &paths, &runner, &env) {
+            Ok(facts) => facts,
+            Err(msg) => {
+                report::banner(&plain);
+                plain.die(&msg);
+                return ExitCode::FAILURE;
+            }
+        }
     };
-    if cli.demo.is_some() {
-        ui.die("--demo arrives with the TUI (M2); nothing was changed");
-        return ExitCode::FAILURE;
-    }
-    report::detected(&ui, &facts);
 
-    let choices = Choices::derive(&facts, &cli.pins);
-    let opts = Opts {
+    // The TUI is the interactive surface only. No terminal or --yes stays on today's output,
+    // byte for byte, which is what CI containers and scripts already depend on.
+    let interactive = tty && !yes;
+    let mut console = if interactive {
+        ConsoleTerm::open()
+    } else {
+        None
+    };
+    let tui = console
+        .as_mut()
+        .map(|term| Tui::new(term as &mut dyn Terminal, caps, logo::FRAME_MS));
+    let ui: &dyn Reporter = match &tui {
+        Some(tui) => tui,
+        None => &plain,
+    };
+
+    let mut choices = Choices::derive(&facts, &cli.pins);
+    let mut opts = Opts {
         dry: cli.dry,
         yes,
         tty,
     };
+
+    if tui.is_none() {
+        report::banner(ui);
+        report::detected(ui, &facts);
+    }
 
     // The floors sit after the uninstall dispatch on purpose: a box below them must still be
     // able to clean itself up.
@@ -213,19 +262,49 @@ fn main() -> ExitCode {
             }
             Floor::Confirm(msg) => {
                 ui.warn(msg);
-                if !ask(&ui, tty && !yes, "Continue anyway?") {
+                if !ask(interactive, "Continue anyway?") {
                     return ExitCode::FAILURE;
                 }
             }
         }
     }
 
-    report::choices_summary(&ui, &choices);
+    if let Some(tui) = &tui {
+        tui.intro(logo::intro_level(&caps, yes));
+        let mut screen = Screen::new(facts.clone(), choices.clone());
+        match tui.settings(&mut screen) {
+            Step::Cancel => {
+                tui.outro(&["Nothing was changed.".to_string()]);
+                return ExitCode::SUCCESS;
+            }
+            Step::DryRun => opts.dry = true,
+            Step::Run(action) => choices.action = action,
+            Step::Idle | Step::Edit(_) => unreachable!("the settings loop only ends on a choice"),
+        }
+        // Every edit the user made lives on the screen, not in the pins.
+        let action = choices.action;
+        choices = screen.choices;
+        choices.action = action;
+    } else {
+        report::choices_summary(ui, &choices);
+    }
+
     let plan = plan::build(&facts, &choices);
+    let demo_runner = demo.as_ref().map(|_| {
+        let at = cli
+            .fail
+            .as_deref()
+            .and_then(|phase| punktfunk_setup::demo::fail_index(&plan, phase));
+        punktfunk_setup::demo::DemoRunner::new(DEMO_LATENCY_MS, at)
+    });
+    let run: &dyn CommandRunner = match &demo_runner {
+        Some(demo) => demo,
+        None => &runner,
+    };
     let exec = Executor {
         paths: &paths,
-        run: &runner,
-        ui: &ui,
+        run,
+        ui,
         opts,
     };
     let outcome = match exec.execute(&plan, &facts, &choices) {
@@ -237,12 +316,12 @@ fn main() -> ExitCode {
     };
 
     if choices.action == Action::Uninstall {
-        report::uninstall_outro(&ui);
+        report::uninstall_outro(ui);
         return ExitCode::SUCCESS;
     }
     // `punktfunk-omarchy setup` did the wiring and prints its own outro.
     if !outcome.ended_early {
-        report::verify(&ui, &runner, &facts, &choices, &outcome, opts);
+        report::verify(ui, run, &facts, &choices, &outcome, opts);
     }
     ExitCode::SUCCESS
 }
@@ -307,7 +386,7 @@ fn load_facts(
 
 /// The sh installer's `ask`, with the default behind Enter. Without a terminal the default
 /// stands — which is why a version-floor confirm defaulting to *no* aborts under `--yes`.
-fn ask(ui: &Plain, interactive: bool, question: &str) -> bool {
+fn ask(interactive: bool, question: &str) -> bool {
     if !interactive {
         return false;
     }
@@ -331,7 +410,7 @@ fn ask(ui: &Plain, interactive: bool, question: &str) -> bool {
     {
         return false;
     }
-    let _ = ui;
+
     matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
 }
 

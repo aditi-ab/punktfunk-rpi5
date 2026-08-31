@@ -12,9 +12,9 @@ use crate::choices::{Action, Choices};
 use crate::exec::{Opts, Outcome};
 use crate::facts::{Facts, Family, Nvidia, DOCS};
 use crate::seam::CommandRunner;
-use crate::ui::Plain;
+use crate::ui::Reporter;
 
-pub fn banner(ui: &Plain) {
+pub fn banner(ui: &dyn Reporter) {
     ui.blank();
     ui.line("  punktfunk guided host installer — PREVIEW");
     ui.line(&format!(
@@ -24,7 +24,7 @@ pub fn banner(ui: &Plain) {
     ui.blank();
 }
 
-pub fn detected(ui: &Plain, facts: &Facts) {
+pub fn detected(ui: &dyn Reporter, facts: &Facts) {
     ui.say(&format!(
         "Detected {} → {} (guide: {})",
         facts.os.pretty,
@@ -34,7 +34,7 @@ pub fn detected(ui: &Plain, facts: &Facts) {
 }
 
 /// Nothing here has run yet — this is the last screen before anything touches the box.
-pub fn choices_summary(ui: &Plain, choices: &Choices) {
+pub fn choices_summary(ui: &dyn Reporter, choices: &Choices) {
     if choices.action == Action::Uninstall {
         return;
     }
@@ -67,7 +67,7 @@ pub fn choices_summary(ui: &Plain, choices: &Choices) {
 }
 
 /// What `--uninstall` deliberately left behind, so a reinstall picks it up.
-pub fn uninstall_outro(ui: &Plain) {
+pub fn uninstall_outro(ui: &dyn Reporter) {
     ui.blank();
     ui.line("  Removed. Left on purpose: ~/.config/punktfunk (identity, pairings, host.env, plugins — a reinstall");
     ui.line("  picks them up), the punktfunk / punktfunk-update groups, and any firewall rules you opened.");
@@ -77,7 +77,7 @@ pub fn uninstall_outro(ui: &Plain) {
 }
 
 pub fn verify(
-    ui: &Plain,
+    ui: &dyn Reporter,
     run: &dyn CommandRunner,
     facts: &Facts,
     choices: &Choices,
@@ -117,7 +117,7 @@ pub fn verify(
 
 /// GPU drivers are the docs pages' job — but these two failures are silent, and the install
 /// having succeeded is exactly what makes them worth saying out loud.
-fn nvidia_warnings(ui: &Plain, facts: &Facts) {
+fn nvidia_warnings(ui: &dyn Reporter, facts: &Facts) {
     match facts.nvidia {
         Nvidia::Absent => return,
         Nvidia::NoDriver => ui.warn(&format!(
@@ -138,7 +138,7 @@ fn nvidia_warnings(ui: &Plain, facts: &Facts) {
     }
 }
 
-fn next_steps(ui: &Plain, facts: &Facts, choices: &Choices, outcome: &Outcome, opts: Opts) {
+fn next_steps(ui: &dyn Reporter, facts: &Facts, choices: &Choices, outcome: &Outcome, opts: Opts) {
     let ip = facts.ip.clone().unwrap_or_else(|| "<host-ip>".to_string());
     ui.blank();
     ui.line("  Done. Next:");

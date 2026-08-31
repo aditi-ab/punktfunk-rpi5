@@ -68,43 +68,43 @@ impl Plain {
             mark.to_string()
         }
     }
+}
 
-    pub fn say(&self, msg: &str) {
+impl crate::ui::Reporter for Plain {
+    fn say(&self, msg: &str) {
         let tag = self.tag("36", "==>");
         self.emit(false, &format!("{tag} {msg}"));
     }
 
-    pub fn ok(&self, msg: &str) {
+    fn ok(&self, msg: &str) {
         let tag = self.tag("32", "  ok");
         self.emit(false, &format!("{tag} {msg}"));
     }
 
-    pub fn warn(&self, msg: &str) {
+    fn warn(&self, msg: &str) {
         let tag = self.tag("33", "  !!");
         self.emit(true, &format!("{tag} {msg}"));
     }
 
-    pub fn die(&self, msg: &str) {
+    fn die(&self, msg: &str) {
         let tag = self.tag("31", "  xx");
         self.emit(true, &format!("{tag} {msg}"));
     }
 
-    /// The dim command echo. Every command prints before it runs — that transparency is a
-    /// trust feature and the terminal scrollback is the audit log.
-    pub fn plus(&self, cmd: &str) {
+    fn plus(&self, cmd: &str) {
         self.emit(false, &format!("  + {cmd}"));
     }
 
     /// Continuation text under a step, indented to line up with the `ok` column.
-    pub fn detail(&self, msg: &str) {
+    fn detail(&self, msg: &str) {
         self.emit(false, &format!("     {msg}"));
     }
 
-    pub fn blank(&self) {
+    fn blank(&self) {
         self.emit(false, "");
     }
 
-    pub fn line(&self, msg: &str) {
+    fn line(&self, msg: &str) {
         self.emit(false, msg);
     }
 }
