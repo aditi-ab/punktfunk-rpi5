@@ -117,7 +117,8 @@ run() {
             -e 's/^sudo dnf distro-sync /sudo dnf distro-sync -y /' \
             -e 's/^sudo apt purge /sudo apt purge -y /' \
             -e 's/^sudo dnf remove /sudo dnf remove -y /' \
-            -e 's/^sudo pacman -Rns /sudo pacman -Rns --noconfirm /')
+            -e 's/^sudo pacman -Rns /sudo pacman -Rns --noconfirm /' \
+            -e 's/^sudo pacman -Rdd /sudo pacman -Rdd --noconfirm /')
     fi
     printf '  + %s\n' "$cmd"
     [ "$DRY" = 1 ] && return 0
@@ -529,19 +530,25 @@ if [ "$SWITCH" = 1 ]; then
                 # older than what is on the box (pacman calls it out as a downgrade), while `-Syu`
                 # would look at a lower stable version and do nothing at all.
                 run 'sudo pacman -Sy'
-                # Same contract as apt above: a package the target channel does not carry keeps
-                # what it has. Naming it anyway aborts the WHOLE transaction ("target not found") —
-                # punktfunk-icons exists only where the icon split has shipped, so every
-                # canary→stable switch died on it until the next stable release. In --dry-run no
-                # repo is configured, so the unfiltered set stands in.
-                want=
+                # A package the target channel does not carry can neither be NAMED (the whole
+                # transaction aborts, "target not found") nor KEPT: its files collide with what
+                # the channel's own packages ship — punktfunk-icons owns the brand SVG that the
+                # pre-split stable host carries itself, and the smoke measured BOTH failures in
+                # turn. So a switch lands the box on exactly what the target channel offers and
+                # removes what it does not, saying so. -Rdd, not -R: the packages that depend on
+                # the leaving one are replaced by the very next -S, and a dependency check
+                # against the outgoing set would refuse the removal that makes room for it.
+                # In --dry-run no repo is configured, so the unfiltered set stands in.
+                want=; drop=
                 for pkg in $(switch_pkgs punktfunk-host punktfunk-web punktfunk-scripting); do
                     if [ "$DRY" = 1 ] || pacman -Si "$pkg" >/dev/null 2>&1; then
                         want="$want $pkg"
                     else
-                        warn "$pkg is not on the $CHANNEL channel — keeping the installed version"
+                        warn "$pkg is not on the $CHANNEL channel — removing it (the $CHANNEL packages carry its files)"
+                        drop="$drop $pkg"
                     fi
                 done
+                [ -n "$drop" ] && run "sudo pacman -Rdd$drop"
                 run "sudo pacman -S$want"
                 ;;
             dnf)
