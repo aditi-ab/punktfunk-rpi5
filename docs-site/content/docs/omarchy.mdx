@@ -85,6 +85,34 @@ punktfunk-host ctl approve 1
 
 See [the ctl reference](/docs/host-cli#ctl) for the full verb list.
 
+## The client on Omarchy
+
+The other direction — this box as the **screen**, streaming from a host elsewhere — is just as
+integrated, and needs none of the host setup above:
+
+```sh
+sudo pacman -S punktfunk-client
+```
+
+**The theme follows you automatically.** The client reads the active theme's own `colors.toml`
+(no template, no registration), so the app, and the couch console with it, wear your colours and
+track `omarchy-theme-set` live. Two switches turn it off if you'd rather keep Punktfunk's look:
+**Follow the Omarchy theme** in the app's preferences, and **Follow system theme** in the
+console's Interface settings. Both exist only on Omarchy.
+
+**Your hosts in the menu (`Super`+`Space`).** Opt in once —
+
+```sh
+punktfunk-client --omarchy-menu on     # or flip "Hosts in the Omarchy menu" in preferences
+```
+
+— and Punktfunk becomes a submenu: one **connect row per saved host** (type the host's name in
+the menu's search and press enter to stream), a **wake row** where a MAC is known, **Open
+Punktfunk** and the **Game console**. The rows follow your saved hosts from then on: pairing or
+forgetting a host anywhere — the app, the couch console, the CLI — rewrites them.
+`--omarchy-menu off` removes exactly Punktfunk's block and leaves the rest of your
+`omarchy-menu.jsonc` alone.
+
 ## Autostart and your session
 
 Omarchy offers **two** Hyprland entries at the login screen, and they differ in a way that matters
