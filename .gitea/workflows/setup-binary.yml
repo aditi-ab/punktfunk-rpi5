@@ -85,6 +85,29 @@ jobs:
             punktfunk-setup_${{ matrix.arch }}
             punktfunk-setup_${{ matrix.arch }}.sha256
 
+  # The only job that touches the PUBLISHED binary. Everything else builds from the tree, on
+  # purpose — the smoke must exercise the checked-out code. This asks the other question: does
+  # the thing a user actually reaches still work? A red here means the distribution channel is
+  # broken (a bad upload, a missing alias, a stale checksum), not that the code is.
+  probe:
+    name: probe the published channel
+    needs: publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:trixie
+    timeout-minutes: 10
+    steps:
+      - name: Prepare the container
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # No PUNKTFUNK_SETUP_BIN: the stub downloads `latest` and verifies its checksum, exactly
+      # as it does on a user's box. --dry-run so nothing is installed.
+      - name: The stub fetches the published binary and runs it
+        run: |
+          sh scripts/install.sh --dry-run --yes \
+            | grep -q 'sudo apt install -y punktfunk-host punktfunk-web punktfunk-scripting'
+
   publish:
     name: publish to the generic registry
     needs: build
