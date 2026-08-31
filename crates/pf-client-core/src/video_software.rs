@@ -1,90 +1,20 @@
-//! The CPU rung — the ladder's LAST one, and (M8) the first one with no FFmpeg in it.
+//! CPU fallback and final decoder-ladder rung, with no FFmpeg dependency.
+//! H.264 uses openh264 and AV1 uses rav1d; HEVC has no permissively licensed software
+//! decoder and is rejected with [`NoSoftwareRung`]. Both implemented codecs accept only
+//! 8-bit 4:2:0, checked from in-band headers before decode so unsupported shape changes
+//! also become typed refusals. [`crate::video::last_rung_verdict`] converts those refusals
+//! into a reconnect that advertises usable codec capabilities.
 //!
-//! * **H.264 → openh264** (BSD-2). Already a workspace dependency: the host's GPU-less
-//!   encoder is the same library ([`pf-encode`'s `enc/sw.rs`]), so the licence posture and
-//!   the statically-bundled build were settled before this rung existed.
-//! * **AV1 → rav1d** (BSD-2) — dav1d, ported to Rust. Picking it over the `dav1d` FFI
-//!   crate is a packaging decision, argued in `Cargo.toml`; picking it over *nothing* is
-//!   the plan's ("dav1d SW is the safety net"). Two properties come free with it:
-//!   there is no `avcodec_find_decoder(AV1)` to hand us libdav1d behind a
-//!   `hw_device_ctx` it silently ignores, and no C decoder in the process at all.
-//! * **HEVC → dropped.** No permissively licensed software HEVC decoder exists (libde265
-//!   is LGPL, which defeats the point of the excision). This rung REFUSES an HEVC
-//!   session with a typed [`NoSoftwareRung`], which is what the session layer turns into
-//!   a reconnect that advertises HEVC-less decode caps — see
-//!   [`crate::video::last_rung_verdict`]. Narrowing instead (limping on at 5 fps, or
-//!   freezing) is the failure mode this whole program exists to end.
+//! Output is an owned, tightly packed I420 [`CpuPlanarFrame`]; the presenter performs CSC.
+//! H.264 colour, crop, keyframe, and recovery-point SEI metadata come from [`H264Planner`]
+//! and [`RecoveryWatch`], matching the native planners rather than decoder-specific metadata.
+//! openh264 is single-threaded; rav1d uses available worker cores and [`Av1Software::new`]
+//! enforces at least two frame contexts so malformed input returns an error instead of aborting.
 //!
-//! **Output is PLANES, not RGBA.** The decoder hands the presenter tightly-packed I420
-//! and the presenter's existing planar CSC shader does the colour, which deletes two
-//! things at once: swscale's per-frame YUV→RGBA pass, and swscale's BT.601 default —
-//! the footgun the old `convert_rgba` carried ~30 lines of correction code for.
-//!
-//! **Colour comes from pf-bitstream, not from the decoder.** openh264 reports no VUI at
-//! all and rav1d reports its own sequence header, so a rung that trusted its decoder
-//! would have two colour implementations to keep in step with the four hardware rungs'
-//! one. Instead the H.264 leg plans every AU with [`H264Planner`] — the SAME planner
-//! `pf-vkdecode`/`pf-dxvadec`/`pf-vaadec` submit from — and reads
-//! `plan.picture.colour`. The signalled matrix/range therefore cannot differ between the
-//! software rung and the hardware rungs, because it is literally the same code reading
-//! the same SPS. The H.264 leg takes the recovery point SEI from the same plan, through
-//! `pf-vkdecode`'s own [`RecoveryWatch`], so an intra-refresh session re-anchors here on
-//! the same rule the native rung uses.
-//!
-//! **The picture envelope is checked BEFORE the decoder sees the AU, on both legs.**
-//! 8-bit 4:2:0 only: openh264 has no wider support at all and rav1d is compiled
-//! `bitdepth_8` here. H.264 reads it off the SPS the planner activated; AV1 reads it off
-//! the sequence header with `dav1d_parse_sequence_header`. Both raise the SAME typed
-//! [`NoSoftwareRung`] so the session reconnects. Letting the DECODER answer instead is
-//! what the M8 review caught: rav1d refuses a 10-bit frame with `ENOPROTOOPT`, the pump
-//! reads a generic error as survivable, and a Main 10 HDR stream — which is what hardware
-//! AV1 sessions are — freezes forever, one keyframe request per identical AU.
-//!
-//! Threading: openh264's `num_threads` is documented upstream as "will probably just
-//! segfault", so this stays single-threaded — the old libavcodec rung's slice threading has
-//! no equivalent here. rav1d gets the machine's cores, and **at least two frame contexts**;
-//! [`Av1Software::new`] carries the whole argument, because "at least two" is not a
-//! performance choice but the difference between an error and `abort()`.
-//!
-//! # Why this rung is NOT process-isolated
-//!
-//! The frame-context floor closes the one abort we hit and can prove. It does not make the
-//! rung panic-proof, and nothing at this call site can: rav1d exposes dav1d's C ABI, every
-//! internal `rav1d_*` entry point is `pub(crate)`, so any reachable panic crosses
-//! `extern "C"` as `panic_cannot_unwind` → `abort()`. No `catch_unwind`, no rung demotion
-//! and no [`NoSoftwareRung`] refusal can contain it. Counted in rav1d 1.1.0's 60 source
-//! files: 285 `unwrap()`, 214 `assert!`, 19 `unreachable!`, 11 `expect()`, 10 `panic!` —
-//! 539 sites that are an `abort()` if a stream can reach them. #97 fixed ONE.
-//!
-//! Isolating the decoder in its own process is the only defence that actually works, and
-//! it is deliberately NOT taken. The decision, so it is not re-litigated from scratch:
-//!
-//! * **The defect is a dependency's, and it is one line.** memorysafety/rav1d#1497 was
-//!   filed 2026-08-07 with the fix (`is_some_and` for the `unwrap`) and a reproducer.
-//!   Paying a permanent architectural tax to route around a bug that costs upstream one
-//!   line is the wrong trade while that line is still plausibly coming.
-//! * **The residual risk is real but unquantified.** 539 panic sites is a scary number
-//!   and a meaningless one: not one of them is known to be reachable from a punktfunk
-//!   stream. The honest next step is to MEASURE reachability — fuzz this rung with
-//!   truncated, reordered and bit-flipped AUs and see whether any input aborts — not to
-//!   buy insurance against a number nobody has bounded. That is cheap; this is not.
-//! * **The cost lands on the video path, and on three platforms.** pf-client-core builds
-//!   into the Linux, Windows and Android clients (the Apple clients decode through
-//!   VideoToolbox and never reach here). Each needs its own shared-memory transport for
-//!   `CpuPlanarFrame`s, its own child lifecycle, crash detection and restart, and its own
-//!   backpressure — and it adds a scheduling boundary to the rung that is ALREADY the
-//!   slowest one on the ladder. Zero-copy is a hard requirement here; an IPC hop that
-//!   copies frames would be rejected on its own terms.
-//! * **What an abort actually costs is bounded.** This rung is reached because the GPU
-//!   rungs already failed, so the session is degraded before rav1d sees a byte. Losing
-//!   the process loses a session the user was going to have a bad time in regardless.
-//!   That is bad, and it is not the same as losing a working session.
-//!
-//! **Revisit when the calculus changes, which is a specific event, not a feeling:** a
-//! SECOND distinct abort observed in the field, or a fuzzer finding a reachable panic.
-//! Either turns this from one upstream bug into a class of them, and a class is what
-//! justifies isolation. Until then the floor plus the upstream fix is the proportionate
-//! answer, and the fuzzing is the work that would tell us we were wrong.
+//! Decoder contexts are exclusively owned and used serially (`Send`, not `Sync`). [`Av1Data`]
+//! owns each copied AU until rav1d consumes or releases it, and decoder output is copied before
+//! the next call. Ordinary decode errors remain recoverable keyframe requests; only
+//! [`NoSoftwareRung`] ends this rung and triggers codec-capability fallback.
 
 use crate::video::{CpuPlanarFrame, RungLoss};
 use crate::video_color::ColorDesc;

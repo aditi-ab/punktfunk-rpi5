@@ -1,32 +1,11 @@
-//! What a provider plugin **says** is running — the one liveness signal the host cannot work out
-//! for itself.
+//! Live game-liveness reports supplied by provider plugins when process scanning cannot infer
+//! the answer reliably.
 //!
-//! [`crate::procscan`] answers "is this game running" by looking at the process table, and
-//! [`crate::gamelease`] turns that into a session lifetime. That works because most stores leave
-//! something recognizable behind: an install directory, an executable, a Steam reaper. Some do not,
-//! and one store in particular *already knows the answer*: Playnite starts the game itself, tracks
-//! it with the mode the person configured (process, directory, original-process), and fires an
-//! event on both edges — carrying the pid it started. Every bit of that was being thrown away, and
-//! the host was left re-deriving a worse version of it by scanning.
-//!
-//! So this is the inbound half of [`crate::library::DetectHint`]. That one is *static* ("here is
-//! how to recognize my title's process"); this one is *live* ("that title is running right now, and
-//! here is its pid"). A provider PUTs its full running set; the host keeps it here; the lease
-//! watcher consults it.
-//!
-//! ### Why the whole set, and why a TTL
-//!
-//! The wire is declarative — the same shape as the library reconcile, for the same reason. A
-//! provider that missed an event, restarted, or was installed mid-game converges on its next PUT
-//! instead of drifting forever; there is no per-event delta to lose.
-//!
-//! And a report **expires**. A plugin that dies with a game running would otherwise leave a claim
-//! that is true today and a lie tomorrow — and unlike Steam's registry flag (which
-//! [`crate::procscan::running_hint`] must treat as merely a bounded veto because Steam leaves it
-//! set on any unclean exit) this claim is allowed to *keep a session alive on its own*. That is
-//! only safe while something is actively restating it, so a report older than [`REPORT_TTL`] stops
-//! counting and the host falls back to scanning, exactly as it does today. The provider's side of
-//! that bargain is to re-PUT well inside the window while anything is running.
+//! A provider PUTs its complete running set, including a pid when known. Whole-set replacement
+//! makes missed events and restarts converge on the next update. Reports expire after
+//! [`REPORT_TTL`] so a dead plugin cannot keep a session alive indefinitely; expired entries fall
+//! back to [`crate::procscan`]. This complements the static recognition hints in
+//! [`crate::library::DetectHint`].
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard, OnceLock};

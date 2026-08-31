@@ -1,89 +1,21 @@
-//! [`VkAv1Decoder`]: the assembled native AV1 decoder — [`crate::decoder_h265`]
-//! one codec over, over pf-bitstream's AV1 planner and M7's CPU half.
+//! Native AV1 Vulkan Video decode over the `pf_bitstream` AV1 planner.
 //!
-//! Per access unit: `plan_au` → (per frame) `plan_to_vk_av1` → tile OBUs into the
-//! bitstream ring → record (barriers, `vkCmdBeginVideoCodingKHR` with every bound
-//! DPB slot, the one-time session RESET control, a caps-gated
-//! `RESULT_STATUS_ONLY` query bracketing `vkCmdDecodeVideoKHR`) → submit on the
-//! decode queue under the caller's [`QueueLock`] with a per-image timeline signal.
-//!
-//! Everything codec-agnostic is SHARED with the other two decoders rather than
-//! re-implemented: the picture pool and its zero-copy hand-off contract
-//! ([`crate::images`]), the bitstream ring, the op ring (command buffers + status
-//! queries), the pending/ready/graveyard bookkeeping, `build_frame` and the DPB
-//! settle (`settle_dpb_ids`, split off `settle_dpb` precisely so AV1's own
-//! `DpbUpdate` type can share it). What is genuinely AV1's own lives here:
-//!
-//! - **One access unit is a TEMPORAL UNIT, and may carry several frames.**
-//!   `Av1Planner::plan_au` returns a VECTOR — the vendored 250-packet vector holds
-//!   274 frames, the extras being hidden ALTREFs. Every plan is decoded, in order;
-//!   the frames they make ready queue up and `decode` hands back the first.
-//! - **A `show_existing_frame` plan decodes nothing.** It has `dpb.stored == None`
-//!   and displays `dpb.outputs` — a picture an earlier, hidden frame decoded. It
-//!   is settled like any other DPB verdict and never reaches a submission.
-//! - **`referenceNameSlotIndices` holds DPB SLOT indices, not positions in
-//!   `pReferenceSlots`.** The two coincide for as long as references happen to land
-//!   in slots `0..refs.len()` in `refs` order, which on a freshly keyed stream they
-//!   do — and that is exactly how the HEVC RPS defect shipped. The plan computes
-//!   slots ([`DecodePlanVkAv1::reference_name_slot_indices`]); this module lays
-//!   `pReferenceSlots` out in [`DecodePlanVkAv1::refs`] order INDEPENDENTLY, and
-//!   [`build_scope_av1`] fails closed when the two disagree about a slot the op
-//!   binds.
-//! - **A DPB slot this frame READS may not be recycled until its decode op is
-//!   recorded.** `refresh_frame_flags` applies AFTER the frame decodes (7.20), so
-//!   almost every inter frame of a low-delay stream overwrites a slot it is
-//!   reading — 268 of the vendored vector's 274 frames. Releasing that slot inside
-//!   the conversion, which is what H.264 and H.265 do with their whole `removed`
-//!   list, gives it to this frame's own decode target: the reference then names
-//!   the slot being written. [`DecodePlanVkAv1::release_after_decode`] carries
-//!   those ids and this module releases them after the submission.
-//! - **A lost reference is fatal, not degraded.** `AuPlan::refs` is indexed by
-//!   reference NAME and a lost reference leaves a HOLE there, so nothing is
-//!   renumbered and the conversion could in principle write
-//!   [`REFERENCE_NAME_UNUSED`] for it and carry on. It does not: `-1` for a name
-//!   the frame DOES reference is a spec violation, and what a driver's firmware
-//!   then predicts from is undefined. The AU is refused
-//!   ([`VkDecodeError::MissingReferenceAv1`], predicate [`lost_reference`]),
-//!   recovery is latched and the stream re-anchors on the next key frame. Since
-//!   the plan became name-indexed this is defence in depth rather than the only
-//!   guard.
-//! - **Tiles, not slices.** `VkVideoDecodeAV1PictureInfoKHR` wants a per-TILE
-//!   offset and size into the uploaded buffer, and the plan carries whole
-//!   tile-group (or frame) OBUs. [`plan_bitstream`] walks each OBU's tile-group
-//!   header and per-tile size fields to recover the tile payloads, and it is those
-//!   payloads — nothing else — that go into the ring slot
-//!   ([`crate::ring::pack_av1_tiles`]).
-//!
-//! Codec dispatch (which decoder a stream gets) is the client wiring's job, not
-//! this crate's: the public surface here mirrors [`crate::VkH265Decoder`]
-//! method-for-method so the dispatch is a three-arm enum.
-//!
-//! # What the bitstream buffer contains
-//!
-//! Exactly the raw tile payloads, concatenated, with `frameHeaderOffset` at 0 —
-//! libavcodec's `vulkan_av1.c` layout, byte for byte. Nothing else goes in: no OBU
-//! headers, no frame header, none of the `tile_size_minus_1` fields between tiles.
-//!
-//! That is a deliberate choice over the spec-literal alternative (upload the whole
-//! tile-group/frame OBUs, point `frameHeaderOffset` at the real frame header). The
-//! spec-literal layout is not WRONG — the per-tile offsets and sizes are the part a
-//! driver indexes by and they are identical either way, AV1 has no start-code
-//! scanning to be confused by the extra bytes, and `frameHeaderOffset` is read by
-//! no driver in this fleet (every one of them takes the whole frame header out of
-//! `pStdPictureInfo`). But libavcodec is the implementation every driver was
-//! validated against, so matching it removes the residual risk on the drivers
-//! nobody here has tested, uploads fewer bytes per frame, and deletes the rebase
-//! arithmetic that mapping in-OBU tile offsets to packed-buffer offsets needed.
-//!
-//! # `pTileOffsets` / `pTileSizes` are sized to the driver's read, not to tileCount
-//!
-//! ⚠ RADV reads `AV1_MAX_NUM_TILES` (256) entries out of both arrays
-//! unconditionally — `radv_video.c`'s `for (i = 0; i < AV1_MAX_NUM_TILES; ++i)` —
-//! and never looks at `tileCount`. libavcodec gets away with it because its
-//! `tile_sizes` is a static `uint32_t[256]`. A `Vec` sized to the real tile count
-//! (one, for every frame of the vendored vector) is a four-byte allocation the
-//! driver reads a kilobyte deep. So both arrays are always 256 entries with the
-//! tail zeroed, and `tileCount` is set separately — see [`SubmittedTiles`].
+//! A temporal-unit access unit may produce multiple frame plans; all are processed
+//! in order. `show_existing_frame` settles DPB/output state without GPU submission.
+//! Decode submissions run under [`QueueLock`], signal the target image timeline,
+//! and keep command, query, upload, and image resources alive through completion.
+//! `referenceNameSlotIndices` contains actual DPB slot indices, independent of
+//! `pReferenceSlots` array positions; inconsistent bindings fail closed.
+//! Per AV1 §7.20, slots read by a frame cannot be recycled for its target before
+//! that decode is recorded; [`DecodePlanVkAv1::release_after_decode`] delays them.
+//! A referenced name with no image is fatal, latches recovery, and waits for the
+//! next key frame rather than submitting [`REFERENCE_NAME_UNUSED`].
+//! [`plan_bitstream`] uploads only concatenated raw tile payloads, with no OBU or
+//! frame headers or tile-size fields, and sets `frameHeaderOffset` to zero to match
+//! FFmpeg's `vulkan_av1.c` layout.
+//! `pTileOffsets` and `pTileSizes` must each own 256 zero-tailed entries for the
+//! driver's full read (not merely `tileCount`), while `tileCount` remains exact.
+//! Result-status queries are used only when the queue-family capability permits.
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;

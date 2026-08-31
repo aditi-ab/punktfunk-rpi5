@@ -1,76 +1,16 @@
-//! Android audio playback (android-only): pull audio packets from the connector, decode to
-//! interleaved f32 (stereo or 5.1/7.1 surround), and feed AAudio via its realtime data callback
-//! through a jitter ring. Mirrors [`crate::decode`]: one thread we own (the decode producer)
-//! plus a shutdown flag; the realtime callback thread is owned by AAudio.
+//! Android audio playback: decode the negotiated Opus (`0xC9`) or lossless PCM (`0xD3`)
+//! plane to interleaved f32 and feed AAudio through a jitter ring.
 //!
-//! **Two planes, one pipeline.** A session runs Opus on `0xC9` (48 kHz, 5 ms frames — what every
-//! host has always spoken) **or** lossless PCM on `0xD3` at the negotiated rate and depth
-//! (`design/hi-res-audio.md`), never both, and which one is a session-wide fact settled in the
-//! handshake — [`punktfunk_core::client::NativeClient::audio_codec`] — not a per-packet one.
-//! Everything below reads it once through [`SessionAudio`]. The two planes share the jitter ring,
-//! the A/V sync loop and the gap tracker *unchanged*, because they share a datagram header; only
-//! the payload decode differs, and the concealment — a lossless format has no PLC to borrow
-//! (§4.5), so [`punktfunk_core::audio::pcm::PcmConceal`] stands in for libopus's.
+//! [`SessionAudio`] fixes rate, depth, frame size, and the host-resolved stereo/5.1/7.1
+//! layout for the session. [`open_ladder`] tries viable AAudio modes at that exact rate,
+//! [`arm`] verifies that callbacks start, and [`supervise`] reopens disconnected devices.
+//! Unsupported rates are rejected before `Hello` by [`output_rate_is_openable`]; playback
+//! never silently resamples negotiated audio.
 //!
-//! **The device is not assumed to work.** Opening AAudio is a negotiation with a vendor HAL, and
-//! this plane used to treat it as a formality: one Exclusive attempt, one Shared retry, and from
-//! there everything was taken on trust. Three separate failures all came out as "the app has no
-//! sound" with a perfectly healthy log — a configuration that opens but never routes, a
-//! `request_start` that fails, and a disconnect (which by AAudio's contract kills the stream for
-//! good and is not rare on a TV, where an HDMI mode switch is a routine event this very client
-//! provokes). So the open now walks a LADDER ([`open_ladder`]), every rung has to prove the device
-//! is really pulling before it is accepted ([`arm`]), and a supervisor owns the whole plane for the
-//! session and reopens it when the device goes away ([`supervise`]). `debug.punktfunk.audio_sharing`
-//! / `audio_perf` / `audio_reopen` pin any of it from `adb shell setprop`, for the device that
-//! reports silence and cannot be handed a custom build.
-//!
-//! **The ladder's rate dimension.** Every rung used to ask for 48 kHz, so rejecting a stream whose
-//! GRANTED rate differed was free. With a negotiated rate it is not: a device that will not grant
-//! the session's rate would fail every rung and the supervisor would disable audio for the whole
-//! session, which is the one outcome the design calls unacceptable. So the rung carries the rate it
-//! asked for, [`arm`] compares against THAT rather than a constant, and the ladder ends with a rung
-//! that asks for nothing at all (AAudio's own choice) for the HAL that refuses an explicit request
-//! but is natively at the rate we wanted. What the ladder deliberately does NOT contain is a rung
-//! at any OTHER rate: opening one would mean either playing the wire at the wrong speed or
-//! resampling it behind the user's back, and §9's rule is "say so and fall back, not resample
-//! quietly". The fallback that keeps such a device in audio therefore happens BEFORE the `Hello`
-//! — see [`output_rate_is_openable`], which is why that function exists. It matters more now than
-//! it did, not less: the plane carries both rate families
-//! ([`punktfunk_core::audio::pcm::rate_is_supported`]), 44 100 Hz is granted almost everywhere and
-//! 176 400 Hz almost nowhere, so which rungs a given device will open is genuinely unknown until
-//! one is opened.
-//!
-//! The layout is the host-RESOLVED channel count (`NativeClient::audio_channels`, negotiated at
-//! connect), so an older/clamping host that can only capture stereo is decoded + played as stereo.
-//! 2 = stereo / 6 = 5.1 / 8 = 7.1, in the canonical wire order FL FR FC LFE RL RR SL SR. **That
-//! now applies to the lossless plane too**: `0xD3` was stereo-only while a surround frame did not
-//! fit a datagram, but the frame ladder is channel-aware and the restriction was one host-side
-//! condition — so every per-frame size here comes from the resolved count, and a 5.1 lossless
-//! session simply negotiates a shorter frame (and a higher packet rate) than a stereo one.
-//!
-//! The ring started as a port of `punktfunk-client-linux/src/audio.rs`, but AAudio — unlike
-//! PipeWire, which adaptively rate-matches the stream and absorbs a shallow buffer — hands us a raw
-//! realtime callback and makes us own the buffer. So this client diverges deliberately to stop the
-//! Android-only crackle: (1) the callback is allocation/free-free — decoded buffers are recycled to
-//! the producer via a free-list instead of being freed on the audio thread (Android's Scudo `free`
-//! has unbounded tail latency); (2) the jitter ring is deeper than the other clients' and decoupled
-//! from the tiny LowLatency burst size, with de-prime hysteresis so a transient drain doesn't
-//! manufacture a silence; (3) the AAudio HW buffer is primed above its 2-burst default and grown on
-//! XRuns (Google's anti-glitch technique).
-//!
-//! (2) is now the SHARED `punktfunk_core::audio::JitterPolicy` at `JitterTuning::AAUDIO`, which also
-//! fixed what this ring was missing: it had a hard cap but nothing that walked the depth back down,
-//! so drift and arrival bursts raised latency permanently and Android settled on its ceiling.
-//!
-//! It is also **A/V synchronised** (`design/audio-latency-overhaul.md`): the decode thread reads the
-//! host capture `pts_ns` every `AudioPacket` has always carried, compares where this frame will
-//! actually play against where the picture it belongs with reached glass
-//! (`decode::DisplayTracker` publishes that), and asks the ring for a depth that closes the gap.
-//! Only ASKS — `JitterPolicy` clamps the request between its own underrun-driven floor and the hard
-//! cap, so continuity outranks sync and a link whose jitter genuinely needs more buffer than the
-//! picture is away keeps its buffer, with the residual reported on the HUD instead of taken out of
-//! the listener's stream. With no video reference (below API 33 there are no render callbacks, so
-//! nothing confirms a present) the target stays `None` and the ring behaves exactly as it did.
+//! The realtime callback recycles buffers rather than allocating. The shared
+//! `JitterTuning::AAUDIO` policy handles drift and underruns, while `DisplayTracker` supplies
+//! the video reference for A/V sync. See `design/hi-res-audio.md` and
+//! `design/audio-latency-overhaul.md` for the full policy.
 
 use crate::audio_format::SessionAudio;
 use ndk::audio::{
@@ -439,41 +379,15 @@ impl AudioPlayback {
     }
 }
 
-/// Would this device open a playback stream at `rate_hz`? Asked **before** the `Hello`, from
-/// [`crate::session::connect`], and the reason it is asked there at all.
+/// Check before `Hello` whether AAudio can open the requested rate and channel layout.
 ///
-/// AAudio's contract is that an explicitly-requested rate is honoured or the open FAILS — it never
-/// silently substitutes. Which means a device that will not grant the requested rate cannot be
-/// rescued *after* negotiation: the wire would already be carrying that rate's frames, the plane is
-/// never renegotiated mid-session (§6), and the only ways to play them on a stream of another rate
-/// are the wrong speed or a resampler nobody asked for. §7 states the rule directly — *"a client
-/// that cannot open a 96 kHz output must not set `CLIENT_CAP_AUDIO_HIRES`"* — and this is how this
-/// client knows.
+/// An explicit AAudio rate is accepted exactly or the open fails, and audio cannot be
+/// renegotiated mid-session. The caller therefore uses failure to omit hi-res capability or
+/// choose a lower wire rate instead of resampling silently.
 ///
-/// **Android is the platform where this can genuinely fail, and the 44.1 kHz family widened the
-/// gap rather than narrowing it.** 44 100 Hz is granted by very nearly every output — it is what
-/// half the world's material is — while 176 400 Hz is granted by very nearly none, and neither
-/// answer is guessable from the rate alone. So the caller probes every rung it is willing to ask
-/// for (see `session::connect`'s fallback ladder) instead of assuming any of them opens.
-///
-/// The probe is the most permissive rung the ladder would ever reach (Shared + no performance
-/// hint), so a `true` here means SOME rung can open it; it is not a promise that the Exclusive one
-/// will. It is also a measurement at one instant: a route change between here and playback can
-/// still invalidate it, which is why [`open_ladder`] carries the rate too.
-///
-/// `channels` is the layout the session will REQUEST, not the one the host will resolve — the
-/// resolved count does not exist until the `Welcome`. It is the closest truth available here, and
-/// it errs the safe way: a device that cannot open 5.1 at all declines hi-res and gets Opus, which
-/// is the plane it would have been left on anyway.
-///
-/// Opened and immediately dropped — never started, no data callback, so nothing is routed and no
-/// audio focus is taken. Never called for the 48 kHz rung (universally granted, and the ladder's
-/// floor), so an ordinary session opens nothing here and pays nothing for it.
-///
-/// ⚠ Never `request_start` this stream. The ndk wrapper's `Drop` **unwraps** `AAudioStream_close`'s
-/// status, so closing a stream the HAL is unhappy about panics rather than logging — which is why
-/// [`open_any`] stops a rung before dropping it. A stream that was opened and never started closes
-/// cleanly from OPEN, so this probe has nothing to tear down.
+/// This probes the most permissive playback mode (Shared with no performance hint), never
+/// starts the stream, and drops it immediately. `channels` is the requested layout because the
+/// host-resolved layout does not exist until `Welcome`.
 pub fn output_rate_is_openable(rate_hz: u32, channels: u8) -> bool {
     let built = AudioStreamBuilder::new().map(|b| {
         b.direction(AudioDirection::Output)
@@ -523,45 +437,15 @@ impl Drop for AudioPlayback {
     }
 }
 
-/// The AAudio configurations to try, best first.
+/// AAudio configurations to try, best first.
 ///
-/// **Why a ladder at all.** This used to be two hard-coded attempts — Exclusive, then Shared — and
-/// only an *open* failure demoted. Everything after the open (a start failure, a stream that never
-/// calls back) simply gave up or, worse, looked healthy while playing nothing. A device that can
-/// open a configuration it cannot route therefore ended as permanent silence with no signal in the
-/// log beyond a perfectly ordinary "AAudio started" line.
+/// Phones prefer Exclusive/LowLatency; TVs start at Shared because some HDMI HALs open MMAP
+/// streams that never route. Every mode is tried at the negotiated rate before one final
+/// unspecified-rate attempt, which [`arm`] accepts only if AAudio chose that same rate. No rung
+/// uses a different explicit rate.
 ///
-/// **Why a TV starts at Shared.** Exclusive is MMAP, the lowest-latency path AAudio has, and it is
-/// the one rung whose behaviour we cannot verify from inside the process — a HAL may accept it and
-/// route it nowhere. The latency it buys was never actually banked: the jitter-ring depths above
-/// are unchanged from the Shared-only era (`JitterTuning::AAUDIO` still primes at 25 ms), so on a
-/// mains-powered HDMI box the few ms an MMAP path saves are worth strictly less than not betting
-/// the entire audio plane on it. Phones and handhelds — where the depths might one day come down,
-/// and where MMAP is exercised by every other app on the device — keep Exclusive first.
-///
-/// **Why rate is the OUTERMOST dimension.** Every sharing/performance mode is tried at the
-/// session's negotiated rate before anything is tried at another: a Shared, resampled stream at
-/// the RIGHT rate is worth more than an MMAP stream at the wrong one, because the wrong one is not
-/// mis-tuned — it is the wrong audio. The second (and last) rate rung asks for nothing at all
-/// (AAUDIO_UNSPECIFIED), for the HAL that refuses an explicit request but is natively at the rate
-/// we wanted; [`arm`] still holds it to the session's rate, so it can only ever rescue, never
-/// mislabel.
-///
-/// **What is deliberately NOT here: a rung at any rate but the session's.** A 48 kHz rung would
-/// open on almost any device — and then the wire carries the resolved rate's frames, which that
-/// stream would play at the wrong speed, or we would resample them behind the user's back, which is
-/// exactly what §9 forbids ("say so and fall back, not resample quietly"). Mid-session the plane
-/// cannot be renegotiated either — the host never switches tags under a client whose device is
-/// already open (§6). So the fallback that keeps such a device in audio has to happen BEFORE the
-/// `Hello`, and it does: [`output_rate_is_openable`] downgrades the REQUEST so this session is
-/// never at an unplayable rate in the first place.
-///
-/// **Overrides.** `debug.punktfunk.audio_sharing` (`exclusive`|`shared`) and
-/// `debug.punktfunk.audio_perf` (`lowlatency`|`none`) pin the ladder to one sharing/performance
-/// mode, so a device that reports no audio can be bisected with `adb shell setprop` instead of a
-/// rebuild — the same reasoning as `debug.punktfunk.no_av_sync`. There is deliberately no rate
-/// override: a pinned rate that disagreed with the wire would produce the mislabelled playback the
-/// whole design is written to prevent, and it is not a knob a field tester could use safely.
+/// `debug.punktfunk.audio_sharing` and `debug.punktfunk.audio_perf` can pin mode choices for
+/// field diagnosis. Rate cannot be overridden because it must match the wire format.
 fn open_ladder(is_tv: bool, fmt: SessionAudio) -> Vec<OpenRung> {
     use AudioPerformanceMode::{LowLatency, None as PerfNone};
     use AudioSharingMode::{Exclusive, Shared};

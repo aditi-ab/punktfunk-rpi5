@@ -1,61 +1,14 @@
 #!/usr/bin/env python3
-"""
-throughput-sweep.py — punktfunk data-plane throughput diagnostic.
+"""Sweep punktfunk's data plane across a ladder of target bitrates.
 
-Drives the built-in `punktfunk-probe --speed-test` up a ladder of target
-bitrates and tabulates, per point:
+The probe pauses video and sends synthetic FEC filler over the real encrypted UDP
+path, separating host send drops from packets lost after send. Rising `host_drop`
+points to the host send path; rising `link_loss` points to the link or client receive
+path. If delivered throughput tracks the target with little loss, investigate the
+encoder rather than transport.
 
-    target | delivered | efficiency | link_loss | host_drop | send_dropped
-
-The probe bursts synthetic FEC filler over the REAL UDP + GF(2^16) FEC + AES-GCM
-data plane with video PAUSED (host `run_probe_burst`), so this isolates the
-transport from NVENC entirely. It separates the two failure modes the raw
-`iperf` number can't:
-
-  * host_drop   = wire packets the host could not even hand to the kernel
-                  (send buffer full / send thread can't keep up)   -> HOST side
-  * link_loss   = wire packets sent but never arrived
-                  (link saturation, or client recv buffer/CPU drop) -> LINK/CLIENT
-
-How to read the result:
-
-  * delivered ~= target, ~0 loss all the way to 2-3 Gbps
-        -> the transport is NOT your wall. The ~500 Mbps ceiling is the ENCODER
-           (CBR undershoot with no filler / codec level cap). Chase that next.
-  * delivered climbs then flattens while host_drop rises
-        -> host send buffer / single send thread. (SO_SNDBUF, USO chunk size.)
-  * delivered flattens while link_loss rises, host_drop ~0
-        -> the link itself, or the client recv path (8 MB RCVBUF clamp / recv CPU).
-           Cross-check with `iperf3 -u -b 2G` between the two boxes to decide
-           which: if iperf also caps, it's the link/OS, not punktfunk.
-
-Prereq (one-time) — pair the probe with your host. Arm pairing on the host,
-then:
-
-    punktfunk-probe --connect HOST:9777 --pair <PIN>
-
-(the probe stores its identity in ~/.config/punktfunk/). After that the sweep
-reuses the trusted identity; pass --pin <HOSTFP> to also pin the host.
-
-Usage:
-
-    scripts/throughput-sweep.py HOST[:PORT] [options]
-
-Options:
-    --pin HEX64        pin the host cert fingerprint (host logs it at startup)
-    --mode WxHxFPS     request this virtual-display mode (default: probe default)
-    --ladder A,B,C     target bitrates in Mbps
-                       (default: 250,500,750,1000,1250,1500,2000,3000)
-    --dur-ms N         burst duration per point in ms (default: 2000)
-    --bin PATH         path to punktfunk-probe (default: target/release/punktfunk-probe)
-    --build            (re)build the probe before sweeping
-    --warmup-video-kbps N   encoder bitrate during warmup (default: 20000 = 20 Mbps)
-    --dry-run          print the probe commands without running them
-    --self-test        run the output parser against a synthetic line and exit
-
-Examples:
-    scripts/throughput-sweep.py 192.168.1.173
-    scripts/throughput-sweep.py 192.168.1.173:9777 --pin a1b2... --ladder 500,1000,2000
+Pair `punktfunk-probe` with the host once before running this script. Use `--help`
+for sweep options and `--self-test` to validate output parsing.
 """
 
 from __future__ import annotations

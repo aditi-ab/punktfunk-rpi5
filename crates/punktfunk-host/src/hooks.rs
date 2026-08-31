@@ -1,33 +1,13 @@
-//! Operator hooks: commands and webhooks fired on host lifecycle events
-//! (scripting-and-hooks RFC §6, M2).
+//! Fire-and-forget operator commands and webhooks for host lifecycle events.
 //!
-//! `<config_dir>/hooks.json` holds a list of [`HookEntry`]s — *what to run on which event* —
-//! managed over `GET|PUT /api/v1/hooks` and applied immediately (the runner reads the store
-//! per event). The runner subscribes to the [`crate::events`] bus and dispatches matching
-//! entries **fire-and-forget**: a hook observes; it can never veto or delay a connection,
-//! stream, or pairing decision (decisions are made asynchronously through the API — RFC §6).
+//! `hooks.json` is operator-privileged and managed through `/api/v1/hooks`. Commands receive
+//! event JSON and `PF_EVENT_*` variables; Windows services run them in the interactive user
+//! session. Webhooks use verified TLS, do not follow redirects or attach Punktfunk credentials,
+//! and may carry an HMAC signature.
 //!
-//! Two actions:
-//! - **`run`** — a shell command, executed detached with the event JSON on stdin plus flat
-//!   `PF_EVENT_*` env vars (the [`crate::stream_marker`] `PF_STREAM_*` vocabulary's sibling).
-//!   Per-hook timeout (default 30 s) kills the whole process group on expiry; reaped
-//!   off-thread (the `try_recover_session` recipe). On a SYSTEM-service Windows host the
-//!   command runs **in the interactive user session** (never SYSTEM); that path cannot carry
-//!   per-process env/stdin, so the event JSON lands in a temp file appended as the command's
-//!   last argument (a console-mode Windows host gets env + stdin like Unix).
-//! - **`webhook`** — POST the event JSON to an operator URL. TLS-verified, redirects are not
-//!   followed, no punktfunk credentials are attached; an optional per-hook secret file yields
-//!   an `X-Punktfunk-Signature: sha256=<hex HMAC>` header so the receiver can authenticate us.
-//!
-//! Bounds (RFC §9.6): at most [`MAX_CONCURRENT_HOOKS`] hook executions in flight (excess
-//! firings are dropped with a warning, never queued unboundedly), per-hook `debounce_ms`, the
-//! exec timeout + process-group kill. Trust model (RFC §9.1): `hooks.json` is
-//! operator-privileged config in the DACL'd/0700 config dir; before executing a hook whose
-//! command is a script *path*, the host verifies that file — and every directory above it — is
-//! owned by the operator (or root) and not group/world-writable — the sshd/sudoers rule — and
-//! refuses loudly otherwise. Log lines name a hook by [`cmd_label`]/[`webhook_origin`], never by
-//! its raw command line or URL: the tracing ring they land in is served over `GET /api/v1/logs`,
-//! and a webhook path segment (Slack, Discord, ntfy, Teams) *is* the bearer credential.
+//! Debouncing, timeouts, process-group termination, and [`MAX_CONCURRENT_HOOKS`] bound work.
+//! Script paths must pass ownership and writability checks. Logs use sanitized labels rather
+//! than raw command lines or webhook URLs, which may contain credentials.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
