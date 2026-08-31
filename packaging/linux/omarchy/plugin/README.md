@@ -10,13 +10,15 @@ Omarchy bar, without opening a browser.
   - *Pairing* — open a window, approve or deny the queue, type a Moonlight PIN.
   - *Devices* — both planes, access level, unpair on hover.
   - *Displays* — pick the virtual-display preset, and read the policy it puts in force.
+  - *Stats* — the live stream, and frame timings while a capture is recording.
 - **service** — one long-lived event stream that drives both of the above and pops an Omarchy toast
   when a device asks to pair.
 
 ### Why tabs
 
-The sections stacked in one column outgrew the popup: the ones at the bottom were reachable only by
-growing the panel past the screen. Tabs make each subject's height independent.
+Five subjects stacked in one column outgrew the popup: the sections at the bottom were reachable
+only by growing the panel past the screen. Tabs make each subject's height independent, and they let
+the one polling surface — *Stats* — run only while it is the thing being looked at.
 
 ## Install
 
@@ -48,11 +50,22 @@ concurrent event streams and the web console holds one of them. It reconnects by
 `ctl.resync` line when it fell behind the host's catch-up ring, which is the plugin's cue to
 re-snapshot rather than trust what it has.
 
+### The one thing that polls
+
+*Stats* has no event to listen to — the host publishes no periodic stats — so the panel polls
+`ctl stats` every two seconds, and **only** while that tab is open. `ctl status --json` measures
+116 ms on the Omarchy testbox, under the 150 ms threshold `ctl.rs` sets for itself. Everything else
+is event-driven or refreshed when its tab is opened.
+
+Nothing here arms a performance capture as a side effect of being read. Arming has consequences the
+reader did not ask for: stopping writes a recording to disk, and the capture is a single host-wide
+slot the web console also drives. It stays a button.
+
 ## Status
 
-**Loaded and exercised on Omarchy 4.0.2** (Hyprland 0.56.2) on 2026-08-31, over a live
-2414x1188@240 HEVC session: `omarchy plugin validate` passes, the shell loads it with no QML
-warnings, and every tab renders against a running host.
+**Loaded and exercised on Omarchy 4.0.2** (Hyprland 0.56.2) on 2026-08-31, over a live 2414x1188@240
+HEVC session: `omarchy plugin validate` passes, the shell loads it with no QML warnings, all five
+tabs render, and *Stats* reads real encoder numbers off the running stream.
 
 ### What running it caught this time
 
@@ -60,6 +73,8 @@ warnings, and every tab renders against a running host.
   no log line — the panel simply never created its layer surface, while the bar icon kept working.
   If a panel stops opening and nothing is logged, check that binding first.
 - **`displays` is always empty on Hyprland.** See *Displays* below.
+- **Three numbers that were misleading until real data landed on them** — the encoder target read as
+  throughput, `fps` shown without `repeat_fps`, and stage percentiles in milliseconds. See *Stats*.
 
 Three things the first on-glass run caught, all still true:
 
@@ -84,6 +99,18 @@ comes back empty. Measured here against a screen you can point at — a live 241
 The same limit is why the tab says a display cannot outlive a disconnect under Hyprland: several
 preset summaries promise exactly that, and this compositor cannot deliver it. The other axes —
 topology, identity, mode-conflict, layout — do apply.
+
+### Stats: two numbers that are not the same number
+
+- **Target** is the encoder bitrate, where adaptive bitrate has settled. Always available.
+- **Sent** is what actually left the box. Only while a capture is recording.
+
+They differ by an order of magnitude on a still screen (300 Mbps target, 11 Mbps sent), because
+capture is damage-driven. For the same reason the tab shows **new** frames per second beside
+**repeated** ones: a healthy 240 Hz stream of a motionless desktop reads `0.0 fps new · 157.2 fps
+repeated`, and showing only the first number would report a dead stream. Stage percentiles switch
+between µs and ms at 1 ms — measured, `send` sits at 15 µs and `encode` at 2321 µs, and either
+single unit loses one end of that range.
 
 ### Known limitation: one watcher per monitor
 

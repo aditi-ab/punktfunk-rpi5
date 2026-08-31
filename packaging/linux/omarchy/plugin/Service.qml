@@ -42,6 +42,17 @@ Item {
   property var displayPresets: []
   property var customPresets: []
 
+  // ── stats ────────────────────────────────────────────────────────────────────────────────────
+  // `stream` is free and live: its `bitrate_kbps` is the encoder's current target, so it moves with
+  // every adaptive-bitrate change. The rest only exists while a capture is armed, because that is
+  // when the streaming loops emit samples at all.
+  property var stream: null
+  property var sessionMode: null
+  property bool captureArmed: false
+  property int captureSamples: 0
+  property var statsSample: null
+  property var statsMeta: null
+
   // A certificate mismatch is NOT "the host is down": something that is not our host answered on
   // the management port, and ctl refused to send the token. Surfaced separately so the panel can
   // say so instead of showing a plausible-looking "not running".
@@ -172,6 +183,28 @@ Item {
   // so what came back is the only trustworthy answer to "what is in force now".
   function setDisplayPreset(id) {
     run(["display", "preset", id], function () { root.refreshDisplays() })
+  }
+
+  // Polled, not evented: the host publishes no periodic stats event, and a bitrate that only moved
+  // on a lifecycle event would be a still photograph labelled "live". `ctl status --json` measured
+  // 116 ms on the Omarchy testbox — under the 150 ms threshold `ctl.rs` sets for itself — and the
+  // Panel only runs this timer while the Stats tab is the one being looked at.
+  function refreshStats() {
+    run(["stats"], function (data, err) {
+      if (err || !data) { root.stream = null; return }
+      root.stream = data.stream || null
+      root.sessionMode = data.session || null
+      root.captureArmed = !!(data.capture && data.capture.armed)
+      root.captureSamples = (data.capture && data.capture.sample_count) || 0
+      root.statsSample = data.sample || null
+      root.statsMeta = data.meta || null
+    })
+  }
+
+  // The capture is ONE host-wide slot the web console also drives, and stopping it writes a
+  // recording to disk — so it is never armed as a side effect of opening a tab.
+  function setCapture(on) {
+    run(["stats", "record", on ? "start" : "stop"], function () { root.refreshStats() })
   }
 
   // ── the event stream ─────────────────────────────────────────────────────────────────────────

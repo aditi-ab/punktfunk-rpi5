@@ -9,13 +9,15 @@ import qs.Ui
 // (`plugins/panels/*/Panel.qml`): a `Panel` root owning the open/close lifecycle, a
 // `BarIconButton` for the bar, a `KeyboardPanel` for the popup, and a local service child.
 //
-// The daily 95 %: what is streaming, who is asking to pair, which devices are trusted, and how the
-// virtual displays behave. The web console stays the deep surface — the full access matrix,
-// settings, logs and the game library are one click away and deliberately not duplicated here.
+// The daily 95 %: what is streaming, who is asking to pair, which devices are trusted, what the
+// virtual displays are doing, and how the stream is actually performing. The web console stays the
+// deep surface — the full access matrix, settings, logs, the game library and the recorded-capture
+// graphs are one click away and deliberately not duplicated here.
 //
-// **Why tabs.** The sections stacked in one column were taller than the popup could show, so the
-// ones at the bottom were reachable only by growing the panel past the screen. Tabs make each
-// subject's height independent.
+// **Why tabs.** Five subjects stacked in one column was taller than the popup could show, so the
+// sections at the bottom were reachable only by growing the panel past the screen. Tabs make each
+// subject's height independent, and they let the two polling ones (Stats above all) run ONLY while
+// they are the thing being looked at — see `statsPoll`.
 Panel {
   id: root
   moduleName: "punktfunk"
@@ -56,6 +58,14 @@ Panel {
   // bitrate moves in steps far larger than 0.1 Mbps, so more digits would only ever be noise.
   function mbps(kbps) { return (Number(kbps || 0) / 1000).toFixed(1) }
 
+  // A stage duration in the unit that shows it. Measured on glass: `send` p50 15 µs, `encode` p50
+  // 2321 µs. Milliseconds everywhere would print `send` as "0.0 ms" — three of the five stages
+  // vanish — and microseconds everywhere makes encode a five-digit number. So: switch at 1 ms.
+  function dur(us) {
+    var n = Number(us || 0)
+    return n >= 1000 ? (n / 1000).toFixed(1) + " ms" : Math.round(n) + " µs"
+  }
+
   Service {
     id: service
     toasts: root.setting("toasts", true)
@@ -72,11 +82,12 @@ Panel {
     root.syncTab()
   }
 
-  // A tab pays for its own data on arrival rather than every tab paying at open. `ctl` is one
-  // process per call, so refreshing all of them would fan out spawns for the one pane on screen.
+  // Each tab pays for its own data on arrival rather than every tab paying at open. `ctl` is one
+  // process per call, so refreshing all five would fan out six spawns for the one pane on screen.
   function syncTab() {
     if (!opened) return
     if (root.tab === "displays") service.refreshDisplays()
+    if (root.tab === "stats") service.refreshStats()
   }
 
   onTabChanged: root.syncTab()
@@ -141,13 +152,24 @@ Panel {
     }
   }
 
+  // Only while the Stats tab is the one on screen. A background poll would spawn a `ctl` every two
+  // seconds for the life of the session, per monitor — the exact cost the one long-lived `watch`
+  // exists to avoid.
+  Timer {
+    id: statsPoll
+    interval: 2000
+    repeat: true
+    running: root.opened && root.tab === "stats"
+    onTriggered: service.refreshStats()
+  }
+
   KeyboardPanel {
     id: panel
     anchorItem: button
     owner: root
     bar: root.bar
     open: root.opened
-    // Wider than the old single column: the tab chips have to sit on one row.
+    // Wider than the old single column: five tab chips have to sit on one row.
     contentWidth: panel.fittedContentWidth(Style.space(460))
     contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(560))
 
@@ -230,7 +252,8 @@ Panel {
           { value: "pairing",
             label: service.pending > 0 ? "Pairing · " + service.pending : "Pairing" },
           { value: "devices", label: "Devices" },
-          { value: "displays", label: "Displays" }
+          { value: "displays", label: "Displays" },
+          { value: "stats", label: "Stats" }
         ]
         value: root.tab
         // Bar-widget panels drive their own cursor and never hand Tab focus to a ButtonGroup (the
@@ -629,6 +652,211 @@ Panel {
         }
       }
 
+      // ── STATS ──────────────────────────────────────────────────────────────────────────────
+      // Two layers, because they cost different things. The top half is free and always true while
+      // a session exists. The bottom half only exists while a capture is armed — and arming is the
+      // operator's explicit act, never this tab's side effect, because stopping writes a recording
+      // to disk and the capture is one host-wide slot the web console shares.
+      ColumnLayout {
+        id: statsTab
+        Layout.fillWidth: true
+        spacing: Style.spacing.sm
+        visible: root.tab === "stats"
+
+        readonly property var s: service.stream
+
+        Text {
+          visible: !statsTab.s
+          Layout.fillWidth: true
+          wrapMode: Text.Wrap
+          text: service.state === "stopped"
+                  ? "The host is not running."
+                  : "Nothing is streaming, so there is nothing to measure."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        Text {
+          visible: !!statsTab.s
+          Layout.fillWidth: true
+          text: statsTab.s
+                  ? statsTab.s.width + "×" + statsTab.s.height + " @ " + statsTab.s.fps
+                    + " · " + String(statsTab.s.codec || "").toUpperCase()
+                  : ""
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+        }
+
+        // The encoder's LIVE target — it steps with adaptive bitrate, which is what someone opens
+        // this tab to watch. Labelled "target" because it is NOT the throughput: measured on glass,
+        // a 300 Mbps target while 11.1 Mbps actually flowed. An unlabelled "300 Mbps" here would
+        // send someone hunting a bandwidth problem that does not exist. Actual sent bytes are one
+        // section down, where the capture that measures them lives.
+        Text {
+          visible: !!statsTab.s
+          Layout.fillWidth: true
+          text: statsTab.s ? "Target " + root.mbps(statsTab.s.bitrate_kbps) + " Mbps" : ""
+          color: root.foreground
+          font.family: "monospace"
+          font.pixelSize: Style.font.body
+        }
+
+        Text {
+          visible: !!statsTab.s && statsTab.s.time_to_first_frame_ms > 0
+          Layout.fillWidth: true
+          text: statsTab.s ? statsTab.s.time_to_first_frame_ms + " ms to the first frame" : ""
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        Text {
+          visible: !!statsTab.s && statsTab.s.last_resize_ms > 0
+          Layout.fillWidth: true
+          text: statsTab.s ? statsTab.s.last_resize_ms + " ms for the last resize" : ""
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        Text {
+          visible: !!service.statsMeta && !!service.statsMeta.encoder_backend
+          Layout.fillWidth: true
+          text: service.statsMeta
+                  ? (service.statsMeta.encoder_backend || "")
+                    + (service.statsMeta.gpu ? " · " + service.statsMeta.gpu : "")
+                  : ""
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+
+        PanelSeparator { Layout.fillWidth: true }
+
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.spacing.sm
+          PanelSectionHeader {
+            Layout.fillWidth: true
+            text: service.captureArmed
+                    ? "Frame timings · " + service.captureSamples + " samples"
+                    : "Frame timings"
+            foreground: root.dim; fontFamily: root.fontFamily
+          }
+          PanelActionButton {
+            iconText: service.captureArmed ? "󰓛" : "󰑊"
+            tooltipText: service.captureArmed
+                           ? "Stop recording and save the capture"
+                           : "Record frame timings"
+            foreground: service.captureArmed ? root.urgent : root.foreground
+            onClicked: service.setCapture(!service.captureArmed)
+          }
+        }
+
+        Text {
+          visible: !service.captureArmed
+          Layout.fillWidth: true
+          wrapMode: Text.Wrap
+          text: "Per-frame drops and stage timings are only sampled while a capture is recording. "
+              + "Stopping saves it; the console graphs the saved ones."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        Text {
+          visible: service.captureArmed && !service.statsSample
+          Layout.fillWidth: true
+          wrapMode: Text.Wrap
+          text: "Recording. The first sample lands within a couple of seconds of a stream starting."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        // What actually left the box, which is the number the target above is NOT.
+        Text {
+          visible: !!service.statsSample
+          Layout.fillWidth: true
+          text: service.statsSample
+                  ? Number(service.statsSample.mbps || 0).toFixed(1) + " Mbps sent"
+                  : ""
+          color: root.foreground
+          font.family: "monospace"
+          font.pixelSize: Style.font.body
+        }
+
+        // NEW frames and REPEATED ones, always both. Capture is damage-driven, so a still desktop
+        // legitimately reads 0 new fps — measured on glass: 0.0 new against 156.8 repeated, on a
+        // perfectly healthy 240 Hz stream. Showing only `fps` there reports a dead stream.
+        Text {
+          visible: !!service.statsSample
+          Layout.fillWidth: true
+          text: service.statsSample
+                  ? Number(service.statsSample.fps || 0).toFixed(1) + " fps new · "
+                    + Number(service.statsSample.repeat_fps || 0).toFixed(1) + " fps repeated"
+                  : ""
+          color: root.foreground
+          font.family: "monospace"
+          font.pixelSize: Style.font.caption
+        }
+
+        Text {
+          visible: !!service.statsSample
+                   && Number(service.statsSample.fps || 0) < 1
+                   && Number(service.statsSample.repeat_fps || 0) > 1
+          Layout.fillWidth: true
+          wrapMode: Text.Wrap
+          text: "Nothing on screen is changing, so the last frame is being repeated."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        Text {
+          visible: !!service.statsSample
+          Layout.fillWidth: true
+          wrapMode: Text.Wrap
+          text: service.statsSample
+                  ? service.statsSample.frames_dropped + " frames dropped · "
+                    + service.statsSample.packets_dropped + " packets lost · "
+                    + service.statsSample.fec_recovered + " recovered by FEC"
+                  : ""
+          color: (service.statsSample && service.statsSample.frames_dropped > 0)
+                   ? root.urgent : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        // p50 AND p99, never the mean: a stage that is fine on average and terrible one frame in
+        // a hundred is what a stutter IS, and a mean hides exactly that frame.
+        Repeater {
+          model: service.statsSample ? (service.statsSample.stages || []) : []
+          RowLayout {
+            Layout.fillWidth: true
+            spacing: Style.spacing.sm
+            Text {
+              Layout.preferredWidth: Style.space(80)
+              text: modelData.name || "—"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+            Text {
+              Layout.fillWidth: true
+              text: "p50 " + root.dur(modelData.p50_us) + " · p99 " + root.dur(modelData.p99_us)
+              color: root.dim
+              font.family: "monospace"
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
+      }
     }
   }
 }
