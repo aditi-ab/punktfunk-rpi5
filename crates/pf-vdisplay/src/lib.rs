@@ -1,32 +1,12 @@
-//! Virtual display orchestration (plan §6 / §W6) — the project's differentiator.
+//! Create client-sized virtual outputs for capture and release them on disconnect.
 //!
-//! A [`VirtualDisplay`] creates a *client-sized* output on demand, rendered natively and
-//! headless (no scaling), to be captured and streamed, then torn down on disconnect. There is
-//! no cross-compositor Wayland protocol for this, so each compositor has its own backend behind
-//! this trait:
+//! [`VirtualDisplay`] hides compositor-specific backends for KWin, wlroots/Sway, Mutter,
+//! Hyprland, gamescope, and the Windows IddCx driver. It also supports externally owned
+//! physical-monitor capture, where lifecycle policy must not alter the display.
 //!
-//! * **KWin** — privileged `zkde_screencast_unstable_v1::stream_virtual_output` ([`kwin`]).
-//! * **wlroots/Sway** — `swaymsg create_output` + `output mode --custom` ([`wlroots`]).
-//! * **Mutter/GNOME** — D-Bus `RemoteDesktop` + `ScreenCast.RecordVirtual` ([`mutter`]).
-//! * **Hyprland** — `hyprctl output create headless` + the xdg-desktop-portal-hyprland ScreenCast
-//!   portal. Its own backend, not a wlroots dialect (`design/hyprland-support.md` D1).
-//! * **gamescope** — three sub-modes behind one backend ([`GamescopeRoute`]): bare
-//!   **spawn** of a nested headless session, host-**managed** `gamescope-session-plus`/SteamOS
-//!   takeover, and **attach** to a session somebody else started. By far the largest backend here,
-//!   because it owns session lifecycle rather than just minting an output.
-//! * **monitor mirror** — no virtual display at all: stream a PHYSICAL head the compositor already
-//!   has (the `PUNKTFUNK_CAPTURE_MONITOR` pin), reporting [`DisplayOwnership::External`] so none of
-//!   the lifecycle policy is applied to someone else's screen.
-//! * **Windows pf-vdisplay** — the all-Rust IddCx driver + its `manager`, the sole Windows backend.
-//!
-//! No list of file sizes here: it rots. The rule instead — the Linux backends plus the Windows
-//! manager are the bulk of this crate, and the platform-neutral half (`policy`, `registry`,
-//! `lifecycle`, `layout`, `identity`, `admission`, `monitors`, `session`, `routing`, `proc`,
-//! `portal_config`) is the minority that every platform's CI actually compiles and tests.
-//!
-//! [`VirtualDisplay::create`] returns a [`VirtualOutput`]: the PipeWire node to capture plus an
-//! owned keepalive whose `Drop` releases the output (RAII — no explicit `destroy`). Capture
-//! consumes the node via the host `capture::capture_virtual_output`.
+//! [`VirtualDisplay::create`] returns a [`VirtualOutput`] containing the capture target and an
+//! RAII keepalive. Gamescope additionally supports spawning, managing, or attaching to a session
+//! through [`GamescopeRoute`].
 
 // `dead_code` is ENFORCED on Linux, where the clear majority of this crate lives — every compositor
 // backend under `vdisplay/linux/` plus everything only they consume, which is roughly half the crate

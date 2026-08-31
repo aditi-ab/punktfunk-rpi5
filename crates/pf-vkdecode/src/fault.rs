@@ -1,84 +1,17 @@
-//! Deliberate decoder-input corruption — the fault injector (M4 of the
-//! native-decode program).
+//! Pure, deterministic decoder-input fault injection for integrity testing.
 //!
-//! # Why a first-class tool
-//!
-//! The whole program started from a field corruption that was ARCHITECTURALLY
-//! undetectable: FFmpeg's Vulkan decoder creates no status queries
-//! (`nb_queries = 0`), never sets `AV_FRAME_FLAG_CORRUPT`, and reports trouble only
-//! as `av_log` lines. Nobody could tell a healthy stream from a broken one without
-//! looking at the screen. The native decoder now has the signals — plan warnings
-//! from pf-bitstream and per-op `RESULT_STATUS` verdicts from the driver — but a
-//! detector nobody can fire is exactly as trustworthy as no detector at all. This
-//! is the trigger: a deterministic way to break decoder input on purpose, so
-//! detection can be PROVEN rather than assumed, on a lab box or in CI.
-//!
-//! It is inert unless explicitly armed ([`AuFault::from_spec`] returns `None` for
-//! an unset/unparsable spec) and it is pure — no I/O, no clock, no randomness — so
-//! a reported fault is reproducible from the spec string alone.
-//!
-//! # The three modes, and which detector each one fires
-//!
-//! They are not variations on one idea. The native lane has TWO independent
-//! detectors — pf-bitstream's planner, which reads syntax, and the driver's per-op
-//! `RESULT_STATUS` query, which reads the decode itself — and the modes exist to
-//! fire them separately, because a harness that can only trip one of them proves
-//! only half the lane:
-//!
-//! * [`FaultMode::Drop`] — the AU never reaches the decoder. The NEXT AU then
-//!   references a picture that was never decoded, so the planner reports
-//!   `FrameNumGap`/`MissingReference`: **parser-visible** damage, caught before a
-//!   single macroblock is decoded. The everyday network-loss shape, and the one
-//!   mode whose detection is provable without a GPU.
-//! * [`FaultMode::Truncate`] — the AU arrives short. Worth knowing, and initially
-//!   surprising: this is **NOT** parser-visible. Annex-B carries no NALU length, so
-//!   a slice cut at a byte boundary is simply a shorter slice — its header parses,
-//!   the picture plans, every later reference resolves against a DPB entry that
-//!   exists. (pf-bitstream's `TruncatedAu` warning is a narrower thing: a NALU
-//!   whose HEADER is malformed with real data still behind it.) What the hardware
-//!   gets is a slice whose bitstream ends mid-picture, which is a decode error it
-//!   can report — so this is the mode that fires the DRIVER's detector
-//!   deterministically.
-//! * [`FaultMode::Flip`] — one byte deep inside the slice payload is altered. The
-//!   bitstream still parses, every reference still resolves, the planner has
-//!   nothing to say — and the picture decodes WRONG, possibly without the driver
-//!   minding either (an entropy decoder happily decodes garbage into macroblocks).
-//!   This is precisely the Xbox Ally X class: corruption that reaches the screen
-//!   with nothing in the pipeline objecting. It is the mode that shows what
-//!   `RESULT_STATUS` can and cannot promise.
-//!
-//! The consequence worth stating plainly, because it is the program's whole thesis:
-//! two of the three modes are invisible to every FFmpeg rung by construction
-//! (`nb_queries = 0`, no `AV_FRAME_FLAG_CORRUPT`), and invisible to the native lane
-//! too on a driver without `queryResultStatusSupport` (RADV). A session that cannot
-//! answer the status query is not a clean session; it is an unmeasured one, and the
-//! telemetry says so rather than reporting zeros.
-//!
-//! # Invocation
-//!
-//! `PUNKTFUNK_AU_FAULT=<mode>[:<period>]` on any desktop client —
-//! `drop`, `truncate`, `flip`, default period 60 (once a second at 60 fps):
-//!
-//! ```text
-//! PUNKTFUNK_AU_FAULT=drop:120 PUNKTFUNK_DECODER=native-vulkan punktfunk-session --connect host
-//! ```
-//!
-//! Every `period`-th AU is faulted, counting from the first one the decoder is
-//! offered, so the parameter sets and opening IDR of a session ride through
-//! untouched at any period above 1.
-//!
-//! # What the injector is NOT in the same lane as
-//!
-//! `PUNKTFUNK_AU_DUMP` (the client's `au_dump` fixture capture) writes the AU as
-//! it arrives from the wire, and this injector runs LATER — at the native
-//! backend's decode entry, the last point before pf-bitstream. So on a faulted
-//! run the dumped fixture is the CLEAN bitstream, not the one the decoder saw;
-//! replaying it will not reproduce the damage. That ordering is deliberate: the
-//! dump is what the HOST sent (the artefact a host-side bug is diagnosed from),
-//! and moving the injector above it would corrupt every backend's input rather
-//! than only the lane whose detectors it exists to fire. To capture the damaged
-//! bytes, reconstruct them from the spec — the injector is pure and deterministic,
-//! which is precisely what makes that possible.
+//! [`AuFault::from_spec`] accepts `PUNKTFUNK_AU_FAULT=<mode>[:<period>]`; invalid
+//! or zero-period specifications do not arm it, and the default period is 60.
+//! Every period-th offered AU is selected, counting from the first; inputs shorter
+//! than 16 bytes pass unchanged rather than corrupting parameter-only fragments.
+//! [`FaultMode::Drop`] withholds the AU and normally exposes a later planner gap or
+//! missing reference. `Truncate` keeps the first three quarters and targets driver
+//! decode-status detection. `Flip` XORs one byte at the same point and may remain
+//! valid syntax, so neither planner nor driver is guaranteed to report it.
+//! Lack of `queryResultStatusSupport` therefore means unmeasured, not clean.
+//! Unselected AUs are borrowed unchanged; corrupted AUs allocate owned bytes only
+//! on the selected call. The injector runs after `PUNKTFUNK_AU_DUMP`, so dumps
+//! remain clean wire input and reproduce faults only by reapplying the same spec.
 
 /// What to do to a faulted access unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

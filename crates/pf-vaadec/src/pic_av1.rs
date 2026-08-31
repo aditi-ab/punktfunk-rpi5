@@ -1,100 +1,22 @@
-//! One AV1 [`AuPlanAv1`] into libva's buffers — M7's VAAPI conversion, and the
-//! third and last hardware rung for this codec.
+//! Converts one AV1 [`AuPlanAv1`] into libva picture and tile buffers.
+//! `ref_frame_map` is slot-indexed and contains `VASurfaceID`s; `ref_frame_idx`
+//! and global motion are reference-name-indexed, with `ref_frame_idx` containing slots.
+//! libva has no per-reference dimensions: drivers recover them from each surface.
+//! These rules come from `va_dec_av1.h`, AV1 §7.11.3.3, and libavcodec `vaapi_av1.c`.
 //!
-//! The layouts it fills are measured against the real `va_dec_av1.h`
-//! ([`crate::va_av1`]); this module is where the AV1 frame header's meaning is
-//! mapped onto them, and where the places VAAPI disagrees with the other two
-//! backends are handled.
+//! Frames with `apply_grain` are refused: correct synthesis requires distinct decode
+//! and display surfaces. The gate is per frame, not `film_grain_params_present`.
+//! For published stores, missing references are replaced with a live surface and
+//! reported in [`DecodePlanVaAv1::substituted_refs`], never submitted as an invalid ID;
+//! shown key frames retain libavcodec's deliberately invalid, unused reference map.
 //!
-//! # The reference convention, and what it is established from
+//! Slot removals and assignment precede tile walking and film-grain refusal so this
+//! ledger remains aligned with [`Av1Planner::plan_au`](pf_bitstream::av1::Av1Planner::plan_au).
+//! After refusal the caller must bind no surface to the assigned slot.
 //!
-//! [`crate::va_av1`]'s module docs state it in full. In one line: **`ref_frame_map`
-//! is indexed by AV1 reference SLOT and holds a `VASurfaceID`; `ref_frame_idx` is
-//! indexed by reference NAME and holds a SLOT (an index into `ref_frame_map`);
-//! global motion is a picture-level array indexed by NAME with `wm[0]` =
-//! `LAST_FRAME`; and there is no per-reference size field at all.** That comes from
-//! `va_dec_av1.h`'s own comments and from libavcodec's `vaapi_av1.c`, which is what
-//! every VAAPI driver is validated against.
-//!
-//! The last clause is the one that differs from DXVA and is easy to get backwards.
-//! `DXVA_PicEntry_AV1` carries each reference's own `width`/`height` because a
-//! decoder scales motion out of a differently-sized reference (7.11.3.3 derives
-//! `xStep` from `RefUpscaledWidth[refIdx]`). libva 2.23.0 has **no**
-//! `ref_frame_width`/`ref_frame_height` — measured, `grep -c` is 0 — so a VAAPI
-//! driver reads each reference's dimensions off the SURFACE. Nothing here needs
-//! `RefState::upscaled_width`, and looking for a field to put it in would end in
-//! writing it somewhere it does not belong.
-//!
-//! # What this conversion refuses, and why refusing is the honest answer
-//!
-//! **Film grain synthesis.** libva's picture buffer carries two surfaces —
-//! `current_frame` (the decode target, which is also what later frames PREDICT
-//! from) and `current_display_picture` (the grained output) — and libavcodec
-//! allocates a second frame (`ctx->tmp_frame`) precisely so the two can differ.
-//! With one surface there are only wrong answers: grain in the reference chain,
-//! which drifts every later frame, or an ungrained picture on screen, and
-//! `va_dec_av1.h` does not say which a driver would pick. So a frame with
-//! `apply_grain` set is [`PlanToVaAv1Error::FilmGrain`] rather than a submission
-//! that decodes to something. The film-grain STRUCTURE is declared and its layout
-//! pinned ([`crate::va_av1::VaFilmGrainStructAV1`]); it is left zero, which libva
-//! documents as "ignore all of this" when `apply_grain` is 0. The fill and the
-//! second surface belong to the same future change and neither is written here.
-//!
-//! No punktfunk host emits film grain (no AV1 hardware encoder in the fleet does)
-//! and neither vendored conformance vector codes it, so this refusal is reachable
-//! only by a stream from elsewhere — where it costs the session this rung and gets
-//! the FFmpeg rung, which synthesises grain correctly.
-//!
-//! The gate is per FRAME rather than per SEQUENCE on purpose: `film_grain_params_present`
-//! only says the tool is coded, and a sequence that declares it while every frame
-//! leaves `apply_grain` at 0 decodes here perfectly. Refusing on the sequence flag
-//! would be a whole-session demotion bought with nothing. What the per-frame gate must
-//! NOT do is poison the ledger on its way out, which is why it sits after the mutation
-//! block — see "A refusal after the mutations is deliberate" below.
-//!
-//! # A lost reference gets a LIVE surface, not `VA_INVALID_ID`
-//!
-//! A slot the planner reports empty, and a slot whose picture this rung never decoded
-//! into a surface, both arrive here as [`VA_INVALID_SURFACE`] in `ref_frame_map`.
-//! Sending that is what `va_dec_av1.h:352` warns about — *"Driver is not responsible
-//! to validate reference frames' id"* — and the sentence CONTINUES: *"If missing frame
-//! is identified, application may choose to perform error recovery by pointing
-//! problematic index to an alternative frame buffer."* That is what
-//! [`DecodePlanVaAv1::substituted_refs`] records: every empty entry is pointed at a
-//! live surface (a resolved reference where there is one, the decode target otherwise)
-//! so a concealed frame is a driver predicting from the WRONG picture rather than a
-//! driver dereferencing a handle that names nothing.
-//!
-//! ⚠ Only where the store is PUBLISHED. A shown key frame publishes an all-invalid map
-//! deliberately (libavcodec does the same) and substituting there would depart from the
-//! one path every driver is exercised on, for a frame that reads no references at all.
-//!
-//! # A refusal after the mutations is deliberate
-//!
-//! [`Av1Planner::plan_au`](pf_bitstream::av1::Av1Planner::plan_au) has already stored
-//! this picture in its own reference store by the time the plan arrives, so a refusal
-//! that skipped this rung's `slots.assign` would leave the ledger one picture short of
-//! the planner's store FOREVER: the next access unit's `dpb_refs` names the picture,
-//! [`SlotMap::slot_of`] answers `None`, and [`PlanToVaAv1Error::UnresolvedReference`]
-//! fires — which is itself a refusal, so it never repairs. One lost tile group would
-//! cost every frame until the next shown key frame.
-//!
-//! So the removals and the assignment run BEFORE the tile walk and before the film
-//! grain gate, and every refusal past that point leaves the ledger in step with the
-//! planner. The caller's side of the contract is in [`plan_to_va_av1`]'s docs: on a
-//! refusal it must bind NOTHING to the assigned slot, which is what turns the next
-//! frame's reference to this picture into the substitution above.
-//!
-//! # Tiles: one record per TILE, several records per BUFFER
-//!
-//! `VASliceParameterBufferAV1` is a tile parameter buffer under a misleading name
-//! (the header says so). libavcodec sends, per tile-group OBU, **one parameter
-//! buffer holding that group's records** beside **one data buffer holding the
-//! group's whole `tile_data` region** — `tile_size_minus_1` fields and all — with
-//! each record's `slice_data_offset` relative to that buffer. That is the DXVA
-//! upload layout, not the Vulkan one, so [`Av1Bitstream::groups`] is the half of the
-//! shared walk this rung reads, and [`DecodePlanVaAv1::tile_groups`] is grouped
-//! accordingly rather than being a flat list.
+//! Each tile-group OBU produces one parameter buffer containing one record per tile
+//! and one data buffer for the complete `tile_data`; every `slice_data_offset` is
+//! relative to that group's data buffer, as required by `va_dec_av1.h` and libavcodec.
 
 use std::ops::Range;
 

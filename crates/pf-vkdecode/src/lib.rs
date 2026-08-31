@@ -1,120 +1,20 @@
-//! Native Vulkan Video H.264 decode for the clients — M2 of the native-decode program
-//! (design/client-native-decode.md §3.2).
+//! Native Vulkan Video decoding for H.264, H.265, and AV1, between
+//! [`pf_bitstream`] access-unit planning and GPU submission.
 //!
-//! This crate sits between [`pf_bitstream`]'s per-AU planning and Vulkan Video
-//! submission.
-//!
-//! WP-A — the CPU-testable half, everything runs without a GPU:
-//!
-//! - [`params`]: the vendored parser's `Sps`/`Pps` converted into the
-//!   `StdVideoH264*ParameterSet` structs session parameters are created from, behind
-//!   owning wrappers ([`OwnedStdSps`]/[`OwnedStdPps`]) because the Std structs embed
-//!   raw pointers.
-//! - [`slots`]: [`SlotMap`], the hardware DPB slot ledger keyed by
-//!   [`pf_bitstream::h264::PicId`]. pf-bitstream's DPB decides what lives and dies;
-//!   this map only translates ids to slot indices and refuses to guess.
-//! - [`pic`]: [`plan_to_vk`], one [`pf_bitstream::h264::AuPlan`] converted into the
-//!   `StdVideoDecodeH264PictureInfo`/`StdVideoDecodeH264ReferenceInfo` set plus slice
-//!   offsets and slot bindings a `vkCmdDecodeVideoKHR` call wants.
-//!
-//! WP-B — the GPU half, built ON the borrowed presenter device (this crate never
-//! creates or destroys a VkDevice) with the decision logic split out pure so it
-//! stays CPU-testable:
-//!
-//! - [`device`]: [`DeviceHandles`] (the borrowed handle bundle + its liveness
-//!   contract), the [`QueueLock`] trait every submit runs under, [`DecodeDevice`].
-//! - [`caps`]: one thin driver query + [`derive_caps`], the pure
-//!   coincide/distinct/layered decision table ([`DecodeCaps`]).
-//! - [`session`]: `VkVideoSessionKHR` + versioned session parameters (pure ledger
-//!   decides Add-vs-Recreate; extent/DPB renegotiation rebuilds the session).
-//! - [`images`]: the picture pool DECOUPLED from DPB slots (the zero-copy FFmpeg
-//!   pool model — a re-activated slot binds a fresh free image, so delivered
-//!   pictures are never decode targets), per-image timeline semaphores with the
-//!   presenter `value+1` write-back, per-plane views, [`HOLD_HEADROOM`] sizing.
-//! - [`ring`]: the host-visible bitstream upload ring (pure alignment/growth
-//!   math) — SLICE NALUs only (feeding a whole AU hangs VCN firmware).
-//! - [`decoder`]: [`VkH264Decoder`] — plan → convert → upload → record → submit,
-//!   with a per-op `RESULT_STATUS_ONLY` query ([`VkH264Decoder::poll_status`]) so
-//!   driver-reported corruption is finally observable (the Ally X class) —
-//!   caps-gated per queue family: where `queryResultStatusSupport` is absent
-//!   (RADV), verdicts degrade to timeline completion, FFmpeg parity.
-//!
-//! M3 (HEVC) — the CPU half, over [`pf_bitstream::h265`]'s WP-1 planner:
-//!
-//! - [`params_h265`]: VPS/SPS/PPS into the `StdVideoH265*ParameterSet` structs
-//!   behind owning wrappers ([`OwnedStdH265Vps`]/[`OwnedStdH265Sps`]/
-//!   [`OwnedStdH265Pps`]) — Main/Main10/4:4:4 RExt fidelity carried through, the
-//!   rest of the envelope rejected typed.
-//! - [`pic_h265`]: [`plan_to_vk_h265`], one [`pf_bitstream::h265::AuPlan`] into
-//!   `StdVideoDecodeH265PictureInfo`/`StdVideoDecodeH265ReferenceInfo` plus the
-//!   RPS index arrays, slice offsets and slot bindings — over the SAME
-//!   [`SlotMap`] (H.265's DPB ceiling is H.264's: 16 references + 1 setup).
-//!
-//! M3 (HEVC) — the GPU half, sharing every codec-agnostic piece with H.264
-//! (picture pool, bitstream ring, op ring, DPB settling, frame delivery) rather
-//! than re-implementing them:
-//!
-//! - [`caps_h265`]: [`H265ProfileKey`] (the stream's profile idc, chroma format
-//!   and bit depths, which Vulkan wants stated on every object) and
-//!   [`derive_caps_h265`] — Main → NV12, Main 10 → P010, RExt 4:4:4 → the
-//!   two-plane 4:4:4 formats, with a device that cannot host the combination
-//!   refused BEFORE a session exists ([`CapsError::NoFormat`]).
-//! - [`session_h265`]: the H.265 session and its THREE-array parameters ledger —
-//!   VPS included, with [`fallback_vps_from_sps`] standing in (and deduping
-//!   correctly) for streams joined after their VPS NALU.
-//! - [`decoder_h265`]: [`VkH265Decoder`], mirroring [`VkH264Decoder`]'s public
-//!   surface method-for-method. Codec DISPATCH is the client wiring's job.
-//!
-//! M7 (AV1) — the CPU half, over [`pf_bitstream::av1`]'s planner:
-//!
-//! - [`params_av1`]: the sequence header into `StdVideoAV1SequenceHeader` behind an
-//!   owning wrapper ([`OwnedStdAv1SequenceHeader`]) — the ONE parameter set AV1 has.
-//! - [`pic_av1`]: [`plan_to_vk_av1`], one [`pf_bitstream::av1::AuPlan`] into
-//!   `StdVideoDecodeAV1PictureInfo` and its eight per-frame sub-blocks, plus the
-//!   per-reference-NAME DPB SLOT table, the tile-group ranges and the slot bindings
-//!   — over the SAME [`SlotMap`] (AV1's ceiling is eight references + one setup).
-//!
-//! M7 (AV1) — the GPU half, sharing every codec-agnostic piece with the other two
-//! (picture pool, bitstream ring, op ring, frame delivery, DPB settling) rather
-//! than re-implementing them:
-//!
-//! - [`caps_av1`]: [`Av1ProfileKey`] — Std profile, sampling, bit depth AND the
-//!   sequence's film-grain flag, because `filmGrainSupport` is part of the Vulkan
-//!   decode PROFILE — and [`derive_caps_av1`]: 4:2:0 8-bit → NV12, 10-bit → P010,
-//!   4:4:4 → the two-plane 4:4:4 pair, with a device that cannot host the
-//!   combination (film grain very much included) refused BEFORE a session exists.
-//! - [`session_av1`]: the AV1 session and its ONE-set parameters ledger — no PPS,
-//!   no VPS, no update path at all, so a changed sequence header RECREATES.
-//! - [`decoder_av1`]: [`VkAv1Decoder`], mirroring [`VkH265Decoder`]'s public
-//!   surface method-for-method, over temporal units that may carry several frames.
-//!
-//! M4 (status and telemetry) — three pure modules turning the signals above into
-//! something a session, a user and a support engineer can act on:
-//!
-//! - [`recovery`]: [`RecoveryWatch`], the recovery point SEI folded into a
-//!   per-picture "the stream healed HERE" mark ([`RecoveryMark`], carried on
-//!   [`DecodedVkFrame::recovery`]). The only clean point an intra-refresh session
-//!   has — its wave emits no IDR — so without it a client freezes for its full
-//!   backstop and then forces the very IDR the wave exists to avoid.
-//! - [`integrity`]: [`is_integrity_warning`] / [`is_integrity_warning_h265`] /
-//!   [`is_integrity_warning_av1`], the one list of warnings that mean the PICTURE
-//!   is damaged. Here rather than in the client so the fault harness asserts
-//!   against the predicate production conceals on.
-//! - [`fault`]: [`AuFault`], deliberate decoder-input corruption
-//!   (`PUNKTFUNK_AU_FAULT`), inert unless armed. A detector nobody can fire is
-//!   exactly as trustworthy as no detector at all.
-//!
-//! Plus [`VkH264Decoder::status_queries`] / [`VkH265Decoder::status_queries`]: does
-//! this device answer per-op `RESULT_STATUS` at all? Without that fact a clean
-//! integrity report cannot be told apart from an unmeasured one — which is the
-//! precise failure the program exists to end.
-//!
-//! Unsafe posture: unlike pf-bitstream (which forbids unsafe outright), this crate
-//! cannot — the `ash::vk::native` bindgen structs are zero-initialized the way the
-//! encode side does it (`pf-encode/src/enc/linux/vk_build.rs`), and the GPU half is
-//! Vulkan FFI. Every unsafe block therefore carries a written `// SAFETY:` proof — enforced by
-//! the workspace `[workspace.lints]` tables, and (unlike the encoder) with NO file-level
-//! `unsafe_op_in_unsafe_fn` exemption: every operation is individually fenced.
+//! The crate borrows the presenter's Vulkan device and never creates or destroys
+//! it; every queue submission is serialized through the caller's [`QueueLock`].
+//! Parameter wrappers own all storage referenced by embedded StdVideo pointers.
+//! [`SlotMap`] only translates planner-owned DPB identities into hardware slots;
+//! it must not infer reference lifetime or conceal missing references.
+//! Picture images are independent of DPB slots: delivered images remain live and
+//! are never rebound as decode targets; timeline hand-off uses presenter value+1.
+//! Upload rings contain only codec decode payloads, with Vulkan alignment and
+//! lifetime maintained until the corresponding timeline operation completes.
+//! Session parameters and pools are rebuilt when profile, extent, or DPB changes.
+//! Result-status queries are capability-gated; unsupported means unmeasured, not
+//! clean. Recovery marks and fault injection remain independent optional signals.
+//! Vulkan FFI is unsafe; each unsafe operation requires a local `SAFETY` proof,
+//! with no file-level `unsafe_op_in_unsafe_fn` exemption.
 
 pub mod caps;
 pub mod caps_av1;

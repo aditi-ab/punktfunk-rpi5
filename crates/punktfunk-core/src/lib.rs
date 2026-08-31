@@ -1,37 +1,14 @@
-//! # punktfunk-core
+//! Shared protocol, transport, FEC, and C-ABI core for Punktfunk hosts and clients.
 //!
-//! The shared protocol / transport / FEC core for the punktfunk low-latency streaming
-//! stack. It is compiled exactly once and linked by every host and client — directly
-//! as a Rust `lib`, or across the [C ABI](crate::abi) by Swift / Kotlin / C clients.
+//! Platform capture, encode, decode, presentation, and input injection live elsewhere.
+//! This crate owns wire framing and reassembly ([`packet`]), erasure coding ([`fec`]),
+//! encryption ([`crypto`]), host/client data-plane state ([`session`]), packet I/O
+//! ([`transport`]), shared configuration and event vocabularies, and the [C ABI](crate::abi).
+//! The optional `quic` feature adds the native control plane, pairing, clock sync, adaptive
+//! bitrate, clipboard transport, and the embeddable client worker.
 //!
-//! Everything platform-specific (capture, encode, decode, present, input injection)
-//! lives *outside* this crate. What lives *here*:
-//!
-//! - [`fec`] — erasure coding. GF(2⁸) for GameStream/Moonlight compatibility (P1) and
-//!   GF(2¹⁶) Leopard-RS (P2) which removes the ~1 Gbps per-frame shard-count ceiling.
-//! - [`packet`] — `#[repr(C)]` zero-copy wire framing: splitting an access unit into
-//!   FEC blocks of MTU-sized shards and reassembling them on the far side.
-//! - [`crypto`] — AES-128-GCM session sealing, matching GameStream in P1.
-//! - [`session`] — the host (submit frame → FEC → packetize → seal → send) and client
-//!   (recv → open → reorder → FEC recover → reassemble) state machines.
-//! - [`transport`] — pluggable packet I/O (in-process loopback for tests; UDP for real).
-//! - [`abi`] — the `extern "C"` surface and `cbindgen`-generated `punktfunk_core.h`.
-//! - [`config`] / [`error`] / [`stats`] — session configuration, the shared error/status
-//!   vocabulary, and the counters snapshot.
-//! - [`input`] — the wire input-event vocabulary (keyboard/mouse/touch, gamepad snapshots).
-//! - [`reject`] — typed application-close rejection codes · [`reanchor`] — the post-loss
-//!   freeze-until-reanchor client gate · [`render_scale`] — the shared render-scale setting ·
-//!   [`audio`] — Opus PCM decode for C-ABI embedders · [`wol`] — Wake-on-LAN.
-//! - `quic` (feature `quic`) — the punktfunk/1 control plane: handshake, typed control
-//!   messages, pairing (SPAKE2), the datagram plane codecs, and clock sync. With it come
-//!   `client` (the embeddable NativeClient worker), `abr` (the adaptive-bitrate
-//!   controller), and `clipboard` (the shared-clipboard transport task). `tls`
-//!   (feature `tls`) — the pinned-fingerprint certificate verifier.
-//!
-//! ## Threading contract
-//!
-//! Nothing in the per-frame path touches an async runtime. `tokio`/`quinn` are gated
-//! behind the off-by-default `quic` feature and used only for the control plane.
+//! Per-frame processing never enters an async runtime; `tokio` and `quinn` are confined to
+//! the optional control plane.
 
 // Unsafe-proof program: every `unsafe {}` / `unsafe impl` in this crate carries a `// SAFETY:`
 // proof. The bulk lives in `abi.rs`, whose sites are instances of the ABI contract stated once at

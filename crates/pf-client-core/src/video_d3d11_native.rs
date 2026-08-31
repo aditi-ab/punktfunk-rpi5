@@ -1,129 +1,21 @@
-//! Native D3D11VA decode — M5 of the native-decode program: `ID3D11VideoDecoder` driven
-//! straight from pf-bitstream's per-AU plans, with no libavcodec anywhere in the path.
+//! Native D3D11VA backend: pf-bitstream plans drive `ID3D11VideoDecoder` directly,
+//! without FFmpeg. It supports H.264, H.265, and AV1 Profile 0 in NV12 or P010.
+//! This module owns profile enumeration, allocation, and submission; [`pf_dxvadec`] owns
+//! the tested DXVA layouts, packing, plan conversion, profile choice, alignment, and sizing.
+//! Decoded surfaces are converted by [`HandoffRing`] into shareable RGBA textures for the
+//! presenter, so this backend intentionally is not zero-copy; see [`crate::video_d3d11`].
 //!
-//! It is the DXVA counterpart of `video_vk_native` and it replaces exactly one half of
-//! [`crate::video_d3d11`]: what WRITES the decode surface. The other half — the fixed-function
-//! `ID3D11VideoProcessor` blitting NV12/P010 into a ring of shareable RGBA textures the
-//! presenter imports by NT handle ([`HandoffRing`]) — is shared code, byte for byte, because
-//! it is the field-proven half (the NVIDIA NV12-import TDR that forced RGB, the Intel green
-//! bar that forced the stream source rect, the key-0 keyed-mutex protocol). This rung
-//! therefore is NOT zero-copy, and deliberately so: that constraint governs the Vulkan path,
-//! where the decoded image IS the presented image.
+//! [`NativeD3d11Decoder::new`] rejects unsupported codecs, shapes, profiles, or configs so
+//! [`crate::video`]'s ladder can fall through before consuming an AU. In-band shape changes
+//! rebuild the whole [`Session`]. Its pool is one decoder-only `ID3D11Texture2D` array whose
+//! slices are DPB slots; [`pf_dxvadec::align_surface`] and [`pf_dxvadec::pool_size`] are authoritative.
+//! Slots named by a submission remain live until [`NativeD3d11Decoder::release_deferred`]
+//! runs after the decode operation, preventing target/reference aliasing.
 //!
-//! # Admission
-//!
-//! `PUNKTFUNK_DECODER=native-d3d11va` reaches every leg of this rung, and since M10 deleted
-//! libavcodec's D3D11VA hwaccel `auto` does too — this is the only DXVA rung there is. The
-//! evidence behind the two legs is NOT the same, and the session log distinguishes them
-//! (`video::native_evidence`, and the table in `video`'s module docs):
-//!
-//! * **H.264 and H.265** — frame-hash parity against libavcodec on an RTX 4090 and an AMD
-//!   iGPU plus a 30-minute soak (M5), re-confirmed on an RTX 3500 Ada and an Intel Arc on
-//!   2026-08-07 (250/250 both codecs, plus 50/50 HEVC Main 10 on both).
-//!
-//!   ⚠⚠ **All of that was against ONE vendored vector per codec, and for H.264 the vector
-//!   was blind to a defect present on 99% of the frames we actually stream.** It reorders
-//!   and carries a 7-frame DPB against 2 reference frames; a punktfunk host emits
-//!   low-delay IPPP whose DPB is exactly as deep as its 3 reference frames, so 8.2.5's
-//!   sliding window unmarks a picture in the very access unit whose C.4.5.3 bump evicts
-//!   it. `plan_to_dxva` released that surface before assigning the decode target one, and
-//!   `SlotMap::assign` handed it straight back — `CurrPic` and a `RefFrameList` entry
-//!   naming one surface, on 117 of 120 access units. Found 2026-08-07 by planning our own
-//!   host's output on the CPU, fixed with the same deferral the AV1 rung got
-//!   ([`pf_dxvadec::DecodePlanDxva::release_after_decode`]), and the stream is now
-//!   vendored so `low_delay_host_h264_every_frame_hashes_bit_identical_to_libavcodec`
-//!   holds the rung to what it streams rather than only to what it conforms to.
-//!
-//!   HEVC is EXEMPT from that defect, and since 2026-08-07 that is a measurement rather
-//!   than an argument: `H265Planner` snapshots `dpb_refs` after `decode_rps`, so an
-//!   RPS-dropped picture never reaches `RefPicList`, and a vendored low-delay HEVC
-//!   stream from the same host confirms it — 115 of its 120 access units retire a
-//!   picture, 0 alias, and all 115 WOULD alias if the snapshot moved one call earlier.
-//!   `low_delay_host_h265_every_frame_hashes_bit_identical_to_libavcodec` is the pixel
-//!   leg; pf-dxvadec's `pic_h265` tests pin the numbers and drive the counterfactual
-//!   through the conversion.
-//! * **AV1** — wired in M7, and frame-hash parity on the SAME two GPUs since 2026-08-07:
-//!   250/250 delivered frames bit-identical to libavcodec on the RTX 3500 Ada and on the
-//!   Intel Arc. It streams 4K60 on both with a clean 5-minute soak, but that is throughput
-//!   and not pixels — the leg streamed exactly as cleanly while 186 and 245 of those 250
-//!   frames were WRONG, which is what the first run of this harness measured on 2026-08-07
-//!   and what `av1_divergence_map` (below) records. The defect was one line of DPB
-//!   bookkeeping in [`pf_dxvadec::plan_to_dxva_av1`]: it released the picture this frame's
-//!   own `refresh_frame_flags` displaces before assigning the decode target a slot, and
-//!   `SlotMap::assign` hands back the slot just vacated, so 268 of the vector's 274 frames
-//!   named one surface as both `CurrPicTextureIndex` and a `RefFrameMapTextureIndex` entry.
-//!   [`NativeD3d11Decoder::frame_av1`] now applies the conversion's
-//!   `release_after_decode` once the decode op is issued.
-//!
-//!   Since 2026-08-07 a SECOND AV1 stream runs beside the vector: our own host's 4K
-//!   output, `low_delay_host_av1_every_frame_hashes_bit_identical_to_libavcodec`. Not for
-//!   the aliasing — the vector covers that better than any host stream could — but
-//!   because every frame of the vector is `tile_cols = tile_rows = 1`, so every tile
-//!   array `plan_to_dxva_av1` fills had only ever been written at index 0. Our encoder
-//!   splits 4K into two tile rows carried in one Tile Group OBU, which is two tile
-//!   RECORDS from one group; 1440p and below measured single-tile, so 4K is the only
-//!   shape that has it.
-//!
-//!   ⚠ Still no SOAK on the goldens, so this leg's evidence is two vendored streams on two
-//!   vendors — narrower than the H.264/H.265 legs above. ⚠⚠ And both are FILES. "250/250
-//!   delivered frames bit-identical" was true for the entire period the host was shipping
-//!   only the FIRST TILE of every 4K frame: that verification ran against a vendored file
-//!   while the truncation lived in packetisation, and this suite stayed green throughout.
-//!   Nothing here covers fragmentation, reassembly or loss.
-//!
-//! A refusal or an init failure logs and falls through to the standard ladder, so neither the
-//! pin nor the `auto` admission can cost a session its decoder.
-//!
-//! # The decode pool — the part that has already failed once
-//!
-//! [`crate::video_d3d11`]'s module docs record it plainly: a **hand-built decode pool
-//! validated on NVIDIA was rejected by Intel at the first `SubmitDecoderBuffers`**, which is
-//! why the libavcodec rung left the pool to libavcodec. A native decoder has no such luxury —
-//! it must own its pool — so this is the highest-risk code in the milestone, and the answer
-//! is not to invent a pool but to reproduce libavcodec's exactly. What that path does, from
-//! `ff_dxva2_common_frame_params` and `d3d11va_frames_init`:
-//!
-//! * **ONE `ID3D11Texture2D` with `ArraySize = pool size`**, not N individual textures. The
-//!   array slice is the DXVA surface index, which is what makes `DXVA_PicEntry::Index7Bits`
-//!   and the DPB slot the same number.
-//! * **`BindFlags = D3D11_BIND_DECODER`, and nothing else.** Not `SHADER_RESOURCE`, not
-//!   `RENDER_TARGET`: a decode pool that also claims a sampling bind flag is precisely the
-//!   sort of request a driver may honour on one vendor and reject on another. The hand-off's
-//!   `CreateVideoProcessorInputView` needs no bind flag at all.
-//! * **`MiscFlags = 0`** — no sharing. The shareable textures are the RGBA ring's, on the
-//!   other side of the video processor.
-//! * **Dimensions aligned to the codec's granule** (16 for H.264, 128 for HEVC and AV1 —
-//!   [`pf_dxvadec::align_surface`]), so the surface is TALLER than the frame. That padding is
-//!   the green bar the hand-off's stream source rect already excludes. The alignment applies
-//!   to the TEXTURE only: `D3D11_VIDEO_DECODER_DESC` gets the CODED size, exactly as
-//!   `d3d11va_create_decoder` passes `avctx->coded_width/coded_height` while
-//!   `ff_dxva2_common_frame_params` allocates at `FFALIGN(coded, surface_alignment)`.
-//! * **`Usage = D3D11_USAGE_DEFAULT`, `MipLevels = 1`, `SampleDesc.Count = 1`**, format NV12
-//!   or P010 per profile.
-//!
-//! Everything else about pool sizing is [`pf_dxvadec::pool_size`], which is unit-tested; the
-//! driver's own `ConfigMinRenderTargetBuffCount` is honoured there.
-//!
-//! # What is decided here vs decided in pf-dxvadec
-//!
-//! Nothing in this file can be tested by any gate this program runs — it is `cfg(windows)`,
-//! so neither the macOS host nor the Linux container compiles it, and the Windows box only
-//! `cargo check`s. Every decision that could be a pure function therefore lives in
-//! [`pf_dxvadec`] with unit tests: the DXVA buffer layouts, the profile table, the
-//! decoder-config choice, the surface alignment, the pool size, the bitstream packing rules,
-//! the buffer DESCRIPTORS, and the whole plan → picparams/qmatrix/slice-control (AV1:
-//! tile-control) conversion. What is left here is enumeration, allocation and submission —
-//! the parts that genuinely need a device.
-//!
-//! # Three codecs, one submission path
-//!
-//! H.264, HEVC and — since M7 — AV1 Profile 0. AV1 is not a fourth flavour of the same
-//! submission: its buffer SET is different (no quantization matrix at all; `DXVA_Tile_AV1`
-//! records where the other two put slice control), its bitstream buffer holds tile data
-//! rather than start-code-prefixed NALUs, and its access unit is a TEMPORAL UNIT that may
-//! decode several frames of which at most one displays. What it shares — and what it must
-//! not fork — is the session, the pool, the slot map, `DecoderBeginFrame`/`EndFrame` and
-//! the hand-off ring, because those are the parts hardware has already found the traps in.
+//! The decoder is exclusively owned and serialized through `&mut self` (`Send`, not `Sync`);
+//! its session drops before the handoff ring, and busy `DecoderBeginFrame` calls use a bounded retry.
+//! Concealed pictures are not submitted and raise [`NativeD3d11Decoder::take_recovery_request`];
+//! skipped H.265 RASL pictures are clean `Ok(None)`, while refusals remain demotion-eligible errors.
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use pf_dxvadec::{Codec, DxvaProfile};
