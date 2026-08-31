@@ -244,6 +244,11 @@ impl SimpleComponent for AppModel {
         }
 
         let settings = Rc::new(RefCell::new(Settings::load()));
+        // Recolour the shell from the desktop theme (Omarchy only; one stat everywhere else).
+        // Every colour in `CSS` above resolves through libadwaita's named palette, so
+        // redefining those names is all it takes. After the settings load, because the
+        // "Follow the Omarchy theme" switch decides whether it draws.
+        crate::omarchy::install(settings.borrow().follow_os_theme);
         // Device lists for the settings pickers: probe in the background, ready long
         // before the dialog opens. A missing session binary or absent PipeWire just
         // leaves the corresponding list empty (and its picker hidden).
@@ -1260,10 +1265,6 @@ fn load_css() {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     }
-    // Every colour above resolves through libadwaita's named palette (`@accent_color` and
-    // friends), so redefining those names is all it takes to wear the desktop's theme. Does
-    // nothing off Omarchy.
-    crate::omarchy::install();
 }
 
 /// Window actions behind the hosts page's header (the primary menu + "+") — thin

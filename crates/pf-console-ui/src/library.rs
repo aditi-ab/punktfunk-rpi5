@@ -652,10 +652,7 @@ impl Palette {
         let Some(stops) = self.stops else {
             return MESH_COLORS;
         };
-        core::array::from_fn(|i| {
-            let (x, y) = ((i % 4) as f64 / 3.0, (i / 4) as f64 / 3.0);
-            ramp(stops, 0.5 * (x + y) + CELL_RAMP[i])
-        })
+        mesh_colors_of(stops)
     }
 
     /// Four drifting blob colours, for the clients that approximate the mesh with a blob field
@@ -664,6 +661,15 @@ impl Palette {
         let stops = self.stops.unwrap_or(&VIOLET_BLOBS);
         core::array::from_fn(|i| ramp(stops, 0.15 + 0.25 * i as f64))
     }
+}
+
+/// The 16 mesh cells from any 5-stop ramp — [`Palette::mesh_colors`] for the curated ramps,
+/// and the follow-system field, whose stops exist only at runtime (see `shell::build_mesh_os`).
+pub(crate) fn mesh_colors_of(stops: &[(f64, f64, f64)]) -> [(f64, f64, f64); 16] {
+    core::array::from_fn(|i| {
+        let (x, y) = ((i % 4) as f64 / 3.0, (i / 4) as f64 / 3.0);
+        ramp(stops, 0.5 * (x + y) + CELL_RAMP[i])
+    })
 }
 
 /// The brand default's blob ramp — the four colours the pre-palette Android/legacy-Apple field

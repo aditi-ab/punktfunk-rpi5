@@ -41,6 +41,25 @@ struct PendingApproval {
 }
 
 pub fn run(target: Option<&str>) -> u8 {
+    // Publish the desktop's theme to the shell ("Follow system theme"), and keep it
+    // current: a 2 s poll, the same interval and reason as the GTK shell and the web
+    // console — `~/.local/state/omarchy/current` is a SYMLINK `omarchy-theme-set`
+    // re-points, which a file monitor on the resolved path cannot follow. Off Omarchy the
+    // one `present()` stat is the whole cost and no thread starts.
+    #[cfg(target_os = "linux")]
+    if pf_client_core::omarchy::present() {
+        std::thread::spawn(|| loop {
+            let t = pf_client_core::omarchy::current().map(|t| pf_console_ui::os_theme::OsTheme {
+                light: !t.dark,
+                background: (t.bg.0, t.bg.1, t.bg.2),
+                foreground: (t.fg.0, t.fg.1, t.fg.2),
+                accent: (t.accent.0, t.accent.1, t.accent.2),
+            });
+            // The revision only moves on a real change, so the idle case is one file read.
+            pf_console_ui::os_theme::set_os_theme(t);
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+    }
     let identity = match trust::load_or_create_identity() {
         Ok(i) => i,
         Err(e) => {

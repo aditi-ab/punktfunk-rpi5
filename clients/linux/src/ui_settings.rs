@@ -1402,6 +1402,10 @@ pub fn show_scoped(
         .title("Start streams in fullscreen")
         .subtitle("F11, the mouse at the top edge, or L1+R1+Start+Select lead back out")
         .build();
+    let theme_row = adw::SwitchRow::builder()
+        .title("Follow the Omarchy theme")
+        .subtitle("Colours track omarchy-theme-set live — off keeps Punktfunk's own look")
+        .build();
     let wake_row = adw::SwitchRow::builder()
         .title("Auto-wake on connect")
         .subtitle(
@@ -1732,6 +1736,7 @@ pub fn show_scoped(
         decoder_row.set_selected(dec_i as u32);
         stats_row.set_selected(index::stats(s));
         fullscreen_row.set_active(s.fullscreen_on_stream);
+        theme_row.set_active(s.follow_os_theme);
         wake_row.set_active(s.auto_wake);
         inhibit_row.set_active(s.inhibit_shortcuts);
         invert_row.set_active(s.invert_scroll);
@@ -2103,6 +2108,13 @@ pub fn show_scoped(
     if !profile_mode {
         session_group.add(&wake_row);
     }
+    // Appearance is device-level like the console's palette, never part of a profile, and
+    // the row exists only where the theme does — Omarchy — rather than sitting disabled.
+    if !profile_mode && pf_client_core::omarchy::present() {
+        let omarchy_group = group("Omarchy", "");
+        omarchy_group.add(&theme_row);
+        general.add(&omarchy_group);
+    }
     let stats_group = group("Statistics", "");
     stats_group.add(stats_row.widget());
     general.add(&session_group);
@@ -2300,6 +2312,9 @@ pub fn show_scoped(
                     [(stats_row.selected() as usize).min(StatsVerbosity::ALL.len() - 1)],
             );
             s.fullscreen_on_stream = fullscreen_row.is_active();
+            s.follow_os_theme = theme_row.is_active();
+            // Live: the switch must not wait out the shell's 2 s poll to mean something.
+            crate::omarchy::set_enabled(s.follow_os_theme);
             s.auto_wake = wake_row.is_active();
             s.inhibit_shortcuts = inhibit_row.is_active();
             s.invert_scroll = invert_row.is_active();

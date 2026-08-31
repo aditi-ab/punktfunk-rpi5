@@ -41,6 +41,9 @@ pub mod library;
 pub mod model;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod os_marks;
+// The desktop's own theme, published by the embedding binary ("Follow system theme").
+#[cfg(any(target_os = "linux", windows, target_os = "android"))]
+pub mod os_theme;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod platform;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]

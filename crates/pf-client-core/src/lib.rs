@@ -101,6 +101,10 @@ pub mod gamescope;
 // gamepad input mask, which SDL's own focus gate structurally cannot provide there.
 #[cfg(target_os = "linux")]
 pub mod overlay_focus;
+// The desktop's Omarchy theme (a state-dir file read + palette maths): the GTK shell's
+// recolour and the session console's follow-system palette both build from it.
+#[cfg(target_os = "linux")]
+pub mod omarchy;
 // The UI icon set (Lucide path data), shared by the Skia console and the GTK shell so one
 // mark cannot differ between them: pure data, every platform.
 pub mod lucide;
