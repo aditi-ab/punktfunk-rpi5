@@ -1,0 +1,132 @@
+# Build and publish the guided installer binary that scripts/install.sh fetches.
+#
+# The stub at the canonical URL is a dumb passthrough: it downloads THIS artifact, checks its
+# sha256 and execs it. So this job is what makes `curl | sh` work at all, and it has to have
+# run on main at least once before a stub that points at `latest` can ship.
+#
+# musl needs no C cross-toolchain here — punktfunk-setup is pure Rust, so rust-lld plus the
+# target's self-contained crt objects link a static-pie for both architectures (measured:
+# ~1 MB, seconds). See design/installer-v2.md D8 and WP4.1.
+name: setup-binary
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - crates/punktfunk-setup/**
+      - data/platforms.json
+      - Cargo.lock
+      - .gitea/workflows/setup-binary.yml
+  pull_request:
+    paths:
+      - crates/punktfunk-setup/**
+      - data/platforms.json
+      - Cargo.lock
+      - .gitea/workflows/setup-binary.yml
+  workflow_dispatch:
+
+env:
+  REGISTRY: git.unom.io
+  OWNER: unom
+  PKG: punktfunk-setup
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+    env:
+      # rust-lld and the musl target's bundled crt objects; no musl-gcc anywhere.
+      RUSTFLAGS: -C linker=rust-lld -C link-self-contained=yes
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo build --release --locked -p punktfunk-setup --target ${{ matrix.target }}
+      # A dynamically linked binary would fail on exactly the boxes this exists for: a fresh
+      # one, where nothing is installed yet.
+      - name: Assert it is static, then strip it
+        run: |
+          BIN=target/${{ matrix.target }}/release/punktfunk-setup
+          file "$BIN" | grep -q 'static-pie' || { echo "::error::$BIN is not static"; exit 1; }
+          strip "$BIN" || llvm-strip "$BIN"
+          ls -l "$BIN"
+      - name: Checksum
+        run: |
+          BIN=target/${{ matrix.target }}/release/punktfunk-setup
+          NAME=punktfunk-setup_${{ matrix.arch }}
+          cp "$BIN" "$NAME"
+          sha256sum "$NAME" | awk '{print $1}' > "$NAME.sha256"
+          cat "$NAME.sha256"
+      # It has to actually run, not merely link. x86_64 only: the runner cannot execute arm64.
+      - name: Smoke the artifact
+        if: matrix.arch == 'x86_64'
+        run: ./punktfunk-setup_${{ matrix.arch }} --help | grep -q 'PUNKTFUNK_INSTALL_OMARCHY_SETUP'
+      # v3: Gitea's API rejects upload-artifact@v4 (see apple.yml). Download is a zip.
+      - uses: actions/upload-artifact@v3
+        with:
+          name: punktfunk-setup-${{ matrix.arch }}
+          path: |
+            punktfunk-setup_${{ matrix.arch }}
+            punktfunk-setup_${{ matrix.arch }}.sha256
+
+  publish:
+    name: publish to the generic registry
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@v3
+        with:
+          name: punktfunk-setup-x86_64
+      - uses: actions/download-artifact@v3
+        with:
+          name: punktfunk-setup-aarch64
+      - name: Publish
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          set -eu
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          BASE="https://${REGISTRY}/api/packages/${OWNER}/generic/${PKG}"
+          # The versioned path is immutable (409 on a repeat is fine); the `latest` alias is
+          # what the stub fetches, so it is deleted and re-uploaded.
+          for f in punktfunk-setup_x86_64 punktfunk-setup_x86_64.sha256 \
+                   punktfunk-setup_aarch64 punktfunk-setup_aarch64.sha256; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              --user "enricobuehler:${REGISTRY_TOKEN}" \
+              --upload-file "$f" "$BASE/$VERSION/$f")
+            case "$code" in
+              2*) echo "published ($code): $VERSION/$f" ;;
+              409) echo "already published (409, immutable): $VERSION/$f" ;;
+              *) echo "::error::upload failed (HTTP $code): $VERSION/$f"; exit 1 ;;
+            esac
+            curl -fsS -o /dev/null --user "enricobuehler:${REGISTRY_TOKEN}" \
+              -X DELETE "$BASE/latest/$f" 2>/dev/null || true
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              --user "enricobuehler:${REGISTRY_TOKEN}" \
+              --upload-file "$f" "$BASE/latest/$f")
+            case "$code" in
+              2*) echo "published ($code): latest/$f" ;;
+              *) echo "::error::alias upload failed (HTTP $code): latest/$f"; exit 1 ;;
+            esac
+          done
