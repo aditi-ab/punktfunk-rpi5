@@ -12,6 +12,10 @@ import qs.Ui
 // The daily 95 %: what is streaming, who is asking to pair, and which devices are trusted. The web
 // console stays the deep surface — the full access matrix, settings, logs and the game library are
 // one click away and deliberately not duplicated here.
+//
+// **Why tabs.** The sections stacked in one column were taller than the popup could show, so the
+// ones at the bottom were reachable only by growing the panel past the screen. Tabs make each
+// subject's height independent, and leave room for the subjects still to come.
 Panel {
   id: root
   moduleName: "punktfunk"
@@ -39,6 +43,10 @@ Panel {
     return service.state === "stopped" ? Qt.darker(barForeground, 1.55) : barForeground
   }
 
+  // The selected tab. Sticky across opens — an operator who was reading Stats wants Stats again —
+  // except when something is waiting on them, which `onOpenedChanged` overrides below.
+  property string tab: "now"
+
   function tail(fp) {
     var s = String(fp || "")
     return s.length > 10 ? "…" + s.slice(-10) : (s || "—")
@@ -50,8 +58,14 @@ Panel {
   }
 
   // Re-snapshot whenever the panel is opened: the widget's incremental state is good enough for an
-  // icon, but a list somebody is about to act on should be fresh.
-  onOpenedChanged: if (opened) { service.refresh(); service.refreshClients() }
+  // icon, but a list somebody is about to act on should be fresh. A pending device or a waiting PIN
+  // is why the panel was opened at all, so it also picks the tab.
+  onOpenedChanged: {
+    if (!opened) return
+    if (root.needsYou) root.tab = "pairing"
+    service.refresh()
+    service.refreshClients()
+  }
 
   BarIconButton {
     id: button
@@ -119,7 +133,8 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    contentWidth: panel.fittedContentWidth(Style.space(420))
+    // Wider than the old single column: the tab chips have to sit on one row.
+    contentWidth: panel.fittedContentWidth(Style.space(460))
     contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(560))
 
     ColumnLayout {
@@ -169,9 +184,14 @@ Panel {
 
       // systemd is asynchronous and the API only answers once the host is listening, so give it a
       // moment rather than painting "not running" over a host that is still starting.
-      Timer { id: settle; interval: 1500; onTriggered: { service.refresh(); service.refreshClients() } }
+      Timer {
+        id: settle
+        interval: 1500
+        onTriggered: { service.refresh(); service.refreshClients() }
+      }
 
       // ── the one banner worth interrupting for ──────────────────────────────────────────────
+      // Above the tabs, not inside one: it says no credential was sent, which is true of every tab.
       Text {
         visible: service.pinMismatch
         Layout.fillWidth: true
@@ -184,205 +204,74 @@ Panel {
             + "else is on that port."
       }
 
-      // ── now — only while something actually streams ────────────────────────────────────────
-      // The header line already says "idle" or "not running"; a section restating that in grey
-      // is what the first-party panels never do (bluetooth hides a section until it has rows).
-      readonly property bool active: service.sessions > 0 || service.games.length > 0
-
-      PanelSectionHeader {
-        visible: column.active
-        text: "Now"; foreground: root.dim; fontFamily: root.fontFamily
-      }
-
-      Text {
-        visible: column.active && service.games.length === 0
+      // ── tabs ───────────────────────────────────────────────────────────────────────────────
+      // `ButtonGroup` from qs.Ui rather than a hand-rolled chip row: it is the shell's own
+      // pick-one-of-N control, so the chips inherit the same selected / hover / focus painting as
+      // every other Omarchy surface and keyboard walking (h/l + Enter) comes with it.
+      ButtonGroup {
         Layout.fillWidth: true
-        text: "Streaming the desktop."
-        color: root.dim
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
+        options: [
+          { value: "now", label: "Now" },
+          // The count rides the label so the badge on the bar icon has somewhere to land.
+          { value: "pairing",
+            label: service.pending > 0 ? "Pairing · " + service.pending : "Pairing" },
+          { value: "devices", label: "Devices" }
+        ]
+        value: root.tab
+        // Bar-widget panels drive their own cursor and never hand Tab focus to a ButtonGroup (the
+        // component's own docs say so); leaving it focusable would put a second focus owner inside
+        // a popup that already has one.
+        focusable: false
+        foreground: root.foreground
+        accent: root.urgent
+        fontFamily: root.fontFamily
+        fontSize: Style.font.caption
+        onChanged: function (v) { root.tab = v }
       }
 
-      Repeater {
-        model: service.games
-        RowLayout {
-          Layout.fillWidth: true
-          spacing: Style.spacing.sm
-          ColumnLayout {
-            Layout.fillWidth: true
-            spacing: 0
-            Text {
-              Layout.fillWidth: true
-              text: modelData.title || "Desktop"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              elide: Text.ElideRight
-            }
-            Text {
-              Layout.fillWidth: true
-              text: (modelData.client || "—") + " · " + (modelData.plane || "")
-                  + (modelData.state === "grace" ? " · reconnecting" : "")
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              elide: Text.ElideRight
-            }
-          }
-        }
-      }
+      PanelSeparator { Layout.fillWidth: true }
 
-      RowLayout {
-        visible: column.active
+      // ── NOW ────────────────────────────────────────────────────────────────────────────────
+      ColumnLayout {
+        id: nowTab
         Layout.fillWidth: true
         spacing: Style.spacing.sm
-        Item { Layout.fillWidth: true }
-        PanelActionButton {
-          iconText: "󰗼"
-          tooltipText: "End the game"
-          foreground: root.foreground
-          onClicked: service.run(["end-game"], function () { service.refresh() })
-        }
-        PanelActionButton {
-          iconText: "󰚌"
-          tooltipText: "Stop the session"
-          foreground: root.foreground
-          onClicked: service.run(["stop-session"], function () { service.refresh() })
-        }
-      }
+        visible: root.tab === "now"
 
-      // Layout.fillWidth: a ColumnLayout sizes children from implicitWidth (100), overriding the
-      // separator's own parent.width binding — without it the rule stops 100px in.
-      PanelSeparator { Layout.fillWidth: true; visible: column.active }
+        readonly property bool active: service.sessions > 0 || service.games.length > 0
 
-      // ── pairing ────────────────────────────────────────────────────────────────────────────
-      PanelSectionHeader { text: "Pairing"; foreground: root.dim; fontFamily: root.fontFamily }
-
-      RowLayout {
-        Layout.fillWidth: true
-        spacing: Style.spacing.sm
         Text {
+          visible: !nowTab.active
           Layout.fillWidth: true
           wrapMode: Text.Wrap
-          color: root.foreground
+          text: service.state === "stopped"
+                  ? "The host is not running."
+                  : "Nothing is streaming. Devices you have paired can connect at any time."
+          color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
-          text: service.armed
-                  ? (service.pairingPin
-                       ? "Pairing is open — enter " + service.pairingPin + " on the device"
-                       : "Pairing is open")
-                  : "Open a pairing window, then add this host on the device."
         }
-        PanelActionButton {
-          iconText: service.armed ? "󰅖" : "󰐕"
-          tooltipText: service.armed ? "Close the pairing window" : "Open a pairing window"
-          foreground: root.foreground
-          onClicked: service.run(service.armed ? ["pair", "disarm"] : ["pair", "arm"],
-                                 function () { service.refresh() })
-        }
-      }
 
-      // The Moonlight/GameStream flow runs the other way round: the CLIENT shows a PIN and the
-      // host is what needs telling. This is the field an Omarchy user expects to find here.
-      RowLayout {
-        visible: service.pinPending
-        Layout.fillWidth: true
-        spacing: Style.spacing.sm
-        TextField {
-          id: pinField
-          Layout.preferredWidth: Style.space(90)
-          placeholderText: "Moonlight PIN"
-        }
-        PanelActionButton {
-          iconText: "󰄬"
-          tooltipText: "Submit the PIN"
-          foreground: root.foreground
-          onClicked: if (pinField.text.length > 0)
-            service.run(["pin", pinField.text], function () { pinField.text = ""; service.refresh() })
-        }
-      }
-
-      Repeater {
-        model: service.pendingDevices
-        RowLayout {
+        Text {
+          visible: nowTab.active && service.games.length === 0
           Layout.fillWidth: true
-          spacing: Style.spacing.sm
-          ColumnLayout {
-            Layout.fillWidth: true
-            spacing: 0
-            Text {
-              Layout.fillWidth: true
-              text: modelData.name || "(unnamed device)"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              elide: Text.ElideRight
-            }
-            Text {
-              Layout.fillWidth: true
-              text: root.tail(modelData.fingerprint) + " · " + (modelData.age_secs || 0) + "s ago"
-              color: root.dim
-              font.family: "monospace"
-              font.pixelSize: Style.font.caption
-            }
-          }
-          PanelActionButton {
-            iconText: "󰅖"
-            tooltipText: "Deny"
-            foreground: root.urgent
-            onClicked: service.run(["deny", String(modelData.id)], function () { service.refresh() })
-          }
-          PanelActionButton {
-            iconText: "󰄬"
-            tooltipText: "Approve"
-            foreground: root.foreground
-            // By id, never "the newest": two devices knocking at once is exactly when a
-            // "newest" shortcut admits the wrong one.
-            onClicked: service.run(["approve", String(modelData.id)], function () {
-              service.refresh(); service.refreshClients()
-            })
-          }
+          text: "Streaming the desktop."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
         }
-      }
 
-      // ── devices — hidden entirely until something is paired ────────────────────────────────
-      readonly property int deviceCount: service.nativeClients.length + service.gamestreamClients.length
-
-      PanelSeparator { Layout.fillWidth: true; visible: column.deviceCount > 0 }
-      PanelSectionHeader {
-        visible: column.deviceCount > 0
-        text: "Devices · " + column.deviceCount
-        foreground: root.dim; fontFamily: root.fontFamily
-      }
-
-      Repeater {
-        model: service.nativeClients.concat(service.gamestreamClients)
-        Item {
-          id: deviceRow
-          Layout.fillWidth: true
-          implicitHeight: deviceCols.implicitHeight
-          // A GameStream row has a `label` and no grants; a native one has `name` and an access
-          // level. Telling them apart matters: `access` is native-only, and offering it on a
-          // Moonlight device would be an action that cannot work.
-          readonly property bool isNative: modelData.access_level !== undefined
-                                        || modelData.name !== undefined
-          // Unpair is rare and destructive, and a standing column of red trash cans was the
-          // loudest thing in the panel. The button shows while the pointer is on the row — the
-          // bluetooth panel's forget-button idiom. A HoverHandler, not a MouseArea: hover
-          // handlers stay hovered over child items that take their own hover, so the button
-          // does not vanish under the pointer that is about to press it.
-          HoverHandler { id: rowHover }
+        Repeater {
+          model: service.games
           RowLayout {
-            id: deviceCols
-            anchors.left: parent.left
-            anchors.right: parent.right
+            Layout.fillWidth: true
             spacing: Style.spacing.sm
             ColumnLayout {
               Layout.fillWidth: true
               spacing: 0
               Text {
                 Layout.fillWidth: true
-                text: modelData.name || modelData.label || "(unnamed device)"
+                text: modelData.title || "Desktop"
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -390,37 +279,227 @@ Panel {
               }
               Text {
                 Layout.fillWidth: true
-                text: root.tail(modelData.fingerprint)
-                    + " · " + (deviceRow.isNative ? "punktfunk" : "moonlight")
-                    + (modelData.access_level ? " · " + modelData.access_level : "")
+                text: (modelData.client || "—") + " · " + (modelData.plane || "")
+                    + (modelData.state === "grace" ? " · reconnecting" : "")
                 color: root.dim
-                font.family: "monospace"
+                font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 elide: Text.ElideRight
               }
             }
+          }
+        }
+
+        RowLayout {
+          visible: nowTab.active
+          Layout.fillWidth: true
+          spacing: Style.spacing.sm
+          Item { Layout.fillWidth: true }
+          PanelActionButton {
+            iconText: "󰗼"
+            tooltipText: "End the game"
+            foreground: root.foreground
+            onClicked: service.run(["end-game"], function () { service.refresh() })
+          }
+          PanelActionButton {
+            iconText: "󰚌"
+            tooltipText: "Stop the session"
+            foreground: root.foreground
+            onClicked: service.run(["stop-session"], function () { service.refresh() })
+          }
+        }
+      }
+
+      // ── PAIRING ────────────────────────────────────────────────────────────────────────────
+      ColumnLayout {
+        id: pairingTab
+        Layout.fillWidth: true
+        spacing: Style.spacing.sm
+        visible: root.tab === "pairing"
+
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.spacing.sm
+          Text {
+            Layout.fillWidth: true
+            wrapMode: Text.Wrap
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            text: service.armed
+                    ? (service.pairingPin
+                         ? "Pairing is open — enter " + service.pairingPin + " on the device"
+                         : "Pairing is open")
+                    : "Open a pairing window, then add this host on the device."
+          }
+          PanelActionButton {
+            iconText: service.armed ? "󰅖" : "󰐕"
+            tooltipText: service.armed ? "Close the pairing window" : "Open a pairing window"
+            foreground: root.foreground
+            onClicked: service.run(service.armed ? ["pair", "disarm"] : ["pair", "arm"],
+                                   function () { service.refresh() })
+          }
+        }
+
+        // The Moonlight/GameStream flow runs the other way round: the CLIENT shows a PIN and the
+        // host is what needs telling. This is the field an Omarchy user expects to find here.
+        RowLayout {
+          visible: service.pinPending
+          Layout.fillWidth: true
+          spacing: Style.spacing.sm
+          TextField {
+            id: pinField
+            Layout.preferredWidth: Style.space(90)
+            placeholderText: "Moonlight PIN"
+          }
+          PanelActionButton {
+            iconText: "󰄬"
+            tooltipText: "Submit the PIN"
+            foreground: root.foreground
+            onClicked: if (pinField.text.length > 0)
+              service.run(["pin", pinField.text], function () { pinField.text = ""; service.refresh() })
+          }
+        }
+
+        Repeater {
+          model: service.pendingDevices
+          RowLayout {
+            Layout.fillWidth: true
+            spacing: Style.spacing.sm
+            ColumnLayout {
+              Layout.fillWidth: true
+              spacing: 0
+              Text {
+                Layout.fillWidth: true
+                text: modelData.name || "(unnamed device)"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                elide: Text.ElideRight
+              }
+              Text {
+                Layout.fillWidth: true
+                text: root.tail(modelData.fingerprint) + " · " + (modelData.age_secs || 0) + "s ago"
+                color: root.dim
+                font.family: "monospace"
+                font.pixelSize: Style.font.caption
+              }
+            }
             PanelActionButton {
-              visible: rowHover.hovered
-              iconText: "󰗨"
-              tooltipText: "Unpair this device"
+              iconText: "󰅖"
+              tooltipText: "Deny"
               foreground: root.urgent
-              onClicked: service.run(["unpair", modelData.fingerprint], function () {
-                service.refreshClients(); service.refresh()
+              onClicked: service.run(["deny", String(modelData.id)], function () { service.refresh() })
+            }
+            PanelActionButton {
+              iconText: "󰄬"
+              tooltipText: "Approve"
+              foreground: root.foreground
+              // By id, never "the newest": two devices knocking at once is exactly when a
+              // "newest" shortcut admits the wrong one.
+              onClicked: service.run(["approve", String(modelData.id)], function () {
+                service.refresh(); service.refreshClients()
               })
             }
           }
         }
       }
 
-      Text {
-        visible: column.deviceCount > 0
+      // ── DEVICES ────────────────────────────────────────────────────────────────────────────
+      ColumnLayout {
+        id: devicesTab
         Layout.fillWidth: true
-        wrapMode: Text.Wrap
-        color: root.dim
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        text: "Renaming and the full access matrix live in the console."
+        spacing: Style.spacing.sm
+        visible: root.tab === "devices"
+
+        readonly property int deviceCount:
+          service.nativeClients.length + service.gamestreamClients.length
+
+        PanelSectionHeader {
+          visible: devicesTab.deviceCount > 0
+          text: "Paired · " + devicesTab.deviceCount
+          foreground: root.dim; fontFamily: root.fontFamily
+        }
+
+        Text {
+          visible: devicesTab.deviceCount === 0
+          Layout.fillWidth: true
+          wrapMode: Text.Wrap
+          text: "No devices are paired yet. Open a pairing window under Pairing, then add this "
+              + "host on the device."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        Repeater {
+          model: service.nativeClients.concat(service.gamestreamClients)
+          Item {
+            id: deviceRow
+            Layout.fillWidth: true
+            implicitHeight: deviceCols.implicitHeight
+            // A GameStream row has a `label` and no grants; a native one has `name` and an access
+            // level. Telling them apart matters: `access` is native-only, and offering it on a
+            // Moonlight device would be an action that cannot work.
+            readonly property bool isNative: modelData.access_level !== undefined
+                                          || modelData.name !== undefined
+            // Unpair is rare and destructive, and a standing column of red trash cans was the
+            // loudest thing in the panel. The button shows while the pointer is on the row — the
+            // bluetooth panel's forget-button idiom. A HoverHandler, not a MouseArea: hover
+            // handlers stay hovered over child items that take their own hover, so the button
+            // does not vanish under the pointer that is about to press it.
+            HoverHandler { id: rowHover }
+            RowLayout {
+              id: deviceCols
+              anchors.left: parent.left
+              anchors.right: parent.right
+              spacing: Style.spacing.sm
+              ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 0
+                Text {
+                  Layout.fillWidth: true
+                  text: modelData.name || modelData.label || "(unnamed device)"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  elide: Text.ElideRight
+                }
+                Text {
+                  Layout.fillWidth: true
+                  text: root.tail(modelData.fingerprint)
+                      + " · " + (deviceRow.isNative ? "punktfunk" : "moonlight")
+                      + (modelData.access_level ? " · " + modelData.access_level : "")
+                  color: root.dim
+                  font.family: "monospace"
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+              }
+              PanelActionButton {
+                visible: rowHover.hovered
+                iconText: "󰗨"
+                tooltipText: "Unpair this device"
+                foreground: root.urgent
+                onClicked: service.run(["unpair", modelData.fingerprint], function () {
+                  service.refreshClients(); service.refresh()
+                })
+              }
+            }
+          }
+        }
+
+        Text {
+          visible: devicesTab.deviceCount > 0
+          Layout.fillWidth: true
+          wrapMode: Text.Wrap
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          text: "Renaming and the full access matrix live in the console."
+        }
       }
+
     }
   }
 }

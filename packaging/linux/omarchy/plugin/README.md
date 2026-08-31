@@ -5,10 +5,18 @@ Omarchy bar, without opening a browser.
 
 - **bar-widget** — host state and live session count, with a badge when a device is waiting for
   approval. Click opens the panel; right-click opens the web console.
-- **panel** — *Now* (what is streaming, Stop / End game), *Pairing* (open a window, approve or deny
-  the queue, type a Moonlight PIN), *Devices* (both planes, access presets, unpair).
+- **panel** — five tabs over a fixed header:
+  - *Now* — what is streaming, Stop / End game.
+  - *Pairing* — open a window, approve or deny the queue, type a Moonlight PIN.
+  - *Devices* — both planes, access level, unpair on hover.
 - **service** — one long-lived event stream that drives both of the above and pops an Omarchy toast
   when a device asks to pair.
+
+### Why tabs
+
+The sections stacked in one column outgrew the popup: the ones at the bottom were reachable only by
+growing the panel past the screen. Tabs make each subject's height independent, and leave room for
+the subjects still to come.
 
 ## Install
 
@@ -32,8 +40,8 @@ prints JSON on stdout. If something that is not your host answers on the managem
 exits 4 with no credential transmitted, and this plugin shows that state instead of a plausible
 "host not running".
 
-`Ctl.qml` is the only file that spawns anything. Reading it answers "can this plugin leak a
-secret?" in about forty lines.
+`Service.qml`'s `run()` is the only place anything is spawned. Reading it answers "can this plugin
+leak a secret?" in about forty lines.
 
 One process runs continuously: `ctl watch`, in `Service.qml`. Exactly one, because the host caps
 concurrent event streams and the web console holds one of them. It reconnects by itself and emits a
@@ -42,11 +50,16 @@ re-snapshot rather than trust what it has.
 
 ## Status
 
-**Loaded and exercised on Omarchy 4.0.1** (Quickshell 0.3.1, Hyprland 0.56.2) on 2026-08-28:
-`omarchy plugin validate` passes, the shell loads it with no QML warnings, and the widget holds a
-live `punktfunk-host ctl watch` and drives the pairing verbs against a real host.
+**Loaded and exercised on Omarchy 4.0.2** (Hyprland 0.56.2) on 2026-08-31: `omarchy plugin validate`
+passes, the shell loads it with no QML warnings, and every tab renders against a running host.
 
-Three things only running it could have caught, all fixed here:
+### What running it caught this time
+
+- **A missing `open: root.opened` on the `KeyboardPanel` failed in total silence.** No QML warning,
+  no log line — the panel simply never created its layer surface, while the bar icon kept working.
+  If a panel stops opening and nothing is logged, check that binding first.
+
+Three things the first on-glass run caught, all still true:
 
 - **The manifest shape.** Omarchy uses `kinds: [...]` + `entryPoints: { … }`, and the entry-point
   key is camelCase (`barWidget`) while the kind is hyphenated (`bar-widget`). `omarchy plugin
