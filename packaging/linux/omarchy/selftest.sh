@@ -149,6 +149,31 @@ cp "$f" "$WORK/menu-broken"
 XDG_CONFIG_HOME="$WORK/menu" setup_menu >/dev/null 2>&1
 check "a config we cannot parse is left alone" "$WORK/menu-broken" "$f"
 
+echo "app menu"
+
+# `setup_webapp` must run to its END on a box with nothing of ours installed yet — no pre-rename
+# entry, no applications dir at all. That is the ordinary first install, and it is where a bare
+# `x=$(grep … | head -1)` under `set -e` + `pipefail` killed the script dead: the step header had
+# already printed, so the operator saw "==> App menu" and then nothing, and every later step
+# (plugin, menu, hooks, theme, status) silently never ran. Reaching `setup_menu` is the proof.
+mkdir -p "$WORK/bin" "$WORK/webapp"
+printf '#!/bin/sh\nexit 0\n' > "$WORK/bin/omarchy-webapp-install"
+printf '#!/bin/sh\nexit 0\n' > "$WORK/bin/omarchy-webapp-remove"
+chmod +x "$WORK/bin/omarchy-webapp-install" "$WORK/bin/omarchy-webapp-remove"
+
+# A CHILD bash, not a subshell: `set -e` is suppressed for everything inside an `if` condition,
+# subshells and called functions included, so an in-process call would pass even while the real
+# `punktfunk-omarchy setup` dies. The child re-sources the script, so its own `set -euo pipefail`
+# is what governs — the same shell state an operator gets.
+if env HOME="$WORK/webapp" XDG_CONFIG_HOME="$WORK/webapp/config" PATH="$WORK/bin:$PATH" \
+     bash -c "source $SCRIPT help >/dev/null 2>&1; setup_webapp" >/dev/null 2>&1 &&
+   grep -q '"punktfunk-host.console"' "$WORK/webapp/config/omarchy/extensions/omarchy-menu.jsonc"
+then
+  printf '  ok   setup_webapp completes with no prior entry and reaches the menu\n'
+else
+  printf '  FAIL setup_webapp aborted before the menu on a clean box\n'; fails=$((fails + 1))
+fi
+
 echo "ask polarity"
 
 # Setup is the consent act, so a non-interactive shell takes each ask's DEFAULT — yes unless the
