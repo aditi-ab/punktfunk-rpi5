@@ -1,0 +1,17 @@
+│
+◆  punktfunk setup  ·  Bazzite 43 · sysext
+│  https://docs.punktfunk.unom.io/docs/bazzite
+│
+│  ▸ Install now with these settings
+│  ──────────────────────────────────────────────────────────
+│    Components        Host ✓ · Client ✗
+│    Channel           stable
+│    Full controller   yes — Bazzite — virtual Steam Deck pad
+│    Moonlight compat  no  — punktfunk's own apps don't need it
+│    Shared clipboard  no
+│    Start at boot     yes — Bazzite hosts are usually headless
+│    Start services    yes
+│  ──────────────────────────────────────────────────────────
+│    Dry run — print every command, change nothing
+│
+│  ↑↓ move · Enter select/edit · q quit — nothing runs until you confirm
