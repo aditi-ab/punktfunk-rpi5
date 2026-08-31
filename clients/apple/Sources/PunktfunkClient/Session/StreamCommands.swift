@@ -86,6 +86,15 @@ struct StreamCommands: Commands {
             .keyboardShortcut("c", modifiers: [.control, .option, .shift])
             .disabled(session?.isStreaming != true || session?.clipboardAvailable != true)
             #if os(macOS)
+            // The quick-action ring (design/touch-client-overlay.md §2). A Mac has no two-finger
+            // twist, so this menu item and its ⌃⌥⇧O — the desktop clients' own chord for the ring
+            // — are how it opens; a pad opens it with Select+A. Captured, InputCapture's monitor
+            // catches the combo and posts the same notification, so both states end at one toggle.
+            Button("Quick Actions") {
+                NotificationCenter.default.post(name: .punktfunkToggleQuickActions, object: nil)
+            }
+            .keyboardShortcut("o", modifiers: [.control, .option, .shift])
+            .disabled(session?.isStreaming != true)
             // Toggle the window's fullscreen. ⌃⌘F is the macOS-standard fullscreen combo; here it's
             // explicit so it's discoverable AND survives capture — while streaming the stream view
             // swallows keys, so InputCapture's monitor detects the same combo and posts the same

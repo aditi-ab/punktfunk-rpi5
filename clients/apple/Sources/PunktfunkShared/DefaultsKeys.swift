@@ -315,6 +315,18 @@ extension Notification.Name {
     /// The quick-action ring's Keyboard slot: summon the stream view's soft keyboard (iOS).
     public static let punktfunkShowSoftKeyboard = Notification.Name("io.unom.punktfunk.show-soft-keyboard")
 
+    /// Posted by the session view when the quick-action ring opens (`object` is a Bool `NSNumber`).
+    /// The Mac's stream layer releases a captured mouse for as long as it is up and takes capture
+    /// back on close: the ring's buttons are SwiftUI above the video, and a grabbed pointer can
+    /// never reach one. macOS only — the touch clients' fingers reach the ring either way.
+    public static let punktfunkRingOpen = Notification.Name("io.unom.punktfunk.ring-open")
+
+    /// Posted by the app's Stream menu ("Quick Actions", ⌃⌥⇧O) and by InputCapture's monitor when the
+    /// same combo fires while input is CAPTURED (a captured stream view never sees the menu's key
+    /// equivalent). The session view toggles the quick-action ring. macOS only — the touch clients
+    /// open the same ring with the two-finger twist, tvOS with a short Back.
+    public static let punktfunkToggleQuickActions = Notification.Name("io.unom.punktfunk.toggle-quick-actions")
+
     /// Posted by the app's Stream menu ("Toggle Fullscreen", ⌃⌘F) and by InputCapture's monitor
     /// when the same combo fires while input is captured (the menu key-equivalent never reaches a
     /// captured stream view). The key window's `FullscreenController` flips the window's fullscreen

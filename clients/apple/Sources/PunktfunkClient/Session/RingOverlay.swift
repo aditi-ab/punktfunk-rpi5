@@ -5,8 +5,13 @@
 // above the stream costs a refresh of display latency on iOS). tvOS carries the same ring,
 // opened by a short Back on the remote or `Select+A` and driven by the pad (§2.5, §2.6); it
 // has no twist, no tap and no drag, so those paths are iOS-only below.
+//
+// macOS carries it too, opened by ⌃⌥⇧O, the Stream menu or `Select+A` — no twist there
+// either, so it opens CENTRED (`openCentred`) rather than under a hand. A Mac has no touch screen
+// and no software keyboard, so the touch-mode, virtual-controller and keyboard slots are dimmed
+// the way tvOS dims its own: the mouse and the real keyboard already do that work.
 
-#if os(iOS) || os(tvOS)
+#if os(iOS) || os(tvOS) || os(macOS)
 import PunktfunkKit
 import PunktfunkShared
 import SwiftUI
@@ -22,6 +27,9 @@ final class RingState: ObservableObject {
     @Published var clockwise = true
     /// Stream-view points; the ring is centred here, clamped so it stays on screen.
     @Published var centre = CGPoint.zero
+    /// Opened with no point of its own (a chord, a menu item): the overlay puts it in the middle
+    /// of the stage instead, so it never depends on a pointer that may be locked or off-window.
+    @Published var centred = false
     @Published var sheet = false
     /// A destructive slot awaiting its second press (the slot id).
     @Published var armed: String?
@@ -84,7 +92,22 @@ final class RingState: ObservableObject {
 
     func openAt(_ c: CGPoint) {
         centre = c
+        centred = false
         commit()
+    }
+
+    /// Open in the middle of the stage — the keyboard, menu and pad routes, which carry no point.
+    func openCentred() {
+        centred = true
+        commit()
+    }
+
+    /// A chord, a menu item or a remote's Back: open it in the middle of the stage, or close the
+    /// one already up. The routes that carry no point are also the routes with no other way out.
+    func toggleCentred() {
+        guard !committed else { return close() }
+        pressTick &+= 1
+        openCentred()
     }
 
     func close() {
@@ -155,6 +178,13 @@ private struct SlotSpec {
     var state = ""
 }
 
+#if os(tvOS)
+/// Why the touch slots are dimmed on a device with no touch screen.
+private let noTouchScreenReason = "Apple TV has no touch screen"
+#elseif os(macOS)
+private let noTouchScreenReason = "A Mac has no touch screen"
+#endif
+
 private func spec(_ slot: SlotId, _ cfg: OverlayConfig, _ a: RingActions) -> SlotSpec {
     switch slot {
     case .endStream:
@@ -163,9 +193,9 @@ private func spec(_ slot: SlotId, _ cfg: OverlayConfig, _ a: RingActions) -> Slo
         return SlotSpec(id: "disconnect_linger", label: "Disconnect, keep the game running",
                         icon: "rectangle.portrait.and.arrow.right")
     case .touchMode:
-        #if os(tvOS)
+        #if os(tvOS) || os(macOS)
         return SlotSpec(id: "touch_mode", label: "Touch mode", icon: "hand.tap",
-                        enabled: false, reason: "Apple TV has no touch screen")
+                        enabled: false, reason: noTouchScreenReason)
         #else
         let m = a.touchMode()
         let icon: String
@@ -178,7 +208,14 @@ private func spec(_ slot: SlotId, _ cfg: OverlayConfig, _ a: RingActions) -> Slo
                         state: m.rawValue.capitalized)
         #endif
     case .keyboard:
+        #if os(macOS)
+        // No software keyboard on a Mac, and the real one already reaches the host — a slot that
+        // opened nothing would read as a broken button rather than as a platform that has one.
+        return SlotSpec(id: "keyboard", label: "Keyboard", icon: "keyboard",
+                        enabled: false, reason: "Use this Mac's keyboard")
+        #else
         return SlotSpec(id: "keyboard", label: "Keyboard", icon: "keyboard")
+        #endif
     case .stats:
         return SlotSpec(id: "stats", label: "Statistics", icon: "chart.bar", toggle: true,
                         state: a.stats().label)
@@ -187,9 +224,9 @@ private func spec(_ slot: SlotId, _ cfg: OverlayConfig, _ a: RingActions) -> Slo
                         enabled: a.micAvailable(), reason: "No microphone is running this session",
                         toggle: true, state: a.micMuted() ? "Muted" : "On")
     case .pad:
-        #if os(tvOS)
+        #if os(tvOS) || os(macOS)
         return SlotSpec(id: "pad", label: "Virtual controller", icon: "gamecontroller",
-                        enabled: false, reason: "Apple TV has no touch screen")
+                        enabled: false, reason: noTouchScreenReason)
         #else
         return SlotSpec(id: "pad", label: "Virtual controller", icon: "gamecontroller",
                         enabled: a.padAvailable(), reason: "Controller input is not forwarded this session",
@@ -292,10 +329,10 @@ struct RingOverlay: View {
             let margin = ringRadius + slotSize / 2 + 16
             // Clamped so the whole ring stays on screen; a stage narrower than two margins
             // (the editor's) centres it instead of pinning it to one side.
-            let cx = geo.size.width < 2 * margin
+            let cx = state.centred || geo.size.width < 2 * margin
                 ? geo.size.width / 2
                 : min(max(state.centre.x, margin), geo.size.width - margin)
-            let cy = geo.size.height < 2 * margin
+            let cy = state.centred || geo.size.height < 2 * margin
                 ? geo.size.height / 2
                 : min(max(state.centre.y, margin), geo.size.height - margin)
             ZStack {
@@ -303,7 +340,7 @@ struct RingOverlay: View {
                 // while it is open. The editor has no stream under it and draws none.
                 Color.black.opacity(editing == nil ? 0.18 * (phase == 1 ? 1 : phase == 0 ? state.progress : 0) : 0)
                     .contentShape(Rectangle())
-                    #if os(iOS)
+                    #if os(iOS) || os(macOS)
                     .onTapGesture {
                         if state.sheet { state.sheet = false } else { state.close() }
                     }
@@ -335,7 +372,7 @@ struct RingOverlay: View {
                     .offset(drag?.k == k ? drag?.offset ?? .zero : .zero)
                     .position(x: cx + ringRadius * q * cos(rad), y: cy + ringRadius * q * sin(rad))
                     .allowsHitTesting(q > 0)
-                    #if os(iOS)
+                    #if os(iOS) || os(macOS)
                     // Editing: one gesture owns the disc, so a drag never also fires the tap.
                     // In-stream the mask leaves the Button alone.
                     .highPriorityGesture(slotDrag(k), including: editing == nil ? .subviews : .all)
@@ -506,7 +543,7 @@ struct RingOverlay: View {
         }
     }
 
-    #if os(iOS)
+    #if os(iOS) || os(macOS)
     /// Editing: the disc's one gesture. A touch that stays put is the pick; one carried onto
     /// another slot swaps the two (§3.3); released near the centre or over its own slot it
     /// springs home and nothing changes. Masked off in-stream (see the call site).
@@ -668,8 +705,18 @@ extension RingOverlay {
         rows.append(SheetRowSpec(header: "Resolution", label: "Resolution", value: resLabel, adjust: adjustRes) { adjustRes(1) })
         rows.append(SheetRowSpec(label: "Refresh", value: "\(mode.hz) Hz", adjust: adjustHz) { adjustHz(1) })
         let tm = spec(.touchMode, cfg, a)
-        rows.append(SheetRowSpec(header: "Input", label: tm.label, value: tm.state) { a.cycleTouchMode() })
-        rows.append(SheetRowSpec(label: "Keyboard") { [state] in state.close(); a.keyboard() })
+        rows.append(SheetRowSpec(header: "Input", label: tm.label,
+                                 value: tm.enabled ? tm.state : tm.reason,
+                                 enabled: tm.enabled) {
+            if tm.enabled { a.cycleTouchMode() }
+        })
+        let kb = spec(.keyboard, cfg, a)
+        rows.append(SheetRowSpec(label: kb.label, value: kb.enabled ? "" : kb.reason,
+                                 enabled: kb.enabled) { [state] in
+            guard kb.enabled else { return }
+            state.close()
+            a.keyboard()
+        })
         let pad = spec(.pad, cfg, a)
         rows.append(SheetRowSpec(label: pad.label, value: pad.enabled ? pad.state : pad.reason, enabled: pad.enabled) {
             if pad.enabled { a.togglePad() }

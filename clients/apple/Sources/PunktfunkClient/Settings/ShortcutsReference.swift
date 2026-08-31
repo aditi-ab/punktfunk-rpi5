@@ -65,6 +65,7 @@ enum ShortcutsCatalog {
             .init(keys: "⌃⌥⇧Q", text: "Release the mouse and keyboard back to this Mac"),
             .init(keys: "⌃⌥⇧D", text: "Disconnect"),
             .init(keys: "⌃⌥⇧S", text: "Cycle the statistics overlay"),
+            .init(keys: "⌃⌥⇧O", text: "Open the quick actions ring"),
         ]
         if micAvailable {
             keyboard.append(.init(keys: "⌃⌥⇧A", text: "Mute or unmute the microphone"))
@@ -103,6 +104,7 @@ enum ShortcutsCatalog {
         groups.append(.init(title: "Controller", items: [
             .init(keys: "L1 + R1 + Start + Select", text: "Hold to disconnect"),
             .init(keys: "Select + X", text: "Cycle the statistics overlay"),
+            .init(keys: "Select + A", text: "Open the quick actions ring"),
             .init(keys: "Hold Select", text: "Press the host's guide button"),
         ]))
         return groups

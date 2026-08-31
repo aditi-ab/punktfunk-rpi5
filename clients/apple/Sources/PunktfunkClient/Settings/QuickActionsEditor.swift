@@ -6,8 +6,12 @@
 // you tap, and the disc as it will look. It edits whichever layer the settings surface is on —
 // the binding comes from `scoped(SettingsFields.overlayActions)` — so a profile that touches it
 // owns the whole ring (D10).
+//
+// On the Mac the same editor, minus the twist: the backdrop is inert and the ring simply sits
+// open on it, a mouse drags the discs where a finger did, and there is no on-screen controller
+// to configure. A shortcut is removed from its own sheet — a macOS Form has no swipe.
 
-#if os(iOS)
+#if os(iOS) || os(macOS)
 import PunktfunkKit
 import PunktfunkShared
 import SwiftUI
@@ -32,9 +36,10 @@ private let builtinGroups: [SlotGroup] = [
         .init(id: "disconnect_linger", label: "Disconnect, keep the game running"),
     ]),
     .init(id: "Input", options: [
-        .init(id: "touch_mode", label: "Touch mode"),
-        .init(id: "keyboard", label: "Keyboard"),
-        .init(id: "pad", label: "Virtual controller", note: "Shows or hides the on-screen controller"),
+        .init(id: "touch_mode", label: "Touch mode", note: noMacNote),
+        .init(id: "keyboard", label: "Keyboard", note: macKeyboardNote),
+        .init(id: "pad", label: "Virtual controller",
+              note: noMacNote ?? "Shows or hides the on-screen controller"),
         .init(id: "send_text", label: "Send text", note: "Not on this device yet"),
     ]),
     .init(id: "View", options: [.init(id: "stats", label: "Statistics")]),
@@ -45,6 +50,19 @@ private let builtinGroups: [SlotGroup] = [
         .init(id: "host:power.shutdown", label: "Shut down host", note: "Only where the host offers it"),
     ]),
 ]
+
+#if os(macOS)
+/// The slots a Mac cannot serve, said once in the catalogue so a dimmed disc is never a surprise
+/// found after picking it. The profile still syncs — an iPhone on the same profile runs them.
+private let noMacNote: String? = "Not on a Mac — no touch screen"
+private let macKeyboardNote: String? = "Not on a Mac — use its own keyboard"
+/// The pointer verb, so the instructions name what the reader is actually holding.
+private let pickVerb = "Click"
+#else
+private let noMacNote: String? = nil
+private let macKeyboardNote: String? = nil
+private let pickVerb = "Tap"
+#endif
 
 private let modifierKeys = ["ctrl", "alt", "shift", "win"]
 
@@ -95,7 +113,13 @@ struct QuickActionsEditor: View {
     /// The backdrop's middle, where the ring opens and re-opens.
     @State private var centre = CGPoint.zero
 
-    private var cfg: OverlayConfig { OverlayConfig.parse(blob) }
+    private var cfg: OverlayConfig {
+        #if os(macOS)
+        OverlayConfig.parse(blob, platform: .desktop)
+        #else
+        OverlayConfig.parse(blob)
+        #endif
+    }
 
     var body: some View {
         Form {
@@ -104,11 +128,18 @@ struct QuickActionsEditor: View {
                     ZStack {
                         // The Form's own cell colour, resolved dark (the scheme below), so the
                         // backdrop reads as one more field rather than a stage.
+                        #if os(macOS)
+                        Color(nsColor: .controlBackgroundColor)
+                            // No twist on a Mac, so the backdrop carries only the sheet dismiss
+                            // the DialCatcher's tap carries on iOS.
+                            .onTapGesture { ring.sheet = false }
+                        #else
                         Color(.secondarySystemGroupedBackground)
                         // The backdrop runs the real twist. Its tap only dismisses the preview
                         // sheet: UIKit hands a disc tap to this view as well as to the SwiftUI
                         // button above it, so closing the ring here closed it on every pick.
                         DialCatcher(onDial: { ring.handle($0) }) { ring.sheet = false }
+                        #endif
                         RingOverlay(state: ring, cfg: cfg, actions: preview,
                                     editing: RingEditing(pick: { picking = PickSlot(k: $0) }, swap: swap))
                     }
@@ -128,12 +159,14 @@ struct QuickActionsEditor: View {
                 .listRowInsets(EdgeInsets())
             } footer: {
                 Text(overridden
-                     ? "Tap a button to change it, drag one onto another to swap. "
+                     ? "\(pickVerb) a button to change it, drag one onto another to swap. "
                        + "This profile has its own quick actions; the default ring no longer reaches it."
-                     : "Tap a button to change it, drag one onto another to swap.")
+                     : "\(pickVerb) a button to change it, drag one onto another to swap.")
             }
+            #if os(iOS)
             // The virtual controller's preset and look (§4.3), written to the blob's `pad`
-            // through the same binding the ring uses.
+            // through the same binding the ring uses. Absent on the Mac: there is no touch screen
+            // to draw it on, and a `pad` block written from here would configure nothing.
             Section {
                 Picker("Layout", selection: Binding(get: { cfg.pad.layout }, set: { l in setPad { $0.layout = l } })) {
                     Text("Full").tag("full")
@@ -155,6 +188,7 @@ struct QuickActionsEditor: View {
                      + "drives the game; a finger anywhere else drives the touch mode. Layout picks which "
                      + "controls it shows; fewer controls leave more of the picture uncovered.")
             }
+            #endif
             Section {
                 ForEach(cfg.shortcuts, id: \.id) { sc in
                     Button {
@@ -178,9 +212,11 @@ struct QuickActionsEditor: View {
                     }
                     .buttonStyle(.plain)
                 }
+                #if os(iOS)
                 .onDelete { offsets in
                     for id in offsets.map({ cfg.shortcuts[$0].id }) { remove(id) }
                 }
+                #endif
                 Button {
                     let next = (cfg.shortcuts.compactMap { Int($0.id.dropFirst()) }.max() ?? 0) + 1
                     editingShortcut = ShortcutDraft(id: "s\(next)", label: "", keys: [], isNew: true)
@@ -190,8 +226,13 @@ struct QuickActionsEditor: View {
             } header: {
                 Text("Shortcuts")
             } footer: {
+                #if os(macOS)
+                Text("A chord the ring sends to the host. A new one takes the first empty slot; "
+                     + "click one to change or remove it.")
+                #else
                 Text("A chord the ring sends to the host. A new one takes the first empty slot; "
                      + "tap one to change it, swipe to remove it.")
+                #endif
             }
             Section {
                 Button("Reset to default", role: .destructive, action: reset)
@@ -199,15 +240,27 @@ struct QuickActionsEditor: View {
                 Text("Restores the platform ring and removes the shortcuts.")
             }
         }
+        #if os(macOS)
+        // The settings tabs' own style, so the editor reads as one more preferences page rather
+        // than the plain two-column form a bare macOS Form draws.
+        .formStyle(.grouped)
+        #endif
         .navigationTitle("Quick actions")
         .sheet(item: $picking) { p in
             SlotPicker(groups: groups, current: cfg.ring[p.k]?.id ?? "") { id in
                 set(p.k, id)
                 picking = nil
             }
+            // A macOS sheet sizes to its content, and a List's content is no size at all.
+            #if os(macOS)
+            .frame(width: 420, height: 520)
+            #endif
         }
         .sheet(item: $editingShortcut) { draft in
             ShortcutEditor(draft: draft, save: save, delete: { remove(draft.id) })
+                #if os(macOS)
+                .frame(width: 460, height: 600)
+                #endif
         }
     }
 
@@ -437,6 +490,9 @@ private struct ShortcutEditor: View {
                     }
                 }
             }
+            #if os(macOS)
+            .formStyle(.grouped)
+            #endif
             .navigationTitle(draft.isNew ? "New shortcut" : "Shortcut")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
