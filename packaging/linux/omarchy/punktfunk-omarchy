@@ -19,7 +19,11 @@
 set -euo pipefail
 
 readonly TAG="punktfunk-omarchy"        # ufw comment tag: how `remove` finds our rules
-readonly WEBAPP="Punktfunk Console"
+# "Web" is load-bearing: the CLIENT package installs a launcher entry named "Punktfunk Console"
+# (the controller couch shell), so on a box with both, the old name meant two identical rows.
+# Prose everywhere already calls this thing the web console; now the launcher agrees.
+readonly WEBAPP="Punktfunk Web Console"
+readonly WEBAPP_OLD="Punktfunk Console"   # pre-rename installs; setup migrates, remove cleans
 readonly HOOKS_SRC="/usr/share/punktfunk/omarchy"
 readonly HOST_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/punktfunk/host.env"
 readonly DROPIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/punktfunk-host.service.d"
@@ -265,6 +269,13 @@ setup_webapp() {
   local icon=io.unom.Punktfunk
   find /usr/share/icons -name "${icon}.*" -print -quit 2>/dev/null | grep -q . \
     || icon=punktfunk-tray   # older package: the tray mark is the only one installed
+  # Migrate a pre-rename install: an entry with the OLD name is ours only when it lives in the
+  # USER's applications dir — the client package's identically-named /usr entry is not ours.
+  local old
+  old=$(grep -rl "^Name=$WEBAPP_OLD$" "$HOME/.local/share/applications" 2>/dev/null | head -1)
+  if [[ -n "$old" ]]; then
+    omarchy-webapp-remove "$WEBAPP_OLD" >/dev/null 2>&1 || rm -f "$old"
+  fi
   if omarchy-webapp-install "$WEBAPP" "https://localhost:47992" "$icon" 2>/dev/null; then
     ok "\"$WEBAPP\" added to Apps (Super+Space)"
     # Point the entry at a one-shot ticket instead of the bare URL, so opening the console from the
@@ -587,8 +598,10 @@ cmd_remove() {
   close_firewall
   if have omarchy-webapp-remove; then
     omarchy-webapp-remove "$WEBAPP" >/dev/null 2>&1 && ok "\"$WEBAPP\" removed from Apps" || true
+    omarchy-webapp-remove "$WEBAPP_OLD" >/dev/null 2>&1 || true
   else
-    rm -f "$HOME/.local/share/applications/${WEBAPP// /}.desktop" 2>/dev/null || true
+    rm -f "$HOME/.local/share/applications/${WEBAPP// /}.desktop" \
+          "$HOME/.local/share/applications/${WEBAPP_OLD// /}.desktop" 2>/dev/null || true
   fi
   remove_plugin
   remove_menu
