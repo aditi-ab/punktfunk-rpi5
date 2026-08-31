@@ -100,11 +100,15 @@ Write-Host "ISCC: $iscc"
 # --- stage the runtime file set (the portable layout = what the installer lays down) ----------
 # Explicit list, not a wildcard copy: the MSIX layout also holds AppxManifest.xml and the tile
 # Assets, which mean nothing outside a package (the exes embed their icons via build.rs).
+# The ONE Assets\ file that does matter unpackaged is the Lucide icon font: the shell loads it
+# via ms-appx:///Assets/lucide.ttf (app/lucide.rs), and unpackaged that URI resolves to the exe
+# directory — without Assets\lucide.ttf every icon in the shell renders as a private-use box.
 $required = @('punktfunk-client.exe', 'punktfunk-session.exe', 'punktfunk-console.exe', 'punktfunk.exe',
-              'Microsoft.WindowsAppRuntime.Bootstrap.dll', 'SDL3.dll', 'resources.pri')
+              'Microsoft.WindowsAppRuntime.Bootstrap.dll', 'SDL3.dll', 'resources.pri',
+              'Assets\lucide.ttf')
 $stage = Join-Path $OutDir 'portable'
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
-New-Item -ItemType Directory -Force -Path $stage | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $stage 'Assets') | Out-Null
 foreach ($f in $required) {
     $src = Join-Path $LayoutDir $f
     if (-not (Test-Path $src)) { throw "missing '$f' in $LayoutDir (did pack-msix.ps1 run first?)" }
