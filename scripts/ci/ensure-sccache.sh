@@ -23,8 +23,42 @@ set -e
 # (sccache's cache keys are not versioned across incompatible releases).
 SCCACHE_VERSION="${SCCACHE_VERSION:-0.10.0}"
 
+# Fork PRs do not receive SCCACHE_* secrets. CMake stores the launcher name
+# `sccache` in the build dir (and in a restored target/ cache). Replace the
+# binary on PATH so every remaining invocation execs the compiler.
+disable_sccache_wrappers() {
+    bin=$(command -v sccache) || return 0
+    tmp=$(mktemp)
+    printf '%s\n' \
+        '#!/bin/sh' \
+        'case "$1" in' \
+        '--version|--show-stats|--start-server|--stop-server) exit 0 ;;' \
+        'esac' \
+        'exec "$@"' > "$tmp"
+    chmod 0755 "$tmp"
+    install -m0755 "$tmp" "$bin"
+    rm -f "$tmp"
+    echo "sccache at $bin is now a compiler passthrough"
+}
+
+probe_sccache() {
+    [ "${RUSTC_WRAPPER:-}" = "sccache" ] || return 0
+    if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+        echo "sccache secrets absent; compiler passthrough"
+        disable_sccache_wrappers
+        return 0
+    fi
+    if sccache --start-server >/tmp/sccache-probe.log 2>&1; then
+        return 0
+    fi
+    echo "sccache storage is not usable; compiler passthrough"
+    cat /tmp/sccache-probe.log >&2 || true
+    disable_sccache_wrappers
+}
+
 if command -v sccache >/dev/null 2>&1; then
     sccache --version
+    probe_sccache
     exit 0
 fi
 
@@ -86,3 +120,4 @@ case "$(uname -s)" in
 esac
 
 sccache --version
+probe_sccache

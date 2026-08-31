@@ -112,6 +112,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: sccache (no-op once the image bakes it)
+        run: sh scripts/ci/ensure-sccache.sh
+
       # FIRST, because it costs a second and everything after it costs ten minutes.
       #
       # A release tag MUST carry its own Play "What's new". If the file is absent Play does not
