@@ -107,11 +107,14 @@ echo "omarchy menu merge"
 # merge gets the same scrutiny as the picker restore.
 menudir="$WORK/menu/omarchy/extensions"
 mkdir -p "$menudir"
+# The URL row matters: `//` inside a STRING is not a comment, and the first validator treated it
+# as one — truncating the row mid-string and refusing to touch a file the user never broke.
 cat > "$menudir/omarchy-menu.jsonc" <<'EOF'
 {
   // a comment the user wrote
   "personal": {"icon":"","label":"Personal"},
   "personal.notes": {"icon":"󰎞","label":"Notes","action":"true"},
+  "personal.site": {"icon":"󰖟","label":"Site","action":"omarchy-launch-webapp https://example.com"},
 }
 EOF
 cp "$menudir/omarchy-menu.jsonc" "$WORK/menu-before"

@@ -30,13 +30,13 @@ command -v omarchy-notification-send >/dev/null || exit 0
 if [[ -n "$id" ]] && command -v punktfunk-host >/dev/null; then
   omarchy-notification-send \
     --urgency=critical \
-    --icon=network-wireless \
+    --icon=io.unom.Punktfunk \
     "Punktfunk pairing request" "$body" \
     --exec "Approve:punktfunk-host ctl approve $id" \
     --exec "Deny:punktfunk-host ctl deny $id"
 else
   omarchy-notification-send \
     --urgency=critical \
-    --icon=network-wireless \
+    --icon=io.unom.Punktfunk \
     "Punktfunk pairing request" "$body — approve it in the console"
 fi

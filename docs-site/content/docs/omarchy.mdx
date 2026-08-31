@@ -65,7 +65,8 @@ That one command, each step idempotent and each one reversible:
 | **Groups** | offers to add you to `input` (virtual gamepads) and `punktfunk` (the virtual Steam Deck pad). Both apply at your **next login**. |
 | **Autostart** | enables `punktfunk-host` as a user service so it comes up at login. It also installs the `graphical-session.target` binding — see [Autostart and your session](#autostart-and-your-session) for when that does more than nothing. |
 | **Firewall** | adds ufw rules scoped to your local networks (and `tailscale0` if you have it), each tagged `punktfunk-omarchy` so `remove` finds them again. |
-| **App menu** | installs "Punktfunk Console" as an Omarchy webapp — it appears in Apps (`Super`+`Space`). |
+| **Browser trust** *(optional)* | trusts the console's certificate in Chromium (`~/.pki/nssdb`), so it opens with no security warning at all. |
+| **App menu** | installs "Punktfunk Console" as an Omarchy webapp — it appears in Apps (`Super`+`Space`) and opens already logged in, in its own window. |
 | **Toasts** *(optional)* | pairing requests and stream start/stop as Omarchy notifications, with **Approve** / **Deny** buttons on the pairing one. |
 | **Idle** *(optional)* | keeps the screen awake for the length of a stream and restores your own setting afterwards. |
 | **Theme** *(optional)* | a `~/.config/omarchy/themed/` template so the console **and the Linux client** follow `omarchy-theme-set`. |
@@ -251,6 +252,6 @@ punktfunk-omarchy remove                      # the Omarchy wiring
 sudo pacman -R punktfunk-host punktfunk-web   # the packages
 ```
 
-`remove` reverses every step of `setup` — units, drop-in, ufw rules, the webapp, the hooks, the
-theme template — and restores the screen-share picker. Your config and pairings survive both; see
+`remove` reverses every step of `setup` — units, drop-in, ufw rules, the certificate trust, the
+webapp, the hooks, the theme template — and restores the screen-share picker. Your config and pairings survive both; see
 [Uninstall](/docs/uninstall) to clear those too.
