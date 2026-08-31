@@ -28,6 +28,45 @@ pub enum DisplayOwnership {
     SessionManaged,
 }
 
+/// Per-session isolation identity for an INDEPENDENT bare-spawn gamescope session
+/// (`design/gamescope-multiuser.md`): the private planes a multi-user spawn gets instead of the
+/// host-lifetime shared ones. Carried on the backend instance like [`GamescopeRoute`]
+/// (`VirtualDisplay::set_session_isolation`) and consumed only by gamescope's spawn path, which
+/// writes its `LIBEI_SOCKET` relay to `ei_relay` and routes the nested apps' audio by env
+/// (`PULSE_SINK`/`PULSE_SOURCE`). `id` is STABLE per client (cert-fingerprint prefix), which is
+/// what lets the keep-alive registry hand a kept spawn — whose env is baked in — back to the same
+/// client and never to another (`isolation_key`).
+///
+/// Defined on every platform because the host's `SessionContext` carries it beside `compositor`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionIsolation {
+    /// Stable per-client identity (lowercase hex fingerprint prefix, or `anon<seq>`).
+    pub id: String,
+    /// This session's `LIBEI_SOCKET` relay file (`pf_paths::gamescope_ei_socket_file_for`);
+    /// the session's pinned injector reads it, the spawn wrapper writes it.
+    pub ei_relay: std::path::PathBuf,
+    /// The session's stream-sink `node.name` for the nested apps' `PULSE_SINK`. `None` when the
+    /// operator forced monitor-mode capture (no per-session sink exists to route to).
+    pub sink: Option<String>,
+    /// The session's virtual-mic `node.name` for the nested apps' `PULSE_SOURCE`.
+    pub mic_source: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl SessionIsolation {
+    /// Build the identity, computing the relay path under the session env lock (the producer-side
+    /// `XDG_RUNTIME_DIR` read must not race a concurrent handshake's `apply_session_env`).
+    pub fn new(id: String, sink: Option<String>, mic_source: Option<String>) -> SessionIsolation {
+        let ei_relay = crate::with_env_lock(|| pf_paths::gamescope_ei_socket_file_for(&id));
+        SessionIsolation {
+            id,
+            ei_relay,
+            sink,
+            mic_source,
+        }
+    }
+}
+
 /// A created virtual output: a PipeWire source to capture, plus an owned keepalive whose drop
 /// tears the output down (releases the compositor-side resource).
 ///
@@ -140,6 +179,18 @@ pub trait VirtualDisplay: Send {
     /// watcher could overwrite one session's decision before another session's `create` read it.
     /// Default: no-op (only the gamescope backend has sub-modes).
     fn set_gamescope_route(&mut self, _route: Option<crate::GamescopeRoute>) {}
+    /// Set this session's [`SessionIsolation`] (an independent multi-user gamescope spawn —
+    /// `design/gamescope-multiuser.md`). Carried on the backend instance for the same reason as
+    /// [`set_gamescope_route`](Self::set_gamescope_route). Default: no-op (only gamescope's
+    /// bare-spawn path isolates).
+    fn set_session_isolation(&mut self, _iso: Option<SessionIsolation>) {}
+    /// The isolation identity baked into this backend's NEXT create — part of the registry's
+    /// keep-alive reuse key: a kept spawn carries its session's relay path and audio routing in
+    /// its process env, so it may only ever be handed back to the same identity. `None` = not an
+    /// isolated spawn (matches only other `None` creates).
+    fn isolation_key(&self) -> Option<String> {
+        None
+    }
     /// Set the connecting client's cert fingerprint so the backend can give that client a STABLE virtual
     /// monitor identity across reconnects and its saved per-monitor config (notably DPI scaling) is
     /// reapplied — via the OS (Windows EDID serial), the compositor (KWin per-slot output name), or
