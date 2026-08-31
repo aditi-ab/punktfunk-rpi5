@@ -127,7 +127,7 @@ if XDG_CONFIG_HOME="$WORK/menu" menu_is_valid "$f"; then
 else
   printf '  FAIL the merged menu does not parse\n'; cat "$f"; fails=$((fails + 1))
 fi
-if grep -q '"personal.notes"' "$f" && grep -q '"punktfunk.console"' "$f"; then
+if grep -q '"personal.notes"' "$f" && grep -q '"punktfunk-host.console"' "$f"; then
   printf "  ok   the user's rows survived and ours were added\n"
 else
   printf "  FAIL rows lost in the merge\n"; fails=$((fails + 1))
@@ -135,7 +135,7 @@ fi
 
 # Idempotent: a second run must not stack a second copy.
 XDG_CONFIG_HOME="$WORK/menu" setup_menu >/dev/null 2>&1
-n=$(grep -c '"punktfunk.console"' "$f")
+n=$(grep -c '"punktfunk-host.console"' "$f")
 if [[ "$n" == "1" ]]; then printf '  ok   re-running does not duplicate the block\n'
 else printf '  FAIL block appears %s times after two runs\n' "$n"; fails=$((fails + 1)); fi
 

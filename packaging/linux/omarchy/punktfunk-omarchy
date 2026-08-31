@@ -321,16 +321,22 @@ menu_file() { printf '%s/omarchy/extensions/omarchy-menu.jsonc' "${XDG_CONFIG_HO
 readonly MENU_BEGIN="// >>> punktfunk (managed by punktfunk-omarchy — do not edit between these markers)"
 readonly MENU_END="// <<< punktfunk"
 
+# Root id `punktfunk-host`, NOT `punktfunk`: that one belongs to the CLIENT's block
+# (pf-client-core, omarchy_menu.rs — "Open Punktfunk", the game console, connect/wake rows). One
+# merged submenu made sense when only the host had rows; with the client installed by default it
+# was a grab bag, so the two directions split the way the desktop entries already name them —
+# the app is "Punktfunk", administration is "Punktfunk Host". Glyphs verified rendering on
+# 4.0.2's shell (the old set mixed semantics and gave Status an EMPTY icon).
 menu_rows() {
   cat <<'EOF'
-  "punktfunk": {"icon":"󰍹","label":"Punktfunk","aliases":["streaming","stream"]},
-  "punktfunk.console": {"icon":"󰖟","label":"Open console","description":"Pairing, devices, settings — opens already logged in","action":"sh -c 'omarchy-launch-webapp \"$(punktfunk-host ctl console-url || echo https://localhost:47992)\"'"},
-  "punktfunk.pair": {"icon":"󰐕","label":"Pair a device","description":"Open a pairing window and show the PIN","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl pair arm; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
-  "punktfunk.pending": {"icon":"󰀦","label":"Devices waiting","description":"Approve or deny a device that is asking to pair","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl pending; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
-  "punktfunk.devices": {"icon":"󰄋","label":"Paired devices","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl clients; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
-  "punktfunk.stop": {"icon":"󰚌","label":"Stop the session","when":"punktfunk-host ctl status --json | grep -q '\"active_sessions\":[1-9]'","action":"punktfunk-host ctl stop-session"},
-  "punktfunk.status": {"icon":"","label":"Status","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-omarchy status; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
-  "punktfunk.restart": {"icon":"󰑓","label":"Restart the host","action":"systemctl --user restart punktfunk-host"},
+  "punktfunk-host": {"icon":"󰒋","label":"Punktfunk Host","aliases":["streaming","hosting"]},
+  "punktfunk-host.console": {"icon":"󰖟","label":"Open web console","description":"Pairing, devices, settings — opens already logged in","action":"sh -c 'omarchy-launch-webapp \"$(punktfunk-host ctl console-url || echo https://localhost:47992)\"'"},
+  "punktfunk-host.pair": {"icon":"󰐕","label":"Pair a device","description":"Open a pairing window and show the PIN","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl pair arm; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
+  "punktfunk-host.pending": {"icon":"󰀦","label":"Devices waiting","description":"Approve or deny a device that is asking to pair","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl pending; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
+  "punktfunk-host.devices": {"icon":"󰍺","label":"Paired devices","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl clients; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
+  "punktfunk-host.stop": {"icon":"󰓛","label":"Stop the session","when":"punktfunk-host ctl status --json | grep -q '\"active_sessions\":[1-9]'","action":"punktfunk-host ctl stop-session"},
+  "punktfunk-host.status": {"icon":"󰋼","label":"Status","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-omarchy status; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
+  "punktfunk-host.restart": {"icon":"󰑓","label":"Restart the host","action":"systemctl --user restart punktfunk-host"},
 EOF
 }
 
@@ -414,10 +420,10 @@ setup_menu() {
 
   # Both halves of "it worked": it still parses, AND our rows are actually in it. The first alone
   # is satisfied by a no-op edit, which is exactly how the awk bug above reported a false success.
-  if menu_is_valid "$tmp.2" && grep -q '"punktfunk.console"' "$tmp.2"; then
+  if menu_is_valid "$tmp.2" && grep -q '"punktfunk-host.console"' "$tmp.2"; then
     mv -f "$tmp.2" "$MENU_FILE"
     rm -f "$tmp"
-    ok "Punktfunk added to the Omarchy menu (Super+Space → Punktfunk)"
+    ok "host actions in the Omarchy menu (Super+Space → Punktfunk Host)"
   else
     rm -f "$tmp" "$tmp.2"
     bad "the menu edit would not have parsed — your file is untouched"
