@@ -124,6 +124,30 @@ impl WinScreen {
         }
     }
 
+    /// The rows grouped for the wizard's Configure page; the transcript keeps the flat
+    /// `[Tasks]` order. Every row lands in exactly one section (tested).
+    pub fn sections(&self) -> Vec<(&'static str, Vec<Field>)> {
+        let rows = self.rows();
+        let group = |title: &'static str, fields: &[Field]| {
+            let fields: Vec<Field> = fields
+                .iter()
+                .copied()
+                .filter(|f| rows.contains(f))
+                .collect();
+            (title, fields)
+        };
+        [
+            group("Drivers", &[Field::Driver, Field::Gamepad, Field::HdrLayer]),
+            group("Network", &[Field::Gamestream, Field::PublicFw]),
+            group("After install", &[Field::StartService, Field::Tray]),
+            group("Web console", &[Field::Password]),
+            group("Shortcuts", &[Field::DesktopIcon]),
+        ]
+        .into_iter()
+        .filter(|(_, fields)| !fields.is_empty())
+        .collect()
+    }
+
     pub fn editor(&self, field: Field) -> Editor {
         let c = &self.choices;
         match field {
@@ -178,7 +202,7 @@ impl WinScreen {
             Field::StartService => "Start streaming as soon as the install finishes.".into(),
             Field::Tray => "The status icon next to the clock, for every user.".into(),
             Field::Password => {
-                "Signs you into the web console. Shown again on the finish page.".into()
+                "Generated for you — keep it or type your own. It signs you into the web console and is shown again on the finish page.".into()
             }
             Field::DesktopIcon => "A Punktfunk shortcut on the desktop.".into(),
         }
@@ -337,6 +361,34 @@ mod tests {
         assert!(!s.rows().contains(&Field::Password));
         assert_eq!(s.editor(Field::Gamestream), Editor::TriState(None));
         assert_eq!(s.editor(Field::PublicFw), Editor::TriState(None));
+    }
+
+    // Every row belongs to exactly one section, in row order — the wizard shows nothing
+    // twice and forgets nothing.
+    #[test]
+    fn the_sections_partition_the_rows() {
+        for (facts, artifact) in [
+            (fresh_facts(), Artifact::Host),
+            (upgrade_facts(), Artifact::Host),
+            (fresh_facts(), Artifact::Client),
+        ] {
+            let s = screen_of(facts, artifact);
+            let flat: Vec<Field> = s.sections().into_iter().flat_map(|(_, f)| f).collect();
+            assert_eq!(flat, s.rows());
+        }
+        let titles: Vec<&str> = screen_of(fresh_facts(), Artifact::Host)
+            .sections()
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(
+            titles,
+            ["Drivers", "Network", "After install", "Web console"]
+        );
+        assert_eq!(
+            screen_of(fresh_facts(), Artifact::Client).sections()[0].0,
+            "Shortcuts"
+        );
     }
 
     #[test]
