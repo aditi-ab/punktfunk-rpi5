@@ -18,7 +18,10 @@ pub mod exec;
 pub mod plan;
 pub mod report;
 pub mod screen;
+pub mod silent;
 pub mod sys;
+
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +47,20 @@ pub const MGMT_PORT: u16 = 47990;
 /// The uninstaller's file name: docs-site promises `{app}\unins000.exe` (D6), so the pack
 /// step emits the wizard, payload-less, under it — and running under it means teardown only.
 pub const UNINSTALLER_EXE: &str = "unins000.exe";
+
+/// The real box's paths: `config` is `%ProgramData%`, so `host_env()` is the file the
+/// service reads. The Linux-shaped fields point into the same tree and nothing reads them.
+pub fn base_paths(env: &Env) -> BasePaths {
+    let data = PathBuf::from(env.get("ProgramData").unwrap_or(r"C:\ProgramData"));
+    BasePaths {
+        os_release: data.join("os-release"),
+        etc_root: data.clone(),
+        sys: data.clone(),
+        run: data.clone(),
+        config: data,
+        home: PathBuf::from(env.get("USERPROFILE").unwrap_or(r"C:\Users\Default")),
+    }
+}
 
 /// The D6 mode switch: the same wizard exe, launched under the uninstaller's name.
 pub fn launched_as_uninstaller(exe: &std::path::Path) -> bool {
@@ -457,6 +474,16 @@ mod tests {
             .with_path("schtasks");
         let env = Env::of(&[("PROCESSOR_ARCHITECTURE", "AMD64")]);
         (run, env, FakeNet::default(), tempfile::tempdir().unwrap())
+    }
+
+    #[test]
+    fn the_real_box_reads_host_env_under_program_data() {
+        let paths = base_paths(&Env::of(&[("ProgramData", r"D:\PD")]));
+        assert!(paths.host_env().starts_with(r"D:\PD"));
+        assert!(paths.host_env().ends_with("punktfunk/host.env"));
+        assert!(base_paths(&Env::default())
+            .config
+            .starts_with(r"C:\ProgramData"));
     }
 
     #[test]

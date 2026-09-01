@@ -6,7 +6,8 @@
 //! which one is attached.
 //!
 //! `Sink::Buffer` is what the golden suite renders into — one stream, so the ordering of
-//! warnings against commands is part of what the goldens pin.
+//! warnings against commands is part of what the goldens pin. `Sink::Writer` is the Windows
+//! silent path's `/LOG=` file and attached console, same one-stream rule.
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -17,6 +18,7 @@ pub type Buffer = Rc<RefCell<String>>;
 pub enum Sink {
     Stdio,
     Buffer(Buffer),
+    Writer(RefCell<Box<dyn Write>>),
 }
 
 pub struct Plain {
@@ -28,6 +30,14 @@ impl Plain {
     pub fn stdio(color: bool) -> Self {
         Self {
             sink: Sink::Stdio,
+            color,
+        }
+    }
+
+    /// Both streams into one writer — a log file, an attached console.
+    pub fn to_writer(writer: impl Write + 'static, color: bool) -> Self {
+        Self {
+            sink: Sink::Writer(RefCell::new(Box::new(writer))),
             color,
         }
     }
@@ -49,6 +59,11 @@ impl Plain {
             Sink::Buffer(buf) => {
                 buf.borrow_mut().push_str(line);
                 buf.borrow_mut().push('\n');
+            }
+            Sink::Writer(w) => {
+                let mut w = w.borrow_mut();
+                let _ = writeln!(w, "{line}");
+                let _ = w.flush();
             }
             Sink::Stdio if stderr => {
                 let mut e = std::io::stderr();

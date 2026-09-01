@@ -1,0 +1,21 @@
+==> Detected Windows (build 26200), x64 — host installer
+  ok existing install: 0.34.0 at C:\Program Files\punktfunk\
+==> Uninstalling the host (https://docs.punktfunk.unom.io/docs/uninstall)
+  + "C:\Program Files\punktfunk\punktfunk-host.exe" service uninstall
+  + "C:\Program Files\punktfunk\punktfunk-tray.exe" --quit
+  + taskkill /F /IM punktfunk-tray.exe
+  + "C:\Program Files\punktfunk\punktfunk-host.exe" driver uninstall
+  + "C:\Program Files\punktfunk\punktfunk-host.exe" driver uninstall --gamepad
+  + "C:\Program Files\punktfunk\punktfunk-host.exe" driver uninstall --audio
+  + schtasks /End /TN PunktfunkWeb
+  + schtasks /Delete /TN PunktfunkWeb /F
+  + schtasks /End /TN PunktfunkScripting
+  + schtasks /Delete /TN PunktfunkScripting /F
+  ok would stop anything still listening on 47992, 3000
+  + netsh advfirewall firewall delete rule "name=Punktfunk web console (TCP 47992)"
+  + netsh advfirewall firewall delete rule "name=Punktfunk plugin UIs (TCP 47993)"
+  ok would remove C:\Program Files\punktfunk from the machine PATH (entry-by-entry, never a substring delete)
+  ok would remove the Add/Remove Programs entry (HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{7C9E6A52-1F4B-4E8D-A3C7-2B5D8F1E0A93}_is1)
+  ok would remove C:\Program Files\punktfunk
+  ok kept on purpose: %ProgramData%\punktfunk (identity, passwords, update cache) and any VB-CABLE install
+  ok punktfunk was removed

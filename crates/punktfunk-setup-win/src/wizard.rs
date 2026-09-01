@@ -359,7 +359,7 @@ fn back(ctx: &Ctx, cur: WizStep) {
 /// The demo's filesystem: everything the executor may write goes under the same per-process
 /// sandbox root as `demo::sandbox_paths` — including the "install dir" the uninstall preset
 /// removes, staged here with a marker so the removal has something honest to do.
-fn stage_demo_tree() -> String {
+pub(crate) fn stage_demo_tree() -> String {
     let app = sandbox_app_dir();
     let _ = std::fs::create_dir_all(&app);
     let _ = std::fs::write(
