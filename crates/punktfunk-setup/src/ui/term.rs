@@ -13,6 +13,7 @@
 //! keeps the frame the user would be looking at, so a golden can assert on it.
 
 use std::collections::VecDeque;
+#[cfg(unix)]
 use std::fs::File;
 
 use console::Term;
@@ -49,6 +50,7 @@ pub struct ConsoleTerm {
 impl ConsoleTerm {
     /// `None` when there is no controlling terminal — in a container or under a service
     /// `/dev/tty` exists but opens ENXIO, so testing `-r`/`-w` would lie.
+    #[cfg(unix)]
     pub fn open() -> Option<ConsoleTerm> {
         let read = File::options()
             .read(true)
@@ -57,6 +59,14 @@ impl ConsoleTerm {
             .ok()?;
         let write = read.try_clone().ok()?;
         let term = Term::read_write_pair(read, write);
+        term.is_term().then_some(ConsoleTerm { term })
+    }
+
+    /// Windows has no `/dev/tty` and no `curl | sh` stdin to route around — the process
+    /// console is the terminal. The WinUI wizard is the real face; this is the silent path.
+    #[cfg(not(unix))]
+    pub fn open() -> Option<ConsoleTerm> {
+        let term = Term::stdout();
         term.is_term().then_some(ConsoleTerm { term })
     }
 }
