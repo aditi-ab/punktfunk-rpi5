@@ -16,7 +16,7 @@ use punktfunk_setup_win::wizard::WizardRoot;
 use test_reactor::{Op, RecordingBackend};
 use windows_reactor::{
     ChannelDispatcher, Component, ControlId, ControlKind, Dispatcher, DispatcherQueuePriority,
-    Event, PropValue, RenderHost,
+    Event, Prop, PropValue, RenderHost,
 };
 
 type Job = Box<dyn FnOnce()>;
@@ -168,19 +168,20 @@ impl Wiz {
         })
     }
 
-    /// The stepper's dots (WP2.1b): every step of this run's path is one ellipse.
+    /// The stepper's dots (WP2.1b): every step of this run's path is one 10 px ellipse —
+    /// the lockup's two circles are ellipses too, so the size is the tell.
     fn dots(&self) -> usize {
         self.host.with_reconciler(|r| {
-            r.backend
-                .ops
-                .iter()
+            let ops = &r.backend.ops;
+            ops.iter()
                 .filter(|op| {
                     matches!(
                         op,
-                        Op::Create {
-                            kind: ControlKind::Ellipse,
-                            ..
-                        }
+                        Op::SetProp {
+                            id,
+                            prop: Prop::Width,
+                            value: PropValue::F64(w),
+                        } if *w == 10.0 && ops.iter().any(|o| matches!(o, Op::Create { id: c, kind: ControlKind::Ellipse } if c == id))
                     )
                 })
                 .count()
