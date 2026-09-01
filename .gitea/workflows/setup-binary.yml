@@ -50,8 +50,9 @@ jobs:
           - arch: aarch64
             target: aarch64-unknown-linux-musl
     env:
-      # rust-lld and the musl target's bundled crt objects; no musl-gcc anywhere.
-      RUSTFLAGS: -C linker=rust-lld -C link-self-contained=yes
+      # rust-lld and the musl target's bundled crt objects; no musl-gcc anywhere. rustc strips
+      # the binary itself: the image's GNU strip cannot read the aarch64 ELF.
+      RUSTFLAGS: -C linker=rust-lld -C link-self-contained=yes -C strip=symbols
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build
@@ -60,16 +61,16 @@ jobs:
           cargo build --release --locked -p punktfunk-setup --target ${{ matrix.target }}
       # A dynamically linked binary would fail on exactly the boxes this exists for: a fresh
       # one, where nothing is installed yet.
-      - name: Assert it is static, then strip it
+      - name: Assert it is static
         run: |
           BIN=target/${{ matrix.target }}/release/punktfunk-setup
-          # readelf, not file(1): the rust-ci image ships binutils but no file. Static-pie
-          # is exactly ET_DYN with no PT_INTERP.
-          readelf -h "$BIN" | grep -q 'Type:.*DYN' || { echo "::error::$BIN is not ET_DYN"; exit 1; }
+          # No PT_INTERP = nothing to load on a pristine box. The ELF type differs by arch —
+          # x86_64-musl links static-pie (ET_DYN), aarch64-musl static (ET_EXEC) — so the
+          # absent interpreter header is the one invariant. readelf, not file(1): the
+          # rust-ci image ships binutils but no file.
           if readelf -l "$BIN" | grep -q 'INTERP'; then
-            echo "::error::$BIN has PT_INTERP — dynamically linked, not static-pie"; exit 1
+            echo "::error::$BIN has PT_INTERP — dynamically linked, not static"; exit 1
           fi
-          strip "$BIN" || llvm-strip "$BIN"
           ls -l "$BIN"
       - name: Checksum
         run: |
