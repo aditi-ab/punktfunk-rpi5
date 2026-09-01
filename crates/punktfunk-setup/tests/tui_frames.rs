@@ -9,6 +9,7 @@
 
 use punktfunk_setup::choices::{Choices, Pins};
 use punktfunk_setup::demo;
+use punktfunk_setup::ui::logo::MARK_PX;
 use punktfunk_setup::ui::summary::{Screen, Step};
 use punktfunk_setup::ui::term::{Key, ScriptedTerm, Terminal};
 use punktfunk_setup::ui::theme::{Caps, Colors};
@@ -37,7 +38,7 @@ fn drive_all(preset: &str, keys: &[Key]) -> (String, Step, Screen, Vec<String>) 
     let mut term = ScriptedTerm::new(keys);
     let step = {
         let tui = Tui::new(&mut term as &mut dyn Terminal, caps(), 0);
-        tui.settings(&mut screen)
+        tui.settings(&mut screen, 0)
     };
     (term.screen().to_string(), step, screen, term.frames.clone())
 }
@@ -139,6 +140,61 @@ fn the_row_editor_frame_names_the_grant() {
     assert!(
         editor.contains("usbip attach"),
         "the editor hid what the row grants"
+    );
+}
+
+/// The mark is part of the settings frame, so picking Client greys the host circle under the
+/// cursor instead of leaving a banner that disagrees with the row below it.
+#[test]
+fn the_mark_mutes_the_half_that_is_not_being_installed() {
+    let colour = Caps {
+        tty: true,
+        colors: Colors::Truecolor,
+        width: 100,
+    };
+    let render = |host: bool, client: bool| {
+        let facts = demo::preset("arch-fresh").expect("preset");
+        let mut choices = Choices::derive(&facts, &Pins::default());
+        choices.components.host = host;
+        choices.components.client = client;
+        let mut screen = Screen::new(facts, choices);
+        let mut term = ScriptedTerm::new(&[Key::Enter]);
+        {
+            let tui = Tui::new(&mut term as &mut dyn Terminal, colour, 0);
+            tui.settings(&mut screen, 0);
+        }
+        term.screen().to_string()
+    };
+
+    let host_only = render(true, false);
+    let both = render(true, true);
+    let client_only = render(false, true);
+
+    assert!(host_only.contains('▀'), "the frame carries no mark at all");
+    assert_ne!(
+        host_only, both,
+        "selecting the client changed nothing in the mark"
+    );
+    assert_ne!(client_only, both);
+    assert_ne!(host_only, client_only);
+
+    // Scoped to the mark's own rows: the lens colour doubles as the TUI's highlight, so the
+    // row labels below carry it whatever the components say.
+    let mark_of = |frame: &str| {
+        frame
+            .lines()
+            .take(MARK_PX / 2)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let lens = "\x1b[38;2;210;201;251m";
+    assert!(
+        mark_of(&both).contains(lens),
+        "both installed should light the lens"
+    );
+    assert!(
+        !mark_of(&host_only).contains(lens),
+        "a host-only install must not light the lens"
     );
 }
 

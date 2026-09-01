@@ -15,9 +15,10 @@
 
 use crate::ui::theme::{Caps, Colors, Layer, Rgb};
 
-/// The mark is square, and must be even: two pixel rows share a cell. 20 px is 10 text rows —
-/// big enough to read as the lens, small enough not to own the screen above a prompt.
-pub const MARK_PX: usize = 20;
+/// The mark is square, and must be even: two pixel rows share a cell. 24 px is 12 text rows.
+/// Below 24 the lens stops being a lens: half-blocks give one sample per half-cell, so the
+/// overlap collapses into a stepped wedge and the circles read as blobs. Measured, not guessed.
+pub const MARK_PX: usize = 24;
 pub const MARK_COLS: u16 = MARK_PX as u16;
 
 const LIGHT: Rgb = Rgb(0xa7, 0x9f, 0xf8);
@@ -75,11 +76,55 @@ fn diagonal() -> (f32, f32) {
     (dx / len, dy / len)
 }
 
+/// Which halves of the mark are lit: the left circle is the host, the right one the client.
+///
+/// A component that is not being installed is muted rather than dropped, so the mark stays the
+/// mark and the screen says what it is about to do without a word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Parts {
+    pub host: bool,
+    pub client: bool,
+}
+
+impl Default for Parts {
+    fn default() -> Self {
+        Parts {
+            host: true,
+            client: true,
+        }
+    }
+}
+
+/// Desaturate toward the colour's own luminance, leaving brightness alone.
+///
+/// Dimming would be the obvious way to mute, and it is wrong: the terminal background is
+/// unknown, so "darker" reads as muted on a dark theme and as *more* prominent on a light one.
+/// Dropping the colour at the same luminance reads the same either way.
+fn muted(c: Rgb) -> Rgb {
+    const DESAT: f32 = 0.8;
+    let luma = 0.299 * f32::from(c.0) + 0.587 * f32::from(c.1) + 0.114 * f32::from(c.2);
+    let mix = |v: u8| (f32::from(v) + (luma - f32::from(v)) * DESAT).round() as u8;
+    Rgb(mix(c.0), mix(c.1), mix(c.2))
+}
+
+/// The mark at rest, with both circles lit.
+pub fn frame(t: f32) -> Vec<Vec<Option<Rgb>>> {
+    frame_parts(t, Parts::default())
+}
+
 /// The pixel grid at `t`, where 0.0 is fully apart and 1.0 is the mark at rest.
 ///
 /// `None` is a pixel the mark does not cover. The draw order is the SVG's: the deep circle
-/// sits over the light one, and the lens over both.
-pub fn frame(t: f32) -> Vec<Vec<Option<Rgb>>> {
+/// sits over the light one, and the lens over both. The lens is lit only when both are — it is
+/// where the two meet, and there is nothing to meet with only one of them installed.
+pub fn frame_parts(t: f32, parts: Parts) -> Vec<Vec<Option<Rgb>>> {
+    let light_c = if parts.host { LIGHT } else { muted(LIGHT) };
+    let deep_c = if parts.client { DEEP } else { muted(DEEP) };
+    let lens_c = if parts.host && parts.client {
+        LENS
+    } else {
+        muted(LENS)
+    };
     // Ease-out: most of the travel happens early, so the circles settle rather than arrive.
     let eased = 1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3);
     let gap = SPREAD * (1.0 - eased);
@@ -96,9 +141,9 @@ pub fn frame(t: f32) -> Vec<Vec<Option<Rgb>>> {
                 .map(|col| {
                     let x = x0 + (col as f32 + 0.5) * w / MARK_PX as f32;
                     match (inside(light, x, y), inside(deep, x, y)) {
-                        (true, true) => Some(LENS),
-                        (_, true) => Some(DEEP),
-                        (true, _) => Some(LIGHT),
+                        (true, true) => Some(lens_c),
+                        (_, true) => Some(deep_c),
+                        (true, _) => Some(light_c),
                         _ => None,
                     }
                 })
@@ -150,8 +195,8 @@ pub fn render(grid: &[Vec<Option<Rgb>>], caps: &Caps, indent: usize) -> String {
 }
 
 /// The mark as it settles, for a caller that will not animate.
-pub fn still(caps: &Caps, indent: usize) -> String {
-    render(&frame(1.0), caps, indent)
+pub fn still(caps: &Caps, indent: usize, parts: Parts) -> String {
+    render(&frame_parts(1.0, parts), caps, indent)
 }
 
 /// The grid as one character per pixel, for tests and for eyeballing the geometry.
@@ -302,6 +347,79 @@ mod tests {
         }
     }
 
+    /// Muting drops the colour and keeps the brightness. Darkening instead would read as muted
+    /// on a dark terminal and as emphasis on a light one.
+    #[test]
+    fn muting_greys_a_colour_without_darkening_it() {
+        let luma =
+            |c: Rgb| 0.299 * f32::from(c.0) + 0.587 * f32::from(c.1) + 0.114 * f32::from(c.2);
+        let spread = |c: Rgb| i32::from(c.0.max(c.1).max(c.2)) - i32::from(c.0.min(c.1).min(c.2));
+        for c in [LIGHT, DEEP, LENS] {
+            let m = muted(c);
+            assert!(
+                (luma(m) - luma(c)).abs() < 2.0,
+                "{c:?} changed brightness when muted"
+            );
+            assert!(
+                spread(m) * 3 < spread(c),
+                "{c:?} kept its colour when muted"
+            );
+        }
+    }
+
+    /// The left circle is the host, the right one the client, and the lens belongs to both.
+    #[test]
+    fn only_the_unselected_half_of_the_mark_is_muted() {
+        let both = frame(1.0);
+        let find = |want: Rgb| {
+            both.iter()
+                .enumerate()
+                .find_map(|(r, row)| row.iter().position(|c| *c == Some(want)).map(|c| (r, c)))
+                .expect("the settled mark carries every colour")
+        };
+        let (lr, lc) = find(LIGHT);
+        let (dr, dc) = find(DEEP);
+        let (nr, nc) = find(LENS);
+
+        let host = frame_parts(
+            1.0,
+            Parts {
+                host: true,
+                client: false,
+            },
+        );
+        assert_eq!(host[lr][lc], Some(LIGHT), "the host circle must stay lit");
+        assert_eq!(
+            host[dr][dc],
+            Some(muted(DEEP)),
+            "the client circle must mute"
+        );
+        assert_eq!(
+            host[nr][nc],
+            Some(muted(LENS)),
+            "nothing meets with one half installed"
+        );
+
+        let client = frame_parts(
+            1.0,
+            Parts {
+                host: false,
+                client: true,
+            },
+        );
+        assert_eq!(client[lr][lc], Some(muted(LIGHT)));
+        assert_eq!(client[dr][dc], Some(DEEP));
+
+        let all = frame_parts(
+            1.0,
+            Parts {
+                host: true,
+                client: true,
+            },
+        );
+        assert_eq!(all[nr][nc], Some(LENS), "both installed lights the lens");
+    }
+
     #[test]
     fn every_two_pixel_rows_share_one_text_row() {
         let caps = caps(Colors::Truecolor, 80, true);
@@ -310,6 +428,9 @@ mod tests {
             0,
             "an odd mark would leave a half-filled last row"
         );
-        assert_eq!(still(&caps, 0).lines().count(), MARK_PX / 2);
+        assert_eq!(
+            still(&caps, 0, Parts::default()).lines().count(),
+            MARK_PX / 2
+        );
     }
 }

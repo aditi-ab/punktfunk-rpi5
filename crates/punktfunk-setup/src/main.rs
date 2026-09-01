@@ -270,9 +270,13 @@ fn main() -> ExitCode {
     }
 
     if let Some(tui) = &tui {
-        tui.intro(logo::intro_level(&caps, yes));
+        let parts = logo::Parts {
+            host: choices.components.host,
+            client: choices.components.client,
+        };
+        let drawn = tui.intro(logo::intro_level(&caps, yes), parts);
         let mut screen = Screen::new(facts.clone(), choices.clone());
-        match tui.settings(&mut screen) {
+        match tui.settings(&mut screen, drawn) {
             Step::Cancel => {
                 tui.outro(&["Nothing was changed.".to_string()]);
                 return ExitCode::SUCCESS;

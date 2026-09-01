@@ -77,30 +77,40 @@ impl<'a> Tui<'a> {
         self.dim(BAR)
     }
 
-    /// The mark, animated or still, per D7's ladder.
-    pub fn intro(&self, level: Intro) {
+    /// Can this terminal draw the mark at all?
+    fn marked(&self) -> bool {
+        logo::intro_level(&self.caps, false) != Intro::Plain
+    }
+
+    /// The mark, animated or still, per D7's ladder. Returns the rows it left on screen, which
+    /// the settings loop clears before drawing its own copy — so the two never stack up.
+    pub fn intro(&self, level: Intro, parts: logo::Parts) -> usize {
         match level {
-            Intro::Plain => {}
-            Intro::Static => self.write(&logo::still(&self.caps, 2)),
+            Intro::Plain => return 0,
+            Intro::Static => self.write(&logo::still(&self.caps, 2, parts)),
             Intro::Animated => {
                 for i in 0..logo::FRAMES {
                     let t = i as f32 / (logo::FRAMES - 1) as f32;
                     if i > 0 {
                         self.term.borrow_mut().clear_last_lines(MARK_ROWS);
                     }
-                    self.write(&logo::render(&logo::frame(t), &self.caps, 2));
+                    self.write(&logo::render(&logo::frame_parts(t, parts), &self.caps, 2));
                     if self.frame_ms > 0 {
                         std::thread::sleep(std::time::Duration::from_millis(self.frame_ms));
                     }
                 }
             }
         }
+        MARK_ROWS
     }
 
     /// The settings list. Returns what the user chose to do with it.
-    pub fn settings(&self, screen: &mut Screen) -> Step {
+    ///
+    /// `already` is what the intro left on screen; the first repaint clears exactly that, so the
+    /// mark the intro animated is replaced by the one this frame owns rather than pushed down.
+    pub fn settings(&self, screen: &mut Screen, already: usize) -> Step {
         self.term.borrow_mut().hide_cursor();
-        let mut drawn = 0usize;
+        let mut drawn = already;
         let outcome = loop {
             let frame = self.frame(screen);
             if drawn > 0 {
@@ -140,6 +150,15 @@ impl<'a> Tui<'a> {
         let mut out = String::new();
         let bar = self.bar();
         let rule = self.dim(&"─".repeat(58));
+        // The mark is part of the frame, not a one-off banner, so muting follows the Components
+        // row live: pick Client and the host circle greys out under the cursor.
+        if self.marked() {
+            let parts = logo::Parts {
+                host: screen.choices.components.host,
+                client: screen.choices.components.client,
+            };
+            out.push_str(&logo::render(&logo::frame_parts(1.0, parts), &self.caps, 2));
+        }
         out.push_str(&format!("{bar}\n"));
         out.push_str(&format!(
             "{}  {}\n",
