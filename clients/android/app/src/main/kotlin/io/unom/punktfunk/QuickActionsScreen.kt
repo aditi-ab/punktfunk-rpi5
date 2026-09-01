@@ -260,6 +260,9 @@ private fun RingStage(cfg: OverlayConfig, editing: RingEditing) {
                 .pointerInput(Unit) {
                     streamTouchInput(
                         handle = 0L, stylus = null, videoAspect = 1f, trackpad = true, invertScroll = false,
+                        // Only the twist is this stage's: a lone finger keeps scrolling the
+                        // settings page under the card (dialOnly's whole point).
+                        dialOnly = true,
                         onCycleStats = {}, onKeyboard = {},
                     ) { ev ->
                         when (ev) {
