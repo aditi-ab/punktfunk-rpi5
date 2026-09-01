@@ -1,20 +1,12 @@
-//! The Skia console UI on Android (design/android-skia-console-port.md, WP3): the same
-//! `pf-console-ui` shell the Linux/Windows session binary shows, drawn by this crate onto
-//! the `SurfaceView` Kotlin hands over, through Skia's GL backend on an EGL context this
-//! module owns. Kotlin keeps the services (trust store, settings, discovery, the mTLS
-//! library fetch, WoL, pairing) and feeds the console's models over these JNI seams; the
-//! console's own asks — start a session, quit, copy text — come back as events.
+//! Skia console UI drawn onto Android's `SurfaceView` through an owned EGL context.
 //!
-//! The seam in one breath: `nativeConsoleCreate` builds the console (a `jlong` handle),
-//! the surface-lifecycle calls hand it somewhere to draw, `nativeConsoleSet*` /
-//! `nativeConsoleLibrary*` push model snapshots (JSON, the model types' own serde shape),
-//! `nativeConsoleMenu`/`PadSample`/`Pointer`/`Key`/`Text` are input,
-//! `nativeConsoleNextEvent` is the blocking event poll (actions, haptic pulses, editing
-//! state, settings to persist), `nativeConsoleDrainCmds` the command bus.
+//! Kotlin retains trust, discovery, library, wake, and pairing services and exchanges their serde
+//! models through JNI. Console actions return through a blocking event poll and command drain.
 //!
-//! JSON everywhere a struct crosses: `HostRow`, `PairPhase`, `WakeStatus`, `LibraryGame`,
-//! `LibraryPhase`, `ConsoleCmd`, `OverlayAction`, `Settings`, `KnownHosts` all serialize with
-//! serde in their defining crates — there is no second Android-side mirror to drift.
+//! `nativeConsoleCreate` returns an opaque integer key into an `Arc<ConsoleHost>` table. Lookups
+//! retain the host across destroy-vs-poll races; destroy removes the key, and the final reference
+//! stops and joins the render thread. Surface, model, menu, pointer, key, and text calls all use the
+//! same retained lookup rather than exposing a Rust pointer to Kotlin.
 
 mod egl;
 mod gpu;
@@ -32,7 +24,9 @@ use pf_console_ui::{
     Platform, SnapshotStore, Stale, WakeStatus,
 };
 use punktfunk_core::config::GamepadPref;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 /// How long `nativeConsoleNextEvent` blocks at most — short enough that Kotlin's poll thread
@@ -113,16 +107,39 @@ struct PadsJson {
     pads: Vec<PadJson>,
 }
 
-/// The `jlong` handle → the host. Every entry point takes the handle Kotlin got from
-/// `nativeConsoleCreate` and returns it to `nativeConsoleDestroy` exactly once, never
-/// concurrently with the destroy (Kotlin owns that ordering on its main thread; the event
-/// poll thread is stopped and joined before destroy — same contract as the rumble poll).
-fn host(handle: jlong) -> Option<&'static ConsoleHost> {
+static NEXT_CONSOLE_HANDLE: AtomicU64 = AtomicU64::new(0x2000_0000_0000_0001);
+
+fn console_hosts() -> &'static Mutex<HashMap<jlong, Arc<ConsoleHost>>> {
+    static HOSTS: OnceLock<Mutex<HashMap<jlong, Arc<ConsoleHost>>>> = OnceLock::new();
+    HOSTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn insert_host(host: ConsoleHost) -> jlong {
+    let host = Arc::new(host);
+    let mut hosts = crate::session::lock_recover(console_hosts());
+    loop {
+        let handle = NEXT_CONSOLE_HANDLE.fetch_add(1, Ordering::Relaxed) as jlong;
+        if handle != 0 && !hosts.contains_key(&handle) {
+            hosts.insert(handle, host);
+            return handle;
+        }
+    }
+}
+
+fn host(handle: jlong) -> Option<Arc<ConsoleHost>> {
     if handle == 0 {
         return None;
     }
-    // SAFETY: live handle per the create/destroy contract above.
-    Some(unsafe { &*(handle as *const ConsoleHost) })
+    crate::session::lock_recover(console_hosts())
+        .get(&handle)
+        .cloned()
+}
+
+fn remove_host(handle: jlong) -> Option<Arc<ConsoleHost>> {
+    if handle == 0 {
+        return None;
+    }
+    crate::session::lock_recover(console_hosts()).remove(&handle)
 }
 
 fn json_arg<T: serde::de::DeserializeOwned>(env: &mut jni::Env, s: &JString) -> Option<T> {
@@ -136,9 +153,10 @@ fn json_arg<T: serde::de::DeserializeOwned>(env: &mut jni::Env, s: &JString) -> 
     }
 }
 
-/// `NativeBridge.nativeConsoleCreate(optionsJson): Long` — build the console (shell + fonts on
-/// the caller's thread, then its render thread parked until a surface arrives). `0` on failure
-/// (logged); Kotlin then keeps its own console.
+/// Build the console and return its opaque table key.
+///
+/// The render thread parks until a surface arrives. `0` means setup failed and Kotlin keeps its
+/// fallback console; no Rust allocation address crosses JNI.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleCreate(
     mut env: EnvUnowned,
@@ -159,28 +177,27 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleCrea
             platform: Platform::Android,
             gpu_cache_bytes: opts.gpu_cache_bytes.max(16 << 20),
         };
-        let host = ConsoleHost::start(console_opts, opts.entry.into_entry(), store);
-        Ok(Box::into_raw(Box::new(host)) as jlong)
+        let host = match ConsoleHost::start(console_opts, opts.entry.into_entry(), store) {
+            Ok(host) => host,
+            Err(e) => {
+                log::error!("console: render thread spawn failed: {e}");
+                return Ok(0);
+            }
+        };
+        Ok(insert_host(host))
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `NativeBridge.nativeConsoleDestroy(handle)` — stop the render thread (joined) and free.
-///
-/// # Safety contract
-/// `handle` must be `0` or a live handle, destroyed once, after the event poll thread stopped.
+/// Remove one console key; the final retained call then stops and joins the render thread.
+/// Zero, stale, duplicate, and concurrent destroys are no-ops.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleDestroy(
     _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) {
-    if handle == 0 {
-        return;
-    }
-    // SAFETY: live handle per the contract; ownership returns here exactly once.
-    let host = unsafe { Box::from_raw(handle as *mut ConsoleHost) };
-    host.stop();
+    drop(remove_host(handle));
 }
 
 /// `NativeBridge.nativeConsoleSurfaceCreated(handle, surface)` — the `SurfaceView`'s surface is

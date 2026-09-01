@@ -231,6 +231,11 @@ fn guard<F: FnOnce() -> PunktfunkStatus>(f: F) -> PunktfunkStatus {
     std::panic::catch_unwind(AssertUnwindSafe(f)).unwrap_or(PunktfunkStatus::Panic)
 }
 
+fn ffi_slice_bytes<T>(len: usize) -> Option<usize> {
+    len.checked_mul(std::mem::size_of::<T>())
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+}
+
 /// `guard` for the entry points that return nothing — the teardown/mutator calls, which have no
 /// status to report a panic through. They still must not let one unwind into C: since Rust 1.81
 /// that is a hard abort rather than undefined behaviour, but aborting the CALLER'S process because
@@ -378,8 +383,8 @@ pub unsafe extern "C" fn punktfunk_set_log_callback(
 /// Returns `Ok` if at least one datagram was sent. Call off the UI thread.
 ///
 /// # Safety
-/// `macs` must point to at least `mac_count * 6` readable bytes. `last_known_ip`, if non-NULL,
-/// must be a NUL-terminated string.
+/// For a representable nonzero count, `macs` must point to `mac_count * 6` readable bytes.
+/// `last_known_ip`, if non-NULL, must be a NUL-terminated string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_wake_on_lan(
     macs: *const u8,
@@ -390,12 +395,15 @@ pub unsafe extern "C" fn punktfunk_wake_on_lan(
         if macs.is_null() {
             return PunktfunkStatus::NullPointer;
         }
-        if mac_count == 0 {
+        let Some(byte_len) = ffi_slice_bytes::<crate::wol::Mac>(mac_count) else {
+            return PunktfunkStatus::InvalidArg;
+        };
+        if byte_len == 0 {
             return PunktfunkStatus::InvalidArg;
         }
-        // SAFETY: per the ABI contract - a caller-supplied pointer/length pair describing one
-        // readable region, borrowed only for this call.
-        let bytes = unsafe { std::slice::from_raw_parts(macs, mac_count * 6) };
+        // SAFETY: the ABI contract supplies `mac_count` MACs; `ffi_slice_bytes` proved their byte
+        // extent is representable by a Rust slice, which is borrowed only for this call.
+        let bytes = unsafe { std::slice::from_raw_parts(macs, byte_len) };
         let mac_vec: Vec<crate::wol::Mac> = bytes
             .chunks_exact(6)
             .map(|c| {
@@ -536,7 +544,8 @@ pub unsafe extern "C" fn punktfunk_session_free(s: *mut PunktfunkSession) {
 /// Host: FEC-protect, packetize, seal and send one encoded access unit.
 ///
 /// # Safety
-/// `s` is a valid host handle; `data` points to `len` readable bytes (or `len == 0`).
+/// `s` is a valid host handle. For a representable nonzero `len`, `data` points to that many
+/// readable bytes; `data` may be NULL when `len == 0`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_host_submit_frame(
     s: *mut PunktfunkSession,
@@ -556,11 +565,14 @@ pub unsafe extern "C" fn punktfunk_host_submit_frame(
         if data.is_null() && len != 0 {
             return PunktfunkStatus::NullPointer;
         }
+        if ffi_slice_bytes::<u8>(len).is_none() {
+            return PunktfunkStatus::InvalidArg;
+        }
         let slice = if len == 0 {
             &[][..]
         } else {
-            // SAFETY: per the ABI contract - a caller-supplied pointer/length pair describing one
-            // readable region, borrowed only for this call.
+            // SAFETY: the ABI contract supplies `len` readable bytes; `ffi_slice_bytes` proved the
+            // extent is representable by a Rust slice, which is borrowed only for this call.
             unsafe { std::slice::from_raw_parts(data, len) }
         };
         match s.inner.submit_frame(slice, pts_ns, flags) {
@@ -4576,7 +4588,8 @@ pub unsafe extern "C" fn punktfunk_connection_send_input(
 /// (a DTX silence frame). The data is copied; the caller may reuse the buffer after this returns.
 ///
 /// # Safety
-/// `c` is a valid connection handle; `opus_data` is valid for `len` bytes (or `len == 0`).
+/// `c` is a valid connection handle. For a representable nonzero `len`, `opus_data` points to
+/// that many readable bytes; it may be NULL when `len == 0`.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_send_mic(
@@ -4597,11 +4610,14 @@ pub unsafe extern "C" fn punktfunk_connection_send_mic(
         if opus_data.is_null() && len != 0 {
             return PunktfunkStatus::NullPointer;
         }
+        if ffi_slice_bytes::<u8>(len).is_none() {
+            return PunktfunkStatus::InvalidArg;
+        }
         let opus = if len == 0 {
             Vec::new()
         } else {
-            // SAFETY: per the ABI contract - a caller-supplied pointer/length pair describing one
-            // readable region, borrowed only for this call.
+            // SAFETY: the ABI contract supplies `len` readable bytes; `ffi_slice_bytes` proved the
+            // extent is representable by a Rust slice, copied before this call returns.
             unsafe { std::slice::from_raw_parts(opus_data, len) }.to_vec()
         };
         match c.inner.send_mic(seq, pts_ns, opus) {
@@ -5289,8 +5305,8 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_control(
 /// only if the host later fetches.
 ///
 /// # Safety
-/// `c` is a valid connection handle; `kinds` points to `n` `PunktfunkClipKind`s (NULL allowed only
-/// when `n == 0`), each `mime` a valid NUL-terminated UTF-8 string.
+/// `c` is a valid connection handle. For `n <= 16`, `kinds` points to `n` `PunktfunkClipKind`s
+/// (NULL only for zero), each with a valid NUL-terminated UTF-8 `mime`.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_clipboard_offer(
@@ -5310,10 +5326,13 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_offer(
         if kinds.is_null() && n != 0 {
             return PunktfunkStatus::NullPointer;
         }
+        if n > crate::quic::CLIP_MAX_KINDS || ffi_slice_bytes::<PunktfunkClipKind>(n).is_none() {
+            return PunktfunkStatus::InvalidArg;
+        }
         let mut out = Vec::with_capacity(n);
         if n != 0 {
-            // SAFETY: per the ABI contract - a caller-supplied pointer/length pair describing one
-            // readable region, borrowed only for this call.
+            // SAFETY: the ABI contract supplies `n` entries; the cap and `ffi_slice_bytes` prove
+            // the extent is representable, and the slice is borrowed only for this call.
             let slice = unsafe { std::slice::from_raw_parts(kinds, n) };
             for k in slice {
                 let mime = if k.mime.is_null() {
@@ -5394,8 +5413,8 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_fetch(
 /// `len == 0` (e.g. a final empty chunk). `punktfunk_connection_clipboard_cancel(req_id)` aborts.
 ///
 /// # Safety
-/// `c` is a valid connection handle; `data` points to `len` bytes (NULL allowed only when
-/// `len == 0`).
+/// `c` is a valid connection handle. For a representable nonzero `len`, `data` points to that
+/// many readable bytes; it may be NULL when `len == 0`.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_clipboard_serve(
@@ -5416,11 +5435,14 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_serve(
         if data.is_null() && len != 0 {
             return PunktfunkStatus::NullPointer;
         }
+        if ffi_slice_bytes::<u8>(len).is_none() {
+            return PunktfunkStatus::InvalidArg;
+        }
         let bytes = if len == 0 {
             Vec::new()
         } else {
-            // SAFETY: per the ABI contract - a caller-supplied pointer/length pair describing one
-            // readable region, borrowed only for this call.
+            // SAFETY: the ABI contract supplies `len` readable bytes; `ffi_slice_bytes` proved the
+            // extent is representable by a Rust slice, copied before this call returns.
             unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
         };
         match c.inner.clip_serve(req_id, bytes, last) {
@@ -6319,6 +6341,27 @@ mod abi_version_tests {
         // v28: `punktfunk_connection_host_caps2` + `PUNKTFUNK_HOST_CAP2_TOUCH` (additive).
         assert_eq!(crate::ABI_VERSION, 28);
         assert_eq!(super::punktfunk_abi_version(), 28);
+    }
+
+    #[test]
+    fn ffi_slice_extents_must_fit_isize() {
+        assert_eq!(super::ffi_slice_bytes::<u8>(0), Some(0));
+        assert_eq!(
+            super::ffi_slice_bytes::<u8>(isize::MAX as usize),
+            Some(isize::MAX as usize)
+        );
+        assert_eq!(super::ffi_slice_bytes::<u8>(isize::MAX as usize + 1), None);
+        assert_eq!(super::ffi_slice_bytes::<[u8; 6]>(usize::MAX / 6 + 1), None);
+    }
+
+    #[test]
+    fn wake_rejects_an_unrepresentable_mac_array_before_reading_it() {
+        let pointer = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        // SAFETY: an unrepresentable count is rejected before `pointer` is read, so the function's
+        // readable-region precondition does not apply.
+        let status =
+            unsafe { super::punktfunk_wake_on_lan(pointer, usize::MAX / 6 + 1, std::ptr::null()) };
+        assert_eq!(status, crate::error::PunktfunkStatus::InvalidArg);
     }
 }
 

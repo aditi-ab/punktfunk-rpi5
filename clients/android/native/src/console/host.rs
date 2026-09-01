@@ -208,14 +208,13 @@ pub(super) struct ConsoleHost {
 }
 
 impl ConsoleHost {
-    /// Start the render thread; it builds the console (shell + fonts — Skia handles, so it
-    /// cannot be built here and sent) and parks until a surface arrives. A build failure
-    /// arrives as a `Dead` event.
+    /// Spawn the render owner, which builds Skia state on-thread and parks for a surface.
+    /// Thread creation errors return to JNI; later console/build failures emit `Dead` events.
     pub(super) fn start(
         opts: ConsoleOptions,
         entry: ConsoleEntry,
         store: Arc<SnapshotStore>,
-    ) -> ConsoleHost {
+    ) -> std::io::Result<ConsoleHost> {
         let shared = Arc::new(Shared::new());
         let handles = ConsoleHandles::new();
         let thread_shared = shared.clone();
@@ -233,21 +232,27 @@ impl ConsoleHost {
                     log::error!("console: render thread ended: {e:#}");
                     thread_shared.emit(HostEvent::Dead(format!("{e:#}")));
                 }
-            })
-            .ok();
-        ConsoleHost {
+            })?;
+        Ok(ConsoleHost {
             shared,
             handles,
             store,
-            thread,
-        }
+            thread: Some(thread),
+        })
     }
 
-    pub(super) fn stop(mut self) {
+    /// Signal the render loop and join it once. The final table-held `Arc` calls this from `Drop`.
+    fn stop(&mut self) {
         self.shared.send(Cmd::Quit);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+    }
+}
+
+impl Drop for ConsoleHost {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 

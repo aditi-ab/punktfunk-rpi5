@@ -24,19 +24,25 @@ pub const fn nt_success(status: NTSTATUS) -> bool {
     status >= 0
 }
 
-/// Read the IddCx DDI at `index` from the stub-provided `IddFunctions` table and reinterpret it as the
-/// concrete `PFN_*` type. `IddFunctions` is a flexible array (`[PFN_IDD_CX; 0]`) populated by IddCxStub
-/// once the driver is loaded.
+/// Read one typed DDI from IddCxStub's runtime-populated flexible table.
+///
+/// The binding declares a zero-length array, so `wrapping_add` addresses the foreign tail without
+/// falsely asserting it lies inside that Rust object. Runtime assertions reject negative indices
+/// and a `T` whose width differs from the table's function-pointer slots.
 ///
 /// # Safety
-/// `index`/`T` must be the matching `_IDDFUNCENUM` index and `PFN_*` type for the same DDI, and the
-/// table must be populated (true after the driver is loaded by the IddCx runtime).
+/// `index` and `T` name the same DDI, and IddCxStub has populated that slot.
 #[inline]
 unsafe fn ddi<T: Copy>(index: i32) -> T {
+    assert!(index >= 0, "negative IddCx DDI index");
+    assert_eq!(
+        core::mem::size_of::<T>(),
+        core::mem::size_of::<iddcx::PFN_IDD_CX>(),
+        "IddCx DDI type has the wrong width"
+    );
     let table = (&raw const iddcx::IddFunctions).cast::<iddcx::PFN_IDD_CX>();
-    // SAFETY: `index` is a valid IddCx table slot; the slot holds a `PFN_*` whose layout is `T`.
-    let slot = unsafe { table.add(index as usize) };
-    // SAFETY: `slot` points at the `index`th (in-bounds) populated table entry, a `PFN_*` of layout `T`.
+    let slot = table.wrapping_add(index as usize);
+    // SAFETY: the contract says IddCxStub populated this foreign tail slot with the matching `T`.
     unsafe { slot.cast::<T>().read() }
 }
 

@@ -13,6 +13,7 @@
 //! `cancel:<id>` · `error:<id>:<code>` · `closed` — null on a poll timeout. Non-text fetch
 //! requests are cancelled natively (only text is ever offered, so they shouldn't occur).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use jni::errors::LogErrorAndDefault;
@@ -23,21 +24,14 @@ use punktfunk_core::clipboard::ClipEventCore;
 use punktfunk_core::error::PunktfunkError;
 use punktfunk_core::quic::{ClipKind, CLIP_FILE_INDEX_NONE, HOST_CAP_CLIPBOARD};
 
-use super::SessionHandle;
+use super::{get_session, SessionHandle};
 
 /// The portable wire MIME both ends map to their platform text type.
 const TEXT_MIME: &str = "text/plain;charset=utf-8";
 
-/// Deref the opaque handle (`0` → `None`).
-///
-/// SAFETY: live handle per the nativeConnect/nativeClose contract; every method used is `&self`
-/// on the `Sync` connector.
-fn client(handle: jlong) -> Option<&'static SessionHandle> {
-    if handle == 0 {
-        return None;
-    }
-    // SAFETY: see the function docs — the Kotlin side guarantees the handle outlives the call.
-    Some(unsafe { &*(handle as *const SessionHandle) })
+/// Retain one keyed session for the duration of a clipboard JNI call.
+fn client(handle: jlong) -> Option<Arc<SessionHandle>> {
+    get_session(handle)
 }
 
 /// `NativeBridge.nativeClipSupported(handle)` — the host advertised `HOST_CAP_CLIPBOARD`.

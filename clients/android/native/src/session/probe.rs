@@ -9,7 +9,7 @@
 //! Two calls: start, then poll. Both are cheap and non-blocking, so Kotlin can drive them from a
 //! coroutine on the main thread the way it polls the stats HUD.
 
-use super::{jni_guard, SessionHandle};
+use super::{get_session, jni_guard};
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JDoubleArray, JObject};
 use jni::sys::{jboolean, jint, jlong};
@@ -33,11 +33,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSpeedTest(
     duration_ms: jint,
 ) -> jboolean {
     jni_guard(false, || {
-        if handle == 0 {
+        let Some(h) = get_session(handle) else {
             return false;
-        }
-        // SAFETY: live handle per the nativeConnect/nativeClose contract.
-        let h = unsafe { &*(handle as *const SessionHandle) };
+        };
         let target = target_kbps.clamp(0, i32::MAX) as u32;
         let duration = duration_ms.clamp(0, i32::MAX) as u32;
         match h.client.request_probe(target, duration) {
@@ -64,11 +62,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeProbeResult
     // `JDoubleArray::default()` is the null reference the old `JObject::null().into_raw()` returned,
     // so Kotlin still reads `null` on every failure path.
     env.with_env(|env| -> jni::errors::Result<JDoubleArray<'local>> {
-        if handle == 0 {
+        let Some(h) = get_session(handle) else {
             return Ok(JDoubleArray::default());
-        }
-        // SAFETY: live handle per the nativeConnect/nativeClose contract.
-        let h = unsafe { &*(handle as *const SessionHandle) };
+        };
         let r = h.client.probe_result();
         let values: [f64; PROBE_RESULT_LEN] = [
             f64::from(u8::from(r.done)),

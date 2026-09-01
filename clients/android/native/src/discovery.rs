@@ -1,19 +1,11 @@
-//! LAN host discovery over mDNS, in Rust via `mdns-sd` — the same crate + service type the
-//! Linux/Windows clients use (`crates/pf-client-core/src/discovery.rs`), exposed to Kotlin over JNI.
+//! LAN host discovery over the same `mdns-sd` path as the desktop clients.
 //!
-//! Why not `NsdManager`: that API delegates to a per-OEM system mDNS daemon whose reliability
-//! varies wildly (the Android client's discovery was "mostly broken"). Browsing in our own Rust
-//! core — the crate is already linked for the whole protocol — gives one tested code path across
-//! every desktop + mobile client and removes the system-daemon dependency. Kotlin still holds the
-//! Wi-Fi `MulticastLock` for the browse lifetime (raw multicast *reception* needs it) and owns the
-//! permission UX; this module owns the socket + resolve.
+//! Kotlin holds the Wi-Fi multicast lock and owns permission UX. Rust owns the service daemon,
+//! folds resolve/remove events into a shared map, and returns a newline-delimited snapshot on poll.
 //!
-//! Shape: [`Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryStart`] spins up a
-//! [`ServiceDaemon`] browsing `_punktfunk._udp.local.` on a background thread that folds
-//! resolve/remove events into a shared map; Kotlin polls `nativeDiscoveryPoll` ~1 Hz for a
-//! newline-joined snapshot and calls `nativeDiscoveryStop` to tear it down. Polling (not a JVM
-//! callback) mirrors `nativeVideoStats`: no `AttachCurrentThread`/global-ref lifecycle to get
-//! wrong, and 1 Hz is plenty for a host picker.
+//! Start returns an opaque integer key into an `Arc<Discovery>` table. Poll retains the browse while
+//! it reads, stop removes the key, and final drop shuts down the daemon and joins its fold thread.
+//! This makes stop-vs-poll races safe without JVM callbacks or Rust pointers crossing JNI.
 
 use crate::session::jni_guard;
 use jni::errors::LogErrorAndDefault;
@@ -22,7 +14,8 @@ use jni::sys::jlong;
 use jni::EnvUnowned;
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 /// DNS-SD service type punktfunk hosts advertise (host side: `punktfunk_host::discovery`).
@@ -79,9 +72,7 @@ impl Host {
     }
 }
 
-/// A running browse behind the `jlong` handle: the daemon, the shared resolved-host map keyed by
-/// mDNS fullname (stable across re-announce and present on both resolve *and* remove — which fixes
-/// the old `NsdManager` key mismatch that leaked stale hosts), and the event-fold thread.
+/// One table-owned browse: its daemon, fullname-keyed host map, and event-fold thread.
 struct Discovery {
     daemon: ServiceDaemon,
     hosts: Arc<Mutex<HashMap<String, Host>>>,
@@ -130,8 +121,8 @@ impl Discovery {
         let thread = match spawned {
             Ok(t) => t,
             Err(e) => {
-                // The daemon thread + bound :5353 socket outlive a dropped handle (no Drop impl), so
-                // shut it down explicitly — same cleanup as the browse-failure path above.
+                // No `Discovery` exists to run `Drop`, so close the daemon on this construction
+                // failure before returning.
                 log::error!("mDNS fold thread spawn failed: {e}");
                 let _ = daemon.shutdown();
                 return None;
@@ -159,12 +150,54 @@ impl Discovery {
         records.join("\n")
     }
 
-    fn stop(mut self) {
+    /// Shut down the daemon and join the event-fold thread once.
+    fn stop(&mut self) {
         let _ = self.daemon.shutdown(); // closes the browse channel → the fold thread exits
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
     }
+}
+
+impl Drop for Discovery {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+static NEXT_DISCOVERY_HANDLE: AtomicU64 = AtomicU64::new(0x3000_0000_0000_0001);
+
+fn discoveries() -> &'static Mutex<HashMap<jlong, Arc<Discovery>>> {
+    static DISCOVERIES: OnceLock<Mutex<HashMap<jlong, Arc<Discovery>>>> = OnceLock::new();
+    DISCOVERIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn insert_discovery(discovery: Discovery) -> jlong {
+    let discovery = Arc::new(discovery);
+    let mut discoveries = crate::session::lock_recover(discoveries());
+    loop {
+        let handle = NEXT_DISCOVERY_HANDLE.fetch_add(1, Ordering::Relaxed) as jlong;
+        if handle != 0 && !discoveries.contains_key(&handle) {
+            discoveries.insert(handle, discovery);
+            return handle;
+        }
+    }
+}
+
+fn get_discovery(handle: jlong) -> Option<Arc<Discovery>> {
+    if handle == 0 {
+        return None;
+    }
+    crate::session::lock_recover(discoveries())
+        .get(&handle)
+        .cloned()
+}
+
+fn remove_discovery(handle: jlong) -> Option<Arc<Discovery>> {
+    if handle == 0 {
+        return None;
+    }
+    crate::session::lock_recover(discoveries()).remove(&handle)
 }
 
 /// Build a [`Host`] from a resolved mDNS record, or `None` if it isn't a usable punktfunk host
@@ -204,25 +237,21 @@ fn resolve(info: &ResolvedService) -> Option<Host> {
     })
 }
 
-/// `NativeBridge.nativeDiscoveryStart(): Long` — start browsing `_punktfunk._udp`; returns an opaque
-/// handle, or `0` on failure (logged). Pair with exactly one [`nativeDiscoveryStop`]. Kotlin must
-/// hold the Wi-Fi `MulticastLock` for the browse lifetime.
-///
-/// [`nativeDiscoveryStop`]: Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryStop
+/// Start `_punktfunk._udp` browsing and return an opaque table key.
+/// Kotlin holds its Wi-Fi multicast lock until stop; `0` reports daemon setup failure.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryStart(
     _env: EnvUnowned,
     _this: JObject,
 ) -> jlong {
     jni_guard(0, || match Discovery::start() {
-        Some(d) => Box::into_raw(Box::new(d)) as jlong,
+        Some(discovery) => insert_discovery(discovery),
         None => 0,
     })
 }
 
-/// `NativeBridge.nativeDiscoveryPoll(handle): String` — the current resolved-host snapshot,
-/// newline-joined records of `key␟name␟addr␟port␟fp␟pair␟mac␟os␟mgmt` (`␟` = U+001F). Empty string = no hosts /
-/// `0` handle. Poll ~1 Hz from the UI thread (cheap: a mutex lock + string build).
+/// Return the current newline-delimited host snapshot for one retained browse.
+/// Missing or concurrently stopped keys produce an empty string.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryPoll<'local>(
     mut env: EnvUnowned<'local>,
@@ -233,41 +262,23 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryPo
     // `LogErrorAndDefault` logs then yields `JString::default()` — the null reference the old
     // `std::ptr::null_mut()` default returned. Kotlin still sees a null String on failure.
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        let out = if handle == 0 {
-            String::new()
-        } else {
-            // SAFETY: live handle per the start/stop contract — Kotlin owns the lifecycle and never
-            // polls after stop (it nulls the handle first).
-            let d = unsafe { &*(handle as *const Discovery) };
-            d.snapshot()
-        };
+        let out = get_discovery(handle)
+            .map(|discovery| discovery.snapshot())
+            .unwrap_or_default();
         env.new_string(out)
     })
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `NativeBridge.nativeDiscoveryStop(handle)` — stop the browse, shut the daemon down and join its
-/// thread. No-op on `0`.
-///
-/// # Safety contract
-/// `handle` must be `0` or a live handle from [`nativeDiscoveryStart`], stopped exactly once and not
-/// concurrently with [`nativeDiscoveryPoll`] (Kotlin owns this; all calls are on the main thread).
-///
-/// [`nativeDiscoveryStart`]: Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryStart
-/// [`nativeDiscoveryPoll`]: Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryPoll
+/// Remove one browse key; final drop shuts down its daemon and joins the fold thread.
+/// Zero, stale, duplicate, and concurrent stops are no-ops.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryStop(
     _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) {
-    jni_guard((), || {
-        if handle != 0 {
-            // SAFETY: live handle from nativeDiscoveryStart, stopped exactly once per the contract.
-            let d = unsafe { Box::from_raw(handle as *mut Discovery) };
-            d.stop();
-        }
-    })
+    jni_guard((), || drop(remove_discovery(handle)))
 }
 
 #[cfg(test)]

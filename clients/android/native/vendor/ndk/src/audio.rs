@@ -975,7 +975,7 @@ impl Drop for AudioStreamBuilder {
     #[doc(alias = "AAudioStreamBuilder_delete")]
     fn drop(&mut self) {
         let status = unsafe { ffi::AAudioStreamBuilder_delete(self.as_ptr()) };
-        AudioError::from_result(status).unwrap();
+        let _ = AudioError::from_result(status);
     }
 }
 
@@ -1414,6 +1414,6 @@ impl Drop for AudioStream {
     #[doc(alias = "AAudioStream_close")]
     fn drop(&mut self) {
         let status = unsafe { ffi::AAudioStream_close(self.as_ptr()) };
-        AudioError::from_result(status).unwrap();
+        let _ = AudioError::from_result(status);
     }
 }

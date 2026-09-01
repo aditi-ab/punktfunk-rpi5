@@ -7,7 +7,7 @@
 //! Not android-gated: `next_rumble`/`next_hidout` are pure-Rust on the `quic` feature, so these
 //! compile on the host build too (parity with the input shims in [`crate::session`]).
 
-use crate::session::{jni_guard, SessionHandle};
+use crate::session::{get_session, jni_guard};
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JByteBuffer, JObject};
 use jni::sys::{jint, jlong};
@@ -69,14 +69,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextRumble(
 ) -> jlong {
     // Runs on a Kotlin poll thread, so a panic here would abort the process; guard the boundary.
     jni_guard(-1, || {
-        if handle == 0 {
+        let Some(h) = get_session(handle) else {
             return -1;
-        }
-        // SAFETY: live handle per the nativeConnect/nativeClose contract; next_rumble_command is
-        // &self on the Sync connector — safe alongside the decode/audio/input threads. Kotlin
-        // stops these poll threads (and joins them — unbounded) before nativeClose frees the
-        // handle.
-        let h = unsafe { &*(handle as *const SessionHandle) };
+        };
         match h.client.next_rumble_command(PULL_TIMEOUT) {
             // A pad whose coils are ACTIVELY being driven by the 0xD1 haptics stream must not see
             // wire rumble: `DsDevice` sets `valid_flag0` bit 1 (`HAPTICS_SELECT`) on every rumble
@@ -116,11 +111,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextHidout(
     // rather than `Err`, so the policy's default is unreachable by construction.
     jni_guard(-1, || {
         env.with_env_no_catch(|env| -> jni::errors::Result<jint> {
-            if handle == 0 {
+            let Some(h) = get_session(handle) else {
                 return Ok(-1);
-            }
-            // SAFETY: live handle per the contract; next_hidout is &self on the Sync connector.
-            let h = unsafe { &*(handle as *const SessionHandle) };
+            };
             let ev = match h.client.next_hidout(PULL_TIMEOUT) {
                 Ok(ev) => ev,
                 Err(_) => return Ok(-1), // timeout or closed — Kotlin loops

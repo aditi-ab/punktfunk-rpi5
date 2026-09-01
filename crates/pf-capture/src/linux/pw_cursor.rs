@@ -118,10 +118,10 @@ fn note_cursor_id(cursor: &mut CursorState, id: u32) -> bool {
     true
 }
 
-/// Update `cursor` from the newest buffer's `SPA_META_Cursor` (no-op when the buffer carries no
-/// cursor meta — producer doesn't support it, or the portal isn't in Metadata cursor mode).
-/// Called for EVERY dequeued buffer, before the stale-frame skip, so pointer-only movements
-/// (which Mutter delivers as metadata-only "corrupted" buffers) still refresh the position.
+/// Read the newest `SPA_META_Cursor` into `cursor`, tolerating absent or malformed metadata.
+/// This runs before stale-frame filtering so metadata-only pointer moves still update position.
+/// Producer offsets, extents, alignment, and bitmap geometry are validated before every read.
+/// Position-only updates retain the last complete bitmap.
 pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sys::spa_buffer) {
     // SAFETY: `spa_buf` is the live buffer we still hold (dequeued, not yet requeued).
     // `spa_buffer_find_meta` returns the `spa_meta` (type + byte `size` + `data` pointer) for
@@ -148,18 +148,17 @@ pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sy
     if data.is_null() || region_size < std::mem::size_of::<spa::sys::spa_meta_cursor>() {
         return;
     }
-    let cur = data as *const spa::sys::spa_meta_cursor;
-    // SAFETY: `region_size >= size_of::<spa_meta_cursor>()` checked above, so every field is in bounds.
-    let (id, pos_x, pos_y, hot_x, hot_y, bmp_off) = unsafe {
-        (
-            (*cur).id,
-            (*cur).position.x,
-            (*cur).position.y,
-            (*cur).hotspot.x,
-            (*cur).hotspot.y,
-            (*cur).bitmap_offset,
-        )
-    };
+    // SAFETY: `region_size >= size_of::<spa_meta_cursor>()` checked above, so the full header is
+    // readable. `read_unaligned` avoids assuming the producer aligned this metadata region.
+    let cur = unsafe { (data as *const spa::sys::spa_meta_cursor).read_unaligned() };
+    let (id, pos_x, pos_y, hot_x, hot_y, bmp_off) = (
+        cur.id,
+        cur.position.x,
+        cur.position.y,
+        cur.hotspot.x,
+        cur.hotspot.y,
+        cur.bitmap_offset,
+    );
     if !note_cursor_id(cursor, id) {
         return;
     }

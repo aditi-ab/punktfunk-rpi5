@@ -1,37 +1,18 @@
-//! punktfunk Vulkan implicit layer — `VK_LAYER_PUNKTFUNK_hdr_inject`.
+//! Vulkan implicit layer `VK_LAYER_PUNKTFUNK_hdr_inject` for IddCx displays.
 //!
-//! ## Why
-//! On Windows, NVIDIA/AMD Vulkan ICDs do **not** advertise any HDR color space
-//! (`HDR10_ST2084_EXT`, `EXTENDED_SRGB_LINEAR_EXT`) for a surface on an IddCx *indirect / virtual*
-//! display — even when Windows "Use HDR" is enabled and the desktop is composited at 10-bit. So
-//! Vulkan games (Doom: The Dark Ages and the rest of id Tech, Indiana Jones, …) query
-//! `vkGetPhysicalDeviceSurfaceFormatsKHR`, find no HDR color space, and refuse HDR
-//! ("This device does not support HDR"). DX11/DX12 HDR works on the same display because the OS
-//! compositor drives it; only the Vulkan WSI *enumeration* is gated. An on-box spike proved the ICD
-//! *accepts and presents* a forced HDR swapchain on that exact surface — it just won't *advertise*
-//! the format. So the entire fix is to append the HDR surface formats to the enumeration the game
-//! queries; once the game asks for that swapchain, the ICD honors it.
+//! Some Windows ICDs accept HDR swapchains on indirect displays but omit their HDR surface formats.
+//! The layer intercepts both surface-format queries and appends HDR10/scRGB formats when Windows
+//! reports advanced color enabled for that surface's monitor. Existing formats are deduplicated;
+//! SDR and already-HDR surfaces pass through unchanged.
 //!
-//! ## What this layer does
-//! Intercepts `vkGetPhysicalDeviceSurfaceFormatsKHR` / `...2KHR`, calls down to the ICD, and appends
-//! `{A2B10G10R10_UNORM_PACK32, HDR10_ST2084_EXT}` and `{R16G16B16A16_SFLOAT, EXTENDED_SRGB_LINEAR_EXT}`
-//! (deduped). **Self-gating:** it only injects when the surface's monitor actually has Windows
-//! advanced-color (HDR) *enabled* — so it is a complete no-op on SDR sessions and on real monitors
-//! (which already advertise HDR, and dedup drops the duplicate). It tracks `VkSurfaceKHR -> HWND` by
-//! intercepting `vkCreateWin32SurfaceKHR`. Everything else is pass-through dispatch chaining.
+//! `vkCreateWin32SurfaceKHR` supplies the `VkSurfaceKHR -> HWND` association used by the HDR gate.
+//! Every other command follows the Vulkan loader's normal dispatch chain. Win32 query structures
+//! use typed C-layout mirrors rather than target-specific offsets.
 //!
-//! Off-switches: the loader-standard `DISABLE_PF_VKHDR=1` (disables the whole layer), and
-//! `PF_VKHDR_EXCLUDE` (comma/semicolon list of exe basenames to skip — defaults include known
-//! kernel-anti-cheat titles). `PF_VKHDR_LOG=1` enables a debug log in `%TEMP%\pf_vkhdr_layer.log`.
-//!
-//! ## Safety model
-//! This cdylib runs inside someone else's process, called by the Vulkan loader. Two contract
-//! sources cover every unsafe operation here: the **loader layer protocol** (negotiate struct,
-//! per-layer chain links, dispatchable handles whose first word is the loader's dispatch-table
-//! pointer) and **Vulkan valid-usage rules** the application must already uphold for the ICD
-//! (NUL-terminated command names, valid create-info chains, count/array pairs in the two-call
-//! idiom). Every `unsafe` block cites the specific clause it leans on. The layer targets x86_64
-//! only (the two hand-computed struct offsets below say so explicitly).
+//! Safety rests on the loader-layer protocol and Vulkan valid usage: live dispatchable handles,
+//! valid create-info chains, NUL-terminated command names, and valid count/array pairs.
+//! `DISABLE_PF_VKHDR=1` disables the layer; `PF_VKHDR_EXCLUDE` skips named executables.
+//! `PF_VKHDR_LOG=1` writes diagnostics to `%TEMP%\pf_vkhdr_layer.log`.
 
 #![allow(non_snake_case)]
 #![allow(clippy::too_many_arguments)]
@@ -98,6 +79,22 @@ pub struct NegotiateLayerInterface {
 }
 
 // raw mirror of VkSurfaceFormat2KHR (avoid ash lifetime generics in fn-pointer types)
+#[repr(C)]
+struct Win32SurfaceCreateInfoRaw {
+    _s_type: vk::StructureType,
+    _p_next: *const c_void,
+    _flags: u32,
+    _hinstance: *const c_void,
+    hwnd: *const c_void,
+}
+
+#[repr(C)]
+struct PhysicalDeviceSurfaceInfo2Raw {
+    _s_type: vk::StructureType,
+    _p_next: *const c_void,
+    surface: vk::SurfaceKHR,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SurfaceFormat2Raw {
@@ -198,8 +195,8 @@ unsafe fn key(raw: u64) -> usize {
 /// which is precisely what the Vulkan `*ProcAddr` contract obliges callers to do.
 #[inline]
 unsafe fn as_pfn(p: *const c_void) -> vk::PFN_vkVoidFunction {
-    // SAFETY: data and function pointers have identical size and representation on all Windows
-    // targets, and per this function's contract `p` is a real `extern "system"` fn address.
+    // SAFETY: `p` is a Vulkan loader function address with the declared system ABI. This build
+    // proves the data/function pointer widths match because `transmute` otherwise cannot compile.
     Some(unsafe { std::mem::transmute::<*const c_void, unsafe extern "system" fn()>(p) })
 }
 
@@ -882,11 +879,10 @@ unsafe extern "system" fn create_win32_surface(
     // create time; forwarding the caller's own arguments unchanged.
     let res = unsafe { down(inst, p_ci, p_alloc, p_surface) };
     if res == vk::Result::SUCCESS {
-        // SAFETY: the down-chain call succeeded, so `p_ci` pointed at a valid
-        // VkWin32SurfaceCreateInfoKHR for the whole call (the ICD just consumed it). On x86_64
-        // its layout is sType(4+4 pad)@0, pNext@8, flags(4+4 pad)@16, hinstance@24, hwnd@32 —
-        // so `p_ci + 32` is an in-bounds, 8-aligned read of the HWND field.
-        let hwnd = unsafe { *((p_ci as *const u8).add(32) as *const isize) };
+        // SAFETY: the down-chain call succeeded, so `p_ci` is the live, aligned
+        // VkWin32SurfaceCreateInfoKHR it just consumed. The C-layout mirror exposes its HWND
+        // without architecture-specific byte arithmetic.
+        let hwnd = unsafe { (*(p_ci as *const Win32SurfaceCreateInfoRaw)).hwnd as isize };
         if let Ok(mut m) = surface_hwnds().lock() {
             // SAFETY: vkCreateWin32SurfaceKHR requires pSurface to be a valid pointer, and on
             // SUCCESS the down-chain just wrote the new surface handle through it.
@@ -925,6 +921,9 @@ unsafe extern "system" fn get_surface_formats(
     p_count: *mut u32,
     p_formats: *mut vk::SurfaceFormatKHR,
 ) -> vk::Result {
+    if p_count.is_null() {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
     let down = instances().lock().ok().and_then(|g| {
         // SAFETY: vkGetPhysicalDeviceSurfaceFormatsKHR requires `pdev` to be a live
         // physical-device handle — a dispatchable object whose first word is the dispatch key.
@@ -994,6 +993,9 @@ unsafe extern "system" fn get_surface_formats2(
     p_count: *mut u32,
     p_formats: *mut c_void,
 ) -> vk::Result {
+    if p_info.is_null() || p_count.is_null() {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
     let down = instances().lock().ok().and_then(|g| {
         // SAFETY: vkGetPhysicalDeviceSurfaceFormats2KHR requires `pdev` to be a live
         // physical-device handle — a dispatchable object whose first word is the dispatch key.
@@ -1031,11 +1033,10 @@ unsafe extern "system" fn get_surface_formats2(
     }
     real.truncate(n as usize);
 
-    // SAFETY: the spec requires pSurfaceInfo to point at a valid VkPhysicalDeviceSurfaceInfo2KHR
-    // for the whole call. On x86_64 its layout is sType(4+4 pad)@0, pNext@8, surface(u64)@16 —
-    // so `p_info + 16` is an in-bounds, 8-aligned read of the non-dispatchable surface handle.
-    let surface =
-        vk::SurfaceKHR::from_raw(unsafe { *((p_info as *const u8).add(16) as *const u64) });
+    // SAFETY: the spec requires `p_info` to be a live, aligned
+    // VkPhysicalDeviceSurfaceInfo2KHR. The C-layout mirror reads its typed surface field without
+    // relying on one target's padding.
+    let surface = unsafe { (*(p_info as *const PhysicalDeviceSurfaceInfo2Raw)).surface };
 
     let mut extras: Vec<vk::SurfaceFormatKHR> = Vec::new();
     if !real.is_empty() && should_inject(surface) {

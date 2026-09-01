@@ -836,6 +836,29 @@ fn realtime_minus_monotonic_ns() -> i64 {
     rt - (ts.tv_sec * 1_000_000_000 + ts.tv_nsec)
 }
 
+fn packed_frame_geometry(
+    width: usize,
+    height: usize,
+    bytes_per_pixel: usize,
+    reported_stride: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    if height == 0 {
+        return None;
+    }
+    let row = width.checked_mul(bytes_per_pixel)?;
+    let stride = if reported_stride == 0 {
+        row
+    } else {
+        reported_stride
+    };
+    if stride < row {
+        return None;
+    }
+    let needed = stride.checked_mul(height - 1)?.checked_add(row)?;
+    let tight = row.checked_mul(height)?;
+    Some((row, stride, needed, tight))
+}
+
 fn consume_frame(
     ud: &mut UserData,
     spa_buf: *mut spa::sys::spa_buffer,
@@ -1313,13 +1336,10 @@ fn consume_frame(
         return;
     }
     let bpp = fmt.bytes_per_pixel();
-    let row = w * bpp;
-    let stride = if stride == 0 { row } else { stride };
-    if stride < row {
-        warn_once("chunk stride < row — frames dropped");
+    let Some((row, stride, needed, tight_len)) = packed_frame_geometry(w, h, bpp, stride) else {
+        warn_once("invalid or overflowing packed-frame geometry — frames dropped");
         return;
-    }
-    let needed = stride * (h - 1) + row;
+    };
     // dmabuf chunks commonly report size 0; fall back to the computed span.
     let size = if size == 0 { needed } else { size };
     // For fd-backed buffers (MemFd SHM, DmaBuf) mmap the fd OURSELVES, sized to the fd's real
@@ -1414,7 +1434,7 @@ fn consume_frame(
     }
     let region = &buf[region_off..region_off + size.min(avail)];
     // De-pad into a tightly-packed buffer (chunk stride may exceed w*bpp).
-    let mut tight = vec![0u8; row * h];
+    let mut tight = vec![0u8; tight_len];
     for y in 0..h {
         tight[y * row..y * row + row].copy_from_slice(&region[y * stride..y * stride + row]);
     }
@@ -2290,7 +2310,9 @@ pub fn pipewire_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::{negotiation_plan, supported_data_plane_count, NegotiationInputs};
+    use super::{
+        negotiation_plan, packed_frame_geometry, supported_data_plane_count, NegotiationInputs,
+    };
 
     #[test]
     fn only_supported_pipewire_plane_counts_become_slice_lengths() {
@@ -2326,6 +2348,18 @@ mod tests {
             native_nv12_session: true,
             ..nvenc()
         }
+    }
+
+    #[test]
+    fn packed_frame_geometry_rejects_overflow_and_short_stride() {
+        assert_eq!(packed_frame_geometry(4, 3, 4, 0), Some((16, 16, 48, 48)));
+        assert_eq!(packed_frame_geometry(4, 3, 4, 15), None);
+        assert_eq!(packed_frame_geometry(1, 0, 4, 4), None);
+        assert_eq!(packed_frame_geometry(usize::MAX, 2, 4, 0), None);
+        assert_eq!(
+            packed_frame_geometry(usize::MAX / 2, 3, 1, usize::MAX / 2),
+            None
+        );
     }
 
     /// The four invariants that were prose-only comments in `pipewire_thread`'s prologue.

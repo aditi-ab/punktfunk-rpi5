@@ -1,11 +1,12 @@
-//! Safe access to Win32 shared-memory sections: [`MappedView`] wraps a mapped view of a known
-//! length and exposes bounds- and alignment-checked accessors, so callers never touch the raw base
-//! pointer. Cross-process sync fields (seqs, pids, handle values) go through real atomics; bulk
-//! report regions use plain unaligned copies, guarded by the channel protocol's seq fields — the
-//! same access discipline the host side uses (`inject/windows/gamepad_raii.rs`).
+//! Safe access to Win32 shared-memory sections through a bounds-checked [`MappedView`].
+//!
+//! Synchronization fields use native-width atomics. A process-local mutex serializes potentially
+//! overlapping access widths, and bulk report bytes use relaxed atomics; the channel's sequence
+//! fences still provide aggregate consistency with the peer process.
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::Mutex;
 
 const FILE_MAP_RW: u32 = 0x0002 | 0x0004; // FILE_MAP_WRITE | FILE_MAP_READ
 
@@ -17,42 +18,21 @@ unsafe extern "system" {
     fn CloseHandle(h: *mut c_void) -> i32;
 }
 
-/// A read/write view over a mapped shared section of exactly `len` bytes. Every accessor
-/// bounds-checks (and, for the atomic ones, alignment-checks) its offset, so no caller can read or
-/// write outside the mapping — the offsets are `offset_of!` constants from `pf_driver_proto`, making
-/// a failed check a compile-shaped logic bug (it aborts the WUDFHost rather than corrupting).
+/// A read/write view over exactly `len` bytes of a shared section.
 ///
-/// Concurrency: the peer process writes the section concurrently. Fields used for cross-process
-/// synchronization must be accessed through the `load_*`/`store_*` atomic accessors; the bulk
-/// byte/scalar accessors are plain unaligned accesses whose consistency is guarded by the channel
-/// protocol (seq-fenced publishes), exactly as on the host side.
+/// Every accessor bounds-checks its range; native-width synchronization fields also check
+/// alignment. A local lock prevents overlapping atomic widths across callbacks, while protocol
+/// sequence fields provide acquire/release publication for each complete peer report.
 pub struct MappedView {
     base: *mut u8,
     len: usize,
+    access: Mutex<()>,
 }
 
-// SAFETY: `MappedView` is a pointer + length over an OS mapping that stays valid until
-// `UnmapViewOfFile` in `Drop` (or forever, once leaked into a `ViewCell`). All access goes through
-// the checked accessors — atomics for shared sync fields, unaligned reads/writes for bulk data —
-// none of which require a single-thread owner, so sharing/sending the view across the driver's
-// callback threads is sound.
+// SAFETY: the mapping stays live until `Drop`; moving the unique wrapper cannot invalidate it.
 unsafe impl Send for MappedView {}
-// SAFETY: `&MappedView` IS shared across threads for real — `ChannelState::data()` hands out
-// `&'static MappedView`, and every driver using it dispatches its queue
-// `WdfIoQueueDispatchParallel` with `NumberOfPresentedRequests = u32::MAX`, so two callbacks can
-// hold it at once. What makes that sound is NOT that the accessors are individually race-free:
-// `read_u8`/`write_u8`/`read_u16`/… are plain unaligned accesses through `&self` and would race if
-// two threads hit the same offset. It is that these bytes are a section mapped into ANOTHER PROCESS
-// that writes them concurrently, so no Rust-level exclusivity over them is achievable in the first
-// place — the peer defeats it regardless of what this type does. Consistency is therefore the
-// channel protocol's job (seq-fenced publishes, per the struct doc), the cross-process
-// synchronization fields go through the `load_*`/`store_*` ATOMIC accessors, and each side reads
-// only fields the protocol says are stable.
-//
-// ⚠ The rule this proof implies, for anything added later: a new accessor may use the plain path
-// ONLY for bytes the protocol already fences. Anything that must be coherent between threads or
-// between processes belongs in the atomic set — a plain accessor over such a field is a race the
-// `Sync` here does not cover.
+// SAFETY: `access` serializes overlapping local widths, and each physical memory access is atomic.
+// Compound reads may tear against the peer; sequence fields provide their aggregate consistency.
 unsafe impl Sync for MappedView {}
 
 impl MappedView {
@@ -74,25 +54,31 @@ impl MappedView {
         if base.is_null() {
             return None;
         }
-        Some(MappedView { base, len })
+        Some(MappedView {
+            base,
+            len,
+            access: Mutex::new(()),
+        })
     }
 
-    /// Map `len` bytes of a section from a raw handle VALUE (the sealed channel's delivery — a
-    /// handle the host duplicated into this process). `None` if the value does not resolve to a
-    /// mappable section. The handle itself is NOT consumed — the caller decides after validating
-    /// the mapped content (see [`close_handle_value`]).
+    /// Map `len` bytes from a duplicated raw section-handle value without consuming the handle.
+    ///
+    /// Returns `None` when the value does not fit this target's pointer width or does not name a
+    /// read/write mapping. The caller closes an accepted handle after validating its contents.
     pub fn from_handle_value(value: u64, len: usize) -> Option<MappedView> {
-        if value == 0 {
-            return None;
-        }
-        // SAFETY: `MapViewOfFile` on an arbitrary handle value is safe — it fails (returns null)
-        // unless the value resolves to a section handle in this process's table with RW access.
-        let base = unsafe { MapViewOfFile(value as usize as *mut c_void, FILE_MAP_RW, 0, 0, len) }
-            as *mut u8;
+        let value = usize::try_from(value).ok().filter(|&value| value != 0)?;
+        // SAFETY: `MapViewOfFile` rejects values that do not name an RW section handle in this
+        // process. The checked conversion above prevents pointer-width truncation.
+        let base =
+            unsafe { MapViewOfFile(value as *mut c_void, FILE_MAP_RW, 0, 0, len) } as *mut u8;
         if base.is_null() {
             return None;
         }
-        Some(MappedView { base, len })
+        Some(MappedView {
+            base,
+            len,
+            access: Mutex::new(()),
+        })
     }
 
     /// How many bytes this view maps — the gate for tail-extension features (a caller may only
@@ -112,96 +98,109 @@ impl MappedView {
         );
     }
 
-    /// Atomic `u32` load at `off` (must be 4-aligned) — the cross-process sync accessor.
+    #[inline]
+    fn lock_access(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.access
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[inline]
+    fn byte(&self, off: usize) -> &AtomicU8 {
+        self.check(off, 1, 1);
+        // SAFETY: `check` proved this byte is in the live mapping; `AtomicU8` needs no stronger
+        // alignment, and every bit pattern is valid.
+        unsafe { &*self.base.add(off).cast::<AtomicU8>() }
+    }
+
+    /// Load one 4-aligned synchronization word with `order`.
     #[inline]
     pub fn load_u32(&self, off: usize, order: Ordering) -> u32 {
+        let _access = self.lock_access();
         self.check(off, 4, 4);
-        // SAFETY: `off` is in-bounds + 4-aligned per `check`, and the page-aligned mapping stays
-        // valid while `&self` lives; an `AtomicU32` view over shared memory is the defined way to
-        // race the peer process.
+        // SAFETY: `off` is in-bounds and aligned, the mapping stays live, and `access` excludes an
+        // overlapping local access of another width. The peer uses the same atomic protocol field.
         unsafe { (*(self.base.add(off) as *const AtomicU32)).load(order) }
     }
 
     /// Atomic `u32` store at `off` (must be 4-aligned).
     #[inline]
     pub fn store_u32(&self, off: usize, v: u32, order: Ordering) {
+        let _access = self.lock_access();
         self.check(off, 4, 4);
-        // SAFETY: as `load_u32` — in-bounds, aligned, valid for `&self`'s lifetime.
+        // SAFETY: as `load_u32` — in-bounds, aligned, live, and locally serialized.
         unsafe { (*(self.base.add(off) as *const AtomicU32)).store(v, order) }
     }
 
     /// Atomic `u64` load at `off` (must be 8-aligned).
     #[inline]
     pub fn load_u64(&self, off: usize, order: Ordering) -> u64 {
+        let _access = self.lock_access();
         self.check(off, 8, 8);
-        // SAFETY: as `load_u32`, with 8-byte size/alignment checked.
+        // SAFETY: as `load_u32`, with 8-byte size/alignment checked and local access serialized.
         unsafe { (*(self.base.add(off) as *const AtomicU64)).load(order) }
     }
 
-    /// Plain byte read at `off` (bulk-region accessor — protocol-guarded, see the type docs).
+    /// Read one bulk byte with relaxed atomic semantics.
     #[inline]
     pub fn read_u8(&self, off: usize) -> u8 {
-        self.check(off, 1, 1);
-        // SAFETY: in-bounds per `check`; a one-byte read cannot tear.
-        unsafe { *self.base.add(off) }
+        let _access = self.lock_access();
+        self.byte(off).load(Ordering::Relaxed)
     }
 
-    /// Plain byte write at `off`.
+    /// Write one bulk byte with relaxed atomic semantics.
     #[inline]
     pub fn write_u8(&self, off: usize, v: u8) {
-        self.check(off, 1, 1);
-        // SAFETY: in-bounds per `check`; a one-byte write cannot tear.
-        unsafe { *self.base.add(off) = v }
+        let _access = self.lock_access();
+        self.byte(off).store(v, Ordering::Relaxed);
     }
 
-    /// Plain (unaligned) `u16` read at `off`.
+    /// Read a native-endian `u16` from two relaxed atomic bytes.
     #[inline]
     pub fn read_u16(&self, off: usize) -> u16 {
-        self.check(off, 2, 1);
-        // SAFETY: in-bounds per `check`; `read_unaligned` has no alignment requirement.
-        unsafe { core::ptr::read_unaligned(self.base.add(off) as *const u16) }
+        let mut bytes = [0; 2];
+        self.read_bytes(off, &mut bytes);
+        u16::from_ne_bytes(bytes)
     }
 
-    /// Plain (unaligned) `u32` read at `off` — the bulk-region accessor for a DATA-section scalar
-    /// (host-written state / a driver-written publish counter; consistency comes from the channel
-    /// protocol's seq fences, not from this access, exactly as on the host side).
+    /// Read a native-endian `u32` from four relaxed atomic bytes.
     #[inline]
     pub fn read_u32(&self, off: usize) -> u32 {
-        self.check(off, 4, 1);
-        // SAFETY: in-bounds per `check`; `read_unaligned` has no alignment requirement.
-        unsafe { core::ptr::read_unaligned(self.base.add(off) as *const u32) }
+        let mut bytes = [0; 4];
+        self.read_bytes(off, &mut bytes);
+        u32::from_ne_bytes(bytes)
     }
 
-    /// Plain (unaligned) `u32` write at `off` (bulk-region accessor).
+    /// Write a native-endian `u32` as four relaxed atomic bytes.
     #[inline]
     pub fn write_u32(&self, off: usize, v: u32) {
-        self.check(off, 4, 1);
-        // SAFETY: in-bounds per `check`; `write_unaligned` has no alignment requirement.
-        unsafe { core::ptr::write_unaligned(self.base.add(off) as *mut u32, v) }
+        self.write_bytes(off, &v.to_ne_bytes());
     }
 
-    /// Plain (unaligned) `i16` read at `off`.
+    /// Read a native-endian `i16` from two relaxed atomic bytes.
     #[inline]
     pub fn read_i16(&self, off: usize) -> i16 {
-        self.check(off, 2, 1);
-        // SAFETY: in-bounds per `check`; `read_unaligned` has no alignment requirement.
-        unsafe { core::ptr::read_unaligned(self.base.add(off) as *const i16) }
+        let mut bytes = [0; 2];
+        self.read_bytes(off, &mut bytes);
+        i16::from_ne_bytes(bytes)
     }
 
-    /// Copy `dst.len()` bytes out of the view starting at `off`.
+    /// Load `dst.len()` bulk bytes with relaxed atomic semantics.
     pub fn read_bytes(&self, off: usize, dst: &mut [u8]) {
+        let _access = self.lock_access();
         self.check(off, dst.len(), 1);
-        // SAFETY: the source range is in-bounds per `check`; `dst` is a live exclusive borrow of
-        // `dst.len()` writable bytes and cannot overlap the foreign mapping.
-        unsafe { core::ptr::copy_nonoverlapping(self.base.add(off), dst.as_mut_ptr(), dst.len()) }
+        for (index, byte) in dst.iter_mut().enumerate() {
+            *byte = self.byte(off + index).load(Ordering::Relaxed);
+        }
     }
 
-    /// Copy `src` into the view starting at `off`.
+    /// Store `src` as relaxed atomic bulk bytes.
     pub fn write_bytes(&self, off: usize, src: &[u8]) {
+        let _access = self.lock_access();
         self.check(off, src.len(), 1);
-        // SAFETY: the destination range is in-bounds per `check`; `src` is a live borrow that
-        // cannot overlap the foreign mapping.
-        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(off), src.len()) }
+        for (index, byte) in src.iter().copied().enumerate() {
+            self.byte(off + index).store(byte, Ordering::Relaxed);
+        }
     }
 }
 
@@ -214,16 +213,19 @@ impl Drop for MappedView {
     }
 }
 
-/// Close a raw handle VALUE owned by this process — the sealed channel's adopt-on-success step
-/// (the mapped view keeps the section alive after the close). Closing a value that is not a live
-/// handle of this process is a logic error the OS rejects (returns FALSE); it is not memory-unsafe.
+/// Close one duplicated raw handle after a mapping adopts its section.
+///
+/// Zero or a value wider than this target's handle width is ignored. Other invalid values are
+/// rejected by `CloseHandle`; no memory is dereferenced through them.
 pub fn close_handle_value(value: u64) {
+    let Ok(value) = usize::try_from(value) else {
+        return;
+    };
     if value == 0 {
         return;
     }
-    // SAFETY: `CloseHandle` validates the value against this process's handle table; no memory is
-    // dereferenced through it.
-    unsafe { CloseHandle(value as usize as *mut c_void) };
+    // SAFETY: `CloseHandle` validates the pointer-width value against this process's handle table.
+    unsafe { CloseHandle(value as *mut c_void) };
 }
 
 /// A lock-free cell holding the driver's adopted DATA view as a **leaked** `&'static MappedView`.

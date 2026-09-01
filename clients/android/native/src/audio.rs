@@ -73,6 +73,7 @@ enum DecodeExit {
 
 /// Decoded-chunk hand-off depth: 64 frames of slack (matches the core's AUDIO_QUEUE).
 const RING_CHUNKS: usize = 64;
+
 /// How long [`arm`] waits for a freshly started stream's FIRST data callback before writing the
 /// rung off. Generous: a LowLatency stream calls back every few ms, and even a legacy path with a
 /// large HDMI period is well inside this. The ring is un-primed for all of it, so what the device
@@ -837,9 +838,10 @@ fn nap(shutdown: &AtomicBool, total_ms: u64) {
     }
 }
 
-/// One open attempt at a given rung. Everything the realtime callback captures (channels, ring,
-/// prime state) is rebuilt per attempt — `open_stream` consumes the builder AND the callback, so
-/// nothing survives a failed try to reuse.
+/// Open one ladder rung with fresh callback state.
+///
+/// `open_stream` consumes its builder and callback, so channels, buffering, and jitter policy are
+/// rebuilt on every attempt. Invalid callback pointer/length pairs stop before a slice is formed.
 fn try_open(rung: OpenRung, ctx: &OpenCtx) -> ndk::audio::Result<LiveStream> {
     let OpenCtx {
         fmt,
@@ -901,13 +903,16 @@ fn try_open(rung: OpenRung, ctx: &OpenCtx) -> ndk::audio::Result<LiveStream> {
         // "the device never pulled" from "the device pulled silence": bumped before any
         // early-out, primed or not.
         cb_counters.callbacks.fetch_add(1, Ordering::Relaxed);
-        let want = num_frames as usize * channels;
-        // SAFETY: AAudio provides `num_frames * channel_count` F32 slots at `data`, and
-        // `arm` refused this stream unless the GRANTED channel count and format match the
-        // `channels`/`PCM_Float` this cast assumes. Unchanged by the lossless plane: the
-        // DEVICE format stays f32 whatever the wire depth is (see `try_open`'s builder), so
-        // this cast is as sound at 24-bit as it was at 16.
-        let out = unsafe { std::slice::from_raw_parts_mut(data as *mut f32, want) };
+        let Some(want) = crate::audio_format::callback_sample_count(num_frames, channels) else {
+            return AudioCallbackResult::Continue;
+        };
+        if data.is_null() {
+            return AudioCallbackResult::Stop;
+        }
+        // SAFETY: AAudio provides `num_frames * channel_count` f32 slots at non-null `data`.
+        // `arm` verified the granted channel count and PCM_Float format; checked arithmetic above
+        // rejected nonpositive or unrepresentable lengths before this slice was formed.
+        let out = unsafe { std::slice::from_raw_parts_mut(data.cast::<f32>(), want) };
         // Drain decoded chunks into the ring WITHOUT freeing on the RT thread: `drain(..)`
         // empties each Vec but keeps its capacity, then the empty buffer is handed back for
         // reuse. The only RT-thread free is the rare case where the recycle channel is

@@ -10,7 +10,10 @@ use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::{hex32, jni_guard, lock_recover, parse_hex32, SessionHandle};
+use super::{
+    get_session, hex32, insert_session, jni_guard, lock_recover, parse_hex32, remove_session,
+    SessionHandle,
+};
 
 /// Machine token of the most recent `nativeConnect`/`nativePair` failure, taken (and cleared)
 /// by `nativeTakeLastError` so Kotlin can render a cause-specific message instead of the old
@@ -484,7 +487,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
                 // Reported by Kotlin at `surfaceCreated` and on every resize after it.
                 surface_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             };
-            Box::into_raw(Box::new(handle)) as jlong
+            insert_session(handle)
         }
         Err(e) => {
             log::error!("nativeConnect to {host}:{port} failed: {e}");
@@ -494,34 +497,23 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     }
 }
 
-/// `NativeBridge.nativeClose(handle)` — drop the session (stops the decode thread, then RAII-tears
-/// down the connector). No-op on `0`.
+/// `NativeBridge.nativeClose(handle)` — remove one session key and begin teardown.
 ///
-/// # Safety contract
-/// `handle` must be `0` or a live handle from [`Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect`],
-/// closed exactly once and not concurrently with other calls on the same handle (Kotlin owns this).
+/// Existing JNI calls retain their `Arc` until they return, then the final drop joins media workers
+/// and closes the connector. Zero, stale, duplicate, and concurrent closes are no-ops.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClose(
     _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) {
-    jni_guard((), || {
-        if handle != 0 {
-            // SAFETY: per the contract, `handle` is a live `Box<SessionHandle>` pointer.
-            unsafe { drop(Box::from_raw(handle as *mut SessionHandle)) };
-        }
-    })
+    jni_guard((), || drop(remove_session(handle)))
 }
 
-/// `NativeBridge.nativeDisconnectQuit(handle)` — signal a DELIBERATE user quit before `nativeClose`,
-/// so the session closes with `QUIT_CLOSE_CODE` and the host tears it down immediately instead of
-/// holding the keep-alive linger for a reconnect. Call from an explicit disconnect action only (a
-/// plain drop / app-background keeps the linger). The handle is only BORROWED (not freed). No-op on `0`.
+/// Mark an explicit user disconnect so the host skips reconnect linger.
 ///
-/// # Safety contract
-/// `handle` must be `0` or a live handle from [`Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect`],
-/// not freed / closed concurrently with this call (Kotlin still owns it and closes it via `nativeClose`).
+/// Missing keys are ignored. The table lookup retains the session through this call even when
+/// `nativeClose` removes the key concurrently.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDisconnectQuit(
     _env: EnvUnowned,
@@ -529,24 +521,16 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDisconnectQ
     handle: jlong,
 ) {
     jni_guard((), || {
-        if handle != 0 {
-            // SAFETY: per the contract, `handle` is a live `Box<SessionHandle>` — we only borrow it
-            // (no drop), so it stays owned by Kotlin for the later `nativeClose`.
-            let sh = unsafe { &*(handle as *const SessionHandle) };
-            sh.client.disconnect_quit();
+        if let Some(session) = get_session(handle) {
+            session.client.disconnect_quit();
         }
     })
 }
 
-/// `NativeBridge.nativeRequestMode(handle, w, h, hz): Boolean` — ask the host to switch the live
-/// session to `w`×`h`@`hz` without reconnecting (the in-stream Resolution row). Non-blocking
-/// enqueue, like `punktfunk_connection_request_mode`: on acceptance the stream continues at the new
-/// mode from an IDR with in-band parameter sets; a rejection leaves the session unchanged. `false`
-/// on a `0` handle, a closed session, or a non-positive dimension.
+/// Request an in-stream resolution switch without reconnecting.
 ///
-/// # Safety contract
-/// `handle` must be `0` or a live handle from [`Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect`],
-/// not freed / closed concurrently with this call.
+/// Returns `false` for a missing session, nonpositive geometry, or a closed request channel.
+/// A concurrent close cannot invalidate the table-retained session during this enqueue.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeRequestMode(
     _env: EnvUnowned,
@@ -557,12 +541,14 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeRequestMode
     refresh_hz: jint,
 ) -> jboolean {
     jni_guard(false, || {
-        if handle == 0 || width <= 0 || height <= 0 || refresh_hz <= 0 {
+        if width <= 0 || height <= 0 || refresh_hz <= 0 {
             return false;
         }
-        // SAFETY: per the contract, `handle` is a live `Box<SessionHandle>` — borrowed only.
-        let sh = unsafe { &*(handle as *const SessionHandle) };
-        sh.client
+        let Some(session) = get_session(handle) else {
+            return false;
+        };
+        session
+            .client
             .request_mode(Mode {
                 width: width as u32,
                 height: height as u32,
@@ -572,32 +558,25 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeRequestMode
     })
 }
 
-/// `NativeBridge.nativeHostFingerprint(handle): String` — the SHA-256 (64-hex) of the cert the host
-/// presented on this connection. Valid after a successful `nativeConnect`; Kotlin pins it on a TOFU
-/// connect. `""` on a `0` handle.
+/// Return the connected host certificate's SHA-256 as 64 lowercase hex characters.
+/// Missing or concurrently closed session keys return an empty string.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostFingerprint<'local>(
     mut env: EnvUnowned<'local>,
     _this: JObject<'local>,
     handle: jlong,
 ) -> JString<'local> {
-    let out = if handle == 0 {
-        String::new()
-    } else {
-        // SAFETY: live handle per the nativeConnect/nativeClose contract.
-        let h = unsafe { &*(handle as *const SessionHandle) };
-        hex32(&h.client.host_fingerprint)
-    };
+    let out = get_session(handle)
+        .map(|session| hex32(&session.client.host_fingerprint))
+        .unwrap_or_default();
     env.with_env(|env| env.new_string(out))
         .resolve::<LogErrorAndDefault>()
 }
 
-/// `NativeBridge.nativeSessionEnded(handle): Boolean` — has the underlying QUIC session ended?
-/// `true` once the connection closed (a host suspend / crash / network drop idle-timed it out, or the
-/// host closed it) — from then on no more frames arrive and the video sits frozen on its last one.
-/// Kotlin's stream watchdog polls this (~1 Hz) to leave a dead stream and return to the menu (where
-/// the user can Wake-on-LAN the host) instead of stranding them on a frozen frame. `false` on a `0`
-/// handle. Cheap (one atomic load); safe on the UI thread.
+/// Report whether the keyed QUIC session has ended.
+///
+/// The stream watchdog polls this to leave a frozen final frame after disconnect. Missing or
+/// concurrently closed keys return `false`; a successful lookup is one atomic client read.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSessionEnded(
     _env: EnvUnowned,
@@ -605,24 +584,14 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSessionEnde
     handle: jlong,
 ) -> jboolean {
     jni_guard(false, || {
-        if handle == 0 {
-            return false;
-        }
-        // SAFETY: live handle per the nativeConnect/nativeClose contract.
-        let h = unsafe { &*(handle as *const SessionHandle) };
-        h.client.is_session_ended()
+        get_session(handle).is_some_and(|session| session.client.is_session_ended())
     })
 }
 
-/// `NativeBridge.nativeEndReason(handle): Int` — WHY the session ended, as a
-/// `punktfunk_core::client::PunktfunkEndReason` byte (Kotlin mirrors it in `SessionEndReason`).
+/// Return the session's `PunktfunkEndReason` byte for Kotlin's disconnect message.
 ///
-/// Companion to `nativeSessionEnded`, which only says THAT it ended. Kotlin's watchdog needs both:
-/// the flag to leave a dead stream, and this to decide what — if anything — to tell the user. A
-/// player quitting their game and a host dropping off the network both end the session, and until
-/// this existed the watchdog worded them identically ("the host may be asleep"), which is wrong for
-/// every deliberate ending. `0` (NONE) on a `0` handle or before the session ends. Cheap (one
-/// atomic load); safe on the UI thread.
+/// `0` means no reason, including a missing or concurrently closed key. A retained lookup
+/// distinguishes deliberate host closure from network loss without exposing session memory.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeEndReason(
     _env: EnvUnowned,
@@ -630,12 +599,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeEndReason(
     handle: jlong,
 ) -> jint {
     jni_guard(0, || {
-        if handle == 0 {
-            return 0;
-        }
-        // SAFETY: live handle per the nativeConnect/nativeClose contract.
-        let h = unsafe { &*(handle as *const SessionHandle) };
-        h.client.end_reason() as jint
+        get_session(handle)
+            .map(|session| session.client.end_reason() as jint)
+            .unwrap_or(0)
     })
 }
 

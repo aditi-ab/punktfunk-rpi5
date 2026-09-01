@@ -2873,8 +2873,8 @@ PunktfunkStatus punktfunk_set_log_callback(uint8_t max_level, PunktfunkLogCb cb,
 // Returns `Ok` if at least one datagram was sent. Call off the UI thread.
 //
 // # Safety
-// `macs` must point to at least `mac_count * 6` readable bytes. `last_known_ip`, if non-NULL,
-// must be a NUL-terminated string.
+// For a representable nonzero count, `macs` must point to `mac_count * 6` readable bytes.
+// `last_known_ip`, if non-NULL, must be a NUL-terminated string.
 PunktfunkStatus punktfunk_wake_on_lan(const uint8_t *macs,
                                       uintptr_t mac_count,
                                       const char *last_known_ip);
@@ -2907,7 +2907,8 @@ void punktfunk_session_free(PunktfunkSession *s);
 // Host: FEC-protect, packetize, seal and send one encoded access unit.
 //
 // # Safety
-// `s` is a valid host handle; `data` points to `len` readable bytes (or `len == 0`).
+// `s` is a valid host handle. For a representable nonzero `len`, `data` points to that many
+// readable bytes; `data` may be NULL when `len == 0`.
 PunktfunkStatus punktfunk_host_submit_frame(PunktfunkSession *s,
                                             const uint8_t *data,
                                             uintptr_t len,
@@ -3970,7 +3971,8 @@ PunktfunkStatus punktfunk_connection_send_input(PunktfunkConnection *c,
 // (a DTX silence frame). The data is copied; the caller may reuse the buffer after this returns.
 //
 // # Safety
-// `c` is a valid connection handle; `opus_data` is valid for `len` bytes (or `len == 0`).
+// `c` is a valid connection handle. For a representable nonzero `len`, `opus_data` points to
+// that many readable bytes; it may be NULL when `len == 0`.
 PunktfunkStatus punktfunk_connection_send_mic(PunktfunkConnection *c,
                                               const uint8_t *opus_data,
                                               uintptr_t len,
@@ -4172,8 +4174,8 @@ PunktfunkStatus punktfunk_connection_clipboard_control(const PunktfunkConnection
 // only if the host later fetches.
 //
 // # Safety
-// `c` is a valid connection handle; `kinds` points to `n` `PunktfunkClipKind`s (NULL allowed only
-// when `n == 0`), each `mime` a valid NUL-terminated UTF-8 string.
+// `c` is a valid connection handle. For `n <= 16`, `kinds` points to `n` `PunktfunkClipKind`s
+// (NULL only for zero), each with a valid NUL-terminated UTF-8 `mime`.
 PunktfunkStatus punktfunk_connection_clipboard_offer(const PunktfunkConnection *c,
                                                      uint32_t seq,
                                                      const PunktfunkClipKind *kinds,
@@ -4202,8 +4204,8 @@ PunktfunkStatus punktfunk_connection_clipboard_fetch(const PunktfunkConnection *
 // `len == 0` (e.g. a final empty chunk). `punktfunk_connection_clipboard_cancel(req_id)` aborts.
 //
 // # Safety
-// `c` is a valid connection handle; `data` points to `len` bytes (NULL allowed only when
-// `len == 0`).
+// `c` is a valid connection handle. For a representable nonzero `len`, `data` points to that
+// many readable bytes; it may be NULL when `len == 0`.
 PunktfunkStatus punktfunk_connection_clipboard_serve(const PunktfunkConnection *c,
                                                      uint32_t req_id,
                                                      const uint8_t *data,

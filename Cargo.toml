@@ -57,11 +57,10 @@ exclude = [
     "tools/win-input-matrix",
 ]
 
-# ndk 0.9.0 verbatim from crates.io plus ONE visibility change (and two warning fixes — an
-# unnecessary `std::` qualification and a feature-gated `Result` import): `MediaCodec::as_ptr` made public
-# (upstream keeps it private and exposes no frame-rendered binding), so the Android client can
-# call `AMediaCodec_setOnFrameRenderedCallback` via ndk-sys for the HUD's `display` stage
-# (design/stats-unification.md). Drop the patch when upstream exposes the pointer or the callback.
+# ndk 0.9.0 with a small maintained patch set: public `MediaCodec::as_ptr` for the missing
+# frame-rendered binding, two warning fixes, and panic-free destructors for fallible NDK cleanup.
+# The pointer patch can disappear when upstream exposes the callback; destructor failures remain
+# non-actionable in `Drop` and must never unwind through a JNI or codec callback boundary.
 [patch.crates-io]
 ndk = { path = "clients/android/native/vendor/ndk" }
 

@@ -19,6 +19,13 @@ use punktfunk_core::client::NativeClient;
 /// not negotiated. Only `0xD3` carries `audio_frame_us`.
 pub(crate) const OPUS_FRAME_US: u32 = 5_000;
 
+pub(crate) fn callback_sample_count(num_frames: i32, channels: usize) -> Option<usize> {
+    let frames = usize::try_from(num_frames)
+        .ok()
+        .filter(|&frames| frames > 0)?;
+    frames.checked_mul(channels).filter(|&samples| samples > 0)
+}
+
 // ---- ms ⇄ interleaved samples: multiply FIRST, divide LAST ------------------------------------
 //
 // This mirrors `punktfunk_core::audio`'s own pair, and it mirrors it because the defect it fixes
@@ -224,6 +231,15 @@ mod tests {
             channels,
             frame_us,
         }
+    }
+
+    #[test]
+    fn callback_lengths_reject_nonpositive_and_overflowing_inputs() {
+        assert_eq!(callback_sample_count(128, 2), Some(256));
+        assert_eq!(callback_sample_count(0, 2), None);
+        assert_eq!(callback_sample_count(-1, 2), None);
+        assert_eq!(callback_sample_count(1, 0), None);
+        assert_eq!(callback_sample_count(i32::MAX, usize::MAX), None);
     }
 
     /// **The defect, stated as numbers.** `per_ms = rate_hz / 1000 * channels` truncates 44 100 Hz

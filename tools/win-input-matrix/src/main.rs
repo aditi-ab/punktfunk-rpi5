@@ -38,18 +38,18 @@ mod imp {
     use windows::Foundation::EventHandler;
     use windows::Gaming::Input::{Gamepad, IGameController, RawGameController};
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
-        DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO, SP_DEVICE_INTERFACE_DATA,
-        SP_DEVICE_INTERFACE_DETAIL_DATA_W, SetupDiDestroyDeviceInfoList,
-        SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
+        SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
+        SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO,
+        SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
     };
     use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
     use windows::Win32::System::Com::CoIncrementMTAUsage;
     use windows::Win32::UI::Input::XboxController::{
-        XINPUT_STATE, XINPUT_VIBRATION, XInputGetState, XInputSetState,
+        XInputGetState, XInputSetState, XINPUT_STATE, XINPUT_VIBRATION,
     };
     // `Interface` brings `cast()` into scope, which is how a WinRT `Gamepad` is correlated to the
     // `RawGameController` that knows its name.
-    use windows::core::{GUID, Interface};
+    use windows::core::{Interface, GUID};
 
     /// `GUID_DEVINTERFACE_XUSB` — the interface class `xinput1_4` enumerates. This is the one that
     /// matters: XInput does not read HID at all, it walks this class.
@@ -57,8 +57,12 @@ mod imp {
     /// `GUID_DEVINTERFACE_HID` — what Steam, SDL/hidapi, RawInput, DirectInput and joy.cpl walk.
     const GUID_DEVINTERFACE_HID: GUID = GUID::from_u128(0x4d1e55b2_f16f_11cf_88cb_001111000030);
 
-    /// Every PRESENT device interface in `class`. Present-only on purpose: the registry lists
-    /// long-dead devnodes too, and "is it there right now" is the whole question.
+    /// Enumerate the device paths for every present interface in `class`.
+    ///
+    /// SetupAPI returns each variable-length detail record as an exact byte count. The backing
+    /// allocation stays aligned for both its fixed header and trailing WCHAR path, while path
+    /// decoding remains bounded by that reported count. Registry-only, long-dead devnodes are
+    /// excluded because this probe asks what input APIs can see now.
     fn interfaces(class: GUID) -> Vec<String> {
         let mut out = Vec::new();
         // SAFETY: `class` is a valid GUID; we pass no enumerator and no owner window. The returned
@@ -102,15 +106,20 @@ mod imp {
             if needed == 0 {
                 continue;
             }
-            let mut buf = vec![0u8; needed as usize];
-            let detail = buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
-            // SAFETY: `buf` is `needed` bytes, the size the API just asked for. `cbSize` must be
-            // the size of the FIXED part of the struct (not the buffer) — 8 on x64.
-            unsafe {
-                (*detail).cbSize = 8;
+            let byte_len = needed as usize;
+            if byte_len < size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() {
+                continue;
             }
-            // SAFETY: `detail` points into `buf`, which lives until the end of this iteration and
-            // is exactly the length the API requested.
+            let word_len = byte_len.div_ceil(size_of::<usize>());
+            let mut storage = vec![0usize; word_len];
+            let detail = storage.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
+            // SAFETY: `storage` is aligned for the detail header and holds at least `needed` bytes.
+            // `cbSize` is the target ABI's fixed struct size, not the variable buffer length.
+            unsafe {
+                (*detail).cbSize = size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
+            }
+            // SAFETY: `detail` points into aligned storage that lives through the call. The exact
+            // byte count passed to SetupAPI is the capacity it reported, excluding rounded padding.
             if unsafe {
                 SetupDiGetDeviceInterfaceDetailW(set, &ifdata, Some(detail), needed, None, None)
             }
@@ -118,14 +127,20 @@ mod imp {
             {
                 continue;
             }
-            // SAFETY: on success the API wrote a NUL-terminated wide string into `DevicePath`.
+            let path_offset = std::mem::offset_of!(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath);
+            let Some(path_bytes) = byte_len.checked_sub(path_offset) else {
+                continue;
+            };
+            let path_units = path_bytes / size_of::<u16>();
+            // SAFETY: `DevicePath` is u16-aligned within the aligned detail record. `path_units`
+            // covers only complete WCHARs inside SetupAPI's exact returned byte count.
             let path = unsafe {
-                let p = (*detail).DevicePath.as_ptr();
-                let mut len = 0usize;
-                while *p.add(len) != 0 {
-                    len += 1;
-                }
-                String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
+                let wide = std::slice::from_raw_parts((*detail).DevicePath.as_ptr(), path_units);
+                let len = wide
+                    .iter()
+                    .position(|&unit| unit == 0)
+                    .unwrap_or(wide.len());
+                String::from_utf16_lossy(&wide[..len])
             };
             out.push(path);
         }
