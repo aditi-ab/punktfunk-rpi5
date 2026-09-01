@@ -436,20 +436,19 @@ fn file_is_heavy(f) {
 
 fn house_style() {
     let s = "";
-    s += "HOUSE STYLE (docs/writing.md; CI scripts/ci/check-writing.py):\n";
-    s += "- A comment is the non-local reason: trap, lifetime, unit on a magic number.\n";
-    s += "- Names and types are the what. If the next five lines already say it, DELETE.\n";
-    s += "- // : at most four lines (CI fails at six). // SAFETY: and FFI/lifetime proofs stay exact.\n";
-    s += "- //! / /// module map: what it is, the contract, how to pin it, where evidence lives.\n";
-    s += "  Aim 8-20 lines (CI fails at 24). Do not pad a short file up to 8.\n";
-    s += "- DELETE: restatement; field reports (dates, devices, OS, log lines, 'Field 2026-');\n";
-    s += "  soak minutes; SKUs; milestone codes (WP-C, M3, M7); plan section numbers; review-ticket\n";
-    s += "  novels; 'this used to'; ponytail:; self-Q&A; changelog-in-a-comment; metaphor.\n";
-    s += "- KEEP: why this number; lifetime / weak-ref / generation; one-line rejected alternative\n";
-    s += "  when it is a trap ('do not grant OWNER (OI)(CI)(F) — WRITE_DAC comes back').\n";
-    s += "- English. Clear. No plot. A comment never enforces a trust boundary.\n";
-    s += "- Comments only. Do not change code, tests, literals, or names.\n";
-    s += "- Do not add writing-ok unless the extra lines are a SAFETY/lifetime trap.\n";
+    s += "HOW TO WRITE A COMMENT (docs/writing.md). Read it. Length CI is a backstop, not the style.\n";
+    s += "A comment is the live invariant: trap, lifetime, unit on a magic number.\n";
+    s += "Present tense. The file as it is. Cover the next five lines with your hand: if the\n";
+    s += "comment is only interesting as history, delete it. Keep the rule that is still true.\n";
+    s += "Not a poem: no cadence, no punchline, no plot. Name the invariant and stop.\n";
+    s += "Not archaeology: old versions, scares, soaks, review tickets, 'this used to' go on the PR.\n";
+    s += "A version comment is the live handshake, not a biography of every bump.\n";
+    s += "// SAFETY: is a proof, not how the bug was found.\n";
+    s += "Module rustdoc: what it is, the contract, how to pin it, where evidence lives.\n";
+    s += "Aim 8-20 lines (CI fails at 24). // : at most four (CI fails at six). Do not pad.\n";
+    s += "A four-line war story is still wrong. A comment never enforces a trust boundary.\n";
+    s += "Comments only. Do not change code, tests, literals, or names.\n";
+    s += "Do not add writing-ok unless the extra lines are a SAFETY/lifetime trap.\n";
     s
 }
 
