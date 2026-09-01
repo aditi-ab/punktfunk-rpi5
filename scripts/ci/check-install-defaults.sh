@@ -75,13 +75,14 @@ NOB='ID=nobara\nID_LIKE="fedora"\nVERSION_ID=43\nPRETTY_NAME="Nobara Linux"\n'
 SIL='ID=fedora\nVARIANT_ID=silverblue\nVERSION_ID=44\nPRETTY_NAME="Fedora Linux 44 (Silverblue)"\n'
 
 # Desktop seat: only the couch/HTPC distros flip group + linger on.
-# D4 (2026-08-31) flipped the punktfunk group to YES on every box, not couch boxes only. The
-# rows below assert that flip; the couch cases still carry their own why-text, and the opt-out
-# case proves --no-punktfunk-group still wins. The grant is named in the label on purpose:
-# under --yes this summary is the only place it is stated.
+# D4 (2026-08-31) flipped the punktfunk group to YES on every box, not couch boxes only, and the
+# clipboard followed on 2026-09-01: each client still opts in per host, so a shared clipboard on
+# the host grants nothing on its own. The rows below assert both flips; the couch cases still
+# carry their own why-text, and the opt-out case proves --no-punktfunk-group still wins. The
+# grant is named in the label on purpose: under --yes this summary is the only place it is stated.
 defaults_case debian-desk  "$DEB"  desktop '' 'Full controller (joins the punktfunk group — grants usbip attach): yes'
 defaults_case debian-desk2 "$DEB"  desktop '' 'Third-party clients (Moonlight, Artemis): no'
-defaults_case debian-desk3 "$DEB"  desktop '' 'Shared clipboard: no'
+defaults_case debian-desk3 "$DEB"  desktop '' 'Shared clipboard: yes'
 defaults_case debian-desk4 "$DEB"  desktop '' 'Start at boot with nobody logged in: no'
 defaults_case fedora-desk  "$FED"  desktop '' 'Full controller (joins the punktfunk group — grants usbip attach): yes'
 defaults_case fedora-desk2 "$FED"  desktop '' 'Start at boot with nobody logged in: no'
@@ -95,7 +96,7 @@ defaults_case omarchy-ssh   "$OMA" headless '' 'Start at boot with nobody logged
 defaults_case bazzite-desk  "$BAZ" desktop '' 'Full controller (joins the punktfunk group — grants usbip attach): yes  (Bazzite — virtual Steam Deck pad)'
 defaults_case bazzite-desk2 "$BAZ" desktop '' 'Start at boot with nobody logged in: yes  (Bazzite hosts are usually headless)'
 defaults_case bazzite-desk3 "$BAZ" desktop '' 'Third-party clients (Moonlight, Artemis): no'
-defaults_case bazzite-desk4 "$BAZ" desktop '' 'Shared clipboard: no'
+defaults_case bazzite-desk4 "$BAZ" desktop '' 'Shared clipboard: yes'
 
 defaults_case nobara-desk  "$NOB" desktop '' 'Full controller (joins the punktfunk group — grants usbip attach): yes  (Nobara — virtual Steam Deck pad)'
 defaults_case nobara-desk2 "$NOB" desktop '' 'Start at boot with nobody logged in: yes  (Nobara hosts are usually headless)'
