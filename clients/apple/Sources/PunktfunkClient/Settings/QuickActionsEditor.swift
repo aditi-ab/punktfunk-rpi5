@@ -161,10 +161,13 @@ struct QuickActionsEditor: View {
                 .frame(height: 400)
                 .listRowInsets(EdgeInsets())
             } footer: {
+                // Footers wear the described-row caption font (SettingsView+Support): the
+                // system footer style renders larger than every other settings caption.
                 Text(overridden
                      ? "\(pickVerb) a button to change it, drag one onto another to swap. "
-                       + "This profile has its own quick actions; the default ring no longer reaches it."
+                       + "This profile has its own quick actions; the default dial no longer reaches it."
                      : "\(pickVerb) a button to change it, drag one onto another to swap.")
+                    .font(.geist(13, relativeTo: .footnote))
             }
             #if os(iOS)
             // The virtual controller's preset and look (§4.3), written to the blob's `pad`
@@ -176,23 +179,19 @@ struct QuickActionsEditor: View {
                     Text("Sticks and shoulders").tag("sticks")
                     Text("D-pad and face buttons").tag("dpad")
                 }
-                PadSlider(label: "Opacity", value: cfg.pad.opacity, range: VirtualPad.opacityRange,
-                          caption: "How strongly the controls draw over the picture; higher hides more of the game.") { v in
+                PadSlider(label: "Opacity", value: cfg.pad.opacity, range: VirtualPad.opacityRange) { v in
                     setPad { $0.opacity = v }
                 }
-                PadSlider(label: "Scale", value: cfg.pad.scale, range: VirtualPad.scaleRange,
-                          caption: "How large the controls are; larger ones cover more of the picture.") { v in
+                PadSlider(label: "Scale", value: cfg.pad.scale, range: VirtualPad.scaleRange) { v in
                     setPad { $0.scale = v }
                 }
                 Button("Edit layout") { editingLayout = true }
             } header: {
                 Text("Virtual controller")
             } footer: {
-                Text("Shown from the ring's Virtual controller button. A finger on one of its controls "
-                     + "drives the game; a finger anywhere else drives the touch mode. Layout picks which "
-                     + "controls it shows; fewer controls leave more of the picture uncovered. "
-                     + "Edit layout moves, sizes or hides each control by hand; wide and upright screens "
-                     + "keep separate layouts.")
+                Text("Shown from the dial's Virtual controller button. "
+                     + "Wide and upright screens keep separate layouts.")
+                    .font(.geist(13, relativeTo: .footnote))
             }
             #endif
             Section {
@@ -232,18 +231,11 @@ struct QuickActionsEditor: View {
             } header: {
                 Text("Shortcuts")
             } footer: {
-                #if os(macOS)
-                Text("A chord the ring sends to the host. A new one takes the first empty slot; "
-                     + "click one to change or remove it.")
-                #else
-                Text("A chord the ring sends to the host. A new one takes the first empty slot; "
-                     + "tap one to change it, swipe to remove it.")
-                #endif
+                Text("A new shortcut takes the first empty dial slot.")
+                    .font(.geist(13, relativeTo: .footnote))
             }
             Section {
                 Button("Reset to default", role: .destructive, action: reset)
-            } footer: {
-                Text("Restores the platform ring and removes the shortcuts.")
             }
         }
         #if os(macOS)
@@ -352,7 +344,6 @@ private struct PadSlider: View {
     let label: String
     let value: Float
     let range: ClosedRange<Float>
-    let caption: String
     let commit: (Float) -> Void
     @State private var live: Float = 0
 
@@ -362,13 +353,6 @@ private struct PadSlider: View {
             Slider(value: $live, in: range) { editing in
                 if !editing { commit(live) }
             }
-            // The described-row caption idiom (SettingsView+Support), so this page's captions
-            // sit at the same size as every other settings page's.
-            Text(caption)
-                .font(.geist(13, relativeTo: .footnote))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .modifier(CaptionWidth())
         }
         .onAppear { live = value }
         .onChange(of: value) { _, v in live = v }
@@ -455,7 +439,7 @@ private struct ShortcutEditor: View {
                         VStack(alignment: .leading, spacing: 3) {
                             Text(draft.label.isEmpty ? (key == nil ? "Pick a key" : chordChip(draft.keys)) : draft.label)
                                 .font(.geist(15, .medium))
-                            Text(key == nil ? "The disc as the ring will draw it" : chordChip(draft.keys))
+                            Text(key == nil ? "The disc as the dial will draw it" : chordChip(draft.keys))
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                         }

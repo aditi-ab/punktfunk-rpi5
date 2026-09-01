@@ -303,9 +303,7 @@ fn editor_page(shared: &Shared) -> adw::NavigationPage {
     content.append(&hint);
     let shortcuts = adw::PreferencesGroup::builder().title("Shortcuts").build();
     content.append(&shortcuts);
-    let reset_group = adw::PreferencesGroup::builder()
-        .description("Restores the platform ring and removes the shortcuts.")
-        .build();
+    let reset_group = adw::PreferencesGroup::builder().build();
     content.append(&reset_group);
 
     // Everything the ring and the list draw is rebuilt from the blob after every edit, so the
@@ -340,7 +338,7 @@ fn editor_page(shared: &Shared) -> adw::NavigationPage {
         reset.connect_clicked(move |_| {
             let alert = adw::AlertDialog::new(
                 Some("Reset quick actions?"),
-                Some("The ring goes back to the platform default and the shortcuts are removed."),
+                Some("The dial goes back to the platform default and the shortcuts are removed."),
             );
             alert.add_responses(&[("cancel", "Cancel"), ("reset", "Reset")]);
             alert.set_response_appearance("reset", adw::ResponseAppearance::Destructive);
@@ -677,9 +675,7 @@ fn build_shortcuts(
         group.set_header_suffix(Some(&add));
     }
     if cfg.shortcuts.is_empty() {
-        group.set_description(Some(
-            "A chord the ring sends to the host. A new one takes the first empty slot.",
-        ));
+        group.set_description(Some("A new shortcut takes the first empty dial slot."));
     } else {
         group.set_description(None);
     }
@@ -791,7 +787,7 @@ fn shortcut_page(
         .xalign(0.0)
         .build();
     let legend_note = gtk::Label::builder()
-        .label("How the ring will draw it")
+        .label("How the dial will draw it")
         .css_classes(["dim-label"])
         .xalign(0.0)
         .build();

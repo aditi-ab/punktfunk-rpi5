@@ -147,7 +147,7 @@ internal fun QuickActionsScreen(
             }
             Text(
                 "Tap a button to change it, drag one onto another to swap." +
-                    if (overridden) " This profile has its own quick actions; the default ring no longer reaches it." else "",
+                    if (overridden) " This profile has its own quick actions; the default dial no longer reaches it." else "",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(start = 4.dp),
@@ -157,26 +157,23 @@ internal fun QuickActionsScreen(
         // same path the ring uses.
         SettingsGroup(
             "Virtual controller",
-            footer = "Shown from the ring's Virtual controller button. A finger on one of its controls drives the game; a finger anywhere else drives the touch mode. " +
-                "Edit layout moves, sizes or hides each control by hand; wide and upright screens keep separate layouts.",
+            footer = "Shown from the dial's Virtual controller button. " +
+                "Wide and upright screens keep separate layouts.",
         ) {
             SettingDropdown(
                 label = "Layout",
                 options = listOf("full" to "Full", "sticks" to "Sticks and shoulders", "dpad" to "D-pad and face buttons"),
                 selected = cfg.pad.layout,
-                caption = "Which controls the controller shows; fewer controls leave more of the picture uncovered.",
             ) { onChange(cfg.copy(pad = cfg.pad.copy(layout = it)).toJson()) }
-            PadSlider(
-                "Opacity", cfg.pad.opacity, PAD_OPACITY_MIN..1f,
-                "How strongly the controls draw over the picture; higher hides more of the game.",
-            ) { onChange(cfg.copy(pad = cfg.pad.copy(opacity = it)).toJson()) }
-            PadSlider(
-                "Scale", cfg.pad.scale, PAD_SCALE_MIN..PAD_SCALE_MAX,
-                "How large the controls are; larger ones cover more of the picture.",
-            ) { onChange(cfg.copy(pad = cfg.pad.copy(scale = it)).toJson()) }
+            PadSlider("Opacity", cfg.pad.opacity, PAD_OPACITY_MIN..1f) {
+                onChange(cfg.copy(pad = cfg.pad.copy(opacity = it)).toJson())
+            }
+            PadSlider("Scale", cfg.pad.scale, PAD_SCALE_MIN..PAD_SCALE_MAX) {
+                onChange(cfg.copy(pad = cfg.pad.copy(scale = it)).toJson())
+            }
             TextButton(onClick = { editingLayout = true }) { Text("Edit layout") }
         }
-        SettingsGroup("Shortcuts", footer = "A chord the ring sends to the host. A new one takes the first empty slot.") {
+        SettingsGroup("Shortcuts", footer = "A new shortcut takes the first empty dial slot.") {
             cfg.shortcuts.forEach { sc ->
                 Row(
                     modifier = Modifier.fillMaxWidth().clickable {
@@ -208,7 +205,7 @@ internal fun QuickActionsScreen(
                 editingShortcut = ShortcutDraft("s$next", "", emptyList(), isNew = true)
             }) { Text("Add shortcut") }
         }
-        SettingsGroup(footer = "Restores the platform ring and removes the shortcuts.") {
+        SettingsGroup {
             TextButton(onClick = onReset) {
                 Text("Reset to default", color = MaterialTheme.colorScheme.error)
             }
@@ -290,14 +287,12 @@ private fun PadSlider(
     label: String,
     value: Float,
     range: ClosedFloatingPointRange<Float>,
-    caption: String,
     onCommit: (Float) -> Unit,
 ) {
     var v by remember(value) { mutableFloatStateOf(value) }
     Column {
         Text("$label · ${(v * 100).roundToInt()}%", style = MaterialTheme.typography.bodyLarge)
         Slider(value = v, onValueChange = { v = it }, valueRange = range, onValueChangeFinished = { onCommit(v) })
-        Text(caption, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -450,7 +445,7 @@ private fun ShortcutEditor(
                         style = MaterialTheme.typography.bodyLarge,
                     )
                     Text(
-                        if (key == null) "The disc as the ring will draw it" else chordChip(keys),
+                        if (key == null) "The disc as the dial will draw it" else chordChip(keys),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontFamily = if (key == null) null else FontFamily.Monospace,
