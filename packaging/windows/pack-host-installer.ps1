@@ -53,6 +53,9 @@ param(
     [string]$BunExe = $env:BUN_EXE,                                # portable bun.exe runtime for the console + runner
     [switch]$NoDriver,                                              # build without the bundled pf-vdisplay driver
     [switch]$NoSign,                                                # skip signing (local debug)
+    # WP3.1 (design/installer-v2-windows.md D3/D6): pack with punktfunk-setup-win instead of ISCC.
+    # Same staging inputs, same output name, same signing. ISCC stays the default until M5.
+    [switch]$Engine,
     # 'auto' (default) = required iff this is a v* tag build; 'true'/'false' to force. See below.
     [ValidateSet('auto', 'true', 'false')][string]$RequireSignedCert = 'auto'
 )
@@ -113,8 +116,8 @@ function Find-AzureDlib([string]$Explicit) {
     }
     $hit.FullName
 }
-$iscc = Find-Iscc
-Write-Host "ISCC: $iscc"
+$iscc = if ($Engine) { $null } else { Find-Iscc }
+if ($iscc) { Write-Host "ISCC: $iscc" }
 
 # --- signing cert (supplied stable pfx OR ephemeral self-signed) -----------------------------
 # FAIL CLOSED on a real release. The ephemeral fallback below exists so canary/CI/dev builds keep
@@ -415,11 +418,67 @@ if (Test-Path (Join-Path $layerSrc 'Cargo.toml')) {
 else { Write-Host "no pf-vkhdr-layer crate -> installer built WITHOUT the HDR Vulkan layer" }
 
 # --- build the installer (from the non-redirected copy under C:\t) -----------------------------
-Write-Host "==> ISCC $($defines -join ' ') $issLocal"
-& $iscc @defines $issLocal
-if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
-
 $setup = Join-Path $OutDir "punktfunk-host-setup-$Version.exe"
+if ($Engine) {
+    # The wizard crate builds into a target dir of its own: windows-reactor-setup stages the
+    # self-contained WinAppSDK runtime next to the exe, and the packer takes everything in that
+    # dir that is not cargo's as the runtime set.
+    $wizTarget = Join-Path $OutDir 'wizard-target'
+    Write-Host "==> building punktfunk-setup-win (self-contained wizard + packer) -> $wizTarget"
+    $prevTarget = $env:CARGO_TARGET_DIR
+    $env:CARGO_TARGET_DIR = $wizTarget
+    Push-Location $repoRoot
+    & cargo build --release -p punktfunk-setup-win
+    $wizExit = $LASTEXITCODE
+    Pop-Location
+    if ($prevTarget) { $env:CARGO_TARGET_DIR = $prevTarget } else { Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue }
+    if ($wizExit -ne 0) { throw "punktfunk-setup-win build failed ($wizExit)" }
+    $wizRel = Join-Path $wizTarget 'release'
+    $wizExe = Join-Path $wizRel 'punktfunk-setup-win.exe'
+    $packer = Join-Path $wizRel 'punktfunk-setup-pack.exe'
+
+    # The {app} tree — the .iss [Files] table as directories (a missing input is simply absent,
+    # exactly as its #ifdef was). The plan's DeployFiles lays this down verbatim.
+    $appStage = Join-Path $OutDir 'app'
+    if (Test-Path $appStage) { Remove-Item $appStage -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $appStage | Out-Null
+    Copy-Item $exe, $trayExe, $hostEnv -Destination $appStage -Force
+    Copy-Item $readme -Destination (Join-Path $appStage 'README.txt') -Force
+    Copy-Item (Join-Path $brandStage 'punktfunk.ico') -Destination $appStage -Force
+    Copy-Item $licStage -Destination (Join-Path $appStage 'licenses') -Recurse -Force
+    if ($ffmpegStage -and (Test-Path $ffmpegStage)) { Copy-Item (Join-Path $ffmpegStage '*.dll') -Destination $appStage -Force }
+    if ($wantWeb -or $wantScripting) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $appStage 'bun') | Out-Null
+        Copy-Item $bunStage -Destination (Join-Path $appStage 'bun\bun.exe') -Force
+    }
+    if ($wantWeb) { Copy-Item $webStage -Destination (Join-Path $appStage 'web\.output') -Recurse -Force }
+    if ($wantScripting) { Copy-Item $scrStage -Destination (Join-Path $appStage 'scripting') -Recurse -Force }
+    if ($layerStage -and (Test-Path $layerStage)) { Copy-Item $layerStage -Destination (Join-Path $appStage 'vklayer') -Recurse -Force }
+    # Driver payloads: extracted beside the wizard, handed to `driver install --dir <staging>\…`.
+    $stagingRoot = Join-Path $OutDir 'staging'
+    if (Test-Path $stagingRoot) { Remove-Item $stagingRoot -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $stagingRoot | Out-Null
+    if (-not $NoDriver) {
+        Copy-Item $stage -Destination (Join-Path $stagingRoot 'pfvdisplay') -Recurse -Force
+        Copy-Item $gpStage -Destination (Join-Path $stagingRoot 'gamepad') -Recurse -Force
+    }
+
+    # D6: the payload-less uninstaller lands in {app} as unins000.exe, signed before it is packed.
+    $unins = Join-Path $appStage 'unins000.exe'
+    & $packer pack-uninstaller --exe $wizExe --runtime $wizRel --version $Version --artifact host --out $unins
+    if ($LASTEXITCODE -ne 0) { throw "pack-uninstaller failed ($LASTEXITCODE)" }
+    Sign-File $unins
+
+    & $packer pack --exe $wizExe --runtime $wizRel --app $appStage --staging $stagingRoot --version $Version --artifact host --out $setup
+    if ($LASTEXITCODE -ne 0) { throw "pack failed ($LASTEXITCODE)" }
+    & $packer inspect $setup
+    if ($LASTEXITCODE -ne 0) { throw "inspect failed ($LASTEXITCODE)" }
+}
+else {
+    Write-Host "==> ISCC $($defines -join ' ') $issLocal"
+    & $iscc @defines $issLocal
+    if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+}
 if (-not (Test-Path $setup)) { throw "expected installer not produced: $setup" }
 
 # --- sign the setup.exe + clean up ------------------------------------------------------------

@@ -23,17 +23,21 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use punktfunk_setup::platform::windows::choices::NetworkAnswer;
 use punktfunk_setup::platform::windows::demo::{sandbox_app_dir, WinDemoRunner, WinPreset};
-use punktfunk_setup::platform::windows::exec::{FakePayload, Subst, WinExecutor};
+use punktfunk_setup::platform::windows::exec::{FakePayload, PayloadSource, Subst, WinExecutor};
 use punktfunk_setup::platform::windows::plan::{self, Artifact};
 use punktfunk_setup::platform::windows::screen::{Editor, Field, WinScreen, WizStep};
-use punktfunk_setup::platform::windows::{choices::WinChoices, report as win_report, FakeNet};
+use punktfunk_setup::platform::windows::{
+    base_paths, choices::WinChoices, report as win_report, FakeNet, NetProbe, SystemNet,
+};
+use punktfunk_setup::seam::{CommandRunner, Env, SystemRunner};
 use punktfunk_setup::ui::Reporter;
 use windows_reactor::*;
 
 use crate::brand;
+use crate::real::{self, DirPayload, Seams};
 
 /// Long enough that a demo step reads as work happening — the Linux demo's value.
-const DEMO_LATENCY_MS: u64 = 140;
+pub const DEMO_LATENCY_MS: u64 = 140;
 
 /// 14 × 16 ms ≈ 220 ms: over before a fast clicker's next click lands (the generation guard
 /// cuts a superseded tween regardless).
@@ -189,7 +193,7 @@ struct Ctx {
     /// This run tears down instead of installing: the uninstaller exe, or Uninstall chosen
     /// on the manage Welcome.
     uninstall: bool,
-    latency_ms: u64,
+    seams: Seams,
     slide: Slide,
     set_screen: AsyncSetState<WinScreen>,
     set_step: AsyncSetState<Nav>,
@@ -201,11 +205,11 @@ struct Ctx {
 pub struct WizardRoot {
     preset: WinPreset,
     initial: WinScreen,
-    latency_ms: u64,
+    seams: Seams,
 }
 
 impl WizardRoot {
-    pub fn new(preset: WinPreset, latency_ms: u64) -> WizardRoot {
+    pub fn new(preset: WinPreset, seams: Seams) -> WizardRoot {
         let mut choices = WinChoices::derive(&preset.facts);
         // The fresh-host password row arrives pre-filled (D9): real RNG, 24 hex chars — the
         // PowerShell RNG hack dies here. It travels via an ACL'd temp file, never argv.
@@ -220,7 +224,7 @@ impl WizardRoot {
         WizardRoot {
             preset,
             initial,
-            latency_ms,
+            seams,
         }
     }
 }
@@ -270,7 +274,7 @@ impl Component for WizardRoot {
             screen: screen.clone(),
             install,
             uninstall,
-            latency_ms: self.latency_ms,
+            seams: self.seams.clone(),
             slide: Slide {
                 progress,
                 forward: nav.forward,
@@ -373,41 +377,106 @@ pub(crate) fn stage_demo_tree() -> String {
     tmp.display().to_string()
 }
 
-fn start_install(ctx: &Ctx) {
-    let preset = ctx.preset.clone();
-    let screen = ctx.screen.clone();
-    let uninstall = ctx.uninstall;
-    let latency_ms = ctx.latency_ms;
-    let set_install = ctx.set_install.clone();
-    let set_step = ctx.set_step.clone();
-    let set_log = ctx.set_log.clone();
-    set_install.call(InstallPhase::Running);
-    std::thread::spawn(move || {
+/// The demo's seams — the same objects `silent` builds, owned for the thread's lifetime.
+pub struct DemoSeams {
+    pub run: WinDemoRunner,
+    pub net: FakeNet,
+    pub payload: FakePayload,
+    pub paths: punktfunk_setup::seam::BasePaths,
+    pub subst: Subst,
+}
+
+impl DemoSeams {
+    pub fn new(preset: &WinPreset, latency_ms: u64) -> DemoSeams {
         let tmp = stage_demo_tree();
-        let choices = screen.effective_choices();
-        let built = plan::build(&screen.facts, &choices, preset.artifact, uninstall);
-        let ui = ChannelReporter::new(set_log);
-        let run = WinDemoRunner::new(latency_ms, None);
-        let net = FakeNet {
-            networks: screen.facts.networks.clone(),
-            ..FakeNet::default()
-        };
-        let payload = FakePayload::default();
-        let paths = punktfunk_setup::demo::sandbox_paths();
-        let exec = WinExecutor {
-            run: &run,
-            net: &net,
-            payload: &payload,
-            paths: &paths,
-            ui: &ui,
-            dry: false,
-            silent: false,
-            web_password: choices.web_password.clone(),
+        DemoSeams {
+            run: WinDemoRunner::new(latency_ms, None),
+            net: FakeNet {
+                networks: preset.facts.networks.clone(),
+                ..FakeNet::default()
+            },
+            payload: FakePayload::default(),
+            paths: punktfunk_setup::demo::sandbox_paths(),
             subst: Subst {
                 version: concat!(env!("CARGO_PKG_VERSION"), "-demo").to_string(),
                 staging: format!("{tmp}\\staging"),
                 temp: tmp,
             },
+        }
+    }
+}
+
+/// The real box's seams (WP3.1): system runner + NLA probe, `%ProgramData%` paths, the
+/// extracted tree as payload (a `FakePayload` when there is none — dry runs only).
+pub struct RealSeams {
+    pub run: SystemRunner,
+    pub net: SystemNet,
+    pub payload: Box<dyn PayloadSource>,
+    pub paths: punktfunk_setup::seam::BasePaths,
+    pub subst: Subst,
+}
+
+impl RealSeams {
+    pub fn new(root: Option<&std::path::Path>, version: &str) -> RealSeams {
+        RealSeams {
+            run: SystemRunner::new(),
+            net: SystemNet,
+            payload: match root {
+                Some(root) => Box::new(DirPayload {
+                    root: root.to_path_buf(),
+                }),
+                None => Box::new(FakePayload::default()),
+            },
+            paths: base_paths(&Env::from_env()),
+            subst: real::subst(root, version),
+        }
+    }
+}
+
+fn start_install(ctx: &Ctx) {
+    let preset = ctx.preset.clone();
+    let screen = ctx.screen.clone();
+    let uninstall = ctx.uninstall;
+    let seams = ctx.seams.clone();
+    let set_install = ctx.set_install.clone();
+    let set_step = ctx.set_step.clone();
+    let set_log = ctx.set_log.clone();
+    set_install.call(InstallPhase::Running);
+    std::thread::spawn(move || {
+        let choices = screen.effective_choices();
+        let built = plan::build(&screen.facts, &choices, preset.artifact, uninstall);
+        let ui = ChannelReporter::new(set_log);
+        let (demo, real) = match &seams {
+            Seams::Demo { latency_ms } => (Some(DemoSeams::new(&preset, *latency_ms)), None),
+            Seams::Real { root, version } => (None, Some(RealSeams::new(root.as_deref(), version))),
+        };
+        let (run, net, payload, paths, subst): (
+            &dyn CommandRunner,
+            &dyn NetProbe,
+            &dyn PayloadSource,
+            &punktfunk_setup::seam::BasePaths,
+            Subst,
+        ) = match (&demo, &real) {
+            (Some(d), _) => (&d.run, &d.net, &d.payload, &d.paths, d.subst.clone()),
+            (_, Some(r)) => (
+                &r.run,
+                &r.net,
+                r.payload.as_ref(),
+                &r.paths,
+                r.subst.clone(),
+            ),
+            (None, None) => unreachable!("one seam set per run"),
+        };
+        let exec = WinExecutor {
+            run,
+            net,
+            payload,
+            paths,
+            ui: &ui,
+            dry: false,
+            silent: false,
+            web_password: choices.web_password.clone(),
+            subst,
         };
         match exec.execute(&built) {
             Ok(()) => {
@@ -931,11 +1000,10 @@ fn done_page(ctx: &Ctx) -> Element {
     )
 }
 
-/// The real window. `--demo` is the only mode this build has (main.rs enforces it).
-pub fn run(preset: WinPreset) -> windows_reactor::Result<()> {
+/// The real window over a preset (canned or probed) and the seams its install runs on.
+pub fn run(preset: WinPreset, seams: Seams) -> windows_reactor::Result<()> {
     brand::install();
-    stage_demo_tree();
-    let root = WizardRoot::new(preset, DEMO_LATENCY_MS);
+    let root = WizardRoot::new(preset, seams);
     // Self-contained: the runtime DLLs sit beside the exe (build.rs), so there is
     // deliberately NO windows_reactor::bootstrap() call — that is the framework path (S1).
     App::new()
