@@ -13,11 +13,9 @@
 //! `usbip` crate trimmed of its libusb host mode); the captured descriptors + the `0x83`/`0xAE`
 //! feature contract come from the shared [`super::steam_proto`] (one source of truth with the gadget).
 //!
-//! **Attach** is in-process by default (no external `usbip` CLI dependency — the production goal): we
-//! run the emulation server on a loopback TCP port, connect to it ourselves, perform the
-//! `OP_REQ_IMPORT` handshake, then hand the connected socket fd to `vhci_hcd` via its sysfs `attach`
-//! file. If anything in that path fails we fall back to the widely-packaged `usbip` CLI; if *that*
-//! also fails, [`open`](SteamDeckUsbip::open) returns `Err` and the caller degrades to UHID.
+//! **Attach** is in-process: the host preconnects and accepts only that TCP 4-tuple before handing
+//! the socket to `vhci_hcd`. The unauthenticated `usbip` CLI path is an explicit debugging override;
+//! failures in the secure path degrade to UHID.
 
 use super::steam_proto::{
     deck_serial, deck_unit_id, feature_reply, neutral_deck_report, parse_steam_output,
@@ -224,10 +222,13 @@ struct ServerThread {
     join: Option<JoinHandle<()>>,
 }
 
+enum ServerEndpoint {
+    Listener(std::net::TcpListener),
+    Connected(std::net::TcpStream),
+}
+
 impl ServerThread {
-    /// Spawn the server on `listener`, serving exactly the one simulated `dev`. `label` names the
-    /// device in log lines and in the `PUNKTFUNK_USBIP_TRACE` file names.
-    fn spawn(listener: std::net::TcpListener, dev: UsbDevice, label: &str) -> Result<ServerThread> {
+    fn spawn(endpoint: ServerEndpoint, dev: UsbDevice, label: &str) -> Result<ServerThread> {
         let stop = Arc::new(tokio::sync::Notify::new());
         let stop_t = stop.clone();
         let label = label.to_string();
@@ -245,7 +246,7 @@ impl ServerThread {
                     }
                 };
                 rt.block_on(run_server(
-                    listener,
+                    endpoint,
                     Arc::new(UsbIpServer::new_simulated(vec![dev])),
                     stop_t,
                     label,
@@ -268,40 +269,42 @@ impl Drop for ServerThread {
     }
 }
 
-/// Serve the ONE USB/IP connection an attachment is for — the kernel's single `vhci_hcd` attach
-/// (our own in-process import, or the `usbip` CLI's) — with the vendored `usbip_sim::handler`,
-/// then stop. The listener is dropped the moment that connection is accepted: it speaks
-/// unauthenticated USB/IP on loopback, so keeping it open for the session lets ANY local user
-/// import the device — reading the streaming client's live controller reports and issuing HID
-/// SET_REPORT transfers at it. Nothing legitimate needs a second accept: every re-attach (kernel
-/// module reload, pad re-plug, the in-process→CLI fallback) goes through [`attach_device`] again
-/// and brings its own listener with it.
+/// Serve one connected USB/IP socket. The in-process path pre-authenticates its socket by
+/// accepting the exact client 4-tuple; the legacy CLI path still supplies a one-shot listener.
 async fn run_server(
-    listener: std::net::TcpListener,
+    endpoint: ServerEndpoint,
     server: Arc<UsbIpServer>,
     stop: Arc<tokio::sync::Notify>,
     label: String,
 ) {
-    let listener = match tokio::net::TcpListener::from_std(listener) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(error = %e, "usbip TcpListener::from_std failed");
-            return;
-        }
-    };
-    let (mut sock, _) = tokio::select! {
-        _ = stop.notified() => return,
-        r = listener.accept() => match r {
-            Ok(peer) => peer,
+    let mut sock = match endpoint {
+        ServerEndpoint::Connected(sock) => match tokio::net::TcpStream::from_std(sock) {
+            Ok(sock) => sock,
             Err(e) => {
-                tracing::warn!(error = %e, "usbip accept error");
+                tracing::error!(error = %e, "usbip TcpStream::from_std failed");
                 return;
+            }
+        },
+        ServerEndpoint::Listener(listener) => {
+            let listener = match tokio::net::TcpListener::from_std(listener) {
+                Ok(listener) => listener,
+                Err(e) => {
+                    tracing::error!(error = %e, "usbip TcpListener::from_std failed");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = stop.notified() => return,
+                result = listener.accept() => match result {
+                    Ok((sock, _)) => sock,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "usbip accept error");
+                        return;
+                    }
+                }
             }
         }
     };
-    // The kernel has its socket; the port has no further legitimate caller. Closing it here is
-    // what keeps the device from being a local privilege boundary for the rest of the session.
-    drop(listener);
     // URB replies are small and interleave with the kernel's next SUBMITs; without
     // TCP_NODELAY the multi-interface request/response pattern collapses into
     // ~40 ms Nagle/delayed-ACK stalls (observed as ~22 reports/s on the Puck's
@@ -371,31 +374,35 @@ impl Drop for UsbipAttachment {
     }
 }
 
-/// Attach a simulated USB device locally via `vhci_hcd`. Requires `vhci_hcd` loaded and root
-/// (the sysfs attach / the CLI both need it). Tries the in-process sysfs attach first, then the
-/// `usbip` CLI; `PUNKTFUNK_USBIP_ATTACH=inproc|cli` pins one path (for debugging). `build` is
-/// invoked once per attempted path (a [`UsbDevice`] isn't reusable across servers); `label`
-/// names the device in the attach log lines.
+/// Attach through the authenticated in-process path. `PUNKTFUNK_USBIP_ATTACH=cli` explicitly
+/// selects the legacy unauthenticated fallback for debugging.
 pub(crate) fn attach_device(build: impl Fn() -> UsbDevice, label: &str) -> Result<UsbipAttachment> {
     ensure_modules();
     if vhci_base().is_none() {
         bail!("vhci_hcd unavailable (no /sys/devices/platform/vhci_hcd*/status) — is it loaded?");
     }
     let mode = std::env::var("PUNKTFUNK_USBIP_ATTACH").ok();
-    if mode.as_deref() != Some("cli") {
-        match attach_in_process(build(), label) {
-            Ok(a) => return Ok(a),
-            Err(e) if mode.as_deref() == Some("inproc") => return Err(e),
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "in-process vhci attach failed — trying the usbip CLI")
-            }
-        }
+    if mode.as_deref() == Some("cli") {
+        tracing::warn!("using the explicitly requested unauthenticated usbip CLI fallback");
+        return attach_via_cli(build(), label);
     }
-    attach_via_cli(build(), label)
+    attach_in_process(build(), label)
 }
 
-/// In-process attach: emulate on a loopback port, do the import handshake ourselves, hand the
-/// connected socket to `vhci_hcd` via sysfs. No external dependency.
+fn accept_expected_client(
+    listener: &std::net::TcpListener,
+    expected: std::net::SocketAddr,
+) -> Result<std::net::TcpStream> {
+    loop {
+        let (candidate, peer) = listener.accept().context("accept usbip connection")?;
+        if peer == expected {
+            return Ok(candidate);
+        }
+        tracing::warn!(%peer, "refusing a local process that raced the usbip importer");
+    }
+}
+
+/// In-process attach: authenticate our loopback socket, import, then hand it to `vhci_hcd`.
 fn attach_in_process(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
     // An ephemeral loopback port (avoids contending the usbip default with another pad).
     let listener =
@@ -404,13 +411,15 @@ fn attach_in_process(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
         .local_addr()
         .context("usbip server local_addr")?
         .port();
-    listener
-        .set_nonblocking(true)
-        .context("usbip listener set_nonblocking")?;
-    let server = ServerThread::spawn(listener, dev, label)?;
-
-    // Connect to our own server and run the OP_REQ_IMPORT handshake.
+    // Connect first, then accept only that socket's kernel-assigned source address. A local
+    // process may reach the visible port first, but it cannot own our live TCP 4-tuple.
     let mut sock = connect_loopback(port).context("connect to usbip server")?;
+    let expected = sock.local_addr().context("usbip client local_addr")?;
+    let server_sock = accept_expected_client(&listener, expected)?;
+    server_sock
+        .set_nonblocking(true)
+        .context("usbip server socket set_nonblocking")?;
+    let server = ServerThread::spawn(ServerEndpoint::Connected(server_sock), dev, label)?;
     let (devid, speed) = import_handshake(&mut sock).context("usbip import handshake")?;
 
     // Hand the connected socket to vhci_hcd. Clear BOTH timeouts first: the kernel's vhci rx/tx
@@ -441,7 +450,7 @@ fn attach_via_cli(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
     listener
         .set_nonblocking(true)
         .context("usbip listener set_nonblocking")?;
-    let server = ServerThread::spawn(listener, dev, label)?;
+    let server = ServerThread::spawn(ServerEndpoint::Listener(listener), dev, label)?;
 
     let before = vhci_used_ports();
     usbip_attach_cli().context("usbip CLI attach")?;
@@ -764,6 +773,17 @@ mod tests {
         assert_eq!(ss, Some(8));
     }
 
+    #[test]
+    fn in_process_import_accepts_only_its_own_tcp_tuple() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _racer = std::net::TcpStream::connect(addr).unwrap();
+        let importer = std::net::TcpStream::connect(addr).unwrap();
+        let expected = importer.local_addr().unwrap();
+        let accepted = accept_expected_client(&listener, expected).unwrap();
+        assert_eq!(accepted.peer_addr().unwrap(), expected);
+    }
+
     /// The emulation server serves exactly ONE USB/IP connection — the kernel's single `vhci_hcd`
     /// attach — and the loopback port closes with it. Anything that can still reach that port
     /// afterwards can import the device: read the streaming client's live controller reports and
@@ -776,9 +796,12 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let report = Arc::new(Mutex::new(neutral_deck_report()));
         let feedback = Arc::new(Mutex::new(SteamFeedback::default()));
-        let server =
-            ServerThread::spawn(listener, build_device(0, &report, &feedback), "test deck")
-                .expect("spawn the emulation server");
+        let server = ServerThread::spawn(
+            ServerEndpoint::Listener(listener),
+            build_device(0, &report, &feedback),
+            "test deck",
+        )
+        .expect("spawn the emulation server");
 
         // The one legitimate importer (what `attach_in_process` does before handing the fd to
         // `vhci_hcd`), held open for the rest of the test exactly as the kernel holds it.
