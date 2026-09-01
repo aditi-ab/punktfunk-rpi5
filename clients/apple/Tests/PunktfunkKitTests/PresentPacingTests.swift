@@ -4,10 +4,9 @@ import XCTest
 import QuartzCore
 @testable import PunktfunkKit
 
-/// Present pacing: the stage-3 bounded in-flight `PresentGate`, the stage-4 `LatestBox`
-/// drawable hand-off, the stage-1/2/3/4 `PresenterChoice` resolution (setting +
-/// PUNKTFUNK_PRESENTER env override + the release-build stage-1 gate + the iOS/tvOS-only
-/// stage-4 gate), and the per-platform glass-gate depth.
+/// Present pacing: the stage-3 gate, stage-4 drawable handoff, decoded-video path, presenter
+/// resolution, and per-platform defaults. The environment-only choices remain available for
+/// on-device comparisons without becoming user settings.
 final class PresentPacingTests: XCTestCase {
     // MARK: - PresentGate
 
@@ -216,13 +215,17 @@ final class PresentPacingTests: XCTestCase {
 
     // MARK: - PresenterChoice
 
-    /// The platform default: deadline-paced stage-4 on iOS/iPadOS AND tvOS (the vsync-latching
-    /// platforms where any bounded-FIFO pacing keeps a standing queue — tvOS joined in the
-    /// 2026-07 presentation rebuild), arrival stage-2 on macOS (sync-off presents don't queue).
-    /// No selection / garbage falls back to it.
+    /// iOS defaults to the deadline link, tvOS to its decoded IOSurface video plane, and macOS to
+    /// arrival-paced Metal. No selection or an unknown value falls back to the platform choice.
     func testPresenterChoiceFallsBackToPlatformDefault() {
-        #if os(iOS) || os(tvOS)
+        #if os(iOS)
         XCTAssertEqual(PresenterChoice.platformDefault, .stage4)
+        #elseif os(tvOS)
+        if #available(tvOS 17.4, *) {
+            XCTAssertEqual(PresenterChoice.platformDefault, .decoded)
+        } else {
+            XCTAssertEqual(PresenterChoice.platformDefault, .stage4)
+        }
         #else
         XCTAssertEqual(PresenterChoice.platformDefault, .stage2)
         #endif
@@ -269,6 +272,23 @@ final class PresentPacingTests: XCTestCase {
             PresenterChoice.resolve(setting: "stage4", env: "stage3", allowStage1: true), .stage3)
         XCTAssertEqual(
             PresenterChoice.resolve(setting: "stage2", env: "stage4", allowStage1: true), .stage4)
+        #endif
+    }
+
+    /// The decoded video-layer path resolves only on tvOS. Other platforms treat an explicit
+    /// value as unknown and retain their platform default.
+    func testDecodedPresenterIsTvOSOnly() {
+        #if os(tvOS)
+        if #available(tvOS 17.4, *) {
+            XCTAssertEqual(
+                PresenterChoice.explicit(setting: nil, env: "decoded", allowStage1: true), .decoded)
+        } else {
+            XCTAssertNil(
+                PresenterChoice.explicit(setting: nil, env: "decoded", allowStage1: true))
+        }
+        #else
+        XCTAssertNil(
+            PresenterChoice.explicit(setting: nil, env: "decoded", allowStage1: true))
         #endif
     }
 
@@ -327,6 +347,27 @@ final class PresentPacingTests: XCTestCase {
             SessionPresenter.pacing(for: .stage4, explicit: nil, codec: .hevc), .deadline)
         XCTAssertEqual(
             SessionPresenter.pacing(for: .stage4, explicit: .stage4, codec: .pyrowave), .deadline)
+        XCTAssertEqual(
+            SessionPresenter.pacing(for: .decoded, explicit: .decoded, codec: .hevc), .decoded)
+        XCTAssertEqual(
+            SessionPresenter.pacing(for: .decoded, explicit: .decoded, codec: .pyrowave), .deadline)
+    }
+
+    func testDecodedPacingRequiresAVideoLayer() {
+        XCTAssertNil(Stage2Pipeline(endToEndMeter: nil, pacing: .decoded))
+    }
+
+    func testSmoothnessKeepsTheBufferedPresenter() {
+        XCTAssertEqual(
+            SessionPresenter.effectivePacing(.decoded, priority: .latency), .decoded)
+        XCTAssertEqual(
+            SessionPresenter.effectivePacing(.decoded, priority: .smooth(buffer: 2)), .deadline)
+        XCTAssertEqual(
+            SessionPresenter.effectivePacing(
+                .decoded, priority: .latency, videoLayerCompatible: false),
+            .deadline)
+        XCTAssertEqual(
+            SessionPresenter.effectivePacing(.arrival, priority: .smooth(buffer: 2)), .arrival)
     }
 
     // MARK: - Windowed present mechanism (the macOS DCP swapID-panic mitigation picker)

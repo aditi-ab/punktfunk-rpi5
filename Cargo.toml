@@ -44,6 +44,7 @@ members = [
     "clients/android/native",
     "tools/cursor-probe",
     "tools/display-disturb",
+    "tools/fence-ring-spike",
     "tools/latency-probe",
     "tools/loss-harness",
 ]

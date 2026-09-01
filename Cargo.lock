@@ -1398,6 +1398,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fence-ring-spike"
+version = "0.34.0"
+dependencies = [
+ "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "ffmpeg-next"
 version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

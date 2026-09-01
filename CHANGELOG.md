@@ -87,6 +87,12 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
   ⌘-chord passthrough and the system-shortcut tap on the capture model only, unlike the SDL
   clients; turn the setting off to keep the chords local.
 
+### Fixed
+
+- **`AVSampleBufferVideoRenderer` is the tvOS 17.4+ default for 4:2:0 streams, removing Metal's
+  two-refresh reservation.** Older tvOS,
+  4:4:4, PyroWave and Smoothness retain Metal; users need no setting changes.
+
 ---
 
 ## v0.34.0

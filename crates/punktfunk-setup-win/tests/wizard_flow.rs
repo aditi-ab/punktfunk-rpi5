@@ -16,7 +16,7 @@ use punktfunk_setup_win::wizard::WizardRoot;
 use test_reactor::{Op, RecordingBackend};
 use windows_reactor::{
     ChannelDispatcher, Component, ControlId, ControlKind, Dispatcher, DispatcherQueuePriority,
-    Event, PropValue, RenderHost,
+    Event, Prop, PropValue, RenderHost,
 };
 
 type Job = Box<dyn FnOnce()>;
@@ -139,7 +139,16 @@ impl Wiz {
 
     /// Replay the event this control attached — a unit event (a button click).
     fn click(&self, label: &str) {
-        let id = self.control_with_text(ControlKind::Button, label);
+        self.fire_unit(ControlKind::Button, label);
+    }
+
+    /// Check a radio button by its label (Welcome's Recommended / Custom).
+    fn choose(&self, label: &str) {
+        self.fire_unit(ControlKind::RadioButton, label);
+    }
+
+    fn fire_unit(&self, kind: ControlKind, label: &str) {
+        let id = self.control_with_text(kind, label);
         let event = self.attached_event(id);
         self.host.with_reconciler(|r| r.backend.fire(id, event));
         self.settle();
@@ -159,22 +168,47 @@ impl Wiz {
         })
     }
 
-    /// The stepper's dots (WP2.1b): every step of this run's path is one ellipse.
+    /// The stepper's dots (WP2.1b): every step of this run's path is one 10 px ellipse —
+    /// the lockup's two circles are ellipses too, so the size is the tell.
     fn dots(&self) -> usize {
         self.host.with_reconciler(|r| {
-            r.backend
-                .ops
-                .iter()
+            let ops = &r.backend.ops;
+            ops.iter()
                 .filter(|op| {
                     matches!(
                         op,
-                        Op::Create {
-                            kind: ControlKind::Ellipse,
-                            ..
-                        }
+                        Op::SetProp {
+                            id,
+                            prop: Prop::Width,
+                            value: PropValue::F64(w),
+                        } if *w == 10.0 && ops.iter().any(|o| matches!(o, Op::Create { id: c, kind: ControlKind::Ellipse } if c == id))
                     )
                 })
                 .count()
+        })
+    }
+
+    /// The toggle of the Configure row labelled `label`: the first ToggleSwitch created
+    /// after that label — row order inside a section, whatever the columns do.
+    fn toggle_of(&self, label: &str) -> ControlId {
+        self.host.with_reconciler(|r| {
+            let ops = &r.backend.ops;
+            let at = ops
+                .iter()
+                .position(
+                    |op| matches!(op, Op::SetProp { value: PropValue::Str(s), .. } if s == label),
+                )
+                .unwrap_or_else(|| panic!("no row labelled '{label}'"));
+            ops[at..]
+                .iter()
+                .find_map(|op| match op {
+                    Op::Create {
+                        id,
+                        kind: ControlKind::ToggleSwitch,
+                    } => Some(*id),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no toggle after '{label}'"))
         })
     }
 
@@ -210,24 +244,31 @@ impl Wiz {
 fn the_fresh_host_demo_walks_welcome_to_done_through_the_fake_executor() {
     let wiz = Wiz::open("win11-fresh");
     assert!(wiz.has_text("punktfunk"), "the Welcome wordmark");
-    assert_eq!(wiz.dots(), 4, "four dots on a private-network box");
+    assert!(wiz.has_text("Recommended") && wiz.has_text("Custom"));
+    assert_eq!(wiz.dots(), 3, "Recommended: Welcome · Install · Done");
     assert!(
         !wiz.has_text("Network"),
         "no ghost Network dot on a private-network box"
     );
 
+    // Custom puts Configure on the path — one more dot, and Continue goes there.
+    wiz.choose("Custom");
+    assert_eq!(wiz.dots(), 4, "Custom adds the Configure dot");
     wiz.click("Continue");
     assert!(
         wiz.has_text("Moonlight compat"),
         "the Configure rows render"
     );
     assert!(
+        wiz.has_text("Drivers") && wiz.has_text("Web console"),
+        "grouped"
+    );
+    assert!(
         wiz.has_text("Web console password"),
         "the fresh-only password row"
     );
 
-    // Row order is creation order: Driver, Gamepad, HDR, Gamestream — toggle Moonlight on.
-    let gamestream = wiz.nth(ControlKind::ToggleSwitch, 3);
+    let gamestream = wiz.toggle_of("Moonlight compat");
     let event = wiz.attached_event(gamestream);
     wiz.host
         .with_reconciler(|r| r.backend.fire_bool(gamestream, event, true));
@@ -252,15 +293,12 @@ fn the_public_network_demo_walks_the_d12_step_and_answer_b_opens_the_firewall() 
     let wiz = Wiz::open("win11-public");
     assert_eq!(
         wiz.dots(),
-        5,
+        4,
         "the Network dot materializes for a Public network"
     );
     assert!(wiz.has_text("Network"), "the stepper labels the extra dot");
 
-    wiz.click("Continue");
-    assert!(wiz.has_text("Public-network firewall rules"));
-
-    // Configure's go button says Continue, not Install — one more step on this run's path.
+    // Recommended skips Configure, never the D12 consent step.
     wiz.click("Continue");
     assert!(
         wiz.has_text("'Cafe' is set to Public"),
@@ -285,7 +323,7 @@ fn the_public_network_demo_walks_the_d12_step_and_answer_b_opens_the_firewall() 
 #[test]
 fn the_uninstaller_demo_offers_only_the_teardown_and_runs_it_in_the_sandbox() {
     let wiz = Wiz::open("win11-uninstall");
-    assert!(wiz.has_text("punktfunk 0.34.0 · host installed"));
+    assert!(wiz.has_text("0.34.0 · host installed"));
     assert!(wiz.has_text("This removes punktfunk"));
     assert!(!wiz.has_text("Reconfigure"), "no payload, no reconfigure");
     assert_eq!(wiz.dots(), 3, "Welcome · Uninstall · Done");
@@ -298,7 +336,7 @@ fn the_uninstaller_demo_offers_only_the_teardown_and_runs_it_in_the_sandbox() {
 #[test]
 fn the_upgrade_demo_opens_in_manage_mode_and_reconfigure_walks_the_upgrade() {
     let wiz = Wiz::open("win11-upgrade");
-    assert!(wiz.has_text("punktfunk 0.34.0 · host installed"));
+    assert!(wiz.has_text("0.34.0 · host installed"));
     wiz.click("Reconfigure");
     assert!(
         wiz.has_text("Moonlight compat"),
@@ -329,6 +367,7 @@ fn uninstall_from_the_manage_welcome_tears_down() {
 #[test]
 fn the_sunshine_demo_shows_the_coexistence_row_and_moves_the_mgmt_port() {
     let wiz = Wiz::open("win11-sunshine");
+    wiz.choose("Custom");
     wiz.click("Continue");
     assert!(
         wiz.has_text("Sunshine detected"),
@@ -340,4 +379,16 @@ fn the_sunshine_demo_shows_the_coexistence_row_and_moves_the_mgmt_port() {
         wiz.has_text("PUNKTFUNK_MGMT_BIND=0.0.0.0:47991"),
         "the SetEnv step ran"
     );
+}
+
+// Recommended: Welcome's Install runs the defaults and Done is where the generated password
+// is seen for the first time.
+#[test]
+fn recommended_installs_the_defaults_and_done_shows_the_password_and_next_steps() {
+    let wiz = Wiz::open("win11-fresh");
+    wiz.click("Install");
+    wiz.wait_for_done();
+    assert!(wiz.has_text("--gamestream=off"), "the defaults ran");
+    assert!(wiz.has_text("Your web console password"));
+    assert!(wiz.has_text("Open the web console") && wiz.has_text("Install a client"));
 }
