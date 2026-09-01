@@ -42,6 +42,9 @@ pub enum Artifact {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WinAction {
     Run(Vec<String>),
+    /// Same spawn, but a non-zero exit is fine: taskkill with nothing to kill, schtasks on an
+    /// absent task, reg delete on a value that is not there — absence IS the goal state.
+    RunLenient(Vec<String>),
     Note(Level, String),
     /// One `KEY=VALUE` line in `%ProgramData%\punktfunk\host.env`.
     SetEnv {
@@ -102,6 +105,7 @@ pub enum WinAction {
     /// Task Scheduler registration needs XML (restart backoff is inexpressible in flags);
     /// the executor generates it. `start_now` only on a fresh registration.
     RegisterScriptingTask {
+        app_dir: String,
         start_now: bool,
     },
     /// Non-elevated, current user, skipped in silent installs (the host supervises one).
@@ -139,7 +143,7 @@ impl WinPlan {
     pub fn commands(&self) -> Vec<String> {
         self.steps()
             .filter_map(|s| match s {
-                WinAction::Run(argv) => Some(join_argv(argv)),
+                WinAction::Run(argv) | WinAction::RunLenient(argv) => Some(join_argv(argv)),
                 _ => None,
             })
             .collect()
@@ -173,6 +177,10 @@ pub fn join_argv(argv: &[String]) -> String {
 
 fn run(argv: &[&str]) -> WinAction {
     WinAction::Run(argv.iter().map(|s| (*s).to_string()).collect())
+}
+
+fn run_lenient(argv: &[&str]) -> WinAction {
+    WinAction::RunLenient(argv.iter().map(|s| (*s).to_string()).collect())
 }
 
 fn note(level: Level, text: impl Into<String>) -> WinAction {
@@ -286,6 +294,7 @@ fn host_install(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
     plan.push(
         "Plugin runner",
         vec![WinAction::RegisterScriptingTask {
+            app_dir: app.clone(),
             start_now: facts.scripting_task == TaskState::Absent,
         }],
     );
@@ -398,7 +407,14 @@ fn registry_steps(facts: &WinFacts, choices: &WinChoices, app: &str) -> Vec<WinA
             "/f",
         ]));
     } else if facts.vulkan_layer_registered {
-        steps.push(run(&["reg", "delete", layers, "/v", &layer_json, "/f"]));
+        steps.push(run_lenient(&[
+            "reg",
+            "delete",
+            layers,
+            "/v",
+            &layer_json,
+            "/f",
+        ]));
     }
     steps.push(WinAction::PathAdd {
         machine: true,
@@ -505,25 +521,25 @@ fn host_uninstall(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
         vec![
             // Service first: the host supervises the tray and would respawn it.
             run(&[&host_exe, "service", "uninstall"]),
-            run(&[&format!("{app}\\punktfunk-tray.exe"), "--quit"]),
-            run(&["taskkill", "/F", "/IM", "punktfunk-tray.exe"]),
+            run_lenient(&[&format!("{app}\\punktfunk-tray.exe"), "--quit"]),
+            run_lenient(&["taskkill", "/F", "/IM", "punktfunk-tray.exe"]),
             // All three legs unconditionally: an upgrade may have dropped a payload an
             // earlier install laid down. `driver uninstall` also purges the trusted certs.
             run(&[&host_exe, "driver", "uninstall"]),
             run(&[&host_exe, "driver", "uninstall", "--gamepad"]),
             run(&[&host_exe, "driver", "uninstall", "--audio"]),
-            run(&["schtasks", "/End", "/TN", "PunktfunkWeb"]),
-            run(&["schtasks", "/Delete", "/TN", "PunktfunkWeb", "/F"]),
-            run(&["schtasks", "/End", "/TN", "PunktfunkScripting"]),
-            run(&["schtasks", "/Delete", "/TN", "PunktfunkScripting", "/F"]),
+            run_lenient(&["schtasks", "/End", "/TN", "PunktfunkWeb"]),
+            run_lenient(&["schtasks", "/Delete", "/TN", "PunktfunkWeb", "/F"]),
+            run_lenient(&["schtasks", "/End", "/TN", "PunktfunkScripting"]),
+            run_lenient(&["schtasks", "/Delete", "/TN", "PunktfunkScripting", "/F"]),
             WinAction::KillPortListeners {
                 ports: vec![47992, 3000],
             },
-            run(&[
+            run_lenient(&[
                 "netsh", "advfirewall", "firewall", "delete", "rule",
                 "name=Punktfunk web console (TCP 47992)",
             ]),
-            run(&[
+            run_lenient(&[
                 "netsh", "advfirewall", "firewall", "delete", "rule",
                 "name=Punktfunk plugin UIs (TCP 47993)",
             ]),
@@ -558,7 +574,7 @@ fn client_install(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
             "punktfunk.exe",
         ]
         .iter()
-        .map(|exe| run(&["taskkill", "/F", "/IM", exe]))
+        .map(|exe| run_lenient(&["taskkill", "/F", "/IM", exe]))
         .collect(),
     );
     plan.push(
@@ -662,9 +678,9 @@ fn client_uninstall(choices: &WinChoices) -> WinPlan {
     plan.push(
         format!("Uninstalling the client ({DOCS}/uninstall)"),
         vec![
-            run(&["taskkill", "/F", "/IM", "punktfunk-client.exe"]),
-            run(&["taskkill", "/F", "/IM", "punktfunk-session.exe"]),
-            run(&["reg", "delete", r"HKCU\Software\Classes\punktfunk", "/f"]),
+            run_lenient(&["taskkill", "/F", "/IM", "punktfunk-client.exe"]),
+            run_lenient(&["taskkill", "/F", "/IM", "punktfunk-session.exe"]),
+            run_lenient(&["reg", "delete", r"HKCU\Software\Classes\punktfunk", "/f"]),
             WinAction::PathRemove {
                 machine: false,
                 dir: app.clone(),

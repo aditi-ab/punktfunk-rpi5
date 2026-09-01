@@ -16,6 +16,7 @@ pub mod choices;
 pub mod exec;
 pub mod plan;
 pub mod report;
+pub mod sys;
 
 use serde::{Deserialize, Serialize};
 
@@ -65,13 +66,17 @@ pub struct NetProfile {
 pub trait NetProbe {
     fn networks(&self) -> Vec<NetProfile>;
     fn port_in_use(&self, port: u16) -> bool;
+    /// D12's consented fix. Per-network; `false` = the API refused (e.g. a domain network).
+    fn make_private(&self, network: &str) -> bool;
 }
 
 /// A `NetProbe` that answers from data and touches nothing.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct FakeNet {
     pub networks: Vec<NetProfile>,
     pub ports_in_use: Vec<u16>,
+    /// Every network a test run asked to flip — what the D12 tests assert against.
+    pub made_private: std::cell::RefCell<Vec<String>>,
 }
 
 impl NetProbe for FakeNet {
@@ -81,6 +86,11 @@ impl NetProbe for FakeNet {
 
     fn port_in_use(&self, port: u16) -> bool {
         self.ports_in_use.contains(&port)
+    }
+
+    fn make_private(&self, network: &str) -> bool {
+        self.made_private.borrow_mut().push(network.to_string());
+        true
     }
 }
 
@@ -322,27 +332,31 @@ impl NetProbe for SystemNet {
     fn port_in_use(&self, port: u16) -> bool {
         std::net::TcpListener::bind(("0.0.0.0", port)).is_err()
     }
+
+    fn make_private(&self, network: &str) -> bool {
+        nlm_make_private(network).unwrap_or(false)
+    }
 }
 
+/// One COM pass over the connected networks; `visit` returns `true` to stop early.
 #[cfg(windows)]
-fn nlm_networks() -> Option<Vec<NetProfile>> {
+fn nlm_visit(
+    mut visit: impl FnMut(&::windows::Win32::Networking::NetworkListManager::INetwork, &str) -> bool,
+) -> Option<()> {
     use ::windows::Win32::Networking::NetworkListManager::{
         INetwork, INetworkListManager, NetworkListManager, NLM_ENUM_NETWORK_CONNECTED,
-        NLM_NETWORK_CATEGORY_DOMAIN_AUTHENTICATED, NLM_NETWORK_CATEGORY_PRIVATE,
     };
     use ::windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
     };
 
-    // SAFETY: plain COM lifecycle — init (tolerating an already-initialized thread), create
-    // the NLM object, walk the connected-network enumerator, uninit only when this call did
-    // the init. Every interface pointer is owned by `windows`' smart pointers.
+    // SAFETY: plain COM lifecycle — init tolerating an already-initialized thread, walk the
+    // enumerator through `windows`' smart pointers, uninit only when this call did the init.
     unsafe {
         let inited = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
-        let result = (|| -> ::windows::core::Result<Vec<NetProfile>> {
+        let result = (|| -> ::windows::core::Result<()> {
             let nlm: INetworkListManager = CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL)?;
             let networks = nlm.GetNetworks(NLM_ENUM_NETWORK_CONNECTED)?;
-            let mut out = Vec::new();
             loop {
                 let mut slot: [Option<INetwork>; 1] = [None];
                 let mut fetched = 0u32;
@@ -351,20 +365,57 @@ fn nlm_networks() -> Option<Vec<NetProfile>> {
                 }
                 let Some(network) = slot[0].take() else { break };
                 let name = network.GetName().map(|b| b.to_string()).unwrap_or_default();
-                let category = match network.GetCategory() {
-                    Ok(NLM_NETWORK_CATEGORY_PRIVATE) => NetCategory::Private,
-                    Ok(NLM_NETWORK_CATEGORY_DOMAIN_AUTHENTICATED) => NetCategory::Domain,
-                    _ => NetCategory::Public,
-                };
-                out.push(NetProfile { name, category });
+                if visit(&network, &name) {
+                    break;
+                }
             }
-            Ok(out)
+            Ok(())
         })();
         if inited {
             CoUninitialize();
         }
         result.ok()
     }
+}
+
+#[cfg(windows)]
+fn nlm_networks() -> Option<Vec<NetProfile>> {
+    use ::windows::Win32::Networking::NetworkListManager::{
+        NLM_NETWORK_CATEGORY_DOMAIN_AUTHENTICATED, NLM_NETWORK_CATEGORY_PRIVATE,
+    };
+    let mut out = Vec::new();
+    // SAFETY: `GetCategory` is a plain out-value call on an interface `nlm_visit` owns.
+    nlm_visit(|network, name| {
+        // SAFETY: a plain out-value call on an interface `nlm_visit` owns for this frame.
+        let category = match unsafe { network.GetCategory() } {
+            Ok(NLM_NETWORK_CATEGORY_PRIVATE) => NetCategory::Private,
+            Ok(NLM_NETWORK_CATEGORY_DOMAIN_AUTHENTICATED) => NetCategory::Domain,
+            _ => NetCategory::Public,
+        };
+        out.push(NetProfile {
+            name: name.to_string(),
+            category,
+        });
+        false
+    })?;
+    Some(out)
+}
+
+/// D12's consented fix: find the network by name and set its NLA category to Private.
+#[cfg(windows)]
+fn nlm_make_private(wanted: &str) -> Option<bool> {
+    use ::windows::Win32::Networking::NetworkListManager::NLM_NETWORK_CATEGORY_PRIVATE;
+    let mut done = false;
+    // SAFETY: `SetCategory` is a plain in-value call on an interface `nlm_visit` owns.
+    nlm_visit(|network, name| {
+        if name == wanted {
+            // SAFETY: a plain in-value call on an interface `nlm_visit` owns for this frame.
+            done = unsafe { network.SetCategory(NLM_NETWORK_CATEGORY_PRIVATE) }.is_ok();
+            return true;
+        }
+        false
+    })?;
+    Some(done)
 }
 
 #[cfg(test)]
@@ -576,6 +627,7 @@ mod tests {
                 category: NetCategory::Public,
             }],
             ports_in_use: vec![MGMT_PORT],
+            ..FakeNet::default()
         };
         let facts = probe(&run, &env, &net, tmp.path());
         let json = serde_json::to_string(&facts).unwrap();

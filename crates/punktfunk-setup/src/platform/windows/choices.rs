@@ -82,6 +82,9 @@ pub struct WinChoices {
     pub tray_autostart: bool,
     /// Client artifact only; the host creates no shortcuts.
     pub desktop_icon: bool,
+    /// Fresh installs only. `None` = the executor generates one (24 hex chars, real RNG);
+    /// the wizard's password row edits it. Never rendered into a transcript or argv.
+    pub web_password: Option<String>,
     /// Where the files go. Upgrades pre-fill the ARP location and ignore `/DIR`, as Inno's
     /// `UsePreviousAppDir` did.
     pub dir: Option<PathBuf>,
@@ -104,6 +107,7 @@ impl WinChoices {
             start_service: true,
             tray_autostart: if upgrade { facts.tray_autostart } else { true },
             desktop_icon: false,
+            web_password: None,
             dir: facts
                 .installed
                 .as_ref()
