@@ -505,12 +505,8 @@ pub fn local_art_bytes(path: &str) -> Option<(Vec<u8>, String)> {
         );
         return None;
     }
-    // Open once and judge THE HANDLE: the servable check above resolved the path, but a
-    // writable link along it can be retargeted between that check and the open, making the
-    // canonicalized object and the opened object two different files (security-review
-    // 2026-08-31 M-4). The handle's final path re-runs containment on what was actually
-    // opened, its fstat gates type/size, and the bounded read consumes those same bytes —
-    // so a post-check swap can no longer move the read out of root or past the size cap.
+    // Re-check confinement and size on the opened handle, then read that handle with a hard cap.
+    // A link swap cannot substitute a different file between validation and consumption.
     let p = std::path::Path::new(&*path);
     let mut f = std::fs::File::open(p).ok()?;
     let real = final_path_of(&f)?;
