@@ -78,14 +78,10 @@ fn budget_for(bitrate_bps: u64, fps: u32) -> usize {
 }
 
 // GPU scheduling priority is deliberately NOT set here. `pf-frame`'s
-// `dxgi::elevate_process_gpu_priority` owns that policy for the whole process and runs once from
-// `make_device` — the call the Windows capture path always makes before any PyroWave texture
-// exists. This module used to raise it itself, to HIGH, once per process; that was a SECOND owner
-// of a process-wide setting racing the real one.
-//
-// The old `PUNKTFUNK_GPU_PRIORITY` knob went with it; `PUNKTFUNK_GPU_PRIORITY_CLASS`
-// (`off|normal|high|realtime`, default `realtime` — see `pf-frame/src/dxgi.rs`) is the one that
-// survives.
+// `dxgi::elevate_process_gpu_priority` owns that policy process-wide (the
+// `PUNKTFUNK_GPU_PRIORITY_CLASS` knob, default `realtime`) and runs once from `make_device`,
+// which the Windows capture path always calls before any PyroWave texture exists — a second
+// owner here would race it, as this module's removed HIGH raise once did.
 
 pub struct PyroWaveEncoder {
     // pyrowave owns the whole Vulkan device (create_device_by_compat) — no ash on this side.

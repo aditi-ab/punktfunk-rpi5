@@ -361,15 +361,11 @@ impl SwapChainProcessor {
             }
             thread::sleep(Duration::from_millis(50));
         }
-        // GPU-scheduling raise for the swap-chain processing device — default ON (see
-        // [`rt_gpu_enabled`] for the history and the `PFVD_NO_RT_GPU` escape hatch): the leg that
-        // feeds every captured frame into the ring must outrank a GPU-saturating game. The
-        // CPU-side half of the same hardening (MMCSS / TIME_CRITICAL, above) is independent.
-        //
-        // Best-effort, never fatal, and issued while our borrowed device reference is still
-        // alive (IddCx uses it synchronously). The REALTIME slot is guaranteed populated
-        // (`IddMinimumVersionRequired = 10`, lib.rs), but the DDI may still decline
-        // (e.g. E_NOTIMPL on pre-WDDM-3.0 hardware).
+        // GPU-scheduling raise for the swap-chain processing device — default ON, so the leg
+        // feeding every captured frame into the ring outranks a GPU-saturating game (history +
+        // `PFVD_NO_RT_GPU` escape hatch: [`rt_gpu_enabled`]). Best-effort, never fatal, issued
+        // while our borrowed device reference is still alive (IddCx uses it synchronously); the
+        // DDI may still decline (e.g. E_NOTIMPL on pre-WDDM-3.0 hardware).
         if set_ok && rt_gpu_enabled() {
             let mut rt = pod_init!(IDARG_IN_SETREALTIMEGPUPRIORITY);
             rt.pDevice = dxgi_device.as_raw().cast();
