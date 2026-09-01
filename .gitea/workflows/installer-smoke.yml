@@ -147,9 +147,14 @@ jobs:
             rmweb: apt-get purge -y punktfunk-web
             oncanary: grep -q ' canary main' /etc/apt/sources.list.d/punktfunk.list
             onstable: grep -q ' stable main' /etc/apt/sources.list.d/punktfunk.list
+          # openh264 lives in fedora-cisco-openh264, hosted by Cisco rather than on the Fedora
+          # mirrors, and the runners cannot reach it — one unreachable package failed the whole
+          # transaction while the other 251 pulled at 15 MiB/s. It arrives as a weak dep of
+          # ffmpeg-libs and punktfunk vendors its own openh264, so dropping the repo costs the
+          # smoke nothing. This is the debian row's --no-install-recommends, aimed at one repo.
           - family: fedora-44
             image: fedora:44
-            prep: dnf install -y -q curl git nodejs zstd
+            prep: rm -f /etc/yum.repos.d/fedora-cisco-openh264*.repo && dnf install -y -q curl git nodejs zstd
             rmweb: dnf remove -y punktfunk-web
             haveclient: rpm -q punktfunk-client
             oncanary: grep -q 'fedora-44-canary' /etc/yum.repos.d/punktfunk.repo
