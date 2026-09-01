@@ -157,7 +157,7 @@ fn rows(d: &Draft, typing: bool, picking: bool) -> Vec<RowSpec> {
         if d.id.is_some() {
             "Save"
         } else {
-            "Add to the ring"
+            "Add to the dial"
         },
         d.key.is_some(),
     ));
@@ -708,7 +708,7 @@ impl ShortcutEditorScreen {
         let x0 = f64::from(rect.left) + EDGE_INSET * k;
         fonts.leading(
             canvas,
-            "Hold the modifiers marked on, then press the key. The ring draws it as a keycap.",
+            "Hold the modifiers marked on, then press the key. The dial draws it as a keycap.",
             W::Regular,
             13.0 * k,
             fg(0.55),
@@ -741,7 +741,7 @@ impl ShortcutEditorScreen {
         );
         fonts.draw(
             canvas,
-            "How the ring will draw it",
+            "How the dial will draw it",
             legend_x,
             f64::from(top) + 46.0 * k,
             W::Regular,

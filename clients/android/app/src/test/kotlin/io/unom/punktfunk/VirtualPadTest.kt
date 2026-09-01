@@ -44,6 +44,57 @@ class VirtualPadTest {
     }
 
     @Test
+    fun preset_ids_are_the_schema_ids() {
+        assertEquals(
+            setOf("lb", "lt", "rb", "rt", "ls", "rs", "dpad", "face", "select", "guide", "start"),
+            padControls("full", 933f, 420f).map { it.id }.toSet(),
+        )
+    }
+
+    @Test
+    fun tweaks_move_scale_hide_and_clamp() {
+        val base = padControls("full", 933f, 420f)
+        val ls = base.first { it.id == "ls" }
+        val out = applyPadTweaks(
+            base,
+            mapOf(
+                "ls" to PadTweak(x = 0.5f, y = 0.5f, scale = 2f),
+                "start" to PadTweak(scale = 9f), // clamps to the bound
+                "face" to PadTweak(hidden = true),
+                "select" to PadTweak(x = 0f, y = 0f), // clamps onto the layer
+                "nope" to PadTweak(x = 0.9f), // no such control: ignored
+            ),
+            933f, 420f,
+        )
+        val moved = out.first { it.id == "ls" }
+        assertEquals(2f * ls.rect.w, moved.rect.w, 1e-3f)
+        assertEquals(466.5f, moved.rect.x + moved.rect.w / 2, 1e-3f)
+        assertEquals(210f, moved.rect.y + moved.rect.h / 2, 1e-3f)
+        val start = out.first { it.id == "start" } as PadControl.Buttons
+        assertEquals(PAD_TWEAK_SCALE_MAX, start.sc, 0f)
+        val baseStart = base.first { it.id == "start" } as PadControl.Buttons
+        assertEquals(baseStart.discs[0].r * PAD_TWEAK_SCALE_MAX, start.discs[0].r, 1e-3f)
+        assertTrue("hidden stays in the list, marked", out.first { it.id == "face" }.hidden)
+        val clamped = out.first { it.id == "select" }.rect
+        assertTrue("$clamped stays on the layer", clamped.x >= 0f && clamped.y >= 0f)
+        assertEquals(base.size, out.size)
+    }
+
+    @Test
+    fun a_pad_config_picks_the_layer_class_for_its_overrides() {
+        val pad = PadConfig(
+            controls = mapOf("face" to PadTweak(hidden = true)),
+            controlsNarrow = mapOf("ls" to PadTweak(hidden = true)),
+        )
+        val wide = padControls(pad, 933f, 420f)
+        assertTrue(wide.first { it.id == "face" }.hidden)
+        assertTrue(!wide.first { it.id == "ls" }.hidden)
+        val narrow = padControls(pad, 420f, 933f)
+        assertTrue(narrow.first { it.id == "ls" }.hidden)
+        assertTrue(!narrow.first { it.id == "face" }.hidden)
+    }
+
+    @Test
     fun dpad_reads_eight_ways_with_a_dead_centre() {
         assertEquals(0, dpadBits(3f, -3f, 10f))
         assertEquals(Gamepad.BTN_DPAD_UP, dpadBits(0f, -40f, 10f))
