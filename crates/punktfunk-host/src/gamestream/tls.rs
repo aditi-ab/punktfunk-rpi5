@@ -159,6 +159,16 @@ async fn serve_governed(
     }
 }
 
+fn connection_builder() -> hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor> {
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    builder
+}
+
 async fn serve_conn<S>(stream: S, app: Router, fp: PeerCertFingerprint, addr: PeerAddr)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -171,14 +181,46 @@ where
             let mut req = req.map(axum::body::Body::new);
             req.extensions_mut().insert(fp);
             req.extensions_mut().insert(addr);
-            app.oneshot(req).await // Router error is Infallible
+            app.oneshot(req).await
         }
     });
     let io = hyper_util::rt::TokioIo::new(stream);
-    let mut builder =
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-    builder.http1().header_read_timeout(HEADER_READ_TIMEOUT);
-    let _ = builder.serve_connection_with_upgrades(io, svc).await;
+    let _ = connection_builder()
+        .serve_connection_with_upgrades(io, svc)
+        .await;
+}
+
+#[cfg(test)]
+mod governed_tests {
+    use super::*;
+    use axum::routing::get;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn configured_header_timeout_has_a_timer() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let app = Router::new().route("/", get(|| async { "ok" }));
+        let served = tokio::spawn(serve_conn(
+            server,
+            app,
+            PeerCertFingerprint(None),
+            PeerAddr("127.0.0.1:1234".parse().unwrap()),
+        ));
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        served.await.unwrap();
+        assert!(String::from_utf8_lossy(&response).contains("200 OK"));
+    }
 }
 
 /// Requests the client cert and **verifies its `CertificateVerify` signature**, but does not
