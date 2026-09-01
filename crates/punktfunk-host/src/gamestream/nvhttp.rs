@@ -516,6 +516,7 @@ fn session_url_xml(st: &AppState, tag: &str) -> String {
 async fn h_pair(
     State(st): State<Arc<AppState>>,
     peer: Option<Extension<PeerCertFingerprint>>,
+    addr: Option<Extension<PeerAddr>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let uniqueid = q.get("uniqueid").cloned().unwrap_or_default();
@@ -538,8 +539,13 @@ async fn h_pair(
     let result = if phrase == Some("getservercert") {
         match (q.get("salt"), q.get("clientcert")) {
             (Some(salt), Some(cc)) => {
+                let peer_ip = addr
+                    .as_ref()
+                    .map_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |a| {
+                        (a.0).0.ip()
+                    });
                 st.pairing
-                    .getservercert(&st.identity, &uniqueid, salt, cc)
+                    .getservercert(&st.identity, &uniqueid, salt, cc, peer_ip)
                     .await
             }
             _ => Ok(pair_error_xml()),
@@ -661,7 +667,7 @@ mod tests {
             peer: Option<Extension<PeerCertFingerprint>>,
         ) -> String {
             let q = HashMap::from([("phrase".to_string(), "pairchallenge".to_string())]);
-            let resp = h_pair(State(st.clone()), peer, Query(q))
+            let resp = h_pair(State(st.clone()), peer, None, Query(q))
                 .await
                 .into_response();
             let b = axum::body::to_bytes(resp.into_body(), 64 * 1024)

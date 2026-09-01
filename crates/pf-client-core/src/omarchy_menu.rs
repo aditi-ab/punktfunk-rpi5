@@ -384,7 +384,7 @@ mod tests {
         let real = concat!(
             "{\n",
             "  // header comment with an example: \"a\": {\"b\":1},\n",
-            "  \"punktfunk.console\": {\"label\":\"Open console\",\"action\":\"sh -c 'omarchy-launch-webapp \\\"$(punktfunk-host ctl console-url || echo https://localhost:47992)\\\"'\"},\n",
+            "  \"punktfunk.console\": {\"label\":\"Open console\",\"action\":\"omarchy-launch-webapp https://localhost:47992\"},\n",
             "  \"last\": {\"label\":\"x\"}, // trailing, then a comment\n",
             "}\n"
         );

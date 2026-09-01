@@ -64,15 +64,17 @@ export function useSubmitPairingPin() {
 			password,
 			uniqueid,
 			fingerprint,
+			peerIp,
 		}: {
 			pin: string;
 			password: string;
-			uniqueid?: string;
-			fingerprint?: string;
+			uniqueid: string;
+			fingerprint: string;
+			peerIp: string;
 		}) =>
 			apiFetch<void>(
 				"/api/v1/pair/pin",
-				json({ pin, password, uniqueid, fingerprint }),
+				json({ pin, password, uniqueid, fingerprint, peer_ip: peerIp }),
 			),
 	});
 }

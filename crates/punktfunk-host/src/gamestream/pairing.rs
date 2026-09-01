@@ -18,53 +18,32 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::Notify;
 
-/// Out-of-band PIN delivery. Moonlight generates + displays a PIN; the operator submits it
-/// via the bearer-authenticated management API (`POST /api/v1/pair/pin`) only — there is no
-/// unauthenticated nvhttp delivery path (a network client must never be able to submit its
-/// own PIN; security-review 2026-06-28 #1). `getservercert` parks until a PIN arrives.
-/// Max pairing handshakes parked in [`PinGate::take`] at once (each holds a slot for up to
-/// 300s), bounding a pre-auth waiter flood. Real pairing is one operator-driven client at a time.
+/// Out-of-band PIN delivery through the authenticated management API only.
 ///
-/// **On brute-forcing the 4-digit PIN** (audited 2026-08-27, apollo-comparison #96): 10⁴ is a
-/// small space, but nothing here is guessing at it, because **a network peer has no way to submit
-/// a PIN**. Submission is `POST /api/v1/pair/pin` on the bearer-authenticated management API and
-/// nowhere else, so there is no oracle to hammer and no attempt counter worth adding — a
-/// per-attempt cap would bound the *operator's* typos, not an attacker. A wrong PIN fails the
-/// ceremony and costs the attacker a fresh client handshake *and* a fresh operator submission,
-/// which is not a loop anyone can automate from the network.
+/// Every parked handshake is keyed by client certificate, wire id and source address. Submissions
+/// must echo that complete identity; no global or sole-waiter shortcut exists. One source may park
+/// one ceremony, the host holds at most four, and each expires after two minutes.
 ///
-/// What that leaves is **capture**, and the answer to it is that a PIN is never a global slot:
-/// every parked handshake is keyed by [`CeremonyId`] (`uniqueid` + client-cert fingerprint), the
-/// management API reports those identities, and a submit is ADDRESSED — to the named ceremony,
-/// or to the only one parked. A racer that parks after the operator submits can never consume a
-/// PIN typed for someone else, and a PIN cannot outlive the ceremony it was addressed to
-/// (security-review 2026-08-31 H-4; predecessors 2026-08-15 #7, 2026-08-25).
-///
-/// The cap below does leak one bit to an unauthenticated peer — a refused `getservercert` tells it
-/// that `MAX_PARKED_WAITERS` handshakes are already parked. That is inherent to having a cap, and
-/// the alternative (an unbounded pre-auth park) is the worse trade.
+/// A network peer cannot submit or brute-force the four-digit PIN. GameStream remains trusted-LAN
+/// only because an on-path attacker can replace the unauthenticated HTTP ceremony itself.
 const MAX_PARKED_WAITERS: usize = 4;
+const MAX_PARKED_PER_IP: usize = 1;
+const PAIRING_PIN_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Identity of one parked pairing ceremony: the wire `uniqueid` and the lowercase-hex SHA-256
-/// fingerprint of the client certificate presented in phase 1. This is what the operator's
-/// console shows next to the PIN prompt, and what a submit names.
+/// Identity of one parked pairing ceremony. The certificate fingerprint is the cryptographic
+/// identity; `uniqueid` and source address give the operator recognizable context.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct CeremonyId {
     pub uniqueid: String,
     pub fingerprint: String,
+    pub peer_ip: std::net::IpAddr,
 }
 
-/// What [`PinGate::submit`] did with the operator's PIN.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SubmitOutcome {
-    /// Addressed to exactly this ceremony.
     Delivered(CeremonyId),
-    /// Nothing is parked — refuse rather than hold a PIN for whoever knocks next.
     NoWaiter,
-    /// The given `uniqueid`/`fingerprint` filters matched no parked ceremony.
     NoMatch,
-    /// More than one parked ceremony matched — the caller must narrow the target.
-    Ambiguous(Vec<CeremonyId>),
 }
 
 pub struct PinGate {
@@ -83,46 +62,33 @@ impl PinGate {
         }
     }
 
-    /// Deliver the operator's PIN to the ceremony the filters select. With no filters the PIN
-    /// goes to the sole parked ceremony; with several parked, the submit must name its target —
-    /// otherwise we refuse rather than hand the secret to a racer.
-    pub fn submit(
-        &self,
-        pin: String,
-        uniqueid: Option<&str>,
-        fingerprint: Option<&str>,
-    ) -> SubmitOutcome {
-        let mut w = self.waiters.lock().unwrap();
-        if w.is_empty() {
+    /// Deliver the operator's PIN only to the exact ceremony selected from pairing status.
+    pub fn submit(&self, pin: String, target: &CeremonyId) -> SubmitOutcome {
+        let mut waiters = self.waiters.lock().unwrap();
+        if waiters.is_empty() {
             return SubmitOutcome::NoWaiter;
         }
-        let matches: Vec<CeremonyId> = w
-            .keys()
-            .filter(|k| uniqueid.is_none_or(|u| k.uniqueid == u))
-            .filter(|k| fingerprint.is_none_or(|f| k.fingerprint.eq_ignore_ascii_case(f)))
-            .cloned()
-            .collect();
-        match matches.len() {
-            0 => SubmitOutcome::NoMatch,
-            1 => {
-                let id = matches.into_iter().next().expect("len checked");
-                *w.get_mut(&id).expect("key from this map") = Some(pin);
-                drop(w);
-                self.notify.notify_waiters();
-                tracing::info!(
-                    uniqueid = %id.uniqueid,
-                    fingerprint = %id.fingerprint,
-                    "pairing: PIN addressed to its ceremony"
-                );
-                SubmitOutcome::Delivered(id)
-            }
-            _ => {
-                tracing::warn!(
-                    "pairing: more than one handshake matches — refusing an ambiguous submit"
-                );
-                SubmitOutcome::Ambiguous(matches)
-            }
-        }
+        let Some((id, slot)) = waiters
+            .iter_mut()
+            .find(|(id, _)| {
+                id.uniqueid == target.uniqueid
+                    && id.fingerprint.eq_ignore_ascii_case(&target.fingerprint)
+                    && id.peer_ip == target.peer_ip
+            })
+            .map(|(id, slot)| (id.clone(), slot))
+        else {
+            return SubmitOutcome::NoMatch;
+        };
+        *slot = Some(pin);
+        drop(waiters);
+        self.notify.notify_waiters();
+        tracing::info!(
+            uniqueid = %id.uniqueid,
+            fingerprint = %id.fingerprint,
+            peer_ip = %id.peer_ip,
+            "pairing: PIN addressed to its ceremony"
+        );
+        SubmitOutcome::Delivered(id)
     }
 
     /// True while at least one pairing handshake is parked waiting for the user's PIN.
@@ -134,18 +100,19 @@ impl PinGate {
     /// identities so the operator answers a NAMED prompt rather than a bare one.
     pub fn pending(&self) -> Vec<CeremonyId> {
         let mut v: Vec<CeremonyId> = self.waiters.lock().unwrap().keys().cloned().collect();
-        v.sort_by(|a, b| (&a.uniqueid, &a.fingerprint).cmp(&(&b.uniqueid, &b.fingerprint)));
+        v.sort_by(|a, b| {
+            (&a.uniqueid, &a.fingerprint, a.peer_ip).cmp(&(&b.uniqueid, &b.fingerprint, b.peer_ip))
+        });
         v
     }
 
     async fn take(&self, timeout: Duration, id: &CeremonyId) -> Option<String> {
         {
-            // Bound the number of pairing handshakes parked at once: each `getservercert` is
-            // pre-auth and parks for up to 300s, so without a cap an unpaired LAN peer could pin
-            // unbounded tasks + keep `awaiting_pin` asserted (security-review 2026-06-28 #12).
             let mut w = self.waiters.lock().unwrap();
-            if w.len() >= MAX_PARKED_WAITERS {
-                tracing::warn!("pairing: too many handshakes awaiting a PIN — refusing");
+            if w.len() >= MAX_PARKED_WAITERS
+                || w.keys().filter(|k| k.peer_ip == id.peer_ip).count() >= MAX_PARKED_PER_IP
+            {
+                tracing::warn!(peer_ip = %id.peer_ip, "pairing: PIN waiter limit reached");
                 return None;
             }
             // A twin park under the SAME identity would race one addressed PIN between two
@@ -233,6 +200,7 @@ impl Pairing {
         uniqueid: &str,
         salt_hex: &str,
         clientcert_hex: &str,
+        peer_ip: std::net::IpAddr,
     ) -> Result<String> {
         let salt_bytes = hex::decode(salt_hex).context("salt hex")?;
         if salt_bytes.len() < 16 {
@@ -249,6 +217,7 @@ impl Pairing {
         let ceremony = CeremonyId {
             uniqueid: uniqueid.to_string(),
             fingerprint: hex::encode(crypto::sha256(&[der.as_slice()])),
+            peer_ip,
         };
         tracing::info!(
             uniqueid,
@@ -258,9 +227,9 @@ impl Pairing {
         );
         let pin = self
             .pin
-            .take(Duration::from_secs(300), &ceremony)
+            .take(PAIRING_PIN_TIMEOUT, &ceremony)
             .await
-            .ok_or_else(|| anyhow!("no PIN submitted within 300s"))?;
+            .ok_or_else(|| anyhow!("no PIN submitted within 120s"))?;
         let aes_key = crypto::pin_key(&salt, &pin);
 
         self.sessions.lock().unwrap().insert(
@@ -446,11 +415,16 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    fn cid(tag: &str) -> CeremonyId {
+    fn cid_at(tag: &str, peer_ip: std::net::IpAddr) -> CeremonyId {
         CeremonyId {
             uniqueid: tag.to_string(),
             fingerprint: hex::encode(crypto::sha256(&[tag.as_bytes()])),
+            peer_ip,
         }
+    }
+
+    fn cid(tag: &str) -> CeremonyId {
+        cid_at(tag, "127.0.0.1".parse().unwrap())
     }
 
     /// `awaiting_pin`/`pending` flip on while `take` is parked and back off on every exit
@@ -469,10 +443,10 @@ mod tests {
         }
         assert_eq!(pairing.pin.pending(), vec![cid("dev-a")]);
 
-        // A bare submit reaches the sole parked ceremony, and names it in the outcome.
+        let target = cid("dev-a");
         assert_eq!(
-            pairing.pin.submit("1234".into(), None, None),
-            SubmitOutcome::Delivered(cid("dev-a"))
+            pairing.pin.submit("1234".into(), &target),
+            SubmitOutcome::Delivered(target)
         );
         assert_eq!(waiter.await.unwrap().as_deref(), Some("1234"));
         assert!(!pairing.pin.awaiting_pin());
@@ -494,7 +468,7 @@ mod tests {
     async fn pin_without_a_waiter_is_refused_and_never_stored() {
         let pairing = Pairing::new();
         assert_eq!(
-            pairing.pin.submit("1234".into(), None, None),
+            pairing.pin.submit("1234".into(), &cid("dev-a")),
             SubmitOutcome::NoWaiter
         );
         // The handshake arriving right after gets no inherited PIN.
@@ -507,38 +481,31 @@ mod tests {
         );
     }
 
-    /// The PIN is ADDRESSED (security-review 2026-08-31 H-4): with two ceremonies parked, a bare
-    /// submit is refused as ambiguous, a named submit reaches exactly its target, and the other
-    /// waiter — a racer parked at the right moment — times out with nothing.
     #[tokio::test]
     async fn pin_is_delivered_only_to_the_named_ceremony() {
         let pairing = Arc::new(Pairing::new());
+        let legit_id = cid_at("legit", "127.0.0.1".parse().unwrap());
+        let racer_id = cid_at("racer", "127.0.0.2".parse().unwrap());
         let legit = {
             let p = pairing.clone();
-            tokio::spawn(async move { p.pin.take(Duration::from_secs(5), &cid("legit")).await })
+            let id = legit_id.clone();
+            tokio::spawn(async move { p.pin.take(Duration::from_secs(5), &id).await })
         };
         let racer = {
             let p = pairing.clone();
-            tokio::spawn(async move { p.pin.take(Duration::from_millis(200), &cid("racer")).await })
+            let id = racer_id.clone();
+            tokio::spawn(async move { p.pin.take(Duration::from_millis(200), &id).await })
         };
         while pairing.pin.pending().len() < 2 {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-
-        // Ambiguous without a name; nothing is delivered.
-        assert!(matches!(
-            pairing.pin.submit("1234".into(), None, None),
-            SubmitOutcome::Ambiguous(ids) if ids.len() == 2
-        ));
-        // A name that matches nothing delivers nothing.
         assert_eq!(
-            pairing.pin.submit("1234".into(), Some("nobody"), None),
+            pairing.pin.submit("1234".into(), &cid("nobody")),
             SubmitOutcome::NoMatch
         );
-        // Named: only the legit ceremony receives; the racer starves.
         assert_eq!(
-            pairing.pin.submit("1234".into(), Some("legit"), None),
-            SubmitOutcome::Delivered(cid("legit"))
+            pairing.pin.submit("1234".into(), &legit_id),
+            SubmitOutcome::Delivered(legit_id)
         );
         assert_eq!(legit.await.unwrap().as_deref(), Some("1234"));
         assert_eq!(racer.await.unwrap(), None);
@@ -553,10 +520,12 @@ mod tests {
         let a = CeremonyId {
             uniqueid: "dev".into(),
             fingerprint: "aa".repeat(32),
+            peer_ip: "127.0.0.1".parse().unwrap(),
         };
         let b = CeremonyId {
             uniqueid: "dev".into(),
             fingerprint: "bb".repeat(32),
+            peer_ip: "127.0.0.2".parse().unwrap(),
         };
         let (ka, kb) = (a.clone(), b.clone());
         let wa = {
@@ -570,14 +539,8 @@ mod tests {
         while pairing.pin.pending().len() < 2 {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        assert!(matches!(
-            pairing.pin.submit("1234".into(), Some("dev"), None),
-            SubmitOutcome::Ambiguous(_)
-        ));
         assert_eq!(
-            pairing
-                .pin
-                .submit("1234".into(), Some("dev"), Some(&a.fingerprint)),
+            pairing.pin.submit("1234".into(), &a),
             SubmitOutcome::Delivered(a)
         );
         assert_eq!(wa.await.unwrap().as_deref(), Some("1234"));
@@ -594,8 +557,9 @@ mod tests {
         for i in 0..MAX_PARKED_WAITERS {
             let p = pairing.clone();
             handles.push(tokio::spawn(async move {
+                let peer = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, i as u8 + 1));
                 p.pin
-                    .take(Duration::from_secs(5), &cid(&format!("dev-{i}")))
+                    .take(Duration::from_secs(5), &cid_at(&format!("dev-{i}"), peer))
                     .await
             }));
         }
@@ -607,13 +571,37 @@ mod tests {
         assert_eq!(
             pairing
                 .pin
-                .take(Duration::from_secs(5), &cid("extra"))
+                .take(
+                    Duration::from_secs(5),
+                    &cid_at("extra", "127.0.0.9".parse().unwrap()),
+                )
                 .await,
             None
         );
         for h in handles {
             h.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn one_source_cannot_fill_the_global_waiter_pool() {
+        let pairing = Arc::new(Pairing::new());
+        let first = {
+            let p = pairing.clone();
+            tokio::spawn(async move { p.pin.take(Duration::from_millis(300), &cid("one")).await })
+        };
+        while !pairing.pin.awaiting_pin() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            pairing
+                .pin
+                .take(Duration::from_secs(5), &cid("different-identity"))
+                .await,
+            None
+        );
+        assert_eq!(pairing.pin.pending().len(), 1);
+        first.abort();
     }
 
     #[tokio::test]

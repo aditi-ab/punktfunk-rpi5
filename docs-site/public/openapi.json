@@ -7710,17 +7710,20 @@
         "description": "One pairing handshake parked waiting for its PIN.",
         "required": [
           "uniqueid",
-          "fingerprint"
+          "fingerprint",
+          "peer_ip"
         ],
         "properties": {
           "fingerprint": {
             "type": "string",
-            "description": "Lowercase hex SHA-256 of the client certificate offered for pinning.",
             "example": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+          },
+          "peer_ip": {
+            "type": "string",
+            "example": "192.168.1.42"
           },
           "uniqueid": {
             "type": "string",
-            "description": "The `uniqueid` the Moonlight client sent.",
             "example": "0123456789ABCDEF"
           }
         }
@@ -8971,29 +8974,26 @@
       },
       "SubmitPin": {
         "type": "object",
-        "description": "The PIN Moonlight displays during pairing, optionally addressed to one parked ceremony.",
+        "description": "The PIN and exact ceremony selected from `GET /pair`.",
         "required": [
-          "pin"
+          "pin",
+          "uniqueid",
+          "fingerprint",
+          "peer_ip"
         ],
         "properties": {
           "fingerprint": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Address the PIN to the ceremony offering this client-cert fingerprint — disambiguates\ntwo ceremonies claiming one `uniqueid`."
+            "type": "string"
+          },
+          "peer_ip": {
+            "type": "string"
           },
           "pin": {
             "type": "string",
-            "description": "1–16 ASCII digits (Moonlight shows 4).",
             "example": "1234"
           },
           "uniqueid": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Address the PIN to the ceremony with this `uniqueid` (from the pairing status). Without\nit the PIN goes to the sole parked ceremony, and is refused when several are parked."
+            "type": "string"
           }
         }
       },

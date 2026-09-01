@@ -15,6 +15,7 @@ export default defineEventHandler(async (event) => {
 		pin?: string;
 		uniqueid?: string;
 		fingerprint?: string;
+		peer_ip?: string;
 		password?: string;
 	}>(event);
 	confirmPassword(event, body?.password);
@@ -24,7 +25,8 @@ export default defineEventHandler(async (event) => {
 	// (security-review 2026-08-31 H-4).
 	return forwardJson(event, "/api/v1/pair/pin", "POST", {
 		pin: String(body?.pin ?? ""),
-		...(body?.uniqueid ? { uniqueid: String(body.uniqueid) } : {}),
-		...(body?.fingerprint ? { fingerprint: String(body.fingerprint) } : {}),
+		uniqueid: String(body?.uniqueid ?? ""),
+		fingerprint: String(body?.fingerprint ?? ""),
+		peer_ip: String(body?.peer_ip ?? ""),
 	});
 });

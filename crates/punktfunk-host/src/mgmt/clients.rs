@@ -44,29 +44,23 @@ pub(crate) struct PairingStatus {
 #[cfg(feature = "gamestream")]
 #[derive(Serialize, ToSchema)]
 pub(crate) struct PendingCeremony {
-    /// The `uniqueid` the Moonlight client sent.
     #[schema(example = "0123456789ABCDEF")]
     uniqueid: String,
-    /// Lowercase hex SHA-256 of the client certificate offered for pinning.
     #[schema(example = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")]
     fingerprint: String,
+    #[schema(example = "192.168.1.42")]
+    peer_ip: String,
 }
 
-/// The PIN Moonlight displays during pairing, optionally addressed to one parked ceremony.
+/// The PIN and exact ceremony selected from `GET /pair`.
 #[cfg(feature = "gamestream")]
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct SubmitPin {
-    /// 1–16 ASCII digits (Moonlight shows 4).
     #[schema(example = "1234")]
     pin: String,
-    /// Address the PIN to the ceremony with this `uniqueid` (from the pairing status). Without
-    /// it the PIN goes to the sole parked ceremony, and is refused when several are parked.
-    #[serde(default)]
-    uniqueid: Option<String>,
-    /// Address the PIN to the ceremony offering this client-cert fingerprint — disambiguates
-    /// two ceremonies claiming one `uniqueid`.
-    #[serde(default)]
-    fingerprint: Option<String>,
+    uniqueid: String,
+    fingerprint: String,
+    peer_ip: String,
 }
 
 /// List paired clients
@@ -357,6 +351,7 @@ pub(crate) async fn get_pairing_status(State(st): State<Arc<MgmtState>>) -> Json
         .map(|c| PendingCeremony {
             uniqueid: c.uniqueid,
             fingerprint: c.fingerprint,
+            peer_ip: c.peer_ip.to_string(),
         })
         .collect();
     Json(PairingStatus {
@@ -393,28 +388,31 @@ pub(crate) async fn submit_pairing_pin(
     if pin.is_empty() || pin.len() > 16 || !pin.bytes().all(|b| b.is_ascii_digit()) {
         return api_error(StatusCode::BAD_REQUEST, "pin must be 1-16 ASCII digits");
     }
+    if req.uniqueid.is_empty()
+        || req.uniqueid.len() > 128
+        || req.fingerprint.len() != 64
+        || !req.fingerprint.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return api_error(StatusCode::BAD_REQUEST, "invalid pairing ceremony identity");
+    }
+    let Ok(peer_ip) = req.peer_ip.parse() else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid pairing ceremony peer_ip");
+    };
+    let target = crate::gamestream::pairing::CeremonyId {
+        uniqueid: req.uniqueid,
+        fingerprint: req.fingerprint,
+        peer_ip,
+    };
     use crate::gamestream::pairing::SubmitOutcome;
-    match st.app.pairing.pin.submit(
-        pin.to_string(),
-        req.uniqueid.as_deref(),
-        req.fingerprint.as_deref(),
-    ) {
+    match st.app.pairing.pin.submit(pin.to_string(), &target) {
         SubmitOutcome::Delivered(_) => StatusCode::NO_CONTENT.into_response(),
-        // Refusing (rather than parking the PIN) prevents a stale PIN from silently
-        // satisfying a *future* pairing attempt.
         SubmitOutcome::NoWaiter => api_error(
             StatusCode::CONFLICT,
             "no pairing handshake is waiting for a PIN",
         ),
         SubmitOutcome::NoMatch => api_error(
             StatusCode::CONFLICT,
-            "no waiting handshake matches the given uniqueid/fingerprint — re-read the pairing status",
-        ),
-        // Which ceremony the operator means is ambiguous; the PIN must be addressed, never
-        // handed to whichever racer polls first (security-review 2026-08-31 H-4).
-        SubmitOutcome::Ambiguous(_) => api_error(
-            StatusCode::CONFLICT,
-            "more than one client is waiting to pair — name the target uniqueid/fingerprint from the pairing status",
+            "the selected pairing ceremony is no longer waiting — refresh and retry",
         ),
     }
 }

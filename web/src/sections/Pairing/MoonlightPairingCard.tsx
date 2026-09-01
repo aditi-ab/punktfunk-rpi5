@@ -24,6 +24,9 @@ import {
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
 
+const ceremonyKey = (c: PairingStatus["pending"][number]) =>
+	`${c.uniqueid}\u0000${c.fingerprint}\u0000${c.peer_ip}`;
+
 /** Container: GameStream/Moonlight pairing — poll status, own the PIN entry, submit it. */
 export const MoonlightPairingSection: FC = () => {
 	const qc = useQueryClient();
@@ -61,14 +64,15 @@ export const MoonlightPairingSection: FC = () => {
 		// one) — never to whichever handshake is parked at delivery time (security-review
 		// 2026-08-31 H-4).
 		const ceremonies = pairing.data?.pending ?? [];
-		const chosen =
-			ceremonies.find((c) => c.fingerprint === target) ?? ceremonies[0];
+		const chosen = ceremonies.find((c) => ceremonyKey(c) === target) ?? ceremonies[0];
+		if (!chosen) return;
 		submit.mutate(
 			{
 				pin,
 				password,
-				uniqueid: chosen?.uniqueid,
-				fingerprint: chosen?.fingerprint,
+				uniqueid: chosen.uniqueid,
+				fingerprint: chosen.fingerprint,
+				peerIp: chosen.peer_ip,
 			},
 			{
 				onSuccess: () => {
@@ -169,6 +173,7 @@ export const MoonlightPairing: FC<{
 								<p className="font-mono text-xs text-muted-foreground">
 									{m.pairing_ceremony_device({
 										uniqueid: ceremonies[0].uniqueid,
+										ip: ceremonies[0].peer_ip,
 										fp: ceremonies[0].fingerprint.slice(-10),
 									})}
 								</p>
@@ -177,7 +182,7 @@ export const MoonlightPairing: FC<{
 								<div className="space-y-2">
 									<p className="text-sm">{m.pairing_ceremony_select()}</p>
 									<Select
-										value={target || ceremonies[0]?.fingerprint}
+										value={target || (ceremonies[0] && ceremonyKey(ceremonies[0]))}
 										onValueChange={onTargetChange}
 									>
 										<SelectTrigger id="pair-target">
@@ -185,9 +190,10 @@ export const MoonlightPairing: FC<{
 										</SelectTrigger>
 										<SelectContent>
 											{ceremonies.map((c) => (
-												<SelectItem key={c.fingerprint} value={c.fingerprint}>
+												<SelectItem key={ceremonyKey(c)} value={ceremonyKey(c)}>
 													{m.pairing_ceremony_device({
 														uniqueid: c.uniqueid,
+														ip: c.peer_ip,
 														fp: c.fingerprint.slice(-10),
 													})}
 												</SelectItem>
