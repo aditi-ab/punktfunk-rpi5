@@ -589,10 +589,11 @@ Open the web console's **Logs** page and search for `METRONOMIC`. You'll get one
   dummy plug, or simply keep the display active while you stream. The console's **Virtual displays**
   page also has a *Disable monitor devices while streaming (PnP)* toggle that suppresses the
   Windows-side reaction; the log line's `connected_inactive` field names the displays it suspects.
-- **…with NO coinciding OS display event** — the disturbance is below Windows. **Check the
-  line's `rt_gpu_driver` / `rt_gpu_host` fields first**: if either shows a REALTIME opt-in,
-  clear it (unset `PFVD_RT_GPU` / set `PUNKTFUNK_GPU_PRIORITY_CLASS=high`) — a punktfunk process
-  holding REALTIME GPU priority is the field-proven amplifier of exactly this pattern on AMD.
+- **…with NO coinciding OS display event** — the disturbance is below Windows. **On an AMD box,
+  A/B the REALTIME GPU-priority defaults first** (`setx /M PFVD_NO_RT_GPU 1` + a device restart,
+  and `PUNKTFUNK_GPU_PRIORITY_CLASS=high`) — an AMD field box tied exactly this pattern to a
+  punktfunk process holding REALTIME GPU priority; the line's `rt_gpu_driver` / `rt_gpu_host`
+  fields show what is engaged.
   Otherwise: a connected but sleeping screen being serviced by the GPU driver, display-poller
   software (the SteelSeries GG / SignalRGB class), or the desktop present clock — try a different
   refresh rate. On a laptop panel that the host deactivated, keeping it active with the

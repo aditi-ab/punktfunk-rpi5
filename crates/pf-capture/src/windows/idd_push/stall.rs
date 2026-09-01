@@ -189,28 +189,22 @@ impl std::fmt::Display for StallClass {
     }
 }
 
-/// The vdisplay driver's GPU-priority lever (`PFVD_RT_GPU` / legacy opt-out `PFVD_NO_RT_GPU`) as
-/// configured in THIS process's environment (machine env; the WUDFHost driver process resolves
-/// the pair the same way, so this read mirrors what the driver decided — modulo a machine env
-/// edited after either process started, which a restart heals). The RX 9070 XT field A/B
-/// (2026-08-12) convicted EXACTLY this lever's REALTIME rung of the metronomic stall signature,
-/// so every stall-triage line must say whether it is engaged before anyone chases display
-/// hardware.
+/// The vdisplay driver's GPU-priority lever (default REALTIME; opt-out `PFVD_NO_RT_GPU`) as
+/// configured in THIS process's environment (the WUDFHost driver process resolves the same
+/// variable, so this read mirrors what the driver decided — modulo a machine env edited after
+/// either process started, which a restart heals). An RX 9070 XT field A/B (2026-08-12) blamed
+/// the REALTIME raise for a metronomic stall signature — the opt-out is that box's A/B lever —
+/// so every stall-triage line says whether the raise is engaged.
 pub(super) fn rt_gpu_driver_posture() -> &'static str {
     if std::env::var_os("PFVD_NO_RT_GPU").is_some() {
         "off (PFVD_NO_RT_GPU)"
     } else {
-        match std::env::var_os("PFVD_RT_GPU") {
-            None => "off (default)",
-            Some(v) if v.eq_ignore_ascii_case("thread") => "gpu-thread (+7)",
-            Some(_) => "REALTIME (PFVD_RT_GPU)",
-        }
+        "REALTIME (default)"
     }
 }
 
 /// The host's own GPU scheduling-priority policy (`PUNKTFUNK_GPU_PRIORITY_CLASS`) as prose —
-/// [`rt_gpu_driver_posture`]'s twin for the second convicted REALTIME lever (the `auto` gate's
-/// HIGH→REALTIME upgrade, ~3.6 s beat in the same A/B).
+/// [`rt_gpu_driver_posture`]'s twin for the host-process REALTIME lever.
 pub(super) fn rt_gpu_host_posture() -> &'static str {
     match std::env::var("PUNKTFUNK_GPU_PRIORITY_CLASS")
         .ok()
@@ -218,9 +212,8 @@ pub(super) fn rt_gpu_host_posture() -> &'static str {
     {
         Some("off") => "off",
         Some("normal") => "normal",
-        Some("realtime") => "REALTIME (pinned)",
-        Some("auto") => "auto (gated REALTIME upgrade)",
-        _ => "high (default)",
+        Some("high") => "high",
+        _ => "REALTIME (default)",
     }
 }
 
@@ -671,8 +664,8 @@ impl StallWatch {
                     verdicts = %self.verdict_tally(),
                     classes = %self.class_tally(),
                     "capture stalls are REPEATING without a stable period — same triage as the \
-                     metronomic class: if rt_gpu_driver or rt_gpu_host shows a REALTIME opt-in, \
-                     clear it first (unset PFVD_RT_GPU / set PUNKTFUNK_GPU_PRIORITY_CLASS=high); \
+                     metronomic class: on an AMD box, A/B the REALTIME GPU-priority defaults \
+                     first (setx /M PFVD_NO_RT_GPU 1 / PUNKTFUNK_GPU_PRIORITY_CLASS=high); \
                      then a connected-but-inactive display's standby servicing (see \
                      connected_inactive), then display-poller software (the SteelSeries GG / \
                      SignalRGB class). A content-silence class tally does NOT exonerate the \
@@ -712,8 +705,8 @@ impl StallWatch {
                      suspects)"
                 );
             } else {
-                // The two REALTIME GPU-priority opt-ins (see the posture helpers' docs for the
-                // 2026-08-12 A/B that convicted both) — a log carrying this warning must say
+                // The two REALTIME GPU-priority levers (default-on; see the posture helpers'
+                // docs for the 2026-08-12 AMD A/B) — a log carrying this warning must say
                 // whether either lever is engaged before anyone chases display hardware.
                 let rt_gpu_driver = rt_gpu_driver_posture();
                 let rt_gpu_host = rt_gpu_host_posture();
@@ -729,12 +722,11 @@ impl StallWatch {
                      the disturbance is BELOW Windows (damage-idle holes — cursor \
                      stationary on a dwm-only desktop, i.e. input/hand pauses — are \
                      already excluded from this beat; see cursor_moved_px_during_gap on \
-                     the per-stall lines). FIRST: if rt_gpu_driver or rt_gpu_host shows a \
-                     REALTIME opt-in, clear it (unset PFVD_RT_GPU / set \
-                     PUNKTFUNK_GPU_PRIORITY_CLASS=high) — a punktfunk process holding \
-                     REALTIME GPU priority is the field-proven amplifier of exactly this \
-                     signature on AMD, and every pre-0.28 field metronome ran with it \
-                     default-on. Otherwise: the GPU driver servicing a \
+                     the per-stall lines). FIRST on an AMD box: A/B the REALTIME \
+                     GPU-priority defaults (setx /M PFVD_NO_RT_GPU 1 / \
+                     PUNKTFUNK_GPU_PRIORITY_CLASS=high) — a 2026-08-12 RX 9070 XT A/B \
+                     tied this signature to a punktfunk process holding REALTIME GPU \
+                     priority. Otherwise: the GPU driver servicing a \
                      connected-but-asleep sink (standby HPD/DDC/link probing), \
                      display-poller software (the SteelSeries-GG/SignalRGB class — \
                      correlate 'slow display-descriptor poll' lines), or the DWM present \
