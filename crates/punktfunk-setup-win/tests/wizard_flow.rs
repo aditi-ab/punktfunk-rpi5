@@ -15,7 +15,7 @@ use punktfunk_setup_win::wizard::WizardRoot;
 use test_reactor::{Op, RecordingBackend};
 use windows_reactor::{
     ChannelDispatcher, Component, ControlId, ControlKind, Dispatcher, DispatcherQueuePriority,
-    Event, Prop, PropValue, RenderHost,
+    Event, PropValue, RenderHost,
 };
 
 type Job = Box<dyn FnOnce()>;
@@ -62,7 +62,11 @@ impl Wiz {
     fn open(preset: &str) -> Wiz {
         let dispatcher = TestDispatcher::default();
         let channel = ChannelDispatcher::new();
-        let root = WizardRoot::new(win_preset(preset).expect(preset), 0);
+        // A small per-step latency, not zero: `wait_for_done` polls with settles, and each
+        // settle renders the CURRENT state — instant installs finish whole between two
+        // polls, so the Install page (whose rendered log the tests assert on) would never
+        // paint a single line.
+        let root = WizardRoot::new(win_preset(preset).expect(preset), 25);
         let host = RenderHost::new(
             RecordingBackend::new(),
             Box::new(root) as Box<dyn Component>,
