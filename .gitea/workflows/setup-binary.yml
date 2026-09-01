@@ -63,7 +63,12 @@ jobs:
       - name: Assert it is static, then strip it
         run: |
           BIN=target/${{ matrix.target }}/release/punktfunk-setup
-          file "$BIN" | grep -q 'static-pie' || { echo "::error::$BIN is not static"; exit 1; }
+          # readelf, not file(1): the rust-ci image ships binutils but no file. Static-pie
+          # is exactly ET_DYN with no PT_INTERP.
+          readelf -h "$BIN" | grep -q 'Type:.*DYN' || { echo "::error::$BIN is not ET_DYN"; exit 1; }
+          if readelf -l "$BIN" | grep -q 'INTERP'; then
+            echo "::error::$BIN has PT_INTERP — dynamically linked, not static-pie"; exit 1
+          fi
           strip "$BIN" || llvm-strip "$BIN"
           ls -l "$BIN"
       - name: Checksum
