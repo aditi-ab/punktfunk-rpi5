@@ -1,7 +1,6 @@
 package io.unom.punktfunk
 
 import android.content.pm.ActivityInfo
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -59,6 +58,7 @@ import androidx.compose.ui.input.pointer.positionChangedIgnoreConsumed
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -66,6 +66,9 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.window.DialogWindowProvider
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -610,23 +613,36 @@ private fun BoxScope.Pill(st: TriggerTouch, scale: Float) {
  */
 @Composable
 internal fun PadLayoutEditor(pad: PadConfig, onChange: (PadConfig) -> Unit, onBack: () -> Unit) {
-    BackHandler(onBack = onBack)
-    // The stage is the stream's canvas, not a settings pane: system bars hidden the way the
-    // stream hides them, and the stream's own phone-only landscape lock (tablets stay free —
-    // which is also what keeps the upright layout editable where it can actually occur).
-    val activity = LocalContext.current as? MainActivity
-    DisposableEffect(Unit) {
-        val bars = activity?.window?.let { WindowCompat.getInsetsController(it, it.decorView) }
-        bars?.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        bars?.hide(WindowInsetsCompat.Type.systemBars())
-        val prior = activity?.requestedOrientation
-        val compact = (activity?.resources?.configuration?.smallestScreenWidthDp ?: 600) < 600
-        if (compact) activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        onDispose {
-            bars?.show(WindowInsetsCompat.Type.systemBars())
-            activity?.requestedOrientation = prior ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    // Its own window: the editor must cover the whole app shell — the bottom tab bar on a
+    // phone, the navigation rail on a tablet — which no composable inside a tab can. Back
+    // dismisses through the dialog, so no BackHandler of its own.
+    Dialog(
+        onDismissRequest = onBack,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+    ) {
+        val activity = LocalContext.current as? MainActivity
+        val dialogWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
+        // The stage is the stream's canvas, not a settings pane: system bars hidden the way the
+        // stream hides them — on the editor's own window, so the activity's bars come back by
+        // themselves — and the stream's phone-only landscape lock (tablets stay free, which is
+        // also what keeps the upright layout editable where it can actually occur).
+        DisposableEffect(Unit) {
+            val bars = dialogWindow?.let { WindowCompat.getInsetsController(it, it.decorView) }
+            bars?.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            bars?.hide(WindowInsetsCompat.Type.systemBars())
+            val prior = activity?.requestedOrientation
+            val compact = (activity?.resources?.configuration?.smallestScreenWidthDp ?: 600) < 600
+            if (compact) activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            onDispose {
+                activity?.requestedOrientation = prior ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            }
         }
+        PadLayoutStage(pad, onChange, onBack)
     }
+}
+
+@Composable
+private fun PadLayoutStage(pad: PadConfig, onChange: (PadConfig) -> Unit, onBack: () -> Unit) {
     var selected by remember { mutableStateOf<String?>(null) }
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     val density = LocalDensity.current.density
