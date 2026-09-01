@@ -1350,16 +1350,16 @@ impl VirtualDisplayManager {
         // auto-activation, the resolve ladder's force-EXTEND (which can light a sleeping sink!),
         // and the isolate all mutate the active set, so only a snapshot taken here can tell a
         // pre-dark sink from a display we switched off (or lit) ourselves.
-        let baseline_active: Vec<CcdTargetKey> = (inner.slots.is_empty()
-            && crate::policy::prefs().standby_sink_neutralise())
-        .then(|| {
-            pf_win_display::win_display::target_inventory()
-                .iter()
-                .filter(|t| t.active)
-                .map(|t| t.key)
-                .collect()
-        })
-        .unwrap_or_default();
+        let baseline_active: Vec<CcdTargetKey> =
+            if inner.slots.is_empty() && crate::policy::prefs().standby_sink_neutralise() {
+                pf_win_display::win_display::target_inventory()
+                    .iter()
+                    .filter(|t| t.active)
+                    .map(|t| t.key)
+                    .collect()
+            } else {
+                Vec::new()
+            };
         // SAFETY: `create_monitor`'s own `# Safety` contract guarantees `dev` is the live control
         // handle; we forward it unchanged to `add_monitor`, whose precondition is exactly that.
         // `render_pin` is an `Option<LUID>` by value (plain `Copy`), so no borrowed memory
