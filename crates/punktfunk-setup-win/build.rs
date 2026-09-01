@@ -17,5 +17,13 @@ fn main() {
         println!(
             "cargo:rustc-link-arg-bin=punktfunk-setup-win=/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
         );
+
+        // The branded icon, ordinal 1 (the client's pattern): Apps & features + the taskbar.
+        let icon = "../../packaging/windows/branding/punktfunk.ico";
+        println!("cargo:rerun-if-changed={icon}");
+        winresource::WindowsResource::new()
+            .set_icon_with_id(icon, "1")
+            .compile()
+            .expect("embed the icon resource");
     }
 }

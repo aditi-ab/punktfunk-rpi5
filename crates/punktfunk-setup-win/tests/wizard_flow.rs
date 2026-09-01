@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use punktfunk_setup::platform::windows::demo::win_preset;
+use punktfunk_setup_win::real::Seams;
 use punktfunk_setup_win::wizard::WizardRoot;
 use test_reactor::{Op, RecordingBackend};
 use windows_reactor::{
@@ -66,7 +67,10 @@ impl Wiz {
         // settle renders the CURRENT state — instant installs finish whole between two
         // polls, so the Install page (whose rendered log the tests assert on) would never
         // paint a single line.
-        let root = WizardRoot::new(win_preset(preset).expect(preset), 25);
+        let root = WizardRoot::new(
+            win_preset(preset).expect(preset),
+            Seams::Demo { latency_ms: 25 },
+        );
         let host = RenderHost::new(
             RecordingBackend::new(),
             Box::new(root) as Box<dyn Component>,

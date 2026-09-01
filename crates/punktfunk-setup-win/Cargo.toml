@@ -21,8 +21,23 @@ publish = false
 name = "punktfunk-setup-win"
 path = "src/main.rs"
 
+# The console-subsystem packer: PowerShell's `&` neither waits for nor captures a GUI exe
+# (S2), so every tool verb lives in a sibling bin.
+[[bin]]
+name = "punktfunk-setup-pack"
+path = "src/bin/pack.rs"
+
 [dependencies]
 punktfunk-setup = { path = "../punktfunk-setup" }
+# The D3 sandwich (WP3.1): tar + xz (liblzma, built statically — S2 chose xz over zstd by
+# 60 MB on the installed tree) + the footer sha. Cross-platform so the pack step and its
+# tests run on every lane; the Linux musl engine keeps its own tiny dep set (D4).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3"
+xz2 = { version = "0.1", features = ["static"] }
 
 # Same rev as clients/windows — one pin, bumped together in the client's bump PRs (design
 # risk table: reactor pin drift). The workspace lock already carries it via the client.
@@ -30,10 +45,20 @@ punktfunk-setup = { path = "../punktfunk-setup" }
 windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
 # `UISettings.AnimationsEnabled` — the system animation switch the D9 slide honours. Same
 # commit as reactor so `windows-core` unifies (the client's rule for this crate).
-windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc", features = ["UI_ViewManagement"] }
+windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc", features = [
+    # `UISettings.AnimationsEnabled` — the D9 slide honours the system animation switch.
+    "UI_ViewManagement",
+    # The admin-only extract dir (WP3.1): an SDDL-built descriptor handed to CreateDirectoryW,
+    # so the dir passes the host's `ensure_admin_only_source` by construction.
+    "fileapi",
+    "sddl",
+    "winbase",
+] }
 
 [target.'cfg(windows)'.build-dependencies]
 windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+# The branded icon (the client's build.rs pattern) — Apps & features and the taskbar show it.
+winresource = "0.1"
 
 # The headless harness the flow tests drive the whole wizard through — same pair as
 # clients/windows' reactor_semantics suite.
