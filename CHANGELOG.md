@@ -42,6 +42,11 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 - **`PUNKTFUNK_INSTALL_OMARCHY_SETUP`** is the env twin for the Omarchy hand-off, which
   previously could only be answered interactively. `PUNKTFUNK_SETUP_BIN` overrides the stub's
   download with a local binary.
+- **`overlay_actions.pad` grows per-control layout overrides.** `pad.controls` (and
+  `pad.controls_narrow` for a narrow layer) maps control ids — `ls`, `rs`, `dpad`, `face`,
+  `lb`, `rb`, `lt`, `rt`, `select`, `guide`, `start` — to `{x, y, scale, hidden}`; absent
+  fields keep the preset, unknown ids survive a rewrite, and a parser that predates the maps
+  ignores them, so nothing to do.
 - **Gamescope sessions run adaptive sync** (`punktfunk-gamescope` `+pfhdr9`, patch 0011): the
   headless connector advertises VRR, so gamescope paints — and publishes to PipeWire — on the
   game's commit instead of its synthetic vblank tick, and the stream receives every unique frame

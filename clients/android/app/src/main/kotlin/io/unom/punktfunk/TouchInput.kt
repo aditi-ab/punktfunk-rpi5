@@ -193,6 +193,10 @@ internal suspend fun PointerInputScope.streamTouchInput(
     videoAspect: Float,
     trackpad: Boolean,
     invertScroll: Boolean,
+    /** The dial editor's stage: only multi-finger gestures are owned (the twist, with the real
+     *  thresholds); a lone finger passes unconsumed to whatever scrolls beneath, and no click,
+     *  cursor move or tap is ever synthesized. */
+    dialOnly: Boolean = false,
     onCycleStats: () -> Unit,
     onKeyboard: (show: Boolean) -> Unit,
     onDial: (DialEvent) -> Unit,
@@ -262,7 +266,7 @@ internal suspend fun PointerInputScope.streamTouchInput(
                 // A still finger raises no event, so the long press is a timeout: while one finger
                 // is down and nothing has moved, wait at most until the hold time; running out
                 // means "held still that long" and picks up the drag.
-                val ev = if (!dragHeld && !moved && maxFingers == 1) {
+                val ev = if (!dialOnly && !dragHeld && !moved && maxFingers == 1) {
                     val remaining = LONG_PRESS_MS - (SystemClock.uptimeMillis() - downT)
                     if (remaining <= 0) null else withTimeoutOrNull(remaining) { awaitPointerEvent() }
                 } else {
@@ -292,6 +296,8 @@ internal suspend fun PointerInputScope.streamTouchInput(
                 // Dropping below three fingers forgets the keyboard-swipe anchor, so a 3→2→3
                 // bounce re-anchors instead of reading the count change as swipe travel.
                 if (pressed.size < 3) kbCount = 0
+
+                if (dialOnly && pressed.size < 2) continue
 
                 if (pressed.size == 2) {
                     val cx = (pressed.sumOf { it.position.x.toDouble() } / pressed.size).toFloat()
@@ -341,6 +347,9 @@ internal suspend fun PointerInputScope.streamTouchInput(
                         // past SCROLL_DIV long before it turns 10°. The anchor follows the
                         // centroid so the scroll starts smoothly once the slop is crossed.
                         if (!scrollEmitted && travel < DIAL_SLOP) {
+                            // The editor's stage claims the undecided pair too, or the page's
+                            // scroll container steals the fingers before the twist can arm.
+                            if (dialOnly) ev.changes.forEach { it.consume() }
                             scrolling = true
                             scrollCount = 2
                             prevCx = cx
@@ -453,7 +462,7 @@ internal suspend fun PointerInputScope.streamTouchInput(
                 ev.changes.forEach { it.consume() }
             }
 
-            if (!dragHeld && !moved) {
+            if (!dialOnly && !dragHeld && !moved) {
                 when {
                     maxFingers >= 3 -> onCycleStats() // in-stream HUD verbosity cycle
                     maxFingers == 2 -> { // two-finger tap → right click

@@ -243,18 +243,22 @@ there is nothing to inhibit.
 **Invert scroll direction** — *default: off*, i.e. the host scrolls the way this machine does.
 
 **Quick actions** — *Android, iPhone/iPad, macOS, Apple TV and the console home.* What the six
-buttons of the in-stream ring hold, and the custom shortcut chords they can send. The editor is the ring
+buttons of the in-stream dial hold, and the custom shortcut chords they can send. The editor is the dial
 itself on every client — tap or click a button to change it, drag one onto another to swap; with a
 controller, the stick walks the buttons, A changes one, Y lifts it and A drops it on another. A
 shortcut is a name, the modifiers, and a key picked on a keyboard. The console keeps the global
-ring only (it never edits profiles). See [the quick-action ring](/docs/input#the-quick-action-ring).
+dial only (it never edits profiles). See [the quick-action dial](/docs/input#the-quick-action-dial).
 
 **Virtual controller** — *Android and iPhone/iPad only*, under Quick actions. **Layout**
 (*default: Full*) picks which controls the on-screen controller shows: Full, Sticks and shoulders,
 or D-pad and face buttons. **Opacity** (*default: 45 %*) and **Scale** (*default: 100 %*) set how
-strongly and how large it draws over the picture. The controller itself is shown and hidden from
-the ring's Virtual controller button, per session. Not on Apple TV (no touch screen), a Steam Deck
-(real sticks) or the desktop clients (a keyboard).
+strongly and how large it draws over the picture. **Edit layout** opens the controller itself over
+a stand-in backdrop: drag a control to move it, tap one to size it (50–200 %) or hide it, and reset
+one control or the whole layout. Wide and upright screens keep separate layouts, so a phone tuned
+in landscape keeps its portrait preset untouched; the overrides ride the same profile-scoped
+setting as the dial, so a Game profile can carry its own arrangement. The controller itself is
+shown and hidden from the dial's Virtual controller button, per session. Not on Apple TV (no touch
+screen), a Steam Deck (real sticks) or the desktop clients (a keyboard).
 
 ## Behavior
 

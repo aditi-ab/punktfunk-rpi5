@@ -54,6 +54,26 @@ final class OverlayActionsTests: XCTestCase {
         XCTAssertTrue(cfg.ring.allSatisfy { $0 == nil })
     }
 
+    /// The Swift port of `pad_control_tweaks_round_trip_and_carry_unknown_ids`.
+    func testPadControlTweaksRoundTripAndCarryUnknownIds() {
+        let blob = """
+            {"v":2,"pad":{"layout":"full","opacity":0.45,"scale":1.0,
+             "controls":{"ls":{"x":0.1,"y":0.8,"scale":1.5},"weird":{"hidden":true}},
+             "controls_narrow":{"face":{"scale":0.75}}}}
+            """
+        let cfg = OverlayConfig.parse(blob)
+        XCTAssertEqual(cfg.pad.controls["ls"], PadTweak(x: 0.1, y: 0.8, scale: 1.5))
+        XCTAssertEqual(cfg.pad.controls["weird"]?.hidden, true, "an unknown id is data, not an error")
+        XCTAssertEqual(cfg.pad.controlsNarrow["face"]?.scale, 0.75)
+        let json = cfg.toJSON()
+        XCTAssertTrue(json.contains("weird"), "a rewrite keeps what it does not know")
+        XCTAssertEqual(OverlayConfig.parse(json), cfg)
+        let plain = OverlayConfig.platformDefault(.touch).toJSON()
+        XCTAssertFalse(plain.contains("controls"), "an untouched pad keeps its blob clean")
+        let sparse = OverlayConfig.parse(#"{"pad":{"controls":{"rs":{"x":0.5}}}}"#).toJSON()
+        XCTAssertTrue(sparse.contains(#""rs":{"x":0.5}"#), "absent fields stay absent: \(sparse)")
+    }
+
     func testKeyNamesMapToWindowsVKs() {
         XCTAssertEqual(keyVk("ctrl"), 0x11)
         XCTAssertEqual(keyVk("Shift"), 0x10)

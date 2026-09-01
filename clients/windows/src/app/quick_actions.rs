@@ -774,7 +774,7 @@ fn shortcuts(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>)
     // One mark either way: the accent fill below is what says it is armed, and the glyph takes
     // the on-accent brush by itself.
     .icon(lucide::icon("rotate-cw"))
-    .tooltip("Restores the platform ring and removes the shortcuts")
+    .tooltip("Restores the platform dial and removes the shortcuts")
     .on_click({
         let (props, ui, set_ui) = (props.clone(), ui.clone(), set_ui.clone());
         move || {
@@ -810,7 +810,7 @@ fn shortcuts(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>)
     let mut parts: Vec<Element> = vec![section("Shortcuts")];
     if rows.is_empty() {
         parts.push(
-            text_block("A chord the ring sends to the host. A new one takes the first empty slot.")
+            text_block("A new shortcut takes the first empty dial slot.")
                 .font_size(12.0)
                 .foreground(ThemeRef::SecondaryText)
                 .wrap()
@@ -819,13 +819,6 @@ fn shortcuts(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>)
     }
     parts.extend(rows);
     parts.push(actions);
-    parts.push(
-        text_block("Reset restores the platform ring and removes the shortcuts.")
-            .font_size(12.0)
-            .foreground(ThemeRef::SecondaryText)
-            .wrap()
-            .into(),
-    );
     card(vstack(parts).spacing(10.0)).into()
 }
 
@@ -862,7 +855,7 @@ fn shortcut_editor(
             })
             .font_size(20.0)
             .semibold(),
-            text_block("How the ring will draw it")
+            text_block("How the dial will draw it")
                 .font_size(12.0)
                 .foreground(ThemeRef::SecondaryText),
         ))

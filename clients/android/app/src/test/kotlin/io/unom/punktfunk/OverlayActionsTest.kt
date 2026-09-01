@@ -63,6 +63,25 @@ class OverlayActionsTest {
         assertTrue(cfg.ring.all { it == null })
     }
 
+    /** The Kotlin port of `pad_control_tweaks_round_trip_and_carry_unknown_ids`. */
+    @Test
+    fun padControlTweaksRoundTripAndCarryUnknownIds() {
+        val blob = """{"v":2,"pad":{"layout":"full","opacity":0.45,"scale":1.0,
+            "controls":{"ls":{"x":0.1,"y":0.8,"scale":1.5},"weird":{"hidden":true}},
+            "controls_narrow":{"face":{"scale":0.75}}}}"""
+        val cfg = OverlayConfig.parse(blob)
+        assertEquals(PadTweak(x = 0.1f, y = 0.8f, scale = 1.5f), cfg.pad.controls["ls"])
+        assertTrue("an unknown id is data, not an error", cfg.pad.controls["weird"]!!.hidden)
+        assertEquals(0.75f, cfg.pad.controlsNarrow["face"]!!.scale)
+        val json = cfg.toJson()
+        assertTrue("a rewrite keeps what it does not know", "weird" in json)
+        assertEquals(cfg, OverlayConfig.parse(json))
+        val plain = OverlayConfig.platformDefault(RingPlatform.TOUCH).toJson()
+        assertTrue("an untouched pad keeps its blob clean", "controls" !in plain)
+        val sparse = OverlayConfig.parse("""{"pad":{"controls":{"rs":{"x":0.5}}}}""").toJson()
+        assertTrue("absent fields stay absent: $sparse", """"rs":{"x":0.5}""" in sparse)
+    }
+
     @Test
     fun keyNamesMapToWindowsVks() {
         assertEquals(0x11, keyVk("ctrl"))

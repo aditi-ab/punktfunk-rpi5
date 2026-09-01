@@ -528,8 +528,8 @@ extension SettingsView {
     /// the user can change: iOS from Touch & pointer, macOS from Keyboard & mouse (the Mac opens
     /// the ring with ⌃⌥⇧O or the Stream menu, so that is where a reader looks for it).
     @ViewBuilder var quickActionsRow: some View {
-        described("Which actions the in-stream ring offers and the shortcuts it can send; "
-                  + "a profile that changes it owns the whole ring.", field: "overlay_actions") {
+        described("Which actions the in-stream dial offers and the shortcuts it can send; "
+                  + "a profile that changes it owns the whole dial.", field: "overlay_actions") {
             // A SHEET, not a push: the detail column is not a NavigationStack, and a
             // NavigationLink pushed from it popped the collapsed iPhone stack to the category
             // list on the way back and left the selection dead (AboutView's rows say the same).
