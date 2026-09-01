@@ -159,6 +159,12 @@ jobs:
             prep: pacman -Sy --noconfirm --needed curl git nodejs && (pacman-key --init >/dev/null 2>&1 || true)
             rmweb: pacman -Rns --noconfirm punktfunk-web
             haveclient: pacman -Q punktfunk-client
+            # The published STABLE host and client each ship /usr/share/icons/.../
+            # io.unom.Punktfunk.svg and pacman refuses the co-install (rpm tolerates identical
+            # duplicate files, so fedora keeps the default channel). Canary splits the file
+            # into punktfunk-icons. Drop the pin when stable splits it too — same trap as
+            # ci/omarchy/row.sh.
+            clientchannel: --channel canary
             oncanary: grep -q '^\[punktfunk-canary\]' /etc/pacman.conf && ! grep -q '^\[punktfunk\]' /etc/pacman.conf
             onstable: grep -q '^\[punktfunk\]' /etc/pacman.conf && ! grep -q '^\[punktfunk-canary\]' /etc/pacman.conf
     container:
@@ -247,7 +253,7 @@ jobs:
       - name: The client installs from the same repo
         if: matrix.haveclient != ''
         run: |
-          $PF --yes --no-start --client
+          $PF --yes --no-start --client ${{ matrix.clientchannel }}
           ${{ matrix.haveclient }}
       - name: --uninstall takes the packages and the repo off again
         run: |
