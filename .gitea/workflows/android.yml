@@ -117,6 +117,10 @@ jobs:
       - name: sccache (no-op once the image bakes it)
         run: sh scripts/ci/ensure-sccache.sh
 
+      - name: Verify Gradle wrapper
+        working-directory: clients/android
+        run: sha256sum -c gradle/wrapper/gradle-wrapper.jar.sha256
+
       # FIRST, because it costs a second and everything after it costs ten minutes.
       #
       # A release tag MUST carry its own Play "What's new". If the file is absent Play does not
@@ -206,7 +210,7 @@ jobs:
           # Gradle DISTRIBUTION, so a wrapper bump with no .gradle.kts change would otherwise
           # restore a key that can never hold the new one. Namespace shared with
           # android-screenshots.yml — same content, one copy in the central store.
-          key: gradle-${{ hashFiles('clients/android/**/*.gradle.kts', 'clients/android/gradle/wrapper/gradle-wrapper.properties') }}
+          key: gradle-${{ hashFiles('clients/android/**/*.gradle.kts', 'clients/android/**/gradle.lockfile', 'clients/android/gradle/verification-metadata.xml', 'clients/android/gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: gradle-
 
       # Clippy for the ANDROID target. Like the kit tests below, this was running NOWHERE: ci.yml
@@ -349,7 +353,7 @@ jobs:
         if: always()
         # v3, not v4: Gitea's artifact backend identifies as GHES, which upload-artifact@v4 refuses
         # (same reason as apple.yml / *-screenshots.yml). Download is a zip of the matched APK(s).
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5 # v3
         with:
           name: punktfunk-android-apk
           path: |

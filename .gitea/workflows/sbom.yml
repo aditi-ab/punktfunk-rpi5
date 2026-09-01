@@ -37,19 +37,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      # Pinned syft (keep in sync with the version validated against this repo; bump deliberately).
-      #
-      # The BINARY version was pinned; the INSTALLER was not — it was fetched from `main` and piped
-      # into a shell, so whatever that branch happened to say at job time ran here, with the job's
-      # environment (2026-08-05 review H-6). Pinning the script to the same tag as the binary makes
-      # the whole step reproducible: bump the tag in both places together.
-      - name: Install syft
-        env:
-          SYFT_VERSION: v1.49.0
+      - name: Install pinned syft
         run: |
           set -euo pipefail
-          curl -sSfL "https://raw.githubusercontent.com/anchore/syft/${SYFT_VERSION}/install.sh" \
-            | sh -s -- -b /usr/local/bin "$SYFT_VERSION"
+          asset=syft_1.49.0_linux_amd64.tar.gz
+          curl -fsSL --retry 5 --retry-all-errors \
+            -o "/tmp/$asset" "https://github.com/anchore/syft/releases/download/v1.49.0/$asset"
+          echo '7aa2f03ee92739cf643279ba3990548b9925d4e22cae13f46831ee62821147fe  /tmp/syft_1.49.0_linux_amd64.tar.gz' | sha256sum -c -
+          tar -xzf "/tmp/$asset" -C /tmp syft
+          install -m 0755 /tmp/syft /usr/local/bin/syft
       - name: Generate SBOM
         run: |
           git config --global --add safe.directory "$PWD"
@@ -70,7 +66,7 @@ jobs:
       # v3, not v4: Gitea's artifact backend rejects upload-artifact@v4 (see apple.yml).
       - name: Upload artifact (non-tag runs)
         if: "!startsWith(github.ref, 'refs/tags/')"
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5 # v3
         with:
           name: sbom
           path: punktfunk-*.cdx.json

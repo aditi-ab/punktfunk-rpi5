@@ -1,0 +1,25 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Manually reviewed historical false positives"
+commits = [
+  "38d2b0e45490adfb2ac78364f28e60d04ba7fa78",
+  "30c31ed31b26e06886148e0b83024c2e2bf8ce0b",
+  "0bfc7fe913d74cb2a3920ece2e14098578464f22",
+  "ec84b30eae89a30025ff5d20980483e43c60f1b0",
+  "3775a39e708afee82c4747ccdde8e9ebc809d898",
+  "641ef6e1e1bac04508136eb92301f78cd174a5c5",
+  "6d370f7ed9c2bf9e0d99b40dde53e77418b54954",
+  "c75fcbd416b1764add98d3c64410fee19a423016",
+  "0a2022abbff885bdee5b86e7c73667a5e30cbacb",
+  "a32314e9a6ebbe64bdbb69686f22d761d2e51a6b",
+]
+
+[[allowlists]]
+description = "Synthetic console handoff test keys"
+regexes = [
+  '''5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8''',
+  '''b8e4a1c07f2d4e6a9b3c5d8e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c''',
+  '''s3cr3t-abcdefghijkl''',
+]

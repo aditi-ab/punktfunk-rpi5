@@ -309,9 +309,9 @@ jobs:
 
       - name: Login to registry
         # Username must be the owner of the REGISTRY_TOKEN PAT, not the push actor.
-        run: |
-          echo "${{ secrets.REGISTRY_TOKEN }}" \
-            | docker login "$REGISTRY" -u enricobuehler --password-stdin
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: printf '%s\n' "$REGISTRY_TOKEN" | docker login "$REGISTRY" -u enricobuehler --password-stdin
 
       - name: Build
         run: |
