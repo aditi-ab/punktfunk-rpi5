@@ -10,17 +10,12 @@ fn main() {
         // /MANIFESTINPUT — the self-contained marker S1 left the elevation question open on.
         windows_reactor_setup::as_self_contained();
 
-        // The S1-deferred manifest answer: link.exe merges every /MANIFESTINPUT into the one
-        // embedded manifest, so requireAdministrator rides in as a second input instead of
-        // patching reactor's. Per-bin on purpose — the client artifact's bin (M4) stays
-        // unelevated. MSVC spelling only, matching the shipped toolchain; a gnu/llvm build
-        // would need the -Wl, prefix reactor-setup itself uses.
-        let manifest =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/elevation.manifest");
-        println!("cargo:rerun-if-changed={}", manifest.display());
+        // The S1-deferred manifest answer. NOT a second /MANIFESTINPUT: link.exe always
+        // merges its own default UAC fragment (level='asInvoker'), and mt.exe refuses two
+        // snippets whose `level` disagree (c1010001) — /MANIFESTUAC replaces that default
+        // instead. Per-bin on purpose: the client artifact's bin (M4) stays unelevated.
         println!(
-            "cargo:rustc-link-arg-bin=punktfunk-setup-win=/MANIFESTINPUT:{}",
-            manifest.display()
+            "cargo:rustc-link-arg-bin=punktfunk-setup-win=/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
         );
     }
 }

@@ -53,7 +53,7 @@ impl Dispatcher for TestDispatcher {
 }
 
 struct Wiz {
-    host: RenderHost,
+    host: RenderHost<RecordingBackend, TestDispatcher>,
     dispatcher: TestDispatcher,
     channel: ChannelDispatcher,
 }

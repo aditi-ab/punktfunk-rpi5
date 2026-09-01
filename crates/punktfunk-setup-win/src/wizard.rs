@@ -192,14 +192,13 @@ impl Component for WizardRoot {
         let steps = run_steps(&ctx.preset, &ctx.screen);
         let pos = steps.iter().position(|s| *s == step).unwrap_or(0);
 
-        let body = match step {
+        match step {
             WizStep::Welcome => welcome_page(&ctx, pos, steps.len()),
             WizStep::Configure => configure_page(&ctx, pos, steps.len()),
             WizStep::Network => network_page(&ctx, pos, steps.len()),
             WizStep::Install => install_page(&ctx, &log, pos, steps.len()),
             WizStep::Done => done_page(&ctx, pos, steps.len()),
-        };
-        body
+        }
     }
 }
 
