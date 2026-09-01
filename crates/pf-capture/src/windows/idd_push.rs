@@ -235,6 +235,39 @@ enum AcquireClass {
     Fatal,
 }
 
+/// What the stale-source watchdog does this tick (see
+/// [`IddPushCapturer::stale_source_watchdog`]) — pure over its inputs so the floor/evidence/
+/// budget rules are testable without a ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StaleAction {
+    None,
+    Rebuild,
+    Fail,
+}
+
+fn stale_source_action(
+    gap: Duration,
+    floor: Duration,
+    cursor_px: u32,
+    evidence_px: u32,
+    offered_delta: u64,
+    trips: u32,
+) -> StaleAction {
+    if gap < floor {
+        return StaleAction::None;
+    }
+    // Activity evidence: the user's input moved the cursor over the frozen image, or the driver
+    // kept offering frames the ring never delivered. Neither = plain idle = no recovery.
+    if cursor_px < evidence_px && offered_delta == 0 {
+        return StaleAction::None;
+    }
+    if trips == 0 {
+        StaleAction::Rebuild
+    } else {
+        StaleAction::Fail
+    }
+}
+
 fn classify_acquire(hr: i32) -> AcquireClass {
     match hr {
         0 => AcquireClass::Acquired,
@@ -395,6 +428,10 @@ pub struct IddPushCapturer {
     /// provenance sequence. Survives ring recreates by construction: it lives on the capturer,
     /// not the ring.
     source_seq: u64,
+    /// Consecutive stale-source watchdog trips (WP3b): 1 = the one in-place rebuild ran; a
+    /// second trip is terminal. Reset only when CONTINUOUS source flow resumes — a single stash
+    /// republish after the rebuild must not re-arm another silent stale floor.
+    stale_trips: u32,
     /// Owns the shared-header file mapping + its mapped view (RAII unmap-then-close). Declared BEFORE
     /// `header`, which is a raw pointer borrowed into this view via [`MappedSection::ptr`]. Also the
     /// duplication source for the driver's header handle on every [`ChannelBroker::send`].
@@ -1611,6 +1648,80 @@ impl IddPushCapturer {
         }
     }
 
+    /// Stale floor for the interim stale-source watchdog (WP3b). Anchored ABOVE the recorded
+    /// benign vendor-hole envelope — field holes run 1.6–10 s during link/power/modeset servicing
+    /// (vdisplay-disturbance-immunity §1), and a transient adapter pause must never trigger
+    /// recovery. The staged-recovery classifier (WP12) inherits this value as its starting floor.
+    const STALE_SOURCE_FLOOR: Duration = Duration::from_secs(15);
+    /// Cursor motion across the gap that counts as ACTIVITY evidence — a couple of real mouse
+    /// movements, comfortably above sub-pixel jitter.
+    const STALE_EVIDENCE_PX: u32 = 64;
+
+    /// Interim stale-source watchdog (immunity plan WP3b; retired when the WP13 recovery ladder
+    /// owns the decision). A wedged-but-ALIVE presentation path answers `Ok(None)` forever — the
+    /// 20 s `next_frame` bail is unreachable after a first frame, and the driver-death watch only
+    /// catches an EXITED WUDFHost — so a known-active display could stream one stale texture
+    /// indefinitely (F1). When no fresh driver frame has arrived through the floor while activity
+    /// evidence exists (the user's cursor moved over the frozen image, or the driver kept
+    /// offering frames the ring never delivered), run ONE same-mode in-place rebuild; a second
+    /// expiry is terminal (typed `RingFault::SourceStalled`). No evidence = plain idle = no
+    /// recovery: a static desktop composes nothing, and that is healthy.
+    fn stale_source_watchdog(&mut self) -> Result<()> {
+        if self.recovering_since.is_some() {
+            return Ok(()); // a recreate is in flight — its own 3 s recover-or-drop governs
+        }
+        let gap = self.last_fresh.elapsed();
+        let offered_delta = self.telemetry().map_or(0, |(_, offered)| {
+            offered.saturating_sub(self.offered_at_fresh)
+        });
+        match stale_source_action(
+            gap,
+            Self::STALE_SOURCE_FLOOR,
+            self.cursor_gap_px,
+            Self::STALE_EVIDENCE_PX,
+            offered_delta,
+            self.stale_trips,
+        ) {
+            StaleAction::None => Ok(()),
+            StaleAction::Rebuild => {
+                self.stale_trips += 1;
+                tracing::warn!(
+                    target = %self.ccd,
+                    gap_s = gap.as_secs(),
+                    cursor_moved_px = self.cursor_gap_px,
+                    offered_delta,
+                    "IDD push: no source frame through the stale floor with activity evidence — \
+                     one same-mode ring rebuild (interim stale-source watchdog)"
+                );
+                if !self.recreate_ring_in_place() {
+                    let fault = crate::RingFault::SourceStalled {
+                        secs: gap.as_secs() as u32,
+                    };
+                    return Err(anyhow::Error::new(fault).context(
+                        "IDD-push: stale-source rebuild failed — ending the video plane",
+                    ));
+                }
+                Ok(())
+            }
+            StaleAction::Fail => {
+                self.stale_trips += 1;
+                let fault = crate::RingFault::SourceStalled {
+                    secs: gap.as_secs() as u32,
+                };
+                tracing::error!(
+                    target = %self.ccd,
+                    %fault,
+                    trips = self.stale_trips,
+                    "IDD push: stale-source watchdog exhausted its one rebuild"
+                );
+                Err(anyhow::Error::new(fault).context(
+                    "IDD-push: a known-active display delivered no source frame through the \
+                     stale floor and a rebuild — ending the video plane with a typed error",
+                ))
+            }
+        }
+    }
+
     fn try_consume(&mut self) -> Result<Option<CapturedFrame>> {
         self.log_driver_status_once();
         // The secure-desktop guard first: while UAC/Winlogon is up there may be NO fresh frames
@@ -1680,6 +1791,9 @@ impl IddPushCapturer {
                 );
             }
         }
+        // Interim stale-source watchdog (WP3b) — after the driver-death watch, so a trip means
+        // the WUDFHost is ALIVE and the presentation path is what stopped.
+        self.stale_source_watchdog()?;
         // Stall-attribution evidence (v2 telemetry): record the STALEST the driver's drain
         // heartbeat ever reads between fresh frames. A heartbeat that goes quiet for the hole
         // convicts our worker (starved/dead WUDFHost); one that stays fresh through it acquits the
@@ -1945,6 +2059,12 @@ impl IddPushCapturer {
                      only between stall-sized holes for its whole span; the per-stall lines \
                      above cover at most its first hole"
                 );
+            }
+            // The stale-source watchdog's episode ends only when CONTINUOUS flow resumes: one
+            // stash republish after its rebuild arrives as a lone fresh frame at the end of a
+            // long gap and must NOT re-arm another silent stale floor over a frozen image.
+            if self.last_fresh.elapsed() < Duration::from_secs(5) {
+                self.stale_trips = 0;
             }
             // A fresh driver frame: feed the driver-death watch and roll the stall-evidence
             // trackers (a regen re-encodes OLD content — it is not evidence of driver progress).
@@ -2313,6 +2433,43 @@ impl Drop for IddPushCapturer {
 mod tests {
     use super::stall::Stall;
     use super::*;
+
+    /// The stale-source watchdog's whole contract (WP3b): under the floor nothing happens; over
+    /// it, NO evidence stays idle (a static desktop is healthy), evidence buys exactly one
+    /// rebuild, and the next expiry is terminal — never an indefinite repeat.
+    #[test]
+    fn stale_source_watchdog_is_one_rebuild_then_terminal() {
+        let (floor, px) = (Duration::from_secs(15), 64u32);
+        let s = Duration::from_secs;
+        // Under the floor: nothing, whatever the evidence says.
+        assert_eq!(
+            stale_source_action(s(14), floor, 999, px, 5, 0),
+            StaleAction::None
+        );
+        // Over the floor with no activity evidence: plain idle — no recovery.
+        assert_eq!(
+            stale_source_action(s(60), floor, 0, px, 0, 0),
+            StaleAction::None
+        );
+        assert_eq!(
+            stale_source_action(s(60), floor, px - 1, px, 0, 0),
+            StaleAction::None
+        );
+        // Cursor motion over a frozen image, or undelivered driver offers: one rebuild…
+        assert_eq!(
+            stale_source_action(s(16), floor, px, px, 0, 0),
+            StaleAction::Rebuild
+        );
+        assert_eq!(
+            stale_source_action(s(16), floor, 0, px, 1, 0),
+            StaleAction::Rebuild
+        );
+        // …and the second expiry is terminal.
+        assert_eq!(
+            stale_source_action(s(16), floor, px, px, 0, 1),
+            StaleAction::Fail
+        );
+    }
 
     /// Every `AcquireSync` HRESULT class routes to a DISTINCT consequence (F4): timeout retries,
     /// abandoned poisons, negative fails typed — none may collapse into an ordinary no-frame.

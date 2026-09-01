@@ -25,6 +25,11 @@ pub enum RingFault {
     /// A slot `ReleaseSync` failed (`hr`; `removed` as above) — the slot may be wedged for the
     /// producer, so the generation cannot be trusted either.
     ReleaseFailed { hr: i32, removed: i32 },
+    /// A known-ACTIVE display (input/cursor moving, or the driver still offering frames)
+    /// delivered no new source frame through the stale floor and one in-place rebuild — the
+    /// interim stale-source watchdog's terminal verdict (immunity plan WP3b; retired when the
+    /// staged recovery ladder owns the decision).
+    SourceStalled { secs: u32 },
 }
 
 impl std::fmt::Display for RingFault {
@@ -38,6 +43,10 @@ impl std::fmt::Display for RingFault {
             Self::ReleaseFailed { hr, removed } => write!(
                 f,
                 "slot release failed {hr:#x} (device-removed reason {removed:#x})"
+            ),
+            Self::SourceStalled { secs } => write!(
+                f,
+                "no source frame for {secs}s on a known-active display, through a rebuild"
             ),
         }
     }
