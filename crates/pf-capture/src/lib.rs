@@ -9,6 +9,41 @@
 
 use anyhow::Result;
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
+
+/// A FATAL frame-transport fault: the delivery ring's current generation is dead, and retrying
+/// `try_latest` cannot help — the caller must rebuild the capture attachment or fail the session.
+/// Carried inside the `anyhow::Error` a capture call returns (downcast to route on it), so a
+/// fatal ring result can never again collapse into an ordinary `Ok(None)` repeat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RingFault {
+    /// The producer died (or a producer thread crashed) holding a slot's keyed mutex
+    /// (`WAIT_ABANDONED`): the surface's consistency is unknown, the generation is poisoned.
+    Abandoned,
+    /// A fatal synchronization HRESULT (`hr`); `removed` is `GetDeviceRemovedReason`'s code at
+    /// the time (0 = the device still reports healthy).
+    DeviceLost { hr: i32, removed: i32 },
+    /// A slot `ReleaseSync` failed (`hr`; `removed` as above) — the slot may be wedged for the
+    /// producer, so the generation cannot be trusted either.
+    ReleaseFailed { hr: i32, removed: i32 },
+}
+
+impl std::fmt::Display for RingFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Abandoned => write!(f, "slot keyed mutex abandoned (producer died holding it)"),
+            Self::DeviceLost { hr, removed } => write!(
+                f,
+                "fatal slot synchronization result {hr:#x} (device-removed reason {removed:#x})"
+            ),
+            Self::ReleaseFailed { hr, removed } => write!(
+                f,
+                "slot release failed {hr:#x} (device-removed reason {removed:#x})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RingFault {}
 // The Linux capturer reaches `DmabufFrame` through `super::`; `CursorOverlay` it names directly as
 // `pf_frame::CursorOverlay`, so only `DmabufFrame` needs to sit in this crate root's scope.
 #[cfg(target_os = "linux")]

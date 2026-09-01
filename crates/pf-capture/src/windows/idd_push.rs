@@ -209,14 +209,44 @@ struct KeyedMutexGuard<'a> {
 /// (`frame_transport.rs`).
 const WAIT_ABANDONED_HRESULT: i32 = 0x0000_0080;
 
+/// The classified result of a slot acquire — the outcomes have DISJOINT consequences and must not
+/// collapse into one "no guard" (they did: a timeout, an abandoned mutex, and a removed device all
+/// read as an ordinary no-frame tick, hiding a dead transport behind repeats forever — F4).
+enum SlotAcquire<'a> {
+    /// Genuinely held — convert/copy under the guard.
+    Acquired(KeyedMutexGuard<'a>),
+    /// `WAIT_TIMEOUT`: the driver holds the slot mid-copy — skip this tick, retry is correct.
+    Busy,
+    /// `WAIT_ABANDONED`: the producer died holding the slot. The cleanup ownership the API handed
+    /// over was already discharged (best-effort release, no pixel action) — the generation is
+    /// poisoned and the caller must fail typed.
+    Abandoned,
+    /// A fatal HRESULT (negative — device removed / invalid call).
+    Fatal(i32),
+}
+
+/// Pure classification of an `AcquireSync` HRESULT — shared shape with the driver's publish loop
+/// (`frame_transport.rs`), split out so the branch logic is testable without a device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcquireClass {
+    Acquired,
+    Abandoned,
+    Busy,
+    Fatal,
+}
+
+fn classify_acquire(hr: i32) -> AcquireClass {
+    match hr {
+        0 => AcquireClass::Acquired,
+        WAIT_ABANDONED_HRESULT => AcquireClass::Abandoned,
+        hr if hr >= 0 => AcquireClass::Busy, // WAIT_TIMEOUT and other success-severity codes
+        _ => AcquireClass::Fatal,
+    }
+}
+
 impl<'a> KeyedMutexGuard<'a> {
-    /// Acquire `mutex` at `key`, waiting up to `timeout_ms`. `None` if the acquire times out / errors
-    /// (the caller skips the frame), so the guard is only ever held when the lock is genuinely held.
-    fn acquire(
-        mutex: &'a IDXGIKeyedMutex,
-        key: u64,
-        timeout_ms: u32,
-    ) -> Option<KeyedMutexGuard<'a>> {
+    /// Acquire `mutex` at `key`, waiting up to `timeout_ms`, classifying the outcome.
+    fn acquire(mutex: &'a IDXGIKeyedMutex, key: u64, timeout_ms: u32) -> SlotAcquire<'a> {
         // SAFETY: `mutex` is a live `IDXGIKeyedMutex` on this thread's immediate-context device.
         // Raw vtable call, NOT the `Result` wrapper: `.is_err()` treated WAIT_TIMEOUT (positive =
         // `Ok`) as acquired, handing out a guard for a slot the DRIVER still held — converting from
@@ -224,13 +254,31 @@ impl<'a> KeyedMutexGuard<'a> {
         let hr = unsafe {
             (Interface::vtable(mutex).AcquireSync)(Interface::as_raw(mutex), key, timeout_ms)
         };
-        match hr.0 {
-            // Acquired — S_OK, or WAIT_ABANDONED (the driver died holding the slot: the lock is
-            // OURS now, and refusing the guard would leave the key held forever, wedging the slot).
-            0 | WAIT_ABANDONED_HRESULT => Some(KeyedMutexGuard { mutex, key }),
-            // WAIT_TIMEOUT (slot busy — the caller skips this frame) or a genuine error: never held.
-            _ => None,
+        match classify_acquire(hr.0) {
+            AcquireClass::Acquired => SlotAcquire::Acquired(KeyedMutexGuard { mutex, key }),
+            // The producer died holding the slot: the lock transferred to us, but the surface's
+            // consistency is unknown — take NO pixel action, discharge the cleanup ownership
+            // (a failed cleanup release does not soften the poisoning), and report it.
+            AcquireClass::Abandoned => {
+                // SAFETY: abandoned still transfers the lock; best-effort release, exactly once.
+                unsafe {
+                    let _ = mutex.ReleaseSync(key);
+                }
+                SlotAcquire::Abandoned
+            }
+            AcquireClass::Busy => SlotAcquire::Busy,
+            AcquireClass::Fatal => SlotAcquire::Fatal(hr.0),
         }
+    }
+
+    /// Release the slot, CHECKED — the `Drop` release stays as the early-return fallback, but the
+    /// steady path must see a failed release (a slot the producer can never re-acquire) instead
+    /// of discarding it.
+    fn release(self) -> std::result::Result<(), i32> {
+        // SAFETY: we hold `mutex` at `key`; release exactly once (`forget` skips the Drop release).
+        let r = unsafe { self.mutex.ReleaseSync(self.key) };
+        std::mem::forget(self);
+        r.map_err(|e| e.code().0)
     }
 }
 
@@ -625,6 +673,14 @@ impl IddPushCapturer {
             return 0;
         }
         (now as u64).saturating_sub(stamp).saturating_mul(1_000_000) / freq
+    }
+
+    /// `GetDeviceRemovedReason` on the host endpoint device, as a raw code (`0` = the device
+    /// still reports healthy) — queried after a fatal slot-synchronization result so the typed
+    /// error names whether a TDR/removal is behind it.
+    fn device_removed_reason(&self) -> i32 {
+        // SAFETY: `self.device` is the capturer's live device; the call only reads it.
+        unsafe { self.device.GetDeviceRemovedReason() }.map_or_else(|e| e.code().0, |()| 0)
     }
 
     /// The driver's provenance stamp for the most recent publish — the OS
@@ -1332,25 +1388,16 @@ impl IddPushCapturer {
         self.live_cursor().map(|o| (o.serial, o.x, o.y, o.visible))
     }
 
-    /// Composite the pointer for this convert: ensure the frame-sized blend scratch, copy the
-    /// slot into it, and alpha-blend the GDI poller's shape at its polled position. Returns the
-    /// scratch (texture + SRV) the conversion should read INSTEAD of the slot; `None` degrades
-    /// to the pointer-less slot (scratch/pass creation failed — warned once). A hidden pointer
-    /// blends nothing (the plain copy is the correct frame).
+    /// (Re)build the blend scratch at the current ring geometry — the ALLOCATION half of the
+    /// composite blend, split from [`Self::prepare_blend_scratch`] so it runs BEFORE the slot's
+    /// keyed mutex is acquired: the held interval must carry only the ordered read/copy/convert
+    /// work, never a `CreateTexture2D` that can stall on the device while the driver waits.
     ///
     /// # Safety
-    /// D3D11 calls on the owning capture/encode thread's device + immediate context, called
-    /// while holding the slot's keyed mutex (the copy reads the slot).
-    unsafe fn prepare_blend_scratch(
-        &mut self,
-        slot_tex: &ID3D11Texture2D,
-    ) -> Option<(ID3D11Texture2D, ID3D11ShaderResourceView)> {
-        // SAFETY: per the contract above, D3D11 calls on the owning thread's device + immediate
-        // context while the slot's keyed mutex is held. `CreateTexture2D`/`CreateShaderResourceView`
-        // take a fully-initialized stack descriptor plus live out-params and are `.ok()`-checked before
-        // use; `CopyResource` moves between our own scratch and the caller's live slot texture, which
-        // share format and size by construction (the scratch is rebuilt whenever the ring geometry
-        // changes).
+    /// D3D11 calls on the owning thread's device; call with NO slot lock held.
+    unsafe fn ensure_blend_scratch(&mut self) {
+        // SAFETY: `CreateTexture2D`/`CreateShaderResourceView` take a fully-initialized stack
+        // descriptor plus live out-params and are `.ok()`-checked before use.
         unsafe {
             let fmt = self.ring_format();
             // (Re)build the scratch at the current ring geometry.
@@ -1403,11 +1450,33 @@ impl IddPushCapturer {
                              pointer-less this session"
                             );
                         }
-                        return None;
                     }
                 }
             }
-            let (tex, srv, ..) = self.blend_scratch.as_ref().expect("just ensured");
+        }
+    }
+
+    /// Composite the pointer for this convert: copy the slot into the pre-built blend scratch
+    /// and alpha-blend the GDI poller's shape at its polled position. Returns the scratch
+    /// (texture + SRV) the conversion should read INSTEAD of the slot; `None` degrades to the
+    /// pointer-less slot (no scratch — creation failed, warned once by `ensure_blend_scratch`).
+    /// A hidden pointer blends nothing (the plain copy is the correct frame).
+    ///
+    /// # Safety
+    /// D3D11 calls on the owning capture/encode thread's device + immediate context, called
+    /// while holding the slot's keyed mutex (the copy reads the slot). Call
+    /// [`Self::ensure_blend_scratch`] before the acquire.
+    unsafe fn prepare_blend_scratch(
+        &mut self,
+        slot_tex: &ID3D11Texture2D,
+    ) -> Option<(ID3D11Texture2D, ID3D11ShaderResourceView)> {
+        // SAFETY: per the contract above, D3D11 calls on the owning thread's device + immediate
+        // context while the slot's keyed mutex is held. The scratch was allocated by
+        // `ensure_blend_scratch` BEFORE the slot acquire; only the ordered copy + blend run here.
+        // `CopyResource` moves between our own scratch and the caller's live slot texture, which
+        // share format and size by construction.
+        unsafe {
+            let (tex, srv, ..) = self.blend_scratch.as_ref()?;
             let (tex, srv) = (tex.clone(), srv.clone());
             self.context.CopyResource(&tex, slot_tex);
             // Blend the pointer (visible shapes only; hidden = the copy alone is the frame).
@@ -1688,15 +1757,39 @@ impl IddPushCapturer {
             let s = &self.slots[slot];
             (s.tex.clone(), s.srv.clone(), s.mutex.clone())
         };
+        // Blend RESOURCE construction (scratch texture + SRV) before the acquisition, so the held
+        // interval below contains only the ordered read/copy/convert work — never a
+        // CreateTexture2D that can stall on the D3D device while the driver waits on the slot.
+        if self.composite_cursor {
+            // SAFETY: D3D11 resource creation on the owning thread's device; no slot is held.
+            unsafe { self.ensure_blend_scratch() };
+        }
         // Acquire the slot's keyed mutex via a RAII guard, scoped to JUST the convert/copy below so it
         // releases at the same point as the old hand-written `ReleaseSync` (the driver gets the slot back
         // immediately, NOT held across the rest of `try_consume`) — but now leak-proof on any early return.
         {
-            let Some(_lock) = KeyedMutexGuard::acquire(&slot_mutex, 0, 8) else {
-                return Ok(None);
+            let lock = match KeyedMutexGuard::acquire(&slot_mutex, 0, 8) {
+                SlotAcquire::Acquired(l) => l,
+                // The driver holds the slot mid-copy — an ordinary tick, retry is correct.
+                SlotAcquire::Busy => return Ok(None),
+                // FATAL outcomes are typed errors now, never an `Ok(None)` repeat (F4): the ring
+                // generation is dead and only a rebuild (or a clean session error) helps.
+                SlotAcquire::Abandoned => {
+                    let fault = crate::RingFault::Abandoned;
+                    tracing::error!(target = %self.ccd, %fault, "IDD push: ring poisoned");
+                    return Err(anyhow::Error::new(fault)
+                        .context("IDD-push ring generation poisoned (rebuild required)"));
+                }
+                SlotAcquire::Fatal(hr) => {
+                    let removed = self.device_removed_reason();
+                    let fault = crate::RingFault::DeviceLost { hr, removed };
+                    tracing::error!(target = %self.ccd, %fault, "IDD push: fatal slot acquire");
+                    return Err(anyhow::Error::new(fault)
+                        .context("IDD-push slot acquire failed fatally (rebuild required)"));
+                }
             };
             // SAFETY: convert on the owning (encode) thread's immediate context, holding the slot lock.
-            // A `?` here is leak-safe: `_lock` (the KeyedMutexGuard) drops on the early return, releasing
+            // A `?` here is leak-safe: `lock` (the KeyedMutexGuard) drops on the early return, releasing
             // the slot back to the driver.
             unsafe {
                 // Composite cursor model: divert the convert input through the blend scratch —
@@ -1761,7 +1854,15 @@ impl IddPushCapturer {
                     }
                 }
             }
-            // `_lock` drops here → `ReleaseSync(0)`.
+            // CHECKED release on the steady path (the Drop release only backs the `?` returns
+            // above): a failed release wedges the slot for the driver and poisons the generation.
+            if let Err(hr) = lock.release() {
+                let removed = self.device_removed_reason();
+                let fault = crate::RingFault::ReleaseFailed { hr, removed };
+                tracing::error!(target = %self.ccd, %fault, "IDD push: fatal slot release");
+                return Err(anyhow::Error::new(fault)
+                    .context("IDD-push slot release failed (rebuild required)"));
+            }
         }
         self.out_idx = (i + 1) % ring_len;
         self.last_seq = seq;
@@ -2212,6 +2313,30 @@ impl Drop for IddPushCapturer {
 mod tests {
     use super::stall::Stall;
     use super::*;
+
+    /// Every `AcquireSync` HRESULT class routes to a DISTINCT consequence (F4): timeout retries,
+    /// abandoned poisons, negative fails typed — none may collapse into an ordinary no-frame.
+    #[test]
+    fn acquire_hresults_classify_disjointly() {
+        assert_eq!(classify_acquire(0), AcquireClass::Acquired);
+        assert_eq!(
+            classify_acquire(WAIT_ABANDONED_HRESULT),
+            AcquireClass::Abandoned
+        );
+        assert_eq!(classify_acquire(0x102), AcquireClass::Busy); // WAIT_TIMEOUT
+        assert_eq!(
+            classify_acquire(0x8007_000E_u32 as i32),
+            AcquireClass::Fatal
+        ); // E_OUTOFMEMORY
+        assert_eq!(
+            classify_acquire(0x887A_0005_u32 as i32),
+            AcquireClass::Fatal
+        ); // DEVICE_REMOVED
+        assert_eq!(
+            classify_acquire(0x8000_4005_u32 as i32),
+            AcquireClass::Fatal
+        ); // E_FAIL
+    }
 
     /// The `CcdTargetKey` packing must equal `pf_frame::dxgi::pack_luid` — the capture target's
     /// `adapter_luid` (packed by pf-frame) is what pf-capture builds its CCD keys from, so a
