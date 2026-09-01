@@ -1,5 +1,6 @@
 package io.unom.punktfunk
 
+import android.content.pm.ActivityInfo
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -31,6 +32,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
@@ -55,6 +57,7 @@ import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChangedIgnoreConsumed
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -63,6 +66,9 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import io.unom.punktfunk.kit.Gamepad
 import kotlin.math.atan2
 import kotlin.math.hypot
@@ -605,6 +611,22 @@ private fun BoxScope.Pill(st: TriggerTouch, scale: Float) {
 @Composable
 internal fun PadLayoutEditor(pad: PadConfig, onChange: (PadConfig) -> Unit, onBack: () -> Unit) {
     BackHandler(onBack = onBack)
+    // The stage is the stream's canvas, not a settings pane: system bars hidden the way the
+    // stream hides them, and the stream's own phone-only landscape lock (tablets stay free —
+    // which is also what keeps the upright layout editable where it can actually occur).
+    val activity = LocalContext.current as? MainActivity
+    DisposableEffect(Unit) {
+        val bars = activity?.window?.let { WindowCompat.getInsetsController(it, it.decorView) }
+        bars?.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        bars?.hide(WindowInsetsCompat.Type.systemBars())
+        val prior = activity?.requestedOrientation
+        val compact = (activity?.resources?.configuration?.smallestScreenWidthDp ?: 600) < 600
+        if (compact) activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        onDispose {
+            bars?.show(WindowInsetsCompat.Type.systemBars())
+            activity?.requestedOrientation = prior ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+    }
     var selected by remember { mutableStateOf<String?>(null) }
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     val density = LocalDensity.current.density
