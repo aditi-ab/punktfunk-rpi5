@@ -52,6 +52,10 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
   (`PUNKTFUNK_GPU_PRIORITY_CLASS`, the `auto` gated-upgrade mode is gone) and the vdisplay
   swap-chain raise (the `PFVD_RT_GPU` opt-in ladder is gone). A box that needs the old posture
   sets `PUNKTFUNK_GPU_PRIORITY_CLASS=high` and `setx /M PFVD_NO_RT_GPU 1`.
+- **The Windows capture micro-probes default off.** `PUNKTFUNK_STALL_PROBES=1` opts a box under
+  diagnosis in (it was on by default with `=0` as the opt-out). The standing probe threads alter
+  the path they diagnose; stall reports still carry driver telemetry and the ETW discriminator,
+  and each session logs its probe posture.
 
 ---
 

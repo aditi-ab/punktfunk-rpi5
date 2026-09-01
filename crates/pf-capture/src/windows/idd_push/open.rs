@@ -602,6 +602,10 @@ impl IddPushCapturer {
                 // hybrid-GPU box keeps reporting TEX_FAIL render-adapter mismatches
                 // (`dxgi::install_gpu_pref_hook`).
                 hybrid_hook_hits = crate::dxgi::hybrid_hook_hits(),
+                // The diagnostic POSTURE, recorded once per session (immunity plan WP3): a field
+                // log must say whether active micro-probes were running — they alter the very
+                // path a disturbance report describes, so every report needs this A/B label.
+                stall_probes = pf_host_config::config().stall_probes,
                 "IDD push(host): created sealed ring + delivered the channel; waiting for the driver \
                  to attach + publish"
             );
