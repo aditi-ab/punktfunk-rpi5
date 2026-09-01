@@ -170,7 +170,10 @@ fn the_mark_mutes_the_half_that_is_not_being_installed() {
     let both = render(true, true);
     let client_only = render(false, true);
 
-    assert!(host_only.contains('▀'), "the frame carries no mark at all");
+    assert!(
+        host_only.contains("\x1b[48;2;"),
+        "the frame carries no mark at all"
+    );
     assert_ne!(
         host_only, both,
         "selecting the client changed nothing in the mark"
@@ -178,8 +181,8 @@ fn the_mark_mutes_the_half_that_is_not_being_installed() {
     assert_ne!(client_only, both);
     assert_ne!(host_only, client_only);
 
-    // Scoped to the mark's own rows: the lens colour doubles as the TUI's highlight, so the
-    // row labels below carry it whatever the components say.
+    // The mark paints backgrounds; the same colour appears as a foreground in the TUI's
+    // highlight, so the escape has to be the background one to mean the lens.
     let mark_of = |frame: &str| {
         frame
             .lines()
@@ -187,7 +190,7 @@ fn the_mark_mutes_the_half_that_is_not_being_installed() {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let lens = "\x1b[38;2;210;201;251m";
+    let lens = "\x1b[48;2;210;201;251m";
     assert!(
         mark_of(&both).contains(lens),
         "both installed should light the lens"
