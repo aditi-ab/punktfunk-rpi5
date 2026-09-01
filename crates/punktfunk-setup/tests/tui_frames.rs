@@ -14,6 +14,7 @@ use punktfunk_setup::ui::summary::{Screen, Step};
 use punktfunk_setup::ui::term::{Key, ScriptedTerm, Terminal};
 use punktfunk_setup::ui::theme::{Caps, Colors};
 use punktfunk_setup::ui::tui::Tui;
+use punktfunk_setup::ui::Reporter;
 
 fn caps() -> Caps {
     Caps {
@@ -311,4 +312,45 @@ fn every_preset_renders_a_screen_without_panicking() {
         let (frame, _, _) = drive(name, &[Key::Enter]);
         assert!(!frame.is_empty(), "{name} rendered nothing");
     }
+}
+
+/// The default run is one repainting line. Nothing is echoed while it is up — which is what
+/// makes the repaint legal — but a warning still has to reach the scrollback.
+#[test]
+fn the_run_collapses_to_a_progress_line() {
+    let mut term = ScriptedTerm::new(&[]);
+    {
+        let tui = Tui::new(&mut term as &mut dyn Terminal, caps(), 0);
+        tui.begin_progress(3);
+        tui.say("Repositories");
+        tui.plus("sudo pacman -Syu punktfunk-host");
+        tui.ok("installed");
+        tui.say("Firewall");
+        tui.warn("no active firewall found");
+        tui.end_progress();
+    }
+    let all = term.frames.join("");
+    assert!(!all.contains("pacman"), "a command was echoed: {all}");
+    assert!(!all.contains("installed"), "an ok line was echoed: {all}");
+    assert!(all.contains("1/3"), "no counter: {all}");
+    assert!(all.contains("2/3  Firewall"), "phase not named: {all}");
+    assert!(
+        all.contains("no active firewall found"),
+        "a warning was swallowed: {all}"
+    );
+}
+
+/// `-v` never calls `begin_progress`, so the transcript is exactly what it was.
+#[test]
+fn verbose_keeps_the_command_transcript() {
+    let mut term = ScriptedTerm::new(&[]);
+    {
+        let tui = Tui::new(&mut term as &mut dyn Terminal, caps(), 0);
+        tui.say("Repositories");
+        tui.plus("sudo pacman -Syu punktfunk-host");
+        tui.ok("installed");
+    }
+    let all = term.frames.join("");
+    assert!(all.contains("sudo pacman -Syu punktfunk-host"), "{all}");
+    assert!(all.contains("installed"), "{all}");
 }

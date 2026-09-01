@@ -10,8 +10,6 @@
 ==> Checking
 
   Done. Next:
-  1. Open punktfunk and pick the host you want to stream from, or add it by address.
-  2. Approve this device in that host's console — or enter a PIN (https://docs.punktfunk.unom.io/docs/pairing).
-  3. Stream. Ctrl+Alt+Shift+Q hands mouse and keyboard back on desktop clients.
-  Stuck? https://docs.punktfunk.unom.io/docs/troubleshooting · client guide: https://docs.punktfunk.unom.io/docs/install-client
+  Open punktfunk and pick a host — then approve this device in that host's console.
+  https://docs.punktfunk.unom.io/docs/install-client · https://docs.punktfunk.unom.io/docs/pairing
 

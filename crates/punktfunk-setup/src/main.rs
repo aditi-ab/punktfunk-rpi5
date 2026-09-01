@@ -52,6 +52,7 @@ usage: punktfunk-setup [options]
   --omarchy-theme | --no-omarchy-theme   follow the Omarchy theme in the console
   --mgmt-port N         port to move the management API to if Sunshine/Apollo holds 47990 (default 47991)
   --no-start            install and configure, but don't enable the services
+  -v, --verbose         echo every command instead of collapsing to a progress line
   --uninstall           stop the services and remove the packages + repo (config stays)
   --dry-run             print every command it would run, change nothing
   --facts FILE          load a box description instead of probing this one
@@ -74,6 +75,7 @@ struct Cli {
     facts_file: Option<PathBuf>,
     demo: Option<String>,
     fail: Option<String>,
+    verbose: bool,
 }
 
 fn env_flag(env: &Env, key: &str) -> Option<bool> {
@@ -107,6 +109,7 @@ fn parse(args: Vec<String>, env: &Env) -> Result<Cli, (u8, String)> {
         facts_file: None,
         demo: None,
         fail: None,
+        verbose: false,
     };
     if env.get("PUNKTFUNK_INSTALL_CHANNEL").is_some() && cli.pins.channel.is_none() {
         return Err((BAD_USAGE, "--channel must be stable or canary".into()));
@@ -158,6 +161,7 @@ fn parse(args: Vec<String>, env: &Env) -> Result<Cli, (u8, String)> {
             "--no-start" => cli.pins.no_start = true,
             "--uninstall" => cli.pins.action = Action::Uninstall,
             "--dry-run" => cli.dry = true,
+            "-v" | "--verbose" => cli.verbose = true,
             "--facts" => cli.facts_file = value().map(PathBuf::from),
             "--demo" => cli.demo = value(),
             "--fail" => cli.fail = value(),
@@ -338,6 +342,12 @@ fn main() -> ExitCode {
         ui,
         opts,
     };
+    if let Some(t) = &tui
+        && !cli.verbose
+        && !opts.dry
+    {
+        t.begin_progress(plan.phases.len());
+    }
     let outcome = match exec.execute(&plan, &facts, &choices) {
         Ok(outcome) => outcome,
         Err(failed) => {
@@ -345,6 +355,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if let Some(t) = &tui {
+        t.end_progress();
+    }
 
     if choices.action == Action::Uninstall {
         report::uninstall_outro(ui);

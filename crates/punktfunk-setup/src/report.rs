@@ -160,15 +160,9 @@ fn next_steps(
     // as printing one for a host that has none.
     if !choices.components.host {
         ui.line(
-            "  1. Open punktfunk and pick the host you want to stream from, or add it by address.",
+            "  Open punktfunk and pick a host — then approve this device in that host's console.",
         );
-        ui.line(&format!(
-            "  2. Approve this device in that host's console — or enter a PIN ({DOCS}/pairing)."
-        ));
-        ui.line("  3. Stream. Ctrl+Alt+Shift+Q hands mouse and keyboard back on desktop clients.");
-        ui.line(&format!(
-            "  Stuck? {DOCS}/troubleshooting · client guide: {DOCS}/install-client"
-        ));
+        ui.line(&format!("  {DOCS}/install-client · {DOCS}/pairing"));
         ui.blank();
         return;
     }
@@ -176,26 +170,20 @@ fn next_steps(
     // Probed again here rather than read off Facts: the install that just ran is usually what
     // put the console on the box, and step 1 must not deny a console that now exists.
     if run.which("punktfunk-web-server") || opts.dry {
+        ui.line("  Connect with a client — a notification appears here to approve it.");
         ui.line(&format!(
-            "  1. Open the web console:  https://{ip}:47992  (the certificate is the host's own — continue past the warning)"
+            "  Console: https://{ip}:47992  (its certificate is this host's own)"
         ));
         ui.line(
-            "     password:  sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password",
+            "  Password: sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password",
         );
     } else {
-        ui.line("  1. Install the web console — it is NOT on this box, and pairing, approving a device and");
+        ui.line("  The web console is NOT on this box, and pairing and every setting live there.");
         ui.line(&format!(
-            "     every setting live there. The install line for your distro is on {}",
+            "  Install line for your distro: {}",
             facts.docs_page
         ));
     }
-    ui.line(&format!(
-        "  2. Install a client on the device you stream to ({DOCS}/install-client), connect, and click"
-    ));
-    ui.line(&format!(
-        "     Approve in the console — or Pair a device for a PIN ({DOCS}/pairing)."
-    ));
-    ui.line("  3. Stream. Ctrl+Alt+Shift+Q hands mouse and keyboard back on desktop clients.");
     if outcome.relogin {
         ui.line("  Group changes apply after you log out and back in (controllers won't work until then).");
     }
@@ -204,9 +192,6 @@ fn next_steps(
             "  Running next to Sunshine/Apollo: {DOCS}/switching-from-sunshine"
         ));
     }
-    ui.line(&format!(
-        "  Stuck? {DOCS}/troubleshooting · this installer is a preview — the full guide is {}",
-        facts.docs_page
-    ));
+    ui.line(&format!("  {DOCS}/troubleshooting · {}", facts.docs_page));
     ui.blank();
 }
