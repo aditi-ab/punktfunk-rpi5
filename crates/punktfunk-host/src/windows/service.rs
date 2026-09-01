@@ -1897,18 +1897,9 @@ fn maybe_boot_loop_rollback(restarts: u32, attempted: &mut bool) {
         );
         return;
     };
-    // Validity-only Authenticode check — and validity is ALL it proves: that the file carries a
-    // cryptographically intact signature, not whose. It is deliberately not more than that, and the
-    // earlier claim here (that the cached file had been verified against "manifest sha256 + pins")
-    // overstated it: releases sign through Azure Artifact Signing, which mints a fresh leaf per
-    // request, so the manifest carries NO `authenticode_sha256` pins to check against and never
-    // has (see `update::windows`'s module docs). What actually binds these bytes is the SHA-256 in
-    // the Ed25519-signed manifest, checked when this installer was downloaded, plus the config-dir
-    // DACL (Users read-only, no create) that keeps `updates\` un-plantable by a local user.
-    // Pinning the publisher here needs `verify_authenticode` to compare something stable across
-    // leaf rotation — the signing subject or the issuing intermediate — which is a change to
-    // `update::windows`, not to this call site (security-review 2026-08-25).
-    if let Err(e) = crate::update::windows::verify_authenticode(&previous, &[]) {
+    // The cached file was hash/publisher-verified when downloaded and is protected by the config
+    // DACL. With no manifest here, this re-check can prove only signature integrity.
+    if let Err(e) = crate::update::windows::verify_authenticode(&previous, &[], None) {
         tracing::error!(
             installer = %previous.display(),
             error = %e,

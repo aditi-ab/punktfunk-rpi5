@@ -154,15 +154,13 @@ jobs:
       - name: Installer prerequisites
         run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils git rsync openssh-client
 
-      # `--init none` is the container mode: no systemd, no daemon. Running as root, nix then talks
-      # to the store directly. Determinate Nix is also what the Nix box (.21) runs, so CI and the
-      # hand-verification box stay on the same distribution.
-      - name: Install Nix
-        run: |
-          curl -fsSL https://install.determinate.systems/nix -o /tmp/nix-installer.sh
-          sh /tmp/nix-installer.sh install linux --init none --no-confirm \
-            --extra-conf "experimental-features = nix-command flakes"
-          "$NIX" --version
+      # Exact action revision and Determinate Nix release; container mode has no daemon.
+      - uses: DeterminateSystems/determinate-nix-action@e9bfc9148566ca239aef4f5cb968674de15c3c20 # v3.5.2
+        with:
+          init: none
+          extra-conf: experimental-features = nix-command flakes
+      - name: Verify Nix
+        run: '"$NIX" --version'
 
       # Nix reads the flake through libgit2 and refuses a checkout owned by another uid
       # ("detected dubious ownership"), which is the normal case for a container job.
@@ -200,6 +198,9 @@ jobs:
       # opt-in below rather than leaving an infra-red gate on the board.
       - name: Build the bun packages
         run: |
+          # The ~2k bun tarball fetch derivations exceed the container's default 1024-fd
+          # soft limit ("error: creating pipe: Too many open files").
+          ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)" || true
           "$NIX" build --print-build-logs .#punktfunk-web .#punktfunk-scripting
 
       # Both launchers exec pkgs.bun from the store; confirm they were produced and are real entry

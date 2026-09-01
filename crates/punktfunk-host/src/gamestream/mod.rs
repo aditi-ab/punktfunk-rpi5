@@ -33,7 +33,7 @@ mod mdns;
 #[cfg(feature = "gamestream")]
 mod nvhttp;
 #[cfg(feature = "gamestream")]
-mod pairing;
+pub mod pairing;
 /// Moonlight `SS_PEN`/`SS_TOUCH` → the native pen model / wire touch (design/pen-tablet-input.md §4).
 #[cfg(feature = "gamestream")]
 mod pen;

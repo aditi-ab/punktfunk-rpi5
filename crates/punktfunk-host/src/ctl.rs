@@ -125,19 +125,19 @@ fn run(args: &[&str], json: bool) -> Result<()> {
             Ok(())
         }
         "pin" => {
-            let pin = rest
-                .first()
-                .copied()
-                .ok_or_else(|| Failure::usage("pin: give the PIN the client is showing"))?;
-            let v = Client::connect(None)?.post("/api/v1/pair/pin", &json!({ "pin": pin }))?;
+            let [pin, uniqueid, fingerprint, peer_ip] = rest else {
+                return Err(Failure::usage(
+                    "pin: give PIN UNIQUEID FP PEER_IP exactly as `ctl status` shows them",
+                ));
+            };
+            let body = json!({
+                "pin": pin,
+                "uniqueid": uniqueid,
+                "fingerprint": fingerprint,
+                "peer_ip": peer_ip,
+            });
+            let v = Client::connect(None)?.post("/api/v1/pair/pin", &body)?;
             out(json, &v, |_| println!("PIN submitted"));
-            Ok(())
-        }
-        // Not an API call at all: a ticket the console can verify with the token it already holds.
-        // See `console_url` — the point is that reading the 0600 token IS the proof.
-        "console-url" => {
-            let url = console_url()?;
-            out(json, &json!({ "url": url }), move |_| println!("{url}"));
             Ok(())
         }
         "clients" => {
@@ -212,6 +212,7 @@ fn pair(args: &[&str], json: bool) -> Result<()> {
             let mut v = v;
             if let Ok(gs) = c.get("/api/v1/pair") {
                 v["pin_pending"] = gs.get("pin_pending").cloned().unwrap_or(json!(false));
+                v["pending"] = gs.get("pending").cloned().unwrap_or(json!([]));
             }
             out(json, &v, render_pair);
             Ok(())
@@ -649,49 +650,6 @@ fn render_stats(v: &Value) {
     }
 }
 
-/// A one-shot console URL carrying a ticket that logs the operator straight in.
-///
-/// **What is being trusted, and what is not.** The console binds all interfaces so it can be
-/// reached from a phone on the LAN, and its admin surface is pairing, unpair and session control —
-/// so the network is not evidence of anything and the password stays. What IS evidence is the
-/// **mgmt token**: a 0600 file inside the 0700 config dir, readable only by the uid the host runs
-/// as. Whoever can read it can already drive the whole admin API directly (it is the credential
-/// the console's own proxy presents), so letting them skip a password they could simply read
-/// widens nothing. A visitor without a ticket still meets the login page.
-///
-/// The ticket is `<unix-seconds>.<nonce>.<HMAC-SHA256>` over `pf-console-handoff:v1:ts:nonce`,
-/// keyed by the token. The console recomputes it with its own copy — no new host route, no shared
-/// state, nothing to expire on this side. TTL and single-use are enforced by the console
-/// (`web/server/routes/_auth/handoff.get.ts`); the nonce is what keeps two launches in the same
-/// second from colliding in its replay set.
-fn console_url() -> Result<String> {
-    use hmac::{Hmac, KeyInit, Mac};
-    let dir = pf_paths::config_dir();
-    let token = crate::mgmt_token::read_persisted(&dir).ok_or_else(|| {
-        Failure::unreachable(format!(
-            "no management token in {} — the console shares this file, so without it there is \
-             nothing for a handoff to prove. Start the host once and retry.",
-            dir.join("mgmt-token").display()
-        ))
-    })?;
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let mut raw = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::rng(), &mut raw);
-    let nonce = hex::encode(raw);
-    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(token.as_bytes())
-        .map_err(|e| Failure::api(format!("could not key the handoff HMAC: {e}")))?;
-    mac.update(format!("pf-console-handoff:v1:{ts}:{nonce}").as_bytes());
-    let sig = hex::encode(mac.finalize().into_bytes());
-    // The console's own port, not the mgmt one. It is not published anywhere the way
-    // `mgmt-endpoint` is, so the documented default stands until somebody moves it.
-    Ok(format!(
-        "https://localhost:47992/_auth/handoff?t={ts}.{nonce}.{sig}"
-    ))
-}
-
 fn grants_for(preset: &str) -> Result<u32> {
     match preset {
         "full" => Ok(GRANT_PRESET_FULL),
@@ -768,7 +726,7 @@ fn render_status(v: &Value) {
         v["paired_clients"].as_i64().unwrap_or(0)
     );
     if v["pin_pending"].as_bool().unwrap_or(false) {
-        println!("pin       PENDING — run `ctl pin <PIN>` with the code the client shows");
+        println!("pin       PENDING — run `ctl pair status` for the ceremony identity");
     }
     render_games(v);
 }
@@ -910,13 +868,20 @@ fn render_pair(v: &Value) {
         println!("pin       {pin}  — enter this on the device");
     }
     if v["pin_pending"].as_bool().unwrap_or(false) {
-        println!("moonlight a client is waiting on its PIN — `ctl pin <PIN>`");
+        println!("moonlight select one waiting ceremony, then submit its exact identity:");
+        for c in v["pending"].as_array().into_iter().flatten() {
+            println!(
+                "          ctl pin <PIN> {} {} {}",
+                c["uniqueid"].as_str().unwrap_or("?"),
+                c["fingerprint"].as_str().unwrap_or("?"),
+                c["peer_ip"].as_str().unwrap_or("?")
+            );
+        }
     }
     println!("paired    {}", v["paired_clients"].as_i64().unwrap_or(0));
 }
 
-/// Last 10 hex characters, the shape an operator compares against what the device shows. Never the
-/// whole 64 — a wall of hex is exactly what makes people stop reading it.
+/// Last 10 hex characters for compact device-list display.
 fn tail(fp: &str) -> String {
     match fp.len() {
         0 => "—".to_string(),
@@ -959,13 +924,8 @@ PAIRING
     pending                      devices knocking, awaiting approval
     approve <ID> [--name N] [--preset P] [--expires-in S]
     deny <ID>
-    pin <PIN>                    submit the PIN a Moonlight/GameStream client is showing
-
-CONSOLE
-    console-url                  print a one-shot URL that opens the web console already logged in.
-                                 The ticket is signed with the management token, so being able to
-                                 read that 0600 file IS the proof — a visitor without one still
-                                 meets the login page.
+    pin <PIN> <UNIQUEID> <FP> <PEER_IP>
+                                 submit to the exact ceremony shown by `status`
 
 DEVICES
     clients                      paired devices on both planes

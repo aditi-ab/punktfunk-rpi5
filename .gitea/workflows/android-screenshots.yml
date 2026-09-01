@@ -41,8 +41,12 @@ jobs:
           # Gradle DISTRIBUTION, so a wrapper bump with no .gradle.kts change would otherwise
           # restore a key that can never hold the new one. Namespace shared with android.yml —
           # it is the same content; two keys just stored it twice in the central cache.
-          key: gradle-${{ hashFiles('clients/android/**/*.gradle.kts', 'clients/android/gradle/wrapper/gradle-wrapper.properties') }}
+          key: gradle-${{ hashFiles('clients/android/**/*.gradle.kts', 'clients/android/**/gradle.lockfile', 'clients/android/gradle/verification-metadata.xml', 'clients/android/gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: gradle-
+
+      - name: Verify Gradle wrapper
+        working-directory: clients/android
+        run: sha256sum -c gradle/wrapper/gradle-wrapper.jar.sha256
 
       # Roborazzi renders Compose on the JVM (Robolectric Native Graphics). `-PskipRustBuild` keeps
       # the cargo-ndk native build out of the graph — the tests never load libpunktfunk_android.so.
@@ -53,7 +57,7 @@ jobs:
       - name: Upload screenshots
         if: always()
         # v3: Gitea's API rejects upload-artifact@v4 (see apple.yml). Download is a zip.
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5 # v3
         with:
           name: punktfunk-android-screenshots
           path: clients/android/app/build/outputs/roborazzi

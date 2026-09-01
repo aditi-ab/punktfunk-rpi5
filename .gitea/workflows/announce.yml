@@ -24,6 +24,10 @@ on:
         description: "Announce even if the tag is a pre-release (-rc)"
         required: false
         default: "false"
+      authenticode_sha256:
+        description: "Stable installer leaf SHA-256 from the Windows signing-job log"
+        required: false
+        default: ""
 
 jobs:
   announce:
@@ -41,16 +45,26 @@ jobs:
       # fleet-wide "update available". Fails the announce loudly if the key is missing (fail-closed)
       # or the installer's live bytes don't match their .sha256 sidecar. Pre-release tags are
       # ALWAYS skipped — an -rc must never enter the stable feed, even with allow_prerelease.
+      # Reads the installer's Authenticode signer for the publisher cross-check below — a plain
+      # Ubuntu package on the plain ubuntu-24.04 runner.
+      - name: Install osslsigncode
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends osslsigncode
+
       - name: Publish the stable update manifest
         env:
           REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
           UPDATE_MANIFEST_KEY: ${{ secrets.UPDATE_MANIFEST_KEY }}
+          # The Azure Artifact Signing certificate's subject CN — the publisher identity every
+          # stable manifest binds (security-review 2026-08-31 H-3). A repo VARIABLE, not a
+          # secret: it is public knowledge (it is in every signed installer).
+          AUTHENTICODE_SUBJECT: ${{ vars.AUTHENTICODE_SUBJECT }}
           # Through the ENVIRONMENT, never interpolated into the script body. A `${{ }}` expansion
           # is a raw textual substitution performed BEFORE the shell sees the line, so a
           # workflow_dispatch input containing shell syntax executes as this step — and this is the
           # step holding UPDATE_MANIFEST_KEY, the Ed25519 key every host pins to decide whether an
           # update is real (2026-08-05 review H-6). As `$INPUT_TAG` it is only ever data.
           INPUT_TAG: ${{ inputs.tag }}
+          INPUT_AUTHENTICODE_SHA256: ${{ inputs.authenticode_sha256 }}
         run: |
           set -euo pipefail
           TAG="$INPUT_TAG"
@@ -75,8 +89,31 @@ jobs:
             echo "ERROR: installer sha256 $SHA does not match the release's .sha256 sidecar" >&2
             exit 1
           }
+          # The operator copies this leaf hash from the Windows signing-job log, not from the
+          # replaceable release asset. Schema-1 clients already enforce this field, so the first
+          # secure rollout protects old clients that do not understand authenticode_subject.
+          LEAF_SHA="$(printf '%s' "$INPUT_AUTHENTICODE_SHA256" | tr 'A-F' 'a-f')"
+          if ! printf '%s' "$LEAF_SHA" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "ERROR: authenticode_sha256 must be the 64-hex signing-job value" >&2
+            exit 1
+          fi
+          if [ -z "$AUTHENTICODE_SUBJECT" ]; then
+            echo "ERROR: set AUTHENTICODE_SUBJECT to the stable signing certificate CN" >&2
+            exit 1
+          fi
+          VERIFY="$(osslsigncode verify \
+            -CAfile /etc/ssl/certs/ca-certificates.crt \
+            -require-leaf-hash "sha256:$LEAF_SHA" \
+            -in /tmp/installer.exe 2>&1)"
+          printf '%s\n' "$VERIFY"
+          SIGNER="$(printf '%s\n' "$VERIFY" | sed -n 's#.*CN=\([^/]*\).*#\1#p' | sed -n '1p')"
+          if [ -z "$SIGNER" ] || [ "$SIGNER" != "$AUTHENTICODE_SUBJECT" ]; then
+            echo "ERROR: installer signer '$SIGNER' is not '$AUTHENTICODE_SUBJECT'" >&2
+            exit 1
+          fi
           CHANNEL=stable VERSION="$VER" REQUIRE_KEY=1 \
             WINDOWS_URL="$URL" WINDOWS_SHA256="$SHA" \
+            AUTHENTICODE_SHA256="$LEAF_SHA" AUTHENTICODE_SUBJECT="$AUTHENTICODE_SUBJECT" \
             NOTES_URL="https://git.unom.io/unom/punktfunk/releases/tag/${TAG}" \
             bash scripts/ci/publish-update-manifest.sh
 

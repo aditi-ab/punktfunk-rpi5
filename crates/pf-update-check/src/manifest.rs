@@ -76,6 +76,15 @@ pub struct WindowsHostAsset {
     /// edit instead of a lockstep host release.
     #[serde(default)]
     pub authenticode_sha256: Vec<String>,
+    /// Expected Authenticode signing-certificate subject (its simple display name — the CN).
+    /// When present, the installer must chain to a TRUSTED root (WinVerifyTrust `S_OK`; the
+    /// untrusted-root tolerance for self-signed canary builds no longer applies) and the
+    /// signing certificate's subject must equal this value. This is the publisher property
+    /// that stays stable across Azure Artifact Signing's per-request leaf rotation, which the
+    /// leaf pins above cannot express (security-review 2026-08-31 H-3). Stable manifests
+    /// carry it; an empty value keeps the legacy validity-only behavior.
+    #[serde(default)]
+    pub authenticode_subject: String,
     /// Minimum Windows build (display/preflight only).
     #[serde(default)]
     pub min_os: String,
@@ -128,6 +137,22 @@ pub fn parse_verified(bytes: &[u8], expected_channel: &str) -> Result<Manifest> 
         if w.sha256.len() != 64 || !w.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("windows_host.sha256 is not a hex SHA-256");
         }
+        if w.authenticode_sha256
+            .iter()
+            .any(|pin| pin.len() != 64 || !pin.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            bail!("windows_host.authenticode_sha256 contains an invalid pin");
+        }
+        if w.authenticode_subject.len() > 256
+            || w.authenticode_subject.chars().any(char::is_control)
+        {
+            bail!("windows_host.authenticode_subject is invalid");
+        }
+        if expected_channel == "stable"
+            && (w.authenticode_sha256.is_empty() || w.authenticode_subject.is_empty())
+        {
+            bail!("stable windows_host requires an Authenticode leaf pin and subject");
+        }
     }
     Ok(m)
 }
@@ -148,6 +173,7 @@ mod tests {
                 "url": "https://git.unom.io/unom/punktfunk/releases/download/v0.23.0/punktfunk-host-setup-0.23.0.exe",
                 "sha256": "aa".repeat(32),
                 "authenticode_sha256": ["bb".repeat(32)],
+                "authenticode_subject": "unom UG",
                 "min_os": "10.0.22621"
             }
         })
@@ -174,6 +200,12 @@ mod tests {
         assert_eq!(
             m.windows_host.as_ref().unwrap().authenticode_sha256.len(),
             1
+        );
+        // The publisher binding the stable channel carries (security-review 2026-08-31 H-3);
+        // absent → empty per serde default, and the Windows verifier then runs its legacy lane.
+        assert_eq!(
+            m.windows_host.as_ref().unwrap().authenticode_subject,
+            "unom UG"
         );
 
         // One flipped byte ⇒ refused before parse.
@@ -227,10 +259,27 @@ mod tests {
         let mut v = doc();
         v["windows_host"]["url"] = serde_json::json!("http://git.unom.io/x.exe");
         assert!(parse_verified(&bytes(&v), "stable").is_err());
+        let mut v = doc();
+        v["windows_host"]["authenticode_sha256"] = serde_json::json!(["nothex"]);
+        assert!(parse_verified(&bytes(&v), "stable").is_err());
+        let mut v = doc();
+        v["windows_host"]["authenticode_subject"] = serde_json::json!("bad\nsubject");
+        assert!(parse_verified(&bytes(&v), "stable").is_err());
         // No windows leg at all is fine (PM channels don't need it).
         let mut v = doc();
         v.as_object_mut().unwrap().remove("windows_host");
         assert!(parse_verified(&bytes(&v), "stable").is_ok());
+    }
+
+    #[test]
+    fn stable_windows_asset_requires_both_publisher_bindings() {
+        for field in ["authenticode_sha256", "authenticode_subject"] {
+            let mut v = doc();
+            v["windows_host"].as_object_mut().unwrap().remove(field);
+            assert!(parse_verified(&bytes(&v), "stable").is_err());
+            v["channel"] = serde_json::json!("canary");
+            assert!(parse_verified(&bytes(&v), "canary").is_ok());
+        }
     }
 
     #[test]

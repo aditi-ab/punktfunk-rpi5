@@ -120,13 +120,9 @@ Item {
     Quickshell.execDetached(argv)
   }
 
-  // The console opens the way the menu entry does: an --app window (no browser chrome) at a
-  // one-shot handoff URL, so it lands already logged in. Shell indirection because the ticket
-  // must be minted at CLICK time — one minted at widget load would be long expired. `|| echo`:
-  // a stopped host fails `ctl console-url`, and an EMPTY --app= opens a plain browser window.
+  // Open the ordinary login page; an admin bearer URL must never enter process arguments.
   function openConsole() {
-    detached(["sh", "-c",
-              "exec omarchy-launch-webapp \"$(punktfunk-host ctl console-url || echo https://localhost:47992)\""])
+    detached(["omarchy-launch-webapp", "https://localhost:47992"])
   }
 
   function notify(title, body) {

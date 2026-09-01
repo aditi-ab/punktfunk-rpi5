@@ -468,8 +468,10 @@ jobs:
         env:
           WRITING_BASE: ${{ github.event.pull_request.base.sha }}
         run: |
+          # No --depth here: a shallow fetch grafts the base commit parentless, and
+          # base..HEAD then lints every commit in the repository's history.
           if [ -n "${WRITING_BASE:-}" ]; then
-            git fetch --depth=1 origin "$WRITING_BASE" 2>/dev/null || true
+            git fetch origin "$WRITING_BASE" 2>/dev/null || true
           fi
           sh scripts/ci/check-writing.sh --self-test
           sh scripts/ci/check-writing.sh

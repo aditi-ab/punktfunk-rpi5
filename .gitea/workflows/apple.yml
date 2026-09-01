@@ -596,7 +596,7 @@ jobs:
         if: steps.ios_ipa.outputs.ipa != ''
         # v3, not v4: Gitea's artifact backend identifies as GHES, which upload-artifact@v4 refuses
         # (same reason as android.yml / the screenshots job below). Download is a zip of the .ipa.
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5 # v3
         with:
           name: punktfunk-ios-ipa
           path: ${{ steps.ios_ipa.outputs.ipa }}
@@ -767,7 +767,7 @@ jobs:
         if: always()
         # v3, not v4: Gitea's artifact backend identifies as GHES, which @actions/artifact v2+
         # (upload-artifact@v4) refuses. v3 uses the older API Gitea supports; download is still a zip.
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5 # v3
         with:
           name: punktfunk-appstore-screenshots
           path: clients/apple/screenshots

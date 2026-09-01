@@ -141,10 +141,9 @@ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "
 # 0.7 + thiserror 2, so the host now links exactly one thiserror major. `cargo tree -p
 # punktfunk-host -i thiserror@1` must keep reporting no match.
 x509-parser = "0.18"
-# Only used for the plain-HTTP nvhttp listener (`bind().serve()`); HTTPS/mTLS is hand-rolled over
-# tokio-rustls (axum-server can't surface the peer cert), so we do NOT enable `tls-rustls` — that
-# feature is what pulled the unmaintained `rustls-pemfile` (security-review dep hygiene).
-axum-server = "0.8"
+# (axum-server left with the plain-HTTP nvhttp listener: both nvhttp listeners now run the
+# governed tokio-rustls/hyper accept loop in gamestream/tls.rs — connection ceilings + header
+# deadlines, security-review 2026-08-31 M-6 — which axum-server could not express.)
 # aws-lc-rs backend, matching punktfunk-core + the clients (a dissenting crate would pull a
 # second crypto stack in). `prefer-post-quantum` offers X25519MLKEM768 first on the mgmt/native
 # TLS 1.3 listeners; classical curves stay in the list, so a client without ML-KEM still connects.

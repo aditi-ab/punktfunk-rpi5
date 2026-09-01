@@ -292,19 +292,12 @@ setup_webapp() {
   fi
   if omarchy-webapp-install "$WEBAPP" "https://localhost:47992" "$icon" 2>/dev/null; then
     ok "\"$WEBAPP\" added to Apps (Super+Space)"
-    # Point the entry at a one-shot ticket instead of the bare URL, so opening the console from the
-    # launcher lands logged in. `ctl console-url` signs it with the management token, which only
-    # this uid can read — a LAN visitor still gets the login page.
     local entry
     entry=$(grep -rl "^Name=$WEBAPP$" "$HOME/.local/share/applications" 2>/dev/null | head -1) || true
-    if [[ -n "$entry" ]] && have punktfunk-host; then
-      # `|| echo`: a stopped host makes `ctl console-url` fail, and an EMPTY `--app=` opens a
-      # plain browser window instead of an app window — the bare URL keeps the shape right and
-      # shows the console's own error page.
-      sed -i "s|^Exec=.*|Exec=sh -c 'omarchy-launch-webapp \"\$(punktfunk-host ctl console-url \|\| echo https://localhost:47992)\"'|" "$entry"
+    if [[ -n "$entry" ]]; then
       sed -i "s|^Icon=.*|Icon=$icon|" "$entry"
       grep -q '^Icon=' "$entry" || printf 'Icon=%s\n' "$icon" >> "$entry"
-      ok "the console entry opens already logged in, with the Punktfunk mark"
+      ok "the console entry opens its login page with the Punktfunk mark"
     fi
   else
     warn "could not add the webapp — add it by hand from the Omarchy menu if you want it"
@@ -334,7 +327,7 @@ readonly MENU_END="// <<< punktfunk"
 menu_rows() {
   cat <<'EOF'
   "punktfunk-host": {"icon":"󰒋","label":"Punktfunk Host","aliases":["streaming","hosting"]},
-  "punktfunk-host.console": {"icon":"󰖟","label":"Open web console","description":"Pairing, devices, settings — opens already logged in","action":"sh -c 'omarchy-launch-webapp \"$(punktfunk-host ctl console-url || echo https://localhost:47992)\"'"},
+  "punktfunk-host.console": {"icon":"󰖟","label":"Open web console","description":"Pairing, devices, settings","action":"omarchy-launch-webapp https://localhost:47992"},
   "punktfunk-host.pair": {"icon":"󰐕","label":"Pair a device","description":"Open a pairing window and show the PIN","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl pair arm; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
   "punktfunk-host.pending": {"icon":"󰀦","label":"Devices waiting","description":"Approve or deny a device that is asking to pair","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl pending; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
   "punktfunk-host.devices": {"icon":"󰍺","label":"Paired devices","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl clients; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},

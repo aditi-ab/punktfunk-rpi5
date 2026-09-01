@@ -455,6 +455,21 @@ jobs:
           & packaging/windows/pack-host-installer.ps1 `
             -Version $env:HOST_VERSION -TargetDir C:\t\release -OutDir C:\t\out
 
+      - name: Report stable Authenticode identity
+        if: startsWith(gitea.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature $env:HOST_SETUP_PATH
+          if ($sig.Status -ne 'Valid' -or -not $sig.SignerCertificate) {
+            throw "stable installer Authenticode status is $($sig.Status)"
+          }
+          $sha = [BitConverter]::ToString(
+            [System.Security.Cryptography.SHA256]::Create().ComputeHash($sig.SignerCertificate.RawData)
+          ).Replace('-', '').ToLowerInvariant()
+          $simple = [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName
+          Write-Output "AUTHENTICODE LEAF SHA-256 FOR ANNOUNCE: $sha"
+          Write-Output "AUTHENTICODE SUBJECT FOR ANNOUNCE: $($sig.SignerCertificate.GetNameInfo($simple, $false))"
+
       - name: Publish to Gitea generic registry
         shell: pwsh
         env:

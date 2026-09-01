@@ -280,6 +280,13 @@ fn art_path_is_confined(path: &Path) -> bool {
     let Ok(real) = path.canonicalize() else {
         return false;
     };
+    resolved_art_path_is_confined(&real)
+}
+
+/// The containment half of [`art_path_is_confined`], on an ALREADY-resolved path — either
+/// `canonicalize` output or an open handle's final path ([`final_path_of`]). Split out so the
+/// read path can judge the object it actually opened rather than the path it was asked about.
+fn resolved_art_path_is_confined(real: &Path) -> bool {
     if let Ok(config) = pf_paths::config_dir().canonicalize() {
         if real.starts_with(&config) {
             return false;
@@ -289,6 +296,64 @@ fn art_path_is_confined(path: &Path) -> bool {
         .iter()
         .filter_map(|r| r.canonicalize().ok())
         .any(|root| real.starts_with(&root))
+}
+
+/// The final, link-resolved path of the object `f` is open on — what the kernel says the handle
+/// IS, immune to any rename/retarget that happens after the open. Used to re-run confinement on
+/// the same object whose bytes are then read (security-review 2026-08-31 M-4).
+#[cfg(target_os = "linux")]
+fn final_path_of(f: &std::fs::File) -> Option<std::path::PathBuf> {
+    use std::os::fd::AsRawFd as _;
+    std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd())).ok()
+}
+
+/// Windows twin of the Linux `final_path_of`: `GetFinalPathNameByHandleW` with the default
+/// normalized DOS form, which carries the same `\\?\` prefix `canonicalize` produces, so
+/// `starts_with` against canonicalized roots compares like with like.
+#[cfg(windows)]
+fn final_path_of(f: &std::fs::File) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, GETFINALPATHNAMEBYHANDLE_FLAGS,
+    };
+    let mut buf = vec![0u16; 512];
+    loop {
+        // SAFETY: the handle is a live open File for the whole call, and `buf` is a valid
+        // mutable u16 buffer of the length the API is told about.
+        let n = unsafe {
+            GetFinalPathNameByHandleW(
+                HANDLE(f.as_raw_handle()),
+                &mut buf,
+                GETFINALPATHNAMEBYHANDLE_FLAGS(0), // FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+            )
+        } as usize;
+        if n == 0 {
+            return None;
+        }
+        if n < buf.len() {
+            return Some(std::ffi::OsString::from_wide(&buf[..n]).into());
+        }
+        buf.resize(n + 1, 0); // n = required length (incl. NUL) when the buffer was too small
+    }
+}
+
+/// macOS twin (dev builds only — the shipped hosts are Linux and Windows): `F_GETPATH`.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn final_path_of(f: &std::fs::File) -> Option<std::path::PathBuf> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: the fd is a live open File and `buf` is the PATH_MAX-sized buffer F_GETPATH
+    // requires; the kernel NUL-terminates what it writes.
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
+        return None;
+    }
+    let len = buf.iter().position(|&b| b == 0)?;
+    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        &buf[..len],
+    )))
 }
 
 /// Sniff an image container from its leading bytes → the content type to serve. `None` for anything
@@ -431,6 +496,7 @@ pub fn sanitize_art_paths(art: &mut Artwork) -> Vec<(&'static str, String)> {
 /// and the read see the same decoded path. Ordering matters: percent-decoding before
 /// canonicalization is what stops a `%2e%2e` escape being invisible to the traversal check.
 pub fn local_art_bytes(path: &str) -> Option<(Vec<u8>, String)> {
+    const MAX_ART_BYTES: u64 = 16 * 1024 * 1024;
     let path = file_url_to_path(path);
     if !art_path_is_servable(&path) {
         tracing::debug!(
@@ -439,12 +505,31 @@ pub fn local_art_bytes(path: &str) -> Option<(Vec<u8>, String)> {
         );
         return None;
     }
+    // Re-check confinement and size on the opened handle, then read that handle with a hard cap.
+    // A link swap cannot substitute a different file between validation and consumption.
     let p = std::path::Path::new(&*path);
-    let meta = std::fs::metadata(p).ok()?;
-    if !meta.is_file() || meta.len() == 0 || meta.len() > 16 * 1024 * 1024 {
+    let mut f = std::fs::File::open(p).ok()?;
+    let real = final_path_of(&f)?;
+    if !resolved_art_path_is_confined(&real) {
+        tracing::debug!(
+            path = %path,
+            "art proxy: opened file resolves outside the allowed art roots"
+        );
         return None;
     }
-    let bytes = std::fs::read(p).ok()?;
+    let meta = f.metadata().ok()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_ART_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    use std::io::Read as _;
+    (&mut f)
+        .take(MAX_ART_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_ART_BYTES {
+        return None;
+    }
     // Serve what the bytes ARE. A file that is not an image is not served at all.
     let ctype = sniff_image_type(&bytes)?;
     Some((bytes, ctype.to_string()))

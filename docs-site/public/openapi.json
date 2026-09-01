@@ -7688,12 +7688,43 @@
         "type": "object",
         "description": "Pairing-flow status.",
         "required": [
-          "pin_pending"
+          "pin_pending",
+          "pending"
         ],
         "properties": {
+          "pending": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PendingCeremony"
+            },
+            "description": "The parked ceremonies. Show these next to the PIN prompt — the operator should answer a\nNAMED request, and echo the identity back in the submit so the PIN is addressed to the\nceremony they saw (security-review 2026-08-31 H-4)."
+          },
           "pin_pending": {
             "type": "boolean",
             "description": "True while a pairing handshake is parked waiting for the user's PIN."
+          }
+        }
+      },
+      "PendingCeremony": {
+        "type": "object",
+        "description": "One pairing handshake parked waiting for its PIN.",
+        "required": [
+          "uniqueid",
+          "fingerprint",
+          "peer_ip"
+        ],
+        "properties": {
+          "fingerprint": {
+            "type": "string",
+            "example": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+          },
+          "peer_ip": {
+            "type": "string",
+            "example": "192.168.1.42"
+          },
+          "uniqueid": {
+            "type": "string",
+            "example": "0123456789ABCDEF"
           }
         }
       },
@@ -8943,15 +8974,26 @@
       },
       "SubmitPin": {
         "type": "object",
-        "description": "The PIN Moonlight displays during pairing.",
+        "description": "The PIN and exact ceremony selected from `GET /pair`.",
         "required": [
-          "pin"
+          "pin",
+          "uniqueid",
+          "fingerprint",
+          "peer_ip"
         ],
         "properties": {
+          "fingerprint": {
+            "type": "string"
+          },
+          "peer_ip": {
+            "type": "string"
+          },
           "pin": {
             "type": "string",
-            "description": "1–16 ASCII digits (Moonlight shows 4).",
             "example": "1234"
+          },
+          "uniqueid": {
+            "type": "string"
           }
         }
       },

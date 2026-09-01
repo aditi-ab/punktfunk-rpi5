@@ -69,7 +69,7 @@ pairing/trust, settings, the desktop library page). Every stream and the console
 library run in the sibling **`punktfunk-session`** Vulkan binary; the shell spawns it
 for connects, and `--connect`/`--browse` on the shell exec it directly (so the Decky
 wrapper keeps working unchanged). Headless flags stay in the shell:
-`--pair <PIN> --connect host[:port]` (pairing ceremony), `--wake host[:port]`, and
+`--pair - --connect host[:port]` (PIN on stdin) (pairing ceremony), `--wake host[:port]`, and
 `--library host[:mgmt_port]` (print a host's game library).
 
 ## Layout

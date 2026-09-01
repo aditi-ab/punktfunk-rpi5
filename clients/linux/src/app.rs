@@ -1178,8 +1178,17 @@ pub fn run() -> glib::ExitCode {
     // real devices (same rationale as the session binary).
     clear_steam_sdl_device_filter();
     // Headless paths (no GTK window).
-    if let Some(pin) = crate::cli::arg_value("--pair") {
-        return crate::cli::headless_pair(&pin);
+    if let Some(pin_arg) = crate::cli::arg_value("--pair") {
+        if pin_arg != "-" {
+            eprintln!("a pairing PIN may not be passed in argv; use `--pair -` and stdin");
+            return glib::ExitCode::FAILURE;
+        }
+        let mut pin = String::new();
+        if std::io::stdin().read_line(&mut pin).is_err() || pin.trim().is_empty() {
+            eprintln!("no pairing PIN on stdin");
+            return glib::ExitCode::FAILURE;
+        }
+        return crate::cli::headless_pair(pin.trim());
     }
     if let Some(target) = crate::cli::arg_value("--library") {
         return crate::cli::headless_library(&target);

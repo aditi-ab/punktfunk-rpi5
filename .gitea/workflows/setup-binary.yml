@@ -50,8 +50,9 @@ jobs:
           - arch: aarch64
             target: aarch64-unknown-linux-musl
     env:
-      # rust-lld and the musl target's bundled crt objects; no musl-gcc anywhere.
-      RUSTFLAGS: -C linker=rust-lld -C link-self-contained=yes
+      # rust-lld and the musl target's bundled crt objects; no musl-gcc anywhere. rustc strips
+      # the binary itself: the image's GNU strip cannot read the aarch64 ELF.
+      RUSTFLAGS: -C linker=rust-lld -C link-self-contained=yes -C strip=symbols
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build
@@ -60,11 +61,16 @@ jobs:
           cargo build --release --locked -p punktfunk-setup --target ${{ matrix.target }}
       # A dynamically linked binary would fail on exactly the boxes this exists for: a fresh
       # one, where nothing is installed yet.
-      - name: Assert it is static, then strip it
+      - name: Assert it is static
         run: |
           BIN=target/${{ matrix.target }}/release/punktfunk-setup
-          file "$BIN" | grep -q 'static-pie' || { echo "::error::$BIN is not static"; exit 1; }
-          strip "$BIN" || llvm-strip "$BIN"
+          # No PT_INTERP = nothing to load on a pristine box. The ELF type differs by arch —
+          # x86_64-musl links static-pie (ET_DYN), aarch64-musl static (ET_EXEC) — so the
+          # absent interpreter header is the one invariant. readelf, not file(1): the
+          # rust-ci image ships binutils but no file.
+          if readelf -l "$BIN" | grep -q 'INTERP'; then
+            echo "::error::$BIN has PT_INTERP — dynamically linked, not static"; exit 1
+          fi
           ls -l "$BIN"
       - name: Checksum
         run: |
@@ -84,6 +90,15 @@ jobs:
           path: |
             punktfunk-setup_${{ matrix.arch }}
             punktfunk-setup_${{ matrix.arch }}.sha256
+      # publish reads these from the run-scoped cache, not the artifact: the artifact download
+      # client re-encodes the storage redirect's presigned URL (%2F -> %252F), which breaks its
+      # signature and the storage answers 400. The upload stays for humans.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            punktfunk-setup_${{ matrix.arch }}
+            punktfunk-setup_${{ matrix.arch }}.sha256
+          key: punktfunk-setup-${{ matrix.arch }}-${{ github.run_id }}
 
   # The only job that touches the PUBLISHED binary. Everything else builds from the tree, on
   # purpose — the smoke must exercise the checked-out code. This asks the other question: does
@@ -118,12 +133,20 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/download-artifact@v3
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          name: punktfunk-setup-x86_64
-      - uses: actions/download-artifact@v3
+          path: |
+            punktfunk-setup_x86_64
+            punktfunk-setup_x86_64.sha256
+          key: punktfunk-setup-x86_64-${{ github.run_id }}
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          name: punktfunk-setup-aarch64
+          path: |
+            punktfunk-setup_aarch64
+            punktfunk-setup_aarch64.sha256
+          key: punktfunk-setup-aarch64-${{ github.run_id }}
+          fail-on-cache-miss: true
       - name: Publish
         env:
           REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}

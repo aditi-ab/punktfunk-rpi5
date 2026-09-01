@@ -327,7 +327,7 @@ export const nativeClients: NativeClient[] = [
 	},
 ];
 
-export const pairingIdle: PairingStatus = { pin_pending: false };
+export const pairingIdle: PairingStatus = { pin_pending: false, pending: [] };
 
 /** The six axes a preset expands to — the baseline the built-ins vary from. */
 const policyFields = (

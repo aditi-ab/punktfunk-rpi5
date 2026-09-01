@@ -555,6 +555,51 @@ fn in_flight_buffer_budget_bounds_allocation() {
     );
 }
 
+/// Received recovery-shard payloads are metered into the in-flight budget and credited back
+/// when their frame ages out (security-review 2026-08-31 M-5): before the fix each parity
+/// buffer was a heap allocation the `4 × max_frame_bytes` ceiling never saw.
+#[test]
+fn recovery_shard_payloads_are_metered_and_released() {
+    let mut r = Reassembler::new(limits());
+    let coder = coder_for(FecScheme::Gf8);
+    let stats = StatsCounters::default();
+
+    // A 4+4 block receiving 3 parity shards only (k=4): can't reconstruct, so the buffers
+    // stay held — each must charge its 16-byte payload on top of the buffer + block state.
+    let mut h = base_header();
+    h.data_shards = 4;
+    h.recovery_shards = 4;
+    h.frame_bytes = 64;
+    for j in 4..7u16 {
+        let mut h = h;
+        h.shard_index = j;
+        assert!(r
+            .push(&packet(h), coder.as_ref(), &stats)
+            .unwrap()
+            .is_none());
+    }
+    assert_eq!(
+        r.in_flight(),
+        64 + block_state_bytes(4, 4) + 3 * 16,
+        "held parity payloads must be part of the in-flight commitment"
+    );
+
+    // A completing frame past the loss window ages frame 0 out: the parity bytes must be
+    // credited back with the rest of its cost, or the budget drifts upward for the session.
+    let mut h = base_header();
+    h.frame_index = 1;
+    h.pts_ns = LOSS_WINDOW_NS + 1;
+    assert!(r
+        .push(&packet(h), coder.as_ref(), &stats)
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        r.in_flight(),
+        0,
+        "released frames must return every charged byte"
+    );
+}
+
 /// A header whose (data_shards, block_count) disagree with the geometry derived from its own
 /// frame_bytes is dropped — the derived-offset invariant that lets shards land directly in
 /// the frame buffer.

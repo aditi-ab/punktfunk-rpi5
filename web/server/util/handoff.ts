@@ -1,19 +1,8 @@
-// Verification for the console handoff ticket — the thing that lets `punktfunk-host ctl
-// console-url` open the console already logged in.
-//
-// Split out of the route so it is testable without an h3 event, because the failure mode here is
-// silent in the worst direction: a verifier that is too lax hands a session to anyone who can guess
-// a URL shape. The route owns the cookie; this file owns the decision.
-//
-// The ticket is minted by the host in `crates/punktfunk-host/src/ctl.rs::console_url` and both
-// sides key the HMAC with the **management token** — a 0600 file in the host's 0700 config dir.
-// That is the whole trust argument: somebody who can read it can already drive the admin API
-// directly, so proving they can read it is not a lower bar than the password, it is the same bar
-// reached a different way.
+// Verifies legacy console handoff tickets minted by pre-0.35 hosts. Current launchers open the
+// ordinary login page because putting a bearer URL in browser argv exposes it to other local users.
+// The route stays for rolling upgrades and accepts only management-token HMACs.
 
-/** How long a ticket stays valid. Long enough for a browser cold start, short enough that one seen
- * in `ps` or a shell history is already dead. Shared with the Rust side only by being documented —
- * the host does not encode an expiry, it just stamps the time. */
+/** Legacy ticket validity window, retained for rolling upgrades. */
 export const HANDOFF_TTL_MS = 60_000;
 
 export type HandoffVerdict =
@@ -93,10 +82,16 @@ export async function verifyHandoff(
 	if (!Number.isFinite(issued) || Math.abs(now - issued) > HANDOFF_TTL_MS) {
 		return { ok: false, reason: "expired" };
 	}
+	// Reserve BEFORE the first await: the event loop can interleave two redemptions of one
+	// ticket while the HMAC is in flight, and both would pass a check-then-record written the
+	// obvious way round (security-review 2026-08-31 M-1). A failed signature releases the
+	// reservation; that cannot burn someone else's ticket, because a wrong-mac guess is a
+	// different map key than the real ticket.
 	if (seen.has(ticket)) return { ok: false, reason: "replayed" };
+	seen.set(ticket, now);
 	if (!safeEqualHex(mac, await macFor(key, ts, nonce))) {
+		seen.delete(ticket);
 		return { ok: false, reason: "bad-signature" };
 	}
-	seen.set(ticket, now);
 	return { ok: true };
 }

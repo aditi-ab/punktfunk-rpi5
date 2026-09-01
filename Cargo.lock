@@ -470,23 +470,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "axum-server"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1df331683d982a0b9492b38127151e6453639cd34926eb9c07d4cd8c6d22bfc"
-dependencies = [
- "bytes",
- "either",
- "fs-err",
- "http",
- "http-body",
- "hyper",
- "hyper-util",
- "tokio",
- "tower-service",
-]
-
-[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1538,16 +1521,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8878864ba14bb86e818a412bfd6f18f9eabd4ec0f008a28e8f7eb61db532fcf9"
 dependencies = [
  "futures-core",
-]
-
-[[package]]
-name = "fs-err"
-version = "3.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b91aa448ca50d7e79433bdf3ee8d99215430d2ec02ade5aefab2a073a1822e8a"
-dependencies = [
- "autocfg",
- "tokio",
 ]
 
 [[package]]
@@ -3691,7 +3664,6 @@ dependencies = [
  "ashpd",
  "aws-lc-rs",
  "axum",
- "axum-server",
  "base64 0.23.1",
  "cbc",
  "futures-util",

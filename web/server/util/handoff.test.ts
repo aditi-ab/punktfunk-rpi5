@@ -45,6 +45,31 @@ describe("verifyHandoff", () => {
 		});
 	});
 
+	test("is single use even under CONCURRENT redemption", async () => {
+		// security-review 2026-08-31 M-1: check-then-record with an await between let two
+		// simultaneous redemptions both pass. The reservation must land before the first await.
+		const now = 1_700_000_000_000;
+		const seen = new Map<string, number>();
+		const t = await mint(KEY, now / 1000, "aabbcc");
+		const results = await Promise.all([
+			verifyHandoff(t, KEY, seen, now),
+			verifyHandoff(t, KEY, seen, now),
+		]);
+		expect(results.filter((r) => r.ok)).toHaveLength(1);
+	});
+
+	test("a failed signature releases its reservation", async () => {
+		// A bad-mac guess must not leave state that outlives the verdict; the REAL ticket (a
+		// different map key) is untouched either way and still redeems.
+		const now = 1_700_000_000_000;
+		const seen = new Map<string, number>();
+		const real = await mint(KEY, now / 1000, "aabbcc");
+		const forged = await mint("some-other-token", now / 1000, "aabbcc");
+		expect((await verifyHandoff(forged, KEY, seen, now)).ok).toBe(false);
+		expect(seen.size).toBe(0);
+		expect(await verifyHandoff(real, KEY, seen, now)).toEqual({ ok: true });
+	});
+
 	test("expires, in both directions", async () => {
 		const now = 1_700_000_000_000;
 		const t = await mint(KEY, now / 1000, "aabbcc");

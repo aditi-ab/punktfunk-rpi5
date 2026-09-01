@@ -36,6 +36,16 @@ class KnownHostStoreTest {
     }
 
     @Test
+    fun clipboardSyncDefaultsOffAndEncodesOff() {
+        // security-review 2026-08-31 M-8: a newly trusted host must not read the clipboard until
+        // the user enables it for that host — the record default, and what a fresh record writes,
+        // are both off (matching the Rust and Apple clients).
+        val h = KnownHost("10.0.0.5", 9777, "HTPC", "a".repeat(64), true)
+        assertFalse(h.clipboardSync)
+        assertFalse(JSONObject(KnownHostStore.encode(h)).getBoolean("clip"))
+    }
+
+    @Test
     fun encodedRecordCarriesTheOsChainAndLegacyRecordsReadBackEmpty() {
         val h = KnownHost("10.0.0.5", 9777, "HTPC", "a".repeat(64), true, os = "linux/fedora/bazzite")
         val j = JSONObject(KnownHostStore.encode(h))

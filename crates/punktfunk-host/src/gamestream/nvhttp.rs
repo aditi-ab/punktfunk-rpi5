@@ -36,11 +36,12 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
     let https_addr = SocketAddr::from(([0, 0, 0, 0], HTTPS_PORT));
     tracing::info!(%http_addr, %https_addr, "nvhttp listening (serverinfo + pair + launch)");
 
-    let http = axum_server::bind(http_addr).serve(router(state.clone(), false).into_make_service());
-    // HTTPS runs the handshake itself (super::tls::serve_https) so handlers see the verified peer
-    // cert as a PeerCertFingerprint extension; the post-pair endpoints gate on the paired allow-list.
+    // Both listeners run the governed acceptor (connection ceilings + header deadlines;
+    // security-review 2026-08-31 M-6). HTTPS additionally runs the handshake itself so handlers
+    // see the verified peer cert as a PeerCertFingerprint extension; the post-pair endpoints
+    // gate on the paired allow-list.
     tokio::try_join!(
-        async { http.await.context("nvhttp HTTP server") },
+        super::tls::serve_plain(http_addr, router(state.clone(), false)),
         super::tls::serve_https(https_addr, router(state, true), tls),
     )?;
     Ok(())
@@ -515,6 +516,7 @@ fn session_url_xml(st: &AppState, tag: &str) -> String {
 async fn h_pair(
     State(st): State<Arc<AppState>>,
     peer: Option<Extension<PeerCertFingerprint>>,
+    addr: Option<Extension<PeerAddr>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let uniqueid = q.get("uniqueid").cloned().unwrap_or_default();
@@ -537,8 +539,13 @@ async fn h_pair(
     let result = if phrase == Some("getservercert") {
         match (q.get("salt"), q.get("clientcert")) {
             (Some(salt), Some(cc)) => {
+                let peer_ip = addr
+                    .as_ref()
+                    .map_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |a| {
+                        (a.0).0.ip()
+                    });
                 st.pairing
-                    .getservercert(&st.identity, &uniqueid, salt, cc)
+                    .getservercert(&st.identity, &uniqueid, salt, cc, peer_ip)
                     .await
             }
             _ => Ok(pair_error_xml()),
@@ -660,7 +667,7 @@ mod tests {
             peer: Option<Extension<PeerCertFingerprint>>,
         ) -> String {
             let q = HashMap::from([("phrase".to_string(), "pairchallenge".to_string())]);
-            let resp = h_pair(State(st.clone()), peer, Query(q))
+            let resp = h_pair(State(st.clone()), peer, None, Query(q))
                 .await
                 .into_response();
             let b = axum::body::to_bytes(resp.into_body(), 64 * 1024)

@@ -1257,20 +1257,19 @@ async fn submit_pin_validates_and_requires_pending_pairing() {
             .unwrap()
     };
 
-    // Malformed PINs → 400.
+    let body = |pin: &str| {
+        format!(
+            r#"{{"pin":"{pin}","uniqueid":"dev","fingerprint":"{}","peer_ip":"127.0.0.1"}}"#,
+            "aa".repeat(32)
+        )
+    };
+    assert_eq!(send(&app, post(&body(""))).await.0, StatusCode::BAD_REQUEST);
     assert_eq!(
-        send(&app, post(r#"{"pin":""}"#)).await.0,
+        send(&app, post(&body("12ab"))).await.0,
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
-        send(&app, post(r#"{"pin":"12ab"}"#)).await.0,
-        StatusCode::BAD_REQUEST
-    );
-
-    // Well-formed but nothing waiting → 409 (a parked stale PIN would poison the
-    // next pairing attempt).
-    assert_eq!(
-        send(&app, post(r#"{"pin":"1234"}"#)).await.0,
+        send(&app, post(&body("1234"))).await.0,
         StatusCode::CONFLICT
     );
 

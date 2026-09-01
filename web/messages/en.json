@@ -262,6 +262,8 @@
 	"pairing_title": "Pairing",
 	"pairing_idle": "No pairing in progress. Start pairing from a Moonlight client, then enter its PIN here.",
 	"pairing_waiting": "A client is waiting to pair. Enter the PIN it shows:",
+	"pairing_ceremony_device": "Device {uniqueid} at {ip} — certificate …{fp}",
+	"pairing_ceremony_select": "Several clients are waiting. Pick the one whose PIN you are entering — the PIN goes only to that device:",
 	"pairing_pin_label": "PIN",
 	"pairing_submit": "Submit PIN",
 	"pairing_pin_sent": "PIN sent. If it's correct, the client finishes pairing and appears under Paired devices below.",

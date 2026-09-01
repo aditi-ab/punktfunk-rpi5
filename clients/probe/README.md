@@ -21,7 +21,7 @@ example of driving the protocol end to end: QUIC control plane, UDP data plane, 
   `--input-test` (mouse/keyboard), `--mic-test` (a 440 Hz Opus tone up to the host mic),
   `--touch-test` (a synthetic finger), `--rich-input-test` (DualSense touchpad + motion, logging the
   HID-output feedback that comes back).
-- **Trust** — `--pin <64-hex>` pins the host fingerprint; `--pair <PIN>` runs the SPAKE2 pairing
+- **Trust** — `--pin <64-hex>` pins the host fingerprint; `--pair -` (PIN on stdin) runs the SPAKE2 pairing
   ceremony and prints the verified fingerprint to pin from then on. Without a pin it trusts on first
   use.
 - **Discovery** — `--discover [secs]` browses the LAN for `_punktfunk._udp` hosts and prints each

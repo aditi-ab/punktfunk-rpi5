@@ -59,9 +59,28 @@ impl ReplayWindow {
         let (w, b) = Self::word_bit(seq);
         self.bits[w] |= b;
     }
-    fn unset(&mut self, seq: u64) {
-        let (w, b) = Self::word_bit(seq);
-        self.bits[w] &= !b;
+
+    /// Clear the slots for sequences `from..to` (exclusive), word at a time: a masked edit on the
+    /// (possibly partial) word at each step, whole-word stores in the interior. The old
+    /// bit-at-a-time clear ran up to `REPLAY_WINDOW - 1` iterations for one valid large in-window
+    /// forward jump — a bounded but pointless CPU spike an AEAD-valid peer could repeat
+    /// (security-review 2026-08-31 L-3). Callers guarantee `to - from < REPLAY_WINDOW`, so the
+    /// range spans distinct ring bits and never aliases itself, and the result is bit-for-bit the
+    /// per-sequence clear it replaces.
+    fn clear_range(&mut self, from: u64, to: u64) {
+        debug_assert!(to.saturating_sub(from) < REPLAY_WINDOW);
+        let mut s = from;
+        while s < to {
+            let bit = (s % 64) as u32; // position within this sequence's ring word
+            let run = (64 - u64::from(bit)).min(to - s); // bits cleared in this word this step
+            let mask = if run == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << run) - 1) << bit
+            };
+            self.bits[Self::word_bit(s).0] &= !mask;
+            s += run;
+        }
     }
 
     /// Record `seq`, returning `true` if it's fresh (accept) or `false` if it's a replay / too old.
@@ -79,11 +98,7 @@ impl ReplayWindow {
             if seq - self.highest >= REPLAY_WINDOW {
                 self.bits = [0; REPLAY_WORDS];
             } else {
-                let mut s = self.highest + 1;
-                while s < seq {
-                    self.unset(s);
-                    s += 1;
-                }
+                self.clear_range(self.highest + 1, seq);
             }
             self.highest = seq;
             self.set(seq);
@@ -155,6 +170,33 @@ mod tests {
         // A fresh seq aliasing 5 (mod WINDOW) but inside the new window is accepted, proving the
         // stale bit was cleared rather than mistaken for a replay.
         assert!(w.accept(far - REPLAY_WINDOW + 1));
+    }
+
+    /// A large-but-in-window forward jump clears exactly the slid-in slots word-wise: bits below
+    /// the jump stay set (still replays), a fresh seq inside the jumped span is accepted, and the
+    /// stale slot a full window before the new high reads as clear. Guards `clear_range` against
+    /// off-by-one/masking bugs the bit-at-a-time loop couldn't have (security-review 2026-08-31
+    /// L-3).
+    #[test]
+    fn large_in_window_jump_clears_word_wise() {
+        let mut w = ReplayWindow::new();
+        // Seed a scattering of low sequences (partial + whole ring words touched).
+        for seq in [0u64, 1, 63, 64, 100, 4000] {
+            assert!(w.accept(seq));
+        }
+        // Jump most of a window forward in one step — the slow path the fix targets.
+        let hi = REPLAY_WINDOW - 1;
+        assert!(w.accept(hi));
+        // A seq that slid in during the jump is fresh (its slot was cleared).
+        assert!(w.accept(50_000));
+        assert!(!w.accept(50_000), "…and now a replay");
+        // The seeded low seqs are still within the window (< REPLAY_WINDOW behind hi) and remain
+        // replays — the clear must not have touched them.
+        for seq in [1u64, 63, 64, 100, 4000] {
+            assert!(!w.accept(seq), "seeded seq {seq} must still read as seen");
+        }
+        // The high-water seq itself is never replayable.
+        assert!(!w.accept(hi));
     }
 
     #[test]

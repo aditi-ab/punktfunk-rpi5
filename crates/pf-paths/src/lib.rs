@@ -92,7 +92,9 @@ pub fn published_mgmt_port_in(dir: &std::path::Path) -> Option<u16> {
 /// by other local users via a traversable config path). On Windows, applies a restrictive DACL
 /// ([`restrict_dir_to_system_admins`]) so a local unprivileged user can't pre-create / plant files in
 /// the config tree (the default `%ProgramData%` ACL grants Users *create*; security-review
-/// 2026-06-28 #3/#11). Tightens (and re-owns) an already-existing dir too.
+/// 2026-06-28 #3/#11). Tightens (and re-owns) an already-existing dir too, and **refuses a reparse
+/// point** ([`reject_reparse_point`]): hardening a junction hardens the attacker-chosen target while
+/// the link object stays theirs (security-review 2026-08-31 W-1).
 pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -109,9 +111,14 @@ pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
+        #[cfg(windows)]
+        reject_reparse_point(dir)?;
         let r = std::fs::create_dir_all(dir);
         #[cfg(windows)]
-        restrict_dir_to_system_admins(dir, first_hardening_of(dir), true);
+        if r.is_ok() {
+            let _hold = hold_plain_directory(dir)?;
+            restrict_dir_to_system_admins(dir, first_hardening_of(dir), true);
+        }
         r
     }
 }
@@ -129,12 +136,68 @@ pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
 pub fn create_secret_dir(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        let r = std::fs::create_dir_all(dir);
+        reject_reparse_point(dir)?;
+        std::fs::create_dir_all(dir)?;
+        let _hold = hold_plain_directory(dir)?;
         restrict_dir_to_system_admins(dir, first_hardening_of(dir), false);
-        r
+        Ok(())
     }
     #[cfg(not(windows))]
     create_private_dir(dir)
+}
+
+/// Refuse a final path component that exists as a junction, symlink, or other reparse point.
+/// Directory callers also hold a no-delete handle across the subsequent ACL update.
+#[cfg(windows)]
+fn reject_reparse_point(path: &std::path::Path) -> std::io::Result<()> {
+    // FILE_ATTRIBUTE_REPARSE_POINT — hard-coded (pure-std crate, no winapi dependency).
+    const REPARSE: u32 = 0x400;
+    match std::fs::symlink_metadata(path) {
+        Ok(md) => {
+            use std::os::windows::fs::MetadataExt;
+            if md.file_attributes() & REPARSE != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} is a reparse point (junction/symlink) — refusing to use it as a \
+                         security-sensitive path",
+                        path.display()
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(windows)]
+fn handle_is_reparse(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+    const REPARSE: u32 = 0x400;
+    Ok(file.metadata()?.file_attributes() & REPARSE != 0)
+}
+
+/// Open the directory itself and deny delete-sharing while its path-based ACL update runs.
+#[cfg(windows)]
+fn hold_plain_directory(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(SHARE_READ_WRITE)
+        .custom_flags(BACKUP_SEMANTICS | OPEN_REPARSE_POINT)
+        .open(path)?;
+    if handle_is_reparse(&file)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is a reparse point", path.display()),
+        ));
+    }
+    Ok(file)
 }
 
 /// Whether this is the first hardening pass of `dir` in this process — the pass that also does the
@@ -280,6 +343,10 @@ fn restrict_dir_to_system_admins(dir: &std::path::Path, deep: bool, users_read: 
 /// read. The open handle carries our own write access across the DACL change.
 pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    // Never write a secret THROUGH a link: a pre-created junction/symlink at this path would
+    // deliver the bytes to an attacker-chosen file (security-review 2026-08-31 W-1).
+    #[cfg(windows)]
+    reject_reparse_point(path)?;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -287,7 +354,22 @@ pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Re
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+        opts.share_mode(SHARE_READ_WRITE)
+            .custom_flags(OPEN_REPARSE_POINT);
+    }
     let mut f = opts.open(path)?;
+    #[cfg(windows)]
+    if handle_is_reparse(&f)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is a reparse point", path.display()),
+        ));
+    }
     #[cfg(windows)]
     if let Err(e) = restrict_to_system_admins(path) {
         drop(f);
@@ -390,9 +472,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The unix half of the create-empty → harden → write ordering: a secret is never even briefly
-    /// group/world-readable, on the first write OR the truncate-and-rewrite one. (The Windows half —
-    /// the `icacls` step being fatal — can only be exercised on Windows.)
+    #[cfg(windows)]
+    #[test]
+    fn precreated_directory_junction_is_refused() {
+        let root = std::env::temp_dir().join(format!("pf-paths-junction-{}", std::process::id()));
+        let target = root.join("target");
+        let link = root.join("config");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&target).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J must work for a standard user");
+        assert!(create_private_dir(&link).is_err());
+        std::fs::remove_dir(&link).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Secrets stay owner-only on first write and rewrite.
     #[cfg(unix)]
     #[test]
     fn secrets_are_owner_only_on_create_and_on_rewrite() {

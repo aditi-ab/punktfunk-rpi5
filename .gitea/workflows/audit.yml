@@ -17,9 +17,8 @@
 #                   actually ships. The fix belongs in the @unom/ui package repo; flip this to
 #                   blocking after a ui release with a clean payload chain lands here.
 #   * cargo-about → license-allowlist gate over the host + driver workspaces (about.toml `accepted`);
-#                   fails if any crate carries a license outside the allowlist — the regression
-#                   guard about.toml always promised. (The Android Gradle tree has no lockfile, so
-#                   nothing scans it — see the CRA roadmap.)
+#                   fails if any crate carries a license outside the allowlist. Android dependencies
+#                   are locked and checksum-verified by Gradle in android.yml.
 #   * miri        → NON-BLOCKING interpretation of the few FFI-free leaf crates, one of them
 #                   cross-compiled to MSVC layout. Not a supply-chain scan; it lives here because
 #                   audit.yml already has exactly the shape it needs (weekly cron,

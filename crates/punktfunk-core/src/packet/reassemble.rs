@@ -232,6 +232,25 @@ fn frame_cost(f: &FrameBuf) -> usize {
             .sum::<usize>()
 }
 
+/// Move a block's held parity buffers to the pool and credit their payload bytes back to the
+/// in-flight budget — the exact mirror of the charge made when each shard was inserted. Every
+/// take-out of `BlockState::recovery` must route through here, or the budget drifts and the
+/// firewall meters only part of the allocation (security-review 2026-08-31 M-5).
+fn reclaim_parity(
+    block: &mut BlockState,
+    recovery_pool: &mut Vec<Vec<u8>>,
+    in_flight_bytes: &mut usize,
+) {
+    for slot in block.recovery.iter_mut() {
+        if let Some(rb) = slot.take() {
+            *in_flight_bytes -= rb.len();
+            if recovery_pool.len() < RECOVERY_POOL_MAX {
+                recovery_pool.push(rb);
+            }
+        }
+    }
+}
+
 /// Buffers incoming shards, recovers lost ones via FEC, and emits whole access units.
 /// Client-side only.
 pub struct Reassembler {
@@ -682,13 +701,7 @@ impl Reassembler {
                     reconstructed_shards(&f.blocks, lim.max_data_shards),
                 );
                 for block in f.blocks.values_mut() {
-                    for slot in block.recovery.iter_mut() {
-                        if let Some(rb) = slot.take() {
-                            if recovery_pool.len() < RECOVERY_POOL_MAX {
-                                recovery_pool.push(rb);
-                            }
-                        }
-                    }
+                    reclaim_parity(block, recovery_pool, in_flight_bytes);
                 }
                 if !is_probe {
                     StatsCounters::add(&stats.frames_dropped, 1);
@@ -820,9 +833,19 @@ impl Reassembler {
         } else {
             let slot = shard_index - data_shards;
             if block.recovery[slot].is_none() {
+                // A parity payload is a heap buffer sized from wire input — meter it against the
+                // same in-flight budget as the frame buffer and block state, or a max-recovery
+                // frame commits far more than the nominal `4 × max_frame_bytes` ceiling
+                // (security-review 2026-08-31 M-5). Refusal is soft: the block just can't
+                // reconstruct and the frame ages out into the ordinary loss path.
+                if *in_flight_bytes + body.len() > IN_FLIGHT_BUF_FACTOR * lim.max_frame_bytes {
+                    drop(stats);
+                    return Ok(None);
+                }
                 let mut rb = recovery_pool.pop().unwrap_or_default();
                 rb.clear();
                 rb.extend_from_slice(body);
+                *in_flight_bytes += rb.len();
                 block.recovery[slot] = Some(rb);
                 block.recovery_received += 1;
             }
@@ -846,13 +869,7 @@ impl Reassembler {
                 coder.reconstruct_into(block.recovery_shards, &mut slots, &block.have_data, &parity)
             };
             // The parity buffers are spent either way — reclaim them for the next block.
-            for slot in block.recovery.iter_mut() {
-                if let Some(rb) = slot.take() {
-                    if recovery_pool.len() < RECOVERY_POOL_MAX {
-                        recovery_pool.push(rb);
-                    }
-                }
-            }
+            reclaim_parity(block, recovery_pool, in_flight_bytes);
             block.done = true;
             match outcome {
                 Ok(()) => {
@@ -1107,13 +1124,7 @@ impl ReassemblyWindow {
                     }
                 }
                 for block in f.blocks.values_mut() {
-                    for slot in block.recovery.iter_mut() {
-                        if let Some(rb) = slot.take() {
-                            if recovery_pool.len() < RECOVERY_POOL_MAX {
-                                recovery_pool.push(rb);
-                            }
-                        }
-                    }
+                    reclaim_parity(block, recovery_pool, in_flight_bytes);
                 }
             }
             keep
