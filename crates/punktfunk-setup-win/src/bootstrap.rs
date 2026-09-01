@@ -41,6 +41,9 @@ pub fn relaunch_if_packed() -> Option<ExitCode> {
     })
 }
 
+// The one raw spawn outside `SystemRunner`: this is the self-extractor re-running itself,
+// not a plan step — no demo or test fake can stand in for it, which is what the fence guards.
+#[allow(clippy::disallowed_methods)]
 fn extract_and_run(exe: &Path, data: &[u8], payload: &[u8]) -> Result<ExitCode, String> {
     let root = fresh_root()?;
     payload::extract(payload, &root)?;
