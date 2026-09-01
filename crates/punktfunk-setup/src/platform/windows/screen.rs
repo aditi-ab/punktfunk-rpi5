@@ -437,6 +437,26 @@ mod tests {
             .contains("--allow-public-network=on"));
     }
 
+    /// WP2.2's D12 leftover: the step is reachable from Reconfigure. An upgrade derives the
+    /// public-rules row to "keep the box's setting", which leaves the trigger armed, and the
+    /// answer reaches the plan even though nothing else about the box is rewritten.
+    #[test]
+    fn reconfigure_on_a_public_network_reaches_the_network_step() {
+        let facts = WinFacts {
+            networks: public_facts().networks,
+            ..upgrade_facts()
+        };
+        let mut s = screen_of(facts, Artifact::Host);
+        assert!(!s.fresh());
+        assert!(s.steps().contains(&WizStep::Network));
+        s.set_network(NetworkAnswer::OpenPublicRules);
+        let commands = s.plan().commands();
+        assert!(commands
+            .iter()
+            .any(|c| c.contains("--allow-public-network=on")));
+        assert!(!commands.iter().any(|c| c.contains("--gamestream")));
+    }
+
     #[test]
     fn make_private_reaches_the_plan_and_switching_answers_leaves_no_stale_opt_in() {
         let mut s = screen_of(public_facts(), Artifact::Host);
