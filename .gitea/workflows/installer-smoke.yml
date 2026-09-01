@@ -250,10 +250,14 @@ jobs:
       # on libc6 >= 2.43 and Debian 13 ships 2.41, so `--client` cannot resolve on the very
       # release the host supports. That is a packaging floor to fix, not an installer bug; add
       # the leg back the day the deb builds against trixie.
+      # Two runs where a channel pin applies: `--client --channel X` makes the installer take
+      # the channel-switch flow and drop --client, so the switch happens first and the client
+      # follows the box's channel on a bare re-run (the re-run steps above prove it does).
       - name: The client installs from the same repo
         if: matrix.haveclient != ''
         run: |
-          $PF --yes --no-start --client ${{ matrix.clientchannel }}
+          test -z "${{ matrix.clientchannel }}" || $PF --yes --no-start ${{ matrix.clientchannel }}
+          $PF --yes --no-start --client
           ${{ matrix.haveclient }}
       - name: --uninstall takes the packages and the repo off again
         run: |
