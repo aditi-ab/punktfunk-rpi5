@@ -223,6 +223,42 @@ pub fn open_audio_capture(channels: u32, rate_hz: u32) -> Result<Box<dyn AudioCa
     linux::PwAudioCapturer::open(channels, rate_hz).map(|c| Box::new(c) as Box<dyn AudioCapturer>)
 }
 
+/// [`open_audio_capture`] with a caller-chosen sink `node.name` — the isolated-session path
+/// (`design/gamescope-multiuser.md`): the session pins its gamescope's apps to the name by
+/// `PULSE_SINK` and captures the same-named sink's monitor. `None` = exactly
+/// [`open_audio_capture`]. Linux-only in effect; other platforms ignore the name (isolation never
+/// mints one there).
+#[cfg(target_os = "linux")]
+pub fn open_audio_capture_named(
+    channels: u32,
+    rate_hz: u32,
+    sink: Option<&str>,
+) -> Result<Box<dyn AudioCapturer>> {
+    linux::PwAudioCapturer::open_named(channels, rate_hz, sink)
+        .map(|c| Box::new(c) as Box<dyn AudioCapturer>)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn open_audio_capture_named(
+    channels: u32,
+    rate_hz: u32,
+    _sink: Option<&str>,
+) -> Result<Box<dyn AudioCapturer>> {
+    open_audio_capture(channels, rate_hz)
+}
+
+/// Whether a per-session audio sink is possible on this host — Linux null-sink/stream-sink capture
+/// modes only. Monitor mode (and every other platform) has no host-owned sink to route a session's
+/// apps into, so an isolated session's audio half stays shared there.
+pub fn per_session_sink_possible() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::sink_capture_active()
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
 #[cfg(target_os = "windows")]
 pub fn open_audio_capture(channels: u32, rate_hz: u32) -> Result<Box<dyn AudioCapturer>> {
     // The capture thread runs the audio wiring plan itself (audio_control::wire_now) before
@@ -333,7 +369,20 @@ pub(crate) fn mic_legacy_buffer() -> bool {
 /// capture endpoint apps see as a mic) — see [`wasapi_mic`].
 #[cfg(target_os = "linux")]
 pub fn open_virtual_mic(channels: u32) -> Result<Box<dyn VirtualMic>> {
-    linux::PwMicSource::open(channels).map(|m| Box::new(m) as Box<dyn VirtualMic>)
+    open_virtual_mic_named(channels, None)
+}
+
+/// [`open_virtual_mic`] with a caller-chosen source `node.name` — the isolated-session mic
+/// (`design/gamescope-multiuser.md` — `punktfunk-mic-{id}`, matched by the gamescope spawn's
+/// `PULSE_SOURCE`). `None` = the shared `punktfunk-mic`. Other platforms ignore the name.
+#[cfg(target_os = "linux")]
+pub fn open_virtual_mic_named(channels: u32, source: Option<&str>) -> Result<Box<dyn VirtualMic>> {
+    linux::PwMicSource::open_named(channels, source).map(|m| Box::new(m) as Box<dyn VirtualMic>)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn open_virtual_mic_named(channels: u32, _source: Option<&str>) -> Result<Box<dyn VirtualMic>> {
+    open_virtual_mic(channels)
 }
 
 #[cfg(target_os = "windows")]

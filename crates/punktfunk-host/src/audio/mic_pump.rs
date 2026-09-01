@@ -107,14 +107,27 @@ impl MicPump {
     /// Start the host-lifetime pump (Linux/Windows). On platforms without a virtual-mic backend
     /// the thread just drains and drops frames (sessions still count the datagrams).
     pub fn start() -> MicPump {
+        Self::start_named(None)
+    }
+
+    /// [`start`](Self::start) with a caller-chosen source `node.name` — a SESSION-lifetime pump
+    /// for an isolated gamescope session (`design/gamescope-multiuser.md`): its own
+    /// `punktfunk-mic-{id}` source, fed only by that session's uplink, torn down when the owner
+    /// (and the datagram task's sender clone) drops. `None` = the shared `punktfunk-mic`.
+    pub fn start_named(source_name: Option<String>) -> MicPump {
         let (tx, rx) = std::sync::mpsc::sync_channel::<MicFrame>(MIC_QUEUE_CAP);
         let spawned = std::thread::Builder::new()
             .name("punktfunk-mic-pump".into())
             .spawn(move || {
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
-                pump_thread(rx, || super::open_virtual_mic(MIC_CHANNELS), PUMP_TUNING);
+                pump_thread(
+                    rx,
+                    move || super::open_virtual_mic_named(MIC_CHANNELS, source_name.as_deref()),
+                    PUMP_TUNING,
+                );
                 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 {
+                    let _ = source_name;
                     tracing::warn!("mic passthrough unsupported on this platform — frames dropped");
                     for _ in rx {}
                 }

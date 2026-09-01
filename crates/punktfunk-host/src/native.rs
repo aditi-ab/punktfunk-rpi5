@@ -114,8 +114,10 @@ pub struct Punktfunk1Options {
     pub max_sessions: u32,
     /// Maximum sessions streaming **at once** (a NVENC/GPU bound); further clients wait in the
     /// accept queue until a slot frees. Concurrent sessions each get their own virtual output +
-    /// encoder but share the host-lifetime input/audio/mic services — i.e. multiple devices viewing
-    /// (and controlling) the *same* desktop on the shared-desktop backends (kwin/mutter/wlroots).
+    /// encoder; on the shared-desktop backends (kwin/mutter/wlroots) they share the host-lifetime
+    /// input/audio/mic services — multiple devices viewing (and controlling) the *same* desktop —
+    /// while ISOLATED gamescope spawns (`design/gamescope-multiuser.md`) each carry their own
+    /// input/audio/mic plane: independent desktops, multi-user on one box.
     /// `0` = unlimited (bounded only by the GPU). Default a conservative few.
     pub max_concurrent: usize,
     /// Only serve clients whose certificate fingerprint is in the paired set. Implies
@@ -492,8 +494,9 @@ pub(crate) async fn serve(
     let opts = Arc::new(opts);
 
     // Concurrency: serve up to `max_concurrent` sessions at once. Each gets its own virtual output +
-    // NVENC encoder; they share the host-lifetime input/audio/mic services — i.e. multiple devices
-    // viewing (and controlling) the SAME desktop on the shared-desktop backends. A permit is taken
+    // NVENC encoder; shared-desktop sessions share the host-lifetime input/audio/mic services
+    // (multiple devices viewing/controlling the SAME desktop), isolated gamescope spawns bring
+    // their own per-session planes (`design/gamescope-multiuser.md`). A permit is taken
     // before accepting, so overflow clients wait in QUIC's accept backlog until a slot frees;
     // `max_concurrent == 0` means unlimited (GPU-bounded). The heavy handshake + pipeline run inside
     // the spawned task, so a slow client never blocks the accept loop.
@@ -1887,9 +1890,65 @@ async fn serve_session(
         pf_clipboard::spawn_decline_loop(conn.clone());
     }
 
+    // Session isolation (`design/gamescope-multiuser.md`): an isolated gamescope spawn gets a
+    // per-session input/audio/mic plane instead of the shared host-lifetime ones, so concurrent
+    // independent sessions never hear or drive each other. The identity is STABLE per client
+    // (cert-fingerprint prefix) — that is what lets the keep-alive registry hand a kept spawn,
+    // whose relay path + audio env are baked into its process, back to the same client on a
+    // reconnect and never to another. Minted here, after the handshake resolved the compositor +
+    // route and BEFORE the input/audio threads spawn, so every plane wires against one decision
+    // (`compositor::session_is_isolated` — the same predicate the mid-stream rebuild sites use).
+    #[cfg(target_os = "linux")]
+    let isolation: Option<crate::vdisplay::SessionIsolation> = compositor
+        .filter(|c| compositor::session_is_isolated(*c, gamescope_route.as_ref()))
+        .map(|_| {
+            // Unpaired (`--open`) clients have no fingerprint; a per-accept sequence keeps them
+            // isolated from each other at the cost of keep-alive reuse across reconnects.
+            static ANON_SEQ: AtomicU64 = AtomicU64::new(0);
+            let id = session_fp_hex
+                .as_deref()
+                .map(|fp| fp[..fp.len().min(8)].to_string())
+                .unwrap_or_else(|| format!("anon{}", ANON_SEQ.fetch_add(1, Ordering::Relaxed)));
+            // Monitor-mode capture has no per-session sink to route to — the audio plane then
+            // stays shared (input/mic still isolate).
+            let sink = crate::audio::per_session_sink_possible()
+                .then(|| format!("punktfunk-speaker-iso-{id}"));
+            let mic_source = Some(format!("punktfunk-mic-{id}"));
+            tracing::info!(%id, sink = sink.as_deref().unwrap_or("-"),
+                "isolated gamescope session — per-session input/audio/mic planes");
+            crate::vdisplay::SessionIsolation::new(id, sink, mic_source)
+        });
+    // The session's own pinned injector (lazy-open against its relay file) + the swappable route
+    // the input thread sends through. Both live to the end of this function = the session's end;
+    // dropping the service ends its thread and closes the EIS connection.
+    #[cfg(target_os = "linux")]
+    let session_injector = isolation
+        .as_ref()
+        .map(|i| crate::inject::InjectorService::start_at(i.ei_relay.clone()));
+    #[cfg(target_os = "linux")]
+    let inj_session_tx = session_injector.as_ref().map(|s| s.sender());
+    #[cfg(target_os = "linux")]
+    let input_route = input::InputRoute::new(match &inj_session_tx {
+        Some(tx) => tx.clone(),
+        None => inj_tx.clone(),
+    });
+    #[cfg(not(target_os = "linux"))]
+    let input_route = input::InputRoute::new(inj_tx.clone());
+    // The isolated session's own mic pump + virtual source (`punktfunk-mic-{id}`), replacing the
+    // shared host-lifetime one for THIS session's 0xCB uplink. Dropped (with the datagram task's
+    // sender) at session end, which tears the source down.
+    #[cfg(target_os = "linux")]
+    let session_mic = isolation
+        .as_ref()
+        .and_then(|i| i.mic_source.clone())
+        .map(|name| crate::audio::MicPump::start_named(Some(name)));
+    #[cfg(target_os = "linux")]
+    let mic_tx = session_mic.as_ref().map(|p| p.sender()).unwrap_or(mic_tx);
+
     // Input plane: QUIC datagrams → channel → a native per-session thread. Pointer/keyboard
-    // events are forwarded to the host-lifetime [`InjectorService`] (`inj_tx`) so the portal
-    // grant persists across sessions; this thread owns the session's virtual gamepads (uinput,
+    // events are forwarded to the session's injector target (`input_route` — the shared
+    // host-lifetime [`InjectorService`] so the portal grant persists across sessions, or an
+    // isolated session's own pinned one); this thread owns the session's virtual gamepads (uinput,
     // per-session) and sends force feedback back over `conn`. It exits when the channel closes
     // (datagram task ends on disconnect) — fresh gamepad state per session.
     //
@@ -1930,7 +1989,10 @@ async fn serve_session(
         let grants = session_grants.clone();
         std::thread::Builder::new()
             .name("punktfunk1-input".into())
-            .spawn(move || input_thread(input_rx, conn, inj_tx, gamepad, pad_audio_on, grants))
+            .spawn({
+                let input_route = input_route.clone();
+                move || input_thread(input_rx, conn, input_route, gamepad, pad_audio_on, grants)
+            })
             .context("spawn input thread")?
     };
     // One reader for ALL client→host datagrams, demuxed by magic byte (two read_datagram loops
@@ -2119,9 +2181,15 @@ async fn serve_session(
         // process configuration and a live connection property, neither of which is guaranteed
         // to answer the same way twice.
         let audio_plane = handshake::AudioPlane::from_welcome(&welcome);
+        // An isolated session's audio captures its OWN named sink (`design/gamescope-multiuser.md`);
+        // `None` (every other session, and monitor-mode hosts) is the shared path unchanged.
+        #[cfg(target_os = "linux")]
+        let iso_sink = isolation.as_ref().and_then(|i| i.sink.clone());
+        #[cfg(not(target_os = "linux"))]
+        let iso_sink = None;
         std::thread::Builder::new()
             .name("punktfunk1-audio".into())
-            .spawn(move || audio_thread(conn, stop, cap, channels, budget, audio_plane))
+            .spawn(move || audio_thread(conn, stop, cap, channels, budget, audio_plane, iso_sink))
             .map_err(|e| tracing::warn!(error = %e, "audio thread spawn failed — session continues without audio"))
             .ok()
     } else {
@@ -2370,6 +2438,16 @@ async fn serve_session(
     // stages ride the same per-session trace; resizes write their totals into the shared slot.
     let bringup_dp = bringup.clone();
     let resize_ms_dp = resize_ms.clone();
+    // Isolation handles for the data plane (the stream thread re-points input across mid-stream
+    // compositor switches and hands the identity to every backend it opens).
+    #[cfg(target_os = "linux")]
+    let isolation_dp = isolation.clone();
+    #[cfg(target_os = "linux")]
+    let input_route_dp = input_route.clone();
+    #[cfg(target_os = "linux")]
+    let inj_shared_tx_dp = inj_tx.clone();
+    #[cfg(target_os = "linux")]
+    let inj_session_tx_dp = inj_session_tx.clone();
     // The address the control connection arrived on, for the data plane's source-address check
     // below — the one comparison that distinguishes "the client is filtering our video" from
     // "the video never left". Captured here because the send loop runs on a blocking thread.
@@ -2533,6 +2611,14 @@ async fn serve_session(
                         resize_ms: resize_ms_dp,
                         #[cfg(target_os = "linux")]
                         input_tx: input_tx_stream,
+                        #[cfg(target_os = "linux")]
+                        isolation: isolation_dp,
+                        #[cfg(target_os = "linux")]
+                        input_route: input_route_dp,
+                        #[cfg(target_os = "linux")]
+                        inj_shared_tx: inj_shared_tx_dp,
+                        #[cfg(target_os = "linux")]
+                        inj_session_tx: inj_session_tx_dp,
                     };
                     match prep {
                         // P1.1: the display prep started at Welcome on its own thread — hand it

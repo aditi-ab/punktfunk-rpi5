@@ -184,6 +184,12 @@ pub(super) fn audio_thread(
     channels: u8,
     budget: punktfunk_core::audio::AudioBudget,
     plane: super::handshake::AudioPlane,
+    // An ISOLATED session's own sink name (`design/gamescope-multiuser.md`): capture opens against
+    // this exact sink (the one the session's gamescope apps are `PULSE_SINK`-pinned to) and stays
+    // out of the shared park slot entirely — a parked shared capturer has the wrong sink, and a
+    // parked isolated one would hand this session's name to the next session. `None` = the shared
+    // path, byte-for-byte today's behavior. Linux-only in effect.
+    sink: Option<String>,
 ) {
     use crate::audio::SAMPLE_RATE;
     const FRAME_MS: usize = 5;
@@ -276,14 +282,21 @@ pub(super) fn audio_thread(
     // the WASAPI activate — 0x80070002 mid-re-registration), so it enters the same
     // reopen-with-backoff loop a mid-session capture death does; audio then starts a few seconds
     // late instead of never.
-    let capturer = match audio_cap.lock().unwrap().take() {
+    // An isolated session never adopts the parked shared capturer (the channel/rate test below
+    // cannot see that it captures the WRONG sink) — it opens its own, named.
+    let cached = if sink.is_none() {
+        audio_cap.lock().unwrap().take()
+    } else {
+        None
+    };
+    let capturer = match cached {
         Some(mut c) if c.channels() == want as u32 && c.sample_rate() == rate_hz => {
             c.drain(); // discard audio captured between sessions (also re-claims routing)
             Some(c)
         }
         prev => {
             drop(prev); // wrong channel count/rate (or none): clean teardown, open fresh
-            match crate::audio::open_audio_capture(want as u32, rate_hz) {
+            match crate::audio::open_audio_capture_named(want as u32, rate_hz, sink.as_deref()) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "punktfunk/1 audio failed to open — retrying in the background until it comes up");
@@ -464,7 +477,7 @@ pub(super) fn audio_thread(
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 continue;
             }
-            match crate::audio::open_audio_capture(want as u32, rate_hz) {
+            match crate::audio::open_audio_capture_named(want as u32, rate_hz, sink.as_deref()) {
                 Ok(c) => {
                     tracing::info!("punktfunk/1 audio capture reopened");
                     capturer = Some(c);
@@ -890,10 +903,14 @@ pub(super) fn audio_thread(
     }
     // Park the live capturer for the next session (None if it died and never reopened),
     // releasing its session-scoped routing claim (Linux: the default sink moves back;
-    // Windows: dropped, restoring the operator's default playback device).
+    // Windows: dropped, restoring the operator's default playback device). An ISOLATED capturer
+    // is dropped instead of parked — its sink name belongs to this session's identity, and a
+    // later shared session adopting it would capture a sink nothing routes to.
     if let Some(mut c) = capturer {
         c.idle();
-        crate::audio::park_audio_capture(&audio_cap, c);
+        if sink.is_none() {
+            crate::audio::park_audio_capture(&audio_cap, c);
+        }
     }
 }
 
@@ -907,6 +924,7 @@ pub(super) fn audio_thread(
     _channels: u8,
     _budget: punktfunk_core::audio::AudioBudget,
     _plane: super::handshake::AudioPlane,
+    _sink: Option<String>,
 ) {
     tracing::warn!("punktfunk/1 audio requires Linux or Windows — session continues without it");
 }

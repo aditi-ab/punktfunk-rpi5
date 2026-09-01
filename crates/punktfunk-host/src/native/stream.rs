@@ -1528,6 +1528,46 @@ pub(super) struct SessionContext {
     /// uses it to PARK the seat pointer on the streamed surface (see [`park_pointer`]).
     #[cfg(target_os = "linux")]
     pub(super) input_tx: std::sync::mpsc::SyncSender<super::input::ClientInput>,
+    /// This session's isolation identity (`design/gamescope-multiuser.md`), minted by
+    /// `serve_session` for an isolated gamescope spawn; handed to the backend instance beside the
+    /// route at every open (initial build + both mid-stream rebuild sites). `None` = shared planes.
+    #[cfg(target_os = "linux")]
+    pub(super) isolation: Option<crate::vdisplay::SessionIsolation>,
+    /// The input thread's swappable injector target — re-pointed by the mid-stream rebuild sites
+    /// (pinned ⇄ shared) as the session's compositor/route changes. See [`super::input::InputRoute`].
+    #[cfg(target_os = "linux")]
+    pub(super) input_route: super::input::InputRoute,
+    /// The shared host-lifetime injector's sender (what a non-isolated target re-points to).
+    #[cfg(target_os = "linux")]
+    pub(super) inj_shared_tx: std::sync::mpsc::Sender<punktfunk_core::input::InputEvent>,
+    /// The session's own pinned injector's sender, when isolated (what an isolated target
+    /// re-points back to after a Desktop detour). The service itself is owned by `serve_session`.
+    #[cfg(target_os = "linux")]
+    pub(super) inj_session_tx: Option<std::sync::mpsc::Sender<punktfunk_core::input::InputEvent>>,
+}
+
+/// Point the session's input at the injector that matches its (re-)resolved compositor + route
+/// (`design/gamescope-multiuser.md`): an ISOLATED gamescope spawn gets its own pinned injector's
+/// sender and deliberately does NOT touch the published shared backend (last-write-wins — a
+/// retarget would steal input from concurrent shared-desktop viewers); everything else gets the
+/// shared service's sender plus today's `set_backend_id` publish so the shared injector follows
+/// the switch. Called at every mid-stream re-resolve; the initial wiring is `serve_session`'s
+/// (same predicate, so they cannot disagree).
+#[cfg(target_os = "linux")]
+fn repoint_session_input(
+    input_route: &super::input::InputRoute,
+    shared: &std::sync::mpsc::Sender<punktfunk_core::input::InputEvent>,
+    session: Option<&std::sync::mpsc::Sender<punktfunk_core::input::InputEvent>>,
+    compositor: crate::vdisplay::Compositor,
+    route: Option<&crate::vdisplay::GamescopeRoute>,
+) {
+    match session.filter(|_| super::compositor::session_is_isolated(compositor, route)) {
+        Some(tx) => input_route.set(tx.clone()),
+        None => {
+            input_route.set(shared.clone());
+            crate::inject::set_backend_id(crate::vdisplay::input_backend_id(compositor));
+        }
+    }
 }
 
 /// Park the seat pointer at the centre of the streamed surface, through the SAME injection path
@@ -1768,6 +1808,14 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         resize_ms,
         #[cfg(target_os = "linux")]
         input_tx,
+        #[cfg(target_os = "linux")]
+        isolation,
+        #[cfg(target_os = "linux")]
+        input_route,
+        #[cfg(target_os = "linux")]
+        inj_shared_tx,
+        #[cfg(target_os = "linux")]
+        inj_session_tx,
     } = ctx;
     // Only the Linux paths (`launch_is_nested`, `set_gamescope_route`) read it; gamescope does not
     // exist on Windows, where every one of those call sites is cfg'd out.
@@ -1974,6 +2022,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             // second connect (or the switch watcher below) could overwrite before this `create`.
             #[cfg(not(target_os = "windows"))]
             vd.set_gamescope_route(gamescope_route.clone());
+            // …and the isolation identity beside it (`design/gamescope-multiuser.md`): the spawn
+            // reads both off the instance.
+            #[cfg(target_os = "linux")]
+            vd.set_session_isolation(isolation.clone());
             // IDD-push reconnect preempt (the dance now lives in the manager, Goal-1 §2.5):
             // serialize setup so a reconnect FLOOD can't run concurrent monitor create/teardown,
             // STOP the prior session + WAIT for it to release its monitor (instead of tearing a
@@ -2574,9 +2626,20 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     compositor_pid: None,
                 });
                 // A mid-stream Game↔Desktop switch is not a fresh dedicated launch — route input at the
-                // switched-to backend's normal sub-mode.
-                crate::inject::set_backend_id(crate::vdisplay::input_backend_id(sw.compositor));
+                // switched-to backend's normal sub-mode. The route resolves first because the
+                // input target depends on it: an isolated spawn keeps its own pinned injector and
+                // leaves the shared slot alone (see `repoint_session_input`).
                 let switched_route = crate::vdisplay::resolve_gamescope_route(sw.compositor, false);
+                #[cfg(target_os = "linux")]
+                repoint_session_input(
+                    &input_route,
+                    &inj_shared_tx,
+                    inj_session_tx.as_ref(),
+                    sw.compositor,
+                    switched_route.as_ref(),
+                );
+                #[cfg(not(target_os = "linux"))]
+                crate::inject::set_backend_id(crate::vdisplay::input_backend_id(sw.compositor));
                 // Switching INTO a desktop mid-stream: the xdg portal / systemd-user env may still
                 // point at the old session, so input would silently not land until a reconnect.
                 // Settle it (env push + KWin portal restart) before the injector reopens against it.
@@ -2593,8 +2656,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         let mut new_vd = crate::vdisplay::open(sw.compositor)?;
                         // The switch re-resolved the sub-mode; give it to the NEW instance, the
                         // same way the initial build does. Without this the rebuilt backend would
-                        // have no route and fall through to a bare spawn.
+                        // have no route and fall through to a bare spawn. The isolation identity
+                        // travels with it (a switch back to the spawn must land on the SAME relay
+                        // path/sink the session's pinned injector and audio watch).
                         new_vd.set_gamescope_route(switched_route.clone());
+                        #[cfg(target_os = "linux")]
+                        new_vd.set_session_isolation(isolation.clone());
                         let pipe = build_pipeline_with_retry(
                             &mut new_vd,
                             cur_mode,
@@ -3525,8 +3592,19 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         if let Some(c) = crate::vdisplay::compositor_for_kind(active.kind) {
                             crate::vdisplay::apply_session_env(&active);
                             // Capture-loss rebuild follows the live box session, not a fresh dedicated launch.
-                            crate::inject::set_backend_id(crate::vdisplay::input_backend_id(c));
+                            // Route first: the input target depends on it (an isolated spawn keeps
+                            // its pinned injector and leaves the shared slot alone).
                             let rebuilt_route = crate::vdisplay::resolve_gamescope_route(c, false);
+                            #[cfg(target_os = "linux")]
+                            repoint_session_input(
+                                &input_route,
+                                &inj_shared_tx,
+                                inj_session_tx.as_ref(),
+                                c,
+                                rebuilt_route.as_ref(),
+                            );
+                            #[cfg(not(target_os = "linux"))]
+                            crate::inject::set_backend_id(crate::vdisplay::input_backend_id(c));
                             if c != compositor {
                                 if matches!(
                                     c,
@@ -3582,6 +3660,8 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                             // compositor switch, or the existing one when the backend is unchanged.
                             // Skipping this would leave the rebuilt display on a bare spawn.
                             vd.set_gamescope_route(rebuilt_route.clone());
+                            #[cfg(target_os = "linux")]
+                            vd.set_session_isolation(isolation.clone());
                         }
                     }
                     let _probe = (loss_at.elapsed() < PROBE_HOLDOFF)

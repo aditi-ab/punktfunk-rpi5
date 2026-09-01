@@ -70,6 +70,12 @@ pub struct GamescopeDisplay {
     /// the decision and this session's `create`. `None` = nothing resolved it (a caller that never
     /// ran `resolve_gamescope_route`); `create` then falls through to the bare spawn, the safe default.
     route: Option<crate::GamescopeRoute>,
+    /// This session's isolation identity (`design/gamescope-multiuser.md` — an independent
+    /// multi-user spawn), set via [`VirtualDisplay::set_session_isolation`]. Same per-instance
+    /// discipline as `route`. Only the bare-spawn path consumes it: the `LIBEI_SOCKET` relay goes
+    /// to its per-session file and the nested apps' audio is routed by env; managed/attach are
+    /// single-occupant by nature and keep the shared planes.
+    isolation: Option<crate::SessionIsolation>,
     /// The topology-restore action the bare-spawn `create` prepared under `Topology::Exclusive` —
     /// the release of this display's [`crate::panel_dpms`] darken hold — pending pickup by the
     /// registry via [`VirtualDisplay::take_topology_restore`], so it runs at the display's
@@ -590,6 +596,17 @@ impl VirtualDisplay for GamescopeDisplay {
         self.route = route;
     }
 
+    fn set_session_isolation(&mut self, iso: Option<crate::SessionIsolation>) {
+        self.isolation = iso;
+    }
+
+    fn isolation_key(&self) -> Option<String> {
+        // Part of the registry reuse key (like `launch_command`/`hdr`): a kept isolated spawn has
+        // its session's relay path and PULSE_SINK/PULSE_SOURCE baked into its env, so only the
+        // same identity may ever get it back.
+        self.isolation.as_ref().map(|i| i.id.clone())
+    }
+
     fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
         // The DPMS darken-hold release the bare-spawn `create` registered (Exclusive topology
         // only). The registry stores it on this display's entry and runs it at teardown — which,
@@ -746,8 +763,9 @@ impl VirtualDisplay for GamescopeDisplay {
         }
         // A5: a per-spawn instance id addresses this spawn's log + node discovery, so two coexisting
         // bare-spawns (a kept lingering one + a fresh one) never parse each other's node id from a
-        // shared log. The nested-command's LIBEI relay stays on the global path (per-instance input
-        // isolation is `design/gamescope-multiuser.md` scope, not addressed here).
+        // shared log. An ISOLATED session (`design/gamescope-multiuser.md`) additionally gets its
+        // own LIBEI relay file + env-routed audio via `self.isolation`; a non-isolated spawn keeps
+        // the global relay path (the shared injector and the GameStream plane read it).
         let inst = SPAWN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let log = spawn_log_path(inst);
         let child = spawn(
@@ -757,10 +775,16 @@ impl VirtualDisplay for GamescopeDisplay {
             app,
             &log,
             self.hdr,
+            self.isolation.as_ref(),
         )?;
         let mut proc = GamescopeProc {
             child,
             log: log.clone(),
+            relay: self
+                .isolation
+                .as_ref()
+                .map(|i| i.ei_relay.clone())
+                .unwrap_or_else(ei_socket_file),
         };
         // gamescope creates its PipeWire node a moment after start; poll for it (the proc is held
         // alive meanwhile, and killed if we give up). Discovery reads THIS spawn's log, the
@@ -5606,6 +5630,7 @@ fn spawn(
     app: Option<String>,
     log: &std::path::Path,
     hdr: bool,
+    iso: Option<&crate::SessionIsolation>,
 ) -> Result<Child> {
     // A real app was requested (vs. the `sleep infinity` keep-alive) — used to scope the game-only
     // cursor-grab flag below.
@@ -5615,7 +5640,11 @@ fn spawn(
     // Steam is Big Picture — the identity gamescope's `--steam` mode is built around — instead of
     // the desktop client window.
     let app = shape_dedicated_command(&app);
-    let relay = ei_socket_file();
+    // Isolated session (`design/gamescope-multiuser.md`): the relay goes to this session's own
+    // file so a concurrent spawn can't overwrite the socket name its pinned injector reads.
+    let relay = iso
+        .map(|i| i.ei_relay.clone())
+        .unwrap_or_else(ei_socket_file);
     let _ = std::fs::remove_file(&relay); // stale socket path from a previous session
                                           // Enable gamescope's Steam integration (`--steam`: in-game overlay, Steam+X shortcuts, gamepad-UI
                                           // navigation) whenever we're launching Steam — the operator no longer has to set the global
@@ -5644,6 +5673,19 @@ fn spawn(
     cmd.args(["sh", "-c", &script, "sh"]);
     if let Some(exe) = &splash_exe {
         cmd.arg(exe);
+    }
+    // Isolated session: pin the nested apps' audio to this session's own sink/mic by env
+    // (pipewire-pulse honors both, and Proton/SDL titles speak Pulse). An env-pinned stream does
+    // not follow default-sink churn, which is what keeps a concurrent session's default claim from
+    // pulling this session's game audio over. Streams the env can't reach (a rare direct-PipeWire
+    // client picking its own target) fall to the claimed default — the shared-audio behavior.
+    if let Some(iso) = iso {
+        if let Some(sink) = &iso.sink {
+            cmd.env("PULSE_SINK", sink);
+        }
+        if let Some(src) = &iso.mic_source {
+            cmd.env("PULSE_SOURCE", src);
+        }
     }
     cmd.args(app.split_whitespace())
         // Prefer the NVIDIA GL vendor for the nested session (harmless on a pure-NVIDIA box).
@@ -5700,15 +5742,18 @@ fn nested_wrapper_script(relay: &std::path::Path, with_splash: bool) -> String {
 struct GamescopeProc {
     child: Child,
     log: std::path::PathBuf,
+    /// The relay file THIS spawn's wrapper wrote — the global path, or the session's per-instance
+    /// one when isolated — so teardown clears its own file and never a concurrent session's.
+    relay: std::path::PathBuf,
 }
 
 impl Drop for GamescopeProc {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        // Clear the relayed EIS socket name so the host-lifetime injector can't reconnect to this
-        // now-dead session's socket between sessions (the stale path is the "Connection refused").
-        let _ = std::fs::remove_file(ei_socket_file());
+        // Clear the relayed EIS socket name so an injector can't reconnect to this now-dead
+        // session's socket between sessions (the stale path is the "Connection refused").
+        let _ = std::fs::remove_file(&self.relay);
         // Drop this spawn's per-instance log (A5) so `$XDG_RUNTIME_DIR` doesn't accumulate them.
         let _ = std::fs::remove_file(&self.log);
     }

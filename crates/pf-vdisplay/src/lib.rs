@@ -58,7 +58,7 @@ pub(crate) fn emit_display_event(ev: DisplayEvent) {
 /// stable for the ~30 external call sites.
 #[path = "vdisplay/backend.rs"]
 pub(crate) mod backend;
-pub use backend::{DisplayOwnership, VirtualDisplay, VirtualOutput};
+pub use backend::{DisplayOwnership, SessionIsolation, VirtualDisplay, VirtualOutput};
 /// The NEGOTIATED ScreenCast cursor mode of a portal-backed output, reported per session by
 /// [`VirtualDisplay::last_portal_cursor_mode`]. (The module itself stays private — the ladder that
 /// picks the mode is this crate's business; the verdict is the caller's.)
