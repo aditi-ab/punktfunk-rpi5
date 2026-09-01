@@ -1,0 +1,54 @@
+# Engine tests on real Windows. The Linux/macOS lanes run this suite too, but they cannot see
+# Windows-only failure modes — the first real run caught three (backslash joins leaking into
+# transcripts, autocrlf corrupting the golden fixtures, console's Windows-only encode_unicode
+# dep breaking type inference). This lane is cheap on purpose: pure Rust, no WDK, no FFmpeg,
+# no Inno — everything it needs is baked into the runner image, so there is deliberately no
+# ensure-windows-toolchain step (that script fetches FFmpeg trees this crate never links).
+name: setup-windows
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/punktfunk-setup/**"
+      - "data/platforms.json"
+      - ".gitea/workflows/setup-windows.yml"
+  pull_request:
+    paths:
+      - "crates/punktfunk-setup/**"
+      - "data/platforms.json"
+      - ".gitea/workflows/setup-windows.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  SCCACHE_BUCKET: unom-ci-sccache
+  SCCACHE_ENDPOINT: https://storage.unom.io
+  SCCACHE_REGION: home-central
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # Same fork backstop as windows-client.yml: this persistent host-mode runner also handles
+  # release signing, so fork-PR code stays off it (fails open for same-repo PRs).
+  test:
+    runs-on: windows-amd64
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.fork != true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Test, lint, format
+        shell: pwsh
+        run: |
+          # Own short target dir: dodges MAX_PATH under the runner's deep workdir and never
+          # collides with the client/host trees in C:\t / C:\t-a64.
+          $env:CARGO_TARGET_DIR = 'C:\t-setup'
+          cargo test -p punktfunk-setup
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cargo clippy -p punktfunk-setup --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cargo fmt -p punktfunk-setup -- --check
+          if ($LASTEXITCODE -ne 0) { exit 1 }

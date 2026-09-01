@@ -5,7 +5,10 @@
 //! which is the "TUI panics on a real terminal" class no in-process test can reach.
 //!
 //! It drives `--demo`, so nothing it runs can touch the machine: demo mode hands the plan a
-//! runner that cannot spawn. Runs on the Linux and macOS test lanes alike.
+//! runner that cannot spawn. Runs on the Linux and macOS lanes; unix-only, because the TUI
+//! through a real pty is a unix contract — ConPTY re-encodes the stream and the reads hang.
+//! The Windows face is the WinUI wizard; its silent path gets its own smoke (WP2.4).
+#![cfg(unix)]
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
