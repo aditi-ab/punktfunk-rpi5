@@ -689,6 +689,7 @@ fn encode_one(
         None => None,
     };
     let frame = CapturedFrame {
+        provenance: Default::default(),
         width: req.width,
         height: req.height,
         pts_ns: req.pts_ns,

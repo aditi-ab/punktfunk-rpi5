@@ -101,14 +101,17 @@ impl CursorPoller {
     /// pointer was clipped to the OLD rect and offset by a stale origin. Re-querying on the poll
     /// thread is what keeps the CCD call off the capture/encode thread, which is the whole reason
     /// this poller exists (see `DescriptorPoller`).
-    pub(super) fn spawn(target_id: u32, rect: (i32, i32, i32, i32)) -> Self {
+    pub(super) fn spawn(
+        ccd: pf_win_display::win_display::CcdTargetKey,
+        rect: (i32, i32, i32, i32),
+    ) -> Self {
         let slot: Arc<Mutex<Option<pf_frame::CursorOverlay>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let secure = Arc::new(AtomicBool::new(false));
         let (slot_t, stop_t, secure_t) = (slot.clone(), stop.clone(), secure.clone());
         let thread = std::thread::Builder::new()
             .name("pf-cursor-poll".into())
-            .spawn(move || run(target_id, rect, &slot_t, &stop_t, &secure_t))
+            .spawn(move || run(ccd, rect, &slot_t, &stop_t, &secure_t))
             .ok();
         if thread.is_none() {
             tracing::warn!("cursor poller thread spawn failed — cursor falls back to driver shm");
@@ -149,7 +152,7 @@ impl Drop for CursorPoller {
 
 /// The poll loop. Owns the thread's input-desktop binding and the shape cache.
 fn run(
-    target_id: u32,
+    ccd: pf_win_display::win_display::CcdTargetKey,
     mut rect: (i32, i32, i32, i32),
     slot: &Mutex<Option<pf_frame::CursorOverlay>>,
     stop: &AtomicBool,
@@ -185,11 +188,11 @@ fn run(
             // against, and this poller outlives all of them. `None` keeps the last good value — a
             // transient CCD failure must not park the pointer at a `(0, 0, 0, 0)` rect, which would
             // report every position invisible.
-            let fresh = pf_win_display::win_display::source_desktop_rect(target_id);
+            let fresh = pf_win_display::win_display::source_desktop_rect(ccd);
             if let Some(fresh) = fresh {
                 if fresh != rect {
                     tracing::info!(
-                        target_id,
+                        target = %ccd,
                         from = ?rect,
                         to = ?fresh,
                         "cursor poller: target desktop rect changed — re-basing pointer positions"
@@ -239,7 +242,7 @@ fn run(
                 if let (Some(now), Some(s)) = (cursor_extent(ci.hCursor), shape.as_ref()) {
                     if now != (s.w, s.h) {
                         tracing::info!(
-                            target_id,
+                            target = %ccd,
                             "cursor: the pointer bitmap resized under a stable handle \
                              ({}x{} -> {}x{}) — re-rasterising (the scale under the pointer moved)",
                             s.w,
@@ -274,7 +277,7 @@ fn run(
                     if !logged_live {
                         logged_live = true;
                         tracing::info!(
-                            target_id,
+                            target = %ccd,
                             "cursor poller live — GDI shape source publishing (serial 1: {w}x{h})"
                         );
                     }

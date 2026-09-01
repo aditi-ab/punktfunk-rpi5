@@ -2408,6 +2408,7 @@ mod tests {
             px.copy_from_slice(&fill);
         }
         CapturedFrame {
+            provenance: Default::default(),
             width: w,
             height: h,
             pts_ns,
@@ -2646,6 +2647,7 @@ mod tests {
             p.copy_from_slice(&px);
         }
         CapturedFrame {
+            provenance: Default::default(),
             width: w,
             height: h,
             pts_ns,
@@ -2904,6 +2906,7 @@ mod tests {
             }
         }
         CapturedFrame {
+            provenance: Default::default(),
             width: w,
             height: h,
             pts_ns: seed as u64 * 16_666_667,

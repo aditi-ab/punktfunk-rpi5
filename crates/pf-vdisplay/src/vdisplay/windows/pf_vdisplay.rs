@@ -1810,13 +1810,12 @@ mod tests {
             })
             .expect("in-place resize acquire");
         let resize_ms = t0.elapsed().as_millis();
-        let t2 = second
-            .win_capture
-            .as_ref()
-            .expect("no capture target")
-            .target_id;
+        let wc2 = second.win_capture.as_ref().expect("no capture target");
+        let t2 = wc2.target_id;
         let in_place = t1 == t2;
-        let active = pf_win_display::win_display::active_resolution(t2);
+        let active = pf_win_display::win_display::active_resolution(
+            pf_win_display::win_display::CcdTargetKey::new(wc2.adapter_luid, wc2.target_id),
+        );
         println!(
             "in-place resize spike: in_place={in_place} (target {t1} -> {t2}) took {resize_ms} ms, \
              active resolution now {active:?}"

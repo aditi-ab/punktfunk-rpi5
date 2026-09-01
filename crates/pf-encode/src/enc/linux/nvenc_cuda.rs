@@ -2896,6 +2896,7 @@ mod tests {
         pf_zerocopy::cuda::write_plane_from_host(uv_ptr, uv_pitch, &uv, w as usize, h as usize / 2)
             .expect("upload UV plane");
         CapturedFrame {
+            provenance: Default::default(),
             width: w,
             height: h,
             pts_ns: i as u64 * 16_666_667,
@@ -2910,6 +2911,7 @@ mod tests {
         // session/registration/encode/RFI machinery, not picture fidelity (that's the on-glass A/B).
         let buf = DeviceBuffer::alloc_nv12(w, h).expect("alloc NV12 device buffer");
         CapturedFrame {
+            provenance: Default::default(),
             width: w,
             height: h,
             pts_ns: i as u64 * 16_666_667,
@@ -3048,6 +3050,7 @@ mod tests {
     fn rgb10_frame(w: u32, h: u32, i: u32) -> CapturedFrame {
         let buf = DeviceBuffer::alloc(w, h).expect("alloc packed RGB device buffer");
         CapturedFrame {
+            provenance: Default::default(),
             width: w,
             height: h,
             pts_ns: i as u64 * 16_666_667,
@@ -3237,6 +3240,7 @@ mod tests {
         for i in 0..6u32 {
             let buf = DeviceBuffer::alloc_yuv444(W, H).expect("alloc YUV444 device buffer");
             let frame = CapturedFrame {
+                provenance: Default::default(),
                 width: W,
                 height: H,
                 pts_ns: i as u64 * 16_666_667,

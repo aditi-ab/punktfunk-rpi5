@@ -277,11 +277,11 @@ pub struct HostConfig {
     pub vdisplay: Option<String>,
     /// `PUNKTFUNK_STALL_PROBES` — run the Windows IDD-push capture's micro-probe engine (per-GPU
     /// fence probes, DWM tick/flush watchdogs, scanline + CPU sentinels — `idd_push/probes.rs`),
-    /// the corroborating evidence legs on every stall report. Default ON while the
-    /// interval-stutter field program runs; explicit-off grammar for perf-sensitive boxes — the
-    /// engine costs standing threads (a blocking `DwmFlush` waiter, ~10 Hz fence copies per GPU,
-    /// a 5 ms-cadence CPU sentinel). Off, stall lines still carry the driver telemetry + the ETW
-    /// present/queue discriminator (cheap, session-filtered); only the probe legs read absent.
+    /// the corroborating evidence legs on every stall report. Default OFF (immunity plan WP3:
+    /// standing fence/scanline/DWM traffic alters the hottest path while diagnosing it — an
+    /// observer effect the disturbance reports must not carry by default); `=1` opts a box under
+    /// diagnosis in. Off, stall lines still carry the driver telemetry + the ETW present/queue
+    /// discriminator (cheap, session-filtered); only the probe legs read absent.
     pub stall_probes: bool,
     /// `PUNKTFUNK_GAMESCOPE_STEAM` — force the bare headless gamescope spawn into its Steam
     /// integration mode (`--steam`) for EVERY launch. A Steam title auto-enables `--steam` on its
@@ -471,8 +471,8 @@ impl HostConfig {
             // this. See the field doc for why it stopped being opt-in).
             audio_hires: env_on("PUNKTFUNK_AUDIO_HIRES").unwrap_or(true),
             perf: flag("PUNKTFUNK_PERF"),
-            // Default ON while the interval-stutter field program runs (see the field doc).
-            stall_probes: env_on("PUNKTFUNK_STALL_PROBES").unwrap_or(true),
+            // Default OFF (immunity plan WP3 — no standing observer effect); opt-in per box.
+            stall_probes: env_on("PUNKTFUNK_STALL_PROBES").unwrap_or(false),
             // Defaults to `virtual` — the flagship per-client virtual output. It used to be unset,
             // which fell through to the synthetic test pattern: fine for a dev box that always has
             // a host.env, wrong for a packaged install, whose unit no longer requires that file at

@@ -53,6 +53,7 @@
 use std::mem::size_of;
 
 use windows::core::PCWSTR;
+use windows::Win32::Devices::Display::QUERY_DISPLAY_CONFIG_FLAGS;
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
     QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
@@ -74,7 +75,7 @@ use windows::Win32::Devices::Display::{
     SDC_APPLY, SDC_FORCE_MODE_ENUMERATION, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND,
     SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
-use windows::Win32::Foundation::POINTL;
+use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, POINTL};
 use windows::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, EnumDisplaySettingsW, CDS_RESET, CDS_TEST, CDS_UPDATEREGISTRY,
     DEVMODEW, DISP_CHANGE_FAILED, DISP_CHANGE_SUCCESSFUL, DM_BITSPERPEL, DM_DISPLAYFREQUENCY,
@@ -82,6 +83,118 @@ use windows::Win32::Graphics::Gdi::{
 };
 
 use punktfunk_core::Mode;
+
+/// Complete Windows display-target identity. Target ids are only unique PER ADAPTER, so a helper
+/// that selects a path from a bare `u32` can resolve, isolate, move, or change HDR on a different
+/// adapter's same-numbered target on a hybrid box. Every public helper in this module that picks
+/// a path takes this key. The packed LUID matches `pf_frame::dxgi::pack_luid` (asserted by a
+/// cross-crate test in pf-capture).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CcdTargetKey {
+    /// Packed adapter LUID (`(HighPart << 32) | (LowPart & 0xffff_ffff)`).
+    pub adapter_luid: i64,
+    pub target_id: u32,
+}
+
+impl CcdTargetKey {
+    pub fn new(adapter_luid: i64, target_id: u32) -> Self {
+        Self {
+            adapter_luid,
+            target_id,
+        }
+    }
+
+    /// Build from the split LUID the OS structs carry.
+    pub fn from_luid_parts(low: u32, high: i32, target_id: u32) -> Self {
+        Self {
+            adapter_luid: pack_luid_parts(low, high),
+            target_id,
+        }
+    }
+}
+
+impl std::fmt::Display for CcdTargetKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{:x}", self.target_id, self.adapter_luid)
+    }
+}
+
+/// The LUID packing every key uses — one formula, identical to `pf_frame::dxgi::pack_luid`.
+pub fn pack_luid_parts(low: u32, high: i32) -> i64 {
+    ((high as i64) << 32) | (low as i64 & 0xffff_ffff)
+}
+
+/// The key of the TARGET side of a CCD path.
+pub(crate) fn path_target_key(p: &DISPLAYCONFIG_PATH_INFO) -> CcdTargetKey {
+    CcdTargetKey::from_luid_parts(
+        p.targetInfo.adapterId.LowPart,
+        p.targetInfo.adapterId.HighPart,
+        p.targetInfo.id,
+    )
+}
+
+/// How a CCD read failed. A QUERY FAILURE is a distinct answer from an empty topology, and no
+/// caller may fold the two: a watchdog that reads a failed query as "stable" mutates on unknown
+/// state (see `isolate_displays_ccd`'s verify).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CcdError {
+    /// `GetDisplayConfigBufferSizes` failed (raw WIN32 code).
+    Sizing(u32),
+    /// `QueryDisplayConfig` failed, after the bounded resize budget (raw WIN32 code).
+    Query(u32),
+}
+
+/// The one robust CCD reader every helper in this module goes through: size, allocate, query —
+/// retrying `ERROR_INSUFFICIENT_BUFFER` from a FRESH sizing call (topology churn between the two
+/// calls legitimately grows the arrays) under a bounded budget. Zero active paths is an ANSWER
+/// (`Ok` with empty vecs), never a failure: `QueryDisplayConfig` REJECTS a zero-count call rather
+/// than returning an empty set, so asking anyway would turn "nothing is active" (every panel
+/// off/standby, a KVM switched away, headless between adapter arrival and first monitor) into
+/// "the query failed". (Measured on .173: sizing succeeds with numPaths=0, the query then
+/// returns 0x57 ERROR_INVALID_PARAMETER — 0x5 from session 0.)
+pub fn query_display_config(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> Result<SavedConfig, CcdError> {
+    // 4 attempts: churn that grows the buffer between sizing and query several times in a row is
+    // already pathological; the budget keeps a lying driver from looping us forever.
+    let mut last = ERROR_INSUFFICIENT_BUFFER.0;
+    for _ in 0..4 {
+        let mut np = 0u32;
+        let mut nm = 0u32;
+        // SAFETY: the CCD contract at the top of this file — `&mut np`/`&mut nm` are live
+        // locals the OS fills with the counts it wants for these flags.
+        let rc = unsafe { GetDisplayConfigBufferSizes(flags, &mut np, &mut nm) };
+        if rc.is_err() {
+            return Err(CcdError::Sizing(rc.0));
+        }
+        if np == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
+        // SAFETY: the CCD contract — `paths`/`modes` were just allocated with exactly `np`/`nm`
+        // elements from the sizing call above, and are handed over with those same counts.
+        let rc = unsafe {
+            QueryDisplayConfig(
+                flags,
+                &mut np,
+                paths.as_mut_ptr(),
+                &mut nm,
+                modes.as_mut_ptr(),
+                None,
+            )
+        };
+        if rc == ERROR_INSUFFICIENT_BUFFER {
+            last = rc.0;
+            continue;
+        }
+        if rc.is_err() {
+            return Err(CcdError::Query(rc.0));
+        }
+        paths.truncate(np as usize);
+        modes.truncate(nm as usize);
+        return Ok((paths, modes));
+    }
+    Err(CcdError::Query(last))
+}
 
 /// Force the desktop into EXTEND topology - the programmatic equivalent of the Win+P / DisplaySwitch
 /// "Extend" shortcut. Windows defaults a FRESHLY-ADDED monitor into CLONE/duplicate mode when a
@@ -123,34 +236,10 @@ pub fn force_extend_topology() {
 /// source not already driving another display — mode indices invalidated so `SDC_ALLOW_CHANGES` lets
 /// the OS pick modes for the new path. Returns `true` when the apply reports success; the caller
 /// still re-polls [`resolve_gdi_name`] to confirm the path actually committed.
-pub fn activate_target_path(target_id: u32) -> bool {
-    let mut np = 0u32;
-    let mut nm = 0u32;
-    // SAFETY: the CCD contract at the top of this file — `&mut np`/`&mut nm` are live
-    // locals the OS fills with the counts it wants for these flags.
-    if unsafe { GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut np, &mut nm) }.is_err() {
+pub fn activate_target_path(key: CcdTargetKey) -> bool {
+    let Ok((paths, modes)) = query_display_config(QDC_ALL_PATHS) else {
         return false;
-    }
-    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
-    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
-    // SAFETY: the CCD contract — `paths`/`modes` were just allocated with exactly `np`/`nm`
-    // elements from the sizing call above, and are handed over with those same counts.
-    if unsafe {
-        QueryDisplayConfig(
-            QDC_ALL_PATHS,
-            &mut np,
-            paths.as_mut_ptr(),
-            &mut nm,
-            modes.as_mut_ptr(),
-            None,
-        )
-    }
-    .is_err()
-    {
-        return false;
-    }
-    paths.truncate(np as usize);
-    modes.truncate(nm as usize);
+    };
 
     // Keep the currently-active paths verbatim — their mode indices stay valid because the queried
     // modes array is passed through unchanged.
@@ -159,7 +248,7 @@ pub fn activate_target_path(target_id: u32) -> bool {
         .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0)
         .copied()
         .collect();
-    if supplied.iter().any(|p| p.targetInfo.id == target_id) {
+    if supplied.iter().any(|p| path_target_key(p) == key) {
         return true; // already active — we raced the OS auto-activate
     }
 
@@ -167,7 +256,7 @@ pub fn activate_target_path(target_id: u32) -> bool {
     // the same adapter (sharing one would make the IDD a clone — exactly the no-frames state this
     // fallback exists to break out of).
     let Some(cand) = paths.iter().find(|p| {
-        p.targetInfo.id == target_id
+        path_target_key(p) == key
             && p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0
             && !supplied.iter().any(|a| {
                 (
@@ -182,7 +271,7 @@ pub fn activate_target_path(target_id: u32) -> bool {
             })
     }) else {
         tracing::warn!(
-            target_id,
+            target = %key,
             "explicit path activation: no inactive path with a free source for this target"
         );
         return false;
@@ -209,14 +298,14 @@ pub fn activate_target_path(target_id: u32) -> bool {
     });
     if rc == 0 {
         tracing::info!(
-            target_id,
+            target = %key,
             "explicit path activation: supplied-config apply succeeded (target committed alongside {} active path(s))",
             supplied.len() - 1
         );
         true
     } else {
         tracing::warn!(
-            target_id,
+            target = %key,
             "explicit path activation: SetDisplayConfig rc={rc:#x}"
         );
         false
@@ -226,34 +315,10 @@ pub fn activate_target_path(target_id: u32) -> bool {
 /// Resolve the `\\.\DisplayN` GDI name for a virtual-display target id via the CCD API. Returns `None`
 /// until the OS activates the target into the desktop topology (needs a real WDDM GPU; on a
 /// GPU-less box this stays `None` even though ADD succeeded).
-pub fn resolve_gdi_name(target_id: u32) -> Option<String> {
-    let mut np = 0u32;
-    let mut nm = 0u32;
-    // SAFETY: the CCD contract at the top of this file — `&mut np`/`&mut nm` are live
-    // locals the OS fills with the counts it wants for these flags.
-    if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) }.is_err() {
-        return None;
-    }
-    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
-    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
-    // SAFETY: the CCD contract — `paths`/`modes` were just allocated with exactly `np`/`nm`
-    // elements from the sizing call above, and are handed over with those same counts.
-    if unsafe {
-        QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut np,
-            paths.as_mut_ptr(),
-            &mut nm,
-            modes.as_mut_ptr(),
-            None,
-        )
-    }
-    .is_err()
-    {
-        return None;
-    }
-    for p in paths.iter().take(np as usize) {
-        if p.targetInfo.id == target_id {
+pub fn resolve_gdi_name(key: CcdTargetKey) -> Option<String> {
+    let (paths, _modes) = query_display_config(QDC_ONLY_ACTIVE_PATHS).ok()?;
+    for p in &paths {
+        if path_target_key(p) == key {
             let mut src = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
             src.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
             src.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
@@ -277,16 +342,16 @@ pub fn resolve_gdi_name(target_id: u32) -> Option<String> {
 /// virtual display's mode out from under the session-negotiated one (game-capture bug GB1).
 ///
 /// Safe to call from any thread.
-pub fn active_resolution(target_id: u32) -> Option<(u32, u32)> {
-    active_mode(target_id).map(|(w, h, _)| (w, h))
+pub fn active_resolution(key: CcdTargetKey) -> Option<(u32, u32)> {
+    active_mode(key).map(|(w, h, _)| (w, h))
 }
 
 /// The target's CURRENT active mode as `(width, height, refresh_hz)` — what the OS actually
 /// committed, which is not always what was asked for: `set_active_mode` deliberately falls back to
 /// the highest advertised refresh <= requested rather than losing the client's resolution. Callers
 /// that RECORD a mode must record this, or they claim a refresh the display is not running.
-pub fn active_mode(target_id: u32) -> Option<(u32, u32, u32)> {
-    let gdi = resolve_gdi_name(target_id)?;
+pub fn active_mode(key: CcdTargetKey) -> Option<(u32, u32, u32)> {
+    let gdi = resolve_gdi_name(key)?;
     let wname: Vec<u16> = gdi.encode_utf16().chain(std::iter::once(0)).collect();
     let mut dm = DEVMODEW {
         dmSize: size_of::<DEVMODEW>() as u16,
@@ -314,14 +379,14 @@ pub fn active_mode(target_id: u32) -> Option<(u32, u32, u32)> {
 ///
 /// Call under the manager `state` lock like the callers it serve — a *serialization* requirement,
 /// not a soundness one: reading topology unlocked races the mutator and yields a stale answer.
-pub fn wait_mode_settled(target_id: u32, mode: Mode, ceiling: std::time::Duration) -> bool {
+pub fn wait_mode_settled(key: CcdTargetKey, mode: Mode, ceiling: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + ceiling;
     loop {
         // `&&` short-circuits, so the second CCD query still does not run while the target has no
         // active path at all — this polls every 25 ms. (It was nested only so each call could carry
         // its own `unsafe` proof; both are safe fns now.)
-        if resolve_gdi_name(target_id).is_some()
-            && active_resolution(target_id) == Some((mode.width, mode.height))
+        if resolve_gdi_name(key).is_some()
+            && active_resolution(key) == Some((mode.width, mode.height))
         {
             return true;
         }
@@ -454,11 +519,11 @@ pub fn wait_mode_advertised(gdi_name: &str, mode: Mode, ceiling: std::time::Dura
 /// was observed, `false` on ceiling.
 ///
 /// Call under the manager `state` lock like the callers it serves (serialization, not soundness).
-pub fn wait_target_departed(target_id: u32, ceiling: std::time::Duration) -> bool {
+pub fn wait_target_departed(key: CcdTargetKey, ceiling: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + ceiling;
     let mut absent_streak = 0u32;
     loop {
-        if resolve_gdi_name(target_id).is_none() {
+        if resolve_gdi_name(key).is_none() {
             absent_streak += 1;
             if absent_streak >= 2 {
                 return true;
@@ -477,34 +542,12 @@ pub fn wait_target_departed(target_id: u32, ceiling: std::time::Duration) -> boo
 /// secure (Winlogon) desktop makes it render SDR/composed so DXGI Desktop Duplication can capture it
 /// (the HDR fullscreen independent-flip otherwise storms `ACCESS_LOST` → black); re-enable on return so
 /// WGC keeps HDR on the normal desktop. Returns true on a successful `DisplayConfigSetDeviceInfo`.
-pub fn set_advanced_color(target_id: u32, enable: bool) -> bool {
-    let mut np = 0u32;
-    let mut nm = 0u32;
-    // SAFETY: the CCD contract at the top of this file — `&mut np`/`&mut nm` are live
-    // locals the OS fills with the counts it wants for these flags.
-    if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) }.is_err() {
+pub fn set_advanced_color(key: CcdTargetKey, enable: bool) -> bool {
+    let Ok((paths, _modes)) = query_display_config(QDC_ONLY_ACTIVE_PATHS) else {
         return false;
-    }
-    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
-    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
-    // SAFETY: the CCD contract — `paths`/`modes` were just allocated with exactly `np`/`nm`
-    // elements from the sizing call above, and are handed over with those same counts.
-    if unsafe {
-        QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut np,
-            paths.as_mut_ptr(),
-            &mut nm,
-            modes.as_mut_ptr(),
-            None,
-        )
-    }
-    .is_err()
-    {
-        return false;
-    }
-    for p in paths.iter().take(np as usize) {
-        if p.targetInfo.id == target_id {
+    };
+    for p in &paths {
+        if path_target_key(p) == key {
             let mut s = DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE::default();
             s.header.r#type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
             s.header.size = size_of::<DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE>() as u32;
@@ -516,7 +559,7 @@ pub fn set_advanced_color(target_id: u32, enable: bool) -> bool {
                                                // OS reads that many bytes and retains nothing.
             let rc = unsafe { DisplayConfigSetDeviceInfo(&s.header) };
             tracing::debug!(
-                target_id,
+                target = %key,
                 enable,
                 rc,
                 "virtual-display set advanced-color (HDR) state"
@@ -525,7 +568,7 @@ pub fn set_advanced_color(target_id: u32, enable: bool) -> bool {
         }
     }
     tracing::warn!(
-        target_id,
+        target = %key,
         "virtual-display advanced-color: target not in active paths"
     );
     false
@@ -539,34 +582,10 @@ pub fn set_advanced_color(target_id: u32, enable: bool) -> bool {
 /// list (both happen transiently during a display-topology re-probe): the caller decides the fallback —
 /// the capture loop's poller keeps the last known value, since reading a blip as "HDR off" used to cost
 /// an HDR session TWO spurious ring recreates (false, then true again a poll later).
-pub fn advanced_color_enabled(target_id: u32) -> Option<bool> {
-    let mut np = 0u32;
-    let mut nm = 0u32;
-    // SAFETY: the CCD contract at the top of this file — `&mut np`/`&mut nm` are live
-    // locals the OS fills with the counts it wants for these flags.
-    if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) }.is_err() {
-        return None;
-    }
-    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
-    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
-    // SAFETY: the CCD contract — `paths`/`modes` were just allocated with exactly `np`/`nm`
-    // elements from the sizing call above, and are handed over with those same counts.
-    if unsafe {
-        QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut np,
-            paths.as_mut_ptr(),
-            &mut nm,
-            modes.as_mut_ptr(),
-            None,
-        )
-    }
-    .is_err()
-    {
-        return None;
-    }
-    for p in paths.iter().take(np as usize) {
-        if p.targetInfo.id == target_id {
+pub fn advanced_color_enabled(key: CcdTargetKey) -> Option<bool> {
+    let (paths, _modes) = query_display_config(QDC_ONLY_ACTIVE_PATHS).ok()?;
+    for p in &paths {
+        if path_target_key(p) == key {
             let mut info = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO::default();
             info.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
             info.header.size = size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as u32;
@@ -594,34 +613,10 @@ pub fn advanced_color_enabled(target_id: u32) -> Option<bool> {
 /// their last value or 1.0).
 ///
 /// Read-only, over owned locals — same shape as [`advanced_color_enabled`].
-pub fn sdr_white_level_scale(target_id: u32) -> Option<f32> {
-    let mut np = 0u32;
-    let mut nm = 0u32;
-    // SAFETY: the CCD contract at the top of this file — `&mut np`/`&mut nm` are live
-    // locals the OS fills with the counts it wants for these flags.
-    if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) }.is_err() {
-        return None;
-    }
-    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
-    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
-    // SAFETY: the CCD contract — `paths`/`modes` were just allocated with exactly `np`/`nm`
-    // elements from the sizing call above, and are handed over with those same counts.
-    if unsafe {
-        QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut np,
-            paths.as_mut_ptr(),
-            &mut nm,
-            modes.as_mut_ptr(),
-            None,
-        )
-    }
-    .is_err()
-    {
-        return None;
-    }
-    for p in paths.iter().take(np as usize) {
-        if p.targetInfo.id == target_id {
+pub fn sdr_white_level_scale(key: CcdTargetKey) -> Option<f32> {
+    let (paths, _modes) = query_display_config(QDC_ONLY_ACTIVE_PATHS).ok()?;
+    for p in &paths {
+        if path_target_key(p) == key {
             let mut info = DISPLAYCONFIG_SDR_WHITE_LEVEL::default();
             info.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
             info.header.size = size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32;
@@ -910,60 +905,29 @@ const DISPLAYCONFIG_PATH_MODE_IDX_INVALID: u32 = 0xffff_ffff;
 /// API failure. Shared by [`isolate_displays_ccd`] (snapshot + per-attempt re-query) and
 /// [`count_other_active`].
 fn query_active_config() -> Option<SavedConfig> {
-    let mut np = 0u32;
-    let mut nm = 0u32;
-    // SAFETY: the CCD contract at the top of this file — `&mut np`/`&mut nm` are live
-    // locals the OS fills with the counts it wants for these flags.
-    if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) }.is_err() {
-        return None;
+    // The zero-path answer (empty-but-`Some`) and the insufficient-buffer retry both live in
+    // `query_display_config`; this wrapper keeps the legacy `Option` shape for the callers whose
+    // `None` genuinely means "the query failed" — and is the ONE place that failure is logged.
+    match query_display_config(QDC_ONLY_ACTIVE_PATHS) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(?e, "CCD active-config query failed");
+            None
+        }
     }
-    // Zero active paths is an ANSWER, not a failure — and an ordinary state: every panel off or in
-    // standby, a KVM switched away, a headless box between the adapter arriving and its first
-    // monitor. `QueryDisplayConfig` REJECTS a zero-count call rather than returning an empty set,
-    // so asking anyway turns "nothing is active" into "the query failed". Measured on .173
-    // (RTX 4090, Win11 26200, TV powered off — every monitor devnode Code 45): the sizing call
-    // succeeds with numPaths=0 and the query then returns 0x57 ERROR_INVALID_PARAMETER in a live
-    // logged-on console session, 0x5 ERROR_ACCESS_DENIED from session 0. That `None` is what makes
-    // `isolate_displays_ccd` report failure, which is the condition whose recovery legs exist to
-    // stop the operator's panels being left dark.
-    if np == 0 {
-        return Some((Vec::new(), Vec::new()));
-    }
-    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
-    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
-    // SAFETY: the CCD contract — `paths`/`modes` were just allocated with exactly `np`/`nm`
-    // elements from the sizing call above, and are handed over with those same counts.
-    if unsafe {
-        QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut np,
-            paths.as_mut_ptr(),
-            &mut nm,
-            modes.as_mut_ptr(),
-            None,
-        )
-    }
-    .is_err()
-    {
-        return None;
-    }
-    paths.truncate(np as usize);
-    modes.truncate(nm as usize);
-    Some((paths, modes))
 }
 
 /// Count currently-ACTIVE display paths whose target id is not in `keep_target_ids` — i.e. displays
 /// that would still be lit besides the managed virtual set. `None` on query failure. Used to VERIFY
 /// isolation actually took, and (in the `primary` topology) to detect a physical that is ALREADY
 /// active so we can skip a force-EXTEND that would reset its refresh.
-pub fn count_other_active(keep_target_ids: &[u32]) -> Option<u32> {
+pub fn count_other_active(keep: &[CcdTargetKey]) -> Option<u32> {
     let (paths, _) = query_active_config()?;
     Some(
         paths
             .iter()
             .filter(|p| {
-                !keep_target_ids.contains(&p.targetInfo.id)
-                    && p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0
+                !keep.contains(&path_target_key(p)) && p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0
             })
             .count() as u32,
     )
@@ -977,6 +941,9 @@ pub fn count_other_active(keep_target_ids: &[u32]) -> Option<u32> {
 /// iGPU → ~2 s stall metronome; `topology: primary` → zero) — only indirect/virtual targets
 /// (our own IDD included) can never be suspects.
 pub struct TargetInventory {
+    /// Complete identity — target ids are only unique per adapter, so every selector keys on this.
+    pub key: CcdTargetKey,
+    /// The bare target id, for LOGS and display only — never select a path from it.
     pub target_id: u32,
     /// Whether any active path drives this target (part of the desktop right now).
     pub active: bool,
@@ -1076,50 +1043,20 @@ fn utf16z_str(buf: &[u16]) -> String {
 /// briefly serialize on the display-config lock during topology churn — callers must keep it OFF
 /// the capture thread (`display_events` runs it on its own listener thread and caches).
 pub fn target_inventory() -> Vec<TargetInventory> {
-    let mut np = 0u32;
-    let mut nm = 0u32;
-    // SAFETY: the CCD contract at the top of this file — `&mut np`/`&mut nm` are live
-    // locals the OS fills with the counts it wants for these flags.
-    if unsafe { GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut np, &mut nm) }.is_err() {
+    let Ok((paths, modes)) = query_display_config(QDC_ALL_PATHS) else {
         return Vec::new();
-    }
-    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
-    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
-    // SAFETY: the CCD contract — `paths`/`modes` were just allocated with exactly `np`/`nm`
-    // elements from the sizing call above, and are handed over with those same counts.
-    if unsafe {
-        QueryDisplayConfig(
-            QDC_ALL_PATHS,
-            &mut np,
-            paths.as_mut_ptr(),
-            &mut nm,
-            modes.as_mut_ptr(),
-            None,
-        )
-    }
-    .is_err()
-    {
-        return Vec::new();
-    }
-    paths.truncate(np as usize);
-    // Targets driven by an ACTIVE path. `(LUID parts, target id)` keys: target ids are only
-    // unique per adapter.
-    let active: Vec<(u32, i32, u32)> = paths
+    };
+    // Targets driven by an ACTIVE path, by complete key (target ids are only unique per adapter).
+    let active: Vec<CcdTargetKey> = paths
         .iter()
         .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0)
-        .map(|p| {
-            (
-                p.targetInfo.adapterId.LowPart,
-                p.targetInfo.adapterId.HighPart,
-                p.targetInfo.id,
-            )
-        })
+        .map(path_target_key)
         .collect();
-    let mut seen: Vec<(u32, i32, u32)> = Vec::new();
+    let mut seen: Vec<CcdTargetKey> = Vec::new();
     let mut out = Vec::new();
     for p in &paths {
         let t = &p.targetInfo;
-        let key = (t.adapterId.LowPart, t.adapterId.HighPart, t.id);
+        let key = path_target_key(p);
         // `targetAvailable` == a monitor is connected; an ACTIVE target is included regardless
         // (the flag reads FALSE transiently right after a removal).
         if (!t.targetAvailable.as_bool() && !active.contains(&key)) || seen.contains(&key) {
@@ -1187,6 +1124,7 @@ pub fn target_inventory() -> Vec<TargetInventory> {
             d => (u64::from(t.refreshRate.Numerator) * 1000 / u64::from(d)) as u32,
         };
         out.push(TargetInventory {
+            key,
             target_id: t.id,
             active: is_active,
             external_physical,
@@ -1233,9 +1171,11 @@ pub fn target_inventory() -> Vec<TargetInventory> {
 pub mod isolate_journal {
     use std::sync::Mutex;
 
+    use super::CcdTargetKey;
+
     /// What we last wrote, so the exclusive re-assert watchdog's repeat isolates don't rewrite the
     /// file every couple of seconds. `None` = "no marker known to be on disk".
-    static LAST: Mutex<Option<Vec<u32>>> = Mutex::new(None);
+    static LAST: Mutex<Option<Vec<CcdTargetKey>>> = Mutex::new(None);
 
     fn path() -> std::path::PathBuf {
         pf_paths::config_dir().join("display-isolate-active.json")
@@ -1243,7 +1183,11 @@ pub mod isolate_journal {
 
     /// Record that `deactivated` physical target(s) are switched off for a live exclusive isolate.
     /// Best-effort: a journal we cannot write costs crash recovery, not the session.
-    pub fn mark(deactivated: &[u32]) {
+    ///
+    /// The on-disk schema is the KEYED one — `[[adapter_luid, target_id], …]`. The pre-key
+    /// `[target_id, …]` shape is still READ (one compatibility release, see [`pending`]) but
+    /// never written.
+    pub fn mark(deactivated: &[CcdTargetKey]) {
         if deactivated.is_empty() {
             return; // nothing was deactivated ⇒ nothing for a later host to put back
         }
@@ -1255,10 +1199,11 @@ pub mod isolate_journal {
         if let Some(dir) = p.parent() {
             let _ = pf_paths::create_private_dir(dir);
         }
-        match std::fs::write(
-            &p,
-            serde_json::to_vec_pretty(deactivated).unwrap_or_default(),
-        ) {
+        let rows: Vec<(i64, u32)> = deactivated
+            .iter()
+            .map(|k| (k.adapter_luid, k.target_id))
+            .collect();
+        match std::fs::write(&p, serde_json::to_vec_pretty(&rows).unwrap_or_default()) {
             Ok(()) => *last = Some(deactivated.to_vec()),
             Err(e) => tracing::warn!(
                 error = %e,
@@ -1295,12 +1240,24 @@ pub mod isolate_journal {
         clear();
     }
 
-    /// The marker a previous host left behind, if any (its deactivated target ids) — the *decision*
+    /// The marker a previous host left behind, if any (its deactivated targets) — the *decision*
     /// half of [`startup_recover`], split out so the recovery rule is testable without driving a
     /// real `SetDisplayConfig` against the machine running the test.
-    pub fn pending() -> Option<Vec<u32>> {
+    ///
+    /// Reads the keyed schema first, then the pre-key `Vec<u32>` one (a marker written by the
+    /// previous release; its keys carry `adapter_luid = 0`, which is fine — the ids only feed a
+    /// log line before the EXTEND recovery). The old decode goes away after one release.
+    pub fn pending() -> Option<Vec<CcdTargetKey>> {
         let bytes = std::fs::read(path()).ok()?;
-        Some(serde_json::from_slice(&bytes).unwrap_or_default())
+        if let Ok(rows) = serde_json::from_slice::<Vec<(i64, u32)>>(&bytes) {
+            return Some(
+                rows.into_iter()
+                    .map(|(luid, id)| CcdTargetKey::new(luid, id))
+                    .collect(),
+            );
+        }
+        let old: Vec<u32> = serde_json::from_slice(&bytes).unwrap_or_default();
+        Some(old.into_iter().map(|id| CcdTargetKey::new(0, id)).collect())
     }
 
     #[cfg(test)]
@@ -1330,18 +1287,33 @@ pub mod isolate_journal {
 
         /// The crash path: a host marks what it switched off and dies. The next start must see the
         /// marker (and which targets), which is what makes it force the desk back on.
+        fn k(luid: i64, id: u32) -> CcdTargetKey {
+            CcdTargetKey::new(luid, id)
+        }
+
         #[test]
         fn a_mark_survives_for_the_next_host_and_clear_retracts_it() {
             with_temp_dir("roundtrip", |_| {
                 assert_eq!(pending(), None, "a clean box owes no recovery");
-                mark(&[101, 202]);
+                mark(&[k(7, 101), k(9, 202)]);
                 assert_eq!(
                     pending(),
-                    Some(vec![101, 202]),
+                    Some(vec![k(7, 101), k(9, 202)]),
                     "a crashed host's marker must be readable by the next start"
                 );
                 clear();
                 assert_eq!(pending(), None, "a clean teardown retracts the marker");
+            });
+        }
+
+        /// A marker written by the PREVIOUS release (`[target_id, …]`) must still trigger
+        /// recovery — read for one compatibility release, mapped to zero-LUID keys (the ids
+        /// only feed a log line).
+        #[test]
+        fn an_old_bare_id_marker_still_asks_for_recovery() {
+            with_temp_dir("oldschema", |dir| {
+                std::fs::write(dir.join("display-isolate-active.json"), b"[101, 202]").unwrap();
+                assert_eq!(pending(), Some(vec![k(0, 101), k(0, 202)]));
             });
         }
 
@@ -1356,26 +1328,37 @@ pub mod isolate_journal {
             });
         }
 
+        /// The keyed schema is what lands on disk: `[[adapter_luid, target_id], …]`.
+        #[test]
+        fn the_marker_is_written_keyed() {
+            with_temp_dir("keyed", |dir| {
+                mark(&[k(0x1f, 4352)]);
+                let bytes = std::fs::read(dir.join("display-isolate-active.json")).unwrap();
+                let rows: Vec<(i64, u32)> = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(rows, vec![(0x1f, 4352)]);
+            });
+        }
+
         /// The re-assert watchdog re-isolates every couple of seconds while something fights it;
         /// that must not mean a disk write per cycle.
         #[test]
         fn repeating_the_same_mark_does_not_rewrite_the_file() {
             with_temp_dir("cached", |dir| {
                 let file = dir.join("display-isolate-active.json");
-                mark(&[7]);
+                mark(&[k(1, 7)]);
                 // Overwrite behind the journal's back rather than comparing mtimes — a filesystem
                 // whose timestamp resolution is coarser than two back-to-back writes would let an
                 // mtime assertion pass without proving anything.
                 std::fs::write(&file, b"SENTINEL").unwrap();
-                mark(&[7]);
+                mark(&[k(1, 7)]);
                 assert_eq!(
                     std::fs::read(&file).unwrap(),
                     b"SENTINEL",
                     "an unchanged mark must not rewrite the journal"
                 );
                 // A CHANGED set still lands — the group grew/shrank and recovery must follow it.
-                mark(&[7, 8]);
-                assert_eq!(pending(), Some(vec![7, 8]));
+                mark(&[k(1, 7), k(1, 8)]);
+                assert_eq!(pending(), Some(vec![k(1, 7), k(1, 8)]));
             });
         }
 
@@ -1404,7 +1387,7 @@ pub mod isolate_journal {
 /// later returns). Returns the original active config to restore on teardown.
 // pub so vdisplay::pf_vdisplay can reuse this backend-neutral CCD isolation helper
 // (it operates on real OS target ids — a pf-vdisplay monitor's target_id qualifies).
-pub fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfig> {
+pub fn isolate_displays_ccd(keep: &[CcdTargetKey]) -> Option<SavedConfig> {
     // Snapshot the ORIGINAL active config ONCE for restore-on-teardown, before any changes.
     let saved = query_active_config()?;
 
@@ -1417,7 +1400,7 @@ pub fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfig> {
     if saved.0.is_empty() {
         tracing::info!(
             "display isolate (CCD): no display path is active — nothing to isolate for target set \
-             {keep_target_ids:?} (every panel off/standby, or a headless host)"
+             {keep:?} (every panel off/standby, or a headless host)"
         );
         return Some(saved);
     }
@@ -1426,11 +1409,11 @@ pub fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfig> {
     // window this exists to cover includes dying mid-apply. `saved.0` is the ACTIVE path set
     // (QDC_ONLY_ACTIVE_PATHS), so everything in it outside the keep set is exactly what teardown
     // owes the operator back. See `isolate_journal`.
-    let doomed: Vec<u32> = saved
+    let doomed: Vec<CcdTargetKey> = saved
         .0
         .iter()
-        .map(|p| p.targetInfo.id)
-        .filter(|id| !keep_target_ids.contains(id))
+        .map(path_target_key)
+        .filter(|k| !keep.contains(k))
         .collect();
     isolate_journal::mark(&doomed);
 
@@ -1442,7 +1425,7 @@ pub fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfig> {
         let (mut paths, mut modes) = query_active_config()?;
         let mut others = 0u32;
         for p in paths.iter_mut() {
-            if keep_target_ids.contains(&p.targetInfo.id) {
+            if keep.contains(&path_target_key(p)) {
                 continue;
             }
             if p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0 {
@@ -1529,17 +1512,23 @@ pub fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfig> {
         }
 
         // VERIFY the OUTCOME (rc alone lies — a "successful" apply can leave a panel active): re-query
-        // and confirm no non-keep display survived. Only then is the virtual set truly the sole desktop.
-        let survivors = count_other_active(keep_target_ids).unwrap_or(0);
-        if survivors == 0 {
-            tracing::info!(
-                "display isolate (CCD): target set {keep_target_ids:?} is the SOLE active desktop (attempt {attempt}/4, deactivated {others}, rc={rc:#x})"
-            );
-            return Some(saved);
+        // and confirm no non-keep display survived. Only then is the virtual set truly the sole
+        // desktop. A FAILED verification query is UNKNOWN, never success: the old `unwrap_or(0)`
+        // here reported "SOLE active desktop" on the strength of a query that answered nothing.
+        match count_other_active(keep) {
+            Some(0) => {
+                tracing::info!(
+                    "display isolate (CCD): target set {keep:?} is the SOLE active desktop (attempt {attempt}/4, deactivated {others}, rc={rc:#x})"
+                );
+                return Some(saved);
+            }
+            Some(survivors) => tracing::warn!(
+                "display isolate (CCD): {survivors} display(s) STILL active after attempt {attempt}/4 (deactivated {others}, rc={rc:#x}) — re-querying + retrying"
+            ),
+            None => tracing::warn!(
+                "display isolate (CCD): verification query FAILED after attempt {attempt}/4 (rc={rc:#x}) — isolation state UNKNOWN, retrying"
+            ),
         }
-        tracing::warn!(
-            "display isolate (CCD): {survivors} display(s) STILL active after attempt {attempt}/4 (deactivated {others}, rc={rc:#x}) — re-querying + retrying"
-        );
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
     // Name the survivors instead of assuming their kind — the field logs showed this path fire
@@ -1547,11 +1536,11 @@ pub fn isolate_displays_ccd(keep_target_ids: &[u32]) -> Option<SavedConfig> {
     // "a non-virtual display stayed active" wording sent the triage the wrong way.
     let survivors: Vec<String> = target_inventory()
         .iter()
-        .filter(|t| t.active && !keep_target_ids.contains(&t.target_id))
-        .map(|t| format!("{} {} \"{}\"", t.target_id, t.tech, t.friendly))
+        .filter(|t| t.active && !keep.contains(&t.key))
+        .map(|t| format!("{} {} \"{}\"", t.key, t.tech, t.friendly))
         .collect();
     tracing::error!(
-        "display isolate (CCD): failed to isolate target set {keep_target_ids:?} after 4 attempts — still active: [{}] (field-reported exclusive-mode bug)",
+        "display isolate (CCD): failed to isolate target set {keep:?} after 4 attempts — still active or unverifiable: [{}] (field-reported exclusive-mode bug)",
         survivors.join(", ")
     );
     Some(saved)
@@ -1688,12 +1677,12 @@ fn anchor_kept_sources_at_origin(
 /// Used by the IDD-push compose kick to dirty THE TARGET display: with parallel displays the
 /// cursor sits on ONE of them, and a cursor wiggle only dirties that one — a sibling display's
 /// kick must first know where to send the cursor (Stage W3 on-glass finding).
-pub fn source_desktop_rect(target_id: u32) -> Option<(i32, i32, i32, i32)> {
+pub fn source_desktop_rect(key: CcdTargetKey) -> Option<(i32, i32, i32, i32)> {
     // SAFETY: `query_active_config` is this module's own CCD helper: it takes nothing and returns owned
     // `Vec`s built from a fresh `QueryDisplayConfig`, so it has no caller obligation at all.
     let (paths, modes) = query_active_config()?;
     for p in &paths {
-        if p.targetInfo.id != target_id || p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+        if path_target_key(p) != key || p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
             continue;
         }
         // SAFETY: POD union read (header) — `modeInfoIdx` overlays a same-sized bitfield struct,
@@ -1799,7 +1788,7 @@ pub fn desktop_bounds() -> Option<(i32, i32, i32, i32)> {
 /// treats the source at `(0,0)` as primary, so auto-row's first member lands primary — the group's
 /// designated member. Paths not named stay where they are. Best-effort: a failure leaves the OS
 /// placement (mouse crossing may not match the layout table until the next apply).
-pub fn apply_source_positions(positions: &[(u32, i32, i32)]) {
+pub fn apply_source_positions(positions: &[(CcdTargetKey, i32, i32)]) {
     if positions.len() < 2 {
         return; // a single (or no) member sits at the origin — nothing to arrange
     }
@@ -1811,7 +1800,7 @@ pub fn apply_source_positions(positions: &[(u32, i32, i32)]) {
     let mut done = std::collections::HashSet::new();
     let mut moved = 0u32;
     for p in paths.iter() {
-        let Some(&(_, x, y)) = positions.iter().find(|(t, _, _)| *t == p.targetInfo.id) else {
+        let Some(&(_, x, y)) = positions.iter().find(|(t, _, _)| *t == path_target_key(p)) else {
             continue;
         };
         // SAFETY: POD union read (header) — `modeInfoIdx` overlays a same-sized bitfield struct,
@@ -1866,7 +1855,7 @@ pub fn apply_source_positions(positions: &[(u32, i32, i32)]) {
 /// atomic CCD `SetDisplayConfig` (NOT GDI `CDS_SET_PRIMARY`, which storms
 /// `DXGI_ERROR_MODE_CHANGE_IN_PROGRESS` when another display is live — see [`set_active_mode`]).
 /// Returns the original config to restore on teardown.
-pub fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<SavedConfig> {
+pub fn set_virtual_primary_ccd(keep: CcdTargetKey) -> Option<SavedConfig> {
     // Through the shared query, not a private copy of it. This was a verbatim duplicate of
     // `query_active_config` — same flags, same shape — and so the one CCD entry point that did not
     // inherit its zero-path fix (the seam asymmetry this crate keeps producing: N-1 of N sibling
@@ -1876,7 +1865,7 @@ pub fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<SavedConfig> {
 
     // The virtual output's source width, to lay the other displays out to its right.
     let virt_width = paths.iter().find_map(|p| {
-        if p.targetInfo.id != keep_target_id {
+        if path_target_key(p) != keep {
             return None;
         }
         // SAFETY: POD union read (header) — `modeInfoIdx` overlays a same-sized bitfield struct,
@@ -1912,7 +1901,7 @@ pub fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<SavedConfig> {
         if m.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
             continue;
         }
-        if p.targetInfo.id == keep_target_id {
+        if path_target_key(p) == keep {
             // (A union field ASSIGNMENT needs no `unsafe` — only reads do.)
             m.Anonymous.sourceMode.position = POINTL { x: 0, y: 0 };
         } else {
@@ -1940,11 +1929,11 @@ pub fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<SavedConfig> {
     });
     if rc == 0 {
         tracing::info!(
-            "display primary (CCD): virtual target {keep_target_id} set PRIMARY at (0,0); {others} other display(s) kept ACTIVE + packed to its right"
+            "display primary (CCD): virtual target {keep} set PRIMARY at (0,0); {others} other display(s) kept ACTIVE + packed to its right"
         );
     } else {
         tracing::warn!(
-            "display primary (CCD): SetDisplayConfig failed rc={rc:#x}{} (virtual {keep_target_id} primary, physicals kept)",
+            "display primary (CCD): SetDisplayConfig failed rc={rc:#x}{} (virtual {keep} primary, physicals kept)",
             sdc_access_denied_hint(rc)
         );
     }
@@ -1957,7 +1946,8 @@ pub fn set_virtual_primary_ccd(keep_target_id: u32) -> Option<SavedConfig> {
 /// either — without the latch [`restore_displays_ccd`]'s backstop re-warns and re-forces on
 /// EVERY teardown, forever (field: the off-TV box). Process-lifetime on purpose: a host restart
 /// re-probes once, in case the sink meanwhile became lightable.
-static DARK_SINKS_FUTILE: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::new());
+static DARK_SINKS_FUTILE: std::sync::Mutex<Vec<(CcdTargetKey, String)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Restore the topology saved by [`isolate_displays_ccd`] (teardown, before the virtual output is
 /// removed), re-activating the displays we deactivated.
@@ -1971,43 +1961,18 @@ pub fn restore_displays_ccd(saved: &SavedConfig) {
     isolate_journal::clear();
 }
 
-/// Every display target that still EXISTS right now — `(adapter LUID low, high, target id)` keys
-/// from a full `QDC_ALL_PATHS` sweep, counting a target present when the OS says a monitor is
-/// attached (`targetAvailable`) OR an active path drives it (the flag reads FALSE transiently
-/// right after a removal — same rule as [`target_inventory`]). `None` when the CCD query itself
-/// fails, so the caller can fall back to trusting its snapshot verbatim.
-fn available_target_keys() -> Option<Vec<(u32, i32, u32)>> {
-    let mut np = 0u32;
-    let mut nm = 0u32;
-    // SAFETY: the CCD contract at the top of this file — `&mut np`/`&mut nm` are live locals the
-    // OS fills with the counts it wants for these flags.
-    if unsafe { GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut np, &mut nm) }.is_err() {
-        return None;
-    }
-    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
-    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
-    // SAFETY: the CCD contract — `paths`/`modes` were just allocated with exactly `np`/`nm`
-    // elements from the sizing call above, and are handed over with those same counts.
-    if unsafe {
-        QueryDisplayConfig(
-            QDC_ALL_PATHS,
-            &mut np,
-            paths.as_mut_ptr(),
-            &mut nm,
-            modes.as_mut_ptr(),
-            None,
-        )
-    }
-    .is_err()
-    {
-        return None;
-    }
-    paths.truncate(np as usize);
-    let mut keys: Vec<(u32, i32, u32)> = Vec::new();
+/// Every display target that still EXISTS right now — complete [`CcdTargetKey`]s from a full
+/// `QDC_ALL_PATHS` sweep, counting a target present when the OS says a monitor is attached
+/// (`targetAvailable`) OR an active path drives it (the flag reads FALSE transiently right after
+/// a removal — same rule as [`target_inventory`]). `None` when the CCD query itself fails, so the
+/// caller can fall back to trusting its snapshot verbatim.
+fn available_target_keys() -> Option<Vec<CcdTargetKey>> {
+    let (paths, _modes) = query_display_config(QDC_ALL_PATHS).ok()?;
+    let mut keys: Vec<CcdTargetKey> = Vec::new();
     for p in &paths {
-        let t = &p.targetInfo;
-        let key = (t.adapterId.LowPart, t.adapterId.HighPart, t.id);
-        let present = t.targetAvailable.as_bool() || p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0;
+        let key = path_target_key(p);
+        let present =
+            p.targetInfo.targetAvailable.as_bool() || p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0;
         if present && !keys.contains(&key) {
             keys.push(key);
         }
@@ -2025,7 +1990,7 @@ fn available_target_keys() -> Option<Vec<(u32, i32, u32)>> {
 fn prune_saved_config_for_targets(
     paths: &[DISPLAYCONFIG_PATH_INFO],
     modes: &[DISPLAYCONFIG_MODE_INFO],
-    avail: &[(u32, i32, u32)],
+    avail: &[CcdTargetKey],
 ) -> (
     Vec<DISPLAYCONFIG_PATH_INFO>,
     Vec<DISPLAYCONFIG_MODE_INFO>,
@@ -2058,8 +2023,7 @@ fn prune_saved_config_for_targets(
         };
     let mut dropped = 0usize;
     for p in paths {
-        let t = &p.targetInfo;
-        if !avail.contains(&(t.adapterId.LowPart, t.adapterId.HighPart, t.id)) {
+        if !avail.contains(&path_target_key(p)) {
             dropped += 1;
             continue;
         }
@@ -2153,10 +2117,10 @@ fn restore_displays_ccd_inner(saved: &SavedConfig) {
         .filter(|t| t.external_physical)
         .fold((0u32, 0u32), |(c, a), t| (c + 1, a + u32::from(t.active)));
     if connected > 0 && lit == 0 {
-        let dark: Vec<(u32, String)> = inventory
+        let dark: Vec<(CcdTargetKey, String)> = inventory
             .iter()
             .filter(|t| t.external_physical && !t.active)
-            .map(|t| (t.target_id, t.monitor_device_path.clone()))
+            .map(|t| (t.key, t.monitor_device_path.clone()))
             .collect();
         // The futility latch: if this exact dark set already survived a force-EXTEND, the sink
         // cannot light (off/standby TV) — re-warning and re-forcing every teardown is noise
@@ -2312,6 +2276,10 @@ mod prune_saved_config_tests {
         }
     }
 
+    fn k(luid_low: u32, target_id: u32) -> CcdTargetKey {
+        CcdTargetKey::from_luid_parts(luid_low, 0, target_id)
+    }
+
     fn indices(p: &DISPLAYCONFIG_PATH_INFO) -> (u32, u32) {
         // SAFETY: POD union reads — `modeInfoIdx` overlays a same-sized bitfield struct, both
         // valid for every bit pattern (the same contract the production reads rely on).
@@ -2327,7 +2295,7 @@ mod prune_saved_config_tests {
     fn everything_attached_survives_with_dense_indices() {
         let paths = vec![path(1, 100, 0, 1), path(1, 200, 2, 3)];
         let modes = vec![mode(10), mode(11), mode(12), mode(13)];
-        let avail = vec![(1, 0, 100), (1, 0, 200)];
+        let avail = vec![k(1, 100), k(1, 200)];
         let (kept, new_modes, dropped) = prune_saved_config_for_targets(&paths, &modes, &avail);
         assert_eq!(dropped, 0);
         assert_eq!(kept.len(), 2);
@@ -2343,7 +2311,7 @@ mod prune_saved_config_tests {
         // mode entries must vanish, and the survivor's indices must be remapped dense.
         let paths = vec![path(1, 100, 0, 1), path(1, 200, 2, 3)];
         let modes = vec![mode(10), mode(11), mode(12), mode(13)];
-        let avail = vec![(1, 0, 100)];
+        let avail = vec![k(1, 100)];
         let (kept, new_modes, dropped) = prune_saved_config_for_targets(&paths, &modes, &avail);
         assert_eq!(dropped, 1);
         assert_eq!(kept.len(), 1);
@@ -2363,7 +2331,7 @@ mod prune_saved_config_tests {
         // contain it once, referenced by both survivors.
         let paths = vec![path(1, 100, 0, 1), path(1, 200, 0, 2)];
         let modes = vec![mode(10), mode(11), mode(12)];
-        let avail = vec![(1, 0, 100), (1, 0, 200)];
+        let avail = vec![k(1, 100), k(1, 200)];
         let (kept, new_modes, dropped) = prune_saved_config_for_targets(&paths, &modes, &avail);
         assert_eq!(dropped, 0);
         assert_eq!(new_modes.len(), 3);
@@ -2378,7 +2346,7 @@ mod prune_saved_config_tests {
         // must degrade to unpinned rather than shipping a table the whole apply fails on.
         let paths = vec![path(1, 100, DISPLAYCONFIG_PATH_MODE_IDX_INVALID, 99)];
         let modes = vec![mode(10)];
-        let avail = vec![(1, 0, 100)];
+        let avail = vec![k(1, 100)];
         let (kept, new_modes, dropped) = prune_saved_config_for_targets(&paths, &modes, &avail);
         assert_eq!(dropped, 0);
         assert!(new_modes.is_empty());
@@ -2397,7 +2365,7 @@ mod prune_saved_config_tests {
         // stale path alive on adapter 1 just because the ids match.
         let paths = vec![path(1, 100, 0, 1)];
         let modes = vec![mode(10), mode(11)];
-        let avail = vec![(2, 0, 100)];
+        let avail = vec![k(2, 100)];
         let (kept, _, dropped) = prune_saved_config_for_targets(&paths, &modes, &avail);
         assert_eq!((kept.len(), dropped), (0, 1));
     }

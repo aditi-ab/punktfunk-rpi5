@@ -330,6 +330,7 @@ mod windows_tests {
     /// the struct is another crate's and carries no `Default`.
     fn target(target_id: u32, gdi_name: &str, active: bool) -> TargetInventory {
         TargetInventory {
+            key: pf_win_display::win_display::CcdTargetKey::new(0, target_id),
             target_id,
             active,
             external_physical: true,

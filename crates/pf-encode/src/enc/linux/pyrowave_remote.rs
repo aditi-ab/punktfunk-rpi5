@@ -945,6 +945,7 @@ mod tests {
     /// and passes it, so this exercises the real key/cache/`SCM_RIGHTS` path.
     fn frame(fd: OwnedFd, cursor: Option<CursorOverlay>) -> CapturedFrame {
         CapturedFrame {
+            provenance: Default::default(),
             width: 1920,
             height: 1080,
             pts_ns: 42,
@@ -1189,6 +1190,7 @@ mod tests {
             respawn_used: false,
         };
         let cpu = CapturedFrame {
+            provenance: Default::default(),
             width: 64,
             height: 64,
             pts_ns: 0,

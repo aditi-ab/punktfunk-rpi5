@@ -37,7 +37,7 @@ struct ConvertedShape {
 impl CursorShared {
     /// Create + initialize the section (magic stamped, seq even/zero). The returned handle is
     /// the section itself (owned by `self`); the caller duplicates it into the WUDFHost.
-    pub(super) fn create(target_id: u32) -> Result<CursorShared> {
+    pub(super) fn create(ccd: pf_win_display::win_display::CcdTargetKey) -> Result<CursorShared> {
         // SAFETY: plain FFI. Unnamed pagefile-backed section, host-lifetime owned; the view is
         // mapped once here and unmapped exactly once by `MappedSection::drop` (which unmaps before
         // closing the mapping handle). No borrow into the view outlives the `MappedSection`: every
@@ -71,7 +71,7 @@ impl CursorShared {
             MappedSection { handle: map, view }
         };
         // Desktop origin of this monitor's source — for the desktop→frame coordinate shift.
-        let rect = pf_win_display::win_display::source_desktop_rect(target_id);
+        let rect = pf_win_display::win_display::source_desktop_rect(ccd);
         let origin = rect.map(|(x, y, _w, _h)| (x, y)).unwrap_or((0, 0));
         Ok(CursorShared {
             section,

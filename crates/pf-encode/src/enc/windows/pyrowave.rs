@@ -1046,6 +1046,7 @@ mod tests {
         )
         .expect("PyroWaveEncoder::open");
         let frame = CapturedFrame {
+            provenance: Default::default(),
             width: w,
             height: h,
             pts_ns: 0,
