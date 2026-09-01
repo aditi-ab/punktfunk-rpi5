@@ -66,6 +66,12 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
   swap-chain raise (the `PFVD_RT_GPU` opt-in ladder is gone). A box that needs the old posture
   sets `PUNKTFUNK_GPU_PRIORITY_CLASS=high` and `setx /M PFVD_NO_RT_GPU 1`.
 
+### Fixed
+
+- **A re-run upgrades a box that already has every package.** The install phase skipped the
+  packages entirely when the host, console and plugin runner were all present, so a box carrying
+  a broken build could only be cleared by uninstalling first — nothing to do.
+
 ---
 
 ## v0.34.0

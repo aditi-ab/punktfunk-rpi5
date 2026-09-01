@@ -227,24 +227,39 @@ fn install_phase(
     // packages, and a weak-deps-off box would never grow a console otherwise.
     if facts.fully_installed() && choices.components.host {
         let version = facts.host_version.clone().unwrap_or_default();
-        let channel = facts
-            .current_channel
-            .map(|c| format!(", {} channel", c.as_str()))
-            .unwrap_or_default();
-        let mut steps = vec![];
-        if facts.current_channel.is_none() {
-            steps.push(Step::note(
-                Level::Warn,
+        // No repo means this build came from somewhere else — source, a hand-placed package —
+        // so there is nothing to upgrade against, and adding a repo now would install over it.
+        let Some(channel) = facts.current_channel else {
+            plan.push(
+                Phase::Install,
                 format!(
-                    "--channel {} had nothing to act on: no punktfunk package repo is configured here, so this install did not come from one (built from source?). Channels: {DOCS}/channels",
-                    choices.channel.as_str()
+                    "host, web console and plugin runner are already installed ({version}) — skipping the install, continuing with setup"
                 ),
-            ));
-        }
+                vec![Step::note(
+                    Level::Warn,
+                    format!(
+                        "--channel {} had nothing to act on: no punktfunk package repo is configured here, so this install did not come from one (built from source?). Channels: {DOCS}/channels",
+                        choices.channel.as_str()
+                    ),
+                )],
+            );
+            return;
+        };
+        // The install line is the only step that moves an installed box onto the channel's
+        // current build; skipping it stranded one on whatever it had, so a re-run could never
+        // deliver a fix and only an uninstall could. Minus the repo write: having a channel is
+        // how we got here, so re-importing the signing key every time buys nothing.
+        let repo = backend.write_repo(facts, choices);
+        let steps = backend
+            .install(facts, choices)
+            .into_iter()
+            .filter(|step| !repo.contains(step))
+            .collect();
         plan.push(
             Phase::Install,
             format!(
-                "host, web console and plugin runner are already installed ({version}{channel}) — skipping the install, continuing with setup"
+                "host, web console and plugin runner are installed ({version}, {} channel) — updating to the current build",
+                channel.as_str()
             ),
             steps,
         );

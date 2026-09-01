@@ -4,7 +4,8 @@
   Third-party clients (Moonlight, Artemis): no
   Shared clipboard: yes
   Start at boot with nobody logged in: no
-==> host, web console and plugin runner are already installed (punktfunk-host 0.34.0, canary channel) — skipping the install, continuing with setup
+==> host, web console and plugin runner are installed (punktfunk-host 0.34.0, canary channel) — updating to the current build
+  + sudo pacman -Syu punktfunk-host punktfunk-web punktfunk-scripting
 ==> Checking for Sunshine / Apollo / Vibeshine
   ok No conflicting game-streaming host detected.
 ==> Controller access

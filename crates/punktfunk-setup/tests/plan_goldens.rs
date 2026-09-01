@@ -266,9 +266,9 @@ fn uninstalls() {
     );
 }
 
-/// An already-complete box: the install is skipped and the setup continues.
+/// An already-complete box: the packages are updated in place, then the setup continues.
 #[test]
-fn a_re_run_on_a_complete_box_is_a_no_op_install() {
+fn a_re_run_on_a_complete_box_updates_in_place() {
     check(
         "arch-installed-rerun",
         &installed("arch", Family::Pacman, Channel::Canary),
@@ -483,7 +483,9 @@ fn the_flatpak_line_is_carried_verbatim() {
 
 // -------------------------------------------------------- design/installer-v2.md §4 traps
 
-/// A bare re-run on a canary machine must never drag it to stable.
+/// A bare re-run on a canary machine must never drag it to stable, and must leave the repo it
+/// already has alone. It still upgrades: that is how a fixed build reaches a box carrying an
+/// older one, and skipping it left an uninstall as the only way out.
 #[test]
 fn trap_channel_follows_the_box_without_an_explicit_flag() {
     let facts = installed("arch", Family::Pacman, Channel::Canary);
@@ -492,8 +494,15 @@ fn trap_channel_follows_the_box_without_an_explicit_flag() {
     assert_eq!(choices.switch_from, None);
     let cmds = plan_for(&facts, &pins()).commands();
     assert!(
-        !cmds.iter().any(|c| c.contains("-Sy")),
-        "a no-op re-run touched the repo: {cmds:?}"
+        !cmds
+            .iter()
+            .any(|c| c.contains("pacman.conf") || c.contains("pacman-key")),
+        "a re-run rewrote the repo it already had: {cmds:?}"
+    );
+    assert!(
+        cmds.iter()
+            .any(|c| c.starts_with("sudo pacman -Syu punktfunk-host")),
+        "a re-run must upgrade the packages it already has: {cmds:?}"
     );
 }
 
@@ -541,6 +550,25 @@ fn trap_pacman_switch_uses_sy_then_s_and_never_syu() {
     assert!(
         cmds[0].contains("sed -i"),
         "the old repo section must be dropped first: {cmds:?}"
+    );
+}
+
+/// The Omarchy report this came from: a box with everything installed got no package step at
+/// all, so a build carrying a fix could not reach it and an uninstall was the only way out.
+/// The db refresh has to survive too, or `-S` upgrades against a stale database.
+#[test]
+fn trap_a_complete_omarchy_box_still_refreshes_and_upgrades() {
+    let facts = installed("omarchy", Family::Pacman, Channel::Canary);
+    let cmds = plan_for(&facts, &pins()).commands();
+    let pacman: Vec<&String> = cmds
+        .iter()
+        .filter(|c| c.starts_with("sudo pacman"))
+        .collect();
+    assert_eq!(pacman.len(), 2, "{cmds:?}");
+    assert_eq!(pacman[0], "sudo pacman -Sy", "{cmds:?}");
+    assert!(
+        pacman[1].starts_with("sudo pacman -S punktfunk-host"),
+        "{cmds:?}"
     );
 }
 
