@@ -1,0 +1,29 @@
+==> Detected Windows (build 26200), x64 — client installer
+==> Choices (nothing below has run yet)
+  Desktop shortcut: no
+==> Stopping running punktfunk apps
+  + taskkill /F /IM punktfunk-client.exe
+  + taskkill /F /IM punktfunk-session.exe
+  + taskkill /F /IM punktfunk-console.exe
+  + taskkill /F /IM punktfunk.exe
+==> Files → %LocalAppData%\Programs\Punktfunk
+  ok would unpack the payload into %LocalAppData%\Programs\Punktfunk
+==> Registry
+  + reg add HKCU\Software\Classes\punktfunk /ve /t REG_SZ /d "URL:Punktfunk stream link" /f
+  + reg add HKCU\Software\Classes\punktfunk /v "URL Protocol" /t REG_SZ /d  /f
+  + reg add HKCU\Software\Classes\punktfunk\DefaultIcon /ve /t REG_SZ /d %LocalAppData%\Programs\Punktfunk\punktfunk-client.exe,0 /f
+  + reg add HKCU\Software\Classes\punktfunk\shell\open\command /ve /t REG_SZ /d ""%LocalAppData%\Programs\Punktfunk\punktfunk-client.exe" "%1"" /f
+  ok would add %LocalAppData%\Programs\Punktfunk to the user PATH
+==> Shortcuts
+  ok would create <start menu>\Punktfunk.lnk → %LocalAppData%\Programs\Punktfunk\punktfunk-client.exe
+  ok would create <start menu>\Punktfunk Console.lnk → %LocalAppData%\Programs\Punktfunk\punktfunk-console.exe
+==> Windows App Runtime
+  ok would ensure the Windows App Runtime (x64; downloaded when missing — a failure warns and never aborts)
+==> Register the uninstaller
+  ok would register 'Punktfunk' in Add/Remove Programs (HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{52464E61-68A1-4621-B6B3-5B8BBB823D1A}_is1)
+
+  Done. Next:
+  1. Open Punktfunk from the Start menu and pick your host.
+  2. Pairing help: https://docs.punktfunk.unom.io/docs/pairing
+  Stuck? https://docs.punktfunk.unom.io/docs/troubleshooting
+

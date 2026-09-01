@@ -13,6 +13,9 @@
 
 pub mod args;
 pub mod choices;
+pub mod exec;
+pub mod plan;
+pub mod report;
 
 use serde::{Deserialize, Serialize};
 
