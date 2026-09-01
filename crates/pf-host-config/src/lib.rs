@@ -410,6 +410,14 @@ pub struct HostConfig {
     /// Clamped to 1..=4; a backend that cannot honor the multiplied rate simply reports what it
     /// achieved and the pacing follows that, exactly as it does for any other refusal.
     pub vdisplay_hz_mult: u32,
+    /// `PUNKTFUNK_GAMESCOPE_VRR=0` — opt OUT of adaptive sync on gamescope sessions. Default on:
+    /// a capable (`+pfhdr9`) gamescope is handed `--adaptive-sync` + `--framerate-limit` at the
+    /// game rate, so it paints — and publishes to PipeWire — on the game's commit instead of its
+    /// synthetic vblank tick, and the stream receives every unique frame up to the session rate
+    /// (the shortfall `vdisplay_hz_mult` papers over on this backend, at the cost of the game
+    /// rendering every frame twice). Inert on a stock/older gamescope: the flags are simply not
+    /// passed (see the `adaptive_sync_args` builder and its `+pfhdr9` probe).
+    pub gamescope_vrr: bool,
 }
 
 impl HostConfig {
@@ -529,6 +537,7 @@ impl HostConfig {
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .unwrap_or(1)
                 .clamp(1, 4),
+            gamescope_vrr: val("PUNKTFUNK_GAMESCOPE_VRR").as_deref().map(str::trim) != Some("0"),
         }
     }
 }

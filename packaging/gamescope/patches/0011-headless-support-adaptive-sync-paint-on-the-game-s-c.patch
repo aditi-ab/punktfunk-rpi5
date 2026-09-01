@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Enrico=20B=C3=BChler?= <enrico.buehler@unom.io>
+Date: Tue, 1 Sep 2026 16:23:41 +0200
+Subject: [PATCH] =?UTF-8?q?headless:=20support=20adaptive=20sync=20?=
+ =?UTF-8?q?=E2=80=94=20paint=20on=20the=20game's=20commit?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A headless gamescope composites on a synthetic vblank: the timer ticks
+at -r and steamcompmgr samples whatever commit is ready. A frame that
+finishes just after the sample waits out a full period, and mismatched
+present/compose grids beat — so a consumer of the PipeWire node (a
+remote-desktop/streaming host) receives measurably fewer unique frames
+than the session rate. The workaround in the field is overdriving -r,
+which makes the compositor (and a vsynced game) do the work twice to
+throw half of it away.
+
+The VRR machinery already does the right thing: with an active-VRR
+connector, steamcompmgr treats every wakeup as a paint opportunity
+(FlipType::VRR paints on hasRepaint; overlay-only repaints defer by
+adaptive_sync_overlay_cycles), and the vblank timer swaps its draw-time
+prediction for the flat kVRRFlushingTime redzone. Nothing about it is
+DRM-specific — and a headless output is the ideal adaptive-sync
+display, since its vblank is a fiction with no scanout to respect.
+
+So let the headless connector participate: SupportsVRR() is true, and
+IsVRRActive() is cv_adaptive_sync — with no scanout cycle to honor,
+"supported" and "active" collapse into "asked for". The in-flight
+present guard stays inert (headless Present() completes immediately
+and queues nothing).
+
+One real interaction: the VRR framerate limiter skips itself when the
+target is within 2 Hz of the refresh rate, deferring to the display's
+own pacing. A display that paces nothing must not be deferred to — on
+headless the limiter is the only throttle the focused app has, and
+skipping it turns every FIFO game loose to render as fast as it can.
+PacesPresents() (default true, headless false) makes that deference
+conditional, so --framerate-limit at the session rate keeps the game
+paced while every present it does make is painted — and published to
+PipeWire — the moment it lands.
+---
+ src/Backends/HeadlessBackend.cpp | 22 +++++++++++++++++++++-
+ src/backend.h                    |  6 ++++++
+ src/meson.build                  |  3 ++-
+ src/steamcompmgr.cpp             |  6 ++++++
+ 4 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/src/Backends/HeadlessBackend.cpp b/src/Backends/HeadlessBackend.cpp
+index 3168c88..1de1540 100644
+--- a/src/Backends/HeadlessBackend.cpp
++++ b/src/Backends/HeadlessBackend.cpp
+@@ -10,6 +10,8 @@ extern int g_nPreferredOutputWidth;
+ extern int g_nPreferredOutputHeight;
+ // `--custom-refresh-rates` (main.cpp): the rates this virtual display may switch between.
+ extern std::vector<uint32_t> g_customRefreshRates;
++// `--adaptive-sync` / Steam's gamescope_control toggle (steamcompmgr.cpp).
++extern gamescope::ConVar<bool> cv_adaptive_sync;
+ 
+ namespace gamescope
+ {
+@@ -52,14 +54,32 @@ namespace gamescope
+         }
+ 		virtual bool IsVRRActive() const override
+ 		{
+-			return false;
++			// Engaged purely by request (`--adaptive-sync`, or Steam's toggle through
++			// gamescope_control): a headless output has no scanout cycle to honor, so
++			// "supported" and "active" collapse into "asked for".
++			return cv_adaptive_sync;
+ 		}
+         virtual std::span<const BackendMode> GetModes() const override
+         {
+             return m_Modes;
+         }
+ 
++        // A headless output is the ideal adaptive-sync display: its vblank is synthetic
++        // (no scanout exists to be respected), so nothing stops a paint from following the
++        // game's commit immediately. Without this, the compose timer quantizes game
++        // presents onto a fictional grid — a frame finished just after the paint sampled
++        // waits out a full period, and a consumer of the PipeWire node (a streaming host)
++        // receives fewer unique frames than the session rate.
+         virtual bool SupportsVRR() const override
++        {
++            return true;
++        }
++
++        // Present() above completes instantly and queues nothing, so this connector paces
++        // nobody — see PacesPresents() in backend.h. With VRR active the framerate limiter
++        // is therefore the ONLY pace the focused app has; steamcompmgr consults this
++        // before letting "target ≈ refresh" stand the limiter down.
++        virtual bool PacesPresents() const override
+         {
+             return false;
+         }
+diff --git a/src/backend.h b/src/backend.h
+index 880aa97..ef8a632 100644
+--- a/src/backend.h
++++ b/src/backend.h
+@@ -190,6 +190,12 @@ namespace gamescope
+ 
+         virtual bool SupportsVRR() const = 0;
+ 
++        // Whether this connector's Present() itself paces flips — a real display's
++        // vblank/VRR cycle, or a nested host compositor's throttle. `false` means presents
++        // complete immediately (headless), so any pacing must come from software: the
++        // framerate limiter must never stand down in deference to such a "display".
++        virtual bool PacesPresents() const { return true; }
++
+         virtual std::span<const uint8_t> GetRawEDID() const = 0;
+         virtual std::span<const uint32_t> GetValidDynamicRefreshRates() const = 0;
+ 
+diff --git a/src/meson.build b/src/meson.build
+index 91bba6b..937a191 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -188,7 +188,8 @@ vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
+ #   +pfhdr6 — …and GAMESCOPE_NO_FOCUS windows are never focus candidates (no new capability)
+ #   +pfhdr7 — …and PipeWire teardown cannot SIGSEGV a lingering compositor (no new capability)
+ #   +pfhdr8 — …and the seat's keyboard carries the XKB_DEFAULT_* keymap (honours the box layout)
+-version_tag = vcs_tag + '+pfhdr8' + ' (' + compiler_name + ' ' + compiler_version + ')'
++#   +pfhdr9 — …and the headless connector supports adaptive sync (paint on game commit)
++version_tag = vcs_tag + '+pfhdr9' + ' (' + compiler_name + ' ' + compiler_version + ')'
+ 
+ gamescope_version_conf = configuration_data()
+ gamescope_version_conf.set('VCS_TAG', version_tag)
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 932316f..49f2d77 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -5965,6 +5965,12 @@ static bool steamcompmgr_should_vblank_window( bool bShouldLimitFPS, uint64_t vb
+ 	{
+ 		bool bCloseEnough = std::abs( g_nSteamCompMgrTargetFPS - nRefreshHz ) < 2;
+ 
++		// "Close enough to the refresh rate" skips the limiter in deference to the
++		// display's own pacing. A connector that does not pace presents (headless)
++		// offers no such deference — the limiter is the only pace there, at any target.
++		if ( !GetBackend()->GetCurrentConnector()->PacesPresents() )
++			bCloseEnough = false;
++
+ 		if ( g_nSteamCompMgrTargetFPS && bShouldLimitFPS && w && !bCloseEnough )
+ 		{
+ 			uint64_t schedule = w->last_commit_first_latch_time + g_SteamCompMgrLimitedAppRefreshCycle;

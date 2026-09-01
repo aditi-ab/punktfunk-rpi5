@@ -42,6 +42,14 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 - **`PUNKTFUNK_INSTALL_OMARCHY_SETUP`** is the env twin for the Omarchy hand-off, which
   previously could only be answered interactively. `PUNKTFUNK_SETUP_BIN` overrides the stub's
   download with a local binary.
+- **Gamescope sessions run adaptive sync** (`punktfunk-gamescope` `+pfhdr9`, patch 0011): the
+  headless connector advertises VRR, so gamescope paints — and publishes to PipeWire — on the
+  game's commit instead of its synthetic vblank tick, and the stream receives every unique frame
+  up to the session rate instead of the tick's quantization of them. The spawn pairs
+  `--adaptive-sync` with `--framerate-limit` at the `-r` rate, because VRR frame callbacks no
+  longer pace the game and the limiter must (the patch keeps it armed on a connector that paces
+  nothing). `PUNKTFUNK_GAMESCOPE_VRR=0` opts out; a stock or older gamescope gets neither flag
+  and behaves exactly as before.
 
 ### Changed
 
