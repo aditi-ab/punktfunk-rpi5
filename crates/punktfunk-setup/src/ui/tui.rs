@@ -236,7 +236,7 @@ impl<'a> Tui<'a> {
             let mark = if on { self.accent(CURSOR) } else { " ".into() };
             match item {
                 Item::Row(field) => {
-                    let label = format!("{:<18}", Screen::label(*field));
+                    let label = format!("{:<25}", Screen::label(*field));
                     let value = screen.value(*field);
                     let text = if on {
                         format!("{}{}", self.highlight(&label), value)
@@ -253,13 +253,6 @@ impl<'a> Tui<'a> {
                     };
                     out.push_str(&format!("{bar}  {mark} {}\n", self.highlight(label)));
                     out.push_str(&format!("{bar}  {rule}\n"));
-                }
-                Item::DryRun => {
-                    out.push_str(&format!("{bar}  {rule}\n"));
-                    out.push_str(&format!(
-                        "{bar}  {mark} {}\n",
-                        self.dim("Dry run — print every command, change nothing")
-                    ));
                 }
                 Item::Uninstall => out.push_str(&format!(
                     "{bar}  {mark} {}\n",

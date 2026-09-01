@@ -4,9 +4,14 @@
 //! literally, as a test. Flags and env twins pin a row before any UI shows it, so `--yes` and
 //! the TUI resolve identically — that is the D5 compatibility promise.
 //!
-//! One default changed from the sh installer on purpose: the punktfunk group is now **yes
-//! everywhere**, not couch-boxes-only. It grants usbip attach, so the row label names the
-//! grant in plain mode too and `--no-punktfunk-group` stays the opt-out.
+//! Two defaults changed from the sh installer on purpose. The punktfunk group is **yes
+//! everywhere**, not couch-boxes-only: it grants usbip attach, so the row label names the
+//! grant in plain mode too and `--no-punktfunk-group` stays the opt-out. The clipboard is
+//! **yes** as well, since each client opts in per host anyway.
+//!
+//! The Omarchy rows live here rather than in `punktfunk-omarchy`, which used to ask for
+//! them itself. `omarchy_setup` stays the umbrella every row defaults to, so the frozen
+//! `--no-omarchy-setup` still clears all four.
 
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +46,10 @@ pub struct Pins {
     pub punktfunk_group: Option<bool>,
     pub linger: Option<bool>,
     pub omarchy_setup: Option<bool>,
+    pub omarchy_toasts: Option<bool>,
+    pub omarchy_idle: Option<bool>,
+    pub omarchy_theme: Option<bool>,
+    pub omarchy_cert: Option<bool>,
     pub mgmt_port: Option<u16>,
     pub no_start: bool,
 }
@@ -61,6 +70,10 @@ pub struct Choices {
     pub move_mgmt_port: bool,
     pub mgmt_port: u16,
     pub omarchy_setup: bool,
+    pub omarchy_toasts: bool,
+    pub omarchy_idle: bool,
+    pub omarchy_theme: bool,
+    pub omarchy_cert: bool,
     /// Why the box chose these — shown next to the row when it is on.
     pub group_why: Option<String>,
     pub gamestream_why: Option<String>,
@@ -88,6 +101,7 @@ impl Choices {
             .couch_box
             .then(|| format!("{couch_why} — virtual Steam Deck pad"));
 
+        let omarchy_setup = pins.omarchy_setup.unwrap_or(true);
         let punktfunk_group = pins.punktfunk_group.unwrap_or(true);
         let gamestream = pins.gamestream.unwrap_or(facts.sunshine_active);
         let linger = pins
@@ -105,12 +119,16 @@ impl Choices {
             switch_from,
             punktfunk_group,
             gamestream,
-            clipboard: pins.clipboard.unwrap_or(false),
+            clipboard: pins.clipboard.unwrap_or(true),
             linger,
             start: !pins.no_start,
             move_mgmt_port: facts.sunshine_active,
             mgmt_port: pins.mgmt_port.unwrap_or(DEFAULT_MGMT_PORT),
-            omarchy_setup: pins.omarchy_setup.unwrap_or(true),
+            omarchy_setup,
+            omarchy_toasts: pins.omarchy_toasts.unwrap_or(omarchy_setup),
+            omarchy_idle: pins.omarchy_idle.unwrap_or(omarchy_setup),
+            omarchy_theme: pins.omarchy_theme.unwrap_or(omarchy_setup),
+            omarchy_cert: pins.omarchy_cert.unwrap_or(omarchy_setup),
             group_why: punktfunk_group.then_some(group_why).flatten(),
             gamestream_why: (gamestream && facts.sunshine_active)
                 .then(|| "Sunshine/Apollo already on this box".to_string()),
@@ -193,7 +211,10 @@ mod tests {
             "the D4 flip: yes on every box, not couch-only"
         );
         assert!(!desktop.gamestream);
-        assert!(!desktop.clipboard);
+        assert!(
+            desktop.clipboard,
+            "the D4 flip: the clipboard is on by default"
+        );
         assert!(!desktop.linger, "a desktop has a graphical seat");
         assert!(desktop.start);
         assert!(

@@ -45,6 +45,11 @@ usage: punktfunk-setup [options]
                         it joins the punktfunk group, which grants usbip attach)
   --linger | --no-linger           start at boot with nobody logged in (default depends on the box)
   --omarchy-setup | --no-omarchy-setup   run `punktfunk-omarchy setup` after an Omarchy install
+                        (the umbrella: --no-omarchy-setup clears the four rows below too)
+  --omarchy-cert | --no-omarchy-cert     trust the console certificate in Chromium
+  --omarchy-toasts | --no-omarchy-toasts pairing and stream toasts
+  --omarchy-idle | --no-omarchy-idle     keep the screen awake while a stream runs
+  --omarchy-theme | --no-omarchy-theme   follow the Omarchy theme in the console
   --mgmt-port N         port to move the management API to if Sunshine/Apollo holds 47990 (default 47991)
   --no-start            install and configure, but don't enable the services
   --uninstall           stop the services and remove the packages + repo (config stays)
@@ -88,6 +93,10 @@ fn parse(args: Vec<String>, env: &Env) -> Result<Cli, (u8, String)> {
             punktfunk_group: env_flag(env, "PUNKTFUNK_INSTALL_PUNKTFUNK_GROUP"),
             linger: env_flag(env, "PUNKTFUNK_INSTALL_LINGER"),
             omarchy_setup: env_flag(env, "PUNKTFUNK_INSTALL_OMARCHY_SETUP"),
+            omarchy_toasts: env_flag(env, "PUNKTFUNK_INSTALL_OMARCHY_TOASTS"),
+            omarchy_idle: env_flag(env, "PUNKTFUNK_INSTALL_OMARCHY_IDLE"),
+            omarchy_theme: env_flag(env, "PUNKTFUNK_INSTALL_OMARCHY_THEME"),
+            omarchy_cert: env_flag(env, "PUNKTFUNK_INSTALL_OMARCHY_CERT"),
             mgmt_port: env
                 .get("PUNKTFUNK_INSTALL_MGMT_PORT")
                 .map(|v| v.parse().unwrap_or(0)),
@@ -131,6 +140,14 @@ fn parse(args: Vec<String>, env: &Env) -> Result<Cli, (u8, String)> {
             "--no-linger" => cli.pins.linger = Some(false),
             "--omarchy-setup" => cli.pins.omarchy_setup = Some(true),
             "--no-omarchy-setup" => cli.pins.omarchy_setup = Some(false),
+            "--omarchy-toasts" => cli.pins.omarchy_toasts = Some(true),
+            "--no-omarchy-toasts" => cli.pins.omarchy_toasts = Some(false),
+            "--omarchy-idle" => cli.pins.omarchy_idle = Some(true),
+            "--no-omarchy-idle" => cli.pins.omarchy_idle = Some(false),
+            "--omarchy-theme" => cli.pins.omarchy_theme = Some(true),
+            "--no-omarchy-theme" => cli.pins.omarchy_theme = Some(false),
+            "--omarchy-cert" => cli.pins.omarchy_cert = Some(true),
+            "--no-omarchy-cert" => cli.pins.omarchy_cert = Some(false),
             "--mgmt-port" => {
                 let raw = value().unwrap_or_default();
                 cli.pins.mgmt_port = Some(
@@ -239,7 +256,7 @@ fn main() -> ExitCode {
     };
 
     let mut choices = Choices::derive(&facts, &cli.pins);
-    let mut opts = Opts {
+    let opts = Opts {
         dry: cli.dry,
         yes,
         tty,
@@ -281,7 +298,6 @@ fn main() -> ExitCode {
                 tui.outro(&["Nothing was changed.".to_string()]);
                 return ExitCode::SUCCESS;
             }
-            Step::DryRun => opts.dry = true,
             Step::Run(action) => choices.action = action,
             Step::Idle | Step::Edit(_) => unreachable!("the settings loop only ends on a choice"),
         }

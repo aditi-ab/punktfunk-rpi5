@@ -588,9 +588,59 @@ fn trap_the_omarchy_hand_off_ends_the_run() {
     let plan = plan_for(&fresh("omarchy", Family::Pacman), &pins());
     let handoff = plan
         .steps()
-        .find(|s| matches!(&s.action, StepAction::RunIfPresent { cmd, .. } if cmd == "punktfunk-omarchy setup"))
+        .find(|s| matches!(&s.action, StepAction::RunIfPresent { cmd, .. } if cmd.starts_with("punktfunk-omarchy setup")))
         .expect("the hand-off step");
     assert!(handoff.ends_run);
+}
+
+/// Every optional part of the hand-off is passed explicitly, so the script never has to ask.
+/// A row that stops being forwarded here becomes a question again on the next Omarchy box.
+#[test]
+fn the_hand_off_carries_every_row_it_used_to_ask_for() {
+    let off = Pins {
+        omarchy_toasts: Some(false),
+        omarchy_theme: Some(false),
+        ..pins()
+    };
+    let cmds = plan_for(&fresh("omarchy", Family::Pacman), &off).commands();
+    let handoff = cmds
+        .iter()
+        .find(|c| c.starts_with("punktfunk-omarchy setup"))
+        .expect("the hand-off command");
+    assert!(handoff.contains("--toasts=0"), "{handoff}");
+    assert!(handoff.contains("--theme=0"), "{handoff}");
+    assert!(handoff.contains("--idle-guard=1"), "{handoff}");
+    assert!(handoff.contains("--cert=1"), "{handoff}");
+    assert!(handoff.contains("--groups=1"), "{handoff}");
+}
+
+/// The labels live in two files — the installer emits them, the script parses them — because the
+/// script ships inside the host package and is not on disk when the settings screen is drawn.
+/// This is the seam that keeps the duplication honest.
+#[test]
+fn trap_every_flag_the_installer_sends_is_one_the_script_accepts() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repo root");
+    let script = std::fs::read_to_string(root.join("packaging/linux/omarchy/punktfunk-omarchy"))
+        .expect("punktfunk-omarchy");
+    let cmds = plan_for(&fresh("omarchy", Family::Pacman), &pins()).commands();
+    let handoff = cmds
+        .iter()
+        .find(|c| c.starts_with("punktfunk-omarchy setup"))
+        .expect("the hand-off command");
+    for flag in handoff.split_whitespace().filter(|w| w.starts_with("--")) {
+        let name = flag.split('=').next().unwrap();
+        assert!(
+            script.contains(&format!("{name}=*)")),
+            "{name} is sent but punktfunk-omarchy has no case for it"
+        );
+    }
+    assert!(
+        !script.contains("read -r -p"),
+        "punktfunk-omarchy setup must not prompt — the installer already asked"
+    );
 }
 
 /// The smoke has to be able to decline the hand-off; the sh installer's question had no twin.
@@ -602,7 +652,9 @@ fn trap_the_hand_off_can_be_declined() {
     };
     let cmds = plan_for(&fresh("omarchy", Family::Pacman), &declined).commands();
     assert!(
-        !cmds.contains(&"punktfunk-omarchy setup".to_string()),
+        !cmds
+            .iter()
+            .any(|c| c.starts_with("punktfunk-omarchy setup")),
         "{cmds:?}"
     );
     // Declining continues generically; nothing is lost.

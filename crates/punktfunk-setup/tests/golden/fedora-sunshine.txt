@@ -2,7 +2,7 @@
 ==> Choices (nothing below has run yet)
   Full controller (joins the punktfunk group — grants usbip attach): yes
   Third-party clients (Moonlight, Artemis): yes  (Sunshine/Apollo already on this box)
-  Shared clipboard: no
+  Shared clipboard: yes
   Start at boot with nobody logged in: no
 ==> Installing: host web-console plugin-runner (stable channel)
   + sudo tee /etc/yum.repos.d/punktfunk.repo >/dev/null <<'REPO'
@@ -27,6 +27,7 @@ REPO
 ==> Options (host.env — everything here is off by default and reversible)
   !! with another GameStream host running, only one can bind the Moonlight ports — stop the other first or skip this
   ok would set PUNKTFUNK_GAMESTREAM=1 in /box/config/punktfunk/host.env
+  ok would set PUNKTFUNK_CLIPBOARD=on in /box/config/punktfunk/host.env
 ==> Firewall
   + sudo firewall-cmd --reload
   + sudo firewall-cmd --permanent --add-service=punktfunk-native --add-service=punktfunk-web --add-service=punktfunk-gamestream --add-port=47991/tcp

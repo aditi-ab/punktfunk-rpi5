@@ -72,6 +72,22 @@ fn a_couch_box_shows_its_derived_defaults() {
     golden("tui-bazzite-couch", &frame);
 }
 
+/// Omarchy's own options are rows on this screen, not a second round of questions from
+/// `punktfunk-omarchy setup` after this one has finished.
+#[test]
+fn an_omarchy_box_asks_for_its_own_options_here() {
+    let (frame, _, _) = drive("omarchy", &[Key::Enter]);
+    golden("tui-omarchy", &frame);
+    for row in [
+        "Console certificate",
+        "Desktop notifications",
+        "Keep the screen awake",
+        "Match the Omarchy theme",
+    ] {
+        assert!(frame.contains(row), "{row} is missing from the screen");
+    }
+}
+
 /// Manage mode: the screen re-titles and grows an Uninstall row.
 #[test]
 fn an_installed_box_shows_the_manage_screen() {
