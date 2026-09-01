@@ -5,8 +5,9 @@
 //! bitmap, no build-time raster step, and it scales by changing one constant.
 //!
 //! Rendering is the half-block idiom: `▀` with foreground = the top pixel and background = the
-//! bottom one gives two square pixels per cell, so `MARK_PX` square is that many columns by
-//! half as many rows. Hard edges, no anti-aliasing: the pixelated look is the point, and the
+//! bottom one gives two pixels per cell. Those pixels are only square when the terminal cell
+//! is exactly 2:1, which is why the grid is not square either — see `MARK_ROWS`.
+//! Hard edges, no anti-aliasing: the pixelated look is the point, and the
 //! terminal background is unknown, so there is nothing safe to blend toward — which is also
 //! why an uncovered cell must actively put the background back rather than leave it inherited.
 //!
@@ -15,11 +16,23 @@
 
 use crate::ui::theme::{Caps, Colors, Layer, Rgb};
 
-/// The mark is square, and must be even: two pixel rows share a cell. 24 px is 12 text rows.
-/// Below 24 the lens stops being a lens: half-blocks give one sample per half-cell, so the
-/// overlap collapses into a stepped wedge and the circles read as blobs. Measured, not guessed.
-pub const MARK_PX: usize = 24;
-pub const MARK_COLS: u16 = MARK_PX as u16;
+/// Pixel columns. Below 24 the lens stops being a lens: half-blocks give one sample per
+/// half-cell, so the overlap collapses into a stepped wedge and the circles read as blobs.
+pub const MARK_COLS: usize = 24;
+
+/// Pixel rows — fewer than the columns, and that is the point.
+///
+/// A half-block pixel is one cell wide by half a cell tall, so it is square only if the cell is
+/// exactly 2:1. Almost none are: 2.1–2.4 is the normal range, and at 2.3 a grid as tall as it is
+/// wide renders the mark 15% taller than wide — circles come out as eggs. Sampling the square
+/// mark into fewer rows than columns cancels that.
+///
+/// 22 assumes a 2.18:1 cell, the middle of the range: the worst case left is about 5%, against
+/// 15% for a square grid. Must stay even — two pixel rows share a text row.
+pub const MARK_ROWS: usize = 22;
+
+/// Text rows the mark occupies.
+pub const MARK_TEXT_ROWS: usize = MARK_ROWS / 2;
 
 const LIGHT: Rgb = Rgb(0xa7, 0x9f, 0xf8);
 const DEEP: Rgb = Rgb(0x6c, 0x5b, 0xf3);
@@ -52,7 +65,7 @@ pub enum Intro {
 pub fn intro_level(caps: &Caps, yes: bool) -> Intro {
     // +2 for the indent the mark is drawn at: a terminal exactly as wide as the mark would
     // wrap its last two columns, and a wrapped line breaks the frame's repaint arithmetic.
-    if !caps.tty || caps.colors < Colors::Ansi256 || caps.width < MARK_COLS + 2 {
+    if !caps.tty || caps.colors < Colors::Ansi256 || usize::from(caps.width) < MARK_COLS + 2 {
         return Intro::Plain;
     }
     if yes {
@@ -136,12 +149,14 @@ pub fn frame_parts(t: f32, parts: Parts) -> Vec<Vec<Option<Rgb>>> {
 
     let (x0, y0, w, h) = bbox();
     let inside = |c: (f32, f32), x: f32, y: f32| (x - c.0).hypot(y - c.1) <= R;
-    (0..MARK_PX)
+    // The square mark is sampled into a grid that is not square, so that the terminal's
+    // taller-than-wide cells put it back to square on the glass.
+    (0..MARK_ROWS)
         .map(|row| {
-            let y = y0 + (row as f32 + 0.5) * h / MARK_PX as f32;
-            (0..MARK_PX)
+            let y = y0 + (row as f32 + 0.5) * h / MARK_ROWS as f32;
+            (0..MARK_COLS)
                 .map(|col| {
-                    let x = x0 + (col as f32 + 0.5) * w / MARK_PX as f32;
+                    let x = x0 + (col as f32 + 0.5) * w / MARK_COLS as f32;
                     match (inside(light, x, y), inside(deep, x, y)) {
                         (true, true) => Some(lens_c),
                         (_, true) => Some(deep_c),
@@ -182,6 +197,14 @@ pub fn render(grid: &[Vec<Option<Rgb>>], caps: &Caps, indent: usize) -> String {
                     out.push_str(&caps.paint(c, Layer::Fg));
                     out.push_str(&caps.clear(Layer::Bg));
                     out.push('▄');
+                }
+                // A cell whose halves match is a BACKGROUND FILL, not a glyph. The terminal
+                // paints the whole cell rectangle — line spacing included — where a drawn
+                // block only covers what the font's glyph box covers, which in several fonts
+                // is a hair short and leaves the mark looking like it has empty rows in it.
+                (Some(a), Some(b)) if a == b => {
+                    out.push_str(&caps.paint(a, Layer::Bg));
+                    out.push(' ');
                 }
                 (Some(a), Some(b)) => {
                     out.push_str(&caps.paint(a, Layer::Fg));
@@ -277,8 +300,8 @@ mod tests {
     #[test]
     fn the_mark_is_square_and_the_grid_is_the_declared_size() {
         let grid = frame(1.0);
-        assert_eq!(grid.len(), MARK_PX);
-        assert!(grid.iter().all(|row| row.len() == MARK_PX));
+        assert_eq!(grid.len(), MARK_ROWS);
+        assert!(grid.iter().all(|row| row.len() == MARK_COLS));
     }
 
     /// The lens only exists where the circles overlap, so it must grow as they arrive.
@@ -315,37 +338,137 @@ mod tests {
         );
     }
 
-    /// A space paints whatever background is in effect. Emitting one without clearing it first
-    /// smeared the previous cell's colour across the rest of the line — which the goldens, being
-    /// colourless, could not see, and a real terminal showed immediately.
+    /// One painted cell, as the terminal would see it.
+    #[derive(Debug, PartialEq)]
+    struct Cell {
+        ch: char,
+        fg: Option<Rgb>,
+        bg: Option<Rgb>,
+    }
+
+    fn parse_cells(line: &str) -> Vec<Cell> {
+        let rgb = |seq: &str| {
+            let parts: Vec<u8> = seq
+                .trim_start_matches("[38;2;")
+                .trim_start_matches("[48;2;")
+                .trim_end_matches('m')
+                .split(';')
+                .filter_map(|v| v.parse().ok())
+                .collect();
+            Rgb(parts[0], parts[1], parts[2])
+        };
+        let (mut fg, mut bg) = (None, None);
+        let mut cells = Vec::new();
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                let mut seq = String::new();
+                for c in chars.by_ref() {
+                    seq.push(c);
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                match seq.as_str() {
+                    s if s.starts_with("[38;2;") => fg = Some(rgb(s)),
+                    s if s.starts_with("[48;2;") => bg = Some(rgb(s)),
+                    "[39m" => fg = None,
+                    "[49m" => bg = None,
+                    "[0m" => {
+                        fg = None;
+                        bg = None;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            cells.push(Cell { ch: c, fg, bg });
+        }
+        cells
+    }
+
+    /// Every cell must paint exactly what the grid says, and nothing it does not.
+    ///
+    /// Two bugs live here. A space paints whatever background is in effect, so an uncovered
+    /// cell that does not clear it smears the previous colour across the line. And a cell whose
+    /// halves match has to be a background fill rather than a block glyph, because a glyph only
+    /// covers the font's glyph box and leaves the mark looking like it has empty rows in it.
     #[test]
-    fn no_blank_cell_is_painted_with_a_leftover_background() {
+    fn every_cell_paints_exactly_what_the_grid_says() {
         let caps = caps(Colors::Truecolor, 80, true);
+        const INDENT: usize = 2;
         for t in [0.0, 0.3, 0.7, 1.0] {
-            let text = render(&frame(t), &caps, 2);
-            let mut bg = false;
-            let mut chars = text.chars();
-            while let Some(c) = chars.next() {
-                if c == '\x1b' {
-                    let mut seq = String::new();
-                    for c in chars.by_ref() {
-                        seq.push(c);
-                        if c.is_ascii_alphabetic() {
-                            break;
+            let grid = frame(t);
+            let text = render(&grid, &caps, INDENT);
+            for (row, line) in text.lines().enumerate() {
+                let cells = parse_cells(line);
+                for pad in &cells[..INDENT] {
+                    assert_eq!(pad.ch, ' ');
+                    assert_eq!(pad.bg, None, "the indent carried a background");
+                }
+                for (col, cell) in cells[INDENT..].iter().enumerate() {
+                    let top = grid[row * 2][col];
+                    let bottom = grid.get(row * 2 + 1).and_then(|r| r[col]);
+                    let what = format!("t={t} row {row} col {col}");
+                    match (top, bottom) {
+                        (None, None) => {
+                            assert_eq!(cell.ch, ' ', "{what}");
+                            assert_eq!(cell.bg, None, "{what}: uncovered cell kept a background");
+                        }
+                        (Some(a), Some(b)) if a == b => {
+                            assert_eq!(cell.ch, ' ', "{what}: a solid cell should be a fill");
+                            assert_eq!(cell.bg, Some(a), "{what}");
+                        }
+                        (Some(a), Some(b)) => {
+                            assert_eq!(cell.ch, '\u{2580}', "{what}");
+                            assert_eq!(cell.fg, Some(a), "{what}");
+                            assert_eq!(cell.bg, Some(b), "{what}");
+                        }
+                        (Some(a), None) => {
+                            assert_eq!(cell.ch, '\u{2580}', "{what}");
+                            assert_eq!(cell.fg, Some(a), "{what}");
+                            assert_eq!(cell.bg, None, "{what}");
+                        }
+                        (None, Some(b)) => {
+                            assert_eq!(cell.ch, '\u{2584}', "{what}");
+                            assert_eq!(cell.fg, Some(b), "{what}");
+                            assert_eq!(cell.bg, None, "{what}");
                         }
                     }
-                    if seq.starts_with("[48;") {
-                        bg = true;
-                    } else if seq == "[49m" || seq == "[0m" {
-                        bg = false;
-                    }
-                } else {
-                    assert!(
-                        !(c == ' ' && bg),
-                        "t={t}: a blank cell carried a background"
-                    );
                 }
             }
+        }
+    }
+
+    /// The mark has to come out round on a real terminal, not on a grid.
+    ///
+    /// The two circles are equal and their union's bounding box is square by construction, so
+    /// its rendered aspect is the whole test. A pixel is one cell wide by half a cell tall, so
+    /// on a cell of aspect A the rows are A/2 as tall as the columns are wide — a square grid
+    /// would fail this at any realistic A, which is exactly the bug it is here to catch.
+    #[test]
+    fn the_mark_renders_round_on_a_real_cell() {
+        let grid = frame(1.0);
+        let (mut min_r, mut max_r) = (usize::MAX, 0usize);
+        let (mut min_c, mut max_c) = (usize::MAX, 0usize);
+        for (r, row) in grid.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                if cell.is_some() {
+                    min_r = min_r.min(r);
+                    max_r = max_r.max(r);
+                    min_c = min_c.min(c);
+                    max_c = max_c.max(c);
+                }
+            }
+        }
+        let cols = (max_c - min_c + 1) as f32;
+        let rows = (max_r - min_r + 1) as f32;
+        for cell_aspect in [2.0f32, 2.18, 2.4] {
+            let ratio = rows * (cell_aspect / 2.0) / cols;
+            assert!(
+                (ratio - 1.0).abs() < 0.12,
+                "on a {cell_aspect}:1 cell the mark renders {ratio:.2}x taller than wide"
+            );
         }
     }
 
@@ -426,13 +549,13 @@ mod tests {
     fn every_two_pixel_rows_share_one_text_row() {
         let caps = caps(Colors::Truecolor, 80, true);
         assert_eq!(
-            MARK_PX % 2,
+            MARK_ROWS % 2,
             0,
             "an odd mark would leave a half-filled last row"
         );
         assert_eq!(
             still(&caps, 0, Parts::default()).lines().count(),
-            MARK_PX / 2
+            MARK_TEXT_ROWS
         );
     }
 }

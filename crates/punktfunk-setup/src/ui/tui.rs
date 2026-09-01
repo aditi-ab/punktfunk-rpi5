@@ -13,7 +13,7 @@ use std::cell::RefCell;
 
 use crate::choices::Action;
 use crate::facts::Channel;
-use crate::ui::logo::{self, Intro, MARK_PX};
+use crate::ui::logo::{self, Intro, MARK_TEXT_ROWS};
 use crate::ui::summary::{Field, Item, Key as UiKey, Screen, Step};
 use crate::ui::term::{Key, Terminal};
 use crate::ui::theme::{Caps, Colors, Layer, BRAND, LENS};
@@ -26,9 +26,6 @@ const CURSOR: &str = "▸";
 const RADIO_ON: &str = "●";
 const RADIO_OFF: &str = "○";
 const WARN: &str = "▲";
-
-/// Rows the mark occupies: two pixel rows per line.
-const MARK_ROWS: usize = MARK_PX / 2;
 
 pub struct Tui<'a> {
     term: RefCell<&'a mut dyn Terminal>,
@@ -155,7 +152,7 @@ impl<'a> Tui<'a> {
                 for i in 0..logo::FRAMES {
                     let t = i as f32 / (logo::FRAMES - 1) as f32;
                     if i > 0 {
-                        self.term.borrow_mut().clear_last_lines(MARK_ROWS);
+                        self.term.borrow_mut().clear_last_lines(MARK_TEXT_ROWS);
                     }
                     self.write(&logo::render(&logo::frame_parts(t, parts), &self.caps, 2));
                     if self.frame_ms > 0 {
@@ -164,7 +161,7 @@ impl<'a> Tui<'a> {
                 }
             }
         }
-        MARK_ROWS
+        MARK_TEXT_ROWS
     }
 
     /// The settings list. Returns what the user chose to do with it.

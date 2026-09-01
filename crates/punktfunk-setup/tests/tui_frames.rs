@@ -9,7 +9,7 @@
 
 use punktfunk_setup::choices::{Choices, Pins};
 use punktfunk_setup::demo;
-use punktfunk_setup::ui::logo::MARK_PX;
+use punktfunk_setup::ui::logo::MARK_TEXT_ROWS;
 use punktfunk_setup::ui::summary::{Screen, Step};
 use punktfunk_setup::ui::term::{Key, ScriptedTerm, Terminal};
 use punktfunk_setup::ui::theme::{Caps, Colors};
@@ -183,7 +183,7 @@ fn the_mark_mutes_the_half_that_is_not_being_installed() {
     let mark_of = |frame: &str| {
         frame
             .lines()
-            .take(MARK_PX / 2)
+            .take(MARK_TEXT_ROWS)
             .collect::<Vec<_>>()
             .join("\n")
     };
