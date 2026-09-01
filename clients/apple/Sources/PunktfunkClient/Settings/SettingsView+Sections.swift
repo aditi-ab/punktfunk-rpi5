@@ -627,13 +627,9 @@ extension SettingsView {
     }
 
     #if os(macOS)
-    /// Dynamic like the captions above, because the setting genuinely has no effect under the
-    /// desktop mouse model (system chords stay local there on every client) — and a toggle that
-    /// silently does nothing should say so instead of leaving the user to find out.
+    /// Dynamic like the captions above: how far the setting reaches depends on whether
+    /// Accessibility is granted, and a toggle whose reach the user cannot see should say so.
     private var inhibitShortcutsDescription: String {
-        if (MouseInputMode(rawValue: effective.mouseMode) ?? .capture) == .desktop {
-            return "No effect under the desktop mouse model — switch Mouse input to Capture."
-        }
         if accessibilityTrusted {
             return "Sends ⌘ shortcuts — ⌘Space, ⌘Tab and Mission Control included — to the host "
                 + "while captured. ⌘⎋ always stays local — it releases capture."
