@@ -9,6 +9,9 @@ members = [
     "crates/punktfunk-encode-worker",
     "crates/punktfunk-tray",
     "crates/punktfunk-setup",
+    # The Windows installer wizard (WinUI 3 over the same engine). Stub bin off-Windows;
+    # shares clients/windows' windows-reactor pin, bumped together.
+    "crates/punktfunk-setup-win",
     "crates/pf-bitstream",
     "crates/pf-bitstream/vendor/cros-codecs",
     "crates/pf-client-core",

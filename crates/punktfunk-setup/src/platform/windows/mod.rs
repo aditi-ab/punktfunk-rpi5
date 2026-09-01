@@ -13,9 +13,11 @@
 
 pub mod args;
 pub mod choices;
+pub mod demo;
 pub mod exec;
 pub mod plan;
 pub mod report;
+pub mod screen;
 pub mod sys;
 
 use serde::{Deserialize, Serialize};

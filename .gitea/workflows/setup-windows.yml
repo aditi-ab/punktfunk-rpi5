@@ -11,11 +11,13 @@ on:
     branches: [main]
     paths:
       - "crates/punktfunk-setup/**"
+      - "crates/punktfunk-setup-win/**"
       - "data/platforms.json"
       - ".gitea/workflows/setup-windows.yml"
   pull_request:
     paths:
       - "crates/punktfunk-setup/**"
+      - "crates/punktfunk-setup-win/**"
       - "data/platforms.json"
       - ".gitea/workflows/setup-windows.yml"
 
@@ -48,7 +50,11 @@ jobs:
           $env:CARGO_TARGET_DIR = 'C:\t-setup'
           cargo test -p punktfunk-setup
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          cargo clippy -p punktfunk-setup --all-targets -- -D warnings
+          # The wizard crate: the headless reactor-harness flow tests (tests/wizard_flow.rs).
+          # Its build.rs stages the WinAppSDK runtime (one nupkg download, cached per runner).
+          cargo test -p punktfunk-setup-win
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          cargo fmt -p punktfunk-setup -- --check
+          cargo clippy -p punktfunk-setup -p punktfunk-setup-win --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cargo fmt -p punktfunk-setup -p punktfunk-setup-win -- --check
           if ($LASTEXITCODE -ne 0) { exit 1 }
