@@ -17,17 +17,20 @@ let meta = #{
 //   skip         string[]  crates to leave alone (done or in-flight)
 //   dry_run      bool
 //   skip_commit  bool
+//   review_only  bool      skip rewrite; inventory → review → commit (crash resume)
 //   batch_size   int       default 4
 
 let skip = [];
 let selected = [];
 let dry_run = false;
 let skip_commit = false;
+let review_only = false;
 let batch_size = 4;
 if args != () {
     if args.skip != () { skip = args.skip; }
     if args.dry_run != () { dry_run = args.dry_run; }
     if args.skip_commit != () { skip_commit = args.skip_commit; }
+    if args.review_only != () { review_only = args.review_only; }
     if args.batch_size != () { batch_size = args.batch_size; }
 }
 if batch_size < 1 { batch_size = 1; }
@@ -170,7 +173,11 @@ let commit_schema = #{
 
 // ---------------------------------------------------------------------------
 phase("Inventory");
-log("Inventory " + selected.len().to_string() + " crates (parallel rewrite follows)");
+if review_only {
+    log("Inventory " + selected.len().to_string() + " crates (review_only: rewrite already on disk)");
+} else {
+    log("Inventory " + selected.len().to_string() + " crates (parallel rewrite follows)");
+}
 
 let inv = agent(inventory_all_prompt(selected), #{
     label: "inventory:all",
@@ -207,17 +214,21 @@ if dry_run {
 }
 
 // ---------------------------------------------------------------------------
-phase("Rewrite");
-let jobs = shard_rewrite_jobs("all", files, batch_size, rewrite_schema);
-log("Rewrite " + jobs.len().to_string() + " batches across " + selected.len().to_string() + " crates");
-let rewrite_results = parallel(jobs);
-
 let claimed_paths = [];
-for r in rewrite_results {
-    if r == () || !r.success || r.output == () { continue; }
-    if r.output.files != () {
-        for f in r.output.files {
-            if f != () && f.path != () { claimed_paths.push(f.path); }
+if review_only {
+    log("Skip rewrite: treating inventory paths as already rewritten");
+    for p in inventory_paths { claimed_paths.push(p); }
+} else {
+    phase("Rewrite");
+    let jobs = shard_rewrite_jobs("all", files, batch_size, rewrite_schema);
+    log("Rewrite " + jobs.len().to_string() + " batches across " + selected.len().to_string() + " crates");
+    let rewrite_results = parallel(jobs);
+    for r in rewrite_results {
+        if r == () || !r.success || r.output == () { continue; }
+        if r.output.files != () {
+            for f in r.output.files {
+                if f != () && f.path != () { claimed_paths.push(f.path); }
+            }
         }
     }
 }
