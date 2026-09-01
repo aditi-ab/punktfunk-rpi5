@@ -1446,14 +1446,17 @@ mod tests {
         drop(vout); // triggers REMOVE + stops the pinger
     }
 
-    /// Forces `Topology::Exclusive` for the duration of a case and puts the operator's real policy
-    /// back on drop — including when the case panics.
+    /// Forces `Topology::Exclusive` **and `KeepAlive::Off`** for the duration of a case and puts
+    /// the operator's real policy back on drop — including when the case panics.
     ///
-    /// The isolate branch this file's Phase-3 cases exercise runs ONLY under `Exclusive`, and a real
-    /// install is usually configured otherwise (.173 is `"topology": "extend"`, which is why the
-    /// first attempt at these cases silently never ran an isolate at all — `topology_action()`
-    /// returns `effective_topology()` as soon as ANY policy is configured). Note this writes the
-    /// host's `display-settings.json`; the guard is what makes that safe to do on a real box.
+    /// The isolate branch this file's Phase-3 cases exercise runs ONLY under `Exclusive`, and a
+    /// real install is usually configured otherwise (`topology_action()` returns
+    /// `effective_topology()` as soon as ANY policy is configured). `KeepAlive::Off` is equally
+    /// load-bearing: every post-teardown assertion here needs the lease drop to actually tear the
+    /// monitor down — under the default 10 s linger the probe races the reaper, and under the
+    /// gaming-rig `forever` the group restore never runs at all (measured on .173: both members
+    /// PINNED, panel left dark, test red for a policy reason). Note this writes the host's
+    /// `display-settings.json`; the guard is what makes that safe to do on a real box.
     struct ExclusiveTopology(crate::policy::DisplayPolicy);
 
     impl ExclusiveTopology {
@@ -1462,9 +1465,10 @@ mod tests {
             let mut forced = original.clone();
             forced.preset = crate::policy::Preset::Custom; // explicit fields are ignored otherwise
             forced.topology = crate::policy::Topology::Exclusive;
+            forced.keep_alive = crate::policy::KeepAlive::Off;
             crate::policy::prefs()
                 .set(forced)
-                .expect("force Topology::Exclusive for this case");
+                .expect("force Topology::Exclusive + KeepAlive::Off for this case");
             assert_eq!(
                 crate::effective_topology(),
                 crate::policy::Topology::Exclusive,
@@ -1604,9 +1608,9 @@ mod tests {
 
         drop(out2);
         drop(out1);
-        thread::sleep(Duration::from_secs(6)); // async PnP removal + the restore settling
-
-        let physicals_after = active_physicals();
+        // Bounded poll, not a fixed sleep: the reaper tick + restore + async PnP removal stack up
+        // to a box-dependent settle (the old 6 s undershot the default linger outright).
+        let physicals_after = wait_for_physicals(Duration::from_secs(20)).unwrap_or_default();
         println!("physicals after teardown  : {physicals_after:?}");
         assert!(
             !physicals_after.is_empty(),
@@ -1704,36 +1708,54 @@ mod tests {
             .collect()
     }
 
-    /// `SDC_TOPOLOGY_EXTEND` needs something to extend ACROSS — and that is the state its callers
-    /// are in, which is why this looked like a defect and is not.
+    /// Poll for the operator's panel to come back, up to `budget`. Teardown is timer-driven even
+    /// at `KeepAlive::Off` (the linger reaper ticks at 500 ms), the CCD restore then settles, and
+    /// PnP removal is async — a fixed sleep undershoots on a slow box and wastes time on a fast
+    /// one. `Some(panel set)` the moment one is active; `None` on budget.
+    fn wait_for_physicals(budget: Duration) -> Option<Vec<(u32, String)>> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let p = active_physicals();
+            if !p.is_empty() {
+                return Some(p);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// `SDC_TOPOLOGY_EXTEND` needs something to extend ACROSS — which is the state its callers
+    /// are in, and why an isolated probe of the preset misleads.
     ///
-    /// `force_extend_topology` carries two jobs: stop a fresh IddCx monitor being CLONED onto the
-    /// existing panel, and serve as `restore_displays_ccd`'s last-resort "the desk is not left
-    /// dark" backstop. Probed directly on .173 with only the LG TV connected, the preset returns
-    /// **rc=31 ERROR_GEN_FAILURE** (`SDC_USE_DATABASE_CURRENT` returns 0), which reads like an
-    /// inert backstop.
+    /// `force_extend_topology` both de-clones a fresh IddCx monitor and serves as
+    /// `restore_displays_ccd`'s dark-desk backstop. Probed alone with one connected display it
+    /// returns rc=31 ERROR_GEN_FAILURE (nothing to extend across) and reads inert; this case is
+    /// the on-glass measurement that it works where it actually fires — active paths
+    /// `1 -> (virtual up) 1 -> (after force-EXTEND) 2`, both real call sites running with the
+    /// virtual still present (the restore fires BEFORE the REMOVE). The same run caught the clone
+    /// hazard live: only the forced EXTEND gave the arriving virtual its own active path.
     ///
-    /// On glass it is not, and this case is the measurement that settled it — active paths
-    /// `1 -> (virtual up) 1 -> (after force-EXTEND) 2`:
+    /// ⚠️ Residual: a restore that fails once the virtual is already gone is back to one
+    /// connected display, where EXTEND returns 31 and cannot re-light anything.
     ///
-    /// * With one connected display there is nothing to extend across, hence rc=31.
-    /// * With the virtual present there are two, and the preset applies. Both real call sites run
-    ///   in exactly that state — the restore fires BEFORE the REMOVE, so the virtual is still
-    ///   there — so the backstop does work where it fires.
-    /// * ⭐ It also caught the clone hazard live: the arriving virtual monitor did **not** get its
-    ///   own active path (1 -> 1), only the forced EXTEND gave it one (-> 2). That is precisely the
-    ///   "no distinct source -> no frames" case `force_extend_topology`'s own doc describes.
-    ///
-    /// ⚠️ Residual worth remembering rather than asserting: a restore that fails once the virtual
-    /// is already gone is back to one connected display, where EXTEND returns 31 and cannot
-    /// re-light anything.
-    ///
-    /// Reports the counts rather than pinning a topology — which answer is "correct" depends on the
-    /// box. It does assert the desk is not left with zero active paths.
+    /// Reports the counts rather than pinning a topology — which answer is "correct" depends on
+    /// the box. It does assert the desk is not left with zero active paths.
     #[test]
     #[ignore = "needs the pf-vdisplay driver on real hardware; run with --ignored"]
     fn live_force_extend_with_a_virtual_display_present() {
+        init_test_tracing();
+        // Pin the lifecycle like the adoption case: without `KeepAlive::Off` the dropped monitor
+        // lingers (or pins, on a gaming-rig box) into the next case AND the teardown assertions
+        // below sample before any restore ran.
+        let _policy = ExclusiveTopology::force();
         let before = active_targets();
+        assert!(
+            !active_physicals().is_empty(),
+            "no external physical panel is active at the start — power the display on first \
+             (a TV in standby reads as Code 45 / zero CCD paths); active now: {before:?}"
+        );
         let mut vd = PfVdisplayDisplay::new().expect("open pf-vdisplay");
         let vout = vd
             .create(Mode {
@@ -1749,7 +1771,8 @@ mod tests {
         thread::sleep(Duration::from_secs(2));
         let after_extend = active_targets();
         drop(vout);
-        thread::sleep(Duration::from_secs(6)); // PnP removal is async — a short wait reads a ghost
+        // Bounded poll, not a fixed sleep — same settle stack as the adoption case above.
+        let panel_back = wait_for_physicals(Duration::from_secs(20));
         let after_drop = active_targets();
         println!("force-EXTEND on glass, ACTIVE TARGETS at each step:");
         println!("  before          : {before:?}");
@@ -1761,7 +1784,7 @@ mod tests {
             "the desk was left with NO active display path after the teardown"
         );
         assert!(
-            !active_physicals().is_empty(),
+            panel_back.is_some(),
             "the operator's physical panel was left DEACTIVATED after teardown: {after_drop:?}"
         );
     }
