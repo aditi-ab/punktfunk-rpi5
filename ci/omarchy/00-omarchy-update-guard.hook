@@ -1,0 +1,20 @@
+# Omarchy's real libalpm PreTransaction hook, vendored for installer-smoke's omarchy row.
+#
+# Source: https://github.com/omacom/omarchy/blob/b686ed892d9c3020c3336203f6d34cc75b544e2b/default/libalpm/hooks/00-omarchy-update-guard.hook
+# Pinned to that commit on purpose. The row's armed canary re-proves, on every run, that this
+# copy still aborts a `pacman -Syu` — so if Omarchy changes the guard upstream, the row goes red
+# instead of quietly testing nothing.
+#
+# ONE deviation from upstream: `Depends = omarchy` is dropped. libalpm skips a hook whose Depends
+# are not installed, and the container has no `omarchy` package — keeping the line would disarm
+# the canary rather than make the test more faithful.
+[Trigger]
+Operation = Upgrade
+Type = Package
+Target = *
+
+[Action]
+Description = Checking Omarchy update entrypoint...
+When = PreTransaction
+Exec = /usr/bin/omarchy-update-pacman-guard
+AbortOnFail

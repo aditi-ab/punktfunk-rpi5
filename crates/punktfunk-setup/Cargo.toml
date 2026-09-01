@@ -1,0 +1,23 @@
+# The guided installer's engine (design/installer-v2.md). Deliberately tiny: no tokio, no
+# async, no platform crates — it has to build static against musl in seconds and run on a box
+# where nothing is installed yet. The TUI deps (cliclack/crossterm) arrive with M2.
+[package]
+name = "punktfunk-setup"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+description = "Guided punktfunk installer: probe the box, derive a plan, run it."
+publish = false
+
+[dependencies]
+anyhow = "1"
+console = "0.16"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+portable-pty = "0.9.0"
+tempfile = "3"
+
+[lints]
+workspace = true

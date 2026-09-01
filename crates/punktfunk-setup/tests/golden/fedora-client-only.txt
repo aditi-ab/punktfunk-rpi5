@@ -1,0 +1,24 @@
+==> Detected fedora → dnf (guide: https://docs.punktfunk.unom.io/docs/fedora)
+==> Choices (nothing below has run yet)
+  Channel: stable
+==> Installing: client (stable channel)
+  + sudo tee /etc/yum.repos.d/punktfunk.repo >/dev/null <<'REPO'
+[punktfunk]
+name=punktfunk
+# fedora-44 on Fedora 44; bazzite on Fedora 43 (a plain Fedora 43 build of the same package)
+baseurl=https://git.unom.io/api/packages/unom/rpm/fedora-44
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://git.unom.io/api/packages/unom/rpm/repository.key
+       https://git.unom.io/api/packages/unom/generic/punktfunk-keys/1/RPM-GPG-KEY-punktfunk
+REPO
+  + sudo dnf install punktfunk-client
+==> Checking
+
+  Done. Next:
+  1. Open punktfunk and pick the host you want to stream from, or add it by address.
+  2. Approve this device in that host's console — or enter a PIN (https://docs.punktfunk.unom.io/docs/pairing).
+  3. Stream. Ctrl+Alt+Shift+Q hands mouse and keyboard back on desktop clients.
+  Stuck? https://docs.punktfunk.unom.io/docs/troubleshooting · client guide: https://docs.punktfunk.unom.io/docs/install-client
+
