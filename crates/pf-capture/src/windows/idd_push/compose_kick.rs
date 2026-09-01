@@ -50,7 +50,7 @@ use super::*;
 /// modern standby) and counts as user presence — every condition under which `SendInput` is
 /// silently impotent (wrong session → wrong input queue; secure desktop → blocked; display off →
 /// nothing composes at all). That set is exactly the lid-closed field-report state.
-pub(super) fn kick_dwm_compose(target_id: u32) {
+pub(super) fn kick_dwm_compose(ccd: pf_win_display::win_display::CcdTargetKey) {
     // Process-GLOBAL throttle (Stage W3): with N parallel capturers each nudging on its own
     // schedule, DWM needs only one dirty per composition window — and the nudge is synthetic INPUT
     // (global, user-visible pointer state), so it must not multiply with capturer count. 50 ms
@@ -69,7 +69,7 @@ pub(super) fn kick_dwm_compose(target_id: u32) {
     let mut pos = POINT::default();
     // SAFETY: plain FFI; `pos` is a valid out-param for this synchronous call.
     let have_pos = unsafe { GetCursorPos(&mut pos) }.is_ok();
-    let rect = pf_win_display::win_display::source_desktop_rect(target_id);
+    let rect = pf_win_display::win_display::source_desktop_rect(ccd);
     // HID-first (see the doc comment): the registered virtual-mouse kick works from any
     // session/desktop and wakes an off display. Both geometries come from CCD (global database),
     // NOT per-session GDI metrics, so the aim is right even from a non-console session. Fall

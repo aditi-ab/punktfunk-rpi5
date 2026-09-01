@@ -143,12 +143,14 @@ fn set_devnode(id: &str, disable: bool) -> bool {
 /// Returns the instance ids to re-enable at teardown.
 pub fn disable_for_deactivated(
     saved: &crate::win_display::SavedConfig,
-    keep_target_id: u32,
+    keep: crate::win_display::CcdTargetKey,
 ) -> Vec<String> {
     const DISPLAYCONFIG_PATH_ACTIVE: u32 = 0x0000_0001;
     let mut targets: Vec<(String, String)> = Vec::new();
     for p in &saved.0 {
-        if p.targetInfo.id == keep_target_id || p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+        if crate::win_display::path_target_key(p) == keep
+            || p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0
+        {
             continue;
         }
         match monitor_instance(p.targetInfo.adapterId, p.targetInfo.id) {
@@ -176,11 +178,11 @@ pub fn disable_for_deactivated(
 /// (the managed virtual set) is excluded belt-and-braces. Runs AFTER the topology action so the
 /// active flags it reads are the settled ones. Journals like [`disable_for_deactivated`]; the
 /// caller merges the returned ids into the same teardown list.
-pub fn disable_connected_inactive(keep_target_ids: &[u32]) -> Vec<String> {
+pub fn disable_connected_inactive(keep: &[crate::win_display::CcdTargetKey]) -> Vec<String> {
     let inventory = crate::win_display::target_inventory();
     let mut targets: Vec<(String, String)> = Vec::new();
     for t in &inventory {
-        if t.active || !t.external_physical || keep_target_ids.contains(&t.target_id) {
+        if t.active || !t.external_physical || keep.contains(&t.key) {
             continue;
         }
         let Some(id) = instance_id_from_interface_path(&t.monitor_device_path) else {

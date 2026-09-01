@@ -338,7 +338,11 @@ use stall::{StallEvidence, StallWatch};
 pub struct IddPushCapturer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
+    /// Driver-protocol target id (ring binding, cursor channel, logs). CCD path selection goes
+    /// through `ccd` — a bare id is only unique per adapter.
     target_id: u32,
+    /// Complete CCD identity (adapter LUID + target id) for every display-global helper.
+    ccd: pf_win_display::win_display::CcdTargetKey,
     /// Owns the shared-header file mapping + its mapped view (RAII unmap-then-close). Declared BEFORE
     /// `header`, which is a raw pointer borrowed into this view via [`MappedSection::ptr`]. Also the
     /// duplication source for the driver's header handle on every [`ChannelBroker::send`].
@@ -921,9 +925,8 @@ impl IddPushCapturer {
                 // one debounce cycle (the poller re-samples in ~250 ms) and never a wrong ring,
                 // which is why this does not block the frame path on a settle poll the way
                 // `open_on` does.
-                let requested =
-                    pf_win_display::win_display::set_advanced_color(self.target_id, want);
-                let observed = pf_win_display::win_display::advanced_color_enabled(self.target_id);
+                let requested = pf_win_display::win_display::set_advanced_color(self.ccd, want);
+                let observed = pf_win_display::win_display::advanced_color_enabled(self.ccd);
                 // A failed READ is not evidence of a failed flip — keep the poller's sample then.
                 now.hdr = observed.unwrap_or(now.hdr);
                 if now.hdr != want {
@@ -1282,7 +1285,7 @@ impl IddPushCapturer {
         if !self.display_hdr {
             return;
         }
-        let queried = pf_win_display::win_display::sdr_white_level_scale(self.target_id);
+        let queried = pf_win_display::win_display::sdr_white_level_scale(self.ccd);
         self.sdr_white_scale = queried.unwrap_or(self.sdr_white_scale);
         tracing::info!(
             target_id = self.target_id,
@@ -1557,7 +1560,7 @@ impl IddPushCapturer {
                     "IDD push: no frame after ring recreate — falling back to a synthetic compose \
                      kick (stash-capable drivers republish at re-attach; old driver?)"
                 );
-                kick_dwm_compose(self.target_id);
+                kick_dwm_compose(self.ccd);
             }
         }
         // Driver-death watch (the SDR path has no other signal): a dead WUDFHost stops publishing,
@@ -2112,7 +2115,7 @@ impl Capturer for IddPushCapturer {
         // driver's stash (measured: new_fps=0 forever after the re-attach). CDS_RESET forces a
         // real mode-set at the CURRENT mode — the same lever bring-up's ADD path relies on —
         // and the ring recreate below then re-attaches after that churn, not before it.
-        match pf_win_display::win_display::resolve_gdi_name(self.target_id) {
+        match pf_win_display::win_display::resolve_gdi_name(self.ccd) {
             Some(gdi) => {
                 if !pf_win_display::win_display::force_mode_reset(&gdi) {
                     tracing::warn!(
@@ -2169,6 +2172,31 @@ impl Drop for IddPushCapturer {
 mod tests {
     use super::stall::Stall;
     use super::*;
+
+    /// The `CcdTargetKey` packing must equal `pf_frame::dxgi::pack_luid` — the capture target's
+    /// `adapter_luid` (packed by pf-frame) is what pf-capture builds its CCD keys from, so a
+    /// divergence would make every display-global helper miss its own target's paths. This crate
+    /// is the lowest one that depends on both, which is why the assertion lives here.
+    #[test]
+    fn ccd_key_packing_matches_pf_frame_pack_luid() {
+        for (low, high) in [
+            (0u32, 0i32),
+            (0xdead_beef, -2),
+            (7, 0x7fff_ffff),
+            (u32::MAX, -1),
+        ] {
+            let luid = windows::Win32::Foundation::LUID {
+                LowPart: low,
+                HighPart: high,
+            };
+            assert_eq!(
+                pf_win_display::win_display::CcdTargetKey::from_luid_parts(low, high, 1)
+                    .adapter_luid,
+                pf_frame::dxgi::pack_luid(luid),
+                "packing diverged for LUID {high:#x}:{low:#x}"
+            );
+        }
+    }
 
     /// W14: the mint must stay inside the publish token's 24-bit generation field, and must skip 0.
     ///

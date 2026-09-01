@@ -34,7 +34,7 @@ use super::{DisplayOwnership, Mode, VirtualOutput};
 use pf_win_display::win_display::{
     count_other_active, force_extend_topology, isolate_displays_ccd, resolve_gdi_name,
     restore_displays_ccd, set_active_mode, set_virtual_primary_ccd, wait_mode_settled,
-    wait_target_departed, SavedConfig,
+    wait_target_departed, CcdTargetKey, SavedConfig,
 };
 
 #[path = "manager/driver.rs"]
@@ -117,6 +117,12 @@ struct Monitor {
 }
 
 impl Monitor {
+    /// This monitor's complete CCD identity — every display-global helper selects paths by it
+    /// (target ids alone are only unique per adapter; `luid` is the IddCx display adapter's).
+    fn ccd_key(&self) -> CcdTargetKey {
+        CcdTargetKey::from_luid_parts(self.luid.LowPart, self.luid.HighPart, self.target_id)
+    }
+
     /// The capture target handed to a session (`None` until the GDI name resolves on a WDDM GPU).
     fn target(&self) -> Option<pf_frame::dxgi::WinCaptureTarget> {
         self.gdi_name
@@ -230,10 +236,10 @@ enum ShrinkAction {
 /// Extracted because the ladder ran this loop three times verbatim, and the 2nd and 3rd copies
 /// documented themselves as "SAFETY: as the resolve loop above" — a pointer to a proof rather than
 /// a proof, which silently rots the moment the block it points at moves.
-fn poll_gdi_name(target_id: u32) -> Option<String> {
+fn poll_gdi_name(key: CcdTargetKey) -> Option<String> {
     for _ in 0..60 {
         thread::sleep(Duration::from_millis(50));
-        if let Some(n) = resolve_gdi_name(target_id) {
+        if let Some(n) = resolve_gdi_name(key) {
             return Some(n);
         }
     }
@@ -256,7 +262,7 @@ pub(crate) static FAIL_NEXT_ISOLATES: std::sync::atomic::AtomicU32 =
 
 /// [`isolate_displays_ccd`] with the test seam in front of it. Every call site in this file goes
 /// through here so an injected failure exercises the same gates a real one would.
-fn isolate_displays_ccd_seam(keep_target_ids: &[u32]) -> Option<SavedConfig> {
+fn isolate_displays_ccd_seam(keep: &[CcdTargetKey]) -> Option<SavedConfig> {
     #[cfg(test)]
     {
         use std::sync::atomic::Ordering;
@@ -267,13 +273,13 @@ fn isolate_displays_ccd_seam(keep_target_ids: &[u32]) -> Option<SavedConfig> {
             .is_ok()
         {
             tracing::warn!(
-                keep = ?keep_target_ids,
+                keep = ?keep,
                 "TEST fault injection: forcing isolate_displays_ccd -> None"
             );
             return None;
         }
     }
-    isolate_displays_ccd(keep_target_ids)
+    isolate_displays_ccd(keep)
 }
 
 /// Decide the [`ShrinkAction`] a NON-LAST-member teardown owes the group.
@@ -311,14 +317,13 @@ fn shrink_action(ccd_exclusive: bool, has_saved: bool) -> ShrinkAction {
 /// the client a size nobody negotiated. The capturer already re-resolves the live size on its own
 /// (`active_resolution` poll, game-capture GB1); the refresh is the field only this read-back can
 /// answer.
-fn committed_mode_or(target_id: u32, requested: Mode) -> Mode {
-    let Some((width, height, refresh_hz)) = pf_win_display::win_display::active_mode(target_id)
-    else {
+fn committed_mode_or(key: CcdTargetKey, requested: Mode) -> Mode {
+    let Some((width, height, refresh_hz)) = pf_win_display::win_display::active_mode(key) else {
         return requested;
     };
     if (width, height) != (requested.width, requested.height) {
         tracing::warn!(
-            target_id,
+            target = %key,
             requested = format!("{}x{}", requested.width, requested.height),
             active = format!("{width}x{height}"),
             "the OS is not running the requested resolution after the settle — recording the \
@@ -328,7 +333,7 @@ fn committed_mode_or(target_id: u32, requested: Mode) -> Mode {
     }
     if refresh_hz != requested.refresh_hz {
         tracing::info!(
-            target_id,
+            target = %key,
             requested_hz = requested.refresh_hz,
             committed_hz = refresh_hz,
             "the OS committed a different refresh than requested (the driver does not advertise \
@@ -371,11 +376,11 @@ struct MgrInner {
 }
 
 impl MgrInner {
-    /// Live target ids in acquire (generation) order — the CCD isolate keep-set + the layout member order.
-    fn target_ids(&self) -> Vec<u32> {
+    /// Live target keys in acquire (generation) order — the CCD isolate keep-set + the layout member order.
+    fn target_keys(&self) -> Vec<CcdTargetKey> {
         let mut mons: Vec<&Monitor> = self.slots.values().map(SlotState::mon).collect();
         mons.sort_by_key(|m| m.generation);
-        mons.iter().map(|m| m.target_id).collect()
+        mons.iter().map(|m| m.ccd_key()).collect()
     }
 }
 
@@ -720,10 +725,10 @@ impl VirtualDisplayManager {
             if let Some(SlotState::Lingering { mon, .. } | SlotState::Pinned { mon }) =
                 inner.slots.remove(&slot)
             {
-                let old_target = mon.target_id;
+                let old_key = mon.ccd_key();
                 tracing::info!(
                     slot,
-                    old_target,
+                    old_target = %old_key,
                     "IDD-push reconnect — preempting the kept (lingering/pinned) monitor, recreating a fresh one"
                 );
                 // SAFETY: `teardown_removed` requires `dev` to be a valid control handle; the `dev`
@@ -734,10 +739,10 @@ impl VirtualDisplayManager {
                 // Let the OS finish the ASYNC monitor departure before the next ADD; a back-to-back
                 // REMOVE→ADD races the teardown and the ADD IOCTL is rejected under reconnect churn.
                 // Verified-state wait, ceiling = the old fixed 400 ms settle (latency plan P0.3).
-                let departed = wait_target_departed(old_target, Duration::from_millis(400));
+                let departed = wait_target_departed(old_key, Duration::from_millis(400));
                 if !departed {
                     tracing::debug!(
-                        old_target,
+                        old_target = %old_key,
                         "preempted monitor still in the active CCD set after the departure ceiling"
                     );
                 }
@@ -756,10 +761,10 @@ impl VirtualDisplayManager {
         if matches!(inner.slots.get(&slot), Some(SlotState::Active { mon, .. }) if !wudf_alive(mon.wudf_pid))
         {
             if let Some(SlotState::Active { mon, .. }) = inner.slots.remove(&slot) {
-                let old_target = mon.target_id;
+                let old_key = mon.ccd_key();
                 tracing::warn!(
                     slot,
-                    old_target,
+                    old_target = %old_key,
                     wudf_pid = mon.wudf_pid,
                     "virtual monitor's WUDFHost is gone — preempting the dead monitor, recreating"
                 );
@@ -769,7 +774,7 @@ impl VirtualDisplayManager {
                 // is exclusively owned here — no aliasing.
                 unsafe { self.teardown_removed(dev_raw(&dev), &mut inner, mon) };
                 // Same async-departure settle as the reconnect preempt above (verified wait, P0.3).
-                let _ = wait_target_departed(old_target, Duration::from_millis(400));
+                let _ = wait_target_departed(old_key, Duration::from_millis(400));
             }
         }
 
@@ -1122,11 +1127,23 @@ impl VirtualDisplayManager {
                     if inner.group.ccd_saved.is_none() || !inner.group.ccd_exclusive {
                         continue; // no exclusive isolate live right now
                     }
-                    let keep = inner.target_ids();
+                    let keep = inner.target_keys();
                     if keep.is_empty() {
                         continue;
                     }
-                    let survivors = count_other_active(&keep).unwrap_or(0);
+                    // A FAILED verification query is UNKNOWN, not "stable": back off to the next
+                    // cycle and mutate nothing (the old `unwrap_or(0)` silently called an unknown
+                    // topology successfully exclusive).
+                    let survivors = match count_other_active(&keep) {
+                        Some(n) => n,
+                        None => {
+                            tracing::debug!(
+                                "exclusive re-assert watchdog: CCD verification query failed — \
+                                 topology state unknown this cycle, mutating nothing"
+                            );
+                            continue;
+                        }
+                    };
                     if survivors == 0 {
                         if fighting > 0 {
                             tracing::info!(
@@ -1216,14 +1233,14 @@ impl VirtualDisplayManager {
         }
         let layout_policy = crate::policy::prefs().get().effective().layout;
         // Members in acquire (generation) order — the auto-row order; identity slot 0 = anonymous (no
-        // manual pin can address it, so it always auto-rows). `(slot, generation, target_id, width)`
+        // manual pin can address it, so it always auto-rows). `(slot, generation, key, width)`
         // copied out so the arrangement below can write back through `get_mut`.
-        let mut ordered: Vec<(u32, u64, u32, i32)> = inner
+        let mut ordered: Vec<(u32, u64, CcdTargetKey, i32)> = inner
             .slots
             .iter()
             .map(|(slot, s)| {
                 let m = s.mon();
-                (*slot, m.generation, m.target_id, m.mode.width as i32)
+                (*slot, m.generation, m.ccd_key(), m.mode.width as i32)
             })
             .collect();
         ordered.sort_by_key(|&(_, generation, _, _)| generation);
@@ -1235,7 +1252,7 @@ impl VirtualDisplayManager {
             })
             .collect();
         let placements = arrange(&members, &layout_policy);
-        let positions: Vec<(u32, i32, i32)> = ordered
+        let positions: Vec<(CcdTargetKey, i32, i32)> = ordered
             .iter()
             .zip(&placements)
             .map(|(&(_, _, target, _), p)| (target, p.x, p.y))
@@ -1292,20 +1309,20 @@ impl VirtualDisplayManager {
     /// unsafe operation at all. It was an `unsafe fn` back when the FFI was inline here, and stayed
     /// one after the FFI moved out: three call sites then carried `unsafe {}` blocks whose SAFETY
     /// proofs asserted things about FFI that is no longer in the body.
-    fn resolve_target_gdi(&self, target_id: u32) -> Option<String> {
+    fn resolve_target_gdi(&self, key: CcdTargetKey) -> Option<String> {
         // 50 ms sampling (latency plan P0.5): the SAME 3 s per-stage ceilings — the 3-stage ladder
         // structure encodes real failure modes (headless auto-activate, integrated-panel clone,
         // lid-closed path activation) and is untouched — but a typical activation resolves on an
         // early poll, so finer sampling shaves ~150 ms off every stage crossing.
-        if let Some(n) = poll_gdi_name(target_id) {
+        if let Some(n) = poll_gdi_name(key) {
             return Some(n);
         }
         force_extend_topology();
-        if let Some(n) = poll_gdi_name(target_id) {
+        if let Some(n) = poll_gdi_name(key) {
             return Some(n);
         }
-        if pf_win_display::win_display::activate_target_path(target_id) {
-            if let Some(n) = poll_gdi_name(target_id) {
+        if pf_win_display::win_display::activate_target_path(key) {
+            if let Some(n) = poll_gdi_name(key) {
                 return Some(n);
             }
         }
@@ -1354,6 +1371,8 @@ impl VirtualDisplayManager {
             self.driver
                 .add_monitor(dev, mode, render_pin, preferred_id, client_hdr, hw_cursor)?
         };
+        let added_key =
+            CcdTargetKey::from_luid_parts(added.luid.LowPart, added.luid.HighPart, added.target_id);
 
         // Mandatory keepalive: ping inside the watchdog window or the driver tears all displays down.
         // ONE device-level pinger serves every slot (any IOCTL bumps the watchdog); started with the
@@ -1363,12 +1382,12 @@ impl VirtualDisplayManager {
         // Resolve the capture target — wait for Windows to auto-activate the freshly-ADDed IDD into its
         // OWN display path, with the integrated-screen clone fallback (shared by the re-arrival path).
         // Its `state`-lock discipline is satisfied: `acquire` holds the lock across this whole call.
-        let gdi_name = self.resolve_target_gdi(added.target_id);
+        let gdi_name = self.resolve_target_gdi(added_key);
         match &gdi_name {
             Some(n) => {
                 tracing::info!(
                     backend = self.driver.name(),
-                    target_id = added.target_id,
+                    target = %added_key,
                     gdi = %n,
                     "IDD target activated into a display path"
                 );
@@ -1391,8 +1410,8 @@ impl VirtualDisplayManager {
                 match topology_action() {
                     Topology::Exclusive => {
                         // The managed keep-set: every live sibling + the new monitor.
-                        let mut keep = inner.target_ids();
-                        keep.push(added.target_id);
+                        let mut keep = inner.target_keys();
+                        keep.push(added_key);
                         if first_member {
                             // EXPERIMENTAL `ddc_power_off` policy axis: command the physical panels
                             // dark over DDC/CI BEFORE the isolate — an HMONITOR (and with it the DDC
@@ -1426,8 +1445,7 @@ impl VirtualDisplayManager {
                                 if let Some(saved) = &inner.group.ccd_saved {
                                     inner.group.pnp_disabled =
                                         pf_win_display::monitor_devnode::disable_for_deactivated(
-                                            saved,
-                                            added.target_id,
+                                            saved, added_key,
                                         );
                                 }
                             }
@@ -1473,8 +1491,19 @@ impl VirtualDisplayManager {
                         // persistence DB, RESETTING a 120 Hz panel to 60 Hz. So force-EXTEND only when the
                         // virtual is currently sole; otherwise skip straight to the reposition, which
                         // re-supplies each physical's QUERIED mode verbatim (preserving its refresh).
-                        let already_extended =
-                            count_other_active(&[added.target_id]).unwrap_or(0) > 0;
+                        // An UNKNOWN answer (query failed) skips the force-EXTEND: mutating the
+                        // topology on unverified state risks resetting a lit panel's refresh for
+                        // nothing, and the reposition below re-supplies the queried modes anyway.
+                        let already_extended = match count_other_active(&[added_key]) {
+                            Some(n) => n > 0,
+                            None => {
+                                tracing::warn!(
+                                    "display topology=primary — CCD query failed; skipping the \
+                                     force-EXTEND (topology state unknown, mutating nothing extra)"
+                                );
+                                true
+                            }
+                        };
                         if already_extended {
                             tracing::info!(
                                 "display topology=primary — a physical display is already active; \
@@ -1485,7 +1514,7 @@ impl VirtualDisplayManager {
                             force_extend_topology();
                             thread::sleep(Duration::from_millis(300));
                         }
-                        inner.group.ccd_saved = set_virtual_primary_ccd(added.target_id);
+                        inner.group.ccd_saved = set_virtual_primary_ccd(added_key);
                     }
                     Topology::Primary => {
                         // A sibling already holds primary (the group's designated member) — the new
@@ -1505,7 +1534,7 @@ impl VirtualDisplayManager {
                 // 1500 ms sleep (a rejected mode / slow third-party CCD-lock holder burns the
                 // ceiling and proceeds, exactly like the sleep it replaces).
                 let settle_start = std::time::Instant::now();
-                let settled = wait_mode_settled(added.target_id, mode, Duration::from_millis(1500));
+                let settled = wait_mode_settled(added_key, mode, Duration::from_millis(1500));
                 tracing::info!(
                     settle_ms = settle_start.elapsed().as_millis() as u64,
                     verified = settled,
@@ -1521,7 +1550,7 @@ impl VirtualDisplayManager {
                 // `/display/state` reports it, and the next Reconfigure diffs against it — a client
                 // re-requesting the rate it actually has would pay a needless resize, while one
                 // re-requesting the phantom rate takes the plain JOIN branch and never tries again.
-                mode = committed_mode_or(added.target_id, mode);
+                mode = committed_mode_or(added_key, mode);
 
                 // Standby-sink neutralisation, second selector (ANY topology): monitors that are
                 // connected but NOT part of the desktop — the standby TV/monitor the
@@ -1547,8 +1576,8 @@ impl VirtualDisplayManager {
                     {
                         thread::sleep(rest);
                     }
-                    let mut keep = inner.target_ids();
-                    keep.push(added.target_id);
+                    let mut keep = inner.target_keys();
+                    keep.push(added_key);
                     for id in pf_win_display::monitor_devnode::disable_connected_inactive(&keep) {
                         if !inner.group.pnp_disabled.contains(&id) {
                             inner.group.pnp_disabled.push(id);
@@ -1557,9 +1586,8 @@ impl VirtualDisplayManager {
                 }
             }
             None => tracing::warn!(
-                "virtual-display target {} not yet an active display path (auto-activate, EXTEND \
-                 preset and explicit path activation all failed — GPU-less box?)",
-                added.target_id
+                "virtual-display target {added_key} not yet an active display path (auto-activate, \
+                 EXTEND preset and explicit path activation all failed — GPU-less box?)"
             ),
         }
 
@@ -1601,6 +1629,7 @@ impl VirtualDisplayManager {
         // FAST PATH (driver-independent): the OS already offers this resolution — the monitor's
         // arrival list, which since the driver's mode-history union contains every size this
         // identity ever served — so a plain CCD mode set reaches it with no driver round-trip.
+        let mon_key = mon.ccd_key();
         let already = pf_win_display::win_display::wait_mode_advertised(&gdi, mode, Duration::ZERO);
         if !already {
             // Out-of-arrival-list mode. On-glass (build 26200) the OS re-parses our description
@@ -1661,7 +1690,7 @@ impl VirtualDisplayManager {
         // Verified-state settle (P0.2): the same committed-state predicate as the create paths. A
         // mode set that did not commit within the ceiling routes to the re-arrival fallback.
         let settle_start = Instant::now();
-        let settled = wait_mode_settled(mon.target_id, mode, Duration::from_millis(1500));
+        let settled = wait_mode_settled(mon_key, mode, Duration::from_millis(1500));
         if !settled {
             anyhow::bail!(
                 "in-place mode set did not commit within 1.5s (advertised after {advertised_ms} ms)"
@@ -1670,7 +1699,7 @@ impl VirtualDisplayManager {
         // Record what actually COMMITTED, not what was asked for — see [`committed_mode_or`], which
         // the fresh-create and re-arrival paths share with this one so all three store the same
         // truth: `mon.mode` is what `/display/state` reports and what the capturer paces to.
-        let landed = committed_mode_or(mon.target_id, mode);
+        let landed = committed_mode_or(mon_key, mode);
         tracing::info!(
             advertised_ms,
             settle_ms = settle_start.elapsed().as_millis() as u64,
@@ -1742,7 +1771,7 @@ impl VirtualDisplayManager {
         // the old fixed 400 ms settle (latency plan P0.3); the driver's ghost-reap ADD retry remains
         // the backstop for a departure the CCD reports early.
         let depart_start = std::time::Instant::now();
-        let departed = wait_target_departed(old.target_id, Duration::from_millis(400));
+        let departed = wait_target_departed(old.ccd_key(), Duration::from_millis(400));
         tracing::info!(
             depart_ms = depart_start.elapsed().as_millis() as u64,
             verified = departed,
@@ -1804,26 +1833,27 @@ impl VirtualDisplayManager {
         // gate's side of the pair (see `Monitor::requested_mode`).
         let requested_mode = mode;
         self.ensure_pinger();
+        let added_key =
+            CcdTargetKey::from_luid_parts(added.luid.LowPart, added.luid.HighPart, added.target_id);
         // 3. Resolve the NEW target's GDI name (target_id changes across a re-arrival). Under the
         //    `state` lock, as its topology-mutator discipline requires.
-        let gdi_name = self.resolve_target_gdi(added.target_id);
+        let gdi_name = self.resolve_target_gdi(added_key);
         match &gdi_name {
             Some(n) => {
                 tracing::info!(
                     backend = self.driver.name(),
-                    "re-arrival target {} -> {n}",
-                    added.target_id
+                    "re-arrival target {added_key} -> {n}"
                 );
                 // ADD only advertises the mode; force it active so DXGI/IDD captures the new size.
                 set_active_mode(n, mode);
                 // 4. Re-isolate the composited set with the NEW target replacing the old — preserving
                 //    the group's first-member restore snapshot. Under the `state` lock (the caller
                 //    holds it and lent us `inner`), as its topology-mutator discipline requires.
-                self.reisolate_after_swap(inner, added.target_id);
+                self.reisolate_after_swap(inner, added_key);
                 // Topology settle before capture reopens: verified-state wait, ceiling = the old
                 // fixed 1500 ms sleep (latency plan P0.2 — the re-arrival twin).
                 let settle_start = std::time::Instant::now();
-                let settled = wait_mode_settled(added.target_id, mode, Duration::from_millis(1500));
+                let settled = wait_mode_settled(added_key, mode, Duration::from_millis(1500));
                 tracing::info!(
                     settle_ms = settle_start.elapsed().as_millis() as u64,
                     verified = settled,
@@ -1834,12 +1864,11 @@ impl VirtualDisplayManager {
                 // [`committed_mode_or`]). Doing this here rather than at the `Monitor` construction
                 // below keeps it on the arm where a path actually exists: with no GDI name there is
                 // no committed mode to read, and the request stands.
-                mode = committed_mode_or(added.target_id, mode);
+                mode = committed_mode_or(added_key, mode);
             }
             None => tracing::warn!(
-                "re-arrival target {} not yet an active display path (auto-activate, EXTEND preset \
-                 and explicit path activation all failed — GPU-less box?)",
-                added.target_id
+                "re-arrival target {added_key} not yet an active display path (auto-activate, \
+                 EXTEND preset and explicit path activation all failed — GPU-less box?)"
             ),
         }
         // 5. Rebuild the Monitor from the ADD reply, PRESERVING `generation` (lease/refcount continuity) and
@@ -1877,13 +1906,13 @@ impl VirtualDisplayManager {
     /// another slot transition's commit. A *serialization* requirement, not a soundness one: every
     /// helper it reaches (`isolate_displays_ccd_seam`, `set_virtual_primary_ccd`) is a safe fn, so
     /// this body performs no unsafe operation. (`&mut MgrInner` already proves the lock is held.)
-    fn reisolate_after_swap(&self, inner: &mut MgrInner, new_target: u32) {
+    fn reisolate_after_swap(&self, inner: &mut MgrInner, new_target: CcdTargetKey) {
         use crate::policy::Topology;
         match topology_action() {
             Topology::Exclusive => {
                 // Grown-set semantics: isolate to the surviving siblings + the new target. The returned
                 // snapshot is DISCARDED — the group keeps the first member's (design §6.1).
-                let mut keep = inner.target_ids();
+                let mut keep = inner.target_keys();
                 keep.push(new_target);
                 let _ = isolate_displays_ccd_seam(&keep);
             }
@@ -1995,7 +2024,7 @@ impl VirtualDisplayManager {
                 // authoritative if the OS re-lit anything). The returned snapshot is discarded;
                 // the group keeps the first member's.
                 ShrinkAction::Reisolate => {
-                    let keep = inner.target_ids();
+                    let keep = inner.target_keys();
                     let _ = isolate_displays_ccd_seam(&keep);
                 }
                 // Re-promote a survivor rather than leaving the desktop's primary on a target that
@@ -2003,7 +2032,7 @@ impl VirtualDisplayManager {
                 // `reisolate_after_swap`, and for the same reason: `set_virtual_primary_ccd`
                 // recaptures one and the group must keep the FIRST member's.
                 ShrinkAction::RepromotePrimary => {
-                    if let Some(&survivor) = inner.target_ids().first() {
+                    if let Some(&survivor) = inner.target_keys().first() {
                         let keep_saved = inner.group.ccd_saved.take();
                         let _ = set_virtual_primary_ccd(survivor);
                         inner.group.ccd_saved = keep_saved;
