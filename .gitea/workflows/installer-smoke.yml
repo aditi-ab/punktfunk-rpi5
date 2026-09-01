@@ -75,6 +75,12 @@ jobs:
       # The consuming jobs read it from the run-scoped cache, not the artifact: the artifact
       # download client re-encodes the storage redirect's presigned URL (%2F -> %252F), which
       # breaks its signature and the storage answers 400. The upload stays for humans.
+      #
+      # actions/cache versions an entry by compression tool, so every job in this hand-off
+      # must agree on zstd or the restore misses (arch images ship it; debian/fedora preps
+      # install it).
+      - name: zstd for the cache archive
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends zstd
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/x86_64-unknown-linux-musl/release/punktfunk-setup
@@ -137,13 +143,13 @@ jobs:
           # script's own prerequisite (it says so and stops without it).
           - family: debian-13
             image: debian:trixie
-            prep: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl git nodejs
+            prep: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl git nodejs zstd
             rmweb: apt-get purge -y punktfunk-web
             oncanary: grep -q ' canary main' /etc/apt/sources.list.d/punktfunk.list
             onstable: grep -q ' stable main' /etc/apt/sources.list.d/punktfunk.list
           - family: fedora-44
             image: fedora:44
-            prep: dnf install -y -q curl git nodejs
+            prep: dnf install -y -q curl git nodejs zstd
             rmweb: dnf remove -y punktfunk-web
             haveclient: rpm -q punktfunk-client
             oncanary: grep -q 'fedora-44-canary' /etc/yum.repos.d/punktfunk.repo
