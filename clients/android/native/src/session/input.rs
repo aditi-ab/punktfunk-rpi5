@@ -16,15 +16,13 @@ use punktfunk_core::quic::{
     HOST_CAP_TEXT_INPUT, PEN_ANGLE_UNKNOWN, PEN_BATCH_MAX, PEN_DISTANCE_UNKNOWN, PEN_TILT_UNKNOWN,
 };
 
-use super::SessionHandle;
+use super::get_session;
 
-/// Shared shim body: guard against a `0` handle, deref, and push one [`InputEvent`].
+/// Retain the keyed session for one non-blocking [`InputEvent`] send.
 fn send_event(handle: jlong, kind: InputKind, code: u32, x: i32, y: i32, flags: u32) {
-    if handle == 0 {
+    let Some(h) = get_session(handle) else {
         return;
-    }
-    // SAFETY: live handle per the nativeConnect/nativeClose contract; send_input is &self.
-    let h = unsafe { &*(handle as *const SessionHandle) };
+    };
     let _ = h.client.send_input(&InputEvent {
         kind,
         _pad: [0; 3],
@@ -158,12 +156,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTextInputSu
     _this: JObject,
     handle: jlong,
 ) -> jboolean {
-    if handle == 0 {
-        return false;
-    }
-    // SAFETY: live handle per the nativeConnect/nativeClose contract; host_caps is &self.
-    let h = unsafe { &*(handle as *const SessionHandle) };
-    h.client.host_caps() & HOST_CAP_TEXT_INPUT != 0
+    get_session(handle).is_some_and(|h| h.client.host_caps() & HOST_CAP_TEXT_INPUT != 0)
 }
 
 /// `NativeBridge.nativeHostSupportsPen(handle)` — the host advertised `HOST_CAP_PEN`, so the
@@ -175,12 +168,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostSupport
     _this: JObject,
     handle: jlong,
 ) -> jboolean {
-    if handle == 0 {
-        return false;
-    }
-    // SAFETY: live handle per the nativeConnect/nativeClose contract; host_caps is &self.
-    let h = unsafe { &*(handle as *const SessionHandle) };
-    h.client.host_caps() & HOST_CAP_PEN != 0
+    get_session(handle).is_some_and(|h| h.client.host_caps() & HOST_CAP_PEN != 0)
 }
 
 /// `NativeBridge.nativeHostSupportsTouch(handle)` — the host advertised `HOST_CAP2_TOUCH`, so
@@ -192,12 +180,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostSupport
     _this: JObject,
     handle: jlong,
 ) -> jboolean {
-    if handle == 0 {
-        return false;
-    }
-    // SAFETY: live handle per the nativeConnect/nativeClose contract; host_caps2 is &self.
-    let h = unsafe { &*(handle as *const SessionHandle) };
-    h.client.host_caps2() & HOST_CAP2_TOUCH != 0
+    get_session(handle).is_some_and(|h| h.client.host_caps2() & HOST_CAP2_TOUCH != 0)
 }
 
 /// Floats per sample in the `nativeSendPen` flat array.
@@ -233,8 +216,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPen(
         if samples.get_region(env, 0, flat).is_err() {
             return Ok(()); // short array — a bridge bug, never worth a crash on the input path
         }
-        // SAFETY: live handle per the nativeConnect/nativeClose contract; send_pen is &self.
-        let h = unsafe { &*(handle as *const SessionHandle) };
+        let Some(h) = get_session(handle) else {
+            return Ok(());
+        };
         let mut batch = [PenSample::default(); PEN_BATCH_MAX];
         for run in flat.chunks(PEN_BATCH_MAX * PEN_JNI_STRIDE) {
             let n = run.len() / PEN_JNI_STRIDE;
@@ -406,12 +390,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadMotionRe
     handle: jlong,
     declared_pref: jint,
 ) -> jboolean {
-    if handle == 0 {
+    let Some(h) = get_session(handle) else {
         return true;
-    }
-    // SAFETY: live handle per the nativeConnect/nativeClose contract; both fields are plain Copy
-    // values read behind `&self`.
-    let h = unsafe { &*(handle as *const SessionHandle) };
+    };
     let declared =
         punktfunk_core::config::GamepadPref::from_u8(declared_pref.clamp(0, u8::MAX as jint) as u8);
     punktfunk_core::config::pad_motion_reaches(
@@ -467,8 +448,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadHidR
         // SAFETY: `ptr`/`cap` describe the direct ByteBuffer's backing store, valid for this call;
         // `n` is bounded by both the buffer capacity and the fixed wire body.
         data[..n].copy_from_slice(unsafe { std::slice::from_raw_parts(ptr, n) });
-        // SAFETY: live handle per the nativeConnect/nativeClose contract; send_rich_input is &self.
-        let h = unsafe { &*(handle as *const SessionHandle) };
+        let Some(h) = get_session(handle) else {
+            return Ok(());
+        };
         let _ = h.client.send_rich_input(RichInput::HidReport {
             pad: (pad as u32 & 0xF) as u8,
             len: n as u8,
@@ -496,11 +478,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadTouc
     x: jint,
     y: jint,
 ) {
-    if handle == 0 {
+    let Some(h) = get_session(handle) else {
         return;
-    }
-    // SAFETY: live handle per the nativeConnect/nativeClose contract; send_rich_input is &self.
-    let h = unsafe { &*(handle as *const SessionHandle) };
+    };
     let _ = h.client.send_rich_input(RichInput::Touchpad {
         pad: (pad as u32 & 0xF) as u8,
         finger: (finger as u32 & 0x1) as u8,
@@ -529,12 +509,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadMoti
     accel_y: jint,
     accel_z: jint,
 ) {
-    if handle == 0 {
+    let Some(h) = get_session(handle) else {
         return;
-    }
+    };
     let c = |v: jint| (v as i64).clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16;
-    // SAFETY: live handle per the nativeConnect/nativeClose contract; send_rich_input is &self.
-    let h = unsafe { &*(handle as *const SessionHandle) };
     let _ = h.client.send_rich_input(RichInput::Motion {
         pad: (pad as u32 & 0xF) as u8,
         gyro: [c(gyro_pitch), c(gyro_yaw), c(gyro_roll)],

@@ -100,8 +100,8 @@ pub type FormatChangedCallback = Box<dyn FnMut(&MediaFormat) + Send>;
 pub type ErrorCallback = Box<dyn FnMut(MediaError, ActionCode, &CStr) + Send>;
 
 impl MediaCodec {
-    /// [punktfunk vendored patch — the ONLY change to this crate] Public so callers can bind
-    /// `AMediaCodec_*` entry points the wrapper doesn't expose yet (here:
+    /// [punktfunk vendored patch] Public so callers can bind `AMediaCodec_*` entry points the
+    /// wrapper doesn't expose yet (here:
     /// `AMediaCodec_setOnFrameRenderedCallback` for the HUD's display stage). The pointer is valid
     /// for `&self`'s lifetime; callers must not delete or re-configure the codec through it.
     pub fn as_ptr(&self) -> *mut ffi::AMediaCodec {
@@ -531,7 +531,7 @@ impl MediaCodec {
 impl Drop for MediaCodec {
     fn drop(&mut self) {
         let status = unsafe { ffi::AMediaCodec_delete(self.as_ptr()) };
-        MediaError::from_status(status).unwrap();
+        let _ = MediaError::from_status(status);
     }
 }
 

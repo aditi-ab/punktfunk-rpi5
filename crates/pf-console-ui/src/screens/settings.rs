@@ -1900,8 +1900,10 @@ fn toggle(value: &mut bool, delta: i32, wrap: bool) -> Option<()> {
     }
 }
 
+// `pub(crate)`, not `pub(super)`: the shell's tests live outside `screens` and share
+// `fake_home` from here — the whole point of there being one copy.
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
     use pf_client_core::trust::Settings;
 
@@ -1932,25 +1934,29 @@ pub(super) mod tests {
         (Settings::default(), Vec::new())
     }
 
-    /// Point the settings store at a throwaway HOME. `apply_row` rebases on the FILE
+    /// Point the settings store at a throwaway config dir. `apply_row` rebases on the FILE
     /// before a mutating press and saves after it, so a test driving that path against the
-    /// real `$HOME` would rewrite the developer's own console settings.
+    /// real profile would rewrite the developer's own console settings.
     ///
-    /// Shared with the library screen's tests, which drive the same `Settings::save` through
-    /// the library bar: one `OnceLock` for the whole binary is what keeps the write to the
-    /// environment sound, and a second copy of this would be exactly the race the SAFETY note
-    /// below rules out.
+    /// Redirects whichever var `trust::config_dir` actually reads here: `HOME` on unix,
+    /// `APPDATA` on Windows. Setting only `HOME` redirected nothing on Windows — every test
+    /// wrote the machine's real `%APPDATA%\punktfunk` file and raced the others through it.
+    ///
+    /// Shared with the shell and library screen tests, which drive the same `Settings::save`:
+    /// one `OnceLock` for the whole binary is what keeps the write to the environment sound,
+    /// and a second copy of this would be exactly the race the SAFETY note below rules out.
     pub(crate) fn fake_home() {
         use std::sync::OnceLock;
         static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
         HOME.get_or_init(|| {
             let dir = std::env::temp_dir().join(format!("pf-settings-test-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
+            let var = if cfg!(windows) { "APPDATA" } else { "HOME" };
             // SAFETY: runs at most once, inside `get_or_init` — concurrent `fake_home` callers
-            // block until it returns, and nothing else in this binary mutates `HOME`. (The old
+            // block until it returns, and nothing else in this binary mutates it. (The old
             // set after the closure ran on EVERY call, so two parallel tests could race the
             // write; setting once under the OnceLock is what makes this sound.)
-            unsafe { std::env::set_var("HOME", &dir) };
+            unsafe { std::env::set_var(var, &dir) };
             dir
         });
     }

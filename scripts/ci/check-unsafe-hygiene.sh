@@ -169,7 +169,6 @@ clients/linux/src/app.rs:1
 clients/linux/src/spawn.rs:1
 clients/session/src/main.rs:4
 crates/pf-console-ui/src/screens/settings.rs:1
-crates/pf-console-ui/src/shell/tests.rs:1
 crates/pf-encode/src/enc/linux/nvenc_cuda.rs:2
 crates/pf-encode/src/enc/linux/worker.rs:1
 crates/pf-encode/src/enc/windows/nvenc.rs:4

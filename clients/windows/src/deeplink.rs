@@ -11,12 +11,13 @@
 //! window is still coming up, and why a hand-off that ultimately fails falls back to running
 //! this instance normally rather than exiting quietly.
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use windows::Win32::commctrl::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::minwindef::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::synchapi::{CreateMutexW, ReleaseMutex};
 use windows::Win32::windef::HWND;
+use windows::Win32::winnt::HANDLE;
 use windows::Win32::winuser::{FindWindowW, SendMessageW, COPYDATASTRUCT, WM_COPYDATA};
 
 /// The single-instance mutex. Named per the design; deliberately not `Global\` — one shell per
@@ -37,7 +38,18 @@ static INBOX: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// The claimed mutex handle, held for the process lifetime. Stored so it is released on exit
 /// (Windows would release it anyway when the process dies; being explicit costs nothing and
 /// documents the intent).
-static MUTEX: AtomicIsize = AtomicIsize::new(0);
+static MUTEX: AtomicUsize = AtomicUsize::new(0);
+
+/// Close one live, process-owned Win32 handle.
+///
+/// # Safety
+/// `handle` must be valid and must not be used or closed after this call.
+unsafe fn close_handle(handle: HANDLE) {
+    windows::core::link!("kernel32.dll" "system" fn CloseHandle(hobject: HANDLE) -> windows::core::BOOL);
+    // SAFETY: the caller's contract makes `handle` a live, process-owned handle that no one
+    // uses or closes again.
+    let _ = unsafe { CloseHandle(handle) };
+}
 
 /// A positional `punktfunk://` (or the `pf://` input alias) anywhere in argv — how protocol
 /// activation, `start`, and a `.lnk` shortcut all deliver a link. Validation happens later in
@@ -52,40 +64,45 @@ pub(crate) fn positional_url(args: &[String]) -> Option<String> {
         .cloned()
 }
 
-/// Try to become the one shell for this user. `true` = we are it; `false` = another instance
-/// holds the mutex and this process should hand off and exit.
+/// Try to claim the user-session mutex and become the primary shell.
+///
+/// `CreateMutexW` returns a valid handle even when the mutex already exists. That secondary handle
+/// is closed immediately; a newly created handle is retained until [`release_primary`]. If creation
+/// fails, this process continues as a primary so activation is not silently dropped.
 pub(crate) fn claim_primary() -> bool {
-    // SAFETY: `CreateMutexW` takes a static wide name literal and no pointer we own; the handle it
-    // returns is stored in `MUTEX` and released once in `release_primary`.
+    // SAFETY: the static name stays live through `CreateMutexW`. Every valid returned handle is
+    // either closed on the secondary path or stored for `release_primary` to take exactly once.
     unsafe {
         let handle = CreateMutexW(None, true, MUTEX_NAME);
-        // Without the mutex we cannot tell primary from secondary; behaving as primary is
-        // the safe answer — a second window is a nuisance, a dropped launch is a bug.
+        // A second window is preferable to dropping the activation when ownership is unknowable.
         if handle.0.is_null() {
             let e = windows::Win32::errhandlingapi::GetLastError();
             tracing::warn!(error = e, "single instance mutex; continuing as primary");
             return true;
         }
-        // ERROR_ALREADY_EXISTS means someone else created it first — `CreateMutexW` still
-        // hands back a valid handle, so ask the OS what actually happened.
         let already = windows::Win32::errhandlingapi::GetLastError()
             == windows::Win32::winerror::ERROR_ALREADY_EXISTS as u32;
         if already {
+            close_handle(handle);
             return false;
         }
-        MUTEX.store(handle.0 as isize, Ordering::Relaxed);
+        MUTEX.store(handle.0 as usize, Ordering::Relaxed);
         true
     }
 }
 
-/// Release the single-instance mutex (process exit).
+/// Relinquish and close the primary mutex handle at process exit.
+///
+/// Taking the handle out of the atomic first makes concurrent or repeated calls no-ops, so the one
+/// stored owner receives exactly one `ReleaseMutex` and one `CloseHandle`.
 pub(crate) fn release_primary() {
     let raw = MUTEX.swap(0, Ordering::Relaxed);
     if raw != 0 {
-        // SAFETY: `raw` is the handle `claim_primary` stored, taken out of the atomic by `swap` so
-        // this runs at most once even if two threads race here.
+        let handle = HANDLE(raw as *mut _);
+        // SAFETY: `handle` is the live owner taken from `MUTEX`; no other caller can take it again.
         unsafe {
-            let _ = ReleaseMutex(windows::Win32::winnt::HANDLE(raw as *mut _));
+            let _ = ReleaseMutex(handle);
+            close_handle(handle);
         }
     }
 }
@@ -153,7 +170,25 @@ pub(crate) fn install_receiver() {
         .ok();
 }
 
-/// The subclass hook: copy our tagged payload out and queue it, pass everything else through.
+/// Decode an OS-marshalled UTF-16 payload without assuming its byte pointer is u16-aligned.
+///
+/// An odd byte count is truncated in the middle of a code unit and is rejected. Complete native-
+/// endian units retain the existing lossy handling of malformed surrogate pairs.
+fn decode_utf16_payload(payload: &[u8]) -> Option<String> {
+    if !payload.len().is_multiple_of(size_of::<u16>()) {
+        return None;
+    }
+    let wide = payload
+        .chunks_exact(size_of::<u16>())
+        .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    Some(String::from_utf16_lossy(&wide))
+}
+
+/// Receive tagged `WM_COPYDATA` links and pass every other window message through.
+///
+/// Null metadata or data pointers are ignored. Payloads are first bounded as bytes, then decoded
+/// without imposing u16 alignment on the buffer Windows marshalled into this process.
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -162,33 +197,27 @@ unsafe extern "system" fn wnd_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
-    if msg == WM_COPYDATA as u32 {
-        // SAFETY: for `WM_COPYDATA` the OS marshals the sender's `COPYDATASTRUCT` and its buffer
-        // into THIS process and keeps both valid for the duration of the handler — that is the
-        // guarantee this relies on, not the sender's honesty, which is why a hostile sender can at
-        // worst supply a wrong `dwData`/contents rather than a bad pointer.
-        let cds = unsafe { &*(lparam.0 as *const COPYDATASTRUCT) };
+    if msg == WM_COPYDATA as u32 && lparam.0 != 0 {
+        // SAFETY: Windows keeps the marshalled `COPYDATASTRUCT` live for this synchronous handler.
+        // The null check above and unaligned value read avoid manufacturing a borrowed reference.
+        let cds = unsafe { (lparam.0 as *const COPYDATASTRUCT).read_unaligned() };
         if cds.dwData == COPYDATA_URL && !cds.lpData.is_null() {
-            let len = cds.cbData as usize / 2;
-            // SAFETY: as above, `lpData` is the OS-marshalled copy, valid for `cbData` bytes and
-            // suitably aligned because the OS allocated it; `len` is `cbData / 2`, so the slice
-            // cannot read past the buffer even if `cbData` is odd (the division rounds down).
-            let slice = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, len) };
-            let url = String::from_utf16_lossy(slice);
-            tracing::debug!(%url, "link from another instance");
-            // Poison-recover, never unwrap: a panic out of a window procedure is an abort since
-            // Rust 1.81, and the inbox is a plain Vec that stays valid whatever a poisoned
-            // writer left behind.
-            INBOX
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(url);
-            return LRESULT(1);
+            // SAFETY: Windows keeps the marshalled payload valid for its declared `cbData` bytes
+            // during this handler. A byte slice imposes no u16-alignment requirement.
+            let payload =
+                unsafe { std::slice::from_raw_parts(cds.lpData.cast::<u8>(), cds.cbData as usize) };
+            if let Some(url) = decode_utf16_payload(payload) {
+                tracing::debug!(%url, "link from another instance");
+                // Poison recovery avoids unwinding from a window procedure; the Vec remains valid.
+                INBOX
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(url);
+                return LRESULT(1);
+            }
         }
     }
-    // SAFETY: the default handler is called with exactly the parameters the OS passed this window
-    // procedure, unmodified — forwarding them on is what a subclass proc is required to do for any
-    // message it does not consume.
+    // SAFETY: forwarding the OS parameters unchanged is required for messages we do not consume.
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
@@ -301,6 +330,39 @@ fn file_name(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Encode a test string in the payload's native-endian byte format.
+    fn utf16_bytes(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(u16::to_ne_bytes).collect()
+    }
+
+    /// Native-endian units decode correctly even when the byte slice starts at an odd address.
+    #[test]
+    fn utf16_payload_decodes_without_alignment() {
+        let mut storage = vec![0xff];
+        storage.extend(utf16_bytes("punktfunk://connect/Café 🎮"));
+        assert_eq!(
+            decode_utf16_payload(&storage[1..]),
+            Some("punktfunk://connect/Café 🎮".to_string())
+        );
+    }
+
+    /// A final unmatched byte is a truncated code unit, not a shorter valid payload.
+    #[test]
+    fn utf16_payload_rejects_odd_truncation() {
+        let mut payload = utf16_bytes("link");
+        payload.pop();
+        assert_eq!(decode_utf16_payload(&payload), None);
+    }
+
+    /// Complete but malformed UTF-16 retains the receiver's lossy replacement behavior.
+    #[test]
+    fn utf16_payload_replaces_a_truncated_surrogate_pair() {
+        assert_eq!(
+            decode_utf16_payload(&0xd83du16.to_ne_bytes()),
+            Some("\u{fffd}".to_string())
+        );
+    }
 
     /// Links are recognised wherever they sit in argv, and nothing else is.
     #[test]

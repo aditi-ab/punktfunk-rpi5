@@ -37,6 +37,31 @@ struct DstBuf {
     cuda: cuda::ExternalDmabuf,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct Nv12Layout {
+    uv_offset: u64,
+    size: u64,
+    pitch_words: u32,
+    uv_offset_words: u32,
+    pitch_usize: usize,
+}
+
+fn nv12_layout(width: u32, height: u32) -> Option<Nv12Layout> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let pitch = u64::from(width).checked_add(3)? & !3;
+    let uv_offset = pitch.checked_mul(u64::from(height))?;
+    let uv_size = pitch.checked_mul(u64::from(height.div_ceil(2)))?;
+    Some(Nv12Layout {
+        uv_offset,
+        size: uv_offset.checked_add(uv_size)?,
+        pitch_words: u32::try_from(pitch / 4).ok()?,
+        uv_offset_words: u32::try_from(uv_offset / 4).ok()?,
+        pitch_usize: usize::try_from(pitch).ok()?,
+    })
+}
+
 /// The lazy compute-CSC pipeline (`rgb2nv12_buf.comp`) for [`VkBridge::import_linear_nv12`].
 struct Csc {
     module: vk::ShaderModule,
@@ -607,11 +632,10 @@ impl VkBridge {
         }
     }
 
-    /// Bridge one LINEAR dmabuf frame into a pooled NV12 CUDA buffer (latency plan T2.5b):
-    /// instead of the plain byte copy, the compute CSC reads the imported RGB texels and writes
-    /// both NV12 planes into the exportable buffer, so NVENC on the gamescope path encodes
-    /// native YUV (its internal RGB→YUV CSC on the contended SM disappears). `pool` must be an
-    /// NV12 pool ([`cuda::BufferPool::new_nv12`]).
+    /// Convert one LINEAR RGB dmabuf into a pooled NV12 CUDA buffer through the Vulkan CSC.
+    /// Source and destination spans are validated before any import, allocation, or dispatch.
+    /// The checked layout must fit Vulkan's byte sizes, the shader's u32 word offsets, and CUDA's
+    /// host `usize`; `pool` must come from [`cuda::BufferPool::new_nv12`].
     pub fn import_linear_nv12(
         &mut self,
         fd: i32,
@@ -625,15 +649,12 @@ impl VkBridge {
             offset % 4 == 0 && stride % 4 == 0,
             "LINEAR dmabuf offset/stride not word-aligned ({offset}/{stride})"
         );
-        // Exportable-buffer NV12 layout the shader writes: 4-aligned Y pitch, UV plane (⌈h/2⌉
-        // rows at the same pitch) directly after the Y plane.
-        let y_pitch = (width as u64 + 3) & !3;
-        let uv_off = y_pitch * height as u64;
-        let dst_size = uv_off + y_pitch * height.div_ceil(2) as u64;
+        let layout = nv12_layout(width, height)
+            .context("NV12 destination layout exceeds addressable buffer or shader offsets")?;
         // SAFETY: same structure and proofs as `import_linear` — `fd` is the caller's live dmabuf
-        // (dup'd by `import_src`), sizes are checked (every frame re-asserts that the imported src
-        // covers `offset + stride*height`; `ensure_dst(dst_size)` makes the exportable buffer at
-        // least the shader's whole write range, whose last word is `dst_size - 4`). The descriptor
+        // (dup'd by `import_src`), and this frame's source span is checked below. `nv12_layout`
+        // proved every destination size and shader offset; `ensure_dst(layout.size)` allocates the
+        // shader's full write range. The descriptor
         // update binds the live cached src buffer and the live dst buffer WHOLE_SIZE; every
         // `*Info`/array is a local outliving its synchronous call; `cmd`/`queue`/`fence` are this
         // bridge's own single-thread handles. The dispatch covers ⌈w/32⌉×⌈h/16⌉ groups of 8×8
@@ -654,7 +675,7 @@ impl VkBridge {
             // As in `import_linear`: this frame's chunk metadata, not the cached import's, decides
             // how far the shader reads.
             anyhow::ensure!(src_size >= span, "dmabuf smaller than frame span");
-            self.ensure_dst(dst_size)?;
+            self.ensure_dst(layout.size)?;
             self.ensure_csc()?;
             let (dst_buffer, dst_cuda_ptr) = {
                 let d = self.dst.as_ref().unwrap();
@@ -704,9 +725,9 @@ impl VkBridge {
                 height,
                 offset / 4,
                 stride / 4,
-                (y_pitch / 4) as u32,
-                (uv_off / 4) as u32,
-                (y_pitch / 4) as u32,
+                layout.pitch_words,
+                layout.uv_offset_words,
+                layout.pitch_words,
             ];
             let push_words = push.map(u32::to_ne_bytes);
             let push_bytes: &[u8] = push_words.as_flattened();
@@ -762,8 +783,8 @@ impl VkBridge {
             let out = pool.get()?;
             cuda::copy_pitched_nv12_to_buffer(
                 dst_cuda_ptr,
-                dst_cuda_ptr + uv_off,
-                y_pitch as usize,
+                dst_cuda_ptr + layout.uv_offset,
+                layout.pitch_usize,
                 &out,
             )?;
             Ok(out)
@@ -907,5 +928,27 @@ impl Drop for VkBridge {
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nv12_layout_checks_sizes_and_shader_offsets() {
+        assert_eq!(
+            nv12_layout(1919, 1080),
+            Some(Nv12Layout {
+                uv_offset: 2_073_600,
+                size: 3_110_400,
+                pitch_words: 480,
+                uv_offset_words: 518_400,
+                pitch_usize: 1920,
+            })
+        );
+        assert_eq!(nv12_layout(0, 1080), None);
+        assert_eq!(nv12_layout(1920, 0), None);
+        assert_eq!(nv12_layout(u32::MAX, u32::MAX), None);
     }
 }

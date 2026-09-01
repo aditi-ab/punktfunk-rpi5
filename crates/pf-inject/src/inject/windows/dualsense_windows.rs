@@ -872,9 +872,21 @@ mod drain_tests {
         write32(buf, OFF_OUT_SEQ, seq);
     }
 
+    /// View exactly the source slice's storage as bytes, including for short test buffers.
     fn bytes_mut(buf: &mut [u32]) -> &mut [u8] {
-        // SAFETY: a u32 slice reinterpreted as bytes — same allocation, laxer alignment.
-        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, SHM_SIZE) }
+        let byte_len = buf
+            .len()
+            .checked_mul(size_of::<u32>())
+            .expect("u32 slice byte length overflow");
+        // SAFETY: `byte_len` is exactly the source slice's allocation range; u8 needs less alignment.
+        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), byte_len) }
+    }
+
+    /// A short source cannot produce a full-section byte slice.
+    #[test]
+    fn byte_view_stays_within_the_source_slice() {
+        let mut buf = [0u32; 2];
+        assert_eq!(bytes_mut(&mut buf).len(), 2 * size_of::<u32>());
     }
 
     fn read32(buf: &mut [u32], off: usize) -> u32 {

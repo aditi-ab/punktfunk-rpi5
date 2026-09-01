@@ -15,7 +15,7 @@ use jni::EnvUnowned;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use super::SessionHandle;
+use super::get_session;
 
 /// `NativeBridge.nativeAccessState(handle): IntArray?` — the live access state as
 /// `[grants, remainingSecs, updateSeq]`; `null` on a `0` handle. `grants` is the
@@ -32,11 +32,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeAccessState
     handle: jlong,
 ) -> JIntArray<'local> {
     env.with_env(|env| -> jni::errors::Result<JIntArray<'local>> {
-        if handle == 0 {
+        let Some(h) = get_session(handle) else {
             return Ok(JIntArray::default());
-        }
-        // SAFETY: live handle per the nativeConnect/nativeClose contract.
-        let h = unsafe { &*(handle as *const SessionHandle) };
+        };
         // Drain the event plane into the seq counter. The connector's grants/deadline slots
         // are already the latest-wins fold when an event lands — the events carry no state
         // this read doesn't get below, they are purely the "something arrived" cue. Zero

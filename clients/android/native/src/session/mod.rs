@@ -1,21 +1,12 @@
-//! Session lifecycle + plane wiring over JNI.
+//! Session lifecycle and media-plane JNI wiring.
 //!
-//! A connected session is a [`SessionHandle`] — an `Arc<NativeClient>` plus the decode thread it
-//! feeds — boxed and handed to Kotlin as an opaque `jlong`. The connector is `Sync`, so the decode
-//! thread pulls the video plane (`next_frame`) directly while Kotlin still holds the handle.
+//! Kotlin receives an opaque integer key, never a Rust pointer. A process-local table stores
+//! `Arc<SessionHandle>` values so close-vs-call races retain the session until each active JNI call
+//! finishes; duplicate or stale closes become no-ops.
 //!
-//! Wired: connect/close, the video plane (HEVC `next_frame` → NDK AMediaCodec → the SurfaceView's
-//! `ANativeWindow`, see [`crate::decode`]), host→client audio ([`crate::audio`]), input
-//! (`send_input` — mouse/keyboard/gamepad), rumble/DualSense HID feedback ([`crate::feedback`]),
-//! and the trust surface: `nativeGenerateIdentity` (persistent identity, Keystore-wrapped on the
-//! Kotlin side), `nativeConnect` with identity + pin (TOFU / pinned), and `nativePair` (SPAKE2 PIN).
-//!
-//! Split by concern: [`connect`] (identity + connect/close + the trust surface), [`planes`]
-//! (video/audio/mic start/stop + the stats drain), [`input`] (the input-plane shims), [`probe`]
-//! (the bandwidth speed test). This module keeps the shared infrastructure they all deref through.
-//!
-//! TODO(M4 Android stage 1): client→host DualSense rich input (`send_rich_input`), mode
-//! renegotiation. Port the remaining orchestration from `clients/linux`.
+//! [`connect`] owns identity, trust, connect, and close. [`planes`] owns video/audio/mic lifecycles,
+//! [`input`] forwards control events, and [`probe`] runs bandwidth measurements. Decode and audio
+//! workers share the `Sync` connector while the table controls the outer session lifetime.
 
 mod access;
 mod clipboard;
@@ -25,9 +16,10 @@ mod planes;
 mod probe;
 
 use punktfunk_core::client::NativeClient;
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 /// Run a JNI body, catching any panic at the FFI boundary and returning `default` instead.
@@ -55,7 +47,7 @@ pub(crate) fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// A live session behind the `jlong` handle: the connector + the decode thread it feeds.
+/// One table-owned live session: its connector, media workers, and session-scoped state.
 pub(crate) struct SessionHandle {
     // Read only by the android decode path (`nativeStartVideo` → `crate::decode`); on the host
     // build (CI's workspace clippy/build) those readers are cfg'd out, so it's intentionally unused.
@@ -101,6 +93,39 @@ pub(crate) struct SessionHandle {
     pub surface_size: Arc<AtomicU64>,
 }
 
+static NEXT_SESSION_HANDLE: AtomicU64 = AtomicU64::new(0x1000_0000_0000_0001);
+
+fn session_handles() -> &'static Mutex<HashMap<i64, Arc<SessionHandle>>> {
+    static HANDLES: OnceLock<Mutex<HashMap<i64, Arc<SessionHandle>>>> = OnceLock::new();
+    HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn insert_session(session: SessionHandle) -> i64 {
+    let session = Arc::new(session);
+    let mut handles = lock_recover(session_handles());
+    loop {
+        let handle = NEXT_SESSION_HANDLE.fetch_add(1, Ordering::Relaxed) as i64;
+        if handle != 0 && !handles.contains_key(&handle) {
+            handles.insert(handle, session);
+            return handle;
+        }
+    }
+}
+
+pub(crate) fn get_session(handle: i64) -> Option<Arc<SessionHandle>> {
+    if handle == 0 {
+        return None;
+    }
+    lock_recover(session_handles()).get(&handle).cloned()
+}
+
+pub(crate) fn remove_session(handle: i64) -> Option<Arc<SessionHandle>> {
+    if handle == 0 {
+        return None;
+    }
+    lock_recover(session_handles()).remove(&handle)
+}
+
 /// Pack a surface's pixel size into one `u64` — so the presenter reads width and height as a
 /// single atomic load and can never see a torn pair (a new width against an old height).
 /// Non-positive values pack as `0`, the "not reported yet" sentinel.
@@ -126,9 +151,9 @@ struct VideoThread {
 }
 
 impl SessionHandle {
-    /// Signal the decode thread to stop and join it. Idempotent.
+    /// Stop and join the decode thread once, recovering a poisoned slot during teardown.
     fn stop_video(&self) {
-        if let Some(mut vt) = self.video.lock().unwrap().take() {
+        if let Some(mut vt) = lock_recover(&self.video).take() {
             vt.shutdown.store(true, Ordering::SeqCst);
             if let Some(j) = vt.join.take() {
                 let _ = j.join();
@@ -136,26 +161,22 @@ impl SessionHandle {
         }
     }
 
-    /// Stop + close audio playback. Dropping the [`crate::audio::AudioPlayback`] joins its decode
-    /// thread and closes the AAudio stream. Idempotent.
+    /// Drop audio playback once; its destructor joins decode and closes AAudio.
     #[cfg(target_os = "android")]
     fn stop_audio(&self) {
-        let _ = self.audio.lock().unwrap().take();
+        let _ = lock_recover(&self.audio).take();
     }
 
-    /// Stop mic uplink. Dropping the [`crate::mic::MicCapture`] joins its encode thread and closes
-    /// the AAudio input stream. Idempotent.
+    /// Drop mic capture once; its destructor joins encode and closes AAudio.
     #[cfg(target_os = "android")]
     fn stop_mic(&self) {
-        let _ = self.mic.lock().unwrap().take();
+        let _ = lock_recover(&self.mic).take();
     }
 
-    /// Stop pad audio. Dropping the [`crate::pad_audio::PadAudio`] joins its render thread, which
-    /// is what guarantees nothing is still writing to the descriptor when Kotlin closes the
-    /// `UsbDeviceConnection`. Idempotent.
+    /// Drop pad audio once and join its renderer before Kotlin closes the USB connection.
     #[cfg(target_os = "android")]
     pub(crate) fn stop_pad_audio(&self) {
-        let _ = self.pad_audio.lock().unwrap().take();
+        let _ = lock_recover(&self.pad_audio).take();
     }
 }
 

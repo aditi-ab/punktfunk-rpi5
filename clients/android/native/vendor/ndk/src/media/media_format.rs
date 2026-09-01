@@ -263,6 +263,6 @@ impl Drop for MediaFormat {
     #[doc(alias = "AMediaFormat_delete")]
     fn drop(&mut self) {
         let status = unsafe { ffi::AMediaFormat_delete(self.as_ptr()) };
-        MediaError::from_status(status).unwrap()
+        let _ = MediaError::from_status(status);
     }
 }

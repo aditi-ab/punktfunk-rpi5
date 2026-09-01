@@ -68,19 +68,18 @@ pub struct MicCapture {
     join: Option<std::thread::JoinHandle<()>>,
 }
 
+// SAFETY: Rust accesses the stream only through this unique owner. Drop first stops and joins the
+// encode worker, then AAudio closes the stream and quiesces its own callback; it may run on any
+// non-callback JNI thread. The session mutex prevents concurrent application-side stream access.
+unsafe impl Send for MicCapture {}
+
 impl MicCapture {
-    /// Open AAudio (LowLatency, 48 kHz/mono/f32) for **input** with a realtime callback that
-    /// forwards captured PCM to a channel, then spawn the Opus encode + uplink thread. With
-    /// `echo_cancel` the stream opens under the `VoiceCommunication` input preset — the HAL's own
-    /// echo canceller / noise suppressor on the capture path (the default `VoiceRecognition`
-    /// preset deliberately bypasses them, which is why the host used to hear its own stream back
-    /// from a speaker-playing phone) — and allocates an audio session id for Kotlin's Java-effect
-    /// backstop. `None` on failure (the caller leaves the rest of the session streaming).
+    /// Open low-latency 48 kHz mono capture and start the Opus uplink worker.
     ///
-    /// `muted` is the SESSION's live mic-mute flag (owned by `SessionHandle`, not by this capture),
-    /// honoured per frame by [`encode_loop`]. Sharing it rather than owning it is what makes mute
-    /// survive the mic stop/start a surface recreate performs — and means a capture started while
-    /// muted never encodes its first frame, so there is no window for one to escape.
+    /// `echo_cancel` selects the voice-communication preset and an audio session for Kotlin's
+    /// effects. The realtime callback only copies into recycled buffers and validates every foreign
+    /// pointer/length pair before slicing. `muted` remains session-owned across capture restarts.
+    /// Returns `None` without disturbing the rest of the stream when setup fails.
     pub fn start(
         client: Arc<NativeClient>,
         echo_cancel: bool,
@@ -109,10 +108,16 @@ impl MicCapture {
             let cb_free_tx = free_tx.clone(); // returns the buffer when the data channel is full
 
             let callback = move |_s: &AudioStream, data: *mut c_void, num_frames: i32| {
-                let n = num_frames as usize * CHANNELS;
-                // SAFETY: for an input stream AAudio provides `num_frames * channel_count` captured
-                // F32 samples at `data` (read-only for us).
-                let inp = unsafe { std::slice::from_raw_parts(data as *const f32, n) };
+                let Some(n) = crate::audio_format::callback_sample_count(num_frames, CHANNELS)
+                else {
+                    return AudioCallbackResult::Continue;
+                };
+                if data.is_null() {
+                    return AudioCallbackResult::Stop;
+                }
+                // SAFETY: AAudio supplies `n` captured f32 samples at non-null `data`; the shared
+                // length validator rejected nonpositive or unrepresentable callback counts.
+                let inp = unsafe { std::slice::from_raw_parts(data.cast::<f32>(), n) };
                 cb_captured.fetch_add(num_frames as u64, Ordering::Relaxed);
                 match free_rx.try_recv() {
                     Ok(mut buf) => {
@@ -225,16 +230,22 @@ impl MicCapture {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let sd = shutdown.clone();
-        let join = std::thread::Builder::new()
+        let join = match std::thread::Builder::new()
             .name("pf-mic".into())
             .spawn(move || encode_loop(client, rx, free_tx, sd, muted, captured, dropped))
-            .ok();
+        {
+            Ok(join) => join,
+            Err(e) => {
+                log::error!("mic: encode thread spawn failed: {e}");
+                return None;
+            }
+        };
 
         Some(MicCapture {
             _stream: stream,
             session_id,
             shutdown,
-            join,
+            join: Some(join),
         })
     }
 

@@ -83,22 +83,12 @@ fn motion_matches_the_shared_vectors() {
     );
 }
 
-/// Point the settings/known-hosts stores at a throwaway HOME — the settings screen
-/// SAVES on adjust, and a test must never write the developer's real config.
-fn fake_home() {
-    use std::sync::OnceLock;
-    static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
-    HOME.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("pf-console-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        // SAFETY: runs at most once, inside `get_or_init` — concurrent `fake_home` callers
-        // block until it returns, and nothing else in this binary mutates `HOME`. (The old
-        // re-set after the closure ran on EVERY call, so two parallel tests could race the
-        // write; setting once under the OnceLock is what makes this sound.)
-        unsafe { std::env::set_var("HOME", &dir) };
-        dir
-    });
-}
+/// Point the settings/known-hosts stores at a throwaway config dir — the settings screen
+/// SAVES on adjust, and a test must never write the developer's real config. THE shared
+/// helper, not a copy: a second `OnceLock` here picked a second directory, so whichever
+/// test ran first decided where the whole binary wrote and the other's saves landed
+/// somewhere its loads never looked.
+use crate::screens::settings::tests::fake_home;
 
 fn hosts() -> Vec<HostRow> {
     let base = HostRow {

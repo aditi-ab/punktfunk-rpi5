@@ -373,8 +373,7 @@ impl<'a> NativeWindowBufferLockGuard<'a> {
 
 impl<'a> Drop for NativeWindowBufferLockGuard<'a> {
     fn drop(&mut self) {
-        let ret = unsafe { ffi::ANativeWindow_unlockAndPost(self.window.ptr.as_ptr()) };
-        assert_eq!(ret, 0);
+        let _ = unsafe { ffi::ANativeWindow_unlockAndPost(self.window.ptr.as_ptr()) };
     }
 }
 
