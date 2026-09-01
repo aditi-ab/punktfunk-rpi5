@@ -72,6 +72,13 @@ jobs:
         with:
           name: punktfunk-setup-musl
           path: target/x86_64-unknown-linux-musl/release/punktfunk-setup
+      # The consuming jobs read it from the run-scoped cache, not the artifact: the artifact
+      # download client re-encodes the storage redirect's presigned URL (%2F -> %252F), which
+      # breaks its signature and the storage answers 400. The upload stays for humans.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/x86_64-unknown-linux-musl/release/punktfunk-setup
+          key: punktfunk-setup-musl-${{ github.run_id }}
 
   omarchy:
     name: omarchy integration self-check
@@ -102,12 +109,13 @@ jobs:
       - name: Prepare the container
         run: pacman -Sy --noconfirm --needed curl git nodejs && (pacman-key --init >/dev/null 2>&1 || true)
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/download-artifact@v3
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          name: punktfunk-setup-musl
-          path: /usr/local/bin
-      - name: Make it executable
-        run: chmod +x /usr/local/bin/punktfunk-setup
+          path: target/x86_64-unknown-linux-musl/release/punktfunk-setup
+          key: punktfunk-setup-musl-${{ github.run_id }}
+          fail-on-cache-miss: true
+      - name: Install the built binary
+        run: install -m 755 target/x86_64-unknown-linux-musl/release/punktfunk-setup /usr/local/bin/punktfunk-setup
       - name: Install under Omarchy's update guard
         run: bash ci/omarchy/row.sh
 
@@ -154,12 +162,13 @@ jobs:
         run: ${{ matrix.prep }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Fetch the installer binary built from this tree
-        uses: actions/download-artifact@v3
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          name: punktfunk-setup-musl
-          path: /usr/local/bin
-      - name: Make it executable
-        run: chmod +x /usr/local/bin/punktfunk-setup
+          path: target/x86_64-unknown-linux-musl/release/punktfunk-setup
+          key: punktfunk-setup-musl-${{ github.run_id }}
+          fail-on-cache-miss: true
+      - name: Install the built binary
+        run: install -m 755 target/x86_64-unknown-linux-musl/release/punktfunk-setup /usr/local/bin/punktfunk-setup
       # No tty → the installer runs as --yes; --no-start because there is no user systemd here.
       # Root without sudo → the sudo shim, another path under test.
       - name: Run the installer unattended
