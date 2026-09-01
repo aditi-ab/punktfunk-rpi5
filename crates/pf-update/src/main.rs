@@ -1,34 +1,20 @@
-//! `pf-update` — the root helper behind triggered Linux package updates
-//! (planning: `host-update-from-web-console.md` §7, plan U2.1).
+//! Root helper for triggered Linux package updates. Polkit starts it for members of
+//! `punktfunk-update`; each unit's `ExecStart` is a fixed verb.
 //!
-//! Two verbs, one per product:
+//! * `apply` — host (`punktfunk-update.service`)
+//! * `apply-client` — client (`punktfunk-client-update.service`)
 //!
-//! * `pf-update apply` — the HOST, via `punktfunk-update.service` (triggered from the web
-//!   console).
-//! * `pf-update apply-client` — the CLIENT, via `punktfunk-client-update.service` (triggered
-//!   by `punktfunk-client --apply-update`, which is what the Decky plugin's one-tap runs).
+//! argv is the verb only. Install kind comes from a root-owned marker, the package list
+//! from the local package database, payloads from the distro's signed repos. Both verbs
+//! upgrade every installed `punktfunk*` package; the verb picks which marker to read and
+//! which binary the post-install gate (`--version` must exit 0) runs.
 //!
-//! Both are started by an unprivileged process through polkit, authorised for members of the
-//! `punktfunk-update` group. **The helper takes zero attacker-influenceable parameters**: no
-//! versions, no URLs, no package names from the caller — the verb comes from a root-owned
-//! unit's fixed `ExecStart`, the install kind from root-owned markers, the package list from
-//! the local package database, and every payload from the distro package manager's own signed
-//! repositories. Compromising a trigger yields "run the system's normal update for the
-//! punktfunk packages", nothing more.
+//! Result JSON is `/var/lib/punktfunk/{,client-}update-result.json` (root-written,
+//! world-readable). stdout/stderr go to the unit journal.
 //!
-//! Both verbs upgrade every installed `punktfunk*` package — a box with both gets both,
-//! whichever unit ran. What the verb changes is which marker is read (the two packages cannot
-//! own one marker path: that is a hard conflict in deb, rpm and pacman alike) and which binary
-//! the **run-the-binary gate** executes afterwards, requiring a clean exit — the
-//! CI-green-on-the-wrong-program class (the 0.22.0 clobber) dies there for one binary run's
-//! worth of cost. The outcome is written to `/var/lib/punktfunk/{,client-}update-result.json`
-//! (root-written, world-readable) for the unprivileged caller to read; stdout/stderr land in
-//! the unit's journal.
+//! Design: `host-update-from-web-console.md`.
 
-// ROOT RUNS THIS. `deny` rather than `forbid` only because of the single `geteuid` call in
-// `linux_main::effective_uid`, which carries the one localized `#[allow(unsafe_code)]` in the
-// crate and explains there why it is not worth a dependency to remove. Any NEW unsafe anywhere
-// in this helper is a build error.
+// `deny` not `forbid`: `effective_uid` is the one `#[allow(unsafe_code)]` in this root helper.
 #![deny(unsafe_code)]
 
 #[cfg(target_os = "linux")]
@@ -40,15 +26,8 @@ mod linux_main {
     const OSTREE_BOOTED: &str = "/run/ostree-booted";
     const PACMAN_OPTIN_CONF: &str = "/etc/punktfunk/update.conf";
 
-    /// Which product this run was started for. It comes from the VERB in a root-owned unit's
-    /// fixed `ExecStart` — never from an unprivileged caller — so it stays inside the
-    /// zero-attacker-influenceable-parameters rule: the two units differ only in which
-    /// product's marker they read and which binary the run-the-binary gate executes.
-    ///
-    /// Two units exist rather than one because the host and the client are separate packages
-    /// and every packaging format we ship treats two packages owning one path as a hard
-    /// conflict — a client-only box (a Steam Deck, a handheld) must be able to install the
-    /// helper without the host package.
+    /// Which marker to read and which binary the post-install gate runs. Two units, two
+    /// paths — one path owned by two packages is a hard conflict in deb, rpm, and pacman.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Mode {
         Host,
@@ -70,7 +49,6 @@ mod linux_main {
             }
         }
 
-        /// The binary the run-the-binary gate executes after a package-manager run.
         fn gate_binary(self) -> &'static str {
             match self {
                 Mode::Host => "/usr/bin/punktfunk-host",
@@ -93,10 +71,8 @@ mod linux_main {
         }
     }
 
-    /// What the host reads back. Field meanings mirror the mgmt API's `UpdateResultInfo`
-    /// where they overlap; `changed=false` is the "your package source has nothing newer
-    /// yet" case (not an error), `staged=true` means a reboot finishes the update
-    /// (rpm-ostree).
+    /// JSON the unprivileged caller reads. `changed=false` is idle, not failure;
+    /// `staged=true` means rpm-ostree needs a reboot to finish.
     #[derive(Serialize)]
     struct HelperResult {
         ok: bool,
@@ -117,16 +93,12 @@ mod linux_main {
             .unwrap_or(0)
     }
 
-    /// Root-owned facts → the apply strategy. Mirrors the host's ladder for the kinds a
-    /// root helper serves (the helper decides for ITSELF — never trusts its caller).
+    /// Kind from root-owned markers and `/run/ostree-booted`, not from argv.
     fn detect_kind(mode: Mode) -> Result<&'static str, String> {
         if Path::new(mode.sysext_marker()).exists() {
             return match mode {
                 Mode::Host => Ok("sysext"),
-                // `punktfunk-sysext update` pulls the HOST image from the signed feed; there
-                // is no client feed to pull from (a client sysext is the local
-                // packaging/arch/build-sysext.sh wrapper). Refusing here is the honest answer
-                // — the alternative would install the host over a client-only box.
+                // The signed sysext feed is the host image. Running it here would replace a client-only box.
                 Mode::Client => Err(
                     "this client is a sysext, and the sysext feed carries the host image only \
                      — rebuild and re-install the client image instead"
@@ -169,8 +141,7 @@ mod linux_main {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
-    /// The installed punktfunk packages, from the LOCAL package database — upgrade exactly
-    /// what this box has (host-only installs don't grow a web console out of nowhere).
+    /// Names from the local package database — a host-only box must not grow a client package.
     fn installed_packages(query: &mut Command, what: &str) -> Result<Vec<String>, String> {
         let out = run_capture(query, what)?;
         let pkgs: Vec<String> = out
@@ -185,9 +156,7 @@ mod linux_main {
         Ok(pkgs)
     }
 
-    /// The run-the-binary gate's reading: execute what we just installed and take its
-    /// `--version`. A binary that cannot run is an update that did NOT stick, whatever the
-    /// package manager reported (the 0.22.0 clobber lesson).
+    /// Post-install: `--version` must exit 0. Package-manager success is not enough.
     fn gate_version(mode: Mode) -> Result<String, String> {
         let bin = mode.gate_binary();
         run_capture(
@@ -196,12 +165,11 @@ mod linux_main {
         )
     }
 
-    /// The per-kind command tables (design §5). Returns `staged` (activation needs a reboot).
+    /// Per-kind apply. `Ok(true)` means the new bits wait for a reboot (rpm-ostree).
     fn apply_for_kind(kind: &str) -> Result<bool, String> {
         match kind {
             "apt" => {
-                // Refresh only OUR index when the documented list file exists (S5);
-                // otherwise a full refresh — normal admin behavior, just slower.
+                // Restrict apt-get update to our list when it exists; a full refresh is slower, not safer.
                 let ours = "/etc/apt/sources.list.d/punktfunk.list";
                 let mut update = Command::new("apt-get");
                 update.env("DEBIAN_FRONTEND", "noninteractive");
@@ -240,9 +208,8 @@ mod linux_main {
                 Ok(false)
             }
             "rpm-ostree" => {
-                // A layered package only re-resolves when forced — the single-transaction
-                // uninstall+install dance (packaging/bazzite/update-punktfunk.sh). Staged;
-                // a reboot activates it.
+                // Layered packages re-resolve only via uninstall+install in one transaction.
+                // Staged: reboot activates.
                 let pkgs = installed_packages(
                     Command::new("rpm").args(["-qa", "--qf", "%{NAME}\n", "punktfunk*"]),
                     "rpm -qa",
@@ -260,7 +227,6 @@ mod linux_main {
                 Ok(true)
             }
             "sysext" => {
-                // The proven signed-feed updater; it refreshes the merged /usr in place.
                 run(
                     Command::new("punktfunk-sysext").arg("update"),
                     "punktfunk-sysext update",
@@ -268,9 +234,7 @@ mod linux_main {
                 Ok(false)
             }
             "pacman" => {
-                // Arch doctrine: partial upgrades break boxes, so the ONLY thing this
-                // helper will run is a full -Syu — and only when the operator opted into
-                // that explicitly (root-owned config, not the API).
+                // Partial Arch upgrades break the box. Full `-Syu` only, and only with the root-owned opt-in.
                 let optin = std::fs::read_to_string(PACMAN_OPTIN_CONF)
                     .ok()
                     .map(|c| c.lines().any(|l| l.trim() == "PACMAN_FULL_SYSUPGRADE=1"))
@@ -317,8 +281,6 @@ mod linux_main {
                 std::process::exit(2);
             }
         };
-        // Effective root is required for every leg; refuse early with a clear message
-        // rather than half-running.
         if effective_uid() != 0 {
             eprintln!("pf-update: must run as root (start punktfunk-update.service)");
             std::process::exit(1);
@@ -348,8 +310,7 @@ mod linux_main {
         let before = gate_version(mode).unwrap_or_default();
 
         let outcome = apply_for_kind(kind).and_then(|staged| {
-            // The run-the-binary gate: the freshly installed binary must actually run.
-            // Skipped for staged (rpm-ostree) — the new binary isn't in /usr until reboot.
+            // Staged rpm-ostree leaves the new binary out of /usr until reboot — skip the gate.
             let after = if staged {
                 before.clone()
             } else {
@@ -397,22 +358,16 @@ mod linux_main {
         std::process::exit(if ok { 0 } else { 1 });
     }
 
-    // One libc symbol, declared directly — not worth a libc dependency in a root helper.
-    // (Edition 2024 spells extern blocks `unsafe extern`, which the `unsafe_code` lint now
-    // counts — the same one-named-exemption rule as `effective_uid` below applies.)
+    // Direct `geteuid` — a libc crate is not worth it here. Edition 2024 `unsafe extern`
+    // trips `unsafe_code`; the allow matches `effective_uid` below.
     #[allow(unsafe_code)]
     unsafe extern "C" {
         #[link_name = "geteuid"]
         fn libc_geteuid() -> u32;
     }
 
-    /// The crate's ONLY unsafe operation, isolated so the crate-level `deny(unsafe_code)` can
-    /// stand and the exemption is one named function rather than a whole call site.
-    ///
-    /// Deliberately NOT rewritten to `rustix::process::geteuid()`: this crate's Cargo.toml states
-    /// that the zero-dependency posture *is* a security invariant of a root helper ("no HTTP
-    /// client, no TLS, no argument parsing"), so pulling in a general-purpose syscall crate to
-    /// delete one `unsafe` would trade a real property for a cosmetic one.
+    /// Sole `unsafe` in the crate so `deny(unsafe_code)` can stand. Do not swap in
+    /// `rustix::process::geteuid()` — Cargo.toml's zero-dep posture is the point of this helper.
     #[allow(unsafe_code)]
     fn effective_uid() -> u32 {
         // SAFETY: `geteuid` is a POSIX syscall wrapper that takes no arguments, reads no memory
