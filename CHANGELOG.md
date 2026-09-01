@@ -362,6 +362,17 @@ repairs loss, not delay; a bitrate backoff cannot shorten a hole). In the 2026-0
 read `loss_ppm=50000` exactly and cut ×0.7 three times, to 6.86 Mbps in 4 s, on a wire with zero
 measured loss.
 
+### Security
+
+- **Remote administration.** GameStream PINs are ceremony-bound and source-limited, HTTP listeners
+  are connection-bounded, and Omarchy no longer puts a console bearer URL in process arguments.
+  Stable-release operators must supply the signing-job leaf hash and configure
+  `AUTHENTICODE_SUBJECT` before running `announce`.
+- **Build and local trust.** Android verifies Skia, Gradle and dependency bytes; local art, temporary
+  session specs, Windows config paths, PipeWire plane counts and USB/IP import sockets are bounded or
+  identity-checked. Regenerate the committed Gradle locks and verification metadata on dependency
+  changes.
+
 ### Security review 2026-08-25
 
 58 findings across host, console, clients and supply chain. **Read that number for what it is:** the
