@@ -56,6 +56,12 @@ const MUTED: Color = Color {
 /// Stepper dot diameter; the line is 2 px and meets the dot's edge.
 const DOT: f64 = 10.0;
 
+/// The lockup intro: the website's 1.3 s at 16 ms a frame.
+const LOGO_FRAMES: u32 = 81;
+/// The mark's box and the wordmark's width, in px; both scale from the site's geometry.
+const MARK: f64 = 112.0;
+const WORD: f64 = 236.0;
+
 /// Command echo and the password: a monospace face that ships with Windows.
 const MONO: &str = "Consolas";
 
@@ -208,6 +214,9 @@ struct Ctx {
     reveal: bool,
     /// The install page's progress bar, tweened 0 → 1 across the plan's phases.
     bar: f64,
+    /// The Welcome lockup's intro, 0 → 1 once on mount (the website's orbit + slide-in).
+    logo: f64,
+    scheme: ColorScheme,
     set_custom: AsyncSetState<bool>,
     set_reveal: AsyncSetState<bool>,
     set_screen: AsyncSetState<WinScreen>,
@@ -257,6 +266,25 @@ impl Component for WizardRoot {
         let (log, set_log) = cx.use_async_state(Vec::<LogLine>::new());
         let (reveal, set_reveal) = cx.use_async_state(false);
         let (custom, set_custom) = cx.use_async_state(false);
+        let scheme = cx.use_color_scheme();
+
+        // The lockup intro plays once, on mount — the same worker-tween, no guard needed.
+        let (logo, set_logo) = cx.use_async_state(0.0f64);
+        cx.use_effect((), {
+            let set_logo = set_logo.clone();
+            move || {
+                if !animations_enabled() {
+                    set_logo.call(1.0);
+                    return;
+                }
+                std::thread::spawn(move || {
+                    for i in 0..=LOGO_FRAMES {
+                        set_logo.call(f64::from(i) / f64::from(LOGO_FRAMES));
+                        std::thread::sleep(std::time::Duration::from_millis(16));
+                    }
+                });
+            }
+        });
 
         // The slide is a manual tween (the client shell's): reactor's one-shot animations run
         // from the visual's CURRENT value, and a freshly mounted page has nothing to fade from.
@@ -341,6 +369,8 @@ impl Component for WizardRoot {
             custom,
             reveal,
             bar,
+            logo,
+            scheme,
             set_custom,
             set_reveal,
             set_screen,
@@ -751,6 +781,96 @@ fn option_card(ctx: &Ctx, custom: bool, title: &str, detail: &str) -> Element {
     .into()
 }
 
+/// The brand lockup — the mark above the "funk" wordmark — with the website's one-shot
+/// intro (pfweb `BrandMark.tsx` / `Wordmark.tsx`) at progress `t` (0 → 1 over 1.3 s):
+/// the two circles orbit once on an axis into the screen, scaling in antiphase with a
+/// small diagonal sway that vanishes at rest, the lens highlight fades in over the tail,
+/// and the letters slide in from the right, staggered. Everything lands on the static mark.
+fn lockup(t: f64, scheme: ColorScheme) -> Element {
+    use std::f64::consts::{FRAC_1_SQRT_2, TAU};
+    // The site's geometry: circles r=194.41 in a 1000 box, cropped to the mark's own box.
+    const R: f64 = 194.41;
+    const BOX: f64 = 583.776;
+    const ORIGIN: (f64, f64) = (208.627, 208.443);
+    let k = MARK / BOX;
+    let angle = TAU * (1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(4));
+    let circle = |cx: f64, cy: f64, side: f64, color: Color| -> (f64, Element) {
+        let z = side * angle.sin() * 0.34;
+        let p = 1.05 / (1.05 - z);
+        let mag = side * 0.06 * (angle.cos() - 1.0);
+        let (tx, ty) = (
+            mag * -FRAC_1_SQRT_2 * 1000.0 * p,
+            mag * FRAC_1_SQRT_2 * 1000.0 * p,
+        );
+        let d = 2.0 * R * k * p;
+        let x = (cx - ORIGIN.0 + tx) * k - d / 2.0;
+        let y = (cy - ORIGIN.1 + ty) * k - d / 2.0;
+        (
+            p,
+            Shape::ellipse()
+                .fill(color)
+                .width(d)
+                .height(d)
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .vertical_alignment(VerticalAlignment::Top)
+                .margin(edges(x, y, 0.0, 0.0))
+                .into(),
+        )
+    };
+    let light = circle(403.037, 597.262, 1.0, brand::LIGHT_CIRCLE);
+    let deep = circle(597.808, 402.853, -1.0, brand::DEEP_CIRCLE);
+    // The nearer circle paints on top; the crisp overlap only reads once they settle.
+    let mut layers: Vec<Element> = if light.0 <= deep.0 {
+        vec![light.1, deep.1]
+    } else {
+        vec![deep.1, light.1]
+    };
+    let h = ((t - 0.6) / 0.346).clamp(0.0, 1.0);
+    let h = 1.0 - (1.0 - h).powi(3);
+    if let Some(uri) = brand::uri("lens-highlight.png") {
+        let size = MARK * (0.6 + 0.4 * h);
+        layers.push(
+            Image::new_with_uri(uri)
+                .stretch(Stretch::Uniform)
+                .width(size)
+                .height(size)
+                .opacity(h)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into(),
+        );
+    }
+    let mark = grid(layers).width(MARK).height(MARK);
+
+    // Letters: each slides in from its own width, 0.55 s from 0.15 s + 90 ms per letter.
+    const LETTER_W: [f64; 4] = [108.54, 133.33, 142.87, 141.79];
+    let wk = WORD / 579.0;
+    let wh = 136.0 * wk;
+    let letters: Vec<Element> = (0..4)
+        .filter_map(|i| {
+            let uri = brand::letter(scheme, i)?;
+            let start = (0.15 + 0.09 * i as f64) / 1.3;
+            let e = ((t - start) / (0.55 / 1.3)).clamp(0.0, 1.0);
+            let e = 1.0 - (1.0 - e).powi(5);
+            let off = (1.0 - e) * LETTER_W[i] * wk;
+            Some(
+                Image::new_with_uri(uri)
+                    .stretch(Stretch::Uniform)
+                    .width(WORD)
+                    .height(wh)
+                    .opacity(e)
+                    .margin(edges(off, 0.0, -off, 0.0))
+                    .into(),
+            )
+        })
+        .collect();
+    let word = grid(letters).width(WORD).height(wh);
+    vstack((mark, word))
+        .spacing(10.0)
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .into()
+}
+
 fn welcome_page(ctx: &Ctx) -> Element {
     let what = match ctx.preset.artifact {
         Artifact::Host => "host",
@@ -758,13 +878,15 @@ fn welcome_page(ctx: &Ctx) -> Element {
     };
     // Manage mode (D9): an installed box re-titles Welcome. The uninstaller exe (D6) offers
     // the teardown only; the installer offers Reconfigure — the upgrade path — or Uninstall.
-    let wordmark = match &ctx.screen.facts.installed {
-        Some(inst) => match &inst.version {
-            Some(v) => format!("punktfunk {v} · {what} installed"),
-            None => format!("punktfunk · {what} installed"),
-        },
-        None => "punktfunk".to_string(),
-    };
+    let subtitle = ctx
+        .screen
+        .facts
+        .installed
+        .as_ref()
+        .map(|inst| match &inst.version {
+            Some(v) => format!("{v} · {what} installed"),
+            None => format!("{what} installed"),
+        });
     let fresh_install = !ctx.preset.uninstall && ctx.screen.facts.installed.is_none();
     let (sentence, buttons): (&str, Vec<Element>) = if ctx.preset.uninstall {
         (
@@ -805,24 +927,17 @@ fn welcome_page(ctx: &Ctx) -> Element {
             )],
         )
     };
-    let mut children: Vec<Element> = Vec::new();
-    if let Some(uri) = brand::mark_uri() {
+    let mut children: Vec<Element> = vec![lockup(ctx.logo, ctx.scheme)];
+    if let Some(subtitle) = subtitle {
         children.push(
-            Image::new_with_uri(uri)
-                .stretch(Stretch::Uniform)
-                .width(104.0)
-                .height(104.0)
+            text_block(subtitle)
+                .font_size(16.0)
+                .semibold()
+                .foreground(ThemeRef::SecondaryText)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .into(),
         );
     }
-    children.push(
-        text_block(wordmark)
-            .font_size(34.0)
-            .semibold()
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .into(),
-    );
     children.push(
         text_block(sentence)
             .wrap()
@@ -1329,11 +1444,16 @@ pub fn run(preset: WinPreset, seams: Seams) -> windows_reactor::Result<()> {
     let root = WizardRoot::new(preset, seams);
     // Self-contained: the runtime DLLs sit beside the exe (build.rs), so there is
     // deliberately NO windows_reactor::bootstrap() call — that is the framework path (S1).
-    App::new()
+    let mut app = App::new()
         .title("Punktfunk Setup")
         .inner_size(980.0, 700.0)
-        .backdrop(Backdrop::Mica)
-        .render(move |cx| root.render(&(), cx))
+        .backdrop(Backdrop::Mica);
+    // WinUI ignores the exe's embedded icon for the window; the title bar and taskbar
+    // take it from a file.
+    if let Some(icon) = brand::path("punktfunk.ico") {
+        app = app.icon(icon.display().to_string());
+    }
+    app.render(move |cx| root.render(&(), cx))
 }
 
 #[cfg(test)]

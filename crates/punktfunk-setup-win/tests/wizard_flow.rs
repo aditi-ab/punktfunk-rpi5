@@ -187,6 +187,30 @@ impl Wiz {
         })
     }
 
+    /// The toggle of the Configure row labelled `label`: the first ToggleSwitch created
+    /// after that label — row order inside a section, whatever the columns do.
+    fn toggle_of(&self, label: &str) -> ControlId {
+        self.host.with_reconciler(|r| {
+            let ops = &r.backend.ops;
+            let at = ops
+                .iter()
+                .position(
+                    |op| matches!(op, Op::SetProp { value: PropValue::Str(s), .. } if s == label),
+                )
+                .unwrap_or_else(|| panic!("no row labelled '{label}'"));
+            ops[at..]
+                .iter()
+                .find_map(|op| match op {
+                    Op::Create {
+                        id,
+                        kind: ControlKind::ToggleSwitch,
+                    } => Some(*id),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no toggle after '{label}'"))
+        })
+    }
+
     /// The nth control of `kind` ever created (creation order = row order).
     fn nth(&self, kind: ControlKind, n: usize) -> ControlId {
         self.host.with_reconciler(|r| {
@@ -243,8 +267,7 @@ fn the_fresh_host_demo_walks_welcome_to_done_through_the_fake_executor() {
         "the fresh-only password row"
     );
 
-    // Row order is creation order: Driver, Gamepad, HDR, Gamestream — toggle Moonlight on.
-    let gamestream = wiz.nth(ControlKind::ToggleSwitch, 3);
+    let gamestream = wiz.toggle_of("Moonlight compat");
     let event = wiz.attached_event(gamestream);
     wiz.host
         .with_reconciler(|r| r.backend.fire_bool(gamestream, event, true));
@@ -343,6 +366,7 @@ fn uninstall_from_the_manage_welcome_tears_down() {
 #[test]
 fn the_sunshine_demo_shows_the_coexistence_row_and_moves_the_mgmt_port() {
     let wiz = Wiz::open("win11-sunshine");
+    wiz.choose("Custom");
     wiz.click("Continue");
     assert!(
         wiz.has_text("Sunshine detected"),
