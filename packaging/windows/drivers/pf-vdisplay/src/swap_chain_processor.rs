@@ -74,13 +74,14 @@ fn hr_success(hr: NTSTATUS) -> bool {
 /// Whether the swap-chain processing device's GPU scheduling is raised to REALTIME (the IddCx
 /// 1.9 `IddCxSetRealtimeGPUPriority` DDI — "higher priority than any regular application can
 /// set"). Default **ON**: minimum latency at every layer — a GPU-saturating game must not starve
-/// the leg that feeds every captured frame into the ring, and the 2026-08 default-OFF (after an
-/// RX 9070 XT field A/B blamed this raise for a metronomic ~1.8 s capture-stall class) did not
-/// fix those AMD reports and did regress loaded NVIDIA boxes into feed starvation. The AMD
-/// metronome keeps its per-box escape hatch: `setx /M PFVD_NO_RT_GPU 1` (any value) + a device
-/// restart disables the raise — read via [`machine_env`] as well as the process environment,
-/// because WUDFHost's own environment is stale until a reboot. The old `PFVD_RT_GPU` opt-in
-/// ladder (off/thread/realtime) is gone; a stale `PFVD_RT_GPU` now just matches the default.
+/// the leg that feeds every captured frame into the ring. The 2026-08 default-OFF (after an
+/// RX 9070 XT field A/B blamed this raise for a metronomic ~1.8 s capture-stall class) at most
+/// masked that still-unattributed stall — confirmed cases kept arriving with the raise off —
+/// while regressing loaded NVIDIA boxes into feed starvation, so it was reverted. The per-box
+/// A/B escape hatch remains: `setx /M PFVD_NO_RT_GPU 1` (any value) + a device restart disables
+/// the raise — read via [`machine_env`] as well as the process environment, because WUDFHost's
+/// own environment is stale until a reboot. The old `PFVD_RT_GPU` opt-in ladder
+/// (off/thread/realtime) is gone; a stale `PFVD_RT_GPU` now just matches the default.
 fn rt_gpu_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();

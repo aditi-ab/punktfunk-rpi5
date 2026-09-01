@@ -158,13 +158,14 @@ enum PrioMode {
 /// D3DKMT_SCHEDULINGPRIORITYCLASS: IDLE 0, BELOW_NORMAL 1, NORMAL 2, ABOVE_NORMAL 3, HIGH 4,
 /// REALTIME 5. REALTIME is the Sunshine/OBS lever: the host's capture/convert/encode contexts
 /// preempt a saturating game instead of waiting behind it, which is the whole product. The
-/// 2026-08 HIGH default (after an AMD RX 9070 XT A/B blamed REALTIME for a metronomic capture
-/// stall) did not fix those AMD reports and did regress NVIDIA boxes into feed starvation
-/// (encode-latency spikes, half the frames reaching the encoder under a GPU-bound game), so it
-/// was reverted. `high` remains the per-box A/B lever for the AMD stall class. Two known traps
-/// REALTIME carries: it costs the local game fps by design (the remote view is the product),
-/// and REALTIME + NVIDIA + HAGS + near-full VRAM is a documented NVENC hang — `high` is the
-/// escape hatch for both.
+/// 2026-08 HIGH default came from an AMD RX 9070 XT A/B that blamed REALTIME for a metronomic
+/// capture stall; confirmed cases kept arriving with the downgrade shipped — it masked that
+/// still-unattributed stall on some boxes, never fixed it — while regressing loaded NVIDIA
+/// boxes into feed starvation (encode-latency spikes, half the frames reaching the encoder
+/// under a GPU-bound game), so it was reverted. Do not re-convict REALTIME on that A/B. One
+/// known trap: REALTIME + NVIDIA + HAGS + near-full VRAM is a documented NVENC hang — `high`
+/// is the escape hatch. Costing the local game fps under load is by design (the remote view
+/// is the product).
 fn configured_gpu_priority_mode() -> PrioMode {
     match std::env::var("PUNKTFUNK_GPU_PRIORITY_CLASS")
         .ok()

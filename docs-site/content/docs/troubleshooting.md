@@ -589,16 +589,15 @@ Open the web console's **Logs** page and search for `METRONOMIC`. You'll get one
   dummy plug, or simply keep the display active while you stream. The console's **Virtual displays**
   page also has a *Disable monitor devices while streaming (PnP)* toggle that suppresses the
   Windows-side reaction; the log line's `connected_inactive` field names the displays it suspects.
-- **…with NO coinciding OS display event** — the disturbance is below Windows. **On an AMD box,
-  A/B the REALTIME GPU-priority defaults first** (`setx /M PFVD_NO_RT_GPU 1` + a device restart,
-  and `PUNKTFUNK_GPU_PRIORITY_CLASS=high`) — an AMD field box tied exactly this pattern to a
-  punktfunk process holding REALTIME GPU priority; the line's `rt_gpu_driver` / `rt_gpu_host`
-  fields show what is engaged.
-  Otherwise: a connected but sleeping screen being serviced by the GPU driver, display-poller
-  software (the SteelSeries GG / SignalRGB class), or the desktop present clock — try a different
-  refresh rate. On a laptop panel that the host deactivated, keeping it active with the
-  **primary** topology usually settles it — see
-  [Virtual displays → Topology](/docs/virtual-displays#topology).
+- **…with NO coinciding OS display event** — the disturbance is below Windows: a connected but
+  sleeping screen being serviced by the GPU driver, display-poller software (the SteelSeries GG /
+  SignalRGB class), or the desktop present clock — try a different refresh rate. On a laptop
+  panel that the host deactivated, keeping it active with the **primary** topology usually
+  settles it — see [Virtual displays → Topology](/docs/virtual-displays#topology). As a last
+  resort, lowering the GPU-priority defaults (`setx /M PFVD_NO_RT_GPU 1` + a device restart, and
+  `PUNKTFUNK_GPU_PRIORITY_CLASS=high`; the line's `rt_gpu_driver` / `rt_gpu_host` fields show
+  what is engaged) has quieted this pattern on some AMD machines — but it masks the disturbance
+  rather than fixing it, and costs stream latency under load.
 
 Freezes that repeat *without* a steady rhythm are caught too: search the log for
 `REPEATING without a stable period` — that warning carries the same fields and the same cure

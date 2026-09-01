@@ -192,9 +192,10 @@ impl std::fmt::Display for StallClass {
 /// The vdisplay driver's GPU-priority lever (default REALTIME; opt-out `PFVD_NO_RT_GPU`) as
 /// configured in THIS process's environment (the WUDFHost driver process resolves the same
 /// variable, so this read mirrors what the driver decided — modulo a machine env edited after
-/// either process started, which a restart heals). An RX 9070 XT field A/B (2026-08-12) blamed
-/// the REALTIME raise for a metronomic stall signature — the opt-out is that box's A/B lever —
-/// so every stall-triage line says whether the raise is engaged.
+/// either process started, which a restart heals). A 2026-08-12 RX 9070 XT A/B once blamed the
+/// REALTIME raise for the metronomic stall signature; confirmed cases with the raise off later
+/// showed lowering priority masks that class at most. The posture still rides every
+/// stall-triage line so the A/B state is always visible.
 pub(super) fn rt_gpu_driver_posture() -> &'static str {
     if std::env::var_os("PFVD_NO_RT_GPU").is_some() {
         "off (PFVD_NO_RT_GPU)"
@@ -664,11 +665,12 @@ impl StallWatch {
                     verdicts = %self.verdict_tally(),
                     classes = %self.class_tally(),
                     "capture stalls are REPEATING without a stable period — same triage as the \
-                     metronomic class: on an AMD box, A/B the REALTIME GPU-priority defaults \
-                     first (setx /M PFVD_NO_RT_GPU 1 / PUNKTFUNK_GPU_PRIORITY_CLASS=high); \
-                     then a connected-but-inactive display's standby servicing (see \
-                     connected_inactive), then display-poller software (the SteelSeries GG / \
-                     SignalRGB class). A content-silence class tally does NOT exonerate the \
+                     metronomic class: a connected-but-inactive display's standby servicing \
+                     (see connected_inactive), then display-poller software (the SteelSeries \
+                     GG / SignalRGB class). Lowering the GPU-priority defaults \
+                     (setx /M PFVD_NO_RT_GPU 1 / PUNKTFUNK_GPU_PRIORITY_CLASS=high) has \
+                     quieted some AMD boxes but masks this class at most — attenuation, not \
+                     attribution. A content-silence class tally does NOT exonerate the \
                      display stack — a frozen presenter reads identically (Flavor 3)"
                 );
             }
@@ -706,8 +708,8 @@ impl StallWatch {
                 );
             } else {
                 // The two REALTIME GPU-priority levers (default-on; see the posture helpers'
-                // docs for the 2026-08-12 AMD A/B) — a log carrying this warning must say
-                // whether either lever is engaged before anyone chases display hardware.
+                // docs) — a log carrying this warning must say whether either lever is
+                // engaged so a priority A/B is interpretable.
                 let rt_gpu_driver = rt_gpu_driver_posture();
                 let rt_gpu_host = rt_gpu_host_posture();
                 tracing::warn!(
@@ -722,15 +724,15 @@ impl StallWatch {
                      the disturbance is BELOW Windows (damage-idle holes — cursor \
                      stationary on a dwm-only desktop, i.e. input/hand pauses — are \
                      already excluded from this beat; see cursor_moved_px_during_gap on \
-                     the per-stall lines). FIRST on an AMD box: A/B the REALTIME \
-                     GPU-priority defaults (setx /M PFVD_NO_RT_GPU 1 / \
-                     PUNKTFUNK_GPU_PRIORITY_CLASS=high) — a 2026-08-12 RX 9070 XT A/B \
-                     tied this signature to a punktfunk process holding REALTIME GPU \
-                     priority. Otherwise: the GPU driver servicing a \
+                     the per-stall lines). Suspects: the GPU driver servicing a \
                      connected-but-asleep sink (standby HPD/DDC/link probing), \
                      display-poller software (the SteelSeries-GG/SignalRGB class — \
                      correlate 'slow display-descriptor poll' lines), or the DWM present \
-                     clock (try a different refresh rate). If connected_inactive lists a \
+                     clock (try a different refresh rate). Lowering the GPU-priority \
+                     defaults (setx /M PFVD_NO_RT_GPU 1 / \
+                     PUNKTFUNK_GPU_PRIORITY_CLASS=high) has quieted some AMD boxes but \
+                     masks this class at most — a quiet A/B is attenuation, not \
+                     attribution. If connected_inactive lists a \
                      display, its standby servicing is a suspect — cursor motion through \
                      the holes is what convicts the display stack. For an external \
                      display: keep it active while streaming, disable its OSD auto input \
