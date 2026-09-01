@@ -67,15 +67,17 @@ That one command, each step idempotent and each one reversible:
 | **Firewall** | adds ufw rules scoped to your local networks (and `tailscale0` if you have it), each tagged `punktfunk-omarchy` so `remove` finds them again. |
 | **Browser trust** *(optional)* | trusts the console's certificate in Chromium (`~/.pki/nssdb`), so it opens with no security warning at all. |
 | **App menu** | installs "Punktfunk Web Console" as an Omarchy webapp — it appears in Apps (`Super`+`Space`) and opens the secure login page in its own window. |
-| **Bar widget** *(optional)* | the Punktfunk Quickshell widget in the bar — live status, pairing approvals and devices without opening the console. |
+| **Bar widget** | the Punktfunk Quickshell widget in the bar — live status, pairing approvals and devices without opening the console. It replaces the tray icon, which is hidden while the widget is enabled. |
 | **Toasts** *(optional)* | pairing requests and stream start/stop as Omarchy notifications, with **Approve** / **Deny** buttons on the pairing one. |
 | **Idle** *(optional)* | keeps the screen awake for the length of a stream and restores your own setting afterwards. |
 | **Theme** *(optional)* | a `~/.config/omarchy/themed/` template so the console **and the Linux client** follow `omarchy-theme-set`. |
 | **Client menu** *(optional)* | when `punktfunk-client` is installed: the **Punktfunk** submenu — the app, the game console, and your saved hosts as connect and wake rows. Host administration lives in its own **Punktfunk Host** submenu. |
 
-Every *(optional)* step defaults to **yes** — Enter accepts, `n` declines, and a run without a
-terminal takes the defaults, so the guided installer delivers the full integration on its own.
-Check it any time with `punktfunk-omarchy status`, and undo all of it with `punktfunk-omarchy
+The *(optional)* steps are rows on the guided installer's own settings screen, answered there
+and not asked again here. Run `punktfunk-omarchy setup` by hand and it takes all of them; each
+has an option to decline one (`--toasts=0`, `--theme=0`). The bar widget is not optional: it
+carries status, pairing and the console, so it replaces the tray rather than sitting beside it.
+Check any time with `punktfunk-omarchy status`, and undo all of it with `punktfunk-omarchy
 remove` (your pairings and `~/.config/punktfunk` are left alone).
 
 ## 4. Pair
@@ -258,5 +260,6 @@ sudo pacman -R punktfunk-host punktfunk-web   # the packages
 ```
 
 `remove` reverses every step of `setup` — units, drop-in, ufw rules, the certificate trust, the
-webapp, the bar widget, the hooks, the theme template — and restores the screen-share picker. Your config and pairings survive both; see
+webapp, the bar widget, the hooks, the theme template — and restores both the screen-share picker
+and the tray icon. Your config and pairings survive both; see
 [Uninstall](/docs/uninstall) to clear those too.
