@@ -58,8 +58,15 @@ jobs:
           cargo build --release --locked -p punktfunk-setup \
             --target x86_64-unknown-linux-musl
       - name: It is actually static
+        # readelf, not file(1): the rust-ci image ships binutils but no file. Static-pie
+        # is exactly ET_DYN with no PT_INTERP.
         run: |
-          file target/x86_64-unknown-linux-musl/release/punktfunk-setup | grep -q 'static-pie'
+          bin=target/x86_64-unknown-linux-musl/release/punktfunk-setup
+          readelf -h "$bin" | grep -q 'Type:.*DYN'
+          if readelf -l "$bin" | grep -q 'INTERP'; then
+            echo "::error::punktfunk-setup has PT_INTERP — dynamically linked, not static-pie"
+            exit 1
+          fi
       # v3: Gitea's API rejects upload-artifact@v4 (see apple.yml). Download is a zip.
       - uses: actions/upload-artifact@v3
         with:
