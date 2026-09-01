@@ -3743,6 +3743,7 @@ version = "0.34.0"
 dependencies = [
  "anyhow",
  "console",
+ "getrandom 0.3.4",
  "portable-pty",
  "serde",
  "serde_json",
