@@ -362,7 +362,13 @@ private struct PadSlider: View {
             Slider(value: $live, in: range) { editing in
                 if !editing { commit(live) }
             }
-            Text(caption).font(.footnote).foregroundStyle(.secondary)
+            // The described-row caption idiom (SettingsView+Support), so this page's captions
+            // sit at the same size as every other settings page's.
+            Text(caption)
+                .font(.geist(13, relativeTo: .footnote))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .modifier(CaptionWidth())
         }
         .onAppear { live = value }
         .onChange(of: value) { _, v in live = v }
