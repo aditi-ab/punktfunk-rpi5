@@ -22,7 +22,7 @@ the host. In the default mouse mode the pointer is also locked to the window —
 | **Ctrl+Alt+Shift+D** | Disconnect |
 | **Ctrl+Alt+Shift+S** | Cycle the [stats overlay](/docs/stats) — off · compact · normal · detailed |
 | **Ctrl+Alt+Shift+V** | Mute or unmute your microphone |
-| **Ctrl+Alt+Shift+O** | Open the [quick-action ring](#the-quick-action-ring) |
+| **Ctrl+Alt+Shift+O** | Open the [quick-action dial](#the-quick-action-dial) |
 | **F11** or **Alt+Enter** | Toggle fullscreen |
 
 While input is released the session window prints the shortest list over the stream:
@@ -65,7 +65,7 @@ microphone mute; the in-stream hint over the video doesn't, to stay one readable
 
 - **macOS** honours the release, mouse-mode, disconnect and stats combos, written
   **⌃⌥⇧Q / M / D / S**, plus **⌃⌥⇧A** for the microphone mute and **⌃⌥⇧O** for the
-  [quick-action ring](#the-quick-action-ring). **⌘⎋** also toggles capture, **⌃⌘F** toggles
+  [quick-action dial](#the-quick-action-dial). **⌘⎋** also toggles capture, **⌃⌘F** toggles
   fullscreen, and **⌃⌥⇧C** starts or stops [clipboard sharing](/docs/clipboard). The **Stream** menu
   lists them all except the mouse-mode combo, which works but has no menu item. Every *other* ⌘
   chord goes to the host while input is captured — ⌘Q reaches the host's compositor rather than
@@ -212,19 +212,19 @@ or Windows before 1809), a client set to Touch passthrough runs the trackpad mod
 session and says so in a short notice when the stream starts, instead of forwarding contacts the
 host would drop.
 
-## The quick-action ring
+## The quick-action dial
 
-On Android, iPhone and iPad a **two-finger twist** on the stream opens a ring of six buttons under
+On Android, iPhone and iPad a **two-finger twist** on the stream opens a dial of six buttons under
 your fingers: about 10° starts it opening, 30° commits it, and lifting short of that winds it back
 in and sends nothing. The centre button opens a sheet with the whole catalogue and the resolution
-presets. On Android the **Back** gesture opens the same ring at the screen centre instead of ending
+presets. On Android the **Back** gesture opens the same dial at the screen centre instead of ending
 the session; on iPhone and iPad the corner disc does; on Apple TV a short press of the remote's
 Back; on macOS, Linux and Windows **Ctrl+Alt+Shift+O** (**⌃⌥⇧O** on a Mac, also the **Stream** menu's
 Quick Actions item); with a controller, **Select+A** (Select first) on every client, and the host
 never sees the two presses. What the six buttons hold is the **Quick actions** setting, and the
-editor is the ring itself — on every client but Apple TV, which takes whatever the profile carries.
+editor is the dial itself — on every client but Apple TV, which takes whatever the profile carries.
 
-A Mac hands your pointer back for as long as the ring is up, so you can click a button, and takes
+A Mac hands your pointer back for as long as the dial is up, so you can click a button, and takes
 capture again when it closes. Buttons a platform cannot serve are dimmed and say why: **Touch
 mode**, **Virtual controller** and **Keyboard** on a Mac, which has no touch screen and no software
 keyboard.
@@ -232,7 +232,7 @@ keyboard.
 ### Virtual controller
 
 Android and iPhone/iPad can draw a controller over the stream, for a game that needs one when no
-controller is attached. Show or hide it from the ring's **Virtual controller** button. The host sees
+controller is attached. Show or hide it from the dial's **Virtual controller** button. The host sees
 one controller arrive when it appears and one leave when it goes, exactly as for a real pad, on the
 next free pad index beside any real controller you have connected. A finger on one of its controls
 drives the game; a finger anywhere else still drives the touch mode, so tap-to-click keeps working

@@ -2176,7 +2176,7 @@ pub fn show_scoped(
     // touch-client-overlay.md §3.3). Built with the dialog above, like every row.
     let ring_group = group(
         "Quick actions",
-        "The ring a two-finger twist or Select+A opens in a stream: what its six buttons hold, \
+        "The dial a two-finger twist or Select+A opens in a stream: what its six buttons hold, \
          and the shortcut chords they can send.",
     );
     ring_group.add(quick.row());

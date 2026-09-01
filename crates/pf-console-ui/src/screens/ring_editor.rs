@@ -230,7 +230,7 @@ impl RingEditorScreen {
         rows.push(new);
         rows.push(RowSpec::action(
             if self.reset_armed {
-                "Press again to reset the ring"
+                "Press again to reset the dial"
             } else {
                 "Reset to default"
             },
