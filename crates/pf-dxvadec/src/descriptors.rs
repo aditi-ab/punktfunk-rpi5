@@ -1,139 +1,18 @@
-//! The buffer DESCRIPTORS one `ID3D11VideoContext::SubmitDecoderBuffers` call
-//! carries: which buffers are in the set at all, and the four
-//! `D3D11_VIDEO_DECODER_BUFFER_DESC` fields whose values are a DECISION rather
-//! than a pointer the driver handed back.
+//! Pure policy for the buffers passed to
+//! `ID3D11VideoContext::SubmitDecoderBuffers`.
 //!
-//! # Why this is a module of its own
-//!
-//! Review 13 found four defects in this backend. **Two of the three structural
-//! ones lived here rather than in the picture parameters**: an HEVC
-//! quantization-matrix buffer submitted unconditionally (so a driver was handed a
-//! matrix of zeros on every stream that disables scaling lists), and a
-//! `NumMBsInBuffer` left at 0 where libavcodec's H.264 path writes
-//! `mb_width * mb_height` — on the exact call (`SubmitDecoderBuffers`) that this
-//! codebase has already seen an Intel driver reject a hand-built variant on.
-//!
-//! Neither is visible in the picture parameters, neither is visible in a smoke
-//! test, and — before this module — neither was visible to any gate this program
-//! runs, because the descriptors were built inside `cfg(windows)` code that no CI
-//! leg compiles. That is the whole reason the values live here: a descriptor set
-//! is a pure function of the conversion's output plus the packer's output, so it
-//! can be asserted on any host, on every leg, over every AU of the vendored
-//! vectors.
-//!
-//! # ⚠ The Windows layer still builds its own for H.264 and HEVC — rewire them
-//!
-//! `pf-client-core`'s `video_d3d11_native.rs` was rewired for **AV1**
-//! (`fill_and_submit_av1` builds its submission from [`descriptors_av1`] and
-//! cross-checks every `DataSize` against what its writers actually wrote), and
-//! that is what this module was written for. Its H.264 and HEVC arm
-//! (`fill_and_submit_slices` + the private `buffer_desc`) still constructs the
-//! same four descriptors itself and should be rewired the same way. Until it is,
-//! the two must be read together: this module is the SPEC and the tests are its
-//! proof, and a divergence between them is a defect in the Windows file. The
-//! ordering, the values and the presence rule below are exactly what that file
-//! does today, transcribed — not a new invention.
-//!
-//! # The values, and where each comes from
-//!
-//! `CompressedBufferType` (D3D11's `BufferType`) code points, from windows-rs at
-//! the workspace's pinned rev (`acb5a1a`,
-//! `crates/libs/windows/src/Windows/Win32/d3d11/mod.rs`) — the same numbers
-//! DXVA2's `DXVA2_*BufferType` enumeration uses:
-//!
-//! | buffer | code point |
-//! |---|---|
-//! | picture parameters | 0 |
-//! | inverse quantization matrix | 4 |
-//! | slice control | 5 |
-//! | bitstream | 6 |
-//!
-//! **Order**: picture parameters, quantization matrices, bitstream, slice
-//! control. libavcodec's `ff_dxva2_common_end_frame` fills its four-entry
-//! descriptor array in exactly that order and submits the array as filled; a
-//! driver is entitled to care, and matching the path every Windows player
-//! exercises costs nothing.
-//!
-//! **`DataOffset`** is 0 on every buffer, for both sides: each buffer is written
-//! from its own mapping's byte 0. (libavcodec `memset`s the descriptor and never
-//! writes the field.)
-//!
-//! **`DataSize`** is the number of bytes actually written: the whole
-//! hand-declared struct for the picture parameters and the quantization matrices,
-//! the packer's PADDED size for the bitstream ([`crate::pack::Packed::data_size`],
-//! a multiple of [`crate::dxva::BITSTREAM_ALIGN`]), and `slices *
-//! size_of::<DXVA_Slice_*_Short>()` for the slice control — **ten** bytes per
-//! record, not twelve. That number is a measured fact rather than a derivation
-//! (`dxva.rs`'s alignment section carries the measurement), and the slice-control
-//! `DataSize` is where it is observable from outside: 20 bytes for a two-slice
-//! H.264 picture, 10 for a one-segment HEVC one.
-//!
-//! **`NumMBsInBuffer` is codec-ASYMMETRIC, and that is not an accident to be
-//! tidied up:**
-//!
-//! * H.264 — `mb_width * mb_height` on the BITSTREAM and SLICE_CONTROL
-//!   descriptors ([`crate::pic::DecodePlanDxva::mb_count`]);
-//! * HEVC — 0 on the same two. HEVC has no macroblocks and the field has no CTB
-//!   spelling;
-//! * **AV1 — 0 on all three**, and neither a tile count nor a superblock count.
-//!   `dxva2_av1.c`'s `commit_bitstream_and_slice_buffer` writes a literal
-//!   `dsc11->NumMBsInBuffer = 0` on the bitstream descriptor and passes a literal
-//!   `0` as `ff_dxva2_commit_buffer`'s `mb_count` for the tile buffer;
-//! * picture parameters and quantization matrices — 0 in every codec.
-//!
-//! That asymmetry is libavcodec's, read out of an **FFmpeg n8.1** tree:
-//! `dxva2_h264.c:307` computes `const unsigned mb_count = h->mb_width *
-//! h->mb_height` and writes it on the bitstream descriptor (`:412` D3D11, `:425`
-//! DXVA2) and passes it for the slice-control commit (`:440-442`);
-//! `dxva2_hevc.c` writes a literal 0 in the same three places (`:338`, `:349`,
-//! `:359-361`); and `dxva2.c` passes a literal 0 for the two parameter buffers.
-//! Setting a CTB count on the HEVC path would be a fresh divergence in the other
-//! direction, which is why it is spelled out here rather than left to symmetry.
-//!
-//! # Presence: the quantization matrix is codec-asymmetric too
-//!
-//! * **H.264: always submitted.** `dxva2_h264.c:513-516` passes `&ctx_pic->qm`
-//!   with `sizeof(qm)` unconditionally, and the PPS's lists are always meaningful
-//!   (the vendored parser has already applied Table 7-2's fallback rules, so a PPS
-//!   that codes no matrix carries the SPS's or the flat default).
-//! * **HEVC: submitted only when the sequence enables scaling lists.**
-//!   `dxva2_hevc.c:417` takes `int scale = ctx_pic->pp.dwCodingParamToolFlags & 1`
-//!   — bit 0 is `scaling_list_enabled_flag` — and `:423-426` passes `NULL`/0 when
-//!   it is clear; the generic layer then submits an IQ-matrix buffer only `if
-//!   (qm_size > 0)` (`dxva2.c` ~962), with `NumMBsInBuffer` 0.
-//!   [`crate::pic_h265::DecodePlanDxvaH265::qmatrix`] is `None` in exactly that
-//!   case, so presence here is `qmatrix.is_some()` and nothing else. Handing a
-//!   driver a matrix the picture parameters just told it to ignore is a bet on the
-//!   driver ignoring it too — and with the vendored parser leaving an uncoded list
-//!   all-zero, the losing side of that bet is every residual dequantizing to
-//!   nothing.
-//!
-//! * **AV1: never.** `dxva2_av1_end_frame` calls `ff_dxva2_common_end_frame` with
-//!   `NULL, 0` for the matrix pair, and the generic layer's `if (qm_size > 0)`
-//!   then skips the buffer entirely — so an AV1 submission is THREE buffers,
-//!   always. AV1's quantiser matrices are selected by index
-//!   (`qm_y`/`qm_u`/`qm_v` in `DXVA_PicParams_AV1::quantization`) out of tables
-//!   the decoder already has, not transmitted; there is no matrix to send.
-//!
-//! ⚠ The flag test is NECESSARY but not SUFFICIENT. HEVC 7.4.5 says that with
-//! `scaling_list_enabled_flag` set and NO scaling-list data in either parameter
-//! set, the Table 7-5/7-6 DEFAULT lists apply. FFmpeg's parser seeds those
-//! defaults; the vendored cros-codecs parser leaves an uncoded SPS's lists ALL
-//! ZERO. So "submit iff the flag" is only half the rule, and the other half lives
-//! in [`crate::pic_h265`]'s `quantization_matrices`, which reads the PPS's copy
-//! (which that parser DOES default-fill) unless the SPS is the only side that
-//! coded any. All three cases are named CPU tests — two in `pic_h265.rs` for the
-//! contents, three in `tests/libav_picparams_parity.rs` for the submission fact.
-//!
-//! # Provenance
-//!
-//! The libavcodec file:line references above were read out of an FFmpeg n8.1 tree
-//! by this work package's coordinator, not out of this repository — there is no
-//! FFmpeg source in the worktree, so nothing here can verify them, and a capture is
-//! the authority. The buffer ORDER is the one claim with no line reference: it is
-//! what `video_d3d11_native.rs` already submits and what
-//! `ff_dxva2_common_end_frame` fills its array in, and the harness's descriptor
-//! comparison is what will confirm it.
+//! Descriptors are ordered picture parameters, optional inverse-quantization
+//! matrix, bitstream, then slice/tile control, matching FFmpeg's DXVA path.
+//! Every `DataOffset` is zero; every `DataSize` is the number of bytes written:
+//! full parameter structs, padded/aligned packed bitstream size, and exact
+//! slice/tile-record sizes (DXVA H.264/HEVC short slice records are 10 bytes).
+//! `NumMBsInBuffer` is H.264's macroblock count only for bitstream and slice
+//! control; it is zero for parameter/matrix buffers and for all HEVC/AV1 buffers.
+//! H.264 always submits its matrix, HEVC does so only when `qmatrix` is present,
+//! and AV1 never does, so AV1 submissions always contain three buffers.
+//! HEVC matrix construction must retain the default-list rules from H.265
+//! §7.4.5, Tables 7-5/7-6; presence alone must not produce zero matrices.
+//! The Windows submission layer must preserve these values and ordering.
 
 use std::mem::size_of;
 

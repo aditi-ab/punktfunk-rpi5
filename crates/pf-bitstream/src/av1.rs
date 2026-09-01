@@ -1,39 +1,13 @@
-//! AV1 access-unit planning — M7's foundation, and the third planner in this crate.
+//! AV1 access-unit planning with the same one-AU-in, one-[`AuPlan`]-out contract as
+//! [`crate::h264`] and [`crate::h265`]. The vendored parser reads syntax; this module owns
+//! reference-slot bookkeeping, output state, and concealment.
 //!
-//! Same contract as [`crate::h264`] and [`crate::h265`]: one access unit in, one
-//! [`AuPlan`] out, carrying everything a hardware backend needs to submit the frame
-//! and everything the client needs to manage surfaces. The vendored cros-codecs
-//! parser does the bitstream reading; this module owns the reference ledger, the
-//! output bookkeeping and the concealment posture.
+//! AV1 names seven reads through `ref_frame_idx`, writes eight numbered slots through
+//! `refresh_frame_flags`, and may display an existing slot without decoding. Consequently
+//! [`AuPlan::refs`] is reference-name indexed and preserves holes for missing slots.
 //!
-//! # AV1's reference model is simpler than H.264's, and explicit
-//!
-//! There is no sliding window, no MMCO, no POC derivation and no bumping process.
-//! There are **eight numbered reference slots**, and each frame says outright what it
-//! does with them:
-//!
-//! * `ref_frame_idx[0..7]` names the slots this frame READS (seven references, which
-//!   may repeat a slot) — and its POSITION is the AV1 reference name, which is why
-//!   [`AuPlan::refs`] is name-indexed and a lost reference leaves a hole;
-//! * `refresh_frame_flags` is an eight-bit mask naming the slots this frame WRITES
-//!   once decoded;
-//! * `show_frame` says whether the frame displays now, and `show_existing_frame`
-//!   displays a slot's existing contents with no decode at all.
-//!
-//! That means this planner's job is bookkeeping rather than derivation, and the whole
-//! of it is checkable against the stream: a frame that names a slot holding nothing is
-//! a lost reference, full stop, with no spec process that might legitimately have
-//! emptied it.
-//!
-//! # What is deliberately NOT here
-//!
-//! The per-backend conversions. Vulkan's `StdVideoDecodeAV1PictureInfo`, DXVA's
-//! `DXVA_PicParams_AV1` and libva's `VAPictureParameterBufferAV1` are three more
-//! spellings of the same plan, and they belong in `pf-vkdecode` / `pf-dxvadec` /
-//! `pf-vaadec` beside their H.264 and H.265 siblings — for the reason the HEVC
-//! reference-set disaster taught: the three APIs disagree about what a "reference
-//! list" even indexes, and each conversion is where its own convention is written
-//! down and tested.
+//! Backend-specific Vulkan, DXVA, and VA-API conversions remain in their decoder crates,
+//! where each API's reference-index convention can be tested independently.
 
 use std::ops::Range;
 use std::rc::Rc;

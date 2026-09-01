@@ -92,6 +92,20 @@ pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
     }
 }
 
+/// Open a libei injector pinned to a SPECIFIC gamescope EIS relay file — the per-session spelling
+/// of [`Backend::GamescopeEi`] (`design/gamescope-multiuser.md`): an isolated multi-user spawn
+/// writes its `LIBEI_SOCKET` to its own relay file, and this session's injector must read exactly
+/// that one, never the global file a concurrent spawn may rewrite. A separate function rather than
+/// a `Backend` variant so [`Backend`] stays `Copy` (the published `SESSION_BACKEND` slot and the
+/// knob parser lean on it). The libei worker polls the relay file itself (`connect_socket_file`),
+/// so calling this before the gamescope is up is fine.
+#[cfg(target_os = "linux")]
+pub fn open_gamescope_at(relay: std::path::PathBuf) -> Result<Box<dyn InputInjector>> {
+    Ok(Box::new(libei::LibeiInjector::open_with(
+        libei::EiSource::SocketPathFile(relay),
+    )?))
+}
+
 /// Open the injector for `backend` (Windows: always `SendInput`).
 #[cfg(target_os = "windows")]
 pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {

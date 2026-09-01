@@ -1,36 +1,12 @@
-//! `HostConfig` — the host's runtime knobs parsed ONCE from the environment, instead of the ~68 scattered
-//! `env::var` reads recomputed at every call site (some up to 8×, which lets capture + encode silently
-//! disagree on the resolved backend — plan §2.4). The service / launcher loads `host.env` into the process
-//! environment before the host starts, and **for the knobs captured here the environment is constant for the
-//! process lifetime**, so a lazily-parsed global is equivalent to "parsed once at startup".
+//! Process-lifetime host configuration parsed once from environment variables.
 //!
-//! **Goal-1 stages 1–2** (`design/windows-host-rewrite.md` §2.2): stage 1 stood this up; stage 2 migrated the
-//! genuinely-constant operator/dispatch knobs onto it (the dispatch-disagreement bug class:
-//! `encoder_pref`, `render_adapter`, the vdisplay backend select — plus the plan-named
-//! `idd_depth`/`zerocopy`/`ten_bit`/`four_four_four` and the multi-site `perf`/`compositor`/
-//! `video_source`/`gamepad`). `SessionPlan` (stage 3) consumes it as the single owner of the
-//! capture/topology/encoder decision.
+//! `HostConfig` owns stable operator and backend-selection knobs so capture, topology, and
+//! encoding share one resolved value. Session-mutated compositor variables, path lookups,
+//! credentials, and single-use tuning remain live reads at their call sites.
 //!
-//! **What is deliberately NOT here (and must stay a live `env::var` read):**
-//! - **Runtime-mutated session vars.** On Linux, `crate::vdisplay::apply_session_env` rewrites the process
-//!   env on *every connect* so one host follows a Bazzite box across Gaming↔Desktop: `WAYLAND_DISPLAY`,
-//!   `XDG_CURRENT_DESKTOP`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, and the *derived* `PUNKTFUNK_*`
-//!   vars `INPUT_BACKEND`, `GAMESCOPE_SESSION`/`GAMESCOPE_NODE`, `KWIN_VIRTUAL_PRIMARY`,
-//!   `MUTTER_VIRTUAL_PRIMARY`, `FORCE_SHM` (+ `GAMESCOPE_APP` on the launch path). Parsing these once would
-//!   freeze them at startup and silently break session-following — they are NOT constant.
-//! - **Single-use local tuning** read exactly where it is used (no resolve-once benefit, and a parse with a
-//!   call-site-local default/clamp): e.g. `FEC_PCT` (two *different* semantics — GameStream default-20 vs
-//!   punktfunk/1 `Option`/clamp-90), `VIDEO_DROP`, `VBV_FRAMES`, `SPLIT_ENCODE`, `PACE_BURST_KB`, the
-//!   `capture/dxgi.rs` timing knobs, the `*_LIVE` test gates.
-//! - **Path / genuinely-dynamic reads**: the config-dir resolution, `PATH` executable search, the
-//!   env-forward-to-child loop, `PUNKTFUNK_MGMT_TOKEN`, `PUNKTFUNK_HOST_CMD`, `PUNKTFUNK_RENDER_NODE`.
-//!
-//! `PUNKTFUNK_ZEROCOPY` note: this field is a **tri-state override** (`None` = unset). Unset defers to
-//! the per-vendor default in `encode/ffmpeg_win.rs::zerocopy_enabled` (AMF on — on-glass validated
-//! 2026-07-06; QSV off until validated on Intel glass); an explicit value forces it (`0|false|off|no`
-//! = off, anything else = on, so the old presence-style `=1` keeps working). The Linux `zerocopy`
-//! module keeps its own *truthy* parser (`1|true|yes|on`) — the two are independent features that
-//! share a name; do NOT conflate them.
+//! `PUNKTFUNK_ZEROCOPY` is a tri-state override: unset defers to the platform/vendor default;
+//! `0|false|off|no` disables it; any other present value enables it. This explicit-off grammar
+//! is distinct from `pf-zerocopy`'s truthy parser.
 #![forbid(unsafe_code)]
 
 /// Which keyboard LAYOUT the box is configured for. Not a `PUNKTFUNK_*` knob — it is read from
@@ -325,6 +301,15 @@ pub struct HostConfig {
     /// starts over (the "fresh gamescope output never delivers frames" field failure). Default ON;
     /// explicit-off grammar (`=0` disables, the on-glass A/B + emergency escape hatch).
     pub gamescope_splash: bool,
+    /// `PUNKTFUNK_GAMESCOPE_ISOLATE` — give every bare-spawn gamescope session its OWN
+    /// input/audio/mic plane (`design/gamescope-multiuser.md`): a per-session EIS relay + pinned
+    /// injector, the nested apps' audio routed to the session's stream sink by env, and a
+    /// per-session virtual mic — so concurrent independent sessions (multi-user on one box) never
+    /// hear or drive each other. Default ON; explicit-off grammar (`=0` restores the shared
+    /// host-lifetime planes, the one-release escape hatch while the isolation path soaks).
+    /// Shared-desktop backends (kwin/mutter/wlroots) and the managed/attach gamescope routes are
+    /// untouched either way — shared planes are the correct semantics there.
+    pub gamescope_isolate: bool,
     /// `PUNKTFUNK_GAMESCOPE_HDR` — allow HDR (10-bit BT.2020 PQ) sessions on the gamescope
     /// backend. Needs the punktfunk gamescope build (`packaging/gamescope`), which teaches
     /// gamescope's PipeWire node the 10-bit PQ capture formats; the host probes for it and stays
@@ -514,6 +499,7 @@ impl HostConfig {
             // Default ON, explicit-off grammar: the splash is what makes a fresh bare spawn deliver
             // its first frames at all; `=0` is the A/B + escape hatch.
             gamescope_splash: env_on("PUNKTFUNK_GAMESCOPE_SPLASH").unwrap_or(true),
+            gamescope_isolate: env_on("PUNKTFUNK_GAMESCOPE_ISOLATE").unwrap_or(true),
             // Default OFF for one canary release (design §4 rollout), then flip the `unwrap_or`.
             gamescope_hdr: env_on("PUNKTFUNK_GAMESCOPE_HDR").unwrap_or(true),
             gamescope_sdr_nits: val("PUNKTFUNK_GAMESCOPE_SDR_NITS")

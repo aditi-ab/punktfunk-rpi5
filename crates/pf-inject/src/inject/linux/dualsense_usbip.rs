@@ -1,84 +1,21 @@
-//! Virtual Sony DualSense over **USB/IP** (`vhci_hcd`) — a *composite* pad that carries its own
-//! USB Audio Class sound card, so the host sees the pad the way a physically-plugged DS5 presents.
+//! Presents a Sony DualSense as a real USB/IP composite device through `vhci_hcd`.
+//! The USB parent is required for Wine's ContainerId pairing and for `snd-usb-audio`
+//! to create the ALSA card that GE-Proton enumerates; `/dev/uhid` provides neither.
 //!
-//! # Why this exists (the uhid pad is not enough)
+//! The four-interface layout is transcribed from `lsusb -v` for wired `054c:0ce6`:
+//! UAC 1.0 control; S16LE 4-channel 48 kHz OUT on isochronous endpoint `0x01`;
+//! S16LE 2-channel 48 kHz IN on `0x82`; and HID interrupt IN/OUT on `0x84`/`0x03`.
+//! [`tests::config_descriptor_matches_hardware`] pins the hardware `wTotalLength` (`0x00E3`).
+//! The HID descriptor length always matches the served 273-byte [`DUALSENSE_RDESC`],
+//! which is proven to bind `hid-playstation` despite hardware advertising 289 bytes.
 //!
-//! [`super::dualsense`] creates the pad with `/dev/uhid`. That is enough for the kernel — the HID
-//! device claims `bus = BUS_USB` and `hid-playstation` binds it — but the *sysfs topology* is a lie:
+//! Audio OUT packets are converted from the raw four-channel S16LE pad layout to `f32`
+//! and published once per pad through [`take_audio_rx`]; the downstream 0xD1 path is unchanged.
+//! Queue overflow drops audio rather than blocking a URB reply and stalling the kernel ISO ring.
 //!
-//! ```text
-//! /sys/devices/virtual/misc/uhid/0003:054C:0CE6.000C  [hid]
-//!   -> /sys/devices/virtual/misc/uhid                 [misc]
-//!   -> /sys/devices/virtual
-//! ```
-//!
-//! There is no `usb_device` anywhere on that chain, and two things a DualSense game depends on are
-//! derived by *walking* it:
-//!
-//! 1. **Wine's ContainerId.** `winebus`'s `get_container_id_for_usb_udev_device` walks a HID device
-//!    up to its `usb_device` parent to synthesise the Windows ContainerId. With no USB ancestor it
-//!    logs `Failed to get parent device.` and every endpoint registers as `GUID_NULL`. A
-//!    libScePad-style title pairs "my controller" with "my controller's speaker" by ContainerId, so
-//!    the pad reads as having no speaker and the game never opens the haptic stream at all.
-//! 2. **GE-Proton's raw-ALSA leg.** GE finds the pad's haptics by enumerating real ALSA **cards**
-//!    (`snd_card_next` → `snd_card_get_name`/`get_longname` → `snd_ctl_pcm_next_device` →
-//!    `snd_pcm_open` demanding 48 kHz / S16 / **4 channels**). Minted PipeWire nodes are not ALSA
-//!    cards and `snd_card_next` cannot see them, however faithfully their proplist impersonates one
-//!    — which is why [`crate::pad_sink`](../../../punktfunk-host/src/audio/linux/pad_sink.rs) never
-//!    sets `api.alsa.path`.
-//!
-//! Both fall out of the same missing fact, and both are fixed by the same change: make the pad a
-//! **real USB device**. `vhci_hcd` gives us one with no out-of-tree module and no Secure Boot
-//! trouble — the transport [`super::steam_usbip`] already ships and validates on Bazzite/SteamOS.
-//!
-//! # What this presents
-//!
-//! The real DualSense's own 4-interface composite layout, reproduced from a `lsusb -v` capture of a
-//! wired `054c:0ce6` (see [`tests::config_descriptor_matches_hardware`], which pins the assembled
-//! `wTotalLength` to the hardware's `0x00E3`):
-//!
-//! | interface | class | contents |
-//! |---|---|---|
-//! | 0 | Audio **Control** | the topology: USB-streaming IN terminal (4ch) → feature unit → Speaker OUT terminal, plus the headset capture chain |
-//! | 1 | Audio **Streaming** (out) | alt 0 = zero-bandwidth, alt 1 = isochronous OUT `0x01`, **S16LE 4ch 48 kHz** — the haptics + speaker |
-//! | 2 | Audio **Streaming** (in) | alt 0 = zero-bandwidth, alt 1 = isochronous IN `0x82`, S16LE 2ch 48 kHz — the headset mic |
-//! | 3 | **HID** | interrupt IN `0x84` / OUT `0x03`, the same report `0x01`/`0x02` codec the uhid pad uses |
-//!
-//! Because interfaces 0–2 are a genuine UAC 1.0 device, `snd-usb-audio` binds them and mints a real
-//! ALSA card named `DualSense Wireless Controller` — the card GE scans for. PipeWire's ALSA monitor
-//! then creates the `…HiFi__Speaker__sink` / `…HiFi__SpeakerHaptic__sink` nodes *itself*, from the
-//! distro's DualSense UCM, so the node graph is not impersonated any more: it is the real thing.
-//!
-//! # Where the audio comes out
-//!
-//! Whatever the game writes lands on us as isochronous OUT packets on endpoint `0x01`, which is the
-//! single point every route converges on — PipeWire-mixed or a raw `hw:X,0` grab alike. The handler
-//! converts those S16LE quad frames to `f32` and publishes them on a per-pad channel that
-//! `punktfunk-host`'s pad-audio streamer drains ([`take_audio_rx`]); the 0xD1 wire path downstream
-//! is unchanged.
-//!
-//! # Known limitation: URBs are answered one at a time
-//!
-//! The vendored server handles one URB per connection at a time — read a `USBIP_CMD_SUBMIT`, answer
-//! it, read the next — and both the interrupt-IN and the isochronous paths *sleep* for their
-//! service interval before answering (they must: `vhci_hcd` does not throttle the server side, and
-//! for an audio endpoint the completion rate is the sample clock). So while audio is streaming, a
-//! HID input poll can queue behind an isochronous URB and wait up to that URB's duration.
-//!
-//! In practice that lands the pad's input polling in the same band as a **physical** DualSense,
-//! which declares `bInterval 6` = 4 ms; it is nevertheless slower than the uhid pad, which has no
-//! polling model at all. Fixing it properly means answering URBs concurrently — USB/IP already
-//! permits out-of-order completion, since every `USBIP_RET_SUBMIT` carries its `seqnum` — by
-//! splitting the socket and spawning per-URB tasks behind a shared writer. That is a change to the
-//! vendored server's concurrency model and is deliberately **not** bundled with the first landing
-//! of this transport.
-//!
-//! # Report descriptor fidelity
-//!
-//! The hardware declares a 289-byte HID report descriptor; we serve
-//! [`DUALSENSE_RDESC`](super::dualsense_proto::DUALSENSE_RDESC) (273 bytes), the descriptor the uhid
-//! pad has always served and that `hid-playstation` is proven to bind. `wDescriptorLength` follows
-//! whatever we actually serve, so the two stay consistent.
+//! This relies only on the in-kernel `vhci_hcd`, not an out-of-tree or Secure-Boot-bypassing module.
+//! The vendored USB/IP server serializes URBs and sleeps for endpoint service intervals, so HID
+//! polls may wait behind audio; concurrency requires seqnum-keyed out-of-order completions.
 
 use super::dualsense_proto::{
     ds_pairing_reply, parse_ds_output, serialize_state, DsFeedback, DsState,

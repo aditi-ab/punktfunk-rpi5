@@ -1,36 +1,14 @@
-//! Plugin registry (plugin-ui-surface design): an in-memory, lease-based directory of running
-//! `punktfunk-plugin-*` processes and the loopback UI each one serves.
+//! In-memory, lease-based directory of running plugins and their loopback UI surfaces.
 //!
-//! A plugin (an out-of-process script under the scripting runner, RFC §8) that wants a UI serves
-//! it on a **loopback** port behind a per-boot secret, then **registers** here — `{title, ui:{port,
-//! secret, icon}}` — over the admin/loopback lane it already holds via the SDK. The web console
-//! reads [`list_plugins`] to grow a nav entry and reverse-proxies to the port (fetching the secret
-//! from [`get_ui_credential`] server-side, never exposing it to the browser). The host itself never
-//! dials the plugin, never health-checks it, and never persists any of this: it is a phone book with
-//! expiry.
+//! Plugins register a port, per-boot secret, title, and icon. The console obtains credentials
+//! server-side and proxies only to `127.0.0.1`; registrations are never persisted or health-
+//! checked and expire lazily after [`LEASE_TTL`]. Mutation routes require bearer authentication
+//! from loopback.
 //!
-//! Lease model (design §3, D8): a registration lives for [`LEASE_TTL`]; the plugin renews with the
-//! same idempotent `PUT` every 30 s. Expiry is **lazy** — a crashed plugin's entry simply stops
-//! listing once stale; there is no reaper task and nothing to persist across a host restart (the
-//! supervised plugin re-registers on its next tick). Every consumer dials `127.0.0.1:<port>` only —
-//! a registration stores a *port*, never an address, so it can never point the proxy elsewhere (D5).
-//!
-//! Auth: these routes carry no special handling — they are outside the [`super::auth::cert_may_access`]
-//! read-only allowlist, so the middleware confines them to a **bearer + loopback** peer like every
-//! other mutation. LAN clients have no business here.
-//!
-//! What that does NOT establish is *which* plugin is calling. `plugin-token` is one shared credential
-//! for the whole runner, so a registration's id is asserted, never proven: any holder can claim any
-//! id — including a live one's, whose port and secret it then replaces — and
-//! [`PluginRegistry::upsert`] has no ownership check to apply. Harmless while this stays a phone
-//! book, but the launch path reads it as an authority ([`ui_credential`] →
-//! [`crate::library::ask_plugin_launch`] dials the registered port and runs what it answers), which
-//! makes the shared token command execution (2026-08-25 review H-1). An ownership check here has
-//! nothing to check against and cannot be given one: the runner imports every plugin into ONE bun
-//! process (`sdk/src/runner.ts`), so there is no per-plugin process to mint a per-plugin token for,
-//! and a plugin that proved its id would still be entitled to answer its own launch asks. The gap
-//! that matters is the principal one (Windows: runner LocalService, host SYSTEM), and closing it is
-//! a runner redesign — a process per plugin — not a guard in this registry.
+//! The shared `plugin-token` authenticates the runner, not an individual plugin. Any holder can
+//! replace an id's registration, and [`crate::library::ask_plugin_launch`] treats that registration
+//! as launch authority. Per-plugin ownership therefore requires runner process isolation rather
+//! than an additional registry check.
 
 use super::shared::*;
 use crate::events::{emit, EventKind};

@@ -1,31 +1,12 @@
-//! Session-scoped suspend/idle inhibition: while at least one client is streaming **and is not
-//! sending input**, the host holds a logind `sleep:idle` BLOCK inhibitor so the box doesn't
-//! auto-suspend out from under a passive viewer. Remote INPUT resets the compositor's idle timers,
-//! but a video-only viewer sends none — observed live on a SteamOS Game-Mode host, which s2idled
-//! mid-stream-day and dropped off the network (and, in a VM with GPU passthrough, never woke
-//! again). Refcounted across planes (native sessions + GameStream media): the first hold acquires,
-//! the last drop releases. Best-effort — no logind (containers, non-systemd boxes) logs once and
-//! streams on. Off Linux this is a no-op: macOS/Windows hosts manage their own power assertions.
+//! Refcounted, session-scoped Linux suspend inhibition for passive streams.
 //!
-//! **The quiet gate is the point, and it is not an optimisation.** A `block` lock on `sleep`
-//! refuses EVERY suspend, not just the idle timer's: "Sleep" in Steam's Big Picture power menu
-//! reaches logind as exactly the same `Suspend()` call, and logind answers the person who pressed
-//! it with `Operation inhibited by "Punktfunk" (…), reason is "a client is streaming"` — silently,
-//! because nothing in that UI surfaces a D-Bus error. Held unconditionally for the length of a
-//! stream (as it was from 2026-07-22 to this commit), the lock made a host impossible to put to
-//! sleep from the machine's own screen for as long as anyone was watching it. Reproduced verbatim
-//! on a Bazzite box, 2026-08-24.
+//! After [`QUIET_BEFORE_VETO`] without client input, the host holds a logind `sleep:idle` block
+//! so an idle timer cannot suspend the machine. [`note_input`] releases it synchronously because
+//! the same logind inhibitor would otherwise reject an intentional Sleep action; silence re-arms
+//! it later. A local suspend request during a passive stream remains indistinguishable from idle
+//! suspension and is therefore still blocked.
 //!
-//! So the veto is held only while the stream is QUIET. Any client input ([`note_input`]) drops it
-//! **synchronously** — releasing is a `close(2)` on the inhibitor fd, no round trip, so a Sleep
-//! press cannot race it — and it is re-taken only after [`QUIET_BEFORE_VETO`] of silence. That is
-//! the same line the original justification already drew ("a video-only viewer sends none"): a
-//! person choosing Sleep is, by definition, sending input, and a passive viewer never does.
-//!
-//! What this deliberately does NOT cover is a local suspend request typed at a box that a passive
-//! viewer is streaming from — the veto is still standing, so it is still refused. That case wants
-//! a person-vs-timer signal we do not have, and the remote viewer's claim on the box is at least
-//! arguable. `ponytail:` if it turns up in the field, the lever is a config knob, not a heuristic.
+//! Acquisition is best-effort, shared by native and GameStream sessions, and a no-op off Linux.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};

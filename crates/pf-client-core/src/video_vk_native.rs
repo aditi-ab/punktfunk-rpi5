@@ -1,179 +1,21 @@
-//! Native Vulkan Video decode backend (WP-C of the native-decode program, widened to
-//! HEVC by M3 WP-2 and to AV1 by M7): pf-vkdecode's
-//! [`VkH264Decoder`]/[`VkH265Decoder`]/[`VkAv1Decoder`] running on the PRESENTER's own
-//! VkDevice — the same zero-copy shape the FFmpeg-Vulkan backend had, with no FFmpeg in
-//! the path. Auto's TOP rung on both desktop OSes, for ALL THREE codecs — each
-//! leg has bit-exact parity against libavcodec (H.264/H.265 on three drivers plus a
-//! 92-minute soak, M2/M3; AV1 250/250 on an RTX 5070 Ti, M7 — `video`'s evidence table
-//! holds the record) — also pinnable via `PUNKTFUNK_DECODER=native-vulkan`;
-//! `video::native_vulkan_gate` is the admission either way, and a failure falls through
-//! to the rung below (the platform's own native rung).
+//! Native Vulkan Video backend using pf-vkdecode on the presenter's `VkDevice`; decoded
+//! images are sampled directly, without FFmpeg, copies, imports, or a second device.
+//! It supports H.264, H.265, and AV1 with NV12, P010, or 8/10-bit two-plane 4:4:4 output;
+//! [`crate::video::native_vulkan_gate`] and [`NativeVulkanDecoder::new`] check admission
+//! and stream shape, with failure falling through the ladder described by [`crate::video`].
 //!
-//! **Codec dispatch:** the negotiated codec picks the decoder ONCE, at construction
-//! ([`Codec`]) — H.264, H.265 or AV1, the three codecs pf-vkdecode speaks. The
-//! negotiated picture SHAPE (chroma format + bit depth) is checked there too, against
-//! the device: an H.265 or AV1 session this GPU has no decode format for is refused at
-//! construction, where the ladder simply walks on to the next rung, rather than at the
-//! first AU, where the only exit is an error streak PAST that rung
-//! ([`NativeVulkanDecoder::new`]). Nothing below the codec enum is per-codec: the
-//! shipped-frame ledger, the release tokens, the
-//! decode-status reads, the timeline waits and the teardown drain are shared, because
-//! all three decoders deliver the identical [`DecodedVkFrame`] contract (same pool/slot
-//! lifecycle, same `value + 1` write-back, same query slots, same generations).
-//! Forking that machinery per codec would fork the one part of this backend hardware
-//! has already proven.
+//! The backend is single-owner (`Send`, not `Sync`); [`submit_queues_collide`] selects the
+//! shared queue lock whenever decode and graphics use the same externally synchronized queue.
+//! A delivered [`NativeVkFrame`] pins its pool slot until [`NativeReleaseGuard`] is dropped
+//! after presentation retires; [`Codec::release_frame`] also waits for its status verdict,
+//! and teardown gives outstanding guards the bounded [`TEARDOWN_BUDGET`] before pool destruction.
 //!
-//! **One AU, several FRAMES (AV1 only).** An AV1 access unit is a TEMPORAL UNIT and may
-//! carry more than one frame — the vendored conformance vector puts 274 frames in 250
-//! units. [`VkAv1Decoder::decode`] walks them all internally and hands back the first
-//! picture the planner declared DISPLAYABLE; the rest come out of `take_ready`, which
-//! this backend already drains for H.265's burst output. Two AV1 facts make that walk
-//! invisible from here, and both are the decoder's doing rather than this module's:
-//! a HIDDEN frame (`show_frame = 0`) is decoded but never declared an output, so it
-//! never enters `take_ready` and can never be shipped; and a `show_existing_frame`
-//! (`dpb.stored == None`) decodes nothing at all and merely declares an
-//! already-decoded picture displayable. So the contract this backend keeps is
-//! unchanged — ONE access unit in, at most one displayable frame out.
-//!
-//! That contract is the SPEC's, not an assumption about punktfunk hosts: AV1 admits
-//! exactly one shown frame per temporal unit, and the 24 two-frame units of the
-//! vendored vector are a hidden ALTREF plus the frame that shows — one output
-//! between them (`pf_bitstream::av1`'s conformance golden pins `shown = 250` across
-//! 250 units, with `show_existing = 0`). [`NativeVulkanDecoder::decode`]'s
-//! deliverable bound is therefore defence in depth against a stream that is NOT
-//! that — a non-conformant encoder, or a scalable stream whose temporal unit carries
-//! several operating points — and not the routine case it would be if a
-//! `show_existing_frame` could ride alongside a shown frame. It cannot.
-//!
-//! **A skipped RASL picture is NOT a decode error.** An HEVC stream joined at a CRA
-//! carries leading pictures whose references precede the join; the spec's own answer
-//! (8.1.3 NOTE) is to decode and output nothing for them. [`VkH265Decoder::decode`]
-//! implements exactly that: `h265::PlanError::RaslSkipped` never becomes a
-//! `VkDecodeError`, so the AU comes back as `Ok` with whatever was ALREADY
-//! display-ready (usually `None`) and with the warning ledger cleared. This backend
-//! must therefore treat `Ok(None)` as "no picture this AU" and nothing more — no
-//! release-unshown, no re-anchor request, no error. Mapping it to an error would make
-//! every open-GOP join beg the host for a keyframe it has no reason to send. (Dead in
-//! the field today — punktfunk hosts emit IDR-only re-entry points — but it is the
-//! contract pf-bitstream's `h265` module docs record for this wiring.)
-//!
-//! AV1's post-failure wait is NOT that shape, and the difference is deliberate.
-//! After a failed frame the decoder empties its own slot ledger and skips every
-//! frame until the next key frame (`VkAv1Decoder::awaiting_key`), because the
-//! planner's eight-slot store still believes the flushed pictures are resident. But
-//! a temporal unit in which every frame was skipped comes back as an ERROR
-//! (`VkDecodeError::AwaitingKeyAv1`), once per access unit — exactly what H.264 and
-//! H.265 answer for the same wait through their planners' `PlanError::AwaitingIdr`,
-//! and for a reason this module owns: an `Ok(None)` with an empty warning ledger is
-//! read here as a CLEAN access unit, and a clean AU clears `video.rs`'s demotion
-//! streak. A rung whose every key frame fails would then never demote — one error
-//! per key frame, zeroed by the skipped frames between them — and the `!delivered`
-//! fall-through to the rung below, the documented backstop for a level above
-//! `maxLevelIdc`, a sequence header disagreeing with the Welcome and (AV1 only)
-//! film grain, would be unreachable. All three codecs demote identically here.
-//!
-//! **Queue lock:** pf-vkdecode submits on queue 0 of the decode family
-//! ([`DECODE_QUEUE_INDEX`] — the presenter creates exactly one queue per family). When
-//! the decode family IS the presenter's graphics family, that is the very `VkQueue` the
-//! presenter/Skia/overlay submit and present on, so every decode submit must hold the
-//! device's shared [`video::QueueLock`] (`vkQueueSubmit` external sync — the 2026-07-09
-//! `VK_ERROR_DEVICE_LOST` class). When the families differ, the decode queue has exactly
-//! one submitter (this backend, on the pump thread) and locking would serialize decode
-//! against present for nothing — [`submit_queues_collide`] is the whole decision. (The
-//! FFmpeg path locked on every family only because `lock_queue` was one callback pair for
-//! the whole device; the collision the lock exists to prevent is the shared-queue one.)
-//!
-//! **Release lifecycle** (decode → present → retire → release): each delivered frame
-//! ships as a [`NativeVkFrame`] whose [`NativeReleaseGuard`] sends a token (seq +
-//! generation) into this backend's channel on drop. The presenter drops the frame only
-//! after the sampling submission's fence has been waited (its retired-frame slot), so a
-//! returned token proves the GPU is done with the image; a frame dropped UNPRESENTED
-//! (newest-wins displacement, post-demotion drain) releases through the same drop. The
-//! backend drains the channel at every `decode` entry and calls
-//! [`Codec::release_frame`] — but only once the frame's decode-status query has
-//! also been read (the slot stays pinned meanwhile, which is what makes re-polling the
-//! query safe: an unreleased slot can never be recycled under the poll).
-//!
-//! **Status queries:** every decode op carries a `RESULT_STATUS_ONLY` query —
-//! [`Codec::poll_status`], read non-blockingly here at each decode entry. A
-//! `Failed` verdict is driver-reported decode corruption, the class libavcodec's
-//! `vulkan_decode.c` (`nb_queries = 0`) architecturally cannot see — the Xbox Ally X
-//! field case. It surfaces as an `Err` from the CURRENT `decode_frame` call so the
-//! existing streak/reanchor machinery fires exactly as it did for libavcodec errors.
-//!
-//! **The recovery policy** (M4) — what a damaged stream ASKS for, and why it cannot
-//! storm. There are two kinds of damage and they are answered differently:
-//!
-//! - **Concealment** (the plan needed a substitute for something lost: an integrity
-//!   warning). The AU's output is released UNSHOWN, [`DecodeHealth`] records it, and
-//!   `decode` answers `Ok(None)` with [`NativeVulkanDecoder::take_recovery_request`]
-//!   raised. `video::Decoder` turns that into its ordinary `want_keyframe`, which the
-//!   pump drains, arms the freeze on, and asks through the ONE ~100 ms recovery
-//!   throttle every other ask already shares (`session.rs`'s `last_kf_req`: frame-gap
-//!   RFI, dropped-climb, no-output streak, overdue backstop, decoder recovery). It is
-//!   deliberately NOT an `Err`: an error ticks the demotion streak, and three of them
-//!   in a second would demote the native rung on exactly the lossy links it exists to
-//!   diagnose — libavcodec concealed the same event silently and kept its job.
-//! - **A driver `Failed` verdict** (and its query-less twin, a decode status that
-//!   could not be established at all — [`StatusVerdicts`]). That is a statement about
-//!   the DECODER, not the stream, so it stays an `Err`: the same volume libavcodec's
-//!   reference-miss errors had, streak-eligible, and a driver making it repeatedly is
-//!   precisely what demotion is for.
-//! - **A REFUSED AU** — the decoder answering `Err` outright (a plan error, a
-//!   Vulkan/session failure). Also an error, also streak-eligible, and counted
-//!   separately from concealment in [`DecodeHealth::refused`]: "the stream is
-//!   damaged and I coped" and "I could not run" are opposite statements about the
-//!   rung, and only the second one means the session is looking at a frozen screen.
-//!
-//! **AV1 answers a LOST REFERENCE as a refusal, not as concealment**, and that is the
-//! codec's doing rather than a policy difference here. AV1's reference array is indexed
-//! by reference NAME, so a lost reference leaves a HOLE and there is no legal substitute
-//! to write into it — `-1` for a name the frame really references is a spec violation
-//! whose firmware behaviour is undefined, so [`VkAv1Decoder::decode`] refuses the AU
-//! (`MissingReferenceAv1`) instead of concealing. The refusal counts in
-//! [`DecodeHealth::refused`], the `Err` sets `want_keyframe` through `video::Decoder`'s
-//! own error arm, and the decoder then skips to the next key frame — answering an
-//! `Err` for every access unit of that wait, so the streak keeps ticking until the
-//! re-anchor lands (the paragraph above). What must not be done is to launder either
-//! answer into a concealment, or into a clean AU: the pictures really were not
-//! decoded, and reporting "damaged, coped" — or "nothing to object to" — would put a
-//! clean-looking bill of health on a rung that produced no picture.
-//!
-//! **The invariant all of the above serves: an answer may clear the demotion
-//! streak only if it PROVES the rung works.** `video::Decoder::decode_frame` resets
-//! the streak on a shipped frame or a CLEAN access unit, and on nothing else — so
-//! every state in which this backend produces no picture has to reach it as either
-//! a concealment (`Ok(None)` + a recovery request) or an `Err`, never as a clean
-//! `Ok(None)`. Concealment is therefore left untouched by the reset (otherwise a
-//! driver failing every other AU on a lossy link has its errors zeroed by the
-//! concealment between them, and a rung that conceals FOREVER — a host framing
-//! regression: every AU damaged, no frame ever shipped — has no escape hatch at
-//! all), and the AV1 key-frame wait is an `Err` rather than the clean `Ok(None)` it
-//! superficially resembles. The one genuinely clean `Ok(None)` is the decoder that
-//! ran and had nothing to object to: it buffered, or it skipped an H.265 RASL
-//! picture after an open-GOP join.
-//!
-//! Neither can storm, for two independent reasons. The ask is throttled to one per
-//! 100 ms per session whatever the damage rate; and once the freeze is armed the gate
-//! lifts only on a proven re-anchor, so a run of damaged AUs refreshes an existing
-//! freeze rather than compounding into more requests. A stream that never recovers
-//! therefore costs one keyframe ask per 100 ms, not one per AU.
-//!
-//! **Recovery-point SEI** (M4): pf-vkdecode's `RecoveryWatch` folds the parsed SEI
-//! into a per-picture mark that rides the frame ([`NativeVkFrame::recovery`]) into
-//! the shared gate's `on_local_recovery`. It is the only way a client can see an
-//! intra-refresh session heal on the two backends that run a wave WITHOUT setting the
-//! wire mark (Windows AMF and QSV — only Linux libav-NVENC sets it): the wave emits
-//! no IDR and libavcodec flags none, so without this such a session freezes for the
-//! full 500 ms backstop and then forces the very IDR the wave exists to avoid.
-//! Additional, never a replacement: the wire path is untouched and the other rungs
-//! keep exactly the behaviour they had.
-//!
-//! **Teardown:** dropping this backend (demotion, session end) waits — bounded — for
-//! every shipped frame's token before dropping the decoder, because the decoder's Drop
-//! destroys the pool images and its own drain only covers DECODE work, not the
-//! presenter's in-flight sampling. Tokens arrive as the presenter's fence waits/drops
-//! displace the frames; a presenter wedged past [`TEARDOWN_BUDGET`] forfeits (warned).
+//! [`Codec::poll_status`] turns failed or unreadable Vulkan status queries into rung errors.
+//! Integrity concealment instead drops the picture unshown and raises
+//! [`NativeVulkanDecoder::take_recovery_request`]; refusals and post-failure keyframe waits
+//! remain errors so ladder demotion can proceed. A clean `Ok(None)` is reserved for buffering
+//! or an H.265 RASL skip. AV1 temporal units may decode hidden frames but expose at most one
+//! displayable frame per [`NativeVulkanDecoder::decode`]; recovery-point SEI rides that frame.
 
 use crate::video::{
     ColorDesc, DecodeHealth, NativeReleaseGuard, NativeReleaseToken, NativeVkFrame, NativeVkLayout,

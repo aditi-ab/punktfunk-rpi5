@@ -1,0 +1,18 @@
+│
+◆  punktfunk-host 0.34.0 · canary
+│  https://docs.punktfunk.unom.io/docs/arch
+│
+│  ▸ Apply these changes
+│  ──────────────────────────────────────────────────────────
+│    Components        Host ✓ · Client ✗
+│    Channel           canary
+│    Full controller   yes — joins the punktfunk group (grants usbip attach)
+│    Moonlight compat  no  — punktfunk's own apps don't need it
+│    Shared clipboard  no
+│    Start at boot     no  — this box has a graphical session
+│    Start services    yes
+│  ──────────────────────────────────────────────────────────
+│    Dry run — print every command, change nothing
+│    Uninstall — remove the packages and the repo
+│
+│  ↑↓ move · Enter select/edit · q quit — nothing runs until you confirm

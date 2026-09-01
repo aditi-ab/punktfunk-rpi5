@@ -19,9 +19,25 @@ use std::path::PathBuf;
 /// a leaf so neither subsystem crate has to reach into the other (plan §W6). Linux-only.
 #[cfg(target_os = "linux")]
 pub fn gamescope_ei_socket_file() -> PathBuf {
+    gamescope_ei_relay("punktfunk-gamescope-ei")
+}
+
+/// The per-session spelling of [`gamescope_ei_socket_file`]: `$XDG_RUNTIME_DIR/
+/// punktfunk-gamescope-{id}-ei`. Used by an ISOLATED bare-spawn gamescope session
+/// (`design/gamescope-multiuser.md`) so two concurrent spawns never overwrite each other's relayed
+/// socket name; the id is the session's stable isolation identity (`pf-vdisplay`'s
+/// `SessionIsolation`). Same directory and therefore the same 0700 ownership story as the global
+/// file. Linux-only.
+#[cfg(target_os = "linux")]
+pub fn gamescope_ei_socket_file_for(id: &str) -> PathBuf {
+    gamescope_ei_relay(&format!("punktfunk-gamescope-{id}-ei"))
+}
+
+#[cfg(target_os = "linux")]
+fn gamescope_ei_relay(name: &str) -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
-        Some(rt) => PathBuf::from(rt).join("punktfunk-gamescope-ei"),
-        None => PathBuf::from("/tmp/punktfunk-gamescope-ei"),
+        Some(rt) => PathBuf::from(rt).join(name),
+        None => PathBuf::from("/tmp").join(name),
     }
 }
 
@@ -408,6 +424,20 @@ fn restrict_to_system_admins(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-session relay derives from the same base dir as the global file and embeds the id —
+    /// the naming contract `pf-vdisplay`'s spawn wrapper and the pinned injector meet at.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn per_session_ei_relay_shares_the_global_files_directory() {
+        let global = gamescope_ei_socket_file();
+        let per = gamescope_ei_socket_file_for("cafe0123");
+        assert_eq!(per.parent(), global.parent());
+        assert_eq!(
+            per.file_name().unwrap().to_str().unwrap(),
+            "punktfunk-gamescope-cafe0123-ei"
+        );
+    }
 
     #[test]
     fn published_mgmt_port_follows_the_endpoint_file_and_is_absent_without_it() {

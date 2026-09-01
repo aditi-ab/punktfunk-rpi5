@@ -83,6 +83,26 @@ fn no_live_session(pinned: Option<&str>) -> anyhow::Error {
 /// [`pick_compositor`]): enumerate what's available, auto-detect the default, pick, and log
 /// whether the explicit request was honored or fell back. Runs blocking probes — call off the
 /// async reactor (`spawn_blocking`).
+/// Whether a session resolved to `(compositor, route)` runs ISOLATED (`design/
+/// gamescope-multiuser.md`): its own pinned injector, env-routed audio and per-session mic instead
+/// of the shared host-lifetime planes. Only the gamescope BARE SPAWN qualifies — managed/attach
+/// are single-occupant by nature, and the shared-desktop backends *want* shared planes — and the
+/// `PUNKTFUNK_GAMESCOPE_ISOLATE` escape hatch can turn it off. The ONE predicate: the resolve
+/// paths (initial + both mid-stream rebuild sites) and `serve_session`'s plane setup must never
+/// disagree about it.
+#[cfg(not(target_os = "windows"))]
+pub(super) fn session_is_isolated(
+    compositor: crate::vdisplay::Compositor,
+    route: Option<&crate::vdisplay::GamescopeRoute>,
+) -> bool {
+    // Only Linux has the isolated planes (gamescope + PipeWire); the non-Linux dev builds that
+    // compile this resolve path answer the way an off knob does.
+    cfg!(target_os = "linux")
+        && compositor == crate::vdisplay::Compositor::Gamescope
+        && matches!(route, Some(crate::vdisplay::GamescopeRoute::Spawn))
+        && pf_host_config::config().gamescope_isolate
+}
+
 pub(super) fn resolve_compositor(
     pref: CompositorPref,
     dedicated_launch: bool,
@@ -160,10 +180,15 @@ pub(super) fn resolve_compositor(
                      to get dedicated game sessions."
                 );
             } else {
-                crate::inject::set_backend_id(crate::vdisplay::input_backend_id(
-                    Compositor::Gamescope,
-                ));
                 let route = crate::vdisplay::resolve_gamescope_route(Compositor::Gamescope, true);
+                // An ISOLATED session's input goes to its own pinned injector, so it must not
+                // retarget the shared service (last-write-wins — it would steal input from any
+                // concurrent shared-desktop viewer for nothing).
+                if !session_is_isolated(Compositor::Gamescope, route.as_ref()) {
+                    crate::inject::set_backend_id(crate::vdisplay::input_backend_id(
+                        Compositor::Gamescope,
+                    ));
+                }
                 tracing::info!(
                     ?route,
                     "dedicated game session — routing to a headless gamescope spawn at the client \
@@ -203,18 +228,21 @@ pub(super) fn resolve_compositor(
                 pf_host_config::config().compositor.as_deref(),
             ));
         }
-        // Point input at the same backend the video landed on — as a published VALUE, not a
-        // `PUNKTFUNK_INPUT_BACKEND` `set_var`. An operator pin skips this, which is what leaves the
-        // operator's own knob in charge on a pinned box.
-        if !overridden {
-            crate::inject::set_backend_id(crate::vdisplay::input_backend_id(chosen));
-        }
         // The gamescope sub-mode (managed where the session infra exists, attach to a foreign
         // gamescope, else per-session bare spawn). Resolved on BOTH paths and travelling back to the
-        // caller as a value carried on the backend instance: a pin skips the input retarget above
+        // caller as a value carried on the backend instance: a pin skips the input retarget below
         // but still needs a route, or `create` falls through to a bare spawn on a box that was
-        // pinned to the managed session.
+        // pinned to the managed session. Resolved BEFORE the input publish because the publish now
+        // depends on it (an isolated spawn keeps its hands off the shared injector).
         let route = crate::vdisplay::resolve_gamescope_route(chosen, false);
+        // Point input at the same backend the video landed on — as a published VALUE, not a
+        // `PUNKTFUNK_INPUT_BACKEND` `set_var`. An operator pin skips this, which is what leaves the
+        // operator's own knob in charge on a pinned box. An ISOLATED session skips it too: its
+        // input goes to its own pinned injector, and retargeting the last-write-wins shared slot
+        // would steal input from any concurrent shared-desktop viewer for nothing.
+        if !overridden && !session_is_isolated(chosen, route.as_ref()) {
+            crate::inject::set_backend_id(crate::vdisplay::input_backend_id(chosen));
+        }
         let avail_ids: Vec<&str> = available.iter().map(|c| c.id()).collect();
         match Compositor::from_pref(pref) {
             Some(want) if want == chosen => {

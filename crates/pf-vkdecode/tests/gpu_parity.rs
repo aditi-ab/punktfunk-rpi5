@@ -1,92 +1,23 @@
-//! GPU frame-hash parity tests (WP-D) — the decode legs are `#[ignore]`d
-//! because they need real Vulkan Video hardware; the coherence guards at the
-//! bottom of this file are not, and run in ordinary CI.
+//! Vulkan Video pixel-parity contract for H.264, H.265, and AV1.
 //!
-//! Run on a Vulkan-Video box with:
+//! The ignored GPU legs decode vendored conformance and host-produced streams, read back each
+//! display-region frame, and require its SHA-256 and total display-order frame count (including
+//! flushed frames) to match the checked-in libavcodec software-decode goldens.
+//! H.264/H.265 also prove three- and four-byte Annex-B start codes produce identical pixels;
+//! AV1 OBUs are length-delimited and therefore have no equivalent prefix-width leg.
+//! Non-ignored CPU guards keep each fixture, AU split, golden count, and intended stream shape
+//! coherent; file fixtures do not cover packetisation, reassembly, or loss.
+//!
+//! Prerequisite: a Vulkan Video device supporting the codec/profile under test. RADV additionally
+//! needs `RADV_PERFTEST=video_decode`; select a GPU with `PF_VKD_SMOKE_VENDOR=0x1002` or `0x10de`.
+//! Run all hardware legs with:
 //!
 //! ```text
 //! cargo test -p pf-vkdecode --test gpu_parity -- --ignored --nocapture
 //! ```
 //!
-//! (RADV boxes additionally need `RADV_PERFTEST=video_decode` — for AV1 as much as
-//! for the other two, and without it `bring_up` reports "no physical device with
-//! VK_KHR_video_decode_av1", which reads like missing silicon; multi-GPU boxes
-//! pin the vendor with `PF_VKD_SMOKE_VENDOR=0x1002` / `0x10de`, same knob as
-//! the smoke tests. Device bring-up lives in `tests/common/mod.rs`.)
-//!
-//! What they prove: H.264, H.265 and AV1 decoding are all exactly specified — every
-//! conformant decoder must produce bit-identical output — so the vendored 25fps
-//! vector of each codec is decoded through [`VkH264Decoder`] / [`VkH265Decoder`] /
-//! [`VkAv1Decoder`],
-//! every output frame's NV12 planes are read back (`vkCmdCopyImageToBuffer` on the
-//! graphics queue — GPU→CPU is fine in a test; the pool grows TRANSFER_SRC via the
-//! decoders' `PF_VKD_TEST_READBACK` hook), cropped to the display region,
-//! SHA-256-hashed in DISPLAY order and compared against goldens from libavcodec's
-//! SOFTWARE decoder (the reference implementation — provenance in
-//! `data/test-25fps.nv12.sha256`, `data/test-25fps-h265.nv12.sha256` and
-//! `data/test-25fps-av1.nv12.sha256`). ALL
-//! frames are collected, including the tail `flush` delivers, and the frame count
-//! must match libavcodec's too.
-//!
-//! Every leg runs ONE body ([`collect_hashes`]) over `common::TestDecoder`, so the
-//! H.265 and AV1 legs cannot quietly test something weaker than the H.264 one. A box
-//! that decodes only some of the three runs those legs and reports the rest as "no
-//! physical device with VK_KHR_video_decode_…", which is a fact about the box —
-//! and on today's fleet AV1 is the one most likely to say so.
-//!
-//! The two Annex-B codecs run that body TWICE: once over the vendored vector as it
-//! sits, and once over the same vector rewritten to FOUR-byte start codes, which is
-//! what the real host emits on 100% of access units in both codecs (1514/1514
-//! H.264 and 1133/1133 HEVC, measured off the M0 NVENC corpus). Prefix width
-//! carries no information, so both runs must reproduce the same goldens —
-//! and submitting the four-byte form to the driver unchanged is precisely the
-//! defect that made HEVC unplayable on every driver tested. Until these legs
-//! existed no parity vector exercised the form that actually ships. **AV1 has no
-//! such twin and needs none**: OBUs are length-delimited, so there is no start-code
-//! prefix for a driver to mis-skip and no second framing to test (see
-//! `common::split_av1_aus`). Its absence is deliberate.
-//!
-//! # The three legs that decode OUR OWN streams
-//!
-//! [`LOWDELAY_H264`], [`LOWDELAY_H265`] and [`LOWDELAY_AV1`] are not conformance
-//! vectors — they are `punktfunk-host spike` output, vendored because a conformance
-//! vector proves conformance to itself and the encoder we ship behind is a different
-//! stream. Each is here for its own reason:
-//!
-//! * **H.264** caught a defect the vector is structurally blind to — 117 of its 120
-//!   access units named one surface as both the decode target and a reference.
-//! * **H.265** is EXEMPT from that defect for a structural reason, and an exemption
-//!   with no stream behind it is how the H.264 defect survived two milestones.
-//! * **AV1** is neither: the vendored AV1 vector already aliases on 268 of its 274
-//!   frames, so that class was covered. It is here because the vector is ONE TILE on
-//!   every frame while our encoder splits 4K into two tile rows, so every tile array
-//!   the conversions fill had only ever been exercised at index 0.
-//!
-//! All three are backed by a non-ignored CPU guard asserting the stream still has the
-//! property it was vendored for. ⚠ And all three are FILES. A file fixture says
-//! nothing about packetisation, reassembly or loss — which for AV1 is not a
-//! hypothetical caveat but a recorded failure: this suite reported 250/250 throughout
-//! the period the host was shipping only the first tile of every 4K frame.
-//!
-//! # Why the AV1 leg exists at all
-//!
-//! Because until it did, the AV1 rung had no pixel evidence whatsoever. An
-//! adversarial review of the conversion found four defects — per-frame flags left
-//! unset on all 274 frames, a units error in `LoopRestorationSize`, per-reference
-//! info describing the wrong picture, and zeroed film-grain fields — and every one
-//! of them would have shown as a hash mismatch on frame 0 or shortly after, while
-//! NONE of them failed clippy or the crate's unit tests. Type-checking a struct
-//! conversion cannot tell you the struct describes the right picture; only the
-//! pixels can.
-//!
-//! The readback follows the presenter's exact frame contract: wait the frame's
-//! timeline `value`, round-trip the layout, signal `value + 1` in the SAME
-//! submission, then `release_frame(frame, true)` — and every submission is
-//! host-waited before the next decode, so nothing here races the decode queue.
-//!
-//! Reading a failure: frame 0 is intra-only — if it already mismatches, suspect
-//! the readback geometry (row pitch / crop) or intra decode; mismatches that
-//! only appear on later frames point at inter prediction / DPB management.
+//! Inputs are the embedded bitstreams and hash files under `tests/data`; success produces no new
+//! evidence files, only assertions that every read-back frame and expected count match.
 
 mod common;
 

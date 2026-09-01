@@ -1,31 +1,11 @@
-//! Shared microburst pacing POLICY for the two video send planes (networking-audit deferred
-//! plan §5): the native plane (`native::paced_submit`, GSO via the core `Session`) and the
-//! GameStream compat plane (`gamestream::stream::spawn_sender`, `sendmmsg` over its own RTP
-//! socket). Both spread a frame's packets across a time budget in chunked bursts so a real link
-//! doesn't drop the frame as one line-rate burst; the syscall layers stay deliberately separate
-//! (different sockets, framing, and error contracts) — this module shares the schedule, not the
-//! plumbing.
+//! Shared packet scheduling for native and GameStream video sends.
 //!
-//! The two planes' parameterizations (pinned by the deterministic-schedule tests below):
+//! Both planes send an initial microburst, then pace overflow with a bitrate-derived budget
+//! while retaining their own sockets and framing. Native adapts chunk size to preserve useful
+//! sleep intervals; GameStream bounds the number of sleep steps on its non-realtime thread.
+//! Deterministic tests pin both policies.
 //!
-//! * **native** — the first `burst_bytes` leave immediately (one absorbed microburst), only the
-//!   overflow is paced across `min(90 % of the time left to the frame deadline, the time the
-//!   overflow needs at ~3× the live stream bitrate)` in ADAPTIVE chunks: 16 packets at today's
-//!   rates, coarsening just enough that the per-chunk interval clears the sleep floor (≤ 64,
-//!   the GSO-segment cap) once the rate would otherwise skip every sleep — so ≥1 Gbps frames
-//!   still pace instead of blasting (no slack ⇒ budget 0 ⇒ never slower than unpaced). The
-//!   rate cap (latency plan T1.2) front-loads the spread: the link demonstrably carries 1× the
-//!   stream rate sustained, so a bounded 3× excursion is safe and a large frame's tail stops
-//!   waiting out the whole interval;
-//! * **GameStream** — the same burst + rate-derived budget as native since the GS competitive
-//!   program's WP1.2 (the original shape — no burst, every frame spread across a fixed
-//!   ¾-interval budget — cost every P-frame an up-to-¾-interval tail for congestion protection
-//!   only oversized frames need). The chunking stays BOUNDED (≤ 12 steps, chunk ≥ 16), because
-//!   on that non-RT send thread every step ends in a `thread::sleep` whose overshoot must stay
-//!   independent of bitrate (Moonlight clients are tested against this timing).
-//!
-//! `PUNKTFUNK_VIDEO_DROP` (the FEC-recovery test knob both planes honor) and the stats
-//! `percentile` helper live here too — they were duplicated alongside the pacing.
+//! The shared `PUNKTFUNK_VIDEO_DROP` test hook and percentile helper live here as well.
 
 use std::time::{Duration, Instant};
 

@@ -1,55 +1,14 @@
-//! Pad audio (the 0xD1 plane): render the host's per-gamepad DualSense streams — voice-coil
-//! haptics (kind 0, the BACK channel pair) and the built-in speaker (kind 1, the FRONT pair) —
-//! into a USB-connected physical DualSense's own 4-channel audio device.
+//! Render per-gamepad DualSense haptics and speaker streams (`0xD1`) on a wired pad's
+//! four-channel USB audio device. Bluetooth pads have no audio sibling and are unsupported.
 //!
-//! Tier A only (v1): a WIRED DualSense / DualSense Edge — Bluetooth exposes no audio device, so
-//! wired is what makes the 4-ch sibling exist at all. The gamepad worker detects tier A at slot
-//! open ([`crate::gamepad`]) and declares the pad's render capabilities to the core
-//! ([`punktfunk_core::client::NativeClient::set_pad_audio_caps`]), which rides them on the
-//! arrival (flags bits 8/9) toward a `HOST_CAP_PAD_AUDIO` host; the host then emits 0xD1 for
-//! exactly those pads. This module owns everything after that:
+//! [`spawn`] correlates each pad with its WASAPI or PipeWire endpoint, decodes both Opus
+//! streams with gap concealment, and interleaves speaker on channels 0/1 and voice coils on
+//! 2/3. Linux requires the physical card's four-channel profile, index-based `AUX0..AUX3`
+//! mapping, and exclusion of host-created look-alike sinks; `ensure_pro_audio` manages the
+//! profile for the session.
 //!
-//! - **Correlation** pad ↔ audio device. Windows: the SDL HID interface path → the devnode's
-//!   `ContainerID` (registry) → the active eRender endpoint whose stamped
-//!   `PKEY_Device_ContainerId` matches AND whose device format has 4 channels. Linux: the
-//!   PipeWire node belonging to a DualSense CARD that carries four channels — see
-//!   `pick_pad_sink`, and the section below for why "a sink that looks like a DualSense" is
-//!   not enough.
-//! - **The renderer worker** ([`spawn`]): drains [`NativeClient::next_pad_audio`] (the plane's
-//!   single consumer), Opus-decodes per (pad, kind) with seq-gap PLC (the session audio path's
-//!   [`AudioGapTracker`] discipline), interleaves both pairs into one 4-ch stream
-//!   (speaker → channels 0/1, haptics → 2/3 — the DS5 device's own layout), and plays it on the
-//!   correlated device: WASAPI shared/event-driven on Windows, a PipeWire playback stream with
-//!   `target.object` on Linux — both with the session players' 3-quantum prime/cap/re-prime
-//!   ring policy at a SMALLER floor (haptics are felt latency). The output device is opened
-//!   lazily on the first arriving frame and re-correlated with backoff when it goes away.
-//!
-//! # Linux: four channels, in order, or nothing is felt
-//!
-//! The voice coils ARE channels 3 and 4 of the pad's USB audio function. Everything on the
-//! Linux side follows from that one fact, and none of it is optional:
-//!
-//! - **The node must have four channels.** A DualSense card almost never presents as one by
-//!   default. PipeWire's ACP picks a stereo profile, and modern `alsa-ucm-conf` (which gained
-//!   `USB-Audio/Sony/DualSense-PS5.conf` in 2026-08) splits the card into a MONO `Speaker` sink
-//!   and a stereo `Headphones` sink instead. Streaming a quad into any of those renders the
-//!   haptics into the headphone jack and folds the coil pair away — audibly plausible, felt as
-//!   nothing. This is the client-side twin of the "set the controller to Pro Audio" advice the
-//!   host-side sink exists to make unnecessary (`audio/linux/pad_sink.rs` in the host tree),
-//!   and here we automate it: `ensure_pro_audio` moves the card's profile and puts it back
-//!   when the session ends.
-//! - **The channels must map by index, not by position.** Games — and this plane — treat the
-//!   quad as four raw channels; a positioned stream into a positioned sink gets helpfully
-//!   re-mixed. So the stream is `AUX0..AUX3` with `stream.dont-remix`, which is both what
-//!   GE-Proton's pulse leg forces and what our own host sink advertises.
-//! - **It must be a real card, never a look-alike.** A Punktfunk HOST minting its pad sink on
-//!   this same machine publishes the full DualSense identity ON PURPOSE — that is how Proton
-//!   finds it. Rendering into it would loop the plane back at the host instead of driving a
-//!   pad. `device.id` tells them apart: a card's node has one, a stream-sink does not.
-//!
-//! The `Settings` side: `pad_haptics` (bool) and `pad_speaker` (`"pad"`/`"mix"`/`"off"`) gate
-//! the `CLIENT_CAP_PAD_AUDIO` advertisement and the per-pad capability bits; `"mix"` (fold the
-//! speaker into the main stream audio) is a declared TODO and renders as `"off"`.
+//! `pad_haptics` and `pad_speaker` gate capability advertisement. Speaker mode `"mix"` is
+//! not implemented and currently behaves as `"off"`.
 
 use punktfunk_core::audio::AudioGapTracker;
 use punktfunk_core::client::NativeClient;

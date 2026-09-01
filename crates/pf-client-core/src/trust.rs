@@ -17,32 +17,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Read one of this client's JSON config files, or its `Default` — tolerating a byte order
-/// mark, and SAYING SO when the file is there but will not parse.
+/// Read a client JSON file or return its default value.
 ///
-/// Both halves are the same bug seen twice.
-///
-/// **The BOM.** PowerShell's `Set-Content -Encoding UTF8` writes a UTF-8 BOM, and every
-/// Windows how-to reaches for it, so `%APPDATA%\punktfunk\client-windows-settings.json`
-/// edited from a shell arrives with `EF BB BF` in front of the `{`. `serde_json` rejects
-/// that at byte 0 — correctly, JSON has no BOM — and the old
-/// `.and_then(|s| from_str(&s).ok())` then turned the whole file into `Default`. Cost an
-/// hour on 2026-08-07: a `codec: "av1"` edit was ignored and the client negotiated HEVC,
-/// with the file plainly right on screen. So the mark is stripped, which is what every
-/// other JSON consumer on Windows does.
-///
-/// **The silence.** The `.ok()` that hid the BOM hides everything else too: a trailing
-/// comma, a truncated write, a hand-edit with a typo. Every one of them presents as "the
-/// app forgot all my settings", with nothing anywhere to say why. A parse failure now costs
-/// one `warn!` naming the file and serde's own line/column. The RESULT is unchanged —
-/// `Default`, never an error — because nothing about streaming may hinge on this file
-/// being readable, and refusing to start because a settings file is malformed would be a
-/// worse failure than the one being fixed.
-///
-/// A missing file is not a parse failure and stays silent: that is just first run. Every
-/// OTHER read failure is reported, which is not pedantry — `Set-Content -Encoding Unicode`
-/// writes UTF-16LE, `read_to_string` rejects it as invalid UTF-8, and that lands in exactly
-/// the same "the app forgot my settings, and said nothing" hole the BOM did.
+/// A leading UTF-8 BOM is accepted because common PowerShell editing commands add one.
+/// Missing files are normal and silent; other read or parse failures warn before falling back
+/// so malformed settings do not look like unexplained resets. Configuration errors never
+/// prevent streaming from starting.
 pub(crate) fn load_json_or_default<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,

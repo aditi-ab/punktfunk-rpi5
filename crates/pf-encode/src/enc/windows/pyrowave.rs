@@ -77,22 +77,11 @@ fn budget_for(bitrate_bps: u64, fps: u32) -> usize {
     ((bitrate_bps / (8 * fps.max(1) as u64)) as usize).max(64 * 1024)
 }
 
-// GPU scheduling priority is deliberately NOT set here. `pf-frame`'s `dxgi::auto_priority_gate`
-// owns that policy for the whole process and runs once from `create_device` — the call the Windows
-// capture path always makes before any PyroWave texture exists.
-//
-// This module used to raise it itself, to HIGH, once per process. That was a SECOND owner of a
-// process-wide setting and it raced the real one: pf-frame's default `auto` mode starts at HIGH and
-// then UPGRADES to REALTIME once it has established that is safe (HAGS off, or HAGS on with VRAM
-// headroom, with a monitor that drops back when VRAM tightens — REALTIME + NVIDIA + HAGS +
-// near-full VRAM is a documented NVENC hang). Opening a PyroWave session after that upgrade stamped
-// HIGH back over REALTIME and the monitor, silently losing the ceiling-raise on exactly the
-// GPU-saturated workload PyroWave cares about most.
-//
-// The old `PUNKTFUNK_GPU_PRIORITY` knob went with it; `PUNKTFUNK_GPU_PRIORITY_CLASS`
-// (`off|normal|high|realtime|auto`, default `high` — `auto` is opt-in since the 2026-08-12 AMD
-// field A/B convicted its REALTIME upgrade, see `pf-frame/src/dxgi.rs`) is the one that survives
-// and it is strictly more capable — the removed knob could not express the auto gate at all.
+// GPU scheduling priority is deliberately NOT set here. `pf-frame`'s
+// `dxgi::elevate_process_gpu_priority` owns that policy process-wide (the
+// `PUNKTFUNK_GPU_PRIORITY_CLASS` knob, default `realtime`) and runs once from `make_device`,
+// which the Windows capture path always calls before any PyroWave texture exists — a second
+// owner here would race it, as this module's removed HIGH raise once did.
 
 pub struct PyroWaveEncoder {
     // pyrowave owns the whole Vulkan device (create_device_by_compat) — no ash on this side.

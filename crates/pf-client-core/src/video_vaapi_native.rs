@@ -4180,137 +4180,26 @@ mod tests {
 
 #[cfg(test)]
 mod parity {
-    //! Frame-hash parity for this rung — the evidence M6 and M7 shipped without, and
-    //! the last rung of the ladder that had none.
+    //! Ignored VAAPI frame-parity tests; run on a host with a real device:
+    //! `cargo test -p pf-client-core --lib video_vaapi_native -- --include-ignored --nocapture`.
+    //! Pin multi-GPU runs with `PUNKTFUNK_VAAPI_DEVICE=/dev/dri/renderD…`.
     //!
-    //! `#[ignore]`d: every leg needs a real VAAPI device. Run them on a box with
+    //! Seven H.264, H.265/Main10, and AV1 vector/low-delay legs hash every delivered
+    //! display frame, including flush output, against the shared libavcodec software
+    //! goldens in `pf-vkdecode/tests/data`; order, drops, crop, and pixels must match.
+    //! The 4K AV1 fixture covers two tiles; hidden AV1 frames are observed only through
+    //! later displayed dependants. Main10 is packed as high-bit-aligned P010.
     //!
-    //! ```text
-    //! cargo test -p pf-client-core --lib video_vaapi_native -- --include-ignored --nocapture
-    //! ```
+    //! Readback is test-only: [`ImageApi`] and all libva image symbols exist only under
+    //! `#[cfg(test)]`; production [`Libva`] remains DRM-PRIME/dmabuf zero-copy, and
+    //! [`the_readback_entry_points_are_resolved_only_inside_this_module`] enforces this boundary.
+    //! [`Readback`] tries `vaDeriveImage`, then `vaCreateImage` + `vaGetImage`, and fails
+    //! rather than skipping if neither returns the pool fourcc. `PF_VAAPI_READBACK=derive|getimage`
+    //! forces a route; when both work, their first-frame bytes must agree.
+    //! [`pf_vaadec::pack_two_plane`] uses driver offsets/pitches and is CPU-unit-tested.
     //!
-    //! and pin a GPU on a multi-GPU box with `PUNKTFUNK_VAAPI_DEVICE=/dev/dri/renderD…`
-    //! (the same pin the rung itself honours).
-    //!
-    //! # What it proves, and against what
-    //!
-    //! Exactly what `pf-vkdecode`'s `gpu_parity` proves for the Vulkan rung and
-    //! `video_d3d11_native`'s `parity` for the D3D11VA one, against the same reference
-    //! and — deliberately — the SAME GOLDEN FILES, read across the crate boundary
-    //! rather than copied: H.264, H.265 and AV1 decoding are exactly specified, so a
-    //! conformant decoder must reproduce libavcodec's SOFTWARE output bit for bit. One
-    //! golden set for three rungs is what makes their verdicts directly comparable;
-    //! three copies would be three measurements.
-    //!
-    //! Until this module existed the VAAPI rung's four legs could only claim that every
-    //! access unit was ACCEPTED and that a surface of the right shape came back. That
-    //! is a much weaker claim than it reads as, and this program has now been shown
-    //! exactly how much weaker: the D3D11VA AV1 rung streamed 4K60 for five clean
-    //! minutes while producing wrong pixels for 186 of 250 frames on one GPU and 245 of
-    //! 250 on another. Nothing but a golden caught it.
-    //!
-    //! # Measured
-    //!
-    //! **All seven legs, 2026-08-08, on `.25`** — Radeon 780M (RDNA3), radeonsi, Mesa
-    //! 26.0.3, VA-API 1.23, `/dev/dri/renderD128`:
-    //!
-    //! | leg | frames | flush tail | verdict |
-    //! |---|---|---|---|
-    //! | H.264, vendored vector | 250 | 7 | bit-identical |
-    //! | H.264, our host's low-delay 640x480 | 120 | 3 | bit-identical |
-    //! | H.265, vendored vector | 250 | 2 | bit-identical |
-    //! | H.265, our host's low-delay 640x480 | 120 | 0 | bit-identical |
-    //! | HEVC Main 10, P010 | 50 | 2 | bit-identical |
-    //! | AV1, vendored vector | 250 delivered of 274 decoded | 0 | bit-identical, and display frame 0 byte-identical to libavcodec's own PIXELS |
-    //! | AV1, our host's 4K two-tile | 60 | 0 | bit-identical |
-    //!
-    //! `vaDeriveImage` answers on radeonsi and is the route every leg took. `vaGetImage`
-    //! also answers; the two agreed byte for byte on every leg's first frame, and
-    //! `PF_VAAPI_READBACK=getimage` reproduces the H.264 leg's 250/250 through the
-    //! copying route alone — so the fallback is exercised rather than merely written.
-    //!
-    //! ⚠ ONE vendor. This is AMD/radeonsi only; Intel's iHD driver has a different
-    //! surface layout and a different `vaDeriveImage` answer, and no Intel box has run
-    //! these legs. The D3D11VA AV1 defect was invisible on NVIDIA for 64 frames and
-    //! structural on Intel from frame 4 — one driver passing is evidence about that
-    //! driver.
-    //!
-    //! # ⚠ The readback is TEST-ONLY, and that is structural rather than a promise
-    //!
-    //! The production path exports a DRM-PRIME dmabuf and the presenter samples it.
-    //! Nothing on it maps a surface, and nothing may: a per-frame CPU readback on the
-    //! live path would cost exactly the copy zero-copy exists to avoid. Four things
-    //! keep this module off it, and the first is the one that matters:
-    //!
-    //! 1. **The entry points are resolved HERE, in `#[cfg(test)]` code.** [`ImageApi`]
-    //!    dlopens `libva.so.2` itself and stores the image function pointers in a type
-    //!    that does not exist outside `cargo test`. In a shipped build there is no
-    //!    `vaMapBuffer` pointer to call, so no production path can reach one however
-    //!    wrong it becomes.
-    //! 2. **The production [`Libva`] gains no field.** Its list of entry points is
-    //!    unchanged by this module, which is the one-screen check a reviewer can do.
-    //! 3. [`the_readback_entry_points_are_resolved_only_inside_this_module`] asserts
-    //!    (1) and (2) mechanically, by scanning this file's own source: every `dlsym`
-    //!    of an image entry point must sit after this module's header. It is a CPU
-    //!    test, so ordinary `cargo test` enforces it on every platform.
-    //! 4. `sha2` is a DEV dependency, so nothing shipped links the hashing either.
-    //!
-    //! # Two routes, because derive is not guaranteed
-    //!
-    //! libva offers two ways to read a surface, and a driver need only implement one:
-    //!
-    //! * **`vaDeriveImage`** maps the surface's own memory. Cheap, and refused outright
-    //!   by drivers whose decode surfaces are tiled or otherwise not linearly
-    //!   addressable.
-    //! * **`vaCreateImage` + `vaGetImage`** asks the driver to copy — and detile — the
-    //!   region into an image of a format it declares it can produce.
-    //!
-    //! [`Readback`] tries derive first, falls back to create+get, and **fails loudly
-    //! naming what the driver gave it** if neither yields the pool's own fourcc. A
-    //! parity test that quietly passed because it could not read anything is the
-    //! failure mode this program has been bitten by three times; there is no skip path
-    //! here. `PF_VAAPI_READBACK=derive|getimage` forces one route, and the first frame
-    //! of every leg is read through BOTH when both work and the two must agree — which
-    //! is the only check that can catch a derive that "succeeds" onto tiled bytes.
-    //!
-    //! # It hashes what the rung DELIVERS, in the order it delivers it
-    //!
-    //! The goldens are one hash per DISPLAY frame. Since the delivery fix this rung
-    //! hands back every displayed picture in display order — `settle` claims every
-    //! output rather than only the last, and [`NativeVaapiDecoder::flush`] drains the
-    //! tail the DPB is still holding — so delivery order IS golden order and the
-    //! comparison is a straight zip. Three things follow, and all three are why this
-    //! shape was chosen over hashing decoded pictures by `PicId`:
-    //!
-    //! * a frame's surface comes from its OWN release token, so the harness never has
-    //!   to infer which surface holds which picture — an inference that was subtly
-    //!   wrong in an earlier draft of this file, because a surface freed at the top of
-    //!   an access unit can be taken as that same unit's decode target and so never
-    //!   looks newly held;
-    //! * the DELIVERY path is under test too. A rung that decoded perfectly and
-    //!   presented in the wrong order, or dropped a picture, fails here — and dropping
-    //!   pictures is precisely what this rung did until 2026-08-08;
-    //! * the frame carries its own display region and keyframe flag
-    //!   ([`PictureFacts`]), so the harness reads geometry from the same place the
-    //!   presenter does rather than from a second guess.
-    //!
-    //! ⚠ What this shape does NOT cover: AV1's **hidden frames**. 24 of the vendored
-    //! vector's 274 decoded pictures are never displayed, so they are never delivered
-    //! and never hashed here. They are not unverified — every shown frame after one
-    //! predicts from it, so a hidden picture decoded wrong shows up as a wrong hash on
-    //! the frames that reference it — but a defect confined to a hidden frame's own
-    //! pixels would be seen one frame late rather than at once.
-    //!
-    //! # The crop, and the ten-bit trap
-    //!
-    //! Surfaces are allocated at the CODED size and are taller than the picture, so the
-    //! chroma plane starts at the driver's own `offsets[1]` and never at
-    //! `pitch * display_height` — the 1088-row smear this project has already paid for.
-    //! That walk is [`pf_vaadec::pack_two_plane`], and it is unit-tested with no device
-    //! at all. Main 10's goldens are **P010**, two bytes per sample with the ten bits in
-    //! the HIGH end of each little-endian word; a driver handing back LSB-aligned
-    //! samples produces a buffer of exactly the right length and the wrong content,
-    //! which [`Divergence::low_bits_set`] is here to name.
+    //! All seven legs were bit-identical on Radeon 780M/radeonsi (Mesa 26.0.3, VA-API 1.23);
+    //! this is driver-specific evidence, not proof for Intel or other VAAPI implementations.
 
     use sha2::Digest;
 

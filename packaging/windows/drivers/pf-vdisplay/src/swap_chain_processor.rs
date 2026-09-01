@@ -71,54 +71,22 @@ fn hr_success(hr: NTSTATUS) -> bool {
     hr >= 0
 }
 
-/// How (whether) the swap-chain processing device's GPU scheduling is raised — the
-/// interval-stutter program's A/B ladder, resolved once per WUDFHost process from the MACHINE
-/// environment (the driver runs as LocalService: `setx /M PFVD_RT_GPU 1` + a device restart
-/// applies it; the [`crate::log`] `OnceLock` pattern).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RtGpuMode {
-    /// No raise at all — canonical-IDD scheduling, and the DEFAULT since the 2026-08 field
-    /// conviction (see [`rt_gpu_mode`]).
-    Off,
-    /// `PFVD_RT_GPU=thread`: `IDXGIDevice::SetGPUThreadPriority(7)` — the graduated middle rung.
-    /// A per-device GPU *thread* priority inside the band ordinary applications can also reach,
-    /// so it biases the scheduler without the REALTIME rung's unreachable-preemption hazard. Not
-    /// the default because it is unmeasured here — and the host process measured the same call as
-    /// "no help" for its encode-starvation case (`pf-frame/src/dxgi.rs`) — so it exists purely as
-    /// the field-A/B rung between OFF and REALTIME.
-    GpuThread,
-    /// `PFVD_RT_GPU=<anything else>`: the IddCx 1.9 `IddCxSetRealtimeGPUPriority` DDI — the old
-    /// default-ON behavior, "higher priority than any regular application can set".
-    Realtime,
-}
-
-/// Resolve the [`RtGpuMode`] ladder. Default **OFF**: no canonical IDD driver raises its
-/// swap-chain device's GPU priority, and a 2026-08 field A/B on an RX 9070 XT convicted our
-/// REALTIME raise as the amplifier of a metronomic ~1.8 s capture-stall class — every ~1.8 s
-/// EVERY process's presents stopped for 150–800 ms while the GPU stayed responsive (a starved
-/// present path, not a stalled engine); clearing the raise removed the metronome entirely.
-/// The raise was added as speculative "outranks GPU contention" hardening (branch-2 of the
-/// disturbance-immunity program) whose CPU half — MMCSS / TIME_CRITICAL on this thread — is the
-/// part that addressed the observed delivery holes and REMAINS in force; the GPU half never had
-/// a measured win and now has a measured loss, so it is opt-in on every vendor (NVIDIA is
-/// untested in either direction, and a vendor-split default would double the support matrix on
-/// no evidence).
-///
-/// Precedence: the old opt-OUT (`PFVD_NO_RT_GPU`, any value) wins over the new opt-IN — a field
-/// box that carried it through the default-ON era must keep meaning OFF no matter what is set
-/// beside it. Both directions stay A/B-able without a rebuild.
-fn rt_gpu_mode() -> RtGpuMode {
+/// Whether the swap-chain processing device's GPU scheduling is raised to REALTIME (the IddCx
+/// 1.9 `IddCxSetRealtimeGPUPriority` DDI — "higher priority than any regular application can
+/// set"). Default **ON**: minimum latency at every layer — a GPU-saturating game must not starve
+/// the leg that feeds every captured frame into the ring. The 2026-08 default-OFF (after an
+/// RX 9070 XT field A/B blamed this raise for a metronomic ~1.8 s capture-stall class) at most
+/// masked that still-unattributed stall — confirmed cases kept arriving with the raise off —
+/// while regressing loaded NVIDIA boxes into feed starvation, so it was reverted. The per-box
+/// A/B escape hatch remains: `setx /M PFVD_NO_RT_GPU 1` (any value) + a device restart disables
+/// the raise — read via [`machine_env`] as well as the process environment, because WUDFHost's
+/// own environment is stale until a reboot. The old `PFVD_RT_GPU` opt-in ladder
+/// (off/thread/realtime) is gone; a stale `PFVD_RT_GPU` now just matches the default.
+fn rt_gpu_enabled() -> bool {
     use std::sync::OnceLock;
-    static MODE: OnceLock<RtGpuMode> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        if std::env::var_os("PFVD_NO_RT_GPU").is_some() {
-            return RtGpuMode::Off;
-        }
-        match std::env::var_os("PFVD_RT_GPU") {
-            None => RtGpuMode::Off,
-            Some(v) if v.eq_ignore_ascii_case("thread") => RtGpuMode::GpuThread,
-            Some(_) => RtGpuMode::Realtime,
-        }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("PFVD_NO_RT_GPU").is_none() && machine_env("PFVD_NO_RT_GPU").is_none()
     })
 }
 
@@ -128,10 +96,8 @@ fn rt_gpu_mode() -> RtGpuMode {
 /// which inherited it from the SCM at boot, and the SCM never refreshes on `WM_SETTINGCHANGE`.
 /// So a `setx /M` set today is invisible to `std::env::var_os` until a REBOOT — measured on
 /// .173 (2026-08-29): the toggle below had no effect across device restarts with fresh WUDFHost
-/// PIDs until this read was added. ⚠ [`rt_gpu_mode`] carries the same trap and is deliberately
-/// left alone: its variables predate the 2026-08 REALTIME conviction, so making them suddenly
-/// readable could re-arm the convicted amplifier on a box that still carries a stale
-/// `PFVD_RT_GPU=1`.
+/// PIDs until this read was added. [`rt_gpu_enabled`]'s opt-out reads through here for the same
+/// reason.
 fn machine_env(name: &str) -> Option<String> {
     use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
     use windows::core::{HSTRING, PCWSTR};
@@ -396,47 +362,26 @@ impl SwapChainProcessor {
             }
             thread::sleep(Duration::from_millis(50));
         }
-        // GPU-scheduling raise for the swap-chain processing device — OPT-IN, default none (see
-        // [`rt_gpu_mode`] for the field conviction that inverted the old default-ON). What used
-        // to be sold as stall immunity ("swap-chain buffer processing outruns ordinary GPU
-        // contention") preempts the game's and DWM's own queues at a level apps can't reach, and
-        // on an AMD field box that manifested as the metronomic content-starving stall class the
-        // stall program spent weeks attributing. The CPU-side half of that hardening (MMCSS /
-        // TIME_CRITICAL, above) is untouched — it addressed the delivery holes actually observed.
-        //
-        // Both raises are best-effort, never fatal, and issued while our borrowed device
-        // reference is still alive (IddCx uses it synchronously; the DXGI call is direct). The
-        // REALTIME slot is guaranteed populated (`IddMinimumVersionRequired = 10`, lib.rs), but
-        // the DDI may still decline (e.g. E_NOTIMPL on pre-WDDM-3.0 hardware).
-        if set_ok {
-            match rt_gpu_mode() {
-                RtGpuMode::Off => {}
-                RtGpuMode::GpuThread => {
-                    // SAFETY: `dxgi_device` is the live device just bound to the swap-chain; the
-                    // call takes a scalar in the documented −7..=7 band and retains nothing.
-                    let res = unsafe { dxgi_device.SetGPUThreadPriority(7) };
-                    dbglog!(
-                        "[pf-vd] swap-chain: GPU thread priority +7 (PFVD_RT_GPU=thread) — ok={} (target={target_id})",
-                        res.is_ok()
-                    );
-                }
-                RtGpuMode::Realtime => {
-                    let mut rt = pod_init!(IDARG_IN_SETREALTIMEGPUPRIORITY);
-                    rt.pDevice = dxgi_device.as_raw().cast();
-                    // SAFETY: driver is loaded; `swap_chain` is the live assigned swap-chain whose
-                    // device bind just succeeded; `rt.pDevice` is that same bound DXGI device,
-                    // alive across the synchronous call; `rt` points to valid local storage.
-                    let hr = unsafe { wdk_iddcx::IddCxSetRealtimeGPUPriority(swap_chain, &rt) };
-                    if hr_success(hr) {
-                        dbglog!(
-                            "[pf-vd] swap-chain: processing device raised to REALTIME GPU priority (PFVD_RT_GPU) (target={target_id})"
-                        );
-                    } else {
-                        dbglog!(
-                            "[pf-vd] swap-chain: realtime GPU priority declined ({hr:#x}) — normal scheduling (target={target_id})"
-                        );
-                    }
-                }
+        // GPU-scheduling raise for the swap-chain processing device — default ON, so the leg
+        // feeding every captured frame into the ring outranks a GPU-saturating game (history +
+        // `PFVD_NO_RT_GPU` escape hatch: [`rt_gpu_enabled`]). Best-effort, never fatal, issued
+        // while our borrowed device reference is still alive (IddCx uses it synchronously); the
+        // DDI may still decline (e.g. E_NOTIMPL on pre-WDDM-3.0 hardware).
+        if set_ok && rt_gpu_enabled() {
+            let mut rt = pod_init!(IDARG_IN_SETREALTIMEGPUPRIORITY);
+            rt.pDevice = dxgi_device.as_raw().cast();
+            // SAFETY: driver is loaded; `swap_chain` is the live assigned swap-chain whose
+            // device bind just succeeded; `rt.pDevice` is that same bound DXGI device,
+            // alive across the synchronous call; `rt` points to valid local storage.
+            let hr = unsafe { wdk_iddcx::IddCxSetRealtimeGPUPriority(swap_chain, &rt) };
+            if hr_success(hr) {
+                dbglog!(
+                    "[pf-vd] swap-chain: processing device raised to REALTIME GPU priority (default; PFVD_NO_RT_GPU disables) (target={target_id})"
+                );
+            } else {
+                dbglog!(
+                    "[pf-vd] swap-chain: realtime GPU priority declined ({hr:#x}) — normal scheduling (target={target_id})"
+                );
             }
         }
         // Release our borrowed device reference — IddCx holds its own now, or we gave up. (Explicit drop

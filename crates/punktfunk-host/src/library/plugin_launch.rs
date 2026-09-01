@@ -1,51 +1,14 @@
-//! The `plugin` launch kind's transport: ask a library plugin what to run for one of **its own**
-//! entries, at launch time, over the loopback UI surface it already registered.
+//! Resolve a plugin-owned library entry to a command at launch time over the plugin's
+//! registered loopback UI surface.
 //!
-//! ## Why the host asks instead of storing a command
+//! Entries persist only an opaque key. Asking the owning plugin avoids storing executable
+//! content, rejects entries the plugin disowns, and picks up current emulator configuration.
+//! The host executes the answer so the process enters the captured session and game lifetime.
 //!
-//! A ROM tile is `<emulator> <args> <rom>` — an operator-configured command line, and the one shape
-//! [`super::privileged_field`] refuses from the plugin lane (2026-08-05 review H-1). The Playnite
-//! plugin hit the same wall and was rescued with a typed `playnite` kind the host resolves itself
-//! (see `command_for`), but that only works because a Playnite launch is a fixed URI scheme. There
-//! is no fixed scheme for "some emulator the operator installed, with the core and flags they chose"
-//! — the knowledge lives in the plugin, and it is the plugin that owns the hardened quoting seam for
-//! it (ROM filenames are untrusted input).
-//!
-//! So the entry carries an **opaque key** and nothing executable, and the command is fetched from
-//! the owning plugin at the moment of an actual launch. What that buys over letting the plugin write
-//! `kind = "command"` straight into the library:
-//!
-//! * **An entry planted under someone ELSE'S provider launches nothing.** The provider is stamped by
-//!   the host from the reconcile URL, so the plugin asked is the entry's owner, and a plugin asked
-//!   about an entry it never published answers 404 (this is why the ask names the entry rather than
-//!   trusting the payload).
-//! * **Nothing executable is ever persisted or served.** No command lands in `library.json`, and
-//!   `GET /library` has none to redact for a paired client.
-//! * **No stale recipes.** The same reasoning as the `xbox` kind resolving its AUMID at launch time:
-//!   an emulator that moved, or a config the operator has since edited, is picked up on the next
-//!   launch instead of leaving an unlaunchable tile behind.
-//!
-//! What it does **not** buy — and this doc claimed it did until the 2026-08-25 review (H-1) — is a
-//! barrier against a stolen plugin token. That one credential also reaches `PUT /api/v1/plugins/{id}`
-//! for *any* id, and a registration names the loopback port and the per-boot secret the host will
-//! dial: a holder stands up its own listener, registers a provider around it, reconciles a `plugin`
-//! entry under that provider, and answers the ask with whatever it likes. The per-boot secret proves
-//! the host reached whoever registered that id, not that they were entitled to it.
-//!
-//! There is no per-plugin credential to bind it to, either: the runner hosts every plugin as a fiber
-//! in ONE bun process (`sdk/src/runner.ts` `import()`s each unit), reading one shared `plugin-token`,
-//! so no token can name a single plugin. Nor would one help — this kind exists so that a plugin MAY
-//! choose a command the host runs, so an id proven beyond doubt buys the same primitive. What is
-//! load-bearing is the principal gap: on Windows the runner is LocalService and the host is SYSTEM,
-//! so whatever can read the LocalService-readable `plugin-token` escalates through here. Closing it
-//! means running the answer as the runner's principal (which gives up the session placement below)
-//! or a process per plugin — a runner redesign, not a change to this transport.
-//!
-//! The host still *runs* the command, because only the host can put the process where the stream can
-//! see it: on Linux the line is either gamescope's own argv (a bare-spawn session nests it) or a
-//! spawn carrying the session's compositor env, and the returned child is what
-//! `design/session-game-lifetime.md` tracks to know the game exited. A plugin spawning the emulator
-//! itself would land it outside the captured session and outside that lifetime.
+//! This is not a boundary against a stolen `plugin-token`: the runner shares one credential,
+//! so its holder can replace any registration and control the command returned for that id.
+//! The per-boot UI secret authenticates the registered listener, not plugin ownership. Closing
+//! that principal gap requires runner isolation or executing as the runner, not validation here.
 
 use super::*;
 use std::time::Duration;

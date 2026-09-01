@@ -1,0 +1,9 @@
+# Crate-scoped on purpose: clippy resolves clippy.toml from CARGO_MANIFEST_DIR upwards, and the
+# workspace has none, so this reaches punktfunk-setup and nothing else.
+#
+# The seam is only real if it cannot be walked around. `SystemRunner::command` carries the single
+# `#[allow(clippy::disallowed_methods)]`; a spawn added anywhere else would silently escape demo
+# mode and every test, which is exactly the failure this lint exists to make loud.
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "spawn through seam::CommandRunner (design/installer-v2.md D3) — a raw spawn bypasses --demo and the test fakes" },
+]

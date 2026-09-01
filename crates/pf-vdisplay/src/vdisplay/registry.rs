@@ -325,6 +325,12 @@ mod pool {
         /// A2): keep-alive reuse requires an exact match, so a kept spawn running game A never serves a
         /// session launching game B. `None` = a plain desktop / no nested command.
         pub(super) launch: Option<String>,
+        /// The isolation identity this display was created with (`design/gamescope-multiuser.md`):
+        /// an isolated spawn bakes its session's EIS relay path + PULSE_SINK/PULSE_SOURCE into the
+        /// gamescope's env, so keep-alive reuse requires an exact match — the same client gets its
+        /// kept session back, another client (or a non-isolated acquire) never does. `None` = not
+        /// an isolated spawn.
+        pub(super) isolation: Option<String>,
         /// The session epoch at creation (A4). Reuse requires an epoch match; the linger timer reaps
         /// entries whose epoch is stale (their compositor instance was replaced under them).
         pub(super) epoch: u64,
@@ -619,6 +625,7 @@ mod pool {
                 identity_slot: None,
                 topology_restore: restore,
                 launch: None,
+                isolation: None,
                 epoch: 0,
                 generation,
                 hw_cursor: false,
@@ -1125,6 +1132,7 @@ mod linux {
         // A2 reuse key: the launch command this acquire carries (a kept spawn running game A must never
         // be reused for a session launching game B). A4 reuse key: the current session epoch.
         let launch = vd.launch_command();
+        let isolation = vd.isolation_key();
         let cur_epoch = crate::session_epoch();
         let r = reg();
 
@@ -1164,6 +1172,7 @@ mod linux {
                         ) && e.backend == backend
                             && e.mode == mode
                             && e.launch == launch
+                            && e.isolation == isolation
                             && e.hw_cursor == vd.hw_cursor()
                             && e.hdr == vd.hdr()
                             && epoch_matches(e.backend, e.epoch, cur_epoch)
@@ -1316,6 +1325,7 @@ mod linux {
             identity_slot,
             topology_restore,
             launch: launch.clone(),
+            isolation: isolation.clone(),
             epoch: cur_epoch,
             generation,
             hw_cursor: vd.hw_cursor(),

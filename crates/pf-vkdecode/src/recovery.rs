@@ -1,105 +1,19 @@
-//! The recovery-point watch: turning the recovery point SEI into a per-picture
-//! "the stream is healed HERE" mark (M4 of the native-decode program).
+//! Converts H.264/H.265 recovery-point SEI state into per-picture
+//! [`RecoveryMark`] values; streams without such SEI produce no marks.
 //!
-//! # Why this exists
-//!
-//! A host running an **intra-refresh wave** never emits an IDR: a moving band of
-//! intra blocks re-codes the whole picture over ~half a second, and loss self-heals
-//! as the band sweeps. That is strictly better for a stream (no 20-40× IDR spike
-//! under loss) — but it leaves the CLIENT with no decoder-visible clean point.
-//! libavcodec sets `AV_FRAME_FLAG_KEY` only for true IDRs (H.264 flags key when
-//! `recovery_frame_cnt == 0`, HEVC only on IRAP), so a client on the FFmpeg rungs
-//! sees a healed picture as an unbroken run of ordinary P-frames. Its post-loss
-//! freeze therefore holds the last good frame until the shared gate's
-//! `REANCHOR_FREEZE_MAX` backstop (punktfunk-core's `reanchor` module) fires and
-//! forces the very IDR intra-refresh exists to avoid — half a second of frozen
-//! picture on a stream that was already clean.
-//!
-//! The host CAN say so on the wire (`USER_FLAG_RECOVERY_POINT`), and where it does
-//! the shared gate lifts on the second mark. But exactly ONE encoder backend sets
-//! it: pf-encode's Linux libav-NVENC, under the `PUNKTFUNK_INTRA_REFRESH` opt-in
-//! (`EncoderCaps::intra_refresh_recovery`). The other two backends that actually
-//! run a wave — Windows AMF and QSV — leave it `false` pending on-glass GDR
-//! validation, so THEIR intra-refresh sessions have no wire clean point at all and
-//! ride the backstop on every loss. The flag also cannot help a host that predates
-//! it, and it dies with the datagram that carried it.
-//!
-//! The bitstream, meanwhile, says it directly, and says it in a place loss cannot
-//! separate from the picture it describes: an NVENC-family encoder emits a
-//! **recovery point SEI** at the start of each wave, naming the picture at which
-//! output becomes correct. (Not universal — pf-encode records that AMF emits none,
-//! so an AMD Windows wave stays invisible either way; this is an overlapping set
-//! with the wire flag's, not a superset.) pf-bitstream parses it for both codecs
-//! already ([`pf_bitstream::h264::RecoveryPoint`],
-//! [`pf_bitstream::h265::RecoveryPointHevc`]) and carries it on every
-//! `AuPlan::picture`. This module is the piece that was missing: the small state
-//! machine that remembers an outstanding recovery point and marks the picture that
-//! reaches it, so the client can observe its own heal instead of waiting one out.
-//!
-//! It is an ADDITIONAL, independent signal. Nothing here touches the wire flags;
-//! a stream with no recovery point SEI produces no marks and behaves exactly as it
-//! did before.
-//!
-//! # The counting rules, and why they are conservative
-//!
-//! The two codecs count the distance to the recovery point in different units, so
-//! the watch keeps two `note_*` entries rather than pretending one unit fits both:
-//!
-//! * **H.265** (D.3.8) counts in PICTURE ORDER: `recovery_poc_cnt` is a signed POC
-//!   delta from the SEI's picture to the recovery point. That is exact arithmetic
-//!   on a number every plan already carries, so [`RecoveryWatch::note_h265`] simply
-//!   remembers `poc + recovery_poc_cnt` and marks the first picture at or past it.
-//!   A NEGATIVE count (a recovery point among leading pictures) marks the SEI's own
-//!   picture, which is what "at or past" means when the target is behind us.
-//!
-//! * **H.264** (D.2.8) counts in `frame_num` INCREMENTS, and `frame_num` advances
-//!   only for reference pictures, so there is no fixed picture-to-increment ratio.
-//!   [`RecoveryWatch::note_h264`] therefore counts increments the only way a
-//!   consumer honestly can: a picture whose `frame_num` DIFFERS from the previous
-//!   one's spends exactly one increment. That under-counts across a `frame_num` GAP
-//!   (a lost reference frame skips several increments but is charged one), which
-//!   makes the watch mark the recovery point LATE, never early — and late is the
-//!   behaviour the client already has today (the backstop). A gap also re-arms the
-//!   client's freeze and normally brings a fresh SEI with it, so the residue is a
-//!   heal reported one wave later, not a stale picture presented as clean.
-//!
-//! Both entries drop an outstanding watch at an IDR/IRAP: a real keyframe is a
-//! whole re-anchor by itself, and its POC/`frame_num` reset would make any pending
-//! target meaningless.
-//!
-//! # An SEI is a wave START only when its target ADVANCES
-//!
-//! [`RecoveryMark::sei_here`] is not "this AU carried a recovery point SEI"; it is
-//! "an intra-refresh wave STARTS here", and the difference decides whether a
-//! consumer may trust the mark that follows. D.2.8/D.3.8 both permit re-announcing
-//! the CURRENT wave's recovery point on every picture with a shrinking count, and
-//! that is exactly what x264's `--intra-refresh` emits. Under a "any SEI is a new
-//! wave" reading the first picture after a loss carries a fresh-looking SEI whose
-//! target is the end of a wave that began BEFORE the loss — so the consumer's
-//! arm-pairing lifts on a picture whose already-swept stripes still reference the
-//! lost frame, presenting a partially stale picture as clean. That is precisely
-//! what the wire path's `REANCHOR_MARKS_TO_LIFT = 2` exists to prevent, and the
-//! local path must not be the weaker of the two.
-//!
-//! So an SEI is honoured as a wave start only when the target it implies lies
-//! BEYOND any outstanding one (H.265: `poc + recovery_poc_cnt` strictly greater
-//! than the outstanding `Target::Poc`; H.264: `recovery_frame_cnt` strictly greater
-//! than the increments still owed, both measured from the same picture). Anything
-//! else is a re-announcement: the further target stands and no wave start is
-//! reported. The cost is that a genuinely NEW wave which is shorter than the
-//! remainder of the one in flight goes unreported — a heal missed, falling back to
-//! the consumer's backstop — which is the same direction every other rule here
-//! errs in: late, never early.
-//!
-//! # What the watch deliberately does NOT decide
-//!
-//! Whether a mark may LIFT a post-loss freeze is the client's decision, not this
-//! module's, because it depends on something no bitstream carries: when the loss
-//! happened. A recovery point whose SEI arrived BEFORE the loss guarantees nothing
-//! — the wave's already-swept stripes still reference the picture that was lost —
-//! so the consumer must require an SEI observed at or after the loss. That is why
-//! [`RecoveryMark`] reports the SEI and the recovery point as two separate facts:
-//! the client pairs them against its own arm.
+//! `sei_here` and `is_recovery_point` are independent and may both be true.
+//! Existing targets are charged before a new SEI is installed, so the announcing
+//! picture is excluded from a fresh H.264 count and may finish the prior wave.
+//! H.264 follows §D.2.8: count `frame_num` changes, conservatively charging gaps
+//! as one increment so uncertain recovery is reported late, never early.
+//! H.265 follows §D.3.8: target `poc + recovery_poc_cnt` and mark the first picture
+//! at or past it; a negative count therefore marks the SEI picture itself.
+//! IDR/IRAP clears any outstanding target because its numbering is no longer valid.
+//! Repeated SEI starts a new wave only when its implied target advances beyond the
+//! outstanding target; shrinking/equal announcements do not set `sei_here`.
+//! This signal is independent of wire recovery flags. The consumer, which knows
+//! loss timing, must pair an SEI at/after loss with its later recovery point before
+//! using it to lift a post-loss freeze.
 
 use pf_bitstream::h264::RecoveryPoint;
 use pf_bitstream::h265::RecoveryPointHevc;
