@@ -1,4 +1,4 @@
-//! Stage four: run a `Plan`. Echo, sudo shim, `--yes` rewrites, TTY stdin, per-step results.
+//! Stage four: run a `Plan`. Echo, sudo shim, no-confirm rewrites, TTY stdin, per-step results.
 //!
 //! `--dry-run` walks the same code and returns before the spawn, so what dry-run prints is
 //! what a real run executes — there is no second rendering path to drift.
@@ -14,8 +14,9 @@ use crate::plan::{Level, Plan, StepAction};
 use crate::seam::{BasePaths, CommandRunner, Stdin};
 use crate::ui::Reporter;
 
-/// Under `--yes` a package manager must not stop for its own confirmation. Ported verbatim
-/// from the sh installer's rewrite table; `-Syu` is tested before `-S` so it wins.
+/// A package manager must not stop for its own confirmation: running the installer is the
+/// consent, and the settings screen already listed what it installs. Ported verbatim from the
+/// sh installer's `--yes` rewrite table; `-Syu` is tested before `-S` so it wins.
 const NONINTERACTIVE: [(&str, &str); 11] = [
     ("flatpak install --user ", "flatpak install --user -y "),
     ("flatpak uninstall --user ", "flatpak uninstall --user -y "),
@@ -30,6 +31,10 @@ const NONINTERACTIVE: [(&str, &str); 11] = [
     ("sudo pacman -Rdd ", "sudo pacman -Rdd --noconfirm "),
 ];
 
+/// The NSS nickname the trust entry is filed under — the same one `punktfunk-omarchy` uses, so
+/// either path replaces the other's entry instead of stacking a second.
+const CERT_NICK: &str = "punktfunk-console";
+
 pub fn noninteractive(cmd: &str) -> String {
     for (from, to) in NONINTERACTIVE {
         if let Some(rest) = cmd.strip_prefix(from) {
@@ -42,8 +47,9 @@ pub fn noninteractive(cmd: &str) -> String {
 #[derive(Debug, Clone, Copy)]
 pub struct Opts {
     pub dry: bool,
-    pub yes: bool,
-    /// A terminal the package manager's own prompt can reach.
+    /// The progress line is up: a step's output is captured and shown only when it fails.
+    pub quiet: bool,
+    /// A terminal sudo's password prompt can reach.
     pub tty: bool,
 }
 
@@ -140,17 +146,14 @@ impl Executor<'_> {
             StepAction::PacmanSwitch { pkgs } => self.pacman_switch(pkgs, facts).map(|()| true),
             StepAction::Linger => self.linger(facts),
             StepAction::StartUnits { units } => self.start_units(units, outcome, facts),
+            StepAction::TrustCert => self.trust_cert(facts, outcome),
         }
     }
 
-    /// Echo the command, then run it — under `--yes` the non-interactive form is what both the
-    /// echo and the spawn get, so the transcript is what actually ran.
+    /// Echo the command, then run it — the non-interactive form is what both the echo and the
+    /// spawn get, so the transcript is what actually ran.
     fn shell(&self, cmd: &str, facts: &Facts) -> Result<(), Failed> {
-        let cmd = if self.opts.yes {
-            noninteractive(cmd)
-        } else {
-            cmd.to_string()
-        };
+        let cmd = noninteractive(cmd);
         self.ui.plus(&cmd);
         if self.opts.dry {
             return Ok(());
@@ -160,12 +163,108 @@ impl Executor<'_> {
         } else {
             Stdin::Null
         };
-        self.run.run_shell(&cmd, stdin).map_err(|_| {
-            Failed(format!(
-                "that step failed — fix it and re-run (the script is safe to repeat), or follow the page by hand: {}",
-                facts.docs_page
-            ))
+        let failed = format!(
+            "that step failed — fix it and re-run (the script is safe to repeat), or follow the page by hand: {}",
+            facts.docs_page
+        );
+        if !self.opts.quiet {
+            return self.run.run_shell(&cmd, stdin).map_err(|_| Failed(failed));
+        }
+        // Nothing was echoed while the step ran, so the tail of its output is the only clue
+        // the user gets. Thirty lines: a package manager's error sits at the end.
+        self.run.run_shell_quiet(&cmd, stdin).map_err(|output| {
+            let skip = output.len().saturating_sub(30);
+            let mut text = failed;
+            if skip < output.len() {
+                text.push_str("\n   the step's last lines:");
+                for line in &output[skip..] {
+                    text.push_str("\n     ");
+                    text.push_str(line);
+                }
+            }
+            Failed(text)
         })
+    }
+
+    /// Chromium reads the per-user NSS store, so one `certutil -A` there makes the console open
+    /// with no security warning. Firefox keeps its own store and still shows one. The host
+    /// mints `native-cert.pem` on its first start, after the unit enable returns, so this
+    /// waits for the file. Delete-then-add so a re-minted identity replaces the old trust.
+    fn trust_cert(&self, facts: &Facts, outcome: &Outcome) -> Result<bool, Failed> {
+        let cert = self.paths.config.join("punktfunk/native-cert.pem");
+        let db = self.paths.home.join(".pki/nssdb");
+        let shown = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
+        let db_arg = format!("sql:{}", shown(&db));
+        let cmd = format!(
+            "certutil -A -d {db_arg} -n {CERT_NICK} -t C,, -i {}",
+            shown(&cert)
+        );
+        if self.opts.dry {
+            self.ui.plus(&cmd);
+            return Ok(true);
+        }
+        if !self.run.which("certutil") {
+            self.ui.warn(&format!(
+                "certutil is not installed, so the console keeps its browser warning — {} and re-run",
+                facts.family.certutil_package()
+            ));
+            return Ok(false);
+        }
+        if !outcome.started {
+            self.ui.warn("the host is not running, so there is no certificate to trust yet — re-run once it is");
+            return Ok(false);
+        }
+        // Through the runner, not the filesystem: a demo box answers at once instead of
+        // waiting five seconds for a file its sandbox never writes.
+        let wait = format!(
+            "for i in $(seq 20); do [ -r '{}' ] && exit 0; sleep 0.25; done; exit 1",
+            shown(&cert)
+        );
+        if !self.run.probe("sh", &["-c", &wait]).is_some_and(|o| o.ok()) {
+            self.ui.warn(&format!(
+                "the host has not written its certificate yet ({}) — re-run to trust it",
+                shown(&cert)
+            ));
+            return Ok(false);
+        }
+        let db_file = format!("{}/cert9.db", shown(&db));
+        if !self
+            .run
+            .probe("test", &["-f", &db_file])
+            .is_some_and(|o| o.ok())
+        {
+            let _ = self.run.probe("mkdir", &["-p", &shown(&db)]);
+            let _ = self
+                .run
+                .probe("certutil", &["-N", "-d", &db_arg, "--empty-password"]);
+        }
+        let _ = self
+            .run
+            .probe("certutil", &["-D", "-d", &db_arg, "-n", CERT_NICK]);
+        self.ui.plus(&cmd);
+        let added = self
+            .run
+            .probe(
+                "certutil",
+                &[
+                    "-A",
+                    "-d",
+                    &db_arg,
+                    "-n",
+                    CERT_NICK,
+                    "-t",
+                    "C,,",
+                    "-i",
+                    &shown(&cert),
+                ],
+            )
+            .is_some_and(|o| o.ok());
+        if added {
+            self.ui.ok("console certificate trusted — a Chromium that is already running picks it up on restart");
+        } else {
+            self.ui.warn("certutil refused the certificate — the browser warning stays; click through once instead");
+        }
+        Ok(true)
     }
 
     /// Replace or append one `KEY=VALUE` line in host.env, creating it on first use.

@@ -6,7 +6,7 @@
   + curl -fsSL https://git.unom.io/api/packages/unom/debian/repository.key | sudo tee /etc/apt/keyrings/punktfunk.asc >/dev/null
   + echo "deb [signed-by=/etc/apt/keyrings/punktfunk.asc] https://git.unom.io/api/packages/unom/debian stable main" | sudo tee /etc/apt/sources.list.d/punktfunk.list
   + sudo apt update
-  + sudo apt install punktfunk-client
+  + sudo apt install -y punktfunk-client
 ==> Checking
 
   Done. Next:

@@ -329,6 +329,18 @@ impl Facts {
 ///
 /// NixOS and SteamOS refuse outright — they own installers for both halves. An unknown distro
 /// is a dead end only for the host: the client still has a user-scope flatpak (§5).
+impl Family {
+    /// What to install for `certutil`, named in the warning when it is missing.
+    pub fn certutil_package(self) -> &'static str {
+        match self {
+            Family::Apt => "sudo apt install libnss3-tools",
+            Family::Dnf | Family::Sysext => "sudo dnf install nss-tools",
+            Family::Pacman => "sudo pacman -S nss",
+            Family::Flatpak => "install nss tools",
+        }
+    }
+}
+
 type Detected = (Family, &'static str, Option<Punt>);
 
 fn detect_family(os: &OsRelease, run: &dyn CommandRunner) -> Result<Detected, Punt> {

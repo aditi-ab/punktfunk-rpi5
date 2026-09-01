@@ -103,11 +103,11 @@ fn render(facts: &Facts, choices: &Choices) -> String {
         FakeRunner::new()
             .with_path("systemctl")
             .answer("systemctl --user show-environment", 0, "");
-    // yes:false on purpose — the goldens must carry platforms.json's lines unrewritten, which
-    // is what makes them the drift alarm. The --yes rewrite has its own test in exec.
+    // The goldens carry platforms.json's lines in their no-confirm form — the rewrite is a
+    // fixed prefix table with its own test in exec, so a platforms.json edit still shows here.
     let opts = Opts {
         dry: true,
-        yes: false,
+        quiet: false,
         tty: false,
     };
 
@@ -266,9 +266,9 @@ fn uninstalls() {
     );
 }
 
-/// An already-complete box: the install is skipped and the setup continues.
+/// An already-complete box: the packages are updated in place, then the setup continues.
 #[test]
-fn a_re_run_on_a_complete_box_is_a_no_op_install() {
+fn a_re_run_on_a_complete_box_updates_in_place() {
     check(
         "arch-installed-rerun",
         &installed("arch", Family::Pacman, Channel::Canary),
@@ -474,6 +474,7 @@ fn the_flatpak_line_is_carried_verbatim() {
     let facts = fresh("bazzite", Family::Sysext);
     let text = render(&facts, &Choices::derive(&facts, &client));
     for line in punktfunk_setup::platform::install_lines("linux-client") {
+        let line = punktfunk_setup::exec::noninteractive(&line);
         assert!(
             text.contains(&line),
             "the flatpak line drifted:\n  {line}\n\n{text}"
@@ -483,7 +484,9 @@ fn the_flatpak_line_is_carried_verbatim() {
 
 // -------------------------------------------------------- design/installer-v2.md §4 traps
 
-/// A bare re-run on a canary machine must never drag it to stable.
+/// A bare re-run on a canary machine must never drag it to stable, and must leave the repo it
+/// already has alone. It still upgrades: that is how a fixed build reaches a box carrying an
+/// older one, and skipping it left an uninstall as the only way out.
 #[test]
 fn trap_channel_follows_the_box_without_an_explicit_flag() {
     let facts = installed("arch", Family::Pacman, Channel::Canary);
@@ -492,8 +495,15 @@ fn trap_channel_follows_the_box_without_an_explicit_flag() {
     assert_eq!(choices.switch_from, None);
     let cmds = plan_for(&facts, &pins()).commands();
     assert!(
-        !cmds.iter().any(|c| c.contains("-Sy")),
-        "a no-op re-run touched the repo: {cmds:?}"
+        !cmds
+            .iter()
+            .any(|c| c.contains("pacman.conf") || c.contains("pacman-key")),
+        "a re-run rewrote the repo it already had: {cmds:?}"
+    );
+    assert!(
+        cmds.iter()
+            .any(|c| c.starts_with("sudo pacman -Syu punktfunk-host")),
+        "a re-run must upgrade the packages it already has: {cmds:?}"
     );
 }
 
@@ -508,7 +518,7 @@ fn trap_apt_switch_pins_versions_and_allows_downgrades() {
     };
     let text = render(&facts, &Choices::derive(&facts, &to_stable));
     assert!(
-        text.contains("sudo apt install --allow-downgrades"),
+        text.contains("sudo apt install -y --allow-downgrades"),
         "{text}"
     );
     assert!(text.contains("punktfunk-host=<version>"), "{text}");
@@ -542,6 +552,77 @@ fn trap_pacman_switch_uses_sy_then_s_and_never_syu() {
         cmds[0].contains("sed -i"),
         "the old repo section must be dropped first: {cmds:?}"
     );
+}
+
+/// The Omarchy report this came from: a box with everything installed got no package step at
+/// all, so a build carrying a fix could not reach it and an uninstall was the only way out.
+/// The db refresh has to survive too, or `-S` upgrades against a stale database.
+#[test]
+fn trap_a_complete_omarchy_box_still_refreshes_and_upgrades() {
+    let facts = installed("omarchy", Family::Pacman, Channel::Canary);
+    let cmds = plan_for(&facts, &pins()).commands();
+    let pacman: Vec<&String> = cmds
+        .iter()
+        .filter(|c| c.starts_with("sudo pacman"))
+        .collect();
+    assert_eq!(pacman.len(), 2, "{cmds:?}");
+    assert_eq!(pacman[0], "sudo pacman -Sy", "{cmds:?}");
+    assert!(
+        pacman[1].starts_with("sudo pacman -S punktfunk-host"),
+        "{cmds:?}"
+    );
+}
+
+/// The certificate is trusted on every host install without a question, after the start
+/// (it exists only once the host has run), and only the opt-out or `--no-start` drops it.
+#[test]
+fn trap_every_host_install_trusts_the_console_cert_after_the_start() {
+    let has_cert = |plan: &Plan| {
+        plan.steps()
+            .any(|s| matches!(s.action, StepAction::TrustCert))
+    };
+    for (id, family) in [
+        ("debian", Family::Apt),
+        ("fedora", Family::Dnf),
+        ("arch", Family::Pacman),
+        ("bazzite", Family::Sysext),
+    ] {
+        let plan = plan_for(&fresh(id, family), &pins());
+        assert!(has_cert(&plan), "{id} does not trust the certificate");
+        let start = plan
+            .phases
+            .iter()
+            .position(|p| p.kind == plan::Phase::Start)
+            .expect("a start phase");
+        assert!(
+            matches!(
+                plan.phases[start].steps.last().map(|s| &s.action),
+                Some(StepAction::TrustCert)
+            ),
+            "{id}: the trust step must close the start phase"
+        );
+    }
+    let off = Pins {
+        console_cert: Some(false),
+        ..pins()
+    };
+    assert!(!has_cert(&plan_for(&fresh("arch", Family::Pacman), &off)));
+    let no_start = Pins {
+        no_start: true,
+        ..pins()
+    };
+    assert!(!has_cert(&plan_for(
+        &fresh("arch", Family::Pacman),
+        &no_start
+    )));
+    let client = Pins {
+        client: true,
+        ..pins()
+    };
+    assert!(!has_cert(&plan_for(
+        &fresh("arch", Family::Pacman),
+        &client
+    )));
 }
 
 /// Omarchy's libalpm hook aborts any transaction carrying both -S and -u.
@@ -822,8 +903,9 @@ fn trap_a_ujust_box_uses_the_recipe_not_usermod() {
     );
 }
 
-/// Every host platform's platforms.json lines must appear in the dry-run text verbatim. This
-/// is D6's drift gate, moved into the crate that embeds the file.
+/// Every host platform's platforms.json lines must appear in the dry-run text, in the
+/// no-confirm form the run uses. This is D6's drift gate, moved into the crate that embeds
+/// the file.
 #[test]
 fn every_platforms_json_install_line_is_carried_verbatim() {
     let cases = [
@@ -836,9 +918,10 @@ fn every_platforms_json_install_line_is_carried_verbatim() {
     for (id, facts) in cases {
         let text = render(&facts, &Choices::derive(&facts, &pins()));
         for line in punktfunk_setup::platform::install_lines(id) {
+            let line = punktfunk_setup::exec::noninteractive(&line);
             assert!(
                 text.contains(&line),
-                "the {id} dry-run no longer carries platforms.json's line verbatim:\n  {line}\n\n{text}"
+                "the {id} dry-run no longer carries platforms.json's line:\n  {line}\n\n{text}"
             );
         }
     }

@@ -1,7 +1,7 @@
 ==> Detected arch → pacman (guide: https://docs.punktfunk.unom.io/docs/arch)
 ==> Uninstalling the host (https://docs.punktfunk.unom.io/docs/uninstall)
   + systemctl --user disable --now punktfunk-host punktfunk-web punktfunk-scripting 2>/dev/null || true
-  + sudo pacman -Rns punktfunk-host punktfunk-web punktfunk-scripting
+  + sudo pacman -Rns --noconfirm punktfunk-host punktfunk-web punktfunk-scripting
   + sudo sed -i '/^\[punktfunk\(-canary\)\{0,1\}\]$/,/^Server = /d' /etc/pacman.conf
 
   Removed. Left on purpose: ~/.config/punktfunk (identity, pairings, host.env, plugins — a reinstall
