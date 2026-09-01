@@ -83,7 +83,7 @@ fn protected_dir(path: &Path) -> Result<(), String> {
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
     use windows::Win32::winbase::LocalFree;
-    use windows::Win32::{HLOCAL, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows::Win32::{HANDLE, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 
     const SDDL: &str = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
     let mut sd = PSECURITY_DESCRIPTOR::default();
@@ -104,7 +104,8 @@ fn protected_dir(path: &Path) -> Result<(), String> {
             bInheritHandle: false.into(),
         };
         let created = CreateDirectoryW(&HSTRING::from(path.as_os_str()), Some(&attrs)).ok();
-        LocalFree(HLOCAL(sd.0));
+        // HLOCAL is a HANDLE alias at this rev, so the alias cannot construct.
+        LocalFree(HANDLE(sd.0));
         created.map_err(|e| format!("create {}: {e}", path.display()))
     }
 }
