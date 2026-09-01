@@ -47,11 +47,17 @@ const SLIDE_TRAVEL: f64 = 36.0;
 /// Upcoming dots and the line ahead: a translucent grey that reads on both themes — shapes
 /// take a `Color`, not a `ThemeRef`.
 const MUTED: Color = Color {
-    a: 0x66,
+    a: 0x55,
     r: 0x80,
     g: 0x80,
     b: 0x80,
 };
+
+/// Stepper dot diameter; the line is 2 px and meets the dot's edge.
+const DOT: f64 = 10.0;
+
+/// Command echo and the password: a monospace face that ships with Windows.
+const MONO: &str = "Consolas";
 
 /// Where the wizard stands and which way it got there (D9: Continue enters from the right,
 /// Back from the left). The install thread's jump to Done is a forward move.
@@ -195,6 +201,11 @@ struct Ctx {
     uninstall: bool,
     seams: Seams,
     slide: Slide,
+    /// The password row's Show/Hide state.
+    reveal: bool,
+    /// The install page's progress bar, tweened 0 → 1 across the plan's phases.
+    bar: f64,
+    set_reveal: AsyncSetState<bool>,
     set_screen: AsyncSetState<WinScreen>,
     set_step: AsyncSetState<Nav>,
     set_install: AsyncSetState<InstallPhase>,
@@ -240,6 +251,7 @@ impl Component for WizardRoot {
         let (install, set_install) = cx.use_async_state(InstallPhase::Idle);
         let (uninstall, set_uninstall) = cx.use_async_state(self.preset.uninstall);
         let (log, set_log) = cx.use_async_state(Vec::<LogLine>::new());
+        let (reveal, set_reveal) = cx.use_async_state(false);
 
         // The slide is a manual tween (the client shell's): reactor's one-shot animations run
         // from the visual's CURRENT value, and a freshly mounted page has nothing to fade from.
@@ -269,6 +281,48 @@ impl Component for WizardRoot {
         });
         let progress = if anim.0 == nav { anim.1 } else { 0.0 };
 
+        // The install bar: one phase heading per plan phase reaches the log, so the bar's
+        // target is the phase count over the plan's; the same worker-tween eases it there.
+        let phases_seen = log.iter().filter(|l| l.kind == LineKind::Phase).count();
+        let total = plan::build(
+            &screen.facts,
+            &screen.effective_choices(),
+            self.preset.artifact,
+            uninstall,
+        )
+        .phases
+        .len()
+        .max(1);
+        let target = match install {
+            InstallPhase::Idle => 0.0,
+            InstallPhase::Finished => 1.0,
+            _ => (phases_seen as f64 - 0.5).max(0.0) / total as f64,
+        };
+        let bar_generation = cx.use_ref(Arc::new(AtomicU64::new(0)));
+        let (bar, set_bar) = cx.use_async_state(0.0f64);
+        cx.use_effect((phases_seen, install == InstallPhase::Finished, total), {
+            let (set_bar, generation, from) =
+                (set_bar.clone(), bar_generation.borrow().clone(), bar);
+            move || {
+                let mine = generation.fetch_add(1, SeqCst) + 1;
+                if !animations_enabled() {
+                    set_bar.call(target);
+                    return;
+                }
+                std::thread::spawn(move || {
+                    for i in 0..=SLIDE_FRAMES {
+                        if generation.load(SeqCst) != mine {
+                            return;
+                        }
+                        let p = f64::from(i) / f64::from(SLIDE_FRAMES);
+                        let eased = 1.0 - (1.0 - p).powi(3);
+                        set_bar.call(from + (target - from) * eased);
+                        std::thread::sleep(std::time::Duration::from_millis(16));
+                    }
+                });
+            }
+        });
+
         let ctx = Ctx {
             preset: self.preset.clone(),
             screen: screen.clone(),
@@ -279,6 +333,9 @@ impl Component for WizardRoot {
                 progress,
                 forward: nav.forward,
             },
+            reveal,
+            bar,
+            set_reveal,
             set_screen,
             set_step,
             set_install,
@@ -511,57 +568,60 @@ fn card(child: impl Into<Element>) -> Border {
         .background(ThemeRef::CardBackground)
         .border_brush(ThemeRef::CardStroke)
         .border_thickness(Thickness::uniform(1.0))
-        .corner_radius(8.0)
-        .padding(edges(16.0, 10.0, 16.0, 10.0))
+        .corner_radius(10.0)
+        .padding(edges(18.0, 12.0, 18.0, 12.0))
 }
 
 /// The D9 stepper: dots joined by a line, filled through the current step in brand violet,
-/// hollow ahead. `steps` is this run's real path, so a preset that never triggers the Network
-/// step never shows its dot.
+/// hollow ahead. Each step owns one equal column: a half-segment either side of its dot,
+/// stopping at the dot's edge, so the line meets every dot and the first/last halves are
+/// simply invisible. `steps` is this run's real path — no ghost Network dot.
 fn stepper(steps: &[WizStep], pos: usize, uninstall: bool) -> Element {
-    const DOT: f64 = 12.0;
-    let mut children: Vec<Element> = Vec::new();
-    let mut columns: Vec<GridLength> = Vec::new();
-    for (i, step) in steps.iter().enumerate() {
-        if i > 0 {
-            // The segment INTO step i: lit once the user stands on or past it.
-            let lit = i <= pos;
-            children.push(
-                Shape::rectangle()
-                    .fill(if lit { brand::VIOLET } else { MUTED })
-                    .height(2.0)
-                    .vertical_alignment(VerticalAlignment::Top)
-                    .margin(edges(6.0, DOT / 2.0 - 1.0, 6.0, 0.0))
-                    .grid_column(columns.len() as i32)
-                    .into(),
-            );
-            columns.push(GridLength::Star(1.0));
-        }
-        let dot = if i <= pos {
-            Shape::ellipse().fill(brand::VIOLET)
-        } else {
-            Shape::ellipse().stroke(MUTED).stroke_thickness(1.5)
-        };
-        let label = text_block(step_title(*step, uninstall)).font_size(11.0);
-        let label = if i == pos {
-            label.semibold()
-        } else {
-            label.foreground(ThemeRef::SecondaryText)
-        };
-        children.push(
+    let n = steps.len();
+    let half = |lit: bool, hidden: bool| {
+        Shape::rectangle()
+            .fill(if lit { brand::VIOLET } else { MUTED })
+            .height(2.0)
+            .opacity(if hidden { 0.0 } else { 1.0 })
+            .vertical_alignment(VerticalAlignment::Center)
+    };
+    let cells: Vec<Element> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, step)| {
+            let dot = if i <= pos {
+                Shape::ellipse().fill(brand::VIOLET)
+            } else {
+                Shape::ellipse().stroke(MUTED).stroke_thickness(1.5)
+            };
+            let line = grid((
+                half(i > 0 && i <= pos, i == 0).grid_column(0),
+                dot.width(DOT).height(DOT).grid_column(1),
+                half(i < pos, i + 1 == n).grid_column(2),
+            ))
+            .columns([
+                GridLength::Star(1.0),
+                GridLength::Auto,
+                GridLength::Star(1.0),
+            ]);
+            let label = text_block(step_title(*step, uninstall)).font_size(11.0);
+            let label = if i == pos {
+                label.semibold()
+            } else {
+                label.foreground(ThemeRef::SecondaryText)
+            };
             vstack((
-                dot.width(DOT)
-                    .height(DOT)
-                    .horizontal_alignment(HorizontalAlignment::Center),
+                line,
                 label.horizontal_alignment(HorizontalAlignment::Center),
             ))
             .spacing(4.0)
-            .grid_column(columns.len() as i32)
-            .into(),
-        );
-        columns.push(GridLength::Auto);
-    }
-    grid(children).columns(columns).into()
+            .grid_column(i as i32)
+            .into()
+        })
+        .collect();
+    grid(cells)
+        .columns(std::iter::repeat_n(GridLength::Star(1.0), n))
+        .into()
 }
 
 /// The incoming page's offset at `progress`: forward starts to the right and travels left,
@@ -579,13 +639,18 @@ fn frame(ctx: &Ctx, step: WizStep, content: Element, buttons: Vec<Element>) -> E
     let pos = steps.iter().position(|s| *s == step).unwrap_or(0);
     let head = stepper(&steps, pos, ctx.uninstall).margin(edges(0.0, 0.0, 0.0, 22.0));
     let title = text_block(step_title(step, ctx.uninstall))
-        .font_size(24.0)
+        .font_size(26.0)
         .semibold()
-        .margin(edges(0.0, 0.0, 0.0, 12.0));
-    let bar = hstack(buttons)
-        .spacing(8.0)
-        .horizontal_alignment(HorizontalAlignment::Right)
-        .margin(edges(0.0, 14.0, 0.0, 0.0));
+        .margin(edges(0.0, 0.0, 0.0, 14.0));
+    let bar = border(
+        hstack(buttons)
+            .spacing(8.0)
+            .horizontal_alignment(HorizontalAlignment::Right),
+    )
+    .border_brush(ThemeRef::DividerStroke)
+    .border_thickness(edges(0.0, 1.0, 0.0, 0.0))
+    .padding(edges(0.0, 14.0, 0.0, 0.0))
+    .margin(edges(0.0, 16.0, 0.0, 0.0));
     let page = grid((title.grid_row(0), content.grid_row(1), bar.grid_row(2))).rows([
         GridLength::Auto,
         GridLength::Star(1.0),
@@ -597,7 +662,7 @@ fn frame(ctx: &Ctx, step: WizStep, content: Element, buttons: Vec<Element>) -> E
         .margin(slide_margin(slide.forward, slide.progress));
     grid((head.grid_row(0), page.grid_row(1)))
         .rows([GridLength::Auto, GridLength::Star(1.0)])
-        .margin(edges(28.0, 22.0, 28.0, 20.0))
+        .margin(edges(36.0, 26.0, 36.0, 24.0))
         .into()
 }
 
@@ -605,6 +670,7 @@ fn continue_button(ctx: &Ctx, cur: WizStep, label: &str) -> Element {
     let ctx = ctx.clone();
     button(label)
         .accent()
+        .min_width(124.0)
         .on_click(move || advance(&ctx, cur))
         .into()
 }
@@ -624,7 +690,10 @@ fn uninstall_button(ctx: &Ctx) -> Element {
 
 fn back_button(ctx: &Ctx, cur: WizStep) -> Element {
     let ctx = ctx.clone();
-    button("Back").on_click(move || back(&ctx, cur)).into()
+    button("Back")
+        .min_width(92.0)
+        .on_click(move || back(&ctx, cur))
+        .into()
 }
 
 fn welcome_page(ctx: &Ctx) -> Element {
@@ -672,15 +741,15 @@ fn welcome_page(ctx: &Ctx) -> Element {
         children.push(
             Image::new_with_uri(uri)
                 .stretch(Stretch::Uniform)
-                .width(96.0)
-                .height(96.0)
+                .width(120.0)
+                .height(120.0)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .into(),
         );
     }
     children.push(
         text_block(wordmark)
-            .font_size(32.0)
+            .font_size(34.0)
             .semibold()
             .horizontal_alignment(HorizontalAlignment::Center)
             .into(),
@@ -688,13 +757,14 @@ fn welcome_page(ctx: &Ctx) -> Element {
     children.push(
         text_block(sentence)
             .wrap()
+            .font_size(15.0)
             .foreground(ThemeRef::SecondaryText)
             .horizontal_alignment(HorizontalAlignment::Center)
             .into(),
     );
     let content = vstack(children)
-        .spacing(14.0)
-        .max_width(420.0)
+        .spacing(18.0)
+        .max_width(500.0)
         .horizontal_alignment(HorizontalAlignment::Center)
         .vertical_alignment(VerticalAlignment::Center)
         .into();
@@ -721,7 +791,7 @@ fn configure_page(ctx: &Ctx) -> Element {
     for field in ctx.screen.rows() {
         items.push(config_row(ctx, field));
     }
-    let content = scroll_view(vstack(items).spacing(6.0).max_width(640.0)).into();
+    let content = scroll_view(vstack(items).spacing(8.0).max_width(760.0)).into();
     // The go button says what Continue will do: install now, or one more step first.
     let steps = run_steps(ctx);
     let next_is_network = steps
@@ -779,17 +849,42 @@ fn config_row(ctx: &Ctx, field: Field) -> Element {
                 .into()
         }
         Editor::Password(value) => {
-            let ctx = ctx.clone();
-            PasswordBox::new()
-                .value(value.unwrap_or_default())
-                .reveal_button_enabled(true)
-                .on_password_changed(move |pw: String| {
-                    let mut s = ctx.screen.clone();
-                    s.set_password(pw);
-                    ctx.set_screen.call(s);
-                })
-                .vertical_alignment(VerticalAlignment::Center)
-                .into()
+            // WinUI's own eye only appears while the user types, so a pre-generated password
+            // would never be revealable — this toggle drives the reveal mode instead.
+            let reveal = ctx.reveal;
+            let edit = ctx.clone();
+            let toggle = ctx.clone();
+            let regen = ctx.clone();
+            hstack((
+                PasswordBox::new()
+                    .value(value.unwrap_or_default())
+                    .password_reveal_mode(if reveal {
+                        PasswordRevealMode::Visible
+                    } else {
+                        PasswordRevealMode::Hidden
+                    })
+                    .reveal_button_enabled(false)
+                    .font_family(MONO)
+                    .min_width(280.0)
+                    .on_password_changed(move |pw: String| {
+                        let mut s = edit.screen.clone();
+                        s.set_password(pw);
+                        edit.set_screen.call(s);
+                    }),
+                button(if reveal { "Hide" } else { "Show" })
+                    .min_width(72.0)
+                    .on_click(move || toggle.set_reveal.call(!reveal)),
+                button("Regenerate").subtle().on_click(move || {
+                    if let Ok(pw) = punktfunk_setup::platform::windows::sys::random_hex(12) {
+                        let mut s = regen.screen.clone();
+                        s.set_password(pw);
+                        regen.set_screen.call(s);
+                    }
+                }),
+            ))
+            .spacing(6.0)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into()
         }
     };
     card(
@@ -878,10 +973,12 @@ fn install_page(ctx: &Ctx, log: &[LogLine]) -> Element {
         items.push(match line.kind {
             LineKind::Phase => text_block(line.text.as_str())
                 .semibold()
-                .margin(edges(0.0, 8.0, 0.0, 0.0))
+                .font_size(13.5)
+                .margin(edges(0.0, 10.0, 0.0, 2.0))
                 .into(),
             LineKind::Cmd => text_block(format!("  + {}", line.text))
                 .font_size(12.0)
+                .font_family(MONO)
                 .wrap()
                 .foreground(ThemeRef::TertiaryText)
                 .into(),
@@ -906,27 +1003,38 @@ fn install_page(ctx: &Ctx, log: &[LogLine]) -> Element {
         });
     }
     let mut children: Vec<Element> = Vec::new();
+    let status = match (ctx.install, ctx.uninstall) {
+        (InstallPhase::Failed, _) => "Something went wrong — the log below has the step.",
+        (_, true) => "Removing punktfunk…",
+        (_, false) => "Installing punktfunk…",
+    };
+    let mut head: Vec<Element> = Vec::new();
     if ctx.install == InstallPhase::Running {
-        children.push(
-            hstack((
-                ProgressRing::indeterminate().width(18.0).height(18.0),
-                text_block(if ctx.uninstall {
-                    "Removing…"
-                } else {
-                    "Installing…"
-                })
-                .foreground(ThemeRef::SecondaryText),
-            ))
-            .spacing(8.0)
-            .into(),
+        head.push(
+            ProgressRing::indeterminate()
+                .width(16.0)
+                .height(16.0)
+                .into(),
         );
     }
-    children.push(
-        card(scroll_view(vstack(items).spacing(2.0)))
-            .padding(edges(14.0, 10.0, 14.0, 10.0))
+    head.push(
+        text_block(status)
+            .foreground(if ctx.install == InstallPhase::Failed {
+                ThemeRef::SystemCritical
+            } else {
+                ThemeRef::SecondaryText
+            })
             .into(),
     );
-    let content = vstack(children).spacing(10.0).into();
+    children.push(hstack(head).spacing(8.0).into());
+    // Range 0–100 is the widget's default; the value tweens in root state.
+    children.push(ProgressBar::new(ctx.bar * 100.0).into());
+    children.push(
+        card(scroll_view(vstack(items).spacing(2.0)))
+            .padding(edges(16.0, 10.0, 16.0, 12.0))
+            .into(),
+    );
+    let content = vstack(children).spacing(12.0).into();
     let buttons = if ctx.install == InstallPhase::Failed {
         vec![button("Close").on_click(|| std::process::exit(1)).into()]
     } else {
@@ -962,12 +1070,18 @@ fn done_page(ctx: &Ctx) -> Element {
                 card(
                     vstack((
                         text_block("Web console password").semibold(),
-                        text_block(pw.clone()).font_size(18.0).selectable(),
-                        text_block(r"Also stored (ACL'd) in %ProgramData%\punktfunk\web-password")
-                            .font_size(12.0)
-                            .foreground(ThemeRef::SecondaryText),
+                        text_block(pw.clone())
+                            .font_size(22.0)
+                            .font_family(MONO)
+                            .selectable(),
+                        text_block(
+                            r"Generated for you at install. Also stored (ACL'd) in %ProgramData%\punktfunk\web-password — change it any time from the console.",
+                        )
+                        .wrap()
+                        .font_size(12.0)
+                        .foreground(ThemeRef::SecondaryText),
                     ))
-                    .spacing(4.0),
+                    .spacing(6.0),
                 )
                 .into(),
             );
@@ -988,7 +1102,7 @@ fn done_page(ctx: &Ctx) -> Element {
             children.push(text_block(trimmed).wrap().into());
         }
     }
-    let content = scroll_view(vstack(children).spacing(8.0).max_width(640.0)).into();
+    let content = scroll_view(vstack(children).spacing(10.0).max_width(760.0)).into();
     frame(
         ctx,
         WizStep::Done,
@@ -1008,7 +1122,7 @@ pub fn run(preset: WinPreset, seams: Seams) -> windows_reactor::Result<()> {
     // deliberately NO windows_reactor::bootstrap() call — that is the framework path (S1).
     App::new()
         .title("Punktfunk Setup")
-        .inner_size(760.0, 660.0)
+        .inner_size(980.0, 700.0)
         .backdrop(Backdrop::Mica)
         .render(move |cx| root.render(&(), cx))
 }

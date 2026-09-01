@@ -178,7 +178,7 @@ impl WinScreen {
             Field::StartService => "Start streaming as soon as the install finishes.".into(),
             Field::Tray => "The status icon next to the clock, for every user.".into(),
             Field::Password => {
-                "Signs you into the web console. Shown again on the finish page.".into()
+                "Generated for you — keep it or type your own. It signs you into the web console and is shown again on the finish page.".into()
             }
             Field::DesktopIcon => "A Punktfunk shortcut on the desktop.".into(),
         }
