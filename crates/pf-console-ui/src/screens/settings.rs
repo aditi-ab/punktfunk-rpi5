@@ -1938,9 +1938,9 @@ pub(crate) mod tests {
     /// before a mutating press and saves after it, so a test driving that path against the
     /// real profile would rewrite the developer's own console settings.
     ///
-    /// BOTH vars: `trust::config_dir` reads `HOME` on unix but `APPDATA` on Windows, so
-    /// setting only `HOME` redirected nothing there — every test wrote the real
-    /// `%APPDATA%\punktfunk` file and raced the others through it.
+    /// Redirects whichever var `trust::config_dir` actually reads here: `HOME` on unix,
+    /// `APPDATA` on Windows. Setting only `HOME` redirected nothing on Windows — every test
+    /// wrote the machine's real `%APPDATA%\punktfunk` file and raced the others through it.
     ///
     /// Shared with the shell and library screen tests, which drive the same `Settings::save`:
     /// one `OnceLock` for the whole binary is what keeps the write to the environment sound,
@@ -1951,14 +1951,12 @@ pub(crate) mod tests {
         HOME.get_or_init(|| {
             let dir = std::env::temp_dir().join(format!("pf-settings-test-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
+            let var = if cfg!(windows) { "APPDATA" } else { "HOME" };
             // SAFETY: runs at most once, inside `get_or_init` — concurrent `fake_home` callers
-            // block until it returns, and nothing else in this binary mutates either var. (The
-            // old set after the closure ran on EVERY call, so two parallel tests could race the
+            // block until it returns, and nothing else in this binary mutates it. (The old
+            // set after the closure ran on EVERY call, so two parallel tests could race the
             // write; setting once under the OnceLock is what makes this sound.)
-            unsafe {
-                std::env::set_var("HOME", &dir);
-                std::env::set_var("APPDATA", &dir);
-            }
+            unsafe { std::env::set_var(var, &dir) };
             dir
         });
     }
