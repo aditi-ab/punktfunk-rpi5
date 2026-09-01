@@ -17,10 +17,13 @@ use crate::ui::theme::{Caps, Colors, Layer, Rgb};
 /// One cell per pixel. Columns and rows differ because cells are not square.
 ///
 /// A terminal cell is roughly 2.2:1, so a pixel drawn as a whole cell is that much taller than
-/// it is wide. Sampling the square mark into 24 columns by 11 rows cancels it: the shape comes
+/// it is wide. Sampling the square mark into 20 columns by 9 rows cancels it: the shape comes
 /// out round across the 2.0–2.4 range real terminals use, worst case about 10%.
-pub const MARK_COLS: usize = 24;
-pub const MARK_ROWS: usize = 11;
+///
+/// 20×9 is near the floor. One cell per pixel is coarse, and by 16×7 the lens thins to a line;
+/// by 14×6 the circles stop being circles. Rendered at every size before picking this one.
+pub const MARK_COLS: usize = 20;
+pub const MARK_ROWS: usize = 9;
 
 /// Text rows the mark occupies — one per pixel row, since a pixel *is* a cell.
 pub const MARK_TEXT_ROWS: usize = MARK_ROWS;
@@ -287,7 +290,14 @@ mod tests {
             "fully apart, there is no overlap to light"
         );
         assert!(lens_pixels(1.0) > 0, "at rest the lens is the whole point");
-        assert!(lens_pixels(0.6) < lens_pixels(1.0));
+        // Non-decreasing, not strictly growing: one cell per pixel is coarse enough that the
+        // count plateaus between frames, which is quantisation rather than the lens stalling.
+        let mut prev = 0;
+        for step in 0..=10 {
+            let now = lens_pixels(step as f32 / 10.0);
+            assert!(now >= prev, "the lens shrank as the circles came together");
+            prev = now;
+        }
     }
 
     /// Half-covered cells must not paint a background, or the mark sits in a violet box.
