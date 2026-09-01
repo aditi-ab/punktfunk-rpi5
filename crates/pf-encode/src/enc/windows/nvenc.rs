@@ -2738,6 +2738,7 @@ mod tests {
             let mut out = Vec::new();
             for i in 0..30u64 {
                 let frame = CapturedFrame {
+                    provenance: Default::default(),
                     width: W,
                     height: H,
                     pts_ns: i * 16_666_667,
@@ -2842,6 +2843,7 @@ mod tests {
                 let mut aus = 0usize;
                 for i in range {
                     let frame = CapturedFrame {
+                        provenance: Default::default(),
                         width: W,
                         height: H,
                         pts_ns: i * 16_666_667,
@@ -2986,6 +2988,7 @@ mod tests {
                 let (mut aus, mut keyframes) = (0usize, 0usize);
                 for i in range {
                     let frame = CapturedFrame {
+                        provenance: Default::default(),
                         width: W,
                         height: H,
                         pts_ns: i * 16_666_667,

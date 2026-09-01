@@ -74,13 +74,17 @@ fn a_couch_box_shows_its_derived_defaults() {
 }
 
 /// Omarchy's own options are rows on this screen, not a second round of questions from
-/// `punktfunk-omarchy setup` after this one has finished.
+/// `punktfunk-omarchy setup` after this one has finished. The console certificate is not a
+/// row: every host install trusts it, so there is nothing to ask.
 #[test]
 fn an_omarchy_box_asks_for_its_own_options_here() {
     let (frame, _, _) = drive("omarchy", &[Key::Enter]);
     golden("tui-omarchy", &frame);
+    assert!(
+        !frame.contains("Console certificate"),
+        "the certificate became a question again"
+    );
     for row in [
-        "Console certificate",
         "Desktop notifications",
         "Keep the screen awake",
         "Match the Omarchy theme",

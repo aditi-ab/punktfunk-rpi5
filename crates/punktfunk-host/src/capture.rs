@@ -210,7 +210,10 @@ pub fn capture_virtual_output(
     // normalizes over the streamed frame, and mapping it over the whole virtual desktop is wrong
     // the moment a physical monitor shares the desktop (Extend topology, or an Exclusive isolate
     // degraded to the keep-physicals fallback) — the pen-offset field bug.
-    crate::inject::set_stream_target(Some(target.target_id));
+    crate::inject::set_stream_target(Some(pf_win_display::win_display::CcdTargetKey::new(
+        target.adapter_luid,
+        target.target_id,
+    )));
     let pref = vout.preferred_mode;
     let keep = vout.keepalive;
     // The sealed-channel delivery seam: resolve the pf-vdisplay control device ONCE and wrap

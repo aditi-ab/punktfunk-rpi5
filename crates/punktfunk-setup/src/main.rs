@@ -44,9 +44,9 @@ usage: punktfunk-setup [options]
   --punktfunk-group | --no-punktfunk-group   full controller / virtual Steam Deck pad (default yes;
                         it joins the punktfunk group, which grants usbip attach)
   --linger | --no-linger           start at boot with nobody logged in (default depends on the box)
+  --console-cert | --no-console-cert     trust the console's certificate in Chromium (default yes)
   --omarchy-setup | --no-omarchy-setup   run `punktfunk-omarchy setup` after an Omarchy install
-                        (the umbrella: --no-omarchy-setup clears the four rows below too)
-  --omarchy-cert | --no-omarchy-cert     trust the console certificate in Chromium
+                        (the umbrella: --no-omarchy-setup clears the three rows below too)
   --omarchy-toasts | --no-omarchy-toasts pairing and stream toasts
   --omarchy-idle | --no-omarchy-idle     keep the screen awake while a stream runs
   --omarchy-theme | --no-omarchy-theme   follow the Omarchy theme in the console
@@ -62,8 +62,8 @@ usage: punktfunk-setup [options]
 
 Every option has an environment twin for scripted installs: PUNKTFUNK_INSTALL_YES=1,
 PUNKTFUNK_INSTALL_CHANNEL, PUNKTFUNK_INSTALL_GAMESTREAM, PUNKTFUNK_INSTALL_CLIPBOARD,
-PUNKTFUNK_INSTALL_PUNKTFUNK_GROUP, PUNKTFUNK_INSTALL_LINGER, PUNKTFUNK_INSTALL_OMARCHY_SETUP,
-PUNKTFUNK_INSTALL_MGMT_PORT (1/0 for the flags)."#;
+PUNKTFUNK_INSTALL_PUNKTFUNK_GROUP, PUNKTFUNK_INSTALL_LINGER, PUNKTFUNK_INSTALL_CONSOLE_CERT,
+PUNKTFUNK_INSTALL_OMARCHY_SETUP, PUNKTFUNK_INSTALL_MGMT_PORT (1/0 for the flags)."#;
 
 /// 2 is "bad usage", matching the sh installer's contract.
 const BAD_USAGE: u8 = 2;
@@ -98,7 +98,7 @@ fn parse(args: Vec<String>, env: &Env) -> Result<Cli, (u8, String)> {
             omarchy_toasts: env_flag(env, "PUNKTFUNK_INSTALL_OMARCHY_TOASTS"),
             omarchy_idle: env_flag(env, "PUNKTFUNK_INSTALL_OMARCHY_IDLE"),
             omarchy_theme: env_flag(env, "PUNKTFUNK_INSTALL_OMARCHY_THEME"),
-            omarchy_cert: env_flag(env, "PUNKTFUNK_INSTALL_OMARCHY_CERT"),
+            console_cert: env_flag(env, "PUNKTFUNK_INSTALL_CONSOLE_CERT"),
             mgmt_port: env
                 .get("PUNKTFUNK_INSTALL_MGMT_PORT")
                 .map(|v| v.parse().unwrap_or(0)),
@@ -149,8 +149,8 @@ fn parse(args: Vec<String>, env: &Env) -> Result<Cli, (u8, String)> {
             "--no-omarchy-idle" => cli.pins.omarchy_idle = Some(false),
             "--omarchy-theme" => cli.pins.omarchy_theme = Some(true),
             "--no-omarchy-theme" => cli.pins.omarchy_theme = Some(false),
-            "--omarchy-cert" => cli.pins.omarchy_cert = Some(true),
-            "--no-omarchy-cert" => cli.pins.omarchy_cert = Some(false),
+            "--console-cert" => cli.pins.console_cert = Some(true),
+            "--no-console-cert" => cli.pins.console_cert = Some(false),
             "--mgmt-port" => {
                 let raw = value().unwrap_or_default();
                 cli.pins.mgmt_port = Some(
@@ -262,7 +262,9 @@ fn main() -> ExitCode {
     let mut choices = Choices::derive(&facts, &cli.pins);
     let opts = Opts {
         dry: cli.dry,
-        yes,
+        // Quiet only where the progress line is drawn: plain mode stays the full transcript
+        // CI reads, and -v asks for it on purpose.
+        quiet: interactive && !cli.verbose && !cli.dry,
         tty,
     };
 

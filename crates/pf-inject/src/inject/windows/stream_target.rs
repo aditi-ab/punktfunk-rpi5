@@ -30,13 +30,13 @@ type Rect = (i32, i32, i32, i32);
 const RECT_TTL: Duration = Duration::from_millis(250);
 
 struct State {
-    target_id: Option<u32>,
+    target: Option<pf_win_display::win_display::CcdTargetKey>,
     rect: Option<Rect>,
     queried: Option<Instant>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
-    target_id: None,
+    target: None,
     rect: None,
     queried: None,
 });
@@ -48,11 +48,11 @@ static STATE: Mutex<State> = Mutex::new(State {
 /// wins for every session's absolute input — per-session routing needs source-tagged input
 /// events (parallel-displays plan) and the single slot is never worse than the historical
 /// whole-desktop mapping.
-pub fn set_stream_target(target_id: Option<u32>) {
+pub fn set_stream_target(target: Option<pf_win_display::win_display::CcdTargetKey>) {
     let mut st = STATE.lock().unwrap();
-    if st.target_id != target_id {
-        tracing::info!(?target_id, "absolute-input stream target set");
-        st.target_id = target_id;
+    if st.target != target {
+        tracing::info!(?target, "absolute-input stream target set");
+        st.target = target;
         st.rect = None;
         st.queried = None;
     }
@@ -62,14 +62,14 @@ pub fn set_stream_target(target_id: Option<u32>) {
 /// resolved (callers fall back to the whole virtual desktop).
 fn stream_rect() -> Option<Rect> {
     let mut st = STATE.lock().unwrap();
-    let target_id = st.target_id?;
+    let target = st.target?;
     let fresh = st.queried.is_some_and(|at| at.elapsed() < RECT_TTL);
     if !fresh {
         st.queried = Some(Instant::now());
-        match pf_win_display::win_display::source_desktop_rect(target_id) {
+        match pf_win_display::win_display::source_desktop_rect(target) {
             Some(r) => {
                 if st.rect != Some(r) {
-                    tracing::info!(target_id, rect = ?r, "stream-target desktop rect resolved");
+                    tracing::info!(target = %target, rect = ?r, "stream-target desktop rect resolved");
                 }
                 st.rect = Some(r);
             }
@@ -79,7 +79,7 @@ fn stream_rect() -> Option<Rect> {
             None => {
                 if st.rect.is_some() {
                     tracing::debug!(
-                        target_id,
+                        target = %target,
                         "stream target not an active path — keeping last rect"
                     );
                 }

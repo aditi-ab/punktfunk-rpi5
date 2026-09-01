@@ -2,7 +2,7 @@
 ==> Choices (nothing below has run yet)
   Channel: stable
 ==> Installing: client (stable channel)
-  + flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref
+  + flatpak install --user -y https://flatpak.unom.io/io.unom.Punktfunk.flatpakref
 ==> Checking
 
   Done. Next:

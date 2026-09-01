@@ -10,47 +10,28 @@
 use super::*;
 
 /// LAST-RESORT fallback: nudge DWM into composing THE TARGET virtual display. DWM presents a
-/// display only when something DIRTIES it — an idle desktop never does, so a freshly-attached ring
-/// (session open, or a mid-session ring recreate) can sit at E_PENDING with no first frame even
-/// though everything is healthy.
+/// display only when something DIRTIES it, so a freshly-attached ring over an idle desktop can
+/// sit at E_PENDING forever. The PRIMARY first-frame mechanism is the driver's `FrameStash`
+/// republish; this kick remains for pre-stash drivers and the never-composed cold start.
+/// Synthetic input is inherently unreliable (secure desktop, ClipCursor, user-visible on a
+/// sibling display), which is why it is the fallback.
 ///
-/// The PRIMARY first-frame mechanism is the driver's `FrameStash` (frame_transport.rs): the driver
-/// retains the last composed frame and republishes it into every freshly-attached ring, so with a
-/// stash-capable driver the first frame lands milliseconds after the channel delivery and this kick
-/// never fires. It remains for pre-stash drivers and for the empty-stash cold start (a monitor that
-/// has NEVER composed — normally the activation compose covers that). Synthetic input is inherently
-/// unreliable — blocked on the secure desktop, defeated by a fullscreen game's ClipCursor, and
-/// user-visible in the sibling-display case — which is exactly why it was demoted to fallback.
-///
-/// pf-vdisplay implements no hardware-cursor plane, so a cursor move is composited into
-/// the frame — a guaranteed real present onto the IDD swap-chain (empirically what
-/// `punktfunk-probe --input-test` always relied on).
-///
-/// The cursor only dirties the display it is ON — proven on-glass in the Stage-W3 two-display
-/// validation: display B's session-open kicks wiggled the cursor on display A and B never composed
-/// a first frame. So the kick is per-TARGET: when the cursor already sits inside `target_id`'s
-/// desktop region (always true single-display), two net-zero 1 px relative moves (the historical
-/// behavior, pointer ends exactly where it started); when it sits on a SIBLING display, jump the
-/// cursor to the target's center and straight back (`SetCursorPos` ×2 — each absolute move dirties
-/// the cursor layer of the display it lands on, so the target composes at least one frame).
-/// Best-effort — injection can be unavailable on the secure desktop, where a fresh compose just
+/// The cursor only dirties the display it is ON (proven on-glass, Stage W3), so the kick is
+/// per-TARGET: inside the target's desktop region, two net-zero 1 px relative moves; on a
+/// SIBLING display, `SetCursorPos` to the target's center and back — each absolute move dirties
+/// the display it lands on. Best-effort on the secure desktop, where a fresh compose just
 /// happened anyway.
 ///
-/// **COST:** the sibling-display branch SLEEPS 35 ms on the calling thread between the two
-/// `SetCursorPos`es. The dwell is load-bearing (see the comment at that branch: a sub-tick
-/// jump-and-return never dirties anything), but the caller is the capture/encode thread, so a kick
-/// on that branch costs ~2 frames of latency at 60 Hz. Every call site is a first-frame or
-/// post-recreate recovery window where no frames are flowing anyway, and the global 50 ms throttle
-/// plus the callers' own 600–800 ms schedules bound how often it can happen.
+/// **COST:** the sibling-display branch SLEEPS 35 ms on the calling (capture/encode) thread —
+/// the dwell is load-bearing (a sub-tick jump-and-return never dirties anything). Every call
+/// site is a first-frame or recovery window with no frames flowing, and the global 50 ms
+/// throttle plus the callers' 600–800 ms schedules bound the rate.
 ///
-/// **HID-first**: when the host has registered [`HID_COMPOSE_KICK`] (the resident pf-mouse virtual
-/// HID pointer), the kick goes through it INSTEAD of the `SendInput` paths below. A report from a
-/// HID device is real input to win32k — delivered regardless of this process's session or the
-/// active desktop, it wakes a powered-off display subsystem (lid-closed laptop / display idle-off /
-/// modern standby) and counts as user presence — every condition under which `SendInput` is
-/// silently impotent (wrong session → wrong input queue; secure desktop → blocked; display off →
-/// nothing composes at all). That set is exactly the lid-closed field-report state.
-pub(super) fn kick_dwm_compose(target_id: u32) {
+/// **HID-first**: a registered [`HID_COMPOSE_KICK`] (the pf-mouse virtual HID pointer) replaces
+/// the `SendInput` paths — a HID report is real input to win32k regardless of session or active
+/// desktop, wakes a powered-off display subsystem, and counts as user presence: every condition
+/// under which `SendInput` is silently impotent (the lid-closed field-report state).
+pub(super) fn kick_dwm_compose(ccd: pf_win_display::win_display::CcdTargetKey) {
     // Process-GLOBAL throttle (Stage W3): with N parallel capturers each nudging on its own
     // schedule, DWM needs only one dirty per composition window — and the nudge is synthetic INPUT
     // (global, user-visible pointer state), so it must not multiply with capturer count. 50 ms
@@ -69,7 +50,7 @@ pub(super) fn kick_dwm_compose(target_id: u32) {
     let mut pos = POINT::default();
     // SAFETY: plain FFI; `pos` is a valid out-param for this synchronous call.
     let have_pos = unsafe { GetCursorPos(&mut pos) }.is_ok();
-    let rect = pf_win_display::win_display::source_desktop_rect(target_id);
+    let rect = pf_win_display::win_display::source_desktop_rect(ccd);
     // HID-first (see the doc comment): the registered virtual-mouse kick works from any
     // session/desktop and wakes an off display. Both geometries come from CCD (global database),
     // NOT per-session GDI metrics, so the aim is right even from a non-console session. Fall

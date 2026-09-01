@@ -1,7 +1,7 @@
 ==> Detected debian → apt (guide: https://docs.punktfunk.unom.io/docs/debian)
 ==> Uninstalling the host (https://docs.punktfunk.unom.io/docs/uninstall)
   + systemctl --user disable --now punktfunk-host punktfunk-web punktfunk-scripting 2>/dev/null || true
-  + sudo apt purge punktfunk-host punktfunk-web punktfunk-scripting
+  + sudo apt purge -y punktfunk-host punktfunk-web punktfunk-scripting
   + sudo rm -f /etc/apt/sources.list.d/punktfunk.list /etc/apt/keyrings/punktfunk.asc
   + sudo apt update
 

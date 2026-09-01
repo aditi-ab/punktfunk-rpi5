@@ -1948,6 +1948,7 @@ mod tests {
         for i in 0..frames {
             on_frame(&mut enc, i);
             let frame = CapturedFrame {
+                provenance: Default::default(),
                 width: 640,
                 height: 480,
                 pts_ns: i as u64 * 33_333_333,
@@ -2235,6 +2236,7 @@ mod tests {
         let mut keyframes = 0usize;
         for i in 0..12u32 {
             let frame = CapturedFrame {
+                provenance: Default::default(),
                 width: W,
                 height: H,
                 pts_ns: i as u64 * 33_333_333,
@@ -2314,6 +2316,7 @@ mod tests {
         let mut aus = 0usize;
         for i in 0..12u32 {
             let frame = CapturedFrame {
+                provenance: Default::default(),
                 width: W,
                 height: H,
                 pts_ns: i as u64 * 33_333_333,

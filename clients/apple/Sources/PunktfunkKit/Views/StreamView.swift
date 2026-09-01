@@ -607,9 +607,6 @@ public final class StreamLayerView: NSView {
         let wasCaptured = captured
         if wasCaptured { releaseCapture() }
         desktopMouse = on
-        // The ⌘-chord passthrough is off under the desktop model (system chords stay local there,
-        // as on every other client) — and the model moves live, so the capture is told, not asked.
-        inputCapture?.desktopMouse = on
         if wasCaptured { engageCapture(fromClick: false) }
         window?.invalidateCursorRects(for: self)
         if on, let p = reappearAt, let sp = cgScreenPoint(forHostX: p.x, p.y) {
@@ -964,7 +961,6 @@ public final class StreamLayerView: NSView {
         ) ?? .capture
         let absOK = connection.resolvedCompositor != .gamescope
         desktopMouse = mode == .desktop && absOK
-        capture.desktopMouse = desktopMouse
         if mode == .desktop && !absOK {
             streamInputLog.info("desktop mouse mode unavailable on a gamescope host (relative-only) — using capture")
         }

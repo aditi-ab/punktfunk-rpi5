@@ -8,7 +8,7 @@
   + curl -fsS https://git.unom.io/api/packages/unom/arch/repository.key | sudo pacman-key --add -
   + sudo pacman-key --lsign-key E0CA04465C99C936E0B0C6510A317015A34DDD69
   + grep -q '^\[punktfunk-canary\]' /etc/pacman.conf || printf '\n[punktfunk-canary]\nServer = https://git.unom.io/api/packages/unom/arch/$repo/$arch\n' | sudo tee -a /etc/pacman.conf >/dev/null
-  + sudo pacman -Syu punktfunk-host punktfunk-web punktfunk-scripting
+  + sudo pacman -Syu --noconfirm punktfunk-host punktfunk-web punktfunk-scripting
 ==> Checking for Sunshine / Apollo / Vibeshine
   ok No conflicting game-streaming host detected.
 ==> Controller access
@@ -20,6 +20,7 @@
   ok no active firewall found — nothing to open (https://docs.punktfunk.unom.io/docs/ports if you add one later)
 ==> Starting the host and the web console
   + systemctl --user enable --now punktfunk-host punktfunk-web
+  + certutil -A -d sql:/box/home/.pki/nssdb -n punktfunk-console -t C,, -i /box/config/punktfunk/native-cert.pem
 ==> Checking
 
   Done. Next:

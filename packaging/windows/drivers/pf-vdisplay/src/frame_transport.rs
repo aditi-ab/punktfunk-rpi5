@@ -261,9 +261,19 @@ pub enum PublishOutcome {
     /// host's ring recreate) — worth stashing: it is the freshest desktop image, in exactly the
     /// descriptor the recreated ring will want.
     DescMismatch,
-    /// Dropped without publishing (all slots busy / device error) — the host is alive and
-    /// consuming, so there is nothing to retain.
+    /// Dropped without publishing (no ring) — nothing to retain.
     Dropped,
+    /// Every slot's keyed mutex was host-held — the designed backpressure (the host is alive and
+    /// behind). Distinct from the fatal outcomes: retrying next compose is correct.
+    AllSlotsBusy,
+    /// A slot's keyed mutex came back `WAIT_ABANDONED`: the host died holding it, so the slot
+    /// surface's consistency is unknown. No pixels were touched; the caller must stop using this
+    /// generation (the next channel delivery attaches a fresh one).
+    HostAbandoned,
+    /// A fatal synchronization/device HRESULT (device removed, invalid call), or a failed
+    /// `ReleaseSync` after the copy — `latest` was NOT advanced. The caller must stop using this
+    /// generation.
+    Fatal,
 }
 
 /// Publishes acquired swap-chain surfaces into the HOST-created ring. Owned by the swap-chain processor
@@ -632,13 +642,21 @@ impl FramePublisher {
         let hr =
             unsafe { (Interface::vtable(&s.mutex).AcquireSync)(Interface::as_raw(&s.mutex), 0, 8) };
         match hr.0 {
-            // Acquired — S_OK, or WAIT_ABANDONED (the host died holding the slot: ownership
-            // transferred to us; exactly the between-sessions case the harvest exists for).
-            0 | WAIT_ABANDONED_HRESULT => {
+            // Acquired cleanly — harvest the last-published image.
+            0 => {
                 // STRAIGHT-LINE between acquire and release (`store` is infallible-by-contract:
                 // best-effort, no early return propagates past it), so the lock cannot leak.
                 stash.store(device, &self.context, &s.tex, at);
                 // SAFETY: the keyed mutex is held (acquired above); release it exactly once.
+                unsafe {
+                    let _ = s.mutex.ReleaseSync(0);
+                }
+            }
+            // WAIT_ABANDONED: the host died holding the slot, so the surface's consistency is
+            // unknown — take NO pixel action (a torn image must not become the next session's
+            // first frame). Only the cleanup ownership the API handed over is discharged.
+            WAIT_ABANDONED_HRESULT => {
+                // SAFETY: abandoned still transfers the lock; release it exactly once.
                 unsafe {
                     let _ = s.mutex.ReleaseSync(0);
                 }
@@ -649,7 +667,11 @@ impl FramePublisher {
     }
 
     /// Copy `surface` into the next free ring slot and signal the host. Never blocks (0 ms try-acquire).
-    pub fn publish(&mut self, surface: &ID3D11Texture2D) -> PublishOutcome {
+    ///
+    /// `display_qpc` is the OS's `PresentDisplayQPCTime` for this frame (0 = none reported, or a
+    /// stash republish) — stamped into the header's `qpc_pts` as the host's source-provenance
+    /// clock.
+    pub fn publish(&mut self, surface: &ID3D11Texture2D, display_qpc: u64) -> PublishOutcome {
         let ring_len = self.slots.len() as u32;
         if ring_len == 0 {
             return PublishOutcome::Dropped;
@@ -704,19 +726,41 @@ impl FramePublisher {
                 (Interface::vtable(&s.mutex).AcquireSync)(Interface::as_raw(&s.mutex), 0, 0)
             };
             match hr.0 {
-                // Acquired — S_OK, or WAIT_ABANDONED (the host died holding the slot: ownership
-                // still transferred; publish normally, a dead host consumes nothing either way).
-                0 | WAIT_ABANDONED_HRESULT => {
-                    // STRAIGHT-LINE, NO `?` between acquire + release — a `?`-return here would leak the
-                    // keyed-mutex lock and wedge the host on this slot. The ordering below is load-bearing:
-                    // the CopyResource is GPU-ordered before the consumer via the slot keyed mutex, and the
-                    // `latest` store (Release) publishes the slot only AFTER the copy is queued + the mutex
-                    // released.
-                    // SAFETY: `s.tex`/`surface` are live, format-matched (checked above) D3D textures on
-                    // `self.context`'s device; the keyed mutex is held here, so we release it exactly once.
+                // WAIT_ABANDONED: the host died (or a host thread crashed) holding the slot — the
+                // surface's consistency is unknown and this generation is DEAD. No pixel action;
+                // discharge the cleanup ownership the API handed over (a failed cleanup release
+                // does not delay the poisoning — the outcome is fatal either way) and tell the
+                // caller to stop using this publisher.
+                WAIT_ABANDONED_HRESULT => {
+                    // SAFETY: abandoned still transfers the lock; best-effort release, once.
                     unsafe {
-                        self.context.CopyResource(&s.tex, surface);
                         let _ = s.mutex.ReleaseSync(0);
+                    }
+                    dbglog!(
+                        "[pf-vd] frame-push FATAL: slot {slot} keyed mutex ABANDONED (host died holding it) — poisoning this ring generation"
+                    );
+                    return PublishOutcome::HostAbandoned;
+                }
+                // Acquired cleanly.
+                0 => {
+                    // STRAIGHT-LINE, NO `?` between acquire + release — a `?`-return would leak
+                    // the keyed-mutex lock and wedge the host on this slot. Ordering is
+                    // load-bearing: the copy is GPU-ordered via the mutex, and `latest` stores
+                    // only after a CHECKED release — a slot whose release failed can never be
+                    // re-acquired by the host and must not be published.
+
+                    // SAFETY: `s.tex`/`surface` are live, format-matched (checked above) D3D
+                    // textures on `self.context`'s device; the mutex is held, released once.
+                    let released = unsafe {
+                        self.context.CopyResource(&s.tex, surface);
+                        s.mutex.ReleaseSync(0)
+                    };
+                    if let Err(e) = released {
+                        dbglog!(
+                            "[pf-vd] frame-push FATAL: slot {slot} ReleaseSync failed rc={:#x} — NOT publishing `latest`; poisoning this ring generation",
+                            e.code().0
+                        );
+                        return PublishOutcome::Fatal;
                     }
                     self.seq = self.seq.wrapping_add(1);
                     // `latest` = (generation << 40) | (seq << 8) | slot, packed by the proto's `FrameToken`
@@ -729,6 +773,15 @@ impl FramePublisher {
                         slot: slot as u8,
                     }
                     .pack();
+                    // Provenance stamp BEFORE the Release publish of `latest`: a host that reads
+                    // it after loading the token sees this frame's stamp or a newer one —
+                    // monotonic either way, and best-effort like the telemetry tail.
+                    // SAFETY: `self.header` stays mapped for the publisher's lifetime; `qpc_pts`
+                    // is an 8-aligned u64 within it (the `latest_cell` pattern).
+                    unsafe {
+                        (*(core::ptr::addr_of!((*self.header).qpc_pts) as *const AtomicU64))
+                            .store(display_qpc, Ordering::Relaxed);
+                    }
                     self.latest_cell().store(latest, Ordering::Release);
                     // SAFETY: `self.event` is the live host-created frame-ready event, duplicated into
                     // this process with the creator's access; signalling it wakes the host consumer.
@@ -741,12 +794,28 @@ impl FramePublisher {
                 }
                 // Busy — the host holds this slot (the designed backpressure): try the next one.
                 WAIT_TIMEOUT_HRESULT => continue,
-                // Genuine failure (negative HRESULT — device removed / invalid call): drop the frame.
-                _ => return PublishOutcome::Dropped,
+                // Genuine failure (negative HRESULT — device removed / invalid call): this ring
+                // generation is done. Name the device-removed reason while it is still queryable.
+                _ => {
+                    // SAFETY: `self.context` is the publisher's live immediate context;
+                    // `GetDevice`/`GetDeviceRemovedReason` only read it.
+                    let removed = unsafe {
+                        self.context.GetDevice().map_or(0, |d| {
+                            d.GetDeviceRemovedReason()
+                                .map_or_else(|e| e.code().0, |()| 0)
+                        })
+                    };
+                    dbglog!(
+                        "[pf-vd] frame-push FATAL: slot {slot} AcquireSync rc={:#x} (device-removed reason {removed:#x}) — poisoning this ring generation",
+                        hr.0
+                    );
+                    return PublishOutcome::Fatal;
+                }
             }
         }
-        // All slots busy — drop this frame (never block the swap-chain thread).
-        PublishOutcome::Dropped
+        // All slots busy — the designed backpressure (never block the swap-chain thread). Distinct
+        // from the fatal outcomes: the host is alive and behind, retrying next compose is correct.
+        PublishOutcome::AllSlotsBusy
     }
 }
 

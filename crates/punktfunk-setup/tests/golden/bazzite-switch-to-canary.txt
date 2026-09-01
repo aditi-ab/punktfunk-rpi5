@@ -20,6 +20,7 @@
   + sudo loginctl enable-linger "$USER"
 ==> Starting the host and the web console
   + systemctl --user enable --now punktfunk-host punktfunk-web
+  + certutil -A -d sql:/box/home/.pki/nssdb -n punktfunk-console -t C,, -i /box/config/punktfunk/native-cert.pem
 ==> Checking
 
   Done. Next:

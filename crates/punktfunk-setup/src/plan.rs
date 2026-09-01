@@ -63,6 +63,9 @@ pub enum StepAction {
     Linger,
     /// Re-probes the user manager, which the linger step above may have just created.
     StartUnits { units: Vec<String> },
+    /// Files the console's certificate in the user's NSS store. Resolved in `exec`: the host
+    /// mints the certificate on its first start, so the step has to wait for the file.
+    TrustCert,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,7 +214,7 @@ pub fn build(facts: &Facts, choices: &Choices) -> Plan {
         plan.push(
             Phase::Start,
             "Starting the host and the web console",
-            start_steps(facts),
+            start_steps(facts, choices),
         );
     }
     plan
@@ -227,24 +230,39 @@ fn install_phase(
     // packages, and a weak-deps-off box would never grow a console otherwise.
     if facts.fully_installed() && choices.components.host {
         let version = facts.host_version.clone().unwrap_or_default();
-        let channel = facts
-            .current_channel
-            .map(|c| format!(", {} channel", c.as_str()))
-            .unwrap_or_default();
-        let mut steps = vec![];
-        if facts.current_channel.is_none() {
-            steps.push(Step::note(
-                Level::Warn,
+        // No repo means this build came from somewhere else — source, a hand-placed package —
+        // so there is nothing to upgrade against, and adding a repo now would install over it.
+        let Some(channel) = facts.current_channel else {
+            plan.push(
+                Phase::Install,
                 format!(
-                    "--channel {} had nothing to act on: no punktfunk package repo is configured here, so this install did not come from one (built from source?). Channels: {DOCS}/channels",
-                    choices.channel.as_str()
+                    "host, web console and plugin runner are already installed ({version}) — skipping the install, continuing with setup"
                 ),
-            ));
-        }
+                vec![Step::note(
+                    Level::Warn,
+                    format!(
+                        "--channel {} had nothing to act on: no punktfunk package repo is configured here, so this install did not come from one (built from source?). Channels: {DOCS}/channels",
+                        choices.channel.as_str()
+                    ),
+                )],
+            );
+            return;
+        };
+        // The install line is the only step that moves an installed box onto the channel's
+        // current build; skipping it stranded one on whatever it had, so a re-run could never
+        // deliver a fix and only an uninstall could. Minus the repo write: having a channel is
+        // how we got here, so re-importing the signing key every time buys nothing.
+        let repo = backend.write_repo(facts, choices);
+        let steps = backend
+            .install(facts, choices)
+            .into_iter()
+            .filter(|step| !repo.contains(step))
+            .collect();
         plan.push(
             Phase::Install,
             format!(
-                "host, web console and plugin runner are already installed ({version}{channel}) — skipping the install, continuing with setup"
+                "host, web console and plugin runner are already installed ({version}, {} channel) — updating to the current build",
+                channel.as_str()
             ),
             steps,
         );
@@ -298,7 +316,7 @@ fn omarchy_steps(_facts: &Facts, choices: &Choices) -> Vec<Step> {
     let cmd = format!(
         "punktfunk-omarchy setup --groups={} --cert={} --toasts={} --idle-guard={} --theme={}",
         bit(choices.punktfunk_group),
-        bit(choices.omarchy_cert),
+        bit(choices.console_cert),
         bit(choices.omarchy_toasts),
         bit(choices.omarchy_idle),
         bit(choices.omarchy_theme),
@@ -440,7 +458,7 @@ fn firewall_steps(facts: &Facts, choices: &Choices) -> Vec<Step> {
     }
 }
 
-fn start_steps(facts: &Facts) -> Vec<Step> {
+fn start_steps(facts: &Facts, choices: &Choices) -> Vec<Step> {
     let mut steps = vec![];
     let mut units = vec!["punktfunk-host".to_string()];
     if facts.web_unit_present {
@@ -462,6 +480,13 @@ fn start_steps(facts: &Facts) -> Vec<Step> {
         action: StepAction::StartUnits { units },
         ends_run: false,
     });
+    // After the start, never before: the certificate exists only once the host has run.
+    if choices.console_cert {
+        steps.push(Step {
+            action: StepAction::TrustCert,
+            ends_run: false,
+        });
+    }
     steps
 }
 

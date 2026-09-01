@@ -286,12 +286,15 @@ impl IddPushCapturer {
     ) -> Result<Self> {
         let (pw, ph, _hz) = preferred
             .context("IDD push needs the negotiated mode (WxH) to size the shared ring")?;
+        // The complete CCD identity every display-global helper below selects paths by (the
+        // packed LUID in the capture target is the IddCx display adapter's).
+        let ccd =
+            pf_win_display::win_display::CcdTargetKey::new(target.adapter_luid, target.target_id);
         // Size the ring to the display's ACTUAL current resolution if it differs from the negotiated mode:
         // a fullscreen game can hold the virtual display at a different mode (esp. across a reconnect), so
         // matching the actual mode lets the first frame flow instead of being dropped (game-capture bug
         // GB1). Falls back to the negotiated mode when the CCD read is unavailable.
-        let (w, h) =
-            pf_win_display::win_display::active_resolution(target.target_id).unwrap_or((pw, ph));
+        let (w, h) = pf_win_display::win_display::active_resolution(ccd).unwrap_or((pw, ph));
         if (w, h) != (pw, ph) {
             tracing::info!(
                 target_id = target.target_id,
@@ -345,19 +348,15 @@ impl IddPushCapturer {
             // An HDR-negotiated (10-bit) session instead enables HDR below and rides the FP16 scRGB
             // ring (design/pyrowave-444-hdr.md Phase 3 for PyroWave; the H.26x P010 path otherwise).
             if !want_hdr {
-                let _ = pf_win_display::win_display::set_advanced_color(target.target_id, false);
+                let _ = pf_win_display::win_display::set_advanced_color(ccd, false);
                 let settle = Instant::now();
                 while settle.elapsed() < Duration::from_millis(250) {
-                    if pf_win_display::win_display::advanced_color_enabled(target.target_id)
-                        == Some(false)
-                    {
+                    if pf_win_display::win_display::advanced_color_enabled(ccd) == Some(false) {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(25));
                 }
-                if pf_win_display::win_display::advanced_color_enabled(target.target_id)
-                    == Some(true)
-                {
+                if pf_win_display::win_display::advanced_color_enabled(ccd) == Some(true) {
                     tracing::error!(
                         target = target.target_id,
                         pyrowave,
@@ -379,7 +378,7 @@ impl IddPushCapturer {
             // settled within 250 ms and would size the ring SDR while the driver composes FP16 → a format
             // mismatch → an immediate ring recreate + dropped first frames (audit §5.4).
             let enabled_hdr =
-                want_hdr && pf_win_display::win_display::set_advanced_color(target.target_id, true);
+                want_hdr && pf_win_display::win_display::set_advanced_color(ccd, true);
             if enabled_hdr {
                 // Let the colorspace change settle before the driver composes + we size the ring:
                 // poll the CCD advanced-color state instead of a fixed sleep (latency plan P0.4),
@@ -389,9 +388,7 @@ impl IddPushCapturer {
                 // stash/format-guard machinery absorbs).
                 let hdr_settle = Instant::now();
                 while hdr_settle.elapsed() < Duration::from_millis(250) {
-                    if pf_win_display::win_display::advanced_color_enabled(target.target_id)
-                        == Some(true)
-                    {
+                    if pf_win_display::win_display::advanced_color_enabled(ccd) == Some(true) {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(25));
@@ -411,8 +408,7 @@ impl IddPushCapturer {
             // Keep the raw observation so Downgrade point D below can say whether the read reported
             // OFF or failed outright — "we asked, it said no" and "we could not tell" have different
             // causes and different fixes.
-            let observed_hdr =
-                pf_win_display::win_display::advanced_color_enabled(target.target_id);
+            let observed_hdr = pf_win_display::win_display::advanced_color_enabled(ccd);
             let display_hdr = want_hdr && (enabled_hdr || observed_hdr.unwrap_or(false));
             // Downgrade point D (design/hdr-10bit-default-and-av1.md item 2d): the session was
             // NEGOTIATED 10-bit (the client was told HDR in the Welcome), but the virtual display
@@ -526,7 +522,7 @@ impl IddPushCapturer {
             // so the session degrades to today's composited pointer (and the forwarder simply
             // never sees a live overlay).
             let cursor_shared = cursor_sender.as_ref().and_then(|send_cursor| {
-                match cursor::CursorShared::create(target.target_id) {
+                match cursor::CursorShared::create(ccd) {
                     Ok(cs) => {
                         // Deliver via the shared helper (also used for RE-delivery after a
                         // driver-side monitor re-arrival destroyed the worker).
@@ -570,9 +566,13 @@ impl IddPushCapturer {
             let cursor_poll = (cursor_shared.is_some() || composite_forced).then(|| {
                 // Safety of the CCD call: read-only QueryDisplayConfig over owned locals (same
                 // call CursorShared::create makes) — already inside open_on's unsafe region.
-                let rect = pf_win_display::win_display::source_desktop_rect(target.target_id)
-                    .unwrap_or((0, 0, i32::MAX, i32::MAX));
-                cursor_poll::CursorPoller::spawn(target.target_id, rect)
+                let rect = pf_win_display::win_display::source_desktop_rect(ccd).unwrap_or((
+                    0,
+                    0,
+                    i32::MAX,
+                    i32::MAX,
+                ));
+                cursor_poll::CursorPoller::spawn(ccd, rect)
             });
             // Heal the driver's persisted cursor-forward state: a session that died on the
             // secure desktop (client drops at the lock screen — the common case) leaves the
@@ -602,6 +602,10 @@ impl IddPushCapturer {
                 // hybrid-GPU box keeps reporting TEX_FAIL render-adapter mismatches
                 // (`dxgi::install_gpu_pref_hook`).
                 hybrid_hook_hits = crate::dxgi::hybrid_hook_hits(),
+                // The diagnostic POSTURE, recorded once per session (immunity plan WP3): a field
+                // log must say whether active micro-probes were running — they alter the very
+                // path a disturbance report describes, so every report needs this A/B label.
+                stall_probes = pf_host_config::config().stall_probes,
                 "IDD push(host): created sealed ring + delivered the channel; waiting for the driver \
                  to attach + publish"
             );
@@ -609,6 +613,9 @@ impl IddPushCapturer {
                 device,
                 context,
                 target_id: target.target_id,
+                ccd,
+                source_seq: 0,
+                stale_trips: 0,
                 section,
                 header,
                 event,
@@ -631,7 +638,7 @@ impl IddPushCapturer {
                 pyro_conv: None,
                 pyro_last: None,
                 desc_poller: DescriptorPoller::spawn(
-                    target.target_id,
+                    ccd,
                     DisplayDescriptor {
                         hdr: display_hdr,
                         width: w,
@@ -800,7 +807,7 @@ impl IddPushCapturer {
                 // May BLOCK this thread ~35 ms (the cursor-on-a-sibling-display branch — see
                 // `kick_dwm_compose`'s COST note). Fine here: we are inside the open-time
                 // first-frame gate, so no frames are flowing yet.
-                kick_dwm_compose(self.target_id);
+                kick_dwm_compose(self.ccd);
                 next_kick = Instant::now() + Duration::from_millis(800);
             }
             if Instant::now() > deadline {

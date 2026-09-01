@@ -43,7 +43,10 @@ impl DescriptorPoller {
     /// stream hitches. Logged (rate-limited) so an affected host self-diagnoses.
     const SLOW: Duration = Duration::from_millis(50);
 
-    pub(super) fn spawn(target_id: u32, initial: DisplayDescriptor) -> Self {
+    pub(super) fn spawn(
+        ccd: pf_win_display::win_display::CcdTargetKey,
+        initial: DisplayDescriptor,
+    ) -> Self {
         let snap = Arc::new(Mutex::new((initial, 0u64)));
         let stop = Arc::new(AtomicBool::new(false));
         let (snap_t, stop_t) = (snap.clone(), stop.clone());
@@ -56,8 +59,8 @@ impl DescriptorPoller {
                 while !stop_t.load(Ordering::Relaxed) {
                     let t = Instant::now();
                     let (hdr, res) = (
-                            pf_win_display::win_display::advanced_color_enabled(target_id),
-                            pf_win_display::win_display::active_resolution(target_id),
+                            pf_win_display::win_display::advanced_color_enabled(ccd),
+                            pf_win_display::win_display::active_resolution(ccd),
                         );
                     let took = t.elapsed();
                     if took >= Self::SLOW
@@ -66,7 +69,7 @@ impl DescriptorPoller {
                         last_slow_log = Some(Instant::now());
                         tracing::warn!(
                             took_ms = took.as_millis() as u64,
-                            target_id,
+                            target = %ccd,
                             "slow display-descriptor poll — something is holding the Windows \
                              display-config lock (topology churn / display-poller software); on \
                              a host with periodic stream hitches, correlate this cadence"

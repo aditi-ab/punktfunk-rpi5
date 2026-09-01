@@ -1098,6 +1098,7 @@ fn consume_frame(
             }
             let hold = ud.try_defer(pw_buf);
             ud.publish(CapturedFrame {
+                provenance: Default::default(),
                 width: w as u32,
                 height: h as u32,
                 pts_ns,
@@ -1242,6 +1243,7 @@ fn consume_frame(
                             );
                         }
                         ud.publish(CapturedFrame {
+                            provenance: Default::default(),
                             width: w as u32,
                             height: h as u32,
                             pts_ns,
@@ -1443,6 +1445,7 @@ fn consume_frame(
     // hardware cursor plane, which stays out of the captured buffer.
     composite_cursor(&mut tight, w, h, fmt, &ud.cursor);
     let frame = CapturedFrame {
+        provenance: Default::default(),
         width: w as u32,
         height: h as u32,
         pts_ns,

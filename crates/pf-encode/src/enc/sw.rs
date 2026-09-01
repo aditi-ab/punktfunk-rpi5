@@ -351,6 +351,7 @@ mod tests {
             OpenH264Encoder::open(PixelFormat::Bgrx, w, h, fps, 8_000_000).expect("open openh264");
         // A flat gray BGRx frame.
         let frame = CapturedFrame {
+            provenance: Default::default(),
             width: w,
             height: h,
             pts_ns: 0,
@@ -494,6 +495,7 @@ mod tests {
         let mut enc =
             OpenH264Encoder::open(PixelFormat::Bgrx, w, h, fps, 8_000_000).expect("open openh264");
         let frame = CapturedFrame {
+            provenance: Default::default(),
             width: w,
             height: h,
             pts_ns: 0,

@@ -16,7 +16,7 @@ repo_gpgcheck=1
 gpgkey=https://git.unom.io/api/packages/unom/rpm/repository.key
        https://git.unom.io/api/packages/unom/generic/punktfunk-keys/1/RPM-GPG-KEY-punktfunk
 REPO
-  + sudo dnf install punktfunk punktfunk-web punktfunk-scripting
+  + sudo dnf install -y punktfunk punktfunk-web punktfunk-scripting
 ==> Checking for Sunshine / Apollo / Vibeshine
   !! another streaming host is active on this box — both want TCP 47990 (its web UI, punktfunk's management API)
   ok would set PUNKTFUNK_MGMT_BIND=0.0.0.0:47991 in /box/config/punktfunk/host.env
@@ -34,6 +34,7 @@ REPO
   + sudo firewall-cmd --reload
 ==> Starting the host and the web console
   + systemctl --user enable --now punktfunk-host punktfunk-web
+  + certutil -A -d sql:/box/home/.pki/nssdb -n punktfunk-console -t C,, -i /box/config/punktfunk/native-cert.pem
 ==> Checking
 
   Done. Next:

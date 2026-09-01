@@ -2482,7 +2482,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // loop re-encoded the last frame because `try_latest` had nothing). A low new-frame rate at a high
     // send rate ⇒ the capture source isn't producing frames (e.g. an IDD virtual display DWM isn't
     // compositing), NOT an encoder problem. Logged every 2 s when `PUNKTFUNK_PERF`.
-    let (mut diag_new, mut diag_repeat) = (0u64, 0u64);
+    let (mut diag_new, mut diag_repeat, mut diag_regen) = (0u64, 0u64, 0u64);
     // Seat-pointer park schedule (see `park_pointer`): per (re)built display, and re-armed by
     // the capture-model flip. More than one attempt for a RELATIVE-ONLY session, because the
     // first park can land on a still-cold EIS connection (devices not yet resumed → the injector
@@ -3424,22 +3424,34 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         let mut repeat = false;
         match cap_result {
             Ok(Some(f)) => {
+                // Only a real SOURCE frame is evidence of source progress: a cursor-only
+                // regeneration re-encodes the previous desktop image at a new pointer
+                // position — encoded and sent like any frame, but never fed to the cadence
+                // estimate, new-frame diagnostics, or capture-rebuild reset (a regenerated
+                // cursor over one stashed texture is how a dead path used to look healthy).
+                let source = f.provenance.origin == pf_frame::FrameOrigin::Source;
                 frame = f;
-                diag_new += 1;
+                if source {
+                    diag_new += 1;
+                } else {
+                    diag_regen += 1;
+                }
                 // Source-cadence estimate (see the declaration above): `t_cap` on the
                 // frame-driven path is taken right after `wait_arrival` wakes, so real-frame
                 // deltas track the game's actual delivery spacing. Deltas past 8×interval are
                 // a gap/hitch (mid-rebuild, alt-tab), not cadence — skipped, not averaged in.
-                if let Some(prev) = last_real_cap {
-                    let d = t_cap.duration_since(prev).as_nanos() as u64;
-                    if d <= interval.as_nanos() as u64 * 8 {
-                        src_period_ns = Some(match src_period_ns {
-                            Some(e) => (e as i64 + (d as i64 - e as i64) / 8) as u64,
-                            None => d,
-                        });
+                if source {
+                    if let Some(prev) = last_real_cap {
+                        let d = t_cap.duration_since(prev).as_nanos() as u64;
+                        if d <= interval.as_nanos() as u64 * 8 {
+                            src_period_ns = Some(match src_period_ns {
+                                Some(e) => (e as i64 + (d as i64 - e as i64) / 8) as u64,
+                                None => d,
+                            });
+                        }
                     }
+                    last_real_cap = Some(t_cap);
                 }
-                last_real_cap = Some(t_cap);
                 // Phase-locked capture: hold the fresh frame so its ARRIVAL at the client lands a
                 // constant small lead before the client's display latch (§3 hold-then-submit; the
                 // capture slot is newest-wins, so a long hold samples fresher content next tick,
@@ -3466,11 +3478,13 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         }
                     }
                 }
-                capture_rebuilds = 0; // a delivered frame clears the consecutive-loss counter
-                                      // Re-arm the park schedule for a (re)built display: pin the seat pointer to
-                                      // the streamed surface (see `park_pointer` and the schedule state above).
-                                      // Not gamescope — its nested seat owns the pointer and its cursor comes from
-                                      // the XFixes source regardless of seat position.
+                if source {
+                    capture_rebuilds = 0; // a delivered SOURCE frame clears the loss counter
+                }
+                // Re-arm the park schedule for a (re)built display: pin the seat pointer to
+                // the streamed surface (see `park_pointer` and the schedule state above).
+                // Not gamescope — its nested seat owns the pointer and its cursor comes from
+                // the XFixes source regardless of seat position.
                 #[cfg(target_os = "linux")]
                 if compositor != pf_vdisplay::Compositor::Gamescope
                     && parked_display != Some((cur_node_id, cur_display_gen))
@@ -3528,31 +3542,24 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 }
                 tracing::warn!(error = %format!("{e:#}"), rebuild = capture_rebuilds,
                     "capture lost — rebuilding pipeline in place");
-                // A Bazzite/SteamOS Gaming↔Desktop switch tears the old compositor down and can take
-                // 15s+ to bring the new one up. Don't fail the session over that (the client would
-                // have to cold-reconnect, surfacing a "session failed") — keep retrying within a
-                // generous budget while the QUIC keepalive (its own thread) holds the connection,
-                // RE-DETECTING the live compositor each attempt so we follow the box to whatever
-                // session comes up: a fresh instance of the same compositor, OR a different one
-                // (the kind-change case the session watcher also handles). The client stays
-                // connected, frozen on the last frame, and the stream resumes when the new output
-                // appears — no reconnect.
+                // A Bazzite/SteamOS Gaming↔Desktop switch tears the old compositor down and can
+                // take 15 s+ to bring the new one up. Don't fail the session over that — keep
+                // retrying within a budget while the QUIC keepalive holds the connection,
+                // RE-DETECTING the live compositor each attempt (same or different kind). The
+                // client stays connected, frozen on the last frame, and resumes — no reconnect.
                 const REBUILD_BUDGET: std::time::Duration = std::time::Duration::from_secs(40);
-                // A managed/attach gamescope (re)launch legitimately takes up to 45 s — the Steam
-                // Big Picture cold start that `launch_session`/`ensure_box_gamescope_mode` poll
-                // for — so the 40 s budget used to expire INSIDE the first attempt (a single-shot
-                // failure ending the session even when a second, warm attempt would have
-                // succeeded). Give gamescope-targeted rebuilds room for two full launch attempts;
-                // desktop compositors keep the tighter budget. Checked per iteration because the
-                // loop retargets `compositor` as re-detection follows the box.
+                // A managed/attach gamescope (re)launch legitimately takes up to 45 s (the Steam
+                // Big Picture cold start), so the 40 s budget used to expire INSIDE the first
+                // attempt — a single-shot failure where a second, warm attempt would have
+                // succeeded. Gamescope-targeted rebuilds get room for two full launches; checked
+                // per iteration because the loop retargets `compositor` as re-detection follows.
                 const GAMESCOPE_REBUILD_BUDGET: std::time::Duration =
                     std::time::Duration::from_secs(100);
-                // Attach-only holdoff: for the first seconds after a capture loss the session
-                // detection can be STALE (the new session isn't up yet), and a rebuild acting on
-                // a stale "Gaming" answer restarts gamescope-session.target — which on SteamOS
-                // steals the seat back from the session the user just switched to (observed
-                // live). While the holdoff lasts, builds run under a vdisplay rebuild-probe
-                // scope: attach to live outputs only, never stop/relaunch/take over sessions.
+                // Attach-only holdoff: right after a capture loss the session detection can be
+                // STALE, and a rebuild acting on a stale "Gaming" answer restarts
+                // gamescope-session.target — on SteamOS that steals the seat back from the
+                // session the user just switched to (observed live). Until it lapses, builds
+                // attach to live outputs only: never stop/relaunch/take over sessions.
                 const PROBE_HOLDOFF: std::time::Duration = std::time::Duration::from_secs(4);
                 let loss_at = std::time::Instant::now();
                 // An explicit PUNKTFUNK_COMPOSITOR pin disables the re-detection below — the
@@ -3946,8 +3953,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             tracing::info!(
                 new_fps = format!("{:.0}", diag_new as f64 / secs),
                 repeat_fps = format!("{:.0}", diag_repeat as f64 / secs),
-                "capture diag: NEW frames from the source vs REPEATS (low new_fps at high send rate ⇒ \
-                 the source isn't producing frames, not an encode stall)"
+                regen_fps = format!("{:.0}", diag_regen as f64 / secs),
+                "capture diag: NEW frames from the source vs REPEATS vs cursor REGENS (low new_fps \
+                 at high send rate ⇒ the source isn't producing frames, not an encode stall; \
+                 regens alone are a cursor over a frozen image)"
             );
             let wait_max = st_wait.iter().copied().max().unwrap_or(0);
             tracing::info!(
@@ -3968,6 +3977,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             st_queue.clear();
             diag_new = 0;
             diag_repeat = 0;
+            diag_regen = 0;
             diag_at = std::time::Instant::now();
         }
         // The source's static HDR mastering metadata is the single source of truth: hand it to the
@@ -4829,11 +4839,15 @@ fn try_inplace_resize(
     // before declaring recovery; a stash-only re-attach must FAIL so the caller ends the session
     // cleanly (a reconnect's fresh bring-up always recovers) instead of streaming a frozen frame.
     let new_frame = if recover_ring {
+        // SOURCE-sequence evidence, not wall-clock PTS — see `source_advanced`.
+        let first_seq = new_frame.provenance.source_seq;
         let first_pts = new_frame.pts_ns;
         let live_deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
         loop {
             match capturer.try_latest() {
-                Ok(Some(f)) if f.pts_ns != first_pts => break f,
+                Ok(Some(f)) if source_advanced(first_seq, first_pts, &f.provenance, f.pts_ns) => {
+                    break f
+                }
                 Ok(_) => {
                     if std::time::Instant::now() >= live_deadline {
                         tracing::warn!(
@@ -5527,9 +5541,43 @@ fn build_pipeline(
     ))
 }
 
+/// Has the SOURCE advanced past the first (possibly stash-delivered) frame of a recovery?
+/// Sequence evidence where the capturer tracks one (`first_seq != 0`): only a NEW source image
+/// advances it — a cursor regeneration or hold re-stamps `pts_ns` over unchanged pixels and must
+/// not count. The pts comparison survives solely as the fallback for an untracked capturer.
+fn source_advanced(
+    first_seq: u64,
+    first_pts: u64,
+    provenance: &pf_frame::Provenance,
+    pts_ns: u64,
+) -> bool {
+    if first_seq != 0 {
+        provenance.source_seq > first_seq
+    } else {
+        pts_ns != first_pts
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The eviction-recovery liveness gate must demand SOURCE progress, not a changed wall-clock
+    /// PTS: a cursor regeneration (and a repeat) stamps a fresh `pts_ns` over unchanged source
+    /// pixels, which is exactly how a dead presentation path used to "prove" recovery.
+    #[test]
+    fn recovery_needs_a_new_source_frame_not_a_new_pts() {
+        use pf_frame::Provenance;
+        // Tracked capturer (IDD): only an ADVANCED source sequence counts…
+        assert!(source_advanced(5, 100, &Provenance::source(6, 0), 999));
+        // …a regen/hold/stalled-source frame with a fresh pts does not.
+        assert!(!source_advanced(5, 100, &Provenance::cursor_regen(5), 999));
+        assert!(!source_advanced(5, 100, &Provenance::hold(5), 999));
+        assert!(!source_advanced(5, 100, &Provenance::source(5, 0), 999));
+        // Untracked capturer (seq 0): the historical pts comparison stands.
+        assert!(source_advanced(0, 100, &Provenance::UNTRACKED, 999));
+        assert!(!source_advanced(0, 100, &Provenance::UNTRACKED, 100));
+    }
 
     /// The 2026-08-13 field log's exact reading — `period_s=2.0` — must be attributed to the
     /// client's backlog shedding, not to a host display disturbance. The whole point of routing

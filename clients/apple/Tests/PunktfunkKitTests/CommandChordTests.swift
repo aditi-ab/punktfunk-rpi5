@@ -12,19 +12,23 @@ import XCTest
 ///    Hyprland/KDE/GNOME, and it used to quit the client.
 ///  * ⌘⎋ and ⌃⌘F NOT reaching it, under every combination. They are the way out of a captured
 ///    stream; forward either and the user is locked in.
+///
+/// The mouse model is deliberately absent from the rule (and from its signature): the chords are
+/// forwarded under the desktop model too, as they are on the SDL clients. Gating it there read as
+/// a broken client — ⌘Q quit Punktfunk instead of reaching Hyprland.
 final class CommandChordTests: XCTestCase {
     // kVK_ANSI_* — physical positions, layout-independent (the same constants the monitor uses).
     private let q: UInt16 = 12, w: UInt16 = 13, h: UInt16 = 4, m: UInt16 = 46
     private let f: UInt16 = 3, esc: UInt16 = 53, leftArrow: UInt16 = 123
 
-    /// Captured, setting on, capture mouse model — the shipping default.
+    /// Captured with the setting on — the shipping default.
     private func forwards(
         _ keyCode: UInt16, _ flags: NSEvent.ModifierFlags,
-        forwarding: Bool = true, inhibit: Bool = true, desktop: Bool = false
+        forwarding: Bool = true, inhibit: Bool = true
     ) -> Bool {
         InputCapture.forwardsCommandChord(
             keyCode: keyCode, flags: flags, forwarding: forwarding,
-            inhibitShortcuts: inhibit, desktopMouse: desktop)
+            inhibitShortcuts: inhibit)
     }
 
     func testCommandChordsGoToTheHostWhileCaptured() {
@@ -70,12 +74,6 @@ final class CommandChordTests: XCTestCase {
         XCTAssertFalse(forwards(q, .command, inhibit: false))
     }
 
-    func testTheDesktopMouseModelKeepsChordsLocal() {
-        // Matches the SDL clients' keyboard grab: a remote desktop is something you ⌘Tab away from.
-        XCTAssertFalse(forwards(q, .command, desktop: true))
-        XCTAssertFalse(forwards(q, .command, inhibit: true, desktop: true))
-    }
-
     /// `deviceIndependentFlagsMask` also carries Caps Lock and the `.function`/`.numericPad` bits
     /// every arrow key sets, so comparing it for equality made chords stop being recognized in
     /// exactly the states a user does not connect to their keyboard: Caps Lock on, or the chord
@@ -107,14 +105,12 @@ final class CommandChordTests: XCTestCase {
     }
 
     /// The system-shortcut tap (⌘Space, ⌘Tab — the keys macOS claims before the app sees them)
-    /// takes keys off the system ONLY while captured, under the capture mouse model, with the app
-    /// frontmost. Any other state must pass through: a tap that eats keys for the whole Mac is the
-    /// failure to pin here.
+    /// takes keys off the system ONLY while captured, with the app frontmost. Any other state must
+    /// pass through: a tap that eats keys for the whole Mac is the failure to pin here.
     func testTheSystemShortcutTapOnlyClaimsWhileCapturedAndFrontmost() {
-        XCTAssertTrue(InputCapture.tapClaims(forwarding: true, desktopMouse: false, appActive: true))
-        XCTAssertFalse(InputCapture.tapClaims(forwarding: false, desktopMouse: false, appActive: true))
-        XCTAssertFalse(InputCapture.tapClaims(forwarding: true, desktopMouse: true, appActive: true))
-        XCTAssertFalse(InputCapture.tapClaims(forwarding: true, desktopMouse: false, appActive: false))
+        XCTAssertTrue(InputCapture.tapClaims(forwarding: true, appActive: true))
+        XCTAssertFalse(InputCapture.tapClaims(forwarding: false, appActive: true))
+        XCTAssertFalse(InputCapture.tapClaims(forwarding: true, appActive: false))
     }
 
     /// The keys the tap exists for must have host VKs — it reposts them into the ordinary key path,

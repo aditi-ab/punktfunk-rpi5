@@ -517,7 +517,7 @@ impl SwapChainProcessor {
                 // stale-descriptor stash (e.g. pre-HDR-flip) is rejected by publish()'s guard —
                 // at worst the old wait-for-compose path.
                 if let Some(t) = stash.texture()
-                    && p.publish(t) == PublishOutcome::Published
+                    && p.publish(t, 0) == PublishOutcome::Published
                 {
                     dbglog!(
                         "[pf-vd] frame-push(driver): republished the retained frame into the fresh ring (target={target_id}) — instant first frame, no compose needed"
@@ -658,9 +658,13 @@ impl SwapChainProcessor {
                             // really 8 bytes/px — a 2× understatement there, acceptable for a
                             // statistic: the OS wants magnitude, not an invoice).
                             stat_bytes = stat_pixels.saturating_mul(4);
-                            match publisher.as_mut().map(|p| p.publish(&tex)) {
+                            match publisher.as_mut().map(|p| p.publish(&tex, display_qpc)) {
                                 // Ring took it (or the host is alive and busy) — nothing to retain.
-                                Some(PublishOutcome::Published | PublishOutcome::Dropped) => {}
+                                Some(
+                                    PublishOutcome::Published
+                                    | PublishOutcome::AllSlotsBusy
+                                    | PublishOutcome::Dropped,
+                                ) => {}
                                 // No ring, or the surface's descriptor doesn't match it (a mode-set /
                                 // HDR flip racing the host's ring recreate): RETAIN the frame — it is
                                 // the desktop image the next attach republishes as its first frame.
@@ -673,6 +677,19 @@ impl SwapChainProcessor {
                                         &tex,
                                         Instant::now(),
                                     );
+                                }
+                                // Poisoned generation (host died holding a slot, a failed release,
+                                // or a fatal device HRESULT): stop using this publisher — the next
+                                // channel delivery attaches a fresh ring. Retain the frame so that
+                                // attach has a first image; publish() already logged the cause.
+                                Some(PublishOutcome::HostAbandoned | PublishOutcome::Fatal) => {
+                                    stash.store(
+                                        &device.device,
+                                        &device.device_context,
+                                        &tex,
+                                        Instant::now(),
+                                    );
+                                    publisher = None;
                                 }
                             }
                         }

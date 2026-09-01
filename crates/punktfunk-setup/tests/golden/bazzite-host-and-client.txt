@@ -7,7 +7,7 @@
 ==> Installing: host web-console plugin-runner client (stable channel)
   + curl -fsSLO https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/bazzite/punktfunk-sysext.sh
   + sudo bash punktfunk-sysext.sh install
-  + flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref
+  + flatpak install --user -y https://flatpak.unom.io/io.unom.Punktfunk.flatpakref
 ==> Checking for Sunshine / Apollo / Vibeshine
   ok No conflicting game-streaming host detected.
 ==> Controller access
@@ -21,6 +21,7 @@
   + sudo loginctl enable-linger "$USER"
 ==> Starting the host and the web console
   + systemctl --user enable --now punktfunk-host punktfunk-web
+  + certutil -A -d sql:/box/home/.pki/nssdb -n punktfunk-console -t C,, -i /box/config/punktfunk/native-cert.pem
 ==> Checking
 
   Done. Next:
