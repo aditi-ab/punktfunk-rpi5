@@ -240,7 +240,9 @@ beside it. A stick follows your thumb from wherever it lands, the D-pad reads ei
 trigger reads how far down its pill your finger sits, so a slow press is a slow press. **Layout**,
 **Opacity** and **Scale** live under Quick actions in the [client settings](/docs/client-settings#input):
 Full (two sticks, D-pad, face buttons, bumpers and triggers), Sticks and shoulders, or D-pad and
-face buttons. Not on Apple TV, a Steam Deck or the desktop clients.
+face buttons. **Edit layout** there rearranges the preset by hand — drag any control where your
+thumbs actually sit, grow or shrink it, or hide the ones a game never needs — with separate
+arrangements for wide and upright screens. Not on Apple TV, a Steam Deck or the desktop clients.
 
 ## Pen and stylus
 

@@ -252,9 +252,13 @@ ring only (it never edits profiles). See [the quick-action ring](/docs/input#the
 **Virtual controller** — *Android and iPhone/iPad only*, under Quick actions. **Layout**
 (*default: Full*) picks which controls the on-screen controller shows: Full, Sticks and shoulders,
 or D-pad and face buttons. **Opacity** (*default: 45 %*) and **Scale** (*default: 100 %*) set how
-strongly and how large it draws over the picture. The controller itself is shown and hidden from
-the ring's Virtual controller button, per session. Not on Apple TV (no touch screen), a Steam Deck
-(real sticks) or the desktop clients (a keyboard).
+strongly and how large it draws over the picture. **Edit layout** opens the controller itself over
+a stand-in backdrop: drag a control to move it, tap one to size it (50–200 %) or hide it, and reset
+one control or the whole layout. Wide and upright screens keep separate layouts, so a phone tuned
+in landscape keeps its portrait preset untouched; the overrides ride the same profile-scoped
+setting as the ring, so a Game profile can carry its own arrangement. The controller itself is
+shown and hidden from the ring's Virtual controller button, per session. Not on Apple TV (no touch
+screen), a Steam Deck (real sticks) or the desktop clients (a keyboard).
 
 ## Behavior
 
