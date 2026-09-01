@@ -41,11 +41,12 @@ stub has no options of its own: everything you pass, and every `PUNKTFUNK_INSTAL
 your environment, is handed to the installer untouched.
 
 With a terminal you get a single screen showing every choice already resolved: press Enter to
-install, or move to a row and edit it. Without one — piped, in CI, or with `--yes` — it prints the
-same choices as plain lines and takes the defaults.
+install, or move to a row and edit it. The install itself reports one progress line rather than a
+running log; `-v` echoes every command instead. Without a terminal — piped, in CI, or with
+`--yes` — it prints the same choices as plain lines and takes the defaults.
 
 The defaults follow the box. Bazzite and Nobara linger; a seatless SSH session lingers; an active
-Sunshine/Apollo host opts into Moonlight compat; the clipboard stays off. The full controller
+Sunshine/Apollo host opts into Moonlight compat; the clipboard is shared. The full controller
 (joining the `punktfunk` group, which grants usbip attach) is **on by default on every box** —
 `--no-punktfunk-group` or `PUNKTFUNK_INSTALL_PUNKTFUNK_GROUP=0` opts out.
 
@@ -55,7 +56,9 @@ distro with no punktfunk repo can still run the client. `--channel stable|canary
 `--no-start`, `--dry-run` and `--uninstall` work as before, and each has an environment twin
 (`PUNKTFUNK_INSTALL_YES`, `PUNKTFUNK_INSTALL_CHANNEL`, `PUNKTFUNK_INSTALL_GAMESTREAM`,
 `PUNKTFUNK_INSTALL_CLIPBOARD`, `PUNKTFUNK_INSTALL_PUNKTFUNK_GROUP`, `PUNKTFUNK_INSTALL_LINGER`,
-`PUNKTFUNK_INSTALL_OMARCHY_SETUP`, `PUNKTFUNK_INSTALL_MGMT_PORT`, `PUNKTFUNK_INSTALL_DRY_RUN`).
+`PUNKTFUNK_INSTALL_OMARCHY_SETUP`, `PUNKTFUNK_INSTALL_OMARCHY_CERT`,
+`PUNKTFUNK_INSTALL_OMARCHY_TOASTS`, `PUNKTFUNK_INSTALL_OMARCHY_IDLE`,
+`PUNKTFUNK_INSTALL_OMARCHY_THEME`, `PUNKTFUNK_INSTALL_MGMT_PORT`, `PUNKTFUNK_INSTALL_DRY_RUN`).
 `--help` lists them all. `--demo <preset>` walks the whole flow against a canned machine and
 changes nothing, which is the honest way to see what it would do before letting it near a box.
 

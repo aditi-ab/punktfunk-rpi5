@@ -2,7 +2,7 @@
 ==> Choices (nothing below has run yet)
   Full controller (joins the punktfunk group — grants usbip attach): yes
   Third-party clients (Moonlight, Artemis): no
-  Shared clipboard: no
+  Shared clipboard: yes
   Start at boot with nobody logged in: no
 ==> Installing: host web-console plugin-runner (canary channel)
   + sudo install -d -m 0755 /etc/apt/keyrings
@@ -16,6 +16,7 @@
   + sudo usermod -aG input "$USER"
   + sudo usermod -aG punktfunk "$USER"
 ==> Options (host.env — everything here is off by default and reversible)
+  ok would set PUNKTFUNK_CLIPBOARD=on in /box/config/punktfunk/host.env
 ==> Firewall
   ok no active firewall found — nothing to open (https://docs.punktfunk.unom.io/docs/ports if you add one later)
 ==> Starting the host and the web console
@@ -23,11 +24,9 @@
 ==> Checking
 
   Done. Next:
-  1. Open the web console:  https://192.168.1.10:47992  (the certificate is the host's own — continue past the warning)
-     password:  sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password
-  2. Install a client on the device you stream to (https://docs.punktfunk.unom.io/docs/install-client), connect, and click
-     Approve in the console — or Pair a device for a PIN (https://docs.punktfunk.unom.io/docs/pairing).
-  3. Stream. Ctrl+Alt+Shift+Q hands mouse and keyboard back on desktop clients.
+  Connect with a client — a notification appears here to approve it.
+  Console: https://192.168.1.10:47992  (its certificate is this host's own)
+  Password: sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password
   Group changes apply after you log out and back in (controllers won't work until then).
-  Stuck? https://docs.punktfunk.unom.io/docs/troubleshooting · this installer is a preview — the full guide is https://docs.punktfunk.unom.io/docs/debian
+  https://docs.punktfunk.unom.io/docs/troubleshooting · https://docs.punktfunk.unom.io/docs/debian
 

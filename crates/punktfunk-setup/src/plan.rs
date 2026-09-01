@@ -283,6 +283,11 @@ fn install_phase(
 /// Everything from here to the start phase is generic Linux wiring — a group, a wide-open
 /// firewall, a user unit. Omarchy has a better local answer for each and one command that does
 /// them all and knows how to reverse itself, so offer that instead of a weaker second version.
+///
+/// Every optional part is passed explicitly. `punktfunk-omarchy setup` used to ask for four of
+/// them itself, which is how an Omarchy install grew a second round of questions after this one
+/// had finished — and how `--yes` skipped the integration entirely, since that script's prompt
+/// defaulted to no on a pipe.
 fn omarchy_steps(_facts: &Facts, choices: &Choices) -> Vec<Step> {
     if !choices.omarchy_setup {
         return vec![Step::note(
@@ -290,16 +295,34 @@ fn omarchy_steps(_facts: &Facts, choices: &Choices) -> Vec<Step> {
             format!("Run it later with: punktfunk-omarchy setup   ({DOCS}/omarchy)"),
         )];
     }
+    let cmd = format!(
+        "punktfunk-omarchy setup --groups={} --cert={} --toasts={} --idle-guard={} --theme={}",
+        bit(choices.punktfunk_group),
+        bit(choices.omarchy_cert),
+        bit(choices.omarchy_toasts),
+        bit(choices.omarchy_idle),
+        bit(choices.omarchy_theme),
+    );
     vec![Step {
         action: StepAction::RunIfPresent {
             program: "punktfunk-omarchy".into(),
-            cmd: "punktfunk-omarchy setup".into(),
+            cmd,
             warn_if_missing: Some(format!(
                 "punktfunk-omarchy is not on PATH — the host package should ship it; see {DOCS}/omarchy"
             )),
         },
         ends_run: true,
     }]
+}
+
+/// The hand-off takes 1/0, never a bare flag: a missing one must be a parse error there, not a
+/// silent no.
+fn bit(on: bool) -> &'static str {
+    if on {
+        "1"
+    } else {
+        "0"
+    }
 }
 
 fn conflict_steps(facts: &Facts, choices: &Choices) -> Vec<Step> {

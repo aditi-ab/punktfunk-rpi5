@@ -174,21 +174,34 @@ else
   printf '  FAIL setup_webapp aborted before the menu on a clean box\n'; fails=$((fails + 1))
 fi
 
-echo "ask polarity"
+echo "setup options"
 
-# Setup is the consent act, so a non-interactive shell takes each ask's DEFAULT — yes unless the
-# caller says n. The first polarity (always no without a tty) made a `curl | sh` install deliver
-# the integration with every optional feature silently skipped. </dev/null forces the non-tty
-# path even when this selftest runs in a terminal.
-if ask "test question" </dev/null >/dev/null 2>&1; then
-  printf '  ok   a non-interactive ask takes the yes default\n'
+# The installer asks for every optional step on its own screen and passes the answers here, so
+# nothing in `setup` may prompt. A stray `read`, a missing case or a silently accepted value all
+# put an Omarchy box back to two rounds of questions, which is what these four checks catch.
+if grep -q 'read -r -p' "$SCRIPT"; then
+  printf '  FAIL setup still prompts for something\n'; fails=$((fails + 1))
 else
-  printf '  FAIL a non-interactive ask said no\n'; fails=$((fails + 1))
+  printf '  ok   nothing in the script prompts\n'
 fi
-if ask "test question" n </dev/null >/dev/null 2>&1; then
-  printf '  FAIL an explicit n default was ignored\n'; fails=$((fails + 1))
+
+if (parse_setup_opts --toasts=0 --theme=0 >/dev/null 2>&1
+    [[ "$OPT_TOASTS" == 0 && "$OPT_THEME" == 0 && "$OPT_IDLE" == 1 ]]); then
+  printf '  ok   an option sets its own row and leaves the rest alone\n'
 else
-  printf '  ok   an explicit n default still means no\n'
+  printf '  FAIL parse_setup_opts did not apply the options\n'; fails=$((fails + 1))
+fi
+
+if (parse_setup_opts --toasts=maybe >/dev/null 2>&1); then
+  printf '  FAIL a value that is not 1 or 0 was accepted\n'; fails=$((fails + 1))
+else
+  printf '  ok   a value that is not 1 or 0 is refused\n'
+fi
+
+if (parse_setup_opts --nonsense=1 >/dev/null 2>&1); then
+  printf '  FAIL an unknown option was accepted\n'; fails=$((fails + 1))
+else
+  printf '  ok   an unknown option is refused\n'
 fi
 
 echo

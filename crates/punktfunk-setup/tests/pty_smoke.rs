@@ -114,7 +114,7 @@ fn plain(raw: &str) -> String {
 
 #[test]
 fn the_demo_walks_from_the_settings_screen_to_the_outro() {
-    let text = plain(&run(&["--demo", "debian-fresh"], b"\r", "Done. Next"));
+    let text = plain(&run(&["--demo", "debian-fresh", "-v"], b"\r", "Done. Next"));
     assert!(
         text.contains("Install now with these settings"),
         "no settings screen:\n{text}"
@@ -123,7 +123,8 @@ fn the_demo_walks_from_the_settings_screen_to_the_outro() {
         text.contains("Full controller"),
         "the rows did not render:\n{text}"
     );
-    // The commands still echo — that transparency is the trust feature the TUI must keep.
+    // Under `-v` the commands still echo. That transparency is the trust feature, and it is
+    // what the flag exists to preserve now that a run collapses to a progress line by default.
     assert!(
         text.contains("+ sudo apt install punktfunk-host punktfunk-web punktfunk-scripting"),
         "the command echo is missing:\n{text}"
@@ -163,7 +164,7 @@ fn a_failed_step_renders_the_failure_and_points_at_the_docs() {
 fn the_demo_writes_nothing_into_the_users_home() {
     let home = tempfile::tempdir().expect("tempdir");
     let text = plain(&run_with_home(
-        &["--demo", "fedora-sunshine"],
+        &["--demo", "fedora-sunshine", "-v"],
         b"\r",
         "Done. Next",
         home.path().to_str(),
@@ -191,5 +192,20 @@ fn quitting_the_settings_screen_changes_nothing() {
     assert!(
         !text.contains("+ sudo pacman"),
         "a cancelled run echoed a command:\n{text}"
+    );
+}
+
+/// The default run shows progress, not a transcript: luxus counted the lines on Omarchy and
+/// the wall of them is what hid the one warning that mattered.
+#[test]
+fn the_default_run_collapses_to_a_progress_line() {
+    let text = plain(&run(&["--demo", "debian-fresh"], b"\r", "Done. Next"));
+    assert!(
+        !text.contains("+ sudo apt install"),
+        "the command echo should be behind -v:\n{text}"
+    );
+    assert!(
+        text.contains("Done. Next"),
+        "never reached the outro:\n{text}"
     );
 }

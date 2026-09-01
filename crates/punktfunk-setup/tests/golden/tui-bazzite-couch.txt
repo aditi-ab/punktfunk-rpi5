@@ -4,14 +4,12 @@
 │
 │  ▸ Install now with these settings
 │  ──────────────────────────────────────────────────────────
-│    Components        Host ✓ · Client ✗
-│    Channel           stable
-│    Full controller   yes — Bazzite — virtual Steam Deck pad
-│    Moonlight compat  no  — punktfunk's own apps don't need it
-│    Shared clipboard  no
-│    Start at boot     yes — Bazzite hosts are usually headless
-│    Start services    yes
-│  ──────────────────────────────────────────────────────────
-│    Dry run — print every command, change nothing
+│    Components               Host ✓ · Client ✗
+│    Channel                  stable
+│    Full controller support  yes — Bazzite — virtual Steam Deck pad
+│    Third-party clients      no  — punktfunk's own apps don't need it
+│    Shared clipboard         yes
+│    Start at boot            yes — Bazzite hosts are usually headless
+│    Host service             yes
 │
 │  ↑↓ move · Enter select/edit · q quit — nothing runs until you confirm

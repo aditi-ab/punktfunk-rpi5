@@ -39,22 +39,31 @@ warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*"; }
 bad()  { printf '  %s✗%s %s\n' "$R" "$N" "$*"; }
 die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 
-# ask "question" [y|n] -> 0 on yes. The default is YES unless a caller says otherwise, and a
-# non-interactive shell TAKES the default: running `setup` is the consent act, and the first
-# polarity (everything defaulted no, non-tty always no) meant a `curl | sh` install delivered
-# the integration with every feature silently skipped. Enter accepts; `n` still declines; and
-# every step stays reversible through `remove`.
-ask() {
-  local q="$1" def="${2:-y}"
-  if [[ ! -t 0 ]]; then [[ "$def" == y ]]; return; fi
-  local reply hint="[Y/n]"
-  [[ "$def" == n ]] && hint="[y/N]"
-  read -r -p "  $q $hint " reply
-  case "${reply:-$def}" in
-    [yY]|[yY][eE][sS]) return 0 ;;
-    *) return 1 ;;
-  esac
+# Every optional part of `setup` arrives as an explicit 1/0. Nothing here prompts: the installer
+# asks for all of these on its own screen, and this script asking again afterwards is what turned
+# an Omarchy install into two rounds of questions. Run by hand with no options, everything is on.
+OPT_GROUPS=1; OPT_CERT=1; OPT_TOASTS=1; OPT_IDLE=1; OPT_THEME=1; OPT_MENU=1
+
+parse_setup_opts() {
+  while (($#)); do
+    case "$1" in
+      --groups=*)     OPT_GROUPS="${1#*=}" ;;
+      --cert=*)       OPT_CERT="${1#*=}" ;;
+      --toasts=*)     OPT_TOASTS="${1#*=}" ;;
+      --idle-guard=*) OPT_IDLE="${1#*=}" ;;
+      --theme=*)      OPT_THEME="${1#*=}" ;;
+      --menu=*)       OPT_MENU="${1#*=}" ;;
+      *) die "unknown setup option '$1' (try: --toasts=1)" ;;
+    esac
+    shift
+  done
+  local v
+  for v in "$OPT_GROUPS" "$OPT_CERT" "$OPT_TOASTS" "$OPT_IDLE" "$OPT_THEME" "$OPT_MENU"; do
+    [[ "$v" == 1 || "$v" == 0 ]] || die "setup options take 1 or 0, not '$v'"
+  done
 }
+
+on() { [[ "$1" == 1 ]]; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -147,7 +156,7 @@ setup_groups() {
     getent group "$g" >/dev/null 2>&1 || { warn "group '$g' does not exist — skipping"; continue; }
     if id -nG "$USER" | tr ' ' '\n' | grep -qx "$g"; then
       ok "already in '$g'"
-    elif ask "add $USER to the '$g' group?"; then
+    elif on "$OPT_GROUPS"; then
       if sudo usermod -aG "$g" "$USER"; then
         ok "added to '$g'"; relogin=1
       else
@@ -243,7 +252,7 @@ setup_cert_trust() {
     warn "no native-cert.pem yet — start the host once, then re-run: punktfunk-omarchy setup"
     return 0
   fi
-  ask "trust the console's certificate in Chromium (removes the security warning)?" || { warn "skipped"; return 0; }
+  on "$OPT_CERT" || { warn "skipped"; return 0; }
   if [[ ! -f "$NSSDB/cert9.db" ]]; then
     mkdir -p "$NSSDB"
     certutil -N -d "sql:$NSSDB" --empty-password
@@ -446,11 +455,28 @@ remove_menu() {
 # them there. Installing into /usr/share/omarchy/shell/plugins instead would drop unowned files
 # inside omarchy's own package: the exact "exists in filesystem" abort on its next upgrade.
 plugin_dest() { printf '%s/omarchy/plugins/punktfunk' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+tray_override() { printf '%s/autostart/io.unom.Punktfunk.Tray.desktop' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+
+# The widget carries status, pairing and the console, so the tray would be a second punktfunk
+# mark in the same bar. A user entry of the same name shadows the package's autostart file;
+# deleting /etc/xdg/autostart would return on the next upgrade and hit every user on the box.
+hide_tray() {
+  local f; f="$(tray_override)"
+  mkdir -p "${f%/*}"
+  printf '[Desktop Entry]\nType=Application\nName=punktfunk host status\nHidden=true\n' >"$f"
+  ok "tray hidden — the bar widget replaces it"
+}
+
+restore_tray() {
+  local f; f="$(tray_override)"
+  [[ -f "$f" ]] || return 0
+  rm -f "$f"
+  ok "tray restored"
+}
 
 setup_plugin() {
   step "Bar widget"
   [[ -d "$HOOKS_SRC/plugin" ]] || { warn "no plugin in $HOOKS_SRC — skipping"; return 0; }
-  ask "add the Punktfunk widget to the Omarchy bar (status, pairing, devices)?" || { warn "skipped"; return 0; }
   local dest; dest="$(plugin_dest)"
   mkdir -p "$dest"
   install -m0644 -t "$dest" "$HOOKS_SRC"/plugin/manifest.json "$HOOKS_SRC"/plugin/*.qml \
@@ -459,6 +485,7 @@ setup_plugin() {
   # shell it needs OMARCHY_PATH (measured on 4.0.1); the other omarchy tools here do not.
   if OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}" omarchy plugin enable punktfunk >/dev/null 2>&1; then
     ok "widget installed and enabled — the Punktfunk mark appears in the bar"
+    hide_tray
   else
     ok "widget installed to $dest"
     warn "could not enable it automatically — run: omarchy plugin enable punktfunk"
@@ -472,7 +499,7 @@ setup_plugin() {
 setup_client_menu() {
   have punktfunk-client || return 0
   step "Client menu"
-  ask "add your saved hosts to the Omarchy menu (connect and wake rows)?" || { warn "skipped"; return 0; }
+  on "$OPT_MENU" || { warn "skipped"; return 0; }
   if punktfunk-client --omarchy-menu on >/dev/null 2>&1; then
     ok "client rows in the Omarchy menu — they follow your saved hosts from here"
   else
@@ -481,6 +508,7 @@ setup_client_menu() {
 }
 
 remove_plugin() {
+  restore_tray
   local dest; dest="$(plugin_dest)"
   # The manifest check keeps an rm -rf honest: only a directory that is actually our plugin goes.
   [[ -d "$dest" ]] && grep -qs '"id": "punktfunk"' "$dest/manifest.json" || return 0
@@ -539,7 +567,7 @@ setup_hooks() {
   # The host already emits every lifecycle event and already runs hook commands (automation.md);
   # these scripts are the glue to `omarchy-notification-send`, so the toasts get the user's theme
   # and Omarchy's own action buttons for free and the host gains no notification code at all.
-  ask "send Omarchy toasts for pairing requests and stream start/stop?" && WANT_TOASTS=1 || warn "skipped"
+  on "$OPT_TOASTS" && WANT_TOASTS=1 || warn "skipped"
 }
 
 setup_idle() {
@@ -548,13 +576,13 @@ setup_idle() {
   say "  During an input-quiet stream (a film, a cutscene) Omarchy's idle timer still counts down,"
   say "  because nothing is moving the pointer here. This keeps the box awake for the length of a"
   say "  session and puts your own setting back afterwards — it never forces 'allow idle' on you."
-  ask "keep the screen awake while a stream is running?" && WANT_IDLE=1 || warn "skipped"
+  on "$OPT_IDLE" && WANT_IDLE=1 || warn "skipped"
 }
 
 setup_theme() {
   step "Theme"
   [[ -r "$HOOKS_SRC/themed/punktfunk.json.tpl" ]] || { warn "no theme template — skipping"; return 0; }
-  ask "follow the Omarchy theme in the web console and the Linux client?" || { warn "skipped"; return 0; }
+  on "$OPT_THEME" || { warn "skipped"; return 0; }
   local themed="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/themed"
   mkdir -p "$themed"
   install -m0644 "$HOOKS_SRC/themed/punktfunk.json.tpl" "$themed/punktfunk.json.tpl"
@@ -779,7 +807,7 @@ cmd_status() {
 }
 
 case "${1:-}" in
-  setup)  cmd_setup ;;
+  setup)  shift; parse_setup_opts "$@"; cmd_setup ;;
   remove) cmd_remove ;;
   status) cmd_status ;;
   ""|-h|--help|help)

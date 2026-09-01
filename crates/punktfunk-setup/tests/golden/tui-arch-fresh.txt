@@ -4,14 +4,11 @@
 │
 │  ▸ Install now with these settings
 │  ──────────────────────────────────────────────────────────
-│    Components        Host ✓ · Client ✗
-│    Channel           stable
-│    Full controller   yes — joins the punktfunk group (grants usbip attach)
-│    Moonlight compat  no  — punktfunk's own apps don't need it
-│    Shared clipboard  no
-│    Start at boot     no  — this box has a graphical session
-│    Start services    yes
-│  ──────────────────────────────────────────────────────────
-│    Dry run — print every command, change nothing
+│    Components               Host ✓ · Client ✗
+│    Channel                  stable
+│    Full controller support  yes — joins the punktfunk group (grants usbip attach)
+│    Third-party clients      no  — punktfunk's own apps don't need it
+│    Shared clipboard         yes
+│    Host service             yes
 │
 │  ↑↓ move · Enter select/edit · q quit — nothing runs until you confirm

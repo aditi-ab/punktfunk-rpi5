@@ -3,8 +3,13 @@
 //! The transcript scrolls and stays the audit log, which is the constraint that shapes this
 //! file: a frame is only ever repainted while it is still the *live* one (the settings list,
 //! a row editor, the intro animation). Once a command has been echoed, nothing overwrites it.
-//! That is why the progress view prints one `◆` heading per phase with its commands dim
-//! beneath, rather than the collapsing checklist a repaint could draw.
+//! That is why the verbose progress view prints one `◆` heading per phase with its commands
+//! dim beneath, rather than the collapsing checklist a repaint could draw.
+//!
+//! The default run collapses to a single live line instead. It repaints, which is allowed
+//! precisely because nothing is echoed while it is up: with no command in the scrollback there
+//! is nothing a repaint could overwrite. Warnings and failures still print above it, and `-v`
+//! restores the transcript.
 //!
 //! Everything reaches the terminal through `term::Terminal`, so `ScriptedTerm` can drive the
 //! whole flow with a key list and assert on the frame the user would be looking at.
@@ -32,6 +37,16 @@ pub struct Tui<'a> {
     caps: Caps,
     /// 0 in tests and under `--demo --fast`, so nothing waits on wall-clock time.
     frame_ms: u64,
+    /// `Some` while the run is collapsed to one live line; `None` under `-v`.
+    progress: RefCell<Option<Progress>>,
+}
+
+/// The live run line. `done` counts phase headings, which `exec` emits one of per phase.
+struct Progress {
+    total: usize,
+    done: usize,
+    title: String,
+    drawn: usize,
 }
 
 impl<'a> Tui<'a> {
@@ -40,11 +55,73 @@ impl<'a> Tui<'a> {
             term: RefCell::new(term),
             caps,
             frame_ms,
+            progress: RefCell::new(None),
         }
     }
 
     fn write(&self, text: &str) {
         self.term.borrow_mut().write(text);
+    }
+
+    /// Collapse the run to one repainting line. Nothing is echoed until `end_progress`.
+    pub fn begin_progress(&self, total: usize) {
+        *self.progress.borrow_mut() = Some(Progress {
+            total,
+            done: 0,
+            title: String::new(),
+            drawn: 0,
+        });
+    }
+
+    /// Take the line down, so the outro starts on a clean row.
+    pub fn end_progress(&self) {
+        if let Some(p) = self.progress.borrow_mut().take()
+            && p.drawn > 0
+        {
+            self.term.borrow_mut().clear_last_lines(p.drawn);
+        }
+    }
+
+    fn progress_live(&self) -> bool {
+        self.progress.borrow().is_some()
+    }
+
+    /// Lift the line so a warning can be printed under it permanently.
+    fn clear_progress(&self) {
+        if let Some(p) = self.progress.borrow_mut().as_mut()
+            && p.drawn > 0
+        {
+            self.term.borrow_mut().clear_last_lines(p.drawn);
+            p.drawn = 0;
+        }
+    }
+
+    fn repaint_progress(&self) {
+        let frame = match self.progress.borrow().as_ref() {
+            Some(p) => self.progress_frame(p),
+            None => return,
+        };
+        self.clear_progress();
+        self.write(&frame);
+        if let Some(p) = self.progress.borrow_mut().as_mut() {
+            p.drawn = frame.lines().count();
+        }
+    }
+
+    fn progress_frame(&self, p: &Progress) -> String {
+        const CELLS: usize = 14;
+        let filled = (CELLS * p.done)
+            .checked_div(p.total)
+            .unwrap_or(0)
+            .min(CELLS);
+        let bar = format!("{}{}", "▓".repeat(filled), "░".repeat(CELLS - filled));
+        format!(
+            "{}  {} {} {}\n",
+            self.bar(),
+            self.accent(STEP_ACTIVE),
+            self.dim(&bar),
+            self.highlight(&format!("{}/{}  {}", p.done, p.total, p.title))
+        )
     }
 
     fn dim(&self, text: &str) -> String {
@@ -236,7 +313,7 @@ impl<'a> Tui<'a> {
             let mark = if on { self.accent(CURSOR) } else { " ".into() };
             match item {
                 Item::Row(field) => {
-                    let label = format!("{:<18}", Screen::label(*field));
+                    let label = format!("{:<25}", Screen::label(*field));
                     let value = screen.value(*field);
                     let text = if on {
                         format!("{}{}", self.highlight(&label), value)
@@ -253,13 +330,6 @@ impl<'a> Tui<'a> {
                     };
                     out.push_str(&format!("{bar}  {mark} {}\n", self.highlight(label)));
                     out.push_str(&format!("{bar}  {rule}\n"));
-                }
-                Item::DryRun => {
-                    out.push_str(&format!("{bar}  {rule}\n"));
-                    out.push_str(&format!(
-                        "{bar}  {mark} {}\n",
-                        self.dim("Dry run — print every command, change nothing")
-                    ));
                 }
                 Item::Uninstall => out.push_str(&format!(
                     "{bar}  {mark} {}\n",
@@ -400,6 +470,14 @@ impl<'a> Tui<'a> {
 /// During execution the same `Plan` reports through here instead of the plain transcript.
 impl Reporter for Tui<'_> {
     fn say(&self, msg: &str) {
+        if self.progress_live() {
+            if let Some(p) = self.progress.borrow_mut().as_mut() {
+                p.done += 1;
+                p.title = msg.to_string();
+            }
+            self.repaint_progress();
+            return;
+        }
         self.write(&format!("{}\n", self.bar()));
         self.write(&format!(
             "{}  {}\n",
@@ -409,23 +487,38 @@ impl Reporter for Tui<'_> {
     }
 
     fn ok(&self, msg: &str) {
+        if self.progress_live() {
+            return;
+        }
         self.write(&format!("{}  {} {msg}\n", self.bar(), self.dim(STEP_DONE)));
     }
 
+    /// A warning outlives the run, so it is printed above the live line, never into it.
     fn warn(&self, msg: &str) {
         let mark = if self.caps.colors == Colors::None {
             WARN.to_string()
         } else {
             format!("\x1b[33m{WARN}\x1b[0m")
         };
+        let live = self.progress_live();
+        if live {
+            self.clear_progress();
+        }
         self.write(&format!("{}  {mark} {msg}\n", self.bar()));
+        if live {
+            self.repaint_progress();
+        }
     }
 
     fn die(&self, msg: &str) {
+        self.end_progress();
         self.failure(msg);
     }
 
     fn plus(&self, cmd: &str) {
+        if self.progress_live() {
+            return;
+        }
         self.write(&format!(
             "{}    {}\n",
             self.bar(),
@@ -434,14 +527,23 @@ impl Reporter for Tui<'_> {
     }
 
     fn detail(&self, msg: &str) {
+        if self.progress_live() {
+            return;
+        }
         self.write(&format!("{}    {}\n", self.bar(), self.dim(msg)));
     }
 
     fn line(&self, msg: &str) {
+        if self.progress_live() {
+            return;
+        }
         self.write(&format!("{}  {msg}\n", self.bar()));
     }
 
     fn blank(&self) {
+        if self.progress_live() {
+            return;
+        }
         self.write(&format!("{}\n", self.bar()));
     }
 }

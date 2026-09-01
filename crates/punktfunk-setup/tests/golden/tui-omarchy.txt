@@ -1,15 +1,18 @@
 │
-◆  punktfunk-host 0.34.0 · canary
-│  https://docs.punktfunk.unom.io/docs/arch
+◆  punktfunk setup  ·  Omarchy · pacman
+│  https://docs.punktfunk.unom.io/docs/omarchy
 │
-│  ▸ Apply these changes
+│  ▸ Install now with these settings
 │  ──────────────────────────────────────────────────────────
 │    Components               Host ✓ · Client ✗
-│    Channel                  canary
+│    Channel                  stable
 │    Full controller support  yes — joins the punktfunk group (grants usbip attach)
 │    Third-party clients      no  — punktfunk's own apps don't need it
 │    Shared clipboard         yes
 │    Host service             yes
-│    Uninstall — remove the packages and the repo
+│    Console certificate      yes
+│    Desktop notifications    yes
+│    Keep the screen awake    yes
+│    Match the Omarchy theme  yes
 │
 │  ↑↓ move · Enter select/edit · q quit — nothing runs until you confirm
