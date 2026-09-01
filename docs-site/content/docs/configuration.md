@@ -100,6 +100,7 @@ the full picture (and [Bazzite](/docs/bazzite) for that distro's specifics).
 | `PUNKTFUNK_GAMESCOPE_GRAB_CURSOR` | `1` | Add `--force-grab-cursor` to a bare gamescope session the host spawns **to run an app or game** (never the empty keep-alive session), forcing relative-mouse capture so FPS mouselook works over the injected pointer. **Off by default** — relative mode breaks absolute-pointer titles and menus, so turn it on per host. |
 | `PUNKTFUNK_GAMESCOPE_SPLASH` | `1` · `0` *(default on)* | Run the built-in splash client inside each bare gamescope session the host spawns. **Leave it on**: gamescope only produces capture buffers once something paints, and a Steam launch paints nothing for its whole bootstrap — without the splash a fresh session starves and times out. `0` is a debugging escape hatch. |
 | `PUNKTFUNK_GAMESCOPE_STEAM` | `1` | Launch every bare gamescope session the host spawns in Steam integration mode (`--steam`). A Steam title turns that on by itself; this forces it for non-Steam launches too. Managed / `gamescope-session-plus` sessions own their own flags and ignore it. |
+| `PUNKTFUNK_GAMESCOPE_ISOLATE` | `1` · `0` *(default on)* | Give every bare gamescope session the host spawns its own input, audio, and mic plane, so concurrent sessions on one box never hear or drive each other. `0` restores the shared host-lifetime planes — an escape hatch while the isolation path soaks. Shared-desktop backends (KWin, Mutter, wlroots) and managed gamescope sessions keep shared planes either way. |
 
 ## Compositor-specific (Linux)
 

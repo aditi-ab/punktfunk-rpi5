@@ -81,10 +81,6 @@ fn main() {
     }
     println!(
         "RESULT {w}x{h} frames={frames} audio_pkts={audio_pkts} audio_avg_bytes={}",
-        if audio_pkts > 0 {
-            audio_bytes / audio_pkts
-        } else {
-            0
-        }
+        audio_bytes.checked_div(audio_pkts).unwrap_or(0)
     );
 }
