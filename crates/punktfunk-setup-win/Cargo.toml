@@ -1,0 +1,42 @@
+# The Windows installer wizard (design/installer-v2-windows.md D2): the punktfunk-setup
+# engine behind a WinUI 3 (windows-reactor) step frame, shipped self-contained as a single
+# extract-and-run exe. Grown from the S1 spike; the S2 overlay/pack modules land with WP3.1.
+[package]
+name = "punktfunk-setup-win"
+description = "Windows installer wizard: the punktfunk-setup engine behind a WinUI 3 step frame"
+version.workspace = true
+edition.workspace = true
+# Not workspace-inherited (1.85): windows-reactor at the pinned rev declares rust-version
+# 1.95+. rust-toolchain.toml pins 1.96, so this records reality — same note as clients/windows.
+rust-version = "1.96"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+# NOT `punktfunk-setup`: the Linux engine crate already builds a binary of that name, and two
+# same-named bins collide in one workspace target dir on the Windows lanes. The pack step
+# (WP3.1) names the shipped artifact (`punktfunk-host-setup-<ver>.exe`) anyway.
+[[bin]]
+name = "punktfunk-setup-win"
+path = "src/main.rs"
+
+[dependencies]
+punktfunk-setup = { path = "../punktfunk-setup" }
+
+# Same rev as clients/windows — one pin, bumped together in the client's bump PRs (design
+# risk table: reactor pin drift). The workspace lock already carries it via the client.
+[target.'cfg(windows)'.dependencies]
+windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+
+[target.'cfg(windows)'.build-dependencies]
+windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+
+# The headless harness the flow tests drive the whole wizard through — same pair as
+# clients/windows' reactor_semantics suite.
+[target.'cfg(windows)'.dev-dependencies]
+windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc", features = ["test"] }
+test_reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+
+[lints]
+workspace = true

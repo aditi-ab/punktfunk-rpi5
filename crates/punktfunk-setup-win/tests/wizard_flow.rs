@@ -1,0 +1,286 @@
+#![cfg(windows)]
+//! WP2.1's acceptance, headless: the wizard drives a fake executor end-to-end. Same harness
+//! as `clients/windows/tests/reactor_semantics.rs` — reactor's `RecordingBackend` renders
+//! the real component tree and replays events into the real handlers, so these run on the
+//! Windows CI lane with no window and no glass.
+//!
+//! Events are fired by replaying the `AttachEvent` op each control registered, never by
+//! guessing an `Event` variant — what the backend attached is what a user's click reaches.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use punktfunk_setup::platform::windows::demo::win_preset;
+use punktfunk_setup_win::wizard::WizardRoot;
+use test_reactor::{Op, RecordingBackend};
+use windows_reactor::{
+    ChannelDispatcher, Component, ControlId, ControlKind, Dispatcher, DispatcherQueuePriority,
+    Event, PropValue, RenderHost,
+};
+
+type Job = Box<dyn FnOnce()>;
+
+/// The upstream tests' single-threaded "UI thread": jobs queue until drained.
+#[derive(Clone, Default)]
+struct TestDispatcher {
+    queue: Rc<RefCell<Vec<Job>>>,
+}
+
+impl TestDispatcher {
+    fn drain(&self) {
+        loop {
+            let item = {
+                let mut q = self.queue.borrow_mut();
+                if q.is_empty() {
+                    None
+                } else {
+                    Some(q.remove(0))
+                }
+            };
+            match item {
+                Some(f) => f(),
+                None => break,
+            }
+        }
+    }
+}
+
+impl Dispatcher for TestDispatcher {
+    fn enqueue(&self, _p: DispatcherQueuePriority, f: Box<dyn FnOnce()>) -> bool {
+        self.queue.borrow_mut().push(f);
+        true
+    }
+}
+
+struct Wiz {
+    host: RenderHost<RecordingBackend, TestDispatcher>,
+    dispatcher: TestDispatcher,
+    channel: ChannelDispatcher,
+}
+
+impl Wiz {
+    fn open(preset: &str) -> Wiz {
+        let dispatcher = TestDispatcher::default();
+        let channel = ChannelDispatcher::new();
+        // A small per-step latency, not zero: `wait_for_done` polls with settles, and each
+        // settle renders the CURRENT state — instant installs finish whole between two
+        // polls, so the Install page (whose rendered log the tests assert on) would never
+        // paint a single line.
+        let root = WizardRoot::new(win_preset(preset).expect(preset), 25);
+        let host = RenderHost::new(
+            RecordingBackend::new(),
+            Box::new(root) as Box<dyn Component>,
+            dispatcher.clone(),
+        );
+        host.set_marshaller(Some(channel.marshaller()));
+        host.kick();
+        dispatcher.drain();
+        Wiz {
+            host,
+            dispatcher,
+            channel,
+        }
+    }
+
+    /// Marshal cross-thread writes in, run the renders they request.
+    fn settle(&self) {
+        self.channel.drain();
+        self.dispatcher.drain();
+        self.host.kick();
+        self.dispatcher.drain();
+    }
+
+    fn texts(&self) -> Vec<String> {
+        self.host.with_reconciler(|r| {
+            r.backend
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    Op::SetProp {
+                        value: PropValue::Str(s),
+                        ..
+                    } => Some(s.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+    }
+
+    fn has_text(&self, needle: &str) -> bool {
+        self.texts().iter().any(|t| t.contains(needle))
+    }
+
+    /// The most recent control of `kind` whose string prop equals `label`.
+    fn control_with_text(&self, kind: ControlKind, label: &str) -> ControlId {
+        self.host.with_reconciler(|r| {
+            let ops = &r.backend.ops;
+            let id = ops
+                .iter()
+                .rev()
+                .find_map(|op| match op {
+                    Op::SetProp {
+                        id,
+                        value: PropValue::Str(s),
+                        ..
+                    } if s == label => Some(*id),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no control carries the text '{label}'"));
+            assert!(
+                ops.iter().any(
+                    |op| matches!(op, Op::Create { id: c, kind: k } if *c == id && *k == kind)
+                ),
+                "'{label}' is not a {kind:?}"
+            );
+            id
+        })
+    }
+
+    /// Replay the event this control attached — a unit event (a button click).
+    fn click(&self, label: &str) {
+        let id = self.control_with_text(ControlKind::Button, label);
+        let event = self.attached_event(id);
+        self.host.with_reconciler(|r| r.backend.fire(id, event));
+        self.settle();
+    }
+
+    fn attached_event(&self, id: ControlId) -> Event {
+        self.host.with_reconciler(|r| {
+            r.backend
+                .ops
+                .iter()
+                .rev()
+                .find_map(|op| match op {
+                    Op::AttachEvent { id: c, event, .. } if *c == id => Some(*event),
+                    _ => None,
+                })
+                .expect("the control attached an event")
+        })
+    }
+
+    /// The nth control of `kind` ever created (creation order = row order).
+    fn nth(&self, kind: ControlKind, n: usize) -> ControlId {
+        self.host.with_reconciler(|r| {
+            r.backend
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    Op::Create { id, kind: k } if *k == kind => Some(*id),
+                    _ => None,
+                })
+                .nth(n)
+                .unwrap_or_else(|| panic!("no {kind:?} number {n}"))
+        })
+    }
+
+    /// Drive until the Done page's Finish button exists (the install thread finished).
+    fn wait_for_done(&self) {
+        for _ in 0..500 {
+            self.settle();
+            if self.has_text("Finish") {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the install never reached Done; texts: {:?}", self.texts());
+    }
+}
+
+#[test]
+fn the_fresh_host_demo_walks_welcome_to_done_through_the_fake_executor() {
+    let wiz = Wiz::open("win11-fresh");
+    assert!(wiz.has_text("punktfunk"), "the Welcome wordmark");
+    assert!(
+        wiz.has_text("Step 1 of 4"),
+        "no Network step on a private-network box"
+    );
+
+    wiz.click("Continue");
+    assert!(
+        wiz.has_text("Moonlight compat"),
+        "the Configure rows render"
+    );
+    assert!(
+        wiz.has_text("Web console password"),
+        "the fresh-only password row"
+    );
+
+    // Row order is creation order: Driver, Gamepad, HDR, Gamestream — toggle Moonlight on.
+    let gamestream = wiz.nth(ControlKind::ToggleSwitch, 3);
+    let event = wiz.attached_event(gamestream);
+    wiz.host
+        .with_reconciler(|r| r.backend.fire_bool(gamestream, event, true));
+    wiz.settle();
+
+    wiz.click("Install");
+    wiz.wait_for_done();
+
+    // The dim command echo proves the executor ran the RE-DERIVED plan (the toggle above).
+    assert!(
+        wiz.has_text("--gamestream=on"),
+        "the install log carries the re-derived service argv"
+    );
+    assert!(
+        wiz.has_text("Web console password"),
+        "the Done page shows the password card"
+    );
+}
+
+#[test]
+fn the_public_network_demo_walks_the_d12_step_and_answer_b_opens_the_firewall() {
+    let wiz = Wiz::open("win11-public");
+    assert!(
+        wiz.has_text("Step 1 of 5"),
+        "the Network step materializes for a Public network"
+    );
+
+    wiz.click("Continue");
+    assert!(wiz.has_text("Public-network firewall rules"));
+
+    // Configure's go button says Continue, not Install — one more step on this run's path.
+    wiz.click("Continue");
+    assert!(
+        wiz.has_text("'Cafe' is set to Public"),
+        "the step names the network"
+    );
+
+    // Answer (b): keep it Public, open the firewall.
+    let radio = wiz.nth(ControlKind::RadioButtons, 0);
+    let event = wiz.attached_event(radio);
+    wiz.host
+        .with_reconciler(|r| r.backend.fire_i32(radio, event, 1));
+    wiz.settle();
+
+    wiz.click("Install");
+    wiz.wait_for_done();
+    assert!(
+        wiz.has_text("--allow-public-network=on"),
+        "answer (b) provably flips the allowpublicfw plan step"
+    );
+}
+
+#[test]
+fn the_uninstall_demo_tears_down_inside_the_sandbox() {
+    let wiz = Wiz::open("win11-uninstall");
+    assert!(wiz.has_text("This removes punktfunk"));
+    wiz.click("Continue");
+    wiz.wait_for_done();
+    assert!(wiz.has_text("service uninstall"), "the teardown ran");
+    assert!(wiz.has_text("punktfunk was removed"));
+}
+
+#[test]
+fn the_sunshine_demo_shows_the_coexistence_row_and_moves_the_mgmt_port() {
+    let wiz = Wiz::open("win11-sunshine");
+    wiz.click("Continue");
+    assert!(
+        wiz.has_text("Sunshine detected"),
+        "the D11 coexistence row is a visible row, not a dialog"
+    );
+    wiz.click("Install");
+    wiz.wait_for_done();
+    assert!(
+        wiz.has_text("PUNKTFUNK_MGMT_BIND=0.0.0.0:47991"),
+        "the SetEnv step ran"
+    );
+}

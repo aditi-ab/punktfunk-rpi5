@@ -1,0 +1,6 @@
+# The engine crate's seam fence, extended here (implementation plan §0): the wizard spawns
+# nothing itself — every process the installer runs goes through the engine's CommandRunner,
+# and a raw spawn here would silently escape --demo and the harness tests.
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "spawn through seam::CommandRunner (design/installer-v2.md D3) — a raw spawn bypasses --demo and the test fakes" },
+]

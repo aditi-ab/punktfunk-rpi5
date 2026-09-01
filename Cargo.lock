@@ -3752,6 +3752,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "punktfunk-setup-win"
+version = "0.34.0"
+dependencies = [
+ "punktfunk-setup",
+ "test_reactor",
+ "windows-reactor",
+ "windows-reactor-setup",
+]
+
+[[package]]
 name = "punktfunk-tray"
 version = "0.34.0"
 dependencies = [
