@@ -98,11 +98,6 @@ public final class InputCapture {
     /// key held down for the rest of the session.
     private var commandChordVKs: Set<UInt32> = []
 
-    /// Mirrors StreamLayerView's live mouse model — ⌃⌥⇧M flips it mid-session, so it can't be
-    /// read from the settings. The ⌘-chord passthrough stays off under the desktop model, matching
-    /// what the SDL clients' keyboard grab does: a remote desktop is something you ⌘Tab away from,
-    /// not into.
-    public var desktopMouse = false
     #endif
 
     #if !os(macOS)
@@ -369,8 +364,7 @@ public final class InputCapture {
             // every keystroke the app receives — including the ones typed into the host list.
             if self.forwarding, flags.contains(.command), Self.forwardsCommandChord(
                 keyCode: event.keyCode, flags: flags, forwarding: self.forwarding,
-                inhibitShortcuts: SessionSettings.current.inhibitShortcuts,
-                desktopMouse: self.desktopMouse
+                inhibitShortcuts: SessionSettings.current.inhibitShortcuts
             ) {
                 if let vk = Self.keyCodeToVK[event.keyCode] { self.sendCommandChordKey(vk) }
                 return nil
@@ -657,14 +651,19 @@ public final class InputCapture {
     }
 
     /// Does this keyDown get taken off AppKit and forwarded to the host instead? Only while input
-    /// is actually captured, only with the cross-client `inhibit_shortcuts` on, and never under the
-    /// desktop mouse model (where the chords stay local by design) — and never for the client's own
-    /// reserved chords, whatever the setting says.
+    /// is actually captured, only with the cross-client `inhibit_shortcuts` on — and never for the
+    /// client's own reserved chords, whatever the setting says.
+    ///
+    /// The mouse model is NOT a condition, and re-adding it is the trap: `inhibit_shortcuts`
+    /// applies in both models here exactly as it does on the SDL clients, whose keyboard grab
+    /// reads `inhibit` and never `desktop` (`pf-presenter`'s `apply_capture`). A remote desktop
+    /// needs the host's ⌘ chords too, and under the desktop model the unlocked pointer clicking
+    /// another window is the always-available way back.
     static func forwardsCommandChord(
         keyCode: UInt16, flags: NSEvent.ModifierFlags,
-        forwarding: Bool, inhibitShortcuts: Bool, desktopMouse: Bool
+        forwarding: Bool, inhibitShortcuts: Bool
     ) -> Bool {
-        guard forwarding, inhibitShortcuts, !desktopMouse else { return false }
+        guard forwarding, inhibitShortcuts else { return false }
         guard flags.contains(.command) else { return false }
         return !isClientReservedChord(keyCode: keyCode, flags: flags)
     }
@@ -727,14 +726,11 @@ public final class InputCapture {
     /// to synthesize.
     ///
     /// Gating, every event: `forwarding` (capture engaged — and capture releases on any focus loss,
-    /// so this is never true with another app frontmost), `!desktopMouse` (system chords stay local
-    /// under the desktop model, like every other client), `NSApp.isActive` as belt-and-braces.
+    /// so this is never true with another app frontmost) and `NSApp.isActive` as belt-and-braces.
     /// Anything else passes through untouched — a tap that swallows keys for the whole Mac is the
     /// failure mode to design against. Installed on the main run loop on purpose: a hung main thread
     /// trips the tap's timeout and macOS disables it, handing the keyboard back.
     private func installSystemKeyTap() {
-        // `desktopMouse` is NOT an install condition: ⌃⌥⇧M flips it mid-capture, so the callback
-        // reads it per event instead and the tap simply idles under the desktop model.
         guard systemKeyTap == nil, SessionSettings.current.inhibitShortcuts, AXIsProcessTrusted()
         else { return }
         let mask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue)
@@ -785,8 +781,7 @@ public final class InputCapture {
             // monitor but not the first responder (verified in a harness). The key window is the
             // stream window whenever `forwarding` is true (capture releases on resignKey); if there
             // somehow is none, let the key go rather than swallow it into nothing.
-            guard Self.tapClaims(forwarding: forwarding, desktopMouse: desktopMouse,
-                                 appActive: NSApp.isActive),
+            guard Self.tapClaims(forwarding: forwarding, appActive: NSApp.isActive),
                   let windowNumber = NSApp.keyWindow?.windowNumber,
                   let copy = event.copy(), let raw = NSEvent(cgEvent: copy),
                   let stamped = Self.restamp(raw, windowNumber: windowNumber)
@@ -809,11 +804,11 @@ public final class InputCapture {
     }
 
     /// Does the system-shortcut tap take this key off macOS and hand it to the app's own key path?
-    /// Pure, for the tests: only while captured, only under the capture mouse model, only with the
-    /// app frontmost. The `inhibit_shortcuts` setting is checked once at install time (the tap does
-    /// not exist with it off).
-    static func tapClaims(forwarding: Bool, desktopMouse: Bool, appActive: Bool) -> Bool {
-        forwarding && !desktopMouse && appActive
+    /// Pure, for the tests: only while captured, only with the app frontmost. The
+    /// `inhibit_shortcuts` setting is checked once at install time (the tap does not exist with it
+    /// off); the mouse model is not a condition — see `forwardsCommandChord`.
+    static func tapClaims(forwarding: Bool, appActive: Bool) -> Bool {
+        forwarding && appActive
     }
     #endif
 

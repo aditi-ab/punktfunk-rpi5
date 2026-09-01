@@ -83,6 +83,9 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 - **A re-run upgrades a box that already has every package.** The install phase skipped the
   packages entirely when the host, console and plugin runner were all present, so a box carrying
   a broken build could only be cleared by uninstalling first — nothing to do.
+- **`inhibit_shortcuts` applies under the desktop mouse model on the Apple client.** It gated the
+  ⌘-chord passthrough and the system-shortcut tap on the capture model only, unlike the SDL
+  clients; turn the setting off to keep the chords local.
 
 ---
 
