@@ -88,6 +88,11 @@ final class PadControlUIView: UIView {
 
     private static let tick = UIImpactFeedbackGenerator(style: .light)
 
+    /// Half the 1.5 pt stroke. A stroke is centred on its path, and the single discs, the
+    /// D-pad cross and the trigger pill run their paths along the view's own edge — without
+    /// this inset the outer half of the line falls outside the backing store and is clipped.
+    private static let strokeInset: CGFloat = 0.75
+
     init(control: PadControl, scale: CGFloat) {
         self.control = control
         self.scale = scale
@@ -247,7 +252,8 @@ final class PadControlUIView: UIView {
         case .buttons(let discs):
             for d in discs {
                 let r = CGFloat(d.r) * scale
-                let circle = UIBezierPath(ovalIn: CGRect(x: CGFloat(d.cx) * scale - r, y: CGFloat(d.cy) * scale - r, width: 2 * r, height: 2 * r))
+                let circle = UIBezierPath(ovalIn: CGRect(x: CGFloat(d.cx) * scale - r, y: CGFloat(d.cy) * scale - r, width: 2 * r, height: 2 * r)
+                    .insetBy(dx: Self.strokeInset, dy: Self.strokeInset))
                 (held & d.bit != 0 ? fillOn : fill).setFill()
                 circle.fill()
                 edge.setStroke()
@@ -256,11 +262,12 @@ final class PadControlUIView: UIView {
                 glyph(d.glyph, at: CGPoint(x: CGFloat(d.cx) * scale, y: CGFloat(d.cy) * scale), size: r * 0.7)
             }
         case .dpad:
-            let s = min(bounds.width, bounds.height)
+            let inset = Self.strokeInset
+            let s = min(bounds.width, bounds.height) - 2 * inset
             let arm = s * 0.34
-            let c = s / 2
-            let vertical = UIBezierPath(roundedRect: CGRect(x: c - arm / 2, y: 0, width: arm, height: s), cornerRadius: arm / 4)
-            let horizontal = UIBezierPath(roundedRect: CGRect(x: 0, y: c - arm / 2, width: s, height: arm), cornerRadius: arm / 4)
+            let c = min(bounds.width, bounds.height) / 2
+            let vertical = UIBezierPath(roundedRect: CGRect(x: c - arm / 2, y: inset, width: arm, height: s), cornerRadius: arm / 4)
+            let horizontal = UIBezierPath(roundedRect: CGRect(x: inset, y: c - arm / 2, width: s, height: arm), cornerRadius: arm / 4)
             fill.setFill()
             vertical.fill()
             horizontal.fill()
@@ -269,16 +276,16 @@ final class PadControlUIView: UIView {
             horizontal.lineWidth = 1.5
             vertical.stroke()
             horizontal.stroke()
-            let reach = c - arm / 2
+            let reach = c - arm / 2 - inset
             fillOn.setFill()
             if held & GamepadWire.dpadUp != 0 {
-                UIBezierPath(roundedRect: CGRect(x: c - arm / 2, y: 0, width: arm, height: reach), cornerRadius: arm / 4).fill()
+                UIBezierPath(roundedRect: CGRect(x: c - arm / 2, y: inset, width: arm, height: reach), cornerRadius: arm / 4).fill()
             }
             if held & GamepadWire.dpadDown != 0 {
                 UIBezierPath(roundedRect: CGRect(x: c - arm / 2, y: c + arm / 2, width: arm, height: reach), cornerRadius: arm / 4).fill()
             }
             if held & GamepadWire.dpadLeft != 0 {
-                UIBezierPath(roundedRect: CGRect(x: 0, y: c - arm / 2, width: reach, height: arm), cornerRadius: arm / 4).fill()
+                UIBezierPath(roundedRect: CGRect(x: inset, y: c - arm / 2, width: reach, height: arm), cornerRadius: arm / 4).fill()
             }
             if held & GamepadWire.dpadRight != 0 {
                 UIBezierPath(roundedRect: CGRect(x: c + arm / 2, y: c - arm / 2, width: reach, height: arm), cornerRadius: arm / 4).fill()
@@ -296,7 +303,8 @@ final class PadControlUIView: UIView {
             fillOn.setFill()
             UIBezierPath(ovalIn: CGRect(x: c.x + knob.x - k, y: c.y + knob.y - k, width: 2 * k, height: 2 * k)).fill()
         case .trigger(let axis):
-            let pill = UIBezierPath(roundedRect: bounds, cornerRadius: bounds.width / 2)
+            let pillRect = bounds.insetBy(dx: Self.strokeInset, dy: Self.strokeInset)
+            let pill = UIBezierPath(roundedRect: pillRect, cornerRadius: pillRect.width / 2)
             fill.setFill()
             pill.fill()
             if pull > 0, let ctx = UIGraphicsGetCurrentContext() {
