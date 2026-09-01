@@ -5,4 +5,6 @@
 #[cfg(windows)]
 pub mod brand;
 #[cfg(windows)]
+pub mod silent;
+#[cfg(windows)]
 pub mod wizard;

@@ -1,6 +1,25 @@
 //! The legs no process can do: SCM stop-and-wait, `.lnk` writing, the env-change broadcast,
-//! the Appx presence check, real randomness. `cfg(windows)` implementations; everywhere else
-//! an honest error so a cross-OS test that reaches one sees a warning path, never a lie.
+//! the Appx presence check, real randomness, the parent-console attach. `cfg(windows)`
+//! implementations; everywhere else an honest error so a cross-OS test that reaches one
+//! sees a warning path, never a lie.
+
+/// A GUI-subsystem exe launched from a terminal: bind the parent's console and open its
+/// output end. `None` when no parent console exists (the updater's spawn), which is the
+/// common case and simply means no console output. `CONOUT$` rather than `stdout()`: the
+/// std handles were fixed at startup, before the attach.
+#[cfg(windows)]
+pub fn attach_parent_console() -> Option<std::fs::File> {
+    use ::windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    // SAFETY: a plain call with a process-id constant; it binds an already-existing console
+    // or fails, and either way touches no memory of ours.
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS).ok()? };
+    std::fs::OpenOptions::new().write(true).open("CONOUT$").ok()
+}
+
+#[cfg(not(windows))]
+pub fn attach_parent_console() -> Option<std::fs::File> {
+    None
+}
 
 #[cfg(windows)]
 pub fn stop_service_wait(name: &str) -> Result<(), String> {
