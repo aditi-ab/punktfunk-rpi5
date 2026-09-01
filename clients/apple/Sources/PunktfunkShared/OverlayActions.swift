@@ -130,16 +130,42 @@ public func keyLegend(_ k: String) -> String {
     }
 }
 
-/// The virtual controller's preset: `layout` is `full`, `sticks` or `dpad`.
+/// One control's layout override: `x` and `y` place its centre as fractions of the layer's
+/// width and height, `scale` sizes it about that centre, `hidden` takes it out of the stream
+/// (the editor still shows it, ghosted). An absent field keeps the preset's value.
+public struct PadTweak: Equatable, Sendable {
+    public var x: Float?
+    public var y: Float?
+    public var scale: Float?
+    public var hidden: Bool
+
+    public init(x: Float? = nil, y: Float? = nil, scale: Float? = nil, hidden: Bool = false) {
+        self.x = x
+        self.y = y
+        self.scale = scale
+        self.hidden = hidden
+    }
+}
+
+/// The virtual controller: `layout` is `full`, `sticks` or `dpad`; `opacity` and `scale` are
+/// the two sliders. `controls` carries the per-control overrides keyed by control id (`ls`,
+/// `rs`, `dpad`, `face`, `lb`, `rb`, `lt`, `rt`, `select`, `guide`, `start`), `controlsNarrow`
+/// the same for a narrow (upright) layer — the two classes the preset already lays out
+/// differently.
 public struct PadConfig: Equatable, Sendable {
     public var layout = "full"
     public var opacity: Float = 0.45
     public var scale: Float = 1
+    public var controls: [String: PadTweak] = [:]
+    public var controlsNarrow: [String: PadTweak] = [:]
 
-    public init(layout: String = "full", opacity: Float = 0.45, scale: Float = 1) {
+    public init(layout: String = "full", opacity: Float = 0.45, scale: Float = 1,
+                controls: [String: PadTweak] = [:], controlsNarrow: [String: PadTweak] = [:]) {
         self.layout = layout
         self.opacity = opacity
         self.scale = scale
+        self.controls = controls
+        self.controlsNarrow = controlsNarrow
     }
 }
 
@@ -200,16 +226,44 @@ public struct OverlayConfig: Equatable, Sendable {
         if let l = padIn["layout"] as? String, !l.isEmpty { pad.layout = l }
         if let o = padIn["opacity"] as? Double { pad.opacity = Float(o) }
         if let s = padIn["scale"] as? Double { pad.scale = Float(s) }
+        func tweaks(_ key: String) -> [String: PadTweak] {
+            guard let m = padIn[key] as? [String: Any] else { return [:] }
+            var out: [String: PadTweak] = [:]
+            for (id, v) in m {
+                guard let t = v as? [String: Any] else { continue }
+                out[id] = PadTweak(x: (t["x"] as? Double).map(Float.init),
+                                   y: (t["y"] as? Double).map(Float.init),
+                                   scale: (t["scale"] as? Double).map(Float.init),
+                                   hidden: t["hidden"] as? Bool ?? false)
+            }
+            return out
+        }
+        pad.controls = tweaks("controls")
+        pad.controlsNarrow = tweaks("controls_narrow")
         return OverlayConfig(ring: ring, shortcuts: shortcuts, pad: pad)
     }
 
     /// The blob to store — always the current schema version.
     public func toJSON() -> String {
+        // An untouched pad keeps its blob clean: no empty maps, no absent fields as nulls.
+        var padOut: [String: Any] = ["layout": pad.layout, "opacity": Double(pad.opacity), "scale": Double(pad.scale)]
+        func tweaks(_ m: [String: PadTweak]) -> [String: Any] {
+            m.mapValues { t in
+                var o: [String: Any] = [:]
+                if let x = t.x { o["x"] = Double(x) }
+                if let y = t.y { o["y"] = Double(y) }
+                if let s = t.scale { o["scale"] = Double(s) }
+                if t.hidden { o["hidden"] = true }
+                return o
+            }
+        }
+        if !pad.controls.isEmpty { padOut["controls"] = tweaks(pad.controls) }
+        if !pad.controlsNarrow.isEmpty { padOut["controls_narrow"] = tweaks(pad.controlsNarrow) }
         let obj: [String: Any] = [
             "v": Self.schemaVersion,
             "ring": ring.map { $0.map { $0.id as Any } ?? NSNull() },
             "shortcuts": shortcuts.map { ["id": $0.id, "label": $0.label, "keys": $0.keys] },
-            "pad": ["layout": pad.layout, "opacity": Double(pad.opacity), "scale": Double(pad.scale)],
+            "pad": padOut,
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]),
               let text = String(data: data, encoding: .utf8)

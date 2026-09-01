@@ -110,6 +110,9 @@ struct QuickActionsEditor: View {
     @StateObject private var ring = RingState()
     @State private var picking: PickSlot?
     @State private var editingShortcut: ShortcutDraft?
+    #if os(iOS)
+    @State private var editingLayout = false
+    #endif
     /// The backdrop's middle, where the ring opens and re-opens.
     @State private var centre = CGPoint.zero
 
@@ -181,12 +184,15 @@ struct QuickActionsEditor: View {
                           caption: "How large the controls are; larger ones cover more of the picture.") { v in
                     setPad { $0.scale = v }
                 }
+                Button("Edit layout") { editingLayout = true }
             } header: {
                 Text("Virtual controller")
             } footer: {
                 Text("Shown from the ring's Virtual controller button. A finger on one of its controls "
                      + "drives the game; a finger anywhere else drives the touch mode. Layout picks which "
-                     + "controls it shows; fewer controls leave more of the picture uncovered.")
+                     + "controls it shows; fewer controls leave more of the picture uncovered. "
+                     + "Edit layout moves, sizes or hides each control by hand; wide and upright screens "
+                     + "keep separate layouts.")
             }
             #endif
             Section {
@@ -262,6 +268,14 @@ struct QuickActionsEditor: View {
                 .frame(width: 460, height: 600)
                 #endif
         }
+        #if os(iOS)
+        // Full screen deliberately, not a sheet: settings live in a sheet, and on an iPad a
+        // sheet is a card — its geometry (and even the wide/narrow layout class) would lie
+        // about the stream the layout is for.
+        .fullScreenCover(isPresented: $editingLayout) {
+            PadLayoutEditor(pad: cfg.pad) { p in setPad { $0 = p } }
+        }
+        #endif
     }
 
     /// The ring's commands with nothing behind them: the editor shows, it never fires (§3.3).

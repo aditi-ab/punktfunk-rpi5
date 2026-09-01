@@ -21,9 +21,10 @@ struct VirtualPadLayer: View {
         GeometryReader { geo in
             let scale = CGFloat(min(max(config.scale, VirtualPad.scaleRange.lowerBound), VirtualPad.scaleRange.upperBound))
             let opacity = CGFloat(min(max(config.opacity, VirtualPad.opacityRange.lowerBound), 1))
-            let controls = padControls(layout: config.layout,
+            let controls = padControls(pad: config,
                                        w: Float(geo.size.width / scale), h: Float(geo.size.height / scale))
-            ForEach(controls, id: \.label) { c in
+                .filter { !$0.hidden }
+            ForEach(controls, id: \.id) { c in
                 PadControlHost(control: c, scale: scale, opacity: opacity, wire: wire)
                     .frame(width: CGFloat(c.rect.w) * scale, height: CGFloat(c.rect.h) * scale)
                     .position(x: (CGFloat(c.rect.x) + CGFloat(c.rect.w) / 2) * scale,
@@ -35,19 +36,25 @@ struct VirtualPadLayer: View {
     }
 }
 
-private struct PadControlHost: UIViewRepresentable {
+/// One control as the stream draws it. The layout editor mounts the same view with no wire and
+/// `interactive: false`, so its own SwiftUI drag can own the fingers over identical pixels.
+struct PadControlHost: UIViewRepresentable {
     let control: PadControl
     let scale: CGFloat
     let opacity: CGFloat
-    let wire: VirtualPadWire
+    let wire: VirtualPadWire?
+    var interactive = true
 
     func makeUIView(context: Context) -> PadControlUIView {
         PadControlUIView(control: control, scale: scale)
     }
 
     func updateUIView(_ view: PadControlUIView, context: Context) {
+        view.control = control
+        view.scale = scale
         view.wire = wire
         view.baseAlpha = opacity
+        view.isUserInteractionEnabled = interactive
         view.refresh()
     }
 }
@@ -60,8 +67,9 @@ private let edge = UIColor(white: 1, alpha: 0.75)
 /// set of bits (the union over every finger, sent on change); a stick and a trigger are owned by
 /// their first finger.
 final class PadControlUIView: UIView {
-    private let control: PadControl
-    private let scale: CGFloat
+    /// Refreshed by `updateUIView`: a tweak resizes a control mid-life without remaking it.
+    var control: PadControl
+    var scale: CGFloat
     var wire: VirtualPadWire?
     var baseAlpha: CGFloat = 0.45
 
@@ -193,7 +201,7 @@ final class PadControlUIView: UIView {
             return best
         case .dpad:
             let c = bounds.width / 2
-            return dpadBits(dx: Float(p.x - c), dy: Float(p.y - c), dead: VirtualPad.dpadDead * Float(scale))
+            return dpadBits(dx: Float(p.x - c), dy: Float(p.y - c), dead: VirtualPad.dpadDead * Float(scale) * control.sc)
         case .stick, .trigger:
             return 0
         }
@@ -214,8 +222,8 @@ final class PadControlUIView: UIView {
 
     private func emitStick(_ d: CGPoint) {
         guard case .stick(let axisX, let axisY) = control.kind else { return }
-        let radius = CGFloat(VirtualPad.stickRadius) * scale
-        let (x, y) = stickWire(dx: Float(d.x), dy: Float(d.y), radius: Float(radius), dead: VirtualPad.stickDead * Float(scale))
+        let radius = CGFloat(VirtualPad.stickRadius) * scale * CGFloat(control.sc)
+        let (x, y) = stickWire(dx: Float(d.x), dy: Float(d.y), radius: Float(radius), dead: VirtualPad.stickDead * Float(scale) * control.sc)
         if x != lastX { wire?.axis(axisX, value: x); lastX = x }
         if y != lastY { wire?.axis(axisY, value: y); lastY = y }
         knob = CGPoint(x: CGFloat(x) / 32767 * radius, y: -CGFloat(y) / 32767 * radius)
@@ -277,14 +285,14 @@ final class PadControlUIView: UIView {
             }
         case .stick:
             let c = CGPoint(x: bounds.midX, y: bounds.midY)
-            let r = CGFloat(VirtualPad.stickRadius) * scale
+            let r = CGFloat(VirtualPad.stickRadius) * scale * CGFloat(control.sc)
             let base = UIBezierPath(ovalIn: CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r))
             UIColor(white: 1, alpha: 0.12).setFill()
             base.fill()
             edge.setStroke()
             base.lineWidth = 1.5
             base.stroke()
-            let k = CGFloat(VirtualPad.stickKnobRadius) * scale
+            let k = CGFloat(VirtualPad.stickKnobRadius) * scale * CGFloat(control.sc)
             fillOn.setFill()
             UIBezierPath(ovalIn: CGRect(x: c.x + knob.x - k, y: c.y + knob.y - k, width: 2 * k, height: 2 * k)).fill()
         case .trigger(let axis):
@@ -301,7 +309,7 @@ final class PadControlUIView: UIView {
             edge.setStroke()
             pill.lineWidth = 1.5
             pill.stroke()
-            glyph(axis == GamepadWire.axisLT ? "LT" : "RT", at: CGPoint(x: bounds.midX, y: bounds.midY), size: 15 * scale)
+            glyph(axis == GamepadWire.axisLT ? "LT" : "RT", at: CGPoint(x: bounds.midX, y: bounds.midY), size: 15 * scale * CGFloat(control.sc))
         }
     }
 
