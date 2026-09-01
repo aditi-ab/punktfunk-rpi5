@@ -841,7 +841,12 @@ fn install_page(ctx: &Ctx, log: &[LogLine]) -> Element {
         children.push(
             hstack((
                 ProgressRing::indeterminate().width(18.0).height(18.0),
-                text_block("Installing…").foreground(ThemeRef::SecondaryText),
+                text_block(if ctx.uninstall {
+                    "Removing…"
+                } else {
+                    "Installing…"
+                })
+                .foreground(ThemeRef::SecondaryText),
             ))
             .spacing(8.0)
             .into(),
