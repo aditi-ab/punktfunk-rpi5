@@ -137,6 +137,22 @@ pub fn parse_verified(bytes: &[u8], expected_channel: &str) -> Result<Manifest> 
         if w.sha256.len() != 64 || !w.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("windows_host.sha256 is not a hex SHA-256");
         }
+        if w.authenticode_sha256
+            .iter()
+            .any(|pin| pin.len() != 64 || !pin.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            bail!("windows_host.authenticode_sha256 contains an invalid pin");
+        }
+        if w.authenticode_subject.len() > 256
+            || w.authenticode_subject.chars().any(char::is_control)
+        {
+            bail!("windows_host.authenticode_subject is invalid");
+        }
+        if expected_channel == "stable"
+            && (w.authenticode_sha256.is_empty() || w.authenticode_subject.is_empty())
+        {
+            bail!("stable windows_host requires an Authenticode leaf pin and subject");
+        }
     }
     Ok(m)
 }
@@ -243,10 +259,27 @@ mod tests {
         let mut v = doc();
         v["windows_host"]["url"] = serde_json::json!("http://git.unom.io/x.exe");
         assert!(parse_verified(&bytes(&v), "stable").is_err());
+        let mut v = doc();
+        v["windows_host"]["authenticode_sha256"] = serde_json::json!(["nothex"]);
+        assert!(parse_verified(&bytes(&v), "stable").is_err());
+        let mut v = doc();
+        v["windows_host"]["authenticode_subject"] = serde_json::json!("bad\nsubject");
+        assert!(parse_verified(&bytes(&v), "stable").is_err());
         // No windows leg at all is fine (PM channels don't need it).
         let mut v = doc();
         v.as_object_mut().unwrap().remove("windows_host");
         assert!(parse_verified(&bytes(&v), "stable").is_ok());
+    }
+
+    #[test]
+    fn stable_windows_asset_requires_both_publisher_bindings() {
+        for field in ["authenticode_sha256", "authenticode_subject"] {
+            let mut v = doc();
+            v["windows_host"].as_object_mut().unwrap().remove(field);
+            assert!(parse_verified(&bytes(&v), "stable").is_err());
+            v["channel"] = serde_json::json!("canary");
+            assert!(parse_verified(&bytes(&v), "canary").is_ok());
+        }
     }
 
     #[test]

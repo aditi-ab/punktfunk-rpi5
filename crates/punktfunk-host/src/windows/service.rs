@@ -1897,13 +1897,8 @@ fn maybe_boot_loop_rollback(restarts: u32, attempted: &mut bool) {
         );
         return;
     };
-    // Validity-only Authenticode check — and validity is ALL it proves: that the file carries a
-    // cryptographically intact signature, not whose. The subject-binding lane now exists
-    // (`authenticode_subject`, security-review 2026-08-31 H-3) but is driven by the MANIFEST of
-    // the release being downloaded; this rollback path has only the cached file and the intent
-    // record, which carries no subject. What actually binds these bytes is the SHA-256 in the
-    // Ed25519-signed manifest, checked when this installer was downloaded, plus the config-dir
-    // DACL (Users read-only, no create) that keeps `updates\` un-plantable by a local user.
+    // The cached file was hash/publisher-verified when downloaded and is protected by the config
+    // DACL. With no manifest here, this re-check can prove only signature integrity.
     if let Err(e) = crate::update::windows::verify_authenticode(&previous, &[], None) {
         tracing::error!(
             installer = %previous.display(),

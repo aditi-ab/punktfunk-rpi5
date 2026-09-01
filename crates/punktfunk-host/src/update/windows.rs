@@ -1,33 +1,13 @@
-//! The Windows apply leg (design §6, plan U1.2/U1.3): download the manifest's immutable
-//! per-version installer, verify it (manifest SHA-256, then Authenticode), persist the intent
-//! record, and spawn the installer detached — which stops the service and thereby kills this
-//! process *by design*; boot-time reconciliation (`jobs::reconcile`) closes the loop.
+//! Windows update apply: download the immutable installer, verify it, persist intent and spawn it
+//! outside the service's kill-on-close job. Boot reconciliation records the outcome.
 //!
-//! Verification order and rules:
-//! 1. **SHA-256 == the signed manifest's** — the primary integrity gate (the manifest is the
-//!    Ed25519-verified document; this check makes the downloaded bytes those exact bytes).
-//! 2. **Authenticode**: when the manifest names the publisher (`authenticode_subject`, the
-//!    stable channel's shape), the signature must verify against a TRUSTED root (`S_OK` — no
-//!    untrusted-root tolerance) and the signing certificate's subject must equal that value.
-//!    Without a subject (canary/local builds, still self-signed) the signature must be
-//!    cryptographically valid, tolerating `CERT_E_UNTRUSTEDROOT`; when the manifest carries
-//!    leaf pins, the signing leaf's SHA-256 must additionally match one. The leaf is taken
-//!    from the SAME `WinVerifyTrust` state (`WTHelperGetProvSignerFromChain`), never a second
-//!    parse — no verify-vs-inspect gap.
+//! The Ed25519-signed manifest binds the file SHA-256. Stable releases additionally require the
+//! per-artifact signing-leaf pin, a trusted Authenticode chain and the expected publisher subject;
+//! old schema-1 clients already enforce the leaf pin. Canary/local builds may use a self-signed
+//! certificate, but still require a valid signature and any pins the manifest supplies.
 //!
-//!    **Leaf pinning cannot be used with Azure Artifact Signing.** That service mints a fresh leaf
-//!    per signing request, valid ~3 days, so an `AUTHENTICODE_SHA256` pin would go stale within days
-//!    of publishing and reject every subsequent release. The certificate SUBJECT is the property
-//!    that stays stable across that rotation, which is exactly what `authenticode_subject` binds —
-//!    combined with the trusted-chain requirement it stops a replaced, attacker-self-signed
-//!    installer from riding a legitimately signed manifest (security-review 2026-08-31 H-3; the
-//!    manifest hash alone authenticated only "whatever the release URL served when the announce
-//!    job ran").
-//!
-//! The spawn uses `CREATE_BREAKAWAY_FROM_JOB`: the service worker's job object is kill-on-close
-//! (a stopping service would otherwise take the installer down with it) and was created
-//! breakaway-ok for exactly this shape (`windows/service.rs`). Failure to break away is a hard,
-//! reported error (plan R3), never a silent fallback.
+//! Signer information comes from the same `WinVerifyTrust` state used for verification. No second
+//! file parse can inspect different bytes.
 
 #![cfg(target_os = "windows")]
 
