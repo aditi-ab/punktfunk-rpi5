@@ -11,6 +11,9 @@
 //! Design of record: `design/installer-v2-windows.md` §3 (facts), D11 (coexistence), D12
 //! (network step) in the planning repo.
 
+pub mod args;
+pub mod choices;
+
 use serde::{Deserialize, Serialize};
 
 use crate::seam::{BasePaths, CommandRunner, Env};
