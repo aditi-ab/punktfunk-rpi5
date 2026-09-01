@@ -46,6 +46,8 @@ static MUTEX: AtomicUsize = AtomicUsize::new(0);
 /// `handle` must be valid and must not be used or closed after this call.
 unsafe fn close_handle(handle: HANDLE) {
     windows::core::link!("kernel32.dll" "system" fn CloseHandle(hobject: HANDLE) -> windows::core::BOOL);
+    // SAFETY: the caller's contract makes `handle` a live, process-owned handle that no one
+    // uses or closes again.
     let _ = unsafe { CloseHandle(handle) };
 }
 
@@ -173,7 +175,7 @@ pub(crate) fn install_receiver() {
 /// An odd byte count is truncated in the middle of a code unit and is rejected. Complete native-
 /// endian units retain the existing lossy handling of malformed surrogate pairs.
 fn decode_utf16_payload(payload: &[u8]) -> Option<String> {
-    if payload.len() % size_of::<u16>() != 0 {
+    if !payload.len().is_multiple_of(size_of::<u16>()) {
         return None;
     }
     let wide = payload
