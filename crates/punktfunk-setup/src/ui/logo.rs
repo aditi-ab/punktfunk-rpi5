@@ -50,7 +50,9 @@ pub enum Intro {
 /// D7's skip ladder. `--yes` keeps the mark but never animates: an unattended run has nobody
 /// watching, and its transcript should not carry 15 repaints.
 pub fn intro_level(caps: &Caps, yes: bool) -> Intro {
-    if !caps.tty || caps.colors < Colors::Ansi256 || caps.width < MARK_COLS {
+    // +2 for the indent the mark is drawn at: a terminal exactly as wide as the mark would
+    // wrap its last two columns, and a wrapped line breaks the frame's repaint arithmetic.
+    if !caps.tty || caps.colors < Colors::Ansi256 || caps.width < MARK_COLS + 2 {
         return Intro::Plain;
     }
     if yes {

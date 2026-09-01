@@ -198,6 +198,81 @@ fn the_mark_mutes_the_half_that_is_not_being_installed() {
     );
 }
 
+/// Visible columns, ignoring the escape sequences.
+fn columns(line: &str) -> usize {
+    let mut cols = 0;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            cols += 1;
+        }
+    }
+    cols
+}
+
+/// A line wider than the terminal wraps, and a wrapped line makes `clear_last_lines` rewind
+/// fewer rows than the frame drew — so every keystroke leaves another stripe behind.
+#[test]
+fn no_frame_line_is_wider_than_the_terminal() {
+    for width in [30u16, 40, 60, 80, 120] {
+        let caps = Caps {
+            tty: true,
+            colors: Colors::Truecolor,
+            width,
+        };
+        let facts = demo::preset("bazzite-couch").expect("preset");
+        let choices = Choices::derive(&facts, &Pins::default());
+        let mut screen = Screen::new(facts, choices);
+        let mut term = ScriptedTerm::new(&[Key::Enter]);
+        term.width = width;
+        {
+            let tui = Tui::new(&mut term as &mut dyn Terminal, caps, 0);
+            tui.settings(&mut screen, 0);
+        }
+        for line in term.screen().lines() {
+            assert!(
+                columns(line) <= usize::from(width),
+                "at width {width} a line ran to {} columns: {line:?}",
+                columns(line)
+            );
+        }
+    }
+}
+
+/// Editing a row used to leave a collapsed answer line behind, so opening the same editor
+/// twice pushed the screen down twice. The row already shows the answer.
+#[test]
+fn repeated_edits_do_not_pile_up_lines() {
+    let once = drive(
+        "arch-fresh",
+        &[Key::Down, Key::Enter, Key::Enter, Key::Char('q')],
+    )
+    .0;
+    let twice = drive(
+        "arch-fresh",
+        &[
+            Key::Down,
+            Key::Enter,
+            Key::Enter,
+            Key::Enter,
+            Key::Enter,
+            Key::Char('q'),
+        ],
+    )
+    .0;
+    assert_eq!(
+        once.lines().count(),
+        twice.lines().count(),
+        "a second edit left an extra line on screen"
+    );
+}
+
 #[test]
 fn q_cancels_without_running_anything() {
     let (_, step, _) = drive("arch-fresh", &[Key::Char('q')]);

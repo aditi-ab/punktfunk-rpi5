@@ -77,6 +77,69 @@ impl<'a> Tui<'a> {
         self.dim(BAR)
     }
 
+    /// Cut every line to the terminal's width, counting printable columns only.
+    ///
+    /// This is what keeps the repaint honest. A frame is rewound with `clear_last_lines`, which
+    /// counts *physical* rows, while the frame knows only how many lines it wrote — so one line
+    /// wider than the terminal wraps, the rewind comes up short, and the leftovers pile up on
+    /// every keystroke. Truncating makes the two counts the same number by construction.
+    fn fit(&self, text: &str) -> String {
+        let width = usize::from(self.caps.width).max(20);
+        let mut out = String::new();
+        for line in text.lines() {
+            let mut cols = 0usize;
+            let mut cut = false;
+            let mut chars = line.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    out.push(c);
+                    for c in chars.by_ref() {
+                        out.push(c);
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if cols == width {
+                    cut = true;
+                    break;
+                }
+                out.push(c);
+                cols += 1;
+            }
+            if cut {
+                out.push_str(&self.caps.reset());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Word-wrap prose to the terminal, leaving room for the gutter.
+    ///
+    /// Row values are truncated instead — they are a column, and a wrapped one stops lining up.
+    /// A why-text is a sentence, and half a sentence about what a permission grants is worse
+    /// than no sentence at all.
+    fn wrap(&self, text: &str) -> Vec<String> {
+        let width = usize::from(self.caps.width).saturating_sub(3).max(24);
+        let mut lines = Vec::new();
+        let mut cur = String::new();
+        for word in text.split_whitespace() {
+            if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > width {
+                lines.push(std::mem::take(&mut cur));
+            }
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+        }
+        if !cur.is_empty() {
+            lines.push(cur);
+        }
+        lines
+    }
+
     /// Can this terminal draw the mark at all?
     fn marked(&self) -> bool {
         logo::intro_level(&self.caps, false) != Intro::Plain
@@ -116,6 +179,7 @@ impl<'a> Tui<'a> {
             if drawn > 0 {
                 self.term.borrow_mut().clear_last_lines(drawn);
             }
+            let frame = self.fit(&frame);
             drawn = frame.lines().count();
             self.write(&frame);
 
@@ -149,7 +213,9 @@ impl<'a> Tui<'a> {
     fn frame(&self, screen: &Screen) -> String {
         let mut out = String::new();
         let bar = self.bar();
-        let rule = self.dim(&"─".repeat(58));
+        // The rule is decoration, so it yields to the terminal rather than forcing a wrap.
+        let rule_cols = usize::from(self.caps.width).saturating_sub(6).min(58);
+        let rule = self.dim(&"─".repeat(rule_cols));
         // The mark is part of the frame, not a one-off banner, so muting follows the Components
         // row live: pick Client and the host circle greys out under the cursor.
         if self.marked() {
@@ -267,7 +333,14 @@ impl<'a> Tui<'a> {
             let mut frame = String::new();
             let bar = self.bar();
             frame.push_str(&format!("{bar}\n"));
-            frame.push_str(&format!("{}  {}\n", self.accent(STEP_ACTIVE), prompt));
+            for (i, text) in self.wrap(prompt).iter().enumerate() {
+                let lead = if i == 0 {
+                    self.accent(STEP_ACTIVE)
+                } else {
+                    bar.clone()
+                };
+                frame.push_str(&format!("{lead}  {text}\n"));
+            }
             for (index, option) in options.iter().enumerate() {
                 let (glyph, text) = if index == cursor {
                     (self.accent(RADIO_ON), self.highlight(option))
@@ -280,6 +353,7 @@ impl<'a> Tui<'a> {
             if drawn > 0 {
                 self.term.borrow_mut().clear_last_lines(drawn);
             }
+            let frame = self.fit(&frame);
             drawn = frame.lines().count();
             self.write(&frame);
 
@@ -292,13 +366,10 @@ impl<'a> Tui<'a> {
                 }
                 Key::Down | Key::Char('j') => cursor = (cursor + 1) % options.len(),
                 Key::Enter | Key::Space => {
-                    // Leave the answer on screen as one collapsed line, clack-style.
+                    // No collapsed transcript line. A sequential wizard leaves one because the
+                    // answer would otherwise scroll away; here the row it belongs to is right
+                    // there in the frame below, so a second copy only piles up with each edit.
                     self.term.borrow_mut().clear_last_lines(drawn);
-                    self.write(&format!(
-                        "{}  {}\n",
-                        self.dim(STEP_DONE),
-                        self.dim(&format!("{prompt} → {}", options[cursor]))
-                    ));
                     return Some(cursor);
                 }
                 Key::Cancel | Key::Char('q') => {
