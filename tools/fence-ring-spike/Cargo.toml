@@ -1,0 +1,27 @@
+# S2 spike (vdisplay-disturbance-immunity plan §4): can a sealed texture ring plus two shared
+# D3D11 fences replace the per-slot keyed mutex between the host and a producer process? Run on
+# both vendors before WP7 commits to the CAS/fence transport.
+[package]
+name = "fence-ring-spike"
+description = "S2 spike: cross-process CAS/fence frame ring experiment (vdisplay stall-immunity plan)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true
