@@ -158,6 +158,25 @@ impl Wiz {
         })
     }
 
+    /// The stepper's dots (WP2.1b): every step of this run's path is one ellipse.
+    fn dots(&self) -> usize {
+        self.host.with_reconciler(|r| {
+            r.backend
+                .ops
+                .iter()
+                .filter(|op| {
+                    matches!(
+                        op,
+                        Op::Create {
+                            kind: ControlKind::Ellipse,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        })
+    }
+
     /// The nth control of `kind` ever created (creation order = row order).
     fn nth(&self, kind: ControlKind, n: usize) -> ControlId {
         self.host.with_reconciler(|r| {
@@ -190,9 +209,10 @@ impl Wiz {
 fn the_fresh_host_demo_walks_welcome_to_done_through_the_fake_executor() {
     let wiz = Wiz::open("win11-fresh");
     assert!(wiz.has_text("punktfunk"), "the Welcome wordmark");
+    assert_eq!(wiz.dots(), 4, "four dots on a private-network box");
     assert!(
-        wiz.has_text("Step 1 of 4"),
-        "no Network step on a private-network box"
+        !wiz.has_text("Network"),
+        "no ghost Network dot on a private-network box"
     );
 
     wiz.click("Continue");
@@ -229,10 +249,12 @@ fn the_fresh_host_demo_walks_welcome_to_done_through_the_fake_executor() {
 #[test]
 fn the_public_network_demo_walks_the_d12_step_and_answer_b_opens_the_firewall() {
     let wiz = Wiz::open("win11-public");
-    assert!(
-        wiz.has_text("Step 1 of 5"),
-        "the Network step materializes for a Public network"
+    assert_eq!(
+        wiz.dots(),
+        5,
+        "the Network dot materializes for a Public network"
     );
+    assert!(wiz.has_text("Network"), "the stepper labels the extra dot");
 
     wiz.click("Continue");
     assert!(wiz.has_text("Public-network firewall rules"));

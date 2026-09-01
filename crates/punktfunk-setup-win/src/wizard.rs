@@ -10,8 +10,13 @@
 //! The install page is a `Reporter`: the executor runs on a worker thread and every
 //! `say`/`plus`/`ok`/`warn` lands as a line of root state — the same dim-command-echo
 //! transparency contract as the TUI, phase checklist included.
+//!
+//! WP2.1b: the stepper draws `run_steps()` — this run's real path, never a ghost Network
+//! dot — and each navigation slides the page in directionally via the client shell's manual
+//! tween (a worker stepping root state under a generation guard); animations off ⇒ a cut.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use punktfunk_setup::platform::windows::choices::NetworkAnswer;
 use punktfunk_setup::platform::windows::demo::{sandbox_app_dir, WinDemoRunner, WinPreset};
@@ -26,6 +31,46 @@ use crate::brand;
 
 /// Long enough that a demo step reads as work happening — the Linux demo's value.
 const DEMO_LATENCY_MS: u64 = 140;
+
+/// 14 × 16 ms ≈ 220 ms: over before a fast clicker's next click lands (the generation guard
+/// cuts a superseded tween regardless).
+const SLIDE_FRAMES: u32 = 14;
+const SLIDE_TRAVEL: f64 = 36.0;
+
+/// Upcoming dots and the line ahead: a translucent grey that reads on both themes — shapes
+/// take a `Color`, not a `ThemeRef`.
+const MUTED: Color = Color {
+    a: 0x66,
+    r: 0x80,
+    g: 0x80,
+    b: 0x80,
+};
+
+/// Where the wizard stands and which way it got there (D9: Continue enters from the right,
+/// Back from the left). The install thread's jump to Done is a forward move.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Nav {
+    pub step: WizStep,
+    pub forward: bool,
+}
+
+/// The page's slide-in: 0 just after a navigation (off to the side, transparent) → 1 settled.
+#[derive(Clone, Copy, PartialEq)]
+struct Slide {
+    progress: f64,
+    forward: bool,
+}
+
+/// `UISettings.AnimationsEnabled`, the system "show animations" switch: off ⇒ every slide is
+/// a cut (D9). Read once — the setting does not change mid-install.
+fn animations_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        windows::UI::ViewManagement::UISettings::new()
+            .and_then(|s| s.AnimationsEnabled())
+            .unwrap_or(true)
+    })
+}
 
 #[derive(Clone, PartialEq)]
 pub enum LineKind {
@@ -139,8 +184,9 @@ struct Ctx {
     screen: WinScreen,
     install: InstallPhase,
     latency_ms: u64,
+    slide: Slide,
     set_screen: AsyncSetState<WinScreen>,
-    set_step: AsyncSetState<WizStep>,
+    set_step: AsyncSetState<Nav>,
     set_install: AsyncSetState<InstallPhase>,
     set_log: AsyncSetState<Vec<LogLine>>,
 }
@@ -175,29 +221,63 @@ impl WizardRoot {
 impl Component for WizardRoot {
     fn render(&self, _props: &(), cx: &mut RenderCx) -> Element {
         let (screen, set_screen) = cx.use_async_state(self.initial.clone());
-        let (step, set_step) = cx.use_async_state(WizStep::Welcome);
+        let start = Nav {
+            step: WizStep::Welcome,
+            forward: true,
+        };
+        let (nav, set_step) = cx.use_async_state(start);
         let (install, set_install) = cx.use_async_state(InstallPhase::Idle);
         let (log, set_log) = cx.use_async_state(Vec::<LogLine>::new());
+
+        // The slide is a manual tween (the client shell's): reactor's one-shot animations run
+        // from the visual's CURRENT value, and a freshly mounted page has nothing to fade from.
+        // A worker steps 0 → 1 after each navigation; the generation guard stops a superseded
+        // one so rapid clicks never fight. A value for another `Nav` reads as 0: no flash.
+        let generation = cx.use_ref(Arc::new(AtomicU64::new(0)));
+        let (anim, set_anim) = cx.use_async_state((start, 0.0f64));
+        cx.use_effect(nav, {
+            let (set_anim, generation) = (set_anim.clone(), generation.borrow().clone());
+            move || {
+                let mine = generation.fetch_add(1, SeqCst) + 1;
+                if !animations_enabled() {
+                    set_anim.call((nav, 1.0));
+                    return;
+                }
+                std::thread::spawn(move || {
+                    for i in 0..=SLIDE_FRAMES {
+                        if generation.load(SeqCst) != mine {
+                            return;
+                        }
+                        let p = f64::from(i) / f64::from(SLIDE_FRAMES);
+                        set_anim.call((nav, 1.0 - (1.0 - p).powi(3))); // ease-out cubic
+                        std::thread::sleep(std::time::Duration::from_millis(16));
+                    }
+                });
+            }
+        });
+        let progress = if anim.0 == nav { anim.1 } else { 0.0 };
 
         let ctx = Ctx {
             preset: self.preset.clone(),
             screen: screen.clone(),
             install,
             latency_ms: self.latency_ms,
+            slide: Slide {
+                progress,
+                forward: nav.forward,
+            },
             set_screen,
             set_step,
             set_install,
             set_log,
         };
-        let steps = run_steps(&ctx.preset, &ctx.screen);
-        let pos = steps.iter().position(|s| *s == step).unwrap_or(0);
 
-        match step {
-            WizStep::Welcome => welcome_page(&ctx, pos, steps.len()),
-            WizStep::Configure => configure_page(&ctx, pos, steps.len()),
-            WizStep::Network => network_page(&ctx, pos, steps.len()),
-            WizStep::Install => install_page(&ctx, &log, pos, steps.len()),
-            WizStep::Done => done_page(&ctx, pos, steps.len()),
+        match nav.step {
+            WizStep::Welcome => welcome_page(&ctx),
+            WizStep::Configure => configure_page(&ctx),
+            WizStep::Network => network_page(&ctx),
+            WizStep::Install => install_page(&ctx, &log),
+            WizStep::Done => done_page(&ctx),
         }
     }
 }
@@ -240,7 +320,10 @@ fn advance(ctx: &Ctx, cur: WizStep) {
         }
         start_install(ctx);
     }
-    ctx.set_step.call(next);
+    ctx.set_step.call(Nav {
+        step: next,
+        forward: true,
+    });
 }
 
 fn back(ctx: &Ctx, cur: WizStep) {
@@ -248,7 +331,10 @@ fn back(ctx: &Ctx, cur: WizStep) {
     if let Some(i) = steps.iter().position(|s| *s == cur)
         && i > 0
     {
-        ctx.set_step.call(steps[i - 1]);
+        ctx.set_step.call(Nav {
+            step: steps[i - 1],
+            forward: false,
+        });
     }
 }
 
@@ -307,7 +393,10 @@ fn start_install(ctx: &Ctx) {
         match exec.execute(&built) {
             Ok(()) => {
                 set_install.call(InstallPhase::Finished);
-                set_step.call(WizStep::Done);
+                set_step.call(Nav {
+                    step: WizStep::Done,
+                    forward: true,
+                });
             }
             Err(failed) => {
                 ui.die(&failed.0);
@@ -338,29 +427,88 @@ fn card(child: impl Into<Element>) -> Border {
         .padding(edges(16.0, 10.0, 16.0, 10.0))
 }
 
-/// Header · content · button bar. The dots-and-line stepper replaces the plain step counter
-/// with WP2.1b; the counter already honours the materialize rule (it counts this run's path).
-fn frame(
-    step: WizStep,
-    pos: usize,
-    total: usize,
-    content: Element,
-    buttons: Vec<Element>,
-) -> Element {
-    let head = vstack((
-        text_block(step.title()).font_size(24.0).semibold(),
-        text_block(format!("Step {} of {total}", pos + 1))
-            .font_size(12.0)
-            .foreground(ThemeRef::SecondaryText),
-    ))
-    .spacing(2.0)
-    .margin(edges(0.0, 0.0, 0.0, 12.0));
+/// The D9 stepper: dots joined by a line, filled through the current step in brand violet,
+/// hollow ahead. `steps` is this run's real path, so a preset that never triggers the Network
+/// step never shows its dot.
+fn stepper(steps: &[WizStep], pos: usize) -> Element {
+    const DOT: f64 = 12.0;
+    let mut children: Vec<Element> = Vec::new();
+    let mut columns: Vec<GridLength> = Vec::new();
+    for (i, step) in steps.iter().enumerate() {
+        if i > 0 {
+            // The segment INTO step i: lit once the user stands on or past it.
+            let lit = i <= pos;
+            children.push(
+                Shape::rectangle()
+                    .fill(if lit { brand::VIOLET } else { MUTED })
+                    .height(2.0)
+                    .vertical_alignment(VerticalAlignment::Top)
+                    .margin(edges(6.0, DOT / 2.0 - 1.0, 6.0, 0.0))
+                    .grid_column(columns.len() as i32)
+                    .into(),
+            );
+            columns.push(GridLength::Star(1.0));
+        }
+        let dot = if i <= pos {
+            Shape::ellipse().fill(brand::VIOLET)
+        } else {
+            Shape::ellipse().stroke(MUTED).stroke_thickness(1.5)
+        };
+        let label = text_block(step.title()).font_size(11.0);
+        let label = if i == pos {
+            label.semibold()
+        } else {
+            label.foreground(ThemeRef::SecondaryText)
+        };
+        children.push(
+            vstack((
+                dot.width(DOT)
+                    .height(DOT)
+                    .horizontal_alignment(HorizontalAlignment::Center),
+                label.horizontal_alignment(HorizontalAlignment::Center),
+            ))
+            .spacing(4.0)
+            .grid_column(columns.len() as i32)
+            .into(),
+        );
+        columns.push(GridLength::Auto);
+    }
+    grid(children).columns(columns).into()
+}
+
+/// The incoming page's offset at `progress`: forward starts to the right and travels left,
+/// back the mirror. Opposite margins keep the width constant, so nothing reflows mid-tween.
+pub fn slide_margin(forward: bool, progress: f64) -> Thickness {
+    let off = (1.0 - progress) * SLIDE_TRAVEL;
+    let (left, right) = if forward { (off, -off) } else { (-off, off) };
+    edges(left, 0.0, right, 0.0)
+}
+
+/// Stepper · (title · content · button bar). The stepper stays put; the rest is the page
+/// that slides in.
+fn frame(ctx: &Ctx, step: WizStep, content: Element, buttons: Vec<Element>) -> Element {
+    let steps = run_steps(&ctx.preset, &ctx.screen);
+    let pos = steps.iter().position(|s| *s == step).unwrap_or(0);
+    let head = stepper(&steps, pos).margin(edges(0.0, 0.0, 0.0, 22.0));
+    let title = text_block(step.title())
+        .font_size(24.0)
+        .semibold()
+        .margin(edges(0.0, 0.0, 0.0, 12.0));
     let bar = hstack(buttons)
         .spacing(8.0)
         .horizontal_alignment(HorizontalAlignment::Right)
         .margin(edges(0.0, 14.0, 0.0, 0.0));
-    grid((head.grid_row(0), content.grid_row(1), bar.grid_row(2)))
-        .rows([GridLength::Auto, GridLength::Star(1.0), GridLength::Auto])
+    let page = grid((title.grid_row(0), content.grid_row(1), bar.grid_row(2))).rows([
+        GridLength::Auto,
+        GridLength::Star(1.0),
+        GridLength::Auto,
+    ]);
+    let slide = ctx.slide;
+    let page = border(page)
+        .opacity(slide.progress)
+        .margin(slide_margin(slide.forward, slide.progress));
+    grid((head.grid_row(0), page.grid_row(1)))
+        .rows([GridLength::Auto, GridLength::Star(1.0)])
         .margin(edges(28.0, 22.0, 28.0, 20.0))
         .into()
 }
@@ -378,7 +526,7 @@ fn back_button(ctx: &Ctx, cur: WizStep) -> Element {
     button("Back").on_click(move || back(&ctx, cur)).into()
 }
 
-fn welcome_page(ctx: &Ctx, pos: usize, total: usize) -> Element {
+fn welcome_page(ctx: &Ctx) -> Element {
     let sentence = if ctx.preset.uninstall {
         "This removes punktfunk from this PC. Identity, pairings and passwords stay — a reinstall picks them up."
     } else {
@@ -423,15 +571,14 @@ fn welcome_page(ctx: &Ctx, pos: usize, total: usize) -> Element {
         .vertical_alignment(VerticalAlignment::Center)
         .into();
     frame(
+        ctx,
         WizStep::Welcome,
-        pos,
-        total,
         content,
         vec![continue_button(ctx, WizStep::Welcome, "Continue")],
     )
 }
 
-fn configure_page(ctx: &Ctx, pos: usize, total: usize) -> Element {
+fn configure_page(ctx: &Ctx) -> Element {
     let mut items: Vec<Element> = Vec::new();
     // The D11 coexistence row: a visible row, never a dialog.
     if let Some(note) = ctx.screen.coexistence_note() {
@@ -465,9 +612,8 @@ fn configure_page(ctx: &Ctx, pos: usize, total: usize) -> Element {
         "Install"
     };
     frame(
+        ctx,
         WizStep::Configure,
-        pos,
-        total,
         content,
         vec![
             back_button(ctx, WizStep::Configure),
@@ -543,7 +689,7 @@ fn config_row(ctx: &Ctx, field: Field) -> Element {
     .into()
 }
 
-fn network_page(ctx: &Ctx, pos: usize, total: usize) -> Element {
+fn network_page(ctx: &Ctx) -> Element {
     let name = match &ctx.screen.choices.network {
         NetworkAnswer::MakePrivate(n) if !n.is_empty() => n.clone(),
         _ => ctx
@@ -593,9 +739,8 @@ fn network_page(ctx: &Ctx, pos: usize, total: usize) -> Element {
     .max_width(640.0)
     .into();
     frame(
+        ctx,
         WizStep::Network,
-        pos,
-        total,
         content,
         vec![
             back_button(ctx, WizStep::Network),
@@ -604,7 +749,7 @@ fn network_page(ctx: &Ctx, pos: usize, total: usize) -> Element {
     )
 }
 
-fn install_page(ctx: &Ctx, log: &[LogLine], pos: usize, total: usize) -> Element {
+fn install_page(ctx: &Ctx, log: &[LogLine]) -> Element {
     let mut items: Vec<Element> = Vec::new();
     for line in log {
         items.push(match line.kind {
@@ -659,10 +804,10 @@ fn install_page(ctx: &Ctx, log: &[LogLine], pos: usize, total: usize) -> Element
     } else {
         vec![] // no cancel mid-plan: the executor's steps are not interruptible-safe
     };
-    frame(WizStep::Install, pos, total, content, buttons)
+    frame(ctx, WizStep::Install, content, buttons)
 }
 
-fn done_page(ctx: &Ctx, pos: usize, total: usize) -> Element {
+fn done_page(ctx: &Ctx) -> Element {
     let mut children: Vec<Element> = Vec::new();
     if ctx.preset.uninstall {
         children.push(
@@ -717,9 +862,8 @@ fn done_page(ctx: &Ctx, pos: usize, total: usize) -> Element {
     }
     let content = scroll_view(vstack(children).spacing(8.0).max_width(640.0)).into();
     frame(
+        ctx,
         WizStep::Done,
-        pos,
-        total,
         content,
         vec![button("Finish")
             .accent()
@@ -740,4 +884,19 @@ pub fn run(preset: WinPreset) -> windows_reactor::Result<()> {
         .inner_size(760.0, 660.0)
         .backdrop(Backdrop::Mica)
         .render(move |cx| root.render(&(), cx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn continue_enters_from_the_right_and_back_from_the_left() {
+        let fwd = slide_margin(true, 0.0);
+        assert!(fwd.left > 0.0 && fwd.right == -fwd.left);
+        let back = slide_margin(false, 0.0);
+        assert!(back.left < 0.0 && back.right == -back.left);
+        let settled = slide_margin(true, 1.0);
+        assert_eq!((settled.left, settled.right), (0.0, 0.0));
+    }
 }
