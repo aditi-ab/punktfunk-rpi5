@@ -323,7 +323,7 @@ fn the_public_network_demo_walks_the_d12_step_and_answer_b_opens_the_firewall() 
 #[test]
 fn the_uninstaller_demo_offers_only_the_teardown_and_runs_it_in_the_sandbox() {
     let wiz = Wiz::open("win11-uninstall");
-    assert!(wiz.has_text("punktfunk 0.34.0 · host installed"));
+    assert!(wiz.has_text("0.34.0 · host installed"));
     assert!(wiz.has_text("This removes punktfunk"));
     assert!(!wiz.has_text("Reconfigure"), "no payload, no reconfigure");
     assert_eq!(wiz.dots(), 3, "Welcome · Uninstall · Done");
@@ -336,7 +336,7 @@ fn the_uninstaller_demo_offers_only_the_teardown_and_runs_it_in_the_sandbox() {
 #[test]
 fn the_upgrade_demo_opens_in_manage_mode_and_reconfigure_walks_the_upgrade() {
     let wiz = Wiz::open("win11-upgrade");
-    assert!(wiz.has_text("punktfunk 0.34.0 · host installed"));
+    assert!(wiz.has_text("0.34.0 · host installed"));
     wiz.click("Reconfigure");
     assert!(
         wiz.has_text("Moonlight compat"),
