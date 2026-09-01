@@ -178,11 +178,39 @@ pub fn disable_for_deactivated(
 /// (the managed virtual set) is excluded belt-and-braces. Runs AFTER the topology action so the
 /// active flags it reads are the settled ones. Journals like [`disable_for_deactivated`]; the
 /// caller merges the returned ids into the same teardown list.
-pub fn disable_connected_inactive(keep: &[crate::win_display::CcdTargetKey]) -> Vec<String> {
-    let inventory = crate::win_display::target_inventory();
+/// `baseline_active` is the caller's PRE-MUTATION snapshot — the targets that were part of the
+/// desktop BEFORE this acquire touched the topology. It is what tells a genuine standby sink
+/// (inactive before us too) from an operator display the isolate itself just switched off: the
+/// post-isolate inventory alone cannot (immunity plan WP3a — the selector used to run after the
+/// Exclusive isolate and disable the operator's freshly-deactivated panel as a "sink").
+pub fn disable_connected_inactive(
+    keep: &[crate::win_display::CcdTargetKey],
+    baseline_active: &[crate::win_display::CcdTargetKey],
+) -> Vec<String> {
+    let targets = select_connected_inactive(
+        &crate::win_display::target_inventory(),
+        keep,
+        baseline_active,
+    );
+    journal_and_disable(targets)
+}
+
+/// The pure selection half of [`disable_connected_inactive`], split from the PnP mutation so the
+/// baseline rule is testable without a live CCD.
+fn select_connected_inactive(
+    inventory: &[crate::win_display::TargetInventory],
+    keep: &[crate::win_display::CcdTargetKey],
+    baseline_active: &[crate::win_display::CcdTargetKey],
+) -> Vec<(String, String)> {
     let mut targets: Vec<(String, String)> = Vec::new();
-    for t in &inventory {
+    for t in inventory {
         if t.active || !t.external_physical || keep.contains(&t.key) {
+            continue;
+        }
+        // Active before this acquire touched the topology ⇒ an operator display we (or a racing
+        // actor) just switched off — NEVER a standby sink. A target absent from the baseline was
+        // dark before us (or arrived dark) and stays a sink candidate.
+        if baseline_active.contains(&t.key) {
             continue;
         }
         let Some(id) = instance_id_from_interface_path(&t.monitor_device_path) else {
@@ -193,7 +221,7 @@ pub fn disable_connected_inactive(keep: &[crate::win_display::CcdTargetKey]) -> 
             targets.push(hit);
         }
     }
-    journal_and_disable(targets)
+    targets
 }
 
 /// Shared tail of the two selectors: crash-journal FIRST, then disable, returning what actually
@@ -265,4 +293,58 @@ pub fn startup_recover() {
         "PnP-disable: found monitor devnodes a previous host left disabled — re-enabling"
     );
     enable_instances(&leftovers);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::win_display::{CcdTargetKey, TargetInventory};
+
+    fn target(luid: i64, id: u32, active: bool, external: bool) -> TargetInventory {
+        TargetInventory {
+            key: CcdTargetKey::new(luid, id),
+            target_id: id,
+            active,
+            external_physical: external,
+            internal_panel: false,
+            tech: "HDMI",
+            friendly: "ACME TV".into(),
+            monitor_device_path: format!(r"\\?\DISPLAY#ACM{id:04}#5&1&0&UID{id}#{{guid}}"),
+            ours: false,
+            gdi_name: String::new(),
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            refresh_mhz: 0,
+            primary: false,
+        }
+    }
+
+    /// WP3a's whole point: an operator display that was ACTIVE before this acquire touched the
+    /// topology is never devnode-disabled by the default standby-sink treatment, however
+    /// inactive it reads after the isolate — while a genuinely pre-dark sink still is.
+    #[test]
+    fn a_display_active_before_the_acquire_is_never_a_standby_sink() {
+        let keep = [CcdTargetKey::new(9, 257)]; // the virtual display
+                                                // Post-isolate view: the operator's panel (100) AND the standby TV (200) both read
+                                                // connected-but-inactive — indistinguishable without the baseline.
+        let inventory = [
+            target(1, 100, false, true), // operator panel, deactivated by OUR isolate
+            target(1, 200, false, true), // standby TV, dark before us too
+            target(9, 257, true, false), // ours
+        ];
+        let baseline_active = [CcdTargetKey::new(1, 100)];
+        let picked = select_connected_inactive(&inventory, &keep, &baseline_active);
+        assert_eq!(picked.len(), 1, "only the pre-dark sink is selected");
+        assert!(picked[0].0.contains("ACM0200"), "picked: {picked:?}");
+        // Same-numbered target on ANOTHER adapter must not shadow the baseline entry.
+        let alias_baseline = [CcdTargetKey::new(2, 100)];
+        let picked = select_connected_inactive(&inventory, &keep, &alias_baseline);
+        assert_eq!(
+            picked.len(),
+            2,
+            "adapter 1's target 100 was NOT in this baseline"
+        );
+    }
 }

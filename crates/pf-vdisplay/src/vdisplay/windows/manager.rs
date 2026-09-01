@@ -1363,6 +1363,21 @@ impl VirtualDisplayManager {
         // ignores the AddRequest field anyway (composited cursor), but gating here keeps the
         // capture layer from creating + delivering a section nobody will ever publish into.
         let hw_cursor = hw_cursor && self.driver_proto.load(Ordering::Relaxed) >= 5;
+        // PRE-MUTATION baseline for the standby-sink selector (immunity plan WP3a): which targets
+        // were part of the desktop before THIS acquire touches anything — the ADD's
+        // auto-activation, the resolve ladder's force-EXTEND (which can light a sleeping sink!),
+        // and the isolate all mutate the active set, so only a snapshot taken here can tell a
+        // pre-dark sink from a display we switched off (or lit) ourselves.
+        let baseline_active: Vec<CcdTargetKey> = (inner.slots.is_empty()
+            && crate::policy::prefs().standby_sink_neutralise())
+        .then(|| {
+            pf_win_display::win_display::target_inventory()
+                .iter()
+                .filter(|t| t.active)
+                .map(|t| t.key)
+                .collect()
+        })
+        .unwrap_or_default();
         // SAFETY: `create_monitor`'s own `# Safety` contract guarantees `dev` is the live control
         // handle; we forward it unchanged to `add_monitor`, whose precondition is exactly that.
         // `render_pin` is an `Option<LUID>` by value (plain `Copy`), so no borrowed memory
@@ -1578,7 +1593,10 @@ impl VirtualDisplayManager {
                     }
                     let mut keep = inner.target_keys();
                     keep.push(added_key);
-                    for id in pf_win_display::monitor_devnode::disable_connected_inactive(&keep) {
+                    for id in pf_win_display::monitor_devnode::disable_connected_inactive(
+                        &keep,
+                        &baseline_active,
+                    ) {
                         if !inner.group.pnp_disabled.contains(&id) {
                             inner.group.pnp_disabled.push(id);
                         }
