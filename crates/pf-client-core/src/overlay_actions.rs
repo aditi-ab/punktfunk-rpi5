@@ -11,6 +11,7 @@
 //! the tests here are the contract they port.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Slots on the ring, clockwise from 12 o'clock.
 pub const RING_SLOTS: usize = 6;
@@ -169,14 +170,42 @@ pub fn key_legend(k: &str) -> String {
     }
 }
 
-/// The virtual controller's preset (Android and Apple only): `layout` is `full`, `sticks` or
-/// `dpad`; `opacity` and `scale` are the two sliders.
+/// A per-control tweak's `scale` bounds; the twins clamp what a blob claims.
+pub const PAD_TWEAK_SCALE_MIN: f32 = 0.5;
+pub const PAD_TWEAK_SCALE_MAX: f32 = 2.0;
+
+/// One control's layout override: `x` and `y` place its centre as fractions of the layer's
+/// width and height, `scale` sizes it about that centre, `hidden` takes it out of the stream
+/// (the editor still shows it, ghosted). An absent field keeps the preset's value.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PadTweak {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub y: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f32>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+}
+
+/// The virtual controller (Android and Apple only): `layout` is `full`, `sticks` or `dpad`;
+/// `opacity` and `scale` are the two sliders. `controls` carries the per-control overrides,
+/// keyed by control id — `ls`, `rs`, `dpad`, `face`, `lb`, `rb`, `lt`, `rt`, `select`, `guide`,
+/// `start` — and `controls_narrow` the same for a narrow (upright) layer, the two classes the
+/// preset already lays out differently. An id this build does not know rides along untouched,
+/// the same courtesy the ring's unknown slots get.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PadConfig {
     pub layout: String,
     pub opacity: f32,
     pub scale: f32,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub controls: BTreeMap<String, PadTweak>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub controls_narrow: BTreeMap<String, PadTweak>,
 }
 
 impl Default for PadConfig {
@@ -185,6 +214,8 @@ impl Default for PadConfig {
             layout: "full".into(),
             opacity: 0.45,
             scale: 1.0,
+            controls: BTreeMap::new(),
+            controls_narrow: BTreeMap::new(),
         }
     }
 }
@@ -601,6 +632,44 @@ mod tests {
         let cfg = OverlayConfig::parse(r#"{"v":2,"ring":[]}"#, RingPlatform::Touch);
         assert_eq!(cfg.pad, PadConfig::default());
         assert!(cfg.ring.iter().all(Option::is_none));
+    }
+
+    /// Per-control overrides ride the pad: partial fields parse with the rest defaulted, an
+    /// unknown control id is carried through a rewrite, and an untouched pad keeps its blob
+    /// clean — no empty maps, no null fields.
+    #[test]
+    fn pad_control_tweaks_round_trip_and_carry_unknown_ids() {
+        let blob = r#"{"v":2,"pad":{"layout":"full","opacity":0.45,"scale":1.0,
+            "controls":{"ls":{"x":0.1,"y":0.8,"scale":1.5},"weird":{"hidden":true}},
+            "controls_narrow":{"face":{"scale":0.75}}}}"#;
+        let cfg = OverlayConfig::parse(blob, RingPlatform::Touch);
+        let ls = &cfg.pad.controls["ls"];
+        assert_eq!(
+            (ls.x, ls.y, ls.scale, ls.hidden),
+            (Some(0.1), Some(0.8), Some(1.5), false)
+        );
+        assert!(
+            cfg.pad.controls["weird"].hidden,
+            "an unknown id is data, not an error"
+        );
+        assert_eq!(cfg.pad.controls_narrow["face"].scale, Some(0.75));
+        let json = cfg.to_json();
+        assert!(
+            json.contains("\"weird\""),
+            "a rewrite keeps what it does not know"
+        );
+        assert_eq!(OverlayConfig::parse(&json, RingPlatform::Touch), cfg);
+        let plain = OverlayConfig::platform_default(RingPlatform::Touch).to_json();
+        assert!(!plain.contains("controls"));
+        let sparse = OverlayConfig::parse(
+            r#"{"pad":{"controls":{"rs":{"x":0.5}}}}"#,
+            RingPlatform::Touch,
+        );
+        let out = sparse.to_json();
+        assert!(
+            out.contains(r#""rs":{"x":0.5}"#),
+            "absent fields stay absent: {out}"
+        );
     }
 
     #[test]
