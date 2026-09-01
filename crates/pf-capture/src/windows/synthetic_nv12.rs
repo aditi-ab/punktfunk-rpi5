@@ -120,6 +120,7 @@ impl Capturer for SyntheticNv12Capturer {
         }
         self.frame_idx += 1;
         Ok(CapturedFrame {
+            provenance: Default::default(),
             width: self.width,
             height: self.height,
             pts_ns,

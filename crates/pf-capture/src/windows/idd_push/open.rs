@@ -610,6 +610,7 @@ impl IddPushCapturer {
                 context,
                 target_id: target.target_id,
                 ccd,
+                source_seq: 0,
                 section,
                 header,
                 event,

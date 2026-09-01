@@ -264,6 +264,7 @@ impl Capturer for SyntheticCapturer {
         let pts_ns = self.frame_idx * 1_000_000_000 / self.fps as u64;
         self.frame_idx += 1;
         Ok(CapturedFrame {
+            provenance: Default::default(),
             width: self.width,
             height: self.height,
             pts_ns,
@@ -332,6 +333,7 @@ impl Capturer for FastSyntheticCapturer {
         }
         self.frame_idx += 1;
         Ok(CapturedFrame {
+            provenance: Default::default(),
             width: self.width,
             height: self.height,
             pts_ns: 0,

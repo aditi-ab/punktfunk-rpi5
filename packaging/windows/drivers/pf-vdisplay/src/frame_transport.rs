@@ -649,7 +649,11 @@ impl FramePublisher {
     }
 
     /// Copy `surface` into the next free ring slot and signal the host. Never blocks (0 ms try-acquire).
-    pub fn publish(&mut self, surface: &ID3D11Texture2D) -> PublishOutcome {
+    ///
+    /// `display_qpc` is the OS's `PresentDisplayQPCTime` for this frame (0 = none reported, or a
+    /// stash republish) — stamped into the header's `qpc_pts` as the host's source-provenance
+    /// clock.
+    pub fn publish(&mut self, surface: &ID3D11Texture2D, display_qpc: u64) -> PublishOutcome {
         let ring_len = self.slots.len() as u32;
         if ring_len == 0 {
             return PublishOutcome::Dropped;
@@ -729,6 +733,15 @@ impl FramePublisher {
                         slot: slot as u8,
                     }
                     .pack();
+                    // Provenance stamp BEFORE the Release publish of `latest`: a host that reads
+                    // it after loading the token sees this frame's stamp or a newer one —
+                    // monotonic either way, and best-effort like the telemetry tail.
+                    // SAFETY: `self.header` stays mapped for the publisher's lifetime; `qpc_pts`
+                    // is an 8-aligned u64 within it (the `latest_cell` pattern).
+                    unsafe {
+                        (*(core::ptr::addr_of!((*self.header).qpc_pts) as *const AtomicU64))
+                            .store(display_qpc, Ordering::Relaxed);
+                    }
                     self.latest_cell().store(latest, Ordering::Release);
                     // SAFETY: `self.event` is the live host-created frame-ready event, duplicated into
                     // this process with the creator's access; signalling it wakes the host consumer.

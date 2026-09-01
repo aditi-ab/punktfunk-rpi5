@@ -4428,6 +4428,7 @@ mod tests {
             px.copy_from_slice(&fill);
         }
         CapturedFrame {
+            provenance: Default::default(),
             width: w,
             height: h,
             pts_ns,
@@ -4617,6 +4618,7 @@ mod tests {
             px.copy_from_slice(&word.to_le_bytes());
         }
         CapturedFrame {
+            provenance: Default::default(),
             width: w,
             height: h,
             pts_ns,
@@ -4735,6 +4737,7 @@ mod tests {
             p.copy_from_slice(&px);
         }
         CapturedFrame {
+            provenance: Default::default(),
             width: w,
             height: h,
             pts_ns,

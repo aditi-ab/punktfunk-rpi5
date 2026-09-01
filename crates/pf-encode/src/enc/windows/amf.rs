@@ -2428,6 +2428,7 @@ mod tests {
             }
             next += interval;
             let frame = CapturedFrame {
+                provenance: Default::default(),
                 width: w,
                 height: h,
                 pts_ns: 1 + i as u64,
@@ -2614,6 +2615,7 @@ mod tests {
                 let mut aus = Vec::new();
                 for i in 0..n {
                     let frame = CapturedFrame {
+                        provenance: Default::default(),
                         width: w,
                         height: h,
                         pts_ns: base + i as u64,
@@ -2728,6 +2730,7 @@ mod tests {
             "no readback before the lazy open — the caller must keep the requested rate"
         );
         let frame = CapturedFrame {
+            provenance: Default::default(),
             width: w,
             height: h,
             pts_ns: 1,
@@ -2834,6 +2837,7 @@ mod tests {
         let mut aus: Vec<EncodedFrame> = Vec::new();
         for i in 0..6 {
             let frame = CapturedFrame {
+                provenance: Default::default(),
                 width: w,
                 height: h,
                 pts_ns: 1 + i as u64,
@@ -2982,6 +2986,7 @@ mod tests {
         const BURST: u64 = 48; // >> RING, submitted faster than the ASIC drains
         for i in 1..=BURST {
             let frame = CapturedFrame {
+                provenance: Default::default(),
                 width: w,
                 height: h,
                 pts_ns: i,

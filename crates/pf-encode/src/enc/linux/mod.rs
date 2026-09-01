@@ -1190,6 +1190,7 @@ mod hdr_tests {
             }
         }
         let frame = CapturedFrame {
+            provenance: Default::default(),
             width: w,
             height: h,
             pts_ns: 0,

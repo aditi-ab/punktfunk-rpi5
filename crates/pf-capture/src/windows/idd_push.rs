@@ -343,6 +343,10 @@ pub struct IddPushCapturer {
     target_id: u32,
     /// Complete CCD identity (adapter LUID + target id) for every display-global helper.
     ccd: pf_win_display::win_display::CcdTargetKey,
+    /// Monotonic count of NEW source images delivered (`FrameOrigin::Source` only) — the
+    /// provenance sequence. Survives ring recreates by construction: it lives on the capturer,
+    /// not the ring.
+    source_seq: u64,
     /// Owns the shared-header file mapping + its mapped view (RAII unmap-then-close). Declared BEFORE
     /// `header`, which is a raw pointer borrowed into this view via [`MappedSection::ptr`]. Also the
     /// duplication source for the driver's header handle on every [`ChannelBroker::send`].
@@ -621,6 +625,32 @@ impl IddPushCapturer {
             return 0;
         }
         (now as u64).saturating_sub(stamp).saturating_mul(1_000_000) / freq
+    }
+
+    /// The driver's provenance stamp for the most recent publish — the OS
+    /// `PresentDisplayQPCTime` the driver writes into `qpc_pts` (0 = pre-provenance driver, or
+    /// the OS reported none). Plausibility-gated: a stamp ahead of the local QPC clock is
+    /// nonsense (a torn read, a restarted counter) and reads as unknown rather than as a
+    /// timestamp recovery logic might trust.
+    fn source_present_qpc(&self) -> u64 {
+        // SAFETY: like `telemetry` — the header stays mapped for the capturer's lifetime, the
+        // field is an 8-aligned u64, and Relaxed matches the driver's best-effort store.
+        let stamp = unsafe {
+            (*(std::ptr::addr_of!((*self.header).qpc_pts) as *const AtomicU64))
+                .load(Ordering::Relaxed)
+        };
+        if stamp == 0 {
+            return 0;
+        }
+        let mut now = 0i64;
+        // SAFETY: plain FFI; `now` is a valid local out-param.
+        if unsafe { QueryPerformanceCounter(&mut now) }.is_err() {
+            return 0;
+        }
+        if stamp > now as u64 {
+            return 0;
+        }
+        stamp
     }
 
     /// The header's v2 telemetry tail — `(drain_heartbeat_qpc, offered_total)`; `None` until a
@@ -1826,6 +1856,9 @@ impl IddPushCapturer {
             // ending frame's own move — discarded, never folded (see `sample_cursor_witness`).
             self.cursor_gap_px = 0;
             self.cursor_pending_px = 0;
+            // The provenance sequence: a NEW source image, never a regen (which re-encodes the
+            // previous one) — the one clock recovery logic may trust for source progress.
+            self.source_seq += 1;
         }
         // Build the frame. For PyroWave the encode input is the Y plane
         // (`texture`) + the CbCr plane & fence in `pyro`; signal the shared fence
@@ -1847,6 +1880,11 @@ impl IddPushCapturer {
             (out.expect("out ring texture").0, None)
         };
         Ok(Some(CapturedFrame {
+            provenance: if regen {
+                pf_frame::Provenance::cursor_regen(self.source_seq)
+            } else {
+                pf_frame::Provenance::source(self.source_seq, self.source_present_qpc())
+            },
             width: self.width,
             height: self.height,
             pts_ns: now_ns(),
@@ -1888,6 +1926,7 @@ impl IddPushCapturer {
                 }
             };
             return Some(CapturedFrame {
+                provenance: pf_frame::Provenance::hold(self.source_seq),
                 width: self.width,
                 height: self.height,
                 pts_ns: now_ns(),
@@ -1915,6 +1954,7 @@ impl IddPushCapturer {
         self.out_idx = (i + 1) % self.out_ring.len();
         self.last_present = Some((dst.clone(), pf));
         Some(CapturedFrame {
+            provenance: pf_frame::Provenance::hold(self.source_seq),
             width: self.width,
             height: self.height,
             pts_ns: now_ns(),

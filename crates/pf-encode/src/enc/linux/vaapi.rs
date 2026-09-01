@@ -1630,6 +1630,7 @@ mod tests {
                 px.copy_from_slice(&[(i * 8) as u8, 0x40, 0xC0, 0xFF]);
             }
             let frame = CapturedFrame {
+                provenance: Default::default(),
                 width: w,
                 height: h,
                 pts_ns: u64::from(i) * 33_333_333,

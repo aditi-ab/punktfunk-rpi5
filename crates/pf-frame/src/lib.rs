@@ -233,6 +233,77 @@ pub struct CursorOverlay {
     pub visible: bool,
 }
 
+/// Where a captured frame's pixels came from. Host wall-clock PTS advances on every delivered
+/// frame — repeats and cursor regenerations included — so it can never prove the SOURCE
+/// (compositor/DWM presentation) made progress; this can. Only [`Source`](Self::Source) may feed
+/// capture health, source cadence, or recovery-stability decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameOrigin {
+    /// A NEW source image from the compositor/DWM presentation path (or a capturer that does not
+    /// distinguish — Linux compositor buffers, synthetic sources — where every delivery is one).
+    Source,
+    /// Unchanged source pixels re-composed only to move/redraw the cursor overlay (Windows
+    /// IDD-push). Encodable and sendable, but no evidence the desktop image changed.
+    CursorRegen,
+    /// A repeat of the previous frame (a stream hold) — not a captured image at all. Maps to the
+    /// existing repeat wire behavior; never serialized separately.
+    Hold,
+}
+
+/// Frame provenance: [`FrameOrigin`] plus the source progress clocks. `UNTRACKED` (the default)
+/// is a capturer that delivers only real frames and tracks no sequence — origin `Source`, both
+/// clocks 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Provenance {
+    pub origin: FrameOrigin,
+    /// Monotonic count of NEW source images this capturer delivered — advances only for
+    /// [`FrameOrigin::Source`] and survives ring rebuilds. `0` = untracked.
+    pub source_seq: u64,
+    /// The source's own present timestamp (Windows: raw QPC ticks from the driver's
+    /// `PresentDisplayQPCTime`). Opaque and monotonic; compare, never convert. `0` = unknown.
+    pub source_qpc: u64,
+}
+
+impl Provenance {
+    pub const UNTRACKED: Self = Self {
+        origin: FrameOrigin::Source,
+        source_seq: 0,
+        source_qpc: 0,
+    };
+
+    pub fn source(source_seq: u64, source_qpc: u64) -> Self {
+        Self {
+            origin: FrameOrigin::Source,
+            source_seq,
+            source_qpc,
+        }
+    }
+
+    /// A cursor-only regeneration over the LAST source image (`source_seq` unchanged).
+    pub fn cursor_regen(source_seq: u64) -> Self {
+        Self {
+            origin: FrameOrigin::CursorRegen,
+            source_seq,
+            source_qpc: 0,
+        }
+    }
+
+    /// A hold/repeat of the last delivered frame (`source_seq` unchanged).
+    pub fn hold(source_seq: u64) -> Self {
+        Self {
+            origin: FrameOrigin::Hold,
+            source_seq,
+            source_qpc: 0,
+        }
+    }
+}
+
+impl Default for Provenance {
+    fn default() -> Self {
+        Self::UNTRACKED
+    }
+}
+
 /// A captured frame. [`format`](Self::format)/dimensions describe the pixels regardless of
 /// where they live — [`payload`](Self::payload) is either a CPU buffer (the spike/fallback path)
 /// or a GPU buffer already on the device (the zero-copy path, plan §9).
@@ -247,6 +318,8 @@ pub struct CapturedFrame {
     /// visible cursor or the pixels were already composited on the CPU de-pad path. See
     /// [`CursorOverlay`].
     pub cursor: Option<CursorOverlay>,
+    /// Where these pixels came from ([`FrameOrigin`]) and the source progress clocks.
+    pub provenance: Provenance,
 }
 
 /// Keeps the producer's buffer behind a zero-copy frame OUT of the producer's pool.
