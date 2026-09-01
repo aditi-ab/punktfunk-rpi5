@@ -588,7 +588,7 @@ fn network_page(ctx: &Ctx, pos: usize, total: usize) -> Element {
         )
         .wrap()
         .foreground(ThemeRef::SecondaryText),
-        radio.into(),
+        radio,
     ))
     .spacing(12.0)
     .max_width(640.0)
