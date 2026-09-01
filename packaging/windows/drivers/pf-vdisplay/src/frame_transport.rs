@@ -743,14 +743,14 @@ impl FramePublisher {
                 }
                 // Acquired cleanly.
                 0 => {
-                    // STRAIGHT-LINE, NO `?` between acquire + release — a `?`-return here would leak the
-                    // keyed-mutex lock and wedge the host on this slot. The ordering below is load-bearing:
-                    // the CopyResource is GPU-ordered before the consumer via the slot keyed mutex, and the
-                    // `latest` store (Release) publishes the slot only AFTER the copy is queued + the mutex
-                    // released. The release is CHECKED: publishing `latest` over a slot whose mutex
-                    // failed to release would hand the host a slot it can never acquire.
-                    // SAFETY: `s.tex`/`surface` are live, format-matched (checked above) D3D textures on
-                    // `self.context`'s device; the keyed mutex is held here, so we release it exactly once.
+                    // STRAIGHT-LINE, NO `?` between acquire + release — a `?`-return would leak
+                    // the keyed-mutex lock and wedge the host on this slot. Ordering is
+                    // load-bearing: the copy is GPU-ordered via the mutex, and `latest` stores
+                    // only after a CHECKED release — a slot whose release failed can never be
+                    // re-acquired by the host and must not be published.
+
+                    // SAFETY: `s.tex`/`surface` are live, format-matched (checked above) D3D
+                    // textures on `self.context`'s device; the mutex is held, released once.
                     let released = unsafe {
                         self.context.CopyResource(&s.tex, surface);
                         s.mutex.ReleaseSync(0)

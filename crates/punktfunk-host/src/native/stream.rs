@@ -3425,11 +3425,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         match cap_result {
             Ok(Some(f)) => {
                 // Only a real SOURCE frame is evidence of source progress: a cursor-only
-                // regeneration re-encodes the previous desktop image at a new pointer position
-                // (it is encoded and sent like any frame, but it must not feed the cadence
-                // estimate, the new-frame diagnostics, or the capture-rebuild reset — a
-                // regenerated cursor over one stashed texture is exactly how a dead
-                // presentation path used to look healthy).
+                // regeneration re-encodes the previous desktop image at a new pointer
+                // position — encoded and sent like any frame, but never fed to the cadence
+                // estimate, new-frame diagnostics, or capture-rebuild reset (a regenerated
+                // cursor over one stashed texture is how a dead path used to look healthy).
                 let source = f.provenance.origin == pf_frame::FrameOrigin::Source;
                 frame = f;
                 if source {
@@ -3543,31 +3542,24 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 }
                 tracing::warn!(error = %format!("{e:#}"), rebuild = capture_rebuilds,
                     "capture lost — rebuilding pipeline in place");
-                // A Bazzite/SteamOS Gaming↔Desktop switch tears the old compositor down and can take
-                // 15s+ to bring the new one up. Don't fail the session over that (the client would
-                // have to cold-reconnect, surfacing a "session failed") — keep retrying within a
-                // generous budget while the QUIC keepalive (its own thread) holds the connection,
-                // RE-DETECTING the live compositor each attempt so we follow the box to whatever
-                // session comes up: a fresh instance of the same compositor, OR a different one
-                // (the kind-change case the session watcher also handles). The client stays
-                // connected, frozen on the last frame, and the stream resumes when the new output
-                // appears — no reconnect.
+                // A Bazzite/SteamOS Gaming↔Desktop switch tears the old compositor down and can
+                // take 15 s+ to bring the new one up. Don't fail the session over that — keep
+                // retrying within a budget while the QUIC keepalive holds the connection,
+                // RE-DETECTING the live compositor each attempt (same or different kind). The
+                // client stays connected, frozen on the last frame, and resumes — no reconnect.
                 const REBUILD_BUDGET: std::time::Duration = std::time::Duration::from_secs(40);
-                // A managed/attach gamescope (re)launch legitimately takes up to 45 s — the Steam
-                // Big Picture cold start that `launch_session`/`ensure_box_gamescope_mode` poll
-                // for — so the 40 s budget used to expire INSIDE the first attempt (a single-shot
-                // failure ending the session even when a second, warm attempt would have
-                // succeeded). Give gamescope-targeted rebuilds room for two full launch attempts;
-                // desktop compositors keep the tighter budget. Checked per iteration because the
-                // loop retargets `compositor` as re-detection follows the box.
+                // A managed/attach gamescope (re)launch legitimately takes up to 45 s (the Steam
+                // Big Picture cold start), so the 40 s budget used to expire INSIDE the first
+                // attempt — a single-shot failure where a second, warm attempt would have
+                // succeeded. Gamescope-targeted rebuilds get room for two full launches; checked
+                // per iteration because the loop retargets `compositor` as re-detection follows.
                 const GAMESCOPE_REBUILD_BUDGET: std::time::Duration =
                     std::time::Duration::from_secs(100);
-                // Attach-only holdoff: for the first seconds after a capture loss the session
-                // detection can be STALE (the new session isn't up yet), and a rebuild acting on
-                // a stale "Gaming" answer restarts gamescope-session.target — which on SteamOS
-                // steals the seat back from the session the user just switched to (observed
-                // live). While the holdoff lasts, builds run under a vdisplay rebuild-probe
-                // scope: attach to live outputs only, never stop/relaunch/take over sessions.
+                // Attach-only holdoff: right after a capture loss the session detection can be
+                // STALE, and a rebuild acting on a stale "Gaming" answer restarts
+                // gamescope-session.target — on SteamOS that steals the seat back from the
+                // session the user just switched to (observed live). Until it lapses, builds
+                // attach to live outputs only: never stop/relaunch/take over sessions.
                 const PROBE_HOLDOFF: std::time::Duration = std::time::Duration::from_secs(4);
                 let loss_at = std::time::Instant::now();
                 // An explicit PUNKTFUNK_COMPOSITOR pin disables the re-detection below — the

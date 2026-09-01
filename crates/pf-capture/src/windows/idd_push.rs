@@ -1629,7 +1629,7 @@ impl IddPushCapturer {
     /// still EVERYWHERE (the demotion direction is strict), while a delta > 0 on a
     /// parallel-displays host may be a sibling display's motion — that direction only ever
     /// upholds today's CONTENT-SILENCE labeling, never worsens it.
-    // ponytail: no per-target rect filter (needs a cached CCD rect); add one if parallel-display
+    // No per-target rect filter yet (needs a cached CCD rect); add one if parallel-display
     // hosts ever show false CONTENT-SILENCE convictions from sibling-cursor motion.
     fn sample_cursor_witness(&mut self) {
         self.cursor_gap_px = self.cursor_gap_px.saturating_add(self.cursor_pending_px);

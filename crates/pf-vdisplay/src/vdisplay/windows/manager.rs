@@ -1270,45 +1270,27 @@ impl VirtualDisplayManager {
         }
     }
 
-    /// Create a fresh monitor at `mode` for `slot` (the client's stable identity slot, `0` = auto):
     /// Wait for Windows to auto-activate a freshly-ADDed IDD target into its OWN display path and
     /// return its GDI name — the capture target. Shared by the fresh CREATE and the mid-stream
-    /// re-arrival ([`re_add`](Self::re_add)).
+    /// re-arrival ([`re_add`](Self::re_add)). `None` on a GPU-less box (target added but not
+    /// WDDM-activated); the capture backend re-resolves once a GPU is present.
     ///
-    /// The IDD comes up EXTENDED alongside any existing/basic display; the caller then promotes it to
-    /// primary / isolates it. Returns `None` on a GPU-less box (target added but not WDDM-activated) —
-    /// the capture backend re-resolves once a GPU is present.
+    /// A three-stage ladder, each stage a real failure mode. Plain poll FIRST — never a forced
+    /// topology change: bare `SDC_TOPOLOGY_EXTEND` is ACCESS_DENIED from Session 0 on a headless
+    /// box and breaks the auto-activate. force-EXTEND is the integrated-screen FALLBACK: a fresh
+    /// IDD there is CLONED onto the panel (shared source, no committed path of its own —
+    /// observed on an Optimus laptop, commit 8e87e61), and the EXTEND de-clones it. LAST RESORT
+    /// is explicit path activation: a lid-closed laptop defeats both (the clamshell policy
+    /// suppresses auto-activation and the EXTEND preset "succeeds" committing nothing) —
+    /// `activate_target_path` commits the path directly, which ignores the lid policy.
     ///
-    /// We do NOT force a topology change FIRST: the bare `SDC_TOPOLOGY_EXTEND` preset is ACCESS_DENIED
-    /// from our Session-0 service context on a headless box and BREAKS this auto-activate (it regressed
-    /// the headless path — the IDD then never gets its own path → "not an active display path" → black).
-    /// force-EXTEND is only the FALLBACK, for an integrated-screen box (e.g. a laptop panel) where a
-    /// fresh IDD is CLONED onto the existing display, sharing its source, so it never gets its own
-    /// committed path (observed on an Intel-iGPU + NVIDIA-Optimus laptop, commit 8e87e61):
-    /// `resolve_gdi_name` stays None → the `is_none()` fallback force-EXTENDs to de-clone and the
-    /// second resolve finds the now-committed path. Headless/extended boxes resolve on the first loop
-    /// and skip it — which is the point, since force-EXTEND is ACCESS_DENIED from our service context
-    /// there.
+    /// CAVEAT (unobserved): textbook CCD also allows a clone with a *shared-source ACTIVE* path
+    /// (resolve → `Some`), which the `is_none()` gate would miss; widening needs a
+    /// `target_is_cloned` helper plus on-laptop validation.
     ///
-    /// CAVEAT (unobserved for IddCx, untested across GPU/driver/OS): textbook CCD also lets a clone
-    /// appear as a *shared-source ACTIVE* path (resolve → Some), which the `is_none()` gate would NOT
-    /// catch. If that ever shows up, widen the gate to also fire when the IDD target's source is shared
-    /// with another active path (a `target_is_cloned` helper) — needs on-laptop validation first.
-    ///
-    /// LAST RESORT — explicit path activation: a lid-closed laptop (field report, Intel iGPU) defeats
-    /// BOTH stages above — the clamshell lid policy suppresses the new-monitor auto-activation, and
-    /// the `SDC_TOPOLOGY_EXTEND` preset "succeeds" without committing a path for the IDD — so the
-    /// target stays connected-but-inactive for the session's whole retry budget. `activate_target_path`
-    /// commits the target's path directly (supplied-config apply, the same thing display Settings
-    /// does), which doesn't consult the lid policy at all.
-    ///
-    /// Call under the `state` lock: this mutates the LIVE CCD topology (force-EXTEND, explicit path
-    /// activation), and the manager's sole-topology-mutator contract is what keeps two acquires from
-    /// interleaving path commits. A *serialization* requirement, not a soundness one — every CCD
-    /// helper it calls is a safe fn in `pf_win_display::win_display`, so this function performs no
-    /// unsafe operation at all. It was an `unsafe fn` back when the FFI was inline here, and stayed
-    /// one after the FFI moved out: three call sites then carried `unsafe {}` blocks whose SAFETY
-    /// proofs asserted things about FFI that is no longer in the body.
+    /// Call under the `state` lock — this mutates the live CCD topology, and the manager's
+    /// sole-topology-mutator contract keeps two acquires from interleaving path commits (a
+    /// serialization requirement, not a soundness one: every helper it calls is a safe fn).
     fn resolve_target_gdi(&self, key: CcdTargetKey) -> Option<String> {
         // 50 ms sampling (latency plan P0.5): the SAME 3 s per-stage ceilings — the 3-stage ladder
         // structure encodes real failure modes (headless auto-activate, integrated-panel clone,
@@ -1496,19 +1478,11 @@ impl VirtualDisplayManager {
                         }
                     }
                     Topology::Primary if first_member => {
-                        // On a headless box the IDD auto-activates as the SOLE display, so a physical
-                        // (if present) is deactivated and QueryDisplayConfig sees only the virtual —
-                        // force EXTEND to (re)activate every connected display alongside the virtual,
-                        // THEN reposition to make the virtual primary. BUT on a box whose physical is
-                        // ALREADY active (the IDD came up extended beside it — the common desktop case),
-                        // that physical is already lit at its real mode; re-applying the bare
-                        // `SDC_TOPOLOGY_EXTEND` preset would only re-pull each display's mode from the
-                        // persistence DB, RESETTING a 120 Hz panel to 60 Hz. So force-EXTEND only when the
-                        // virtual is currently sole; otherwise skip straight to the reposition, which
-                        // re-supplies each physical's QUERIED mode verbatim (preserving its refresh).
-                        // An UNKNOWN answer (query failed) skips the force-EXTEND: mutating the
-                        // topology on unverified state risks resetting a lit panel's refresh for
-                        // nothing, and the reposition below re-supplies the queried modes anyway.
+                        // force-EXTEND only when the virtual is the SOLE active display (the
+                        // headless auto-activate): on a lit physical the bare EXTEND preset
+                        // re-pulls persistence-DB modes and resets a 120 Hz panel to 60; the
+                        // reposition below re-supplies queried modes verbatim. An UNKNOWN
+                        // answer (query failed) also skips it — never mutate unverified state.
                         let already_extended = match count_other_active(&[added_key]) {
                             Some(n) => n > 0,
                             None => {
