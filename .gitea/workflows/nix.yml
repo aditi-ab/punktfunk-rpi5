@@ -198,6 +198,9 @@ jobs:
       # opt-in below rather than leaving an infra-red gate on the board.
       - name: Build the bun packages
         run: |
+          # The ~2k bun tarball fetch derivations exceed the container's default 1024-fd
+          # soft limit ("error: creating pipe: Too many open files").
+          ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)" || true
           "$NIX" build --print-build-logs .#punktfunk-web .#punktfunk-scripting
 
       # Both launchers exec pkgs.bun from the store; confirm they were produced and are real entry
