@@ -797,12 +797,10 @@ impl FramePublisher {
                 // Genuine failure (negative HRESULT — device removed / invalid call): this ring
                 // generation is done. Name the device-removed reason while it is still queryable.
                 _ => {
-                    // SAFETY: `self.context` is the publisher's live immediate context; `GetDevice`
-                    // fills the local out-param, and `GetDeviceRemovedReason` only reads the device.
+                    // SAFETY: `self.context` is the publisher's live immediate context;
+                    // `GetDevice`/`GetDeviceRemovedReason` only read it.
                     let removed = unsafe {
-                        let mut dev: Option<ID3D11Device> = None;
-                        self.context.GetDevice(&mut dev);
-                        dev.map_or(0, |d| {
+                        self.context.GetDevice().map_or(0, |d| {
                             d.GetDeviceRemovedReason()
                                 .map_or_else(|e| e.code().0, |()| 0)
                         })
