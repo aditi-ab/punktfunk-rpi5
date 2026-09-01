@@ -171,9 +171,11 @@ impl Executor<'_> {
     /// Replace or append one `KEY=VALUE` line in host.env, creating it on first use.
     fn set_env(&self, key: &str, value: &str) {
         let path = self.paths.host_env();
+        // These are Linux box paths, and the goldens must be byte-identical on every OS the
+        // suite runs on — a Windows test host's PathBuf::join writes `\` into the transcript.
+        let shown = path.display().to_string().replace('\\', "/");
         if self.opts.dry {
-            self.ui
-                .ok(&format!("would set {key}={value} in {}", path.display()));
+            self.ui.ok(&format!("would set {key}={value} in {shown}"));
             return;
         }
         if let Some(dir) = path.parent() {
@@ -189,9 +191,9 @@ impl Executor<'_> {
         let mut body = lines.join("\n");
         body.push('\n');
         if std::fs::write(&path, body).is_ok() {
-            self.ui.ok(&format!("{key}={value} → {}", path.display()));
+            self.ui.ok(&format!("{key}={value} → {shown}"));
         } else {
-            self.ui.warn(&format!("could not write {}", path.display()));
+            self.ui.warn(&format!("could not write {shown}"));
         }
     }
 
