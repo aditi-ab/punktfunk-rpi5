@@ -126,7 +126,7 @@ fn the_demo_walks_from_the_settings_screen_to_the_outro() {
     // Under `-v` the commands still echo. That transparency is the trust feature, and it is
     // what the flag exists to preserve now that a run collapses to a progress line by default.
     assert!(
-        text.contains("+ sudo apt install punktfunk-host punktfunk-web punktfunk-scripting"),
+        text.contains("+ sudo apt install -y punktfunk-host punktfunk-web punktfunk-scripting"),
         "the command echo is missing:\n{text}"
     );
     assert!(

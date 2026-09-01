@@ -11,7 +11,8 @@
 //!
 //! The Omarchy rows live here rather than in `punktfunk-omarchy`, which used to ask for
 //! them itself. `omarchy_setup` stays the umbrella every row defaults to, so the frozen
-//! `--no-omarchy-setup` still clears all four.
+//! `--no-omarchy-setup` still clears all three. The console certificate is not one of them:
+//! every host install trusts it, Omarchy through the hand-off, everyone else in `exec`.
 
 use serde::{Deserialize, Serialize};
 
@@ -49,7 +50,7 @@ pub struct Pins {
     pub omarchy_toasts: Option<bool>,
     pub omarchy_idle: Option<bool>,
     pub omarchy_theme: Option<bool>,
-    pub omarchy_cert: Option<bool>,
+    pub console_cert: Option<bool>,
     pub mgmt_port: Option<u16>,
     pub no_start: bool,
 }
@@ -73,7 +74,9 @@ pub struct Choices {
     pub omarchy_toasts: bool,
     pub omarchy_idle: bool,
     pub omarchy_theme: bool,
-    pub omarchy_cert: bool,
+    /// Trust the console's certificate in the user's browser store. On by default on every
+    /// host install and never a row on the screen: it is one certificate, this machine's own.
+    pub console_cert: bool,
     /// Why the box chose these — shown next to the row when it is on.
     pub group_why: Option<String>,
     pub gamestream_why: Option<String>,
@@ -128,7 +131,7 @@ impl Choices {
             omarchy_toasts: pins.omarchy_toasts.unwrap_or(omarchy_setup),
             omarchy_idle: pins.omarchy_idle.unwrap_or(omarchy_setup),
             omarchy_theme: pins.omarchy_theme.unwrap_or(omarchy_setup),
-            omarchy_cert: pins.omarchy_cert.unwrap_or(omarchy_setup),
+            console_cert: pins.console_cert.unwrap_or(true),
             group_why: punktfunk_group.then_some(group_why).flatten(),
             gamestream_why: (gamestream && facts.sunshine_active)
                 .then(|| "Sunshine/Apollo already on this box".to_string()),

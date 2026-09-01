@@ -10,7 +10,6 @@
 │    Third-party clients      no  — punktfunk's own apps don't need it
 │    Shared clipboard         yes
 │    Host service             yes
-│    Console certificate      yes
 │    Desktop notifications    yes
 │    Keep the screen awake    yes
 │    Match the Omarchy theme  yes

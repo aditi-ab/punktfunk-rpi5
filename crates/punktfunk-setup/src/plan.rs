@@ -63,6 +63,9 @@ pub enum StepAction {
     Linger,
     /// Re-probes the user manager, which the linger step above may have just created.
     StartUnits { units: Vec<String> },
+    /// Files the console's certificate in the user's NSS store. Resolved in `exec`: the host
+    /// mints the certificate on its first start, so the step has to wait for the file.
+    TrustCert,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,7 +214,7 @@ pub fn build(facts: &Facts, choices: &Choices) -> Plan {
         plan.push(
             Phase::Start,
             "Starting the host and the web console",
-            start_steps(facts),
+            start_steps(facts, choices),
         );
     }
     plan
@@ -258,7 +261,7 @@ fn install_phase(
         plan.push(
             Phase::Install,
             format!(
-                "host, web console and plugin runner are installed ({version}, {} channel) — updating to the current build",
+                "host, web console and plugin runner are already installed ({version}, {} channel) — updating to the current build",
                 channel.as_str()
             ),
             steps,
@@ -313,7 +316,7 @@ fn omarchy_steps(_facts: &Facts, choices: &Choices) -> Vec<Step> {
     let cmd = format!(
         "punktfunk-omarchy setup --groups={} --cert={} --toasts={} --idle-guard={} --theme={}",
         bit(choices.punktfunk_group),
-        bit(choices.omarchy_cert),
+        bit(choices.console_cert),
         bit(choices.omarchy_toasts),
         bit(choices.omarchy_idle),
         bit(choices.omarchy_theme),
@@ -455,7 +458,7 @@ fn firewall_steps(facts: &Facts, choices: &Choices) -> Vec<Step> {
     }
 }
 
-fn start_steps(facts: &Facts) -> Vec<Step> {
+fn start_steps(facts: &Facts, choices: &Choices) -> Vec<Step> {
     let mut steps = vec![];
     let mut units = vec!["punktfunk-host".to_string()];
     if facts.web_unit_present {
@@ -477,6 +480,13 @@ fn start_steps(facts: &Facts) -> Vec<Step> {
         action: StepAction::StartUnits { units },
         ends_run: false,
     });
+    // After the start, never before: the certificate exists only once the host has run.
+    if choices.console_cert {
+        steps.push(Step {
+            action: StepAction::TrustCert,
+            ends_run: false,
+        });
+    }
     steps
 }
 

@@ -42,6 +42,10 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 - **`PUNKTFUNK_INSTALL_OMARCHY_SETUP`** is the env twin for the Omarchy hand-off, which
   previously could only be answered interactively. `PUNKTFUNK_SETUP_BIN` overrides the stub's
   download with a local binary.
+- **Every host install trusts the console's certificate** in the user's NSS store, so Chromium
+  opens `https://localhost:47992` with no warning; it was Omarchy-only and a question. It needs
+  `certutil` (`nss`, `libnss3-tools`, `nss-tools`) and warns when that is missing —
+  `--no-console-cert` / `PUNKTFUNK_INSTALL_CONSOLE_CERT=0` opts out.
 - **`overlay_actions.pad` grows per-control layout overrides.** `pad.controls` (and
   `pad.controls_narrow` for a narrow layer) maps control ids — `ls`, `rs`, `dpad`, `face`,
   `lb`, `rb`, `lt`, `rt`, `select`, `guide`, `start` — to `{x, y, scale, hidden}`; absent
@@ -61,6 +65,10 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 - **The install commands are generated from `data/platforms.json`.** They were copied beside it
   and kept in step by a CI substring check; the binary embeds the file, so the docs and the
   installer cannot drift. Nothing to do.
+- **The package manager no longer asks its own "proceed?"** — every install line carries
+  `-y` / `--noconfirm`, since running the installer is the consent. While the progress line is
+  up a step's output is captured and its last lines are shown only when it fails; `-v` keeps the
+  full transcript.
 - **REALTIME GPU scheduling priority is the Windows default again**, in the host process
   (`PUNKTFUNK_GPU_PRIORITY_CLASS`, the `auto` gated-upgrade mode is gone) and the vdisplay
   swap-chain raise (the `PFVD_RT_GPU` opt-in ladder is gone). A box that needs the old posture

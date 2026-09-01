@@ -139,6 +139,12 @@ pub struct RunFailed;
 pub trait CommandRunner {
     fn run_shell(&self, cmd: &str, stdin: Stdin) -> Result<(), RunFailed>;
 
+    /// `run_shell` with the output captured instead of inherited. The progress view shows
+    /// nothing while a step runs, so on failure the tail is what the user gets to act on.
+    fn run_shell_quiet(&self, cmd: &str, stdin: Stdin) -> Result<(), Vec<String>> {
+        self.run_shell(cmd, stdin).map_err(|RunFailed| Vec::new())
+    }
+
     /// Spawn a probe and capture it. `None` when the program is not on `PATH`.
     fn probe(&self, program: &str, args: &[&str]) -> Option<Output>;
 
@@ -172,6 +178,25 @@ impl SystemRunner {
         }
     }
 
+    /// `sh -ec <cmd>` with stdin wired the way the caller asked.
+    fn sh(&self, cmd: &str, stdin: Stdin) -> std::process::Command {
+        let source = match stdin {
+            Stdin::Tty => std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/tty")
+                .ok(),
+            Stdin::Null => None,
+        };
+        let mut c = self.command("sh");
+        c.arg("-ec").arg(cmd);
+        match source {
+            Some(tty) => c.stdin(std::process::Stdio::from(tty)),
+            None => c.stdin(std::process::Stdio::null()),
+        };
+        c
+    }
+
     // The single sanctioned `Command::new` in the crate; everything else routes through the
     // trait so demo mode and the tests cannot be bypassed by accident.
     #[allow(clippy::disallowed_methods)]
@@ -200,23 +225,22 @@ impl Default for SystemRunner {
 
 impl CommandRunner for SystemRunner {
     fn run_shell(&self, cmd: &str, stdin: Stdin) -> Result<(), RunFailed> {
-        let source = match stdin {
-            Stdin::Tty => std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/tty")
-                .ok(),
-            Stdin::Null => None,
-        };
-        let mut c = self.command("sh");
-        c.arg("-ec").arg(cmd);
-        match source {
-            Some(tty) => c.stdin(std::process::Stdio::from(tty)),
-            None => c.stdin(std::process::Stdio::null()),
-        };
-        match c.status() {
+        match self.sh(cmd, stdin).status() {
             Ok(s) if s.success() => Ok(()),
             _ => Err(RunFailed),
+        }
+    }
+
+    /// `exec 2>&1` keeps stderr in order with stdout. sudo's password prompt talks to the
+    /// terminal directly, so it still reaches the user.
+    fn run_shell_quiet(&self, cmd: &str, stdin: Stdin) -> Result<(), Vec<String>> {
+        match self.sh(&format!("exec 2>&1\n{cmd}"), stdin).output() {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => Err(String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect()),
+            Err(_) => Err(Vec::new()),
         }
     }
 

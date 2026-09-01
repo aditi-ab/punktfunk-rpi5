@@ -25,7 +25,6 @@ pub enum Field {
     Clipboard,
     Linger,
     Start,
-    OmarchyCert,
     OmarchyToasts,
     OmarchyIdle,
     OmarchyTheme,
@@ -87,7 +86,6 @@ impl Screen {
             // Omarchy's own options, asked here instead of again by `punktfunk-omarchy setup`.
             if facts.omarchy {
                 items.extend([
-                    Item::Row(Field::OmarchyCert),
                     Item::Row(Field::OmarchyToasts),
                     Item::Row(Field::OmarchyIdle),
                     Item::Row(Field::OmarchyTheme),
@@ -168,7 +166,6 @@ impl Screen {
             Field::Clipboard => self.choices.clipboard = on,
             Field::Linger => self.choices.linger = on,
             Field::Start => self.choices.start = on,
-            Field::OmarchyCert => self.choices.omarchy_cert = on,
             Field::OmarchyToasts => self.choices.omarchy_toasts = on,
             Field::OmarchyIdle => self.choices.omarchy_idle = on,
             Field::OmarchyTheme => self.choices.omarchy_theme = on,
@@ -220,7 +217,6 @@ impl Screen {
             Field::Clipboard => "Shared clipboard",
             Field::Linger => "Start at boot",
             Field::Start => "Host service",
-            Field::OmarchyCert => "Console certificate",
             Field::OmarchyToasts => "Desktop notifications",
             Field::OmarchyIdle => "Keep the screen awake",
             Field::OmarchyTheme => "Match the Omarchy theme",
@@ -257,7 +253,6 @@ impl Screen {
                 _ => "no  — the host waits for your session".into(),
             },
             Field::Start => yn(c.start).trim_end().to_string(),
-            Field::OmarchyCert => yn(c.omarchy_cert).trim_end().to_string(),
             Field::OmarchyToasts => yn(c.omarchy_toasts).trim_end().to_string(),
             Field::OmarchyIdle => yn(c.omarchy_idle).trim_end().to_string(),
             Field::OmarchyTheme => yn(c.omarchy_theme).trim_end().to_string(),
@@ -274,7 +269,6 @@ impl Screen {
             Field::Clipboard => "Share the clipboard between this host and your clients. Each client still opts in per host.",
             Field::Linger => "Starts the host at boot so it is reachable before anyone logs in. It can only stream once a session exists.",
             Field::Start => "Enable and start the services once the install finishes. Off installs the files and starts nothing.",
-            Field::OmarchyCert => "Opens the console without a browser warning. Trusts one certificate, belonging to this machine only.",
             Field::OmarchyToasts => "A toast when a device asks to pair, and when a stream starts or stops.",
             Field::OmarchyIdle => "Holds off the idle lock for as long as a stream is running.",
             Field::OmarchyTheme => "The console follows whatever theme Omarchy is on, instead of its own palette.",
