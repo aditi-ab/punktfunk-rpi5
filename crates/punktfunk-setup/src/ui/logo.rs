@@ -4,18 +4,20 @@
 //! lens — so the mark is a point-in-circle test per pixel over the union's bounding box. No
 //! bitmap, no build-time raster step, and it scales by changing one constant.
 //!
-//! Rendering is the half-block idiom: `▀` with foreground = the top pixel and background =
-//! the bottom one gives two square pixels per cell, so 26×26 px is 26 columns by 13 rows.
-//! Hard edges, no anti-aliasing: the pixelated look is the point, and the terminal background
-//! is unknown so there is nothing safe to blend toward.
+//! Rendering is the half-block idiom: `▀` with foreground = the top pixel and background = the
+//! bottom one gives two square pixels per cell, so `MARK_PX` square is that many columns by
+//! half as many rows. Hard edges, no anti-aliasing: the pixelated look is the point, and the
+//! terminal background is unknown, so there is nothing safe to blend toward — which is also
+//! why an uncovered cell must actively put the background back rather than leave it inherited.
 //!
 //! The animation slides the two circles together along their diagonal and the lens lights up
 //! as they meet — the brand story drawn. `design/installer-v2.md` D7 owns the skip rules.
 
 use crate::ui::theme::{Caps, Colors, Layer, Rgb};
 
-/// The mark is square; 26 px is 13 text rows, which fits above a prompt without scrolling.
-pub const MARK_PX: usize = 26;
+/// The mark is square, and must be even: two pixel rows share a cell. 20 px is 10 text rows —
+/// big enough to read as the lens, small enough not to own the screen above a prompt.
+pub const MARK_PX: usize = 20;
 pub const MARK_COLS: u16 = MARK_PX as u16;
 
 const LIGHT: Rgb = Rgb(0xa7, 0x9f, 0xf8);
@@ -115,7 +117,13 @@ pub fn render(grid: &[Vec<Option<Rgb>>], caps: &Caps, indent: usize) -> String {
             let up = top[col];
             let down = bottom.and_then(|row| row[col]);
             match (up, down) {
-                (None, None) => out.push(' '),
+                // A space still paints the background it inherits, so an uncovered cell has to
+                // put it back to default. Skipping that smeared the previous cell's colour
+                // across the rest of the line.
+                (None, None) => {
+                    out.push_str(&caps.clear(Layer::Bg));
+                    out.push(' ');
+                }
                 // A half-covered cell paints one layer and leaves the other alone, so the
                 // mark sits on the user's own background instead of a violet rectangle.
                 (Some(c), None) => {
@@ -194,7 +202,7 @@ mod tests {
             Intro::Plain
         );
         assert_eq!(
-            intro_level(&caps(Colors::Truecolor, 20, true), false),
+            intro_level(&caps(Colors::Truecolor, 12, true), false),
             Intro::Plain
         );
     }
@@ -260,9 +268,48 @@ mod tests {
         );
     }
 
+    /// A space paints whatever background is in effect. Emitting one without clearing it first
+    /// smeared the previous cell's colour across the rest of the line — which the goldens, being
+    /// colourless, could not see, and a real terminal showed immediately.
     #[test]
-    fn thirteen_rows_carry_twenty_six_pixel_rows() {
+    fn no_blank_cell_is_painted_with_a_leftover_background() {
         let caps = caps(Colors::Truecolor, 80, true);
+        for t in [0.0, 0.3, 0.7, 1.0] {
+            let text = render(&frame(t), &caps, 2);
+            let mut bg = false;
+            let mut chars = text.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    let mut seq = String::new();
+                    for c in chars.by_ref() {
+                        seq.push(c);
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                    if seq.starts_with("[48;") {
+                        bg = true;
+                    } else if seq == "[49m" || seq == "[0m" {
+                        bg = false;
+                    }
+                } else {
+                    assert!(
+                        !(c == ' ' && bg),
+                        "t={t}: a blank cell carried a background"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_two_pixel_rows_share_one_text_row() {
+        let caps = caps(Colors::Truecolor, 80, true);
+        assert_eq!(
+            MARK_PX % 2,
+            0,
+            "an odd mark would leave a half-filled last row"
+        );
         assert_eq!(still(&caps, 0).lines().count(), MARK_PX / 2);
     }
 }
