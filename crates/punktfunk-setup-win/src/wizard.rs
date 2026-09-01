@@ -1106,7 +1106,7 @@ fn config_row(ctx: &Ctx, field: Field) -> Element {
                     })
                     .reveal_button_enabled(false)
                     .font_family(MONO)
-                    .min_width(280.0)
+                    .min_width(240.0)
                     .on_password_changed(move |pw: String| {
                         let mut s = edit.screen.clone();
                         s.set_password(pw);
@@ -1128,17 +1128,26 @@ fn config_row(ctx: &Ctx, field: Field) -> Element {
             .into()
         }
     };
+    let words = vstack((
+        text_block(WinScreen::label(field)).semibold(),
+        text_block(ctx.screen.why(field))
+            .wrap()
+            .font_size(12.0)
+            .foreground(ThemeRef::SecondaryText),
+    ))
+    .spacing(1.0);
+    // The password editor is wider than a section column's Auto slot leaves room for: side
+    // by side, the label column collapses to nothing and the wrapped hint explodes in
+    // height. That row stacks instead.
+    if field == Field::Password {
+        return vstack((words, editor.margin(edges(0.0, 8.0, 0.0, 0.0))))
+            .spacing(2.0)
+            .into();
+    }
     grid((
-        vstack((
-            text_block(WinScreen::label(field)).semibold(),
-            text_block(ctx.screen.why(field))
-                .wrap()
-                .font_size(12.0)
-                .foreground(ThemeRef::SecondaryText),
-        ))
-        .spacing(1.0)
-        .vertical_alignment(VerticalAlignment::Center)
-        .grid_column(0),
+        words
+            .vertical_alignment(VerticalAlignment::Center)
+            .grid_column(0),
         editor.grid_column(1),
     ))
     .columns([GridLength::Star(1.0), GridLength::Auto])
