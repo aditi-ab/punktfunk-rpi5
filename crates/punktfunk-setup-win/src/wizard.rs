@@ -53,8 +53,10 @@ const MUTED: Color = Color {
     b: 0x80,
 };
 
-/// Stepper dot diameter; the line is 2 px and meets the dot's edge.
+/// Stepper dot diameter; the line is 2 px and meets the dot's edge. Each step gets `STEP_W`
+/// of the header's right side — narrow, the labels still fit at 11 px.
 const DOT: f64 = 10.0;
+const STEP_W: f64 = 84.0;
 
 /// The lockup intro: the website's 1.3 s at 16 ms a frame.
 const LOGO_FRAMES: u32 = 81;
@@ -689,11 +691,21 @@ pub fn slide_margin(forward: bool, progress: f64) -> Thickness {
 fn frame(ctx: &Ctx, step: WizStep, content: Element, buttons: Vec<Element>) -> Element {
     let steps = run_steps(ctx);
     let pos = steps.iter().position(|s| *s == step).unwrap_or(0);
-    let head = stepper(&steps, pos, ctx.uninstall).margin(edges(0.0, 0.0, 0.0, 22.0));
-    let title = text_block(step_title(step, ctx.uninstall))
-        .font_size(26.0)
-        .semibold()
-        .margin(edges(0.0, 0.0, 0.0, 14.0));
+    // One header row: the step title left, the stepper right and narrow.
+    let head = grid((
+        text_block(step_title(step, ctx.uninstall))
+            .font_size(26.0)
+            .semibold()
+            .vertical_alignment(VerticalAlignment::Center)
+            .grid_column(0),
+        stepper(&steps, pos, ctx.uninstall)
+            .width(steps.len() as f64 * STEP_W)
+            .horizontal_alignment(HorizontalAlignment::Right)
+            .vertical_alignment(VerticalAlignment::Center)
+            .grid_column(1),
+    ))
+    .columns([GridLength::Star(1.0), GridLength::Auto])
+    .margin(edges(0.0, 0.0, 0.0, 20.0));
     let bar = border(
         hstack(buttons)
             .spacing(8.0)
@@ -703,11 +715,8 @@ fn frame(ctx: &Ctx, step: WizStep, content: Element, buttons: Vec<Element>) -> E
     .border_thickness(edges(0.0, 1.0, 0.0, 0.0))
     .padding(edges(0.0, 14.0, 0.0, 0.0))
     .margin(edges(0.0, 16.0, 0.0, 0.0));
-    let page = grid((title.grid_row(0), content.grid_row(1), bar.grid_row(2))).rows([
-        GridLength::Auto,
-        GridLength::Star(1.0),
-        GridLength::Auto,
-    ]);
+    let page = grid((content.grid_row(0), bar.grid_row(1)))
+        .rows([GridLength::Star(1.0), GridLength::Auto]);
     let slide = ctx.slide;
     let page = border(page)
         .opacity(slide.progress)
@@ -748,13 +757,14 @@ fn back_button(ctx: &Ctx, cur: WizStep) -> Element {
         .into()
 }
 
-/// One of the two setup options on Welcome: a radio in a card, the whole card tappable, the
-/// chosen one outlined in the accent.
+/// One of the two setup options on Welcome: a radio in a card, the whole card tappable. The
+/// chosen one shows an accent ring drawn OVER the card (a stroke-only rectangle, so taps pass
+/// through) that fades in and out — the card itself never changes size, so nothing shifts.
 fn option_card(ctx: &Ctx, custom: bool, title: &str, detail: &str) -> Element {
     let selected = ctx.custom == custom;
     let pick = ctx.set_custom.clone();
     let tap = ctx.set_custom.clone();
-    border(
+    let card = border(
         vstack((
             RadioButton::new(title)
                 .group("setup")
@@ -769,16 +779,18 @@ fn option_card(ctx: &Ctx, custom: bool, title: &str, detail: &str) -> Element {
         .spacing(2.0),
     )
     .background(ThemeRef::CardBackground)
-    .border_brush(if selected {
-        ThemeRef::Accent
-    } else {
-        ThemeRef::CardStroke
-    })
-    .border_thickness(Thickness::uniform(if selected { 2.0 } else { 1.0 }))
+    .border_brush(ThemeRef::CardStroke)
+    .border_thickness(Thickness::uniform(1.0))
     .corner_radius(10.0)
     .padding(edges(16.0, 12.0, 16.0, 14.0))
-    .on_tapped(move || tap.call(custom))
-    .into()
+    .on_tapped(move || tap.call(custom));
+    let ring = Shape::rectangle()
+        .stroke(brand::VIOLET)
+        .stroke_thickness(2.0)
+        .corner_radius(10.0)
+        .opacity(if selected { 1.0 } else { 0.0 })
+        .with_opacity_transition(std::time::Duration::from_millis(180));
+    grid((card, ring)).into()
 }
 
 /// The brand lockup — the mark above the "funk" wordmark — with the website's one-shot
