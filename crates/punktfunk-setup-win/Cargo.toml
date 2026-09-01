@@ -28,6 +28,9 @@ punktfunk-setup = { path = "../punktfunk-setup" }
 # risk table: reactor pin drift). The workspace lock already carries it via the client.
 [target.'cfg(windows)'.dependencies]
 windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+# `UISettings.AnimationsEnabled` — the system animation switch the D9 slide honours. Same
+# commit as reactor so `windows-core` unifies (the client's rule for this crate).
+windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc", features = ["UI_ViewManagement"] }
 
 [target.'cfg(windows)'.build-dependencies]
 windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
