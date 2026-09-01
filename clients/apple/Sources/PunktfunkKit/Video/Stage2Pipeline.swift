@@ -556,6 +556,25 @@ final class LatestBox<T>: @unchecked Sendable {
     }
 }
 
+/// Stage-4's stale-link ladder. A link that stops vending is relinked; a link that stalls
+/// AGAIN within `rebuildWindow` of that relink means the CAMetalLayer itself is wedged, and
+/// only a fresh layer cures that — so the caller rebuilds the whole presenter instead.
+/// Field 2026-09-01 (iPad Pro / iOS 27): the relink vended exactly one drawable, then went
+/// silent for good; reconnecting (a new layer) fixed it every time. 2 s covers that shape
+/// (the second stall is re-detected ≈0.3 s after the relink) with margin; a link that ran
+/// clean for longer has earned a fresh relink. Render-thread confined. Internal for tests.
+struct LinkStallPolicy {
+    enum Action { case relink, rebuild }
+    let rebuildWindow: CFTimeInterval
+    private(set) var lastRelink: CFTimeInterval = -.infinity
+    init(rebuildWindow: CFTimeInterval = 2) { self.rebuildWindow = rebuildWindow }
+    mutating func onStall(now: CFTimeInterval) -> Action {
+        if now - lastRelink < rebuildWindow { return .rebuild }
+        lastRelink = now
+        return .relink
+    }
+}
+
 /// The deadline link's frame-latency ASK and property READBACK, published for the HUD to render.
 ///
 /// ⚠ A readback is NOT a grant. `preferredFrameLatency` is a plain read-write float
@@ -1177,6 +1196,9 @@ public final class Stage2Pipeline {
 
     /// The Metal layer the hosting view installs + sizes.
     public var layer: CAMetalLayer { presenter.layer }
+    /// Deadline pacing found the layer wedged (see `LinkStallPolicy`): fires ONCE, from the
+    /// render thread. The owner rebuilds the presenter on a fresh layer. Set before `start`.
+    public var onPresentWedged: (@Sendable () -> Void)?
 
     /// Unified-stats meters (design/stats-unification.md): `endToEndMeter` records the headline
     /// end-to-end (capture→on-glass, skew-corrected); `decodeMeter` the decode stage
@@ -1591,6 +1613,7 @@ public final class Stage2Pipeline {
         let clockOffset = clockOffset
         let hint = frameRateHint
         let layer = presenter.layer
+        let onWedged = onPresentWedged
         let stash = LatestBox<CAMetalDrawable>()
         // Cadence targeting under deadline pacing: the link's vend IS the grid snap, so the clock
         // only has to hold a frame back until it is due and the next update presents it — at most
@@ -1702,6 +1725,10 @@ public final class Stage2Pipeline {
             // When the link last handed over a drawable, for the stale-link watchdog. Reset on
             // every (re)start too, so a fresh link gets its first vend before it can be judged.
             var lastVend = CACurrentMediaTime()
+            // Relink once, rebuild if it stalls again (see LinkStallPolicy). `wedged` latches:
+            // the rebuild replaces this pipeline, so the watchdog stops after one report.
+            var stallPolicy = LinkStallPolicy()
+            var wedged = false
             // Per-iteration autorelease pool — same contract as the arrival/glass loop (the
             // vended drawable and its retinue are autoreleased objects on a runloop-less thread).
             while !token.isStopped { autoreleasepool {
@@ -1746,26 +1773,28 @@ public final class Stage2Pipeline {
                     ring.putBack(frame)
                     debugStats?.noDrawableWake()
                     // …unless the link has gone silent (see `linkStaleAfter`). Only a decoded
-                    // frame reaches here, so a quiet stream never trips this. Retire the
-                    // generation and relink: invalidating the old link also returns the
-                    // drawables it holds, so this recovers a dead link and an exhausted pool
-                    // alike. The retired thread sees its flag within one runloop poll (≤100 ms)
-                    // and invalidates there; the brief two-link overlap is harmless because the
-                    // old link is, by definition, not vending.
-                    // ponytail: unbounded retries (~4/s while frames arrive and no link vends).
-                    // A relink that works logs once; a repeat IS the signal that relinking is
-                    // not the cure, and it lands in the send-logs ring where we can read it.
-                    // Add a backoff only if that noise ever costs more than it tells us.
+                    // frame reaches here, so a quiet stream never trips this. First stall:
+                    // retire the generation and relink (the retired thread invalidates within
+                    // one ≤100 ms runloop poll). A stall right after that relink: the layer
+                    // is wedged — hand the session to the owner for a rebuild (LinkStallPolicy).
                     let stalledFor = CACurrentMediaTime() - lastVend
-                    if let stale = linkStop, stalledFor > linkStaleAfter {
-                        stale.stop()
-                        let stop = StopFlag()
-                        linkStop = stop
-                        lastVend = CACurrentMediaTime()
-                        startLink(stop)
+                    if let stale = linkStop, !wedged, stalledFor > linkStaleAfter {
                         let ms = Int(stalledFor * 1000)
-                        presentLog.error(
-                            "stage4: link stalled \(ms) ms with no vend — retiring it, relinking")
+                        stale.stop()
+                        if stallPolicy.onStall(now: CACurrentMediaTime()) == .rebuild,
+                           let onWedged {
+                            wedged = true
+                            presentLog.error(
+                                "stage4: link stalled \(ms) ms again right after a relink — layer wedged, rebuilding the presenter")
+                            onWedged()
+                        } else {
+                            let stop = StopFlag()
+                            linkStop = stop
+                            lastVend = CACurrentMediaTime()
+                            startLink(stop)
+                            presentLog.error(
+                                "stage4: link stalled \(ms) ms with no vend — retiring it, relinking")
+                        }
                     }
                     debugStats?.flushIfDue(ring: ring, gate: nil)
                     return

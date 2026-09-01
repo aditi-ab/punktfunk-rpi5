@@ -162,8 +162,11 @@ Out-of-tree embedders must recompile. Read **Breaking**. Detail: `design/touch-c
 
 - **A refused swapchain costs fullscreen, not the session** (Windows presenter). Warn, drop to
   windowed, rebuild against the geometry that worked. A windowed failure still propagates.
-- **Stage 4 relinks when the display link stops vending** (Apple). Past 250 ms without a vend
-  while frames still decode, the render thread retires the link generation.
+- **Stage 4 relinks when the display link stops vending, and rebuilds the presenter when the
+  relink does not hold** (Apple). Past 250 ms without a vend while frames still decode, the
+  render thread retires the link generation; a second stall within 2 s of that relink means the
+  CAMetalLayer is wedged, and `SessionPresenter` restarts pipeline, presenter and layer on the
+  same connection (one IDR).
 - **Switch Pro SPI-flash reads are served by range**, not an exact (address, length) pair.
   Steam's HIDAPI calibration reads no longer get a zero-fill.
 - **Steam Input's touch-as-mouse no longer walks the host cursor** on a Deck in Gaming Mode.

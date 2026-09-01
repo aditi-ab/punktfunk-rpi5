@@ -988,7 +988,7 @@ public final class StreamLayerView: NSView {
             decodeMeter: decodeMeter,
             displayMeter: displayMeter,
             presentFloorMeter: presentFloorMeter,
-            makeDisplayLink: { displayLink(target: $0, selector: $1) },
+            makeDisplayLink: { [unowned self] in self.displayLink(target: $0, selector: $1) },
             onFrame: onFrame,
             onSessionEnd: onSessionEnd,
             onDecodedSize: { [weak self] w, h in // resize overlay END signal (new-mode IDR dims)
