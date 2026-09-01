@@ -70,6 +70,16 @@ internal fun QuickActionsScreen(
     val cfg = remember(blob) { OverlayConfig.parse(blob) }
     var picking by remember { mutableStateOf<Int?>(null) }
     var editingShortcut by remember { mutableStateOf<ShortcutDraft?>(null) }
+    var editingLayout by remember { mutableStateOf(false) }
+
+    if (editingLayout) {
+        PadLayoutEditor(
+            pad = cfg.pad,
+            onChange = { onChange(cfg.copy(pad = it).toJson()) },
+            onBack = { editingLayout = false },
+        )
+        return
+    }
 
     fun set(k: Int, id: String) {
         onChange(cfg.copy(ring = cfg.ring.toMutableList().also { it[k] = SlotId.parse(id) }).toJson())
@@ -147,7 +157,8 @@ internal fun QuickActionsScreen(
         // same path the ring uses.
         SettingsGroup(
             "Virtual controller",
-            footer = "Shown from the ring's Virtual controller button. A finger on one of its controls drives the game; a finger anywhere else drives the touch mode.",
+            footer = "Shown from the ring's Virtual controller button. A finger on one of its controls drives the game; a finger anywhere else drives the touch mode. " +
+                "Edit layout moves, sizes or hides each control by hand; wide and upright screens keep separate layouts.",
         ) {
             SettingDropdown(
                 label = "Layout",
@@ -163,6 +174,7 @@ internal fun QuickActionsScreen(
                 "Scale", cfg.pad.scale, PAD_SCALE_MIN..PAD_SCALE_MAX,
                 "How large the controls are; larger ones cover more of the picture.",
             ) { onChange(cfg.copy(pad = cfg.pad.copy(scale = it)).toJson()) }
+            TextButton(onClick = { editingLayout = true }) { Text("Edit layout") }
         }
         SettingsGroup("Shortcuts", footer = "A chord the ring sends to the host. A new one takes the first empty slot.") {
             cfg.shortcuts.forEach { sc ->

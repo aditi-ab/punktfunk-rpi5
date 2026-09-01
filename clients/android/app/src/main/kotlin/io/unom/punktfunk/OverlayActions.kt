@@ -133,8 +133,26 @@ fun keyLegend(k: String): String = when (k.trim().lowercase()) {
     else -> k.trim().lowercase().replaceFirstChar { it.uppercase() }
 }
 
-/** The virtual controller's preset: [layout] is `full`, `sticks` or `dpad`. */
-data class PadConfig(val layout: String = "full", val opacity: Float = 0.45f, val scale: Float = 1f)
+/**
+ * One control's layout override: [x] and [y] place its centre as fractions of the layer's width
+ * and height, [scale] sizes it about that centre, [hidden] takes it out of the stream (the
+ * editor still shows it, ghosted). An absent field keeps the preset's value.
+ */
+data class PadTweak(val x: Float? = null, val y: Float? = null, val scale: Float? = null, val hidden: Boolean = false)
+
+/**
+ * The virtual controller: [layout] is `full`, `sticks` or `dpad`; [opacity] and [scale] are the
+ * two sliders. [controls] carries the per-control overrides keyed by control id (`ls`, `rs`,
+ * `dpad`, `face`, `lb`, `rb`, `lt`, `rt`, `select`, `guide`, `start`), [controlsNarrow] the
+ * same for a narrow (upright) layer — the two classes the preset already lays out differently.
+ */
+data class PadConfig(
+    val layout: String = "full",
+    val opacity: Float = 0.45f,
+    val scale: Float = 1f,
+    val controls: Map<String, PadTweak> = emptyMap(),
+    val controlsNarrow: Map<String, PadTweak> = emptyMap(),
+)
 
 /** Which platform default ring applies. Android is always [TOUCH]; [DESKTOP] exists so the
  *  parser matches its twins exactly. */
@@ -164,11 +182,25 @@ data class OverlayConfig(
                 }
             },
         )
-        j.put(
-            "pad",
-            JSONObject().put("layout", pad.layout).put("opacity", pad.opacity.toDouble())
-                .put("scale", pad.scale.toDouble()),
-        )
+        val padOut = JSONObject().put("layout", pad.layout).put("opacity", pad.opacity.toDouble())
+            .put("scale", pad.scale.toDouble())
+        // An untouched pad keeps its blob clean: no empty maps, no absent fields as nulls.
+        fun tweaks(map: Map<String, PadTweak>) = JSONObject().also { out ->
+            map.forEach { (id, t) ->
+                out.put(
+                    id,
+                    JSONObject().apply {
+                        t.x?.let { put("x", it.toDouble()) }
+                        t.y?.let { put("y", it.toDouble()) }
+                        t.scale?.let { put("scale", it.toDouble()) }
+                        if (t.hidden) put("hidden", true)
+                    },
+                )
+            }
+        }
+        if (pad.controls.isNotEmpty()) padOut.put("controls", tweaks(pad.controls))
+        if (pad.controlsNarrow.isNotEmpty()) padOut.put("controls_narrow", tweaks(pad.controlsNarrow))
+        j.put("pad", padOut)
         return j.toString()
     }
 
@@ -217,10 +249,29 @@ data class OverlayConfig(
                 }
             }
             val padIn = j.optJSONObject("pad")
+            fun tweaks(key: String): Map<String, PadTweak> {
+                val obj = padIn?.optJSONObject(key) ?: return emptyMap()
+                return buildMap {
+                    obj.keys().forEach { id ->
+                        val t = obj.optJSONObject(id) ?: return@forEach
+                        put(
+                            id,
+                            PadTweak(
+                                x = t.optDouble("x").takeIf { !it.isNaN() }?.toFloat(),
+                                y = t.optDouble("y").takeIf { !it.isNaN() }?.toFloat(),
+                                scale = t.optDouble("scale").takeIf { !it.isNaN() }?.toFloat(),
+                                hidden = t.optBoolean("hidden", false),
+                            ),
+                        )
+                    }
+                }
+            }
             val pad = PadConfig(
                 layout = padIn?.optString("layout", "full")?.ifEmpty { "full" } ?: "full",
                 opacity = padIn?.optDouble("opacity", 0.45)?.toFloat() ?: 0.45f,
                 scale = padIn?.optDouble("scale", 1.0)?.toFloat() ?: 1f,
+                controls = tweaks("controls"),
+                controlsNarrow = tweaks("controls_narrow"),
             )
             return OverlayConfig(ring, shortcuts, pad)
         }
