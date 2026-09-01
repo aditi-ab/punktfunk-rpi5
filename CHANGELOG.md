@@ -48,6 +48,10 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 - **The install commands are generated from `data/platforms.json`.** They were copied beside it
   and kept in step by a CI substring check; the binary embeds the file, so the docs and the
   installer cannot drift. Nothing to do.
+- **REALTIME GPU scheduling priority is the Windows default again**, in the host process
+  (`PUNKTFUNK_GPU_PRIORITY_CLASS`, the `auto` gated-upgrade mode is gone) and the vdisplay
+  swap-chain raise (the `PFVD_RT_GPU` opt-in ladder is gone). A box that needs the old posture
+  sets `PUNKTFUNK_GPU_PRIORITY_CLASS=high` and `setx /M PFVD_NO_RT_GPU 1`.
 
 ---
 
