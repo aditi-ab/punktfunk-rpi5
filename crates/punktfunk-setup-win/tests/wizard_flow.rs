@@ -110,29 +110,26 @@ impl Wiz {
         self.texts().iter().any(|t| t.contains(needle))
     }
 
-    /// The most recent control of `kind` whose string prop equals `label`.
+    /// The most recent control of `kind` whose string prop equals `label` — of that kind,
+    /// so a stepper label reading "Uninstall" never shadows the button.
     fn control_with_text(&self, kind: ControlKind, label: &str) -> ControlId {
         self.host.with_reconciler(|r| {
             let ops = &r.backend.ops;
-            let id = ops
-                .iter()
+            let of_kind = |id: &ControlId| {
+                ops.iter()
+                    .any(|op| matches!(op, Op::Create { id: c, kind: k } if c == id && *k == kind))
+            };
+            ops.iter()
                 .rev()
                 .find_map(|op| match op {
                     Op::SetProp {
                         id,
                         value: PropValue::Str(s),
                         ..
-                    } if s == label => Some(*id),
+                    } if s == label && of_kind(id) => Some(*id),
                     _ => None,
                 })
-                .unwrap_or_else(|| panic!("no control carries the text '{label}'"));
-            assert!(
-                ops.iter().any(
-                    |op| matches!(op, Op::Create { id: c, kind: k } if *c == id && *k == kind)
-                ),
-                "'{label}' is not a {kind:?}"
-            );
-            id
+                .unwrap_or_else(|| panic!("no {kind:?} carries the text '{label}'"))
         })
     }
 
@@ -282,10 +279,44 @@ fn the_public_network_demo_walks_the_d12_step_and_answer_b_opens_the_firewall() 
 }
 
 #[test]
-fn the_uninstall_demo_tears_down_inside_the_sandbox() {
+fn the_uninstaller_demo_offers_only_the_teardown_and_runs_it_in_the_sandbox() {
     let wiz = Wiz::open("win11-uninstall");
+    assert!(wiz.has_text("punktfunk 0.34.0 · host installed"));
     assert!(wiz.has_text("This removes punktfunk"));
-    wiz.click("Continue");
+    assert!(!wiz.has_text("Reconfigure"), "no payload, no reconfigure");
+    assert_eq!(wiz.dots(), 3, "Welcome · Uninstall · Done");
+    wiz.click("Uninstall");
+    wiz.wait_for_done();
+    assert!(wiz.has_text("service uninstall"), "the teardown ran");
+    assert!(wiz.has_text("punktfunk was removed"));
+}
+
+#[test]
+fn the_upgrade_demo_opens_in_manage_mode_and_reconfigure_walks_the_upgrade() {
+    let wiz = Wiz::open("win11-upgrade");
+    assert!(wiz.has_text("punktfunk 0.34.0 · host installed"));
+    wiz.click("Reconfigure");
+    assert!(
+        wiz.has_text("Moonlight compat"),
+        "the Configure rows render"
+    );
+    assert!(
+        !wiz.has_text("Web console password"),
+        "no password row on an installed box"
+    );
+    wiz.click("Install");
+    wiz.wait_for_done();
+    assert!(wiz.has_text("service install"), "the upgrade plan ran");
+    assert!(
+        !wiz.has_text("service uninstall"),
+        "Reconfigure never tears down"
+    );
+}
+
+#[test]
+fn uninstall_from_the_manage_welcome_tears_down() {
+    let wiz = Wiz::open("win11-upgrade");
+    wiz.click("Uninstall");
     wiz.wait_for_done();
     assert!(wiz.has_text("service uninstall"), "the teardown ran");
     assert!(wiz.has_text("punktfunk was removed"));

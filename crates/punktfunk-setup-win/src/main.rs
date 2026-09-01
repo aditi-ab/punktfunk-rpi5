@@ -18,9 +18,10 @@ use punktfunk_setup_win::wizard;
 fn main() -> std::process::ExitCode {
     use punktfunk_setup::platform::windows::args::InnoArgs;
     use punktfunk_setup::platform::windows::demo::{win_preset, WIN_PRESETS};
+    use punktfunk_setup::platform::windows::launched_as_uninstaller;
     use std::process::ExitCode;
 
-    const USAGE: &str = "punktfunk setup wizard (WP2.1 — demo presets only)\n\n\
+    const USAGE: &str = "punktfunk setup wizard (demo presets only until the pack step lands)\n\n\
         usage: punktfunk-setup-win --demo <preset>\n\
         presets: win11-fresh win11-upgrade win11-sunshine win11-public win11-uninstall client-fresh client-win10";
 
@@ -54,13 +55,18 @@ fn main() -> std::process::ExitCode {
         );
         return ExitCode::from(2);
     };
-    let Some(preset) = win_preset(&name) else {
+    let Some(mut preset) = win_preset(&name) else {
         eprintln!(
             "unknown --demo preset '{name}'. Try: {}",
             WIN_PRESETS.join(", ")
         );
         return ExitCode::from(2);
     };
+    // D6: the payload-less copy packed as unins000.exe is the uninstaller — the same wizard,
+    // teardown path only. The name is the switch, so a demo copied to that name walks it.
+    if std::env::current_exe().is_ok_and(|p| launched_as_uninstaller(&p)) {
+        preset.uninstall = true;
+    }
 
     match wizard::run(preset) {
         Ok(()) => ExitCode::SUCCESS,

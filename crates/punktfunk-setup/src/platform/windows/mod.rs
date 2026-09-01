@@ -41,6 +41,18 @@ pub const COMPETING_SERVICES: [&str; 5] = [
 /// The management API's default port — and Sunshine's web UI port, which is why D11 exists.
 pub const MGMT_PORT: u16 = 47990;
 
+/// The uninstaller's file name: docs-site promises `{app}\unins000.exe` (D6), so the pack
+/// step emits the wizard, payload-less, under it — and running under it means teardown only.
+pub const UNINSTALLER_EXE: &str = "unins000.exe";
+
+/// The D6 mode switch: the same wizard exe, launched under the uninstaller's name.
+pub fn launched_as_uninstaller(exe: &std::path::Path) -> bool {
+    // Both separators by hand: on the unix golden lanes a backslash path is ONE component.
+    exe.to_str()
+        .and_then(|s| s.rsplit(['\\', '/']).next())
+        .is_some_and(|n| n.eq_ignore_ascii_case(UNINSTALLER_EXE))
+}
+
 /// Where D11 moves the management API when a competitor owns [`MGMT_PORT`].
 pub const MGMT_PORT_MOVED: u16 = 47991;
 
@@ -445,6 +457,19 @@ mod tests {
             .with_path("schtasks");
         let env = Env::of(&[("PROCESSOR_ARCHITECTURE", "AMD64")]);
         (run, env, FakeNet::default(), tempfile::tempdir().unwrap())
+    }
+
+    #[test]
+    fn the_uninstaller_name_switches_mode_whatever_its_case() {
+        let p = std::path::Path::new;
+        assert!(launched_as_uninstaller(p(
+            r"C:\Program Files\punktfunk\UNINS000.EXE"
+        )));
+        assert!(launched_as_uninstaller(p("unins000.exe")));
+        assert!(!launched_as_uninstaller(p(
+            r"C:\x\punktfunk-host-setup.exe"
+        )));
+        assert!(!launched_as_uninstaller(p(r"C:\unins000.exe\setup.exe")));
     }
 
     #[test]

@@ -194,16 +194,21 @@ mod tests {
         assert!(win_preset("nope").is_none());
     }
 
-    /// The RemoveFiles trap: no preset may aim the uninstall at a real install dir.
+    /// The RemoveFiles trap: no preset that can reach the teardown — the uninstaller, or any
+    /// installed box's manage Welcome — may aim it at a real install dir.
     #[test]
-    fn the_uninstall_preset_lives_in_the_sandbox() {
-        let preset = win_preset("win11-uninstall").unwrap();
-        let location = preset.facts.installed.unwrap().location.unwrap();
-        assert!(
-            std::path::Path::new(&location).starts_with(std::env::temp_dir()),
-            "{location} escaped the sandbox"
-        );
-        assert!(!location.contains("Program Files"));
+    fn every_installed_preset_lives_in_the_sandbox() {
+        for name in WIN_PRESETS {
+            let Some(installed) = win_preset(name).unwrap().facts.installed else {
+                continue;
+            };
+            let location = installed.location.unwrap();
+            assert!(
+                std::path::Path::new(&location).starts_with(std::env::temp_dir()),
+                "{name}: {location} escaped the sandbox"
+            );
+            assert!(!location.contains("Program Files"));
+        }
     }
 
     #[test]

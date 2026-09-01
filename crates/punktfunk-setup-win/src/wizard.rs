@@ -14,6 +14,9 @@
 //! WP2.1b: the stepper draws `run_steps()` — this run's real path, never a ghost Network
 //! dot — and each navigation slides the page in directionally via the client shell's manual
 //! tween (a worker stepping root state under a generation guard); animations off ⇒ a cut.
+//! WP2.2: an installed box opens in manage mode — Welcome re-titled, Reconfigure or
+//! Uninstall — and the payload-less `unins000.exe` (D6) is the same page offering only the
+//! teardown. Uninstall is run state, chosen there; the executor thread reads it from `Ctx`.
 
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -183,11 +186,15 @@ struct Ctx {
     preset: WinPreset,
     screen: WinScreen,
     install: InstallPhase,
+    /// This run tears down instead of installing: the uninstaller exe, or Uninstall chosen
+    /// on the manage Welcome.
+    uninstall: bool,
     latency_ms: u64,
     slide: Slide,
     set_screen: AsyncSetState<WinScreen>,
     set_step: AsyncSetState<Nav>,
     set_install: AsyncSetState<InstallPhase>,
+    set_uninstall: AsyncSetState<bool>,
     set_log: AsyncSetState<Vec<LogLine>>,
 }
 
@@ -227,6 +234,7 @@ impl Component for WizardRoot {
         };
         let (nav, set_step) = cx.use_async_state(start);
         let (install, set_install) = cx.use_async_state(InstallPhase::Idle);
+        let (uninstall, set_uninstall) = cx.use_async_state(self.preset.uninstall);
         let (log, set_log) = cx.use_async_state(Vec::<LogLine>::new());
 
         // The slide is a manual tween (the client shell's): reactor's one-shot animations run
@@ -261,6 +269,7 @@ impl Component for WizardRoot {
             preset: self.preset.clone(),
             screen: screen.clone(),
             install,
+            uninstall,
             latency_ms: self.latency_ms,
             slide: Slide {
                 progress,
@@ -269,6 +278,7 @@ impl Component for WizardRoot {
             set_screen,
             set_step,
             set_install,
+            set_uninstall,
             set_log,
         };
 
@@ -283,18 +293,26 @@ impl Component for WizardRoot {
 }
 
 /// This run's step list. An uninstall run has nothing to configure — Welcome states what is
-/// about to happen and Install is the teardown (the full manage screen is WP2.2).
-fn run_steps(preset: &WinPreset, screen: &WinScreen) -> Vec<WizStep> {
-    if preset.uninstall {
+/// about to happen and Install is the teardown.
+fn run_steps(ctx: &Ctx) -> Vec<WizStep> {
+    if ctx.uninstall {
         vec![WizStep::Welcome, WizStep::Install, WizStep::Done]
     } else {
-        screen.steps()
+        ctx.screen.steps()
+    }
+}
+
+/// The Install step is the teardown on an uninstall run, and its dot says so.
+fn step_title(step: WizStep, uninstall: bool) -> &'static str {
+    match step {
+        WizStep::Install if uninstall => "Uninstall",
+        _ => step.title(),
     }
 }
 
 /// Continue: move to the step after `cur` on this run's real path.
 fn advance(ctx: &Ctx, cur: WizStep) {
-    let steps = run_steps(&ctx.preset, &ctx.screen);
+    let steps = run_steps(ctx);
     let next = steps
         .iter()
         .skip_while(|s| **s != cur)
@@ -327,7 +345,7 @@ fn advance(ctx: &Ctx, cur: WizStep) {
 }
 
 fn back(ctx: &Ctx, cur: WizStep) {
-    let steps = run_steps(&ctx.preset, &ctx.screen);
+    let steps = run_steps(ctx);
     if let Some(i) = steps.iter().position(|s| *s == cur)
         && i > 0
     {
@@ -358,6 +376,7 @@ fn stage_demo_tree() -> String {
 fn start_install(ctx: &Ctx) {
     let preset = ctx.preset.clone();
     let screen = ctx.screen.clone();
+    let uninstall = ctx.uninstall;
     let latency_ms = ctx.latency_ms;
     let set_install = ctx.set_install.clone();
     let set_step = ctx.set_step.clone();
@@ -366,7 +385,7 @@ fn start_install(ctx: &Ctx) {
     std::thread::spawn(move || {
         let tmp = stage_demo_tree();
         let choices = screen.effective_choices();
-        let built = plan::build(&screen.facts, &choices, preset.artifact, preset.uninstall);
+        let built = plan::build(&screen.facts, &choices, preset.artifact, uninstall);
         let ui = ChannelReporter::new(set_log);
         let run = WinDemoRunner::new(latency_ms, None);
         let net = FakeNet {
@@ -430,7 +449,7 @@ fn card(child: impl Into<Element>) -> Border {
 /// The D9 stepper: dots joined by a line, filled through the current step in brand violet,
 /// hollow ahead. `steps` is this run's real path, so a preset that never triggers the Network
 /// step never shows its dot.
-fn stepper(steps: &[WizStep], pos: usize) -> Element {
+fn stepper(steps: &[WizStep], pos: usize, uninstall: bool) -> Element {
     const DOT: f64 = 12.0;
     let mut children: Vec<Element> = Vec::new();
     let mut columns: Vec<GridLength> = Vec::new();
@@ -454,7 +473,7 @@ fn stepper(steps: &[WizStep], pos: usize) -> Element {
         } else {
             Shape::ellipse().stroke(MUTED).stroke_thickness(1.5)
         };
-        let label = text_block(step.title()).font_size(11.0);
+        let label = text_block(step_title(*step, uninstall)).font_size(11.0);
         let label = if i == pos {
             label.semibold()
         } else {
@@ -487,10 +506,10 @@ pub fn slide_margin(forward: bool, progress: f64) -> Thickness {
 /// Stepper · (title · content · button bar). The stepper stays put; the rest is the page
 /// that slides in.
 fn frame(ctx: &Ctx, step: WizStep, content: Element, buttons: Vec<Element>) -> Element {
-    let steps = run_steps(&ctx.preset, &ctx.screen);
+    let steps = run_steps(ctx);
     let pos = steps.iter().position(|s| *s == step).unwrap_or(0);
-    let head = stepper(&steps, pos).margin(edges(0.0, 0.0, 0.0, 22.0));
-    let title = text_block(step.title())
+    let head = stepper(&steps, pos, ctx.uninstall).margin(edges(0.0, 0.0, 0.0, 22.0));
+    let title = text_block(step_title(step, ctx.uninstall))
         .font_size(24.0)
         .semibold()
         .margin(edges(0.0, 0.0, 0.0, 12.0));
@@ -521,23 +540,63 @@ fn continue_button(ctx: &Ctx, cur: WizStep, label: &str) -> Element {
         .into()
 }
 
+/// Uninstall from Welcome: flips this run to the teardown path, then advances exactly like
+/// Continue — the install thread reads the flag through the same `Ctx`.
+fn uninstall_button(ctx: &Ctx) -> Element {
+    let mut ctx = ctx.clone();
+    ctx.uninstall = true;
+    button("Uninstall")
+        .on_click(move || {
+            ctx.set_uninstall.call(true);
+            advance(&ctx, WizStep::Welcome);
+        })
+        .into()
+}
+
 fn back_button(ctx: &Ctx, cur: WizStep) -> Element {
     let ctx = ctx.clone();
     button("Back").on_click(move || back(&ctx, cur)).into()
 }
 
 fn welcome_page(ctx: &Ctx) -> Element {
-    let sentence = if ctx.preset.uninstall {
-        "This removes punktfunk from this PC. Identity, pairings and passwords stay — a reinstall picks them up."
+    let what = match ctx.preset.artifact {
+        Artifact::Host => "host",
+        Artifact::Client => "client",
+    };
+    // Manage mode (D9): an installed box re-titles Welcome. The uninstaller exe (D6) offers
+    // the teardown only; the installer offers Reconfigure — the upgrade path — or Uninstall.
+    let wordmark = match &ctx.screen.facts.installed {
+        Some(inst) => match &inst.version {
+            Some(v) => format!("punktfunk {v} · {what} installed"),
+            None => format!("punktfunk · {what} installed"),
+        },
+        None => "punktfunk".to_string(),
+    };
+    let (sentence, buttons): (&str, Vec<Element>) = if ctx.preset.uninstall {
+        (
+            "This removes punktfunk from this PC. Identity, pairings and passwords stay — a reinstall picks them up.",
+            vec![uninstall_button(ctx)],
+        )
+    } else if ctx.screen.facts.installed.is_some() {
+        (
+            "Reconfigure keeps what is on this PC and applies your changes. Uninstall removes it — identity, pairings and passwords stay.",
+            vec![
+                uninstall_button(ctx),
+                continue_button(ctx, WizStep::Welcome, "Reconfigure"),
+            ],
+        )
     } else {
-        match ctx.preset.artifact {
-            Artifact::Host => {
-                "This installs the punktfunk host — it streams this PC's screen, audio and games to your devices."
-            }
-            Artifact::Client => {
-                "This installs the punktfunk client — it plays streams from a punktfunk host."
-            }
-        }
+        (
+            match ctx.preset.artifact {
+                Artifact::Host => {
+                    "This installs the punktfunk host — it streams this PC's screen, audio and games to your devices."
+                }
+                Artifact::Client => {
+                    "This installs the punktfunk client — it plays streams from a punktfunk host."
+                }
+            },
+            vec![continue_button(ctx, WizStep::Welcome, "Continue")],
+        )
     };
     let mut children: Vec<Element> = Vec::new();
     if let Some(uri) = brand::mark_uri() {
@@ -551,7 +610,7 @@ fn welcome_page(ctx: &Ctx) -> Element {
         );
     }
     children.push(
-        text_block("punktfunk")
+        text_block(wordmark)
             .font_size(32.0)
             .semibold()
             .horizontal_alignment(HorizontalAlignment::Center)
@@ -570,12 +629,7 @@ fn welcome_page(ctx: &Ctx) -> Element {
         .horizontal_alignment(HorizontalAlignment::Center)
         .vertical_alignment(VerticalAlignment::Center)
         .into();
-    frame(
-        ctx,
-        WizStep::Welcome,
-        content,
-        vec![continue_button(ctx, WizStep::Welcome, "Continue")],
-    )
+    frame(ctx, WizStep::Welcome, content, buttons)
 }
 
 fn configure_page(ctx: &Ctx) -> Element {
@@ -600,7 +654,7 @@ fn configure_page(ctx: &Ctx) -> Element {
     }
     let content = scroll_view(vstack(items).spacing(6.0).max_width(640.0)).into();
     // The go button says what Continue will do: install now, or one more step first.
-    let steps = run_steps(&ctx.preset, &ctx.screen);
+    let steps = run_steps(ctx);
     let next_is_network = steps
         .iter()
         .skip_while(|s| **s != WizStep::Configure)
@@ -809,7 +863,7 @@ fn install_page(ctx: &Ctx, log: &[LogLine]) -> Element {
 
 fn done_page(ctx: &Ctx) -> Element {
     let mut children: Vec<Element> = Vec::new();
-    if ctx.preset.uninstall {
+    if ctx.uninstall {
         children.push(
             text_block("punktfunk was removed from this PC.")
                 .wrap()
