@@ -48,6 +48,9 @@ struct PadLayoutEditor: View {
             }
         }
         .ignoresSafeArea()
+        // The stream runs without a status bar, so the editor does too — a bar over the stage
+        // would sit on controls the stream lets you reach.
+        .statusBarHidden(true)
         .environment(\.colorScheme, .dark)
     }
 
