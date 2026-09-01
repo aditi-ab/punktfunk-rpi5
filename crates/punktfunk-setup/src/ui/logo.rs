@@ -330,7 +330,9 @@ mod tests {
                 .trim_start_matches("[48;2;")
                 .trim_end_matches('m')
                 .split(';')
-                .filter_map(|v| v.parse().ok())
+                // ::<u8> spelled out: on the Windows target, console's encode_unicode dep
+                // adds more `FromIterator<_> for Vec<u8>` impls and inference goes ambiguous.
+                .filter_map(|v| v.parse::<u8>().ok())
                 .collect();
             Rgb(parts[0], parts[1], parts[2])
         };

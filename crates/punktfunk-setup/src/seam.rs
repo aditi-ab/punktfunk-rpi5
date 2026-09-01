@@ -326,9 +326,11 @@ mod tests {
     #[test]
     fn etc_root_is_a_prefix_not_the_directory() {
         let p = BasePaths::rooted(Path::new("/tmp/box"));
+        // Compared as Paths, not strings: join() writes `\` on Windows and the components
+        // are what the contract is about.
         assert_eq!(
-            p.etc("apt/sources.list.d/punktfunk.list").to_str().unwrap(),
-            "/tmp/box/etc/apt/sources.list.d/punktfunk.list"
+            p.etc("apt/sources.list.d/punktfunk.list"),
+            Path::new("/tmp/box/etc/apt/sources.list.d/punktfunk.list")
         );
     }
 

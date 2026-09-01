@@ -1,0 +1,3 @@
+# The setup goldens are byte-exact fixtures compared against generated output. A Windows
+# checkout with autocrlf would smuggle \r into every one of them, so eol conversion is off.
+crates/punktfunk-setup/tests/golden/** -text

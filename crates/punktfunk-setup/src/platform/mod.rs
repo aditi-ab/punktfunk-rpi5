@@ -9,6 +9,8 @@
 //! not by a gate. What can still drift is the *shape* — which entry is the repo block and
 //! which is the install — so `shape` tests pin every family's split.
 
+pub mod windows;
+
 use std::sync::OnceLock;
 
 use crate::choices::Choices;
@@ -17,7 +19,7 @@ use crate::plan::{switch_pkgs, Step, StepAction};
 use crate::seam::{BasePaths, CommandRunner};
 
 /// The single source for every install line (`design/installer-v2.md` D6).
-const PLATFORMS_JSON: &str = include_str!("../../../data/platforms.json");
+const PLATFORMS_JSON: &str = include_str!("../../../../data/platforms.json");
 
 /// Drops whichever punktfunk section pacman.conf holds — the stable one, the canary one, or both.
 const PACMAN_RM_REPO: &str =
