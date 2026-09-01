@@ -796,6 +796,10 @@ impl Drop for DmabufMap {
     }
 }
 
+fn supported_data_plane_count(count: u32) -> Option<usize> {
+    (1..=2).contains(&count).then_some(count as usize)
+}
+
 /// De-pad / import a single PipeWire buffer and push it to the encoder. Called from the
 /// `.process` callback with the NEWEST drained buffer (latest-frame-only). `datas` is sourced
 /// via the same transparent cast libspa's `Buffer::datas_mut` performs, so the safe `Data`
@@ -847,22 +851,15 @@ fn consume_frame(
     if ud.signals.broken.load(Ordering::Relaxed) {
         return;
     }
-    // SAFETY: `spa_buf` is the `*mut spa_buffer` of the PipeWire buffer we dequeued and still hold for
-    // this `.process` callback (not requeued until after `consume_frame` returns), so it is live. The
-    // block null-checks `spa_buf`, requires `n_datas != 0`, and null-checks the `datas` array pointer
-    // before forming any slice. `(*spa_buf).datas` points to `n_datas` libspa `spa_data` structs, and
-    // `pw::spa::buffer::Data` is `#[repr(transparent)]` over `spa_data` (the same cast
-    // `Buffer::datas_mut` performs — see the function doc), so the pointer cast + length describe
-    // exactly that array, in bounds. The PipeWire loop is single-threaded and owns the buffer here, so
-    // this `&mut` slice is the only reference to it (no aliasing/data race).
+    // SAFETY: the dequeued buffer stays held for this callback. We reject counts outside the
+    // one/two-plane formats this function supports before using PipeWire's array pointer.
     let datas: &mut [pw::spa::buffer::Data] = unsafe {
-        if spa_buf.is_null() || (*spa_buf).n_datas == 0 || (*spa_buf).datas.is_null() {
+        if spa_buf.is_null() || (*spa_buf).datas.is_null() {
             &mut []
+        } else if let Some(len) = supported_data_plane_count((*spa_buf).n_datas) {
+            std::slice::from_raw_parts_mut((*spa_buf).datas as *mut pw::spa::buffer::Data, len)
         } else {
-            std::slice::from_raw_parts_mut(
-                (*spa_buf).datas as *mut pw::spa::buffer::Data,
-                (*spa_buf).n_datas as usize,
-            )
+            &mut []
         }
     };
     if datas.is_empty() {
@@ -2293,7 +2290,16 @@ pub fn pipewire_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::{negotiation_plan, NegotiationInputs};
+    use super::{negotiation_plan, supported_data_plane_count, NegotiationInputs};
+
+    #[test]
+    fn only_supported_pipewire_plane_counts_become_slice_lengths() {
+        assert_eq!(supported_data_plane_count(0), None);
+        assert_eq!(supported_data_plane_count(1), Some(1));
+        assert_eq!(supported_data_plane_count(2), Some(2));
+        assert_eq!(supported_data_plane_count(3), None);
+        assert_eq!(supported_data_plane_count(u32::MAX), None);
+    }
 
     /// A healthy NVENC session: zero-copy on, no latches, SDR 4:2:0, non-VAAPI backend.
     fn nvenc() -> NegotiationInputs {
