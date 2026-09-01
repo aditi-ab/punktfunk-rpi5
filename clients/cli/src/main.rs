@@ -50,7 +50,7 @@ mod cli {
 punktfunk — the Punktfunk client, headless
 
   punktfunk discover [--json] [--timeout SECS]
-  punktfunk pair <host[:port]> [--pin N|-] [--name LABEL]
+  punktfunk pair <host[:port]> [--pin -] [--name LABEL]
   punktfunk hosts list [--probe] [--json]
   punktfunk hosts add <host[:port]> [--name LABEL] [--fp HEX]
   punktfunk hosts forget <host-ref>
@@ -97,11 +97,8 @@ address with `punktfunk hosts add` and it shows in `hosts list --probe`."
                 "\
 punktfunk pair <host[:port]> — enrol this device with a host (PIN ceremony)
 
-  --pin N       the PIN the host is showing; without it the command asks, and
-                refuses (exit 6) when there is no terminal to ask on. The value
-                sits on argv, which every local user can read (/proc/*/cmdline)
-  --pin -       read the PIN from stdin instead (one line) — what a script or
-                another program should use, so the secret never hits argv
+  --pin -       read the PIN from stdin (one line). Without it the command asks,
+                and refuses (exit 6) when there is no terminal to ask on
   --name LABEL  the label the host files this device under
                 (default: this machine's name)
 
@@ -472,27 +469,23 @@ from the config directory for a true factory reset."
             })
     }
 
-    /// `pair <host[:port]> [--pin N|-]` — the SPAKE2 ceremony. Without `--pin` it prompts, which
-    /// is the interactive shape; with one it is scriptable. Refuses rather than prompting when
-    /// stdin isn't a terminal and no PIN was given: a pairing that silently blocks a CI job
-    /// forever is worse than an exit code.
-    ///
-    /// `--pin -` reads the PIN from stdin instead. A value on argv is readable by every local
-    /// user (`/proc/*/cmdline` is world-readable on every distro we target) and the PIN is the
-    /// only secret binding the ceremony to the operator's intent, so programmatic callers — the
-    /// Decky backend among them — pipe it in rather than spelling it on the command line.
+    /// Run the SPAKE2 ceremony, prompting on a terminal or reading `--pin -` from stdin.
+    /// Literal PIN arguments are refused because process command lines are public metadata.
     fn pair(args: &[String]) -> u8 {
         let Some(target) = positional(args, 0) else {
-            eprintln!("usage: punktfunk pair <host[:port]> [--pin N|-]");
+            eprintln!("usage: punktfunk pair <host[:port]> [--pin -]");
             return UNRESOLVED;
         };
         let (addr, port) = split_host_port(&target);
         let pin = match value(args, "--pin").as_deref() {
             Some("-") => read_pin(None),
-            Some(p) => Some(p.to_string()),
+            Some(_) => {
+                eprintln!("a PIN may not be passed in argv; use --pin - or an interactive prompt");
+                return NEEDS_INTERACTION;
+            }
             None if is_tty() => read_pin(Some(&addr)),
             None => {
-                eprintln!("no --pin and no terminal to ask on");
+                eprintln!("no --pin - and no terminal to ask on");
                 return NEEDS_INTERACTION;
             }
         };

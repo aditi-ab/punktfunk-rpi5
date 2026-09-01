@@ -6,7 +6,7 @@
 //! `--launch id`, `--fullscreen`), exits when the session ends. Reads the same identity
 //! / known-hosts / settings stores as the desktop shell on each OS — the GTK client
 //! (`punktfunk-client`) on Linux, the WinUI client on Windows — so pairing on either side
-//! makes the other connect silently. `--pair <PIN> --connect host` runs the ceremony here,
+//! makes the other connect silently. `--pair - --connect host` runs the ceremony here,
 //! with no window and no toolkit, for machines that have only a shell.
 //!
 //! Stdout is the machine interface (the shell↔session contract): `{"ready":true}` after
@@ -169,7 +169,7 @@ mod session_main {
         Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
     }
 
-    /// `--pair <PIN> --connect host[:port]` — the SPAKE2 PIN ceremony with no window, no GTK
+    /// `--pair - --connect host[:port]` — the SPAKE2 PIN ceremony with no window, no GTK
     /// and no console UI, so a machine that has only SSH can be enrolled: an embedded/kiosk
     /// client, a headless box, an image being provisioned. Writes the verified host into the
     /// same known-hosts store `--connect` reads, so pairing here is exactly what makes the
@@ -734,13 +734,8 @@ mod session_main {
                             "     vulkan video decode: {}",
                             if a.usable { "YES" } else { "no" }
                         );
-                        // Name every bit, and ACCOUNT for the ones we cannot name. The
-                        // 5070 Ti reports 0xF — four bits — while punktfunk decodes three
-                        // codecs, so the first version of this line printed three names
-                        // beside a four-bit mask and looked complete. VP9 (bit 3) is a
-                        // real decode operation this client has no rung for; a codec the
-                        // tool cannot name must not silently vanish from a mask it prints,
-                        // or the reader is left to trust that the words cover the number.
+                        // Name every advertised bit, including unsupported VP9, so the labels
+                        // account for the complete mask.
                         const OPS: [(u32, &str); 4] = [
                             (0x1, "H.264"),
                             (0x2, "H.265"),
@@ -891,17 +886,20 @@ mod session_main {
             };
         }
 
-        // `--pair <PIN>`: enrol this machine against a host and exit. DEPRECATED — pairing is
-        // a trust ceremony and belongs to the brain, fronted by `punktfunk pair` or a shell
-        // (design/client-architecture-split.md §5). It still works, with a notice, for the one
-        // release this needs; a renderer owning a trust ceremony is exactly the mixing of
-        // concerns the split exists to undo.
-        if let Some(pin) = arg_value("--pair") {
-            eprintln!(
-                "note: punktfunk-session --pair is deprecated \u{2014} use `punktfunk pair \
-                 <host[:port]>` instead (same store, same result)."
-            );
-            return headless_pair(&pin);
+        // Deprecated compatibility path: stdin only, so the PIN never enters process metadata.
+        if let Some(pin_arg) = arg_value("--pair") {
+            if pin_arg != "-" {
+                eprintln!(
+                    "punktfunk-session pairing accepts only `--pair -`; prefer `punktfunk pair`"
+                );
+                return EXIT_CONNECT_FAILED;
+            }
+            let mut pin = String::new();
+            if std::io::stdin().read_line(&mut pin).is_err() || pin.trim().is_empty() {
+                eprintln!("no pairing PIN on stdin");
+                return EXIT_CONNECT_FAILED;
+            }
+            return headless_pair(pin.trim());
         }
 
         // (The RADV video-decode opt-in that used to live here now runs at the very top of
@@ -979,7 +977,7 @@ mod session_main {
             eprintln!(
                 "usage: punktfunk-session --connect host[:port] [--fp HEX] [--launch id] [--profile REF] [--fullscreen]\n\
                  \x20      punktfunk-session --browse [host[:port]] [--mgmt PORT] [--fullscreen] [--json-status]\n\
-                 \x20      punktfunk-session --pair <PIN> --connect host[:port] [--name LABEL]\n\
+                 \x20      punktfunk-session --pair - --connect host[:port] [--name LABEL]\n\
                  \n\
                  Streams from a paired punktfunk host in a Vulkan window. --browse opens the\n\
                  gamepad console instead: bare --browse is the host list (discovery, PIN\n\
@@ -1042,7 +1040,7 @@ mod session_main {
                 "error",
                 &format!(
                     "no pinned fingerprint for {addr}:{port} — pair first \
-                     (punktfunk-session --pair <PIN> --connect {addr}:{port}) or pass --fp HEX"
+                     (punktfunk-session --pair - --connect {addr}:{port}) or pass --fp HEX"
                 ),
                 Some(true),
             );

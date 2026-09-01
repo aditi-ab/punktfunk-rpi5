@@ -1,50 +1,15 @@
-//! `punktfunk-probe` — the reference client for `punktfunk/1`: QUIC control plane, UDP data
-//! plane, input over QUIC datagrams. Two modes, decided by the host's Welcome:
+//! Reference `punktfunk/1` client for protocol verification and stream diagnostics.
 //!
-//! * **verification** (`frames > 0`, synthetic host): byte-checks deterministic test frames;
-//! * **stream** (`frames == 0`, virtual host): receives real encoded AUs, writes a playable
-//!   elementary stream (the dump extension follows the negotiated codec — `.h265`/`.h264`/`.av1`;
-//!   the probe advertises all three), and reports per-frame **capture→received latency**
-//!   percentiles (the host stamps each frame with its capture wall clock; same-host runs share
-//!   that clock).
+//! A synthetic host enables deterministic frame checks; a virtual host writes encoded AUs and
+//! reports capture-to-receive latency. Input, microphone, touch and rich-input flags exercise the
+//! corresponding wire planes. Host audio and HID feedback are counted rather than rendered.
 //!
-//! `--input-test` exercises the input plane: scripted mouse/keyboard datagrams during the
-//! stream (watch them land in the host session, e.g. xev inside gamescope). `--mic-test`
-//! exercises the mic uplink: a synthetic 440 Hz tone streamed as Opus (0xCB) → the host's
-//! virtual microphone source (record it host-side to hear the tone). `--touch-test` drags a
-//! synthetic finger in a circle → host libei `ei_touchscreen` injection. `--rich-input-test`
-//! drives a virtual DualSense touchpad + motion over the 0xCC plane (host on
-//! `PUNKTFUNK_GAMEPAD=dualsense`) and logs the 0xCD HID-output feedback (lightbar / adaptive
-//! triggers) that comes back.
+//! `--pin HEX` pins the host certificate. `--pair -` reads a SPAKE2 PIN from stdin and prints the
+//! verified fingerprint; literal PIN arguments are refused. `--discover` lists native mDNS hosts.
 //!
-//! `--pin <64-hex>` pins the host's certificate fingerprint (the host logs it at startup);
-//! without it the client trusts on first use and prints the observed fingerprint to pin.
-//! `--pair <PIN>` runs the SPAKE2 pairing ceremony: read the PIN the host prints when it
-//! arms pairing (`--allow-pairing`/`--require-pairing`), pass it here; on success the
-//! client prints the verified host fingerprint to `--pin` from then on.
-//! Host→client datagrams (Opus audio, rumble) are counted and reported with the stream
-//! stats — decode/playback is the platform clients' job.
-//!
-//! `--compositor NAME` requests a host compositor backend (`auto`|`kwin`|`wlroots`|`mutter`|
-//! `gamescope`); the host honors it if available, else auto-detects and reports the resolved
-//! choice in its Welcome (logged as `session offer … compositor=…`).
-//!
-//! `--gamepad NAME` requests a host virtual-pad backend
-//! (`auto`|`xbox360`|`dualsense`|`xboxone`|`dualshock4`); the host honors it where available (the
-//! UHID pads — DualSense, DualShock 4 — need Linux), else falls back to X-Box 360, and reports the
-//! resolved choice in its Welcome (logged as `session offer … gamepad=…`).
-//!
-//! `--discover [SECS]` browses the LAN for native (`_punktfunk._udp`) hosts the host advertises
-//! over mDNS, prints each (name, addr:port, pairing requirement, cert fingerprint to pin), and
-//! exits without connecting.
-//!
-//! Usage: `punktfunk-probe [--connect HOST:PORT] [--mode WxHxFPS] [--remode WxHxFPS:SECS]
-//!         [--rebitrate KBPS:SECS]
-//!         [--out FILE] [--bitrate KBPS] [--codec auto|h264|hevc|av1] [--audio-channels 2|6|8]
-//!         [--launch APP] [--name NAME] [--speed-test KBPS:MS]
-//!         [--input-test | --mic-test [--mic-burst] | --touch-test | --rich-input-test]
-//!         [--pin HEX | --pair PIN] [--compositor NAME] [--gamepad NAME] | --discover [SECS]`
-//! Env: `PUNKTFUNK_CLIENT_10BIT=1` / `PUNKTFUNK_CLIENT_444=1` advertise the 10-bit / 4:4:4 caps.
+//! Usage: `punktfunk-probe [--connect HOST:PORT] [--mode WxHxFPS] [--out FILE]
+//! [--bitrate KBPS] [--codec auto|h264|hevc|av1] [--input-test|--mic-test|--touch-test]
+//! [--pin HEX|--pair -] [--compositor NAME] [--gamepad NAME] | --discover [SECS]`
 #![forbid(unsafe_code)]
 
 use anyhow::{anyhow, Context, Result};
@@ -92,7 +57,7 @@ struct Args {
     /// encoder rate retarget (Phase 3.2) / rebuild fallback. Wiggles the cursor around the switch
     /// so a damage-driven idle desktop actually publishes frames through it.
     rebitrate: Option<(u32, u32)>,
-    /// `--pair PIN` — run the pairing ceremony instead of a session.
+    /// `--pair -` — run the pairing ceremony instead of a session.
     pair: Option<String>,
     /// `--name LABEL` — how the host labels this client when pairing.
     name: String,
@@ -291,7 +256,13 @@ fn parse_args() -> Args {
         pin,
         remode,
         rebitrate,
-        pair: get("--pair").map(String::from),
+        pair: get("--pair").map(|value| {
+            if value != "-" {
+                eprintln!("a pairing PIN may not be passed in argv; pipe it to `--pair -`");
+                std::process::exit(2);
+            }
+            value.to_string()
+        }),
         name: get("--name").unwrap_or("punktfunk-probe").to_string(),
         compositor,
         gamepad,
@@ -386,11 +357,15 @@ fn run(args: Args) -> Result<()> {
         return discover(secs);
     }
     // Pairing mode: run the PIN ceremony and print the fingerprint to pin, then exit.
-    if let Some(pin) = &args.pair {
+    if args.pair.is_some() {
         let (host, port) = args
             .connect
             .rsplit_once(':')
             .context("--connect host:port")?;
+        let mut pin = String::new();
+        std::io::stdin().read_line(&mut pin).context("read PIN")?;
+        let pin = pin.trim();
+        anyhow::ensure!(!pin.is_empty(), "no PIN on stdin");
         let identity = load_or_create_identity()?;
         let fp = punktfunk_core::client::NativeClient::pair(
             host,
@@ -485,9 +460,7 @@ fn discover(secs: u64) -> Result<()> {
         for row in hosts.values() {
             println!("{row}");
         }
-        println!(
-            "\nconnect with: punktfunk-probe --connect <addr:port> [--pin <fp> | --pair <PIN>]"
-        );
+        println!("\nconnect with: punktfunk-probe --connect <addr:port> [--pin <fp> | --pair -]");
     }
     Ok(())
 }
