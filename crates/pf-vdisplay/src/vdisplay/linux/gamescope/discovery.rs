@@ -553,6 +553,21 @@ pub(crate) fn gamescope_can_composite_external_overlay() -> bool {
     gamescope_patch_level() >= 4 && !flags_lost()
 }
 
+/// Does the resolved gamescope paint — and publish to its PipeWire node — on the game's COMMIT
+/// when adaptive sync is requested, instead of sampling on its synthetic vblank tick?
+///
+/// Below this level `--adaptive-sync` is inert on a headless session (the connector advertises no
+/// VRR), so the compose timer quantizes game presents onto the `-r` grid: a frame finished just
+/// after the tick's sample waits out a full period, and the stream delivers measurably fewer
+/// unique frames than the session rate — the shortfall `PUNKTFUNK_VDISPLAY_HZ_MULT` papers over
+/// by making the game render every frame twice. Also below this level a `--framerate-limit`
+/// equal to the refresh rate is skipped as "close enough" to the display's own pacing — under
+/// VRR that limiter is the only pace the game has left, which is why the two flags only ever
+/// travel together (the `adaptive_sync_args` builder).
+pub(crate) fn gamescope_paints_on_commit() -> bool {
+    gamescope_patch_level() >= 9 && !flags_lost()
+}
+
 /// Has a spawn been observed where our flags did NOT reach the gamescope process?
 ///
 /// The binary probe above answers "can it", which is all the bare spawn needs — there we build

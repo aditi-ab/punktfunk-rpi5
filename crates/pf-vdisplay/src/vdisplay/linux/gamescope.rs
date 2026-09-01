@@ -29,7 +29,8 @@ mod splash;
 use discovery::{
     check_gamescope_version, find_gamescope_eis_socket, find_gamescope_node, gamescope_bin,
     gamescope_can_composite_external_overlay, gamescope_can_offer_refresh_rates,
-    gamescope_honours_xkb_env, gamescope_node_present, poll_managed_node, wait_for_node,
+    gamescope_honours_xkb_env, gamescope_node_present, gamescope_paints_on_commit,
+    poll_managed_node, wait_for_node,
 };
 pub(crate) use discovery::{
     game_session_exited, gamescope_can_composite_cursor, gamescope_hdr_capable, is_available,
@@ -1453,6 +1454,7 @@ fn write_steamos_dropin(shim_dir: &std::path::Path, mode: Mode, hdr: bool) -> Re
         hdr_args = hdr_args(hdr)
             .into_iter()
             .chain(cursor_args())
+            .chain(adaptive_sync_args(game_hz(mode.refresh_hz)))
             // The advertised SET, not the rate we run at: `-r` is `PF_HZ` (frame-limited) above,
             // while the set is keyed on the session's own mode — the same split `launch_session`
             // makes between its `game` and `offered`.
@@ -1625,6 +1627,7 @@ fn write_session_plus_dropin(
         hdr_args = hdr_args(hdr)
             .into_iter()
             .chain(cursor_args())
+            .chain(adaptive_sync_args(game_hz(mode.refresh_hz)))
             .collect::<Vec<_>>()
             .join(" "),
         wsi = wsi.unit_lines(),
@@ -2270,8 +2273,7 @@ fn mode_mismatch(want_w: u32, want_h: u32, want_hz: u32, argvs: &[Vec<String>]) 
 /// PATH shim, and a session that ignores either execs the distro's gamescope with none of them.
 /// The HDR half of that failure is loud on its own (capture negotiation times out and the session
 /// dies on the bit-depth promise) — but a lost `--pipewire-composite-cursor` is SILENT: the host
-/// was told the compositor would paint the pointer, so it didn't, and nobody did. The stream is
-/// fine except that it has no cursor.
+/// was told the compositor would paint the pointer, so it didn't, and nobody did.
 ///
 /// So check the running compositor and refuse the session when a flag is missing. The plan is
 /// already fixed by this point (`cursor_blend` feeds the encoder open, which precedes the display),
@@ -2281,18 +2283,19 @@ fn mode_mismatch(want_w: u32, want_h: u32, want_hz: u32, argvs: &[Vec<String>]) 
 /// Fail OPEN in every ambiguous direction: no expected flags, or no readable gamescope process at
 /// all, is silence. Only a compositor we can see, that is missing a flag we can name, fails.
 ///
-/// It accepts ANY running gamescope carrying the flags, which is deliberate — a box commonly has a
-/// second one (observed on the Nobara test box: its own game-mode
-/// `/usr/bin/gamescope --prefer-output *,eDP-1 … --steam` running beside ours), and demanding that
-/// EVERY gamescope carry them would reject a perfectly good session. The direction that error can
-/// go is a false PASS, and the flag that matters is immune to it: `--pipewire-composite-cursor`
-/// exists only in our patch set, so no foreign gamescope can be carrying it. `--hdr-enabled`
-/// predates us and could in principle be borrowed from a neighbour, but its failure mode is the
+/// It accepts ANY running gamescope carrying the flags, which is deliberate — a box commonly runs
+/// a second one (Nobara's own game-mode gamescope, observed beside ours), and demanding EVERY
+/// gamescope carry them would reject a good session. That error direction is a false PASS, and
+/// the flag that matters is immune: `--pipewire-composite-cursor` exists only in our patch set.
+/// `--hdr-enabled` could in principle be borrowed from a neighbour, but its failure mode is the
 /// loud one this check is not for.
 fn verify_managed_spawn_flags(hdr: bool) -> Result<()> {
     let expected: Vec<String> = hdr_args(hdr)
         .into_iter()
         .chain(cursor_args())
+        // The rate value is a placeholder: the filter below keeps flag NAMES only, and
+        // `--adaptive-sync` is what proves the VRR half of the plan reached the compositor.
+        .chain(adaptive_sync_args(1))
         .filter(|a| a.starts_with("--")) // flag names only — their values are bare words
         .collect();
     if expected.is_empty() {
@@ -5203,6 +5206,7 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
                 hdr_args(hdr)
                     .into_iter()
                     .chain(cursor_args())
+                    .chain(adaptive_sync_args(game))
                     .collect::<Vec<_>>()
                     .join(" ")
             ))
@@ -5414,6 +5418,7 @@ fn add_bare_gamescope_args(
     for arg in hdr_args(hdr)
         .into_iter()
         .chain(cursor_args())
+        .chain(adaptive_sync_args(game_hz(hz)))
         .chain(refresh_rate_args(hz))
     {
         command.arg(arg);
@@ -5486,6 +5491,29 @@ fn cursor_args() -> Vec<String> {
         args.push("--pipewire-composite-external-overlay".to_string());
     }
     args
+}
+
+/// Adaptive sync for a headless session (patch level 9+): gamescope paints — and publishes to its
+/// PipeWire node — on the game's commit instead of the synthetic vblank tick, so the stream
+/// receives every unique frame the game produces rather than the tick's quantization of them (the
+/// rate shortfall `PUNKTFUNK_VDISPLAY_HZ_MULT` papers over by making the game render every frame
+/// twice). The two flags only ever travel together: under VRR the frame callbacks stop pacing the
+/// game to the refresh grid, so `--framerate-limit` — at the SAME rate `-r` throttles to today —
+/// is what keeps a FIFO game at the session rate instead of rendering as fast as it can, and the
+/// `+pfhdr9` patch keeps that limiter armed on a connector that paces nothing (upstream skips a
+/// limit equal to the refresh as "close enough" in deference to a real display's own pacing).
+/// Both flags exist upstream — an older binary would ACCEPT them and do nothing headless — but
+/// they are gated on the probe anyway so a spawned session's argv always means what it says.
+/// `PUNKTFUNK_GAMESCOPE_VRR=0` opts out.
+fn adaptive_sync_args(game_hz: u32) -> Vec<String> {
+    if !pf_host_config::config().gamescope_vrr || !gamescope_paints_on_commit() {
+        return Vec::new();
+    }
+    vec![
+        "--adaptive-sync".to_string(),
+        "--framerate-limit".to_string(),
+        game_hz.to_string(),
+    ]
 }
 
 /// The box's configured keyboard layout as `XKB_DEFAULT_*`, for a gamescope session we launch.
