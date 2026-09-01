@@ -201,10 +201,14 @@ struct Ctx {
     uninstall: bool,
     seams: Seams,
     slide: Slide,
+    /// Custom setup: the Configure step is on this run's path. Off, the defaults install
+    /// (Recommended); Reconfigure on an installed box always turns it on.
+    custom: bool,
     /// The password row's Show/Hide state.
     reveal: bool,
     /// The install page's progress bar, tweened 0 → 1 across the plan's phases.
     bar: f64,
+    set_custom: AsyncSetState<bool>,
     set_reveal: AsyncSetState<bool>,
     set_screen: AsyncSetState<WinScreen>,
     set_step: AsyncSetState<Nav>,
@@ -252,6 +256,7 @@ impl Component for WizardRoot {
         let (uninstall, set_uninstall) = cx.use_async_state(self.preset.uninstall);
         let (log, set_log) = cx.use_async_state(Vec::<LogLine>::new());
         let (reveal, set_reveal) = cx.use_async_state(false);
+        let (custom, set_custom) = cx.use_async_state(false);
 
         // The slide is a manual tween (the client shell's): reactor's one-shot animations run
         // from the visual's CURRENT value, and a freshly mounted page has nothing to fade from.
@@ -333,8 +338,10 @@ impl Component for WizardRoot {
                 progress,
                 forward: nav.forward,
             },
+            custom,
             reveal,
             bar,
+            set_custom,
             set_reveal,
             set_screen,
             set_step,
@@ -354,12 +361,27 @@ impl Component for WizardRoot {
 }
 
 /// This run's step list. An uninstall run has nothing to configure — Welcome states what is
-/// about to happen and Install is the teardown.
+/// about to happen and Install is the teardown. Recommended (the default) skips Configure;
+/// the Network step still materializes on its own trigger, whichever was chosen.
 fn run_steps(ctx: &Ctx) -> Vec<WizStep> {
     if ctx.uninstall {
         vec![WizStep::Welcome, WizStep::Install, WizStep::Done]
     } else {
-        ctx.screen.steps()
+        ctx.screen
+            .steps()
+            .into_iter()
+            .filter(|s| ctx.custom || *s != WizStep::Configure)
+            .collect()
+    }
+}
+
+/// What Continue will do from `cur`: install now, or one more step first.
+fn go_label(ctx: &Ctx, cur: WizStep) -> &'static str {
+    let next = run_steps(ctx).into_iter().skip_while(|s| *s != cur).nth(1);
+    if next == Some(WizStep::Install) {
+        "Install"
+    } else {
+        "Continue"
     }
 }
 
@@ -696,6 +718,39 @@ fn back_button(ctx: &Ctx, cur: WizStep) -> Element {
         .into()
 }
 
+/// One of the two setup options on Welcome: a radio in a card, the whole card tappable, the
+/// chosen one outlined in the accent.
+fn option_card(ctx: &Ctx, custom: bool, title: &str, detail: &str) -> Element {
+    let selected = ctx.custom == custom;
+    let pick = ctx.set_custom.clone();
+    let tap = ctx.set_custom.clone();
+    border(
+        vstack((
+            RadioButton::new(title)
+                .group("setup")
+                .checked(selected)
+                .on_checked(move || pick.call(custom)),
+            text_block(detail)
+                .wrap()
+                .font_size(12.5)
+                .foreground(ThemeRef::SecondaryText)
+                .margin(edges(30.0, 0.0, 0.0, 0.0)),
+        ))
+        .spacing(2.0),
+    )
+    .background(ThemeRef::CardBackground)
+    .border_brush(if selected {
+        ThemeRef::Accent
+    } else {
+        ThemeRef::CardStroke
+    })
+    .border_thickness(Thickness::uniform(if selected { 2.0 } else { 1.0 }))
+    .corner_radius(10.0)
+    .padding(edges(16.0, 12.0, 16.0, 14.0))
+    .on_tapped(move || tap.call(custom))
+    .into()
+}
+
 fn welcome_page(ctx: &Ctx) -> Element {
     let what = match ctx.preset.artifact {
         Artifact::Host => "host",
@@ -710,18 +765,28 @@ fn welcome_page(ctx: &Ctx) -> Element {
         },
         None => "punktfunk".to_string(),
     };
+    let fresh_install = !ctx.preset.uninstall && ctx.screen.facts.installed.is_none();
     let (sentence, buttons): (&str, Vec<Element>) = if ctx.preset.uninstall {
         (
             "This removes punktfunk from this PC. Identity, pairings and passwords stay — a reinstall picks them up.",
             vec![uninstall_button(ctx)],
         )
-    } else if ctx.screen.facts.installed.is_some() {
+    } else if !fresh_install {
+        let mut reconfigure = ctx.clone();
+        reconfigure.custom = true;
         (
             "Reconfigure keeps what is on this PC and applies your changes. Uninstall removes it — identity, pairings and passwords stay.",
-            vec![
-                uninstall_button(ctx),
-                continue_button(ctx, WizStep::Welcome, "Reconfigure"),
-            ],
+            vec![uninstall_button(ctx), {
+                let go = reconfigure.clone();
+                button("Reconfigure")
+                    .accent()
+                    .min_width(124.0)
+                    .on_click(move || {
+                        go.set_custom.call(true);
+                        advance(&go, WizStep::Welcome);
+                    })
+                    .into()
+            }],
         )
     } else {
         (
@@ -733,7 +798,11 @@ fn welcome_page(ctx: &Ctx) -> Element {
                     "This installs the punktfunk client — it plays streams from a punktfunk host."
                 }
             },
-            vec![continue_button(ctx, WizStep::Welcome, "Continue")],
+            vec![continue_button(
+                ctx,
+                WizStep::Welcome,
+                go_label(ctx, WizStep::Welcome),
+            )],
         )
     };
     let mut children: Vec<Element> = Vec::new();
@@ -741,8 +810,8 @@ fn welcome_page(ctx: &Ctx) -> Element {
         children.push(
             Image::new_with_uri(uri)
                 .stretch(Stretch::Uniform)
-                .width(120.0)
-                .height(120.0)
+                .width(104.0)
+                .height(104.0)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .into(),
         );
@@ -760,57 +829,114 @@ fn welcome_page(ctx: &Ctx) -> Element {
             .font_size(15.0)
             .foreground(ThemeRef::SecondaryText)
             .horizontal_alignment(HorizontalAlignment::Center)
+            .max_width(520.0)
             .into(),
     );
+    if fresh_install {
+        let (recommended, custom) = match ctx.preset.artifact {
+            Artifact::Host => (
+                "The defaults: virtual display and gamepad drivers, the HDR layer, a tray icon, and the service starts right away. A web console password is generated for you.",
+                "Pick the drivers, Moonlight compatibility, firewall scope, autostart and the console password yourself.",
+            ),
+            Artifact::Client => (
+                "Install into your profile with Start-menu shortcuts.",
+                "Choose whether a desktop shortcut is added.",
+            ),
+        };
+        children.push(
+            grid((
+                option_card(ctx, false, "Recommended", recommended).grid_column(0),
+                option_card(ctx, true, "Custom", custom).grid_column(1),
+            ))
+            .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
+            .column_spacing(12.0)
+            .max_width(720.0)
+            .margin(edges(0.0, 10.0, 0.0, 0.0))
+            .into(),
+        );
+    }
     let content = vstack(children)
-        .spacing(18.0)
-        .max_width(500.0)
+        .spacing(16.0)
         .horizontal_alignment(HorizontalAlignment::Center)
         .vertical_alignment(VerticalAlignment::Center)
         .into();
     frame(ctx, WizStep::Welcome, content, buttons)
 }
 
+/// One titled section: its rows in a single card, divided, never a card per row.
+fn section(ctx: &Ctx, title: &str, fields: &[Field], lead: Option<Element>) -> Element {
+    let mut rows: Vec<Element> = Vec::new();
+    if let Some(lead) = lead {
+        rows.push(lead);
+    }
+    for field in fields {
+        let row = config_row(ctx, *field);
+        rows.push(if rows.is_empty() {
+            row
+        } else {
+            border(row)
+                .border_brush(ThemeRef::DividerStroke)
+                .border_thickness(edges(0.0, 1.0, 0.0, 0.0))
+                .padding(edges(0.0, 10.0, 0.0, 0.0))
+                .margin(edges(0.0, 10.0, 0.0, 0.0))
+                .into()
+        });
+    }
+    vstack((
+        text_block(title)
+            .font_size(12.0)
+            .semibold()
+            .foreground(ThemeRef::SecondaryText)
+            .margin(edges(2.0, 0.0, 0.0, 6.0)),
+        card(vstack(rows)),
+    ))
+    .into()
+}
+
 fn configure_page(ctx: &Ctx) -> Element {
-    let mut items: Vec<Element> = Vec::new();
-    // The D11 coexistence row: a visible row, never a dialog.
-    if let Some(note) = ctx.screen.coexistence_note() {
-        items.push(
-            card(
-                vstack((
-                    text_block("Runs next to your other streaming host")
-                        .semibold()
-                        .foreground(ThemeRef::SystemAttention),
-                    text_block(note).wrap().foreground(ThemeRef::SecondaryText),
-                ))
-                .spacing(2.0),
-            )
-            .into(),
-        );
+    // The D11 coexistence note leads the Network section: a visible row, never a dialog.
+    let coexistence = ctx.screen.coexistence_note().map(|note| {
+        vstack((
+            text_block("Runs next to your other streaming host")
+                .semibold()
+                .foreground(ThemeRef::SystemAttention),
+            text_block(note)
+                .wrap()
+                .font_size(12.0)
+                .foreground(ThemeRef::SecondaryText),
+        ))
+        .spacing(2.0)
+        .into()
+    });
+    let mut columns: [Vec<Element>; 2] = [Vec::new(), Vec::new()];
+    for (i, (title, fields)) in ctx.screen.sections().into_iter().enumerate() {
+        let lead = if title == "Network" {
+            coexistence.clone()
+        } else {
+            None
+        };
+        columns[i % 2].push(section(ctx, title, &fields, lead));
     }
-    for field in ctx.screen.rows() {
-        items.push(config_row(ctx, field));
-    }
-    let content = scroll_view(vstack(items).spacing(8.0).max_width(760.0)).into();
-    // The go button says what Continue will do: install now, or one more step first.
-    let steps = run_steps(ctx);
-    let next_is_network = steps
-        .iter()
-        .skip_while(|s| **s != WizStep::Configure)
-        .nth(1)
-        == Some(&WizStep::Network);
-    let label = if next_is_network {
-        "Continue"
+    let [left, right] = columns;
+    let body: Element = if right.is_empty() {
+        vstack(left).spacing(18.0).max_width(560.0).into()
     } else {
-        "Install"
+        grid((
+            vstack(left).spacing(18.0).grid_column(0),
+            vstack(right).spacing(18.0).grid_column(1),
+        ))
+        .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
+        .column_spacing(18.0)
+        .into()
     };
+    let content = scroll_view(body).into();
     frame(
         ctx,
         WizStep::Configure,
         content,
         vec![
             back_button(ctx, WizStep::Configure),
-            continue_button(ctx, WizStep::Configure, label),
+            continue_button(ctx, WizStep::Configure, go_label(ctx, WizStep::Configure)),
         ],
     )
 }
@@ -887,23 +1013,21 @@ fn config_row(ctx: &Ctx, field: Field) -> Element {
             .into()
         }
     };
-    card(
-        grid((
-            vstack((
-                text_block(WinScreen::label(field)).semibold(),
-                text_block(ctx.screen.why(field))
-                    .wrap()
-                    .font_size(12.0)
-                    .foreground(ThemeRef::SecondaryText),
-            ))
-            .spacing(1.0)
-            .vertical_alignment(VerticalAlignment::Center)
-            .grid_column(0),
-            editor.grid_column(1),
+    grid((
+        vstack((
+            text_block(WinScreen::label(field)).semibold(),
+            text_block(ctx.screen.why(field))
+                .wrap()
+                .font_size(12.0)
+                .foreground(ThemeRef::SecondaryText),
         ))
-        .columns([GridLength::Star(1.0), GridLength::Auto])
-        .column_spacing(16.0),
-    )
+        .spacing(1.0)
+        .vertical_alignment(VerticalAlignment::Center)
+        .grid_column(0),
+        editor.grid_column(1),
+    ))
+    .columns([GridLength::Star(1.0), GridLength::Auto])
+    .column_spacing(16.0)
     .into()
 }
 
@@ -1043,12 +1167,32 @@ fn install_page(ctx: &Ctx, log: &[LogLine]) -> Element {
     frame(ctx, WizStep::Install, content, buttons)
 }
 
+/// A follow-up action on Done: what to do, why, and the link that does it.
+fn next_step(title: &str, detail: &str, link: &str, uri: &str) -> Element {
+    card(
+        vstack((
+            text_block(title).semibold(),
+            text_block(detail)
+                .wrap()
+                .font_size(12.0)
+                .foreground(ThemeRef::SecondaryText),
+            HyperlinkButton::new(link)
+                .navigate_uri(uri)
+                .margin(edges(-10.0, 4.0, 0.0, 0.0)),
+        ))
+        .spacing(4.0),
+    )
+    .into()
+}
+
 fn done_page(ctx: &Ctx) -> Element {
+    use punktfunk_setup::facts::DOCS;
     let mut children: Vec<Element> = Vec::new();
     if ctx.uninstall {
         children.push(
             text_block("punktfunk was removed from this PC.")
-                .wrap()
+                .font_size(18.0)
+                .semibold()
                 .into(),
         );
         children.push(
@@ -1060,8 +1204,20 @@ fn done_page(ctx: &Ctx) -> Element {
             .into(),
         );
     } else {
-        // Fresh host: the password card, the one thing the user must leave with (D9).
         let fresh = ctx.screen.fresh();
+        children.push(
+            text_block(match (ctx.preset.artifact, fresh) {
+                (Artifact::Host, true) => "The punktfunk host is installed and streaming.",
+                (Artifact::Host, false) => "The punktfunk host is up to date.",
+                (Artifact::Client, true) => "The punktfunk client is installed.",
+                (Artifact::Client, false) => "The punktfunk client is up to date.",
+            })
+            .font_size(18.0)
+            .semibold()
+            .into(),
+        );
+        // Fresh host: the password card, the one thing the user must leave with (D9) — and
+        // the only place a Recommended install shows it.
         if ctx.preset.artifact == Artifact::Host
             && fresh
             && let Some(pw) = &ctx.screen.choices.web_password
@@ -1069,7 +1225,7 @@ fn done_page(ctx: &Ctx) -> Element {
             children.push(
                 card(
                     vstack((
-                        text_block("Web console password").semibold(),
+                        text_block("Your web console password").semibold(),
                         text_block(pw.clone())
                             .font_size(22.0)
                             .font_family(MONO)
@@ -1086,29 +1242,82 @@ fn done_page(ctx: &Ctx) -> Element {
                 .into(),
             );
         }
-        // The transcript outro carries the D11/D12 footnotes — same words, this surface.
+        children.push(
+            text_block("Next")
+                .font_size(12.0)
+                .semibold()
+                .foreground(ThemeRef::SecondaryText)
+                .margin(edges(2.0, 6.0, 0.0, -4.0))
+                .into(),
+        );
+        let (first, second) = match ctx.preset.artifact {
+            Artifact::Host => (
+                next_step(
+                    "Open the web console",
+                    "Approve devices, pick what to stream, change settings. The certificate is the host's own — continue past the browser's warning.",
+                    "https://localhost:47992",
+                    "https://localhost:47992/",
+                ),
+                next_step(
+                    "Install a client",
+                    "On the device you stream to — Windows, macOS, iOS, Android, Linux, Steam Deck — then connect and click Approve in the console.",
+                    "Client downloads",
+                    &format!("{DOCS}/install-client"),
+                ),
+            ),
+            Artifact::Client => (
+                next_step(
+                    "Open Punktfunk",
+                    "It is in the Start menu. Pick your host from the list, or add one by address.",
+                    "Pairing help",
+                    &format!("{DOCS}/pairing"),
+                ),
+                next_step(
+                    "No host yet?",
+                    "Install the punktfunk host on the PC you want to stream from.",
+                    "Host install guide",
+                    &format!("{DOCS}/windows-host"),
+                ),
+            ),
+        };
+        children.push(
+            grid((first.grid_column(0), second.grid_column(1)))
+                .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
+                .column_spacing(12.0)
+                .into(),
+        );
+        // The D11/D12 footnotes — the same words as the transcript, as attention cards.
         let collector = VecReporter::default();
-        win_report::outro(
+        win_report::footnotes(
             &collector,
             &ctx.screen.facts,
             &ctx.screen.effective_choices(),
-            ctx.preset.artifact,
         );
         for line in collector.0.into_inner() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            children.push(text_block(trimmed).wrap().into());
+            children.push(
+                card(
+                    text_block(line.trim())
+                        .wrap()
+                        .foreground(ThemeRef::SystemAttention),
+                )
+                .into(),
+            );
         }
+        children.push(
+            HyperlinkButton::new("Stuck? Troubleshooting")
+                .navigate_uri(format!("{DOCS}/troubleshooting"))
+                .margin(edges(-10.0, 0.0, 0.0, 0.0))
+                .into(),
+        );
     }
-    let content = scroll_view(vstack(children).spacing(10.0).max_width(760.0)).into();
+    let content = scroll_view(vstack(children).spacing(12.0).max_width(760.0)).into();
     frame(
         ctx,
         WizStep::Done,
         content,
         vec![button("Finish")
             .accent()
+            .min_width(124.0)
             .on_click(|| std::process::exit(0))
             .into()],
     )

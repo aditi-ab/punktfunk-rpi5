@@ -139,7 +139,16 @@ impl Wiz {
 
     /// Replay the event this control attached — a unit event (a button click).
     fn click(&self, label: &str) {
-        let id = self.control_with_text(ControlKind::Button, label);
+        self.fire_unit(ControlKind::Button, label);
+    }
+
+    /// Check a radio button by its label (Welcome's Recommended / Custom).
+    fn choose(&self, label: &str) {
+        self.fire_unit(ControlKind::RadioButton, label);
+    }
+
+    fn fire_unit(&self, kind: ControlKind, label: &str) {
+        let id = self.control_with_text(kind, label);
         let event = self.attached_event(id);
         self.host.with_reconciler(|r| r.backend.fire(id, event));
         self.settle();
@@ -210,16 +219,24 @@ impl Wiz {
 fn the_fresh_host_demo_walks_welcome_to_done_through_the_fake_executor() {
     let wiz = Wiz::open("win11-fresh");
     assert!(wiz.has_text("punktfunk"), "the Welcome wordmark");
-    assert_eq!(wiz.dots(), 4, "four dots on a private-network box");
+    assert!(wiz.has_text("Recommended") && wiz.has_text("Custom"));
+    assert_eq!(wiz.dots(), 3, "Recommended: Welcome · Install · Done");
     assert!(
         !wiz.has_text("Network"),
         "no ghost Network dot on a private-network box"
     );
 
+    // Custom puts Configure on the path — one more dot, and Continue goes there.
+    wiz.choose("Custom");
+    assert_eq!(wiz.dots(), 4, "Custom adds the Configure dot");
     wiz.click("Continue");
     assert!(
         wiz.has_text("Moonlight compat"),
         "the Configure rows render"
+    );
+    assert!(
+        wiz.has_text("Drivers") && wiz.has_text("Web console"),
+        "grouped"
     );
     assert!(
         wiz.has_text("Web console password"),
@@ -252,15 +269,12 @@ fn the_public_network_demo_walks_the_d12_step_and_answer_b_opens_the_firewall() 
     let wiz = Wiz::open("win11-public");
     assert_eq!(
         wiz.dots(),
-        5,
+        4,
         "the Network dot materializes for a Public network"
     );
     assert!(wiz.has_text("Network"), "the stepper labels the extra dot");
 
-    wiz.click("Continue");
-    assert!(wiz.has_text("Public-network firewall rules"));
-
-    // Configure's go button says Continue, not Install — one more step on this run's path.
+    // Recommended skips Configure, never the D12 consent step.
     wiz.click("Continue");
     assert!(
         wiz.has_text("'Cafe' is set to Public"),
@@ -340,4 +354,16 @@ fn the_sunshine_demo_shows_the_coexistence_row_and_moves_the_mgmt_port() {
         wiz.has_text("PUNKTFUNK_MGMT_BIND=0.0.0.0:47991"),
         "the SetEnv step ran"
     );
+}
+
+// Recommended: Welcome's Install runs the defaults and Done is where the generated password
+// is seen for the first time.
+#[test]
+fn recommended_installs_the_defaults_and_done_shows_the_password_and_next_steps() {
+    let wiz = Wiz::open("win11-fresh");
+    wiz.click("Install");
+    wiz.wait_for_done();
+    assert!(wiz.has_text("--gamestream=off"), "the defaults ran");
+    assert!(wiz.has_text("Your web console password"));
+    assert!(wiz.has_text("Open the web console") && wiz.has_text("Install a client"));
 }
