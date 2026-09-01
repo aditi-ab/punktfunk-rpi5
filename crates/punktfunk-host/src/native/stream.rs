@@ -5049,8 +5049,11 @@ fn build_pipeline_with_retry(
     // second virtual output). Dropped when this fn returns — on success the Pipeline's own lease keeps
     // the monitor Active; on failure refs falls to 0 → Lingering → linger-timeout teardown.
     let _retry_hold = if matches!(plan.capture, crate::session_plan::CaptureBackend::IddPush) {
+        // Must match `build_pipeline`'s acquire mode: a lease at the plain session mode makes the
+        // monitor arrive at 1x, and the acquire's live churn to the HZ_MULT rate is BADMODE (the
+        // OS pins settable modes at arrival) and lands under the opening capture ring, killing it.
         Some(
-            vd.create(mode)
+            vd.create(display_mode_for(mode))
                 .context("acquire virtual output for the session (retry-hold lease)")?,
         )
     } else {
