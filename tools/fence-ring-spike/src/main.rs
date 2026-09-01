@@ -486,8 +486,8 @@ mod win {
 
         let deadline = Instant::now() + Duration::from_secs(a.secs);
         let mut retire_v: u64 = 0;
-        let (mut consumed, mut torn, mut stale, mut premature, mut last_seq) =
-            (0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut consumed, mut torn, mut stale, mut premature, mut last_seq, mut stale_dropped) =
+            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         let mut kill_done = a.kill_after == 0;
         let mut death_at: Option<Instant> = None;
         let bpp = if a.format == DXGI_FORMAT_R16G16B16A16_FLOAT {
@@ -516,6 +516,17 @@ mod win {
             for (i, s) in hd.slots.iter().enumerate() {
                 if s.state.load(Ordering::Acquire) == PUBLISHED {
                     let seq = s.seq.load(Ordering::Acquire);
+                    if seq <= last_seq {
+                        // Older than what was already delivered: newest-wins DROPS it (a stream
+                        // must never show it) — S2 finding, first matrix run under --chaos.
+                        if s.state
+                            .compare_exchange(PUBLISHED, FREE, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            stale_dropped += 1;
+                        }
+                        continue;
+                    }
                     if pick.is_none_or(|(_, ps)| seq > ps) {
                         pick = Some((i, seq));
                     }
@@ -612,8 +623,9 @@ mod win {
         }
         println!(
             "VERDICT consumed={consumed} produced={produced} torn={torn} stale_relabel={stale} \
-             premature={premature} producer_skipped_unretired={skipped} \
-             producer_overwrote_published={over} last_seq={last_seq}"
+             premature={premature} stale_dropped={stale_dropped} \
+             producer_skipped_unretired={skipped} producer_overwrote_published={over} \
+             last_seq={last_seq}"
         );
         let pass = torn == 0 && stale == 0 && premature == 0 && consumed > 0;
         println!("{}", if pass { "PASS" } else { "FAIL" });
