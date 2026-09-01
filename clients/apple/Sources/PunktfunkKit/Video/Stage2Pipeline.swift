@@ -1,46 +1,22 @@
-// Stage-2 presenter orchestrator. GOAL ARCHITECTURE (the result of the 2026-07 pacing saga —
-// read this before touching presentation):
+// Explicit VideoToolbox decode and presentation orchestration.
 //
-//   net pump ──► VideoDecoder (VT async) ──► newest-wins 1-slot ring ──► RENDER THREAD ──► CAMetalLayer
+//   net pump -> VideoDecoder -> tvOS video renderer
+//                            -> newest-wins store -> render thread -> CAMetalLayer
 //
-// • The render thread is woken by FRAME ARRIVAL (the decoder callback signals it), never gated on
-//   the display link: on macOS the WindowServer's damage tracking / FramePacing does not count our
-//   out-of-band presents, so anything display-link-gated stalls exactly when the rest of the screen
-//   goes quiet (adaptive-sync displays idle the link down). A decoded frame is always presented
-//   promptly. The display link remains only as (a) a vsync CLOCK (phase + period, for the opt-in
-//   V-Sync policy below), (b) a retry tick for a frame that couldn't get a drawable (`putBack`),
-//   and (c) the iOS ProMotion rate hint.
-// • The layer's own displaySyncEnabled stays FALSE on macOS — synced presents starve the drawable
-//   pool outright (see MetalVideoPresenter's init for the post-mortem).
-// • Present policy is a USER SETTING (DefaultsKey.vsync; PUNKTFUNK_PRESENT_MODE=immediate|vsync
-//   overrides it for A/B), resolved once per session in start():
-//     – V-Sync OFF (default): present immediately — lowest latency, the long-proven behavior.
-//     – V-Sync ON: present(at: next vsync) predicted from the link's last phase/period, at most one
-//       period ahead by construction, falling back to immediate when the link data is stale — a
-//       schedule can never sit far in the future holding drawables hostage.
-// • Present PACING is the stage-2/3/4 presenter split (`PresentPacing`, chosen per session by
-//   SessionPresenter from the presenter setting / PUNKTFUNK_PRESENTER): stage-2 presents on
-//   frame arrival; stage-3 additionally gates presents on the on-glass callback (`PresentGate`)
-//   so the layer's FIFO image queue can never saturate; stage-4 (iOS/tvOS) presents into
-//   CAMetalDisplayLink-vended drawables the moment a frame decodes — deadline pacing, where the
-//   queue cannot exist at all — see PresentPacing's doc for the full rationale. Under deadline
-//   pacing the render thread below is fed by BOTH the decoder callback and the link's per-refresh
-//   updates (which vend the drawable), and the V-Sync policy/vsync clock don't apply.
-// • Rendering lives on its own thread so any `nextDrawable()` wait lands off-main (input, SwiftUI).
+// Metal rendering is driven by decoded-frame arrival. The ordinary display link supplies a clock,
+// retries transient drawable misses, and polls tvOS's displayed IOSurface; deadline pacing instead
+// owns a CAMetalDisplayLink. macOS keeps displaySyncEnabled off because synchronized out-of-band
+// presents can starve its drawable pool.
 //
-// The render thread also stamps the unified latency stages (end-to-end capture→on-glass + decode and
-// display stage terms — design/stats-unification.md). Mirrors StreamPump's lifecycle (one per start;
-// cancel is permanent). PUNKTFUNK_PRESENT_DEBUG=1 prints per-second pacing stats (see
-// PresentDebugStats).
-//
-// Threading: the pump runs on its own thread; the decoder callback on a VT thread; the render loop on
-// the render thread; `renderTick` + `start`/`stop` on the MAIN thread (the view's CADisplayLink fires
-// there). Only the ring (lock-guarded), the vsync clock (lock-guarded), and the decoder/presenter
-// (internally locked / staged) cross threads.
+// The pump, VideoToolbox callback, and Metal render loop run on separate threads. Start, stop, and
+// ordinary display-link ticks run on main. Shared stores and clocks are lock-guarded; presenter
+// configuration is staged to its render thread. Latency meters stamp receipt, decode, and on-glass
+// boundaries. PUNKTFUNK_PRESENT_DEBUG=1 prints Metal pacing diagnostics.
 
 #if canImport(Metal) && canImport(QuartzCore)
 import AVFoundation
 import Foundation
+import IOSurface
 import Metal
 import PunktfunkShared
 import QuartzCore
@@ -490,46 +466,115 @@ private func saturatingMul(_ a: Int64, _ b: Int64) -> Int64 {
     return (a > 0) == (b > 0) ? Int64.max : Int64.min
 }
 
-/// When a ready frame is pushed to the layer — the stage-2 vs stage-3 presenter split. Same decode
-/// half, same newest-wins ring; only the present cadence differs.
+/// Selects when a decoded frame enters the layer; decode and the newest-wins store are shared.
 ///
-/// - `arrival` (stage-2, the macOS default): present the moment a frame is decoded. Lowest latency
-///   while the layer's image queue is shallow — but that queue is FIFO and consumed at one drawable
-///   per refresh (iOS always vsync-latches; the macOS 26 compositor latch-paces our out-of-band
-///   presents the same way when composited), so at stream rate ≈ refresh rate its depth is STICKY:
-///   one early burst (session start, a Wi-Fi clump) fills it to `maximumDrawableCount` and — with
-///   arrivals and latches then running at the same rate — it never drains. Every later frame rides
-///   ~2–3 refreshes of queue (the measured 23–30 ms display stage on 120 Hz ProMotion panels), and
-///   the full-queue regime is where host↔panel clock drift turns into periodic repeats/drops (the
-///   "fixed-interval" jitter reports).
-/// - `glass` (stage-3; tvOS's default until the 2026-07 rebuild moved it to stage-4, now an
-///   on-device A/B rung): at most a small BOUNDED number of presented-but-
-///   undisplayed drawables in flight (`PresentGate`; depth 1 — see `SessionPresenter.gateDepth`
-///   for why deeper is a regression). The render thread presents only while a gate slot is free
-///   (a drawable's presented handler reopens its slot and re-signals); frames decoded meanwhile
-///   coalesce in the newest-wins ring. Freshness is preserved by DROPPING stale frames before
-///   present instead of queueing them behind the display — the hidden queue latency becomes
-///   explicit, correct frame drops. The residual cost: presents serialize on the on-glass
-///   callback, whose own delivery latency pushes each present ~a refresh past the frame's decode
-///   (the field-measured 14 ms display stage at 120 Hz vs the ~half-refresh floor).
-/// - `deadline` (stage-4, the iOS/iPadOS default; iOS/tvOS only — see
-///   `PresenterChoice.explicit`): a CAMetalDisplayLink vends ONE drawable per refresh
-///   (`preferredFrameLatency` 1) into a newest-wins hand-off slot, and the render thread pairs
-///   it with the newest decoded frame THE MOMENT either half arrives — usually the frame, into
-///   an already-vended drawable. The image queue cannot exist (one vended drawable in flight,
-///   ever), nothing serializes on the on-glass callback (the link's next vend is the pace), and
-///   the present is deadline-timed by the system to latch the upcoming refresh. This is the only
-///   pacing whose steady state can reach the sub-refresh display floor on the always-vsync-latch
-///   platforms; `arrival`/`glass` remain the on-device A/B rungs.
+/// - `arrival` (stage-2): render from frame arrival. This is the macOS default and remains an
+///   explicit A/B elsewhere; macOS smoothness can additionally schedule it on the vsync grid.
+/// - `glass` (stage-3): admit a bounded number of presents and reopen each slot from its on-glass
+///   callback. Frames decoded while closed coalesce in the store instead of joining the layer FIFO.
+/// - `deadline` (stage-4): pair the newest frame with a CAMetalDisplayLink-vended drawable. This is
+///   the iOS default; tvOS retains it as an A/B path because its minimum render window spans two
+///   fixed-rate refreshes.
+/// - `decoded`: send VideoToolbox's IOSurface-backed output directly to the system video renderer.
+///   This is tvOS's latency default and avoids compressed decode buffering plus the Metal FIFO.
 ///
-/// macOS PyroWave sessions default to `glass` even though the platform default is stage-2: burst
-/// presents into a composited (windowed) layer are the trigger pattern for the macOS DCP
-/// "mismatched swapID's" KERNEL PANIC, and the one-in-flight gate removes that pattern — see
-/// `SessionPresenter.pacing` for the full rationale.
-public enum PresentPacing: Sendable {
+/// macOS PyroWave defaults to `glass` to prevent burst presents in its composited layer.
+public enum PresentPacing: Sendable, Equatable {
     case arrival
     case glass
     case deadline
+    case decoded
+}
+
+/// Direct decoded-frame handoff to AVSampleBufferDisplayLayer's background-safe renderer.
+///
+/// VideoToolbox already produced an IOSurface-backed YUV image, so wrapping it as an immediate
+/// uncompressed sample adds no copy or second decode. Backpressure drops the frame instead of
+/// building a queue; the next decoder callback supplies a fresher image. Display-link polling maps
+/// the renderer's current IOSurface ID back to its capture/decode stamp for on-glass metrics.
+/// The renderer owns each sample after enqueue. Sendable because AVSampleBufferVideoRenderer
+/// explicitly permits background-thread enqueueing.
+final class DecodedVideoSink: @unchecked Sendable {
+    private struct Stamp {
+        let ptsNs: UInt64
+        let decodedNs: Int64
+    }
+
+    private let renderer: AVSampleBufferVideoRenderer
+    private let lock = NSLock()
+    private var stamps: [IOSurfaceID: Stamp] = [:]
+
+    init(layer: AVSampleBufferDisplayLayer) {
+        renderer = layer.sampleBufferRenderer
+    }
+
+    func reset() {
+        renderer.flush()
+        lock.lock()
+        stamps.removeAll()
+        lock.unlock()
+    }
+
+    @discardableResult
+    func submit(_ frame: ReadyFrame) -> Bool {
+        guard case .video(let pixelBuffer, _) = frame.image else { return false }
+        if renderer.requiresFlushToResumeDecoding || renderer.status == .failed { reset() }
+        guard renderer.isReadyForMoreMediaData,
+              let sample = Self.immediateSample(pixelBuffer)
+        else { return false }
+        guard let surfaceID = Self.surfaceID(pixelBuffer) else { return false }
+        lock.lock()
+        // More than one second of unmatched 60 fps surfaces cannot yield a live latency sample.
+        if stamps.count >= 64 { stamps.removeAll(keepingCapacity: true) }
+        stamps[surfaceID] = Stamp(ptsNs: frame.ptsNs, decodedNs: frame.decodedNs)
+        lock.unlock()
+        renderer.enqueue(sample)
+        return true
+    }
+
+    func takeDisplayedStamp() -> (ptsNs: UInt64, decodedNs: Int64)? {
+        guard #available(macOS 14.4, iOS 17.4, tvOS 17.4, *),
+              let pixelBuffer = renderer.displayedPixelBuffer(),
+              let surfaceID = Self.surfaceID(pixelBuffer)
+        else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let stamp = stamps.removeValue(forKey: surfaceID) else { return nil }
+        return (stamp.ptsNs, stamp.decodedNs)
+    }
+
+    private static func surfaceID(_ pixelBuffer: CVPixelBuffer) -> IOSurfaceID? {
+        guard let surface = CVPixelBufferGetIOSurface(pixelBuffer) else { return nil }
+        return IOSurfaceGetID(surface.takeUnretainedValue())
+    }
+
+    static func immediateSample(_ pixelBuffer: CVPixelBuffer) -> CMSampleBuffer? {
+        var format: CMVideoFormatDescription?
+        guard CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer,
+            formatDescriptionOut: &format) == noErr,
+            let format
+        else { return nil }
+        var timing = CMSampleTimingInfo(
+            duration: .invalid, presentationTimeStamp: .invalid, decodeTimeStamp: .invalid)
+        var sample: CMSampleBuffer?
+        guard CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer,
+            formatDescription: format, sampleTiming: &timing,
+            sampleBufferOut: &sample) == noErr,
+            let sample,
+            let attachments = CMSampleBufferGetSampleAttachmentsArray(
+                sample, createIfNecessary: true),
+            CFArrayGetCount(attachments) > 0
+        else { return nil }
+        let dict = unsafeBitCast(
+            CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+        CFDictionarySetValue(
+            dict,
+            Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+            Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+        return sample
+    }
 }
 
 /// Newest-wins 1-slot hand-off box (the generic sibling of `ReadyRing`): deadline pacing's
@@ -1111,16 +1156,15 @@ public final class Stage2Pipeline {
     private let ring: FrameStore<ReadyFrame>
     private let presenter: MetalVideoPresenter
     private let decoder: VideoDecoder
-    /// Present cadence — `.arrival` (stage-2), `.glass` (stage-3, the present gate) or
-    /// `.deadline` (stage-4, the CAMetalDisplayLink engine). Fixed for the pipeline's lifetime;
-    /// SessionPresenter resolves it per session (see PresentPacing).
+    private let decodedSink: DecodedVideoSink?
+    /// Presentation mechanism, fixed for the pipeline lifetime and resolved per session by
+    /// SessionPresenter. See PresentPacing for each path's ownership and cadence.
     private let pacing: PresentPacing
     /// The glass gate's in-flight present budget (`PresentGate` capacity) — meaningful only under
     /// `.glass`; SessionPresenter resolves it per platform (see `SessionPresenter.gateDepth`).
     private let gateDepth: Int
-    /// macOS smoothness: pace presents onto the vsync grid (`present(at:)` via the VsyncClock),
-    /// at most one per vsync, so the FIFO store drains on the display's cadence rather than on
-    /// arrival. Ignored under `.deadline` (the link IS the cadence there).
+    /// macOS smoothness: schedule at most one present on each display-link target so the FIFO
+    /// store drains at display cadence. Deadline pacing has its own link and ignores this policy.
     private let vsyncPaced: Bool
     /// Source-timestamp playout for the SMOOTHNESS intent: every decoded frame is stamped with
     /// when it is due on the host's own cadence, and the present decision aims there instead of at
@@ -1183,19 +1227,27 @@ public final class Stage2Pipeline {
     /// (received→decoded); `displayMeter` the display stage (decoded→on-glass, the ring wait +
     /// render + vsync — the tail stage-2 exists to shorten). All optional: metering never gates
     /// the presenter choice. Returns nil if Metal can't be set up (headless / no GPU) — caller
-    /// falls back to the stage-1 presenter. `pacing` selects the stage-2 (arrival) vs stage-3
-    /// (glass-gated) present cadence — see PresentPacing; `gateDepth` is the glass gate's
-    /// in-flight present budget (see `SessionPresenter.gateDepth`).
+    /// falls back to the stage-1 presenter. `pacing` also selects the decoded video sink when its
+    /// `displayLayer` is supplied. `gateDepth` bounds glass presents; `vsyncPaced` schedules macOS
+    /// smoothness onto the ordinary display-link grid.
     public init?(
         endToEndMeter: LatencyMeter?,
         decodeMeter: LatencyMeter? = nil,
         displayMeter: LatencyMeter? = nil,
         presentFloorMeter: LatencyMeter? = nil,
+        displayLayer: AVSampleBufferDisplayLayer? = nil,
         pacing: PresentPacing = .arrival,
         gateDepth: Int = 1,
         storePolicy: FrameStorePolicy = .newestWins,
         vsyncPaced: Bool = false
     ) {
+        let decodedSink: DecodedVideoSink?
+        if pacing == .decoded {
+            guard let displayLayer else { return nil }
+            decodedSink = DecodedVideoSink(layer: displayLayer)
+        } else {
+            decodedSink = nil
+        }
         guard let presenter = MetalVideoPresenter.make() else { return nil }
         self.presenter = presenter
         self.pacing = pacing
@@ -1206,6 +1258,7 @@ public final class Stage2Pipeline {
         self.decodeMeter = decodeMeter
         self.displayMeter = displayMeter
         self.presentFloorMeter = presentFloorMeter
+        self.decodedSink = decodedSink
         // The intent gate: source-timestamp playout is what `smooth` MEANS now, and `latency` is
         // defined as arrival-driven with no cushion — so the store policy, which is the intent's
         // only other expression (`PresentPriority.storePolicy`: smooth → fifo, latency →
@@ -1234,15 +1287,19 @@ public final class Stage2Pipeline {
                 // device's real decode limit instead of the network link ceiling. Every decoded
                 // frame (not just presented ones), so a newest-wins drop can't hide the backlog.
                 decodeReport.record(receivedNs: frame.receivedNs, decodedNs: frame.decodedNs)
-                // Phase-locked capture's arrival half: the stamp VALUE is reassembly
-                // completion, so recording it at decode adds no bias to the 1 Hz aggregate.
-                phaseReporter.noteArrival(receivedNs: frame.receivedNs)
+                // The decoded video plane reanchors independently of host submit phase. Feeding
+                // it to the phase controller adds a standing grid period without moving display.
+                if pacing != .decoded { phaseReporter.noteArrival(receivedNs: frame.receivedNs) }
                 // Freeze-until-reanchor: WITHHOLD a decoder-concealed post-loss frame (the gray/
                 // garbage VideoToolbox returns Ok for a reference-missing delta) — don't submit it,
                 // so the CAMetalLayer keeps its last good drawable on glass. The gate lifts (returns
                 // present) on a proven clean re-anchor (IDR / RFI anchor / 2nd recovery mark) or the
                 // bounded backstop. decoderKeyframe=false: VT doesn't flag IDRs, the wire FLAG_SOF does.
                 guard gate.onDecoded(flags: frame.flags) else { return }
+                if let decodedSink {
+                    decodedSink.submit(frame)
+                    return
+                }
                 // Decoder OUTPUT is where the cadence loop is sampled — the instant the frame
                 // becomes presentable. Receipt would not model decode at all and could hand back a
                 // due time already past by the moment the frame exists; dequeue would fold the
@@ -1258,9 +1315,14 @@ public final class Stage2Pipeline {
             onDecodeError: { _ in if gate.onNoOutput() { recovery.request() } })
     }
 
-    /// Start pulling AUs into the decoder. MAIN THREAD. `onFrame` fires per AU at receipt (the
-    /// host+network / capture→received meter, exactly as stage-1); `onSessionEnd` on close.
-    /// `clockOffsetNs` (host minus client) makes the end-to-end stamp cross-machine valid.
+    /// Start the AU pump, decoder, and selected presentation loop on the main thread.
+    ///
+    /// `onFrame` fires at receipt for host/network metering. `onDecodedSize` reports coded-size
+    /// changes, and `onSessionEnd` reports transport closure. Presentation records the live
+    /// host-minus-client clock offset at each on-glass callback so end-to-end samples remain valid
+    /// after clock resynchronization.
+    ///
+    /// A stopped pipeline is permanent; construct a new instance for another session.
     public func start(
         connection: PunktfunkConnection,
         onFrame: (@Sendable (AccessUnit) -> Void)?,
@@ -1270,7 +1332,7 @@ public final class Stage2Pipeline {
         clockOffset = { connection.clockOffsetNs } // live (re-synced) — see the field doc
         recovery.bind(connection) // arm host-keyframe recovery for this session
         decodeReport.bind(connection) // arm the Automatic-bitrate decode signal for this session
-        phaseReporter.bind(connection) // arm phase reports (flushed only by the deadline link)
+        phaseReporter.bind(pacing == .decoded ? nil : connection)
         gate.reseed(framesDropped: connection.framesDropped()) // baseline the freeze to this session
         // A fresh session is a fresh source clock: re-anchor on its first frame rather than slew
         // for seconds off the previous host's offset. (Mid-session discontinuities — background
@@ -1285,6 +1347,7 @@ public final class Stage2Pipeline {
         decoder.setChroma444(connection.isChroma444)
         decoder.setCodec(connection.videoCodec)
         presenter.configure(hdr: connection.isHDR)
+        decodedSink?.reset()
 
         let token = token
         let decoder = decoder
@@ -1423,6 +1486,8 @@ public final class Stage2Pipeline {
         thread.qualityOfService = .userInteractive
         pumpJoinable = true
         thread.start()
+
+        if decodedSink != nil { return }
 
         // The present half. Deadline pacing (stage-4) swaps it wholesale: a CAMetalDisplayLink
         // vends the drawables and its per-refresh updates co-drive the render thread — see
@@ -1807,15 +1872,26 @@ public final class Stage2Pipeline {
         renderThread.start()
     }
 
-    /// MAIN thread, once per display-link tick: refresh the vsync clock (V-Sync-mode scheduling)
-    /// and nudge the render thread. The nudge is NOT the presentation trigger — frame arrival is
-    /// (see the header) — it only retries a frame a transient `nextDrawable` failure put back into
-    /// the ring, which matters under the host's infinite GOP where a static scene sends no
-    /// replacement frame. Arrival/glass pacing only — deadline sessions have no CADisplayLink
-    /// (their CAMetalDisplayLink's updates are both clock and retry).
-    public func renderTick(targetMediaTime: CFTimeInterval, period: CFTimeInterval) {
+    /// Consume an ordinary display-link tick on the main thread.
+    ///
+    /// The target refresh updates scheduled-present timing. For decoded-video presentation, the
+    /// currently displayed IOSurface is correlated to its frame and stamped at this tick's
+    /// just-finished refresh. Other pacings signal the render thread only as a retry;
+    /// decoded-frame arrival remains their primary trigger. Deadline pacing has its own
+    /// CAMetalDisplayLink and never calls this method.
+    public func renderTick(
+        targetMediaTime: CFTimeInterval, displayedMediaTime: CFTimeInterval,
+        period: CFTimeInterval
+    ) {
         vsyncClock.set(target: targetMediaTime, period: period)
-        renderSignal.signal()
+        #if os(tvOS)
+        if let stamp = decodedSink?.takeDisplayedStamp() {
+            let atNs = Self.realtimeNs(forDisplayLinkTimestamp: displayedMediaTime)
+            endToEndMeter?.record(ptsNs: stamp.ptsNs, atNs: atNs, offsetNs: clockOffset())
+            displayMeter?.record(ptsNs: UInt64(stamp.decodedNs), atNs: atNs, offsetNs: 0)
+        }
+        #endif
+        if pacing != .decoded { renderSignal.signal() }
     }
 
     /// MAIN thread (SessionPresenter — session start + every layout/Reconfigure): hint the

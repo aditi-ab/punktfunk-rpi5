@@ -5,6 +5,7 @@
 
 import AVFoundation
 import CoreMedia
+import IOSurface
 import VideoToolbox
 import XCTest
 @testable import PunktfunkKit
@@ -67,6 +68,64 @@ final class VideoToolboxRoundTripTests: XCTestCase {
         XCTAssertEqual(CVPixelBufferGetHeight(pixels), height)
     }
 
+    /// An already-decoded image can be wrapped without copying and carries the immediate-display
+    /// sample attachment required by the tvOS video path.
+    func testDecodedImageWrapsForImmediateDisplay() throws {
+        let pixels = try gradientPixelBuffer()
+        let sample = try XCTUnwrap(DecodedVideoSink.immediateSample(pixels))
+        XCTAssertEqual(
+            CVPixelBufferGetWidth(try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))), width)
+        let attachments = try XCTUnwrap(
+            CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false))
+        let dict = unsafeBitCast(
+            CFArrayGetValueAtIndex(attachments, 0), to: CFDictionary.self)
+        let value = CFDictionaryGetValue(
+            dict,
+            Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque())
+        XCTAssertEqual(value, Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+    }
+
+    /// The uncompressed wrapper must preserve the color description that lets tvOS select and
+    /// interpret the HDR10 video plane instead of treating P010 samples as untagged SDR.
+    func testDecodedHDRImagePreservesPQColorDescription() throws {
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+            kCVPixelBufferMetalCompatibilityKey: true,
+        ]
+        var buffer: CVPixelBuffer?
+        XCTAssertEqual(
+            CVPixelBufferCreate(
+                kCFAllocatorDefault, width, height,
+                kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+                attrs as CFDictionary, &buffer),
+            kCVReturnSuccess)
+        let pixels = try XCTUnwrap(buffer)
+        CVBufferSetAttachment(
+            pixels, kCVImageBufferColorPrimariesKey,
+            kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
+        CVBufferSetAttachment(
+            pixels, kCVImageBufferTransferFunctionKey,
+            kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, .shouldPropagate)
+        CVBufferSetAttachment(
+            pixels, kCVImageBufferYCbCrMatrixKey,
+            kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
+
+        let sample = try XCTUnwrap(DecodedVideoSink.immediateSample(pixels))
+        let format = try XCTUnwrap(CMSampleBufferGetFormatDescription(sample))
+        XCTAssertEqual(
+            CMFormatDescriptionGetExtension(
+                format, extensionKey: kCMFormatDescriptionExtension_ColorPrimaries) as? String,
+            kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String)
+        XCTAssertEqual(
+            CMFormatDescriptionGetExtension(
+                format, extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String,
+            kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
+        XCTAssertEqual(
+            CMFormatDescriptionGetExtension(
+                format, extensionKey: kCMFormatDescriptionExtension_YCbCrMatrix) as? String,
+            kCMFormatDescriptionYCbCrMatrix_ITU_R_2020 as String)
+    }
+
     /// Stage-2 decode half: the same known IDR through `VideoDecoder` — assert its async output
     /// callback fires with a CVPixelBuffer of the right dimensions, the pts and the receipt stamp
     /// round-trip (the latter rides the frame refcon), and decode-completion is stamped.
@@ -102,6 +161,9 @@ final class VideoToolboxRoundTripTests: XCTestCase {
         let buffer = try XCTUnwrap(ready.pixelBuffer, "a VT decode delivers a .video frame")
         XCTAssertEqual(CVPixelBufferGetWidth(buffer), width)
         XCTAssertEqual(CVPixelBufferGetHeight(buffer), height)
+        XCTAssertNotNil(CVPixelBufferGetIOSurface(buffer), "decoded output must be IOSurface-backed")
+        XCTAssertNotNil(
+            DecodedVideoSink.immediateSample(buffer), "decoded NV12 must wrap for video presentation")
         XCTAssertEqual(ready.ptsNs, 42_000_000, "pts round-trips through the decoder")
         XCTAssertEqual(
             ready.receivedNs, 41_000_000, "receivedNs round-trips through the frame refcon")

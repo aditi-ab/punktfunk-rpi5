@@ -238,8 +238,14 @@ public final class VideoDecoder: @unchecked Sendable {
             || s == (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String)
     }
 
-    /// `lock` held. Replace the session with one for `newFormat`. SDR streams decode to 8-bit NV12;
-    /// HDR streams (BT.2020 PQ) decode to 10-bit P010 so the presenter can drive EDR.
+    /// Replace the session for `newFormat` while `lock` is held.
+    ///
+    /// Chroma and HDR signaling choose the biplanar output format. Every output is both Metal-
+    /// compatible and IOSurface-backed, allowing either renderer to consume the same decoded image
+    /// without a copy. Hardware-only formats fail session creation rather than silently falling back
+    /// to a decoder that cannot sustain the stream.
+    ///
+    /// Returns false if VideoToolbox refuses the requested configuration.
     private func createSessionLocked(format newFormat: CMVideoFormatDescription) -> Bool {
         if let session {
             VTDecompressionSessionWaitForAsynchronousFrames(session)
@@ -262,6 +268,7 @@ public final class VideoDecoder: @unchecked Sendable {
         }()
         let imageAttrs: [CFString: Any] = [
             kCVPixelBufferMetalCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
             kCVPixelBufferPixelFormatTypeKey: pixelFormat,
         ]
         var callback = VTDecompressionOutputCallbackRecord(
