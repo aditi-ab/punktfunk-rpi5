@@ -1,11 +1,14 @@
-//! The Windows DXGI capture identity + shared D3D11 device creation (plan §W6): the capture
-//! target descriptor ([`WinCaptureTarget`]), the GPU-resident captured texture ([`D3d11Frame`]),
-//! the adapter-LUID packer ([`pack_luid`]), and [`make_device`] — a fresh D3D11 device/context on
-//! a chosen adapter, applying the process GPU scheduling-priority hardening. Extracted from the
-//! host's `capture/windows/dxgi.rs` so the capture IDD-push path, the encode D3D11 backends, and
-//! pf-vdisplay all share ONE identity type + device factory (no capture↔encode↔vdisplay cycle).
-//! The win32u GPU-preference hook, the HDR/video-engine converters, and the self-tests stay in the
-//! capture crate — they are capture mechanics, not shared identity.
+//! DXGI capture identity and the shared D3D11 device factory.
+//!
+//! [`WinCaptureTarget`], [`D3d11Frame`], [`pack_luid`], and [`make_device`] live here so
+//! capture (IDD-push), encode (D3D11 backends), and pf-vdisplay share one identity type
+//! and one device factory without a capture↔encode↔vdisplay crate cycle.
+//!
+//! [`make_device`] builds a free-threaded D3D11 device on a chosen adapter and raises the
+//! process GPU scheduling class (see [`elevate_process_gpu_priority`]). Recreate the
+//! device after ACCESS_LOST: a device born on one desktop cannot duplicate another.
+//!
+//! Win32u GPU-preference, HDR converters, and DXGI self-tests stay in the capture crate.
 
 use anyhow::{Context, Result};
 use windows::core::Interface;
@@ -19,82 +22,69 @@ use windows::Win32::Graphics::Dxgi::{IDXGIAdapter1, IDXGIDevice, IDXGIDevice1};
 
 #[derive(Clone)]
 pub struct WinCaptureTarget {
-    /// Packed DXGI adapter LUID (`(HighPart << 32) | (LowPart & 0xffff_ffff)`).
+    /// Packed DXGI adapter LUID: `(HighPart << 32) | (LowPart & 0xffff_ffff)`.
     pub adapter_luid: i64,
-    /// The output's GDI device name, e.g. `\\.\DISPLAY3`. Can CHANGE across a secure-desktop switch.
+    /// GDI device name. Changes across a secure-desktop switch; re-resolve from [`Self::target_id`].
     pub gdi_name: String,
-    /// Stable virtual-display (IddCx) target id — re-resolved to the current GDI name on every recovery.
+    /// IddCx target id. Stable across GDI-name changes; re-resolve on every recovery.
     pub target_id: u32,
-    /// The pf-vdisplay driver's WUDFHost pid (from the ADD reply) — the process the IDD-push capturer
-    /// duplicates the sealed frame channel's handles INTO (`idd_push::ChannelBroker`). `0` = unknown
-    /// (a pre-v2 pairing can't occur — the version handshake is hard — so this only guards misuse).
+    /// WUDFHost pid from the ADD reply — the process IDD-push duplicates sealed-channel
+    /// handles into. `0` = unknown.
     pub wudf_pid: u32,
-    /// The ADD reply flagged the ADAPTER as carrying an IRREVOCABLE IddCx hardware-cursor declare
-    /// from an earlier session (remote-desktop-sweep §8.6; reach is adapter-wide, not per-target —
-    /// on-glass 2026-07-23, a GameStream session's fresh target streamed cursor-less): DWM
-    /// excludes the pointer from its frames until adapter reset, so a session WITHOUT the cursor
-    /// channel must self-composite (the IDD-push capturer's forced-composite gate) or the
-    /// streamed desktop has no cursor at all.
+    /// IddCx hardware-cursor declare is adapter-wide and irrevocable until adapter reset;
+    /// DWM then omits the pointer from its frames. A session without the cursor channel
+    /// must self-composite or the stream has no cursor.
     pub cursor_excluded: bool,
 }
 
-/// The PyroWave (Windows) zero-copy sharing payload attached to a captured frame: the SECOND plane
-/// texture + the cross-device fence the wavelet encoder needs (design/pyrowave-windows-host-
-/// zerocopy.md). The wavelet encoder ingests **two SEPARATE** shareable plane textures — the full-res
-/// `R8_UNORM` **Y** rides [`D3d11Frame::texture`], and the half-res `R8G8_UNORM` **CbCr** rides
-/// [`cbcr`](Self::cbcr) — because importing a single *planar* NV12 texture into Vulkan is unreliable
-/// on NVIDIA at arbitrary sizes; separate single/two-component textures import reliably. `None` on
-/// every non-PyroWave frame (NVENC/AMF/QSV encode the in-place NV12/BGRA and need no cross-device
-/// fence). The encoder makes each texture's shared handle on demand.
+/// PyroWave zero-copy share: second plane + cross-device fence.
+///
+/// The wavelet encoder takes two shareable textures, not planar NV12: full-res `R8_UNORM`
+/// Y on [`D3d11Frame::texture`], half-res `R8G8_UNORM` CbCr here. NVIDIA's Vulkan import
+/// of a single planar NV12 is unreliable at arbitrary sizes. `None` on NVENC/AMF/QSV
+/// frames. The encoder mints each texture's shared handle on demand.
 pub struct PyroFrameShare {
-    /// The half-res `R8G8_UNORM` interleaved CbCr plane (created `SHARED | SHARED_NTHANDLE`). The
-    /// full-res Y plane is [`D3d11Frame::texture`].
+    /// Half-res `R8G8_UNORM` CbCr, created `SHARED | SHARED_NTHANDLE`.
     pub cbcr: ID3D11Texture2D,
-    /// The shared D3D11/D3D12 **fence** NT handle (raw), passed on EVERY frame; the encoder imports
-    /// it (duplicating) whenever it has no timeline yet (first frame or after an encoder rebuild).
+    /// Shared D3D11/D3D12 fence NT handle. Encoder imports (duplicating) on first frame
+    /// or after an encoder rebuild.
     pub fence_handle: Option<isize>,
-    /// The fence value the capturer signalled after THIS frame's convert. The encoder's Vulkan
-    /// acquire waits on it, so the wavelet read is ordered after the D3D11 CSC.
+    /// Fence value signalled after this frame's convert. Encoder Vulkan acquire waits
+    /// on it so the wavelet read follows the D3D11 CSC.
     pub fence_value: u64,
-    /// The capturer's ring generation, bumped every time it recreates its texture ring. The
-    /// PyroWave encoder caches its plane imports keyed on the texture's COM address, which carries
-    /// no reference — after a recreate those addresses can be recycled by the allocator, so a
-    /// cached import may describe a texture that no longer exists. The encoder flushes its import
-    /// cache whenever this changes, making cache identity independent of allocator behaviour.
+    /// Capturer texture-ring generation. Encoder caches plane imports by COM address,
+    /// which the allocator can recycle after a ring recreate; flush the cache when this
+    /// changes.
     pub ring_gen: u32,
 }
 
-/// A GPU-resident captured texture (the Windows zero-copy path: NVENC/AMF/QSV encode it in place;
-/// the PyroWave backend imports it — plus the second plane in [`pyro`](Self::pyro) — into its own
-/// Vulkan device). For a PyroWave frame, `texture` is the full-res `R8_UNORM` Y plane.
+/// GPU-resident captured texture. NVENC/AMF/QSV encode in place; PyroWave imports
+/// `texture` (Y) plus [`Self::pyro`] (CbCr) into its Vulkan device.
 pub struct D3d11Frame {
     pub texture: ID3D11Texture2D,
     pub device: ID3D11Device,
-    /// PyroWave zero-copy sharing info (the CbCr plane + fence); `None` unless this is a PyroWave
-    /// session. See [`PyroFrameShare`].
+    /// PyroWave CbCr + fence. `None` unless this is a PyroWave session.
     pub pyro: Option<PyroFrameShare>,
 }
-// SAFETY: `D3d11Frame` owns an `ID3D11Texture2D` + `ID3D11Device`, which are COM interface pointers.
-// D3D11 devices/resources use thread-safe (interlocked) COM reference counting, and the device is
-// created free-threaded (`make_device` passes no `D3D11_CREATE_DEVICE_SINGLETHREADED`), so handing
-// ownership of the frame to another thread — the capture→encode handoff — and releasing it there is
-// sound. The value is moved, never aliased (no `Sync`), so there is no concurrent use of the
-// single-threaded immediate context.
+// SAFETY: `ID3D11Texture2D` and `ID3D11Device` are COM pointers with interlocked
+// refcounting. `make_device` does not pass `D3D11_CREATE_DEVICE_SINGLETHREADED`, so
+// the device is free-threaded. The value is moved, never aliased (`Send` without
+// `Sync`); the single-threaded immediate context is never used concurrently.
 unsafe impl Send for D3d11Frame {}
 
 pub fn pack_luid(luid: LUID) -> i64 {
     ((luid.HighPart as i64) << 32) | (luid.LowPart as i64 & 0xffff_ffff)
 }
 
-/// Create a fresh D3D11 device + context on a specific adapter (driver_type UNKNOWN with an explicit
-/// adapter). Used at open and on every ACCESS_LOST: a device created on one desktop cannot sustain a
-/// duplication on a *different* desktop (perpetual ACCESS_LOST), so the secure-desktop switch needs a
-/// device made while the thread is attached to that desktop.
+/// Fresh D3D11 device + context on `adapter` (`D3D_DRIVER_TYPE_UNKNOWN`).
+///
+/// Recreate on ACCESS_LOST: a device created on one desktop cannot sustain a
+/// duplication on another, so a secure-desktop switch needs a device made while
+/// the thread is attached to that desktop.
 ///
 /// # Safety
-/// `adapter` must be a live `IDXGIAdapter1` for the duration of the call. The fn calls the D3D11 /
-/// DXGI FFI (`D3D11CreateDevice`, GPU scheduling-priority hardening) but forms no lasting alias to
-/// `adapter`; the returned device/context are the sole owners of the new COM objects.
+/// `adapter` must stay live for the call. No lasting alias is taken; the returned
+/// device/context own the new COM objects.
 pub unsafe fn make_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     let mut device: Option<ID3D11Device> = None;
     let mut context: Option<ID3D11DeviceContext> = None;
@@ -117,23 +107,16 @@ pub unsafe fn make_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D
     let device = device.context("null D3D11 device")?;
     let context = context.context("null D3D11 context")?;
 
-    // GPU scheduling hardening — the same approach Sunshine/Apollo use, reimplemented here via the
-    // documented D3DKMT/DXGI APIs (no GPL source copied). Our capture+encode
-    // shares the GPU with the streamed game; when the game saturates the GPU our process is starved of
-    // GPU time slices, so NVENC sits near-idle yet `lock_bitstream` waits ~20 ms for our context to be
-    // scheduled — capping the stream (~47 fps measured at 5K@240) and stuttering. Per-frame copy/convert
-    // is NOT the cause (zero-copy + thread-priority alone didn't move it); the PROCESS-level GPU
-    // scheduling priority class is the decisive cross-process lever. Secondary: the absolute per-device
-    // GPU thread priority and a 1-frame latency cap.
+    // Process-level GPU scheduling so capture/encode is not starved by a saturating game.
+    // Thread priority and a 1-frame latency cap are secondary.
     elevate_process_gpu_priority();
     if let Ok(dxgi_dev) = device.cast::<IDXGIDevice>() {
-        // The absolute max GPU thread priority (0x4000001E; the same value Sunshine/Apollo use); fall back to relative +7.
+        // Absolute max GPU thread priority (`0x4000_001E`); fall back to relative +7.
         // SAFETY: `dxgi_dev` is a live interface just obtained by a checked `cast`; both calls take
         // a scalar and only report failure through their return value.
         if unsafe { dxgi_dev.SetGPUThreadPriority(0x4000_001E) }.is_err()
             // SAFETY: same live interface, same scalar-in/HRESULT-out contract as the call above.
-            // Deliberately its own block rather than one around the whole chain, which would
-            // destroy the short-circuit and always issue the relative-priority call too.
+            // Own block so the `&&` short-circuit still skips the relative-priority call.
             && unsafe { dxgi_dev.SetGPUThreadPriority(7) }.is_err()
         {
             tracing::warn!("SetGPUThreadPriority failed (run as admin/SYSTEM for GPU priority)");
@@ -146,26 +129,20 @@ pub unsafe fn make_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D
     Ok((device, context))
 }
 
-/// The configured GPU scheduling-priority policy (`PUNKTFUNK_GPU_PRIORITY_CLASS`).
+/// `PUNKTFUNK_GPU_PRIORITY_CLASS` policy.
 enum PrioMode {
-    /// Leave the OS default untouched (`off`).
+    /// Skip the D3DKMT call; this is not class 0 (IDLE).
     Off,
-    /// A fixed class (`normal`=2 / `high`=4 / `realtime`=5 — the default).
+    /// Fixed D3DKMT class: `normal`=2, `high`=4, `realtime`=5.
     Static(i32),
 }
 
-/// Resolve `PUNKTFUNK_GPU_PRIORITY_CLASS` (`off|normal|high|realtime`, default **REALTIME**).
-/// D3DKMT_SCHEDULINGPRIORITYCLASS: IDLE 0, BELOW_NORMAL 1, NORMAL 2, ABOVE_NORMAL 3, HIGH 4,
-/// REALTIME 5. REALTIME is the Sunshine/OBS lever: the host's capture/convert/encode contexts
-/// preempt a saturating game instead of waiting behind it, which is the whole product. The
-/// 2026-08 HIGH default came from an AMD RX 9070 XT A/B that blamed REALTIME for a metronomic
-/// capture stall; confirmed cases kept arriving with the downgrade shipped — it masked that
-/// still-unattributed stall on some boxes, never fixed it — while regressing loaded NVIDIA
-/// boxes into feed starvation (encode-latency spikes, half the frames reaching the encoder
-/// under a GPU-bound game), so it was reverted. Do not re-convict REALTIME on that A/B. One
-/// known trap: REALTIME + NVIDIA + HAGS + near-full VRAM is a documented NVENC hang — `high`
-/// is the escape hatch. Costing the local game fps under load is by design (the remote view
-/// is the product).
+/// Resolve `PUNKTFUNK_GPU_PRIORITY_CLASS` (`off|normal|high|realtime`).
+///
+/// D3DKMT_SCHEDULINGPRIORITYCLASS: IDLE 0, BELOW_NORMAL 1, NORMAL 2, ABOVE_NORMAL 3,
+/// HIGH 4, REALTIME 5. Default is REALTIME so capture/convert/encode preempts a
+/// saturating game. Trap: REALTIME + NVIDIA + HAGS + near-full VRAM hangs NVENC —
+/// set `high` then. Costing local game fps under load is by design.
 fn configured_gpu_priority_mode() -> PrioMode {
     match std::env::var("PUNKTFUNK_GPU_PRIORITY_CLASS")
         .ok()
@@ -174,15 +151,16 @@ fn configured_gpu_priority_mode() -> PrioMode {
         Some("off") => PrioMode::Off,
         Some("normal") => PrioMode::Static(2),
         Some("high") => PrioMode::Static(4),
-        // `realtime`, unset, and anything unrecognized all land on the REALTIME default.
+        // `realtime`, unset, and anything unrecognized all land on REALTIME.
         _ => PrioMode::Static(5),
     }
 }
 
-/// Enable SE_INC_BASE_PRIORITY on the CURRENT process token (best-effort) — the kernel gates the
-/// HIGH/REALTIME GPU scheduling-priority bump on it. Held by SYSTEM/Administrators; a UAC-FILTERED
-/// token does NOT have it, which is why `elevate_process_gpu_priority` may silently no-op in a
-/// restricted service context.
+/// Enable `SE_INC_BASE_PRIORITY` on this process token (best-effort).
+///
+/// The kernel gates HIGH/REALTIME GPU scheduling on it. SYSTEM/Administrators
+/// hold it; a UAC-filtered token does not, so [`elevate_process_gpu_priority`]
+/// may silently no-op.
 fn enable_inc_base_priority() {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
@@ -240,10 +218,10 @@ fn enable_inc_base_priority() {
     }
 }
 
-/// Call `gdi32!D3DKMTSetProcessSchedulingPriorityClass(process, prio)` (no stable windows-rs binding —
-/// loaded by name). Returns the NTSTATUS (0 = success) or `None` if the export can't be resolved. The
-/// CALLING process must hold SE_INC_BASE_PRIORITY ([`enable_inc_base_priority`]) for HIGH/REALTIME; the
-/// kernel checks the caller's privilege whether the target is self or a child we created.
+/// `gdi32!D3DKMTSetProcessSchedulingPriorityClass(process, prio)` by name (no
+/// stable windows-rs binding). Returns NTSTATUS (0 = success) or `None` if the
+/// export is missing. Caller must hold `SE_INC_BASE_PRIORITY` for HIGH/REALTIME;
+/// the kernel checks the caller whether the target is self or a child.
 unsafe fn d3dkmt_set_scheduling_priority_class(
     process: windows::Win32::Foundation::HANDLE,
     prio: i32,
@@ -269,16 +247,11 @@ unsafe fn d3dkmt_set_scheduling_priority_class(
     Some(unsafe { f(process, prio) })
 }
 
-/// GPU scheduling-priority hardening — the same approach as Sunshine/Apollo, independently
-/// implemented via the documented D3DKMT APIs (no GPL source copied). On a
-/// GPU-saturated game our capture+encode process is starved of GPU time slices — NVENC sits ~idle but
-/// `lock_bitstream` waits ~20 ms for our context to be scheduled. Elevating the PROCESS GPU scheduling
-/// priority class (the strong cross-process lever — far more effective than `SetGPUThreadPriority`
-/// alone, which we measured as no help) lets our brief encode preempt the game. Default is
-/// REALTIME — minimum latency at every layer; see [`configured_gpu_priority_mode`] for the
-/// history and the `high` escape hatch. Runs once per process. Best-effort: silently no-ops
-/// under a UAC-filtered token (the process will not hold SE_INC_BASE_PRIORITY, so the D3DKMT
-/// call is a no-op).
+/// Raise this process's D3DKMT GPU scheduling class (once, best-effort).
+///
+/// Process class is the cross-process lever; `SetGPUThreadPriority` alone does
+/// not unstarve encode under a GPU-bound game. Default REALTIME; see
+/// [`configured_gpu_priority_mode`]. No-ops under a UAC-filtered token.
 fn elevate_process_gpu_priority() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
