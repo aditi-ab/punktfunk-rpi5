@@ -1,28 +1,24 @@
-//! Where the host session's keyboard LAYOUT comes from.
+//! Where the host session's keyboard layout comes from.
 //!
-//! punktfunk's key wire is **US-positional**: a client sends the Windows VK of the *physical* key
-//! it saw, [`vk_to_evdev`](super::keymap::vk_to_evdev) turns that into a Linux evdev code, and the
-//! **session's keymap** is what decides which character that position finally produces. The
-//! standing contract is therefore "host layout == the layout printed on the client's keyboard" —
-//! a German keyboard needs a German session, or its ISO keys render as their US neighbours
-//! (`#`→`\`, `ä`→`'`, `-`→`/`, the y↔z swap).
+//! The key wire is US-positional: a client sends the Windows VK of the
+//! physical key, [`vk_to_evdev`](super::keymap::vk_to_evdev) turns that into
+//! an evdev code, and the **session keymap** decides the character. Host
+//! layout must match the client's printed layout, or ISO keys scramble
+//! (`#`→`\`, `ä`→`'`, y↔z).
 //!
-//! Nothing on a Wayland box arranges that by itself. `localectl set-x11-keymap de` records the
-//! choice in `/etc/X11/xorg.conf.d/00-keyboard.conf` (and, on systemd ≥ 249, `/etc/vconsole.conf`),
-//! but that file is read by **Xorg** — a Wayland compositor never opens it. libxkbcommon's own
-//! fallback chain stops at the `XKB_DEFAULT_*` env vars, and no session manager exports those. So
-//! compiling a keymap from empty names on a properly-configured German box still silently yields
-//! evdev/pc105/**us**, which is exactly the scramble above.
+//! A Wayland compositor never reads `/etc/X11/xorg.conf.d/00-keyboard.conf`
+//! (`localectl` writes it for Xorg). libxkbcommon's fallback stops at
+//! `XKB_DEFAULT_*`, which no session manager exports. Compiling from empty
+//! names on a configured German box still yields evdev/pc105/us.
 //!
-//! [`system_layout`] reads what the machine actually recorded so the injected keyboard follows the
-//! box. It is advisory for backends whose keymap we do not own (libei/KWin/gamescope resolve our
-//! evdev codes against the compositor's own keymap — see [`crate::text_input_supported`]); there it
-//! only feeds the diagnostic, and the operator has to fix the session itself.
+//! [`system_layout`] reads what the machine recorded. Advisory for backends
+//! whose keymap we do not own (libei/KWin/gamescope — see
+//! [`crate::text_input_supported`]); there it only feeds the diagnostic.
 
 use std::path::{Path, PathBuf};
 
-/// The five xkb rule names, each `None` when nothing configured it (libxkbcommon then applies its
-/// own built-in default — `evdev`/`pc105`/`us`/``/``).
+/// The five xkb rule names. `None` means unset; libxkbcommon then applies
+/// `evdev`/`pc105`/`us`/``/``.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct XkbNames {
     pub rules: Option<String>,
@@ -33,7 +29,6 @@ pub struct XkbNames {
 }
 
 impl XkbNames {
-    /// Nothing at all was configured ⇒ the compiled keymap will be libxkbcommon's US default.
     pub fn is_empty(&self) -> bool {
         self.rules.is_none()
             && self.model.is_none()
@@ -42,10 +37,9 @@ impl XkbNames {
             && self.options.is_none()
     }
 
-    /// Fill every field this one leaves unset from `fallback` (per-field precedence, mirroring how
-    /// libxkbcommon itself falls back one `XKB_DEFAULT_*` variable at a time rather than taking a
-    /// source whole — a box that exports only `XKB_DEFAULT_LAYOUT` still keeps its configured
-    /// variant).
+    /// Fill unset fields from `fallback`, one field at a time — matching
+    /// libxkbcommon's `XKB_DEFAULT_*` (a box that exports only LAYOUT still
+    /// keeps its configured variant).
     fn fill_from(&mut self, fallback: XkbNames) {
         for (slot, value) in [
             (&mut self.rules, fallback.rules),
@@ -60,8 +54,8 @@ impl XkbNames {
         }
     }
 
-    /// The names as `xkb_keymap_new_from_names` wants them: an empty string means "unset", which
-    /// is where libxkbcommon applies its own default for that field.
+    /// Names as `xkb_keymap_new_from_names` wants them: empty string is unset,
+    /// and libxkbcommon applies its default for that field.
     pub fn as_args(&self) -> (&str, &str, &str, &str, Option<String>) {
         (
             self.rules.as_deref().unwrap_or(""),
@@ -72,10 +66,9 @@ impl XkbNames {
         )
     }
 
-    /// The same names as `XKB_DEFAULT_*` environment pairs, for a compositor punktfunk spawns
-    /// itself. Only the fields we actually resolved are emitted — exporting an empty
-    /// `XKB_DEFAULT_VARIANT` is not the same as leaving it unset, since an explicit empty string
-    /// *overrides* a variant the rules file would otherwise supply.
+    /// `XKB_DEFAULT_*` pairs for a compositor we spawn. Only resolved fields:
+    /// an explicit empty `XKB_DEFAULT_VARIANT` overrides a variant the rules
+    /// file would otherwise supply.
     pub fn env_pairs(&self) -> Vec<(&'static str, String)> {
         [
             ("XKB_DEFAULT_RULES", &self.rules),
@@ -89,7 +82,6 @@ impl XkbNames {
         .collect()
     }
 
-    /// `de(nodeadkeys)` / `de` / `us (libxkbcommon default)` — for one readable log field.
     pub fn describe(&self) -> String {
         match (&self.layout, &self.variant) {
             (Some(l), Some(v)) if !v.is_empty() => format!("{l}({v})"),
@@ -99,24 +91,21 @@ impl XkbNames {
     }
 }
 
-/// The resolved layout plus where it came from, so the log line can name the file an operator
-/// would have to edit.
+/// Resolved layout plus the file an operator would edit.
 #[derive(Clone, Debug)]
 pub struct SystemLayout {
     pub names: XkbNames,
-    /// Origin of `names.layout` specifically — the field that matters and the only one worth
-    /// naming in a one-line log.
+    /// Origin of `names.layout` — the only field worth naming in a one-line log.
     pub source: String,
 }
 
 /// What `localectl set-x11-keymap` writes.
 const X11_CONF_DIR: &str = "/etc/X11/xorg.conf.d";
-/// systemd ≥ 249 mirrors the X11 keymap here as `XKBLAYOUT=`/`XKBVARIANT=`/…
+/// systemd ≥ 249 mirrors the X11 keymap here as `XKBLAYOUT=` / `XKBVARIANT=`.
 const VCONSOLE_CONF: &str = "/etc/vconsole.conf";
 
-/// Resolve the host's configured keyboard layout: `XKB_DEFAULT_*` env (explicit operator intent,
-/// and what libxkbcommon would have used anyway) → `/etc/X11/xorg.conf.d/*keyboard*.conf` →
-/// `/etc/vconsole.conf`. Per-field, so a partially-configured box keeps whatever each source knows.
+/// Host keyboard layout: `XKB_DEFAULT_*` → `/etc/X11/xorg.conf.d/*keyboard*.conf`
+/// → `/etc/vconsole.conf`. Per-field, so a partial box keeps each source's knowledge.
 pub fn system_layout() -> SystemLayout {
     resolve_from(
         from_env(),
@@ -125,8 +114,7 @@ pub fn system_layout() -> SystemLayout {
     )
 }
 
-/// [`system_layout`] with its three inputs injected — the env block is a parameter so the tests
-/// never depend on the `XKB_DEFAULT_*` of whatever machine runs them.
+/// [`system_layout`] with inputs injected so tests do not read the machine's `XKB_DEFAULT_*`.
 fn resolve_from(env: XkbNames, x11_dir: &Path, vconsole: &Path) -> SystemLayout {
     let mut names = env;
     let mut source = if names.layout.is_some() {
@@ -171,9 +159,9 @@ fn from_env() -> XkbNames {
     }
 }
 
-/// Every `*keyboard*.conf` in the Xorg snippet directory, in **reverse** lexical order. Xorg
-/// merges these low-to-high with the later file winning; [`resolve_from`] fills fields first-hit-
-/// wins, so handing it the highest-numbered snippet first reproduces that precedence.
+/// `*keyboard*.conf` in **reverse** lexical order. Xorg merges low-to-high
+/// (later file wins); [`resolve_from`] is first-hit-wins, so the highest-
+/// numbered snippet must come first.
 fn x11_keyboard_confs(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -193,9 +181,9 @@ fn x11_keyboard_confs(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Pull `Option "XkbLayout" "de"` style entries out of an Xorg `InputClass` snippet. Deliberately
-/// section-blind: `localectl` writes exactly one `MatchIsKeyboard` class, and scanning every
-/// `Option` line beats half-implementing the Xorg config grammar.
+/// `Option "XkbLayout" "de"` from an Xorg `InputClass` snippet. Section-blind:
+/// `localectl` writes one `MatchIsKeyboard` class; scanning every `Option`
+/// beats half-implementing the Xorg grammar.
 fn parse_x11_keyboard_conf(text: &str) -> XkbNames {
     let mut names = XkbNames::default();
     for line in text.lines() {
@@ -204,7 +192,6 @@ fn parse_x11_keyboard_conf(text: &str) -> XkbNames {
             continue;
         }
         let mut fields = line.split('"');
-        // `Option ` | key | ` ` | value
         let Some(head) = fields.next() else { continue };
         if !head.trim_end().eq_ignore_ascii_case("Option") {
             continue;
@@ -226,11 +213,11 @@ fn parse_x11_keyboard_conf(text: &str) -> XkbNames {
     names
 }
 
-/// Pull `XKBLAYOUT=de` / `XKBVARIANT="nodeadkeys"` out of `/etc/vconsole.conf`.
+/// `XKBLAYOUT=de` / `XKBVARIANT="nodeadkeys"` from `/etc/vconsole.conf`.
 ///
-/// ⚠ `KEYMAP=` is deliberately ignored: it names a **console** keymap (`de-nodeadkeys`, `uk`,
-/// `sg-latin1`), whose namespace only coincides with xkb's by accident — `uk` is xkb `gb`, and a
-/// wrong guess here would mis-type every key rather than fall back to a visible default.
+/// `KEYMAP=` is ignored: it names a console keymap (`de-nodeadkeys`, `uk`,
+/// `sg-latin1`) whose namespace only coincides with xkb by accident (`uk` is
+/// xkb `gb`). A wrong guess here mis-types every key.
 fn parse_vconsole_conf(text: &str) -> XkbNames {
     let mut names = XkbNames::default();
     for line in text.lines() {
@@ -299,7 +286,6 @@ EndSection
 
     #[test]
     fn parses_vconsole_and_ignores_console_keymap() {
-        // The KEYMAP= line must NOT become an xkb layout: console and xkb namespaces differ.
         let n = parse_vconsole_conf("KEYMAP=\"de-nodeadkeys\"\nFONT=\"eurlatgr\"\n");
         assert!(n.is_empty(), "KEYMAP must not be read as an xkb layout");
 
@@ -319,7 +305,6 @@ EndSection
 
     #[test]
     fn per_field_fallback_keeps_the_more_specific_source() {
-        // Env named only the layout; the X11 snippet still supplies model/variant.
         let mut n = XkbNames {
             layout: Some("fr".into()),
             ..Default::default()
@@ -346,7 +331,6 @@ EndSection
         );
     }
 
-    /// A throwaway `/etc` stand-in; the caller writes the two files it cares about.
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pf-layout-{}-{tag}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
@@ -363,8 +347,6 @@ EndSection
         std::fs::write(&vconsole, "XKBLAYOUT=fr\nXKBOPTIONS=compose:ralt\n").unwrap();
 
         let got = resolve_from(XkbNames::default(), &x11, &vconsole);
-        // The X11 snippet outranks vconsole, so its layout stands; vconsole still fills the
-        // options nothing else supplied.
         assert_eq!(got.names.layout.as_deref(), Some("de"));
         assert_eq!(got.names.variant.as_deref(), Some("nodeadkeys"));
         assert_eq!(got.names.options.as_deref(), Some("compose:ralt"));
@@ -386,7 +368,6 @@ EndSection
 
         let got = resolve_from(XkbNames::default(), &x11, &dir.join("absent"));
         assert_eq!(got.names.layout.as_deref(), Some("no"));
-        // The `00-` file still supplies what `90-` left unsaid.
         assert_eq!(got.names.variant.as_deref(), Some("nodeadkeys"));
         assert!(
             got.source.ends_with("90-custom-keyboard.conf"),

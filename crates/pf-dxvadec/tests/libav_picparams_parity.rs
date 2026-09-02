@@ -1,28 +1,20 @@
-//! DXVA submission parity contract for H.264, HEVC, and AV1.
+//! DXVA submission parity for H.264, HEVC, and AV1.
 //!
-//! Ordinary tests validate every vendored-vector submission's descriptor set, matrix presence,
-//! macroblock counts, and slice tiling. Ignored tests compare picture parameters, matrices, and
-//! descriptor values with captures from patched FFmpeg n8.1 on Windows with working D3D11VA.
-//! The patch must emit `PFPP`/`PFQM`/`PFBD`/`PFCFG` records under one zero-based picture index;
-//! captures must cover every submitted picture and every descriptor (software fallback is void).
-//! AV1 indexes 274 decoded frames, not its 250 temporal units, and has no matrix or PFCFG check.
+//! Ordinary tests check descriptor set, matrix presence, MB counts, and tiling on the
+//! vendored vectors. Ignored tests compare picture parameters, matrices, and descriptors
+//! against patched FFmpeg n8.1 D3D11VA captures (`PFPP`/`PFQM`/`PFBD`/`PFCFG` under a
+//! zero-based picture index). AV1 indexes 274 decoded frames, not 250 temporal units,
+//! and has no matrix or PFCFG check. Software fallback is void.
 //!
-//! Run ordinary structural checks, or regenerate captures from the exact vendored streams:
 //! ```text
 //! cargo test -p pf-dxvadec --test libav_picparams_parity
 //! ffmpeg -hwaccel d3d11va -hwaccel_output_format d3d11 -i test-25fps.h264 -f null - 2> h264.log
-//! ffmpeg -hwaccel d3d11va -hwaccel_output_format d3d11 -i test-25fps.h265 -f null - 2> hevc.log
-//! ffmpeg -hwaccel d3d11va -hwaccel_output_format d3d11 -i test-25fps.ivf.av1 -f null - 2> av1.log
 //! grep -oE 'PF(PP|QM|BD|CFG) .*' h264.log > libav-h264.capture
-//! grep -oE 'PF(PP|QM|BD|CFG) .*' hevc.log > libav-hevc.capture
-//! grep -oE 'PF(PP|QM|BD|CFG) .*' av1.log > libav-av1.capture
-//! PF_LIBAV_CAPTURE_H264=libav-h264.capture PF_LIBAV_CAPTURE_HEVC=libav-hevc.capture \
-//! PF_LIBAV_CAPTURE_AV1=libav-av1.capture cargo test -p pf-dxvadec --test libav_picparams_parity -- --ignored --nocapture
+//! PF_LIBAV_CAPTURE_H264=libav-h264.capture cargo test -p pf-dxvadec --test libav_picparams_parity -- --ignored
 //! ```
-//! `PF_DXVA_DUMP=<path>` writes this harness's records for manual comparison.
-//! Surface indices/reference ordering are compared structurally; H.264's constant POC offset and
-//! HEVC's tiles-disabled bit-10 difference are narrow documented allowances. Reject H.264 captures
-//! with `Reserved16Bits == 0`; bitstream sizes may differ only by splitter trailing-zero handling.
+//! Repeat for HEVC (`test-25fps.h265`) and AV1 (`test-25fps.ivf.av1`). `PF_DXVA_DUMP`
+//! writes this harness's records. H.264 POC offset and HEVC tiles-disabled bit 10 are
+//! the only allowances; reject `Reserved16Bits == 0`.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -63,27 +55,17 @@ const TEST_25FPS_H264: &[u8] = include_bytes!(
 const TEST_25FPS_H265: &[u8] = include_bytes!(
     "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
 );
-/// The AV1 vector is an IVF container, and its unit of comparison is the TEMPORAL UNIT rather
-/// than the access unit: one IVF packet may decode several frames, of which at most one shows.
+/// IVF packet, not AU: one packet may decode several frames, of which at most one shows.
 const TEST_25FPS_AV1: &[u8] = include_bytes!(
     "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
 );
 
-/// Both vendored vectors carry exactly this many access units — pf-bitstream's own golden, and
-/// the number of `PFPP` lines a valid capture holds.
+/// 250 AUs: pf-bitstream golden and a valid capture's `PFPP` count.
 const VENDORED_AUS: usize = 250;
 
-/// A generous stand-in for the driver's bitstream mapping. Real mappings are a few MiB; the
-/// vendored vectors are 320x240, so nothing here comes close to the tail-padding clamp (which
-/// [`pf_dxvadec::pack`]'s own unit tests cover).
+/// 1 MiB stand-in. 320×240 vectors never hit pack's tail-padding clamp.
 const MAPPING_BYTES: usize = 1 << 20;
 
-// ---------------------------------------------------------------------------
-// Access-unit splitting
-// ---------------------------------------------------------------------------
-
-/// The same AU splitter every H.264 test in this program uses: a new AU starts at a non-slice
-/// NALU following a slice, or at a slice whose `first_mb_in_slice` is 0 following a slice.
 fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
     use cros_codecs::codec::h264::parser::Nalu;
     use cros_codecs::codec::h264::parser::NaluType;
@@ -110,12 +92,9 @@ fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
     aus
 }
 
-/// The H.265 splitter, which is NOT the H.264 one: the flag that starts a picture is
-/// `first_slice_segment_in_pic_flag`, the first bit after the TWO-byte NAL header, and "slice" is
-/// every NALU type below 32. Copied from the tested implementation in
-/// `crates/pf-bitstream/src/h265.rs` (`fn split_into_aus`, test-private there) rather than
-/// re-derived, because a splitter that disagrees with pf-bitstream's would make every AU index
-/// in a capture point at a different picture.
+/// HEVC AU split: `first_slice_segment_in_pic_flag` is the first bit after the two-byte NAL
+/// header; types below 32 are slices. Copied from `pf-bitstream` `h265.rs` — a different
+/// split would pair every capture AU with the wrong picture.
 fn split_into_aus_h265(stream: &[u8]) -> Vec<&[u8]> {
     use cros_codecs::codec::h265::parser::Nalu;
 
@@ -142,36 +121,22 @@ fn split_into_aus_h265(stream: &[u8]) -> Vec<&[u8]> {
     aus
 }
 
-// ---------------------------------------------------------------------------
-// This crate's side
-// ---------------------------------------------------------------------------
-
-/// Everything one AU's `SubmitDecoderBuffers` call would carry, from this crate.
 struct OurSubmission {
-    /// The picture-parameters buffer's bytes.
     pic_params: Vec<u8>,
-    /// The quantization-matrix buffer's bytes, or `None` when the buffer is not submitted at
-    /// all — which for HEVC is the whole of review 13's defect.
     qmatrix: Option<Vec<u8>>,
-    /// The descriptor set, in submission order.
     descriptors: Vec<BufferDescriptor>,
-    /// The packer's slice records, for the internal-consistency checks. Empty on AV1, whose
-    /// slice-control buffer holds [`Self::tiles`] instead.
+    /// Empty on AV1; those submissions use `tiles`.
     records: Vec<SliceRecord>,
-    /// AV1's slice-control records — one `DXVA_Tile_AV1` per TILE, not per tile group. Empty
-    /// on H.264 and H.265.
+    /// One `DXVA_Tile_AV1` per tile, not per tile group. Empty on H.264/H.265.
     tiles: Vec<TileAv1>,
-    /// Bytes the packer wrote BEFORE the tail padding.
+    /// Packer bytes before 128-byte tail padding.
     unpadded: u32,
-    /// `mb_width * mb_height` (H.264) or 0 (HEVC) — the value the descriptors must carry.
+    /// H.264: `mb_width * mb_height`. HEVC/AV1: 0.
     mb_count: u32,
 }
 
-/// Plan and convert the whole vendored H.264 vector, one entry per AU.
-///
-/// Every AU must plan and convert: this vector is pf-bitstream's clean golden, so a skipped AU
-/// is a regression rather than a stream fact. Swallowing an error here — the shape the scaffold
-/// this replaced had — is how a harness reports a clean bill of health while comparing nothing.
+/// One submission per AU. A skip on this golden vector is a regression; swallowing a plan
+/// error would report a clean run while comparing nothing.
 fn our_h264_submissions() -> Vec<OurSubmission> {
     let mut planner = H264Planner::new();
     let mut slots: Option<SlotMap> = None;
@@ -185,17 +150,11 @@ fn our_h264_submissions() -> Vec<OurSubmission> {
         if map.capacity() != plan.picture.max_dpb_frames + 1 {
             *map = SlotMap::new(plan.picture.max_dpb_frames);
         }
-        // `StatusReportFeedbackNumber` counts planned pictures from 1, which is exactly what
-        // libavcodec's `1 + report_id++` produces for a decoder that saw only this stream.
+        // `StatusReportFeedbackNumber` is 1-based; libavcodec uses `1 + report_id++`.
         let dxva = pf_dxvadec::plan_to_dxva(&plan, map, out.len() as u32 + 1)
             .unwrap_or_else(|e| panic!("AU {i} must convert: {e}"));
-        // The conversion's half of the deferral contract
-        // ([`pf_dxvadec::DecodePlanDxva::release_after_decode`]): a loop that converts
-        // AU after AU without applying it holds a surface per AU and runs the ledger
-        // dry. The vendored vector never puts a picture in both `RefFrameList` and
-        // `removed`, so this list is always empty HERE — applied anyway, because a
-        // harness that mirrors the caller only on the streams where it does not matter
-        // is a harness that would not notice the caller being wrong.
+        // Apply `release_after_decode` even though this vector never fills it: skip it
+        // and a convert-only loop holds a surface per AU and dries the ledger.
         for &id in &dxva.release_after_decode {
             assert!(
                 map.release(id),
@@ -219,8 +178,7 @@ fn our_h264_submissions() -> Vec<OurSubmission> {
     out
 }
 
-/// Plan and convert the whole vendored HEVC vector, one entry per AU. Same no-skipping contract
-/// as the H.264 side — `RaslSkipped` cannot arise on a vector that starts at an IDR.
+/// Same no-skip as H.264. `RaslSkipped` cannot arise on an IDR-start vector.
 fn our_hevc_submissions() -> Vec<OurSubmission> {
     let mut planner = H265Planner::new();
     let mut slots: Option<SlotMap> = None;
@@ -256,21 +214,12 @@ fn our_hevc_submissions() -> Vec<OurSubmission> {
     out
 }
 
-/// Every AV1 FRAME the vendored vector decodes — 274, of which 250 are displayed.
-///
-/// The unit of comparison is the frame and not the temporal unit, because that is what
-/// libavcodec's hwaccel counts: `ff_dxva2_common_end_frame` runs once per submitted PICTURE, so
-/// a capture's AU index walks decoded frames. A `show_existing_frame` unit submits nothing and
-/// appears on neither side; this vector has none.
+/// 274 decoded frames (250 displayed). Capture index walks `ff_dxva2_common_end_frame`
+/// pictures, not temporal units. This vector has no `show_existing_frame`.
 const VENDORED_AV1_FRAMES: usize = 274;
 
-/// Plan, convert and pack the whole vendored AV1 vector, one entry per decoded FRAME.
-///
-/// ⚠ This is the only one of the three that has to speak the conversion's DEFERRED RELEASE
-/// contract ([`pf_dxvadec::DecodePlanDxvaAv1::release_after_decode`]). A loop that converts
-/// without it holds a surface on 268 of these 274 frames and runs the nine-slot ledger dry
-/// inside ten — and, worse for a harness, it would compare a submission built by a caller that
-/// is not the rung.
+/// One entry per decoded frame. Must apply `release_after_decode`: skip it and 268 of 274
+/// frames hold a surface and the nine-slot ledger dries inside ten.
 fn our_av1_submissions() -> Vec<OurSubmission> {
     let mut planner = Av1Planner::new();
     let mut slots = SlotMap::new(NUM_REF_SLOTS);
@@ -282,7 +231,7 @@ fn our_av1_submissions() -> Vec<OurSubmission> {
             .unwrap_or_else(|e| panic!("unit {i} of the vendored AV1 vector must plan: {e}"));
         for plan in &plans {
             if plan.dpb.stored.is_none() {
-                continue; // `show_existing_frame`: no submission at all
+                continue; // `show_existing_frame`: no submission
             }
             let dxva = pf_dxvadec::plan_to_dxva_av1(unit, plan, &mut slots)
                 .unwrap_or_else(|e| panic!("unit {i} must convert: {e}"));
@@ -291,15 +240,10 @@ fn our_av1_submissions() -> Vec<OurSubmission> {
             let unpadded = pf_dxvadec::packed_size_av1(&dxva.bitstream) as u32;
             out.push(OurSubmission {
                 pic_params: pf_dxvadec::as_bytes(&dxva.pic_params).to_vec(),
-                // AV1 transmits no quantization matrix at all: its matrices are SELECTED by
-                // index out of tables the decoder already has, and `dxva2_av1_end_frame`
-                // passes `NULL, 0` for the pair. `None` here is a fact about the codec, not a
-                // condition on the stream the way HEVC's is.
+                // AV1 has no matrix buffer (`dxva2_av1_end_frame` passes `NULL, 0`).
                 qmatrix: None,
                 descriptors: pf_dxvadec::descriptors_av1(&packed),
-                // AV1's slice-control records are `DXVA_Tile_AV1`, a different struct with a
-                // different size; the shared `SliceRecord` checks do not apply to them, and
-                // the tile records get their own test rather than a coerced one.
+                // `SliceRecord` checks do not apply to `DXVA_Tile_AV1`.
                 records: Vec::new(),
                 tiles: packed.tiles.clone(),
                 unpadded,
@@ -317,8 +261,7 @@ fn our_av1_submissions() -> Vec<OurSubmission> {
     out
 }
 
-/// The IVF frame walk — the same one `video_d3d11_native`'s parity module and every AV1 test in
-/// this program use: a 32-byte file header, then a 12-byte header per packet carrying its size.
+/// IVF: 32-byte file header, then 12-byte size header per packet.
 fn split_ivf(stream: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut at = 32usize;
@@ -335,27 +278,15 @@ fn split_ivf(stream: &[u8]) -> Vec<&[u8]> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// Offset → field name
-// ---------------------------------------------------------------------------
-
-/// A field table for a hand-declared DXVA struct: `(name, offset)` per field, in declaration
-/// order, built from the field IDENTIFIERS so a name and the offset it reports cannot drift
-/// apart — the whole point of the table is to turn a differing byte into a field name, and a
-/// table with a copy-pasted mismatch would name the wrong one.
-/// Nested paths (`tiles.cols`) are accepted as well as plain identifiers, and are named by
-/// the whole path — AV1's picture parameters are eight nested blocks, and a table that could
-/// only reach the outer members would report "segmentation differs" for a 140-byte struct.
+/// `(name, offset)` from field identifiers so a copy-paste cannot name the wrong byte.
+/// Nested paths (`tiles.cols`) keep AV1's inner blocks from collapsing to one name.
 macro_rules! field_table {
     ($ty:ty, $($($field:ident).+),+ $(,)?) => {
         &[$((stringify!($($field).+), offset_of!($ty, $($field).+))),+]
     };
 }
 
-/// Every field of `DXVA_PicParams_H264`. Lengths are DERIVED from the next field's offset rather
-/// than written down: the struct has no interior padding (dxva.rs proves every offset at compile
-/// time), so consecutive offsets tile it exactly — and a hand-typed length is one more thing that
-/// can be wrong in a file whose whole job is to catch wrong numbers.
+/// Lengths from the next field's offset; `dxva.rs` proves no interior padding.
 const H264_FIELDS: &[(&str, usize)] = field_table!(
     PicParamsH264,
     wFrameWidthInMbsMinus1,
@@ -398,7 +329,6 @@ const H264_FIELDS: &[(&str, usize)] = field_table!(
     SliceGroupMap,
 );
 
-/// Every field of `DXVA_PicParams_HEVC`, same construction.
 const HEVC_FIELDS: &[(&str, usize)] = field_table!(
     PicParamsHevc,
     PicWidthInMinCbsY,
@@ -444,11 +374,10 @@ const HEVC_FIELDS: &[(&str, usize)] = field_table!(
     StatusReportFeedbackNumber,
 );
 
-/// `DXVA_Qmatrix_H264`'s two arrays.
 const H264_QMATRIX_FIELDS: &[(&str, usize)] =
     field_table!(QmatrixH264, bScalingLists4x4, bScalingLists8x8);
 
-/// The two short slice-control records, which are the structs the twelve-vs-ten defect was in.
+/// Ten-byte packed records; `#[repr(C)] {u32, u32, u16}` would be twelve.
 const H264_SLICE_FIELDS: &[(&str, usize)] = field_table!(
     SliceH264Short,
     BSNALunitDataLocation,
@@ -462,7 +391,6 @@ const HEVC_SLICE_FIELDS: &[(&str, usize)] = field_table!(
     wBadSliceChopping,
 );
 
-/// `DXVA_Qmatrix_HEVC`'s six.
 const HEVC_QMATRIX_FIELDS: &[(&str, usize)] = field_table!(
     QmatrixHevc,
     ucScalingLists0,
@@ -473,17 +401,9 @@ const HEVC_QMATRIX_FIELDS: &[(&str, usize)] = field_table!(
     ucScalingListDCCoefSizeID3,
 );
 
-/// Every field of `DXVA_PicParams_AV1`, same construction — but reaching INTO the eight nested
-/// blocks, because they are where AV1 keeps almost the whole frame header. `tiles` alone is 260
-/// bytes and `segmentation` 140; a table stopping at the outer members would turn every finding
-/// in them into one useless name.
-///
-/// Three members stay whole on purpose. `frame_refs` is seven 36-byte entries which — unlike
-/// the other two codecs' reference arrays — carry NO surface index and so compare byte for
-/// byte: `Index` is `ref_frame_idx[name]`, an AV1 SLOT both sides read out of the same frame
-/// header. `ref_frame_map_texture_index` is the surface array, which cannot be compared by
-/// value at all ([`av1_reference_store`]). And `film_grain` is 158 bytes neither vendored
-/// vector codes.
+/// Nested members: `tiles` is 260 bytes, `segmentation` 140. `frame_refs` stays whole — its
+/// `Index` is an AV1 slot, not a surface, so it compares byte for byte. Surface array is
+/// [`av1_reference_store`]. `film_grain` is 158 bytes this vector never codes.
 const AV1_FIELDS: &[(&str, usize)] = field_table!(
     PicParamsAv1,
     width,
@@ -541,8 +461,7 @@ const AV1_FIELDS: &[(&str, usize)] = field_table!(
     status_report_feedback_number,
 );
 
-/// `DXVA_Tile_AV1` — AV1's slice-control record, and the one this crate had to derive rather
-/// than measure (`dxva.h` declares it; the SIZE is what the descriptor states).
+/// Size is what the descriptor states; `dxva.h` declares the type.
 const AV1_TILE_FIELDS: &[(&str, usize)] = field_table!(
     TileAv1,
     data_offset,
@@ -554,7 +473,6 @@ const AV1_TILE_FIELDS: &[(&str, usize)] = field_table!(
     reserved8,
 );
 
-/// Turn a field table into `(name, byte range)`, the last field running to `total`.
 fn field_ranges(
     fields: &[(&'static str, usize)],
     total: usize,
@@ -586,27 +504,13 @@ fn i32_at(bytes: &[u8], offset: usize) -> i32 {
     u32_at(bytes, offset) as i32
 }
 
-// ---------------------------------------------------------------------------
-// Findings
-// ---------------------------------------------------------------------------
-
-/// One kind of divergence, and how often it happened.
 struct Finding {
     count: usize,
     first_au: usize,
     detail: String,
 }
 
-/// Divergences, grouped by the FIELD they belong to rather than by byte offset. A byte offset is
-/// nearly useless on a hand-declared struct; the crate proves its offsets at compile time, so
-/// this maps them back to names and reports those.
-///
-/// Two channels, and the split is the whole reason this type exists rather than a `Vec`:
-/// [`Findings::note`] records a FINDING (the run fails), [`Findings::document`] records a
-/// divergence this program has already decided is not a defect. Documented ones are printed on
-/// every run with their reason and their AU count — never dropped, because a divergence nobody
-/// prints is a divergence nobody re-reads, and each of them is only allowed within a stated
-/// allowance that the comparison itself enforces.
+/// `note` fails the run; `document` prints an allowed divergence so it cannot go unread.
 #[derive(Default)]
 struct Findings {
     by_field: BTreeMap<String, Finding>,
@@ -626,7 +530,6 @@ impl Findings {
         entry.count += 1;
     }
 
-    /// A divergence the module docs list, with the reason it is not a defect.
     fn document(&mut self, field: impl Into<String>, au: usize, reason: impl Into<String>) {
         let entry = self
             .documented
@@ -651,9 +554,7 @@ impl Findings {
         self.documented.keys().map(String::as_str).collect()
     }
 
-    /// Print the verdict and fail if there is one. Never silently passes: a run that classified
-    /// nothing prints the AU count it did compare, so "no findings" cannot be confused with
-    /// "nothing was compared".
+    /// Prints AU count even when empty so a no-op compare cannot look clean.
     fn verdict(&self, what: &str, aus: usize) {
         for (field, documented) in &self.documented {
             println!(
@@ -685,33 +586,18 @@ impl Findings {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Reference entries as pictures
-// ---------------------------------------------------------------------------
-
-/// A picture's identity as the reference arrays express it, and the key the surface mapping is
-/// tracked by: `(long-term, FrameNum or LongTermFrameIdx, TopFieldOrderCnt,
-/// BottomFieldOrderCnt)`. HEVC leaves the second and fourth members at 0 — it identifies a
-/// reference by POC alone.
-///
-/// It is DXVA's own key, deliberately, so both sides express it the same way. The one consequence
-/// worth naming: a picture that is re-marked long-term changes key (`FrameNum` becomes
-/// `LongTermFrameIdx`), so the surface mapping loses the link to its earlier self rather than
-/// reporting a change — a missed check, never a false finding. Both sides re-key identically, so
-/// the SET comparison is unaffected.
+/// `(long-term, FrameNum/LongTermFrameIdx, TopPOC, BottomPOC)`. HEVC zeros members 2 and 4.
+/// Re-marking long-term changes the key, so the mapping drops the earlier self — a miss,
+/// never a false finding.
 type PictureKey = (bool, u16, i32, i32);
 
-/// A reference entry with its surface index REMOVED: the identity DXVA resolves a reference by,
-/// plus the per-entry flag bits that belong to it. Comparing the array as a multiset of these is
-/// what makes the two sides' different orders irrelevant while keeping every fact — the flag
-/// bits travel with their entry, which is "re-indexed to the compared order" in practice.
+/// Reference identity without surface index, so order differences do not count.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct RefEntry {
     long_term: bool,
-    /// `FrameNumList[i]` (H.264): `frame_num`, or `LongTermFrameIdx` for a long-term entry.
-    /// Always 0 for HEVC, which has no such array.
+    /// H.264 `FrameNum` or `LongTermFrameIdx`. Always 0 for HEVC.
     frame_num_or_lt_idx: u16,
-    /// `FieldOrderCntList[i]` (H.264) or `PicOrderCntValList[i]` (HEVC, in `top`).
+    /// H.264 `FieldOrderCntList[i]`, or HEVC `PicOrderCntValList[i]` in `top`.
     top: i32,
     bottom: i32,
     used_top: bool,
@@ -720,8 +606,6 @@ struct RefEntry {
 }
 
 impl RefEntry {
-    /// The identity half alone — what follows a picture across AUs, and therefore what the
-    /// surface mapping is keyed by.
     fn key(self) -> PictureKey {
         (
             self.long_term,
@@ -732,37 +616,19 @@ impl RefEntry {
     }
 }
 
-/// FFmpeg's H.264 POC base, and the proof that it is a CONSTANT.
-///
-/// libavcodec's H.264 decoder seeds `prev_poc_msb = 1 << 16` at every IDR, so every
-/// `TopFieldOrderCnt`/`BottomFieldOrderCnt` it hands DXVA is the specification's plus 65536 —
-/// measured, on the RTX 4090 capture: AUs 0..7 carry 65536, 65540, 65538, 65544, … where 8.2.1
-/// (and this crate) derive 0, 4, 2, 8, …. The PROGRESSION is identical; only the base differs.
-///
-/// This crate keeps the spec's values, deliberately: the offset is an artefact of another
-/// decoder's POC bookkeeping, not a DXVA requirement, and importing it would mean writing a magic
-/// 65536 into a derivation that pf-bitstream shares with the Vulkan rung. It is harmless on the
-/// wire because every use a driver makes of these fields is a DIFFERENCE — temporal direct
-/// scaling, implicit weighted prediction, co-located picture selection — and the offset is uniform
-/// across `CurrPic` and every `RefFrameList` entry of a stream, so it cancels. (References are
-/// matched by `FrameNumList`, not by POC.) That it is uniform is exactly what this type checks.
-///
-/// So POCs are compared RELATIVE: the offset is derived from the first AU and then required to
-/// hold for every POC of every later AU. A wrong POC on either side changes the offset and is
-/// reported. Only 0 and 65536 are accepted as the base itself — any other constant is a finding,
-/// because then it is not the quirk documented here.
+/// libavcodec seeds `prev_poc_msb = 1 << 16` at IDR, so its POCs are spec + 65536. This crate
+/// keeps 8.2.1 values; drivers use differences, so a uniform offset cancels. Compare relative:
+/// first AU sets the base (only 0 or 65536), later AUs must hold it.
 #[derive(Default)]
 struct PocBase {
     offset: Option<i64>,
 }
 
 impl PocBase {
-    /// The offset in force, or 0 before the first AU has established one.
     fn offset(&self) -> i64 {
         self.offset.unwrap_or(0)
     }
 
-    /// Check one POC pair, establishing the base on the first call.
     fn check(&mut self, au: usize, field: &str, ours: i32, theirs: i32, findings: &mut Findings) {
         let delta = i64::from(theirs) - i64::from(ours);
         match self.offset {
@@ -804,12 +670,8 @@ impl PocBase {
     }
 }
 
-/// Subtract libav's POC base from a decoded reference array, so the set comparison compares
-/// pictures rather than POC bases (see [`PocBase`]).
-///
-/// `bottom_too` is true for H.264, whose entries carry a real `FieldOrderCntList[i][2]` PAIR, and
-/// false for HEVC, whose `bottom` member is a placeholder this harness leaves at 0 on both sides —
-/// shifting it would invent a difference rather than absorb one.
+/// Subtract libav's POC base so the set compares pictures, not bases. `bottom_too` is false
+/// for HEVC: `bottom` is a placeholder 0; shifting it would invent a difference.
 fn shift_poc(entries: &mut [(u8, RefEntry)], offset: i64, bottom_too: bool) {
     for (_, entry) in entries.iter_mut() {
         entry.top = (i64::from(entry.top) - offset) as i32;
@@ -819,34 +681,16 @@ fn shift_poc(entries: &mut [(u8, RefEntry)], offset: i64, bottom_too: bool) {
     }
 }
 
-/// A per-field allowance: `Some(reason)` when THIS difference in THIS field is a divergence the
-/// module docs have already settled, rather than a finding.
-///
-/// Deliberately per-DIFFERENCE and not per-field: a field with an allowance still reports anything
-/// outside it. An allowlist keyed by field name alone would be the "vacuous green" this program
-/// has been bitten by before — it would hide the next real difference in the same word.
+/// Per-difference, not per-field: an allowed field still reports anything outside the reason.
 type Allowance = fn(&str, &[u8], &[u8]) -> Option<&'static str>;
 
-/// H.264 has none: every difference in a scalar field is a finding.
 fn no_allowance(_: &str, _: &[u8], _: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// HEVC's one documented scalar divergence: bit 10 of `dwCodingSettingPicturePropertyFlags`,
-/// `loop_filter_across_tiles_enabled_flag`, which this crate sets and libavcodec does not.
-///
-/// 7.4.3.3.1 infers the flag to be 1 when the PPS does not code it, and the PPS only codes it
-/// under `tiles_enabled_flag` — so with tiles disabled, 1 is what the specification says and what
-/// the vendored parser reports. libavcodec's capture carries 0 on all 250 AUs of the vendored
-/// vector. Neither can change a decoded picture: with `tiles_enabled_flag` clear there are no tile
-/// boundaries for a loop filter to cross, which is why this is documented rather than fixed —
-/// matching libavcodec here would mean overriding a spec inference on the strength of one
-/// measurement of another decoder's parser default, and that default is not readable from this
-/// worktree.
-///
-/// The allowance is tight: ONLY bit 10, only ours-set-theirs-clear, and only while both sides
-/// agree tiles are disabled. Any other difference in the same word — including bit 10 with tiles
-/// ENABLED, where the flag stops being inert — is a finding.
+/// Bit 10 of `dwCodingSettingPicturePropertyFlags` (`loop_filter_across_tiles_enabled_flag`):
+/// 7.4.3.3.1 infers 1 when tiles are off; libavcodec emits 0. Inert with tiles disabled.
+/// Only that bit, ours-set/theirs-clear, tiles off on both sides.
 fn hevc_allowance(field: &str, ours: &[u8], theirs: &[u8]) -> Option<&'static str> {
     /// `tiles_enabled_flag`.
     const TILES: u32 = 1 << 7;
@@ -872,7 +716,6 @@ fn hevc_allowance(field: &str, ours: &[u8], theirs: &[u8]) -> Option<&'static st
     )
 }
 
-/// One side's H.264 reference array, decoded: the in-use entries with their surface indices.
 fn h264_ref_entries(pp: &[u8]) -> Vec<(u8, RefEntry)> {
     let list = offset_of!(PicParamsH264, RefFrameList);
     let poc = offset_of!(PicParamsH264, FieldOrderCntList);
@@ -898,8 +741,7 @@ fn h264_ref_entries(pp: &[u8]) -> Vec<(u8, RefEntry)> {
         .collect()
 }
 
-/// One side's HEVC reference array, decoded. HEVC's array carries no `FrameNum` and no use
-/// flags — residency IS the statement — so those members stay at their neutral values.
+/// HEVC has no FrameNum/use flags; residency is the statement, so those members stay neutral.
 fn hevc_ref_entries(pp: &[u8]) -> Vec<(u8, RefEntry)> {
     let list = offset_of!(PicParamsHevc, RefPicList);
     let poc = offset_of!(PicParamsHevc, PicOrderCntValList);
@@ -922,29 +764,17 @@ fn hevc_ref_entries(pp: &[u8]) -> Vec<(u8, RefEntry)> {
         .collect()
 }
 
-/// One side's AV1 reference store, read out of the SUBMITTED BYTES: `(CurrPicTextureIndex,
-/// RefFrameMapTextureIndex[8], frame_refs[name].Index for the seven names)`.
-///
-/// AV1's reference numbering is two arrays that mean different things at once and the split is
-/// exactly what a comparison has to respect. `frame_refs[i].Index` is an AV1 reference SLOT —
-/// `ref_frame_idx[i]`, which both sides read out of the same frame header — so it is a VALUE
-/// that must match libavcodec's exactly, and it is compared as part of the `frame_refs` field.
-/// `RefFrameMapTextureIndex[slot]` and `CurrPicTextureIndex` are SURFACES, which come from each
-/// side's own pool and are only ever a bijection.
-///
-/// So the store is compared as a SHAPE: which slots are occupied, and whether the decode target
-/// collides with any of them.
+/// `(CurrPicTextureIndex, RefFrameMapTextureIndex[8], frame_refs[name].Index[7])`.
+/// `frame_refs[].Index` is an AV1 slot from the frame header (value). The other two are
+/// surfaces (shape only: occupancy and decode-target collision).
 fn av1_reference_store(pp: &[u8]) -> (u8, [u8; 8], [u8; 7]) {
     let curr = pp[offset_of!(PicParamsAv1, curr_pic_texture_index)];
     let mut store = [UNUSED_INDEX; 8];
     let base = offset_of!(PicParamsAv1, ref_frame_map_texture_index);
     store.copy_from_slice(&pp[base..base + 8]);
     let mut names = [UNUSED_INDEX; 7];
-    // The stride and the member offset come from the TYPE, never from the two numbers
-    // `dxva_av1.rs` measured (36 and 33). Those are pinned there as compile-time assertions
-    // against the Windows SDK's own header, and re-typing them here would be a second copy that
-    // can drift from the first — which for a reader of this array is the difference between a
-    // reference slot and a warp coefficient.
+    // Stride and member offset from the type, not the 36/33 `dxva_av1.rs` pins. A second
+    // copy would drift: slot vs warp coefficient.
     for (name, slot) in names.iter_mut().enumerate() {
         *slot = pp[offset_of!(PicParamsAv1, frame_refs)
             + name * size_of::<PicEntryAv1>()
@@ -953,20 +783,14 @@ fn av1_reference_store(pp: &[u8]) -> (u8, [u8; 8], [u8; 7]) {
     (curr, store, names)
 }
 
-/// The surface mapping between the two sides, tracked per PICTURE.
-///
-/// A global index-to-index bijection over a whole stream is the wrong model: both sides reuse a
-/// surface once its picture leaves the DPB, and they need not reuse it at the same moment. What
-/// must hold is that while a picture is live, its two surface numbers keep agreeing — so the
-/// mapping is keyed by the picture and dropped when a side reassigns the index.
+/// Per-picture surface pairing. Not a stream-wide index bijection: both sides reuse
+/// surfaces after DPB exit, not necessarily together. Drop the pair when either reassigns.
 #[derive(Default)]
 struct SurfaceMapping {
     live: BTreeMap<PictureKey, (u8, u8)>,
 }
 
 impl SurfaceMapping {
-    /// Record one AU's pairs, reporting a mapping that changed under a live picture and two
-    /// pictures collapsing onto one surface.
     fn observe(
         &mut self,
         au: usize,
@@ -1010,9 +834,7 @@ impl SurfaceMapping {
             }
             self.live.insert(key, (ours, theirs));
         }
-        // A surface either side has just reassigned no longer says anything about the picture
-        // that used to hold it, so the stale entries go — that is the difference between
-        // "the mapping broke" and "the pool moved on".
+        // Drop pairs whose surface was reassigned: pool reuse, not a broken mapping.
         self.live.retain(|key, &mut (ours, theirs)| {
             let ours_now = ours_seen.get(&ours);
             let theirs_now = theirs_seen.get(&theirs);
@@ -1021,11 +843,6 @@ impl SurfaceMapping {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The capture
-// ---------------------------------------------------------------------------
-
-/// One captured buffer descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CapturedDescriptor {
     buffer_type: u32,
@@ -1034,21 +851,17 @@ struct CapturedDescriptor {
     data_offset: u32,
 }
 
-/// A parsed capture, for ONE codec.
 #[derive(Default)]
 struct Capture {
     pic_params: BTreeMap<usize, Vec<u8>>,
-    /// `Some(bytes)` for a submitted matrix, `None` for the explicit `absent` spelling. An AU
-    /// missing from this map was never reported either way, which is itself a finding.
+    /// Missing key ≠ `None` (`absent`); an AU not in this map was never reported.
     qmatrix: BTreeMap<usize, Option<Vec<u8>>>,
     descriptors: BTreeMap<usize, Vec<CapturedDescriptor>>,
     config_bitstream_raw: BTreeMap<usize, u32>,
-    /// Lines that carry one of this harness's prefixes and could not be read. Never dropped
-    /// silently: a capture whose format drifted must fail loudly, not compare less.
+    /// Malformed prefix lines. Fail loud; do not compare a shorter capture.
     unreadable: Vec<String>,
 }
 
-/// `hex` → bytes, or `None` when it is not an even-length hex string.
 fn from_hex(hex: &str) -> Option<Vec<u8>> {
     if hex.len() % 2 != 0 || hex.is_empty() {
         return None;
@@ -1066,18 +879,14 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Parse the lines of one codec out of a capture. `codec` is the token FFmpeg's
-/// `avcodec_get_name` produces: `h264` or `hevc`.
+/// `codec` is FFmpeg `avcodec_get_name`: `h264`, `hevc`, or `av1`.
 fn parse_capture(text: &str, codec: &str) -> Capture {
-    /// The markers, with their trailing space so a bare word cannot match one.
+    /// Trailing space so a bare word cannot match.
     const MARKERS: [&str; 4] = ["PFPP ", "PFQM ", "PFBD ", "PFCFG "];
 
     let mut out = Capture::default();
     for raw in text.lines() {
-        // The marker is found ANYWHERE in the line, not required at its start: FFmpeg's logger
-        // prefixes a message logged against a codec context with `[h264 @ 0x…] `, and a capture
-        // made that way must still be readable (the recipe asks for `av_log(NULL, …)` so it is
-        // not, but a capture is expensive and this costs nothing).
+        // Marker anywhere in the line: FFmpeg prefixes `[h264 @ 0x…] ` on codec-context logs.
         let Some(start) = MARKERS.iter().filter_map(|m| raw.find(m)).min() else {
             continue;
         };
@@ -1089,7 +898,6 @@ fn parse_capture(text: &str, codec: &str) -> Capture {
             continue;
         }
         let fields: Vec<&str> = rest.split_whitespace().collect();
-        // Every line is `<prefix> <codec> <au> …`, so anything shorter is malformed.
         let (Some(line_codec), Some(au)) = (fields.first(), fields.get(1)) else {
             out.unreadable.push(line.to_string());
             continue;
@@ -1149,7 +957,6 @@ fn parse_capture(text: &str, codec: &str) -> Capture {
     out
 }
 
-/// Read the capture named by `var`, or `None` when it is unset.
 fn capture_from_env(var: &str, codec: &str) -> Option<Capture> {
     let path = std::env::var(var).ok()?;
     let text = std::fs::read_to_string(&path)
@@ -1157,8 +964,6 @@ fn capture_from_env(var: &str, codec: &str) -> Option<Capture> {
     Some(parse_capture(&text, codec))
 }
 
-/// The checks every comparison needs before it compares anything: the capture is readable, it
-/// covers the same AUs, and it was not made against a workaround path.
 fn preflight(capture: &Capture, ours: usize, codec: &str, reserved16: Option<usize>) {
     assert!(
         capture.unreadable.is_empty(),
@@ -1200,14 +1005,8 @@ fn preflight(capture: &Capture, ours: usize, codec: &str, reserved16: Option<usi
              path and is VOID for comparison (module docs)"
         );
     }
-    // A `PFCFG` line is optional, but a wrong one voids the slice-control comparison: it means
-    // the driver read the other slice-control struct entirely.
-    //
-    // ⚠ AV1 is exempt, and not because the check is inconvenient: `ConfigBitstreamRaw`'s short
-    // format is a property of the two SHORT SLICE-CONTROL structs, and AV1's slice-control
-    // record is `DXVA_Tile_AV1`, which has no short/long pair for a config to select between.
-    // Comparing an AV1 capture's number against HEVC's 1 — which a `_ =>` arm would do — is a
-    // check of nothing that fails on anything.
+    // Wrong `PFCFG` voids slice-control compare (driver read the other struct). AV1 has
+    // no short/long pair; a `_ =>` arm would test `DXVA_Tile_AV1` against HEVC's 1.
     let want = match codec {
         "h264" => pf_dxvadec::short_slice_config(Codec::H264),
         "hevc" => pf_dxvadec::short_slice_config(Codec::H265),
@@ -1223,13 +1022,7 @@ fn preflight(capture: &Capture, ours: usize, codec: &str, reserved16: Option<usi
     }
 }
 
-// ---------------------------------------------------------------------------
-// The comparisons
-// ---------------------------------------------------------------------------
-
-/// How two versions of one field differ, in a form a reader can act on: the whole value in hex
-/// when it is small enough to read, and a count plus the first differing byte when it is an array
-/// (a `SliceGroupMap` printed in full is 1620 characters of nothing).
+/// Hex when ≤8 bytes; else count and first differing byte (`SliceGroupMap` is 810 bytes).
 fn byte_diff_detail(ours: &[u8], theirs: &[u8]) -> String {
     if ours.len() <= 8 {
         return format!("ours {}, libav {}", to_hex(ours), to_hex(theirs));
@@ -1249,8 +1042,6 @@ fn byte_diff_detail(ours: &[u8], theirs: &[u8]) -> String {
     )
 }
 
-/// Compare the scalar fields — everything that is neither a surface index nor part of a
-/// reference array — byte for byte, reporting by field name.
 fn compare_scalars(
     au: usize,
     ours: &[u8],
@@ -1279,9 +1070,7 @@ fn compare_scalars(
             }
         }
     }
-    // The field table must tile the struct; if a byte ever falls outside it, report it as a raw
-    // offset rather than pass over it. That is the fallback the module docs promise, and the
-    // reason this harness can never silently ignore a difference it cannot name.
+    // Untabled bytes still report by raw offset; a gap cannot pass silently.
     for (offset, covered) in classified.iter().enumerate() {
         if !covered && ours[offset] != theirs[offset] {
             findings.note(
@@ -1293,7 +1082,6 @@ fn compare_scalars(
     }
 }
 
-/// Compare one AU's reference array as a SET, and feed the surface mapping.
 fn compare_ref_array(
     au: usize,
     field: &str,
@@ -1326,10 +1114,7 @@ fn compare_ref_array(
         );
     }
 
-    // The pairs the mapping is built from: a picture present on both sides, identified by its
-    // key. An ambiguous key (two entries claiming the same identity) is skipped and reported —
-    // it cannot happen off a conformant stream, and guessing which is which would invent a
-    // mapping.
+    // Ambiguous keys are skipped and reported; guessing a pair would invent a mapping.
     let mut pairs = Vec::new();
     for &(our_slot, entry) in ours {
         let key = entry.key();
@@ -1357,13 +1142,11 @@ fn compare_ref_array(
     mapping.observe(au, field, &pairs, findings);
 }
 
-/// The whole H.264 picture-parameter comparison.
 fn compare_h264_picparams(ours: &[OurSubmission], capture: &Capture) -> Findings {
     let ranges = field_ranges(H264_FIELDS, size_of::<PicParamsH264>());
     let structural = [
         "CurrPic",
-        // The POC fields are compared RELATIVE to libavcodec's base offset rather than byte for
-        // byte — see `PocBase` for the measurement and for why this crate keeps 8.2.1's values.
+        // Compared relative via `PocBase`, not byte-for-byte.
         "CurrFieldOrderCnt",
         "RefFrameList",
         "FieldOrderCntList",
@@ -1405,9 +1188,7 @@ fn compare_h264_picparams(ours: &[OurSubmission], capture: &Capture) -> Findings
             no_allowance,
             &mut findings,
         );
-        // The POC fields, compared RELATIVE to libavcodec's base offset (`PocBase`). The base is
-        // established from the CURRENT picture's own count, which is the one POC both sides
-        // certainly report for the same picture, and then required of every POC after it.
+        // Base from CurrFieldOrderCnt (same picture on both sides), then required of later POCs.
         let poc_at = offset_of!(PicParamsH264, CurrFieldOrderCnt);
         poc.check(
             au,
@@ -1433,9 +1214,7 @@ fn compare_h264_picparams(ours: &[OurSubmission], capture: &Capture) -> Findings
             &mut mapping,
             &mut findings,
         );
-        // `CurrPic` needs no matching: the same AU is the same picture on both sides. It is fed
-        // through the mapping under the current picture's own key, so that when this picture
-        // shows up as a REFERENCE later, the two surfaces are checked against this pairing.
+        // Same AU is the same picture; feed CurrPic into the mapping so later refs check this pair.
         let curr = offset_of!(PicParamsH264, CurrPic);
         let frame_num = offset_of!(PicParamsH264, frame_num);
         if sub.pic_params[curr] & 0x80 != theirs[curr] & 0x80 {
@@ -1465,16 +1244,13 @@ fn compare_h264_picparams(ours: &[OurSubmission], capture: &Capture) -> Findings
     findings
 }
 
-/// One HEVC RPS index array, resolved through its own side's `RefPicList` into the pictures it
-/// names — which is the only form in which the two sides' arrays are comparable.
+/// Resolve RPS indexes through this side's `RefPicList`; raw indexes are not comparable.
 fn hevc_rps_pictures(pp: &[u8], array: usize, entries: &[(u8, RefEntry)]) -> Vec<Option<RefEntry>> {
     let list = offset_of!(PicParamsHevc, RefPicList);
     (0..8)
         .map(|i| {
             let index = pp[array + i];
-            // The array holds an index INTO `RefPicList` (15 entries), so anything outside that
-            // — the `0xFF` sentinel included — names nothing, and resolving it is how a stale or
-            // out-of-range index becomes a reported difference rather than a garbage read.
+            // `0xFF` and any index ≥15 name nothing; do not treat them as a `RefPicList` slot.
             if usize::from(index) >= 15 {
                 return None;
             }
@@ -1490,31 +1266,14 @@ fn hevc_rps_pictures(pp: &[u8], array: usize, entries: &[(u8, RefEntry)]) -> Vec
         .collect()
 }
 
-/// The whole AV1 picture-parameter comparison.
-///
-/// Structurally simpler than the other two and the reason is worth stating: AV1 puts NO surface
-/// index in its reference entries. `frame_refs[i].Index` is `ref_frame_idx[i]`, an AV1 SLOT both
-/// sides read out of the same frame header, so the seven 36-byte entries — sizes, warp
-/// parameters, warp type and slot alike — compare byte for byte with no re-indexing, no set
-/// comparison and no allowance. Only two members carry surfaces, and they are handled as the
-/// SHAPE of the store rather than by value ([`av1_reference_store`]).
-///
-/// There is no POC base to derive either: AV1's `order_hint` is a coded field, not a decoder's
-/// running count, so libavcodec has nothing to seed it with.
-///
-/// ⚠ **`width`/`height` is a divergence waiting to be measured, and this comparison will
-/// report it rather than absorb it.** libavcodec sends `avctx->width`, which
-/// `update_context_with_frame_header` sets from `frame_width_minus_1 + 1` — FrameWidth, the
-/// PRE-superres coded width — and the same for `frame_refs[i].width` off the reference's
-/// `AVFrame`; this crate sends `UpscaledWidth`. With superres off the two are equal by
-/// definition (7.20), which is every frame of the vendored vector and every frame a punktfunk
-/// host emits, so a capture made from this vector cannot tell them apart. Deliberately given no
-/// allowance: if a superres capture ever reaches this harness, the difference must be a finding
-/// somebody reads, not a line somebody already excused. See `pic_av1.rs`'s note at `pp.width`.
+/// `frame_refs[].Index` is an AV1 slot, not a surface: those 36-byte entries compare byte
+/// for byte. Surfaces are occupancy/collision only ([`av1_reference_store`]). `order_hint`
+/// is coded, so no POC base. No allowance on `width`/`height`: this crate sends
+/// UpscaledWidth, libavcodec FrameWidth; equal with superres off (this vector). A superres
+/// capture must report, not absorb. See `pic_av1.rs` at `pp.width`.
 fn compare_av1_picparams(ours: &[OurSubmission], capture: &Capture) -> Findings {
     let ranges = field_ranges(AV1_FIELDS, size_of::<PicParamsAv1>());
-    // The two surface arrays, and nothing else: every other byte of this struct is a fact about
-    // the bitstream that both sides derive from the same frame header.
+    // Surfaces only; every other byte is from the same frame header.
     let structural = ["curr_pic_texture_index", "ref_frame_map_texture_index"];
     let mut findings = Findings::default();
     for (au, sub) in ours.iter().enumerate() {
@@ -1548,8 +1307,7 @@ fn compare_av1_picparams(ours: &[OurSubmission], capture: &Capture) -> Findings 
             &mut findings,
         );
 
-        // The store, as a shape. Which SLOTS hold a picture is a fact about the bitstream and
-        // must agree; which SURFACE each holds is each side's own pool and never can.
+        // Occupancy must agree; surface numbers come from each side's pool.
         let (our_curr, our_store, _) = av1_reference_store(&sub.pic_params);
         let (their_curr, their_store, _) = av1_reference_store(theirs);
         for slot in 0..8 {
@@ -1563,16 +1321,9 @@ fn compare_av1_picparams(ours: &[OurSubmission], capture: &Capture) -> Findings 
                 );
             }
         }
-        // The decode target must hold no store entry's surface. libavcodec cannot produce a
-        // collision — it fills the store from `h->ref[i]`, which the reference update has not
-        // run on yet, and takes `CurrPicTextureIndex` from `h->cur_frame.f` — so a collision on
-        // our side is a defect however the surfaces are numbered. This is the check that names
-        // the 2026-08-07 defect.
-        //
-        // ⚠ Note what is deliberately NOT checked: that two slots hold different surfaces. One
-        // picture in several reference slots is ordinary AV1 and this very vector does it —
-        // the key frame sits in BWDREF and ALTREF2 for the stream's whole length — so a
-        // "duplicate surface" check would fire on 273 of 274 frames of a correct conversion.
+        // Decode target must not alias a store surface. Do not require unique surfaces
+        // across slots: one picture in several slots is ordinary (this vector's key frame
+        // sits in BWDREF and ALTREF2); that check would fire on 273 of 274 correct frames.
         for (label, curr, store) in [
             ("ours", our_curr, our_store),
             ("libav", their_curr, their_store),
@@ -1592,15 +1343,11 @@ fn compare_av1_picparams(ours: &[OurSubmission], capture: &Capture) -> Findings 
     findings
 }
 
-/// The whole HEVC picture-parameter comparison.
 fn compare_hevc_picparams(ours: &[OurSubmission], capture: &Capture) -> Findings {
     let ranges = field_ranges(HEVC_FIELDS, size_of::<PicParamsHevc>());
     let structural = [
         "CurrPic",
-        // Relative, like H.264's — though libavcodec's HEVC POCs carry no base offset (measured:
-        // 0 on all 250 AUs of the vendored vector). `PocBase` derives whatever offset exists
-        // rather than assuming this one, so a future FFmpeg that grows one produces a documented
-        // line instead of 250 findings.
+        // Relative like H.264. This vector's HEVC POCs have offset 0; derive, do not assume.
         "CurrPicOrderCntVal",
         "RefPicList",
         "PicOrderCntValList",
@@ -1651,7 +1398,7 @@ fn compare_hevc_picparams(ours: &[OurSubmission], capture: &Capture) -> Findings
         );
         let our_entries = hevc_ref_entries(&sub.pic_params);
         let mut their_entries = hevc_ref_entries(theirs);
-        // HEVC's entries carry one POC each, in `top`; `bottom` is a placeholder.
+        // `bottom` is unused; do not shift it.
         shift_poc(&mut their_entries, poc.offset(), false);
         compare_ref_array(
             au,
@@ -1699,7 +1446,7 @@ fn compare_hevc_picparams(ours: &[OurSubmission], capture: &Capture) -> Findings
     findings
 }
 
-/// The quantization-matrix comparison: presence FIRST, then contents by field.
+/// Presence first, then contents. Missing capture key is a finding, not `absent`.
 fn compare_qmatrix(
     ours: &[OurSubmission],
     capture: &Capture,
@@ -1758,7 +1505,6 @@ fn compare_qmatrix(
     findings
 }
 
-/// A descriptor buffer type as a name, for reports.
 fn buffer_name(buffer_type: u32) -> &'static str {
     match buffer_type {
         BUFFER_PICTURE_PARAMETERS => "PICTURE_PARAMETERS",
@@ -1769,9 +1515,7 @@ fn buffer_name(buffer_type: u32) -> &'static str {
     }
 }
 
-/// The descriptor comparison. Everything but the bitstream buffer's `DataSize` must match
-/// exactly; that one field has a legitimate divergence class, which is classified apart rather
-/// than reported as one undifferentiated difference (module docs).
+/// All fields exact except bitstream `DataSize`, which has a delimitation class.
 fn compare_descriptors(ours: &[OurSubmission], capture: &Capture) -> Findings {
     let mut findings = Findings::default();
     for (au, sub) in ours.iter().enumerate() {
@@ -1786,9 +1530,8 @@ fn compare_descriptors(ours: &[OurSubmission], capture: &Capture) -> Findings {
         let our_types: Vec<u32> = sub.descriptors.iter().map(|d| d.buffer_type).collect();
         let their_types: Vec<u32> = theirs.iter().map(|d| d.buffer_type).collect();
         if our_types != their_types {
-            // A missing BITSTREAM on their side is the one shape that is a MISSED PATCH rather
-            // than a divergence — the bitstream descriptor is the one libavcodec fills outside
-            // the choke point (recipe step 2) — so it is named as such.
+            // Missing BITSTREAM is a missed patch: libavcodec fills that descriptor outside
+            // the choke point.
             let detail = if !their_types.contains(&BUFFER_BITSTREAM) {
                 "the capture carries no BITSTREAM descriptor at all: recipe step 2's SECOND \
                  patch site (the inline fill in commit_bitstream_and_slice_buffer) was missed"
@@ -1853,13 +1596,8 @@ fn compare_descriptors(ours: &[OurSubmission], capture: &Capture) -> Findings {
                 );
                 continue;
             }
-            // The bitstream buffer. Their slice COUNT is readable from their slice-control
-            // size, which is what separates "the two sides split the AU differently" from "the
-            // two sides delimit each slice a couple of bytes apart". (Both codecs' short
-            // records are TEN bytes — asserted in
-            // `the_slice_control_descriptor_is_one_ten_byte_short_format_record_per_slice_for_both_codecs`
-            // — so one divisor serves both; a slice-control buffer that is NOT a multiple of it
-            // has already been reported as a `SLICE_CONTROL.DataSize` difference above.)
+            // Slice count from their slice-control size (10-byte records, both codecs).
+            // Different counts void the size compare; a non-multiple is already a DataSize finding.
             let their_slices = theirs
                 .iter()
                 .find(|d| d.buffer_type == BUFFER_SLICE_CONTROL)
@@ -1886,13 +1624,9 @@ fn compare_descriptors(ours: &[OurSubmission], capture: &Capture) -> Findings {
                     ),
                 ),
                 _ => {
-                    // Classify on the UNPADDED sizes, which is the only way a small difference
-                    // can be told from a large one: padding rounds up to 128, so an eight-byte
-                    // delimitation difference shows as a delta of 0 or of a whole 128 depending
-                    // on which side of a granule the two land. Theirs is not captured directly,
-                    // but padding is 1..=128 bytes, so it lies in a known window — and the
-                    // difference is legitimate exactly when that window reaches to within four
-                    // bytes per slice of our own unpadded size.
+                    // Classify on unpadded size: 128-byte pad can turn an 8-byte split
+                    // difference into 0 or 128. Their pad is 1..=128; legitimate iff that
+                    // window is within four bytes per slice of our unpadded size.
                     let delta = i64::from(our_desc.data_size) - i64::from(their_desc.data_size);
                     let tolerance = 4 * our_slices.max(1) as i64;
                     let their_low = i64::from(their_desc.data_size) - 128;
@@ -1929,13 +1663,7 @@ fn compare_descriptors(ours: &[OurSubmission], capture: &Capture) -> Findings {
     findings
 }
 
-// ---------------------------------------------------------------------------
-// This side, in the capture's own format
-// ---------------------------------------------------------------------------
-
-/// Write our submissions as the capture format, so a dump of ours and a capture of libav's can
-/// be diffed by any tool — and so the parser above is exercised against a writer that shares no
-/// code with it.
+/// Writer shares no code with the parser; a format drift fails the self-compare.
 fn dump(codec: &str, ours: &[OurSubmission]) -> String {
     let mut text = String::new();
     let raw = pf_dxvadec::short_slice_config(match codec {
@@ -1964,19 +1692,8 @@ fn dump(codec: &str, ours: &[OurSubmission]) -> String {
     text
 }
 
-// ===========================================================================
-// CPU-provable: no capture, ordinary CI
-// ===========================================================================
-
-/// Every hand-declared struct's field table must tile it exactly — no gap anywhere, and nothing
-/// left over at the end.
-///
-/// Two jobs in one. It is what makes the reports above name the right field (a gap would name the
-/// wrong one, or none at all). And it is the AUDIT the twelve-vs-ten slice-record defect asked
-/// for, in executable form: a struct tiled exactly by its members has no padding, interior OR
-/// tail, so its Rust layout is the C declaration under 1-byte packing — which is how `dxva.h`
-/// declares all six. The slice records are in the list precisely because they are the pair that
-/// got it wrong; the other four were confirmed against libavcodec's runtime `sizeof` as well.
+/// Field table tiles each struct with no gap or tail. That is 1-byte packing (`dxva.h`); a
+/// gap would name the wrong field. Slice records are here because `repr(C)` would be 12.
 #[test]
 fn every_hand_declared_dxva_struct_is_tiled_exactly_by_its_fields() {
     for (what, fields, total) in [
@@ -1994,11 +1711,8 @@ fn every_hand_declared_dxva_struct_is_tiled_exactly_by_its_fields() {
             HEVC_SLICE_FIELDS,
             size_of::<SliceHevcShort>(),
         ),
-        // AV1's two. `PicParamsAv1` is the one struct in this crate whose offsets were
-        // MEASURED rather than mirrored — `layout-probe-av1.c` compiled with MSVC against the
-        // Windows SDK's own `dxva.h` — and `dxva_av1.rs` pins every one at compile time. What
-        // this adds is the other half: that the TABLE above reaches all 912 bytes, so a
-        // capture comparison can name every one of them.
+        // `PicParamsAv1` offsets are measured (`layout-probe-av1.c`); this asserts the table
+        // covers all 912 bytes.
         ("PicParamsAv1", AV1_FIELDS, size_of::<PicParamsAv1>()),
         ("TileAv1", AV1_TILE_FIELDS, size_of::<TileAv1>()),
     ] {
@@ -2037,27 +1751,9 @@ fn every_h264_au_submits_four_buffers_in_libavcodecs_order() {
     }
 }
 
-/// **No AV1 submission names its decode surface anywhere in the reference store**, and every
-/// reference NAME resolves through a slot that holds one.
-///
-/// This is the defect the Windows parity harness caught on 2026-08-07 and the one nothing on
-/// the CPU could see, stated over the SUBMITTED BYTES — which is where a libavcodec capture
-/// would see it too, and the reason it belongs in this file as well as in `pic_av1`'s own
-/// tests. `plan_to_dxva_av1` released the picture this frame's own `refresh_frame_flags`
-/// displaces before assigning the decode target a slot, and `SlotMap::assign` hands back the
-/// slot just vacated — so `CurrPicTextureIndex` and one `RefFrameMapTextureIndex` entry were
-/// the same surface on 268 of these 274 frames: decode into the picture you predict from.
-/// Intel Arc followed the aliased surface and got 245 of 250 delivered frames wrong; NVIDIA
-/// tolerated it for 63 frames and then lost one 16x24 luma block at the `order_hint` wrap.
-///
-/// libavcodec cannot produce this shape and that is the whole argument for calling it a defect
-/// rather than a convention: `ff_dxva2_av1_fill_picture_parameters` fills
-/// `RefFrameMapTextureIndex` from `h->ref[i]`, the pre-refresh store, and takes
-/// `CurrPicTextureIndex` from `h->cur_frame.f`, a frame the reference-frame update has not run
-/// on yet. The two cannot be one surface.
-///
-/// The counts are asserted, not printed. At zero references this test would pass against a
-/// conversion that named nothing at all.
+/// Decode surface must not appear in the reference store; each named ref must resolve to an
+/// occupied slot. Releasing the `refresh_frame_flags` picture before assign reused that
+/// slot as `CurrPicTextureIndex`. Counts are asserted: zero refs would skip every check.
 #[test]
 fn no_av1_submission_names_its_decode_surface_in_the_reference_store() {
     let subs = our_av1_submissions();
@@ -2100,14 +1796,8 @@ fn no_av1_submission_names_its_decode_surface_in_the_reference_store() {
     );
 }
 
-/// AV1 submits THREE buffers and never a quantization matrix, on every frame of the vector.
-///
-/// The codec asymmetry the H.264 and HEVC tests above are about, taken to its third case.
-/// H.264 submits the matrix unconditionally, HEVC only under `scaling_list_enabled_flag`, and
-/// AV1 has no matrix BUFFER at all: its quantiser matrices are SELECTED by index
-/// (`qm_y`/`qm_u`/`qm_v`) out of tables the decoder already holds, and `dxva2_av1_end_frame`
-/// passes `NULL, 0` for the qm pair so the generic layer submits nothing. A fourth descriptor
-/// here would be a buffer the driver has no `DXVA_Qmatrix_AV1` to read it as.
+/// Three buffers, never a matrix. AV1 selects `qm_y`/`qm_u`/`qm_v` from decoder tables;
+/// `dxva2_av1_end_frame` passes `NULL, 0`. There is no `DXVA_Qmatrix_AV1`.
 #[test]
 fn every_av1_frame_submits_three_buffers_and_never_a_quantization_matrix() {
     for (frame, sub) in our_av1_submissions().iter().enumerate() {
@@ -2127,9 +1817,7 @@ fn every_av1_frame_submits_three_buffers_and_never_a_quantization_matrix() {
     }
 }
 
-/// No AV1 descriptor carries a macroblock count. AV1 has no macroblocks and `dxva2_av1.c`
-/// never touches the field — the same statement `no_hevc_descriptor_ever_carries_a_macroblock_count`
-/// makes, and the same defect class review 13 found on the H.264 side in the other direction.
+/// AV1 has no macroblocks; `dxva2_av1.c` never writes `NumMBsInBuffer`.
 #[test]
 fn no_av1_descriptor_ever_carries_a_macroblock_count() {
     for (frame, sub) in our_av1_submissions().iter().enumerate() {
@@ -2145,22 +1833,10 @@ fn no_av1_descriptor_ever_carries_a_macroblock_count() {
     }
 }
 
-/// AV1's slice-control buffer is `16 * tile count`, its bitstream descriptor is the packer's
-/// PADDED size, and the tile records tile the unpadded window exactly — in order, without gaps
-/// and without overlaps.
-///
-/// The last part is what distinguishes AV1 from the other two codecs here and is the reason
-/// this cannot reuse `the_bitstream_descriptor_is_the_packers_padded_size_and_the_slice_records_tile_it_exactly`:
-/// a `DXVA_Tile_AV1` addresses a TILE PAYLOAD, which is the bytes after that tile's
-/// `tile_size_minus_1` field — so consecutive records are separated by those size fields and do
-/// NOT abut, unlike H.264/HEVC slice records which tile their buffer with no gaps. What must
-/// hold is weaker and still exact: strictly increasing, non-overlapping, inside the unpadded
-/// window, and never starting at a tile-group OBU's first byte (which would hand the driver an
-/// OBU header as entropy-coded tile data).
-///
-/// ⚠ The padding is charged to NO record. H.264 and HEVC add the tail padding to their last
-/// slice record's `SliceBytesInBuffer`; `pack_av1` does not, because a tile's size is the
-/// tile's, and the descriptor is the only place AV1's padding is accounted at all.
+/// Slice-control is `16 * tile count`; bitstream descriptor is padded size. Tiles address
+/// payloads after `tile_size_minus_1`, so records do not abut. Must be strictly increasing,
+/// non-overlapping, inside the unpadded window, never an OBU header. Padding is on the
+/// descriptor only — unlike H.264/HEVC last-slice charging.
 #[test]
 fn the_av1_bitstream_descriptor_is_padded_and_the_tile_records_tile_it_without_overlapping() {
     let mut frames_with_padding = 0usize;
@@ -2175,12 +1851,8 @@ fn the_av1_bitstream_descriptor_is_padded_and_the_tile_records_tile_it_without_o
             0,
             "frame {frame}: the bitstream descriptor states the PADDED size"
         );
-        // ⚠ `1..=128`, not `0..128`. `pack_av1` writes libavcodec's expression verbatim —
-        // `BITSTREAM_ALIGN - (cursor % BITSTREAM_ALIGN)` — so data that is ALREADY on the
-        // granule gets a whole 128-byte block rather than none (`pack_av1`'s
-        // `data_already_on_the_granule_still_gets_a_full_padding_block`). This vector never
-        // lands on the granule, which is exactly why the bound has to come from the rule and
-        // not from the measurement.
+        // `1..=128`, not `0..128`: `BITSTREAM_ALIGN - (cursor % ALIGN)` writes a full
+        // block when already on the granule. This vector never lands there.
         let padding = bitstream.data_size - sub.unpadded;
         assert!(
             (1..=128).contains(&padding),
@@ -2202,7 +1874,7 @@ fn the_av1_bitstream_descriptor_is_padded_and_the_tile_records_tile_it_without_o
 
         let mut previous_end = 0u32;
         for (i, tile) in sub.tiles.iter().enumerate() {
-            // `#[repr(packed)]` — copy the fields out before using them.
+            // `#[repr(packed)]`: copy fields before use.
             let (offset, size) = (tile.data_offset, tile.data_size);
             assert!(size > 0, "frame {frame}, tile {i}: an empty tile payload");
             assert!(
@@ -2229,10 +1901,7 @@ fn the_av1_bitstream_descriptor_is_padded_and_the_tile_records_tile_it_without_o
 
 #[test]
 fn every_h264_bitstream_and_slice_control_descriptor_carries_mb_width_times_mb_height() {
-    // Review 13's defect, over the whole vector: `NumMBsInBuffer` was 0 where libavcodec's
-    // H.264 path writes `h->mb_width * h->mb_height`, on the exact call this codebase has
-    // already seen an Intel driver reject a hand-built variant on. The vendored vector is
-    // 320x240 — 20x15 macroblocks.
+    // 320×240 = 20×15 macroblocks. H.264 bitstream and slice-control carry that product.
     for (au, sub) in our_h264_submissions().iter().enumerate() {
         assert_eq!(sub.mb_count, 20 * 15, "AU {au}");
         for desc in &sub.descriptors {
@@ -2252,10 +1921,7 @@ fn every_h264_bitstream_and_slice_control_descriptor_carries_mb_width_times_mb_h
 
 #[test]
 fn every_h264_au_submits_the_quantization_matrix_buffer() {
-    // H.264's predicate is UNCONDITIONAL in libavcodec (it passes `&ctx_pic->qm` with
-    // `sizeof(qm)` every time), and the PPS's lists are always meaningful because the vendored
-    // parser has applied Table 7-2's fallback rules. This is the codec where omitting the
-    // buffer would be the defect — the mirror image of HEVC's.
+    // libavcodec always passes `&ctx_pic->qm`; Table 7-2 fallbacks make the lists meaningful.
     for (au, sub) in our_h264_submissions().iter().enumerate() {
         assert!(sub.qmatrix.is_some(), "AU {au}");
         let desc = sub
@@ -2270,8 +1936,7 @@ fn every_h264_au_submits_the_quantization_matrix_buffer() {
 
 #[test]
 fn the_whole_vendored_hevc_vector_omits_the_quantization_matrix_buffer() {
-    // Case 1 of the three the qmatrix predicate has: `scaling_list_enabled_flag` clear. The
-    // buffer is not submitted AT ALL — three descriptors, not four with an empty one.
+    // `scaling_list_enabled_flag` clear: omit the buffer, do not submit an empty one.
     let ours = our_hevc_submissions();
     for (au, sub) in ours.iter().enumerate() {
         assert!(sub.qmatrix.is_none(), "AU {au}");
@@ -2287,7 +1952,7 @@ fn the_whole_vendored_hevc_vector_omits_the_quantization_matrix_buffer() {
             ],
             "AU {au}"
         );
-        // …and the picture parameters say so, which is the predicate libavcodec reads.
+        // libavcodec reads this flag as the submit predicate.
         let flags = u32_at(
             &sub.pic_params,
             offset_of!(PicParamsHevc, dwCodingParamToolFlags),
@@ -2298,9 +1963,7 @@ fn the_whole_vendored_hevc_vector_omits_the_quantization_matrix_buffer() {
 
 #[test]
 fn no_hevc_descriptor_ever_carries_a_macroblock_count() {
-    // The asymmetry, over the whole vector: libavcodec's HEVC path writes 0 where its H.264
-    // path writes mb_width*mb_height, so a CTB count here would be a fresh divergence in the
-    // other direction.
+    // HEVC writes 0; a CTB count would diverge the other way from H.264.
     for (au, sub) in our_hevc_submissions().iter().enumerate() {
         for desc in &sub.descriptors {
             assert_eq!(
@@ -2336,10 +1999,7 @@ fn every_descriptor_of_both_codecs_starts_at_offset_zero_and_names_a_distinct_bu
 
 #[test]
 fn the_bitstream_descriptor_is_the_packers_padded_size_and_the_slice_records_tile_it_exactly() {
-    // The internal consistency a driver reads: every `BSNALunitDataLocation` lands inside the
-    // buffer, the records are contiguous from byte 0, and the last one ends EXACTLY at
-    // `DataSize` — which is what makes the tail padding charged to it rather than dangling past
-    // the end (see pack.rs's module docs).
+    // Records tile from 0 to `DataSize` inclusive of padding; see `pack.rs`.
     for (codec, subs) in [
         ("h264", our_h264_submissions()),
         ("hevc", our_hevc_submissions()),
@@ -2389,18 +2049,8 @@ fn the_bitstream_descriptor_is_the_packers_padded_size_and_the_slice_records_til
 
 #[test]
 fn the_slice_control_descriptor_is_one_ten_byte_short_format_record_per_slice_for_both_codecs() {
-    // Two facts in one, both measured against libavcodec on the RTX 4090 box rather than
-    // derived:
-    //
-    // * **The short record is TEN bytes.** The capture's slice-control `DataSize` is 20 on the
-    //   H.264 vector, which is two slices per picture, and 10 on the HEVC vector, which is one
-    //   slice segment per picture — two codecs, two slice counts, one record size. `dxva.h`
-    //   packs these wire structures to a byte; a `#[repr(C)]` `{u32, u32, u16}` would be twelve
-    //   and would displace every record after the first (see `dxva.rs`'s alignment section).
-    // * **The `ConfigBitstreamRaw` hazard**: short format is 2 for H.264 and 1 for HEVC — one
-    //   number with two spellings — and these are the short records for both. A buffer sized for
-    //   one format against a config negotiated for the other is a driver reading a different
-    //   struct at every offset.
+    // Short record is 10 bytes (`#[repr(C)] {u32,u32,u16}` is 12). ConfigBitstreamRaw is
+    // 2 for H.264 and 1 for HEVC; mismatch makes the driver read a different struct.
     assert_eq!(pf_dxvadec::short_slice_config(Codec::H264), 2);
     assert_eq!(pf_dxvadec::short_slice_config(Codec::H265), 1);
     assert_eq!(size_of::<SliceH264Short>(), 10);
@@ -2420,10 +2070,7 @@ fn the_slice_control_descriptor_is_one_ten_byte_short_format_record_per_slice_fo
                 10 * sub.records.len(),
                 "{codec} AU {au}"
             );
-            // The vectors' slice counts, so the record size above is anchored to the capture's
-            // own number rather than to an arithmetic identity: if our splitter ever produced a
-            // different slice count for these streams, the two sides would stop being
-            // comparable and 10 would no longer follow from 20 and 10.
+            // Slice counts from the capture (2 / 1), not from `DataSize / 10`.
             assert_eq!(
                 sub.records.len(),
                 slices_per_picture,
@@ -2439,14 +2086,8 @@ fn the_slice_control_descriptor_is_one_ten_byte_short_format_record_per_slice_fo
 
 #[test]
 fn the_tail_padding_is_charged_to_the_last_slice_record_and_to_no_other() {
-    // libavcodec's `commit_bitstream_and_slice_buffer` zero-fills
-    // `FFMIN(128 - ((current - dxva_data) & 127), end - current)` bytes and then does
-    // `slice->SliceBytesInBuffer += padding` — on the FINAL loop iteration's record. So the last
-    // record's `SliceBytesInBuffer` counts the padding and every earlier record's does not, and
-    // a driver reading the records back must find them tiling the buffer exactly.
-    // [`pf_dxvadec::pack`] implements the same rule; this is where it is checked on the real
-    // vectors, on the H.264 one because that is the one with more than one slice per picture —
-    // the shape a single-slice vector cannot distinguish.
+    // Padding is charged only to the last `SliceBytesInBuffer`. H.264 has two slices per
+    // picture; a single-slice vector cannot distinguish last-vs-only.
     for (codec, subs) in [
         ("h264", our_h264_submissions()),
         ("hevc", our_hevc_submissions()),
@@ -2466,8 +2107,6 @@ fn the_tail_padding_is_charged_to_the_last_slice_record_and_to_no_other() {
                 .records
                 .split_last()
                 .unwrap_or_else(|| panic!("{codec} AU {au}: no slices"));
-            // Every earlier record stops exactly where the next slice's start code begins, so
-            // none of them carries any of the padding.
             for (i, record) in earlier.iter().enumerate() {
                 assert_eq!(
                     record.location + record.bytes,
@@ -2476,14 +2115,11 @@ fn the_tail_padding_is_charged_to_the_last_slice_record_and_to_no_other() {
                     i + 1
                 );
             }
-            // The last one runs to the end of the buffer…
             assert_eq!(
                 last.location + last.bytes,
                 bitstream.data_size,
                 "{codec} AU {au}: the last record must reach DataSize"
             );
-            // …and stripping the padding off it leaves exactly the slice bytes the packer wrote,
-            // which is the statement that the padding is in THAT record and nowhere else.
             assert_eq!(
                 sub.records.iter().map(|r| r.bytes).sum::<u32>() - padding,
                 sub.unpadded,
@@ -2518,13 +2154,8 @@ fn the_picture_parameter_buffer_is_the_whole_hand_declared_struct_for_both_codec
     }
 }
 
-/// The vector's first HEVC plan with its parameter sets rewritten to a chosen scaling-list
-/// shape, converted and packed — the three cases of 7.4.5's activation, at the descriptor level.
-///
-/// Only the scaling-list fields move; everything else is the parser's own output, which is what
-/// makes the "coded nowhere" case meaningful (`pps.scaling_list` then holds the parser's Table
-/// 7-5/7-6 default fill, and `sps.scaling_list` the all-zero `ScalingLists::default()` an
-/// uncoded SPS is left with).
+/// First HEVC AU with only scaling-list fields rewritten (7.4.5 cases). Uncoded SPS stays
+/// `ScalingLists::default()` (zeros); PPS then holds Table 7-5/7-6 defaults.
 fn hevc_case(enabled: bool, sps_coded: Option<u8>, pps_coded: Option<u8>) -> OurSubmission {
     use std::rc::Rc;
 
@@ -2577,7 +2208,7 @@ fn hevc_case(enabled: bool, sps_coded: Option<u8>, pps_coded: Option<u8>) -> Our
 
 #[test]
 fn an_hevc_sequence_that_disables_scaling_lists_submits_no_matrix_however_much_is_coded() {
-    // Case 1 again, with data coded in BOTH parameter sets: the flag decides, not the data.
+    // Flag decides, not whether lists are coded.
     let sub = hevc_case(false, Some(7), Some(9));
     assert!(sub.qmatrix.is_none());
     assert!(!sub
@@ -2588,7 +2219,6 @@ fn an_hevc_sequence_that_disables_scaling_lists_submits_no_matrix_however_much_i
 
 #[test]
 fn an_hevc_sequence_that_enables_scaling_lists_and_codes_them_submits_the_coded_lists() {
-    // Case 2: the buffer travels, sized to the whole struct, carrying the coded data.
     let sub = hevc_case(true, Some(7), Some(9));
     let qm = sub
         .qmatrix
@@ -2602,7 +2232,7 @@ fn an_hevc_sequence_that_enables_scaling_lists_and_codes_them_submits_the_coded_
         .expect("the matrix buffer is in the set");
     assert_eq!(desc.data_size as usize, size_of::<QmatrixHevc>());
     assert_eq!(desc.num_mbs_in_buffer, 0);
-    // The PPS's data wins over the SPS's (7.4.5), which is visible in the bytes themselves.
+    // PPS wins over SPS (7.4.5).
     assert!(
         qm.iter().all(|&b| b == 9 || b == 17),
         "the PPS's fill of 9 (DC 9 + 8)"
@@ -2623,16 +2253,9 @@ fn an_hevc_sequence_that_enables_scaling_lists_and_codes_them_submits_the_coded_
 
 #[test]
 fn an_hevc_sequence_that_enables_scaling_lists_but_codes_none_submits_the_defaults_not_zeros() {
-    // Case 3, and the one that is a live defect if it regresses: `scaling_list_enabled_flag` set
-    // with no scaling-list data in either parameter set is a legal, ordinary shape, and 7.4.5
-    // says the Table 7-5/7-6 DEFAULTS apply. FFmpeg's parser seeds those defaults; the vendored
-    // cros-codecs parser leaves an uncoded SPS all-ZERO — so a conversion that read the SPS
-    // here would submit a matrix of zeros while bit 0 of dwCodingParamToolFlags told the driver
-    // it was authoritative, and every residual would dequantize to nothing.
-    //
-    // pic_h265.rs checks the CONTENTS against the spec tables transcribed by hand; this checks
-    // the two facts the descriptor level owns — the buffer is submitted, and what it carries is
-    // not zeros.
+    // Enabled with nothing coded: 7.4.5 defaults, not the uncoded-SPS zeros. Submitting
+    // zeros while bit 0 claims authority dequantizes every residual to nothing.
+    // `pic_h265.rs` checks table contents; this checks presence and not-all-zero.
     let sub = hevc_case(true, None, None);
     let qm = sub
         .qmatrix
@@ -2648,14 +2271,13 @@ fn an_hevc_sequence_that_enables_scaling_lists_but_codes_none_submits_the_defaul
         !qm.iter().all(|&b| b == 0),
         "an all-zero matrix dequantizes every residual to nothing"
     );
-    // Table 7-5's 4x4 lists are flat 16, and the inferred DC is 8 + 8 = 16.
+    // Table 7-5 4x4 lists are 16; inferred DC is 8+8.
     let lists0 = offset_of!(QmatrixHevc, ucScalingLists0);
     assert!(qm[lists0..lists0 + 96].iter().all(|&b| b == 16));
     let dc2 = offset_of!(QmatrixHevc, ucScalingListDCCoefSizeID2);
     assert!(qm[dc2..dc2 + 6].iter().all(|&b| b == 16));
     let dc3 = offset_of!(QmatrixHevc, ucScalingListDCCoefSizeID3);
     assert!(qm[dc3..dc3 + 2].iter().all(|&b| b == 16));
-    // …and every 8x8-and-up list carries a real curve rather than zeros.
     let lists1 = offset_of!(QmatrixHevc, ucScalingLists1);
     let lists3_end = offset_of!(QmatrixHevc, ucScalingListDCCoefSizeID2);
     assert!(qm[lists1..lists3_end].iter().all(|&b| b != 0));
@@ -2663,11 +2285,7 @@ fn an_hevc_sequence_that_enables_scaling_lists_but_codes_none_submits_the_defaul
 
 #[test]
 fn the_dump_and_the_parser_agree_and_the_comparison_finds_nothing_against_ourselves() {
-    // The comparators, exercised on real 250-AU data with a known answer. This is not a
-    // tautology dressed as a test: the writer and the parser share no code, so a format drift
-    // on either side fails here, and — with the next two tests, which mutate the "capture" and
-    // require a NAMED finding — it is what keeps this file from reporting a clean bill of
-    // health while comparing nothing.
+    // Writer and parser share no code; a format drift fails here.
     let ours = our_h264_submissions();
     let capture = parse_capture(&dump("h264", &ours), "h264");
     preflight(
@@ -2694,8 +2312,7 @@ fn the_dump_and_the_parser_agree_and_the_comparison_finds_nothing_against_oursel
             "comparing our own bytes against themselves must find nothing, got {:?}",
             findings.fields()
         );
-        // Nor may anything be DOCUMENTED away: an allowance that fires on identical bytes is an
-        // allowance that would hide a real difference.
+        // An allowance that fires on identical bytes would hide a real difference.
         assert!(
             findings.documented_fields().is_empty(),
             "identical bytes documented a divergence: {:?}",
@@ -2705,7 +2322,7 @@ fn the_dump_and_the_parser_agree_and_the_comparison_finds_nothing_against_oursel
 
     let ours = our_hevc_submissions();
     let capture = parse_capture(&dump("hevc", &ours), "hevc");
-    // No Reserved16Bits check for HEVC: the ClearVideo workaround is an H.264-only path.
+    // ClearVideo workaround is H.264-only.
     preflight(&capture, ours.len(), "hevc", None);
     for findings in [
         compare_hevc_picparams(&ours, &capture),
@@ -2728,16 +2345,10 @@ fn the_dump_and_the_parser_agree_and_the_comparison_finds_nothing_against_oursel
             findings.documented_fields()
         );
     }
-    // The HEVC matrices are `absent` on this vector, and the parser must carry that fact rather
-    // than losing it — the whole of review 13's defect is the difference between the two.
+    // `absent` must survive parse; dropping it is the HEVC omit-matrix defect.
     assert!(capture.qmatrix.values().all(Option::is_none));
 
-    // AV1, on all 274 FRAMES. Nothing here has ever been run against libavcodec's own bytes
-    // (module docs say why), so this self-comparison is the only thing standing between
-    // `compare_av1_picparams` and a first capture: it proves the 912-byte field table reaches
-    // every byte, that `av1_reference_store` reads `CurrPicTextureIndex` and the eight-entry
-    // store from the offsets it thinks it does — a wrong one would report a false alias on a
-    // correct submission — and that the comparison invents nothing on identical input.
+    // Self-compare is the only AV1 capture stand-in: 912-byte table coverage and store offsets.
     let ours = our_av1_submissions();
     let capture = parse_capture(&dump("av1", &ours), "av1");
     preflight(&capture, ours.len(), "av1", None);
@@ -2757,14 +2368,10 @@ fn the_dump_and_the_parser_agree_and_the_comparison_finds_nothing_against_oursel
             findings.documented_fields()
         );
     }
-    // AV1 reports `absent` on every frame — it has no matrix BUFFER at all, unlike HEVC where
-    // the same spelling is a per-sequence decision.
+    // AV1 `absent` is codec-wide, not a per-sequence HEVC decision.
     assert!(capture.qmatrix.values().all(Option::is_none));
 }
 
-/// A submission holding only what [`compare_descriptors`] reads, for the bitstream-size
-/// classifier: `slices` slice records tiling a `padded`-byte buffer whose slice data (before the
-/// tail padding) is `unpadded` bytes.
 fn descriptor_only_submission(unpadded: u32, padded: u32, slices: usize) -> OurSubmission {
     let each = unpadded / slices as u32;
     let mut records: Vec<SliceRecord> = (0..slices)
@@ -2773,7 +2380,7 @@ fn descriptor_only_submission(unpadded: u32, padded: u32, slices: usize) -> OurS
             bytes: each,
         })
         .collect();
-    // The last record carries the remainder and the padding, exactly as the packer charges it.
+    // Last record carries remainder and padding, as the packer does.
     let last = records.last_mut().expect("at least one slice");
     last.bytes = padded - last.location;
     OurSubmission {
@@ -2800,9 +2407,7 @@ fn descriptor_only_submission(unpadded: u32, padded: u32, slices: usize) -> OurS
     }
 }
 
-/// Rewrite every `PFPP <codec>` line of a capture through `f`, which receives the AU index and
-/// the picture-parameter bytes. The instrument the two absorbers below are tested with: a
-/// divergence this harness ABSORBS must be reproducible on demand, or its allowance is untested.
+/// Rewrite each PFPP so an absorbed divergence is reproducible, or the allowance is untested.
 fn map_picparams(text: &str, codec: &str, mut f: impl FnMut(usize, &mut Vec<u8>)) -> String {
     let prefix = format!("PFPP {codec} ");
     let mut out = String::new();
@@ -2823,9 +2428,7 @@ fn map_picparams(text: &str, codec: &str, mut f: impl FnMut(usize, &mut Vec<u8>)
     out
 }
 
-/// Add `delta` to every POC an H.264 picture-parameters buffer carries: the current picture's pair
-/// and every IN-USE reference entry's (an unused entry's counts are zero on both sides and must
-/// stay that way). This is libavcodec's `prev_poc_msb` offset, synthesised.
+/// Shift in-use POCs only; unused entries stay 0. Synthesises libavcodec's `prev_poc_msb`.
 fn shift_h264_capture_poc(pp: &mut [u8], delta: i32) {
     let curr = offset_of!(PicParamsH264, CurrFieldOrderCnt);
     let list = offset_of!(PicParamsH264, RefFrameList);
@@ -2845,7 +2448,6 @@ fn shift_h264_capture_poc(pp: &mut [u8], delta: i32) {
     }
 }
 
-/// A one-AU capture of `(buffer type, DataSize, NumMBsInBuffer)` descriptors.
 fn descriptor_capture(descs: &[(u32, u32, u32)]) -> String {
     let mut text = String::new();
     for (buffer_type, data_size, mbs) in descs {
@@ -2856,14 +2458,11 @@ fn descriptor_capture(descs: &[(u32, u32, u32)]) -> String {
 
 #[test]
 fn libavcodecs_constant_poc_base_is_documented_and_anything_else_about_a_poc_is_a_finding() {
-    // The absorber that lets the H.264 comparison pass against the real capture, and the three
-    // ways it must NOT absorb. Without this test the POC fields would simply be excluded from the
-    // comparison, which is the "green gate that proves nothing" shape this program has been bitten
-    // by: an excluded field cannot report a wrong POC either.
+    // Do not exclude POC fields: an excluded field cannot report a wrong POC.
     let ours = our_h264_submissions();
     let base = dump("h264", &ours);
 
-    // 1. Every POC offset by FFmpeg's 65536 — what the RTX 4090 capture actually carries.
+    // Constant 65536 base: documented, not a finding.
     let shifted = map_picparams(&base, "h264", |_, pp| shift_h264_capture_poc(pp, 65536));
     let findings = compare_h264_picparams(&ours, &parse_capture(&shifted, "h264"));
     assert!(
@@ -2876,14 +2475,13 @@ fn libavcodecs_constant_poc_base_is_documented_and_anything_else_about_a_poc_is_
         vec!["FieldOrderCnt[POC base]"]
     );
 
-    // 2. A base that is neither 0 nor 65536 is unexplained, and unexplained is a finding.
+    // Any other constant is a finding.
     let odd = map_picparams(&base, "h264", |_, pp| shift_h264_capture_poc(pp, 7));
     let findings = compare_h264_picparams(&ours, &parse_capture(&odd, "h264"));
     assert_eq!(findings.fields(), vec!["CurrFieldOrderCnt[0][POC base]"]);
     assert!(findings.documented_fields().is_empty());
 
-    // 3. A base that stops holding is a real POC divergence: 65536 everywhere except one AU,
-    //    whose current picture is four counts adrift.
+    // A base that drifts on one AU is a real POC finding.
     let drifting = map_picparams(&base, "h264", |au, pp| {
         shift_h264_capture_poc(pp, if au == 10 { 65536 - 4 } else { 65536 })
     });
@@ -2901,9 +2499,7 @@ fn libavcodecs_constant_poc_base_is_documented_and_anything_else_about_a_poc_is_
 
 #[test]
 fn the_hevc_tiles_flag_allowance_is_exactly_bit_ten_with_tiles_disabled_and_nothing_else() {
-    // The other absorber, and the reason it is written per-DIFFERENCE rather than per-field: the
-    // same word carries eighteen other flags, and a difference in any of them — or in bit 10 while
-    // tiles are ENABLED, where the flag stops being inert — must still be a finding.
+    // Per-difference: the same word has eighteen other flags; bit 10 with tiles on is live.
     let ours = our_hevc_submissions();
     let base = dump("hevc", &ours);
     let at = offset_of!(PicParamsHevc, dwCodingSettingPicturePropertyFlags);
@@ -2914,8 +2510,6 @@ fn the_hevc_tiles_flag_allowance_is_exactly_bit_ten_with_tiles_disabled_and_noth
         })
     };
 
-    // Bit 10 clear on libav's side, tiles disabled on both: the documented divergence, which is
-    // what the real capture carries on all 250 AUs.
     let capture = parse_capture(&rewrite(&base, 1 << 10, 0), "hevc");
     let findings = compare_hevc_picparams(&ours, &capture);
     assert!(
@@ -2928,8 +2522,7 @@ fn the_hevc_tiles_flag_allowance_is_exactly_bit_ten_with_tiles_disabled_and_noth
         vec!["dwCodingSettingPicturePropertyFlags"]
     );
 
-    // A different bit of the same word is a finding: bit 11 is
-    // pps_loop_filter_across_slices_enabled_flag, which is not inert at all.
+    // Bit 11 (`pps_loop_filter_across_slices_enabled_flag`) is not inert.
     let capture = parse_capture(&rewrite(&base, 1 << 11, 0), "hevc");
     let findings = compare_hevc_picparams(&ours, &capture);
     assert_eq!(
@@ -2938,8 +2531,7 @@ fn the_hevc_tiles_flag_allowance_is_exactly_bit_ten_with_tiles_disabled_and_noth
     );
     assert!(findings.documented_fields().is_empty());
 
-    // Bit 10 differing while BOTH sides say tiles are enabled: the flag now governs a real tile
-    // boundary, so the allowance must not apply.
+    // Bit 10 with tiles enabled governs a real boundary.
     let ours_with_tiles: Vec<OurSubmission> = ours
         .iter()
         .map(|sub| {
@@ -2971,12 +2563,8 @@ fn the_hevc_tiles_flag_allowance_is_exactly_bit_ten_with_tiles_disabled_and_noth
 
 #[test]
 fn a_bitstream_size_difference_is_classified_by_the_unpadded_window_it_implies() {
-    // The one descriptor field with a legitimate divergence class, and the arithmetic that tells
-    // the two apart. Ours: 1026 bytes of slice data over two slices, padded to 1152. Their
-    // padding is not captured, but it is 1..=128 bytes, so a captured 1024 means their slice data
-    // was 896..=1023 — which reaches to within four bytes per slice of our 1026 (1022 is 4 bytes
-    // less over two slices), the trailing-zero delimitation shape. A captured 512 cannot: no
-    // padding puts their slice data anywhere near ours.
+    // Ours 1026 unpadded / 1152 padded, two slices. Captured 1024 ⇒ unpadded 896..=1023,
+    // within 4 bytes/slice of 1026. Captured 512 cannot land in that window.
     let ours = vec![descriptor_only_submission(1026, 1152, 2)];
 
     let legitimate = descriptor_capture(&[
@@ -2993,9 +2581,7 @@ fn a_bitstream_size_difference_is_classified_by_the_unpadded_window_it_implies()
     let findings = compare_descriptors(&ours, &parse_capture(&defect, "h264"));
     assert_eq!(findings.fields(), vec!["BITSTREAM.DataSize"]);
 
-    // A differing slice count outranks the size: the two sides split the AU differently, which
-    // voids the size comparison rather than needing a verdict of its own. Three ten-byte records
-    // where ours has two.
+    // Slice-count mismatch voids the size compare (three 10-byte records vs two).
     let split = descriptor_capture(&[
         (BUFFER_BITSTREAM, 1024, 300),
         (BUFFER_SLICE_CONTROL, 30, 300),
@@ -3006,7 +2592,6 @@ fn a_bitstream_size_difference_is_classified_by_the_unpadded_window_it_implies()
         vec!["BITSTREAM.DataSize[slice count]", "SLICE_CONTROL.DataSize"]
     );
 
-    // And a NumMBsInBuffer difference is never in the legitimate class.
     let zeroed = descriptor_capture(&[(BUFFER_BITSTREAM, 1152, 0), (BUFFER_SLICE_CONTROL, 20, 0)]);
     let findings = compare_descriptors(&ours, &parse_capture(&zeroed, "h264"));
     assert_eq!(
@@ -3019,7 +2604,6 @@ fn a_bitstream_size_difference_is_classified_by_the_unpadded_window_it_implies()
 fn a_changed_scalar_field_is_reported_by_its_name() {
     let ours = our_h264_submissions();
     let mut text = dump("h264", &ours);
-    // Flip `pic_init_qp_minus26` (offset 172) on AU 7 of the "capture".
     let offset = offset_of!(PicParamsH264, pic_init_qp_minus26);
     text = mutate_capture_byte(&text, 7, offset, 0x5A);
     let capture = parse_capture(&text, "h264");
@@ -3027,11 +2611,7 @@ fn a_changed_scalar_field_is_reported_by_its_name() {
     assert_eq!(findings.fields(), vec!["pic_init_qp_minus26"]);
     assert_eq!(findings.by_field["pic_init_qp_minus26"].first_au, 7);
 
-    // …and a differing byte the field table does NOT cover is still reported, by raw offset.
-    // The table tiles both structs (asserted above), so this fallback is unreachable in
-    // practice; it exists so that a field added to the struct without being added to the table
-    // cannot pass unnoticed, and it is exercised here with a deliberately truncated table rather
-    // than left as an unproven claim in the module docs.
+    // Truncated table: an untabled byte must still report by raw offset.
     let mut findings = Findings::default();
     let mut theirs = ours[0].pic_params.clone();
     theirs[offset] = 0x5A;
@@ -3050,12 +2630,7 @@ fn a_changed_scalar_field_is_reported_by_its_name() {
 
 #[test]
 fn a_reordered_reference_list_is_no_finding_but_a_changed_one_is() {
-    // The divergence this harness must NOT report, and the one it must. libavcodec emits its
-    // reference array in a different order from ours by construction; a set comparison sees
-    // through that. Dropping a reference — or renumbering one side's surfaces inconsistently —
-    // must still be caught.
     let ours = our_h264_submissions();
-    // An AU with at least two references, so a reversal is observable.
     let (au, entries) = ours
         .iter()
         .enumerate()
@@ -3079,7 +2654,6 @@ fn a_reordered_reference_list_is_no_finding_but_a_changed_one_is() {
         findings.fields()
     );
 
-    // Now DROP the last reference from that AU: the set differs, and it must be named.
     let mut dropped = ours[au].pic_params.clone();
     let list = offset_of!(PicParamsH264, RefFrameList);
     let last = entries.len() - 1;
@@ -3098,9 +2672,7 @@ fn a_reordered_reference_list_is_no_finding_but_a_changed_one_is() {
 
 #[test]
 fn a_wholly_renumbered_surface_set_is_no_finding_and_an_inconsistent_one_is() {
-    // The bijection, both ways round. Renumbering EVERY surface index on the capture side is
-    // exactly what a different frame pool does, and it must pass; renumbering one AU's alone
-    // breaks the mapping under live pictures and must not.
+    // Whole-stream renumber is a pool bijection; one AU alone breaks live mappings.
     let ours = our_h264_submissions();
     let base = dump("h264", &ours);
 
@@ -3120,8 +2692,6 @@ fn a_wholly_renumbered_surface_set_is_no_finding_and_an_inconsistent_one_is() {
         findings.fields()
     );
 
-    // One AU renumbered differently from the rest: the pictures it still holds change surface
-    // mid-life, which is precisely what a mis-resolved reference looks like.
     let au = ours
         .iter()
         .position(|sub| h264_ref_entries(&sub.pic_params).len() >= 2)
@@ -3146,9 +2716,6 @@ fn a_wholly_renumbered_surface_set_is_no_finding_and_an_inconsistent_one_is() {
 
 #[test]
 fn an_omitted_hevc_matrix_buffer_is_reported_as_a_presence_difference() {
-    // Review 13's HEVC defect, in the form the harness would have caught it: the capture says
-    // `absent`, our side submits one. (Built by rewriting the capture rather than the crate,
-    // because the crate no longer has the defect — which is the point.)
     let ours = our_hevc_submissions();
     let mut subs = ours;
     subs[3].qmatrix = Some(vec![0u8; size_of::<QmatrixHevc>()]);
@@ -3168,7 +2735,6 @@ fn an_omitted_hevc_matrix_buffer_is_reported_as_a_presence_difference() {
         subs[3].descriptors[1],
         subs[3].descriptors[2],
     ];
-    // The capture is the honest one: no matrix on any AU.
     let honest = our_hevc_submissions();
     let capture = parse_capture(&dump("hevc", &honest), "hevc");
 
@@ -3186,15 +2752,11 @@ fn an_omitted_hevc_matrix_buffer_is_reported_as_a_presence_difference() {
 
 #[test]
 fn a_missing_bitstream_descriptor_is_reported_as_a_missed_patch_site_not_a_defect() {
-    // The one capture-side mistake that is likely, because libavcodec fills the bitstream
-    // descriptor outside the choke point: three PFBD lines per AU instead of four. The harness
-    // must name the patch site rather than accuse our submission of dropping a buffer.
     let ours = our_h264_submissions();
     let text: String = dump("h264", &ours)
         .lines()
         .filter(|line| {
-            // Only the BITSTREAM descriptor, which is the FOURTH token: matching on " 6 "
-            // anywhere would also delete AU 6's whole descriptor set.
+            // BITSTREAM type is token 3; matching ` 6 ` anywhere would drop AU 6's whole set.
             let fields: Vec<&str> = line.split_whitespace().collect();
             !(fields.first() == Some(&"PFBD") && fields.get(3) == Some(&"6"))
         })
@@ -3217,12 +2779,10 @@ fn an_unreadable_or_short_capture_is_refused_rather_than_partly_compared() {
     let ours = our_h264_submissions();
     let good = dump("h264", &ours);
 
-    // A line whose format drifted.
     let broken = good.replace("PFPP h264 5 ", "PFPP h264 5 zz");
     let capture = parse_capture(&broken, "h264");
     assert_eq!(capture.unreadable.len(), 1);
 
-    // A capture of the wrong stream length.
     let short: String = good
         .lines()
         .filter(|line| !line.starts_with("PFPP h264 24 "))
@@ -3232,11 +2792,8 @@ fn an_unreadable_or_short_capture_is_refused_rather_than_partly_compared() {
     assert_eq!(capture.pic_params.len(), VENDORED_AUS - 1);
     assert!(!capture.pic_params.contains_key(&24));
 
-    // Another codec's lines are not this codec's.
     assert!(parse_capture(&good, "hevc").pic_params.is_empty());
 
-    // A capture logged against a codec context rather than NULL carries FFmpeg's own
-    // `[h264 @ 0x…] ` prefix, and must still read cleanly.
     let prefixed: String = good
         .lines()
         .map(|line| format!("[h264 @ 0x7ff1c380a200] {line}\n"))
@@ -3247,11 +2804,6 @@ fn an_unreadable_or_short_capture_is_refused_rather_than_partly_compared() {
     assert_eq!(capture.descriptors.len(), VENDORED_AUS);
 }
 
-// ---------------------------------------------------------------------------
-// Capture-side mutators, for the tests above
-// ---------------------------------------------------------------------------
-
-/// Replace AU `au`'s `PFPP` line with `pp`.
 fn with_picparams(text: &str, au: usize, pp: &[u8]) -> String {
     let prefix = format!("PFPP h264 {au} ");
     let hevc = format!("PFPP hevc {au} ");
@@ -3268,7 +2820,6 @@ fn with_picparams(text: &str, au: usize, pp: &[u8]) -> String {
         .collect()
 }
 
-/// Set one byte of AU `au`'s captured picture parameters.
 fn mutate_capture_byte(text: &str, au: usize, offset: usize, value: u8) -> String {
     let prefix = format!("PFPP h264 {au} ");
     let mut out = String::new();
@@ -3284,9 +2835,7 @@ fn mutate_capture_byte(text: &str, au: usize, offset: usize, value: u8) -> Strin
     out
 }
 
-/// Reverse the in-use entries of an H.264 reference array, carrying each entry's keys and flag
-/// bits with it — the reordering libavcodec's own `short_ref`-then-`long_ref` walk produces,
-/// synthesised so the set comparison can be tested without a capture.
+/// Reverse in-use entries with keys and flags, as libavcodec's `short_ref` then `long_ref` walk.
 fn reverse_h264_reference_list(pp: &[u8]) -> Vec<u8> {
     let mut out = pp.to_vec();
     let list = offset_of!(PicParamsH264, RefFrameList);
@@ -3314,7 +2863,6 @@ fn reverse_h264_reference_list(pp: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Rewrite every surface index of an H.264 picture-parameters buffer through `f`.
 fn renumber_h264_surfaces(pp: &[u8], f: impl Fn(u8) -> u8) -> Vec<u8> {
     let mut out = pp.to_vec();
     let curr = offset_of!(PicParamsH264, CurrPic);
@@ -3328,20 +2876,13 @@ fn renumber_h264_surfaces(pp: &[u8], f: impl Fn(u8) -> u8) -> Vec<u8> {
     out
 }
 
-// ===========================================================================
-// Capture-dependent: #[ignore]d, and saying why
-// ===========================================================================
-
-/// Emit this crate's whole submission — both codecs — in the capture's own format, so the two
-/// files can be diffed by any tool without a capture at all.
 #[test]
 #[ignore = "needs a libavcodec capture: PF_LIBAV_CAPTURE_AV1=<file> (see the module docs)"]
 fn our_av1_picture_parameters_match_libavcodecs() {
     let capture = capture_from_env("PF_LIBAV_CAPTURE_AV1", "av1")
         .expect("PF_LIBAV_CAPTURE_AV1=<file> names a capture (see the module docs)");
     let ours = our_av1_submissions();
-    // No `Reserved16Bits` preflight: both libavcodec workarounds are H.264-only
-    // (`dxva2_h264.c`), and `DXVA_PicParams_AV1` has no such field to test.
+    // ClearVideo workarounds are H.264-only; AV1 has no `Reserved16Bits`.
     preflight(&capture, ours.len(), "av1", None);
     compare_av1_picparams(&ours, &capture).verdict("AV1 picture parameters", ours.len());
 }
@@ -3352,9 +2893,7 @@ fn dump_our_submission_in_the_captures_own_format() {
     let path = std::env::var("PF_DXVA_DUMP").expect("PF_DXVA_DUMP=<path> names the output file");
     let mut text = dump("h264", &our_h264_submissions());
     text.push_str(&dump("hevc", &our_hevc_submissions()));
-    // AV1 too, and it is the codec that needs this most: no libavcodec AV1 capture has
-    // ever been taken (module docs say why), so for that codec this dump is the only
-    // way to read what the driver is being handed at all.
+    // AV1 dump is the only view of the submission until a capture exists.
     text.push_str(&dump("av1", &our_av1_submissions()));
     std::fs::write(&path, text).expect("write the dump");
     println!("wrote {path}");

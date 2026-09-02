@@ -1,19 +1,15 @@
-//! Client-side cursor rendering (design/remote-desktop-sweep.md M2): the host forwards the
-//! pointer's SHAPE (reliable control stream, cached by serial) and per-frame STATE (lossy
-//! `0xD0` — position/visibility), and WE draw it as a real OS cursor — pointer feel stops
-//! paying the video round-trip (the Parsec/RDP model). Active only when the session
-//! negotiated it (`HOST_CAP_CURSOR` in the Welcome — the host stopped compositing then) and
-//! only applied while the DESKTOP mouse model is engaged: under capture the pointer is
-//! relative-locked (SDL hides it) and games draw their own cursor in-frame.
+//! Client-side OS cursor: the host forwards SHAPE (reliable, cached by serial)
+//! and per-frame STATE (lossy `0xD0` — position/visibility). We draw it locally
+//! so pointer feel does not pay the video round-trip. Active only when
+//! `HOST_CAP_CURSOR` was in Welcome (host stopped compositing) and the DESKTOP
+//! mouse model is engaged — under capture the pointer is relative-locked and
+//! games draw their own cursor in-frame.
 //!
-//! The host sends the bitmap in host-FRAMEBUFFER pixels, whose size tracks the host virtual
-//! display's DPI scaling (32 px at 100%, 96 px at 300%). Drawn 1:1 it balloons on a high-DPI
-//! host; instead we scale it by the aspect-fit factor the video is drawn at
-//! (`min(window_px/mode)`) TIMES the client display's content scale (SDL shows the surface at
-//! ~1:1 physical pixels on every backend, so without the second factor a 200 % client's
-//! pointer came out half the size of its native ones — see the run loop's `cursor_scale`).
-//! SDL cursors are fixed-size from their surface (no draw-time scaling), so we cache
-//! shapes RAW and resample per install — rebuilding when the serial OR the scale changes.
+//! Host bitmaps are host-framebuffer pixels (they track host DPI). Scale by
+//! the video aspect-fit factor times the client display's content scale
+//! (`cursor_scale` in the run loop). SDL cursors are fixed-size from their
+//! surface, so shapes are cached RAW and resampled per install — rebuild when
+//! serial or scale changes.
 
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::quic::{CursorState, HOST_CAP_CURSOR};
@@ -23,14 +19,12 @@ use sdl3::surface::Surface;
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// Shape serials cached at most — cursors cycle through a handful of shapes (arrow, I-beam,
-/// resize…); a runaway host can't grow the map past this (the cache resets, shapes re-arrive
-/// on the reliable stream via the serial-miss path).
+/// Cap. Cursors cycle a handful of shapes; 64 stops a runaway host. Reset
+/// re-installs via the serial-miss path on the reliable stream.
 const SHAPE_CACHE_MAX: usize = 64;
 
-/// A forwarded cursor shape held RAW (host-framebuffer-pixel bytes + hotspot), so it can be
-/// rebuilt into a scaled OS cursor whenever the video-fit changes (a window resize). Caching a
-/// fixed-size `Cursor` instead would freeze the pointer at its build-time size.
+/// Host-framebuffer bytes + hotspot, held raw so a fit-scale change can rebuild
+/// the OS cursor. Caching a fixed-size `Cursor` would freeze it at build-time size.
 struct RawShape {
     rgba: Vec<u8>,
     w: u32,
@@ -40,16 +34,15 @@ struct RawShape {
 }
 
 pub struct CursorChannel {
-    /// The Welcome carried `HOST_CAP_CURSOR` — the host forwards instead of compositing.
+    /// Welcome carried `HOST_CAP_CURSOR`: host forwards instead of compositing.
     negotiated: bool,
-    /// Serial → raw forwarded shape (bounded by [`SHAPE_CACHE_MAX`]).
     shapes: HashMap<u32, RawShape>,
-    /// The serial + fit scale the currently-installed OS cursor was built at (`None` =
-    /// default/system cursor). A change in EITHER forces a rebuild.
+    /// Serial and fit-scale the installed OS cursor was built at. `None` is the
+    /// system default. A change in either forces a rebuild.
     installed: Option<(u32, f32)>,
-    /// Keeps the installed `Cursor` alive — SDL requires it to outlive its `set()`.
+    /// Installed `Cursor` must outlive `set()` (SDL).
     installed_cursor: Option<Cursor>,
-    /// Latest `0xD0` state (latest-wins across a drained batch).
+    /// Latest `0xD0` (latest-wins across a drained batch).
     state: Option<CursorState>,
 }
 
@@ -68,25 +61,19 @@ impl CursorChannel {
         }
     }
 
-    /// Whether the host forwards the cursor this session (it no longer composites one).
     pub fn negotiated(&self) -> bool {
         self.negotiated
     }
 
-    /// The latest drained `0xD0` state — the run loop reads `relative_hint` off it for the
-    /// M3 host-driven mode flip (and `x`/`y` as the reappear position when leaving relative).
+    /// The run loop reads `relative_hint` for the host-driven mode flip and
+    /// `x`/`y` as the reappear position when leaving relative.
     pub fn state(&self) -> Option<CursorState> {
         self.state
     }
 
-    /// Drain the two planes and apply the newest state — once per run-loop iteration.
-    /// `desktop_active` = the desktop mouse model is engaged (captured + desktop): only then
-    /// do we own the local cursor's shape/visibility; under capture SDL's relative mode owns
-    /// it, and released the system cursor must look normal. `fit_scale` is host-framebuffer
-    /// pixels → cursor-surface pixels (the run loop's `cursor_scale`: the aspect-fit factor
-    /// the video is drawn at, times the client display's content scale); the shape is
-    /// resampled by it so the pointer matches the streamed desktop at any host DPI *and*
-    /// the client's native pointers at any client DPI.
+    /// Own shape/visibility only while `desktop_active`; under capture SDL relative
+    /// mode owns the cursor, and released it must look like the system default.
+    /// `fit_scale` is host-framebuffer pixels → cursor-surface pixels.
     pub fn pump(
         &mut self,
         connector: &NativeClient,
@@ -99,7 +86,7 @@ impl CursorChannel {
         }
         while let Ok(shape) = connector.next_cursor_shape(Duration::ZERO) {
             if self.shapes.len() >= SHAPE_CACHE_MAX {
-                // Degenerate host: reset — live shapes re-install via the serial-miss path.
+                // Runaway host: reset; live shapes re-install via the serial-miss path.
                 self.shapes.clear();
                 self.installed = None;
             }
@@ -108,7 +95,7 @@ impl CursorChannel {
                 tracing::warn!(w, h, "cursor shape malformed — ignored");
                 continue;
             }
-            // A re-sent serial replaces its entry; force re-install if it's current.
+            // Re-sent serial replaces the entry; force re-install if it is current.
             if matches!(self.installed, Some((s, _)) if s == shape.serial) {
                 self.installed = None;
             }
@@ -128,8 +115,8 @@ impl CursorChannel {
         }
 
         if !desktop_active {
-            // Capture mode / released: hand the cursor back to the system default so a
-            // released pointer over the window doesn't wear the host's shape.
+            // Capture or released: restore the system default so the pointer over
+            // the window is not the host's shape.
             if self.installed.take().is_some() {
                 if let Ok(c) = Cursor::from_system(SystemCursor::Arrow) {
                     c.set();
@@ -151,20 +138,17 @@ impl CursorChannel {
                         "cursor shape rejected by SDL — keeping the previous cursor"),
                 }
             }
-            // Serial miss: the (reliable) shape hasn't landed yet — keep the previous
-            // cursor for the RTT rather than flashing default.
+            // Serial miss: keep the previous cursor for one RTT rather than flashing default.
         }
-        // Visibility follows the host (a host app hid its pointer ⇒ ours hides too). Queried,
-        // not shadowed, so apply_capture's own show/hide calls can never desync us.
+        // Query, do not shadow: apply_capture's own show/hide must not desync us.
         if mouse.is_cursor_showing() != st.visible() {
             mouse.show_cursor(st.visible());
         }
     }
 }
 
-/// Resample a raw shape by `fit_scale` and build an SDL color cursor from it. The hotspot scales
-/// with the bitmap so the click point stays true. `fit_scale <= 0` (or a degenerate result) is
-/// clamped so we always hand SDL a ≥1×1 surface.
+/// Resample by `fit_scale` into an SDL color cursor. Hotspot scales with the
+/// bitmap. `fit_scale <= 0` (or a degenerate result) is clamped to a ≥1×1 surface.
 fn build_scaled_cursor(shape: &RawShape, fit_scale: f32) -> Result<Cursor, String> {
     let scale = if fit_scale.is_finite() && fit_scale > 0.0 {
         fit_scale
@@ -177,7 +161,6 @@ fn build_scaled_cursor(shape: &RawShape, fit_scale: f32) -> Result<Cursor, Strin
     let hot_y = ((shape.hot_y as f32 * scale).round() as u32).min(dh - 1) as i32;
 
     if dw == shape.w && dh == shape.h {
-        // 1:1 fit (mode == window) — no resample, feed the bytes straight through.
         let mut data = shape.rgba.clone();
         let surf = Surface::from_data(
             &mut data,
@@ -196,10 +179,9 @@ fn build_scaled_cursor(shape: &RawShape, fit_scale: f32) -> Result<Cursor, Strin
     Cursor::from_surface(&surf, hot_x, hot_y).map_err(|e| e.to_string())
 }
 
-/// Area-average resample of a straight-alpha RGBA bitmap `(sw×sh) → (dw×dh)`. Averaging is done on
-/// PREMULTIPLIED colour (weighting each source texel by its alpha) so transparent-pixel colour
-/// can't bleed into the fringe, then un-premultiplied back to straight alpha. Handles both down-
-/// and up-scale; for a cursor the common case is a downscale (high-DPI host → smaller pointer).
+/// Area-average `(sw×sh) → (dw×dh)` on straight-alpha RGBA. Average in
+/// premultiplied colour so transparent-pixel colour cannot bleed into the
+/// fringe, then un-premultiply back.
 fn resample_rgba(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
     let mut out = vec![0u8; (dw * dh * 4) as usize];
     let fx = sw as f32 / dw as f32;

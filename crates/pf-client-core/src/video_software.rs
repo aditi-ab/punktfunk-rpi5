@@ -1,20 +1,18 @@
-//! CPU fallback and final decoder-ladder rung, with no FFmpeg dependency.
-//! H.264 uses openh264 and AV1 uses rav1d; HEVC has no permissively licensed software
-//! decoder and is rejected with [`NoSoftwareRung`]. Both implemented codecs accept only
-//! 8-bit 4:2:0, checked from in-band headers before decode so unsupported shape changes
-//! also become typed refusals. [`crate::video::last_rung_verdict`] converts those refusals
-//! into a reconnect that advertises usable codec capabilities.
+//! Last decoder-ladder rung: CPU, no FFmpeg. H.264 is openh264, AV1 is rav1d;
+//! HEVC has no permissively licensed software decoder and is [`NoSoftwareRung`].
+//! Both codecs accept 8-bit 4:2:0 only, read from in-band headers so a mid-stream
+//! shape change is the same typed refusal. [`crate::video::last_rung_verdict`]
+//! turns that into a reconnect that advertises codecs this build can decode.
 //!
-//! Output is an owned, tightly packed I420 [`CpuPlanarFrame`]; the presenter performs CSC.
-//! H.264 colour, crop, keyframe, and recovery-point SEI metadata come from [`H264Planner`]
-//! and [`RecoveryWatch`], matching the native planners rather than decoder-specific metadata.
-//! openh264 is single-threaded; rav1d uses available worker cores and [`Av1Software::new`]
-//! enforces at least two frame contexts so malformed input returns an error instead of aborting.
+//! Output is owned packed I420 [`CpuPlanarFrame`]; the presenter does CSC.
+//! H.264 colour, crop, IDR, and recovery-point SEI come from [`H264Planner`]
+//! and [`RecoveryWatch`], not from openh264. Decoder contexts are `Send` not
+//! `Sync` and used serially. [`Av1Data`] owns each copied AU until rav1d
+//! takes or drops it. Ordinary decode errors ask for a keyframe;
+//! [`NoSoftwareRung`] ends the rung.
 //!
-//! Decoder contexts are exclusively owned and used serially (`Send`, not `Sync`). [`Av1Data`]
-//! owns each copied AU until rav1d consumes or releases it, and decoder output is copied before
-//! the next call. Ordinary decode errors remain recoverable keyframe requests; only
-//! [`NoSoftwareRung`] ends this rung and triggers codec-capability fallback.
+//! [`Av1Software::new`] refuses `n_fc < 2`: rav1d aborts the process on a
+//! decode error with one frame context. Evidence: tests in this file.
 
 use crate::video::{CpuPlanarFrame, RungLoss};
 use crate::video_color::ColorDesc;
@@ -22,9 +20,7 @@ use anyhow::{anyhow, bail, Context as _, Result};
 use pf_bitstream::h264::{H264Planner, PlanError};
 use pf_vkdecode::RecoveryWatch;
 
-/// The codecs this rung can decode at all. Deliberately its own enum rather than an
-/// `ffmpeg::codec::Id`: the whole point of M8 was that nothing in here speaks FFmpeg, and
-/// the ladder above still does only because its other rungs are not swapped yet (M10).
+/// Own enum, not `ffmpeg::codec::Id` — this rung must not speak FFmpeg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SwCodec {
     H264,
@@ -32,8 +28,6 @@ pub(crate) enum SwCodec {
 }
 
 impl SwCodec {
-    /// The wire codec bit this rung can serve, or `None` — the one place the
-    /// "which codecs does software cover" question is answered.
     pub(crate) fn for_wire(codec: u8) -> Option<SwCodec> {
         match codec {
             punktfunk_core::quic::CODEC_H264 => Some(SwCodec::H264),
@@ -43,41 +37,27 @@ impl SwCodec {
     }
 }
 
-/// This build has no software decoder for the session's stream — the ladder has run out
-/// of rungs.
+/// Last-rung refusal: this build cannot decode the session's stream.
 ///
-/// A distinct type, not a formatted string, because the SESSION layer must be able to
-/// tell this apart from every other decode failure: everything else is survivable (feed
-/// the next AU, ask for an IDR), and this one is not survivable at all — it can only be
-/// answered by reconnecting with something this client can actually decode. It rides out
-/// through `anyhow` and is recovered with `downcast_ref`, so no signature in the ladder
-/// changes shape for it.
+/// Distinct from every other decode `Err` so the session can `downcast_ref` it.
+/// Survivable failures ask for an IDR; this one only reconnects with a codec
+/// the client can decode. Travels through `anyhow` so ladder signatures stay
+/// unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoSoftwareRung {
-    /// The `quic::CODEC_*` bit of the session that has no CPU rung.
+    /// The `quic::CODEC_*` bit with no CPU decoder.
     pub codec: u8,
-    /// `None` — the CODEC itself has no CPU decoder (HEVC). `Some(what)` — the codec
-    /// does, but not for THIS stream's picture shape (10-bit, 4:4:4).
-    ///
-    /// The two are one type on purpose. They are different diagnoses but the SAME
-    /// available action: the codec is fixed at Welcome, so a shape this rung cannot
-    /// decode can only be escaped the way a codec it cannot decode is — a reconnect that
-    /// takes the codec off the table, after which the host resolves a new shape too. A
-    /// blunt instrument for the shape case, and the only one the wire offers.
-    ///
-    /// The shape case cannot be answered at construction alone: a Windows HDR desktop
-    /// flips to Main 10 IN-BAND with a new parameter set, so the Welcome's
-    /// [`crate::video::StreamFormat`] can say 8-bit for a session that becomes 10-bit
-    /// mid-stream. That is why this is raised from the per-AU path, off the bitstream's
-    /// own headers, rather than from a negotiated field.
+    /// `None`: the codec has no CPU decoder (HEVC). `Some`: 8-bit 4:2:0 only,
+    /// and this stream is not (10-bit, 4:4:4). One type because Welcome pins
+    /// the codec, so a bad shape has the same escape as a missing codec:
+    /// reconnect and drop it. Raised per AU from in-band headers — Welcome's
+    /// [`crate::video::StreamFormat`] can say 8-bit for a stream that later is not.
     pub shape: Option<&'static str>,
 }
 
 impl NoSoftwareRung {
-    /// Which diagnosis this is, for the reconnect rule
-    /// ([`last_rung_verdict`](crate::video::last_rung_verdict)). The two answers differ:
-    /// a missing CODEC means every hardware rung already failed, a missing SHAPE means
-    /// none of them was even asked.
+    /// [`last_rung_verdict`](crate::video::last_rung_verdict) input: `Codec` means
+    /// hardware already failed; `Shape` means hardware was never asked.
     pub fn loss(&self) -> RungLoss {
         match self.shape {
             None => RungLoss::Codec,
@@ -106,14 +86,11 @@ impl std::fmt::Display for NoSoftwareRung {
 
 impl std::error::Error for NoSoftwareRung {}
 
-// --- software backend ---------------------------------------------------------------
-
 pub(crate) struct SoftwareDecoder {
     inner: Inner,
-    /// Last colour signalling the stream actually stated. Held across AUs the metadata
-    /// parser could not read (see [`H264Software::colour_of`]) so a stream never silently
-    /// reverts to the SDR default mid-session; seeded with that default, which is what
-    /// "unspecified" resolves to anyway (`csc_rows`).
+    /// Last colour the stream stated. Held across AUs the planner could not
+    /// read so the picture does not snap back to the SDR default; seed is
+    /// that default (`csc_rows` "unspecified").
     color: ColorDesc,
 }
 
@@ -123,11 +100,8 @@ enum Inner {
 }
 
 impl SoftwareDecoder {
-    /// Build the CPU rung for a WIRE codec bit.
-    ///
-    /// `Err` carrying a [`NoSoftwareRung`] means "there is no such rung", not "the rung
-    /// failed to start" — the two are different questions for the caller and must not
-    /// collapse into one string.
+    /// `Err` with [`NoSoftwareRung`] means this build has no rung for `codec`,
+    /// not that the rung failed to start.
     pub(crate) fn new(codec: u8) -> Result<SoftwareDecoder> {
         let Some(sw) = SwCodec::for_wire(codec) else {
             return Err(NoSoftwareRung { codec, shape: None }.into());
@@ -146,9 +120,8 @@ impl SoftwareDecoder {
         );
         Ok(SoftwareDecoder {
             inner,
-            // "Unspecified" everywhere: `csc_rows` resolves that to BT.709 limited, the
-            // host's SDR default, which is also what E.2.1 inference produces for a
-            // stream whose VUI is silent.
+            // Unspecified (2) + limited: `csc_rows` maps this to BT.709 limited,
+            // the SDR default and E.2.1's answer for a silent VUI.
             color: ColorDesc {
                 primaries: 2,
                 transfer: 2,
@@ -166,46 +139,32 @@ impl SoftwareDecoder {
     }
 }
 
-// --- H.264 (openh264) ----------------------------------------------------------------
-
 struct H264Software {
     decoder: openh264::decoder::Decoder,
-    /// The metadata half: colour signalling, the IDR flag and the display crop, from the
-    /// same planner every hardware rung submits from. It does NOT drive openh264 —
-    /// openh264 owns its own parsing — so a plan the narrow envelope refuses costs
-    /// metadata for that AU, never the picture.
-    ///
-    /// Boxed: the planner's DPB dwarfs everything else here, and `Backend` (which holds
-    /// this by value) is an enum whose other variants are pointer-sized — the same reason
-    /// the native rungs are boxed there.
+    /// Colour, IDR, crop from the shared planner. Does not drive openh264 —
+    /// a refused plan drops metadata for that AU, never the picture.
+    /// Boxed: the planner DPB dwarfs the other `Backend` variants (pointer-sized).
     planner: Box<H264Planner>,
-    /// The recovery point SEI, folded per picture by the SAME rule the native Vulkan rung
-    /// uses (`pf-vkdecode`'s watch, unchanged and shared): an intra-refresh session never
-    /// emits an IDR, so without this the pump's post-loss freeze on THIS rung waits out
-    /// its 500 ms backstop and then forces the very IDR the wave exists to avoid.
+    /// Recovery-point SEI, same fold as the Vulkan rung. Intra-refresh never
+    /// emits an IDR; without this the pump's post-loss freeze waits 500 ms
+    /// and then forces the IDR the wave exists to avoid.
     recovery: RecoveryWatch,
-    /// One warn per session for a stream whose AUs will not plan: the picture is fine
-    /// (openh264 decodes it), but colour is then whatever the last plannable AU said,
-    /// and a support engineer must be able to see that from the log rather than infer it
-    /// from a hue.
+    /// One warn per session when AUs will not plan: the picture still
+    /// decodes; colour then stays at the last plannable AU.
     plan_warned: bool,
 }
 
-/// Everything the planner tells the software rung about the AU it is ABOUT to submit.
 struct AuFacts {
     is_idr: bool,
-    /// `None` = the AU did not plan; the caller keeps the last colour it saw.
+    /// `None` = AU did not plan; caller keeps the last colour.
     color: Option<ColorDesc>,
     recovery: punktfunk_core::reanchor::LocalRecovery,
 }
 
 impl H264Software {
     fn new() -> Result<H264Software> {
-        // Default config: error concealment OFF, logging quiet, one thread. Concealment
-        // is deliberately not enabled — this rung's contract is that its errors SURFACE
-        // (the pump turns an `Err` into a keyframe request through the same throttle as
-        // every other rung), and a decoder quietly inventing macroblocks is precisely
-        // the "looked clean, wasn't" shape M4's telemetry exists to make impossible.
+        // Concealment off: an `Err` must surface so the pump can request a
+        // keyframe. Invented macroblocks look clean and are not.
         let decoder =
             openh264::decoder::Decoder::new().map_err(|e| anyhow!("openh264 decoder: {e}"))?;
         Ok(H264Software {
@@ -217,9 +176,8 @@ impl H264Software {
     }
 
     fn decode(&mut self, au: &[u8], color: &mut ColorDesc) -> Result<Option<CpuPlanarFrame>> {
-        // Plan FIRST: the plan describes the AU we are about to decode, and reading it
-        // after would attribute this picture's colour to the next one on a decoder that
-        // buffers.
+        // Plan before decode: a buffering decoder would otherwise pin this AU's
+        // colour on the next picture.
         let facts = self.plan_facts(au)?;
         if let Some(c) = facts.color {
             *color = c;
@@ -246,27 +204,18 @@ impl H264Software {
         Ok(Some(frame))
     }
 
-    /// The IDR flag, the colour and the recovery mark for this AU, from the shared
-    /// planner.
+    /// IDR, colour, recovery for this AU from the shared planner.
     ///
-    /// `colour` is `None` when the AU could not be planned — which is NORMAL for the
-    /// first AUs after a mid-session demotion onto this rung: the parameter sets arrive
-    /// in-band on the next IDR (which the demotion has already requested), so until it
-    /// lands the planner has no active SPS and says so. Answering `is_idr = false` there
-    /// is the conservative direction: it costs the re-anchor gate one frame of patience,
-    /// where a false `true` would lift a post-loss freeze onto a picture that is still
-    /// concealed — and the recovery mark is empty for the same reason.
-    ///
-    /// `Err` is reserved for the ONE thing that is not a metadata problem: a picture
-    /// shape this rung cannot decode. It travels as [`NoSoftwareRung`] so the session
-    /// reconnects instead of erroring per AU forever — see the type's `shape` field for
-    /// why that answer has to come from here rather than from the Welcome.
+    /// `color: None` is normal before the first in-band IDR (no active SPS).
+    /// `is_idr = false` and empty recovery then: a false `true` would lift a
+    /// post-loss freeze onto a still-concealed picture.
+    /// `Err` is only a shape this rung cannot decode ([`NoSoftwareRung`]), so
+    /// the session reconnects instead of erroring every AU.
     fn plan_facts(&mut self, au: &[u8]) -> Result<AuFacts> {
         match self.planner.plan_au(au) {
             Ok(plan) => {
-                // The envelope, read from the SPS the planner activated for THIS picture
-                // — so an in-band flip to Main 10 (a Windows HDR desktop) is caught on
-                // the AU that carries it, not left to openh264 to fail on repeatedly.
+                // Envelope from the SPS this picture activated, so an in-band
+                // Main 10 flip is caught here instead of failing openh264 every AU after.
                 if let Some(shape) = unsupported_shape(
                     plan.picture.chroma_format_idc,
                     plan.picture.bit_depth_luma_minus8,
@@ -278,11 +227,8 @@ impl H264Software {
                     .into());
                 }
                 let c = plan.picture.colour;
-                // The wave's own verdict for this picture. Folded even when openh264
-                // then produces nothing: the watch counts `frame_num` increments, so
-                // skipping a picture would leave the count owing forever. Losing the
-                // MARK of a picture that never came out only makes the lift late, which
-                // is the safe direction.
+                // Fold recovery even if openh264 emits nothing: the watch counts
+                // `frame_num`. Skipping one leaves the count owing; a late lift is safe.
                 let mark = self.recovery.note_h264(
                     plan.picture.frame_num,
                     plan.picture.is_idr,
@@ -303,9 +249,8 @@ impl H264Software {
                 })
             }
             Err(e) => {
-                // `NoActiveParamSet` before the first in-band IDR is expected and says
-                // nothing; anything else means the stream is outside the envelope the
-                // hardware rungs plan from, which is worth exactly one line.
+                // `NoActiveParamSet` before the first IDR is expected. Anything else
+                // is outside the hardware envelope — one warn for the session.
                 if !matches!(e, PlanError::NoActiveParamSet { .. }) && !self.plan_warned {
                     self.plan_warned = true;
                     tracing::warn!(
@@ -324,13 +269,9 @@ impl H264Software {
     }
 }
 
-/// The CPU rung's picture envelope: 8-bit 4:2:0 and nothing else. `Some(what)` names what
-/// falls outside it, for [`NoSoftwareRung::shape`].
-///
-/// Stated once and shared by both legs. Neither decoder is BUILT for anything wider —
-/// openh264 has no 4:2:2/4:4:4 or high-bit-depth support at all, and rav1d is compiled
-/// here with `bitdepth_8` only — so this is a refusal that reflects the build, not a
-/// policy that could drift from it.
+/// 8-bit 4:2:0 only. `Some` names what is outside, for [`NoSoftwareRung::shape`].
+/// Shared by both legs; matches the build (openh264 has no high depth / 4:4:4,
+/// rav1d is `bitdepth_8` only), not a policy that could drift from it.
 fn unsupported_shape(chroma_format_idc: u8, bit_depth_minus8: u8) -> Option<&'static str> {
     if bit_depth_minus8 != 0 {
         return Some("10-bit or deeper");
@@ -341,12 +282,8 @@ fn unsupported_shape(chroma_format_idc: u8, bit_depth_minus8: u8) -> Option<&'st
     None
 }
 
-// --- AV1 (rav1d) ----------------------------------------------------------------------
-
-// rav1d ships dav1d's C ABI as `#[no_mangle] extern "C"` Rust functions over `#[repr(C)]`
-// types — there is no linker and no `.so` in sight, but the calling contract is still
-// dav1d's, so the FFI discipline below is dav1d's too: every context/picture is owned by
-// exactly one value here, and `Drop` closes it exactly once.
+// rav1d is dav1d's C ABI as `extern "C"` Rust (`#[repr(C)]`, no `.so`).
+// Each context/picture has one owner here; `Drop` closes it once.
 use rav1d::include::dav1d::data::Dav1dData;
 use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
 use rav1d::include::dav1d::headers::{Dav1dSequenceHeader, DAV1D_PIXEL_LAYOUT_I420};
@@ -358,27 +295,23 @@ use rav1d::src::lib::{
 };
 use std::ptr::NonNull;
 
-/// Frame contexts rav1d must end up with — see [`Av1Software::new`] for why ONE is fatal.
+/// Floor on rav1d `n_fc`. One is fatal ([`Av1Software::new`]).
 ///
-/// rav1d derives its count as `n_fc = min(max_frame_delay, n_threads)` (`get_num_threads`),
-/// so this is a floor on BOTH settings, not just on the delay. Two, not more: every extra
-/// context is another 4K working set, and the drain in [`Av1Software::decode`] takes the
-/// frame back out in the same call, so there is nothing to buy above the minimum.
+/// `n_fc = min(max_frame_delay, n_threads)`, so this floors both. Two, not
+/// more: each extra context is another 4K working set, and `decode` drains
+/// the frame in the same call.
 const AV1_MIN_FRAME_CONTEXTS: i32 = 2;
 
 struct Av1Software {
-    /// `None` only between `Drop` taking it and the close returning — every other
-    /// observer sees a live context.
+    /// `None` only between `Drop` taking it and close returning.
     ctx: Option<Dav1dContext>,
 }
 
-/// An owned `Dav1dData`, unref'd exactly once on drop.
+/// Owned `Dav1dData`, unref'd once on drop.
 ///
-/// The same shape (and the same lesson) as the libavcodec rungs' `AvBuffer`: the send loop
-/// below has several fallible exits between allocating the buffer and dav1d taking its
-/// reference, and hand-unref'ing on each one is how a leak per failed AU gets written.
-/// dav1d zeroes the struct when it takes the reference, so an already-consumed `Dav1dData`
-/// drops to a no-op and the double-unref this type prevents cannot happen either.
+/// The send loop has several fallible exits between allocate and dav1d taking
+/// the reference; hand-unref on each is a leak per failed AU. dav1d zeroes
+/// the struct when it takes the ref, so a consumed value's `Drop` is a no-op.
 struct Av1Data(Dav1dData);
 
 impl Av1Data {
@@ -415,16 +348,8 @@ unsafe impl Send for Av1Software {}
 impl Av1Software {
     fn new() -> Result<Av1Software> {
         let mut settings = av1_settings();
-        // Ask rav1d itself what those settings actually bought, and refuse to open a
-        // decoder that would abort the process on its first bad AU.
-        //
-        // `dav1d_get_frame_delay` IS `get_num_threads`' `n_fc`, so this is not a restatement
-        // of [`av1_settings`]' arithmetic — it is rav1d's own answer, and it stays right if
-        // rav1d's derivation ever changes. It is here because the alternative failure mode
-        // is uniquely bad: a settings edit that quietly reinstates `n_fc = 1` costs nothing
-        // at build time, nothing in the tests, nothing on a clean link, and then kills the
-        // whole client the first time a frame arrives damaged. A refusal is a `bail!` the
-        // session reports and recovers from; the thing it replaces is `abort()`.
+        // rav1d's own `n_fc` (`dav1d_get_frame_delay`), not a copy of our arithmetic.
+        // `n_fc < 2` is `abort()` on the first bad AU; a `bail!` here is recoverable.
         let delay = frame_delay(&mut settings);
         if delay < AV1_MIN_FRAME_CONTEXTS {
             bail!(
@@ -451,9 +376,8 @@ impl Av1Software {
     }
 }
 
-/// The settings the AV1 CPU leg opens rav1d with. Its own function so the invariant the
-/// rung's life depends on — `n_fc >= AV1_MIN_FRAME_CONTEXTS` — is testable without opening
-/// a decoder.
+/// Settings this leg opens rav1d with. Separate so `n_fc >= AV1_MIN_FRAME_CONTEXTS`
+/// is testable without constructing a decoder.
 fn av1_settings() -> Dav1dSettings {
     let mut settings = std::mem::MaybeUninit::<Dav1dSettings>::uninit();
     // SAFETY: `dav1d_default_settings` fully initializes the `Dav1dSettings` behind
@@ -462,61 +386,17 @@ fn av1_settings() -> Dav1dSettings {
         dav1d_default_settings(NonNull::new_unchecked(settings.as_mut_ptr()));
         settings.assume_init()
     };
-    // ⚠⚠⚠ TWO frame contexts, not one, and this is a CORRECTNESS setting.
-    //
-    // rav1d 1.1.0 (and upstream `main` as of 2026-08-07) aborts the process on ANY decode
-    // error whenever it is configured with a single frame context. The path, read out of
-    // `rav1d/src/decode.rs`:
-    //
-    //   * `rav1d_submit_frame`'s `c.fc.len() == 1` branch calls `rav1d_decode_frame`
-    //     inline, which ALWAYS finishes in `rav1d_decode_frame_exit` — and that does an
-    //     unconditional `mem::take(&mut f.frame_hdr)` (`decode.rs:4873`).
-    //   * If the decode returned `Err`, the same branch then re-enters the local
-    //     `on_error`, whose first act is `f.frame_hdr.as_ref().unwrap()`
-    //     (`decode.rs:4997`) — on the `None` the teardown above just left.
-    //   * That panic unwinds into `dav1d_send_data`, which is `extern "C"`, so it is
-    //     `panic_cannot_unwind` → `abort()`. No `catch_unwind` at our call site, no rung
-    //     demotion and no `NoSoftwareRung` refusal can catch an abort.
-    //
-    // The `c.fc.len() > 1` branch never calls `rav1d_decode_frame`, so it never reaches
-    // that `on_error` at all: it hands the frame to `rav1d_task_frame_init` and errors come
-    // back through `cached_error`/`task_thread.retval` as ordinary `EINVAL`s — which the
-    // pump already answers with a keyframe request.
-    //
-    // Measured on .21 (2026-08-07) against a captured 4K60 AV1 stream that the client had
-    // itself made undecodable by flushing its backlog and jumping to live, so the next AU
-    // referenced frames nobody had decoded (libdav1d gives the same verdict on the same
-    // capture: 13 frames, then "Invalid data"):
-    //
-    //   n_threads=8 max_frame_delay=1  → n_fc=1 → ABORT
-    //   n_threads=1 max_frame_delay=1  → n_fc=1 → ABORT
-    //   n_threads=1 max_frame_delay=2  → n_fc=1 → ABORT   ← the one that proves the rule
-    //   n_threads=8 max_frame_delay=2  → n_fc=2 → 13 pictures, EINVAL, survives
-    //   n_threads=8 max_frame_delay=0  → n_fc=3 → survives
-    //
-    // The third row is why `n_threads` has a floor of two and not one: `n_fc` is
-    // `min(max_frame_delay, n_threads)`, so a single thread silently puts the whole thing
-    // back on the aborting path. Pinning threads to 1 was also tested as the suspected
-    // trigger and is NOT one — the tile workers are innocent, the single frame context is
-    // the whole defect.
-    //
-    // The frame of latency this would normally cost is bought back in `decode`, which
-    // drains the in-flight frame in the same call instead of pipelining it — see there.
-    //
-    // Reported upstream as memorysafety/rav1d#1497, with the one-line fix
-    // (`is_some_and` for the `unwrap`) and a reproducer that needs no capture: any AV1
-    // stream with one temporal unit removed from the middle. If a release ever carries
-    // that fix, THIS floor is still the right default — it is what makes a decoder error
-    // an error — but the `bail!` in `Av1Software::new` could then relax.
+    // Two frame contexts, not one. rav1d `abort()`s the process on any decode
+    // error when `n_fc == 1` (panic in `extern "C"` `dav1d_send_data`). `n_fc`
+    // is `min(max_frame_delay, n_threads)`, so `n_threads` is floored too.
+    // `decode` drains the in-flight frame in the same call; no extra latency.
     settings.max_frame_delay = AV1_MIN_FRAME_CONTEXTS;
-    // `n_threads` drives the INTRA-frame tile/row workers, which add no delay, and now also
-    // floors `n_fc`. Capped at 8 — this is the rung reached because the GPU already failed,
-    // and it should not also take the machine over.
+    // Tile/row workers add no delay and also floor `n_fc`. Cap 8: this rung
+    // exists because the GPU failed; it must not take the machine.
     settings.n_threads = std::thread::available_parallelism()
         .map(|n| n.get().clamp(AV1_MIN_FRAME_CONTEXTS as usize, 8))
         .unwrap_or(AV1_MIN_FRAME_CONTEXTS as usize) as i32;
-    // Film grain synthesis is a post-process the hosts never signal and nobody can
-    // afford on the rung that exists because the GPU already failed.
+    // Hosts never signal film grain; synthesis is too expensive on this rung.
     settings.apply_grain = 0;
     settings
 }
@@ -527,14 +407,10 @@ impl Av1Software {
         if au.is_empty() {
             return Ok(None);
         }
-        // The envelope, off the BITSTREAM's own sequence header, before a byte reaches
-        // the decoder — exactly what the H.264 leg does with `plan_au`, and for the same
-        // reason. rav1d is compiled `bitdepth_8` only, so a 10-bit frame makes
-        // `rav1d_submit_frame` refuse with `ENOPROTOOPT`; that refusal is a per-AU error
-        // the pump would answer with a keyframe request forever, on a stream where every
-        // following AU is identically 10-bit. This is the shipping case, not a corner:
-        // AV1 is advertised only where hardware AV1 exists, hardware AV1 + HDR is Main 10,
-        // and a mid-session hardware failure demotes here.
+        // Envelope from the AU's sequence header, before submit. A 10-bit frame
+        // is `ENOPROTOOPT` from a `bitdepth_8` build; the pump would treat that
+        // as survivable and request a keyframe forever. Hardware AV1 + HDR is
+        // Main 10, so a mid-session demotion lands here on that stream.
         if let Some(shape) = self.unsupported_sequence(au) {
             return Err(NoSoftwareRung {
                 codec: punktfunk_core::quic::CODEC_AV1,
@@ -542,22 +418,12 @@ impl Av1Software {
             }
             .into());
         }
-        // A `Dav1dData` that owns its own copy: `dav1d_data_create` allocates, we fill
-        // it, and `dav1d_send_data` takes the reference on success. Deliberately not
-        // `dav1d_data_wrap` over the caller's `au` — that would hand the decoder a
-        // borrow of a buffer the pump reuses on the next AU.
+        // Own copy: `dav1d_data_wrap` over `au` would lend the decoder a buffer
+        // the pump reuses on the next AU.
         let mut data = Av1Data::create(au)?;
-        // dav1d consumes `data` incrementally: a partial send leaves bytes in it and asks
-        // to be re-sent. A punktfunk AU is one temporal unit and the decoder is drained
-        // every call, so the loop is bounded by the AU — but it is a LOOP, because
-        // `EAGAIN` here means "take pictures out first", not "the AU is bad".
-        //
-        // Only the NEWEST picture survives, which matches every other backend's
-        // `decode -> Option<Frame>` contract (the old libav rung's `while receive_frame`
-        // did the same). It matters more here than elsewhere because an AV1 temporal unit
-        // really can carry several shown frames — but this is the rung reached after the
-        // hardware already failed, and showing the newest is the same answer the pump's
-        // newest-wins frame queue would give a moment later anyway.
+        // Partial send leaves bytes; `EAGAIN` means drain pictures, not "bad AU".
+        // Keep the newest picture (`decode -> Option<Frame>`). An AV1 TU can show
+        // several frames; newest matches the pump queue.
         let mut out: Option<CpuPlanarFrame> = None;
         loop {
             // SAFETY: `ctx` is the live context from `dav1d_open` (not yet closed) and
@@ -567,12 +433,8 @@ impl Av1Software {
             let r = unsafe { dav1d_send_data(Some(ctx), NonNull::new(&mut data.0)) };
             let sent = r.0 >= 0;
             if !sent && dav1d_errno(r) != Some(libc::EAGAIN) {
-                // A shape the build cannot decode reaches here only if it slipped past
-                // the sequence-header check above (an AU whose OBUs carry no sequence
-                // header of their own). Still typed rather than generic: the pump's
-                // survivable branch would ask for a keyframe and get the same refusal on
-                // every AU for the rest of the session — a permanent freeze with no
-                // fallback, which is the one outcome this rung exists to end.
+                // `ENOPROTOOPT` with no sequence header on this AU. Typed: a generic
+                // `Err` would look survivable and freeze the session on every following AU.
                 if dav1d_errno(r) == Some(libc::ENOPROTOOPT) {
                     return Err(NoSoftwareRung {
                         codec: punktfunk_core::quic::CODEC_AV1,
@@ -582,42 +444,20 @@ impl Av1Software {
                 }
                 bail!("rav1d send_data: {}", r.0);
             }
-            // The AU is fully inside the decoder — stop feeding and go and drain it.
             if sent && data.0.sz == 0 {
                 break;
             }
             match self.take_picture(ctx, color)? {
                 Some(f) => out = Some(f),
-                // Nothing to take and the decoder still would not accept the rest: it
-                // has neither produced nor consumed, which is a wedge, not back-pressure.
+                // Neither produced nor consumed: a wedge, not back-pressure.
                 None if !sent => bail!("rav1d: decoder accepted no data and produced no picture"),
                 None => {}
             }
         }
-        // Now drain — and drain PAST the first `EAGAIN`, which is the whole trick that
-        // makes two frame contexts cost no latency.
-        //
-        // `rav1d_get_picture` only reaches its blocking `drain_picture` on a call whose own
-        // `drain` flag is ALREADY set, and that flag is set by the PREVIOUS `get_picture`
-        // and cleared by every `send_data` that carried bytes. So the first `EAGAIN` after
-        // a send does not mean "no picture for this AU" — it means "ask again", and the
-        // frame this AU coded comes out of the SECOND call, which waits for the tile
-        // workers instead of leaving the frame in flight. Stopping at the first `None` is
-        // what a single-frame-context reading of dav1d's API teaches, and with `n_fc = 2`
-        // it silently puts the pipeline two frames behind.
-        //
-        // Measured on .21 (2026-08-07), 4K60 AV1, 14 temporal units, `n_fc = 2`:
-        //   stopping at the first `None`  → units 0 and 1 produce NOTHING, then one frame
-        //                                   per unit: a standing two-frame delay
-        //   draining past it (this loop)  → one frame per unit from unit 0, and 20-42 ms
-        //                                   per unit against 21-53 ms at `n_fc = 1`
-        // i.e. it is not a trade at all — same cadence as the aborting configuration, and
-        // slightly faster, because the tile workers overlap the drain.
-        //
-        // Terminating: every `Some` consumes one picture and a temporal unit codes finitely
-        // many, and rav1d opens each frame context `finished = true` (`lib.rs:232`), so the
-        // drain walk over an idle context returns rather than waiting for a frame nobody
-        // submitted.
+        // Drain past the first `EAGAIN`. `get_picture` only blocks on a call whose
+        // `drain` flag the previous call set, and `send_data` clears it — so the
+        // first `EAGAIN` means "ask again". Stopping there with `n_fc = 2` leaves
+        // this AU's frame in flight (two frames of latency).
         let mut idle = 0;
         while idle < 2 {
             match self.take_picture(ctx, color)? {
@@ -631,15 +471,10 @@ impl Av1Software {
         Ok(out)
     }
 
-    /// This AU's sequence header against the build's envelope: `Some(what)` names what
-    /// falls outside it, `None` means "8-bit 4:2:0, or this AU carries no sequence header
-    /// of its own".
-    ///
-    /// An AU without one is the AV1 twin of the H.264 leg's `NoActiveParamSet`: it says
-    /// nothing, so it decodes against whatever sequence the decoder already holds — which
-    /// a previous AU was checked for. Punktfunk hosts re-send the sequence header on every
-    /// key frame, and the demotion onto this rung asks for one immediately, so the first
-    /// AU this rung ever decodes carries one.
+    /// Sequence header vs the 8-bit 4:2:0 envelope. `None` = this AU has no
+    /// sequence header (AV1 twin of `NoActiveParamSet`): decode against the
+    /// sequence a previous AU was already checked for. Hosts resend it on
+    /// every key frame; demotion requests one, so the first AU here has it.
     fn unsupported_sequence(&self, au: &[u8]) -> Option<&'static str> {
         let mut seq = std::mem::MaybeUninit::<Dav1dSequenceHeader>::uninit();
         // SAFETY: `out` is a live local this call either fully writes or leaves untouched
@@ -653,7 +488,7 @@ impl Av1Software {
             )
         };
         if r.0 < 0 {
-            return None; // no sequence header here (ENOENT), or an AU we cannot read
+            return None; // no sequence header (ENOENT), or an AU we cannot read
         }
         // SAFETY: the call returned success, which is its contract for having written
         // the whole `Dav1dSequenceHeader`.
@@ -667,7 +502,6 @@ impl Av1Software {
         None
     }
 
-    /// One picture out of the decoder, converted. `None` = nothing ready yet.
     fn take_picture(
         &self,
         ctx: Dav1dContext,
@@ -683,9 +517,8 @@ impl Av1Software {
         if r.0 < 0 {
             bail!("rav1d get_picture: {}", r.0);
         }
-        // From here the picture is OURS and must be unref'd on every exit — including the
-        // refusals below, which is why the conversion is a closure and the unref is not
-        // in a branch.
+        // Picture is ours: unref on every exit, including the refusals. Convert
+        // first, unref after, so a `return Err` cannot skip it.
         let converted = Self::convert(&pic, color);
         // SAFETY: `pic` is the live picture `dav1d_get_picture` just wrote; this releases
         // exactly the one reference it handed over, once.
@@ -694,17 +527,9 @@ impl Av1Software {
     }
 
     fn convert(pic: &Dav1dPicture, color: &mut ColorDesc) -> Result<CpuPlanarFrame> {
-        // 8-bit 4:2:0 only, stated as a refusal rather than assumed — and as the SAME
-        // typed refusal the H.264 leg raises, so a shape this rung cannot decode
-        // reconnects instead of erroring once per AU for the rest of the session.
-        // Treating a 4:4:4 picture's planes as 4:2:0 would decode correctly and display
-        // wrong, which is the class this program exists to refuse.
-        //
-        // A BELT, not the gate: `unsupported_sequence` refuses these shapes before the
-        // AU is submitted, and a `bitdepth_8`-only build cannot produce a 10-bit picture
-        // anyway (`rav1d_submit_frame` refuses the frame setup). Kept because it costs
-        // two comparisons and because the day this build gains `bitdepth_16` the layout
-        // half stops being redundant.
+        // Same typed refusal as H.264: 4:4:4 planes treated as 4:2:0 decode and
+        // display wrong. Belt: `unsupported_sequence` already refused submit;
+        // kept so a `bitdepth_16` build still rejects layout.
         let shape = if pic.p.bpc != 8 {
             Some("10-bit or deeper")
         } else if pic.p.layout != DAV1D_PIXEL_LAYOUT_I420 {
@@ -720,8 +545,7 @@ impl Av1Software {
             .into());
         }
         let (w, h) = (pic.p.w.max(0) as u32, pic.p.h.max(0) as u32);
-        // Colour rides the SEQUENCE header, which AV1 re-sends whenever it changes — the
-        // same per-picture contract the H.264 leg gets from the SPS, so an in-band
+        // Colour from the sequence header (resent on change), so an in-band
         // SDR↔HDR flip is followed rather than latched.
         if let Some(seq) = pic.seq_hdr {
             // SAFETY: `seq_hdr` belongs to the picture we hold a reference to, so it is
@@ -739,8 +563,7 @@ impl Av1Software {
             unsafe { f.as_ref() }.frame_type == rav1d::include::dav1d::headers::DAV1D_FRAME_TYPE_KEY
         });
         let (_, ch) = CpuPlanarFrame::chroma_dims(w, h);
-        // dav1d gives ONE chroma stride for both planes (`stride[1]`), which is why the
-        // triple below repeats it rather than looking for a third.
+        // dav1d has one chroma stride (`stride[1]`) for both planes.
         let strides = [
             pic.stride[0].max(0) as usize,
             pic.stride[1].max(0) as usize,
@@ -762,10 +585,8 @@ impl Av1Software {
             // copy below then refuses.
             planes[i] = unsafe { std::slice::from_raw_parts(p.as_ptr().cast::<u8>(), sizes[i]) };
         }
-        // No local-recovery answer from this leg: AV1 has no recovery point SEI, and its
-        // intra-refresh equivalent (`frame_refs_short_signaling` / S-frames) is not
-        // something a punktfunk host emits — so the pump's re-anchor behaviour on AV1 is
-        // exactly the wire's, as it is on every lane but H.264/H.265.
+        // AV1 has no recovery-point SEI; hosts do not emit S-frames. Re-anchor
+        // is the wire's, as on every lane except H.264/H.265.
         CpuPlanarFrame::from_i420(
             w,
             h,
@@ -790,25 +611,19 @@ impl Drop for Av1Software {
     }
 }
 
-/// The errno behind a `Dav1dResult`, or `None` for success.
+/// Negated errno from a `Dav1dResult`, or `None` on success.
 ///
-/// rav1d returns the NEGATED errno as a plain `c_int`, and the codes are `libc`'s own
-/// (`Rav1dError::ENOPROTOOPT = libc::ENOPROTOOPT as u8`) — so they are matched against
-/// `libc`'s rather than written out. Not a nicety: `EAGAIN` is 11 everywhere but
-/// `ENOPROTOOPT` is **92 on Linux and 123 on Windows**, and a literal would therefore be
-/// right on exactly one platform. The typed enum this would rather match on
-/// (`Rav1dError`) lives in a `pub(crate)` module — rav1d re-exports only `Dav1dResult` —
-/// so the errno is the only handle the crate actually offers.
+/// Match `libc`'s codes, not literals: `EAGAIN` is 11 everywhere, but
+/// `ENOPROTOOPT` is 92 on Linux and 123 on Windows. `Rav1dError` is
+/// `pub(crate)` in rav1d; only `Dav1dResult` is re-exported.
 fn dav1d_errno(r: rav1d::Dav1dResult) -> Option<i32> {
     (r.0 < 0).then_some(-r.0)
 }
 
-/// How many frame contexts (`n_fc`) rav1d will actually run with, given these settings.
-///
-/// rav1d's own `get_num_threads` answer rather than a copy of its arithmetic, so the floor
-/// [`Av1Software::new`] enforces cannot drift away from the thing it is protecting against.
-/// A negative return (settings rav1d would refuse outright) collapses to 0, which the
-/// caller's floor check then rejects — the right answer for that case too.
+/// rav1d's own `n_fc` for these settings (`dav1d_get_frame_delay`).
+/// Not a copy of its arithmetic, so [`Av1Software::new`]'s floor cannot
+/// drift. Negative (settings rav1d would refuse) becomes 0, which fails
+/// the floor too.
 fn frame_delay(settings: &mut Dav1dSettings) -> i32 {
     // SAFETY: `settings` is a live local for the duration of the call, which is this
     // function's whole contract — it `ptr::read`s the struct and writes nothing back. The
@@ -823,17 +638,13 @@ mod tests {
     use super::*;
     use crate::video::csc_rows;
 
-    /// The nine bars every fixture encodes, in x order: eight fully-saturated
-    /// primaries/secondaries plus black and white, and then the one that carries the
-    /// RANGE axis.
+    /// Nine bars in x order: saturated primaries/secondaries, black, white,
+    /// then the RANGE axis.
     ///
-    /// ⚠ `(192, 128, 64)` is not decoration. On saturated bars a limited↔full mismatch
-    /// only pushes values outside [0, 1], where the shader clamps — so the 709-FULL
-    /// fixture decoded with the WRONG range comes back with max error **0** over the
-    /// eight, and this test could not fail on range at all. Measured on these fixtures:
-    /// the mid-tone gives max error 11 under the wrong range. A 50% grey does not do the
-    /// job either (3, inside the ±4 tolerance) — it has to be OFF-neutral, so the chroma
-    /// scale is exercised and not just the luma one.
+    /// `(192, 128, 64)` is the only bar that can fail a limited↔full mismatch.
+    /// Saturated bars clamp at [0, 1], so the 709-FULL fixture with the wrong
+    /// range has max error 0. 50% grey is 3 (inside ±4). Off-neutral mid-tone
+    /// is 11, and it exercises chroma scale too.
     const BARS: [(u8, u8, u8); 9] = [
         (255, 255, 255),
         (255, 255, 0),
@@ -846,17 +657,13 @@ mod tests {
         (192, 128, 64),
     ];
 
-    /// The presenter's planar CSC shader, on the CPU: sample the three planes and apply
-    /// `csc_rows` exactly as `planar_csc.frag` does (`rgb[i] = dot(r[i].xyz, yuv) +
-    /// r[i].w`, then clamp). 8-bit, no MSB packing — the software rung's only shape.
+    /// Presenter planar CSC on the CPU: sample three planes, apply `csc_rows`
+    /// as `planar_csc.frag` (`rgb[i] = dot(r[i].xyz, yuv) + r[i].w`, clamp).
+    /// 8-bit, no MSB packing — this rung's only shape.
     ///
-    /// This is a MODEL of the shader, and it is the honest one: `csc_rows` is the single
-    /// coefficient implementation the shader's push constants are filled from (and the
-    /// Windows client's constant buffer, and the Apple client's Swift port), so what this
-    /// exercises end to end is exactly what changes colour on screen — the decoder's
-    /// plane layout, and the `ColorDesc` it read out of the bitstream. Sampling is
-    /// nearest at bar centres, which is where the shader's quarter-texel 4:2:0 siting
-    /// correction and its linear filter both make no difference.
+    /// `csc_rows` is the one coefficient source the shader, Windows CB, and
+    /// Apple Swift port all fill from. Nearest at bar centres, where 4:2:0
+    /// siting and the linear filter do not matter.
     fn shader_rgb(f: &CpuPlanarFrame, x: u32, y: u32) -> [u8; 3] {
         let rows = csc_rows(f.color, 8, false);
         let (cw, _) = CpuPlanarFrame::chroma_dims(f.width, f.height);
@@ -878,32 +685,15 @@ mod tests {
             .expect("no frame out of the fixture")
     }
 
-    /// **M8's exit criterion.** Three lossless-ish H.264 colour-bar fixtures whose VUIs
-    /// differ ONLY in matrix and range (see `tests/gen-bars.sh` for the recipe): decode
-    /// each through the real CPU rung, then convert with the real `csc_rows`, and require
-    /// the original RGB back.
+    /// Three H.264 colour-bar fixtures whose VUIs differ only in matrix and
+    /// range (`tests/gen-bars.sh`): decode on this rung, convert with
+    /// `csc_rows`, require the original RGB. Every assertion is a pixel that
+    /// depends on colour signalling surviving the path.
     ///
-    /// What it would have caught, one failure per axis:
-    ///
-    /// * **The BT.601 default** — the bug the deleted `convert_rgba` carried explicit
-    ///   correction code for. swscale converts with BT.601 coefficients unless told
-    ///   otherwise, so a rung that dropped the signalling (or hardcoded one matrix)
-    ///   renders the 601 fixture with 709 coefficients or vice versa. On the saturated
-    ///   bars that is tens of code points — e.g. pure red's green channel goes from 0 to
-    ///   ~+40 — far outside the ±4 tolerance (measured on these fixtures: max error 22
-    ///   for 709 read as 601, 39 the other way).
-    /// * **Range** — the 709-full fixture differs from 709-limited by the 16..235 vs
-    ///   0..255 expansion only. ⚠ On the eight saturated bars this axis CANNOT fail:
-    ///   every one of them is at an extreme, so a mismatch only pushes values outside
-    ///   [0, 1] where the shader clamps, and the fixture decodes with max error **0**
-    ///   under the wrong range. The ninth bar, `(192, 128, 64)`, is what makes the axis
-    ///   testable (max error 11 wrong-range, ~1 right) — see [`BARS`].
-    /// * **Plane order and stride** — a Cb/Cr swap turns red into blue, and a stride
-    ///   mistake shears the bars sideways, so both show up as a wrong bar rather than a
-    ///   wrong shade.
-    ///
-    /// It is deliberately NOT a "did it decode" test: every assertion is a pixel value
-    /// that depends on the colour signalling surviving the whole path.
+    /// 601 vs 709 on saturated bars is tens of code points (red's green
+    /// ~0 → ~40). Range needs [`BARS`]'s ninth sample — the eight saturated
+    /// bars clamp a limited↔full mismatch to max error 0. A Cb/Cr swap or
+    /// stride error shears or swaps bars.
     #[test]
     fn software_h264_reproduces_the_golden_bars_in_both_ranges() {
         let fixtures: [(&str, &[u8], ColorDesc); 3] = [
@@ -913,7 +703,7 @@ mod tests {
                 ColorDesc {
                     primaries: 1,
                     transfer: 1,
-                    matrix: 5, // BT.470BG — what a Linux host's RGB-input NVENC signals
+                    matrix: 5, // BT.470BG: Linux host RGB-input NVENC
                     full_range: false,
                 },
             ),
@@ -955,12 +745,10 @@ mod tests {
         }
     }
 
-    /// The same three fixtures, but asserting the thing a "it decoded" test cannot: the
-    /// 601 and 709 pictures are DIFFERENT pixels, so a rung that ignored the signalling
-    /// and converted both with one matrix would still pass a self-consistency check.
-    ///
-    /// Guards the fixtures themselves as much as the code — if a regeneration ever
-    /// produced two identical bitstreams the colour test above would go vacuously green.
+    /// The 601 and 709 pictures are different pixels. A rung that ignored
+    /// signalling and converted both with one matrix would still pass a
+    /// self-consistency check. Also guards the fixtures: identical bitstreams
+    /// would make the colour test vacuously green.
     #[test]
     fn the_601_and_709_fixtures_really_do_carry_different_luma() {
         let f601 = decode_one(
@@ -971,8 +759,8 @@ mod tests {
             punktfunk_core::quic::CODEC_H264,
             include_bytes!("../tests/bars-709-limited.h264"),
         );
-        // Pure red: Y = 0.299·255 ≈ 76 under 601, 0.2126·255 ≈ 54 under 709 (both then
-        // range-compressed to 16..235). Same displayed colour, different code points.
+        // Pure red: Y ≈ 76 under 601, ≈ 54 under 709 (then 16..235). Same
+        // displayed colour, different code points — why the threshold is > 10.
         let (x, y) = (5 * 32 + 16, 32);
         let a = f601.plane(0)[(y * f601.width + x) as usize];
         let b = f709.plane(0)[(y * f709.width + x) as usize];
@@ -981,7 +769,6 @@ mod tests {
             "601 luma {a} vs 709 luma {b} — the fixtures do not differ, so the colour \
              test above proves nothing"
         );
-        // ...and after the CSC both land on the same red.
         for (f, name) in [(&f601, "601"), (&f709, "709")] {
             let px = shader_rgb(f, x, y);
             assert!(
@@ -991,8 +778,7 @@ mod tests {
         }
     }
 
-    /// HEVC has no CPU rung and must say so with the TYPE the session layer keys its
-    /// reconnect off — not with a string, and not by quietly producing nothing.
+    /// HEVC has no CPU rung. Must be [`NoSoftwareRung`], not a string and not `Ok(None)`.
     #[test]
     fn hevc_is_refused_with_the_typed_no_rung_error() {
         let err = SoftwareDecoder::new(punktfunk_core::quic::CODEC_HEVC)
@@ -1004,23 +790,16 @@ mod tests {
         assert_eq!(typed.codec, punktfunk_core::quic::CODEC_HEVC);
         assert_eq!(typed.shape, None, "the CODEC is missing, not a shape");
         assert!(err.to_string().contains("HEVC"), "{err}");
-        // And the two codecs that DO have one still build.
         assert!(SoftwareDecoder::new(punktfunk_core::quic::CODEC_H264).is_ok());
         assert!(SoftwareDecoder::new(punktfunk_core::quic::CODEC_AV1).is_ok());
     }
 
-    /// A picture shape the CPU rung cannot decode must raise the SAME typed refusal as a
-    /// missing codec, because it has the same available answer (reconnect) and because
-    /// the alternative — an `Err` per AU forever, or 8-bit maths over 10-bit samples — is
-    /// respectively a frozen screen and a wrong one.
-    ///
-    /// Exercised as the pure rule plus the two shapes a punktfunk host can actually
-    /// resolve: Main 10 (an HDR desktop, flipped IN-BAND, which is why the check reads
-    /// the ACTIVE SPS and not the Welcome) and 4:4:4 (the "Full chroma" opt-in).
+    /// A shape this rung cannot decode is the same typed refusal as a missing
+    /// codec (reconnect). Else: `Err` every AU, or 8-bit maths on 10-bit samples.
+    /// Covers Main 10 (in-band, so the active SPS not Welcome) and 4:4:4.
     #[test]
     fn a_shape_the_cpu_rung_cannot_decode_is_the_same_typed_refusal() {
         use punktfunk_core::quic::{CHROMA_IDC_420, CHROMA_IDC_444};
-        // 8-bit 4:2:0 is the whole envelope.
         assert_eq!(unsupported_shape(CHROMA_IDC_420, 0), None);
         assert_eq!(
             unsupported_shape(CHROMA_IDC_420, 2),
@@ -1030,14 +809,11 @@ mod tests {
             unsupported_shape(CHROMA_IDC_444, 0),
             Some("chroma other than 4:2:0")
         );
-        // Depth is reported FIRST when both are wrong: it is the one that silently
-        // mis-scales rather than merely mis-siting, so it is the more useful diagnosis.
+        // Depth first when both are wrong: mis-scale is worse than mis-siting.
         assert_eq!(
             unsupported_shape(CHROMA_IDC_444, 2),
             Some("10-bit or deeper")
         );
-        // And the refusal reaches a caller as the type the session keys its reconnect
-        // off, with a message that says which stream, not just "decode failed".
         let e: anyhow::Error = NoSoftwareRung {
             codec: punktfunk_core::quic::CODEC_AV1,
             shape: Some("10-bit or deeper"),
@@ -1049,14 +825,9 @@ mod tests {
         assert!(e.to_string().contains("8-bit 4:2:0 only"), "{e}");
     }
 
-    /// The 709-full fixture must be ABLE to fail on the range axis. It could not before
-    /// the M8 review — every bar was saturated, so a limited↔full mismatch only pushed
-    /// values past the shader's clamp and the decode came back byte-perfect with the
-    /// WRONG range honoured.
-    ///
-    /// Guards the fixture, not the code: if `BARS` ever loses its mid-tone (or a
-    /// regeneration drops the ninth bar), the range half of the test above goes vacuous
-    /// and this is what says so.
+    /// The 709-full fixture must be able to fail the range axis. Saturated
+    /// bars clamp a limited↔full mismatch; [`BARS`]'s mid-tone is what makes
+    /// the range half of the test above non-vacuous.
     #[test]
     fn the_full_range_fixture_is_decoded_wrong_by_the_wrong_range() {
         let f = decode_one(
@@ -1092,19 +863,12 @@ mod tests {
         );
     }
 
-    /// **B1.** A 10-bit AV1 stream must be REFUSED with the typed error, not errored on
-    /// per AU forever.
+    /// A 10-bit AV1 stream must be [`NoSoftwareRung`], not a per-AU `Err`.
+    /// rav1d `bitdepth_8` refuses with `ENOPROTOOPT`; a generic `anyhow` looks
+    /// survivable (keyframe, next AU still 10-bit, freeze). Hardware AV1 + HDR
+    /// is Main 10, so a mid-session demotion lands here.
     ///
-    /// This is the shipping case, not a corner: AV1 is advertised only where hardware AV1
-    /// exists, hardware AV1 + HDR is Main 10, and a mid-session hardware failure demotes
-    /// onto this rung. rav1d is built `bitdepth_8`, so its frame setup refuses with
-    /// `ENOPROTOOPT`; before the review that surfaced as a generic `anyhow` the pump read
-    /// as survivable — keyframe requested, next AU identically 10-bit, screen frozen for
-    /// the rest of the session with no fallback.
-    ///
-    /// The fixture is a whole 10-bit AV1 temporal unit (SVT-AV1, 64x64 red, one key
-    /// frame) inline rather than on disk: 38 bytes, and what is being tested is the
-    /// SEQUENCE HEADER inside it.
+    /// 38-byte 10-bit temporal unit inline; the sequence header is the test.
     #[test]
     fn a_10bit_av1_stream_is_refused_with_the_typed_no_rung_error() {
         const TU_10BIT: [u8; 38] = [
@@ -1123,12 +887,9 @@ mod tests {
         );
         assert_eq!(typed.codec, punktfunk_core::quic::CODEC_AV1);
         assert_eq!(typed.shape, Some("10-bit or deeper"));
-        // ...and the session layer's rule reads it as a SHAPE loss, so the retry is not
-        // narrowed to codecs with a CPU rung.
+        // `RungLoss::Shape`: the retry is not narrowed to codecs with a CPU rung.
         assert_eq!(typed.loss(), crate::video::RungLoss::Shape);
-        // Every following AU raises the same refusal rather than the decoder wedging:
-        // the pump breaks out on the first one, but a stuck loop here is the failure
-        // mode, so prove it stays a refusal.
+        // Same refusal on the next AU; a wedge here is the failure mode.
         assert!(dec
             .decode(&TU_10BIT)
             .err()
@@ -1136,20 +897,11 @@ mod tests {
             .is_some());
     }
 
-    /// **The rung must never open rav1d with one frame context.**
+    /// Never open rav1d with one frame context.
     ///
-    /// With `n_fc == 1`, rav1d 1.1.0 `abort()`s the whole client on ANY decode error:
-    /// `rav1d_submit_frame`'s single-frame-context branch runs `rav1d_decode_frame`, whose
-    /// `rav1d_decode_frame_exit` unconditionally takes `f.frame_hdr`, and then — only if
-    /// the decode failed — calls an `on_error` that opens with
-    /// `f.frame_hdr.as_ref().unwrap()`. The panic crosses `dav1d_send_data`'s `extern "C"`
-    /// frame as `panic_cannot_unwind`, so nothing in this crate can catch it: not the
-    /// pump's survivable-error arm, not a rung demotion, not a `NoSoftwareRung` refusal.
-    /// Reproduced on .21 on 2026-08-07 with a 4K60 AV1 capture, twice.
-    ///
-    /// The assertion is rav1d's OWN `n_fc` (`dav1d_get_frame_delay` is literally
-    /// `get_num_threads`' answer), not a re-derivation of it here, so it also holds if
-    /// rav1d changes how the number is computed.
+    /// `n_fc == 1` makes rav1d `abort()` on any decode error: a panic inside
+    /// `extern "C"` `dav1d_send_data`. Nothing in this crate can catch it.
+    /// Asserted against rav1d's own `n_fc` (`dav1d_get_frame_delay`).
     #[test]
     fn the_av1_rung_never_opens_rav1d_with_a_single_frame_context() {
         let mut s = av1_settings();
@@ -1161,20 +913,13 @@ mod tests {
             s.n_threads,
             s.max_frame_delay,
         );
-        // ...and the constructor refuses rather than opening such a decoder, so a machine
-        // whose settings somehow land there loses the rung instead of the process.
+        // Constructor refuses such a decoder: lose the rung, not the process.
         assert!(Av1Software::new().is_ok());
     }
 
-    /// ⚠ The trap that makes the setting above look like a one-liner when it is two.
-    ///
-    /// `n_fc = min(max_frame_delay, n_threads)`, so `max_frame_delay = 2` on its own is NOT
-    /// enough: one decode thread drags `n_fc` back to 1 and reinstates the abort. Measured
-    /// on .21 — `n_threads=1, max_frame_delay=2` aborted on the same capture that
-    /// `n_threads=8, max_frame_delay=2` survives — which is also the datapoint that rules
-    /// out "the tile workers are the trigger": fewer threads made it worse, not better.
-    ///
-    /// Asserted against rav1d's own arithmetic so it cannot rot into folklore.
+    /// `n_fc = min(max_frame_delay, n_threads)`. `max_frame_delay = 2` alone
+    /// is not enough: one decode thread sets `n_fc` back to 1 and restores
+    /// the abort. Asserted against rav1d's own arithmetic.
     #[test]
     fn one_decode_thread_would_put_the_rung_back_on_the_aborting_path() {
         let mut one_thread = av1_settings();
@@ -1184,14 +929,13 @@ mod tests {
             1,
             "n_fc is min(max_frame_delay, n_threads) — this is why n_threads has a floor"
         );
-        // And the floor in `av1_settings` is what keeps the shipping config off it.
+        // `av1_settings` floors `n_threads` so shipping stays off that path.
         assert!(av1_settings().n_threads >= AV1_MIN_FRAME_CONTEXTS);
     }
 
-    /// The AV1 leg decodes a real stream and reports the sequence header's own colour.
-    /// Fixture: the vendored cros-codecs AV1 vector (IVF), whose first temporal unit is a
-    /// key frame — enough to prove the rav1d FFI (open → send → get → unref → close),
-    /// the I420 plane copy and the colour read, none of which the H.264 leg exercises.
+    /// Decode a real AV1 stream and report the sequence header's colour.
+    /// Fixture: vendored cros-codecs IVF; first TU is a key frame. Covers
+    /// rav1d FFI, I420 copy, and colour — none of which the H.264 leg hits.
     #[test]
     fn software_av1_decodes_and_reports_its_sequence_colour() {
         const IVF: &[u8] = include_bytes!(
@@ -1202,10 +946,8 @@ mod tests {
         let mut dec = SoftwareDecoder::new(punktfunk_core::quic::CODEC_AV1).expect("av1 decoder");
         let mut first = None;
         let (mut units, mut frames) = (0u32, 0u32);
-        // Drive the WHOLE vector, not just the first unit: the send loop runs once per
-        // temporal unit and its `Dav1dData` guard drops on every path through it, so a
-        // leak or a wedge shows up as the run failing rather than as a slow drift nobody
-        // reproduces.
+        // Whole vector: send loop + `Dav1dData` drop once per TU, so a leak or
+        // wedge fails the run instead of drifting.
         while off + 12 <= IVF.len() {
             let sz = u32::from_le_bytes(IVF[off..off + 4].try_into().unwrap()) as usize;
             off += 12;
@@ -1225,24 +967,19 @@ mod tests {
             units > 100,
             "expected the full 25 fps vector, got {units} units"
         );
-        // ⚠ This equality is also the LATENCY guard for the two-frame-context config.
-        // rav1d with `n_fc = 2` pipelines by default: `dav1d_get_picture` answers `EAGAIN`
-        // once after each send and only reaches its blocking drain on the call after that.
-        // A `decode` that stopped at the first `EAGAIN` would still decode every frame
-        // eventually — it would just hand each one back two AUs late, and `frames` would
-        // come up exactly `n_fc` short of `units` here. So this line is what says the drain
-        // loop still returns THIS AU's picture in THIS call.
+        // Latency guard for `n_fc = 2`. Stopping `get_picture` at the first
+        // `EAGAIN` still decodes every frame, two AUs late, and `frames` would
+        // be `n_fc` short of `units`. Equality means this AU's picture returned
+        // in this call.
         assert_eq!(frames, units, "every temporal unit here shows a picture");
         let f = first.expect("no AV1 frame decoded");
         assert_eq!((f.width, f.height), (320, 240));
         assert!(f.keyframe, "the first temporal unit is a key frame");
-        // The vector signals nothing, so E.2.1-equivalent "unspecified" (2) must come
-        // through UNTOUCHED — `csc_rows` is what resolves it to the BT.709 SDR default,
-        // and a decoder that resolved it early would make an in-band HDR flip invisible.
+        // Unspecified (2) must survive: `csc_rows` maps it to BT.709 SDR.
+        // Resolving early would hide an in-band HDR flip.
         assert_eq!(f.color.matrix, 2, "unspecified matrix must survive as 2");
         assert!(!f.color.full_range);
-        // Planes are tightly packed at the picture's own size — the presenter uploads
-        // them with no stride, so this invariant is load-bearing, not cosmetic.
+        // Tightly packed at picture size: the presenter uploads with no stride.
         assert_eq!(f.plane(0).len(), (f.width * f.height) as usize);
         let (cw, ch) = CpuPlanarFrame::chroma_dims(f.width, f.height);
         assert_eq!(f.plane(1).len(), (cw * ch) as usize);

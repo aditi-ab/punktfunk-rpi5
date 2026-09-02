@@ -1,61 +1,38 @@
-//! The native audio plane (plan §W1 — carved out of the [`super`] module): desktop capture →
-//! either
+//! Native audio plane: desktop capture → Opus (`AUDIO_MAGIC` / `AUDIO_RED_MAGIC`) or lossless
+//! PCM (`AUDIO_PCM_MAGIC`) at the negotiated channel count. Opus is 48 kHz, 5 ms, constrained
+//! VBR at [`AudioTier`](punktfunk_core::audio::AudioTier). PCM covers both rate families
+//! (44.1/48/88.2/96/176.4 kHz), 16/24-bit, and a negotiated frame duration — see
+//! `design/hi-res-audio.md`.
 //!
-//! - **Opus** (48 kHz, 5 ms, constrained VBR at the configured
-//!   [`AudioTier`](punktfunk_core::audio::AudioTier)) → `AUDIO_MAGIC` QUIC datagrams, or
-//!   `AUDIO_RED_MAGIC` when the session negotiated redundancy — the default and the fallback; or
-//! - **lossless PCM** (both rate families — 44.1/48/88.2/96/176.4 kHz — 16/24-bit, any negotiated
-//!   channel count, a negotiated frame duration) → `AUDIO_PCM_MAGIC` datagrams, when the
-//!   handshake's §8.4 gate resolved the hi-res plane (`design/hi-res-audio.md`).
-//!
-//! …at the negotiated channel count. Which plane a session runs is decided ONCE, at handshake,
-//! and never switches underneath the client: its output device is open at a fixed rate, so a
-//! change would mean a re-open (§6). The encoder ([`NativeAudioEnc`]) and the
-//! capture/encode/send loop ([`audio_thread`]) are gated to linux/windows (libopus + a real
-//! capturer); other targets get the stub, so a dev build streams video-only rather than failing
-//! to compile.
-//!
-//! Two things here deliberately DIVERGE from the GameStream plane, which used to share this
-//! tuning: hard CBR (its audio FEC needs fixed-size packets; this plane has no FEC, so CBR was a
-//! pure quality tax) and the fixed 128 kbps stereo bitrate. See [`NativeAudioEnc::new`].
+//! The plane is chosen once at handshake and never switches: the client's output device is
+//! open at a fixed rate. [`NativeAudioEnc`] and [`audio_thread`] compile on linux/windows
+//! (libopus + a real capturer); other targets get the stub so a dev build streams video-only.
+//! Unlike GameStream this path has no FEC, so it uses constrained VBR rather than hard CBR —
+//! see [`NativeAudioEnc::new`].
 
 use super::*;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use punktfunk_core::audio::pcm;
 
-/// The audio plane's wire clock — the `pts_ns` every datagram is stamped with.
+/// Wire clock: `pts_ns` is an anchor plus a running total of interleaved samples.
 ///
-/// An **anchor plus a running total of interleaved samples**, not an accumulator advanced once per
-/// frame. That shape is the whole point:
+/// `frame_us` is a label. `pcm::samples_per_frame` floors, so a rung is a real duration only
+/// when the rate divides it — every rung divides the 48 kHz family; none of the seven divides
+/// 44 100 Hz. A "5 ms" frame at 44 100 Hz is 220 samples/ch = 4 988 662 ns. Stamping
+/// `pts += frame_us * 1000` runs **2 268 ppm fast** (2.3 ms/s invented) for the session.
 ///
-/// ⚠⚠ **The negotiated `frame_us` is a LABEL, not a duration.** A frame carries a whole number of
-/// samples PER CHANNEL, and `pcm::samples_per_frame` floors — so a rung is a real duration only
-/// when the rate divides it. Every rung divides the 48 kHz family; **none of the seven divides
-/// 44 100 Hz**, 88 200 divides only 5 000 µs and 176 400 only 5 000 and 2 500. A "5 ms" frame at
-/// 44 100 Hz is 220 samples per channel — `frame_duration_ns` of it is 4 988 662 ns, not
-/// 5 000 000. Stamping `pts += frame_us * 1000` therefore runs the clock **2 268 ppm fast**: 2.3
-/// ms of invented time every second, for the life of the session.
-///
-/// ⚠ And it is not self-correcting. [`reanchor`](Self::reanchor) only ever moves the clock
-/// FORWARD (a capture arrival must not un-send frames already on the wire), so a clock running
-/// slow is pulled up by the next chunk while a clock running fast is never pulled back by
-/// anything. The client's A/V sync loop then chases a drift manufactured at the source, and every
-/// stat agrees with it, because the timestamps are self-consistent and simply wrong.
-///
-/// Counting samples cannot drift: the sample count IS the frame. A running total beats even a sum
-/// of per-frame `frame_duration_ns` values — that sum accumulates just under 1 ns per frame
-/// (~0.2 µs/s, irrelevant next to 2.3 ms/s, but not nothing), while this accumulates zero.
+/// [`reanchor`](Self::reanchor) only moves FORWARD (must not un-send frames already on the
+/// wire), so a fast clock is never pulled back. Counting samples cannot drift. A running
+/// total also beats summing per-frame `frame_duration_ns` (~1 ns/frame remainder); this
+/// accumulates zero.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 struct PtsClock {
-    /// Wall-clock nanoseconds the current run of samples is measured from.
     base_ns: u64,
-    /// Interleaved samples charged to the clock since [`base_ns`](Self::base_ns).
     samples: usize,
     rate_hz: u32,
     channels: u8,
-    /// Interleaved samples in one second — the fold factor [`advance`](Self::advance) uses to keep
-    /// `samples` bounded. Precomputed: it is a property of the plane, not of a frame.
+    /// Fold factor for [`advance`](Self::advance): interleaved samples in one second.
     samples_per_sec: usize,
 }
 
@@ -71,19 +48,17 @@ impl PtsClock {
         }
     }
 
-    /// The pts of the NEXT frame to leave, real or synthesized.
+    /// Pts of the NEXT frame to leave, real or synthesized.
     fn pts_ns(&self) -> u64 {
         self.base_ns + pcm::frame_duration_ns(self.samples, self.rate_hz, self.channels)
     }
 
-    /// Charge one frame of `samples` interleaved samples: it has left the host.
     fn advance(&mut self, samples: usize) {
         self.samples += samples;
-        // Fold whole seconds into the base so a long session cannot grow the total without bound
-        // (`frame_duration_ns` takes a `usize`, which is 32 bits on some targets, and 176 400 Hz
-        // 7.1 is 1.4 M samples a second). EXACT, so the fold is invisible to `pts_ns`:
-        // `rate_hz × channels` interleaved samples are 1 000 000 000 ns at every rate this plane
-        // carries, with no remainder to round away.
+        // Fold whole seconds into the base: `frame_duration_ns` takes a `usize` (32-bit on
+        // some targets; 176 400 Hz 7.1 is 1.4 M samples/s). Exact — `rate_hz × channels`
+        // interleaved samples are 1 000 000 000 ns at every rate this plane carries, so the
+        // fold is invisible to `pts_ns`.
         if self.samples_per_sec > 0 && self.samples >= self.samples_per_sec {
             let secs = self.samples / self.samples_per_sec;
             self.base_ns += secs as u64 * 1_000_000_000;
@@ -93,10 +68,9 @@ impl PtsClock {
 
     /// Re-anchor on a capture arrival — **forward only**.
     ///
-    /// Infilled frames advanced the wire clock while capture was away, and an anchor re-derived
-    /// from a chunk's arrival can land at or before the last frame already sent; moving back would
-    /// re-issue a pts the client has already played. Re-anchoring restarts the running total,
-    /// because the new base already describes everything the old base plus its samples did.
+    /// Infill may have already advanced the wire clock; an arrival-derived anchor can land at
+    /// or before the last sent pts. Moving back would re-issue a pts the client has played.
+    /// Restarts the running total: the new base already covers the old base plus its samples.
     fn reanchor(&mut self, anchor_ns: u64) {
         if anchor_ns > self.pts_ns() {
             self.base_ns = anchor_ns;
@@ -105,9 +79,8 @@ impl PtsClock {
     }
 }
 
-/// Opus encoder for the native audio plane: a plain stereo encoder (the live-validated,
-/// byte-identical path) or a libopus *multistream* encoder for 5.1/7.1, both behind one
-/// `encode_float`. Surround uses the safe `opus::MSEncoder` (no `audiopus_sys`).
+/// Opus encoder: stereo (`opus::Encoder`) or 5.1/7.1 multistream (`opus::MSEncoder`), both
+/// behind one `encode_float`. Surround uses the safe wrapper, not `audiopus_sys`.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 enum NativeAudioEnc {
     Stereo(opus::Encoder),
@@ -116,19 +89,13 @@ enum NativeAudioEnc {
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl NativeAudioEnc {
-    /// Build the encoder for `channels` (2/6/8) at `tier`, RESTRICTED_LOWDELAY like the GameStream
-    /// path but — unlike it — in CONSTRAINED VBR.
+    /// Encoder for `channels` (2/6/8) at `tier`, `LowDelay`, constrained VBR.
     ///
-    /// **Why not hard CBR (WP1.2).** The layout table's comment justifies `set_vbr(false)` with
-    /// "constant packet size, which GameStream's audio FEC relies on" — true of the GameStream
-    /// plane, and irrelevant here: the native `punktfunk/1` audio plane has no FEC at all (see
-    /// `punktfunk_core::audio::AudioGapTracker`, which exists precisely because a lost packet has
-    /// nothing to rebuild it from). So this path was paying a pure quality tax for a constraint
-    /// that does not apply to it. Constrained VBR keeps the same average bitrate and the same
-    /// bounded packet size, and spends the bits where the signal needs them.
-    ///
-    /// The GameStream encoder (`crate::gamestream::audio`) is deliberately NOT changed: its FEC
-    /// really does need fixed-size packets.
+    /// GameStream uses hard CBR because its audio FEC needs fixed-size packets. This plane
+    /// has no FEC (`punktfunk_core::audio::AudioGapTracker` exists because a lost packet has
+    /// nothing to rebuild it from), so CBR would be a quality tax. Constrained VBR keeps the
+    /// same average bitrate and a bounded packet size. Do not change the GameStream encoder:
+    /// its FEC still needs fixed-size packets.
     fn new(
         channels: u8,
         tier: punktfunk_core::audio::AudioTier,
@@ -168,14 +135,12 @@ impl NativeAudioEnc {
     }
 }
 
-/// The audio thread: desktop capture → the session's resolved audio plane (Opus on
-/// `AUDIO_MAGIC`/`AUDIO_RED_MAGIC`, or lossless PCM on `AUDIO_PCM_MAGIC`) at the negotiated
-/// `channels` (2 stereo / 6 = 5.1 / 8 = 7.1, canonical wire order FL FR FC LFE RL RR SL SR).
-/// QUIC already encrypts; no extra layer. The capturer comes from (and returns to) the persistent
-/// slot — see [`AudioCapSlot`].
+/// Desktop capture → the session's resolved plane (Opus on `AUDIO_MAGIC`/`AUDIO_RED_MAGIC`,
+/// or PCM on `AUDIO_PCM_MAGIC`) at negotiated `channels` (2 / 6 = 5.1 / 8 = 7.1, wire order
+/// FL FR FC LFE RL RR SL SR). Capturer comes from and returns to [`AudioCapSlot`].
 ///
-/// `plane` is the format the `Welcome` states — read back off it by the caller, never recomputed,
-/// so the wire the client was promised and the wire we send cannot disagree.
+/// `plane` is the format `Welcome` stated — read back by the caller, never recomputed, so
+/// the promised wire and the sent wire cannot disagree.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(super) fn audio_thread(
     conn: quinn::Connection,
@@ -184,11 +149,9 @@ pub(super) fn audio_thread(
     channels: u8,
     budget: punktfunk_core::audio::AudioBudget,
     plane: super::handshake::AudioPlane,
-    // An ISOLATED session's own sink name (`design/gamescope-multiuser.md`): capture opens against
-    // this exact sink (the one the session's gamescope apps are `PULSE_SINK`-pinned to) and stays
-    // out of the shared park slot entirely — a parked shared capturer has the wrong sink, and a
-    // parked isolated one would hand this session's name to the next session. `None` = the shared
-    // path, byte-for-byte today's behavior. Linux-only in effect.
+    // Isolated session sink (`design/gamescope-multiuser.md`): open this exact sink and skip
+    // the shared park slot. A parked shared capturer has the wrong sink; parking an isolated
+    // one would hand this session's name to the next. `None` = shared path. Linux-only.
     sink: Option<String>,
 ) {
     use crate::audio::SAMPLE_RATE;
@@ -201,15 +164,10 @@ pub(super) fn audio_thread(
     /// re-anchors. Chasing an old schedule after a stall would send a burst — the exact thing
     /// pacing exists to prevent — so past this point the debt is forgiven, not repaid.
     const PACE_REANCHOR: std::time::Duration = std::time::Duration::from_millis(100);
-    /// How much audio is faded at each edge of a capture hole — out into the hole, in out of
-    /// it — in µs. One millisecond: long enough to be a slope rather than an edge, far too short
-    /// to read as a swell. See `last_real` / `resume_fade` below.
+    /// Fade at each edge of a capture hole, in µs. 1 ms is a slope, not an edge, and too
+    /// short to read as a swell. See `last_real` / `resume_fade`.
     const EDGE_FADE_US: u64 = 1_000;
     let want = punktfunk_core::audio::normalize_channels(channels);
-    // The three session values that used to be compile-time constants. Every one of them is now
-    // a property of the negotiated plane, and everything downstream — the pacer, the sample
-    // clock, the capture open, the scratch buffers — is derived from these rather than from
-    // `SAMPLE_RATE`/`FRAME_MS` directly.
     let pcm_plane = plane.is_pcm();
     let rate_hz = if pcm_plane {
         plane.rate_hz
@@ -217,73 +175,37 @@ pub(super) fn audio_thread(
         SAMPLE_RATE
     };
     let bits = plane.bits;
-    // Opus is the fixed 5 ms of `0xC9`; the PCM plane's duration was negotiated from the
-    // connection's datagram size. The `max(1)` is a floor against a malformed plane rather than a
-    // real case — the §8.4 gate never produces a PCM plane with a zero frame — but a zero here
-    // would divide the pacer by nothing and produce empty frames at infinite rate.
+    // Opus is the fixed 5 ms of `0xC9`; PCM's duration was negotiated from datagram size.
+    // `max(1)`: a zero frame would divide the pacer by nothing and emit empty frames at
+    // infinite rate.
     let frame_us: u32 = if pcm_plane {
         (plane.frame_us as u32).max(1)
     } else {
         FRAME_MS as u32 * 1000
     };
-    // Interleaved samples in one protocol frame, derived from the negotiated rate and frame
-    // duration rather than from a constant. THE single source of truth for how long a frame is —
-    // the client's ring drains exactly this many, so both ends agree by construction rather than
-    // by re-deriving `rate × µs` and hoping they round the same way (`pcm::samples_per_frame`).
-    //
-    // ⚠ Exact only on the 48 kHz family. Every ladder rung divides 48 000 and 96 000 into whole
-    // samples per channel; **none of them divides 44 100**, and 88 200/176 400 divide only the
-    // longest one or two. On those rates this FLOORS, so a frame is up to one sample per channel
-    // shorter than the rung it is labelled with — safe for sizing (the payload can only shrink
-    // inside its datagram) and wrong for timing, which is why the pts below is stamped from
-    // `frame_duration_ns` and not from `frame_us`.
+    // Interleaved samples in one protocol frame (`pcm::samples_per_frame`). Exact on the
+    // 48 kHz family; floors on 44.1 / 88.2 / 176.4, so a frame is up to one sample/ch short
+    // of its label. Safe for sizing; wrong for timing — stamp pts from `frame_duration_ns`,
+    // not `frame_us`.
     let frame_len = pcm::samples_per_frame(rate_hz, frame_us, want);
-    // One protocol frame of wall time — the cadence paced sends aim for. A `let`, not a const:
-    // the PCM plane's frames are shorter than 5 ms whenever the format does not fit a datagram
-    // at that length (§4.2), and a 96/24 session paces 500 of them a second.
-    //
-    // Measured from the frame's REAL sample count for the same reason the pts is, even though the
-    // consequence here is far smaller: this only decides when the loop next looks for work, and
-    // every release is additionally gated on `acc` actually holding a frame, so a rung-length
-    // interval would produce a slot the pacer waits out rather than time it invents. Cosmetic or
-    // not, two clocks describing the same frame must not disagree — a 0.23 % gap between them is
-    // exactly the kind of thing a later reader reconciles in the wrong direction. On the 48 kHz
-    // family this is bit-identical to `from_micros(frame_us)`.
-    //
-    // The `max(1)` guards the same malformed-plane case `frame_us` does above: a sub-microsecond
-    // rung would floor `frame_len` to zero samples and leave the pacer with a zero interval to
-    // spin on. The §8.4 gate never produces one (the shortest ladder rung is 1 000 µs).
+    // One protocol frame of wall time, from the real sample count so this clock and pts
+    // agree (0.23 % apart on 44.1 kHz). `max(1)`: a zero interval would spin the pacer;
+    // shortest ladder rung is 1 000 µs.
     let frame_interval =
         std::time::Duration::from_nanos(pcm::frame_duration_ns(frame_len, rate_hz, want).max(1));
-    // Same boost the video capture/encode loop takes, and this thread needs it MORE: it paces
-    // 5 ms datagrams, so a scheduling stall here is directly audible where a late video frame
-    // is one presentation slip. The 2026-08-14 field log's stutter was exactly this thread
-    // descheduled by fresh-game-launch shader storms — it carried no priority at all.
+    // Same boost as the video loop; this thread needs it more: a stall on 5 ms datagrams
+    // is a click, not a presentation slip.
     pf_frame::thread_qos::boost_thread_priority(true);
-    // Tier and redundancy are ONE decision, budgeted against the session's video bitrate — see
-    // `handshake::audio_budget`. An unparseable `audio.quality` was already warned about there
-    // and fell back to the default, so nothing here can silently downgrade someone's audio.
-    //
-    // Redundancy is FORCED off on the lossless plane (§4.5): `0xD2` is not defined for `0xD3`,
-    // there is no PCM-side decoder that would receive it, and doubling a 1.4–33.9 Mbps plane is
-    // absurd on its face. The handshake already refuses to grant both bits together, so this is
-    // a second lock on the same door — cheap, and it means no future change to the budget ladder
-    // can switch redundancy on behind this branch.
+    // Tier and redundancy come from `handshake::audio_budget`. Forced off on PCM: `0xD2`
+    // is not defined for `0xD3`, there is no PCM decoder for it, and doubling a 1.4–33.9
+    // Mbps plane is not a budget. Handshake already refuses both bits; this is the send-side
+    // lock so a budget-ladder change cannot turn redundancy on here.
     let (tier, redundancy) = (budget.tier, budget.redundancy && !pcm_plane);
 
-    // Reuse the cached capturer ONLY when its channel count AND rate match this session's; a
-    // stereo capturer left by a prior session must not feed a 5.1/7.1 session (the encoder + the
-    // client's decoder are sized for `want`, so a mismatched capturer would garble/desync the
-    // audio), and a 48 kHz one must not feed a 96 kHz session — the frame arithmetic below is
-    // denominated in the negotiated rate, so a mismatch there is a pitch shift plus a sample
-    // clock that drifts against the wire clock at exactly the ratio of the two rates.
-    // A FAILED first open does not end the session's audio: session start is peak endpoint churn
-    // on Windows (the virtual-display attach and the wiring plan's own default-device flips race
-    // the WASAPI activate — 0x80070002 mid-re-registration), so it enters the same
-    // reopen-with-backoff loop a mid-session capture death does; audio then starts a few seconds
-    // late instead of never.
-    // An isolated session never adopts the parked shared capturer (the channel/rate test below
-    // cannot see that it captures the WRONG sink) — it opens its own, named.
+    // Reuse the parked capturer only when channels AND rate match: a mismatch garbles the
+    // encoder and drifts the sample clock against the wire. Isolated sessions never adopt
+    // the parked shared capturer (the match cannot see the wrong sink). A failed first open
+    // enters the same reopen-with-backoff loop as a mid-session death.
     let cached = if sink.is_none() {
         audio_cap.lock().unwrap().take()
     } else {
@@ -295,7 +217,7 @@ pub(super) fn audio_thread(
             Some(c)
         }
         prev => {
-            drop(prev); // wrong channel count/rate (or none): clean teardown, open fresh
+            drop(prev);
             match crate::audio::open_audio_capture_named(want as u32, rate_hz, sink.as_deref()) {
                 Ok(c) => Some(c),
                 Err(e) => {
@@ -323,11 +245,9 @@ pub(super) fn audio_thread(
         }
     };
 
-    // Operator capture gain, soft-limited (`PUNKTFUNK_AUDIO_GAIN`, default 1.0 = untouched). This
-    // plane had NO gain at all until now, so `PUNKTFUNK_AUDIO_GAIN` silently did nothing on
-    // punktfunk/1 while working on GameStream — and since WASAPI loopback taps upstream of the
-    // endpoint's master volume, there was no other host-side way to lift a quiet desktop mix.
-    // Read once per session rather than per frame: this is an operator setting, not a live control.
+    // Operator capture gain (`PUNKTFUNK_AUDIO_GAIN`, default 1.0). WASAPI loopback taps
+    // upstream of the endpoint master volume, so this is the host-side lift. Read once:
+    // operator setting, not a live control.
     let gain = crate::audio::capture_gain();
     if gain != 1.0 {
         tracing::info!(
@@ -338,111 +258,56 @@ pub(super) fn audio_thread(
         );
     }
     let mut acc: Vec<f32> = Vec::with_capacity(frame_len * 4);
-    // The frame currently being encoded. Reused rather than collected fresh each time: it is
-    // filled from `acc` on the normal path and padded out with silence on the infill path, and
-    // one buffer covers both without allocating 200 times a second.
     let mut frame_buf: Vec<f32> = Vec::with_capacity(frame_len);
-    // Sized for the largest surround frame (7.1 HQ ≈ 1.3 KB at 5 ms); ample for normal quality.
-    // Empty on the PCM plane, which has no Opus encoder to write into it.
+    // 4096 covers 7.1 HQ ≈ 1.3 KB at 5 ms. Empty on PCM: no Opus encoder writes here.
     let mut opus_buf = vec![0u8; if pcm_plane { 0 } else { 4096 }];
-    // The PCM plane's own scratch. Sized EXACTLY — `frame_payload_bytes` is not an estimate but
-    // the size every frame has, and the 4 KB Opus guess would be both too small for 96/24 at the
-    // longest rungs and meaningless as a bound. `from_f32` appends, so this is cleared per frame
-    // and never reallocates after the first.
+    // Exact payload size — `from_f32` appends, so clear per frame. A 4 KB Opus guess is
+    // too small for 96/24 at the longest rungs.
     let mut pcm_wire: Vec<u8> = if pcm_plane {
         Vec::with_capacity(pcm::frame_payload_bytes(rate_hz, bits, want, frame_us))
     } else {
         Vec::new()
     };
     let mut seq: u32 = 0;
-    // W-B1 — whether the wire covers a capture hole with silence, and for how long. See
-    // [`InfillPolicy`]: before this, a hole meant the loop simply blocked in `next_chunk` and
-    // NOTHING left the host for its duration, so the client's ring drained → underran →
-    // de-primed → re-primed, and a 30 ms hole became a much longer audible artifact.
-    //
-    // Built from THIS session's frame, like the pacer above it. Both of the policy's figures used
-    // to be written against the Opus 5 ms frame — correct for as long as 5 ms was the only frame
-    // there was, and off by up to 5× on the lossless plane, whose frames are shorter by
-    // construction (§4.2).
+    // Cover capture holes with silence. Built from this session's `frame_us`: PCM frames
+    // can be 1 ms, so Opus's 5 ms constants would be off by up to 5×. See [`InfillPolicy`].
     let mut infill = crate::audio::capture_policy::InfillPolicy::new(frame_us);
     let mut last_chunk_at = std::time::Instant::now();
     // Nothing may be synthesized before the first real frame: there is no continuity to protect
     // yet, and the wire clock has no anchor to continue from.
     let mut sent_any = false;
-    // The two EDGES of a hole. The infill used to be digital zero from its first sample, and
-    // zero is not the absence of sound — it is a step from whatever level the last real sample
-    // sat at down to nothing, which the listener hears as a click at the front of every hole
-    // (and which the codec faithfully encodes); the audio then resumes mid-waveform, a second
-    // step. The Skynet field host opens ~2 such holes a second. So the first synthesized frame
-    // fades the audio OUT over `EDGE_FADE_US` and the first real frame after the hole fades it
-    // back IN over the same span, both on the same raised cosine — a crossfade through silence
-    // rather than a step at each end. `last_real` is what the fade-out is built from when a hole
-    // opens on an empty partial (nothing of the pre-hole audio left in hand to fade).
+    // Fade out into a hole and fade in after it (`EDGE_FADE_US`, raised cosine). Digital
+    // zero is a step from the last real sample — a click. `last_real` is the fade-out
+    // source when the hole opens on an empty partial.
     let mut last_real: Vec<f32> = Vec::with_capacity(frame_len);
     let mut resume_fade = false;
-    // In interleaved samples: `frames × channels`, so the curve spans whole frames. (Adjacent
-    // channels of one frame land one step apart on the curve — a 1/n gain difference, nothing at
-    // any fade longer than a few frames.)
+    // Interleaved: `frames × channels` so the curve spans whole frames.
     let edge_fade_samples = (rate_hz as u64 * EDGE_FADE_US / 1_000_000) as usize * want as usize;
-    // Backlog above which a slot sends TWO frames — see the bonus arm in the loop below. Sized
-    // from the largest capture chunk this session has actually seen (the graph's quantum, or a
-    // VM's clamped 1024 frames), plus one full protocol frame: anything up to that is a chunk
-    // being paced out, anything past it is audio that arrived faster than the schedule sends.
+    // Bonus-send threshold: observed capture quantum plus one protocol frame. Up to that
+    // is a chunk being paced out; past it, audio arrived faster than the schedule.
     let mut max_chunk_len: usize = 0;
-    // Reopen-with-backoff: hold the capturer in an Option so a mid-session capture-thread death
-    // (device unplug, daemon restart) — or a first open lost to session-start churn above —
-    // reopens instead of muting the rest of a multi-hour session. A quiet sink is NOT a death —
-    // `next_chunk` returns an empty chunk on its idle timeout — so only a genuine thread-ended
-    // Err drops the capturer. Reopens are throttled by INJECTOR_REOPEN_BACKOFF. The Opus encoder
-    // and the monotonic `seq` are kept across reopens (the client sees a gap, not a restart).
+    // Reopen on capture-thread death (or a failed first open). Empty chunks from a quiet
+    // sink are not death. Encoder and `seq` survive reopens so the client sees a gap, not
+    // a restart. Throttled by `INJECTOR_REOPEN_BACKOFF`.
     let mut last_failed = capturer.is_none().then(std::time::Instant::now);
     let mut capturer = capturer;
     // A stuck Opus encoder would fail on every 5 ms frame (~200/s); power-of-two throttle the
     // warn so it can't flood stderr + the log ring while still surfacing that it's failing.
     let mut opus_encode_errs: u64 = 0;
-    // WP3.1 — the previous frame's Opus bytes, for the redundant `0xD2` plane. Cleared whenever
-    // continuity breaks (a capture reopen), so we never advertise a predecessor the client's
-    // sequence numbering does not agree with.
+    // Previous Opus bytes for the redundant `0xD2` plane. Cleared when continuity breaks
+    // so we never advertise a predecessor the client's seq does not agree with.
     let mut prev_frame: Vec<u8> = Vec::new();
-    // W1.1/W1.2 — the audio SAMPLE clock, and the schedule frames leave on.
-    //
-    // `pts_ns` used to be `now_ns()` evaluated inside the drain loop below, which made it the
-    // instant we got round to ENCODING rather than the instant the samples were CAPTURED. Every
-    // frame carved out of one capture chunk therefore carried a near-identical timestamp, and the
-    // value drifted with encoder scheduling. That was harmless only for as long as nothing
-    // consumed it; a client-side A/V sync loop regulating against it would be regulating against
-    // a fiction, so this is a prerequisite for the whole overhaul, not a tidy-up.
-    //
-    // `pace_due` exists because a chunk is not a frame. A capture callback hands us a whole
-    // quantum (5 ms when the graph honours our ask, 21.3 ms on a VM that clamps it to 1024 —
-    // see `audio::linux`'s quantum warning), and the old loop drained all of it into
-    // back-to-back `send_datagram` calls. The wire then carried a 4-5 frame burst followed by
-    // ~21 ms of nothing, and a client ring can only absorb that by standing at least a burst
-    // period deep. Releasing frames on the audio clock instead costs no AVERAGE latency — the
-    // client was buffering those frames anyway — and removes the burst the ring was sized for.
-    // Uninitialised on purpose: every read is preceded by the re-anchor at the top of the chunk
-    // loop, and seeding it with a placeholder would just be a value the compiler correctly points
-    // out is never read.
-    //
-    // Seeded rather than left uninitialised now that infilled frames advance it too: it is the
-    // pts of the NEXT frame to leave, real or synthesized, and every send advances it by one
-    // frame. `sent_any` is what keeps the seed from ever reaching the wire. See [`PtsClock`] for
-    // why it counts SAMPLES rather than accumulating the negotiated frame length.
+    // Sample clock (see [`PtsClock`]) and the wall-clock send schedule. A capture quantum
+    // is not a frame: draining it into back-to-back datagrams bursts 4–5 frames then
+    // silence. `sent_any` keeps the seed off the wire until the first real send.
     let mut clock = PtsClock::new(rate_hz, want);
     let mut pace_due: Option<std::time::Instant> = None;
-    // WP-C — what the wire actually did, as opposed to what the tap handed us. See [`SendStats`]:
-    // until this existed the send path was the one stage of the audio pipeline that could not be
-    // ruled in or out from a field log.
-    //
-    // Built from this session's frame, like the pacer and the infill policy: its `late` counter is
-    // "missed its slot by a whole protocol frame", and the lossless plane's frame is as short as
-    // 1 ms. Against the Opus constant this session could miss every slot and still report zero.
+    // Wire-side counters. `late` is "missed the slot by a whole protocol frame"; PCM
+    // frames can be 1 ms, so an Opus 5 ms constant would miss every slot and report zero.
     let mut send_stats = crate::audio::capture_policy::SendStats::new(frame_us);
     let mut last_send_stats = std::time::Instant::now();
     let mut last_departure: Option<std::time::Instant> = None;
-    // §4.8 — datagrams the wire refused. Counted, not merely survived: an uncounted drop is what
-    // makes a field report un-triageable (the lesson WP0.2 wrote down for the capture side), and
-    // on the PCM plane there is no PLC to hide one.
+    // Datagrams the wire refused. Counted: PCM has no PLC to hide a drop.
     let mut oversized_drops: u64 = 0;
     // The Opus plane's capture-rate warning fires at most once per session — the condition is
     // re-tested a few hundred times a second, and it is a statement about the capturer, not an
@@ -451,9 +316,6 @@ pub(super) fn audio_thread(
     if capturer.is_some() {
         tracing::info!(
             channels = want,
-            // The plane this session actually runs, stated rather than assumed. The old line
-            // said "Opus 48 kHz, 5 ms datagrams" as a literal, which was true of every session
-            // that existed when it was written and is now one of four possible answers.
             plane = if pcm_plane { "0xD3 PCM" } else { "0xC9 Opus" },
             lossless = pcm_plane,
             rate_hz,
@@ -483,9 +345,8 @@ pub(super) fn audio_thread(
                     capturer = Some(c);
                     last_failed = None;
                     acc.clear(); // drop the partial frame straddling the gap
-                                 // The next frame has no valid predecessor across the gap: sending the
-                                 // pre-gap frame as "the previous one" would hand the client audio from
-                                 // before the discontinuity to splice in.
+                    // Predecessor is invalid across the gap: the client would splice pre-gap
+                    // audio onto the new stream.
                     prev_frame.clear();
                 }
                 Err(e) => {
@@ -496,45 +357,10 @@ pub(super) fn audio_thread(
                 }
             }
         }
-        // ⚠ Never ship a rate we did not get (`design/hi-res-audio.md` §9: "never claim a rate
-        // you did not get" — the rule is the same at both ends).
-        //
-        // **BELT AND BRACES, not the mechanism.** §8.4 condition 4 now asks the capture path what
-        // rate it can honestly deliver BEFORE the `Welcome` is built
-        // (`handshake::resolve_audio_plane` + `crate::audio::probe_capture_rate`), so the Windows
-        // §8.2 decline and the Linux §8.3 one both land as an ordinary "the session uses Opus
-        // 48 kHz" with a logged reason. This check is no longer how either of those is reached,
-        // and it is no longer expected to fire at all.
-        //
-        // What is left for it is the race the gate structurally cannot close: the probe reads the
-        // device, and the capture opens some milliseconds later. An endpoint whose format an
-        // operator changes in between, a hotplug that re-plans onto a different endpoint, or a
-        // graph that renegotiates mid-session all land here. That is a much smaller and much
-        // rarer set than "every 96 kHz request on a 48 kHz box", which is what it used to catch.
-        //
-        // The ACTION stays the same, because there is still only one correct one. The `Welcome`
-        // has already promised the client `rate_hz` and its output device is open at exactly
-        // that; every pts, every frame length and the client's whole de-jitter ring are
-        // denominated in it. We cannot switch the wire to Opus mid-session (§6 — a session runs
-        // one plane, and changing it means re-opening the client's device), and sending
-        // wrongly-clocked samples under the promised label is precisely the "label right, content
-        // wrong" failure this feature exists to avoid. So the lossless plane ENDS. What changed
-        // is the message: it no longer tells the operator to go and set a device rate, because
-        // the gate says that up front now — reaching here means something moved underneath a
-        // session the gate had already vetted.
-        //
-        // The Opus plane only WARNS, and deliberately: it is 48 kHz by definition, every
-        // capturer has always been asked for 48 kHz, and both backends resample to it rather
-        // than hand back something else. If one ever did, that has been true (and mis-clocked)
-        // for the plane's whole life — turning it into a session-ending condition here would
-        // risk silencing hosts that work today in order to police a case this pass did not
-        // introduce. Say it out loud instead; making it fatal is a decision for whoever has a
-        // reproduction.
-        //
-        // Checked every iteration rather than once at open, because the capturers do not all know
-        // their rate at open time: PipeWire's `param_changed` may land a moment after the ready
-        // handshake, and either backend can renegotiate mid-session. An atomic load a few hundred
-        // times a second costs nothing next to the encode.
+        // Never send a rate we did not get (`design/hi-res-audio.md`). Probe-then-open is a
+        // race (hotplug, format change, renegotiate). PCM ends: the client is open at
+        // `rate_hz` and the plane cannot switch. Opus only warns — 48 kHz, capturer resamples.
+        // Checked every iteration: PipeWire may not know its rate at open.
         let live_rate = capturer.as_ref().unwrap().sample_rate();
         if live_rate != rate_hz {
             if pcm_plane {
@@ -559,21 +385,16 @@ pub(super) fn audio_thread(
                 );
             });
         }
-        // Wake on whichever comes first: a capture chunk, or the moment the wire next has
-        // something to say. Waiting only on capture is what made a hole cost more than the audio
-        // it swallowed — see [`InfillPolicy`].
+        // Wake on a chunk or the next owed slot, whichever first. Waiting only on capture
+        // made a hole cost more than the audio it swallowed — see [`InfillPolicy`].
         let waited = if infill.exhausted() || !sent_any {
-            // Nothing is owed until real audio returns: either the infill budget is spent (the
-            // host is not glitching, it is QUIET) or nothing has ever been sent, so there is no
-            // continuity to hold. Block the way this loop always did rather than waking two
-            // hundred times a second to decide to stay silent — a session that starts on a quiet
-            // desktop would otherwise spin until the first sound.
+            // Infill budget spent (sink is quiet) or nothing has been sent yet. Block on
+            // capture rather than waking hundreds of times a second to stay silent.
             capturer.as_mut().unwrap().next_chunk()
         } else {
             let now = std::time::Instant::now();
-            // A frame that is due but has no audio behind it cannot be acted on until the hole is
-            // old enough to be worth covering, so wait for the LATER of the two — waiting only for
-            // the due time would spin through the window between them.
+            // A due slot with no audio cannot fire until the hole is old enough to cover;
+            // wait for the later of the two.
             let ready_at = match pace_due {
                 Some(due) if acc.len() >= frame_len => due,
                 Some(due) => due.max(last_chunk_at + infill.after()),
@@ -594,18 +415,15 @@ pub(super) fn audio_thread(
         if !chunk.is_empty() {
             if infill.chunk_arrived() {
                 // The wire fell silent across that hole. The partial frame in `acc` and the
-                // redundancy predecessor both describe audio from before a discontinuity, so
-                // splicing either onto what follows is a click plus a pts that lies about it.
+                // redundancy predecessor both describe audio from before a discontinuity;
+                // splicing either onto what follows is a click plus a pts for the wrong time.
                 acc.clear();
                 prev_frame.clear();
             }
             last_chunk_at = std::time::Instant::now();
-            // Anchor the sample clock on THIS chunk's arrival. PipeWire hands us a buffer of
-            // already captured audio, so the newest sample in `acc` is ~now and the oldest is one
-            // whole buffer-occupancy earlier. Re-deriving the anchor every chunk (rather than
-            // free-running a counter) keeps the stamp tied to the capture device's own cadence, so
-            // a drifting or resampling graph corrects itself instead of accumulating error over a
-            // long session.
+            // Anchor on this chunk's arrival. PipeWire hands already-captured audio, so
+            // the newest sample is ~now. Re-deriving each chunk ties pts to the device
+            // cadence instead of accumulating graph drift.
             let arrival_ns = now_ns();
             acc.extend_from_slice(&chunk);
             max_chunk_len = max_chunk_len.max(chunk.len());
@@ -618,58 +436,24 @@ pub(super) fn audio_thread(
                 want,
             )));
             let queued_frames = (acc.len() / want as usize) as u64;
-            // The session's rate, not the module constant: at 96 kHz a 48 000 divisor would put
-            // the anchor twice as far into the past as the queued audio really is, so every pts
-            // would be early by the whole buffer occupancy and A/V sync would chase it.
+            // Session rate, not the 48 kHz module constant: at 96 kHz that divisor would
+            // put the anchor a whole buffer occupancy too early.
             let anchor = arrival_ns.saturating_sub(queued_frames * 1_000_000_000 / rate_hz as u64);
             // Never step backwards — and see [`PtsClock::reanchor`] for why that asymmetry is
             // exactly what makes a fast clock unrecoverable and the sample-exact stamp mandatory.
             clock.reanchor(anchor);
         }
-        // Everything the wire owes for the slots that have come due — real or synthesized, one
-        // schedule, one encoder, one `seq`. A schedule that has fallen more than
-        // `PACE_REANCHOR` behind is re-anchored rather than chased, so a scheduling hiccup cannot
-        // turn into a permanent send-time debt.
-        //
-        // **The schedule is wall clock; the source is not, and the two disagree in both
-        // directions.** What this loop owes the client is a wire that carries one frame per
-        // frame-time of WALL clock — the client's ring is drained on its own device clock, so
-        // any frame this schedule fails to send is a frame the ring goes without, and any frame
-        // it sends over is one the ring holds forever:
-        //
-        // - **Source behind** (capture lost audio, or the graph clock is slow): a slot comes due
-        //   with no complete frame in `acc`. That is a hole. The ≥ 10 ms kind was already covered
-        //   by the infill policy, measured from the last chunk; the SHORT kind — a missed
-        //   2.7 ms graph cycle or two, invisible to the capture gap counter — was not, and it
-        //   left the schedule permanently behind by the loss. The 2026-08-17 field log shows the
-        //   shape: 33–72 % of departures "late", `max_late_ms` climbing to 99, `reanchors` ≈ 0 —
-        //   a lag that only ever accumulated, and was only ever repaid when the next long hole's
-        //   infill burst out (lag + 10 ms) / 5 ms silence frames back to back. On the client
-        //   that is a ring drained a frame at a time and then refilled with a burst it has to
-        //   trim. So the infill decision now looks at the LAG as well as the time since the
-        //   last chunk: a schedule `after()` behind with no audio to send is owed a frame of
-        //   cover exactly as a hole that long is, and the lag stays bounded at that (a couple
-        //   of frames at a frame-sized quantum, one chunk plus a frame on a clamped one).
-        // - **Source ahead** (the graph clock is fast, or a chunk landed after a stall): `acc`
-        //   holds more than a chunk's worth beyond the frame being sent. Left alone the surplus
-        //   is never sent — one frame per slot, forever — so a source a hundred ppm fast grows
-        //   the backlog, and the latency, by five milliseconds every fifty seconds for the life
-        //   of the session, and only a hole ever takes it back. So a slot whose remaining
-        //   backlog exceeds one chunk plus one frame sends a second frame in the same slot
-        //   (`bonus`): at most two per slot, so a burst never exceeds what a 10 ms quantum
-        //   sends every cycle anyway, and the surplus drains at twice real time until it is gone.
-        //
-        // Both together bound what `late` can accumulate: a lag can no longer grow past
-        // `after()` without being covered, so a `max_late_ms` beyond that band is this thread's
-        // own scheduling — the reading WP-C built the counter for — and not the source's.
+        // Release one frame per wall-clock slot. Source behind (no complete frame): cover
+        // with silence when lag ≥ `after()`, else the schedule falls behind forever.
+        // Source ahead (backlog > one chunk + one frame): send a second frame in the same
+        // slot (`bonus`), at most two, so surplus drains at 2× instead of growing latency.
         let mut bonus_taken = false;
         loop {
             let now = std::time::Instant::now();
-            // How far past its slot this frame is leaving. Measured before the re-anchor arm can
-            // erase the evidence — that arm is the one that forgives debt silently (WP-C).
+            // Late vs slot, measured before the re-anchor arm forgives the debt.
             let mut late = std::time::Duration::ZERO;
             match pace_due {
-                Some(due) if due > now => break, // this frame's slot has not arrived yet
+                Some(due) if due > now => break,
                 Some(due) if now.duration_since(due) > PACE_REANCHOR => {
                     send_stats.observe_reanchor();
                     pace_due = None;
@@ -684,26 +468,19 @@ pub(super) fn audio_thread(
             } else if !sent_any {
                 break;
             } else {
-                // The hole is the LATER of "since the last chunk" and "how far the schedule is
-                // behind": the first is a graph that stopped feeding us, the second is a graph
-                // that fed us less than wall clock — see the loop comment.
+                // Hole is max(time since last chunk, schedule lag): graph stopped, or
+                // graph fed less than wall clock.
                 match infill.decide(last_chunk_at.elapsed().max(late)) {
                     crate::audio::capture_policy::Infill::Silence => {
                         infilled = true;
-                        // Pad the partial frame out with silence and send THAT, rather than
-                        // leaving it for post-gap samples to complete: one frame carrying audio
-                        // from both sides of a hole is a click, and its pts is a lie about when
-                        // half of it was captured. (And it is not dropped either: those samples
-                        // are audio the wire owes, and every sample dropped here would come
-                        // straight back as schedule lag — see the loop comment.)
+                        // Send the partial padded with silence; do not wait for post-gap
+                        // samples to complete it (that frame would straddle the hole).
+                        // Dropping it would come back as schedule lag.
                         let partial = acc.len();
                         frame_buf.append(&mut acc);
                         if infill.covered() == infill.frame() {
-                            // First frame of the hole: the audio does not stop at a step. Fade
-                            // the tail of what we have over up to `EDGE_FADE_US` — the partial
-                            // frame if there is one, else the same slice of the last real frame
-                            // again, so the fade is a slope from the level the listener was at
-                            // down to nothing rather than an edge there.
+                            // Fade the tail we have — the partial, or `last_real` if empty —
+                            // so the hole is a slope from the listener's level, not a step.
                             if partial == 0 && !last_real.is_empty() {
                                 let n = edge_fade_samples.min(last_real.len());
                                 frame_buf.extend_from_slice(&last_real[..n]);
@@ -719,10 +496,8 @@ pub(super) fn audio_thread(
                     | crate::audio::capture_policy::Infill::Quiet => break,
                 }
             }
-            // A slot whose remaining backlog exceeds one chunk plus one whole frame sends a
-            // second frame in the same slot — see the loop comment. Decided on what is left
-            // AFTER this frame, so the frame that merely completes a chunk never triggers it,
-            // and never twice in a row, so a big surplus drains at 2× and not in one burst.
+            // Second frame in this slot if remaining backlog exceeds one chunk plus one
+            // frame. Decided on what is left AFTER this frame; never twice in a row.
             let bonus = !infilled && !bonus_taken && acc.len() >= max_chunk_len + frame_len;
             pace_due = match pace_due {
                 Some(due) if bonus => Some(due), // same slot again for the next frame
@@ -743,20 +518,13 @@ pub(super) fn audio_thread(
                 last_real.clear();
                 last_real.extend_from_slice(&frame_buf);
             }
-            // W1.1 — the wire clock. ⚠ Charged the frame's REAL sample count, never the negotiated
-            // `frame_us`, which is a label on the 44.1 kHz family and would run this 2.3 ms/s fast
-            // forever; see [`PtsClock`]. `frame_buf.len()` rather than `frame_len` because both
-            // fill paths above produce exactly `frame_len` today and taking the count off the
-            // buffer we are about to send keeps that an observation rather than an assumption.
+            // Charge the frame's real sample count, never `frame_us` (a label on 44.1 kHz
+            // that would run 2.3 ms/s fast). `frame_buf.len()` so the stamp matches the
+            // buffer we send. See [`PtsClock`].
             let pts_ns = clock.pts_ns();
             clock.advance(frame_buf.len());
-            // Build this frame's datagram. Two planes, ONE send path below: the pacing, the
-            // telemetry and the send-error handling are properties of the wire, not of the codec,
-            // and duplicating them per plane is how the two would drift.
-            //
-            // `None` = nothing to send for this slot (an Opus encoder error, already counted).
-            // The PCM path cannot fail: `from_f32` is scale-and-clamp over a buffer of known
-            // length, with no encoder state to get stuck in.
+            // One send path for both planes. `None` = Opus encode error (already counted).
+            // PCM cannot fail: `from_f32` is scale-and-clamp over a known length.
             let datagram: Option<Vec<u8>> = if pcm_plane {
                 pcm_wire.clear();
                 pcm::from_f32(&frame_buf, bits, &mut pcm_wire);
@@ -764,11 +532,9 @@ pub(super) fn audio_thread(
                     seq, pts_ns, &pcm_wire,
                 ))
             } else {
-                // Hoisted out of the `match` scrutinee on purpose: the arms below take an
-                // IMMUTABLE slice of `opus_buf`, and a `&mut opus_buf` sitting in a scrutinee
-                // temporary is live for the whole match statement. Binding the result first ends
-                // that borrow at this semicolon and leaves nothing for the reader (or the borrow
-                // checker) to reason about.
+                // Bind the encode result first: the match arms take an immutable slice of
+                // `opus_buf`, and a `&mut opus_buf` in the scrutinee would live for the
+                // whole match.
                 let encoded = enc
                     .as_mut()
                     .expect("opus plane has an encoder")
@@ -787,10 +553,8 @@ pub(super) fn audio_thread(
                             punktfunk_core::quic::encode_audio_datagram(seq, pts_ns, opus)
                         };
                         if redundancy {
-                            // The predecessor this frame just became. Recorded BEFORE the send
-                            // rather than after it, so the drop arm below can clear it: a frame
-                            // that never left must not be advertised as frame `seq`'s
-                            // predecessor when the client's numbering has already moved past it.
+                            // Recorded before send so the drop arm can clear it: a frame
+                            // that never left must not be advertised as `seq`'s predecessor.
                             prev_frame.clear();
                             prev_frame.extend_from_slice(opus);
                         }
@@ -810,16 +574,12 @@ pub(super) fn audio_thread(
                 }
             };
             let Some(d) = datagram else { continue };
-            // §4.8 — `SendDatagramError` is FOUR outcomes, and treating all of them as
-            // "connection gone" was wrong in a way hi-res makes reachable. A single oversized
-            // frame used to kill audio for the whole remaining session, silently: no log, no
-            // counter, and the video stream carrying on around it.
+            // Four `SendDatagramError` outcomes; only `ConnectionLost` ends the session.
             match conn.send_datagram(d.into()) {
                 Ok(()) => {
                     seq = seq.wrapping_add(1);
-                    // Score the departure against its slot and against the previous one. `now` is
-                    // from the top of this iteration — microseconds earlier and one clock read
-                    // cheaper, 200 times a second.
+                    // Score against the slot and the previous departure. `now` is from the
+                    // top of this iteration — one clock read cheaper, ~200/s.
                     send_stats.observe_departure(
                         late,
                         last_departure.map(|t| now.duration_since(t)),
@@ -830,18 +590,11 @@ pub(super) fn audio_thread(
                     // anchor to continue from — both preconditions for synthesizing anything.
                     sent_any = true;
                 }
-                // The only outcome that really is "the session is over".
                 Err(quinn::SendDatagramError::ConnectionLost(_)) => break 'session,
-                // The frame exceeds what this path can carry right now — quinn refuses it
-                // outright rather than fragmenting. One frame, not the plane: drop it, advance
-                // `seq` so the client SEES a gap and conceals it rather than silently
-                // mis-attributing the next frame, and keep going. Warn on powers of two (the
-                // idiom the encode-error arm above uses) so a persistently oversized format
-                // says so once, then twice, then four times, instead of 400 times a second.
-                //
-                // Persistent rather than transient is the case worth reading for: it means the
-                // negotiated `audio_frame_us` was sized against a datagram budget this path
-                // turned out not to have — see the MTU note in `handshake::negotiate`.
+                // One oversized frame, not the plane. Advance `seq` so the client sees a
+                // gap and conceals it. Warn on powers of two. Persistent means
+                // `audio_frame_us` was sized against a datagram budget this path lacks
+                // (see MTU note in `handshake::negotiate`).
                 Err(quinn::SendDatagramError::TooLarge) => {
                     oversized_drops += 1;
                     if oversized_drops.is_power_of_two() {
@@ -859,11 +612,9 @@ pub(super) fn audio_thread(
                     seq = seq.wrapping_add(1);
                     prev_frame.clear();
                 }
-                // Datagrams are gone for the rest of the connection — the peer never supported
-                // them, or the transport disabled them. Nothing this loop can do will make the
-                // next frame land, so end the audio plane cleanly (the capturer is parked below,
-                // the session keeps streaming video) instead of burning a core paced against a
-                // wire that cannot take it. Logged once, by construction: this arm breaks.
+                // Datagrams disabled for the rest of the connection. End the audio plane
+                // (capturer parked below; video continues) rather than pacing a wire that
+                // cannot take it. Logged once: this arm breaks.
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -875,9 +626,8 @@ pub(super) fn audio_thread(
             }
         }
         if last_send_stats.elapsed() >= crate::audio::capture_policy::STATS_EVERY {
-            // Deliberately the same window as the capture line, so the two can be read as a pair:
-            // holes at the tap with clean departures means the host delivered everything it had,
-            // and the search belongs upstream of us.
+            // Same window as the capture line so they read as a pair: holes at the tap
+            // with clean departures means the host delivered everything it had.
             tracing::info!(
                 sent = send_stats.sent,
                 infilled = send_stats.infilled,
@@ -885,27 +635,20 @@ pub(super) fn audio_thread(
                 max_late_ms = send_stats.max_late_ms(),
                 max_spacing_ms = send_stats.max_spacing_ms(),
                 reanchors = send_stats.reanchors,
-                // §4.8 — frames the wire refused as oversized, cumulative for the session
-                // (unlike the rest of this line, which resets per window: a total is what
-                // answers "did this ever happen at all", and it is the question a field log
-                // gets asked). Zero on every healthy session, which is the point — a counter
-                // that reads zero for a REASON rather than by luck.
+                // Cumulative for the session (the rest of this line resets per window):
+                // a total answers "did this ever happen". Zero on a healthy session.
                 oversized_drops,
                 "audio egress"
             );
-            // The frame rides into the fresh window too — `Default` would have reset it to zero,
-            // which is why `SendStats` no longer has one: a zero frame makes every departure
-            // "late by a whole frame", and this is the line that would have said so, every 30 s,
-            // for the rest of the session.
+            // Keep this session's `frame_us`. `Default` would zero it, and every
+            // departure would then count as late by a whole frame.
             send_stats = crate::audio::capture_policy::SendStats::new(frame_us);
             last_send_stats = std::time::Instant::now();
         }
     }
-    // Park the live capturer for the next session (None if it died and never reopened),
-    // releasing its session-scoped routing claim (Linux: the default sink moves back;
-    // Windows: dropped, restoring the operator's default playback device). An ISOLATED capturer
-    // is dropped instead of parked — its sink name belongs to this session's identity, and a
-    // later shared session adopting it would capture a sink nothing routes to.
+    // Park a live shared capturer (releases the routing claim). Isolated capturers are
+    // dropped: their sink name is this session's, and a later shared session would capture
+    // a sink nothing routes to.
     if let Some(mut c) = capturer {
         c.idle();
         if sink.is_none() {
@@ -914,8 +657,8 @@ pub(super) fn audio_thread(
     }
 }
 
-/// Stub — punktfunk/1 audio needs Linux (PipeWire capture + libopus); non-Linux dev builds
-/// run sessions without it, same as when the capturer fails to open.
+/// Stub: native audio needs Linux or Windows (capture + libopus). Other targets run
+/// the session without it, same as a capturer that fails to open.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub(super) fn audio_thread(
     _conn: quinn::Connection,
@@ -933,17 +676,13 @@ pub(super) fn audio_thread(
 mod tests {
     use super::*;
 
-    /// The number this whole clock exists for, pinned exactly rather than approximately.
+    /// The number this clock exists for, pinned exactly.
     ///
-    /// One second of "5 ms" frames at 44 100 Hz stereo: 200 frames of 440 interleaved samples =
-    /// 88 000 samples, which is 997 732 426 ns — the second is 0.23 % SHORT of the 200 × 5 ms the
-    /// rung is labelled with, because 44 100 divides none of the seven ladder rungs and
-    /// `samples_per_frame` floors 220.5 to 220 per channel.
-    ///
-    /// The old stamp added `frame_us * 1000` per frame and would land on exactly 1 000 000 000 —
-    /// 2 267 574 ns of time this host never captured, every second, forever. Planting that error
-    /// (`base += frame_us * 1000` in place of `advance`) makes the equality below fail by
-    /// 2 267 574 ns and the ppm assertion report 2 268.
+    /// One second of "5 ms" frames at 44 100 Hz stereo: 200 frames × 440 interleaved
+    /// samples = 88 000 samples = 997 732 426 ns. The rung is labelled 1 000 000 000 ns
+    /// because 44 100 divides none of the seven ladder rungs and `samples_per_frame`
+    /// floors 220.5 to 220 per channel. Advancing `frame_us * 1000` instead invents
+    /// 2 267 574 ns every second (2 272 ppm).
     #[test]
     fn the_clock_counts_samples_and_not_nominal_frames() {
         let (rate, us, ch) = (44_100u32, 5_000u32, 2u8);
@@ -964,17 +703,15 @@ mod tests {
         let fast_ppm = (nominal_ns - real_ns) * 1_000_000 / real_ns;
         assert_eq!(fast_ppm, 2_272, "the nominal clock runs this many ppm fast");
 
-        // ⚠ And the drift is CUMULATIVE, which is what makes it a defect rather than an offset:
-        // an hour of session is 8.2 seconds of invented time. The re-anchor cannot take any of it
-        // back (it only moves forward), so the client's A/V sync loop chases it to the end.
+        // Drift is cumulative: an hour is 8.2 s of invented time. Re-anchor only moves
+        // forward, so the client's A/V sync chases it to the end.
         let hour = 3_600 * (nominal_ns - real_ns) / 1_000_000;
         assert_eq!(hour, 8_163, "ms of drift over an hour");
     }
 
-    /// Summing floored per-frame durations — the alternative core's doc offers — is *also* fine,
-    /// and this pins the size of the difference so the choice is on the record rather than
-    /// re-litigated. Under 1 ns per frame against the running total, four orders of magnitude
-    /// below what the nominal advance invents.
+    /// Summing floored per-frame durations is also fine; this pins the difference so the
+    /// choice stays on the record. Under 1 ns/frame against the running total — four
+    /// orders of magnitude below what the nominal advance invents.
     #[test]
     fn a_running_total_beats_summing_floored_frames_by_a_hair() {
         let (rate, us, ch) = (44_100u32, 5_000u32, 2u8);
@@ -992,10 +729,8 @@ mod tests {
         );
     }
 
-    /// On the 48 kHz family a rung IS a duration, so the new clock and the old nominal advance are
-    /// the same clock. This is why the defect went unnoticed while the ladder was 48/96 only — and
-    /// it is the compatibility claim that matters most: an Opus session's timestamps must not move
-    /// by a nanosecond.
+    /// On the 48 kHz family a rung IS a duration, so this clock and `frame_us * 1000` are
+    /// bit-identical. An Opus session's timestamps must not move by a nanosecond.
     #[test]
     fn the_48k_family_is_bit_identical_to_the_nominal_advance() {
         for (rate, ch) in [(48_000u32, 2u8), (48_000, 6), (48_000, 8), (96_000, 2)] {

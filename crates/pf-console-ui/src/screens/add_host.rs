@@ -1,8 +1,7 @@
-//! The controller "Add Host" screen — three field rows (name / address / port) plus the
-//! Add action. A on a field opens the on-screen keyboard in a bottom tray (on a Steam
-//! Deck it opens SDL text input instead — Steam's own keyboard types, ours never
-//! draws), B peels one layer: keyboard first, then the screen. Field edits are live;
-//! hardware keyboards type straight into the focused field through SDL text input.
+//! Add or edit a host by address on the controller console.
+//!
+//! Deck never draws the tray: Steam's overlay types through SDL text input, so
+//! pad events only dismiss the field. Elsewhere A raises the on-screen keyboard.
 
 use crate::glyphs::{Hint, HintKey};
 use crate::model::{ConsoleCmd, HostRow};
@@ -29,9 +28,7 @@ pub(crate) struct AddHostScreen {
     address: String,
     port: String,
     editing: Option<Field>,
-    /// `Some(host key)` = editing a saved host rather than adding one. The same three
-    /// fields either way — what changes is the verb, and that the write must UPDATE the
-    /// stored host instead of appending a second one beside it.
+    /// `Some(host key)`: save over that host. `None`: append.
     edits: Option<String>,
 }
 
@@ -48,13 +45,12 @@ impl AddHostScreen {
         }
     }
 
-    /// The same screen, prefilled, saving over a host instead of adding one.
     pub(crate) fn edit(host: &HostRow) -> AddHostScreen {
         AddHostScreen {
             name: host.name.clone(),
             address: host.addr.clone(),
             port: host.port.to_string(),
-            // A pinned card's key carries its profile past a NUL; the HOST is what's edited.
+            // Pinned-card keys are `host\0profile`; only the host side is edited.
             edits: Some(host.key.split('\0').next().unwrap_or(&host.key).to_string()),
             ..AddHostScreen::new()
         }
@@ -76,9 +72,7 @@ impl AddHostScreen {
         }
     }
 
-    /// Mouse/touch. A raised keyboard is modal: it takes anything landing on it, and a
-    /// press outside closes it rather than reaching the row underneath — which is what a
-    /// tap outside a keyboard means everywhere else on a touchscreen.
+    /// A press outside the tray closes it; the row underneath is not activated.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
         if self.editing.is_some() && !ctx.deck {
             if !self.keyboard.covers(p) {
@@ -133,13 +127,12 @@ impl AddHostScreen {
         }
     }
 
-    /// Apply one typed character to the editing field (charset + the port's 5-digit
-    /// cap). Returns false when refused — the boundary thud.
     fn type_char(&mut self, ch: char) -> bool {
         let Some(f) = self.editing else { return false };
         if !permits(Self::charset(f), ch) {
             return false;
         }
+        // u16 max is 65535 — five digits.
         if f == Field::Port && self.field_mut(f).chars().count() >= 5 {
             return false;
         }
@@ -184,7 +177,7 @@ impl AddHostScreen {
     ) -> Option<MenuPulse> {
         if let Some(_field) = self.editing {
             if ctx.deck {
-                // Steam's keyboard owns typing; the pad only closes the field.
+                // Steam owns typing on Deck; the pad only dismisses the field.
                 return match ev {
                     MenuEvent::Back | MenuEvent::Confirm => {
                         self.editing = None;
@@ -231,7 +224,6 @@ impl AddHostScreen {
         }
     }
 
-    /// The commit row's behaviour, shared by the pad/keyboard path and the pointer's.
     fn activate(&mut self, msg: ListMsg, fx: &mut Outbox) {
         if !matches!(msg, ListMsg::Activate) {
             return;
@@ -241,8 +233,8 @@ impl AddHostScreen {
             return;
         }
         if !self.can_add() {
-            // Not commitable yet — jump to what's missing instead of a dead press.
-            self.list.cursor = 1; // the address row
+            // Incomplete: jump to address instead of a dead press.
+            self.list.cursor = 1;
             self.editing = Some(Field::Address);
             return;
         }
@@ -253,8 +245,7 @@ impl AddHostScreen {
         let port = self.port.parse().unwrap_or(9777);
         match &self.edits {
             Some(key) => {
-                // Name it by its nickname if it has one, else by the address — the same
-                // fallback the store applies to an unnamed host.
+                // Same unnamed-host fallback as the store: nickname, else address.
                 let label = if name.is_empty() {
                     addr.clone()
                 } else {
@@ -306,10 +297,8 @@ impl AddHostScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
-        // Half of the heading's block, so it sits on the heading's column — a centred
-        // sub-line under a leading title reads as belonging to the rows instead. Its width
-        // is capped against the ROW column, not the screen: measured off the full width it
-        // would run all the way under the controller chip.
+        // 2 px ≈ half a heading block, left-aligned to the title column.
+        // Width is ROW_MAX_W * 0.72 so the line never runs under the controller chip.
         fonts.leading(
             canvas,
             "Hosts on this network appear automatically — add one by address for everything else.",
@@ -321,7 +310,6 @@ impl AddHostScreen {
             ROW_MAX_W * 0.72 * k,
         );
 
-        // While the keyboard tray is up (never on Deck) the rows squeeze above it.
         let seat = self.keyboard.seat(self.editing.is_some() && !ctx.deck, dt);
         let tray_h = if seat > 0.0 {
             (Keyboard::tray_height() + 12.0) * k * seat
@@ -410,13 +398,11 @@ mod tests {
         let mut s = AddHostScreen::new();
         let mut fx = Outbox::default();
 
-        // A on "Add Host" while the address is empty jumps into the address field.
         s.list.cursor = 3;
         s.menu(MenuEvent::Confirm, &mut c, &mut fx);
         assert_eq!(s.editing, Some(Field::Address));
         assert_eq!(s.list.cursor, 1);
 
-        // Hardware keys / Steam keyboard commit text; spaces are refused for addresses.
         s.text_input("deck tower.local");
         assert_eq!(s.address, "decktower.local");
         s.edit_key(crate::input::Key::Backspace);
@@ -425,7 +411,6 @@ mod tests {
         s.edit_key(crate::input::Key::Return);
         assert!(s.editing.is_none());
 
-        // Now Add saves, toasts, and pops.
         s.list.cursor = 3;
         let mut fx = Outbox::default();
         s.menu(MenuEvent::Confirm, &mut c, &mut fx);
@@ -454,9 +439,8 @@ mod tests {
         let mut s = AddHostScreen::new();
         let mut fx = Outbox::default();
         s.list.cursor = 1;
-        s.menu(MenuEvent::Confirm, &mut c, &mut fx); // open the address field
+        s.menu(MenuEvent::Confirm, &mut c, &mut fx);
         assert!(s.editing());
-        // Moves don't drive a key grid on Deck; B closes the field.
         assert!(s
             .menu(
                 MenuEvent::Move(pf_client_core::menu_nav::MenuDir::Right),

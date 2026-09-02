@@ -1,25 +1,19 @@
-//! The Skia console UI (punktfunk-planning `linux-client-rearchitecture.md` §6, and
-//! `android-skia-console-port.md` for the second host): one shell — home (host carousel),
-//! the game library (coverflow, grid, Collections), settings, add-host, PIN pairing —
-//! with screen transitions, per-pad button glyphs and a controller keyboard, rendered onto
-//! whatever `skia_safe::Canvas` a host hands it.
+//! Skia console UI: one shell — home, library, settings, add-host, pairing —
+//! drawn onto whatever `skia_safe::Canvas` a host hands it. Design:
+//! `linux-client-rearchitecture.md`, `android-skia-console-port.md`.
 //!
 //! Two hosts sit on the portable [`Console`] driver:
-//! - the Vulkan session binary's [`SkiaOverlay`] (feature `vulkan-overlay`, the default) —
-//!   an [`Overlay`](pf_presenter::overlay::Overlay) implementation rendering on the
-//!   PRESENTER's Vulkan device into offscreen RGBA images the presenter composites as one
-//!   premultiplied quad, plus the in-stream chrome (stats OSD, capture hint, start banner).
-//!   Skia never touches the swapchain, and nothing here runs while the overlay has nothing
-//!   to show — the §6.1 invariants live or die in `skia_overlay.rs`;
-//! - the Android client's GL host (`clients/android/native`), which owns its own EGL
-//!   surface and drives [`Console`] directly, `default-features = false`.
+//! - the Vulkan session's [`SkiaOverlay`] (feature `vulkan-overlay`) — an
+//!   [`Overlay`](pf_presenter::overlay::Overlay) on the presenter's device,
+//!   offscreen RGBA, composited as one premultiplied quad. Skia never
+//!   touches the swapchain; the overlay draws only when it has something
+//!   to show (`skia_overlay.rs`);
+//! - the Android GL host (`clients/android/native`), which owns EGL and
+//!   drives [`Console`] with `default-features = false`.
 //!
-//! Everything but `skia_overlay.rs` is platform-free: screens draw to `&Canvas`, settings
-//! persist through [`store::SettingsStore`], keys arrive as [`input::Key`], the platform's
-//! row set is a [`platform::Platform`] question. That is what the CPU-raster tests in
-//! `shell/tests.rs` and the screenshot dump prove every run.
-
-// Unsafe-proof program: every `unsafe {}` in the Skia/Vulkan overlay carries a `// SAFETY:` proof.
+//! Everything but `skia_overlay.rs` is platform-free: screens draw to
+//! `&Canvas`, settings through [`store::SettingsStore`], keys as
+//! [`input::Key`], platform rows as [`platform::Platform`].
 
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod anim;
@@ -41,16 +35,15 @@ pub mod library;
 pub mod model;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod os_marks;
-// The desktop's own theme, published by the embedding binary ("Follow system theme").
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod os_theme;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod platform;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod pointer;
-// The in-stream ring on Skia is the DESKTOP shell's (Android has its Compose ring); the Android
-// console draws it only as the settings editor, where the desktop-gated host-action cache is
-// not consulted.
+// In-stream ring is the desktop shell's (Android has Compose). Android
+// draws this module only as the settings editor; the host-action cache
+// is desktop-gated and is not consulted there.
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod ring;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]

@@ -1,57 +1,32 @@
-//! Transport-independent Nintendo Switch Pro Controller contract — the report codec + canned
-//! handshake replies the Linux UHID backend ([`super::switch_pro`]) drives `hid-nintendo` with.
+//! Nintendo Switch Pro Controller report codec and handshake replies for the
+//! Linux UHID backend ([`super::switch_pro`]).
 //!
-//! Everything here is pinned against the kernel driver source (drivers/hid/hid-nintendo.c —
-//! the ONE consumer of these bytes; a virtual pad must answer its probe exactly or no input
-//! devices appear):
+//! Pinned to `drivers/hid/hid-nintendo.c`. Miss the probe and no input device appears.
 //!
-//! - **USB handshake**: 2-byte output reports `0x80 <cmd>` (handshake / baudrate / no-timeout),
-//!   each ACKed with an input report `0x81 <cmd>` (`joycon_send_usb` matches only those two
-//!   bytes).
-//! - **Subcommands**: output report `0x01` (packet counter + 8 rumble bytes + subcommand id +
-//!   args), ACKed with input report `0x21` — a 12-byte input-state header, then ack byte /
-//!   echoed subcommand id / payload. The driver matches ONLY the echoed id (byte 14) and
-//!   requires ≥ 49 bytes; real hardware sends 64.
-//! - **SPI flash reads** (subcommand `0x10`): the driver reads the user-calibration magics
-//!   (absent here → `0xFF 0xFF`, so it takes the factory path), the factory stick calibrations
-//!   (9-byte packed 12-bit triples — max/center/min order DIFFERS left vs right), and the
-//!   24-byte factory IMU calibration. We serve blobs chosen so the math is clean: sticks
-//!   centered at [`STICK_CENTER`] ± [`STICK_RANGE`], IMU offsets 0 with the driver's default
-//!   scales (accel 16384, gyro 13371) so raw units pass through 1:1.
-//! - **Input report `0x30`**: 3 button bytes (bit layout per `JC_BTN_*`), two packed 12-bit
-//!   stick triples, battery/connection, and 3 IMU sample frames (accel then gyro, i16 LE).
-//! - **Rumble**: 4 encoded bytes per side in every `0x01`/`0x10` output; we decode the
-//!   amplitude through the driver's own `joycon_rumble_amplitudes` table (inverted) back to the
-//!   0..=0xFFFF wire magnitudes it was scaled from (left = strong/low, right = weak/high).
+//! USB: output `0x80 <cmd>` → input `0x81 <cmd>` (`joycon_send_usb` matches those two
+//! bytes). Subcommand `0x01` → `0x21` (≥ 49 bytes; we send 64); the driver matches only
+//! the echoed id at byte 14. SPI `0x10` is served by address range so SDL's 18-byte /
+//! 22-byte reads see the same factory blobs as the kernel's 9-byte ones. Input `0x30`
+//! is buttons + packed sticks + three IMU frames.
 //!
-//! Wire-mapping subtleties (see the plan doc, gamepad-new-types §4):
-//! - **Positional swap.** Wire `BTN_A` is the SOUTH button (GameStream convention); on a Switch
-//!   pad SOUTH is `B`. `from_gamepad` maps wire-south → the report's B bit (and X/Y likewise),
-//!   so the physical-position ↔ glyph relationship stays correct end-to-end.
-//! - **Units.** Wire motion is DualSense-convention (20 LSB/°·s, 10000 LSB/g); the report wants
-//!   real-Pro-Controller raw units (≈14.247 LSB/°·s per `JC_IMU_GYRO_RES_PER_DPS`, 4096 LSB/g
-//!   per `JC_IMU_ACCEL_RES_PER_G`), which our calibration blobs make the driver consume 1:1.
+//! Face buttons are positional (wire south → report B). Wire motion is DualSense units
+//! (20 LSB/°·s, 10000 LSB/g); the report is raw Pro units (14.247 LSB/°·s, 4096 LSB/g)
+//! via the factory-calibration identity. Evidence: this module's tests and hid-nintendo.c.
 
 use punktfunk_core::input::gamepad as gs;
 
 pub const SWITCH_VENDOR: u32 = 0x057E; // Nintendo Co., Ltd
 pub const SWITCH_PRODUCT: u32 = 0x2009; // Pro Controller
 
-/// The raw IMU resolutions `hid-nintendo` reports a Pro Controller at — its own
-/// `JC_IMU_GYRO_RES_PER_DPS` (14.247, carried here in thousandths so the ratio stays exact) and
-/// `JC_IMU_ACCEL_RES_PER_G`. Fixed by the driver, not by us: the factory-calibration blob we serve
-/// is the driver's identity default, so it consumes our report at exactly these numbers.
+/// `JC_IMU_GYRO_RES_PER_DPS` in thousandths so 14.247 stays exact. Factory IMU cal is
+/// the driver's identity default, so reports are consumed at this ratio.
 const JC_IMU_GYRO_MILLI_RES_PER_DPS: i32 = 14_247;
-/// See [`JC_IMU_GYRO_MILLI_RES_PER_DPS`].
+/// `JC_IMU_ACCEL_RES_PER_G`. Same identity-cal path as gyro.
 const JC_IMU_ACCEL_RES_PER_G: i32 = 4096;
 
-/// Nintendo Switch Pro Controller **USB** HID report descriptor (203 bytes) — a verbatim
-/// real-device capture (usbhid-dump off a wired Pro Controller; three independent public
-/// captures agree byte-for-byte: mzyy94's usbhid-dump, ToadKing's full USB capture, and
-/// spacemeowx2's annotated dump). Declares exactly the report ids `hid-nintendo` exchanges
-/// wired (inputs 0x30/0x21/0x81, outputs 0x01/0x10/0x80/0x82); the driver reads raw events,
-/// so the descriptor only has to `hid_parse()` — but this is what real hardware presents.
-/// NOT the Bluetooth descriptor (that one is ~170 bytes with a different report set).
+/// Wired Pro Controller USB HID report descriptor (203 bytes). Report ids the driver
+/// exchanges: in 0x30/0x21/0x81, out 0x01/0x10/0x80/0x82. Not the Bluetooth descriptor
+/// (~170 bytes, different report set).
 #[rustfmt::skip]
 pub const PROCON_RDESC: &[u8] = &[
     0x05, 0x01, 0x15, 0x00, 0x09, 0x04, 0xA1, 0x01, 0x85, 0x30, 0x05, 0x01, 0x05, 0x09, 0x19, 0x01,
@@ -68,25 +43,19 @@ pub const PROCON_RDESC: &[u8] = &[
     0x75, 0x08, 0x95, 0x3F, 0x91, 0x83, 0x85, 0x80, 0x09, 0x05, 0x75, 0x08, 0x95, 0x3F, 0x91, 0x83,
     0x85, 0x82, 0x09, 0x06, 0x75, 0x08, 0x95, 0x3F, 0x91, 0x83, 0xC0,
 ];
-/// Every input report we emit is the full USB size (the driver requires ≥ 49 for `0x21`).
+/// USB report size. The driver rejects `0x21` shorter than 49 bytes.
 pub const SWITCH_REPORT_LEN: usize = 64;
 
-/// Stick raw center + full-deflection range of OUR virtual pad's calibration (12-bit axis).
-/// The factory blobs below advertise exactly this, so the driver maps
-/// `center ± range → ∓/± 32767` — one clean linear scale from the wire values.
+/// 12-bit factory cal we advertise: driver maps `center ± range` → `∓/± 32767`.
 pub const STICK_CENTER: u16 = 2048;
 pub const STICK_RANGE: u16 = 1400;
 
-/// `battery and connection info` byte (report byte 2): high 3 bits = level (4 = full),
-/// BIT(4) = charging, BIT(0) = host powered — "full + charging + wired", so no low-battery
-/// warnings ever.
+/// Report byte 2: full + charging + wired (`0x91`). Suppresses low-battery warnings.
 pub const BAT_CON_FULL_WIRED: u8 = 0x91;
-/// `vibrator_report` (report byte 12): must be non-zero or the driver stops pumping its rumble
-/// queue (`joycon_ctlr_read_handler` gates on it). Real hardware sends 0x70-ish.
+/// Report byte 12. Zero here stops the driver's rumble queue (`joycon_ctlr_read_handler`).
 pub const VIBRATOR_READY: u8 = 0x70;
 
-// Button bits of the 24-bit little-endian button field (report bytes 3..6), per the kernel's
-// JC_BTN_* defines.
+// 24-bit LE button field (report bytes 3..6), `JC_BTN_*` in hid-nintendo.c.
 pub mod btn {
     pub const Y: u32 = 1 << 0;
     pub const X: u32 = 1 << 1;
@@ -108,24 +77,21 @@ pub mod btn {
     pub const ZL: u32 = 1 << 23;
 }
 
-/// Full Pro Controller state serialized into report `0x30` (and the `0x21` reply headers).
-/// Sticks are the RAW 12-bit values ([`STICK_CENTER`]-centered); motion is raw IMU units.
+/// Raw 12-bit sticks ([`STICK_CENTER`]-based) and raw IMU units for report `0x30` / `0x21`.
 #[derive(Clone, Copy)]
 pub struct SwitchState {
-    /// 24-bit `JC_BTN_*` field.
     pub buttons: u32,
     pub lx: u16,
     pub ly: u16,
     pub rx: u16,
     pub ry: u16,
-    /// Raw gyro (≈14.247 LSB/°·s) and accel (4096 LSB/g), driver axis order x/y/z.
+    /// Raw gyro (~14.247 LSB/°·s) and accel (4096 LSB/g), driver axis order x/y/z.
     pub gyro: [i16; 3],
     pub accel: [i16; 3],
 }
 
 impl SwitchState {
-    /// Centered sticks, nothing pressed, flat at rest (1 g on +Z — a pad lying on the desk, so
-    /// SDL/games don't see a free-falling controller).
+    /// Centered, unpressed, 1 g on +Z (pad at rest). Zero accel looks like free-fall.
     pub fn neutral() -> SwitchState {
         SwitchState {
             buttons: 0,
@@ -138,11 +104,8 @@ impl SwitchState {
         }
     }
 
-    /// Map a GameStream/XInput pad frame into Pro Controller state. Face buttons are mapped
-    /// **positionally** (wire A = south → Switch B, etc. — see the module doc); triggers are
-    /// digital on a Pro Controller, so any analog pull presses ZL/ZR. The wire paddles have no
-    /// Switch slot — fold them via [`super::steam_remap`] BEFORE calling this (like the
-    /// DualSense-family backends do).
+    /// Positional face map (wire south → Switch B). Analog triggers become ZL/ZR.
+    /// Fold paddles through [`super::steam_remap`] first — they have no Switch slot.
     pub fn from_gamepad(
         buttons: u32,
         lx: i16,
@@ -154,7 +117,6 @@ impl SwitchState {
     ) -> SwitchState {
         let on = |bit: u32| buttons & bit != 0;
         let mut b = 0u32;
-        // Positional: wire south/east/west/north → the Switch button at that position.
         if on(gs::BTN_A) {
             b |= btn::B; // south
         }
@@ -219,28 +181,22 @@ impl SwitchState {
         }
     }
 
-    /// Zero angular velocity, keeping acceleration (gravity is legitimately persistent) and
-    /// everything else. Returns whether anything changed — the host's idle-motion watchdog,
-    /// `PadProto::neutralize_gyro`.
+    /// Zero gyro only. Gravity stays. True iff the sample changed (`PadProto::neutralize_gyro`).
     pub fn neutralize_gyro(&mut self) -> bool {
         let changed = self.gyro != [0; 3];
         self.gyro = [0; 3];
         changed
     }
 
-    /// Reset the rich-plane fields to a fresh pad's, leaving buttons/sticks alone — for the Pro
-    /// Controller that is motion only (it has no touchpad). `PadProto::clear_rich`.
+    /// Motion only — this pad has no touchpad (`PadProto::clear_rich`).
     pub fn clear_rich(&mut self) {
         let fresh = SwitchState::neutral();
         self.gyro = fresh.gyro;
         self.accel = fresh.accel;
     }
 
-    /// Apply a wire motion sample (DualSense-convention units) as raw IMU values. No axis flip:
-    /// both conventions are x-toward-triggers / z-up for a Pro Controller held like a DualSense,
-    /// and the driver applies no negation for the Pro (only the right Joy-Con negates).
+    /// DualSense-convention sample → raw IMU. No axis flip: the Pro path does not negate.
     pub fn apply_motion(&mut self, gyro: [i16; 3], accel: [i16; 3]) {
-        // Wire units → the driver's raw units. Gyro is carried in thousandths so 14.247 stays exact.
         let gyro_den = 1000 * gs::MOTION_GYRO_LSB_PER_DEG_S;
         self.gyro = gyro.map(|v| ((v as i32 * JC_IMU_GYRO_MILLI_RES_PER_DPS) / gyro_den) as i16);
         self.accel = accel
@@ -248,16 +204,14 @@ impl SwitchState {
     }
 }
 
-/// Wire stick value (i16, +32767 = right/up) → raw 12-bit axis. The driver Y-negates BOTH the
-/// wire's and evdev's conventions away: it computes `evdev_y = -scale(raw_y)`, and evdev's
-/// gamepad convention is negative-up — so wire +y (up) maps to raw above-center, exactly like x.
+/// Wire i16 (+ = right/up) → 12-bit raw. Driver Y-negates both conventions, so +y
+/// is above-center, same as x.
 pub fn stick_raw(v: i16) -> u16 {
     let raw = STICK_CENTER as i32 + (v as i32 * STICK_RANGE as i32) / 32767;
     raw.clamp(0, 0xFFF) as u16
 }
 
-/// Pack two 12-bit values into the 3-byte stick / calibration wire form
-/// (`hid_field_extract` little-endian bitfield order).
+/// Two 12-bit values in `hid_field_extract` little-endian bitfield order.
 pub fn pack12(a: u16, b: u16) -> [u8; 3] {
     [
         (a & 0xFF) as u8,
@@ -266,8 +220,7 @@ pub fn pack12(a: u16, b: u16) -> [u8; 3] {
     ]
 }
 
-/// Write the shared 13-byte input-state header (report id .. `vibrator_report`) that both the
-/// `0x30` stream and every `0x21` subcommand reply carry.
+/// Shared 13-byte header for `0x30` and every `0x21` reply.
 fn write_header(r: &mut [u8; SWITCH_REPORT_LEN], id: u8, st: &SwitchState, timer: u8) {
     r[0] = id;
     r[1] = timer;
@@ -280,9 +233,8 @@ fn write_header(r: &mut [u8; SWITCH_REPORT_LEN], id: u8, st: &SwitchState, timer
     r[12] = VIBRATOR_READY;
 }
 
-/// Serialize the full/standard input report `0x30`: state header + 3 IMU sample frames
-/// (accel x/y/z then gyro x/y/z, i16 LE — `struct joycon_imu_data`). We repeat the current
-/// sample across all three 5 ms sub-frames (we sample per report, not per sub-frame).
+/// Report `0x30`: header + 3 IMU frames (accel then gyro, i16 LE). The same sample
+/// is repeated; we do not sample per 5 ms sub-frame.
 pub fn serialize_report_0x30(st: &SwitchState, timer: u8) -> [u8; SWITCH_REPORT_LEN] {
     let mut r = [0u8; SWITCH_REPORT_LEN];
     write_header(&mut r, 0x30, st, timer);
@@ -298,8 +250,7 @@ pub fn serialize_report_0x30(st: &SwitchState, timer: u8) -> [u8; SWITCH_REPORT_
     r
 }
 
-/// Build the `0x81 <cmd>` input report acknowledging a USB `0x80 <cmd>` command
-/// (`joycon_send_usb` matches exactly those two bytes).
+/// `0x81 <cmd>` ACK. `joycon_send_usb` matches those two bytes only.
 pub fn build_usb_ack(cmd: u8) -> [u8; SWITCH_REPORT_LEN] {
     let mut r = [0u8; SWITCH_REPORT_LEN];
     r[0] = 0x81;
@@ -307,9 +258,7 @@ pub fn build_usb_ack(cmd: u8) -> [u8; SWITCH_REPORT_LEN] {
     r
 }
 
-/// Build a `0x21` subcommand reply: state header, then ack / echoed subcommand id / payload.
-/// The driver matches on the echoed id only; the MSB-set ack byte mirrors real hardware
-/// (`0x80` plain ack, `0x80 | data-type` when a payload follows).
+/// `0x21` reply. Driver matches echoed id (byte 14) only; ack MSB-set like hardware.
 pub fn build_subcmd_reply(
     st: &SwitchState,
     timer: u8,
@@ -326,10 +275,7 @@ pub fn build_subcmd_reply(
     r
 }
 
-/// The device-info payload (subcommand `0x02`): firmware 4.33, type `0x03` = **Pro Controller**
-/// (`ctlr_type` — the value that selects the Pro button/stick/IMU paths), `0x02`, the 6-byte
-/// MAC (parsed into `ctlr->mac_addr`, printed + used as the input devices' `uniq`), `0x01`,
-/// and `0x01` = "colors in SPI" (not read by the driver).
+/// Subcommand `0x02`: FW 4.33, type `0x03` (Pro), MAC used as the input `uniq`.
 pub fn device_info_payload(mac: &[u8; 6]) -> [u8; 12] {
     let mut p = [0u8; 12];
     p[0] = 0x04;
@@ -342,31 +288,26 @@ pub fn device_info_payload(mac: &[u8; 6]) -> [u8; 12] {
     p
 }
 
-/// A stable per-pad virtual MAC (Nintendo OUI + our index) — the driver requires one from
-/// device info and keys the input devices' `uniq` off it.
+/// Nintendo OUI + pad index. Device-info MAC; the driver keys `uniq` off it.
 pub fn switch_mac(index: u8) -> [u8; 6] {
     [0x7C, 0xBB, 0x8A, 0xDF, 0x00, index]
 }
 
-/// The modelled contents of the pad's SPI flash as `(start address, bytes)` blocks. Everything
-/// outside them reads back zero.
+/// Modelled SPI flash as `(start, bytes)`. Anything else reads as zero.
 ///
-/// - `0x6020` (factory IMU cal, 24 B): offsets 0, accel scale 16384, gyro scale 13371 — the
-///   driver's own defaults, making its per-sample math the identity (accel) / ×1000 (gyro).
-/// - `0x603D`/`0x6046` (factory stick cal, 9 B each, contiguous): [`STICK_CENTER`] ±
-///   [`STICK_RANGE`] on every axis. **Byte order differs**: left = max-above ++ center ++
-///   min-below; right = center ++ min-below ++ max-above (`joycon_read_stick_calibration`).
-/// - `0x8010`/`0x801B`/`0x8026` (user-cal magics): NOT `0xB2 0xA1` → user cal absent, so every
-///   consumer takes the factory path.
+/// `0x6020` IMU: offsets 0, accel scale 16384, gyro scale 13371 (driver identity).
+/// Stick cal: [`STICK_CENTER`] ± [`STICK_RANGE`]. Left = max ++ center ++ min;
+/// right = center ++ min ++ max (`joycon_read_stick_calibration`). User magics
+/// at `0x8010`/`0x801B`/`0x8026` are not `0xB2 0xA1`, so consumers take factory.
 fn flash_blocks() -> [(u32, Vec<u8>); 6] {
     let cal_pair = pack12(STICK_RANGE, STICK_RANGE);
     let center_pair = pack12(STICK_CENTER, STICK_CENTER);
     let mut imu = Vec::with_capacity(24);
-    imu.extend_from_slice(&[0u8; 6]); // accel offsets = 0
+    imu.extend_from_slice(&[0u8; 6]);
     for _ in 0..3 {
         imu.extend_from_slice(&16384u16.to_le_bytes()); // accel scale (driver default)
     }
-    imu.extend_from_slice(&[0u8; 6]); // gyro offsets = 0
+    imu.extend_from_slice(&[0u8; 6]);
     for _ in 0..3 {
         imu.extend_from_slice(&13371u16.to_le_bytes()); // gyro scale (driver default)
     }
@@ -380,15 +321,11 @@ fn flash_blocks() -> [(u32, Vec<u8>); 6] {
     ]
 }
 
-/// Serve an SPI-flash read (subcommand `0x10`): reply payload = echoed LE address + echoed
-/// length + the `len` bytes living at `addr` in [`flash_blocks`].
+/// SPI `0x10` reply: echoed LE addr + len + `len` bytes at `addr`.
 ///
-/// **Answer by RANGE, never by exact `(addr, len)`.** Two consumers read the same flash with
-/// different shapes, and only one of them is the kernel: `hid-nintendo` reads the two factory
-/// stick blocks as separate 9-byte reads, while SDL — which is Steam's own Switch driver, and
-/// therefore what a game actually sees — reads all 18 bytes at `0x603D` in one go and the
-/// 22-byte user block at `0x8010`. Matching exact pairs served the kernel and silently
-/// zero-filled Steam, which zeroed its stick centre and pinned both sticks to a corner.
+/// Serve by range, never by exact `(addr, len)`. hid-nintendo reads two 9-byte
+/// stick blocks; SDL reads 18 bytes at `0x603D` and 22 at `0x8010`. Exact-pair
+/// matching zero-fills Steam and pins both sticks to a corner.
 pub fn spi_flash_read(addr: u32, len: u8) -> Vec<u8> {
     let mut data = vec![0u8; len as usize];
     for (start, bytes) in flash_blocks() {
@@ -406,23 +343,19 @@ pub fn spi_flash_read(addr: u32, len: u8) -> Vec<u8> {
     payload
 }
 
-/// One decoded host-bound output report from the driver.
 pub enum SwitchOutput {
-    /// `0x80 <cmd>` USB command — answer with [`build_usb_ack`].
+    /// `0x80 <cmd>` — reply with [`build_usb_ack`].
     UsbCmd(u8),
-    /// `0x01` subcommand (with its rumble bytes) — answer with a `0x21` reply.
+    /// `0x01` — reply with `0x21`.
     Subcmd {
         id: u8,
-        /// Subcommand argument bytes (report bytes 11..).
         args: Vec<u8>,
-        /// Decoded rumble `(low, high)` magnitudes.
         rumble: (u16, u16),
     },
-    /// `0x10` rumble-only report — no reply expected.
+    /// `0x10` rumble-only — no reply.
     Rumble((u16, u16)),
 }
 
-/// Parse one output report from the driver. Returns `None` for anything unrecognized/short.
 pub fn parse_output(data: &[u8]) -> Option<SwitchOutput> {
     match *data.first()? {
         0x80 => Some(SwitchOutput::UsbCmd(*data.get(1)?)),
@@ -436,9 +369,8 @@ pub fn parse_output(data: &[u8]) -> Option<SwitchOutput> {
     }
 }
 
-/// The driver's `joycon_rumble_amplitudes` table, amplitude column only, indexed by
-/// `amp_high / 2` (the encoded high-band amplitude byte is always even). Copied verbatim from
-/// hid-nintendo.c; last entry = `joycon_max_rumble_amp` (1003).
+/// `joycon_rumble_amplitudes` amplitude column, indexed by `amp_high / 2`.
+/// Last entry is `joycon_max_rumble_amp` (1003).
 #[rustfmt::skip]
 const RUMBLE_AMPS: [u16; 101] = [
        0,   10,   12,   14,   17,   20,   24,   28,   33,   40,
@@ -454,9 +386,8 @@ const RUMBLE_AMPS: [u16; 101] = [
     1003,
 ];
 
-/// Invert the driver's per-side rumble encoding back to the 0..=0xFFFF magnitude it scaled
-/// from: byte1's even bits carry the amplitude-table index × 2 (`data[1] = freq_high_lo +
-/// amp.high`, where the freq contribution is only ever bit 0).
+/// Invert one side: even bits of byte 1 are the table index × 2
+/// (`data[1] = freq_high_lo + amp.high`; freq is bit 0 only).
 fn side_amplitude(side: &[u8]) -> u16 {
     let idx = ((side[1] & 0xFE) / 2) as usize;
     let amp = RUMBLE_AMPS[idx.min(RUMBLE_AMPS.len() - 1)] as u32;
@@ -464,8 +395,7 @@ fn side_amplitude(side: &[u8]) -> u16 {
     ((amp * 65535) / 1003).min(65535) as u16
 }
 
-/// Decode the 8 rumble bytes (left side = strong → wire `low`, right side = weak → wire
-/// `high`, per `joycon_play_effect`).
+/// 8 rumble bytes → (low, high). Left = strong/low, right = weak/high (`joycon_play_effect`).
 pub fn decode_rumble(bytes: &[u8]) -> (u16, u16) {
     if bytes.len() < 8 {
         return (0, 0);
@@ -473,8 +403,7 @@ pub fn decode_rumble(bytes: &[u8]) -> (u16, u16) {
     (side_amplitude(&bytes[..4]), side_amplitude(&bytes[4..8]))
 }
 
-/// Decode a player-lights subcommand payload (`(flash << 4) | on`, one bit per LED) into the
-/// wire `PlayerLeds` bits: a flashing LED counts as on.
+/// `(flash << 4) | on` → wire bits. A flashing LED counts as on.
 pub fn player_leds_bits(arg: u8) -> u8 {
     (arg & 0x0F) | (arg >> 4)
 }
@@ -483,9 +412,7 @@ pub fn player_leds_bits(arg: u8) -> u8 {
 mod tests {
     use super::*;
 
-    /// The positional swap, pinned: wire south/east/west/north land on the Switch B/A/Y/X bits
-    /// (the driver then maps them back to BTN_SOUTH/EAST/WEST/NORTH — position-correct
-    /// end-to-end), and the rest of the buttons land on their JC_BTN_* bits.
+    /// Wire south/east/west/north → Switch B/A/Y/X (`JC_BTN_*` for the rest).
     #[test]
     fn positional_swap_and_button_bits() {
         let st = SwitchState::from_gamepad(gs::BTN_A, 0, 0, 0, 0, 0, 0);
@@ -496,7 +423,6 @@ mod tests {
         assert_eq!(st.buttons, btn::Y);
         let st = SwitchState::from_gamepad(gs::BTN_Y, 0, 0, 0, 0, 0, 0);
         assert_eq!(st.buttons, btn::X);
-        // Shoulders / sticks / meta / dpad / triggers-as-digital.
         let st = SwitchState::from_gamepad(
             gs::BTN_LB | gs::BTN_RB | gs::BTN_BACK | gs::BTN_START | gs::BTN_GUIDE | gs::BTN_MISC1,
             0,
@@ -514,32 +440,27 @@ mod tests {
         assert_eq!(st.buttons, btn::UP | btn::LEFT);
     }
 
-    /// Sticks: wire full deflection → center ± range on the raw 12-bit axis, both axes the same
-    /// direction (the driver's own Y negation restores evdev's negative-up).
+    /// Full deflection → `center ± range`. Driver Y-negation restores evdev negative-up.
     #[test]
     fn stick_scaling() {
         assert_eq!(stick_raw(0), STICK_CENTER);
         assert_eq!(stick_raw(32767), STICK_CENTER + STICK_RANGE);
         assert_eq!(stick_raw(-32767), STICK_CENTER - STICK_RANGE);
-        // Extreme min doesn't underflow past the 12-bit range.
         assert!(stick_raw(i16::MIN) <= 0xFFF);
     }
 
-    /// The 3-byte 12-bit packing matches `hid_field_extract`'s little-endian bitfield order:
-    /// value A at bit 0, value B at bit 12.
+    /// A at bit 0, B at bit 12 (`hid_field_extract` LE bitfield).
     #[test]
     fn pack12_layout() {
         assert_eq!(pack12(0x578, 0x578), [0x78, 0x85, 0x57]); // 1400/1400 (the cal pair)
         assert_eq!(pack12(0x800, 0x800), [0x00, 0x08, 0x80]); // 2048/2048 (the center pair)
-                                                              // Extract back: a = b0 | (b1 & 0xF) << 8; b = (b1 >> 4) | b2 << 4.
         let p = pack12(0xABC, 0x123);
         let a = p[0] as u16 | ((p[1] as u16 & 0xF) << 8);
         let b = ((p[1] as u16) >> 4) | ((p[2] as u16) << 4);
         assert_eq!((a, b), (0xABC, 0x123));
     }
 
-    /// Report 0x30 layout, pinned against `struct joycon_input_report` + `joycon_imu_data`:
-    /// header bytes, packed sticks, and the 3 × 12-byte IMU frames (accel then gyro, LE).
+    /// `struct joycon_input_report` + `joycon_imu_data`: header, packed sticks, 3 IMU frames.
     #[test]
     fn report_0x30_layout() {
         let mut st = SwitchState::neutral();
@@ -556,17 +477,14 @@ mod tests {
         assert_eq!(&r[6..9], &pack12(STICK_CENTER, STICK_CENTER));
         assert_eq!(&r[9..12], &pack12(STICK_CENTER, STICK_CENTER));
         assert_eq!(r[12], VIBRATOR_READY);
-        // Frame 0 at byte 13: accel x/y/z then gyro x/y/z, i16 LE.
         assert_eq!(&r[13..15], &(-1i16).to_le_bytes());
         assert_eq!(&r[15..17], &0x3344u16.to_le_bytes());
         assert_eq!(&r[19..21], &0x1122u16.to_le_bytes());
-        // Frames repeat identically at +12 and +24.
         assert_eq!(&r[13..25], &r[25..37]);
         assert_eq!(&r[13..25], &r[37..49]);
     }
 
-    /// Subcommand replies: ≥ 49 bytes (we send 64), ack at byte 13, echoed id at byte 14 (the
-    /// ONLY byte the driver's matcher checks), payload from byte 15.
+    /// ≥ 49 bytes, ack at 13, echoed id at 14 (the only byte the driver matches).
     #[test]
     fn subcmd_reply_layout() {
         let st = SwitchState::neutral();
@@ -576,13 +494,11 @@ mod tests {
         assert_eq!(r[13], 0x90);
         assert_eq!(r[14], 0x10);
         assert_eq!(&r[15..17], &[0xAA, 0xBB]);
-        // USB ack: exactly the two bytes joycon_send_usb matches.
         let a = build_usb_ack(0x02);
         assert_eq!((a[0], a[1]), (0x81, 0x02));
     }
 
-    /// SPI blobs: magics read as ABSENT (≠ B2 A1); the stick blobs put center strictly between
-    /// min and max on both axes in the driver's per-side byte order; the reply echoes addr+len.
+    /// User magics absent; stick min < center < max in per-side byte order; reply echoes addr+len.
     #[test]
     fn spi_blobs_valid() {
         for addr in [0x8010u32, 0x801B, 0x8026] {
@@ -609,37 +525,29 @@ mod tests {
         let r = spi_flash_read(0x6046, 9);
         let (rc, _) = unpack(&r[5..8]);
         assert_eq!(rc, STICK_CENTER);
-        // IMU: offsets 0, driver-default scales — the identity calibration.
         let imu = spi_flash_read(0x6020, 24);
         let d = &imu[5..];
         assert_eq!(&d[0..6], &[0; 6]);
         assert_eq!(&d[6..8], &16384u16.to_le_bytes());
         assert_eq!(&d[12..18], &[0; 6]);
         assert_eq!(&d[18..20], &13371u16.to_le_bytes());
-        // An unmodelled range still answers, echoing addr+len over zero data.
         let gap = spi_flash_read(0x6050, 12);
         assert_eq!(&gap[..5], &[0x50, 0x60, 0, 0, 12]);
         assert_eq!(&gap[5..], &[0u8; 12]);
     }
 
-    /// ⭐ SDL — Steam's own Switch driver, and so what a GAME sees — reads the same calibration
-    /// in shapes `hid-nintendo` never asks for: all 18 factory bytes at `0x603D` in one read,
-    /// and the 22-byte user block at `0x8010`. Serving reads by exact `(addr, len)` answered the
-    /// kernel and zero-filled Steam, which zeroed its stick centre so every raw value read as
-    /// positive — both sticks pinned toward one corner, unable to travel past centre.
+    /// SDL reads 18 factory bytes at `0x603D` and 22 user bytes at `0x8010` — shapes
+    /// hid-nintendo never asks. Exact `(addr, len)` matching zero-fills those reads.
     #[test]
     fn spi_serves_sdl_read_shapes() {
-        // Factory: one 18-byte read = the left block then the right block, contiguous.
         let f = spi_flash_read(0x603D, 18);
         assert_eq!(&f[..5], &[0x3D, 0x60, 0, 0, 18]);
         assert_eq!(&f[5..14], &spi_flash_read(0x603D, 9)[5..]);
         assert_eq!(&f[14..], &spi_flash_read(0x6046, 9)[5..]);
-        // SDL's own centre parse over its left half must land on our centre, not 0.
         let cal = &f[5..];
         let cx = (((cal[4] as u16) << 8) & 0xF00) | cal[3] as u16;
         let cy = ((cal[5] as u16) << 4) | ((cal[4] as u16) >> 4);
         assert_eq!((cx, cy), (STICK_CENTER, STICK_CENTER));
-        // User: one 22-byte read; both magics sit where SDL looks and neither is B2 A1.
         let u = spi_flash_read(0x8010, 22);
         assert_eq!(&u[..5], &[0x10, 0x80, 0, 0, 22]);
         let user = &u[5..];
@@ -648,7 +556,7 @@ mod tests {
         assert_eq!(&user[11..13], &[0xFF, 0xFF]); // right magic @ 0x801B
     }
 
-    /// Motion unit conversion: wire (20 LSB/°·s, 10000 LSB/g) → raw (14.247 LSB/°·s, 4096 LSB/g).
+    /// Wire 20 LSB/°·s, 10000 LSB/g → raw 14.247 LSB/°·s, 4096 LSB/g.
     #[test]
     fn motion_units() {
         let mut st = SwitchState::neutral();
@@ -658,8 +566,7 @@ mod tests {
         assert_eq!(st.accel, [4096, -4096, 0]);
     }
 
-    /// Rumble decode inverts the driver's encoder: a neutral packet decodes to silence; the
-    /// max-amplitude packet decodes to full scale; left = low/strong, right = high/weak.
+    /// Neutral → 0; max amp → 65535; left = low/strong, right = high/weak.
     #[test]
     fn rumble_decode() {
         // Neutral per the driver's tables: freq defaults + amp 0.
@@ -678,7 +585,6 @@ mod tests {
         assert_eq!(decode_rumble(&[0x10; 4]), (0, 0));
     }
 
-    /// Output-report parse: the three shapes the driver sends.
     #[test]
     fn parse_output_shapes() {
         assert!(matches!(
@@ -687,8 +593,8 @@ mod tests {
         ));
         let mut sub = vec![0x01, 0x05];
         sub.extend_from_slice(&[0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40]);
-        sub.push(0x10); // subcmd id
-        sub.extend_from_slice(&[0x3D, 0x60, 0x00, 0x00, 0x09]); // SPI addr+len args
+        sub.push(0x10);
+        sub.extend_from_slice(&[0x3D, 0x60, 0x00, 0x00, 0x09]);
         match parse_output(&sub) {
             Some(SwitchOutput::Subcmd { id, args, rumble }) => {
                 assert_eq!(id, 0x10);
@@ -707,7 +613,7 @@ mod tests {
         assert!(parse_output(&[]).is_none());
     }
 
-    /// Player lights: solid + flashing nibbles both count as lit.
+    /// Solid and flashing nibbles both count as lit.
     #[test]
     fn player_lights() {
         assert_eq!(player_leds_bits(0x01), 0b0001);
@@ -715,7 +621,6 @@ mod tests {
         assert_eq!(player_leds_bits(0x23), 0b0011 | 0b0010);
     }
 
-    /// Device info: type byte 0x03 (Pro Controller) at payload[2], MAC at [4..10].
     #[test]
     fn device_info_shape() {
         let mac = switch_mac(3);

@@ -1,16 +1,17 @@
 //! `--demo`: the whole flow against a canned box, with nothing able to touch this machine.
 //!
-//! The guarantee is structural, not careful: demo mode hands the plan a `DemoRunner`, and the
-//! runner is the only thing in the crate that can spawn. There is no flag inside `exec` to get
-//! wrong. `design/installer-v2.md` D9.
+//! The guarantee is structural: demo mode hands the plan a `DemoRunner`, and
+//! the runner is the only thing in the crate that can spawn. There is no flag
+//! inside `exec` to get wrong. See `design/installer-v2.md`.
 //!
-//! Presets are built here rather than parsed from embedded JSON so they cannot drift from the
-//! `Facts` struct — adding a field breaks this file instead of silently defaulting a preset.
-//! `--facts <file.json>` remains the escape hatch for an arbitrary box.
+//! Presets are built here rather than parsed from embedded JSON so they cannot
+//! drift from `Facts` — adding a field breaks this file instead of silently
+//! defaulting a preset. `--facts <file.json>` is the escape hatch for an
+//! arbitrary box.
 //!
-//! `--fail <phase>` resolves, at plan time, which command index that phase starts at and tells
-//! the runner to fail there, so the failure rendering is reviewable without `exec` knowing
-//! demo mode exists.
+//! `--fail <phase>` resolves, at plan time, which command index that phase
+//! starts at and tells the runner to fail there, so failure rendering is
+//! reviewable without `exec` knowing demo mode exists.
 
 use std::cell::Cell;
 
@@ -20,15 +21,13 @@ use crate::seam::{BasePaths, CommandRunner, Output, RunFailed, Stdin};
 
 /// Demo mode's filesystem root.
 ///
-/// The runner alone does not keep D9's promise: a `SetEnv` step edits host.env with `std::fs`,
-/// not through a spawn, so it would reach the real `~/.config/punktfunk` however fake the
-/// runner is. `BasePaths` is the seam that covers filesystem reach, so demo mode moves it.
+/// A `SetEnv` step edits host.env with `std::fs`, not a spawn, so a fake runner would still
+/// reach `~/.config/punktfunk`. `BasePaths` is the seam that covers filesystem reach.
 pub fn sandbox_paths() -> BasePaths {
     let root = std::env::temp_dir().join(format!("punktfunk-setup-demo-{}", std::process::id()));
     BasePaths::rooted(&root)
 }
 
-/// One per flow worth reviewing (D9).
 pub const PRESETS: [&str; 9] = [
     "arch-fresh",
     "debian-fresh",
@@ -231,10 +230,7 @@ impl CommandRunner for DemoRunner {
     }
 }
 
-/// Which command index the named phase's first command sits at.
-///
-/// Accepts a phase title prefix, case-insensitively, so `--fail install` and `--fail firewall`
-/// both work without the caller knowing the phase enum.
+/// Command index of the named phase's first command. Title prefix, case-insensitive.
 pub fn fail_index(plan: &Plan, phase: &str) -> Option<usize> {
     let needle = phase.to_lowercase();
     let mut command = 0usize;
@@ -267,7 +263,6 @@ mod tests {
         assert!(preset("nope").is_none());
     }
 
-    /// D9's acceptance: every preset walks the whole engine without panicking.
     #[test]
     fn every_preset_builds_a_plan() {
         for name in PRESETS {
@@ -301,8 +296,7 @@ mod tests {
         assert_eq!(fail_index(&built, "nonsense"), None);
     }
 
-    /// A `SetEnv` step writes with `std::fs`, so a fake runner alone does not make demo mode
-    /// safe. This is the seam that does; it once wrote a real `~/.config/punktfunk/host.env`.
+    /// A `SetEnv` step writes with `std::fs`, so a fake runner alone does not make demo mode safe.
     #[test]
     fn the_sandbox_never_points_at_the_real_config_directory() {
         let sandbox = sandbox_paths().host_env();

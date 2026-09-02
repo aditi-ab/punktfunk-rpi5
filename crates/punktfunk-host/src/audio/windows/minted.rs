@@ -1,28 +1,18 @@
-//! Minted punktfunk-owned audio endpoints — the Windows audio substrate.
+//! Minted punktfunk-owned audio endpoints — own instances of Valve's streaming-audio
+//! drivers, not Steam's primaries and not a bundled VB-Cable.
 //!
-//! The audio-substrate decision (`windows-audio-endpoints-and-vbcable.md`, 2026-08-07, spikes
-//! S2+S3 measured green): instead of borrowing Steam's primary endpoints and bundling VB-Cable
-//! for the mic, the host mints its OWN instances of Valve's streaming-audio drivers —
+//! * Speakers (`SteamStreamingSpeakers.inf`): silent host sink; WASAPI loopback feeds the encoder.
+//! * Microphone (`SteamStreamingMicrophone.inf`): host writes decoded voice to render; capture
+//!   is the mic host apps record.
 //!
-//! * **"Punktfunk Speakers"** (`SteamStreamingSpeakers.inf`): the client-only loopback sink.
-//!   Desktop audio routes here (the wiring plan parks the default playback on it during a
-//!   stream), its WASAPI loopback feeds the encoder, and the host stays silent. Measured
-//!   clean: 48 kHz stereo f32, loopback peak == rendered peak (S2).
-//! * **"Punktfunk Microphone"** (`SteamStreamingMicrophone.inf`): the virtual mic. The host
-//!   writes the client's decoded voice into its render side; its capture side surfaces as the
-//!   microphone host apps record. Measured bit-faithful render→capture (S3).
+//! A background worker at host start mints one marked `ROOT\MEDIA` devnode per role
+//! (`PunktfunkAudioRole` in Device Parameters — names match Steam's primaries, so identity is
+//! the marker). [`minted_ids`] publishes the endpoint ids for the wiring plan. Missing Steam
+//! drivers, a denied install, or `PUNKTFUNK_NO_AUDIO_MINT` leaves the ids empty and the plan
+//! stays on the name-based ladder.
 //!
-//! Provisioning mirrors the pad-audio provider: a background worker at host start, idempotent
-//! devnode-per-role with a durable `PunktfunkAudioRole` marker in `Device Parameters` (names
-//! are NOT identity — a minted instance is name-identical to Steam's primaries), results
-//! published once for the wiring plan to consume BY ID ([`minted_ids`] →
-//! [`wiring_plan::MintedIds`]). Everything is best-effort: no Steam driver, a denied install,
-//! or `PUNKTFUNK_NO_AUDIO_MINT` leaves the ids empty and the wiring plan falls back to the
-//! name-based ladder (Steam primaries → cable → real hardware) unchanged.
-//!
-//! Endpoints are PERSISTENT by design, like pad endpoints — they survive host restarts and
-//! re-resolve by marker on the next start. `punktfunk-host audio-probe` carries the manual
-//! `mint` / `plan` inspection paths.
+//! Endpoints persist across host restarts and re-resolve by marker. Evidence:
+//! `design/windows-audio-endpoints-and-vbcable.md`. Probe: `punktfunk-host audio-probe mint`.
 
 use super::pad_endpoint as pe;
 use super::{audio_control, wiring_plan};
@@ -32,28 +22,19 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Durable role marker in a minted devnode's `Device Parameters` key. pub(crate): the uninstall
-/// sweep ([`devnode_cleanup`](super::devnode_cleanup)) matches devnodes on it.
+/// Durable `Device Parameters` marker. The uninstall sweep matches minted devnodes on it.
 pub(crate) const ROLE_MARKER: &str = "PunktfunkAudioRole";
-/// How long to wait for audiosrv to register a freshly minted endpoint.
+/// Audiosrv can take this long to register a freshly minted endpoint.
 const ENDPOINT_WAIT: Duration = Duration::from_secs(15);
-/// Minimum spacing between provisioning retries once the startup attempt failed
-/// ([`ensure_provisioned`] is called from wiring passes, which recur freely).
+/// Floor between retries. [`ensure_provisioned`] is called from wiring passes, which recur freely.
 const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
-/// Full passes that ended unlatched before minting gives up for this host lifetime (a service
-/// restart re-arms). An unlatched pass that reaches the PnP surface costs the whole BOX, not
-/// just us: the driver (re)bind raises a device-change broadcast every running app services,
-/// and games rebuild their audio graph on it — a box that cannot mint must not pay that on
-/// every retry forever (field-measured 2026-08-12 as Helldivers 2 hitching to 2–5 FPS 1% lows,
-/// one hitch per mic-pump reopen).
+/// Unlatched PnP (re)binds broadcast a device-change every running app services.
+/// A box that cannot mint must not pay that on every retry; a service restart re-arms.
 const MAX_UNLATCHED_ATTEMPTS: u32 = 5;
-/// How long [`ensure_blocking`] waits on a pass another thread already runs before giving the
-/// wiring plan the unlatched answer (a full cold-boot pass worst-cases around two
-/// [`ENDPOINT_WAIT`]s plus the stamp settles).
+/// Wait for an in-flight pass. A cold mint worst-cases around two [`ENDPOINT_WAIT`]s plus stamp settles.
 const BLOCKING_WAIT: Duration = Duration::from_secs(90);
 
-/// The two minted roles. `value` is the persisted marker; the needles drive
-/// [`discover_driver`].
+/// Persisted marker (`value`) and the INF/hwid needles for [`discover_driver`].
 #[derive(Clone, Copy, PartialEq)]
 enum Role {
     Speakers,
@@ -93,8 +74,7 @@ impl Role {
     }
 }
 
-/// The provider's published result. Partial is possible and usable (one driver leg failing
-/// must not cost the other role); consumers read the per-role `Option`s.
+/// Partial is usable: one driver leg failing must not cost the other role.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct MintedAudio {
     pub speakers_devnode: Option<String>,
@@ -110,19 +90,16 @@ impl MintedAudio {
     }
 }
 
-/// Set once by the worker, and only when at least one role provisioned (the pad provider's R5
-/// lesson: latching an empty result turns one transient failure into a process-lifetime
-/// disability).
+/// Latch only a non-empty result. An empty latch freezes a transient failure for the process lifetime.
 static PROVISIONED: OnceLock<Arc<MintedAudio>> = OnceLock::new();
-/// A provisioning attempt is in flight — keeps concurrent askers to one worker.
+/// Keeps concurrent askers to one worker.
 static PROVISIONING: AtomicBool = AtomicBool::new(false);
-/// When the last attempt STARTED — the [`RETRY_COOLDOWN`] anchor.
+/// When the last attempt started — the [`RETRY_COOLDOWN`] anchor, not when it finished.
 static LAST_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
-/// Completed passes that did not latch, across the worker and the blocking path — the
-/// [`MAX_UNLATCHED_ATTEMPTS`] give-up counter.
+/// Give-up counter for [`MAX_UNLATCHED_ATTEMPTS`], shared by the worker and the blocking path.
 static UNLATCHED_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 
-/// Count one finished-but-unlatched pass; the crossing attempt logs the give-up exactly once.
+/// Count one finished-but-unlatched pass. The crossing attempt logs the give-up exactly once.
 fn record_unlatched_attempt() {
     let n = UNLATCHED_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
     if n == MAX_UNLATCHED_ATTEMPTS {
@@ -139,13 +116,7 @@ fn gave_up() -> bool {
     UNLATCHED_ATTEMPTS.load(Ordering::SeqCst) >= MAX_UNLATCHED_ATTEMPTS
 }
 
-/// The wiring plan's tier-0 input: the minted ids, or all-empty while nothing is provisioned.
-///
-/// The mic ids were briefly unpublished during the 2026-08-07 pitch investigation ("voice an
-/// octave low") — the eventual measured truth: both pins run stereo/48 kHz fine, the octave
-/// came from the driver's DEFAULT endpoints disagreeing (stereo render vs mono capture), and
-/// the per-direction stamp sets in [`stamp_identity`] fix it permanently
-/// (`audio-probe micpitch`: 440 Hz in → 440 Hz out, peak exact). Full tier-0 restored.
+/// Wiring-plan tier-0: minted endpoint ids, or all-empty while nothing is provisioned.
 pub(crate) fn minted_ids() -> wiring_plan::MintedIds {
     match PROVISIONED.get() {
         Some(m) => wiring_plan::MintedIds {
@@ -157,14 +128,12 @@ pub(crate) fn minted_ids() -> wiring_plan::MintedIds {
     }
 }
 
-/// The raw provisioning record — the probe's view (unlike [`minted_ids`], the mic ids are
-/// visible here).
+/// The full record including devnode instance ids. [`minted_ids`] is the wiring-plan subset.
 pub(crate) fn provisioned() -> Option<Arc<MintedAudio>> {
     PROVISIONED.get().cloned()
 }
 
-/// Spawn the provisioning worker (idempotent; returns immediately). Called at host start next
-/// to the pad provider, and again from [`ensure_provisioned`] on the retry path.
+/// Spawn the provisioning worker. Idempotent; returns immediately.
 pub(crate) fn provision_at_startup() {
     if std::env::var_os("PUNKTFUNK_NO_AUDIO_MINT").is_some() || gave_up() {
         return;
@@ -208,9 +177,7 @@ pub(crate) fn provision_at_startup() {
     }
 }
 
-/// Retry hook for wiring passes: cheap once latched; while unlatched it re-asks at most every
-/// [`RETRY_COOLDOWN`] — a box where Steam arrives later mints on a later pass instead of at
-/// the next reboot.
+/// Wiring-pass retry. Cheap once latched; while unlatched, at most every [`RETRY_COOLDOWN`] so a late Steam install still mints.
 pub(crate) fn ensure_provisioned() {
     if PROVISIONED.get().is_some() || gave_up() {
         return;
@@ -224,8 +191,7 @@ pub(crate) fn ensure_provisioned() {
     provision_at_startup();
 }
 
-/// One synchronous provisioning pass over both roles (worker thread + the `audio-probe mint`
-/// devtest). Per-role failures degrade to that role being absent.
+/// One pass over both roles. A per-role failure leaves that role absent rather than failing the pair.
 fn ensure_all() -> Result<MintedAudio> {
     wasapi::initialize_mta()
         .ok()
@@ -251,16 +217,10 @@ fn ensure_all() -> Result<MintedAudio> {
     Ok(out)
 }
 
-/// Ensure one role's devnode + endpoint(s): reuse the marker-matched devnode from an earlier
-/// run, else mint one; (re)bind the driver idempotently; wait for audiosrv's endpoints; put
-/// back any default device the fresh endpoint grabbed (measured on the pad program: a newly
-/// registered endpoint can take either default).
+/// One role: reuse a marked healthy devnode, else mint; (re)bind; wait for audiosrv. A fresh endpoint can steal either default — put it back.
 fn ensure_role(role: Role) -> Result<(String, String, Option<String>)> {
-    // Steady state: a previous run's devnode with all endpoints live — resolve by marker and
-    // return without touching PnP or the default-device policy. The full pass below (re)binds
-    // the driver even over an existing devnode, and that bind raises a device-change broadcast
-    // every running app services — right at first mint, ruinous from a retry path (each
-    // broadcast makes games rebuild their audio graph; see [`MAX_UNLATCHED_ATTEMPTS`]).
+    // Healthy marked endpoints: return without a driver (re)bind. That bind broadcasts
+    // a device-change every running app services; games rebuild their audio graph on it.
     if let Some((devnode, render, capture)) = find_healthy_role(role)? {
         stamp_identity(&render, role, false);
         if let Some(cap) = capture.as_ref() {
@@ -275,12 +235,8 @@ fn ensure_role(role: Role) -> Result<(String, String, Option<String>)> {
     let (hwid, inf) = discover_driver(role.needle(), role.inf_name())?;
     let devnode = match find_role_devnode(role)? {
         Some(inst) => inst,
-        // Before minting a SECOND devnode, reclaim an abandoned one. Minting is two PnP steps
-        // (register, then mark), and a host that dies between them — the 0.30.0 teardown abort
-        // did exactly this, five times on one box — leaves a registered, driver-bound, endpoint-
-        // serving devnode that carries no marker. Nothing then resolves it: the next pass mints
-        // a fresh one and the orphan lingers as a duplicate "Punktfunk Speakers"/"Punktfunk
-        // Microphone" in the Sound zoo, invisible to the marker-matched uninstall sweep.
+        // Register-then-mark can leave a live unmarked devnode. Adopt it before minting
+        // a second; the uninstall sweep only sees marked instances.
         None => match adopt_orphan_devnode(role, &hwid)? {
             Some(inst) => inst,
             None => {
@@ -302,24 +258,12 @@ fn ensure_role(role: Role) -> Result<(String, String, Option<String>)> {
         Role::Speakers => None,
     };
 
-    // Stamp the human name onto every endpoint of the role. Field-measured necessity, not
-    // cosmetics: unstamped, the minted instances read "Lautsprecher (2- Steam Streaming
-    // Microphone)" etc. and even the box's owner picked the wrong device out of the Sound
-    // settings zoo. The MIC RENDER additionally gets a MONO format set — measured (440 Hz in,
-    // 220 Hz out): the driver forwards the render stream RAW into its mono capture side, so a
-    // stereo-declared render plays back an octave low; declaring mono makes the engine
-    // downmix before the crossing. Minimal stamps only (a wider set makes
-    // AudioEndpointBuilder re-mint the endpoint under a new GUID — the pad program measured
-    // that); stamping needs the SYSTEM ACL route on the MMDevices keys, so a dev-run devtest
-    // may leave them unstamped — the wiring never depends on them (identity is the recorded
-    // id).
     stamp_identity(&render, role, false);
     if let Some(cap) = capture.as_ref() {
         stamp_identity(cap, role, true);
     }
 
-    // Freshly registered endpoints can grab a default; the wiring plan owns default policy,
-    // not the mint.
+    // A freshly registered endpoint can grab a default. The wiring plan owns that policy, not the mint.
     if let Some(prev) = prev_render {
         if audio_control::default_render_id().as_deref() != Some(prev.as_str())
             && audio_control::set_default_endpoint(&prev).is_ok()
@@ -343,10 +287,7 @@ fn ensure_role(role: Role) -> Result<(String, String, Option<String>)> {
     Ok((devnode, render, capture))
 }
 
-/// The role's marker devnode with EVERY endpoint the role owes already registered, or `None`
-/// (missing devnode, missing endpoint, or an enumeration error → the caller runs the full
-/// pass). Same endpoint resolvers [`wait_for`] polls, so "healthy" here is exactly the state
-/// the full pass would declare ready.
+/// Marker-matched devnode with every endpoint the role owes already registered, else `None` so the caller runs the full pass.
 fn find_healthy_role(role: Role) -> Result<Option<(String, String, Option<String>)>> {
     let Some(devnode) = find_role_devnode(role)? else {
         return Ok(None);
@@ -364,25 +305,16 @@ fn find_healthy_role(role: Role) -> Result<Option<(String, String, Option<String
     Ok(Some((devnode, render, capture)))
 }
 
-/// How many stamp/settle passes a name gets before we accept "stored but not yet served"
-/// (a settled endpoint takes the stamp on the first pass; a freshly minted one may need the
-/// audio stack to notice — it serves after the next Audiosrv restart/reboot at the latest).
+/// Stamp/settle passes before accepting "stored but not yet served". A settled endpoint takes the first; a fresh one may wait for Audiosrv.
 const STAMP_ATTEMPTS: usize = 3;
-/// Settle time between a stamp write and its served-check (mirrors the pad provisioner:
-/// checking immediately reports success on passes that later get reverted).
+/// Gap between a stamp write and the served-check. Immediate reads report success on writes the stack later reverts.
 const STAMP_SETTLE: Duration = Duration::from_millis(1200);
 
-/// `WAVEFORMATEXTENSIBLE`: 2 ch / 48 kHz / 32-bit float, mask 0x3 (FL FR), IEEE-float subtype
-/// — the ONE format both sides of the minted microphone declare.
+/// Stereo 48 kHz f32 `WAVEFORMATEXTENSIBLE` — both sides of the minted mic declare this mix format.
 ///
-/// Measured ground truth (micpitch, 2026-08-07): the driver forwards the render stream RAW
-/// into the capture side, and its render pin is STEREO-ONLY (a mono-stamped render turned the
-/// endpoint unopenable — `AUDCLNT_E_UNSUPPORTED_FORMAT` on every open, the pad program's
-/// incoherent-stamp signature). The driver-default capture side declares MONO, so the raw
-/// stereo stream read as mono played voice an octave low. Declaring the CAPTURE side stereo —
-/// matching what actually crosses — is the honest fix; the render's stereo float default is
-/// stamped explicitly too, pinning the pair coherent (and healing any endpoint a previous
-/// build left mono-stamped).
+/// The driver forwards the render stream raw into capture. A mono-stamped render is unopenable
+/// (`AUDCLNT_E_UNSUPPORTED_FORMAT`); a stereo render against a mono capture default plays an
+/// octave low. Pin both sides coherent.
 const WFX_F32_2CH_48K: [u8; 40] = [
     0xfe, 0xff, // wFormatTag = WAVE_FORMAT_EXTENSIBLE
     0x02, 0x00, // nChannels = 2
@@ -396,9 +328,7 @@ const WFX_F32_2CH_48K: [u8; 40] = [
     0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b,
     0x71, // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
 ];
-/// The PCM16 leg of the stereo set — the pad program's measured coherence rule: the DEVICE
-/// format is 16-bit PCM, the mix/host formats float (a float device-format was part of the
-/// incoherent sets that made endpoints unopenable).
+/// Device-format leg: 16-bit PCM stereo. A float device-format is one of the incoherent sets that make the endpoint unopenable.
 const WFX_PCM16_2CH_48K: [u8; 40] = [
     0xfe, 0xff, // wFormatTag = WAVE_FORMAT_EXTENSIBLE
     0x02, 0x00, // nChannels = 2
@@ -413,9 +343,7 @@ const WFX_PCM16_2CH_48K: [u8; 40] = [
     0x71, // KSDATAFORMAT_SUBTYPE_PCM
 ];
 
-/// Best-effort: write the role's display name — plus, on the mic RENDER, the mono format set —
-/// onto one endpoint and wait for the audio stack to SERVE it. Never fails the role — an
-/// unstamped endpoint still wires correctly by id.
+/// Best-effort display name and, on the mic, the stereo format set. Never fails the role — wiring keys off the recorded id. A wider stamp makes AudioEndpointBuilder re-mint the endpoint under a new GUID.
 fn stamp_identity(endpoint_id: &str, role: Role, capture: bool) {
     let mut stamps = vec![
         pe::Stamp {
@@ -429,14 +357,8 @@ fn stamp_identity(endpoint_id: &str, role: Role, capture: bool) {
             value: pe::StampValue::Str("Punktfunk"),
         },
     ];
-    // The mic pair runs STEREO 48 kHz on both sides — the pins accept it (micpins), and the
-    // octave-low voice was the two sides DISAGREEING (stereo render default vs mono capture
-    // default). The stamp sets differ per direction, bisected live:
-    //   * RENDER: the pad program's proven PCM16-device/float-mix split (its own bisect).
-    //   * CAPTURE: the DEVICE format ONLY — the mix/host keys are RENDER-engine properties,
-    //     and stamping them onto a capture endpoint broke its shared-mode graph
-    //     (IsFormatSupported said 2ch/48k OK while Initialize failed 0x88890008 on a fresh,
-    //     once-stamped endpoint; unstamped it opened fine).
+    // Both mic pins stereo 48 kHz. Capture gets the device format only — mix/host keys
+    // are render-engine properties and break shared-mode Initialize on a capture endpoint.
     if role == Role::Mic {
         stamps.push(pe::Stamp {
             label: "device-format",
@@ -463,8 +385,7 @@ fn stamp_identity(endpoint_id: &str, role: Role, capture: bool) {
             ]);
         }
     }
-    // Steady state (every boot after the first): the names are already served — no writes,
-    // no settle sleeps.
+    // Already served (every boot after the first): no writes, no settle sleeps.
     if pe::stamps_served(endpoint_id, &stamps) {
         return;
     }
@@ -493,7 +414,7 @@ fn stamp_identity(endpoint_id: &str, role: Role, capture: bool) {
          audio-stack restart or reboot");
 }
 
-/// Poll audiosrv for the endpoint a minted devnode registers in one direction.
+/// Poll until audiosrv has registered this devnode's render or capture endpoint.
 fn wait_for(devnode: &str, capture: bool) -> Result<String> {
     let deadline = Instant::now() + ENDPOINT_WAIT;
     loop {
@@ -516,7 +437,7 @@ fn wait_for(devnode: &str, capture: bool) -> Result<String> {
     }
 }
 
-/// The devnode a previous run minted for `role` (marker-matched — names are not identity).
+/// Marker-matched devnode from a previous run. Names match Steam's primaries, so they are not identity.
 fn find_role_devnode(role: Role) -> Result<Option<String>> {
     let set = pe::media_class_devs()?;
     for i in 0.. {
@@ -540,20 +461,12 @@ fn find_role_devnode(role: Role) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// Reclaim an ABANDONED punktfunk devnode for `role`, re-marking it so it resolves normally from
-/// here on; `None` when there is nothing to adopt (the ordinary first-mint path).
+/// Reclaim a `ROOT\MEDIA\NNNN` instance of this role's hwid that carries no owner marker.
 ///
-/// The shape adopted is `ROOT\MEDIA\NNNN` + the role's Steam hardware id + NO owner marker.
-/// That triple can only be ours: `ROOT\MEDIA\NNNN` is what
-/// `SetupDiCreateDeviceInfoW(… DICD_GENERATE_ID)` on the MEDIA class yields, and STEAM'S OWN
-/// devnodes are enumerated under `ROOT\SteamStreamingSpeakers\*` /
-/// `ROOT\SteamStreamingMicrophone\*` — they carry the same hardware id but never that instance
-/// prefix, which is precisely what keeps this from adopting (and later sweeping) Steam's devices.
-/// A marker of ANY family is left alone: it is a live devnode, ours but spoken for.
-///
-/// Which family the orphan came from does not matter. Every one is a plain instance of the same
-/// Valve driver; roles are ours to assign, and re-marking it here is what makes the assignment
-/// stick across restarts.
+/// Minting is register-then-mark; a host that dies between leaves a live, unmarked, driver-bound
+/// endpoint. The next pass would mint a duplicate the uninstall sweep cannot see. Steam's own
+/// devices are `ROOT\SteamStreamingSpeakers\*` / `ROOT\SteamStreamingMicrophone\*` — same hwid,
+/// never that instance prefix — so this cannot adopt them. Any family marker is left alone.
 fn adopt_orphan_devnode(role: Role, hwid: &str) -> Result<Option<String>> {
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
         SetupDiEnumDeviceInfo, SPDRP_HARDWAREID,
@@ -595,10 +508,7 @@ fn adopt_orphan_devnode(role: Role, hwid: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// Find the (exact hardware id, INF path) for one of Steam's streaming drivers: prefer any
-/// installed devnode whose hardware-id list contains `needle` (its `oemNN.inf` is the driver
-/// Windows already trusts), else fall back to Steam's driver directory. Shared with the
-/// `audio-probe` devtest.
+/// Hardware id + INF for one Steam streaming driver: prefer an installed `oemNN.inf` Windows already trusts, else Steam's driver directory.
 pub(crate) fn discover_driver(needle: &str, inf_name: &str) -> Result<(String, String)> {
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
         SetupDiEnumDeviceInfo, SPDRP_HARDWAREID,
@@ -630,12 +540,12 @@ pub(crate) fn discover_driver(needle: &str, inf_name: &str) -> Result<(String, S
                 return Ok((hwid, full));
             }
         }
-        // Devnode exists but its INF is gone — keep its exact hwid, try Steam's directory.
+        // Keep the exact hwid even if this devnode's INF is gone; try Steam's directory.
         if let Some(s) = steam_dir_inf() {
             return Ok((hwid, s));
         }
     }
-    // No installed devnode at all: canonical hwid + Steam's directory.
+    // The INF stem is the canonical ROOT hardware id when no matching devnode is installed.
     if let Some(s) = steam_dir_inf() {
         return Ok((format!("ROOT\\{}", inf_name.trim_end_matches(".inf")), s));
     }
@@ -645,22 +555,15 @@ pub(crate) fn discover_driver(needle: &str, inf_name: &str) -> Result<(String, S
     )
 }
 
-/// Synchronous provisioning — for the mic pump's resolve and the devtests.
+/// Synchronous pass for the mic pump's first resolve and the devtests.
 ///
-/// The pump's FIRST open must not race the startup worker: measured on the target box, the
-/// pump wired 2 s before the worker latched, took the cable as its write target, and the next
-/// wiring pass would then have pointed the default recording at the minted microphone —
-/// which nothing writes into: dead mic-air until a pump reopen. Blocking the first resolve
-/// (existing marker devnodes re-resolve in milliseconds; a cold boot pays the one-time mint)
-/// keeps the pump's target and the plan's verdict the same thing. Latched calls return
-/// immediately; the opt-out env is honoured like everywhere else.
+/// The pump's first open must not race the startup worker: wiring the cable, then parking
+/// default recording on a minted mic nobody writes, is a dead mic until reopen. Existing
+/// marked devnodes re-resolve in milliseconds; a cold boot pays the one-time mint. Latched
+/// calls and `PUNKTFUNK_NO_AUDIO_MINT` return immediately.
 ///
-/// While UNLATCHED this is where the pump's reopen backoff (capped at 60 s) used to meet an
-/// unguarded full pass: one PnP rebind + device-change broadcast roughly every minute, forever,
-/// on any box where minting cannot converge (the 2026-08-12 Helldivers 2 field report). Now a
-/// pass someone else already runs is WAITED for instead of raced, a failed pass repeats at most
-/// every [`RETRY_COOLDOWN`], and [`MAX_UNLATCHED_ATTEMPTS`] failures stop retrying for the
-/// host lifetime.
+/// Unlatched: wait for an in-flight pass instead of racing SetupAPI; a failed pass repeats
+/// at most every [`RETRY_COOLDOWN`]; [`MAX_UNLATCHED_ATTEMPTS`] stops for this host lifetime.
 pub(crate) fn ensure_blocking() {
     if std::env::var_os("PUNKTFUNK_NO_AUDIO_MINT").is_some()
         || PROVISIONED.get().is_some()
@@ -668,9 +571,7 @@ pub(crate) fn ensure_blocking() {
     {
         return;
     }
-    // A pass is in flight (the startup worker, or a concurrent resolve): wait for its verdict
-    // rather than racing a second SetupAPI/PnP sweep against it — that race is how the pump
-    // once ended up wired to the cable while the worker minted (the dead-mic-air deploy race).
+    // Wait for the in-flight pass rather than racing a second SetupAPI/PnP sweep.
     if PROVISIONING.swap(true, Ordering::SeqCst) {
         let deadline = Instant::now() + BLOCKING_WAIT;
         while PROVISIONING.load(Ordering::SeqCst) && Instant::now() < deadline {
@@ -678,8 +579,7 @@ pub(crate) fn ensure_blocking() {
         }
         return;
     }
-    // We own the slot. First-ever resolve runs unconditionally (the cold-boot mint the doc
-    // above insists on); after a failed pass the cooldown answers instead of a re-run.
+    // First resolve runs; after a failed pass the cooldown answers instead of a re-run.
     let run = {
         let mut last = LAST_ATTEMPT.lock().unwrap();
         if last.is_some_and(|t| t.elapsed() < RETRY_COOLDOWN) {

@@ -1,26 +1,19 @@
-//! Input capture — the `ui_stream` state machine on SDL events, upgraded to real
-//! pointer lock (the "stage-2 presenter's job" the GTK client deferred).
+//! Presenter input: SDL events → capture state and wire `InputEvent`s.
 //!
-//! Capture is a deliberate, reversible STATE (Moonlight-style): engaged when the stream
-//! starts and when the user clicks into the video (that click is suppressed toward the
-//! host); released by Ctrl+Alt+Shift+Q (toggles) or focus loss — held keys/buttons are
-//! flushed host-side on release so nothing sticks down. While captured the pointer is
-//! LOCKED (SDL relative mouse mode: hidden, confined, raw deltas) and motion goes on
-//! the wire as RELATIVE `MouseMove` — the local cursor can't outrun or escape the
-//! stream, so the only cursor you see is the host's. An auto-release from focus loss
-//! re-engages on focus gain; an explicit user release (the chord) stays released until
-//! the user opts back in.
+//! Capture is reversible. Engage at stream start and on click-into-video (that
+//! click is not forwarded). Release on Ctrl+Alt+Shift+Q or focus loss; held
+//! keys/buttons flush as ups. While captured, SDL relative mouse mode hides,
+//! confines, and feeds raw deltas as `MouseMove`. Focus-loss re-engages on
+//! gain; the chord stays released until the user opts in.
 //!
-//! Keys are SDL scancodes → VK via `keymap_sdl`, layout-independent. Motion deltas are
-//! COALESCED: one summed `MouseMove` per loop iteration (a 1000 Hz mouse would
-//! otherwise send a datagram per event).
+//! Keys are SDL scancodes → VK via `keymap_sdl` (layout-independent). Relative
+//! motion coalesces to one summed `MouseMove` per loop — a 1000 Hz mouse would
+//! otherwise send a datagram per event.
 //!
-//! The DESKTOP mouse model (design/remote-desktop-sweep.md M1) reuses this same engage/
-//! release state but never locks the pointer: the local cursor moves freely (hidden over
-//! the window — the host's composited cursor is the one you see) and motion goes on the
-//! wire as absolute positions through the letterbox (`MouseMoveAbs`, latest-wins per loop
-//! iteration). Requires a host injector with absolute support — gamescope's EIS is
-//! relative-only, so sessions there are pinned to capture ([`Capture::new`] `abs_ok`).
+//! Desktop mode (`design/remote-desktop-sweep.md`) reuses engage/release but
+//! never locks: the local cursor moves freely (hidden over the window) and
+//! motion is latest-wins `MouseMoveAbs` through the letterbox. Gamescope EIS
+//! is relative-only; those sessions pin to capture ([`Capture::new`] `abs_ok`).
 
 use crate::keymap_sdl;
 use crate::touch::{Abs, Act, Gestures};
@@ -32,10 +25,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 impl Act {
-    /// The `(InputKind, code, x, y, flags)` this intent sends. `Button`/`CycleStats` don't map
-    /// to a single motion send, so callers special-case them; this covers the motion/scroll
-    /// intents shared with the raw pointer path. Lives here, not in `touch.rs`, so the
-    /// gesture engine stays free of the platform-gated core dependency and tests everywhere.
+    /// Motion/scroll packing for the wire. Lives here, not in `touch.rs`: the
+    /// gesture engine must not take the platform-gated core dependency.
     pub fn wire(self) -> Option<(InputKind, u32, i32, i32, u32)> {
         match self {
             Act::MoveRel { dx, dy } => Some((InputKind::MouseMove, 0, dx, dy, 0)),
@@ -56,7 +47,7 @@ impl Act {
     }
 }
 
-/// Which transition a forwarded touchscreen finger is (SDL delivers one finger per event).
+/// One SDL finger event. SDL never batches fingers in a single event.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FingerPhase {
     Down,
@@ -67,47 +58,34 @@ pub enum FingerPhase {
 pub struct Capture {
     connector: Arc<NativeClient>,
     captured: bool,
-    /// The user released deliberately (the chord) — focus-gain must NOT re-engage.
+    /// Chord release: focus-gain must not re-engage.
     user_released: bool,
-    /// VKs / GameStream button ids currently held — flushed up on release.
     held_keys: HashSet<u8>,
     held_buttons: HashSet<u32>,
     /// Relative motion not yet on the wire, summed per loop iteration.
     pending_rel: (i32, i32),
     /// Desktop-model position not yet on the wire, latest-wins per loop iteration.
     pending_abs: Option<Abs>,
-    /// The desktop (absolute, uncaptured) mouse model is active. Flipped live by the
-    /// Ctrl+Alt+Shift+M chord; never true unless `abs_ok`.
+    /// Never true unless `abs_ok`.
     desktop: bool,
-    /// The host injector accepts `MouseMoveAbs` (any compositor but gamescope).
+    /// Host injector accepts `MouseMoveAbs` (any compositor but gamescope).
     abs_ok: bool,
-    /// Fractional wheel remainder per axis (x, y) in 120-unit WHEEL_DELTA space —
-    /// precision surfaces deliver sub-unit deltas; truncating each event drops the tail.
+    /// Fractional remainder per axis in 120-unit WHEEL_DELTA space — precision
+    /// surfaces deliver sub-unit deltas; truncating each event drops the tail.
     scroll_acc: (f64, f64),
-    /// Active touchscreen contacts: SDL finger id → the small wire touch id (slot) we
-    /// forward it under. SDL finger ids are opaque and large; the host wants compact,
-    /// per-contact-unique ids reusable after up (input.rs::TouchDown). Slots are freed on
-    /// up and flushed up on release so no contact stays pressed on the host. Only used in
-    /// [`TouchMode::Touch`]; the other modes drive `gestures` instead.
+    /// SDL finger id → compact host slot (`TouchDown`). SDL ids are opaque and
+    /// large; slots reuse after up, flush on release. [`TouchMode::Touch`] only.
     touch_slots: HashMap<u64, u32>,
-    /// The touchscreen input model for this session, and — for trackpad/pointer — the
-    /// gesture state machine finger events feed.
     touch_mode: TouchMode,
-    /// Reverse the scroll direction sent to the host ([`Settings::invert_scroll`]).
     invert_scroll: bool,
     gestures: Gestures,
-    /// The session's effective access grants (per-client access §7) — the courtesy gate in
-    /// front of every wire send here, keyed by the SAME `classify()` the host's filter uses:
-    /// an event whose class the mask doesn't cover never leaves this struct (the host would
-    /// drop it anyway; not sending is what keeps "my keyboard does nothing" from being a
-    /// mystery — the run loop pairs this with not grabbing what can't land). Moved live by
-    /// [`Capture::set_grants`] on a mid-session `AccessUpdate`.
+    /// Session access mask. `send` uses the same [`classify`] as the host filter
+    /// so a new `InputKind` cannot slip one side. Live via [`Capture::set_grants`].
     grants: u32,
 }
 
-/// Forward one event IF the session's grants cover its class — the client half of the
-/// host's classify-and-drop filter, sharing its exhaustive [`classify`] so a future
-/// `InputKind` can't slip past one side and not the other.
+/// Drop locally if `grants` does not cover `kind`. Shares [`classify`] with the
+/// host so a new `InputKind` cannot pass one side only.
 fn send(
     connector: &NativeClient,
     grants: u32,
@@ -131,10 +109,8 @@ fn send(
 }
 
 impl Capture {
-    /// `abs_ok` = the host injector accepts absolute pointer events; without it the
-    /// desktop model is unavailable and `mouse_mode` silently resolves to capture.
-    /// `grants` = the session's effective access mask (the Welcome advert — the run loop
-    /// keeps it live through [`Capture::set_grants`]).
+    /// Without `abs_ok` the desktop model is unavailable and `mouse_mode`
+    /// silently resolves to capture.
     pub fn new(
         connector: Arc<NativeClient>,
         touch_mode: TouchMode,
@@ -166,25 +142,19 @@ impl Capture {
         self.captured
     }
 
-    /// The session's effective access grants — what the run loop passes to
-    /// `apply_capture` so pointer lock and the keyboard grab track the mask.
+    /// Access mask the run loop feeds `apply_capture` so lock/grab track it.
     pub fn grants(&self) -> u32 {
         self.grants
     }
 
-    /// Whether engaging capture buys anything at all: with neither POINTER nor KEYBOARD
-    /// granted there is nothing to lock or grab FOR (a view-only or controller-only
-    /// session), so [`Capture::engage`] refuses and the "click to capture" hint stays
-    /// down — the worst failure mode is a locked pointer whose motion lands nowhere.
+    /// Without POINTER or KEYBOARD, engage would lock a pointer that lands nowhere.
     pub fn can_capture(&self) -> bool {
         self.grants & (GRANT_POINTER | GRANT_KEYBOARD) != 0
     }
 
-    /// Fold a mid-session `AccessUpdate` into the gate. A class REMOVED while something
-    /// of its kind is held flushes the held state up first, under the OLD mask — the
-    /// host may still honor the ups, and either way nothing stays pressed locally. The
-    /// run loop re-applies pointer lock / keyboard grab (and releases capture entirely
-    /// when [`Capture::can_capture`] went false) right after this.
+    /// Mid-session `AccessUpdate`. Lost classes flush held ups under the OLD
+    /// mask first — the host may still honor them. The run loop then re-applies
+    /// lock/grab, and releases capture if [`Capture::can_capture`] went false.
     pub fn set_grants(&mut self, grants: u32) {
         if grants == self.grants {
             return;
@@ -233,14 +203,12 @@ impl Capture {
         self.grants = grants;
     }
 
-    /// The desktop (absolute, uncaptured) mouse model is active.
     pub fn desktop(&self) -> bool {
         self.desktop
     }
 
-    /// Flip capture ⇄ desktop (the Ctrl+Alt+Shift+M chord). `None` = the host can't take
-    /// absolute pointer events (gamescope), so the chord has nothing to offer; otherwise
-    /// the new desktop state. Motion gathered under the old model never crosses modes.
+    /// Ctrl+Alt+Shift+M. `None` if the host cannot take absolute events
+    /// (gamescope). Pending motion from the old model is dropped, not sent.
     pub fn toggle_desktop(&mut self) -> Option<bool> {
         if !self.abs_ok {
             return None;
@@ -251,10 +219,9 @@ impl Capture {
         Some(self.desktop)
     }
 
-    /// Set the mouse model directly (the M3 host-driven flip — `relative_hint` says a host
-    /// app grabbed/hid the pointer, so run relative; hint clear = back to absolute). Same
-    /// gating and motion hygiene as [`toggle_desktop`](Self::toggle_desktop); returns whether
-    /// the model actually changed.
+    /// Host-driven flip: `relative_hint` grabbed/hid the pointer → relative;
+    /// hint clear → absolute. Same gating and pending-motion drop as
+    /// [`toggle_desktop`](Self::toggle_desktop).
     pub fn set_desktop(&mut self, on: bool) -> bool {
         if !self.abs_ok || self.desktop == on {
             return false;
@@ -265,16 +232,13 @@ impl Capture {
         true
     }
 
-    /// Whether a regained focus should re-engage: yes unless the user released
-    /// deliberately (the chord keeps its meaning across an Alt-Tab).
+    /// Re-engage on focus gain unless the user released via the chord.
     pub fn should_reengage(&self) -> bool {
         !self.captured && !self.user_released
     }
 
-    /// Engage capture. The caller flips SDL relative mouse mode on (pointer lock) —
-    /// only on `true`: a session whose grants cover neither pointer nor keyboard
-    /// refuses (see [`Capture::can_capture`]), and the caller must leave the pointer
-    /// free rather than lock it over input that can't land.
+    /// Caller turns on SDL relative mouse only if this returns true: otherwise
+    /// grants cover neither pointer nor keyboard ([`Capture::can_capture`]).
     pub fn engage(&mut self) -> bool {
         if !self.can_capture() {
             return false;
@@ -284,9 +248,8 @@ impl Capture {
         true
     }
 
-    /// Release capture, flushing everything held so nothing sticks down on the host.
-    /// `by_user` = the chord (stays released); focus loss re-engages on focus gain.
-    /// The caller flips SDL relative mouse mode off. Returns false if not engaged.
+    /// Flush held keys/buttons/touches as ups. `by_user` (the chord) stays
+    /// released; focus loss re-engages on gain. Caller turns off relative mouse.
     pub fn release(&mut self, by_user: bool) -> bool {
         if by_user {
             self.user_released = true;
@@ -294,7 +257,7 @@ impl Capture {
         if !std::mem::replace(&mut self.captured, false) {
             return false;
         }
-        self.pending_rel = (0, 0); // never flush motion gathered while captured
+        self.pending_rel = (0, 0); // never send motion gathered while captured
         self.pending_abs = None;
         for vk in self.held_keys.drain() {
             send(
@@ -329,14 +292,13 @@ impl Capture {
                 0,
             );
         }
-        // The gesture engine's held left button (a tap-drag in progress) rides in
-        // `held_buttons` above, so it was just flushed — here we only forget its state.
+        // Tap-drag's left button was flushed via `held_buttons`; only forget state.
         self.gestures.reset();
         true
     }
 
-    /// Forward the coalesced motion, if any — one datagram per loop iteration. Only one
-    /// of the two stores is ever populated (the run loop routes by [`desktop`](Self::desktop)).
+    /// One datagram per loop. Only one store is populated; the run loop routes
+    /// by [`desktop`](Self::desktop).
     pub fn flush_motion(&mut self) {
         let (dx, dy) = std::mem::take(&mut self.pending_rel);
         if dx != 0 || dy != 0 {
@@ -363,7 +325,6 @@ impl Capture {
         }
     }
 
-    /// Relative motion (SDL relative mouse mode delivers raw deltas while locked).
     pub fn on_motion(&mut self, xrel: f32, yrel: f32) {
         if self.captured && !self.desktop {
             self.pending_rel.0 += xrel as i32;
@@ -371,9 +332,8 @@ impl Capture {
         }
     }
 
-    /// Desktop-model motion: the cursor's position mapped into the letterboxed content
-    /// rect. Latest-wins — intermediate positions carry no information the final one
-    /// doesn't (unlike deltas, which must sum).
+    /// Letterboxed content position. Latest-wins: intermediates add nothing
+    /// (deltas must sum).
     pub fn on_motion_abs(&mut self, abs: Abs) {
         if self.captured && self.desktop {
             self.pending_abs = Some(abs);
@@ -385,8 +345,7 @@ impl Capture {
             return;
         }
         if let Some(vk) = keymap_sdl::scancode_to_vk(sc) {
-            // Keep the wire ordered: the host must see the cursor where the user does
-            // when the key lands (e.g. "press E at the crosshair").
+            // Host must see the cursor where the user does when the key lands.
             self.flush_motion();
             self.held_keys.insert(vk);
             send(
@@ -403,7 +362,7 @@ impl Capture {
 
     pub fn on_key_up(&mut self, sc: sdl3::keyboard::Scancode) {
         if let Some(vk) = keymap_sdl::scancode_to_vk(sc) {
-            // Flush-on-release may have beaten us to it — only forward if still held.
+            // Flush-on-release may have already sent this up.
             if self.held_keys.remove(&vk) {
                 send(
                     &self.connector,
@@ -418,9 +377,8 @@ impl Capture {
         }
     }
 
-    /// A button press while captured. The engaging click is the caller's business (it
-    /// never reaches here). Pending motion flushes first so the button-down lands where
-    /// the host cursor actually is.
+    /// The engaging click never reaches here. Flush motion first so the down
+    /// lands where the host cursor is.
     pub fn on_button_down(&mut self, b: sdl3::mouse::MouseButton) {
         if !self.captured {
             return;
@@ -457,9 +415,8 @@ impl Capture {
         }
     }
 
-    /// Wheel — the wire carries WHEEL_DELTA(120) units, positive = up / right. SDL3's y
-    /// is positive = up and x positive = right already. Fractional remainders
-    /// accumulate per axis.
+    /// Wire units are WHEEL_DELTA (120), positive = up / right — same as SDL3.
+    /// Fractional remainder per axis; truncating each event drops the tail.
     pub fn on_wheel(&mut self, dx: f32, dy: f32) {
         if !self.captured {
             return;
@@ -498,8 +455,6 @@ impl Capture {
         self.scroll_acc = (ax, ay);
     }
 
-    /// The compact wire touch id for an SDL finger — its existing slot, or the lowest free
-    /// one (contacts are few, so a linear scan is nothing). Held until the finger lifts.
     fn touch_slot(&mut self, finger_id: u64) -> u32 {
         if let Some(&slot) = self.touch_slots.get(&finger_id) {
             return slot;
@@ -510,14 +465,14 @@ impl Capture {
         slot
     }
 
-    /// Touch flags pack the client surface size the coordinates are relative to, so the
-    /// host can rescale into its output — identical layout to Android's nativeSendTouch.
+    /// Pack client surface size so the host can rescale. Same layout as
+    /// Android `nativeSendTouch`.
     fn touch_flags(w: u32, h: u32) -> u32 {
         ((w & 0xffff) << 16) | (h & 0xffff)
     }
 
-    /// A new touchscreen contact — `x`/`y` are absolute in the `w`×`h` content surface.
-    /// Ignored unless captured (the stream owns the glass; the menu is gamepad-driven).
+    /// `x`/`y` are absolute in the `w`×`h` content surface, not window pixels.
+    /// Ignored unless captured — the overlay is gamepad-driven.
     pub fn on_touch_down(&mut self, finger_id: u64, x: i32, y: i32, w: u32, h: u32) {
         if !self.captured {
             return;
@@ -534,8 +489,7 @@ impl Capture {
         );
     }
 
-    /// A contact moved. Only forwarded for a finger we already sent a down for — a move
-    /// with no live slot (capture engaged mid-touch) would have no matching host contact.
+    /// Skip a finger with no slot: capture engaged mid-touch has no host contact.
     pub fn on_touch_move(&mut self, finger_id: u64, x: i32, y: i32, w: u32, h: u32) {
         if !self.captured {
             return;
@@ -553,9 +507,8 @@ impl Capture {
         }
     }
 
-    /// A contact lifted — release its slot and the host contact. Forwarded even when not
-    /// captured: a `release()` may have already flushed it (then the slot is gone and this
-    /// no-ops), but a stray up must never strand a pressed contact on the host.
+    /// Always run, even uncaptured: `release()` may have flushed the slot, but
+    /// a stray up must not leave a pressed contact on the host.
     pub fn on_touch_up(&mut self, finger_id: u64) {
         if let Some(slot) = self.touch_slots.remove(&finger_id) {
             send(
@@ -570,12 +523,10 @@ impl Capture {
         }
     }
 
-    /// Route one forwarded touchscreen finger by the session's touch model. `wx`/`wy` are
-    /// physical window pixels (the trackpad ballistics + gesture geometry); `abs` is the same
-    /// finger mapped into the letterboxed content rect (pointer moves + raw passthrough). In
-    /// `Touch` mode fingers go on the wire as real contacts; in `Trackpad`/`Pointer` they
-    /// drive the gesture engine. Returns the intents the RUN LOOP owns — the three-finger
-    /// stats tap and the dial's turn/commit/cancel; everything else went on the wire here.
+    /// `wx`/`wy` are physical window pixels (trackpad ballistics); `abs` is the
+    /// letterboxed content rect (pointer / passthrough). `Touch` goes on the
+    /// wire; `Trackpad`/`Pointer` drive the gesture engine. Returns run-loop
+    /// intents (`CycleStats`, dial); everything else is sent here.
     pub fn dispatch_finger(
         &mut self,
         phase: FingerPhase,
@@ -595,9 +546,8 @@ impl Capture {
                 Vec::new()
             }
             TouchMode::Trackpad | TouchMode::Pointer => {
-                // Down/Move only while captured (the stream owns the glass); an Up always runs
-                // so a lift can conclude a gesture / release a held drag even if capture just
-                // dropped (focus loss mid-touch).
+                // Down/Move only while captured. Up always runs so a lift can
+                // finish a gesture after focus-loss mid-touch.
                 if !self.captured && phase != FingerPhase::Up {
                     return Vec::new();
                 }
@@ -617,8 +567,8 @@ impl Capture {
         self.touch_mode
     }
 
-    /// The ring's Touch mode slot: switch the model mid-stream. Anything a gesture holds is
-    /// released first (a held drag must not survive a model switch), and the engine restarts.
+    /// Mid-stream model switch. Flush held buttons/touches first — a drag
+    /// must not survive — then restart the gesture engine.
     pub fn set_touch_mode(&mut self, mode: TouchMode) {
         for b in self.held_buttons.drain() {
             send(
@@ -646,7 +596,7 @@ impl Capture {
         self.gestures = Gestures::new(mode == TouchMode::Trackpad, self.invert_scroll);
     }
 
-    /// A ring shortcut: the chord's VKs down in order, then up in reverse.
+    /// Down in order, up in reverse so modifiers stay held until the last key.
     pub fn send_chord(&mut self, vks: &[u8]) {
         for &vk in vks {
             send(
@@ -672,8 +622,8 @@ impl Capture {
         }
     }
 
-    /// Time passes: the gesture engine's long-press arm. Once per run-loop iteration; `t_ms`
-    /// is the finger clock (SDL ticks). Passthrough fingers have no timer.
+    /// Long-press arm, once per run-loop tick. `t_ms` is SDL ticks.
+    /// [`TouchMode::Touch`] has no timer.
     pub fn tick(&mut self, t_ms: f64) {
         if !self.captured || self.touch_mode == TouchMode::Touch {
             return;
@@ -683,9 +633,8 @@ impl Capture {
         }
     }
 
-    /// Send one gesture [`Act`] on the wire, tracking button holds in `held_buttons` so a
-    /// capture release flushes them (a tap-drag's left button never sticks down). Hands back
-    /// the run-loop intents — [`Act::CycleStats`] and the dial's — which are not wire events.
+    /// Track button holds in `held_buttons` so capture release flushes a
+    /// tap-drag. Returns [`Act::CycleStats`] and dial intents to the run loop.
     fn apply_touch_act(&mut self, act: Act) -> Option<Act> {
         match act {
             Act::CycleStats | Act::Dial { .. } | Act::DialCommit | Act::DialCancel => {

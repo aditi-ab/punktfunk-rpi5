@@ -1,242 +1,172 @@
-//! Typed post-handshake control messages (`CTL_MAGIC` + type byte): reconfigure, keyframe,
-//! RFI, loss reports, bitrate, bandwidth probes, and clock sync.
+//! Typed post-handshake control messages (`CTL_MAGIC` + type byte).
+//!
+//! Handshake is positional and stays untyped for wire compatibility. After
+//! [`Start`], every message is `magic || type || payload`. Unknown types are
+//! ignored, so mixed versions stay forward-safe: a new message never
+//! lengthens an old one ([`LossReport`] decode is exact-length).
+//!
+//! Encode layout is the `// magic[0..4] type[4] …` comment on each `encode`.
+//! Clipboard: `design/clipboard-and-file-transfer.md`. Shard grow/shrink:
+//! `design/shard-payload-reneg.md`. Phase lock: `design/phase-locked-capture.md`.
 
 use super::*;
 use crate::config::Mode;
 use crate::error::{PunktfunkError, Result};
 
-/// `client → host`, any time after [`Start`]: switch the session to a new display mode
-/// (window resized, refresh changed) without reconnecting. The host answers with
-/// [`Reconfigured`]; on acceptance it rebuilds its virtual output + encoder at the new
-/// mode and the stream continues over the unchanged data plane — the first new-mode frame
-/// is an IDR with in-band parameter sets, which is all a decoder needs to follow.
-///
-/// Post-handshake messages carry a type byte after the magic (the handshake itself is
-/// positional and stays untyped for wire compatibility).
+/// `client → host` after [`Start`]: switch display mode without reconnecting.
+/// Host answers [`Reconfigured`]. On accept it rebuilds output + encoder; the
+/// data plane is unchanged. The first new-mode frame is an IDR with in-band
+/// parameter sets — that is all a decoder needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reconfigure {
     pub mode: Mode,
 }
 
-/// `host → client`: answer to [`Reconfigure`]. `accepted = false` means the requested
-/// mode was rejected (e.g. exceeds encoder limits) and the session continues at `mode`
-/// (the still-active one); `true` means `mode` is now being switched to live.
+/// `host → client` answer to [`Reconfigure`]. `accepted = false`: request
+/// rejected (encoder limits); `mode` is the still-active one. `true`: `mode`
+/// is being switched to live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reconfigured {
     pub accepted: bool,
     pub mode: Mode,
 }
 
-/// `client → host`, any time after [`Start`]: ask the host's encoder to emit a fresh IDR
-/// keyframe NOW. The infinite-GOP stream opens with one IDR then sends P-frames only, so a
-/// decoder that wedges (a lost/corrupt opening IDR, a bad early P-frame — most likely on the
-/// cold first session) would otherwise stay frozen until the next loss-triggered recovery
-/// keyframe, which may be far off. The client sends this when it detects a stalled decode;
-/// the host forces the next frame to be an IDR with in-band parameter sets, recovering the
-/// picture in ~one frame. Fire-and-forget — no reply (the recovered IDR is the ack).
+/// `client → host` after [`Start`]: force the next frame to an IDR with
+/// in-band parameter sets. Infinite GOP is one opening IDR then P-frames, so
+/// a wedged decoder stays frozen until the next loss-triggered keyframe.
+/// Fire-and-forget — the recovered IDR is the ack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RequestKeyframe;
 
-/// `client → host`: reference-frame-invalidation recovery — the loss-aware sibling of
-/// [`RequestKeyframe`]. The client detected a `frame_index` gap and reports the range `[first_frame,
-/// last_frame]` of access units it can no longer trust (from the first missing index through the
-/// newest received). Instead of a full IDR (a 20-40× spike that deepens the loss it recovers), a host
-/// whose encoder supports RFI re-references a known-good picture *before* `first_frame` — an AMD LTR
-/// force-reference or an NVENC `nvEncInvalidateRefFrames` — emitting a single clean P-frame it tags
-/// [`crate::packet::USER_FLAG_RECOVERY_ANCHOR`] so the client lifts its freeze on it. A host that
-/// can't RFI (no valid reference / libavcodec backend) forces an IDR instead, exactly as for a bare
-/// [`RequestKeyframe`]; a host that predates this ignores the unknown message and the client's
-/// keyframe backstop still recovers. Fire-and-forget — the recovered frame is the only ack.
+/// `client → host`: invalidate `[first_frame, last_frame]` instead of a full
+/// IDR (a 20–40× spike). A host that can RFI re-references a picture before
+/// `first_frame` and tags the P-frame [`crate::packet::USER_FLAG_RECOVERY_ANCHOR`].
+/// Else it forces an IDR, as for [`RequestKeyframe`]. Fire-and-forget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RfiRequest {
-    /// First access-unit `frame_index` the client can no longer trust (the gap start).
     pub first_frame: u32,
-    /// Newest received `frame_index` at the time of the report (the invalidation range end).
     pub last_frame: u32,
 }
 
-/// `host → client`, any time after [`Start`]: the video data plane's sealed shard payload
-/// changes mid-session (design/shard-payload-reneg.md Phase 1). Sent ONLY to a client whose
-/// [`Hello::max_shard_payload`] advertised per-frame geometry (0/absent = legacy — the host
-/// must never send this), and never above that advertised ceiling. Asymmetric semantics:
-///
-/// - **Shrink** (the mid-session MTU heal): the host may re-key its packetizer at the next
-///   AU boundary immediately after sending — per-frame pinning on the client makes the
-///   control-vs-datagram reorder race irrelevant and a smaller shard always fits existing
-///   buffers. The [`ShardPayloadAck`] is telemetry.
-/// - **Grow** (jumbo): the host must not emit a single sealed datagram above the OLD size
-///   until the ack arrives — the ack IS the gate, even when the client's buffers would
-///   happen to fit (the rule must not erode if the buffer strategy changes later).
-///
-/// No `effective_frame_index`: per-frame pinning makes it redundant — every video packet
-/// carries its own `shard_bytes` and the receiver follows each frame's pin.
+/// `host → client` after [`Start`]: sealed shard payload changes mid-session
+/// (`design/shard-payload-reneg.md`). Only to a client whose
+/// [`Hello::max_shard_payload`] advertised per-frame geometry, never above that
+/// ceiling. Shrink: packetizer may re-key at the next AU; [`ShardPayloadAck`] is
+/// telemetry. Grow: no sealed datagram above the OLD size until the ack — the
+/// ack is the gate. No `effective_frame_index`: each packet carries `shard_bytes`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShardPayloadChanged {
-    /// The new sealed shard payload in bytes (even, within the client's advertised bounds).
+    /// Even, within the client's advertised bounds.
     pub shard_payload: u16,
 }
 
-/// `client → host`: answer to [`ShardPayloadChanged`] — echoes the value the client applied.
-/// Only sent for an in-bounds request; an out-of-bounds one is dropped WITHOUT an ack (a
-/// buggy host must not read silence-then-garbage as a granted grow). The host treats the
-/// echoed value as the grant for a pending grow.
+/// `client → host` answer to [`ShardPayloadChanged`]. Out-of-bounds is dropped
+/// with no ack — silence must not read as a granted grow. Echoed value is the
+/// grant for a pending grow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShardPayloadAck {
     pub shard_payload: u16,
 }
 
-/// `client → host`, periodic: the client's observed data-plane loss, so the host can size FEC to
-/// the link instead of a flat percentage (adaptive FEC). `loss_ppm` is parts-per-million of shards
-/// that arrived missing-but-recovered (plus a bump when frames went unrecoverable) over the report
-/// window — i.e. the loss FEC is currently absorbing. The host maps it to a recovery percentage,
-/// clamped to a sane band, and applies it live; a clean link decays toward the floor (fewer packets,
-/// which directly helps a packet-rate-bound uplink like the Steam Deck's WiFi tx). Fire-and-forget.
-/// A host that predates this ignores it (unknown control message) and keeps its static FEC.
+/// `client → host`, periodic: observed data-plane loss so the host can size
+/// FEC to the link. `loss_ppm` is parts-per-million of shards missing-but-
+/// recovered (plus a bump when frames went unrecoverable). Fire-and-forget.
+/// An older host ignores the unknown type and keeps static FEC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LossReport {
     pub loss_ppm: u32,
 }
 
-/// `client → host`, sent immediately after each [`LossReport`]: data-plane packets this client has
-/// received all session, cumulative.
+/// `client → host`, right after each [`LossReport`]: cumulative data-plane
+/// packets received this session.
 ///
-/// ⚠ Exists because `loss_ppm` alone is **ambiguous at zero**: a client receiving a flawless stream
-/// and a client receiving *nothing at all* both report `loss_ppm = 0` — loss is a ratio over a
-/// window whose denominator is the packets that arrived, so no-packets is indistinguishable from
-/// no-loss. That ambiguity let a host decay adaptive FEC to its floor while the client sat behind a
-/// black screen having received zero bytes, and the host's own stall diagnosis blamed the client for
-/// "not sustaining the stream" it had never been sent (field 2026-08-20: a Windows host whose
-/// per-session data port was closed inbound, so the client's hole-punch never opened the return
-/// path). `0` while the host has sent frames is the one unambiguous statement of "the video data
-/// plane is not reaching me" — the control plane carrying this report is, by construction, healthy.
+/// `loss_ppm` is a ratio over arrived packets, so a silent client and a
+/// flawless client both report 0. `packets_received == 0` while the host has
+/// sent frames is the unambiguous "video is not reaching me" (the control
+/// plane carrying this is healthy).
 ///
-/// ⚠ A SEPARATE MESSAGE rather than a field appended to [`LossReport`], and that is load-bearing:
-/// `LossReport::decode` length-checks EXACTLY, so a longer report is rejected outright by every host
-/// already shipped — a new client would silently lose adaptive FEC against them. Mixed versions are
-/// normal here (the field case that motivated this ran a current host against a months-old client),
-/// so the compatible shape is a new type byte an older host simply ignores, exactly as it already
-/// ignores every other control message it predates.
-///
-/// Cumulative, not per-window, so a single message is self-contained; `u64` to match the counter it
-/// mirrors, with no saturation to reason about.
+/// Own type byte, not a field on [`LossReport`]: that decode is exact-length,
+/// so lengthening it would make every shipped host reject adaptive FEC.
+/// Cumulative `u64` so one message is self-contained with no saturation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeliveryReport {
     pub packets_received: u64,
 }
 
-/// `client → host`, any time after [`Start`]: reconfigure the encoder to a new target bitrate
-/// without reconnecting — the mid-stream lever of adaptive bitrate. The host clamps the request
-/// exactly like [`Hello::bitrate_kbps`] (its `[MIN, MAX]` band; `0` → host default), answers with
-/// [`BitrateChanged`] carrying the value it actually configured, and rebuilds the encoder in
-/// place at the same mode — the first new-rate frame is an IDR with in-band parameter sets, which
-/// every client decoder already follows (same discipline as a [`Reconfigure`] mode switch).
-///
-/// Sent by the client's automatic-bitrate controller (active when the user's bitrate setting is
-/// "Automatic", i.e. `Hello::bitrate_kbps == 0`) when the link can't sustain the current rate —
-/// or can sustain more again. A host that predates this ignores it (unknown control message) and
-/// never answers; the client's controller detects the silence and disables itself.
+/// `client → host` after [`Start`]: retarget encoder bitrate without
+/// reconnecting. Host clamps like [`Hello::bitrate_kbps`] (`0` → default),
+/// answers [`BitrateChanged`], and retargets in place. Automatic-bitrate
+/// clients send this; silence (unknown type) disables the controller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SetBitrate {
-    /// Requested encoder bitrate in kilobits per second (`0` = host default, like Hello's field).
     pub bitrate_kbps: u32,
 }
 
-/// `host → client`: answer to [`SetBitrate`] — the bitrate the host actually configured (the
-/// request clamped to its supported band). The encoder retargets in place where the backend can
-/// (no IDR — the stream carries straight on); a backend without in-place reconfigure rebuilds and
-/// switches on the next frame (an IDR). The stream never pauses either way. Also the controller's
-/// liveness signal: no answer ⇒ an old host that doesn't renegotiate bitrate.
+/// `host → client` answer to [`SetBitrate`]: the clamped configured rate.
+/// In-place retarget has no IDR; a rebuild switches on the next frame (IDR).
+/// No answer ⇒ an old host that does not renegotiate bitrate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BitrateChanged {
     pub bitrate_kbps: u32,
 }
 
-/// `host → client`, unsolicited: the host tore its own capture ring and encoder down and rebuilt
-/// them in place, and nothing flowed for `gap_ms`. Entirely host-local — no packet was lost, the
-/// link never changed — but the client's adaptive-bitrate controller decides on 750 ms report
-/// windows, and a window straddling the rebuild sees almost no stream.
+/// `host → client`, unsolicited: capture+encoder rebuilt in place; nothing
+/// flowed for `gap_ms`. Host-local — no packet lost — but a 750 ms ABR
+/// window straddling the rebuild looks like congestion.
 ///
-/// The 0.29 field log is the case this exists for: an exclusive-topology eviction on a Windows
-/// host rebuilt the pipeline for 401 ms, and the straddling window reported `actual_kbps=390`
-/// against a 20 000 target with `loss_ppm=0` and a host encode mean of 15 063 µs against a ~2 800
-/// baseline. The controller read that as congestion, backed off ×0.7 and retired slow start, and
-/// the session spent the next three minutes at ~15 Mbps on a link that never dropped a packet.
-/// The client already knows how to throw a window away — it does exactly that for the tail of its
-/// own speed-test probe — so the host announcing the rebuild is all that was missing.
+/// A duration, never an instant: host and client clocks are not one domain.
+/// The client anchors the gap to its own receive time; `gap_ms` is log
+/// evidence, not an input to the arithmetic.
 ///
-/// A DURATION, never an instant, on purpose: host and client clocks are not in the same domain
-/// (14.7 s apart in that same log), so an instant stamped in the host's clock would need
-/// skew-correcting before it meant anything on the client. The control stream is reliable and
-/// sub-millisecond on a LAN, so the client anchors the gap to its OWN receive time — "the rebuild
-/// just ended" — and `gap_ms` is evidence for the log rather than an input to the arithmetic.
-///
-/// Fire-and-forget, and sent only after a rebuild that SUCCEEDED. The eviction recovery's failure
-/// arm ends the session outright, and the reconnect re-baselines everything the controller had
-/// learned; a mode-switch rebuild that fails keeps streaming the old mode, and that one does leave
-/// its stall unannounced today — a known gap, not a claim that no such gap exists.
-///
-/// A client that predates this hits its "unknown control message" arm and keeps the old behavior.
+/// Fire-and-forget, and only after a rebuild that succeeded. Failure of
+/// eviction recovery ends the session (reconnect re-baselines). A failed
+/// mode-switch keeps the old mode and does not announce that stall.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PipelineGap {
-    /// How long the host's pipeline was down, in milliseconds (the rebuild's measured span).
     pub gap_ms: u32,
 }
 
-/// `client → host`, any time after [`Start`]: run a bandwidth speed test. The host bursts
-/// filler access units (flagged [`crate::packet::FLAG_PROBE`]) over the data plane at
-/// `target_kbps` of application goodput for `duration_ms`, *pausing video for the duration*, then
-/// replies with [`ProbeResult`]. The client measures the received probe bytes + time to estimate
-/// the link's sustainable rate (and the loss vs. the host's reported send count) so it can pick a
-/// [`Hello::bitrate_kbps`]. The host clamps both fields to sane bounds.
+/// `client → host` after [`Start`]: bandwidth probe. Host bursts
+/// [`crate::packet::FLAG_PROBE`] AUs at `target_kbps` for `duration_ms`,
+/// pausing video, then replies [`ProbeResult`]. Host clamps both fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProbeRequest {
-    /// Goodput rate the host should send the probe at, in kilobits per second.
     pub target_kbps: u32,
-    /// How long to burst, in milliseconds.
     pub duration_ms: u32,
 }
 
-/// `host → client`: the probe burst is finished. Reports what the host actually put on the wire so
-/// the client can split the two failure modes apart: **host-side** drops (the send buffer couldn't
-/// keep up — raise `net.core.wmem_max`) vs **link** loss (wire packets the air dropped). The client
-/// measures delivered wire packets itself and computes:
+/// `host → client`: probe burst finished. Splits host-side drops (send
+/// buffer; raise `net.core.wmem_max`) from link loss. Client computes:
 ///
-/// - link loss   = `(wire_packets_sent − received) / wire_packets_sent`
-/// - host drop   = `send_dropped / (wire_packets_sent + send_dropped)`
-/// - throughput  = `received_wire_bytes * 8 / duration_ms`
+/// - link loss  = `(wire_packets_sent − received) / wire_packets_sent`
+/// - host drop  = `send_dropped / (wire_packets_sent + send_dropped)`
+/// - throughput = `received_wire_bytes * 8 / duration_ms`
 ///
-/// Counting delivered traffic at the *packet* level (not whole reassembled AUs) makes the figure
-/// degrade gracefully past the FEC budget instead of cliffing to zero.
+/// Packet-level (not reassembled AUs) so the figure degrades past FEC
+/// instead of dropping to zero at the budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProbeResult {
-    /// Total access-unit payload bytes the host emitted for the probe (application goodput offered).
     pub bytes_sent: u64,
-    /// Number of probe access units the host emitted.
     pub packets_sent: u32,
-    /// The burst's actual duration in milliseconds (the host clamps/measures the request).
     pub duration_ms: u32,
-    /// Wire packets the kernel ACCEPTED for transmission — what actually went on the link (offered
-    /// minus the send-buffer drops below). `0` from a pre-wire-stats host (back-compat decode).
+    /// Packets the kernel accepted. `0` from a pre-wire-stats host.
     pub wire_packets_sent: u32,
-    /// Wire packets the host could NOT hand to the kernel (send buffer full): the host-side ceiling.
+    /// Packets not handed to the kernel (send buffer full).
     pub send_dropped: u32,
 }
 
-/// `client → host`, right after [`Start`]: one round of the wall-clock skew handshake. The client
-/// stamps `t1_ns` (its monotonic-since-epoch clock) and sends; the host echoes it in [`ClockEcho`]
-/// with its own receive/send stamps. A few rounds let the client estimate the host↔client clock
-/// offset, so the per-frame `capture→received` latency (the AU `pts_ns` is the host's capture
-/// clock) is meaningful across machines, not just same-host. An old host ignores it (the client
-/// times out and assumes a shared clock).
+/// `client → host` after [`Start`]: one round of the wall-clock skew
+/// handshake. Client stamps `t1_ns`; host answers [`ClockEcho`]. A few
+/// rounds estimate host−client offset so AU `pts_ns` latency is meaningful
+/// across machines. An old host ignores it; the client times out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClockProbe {
     pub t1_ns: u64,
 }
 
-/// `host → client`: answer to [`ClockProbe`]. `t2_ns` is when the host received the probe and
-/// `t3_ns` when it sent this echo (both the host clock); `t1_ns` is the client's send stamp echoed
-/// back. With the client's receive time `t4`, offset = ((t2−t1)+(t3−t4))/2 (host minus client) and
-/// RTT = (t4−t1)−(t3−t2). See [`clock_offset_ns`].
+/// `host → client` answer to [`ClockProbe`]. `t2_ns`/`t3_ns` are host
+/// receive/send; `t1_ns` is echoed. With client receive `t4`:
+/// offset = ((t2−t1)+(t3−t4))/2, RTT = (t4−t1)−(t3−t2). See [`clock_offset_ns`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClockEcho {
     pub t1_ns: u64,
@@ -244,70 +174,46 @@ pub struct ClockEcho {
     pub t3_ns: u64,
 }
 
-/// `client → host`, ~1 Hz: the client's display-latch grid, so the host can PHASE-LOCK its
-/// capture/send tick and land frames a constant, small margin before the client's vsync latch
-/// (design/phase-locked-capture.md). Sent only by clients with a vsync-aware presenter, gated on
-/// [`CLIENT_CAP_PHASE_LOCK`](crate::quic::CLIENT_CAP_PHASE_LOCK); an old host ignores it.
+/// `client → host`, ~1 Hz: display-latch grid so the host can phase-lock
+/// capture (`design/phase-locked-capture.md`). Gated on
+/// [`CLIENT_CAP_PHASE_LOCK`](crate::quic::CLIENT_CAP_PHASE_LOCK).
 ///
-/// Timestamps are HOST clock (`CLOCK_REALTIME`): the client converts before sending
-/// (`T_host = T_client + offset` — the skew offset from the clock handshake lives only
-/// client-side, the host deliberately stores none).
+/// Timestamps are host `CLOCK_REALTIME`: the client converts before send
+/// (`T_host = T_client + offset`). The offset lives only client-side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PhaseReport {
-    /// The client's next display latch, host clock. The host extrapolates forward by
-    /// `latch_period_ns` — the report describes a grid, not one instant.
+    /// Next display latch, host clock. Host extrapolates by `latch_period_ns`.
     pub next_latch_host_ns: u64,
-    /// The client panel's refresh period (its true latch grid — not the app's possibly
-    /// down-rated callback rate).
+    /// Panel refresh period (true latch grid, not a down-rated callback).
     pub latch_period_ns: u32,
-    /// The client's own error bound on this grid (skew residual + latch jitter p95) — the host
-    /// widens its arrival margin by this, never narrows below its floor.
+    /// Skew residual + latch jitter p95. Host widens its margin by this,
+    /// never narrows below its floor.
     pub uncertainty_ns: u32,
-    /// Measured lead of frame arrival before latch over the last window (ns; clamped ≥ 0).
-    /// v2 senders put the CIRCULAR (vector-mean) lead mod the panel period here; v1 senders put
-    /// the window median. The controller drives this toward its target lead — the error signal.
+    /// Arrival-before-latch lead, ns, clamped ≥ 0. v2: circular mean mod
+    /// period; v1: window median. Error signal toward the target lead.
     pub arrival_lead_ns: u32,
-    /// v2 tail: circular coherence of the arrival phase, ‰ (0 = phase uniformly smeared over the
-    /// period — alignment is physically pointless; 1000 = perfectly phase-locked arrivals).
-    /// [`u16::MAX`] = a v1 sender (25-byte wire form) that reported a median with no coherence —
-    /// the host then relies on its travel-cap safety net alone.
+    /// Arrival-phase coherence, ‰ (0 = smeared, 1000 = locked). [`u16::MAX`]
+    /// = v1 25-byte form with no coherence; host uses its travel-cap only.
     pub coherence_milli: u16,
 }
 
-/// Type byte of [`Reconfigure`] (first byte after the magic).
 pub const MSG_RECONFIGURE: u8 = 0x01;
-/// Type byte of [`Reconfigured`].
 pub const MSG_RECONFIGURED: u8 = 0x02;
-/// Type byte of [`RequestKeyframe`].
 pub const MSG_REQUEST_KEYFRAME: u8 = 0x03;
-/// Type byte of [`LossReport`].
 pub const MSG_LOSS_REPORT: u8 = 0x04;
-/// Type byte of [`SetBitrate`].
 pub const MSG_SET_BITRATE: u8 = 0x05;
-/// Type byte of [`BitrateChanged`].
 pub const MSG_BITRATE_CHANGED: u8 = 0x06;
-/// Type byte of [`RfiRequest`].
 pub const MSG_RFI_REQUEST: u8 = 0x07;
-/// Type byte of [`ShardPayloadChanged`].
 pub const MSG_SHARD_PAYLOAD_CHANGED: u8 = 0x08;
-/// Type byte of [`ShardPayloadAck`].
 pub const MSG_SHARD_PAYLOAD_ACK: u8 = 0x09;
-/// Type byte of [`PipelineGap`]. 0x0A extends the video/rate-control block (0x01-0x09) it belongs
-/// to: its only consumer is the same adaptive-bitrate controller [`LossReport`], [`SetBitrate`]
-/// and [`BitrateChanged`] already feed. Deliberately NOT in the 0x30 clock block — it carries a
-/// duration precisely so that no clock domain is involved.
+/// [`PipelineGap`]. 0x0A stays in the 0x01–0x09 video/rate-control block
+/// (same ABR consumer). Not 0x30: it carries a duration, no clock domain.
 pub const MSG_PIPELINE_GAP: u8 = 0x0A;
-/// Type byte of [`DeliveryReport`].
 pub const MSG_DELIVERY_REPORT: u8 = 0x0B;
-/// Type byte of [`ProbeRequest`].
 pub const MSG_PROBE_REQUEST: u8 = 0x20;
-/// Type byte of [`ProbeResult`].
 pub const MSG_PROBE_RESULT: u8 = 0x21;
-/// Type byte of [`ClockProbe`].
 pub const MSG_CLOCK_PROBE: u8 = 0x30;
-/// Type byte of [`ClockEcho`].
 pub const MSG_CLOCK_ECHO: u8 = 0x31;
-/// Type byte of [`PhaseReport`].
 pub const MSG_PHASE_REPORT: u8 = 0x32;
 
 impl Reconfigure {
@@ -545,25 +451,17 @@ impl PipelineGap {
     }
 }
 
-/// Compute a [`LossReport`] `loss_ppm` from one window's session-stat deltas: shards FEC recovered
-/// (the loss it absorbed), recovered-but-then-arrived shards (`late` — reordered delivery lets a
-/// block reconstruct early, so those were never lost; netting them out keeps plain reordering from
-/// reading as packet loss and spooking adaptive FEC + the bitrate controller), shards received,
-/// and frames that went unrecoverable. Loss ≈ (recovered − late) / (received + recovered − late) —
-/// the fraction of shards that truly never arrived (a late shard is inside `received`, so the
-/// denominator nets it too; saturating, so reorder straddling a window boundary can't go
-/// negative). A frame drop means loss exceeded the current FEC budget (so `recovered` plateaus),
-/// so add a fixed bump to push the host's FEC up past the cap on the next adjustment. Returns
-/// parts-per-million, capped at 1e6.
+/// [`LossReport`] `loss_ppm` from one window's session-stat deltas.
 ///
-/// EXCEPT the all-late window (`lost == 0 && late > 0`): every presumed-lost shard eventually
-/// ARRIVED — the frames died of lateness, not loss. That is a delivery HOLE (a host compose
-/// stall's resume edge, a client-radio pause), and neither lever this number drives can touch
-/// it: FEC repairs loss, not delay, and the host's bitrate backoff cannot shorten a hole.
-/// Bumping there was the false ratchet in the 2026-08-27 field log — `loss_ppm=50000` exactly,
-/// ×0.7³ to 6.86 Mbps in 4 s, on a wire with zero measured loss. A window with real silent loss
-/// keeps the bump: shards that never arrived at all sit in neither `recovered` nor `late`, so
-/// that window reads `late == 0` and still bumps.
+/// Loss ≈ (recovered − late) / (received + recovered − late): late shards
+/// reconstructed early then arrived, so they are reorder not loss (netted
+/// from both ends; saturating so a straddling window cannot go negative).
+/// An unrecoverable frame means loss exceeded the FEC budget, so add a
+/// fixed bump to push FEC past the cap. Returns ppm, capped at 1e6.
+///
+/// Exception: `lost == 0 && late > 0` — every presumed-lost shard arrived.
+/// Frames died of lateness (a delivery hole). FEC and bitrate backoff
+/// cannot shorten delay, so do not bump.
 pub fn window_loss_ppm(recovered: u64, late: u64, received: u64, frames_dropped: u64) -> u32 {
     let lost = recovered.saturating_sub(late);
     let denom = received.saturating_add(lost);
@@ -616,8 +514,7 @@ impl ProbeResult {
     }
 
     pub fn decode(b: &[u8]) -> Result<ProbeResult> {
-        // Back-compat: 21 bytes (pre-wire-stats host, new fields default 0) or 29 bytes (with the
-        // wire_packets_sent + send_dropped tail). Accept either; reject anything shorter/garbled.
+        // 21 bytes = pre-wire-stats host (new fields 0); 29 = with wire stats. Reject shorter.
         if b.len() < 21 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PROBE_RESULT {
             return Err(PunktfunkError::InvalidArg("bad ProbeResult"));
         }
@@ -684,8 +581,7 @@ impl ClockEcho {
 impl PhaseReport {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] latch[5..13] period[13..17] uncertainty[17..21] lead[21..25]
-        // coherence[25..27] — the v2 tail; a MAX sentinel encodes as the 25-byte v1 form so a
-        // v1-shaped report stays byte-identical (append discipline, like the 0xCF tail).
+        // coherence[25..27] v2 tail. MAX sentinel encodes as the 25-byte v1 form (append-only).
         let mut b = Vec::with_capacity(27);
         b.extend_from_slice(CTL_MAGIC);
         b.push(MSG_PHASE_REPORT);
@@ -726,158 +622,113 @@ pub fn frame(payload: &[u8]) -> Vec<u8> {
     b
 }
 
-// ---------------------------------------------------------------------------------------------
-// Shared clipboard & file transfer — wire codecs (ported from the pre-W7 quic/msgs.rs on the
-// clipboard-feature merge; the control-stream metadata messages live beside the clock codecs).
-// ---------------------------------------------------------------------------------------------
+// Shared clipboard & file transfer (`design/clipboard-and-file-transfer.md`).
+// 0x40–0x42 ride the control stream; 0x43–0x44 ride a per-transfer bi-stream
+// (never dispatched by control loops). Unknown types drop — forward-safe.
 
-// ---------------------------------------------------------------------------------------------
-// Shared clipboard & file transfer (design/clipboard-and-file-transfer.md §3). The small
-// metadata messages ride the control stream (0x40-0x42); the two fetch-stream messages
-// (0x43-0x44) travel on a per-transfer bi-stream (see the [`super::clipstream`] helpers), never
-// the control stream, so they are never dispatched by the control loops. All are typed
-// (`CTL_MAGIC` + type byte), so an older peer hits its "unknown control message" arm and drops
-// any it doesn't know — the whole feature is forward-safe.
-// ---------------------------------------------------------------------------------------------
-
-/// Type byte of [`ClipControl`] (client → host): enable/disable the shared clipboard for this
-/// session. Idempotent; opt-in is enforced here, not just in UI.
+/// Idempotent enable/disable. Opt-in is here, not just in UI.
 pub const MSG_CLIP_CONTROL: u8 = 0x40;
-/// Type byte of [`ClipState`] (host → client): ack + unsolicited policy/backend updates.
 pub const MSG_CLIP_STATE: u8 = 0x41;
-/// Type byte of [`ClipOffer`] (symmetric): the lazy announcement — format list only, no bytes.
+/// Format list only — no clipboard bytes.
 pub const MSG_CLIP_OFFER: u8 = 0x42;
-/// Type byte of [`ClipFetch`] (requester → holder, **fetch stream only**): pull one format of the
-/// current offer.
+/// Fetch stream only — never the control stream.
 pub const MSG_CLIP_FETCH: u8 = 0x43;
-/// Type byte of [`ClipFetchHdr`] (holder → requester, **fetch stream only**): the fetch response
-/// header that precedes the data chunks.
+/// Fetch stream only — header that precedes the data chunks.
 pub const MSG_CLIP_FETCH_HDR: u8 = 0x44;
 
-/// [`ClipControl::flags`] bit: the client permits file kinds to be offered/fetched this session.
-/// Absent ⇒ files are filtered out of offers in both directions (text/rich/image only).
+/// Absent ⇒ files are filtered from offers in both directions.
 pub const CLIP_FLAG_FILES: u8 = 0x01;
 
-/// [`ClipState::policy`] bit: the host permits non-file formats (text/RTF/HTML/image). Always set
-/// while enabled unless a future direction limit clears it.
+/// Always set while enabled unless a future direction limit clears it.
 pub const CLIP_POLICY_TEXT: u8 = 0x01;
-/// [`ClipState::policy`] bit: the host permits file formats. Cleared by the operator `no-files`
-/// / `text-only` policy so the client can grey out "Include files".
+/// Cleared by operator `no-files` / `text-only`.
 pub const CLIP_POLICY_FILES: u8 = 0x02;
 
-/// [`ClipState::reason`]: normal ack, nothing exceptional.
 pub const CLIP_REASON_OK: u8 = 0;
-/// [`ClipState::reason`]: this session type has no working clipboard backend (e.g. a gamescope
-/// session with no data-control global) — the client shows "not supported in this session type".
+/// No working clipboard backend for this session type.
 pub const CLIP_REASON_BACKEND_UNAVAILABLE: u8 = 1;
-/// [`ClipState::reason`]: another client took over the single per-desktop clipboard binding; this
-/// one was disabled (last `ClipControl{enabled}` wins).
+/// Another client took the single per-desktop clipboard binding.
 pub const CLIP_REASON_TAKEN_OVER: u8 = 2;
-/// [`ClipState::reason`]: the host operator policy (`PUNKTFUNK_CLIPBOARD=off`) disables clipboard.
 pub const CLIP_REASON_POLICY_DISABLED: u8 = 3;
-/// [`ClipState::reason`]: enabled, but the host policy forbids file transfer (`no-files` /
-/// `text-only`) — surfaced so the client greys "Include files" with a footnote.
+/// Enabled, but host policy forbids file transfer.
 pub const CLIP_REASON_NO_FILES: u8 = 4;
-/// [`ClipState::reason`]: the operator policy allows clipboard, but THIS device's access grants
-/// don't (`GRANT_CLIPBOARD` unbit — design/per-client-access.md §5.4). Distinct from
-/// [`CLIP_REASON_POLICY_DISABLED`] so the client can say "not permitted for this device" instead
-/// of "the host has clipboard off".
+/// Distinct from [`CLIP_REASON_POLICY_DISABLED`]: host allows clipboard,
+/// this device's grants do not (`GRANT_CLIPBOARD`).
 pub const CLIP_REASON_NOT_PERMITTED: u8 = 5;
 
-/// [`ClipFetchHdr::status`]: the requested format is being served; data chunks follow until FIN.
+/// Data chunks follow until FIN.
 pub const CLIP_FETCH_OK: u8 = 0;
-/// [`ClipFetchHdr::status`]: the fetch named a `seq` that is no longer the holder's current offer;
-/// the requester degrades the paste to "nothing inserted" rather than wrong data. No chunks follow.
+/// `seq` is no longer current. Paste nothing rather than wrong data. No chunks.
 pub const CLIP_FETCH_STALE: u8 = 1;
-/// [`ClipFetchHdr::status`]: the format/index is not available (no backend, or it vanished). No
-/// chunks follow.
+/// Format/index not available. No chunks.
 pub const CLIP_FETCH_UNAVAILABLE: u8 = 2;
-/// [`ClipFetchHdr::status`]: policy/cap denies this fetch (e.g. a file fetch under `no-files`). No
-/// chunks follow.
+/// Policy/cap denies this fetch. No chunks.
 pub const CLIP_FETCH_DENIED: u8 = 3;
 
-/// Maximum number of [`ClipKind`] entries in one [`ClipOffer`] (resource cap, §7).
 pub const CLIP_MAX_KINDS: usize = 16;
-/// Maximum length in bytes of a [`ClipKind::mime`] string (resource cap, §7).
 pub const CLIP_MAX_MIME: usize = 128;
-/// [`ClipFetch::file_index`] sentinel meaning "not a file fetch" (a whole non-file format, or the
-/// file *manifest* itself). Real file fetches use `0..n`.
+/// Not a file fetch (a whole non-file format, or the file manifest).
 pub const CLIP_FILE_INDEX_NONE: u32 = u32::MAX;
 
-/// One advertised clipboard format inside a [`ClipOffer`] — a portable MIME name plus a size hint.
-/// The bytes never ride here; they cross lazily on a fetch stream only when the destination pastes.
+/// One advertised clipboard format. Bytes never ride here — they cross on a
+/// fetch stream only when the destination pastes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipKind {
-    /// Portable wire MIME, e.g. `text/plain;charset=utf-8`, `text/html`, `image/png`,
-    /// `application/x-punktfunk-files`. Each end maps it to a platform type at fetch time. ≤
-    /// [`CLIP_MAX_MIME`] bytes; a longer one is rejected on decode.
+    /// Portable wire MIME. ≤ [`CLIP_MAX_MIME`] bytes; longer is rejected on decode.
     pub mime: String,
-    /// Best-effort total size of this format in bytes; `0` = unknown (a streaming provider).
+    /// Best-effort size in bytes; `0` = unknown (streaming provider).
     pub size_hint: u64,
 }
 
-/// `client → host` ([`MSG_CLIP_CONTROL`]): flip the shared clipboard on/off for this session.
-/// Sent when the user toggles the per-host pref and once at session start if it is on. **Nothing
-/// clipboard-related happens on either side until an `enabled: true` arrives** — opt-in at the
-/// protocol layer.
+/// `client → host` ([`MSG_CLIP_CONTROL`]): flip shared clipboard for this
+/// session. Nothing clipboard-related happens until `enabled: true` arrives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClipControl {
     pub enabled: bool,
-    /// Bitfield of [`CLIP_FLAG_FILES`] (+ reserved bits for future direction limits).
+    /// [`CLIP_FLAG_FILES`] plus reserved bits for future direction limits.
     pub flags: u8,
 }
 
-/// `host → client` ([`MSG_CLIP_STATE`]): acknowledge a [`ClipControl`] and push unsolicited
-/// updates (policy changed, backend lost). The client surfaces `reason`/`policy` in the toggle UI
-/// instead of failing silently.
+/// `host → client` ([`MSG_CLIP_STATE`]): ack a [`ClipControl`] and push
+/// unsolicited policy/backend updates. Client surfaces `reason`/`policy`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClipState {
     pub enabled: bool,
-    /// Bitfield of [`CLIP_POLICY_TEXT`] / [`CLIP_POLICY_FILES`] — what the host currently permits.
     pub policy: u8,
-    /// One of the `CLIP_REASON_*` values explaining `enabled`/`policy`.
     pub reason: u8,
 }
 
-/// Symmetric ([`MSG_CLIP_OFFER`], either direction): the lazy announcement. Sent when the local
-/// clipboard changes; carries the **format list only** (comfortably inside the 64 KiB control
-/// frame). A new offer replaces the sender's previous one; `seq` lets the holder reject stale
-/// fetches (§3.4). Files are announced as one `application/x-punktfunk-files` kind — the file
-/// list itself is fetched lazily, never inlined here.
+/// Symmetric ([`MSG_CLIP_OFFER`]): format list only. A new offer replaces the
+/// previous; `seq` lets the holder reject stale fetches. Files are one
+/// `application/x-punktfunk-files` kind — the list is fetched, never inlined.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipOffer {
     /// Monotonic per sender; newest wins.
     pub seq: u32,
-    /// ≤ [`CLIP_MAX_KINDS`] entries.
     pub kinds: Vec<ClipKind>,
 }
 
-/// `requester → holder` ([`MSG_CLIP_FETCH`], **fetch stream only**): the first message on a
-/// per-transfer bi-stream, naming which format (and, for files, which entry) of `seq` to pull.
+/// `requester → holder` ([`MSG_CLIP_FETCH`], fetch stream only): first message
+/// on a per-transfer bi-stream, naming which format of `seq` to pull.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipFetch {
-    /// The offer `seq` this fetch is against; the holder answers [`CLIP_FETCH_STALE`] if it is no
-    /// longer current.
+    /// Holder answers [`CLIP_FETCH_STALE`] if this is no longer current.
     pub seq: u32,
-    /// File index for a file transfer, or [`CLIP_FILE_INDEX_NONE`] for a non-file format / the
-    /// file manifest.
+    /// File index, or [`CLIP_FILE_INDEX_NONE`] for a non-file format / the manifest.
     pub file_index: u32,
-    /// The requested wire MIME (≤ [`CLIP_MAX_MIME`] bytes).
     pub mime: String,
 }
 
-/// `holder → requester` ([`MSG_CLIP_FETCH_HDR`], **fetch stream only**): the response header that
-/// precedes the raw data chunks (which run until the stream's FIN). When `status` is anything
-/// other than [`CLIP_FETCH_OK`] no chunks follow.
+/// `holder → requester` ([`MSG_CLIP_FETCH_HDR`], fetch stream only). When
+/// `status` is not [`CLIP_FETCH_OK`], no chunks follow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClipFetchHdr {
-    /// One of the `CLIP_FETCH_*` values.
     pub status: u8,
-    /// Total byte count that will follow; `0` = unknown (a streaming provider — FIN ends it).
+    /// Bytes that will follow; `0` = unknown (streaming — FIN ends it).
     pub total_size: u64,
 }
 
-/// Append one [`ClipKind`] to `b`: `mime_len u8 || mime bytes || size_hint u64 LE`.
+/// `mime_len u8 || mime bytes || size_hint u64 LE`.
 fn put_clip_kind(b: &mut Vec<u8>, k: &ClipKind) {
     let mime = k.mime.as_bytes();
     let n = mime.len().min(CLIP_MAX_MIME);
@@ -886,7 +737,6 @@ fn put_clip_kind(b: &mut Vec<u8>, k: &ClipKind) {
     b.extend_from_slice(&k.size_hint.to_le_bytes());
 }
 
-/// Read one [`ClipKind`] at `off`, returning it and the next offset.
 fn get_clip_kind(b: &[u8], off: usize) -> Result<(ClipKind, usize)> {
     if off >= b.len() {
         return Err(PunktfunkError::InvalidArg("truncated ClipKind"));
@@ -1045,42 +895,28 @@ impl ClipFetchHdr {
     }
 }
 
-// --- Cursor channel (design/remote-desktop-sweep.md M2) --------------------------------------
-// The host cursor, forwarded out-of-band so the CLIENT draws it as a real OS cursor (the
-// Parsec/RDP model) instead of paying the video round-trip. Shape (rare, needs reliability)
-// rides here on the control stream; per-frame position/visibility rides the lossy `0xD0`
-// datagram plane ([`super::datagram::CursorState`]). Active only when the client's
-// [`CLIENT_CAP_CURSOR`](super::caps::CLIENT_CAP_CURSOR) met the host's
-// [`HOST_CAP_CURSOR`](super::caps::HOST_CAP_CURSOR) — the host stops compositing then.
-// ---------------------------------------------------------------------------------------------
+// Cursor channel (`design/remote-desktop-sweep.md`). Shape rides the control
+// stream; per-frame position rides lossy `0xD0` ([`super::datagram::CursorState`]).
+// Active only when [`CLIENT_CAP_CURSOR`](super::caps::CLIENT_CAP_CURSOR) met
+// [`HOST_CAP_CURSOR`](super::caps::HOST_CAP_CURSOR) — host then stops compositing.
 
-/// Type byte of [`CursorShape`] (host → client): the pointer's bitmap + hotspot changed.
 pub const MSG_CURSOR_SHAPE: u8 = 0x50;
-
-/// Type byte of [`CursorRenderMode`] (client → host): who renders the pointer right now.
 pub const MSG_CURSOR_RENDER: u8 = 0x51;
 
-/// Per-side pixel cap for a forwarded cursor bitmap. The control-stream frame is length-prefixed
-/// with a `u16`, so a whole message must fit 65535 bytes — 128×128 RGBA (65536 B) already
-/// overshoots before the 17-byte header. 120² (57.6 KiB + header) fits with headroom and covers
-/// real cursors (typically ≤ 64 px, ≤ 96 px at HiDPI scale); the HOST downscales anything
-/// larger before forwarding, so the cap is invisible to clients.
+/// Per-side pixel cap. Control frames are `u16`-length-prefixed (65535).
+/// 128×128 RGBA is 65536 B before the 17-byte header; 120² (57.6 KiB +
+/// header) fits. Host downscales anything larger.
 pub const CURSOR_SHAPE_MAX_SIDE: u16 = 120;
 
-/// `host → client` ([`MSG_CURSOR_SHAPE`]): one cursor shape, sent when the pointer's bitmap
-/// changes (never per-frame — [`super::datagram::CursorState`] carries the motion). The client
-/// caches shapes by `serial` and re-installs a cached one without any bitmap crossing again
-/// (the RDP pointer-cache idea for free: re-showing a known serial is a 14-byte
-/// [`super::datagram::CursorState`], not a resend).
+/// `host → client` ([`MSG_CURSOR_SHAPE`]): pointer bitmap changed. Never
+/// per-frame — [`super::datagram::CursorState`] carries motion. Client caches
+/// by `serial`; a known serial is a 14-byte datagram, not a resend.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CursorShape {
-    /// Bitmap identity — bumped by the host's capture layer only on shape change; position
-    /// moves keep the serial stable. [`super::datagram::CursorState::serial`] references it.
+    /// Bumped only on shape change; position moves keep it stable.
     pub serial: u32,
-    /// Bitmap dimensions in pixels, `1..=`[`CURSOR_SHAPE_MAX_SIDE`] each.
     pub w: u16,
     pub h: u16,
-    /// Hotspot (the pixel that IS the pointer position), within `w`×`h`.
     pub hot_x: u16,
     pub hot_y: u16,
     /// Straight-alpha RGBA8, exactly `w * h * 4` bytes, no padding.
@@ -1125,15 +961,11 @@ impl CursorShape {
     }
 }
 
-/// `client → host` ([`MSG_CURSOR_RENDER`]): who renders the pointer, switched live by the
-/// client's mouse-model flip (⌃⌥⇧M — design/remote-desktop-sweep.md §8). `client_draws: true`
-/// = the DESKTOP model: the host EXCLUDES the pointer from the video and forwards
-/// shape/state ([`CursorShape`]/`0xD0`) for the client's local OS cursor. `false` = the
-/// CAPTURE model: the host COMPOSITES the pointer into the video exactly as a
-/// channel-less session would (DWM / encoder blend — full fidelity incl. XOR inversion)
-/// and the forwarder goes quiet. Sessions that negotiated the cursor cap start in
-/// `client_draws: true` (the pre-message behavior) until told otherwise; the message is
-/// idempotent and latest-wins.
+/// `client → host` ([`MSG_CURSOR_RENDER`]): who draws the pointer, live.
+/// `client_draws: true` = desktop model: host excludes the pointer and
+/// forwards [`CursorShape`]/`0xD0`. `false` = capture model: host composites
+/// (DWM / encoder blend, including XOR inversion) and the forwarder goes
+/// quiet. Cap-negotiated sessions start `true` until told otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CursorRenderMode {
     pub client_draws: bool,
@@ -1159,29 +991,21 @@ impl CursorRenderMode {
     }
 }
 
-// --- Per-client access (design/per-client-access.md §4/§9) -----------------------------------
-// Mid-session grant/expiry traffic. The grant vocabulary itself lives in [`super::access`];
-// this is the one control message that carries it host → client.
-// ---------------------------------------------------------------------------------------------
+// Per-client access (`design/per-client-access.md`). Grant vocabulary lives
+// in [`super::access`]; this is the one host → client control message.
 
-/// Type byte of [`AccessUpdate`] (host → client): the session's effective grants or remaining
-/// lifetime changed. 0x58: the 0x50 block belongs to the cursor channel (0x50/0x51 taken),
-/// so access sits at its top, clear of both the clipboard block (0x40-0x44) and any further
-/// cursor growth.
+/// [`AccessUpdate`]. 0x58: 0x50–0x51 are cursor; 0x40–0x44 are clipboard.
 pub const MSG_ACCESS_UPDATE: u8 = 0x58;
 
-/// `host → client` ([`MSG_ACCESS_UPDATE`]): a console edit changed this device's grants, or its
-/// temporary access is about to run out (the T−5 m / T−1 m warnings). Latest-wins and
-/// best-effort — the HOST enforces regardless; this exists so the client can re-gate capture
-/// and warn the user before the expiry close ([`ACCESS_EXPIRED_CLOSE_CODE`](crate::reject))
-/// instead of the session just ending. An older client hits its "unknown control message" arm
-/// and simply misses the courtesy.
+/// `host → client` ([`MSG_ACCESS_UPDATE`]): grants or remaining lifetime
+/// changed. Latest-wins, best-effort — the host enforces regardless. Lets
+/// the client re-gate capture and warn before
+/// [`ACCESS_EXPIRED_CLOSE_CODE`](crate::reject). Older clients miss the courtesy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AccessUpdate {
-    /// The effective grant bitmask ([`super::GRANT_GAMEPAD`] family) — same vocabulary as the
-    /// [`Welcome`](super::Welcome) advert.
+    /// [`super::GRANT_GAMEPAD`] family — same vocabulary as [`Welcome`](super::Welcome).
     pub grants: u32,
-    /// Seconds until this device's access expires; `0` = permanent (no deadline).
+    /// Seconds until expiry; `0` = permanent.
     pub remaining_secs: u32,
 }
 
@@ -1218,7 +1042,6 @@ mod tests {
             let m = CursorRenderMode { client_draws };
             assert_eq!(CursorRenderMode::decode(&m.encode()).unwrap(), m);
         }
-        // Type byte separates it from the shape message (and vice versa).
         assert!(CursorRenderMode::decode(
             &CursorShape {
                 serial: 1,
@@ -1245,7 +1068,7 @@ mod tests {
         let d = pr.encode();
         assert_eq!(d.len(), 27, "a real coherence rides the v2 tail");
         assert_eq!(PhaseReport::decode(&d).unwrap(), pr);
-        // The MAX sentinel encodes as the 25-byte v1 form and roundtrips back to the sentinel.
+        // MAX sentinel encodes as the 25-byte v1 form.
         let v1 = PhaseReport {
             coherence_milli: u16::MAX,
             ..pr
@@ -1254,9 +1077,7 @@ mod tests {
         assert_eq!(d1.len(), 25);
         assert_eq!(&d1[..25], &d[..25], "v1 form is a strict prefix of v2");
         assert_eq!(PhaseReport::decode(&d1).unwrap(), v1);
-        // Wrong type byte (a ClockProbe) must not decode as a PhaseReport.
         assert!(PhaseReport::decode(&ClockProbe { t1_ns: 7 }.encode()).is_err());
-        // Truncation to a length that is neither form must not decode.
         assert!(PhaseReport::decode(&d[..24]).is_err());
         assert!(PhaseReport::decode(&d[..26]).is_err());
     }
@@ -1278,7 +1099,6 @@ mod tests {
             };
             assert_eq!(Reconfigured::decode(&rs.encode()).unwrap(), rs);
         }
-        // The type byte separates the post-handshake messages from each other.
         assert!(Reconfigure::decode(
             &Reconfigured {
                 accepted: true,
@@ -1293,7 +1113,6 @@ mod tests {
     fn request_keyframe_roundtrip() {
         let bytes = RequestKeyframe.encode();
         assert!(RequestKeyframe::decode(&bytes).is_ok());
-        // Distinct from the other control messages — its type byte must not collide.
         let mode = Mode {
             width: 1280,
             height: 720,
@@ -1301,7 +1120,6 @@ mod tests {
         };
         assert!(RequestKeyframe::decode(&Reconfigure { mode }.encode()).is_err());
         assert!(Reconfigure::decode(&bytes).is_err());
-        // Length is exact (no trailing bytes accepted).
         assert!(RequestKeyframe::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
     }
 
@@ -1314,7 +1132,6 @@ mod tests {
             };
             assert_eq!(RfiRequest::decode(&r.encode()).unwrap(), r);
         }
-        // Disjoint from the bare keyframe request (its loss-unaware sibling) and others: type byte + length.
         assert!(RfiRequest::decode(&RequestKeyframe.encode()).is_err());
         assert!(RequestKeyframe::decode(
             &RfiRequest {
@@ -1324,7 +1141,6 @@ mod tests {
             .encode()
         )
         .is_err());
-        // Exact length — no trailing bytes.
         let bytes = RfiRequest {
             first_frame: 3,
             last_frame: 9,
@@ -1340,7 +1156,6 @@ mod tests {
             let r = LossReport { loss_ppm };
             assert_eq!(LossReport::decode(&r.encode()).unwrap(), r);
         }
-        // Disjoint from the other control messages (type byte + length).
         assert!(LossReport::decode(&RequestKeyframe.encode()).is_err());
         assert!(RequestKeyframe::decode(&LossReport { loss_ppm: 0 }.encode()).is_err());
         assert!(LossReport::decode(
@@ -1359,12 +1174,8 @@ mod tests {
         assert!(DeliveryReport::decode(&LossReport { loss_ppm: 0 }.encode()).is_err());
     }
 
-    /// The delivery count MUST NOT ride on [`LossReport`]: that message is length-checked EXACTLY,
-    /// so lengthening it would make every already-shipped host reject the loss reports its adaptive
-    /// FEC runs on — a silent regression for a new client against an old host, which is the normal
-    /// mixed-version case here (the field report that motivated this ran a current host against a
-    /// months-old client). Its own type byte keeps `LossReport` byte-identical while an older host
-    /// simply ignores the message it does not know.
+    /// Own type byte: [`LossReport`] decode is exact-length, so appending
+    /// here would make every shipped host reject adaptive FEC.
     #[test]
     fn the_delivery_count_does_not_disturb_the_loss_report_wire_form() {
         let loss = LossReport { loss_ppm: 42 }.encode();
@@ -1379,40 +1190,30 @@ mod tests {
             delivery[4], MSG_LOSS_REPORT,
             "a distinct type byte is what makes an old host ignore it instead of failing"
         );
-        // Neither can be silently mis-parsed as the other.
         assert!(LossReport::decode(&delivery).is_err());
         assert!(DeliveryReport::decode(&loss).is_err());
     }
 
     #[test]
     fn window_loss_ppm_estimates_and_caps() {
-        // No traffic → 0. A clean window (nothing recovered) → 0.
         assert_eq!(window_loss_ppm(0, 0, 0, 0), 0);
         assert_eq!(window_loss_ppm(0, 0, 1000, 0), 0);
-        // 50 recovered of 1000 total (950 received + 50 recovered) = 5%.
+        // 50 of 1000 = 5%.
         assert_eq!(window_loss_ppm(50, 0, 950, 0), 50_000);
-        // An unrecoverable frame adds the +5% bump (push FEC past the current cap).
+        // Unrecoverable frame adds the +5% bump.
         assert_eq!(window_loss_ppm(50, 0, 950, 1), 100_000);
-        // A total-loss window with a drop but nothing received still reports the bump, capped at 1e6.
         assert_eq!(window_loss_ppm(0, 0, 0, 3), 50_000);
         assert!(window_loss_ppm(u64::MAX, 0, 1, 9) <= 1_000_000);
-        // Reordering: shards "recovered" early that then arrived are late, not lost — netted out, so
-        // a pure-reorder window reads 0. Partially late nets to the true loss (20 of 1000 = 2%).
+        // Late shards are reorder, not loss. 20 of 1000 = 2%.
         assert_eq!(window_loss_ppm(50, 50, 1000, 0), 0);
         assert_eq!(window_loss_ppm(50, 30, 980, 0), 20_000);
-        // `late` can outrun `recovered` across a window boundary (reorder straddling the report
-        // tick) or via a rare wire duplicate — saturate at a clean window, never underflow.
+        // `late` can outrun `recovered` across a window boundary — saturate, never underflow.
         assert_eq!(window_loss_ppm(10, 25, 1000, 0), 0);
-        // The all-late window (lost == 0, late > 0): every presumed-lost shard arrived — the
-        // dropped frames died of LATENESS (a delivery hole), which neither FEC nor a bitrate
-        // backoff can fix. No bump — this was the 2026-08-27 false ratchet (loss_ppm=50000 on a
-        // wire with zero loss, ×0.7³ in 4 s).
+        // All-late (`lost == 0`, `late > 0`): delivery hole, not loss. No bump.
         assert_eq!(window_loss_ppm(50, 50, 1000, 2), 0);
         assert_eq!(window_loss_ppm(10, 25, 1000, 4), 0);
-        // Mixed windows keep the bump: real net loss alongside lateness is still loss…
         assert_eq!(window_loss_ppm(50, 30, 980, 1), 70_000);
-        // …and silent total loss (shards that never arrived count in NEITHER recovered nor
-        // late) reads late == 0 and still bumps — the case the bump exists for.
+        // Silent total loss: shards in neither recovered nor late still bump.
         assert_eq!(window_loss_ppm(0, 0, 500, 2), 50_000);
     }
 
@@ -1426,7 +1227,7 @@ mod tests {
             bitrate_kbps: 14_000,
         };
         assert_eq!(BitrateChanged::decode(&ack.encode()).unwrap(), ack);
-        // Same payload shape as LossReport — the type byte alone must keep them disjoint.
+        // Same 9-byte shape as [`LossReport`] — type byte is the only split.
         assert!(LossReport::decode(&req.encode()).is_err());
         assert!(SetBitrate::decode(&ack.encode()).is_err());
         assert!(BitrateChanged::decode(&req.encode()).is_err());
@@ -1435,15 +1236,12 @@ mod tests {
 
     #[test]
     fn pipeline_gap_roundtrips() {
-        // 401 ms is the 0.29 field rebuild verbatim; the rest are the boundaries a duration can
-        // legitimately take (an instant rebuild, a whole minute of it).
         for gap_ms in [1u32, 401, 60_000, u32::MAX] {
             let m = PipelineGap { gap_ms };
             assert_eq!(PipelineGap::decode(&m.encode()).unwrap(), m);
         }
-        // 0x0A shares its 9-byte shape with the three rate-control messages either side of it, so
-        // the type byte is the ONLY thing keeping them apart — a gap that re-decoded as a
-        // `SetBitrate` would retarget the encoder to 401 kbps.
+        // Same 9-byte shape as the rate-control messages. A gap decoded as
+        // [`SetBitrate`] would retarget the encoder to 401 kbps.
         let gap = PipelineGap { gap_ms: 401 }.encode();
         assert_eq!(gap[4], MSG_PIPELINE_GAP);
         assert!(LossReport::decode(&gap).is_err());
@@ -1452,8 +1250,6 @@ mod tests {
         assert!(PipelineGap::decode(&LossReport { loss_ppm: 401 }.encode()).is_err());
         assert!(PipelineGap::decode(&SetBitrate { bitrate_kbps: 401 }.encode()).is_err());
         assert!(PipelineGap::decode(&BitrateChanged { bitrate_kbps: 401 }.encode()).is_err());
-        // …and the neighbouring id (0x09) an old peer would have to fall past to reach its
-        // "unknown control message" arm. Length is exact — no trailing bytes, no truncation.
         assert!(ShardPayloadAck::decode(&gap).is_err());
         assert!(PipelineGap::decode(&[gap.as_slice(), &[0]].concat()).is_err());
         assert!(PipelineGap::decode(&gap[..gap.len() - 1]).is_err());
@@ -1466,16 +1262,13 @@ mod tests {
             assert_eq!(ShardPayloadChanged::decode(&chg.encode()).unwrap(), chg);
             let ack = ShardPayloadAck { shard_payload };
             assert_eq!(ShardPayloadAck::decode(&ack.encode()).unwrap(), ack);
-            // Identical payload shape — the type byte alone must keep the pair disjoint (a
-            // change echoed back must never re-decode as a change).
+            // Identical payload — an ack must never re-decode as a change.
             assert!(ShardPayloadChanged::decode(&ack.encode()).is_err());
             assert!(ShardPayloadAck::decode(&chg.encode()).is_err());
         }
-        // Exact length — no trailing bytes, no truncation.
         let bytes = ShardPayloadChanged { shard_payload: 512 }.encode();
         assert!(ShardPayloadChanged::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
         assert!(ShardPayloadChanged::decode(&bytes[..bytes.len() - 1]).is_err());
-        // Disjoint from the neighboring ids either side (0x07 RfiRequest / 0x20 ProbeRequest).
         assert!(ShardPayloadChanged::decode(
             &RfiRequest {
                 first_frame: 1,
@@ -1502,7 +1295,7 @@ mod tests {
         };
         assert_eq!(ProbeResult::decode(&res.encode()).unwrap(), res);
         assert_eq!(res.encode().len(), 29);
-        // A pre-wire-stats host's 21-byte ProbeResult still decodes, with the new fields zeroed.
+        // 21-byte pre-wire-stats form: new fields decode as 0.
         let legacy = {
             let full = res.encode();
             full[..21].to_vec()
@@ -1511,7 +1304,6 @@ mod tests {
         assert_eq!(decoded.wire_packets_sent, 0);
         assert_eq!(decoded.send_dropped, 0);
         assert_eq!(decoded.bytes_sent, res.bytes_sent);
-        // Type bytes keep the control messages disjoint from each other.
         assert!(ProbeRequest::decode(&res.encode()).is_err());
         assert!(Reconfigure::decode(&req.encode()).is_err());
         assert!(ProbeResult::decode(&req.encode()).is_err());
@@ -1529,13 +1321,10 @@ mod tests {
             t3_ns: 1_700_000_050_789,
         };
         assert_eq!(ClockEcho::decode(&echo.encode()).unwrap(), echo);
-        // Disjoint from the other control messages (distinct type bytes).
         assert!(ClockProbe::decode(&echo.encode()).is_err());
         assert!(ProbeRequest::decode(&probe.encode()).is_err());
         assert!(ClockEcho::decode(&probe.encode()).is_err());
     }
-
-    // ---- Shared clipboard control + fetch-stream message codecs (0x40-0x44) -----------------------
 
     #[test]
     fn clip_control_roundtrip() {
@@ -1548,7 +1337,6 @@ mod tests {
             let m = ClipControl { enabled, flags };
             assert_eq!(ClipControl::decode(&m.encode()).unwrap(), m);
         }
-        // Disjoint from its host→client sibling (type byte + length) and exact length.
         assert!(ClipControl::decode(
             &ClipState {
                 enabled: true,
@@ -1594,8 +1382,7 @@ mod tests {
         for m in cases {
             assert_eq!(ClipState::decode(&m.encode()).unwrap(), m);
         }
-        // The reason vocabulary stays collision-free: a shipped client switches on these bytes,
-        // so a re-used value would mislabel refusals in the field, not fail loudly.
+        // A reused value would mislabel refusals on a shipped client, not fail.
         let reasons = [
             CLIP_REASON_OK,
             CLIP_REASON_BACKEND_UNAVAILABLE,
@@ -1609,7 +1396,6 @@ mod tests {
                 assert_ne!(a, b, "CLIP_REASON_* values must be distinct");
             }
         }
-        // A ClipControl must not decode as a ClipState (type byte).
         assert!(ClipState::decode(
             &ClipControl {
                 enabled: true,
@@ -1624,7 +1410,6 @@ mod tests {
 
     #[test]
     fn clip_offer_roundtrip() {
-        // Empty offer, one kind, and a full multi-format offer (text/rich/image/files).
         let cases = [
             ClipOffer {
                 seq: 0,
@@ -1662,15 +1447,12 @@ mod tests {
         for m in &cases {
             assert_eq!(&ClipOffer::decode(&m.encode()).unwrap(), m);
         }
-        // Trailing bytes are rejected (get_clip_kind consumes exactly to the end).
         let mut padded = cases[1].encode();
         padded.push(0);
         assert!(ClipOffer::decode(&padded).is_err());
-        // A count byte over the cap is rejected before allocating.
         let mut over = cases[0].encode();
         over[9] = (CLIP_MAX_KINDS + 1) as u8;
         assert!(ClipOffer::decode(&over).is_err());
-        // Disjoint from a same-family control message.
         assert!(ClipOffer::decode(
             &ClipControl {
                 enabled: true,
@@ -1703,11 +1485,10 @@ mod tests {
         for m in &cases {
             assert_eq!(&ClipFetch::decode(&m.encode()).unwrap(), m);
         }
-        // Trailing + truncation both rejected (exact-length mime check).
         let bytes = cases[0].encode();
         assert!(ClipFetch::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
         assert!(ClipFetch::decode(&bytes[..bytes.len() - 1]).is_err());
-        // A fetch-stream message must not decode as a control-stream offer, and vice-versa.
+        // Fetch-stream vs control-stream: neither decoder accepts the other.
         assert!(ClipOffer::decode(&cases[0].encode()).is_err());
         assert!(ClipFetch::decode(
             &ClipOffer {
@@ -1750,7 +1531,6 @@ mod tests {
             rgba: (0..2 * 3 * 4).map(|i| i as u8).collect(),
         };
         assert_eq!(CursorShape::decode(&s.encode()).unwrap(), s);
-        // Max-side shape still fits the u16 control frame with headroom.
         let side = CURSOR_SHAPE_MAX_SIDE;
         let big = CursorShape {
             serial: u32::MAX,
@@ -1763,7 +1543,6 @@ mod tests {
         let bytes = big.encode();
         assert!(bytes.len() <= u16::MAX as usize, "must fit a control frame");
         assert_eq!(CursorShape::decode(&bytes).unwrap(), big);
-        // Rejections: zero / oversize dims, and a length that disagrees with them.
         let mut zero = s.encode();
         zero[9] = 0;
         zero[10] = 0;
@@ -1774,16 +1553,15 @@ mod tests {
         let mut short = s.encode();
         short.pop();
         assert!(CursorShape::decode(&short).is_err());
-        // Distinct from the neighboring vocabulary.
         assert!(ClipState::decode(&s.encode()).is_err());
     }
 
     #[test]
     fn access_update_roundtrip() {
         for (grants, remaining_secs) in [
-            (GRANT_ALL, 0u32),                   // full control, permanent
-            (GRANT_PRESET_CONTROLLER_ONLY, 300), // guest at the T−5 m warning
-            (GRANT_PRESET_VIEW_ONLY, 60),        // spectator at T−1 m
+            (GRANT_ALL, 0u32),
+            (GRANT_PRESET_CONTROLLER_ONLY, 300),
+            (GRANT_PRESET_VIEW_ONLY, 60),
             (GRANT_GAMEPAD | GRANT_CLIPBOARD, u32::MAX),
         ] {
             let m = AccessUpdate {
@@ -1792,8 +1570,6 @@ mod tests {
             };
             assert_eq!(AccessUpdate::decode(&m.encode()).unwrap(), m);
         }
-        // 0x58 stays clear of every neighbor's decoder (an old peer's dispatch chain must fall
-        // through to its "unknown control message" arm), and the length is exact.
         let bytes = AccessUpdate {
             grants: GRANT_ALL,
             remaining_secs: 1,

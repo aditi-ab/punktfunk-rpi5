@@ -1,46 +1,32 @@
-//! Title launch: resolve a library id / raw command into an executable command line (per-store +
-//! per-OS), and the gamescope-session launch helpers. Split out of the `library` facade (plan §W5).
+//! Resolve a library id or operator command into the per-OS line the host runs.
 //!
-//! This module owns the **whole launch side** of the library: the `kind` vocabulary, its per-kind
-//! charset validators, and the per-OS resolvers. That split is deliberate and load-bearing — the
-//! scanner modules beside it do *enumeration only*, so they can be lifted out into library plugins
-//! without taking any launch logic with them (design/library-scanner-plugins.md D1: a client sends
-//! only an entry id and the host resolves the [`LaunchSpec`] it holds, which stays true whether the
-//! entry was enumerated in-process or reconciled in by a plugin).
+//! Scanners enumerate only. This module owns the `kind` vocabulary, charset
+//! validators, and resolvers so a plugin lift does not take launch with it.
+//! A client sends an entry id; the host holds the [`LaunchSpec`]
+//! (design/library-scanner-plugins.md D1).
+//!
+//! Linux: the host runs the resolved shell command (nested gamescope or live
+//! session). Windows: [`launch_title`] spawns into the interactive session.
 
 use super::*;
 
-/// Everything a session needs about the title it is launching, resolved in **one** library scan:
-/// what to run, what to call it, and how to recognize it once it is running.
-///
-/// Enumerating the library touches every installed store's on-disk metadata, so the launch path
-/// resolves this once at handshake time and threads it into the data plane rather than looking the
-/// same id up again per use.
+/// Library enumeration hits every store's on-disk metadata, so handshake
+/// resolves this once and threads it through the data plane.
 pub struct LaunchTarget {
-    /// Identity for the status surface and the `game.*` events.
     pub game: crate::gamelease::GameRef,
-    /// This entry opens a LAUNCHER, not a game (design D4) — so there is no "the game exited"
-    /// moment to detect, and the lease stays untracked no matter what else is known about it.
+    /// Launcher tile (design D4): no game-exit to detect; the lease stays untracked.
     /// See [`crate::gamelease::LeaseRequest::launcher`].
     pub launcher: bool,
-    /// How to recognize the running game ([`DetectSpec`]); empty when the store offers nothing.
     pub detect: DetectSpec,
-    /// The resolved shell command. `Some` on Linux (where the host runs it); `None` on Windows,
-    /// which launches by library id through the interactive-session spawner instead.
+    /// Linux: the host-run shell command. Windows: always `None`; spawn is by library id.
     pub command: Option<String>,
 }
 
-/// Resolve a store-qualified library id (as sent by a client in `Hello::launch`, or carried on a
-/// GameStream catalog entry) against the host's **own** library — so a client can only pick an
-/// existing title, never inject a command. `None` = unknown id, or — on Linux — a title with no
-/// runnable recipe.
+/// Map a store-qualified library id to a [`LaunchTarget`] from the host's library.
+/// `None` = unknown id, or on Linux a title with no runnable recipe.
 ///
-/// This is the single lookup, shared by both planes: the client sends only an id, and everything the
-/// session does with the title afterwards comes from what the host itself knows about it.
-///
-/// **Linux**: the resolved command is run by the host (nested into a per-session gamescope, or
-/// spawned into the live session). **Windows** has no gamescope to nest into and resolves the
-/// concrete process at launch time instead, via [`launch_title`].
+/// Shared by both planes. Linux runs the command (nested gamescope or live
+/// session). Windows has no nest: [`launch_title`] resolves the process later.
 pub fn resolve_launch(id: &str) -> Option<LaunchTarget> {
     let entry = all_games().into_iter().find(|g| g.id == id)?;
     let game = crate::gamelease::GameRef {
@@ -50,8 +36,7 @@ pub fn resolve_launch(id: &str) -> Option<LaunchTarget> {
     };
     #[cfg(not(windows))]
     {
-        // Linux runs the command itself, so a title without one has nothing to launch — same answer
-        // (and same warning path) as before this resolution existed.
+        // No command ⇒ nothing to launch; same `None` as an unknown id.
         let command = plugin_recipe(&entry)
             .map(|l| l.command)
             .or_else(|| entry.launch.as_ref().and_then(command_for))?;
@@ -64,9 +49,7 @@ pub fn resolve_launch(id: &str) -> Option<LaunchTarget> {
     }
     #[cfg(windows)]
     {
-        // Windows resolves the concrete process at launch time (`launch_title`), which is also where
-        // a missing recipe is reported — so an entry with no Windows recipe still yields a target and
-        // the existing warning fires there.
+        // Recipe is resolved in `launch_title`; a missing one still yields a target here.
         Some(LaunchTarget {
             game,
             launcher: entry.role == GameRole::Launcher,
@@ -76,26 +59,22 @@ pub fn resolve_launch(id: &str) -> Option<LaunchTarget> {
     }
 }
 
-/// The recipe for a `plugin`-kind entry, asked of the plugin that owns it. `None` for every other
-/// kind (without doing any I/O), so both per-OS resolvers can simply try this first.
+/// Recipe for a `plugin`-kind entry from the plugin that owns it. `None` for
+/// every other kind, with no I/O, so both OS resolvers try this first.
 ///
-/// This lives beside [`resolve_launch`] / [`launch_title`] rather than inside `command_for` /
-/// `windows_launch_for` because it needs the entry's **`provider`** — and that field is the whole
-/// authorization story. `provider` is stamped by the host from the reconcile URL
-/// (`PUT /library/provider/{provider}`), never taken from the payload, so it is what decides which
-/// plugin gets asked. A plugin that plants an entry under someone else's provider only causes that
-/// *other* plugin to be asked about a key it never published — which is a 404, not a launch.
+/// Lives here rather than in `command_for` / `windows_launch_for` because it
+/// needs `provider` (stamped from `PUT /library/provider/{provider}`). A plant
+/// under someone else's provider 404s at that other plugin, not a launch.
 ///
-/// **Blocking**: see [`ask_plugin_launch`]. `resolve_launch`'s async callers hop through
-/// `spawn_blocking`; the handshake probe uses [`launch_is_resolvable`], which never asks.
+/// Blocking: [`ask_plugin_launch`]. Async callers use `spawn_blocking`; the
+/// handshake probe is [`launch_is_resolvable`], which never asks.
 fn plugin_recipe(entry: &GameEntry) -> Option<PluginLaunch> {
     let spec = entry.launch.as_ref()?;
     if spec.kind != "plugin" {
         return None;
     }
     let Some(provider) = entry.provider.as_deref() else {
-        // Only a provider reconcile can author this kind, so this is unreachable short of a
-        // hand-edited library.json — say so rather than silently doing nothing.
+        // Unreachable unless library.json was hand-edited; warn rather than silent None.
         tracing::warn!(
             id = %entry.id,
             "plugin launch: entry carries no provider, so no plugin can answer for it"
@@ -105,13 +84,9 @@ fn plugin_recipe(entry: &GameEntry) -> Option<PluginLaunch> {
     ask_plugin_launch(provider, &spec.value)
 }
 
-/// Whether `id` will actually launch something — **without asking a plugin**.
-///
-/// The handshake needs this one bit to decide dedicated-session routing, and it runs on the async
-/// path, so it must not make a blocking call out to a plugin. For a `plugin`-kind entry the cheap
-/// answer is "a live plugin is registered under its provider, and the key is well formed"; if that
-/// plugin later refuses the ask, the launch fails the same way any unresolvable entry does and the
-/// player is left on the session.
+/// Cheap "will this launch" bit for handshake routing. Async path: never asks
+/// a plugin. For `plugin` kind, a live provider plus a well-formed key is
+/// enough; a later refuse fails like any other unresolvable entry.
 #[cfg(not(windows))]
 pub fn launch_is_resolvable(id: &str) -> bool {
     let Some(entry) = all_games().into_iter().find(|g| g.id == id) else {
@@ -130,96 +105,62 @@ pub fn launch_is_resolvable(id: &str) -> bool {
     command_for(spec).is_some()
 }
 
-/// Map a resolved [`LaunchSpec`] to its shell command (pure — the unit-testable core of
-/// [`resolve_launch`], split out so the appid-validation can be tested without a Steam install).
-///
-/// The `plugin` kind is deliberately absent: its answer comes from another process, so it is
-/// resolved by [`plugin_recipe`] before this is reached.
-///
-/// - `steam_appid` → `steam steam://rungameid/<appid>` (appid validated as digits).
-/// - `command` → the stored command verbatim. This string comes from the host's own custom store
-///   (added by the host operator via the admin UI), never from the client, so it is trusted.
+/// Pure map from [`LaunchSpec`] to a shell command. `plugin` is absent: that
+/// answer is another process, resolved by [`plugin_recipe`] first.
 #[cfg(not(windows))]
 fn command_for(spec: &LaunchSpec) -> Option<String> {
     match spec.kind.as_str() {
         "steam_appid" => valid_steam_appid(&spec.value)
             .then(|| format!("steam steam://rungameid/{}", spec.value)),
-        // Lutris: a digits-only pga.db game id (same guard as steam_appid) → its run URI.
         #[cfg(target_os = "linux")]
         "lutris_id" => (!spec.value.is_empty() && spec.value.bytes().all(|b| b.is_ascii_digit()))
             .then(|| format!("lutris lutris:rungameid/{}", spec.value)),
-        // Heroic: `<runner>:<appName>` → the validated heroic://launch command (see heroic_command).
         #[cfg(target_os = "linux")]
         "heroic" => heroic_command(&spec.value),
-        // A launcher entry (D4): open the Steam client itself, in Big Picture or on the desktop.
-        // Nested in gamescope this is the SteamOS game-mode shape.
+        // Steam client UI (design D4). Nested in gamescope this is SteamOS game-mode.
         "steam_ui" => match spec.value.as_str() {
             "bigpicture" => Some("steam -gamepadui".into()),
             "desktop" => Some("steam".into()),
             _ => None,
         },
-        // The other launchers' own UIs (D4). The host builds the command — a plugin only names
-        // which launcher — so no shell string ever crosses the wire.
+        // Other launcher UIs (design D4). Host builds the command; the plugin names the launcher.
         #[cfg(target_os = "linux")]
         "launcher_ui" => match spec.value.as_str() {
-            // The same resolution the `heroic` game launches use (native binary, else Flatpak), just
-            // without `--no-gui` and without a URI: that opens Heroic's window, which IS the tile.
+            // Same prefix as a game launch, minus `--no-gui` and URI: the window is the tile.
             "heroic" => heroic_launch_prefix(),
-            // Heroic's console mode — its couch front end, the Big Picture of this launcher.
-            //
-            // It takes TWO flags, which is not obvious and is why this is the host's business and
-            // not a plugin's: `--console` only routes the UI to that front end, and `--fullscreen`
-            // is what actually fills the screen (Heroic reads them separately —
-            // `isCLIConsoleMode` / `isCLIFullscreen`). Neither is a URI: `heroic://` speaks only
-            // `ping` and `launch`, so a protocol hand-off cannot reach console mode at all — the
-            // same reason Playnite's fullscreen tile spawns its exe directly.
-            //
-            // Console mode arrived in Heroic 2.21.0. An older Heroic ignores the unknown
-            // `--console` and honours `--fullscreen`, so the tile degrades to a fullscreen desktop
-            // UI rather than to nothing.
+            // Both flags: `--console` routes the UI; `--fullscreen` fills the screen.
+            // `heroic://` has only ping/launch, so a URI cannot open console mode.
+            // Heroic < 2.21.0 ignores `--console` and still honours `--fullscreen`.
             "heroic-console" => {
                 heroic_launch_prefix().map(|p| format!("{p} --console --fullscreen"))
             }
-            // Bare `lutris` opens the Lutris window; with a `lutris:rungameid/…` URI it launches a
-            // game instead (the `lutris_id` kind above).
+            // Bare `lutris` opens the window; a `lutris:rungameid/…` URI would launch a game.
             "lutris" => Some("lutris".into()),
             _ => None,
         },
-        // Trusted: the command comes from the host's own custom store, never the client.
         "command" => (!spec.value.trim().is_empty()).then(|| spec.value.clone()),
         _ => None,
     }
 }
 
-/// A resolved Windows launch: the command line to spawn, the directory to spawn it in, and whether
-/// the process that line starts **is** the game.
+/// Command line, working dir, and whether the started process **is** the game.
 ///
-/// [`Self::owns_game`] is the whole reason this is a struct and not a pair. Almost every Windows
-/// recipe is a protocol hand-off — `explorer.exe "playnite://…"`, `Steam.exe "steam://…"` — that
-/// forwards the request to whichever launcher owns the title and then exits. Its pid is a
-/// forwarder's, so that pid's lifetime says nothing about the game's, in either direction:
-///
-/// * the launcher was already running, so the forwarder quits a second later — read as a `Child`
-///   lease, that is the game "exiting" while it is still loading;
-/// * the launcher was *not* running, so the process the host started becomes the launcher itself
-///   and outlives every game the player then quits — a lease that can never report an exit.
-///
-/// Only a line that starts the game (or the operator's own command) directly earns its pid a place
-/// in [`crate::gamelease::LeaseRequest::spawned`]; a hand-off pid is dropped, and the lease falls
-/// back to the title's detect signals, exactly as it did before the pid was carried at all.
+/// Almost every Windows recipe is a protocol hand-off (`steam://`, `playnite://`)
+/// whose pid is a forwarder's: already-running launcher → pid dies while the
+/// game still loads; cold launcher → pid becomes the launcher and never exits.
+/// Only a direct game (or operator) start goes on
+/// [`crate::gamelease::LeaseRequest::spawned`]; a hand-off pid is dropped and
+/// the lease uses detect signals.
 #[cfg(windows)]
 pub struct WinRecipe {
-    /// The full command line to hand to `CreateProcessAsUserW`.
     pub cmdline: String,
-    /// The working directory to start it in, when the recipe needs a specific one.
     pub workdir: Option<std::path::PathBuf>,
-    /// See the type docs: `false` for a protocol/launcher hand-off.
+    /// `false` for a protocol/launcher hand-off (see type docs).
     pub owns_game: bool,
 }
 
 #[cfg(windows)]
 impl WinRecipe {
-    /// A line that forwards the launch to whoever owns the title and then exits.
     fn handoff(cmdline: String) -> Self {
         Self {
             cmdline,
@@ -228,7 +169,6 @@ impl WinRecipe {
         }
     }
 
-    /// A line that starts the game — or the operator's own command — as its own process.
     fn game(cmdline: String, workdir: Option<std::path::PathBuf>) -> Self {
         Self {
             cmdline,
@@ -238,36 +178,29 @@ impl WinRecipe {
     }
 }
 
-/// What a Windows launch started, as the lease needs to hear it — see [`WinRecipe::owns_game`].
+/// Pid from a Windows launch, plus whether it is the game's ([`WinRecipe::owns_game`]).
 #[cfg(windows)]
 pub struct WindowsLaunch {
-    /// The pid `CreateProcessAsUserW` handed back.
     pub pid: u32,
-    /// Whether that pid is the game's rather than a forwarder's.
+    /// Whether this pid is the game, not a protocol forwarder.
     pub owns_game: bool,
 }
 
 #[cfg(windows)]
 impl WindowsLaunch {
-    /// The pid to carry on the lease: `None` when all the host started was a hand-off.
+    /// Lease pid: `None` when the host only started a hand-off.
     pub fn tracked_pid(&self) -> Option<u32> {
         self.owns_game.then_some(self.pid)
     }
 }
 
-/// Windows: launch a store-qualified library id into the **interactive user session** — the Windows
-/// analogue of the Linux gamescope-nested [`resolve_launch`]. The id is resolved against the host's
-/// OWN library (the client never sends a command), mapped to a concrete process by
-/// [`windows_launch_for`], and spawned via [`crate::interactive::spawn_in_active_session`].
+/// Spawn a store-qualified library id into the interactive user session.
+/// Windows analogue of nested [`resolve_launch`]. Mapped by [`windows_launch_for`],
+/// spawned via [`crate::interactive::spawn_in_active_session`].
 ///
-/// Wired into the data plane *after* capture is live, so the title renders onto the already-captured
-/// desktop and grabs foreground.
-///
-/// Returns the process it started and whether that process is the game ([`WindowsLaunch`]) — the
-/// pid is what the caller hands to [`crate::gamelease::LeaseRequest::spawned`], but only when it
-/// belongs to the game. It used to be logged and discarded, and that was the whole of Windows'
-/// disadvantage against Linux here: with no `Child` to hold and no pid kept, a title whose provider
-/// supplied no detect hint left the lease nothing to watch or signal.
+/// Called after capture is live so the title hits the already-captured desktop.
+/// Returns [`WindowsLaunch`]; the pid goes on [`crate::gamelease::LeaseRequest::spawned`]
+/// only when it belongs to the game.
 #[cfg(windows)]
 pub fn launch_title(id: &str) -> Result<WindowsLaunch> {
     let entry = all_games()
@@ -276,11 +209,8 @@ pub fn launch_title(id: &str) -> Result<WindowsLaunch> {
         .filter(|g| g.launch.is_some())
         .ok_or_else(|| anyhow::anyhow!("no launchable library entry '{id}'"))?;
     let spec = entry.launch.clone().expect("filtered to Some above");
-    // A `plugin` entry's recipe comes from the plugin that owns it, and arrives in the same
-    // (command line, working dir) shape this path already spawns. `windows_launch_for` has no arm
-    // for the kind, so a failed ask falls through to the "no recipe" error below.
-    // A plugin publishes a concrete `(command line, working dir)` for its own title, the same shape
-    // the operator-typed `command` kind produces — so it is spawned, and tracked, on the same terms.
+    // Plugin recipe is the same (cmdline, cwd) shape; `windows_launch_for` has
+    // no `plugin` arm, so a failed ask falls through to "no recipe" below.
     let recipe = plugin_recipe(&entry)
         .map(|l| WinRecipe::game(l.command, l.cwd))
         .or_else(|| windows_launch_for(&spec))
@@ -307,14 +237,10 @@ pub fn launch_title(id: &str) -> Result<WindowsLaunch> {
     Ok(WindowsLaunch { pid, owns_game })
 }
 
-/// Windows: map a resolved [`LaunchSpec`] to a `(command line, working dir)` to spawn into the
-/// interactive session. Pure + unit-testable. `None` = no Windows recipe for this kind.
+/// Pure map from [`LaunchSpec`] to a spawn recipe. `None` = no Windows recipe.
 ///
-/// CreateProcessAsUserW does NO shell or protocol resolution, so the URI/flags are handed to a
-/// concrete EXE as plain arguments — a (host-derived) URI string can never reach a command interpreter.
-///
-/// The `plugin` kind is deliberately absent: its answer comes from another process, so it is
-/// resolved by [`plugin_recipe`] before this is reached.
+/// CreateProcessAsUserW does no shell or protocol resolution: URI/flags go to
+/// a concrete EXE as argv. `plugin` is absent; [`plugin_recipe`] resolves it.
 #[cfg(windows)]
 fn windows_launch_for(spec: &LaunchSpec) -> Option<WinRecipe> {
     match spec.kind.as_str() {
@@ -323,20 +249,15 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<WinRecipe> {
                 return None;
             }
             let uri = format!("steam://rungameid/{}", spec.value);
-            // Prefer launching Steam.exe with the URI as an argument; fall back to explorer.exe, which
-            // resolves the steam:// handler from the user hive. (The appid is digits-validated, so the
-            // only variable part of the line is a number either way.)
+            // Steam.exe + URI, else explorer.exe for the steam:// user-hive handler.
             let cmdline = match steam_exe() {
                 Some(exe) => format!("\"{}\" \"{uri}\"", exe.display()),
                 None => format!("explorer.exe \"{uri}\""),
             };
-            // Either line is a forwarder: `Steam.exe <uri>` against a running client posts the URI
-            // and exits, and against a cold one it *becomes* the client. Neither is the game.
+            // Forwarder either way: running Steam posts the URI and exits; cold Steam *is* the client.
             Some(WinRecipe::handoff(cmdline))
         }
-        // A launcher entry (D4): open the Steam client's own UI. Same Steam.exe-then-explorer ladder
-        // as `steam_appid`, and the URI is one of exactly two host-owned literals — nothing from the
-        // entry is interpolated at all.
+        // Steam client UI (design D4). Same Steam.exe-then-explorer ladder as `steam_appid`.
         "steam_ui" => {
             let uri = match spec.value.as_str() {
                 "bigpicture" => "steam://open/bigpicture",
@@ -349,33 +270,18 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<WinRecipe> {
             };
             Some(WinRecipe::handoff(cmdline))
         }
-        // Epic: open the (host-built, validated) com.epicgames.launcher:// URI via explorer.exe — a
-        // concrete EXE that resolves the registered protocol handler as the user; the URI is a single
-        // argv element (no shell, no cmd /c). Same pattern as the steam explorer fallback.
+        // explorer.exe + Epic URI: one argv, no shell. Same pattern as the Steam fallback.
         "epic" => epic_launch_uri(&spec.value)
             .map(|uri| WinRecipe::handoff(format!("explorer.exe \"{uri}\""))),
-        // GOG: spawn the game's own exe directly (no Galaxy) — the one store recipe that is NOT a
-        // hand-off. The triple comes from the plugin, so `gog_spawn` re-confines it to a GOG install
-        // the host finds itself.
+        // Direct exe spawn (not a Galaxy hand-off). `gog_spawn` re-confines the plugin triple.
         "gog" => gog_spawn(&spec.value).map(|(cmdline, workdir)| WinRecipe::game(cmdline, workdir)),
-        // Xbox/Game Pass: activate the UWP/GDK package by its AUMID (<PFN>!<AppId>) via explorer's
-        // shell:AppsFolder — which runs in the interactive user session (UWP activation fails as
-        // SYSTEM/session-0; spawn_in_active_session uses the user token). Guard the charset (the value
-        // is host-derived from MicrosoftGame.config + AppRepository, but belt-and-suspenders).
+        // shell:AppsFolder AUMID. UWP activation fails as SYSTEM/session-0; spawn uses the user token.
         "aumid" => valid_aumid(&spec.value).then(|| {
             WinRecipe::handoff(format!("explorer.exe \"shell:AppsFolder\\{}\"", spec.value))
         }),
-        // Xbox / Game Pass from a library PLUGIN: `<Identity>!<AppId>`, both read straight out of
-        // `MicrosoftGame.config`. The host completes it into the AUMID.
-        //
-        // This kind exists because of a measured privilege asymmetry (2026-08-06): resolving the
-        // PackageFamilyName means enumerating `%ProgramData%\…\AppRepository\Packages`, which is
-        // denied to `NT AUTHORITY\LocalService` — the principal the plugin runner runs as — and
-        // allowed to the host, which runs as LocalSystem. So the plugin sends what it can read and
-        // the host reads the authoritative publisher hash itself, at launch time.
-        //
-        // Resolving here rather than caching at install time also means a package update that
-        // changes the hash cannot leave a stale, unlaunchable tile behind.
+        // Plugin sends `<Identity>!<AppId>` from MicrosoftGame.config. AppRepository
+        // is LocalSystem-only (LocalService cannot enumerate it), so the host
+        // completes the PFN at launch — a cached hash would stale on package update.
         "xbox" => {
             let (identity, app_id) = spec.value.split_once('!')?;
             if !aumid_part(identity) || !aumid_part(app_id) {
@@ -386,24 +292,16 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<WinRecipe> {
                 "explorer.exe \"shell:AppsFolder\\{pfn}!{app_id}\""
             )))
         }
-        // Playnite: open the game through Playnite's own URI handler, which is what actually knows
-        // how to start it (Playnite maps the id to whichever store owns the title). explorer.exe
-        // resolves the registered protocol as the user — the same pattern as the `epic` kind — and
-        // the id is GUID-validated, so the only variable part of the line is 36 hex-and-dash chars.
-        //
-        // This kind exists because the plugin used to publish `kind: "command"` (a `start ""` shell
-        // line). The 2026-08-05 review made `command` operator-only, which refuses a plugin's whole
-        // reconcile — so without a typed kind the Playnite plugin cannot publish anything at all.
+        // explorer.exe + playnite:// — Playnite maps the id to the owning store.
+        // Typed kind: `command` is operator-only, so a plugin cannot publish one.
         "playnite" => valid_playnite_id(&spec.value).then(|| {
             WinRecipe::handoff(format!(
                 "explorer.exe \"playnite://playnite/start/{}\"",
                 spec.value
             ))
         }),
-        // A launcher entry (D4) on Windows: today that is Playnite's Fullscreen app, spawned
-        // directly (its `playnite://` handler opens the DESKTOP app, so no URI can do this). The
-        // value is the literal "playnite" — nothing from the entry reaches the command line — and
-        // the working directory is Playnite's own install dir, as a .NET app expects.
+        // Playnite Fullscreen (design D4). `playnite://` opens the desktop app, so spawn the exe.
+        // Workdir is the install dir; a .NET app expects it.
         "launcher_ui" => match spec.value.as_str() {
             "playnite" => playnite_fullscreen_exe().map(|exe| {
                 let dir = exe.parent().map(std::path::Path::to_path_buf);
@@ -411,11 +309,7 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<WinRecipe> {
             }),
             _ => None,
         },
-        // Operator-typed custom command (host-owned, never client-set): run it through the shell in the
-        // interactive session. `cmd.exe /c` is acceptable here precisely because the value is operator
-        // input — the same trust as the operator typing it — not a client-influenced string.
-        // `cmd.exe /c <v>` blocks until the operator's command returns, so its pid tracks that
-        // command's life — the Windows twin of the Linux child the host holds.
+        // Operator command. `cmd.exe /c` blocks until it returns, so the pid is that command's life.
         "command" => {
             let v = spec.value.trim();
             (!v.is_empty()).then(|| WinRecipe::game(format!("cmd.exe /c {v}"), None))
@@ -424,9 +318,8 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<WinRecipe> {
     }
 }
 
-/// Windows: the default Steam install's `steam.exe`, if present. A non-default Steam install dir
-/// (registry `Valve\Steam\InstallPath`) isn't covered — the explorer.exe protocol fallback handles
-/// that case. Probes the default Program Files dirs, in `ProgramFiles(x86)`-first order.
+/// Default `steam.exe` only. Non-default installs use the explorer.exe protocol
+/// fallback. Probes Program Files, `ProgramFiles(x86)` first.
 #[cfg(windows)]
 fn steam_exe() -> Option<std::path::PathBuf> {
     for var in ["ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"] {
@@ -440,19 +333,11 @@ fn steam_exe() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Resolve a package's PackageFamilyName by finding its
-/// `AppRepository\Packages\<PackageFullName>` dir (machine-wide, SYSTEM-readable) and reducing the
-/// full name to `Name_PublisherHash`. This READS the authoritative PFN — never compute the hash.
+/// PackageFamilyName from `AppRepository\Packages\<PackageFullName>`:
+/// `Name_PublisherHash`. Read the hash; never compute it.
 ///
-/// **Readable by the host, NOT by the plugin runner.** Measured on 2026-08-06: that directory is
-/// `UnauthorizedAccessException` for `NT AUTHORITY\LocalService` (which the runner is), while the
-/// host service runs as LocalSystem and enumerates all 348 entries. That asymmetry is the entire
-/// reason the `xbox` launch kind exists — a library plugin sends the package Identity it CAN read
-/// out of `MicrosoftGame.config`, and this resolves the rest at launch time.
-///
-/// It lives here rather than beside a scanner because it is **launch** vocabulary: the in-host Xbox
-/// scanner that used to share it was removed with the rest of the built-ins, and the plugin that
-/// replaced it depends on exactly this resolution step.
+/// LocalSystem can enumerate that dir; the plugin runner (LocalService) cannot.
+/// The plugin sends Identity from MicrosoftGame.config; this completes the PFN.
 #[cfg(windows)]
 fn xbox_pfn(identity: &str) -> Option<String> {
     let pkgs = std::path::PathBuf::from(std::env::var_os("ProgramData")?)
@@ -472,68 +357,51 @@ fn xbox_pfn(identity: &str) -> Option<String> {
     None
 }
 
-/// PackageFamilyName from a PackageFullName dir name
-/// (`Name_Version_Arch_ResourceId_PublisherHash`) → `Name_PublisherHash`. The hash is the last
-/// `_`-segment; `Name` is the caller's identity.
+/// `Name_Version_Arch_ResourceId_PublisherHash` → `Name_PublisherHash`.
+/// Hash is the last `_`-segment; `Name` is the caller's identity.
 #[cfg(windows)]
 fn pfn_from_full(dir_name: &str, identity: &str) -> Option<String> {
     let hash = dir_name.rsplit('_').next()?;
     (!hash.is_empty() && hash != dir_name).then(|| format!("{identity}_{hash}"))
 }
 
-// ------------------------------------------------------- per-kind launch values (host-owned ABI)
-//
-// Each helper below turns a store's launch VALUE — the only part a scanner (or, after extraction, a
-// library plugin) supplies — into the URI/command line the host actually runs. They live here rather
-// than beside the enumeration that produces the value because the host keeps owning URI construction
-// and spawning no matter where the enumeration came from (D1). Every one of them is total and
-// validating: an unparseable or hostile value yields `None`, never a partially-interpolated command.
+// Per-kind launch values. Scanners supply the VALUE; the host builds the URI.
+// Lives here so URI construction stays with launch (design D1). Unparseable
+// or hostile → `None`, never a partial command.
 
-/// A digits-only Steam appid: the sole client-influenced part of a Steam launch, validated before it
-/// is interpolated into any command / URI (so a client-sent id can never carry shell or URI syntax).
-/// Cross-platform — used by the Linux shell mapping ([`command_for`]) and the Windows spawn mapping
-/// ([`windows_launch_for`]).
-///
-/// Also accepts the 64-bit non-Steam-shortcut game id ([`shortcut_gameid`]), which is likewise
-/// digits — the two share the `steam_appid` kind precisely because `rungameid` takes either.
+/// Digits-only Steam appid (or 64-bit [`shortcut_gameid`]). Shared kind because
+/// `rungameid` takes either. Used by [`command_for`] and [`windows_launch_for`].
 pub(crate) fn valid_steam_appid(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// The 64-bit game id `steam://rungameid/` needs to launch a non-Steam shortcut: high dword = the
-/// 32-bit shortcut appid, low dword = the shortcut marker `0x0200_0000`. (Handing `rungameid` the
-/// bare 32-bit appid does not launch a shortcut — it must be this composed id.)
+/// 64-bit `rungameid` for a non-Steam shortcut: high dword = 32-bit appid,
+/// low dword = marker `0x0200_0000`. The bare 32-bit appid does not launch it.
 pub(crate) fn shortcut_gameid(appid: u32) -> u64 {
     ((appid as u64) << 32) | 0x0200_0000
 }
 
-/// The `steam_ui` launch values (D4) — which Steam UI a launcher entry opens. A closed two-value
-/// enum, validated on the way IN (the reconcile payload) as well as on the way out, so an entry can
-/// never carry a third value that silently resolves to nothing at launch time.
+/// `steam_ui` values (design D4). Closed set, validated inbound and outbound
+/// so a third value cannot sit in the library and resolve to nothing at launch.
 pub(crate) fn valid_steam_ui(value: &str) -> bool {
     matches!(value, "bigpicture" | "desktop")
 }
 
-/// One half of an AUMID (a package family name or an app id): non-empty, and no character that
-/// could break out of the `shell:AppsFolder\…` argument. Both halves are host-derived, so this is
-/// belt-and-braces — but the `xbox` kind now takes an Identity straight off a plugin's wire, which
-/// makes it load-bearing rather than defensive.
+/// One AUMID half: non-empty, charset that cannot break `shell:AppsFolder\…`.
+/// Load-bearing for `xbox`, whose Identity arrives from a plugin.
 pub(crate) fn aumid_part(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// A full `<PFN>!<AppId>` AUMID.
 pub(crate) fn valid_aumid(value: &str) -> bool {
     value
         .split_once('!')
         .is_some_and(|(pfn, app)| aumid_part(pfn) && aumid_part(app))
 }
 
-/// A Playnite game id: the GUID Playnite's own database uses, and the only client-influenced part
-/// of a `playnite` launch. Interpolated into a URI handed to explorer.exe, so the charset is
-/// validated first — 8-4-4-4-12 lowercase-or-uppercase hex with dashes, nothing else.
+/// Playnite GUID, interpolated into an explorer.exe URI: 8-4-4-4-12 hex + dashes.
 pub(crate) fn valid_playnite_id(value: &str) -> bool {
     let groups = [8usize, 4, 4, 4, 12];
     let mut parts = value.split('-');
@@ -546,36 +414,19 @@ pub(crate) fn valid_playnite_id(value: &str) -> bool {
     parts.next().is_none()
 }
 
-/// The launcher UIs **this host** can open, as `launcher_ui` values (D4).
+/// `launcher_ui` values this OS can open (design D4). One kind; a value names
+/// a UI (`heroic` vs `heroic-console`; Windows `playnite` is Fullscreen).
 ///
-/// One kind for every launcher but Steam, rather than one kind each. A value names a launcher *UI*,
-/// which for most of them is the same thing as naming the launcher — and where it is not, the value
-/// says which one: `heroic` opens Heroic's window, `heroic-console` its couch front end, and on
-/// Windows `playnite` has always meant Playnite's **Fullscreen** app rather than its desktop one.
-/// Steam keeps its own [`valid_steam_ui`] kind because it was the first launcher with two UIs worth
-/// opening, and because both of its values are the same length of word — splitting Heroic's two out
-/// into a `heroic_ui` kind today would buy symmetry and cost every N-1 host: an unknown *kind*
-/// degrades to an unlaunchable tile, but an unknown *value* is a hard 400 that refuses the whole
-/// reconcile, so a new value is the shape that has to be gated on `minHost` in the plugin index
-/// either way.
-///
-/// Platform-gated, because a value naming a launcher this OS cannot run is not a tile that merely
-/// looks odd — it is one that fails at launch. Validated inbound too, so a plugin gets a 400 it can
-/// act on instead of publishing a dead entry.
-///
-/// **Why a typed kind at all**, when design D4 originally said non-Steam launchers would ride the
-/// `command` kind: the 2026-08-05 review made `launch.kind = "command"` operator-only (it is handed
-/// to a shell), so a plugin publishing one is refused. A typed kind keeps D1's rule intact — the
-/// plugin supplies a validated *value*, the host builds the command — and is the only way a scanner
-/// plugin can offer a launcher tile at all.
+/// Unknown *kind* is an unlaunchable tile; unknown *value* is a 400 that
+/// refuses the whole reconcile. Platform-gated so a plugin gets 400 inbound
+/// instead of a tile that fails at launch. `command` is operator-only, so a
+/// plugin cannot publish a launcher without this kind.
 fn launcher_ui_stores() -> &'static [&'static str] {
     #[cfg(target_os = "linux")]
     {
         &["heroic", "heroic-console", "lutris"]
     }
-    // Playnite's activation is verified (2026-08-06, on the .173 box); Epic, GOG Galaxy and the
-    // Xbox app are still unwired — each needs its own verified activation, and an unverified guess
-    // would ship a tile that does nothing.
+    // Playnite only. Unverified Epic/GOG/Xbox activation would ship a dead tile.
     #[cfg(windows)]
     {
         &["playnite"]
@@ -586,29 +437,16 @@ fn launcher_ui_stores() -> &'static [&'static str] {
     }
 }
 
-/// Is `value` a launcher this host's platform knows about at all?
-///
-/// The *vocabulary* half of the old `valid_launcher_ui`. A value outside this set is a plugin
-/// author's mistake — a typo, or a launcher this OS has no support for — and no amount of
-/// installing things on the box will make it resolve, so the reconcile refuses the payload.
+/// Vocabulary: is `value` a launcher this OS knows? A miss is a plugin bug;
+/// installing software will not fix it, so reconcile refuses the payload.
 pub(crate) fn known_launcher_ui(value: &str) -> bool {
     launcher_ui_stores().contains(&value)
 }
 
-/// Can this host open `value`'s launcher **right now**?
-///
-/// The *environment* half. Deliberately separate from [`known_launcher_ui`], because the two
-/// failures are not the same kind of thing and must not get the same answer:
-///
-/// - an unknown value is a bug in the plugin, and a 400 is the only way its author finds out;
-/// - a known value that will not resolve means the launcher simply is not installed here, which is
-///   an ordinary fact about the box, not a defect in the payload.
-///
-/// Conflating them cost a real library: the Playnite plugin publishes one launcher tile alongside
-/// every game, so a host that could not resolve Playnite 400'd the whole reconcile and the operator
-/// got **no games at all** — the same shape as the unservable-cover bug that
-/// [`super::sanitize_art_paths`] was introduced to fix. The tile is dropped now (see
-/// [`super::sanitize_launcher_entries`]) and the games sync.
+/// Environment: can this box open `value` *now*? Separate from
+/// [`known_launcher_ui`]: unknown value is a plugin bug (400); known-but-missing
+/// is an ordinary fact. Conflating them 400'd whole libraries over one tile
+/// ([`super::sanitize_launcher_entries`] drops the tile; games still sync).
 pub(crate) fn resolvable_launcher_ui(value: &str) -> bool {
     if !known_launcher_ui(value) {
         return false;
@@ -617,10 +455,8 @@ pub(crate) fn resolvable_launcher_ui(value: &str) -> bool {
     if value == "playnite" {
         return playnite_fullscreen_exe().is_some();
     }
-    // Same question for both Heroic tiles, and the same answer: they resolve to whatever
-    // `heroic_launch_prefix` finds, so when that finds nothing the tile is dead and must not be
-    // published. Keeping `~/.config/heroic` around after uninstalling Heroic is enough to reach
-    // this — the plugin's `detect` only looks for that directory.
+    // Both Heroic tiles share `heroic_launch_prefix`. Plugin `detect` is only
+    // `~/.config/heroic`, which can survive uninstall — so probe the binary.
     #[cfg(target_os = "linux")]
     if matches!(value, "heroic" | "heroic-console") {
         return heroic_launch_prefix().is_some();
@@ -628,15 +464,8 @@ pub(crate) fn resolvable_launcher_ui(value: &str) -> bool {
     true
 }
 
-/// Windows: Playnite's **Fullscreen** app, if this host can find it.
-///
-/// Fullscreen rather than Desktop for two reasons: a launcher tile is opened from a couch over a
-/// stream, and — verified on 2026-08-06 — the registered `playnite://` protocol handler points at
-/// `Playnite.DesktopApp.exe`, so a URI cannot open fullscreen mode at all. The exe is launched
-/// directly, which is also why nothing here is interpolated from the entry: the whole value is the
-/// literal `"playnite"`.
-///
-/// `None` when nothing resolves, which is what drops the tile.
+/// Playnite Fullscreen exe, if found. `playnite://` is registered to the
+/// desktop app, so a URI cannot open fullscreen. `None` drops the tile.
 #[cfg(windows)]
 fn playnite_fullscreen_exe() -> Option<std::path::PathBuf> {
     const EXE: &str = "Playnite.FullscreenApp.exe";
@@ -646,43 +475,26 @@ fn playnite_fullscreen_exe() -> Option<std::path::PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Windows: every directory that might hold a Playnite install, best candidates first.
+/// Candidate Playnite install dirs, best first. LocalSystem invalidates the
+/// obvious lookups:
 ///
-/// **Playnite installs per-user by default, and this host is a LocalSystem service** — which
-/// invalidates all three of the obvious lookups, and is why this is not a two-liner:
+/// - HKCU is SYSTEM's hive (`S-1-5-18`); read loaded `HKEY_USERS` instead
+///   (logged-on streamers; same trade-off as [`crate::procscan::steam_running_hint`]).
+/// - Match uninstall by `DisplayName`. Inno registers `<AppId>_is1`, not `Playnite`.
+/// - `%LOCALAPPDATA%` is SYSTEM's profile; enumerate users-base profiles instead.
 ///
-/// - `HKEY_CURRENT_USER` is *SYSTEM's own* hive (`S-1-5-18`), never the person's, so a per-user
-///   install is invisible there. Every **loaded** hive under `HKEY_USERS` is read instead: only
-///   logged-on users' hives are loaded, which is exactly the set that can be streaming, and it
-///   avoids a `WTSQueryUserToken` dance for what is a best-effort probe. Same trade-off
-///   [`crate::procscan::steam_running_hint`] makes, for the same reason.
-/// - The uninstall subkey is matched by its **`DisplayName`**, not by key name. Playnite ships an
-///   Inno Setup installer and Inno registers `<AppId>_is1` — measured on a Windows box where Git
-///   and Inno itself appear as `Git_is1` and `Inno Setup 6_is1`. The hardcoded
-///   `…\Uninstall\Playnite` this replaced matched nothing on any box.
-/// - `%LOCALAPPDATA%` for a SYSTEM service is `C:\Windows\System32\config\systemprofile\AppData\
-///   Local`, so the default-install fallback cannot trust the variable — it enumerates the profiles
-///   under the users base instead, the same breadth [`super::art::art_roots`] already allows.
-///
-/// A **portable** Playnite is none of those: it is unzipped wherever the operator wanted it
-/// (`D:\Apps\Playnite`), registers no uninstall entry, and is not under any profile. Its one
-/// registry trace is the `playnite://` handler Playnite registers for itself
-/// ([`playnite_dir_from_uri_handler`]) — the same registration this host's own launch path follows.
-///
-/// Order matters only as a preference: a registry `InstallLocation` is what the installer actually
-/// did, so it is consulted before the conventional path. Every candidate is probed for the exe, so
-/// a stale entry costs one `is_file` and nothing else.
+/// Portable installs leave only the `playnite://` handler
+/// ([`playnite_dir_from_uri_handler`]). Registry `InstallLocation` before
+/// conventional paths; each candidate is an `is_file` probe.
 #[cfg(windows)]
 fn playnite_install_dirs() -> Vec<std::path::PathBuf> {
     use winreg::enums::{HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ};
     use winreg::RegKey;
 
-    // 64-bit and 32-bit views. HKCU/HKU `Software` is not redirected (only `Software\Classes` is),
-    // so the WOW view is a machine-hive concern only.
+    // 64- and 32-bit views. HKCU/HKU `Software` is not redirected; WOW is HKLM-only.
     const UNINSTALL: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall";
     const UNINSTALL_WOW: &str = r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
-    // Playnite's own `playnite://` registration, in both spellings: bare inside a `…_Classes` hive,
-    // and via the `Software\Classes` link everywhere else.
+    // `playnite://` command: bare inside a `…_Classes` hive, `Software\Classes` elsewhere.
     const URI_COMMAND: &str = r"playnite\shell\open\command";
     const CLASSES_URI_COMMAND: &str = r"Software\Classes\playnite\shell\open\command";
 
@@ -698,10 +510,8 @@ fn playnite_install_dirs() -> Vec<std::path::PathBuf> {
         let Ok(hive) = users.open_subkey_with_flags(&sid, KEY_READ) else {
             continue;
         };
-        // The `…_Classes` companion hives carry file associations — which is exactly where the
-        // `playnite://` handler lives, `HKCU\Software\Classes` BEING that hive — and never uninstall
-        // entries. Both spellings are probed rather than reasoned about: the in-hive `Software\Classes`
-        // link is a link, and a probe that misses costs one failed `open_subkey`.
+        // `_Classes` hives hold associations (`playnite://`), never uninstall keys.
+        // Probe both spellings; a miss is one failed `open_subkey`.
         if sid.ends_with("_Classes") {
             playnite_dir_from_uri_handler(&hive, URI_COMMAND, &mut dirs);
             continue;
@@ -710,20 +520,15 @@ fn playnite_install_dirs() -> Vec<std::path::PathBuf> {
         playnite_dir_from_uri_handler(&hive, CLASSES_URI_COMMAND, &mut dirs);
     }
 
-    // The conventional per-user location, for every profile on the box — this is where Playnite's
-    // own default install lands, and it covers a user whose hive is not currently loaded.
+    // Default per-user path, including profiles whose hive is not loaded.
     for profile in windows_user_profiles() {
         push_unique(&mut dirs, profile.join(r"AppData\Local\Playnite"));
     }
     dirs
 }
 
-/// Collect `InstallLocation` from every Playnite-looking uninstall entry under `root\path`.
-///
-/// Matched on `DisplayName` because the key name is the installer's `AppId` (see
-/// [`playnite_install_dirs`]). `starts_with` rather than equality so a versioned or suffixed display
-/// name still counts; the value is only ever used as a directory to probe for the exe, so a false
-/// positive costs one failed `is_file`.
+/// `InstallLocation` from Playnite-looking uninstall entries under `root\path`.
+/// Match `DisplayName` (`starts_with`) because the key is Inno's `<AppId>_is1`.
 #[cfg(windows)]
 fn playnite_dirs_from_uninstall(
     root: &winreg::RegKey,
@@ -752,12 +557,8 @@ fn playnite_dirs_from_uninstall(
     }
 }
 
-/// Take the directory of Playnite's registered `playnite://` handler from `root\path`, if there is one.
-///
-/// This is what finds a **portable** Playnite. It leaves no uninstall entry and lives under no user
-/// profile, so every other probe here is blind to it — but Playnite registers its own URI scheme,
-/// and that registration is the very one `explorer.exe "playnite://…"` follows when this host starts
-/// a Playnite title. If it resolves, this box already opens games with that copy.
+/// Directory of the registered `playnite://` handler. Finds portable Playnite
+/// (no uninstall key, not under a profile). Same registration the launch path uses.
 #[cfg(windows)]
 fn playnite_dir_from_uri_handler(
     root: &winreg::RegKey,
@@ -781,13 +582,8 @@ fn playnite_dir_from_uri_handler(
     }
 }
 
-/// The executable out of a registered shell-open command line:
-/// `"D:\Apps\Playnite\Playnite.DesktopApp.exe" --uridata "%1"` → `D:\Apps\Playnite\Playnite.DesktopApp.exe`.
-///
-/// Quoted form first, because that is what a registrar writes. The cut at the first `.exe` is the
-/// fallback for the unquoted spelling, whose path may itself contain spaces and so cannot be split on
-/// whitespace. `None` when neither shape matches; the result is only ever a directory to probe for an
-/// exe, so a miss costs one `is_file` and nothing else.
+/// Exe from a shell-open command. Quoted form first (what a registrar writes).
+/// Unquoted fallback cuts at `.exe` — the path may contain spaces.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn exe_from_shell_command(command: &str) -> Option<&str> {
     let command = command.trim();
@@ -798,26 +594,10 @@ fn exe_from_shell_command(command: &str) -> Option<&str> {
     Some(&command[..end])
 }
 
-/// Windows: every Playnite root on this box, as an **art** root.
-///
-/// A portable Playnite keeps its library beside the exe — covers land in
-/// `<PlayniteDir>\library\files\…` — so for that layout the install dir IS where the art lives, and
-/// the users base can never cover it: the whole point of portable is that it sits wherever the
-/// operator put it (`D:\Apps\Playnite` in the report that prompted this). Without it a portable
-/// install synced its games and had EVERY cover dropped by the confinement. An installed Playnite
-/// keeps the same tree under `%APPDATA%\Playnite`, already inside the users base; naming that
-/// directory twice costs one `canonicalize` in [`super::art::art_path_is_confined`].
-///
-/// Same shape and same reasoning as [`super::art::steam_art_roots`], and it does not widen what the
-/// host can be *tricked* into reading: every candidate comes from the host's own registry and
-/// filesystem probes, never from the plugin lane that supplies the art path, and the extension,
-/// regular-file, magic-byte and config-dir gates all still apply on top.
-///
-/// The per-user hives these candidates partly come from are writable by that user — which is a bar
-/// this host already stands on, and one rung lower here than where it already stood: the same
-/// lookup picks the `Playnite.FullscreenApp.exe` a launcher tile SPAWNS. Trusting it to name a
-/// directory whose image files may be read is strictly weaker than trusting it to name a program to
-/// run.
+/// Playnite install dirs as art roots. Portable keeps covers beside the exe
+/// (`<PlayniteDir>\library\files\…`); the users base cannot see that tree.
+/// Same shape as [`super::art::steam_art_roots`]. Candidates come from host
+/// registry/fs probes, not the plugin lane that supplies the art path.
 #[cfg(windows)]
 pub(crate) fn playnite_art_roots() -> Vec<std::path::PathBuf> {
     playnite_install_dirs()
@@ -826,11 +606,8 @@ pub(crate) fn playnite_art_roots() -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// Every user profile directory on the box (`C:\Users\*`), minus the shared `Public` pseudo-profile.
-///
-/// `%PUBLIC%`'s parent is the users base on every supported Windows — the same derivation
-/// [`super::art::art_roots`] uses — with `%SystemDrive%\Users` as the fallback when the variable is
-/// missing from a service's environment.
+/// User profiles (`C:\Users\*`), minus `Public`. Users base is `%PUBLIC%`'s
+/// parent ([`super::art::art_roots`]); `%SystemDrive%\Users` if the var is missing.
 #[cfg(windows)]
 fn windows_user_profiles() -> Vec<std::path::PathBuf> {
     let base = std::env::var_os("PUBLIC")
@@ -852,8 +629,7 @@ fn windows_user_profiles() -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// Push `path` unless an equal one is already there — the candidate lists are a handful of entries,
-/// so a linear check beats carrying a set around.
+/// Dedup. Candidate lists are tiny; a linear scan beats a set.
 #[cfg(windows)]
 fn push_unique(out: &mut Vec<std::path::PathBuf>, path: std::path::PathBuf) {
     if !out.contains(&path) {
@@ -861,19 +637,18 @@ fn push_unique(out: &mut Vec<std::path::PathBuf>, path: std::path::PathBuf) {
     }
 }
 
-/// Map a `heroic` LaunchSpec value (`<runner>:<appName>`) to the Heroic launch command, run nested in
-/// gamescope. The host owns this mapping; the client only ever sends the id. CAVEAT: Heroic is a
-/// single-instance Electron app — in a fresh per-session gamescope it boots, launches the game (which
-/// renders into that gamescope) and stays hidden via `--no-gui`; but if a Heroic GUI is ALREADY
-/// running on the box, the spawned process forwards the URI and exits, which would tear the session
-/// down. The validated path is the fresh-session case; needs live confirmation on a box with Heroic.
+/// `<runner>:<appName>` → Heroic command, nested in gamescope.
+///
+/// Heroic is single-instance Electron. Fresh gamescope: boot, launch, stay
+/// hidden (`--no-gui`). An already-running GUI forwards the URI and exits,
+/// which would tear the session — validated only for the fresh-session case.
 #[cfg(target_os = "linux")]
 pub(crate) fn heroic_command(value: &str) -> Option<String> {
     let (runner, app) = value.split_once(':')?;
     if !matches!(runner, "legendary" | "gog" | "nile") {
         return None;
     }
-    // appName charset (Epic alnum, GOG digits, Amazon alnum) — keep the URI a single safe token.
+    // appName charset: keep the URI a single token (Epic/Amazon alnum, GOG digits).
     if app.is_empty()
         || !app
             .bytes()
@@ -882,15 +657,12 @@ pub(crate) fn heroic_command(value: &str) -> Option<String> {
         return None;
     }
     let prefix = heroic_launch_prefix()?;
-    // No quotes: gamescope spawns the app by `split_whitespace()`, and the URI has no spaces (appName
-    // is validated above) so it stays a single argv token; `&` is fine (exec'd, not shell-parsed).
+    // No quotes: gamescope splits on whitespace. URI has no spaces; `&` is exec'd, not a shell.
     Some(format!(
         "{prefix} --no-gui heroic://launch?appName={app}&runner={runner}"
     ))
 }
 
-/// How to invoke Heroic: the native `heroic` binary if on `PATH`, else the Flatpak app if its data
-/// root is present. `None` ⇒ Heroic not found, so no launch command.
 #[cfg(target_os = "linux")]
 fn heroic_launch_prefix() -> Option<String> {
     let on_path = std::env::var_os("PATH")
@@ -904,9 +676,8 @@ fn heroic_launch_prefix() -> Option<String> {
     flatpak.then(|| "flatpak run com.heroicgameslauncher.hgl".into())
 }
 
-/// Map an `epic` LaunchSpec value to the Epic Games Launcher URI. The value is either the full
-/// `<namespace>:<catalogItemId>:<appName>` triple (what the manifests carry) or a bare `appName`;
-/// every part is charset-checked so the URI stays one safe argv token.
+/// Epic URI from a `<namespace>:<catalogItemId>:<appName>` triple or a bare
+/// `appName`. Charset-checked so the URI stays one argv token.
 #[cfg(windows)]
 pub(crate) fn epic_launch_uri(value: &str) -> Option<String> {
     let ok = |s: &str| {
@@ -924,24 +695,16 @@ pub(crate) fn epic_launch_uri(value: &str) -> Option<String> {
     ))
 }
 
-/// Map a `gog` LaunchSpec value — the tab-separated `exe \t args \t workdir` spawn triple a GOG
-/// library plugin derives from `goggame-<id>.info` — to a `(command line, working dir)`. GOG games
-/// are spawned directly (no Galaxy), so the exe is quoted and the arguments ride verbatim.
-///
-/// The exe (and the working dir) is re-confined here to an install directory GOG's own registry
-/// lists ([`gog_install_dirs`]). The plugin already confines it while parsing the manifest
-/// (plugin-kit's `confinedJoin`, the port of the in-host scanner's `confined_join`) — but that runs
-/// outside this host's trust boundary: the triple arrives over the provider API, and unchecked this
-/// kind is an arbitrary exe-plus-arguments primitive for any lane that may publish an entry
-/// (security review 2026-08-25). `None` ⇒ no GOG install owns that exe, so the entry has no recipe
-/// and the launch fails the way any unresolvable one does.
+/// GOG `exe \t args \t workdir` triple → `(cmdline, workdir)`. Direct spawn
+/// (no Galaxy). Re-confine exe and workdir to [`gog_install_dirs`]: the plugin
+/// already confined at parse, but the triple arrives over the provider API.
+/// `None` if no GOG install owns the exe.
 #[cfg(windows)]
 pub(crate) fn gog_spawn(value: &str) -> Option<(String, Option<PathBuf>)> {
     gog_spawn_in(value, &gog_install_dirs())
 }
 
-/// The pure core of [`gog_spawn`] (unit-testable without a GOG install): `installs` is the set of
-/// directories the exe and the working dir must sit inside.
+/// Pure [`gog_spawn`]: `installs` is the set the exe and workdir must sit inside.
 #[cfg(windows)]
 fn gog_spawn_in(value: &str, installs: &[String]) -> Option<(String, Option<PathBuf>)> {
     let under = |p: &str| installs.iter().any(|dir| path_under(dir, p));
@@ -955,8 +718,7 @@ fn gog_spawn_in(value: &str, installs: &[String]) -> Option<(String, Option<Path
         return None;
     }
     let args = parts.next().unwrap_or("");
-    // An out-of-bounds working dir is dropped rather than refused: it only decides where the
-    // (confined) exe starts, and an entry that omits it already spawns without one.
+    // Out-of-bounds workdir is dropped, not refused: it only sets cwd of a confined exe.
     let workdir = parts.next().filter(|s| under(s)).map(PathBuf::from);
     let cmdline = if args.trim().is_empty() {
         format!("\"{exe}\"")
@@ -966,12 +728,8 @@ fn gog_spawn_in(value: &str, installs: &[String]) -> Option<(String, Option<Path
     Some((cmdline, workdir))
 }
 
-/// Windows: every directory GOG's own registry names as an installed game's root
-/// (`HKLM\SOFTWARE\WOW6432Node\GOG.com\Games\<productId>\PATH` — GOG is 32-bit, so the WOW view is
-/// where it writes). This is the host's OWN enumeration of the store, which is the whole point: it
-/// is what a `gog` launch value is checked against, and it is the same key the in-host scanner read
-/// before the store moved to a plugin. Empty when GOG isn't installed, which refuses every `gog`
-/// launch on that box.
+/// GOG install roots from `HKLM\SOFTWARE\WOW6432Node\GOG.com\Games\<id>\PATH`.
+/// GOG is 32-bit, so it writes the WOW view. Empty ⇒ every `gog` launch refuses.
 #[cfg(windows)]
 fn gog_install_dirs() -> Vec<String> {
     use winreg::enums::HKEY_LOCAL_MACHINE;
@@ -993,12 +751,9 @@ fn gog_install_dirs() -> Vec<String> {
         .collect()
 }
 
-/// Whether `path` is `dir` itself or something inside it, compared the way Windows compares paths:
-/// case-insensitively, either separator, and with `..` refused outright (it would climb straight
-/// back out of the directory the prefix test just accepted — the component the in-host scanner's
-/// `confined_join` refused for the same reason). A string test rather than [`Path::starts_with`],
-/// which compares components case-SENSITIVELY: the install path a plugin sends need not be spelled
-/// the way the registry spells it.
+/// Windows path containment: case-insensitive, either separator, `..` refused
+/// (it climbs out of the prefix the test just accepted). String compare, not
+/// [`Path::starts_with`], which is case-sensitive — plugin spelling may differ.
 #[cfg(windows)]
 fn path_under(dir: &str, path: &str) -> bool {
     let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
@@ -1012,78 +767,56 @@ fn path_under(dir: &str, path: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('\\'))
 }
 
-/// Launch a GameStream `apps.json` command (operator-typed, trusted — never client-set) into the
-/// interactive Windows user session, AFTER capture is up (the host is SYSTEM). The Linux paths go
-/// through the compositor-aware [`launch_session_command`] instead.
+/// Operator `apps.json` command into the interactive session, after capture
+/// (host is SYSTEM). Linux uses compositor-aware [`launch_session_command`].
 #[cfg(windows)]
 pub fn launch_gamestream_command(cmd: &str) -> Result<WindowsLaunch> {
     let cmd = cmd.trim();
     anyhow::ensure!(!cmd.is_empty(), "empty command");
-    // cmd.exe /c is fine here: the value is the host operator's own apps.json command, not a
-    // client-influenced string (same trust as the custom-store `command` kind).
     let pid = crate::interactive::spawn_in_active_session(&format!("cmd.exe /c {cmd}"), None)
         .context("spawn gamestream command in the interactive session")?;
     tracing::info!(command = %cmd, pid, "gamestream: launched app in the interactive session");
-    // `cmd.exe /c` waits for the operator's command, so this pid is the command's own life. Should
-    // the command itself be a forwarder that returns at once, the lease's shim window is what reads
-    // that as a hand-off rather than as the game exiting.
+    // `cmd.exe /c` waits, so this pid is the command's life. A forwarder that
+    // returns at once is the lease shim's problem, not a game-exit.
     Ok(WindowsLaunch {
         pid,
         owns_game: true,
     })
 }
 
-/// Launch a library title chosen from the **GameStream `/applist`** (the store-qualified id is carried
-/// on the `AppEntry`, resolved from the numeric Moonlight appid) into the interactive Windows user
-/// session ([`launch_title`]). The id is resolved against the host's OWN library, so a client can
-/// only ever pick an existing title — never inject a command. Linux resolves the id via
-/// [`resolve_launch`] and goes through [`launch_session_command`] instead.
+/// GameStream `/applist` title into the interactive session ([`launch_title`]).
+/// Linux uses [`resolve_launch`] then [`launch_session_command`].
 #[cfg(windows)]
 pub fn launch_gamestream_library(id: &str) -> Result<WindowsLaunch> {
     launch_title(id)
 }
 
-/// The child a session launch produced.
-///
-/// Handed back to the caller so the game's lifetime can be tracked
-/// (design/session-game-lifetime.md) instead of the process being forgotten the moment it starts.
+/// Child from a session launch, for lifetime tracking
+/// (design/session-game-lifetime.md).
 #[cfg(target_os = "linux")]
 pub struct SpawnedLaunch {
     pub child: std::process::Child,
-    /// Whether the child leads its own process group — true for the plain session spawn in [`launch_session_command`], which
-    /// deliberately creates one so the whole wrapper tree can be signalled as a unit. False for the
-    /// gamescope-session spawn, which shares the host's group (see
-    /// [`crate::gamelease::OwnedChild::group_leader`]: a non-leader must never be signalled by
-    /// negative pid).
+    /// Own process group (plain session spawn) vs host group (gamescope).
+    /// A non-leader must never be signalled by negative pid
+    /// ([`crate::gamelease::OwnedChild::group_leader`]).
     pub group_leader: bool,
 }
 
-/// Launch a resolved shell command into the **live Linux session** for the session's compositor —
-/// the one launch entry point shared by the native (punktfunk/1) and GameStream planes, called
-/// AFTER capture is up so the app renders onto the streamed output. The command is host-resolved
-/// (a library id via [`resolve_launch`], or an operator-typed apps.json/custom command) — never a
-/// client-sent string. Best-effort by contract: a failure leaves the user on the (streamed)
-/// desktop/session rather than tearing the stream down.
+/// Host-resolved command into the live Linux session, after capture is up.
+/// Shared by native and GameStream. Best-effort: failure leaves the user on
+/// the streamed desktop rather than tearing the stream down.
 ///
-/// * **KWin / Mutter** — the host runs inside the user's graphical session (the process env was
-///   retargeted at it by `apply_session_env`) and the per-session virtual output is promoted
-///   *primary*, so a plain spawn lands the app on the streamed output.
-/// * **Hyprland / wlroots (sway)** — those two are EXTEND-only: the streamed head is added *beside*
-///   the operator's and nothing promotes it, so a plain spawn lands the app on whichever monitor
-///   holds focus — the operator's physical one. This is the case that was reported from the field as
-///   "anything from the library opens on my main display instead of the virtual screen". The spawn is
-///   therefore preceded by [`crate::vdisplay::focus_streamed_output`], which claims focus for the
-///   streamed head so the window Hyprland/sway is about to map goes there. (The backends also focus
-///   it at capture bring-up; re-asserting here is what covers the gap between the two — portal
-///   handshake, encoder build and first frame all sit in between, and anything that touches focus in
-///   that window would otherwise silently put the launch back on a physical head.)
-/// * **gamescope (managed / SteamOS / attach)** — the app must open *inside* the running gamescope
-///   session: spawned with the session's own `DISPLAY`/Wayland env
-///   ([`crate::vdisplay::launch_into_gamescope_session`]). A `steam steam://…` command additionally
-///   forwards over the running Steam instance's own pipe, so the dominant Steam case is
-///   env-independent.
-/// * **gamescope (bare spawn)** — not routed here: the command was nested into the fresh gamescope
-///   via `set_launch_command` (the caller gates on `vdisplay::launch_is_nested`).
+/// * **KWin / Mutter** — session env already retargeted, virtual output is
+///   primary; a plain spawn lands on the stream.
+/// * **Hyprland / wlroots (sway)** — EXTEND-only: the streamed head sits
+///   beside the operator's. [`crate::vdisplay::focus_streamed_output`] claims
+///   it here; capture also focused it, but portal handshake / encoder / first
+///   frame sit in between and can steal focus back.
+/// * **gamescope (managed / SteamOS / attach)** — spawn inside the running
+///   session ([`crate::vdisplay::launch_into_gamescope_session`]). `steam
+///   steam://…` also forwards over Steam's pipe.
+/// * **gamescope (bare spawn)** — not here: nested via `set_launch_command`
+///   (`vdisplay::launch_is_nested`).
 #[cfg(target_os = "linux")]
 pub fn launch_session_command(
     compositor: crate::vdisplay::Compositor,
@@ -1092,10 +825,8 @@ pub fn launch_session_command(
     use std::os::unix::process::CommandExt;
     let cmd = cmd.trim();
     anyhow::ensure!(!cmd.is_empty(), "empty command");
-    // Claim focus for the streamed head before spawning, so the window the compositor is about to map
-    // opens where the client is looking (see the EXTEND note above; a no-op on every other backend).
-    // The name comes from the same slot the absolute-input pointer is bound to, so focus and cursor
-    // land on one head by construction rather than by two independent guesses.
+    // Focus the streamed head first (no-op off EXTEND). Same slot as the
+    // absolute-input pointer, so focus and cursor share one head.
     if let Some(out) = crate::inject::stream_output() {
         if crate::vdisplay::focus_streamed_output(compositor, &out) {
             tracing::debug!(output = %out, "claimed focus for the streamed head before launching");
@@ -1109,9 +840,8 @@ pub fn launch_session_command(
             std::process::Command::new("sh")
                 .arg("-c")
                 .arg(cmd)
-                // Its own process group, so ending this game later signals the shell *and* the game
-                // it exec'd or forked — the whole tree the host started — and nothing else. Also
-                // detaches it from any signal the host's own group receives.
+                // Own process group: later teardown signals the shell and its
+                // children, and not the host's group.
                 .process_group(0)
                 .spawn()
                 .context("spawn launch command")?,
@@ -1145,19 +875,16 @@ mod tests {
             command_for(&steam).as_deref(),
             Some("steam steam://rungameid/570")
         );
-        // A non-numeric "appid" (e.g. a client trying to inject) is rejected, never interpolated.
         let evil = LaunchSpec {
             kind: "steam_appid".into(),
             value: "570; rm -rf ~".into(),
         };
         assert_eq!(command_for(&evil), None);
-        // Custom commands (from the host's own store) pass through verbatim.
         let custom = LaunchSpec {
             kind: "command".into(),
             value: "dolphin-emu --batch".into(),
         };
         assert_eq!(command_for(&custom).as_deref(), Some("dolphin-emu --batch"));
-        // Empty / unknown kinds → no command.
         assert_eq!(
             command_for(&LaunchSpec {
                 kind: "command".into(),
@@ -1177,7 +904,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn command_for_lutris_and_heroic_guards() {
-        // Lutris: digits → its run URI; a non-numeric id (injection attempt) is rejected.
         assert_eq!(
             command_for(&LaunchSpec {
                 kind: "lutris_id".into(),
@@ -1193,21 +919,16 @@ mod tests {
             }),
             None
         );
-        // Heroic guards (independent of whether Heroic is installed): bad runner / appName → None.
         assert_eq!(heroic_command("badrunner:Quail"), None);
         assert_eq!(heroic_command("legendary:bad name"), None);
         assert_eq!(heroic_command("nile:"), None);
-        // When Heroic IS resolvable (a dev box), a valid id yields the launch URI; on CI (no Heroic)
-        // it's None — assert the URI shape only when a launcher prefix exists.
+        // Prefix exists only on boxes with Heroic; assert URI shape only then.
         if let Some(cmd) = heroic_command("legendary:Quail-1.2_x") {
             assert!(cmd.contains("heroic://launch?appName=Quail-1.2_x&runner=legendary"));
             assert!(cmd.contains("--no-gui"));
         }
     }
 
-    /// The `steam_ui` launcher kind (D4): a closed two-value enum, mapped to the Steam client's own
-    /// UI on each OS. Nothing from the entry is interpolated — the value only SELECTS between two
-    /// host-owned literals — so there is no injection surface at all here.
     #[test]
     fn steam_ui_is_a_closed_two_value_enum() {
         assert!(valid_steam_ui("bigpicture"));
@@ -1217,9 +938,6 @@ mod tests {
         assert!(!valid_steam_ui("bigpicture; rm -rf ~"));
     }
 
-    /// The `launcher_ui` kind exists because D4's original plan — non-Steam launchers riding the
-    /// `command` kind — stopped being available to plugins when the 2026-08-05 review made
-    /// `command` operator-only. A plugin names a launcher; the host builds the command.
     #[test]
     fn launcher_ui_accepts_only_launchers_this_host_can_open() {
         #[cfg(target_os = "linux")]
@@ -1227,11 +945,8 @@ mod tests {
             assert!(known_launcher_ui("heroic"));
             assert!(known_launcher_ui("heroic-console"));
             assert!(known_launcher_ui("lutris"));
-            // Not wired on this OS — outside the vocabulary, so it is refused inbound rather than
-            // becoming a tile that does nothing.
             assert!(!known_launcher_ui("gog"));
-            // Both Heroic tiles resolve through the same probe, so a box without Heroic drops both
-            // rather than publishing one dead tile beside the other.
+            // Both Heroic tiles share one probe; a miss drops both, not one dead tile.
             assert_eq!(
                 resolvable_launcher_ui("heroic"),
                 heroic_launch_prefix().is_some()
@@ -1243,74 +958,60 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            // Playnite is in the vocabulary unconditionally — whether this particular box has it
-            // installed is a separate question, answered by `resolvable_launcher_ui` below. Keeping
-            // them separate is the fix for the reconcile that 400'd a whole library over one tile.
+            // Vocabulary vs installed: separate so a missing Playnite cannot 400 the library.
             assert!(known_launcher_ui("playnite"));
             assert_eq!(
                 resolvable_launcher_ui("playnite"),
                 playnite_fullscreen_exe().is_some()
             );
-            // The Linux launchers, and the Windows ones whose activation is still unverified
-            // (Epic, GOG Galaxy, the Xbox app), stay refused.
             assert!(!known_launcher_ui("heroic"));
             assert!(!known_launcher_ui("gog"));
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         {
-            // No launcher UIs are wired on this OS, so every value is refused.
             assert!(!known_launcher_ui("heroic"));
             assert!(!known_launcher_ui("gog"));
         }
-        // Junk is outside the vocabulary on every OS, so it never reaches a resolver.
         assert!(!known_launcher_ui(""));
         assert!(!known_launcher_ui("lutris; rm -rf ~"));
         assert!(!resolvable_launcher_ui(""));
         assert!(!resolvable_launcher_ui("lutris; rm -rf ~"));
     }
 
-    /// The `xbox` kind is what a library PLUGIN can publish: the runner's principal cannot read
-    /// AppRepository (measured 2026-08-06), so it sends `<Identity>!<AppId>` and the host resolves
-    /// the publisher hash. The charset guard is load-bearing here — unlike `aumid`, this value
-    /// arrives over the wire.
+    /// `xbox` is plugin-facing: Identity over the wire, host completes the PFN.
+    /// Charset is load-bearing here; `aumid` is host-derived.
     #[test]
     fn xbox_value_is_identity_bang_appid_and_charset_guarded() {
         assert!(valid_aumid("Microsoft.Foo!Game"));
         assert!(valid_aumid("A_b-c.d!App"));
-        // Both halves must be present and non-empty.
         assert!(!valid_aumid("Microsoft.Foo"));
         assert!(!valid_aumid("!Game"));
         assert!(!valid_aumid("Microsoft.Foo!"));
         assert!(!valid_aumid(""));
-        // Nothing that could break out of the `shell:AppsFolder\…` argument.
         assert!(!valid_aumid("Foo\"!Game"));
         assert!(!valid_aumid("Foo!Game\" & calc"));
         assert!(!valid_aumid("Foo\\..\\Bar!Game"));
         assert!(!valid_aumid("Foo Bar!Game"));
     }
 
-    /// The portable-Playnite probe, at the only part of it that can be wrong off-Windows: pulling the
-    /// exe out of the registered `playnite://` command line. A miss here is a portable install the
-    /// host cannot find — no launcher tile, and (through [`playnite_art_roots`]) every cover dropped.
+    /// Parse `playnite://` command lines (portable probe, works off-Windows).
+    /// A miss is a portable install the host cannot find — no tile, no covers.
     #[test]
     fn exe_is_read_out_of_a_registered_shell_command() {
-        // What Playnite actually registers, portable install on a second drive.
         assert_eq!(
             exe_from_shell_command(r#""D:\Apps\Playnite\Playnite.DesktopApp.exe" --uridata "%1""#),
             Some(r"D:\Apps\Playnite\Playnite.DesktopApp.exe")
         );
-        // Unquoted, with a space in the path — which is why this cannot split on whitespace.
+        // Unquoted path with spaces: cannot split on whitespace.
         assert_eq!(
             exe_from_shell_command(r"C:\Program Files\Playnite\Playnite.DesktopApp.exe %1"),
             Some(r"C:\Program Files\Playnite\Playnite.DesktopApp.exe")
         );
-        // Case is the registrar's business, not ours.
         assert_eq!(
             exe_from_shell_command(r"D:\Apps\Playnite\PLAYNITE.DESKTOPAPP.EXE"),
             Some(r"D:\Apps\Playnite\PLAYNITE.DESKTOPAPP.EXE")
         );
-        // Nothing exe-shaped, and the empty quoted form: no candidate beats a bogus one, because a
-        // bogus one would become an allowed art root.
+        // No exe shape / empty quotes: a bogus candidate would become an art root.
         assert_eq!(
             exe_from_shell_command("rundll32 shell32.dll,Control_RunDLL"),
             None
@@ -1319,9 +1020,7 @@ mod tests {
         assert_eq!(exe_from_shell_command(""), None);
     }
 
-    /// Windows' launcher tile opens Playnite's FULLSCREEN app. Both negatives are the point: the
-    /// desktop app is not what a couch tile should open, and the `playnite://` handler cannot be
-    /// used because it is registered to the desktop app (verified on .173, 2026-08-06).
+    /// Launcher tile is Fullscreen. `playnite://` is registered to the desktop app.
     #[cfg(windows)]
     #[test]
     fn playnite_launcher_opens_the_fullscreen_app() {
@@ -1331,12 +1030,10 @@ mod tests {
                 value: v.into(),
             })
         };
-        // A launcher this host cannot open is refused, whatever the OS.
         assert!(ui("gog").is_none());
         assert!(ui("heroic").is_none());
         assert!(ui("").is_none());
 
-        // The rest only means anything on a box that actually has Playnite.
         let Some(exe) = playnite_fullscreen_exe() else {
             return;
         };
@@ -1358,11 +1055,10 @@ mod tests {
                 value: v.into(),
             })
         };
-        // Bare `lutris` opens the window; the URI form is the `lutris_id` kind and launches a game.
+        // Bare `lutris` opens the window; the URI form is `lutris_id` and launches a game.
         assert_eq!(ui("lutris").as_deref(), Some("lutris"));
         assert!(!ui("lutris").unwrap().contains("rungameid"));
-        // Heroic resolves the same way its game launches do, but with no `--no-gui` and no URI — so
-        // the window IS what opens. `None` on a box without Heroic, which is a correct answer.
+        // Same prefix as a game launch, no `--no-gui` / URI. `None` without Heroic is correct.
         if let Some(cmd) = ui("heroic") {
             assert!(!cmd.contains("--no-gui"), "the GUI is the point: {cmd:?}");
             assert!(!cmd.contains("heroic://"), "no game URI: {cmd:?}");
@@ -1371,15 +1067,13 @@ mod tests {
                 "that is the other tile: {cmd:?}"
             );
         }
-        // Console mode needs BOTH flags — `--console` alone routes the UI without filling the
-        // screen, which from a couch is the bug this tile exists to avoid. Same prefix as the
-        // window tile, so it is `None` on the same boxes.
+        // Both flags: `--console` alone does not fill the screen. Same prefix as `heroic`.
         assert_eq!(ui("heroic-console").is_some(), ui("heroic").is_some());
         if let Some(cmd) = ui("heroic-console") {
             assert!(cmd.contains("--console"), "{cmd:?}");
             assert!(cmd.contains("--fullscreen"), "{cmd:?}");
             assert!(!cmd.contains("--no-gui"), "the GUI is the point: {cmd:?}");
-            // Gamescope spawns by `split_whitespace`, so every token has to stand alone.
+            // Gamescope spawns by `split_whitespace`, so every token must stand alone.
             assert!(cmd.split_whitespace().any(|t| t == "--console"), "{cmd:?}");
         }
         assert_eq!(ui("nonsense"), None);
@@ -1395,8 +1089,7 @@ mod tests {
                 value: v.into(),
             })
         };
-        // Big Picture is the SteamOS game-mode shape; nested in gamescope this is what `--steam`
-        // integration is built around.
+        // Nested in gamescope this is the SteamOS `--steam` game-mode shape.
         assert_eq!(ui("bigpicture").as_deref(), Some("steam -gamepadui"));
         assert_eq!(ui("desktop").as_deref(), Some("steam"));
         assert_eq!(ui("nonsense"), None);
@@ -1433,7 +1126,6 @@ mod tests {
     #[test]
     fn steam_appid_validation_accepts_appids_and_shortcut_gameids() {
         assert!(valid_steam_appid("570"));
-        // The 64-bit shortcut game id shares the `steam_appid` kind — `rungameid` takes either.
         assert!(valid_steam_appid(
             &shortcut_gameid(2_456_789_012).to_string()
         ));
@@ -1442,8 +1134,7 @@ mod tests {
         assert!(!valid_steam_appid("-1"));
     }
 
-    /// Moved here with `shortcut_gameid` (WP1.1): the composed id is launch vocabulary, not
-    /// enumeration — the scanner only supplies the 32-bit appid it read out of `shortcuts.vdf`.
+    /// Launch vocabulary, not enumeration: the scanner supplies the 32-bit appid only.
     #[test]
     fn shortcut_gameid_composes_appid_and_marker() {
         let id = shortcut_gameid(0x8000_0000);
@@ -1462,7 +1153,7 @@ mod tests {
             epic_launch_uri("Fortnite").as_deref(),
             Some("com.epicgames.launcher://apps/Fortnite?action=launch&silent=true")
         );
-        assert!(epic_launch_uri("bad part:x:y").is_none()); // a space → rejected
+        assert!(epic_launch_uri("bad part:x:y").is_none());
         assert!(epic_launch_uri("").is_none());
     }
 
@@ -1480,32 +1171,26 @@ mod tests {
         assert!(spawn("").is_none());
     }
 
-    /// The `gog` kind is an exe PLUS ARGUMENTS, and the triple reaches the host over the provider
-    /// API — so the exe has to be one the host itself found, not one the caller named (security
-    /// review 2026-08-25). Without this the kind is `cmd.exe /c <anything>` by another spelling.
+    /// Triple arrives over the provider API: exe must sit in a host-found GOG install.
     #[cfg(windows)]
     #[test]
     fn gog_spawn_refuses_an_exe_outside_every_gog_install() {
         let installs = ["C:\\Games\\W3".to_string()];
         let spawn = |v: &str| gog_spawn_in(v, &installs);
         assert!(spawn("C:\\Windows\\System32\\cmd.exe\t/c calc\tC:\\Games\\W3").is_none());
-        // A sibling whose name merely starts with the install path is not inside it.
+        // Prefix match is not containment: a sibling path must not pass.
         assert!(spawn("C:\\Games\\W3x\\evil.exe").is_none());
-        // ...nor is anything that climbs back out of one.
         assert!(spawn("C:\\Games\\W3\\..\\..\\Windows\\System32\\cmd.exe").is_none());
-        // No GOG install at all ⇒ nothing is launchable, rather than everything.
+        // Empty install set ⇒ nothing is launchable, rather than everything.
         assert!(gog_spawn_in("C:\\Games\\W3\\witcher3.exe", &[]).is_none());
-        // Windows paths are case-insensitive and take either separator, so a plugin that spells the
-        // install dir differently to the registry still launches its own games.
+        // Case and separator: plugin spelling may differ from the registry.
         assert!(spawn("c:/games/w3/bin/game.exe").is_some());
-        // An out-of-bounds working dir costs the working dir, not the launch.
+        // Out-of-bounds workdir costs the workdir, not the launch.
         let (_, wd) = spawn("C:\\Games\\W3\\witcher3.exe\t\tC:\\Windows\\System32").unwrap();
         assert!(wd.is_none());
     }
 
-    /// Moved here with `xbox_pfn` when the built-in scanners were removed: reducing a
-    /// PackageFullName to its family name is what the `xbox` launch kind does with the Identity a
-    /// de-privileged plugin sends it, so the guard belongs to the launch path now.
+    /// Family name from PackageFullName: the `xbox` kind's Identity completion.
     #[cfg(windows)]
     #[test]
     fn pfn_reduces_a_package_full_name_to_its_family() {
@@ -1517,15 +1202,13 @@ mod tests {
             .as_deref(),
             Some("Microsoft.624F8B84B80_8wekyb3d8bbwe")
         );
-        // No `_` at all → nothing to reduce, and we must not invent a hash.
+        // No `_` → nothing to reduce; must not invent a hash.
         assert!(pfn_from_full("NoUnderscore", "NoUnderscore").is_none());
     }
 
     #[cfg(windows)]
     #[test]
     fn windows_launch_for_maps_and_guards() {
-        // Steam: a digits-only appid → a steam:// URI line (via Steam.exe or explorer.exe, depending
-        // on the box) with no working dir.
         let steam = LaunchSpec {
             kind: "steam_appid".into(),
             value: "570".into(),
@@ -1534,13 +1217,11 @@ mod tests {
         let line = &steam_r.cmdline;
         assert!(line.contains("steam://rungameid/570"), "line was {line:?}");
         assert!(steam_r.workdir.is_none());
-        // A non-numeric "appid" (a client trying to inject) is rejected, never interpolated.
         let evil = LaunchSpec {
             kind: "steam_appid".into(),
             value: "570\" & calc".into(),
         };
         assert!(windows_launch_for(&evil).is_none());
-        // Operator command → cmd /c passthrough (trusted host input).
         let cmd = LaunchSpec {
             kind: "command".into(),
             value: "notepad.exe".into(),
@@ -1551,7 +1232,6 @@ mod tests {
             cmd_r.owns_game,
             "`cmd /c` blocks on the operator's command, so its pid is that command's"
         );
-        // Xbox AUMID → explorer shell:AppsFolder activation; a value without '!' is rejected.
         let aumid = LaunchSpec {
             kind: "aumid".into(),
             value: "Microsoft.X_8wekyb3d8bbwe!Game".into(),
@@ -1565,7 +1245,6 @@ mod tests {
             value: "no-bang".into()
         })
         .is_none());
-        // Empty / unknown kinds → no recipe.
         assert!(windows_launch_for(&LaunchSpec {
             kind: "command".into(),
             value: "  ".into()

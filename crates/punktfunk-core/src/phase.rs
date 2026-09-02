@@ -1,53 +1,45 @@
-//! Circular (directional) statistics for phase-locked capture (design/phase-locked-capture.md):
-//! the client-side half of the controller's v2 error signal, plus the panel-grid learner every
-//! vsync-aware presenter paces against. Pure math, no features — shared so every presenter
-//! (Android today, iOS and the desktop session client next) computes the SAME statistic the host
-//! controller was tuned against, and so the controller's simulation tests can generate their
-//! synthetic reports through the identical code path.
+//! Circular statistics, panel-grid learning, and source-timestamp playout.
+//!
+//! Shared client math: every presenter and the host's simulation tests compute
+//! the same numbers the controller was tuned against. Pure, no features.
+//!
+//! - [`circular_latch`] — mean latch and coherence of latch samples mod a period.
+//! - [`PanelGrid`] — learned refresh period. Finer is adopted at once; coarser
+//!   only after [`PANEL_WIDEN_STREAK`] agreeing observations.
+//! - [`CadenceClock`] — type-2 loop. Due time is `src_pts + offset + cushion`;
+//!   timestamps are never smoothed.
+//!
+//! Evidence: `design/phase-locked-capture.md`,
+//! `design/presenter-cadence-rework.md`.
 
-/// Plausible panel periods: ~24 Hz to ~500 Hz. A spacing outside this is a clock glitch, not a
-/// display mode, and must never reach the estimate.
+/// ~24 Hz to ~500 Hz. Outside this is a clock glitch, not a display mode.
 const PANEL_PERIOD_RANGE_NS: std::ops::RangeInclusive<i64> = 2_000_000..=42_000_000;
 
-/// Spacings within this of the estimate are the same grid — absorbs ordinary timeline jitter.
+/// 200 µs of timeline jitter is still the same grid.
 const PANEL_GRID_TOLERANCE_NS: i64 = 200_000;
 
-/// Consecutive WIDER observations required before the estimate grows. One stray wide sample is a
-/// scheduling hiccup; eight in a row (~66 ms at 120 Hz) is a display that really did slow down.
+/// One stray wider sample is a hiccup; eight (~66 ms at 120 Hz) is a panel
+/// that really slowed down.
 const PANEL_WIDEN_STREAK: u8 = 8;
 
-/// The panel's true refresh period, learned from observed vsync/frame-timeline spacing.
+/// Learned refresh period from vsync/frame-timeline spacing.
 ///
-/// A presenter subdivides its release targets onto this grid, so an estimate FINER than the panel
-/// makes it aim at instants that never arrive and release faster than the display consumes —
-/// which is why the estimate has to be able to move both ways.
-///
-/// Seeding is the reason this is not simply "believe the last sample". The platform's *configured*
-/// mode is not the panel: under a per-uid frame-rate override a 120 Hz panel reports 60
-/// (`Display.getRefreshRate` returns the override — observed on-glass, A024), and the app's own
-/// choreographer callbacks arrive at the down-rated rate while the panel scans at its own. The
-/// mode TABLE is honest about what the panel *can* do, so it is the seed; the timeline spacing is
-/// honest about what it is *doing*, so it is the correction.
-///
-/// The asymmetry is deliberate. **Narrowing is immediate**: a finer real grid is always safe to
-/// subdivide onto, and it is the down-rate case the seed most often gets wrong. **Widening needs
-/// [`PANEL_WIDEN_STREAK`] consecutive agreeing observations** and then adopts the *narrowest* of
-/// them, because a wide sample is far more likely to be a missed callback than a mode change.
-///
-/// ⚠ 0.23.0 shipped this learner as narrow-only, seeded from the display mode the app *requests*
-/// (`preferredDisplayModeId` is a hint the system may refuse). A refused 120 Hz switch therefore
-/// left the presenter pacing a 60 Hz panel on an 8.33 ms grid with no way back — permanently.
+/// Presenters subdivide release targets onto this grid. An estimate finer than
+/// the panel aims at instants that never arrive, so the estimate moves both ways:
+/// narrow immediately, widen only after [`PANEL_WIDEN_STREAK`] agreeing samples,
+/// taking the narrowest of them (a single wide sample is a missed callback).
+/// Seed from the mode table (what the panel can do); correct from timeline
+/// spacing (what it is doing) — a per-uid override is not the panel.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PanelGrid {
     period_ns: i64,
     widen_streak: u8,
-    /// Narrowest wider-than-estimate spacing seen during the current streak.
+    /// Narrowest of the current widen streak — not the latest, not the widest.
     widen_candidate: i64,
 }
 
 impl PanelGrid {
-    /// Seed from the display mode's refresh rate (`0` = unknown — the first plausible observation
-    /// then sets the estimate outright).
+    /// `hz == 0` leaves the estimate unknown; the first plausible sample sets it.
     pub fn seeded(hz: i32) -> PanelGrid {
         PanelGrid {
             period_ns: if hz > 0 { 1_000_000_000 / hz as i64 } else { 0 },
@@ -56,15 +48,14 @@ impl PanelGrid {
         }
     }
 
-    /// The learned period, or `0` while unknown.
     pub fn period_ns(&self) -> i64 {
         self.period_ns
     }
 
-    /// Fold one observed grid spacing. Returns `true` when [`period_ns`](Self::period_ns) changed.
+    /// `true` when [`period_ns`](Self::period_ns) changed.
     pub fn observe(&mut self, spacing_ns: i64) -> bool {
         if !PANEL_PERIOD_RANGE_NS.contains(&spacing_ns) {
-            return false; // implausible — a clock glitch, not a display mode
+            return false;
         }
         if self.period_ns == 0 {
             self.reset_streak();
@@ -90,7 +81,7 @@ impl PanelGrid {
             }
             return false;
         }
-        self.reset_streak(); // this sample agreed — the run of wider ones is broken
+        self.reset_streak(); // agreed sample; the widen run is broken
         false
     }
 
@@ -100,17 +91,12 @@ impl PanelGrid {
     }
 }
 
-/// Circular (vector-mean) statistics of latch samples against a display period: the mean latch
-/// mod the period (ns) and the coherence (‰).
+/// Mean latch mod the period (ns) and coherence (‰) of latch samples.
 ///
-/// The mean is what a phase controller can actually steer under jitter — the MEDIAN of a
-/// period-spanning distribution is immovable (shifting a uniform-mod-P distribution's mean
-/// leaves its median untouched; the controller-v1 on-glass lesson, 2026-07-31). The coherence
-/// (the resultant length `R` of the unit phasors, scaled to ‰) says whether ANY phase exists to
-/// steer: 0 = arrivals uniformly smeared over the period (alignment is physically pointless),
-/// 1000 = perfectly phase-locked.
-///
-/// `None` under 8 samples or a non-positive period — too little evidence to report a phase.
+/// Mean, not median: shifting a uniform-mod-P distribution leaves its median
+/// untouched, so a median is unsteerable. Coherence is resultant length `R`
+/// of the unit phasors, in ‰: 0 = smeared over the period, 1000 = locked.
+/// `None` under 8 samples or a non-positive period.
 pub fn circular_latch(samples_us: &[u64], period_ns: i64) -> Option<(u64, u16)> {
     if samples_us.len() < 8 || period_ns <= 0 {
         return None;
@@ -129,27 +115,19 @@ pub fn circular_latch(samples_us: &[u64], period_ns: i64) -> Option<(u64, u16)> 
     Some((mean_ns, (r * 1000.0) as u16))
 }
 
-// ---- Source-timestamp playout (design/presenter-cadence-rework.md, WP3) --------------------
-
-/// Tuning for one cadence loop. Gains are SHIFT COUNTS — the loop is fixed-point i64 throughout,
-/// so it runs identically on every client and in the offline harness, and carries no float into a
-/// present path.
-///
-/// ⚠ **These values are provisional, and saying so is part of the design.** The plan asks for
-/// constants fitted to recorded `(src_pts, received, decoded)` traces (its spike S2), and S2 was
-/// never run — the 2026-08-05 baseline records that omission itself. What is here is derived from
-/// first principles (a proportional time constant of tens of frames, an integral an order slower,
-/// a cushion of a few mean-absolute-deviations) and is honest about being a starting point. The
-/// first real trace should replace them, with the trace named beside each.
+/// Gains are shift counts (`1 >> n` per frame). Fixed-point i64 so every
+/// client and the offline harness compute the same due times; no float on a
+/// present path. Starting values: proportional time-constant of tens of frames,
+/// integral an order slower, cushion a few MADs of residual.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CadenceTuning {
-    /// Proportional gain on the offset estimate: `1 >> offset_shift` of the residual per frame.
+    /// Proportional: `1 >> offset_shift` of the residual per frame.
     pub offset_shift: u8,
-    /// Integral gain on the per-frame rate (skew) term: `1 >> skew_shift`.
+    /// Integral on the per-frame rate (skew): `1 >> skew_shift`.
     pub skew_shift: u8,
-    /// EMA weight for the residual mean-absolute-deviation.
+    /// EMA of |residual|.
     pub jitter_shift: u8,
-    /// Per-sample residual clamp — one outlier must not yank the estimate.
+    /// One outlier must not yank the estimate.
     pub error_clamp_ns: i64,
     /// Cushion = `mad * cushion_num / cushion_den`, clamped to
     /// `[cushion_floor_ns, frame_interval_ns]`.
@@ -161,8 +139,8 @@ pub struct CadenceTuning {
 }
 
 impl CadenceTuning {
-    /// For callers that snap the due time onto a display grid afterwards: the snap-up itself
-    /// carries roughly half a refresh of implicit slack, so the cushion can be small.
+    /// Snap-up onto a display grid already carries ~½ refresh of slack, so the
+    /// cushion can be small.
     pub const fn snapping() -> CadenceTuning {
         CadenceTuning {
             offset_shift: 5,
@@ -176,7 +154,7 @@ impl CadenceTuning {
         }
     }
 
-    /// For callers presenting at the due time directly (VRR, direct scanout): no implicit slack,
+    /// Presenting at the due time directly (VRR, scanout): no implicit slack,
     /// so the cushion must cover more of the distribution on its own.
     pub const fn free_running() -> CadenceTuning {
         CadenceTuning {
@@ -187,18 +165,15 @@ impl CadenceTuning {
     }
 }
 
-/// Loop health for the 1 Hz line — the numbers that say whether the cushion is doing its job.
-///
-/// Residual PERCENTILES are deliberately absent: this type is allocation-free and holds no
-/// histogram, and the client stat paths (the judder metric) are where distributions belong.
+/// No residual percentiles: allocation-free, no histogram. Distributions live
+/// on the client judder metric.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CadenceHealth {
-    /// Frames folded since the last [`CadenceClock::reset`].
+    /// Since last [`CadenceClock::reset`].
     pub frames: u64,
-    /// …of which the due time was already past when the frame became presentable. The direct
-    /// signal that the cushion is too small.
+    /// Due time already past when the frame became presentable — cushion too small.
     pub late: u64,
-    /// Times the loop gave up tracking and re-anchored (gap, regression, or explicit reset).
+    /// Gave up tracking (gap, regression, or explicit reset).
     pub reanchors: u64,
     pub offset_ns: i64,
     pub skew_ns: i64,
@@ -206,30 +181,15 @@ pub struct CadenceHealth {
     pub cushion_ns: i64,
 }
 
-/// Plays frames out on the SOURCE's cadence instead of on their arrival instant.
+/// Type-2 playout: due time is `src_pts + offset + cushion` on the source
+/// cadence, not the arrival instant.
 ///
-/// The defect it exists for: every client presents a frame as soon as it is decoded, so the
-/// transport's jitter — and, on a host whose compositor delivers raggedly, the compositor's —
-/// lands on the glass 1:1. The loop estimates the offset between the source clock and the present
-/// clock, and hands back a due time on the source's own timeline plus a cushion sized to the
-/// measured jitter.
-///
-/// **Type-2 on purpose.** It tracks offset *and* per-frame rate, because two free-running crystals
-/// produce a ramp and a proportional-only loop lags a ramp forever.
-///
-/// **It smooths the offset, never the timestamps.** The due time is `src_pts + offset + cushion`,
-/// so genuine variation in the source's own cadence — a variable-rate renderer, an irregular
-/// capture tick — passes straight through. Only the transport's contribution to `ready − pts` is
-/// filtered. Any change that makes due times more evenly spaced than the source is a bug, not an
-/// improvement; `preserves_source_cadence` is the test that says so.
-///
-/// **Domain-agnostic by construction.** A constant offset between clock domains (monotonic vs
-/// realtime) is absorbed by the offset estimator, so a caller feeds `ready_ns` and reads `due_ns`
-/// in ONE domain and needs no clock conversion anywhere in this path. Suspend/resume breaks the
-/// constant — that is a discontinuity, and [`reset`](Self::reset) covers it.
-///
-/// Prior art is ordinary and old: MPEG-2 TS PCR recovery and RTP playout scheduling (RFC 3550
-/// §6.4.1 carries the jitter estimator this MAD mirrors).
+/// Tracks offset *and* per-frame rate because two free-running crystals produce
+/// a ramp a proportional-only loop lags forever. Smooths the offset, never the
+/// timestamps — genuine source variation passes through; only `ready − pts` is
+/// filtered. Due times more even than the source is a bug
+/// (`preserves_source_cadence`). A constant clock-domain offset is absorbed;
+/// suspend/resume is a discontinuity — call [`reset`](Self::reset).
 #[derive(Debug, Clone)]
 pub struct CadenceClock {
     tuning: CadenceTuning,
@@ -241,7 +201,7 @@ pub struct CadenceClock {
     mad_ns: i64,
     /// `None` until the first sample anchors the loop.
     last_pts_ns: Option<u64>,
-    /// Last frame interval seen, so [`cushion_ns`](Self::cushion_ns) can apply its ceiling.
+    /// Last interval seen, so [`cushion_ns`](Self::cushion_ns) can apply its ceiling.
     frame_interval_ns: i64,
     health: CadenceHealth,
 }
@@ -259,24 +219,21 @@ impl CadenceClock {
         }
     }
 
-    /// Force a re-anchor on the next sample. Call on every discontinuity the client already knows
-    /// about: reanchor, codec rebuild, surface recreate, jump-to-live, resume.
+    /// Re-anchor on the next sample. Call on known discontinuities: codec
+    /// rebuild, surface recreate, jump-to-live, resume.
     pub fn reset(&mut self) {
         self.last_pts_ns = None;
         self.skew_ns = 0;
-        // `mad_ns` deliberately SURVIVES. It describes the link, not the stream, and a cushion
-        // that collapsed to its floor at every rebuild would spend the next few hundred frames
-        // presenting late — the exact failure the cushion exists to prevent.
+        // `mad_ns` survives: it describes the link, not the stream. Collapsing
+        // the cushion to its floor on every rebuild presents late for hundreds
+        // of frames — the failure the cushion exists to prevent.
     }
 
-    /// Fold one presentable frame and return when it is due, in the present clock domain.
+    /// Due time in the present-clock domain. May be earlier than `ready_ns`
+    /// (late): present at the next opportunity; do not clamp to now — that
+    /// would turn every late frame into a fresh anchor.
     ///
-    /// `ready_ns` is when the frame became presentable; `frame_interval_ns` is the nominal source
-    /// interval and the cushion's ceiling.
-    ///
-    /// The result **may be earlier than `ready_ns`** — that is a late frame, and the caller's
-    /// contract is "already due ⇒ present at the next opportunity", never "drag the grid back to
-    /// now". Clamping here would quietly turn every late frame into a fresh anchor.
+    /// `frame_interval_ns` is the nominal source interval and the cushion ceiling.
     pub fn due_ns(&mut self, src_pts_ns: u64, ready_ns: i64, frame_interval_ns: i64) -> i64 {
         self.frame_interval_ns = frame_interval_ns;
         self.health.frames += 1;
@@ -284,8 +241,8 @@ impl CadenceClock {
         let raw = ready_ns - pts;
 
         let anchored = match self.last_pts_ns {
-            // Source time going BACKWARDS, or a gap so long the estimate cannot be trusted to
-            // have tracked across it: re-anchor rather than slew for seconds.
+            // PTS went backwards, or the gap is too long to have tracked:
+            // re-anchor rather than slew for seconds.
             Some(last)
                 if src_pts_ns < last || src_pts_ns - last > self.tuning.reanchor_gap_ns as u64 =>
             {
@@ -295,8 +252,6 @@ impl CadenceClock {
             None => false,
         };
         if anchored {
-            // Advance the estimate one frame on the rate term, then correct it by a bounded
-            // fraction of what the new sample says.
             self.offset_ns = self.offset_ns.saturating_add(self.skew_ns);
             let err = (raw - self.offset_ns)
                 .clamp(-self.tuning.error_clamp_ns, self.tuning.error_clamp_ns);
@@ -325,13 +280,10 @@ impl CadenceClock {
         due
     }
 
-    /// A frame whose timestamp is not on the source cadence — a repeat the host re-anchored at
-    /// submit, or a stamp its plausibility gate replaced with "now". Those samples do not lie on
-    /// the source's timeline, and folding them in would drag the offset estimate toward "now"
-    /// exactly when the stream is idle and the estimate matters most.
-    ///
-    /// Returns a due time from the CURRENT estimate, leaving offset, skew and jitter untouched:
-    /// the frame is simply due once it is ready, cushioned like any other.
+    /// Timestamp not on the source cadence (host re-anchor, plausibility "now").
+    /// Folding it would drag the offset toward now while the stream is idle —
+    /// when the estimate matters most. Returns a due time from the current
+    /// estimate; offset, skew, and jitter stay put.
     pub fn note_off_cadence(&mut self, ready_ns: i64, frame_interval_ns: i64) -> i64 {
         self.frame_interval_ns = frame_interval_ns;
         ready_ns.saturating_add(self.cushion_ns())
@@ -341,11 +293,8 @@ impl CadenceClock {
         self.mad_ns
     }
 
-    /// How far past the estimate a frame is held, to absorb the measured jitter.
-    ///
-    /// The one-frame-interval ceiling is an INVARIANT, not a tunable: a cushion past a whole frame
-    /// buys latency for smoothness the source cannot supply, and at that point the honest fix is a
-    /// deeper buffer the user asked for, not a loop quietly holding frames.
+    /// Ceiling of one frame interval is an invariant, not a tunable: past a
+    /// whole frame the source cannot supply that smoothness — deepen the buffer.
     pub fn cushion_ns(&self) -> i64 {
         let den = self.tuning.cushion_den.max(1) as i64;
         let want = self.mad_ns.saturating_mul(self.tuning.cushion_num as i64) / den;
@@ -373,9 +322,8 @@ impl CadenceClock {
     }
 }
 
-/// Arithmetic shift that rounds toward ZERO, so a negative residual is damped by exactly as much
-/// as its positive twin. A plain `>>` rounds toward −∞, which biases a loop that spends its whole
-/// life within a few nanoseconds of zero error.
+/// Shift toward zero. Plain `>>` rounds toward −∞ and would bias a loop that
+/// lives within a few nanoseconds of zero error.
 const fn shr_toward_zero(v: i64, shift: u8) -> i64 {
     if v < 0 {
         -((-v) >> shift)
@@ -389,15 +337,12 @@ mod tests {
     use super::*;
 
     const P: i64 = 8_333_333; // 120 Hz in ns
-    const P_US: u64 = 8_333; // …and in µs, the sample unit
+    const P_US: u64 = 8_333; // sample unit, µs
 
-    // ---- CadenceClock (design/presenter-cadence-rework-implementation-plan.md §2.3) --------
-
-    /// A source stamping realtime, played out by a client whose present clock is monotonic and
-    /// therefore a whole different era. The loop must never need to be told about this.
+    /// Realtime PTS vs monotonic present clock. The loop is not told the offset.
     const PTS0: u64 = 1_786_000_000_000_000_000;
     const DOMAIN: i64 = -1_785_000_000_000_000_000;
-    /// Transport + decode: what `ready − pts` sits at once the domain is taken out.
+    /// Transport + decode: `ready − pts` once the domain is taken out.
     const DELAY: i64 = 12_000_000;
 
     /// Deterministic LCG in ±spread around zero — no OS randomness in tests.
@@ -419,7 +364,6 @@ mod tests {
         (PTS0 as i64 + k * P) as u64
     }
 
-    /// Run `n` frames of a well-behaved 120 Hz source and hand back the clock.
     fn settled(n: i64, spread_ns: i64) -> CadenceClock {
         let mut c = CadenceClock::new(CadenceTuning::snapping());
         let mut rng = Lcg(7);
@@ -441,9 +385,7 @@ mod tests {
         assert_eq!(c.health().reanchors, 1, "only the cold start anchors");
     }
 
-    /// The type-2 property, and the reason the loop carries a rate term at all: two free-running
-    /// crystals produce a RAMP, and a proportional-only loop lags a ramp forever. Asserted against
-    /// its own type-1 twin so the difference is the measurement, not a threshold I chose.
+    /// Type-2 vs its own type-1 twin: crystals produce a ramp; P-only lags forever.
     #[test]
     fn tracks_a_clock_ramp() {
         const RAMP: i64 = 400; // ns per frame ≈ 48 ppm, an ordinary crystal pair
@@ -458,8 +400,7 @@ mod tests {
             last_err.abs()
         };
         let type2 = run(CadenceTuning::snapping());
-        // The same loop with its integral gain switched off: a shift this large truncates every
-        // residual to zero, which is exactly "proportional only".
+        // skew_shift 63 truncates every residual to 0 — proportional-only.
         let type1 = run(CadenceTuning {
             skew_shift: 63,
             ..CadenceTuning::snapping()
@@ -475,7 +416,7 @@ mod tests {
     fn rejects_a_single_outlier() {
         let mut c = settled(400, 200_000);
         let before = c.health().offset_ns;
-        // One frame arrives half a second late — a stall, not a new operating point.
+        // Half a second late: a stall, not a new operating point.
         let k = 400;
         c.due_ns(
             pts_at(k),
@@ -483,8 +424,8 @@ mod tests {
             P,
         );
         let moved = (c.health().offset_ns - before).abs();
-        // The clamped correction, plus the one frame of rate the loop advances by regardless —
-        // that advance is the estimate doing its job, not the outlier moving it.
+        // Clamp plus one frame of rate advance — the advance is the estimate
+        // working, not the outlier.
         let t = CadenceTuning::snapping();
         let bound = (t.error_clamp_ns >> t.offset_shift) + c.health().skew_ns.abs();
         assert!(
@@ -497,7 +438,7 @@ mod tests {
     fn reanchors_on_a_gap() {
         let mut c = settled(400, 200_000);
         let anchors = c.health().reanchors;
-        // The stream was paused for two seconds; the estimate cannot have tracked across that.
+        // Two-second pause: the estimate cannot have tracked across it.
         let far = pts_at(400) + 2_000_000_000;
         let ready = far as i64 + DOMAIN + DELAY + 4_000_000;
         c.due_ns(far, ready, P);
@@ -518,9 +459,8 @@ mod tests {
         assert_eq!(c.health().reanchors, anchors + 1);
     }
 
-    /// A due time in the past is returned AS IS. Clamping it to `ready_ns` would quietly turn
-    /// every late frame into a fresh anchor, which is how an arrival-driven presenter behaves —
-    /// the thing this clock exists to stop being.
+    /// Past due is returned as-is. Clamping to `ready_ns` would turn every late
+    /// frame into a fresh anchor — arrival-driven presentation.
     #[test]
     fn late_frame_returns_past_due() {
         let mut c = settled(400, 200_000);
@@ -550,9 +490,8 @@ mod tests {
         assert_eq!(due, 1_000_000 + c.cushion_ns());
     }
 
-    /// One domain in, same domain out: shifting the whole present-side trace by an arbitrary
-    /// constant must change every due time by exactly that constant and nothing else. This is
-    /// what lets each client feed its own clock without a conversion in the path.
+    /// Shift the present-side trace by a constant: every due time moves by
+    /// exactly that constant. Callers feed one domain; no conversion in-path.
     #[test]
     fn domain_offset_is_absorbed() {
         const SHIFT: i64 = 987_654_321_000;
@@ -573,13 +512,11 @@ mod tests {
         }
     }
 
-    /// The invariant that separates this from a metronome: a source that genuinely runs at an
-    /// irregular rate is REPRODUCED, not evened out. Anything that made these due spacings more
-    /// uniform than the source's own would be a bug.
+    /// Irregular source cadence is reproduced, not evened out. More-uniform due
+    /// spacings than the source would be a bug.
     #[test]
     fn preserves_source_cadence() {
         let mut c = CadenceClock::new(CadenceTuning::snapping());
-        // A deliberately lumpy source: alternating short and long frames.
         let spacings: Vec<i64> = (0..300)
             .map(|k| if k % 2 == 0 { P / 2 } else { P * 3 / 2 })
             .collect();
@@ -608,7 +545,7 @@ mod tests {
     fn cushion_respects_ceiling() {
         let mut c = CadenceClock::new(CadenceTuning::free_running());
         let mut rng = Lcg(17);
-        // Jitter far wider than a frame — the cushion must still never exceed one interval.
+        // Jitter wider than a frame: cushion must still never exceed one interval.
         for k in 0..500i64 {
             let ready = pts_at(k) as i64 + DOMAIN + DELAY + rng.noise(40_000_000);
             c.due_ns(pts_at(k), ready, P);
@@ -624,13 +561,10 @@ mod tests {
         );
     }
 
-    // ---- Offline sim (§2.4): the real clock, replayed, against today's rule ----------------
-    //
-    // R7, the phase-lock v3 lesson: the harness imports the REAL type. A paraphrase once
-    // "confirmed" a non-bug and cost a session.
+    // Import the real type — a paraphrase once "confirmed" a non-bug.
 
-    /// Judder as WP1 defines it: round each consecutive present spacing to whole panel periods,
-    /// then report the ‰ of intervals that are not the modal count.
+    /// Round consecutive present spacings to whole panel periods; ‰ that are
+    /// not the modal count.
     fn judder_permille(presents: &[i64], panel_ns: i64) -> u32 {
         let counts: Vec<i64> = presents
             .windows(2)
@@ -647,13 +581,11 @@ mod tests {
         (off * 1000 / counts.len()) as u32
     }
 
-    /// Turn a series of target instants into the refreshes a frame actually reaches glass on.
+    /// Map target instants onto the refreshes a frame actually presents on.
     ///
-    /// Newest-wins, which is what both presenters really do: a frame whose slot is already
-    /// claimed REPLACES the one aimed there rather than being delayed to the next refresh.
-    /// Delaying it instead would ratchet — one clamp puts the sequence permanently ahead of its
-    /// own targets and every later frame clamps too, producing a flawless metronome out of an
-    /// arbitrarily jittery input, and scoring zero judder for both rules.
+    /// Newest-wins: a claimed slot is replaced, not delayed. Delaying ratchets —
+    /// one clamp puts the sequence permanently ahead and every later frame
+    /// clamps too, scoring zero judder for both rules.
     fn present_slots(targets: &[i64], panel_ns: i64) -> Vec<i64> {
         let mut out: Vec<i64> = Vec::new();
         for &t in targets {
@@ -667,10 +599,8 @@ mod tests {
 
     #[test]
     fn the_clock_beats_arrival_presentation_on_a_jittery_link() {
-        // ±6 ms — the 2026-08-15 field shape, where KWin's screencast arrival offsets ran
-        // 0.11–8.22 ms against an 8.33 ms period. Jitter much narrower than the panel period is
-        // the case snapping absorbs on its own (and, at a lucky grid phase, absorbs entirely),
-        // which is precisely why the reported host is the one worth simulating.
+        // ±6 ms, comparable to an 8.33 ms period. Narrower jitter is what
+        // snapping absorbs on its own, so it would not stress the clock.
         const JITTER: i64 = 6_000_000;
         let mut c = CadenceClock::new(CadenceTuning::snapping());
         let mut rng = Lcg(23);
@@ -679,15 +609,13 @@ mod tests {
             let ready = pts_at(k) as i64 + DOMAIN + DELAY + rng.noise(JITTER);
             let due = c.due_ns(pts_at(k), ready, P);
             if k > 200 {
-                // Today: aim at the frame the moment it is decoded. With the clock: aim at its
-                // due time, and never before the frame exists.
+                // Arrival: present when decoded. Clock: present at due, never before ready.
                 arrival.push(ready);
                 cadence.push(ready.max(due));
             }
         }
         let ja = judder_permille(&present_slots(&arrival, P), P);
         let jc = judder_permille(&present_slots(&cadence, P), P);
-        // The expected-gain figure §2.4 asks this harness to produce. `cargo test -- --nocapture`.
         println!(
             "sim: arrival {ja}‰ → cadence {jc}‰ (cushion {} ns)",
             c.cushion_ns()
@@ -698,8 +626,6 @@ mod tests {
         );
     }
 
-    /// …and it must NOT "win" by flattening a source that is genuinely uneven — the same harness,
-    /// a variable-rate source, and the clock is expected to reproduce its lumpiness.
     #[test]
     fn the_sim_does_not_reward_flattening_a_variable_source() {
         let mut c = CadenceClock::new(CadenceTuning::snapping());
@@ -741,8 +667,8 @@ mod tests {
 
     #[test]
     fn cluster_straddling_the_wrap_averages_at_the_boundary() {
-        // Half the samples just below the period boundary, half just above 0: an ARITHMETIC
-        // mean would report ~P/2 (maximally wrong); the circular mean must sit at the boundary.
+        // Half just below the period, half just above 0. An arithmetic mean
+        // would report ~P/2; the circular mean must sit at the boundary.
         let samples = [
             P_US - 200,
             P_US - 100,
@@ -799,9 +725,8 @@ mod panel_grid_tests {
         assert_eq!(g.period_ns(), P120, "a finer real grid is adopted at once");
     }
 
-    /// The 0.23.0 bug: `preferredDisplayModeId` is a request, so a refused 120 Hz switch seeds a
-    /// 120 Hz grid on a panel that is really running 60. The narrow-only learner could never
-    /// climb back, and the presenter aimed at instants the panel never reached.
+    /// Requested 120 Hz, panel still 60: must widen back. A finer-only learner
+    /// would pace a 60 Hz panel on an 8.33 ms grid with no way back.
     #[test]
     fn widens_back_out_when_the_requested_mode_was_refused() {
         let mut g = PanelGrid::seeded(120);
@@ -833,7 +758,6 @@ mod panel_grid_tests {
     #[test]
     fn widening_adopts_the_narrowest_of_the_run() {
         let mut g = PanelGrid::seeded(120);
-        // A run of wide spacings that includes some very wide outliers.
         let run = [
             P60,
             33_000_000,
@@ -868,8 +792,8 @@ mod panel_grid_tests {
 
     #[test]
     fn a_transient_narrow_glitch_self_heals() {
-        // Narrowing is immediate, so a glitch DOES poison the estimate — the point is that it is
-        // no longer permanent (0.23.0's learner had no way back).
+        // Narrowing is immediate, so a glitch poisons the estimate; widening
+        // must still recover.
         let mut g = PanelGrid::seeded(120);
         assert!(g.observe(2_100_000), "a glitch narrows the estimate");
         assert_eq!(g.period_ns(), 2_100_000);

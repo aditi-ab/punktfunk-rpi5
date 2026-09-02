@@ -1,29 +1,17 @@
-//! Phase A.2 micro-probes (stall attribution, `vdisplay-disturbance-immunity.md` §4.2): a small
-//! engine of watchdogged sacrificial threads that continuously measure the legs a capture stall
-//! could hide in, so the stall reporter can read back "what was alive during the hole":
+//! Stall-attribution probes for IDD-push capture.
 //!
-//! - **fence** (one thread per hardware adapter): a tiny CopyResource + D3D11 fence round-trip —
-//!   engine liveness. A Level-Two/Three adapter freeze ("graphics hardware is idle") stalls this
-//!   for the freeze's duration on EVERY engine of that adapter.
-//! - **dwm-tick**: `DwmGetCompositionTimingInfo(NULL)` `cRefresh` advance — the compositor's own
-//!   clock. Frozen tick with live fences = DWM (or something it waits on) is blocked, not the GPU.
-//!   The same sample also tracks `cFrame` (the COMPOSED-frame counter) — the compose-silence
-//!   discriminator: a clock that ticks while `cFrame` freezes means DWM had NOTHING to compose
-//!   (the foreground content stopped presenting); a `cFrame` that keeps advancing through a hole
-//!   means DWM built frames that never reached OUR swap-chain (the OS frame-generation leg).
-//! - **dwm-flush**: a watchdogged `DwmFlush` — its latency IS the composition-wait measurement.
-//! - **scanline**: `D3DKMTGetScanLine` on an active output (Level-Zero reentrant — documented safe
-//!   against every miniport lock, so a BLOCKED call here convicts the KMD itself). Prefers a
-//!   physical head; on an exclusive topology only our IDD is active and the call's latency is
-//!   still the KMD-liveness signal ([`pf_win_display::win_display::active_scanline_target`]).
-//! - **cpu**: a high-res sleeper measuring overshoot — the DPC-storm / CPU-starvation
-//!   discriminator (a machine-wide scheduling hole inflates every other probe too).
+//! Detached watchdogged threads sample the legs a stall can hide in: GPU
+//! engine, DWM clock/compose, composition wait, KMD, CPU. The stall reporter
+//! reads [`ProbeEngine::window`]. Blocking is the sample; none of these run
+//! on the capture/encode path.
 //!
-//! The blocking of a probe is its measurement — none of these ever run on the capture/encode
-//! path. Threads are DETACHED (never joined): a probe wedged inside a kernel call for the stall's
-//! duration exits at its next loop turn after the stop flag flips. One engine per process
-//! ([`acquire`]), refcounted across parallel capturers; probes sample at 20 Hz or slower and cost
-//! microseconds each, so the engine is invisible next to a streaming session.
+//! Threads are never joined: a probe wedged in a kernel call exits at the
+//! next loop turn after the last [`acquire`] `Arc` drops. One engine per
+//! process, refcounted across capturers. ≤20 Hz, microseconds each.
+//!
+//! Consumer: [`super::stall`]. Scanline target:
+//! [`pf_win_display::win_display::active_scanline_target`]. Evidence:
+//! `design/vdisplay-disturbance-immunity.md`.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,11 +36,8 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use super::stall::ProbeWindow;
 
-/// One probe's sample ring: `(completed_at, span, value_us)` — `value` is the measurement (a call
-/// latency or a frozen-span/overshoot), `span` the wall interval it describes ending at
-/// `completed_at`. Capped at 512 samples: at the fastest producer's ~20 Hz that is ~26 s of
-/// coverage, ~51 s for the 100 ms loops — comfortably longer than the seconds-old windows a stall
-/// report asks for, but NOT the "several minutes" this used to claim.
+/// 512 entries ≈ 26 s at 20 Hz (51 s at 100 ms), longer than any stall
+/// window the reporter asks for.
 struct Ring {
     samples: Mutex<VecDeque<(Instant, Duration, u64)>>,
 }
@@ -72,9 +57,8 @@ impl Ring {
         s.push_back((completed_at, span, value_us));
     }
 
-    /// Max `value` among samples whose described interval `[completed_at - span, completed_at]`
-    /// intersects `[from, to]`; `None` when the ring holds nothing for the window (probe absent,
-    /// or it started after the window).
+    /// Max `value` whose `[completed_at - span, completed_at]` intersects `[from, to]`.
+    /// `None` if the ring has nothing covering the window.
     fn window_max(&self, from: Instant, to: Instant) -> Option<u64> {
         let s = self.samples.lock().unwrap();
         let mut max: Option<u64> = None;
@@ -88,9 +72,8 @@ impl Ring {
     }
 }
 
-/// A blocking probe's "currently inside the call since" marker: a call still blocked when the
-/// reporter reads the window is exactly the interesting case, and its ring sample does not exist
-/// yet — the marker's age stands in for it.
+/// In-flight call start. A blocked probe has no ring sample yet; the marker's
+/// age is the window read.
 struct InFlight {
     since: Mutex<Option<Instant>>,
 }
@@ -112,7 +95,7 @@ impl InFlight {
         *self.since.lock().unwrap() = None;
     }
 
-    /// Age (µs) of a call still in flight that started before `to`; 0 when idle.
+    /// Age (µs) of a call that started before `to` and has not returned; 0 if idle.
     fn blocked_us(&self, to: Instant) -> u64 {
         match *self.since.lock().unwrap() {
             Some(since) if since <= to => to.duration_since(since).as_micros() as u64,
@@ -121,7 +104,6 @@ impl InFlight {
     }
 }
 
-/// A blocking probe = ring + in-flight marker; `window_max` folds both.
 struct BlockingProbe {
     ring: Ring,
     inflight: InFlight,
@@ -155,21 +137,22 @@ impl BlockingProbe {
 
 struct Inner {
     stop: AtomicBool,
-    /// One per hardware adapter, labelled by LUID (hybrids run two).
+    /// One per hardware adapter, labelled by LUID (hybrids have two).
     fences: Vec<(String, BlockingProbe)>,
     dwm_tick: Ring,
-    /// `cFrame` (composed-frame counter) frozen spans, sampled by the same dwm-tick thread.
+    /// `cFrame` frozen spans — same thread as `dwm_tick`, not a second probe.
     dwm_frame: Ring,
     dwm_flush: BlockingProbe,
     scanline: BlockingProbe,
-    /// Whether the scanline probe currently targets a PHYSICAL head (see the module docs).
+    /// Physical-head target. Exclusive topology leaves only our IDD; latency
+    /// still counts, scanline values do not.
     scanline_physical: AtomicBool,
     scanline_running: AtomicBool,
     cpu: Ring,
 }
 
-/// The process-wide micro-probe engine. Hold the `Arc` for the session's lifetime; the last drop
-/// stops every thread at its next loop turn.
+/// Process-wide probe engine. Last `Arc` drop flips `stop`; threads exit at
+/// their next loop turn (never joined).
 pub(super) struct ProbeEngine {
     inner: Arc<Inner>,
 }
@@ -182,8 +165,8 @@ impl Drop for ProbeEngine {
 
 static ENGINE: Mutex<Weak<ProbeEngine>> = Mutex::new(Weak::new());
 
-/// The engine, started on first use and shared across parallel capturers (probe threads are
-/// per-PROCESS facts — two capturers asking the same questions twice would only add noise).
+/// Process singleton: probes are machine facts. Two capturers sampling twice
+/// only add noise.
 pub(super) fn acquire() -> Arc<ProbeEngine> {
     let mut g = ENGINE.lock().unwrap();
     if let Some(e) = g.upgrade() {
@@ -195,8 +178,6 @@ pub(super) fn acquire() -> Arc<ProbeEngine> {
 }
 
 impl ProbeEngine {
-    /// What the probes saw across `[from, to]` — the stall reporter's evidence read. Cheap: five
-    /// short mutex-held ring scans.
     pub(super) fn window(&self, from: Instant, to: Instant) -> ProbeWindow {
         let i = &self.inner;
         ProbeWindow {
@@ -234,8 +215,8 @@ impl ProbeEngine {
             scanline_running: AtomicBool::new(false),
             cpu: Ring::new(),
         });
-        // Fence probes re-enumerate to pair each adapter with its probe slot by index (the two
-        // enumerations run back-to-back; a hot-plugged GPU between them only skips a probe).
+        // Re-enumerate to pair adapters with probe slots by index. A GPU hot-plugged
+        // between the two walks only skips a probe.
         for (idx, (label, adapter)) in enumerate_hardware_adapters().into_iter().enumerate() {
             let inner_t = inner.clone();
             spawn_detached(&format!("pf-probe-fence-{idx}"), move || {
@@ -258,15 +239,14 @@ impl ProbeEngine {
     }
 }
 
-/// Spawn a detached probe thread — never joined by design (see the module docs).
 fn spawn_detached(name: &str, f: impl FnOnce() + Send + 'static) {
     if let Err(e) = std::thread::Builder::new().name(name.into()).spawn(f) {
         tracing::debug!(name, error = %e, "micro-probe thread failed to spawn — probe absent");
     }
 }
 
-/// Hardware (non-software) DXGI adapters, labelled by LUID. Display-only/indirect adapters are
-/// filtered later by their device-creation failure, not here.
+/// Hardware DXGI adapters by LUID. Display-only/indirect fail later at
+/// `D3D11CreateDevice`, not here.
 fn enumerate_hardware_adapters() -> Vec<(String, IDXGIAdapter1)> {
     let mut out = Vec::new();
     // SAFETY: plain factory creation; the result is checked.
@@ -296,9 +276,8 @@ fn enumerate_hardware_adapters() -> Vec<(String, IDXGIAdapter1)> {
     out
 }
 
-/// One adapter's engine-liveness loop: submit a trivial copy, signal a fence, wait on its event.
-/// The wait latency is the sample. Device-creation failure = probe absent for this adapter
-/// (display-only/indirect adapters land here).
+/// Engine-liveness: CopyResource + fence wait. Wait latency is the sample.
+/// Device-create failure (display-only / indirect) leaves this adapter absent.
 fn fence_probe_loop(inner: &Inner, idx: usize, label: &str, adapter: &IDXGIAdapter1) {
     let Some((context, ctx4, fence, event, (a, b))) = fence_probe_setup(adapter) else {
         tracing::debug!(
@@ -314,11 +293,10 @@ fn fence_probe_loop(inner: &Inner, idx: usize, label: &str, adapter: &IDXGIAdapt
     while !inner.stop.load(Ordering::Relaxed) {
         value += 1;
         probe.measure(|| {
-            // SAFETY: all COM objects are live for this loop's lifetime (owned above); `a`/`b`
-            // are same-device, same-desc textures; the event handle is ours. The fence signal
-            // orders after the queued copy, so the wait measures the engine actually processing
-            // work; the 10 s ceiling only bounds a truly wedged adapter (the timeout sample still
-            // records — that IS the measurement).
+            // SAFETY: COM objects live for this loop (owned above); `a`/`b` are
+            // same-device same-desc; the event is ours. Signal follows the copy
+            // so the wait is engine work. 10 s bounds a wedged adapter; timeout
+            // still records.
             unsafe {
                 context.CopyResource(&a, &b);
                 let _ = ctx4.Signal(&fence, value);
@@ -335,9 +313,7 @@ fn fence_probe_loop(inner: &Inner, idx: usize, label: &str, adapter: &IDXGIAdapt
     }
 }
 
-/// The fence probe's D3D plumbing: a device on `adapter`, its fence, the wait event, and two tiny
-/// textures kept alive for the copies. `None` when any piece is unavailable (pre-FL11 or
-/// display-only adapters, fence-less runtimes).
+/// `None` for pre-FL11, display-only, or fence-less runtimes.
 #[allow(clippy::type_complexity)]
 fn fence_probe_setup(
     adapter: &IDXGIAdapter1,
@@ -404,12 +380,10 @@ fn fence_probe_setup(
     Some((context, ctx4, fence, event, (a, b)))
 }
 
-/// `cRefresh` + `cFrame` advance sampling: each tick records how long the compositor's refresh
-/// counter and its COMPOSED-frame counter have been unchanged. A frozen refresh span covering a
-/// stall (with live fences) = DWM blocked, not the GPU. A LIVE refresh with a frozen `cFrame` =
-/// DWM ticked but composed nothing — no damage anywhere, i.e. the foreground content itself
-/// stopped presenting; a `cFrame` that advances through a capture hole = DWM composed frames the
-/// IDD swap-chain never received (the OS frame-generation leg dropped them).
+/// Frozen-span of `cRefresh` (DWM clock) and `cFrame` (composed-frame count).
+/// Frozen refresh + live fences ⇒ compositor blocked, not GPU. Frozen `cFrame`
+/// with a live clock ⇒ nothing to compose. Advancing `cFrame` through a hole ⇒
+/// DWM built frames the IDD swap-chain never saw.
 fn dwm_tick_loop(inner: &Inner) {
     let mut last_refresh = 0u64;
     let mut last_change = Instant::now();
@@ -443,7 +417,7 @@ fn dwm_tick_loop(inner: &Inner) {
     }
 }
 
-/// Watchdogged `DwmFlush`: blocks until the next composition — the wait IS the measurement.
+/// `DwmFlush` wait until the next composition. Latency is the sample.
 fn dwm_flush_loop(inner: &Inner) {
     while !inner.stop.load(Ordering::Relaxed) {
         inner.dwm_flush.measure(|| {
@@ -455,15 +429,15 @@ fn dwm_flush_loop(inner: &Inner) {
     }
 }
 
-/// `D3DKMT_OPENADAPTERFROMLUID` (d3dkmthk.h): LUID in, kernel adapter handle out.
+/// `D3DKMT_OPENADAPTERFROMLUID` (d3dkmthk.h). Size asserted below.
 #[repr(C)]
 struct D3dkmtOpenAdapterFromLuid {
     adapter_luid: LUID,
     h_adapter: u32,
 }
 
-/// `D3DKMT_GETSCANLINE` (d3dkmthk.h): `InVerticalBlank` is a C `BOOLEAN` (u8) — the pad bytes
-/// before the 4-aligned `scan_line` mirror the C layout exactly (size assert below).
+/// `D3DKMT_GETSCANLINE` (d3dkmthk.h). `InVerticalBlank` is C `BOOLEAN` (u8);
+/// pad to 4-align `scan_line`. Size asserted below.
 #[repr(C)]
 struct D3dkmtGetScanline {
     h_adapter: u32,
@@ -473,7 +447,7 @@ struct D3dkmtGetScanline {
     scan_line: u32,
 }
 
-/// `D3DKMT_CLOSEADAPTER` (d3dkmthk.h).
+/// `D3DKMT_CLOSEADAPTER` (d3dkmthk.h). Size asserted below.
 #[repr(C)]
 struct D3dkmtCloseAdapter {
     h_adapter: u32,
@@ -487,12 +461,11 @@ const _: () = {
 
 type D3dkmtFn<T> = unsafe extern "system" fn(*mut T) -> i32;
 
-/// Resolve a `D3DKMT*` entry point from gdi32 (no stable windows-rs bindings — the same
-/// GetProcAddress route as pf-frame's scheduling-priority call).
+/// `D3DKMT*` from gdi32 — no stable windows-rs bindings.
 ///
 /// # Safety
-/// `T` must be the exact d3dkmthk.h argument struct for `name` — the transmute binds the
-/// signature, and the layout asserts above pin the three structs this module uses.
+/// `T` is the d3dkmthk.h argument struct for `name`. The transmute binds the
+/// signature; the size asserts above pin the three structs this module uses.
 unsafe fn d3dkmt<T>(name: windows::core::PCSTR) -> Option<D3dkmtFn<T>> {
     // SAFETY: gdi32 is a permanent system module in any process that touched GDI/D3D; the name is
     // a static nul-terminated literal from the caller.
@@ -504,16 +477,15 @@ unsafe fn d3dkmt<T>(name: windows::core::PCSTR) -> Option<D3dkmtFn<T>> {
     Some(unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, D3dkmtFn<T>>(p) })
 }
 
-/// Level-Zero KMD-liveness loop: `D3DKMTGetScanLine` against an active output, retargeted every
-/// ~2 s (topology moves mid-session). The call's LATENCY is the signal; a blocked Level-Zero DDI
-/// convicts the KMD below every OS lever.
+/// `D3DKMTGetScanLine` on an active output. Latency is KMD liveness: the DDI
+/// is reentrant against miniport locks, so a blocked call convicts the KMD.
+/// Retarget every ~2 s (`ticks % 20` at 100 ms) — topology moves mid-session.
 fn scanline_loop(inner: &Inner) {
-    // SAFETY: `D3dkmtOpenAdapterFromLuid` is the exact d3dkmthk.h struct for this export
-    // (layout-asserted above) — the `d3dkmt` safety contract.
+    // SAFETY: `D3dkmtOpenAdapterFromLuid` matches d3dkmthk.h (size asserted); `d3dkmt` contract.
     let open = unsafe { d3dkmt::<D3dkmtOpenAdapterFromLuid>(s!("D3DKMTOpenAdapterFromLuid")) };
-    // SAFETY: `D3dkmtGetScanline` is the exact d3dkmthk.h struct for this export (asserted above).
+    // SAFETY: `D3dkmtGetScanline` matches d3dkmthk.h (size asserted).
     let get = unsafe { d3dkmt::<D3dkmtGetScanline>(s!("D3DKMTGetScanLine")) };
-    // SAFETY: `D3dkmtCloseAdapter` is the exact d3dkmthk.h struct for this export (asserted above).
+    // SAFETY: `D3dkmtCloseAdapter` matches d3dkmthk.h (size asserted).
     let close = unsafe { d3dkmt::<D3dkmtCloseAdapter>(s!("D3DKMTCloseAdapter")) };
     let (Some(open), Some(get), Some(close)) = (open, get, close) else {
         tracing::debug!("scanline probe: D3DKMT entry points unavailable — absent");
@@ -574,7 +546,8 @@ fn scanline_loop(inner: &Inner) {
     }
 }
 
-/// DPC/starvation sentinel: 5 ms sleeps, overshoot aggregated to one max per ~100 ms bucket.
+/// 5 ms sleep overshoot, max-aggregated per ~100 ms bucket. A machine-wide
+/// scheduling hole inflates every other probe too.
 fn cpu_sentinel_loop(inner: &Inner) {
     let mut bucket_max = 0u64;
     let mut bucket_start = Instant::now();

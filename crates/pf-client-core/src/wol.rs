@@ -1,13 +1,8 @@
-//! Client-side Wake-on-LAN: parse stored MAC strings and hand them to the shared core sender
-//! (`punktfunk_core::wol`). A sleeping host has no ARP entry, so the broadcast the core sends is
-//! what actually wakes it; this is called just before connecting to an offline saved host, and
-//! from the explicit "Wake host" menu item / `--wake` CLI mode.
+//! Client Wake-on-LAN: parse stored MAC strings and send via `punktfunk_core::wol`.
+//! A sleeping host has no ARP entry; the core's broadcast is what actually wakes it.
 
 use std::net::Ipv4Addr;
 
-/// Fire a Wake-on-LAN magic packet at `macs` (each `aa:bb:cc:dd:ee:ff`), also unicasting
-/// `last_ip` when given. Best-effort — logs the outcome and never blocks the caller meaningfully
-/// (the core sends a short burst of datagrams and returns).
 pub fn wake(macs: &[String], last_ip: Option<Ipv4Addr>) {
     let parsed: Vec<[u8; 6]> = macs
         .iter()

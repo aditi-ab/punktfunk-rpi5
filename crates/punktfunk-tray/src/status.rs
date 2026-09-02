@@ -1,14 +1,17 @@
-//! Host status model + the poller thread feeding the platform tray implementations.
+//! Host status model and the poller that feeds the platform trays.
 //!
-//! Two sources, service manager FIRST: the SCM (Windows) / systemd user unit (Linux) decides
-//! stopped-vs-running — a malicious local process squatting the mgmt port while the service is
-//! down can never make the tray say Running. Only when the service manager reports Running does
-//! the poller consult the host's loopback-only `GET /api/v1/local/summary` for streaming detail.
+//! Service-manager state is first: SCM (Windows) / systemd user unit (Linux)
+//! decides stopped-vs-running. A listener on the mgmt port while the service is
+//! down cannot make the tray say Running. After Running, the poller reads
+//! loopback `GET /api/v1/local/summary` for streaming detail.
+//!
+//! Linux pins the mgmt agent to the host identity cert when the same-user file
+//! is readable. Windows cannot: the cert is SYSTEM/Admins-DACL'd. Platform
+//! trays: `linux.rs`, `win.rs`.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// What the service manager reports for the host service.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ServiceState {
     NotInstalled,
@@ -16,29 +19,25 @@ pub enum ServiceState {
     StartPending,
     StopPending,
     Running,
-    /// Linux `ActiveState=failed` (with the sub-state), or a Windows stop with a failure exit code.
+    /// systemd `ActiveState=failed` (SubState in the string), or a Windows stop with a non-clean exit.
     Failed(String),
 }
 
-/// `GET /api/v1/local/summary` — the non-sensitive counts/booleans the host serves to loopback
-/// peers without authentication (mgmt.rs `LocalSummary`). Unknown fields are ignored so a newer
-/// host can grow the summary without breaking an older tray.
+/// `GET /api/v1/local/summary` (`LocalSummary` in mgmt.rs). Unknown fields are ignored.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 pub struct Summary {
     pub version: String,
     pub video_streaming: bool,
     pub audio_streaming: bool,
     pub session: Option<SessionInfo>,
-    /// Display name of the streaming client (trust-store name, else the device's own), for the
-    /// connect toast. `#[serde(default)]`: absent when idle, nameless, or from an older host.
+    /// Display name for the connect toast. Absent when idle or nameless.
     #[serde(default)]
     pub client_name: Option<String>,
     pub paired_clients: u32,
     pub native_paired_clients: u32,
     pub pin_pending: bool,
     pub pending_approvals: u32,
-    /// Virtual displays kept with no live session (lingering/pinned). `#[serde(default)]` so an older
-    /// host that doesn't send it deserializes as 0.
+    /// Lingering/pinned virtual displays; 0 when omitted.
     #[serde(default)]
     pub kept_displays: u32,
 }
@@ -50,22 +49,20 @@ pub struct SessionInfo {
     pub fps: u32,
 }
 
-/// What the icon shows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TrayStatus {
     NotInstalled,
     Stopped,
-    /// Service starting, or running with the mgmt API not answering yet (within [`START_GRACE`]).
+    /// StartPending, or Running with no summary yet (within [`START_GRACE`]).
     Starting,
     Running(Summary),
-    /// Service running but the summary unreachable past the grace period — amber, not red: a
-    /// custom `PUNKTFUNK_HOST_CMD` (no mgmt API) or a relocated `--mgmt-bind` is legitimate.
+    /// Running, summary unreachable past [`START_GRACE`]. Not a service failure:
+    /// a custom `PUNKTFUNK_HOST_CMD` or relocated `--mgmt-bind` is legitimate.
     Degraded,
     Error(String),
 }
 
 impl TrayStatus {
-    /// One-line headline for the tooltip / the disabled menu header.
     pub fn headline(&self) -> String {
         match self {
             TrayStatus::NotInstalled => "punktfunk host — not installed".into(),
@@ -79,9 +76,7 @@ impl TrayStatus {
                     s.version, sess.width, sess.height, sess.fps
                 ),
                 (_, true) => format!("punktfunk host {} — streaming", s.version),
-                // Idle, but surface a kept (lingering/pinned) display: it — and, under an
-                // exclusive topology, your physical monitors — is being held. Release it from
-                // the console.
+                // A kept display can hold physical monitors dark (exclusive topology).
                 _ if s.kept_displays > 0 => format!(
                     "punktfunk host {} — idle · {} display{} kept",
                     s.version,
@@ -93,18 +88,12 @@ impl TrayStatus {
         }
     }
 
-    /// A client is streaming: the host's flag, OR a live session in the summary.
-    ///
-    /// The session is checked too because a host from before the `get_local_summary` fix raised
-    /// `video_streaming` from the GameStream plane only — through a whole session on the native
-    /// (default) plane it said false while still reporting that session's mode, which is what left
-    /// the tray sitting at "idle" mid-stream. This keeps a newer tray honest against such a host.
+    /// A live `session` counts even when `video_streaming` is false.
     pub fn is_streaming(&self) -> bool {
         matches!(self, TrayStatus::Running(s) if s.video_streaming || s.session.is_some())
     }
 
-    /// Virtual displays held with no live session (lingering/pinned) — offered as a one-click
-    /// release in the menu, since holding one can also be keeping physical monitors dark.
+    /// Lingering/pinned virtual displays (0 unless Running). Holding one can keep physical monitors dark.
     pub fn kept_displays(&self) -> u32 {
         match self {
             TrayStatus::Running(s) => s.kept_displays,
@@ -112,18 +101,16 @@ impl TrayStatus {
         }
     }
 
-    /// A pairing attempt is waiting on the operator (shown as an extra menu entry).
+    /// Pin or pending approval; the tray adds a menu entry.
     pub fn pairing_attention(&self) -> bool {
         matches!(self, TrayStatus::Running(s) if s.pin_pending || s.pending_approvals > 0)
     }
 }
 
-/// How long a running service may leave the summary unreachable before Starting turns Degraded.
-/// Also re-applied mid-life: the SYSTEM supervisor relaunching a crashed host child looks like
-/// "running, briefly unreachable" — that shows as Starting again, not an alarming flicker to red.
+/// Unreachable-summary window before Starting becomes Degraded. Re-armed while
+/// Running so a child restart shows Starting, not Degraded.
 pub const START_GRACE: Duration = Duration::from_secs(15);
 
-/// Pure status mapping (unit-tested): service-manager state first, summary second, grace third.
 pub fn map_status(svc: &ServiceState, summary: Option<Summary>, grace_expired: bool) -> TrayStatus {
     match svc {
         ServiceState::NotInstalled => TrayStatus::NotInstalled,
@@ -138,8 +125,6 @@ pub fn map_status(svc: &ServiceState, summary: Option<Summary>, grace_expired: b
     }
 }
 
-// ── Poller ──────────────────────────────────────────────────────────────────────────────────────
-
 pub struct Poller {
     shared: Arc<Shared>,
 }
@@ -150,12 +135,9 @@ struct Shared {
 }
 
 impl Poller {
-    /// Spawn the poll thread; `on_change(status, console_up)` fires (from that thread) whenever
-    /// either changes. `console_up` is a live loopback probe of the web console on `web_port`. It
-    /// annotates the "Open web console" entry ("not responding") rather than hiding it: the entry
-    /// is the tray's most-wanted action, and a menu that silently drops it — because the console
-    /// was still starting, or the probe timed out — is indistinguishable from a tray that never
-    /// had one.
+    /// `on_change(status, console_up)` from the poll thread. `console_up` is a
+    /// loopback probe of `web_port`; it annotates "Open web console" rather than
+    /// hiding the entry.
     pub fn spawn(
         mgmt_addr: String,
         mgmt_port: Option<u16>,
@@ -174,7 +156,7 @@ impl Poller {
         Poller { shared }
     }
 
-    /// Force an immediate re-poll (right after a start/stop/restart menu action).
+    /// Wake the poller after a start/stop/restart menu action.
     pub fn poke(&self) {
         *self.shared.poked.lock().unwrap() = true;
         self.shared.cv.notify_one();
@@ -188,51 +170,29 @@ fn poll_loop(
     web_port: u16,
     on_change: Box<dyn Fn(TrayStatus, bool) + Send>,
 ) {
-    // Resolved PER TICK, not once: with no `--mgmt-port` the port is whatever the host last
-    // published, and a host restarted on a moved `PUNKTFUNK_MGMT_BIND` must not leave the tray
-    // polling the old one until the next login. One tiny file read every 3 s is nothing.
+    // Per tick, not once: a captured port misses a republished
+    // `PUNKTFUNK_MGMT_BIND` after restart.
     let summary_url = || {
         let port = mgmt_port
             .or_else(pf_paths::published_mgmt_port)
             .unwrap_or(47990);
-        // IPv6 literals bracketed, like the Linux client's `base_url`.
+        // IPv6 literals must be bracketed.
         if mgmt_addr.contains(':') {
             format!("https://[{mgmt_addr}]:{port}/api/v1/local/summary")
         } else {
             format!("https://{mgmt_addr}:{port}/api/v1/local/summary")
         }
     };
-    // `/login`, not `/`: `/` is auth-gated and 302s to `/login`, and ureq follows redirects by
-    // default — so probing `/` spent TLS + `/` + a full cold `/login` SSR render inside one 2 s
-    // budget, and a console that was merely warming up read as down. `/login` is the cheapest page
-    // that proves the server is answering, and the agent below refuses redirects so the probe is
-    // exactly one round trip. (A 302 still counts as up via the `Status` arm in `probe_console`.)
+    // `/login`, not `/`: `/` 302s, and `max_redirects(0)` does not follow it.
     let console_url = format!("https://127.0.0.1:{web_port}/login");
-    // Named, not `agent`: shadowing the fn (as this did while there was only one agent) would make
-    // the second call below resolve to this binding instead.
+    // Not `agent`: that name shadows the fn and the next call would bind this value.
     let mgmt_agent = agent(load_pin());
-    // The console probe gets its OWN, UNPINNED agent. It is a different server from the mgmt API
-    // and there is no rule that it presents the same certificate: it served the legacy `cert.pem`
-    // while mgmt served the native one (the identity split), so the pinned agent refused the
-    // handshake and every identity-split host showed "Open web console (not responding)" over a
-    // perfectly healthy console — next to a tooltip reading "idle", because the same agent reached
-    // mgmt fine (field report 2026-08-24). An operator fronting the console with their own LAN-CA
-    // cert would have hit it just as squarely, so the coupling goes rather than the symptom.
-    //
-    // Nothing is lost by dropping the pin: this probe sends no credentials, reads no body, and
-    // decides only presentation — the menu entry's label, plus whether a tray-icon click opens
-    // the console or the menu (win.rs). A port-squatter could flip that, but the entry itself is
-    // unconditional and opens the same URL either way, and no browser ever pinned this cert. On
-    // Windows the probe was never pinned to begin with: `punktfunk_config_dir` returns None there,
-    // so `load_pin` was already None.
+    // Unpinned: the console is a different server and may present a different cert.
     let console_agent = agent(None);
     let mut last: Option<(TrayStatus, bool)> = None;
-    // When the summary became unreachable while the service was running (grace anchor).
-    // Runs for the process lifetime (the tray exits by process exit; nothing to unwind).
+    // Grace timer for an unreachable summary while Running.
     let mut unreachable_since: Option<Instant> = None;
-    // Consecutive failed console probes. One miss is not "down": the console is a bun/Nitro SSR
-    // whose cold first render can outrun this agent's 2 s timeout, and a menu entry that changes
-    // its label every few seconds reads as broken.
+    // One miss is not down: a cold SSR can outrun the 2 s timeout.
     let mut console_misses = 0u32;
     loop {
         let svc = probe_service();
@@ -261,7 +221,6 @@ fn poll_loop(
             on_change(status.clone(), console_up);
             last = Some((status, console_up));
         }
-        // 3 s while there is anything to watch; back off when the box just doesn't run a host.
         let cadence = match last.as_ref().map(|(s, _)| s) {
             Some(TrayStatus::Stopped) | Some(TrayStatus::NotInstalled) => Duration::from_secs(10),
             _ => Duration::from_secs(3),
@@ -274,8 +233,7 @@ fn poll_loop(
     }
 }
 
-/// Is the web console answering on loopback? Any HTTP response (incl. the login redirect / 401)
-/// counts as up — only a transport failure (nothing listening, TLS handshake dead) means down.
+/// Any HTTP status (302, 401 included) is up; only a transport failure is down.
 fn probe_console(agent: &ureq::Agent, url: &str) -> bool {
     match agent.get(url).call() {
         Ok(_) => true,
@@ -283,8 +241,6 @@ fn probe_console(agent: &ureq::Agent, url: &str) -> bool {
         Err(_) => false,
     }
 }
-
-// ── Summary fetch (loopback HTTPS) ──────────────────────────────────────────────────────────────
 
 fn fetch_summary(agent: &ureq::Agent, url: &str) -> Option<Summary> {
     let body = agent
@@ -297,17 +253,12 @@ fn fetch_summary(agent: &ureq::Agent, url: &str) -> Option<Summary> {
     serde_json::from_str(&body).ok()
 }
 
-/// The host identity cert's SHA-256, when `cert.pem` is readable (Linux: same-user file). On
-/// Windows the file is SYSTEM/Administrators-DACL'd, so the per-user tray can't pin — `None` =
-/// accept any cert. That is acceptable here: the connection is loopback, carries no credentials,
-/// and only *reads* non-sensitive data; stopped-vs-running is decided by the service manager, so
-/// a port-squatter gains nothing but a fake "streaming" tooltip on an already-compromised box.
+/// SHA-256 of the host identity cert when readable (Linux, same-user file).
+/// Windows: `None` — the cert file is SYSTEM/Administrators-DACL'd.
 fn load_pin() -> Option<[u8; 32]> {
     use rustls::pki_types::pem::PemObject;
     let dir = punktfunk_config_dir()?;
-    // The mgmt API presents the NATIVE identity when one exists (the identity split —
-    // host `crate::identity`); `cert.pem` is the legacy/GameStream identity, still what mgmt
-    // serves on hosts that predate the split. Prefer the native cert, fall back to legacy.
+    // Prefer `native-cert.pem`; `cert.pem` is the GameStream identity still served when native is absent.
     let pem = std::fs::read(dir.join("native-cert.pem"))
         .or_else(|_| std::fs::read(dir.join("cert.pem")))
         .ok()?;
@@ -315,9 +266,8 @@ fn load_pin() -> Option<[u8; 32]> {
     Some(punktfunk_core::tls::cert_fingerprint(der.as_ref()))
 }
 
-/// The host's config dir, mirroring `gamestream::config_dir()` without linking the host crate:
-/// `PUNKTFUNK_CONFIG_DIR` override, else `$XDG_CONFIG_HOME`/`~/.config` + `punktfunk` (Linux).
-/// `None` on Windows — everything the tray would read there is SYSTEM/Admins-DACL'd anyway.
+/// Host config dir, mirroring `gamestream::config_dir()` without linking the
+/// host crate. `None` on Windows: those files are SYSTEM/Admins-DACL'd.
 pub fn punktfunk_config_dir() -> Option<std::path::PathBuf> {
     if let Some(d) = std::env::var_os("PUNKTFUNK_CONFIG_DIR") {
         if !d.is_empty() {
@@ -341,8 +291,7 @@ pub fn punktfunk_config_dir() -> Option<std::path::PathBuf> {
     None
 }
 
-/// A sync HTTPS agent over the same rustls(aws-lc-rs) stack the rest of the workspace uses, with a
-/// pin-or-accept-any verifier (the Linux client's `PinVerify` pattern, `library.rs`).
+/// Sync HTTPS agent: rustls(aws-lc-rs) + `PinVerify` (Linux client `library.rs`).
 fn agent(pin: Option<[u8; 32]>) -> ureq::Agent {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let cfg = rustls::ClientConfig::builder_with_provider(provider)
@@ -351,24 +300,19 @@ fn agent(pin: Option<[u8; 32]>) -> ureq::Agent {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(punktfunk_core::tls::PinVerify::new(pin)))
         .with_no_client_auth();
-    // ureq's `TlsConfig` cannot install a custom verifier, so the agent wraps this `ClientConfig`
-    // directly (the glue lives in punktfunk-core, shared with the desktop client's library fetch).
+    // ureq `TlsConfig` cannot install a custom verifier; wrap `ClientConfig` via punktfunk-core.
     punktfunk_core::tls::ureq_agent::agent(
         Arc::new(cfg),
         ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(2)))
             .timeout_global(Some(Duration::from_secs(2)))
-            // No redirect-following. Neither user of this agent wants it: the summary is a
-            // terminal JSON route, and the console probe treats any HTTP answer (302 included) as
-            // "up", so chasing the hop only spends the 2 s budget re-rendering a page nobody reads.
+            // No redirects: the summary is a terminal JSON route; the console probe treats any HTTP answer as up.
             .max_redirects(0)
             .build(),
     )
 }
 
-// ── Service-manager probe ───────────────────────────────────────────────────────────────────────
-
-/// The SCM name registered by `punktfunk-host service install` (windows/service.rs SERVICE_NAME).
+/// SCM name written by `punktfunk-host service install` (`windows/service.rs`).
 #[cfg(windows)]
 pub const SERVICE_NAME: &str = "PunktfunkHost";
 
@@ -376,14 +320,13 @@ pub const SERVICE_NAME: &str = "PunktfunkHost";
 pub fn probe_service() -> ServiceState {
     use windows_service::service::{ServiceAccess, ServiceExitCode, ServiceState as Scm};
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
-    // CONNECT + QUERY_STATUS work unprivileged. Re-opened every poll on purpose: a reinstall
-    // (delete + create) invalidates old handles, and this picks the new service up within a poll.
+    // CONNECT + QUERY_STATUS are unprivileged. Re-open every poll: a reinstall invalidates old handles.
     let Ok(manager) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
     else {
         return ServiceState::NotInstalled;
     };
     let Ok(svc) = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) else {
-        return ServiceState::NotInstalled; // ERROR_SERVICE_DOES_NOT_EXIST et al.
+        return ServiceState::NotInstalled; // ERROR_SERVICE_DOES_NOT_EXIST and other open failures.
     };
     let Ok(status) = svc.query_status() else {
         return ServiceState::NotInstalled;
@@ -395,8 +338,7 @@ pub fn probe_service() -> ServiceState {
             ServiceState::Running
         }
         Scm::Stopped => match status.exit_code {
-            // 0 = clean; 1077 = never started since boot (ERROR_SERVICE_NEVER_HAS_BEEN_RUN? no —
-            // "no attempts to start have been made"): both are an ordinary Stopped, not a failure.
+            // 0 = clean stop; 1077 = never started since boot. Both are Stopped, not Failed.
             ServiceExitCode::Win32(0) | ServiceExitCode::Win32(1077) => ServiceState::Stopped,
             ServiceExitCode::Win32(code) => ServiceState::Failed(format!("exit code {code}")),
             ServiceExitCode::ServiceSpecific(code) => {
@@ -406,14 +348,13 @@ pub fn probe_service() -> ServiceState {
     }
 }
 
-/// The systemd user unit the Linux packages install (scripts/punktfunk-host.service).
+/// Systemd user unit installed by the Linux packages (`scripts/punktfunk-host.service`).
 #[cfg(target_os = "linux")]
 pub const UNIT_NAME: &str = "punktfunk-host.service";
 
 #[cfg(target_os = "linux")]
 pub fn probe_service() -> ServiceState {
-    // `systemctl show` exits 0 even for unknown units (LoadState=not-found) — parse, don't rely
-    // on the exit code.
+    // `systemctl show` exits 0 for unknown units (`LoadState=not-found`); parse, do not use the exit code.
     let Ok(out) = std::process::Command::new("systemctl")
         .args([
             "--user",
@@ -467,7 +408,6 @@ mod tests {
         }
     }
 
-    /// The full (service state × summary × grace) table.
     #[test]
     fn status_mapping_table() {
         use ServiceState as S;
@@ -483,18 +423,15 @@ mod tests {
                 false,
                 T::Error("code 3".into()),
             ),
-            // Running + summary → Running regardless of grace.
             (
                 S::Running,
                 Some(summary(false)),
                 true,
                 T::Running(summary(false)),
             ),
-            // Running + unreachable: Starting within grace, Degraded past it.
             (S::Running, None, false, T::Starting),
             (S::Running, None, true, T::Degraded),
-            // A summary while the SCM says Stopped is impossible by construction (the poller only
-            // fetches when Running) — but the mapping must still trust the service manager.
+            // Stopped + a summary cannot happen in the poller; the mapping still trusts the service manager.
             (S::Stopped, Some(summary(true)), false, T::Stopped),
         ];
         for (svc, sum, grace, want) in cases {
@@ -506,10 +443,7 @@ mod tests {
         }
     }
 
-    /// Conflicting-host detection is deliberately NOT a tray concern: "installed" is not
-    /// "running", and an always-on ⚠ over a merely-present Sunshine cried wolf. The host still
-    /// detects and reports it (startup log, `detect-conflicts`, the mgmt summary) — the tray just
-    /// ignores that field, which it must keep tolerating on the wire.
+    /// `conflicts` is host-side; the tray ignores it and must still deserialize.
     #[test]
     fn a_summary_carrying_conflicts_still_deserializes_and_is_ignored() {
         let json = r#"{"version":"0.5.1","video_streaming":false,"audio_streaming":false,
@@ -540,20 +474,17 @@ mod tests {
             .contains("status unavailable"));
     }
 
-    /// A live session means streaming even if the host's flag says otherwise — a host from before
-    /// the `get_local_summary` fix only raised `video_streaming` for the GameStream plane, so a
-    /// native session showed as "idle" with its own mode printed next to it.
+    /// A live session is streaming even when `video_streaming` is false.
     #[test]
     fn a_live_session_reads_as_streaming_without_the_flag() {
         let mut s = summary(true);
-        s.video_streaming = false; // pre-fix host, native session
+        s.video_streaming = false;
         let st = TrayStatus::Running(s);
         assert!(st.is_streaming());
         assert_eq!(
             st.headline(),
             "punktfunk host 0.5.1 — streaming 2560×1440@120"
         );
-        // No session and no flag is still idle.
         assert!(!TrayStatus::Running(summary(false)).is_streaming());
     }
 

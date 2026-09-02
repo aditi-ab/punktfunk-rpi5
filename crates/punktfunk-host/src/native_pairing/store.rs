@@ -1,14 +1,18 @@
-//! The persistent native-pairing trust store: `~/.config/punktfunk/punktfunk1-paired.json`
-//! (plan §W5 — carved out of the [`super`] facade). Owns the paired-clients [`Mutex`] and the
-//! atomic-replace persistence; the pending-approval side of a pairing lives in [`super::approval`].
+//! Persistent paired-client store: `punktfunk1-paired.json` under the config dir.
+//!
+//! Owns the paired-clients [`Mutex`] and atomic-replace persistence. GameStream
+//! pairing is a separate store. Pending knocks live in [`super::approval`].
+//! Persist failures roll back in-memory state so RAM never diverges from disk.
+//!
+//! Pin this via [`TrustStore`]. Grant masks are stored as written; readers AND
+//! with [`GRANT_ALL`]. Expiry is host wall clock, re-evaluated at each check.
 
 use anyhow::Result;
 use punktfunk_core::quic::GRANT_ALL;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// The host's paired punktfunk/1 clients: `~/.config/punktfunk/punktfunk1-paired.json`.
-/// (Separate from GameStream pairing, which has its own store and ceremony.)
+/// Paired punktfunk/1 clients. GameStream pairing uses a different store.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct PairedClients {
     pub clients: Vec<PairedClient>,
@@ -19,32 +23,27 @@ pub struct PairedClient {
     pub name: String,
     /// Hex SHA-256 of the client's certificate.
     pub fingerprint: String,
-    /// Grant bitmask (`punktfunk_core::quic::GRANT_*`). `None` (absent in stores from before
-    /// grants existed) = full control — existing pairings keep today's behavior. Stored as
-    /// written; readers mask with [`GRANT_ALL`] so a store edited by a *future* host version
-    /// can't smuggle reserved bits into this one's enforcement.
+    /// `GRANT_*` mask. `None` (pre-grants stores) is full control. Readers AND with
+    /// [`GRANT_ALL`] so reserved bits from a newer writer cannot take effect here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grants: Option<u32>,
-    /// Absolute expiry, host wall clock, unix seconds. `None` = permanent. Deliberately wall
-    /// clock (design §4): the user's mental model is "until tonight", so an NTP step moves the
-    /// deadline with the clock; evaluate at each check, never against a cached monotonic offset.
+    /// Host wall-clock unix seconds. `None` is permanent. Re-evaluate at each check;
+    /// do not cache against a monotonic offset — an NTP step must move the deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_unix: Option<i64>,
-    /// When the access was granted (unix seconds) — display/audit only, never enforced.
+    /// Grant time, unix seconds. Display/audit only; never enforced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_unix: Option<i64>,
 }
 
-/// An operator's access choice for a device: what it may do, and for how long. The payload of
-/// the authorized-widening paths (arm dialog / approve dialog / console edit — design §5.7);
-/// everywhere it is `Option<Access>`, `None` means "no explicit choice" — new records get the
-/// full/permanent default and existing records keep what they have.
+/// Operator access choice. `Option<Access>::None` means no choice: new records get
+/// full/permanent, existing records keep their grants and expiry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Access {
-    /// Grant bitmask (`punktfunk_core::quic::GRANT_*` bits). Reserved bits are the management
-    /// API's job to reject (400, never silently cleared); the store masks them on *read*.
+    /// `GRANT_*` bits. The store masks reserved bits on read; the management API
+    /// must 400 them — never silently clear.
     pub grants: u32,
-    /// Absolute expiry, host wall clock, unix seconds. `None` = permanent.
+    /// Host wall-clock unix seconds. `None` is permanent.
     pub expires_unix: Option<i64>,
 }
 
@@ -62,13 +61,11 @@ struct PairedState {
 }
 
 fn default_path() -> Result<PathBuf> {
-    // `config_dir()` resolves XDG/HOME on Linux and falls back to %APPDATA% on Windows — so the
-    // native paired-store works without a HOME env var (which a Windows service/task doesn't set).
+    // `config_dir()` falls back to %APPDATA% when HOME is unset (Windows service).
     Ok(pf_paths::config_dir().join("punktfunk1-paired.json"))
 }
 
-/// Host wall clock, unix seconds — the clock every grant/expiry field is expressed in
-/// (design §4: wall time on purpose; the host clock is operator-owned).
+/// Host wall-clock unix seconds. Grant and expiry fields use this clock.
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -87,23 +84,19 @@ fn save(state: &PairedState) -> Result<()> {
     if let Some(dir) = state.path.parent() {
         pf_paths::create_private_dir(dir)?;
     }
-    // Atomic replace: a crash/full-disk mid-write must not truncate the trust store (which would
-    // silently lock out every paired client on a --require-pairing host). Temp + rename. The temp is
-    // written owner-only so a local user can't inject a fingerprint to pair themselves.
+    // Temp + rename so a crash mid-write cannot truncate the store. Owner-only so a
+    // local user cannot inject a fingerprint.
     let tmp = state.path.with_extension("json.tmp");
     pf_paths::write_secret_file(&tmp, &serde_json::to_vec_pretty(&state.clients)?)?;
     std::fs::rename(&tmp, &state.path)?;
     Ok(())
 }
 
-/// The persistent trust store — the paired-clients set behind a [`Mutex`], backed by an
-/// atomic-replace JSON file.
 pub(super) struct TrustStore {
     paired: Mutex<PairedState>,
 }
 
 impl TrustStore {
-    /// Open (load) the trust store. `store_path = None` uses the default config path.
     pub(super) fn open(store_path: Option<PathBuf>) -> Result<TrustStore> {
         let path = match store_path {
             Some(p) => p,
@@ -115,21 +108,15 @@ impl TrustStore {
         })
     }
 
-    /// Is this client (hex SHA-256 fingerprint) in the paired set? **Expiry-blind**: an expired
-    /// record still answers `true` (it is *listed*, just not authorized) — see
-    /// [`Self::effective`] for the authorization question.
+    /// Present in the store, including expired records. Use [`Self::effective`] for authorization.
     pub(super) fn is_paired(&self, fp_hex: &str) -> bool {
         self.paired.lock().unwrap().clients.contains(fp_hex)
     }
 
-    /// The grant mask this fingerprint is authorized for *right now* — `None` when unpaired OR
-    /// expired, `Some(mask)` otherwise (absent grants = [`GRANT_ALL`], the pre-grants record).
-    /// The mask is ANDed with [`GRANT_ALL`] on the way out: a store written by a future host
-    /// version (or hand-edited) can't smuggle reserved bits into this version's enforcement.
-    /// An explicitly stored pre-power "Full control" (exactly the old `GRANT_ALL`) reads as the
-    /// current one — the legacy-full rule, `normalize_legacy_full` (host-actions §4.3).
-    /// `now_unix` is the caller's wall clock — passed in, not sampled here, so the expiry
-    /// evaluation and whatever decision it feeds share one instant.
+    /// Authorized mask right now: `None` if unpaired or expired. Absent grants are
+    /// [`GRANT_ALL`]. AND with [`GRANT_ALL`] on the way out; `normalize_legacy_full`
+    /// maps the old full-control value. `now_unix` is the caller's clock so expiry
+    /// and the decision it feeds share one instant.
     pub(super) fn effective(&self, fp_hex: &str, now_unix: i64) -> Option<u32> {
         let p = self.paired.lock().unwrap();
         let c = p
@@ -143,8 +130,7 @@ impl TrustStore {
         Some(punktfunk_core::quic::normalize_legacy_full(c.grants.unwrap_or(GRANT_ALL)) & GRANT_ALL)
     }
 
-    /// The stored record for a fingerprint (for the facade's watch-state snapshot and the
-    /// approval path's honest return value). Verbatim — no expiry evaluation, no masking.
+    /// Stored record, verbatim: no expiry check and no grant mask.
     pub(super) fn get(&self, fp_hex: &str) -> Option<PairedClient> {
         self.paired
             .lock()
@@ -156,26 +142,16 @@ impl TrustStore {
             .cloned()
     }
 
-    /// Record a successful pairing with no explicit access choice. For a **new** fingerprint this
-    /// mints the legacy full/permanent record (all access fields absent — byte-identical to a
-    /// pre-grants store). For an **existing** fingerprint it is name-only: grants, expiry, and
-    /// granted-time are preserved. That asymmetry is the security property (design §5.7): today a
-    /// guest limited to Controller · 4 h could re-run the pairing ceremony and this method used to
-    /// *replace* the record — silently escalating to full control. The only paths that widen
-    /// access take an explicit [`Access`] via [`Self::add_with_access`] / [`Self::set_access`],
-    /// and all of them sit behind the operator (mgmt bearer / armed window).
+    /// Pair with no access choice. A new fingerprint gets full/permanent; an existing
+    /// one updates the name only. Widening grants requires [`Self::add_with_access`]
+    /// or [`Self::set_access`].
     pub(super) fn add(&self, name: &str, fp_hex: &str) -> Result<()> {
         self.add_with_access(name, fp_hex, None)
     }
 
-    /// Record a successful pairing, optionally with the operator's access choice. `Some(access)`
-    /// (the arm/approve dialogs) sets grants + expiry and stamps `granted_unix` — on a re-pair it
-    /// *replaces* the previous access, because the operator just chose anew. `None` behaves like
-    /// [`Self::add`] (name-only for an existing fingerprint; full/permanent default for a new
-    /// one). The fingerprint match is case-insensitive, like every other comparison here; the
-    /// name is sanitized (untrusted). On a persist failure the in-memory store is rolled back so
-    /// it never diverges from disk. (Clearing any pending knock for this fingerprint is the
-    /// caller's job — see [`super::approval::ApprovalQueue::admit_and_clear`].)
+    /// Pair, optionally with [`Access`]. `Some` replaces grants and expiry; `None`
+    /// matches [`Self::add`]. Persist failure rolls back RAM. The caller clears any
+    /// pending knock ([`super::approval::ApprovalQueue::admit_and_clear`]).
     pub(super) fn add_with_access(
         &self,
         name: &str,
@@ -184,7 +160,7 @@ impl TrustStore {
     ) -> Result<()> {
         let name = super::sanitize_device_name(name, fp_hex);
         let mut p = self.paired.lock().unwrap();
-        let snapshot = p.clients.clients.clone(); // restore on a failed save
+        let snapshot = p.clients.clients.clone(); // rollback if save fails
         match p
             .clients
             .clients
@@ -214,9 +190,8 @@ impl TrustStore {
         Ok(())
     }
 
-    /// Overwrite an existing record's access (the console edit sheet / "expire now" / extend).
-    /// Returns `false` (and writes nothing) for an unknown fingerprint — editing access is not a
-    /// way to pair a device. On a persist failure the in-memory store is rolled back.
+    /// Overwrite access on an existing record. Unknown fingerprint returns `false`
+    /// and writes nothing — this is not a pairing path. Persist failure rolls back RAM.
     pub(super) fn set_access(&self, fp_hex: &str, access: Access) -> Result<bool> {
         let mut p = self.paired.lock().unwrap();
         let snapshot = p.clients.clients.clone();
@@ -238,13 +213,11 @@ impl TrustStore {
         Ok(true)
     }
 
-    /// The paired clients (for the management API's device list).
     pub(super) fn list(&self) -> Vec<PairedClient> {
         self.paired.lock().unwrap().clients.clients.clone()
     }
 
-    /// Remove a paired client by fingerprint. Returns whether one was removed. On a persist
-    /// failure the in-memory store is rolled back (it never diverges from disk).
+    /// Drop this fingerprint. Persist failure rolls back RAM so it matches disk.
     pub(super) fn remove(&self, fp_hex: &str) -> Result<bool> {
         let mut p = self.paired.lock().unwrap();
         let before = p.clients.clients.len();
@@ -262,20 +235,15 @@ impl TrustStore {
         Ok(removed)
     }
 
-    /// Remove EVERY paired client, in ONE persisted write. Returns the fingerprints removed, so
-    /// the caller can tear down the live sessions they own. On a persist failure the in-memory
-    /// store is rolled back (it never diverges from disk), exactly like [`Self::remove`].
-    ///
-    /// Not a loop over [`Self::remove`]: that would rewrite (and fsync-rename) the store once per
-    /// client, and a failure partway would leave the operator with a half-emptied trust store and
-    /// no way to tell which half.
+    /// Drop every client in one persist. Returns the removed fingerprints so live
+    /// sessions can be torn down. Not a loop over [`Self::remove`]: a mid-loop
+    /// failure would leave a half-emptied store. Persist failure rolls back RAM.
     pub(super) fn remove_all(&self) -> Result<Vec<String>> {
         let mut p = self.paired.lock().unwrap();
         if p.clients.clients.is_empty() {
             return Ok(Vec::new());
         }
-        // `take` leaves the empty list in place to be persisted, and hands us the snapshot that
-        // doubles as both the rollback value and the removed-fingerprint report.
+        // Empty list is what we persist; the taken vec is rollback and the return value.
         let snapshot = std::mem::take(&mut p.clients.clients);
         if let Err(e) = save(&p) {
             p.clients.clients = snapshot;
@@ -284,7 +252,6 @@ impl TrustStore {
         Ok(snapshot.into_iter().map(|c| c.fingerprint).collect())
     }
 
-    /// The number of paired clients (for the status snapshot).
     pub(super) fn count(&self) -> u32 {
         self.paired.lock().unwrap().clients.clients.len() as u32
     }

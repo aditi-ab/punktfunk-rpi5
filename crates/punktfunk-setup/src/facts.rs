@@ -1,15 +1,11 @@
 //! A read-only probe of the box: everything later stages are allowed to know about it.
 //!
-//! Stage one of `Facts → Choices → Plan → Execute` (`design/installer-v2.md` D3). Every probe
-//! here is ported from `scripts/install.sh`, which stays the behavioural spec until WP4.3;
-//! §4 of the design lists the ones that cost a field failure, and each has a named test.
+//! Stage one of `Facts → Choices → Plan → Execute`. All I/O goes through
+//! `seam::BasePaths` and `seam::CommandRunner`; nothing here takes a unix-only type,
+//! so `--demo` and the tests stay honest on a Mac. See `design/installer-v2.md`.
 //!
-//! Nothing in this file may take a unix-only type — it is half of the Windows-port seam, and
-//! it has to run on a Mac for `--demo` to be honest. All I/O goes through `seam::BasePaths`
-//! and `seam::CommandRunner`, so a test builds a whole distro in a tempdir.
-//!
-//! Detection punts (NixOS, SteamOS, an unknown distro) are `Punt`; the version floors are
-//! `Floor` data instead, because `--uninstall` must keep working on a box below them.
+//! Detection punts (NixOS, SteamOS, an unknown distro) are `Punt`. Version floors are
+//! `Floor` data, because `--uninstall` must keep working on a box below them.
 
 use serde::{Deserialize, Serialize};
 
@@ -17,13 +13,12 @@ use crate::seam::{BasePaths, CommandRunner, Env};
 
 pub const DOCS: &str = "https://docs.punktfunk.unom.io/docs";
 
-/// The flatpak the client ships as, where a family has no native package for it.
+/// User-scope client id when the family has no native package.
 pub const FLATPAK_APP: &str = "io.unom.Punktfunk";
 
-/// The three binaries the installer asks about separately.
-///
-/// "Is the host there?" is the wrong question: a box with the host but no console never grows
-/// one, however often the installer runs (`design/installer-v2.md` §4).
+/// The three binaries the installer asks about separately. "Is the host there?" is the
+/// wrong question: a box with the host but no console never grows one, however often
+/// the installer runs.
 pub const BINARIES: [(&str, &str); 3] = [
     ("punktfunk-host", "host"),
     ("punktfunk-web-server", "web-console"),
@@ -38,7 +33,7 @@ pub enum Family {
     Pacman,
     Sysext,
     /// No host repo here. The client still installs, user-scope, from the flatpak line —
-    /// which is why an unknown distro is a family rather than a dead end (§5).
+    /// which is why an unknown distro is a family rather than a dead end.
     Flatpak,
 }
 
@@ -53,8 +48,7 @@ impl Family {
         }
     }
 
-    /// Whether this family carries `punktfunk-client` in the same repo as the host. Where it
-    /// does not, the client arrives as a user-scope flatpak instead.
+    /// Native `punktfunk-client` in the host repo; otherwise the client is a user-scope flatpak.
     pub fn has_native_client(self) -> bool {
         matches!(self, Family::Apt | Family::Dnf | Family::Pacman)
     }
@@ -96,8 +90,8 @@ pub enum Firewall {
     None,
 }
 
-/// What the NVIDIA half of the verify pass found. The install succeeds in every state here;
-/// the middle two mean nothing will encode until the user acts.
+/// NVIDIA half of the verify pass. The install succeeds in every state; `NoDriver` and
+/// `ModuleNotLoaded` mean nothing will encode until the user acts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Nvidia {
@@ -107,7 +101,7 @@ pub enum Nvidia {
     Ok,
 }
 
-/// A distro this installer will not act on. Carries the sh script's die text verbatim.
+/// A distro this installer will not act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Punt {
     NotLinux,
@@ -139,13 +133,13 @@ impl Punt {
     }
 }
 
-/// A version floor the package itself cannot express. Checked only before an install — the sh
-/// script reaches `--uninstall` first, so a box below the floor can still be cleaned up.
+/// A version floor the package itself cannot express. Checked only before an install, so a
+/// box below the floor can still be uninstalled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Floor {
     /// Fatal: below the glibc floor, or a Fedora with no RPM group.
     Die(String),
-    /// Warn, then ask "Continue anyway?" with default **no** — so `--yes` aborts.
+    /// Warn, then ask "Continue anyway?" with default no — so `--yes` aborts.
     Confirm(String),
 }
 
@@ -190,12 +184,11 @@ impl OsRelease {
         os
     }
 
-    /// The sh script's `like()`: is `needle` the ID or one of the ID_LIKE words?
     pub fn like(&self, needle: &str) -> bool {
         self.id == needle || self.id_like.split_whitespace().any(|w| w == needle)
     }
 
-    /// `VERSION_ID` before the first dot, as a number. 0 when it is not one.
+    /// `VERSION_ID` before the first dot, as a number. `0` when it is not one.
     pub fn major(&self) -> u32 {
         self.version_id
             .split('.')
@@ -211,15 +204,15 @@ impl OsRelease {
 pub struct Facts {
     pub os: OsRelease,
     pub family: Family,
-    /// Omarchy is a pacman *flavour*, not a family: same repo, same packages, different
-    /// transaction shape and a hand-off afterwards (`design/installer-v2.md` §4).
+    /// Omarchy is a pacman flavour, not a family: same repo, same packages, different
+    /// transaction shape and a hand-off afterwards.
     pub omarchy: bool,
     pub docs_page: String,
-    /// Why a **host** install cannot happen here. A client install ignores it.
+    /// Why a host install cannot happen here. A client install ignores it.
     pub host_punt: Option<String>,
     pub rpm_group: Option<String>,
     pub floor: Option<Floor>,
-    /// The flatpak client is already on the box, so uninstall has a leg to sweep.
+    /// Flatpak client already on the box; uninstall has a leg to sweep.
     pub has_flatpak_client: bool,
     pub couch_box: bool,
     pub graphical_seat: bool,
@@ -317,7 +310,6 @@ impl Facts {
         })
     }
 
-    /// Is every one of the three binaries already on the box?
     pub fn fully_installed(&self) -> bool {
         self.missing.is_empty()
     }
@@ -379,7 +371,7 @@ fn detect_family(os: &OsRelease, run: &dyn CommandRunner) -> Result<Detected, Pu
     ))
 }
 
-/// Version floors the package cannot express, plus the Fedora RPM group they share a check with.
+/// Fedora RPM group lives here because it shares the version-floor check.
 pub fn floors(os: &OsRelease, family: Family) -> (Option<String>, Option<Floor>) {
     let floor = match os.id.as_str() {
         "debian" if os.major() < 13 => Some(Floor::Die(format!(
@@ -401,7 +393,7 @@ pub fn floors(os: &OsRelease, family: Family) -> (Option<String>, Option<Floor>)
     }
     match os.major() {
         44 => (Some("fedora-44".into()), floor),
-        // A plain Fedora 43 build of the same package.
+        // Fedora 43 ships the same RPM as Bazzite, so the group name is `bazzite`.
         43 => (Some("bazzite".into()), floor),
         _ => (
             None,
@@ -419,10 +411,9 @@ fn graphical_seat(env: &Env) -> bool {
         || matches!(env.get("XDG_SESSION_TYPE"), Some("x11" | "wayland"))
 }
 
-/// The same split as `punktfunk-host detect-conflicts`: exit 1 is the only "yes".
-///
-/// Any other code is a host too old to know the subcommand, a half-install or a crash — fall
-/// through to the unit probe rather than opening the plain-HTTP GameStream surface on a guess.
+/// Same split as `punktfunk-host detect-conflicts`: exit 1 is the only "yes". Any other
+/// code is a host too old to know the subcommand, a half-install, or a crash — fall
+/// through to the unit probe rather than opening the GameStream surface on a guess.
 fn sunshine_active(run: &dyn CommandRunner) -> bool {
     if run.which("punktfunk-host")
         && let Some(out) = run.probe("punktfunk-host", &["detect-conflicts"])
@@ -469,8 +460,8 @@ fn nvidia(paths: &BasePaths, run: &dyn CommandRunner) -> Nvidia {
     }
 }
 
-/// Packages never open ports; they install firewalld services / ufw profiles by name. Only an
-/// *active* firewall is worth writing rules into.
+/// Packages never open ports; they install firewalld services / ufw profiles by name. Only
+/// an active firewall is worth writing rules into.
 fn firewall(paths: &BasePaths, run: &dyn CommandRunner) -> Firewall {
     if run.which("firewall-cmd")
         && run
@@ -543,7 +534,7 @@ mod tests {
         assert_eq!(page, "arch");
     }
 
-    // rpm-ostree and bootc are checked BEFORE the fedora test, or Bazzite lands on dnf.
+    // rpm-ostree and bootc are checked before the fedora test, or Bazzite lands on dnf.
     #[test]
     fn an_ostree_box_is_sysext_even_though_it_looks_like_fedora() {
         let r = FakeRunner::new().with_path("rpm-ostree");
@@ -570,8 +561,8 @@ mod tests {
         );
     }
 
-    // The docs promise Game Mode / HTPC images only. rpm-ostree, bootc and ujust are NOT tells:
-    // Silverblue and Bluefin ship all three and are workstations.
+    // Game Mode / HTPC images only. rpm-ostree, bootc, and ujust are not tells: Silverblue
+    // and Bluefin ship all three and are workstations.
     #[test]
     fn couch_box_is_bazzite_and_nobara_only() {
         assert!(os("bazzite", "fedora", "43").like("bazzite"));
@@ -614,8 +605,7 @@ mod tests {
         assert!(!sunshine_active(&no));
     }
 
-    // A host too old to know the subcommand exits 127/2 — that is not an answer, so the unit
-    // probe decides instead of opening the GameStream surface on a guess.
+    // A host too old to know the subcommand exits 127/2 — that is not an answer. The unit probe decides.
     #[test]
     fn an_unknown_detect_conflicts_code_falls_through_to_the_unit_probe() {
         let old = FakeRunner::new()

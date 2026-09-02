@@ -1,23 +1,19 @@
-//! Consumer-side implicit-fence wait for dmabuf capture (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`).
+//! Consumer wait on a dmabuf's implicit fence (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`).
 //!
-//! Mutter renders its virtual monitor DIRECTLY into the PipeWire dmabuf and hands the buffer over
-//! at GPU-submit time. With no fencing the consumer can sample mid-render and encode the buffer's
-//! *previous* contents — the "stale/old frame" flashing on NVIDIA (KWin/gamescope blit into the
-//! buffer so they don't hit this). The producer-driven fix is PipeWire explicit sync, but
-//! Mutter+NVIDIA can't produce a sync_fd (`error alloc buffers` / no cogl sync_fd).
+//! The ioctl snapshots in-flight GPU writes on the reservation object into a
+//! sync_file fd; `poll` is readable once those writes complete. Sampling
+//! without that wait can encode the buffer's previous contents when the
+//! producer hands the buffer over at GPU-submit time.
 //!
-//! So sync from the *consumer* side instead: a dmabuf carries its in-flight GPU work as an implicit
-//! fence on its reservation object. `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` snapshots that into a sync_file
-//! fd we can `poll()` — readable once the producer's writes complete. This makes zero-copy capture
-//! race-free WITHOUT the producer doing anything, *iff* the driver actually attaches the fence. If it
-//! attaches none, the export yields an already-signaled sync_file (poll returns immediately) — no
-//! wait, no harm, and `WaitOutcome::NoFence` tells us the driver doesn't fence (so zero-copy
-//! would still race).
+//! No attached fence → already-signaled sync_file (`WaitOutcome::NoFence`);
+//! zero-copy can still race. Timeout is fail-open (`TimedOut`).
+//!
+//! Pin: `ioctl_number_matches_dma_buf_h`, `poll_readable_reports_the_truth`.
 
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
-// linux/dma-buf.h ioctls on the DMA_BUF_BASE ('b' = 0x62) magic. _IOWR = dir(3)<<30 | size<<16 | base<<8 | nr.
+// linux/dma-buf.h: DMA_BUF_BASE is 'b' (0x62). _IOWR = dir(3)<<30 | size<<16 | base<<8 | nr.
 const DMA_BUF_BASE: u64 = 0x62;
 const fn iowr(nr: u32, size: usize) -> u64 {
     (3u64 << 30) | ((size as u64) << 16) | (DMA_BUF_BASE << 8) | nr as u64
@@ -30,70 +26,59 @@ struct DmaBufExportSyncFile {
 }
 
 const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: u64 = iowr(2, std::mem::size_of::<DmaBufExportSyncFile>());
-/// We will READ the buffer → export the fence(s) we must wait for before reading (the producer's writes).
+/// Wait for outstanding writes. WRITE would also wait for readers we never attach.
 const DMA_BUF_SYNC_READ: u32 = 1 << 0;
 
-/// What the implicit-fence wait actually observed — the operator-facing diagnostic for "does
-/// implicit fencing work on this box" must not conflate these (a timeout or an interrupted wait
-/// proceeds with a possibly mid-render buffer; a signaled fence closed the race for real).
+/// Observed wait. `TimedOut` may be mid-render; `Signaled` waited out the write;
+/// `NoFence` means the driver attached nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WaitOutcome {
-    /// No sync_file / already signaled — the driver attaches no implicit fence (or the render
-    /// finished before we looked); zero-copy can still race.
+    /// Already signaled or no fence attached. Zero-copy can still race.
     NoFence,
-    /// A render was in flight and we waited until its fence signaled — the race was real, now closed.
     Signaled,
-    /// A render was in flight and `timeout_ms` elapsed first — we proceed (fail-open: blocking
-    /// longer would stall capture), possibly encoding a mid-render buffer.
+    /// Fail-open after `timeout_ms`. Blocking longer stalls capture; the buffer may be mid-render.
     TimedOut,
 }
 
-/// Wait until the producer's writes to `dmabuf_fd` complete (or `timeout_ms` elapses; negative =
-/// no timeout). `Err` means the ioctl or the poll itself failed (e.g. the kernel/driver lacks
-/// `EXPORT_SYNC_FILE`); see [`WaitOutcome`] for the success cases.
+/// Wait for producer writes on `dmabuf_fd`. Negative `timeout_ms` is infinite.
+/// `Err` if the ioctl or poll failed (kernel lacks `EXPORT_SYNC_FILE`).
 pub fn wait_read_ready(dmabuf_fd: RawFd, timeout_ms: i32) -> std::io::Result<WaitOutcome> {
     let mut req = DmaBufExportSyncFile {
         flags: DMA_BUF_SYNC_READ,
         fd: -1,
     };
-    // SAFETY: `dmabuf_fd` is a live dmabuf fd supplied by the caller (borrowed for this call; we
-    // never close it). `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` encodes `size_of::<DmaBufExportSyncFile>()`
-    // — the exact byte count the kernel copies — and `&mut req` is a live, correctly-sized
-    // `#[repr(C)]` struct the EXPORT_SYNC_FILE ioctl reads (`flags`) and writes (`fd`). `req`
-    // outlives this synchronous call and is not aliased elsewhere.
+    // SAFETY: `dmabuf_fd` is a live borrowed dmabuf; we never close it.
+    // The ioctl size is `size_of::<DmaBufExportSyncFile>()`. `&mut req` is a
+    // live `#[repr(C)]` value the kernel reads (`flags`) and writes (`fd`);
+    // it outlives this call and is not aliased.
     let r = unsafe { libc::ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &mut req) };
     if r < 0 {
         return Err(std::io::Error::last_os_error());
     }
     let sync_fd = req.fd;
     if sync_fd < 0 {
-        return Ok(WaitOutcome::NoFence); // no sync_file exported
+        return Ok(WaitOutcome::NoFence);
     }
     let outcome = poll_readable(sync_fd, timeout_ms);
-    // SAFETY: `sync_fd` is the sync_file fd the EXPORT_SYNC_FILE ioctl created and handed us to own;
-    // this point is reached only when `sync_fd >= 0`, this `close` runs exactly once on it, and it is
-    // never used afterward — no double-close or use-after-close.
+    // SAFETY: `sync_fd` is the ioctl-created sync_file we own (`sync_fd >= 0`).
+    // Closed exactly once here; not used after.
     unsafe { libc::close(sync_fd) };
     outcome
 }
 
-/// Poll `fd` for `POLLIN`: a non-blocking probe first (already-readable ⇒ [`WaitOutcome::NoFence`]
-/// — the fence was signaled before we looked), then a blocking wait up to `timeout_ms` (negative =
-/// no timeout). `EINTR` retries with the remaining budget instead of silently skipping the wait —
-/// the host spawns subprocesses, so a `SIGCHLD` mid-poll is a real occurrence, and skipping here
-/// would reopen the exact stale-frame race this file exists to close.
+/// Poll `fd` for `POLLIN`. Already readable at the probe is [`WaitOutcome::NoFence`].
+/// Negative `timeout_ms` is infinite. Retry `EINTR` with the remaining budget —
+/// skipping the wait would sample a still-in-flight buffer.
 fn poll_readable(fd: RawFd, timeout_ms: i32) -> std::io::Result<WaitOutcome> {
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
     };
-    // Non-blocking probe: not-yet-readable (poll == 0) means the producer is still rendering.
     let probed = loop {
-        // SAFETY: `&mut pfd` points at a single live `libc::pollfd` and `nfds == 1` matches that
-        // one element; `fd` is the caller's live sync_file fd. `poll` reads `fd`/`events` and
-        // writes `revents` for this non-blocking (timeout 0) probe, then returns — `pfd` outlives
-        // the call and aliases nothing.
+        // SAFETY: `pfd` is one live `pollfd`; `nfds == 1`. `fd` is the caller's
+        // live sync_file. `poll` reads `fd`/`events`, writes `revents`; `pfd`
+        // outlives this timeout-0 probe and is not aliased.
         let r = unsafe { libc::poll(&mut pfd, 1, 0) };
         if r >= 0 {
             break r;
@@ -105,7 +90,7 @@ fn poll_readable(fd: RawFd, timeout_ms: i32) -> std::io::Result<WaitOutcome> {
     };
     if probed > 0 {
         if pfd.revents & libc::POLLIN != 0 {
-            return Ok(WaitOutcome::NoFence); // signaled before we looked
+            return Ok(WaitOutcome::NoFence);
         }
         // POLLERR/POLLNVAL without POLLIN — the fd is broken, not signaled.
         return Err(std::io::Error::other(format!(
@@ -125,9 +110,8 @@ fn poll_readable(fd: RawFd, timeout_ms: i32) -> std::io::Result<WaitOutcome> {
             },
         };
         pfd.revents = 0;
-        // SAFETY: same live single-element `pfd` (its `revents` reset to 0 just above), `nfds == 1`,
-        // and `fd` still open (closed by the caller only after this function returns). This blocking
-        // `poll` (up to `remaining` ms) waits for the fence to signal; it reads `fd`/`events`,
+        // SAFETY: same live single-element `pfd` (`revents` reset above), `nfds == 1`.
+        // `fd` stays open until the caller returns. `poll` reads `fd`/`events`,
         // writes `revents`, and returns before `pfd` ends.
         let r = unsafe { libc::poll(&mut pfd, 1, remaining) };
         match r {
@@ -147,7 +131,6 @@ fn poll_readable(fd: RawFd, timeout_ms: i32) -> std::io::Result<WaitOutcome> {
                 if e.raw_os_error() != Some(libc::EINTR) {
                     return Err(e);
                 }
-                // Interrupted — recompute the remaining budget and keep waiting.
             }
         }
     }
@@ -157,15 +140,13 @@ fn poll_readable(fd: RawFd, timeout_ms: i32) -> std::io::Result<WaitOutcome> {
 mod tests {
     use super::*;
 
-    /// The ioctl number must match linux/dma-buf.h exactly — it's computed, so lock it down.
+    /// `iowr(2, size)` must equal linux/dma-buf.h `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`.
     #[test]
     fn ioctl_number_matches_dma_buf_h() {
         assert_eq!(DMA_BUF_IOCTL_EXPORT_SYNC_FILE, 0xC008_6202);
     }
 
-    /// The poll state machine, driven by a pipe (readable ⇔ signaled): a not-yet-readable fd that
-    /// stays quiet is a truthful `TimedOut` (not the old `Ok(true)`), and one already readable at
-    /// the probe is `NoFence`.
+    /// Pipe stand-in: quiet fd → `TimedOut`; already-readable → `NoFence`.
     #[test]
     fn poll_readable_reports_the_truth() {
         use std::io::Write;

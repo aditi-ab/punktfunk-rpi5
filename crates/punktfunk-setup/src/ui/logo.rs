@@ -1,52 +1,43 @@
-//! The lens mark, computed rather than embedded.
+//! The lens mark, rasterised from the favicon geometry rather than embedded.
 //!
-//! `web/public/favicon.svg` is pure geometry — two equal circles whose intersection is the
-//! lens — so the mark is a point-in-circle test per pixel over the union's bounding box. No
-//! bitmap, no build-time raster step, and it scales by changing one constant.
+//! `web/public/favicon.svg` is two equal circles; their intersection is the lens.
+//! Each frame is a point-in-circle test over the union's bounding box. Scale by
+//! changing `MARK_COLS` / `MARK_ROWS`.
 //!
-//! A pixel is one whole cell, painted as a background fill rather than drawn as a block glyph
-//! — `render` explains why that matters more than the resolution it costs. Cells are not
-//! square, so neither is the grid. Hard edges, no anti-aliasing: the pixelated look is the
-//! point, and the terminal background is unknown, so there is nothing safe to blend toward.
+//! A pixel is one whole cell, painted as a background fill, not a block glyph —
+//! see `render`. Cells are not square, so neither is the grid. No anti-aliasing:
+//! the terminal background is unknown, so there is nothing safe to blend toward.
 //!
-//! The animation slides the two circles together along their diagonal and the lens lights up
-//! as they meet — the brand story drawn. `design/installer-v2.md` D7 owns the skip rules.
+//! Skip rules: `design/installer-v2.md` D7.
 
 use crate::ui::theme::{Caps, Colors, Layer, Rgb};
 
 /// One cell per pixel. Columns and rows differ because cells are not square.
 ///
-/// A terminal cell is roughly 2.2:1, so a pixel drawn as a whole cell is that much taller than
-/// it is wide. Sampling the square mark into 20 columns by 9 rows cancels it: the shape comes
-/// out round across the 2.0–2.4 range real terminals use, worst case about 10%.
-///
-/// 20×9 is near the floor. One cell per pixel is coarse, and by 16×7 the lens thins to a line;
-/// by 14×6 the circles stop being circles. Rendered at every size before picking this one.
+/// A terminal cell is ~2.2:1. Sampling the square mark into 20×9 cancels that:
+/// the shape stays round across the 2.0–2.4 range, worst case about 10%.
+/// Below 16×7 the lens thins to a line; below 14×6 the circles collapse.
 pub const MARK_COLS: usize = 20;
 pub const MARK_ROWS: usize = 9;
 
-/// Text rows the mark occupies — one per pixel row, since a pixel *is* a cell.
 pub const MARK_TEXT_ROWS: usize = MARK_ROWS;
 
 const LIGHT: Rgb = Rgb(0xa7, 0x9f, 0xf8);
 const DEEP: Rgb = Rgb(0x6c, 0x5b, 0xf3);
 const LENS: Rgb = Rgb(0xd2, 0xc9, 0xfb);
 
-/// Circle centres and radius in the favicon's 1000×1000 viewBox, read off its two arcs.
+/// Circle centres and radius in the favicon's 1000×1000 viewBox.
 const R: f32 = 194.41;
 const LIGHT_C: (f32, f32) = (403.037, 597.262);
 const DEEP_C: (f32, f32) = (597.808, 402.853);
 
-/// How far apart the circles start, in viewBox units. About one radius, so at t=0 each is
-/// mostly outside the frame and the mark reads as two endpoints arriving.
+/// Start gap in viewBox units. ~one radius, so at t=0 each circle is mostly off-frame.
 const SPREAD: f32 = 190.0;
 
-/// 15 frames at 40 ms is ~600 ms — long enough to read as motion, short enough that nobody
-/// waiting to install a package resents it.
+/// 15 frames at 40 ms ≈ 600 ms: long enough to read as motion, short enough not to stall install.
 pub const FRAMES: usize = 15;
 pub const FRAME_MS: u64 = 40;
 
-/// How much of the intro the terminal has earned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intro {
     Animated,
@@ -54,11 +45,11 @@ pub enum Intro {
     Plain,
 }
 
-/// D7's skip ladder. `--yes` keeps the mark but never animates: an unattended run has nobody
-/// watching, and its transcript should not carry 15 repaints.
+/// Skip ladder (`design/installer-v2.md` D7). `--yes` keeps the mark but never
+/// animates: an unattended transcript must not carry 15 repaints.
 pub fn intro_level(caps: &Caps, yes: bool) -> Intro {
-    // +2 for the indent the mark is drawn at: a terminal exactly as wide as the mark would
-    // wrap its last two columns, and a wrapped line breaks the frame's repaint arithmetic.
+    // +2 is the indent. A terminal as wide as the mark would wrap the last two
+    // columns and break the frame's repaint arithmetic.
     if !caps.tty || caps.colors < Colors::Ansi256 || usize::from(caps.width) < MARK_COLS + 2 {
         return Intro::Plain;
     }
@@ -69,7 +60,6 @@ pub fn intro_level(caps: &Caps, yes: bool) -> Intro {
     }
 }
 
-/// The union of both circles at rest, which every frame is drawn inside.
 fn bbox() -> (f32, f32, f32, f32) {
     let x0 = (LIGHT_C.0 - R).min(DEEP_C.0 - R);
     let y0 = (LIGHT_C.1 - R).min(DEEP_C.1 - R);
@@ -78,17 +68,13 @@ fn bbox() -> (f32, f32, f32, f32) {
     (x0, y0, x1 - x0, y1 - y0)
 }
 
-/// Unit vector from the light circle toward the deep one — the diagonal they travel.
 fn diagonal() -> (f32, f32) {
     let (dx, dy) = (DEEP_C.0 - LIGHT_C.0, DEEP_C.1 - LIGHT_C.1);
     let len = dx.hypot(dy);
     (dx / len, dy / len)
 }
 
-/// Which halves of the mark are lit: the left circle is the host, the right one the client.
-///
-/// A component that is not being installed is muted rather than dropped, so the mark stays the
-/// mark and the screen says what it is about to do without a word.
+/// Left circle is host, right is client. Unselected halves mute rather than drop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Parts {
     pub host: bool,
@@ -104,11 +90,8 @@ impl Default for Parts {
     }
 }
 
-/// Desaturate toward the colour's own luminance, leaving brightness alone.
-///
-/// Dimming would be the obvious way to mute, and it is wrong: the terminal background is
-/// unknown, so "darker" reads as muted on a dark theme and as *more* prominent on a light one.
-/// Dropping the colour at the same luminance reads the same either way.
+/// Desaturate toward the colour's own luminance. Do not dim: the terminal
+/// background is unknown, so darker reads as muted on dark and as emphasis on light.
 fn muted(c: Rgb) -> Rgb {
     const DESAT: f32 = 0.8;
     let luma = 0.299 * f32::from(c.0) + 0.587 * f32::from(c.1) + 0.114 * f32::from(c.2);
@@ -116,16 +99,14 @@ fn muted(c: Rgb) -> Rgb {
     Rgb(mix(c.0), mix(c.1), mix(c.2))
 }
 
-/// The mark at rest, with both circles lit.
 pub fn frame(t: f32) -> Vec<Vec<Option<Rgb>>> {
     frame_parts(t, Parts::default())
 }
 
-/// The pixel grid at `t`, where 0.0 is fully apart and 1.0 is the mark at rest.
+/// Pixel grid at `t` (0 = apart, 1 = at rest). `None` is uncovered.
 ///
-/// `None` is a pixel the mark does not cover. The draw order is the SVG's: the deep circle
-/// sits over the light one, and the lens over both. The lens is lit only when both are — it is
-/// where the two meet, and there is nothing to meet with only one of them installed.
+/// Draw order matches the SVG: deep over light, lens over both. The lens is
+/// lit only when both halves are installed.
 pub fn frame_parts(t: f32, parts: Parts) -> Vec<Vec<Option<Rgb>>> {
     let light_c = if parts.host { LIGHT } else { muted(LIGHT) };
     let deep_c = if parts.client { DEEP } else { muted(DEEP) };
@@ -134,7 +115,7 @@ pub fn frame_parts(t: f32, parts: Parts) -> Vec<Vec<Option<Rgb>>> {
     } else {
         muted(LENS)
     };
-    // Ease-out: most of the travel happens early, so the circles settle rather than arrive.
+    // Ease-out cubic: most of the travel happens early so the circles settle.
     let eased = 1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3);
     let gap = SPREAD * (1.0 - eased);
     let (dx, dy) = diagonal();
@@ -143,8 +124,6 @@ pub fn frame_parts(t: f32, parts: Parts) -> Vec<Vec<Option<Rgb>>> {
 
     let (x0, y0, w, h) = bbox();
     let inside = |c: (f32, f32), x: f32, y: f32| (x - c.0).hypot(y - c.1) <= R;
-    // The square mark is sampled into a grid that is not square, so that the terminal's
-    // taller-than-wide cells put it back to square on the glass.
     (0..MARK_ROWS)
         .map(|row| {
             let y = y0 + (row as f32 + 0.5) * h / MARK_ROWS as f32;
@@ -163,20 +142,16 @@ pub fn frame_parts(t: f32, parts: Parts) -> Vec<Vec<Option<Rgb>>> {
         .collect()
 }
 
-/// One frame as text: one cell per pixel, painted as a background fill.
+/// One cell per pixel, painted as a background fill.
 ///
-/// NOT half-blocks, though they would double the vertical resolution. `▀` is a glyph, and a
-/// glyph only covers the box its font gives it — measured on macOS, block glyphs fall short of
-/// the cell and leave a hairline between every row, so the mark reads as having empty rows
-/// through it. A background fill is painted by the terminal across the whole cell, seams
-/// included, and is the same on every font. Chunky and right beats detailed and striped.
+/// Do not use half-block glyphs (`▀`). A glyph only covers its font box and
+/// leaves a hairline between rows. A background fill covers the whole cell.
 pub fn render(grid: &[Vec<Option<Rgb>>], caps: &Caps, indent: usize) -> String {
     let mut out = String::new();
     for row in grid {
         out.push_str(&" ".repeat(indent));
         for cell in row {
-            // An uncovered cell must put the background back, or it inherits the previous
-            // cell's colour and smears it along the line.
+            // Uncovered cells must restore the default background or they smear the previous colour.
             match cell {
                 Some(c) => out.push_str(&caps.paint(*c, Layer::Bg)),
                 None => out.push_str(&caps.clear(Layer::Bg)),
@@ -189,12 +164,10 @@ pub fn render(grid: &[Vec<Option<Rgb>>], caps: &Caps, indent: usize) -> String {
     out
 }
 
-/// The mark as it settles, for a caller that will not animate.
 pub fn still(caps: &Caps, indent: usize, parts: Parts) -> String {
     render(&frame_parts(1.0, parts), caps, indent)
 }
 
-/// The grid as one character per pixel, for tests and for eyeballing the geometry.
 pub fn ascii(grid: &[Vec<Option<Rgb>>]) -> String {
     let mut out = String::new();
     for row in grid {
@@ -254,7 +227,6 @@ mod tests {
         assert_eq!(intro_level(&caps, false), Intro::Plain);
     }
 
-    /// The settled mark is deterministic geometry, so it is worth pinning exactly.
     #[test]
     fn the_settled_mark_is_the_expected_pixel_grid() {
         let art = ascii(&frame(1.0));
@@ -274,7 +246,6 @@ mod tests {
         assert!(grid.iter().all(|row| row.len() == MARK_COLS));
     }
 
-    /// The lens only exists where the circles overlap, so it must grow as they arrive.
     #[test]
     fn the_lens_lights_up_as_the_circles_meet() {
         let lens_pixels = |t: f32| {
@@ -290,8 +261,7 @@ mod tests {
             "fully apart, there is no overlap to light"
         );
         assert!(lens_pixels(1.0) > 0, "at rest the lens is the whole point");
-        // Non-decreasing, not strictly growing: one cell per pixel is coarse enough that the
-        // count plateaus between frames, which is quantisation rather than the lens stalling.
+        // Non-decreasing, not strictly increasing: one cell per pixel plateaus between frames.
         let mut prev = 0;
         for step in 0..=10 {
             let now = lens_pixels(step as f32 / 10.0);
@@ -300,7 +270,6 @@ mod tests {
         }
     }
 
-    /// Half-covered cells must not paint a background, or the mark sits in a violet box.
     #[test]
     fn an_edge_cell_leaves_the_terminal_background_alone() {
         let caps = caps(Colors::Truecolor, 80, true);
@@ -315,7 +284,6 @@ mod tests {
         );
     }
 
-    /// One painted cell, as the terminal would see it.
     #[derive(Debug, PartialEq)]
     struct Cell {
         ch: char,
@@ -330,8 +298,7 @@ mod tests {
                 .trim_start_matches("[48;2;")
                 .trim_end_matches('m')
                 .split(';')
-                // ::<u8> spelled out: on the Windows target, console's encode_unicode dep
-                // adds more `FromIterator<_> for Vec<u8>` impls and inference goes ambiguous.
+                // `::<u8>` is required: Windows pulls extra `FromIterator` impls and inference fails.
                 .filter_map(|v| v.parse::<u8>().ok())
                 .collect();
             Rgb(parts[0], parts[1], parts[2])
@@ -366,12 +333,6 @@ mod tests {
         cells
     }
 
-    /// Every cell must paint exactly what the grid says, and nothing it does not.
-    ///
-    /// Two bugs live here. A space paints whatever background is in effect, so an uncovered
-    /// cell that does not clear it smears the previous colour across the line. And a cell whose
-    /// halves match has to be a background fill rather than a block glyph, because a glyph only
-    /// covers the font's glyph box and leaves the mark looking like it has empty rows in it.
     #[test]
     fn every_cell_paints_exactly_what_the_grid_says() {
         let caps = caps(Colors::Truecolor, 80, true);
@@ -394,12 +355,6 @@ mod tests {
         }
     }
 
-    /// The mark has to come out round on a real terminal, not on a grid.
-    ///
-    /// The two circles are equal and their union's bounding box is square by construction, so
-    /// its rendered aspect is the whole test. A pixel is one cell wide by half a cell tall, so
-    /// on a cell of aspect A the rows are A/2 as tall as the columns are wide — a square grid
-    /// would fail this at any realistic A, which is exactly the bug it is here to catch.
     #[test]
     fn the_mark_renders_round_on_a_real_cell() {
         let grid = frame(1.0);
@@ -426,8 +381,6 @@ mod tests {
         }
     }
 
-    /// Muting drops the colour and keeps the brightness. Darkening instead would read as muted
-    /// on a dark terminal and as emphasis on a light one.
     #[test]
     fn muting_greys_a_colour_without_darkening_it() {
         let luma =
@@ -446,7 +399,6 @@ mod tests {
         }
     }
 
-    /// The left circle is the host, the right one the client, and the lens belongs to both.
     #[test]
     fn only_the_unselected_half_of_the_mark_is_muted() {
         let both = frame(1.0);

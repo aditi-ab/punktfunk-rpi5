@@ -2,8 +2,6 @@ use super::*;
 
 #[test]
 fn the_os_field_compiles_for_both_modes() {
-    // What a follow-system rebuild does per theme switch: derive stops, compile the SkSL,
-    // build the ink. A dark and a light theme cover both stop derivations.
     for light in [false, true] {
         let t = crate::os_theme::OsTheme {
             light,
@@ -27,19 +25,11 @@ use crate::screens::home::HomeScreen;
 use crate::screens::library::LibraryScreen;
 use punktfunk_core::config::GamepadPref;
 
-/// The screen-transition contract, against the shared vectors. Every client re-implements this
-/// motion in its own animation system, so the numbers exist in three places and drifted in two of
-/// them before there was a test.
+/// Pins `motion_spring` (vectors v2). v1 `motion` still exists for other clients; this
+/// transition is a spring, not that ease-out, so sampling v1 would pass a curve we do not run.
 ///
-/// This side reads `motion_spring` (vectors version 2). The v1 `motion` block is still in the
-/// file and still correct — the Android client's `ConsoleVectorsTest` pins it, and the Apple
-/// client's `GamepadShell` mirrors its constants — but the desktop console's transition is a
-/// damped spring now rather than a 0.26 s ease-out-cubic, so it no longer implements that block
-/// and says so here rather than quietly passing a test about a curve it does not run.
-///
-/// Springs are INTEGRATOR-dependent, which is why v2 pins parameters where v1 pinned sampled
-/// positions: two runtimes that both honour `response`/`damping` agree to the eye and disagree
-/// in the third decimal, and sampling would pin the disagreement instead of the feel.
+/// Springs are integrator-dependent: two runtimes that honour `response`/`damping` agree
+/// to the eye and disagree in the third decimal. Pin the parameters, not sampled positions.
 #[test]
 fn motion_matches_the_shared_vectors() {
     let raw = include_str!("../../../../clients/shared/console-vectors.json");
@@ -75,19 +65,15 @@ fn motion_matches_the_shared_vectors() {
         "this client's transitions accept Back mid-flight; the block must say so"
     );
 
-    // The v1 block stays put until the last client migrates, and stays MARKED so nobody
-    // reads it as live. Deleting it here would silently red Android's test instead.
+    // v1 stays until the last client migrates. Deleting it here reds Android's test.
     assert!(
         file["motion"]["$deprecated"].is_string(),
         "the v1 motion block must carry its deprecation note while other clients read it"
     );
 }
 
-/// Point the settings/known-hosts stores at a throwaway config dir — the settings screen
-/// SAVES on adjust, and a test must never write the developer's real config. THE shared
-/// helper, not a copy: a second `OnceLock` here picked a second directory, so whichever
-/// test ran first decided where the whole binary wrote and the other's saves landed
-/// somewhere its loads never looked.
+/// Shared throwaway config dir. Settings SAVE on adjust; a second `OnceLock` here
+/// would pick a second directory and the other test's loads would miss its writes.
 use crate::screens::settings::tests::fake_home;
 
 fn hosts() -> Vec<HostRow> {
@@ -156,13 +142,10 @@ fn shell(stack: Vec<Screen>) -> (Shell, ConsoleShared, LibraryShared) {
     (shell, console, library)
 }
 
-/// The shell survives a full navigation lap (a smoke test over every screen's
-/// input handling — no rendering, no GPU).
 #[test]
 fn navigation_lap() {
     let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
     s.sync();
-    // Home → Settings (X), adjust something, back out.
     s.handle_menu(MenuEvent::Tertiary);
     assert_eq!(s.stack.len(), 2);
     finish_motion(&mut s);
@@ -171,14 +154,12 @@ fn navigation_lap() {
     s.handle_menu(MenuEvent::Back);
     finish_motion(&mut s);
     assert_eq!(s.stack.len(), 1);
-    // Home → Library on the paired host (Y), then back.
     s.handle_menu(MenuEvent::Secondary);
     assert_eq!(s.stack.len(), 2);
     finish_motion(&mut s);
     s.handle_menu(MenuEvent::Back);
     finish_motion(&mut s);
     assert_eq!(s.stack.len(), 1);
-    // B at the root quits.
     s.handle_menu(MenuEvent::Back);
     assert!(matches!(s.take_action(), Some(OverlayAction::Quit)));
 }
@@ -193,25 +174,21 @@ fn connect_flow_raises_launch_and_cancel() {
         Some(OverlayAction::Launch { launch: None, .. })
     ));
     assert!(s.connecting.is_some());
-    // While connecting: B cancels — and the takeover comes down on the spot. It must NOT wait
-    // for a session phase to clear it: the dial is blocking on the host's side of this
-    // interface, so that wait was the whole connect budget, and an embedder that just drops a
-    // canceled dial sends no phase at all — the console stuck on "Canceling…" until the app died.
+    // Cancel drops the takeover immediately. Waiting for a session phase burns the
+    // connect budget; an embedder that drops a canceled dial sends no phase at all.
     s.handle_menu(MenuEvent::Back);
     assert!(matches!(
         s.take_action(),
         Some(OverlayAction::CancelConnect)
     ));
     assert!(s.connecting.is_none(), "cancel drops the takeover itself");
-    // A dial that resolves afterwards (or never) changes nothing.
     s.session_ended(None);
     assert!(s.connecting.is_none());
 }
 
 fn finish_motion(s: &mut Shell) {
-    // Tests fast-forward transitions. Seats the spring on its target and runs the REAL
-    // settle, rather than wishing the motion away — otherwise a reversed push would skip
-    // the bookkeeping that takes its screen back off the stack.
+    // Seat the spring and run the real settle. Skipping it drops the bookkeeping
+    // that pops a reversed push off the stack.
     if let Motion::Nav { spring, target, .. } = &mut s.motion {
         spring.pos = *target;
         spring.vel = 0.0;
@@ -219,9 +196,8 @@ fn finish_motion(s: &mut Shell) {
     s.finish_nav();
 }
 
-/// Step the transition at a fixed `dt` until it settles, collecting every position it
-/// passed through. Bounded so a spring that never settles fails the test instead of
-/// hanging it.
+/// Step at a fixed `dt` until settle. Bound so a spring that never settles fails
+/// instead of hanging.
 fn run_motion(s: &mut Shell) -> Vec<f64> {
     let mut path = Vec::new();
     for _ in 0..600 {
@@ -233,12 +209,8 @@ fn run_motion(s: &mut Shell) -> Vec<f64> {
     panic!("transition never settled");
 }
 
-/// A pinned host+profile card's library launches with THAT profile (design §5.2a).
-///
-/// The card's plain A-press always carried its profile; Y — which the card offers, being
-/// paired and saved — opened a library screen that knew only the host, so every title
-/// launched off it silently fell back to the host's default binding. The profile a user
-/// pinned is the whole reason they pressed that card.
+/// Y on a pinned card must carry that profile into the library. Falling back to the
+/// host default would ignore the pin, which is why the card exists.
 #[test]
 fn a_pinned_cards_library_launches_with_its_profile() {
     let mut rows = hosts();
@@ -256,7 +228,7 @@ fn a_pinned_cards_library_launches_with_its_profile() {
     console.set_hosts(rows);
     s.sync();
 
-    // Focus the pinned card (it sits right after its host's primary tile), then Y.
+    // Pinned card sits immediately after its host's primary tile.
     s.handle_menu(MenuEvent::Move(MenuDir::Right));
     s.handle_menu(MenuEvent::Secondary);
     finish_motion(&mut s);
@@ -294,8 +266,7 @@ fn a_pinned_cards_library_launches_with_its_profile() {
     }
 }
 
-/// …and off the host's PRIMARY tile there is no one-off: the host's binding decides,
-/// which is what the resolver sees as `None`.
+/// Primary tile: no one-off profile. The resolver sees `None` and uses the host binding.
 #[test]
 fn a_primary_tiles_library_leaves_the_profile_to_the_binding() {
     let (mut s, _console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
@@ -322,7 +293,7 @@ fn a_primary_tiles_library_leaves_the_profile_to_the_binding() {
 fn wake_gates_input_in_the_same_press() {
     let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
     s.sync();
-    // Focus "Office Tower" (offline + wakeable), then A: the wake starts.
+    // Office Tower is the second tile: offline and wakeable.
     s.handle_menu(MenuEvent::Move(MenuDir::Right));
     s.handle_menu(MenuEvent::Confirm);
     let w = s
@@ -331,27 +302,20 @@ fn wake_gates_input_in_the_same_press() {
         .expect("Waking card raised in the SAME call as the A press");
     assert_eq!(w.name, "Office Tower");
     assert!(!w.online);
-    // The very next input is modal-gated — the cursor can't drift onto Add Host —
-    // and sync (which runs first in handle_menu) must not clear the placeholder
-    // before the service thread reports its first real status.
+    // Gate the next input. `sync` (first in handle_menu) must not clear the
+    // placeholder before the service thread reports a real status.
     assert!(s.handle_menu(MenuEvent::Move(MenuDir::Right)).is_none());
     assert!(
         s.wake.is_some(),
         "optimistic card survived a sync with no service status"
     );
-    // B cancels: the gate releases and navigation works again.
     s.handle_menu(MenuEvent::Back);
     assert!(s.wake.is_none());
     assert!(s.handle_menu(MenuEvent::Move(MenuDir::Left)).is_some());
 }
 
-/// Every settings tab actually RASTERS. The eyeball dump below is `#[ignore]`d, so without
-/// this nothing in the normal gate ever ran the tab strip's layout arithmetic or a settings
-/// screen's rows — a bad index there would only surface on a Deck. CPU raster: the SkSL
-/// backdrop, the layers and the text all run without a GPU.
-/// Tab / Shift+Tab change section. The strip shipped on the shoulder buttons and
-/// PgUp/PgDn only, and the legend names PgUp/PgDn solely when NO pad is attached — so with
-/// a controller plugged in a keyboard user had no way in, and no way to find one.
+/// Tab / Shift+Tab change section even with a pad attached. The legend names
+/// PgUp/PgDn only when no pad is present, so keyboard users otherwise have no way in.
 #[test]
 fn tab_and_shift_tab_change_section() {
     use crate::input::Key as Scancode;
@@ -367,10 +331,8 @@ fn tab_and_shift_tab_change_section() {
     assert_eq!(tab(&s), 1, "Tab goes forward");
     assert!(s.key(Scancode::Tab, true, false));
     assert_eq!(tab(&s), 0, "Shift+Tab goes back");
-    // …and it wraps backwards off the first tab, exactly as the shoulders do.
     s.key(Scancode::Tab, true, false);
     assert_eq!(tab(&s), crate::screens::settings::TAB_COUNT - 1);
-    // A key repeat must not run through the strip a section per frame held.
     let before = tab(&s);
     s.key(Scancode::Tab, false, true);
     assert_eq!(tab(&s), before, "held Tab doesn't skip sections");
@@ -388,7 +350,7 @@ fn a_secondary_press_goes_back() {
         y: 10.0,
         kind: crate::pointer::PointerKind::Back,
     }));
-    // The pop runs through the same transition a B press does.
+    // Same transition a B press uses.
     assert!(matches!(
         s.motion,
         Motion::Nav {
@@ -398,17 +360,10 @@ fn a_secondary_press_goes_back() {
     ));
 }
 
-/// A REPLACE recedes the screen it replaced, not that screen's parent.
-///
-/// Reported from a Deck: choosing "Edit…" in a host's menu flashed the host LIST for the
-/// length of the transition before the editor arrived. The cause is that a push paints the
-/// screen beneath the incoming one as its receding layer, while a replace had already popped
-/// and dropped the screen being swapped out — so "beneath" was the menu's parent, one level
-/// too far, and the transition animated the editor in over Home.
-///
-/// Asserted on the carried screen rather than on pixels: the defect is entirely a question of
-/// WHICH screen the motion holds, and a frame diff would pin the particular look of a
-/// transition instead of the thing that was wrong with it.
+/// Replace recedes the swapped-out screen, not its parent. A push paints the
+/// screen beneath as the leaving layer; replace already popped, so without carrying
+/// the predecessor the renderer recedes the parent. Asserted on the carried screen:
+/// a frame diff would pin the look of a transition, not which screen it holds.
 #[test]
 fn a_replace_carries_the_screen_it_replaced() {
     let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
@@ -416,10 +371,8 @@ fn a_replace_carries_the_screen_it_replaced() {
     assert!(matches!(s.stack.last(), Some(Screen::HostOptions(_))));
     finish_motion(&mut s);
 
-    // Walk to "Edit…" and take it. The first fixture host is paired, saved and online and
-    // cannot wake, so its menu is [Send logs, Library, Copy link, Edit…, …] — Edit is three
-    // down. Pressed exactly rather than searched, so that reordering the menu fails HERE
-    // instead of quietly landing this test's Confirm on something destructive.
+    // First host's menu is [Send logs, Library, Copy link, Edit…, …] — three Downs.
+    // Pressed exactly so a menu reorder fails here, not on something destructive.
     s.handle_menu(MenuEvent::Move(MenuDir::Down));
     s.handle_menu(MenuEvent::Move(MenuDir::Down));
     s.handle_menu(MenuEvent::Move(MenuDir::Down));
@@ -442,8 +395,6 @@ fn a_replace_carries_the_screen_it_replaced() {
         _ => panic!("a replace must be a push CARRYING its predecessor"),
     }
 
-    // …and reversing it puts the menu back, because that is the screen the user watched
-    // recede and then return.
     s.handle_menu(MenuEvent::Back);
     finish_motion(&mut s);
     assert!(
@@ -452,7 +403,6 @@ fn a_replace_carries_the_screen_it_replaced() {
     );
 }
 
-/// Up on a saved tile opens that host's menu; a discovered-but-unsaved one has none.
 #[test]
 fn up_opens_host_options_for_saved_tiles_only() {
     let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
@@ -494,11 +444,9 @@ fn every_settings_tab_rasters() {
             &pads,
         );
     };
-    // One lap of the strip — R1 wraps back to where it started. Every tab's rows fit on an
-    // 800-tall window at once, so ONE frame per tab draws all of them; the cursor is walked to
-    // the end first (input only, no render) so the focused and unfocused row paths both run.
-    // Deliberately frugal: a full-screen SkSL field on the CPU costs the better part of a second
-    // per frame in a debug build, and this test's job is to catch a panic, not to look pretty.
+    // One lap of the strip. Walk to the end first so both row paths run, then one
+    // frame per tab — every tab's rows fit on 800-tall. CPU SkSL is ~1s/frame in
+    // debug; this is a panic catch, not an eyeball pass.
     for _ in 0..crate::screens::settings::TAB_COUNT {
         for _ in 0..12 {
             s.handle_menu(MenuEvent::Move(MenuDir::Down));
@@ -506,12 +454,11 @@ fn every_settings_tab_rasters() {
         frame(&mut s);
         s.handle_menu(MenuEvent::JumpForward);
     }
-    // A narrow window is the case the strip has to shrink for (the pills are laid out from
-    // measured text, so a too-small width must clamp rather than lay out off-screen).
+    // 640×400: pills are measured text, so a too-small width must clamp, not overflow.
     s.render(surface.canvas(), 640, 400, &fonts, None, None, &pads);
 }
 
-/// The settings screen with one frame rendered, so its rows have real rects to press.
+/// One rendered frame so the rows have real rects to press.
 fn rendered_settings() -> (Shell, skia_safe::Rect) {
     let fonts = crate::theme::build_fonts().unwrap();
     let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
@@ -526,21 +473,17 @@ fn rendered_settings() -> (Shell, skia_safe::Rect) {
     (s, row)
 }
 
-/// The whole point of the touch tracker: a finger swiping across the settings list is
-/// SCROLLING, and must not flip the value it happened to land on — which is exactly what
-/// the press-acts-on-contact model did to every swipe before the `touch` flag existed.
-/// The same contact lifted in place IS the tap, delivered on the lift at the anchor.
+/// A finger swipe across the list is a scroll and must not flip the landed-on value.
+/// The same contact lifted in place is the tap, delivered on lift at the anchor.
 #[test]
 fn a_touch_swipe_scrolls_settings_without_changing_a_value() {
     use pf_client_core::console::{PointerButton, PointerInput};
     let (mut s, row) = rendered_settings();
     let (cx, cy) = (row.center_x(), row.center_y());
-    // The Resolution row's whole observable state: activating it steps the D1 tri-state
-    // Native -> Match window, which flips the FLAG while width/height stay (0, 0).
+    // Resolution's observable: Native → Match window flips the flag; size stays (0, 0).
     let state = |s: &Shell| (s.settings.match_window, s.settings.width, s.settings.height);
     let before = state(&s);
 
-    // Finger lands on the Resolution row and swipes up, well past slop and several ticks.
     s.pointer_input(PointerInput::Down {
         x: cx,
         y: cy,
@@ -564,8 +507,6 @@ fn a_touch_swipe_scrolls_settings_without_changing_a_value() {
         "a swipe across a row is a scroll, not a value change"
     );
 
-    // The same contact, lifted where it landed: a tap. Deferred — nothing on contact,
-    // the step on the lift.
     s.pointer_input(PointerInput::Down {
         x: cx,
         y: cy,
@@ -585,8 +526,7 @@ fn a_touch_swipe_scrolls_settings_without_changing_a_value() {
     );
 }
 
-/// A mouse is not a finger: its press keeps acting on contact, exactly as before the
-/// touch flag existed.
+/// A mouse press still acts on contact. Only touch defers to the lift.
 #[test]
 fn a_mouse_press_still_acts_on_contact() {
     use pf_client_core::console::{PointerButton, PointerInput};
@@ -602,9 +542,8 @@ fn a_mouse_press_still_acts_on_contact() {
     assert_ne!(state(&s), before, "a mouse click acts on the press");
 }
 
-/// A horizontal drag on Home steps the carousel — one tick per `DRAG_TICK_DP` of travel
-/// past the slop — and the lift after a drag presses nothing. Needs no render: ticks act
-/// on the cursor, not on drawn rects.
+/// One tick per `DRAG_TICK_DP` past slop; the lift after a drag presses nothing.
+/// Ticks act on the cursor, not drawn rects, so no render.
 #[test]
 fn a_horizontal_drag_steps_the_home_carousel() {
     use pf_client_core::console::{PointerButton, PointerInput};
@@ -616,8 +555,7 @@ fn a_horizontal_drag_steps_the_home_carousel() {
         button: PointerButton::Primary,
         touch: true,
     });
-    // First move leaves the slop (locks the horizontal axis); the second travels one full
-    // tick leftward — content follows the finger, so the NEXT tile comes up.
+    // First move leaves slop (locks X); the second is one tick left — next tile.
     s.pointer_input(PointerInput::Move { x: 620.0, y: 400.0 });
     s.pointer_input(PointerInput::Move {
         x: 620.0 - DRAG_TICK_DP as f32,
@@ -628,9 +566,8 @@ fn a_horizontal_drag_steps_the_home_carousel() {
         y: 400.0,
         button: PointerButton::Primary,
     });
-    // The fixture's second host (Office Tower) is offline with a stored MAC: Confirm on it
-    // raises the wake card. That proves the drag moved the cursor — and that the lift
-    // after a drag pressed nothing (a press would have acted before Confirm ran).
+    // Second host is offline with a stored MAC: Confirm raises wake. That proves
+    // the drag moved the cursor and the lift itself pressed nothing.
     assert!(
         s.wake.is_none(),
         "the drag itself must not activate anything"
@@ -642,8 +579,7 @@ fn a_horizontal_drag_steps_the_home_carousel() {
     );
 }
 
-/// A canceled touch (the finger left the window, the toolkit stole the gesture) is
-/// dropped whole: no press ever lands.
+/// A canceled touch is dropped whole: a stray lift after Cancel must not act.
 #[test]
 fn a_canceled_touch_never_acts() {
     use pf_client_core::console::{PointerButton, PointerInput};
@@ -669,14 +605,9 @@ fn a_canceled_touch_never_acts() {
     );
 }
 
-/// The work package's whole reason for existing: Back pressed mid-push is HEARD, and it
-/// turns the screen around rather than queuing a second animation behind the first.
-///
-/// The continuity assertion is the important half. A naive "cancel and play a pop" reads
-/// as a snap because the two recipes disagree about where things are; retargeting the same
-/// spring cannot snap, because position is carried and only the target moved. This asserts
-/// the position never jumps by more than a frame's worth of the travel it was already
-/// doing.
+/// Back mid-push retargets the same spring rather than queuing a pop. Cancel-and-play
+/// snaps because the two recipes disagree on position; carrying `pos` cannot.
+/// Assert the first sample after retarget is within a frame of travel.
 #[test]
 fn back_mid_push_turns_the_screen_around() {
     let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
@@ -684,7 +615,6 @@ fn back_mid_push_turns_the_screen_around() {
     s.handle_menu(MenuEvent::Tertiary); // X → Settings
     assert_eq!(s.stack.len(), 2);
 
-    // Let it get properly under way, then interrupt.
     let mut before = 0.0;
     for _ in 0..12 {
         before = s.advance_nav(1.0 / 120.0).expect("still in flight");
@@ -699,13 +629,11 @@ fn back_mid_push_turns_the_screen_around() {
 
     let path = run_motion(&mut s);
     assert!(!path.is_empty(), "the reversal actually animated");
-    // No snap: the first sample after the retarget continues from where it was.
     assert!(
         (path[0] - before).abs() < 0.05,
         "jumped from {before} to {}",
         path[0]
     );
-    // And it goes DOWN — the screen is leaving, having briefly been arriving.
     assert!(*path.last().expect("non-empty") < before);
     assert_eq!(
         s.stack.len(),
@@ -715,13 +643,13 @@ fn back_mid_push_turns_the_screen_around() {
     assert!(matches!(s.motion, Motion::None));
 }
 
-/// Back at the ROOT is not a reversal — there is no parent to fall back to, and B there
-/// means quit. The transition declines it so the normal path can answer.
+/// Back at the root is not a reversal: there is no parent, and B there means quit.
+/// Decline it so the normal path can answer.
 #[test]
 fn back_mid_push_at_the_root_is_left_to_the_normal_path() {
     let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
     s.sync();
-    // A Replace at the root pushes without deepening the stack.
+    // Replace at the root pushes without deepening the stack.
     s.apply_nav(crate::screens::Nav::Replace(Box::new(Screen::Home(
         HomeScreen::new(),
     ))));
@@ -732,9 +660,8 @@ fn back_mid_push_at_the_root_is_left_to_the_normal_path() {
     assert_eq!(s.stack.len(), 1, "and the root survived");
 }
 
-/// A mid-pop A is refused: activating a half-dismissed screen is a mis-tap, not intent.
-/// A mid-pop BACK, on the other hand, is exactly what a held B is — it starts the next pop
-/// at once, which is the stutter this work package removes.
+/// Mid-pop Confirm is a mis-tap and is refused. Mid-pop Back is a held B: start
+/// the next pop at once rather than queuing it behind the current one.
 #[test]
 fn mid_pop_refuses_confirm_but_honours_another_back() {
     let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
@@ -754,15 +681,13 @@ fn mid_pop_refuses_confirm_but_honours_another_back() {
     );
     assert_eq!(s.stack.len(), depth, "and pushes nothing");
 
-    // Back again, though, walks out another level — here that is the root, so it quits.
     s.handle_menu(MenuEvent::Back);
     finish_motion(&mut s);
     assert!(matches!(s.take_action(), Some(OverlayAction::Quit)));
 }
 
-/// A completed pop frees the screen it was carrying, and hint rects are published only
-/// once the shell is settled — the invariant that predates springs and survives them,
-/// because "settled" is still exactly `Motion::None`.
+/// A completed pop frees the carried screen. Hint rects publish only at
+/// `Motion::None` — mid-transition they are slid and scaled.
 #[test]
 fn a_completed_pop_frees_its_screen_and_republishes_hints() {
     let fonts = crate::theme::build_fonts().unwrap();
@@ -775,7 +700,6 @@ fn a_completed_pop_frees_its_screen_and_republishes_hints() {
     finish_motion(&mut s);
     s.handle_menu(MenuEvent::Back);
 
-    // Mid-pop: a screen is being carried, and the legend is not clickable.
     assert!(
         matches!(
             &s.motion,
@@ -801,10 +725,8 @@ fn a_completed_pop_frees_its_screen_and_republishes_hints() {
     );
 }
 
-/// Draw one frame at a small size. A freshly pushed screen has not seen the shared model
-/// yet — it adopts it on its first sync — so a test that asserts on a screen's CONTENT
-/// straight after pushing it is asking before the answer exists. The app always renders;
-/// so does this.
+/// One small frame. A freshly pushed screen adopts the shared model on its first
+/// sync; asserting on content before that is asking before the answer exists.
 fn frame(s: &mut Shell) {
     let fonts = crate::theme::build_fonts().unwrap();
     let pads: Vec<PadInfo> = Vec::new();
@@ -812,7 +734,6 @@ fn frame(s: &mut Shell) {
     s.render(surface.canvas(), 480, 300, &fonts, None, None, &pads);
 }
 
-/// A library with more than one group, for the collections flow.
 fn mixed_library(library: &LibraryShared) {
     let g = |id: &str, title: &str, store: &str, platform: Option<&str>, launcher: bool| {
         crate::library::LibraryGame {
@@ -835,17 +756,8 @@ fn mixed_library(library: &LibraryShared) {
     ]);
 }
 
-/// "Start in collections" actually starts in collections — asserted on the SHELL, because
-/// the shelf was never the part that was broken.
-///
-/// The handover shipped dead: `LibraryScreen::collections_upgrade` was written, documented and
-/// unit-tested for its DECISION, and then nothing ever called it. It carried an
-/// `#[allow(dead_code)]`, which is precisely what stopped the compiler from saying so, and the
-/// shelf's own tests passed throughout because they called it directly. The setting was on,
-/// the shelf agreed it should stand aside, and the library opened on the shelf anyway.
-///
-/// So this drives `Shell::sync` and asserts on the STACK. A screen cannot replace itself —
-/// only the shell owns the stack — so the shell is where the wiring has to be witnessed.
+/// Asserted on the shell stack after `sync`. A screen cannot replace itself;
+/// only the shell owns the stack, so that is where the handover has to be witnessed.
 #[test]
 fn the_setting_hands_a_multi_platform_library_over_to_collections() {
     let games: Vec<crate::library::LibraryGame> = platform_games();
@@ -856,10 +768,8 @@ fn the_setting_hands_a_multi_platform_library_over_to_collections() {
         ]);
         s.settings.library_collections = enabled;
 
-        // The shelf reads the model only once its OWN fetch has begun: a library that is Ready
-        // before that is the PREVIOUS host's, still sitting in the shared model. `begin_fetch`
-        // is what the service thread does when it drains the queued `FetchLibrary`, and the
-        // epoch it raises is what the shelf compares against the one it was pushed at.
+        // Ready before `begin_fetch` is the previous host's library. The epoch
+        // `begin_fetch` raises is what the shelf compares against its push epoch.
         s.sync();
         assert!(
             matches!(s.stack.last(), Some(Screen::Library(_))),
@@ -889,8 +799,7 @@ fn the_setting_hands_a_multi_platform_library_over_to_collections() {
     }
 }
 
-/// …and a library with only ONE collection opens on its shelf whatever the setting says,
-/// because a collections screen listing a single tile is a press that buys nothing.
+/// A collections screen listing a single tile is a press that buys nothing.
 #[test]
 fn one_collection_is_not_worth_a_screen() {
     let (mut s, _console, library) = shell(vec![
@@ -916,9 +825,6 @@ fn one_collection_is_not_worth_a_screen() {
     );
 }
 
-/// The user's flow, verbatim: group by platform, walk the platforms, pick PS3, see its
-/// games — and get back out again. This is the whole point of Part C, so it is asserted
-/// end to end rather than in pieces.
 #[test]
 fn collections_drill_in_reaches_one_platform_and_backs_out() {
     let (mut s, _console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
@@ -928,7 +834,6 @@ fn collections_drill_in_reaches_one_platform_and_backs_out() {
     finish_motion(&mut s);
     assert!(matches!(s.stack.last(), Some(Screen::Library(_))));
 
-    // Y again → Collections.
     s.handle_menu(MenuEvent::Secondary);
     finish_motion(&mut s);
     assert!(
@@ -936,11 +841,9 @@ fn collections_drill_in_reaches_one_platform_and_backs_out() {
         "Y on a multi-group library opens the collections"
     );
 
-    // Walk to the PS3 tile. Groups sort A–Z with launchers pinned first, so the strip
-    // reads: Launchers, PS3, SNES, Steam.
+    // Groups sort A–Z with launchers first: Launchers, PS3, SNES, Steam.
     s.handle_menu(MenuEvent::Move(MenuDir::Right));
 
-    // A opens that collection as a filtered shelf.
     s.handle_menu(MenuEvent::Confirm);
     finish_motion(&mut s);
     frame(&mut s); // the new shelf adopts the shared model on its first sync
@@ -954,7 +857,6 @@ fn collections_drill_in_reaches_one_platform_and_backs_out() {
         shelf.title()
     );
 
-    // B B walks back out to the unfiltered shelf.
     s.handle_menu(MenuEvent::Back);
     finish_motion(&mut s);
     assert!(matches!(s.stack.last(), Some(Screen::Collections(_))));
@@ -967,8 +869,7 @@ fn collections_drill_in_reaches_one_platform_and_backs_out() {
     assert_eq!(shelf.len_for_test(), 6, "the whole library again");
 }
 
-/// The gate: a library with nothing to collect must not offer the button, and must not
-/// answer it either — a hint and its press have to agree.
+/// A library with nothing to collect must not offer the button, and must not answer it.
 #[test]
 fn collections_is_offered_only_when_there_is_something_to_browse() {
     let (mut s, _console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
@@ -1004,22 +905,19 @@ fn collections_is_offered_only_when_there_is_something_to_browse() {
     ));
     assert_eq!(s.stack.len(), depth, "and pushed nothing");
 
-    // Now give it a second group and the same press works.
     mixed_library(&library);
     s.handle_menu(MenuEvent::Secondary);
     finish_motion(&mut s);
     assert!(matches!(s.stack.last(), Some(Screen::Collections(_))));
 }
 
-/// The trailing Rescan tile asks discovery to look again — and nothing else. It sits one
-/// step past Add Host, where a mis-timed press used to land on nothing at all, so the test
-/// that matters is that it CANNOT connect: an accidental A on the end of the strip must
-/// never start a session.
+/// Rescan sits past Add Host and must never start a session: accidental A on the
+/// end of the strip raises a scan, not a Launch.
 #[test]
 fn the_rescan_tile_probes_and_never_connects() {
     let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
     s.sync();
-    // Walk to the very end of the strip: hosts, then Add Host, then Rescan.
+    // Hosts, then Add Host, then Rescan — walk to the end.
     for _ in 0..12 {
         s.handle_menu(MenuEvent::Move(MenuDir::Right));
     }
@@ -1038,8 +936,7 @@ fn the_rescan_tile_probes_and_never_connects() {
     assert!(s.connecting.is_none(), "and must not open the connect card");
     assert_eq!(s.stack.len(), 1, "and must push no screen");
     assert!(s.toast.is_some(), "it says it is scanning");
-    // One step back is Add Host, which DOES push — proof the walk reached the end rather
-    // than stalling somewhere harmless.
+    // One step back is Add Host, which does push — proof the walk reached the end.
     s.handle_menu(MenuEvent::Move(MenuDir::Left));
     s.handle_menu(MenuEvent::Confirm);
     assert!(
@@ -1048,10 +945,8 @@ fn the_rescan_tile_probes_and_never_connects() {
     );
 }
 
-/// The three toast kinds must be tellable apart WITHOUT reading the words — that is the
-/// whole reason the kind exists. In particular the error tint is fixed rather than
-/// palette-derived: `moss`'s accent is a green and `ember`'s is an orange, and reporting a
-/// failure in the colour the rest of the UI uses for "this is fine" is exactly the bug.
+/// Error tint is fixed, not palette-derived. `moss` accent is green; reporting
+/// a failure in the colour the rest of the UI uses for "this is fine" is the bug.
 #[test]
 fn toast_kinds_are_visually_distinct() {
     use crate::shell::{ToastKind, ToastMark};
@@ -1065,7 +960,7 @@ fn toast_kinds_are_visually_distinct() {
     assert_ne!(rgb(info_c), rgb(ok_c));
     assert_ne!(rgb(ok_c), rgb(err_c));
 
-    // Swap in a green-accented palette: Success follows it, Error must not.
+    // Green-accented palette: Success follows it, Error must not.
     crate::theme::set_ink(crate::theme::Ink::of(crate::library::palette("moss")));
     let (ok_moss, _) = ToastKind::Success.look();
     let (err_moss, _) = ToastKind::Error.look();
@@ -1081,11 +976,8 @@ fn toast_kinds_are_visually_distinct() {
     );
 }
 
-/// Reduced motion: the setting round-trips through the store, the backdrop shader's clock
-/// freezes, and the transition shortens. The clock is asserted through `field_clock`
-/// rather than by diffing pixels because that IS the decision — `draw_aurora` has exactly
-/// one place it reads time, and both callers (the screens and the connect takeover) go
-/// through it.
+/// Reduced motion freezes `field_clock` and shortens the spring. Asserted on the
+/// clock, not pixels: `draw_aurora` has one time read, and both callers go through it.
 #[test]
 fn reduce_motion_freezes_the_field_and_shortens_the_transition() {
     let fonts = crate::theme::build_fonts().unwrap();
@@ -1109,10 +1001,10 @@ fn reduce_motion_freezes_the_field_and_shortens_the_transition() {
         spec.response < crate::anim::springs::NAV.response,
         "and quicker"
     );
-    // …and a frame still draws (the shader runs at t = 0 like any other phase).
+    // Shader still draws at t = 0.
     s.render(surface.canvas(), w, h, &fonts, None, None, &pads);
 
-    // Round-trip through the settings file, which is what makes it survive a restart.
+    // Persist through the settings file so a restart keeps it.
     s.settings.save();
     let back = pf_client_core::trust::Settings::load();
     assert!(back.reduce_motion, "persisted");
@@ -1124,9 +1016,8 @@ fn reduce_motion_freezes_the_field_and_shortens_the_transition() {
     );
 }
 
-/// Render every console scene to PNGs for the eyeball pass (ignored; run with
-/// `PF_CONSOLE_DUMP=<dir> cargo test -p pf-console-ui --release -- --ignored dump`).
-/// CPU raster — the SkSL aurora, layers and text all run without a GPU.
+/// Ignored eyeball dump. `PF_CONSOLE_DUMP=<dir> cargo test -p pf-console-ui --release -- --ignored dump`.
+/// CPU raster: SkSL aurora, layers, and text run without a GPU.
 #[test]
 #[ignore]
 fn dump_console_screens() {
@@ -1135,9 +1026,7 @@ fn dump_console_screens() {
     let (w, h) = (1280, 800);
     let pads: Vec<PadInfo> = Vec::new();
     let dump = |shell: &mut Shell, frames: usize, sleep_ms: u64, name: &str, pad: bool| {
-        // Deterministic time: each frame is one fixed step (the sleep it stands in for, plus
-        // the ~4 ms a raster frame costs), so the dump does not depend on the machine's speed
-        // or load — the whole point of comparing two of them.
+        // Fixed step = sleep + ~4 ms raster, so two dumps compare independent of load.
         let step = sleep_ms as f64 / 1000.0 + 0.004;
         shell.fake_clock = Some((shell.fake_clock.map_or(0.0, |(t, _)| t), step));
         let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
@@ -1160,28 +1049,23 @@ fn dump_console_screens() {
         std::fs::write(format!("{dir}/{name}.png"), png.as_bytes()).unwrap();
     };
 
-    // Home, settled, with a pad (Letters glyphs).
     let (mut s, console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
     dump(&mut s, 40, 8, "01-home", true);
 
-    // The host menu — Up on the focused saved tile. The home frame above carries the new
-    // ▲ Options hint that leads here, so the two are worth eyeballing together.
+    // Up on the focused saved tile. Eyeball with 01-home: that frame carries the Options hint.
     s.handle_menu(MenuEvent::Move(MenuDir::Up));
     dump(&mut s, 40, 8, "01b-host-options", true);
     s.handle_menu(MenuEvent::Back);
     dump(&mut s, 20, 8, "_settle0", true);
 
-    // Mid-push into Settings (the transition still): a couple of fast frames land
-    // the capture around p ≈ 0.4 — both layers visible.
+    // A few fast frames land around p ≈ 0.4 — both layers visible.
     s.handle_menu(MenuEvent::Tertiary);
     dump(&mut s, 3, 25, "02-transition", true);
     dump(&mut s, 40, 8, "03-settings", true);
 
-    // The Interface tab (5 shoulder presses along) leads with the Background row, so these
-    // frames show the strip mid-list AND the palette picker. Palettes are set directly rather
-    // than by counting Confirm presses, so reordering the table can't silently shoot the wrong
-    // one. Each is a whole LOOK, not just a backdrop: accent, ink and scrim move together, so
-    // the pale ones must be eyeballed with dark text on them.
+    // Interface tab leads with Background. Palettes are set by id, not Confirm counts,
+    // so reordering the table cannot shoot the wrong one. Accent, ink and scrim move
+    // together: pale palettes need dark text on them.
     for _ in 0..5 {
         s.handle_menu(MenuEvent::JumpForward);
     }
@@ -1189,12 +1073,10 @@ fn dump_console_screens() {
         s.settings.ui_palette = id.to_string();
         dump(&mut s, 40, 8, &format!("03-settings-{id}"), true);
     }
-    // Back to the first tab so the later scenes look like they always did.
     for _ in 0..5 {
         s.handle_menu(MenuEvent::JumpBack);
     }
-    // …and the LAUNCHER at full contrast under a few of them — the backdrop's loudest form,
-    // and the one the palettes are really chosen by.
+    // Home at full contrast under a few palettes: the backdrop's loudest form.
     s.handle_menu(MenuEvent::Back);
     dump(&mut s, 20, 8, "_settle", true);
     for id in ["nebula", "sunset", "holo"] {
@@ -1206,13 +1088,13 @@ fn dump_console_screens() {
     s.handle_menu(MenuEvent::Tertiary); // back into Settings for the scenes below
     dump(&mut s, 20, 8, "_settle3", true);
 
-    // Add Host with the keyboard tray up (keyboard glyph style: no pad).
+    // Add Host with the keyboard tray; no pad so the glyphs are keyboard-style.
     s.handle_menu(MenuEvent::Back);
     dump(&mut s, 40, 8, "_back", true);
     for _ in 0..3 {
         s.handle_menu(MenuEvent::Move(MenuDir::Right));
     }
-    s.handle_menu(MenuEvent::Confirm); // Add Host screen
+    s.handle_menu(MenuEvent::Confirm);
     dump(&mut s, 40, 8, "04-addhost", false);
     s.handle_menu(MenuEvent::Confirm); // open the Name keyboard
     for ev in [
@@ -1224,7 +1106,6 @@ fn dump_console_screens() {
     }
     dump(&mut s, 40, 8, "05-addhost-keyboard", false);
 
-    // Pair (focused on the unpaired discovered host).
     s.handle_menu(MenuEvent::Back); // close keyboard
     s.handle_menu(MenuEvent::Back); // leave add-host
     dump(&mut s, 40, 8, "_back2", true);
@@ -1232,7 +1113,6 @@ fn dump_console_screens() {
     s.handle_menu(MenuEvent::Confirm);
     dump(&mut s, 40, 8, "06-pair", true);
 
-    // Library with placeholder posters.
     library.set_games(
         [
             "Hades II",
@@ -1256,10 +1136,7 @@ fn dump_console_screens() {
         })
         .collect(),
     );
-    // A shell parked on this host's shelf. A closure rather than one inline block because
-    // there are three scenes over it now — the coverflow, and the sort/view bar at both
-    // palette poles — and each needs its own shell, since the entrance and the bar's focus
-    // are per-shell state that cannot be rewound.
+    // Fresh shell per scene: entrance and bar focus are per-shell and cannot be rewound.
     let shelf_shell = || {
         let console2 = ConsoleShared::default();
         console2.set_hosts(hosts());
@@ -1278,44 +1155,28 @@ fn dump_console_screens() {
     let mut s2 = shelf_shell();
     s2.handle_menu(MenuEvent::Move(MenuDir::Right));
     s2.handle_menu(MenuEvent::Move(MenuDir::Right));
-    // 80 frames, not 40: this shelf carries no art, so it takes the entrance's 400 ms
-    // art-wait deadline, and until that expires the screen is deliberately the loading
-    // spinner. At 40×8 ms the dump could finish inside the wait and shoot the SPINNER while
-    // claiming to be the coverflow — a screenshot that lies is worse than a missing one.
+    // 80 frames, not 40: no art means the 400 ms art-wait deadline, and 40×8 ms can
+    // finish inside it and dump the spinner as the coverflow.
     dump(&mut s2, 80, 8, "07-library", true);
 
-    // …and the same shelf with the SORT/VIEW bar focused, which is the only state that draws
-    // the bar's accent wash. There was no shot of it, which is how the wash shipped covering
-    // the whole 46 dp band while its content occupies the top 34 — 2 dp of padding above the
-    // pills and 14 below, a backdrop its own content visibly sat high inside. Shot at BOTH
-    // palette poles because the wash is `accent(0.14)`: a translucent accent reads differently
-    // over a dark field than over a pale one, and this crate has been bitten by exactly that.
+    // Sort/view bar focused: the only state that draws the accent wash. Both palette
+    // poles — `accent(0.14)` reads differently over dark than pale.
     for (name, palette) in [
         ("07c-library-bar", "violet"),
         ("07c-library-bar-mint", "mint"),
     ] {
         let mut s4 = shelf_shell();
         s4.settings.ui_palette = palette.to_string();
-        // Settle the shelf first (same 400 ms art-wait as above), THEN Up to the bar: pressing
-        // before the field exists would be swallowed and the bar would never take focus.
+        // Settle the shelf first (same 400 ms art-wait). Up before the field exists is swallowed.
         dump(&mut s4, 80, 8, "_07c-settle", true);
         s4.handle_menu(MenuEvent::Move(MenuDir::Up));
         dump(&mut s4, 20, 8, name, true);
     }
 
-    // Collections, the drill-in, on a library that actually has PLATFORMS — the scene above
-    // has none, so collating it would yield one group and witness nothing.
-    //
-    // The order below is load-bearing, and the reason there was no collections scene until a
-    // tile redesign needed one. `adopt_art` is a ONE-SHOT snapshot taken the moment Y is
-    // pressed, so art has to be pushed AND the shelf given frames to decode it BEFORE the
-    // press. Press first and every tile renders its monogram, and a deck of covers looks
-    // exactly like a deck that was never built.
-    //
-    // That same ordering — art before the game list — is what the fake-library dev hook does,
-    // and it MASKS the shelf's entrance defect (art is already decoded on the first Ready
-    // frame, so the entrance arms immediately). These scenes are evidence about the collection
-    // TILE and nothing else; do not read them as saying the entrance is well.
+    // `adopt_art` is a one-shot at the Y press: push art and give the shelf frames to
+    // decode it first, or every tile is a monogram. Art-before-list is also what the
+    // fake-library hook does, which masks the entrance defect — these scenes are about
+    // the collection tile, not the entrance.
     for (name, palette) in [
         ("07b-collections", "violet"),
         ("07b-collections-mint", "mint"),
@@ -1326,9 +1187,8 @@ fn dump_console_screens() {
         s3.handle_menu(MenuEvent::Secondary);
         dump(&mut s3, 40, 8, name, true);
     }
-    // …and the same screen with NOTHING decoded: the ghost slots and the monogram badge, which
-    // is the permanent look of a platform full of art-less ROM entries rather than a loading
-    // state. Pale, because that is where a hardcoded face strands its own initials.
+    // Nothing decoded: ghost slots and the monogram badge — the permanent look of
+    // art-less ROM entries. Pale, where a hardcoded face strands its initials.
     {
         let (mut s3, _c3, _l3) = collections_shell_no_art();
         s3.settings.ui_palette = "mint".to_string();
@@ -1337,7 +1197,6 @@ fn dump_console_screens() {
         dump(&mut s3, 40, 8, "07b-collections-noart", true);
     }
 
-    // The wake and connecting overlays + a toast.
     console.set_wake(Some(WakeStatus {
         key: "bb22".into(),
         name: "Office Tower".into(),
@@ -1363,10 +1222,8 @@ fn dump_console_screens() {
     s.session_failed("Connection timed out");
     dump(&mut s, 10, 8, "10-toast", true);
 
-    // The TV-remote legend (Android platform, keys driving): the OK and ↩ badges, the
-    // ▲ section pointer, the hidden Y/X hints, and the remote chip mark — Home and the
-    // hint-dense Settings. The platform flip is legends-only for these two frames; the
-    // stack was built desktop, so only the glyphs and the Android row set differ.
+    // Android + keys: OK/↩ badges, section pointer, hidden Y/X, remote chip. Platform
+    // flip is legends-only; the stack was built desktop.
     dump(&mut s, 30, 8, "_remote-settle", true);
     s.platform = crate::platform::Platform::Android;
     s.note_input_source(crate::console::InputSource::Keys);
@@ -1375,11 +1232,8 @@ fn dump_console_screens() {
     dump(&mut s, 40, 8, "11b-settings-remote", false);
 }
 
-/// A 2:3 poster, PNG-encoded, in a colour derived from `seed`.
-///
-/// Real encoded bytes rather than a stub, because the thing under test is the decode path:
-/// `LibraryScreen` feeds these to `Image::from_encoded`, and a shape that fails to decode is
-/// indistinguishable in a screenshot from a tile that chose to draw no cover.
+/// A 2:3 poster, PNG-encoded, colour from `seed`. Real bytes: `LibraryScreen` feeds
+/// these to `Image::from_encoded`, and a decode miss looks like a tile with no cover.
 fn poster_png(seed: usize) -> Vec<u8> {
     let mut surface = skia_safe::surfaces::raster_n32_premul((60, 90)).unwrap();
     let hue = [
@@ -1391,8 +1245,7 @@ fn poster_png(seed: usize) -> Vec<u8> {
     surface
         .canvas()
         .clear(skia_safe::Color4f::new(hue.0, hue.1, hue.2, 1.0));
-    // A darker band across the lower third, so a cover is visibly ORIENTED — a flat colour
-    // would hide a cover drawn upside-down or with its aspect wrong.
+    // Darker band on the lower third so a flipped or wrong-aspect cover is visible.
     surface.canvas().draw_rect(
         skia_safe::Rect::from_xywh(0.0, 62.0, 60.0, 28.0),
         &crate::theme::fill(skia_safe::Color4f::new(
@@ -1410,8 +1263,6 @@ fn poster_png(seed: usize) -> Vec<u8> {
         .to_vec()
 }
 
-/// Games across four platforms — what the collections screen is for, and what the flat
-/// `platform: None` library above cannot produce.
 fn platform_games() -> Vec<crate::library::LibraryGame> {
     [
         ("Gran Turismo 6", "PlayStation 3"),
@@ -1473,8 +1324,7 @@ fn collections_shell_no_art() -> (Shell, ConsoleShared, crate::library::LibraryS
     collections_shell_inner(false)
 }
 
-/// The bounding box of everything lit on a raster surface, in pixels: `(left, right, bottom)`.
-/// White ink on a cleared black field, so any channel answers.
+/// Bounding box of lit pixels: `(left, right, bottom)`. White ink on black, any channel.
 fn ink_bounds(surface: &mut skia_safe::Surface, w: i32, h: i32) -> (i32, i32, i32) {
     let mut pixels = vec![0u8; (w * h * 4) as usize];
     let info = skia_safe::ImageInfo::new_n32_premul((w, h), None);
@@ -1495,14 +1345,8 @@ fn ink_bounds(surface: &mut skia_safe::Surface, w: i32, h: i32) -> (i32, i32, i3
     (left, right, bottom)
 }
 
-/// A screen heading starts on its column and stays on ONE line.
-///
-/// Both halves are the defect this replaced. The heading used to be centred, which read as a
-/// floating label rather than as a section heading — every other punktfunk client anchors it
-/// to the leading edge — and, being a wrapping paragraph, a long host name grew a SECOND line
-/// downward into the screen's content. Asserted against a control render of the same string
-/// with room to spare rather than against a pixel row, so the line box is Geist's to define:
-/// the clamped heading must occupy the same one line the unclamped one does.
+/// Compared to an unclamped control of the same string so Geist defines the line
+/// box: the clamped heading must occupy the same one line the unclamped one does.
 #[test]
 fn a_heading_starts_on_its_column_and_never_takes_a_second_line() {
     let fonts = crate::theme::build_fonts().unwrap();
@@ -1527,8 +1371,7 @@ fn a_heading_starts_on_its_column_and_never_takes_a_second_line() {
         ink_bounds(&mut surface, w, h)
     };
 
-    // Room to spare: one line, and the ink begins at the column (a cap's left sidebearing
-    // puts it a pixel or two right of the paragraph's origin, never left of it).
+    // One line; a cap's left sidebearing sits a pixel or two right of origin, never left.
     let (loose_left, loose_right, loose_bottom) = render(1100.0);
     assert!(
         (loose_left as f64) >= x - 1.0 && (loose_left as f64) < x + 0.1 * 1100.0,
@@ -1539,8 +1382,7 @@ fn a_heading_starts_on_its_column_and_never_takes_a_second_line() {
         "the control render was clipped by the surface"
     );
 
-    // Squeezed: it ellipsizes inside the budget instead of wrapping, so its ink ends where
-    // the budget does and its bottom stays on the control's single line.
+    // Ellipsize inside the budget instead of wrapping: right edge at the budget, same bottom.
     let budget = 300.0;
     let (tight_left, tight_right, tight_bottom) = render(budget);
     assert_eq!(
@@ -1559,20 +1401,10 @@ fn a_heading_starts_on_its_column_and_never_takes_a_second_line() {
     );
 }
 
-/// The console's geometry is ANTI-ALIASED — the defect this pins shipped in the overhaul and
-/// was only caught by looking at a Deck.
-///
-/// Skia defaults `SkPaint::fAntiAlias` to FALSE, so `Paint::new(colour, None)` — the terse and
-/// obvious way to write a draw call — produces hard-stepped edges. The console drew nearly
-/// everything that way: glass panels, the badge round-rects, the online pip, the D-pad and
-/// PlayStation glyph paths. Only paints that happened to be mutated for some other reason (a
-/// stroke style, a width) had picked up a `set_anti_alias(true)` along the way, which is why
-/// the console shipped smooth 1 px rings sitting on top of jagged fills.
-///
-/// Asserted on a SHAPE rather than on a screen: a full render is a poor witness here — one
-/// jagged corner is a few dozen pixels in 1.02 M, and no threshold that catches it survives an
-/// unrelated palette tweak. A lone circle on a blank field is unambiguous. With AA its boundary
-/// is a ring of PARTIAL coverage; without it every pixel is one of exactly two values.
+/// Skia defaults `SkPaint::fAntiAlias` to false, so `Paint::new(colour, None)` hard-steps.
+/// Asserted on a lone circle: a full render hides a few dozen jagged pixels in 1.02 M,
+/// and no threshold that catches them survives a palette tweak. With AA the boundary
+/// is a ring of partial coverage; without it every pixel is one of two values.
 #[test]
 fn geometry_is_anti_aliased() {
     let (w, h) = (64, 64);
@@ -1580,8 +1412,7 @@ fn geometry_is_anti_aliased() {
     surface
         .canvas()
         .clear(skia_safe::Color4f::new(0.0, 0.0, 0.0, 1.0));
-    // Deliberately off the pixel grid: a circle centred on a half-pixel has an edge that
-    // cannot be represented exactly, which is when AA is the whole difference.
+    // Off the pixel grid: a half-pixel centre has an edge that cannot be exact, so AA matters.
     surface.canvas().draw_circle(
         skia_safe::Point::new(31.5, 31.5),
         20.3,
@@ -1594,7 +1425,7 @@ fn geometry_is_anti_aliased() {
         surface.read_pixels(&info, &mut pixels, (w * 4) as usize, (0, 0)),
         "raster surface read-back"
     );
-    // Red channel alone — the fill is white on black, so all three agree.
+    // White on black: all three channels agree, so red alone is enough.
     let partial = pixels
         .chunks_exact(4)
         .filter(|px| (8..248).contains(&px[0]))
@@ -1606,16 +1437,9 @@ fn geometry_is_anti_aliased() {
     );
 }
 
-/// A shader-painted element actually PAINTS — the second trap in the same corner, and the one
-/// that cost a whole screenshot round.
-///
-/// Skia modulates a shader's output by the paint's ALPHA. `Paint::default` is opaque black, so
-/// the console's gradients and the aurora's runtime effect never noticed the rule existed; the
-/// moment those paints were rebuilt from a "the shader supplies the colour anyway" transparent
-/// placeholder, every one of them drew NOTHING. Not dimmer, not wrong-coloured — absent: the
-/// backdrop, the badge, the vignette and the panel's gradient stroke all vanished at once, and
-/// every test still passed, because a test that only renders a frame cannot tell a missing layer
-/// from a dark one. `theme::shaded` is opaque by construction; this holds it to that.
+/// Skia modulates a shader by the paint's alpha. `Paint::default` is opaque black so
+/// gradients never noticed; a transparent "shader supplies the colour" placeholder
+/// draws nothing. `theme::shaded` is opaque by construction; this holds it to that.
 #[test]
 fn a_shaded_paint_is_opaque_enough_to_draw() {
     let (w, h) = (32, 32);
@@ -1662,18 +1486,12 @@ fn a_shaded_paint_is_opaque_enough_to_draw() {
     );
 }
 
-/// …and every paint in the crate is built by `theme::fill`/`stroke`/`layer`, so the assertion
-/// above keeps holding for code written after it.
-///
-/// A pixel test can only witness the shapes it happens to draw; this witnesses the CLASS. The
-/// trap is that the aliased spelling is the NATURAL one — `&Paint::new(c, None)` passed inline
-/// as an argument, no binding, no obvious place to hang a flag — so it reappears whenever a new
-/// draw call is written, in whichever file is being worked on that day. Reading the crate's own
-/// source is the only check that scales to that.
+/// Every paint in the crate is built by `theme::fill`/`stroke`/`layer`. A pixel test
+/// only witnesses the shapes it draws; this witnesses the class. `&Paint::new(c, None)`
+/// is the natural inline spelling, so it reappears in whichever file is being written.
 #[test]
 fn paints_are_built_by_the_theme_constructors() {
-    // Split so the needles do not appear literally in this file — the scan reads its own
-    // source too, and a self-match is the first thing this test did.
+    // Concat so the needles do not appear in this file — the scan reads its own source.
     let needles = [concat!("Paint", "::new("), concat!("Paint", "::default()")];
     let mut offenders = Vec::new();
     let mut stack = vec![std::path::PathBuf::from(concat!(
@@ -1690,8 +1508,7 @@ fn paints_are_built_by_the_theme_constructors() {
             if path.extension().is_none_or(|e| e != "rs") {
                 continue;
             }
-            // theme.rs holds the sanctioned constructors, and is the one place the raw ones
-            // are allowed.
+            // theme.rs holds the sanctioned constructors; raw paints are allowed there only.
             if path.file_name().is_some_and(|f| f == "theme.rs") {
                 continue;
             }

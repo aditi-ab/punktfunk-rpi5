@@ -1,17 +1,11 @@
-//! Windows display-topology helpers (plan §W6), extracted from the host's `windows/{win_display,
-//! monitor_devnode,display_events}.rs` so the IDD-push capturer (`pf-capture`) and the pf-vdisplay
-//! backend (the host) depend on them as a leaf PEER instead of the capturer reaching back into the
-//! orchestrator. Windows-only; compiles to an empty lib elsewhere.
+//! Windows display-topology helpers. Leaf peer for the IDD-push capturer (`pf-capture`) and the
+//! pf-vdisplay host backend; Windows-only, empty lib elsewhere.
 //!
 //! - [`win_display`]: CCD/GDI path activation, mode-setting, HDR advanced-colour toggles, and the
 //!   source-desktop geometry the capturer duplicates.
 //! - [`monitor_devnode`]: PnP monitor devnode enable/disable (the parallel-display isolation lever).
-//! - [`display_events`]: the `WM_DISPLAYCHANGE` / device-arrival watch that lets a capture stall say
+//! - [`display_events`]: `WM_DISPLAYCHANGE` / device-arrival watch so a capture stall can say
 //!   whether an OS display event coincided with it.
-
-// `win_display` has denied both unsafe-proof lints since its CCD helpers stopped being `unsafe fn`;
-// hoist that to the crate root so the smaller modules (`input_desktop`, `monitor_devnode`,
-// `display_events`) and any future one are covered by default rather than by remembering to opt in.
 
 #[cfg(target_os = "windows")]
 pub mod adl_emul;
@@ -22,18 +16,16 @@ pub mod display_events;
 mod input_desktop;
 #[cfg(target_os = "windows")]
 pub mod monitor_devnode;
-/// Cross-crate "topology churn in flight" latch (pure std — no Windows surface, so unconditionally
-/// compiled and unit-tested on every platform).
+/// Cross-crate "topology churn in flight" latch. Pure std — no Windows surface, so compiled and
+/// unit-tested on every platform.
 pub mod topology_churn;
 #[cfg(target_os = "windows")]
 pub mod win_display;
 
-/// `Some((own_session, console_session))` when this process is NOT in the active console session —
-/// the state where every `SetDisplayConfig`/CDS write fails `ERROR_ACCESS_DENIED`, GDI reads
-/// describe the wrong session's displays, and input compose kicks go nowhere (the lid-closed /
-/// non-console field failure mode). The IDD-push capturer uses it to phrase a diagnostic when the
-/// driver won't attach. (A byte-copy of the host's `interactive::console_session_mismatch`: it lives
-/// here too so `pf-capture` gets it as a leaf peer instead of reaching into the orchestrator.)
+/// `Some((own_session, console_session))` when this process is not in the active console session —
+/// every `SetDisplayConfig`/CDS write then fails `ERROR_ACCESS_DENIED`, GDI reads describe the
+/// wrong session, and input compose kicks go nowhere. The IDD-push capturer uses it to phrase a
+/// diagnostic when the driver won't attach.
 #[cfg(target_os = "windows")]
 pub fn console_session_mismatch() -> Option<(u32, u32)> {
     use windows::Win32::System::RemoteDesktop::{

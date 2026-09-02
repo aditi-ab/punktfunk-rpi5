@@ -1,9 +1,11 @@
-//! Erasure coding. Two backends behind one [`ErasureCoder`] trait: GF(2⁸) (classic
-//! Reed–Solomon, Moonlight-compatible, P1) and GF(2¹⁶) Leopard-RS (the wall-breaker, P2).
+//! Erasure coding. [`ErasureCoder`] fronts two backends: GF(2⁸) Cauchy
+//! Reed–Solomon (Moonlight `nanors`) and GF(2¹⁶) Leopard-RS.
 //!
-//! The wall this breaks: GameStream's GF(2⁸) RS caps a block at 255 shards, which at
-//! 5120×1440@240 is hit around 1 Gbps. GF(2¹⁶) raises that ceiling to 65535 shards and
-//! runs in O(n log n) with SIMD, so the per-frame shard count stops being the limiter.
+//! GF(2⁸) caps a block at 255 shards. GF(2¹⁶) raises that to 65535 and
+//! runs in O(n log n). Shard length is equal within a block.
+//!
+//! Pin GF(2⁸) with `nanors_exact_parity_vectors`. Round-trips for both
+//! backends live in this module.
 
 mod gf16;
 mod gf8;
@@ -24,23 +26,17 @@ pub enum FecError {
     Backend(&'static str),
 }
 
-/// Backend-agnostic erasure coder. All shards in a block are equal length.
+/// All shards in a block are equal length.
 pub trait ErasureCoder: Send + Sync {
     fn scheme(&self) -> FecScheme;
 
-    /// Encode `data` (K original shards) into `recovery_count` (M) parity shards.
-    /// Returns the M recovery shards. `recovery_count == 0` returns an empty `Vec`.
-    /// Takes shard *references* so the packetizer can point straight into the frame
-    /// buffer instead of copying every data byte into per-shard `Vec`s first.
+    /// `recovery_count == 0` returns empty. `data` is borrowed so the
+    /// packetizer can point into the frame buffer without a per-shard copy.
     fn encode(&self, data: &[&[u8]], recovery_count: usize) -> Result<Vec<Vec<u8>>, FecError>;
 
-    /// [`encode`](Self::encode) into caller-pooled parity buffers: on success `out` holds
-    /// exactly `recovery_count` shards, reusing its existing `Vec` allocations (extras are
-    /// truncated away, missing ones are grown once to the high-water mark). The per-frame
-    /// hot path (plan Phase 1.4) — backends also reuse their internal codec state here, so
-    /// steady-state frames cost no encoder construction and no parity allocations. The
-    /// default delegates to `encode` (correct, unpooled) for backends without an override.
-    /// On error `out`'s contents are unspecified and must not be sent.
+    /// Pooled [`encode`](Self::encode): on success `out` holds exactly
+    /// `recovery_count` shards, reusing existing `Vec`s. Default delegates
+    /// to `encode` (unpooled). On error `out` is unspecified — do not send.
     fn encode_into(
         &self,
         data: &[&[u8]],
@@ -51,9 +47,8 @@ pub trait ErasureCoder: Send + Sync {
         Ok(())
     }
 
-    /// Reconstruct the K original shards. `received` has length K+M: indices `0..K` are
-    /// originals, `K..K+M` are recovery shards; `Some` = present, `None` = lost.
-    /// Returns the K original shards in order.
+    /// `received` is length K+M: `0..K` originals, `K..` recovery;
+    /// `Some` present, `None` lost. Returns the K originals in order.
     fn reconstruct(
         &self,
         data_count: usize,
@@ -61,17 +56,10 @@ pub trait ErasureCoder: Send + Sync {
         received: &mut [Option<Vec<u8>>],
     ) -> Result<Vec<Vec<u8>>, FecError>;
 
-    /// Reconstruct ONLY the missing data shards of a block, writing each straight into its final
-    /// slot in the caller's buffer — the receive-side half of [`encode`](Self::encode)'s ref-based
-    /// contract (the reassembler's slots are slices of one contiguous frame buffer, so recovery
-    /// lands at its final AU offset with no per-shard `Vec`s and no block/AU concat copies).
-    ///
-    /// `data` holds the block's K equal-length shard slots; `have[i]` marks the slots whose bytes
-    /// were received (valid codec input — a missing slot's contents are unspecified on entry).
-    /// `recovery` is the received parity as `(recovery_index, bytes)` with `recovery_index <
-    /// recovery_count` (the block's declared M, which the codec math needs even when not all M
-    /// arrived). On success every missing slot has been filled; on error missing slots are
-    /// unspecified and the caller must discard the block.
+    /// Fill missing data shards in the caller's slots. A missing slot's
+    /// bytes are unspecified on entry. `recovery` is `(index, bytes)` with
+    /// `index < recovery_count` (declared M; the math needs M even when
+    /// not every parity shard arrived). On error, discard the block.
     fn reconstruct_into(
         &self,
         recovery_count: usize,
@@ -81,7 +69,6 @@ pub trait ErasureCoder: Send + Sync {
     ) -> Result<(), FecError>;
 }
 
-/// Construct the coder for a scheme.
 pub fn coder_for(scheme: FecScheme) -> Box<dyn ErasureCoder> {
     match scheme {
         FecScheme::Gf8 => Box::new(Gf8Coder::default()),
@@ -89,10 +76,7 @@ pub fn coder_for(scheme: FecScheme) -> Box<dyn ErasureCoder> {
     }
 }
 
-/// Validate the shape `reconstruct` promises: `received.len() == data + recovery`, and
-/// every present shard shares one length. Both backends call this first so neither the
-/// fast path nor a malformed caller can slip mismatched-length or wrong-count shards
-/// through (the fast paths bypass the backend's own length checks otherwise).
+/// Both backends call this first; their fast paths skip their own checks.
 pub(crate) fn validate_block_shape(
     received: &[Option<Vec<u8>>],
     data_count: usize,
@@ -116,9 +100,7 @@ pub(crate) fn validate_block_shape(
     Ok(())
 }
 
-/// Validate the shape [`ErasureCoder::reconstruct_into`] promises: `have` matches `data`, one
-/// shard length across data slots and recovery shards, recovery indices within the declared M,
-/// and enough shards present to reconstruct at all. Both backends call this first.
+/// Both backends call this first.
 pub(crate) fn validate_into_shape(
     data: &[&mut [u8]],
     have: &[bool],
@@ -153,7 +135,6 @@ pub(crate) fn validate_into_shape(
     Ok(())
 }
 
-/// Validate `encode` inputs: at least one data shard, all of equal length.
 pub(crate) fn validate_encode_shape(data: &[&[u8]]) -> Result<(), FecError> {
     let first = data
         .first()
@@ -169,8 +150,6 @@ pub(crate) fn validate_encode_shape(data: &[&[u8]]) -> Result<(), FecError> {
 mod tests {
     use super::*;
 
-    /// Round-trip a block through a coder, losing exactly `lose` shards (some data,
-    /// some recovery), and assert the originals come back byte-identical.
     fn roundtrip(coder: &dyn ErasureCoder, k: usize, m: usize, shard_len: usize, lose: &[usize]) {
         let data: Vec<Vec<u8>> = (0..k)
             .map(|i| (0..shard_len).map(|b| (i * 31 + b * 7) as u8).collect())
@@ -190,9 +169,8 @@ mod tests {
         assert_eq!(restored, data);
     }
 
-    /// Round-trip through `reconstruct_into`: encode, zero out `lose_data` slots in a contiguous
-    /// buffer (the reassembler's frame-buffer shape), drop `lose_recovery` parity shards, and
-    /// assert the missing slots are restored in place while the present ones are untouched.
+    /// `reconstruct_into` against a contiguous buffer (reassembler frame
+    /// layout). Present slots must stay untouched.
     fn roundtrip_into(
         coder: &dyn ErasureCoder,
         k: usize,
@@ -211,7 +189,7 @@ mod tests {
         let mut have = vec![true; k];
         for (i, s) in src.iter().enumerate() {
             if lose_data.contains(&i) {
-                have[i] = false; // slot stays zeroed — codec must fill it
+                have[i] = false; // codec must fill this hole
             } else {
                 buf[i * shard_len..(i + 1) * shard_len].copy_from_slice(s);
             }
@@ -240,7 +218,7 @@ mod tests {
     fn gf16_reconstruct_into_fills_only_the_holes() {
         roundtrip_into(&Gf16Coder::default(), 16, 4, 256, &[1, 9], &[3]);
         roundtrip_into(&Gf16Coder::default(), 4, 2, 16, &[0, 3], &[]);
-        roundtrip_into(&Gf16Coder::default(), 4, 2, 16, &[], &[0, 1]); // nothing missing, no parity needed
+        roundtrip_into(&Gf16Coder::default(), 4, 2, 16, &[], &[0, 1]);
     }
 
     #[test]
@@ -252,25 +230,22 @@ mod tests {
     #[test]
     fn reconstruct_into_rejects_bad_shapes() {
         let mut buf = [0u8; 4 * 8];
-        // Too few shards: 2 of 4 data present, no recovery.
         let mut slots: Vec<&mut [u8]> = buf.chunks_mut(8).collect();
         let have = [true, true, false, false];
         assert!(Gf16Coder::default()
             .reconstruct_into(2, &mut slots, &have, &[])
             .is_err());
-        // Recovery index out of the declared range.
+        // Indices 2 and 3 are outside declared `M = 2`.
         let parity = [0u8; 8];
         let mut slots: Vec<&mut [u8]> = buf.chunks_mut(8).collect();
         assert!(Gf16Coder::default()
             .reconstruct_into(2, &mut slots, &have, &[(2, &parity), (3, &parity)])
             .is_err());
-        // Mismatched recovery shard length.
         let short = [0u8; 6];
         let mut slots: Vec<&mut [u8]> = buf.chunks_mut(8).collect();
         assert!(Gf8Coder::default()
             .reconstruct_into(2, &mut slots, &have, &[(0, &short), (1, &parity)])
             .is_err());
-        // `have` length disagreeing with `data`.
         let mut slots: Vec<&mut [u8]> = buf.chunks_mut(8).collect();
         assert!(Gf8Coder::default()
             .reconstruct_into(2, &mut slots, &[true; 3], &[(0, &parity)])
@@ -279,7 +254,7 @@ mod tests {
 
     #[test]
     fn gf8_recovers_within_budget() {
-        // 16 data + 4 recovery; lose 2 data + 2 recovery (== budget).
+        // Lose 2 data + 2 recovery: exactly the `m = 4` budget.
         roundtrip(&Gf8Coder::default(), 16, 4, 256, &[0, 7, 16, 19]);
     }
 
@@ -299,7 +274,7 @@ mod tests {
             .map(Some)
             .chain(recovery.into_iter().map(Some))
             .collect();
-        // Lose 3 with only 2 recovery shards → unrecoverable.
+        // Three losses, `m = 2` — unrecoverable.
         received[0] = None;
         received[1] = None;
         received[2] = None;
@@ -310,8 +285,7 @@ mod tests {
 
     #[test]
     fn reconstruct_rejects_wrong_received_length() {
-        // data=2, recovery=2 expects a 4-element slice; a 3-element one must error, not
-        // panic on the recovery-slice index (both backends).
+        // Length 3 vs K+M=4 must error, not panic on a recovery-slice index.
         let mut recv: Vec<Option<Vec<u8>>> = vec![Some(vec![0u8; 8]), None, Some(vec![0u8; 8])];
         assert!(Gf16Coder::default().reconstruct(2, 2, &mut recv).is_err());
         let mut recv: Vec<Option<Vec<u8>>> = vec![Some(vec![0u8; 8]), None, Some(vec![0u8; 8])];
@@ -320,7 +294,6 @@ mod tests {
 
     #[test]
     fn reconstruct_rejects_mismatched_shard_lengths() {
-        // The GF16 fast path used to clone shards verbatim without a length check.
         let mut recv: Vec<Option<Vec<u8>>> =
             vec![Some(vec![0u8; 8]), Some(vec![0u8; 6]), None, None];
         assert!(Gf16Coder::default().reconstruct(2, 2, &mut recv).is_err());

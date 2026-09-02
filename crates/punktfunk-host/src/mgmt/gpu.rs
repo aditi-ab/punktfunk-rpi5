@@ -1,95 +1,75 @@
-//! GPU-tagged management endpoints: inventory + automatic/preferred selection. Split out of the
-//! `mgmt` facade (plan §W5).
+//! GPU inventory and auto/manual preference. A preference change applies to the next session;
+//! a running session keeps the GPU it opened on.
 
 use super::shared::*;
 
-/// One hardware GPU on the host (software/WARP adapters are never listed).
+/// Hardware GPU. Software/WARP adapters are never listed.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ApiGpu {
-    /// Stable identifier (`vendorid-deviceid-occurrence`, hex PCI ids) — pass to `setGpuPreference`.
-    /// Stable across reboots and driver updates, unlike an adapter index or LUID.
+    /// `vendorid-deviceid-occurrence` (hex PCI). Stable across reboot/driver; not an index or LUID.
     #[schema(example = "10de-2c05-0")]
     id: String,
-    /// Adapter/marketing name.
     #[schema(example = "NVIDIA GeForce RTX 5070 Ti")]
     name: String,
     /// `nvidia` | `amd` | `intel` | `other`.
     vendor: String,
-    /// Dedicated VRAM in MiB (0 where the platform doesn't expose it).
+    /// 0 when the platform does not expose dedicated VRAM.
     vram_mb: u64,
 }
 
-/// The GPU the **next** session's pipeline will be created on, and why. (A preference change
-/// applies to the next session; a running session keeps the GPU it opened on.)
+/// GPU the next session opens on. A running session keeps the GPU it already opened.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ApiSelectedGpu {
     id: String,
     name: String,
     /// `nvidia` | `amd` | `intel` | `other`.
     vendor: String,
-    /// Why this GPU was selected: `preference` (the manual choice), `env`
-    /// (`PUNKTFUNK_RENDER_ADAPTER`), `auto` (max dedicated VRAM / platform default), or
-    /// `preference_missing` (a manual choice is set but that GPU is absent — auto-selected
-    /// instead so the host keeps streaming).
+    /// `preference` | `env` | `auto` | `preference_missing` (manual pick absent → auto, still stream).
     source: String,
 }
 
-/// The GPU live sessions are encoding on right now.
+/// GPU live encode sessions are on now (not the next-session pick).
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ApiActiveGpu {
-    /// Stable id matching an entry of `gpus` (empty for the CPU/software encoder).
+    /// Matches a `gpus` entry; empty when encoding on CPU/software.
     id: String,
     name: String,
     /// `nvidia` | `amd` | `intel` | `other`.
     vendor: String,
-    /// The encode backend in use (`nvenc` | `amf` | `qsv` | `vaapi` | `software`).
+    /// `nvenc` | `amf` | `qsv` | `vaapi` | `software`.
     backend: String,
-    /// Number of live encode sessions on it.
     sessions: u32,
 }
 
-/// Full GPU-selection state for the console: inventory, the persisted preference, what the next
-/// session will use, and what is in use right now.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct GpuState {
-    /// The host's hardware GPUs.
     gpus: Vec<ApiGpu>,
     /// `auto` or `manual`.
     mode: String,
-    /// The manually preferred GPU's stable id, when one is stored (kept while `mode` is `auto` so
-    /// a console can offer returning to it). May reference a GPU that is currently absent.
+    /// Stored manual pick; retained in `auto` so the console can switch back. May name an absent GPU.
     preferred_id: Option<String>,
-    /// The stored name of the preferred GPU (a usable label even when it is absent).
+    /// Label for the stored pick, kept even when that GPU is absent.
     preferred_name: Option<String>,
-    /// Whether the preferred GPU is currently present.
     preferred_available: bool,
-    /// `PUNKTFUNK_RENDER_ADAPTER` (the host.env pin), when set — it applies while `mode` is
-    /// `auto`; a manual preference overrides it.
+    /// `PUNKTFUNK_RENDER_ADAPTER` when set. Honoured in `auto`; a manual pick overrides it.
     env_override: Option<String>,
-    /// `PUNKTFUNK_ENCODER` (the host.env encoder pin), when set to something other than `auto`
-    /// (e.g. `qsv`, `nvenc`, `amf`, `software`). A pin whose vendor contradicts the selected
-    /// GPU is overridden at session open — the adapter wins — so the console can warn that the
-    /// pin is stale rather than letting the selection look broken.
+    /// `PUNKTFUNK_ENCODER` when pinned (`qsv` / `nvenc` / …, not `auto`). A vendor mismatch is
+    /// overridden at session open (adapter wins); the console uses this to flag a stale pin.
     encoder_pin: Option<String>,
-    /// The GPU the next session will use.
     selected: Option<ApiSelectedGpu>,
-    /// The GPU live sessions use right now (absent while nothing is streaming).
     active: Option<ApiActiveGpu>,
 }
 
-/// Request body for `setGpuPreference`.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct SetGpuPreference {
-    /// `auto` (env pin, else max dedicated VRAM — the default) or `manual`.
+    /// `auto` (env pin, else max dedicated VRAM) or `manual`.
     #[schema(example = "manual")]
     mode: String,
-    /// Required when `mode` is `manual`: the stable `id` of a currently listed GPU
-    /// (see `listGpus`).
+    /// Required for `manual`: a currently listed GPU `id`.
     #[schema(example = "10de-2c05-0")]
     gpu_id: Option<String>,
 }
 
-/// Build the [`GpuState`] snapshot (shared by the GET and the PUT's response).
 pub(crate) fn gpu_state() -> GpuState {
     let gpus = pf_gpu::enumerate();
     let pref = pf_gpu::prefs().get();
@@ -97,7 +77,7 @@ pub(crate) fn gpu_state() -> GpuState {
         Some(want) => {
             let found = pf_gpu::find_preferred(&gpus, want);
             let id = match found {
-                // Canonical: the present GPU's id (identity may have matched loosely).
+                // Present GPU's id: identity may have matched loosely.
                 Some(i) => gpus[i].id.clone(),
                 None => format!(
                     "{:04x}-{:04x}-{}",
@@ -154,8 +134,7 @@ pub(crate) fn gpu_state() -> GpuState {
     }
 }
 
-/// The `PUNKTFUNK_ENCODER` value worth surfacing to the console: `None` for unset/empty and for
-/// an explicit `auto` (both mean "derive from the selected adapter" — nothing is pinned).
+/// `None` for unset, empty, and `auto` — those mean "derive from the adapter", not a pin.
 fn encoder_pin_of(pref: &str) -> Option<String> {
     match pref {
         "" | "auto" => None,
@@ -167,8 +146,7 @@ fn encoder_pin_of(pref: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Only a real pin surfaces to the console — the `auto` spellings pin nothing, and showing
-    /// them would put a permanent scary note under every default install's GPU card.
+    /// `auto` / empty must not surface: the console would treat the default as a stale pin.
     #[test]
     fn encoder_pin_surfaces_only_real_pins() {
         assert_eq!(encoder_pin_of(""), None);
@@ -180,8 +158,7 @@ mod tests {
 
 /// GPU inventory and selection
 ///
-/// Lists the host's hardware GPUs, the persisted auto/manual preference, the GPU the next session
-/// will use (and why), and the GPU live sessions encode on right now.
+/// Preference changes apply to the next session; a running session keeps its GPU.
 #[utoipa::path(
     get,
     path = "/gpus",
@@ -198,10 +175,8 @@ pub(crate) async fn list_gpus() -> Json<GpuState> {
 
 /// Set the GPU preference
 ///
-/// `auto` restores automatic selection (`PUNKTFUNK_RENDER_ADAPTER` pin, else max dedicated VRAM);
-/// `manual` pins capture + encode to the given GPU. Persisted across restarts; applies to the
-/// **next** session (a running session keeps its GPU). If the preferred GPU is absent at session
-/// start the host falls back to automatic selection rather than failing.
+/// `auto` = env pin else max VRAM; `manual` pins capture+encode. Applies to the next session.
+/// An absent preferred GPU falls back to auto rather than failing the session.
 #[utoipa::path(
     put,
     path = "/gpus/preference",

@@ -1,41 +1,16 @@
-//! Intel **QSV** hardware encoder (Windows, D3D11 input) — the native-VPL replacement for the
-//! libavcodec `*_qsv` path (design/native-qsv-encoder.md), the Intel analogue of [`super::amf`]
-//! and [`super::nvenc`].
+//! Intel **QSV** hardware encoder (Windows, D3D11 input). Native-VPL analogue of
+//! [`super::amf`] and [`super::nvenc`].
 //!
-//! Why not libavcodec: the ffmpeg QSV arm defaults to a **CPU readback** per frame (the exact
-//! GPU→CPU→GPU roundtrip the video path bans), stubs every capability probe (`can_encode_10bit`
-//! hardcoded `false` — 10-bit/HDR is dead on Intel today), and can express none of RFI, in-place
-//! bitrate retarget, or in-band HDR metadata. The VPL runtime returns typed `mfxStatus` codes, so
-//! a driver wedge surfaces on the frame it happens instead of as forever-EAGAIN.
+//! Drives the statically linked MIT VPL dispatcher (`libvpl-sys`): `MFXLoad` → hardware
+//! filter → `MFXCreateSession` resolves the driver-store GPU runtime. Missing Intel
+//! driver fails session creation and open falls through — same degrade as NVENC/AMF.
+//! Feature `qsv` (cmake + libclang).
 //!
-//! Drives the **statically linked MIT VPL dispatcher** (`libvpl-sys`, vendored — no new runtime
-//! DLL): `MFXLoad` → hardware-implementation filter → `MFXCreateSession` resolves the
-//! driver-store GPU runtime (`libmfx64-gen.dll` on Gen12+/Arc/MTL, legacy `libmfxhw64.dll` on
-//! BDW→ICL). A box without an Intel driver fails session creation and the open falls through —
-//! the same degrade contract as the NVENC/AMF runtime loaders. Behind the `qsv` cargo feature
-//! (build needs cmake+libclang, both already in the closure via pyrowave-sys).
-//!
-//! Input is zero-copy by construction (design §3.4): the session is bound to the **capturer's
-//! device** (`SetHandle` before Init — same-adapter requirement enforced via LUID match against
-//! the dispatcher's implementation list), input surfaces come from the runtime's own video-memory
-//! pool (`MFXMemory_GetSurfaceForEncode`, production API 2.0), and the captured NV12/P010 texture
-//! is `CopySubresourceRegion`'d GPU-side into the surface's native texture
-//! (`FrameInterface->GetNativeHandle`). No readback path exists: a capturer that fell back to
-//! Bgra/Rgb10a2 or CPU frames is rejected at open/submit, mirroring the AMF contract. The
-//! experimental import API (`mfxSurfaceD3D11Tex2D`, still `ONEVPL_EXPERIMENTAL` at 2.17) is a
-//! later opt-in, not the shipping path.
-//!
-//! Scope (design §6): Phase 1 — AVC + HEVC (NV12/P010), bounded sync-point poll, in-place
-//! `reset()`, no-IDR `reconfigure_bitrate` (`MFXVideoENCODE_Reset` + `StartNewSequence=OFF`,
-//! legal because HRD conformance is off); Phase 2 — AV1 (DG2/Arc + MTL+; probed, never assumed),
-//! 10-bit (HEVC Main10 / AV1, P010 `Shift=1`), in-band HDR mastering/CLL
-//! (`mfxExtMasteringDisplayColourVolume`/`mfxExtContentLightLevelInfo` → HEVC prefix SEI / AV1
-//! metadata OBU at IDR) + BT.2020/PQ `mfxExtVideoSignalInfo`; Phase 3 — LTR-based RFI via
-//! `mfxExtRefListCtrl` (the [`super::amf`] slot policy verbatim: mark cadence into 2 user-LTR
-//! slots, force-reference the newest pre-loss slot, `recovery_anchor` on the forced frame),
-//! Query-gated per codec — the AV1 arm is honored by the open runtime source but spec-silent, so
-//! it stays behind the same gate and falls back to IDR wherever the driver declines. 4:4:4 stays
-//! `false` until probed on real hardware (design §8.6).
+//! Input is same-adapter D3D11 NV12/P010: `SetHandle` then GPU-side
+//! `CopySubresourceRegion` into a runtime encode surface (`MFXMemory_GetSurfaceForEncode`).
+//! No readback: Bgra/Rgb10a2 or CPU frames fail open/submit. HRD off so
+//! `reconfigure_bitrate` is a no-IDR Reset. LTR-RFI is Query-gated per codec.
+//! Evidence: `design/native-qsv-encoder.md`.
 
 use super::policy::{intra_refresh_requested, ltr_test_force_at};
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
@@ -51,8 +26,6 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 
-/// Human-readable name for the `mfxStatus` codes this module branches on or logs; everything
-/// else is reported numerically (identifiable against mfxdefs.h).
 fn sts_name(s: vpl::mfxStatus) -> &'static str {
     match s {
         vpl::MFX_ERR_NONE => "MFX_ERR_NONE",
@@ -77,21 +50,16 @@ fn sts_name(s: vpl::mfxStatus) -> &'static str {
 }
 
 fn vpl_ok(s: vpl::mfxStatus, what: &str) -> Result<()> {
-    // Warnings (> 0) are success-with-note in the VPL model (e.g. params corrected); only
-    // negative codes are failures.
+    // VPL: positive is success-with-note (params corrected); only negatives fail.
     if s < vpl::MFX_ERR_NONE {
         bail!("{what} failed: {} ({s})", sts_name(s));
     }
     Ok(())
 }
 
-// ---------------------------------------------------------------------------------------------
-// Bindgen anonymous-union accessors. The VPL C API nests anonymous structs/unions
-// (`mfxVideoParam.{mfx}` → encode-options struct → per-RC unions); these helpers pin the
-// generated `__bindgen_anon_*` paths in ONE place so the rest of the module reads like the C.
-// ---------------------------------------------------------------------------------------------
+// Bindgen union accessors. Pin `__bindgen_anon_*` here so call sites read like C.
 
-/// The encode-options view of `mfxInfoMFX` (`TargetUsage`…`EncodedOrder`).
+/// Encode-options view of `mfxInfoMFX` (the generated union is unreadable at call sites).
 type EncOpts = vpl::mfxInfoMFX__bindgen_ty_1__bindgen_ty_1;
 
 fn mfx_of(par: &mut vpl::mfxVideoParam) -> &mut vpl::mfxInfoMFX {
@@ -122,8 +90,7 @@ fn frame_wh(info: &mut vpl::mfxFrameInfo) -> &mut vpl::mfxFrameInfo__bindgen_ty_
     unsafe { &mut info.__bindgen_anon_1.__bindgen_anon_1 }
 }
 
-/// The VPL rate ceiling is `mfxU16` kbps × `BRCParamMultiplier`. Split `bps` into the smallest
-/// multiplier that fits, so high-rate sessions (the >65 Mbps streaming range) don't saturate.
+/// Split `bps` into `mfxU16` kbps × `BRCParamMultiplier` so rates above 65 Mbps still fit.
 fn split_rate(bps: u64) -> (u16, u16) {
     let kbps = (bps / 1000).max(1);
     let mult = (kbps / (u16::MAX as u64) + 1) as u16;
@@ -134,36 +101,23 @@ const fn align16(v: u32) -> u16 {
     (v.div_ceil(16) * 16) as u16
 }
 
-// ---------------------------------------------------------------------------------------------
-// LTR-RFI policy knobs — the [`super::amf`] slot machinery verbatim (design §5): two user-LTR
-// slots refreshed on a cadence; loss recovery force-references the newest pre-loss slot.
-// ---------------------------------------------------------------------------------------------
-
 const NUM_LTR_SLOTS: usize = 2;
 
-/// `PUNKTFUNK_NO_QSV_LTR` — defeat switch for the LTR-RFI path (parity with
-/// `PUNKTFUNK_NO_AMF_LTR`); loss recovery then always falls back to IDR.
+/// Defeat LTR-RFI (`PUNKTFUNK_NO_QSV_LTR`); loss recovery then always IDRs.
 fn ltr_disabled() -> bool {
     super::policy::env_flag("PUNKTFUNK_NO_QSV_LTR")
 }
 
-/// Frames between LTR marks ([`super::policy::ltr_interval_env`] overrides); default ~1/4 s
-/// so a loss usually finds a slot only a few frames old.
+/// Frames between LTR marks. Default ~1/4 s so a loss usually finds a recent slot.
 fn ltr_mark_interval(fps: u32) -> i64 {
     super::policy::ltr_interval_env().unwrap_or_else(|| (fps as i64 / 4).max(1))
 }
 
-/// The intra-refresh wave period, narrowed to the `mfxU16` field's useful 8..=240
-/// ([`super::policy::intra_refresh_period`] parses the shared knob).
+/// Intra-refresh wave period, clamped to the `mfxU16` field's useful 8..=240.
 fn intra_refresh_period(fps: u32) -> u16 {
     super::policy::intra_refresh_period(fps).clamp(8, 240) as u16
 }
 
-// ---------------------------------------------------------------------------------------------
-// Dispatcher plumbing: loader/session guards + Intel-implementation enumeration.
-// ---------------------------------------------------------------------------------------------
-
-/// Owned `mfxLoader` (dispatcher instance) — `MFXUnload` on drop.
 struct Loader(vpl::mfxLoader);
 impl Drop for Loader {
     fn drop(&mut self) {
@@ -174,7 +128,7 @@ impl Drop for Loader {
     }
 }
 
-/// Owned `mfxSession` — `MFXClose` on drop (closes the encoder too if still open).
+/// Owned `mfxSession`. `MFXClose` also tears down an encoder still open on it.
 struct Session(vpl::mfxSession);
 impl Drop for Session {
     fn drop(&mut self) {
@@ -186,17 +140,14 @@ impl Drop for Session {
     }
 }
 
-/// One dispatcher-enumerated hardware implementation: its index (for `MFXCreateSession`) and
-/// the adapter LUID it lives on (`mfxExtendedDeviceId`, zero when the runtime couldn't say).
+/// Dispatcher hardware impl: `MFXCreateSession` index plus adapter LUID (zero if unknown).
 struct VplImpl {
     index: u32,
     luid: [u8; 8],
     luid_valid: bool,
 }
 
-/// Create a loader filtered to **Intel hardware** implementations and enumerate them. The
-/// filter properties go through per-property `mfxConfig` objects (the dispatcher contract:
-/// one property per config handle).
+/// Loader filtered to Intel hardware. Dispatcher contract: one property per `mfxConfig`.
 fn intel_loader() -> Result<(Loader, Vec<VplImpl>)> {
     // SAFETY: plain dispatcher C calls on handles owned by this function. Each config handle is
     // owned by the loader (released by MFXUnload); the `mfxVariant`s are by-value. The
@@ -236,7 +187,7 @@ fn intel_loader() -> Result<(Loader, Vec<VplImpl>)> {
                 &mut hdl,
             );
             if sts != vpl::MFX_ERR_NONE || hdl.is_null() {
-                break; // MFX_ERR_NOT_FOUND past the last implementation
+                break; // MFX_ERR_NOT_FOUND past the last impl
             }
             let dev = &*(hdl as *const vpl::mfxExtendedDeviceId);
             impls.push(VplImpl {
@@ -250,8 +201,7 @@ fn intel_loader() -> Result<(Loader, Vec<VplImpl>)> {
     }
 }
 
-/// The DXGI adapter LUID of a live D3D11 device, as the little-endian byte layout
-/// `mfxExtendedDeviceId::DeviceLUID` uses (a straight memcpy of the Windows `LUID`).
+/// DXGI adapter LUID in the little-endian layout `mfxExtendedDeviceId::DeviceLUID` uses.
 fn device_luid(device: &ID3D11Device) -> Option<[u8; 8]> {
     // SAFETY: standard COM navigation on a live device; every interface is an owned
     // windows-rs wrapper released on drop, and `GetDesc` fills a plain out-struct.
@@ -265,9 +215,8 @@ fn device_luid(device: &ID3D11Device) -> Option<[u8; 8]> {
     }
 }
 
-/// Create a session on the implementation living on `luid` (the capture device's adapter —
-/// the same-device requirement every backend enforces). `None` LUID (or no match) picks the
-/// first Intel implementation, which is only correct on the boxes where there is exactly one.
+/// Session on the capture adapter. `None` / no match picks the first Intel impl — only
+/// correct when the box has exactly one.
 fn create_session(target_luid: Option<[u8; 8]>) -> Result<(Loader, Session, (u16, u16))> {
     let (loader, impls) = intel_loader()?;
     if impls.is_empty() {
@@ -278,10 +227,8 @@ fn create_session(target_luid: Option<[u8; 8]>) -> Result<(Loader, Session, (u16
         .unwrap_or(&impls[0]);
     if let Some(want) = target_luid {
         if !(chosen.luid_valid && chosen.luid == want) {
-            // Static configuration mismatch — the capture adapter has no Intel VPL
-            // implementation, so every rebuild re-hits this same wall. The terminal marker
-            // makes the stream loop end the session at once instead of spending its reset
-            // budget (5 futile rebuilds, then an opaque loop as the client reconnects).
+            // Capture adapter is not Intel VPL. Terminal so the stream loop ends
+            // instead of burning the reset budget on the same mismatch.
             return Err(anyhow::Error::new(super::TerminalEncoderError).context(
                 "capture device's adapter is not an Intel VPL implementation (hybrid box? \
                      point PUNKTFUNK_RENDER_ADAPTER / the web-console GPU preference at the \
@@ -306,16 +253,10 @@ fn create_session(target_luid: Option<[u8; 8]>) -> Result<(Loader, Session, (u16
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Parameter construction. The ext-buffer chain is owned by `ParamSet` so every pointer the
-// `mfxVideoParam` hands to the runtime stays alive for the duration of the Init/Query/Reset
-// call it is used in.
-// ---------------------------------------------------------------------------------------------
-
 /// `NumRefFrame`: 2 short-term + the 2 LTR slots.
 const NUM_REF_FRAMES: u16 = 4;
 
-/// A fully-built `mfxVideoParam` + the ext-buffer storage its `ExtParam` points into.
+/// `mfxVideoParam` plus the ext-buffer storage `ExtParam` points into (must outlive the call).
 struct ParamSet {
     par: vpl::mfxVideoParam,
     co: Box<vpl::mfxExtCodingOption>,
@@ -327,8 +268,7 @@ struct ParamSet {
 }
 
 impl ParamSet {
-    /// (Re)collect the ext-buffer pointer array and wire it into `par`. Must be called after
-    /// any change to which buffers exist; the boxes give each buffer a stable address.
+    /// Rebuild `ExtParam` from the live boxes. Call after any buffer is added or dropped.
     fn seal(&mut self) {
         self.ptrs.clear();
         self.ptrs
@@ -357,7 +297,7 @@ struct EncodeConfig {
     fps: u32,
     bitrate_bps: u64,
     ten_bit: bool,
-    /// Attach the intra-refresh wave (CO2) instead of running LTR.
+    /// CO2 intra-refresh wave instead of LTR (mutually exclusive).
     intra_refresh: bool,
     hdr_meta: Option<punktfunk_core::quic::HdrMeta>,
 }
@@ -371,9 +311,7 @@ fn codec_id(codec: Codec) -> u32 {
     }
 }
 
-/// Build the low-latency parameter block (design §3.3): `AsyncDepth=1`, no B-frames, VDEnc,
-/// CBR with HRD conformance off (the no-IDR bitrate-reset prerequisite), effectively-infinite
-/// GOP — IDRs happen on demand via `mfxEncodeCtrl` only.
+/// Low-latency block: `AsyncDepth=1`, no B-frames, CBR, HRD off (no-IDR Reset), infinite GOP.
 fn build_params(cfg: &EncodeConfig) -> ParamSet {
     // SAFETY: all-zero is the documented initial state for every VPL parameter struct; fields
     // are then set through the typed accessors.
@@ -395,8 +333,8 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
     {
         let e = enc_of(mfx);
         e.TargetUsage = vpl::MFX_TARGETUSAGE_BEST_SPEED as u16;
-        e.GopPicSize = u16::MAX; // effectively infinite — IDR on demand only
-        e.GopRefDist = 1; // no B-frames (latency + FIFO pairing contract)
+        e.GopPicSize = u16::MAX; // infinite GOP — IDR on demand only
+        e.GopRefDist = 1; // no B-frames (latency + FIFO pairing)
         e.IdrInterval = 0;
         e.RateControlMethod = vpl::MFX_RATECONTROL_CBR as u16;
         e.NumRefFrame = NUM_REF_FRAMES;
@@ -426,8 +364,7 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
         wh.CropH = cfg.height as u16;
     }
 
-    // mfxExtCodingOption: HRD conformance OFF — the spec's prerequisite for a bitrate Reset
-    // that "will not result in the generation of a new keyframe or sequence header".
+    // HRD off: spec prerequisite for a bitrate Reset that does not emit a keyframe.
     // SAFETY: all-zero is valid for every ext buffer; the header is then stamped.
     let mut co: Box<vpl::mfxExtCodingOption> = Box::new(unsafe { std::mem::zeroed() });
     co.Header.BufferId = vpl::MFX_EXTBUFF_CODING_OPTION as u32;
@@ -436,7 +373,7 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
     co.VuiNalHrdParameters = vpl::MFX_CODINGOPTION_OFF as u16;
     co.MaxDecFrameBuffering = NUM_REF_FRAMES;
 
-    // Intra-refresh wave (opt-in; AVC/HEVC only — the AV1 runtime has no IntRefType at all).
+    // Intra-refresh: AVC/HEVC only — AV1 has no IntRefType.
     let co2 = (cfg.intra_refresh && matches!(cfg.codec, Codec::H264 | Codec::H265)).then(|| {
         // SAFETY: all-zero is valid; header stamped below.
         let mut b: Box<vpl::mfxExtCodingOption2> = Box::new(unsafe { std::mem::zeroed() });
@@ -447,12 +384,8 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
         b
     });
 
-    // Colour signalling, written UNCONDITIONALLY (mirrors nvenc_core.rs): the input is already
-    // CSC'd to a specific matrix — BT.709 limited for SDR (the capture-side VideoConverter),
-    // BT.2020 PQ for HDR (HdrP010Converter) — so the stream must say so. An SDR stream without a
-    // colour description leaves the choice to the decoder's "unspecified" default, and
-    // Moonlight/third-party/Android-vendor decoders default to 601 at sub-HD → mis-rendered
-    // colours. (10-bit sessions are the HDR path on Windows — same coupling as NVENC.)
+    // Colour signalling is unconditional: capture already CSC'd to BT.709 limited or
+    // BT.2020 PQ. An "unspecified" stream lets decoders pick 601 at sub-HD.
     let hdr = cfg.ten_bit && cfg.codec != Codec::H264;
     let vsi = {
         // SAFETY: all-zero is valid; header stamped below.
@@ -480,27 +413,15 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
         b.Header.BufferId = vpl::MFX_EXTBUFF_MASTERING_DISPLAY_COLOUR_VOLUME as u32;
         b.Header.BufferSz = std::mem::size_of::<vpl::mfxExtMasteringDisplayColourVolume>() as u32;
         b.InsertPayloadToggle = vpl::MFX_PAYLOAD_IDR as u16;
-        // HdrMeta carries the ST.2086 G,B,R primary order in 1/50000 units — the same order and
-        // units as the SEI fields VPL mirrors, so the chromaticities copy straight through.
+        // HdrMeta is ST.2086 G,B,R in 1/50000 units — same order and units as the SEI fields.
         for (i, p) in m.display_primaries.iter().enumerate() {
             b.DisplayPrimariesX[i] = p[0];
             b.DisplayPrimariesY[i] = p[1];
         }
         b.WhitePointX = m.white_point[0];
         b.WhitePointY = m.white_point[1];
-        // BOTH luminance fields are 0.0001 cd/m² here — do NOT scale the max.
-        //
-        // The `/10_000` this used to carry followed the VPL header's *video-processing* unit
-        // (whole cd/m², which is right for VPP), but on the ENCODE path the runtime passes these
-        // straight into the ITU-T H.265 Annex D mastering-display SEI, whose unit is 0.0001 cd/m².
-        // Dividing therefore under-reported peak brightness by 10,000x. Confirmed in a real
-        // bitstream on Intel UHD 750 (2026-07-25): SEI 137 carried
-        // max_display_mastering_luminance = 1000, i.e. **0.1 nits** for a 1000-nit display, while
-        // the undivided min = 500 (0.05 nits) was correct — the asymmetry was the tell. A client
-        // tone-mapping against 0.1 nits crushes the image.
-        //
-        // Unscaled also matches every sibling: `MinDisplayMasteringLuminance` right below,
-        // `pf_frame::hdr::hevc_mastering_display_sei`, and the AMF backend.
+        // Both luminance fields are 0.0001 cd/m² — do not scale the max. VPP headers
+        // use whole cd/m²; encode copies these into HEVC Annex D SEI as-is.
         b.MaxDisplayMasteringLuminance = m.max_display_mastering_luminance;
         b.MinDisplayMasteringLuminance = m.min_display_mastering_luminance;
         b
@@ -534,8 +455,7 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
     set
 }
 
-/// A zeroed `mfxExtRefListCtrl` with every list entry marked unused
-/// (`FrameOrder = MFX_FRAMEORDER_UNKNOWN`) — the required idle state.
+/// Idle `mfxExtRefListCtrl`: every `FrameOrder` is `MFX_FRAMEORDER_UNKNOWN`.
 fn empty_reflist() -> vpl::mfxExtRefListCtrl {
     // SAFETY: all-zero is a valid `mfxExtRefListCtrl`; the header + sentinel FrameOrders are
     // stamped before use.
@@ -555,9 +475,8 @@ fn empty_reflist() -> vpl::mfxExtRefListCtrl {
     r
 }
 
-/// Per-frame encode control: the `mfxEncodeCtrl` plus the ext buffers it points at. Boxed and
-/// kept alive in the in-flight FIFO until the frame's sync point completes — EncodeFrameAsync
-/// copies the ctrl itself but NOT the attached ext buffers.
+/// Per-frame `mfxEncodeCtrl` plus ext buffers. EncodeFrameAsync copies the ctrl, not the
+/// buffers — this box stays in the in-flight FIFO until the sync point completes.
 struct FrameCtrl {
     ctrl: vpl::mfxEncodeCtrl,
     reflist: vpl::mfxExtRefListCtrl,
@@ -585,8 +504,7 @@ impl FrameCtrl {
     }
 }
 
-/// One in-flight frame: its sync point, the bitstream buffer the AU lands in, the FIFO
-/// metadata, and the ctrl keeping per-frame ext buffers alive until synced.
+/// In-flight frame. `_ctrl` keeps per-frame ext buffers alive until the sync point completes.
 struct Pending {
     syncp: vpl::mfxSyncPoint,
     bs: Box<BsBuf>,
@@ -596,8 +514,7 @@ struct Pending {
     _ctrl: Option<Box<FrameCtrl>>,
 }
 
-/// An output bitstream buffer: the backing bytes + the `mfxBitstream` describing them. Boxed so
-/// the `Data` pointer stays stable while the runtime writes into it asynchronously.
+/// Output bitstream. Boxed so `Data` stays stable while the runtime writes asynchronously.
 struct BsBuf {
     buf: Vec<u8>,
     mfx: vpl::mfxBitstream,
@@ -622,34 +539,25 @@ impl BsBuf {
     }
 }
 
-/// How many frames may be in flight before `submit` drains output to make room — with
-/// `AsyncDepth=1` the steady state is 1, this only bounds a falling-behind encoder.
+/// Cap on in-flight frames. Steady state is 1 (`AsyncDepth=1`); this only bounds a stall.
 const IN_FLIGHT_MAX: usize = 4;
 
-/// How long `submit` waits out `MFX_WRN_DEVICE_BUSY` / a full in-flight window before declaring
-/// a wedge — same shape as the AMF drain budget: generous vs a frame's encode time, far under
-/// the session watchdog's ~2 s floor.
+/// Drain budget for `DEVICE_BUSY` / a full in-flight window. One frame's encode time, far
+/// under the session watchdog's ~2 s floor.
 const BUSY_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
 
 struct Inner {
-    /// Drop order matters: the session (with its open encoder) must close before the loader
-    /// unloads the runtime — struct fields drop in declaration order.
+    /// Session must Close before the loader unloads the runtime (declaration drop order).
     session: Session,
     _loader: Loader,
-    /// The capturer's device this session is bound to (SetHandle at bring-up).
     _device: ID3D11Device,
-    /// That device's immediate context, for the GPU-side copy into the runtime's surface.
     dctx: ID3D11DeviceContext,
-    /// In-flight frames, FIFO — GopRefDist=1 means AUs complete in submit order.
+    /// In-flight FIFO. `GopRefDist=1` so AUs complete in submit order.
     pending: VecDeque<Pending>,
-    /// AUs already synced by `submit`'s backpressure drain, waiting for `poll`.
     ready: VecDeque<EncodedFrame>,
-    /// Recycled bitstream buffers. Boxed although the Vec is heap-backed: the `mfxBitstream`
-    /// address must stay stable while a buffer is in flight (`Pending` moves the SAME box out
-    /// of/into this pool, and the runtime holds `&mut mfx` across the async encode).
+    /// Recycled bitstream boxes. `mfxBitstream` address must stay stable while in flight.
     #[allow(clippy::vec_box)]
     bs_pool: Vec<Box<BsBuf>>,
-    /// Per-AU output buffer size (from `GetVideoParam` post-Init).
     bs_bytes: usize,
     frames_submitted: u64,
     first_au_logged: bool,
@@ -670,10 +578,7 @@ impl Inner {
     }
 
     fn take_bs(&mut self) -> Box<BsBuf> {
-        // Pooled buffers were sized by whatever `bs_bytes` was when they were allocated. A bitrate
-        // retarget raises the driver's worst-case AU size, so a recycled buffer can be SMALLER than
-        // the current requirement — hand those back to the allocator instead of letting the runtime
-        // write an AU into a short buffer.
+        // A bitrate retarget can raise worst-case AU size; drop pooled buffers that are now short.
         while let Some(mut b) = self.bs_pool.pop() {
             if b.mfx.MaxLength as usize >= self.bs_bytes {
                 b.recycle();
@@ -691,54 +596,40 @@ pub struct QsvEncoder {
     fps: u32,
     bitrate_bps: u64,
     ten_bit: bool,
-    /// Built lazily from the first frame's device; rebuilt when the capturer's device changes
-    /// — the same lifecycle as the NVENC/AMF backends.
+    /// Lazy from the first frame's device; rebuilt on capturer-device change.
     inner: Option<Inner>,
     bound_device: isize,
     frame_idx: i64,
     force_kf: bool,
     hdr_meta: Option<punktfunk_core::quic::HdrMeta>,
-    /// The HDR metadata baked into the live encoder's Init params, so a post-Init change can
-    /// trigger the (IDR-carrying) re-Init that refreshes the in-band SEI/OBU.
+    /// HDR metadata baked at Init. A post-Init change re-Inits so in-band SEI/OBU refreshes.
     hdr_applied: Option<punktfunk_core::quic::HdrMeta>,
-    /// The driver accepted intra-refresh at Query — gates `EncoderCaps::intra_refresh`.
+    /// Driver accepted intra-refresh — gates [`EncoderCaps::intra_refresh`].
     ir_active: bool,
-    // --- LTR-RFI recovery (the mfxExtRefListCtrl port of the AMF slot policy, design §5) ---
-    /// `mfxExtRefListCtrl` passed the per-codec Query gate at bring-up — gates
-    /// `EncoderCaps::supports_rfi` and all per-frame marking/forcing below.
+    /// `mfxExtRefListCtrl` passed the per-codec Query gate — gates [`EncoderCaps::supports_rfi`].
     ltr_active: bool,
-    /// The wire frame index stored in each LTR slot (`None` = never marked).
-    ///
-    /// This mirrors the HARDWARE DPB, so an entry must not be cleared merely because we distrust
-    /// it: nulling issues no VPL call, and the encoder keeps the frame marked long-term until that
-    /// `LongTermIdx` is re-marked or an IDR flushes it. Distrust is recorded in `ltr_tainted`
-    /// instead, so the rejection list can still NAME the entry the hardware is holding.
+    /// Wire index in each LTR slot (`None` = never marked). Mirrors the hardware DPB:
+    /// clearing an entry issues no VPL call, so the encoder keeps the frame long-term.
+    /// Distrust lives in `ltr_tainted` so RejectedRefList can still name the slot.
     ltr_slots: [Option<i64>; NUM_LTR_SLOTS],
-    /// Per-slot taint from `invalidate_ref_frames`' sweep: the mark is still live in the hardware
-    /// DPB but was encoded inside the client's corrupt window, so it may not anchor a recovery —
-    /// it must be REJECTED instead. Cleared wherever the slot is re-marked or the DPB is flushed.
+    /// Mark is live in the DPB but sat inside the client's corrupt window — reject, don't force.
+    /// Cleared on re-mark or IDR flush.
     ltr_tainted: [bool; NUM_LTR_SLOTS],
     next_ltr_slot: usize,
     ltr_mark_interval: i64,
-    /// Set by `invalidate_ref_frames`: the slot the next submitted frame force-references.
     pending_force: Option<usize>,
     ltr_test_force_at: Option<i64>,
-    /// Consecutive `reset()`s without a subsequent AU — escalates the in-place Close+Init to a
-    /// full session teardown, the same ladder as the AMF reconnect-wedge recovery.
+    /// Resets with no AU since. At 2, drop `inner` instead of Close+Init on a dead session.
     resets_without_output: u32,
 }
 
-// SAFETY: `QsvEncoder` owns raw VPL handles (loader/session/sync points) and windows-rs COM
-// handles that are not auto-`Send`. The session glue creates the encoder, drives
-// `submit`/`poll`/`flush`/`reset`, and drops it all on one dedicated encode thread; it is never
-// shared by reference across threads, and the D3D11 immediate context is only ever touched from
-// that thread — the same contract the NVENC/AMF/ffmpeg backends rely on.
+// SAFETY: raw VPL and D3D11 handles are not auto-`Send`. The session moves the encoder onto
+// one encode thread and drives it there; the immediate context is never shared.
 unsafe impl Send for QsvEncoder {}
 
 impl QsvEncoder {
-    /// Open the native QSV encoder. Fails cleanly when: no Intel hardware VPL implementation
-    /// exists (no Intel GPU/driver), the codec fails its probe (AV1 pre-DG2/MTL), or the
-    /// capture format is not the zero-copy NV12/P010 path.
+    /// Open native QSV. Fails when there is no Intel VPL impl, the codec probe declines, or
+    /// capture is not NV12/P010.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         codec: Codec,
@@ -753,16 +644,11 @@ impl QsvEncoder {
         if codec == Codec::PyroWave {
             bail!("PyroWave never opens the QSV backend");
         }
-        // AV1 is DG2/Arc + MTL and later — probe at open (never assume) so an older box fails
-        // HERE with a clear reason. The codec advertisement gates on the same probe.
+        // AV1 is DG2/Arc + MTL+ — probe here so an older box fails at open, not at lazy Init.
         if codec == Codec::Av1 && !probe_can_encode(Codec::Av1) {
             bail!("this GPU/driver declined AV1 encode (DG2/Arc or MTL+ required) — QSV probe");
         }
-        // Depth follows the delivered pixels, not the negotiated depth ([`crate::ten_bit_input`]).
-        // With the old `bit_depth >= 10 || …` shape a 10-bit-negotiated session over an 8-bit
-        // capture derived `expected = P010` and hit the bail below, ending the session at open —
-        // and taking the ffmpeg fallback with it, since that path had the same defect in a worse
-        // form (it accepted the open and then failed every frame).
+        // Depth follows delivered pixels, not negotiated depth ([`crate::ten_bit_input`]).
         let ten_bit = crate::ten_bit_input(format, bit_depth);
         if ten_bit && codec == Codec::H264 {
             bail!("native QSV: 10-bit is HEVC/AV1-only (H.264 High10 is not negotiated)");
@@ -823,16 +709,12 @@ impl QsvEncoder {
         }
     }
 
-    /// Initialise (or re-initialise) the encoder component on a live session: Query-gate the
-    /// optional features (LTR reflist, intra-refresh), Init, then size the bitstream pool from
-    /// the driver's own `BufferSizeInKB` answer. Returns `(ltr_active, ir_active, bs_bytes)`.
+    /// Query-gate LTR/IR, Init, then size the bitstream pool from `BufferSizeInKB`.
     fn init_encode(&self, session: vpl::mfxSession) -> Result<(bool, bool, usize)> {
         let cfg = self.encode_config();
         let mut set = build_params(&cfg);
-        // Query-gate mfxExtRefListCtrl per codec (design §5): attach an idle reflist to a Query
-        // copy; a driver/codec that can't honor it clears or errors it. AVC/HEVC are spec'd;
-        // AV1 is runtime-implemented but spec-silent — exactly why this is a gate, not an
-        // assumption. (Query mutates nothing on the live encoder.)
+        // Query-gate mfxExtRefListCtrl: AVC/HEVC are spec'd; AV1 is runtime-only and
+        // spec-silent. Query mutates nothing on the live encoder.
         let ltr_active = self.ltr_wanted() && {
             let mut q_in = build_params(&cfg);
             let mut q_out = build_params(&cfg);
@@ -859,17 +741,15 @@ impl QsvEncoder {
             }
             ok
         };
-        // Init validates the whole block; warnings (corrected params, partial acceleration)
-        // are logged but accepted.
+        // Warnings (corrected params, partial acceleration) are logged but accepted.
         // SAFETY: `session` is live; `set` (params + ext chain) outlives the synchronous call.
         let sts = unsafe { vpl::MFXVideoENCODE_Init(session, &mut set.par) };
         vpl_ok(sts, "MFXVideoENCODE_Init")?;
         if sts > vpl::MFX_ERR_NONE {
             tracing::debug!(status = sts_name(sts), "QSV Init returned a warning");
         }
-        // Whether we ASKED for intra-refresh. Not the same as getting it — confirmed below.
+        // Asked-for, not installed — confirmed by GetVideoParam below.
         let ir_requested = cfg.intra_refresh && set.co2.is_some();
-        // The driver's own answer for the worst-case AU size.
         // SAFETY: `session` is live; `got` and its (empty) ext chain outlive the call.
         let bs_bytes = unsafe {
             let mut got: vpl::mfxVideoParam = std::mem::zeroed();
@@ -882,23 +762,10 @@ impl QsvEncoder {
             let kb = enc_of(m).BufferSizeInKB as usize;
             (kb * mult * 1000).max(256 * 1024)
         };
-        // Intra-refresh HONESTY: ask the driver what it actually installed instead of trusting that
-        // it took what we sent. Both `Query` and `Init` can return MFX_WRN_INCOMPATIBLE_VIDEO_PARAM
-        // — a WARNING, which the code above accepts — while silently dropping the wave. Confirmed
-        // on Intel UHD 750 (2026-07-25): H.264 reports exactly that, `GetVideoParam` comes back with
-        // `IntRefType = 0`, and `ir_active` still claimed true. H.265 on the same GPU is genuinely
-        // active, so this is per-codec and cannot be decided statically.
-        //
-        // That lie is not cosmetic: `ir_active` feeds `EncoderCaps::intra_refresh`, so the session
-        // advertises gradual refresh to the client and then never emits it — the client stops
-        // requesting the IDRs it would otherwise have asked for on loss, and a lost frame is
-        // concealed instead of repaired.
-        //
-        // Deliberately a SEPARATE, best-effort query rather than a buffer chained onto the
-        // `BufferSizeInKB` call above (which is what the audit finding suggested): that value is
-        // load-bearing for every bitstream allocation, and a runtime that dislikes the chained
-        // buffer would take it down with the readback. A failure here costs only the verdict, and
-        // is resolved conservatively.
+        // Query/Init can warn INCOMPATIBLE_VIDEO_PARAM and still drop the wave
+        // (`IntRefType=0`). `ir_active` feeds `EncoderCaps::intra_refresh`; a false
+        // true stops the client asking for IDRs. Separate GetVideoParam so a dislike
+        // of CO2 cannot take down the BufferSizeInKB read.
         let ir_active = if ir_requested {
             // SAFETY: `session` is live on this thread; `got` and `co2_out` (with `ptrs` holding the
             // only reference to it) all outlive the synchronous call, and the runtime writes back
@@ -936,8 +803,6 @@ impl QsvEncoder {
         Ok((ltr_active, ir_active, bs_bytes))
     }
 
-    /// Lazy bring-up on the capturer's device (rebuilt on device change): dispatcher session on
-    /// the device's own adapter, `SetHandle`, multithread-protect the D3D11 context, Init.
     fn ensure_inner(&mut self, device: &ID3D11Device) -> Result<()> {
         let dev_raw = device.as_raw() as isize;
         if self.inner.is_some() && self.bound_device == dev_raw {
@@ -954,9 +819,8 @@ impl QsvEncoder {
             let dctx = device
                 .GetImmediateContext()
                 .context("ID3D11Device immediate context")?;
-            // The runtime touches the device from its own threads — multithread protection
-            // must be ON **before** SetHandle or the runtime rejects the device with
-            // MFX_ERR_UNDEFINED_BEHAVIOR (-16, seen on-glass on Arc).
+            // Runtime threads touch the device: protection must be ON before SetHandle
+            // or the runtime returns MFX_ERR_UNDEFINED_BEHAVIOR.
             if let Ok(mt) = dctx.cast::<ID3D11Multithread>() {
                 let _ = mt.SetMultithreadProtected(true);
             }
@@ -1007,8 +871,7 @@ impl QsvEncoder {
     }
 }
 
-/// Sync the OLDEST in-flight frame with `wait_ms`, FIFO-pairing bitstream and metadata.
-/// `Ok(Some)` = an AU; `Ok(None)` = not ready yet; `Err` = typed failure (caller resets).
+/// Sync the oldest in-flight frame. `None` = not ready; `Err` = typed failure (caller resets).
 fn sync_one(inner: &mut Inner, wait_ms: u32) -> Result<Option<EncodedFrame>> {
     let Some(front) = inner.pending.front() else {
         return Ok(None);
@@ -1079,8 +942,7 @@ impl Encoder for QsvEncoder {
             expected
         );
         self.ensure_inner(&frame.device)?;
-        // A mid-stream HDR regrade re-inits the encoder so the new mastering SEI/OBU rides the
-        // (unavoidable anyway) fresh IDR. Rare — the grade is static per source.
+        // Mid-stream HDR regrade re-Inits so the new mastering SEI/OBU rides the fresh IDR.
         if self.ten_bit && self.hdr_meta != self.hdr_applied && self.hdr_meta.is_some() {
             tracing::info!("QSV HDR metadata changed — re-initialising the encoder");
             self.inner = None;
@@ -1091,16 +953,14 @@ impl Encoder for QsvEncoder {
         let opening = self.inner.as_ref().is_none_or(|i| i.frames_submitted == 0);
         let forced = std::mem::take(&mut self.force_kf) || opening;
         self.frame_idx += 1;
-        // --- LTR-RFI per-frame decisions (the AMF policy verbatim; see that module's doc) ---
         let mut mark_slot: Option<usize> = None;
         let mut force_ltr: Option<(usize, i64)> = None;
         let mut recovery_anchor = false;
         if self.ltr_active {
             if forced {
-                // An IDR voids the decoder's reference buffers — drop stale slots and any
-                // queued force; the mark cadence below re-anchors on the IDR itself.
+                // IDR voids decoder refs — drop stale slots and any queued force.
                 self.ltr_slots = [None; NUM_LTR_SLOTS];
-                self.ltr_tainted = [false; NUM_LTR_SLOTS]; // the IDR flushed the DPB with them
+                self.ltr_tainted = [false; NUM_LTR_SLOTS]; // IDR flushed the DPB
                 self.next_ltr_slot = 0;
                 self.pending_force = None;
             } else if self.ltr_test_force_at == Some(cur_idx) {
@@ -1112,12 +972,9 @@ impl Encoder for QsvEncoder {
                 );
             }
             if let Some(slot) = self.pending_force.take() {
-                // Resolve the anchor NOW: a taint sweep in `invalidate_ref_frames` may have
-                // emptied the slot since the force was queued. An empty slot means there is
-                // nothing clean to re-reference — the frame must ship as a plain P WITHOUT the
-                // `recovery_anchor` tag (the client lifts its post-loss freeze on that tag).
-                // The slot is no longer emptied by the sweep, so test the taint flag too — a
-                // tainted slot is exactly the "nothing clean to re-reference" case.
+                // Resolve now: taint may have landed since the force was queued.
+                // Empty or tainted = ship a plain P, no `recovery_anchor` (that tag
+                // lifts the client's post-loss freeze).
                 if let Some(idx) = self.ltr_slots[slot].filter(|_| !self.ltr_tainted[slot]) {
                     force_ltr = Some((slot, idx));
                     recovery_anchor = true;
@@ -1126,8 +983,7 @@ impl Encoder for QsvEncoder {
             if force_ltr.is_none() && (forced || cur_idx % self.ltr_mark_interval == 0) {
                 let slot = self.next_ltr_slot;
                 self.ltr_slots[slot] = Some(cur_idx);
-                // Re-marking replaces the hardware's LongTermIdx: the tainted frame is gone from
-                // the DPB and this slot is clean again.
+                // Re-mark replaces LongTermIdx: the tainted frame leaves the DPB.
                 self.ltr_tainted[slot] = false;
                 self.next_ltr_slot = (self.next_ltr_slot + 1) % NUM_LTR_SLOTS;
                 mark_slot = Some(slot);
@@ -1136,8 +992,7 @@ impl Encoder for QsvEncoder {
         let ltr_slots = self.ltr_slots;
         let reject_ok = self.codec != Codec::Av1;
         let inner = self.inner.as_mut().expect("ensure_inner succeeded");
-        // Bound the in-flight window BEFORE submitting: drain finished AUs (buffered for
-        // `poll`) instead of letting the queue grow under overload.
+        // Drain finished AUs into `ready` before submit so the queue cannot grow under overload.
         if inner.pending.len() >= IN_FLIGHT_MAX {
             let deadline = std::time::Instant::now() + BUSY_BUDGET;
             while inner.pending.len() >= IN_FLIGHT_MAX {
@@ -1180,7 +1035,7 @@ impl Encoder for QsvEncoder {
                 .then(|| (*iface).Release)
                 .flatten()
                 .ok_or_else(|| anyhow!("QSV surface has no FrameInterface.Release"))?;
-            // From here on, every failure path must release the surface.
+            // Every failure path below must release the surface.
             let submit_result: Result<vpl::mfxSyncPoint> = (|| {
                 let get_native = (*iface)
                     .GetNativeHandle
@@ -1213,11 +1068,9 @@ impl Encoder for QsvEncoder {
                 inner
                     .dctx
                     .CopySubresourceRegion(&dst_res, 0, 0, 0, 0, &src, 0, None);
-                // Wire-index pinning: mfxExtRefListCtrl addresses frames by FrameOrder, so the
-                // wire index IS the RFI domain — `submit_indexed` keeps them equal.
+                // mfxExtRefListCtrl keys on FrameOrder; `submit_indexed` keeps that = wire index.
                 (*surf).Data.FrameOrder = cur_idx as u32;
                 (*surf).Data.TimeStamp = captured.pts_ns.wrapping_mul(9) / 100_000; // 90 kHz
-                                                                                    // Per-frame control: forced IDR and/or the LTR reflist.
                 let mut ctrl: Option<Box<FrameCtrl>> = None;
                 if forced || mark_slot.is_some() || force_ltr.is_some() {
                     let mut c = FrameCtrl::new();
@@ -1229,7 +1082,6 @@ impl Encoder for QsvEncoder {
                     }
                     let mut use_reflist = false;
                     if let Some(slot) = mark_slot {
-                        // Mark THIS frame as long-term reference `slot` (explicit index).
                         c.reflist.LongTermRefList[0].FrameOrder = cur_idx as u32;
                         c.reflist.LongTermRefList[0].PicStruct =
                             vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
@@ -1238,25 +1090,15 @@ impl Encoder for QsvEncoder {
                         use_reflist = true;
                     }
                     if let Some((slot, ltr_frame)) = force_ltr {
-                        // Force THIS frame to predict only from the known-good LTR — the
-                        // clean re-anchor. LongTermIdx stays 0 inside PreferredRefList
-                        // (the AV1 runtime rejects nonzero there; AVC/HEVC key on
-                        // FrameOrder).
+                        // LongTermIdx stays 0 in PreferredRefList (AV1 rejects nonzero;
+                        // AVC/HEVC key on FrameOrder).
                         c.reflist.PreferredRefList[0].FrameOrder = ltr_frame as u32;
                         c.reflist.PreferredRefList[0].PicStruct =
                             vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
-                        // A preference alone is a reorder HINT (VPL spec) — the encoder may
-                        // still predict from the tainted short-term refs alongside it. AMF's
-                        // ForceLTRReferenceBitfield and NVENC's invalidation are hard
-                        // exclusions; emulate that here by rejecting every other DPB
-                        // candidate — the short-term sliding window (the 2 most recent
-                        // frames) and the other LTR slot — and capping L0 at one active
-                        // entry. Without this the "clean recovery" frame can carry the
-                        // corruption forward, which the client cannot detect (the field
-                        // failure: permanent macroblock soup under sustained loss).
-                        // AVC/HEVC only: the AV1 runtime's universal-reflist rejection path
-                        // is unvalidated, and an unhonored hint there still converges via
-                        // the host's IDR escalation.
+                        // PreferredRefList is a reorder hint; the encoder may still
+                        // predict from tainted short-term refs. Reject the other DPB
+                        // candidates and cap L0 at 1. AVC/HEVC only — AV1 rejection
+                        // is unvalidated; an unhonored hint still IDR-escalates.
                         if reject_ok {
                             let mut rej = 0;
                             let mut reject = |idx: i64| {
@@ -1310,7 +1152,6 @@ impl Encoder for QsvEncoder {
                     if sts != vpl::MFX_WRN_DEVICE_BUSY {
                         break sts;
                     }
-                    // Busy = drain and retry, bounded — not a wedge unless it never clears.
                     if let Some(au) = sync_one(inner, 1)? {
                         inner.ready.push_back(au);
                     }
@@ -1324,9 +1165,7 @@ impl Encoder for QsvEncoder {
                         self.force_kf = true;
                         bail!("QSV EncodeFrameAsync stayed DEVICE_BUSY past the drain budget");
                     }
-                    // With GopRefDist=1 the encoder owes one AU per submission; MORE_DATA
-                    // (frame cached, no sync point) would break the FIFO pairing — surface it
-                    // loudly rather than desync.
+                    // GopRefDist=1 owes one AU per submit; MORE_DATA would desync the FIFO.
                     vpl::MFX_ERR_MORE_DATA => {
                         self.force_kf = true;
                         bail!("QSV EncodeFrameAsync returned MORE_DATA with GopRefDist=1");
@@ -1352,16 +1191,14 @@ impl Encoder for QsvEncoder {
                 inner.frames_submitted += 1;
                 Ok(syncp)
             })();
-            // The runtime holds its own reference for the encode in flight; ours drops now.
+            // Runtime holds its own ref for the in-flight encode; ours drops now.
             let _ = release(surf);
             submit_result?;
         }
         Ok(())
     }
 
-    /// Pin this submission's frame number to the wire frame index (see the trait doc): the LTR
-    /// slots and `mfxFrameData::FrameOrder` then live in the wire domain, so
-    /// `invalidate_ref_frames`'s pre-loss check stays correct across every rebuild.
+    /// Pin `frame_idx` to the wire index so LTR slots and FrameOrder stay in the wire domain.
     fn submit_indexed(&mut self, frame: &CapturedFrame, wire_index: u32) -> Result<()> {
         self.frame_idx = wire_index as i64;
         self.submit(frame)
@@ -1372,29 +1209,18 @@ impl Encoder for QsvEncoder {
     }
 
     fn set_hdr_meta(&mut self, meta: Option<punktfunk_core::quic::HdrMeta>) {
-        // Stored; baked into the Init ext chain (mastering/CLL at every IDR). A post-Init
-        // change re-inits on the next submit — see `submit`.
         self.hdr_meta = meta;
     }
 
-    /// LTR-RFI recovery — the `mfxExtRefListCtrl` port of the AMF slot policy: answer a loss of
-    /// client frames `[first, last]` by force-referencing the newest LTR marked *before* the
-    /// loss. `false` = no usable pre-loss LTR (or the driver declined the buffer at bring-up) —
-    /// the caller falls back to `request_keyframe`.
+    /// Force-reference the newest LTR marked before `[first, last]`. `false` → IDR fallback.
     fn invalidate_ref_frames(&mut self, first: i64, last: i64) -> bool {
         if !self.ltr_active || first < 0 || first > last {
             return false;
         }
-        // The taint-sweep + anchor-pick POLICY lives in `rfi::plan_slot_recovery` (one decision
-        // shared with AMF and Vulkan Video). This backend's mechanism: distrust is a SEPARATE
-        // `ltr_tainted` flag, never a cleared mirror slot — `ltr_slots` mirrors the HARDWARE DPB,
-        // and nulling an entry issues no VPL call, so the frame stays marked long-term in the
-        // encoder. Clearing it made the rejection list below (which iterates the mirror and only
-        // names `Some` slots) silently SKIP the one entry the sweep exists to distrust, so the
-        // recovery frame could still predict from it. With two slots the "exactly one swept" case
-        // is the modal one, and it was the broken one. The `!ltr_tainted` view filter below is
-        // what persists that distrust across loss events (this call's taints are excluded from
-        // this call's anchor by the policy itself).
+        // Policy is `rfi::plan_slot_recovery`. Distrust is `ltr_tainted`, never a
+        // cleared mirror: `ltr_slots` tracks the hardware DPB, and RejectedRefList
+        // only names `Some` slots. Filter with `!ltr_tainted` so distrust survives
+        // later losses.
         let view: Vec<(usize, i64)> = self
             .ltr_slots
             .iter()
@@ -1422,8 +1248,7 @@ impl Encoder for QsvEncoder {
                 true
             }
             None => {
-                // The sweep may have emptied the slot an earlier (un-consumed) force pointed
-                // at — clear it so the next submit can't half-apply a stale recovery.
+                // Drop a queued force that now points at nothing clean.
                 self.pending_force = None;
                 tracing::info!(
                     first,
@@ -1436,19 +1261,10 @@ impl Encoder for QsvEncoder {
     }
 
     /// Withdraw anchor trust from every live LTR (trait docs carry the why).
-    ///
-    /// This backend's mechanism, unchanged from the sweep's: distrust is the SEPARATE
-    /// `ltr_tainted` flag, never a cleared mirror slot. `ltr_slots` mirrors the HARDWARE DPB and
-    /// nulling an entry issues no VPL call, so the frame stays marked long-term in the encoder —
-    /// and the RejectedRefList built at submit only names `Some` slots, so a cleared mirror would
-    /// silently SKIP the very entry being distrusted and the recovery frame could still predict
-    /// from it. Taint keeps the mirror intact and the rejection reachable.
-    ///
-    /// The taint lifts itself: an IDR flush and a re-mark both clear it, so this suppresses RFI
-    /// for a few frames, never for the session.
-    ///
-    /// `pending_force` is cleared for the same reason as the decline arm above — an un-consumed
-    /// force would point at a slot this call just distrusted.
+    /// Distrust is `ltr_tainted`, never a cleared `ltr_slots` entry — the mirror
+    /// tracks the hardware DPB and RejectedRefList only names `Some` slots.
+    /// Taint clears on IDR flush or re-mark. Drop `pending_force` so an unconsumed
+    /// force cannot re-reference a slot this call just distrusted.
     fn distrust_references(&mut self) {
         let live = self
             .ltr_slots
@@ -1470,21 +1286,18 @@ impl Encoder for QsvEncoder {
 
     fn caps(&self) -> EncoderCaps {
         EncoderCaps {
-            // As Windows NVENC: the capturer composites; this backend never reads `frame.cursor`.
+            // Capturer composites; this backend never reads `frame.cursor`.
             blends_cursor: false,
             supports_rfi: self.ltr_active,
             chroma_444: false,
             intra_refresh: self.ir_active,
-            // Unvalidated on-glass — the host keeps the IDR recovery path until then.
+            // Unvalidated — host keeps the IDR recovery path until then.
             intra_refresh_recovery: false,
             intra_refresh_period: 0,
         }
     }
 
-    /// Bounded-blocking poll ([`super::amf`]'s model): give the oldest owed AU up to
-    /// `min(3/4 frame interval, 12 ms)` inside `SyncOperation`, so it ships the same tick the
-    /// hardware finishes. On expiry return `Ok(None)` — the session loop keeps the frame in
-    /// flight and the encode-stall watchdog arbitrates a real wedge.
+    /// Wait up to `min(3/4 frame interval, 12 ms)` for the oldest AU. Expiry is `Ok(None)`.
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
         let au = {
             let Some(inner) = self.inner.as_mut() else {
@@ -1510,10 +1323,7 @@ impl Encoder for QsvEncoder {
         Ok(au)
     }
 
-    /// Encode-stall recovery: forfeit the in-flight frames, `Close` the encoder and re-`Init`
-    /// it on the same session. A second reset without any produced AU escalates to a full
-    /// session teardown (fresh loader/session on the next submit) — the same ladder as AMF's
-    /// reconnect-wedge recovery.
+    /// Stall recovery: Close+Init in place. A second reset with no AU drops the whole session.
     fn reset(&mut self) -> bool {
         self.force_kf = true;
         self.resets_without_output = self.resets_without_output.saturating_add(1);
@@ -1534,14 +1344,11 @@ impl Encoder for QsvEncoder {
         }
         let rebuilt = {
             let inner = self.inner.as_mut().expect("checked above");
-            // Best-effort settle of in-flight operations (Close aborts them anyway).
+            // Best-effort settle (Close aborts them anyway).
             while sync_one(inner, 5).ok().flatten().is_some() {}
-            // Close BEFORE dropping `pending`. Each `Pending` owns the `Box<BsBuf>` the runtime
-            // is writing into asynchronously (and a `Box<FrameCtrl>` it reads), so clearing first
-            // frees that heap while the operation is still live — a use-after-free by the VPL
-            // runtime. The drain above is best-effort and bails on the first `Err`, which is
-            // exactly the wedged-encoder case that triggers this reset, so it cannot be relied on
-            // to have retired everything. Close aborts the operations; only then is the drop safe.
+            // Close before dropping `pending`: each entry owns the BsBuf/FrameCtrl
+            // the runtime still writes. Drain bails on Err — Close aborts, then drop is safe.
+
             // SAFETY: the session is live on this thread; Close on a wedged encoder is legal
             // (result deliberately ignored) and re-Init happens through `init_encode`.
             unsafe {
@@ -1563,7 +1370,7 @@ impl Encoder for QsvEncoder {
                 self.pending_force = None;
                 if let Some(inner) = self.inner.as_mut() {
                     inner.bs_bytes = bs_bytes;
-                    inner.bs_pool.clear(); // sizes may have changed
+                    inner.bs_pool.clear(); // BufferSizeInKB may have changed
                 }
                 tracing::info!("QSV encoder rebuilt in place (Close + re-Init on the session)");
             }
@@ -1581,15 +1388,10 @@ impl Encoder for QsvEncoder {
         true
     }
 
-    /// In-place ABR retarget: `MFXVideoENCODE_Reset` with the new rate and
-    /// `mfxExtEncoderResetOption{StartNewSequence=OFF}` — no IDR, no in-flight forfeit, legal
-    /// in CBR because HRD conformance is off (Appendix C). The one wrinkle vs AMF: Reset
-    /// requires completed sync operations, so the in-flight window is drained (into `ready`)
-    /// first; a drain that can't finish inside the budget falls back to the caller's rebuild.
+    /// No-IDR ABR: `MFXVideoENCODE_Reset` + `StartNewSequence=OFF` (legal because HRD is off).
+    /// Drain in-flight first — Reset requires completed syncs; a stuck drain falls back.
     fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
-        // Drain phase in its own scope so the `inner` borrow ends before the param rebuild
-        // below reads `self` again (the raw session pointer stays valid — `self.inner` is not
-        // touched in between).
+        // Drain in its own scope so the `inner` borrow ends before the param rebuild.
         let session = {
             let Some(inner) = self.inner.as_mut() else {
                 self.bitrate_bps = bps;
@@ -1643,11 +1445,9 @@ impl Encoder for QsvEncoder {
             self.bitrate_bps = old;
             return false;
         }
-        // Re-read the driver's worst-case AU size. `Reset` re-derives `BufferSizeInKB` from the new
-        // rate, and a step-up can raise it well above what `init_encode` computed — leaving
-        // `bs_bytes` (and every buffer already in the pool) sized for the OLD, lower bitrate. This
-        // mirrors `init_encode`, which asks the same question post-Init; `take_bs` drops any pooled
-        // buffer that is now too small.
+        // Reset re-derives BufferSizeInKB; a step-up can outgrow pooled buffers.
+        // take_bs drops any that are now too small.
+
         // SAFETY: `session` is live on this thread and drained above; `got` and its (empty) ext
         // chain outlive the synchronous call.
         let refreshed = unsafe {
@@ -1682,8 +1482,7 @@ impl Encoder for QsvEncoder {
         let Some(inner) = self.inner.as_mut() else {
             return Ok(());
         };
-        // Signal end-of-stream: null-surface EncodeFrameAsync drains the (with AsyncDepth=1,
-        // empty) internal queue; owed AUs then surface through `poll`.
+        // Null-surface EncodeFrameAsync is EOS; owed AUs then surface through `poll`.
         // SAFETY: session live on this thread; a null surface is the documented EOS marker;
         // each drained AU gets its own pooled bitstream + sync point, queued like a submit.
         unsafe {
@@ -1698,7 +1497,7 @@ impl Encoder for QsvEncoder {
                     &mut syncp,
                 );
                 if sts < vpl::MFX_ERR_NONE || syncp.is_null() {
-                    break; // MFX_ERR_MORE_DATA = fully drained
+                    break; // MFX_ERR_MORE_DATA = drained
                 }
                 inner.pending.push_back(Pending {
                     syncp,
@@ -1714,19 +1513,12 @@ impl Encoder for QsvEncoder {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Capability probes (design §4): honest per-GPU Query answers, feeding `can_encode_10bit` /
-// `windows_codec_support` so negotiation matches what the session's encoder will really open.
-// ---------------------------------------------------------------------------------------------
-
-/// Can the selected Intel GPU encode `codec` at all? Session + `MFXVideoENCODE_Query` on a
-/// tiny parameter block (no device handle — the runtime probes on its own device).
+/// Can the selected Intel GPU encode `codec`? Query on a tiny block; no device handle.
 pub fn probe_can_encode(codec: Codec) -> bool {
     probe_query(codec, false)
 }
 
-/// Can it encode `codec` at 10-bit (HEVC Main10 / AV1 10-bit, P010 input)? H.264 is always
-/// `false` (High10 is never negotiated).
+/// 10-bit encode (HEVC Main10 / AV1, P010). H.264 is always false — High10 is never negotiated.
 pub fn probe_can_encode_10bit(codec: Codec) -> bool {
     if !codec.supports_10bit() {
         return false;
@@ -1744,9 +1536,8 @@ fn probe_query(codec: Codec, ten_bit: bool) -> bool {
         b[4..].copy_from_slice(&l.HighPart.to_le_bytes());
         b
     });
-    // Prefer the implementation on the selected adapter; on a hybrid box whose selected GPU is
-    // not Intel, fall back to the first Intel implementation — the probe answers "can the
-    // Intel silicon on this box do it", the session open then enforces same-adapter.
+    // Prefer the selected adapter; on a hybrid non-Intel pick, fall back to first Intel
+    // impl. The probe answers "can Intel silicon do it"; open then enforces same-adapter.
     let opened = match selected {
         Some(want) => create_session(Some(want)).or_else(|_| create_session(None)),
         None => create_session(None),
@@ -1775,8 +1566,7 @@ fn probe_query(codec: Codec, ten_bit: bool) -> bool {
 mod tests {
     use super::*;
 
-    /// Dispatcher + enumeration smoke: must not crash on any box; on a box without Intel
-    /// hardware it returns an empty list or errors cleanly.
+    /// Enumeration must not crash; no Intel hardware → empty list or a clean error.
     #[test]
     fn intel_enumeration_smoke() {
         match intel_loader() {
@@ -1789,8 +1579,7 @@ mod tests {
         }
     }
 
-    /// Probe smoke: answers must be stable booleans (no panic) whether or not Intel hardware
-    /// is present. On the CI box (no Intel GPU) everything is `false`.
+    /// Probe answers are booleans (no panic) with or without Intel hardware.
     #[test]
     fn probe_smoke() {
         for codec in [Codec::H264, Codec::H265, Codec::Av1] {
@@ -1804,15 +1593,12 @@ mod tests {
     }
 
     fn init_tracing() {
-        // Mirror the NVENC tests: visible encoder logs under --nocapture (the LTR accept/
-        // reject and array-texture warnings are the on-glass diagnostics).
         let _ = tracing_subscriber::fmt()
             .with_env_filter("pf_encode=debug")
             .with_test_writer()
             .try_init();
     }
 
-    /// Per-AU facts the live matrix asserts on.
     struct AuMeta {
         keyframe: bool,
         recovery_anchor: bool,
@@ -1822,18 +1608,16 @@ mod tests {
 
     fn test_hdr_meta() -> punktfunk_core::quic::HdrMeta {
         punktfunk_core::quic::HdrMeta {
-            display_primaries: [[13250, 34500], [7500, 3000], [34000, 16000]], // G, B, R
+            display_primaries: [[13250, 34500], [7500, 3000], [34000, 16000]], // G,B,R
             white_point: [15635, 16450],
-            max_display_mastering_luminance: 10_000_000, // 1000 nits in 0.0001 cd/m²
+            max_display_mastering_luminance: 10_000_000, // 1000 nits @ 0.0001 cd/m²
             min_display_mastering_luminance: 500,        // 0.05 nits
             max_cll: 1000,
             max_fall: 400,
         }
     }
 
-    /// Drive a live encode on the box's Intel implementation. `None` = no usable hardware for
-    /// this (codec, bit depth) — the caller's test skips cleanly. `on_frame` runs before each
-    /// submit (the seam for RFI/retarget mid-stream actions).
+    /// Live encode on Intel silicon. `None` = skip. `on_frame` runs before each submit.
     fn drive_live(
         codec: Codec,
         ten_bit: bool,
@@ -1867,7 +1651,6 @@ mod tests {
             eprintln!("skipping: this GPU declines 10-bit {codec:?}");
             return None;
         }
-        // A device on the Intel adapter the implementation reported.
         // SAFETY: self-contained harness owning every COM handle it creates; `EnumAdapterByLuid`
         // gets the LUID the runtime itself reported; `D3D11CreateDevice` fills `device` only
         // on success; the NV12/P010 texture is created and used on that one device/thread.
@@ -1985,7 +1768,6 @@ mod tests {
         }
     }
 
-    /// H.264 8-bit — the Phase-0 spike (design §6).
     #[test]
     fn qsv_encode_live_smoke() {
         let Some(aus) = drive_live(Codec::H264, false, 30, |_, _| {}) else {
@@ -1994,7 +1776,6 @@ mod tests {
         assert_stream_shape(&aus, 30, true);
     }
 
-    /// HEVC 8-bit.
     #[test]
     fn qsv_live_hevc() {
         let Some(aus) = drive_live(Codec::H265, false, 30, |_, _| {}) else {
@@ -2003,7 +1784,6 @@ mod tests {
         assert_stream_shape(&aus, 30, true);
     }
 
-    /// HEVC Main10 (P010) with the HDR mastering/CLL grade attached — Phase 2 on-glass.
     #[test]
     fn qsv_live_hevc10_hdr() {
         let Some(aus) = drive_live(Codec::H265, true, 30, |_, _| {}) else {
@@ -2012,8 +1792,7 @@ mod tests {
         assert_stream_shape(&aus, 30, true);
     }
 
-    /// AV1 10-bit (DG2/Arc + MTL+ only; skips elsewhere) — Phase 2 on-glass. AV1 output is an
-    /// OBU stream, not Annex-B.
+    /// AV1 output is an OBU stream, not Annex-B.
     #[test]
     fn qsv_live_av1_10bit() {
         let Some(aus) = drive_live(Codec::Av1, true, 30, |_, _| {}) else {
@@ -2022,8 +1801,7 @@ mod tests {
         assert_stream_shape(&aus, 30, false);
     }
 
-    /// LTR-RFI end-to-end — Phase 3 on-glass: invalidate mid-stream and expect the clean
-    /// re-anchor P-frame (recovery_anchor, NOT a keyframe) instead of an IDR.
+    /// Mid-stream invalidate must emit a `recovery_anchor` P-frame, not an IDR.
     #[test]
     fn qsv_live_ltr_rfi() {
         let mut rfi_answered = false;
@@ -2055,16 +1833,13 @@ mod tests {
         );
     }
 
-    /// Taint sweep: a loss that predates every live LTR mark leaves NO clean anchor — every
-    /// slot was marked inside the client's corrupt window. The invalidate must decline (the
-    /// caller then serves the IDR) and no recovery_anchor AU may ship; before the sweep this
-    /// force-referenced a tainted mark and shipped corruption tagged as a clean recovery.
+    /// A loss covering every live LTR mark must decline (IDR fallback); no recovery_anchor AU.
     #[test]
     fn qsv_live_ltr_rfi_taint_sweep_declines() {
         let mut rfi_answered = None;
         let Some(aus) = drive_live(Codec::H264, false, 60, |enc, i| {
             if i == 30 && enc.caps().supports_rfi {
-                // Frame 0 lost: the IDR itself — every mark (0, 15, ...) is at-or-after it.
+                // Frame 0 is the IDR — every later mark is at-or-after the loss.
                 rfi_answered = Some(enc.invalidate_ref_frames(0, 2));
             }
         }) else {
@@ -2085,8 +1860,7 @@ mod tests {
         );
     }
 
-    /// No-IDR bitrate retarget — Phase 3 on-glass: `reconfigure_bitrate` mid-stream must be
-    /// accepted (HRD off + StartNewSequence=OFF) and must not emit a keyframe.
+    /// Mid-stream `reconfigure_bitrate` must accept and must not emit a keyframe.
     #[test]
     fn qsv_live_bitrate_retarget() {
         let mut accepted = false;
@@ -2105,12 +1879,9 @@ mod tests {
         );
     }
 
-    /// FULL-CHAIN colour check at the field capture size: a known P010 colour-bar source at
-    /// 1920x1080 — whose height is NOT 16-aligned, so the ingest `CopySubresourceRegion` copies
-    /// into a 1920x1088 runtime pool surface whose chroma plane sits at a DIFFERENT row offset
-    /// than the source's (the seam no 640x480 test exercises) — encoded to Main10 HEVC and
-    /// dumped to `%TEMP%\pf_qsv_1080_bars.h265` for off-box decode verification against the
-    /// same codes. On-box this asserts stream shape; the pixel verdict needs a decoder.
+    /// 1920×1080 P010 bars: height is not 16-aligned, so ingest copies into a
+    /// 1920×1088 pool surface whose chroma plane sits at a different row offset
+    /// than the source. Dumps `%TEMP%\pf_qsv_1080_bars.h265` for off-box decode.
     #[test]
     fn qsv_live_p010_1080_colorbars_dump() {
         use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -2121,9 +1892,7 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_P010, DXGI_SAMPLE_DESC};
         use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
 
-        // (Y, Cb, Cr) 10-bit limited codes for the 8 sRGB bars white/yellow/cyan/green/magenta/
-        // red/blue/black at 80-nit SDR white under PQ/BT.2020 — the same math as pf-capture's
-        // `p010_reference` (and the bars_pq2020 client fixture). Stored MSB-aligned (`<<6`).
+        // 10-bit limited YCbCr for the 8 sRGB bars at 80-nit PQ/BT.2020. MSB-aligned (`<<6`).
         const BARS: [(u16, u16, u16); 8] = [
             (490, 512, 512),
             (478, 423, 518),
@@ -2151,8 +1920,7 @@ mod tests {
             return;
         }
 
-        // P010 initial data: plane 0 = H rows of W u16 luma; plane 1 = H/2 rows of W u16
-        // (interleaved Cb,Cr pairs), same pitch. Bars are vertical: bar index = x / (W/8).
+        // P010: plane 0 = H×W luma; plane 1 = H/2 rows of interleaved Cb,Cr. Vertical bars.
         let bar_w = (W / 8) as usize;
         let mut init = vec![0u16; (W as usize) * (H as usize + H as usize / 2)];
         for y in 0..H as usize {
@@ -2273,12 +2041,8 @@ mod tests {
         );
     }
 
-    /// The PRODUCTION host chain minus the IDD ring: the REAL `HdrP010Converter` renders the 8
-    /// sRGB bars into a ring-profile P010 texture (`BIND_RENDER_TARGET` only — RTV-written, not
-    /// CPU-uploaded) on the VPL implementation's own adapter, and THAT texture goes through the
-    /// unaligned-height ingest copy into a Main10 encode. Dumped to
-    /// `%TEMP%\pf_qsv_conv_1080_bars.h265`; expected decode codes = the bars_pq2020 fixture set
-    /// (see `hdr_p010_convert_bars_on_luid`).
+    /// Same 1080p ingest path through the real `HdrP010Converter` (RTV-written P010).
+    /// Dumps `%TEMP%\pf_qsv_conv_1080_bars.h265`.
     #[test]
     fn qsv_live_hdr_converter_e2e_1080_dump() {
         const W: u32 = 1920;

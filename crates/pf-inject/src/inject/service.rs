@@ -1,37 +1,30 @@
-//! The off-thread injector service (plan §W4, carved out of the inject facade): a host-lifetime
-//! pointer/keyboard injector pinned to its OWN thread and fed over a clonable `Send` channel, plus
-//! the pre-injection [`coalesce`] pass. The backend owns non-`Send` compositor state (a Wayland
-//! connection / xkb / EIS socket), so it must live on one thread; both the GameStream control plane
-//! and the native punktfunk/1 plane forward decoded input here instead of injecting inline.
+//! Off-thread pointer/keyboard injector plus the pre-injection [`coalesce`] pass.
+//!
+//! The backend owns non-`Send` compositor state (Wayland / xkb / EIS), so it lives on one thread
+//! and is fed over a clonable `Send` channel. GameStream and native punktfunk/1 both forward
+//! decoded input here instead of injecting inline.
 
 use super::*;
 
-/// Host-lifetime pointer/keyboard injector running on its OWN thread, fed over a clonable `Send`
-/// channel. The injector backend owns non-`Send` compositor state (a Wayland connection / xkb / EIS
-/// socket), so it must live on a single thread; both the GameStream control plane and the native
-/// punktfunk/1 plane forward their decoded keyboard/mouse events here instead of injecting inline, so
-/// a slow inject (a portal stall, a desktop switch) never head-blocks the network thread's
-/// keepalive/retransmit servicing.
+/// Host-lifetime injector on its own thread. A slow inject (portal stall, desktop switch) must
+/// not head-block the network thread's keepalive/retransmit. Backend is non-`Send`.
 pub struct InjectorService {
     tx: std::sync::mpsc::Sender<InputEvent>,
 }
 
 impl InjectorService {
     pub fn start() -> InjectorService {
-        // Windows: make sure the process-wide resident virtual HID mouse exists (idempotent).
-        // Without a pointing device present, win32k reports no cursor and DWM composites none
-        // into the IDD frame — SendInput injection alone moves an invisible pointer.
+        // Without a pointing device, win32k reports no cursor and DWM composites none into the
+        // IDD frame — SendInput then moves an invisible pointer. Idempotent.
         #[cfg(target_os = "windows")]
         super::mouse_windows::ensure_resident();
 
         Self::start_inner(None)
     }
 
-    /// A SESSION-lifetime injector pinned to one gamescope EIS relay file
-    /// (`design/gamescope-multiuser.md`): same thread/channel/lazy-open/reopen discipline as the
-    /// shared service, but the backend never follows the published session backend — it is this
-    /// session's own gamescope, full stop. The owner drops the service (and every sender clone)
-    /// at session end, which ends the thread and closes the EIS connection.
+    /// Session-lifetime injector pinned to one gamescope EIS relay (`design/gamescope-multiuser.md`).
+    /// Never follows the published session backend. Dropping the service (and every sender clone)
+    /// ends the thread and closes the EIS connection.
     #[cfg(target_os = "linux")]
     pub fn start_at(relay: std::path::PathBuf) -> InjectorService {
         Self::start_inner(Some(relay))
@@ -48,28 +41,20 @@ impl InjectorService {
         InjectorService { tx }
     }
 
-    /// A sender a session/plane forwards its pointer/keyboard events to. Cloned per caller; dropping a
-    /// clone does NOT stop the service (it runs while any sender — incl. the service's own — lives).
+    /// Cloned per caller. Dropping a clone does not stop the service; it runs while any sender lives.
     pub fn sender(&self) -> std::sync::mpsc::Sender<InputEvent> {
         self.tx.clone()
     }
 }
 
-/// Backoff between reopen attempts after the injector backend fails to open or its worker dies, so a
-/// persistently-unavailable portal isn't hammered once per event.
+/// 2 s between reopen attempts after open/worker death, so a dead portal is not hit once per event.
 const INJECTOR_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The injector worker: lazily open the pointer/keyboard backend, then inject every forwarded
-/// event. Reopen (after [`INJECTOR_REOPEN_BACKOFF`]) on open failure, on a backend change
-/// (input follows the active session — unpinned only), or if the backend's worker dies mid-stream.
-/// Exits only when every sender has dropped (host shutdown for the shared service; session end for
-/// a pinned one), which drops the injector and closes its portal session / EIS connection.
-/// `pin` = the per-session gamescope relay file ([`InjectorService::start_at`]); `None` = the
-/// shared host-lifetime service following [`default_backend`].
-///
-/// Each wake drains the whole backlog and [`coalesce`]s redundant motion before injecting, so a slow
-/// backend never builds up a queue of stale relative-mouse/scroll events (latency) — while button,
-/// key, and absolute-move ordering is preserved exactly.
+/// Lazy-open worker. Reopen after [`INJECTOR_REOPEN_BACKOFF`] on open failure, on an unpinned
+/// backend change, or if the worker dies. Exits when every sender drops (host shutdown, or
+/// session end for a pin). `pin` is the gamescope relay ([`InjectorService::start_at`]); `None`
+/// follows [`default_backend`]. Each wake drains the backlog and [`coalesce`]s motion so a slow
+/// backend cannot queue stale relative-mouse/scroll; buttons, keys, and absolute moves stay ordered.
 fn injector_service_thread(
     rx: std::sync::mpsc::Receiver<InputEvent>,
     pin: Option<std::path::PathBuf>,
@@ -78,23 +63,14 @@ fn injector_service_thread(
     let mut open_backend: Option<Backend> = None;
     let mut last_failed: Option<std::time::Instant> = None;
     while let Ok(first) = rx.recv() {
-        // Drain everything already queued behind `first` so we coalesce a whole burst at once.
         let mut batch = vec![first];
         while let Ok(ev) = rx.try_recv() {
             batch.push(ev);
         }
 
-        // The resolved input backend (published by the host per connect / mid-stream session switch
-        // — `set_backend_id`) may have changed since we opened. Reopen against it so input FOLLOWS
-        // the active session instead of injecting into a stale, still-warm backend (e.g. the managed
-        // gamescope's EIS socket after the user switched to the KDE desktop).
-        //
-        // This runs once per BATCH, which is why the published value is a `RwLock` read and not a
-        // `getenv`: the old `PUNKTFUNK_INPUT_BACKEND` round-trip made this hot path a data race
-        // against the connect path's `setenv` (security-review 2026-08-25).
-        //
-        // A PINNED service (`start_at` — one session's own gamescope) never follows the published
-        // backend: its target cannot change, only die, and death is the reopen arm below.
+        // Unpinned: reopen if the published backend changed, so input follows the active session
+        // instead of a stale EIS socket. Read the `RwLock`, not `getenv` — `setenv` on connect
+        // raced this hot path. A pin never follows; its target can only die (reopen arm below).
         let want = if pin.is_none() {
             let want = default_backend();
             if injector.is_some() && open_backend != Some(want) {
@@ -104,17 +80,16 @@ fn injector_service_thread(
                     "input: backend changed — reopening injector for the active session"
                 );
                 injector = None;
-                last_failed = None; // re-resolve immediately
+                last_failed = None; // skip backoff; resolve now
             }
             Some(want)
         } else {
             None
         };
         if injector.is_none() {
-            // Open on the first event; after a failure wait out the backoff before retrying (a few
-            // events drop during setup — acceptable, input is lossy). The lazy open is also what
-            // solves the pinned service's ordering: it is created before its gamescope spawns, and
-            // by the first event the relay file exists (the libei worker polls it besides).
+            // First event opens; after failure wait the backoff (a few events drop; input is lossy).
+            // Lazy open also covers pin ordering: the service is created before gamescope, and the
+            // relay exists by the first event (the libei worker polls it).
             let ready = last_failed.is_none_or(|t| t.elapsed() >= INJECTOR_REOPEN_BACKOFF);
             if ready {
                 let opened = match (&pin, want) {
@@ -148,13 +123,12 @@ fn injector_service_thread(
         if let Some(inj) = injector.as_mut() {
             for ev in coalesce(batch) {
                 if let Err(e) = inj.inject(&ev) {
-                    // The backend's worker (portal session / EIS socket) died — drop it and reopen on
-                    // a later event (covers a gamescope EIS socket that respawns with its session).
+                    // Portal / EIS worker died. Drop and reopen on a later event (gamescope respawns).
                     tracing::warn!(error = %format!("{e:#}"), "inject failed — reopening injector");
                     injector = None;
                     open_backend = None;
                     last_failed = Some(std::time::Instant::now());
-                    break; // abandon the rest of this batch; the next one reopens
+                    break; // rest of this batch is stale; the next recv reopens
                 }
             }
         }
@@ -162,10 +136,8 @@ fn injector_service_thread(
     tracing::debug!("injector service stopped (host shutting down)");
 }
 
-/// Coalesce a drained burst: sum consecutive relative-mouse deltas and consecutive same-axis scroll
-/// deltas (identical net effect, far fewer injects), passing buttons, keys, absolute moves, and any
-/// type change through untouched and in order. Only *adjacent* same-type events merge, so a button
-/// or key between two moves flushes the accumulated motion first — ordering is never reshuffled.
+/// Sum adjacent relative-mouse and same-axis scroll. Buttons, keys, absolute moves, and type
+/// changes pass through in order: a key between two moves flushes the accumulated motion first.
 fn coalesce(events: Vec<InputEvent>) -> Vec<InputEvent> {
     let mut out: Vec<InputEvent> = Vec::with_capacity(events.len());
     for ev in events {
@@ -207,12 +179,12 @@ mod tests {
     fn coalesce_sums_adjacent_motion_and_preserves_order() {
         let events = vec![
             mk(InputKind::MouseMove, 0, 1, 2),
-            mk(InputKind::MouseMove, 0, 3, -1), // → summed with the previous move
-            mk(InputKind::KeyDown, 30, 0, 0),   // flushes the move, passes through verbatim
-            mk(InputKind::MouseMove, 0, 5, 5),  // a NEW run after the key (not merged across it)
+            mk(InputKind::MouseMove, 0, 3, -1),
+            mk(InputKind::KeyDown, 30, 0, 0),
+            mk(InputKind::MouseMove, 0, 5, 5),
             mk(InputKind::MouseScroll, 0, 1, 0),
-            mk(InputKind::MouseScroll, 0, 2, 0), // same axis (code 0) → summed
-            mk(InputKind::MouseScroll, 1, 1, 0), // different axis (code 1) → separate
+            mk(InputKind::MouseScroll, 0, 2, 0),
+            mk(InputKind::MouseScroll, 1, 1, 0),
         ];
         let out = coalesce(events);
         assert_eq!(out.len(), 5);

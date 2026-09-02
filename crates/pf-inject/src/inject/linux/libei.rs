@@ -1,23 +1,17 @@
 //! libei input injection — the portable EI-sender path.
 //!
-//! Two ways to reach an EIS server ([`EiSource`]):
-//! * **Portal** — `org.freedesktop.portal.RemoteDesktop` via `ashpd` (KWin, GNOME/Mutter),
-//!   which hands us the EIS socket fd after the session grant.
-//! * **Socket** — connect directly to a compositor's own EIS socket. gamescope runs an EIS
-//!   server and exports its path to its children as `LIBEI_SOCKET`; our gamescope backend
-//!   relays that path through a file so the injector can connect (no portal involved).
+//! Reach an EIS server through [`EiSource`]: the xdg RemoteDesktop portal, Mutter's
+//! direct RemoteDesktop API, or a gamescope `LIBEI_SOCKET` path relayed in a file.
+//! `reis` drives the connection as an EI sender: bind seat capabilities, then per
+//! device `start_emulating` → emit → `frame`.
 //!
-//! Either way, `reis` drives the connection as an EI *sender*: bind the seat's
-//! pointer/keyboard/scroll/button capabilities and, per device, `start_emulating` → emit →
-//! `frame`. The session and the EIS connection must stay alive and the event stream must be
-//! polled continuously (resume/pause/ping/modifier traffic), so the whole thing runs on a
-//! dedicated thread with its own tokio runtime; the synchronous control thread reaches it
-//! through an unbounded channel and [`LibeiInjector::inject`] merely enqueues.
+//! The portal/Mutter session and the EIS connection must stay alive, and the event
+//! stream must be polled (resume/pause/ping). The worker owns its own tokio runtime;
+//! the control thread only enqueues via [`LibeiInjector::inject`].
 //!
-//! Keyboard codes are Linux evdev (the same space our VK→evdev table produces) and the
-//! compositor supplies the keymap, so — unlike the wlr path — there is no keymap to upload and
-//! no modifier mask to serialize: pressing the modifier *keys* (which Moonlight sends as normal
-//! key events) is enough.
+//! Keyboard codes are Linux evdev. The compositor supplies the keymap, so there is
+//! no keymap to upload and no modifier mask to serialize — modifier keys arrive as
+//! normal key events.
 
 use super::{gs_button_to_evdev, vk_to_evdev, InputInjector};
 use crate::AbsoluteAnchor;
@@ -38,26 +32,21 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-/// `code` value marking a horizontal scroll event (mirrors `gamestream::input`).
+/// Wire `code` for a horizontal scroll event (same as `gamestream::input`).
 const SCROLL_HORIZONTAL: u32 = 1;
 
-/// Where to find the EIS server.
 #[derive(Clone, Debug)]
 pub enum EiSource {
-    /// `org.freedesktop.portal.RemoteDesktop` via `ashpd` (KWin — a pre-seeded grant avoids the
-    /// approval dialog).
+    /// xdg `RemoteDesktop` via `ashpd`. A pre-seeded grant skips the approval dialog.
     Portal,
-    /// Mutter's *direct* `org.gnome.Mutter.RemoteDesktop` EIS (GNOME). Unlike the xdg portal, this
-    /// needs no interactive "Allow remote control?" approval — which a headless host can't answer,
-    /// so the portal's `Start()` would just time out. Mirrors how the Mutter *video* backend uses
-    /// the same direct API.
+    /// Mutter's direct `org.gnome.Mutter.RemoteDesktop` EIS. The xdg portal's `Start()`
+    /// waits for an "Allow remote control?" click a headless host cannot answer.
     MutterEis,
-    /// A file containing the EIS socket path/name (gamescope's relayed `LIBEI_SOCKET`); polled
-    /// until it appears, since the compositor may still be starting.
+    /// File holding the EIS socket path (gamescope's relayed `LIBEI_SOCKET`). Polled
+    /// until the compositor is listening.
     SocketPathFile(std::path::PathBuf),
 }
 
-/// Handle held by the control thread; forwards events to the libei worker thread.
 pub struct LibeiInjector {
     tx: UnboundedSender<InputEvent>,
 }
@@ -73,10 +62,8 @@ impl LibeiInjector {
             .name("punktfunk-libei".into())
             .spawn(move || worker(rx, source))
             .map_err(|e| anyhow!("spawn libei worker thread: {e}"))?;
-        // Return immediately — the portal/socket handshake must NOT run on the caller's
-        // (control) thread, or a slow/denied setup would freeze the ENet control stream and
-        // drop the client. The worker establishes the session asynchronously and logs its
-        // status; events enqueue until devices resume (a few startup events may be dropped).
+        // Handshake stays off the control thread: a slow or denied portal would freeze
+        // the ENet stream. Events enqueue until a device resumes; a few early ones drop.
         Ok(Self { tx })
     }
 }
@@ -89,7 +76,6 @@ impl InputInjector for LibeiInjector {
     }
 }
 
-/// Worker thread entry: build a tokio runtime and run the session to completion.
 fn worker(rx: UnboundedReceiver<InputEvent>, source: EiSource) {
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -105,11 +91,9 @@ fn worker(rx: UnboundedReceiver<InputEvent>, source: EiSource) {
     rt.block_on(session_main(rx, source));
 }
 
-/// Open the portal/socket + EIS (bounded), then pump events until disconnect or shutdown.
 async fn session_main(mut rx: UnboundedReceiver<InputEvent>, source: EiSource) {
-    // Keep `_rd`/`_session` bound for the whole loop — dropping the portal session closes the
-    // EIS connection. Bound the setup so a headless approval dialog (un-bypassed grant) can't
-    // hang the worker forever.
+    // Dropping the portal session closes EIS. Bound setup so an unanswered approval
+    // dialog cannot hang the worker.
     let (_keepalive, context, mut events, output_hint) = match tokio::time::timeout(
         Duration::from_secs(30),
         connect(source),
@@ -132,11 +116,8 @@ async fn session_main(mut rx: UnboundedReceiver<InputEvent>, source: EiSource) {
 
     let mut state = EiState::new();
     state.output_hint = output_hint;
-    // Watchdog: a healthy EIS server adds + resumes an input device within a beat of the handshake.
-    // If none has resumed by this deadline, the connection is dead-on-arrival (stale/half-ready
-    // gamescope socket the handshake passed but no real server is behind) — exit so the next
-    // inject() fails and InjectorService reopens against a fresh socket, instead of silently
-    // swallowing every event for the whole session.
+    // 5s: a live EIS resumes a device right after handshake. Past that the socket
+    // was stale — exit so InjectorService reopens instead of swallowing every event.
     let resume_deadline = tokio::time::sleep(Duration::from_secs(5));
     tokio::pin!(resume_deadline);
     let mut resumed_once = false;
@@ -165,27 +146,22 @@ async fn session_main(mut rx: UnboundedReceiver<InputEvent>, source: EiSource) {
             }
         }
     }
-    // A client that vanished mid-press must not leave keys/buttons latched in the
-    // compositor — Mutter keeps the implicit grab of a destroyed device's button and the
-    // focused app stops taking clicks until it is restarted. Release everything still
-    // held before the EIS connection (and its devices) go away.
+    // Mutter keeps the implicit grab of a destroyed device's held button until the
+    // focused app restarts. Release before the EIS connection (and its devices) go.
     state.release_all(&context);
 }
 
-/// Tie down the verbose tuple the connect step returns. The keep-alive must stay alive for the
-/// whole session — dropping the portal/Mutter session closes the EIS connection; for the
-/// direct-socket path it's `Box::new(())`.
+/// Connect-step return. Keep-alive must outlive the session — dropping the
+/// portal/Mutter session closes EIS. Direct-socket path uses `Box::new(())`.
 type Connected = (
     Box<dyn Send>,
     ei::Context,
     reis::tokio::EiConvertEventStream,
-    // The compositor's output size ("WxH" relay-file hint) — the scale target for absolute
-    // coordinates when the EIS advertises only a degenerate region (gamescope). `None` for
-    // the portal/Mutter paths, whose regions are real.
+    // Relay-file "WxH" scale target when EIS advertises a degenerate region
+    // (gamescope). `None` on portal/Mutter, whose regions are real.
     Option<(u32, u32)>,
 );
 
-/// Reach an EIS server per `source` and run the EI sender handshake.
 async fn connect(source: EiSource) -> Result<Connected> {
     let (keepalive, stream, output_hint): (Box<dyn Send>, UnixStream, Option<(u32, u32)>) =
         match source {
@@ -203,10 +179,8 @@ async fn connect(source: EiSource) -> Result<Connected> {
             }
         };
     let context = ei::Context::new(stream).map_err(|e| anyhow!("reis EI context: {e}"))?;
-    // Bound the handshake. `UnixStream::connect` to a socket *file* succeeds the moment the path
-    // exists, but a stale/half-ready gamescope (its socket created early in startup, or left behind
-    // by a SIGKILLed prior session) may never drive the EI handshake — which would otherwise hang
-    // this worker forever. A bounded handshake lets the worker error out so InjectorService reopens.
+    // `UnixStream::connect` succeeds as soon as the path exists; a stale gamescope
+    // socket never completes the EI handshake. Bound so InjectorService can reopen.
     let (_conn, events) = tokio::time::timeout(
         Duration::from_secs(8),
         context.handshake_tokio("punktfunk-host", ei::handshake::ContextType::Sender),
@@ -219,7 +193,6 @@ async fn connect(source: EiSource) -> Result<Connected> {
     Ok((keepalive, context, events, output_hint))
 }
 
-/// Open a RemoteDesktop portal session (pointer + keyboard) and obtain the EIS socket fd.
 async fn connect_portal() -> Result<(
     RemoteDesktop,
     ashpd::desktop::Session<RemoteDesktop>,
@@ -258,12 +231,9 @@ async fn connect_portal() -> Result<(
     Ok((rd, session, fd))
 }
 
-/// GNOME path: get the EIS socket fd from Mutter's *direct* `org.gnome.Mutter.RemoteDesktop` API
-/// (`CreateSession` → `Start` → `ConnectToEIS`). No xdg portal is involved, so there is no
-/// interactive "Allow remote control?" approval to satisfy — exactly why [`connect_portal`] times
-/// out on a headless GNOME host. (Same direct API the Mutter *video* backend uses.) The returned
-/// keep-alive owns the D-Bus connection + session; dropping it tears the Mutter session down and
-/// closes the EIS connection (Mutter sessions die with their D-Bus connection).
+/// EIS fd from Mutter's direct `org.gnome.Mutter.RemoteDesktop` (`CreateSession` →
+/// `Start` → `ConnectToEIS`). No portal approval. Keep-alive owns the D-Bus
+/// connection + session; dropping it tears the Mutter session down and closes EIS.
 async fn connect_mutter() -> Result<(Box<dyn Send>, std::os::fd::OwnedFd)> {
     use zbus::zvariant::{OwnedObjectPath, Value};
     let conn = zbus::Connection::session()
@@ -302,25 +272,18 @@ async fn connect_mutter() -> Result<(Box<dyn Send>, std::os::fd::OwnedFd)> {
     Ok((Box::new((conn, session)), std::os::fd::OwnedFd::from(fd)))
 }
 
-/// Poll `file` for the EIS socket path (the gamescope backend relays `LIBEI_SOCKET` there once
-/// the nested app launches), then connect. A bare name is resolved against `XDG_RUNTIME_DIR`,
-/// mirroring libei's own `LIBEI_SOCKET` semantics. Line 2 of the relay file, when present,
-/// carries the compositor's output size as `WxH` — returned as the absolute-coordinate scale
-/// hint (gamescope's EIS region is degenerate, so the geometry can't come from the protocol).
+/// Poll `file` for the EIS socket path (gamescope relays `LIBEI_SOCKET` there), then
+/// connect. A bare name is resolved against `XDG_RUNTIME_DIR`, matching libei.
+/// Line 2, when present, is compositor output `WxH` — gamescope's EIS region is
+/// degenerate, so geometry cannot come from the protocol.
 async fn connect_socket_file(file: &std::path::Path) -> Result<(UnixStream, Option<(u32, u32)>)> {
-    // The relay file is rewritten each session with the CURRENT gamescope's `LIBEI_SOCKET`, and the
-    // socket may not be `listen()`ing the instant its name appears — or the file may briefly still
-    // hold a prior, now-dead session's name (the host-lifetime injector reconnecting between
-    // sessions). So poll: RE-READ the file and RETRY the connect, treating "refused"/"missing" as
-    // not-ready-yet (the exact "Connection refused" we saw when a stale socket lingered). Bounded so
-    // a genuinely wedged setup still surfaces an error.
+    // Re-read and retry: the file may still name a dead session's socket, or the
+    // live one is not listening yet. Bound so a wedged compositor still errors.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let mut logged = String::new();
     loop {
-        // Defense-in-depth: never follow a symlinked relay file. It lives under `$XDG_RUNTIME_DIR`
-        // (per-user 0700) so a cross-user plant is already blocked, but refuse a symlink outright
-        // rather than read through one to an attacker-chosen target (a rogue EIS server would
-        // keylog/deny the session's input; security-review 2026-06-28 #6).
+        // Refuse a symlink. The file lives under `$XDG_RUNTIME_DIR` (0700), but
+        // following one would connect to an attacker-chosen EIS server.
         if std::fs::symlink_metadata(file)
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false)
@@ -352,9 +315,8 @@ async fn connect_socket_file(file: &std::path::Path) -> Result<(UnixStream, Opti
                 }
                 match UnixStream::connect(&full) {
                     Ok(stream) => return Ok((stream, hint)),
-                    // Refused = socket file exists but no listener yet (or a dead session);
-                    // NotFound = path not created yet. Both heal once the live gamescope's EIS is
-                    // up — retry. Anything else (e.g. permission) is a real failure.
+                    // Refused: file exists, no listener yet (or a dead session).
+                    // NotFound: path not created yet. Retry. Anything else is fatal.
                     Err(e)
                         if matches!(
                             e.kind(),
@@ -374,26 +336,19 @@ async fn connect_socket_file(file: &std::path::Path) -> Result<(UnixStream, Opti
     }
 }
 
-/// One EI device and its emulation state.
-/// Pick the region to map absolute coordinates into. The device advertises one region per logical
-/// monitor and blindly taking `first()` next to a physical monitor put the pointer — and every
-/// click — on whichever output the compositor happened to announce first (on-glass: GNOME with a
-/// dummy HDMI beside the virtual primary; the seat cursor never entered the streamed monitor, so
-/// neither embedded nor metadata cursor capture could see it).
+/// Region to map absolute coordinates into. The device advertises one region per
+/// logical monitor; `first()` is whichever output the compositor announced first.
 ///
-/// The ladder, most identifying first:
-///
-/// 1. **`mapping_id`** from the session's [`AbsoluteAnchor`] — the protocol's own key for
-///    correlating a region with a video stream.
-/// 2. **origin** from the anchor — two outputs can share a size, never a top-left. This is what
-///    makes a *mirrored physical monitor* land correctly (`design/per-monitor-portal-capture.md`
-///    §7.2): its region is not the client's size, so the size rung can't find it.
-/// 3. **size** — the streamed mode. Correct for a client-sized virtual output, ambiguous the
-///    moment two heads share a mode, which is exactly why the rungs above exist.
+/// Most identifying first:
+/// 1. [`AbsoluteAnchor::mapping_id`] — protocol key correlating a region with a stream.
+/// 2. Anchor origin — two outputs can share a size, never a top-left. A mirrored
+///    physical monitor's region is not the client's size (`design/per-monitor-portal-capture.md`).
+/// 3. Streamed mode size — right for a client-sized virtual output, ambiguous once
+///    two heads share a mode.
 /// 4. `first()`.
 ///
-/// An anchor that matches nothing falls through rather than failing: the region set is the truth
-/// and the anchor is our belief about it. The caller logs that miss ([`anchor_missed`]).
+/// An unmatched anchor falls through: the region set is the truth. The caller logs
+/// the miss ([`anchor_missed`]).
 fn region_for_mode<'a>(
     regions: &'a [reis::event::Region],
     w: f32,
@@ -407,8 +362,8 @@ fn region_for_mode<'a>(
             }
         }
         if let Some((x, y)) = a.origin {
-            // EI region offsets are unsigned; a compositor places every output at a non-negative
-            // origin in its own global space, so a negative anchor simply matches nothing.
+            // EI region offsets are unsigned; a negative origin matches nothing
+            // rather than wrapping to a huge u32 that could hit a real region.
             if x >= 0 && y >= 0 {
                 if let Some(r) = regions.iter().find(|r| r.x == x as u32 && r.y == y as u32) {
                     return Some(r);
@@ -419,20 +374,17 @@ fn region_for_mode<'a>(
     regions
         .iter()
         .find(|r| r.width as f32 == w && r.height as f32 == h)
-        // A display scale s shrinks the output's EI region to LOGICAL pixels (Mutter advertises
-        // 853x533 for a 1280x800 output at 1.5), so the exact rung above misses every scaled
-        // output and fell through to `regions.first()` — the wrong monitor whenever another
-        // region sorts first (on-glass: a park landed on a LINGERING sibling virtual display).
+        // Display scale shrinks the EI region to logical pixels (Mutter: 1280×800
+        // at 1.5 → 853×533). Exact size then misses; without this rung we take
+        // `regions.first()` — the wrong monitor whenever another region sorts first.
         .or_else(|| regions.iter().find(|r| scaled_region_match(r, w, h)))
         .or_else(|| regions.first())
 }
 
-/// Is `r` the streamed `w`×`h` surface advertised at a display scale > 1 — i.e. does one
-/// consistent scale factor map the region onto the mode on both axes? Per-axis rounding
-/// (Mutter floors 1280/1.5 to 853) allows ±2 logical px of slack, scaled back into mode space.
-/// Scales run 1..=4 (fractional 1.25/1.5/1.75 included); exactly 1.0 is the exact rung's job,
-/// and anything past 4 is no real display scale — matching it would just resurrect the
-/// wrong-monitor fallback this rung exists to prevent.
+/// True when `r` is the streamed `w`×`h` surface advertised at display scale > 1.
+/// ±2 logical px of slack covers per-axis floor (Mutter: 1280/1.5 → 853). Scales
+/// 1..=4 (fractional 1.25/1.5/1.75 included); 1.0 is the exact rung, and >4 is
+/// not a real display scale — matching it would pick the wrong monitor.
 fn scaled_region_match(r: &reis::event::Region, w: f32, h: f32) -> bool {
     let (rw, rh) = (r.width as f32, r.height as f32);
     if rw < 1.0 || rh < 1.0 {
@@ -445,13 +397,8 @@ fn scaled_region_match(r: &reis::event::Region, w: f32, h: f32) -> bool {
     (rh * s - h).abs() <= 2.0 * s
 }
 
-/// Report which region absolute coordinates actually landed in, once per distinct answer.
-///
-/// The ladder above is only *observable* through where the pointer ends up, which on a two-head box
-/// is precisely the thing that is hard to see and easy to get wrong — the anchor exists because it
-/// already resolved wrong on-glass once, silently. `warn_anchor_miss` covers the anchor naming
-/// nothing; this covers the other half, an anchor that matched *something*, by saying which. Once
-/// per distinct region so a live session logs one line, not one per motion event.
+/// Log which region absolute coordinates landed in, once per distinct region so
+/// a live session is one line, not one per motion event.
 fn note_abs_region(region: &reis::event::Region, anchor: Option<&AbsoluteAnchor>) {
     static LAST: std::sync::Mutex<Option<(u32, u32, u32, u32)>> = std::sync::Mutex::new(None);
     let key = (region.x, region.y, region.width, region.height);
@@ -469,10 +416,8 @@ fn note_abs_region(region: &reis::event::Region, anchor: Option<&AbsoluteAnchor>
     );
 }
 
-/// Did an anchor name an output this region set doesn't have? Drives the one-shot warning — a
-/// silently mis-mapped pointer is the failure this whole ladder exists to prevent, so when the
-/// anchor can't be honored that has to be visible in the log rather than inferred from "clicks land
-/// on the wrong screen".
+/// True when the anchor names an output this region set does not have. Drives
+/// the one-shot warning: a miss must be in the log, not inferred from clicks.
 fn anchor_missed(regions: &[reis::event::Region], anchor: Option<&AbsoluteAnchor>) -> bool {
     let Some(a) = anchor else {
         return false;
@@ -492,47 +437,42 @@ fn anchor_missed(regions: &[reis::event::Region], anchor: Option<&AbsoluteAnchor
 
 struct DeviceSlot {
     device: reis::event::Device,
-    /// The device is resumed (allowed to emit). Devices arrive paused and may pause again.
+    /// Devices arrive paused and may pause again.
     resumed: bool,
-    /// We have issued `start_emulating` since the last resume.
+    /// `start_emulating` issued since the last resume.
     emulating: bool,
 }
 
-/// Tracks bound devices + the serial/sequence/timebase the EI protocol requires.
+/// Bound devices plus the serial/sequence/timebase the EI protocol requires.
 struct EiState {
     devices: Vec<DeviceSlot>,
     last_serial: u32,
     sequence: u32,
     start: Instant,
-    /// Total inject() calls — used only to throttle diagnostic logging.
+    /// inject() count — throttle for diagnostic logging.
     injected: u64,
-    /// Bitmask of [`InputKind`]s already logged once (diagnostics: surface the FIRST of each
-    /// kind a client sends + whether it emitted, so an unexpected client — e.g. a touch-only
-    /// tablet hitting a compositor without ei_touchscreen — is immediately diagnosable).
+    /// [`InputKind`]s already logged once (first of each kind).
     seen_kinds: u32,
-    /// Wire codes currently held down (keys = VK, buttons = GameStream ids, touches = ids)
-    /// — synthesized back up at session end ([`EiState::release_all`]). A client that
-    /// vanishes mid-press must not leave the compositor with a latched key or an implicit
-    /// pointer grab: observed on Mutter, a button held by a destroyed EIS device wedges
-    /// click delivery to the focused app until that app is restarted.
+    /// Wire codes still down (keys = truncated VK, buttons = GameStream ids,
+    /// touches = ids). Synthesized up at session end ([`EiState::release_all`]).
+    /// A vanished client must not leave a latched key or Mutter's implicit grab.
     held_keys: Vec<u32>,
     held_buttons: Vec<u32>,
     held_touches: Vec<u32>,
-    /// The touch id currently degraded to the absolute pointer ([`EiState::degrade_touch`]) —
-    /// the "primary finger" while the EIS has no touchscreen device. `None` between touches.
+    /// Touch id currently driving the absolute pointer ([`EiState::degrade_touch`]).
+    /// `None` between touches.
     degraded_touch: Option<u32>,
-    /// The compositor's output size (relay-file "WxH" hint) — scale target for absolute
-    /// coordinates when the device's region is degenerate/absent (gamescope). Without it the
-    /// fallback is raw client pixels, correct only when the stream runs at the output's size.
+    /// Compositor output size (relay-file "WxH") — scale target when the device's
+    /// region is degenerate. Without it the fallback is raw client pixels.
     output_hint: Option<(u32, u32)>,
 }
 
-/// The anchor whose miss we last warned about, so a persistently unmatchable anchor logs once per
-/// *change* instead of once per pointer sample (absolute motion arrives at client frame rate).
+/// Last-warned unmatched anchor, so a sticky miss logs once per change rather
+/// than once per pointer sample (absolute motion arrives at client frame rate).
 static LAST_WARNED_ANCHOR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-/// Warn — once per distinct anchor — that the session's anchor names an output this EIS doesn't
-/// advertise, so absolute coordinates fell back to size matching. See [`region_for_mode`].
+/// Warn once per distinct anchor that it names no advertised EIS region, so
+/// absolute coordinates fell back to size matching. See [`region_for_mode`].
 fn warn_anchor_miss(anchor: &AbsoluteAnchor, regions: &[reis::event::Region]) {
     let key = format!("{anchor:?}");
     let mut last = LAST_WARNED_ANCHOR.lock().unwrap_or_else(|e| e.into_inner());
@@ -551,16 +491,14 @@ fn warn_anchor_miss(anchor: &AbsoluteAnchor, regions: &[reis::event::Region]) {
     );
 }
 
-/// Is this EIS region a plausible OUTPUT geometry — something to map normalized coordinates
-/// into? gamescope advertises a degenerate `(0,0,INT32_MAX,INT32_MAX)` "everything" region on
-/// its virtual input device, meaning "absolute coordinates are raw"; normalizing into it
-/// explodes a center tap to x≈1e9, which the compositor clamps to the far corner. 16384
-/// comfortably covers real multi-monitor layouts while rejecting the sentinel.
+/// Plausible output geometry to map normalized coordinates into. gamescope
+/// advertises `(0,0,INT32_MAX,INT32_MAX)` meaning "coordinates are raw";
+/// normalizing into it explodes a center tap to x≈1e9. 16384 covers real
+/// multi-monitor layouts while rejecting that sentinel.
 fn sane_region(r: &reis::event::Region) -> bool {
     r.width > 0 && r.height > 0 && r.width <= 16_384 && r.height <= 16_384
 }
 
-/// Stable small index per [`InputKind`] for the `seen_kinds` bitmask.
 fn kind_bit(kind: InputKind) -> u32 {
     let i = match kind {
         InputKind::MouseMove => 0,
@@ -600,14 +538,12 @@ impl EiState {
         }
     }
 
-    /// Release everything the remote client still holds — called when the session ends
-    /// (client gone, EIS closing). Synthesizes wire-level release events through the
-    /// normal [`EiState::inject`] path so the compositor sees proper key-up / button-up /
-    /// touch-up frames before the devices disappear.
+    /// Synthesize wire-level releases through [`EiState::inject`] so the
+    /// compositor sees key-up / button-up / touch-up before devices disappear.
     fn release_all(&mut self, ctx: &ei::Context) {
-        // A degraded touch is held as a synthesized left button (in `held_buttons`), so the
-        // loop below releases it — but the primary-finger latch must clear too, or the NEXT
-        // session's first TouchDown reads as a second finger and is ignored.
+        // The synthesized left button is in `held_buttons` and is released below.
+        // Clear the primary-finger latch too, or the next session's first
+        // TouchDown reads as a second finger and is ignored.
         self.degraded_touch = None;
         let (keys, buttons, touches) = (
             std::mem::take(&mut self.held_keys),
@@ -646,7 +582,6 @@ impl EiState {
         self.start.elapsed().as_micros() as u64
     }
 
-    /// Apply a server event: bind capabilities, track devices, and follow resume/pause.
     fn handle_ei(&mut self, ev: EiEvent, ctx: &ei::Context) {
         match ev {
             EiEvent::SeatAdded(e) => {
@@ -685,9 +620,8 @@ impl EiState {
                     keyboard = dev.has_capability(DeviceCapability::Keyboard),
                     button = dev.has_capability(DeviceCapability::Button),
                     scroll = dev.has_capability(DeviceCapability::Scroll),
-                    // One region per logical monitor — which one absolute coords map into is
-                    // resolved per event (`region_for_mode`); log them so a mis-mapped pointer
-                    // (cursor/clicks on the wrong output) is diagnosable from the journal.
+                    // One region per logical monitor; `region_for_mode` picks per event.
+                    // Log them so a mis-mapped pointer is diagnosable from the journal.
                     regions = ?dev
                         .regions()
                         .iter()
@@ -702,20 +636,18 @@ impl EiState {
                     d.emulating = false;
                 }
             }
-            // Informational: the server reports resulting modifier/group state; we don't set it.
+            // Server reports resulting modifier/group state; we do not set it.
             EiEvent::KeyboardModifiers(e) => self.last_serial = e.serial,
             _ => {}
         }
     }
 
-    /// Index of a resumed device exposing `cap`.
     fn device_for(&self, cap: DeviceCapability) -> Option<usize> {
         self.devices
             .iter()
             .position(|d| d.resumed && d.device.has_capability(cap))
     }
 
-    /// Ensure the device at `idx` is in `start_emulating` state before we emit on it.
     fn ensure_emulating(&mut self, idx: usize, dev: &ei::Device) {
         if !self.devices[idx].emulating {
             dev.start_emulating(self.last_serial, self.sequence);
@@ -724,13 +656,11 @@ impl EiState {
         }
     }
 
-    /// Degrade touch to a single-finger ABSOLUTE POINTER on compositors whose EIS never
-    /// creates a touchscreen device (gamescope's "Gamescope Virtual Input" advertises
-    /// pointer/pointer_abs/button but no touch — observed live; headless KWin the same).
-    /// Down = abs-move + left press, move = abs-move, up = left release — synthesized through
-    /// the normal [`EiState::inject`] Mouse* paths so region mapping, held-state tracking and
-    /// [`EiState::release_all`] all apply. Only the FIRST finger drives the pointer; later
-    /// fingers are ignored (a pointer has no second contact — a pinch degrades to a drag).
+    /// Degrade touch to a single-finger absolute pointer when EIS has no
+    /// touchscreen device (gamescope / headless KWin). Down = abs-move + left
+    /// press, move = abs-move, up = left release, via [`EiState::inject`] so
+    /// region mapping, held-state, and [`EiState::release_all`] apply. Later
+    /// fingers are ignored — a pointer has no second contact.
     fn degrade_touch(&mut self, ev: &InputEvent, ctx: &ei::Context) {
         const GS_BUTTON_LEFT: u32 = 1;
         match ev.kind {
@@ -788,12 +718,9 @@ impl EiState {
         }
     }
 
-    /// Translate and emit one client input event, committing it as a single `frame`.
     fn inject(&mut self, ev: &InputEvent, ctx: &ei::Context) {
-        // No ei_touchscreen device but an absolute pointer exists → degrade rather than drop
-        // (the game-mode "touch simply does not work" trap). Checked per event, not latched:
-        // a touchscreen device appearing later (compositor restart, capability change) takes
-        // over seamlessly on the next touch.
+        // No ei_touchscreen but an absolute pointer exists → degrade rather than
+        // drop. Per event, not latched: a touchscreen appearing later takes over.
         if matches!(
             ev.kind,
             InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp
@@ -816,14 +743,13 @@ impl EiState {
             | InputKind::GamepadButton
             | InputKind::GamepadAxis
             | InputKind::GamepadRemove
-            | InputKind::GamepadArrival => return, // uinput path (later)
-            // libei presses keycodes against the server's negotiated keymap — no committed-text
-            // path (the HOST_CAP_TEXT_INPUT cap is not advertised on this backend).
+            | InputKind::GamepadArrival => return, // uinput path
+            // Keycodes against the server's keymap — no committed-text path
+            // (`HOST_CAP_TEXT_INPUT` is not advertised on this backend).
             InputKind::TextInput => return,
         };
         self.injected += 1;
         let n = self.injected;
-        // Log the first of each kind always (diagnostics), then occasionally.
         let bit = kind_bit(ev.kind);
         let first = self.seen_kinds & bit == 0;
         self.seen_kinds |= bit;
@@ -839,10 +765,8 @@ impl EiState {
                     "libei: dropped event — no resumed device exposes this capability"
                 );
             }
-            // No resumed device with this capability yet. For touch this is usually permanent on
-            // this compositor — the RemoteDesktop portal may grant the Touchscreen *device type*
-            // while the EIS server never creates a touchscreen *device* (observed on headless
-            // KWin). Surface it once so touch silently going nowhere is diagnosable.
+            // Portal may grant Touchscreen while EIS never creates a touchscreen
+            // device. Surface once so a silent drop is diagnosable.
             if matches!(
                 ev.kind,
                 InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp
@@ -874,14 +798,10 @@ impl EiState {
                 let h = (ev.flags & 0xffff) as f32;
                 match slot.interface::<ei::PointerAbsolute>() {
                     Some(p) if w > 0.0 && h > 0.0 => {
-                        // Map the normalized client position into the region matching the streamed
-                        // output's mode (`region_for_mode` picks the right one on a multi-monitor
-                        // EIS). gamescope's "Gamescope Virtual Input" advertises a degenerate
-                        // (0,0,INT32_MAX,INT32_MAX) region meaning "coordinates are raw" —
-                        // `sane_region` rejects it (normalizing into it explodes a center tap to
-                        // x≈1e9, clamped to the far corner), so a non-matching / insane region
-                        // falls to the output hint (correct across a resolution mismatch), then
-                        // raw client pixels as the last resort.
+                        // Map normalized client position into the streamed output's
+                        // region. `sane_region` rejects gamescope's INT32_MAX "raw"
+                        // region (a center tap would become x≈1e9). Else output hint,
+                        // then raw client pixels.
                         let nx = (ev.x as f32 / w).clamp(0.0, 1.0);
                         let ny = (ev.y as f32 / h).clamp(0.0, 1.0);
                         let anchor = crate::absolute_anchor();
@@ -901,9 +821,8 @@ impl EiState {
                                     region.y as f32 + ny * region.height as f32,
                                 )
                             }
-                            // Degenerate/absent region: scale into the relay-file output hint
-                            // (correct even when the client streams at a different resolution
-                            // than the session runs); raw client pixels as the last resort.
+                            // Degenerate/absent region: scale into the relay-file
+                            // output hint; raw client pixels as last resort.
                             None => match self.output_hint {
                                 Some((ow, oh)) => (nx * ow as f32, ny * oh as f32),
                                 None => (ev.x as f32, ev.y as f32),
@@ -929,16 +848,9 @@ impl EiState {
             }
             InputKind::MouseScroll => match slot.interface::<ei::Scroll>() {
                 Some(s) => {
-                    // Wire deltas are WHEEL_DELTA(120)-scaled in `x`. Emit BOTH ei scroll axes
-                    // from it: `scroll_discrete` (120-per-detent — drives line/page scrolling)
-                    // AND the continuous `scroll` axis in logical px (≈15 px/detent). Without
-                    // the continuous axis Mutter floors a sub-detent delta (trackpad / precise
-                    // wheel / fractional smooth scroll) to zero whole clicks, so small scrolls
-                    // never register and you have to spin the wheel a lot — emitting the pixel
-                    // axis too makes every delta move proportionally (matches the wlr backend's
-                    // 15 px/notch). Positive wire = up (vertical, negated on the ei axis) /
-                    // RIGHT (horizontal, already positive — moonlight-qt/Sunshine pass it
-                    // through unnegated); only the vertical axis flips.
+                    // Wire `x` is WHEEL_DELTA(120). Emit discrete (120/detent) and
+                    // continuous px (15 px/detent). Without the px axis Mutter floors
+                    // a sub-detent delta to zero. Vertical is negated; horizontal is not.
                     const PX_PER_DETENT: f32 = 15.0;
                     let px = ev.x as f32 / 120.0 * PX_PER_DETENT;
                     if ev.code == SCROLL_HORIZONTAL {
@@ -967,10 +879,9 @@ impl EiState {
                     }
                 }
             }
-            // Touch: `code` is the touch id, `x`/`y` are client pixels and `flags` packs the
-            // client surface w/h — mapped into the device's region exactly like MouseMoveAbs.
-            // One InputEvent = one frame, which satisfies the ei_touchscreen rule that a down /
-            // motion / up must not share a frame.
+            // `code` is the touch id; `x`/`y` are client pixels; `flags` packs surface
+            // w/h — mapped like MouseMoveAbs. One event = one frame (ei_touchscreen
+            // forbids down/motion/up sharing a frame).
             InputKind::TouchDown | InputKind::TouchMove => {
                 let w = ((ev.flags >> 16) & 0xffff) as f32;
                 let h = (ev.flags & 0xffff) as f32;
@@ -978,9 +889,8 @@ impl EiState {
                     Some(t) if w > 0.0 && h > 0.0 => {
                         let nx = (ev.x as f32 / w).clamp(0.0, 1.0);
                         let ny = (ev.y as f32 / h).clamp(0.0, 1.0);
-                        // Same region-selection + degenerate fallback ladder as MouseMoveAbs
-                        // (including the session anchor — touch must land on the same monitor the
-                        // pointer does, or a mirrored session's taps go to a different screen).
+                        // Same region ladder as MouseMoveAbs so touch and pointer
+                        // land on the same monitor.
                         let anchor = crate::absolute_anchor();
                         let (x, y) = match region_for_mode(slot.regions(), w, h, anchor.as_ref())
                             .filter(|r| sane_region(r))
@@ -1019,20 +929,10 @@ impl EiState {
         }
 
         if emitted {
-            // Track held state on the wire codes so `release_all` can undo it at
-            // session end (vanished clients must not leave anything latched).
             match ev.kind {
-                // Track the code we ACTUALLY INJECTED, not the raw wire code.
-                //
-                // Injection truncates (`vk_to_evdev(ev.code as u8)`), so 0x41, 0x141, 0x241 … all
-                // press the same key — but this list stored the full 32 bits, so a KeyUp for 0x41
-                // never matched the entry a KeyDown for 0x141 left behind. A client sending
-                // distinct high bytes therefore appended entries that could never be removed, to a
-                // `Vec` scanned linearly on every keystroke, for the lifetime of the injector
-                // thread — which outlives the session (2026-08-05 review L-4). Tracking the
-                // truncated code makes the list correct AND bounds it at 256 entries by
-                // construction. `release_all` re-injects through the same truncation, so the
-                // release path is unchanged.
+                // Track the injected code, not the raw wire code. `vk_to_evdev`
+                // truncates to u8, so 0x41 and 0x141 press the same key; storing
+                // 32 bits left KeyUp unable to match and the list unbounded.
                 InputKind::KeyDown if !self.held_keys.contains(&(ev.code & 0xff)) => {
                     self.held_keys.push(ev.code & 0xff);
                 }
@@ -1050,8 +950,8 @@ impl EiState {
             dev.frame(self.last_serial, self.now_us());
         }
         if let Err(e) = ctx.flush() {
-            // In the per-input-event hot path: a dead EIS socket fails flush on every event
-            // (mouse-move = 100s/s), so gate the warn behind the same `loud` sampler as its siblings.
+            // Dead EIS fails flush on every event (mouse-move = 100s/s); same
+            // `loud` sampler as the sibling warns.
             if loud {
                 tracing::warn!(error = %e, "libei: ctx.flush failed");
             }
@@ -1077,8 +977,7 @@ mod tests {
         }
     }
 
-    /// The case the anchor exists for: two heads at the SAME size, so the size rung is a coin
-    /// flip. The origin picks the right one.
+    /// Two heads at the same size: size matching is a coin flip. Origin picks.
     #[test]
     fn the_origin_disambiguates_two_same_size_monitors() {
         let regions = [
@@ -1091,14 +990,14 @@ mod tests {
         };
         let picked = region_for_mode(&regions, 1920.0, 1080.0, Some(&anchor)).unwrap();
         assert_eq!((picked.x, picked.y), (1920, 0));
-        // Without the anchor the same call takes the first same-sized region — the old behavior,
-        // preserved deliberately for the client-sized virtual-output path.
+        // No anchor takes the first same-sized region — required for the
+        // client-sized virtual-output path.
         let picked = region_for_mode(&regions, 1920.0, 1080.0, None).unwrap();
         assert_eq!((picked.x, picked.y), (0, 0));
     }
 
-    /// `mapping_id` outranks the origin: it is the protocol's own stream↔region correlation, so a
-    /// stale/rounded origin can't override it.
+    /// `mapping_id` outranks origin: a stale/rounded origin must not override
+    /// the protocol's stream↔region key.
     #[test]
     fn mapping_id_outranks_the_origin() {
         let regions = [
@@ -1113,28 +1012,24 @@ mod tests {
         assert_eq!(picked.mapping_id.as_deref(), Some("head-b"));
     }
 
-    /// A display scale shrinks the output's EI region to logical pixels — the exact rung misses
-    /// it, and before the scaled rung the ladder fell through to `regions.first()`, the wrong
-    /// monitor. The on-glass shape: a 1280x800 stream whose output runs at 1.5 scale (Mutter
-    /// advertises 853x533, per-axis floor), listed AFTER a lingering sibling virtual display.
+    /// Display scale shrinks the EI region to logical pixels. Without the scaled
+    /// rung the ladder takes `regions.first()`. 1280×800 at 1.5 is 853×533.
     #[test]
     fn a_scaled_output_beats_the_first_region_fallback() {
         let regions = [
-            region(0, 0, 1462, 1044, None),    // lingering sibling virtual display
+            region(0, 0, 1462, 1044, None),    // first() would pick this
             region(1462, 0, 1920, 1080, None), // physical
-            region(3382, 0, 853, 533, None),   // ours: 1280x800 at 1.5 scale
+            region(3382, 0, 853, 533, None),   // 1280×800 at 1.5
         ];
         let picked = region_for_mode(&regions, 1280.0, 800.0, None).unwrap();
         assert_eq!((picked.width, picked.height), (853, 533));
-        // Integer scales round-trip too (2x: 640x400).
         let regions = [
             region(0, 0, 1920, 1080, None),
             region(1920, 0, 640, 400, None),
         ];
         let picked = region_for_mode(&regions, 1280.0, 800.0, None).unwrap();
         assert_eq!((picked.width, picked.height), (640, 400));
-        // A region that is NOT the mode at any consistent scale (wrong aspect) must not match —
-        // the fallback stays `regions.first()`.
+        // Wrong aspect is not a consistent scale — fallback stays `regions.first()`.
         let regions = [
             region(0, 0, 1000, 1000, None),
             region(1000, 0, 640, 200, None),
@@ -1143,15 +1038,13 @@ mod tests {
         assert_eq!((picked.width, picked.height), (1000, 1000));
     }
 
-    /// A mirrored monitor's region is NOT the client's streamed size, so the size rung would miss
-    /// it entirely — the origin is what makes this land.
+    /// A mirrored monitor's region is not the streamed size; origin is what finds it.
     #[test]
     fn the_anchor_finds_a_monitor_the_streamed_size_does_not_match() {
         let regions = [
             region(0, 0, 1920, 1080, None),
             region(1920, 0, 3840, 2160, None),
         ];
-        // Client streams 1280x720 of a 4K head parked to the right.
         let anchor = AbsoluteAnchor {
             origin: Some((1920, 0)),
             mapping_id: None,
@@ -1160,8 +1053,7 @@ mod tests {
         assert_eq!((picked.width, picked.height), (3840, 2160));
     }
 
-    /// An anchor that names nothing present must not strand input: fall back down the ladder
-    /// (size, then first) — and say so, which `anchor_missed` drives.
+    /// Unmatched anchor falls through the ladder (size, then first) and is reported.
     #[test]
     fn an_unmatched_anchor_falls_back_and_is_reported() {
         let regions = [region(0, 0, 1920, 1080, None)];
@@ -1172,7 +1064,6 @@ mod tests {
         assert!(anchor_missed(&regions, Some(&anchor)));
         let picked = region_for_mode(&regions, 1920.0, 1080.0, Some(&anchor)).unwrap();
         assert_eq!((picked.x, picked.y), (0, 0), "fell back to the size match");
-        // A matched anchor is never reported as missed.
         let ok = AbsoluteAnchor {
             origin: Some((0, 0)),
             mapping_id: None,
@@ -1181,8 +1072,7 @@ mod tests {
         assert!(!anchor_missed(&regions, None), "no anchor is not a miss");
     }
 
-    /// EI region offsets are unsigned; a negative anchor origin can only ever match nothing, and
-    /// must not be cast into a huge u32 that accidentally matches something.
+    /// EI offsets are unsigned; a negative origin must match nothing, not wrap.
     #[test]
     fn a_negative_origin_matches_nothing_rather_than_wrapping() {
         let regions = [region(0, 0, 1920, 1080, None)];
@@ -1195,8 +1085,7 @@ mod tests {
         assert_eq!((picked.x, picked.y), (0, 0));
     }
 
-    /// An empty anchor is the same as no anchor — so a caller can build one unconditionally and
-    /// let the setter drop it.
+    /// An empty anchor is the same as none — callers may build one unconditionally.
     #[test]
     fn an_empty_anchor_is_dropped_by_the_setter() {
         crate::set_absolute_anchor(Some(AbsoluteAnchor::default()));

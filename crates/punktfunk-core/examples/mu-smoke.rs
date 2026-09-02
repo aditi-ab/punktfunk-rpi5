@@ -1,9 +1,8 @@
-//! Headless validation driver for the gamescope multi-user isolation smoke
-//! (`design/gamescope-multiuser.md`): connect to a local host with
-//! `CompositorPref::Gamescope` (the isolated Spawn route), count video frames and
-//! audio payload bytes, and optionally wiggle the pointer so the session's pinned
-//! injector opens against its per-session EIS relay. A validation tool, not a
-//! product client — no decode, no presentation.
+//! Headless gamescope multi-user isolation smoke (`design/gamescope-multiuser.md`).
+//!
+//! Pins `CompositorPref::Gamescope` (isolated Spawn — Auto shares the seat) and
+//! prints frame/audio counts. `--input` moves the pointer so the session's pinned
+//! injector opens on its per-session EIS relay. No decode, no presentation.
 //!
 //! Usage: `mu-smoke <port> <W> <H> [seconds] [--input]`
 
@@ -32,18 +31,18 @@ fn main() {
         mode,
         CompositorPref::Gamescope,
         GamepadPref::Auto,
-        0,     // bitrate: host default
-        0,     // video_caps: 8-bit SDR
+        0,     // host default
+        0,     // 8-bit SDR
         2,     // stereo
-        0,     // codecs: HEVC-only baseline
-        0,     // preferred codec: auto
-        None,  // display_hdr
-        0,     // client_caps
-        false, // whole-AU delivery
-        None,  // launch: bare spawn (splash + keep-alive)
+        0,     // 0 → HEVC-only
+        0,     // auto
+        None,
+        0,
+        false, // no part decoder
+        None,  // bare spawn
         Some(format!("mu-smoke-{w}x{h}")),
-        None, // pin: TOFU
-        None, // identity: ephemeral
+        None, // TOFU
+        None, // ephemeral
         Duration::from_secs(40),
     )
     .expect("connect");

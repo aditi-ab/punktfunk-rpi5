@@ -1,8 +1,8 @@
-//! Stage two: the editable option set, with every default derived from `Facts`.
+//! Stage two: the editable option set. Every default is derived from `Facts`.
 //!
-//! The D4 table in `design/installer-v2.md` is the contract and `defaults_table` below is it,
-//! literally, as a test. Flags and env twins pin a row before any UI shows it, so `--yes` and
-//! the TUI resolve identically — that is the D5 compatibility promise.
+//! `design/installer-v2.md` is the contract; `defaults_table` below is that
+//! table as a test. Flags and env twins pin a row before any UI shows it, so
+//! `--yes` and the TUI resolve identically.
 //!
 //! Two defaults changed from the sh installer on purpose. The punktfunk group is **yes
 //! everywhere**, not couch-boxes-only: it grants usbip attach, so the row label names the
@@ -28,7 +28,7 @@ pub enum Action {
     Uninstall,
 }
 
-/// What to put on the box. Neither flag given means host, matching the sh installer.
+/// What to put on the box. Neither flag given means host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Components {
     pub host: bool,
@@ -87,7 +87,6 @@ impl Choices {
     pub fn derive(facts: &Facts, pins: &Pins) -> Choices {
         let (channel, switch_from) = resolve_channel(facts, pins.channel);
 
-        // Couch/HTPC images want the Deck pad and linger; a seatless session wants linger.
         let couch_why = match facts.os.id.as_str() {
             "bazzite" => "Bazzite",
             "nobara" => "Nobara",
@@ -114,7 +113,7 @@ impl Choices {
         Choices {
             action: pins.action,
             components: Components {
-                // Neither flag = host, as today. `--client` alone is a client-only install.
+                // Neither flag = host. `--client` alone is client-only.
                 host: pins.host || !pins.client,
                 client: pins.client,
             },
@@ -197,7 +196,7 @@ mod tests {
         }
     }
 
-    // design/installer-v2.md D4, as a table. A row changing here is a product decision.
+    // `design/installer-v2.md` defaults. A row changing here is a product decision.
     #[test]
     fn defaults_table() {
         let desktop = Choices::derive(&fresh("arch", Family::Pacman), &Pins::default());
@@ -270,7 +269,6 @@ mod tests {
         );
     }
 
-    // The stickiness trap: a bare re-run on a canary box must not drag it to stable.
     #[test]
     fn a_bare_re_run_follows_the_box_and_never_switches() {
         let mut canary = fresh("arch", Family::Pacman);
@@ -315,7 +313,7 @@ mod tests {
         );
     }
 
-    // No repo configured (a source build): --channel has nothing to switch, so it just sets one.
+    // No repo (a source build): `--channel` sets one; there is nothing to switch from.
     #[test]
     fn a_channel_flag_on_a_box_with_no_repo_is_not_a_switch() {
         let pins = Pins {

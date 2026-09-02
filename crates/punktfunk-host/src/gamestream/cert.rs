@@ -1,25 +1,27 @@
-//! The host's self-signed RSA-2048 identity: the cert returned to clients as `plaincert`
-//! during pairing AND presented as the TLS server cert on 47984 (Moonlight pins it). The
-//! cert's own X.509 signature bytes are an input to the pairing hashes, so we extract them.
+//! Host RSA-2048 identity: GameStream `plaincert` and the TLS server cert on
+//! 47984 (Moonlight pins it). Pairing hashes bind the cert's X.509
+//! `signatureValue` bytes, extracted here.
+//!
+//! Persist as `cert.pem` / `key.pem` under the config dir. Tests in this
+//! file pin minting and the GameStream TLS handshake.
 
 use anyhow::{anyhow, Context, Result};
 use pf_paths::config_dir;
 use rsa::pkcs1v15::SigningKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use rsa::RsaPrivateKey;
-// `rsa`'s own re-export: this `Sha256` is a TYPE PARAMETER to `SigningKey`, so it has to be the
-// one `rsa 0.9`'s `digest 0.10` traits speak — not the crate-wide `sha2 0.11`. See Cargo.toml.
+// `rsa 0.9` re-export: `SigningKey`'s type param must be this `digest 0.10`
+// `Sha256`, not crate-wide `sha2 0.11`. See Cargo.toml.
 use rsa::sha2::Sha256;
 use std::fs;
 
 pub struct ServerIdentity {
-    /// PEM of the cert (returned hex-encoded as `plaincert`; also the TLS server cert).
+    /// Pairing `plaincert` (hex of this PEM) and the TLS server cert.
     pub cert_pem: String,
-    /// PKCS#8 PEM of the private key (TLS server key).
     pub key_pem: String,
-    /// The cert's X.509 `signatureValue` bytes — bound into the pairing challenge hashes.
+    /// X.509 `signatureValue` — bound into the pairing challenge hashes.
     pub signature: Vec<u8>,
-    /// RSA-PKCS1v15-SHA256 signer over the host key (the pairing `sign256`).
+    /// Pairing `sign256`.
     pub signing_key: SigningKey<Sha256>,
 }
 
@@ -28,13 +30,8 @@ impl ServerIdentity {
         let dir = config_dir();
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
-        // Harden the directory BEFORE the first read, not only in the branch that generates a new
-        // identity (2026-08-05 review M-1). Reading first is what made the hardening pointless
-        // against the attack it was written for: combined with H-4's pre-creatable
-        // `%ProgramData%\punktfunk`, a local user could plant a cert/key pair and have it adopted
-        // verbatim as the host's long-lived identity — the QUIC server key, the mgmt-API TLS key and
-        // the RSA pairing signer all becoming a key the attacker holds. The compromise is permanent:
-        // this function never regenerates while both files are non-empty.
+        // Harden before the first read. This never regenerates while both
+        // files are non-empty, so a planted pair becomes the host identity.
         pf_paths::create_private_dir(&dir).ok();
         let (cert_pem, key_pem) = match (
             fs::read_to_string(&cert_path),
@@ -43,13 +40,8 @@ impl ServerIdentity {
             (Ok(c), Ok(k)) if !c.trim().is_empty() && !k.trim().is_empty() => (c, k),
             _ => {
                 let (c, k) = generate()?;
-                // The private key is the trust root for EVERY surface (TLS server cert, pairing
-                // signing, the QUIC identity clients pin) — write it owner-only (0600 / SYSTEM-only
-                // DACL) so a local user can't read it and impersonate the host. The dir is already
-                // 0700 / SYSTEM+Admins from the unconditional hardening above.
                 pf_paths::write_secret_file(&key_path, k.as_bytes())
                     .with_context(|| format!("write {}", key_path.display()))?;
-                // The cert is public (handed to clients), but write it owner-only too for consistency.
                 pf_paths::write_secret_file(&cert_path, c.as_bytes())
                     .with_context(|| format!("write {}", cert_path.display()))?;
                 tracing::info!(path = %cert_path.display(), "generated punktfunk host certificate (RSA-2048, key 0600)");
@@ -59,7 +51,7 @@ impl ServerIdentity {
         Self::from_pems(cert_pem, key_pem)
     }
 
-    /// Build an identity from PEMs (no I/O).
+    /// Parse PEMs; no I/O.
     pub fn from_pems(cert_pem: String, key_pem: String) -> Result<ServerIdentity> {
         let priv_key = RsaPrivateKey::from_pkcs8_pem(&key_pem).context("parse host private key")?;
         let signing_key = SigningKey::<Sha256>::new(priv_key);
@@ -72,7 +64,7 @@ impl ServerIdentity {
         })
     }
 
-    /// Throwaway in-memory identity — nothing touches the config dir (used by tests).
+    /// In-memory identity; does not touch the config dir.
     pub fn ephemeral() -> Result<ServerIdentity> {
         let (cert_pem, key_pem) = generate()?;
         Self::from_pems(cert_pem, key_pem)
@@ -80,20 +72,10 @@ impl ServerIdentity {
 }
 
 fn generate() -> Result<(String, String)> {
-    // rcgen cannot *generate* an RSA key on either backend — `generate_for(&PKCS_RSA_SHA256)`
-    // returns `KeyGenerationUnavailable`. Moonlight requires an RSA-2048 identity, so generate the
-    // key with the pure-Rust `rsa` crate (already a dep for the pairing signer) and hand the PKCS#8
-    // PEM to rcgen, which *can* load an existing RSA key and self-sign with it. Returning that same
-    // PEM keeps it byte-identical to what `from_pems` re-parses.
-    //
-    // This path runs ONLY when no cert exists yet — a fresh install — so an upgraded box never
-    // re-executes it.
-    //
-    // The rng comes from `rsa`'s OWN rand_core re-export, not from our `rand`. `RsaPrivateKey::new`
-    // is bounded on rand_core **0.6**'s `CryptoRngCore`, and since the host moved to rand 0.9 its
-    // `ThreadRng` implements rand_core 0.9's traits instead — a different trait of the same name,
-    // so it no longer satisfies the bound. `rsa::rand_core::OsRng` is the OS CSPRNG under the
-    // exact traits `rsa` compiled against, which keeps the two rand_core majors from meeting.
+    // rcgen cannot generate RSA (`KeyGenerationUnavailable`); Moonlight needs RSA-2048.
+    // Mint with `rsa`, self-sign via rcgen, return the same PKCS#8 PEM `from_pems` re-parses.
+    // `RsaPrivateKey::new` wants rand_core 0.6's `CryptoRngCore`. Our `rand` 0.9 `ThreadRng`
+    // is a different trait of the same name — use `rsa::rand_core::OsRng`.
     let priv_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048)
         .context("generate RSA-2048 host key")?;
     let key_pem = priv_key
@@ -112,7 +94,6 @@ fn generate() -> Result<(String, String)> {
     Ok((cert.pem(), key_pem))
 }
 
-/// Extract the X.509 `signatureValue` bytes from a cert PEM.
 fn cert_signature(cert_pem: &str) -> Result<Vec<u8>> {
     let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
         .map_err(|e| anyhow!("parse cert pem: {e}"))?;
@@ -120,13 +101,6 @@ fn cert_signature(cert_pem: &str) -> Result<Vec<u8>> {
     Ok(x509.signature_value.data.to_vec())
 }
 
-/// Coverage for what the aws-lc-rs migration (#192) changed here but shipped unverified.
-///
-/// `generate()` was already reached by other tests via `ServerIdentity::ephemeral()`, but only ever
-/// as an unasserted fixture — nothing checked that what came back was still an RSA-2048 identity,
-/// which is the one property Moonlight requires. The handshake behaviour had no coverage at all,
-/// and the GameStream TLS path is the single place where a legacy peer meets the new backend, so
-/// a backend or feature regression there would surface first in the field.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,9 +113,8 @@ mod tests {
     };
     use std::sync::Arc;
 
-    /// Moonlight does not chain-verify the host: it pins the cert by SHA-256 out of band, exactly
-    /// as our own `AcceptAnyClientCert` does in the other direction. Modelling that is what makes
-    /// this a Moonlight-shaped peer rather than a webpki-clean one.
+    /// Moonlight pins the host cert out of band; it does not chain-verify.
+    /// Same shape as `AcceptAnyClientCert` the other way — not webpki-clean.
     #[derive(Debug)]
     struct PinsOutOfBand(Arc<CryptoProvider>);
 
@@ -193,7 +166,6 @@ mod tests {
         (certs, key)
     }
 
-    /// Shuttle handshake bytes between the two ends until both stop handshaking.
     fn pump(client: &mut ClientConnection, server: &mut ServerConnection) {
         for _ in 0..40 {
             while client.wants_write() {
@@ -225,13 +197,12 @@ mod tests {
         panic!("handshake did not converge");
     }
 
-    /// Run a mutual handshake against the real `tls::server_config` and return the negotiated
-    /// (protocol version, key exchange group, number of client certs the server saw).
+    /// Mutual handshake vs `tls::server_config`. Returns (version, kx group, client certs seen).
     fn handshake_against_host(
         versions: &[&'static rustls::SupportedProtocolVersion],
     ) -> (String, String, usize) {
         let (host_cert, host_key) = generate().expect("host identity");
-        // A Moonlight client's own identity is an RSA-2048 self-signed cert — the same shape.
+        // Moonlight client identity is the same RSA-2048 self-signed shape.
         let (peer_cert, peer_key) = generate().expect("peer identity");
 
         let server_cfg =
@@ -263,8 +234,6 @@ mod tests {
         (version, kx, seen)
     }
 
-    /// The fresh-install path. rcgen cannot generate an RSA key, so this leans on `rsa` for the key
-    /// and rcgen only to self-sign — a split that must keep working across a crypto-backend change.
     #[test]
     fn generate_mints_a_loadable_rsa2048_identity() {
         let (cert_pem, key_pem) = generate().expect("generate");
@@ -274,10 +243,8 @@ mod tests {
             "key is not PKCS#8 PEM"
         );
 
-        // Everything downstream (pairing hashes, the TLS server cert) goes through from_pems.
         let identity = ServerIdentity::from_pems(cert_pem, key_pem).expect("from_pems");
-        // An RSA-2048 signature is exactly 256 bytes; this pins the key size that Moonlight needs
-        // without depending on an `rsa` accessor that could change shape.
+        // RSA-2048 PKCS#1 signature is 256 bytes. Pins key size without an `rsa` accessor.
         assert_eq!(
             identity.signature.len(),
             256,
@@ -285,7 +252,6 @@ mod tests {
         );
     }
 
-    /// GAP 1 from the #192 handoff: a legacy peer negotiating TLS 1.2 against the new backend.
     #[test]
     fn moonlight_shaped_peer_completes_a_tls12_mutual_handshake() {
         let (version, _kx, client_certs_seen) = handshake_against_host(&[&rustls::version::TLS12]);
@@ -296,9 +262,6 @@ mod tests {
         );
     }
 
-    /// GAP 3 from the #192 handoff: `prefer-post-quantum` was asserted from the rustls source and
-    /// never observed. Pin it, so a provider or feature regression that silently drops ML-KEM back
-    /// to a classical group fails here instead of in the field.
     #[test]
     fn tls13_negotiates_the_post_quantum_group() {
         let (version, kx, client_certs_seen) = handshake_against_host(&[&rustls::version::TLS13]);

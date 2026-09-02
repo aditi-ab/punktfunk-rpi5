@@ -1,59 +1,21 @@
-//! What the driver ACTUALLY answers about video image formats, verbatim — the
-//! physical-device-only probe behind `punktfunk-session --probe-decode`.
+//! Verbatim physical-device video-format probe behind `punktfunk-session --probe-decode`.
 //!
-//! # Why this exists
+//! For every profile the client can negotiate, asks the same question the
+//! session caps query asks, in every usage the image pools would create with,
+//! and records the answer — including failures as `VkResult`. Shares
+//! [`crate::caps::query_formats_on`] with the real caps path; a private copy
+//! would eventually disagree with the code it explains.
 //!
-//! Twice in a row an Intel Arc refusal was diagnosed from punktfunk's OWN error text
-//! and twice the conclusion ("Intel driver bug") was wrong — the bug was ours, in the
-//! `pNext` order of the capability query. What broke it open both times was logging
-//! the driver's answer with no interpretation in front of it. This module makes that
-//! the DEFAULT rather than a debugging afterthought: for every decode profile the
-//! client can negotiate, it asks the driver the same question the session's caps query
-//! asks, in every usage combination the image pools would create with, and records
-//! what came back — including the failures, spelled as the `VkResult` the driver
-//! returned.
-//!
-//! It shares [`crate::caps::query_formats_on`] with the real caps path on purpose. A
-//! probe with its own copy of the query is a probe that eventually disagrees with the
-//! code it is meant to explain, which is worse than no probe at all.
-//!
-//! # What it measured
-//!
-//! Intel Arc (Windows driver 101.8861, 2026-08): every one of the 26 decode profiles
-//! reports the SAME envelope for its NV12/P010 picture format —
-//! `TRANSFER_SRC | VIDEO_DECODE_DST | VIDEO_DECODE_DPB`, and `imageCreateFlags` EMPTY —
-//! with `DPB_AND_OUTPUT_COINCIDE` as the only decode mode. No `SAMPLED`, so a shader
-//! cannot read the decoded picture; and no `MUTABLE_FORMAT`/`EXTENDED_USAGE`, which
-//! closes the spec's only escape hatch (see [`crate::caps::VideoFormat::
-//! image_create_flags`]). `TRANSFER_SRC` is the sole way out of the image — i.e. a
-//! copy. NVIDIA (596.41) answers the same queries with
-//! `TRANSFER_SRC|TRANSFER_DST|SAMPLED|DECODE_DST|DECODE_DPB|ENCODE_SRC|ENCODE_DPB` and
-//! `MUTABLE_FORMAT|EXTENDED_USAGE`, which is what makes the zero-copy path work there.
-//!
-//! The Intel answers carry one genuine conformance bug, which is what made the refusal
-//! read oddly: the driver ignores the REQUESTED `imageUsage` completely. Asked for
-//! `SAMPLED` alone it still returns that same decode envelope, where the spec says the
-//! returned `imageUsageFlags` "will contain at least the same set of image usage flags"
-//! and `VK_ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR` is the documented refusal. That is why
-//! derivation reported "the NV12 entry does not advertise SAMPLED" (an entry was found)
-//! rather than "no NV12 in the coincide list" (nothing returned). It changes the error
-//! text, not the answer.
-//!
-//! # What the cross-check is, and is NOT
+//! A driver may ignore the requested `imageUsage` and still return an entry
+//! whose envelope omits those bits. Empty list is the spec refusal
+//! (`ERROR_FORMAT_NOT_SUPPORTED` / `ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR`).
 //!
 //! [`UsageProbe::image_format_support`] asks `vkGetPhysicalDeviceImageFormatProperties2`
-//! the same question with the same profile list chained. It is deliberately kept, and
-//! deliberately NOT treated as authority, because measuring it settled what it is worth:
-//! on BOTH vendors it answers "creatable" for combinations the video-format query
-//! rejects — NVIDIA included, for `SAMPLED` alone, which is not a legal video image
-//! usage at all. So that entry point does not fully honour the video profile list on any
-//! driver measured here, and a "creatable" from it is NOT evidence that a decode picture
-//! can be sampled. It is reported because the question is otherwise re-asked by every
-//! person who reads the refusal; the answer is on the record instead.
-//!
-//! `vkGetPhysicalDeviceVideoFormatPropertiesKHR` remains the authority, and two
-//! independent implementations of it — this probe and `vulkaninfo --show-video-props` —
-//! agree on every value above.
+//! with the same profile list. Reported, not authority: that entry point does
+//! not fully honour the chained video profile list, so "creatable" is not
+//! permission to sample a decode picture.
+//! `vkGetPhysicalDeviceVideoFormatPropertiesKHR` is the authority; pin against
+//! `vulkaninfo --show-video-props`.
 
 use ash::vk;
 use ash::vk::native as hh;
@@ -69,14 +31,8 @@ use crate::caps::P010;
 use crate::caps_av1::Av1ProfileKey;
 use crate::caps_h265::H265ProfileKey;
 
-/// The usage combinations the probe asks about, widest question first.
-///
-/// The first three are the REAL ones — exactly what [`crate::images`] creates with, so
-/// their answers are the ones derivation acts on. The rest exist to localise a refusal:
-/// when `DPB|DST|SAMPLED` fails, `DPB|DST` says whether the decode roles alone are fine
-/// (i.e. the gap is sampling) and `SAMPLED` alone says whether the format is sampleable
-/// under this profile at all. Without them, a single failed query leaves "which half is
-/// missing?" to inference — which is how this device got misdiagnosed twice.
+/// Usage combinations, widest first. First three match [`crate::images`].
+/// The rest split a refusal: decode roles vs sampling vs destination alone.
 const USAGE_MATRIX: [(&str, vk::ImageUsageFlags); 6] = [
     ("coincide DPB|DST|SAMPLED", COINCIDE_USAGE),
     ("distinct DPB", DPB_USAGE),
@@ -86,45 +42,35 @@ const USAGE_MATRIX: [(&str, vk::ImageUsageFlags); 6] = [
     ("DST alone", vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR),
 ];
 
-/// Decode roles with sampling deliberately withheld — the discriminator between "this
-/// device cannot decode this profile" and "it can decode it but not let anyone read it".
+/// Discriminator: decode roles work, sampling does not.
 const DECODE_ONLY_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
     vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR.as_raw()
         | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR.as_raw(),
 );
 
-/// One decode profile's worth of driver answers.
 #[derive(Debug, Clone)]
 pub struct ProfileProbe {
-    /// The profile as a human would name it ("H.265 Main 4:2:0 8-bit").
     pub profile: &'static str,
-    /// The picture format this profile decodes to — the entry the probe looks for.
+    /// Picture format derivation will look for.
     pub wanted: vk::Format,
     /// One row per [`USAGE_MATRIX`] entry, in that order.
     pub usages: Vec<UsageProbe>,
 }
 
-/// The driver's answer for ONE (profile, usage) question.
 #[derive(Debug, Clone)]
 pub struct UsageProbe {
     pub label: &'static str,
     pub usage: vk::ImageUsageFlags,
-    /// `vkGetPhysicalDeviceVideoFormatPropertiesKHR`: every entry it returned, or the
-    /// `VkResult` it failed with. An EMPTY vector is itself an answer — the two
-    /// "no formats for this combination" results
-    /// (`ERROR_FORMAT_NOT_SUPPORTED`/`ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR`) are mapped
-    /// to it by the shared query, exactly as derivation sees them.
+    /// Video-format query: entries, or the `VkResult`. Empty `Ok` is the spec
+    /// refusal (`ERROR_FORMAT_NOT_SUPPORTED` / `ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR`).
     pub formats: Result<Vec<VideoFormat>, vk::Result>,
-    /// `vkGetPhysicalDeviceImageFormatProperties2` for the SAME profile list, format
-    /// and usage. `Ok(())` means that call says an image of the shape is creatable —
-    /// which, as the module docs record, is a WEAKER claim than it looks: measured on
-    /// both vendors, this entry point does not fully honour the chained video profile
-    /// list, so it must not be read as permission to create a video image.
+    /// Same profile list via `vkGetPhysicalDeviceImageFormatProperties2`.
+    /// `Ok` is not permission to create a video image: this entry point does
+    /// not fully honour the chained profile list.
     pub image_format_support: Result<(), vk::Result>,
 }
 
 impl UsageProbe {
-    /// The entry for the profile's picture format, if the driver returned one.
     pub fn wanted_entry(&self, wanted: vk::Format) -> Option<VideoFormat> {
         self.formats
             .as_ref()
@@ -135,21 +81,11 @@ impl UsageProbe {
     }
 }
 
-/// The profiles worth probing: one per codec rung the client can negotiate, plus the
-/// 10-bit legs, because an HDR stream picks a DIFFERENT Vulkan profile from an SDR one
-/// and a device may well host one and not the other.
-///
-/// Deliberately NOT every profile the driver supports — this answers "can punktfunk
-/// decode here", and a list padded with profiles no rung ever requests makes the row
-/// that matters harder to find. `vulkaninfo --show-video-props` is the tool for the
-/// exhaustive sweep.
+/// Negotiable rungs only, including 10-bit (a different Vulkan profile from 8-bit).
+/// Exhaustive sweep is `vulkaninfo --show-video-props`.
 fn probed_profiles() -> Vec<(&'static str, DecodeProfile, vk::Format)> {
-    // Every key is built through the SAME constructor the decoders negotiate with
-    // (`from_negotiated`), so a profile the client could never request cannot appear
-    // here — and a combination those constructors refuse simply drops out of the list
-    // instead of being hand-rolled into existence for the probe's benefit.
-    // 4:2:0 is chroma_format_idc 1 in both codecs' vocabulary; H.265 states depth as
-    // `bit_depth_luma_minus8`, AV1 in whole bits.
+    // Same `from_negotiated` as the decoders; a refused combination drops out.
+    // 4:2:0 is chroma_format_idc 1; H.265 depth is `bit_depth_luma_minus8`, AV1 whole bits.
     let mut out: Vec<(&'static str, DecodeProfile, vk::Format)> = vec![(
         "H.264 High 4:2:0 8-bit",
         DecodeProfile::H264(hh::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH),
@@ -161,8 +97,7 @@ fn probed_profiles() -> Vec<(&'static str, DecodeProfile, vk::Format)> {
     if let Ok(key) = H265ProfileKey::from_negotiated(1, 2) {
         out.push(("H.265 Main 10 4:2:0 10-bit", DecodeProfile::H265(key), P010));
     }
-    // AV1 without film grain: `filmGrainSupport` is part of the Vulkan PROFILE, and
-    // grain-less is what a punktfunk host encodes.
+    // `filmGrainSupport` is part of the Vulkan profile; hosts encode grain-less.
     if let Ok(key) = Av1ProfileKey::from_negotiated(1, 8, false) {
         out.push(("AV1 Main 4:2:0 8-bit", DecodeProfile::Av1(key), NV12));
     }
@@ -172,11 +107,8 @@ fn probed_profiles() -> Vec<(&'static str, DecodeProfile, vk::Format)> {
     out
 }
 
-/// Ask one physical device every question in the matrix, for every probed profile.
-///
-/// Never fails as a whole: a driver that refuses a profile outright is a ROW in the
-/// output, not an error return — the point is to come back with the full picture even
-/// when most of it is refusals.
+/// One physical device, every matrix question, every probed profile.
+/// A refusal is a row, not an error return.
 ///
 /// # Safety
 ///
@@ -232,15 +164,8 @@ pub unsafe fn probe_video_formats(
         .collect()
 }
 
-/// The second opinion: can an image of (`format`, `usage`) exist for this video profile,
-/// according to `vkGetPhysicalDeviceImageFormatProperties2`?
-///
-/// This is the same question `vkCreateImage` will be validated against
-/// (VUID-VkImageCreateInfo-pNext-06811 routes through the video format properties, but
-/// the general image-format query is what reports whether the combination is creatable
-/// at all), asked through a DIFFERENT entry point. Where it disagrees with the video
-/// format properties, one of the two driver paths is wrong — and knowing which is the
-/// difference between a bug report to Intel and a fix in this repository.
+/// Image-format query for (`format`, `usage`) plus the profile list.
+/// Distinct entry point from the video-format query; not authority (module docs).
 ///
 /// # Safety
 ///
@@ -271,15 +196,9 @@ unsafe fn image_format_supported(
     }
 }
 
-/// `usage` as `NAME|NAME (0xHEX)`, with any bit this build cannot name kept VISIBLE.
-///
-/// The raw value is always printed beside the words for the same reason the codec-op
-/// line prints its mask: a reader must be able to check the names against the number,
-/// and a bit the tool has no word for must not silently vanish from a mask it reports.
+/// `NAME|NAME (0xHEX)`. Unnamed bits stay in the string; they must not vanish.
 pub fn describe_usage(usage: vk::ImageUsageFlags) -> String {
-    // The encode trio is here because NVIDIA advertises it on DECODE pictures (measured:
-    // 0xC000 beside the decode bits), and a mask printed as "unrecognised" invites the
-    // reader to wonder whether the tool is out of date rather than reading the answer.
+    // Encode bits appear on decode pictures; leaving them unnamed looks like a stale tool.
     const BITS: [(vk::ImageUsageFlags, &str); 12] = [
         (vk::ImageUsageFlags::TRANSFER_SRC, "TRANSFER_SRC"),
         (vk::ImageUsageFlags::TRANSFER_DST, "TRANSFER_DST"),
@@ -297,8 +216,7 @@ pub fn describe_usage(usage: vk::ImageUsageFlags) -> String {
     describe_mask(usage.as_raw(), &BITS.map(|(f, n)| (f.as_raw(), n)))
 }
 
-/// `imageCreateFlags` as `NAME|NAME (0xHEX)`, same accounting rule as
-/// [`describe_usage`].
+/// `imageCreateFlags` as `NAME|NAME (0xHEX)`, same rule as [`describe_usage`].
 pub fn describe_create_flags(flags: vk::ImageCreateFlags) -> String {
     const BITS: [(vk::ImageCreateFlags, &str); 5] = [
         (vk::ImageCreateFlags::MUTABLE_FORMAT, "MUTABLE_FORMAT"),
@@ -310,8 +228,7 @@ pub fn describe_create_flags(flags: vk::ImageCreateFlags) -> String {
     describe_mask(flags.as_raw(), &BITS.map(|(f, n)| (f.as_raw(), n)))
 }
 
-/// The shared naming rule: named bits joined by `|`, then the raw value, then any
-/// leftover bits called out as unrecognised rather than dropped.
+/// Named bits `|`-joined, then the raw value; leftover bits stay as `unrecognised`.
 fn describe_mask(raw: u32, bits: &[(u32, &str)]) -> String {
     if raw == 0 {
         return "(none) (0x0)".to_string();
@@ -335,8 +252,6 @@ fn describe_mask(raw: u32, bits: &[(u32, &str)]) -> String {
 mod tests {
     use super::*;
 
-    /// The matrix must contain the three combinations the pools REALLY create with —
-    /// a probe that answers about usages nobody creates explains nothing.
     #[test]
     fn the_matrix_covers_every_usage_the_pools_create_with() {
         for real in [COINCIDE_USAGE, DPB_USAGE, OUTPUT_USAGE] {
@@ -345,16 +260,12 @@ mod tests {
                 "{real:?} is created by the image pools but never probed"
             );
         }
-        // And the two discriminators that localise a refusal.
         assert!(USAGE_MATRIX.iter().any(|(_, u)| *u == DECODE_ONLY_USAGE));
         assert!(USAGE_MATRIX
             .iter()
             .any(|(_, u)| *u == vk::ImageUsageFlags::SAMPLED));
     }
 
-    /// Every profile the client can negotiate gets a row, each with the picture format
-    /// its caps derivation will look for — a probe that reported a 10-bit profile
-    /// against NV12 would "find" nothing and read as a device gap.
     #[test]
     fn every_probed_profile_names_the_format_derivation_wants() {
         let profiles = probed_profiles();
@@ -372,10 +283,6 @@ mod tests {
         assert!(profiles.iter().any(|(_, _, w)| *w == P010), "no 10-bit leg");
     }
 
-    /// The mask printers must never drop a bit: names AND the raw value AND anything
-    /// unnamed. This is the accounting rule the codec-op line already follows, and the
-    /// reason it exists is that a silently-dropped bit reads as a capability the device
-    /// does not have (or worse, hides one it does).
     #[test]
     fn mask_descriptions_account_for_every_bit_they_print() {
         assert_eq!(
@@ -383,7 +290,6 @@ mod tests {
             "SAMPLED|DECODE_DST|DECODE_DPB (0x1404)"
         );
         assert_eq!(describe_usage(vk::ImageUsageFlags::empty()), "(none) (0x0)");
-        // The Intel Arc envelope, verbatim — the string a field report will contain.
         let intel = vk::ImageUsageFlags::TRANSFER_SRC
             | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
             | vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR;
@@ -391,7 +297,6 @@ mod tests {
             describe_usage(intel),
             "TRANSFER_SRC|DECODE_DST|DECODE_DPB (0x1401)"
         );
-        // A bit with no name still shows up.
         let unknown = vk::ImageUsageFlags::from_raw(0x8000_0000);
         assert_eq!(
             describe_usage(unknown),
@@ -409,8 +314,6 @@ mod tests {
         );
     }
 
-    /// `wanted_entry` picks by FORMAT, so a driver that returns several entries cannot
-    /// hide the one derivation will act on behind a different format.
     #[test]
     fn the_wanted_entry_is_found_by_format_among_others() {
         let probe = UsageProbe {
@@ -432,7 +335,7 @@ mod tests {
         };
         assert_eq!(probe.wanted_entry(NV12).unwrap().image_usage, DPB_USAGE);
         assert!(probe.wanted_entry(crate::caps::YUV444_8).is_none());
-        // A failed query has no entry at all — distinct from "returned nothing".
+        // Failed query: no entry. Distinct from "returned nothing".
         let failed = UsageProbe {
             formats: Err(vk::Result::ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR),
             ..probe

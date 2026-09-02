@@ -1,44 +1,22 @@
-//! The stable `extern "C"` surface. `cbindgen` turns this module into
-//! `include/punktfunk_core.h` (see `build.rs`).
+//! Stable `extern "C"` surface. `cbindgen` emits `include/punktfunk_core.h`
+//! (`build.rs`). Pin with [`punktfunk_abi_version`] and `struct_size`.
 //!
-//! ## Principles (plan §5)
-//! - Opaque handles only: C sees `PunktfunkSession*`, never a Rust type's fields.
-//! - All cross-boundary structs are `#[repr(C)]`; buffers are pointer + length.
-//! - Explicit ownership: every handle from `*_new` / `*_pair` must be passed to
-//!   [`punktfunk_session_free`]. A [`PunktfunkFrame`]'s `data` is borrowed until the next
-//!   `poll`/`free` on that session — copy it out before then.
-//! - Versioned: [`punktfunk_abi_version`] + `PunktfunkConfig::struct_size` for forward-compat.
-//! - Panics never cross the boundary. Status-returning entry points use [`guard`], which reports a
-//!   panic as `PunktfunkStatus::Panic`; the teardown/mutator ones that return nothing use
-//!   [`guard_void`], which swallows and logs. The remaining bare ones are bare ON PURPOSE and only
-//!   because they cannot panic: [`punktfunk_abi_version`] returns a constant, and the
-//!   `punktfunk_connect*` shims forward every argument unchanged into a guarded implementation.
+//! Opaque handles only. Cross-boundary structs are `#[repr(C)]`; buffers are
+//! pointer + length. Every handle from `*_new` / `*_pair` must reach
+//! [`punktfunk_session_free`]. A [`PunktfunkFrame`]'s `data` is borrowed until
+//! the next `poll`/`free` on that session — copy it out.
+//!
+//! Callers own every pointer. Handles stay valid until `*_free` (`as_mut` /
+//! `as_ref` turn null into `None`). Out-params are writable slots; C strings
+//! are NUL-terminated or null (`opt_cstr`). Nothing is retained past the call.
+//!
+//! Panics never cross: [`guard`] maps them to `PunktfunkStatus::Panic`;
+//! [`guard_void`] swallows teardown panics. Bare entry points cannot panic.
+//! Evidence: `include/punktfunk_core.h`.
 
-// The crate denies `unsafe_code` (lib.rs): the network plane is safe Rust by compiler-enforced
-// invariant. This module is one of the two documented carve-outs — an `extern "C"` surface for
-// the platform clients cannot exist without unsafe, and every site below carries its proof.
+// Crate-denied `unsafe_code` (lib.rs). This `extern "C"` surface is a carve-out;
+// every `unsafe` site has a proof.
 #![allow(unsafe_code)]
-
-// THE ABI CONTRACT, stated once - most `// SAFETY:` proofs below are an instance of it.
-//
-// Every pointer crossing this boundary is C memory the CALLER owns, and the header
-// (`include/punktfunk_core.h`) is where that contract is published. Three shapes recur:
-//
-//  * HANDLES (`PunktfunkSession*`, `PunktfunkConnection*`, ...) come from a `*_new`/`*_pair` and
-//    stay valid until the matching `*_free`. They are only ever reached through `as_mut()`/
-//    `as_ref()`, which turn null into `None` - so a null handle is a `NullPointer` status, never a
-//    dereference. Using one after `*_free` is the caller's error and the one thing this layer
-//    cannot defend against.
-//  * OUT-PARAMS are caller-owned writable slots of the matching `#[repr(C)]` type. Where the header
-//    documents one as optional it is null-checked here before it is written; where it does not, a
-//    null is rejected by the entry point's own guard before any store.
-//  * C STRINGS are NUL-terminated or null, and are read through `opt_cstr`, which handles both and
-//    borrows for the call only.
-//
-// Two properties hold everywhere and are not repeated per site: no pointer is retained past the
-// call that received it (a `PunktfunkFrame`'s `data` is borrowed until the next `poll`/`free` on
-// that session, as the module header says), and every entry point runs inside `guard`'s
-// `catch_unwind`, so a panic becomes a status code rather than unwinding into C.
 
 use crate::config::{Config, FecConfig, FecScheme, ProtocolPhase, Role};
 use crate::crypto::SessionKey;
@@ -53,28 +31,22 @@ use std::os::raw::c_char;
 use std::panic::AssertUnwindSafe;
 use std::ptr;
 
-/// Poison-recovering lock for the C ABI surface. `.lock().unwrap()` inside an `extern "C"` fn
-/// turns a poisoned mutex (some other thread panicked mid-write) into a panic across the C
-/// boundary — an abort since Rust 1.81, exactly the class the panic-in-extern grep gate exists
-/// for. The slots behind these mutexes are plain last-value caches (frame/audio/cursor/clip), so
-/// whatever a poisoned writer left behind is still structurally valid data to overwrite or hand
-/// out; recovering the guard is strictly better than aborting the embedding application.
-/// (Ungated since v25: [`punktfunk_set_log_callback`]'s sink slot uses it on every build.)
+/// Recover a poisoned mutex. Slots are last-value caches; a poisoned writer
+/// still left structurally valid data.
 fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Opaque session handle. Pointer-only from C.
+/// Opaque session handle. C sees only the pointer.
 pub struct PunktfunkSession {
     inner: Session,
-    /// Keeps the most recently polled frame alive so [`PunktfunkFrame::data`] stays valid
-    /// until the next poll or free.
+    /// Last polled frame. [`PunktfunkFrame::data`] is valid until the next poll/free.
     last_frame: Option<crate::session::Frame>,
     input_cb: Option<(PunktfunkInputCb, *mut c_void)>,
 }
 
-/// Forward-compatible session configuration. The caller MUST set `struct_size` to
-/// `sizeof(PunktfunkConfig)`; the core uses it to detect ABI skew.
+/// Session configuration. Set `struct_size` to `sizeof(PunktfunkConfig)`; a
+/// smaller prefix is rejected rather than over-read.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PunktfunkConfig {
@@ -94,7 +66,7 @@ pub struct PunktfunkConfig {
     pub salt: [u8; 4],
     /// Test hook for the loopback transport; 0 in production.
     pub loopback_drop_period: u32,
-    /// Largest encoded access unit the receiver will accept (bounds reassembler memory).
+    /// Largest encoded access unit the receiver accepts (reassembler memory bound).
     pub max_frame_bytes: u64,
 }
 
@@ -110,8 +82,7 @@ impl PunktfunkConfig {
             2 => ProtocolPhase::P2Punktfunk,
             _ => return Err(PunktfunkStatus::InvalidArg),
         };
-        // Range-check before narrowing: a `300` fec_percent or `65600` block size must be
-        // rejected, not silently truncated to a valid-looking value.
+        // Reject before narrowing: 300% or a 65600-shard block must not wrap to a valid u8/u16.
         let scheme = u8::try_from(self.fec_scheme)
             .ok()
             .and_then(FecScheme::from_u8)
@@ -120,9 +91,7 @@ impl PunktfunkConfig {
             u8::try_from(self.fec_percent).map_err(|_| PunktfunkStatus::InvalidArg)?;
         let max_data_per_block =
             u16::try_from(self.max_data_per_block).map_err(|_| PunktfunkStatus::InvalidArg)?;
-        // The one narrowing here that differs by target width: on 32-bit (armeabi-v7a) an
-        // `as usize` silently truncates a >4 GiB value to a plausible-looking residue that
-        // passes validate() — reject it instead, like every narrowing above.
+        // 32-bit: `as usize` truncates >4 GiB to a residue that still passes `validate()`.
         let max_frame_bytes =
             usize::try_from(self.max_frame_bytes).map_err(|_| PunktfunkStatus::InvalidArg)?;
         let cfg = Config {
@@ -136,9 +105,7 @@ impl PunktfunkConfig {
             shard_payload: self.shard_payload as usize,
             max_frame_bytes,
             encrypt: self.encrypt != 0,
-            // The C ABI keeps its fixed 16-byte key and always selects AES-128-GCM — no
-            // ABI_VERSION bump. Raw-`Config` C embedders can't negotiate ChaCha; the Swift/
-            // Kotlin clients are aarch64 with AES CE and never want it.
+            // 16-byte key is AES-128-GCM. A different cipher needs an ABI bump.
             key: SessionKey::Aes128Gcm(self.key),
             salt: self.salt,
             loopback_drop_period: self.loopback_drop_period,
@@ -148,31 +115,25 @@ impl PunktfunkConfig {
     }
 }
 
-/// Read a `PunktfunkConfig` from a caller pointer, enforcing the `struct_size` ABI-skew
-/// guard *before* reading the whole struct: a caller compiled against a smaller (older)
-/// layout is rejected rather than causing an out-of-bounds read.
+/// Read `struct_size` first so a smaller older layout is rejected, not over-read.
 ///
 /// # Safety
-/// `cfg` must either be null or point to at least its own declared `struct_size` bytes.
+/// `cfg` is null or points to at least its declared `struct_size` bytes.
 unsafe fn config_from_ptr(cfg: *const PunktfunkConfig) -> Result<Config, PunktfunkStatus> {
     if cfg.is_null() {
         return Err(PunktfunkStatus::NullPointer);
     }
-    // Read only the 4-byte size prefix first to bound the subsequent full read.
-    // SAFETY: `addr_of!` forms a raw pointer WITHOUT creating a reference, which is the point: the
-    // caller's struct may be an older, smaller version, so the field is read by offset rather than
-    // through a `&`.
+    // SAFETY: `addr_of!` does not form a `&`; the caller may have a smaller older layout.
     let declared = unsafe { std::ptr::addr_of!((*cfg).struct_size).read_unaligned() } as usize;
     if declared < std::mem::size_of::<PunktfunkConfig>() {
         return Err(PunktfunkStatus::InvalidArg);
     }
-    // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied and
-    // are null-checked or handle-validated on this path before they are read.
+    // SAFETY: `cfg` is non-null and `struct_size` covers this type.
     unsafe { *cfg }.to_config()
 }
 
-/// A reassembled access unit. `data`/`len` borrow session-owned memory valid until the
-/// next `punktfunk_client_poll_frame`/`punktfunk_session_free` on the same session.
+/// Reassembled access unit. `data`/`len` borrow session memory until the next
+/// `punktfunk_client_poll_frame` / `punktfunk_session_free` on this session.
 #[repr(C)]
 pub struct PunktfunkFrame {
     pub data: *const u8,
@@ -180,15 +141,12 @@ pub struct PunktfunkFrame {
     pub frame_index: u32,
     pub pts_ns: u64,
     pub flags: u32,
-    /// Wall-clock reassembly-completion instant (ns since the Unix epoch, CLOCK_REALTIME — the
-    /// clock `pts_ns` and the skew handshake use). THIS is the receipt stamp for latency math:
-    /// a stamp the embedder takes itself at the poll return additionally contains the
-    /// pre-decode hand-off queue wait, so a client-side standing backlog would masquerade as
-    /// network latency (ABI v9 — the 2026-07 two-pair standing-latency investigation).
+    /// Reassembly-complete instant, ns since Unix epoch (`CLOCK_REALTIME`, same
+    /// clock as `pts_ns`). A stamp at poll return includes pre-decode queue wait.
     pub received_ns: u64,
 }
 
-/// Snapshot of session counters.
+/// Session counters.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct PunktfunkStats {
@@ -198,8 +156,7 @@ pub struct PunktfunkStats {
     pub packets_sent: u64,
     pub packets_received: u64,
     pub packets_dropped: u64,
-    /// Packets dropped on the host send path because the kernel buffer was full (WouldBlock) — the
-    /// dominant loss mode at very high bitrate; distinct from `packets_dropped` (recv-side).
+    /// Host send-path drops (`WouldBlock`). Distinct from recv-side `packets_dropped`.
     pub packets_send_dropped: u64,
     pub fec_recovered_shards: u64,
     pub bytes_sent: u64,
@@ -223,7 +180,7 @@ impl From<Stats> for PunktfunkStats {
     }
 }
 
-/// Host-side callback invoked for each input event drained by `punktfunk_host_poll_input`.
+/// Host-side callback for each input event drained by `punktfunk_host_poll_input`.
 pub type PunktfunkInputCb = extern "C" fn(event: *const InputEvent, user: *mut c_void);
 
 #[inline]
@@ -236,11 +193,8 @@ fn ffi_slice_bytes<T>(len: usize) -> Option<usize> {
         .filter(|&bytes| bytes <= isize::MAX as usize)
 }
 
-/// `guard` for the entry points that return nothing — the teardown/mutator calls, which have no
-/// status to report a panic through. They still must not let one unwind into C: since Rust 1.81
-/// that is a hard abort rather than undefined behaviour, but aborting the CALLER'S process because
-/// one of our `Drop` impls hit a poisoned mutex is not an acceptable failure mode for a library.
-/// Swallowing is right here — the object is being torn down either way.
+/// [`guard`] for teardown with no status: swallow the panic. Unwinding into C
+/// aborts the embedder; the object is being dropped either way.
 fn guard_void<F: FnOnce()>(f: F) {
     if std::panic::catch_unwind(AssertUnwindSafe(f)).is_err() {
         tracing::error!("panic escaped a punktfunk_* teardown entry point; swallowed at the C ABI");
@@ -255,19 +209,15 @@ fn new_handle(session: Session) -> *mut PunktfunkSession {
     }))
 }
 
-/// Current ABI version. Mismatch with [`crate::ABI_VERSION`] means incompatible core.
+/// Current ABI version. Mismatch with [`crate::ABI_VERSION`] is an incompatible core.
 #[unsafe(no_mangle)]
 pub extern "C" fn punktfunk_abi_version() -> u32 {
     crate::ABI_VERSION
 }
 
-/// A log line from the core (ABI v25, [`punktfunk_set_log_callback`]). `level` is 1 = error,
-/// 2 = warn, 3 = info, 4 = debug, 5 = trace. `target` is the Rust module path the line came from
-/// (`punktfunk_core::transport::udp`, `quinn::connection`, …) and `message` the formatted text;
-/// both are NUL-terminated UTF-8, borrowed for the duration of the call only — copy them out.
-/// Called from whichever thread logged, so the callback must be thread-safe, must not block for
-/// long (it sits on the transport and pump threads), and must not call back into the core's
-/// logging (it would be re-entered).
+/// Log sink for [`punktfunk_set_log_callback`]. `level` 1..=5 (error…trace).
+/// `target` and `message` are NUL-terminated UTF-8, borrowed for this call —
+/// copy them out. Any thread may call; thread-safe, non-blocking, no re-entry.
 pub type PunktfunkLogCb = Option<
     unsafe extern "C" fn(
         level: u8,
@@ -282,40 +232,35 @@ struct LogSink {
     cb: unsafe extern "C" fn(u8, *const c_char, *const c_char, *mut c_void),
     user: *mut c_void,
 }
-// SAFETY: the user pointer is an opaque token handed back to the caller's own callback, which the
-// contract above requires to be thread-safe; the core never dereferences it.
+// SAFETY: `user` is an opaque token handed back to the caller's thread-safe callback; never deref'd.
 unsafe impl Send for LogSink {}
 
 static LOG_SINK: std::sync::Mutex<Option<LogSink>> = std::sync::Mutex::new(None);
 static LOG_INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// The `log` backend behind [`punktfunk_set_log_callback`]: every record the core (and its
-/// dependencies that log through `log`, plus its own `tracing` events via tracing's `log` bridge)
-/// emits is handed to the registered sink. Installed once; the sink slot is swappable after.
+/// `log` backend for [`punktfunk_set_log_callback`]. Installed once; the sink slot swaps.
 struct CallbackLogger;
 
 impl log::Log for CallbackLogger {
     fn enabled(&self, _: &log::Metadata) -> bool {
-        // Level gating is `log::set_max_level`, applied by `punktfunk_set_log_callback`.
+        // Level gating is `log::set_max_level` in `punktfunk_set_log_callback`.
         true
     }
 
     fn log(&self, record: &log::Record) {
-        // Copy the sink OUT of the lock before calling it: a callback that logs (it shouldn't, but
-        // an embedder's mistake must be a duplicate line, not a deadlock) re-enters `log` cleanly.
+        // Drop the lock before the callback: a re-entrant log must duplicate, not deadlock.
         let Some(sink) = *lock_recover(&LOG_SINK) else {
             return;
         };
         let cstr = |s: String| {
-            // An interior NUL can't cross as a C string; drop the byte rather than the line.
+            // Interior NUL cannot be a C string; drop that byte, keep the line.
             let mut bytes = s.into_bytes();
             bytes.retain(|&b| b != 0);
             std::ffi::CString::new(bytes).unwrap_or_default()
         };
         let target = cstr(record.target().to_string());
         let message = cstr(record.args().to_string());
-        // SAFETY: the sink was registered through the ABI with exactly this signature; both
-        // strings outlive the call (they are locals dropped after it) and are NUL-terminated.
+        // SAFETY: sink matches this signature; both strings are locals and live for this call.
         unsafe {
             (sink.cb)(
                 record.level() as u8,
@@ -329,25 +274,12 @@ impl log::Log for CallbackLogger {
     fn flush(&self) {}
 }
 
-/// Receive the core's log lines (ABI v25). The core logs through `tracing`; on the desktop and
-/// Android shells a subscriber/logger installed by the shell picks those up, but an embedder that
-/// installs none (Swift, any C host) saw NOTHING — every transport warning (socket-buffer clamp,
-/// QoS refusal), every quinn connection event and every rustls handshake note vanished, and a
-/// client log bundle carried the shell's half of the story only. This routes them to `cb`.
-///
-/// `max_level` is the most verbose level delivered (1 = error … 5 = trace; 0 = nothing) —
-/// `log::set_max_level`, so anything above it costs no formatting. 3 (info) is the right default
-/// for a field log ring; quinn's debug/trace is per-packet and would churn any bounded ring.
-/// `cb == NULL` detaches the sink (lines are dropped again). `user` is handed back on every call.
-///
-/// Returns `Ok`, or `Unsupported` when another `log` backend is already installed in this
-/// process (e.g. the Android shell's `android_logger`) — the core cannot replace it, and that
-/// backend already receives everything this one would. Idempotent: call again to change the
-/// level or the sink.
+/// Route core `log`/`tracing` lines to `cb`. `max_level` 1..=5 (error…trace), 0 = off.
+/// 3 (info) is the usual default; debug/trace is per-packet. `cb == NULL` detaches.
+/// `Unsupported` if another `log` backend is already installed. Idempotent.
 ///
 /// # Safety
-/// `cb`, if non-null, must remain a valid function for as long as it is installed (until the next
-/// call with NULL), and `user` must stay valid for every call the core may make meanwhile.
+/// Non-null `cb` stays valid until the next NULL call; `user` stays valid for every callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_set_log_callback(
     max_level: u8,
@@ -372,19 +304,14 @@ pub unsafe extern "C" fn punktfunk_set_log_callback(
     })
 }
 
-/// Send a Wake-on-LAN magic packet to wake sleeping host NIC(s).
-///
-/// `macs` points to `mac_count` contiguous 6-byte MAC addresses (`mac_count * 6` bytes total) —
-/// a host may report several NICs; all are woken. `last_known_ip`, if non-NULL, is an IPv4
-/// dotted-quad string additionally targeted by unicast (pass NULL to skip). The packet is
-/// broadcast to every local interface's subnet-directed broadcast and to `255.255.255.255` on
-/// ports 9 and 7. This does NOT require an open connection and is not part of the QUIC surface.
-///
-/// Returns `Ok` if at least one datagram was sent. Call off the UI thread.
+/// Wake-on-LAN magic packet. `macs` is `mac_count` contiguous 6-byte MACs.
+/// `last_known_ip` is an optional IPv4 dotted-quad unicast target. Broadcasts
+/// subnet-directed and `255.255.255.255` on ports 9 and 7. No session needed.
+/// `Ok` if at least one datagram was sent. Call off the UI thread.
 ///
 /// # Safety
-/// For a representable nonzero count, `macs` must point to `mac_count * 6` readable bytes.
-/// `last_known_ip`, if non-NULL, must be a NUL-terminated string.
+/// Nonzero representable `mac_count`: `macs` is `mac_count * 6` readable bytes.
+/// `last_known_ip`, if non-NULL, is a NUL-terminated string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_wake_on_lan(
     macs: *const u8,
@@ -401,8 +328,7 @@ pub unsafe extern "C" fn punktfunk_wake_on_lan(
         if byte_len == 0 {
             return PunktfunkStatus::InvalidArg;
         }
-        // SAFETY: the ABI contract supplies `mac_count` MACs; `ffi_slice_bytes` proved their byte
-        // extent is representable by a Rust slice, which is borrowed only for this call.
+        // SAFETY: `ffi_slice_bytes` proved `mac_count` MACs fit a Rust slice; borrowed for this call.
         let bytes = unsafe { std::slice::from_raw_parts(macs, byte_len) };
         let mac_vec: Vec<crate::wol::Mac> = bytes
             .chunks_exact(6)
@@ -415,8 +341,7 @@ pub unsafe extern "C" fn punktfunk_wake_on_lan(
         let ip = if last_known_ip.is_null() {
             None
         } else {
-            // SAFETY: per the ABI contract - a caller-supplied C string, NUL-terminated or null,
-            // borrowed only for this call.
+            // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
             match unsafe { CStr::from_ptr(last_known_ip) }
                 .to_str()
                 .ok()
@@ -433,11 +358,10 @@ pub unsafe extern "C" fn punktfunk_wake_on_lan(
     })
 }
 
-/// Create a session over a real UDP transport (`local`/`peer` are `host:port` strings).
-/// Returns NULL on error.
+/// Create a session over UDP (`local`/`peer` are `host:port` strings). NULL on error.
 ///
 /// # Safety
-/// `cfg`, `local`, `peer` must be valid pointers; the strings must be NUL-terminated.
+/// `cfg`, `local`, `peer` are valid pointers; the strings are NUL-terminated.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_session_new(
     cfg: *const PunktfunkConfig,
@@ -448,20 +372,17 @@ pub unsafe extern "C" fn punktfunk_session_new(
         if cfg.is_null() || local.is_null() || peer.is_null() {
             return ptr::null_mut();
         }
-        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
-        // and are null-checked or handle-validated on this path before they are read.
+        // SAFETY: pointers are caller-supplied and null-checked on this path.
         let config = match unsafe { config_from_ptr(cfg) } {
             Ok(c) => c,
             Err(_) => return ptr::null_mut(),
         };
-        // SAFETY: per the ABI contract - a caller-supplied C string, NUL-terminated or null,
-        // borrowed only for this call.
+        // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
         let local = match unsafe { CStr::from_ptr(local) }.to_str() {
             Ok(s) => s,
             Err(_) => return ptr::null_mut(),
         };
-        // SAFETY: per the ABI contract - a caller-supplied C string, NUL-terminated or null,
-        // borrowed only for this call.
+        // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
         let peer = match unsafe { CStr::from_ptr(peer) }.to_str() {
             Ok(s) => s,
             Err(_) => return ptr::null_mut(),
@@ -478,11 +399,11 @@ pub unsafe extern "C" fn punktfunk_session_new(
     result.unwrap_or(ptr::null_mut())
 }
 
-/// Create a connected host+client session pair sharing an in-process loopback
-/// transport. Test/dev only — exercises the full FEC + framing path without a network.
+/// Connected host+client pair on in-process loopback. Test/dev only: full FEC
+/// + framing without a network.
 ///
 /// # Safety
-/// All four pointers must be valid; the two out-params receive owned handles.
+/// All four pointers are valid; the two out-params receive owned handles.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_test_loopback_pair(
     host_cfg: *const PunktfunkConfig,
@@ -495,14 +416,12 @@ pub unsafe extern "C" fn punktfunk_test_loopback_pair(
         {
             return PunktfunkStatus::NullPointer;
         }
-        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
-        // and are null-checked or handle-validated on this path before they are read.
+        // SAFETY: pointers are caller-supplied and null-checked on this path.
         let hconf = match unsafe { config_from_ptr(host_cfg) } {
             Ok(c) => c,
             Err(s) => return s,
         };
-        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
-        // and are null-checked or handle-validated on this path before they are read.
+        // SAFETY: pointers are caller-supplied and null-checked on this path.
         let cconf = match unsafe { config_from_ptr(client_cfg) } {
             Ok(c) => c,
             Err(s) => return s,
@@ -516,8 +435,7 @@ pub unsafe extern "C" fn punktfunk_test_loopback_pair(
             Ok(s) => s,
             Err(e) => return e.status(),
         };
-        // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the matching
-        // `#[repr(C)]` type, written once by value.
+        // SAFETY: `out` is a caller-owned `#[repr(C)]` slot, written once by value.
         unsafe {
             *out_host = new_handle(hs);
             *out_client = new_handle(cs);
@@ -526,26 +444,25 @@ pub unsafe extern "C" fn punktfunk_test_loopback_pair(
     })
 }
 
-/// Free a session handle. Safe to call with NULL.
+/// Free a session handle. NULL is a no-op.
 ///
 /// # Safety
-/// `s` must be a handle from `punktfunk_session_new`/`punktfunk_test_loopback_pair`, freed once.
+/// `s` is a handle from `punktfunk_session_new` / `punktfunk_test_loopback_pair`, freed once.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_session_free(s: *mut PunktfunkSession) {
     guard_void(|| {
         if !s.is_null() {
-            // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
-            // and are null-checked or handle-validated on this path before they are read.
+            // SAFETY: pointers are caller-supplied and null-checked on this path.
             drop(unsafe { Box::from_raw(s) });
         }
     });
 }
 
-/// Host: FEC-protect, packetize, seal and send one encoded access unit.
+/// Host: FEC-protect, packetize, seal, and send one encoded access unit.
 ///
 /// # Safety
-/// `s` is a valid host handle. For a representable nonzero `len`, `data` points to that many
-/// readable bytes; `data` may be NULL when `len == 0`.
+/// `s` is a valid host handle. For a representable nonzero `len`, `data` points
+/// to that many readable bytes; `data` may be NULL when `len == 0`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_host_submit_frame(
     s: *mut PunktfunkSession,
@@ -555,9 +472,7 @@ pub unsafe extern "C" fn punktfunk_host_submit_frame(
     flags: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let s = match unsafe { s.as_mut() } {
             Some(s) => s,
             None => return PunktfunkStatus::NullPointer,
@@ -571,8 +486,7 @@ pub unsafe extern "C" fn punktfunk_host_submit_frame(
         let slice = if len == 0 {
             &[][..]
         } else {
-            // SAFETY: the ABI contract supplies `len` readable bytes; `ffi_slice_bytes` proved the
-            // extent is representable by a Rust slice, which is borrowed only for this call.
+            // SAFETY: `ffi_slice_bytes` proved `len` bytes fit a Rust slice; borrowed for this call.
             unsafe { std::slice::from_raw_parts(data, len) }
         };
         match s.inner.submit_frame(slice, pts_ns, flags) {
@@ -582,8 +496,8 @@ pub unsafe extern "C" fn punktfunk_host_submit_frame(
     })
 }
 
-/// Client: poll for the next reassembled access unit. Returns [`PunktfunkStatus::NoFrame`]
-/// when nothing is ready yet. On `Ok`, `*out` borrows session memory until the next poll.
+/// Client: poll for the next reassembled access unit. [`PunktfunkStatus::NoFrame`]
+/// when nothing is ready. On `Ok`, `*out` borrows session memory until the next poll.
 ///
 /// # Safety
 /// `s` is a valid client handle; `out` points to a writable `PunktfunkFrame`.
@@ -593,9 +507,7 @@ pub unsafe extern "C" fn punktfunk_client_poll_frame(
     out: *mut PunktfunkFrame,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let s = match unsafe { s.as_mut() } {
             Some(s) => s,
             None => return PunktfunkStatus::NullPointer,
@@ -606,8 +518,7 @@ pub unsafe extern "C" fn punktfunk_client_poll_frame(
         match s.inner.poll_frame() {
             Ok(frame) => {
                 let f = s.last_frame.insert(frame);
-                // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
-                // matching `#[repr(C)]` type, written once by value.
+                // SAFETY: `out` is a caller-owned `#[repr(C)]` slot, written once by value.
                 unsafe {
                     *out = PunktfunkFrame {
                         data: f.data.as_ptr(),
@@ -626,8 +537,7 @@ pub unsafe extern "C" fn punktfunk_client_poll_frame(
 }
 
 /// Client: serialize and send one input event to the host.
-///
-/// Returns `InvalidArg` if `ev->kind` is not a recognized event kind.
+/// `InvalidArg` if `ev->kind` is not a recognized event kind.
 ///
 /// # Safety
 /// `s` is a valid client handle; `ev` points to a readable `InputEvent`-sized allocation.
@@ -637,15 +547,12 @@ pub unsafe extern "C" fn punktfunk_send_input(
     ev: *const InputEvent,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let s = match unsafe { s.as_mut() } {
             Some(s) => s,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: `read_input_event` upholds this file's failures-become-status-codes principle
-        // for the one field where a reference formed too early would be UB instead.
+        // SAFETY: `read_input_event` validates the tag before forming `&InputEvent` (else UB).
         let ev = match unsafe { read_input_event(ev) } {
             Ok(e) => e,
             Err(status) => return status,
@@ -657,48 +564,37 @@ pub unsafe extern "C" fn punktfunk_send_input(
     })
 }
 
-/// Validate caller memory as an [`InputEvent`] WITHOUT forming the reference first.
-///
-/// `InputEvent.kind` is a `#[repr(u8)]` enum with 16 valid discriminants, and a C embedder
-/// writing `ev->kind = 42` is not a decodable error once `&InputEvent` exists — forming the
-/// reference IS the UB, by the language's validity rule. So the tag is read as a raw byte and
-/// validated through the same `InputKind::from_u8` the wire path uses (`input.rs::decode`),
-/// and the typed reference comes into existence only afterwards. Every other field is a plain
-/// integer (or the `[u8; 3]` pad), valid for any bit pattern.
+/// Validate the `kind` tag as a raw byte before forming `&InputEvent`. An
+/// unknown `ev->kind` is UB once the typed reference exists; other fields are integers.
 ///
 /// # Safety
-/// `ev` is null (reported as a status) or readable for `size_of::<InputEvent>()` bytes.
+/// `ev` is null (status) or readable for `size_of::<InputEvent>()` bytes.
 unsafe fn read_input_event<'a>(ev: *const InputEvent) -> Result<&'a InputEvent, PunktfunkStatus> {
     if ev.is_null() {
         return Err(PunktfunkStatus::NullPointer);
     }
-    // SAFETY: non-null per the check above, readable per this fn's contract; a one-byte read
-    // at offset 0 (the `kind` tag — repr(C) puts it first) cannot itself be UB for any value.
+    // SAFETY: non-null, readable; a one-byte read of the leading `kind` tag is valid for any value.
     if crate::input::InputKind::from_u8(unsafe { ev.cast::<u8>().read() }).is_none() {
         return Err(PunktfunkStatus::InvalidArg);
     }
-    // SAFETY: non-null, readable, and the discriminant byte was just validated — every field
-    // of the repr(C) struct now holds a valid bit pattern for its type.
+    // SAFETY: discriminant validated; remaining fields are valid for any bit pattern.
     Ok(unsafe { &*ev })
 }
 
-/// Register the host-side input callback (pass a NULL fn pointer to clear). The callback
-/// fires from within [`punktfunk_host_poll_input`], on the calling thread.
+/// Register the host-side input callback (NULL fn pointer clears). Fires from
+/// [`punktfunk_host_poll_input`] on the calling thread.
 ///
 /// # Safety
 /// `s` is a valid host handle; `user` is passed back verbatim to `cb`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_set_input_callback(
     s: *mut PunktfunkSession,
-    // Written as an explicit `Option<fn>` (not the `PunktfunkInputCb` alias) so cbindgen
-    // emits a nullable C function pointer rather than an opaque wrapper struct.
+    // Explicit `Option<fn>` so cbindgen emits a nullable C function pointer, not a wrapper.
     cb: Option<extern "C" fn(event: *const InputEvent, user: *mut c_void)>,
     user: *mut c_void,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let s = match unsafe { s.as_mut() } {
             Some(s) => s,
             None => return PunktfunkStatus::NullPointer,
@@ -708,7 +604,7 @@ pub unsafe extern "C" fn punktfunk_set_input_callback(
     })
 }
 
-/// Host: drain all pending input events, invoking the registered callback for each.
+/// Host: drain pending input events, invoking the registered callback for each.
 /// Returns the count dispatched (≥ 0), or a negative [`PunktfunkStatus`] on error.
 ///
 /// # Safety
@@ -718,18 +614,10 @@ pub unsafe extern "C" fn punktfunk_host_poll_input(s: *mut PunktfunkSession) -> 
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let mut count = 0i32;
         loop {
-            // Narrow scope: re-derive the handle and pull ONE event, then drop the borrow
-            // before dispatching. The callback may legally re-enter `punktfunk_*` on this
-            // handle (get_stats, send_input, clearing the callback) — with a `&mut` held
-            // across the call that re-entry aliased it (UB under noalias). Re-reading
-            // `input_cb` per iteration also makes a mid-drain
-            // `punktfunk_set_input_callback(s, NULL, NULL)` take effect immediately instead
-            // of firing the cleared callback for the queued remainder. (Freeing the session
-            // from inside the callback remains forbidden, as on every entry point.)
+            // Drop the `&mut` before the callback: it may re-enter this handle (noalias UB).
+            // Re-read `input_cb` each iteration so a mid-drain NULL clear takes effect now.
             let (ev, cb) = {
-                // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the
-                // caller has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and
-                // the `match` here handles.
+                // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
                 let s = match unsafe { s.as_mut() } {
                     Some(s) => s,
                     None => return PunktfunkStatus::NullPointer as i32,
@@ -760,9 +648,7 @@ pub unsafe extern "C" fn punktfunk_get_stats(
     out: *mut PunktfunkStats,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let s = match unsafe { s.as_ref() } {
             Some(s) => s,
             None => return PunktfunkStatus::NullPointer,
@@ -771,75 +657,45 @@ pub unsafe extern "C" fn punktfunk_get_stats(
             return PunktfunkStatus::NullPointer;
         }
         let stats = s.inner.stats();
-        // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path, written
-        // once by value.
+        // SAFETY: `out` is non-null on this path; written once by value.
         unsafe { *out = PunktfunkStats::from(stats) };
         PunktfunkStatus::Ok
     })
 }
 
-// ---------------------------------------------------------------------------------------------
-// punktfunk/1 connection API (`quic` feature) — the embeddable client connector platform clients
-// link (SwiftUI/VideoToolbox, Android, …). In the generated header these are guarded by
-// `PUNKTFUNK_FEATURE_QUIC`; define it when linking a punktfunk-core built with `--features quic`.
-// ---------------------------------------------------------------------------------------------
+// `quic` client connector. Header symbols sit under `PUNKTFUNK_FEATURE_QUIC`.
 
-/// Opaque handle to a live `punktfunk/1` connection (QUIC control plane + UDP data plane, all
-/// pumped on internal threads).
-///
-/// Thread contract: each plane (video `next_au`, audio `next_audio`, rumble `next_rumble`)
-/// may be pulled from its own thread, at most one thread per plane. The accessors only
-/// take shared references internally (per-plane mutexed borrow slots), so cross-plane
-/// concurrency is sound — never two threads on the *same* plane.
+/// Live `punktfunk/1` connection (QUIC control + UDP data, pumped on internal threads).
+/// One puller thread per plane; never two threads on the same plane.
 #[cfg(feature = "quic")]
 pub struct PunktfunkConnection {
     inner: crate::client::NativeClient,
-    /// Backs the pointer returned by the last `punktfunk_connection_next_au` (borrow-until-next-call).
+    /// Last `next_au` payload. Pointer valid until the next video pull.
     last: std::sync::Mutex<Option<crate::session::Frame>>,
-    /// Same, for `punktfunk_connection_next_audio` (independent of the video slot).
+    /// Last `next_audio` payload. Independent of the video slot.
     last_audio: std::sync::Mutex<Option<crate::client::AudioPacket>>,
-    /// Decode-in-core state for `punktfunk_connection_next_audio_pcm` (Apple / any embedder
-    /// without a multistream Opus decoder). The decoder is built lazily from the negotiated
-    /// `inner.audio_channels`; `pcm` is a fixed-capacity reusable buffer the returned pointer
-    /// borrows until the next PCM call (same contract as `last_audio`).
+    /// In-core PCM decode. Returned pointer valid until the next PCM call.
     audio_pcm: std::sync::Mutex<AudioPcmState>,
-    /// Backs the `data`/`len` pointer of the last `punktfunk_connection_next_clipboard` event
-    /// (a fetched payload, an offer's format list, or a fetch-request's MIME) —
-    /// borrow-until-next-call, same contract as `last`.
+    /// Last clipboard payload. Pointer valid until the next `next_clipboard`.
     last_clip: std::sync::Mutex<Option<Vec<u8>>>,
-    /// The last cursor shape handed out — `next_cursor_shape`'s `rgba` pointer borrows it
-    /// until the next cursor-shape call (the `last_audio` contract).
+    /// Last cursor RGBA. Pointer valid until the next cursor-shape call.
     last_cursor_shape: std::sync::Mutex<Option<crate::quic::CursorShape>>,
 }
 
-/// The session's resolved audio format, as the in-core decode path needs it.
-///
-/// Gathered into one value rather than threaded as four more parameters because the two decode
-/// entry points below take it whole, and because the four fields are only meaningful together: a
-/// rate without the codec cannot tell a 48 kHz PCM session from a 48 kHz Opus one.
-///
-/// Read fresh off the connection on every call, which is free and cannot drift: the format is
-/// resolved once at handshake and the host never changes it mid-session (the client's output
-/// device is open at a fixed format, so a change would mean a re-open).
+/// Handshake-resolved audio format. Codec + rate together distinguish 48 kHz
+/// PCM from 48 kHz Opus. Read fresh each call; the host never changes it live.
 #[cfg(feature = "quic")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct AudioFormat {
-    /// [`crate::quic::AUDIO_CODEC_OPUS`] (`0xC9`) or [`crate::quic::AUDIO_CODEC_PCM`] (`0xD3`) —
-    /// what SELECTS the decoder below, and the only field that can.
+    /// `AUDIO_CODEC_OPUS` (`0xC9`) or `AUDIO_CODEC_PCM` (`0xD3`). Selects the decoder.
     codec: u8,
-    /// The resolved sample rate. 48 000 on every Opus session; any rate
-    /// [`crate::audio::pcm::rate_is_supported`] admits on the lossless plane.
+    /// 48 000 on Opus; any [`crate::audio::pcm::rate_is_supported`] rate on PCM.
     rate_hz: u32,
-    /// The resolved sample depth (16 or 24) — the stride `0xD3` payloads are unpacked at.
-    /// Meaningless on the Opus plane, which decodes to f32 regardless.
+    /// 16 or 24. PCM unpack stride. Unused on Opus (decodes to f32).
     bits: u8,
-    /// The resolved channel count, already through [`crate::audio::normalize_channels`].
+    /// After [`crate::audio::normalize_channels`].
     channels: u8,
-    /// One frame in microseconds: the negotiated `audio_frame_us` on the lossless plane, the
-    /// `0xC9` plane's fixed 5 ms otherwise. Carried because the concealment CAP is a duration
-    /// (`crate::audio::MAX_CONCEAL_MS`) and only this turns it into the frame count `ensure_buffer`
-    /// has to leave room for — the two must be computed from the same number or the cap can outrun
-    /// the buffer.
+    /// Frame length in µs. Concealment cap is a duration; this turns it into a frame count.
     frame_us: u32,
 }
 
@@ -848,11 +704,8 @@ impl AudioFormat {
     fn of(c: &crate::client::NativeClient) -> AudioFormat {
         AudioFormat {
             codec: c.audio_codec,
-            // A zero rate is inexpressible off the wire — `Welcome::decode` folds both absence
-            // and a literal 0 to the legacy 48 kHz — but the buffer sizing below divides by
-            // 1000 and uses "buffer is non-empty" as its already-sized latch, so a 0 here would
-            // mean a zero-length buffer that re-sizes (and so reallocates) on every packet.
-            // That is the one invariant on this type that must not depend on a peer's honesty.
+            // Zero rate sizes a 0-length buffer (`!pcm.is_empty()` is the sized latch)
+            // and reallocates every packet. Do not trust a peer 0.
             rate_hz: if c.audio_sample_rate_hz == 0 {
                 crate::audio::SAMPLE_RATE_HZ
             } else {
@@ -860,9 +713,7 @@ impl AudioFormat {
             },
             bits: c.audio_bits,
             channels: crate::audio::normalize_channels(c.audio_channels),
-            // `audio_frame_us` is `0` on an Opus session and from any host older than the
-            // lossless plane, which is not a frame length — fold it to the `0xC9` plane's fixed
-            // 5 ms so the concealment cap below is computed against something real either way.
+            // 0 is not a frame length. Fold to the 5 ms Opus frame.
             frame_us: if c.audio_frame_us == 0 {
                 crate::audio::FRAME_MS * 1000
             } else {
@@ -877,75 +728,38 @@ impl AudioFormat {
     }
 }
 
-/// Lazily-initialized in-core decode state, for either audio plane.
-///
-/// On Opus (`0xC9`) a coupled-1-stream multistream decoder is equivalent to a plain stereo
-/// decoder, so one [`opus::MSDecoder`] handles 2/6/8 channels. On the lossless plane (`0xD3`)
-/// there is no decoder at all — [`crate::audio::pcm::to_f32`] unpacks the samples — and no
-/// libopus PLC either, which is why [`crate::audio::pcm::PcmConceal`] rides alongside.
+/// In-core decode for either audio plane. Opus uses one [`opus::MSDecoder`];
+/// PCM unpacks with [`crate::audio::pcm::to_f32`] and conceals with [`PcmConceal`].
 #[cfg(feature = "quic")]
 #[derive(Default)]
 struct AudioPcmState {
     decoder: Option<opus::MSDecoder>,
-    /// Interleaved f32 PCM, wire channel order. Pre-sized ONCE by `ensure_buffer` for the largest
-    /// frame its plane can present plus a full concealment run, so decode never reallocates
-    /// (which would dangle the pointer handed to the embedder).
+    /// Interleaved f32. Sized once; growth would dangle the pointer handed to the embedder.
     pcm: Vec<f32>,
-    /// Loss detector — the same seq-gap accounting the other clients run in their own decode
-    /// loops (`pf-client-core`'s session pump, Android's native pump), here for the one decoder
-    /// that lives in core. Without it a lost 5 ms packet reaches the embedder's playout ring as
-    /// a hard time-domain gap: a click per loss, sustained crackle on lossy Wi-Fi.
+    /// Seq-gap tracker. Without it a lost packet is a hard click in the playout ring.
     gaps: crate::audio::AudioGapTracker,
-    /// Per-channel sample count of the last real decode — sizes each synthesized concealment
-    /// frame. 0 until the first decode, which skips concealment (nothing to size it from),
-    /// exactly like the other clients.
+    /// Last real decode's per-channel samples. 0 skips concealment (nothing to size from).
     frame_samples: usize,
-    /// Frames synthesized for a packet DROUGHT since the last real packet
-    /// ([`punktfunk_connection_audio_plc`]), subtracted from the loss concealment the next packet
-    /// asks for: a packet genuinely lost inside a drought this already covered must not be covered
-    /// twice, which would insert audio the stream never carried and push everything after it
-    /// later. The subtraction has to happen HERE — the gap tracker is on this side of the ABI, so
-    /// the embedder driving the drought cannot see what it is about to be charged for.
+    /// PLC frames already given during a drought. Subtract so a later gap is not covered twice.
     drought_frames: u32,
-    /// Concealment for the lossless plane, where libopus PLC does not exist and cannot: there is
-    /// nothing in a raw frame from which to synthesize its successor (`design/hi-res-audio.md`
-    /// §4.5). Unused on an Opus session, which keeps using the decoder's own PLC.
+    /// PCM-plane concealer. Unused on Opus (libopus PLC).
     conceal_pcm: crate::audio::pcm::PcmConceal,
-    /// Staging for one `0xD3` frame — decoded into here, then COPIED into `pcm` at the right
-    /// offset. The indirection is what preserves the no-realloc invariant:
-    /// [`crate::audio::pcm::to_f32`] clears and reserves its output, either of which would move
-    /// `pcm` out from under the pointer the embedder is still holding, and it always writes from
-    /// index 0 — where a concealed frame may already be sitting.
+    /// PCM staging. `to_f32` clears/reserves; writing into `pcm` would move the embedder pointer.
     scratch_pcm: Vec<f32>,
 }
 
 #[cfg(feature = "quic")]
 impl AudioPcmState {
-    /// Size `pcm` once, from the negotiated format, and never again.
-    ///
-    /// ⚠ **The buffer must NEVER be reallocated after this.** The embedder is handed a raw
-    /// pointer INTO it by [`punktfunk_connection_next_audio_pcm`] and reads it until its next
-    /// call, so a later `Vec` growth would leave that pointer dangling — a use-after-free the
-    /// embedder cannot see coming and which would not reproduce on a machine whose allocator
-    /// happened to grow in place. Everything downstream therefore writes into a fixed-length
-    /// slice and CLAMPS to it rather than extending: `decode_float` is given a bounded
-    /// subslice, and the PCM path copies through `scratch_pcm`.
-    ///
-    /// "Already sized" is `!pcm.is_empty()`, which is why [`AudioFormat::of`] refuses to produce
-    /// a zero rate: a zero-length buffer would re-enter this function on every packet.
+    /// Size `pcm` once. The embedder holds a pointer into it until the next PCM
+    /// call; later `Vec` growth would dangle. Writes clamp; never extend.
+    /// `!pcm.is_empty()` is the sized latch — a zero rate would re-enter forever.
     fn ensure_buffer(&mut self, fmt: AudioFormat) {
         if !self.pcm.is_empty() {
             return;
         }
         let ch = fmt.channels.max(1) as usize;
-        // Per-channel samples in the largest frame this plane can ever hand out. The two planes
-        // differ by 24×, so they are sized separately rather than both to the Opus worst case:
-        //
-        // - Opus: the largest legal frame is 120 ms (5760 samples/ch at 48 kHz).
-        // - `0xD3`: the longest rung of `FRAME_US_LADDER`, because the frame duration is chosen
-        //   from the path MTU at session start and the plane is never fragmented, so nothing
-        //   longer can arrive from a conforming host. (A non-conforming one is bounded anyway —
-        //   every copy into `pcm` below is clamped to what is left.)
+        // Largest frame this plane can present. Opus: 120 ms. PCM: longest `FRAME_US_LADDER`
+        // rung (MTU-sized, never fragmented). Copies into `pcm` still clamp.
         let per_ch = if fmt.is_pcm() {
             crate::audio::pcm::samples_per_frame(
                 fmt.rate_hz,
@@ -955,37 +769,24 @@ impl AudioPcmState {
         } else {
             fmt.rate_hz as usize / 1000 * 120
         };
-        // A gap can owe a whole concealment run of frames in front of the real one, and they are
-        // handed out as one contiguous buffer.
-        //
-        // ⚠ The COUNT comes from the session's resolved frame (the cap is 50 ms of audio, so a
-        // 2 ms frame owes 25 of them, not 10) while the SIZE comes from the longest rung the
-        // ladder can offer. Deliberately mismatched, and only in the safe direction: sizing the
-        // frames from `fmt.frame_us` too would be tighter, but it would make a host that
-        // negotiated 2 ms and then sent 5 ms truncate audio instead of merely wasting memory, and
-        // this buffer can never be grown to recover from that.
+        // Count from resolved frame (50 ms cap → 25×2 ms, not 10). Size from the longest
+        // ladder rung: a 2 ms session that then sends 5 ms must not truncate; cannot grow.
         let run = crate::audio::max_conceal_packets(fmt.frame_us) as usize;
         self.pcm = vec![0f32; (1 + run) * per_ch.max(1) * ch];
-        // The tracker must cap at exactly the run this buffer was sized for. It is set HERE, under
-        // the same one-shot latch, because a cap that outran the buffer would be silently
-        // truncated frames — and a buffer sized for a run the tracker never asks for is dead
-        // memory nobody would notice.
+        // Cap the tracker at this same run. A larger cap would silently truncate frames.
         self.gaps.set_frame_us(fmt.frame_us);
     }
 
-    /// Copy `n` samples of `scratch_pcm` into `pcm` at `filled`, returning how many actually
-    /// landed. The clamp is load-bearing, not defensive tidiness: it is what makes an oversized
-    /// or malformed datagram a truncated frame instead of a buffer overrun or a reallocation.
+    /// Copy `n` scratch samples into `pcm` at `filled`. Clamp is load-bearing:
+    /// oversized datagrams truncate instead of reallocating or overrunning.
     fn stage_scratch(&mut self, filled: usize, n: usize) -> usize {
         let n = n.min(self.scratch_pcm.len()).min(self.pcm.len() - filled);
         self.pcm[filled..filled + n].copy_from_slice(&self.scratch_pcm[..n]);
         n
     }
 
-    /// The lossless (`0xD3`) half of [`decode_packet`](Self::decode_packet): unpack interleaved
-    /// LE samples, with [`crate::audio::pcm::PcmConceal`] standing in for the PLC a lossless
-    /// format cannot have. Shape-for-shape the Opus path — concealed frames first, the real one
-    /// after, one contiguous buffer, same return contract — so the ABI above needs no branch.
+    /// PCM half of [`decode_packet`](Self::decode_packet): unpack + [`PcmConceal`].
+    /// Same shape as Opus (conceal then real, one buffer) so the C surface does not branch.
     fn decode_pcm_packet(
         &mut self,
         data: &[u8],
@@ -995,8 +796,7 @@ impl AudioPcmState {
         let ch = fmt.channels.max(1) as usize;
         self.ensure_buffer(fmt);
 
-        // Same accounting as the Opus path, including the drought credit: whatever the embedder
-        // already covered while the wire was quiet comes off the top.
+        // Same drought credit as Opus: frames already handed out while the wire was quiet.
         let missing = self
             .gaps
             .missing_before(seq)
@@ -1015,46 +815,29 @@ impl AudioPcmState {
         }
 
         if data.is_empty() {
-            // No host emits an empty `0xD3` payload — PCM has no DTX — but a torn datagram can
-            // present as one, and it must NOT reach `PcmConceal::accept`: accepting an empty
-            // frame would clear the last good frame and leave the next loss with nothing to
-            // conceal from. Treated exactly like the Opus DTX marker: the slot is accounted (so
-            // it is never itself "concealed" later) and any concealment owed still goes out.
+            // PCM has no DTX. Empty is a torn datagram: do not `accept` it (that clears the
+            // last good frame). Account the slot like Opus DTX; still emit concealment owed.
             return Ok(filled);
         }
         match crate::audio::pcm::to_f32(data, fmt.bits, &mut self.scratch_pcm) {
             Some(n) => {
                 let staged = self.stage_scratch(filled, n);
-                // The next loss is concealed from what the embedder actually HEARD — the staged
-                // frame, not the decoded one. They differ only for an oversized datagram no
-                // conforming host sends, and taking the staged length there keeps the
-                // concealment source bounded by the same fixed buffer as everything else.
+                // Conceal from the staged length (what the embedder heard), not the decoded
+                // one: keeps the source inside the fixed buffer on an oversized datagram.
                 self.conceal_pcm.accept(&self.scratch_pcm[..staged]);
                 self.frame_samples = staged / ch;
                 Ok(filled + staged)
             }
-            // Not a whole number of samples at this depth — a truncated or hostile datagram.
-            // Same disposal as an undecodable Opus packet: hand out the concealment the gap
-            // before it earned rather than dropping that with the packet.
+            // Torn datagram: keep concealment already earned, same as undecodable Opus.
             None if filled > 0 => Ok(filled),
             None => Err(PunktfunkStatus::BadPacket),
         }
     }
 
-    /// Decode one arriving audio packet into `self.pcm`, synthesizing packet-loss concealment for
-    /// any packets the sequence says went missing immediately before it — the concealed frames
-    /// land first, the real frame after, one contiguous interleaved buffer.
-    ///
-    /// `fmt` selects the plane: Opus off `0xC9` (libopus, and libopus PLC for the gaps) or
-    /// lossless PCM off `0xD3` (a stride unpack, and [`crate::audio::pcm::PcmConceal`] for the
-    /// gaps — a lossless format has no PLC to borrow). The return contract is identical either
-    /// way, so the C surface above never branches on the plane.
-    ///
-    /// Returns the interleaved sample count now valid at the front of `pcm`; `Ok(0)` means
-    /// nothing to hand out this call (a DTX silence marker with no loss before it). An empty
-    /// `data` is the DTX marker: it still advances the loss accounting (so the silent slot is
-    /// never itself "concealed" later) and flushes any concealment owed, but is never decoded —
-    /// `decode_float` would treat it as a loss and synthesize the buffer's full capacity.
+    /// Decode one packet into `pcm`. Missing seqs are concealed first, then the
+    /// real frame, one interleaved buffer. Empty `data` is DTX: account the slot,
+    /// flush owed concealment, never decode (`decode_float` would fill the buffer).
+    /// `Ok(0)` = nothing to hand out.
     fn decode_packet(
         &mut self,
         data: &[u8],
@@ -1068,11 +851,7 @@ impl AudioPcmState {
         let ch = channels as usize;
         if self.decoder.is_none() {
             let layout = crate::audio::layout_for(channels, false);
-            // The negotiated rate, not a constant. On this plane it is always 48 000 — libopus
-            // accepts only 8/12/16/24/48 kHz and rejects 96 000 outright, which is the entire
-            // reason `0xD3` exists — so passing it through costs nothing and makes libopus itself
-            // the validator: a host that claimed Opus at a rate libopus cannot open fails loudly
-            // here instead of quietly decoding at the wrong one.
+            // Negotiated rate, not a constant. libopus rejects 96 kHz; fail here, not silently.
             match opus::MSDecoder::new(fmt.rate_hz, layout.streams, layout.coupled, layout.mapping)
             {
                 Ok(d) => {
@@ -1084,11 +863,7 @@ impl AudioPcmState {
         }
         let dec = self.decoder.as_mut().unwrap();
 
-        // Conceal lost packets (a seq gap) before decoding the one that arrived: empty input
-        // synthesizes `frame_samples` of interpolation per missing packet — an inaudible fade
-        // instead of the click a hard gap makes in the ring. Mirrors the Linux/Windows session
-        // pump and the Android native pump; capped by the tracker at 50 ms. Whatever a drought
-        // already covered comes off the top — that audio is in the embedder's ring already.
+        // PLC the seq gap first (empty input, 50 ms cap). Subtract drought frames already in the ring.
         let missing = self
             .gaps
             .missing_before(seq)
@@ -1105,9 +880,7 @@ impl AudioPcmState {
         }
 
         if data.is_empty() {
-            // DTX silence marker (a legal wire form) — never decoded (see above); the sink
-            // underruns to silence on its own. Concealment owed for losses before it still
-            // goes out.
+            // DTX: never decode; still emit concealment owed for losses before it.
             return Ok(filled);
         }
         match dec.decode_float(data, &mut self.pcm[filled..], false) {
@@ -1115,26 +888,16 @@ impl AudioPcmState {
                 self.frame_samples = samples;
                 Ok(filled + samples * ch)
             }
-            // An undecodable packet: hand out whatever concealment the gap before it earned
-            // rather than dropping it with the packet. Its own 5 ms slot plays as a ring gap,
-            // as on every other client (the tracker has already anchored at this seq).
+            // Undecodable: keep concealment already earned. This slot is a ring gap.
             Err(_) if filled > 0 => Ok(filled),
             Err(_) => Err(PunktfunkStatus::BadPacket),
         }
     }
 
-    /// Synthesize ONE concealment frame with no packet involved — the drought half of concealment
-    /// (see [`punktfunk_connection_audio_plc`] for what asks for it and why).
-    ///
-    /// Returns the interleaved sample count now valid at the front of `pcm`, or `Ok(0)` when
-    /// nothing has decoded yet: both concealers extrapolate from the LAST decoded frame, so
-    /// before there is one there is neither state to extrapolate from nor a frame size to ask for.
+    /// One drought concealment frame, no packet. `Ok(0)` before the first decode.
     fn conceal(&mut self, fmt: AudioFormat) -> Result<usize, PunktfunkStatus> {
         if fmt.is_pcm() {
-            // `PcmConceal`, never libopus PLC. There is no decoder on this plane to ask, and even
-            // if one were built it would be extrapolating from nothing: a lossless frame carries
-            // no model of the signal, only the signal. `conceal` returns false before the first
-            // real frame — the same "nothing to hand out" the Opus arm reports below.
+            // PCM has no decoder/PLC. `conceal` is false before the first real frame.
             if !self.conceal_pcm.conceal(&mut self.scratch_pcm) {
                 return Ok(0);
             }
@@ -1159,47 +922,32 @@ impl AudioPcmState {
                 self.drought_frames = self.drought_frames.saturating_add(1);
                 Ok(samples * ch)
             }
-            // libopus declined to interpolate. Nothing to hand out, and the caller's response is
-            // a timeout's: write nothing and let its ring's own underrun path have the drought.
+            // libopus declined; write nothing (same as a timeout).
             Err(_) => Ok(0),
         }
     }
 }
 
-/// `PunktfunkHidOutput::kind` — lightbar RGB (`r`/`g`/`b` valid).
+/// `PunktfunkHidOutput::kind`: lightbar RGB (`r`/`g`/`b` valid).
 pub const PUNKTFUNK_HIDOUT_LED: u8 = 1;
-/// `PunktfunkHidOutput::kind` — player-indicator LEDs (`player_bits` valid, low 5 bits).
+/// `PunktfunkHidOutput::kind`: player-indicator LEDs (`player_bits` valid, low 5 bits).
 pub const PUNKTFUNK_HIDOUT_PLAYER_LEDS: u8 = 2;
-/// `PunktfunkHidOutput::kind` — one adaptive-trigger effect (`which` + `effect`/`effect_len` valid).
+/// `PunktfunkHidOutput::kind`: one adaptive-trigger effect (`which` + `effect`/`effect_len` valid).
 pub const PUNKTFUNK_HIDOUT_TRIGGER: u8 = 3;
-/// `PunktfunkHidOutput::kind` — a trackpad haptic pulse (Steam Controller voice-coils). `which` =
-/// side (0 = right pad, 1 = left pad); `effect[0..6]` packs `amplitude` / `period` / `count` as
-/// little-endian `u16`s with `effect_len = 6`. Clients without trackpad coils drop it.
+/// Trackpad haptic pulse. `which` = side (0 right, 1 left); `effect[0..6]` =
+/// amplitude/period/count as LE `u16`, `effect_len = 6`. Drop if no coils.
 pub const PUNKTFUNK_HIDOUT_TRACKPAD_HAPTIC: u8 = 4;
-/// `PunktfunkHidOutput::kind` — the audio-control region of a DS5 output report (pad-audio
-/// routing/volumes; the audio SAMPLES arrive via [`punktfunk_connection_next_pad_audio`]).
-/// `which` = the condensed audio flags (bit0 = haptics-select, bits1..4 = the report's
-/// audio-valid flags); `effect[0..6]` = bytes 5..=10 of the report verbatim
-/// (headphone/speaker/mic volumes + routing) with `effect_len = 6`. Forwarded change-only.
+/// DS5 audio-control region. Samples arrive via [`punktfunk_connection_next_pad_audio`].
+/// `which` = flags; `effect[0..6]` = report bytes 5..=10; `effect_len = 6`. Change-only.
 pub const PUNKTFUNK_HIDOUT_AUDIO_CTL: u8 = 5;
-/// `PunktfunkHidOutput::kind` — a raw report the host's hidraw consumer (Steam) wrote to an
-/// as-is passthrough pad (`HidOutput::HidRaw`, the reverse of
-/// [`punktfunk_connection_send_hid_report`]): `hid_kind` (`PUNKTFUNK_HID_RAW_OUTPUT` /
-/// `PUNKTFUNK_HID_RAW_FEATURE`) + `raw`/`raw_len` valid. Replay it verbatim on the physical
-/// device — an OUTPUT report on the interrupt-OUT endpoint / per-report GATT characteristic
-/// (Triton rumble `0x80`, haptic pulse `0x81`, …), a FEATURE report as `SET_REPORT` / a GATT
-/// feature write (lizard mode, IMU enable). Only an as-is passthrough session
-/// (`PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2`) emits these; clients without such a capture drop them.
+/// Raw hidraw report to replay (`HidRaw`). `hid_kind` + `raw`/`raw_len` valid.
+/// Only `PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2` emits these; others drop.
 pub const PUNKTFUNK_HIDOUT_HID_RAW: u8 = 6;
-/// Capacity of `PunktfunkHidOutput::effect` (the DualSense trigger parameter block).
+/// Capacity of `PunktfunkHidOutput::effect` (DualSense trigger parameter block).
 pub const PUNKTFUNK_HID_EFFECT_MAX: u8 = 11;
 
-/// One HID-output feedback event a game wrote to the host's virtual pad
-/// ([`punktfunk_connection_next_hidout`]). `kind` selects which fields are meaningful — replay it
-/// on the real controller: DualSense feedback (lightbar color, player LEDs, an adaptive-trigger
-/// effect via the platform's `GCDualSenseAdaptiveTrigger`-style API), or — on an as-is Steam
-/// Controller 2 passthrough session — a raw report to forward verbatim
-/// (`PUNKTFUNK_HIDOUT_HID_RAW`).
+/// HID-output feedback from the host virtual pad ([`punktfunk_connection_next_hidout`]).
+/// `kind` selects which fields to replay on the physical controller.
 #[cfg(feature = "quic")]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1220,30 +968,19 @@ pub struct PunktfunkHidOutput {
     pub which: u8,
     /// Trigger: number of valid bytes in `effect` (≤ `PUNKTFUNK_HID_EFFECT_MAX`).
     pub effect_len: u8,
-    /// Trigger: the raw DualSense trigger parameter block (mode + params).
-    /// Sized off [`PUNKTFUNK_HID_EFFECT_MAX`] rather than a second literal `11` — the constant is
-    /// exported precisely so embedders can size their own buffers against it, and it declaring one
-    /// number while the struct it describes hardcoded another was the whole hazard.
+    /// DualSense trigger parameter block. Length is [`PUNKTFUNK_HID_EFFECT_MAX`], not a second `11`.
     pub effect: [u8; PUNKTFUNK_HID_EFFECT_MAX as usize],
-    /// HidRaw: `PUNKTFUNK_HID_RAW_OUTPUT` (an OUTPUT report — a hidraw `write()`) or
-    /// `PUNKTFUNK_HID_RAW_FEATURE` (a FEATURE report — `SET_REPORT`). Distinct from `kind`,
-    /// which says this event IS a raw report; this says which device channel replays it.
+    /// HidRaw channel: `PUNKTFUNK_HID_RAW_OUTPUT` or `PUNKTFUNK_HID_RAW_FEATURE`.
     pub hid_kind: u8,
     /// HidRaw: number of valid bytes in `raw` (≤ `PUNKTFUNK_HID_REPORT_MAX`).
     pub raw_len: u8,
-    /// HidRaw: the full report, id byte first — exactly what the host's hidraw consumer wrote
-    /// (Steam writes feature frames whole, so trailing zero-padding is normal; OUTPUT frames
-    /// arrive host-trimmed to the declared report length on current hosts). Sized off
-    /// [`HID_REPORT_MAX`](crate::quic::HID_REPORT_MAX), the wire bound for the same bytes.
+    /// HidRaw report, id byte first. Feature frames may be zero-padded; sized off `HID_REPORT_MAX`.
     pub raw: [u8; crate::quic::HID_REPORT_MAX],
 }
 
 #[cfg(feature = "quic")]
 impl PunktfunkHidOutput {
-    /// Total since ABI v27: every [`HidOutput`](crate::quic::HidOutput) variant has a C
-    /// representation. `HidRaw` used to map to `None` (the struct predated the as-is SC2
-    /// passthrough and had no buffer for a 64-byte report; the pull site skipped it) — the
-    /// Apple client now declares that kind, so the report rides `raw`/`raw_len`/`hid_kind`.
+    /// Map every [`HidOutput`](crate::quic::HidOutput) variant. `HidRaw` uses `raw`/`hid_kind`.
     fn from_hid(h: &crate::quic::HidOutput) -> PunktfunkHidOutput {
         use crate::quic::HidOutput;
         let mut out = PunktfunkHidOutput {
@@ -1288,8 +1025,7 @@ impl PunktfunkHidOutput {
                 period,
                 count,
             } => {
-                // No new struct (PunktfunkHidOutput has no size guard): pack into the existing
-                // `which` (side) + `effect[0..6]` (amplitude/period/count LE), `effect_len = 6`.
+                // No size guard: pack into `which` + `effect[0..6]` LE, `effect_len = 6`.
                 out.kind = PUNKTFUNK_HIDOUT_TRACKPAD_HAPTIC;
                 out.pad = *pad;
                 out.which = *side;
@@ -1302,17 +1038,13 @@ impl PunktfunkHidOutput {
                 out.kind = PUNKTFUNK_HIDOUT_HID_RAW;
                 out.pad = *pad;
                 out.hid_kind = *kind;
-                // `decode` already bounds the Vec to HID_REPORT_MAX; clamp again so a
-                // locally-constructed oversize value can never overrun the fixed body.
+                // `decode` already bounds; clamp so a local oversize cannot overrun `raw`.
                 let n = data.len().min(out.raw.len());
                 out.raw[..n].copy_from_slice(&data[..n]);
                 out.raw_len = n as u8;
             }
             HidOutput::AudioCtl { pad, flags, raw } => {
-                // Same packing idiom as TrackpadHaptic: `which` carries the flags byte,
-                // `effect[0..6]` the raw audio region. The u16 wire pad narrows losslessly
-                // because `HidOutput::decode` refuses one at or above `input::MAX_PADS` (B27) —
-                // it is enforced there, not merely assumed here.
+                // Same pack as TrackpadHaptic. `pad as u8` is lossless: decode rejects ≥ MAX_PADS.
                 out.kind = PUNKTFUNK_HIDOUT_AUDIO_CTL;
                 out.pad = *pad as u8;
                 out.which = *flags;
@@ -1324,29 +1056,28 @@ impl PunktfunkHidOutput {
     }
 }
 
-/// Static HDR metadata for an HDR session ([`punktfunk_connection_next_hdr_meta`]): SMPTE ST.2086
-/// mastering display colour volume + CEA-861.3 content light level. All fields are in the standard
-/// HDR10 SEI fixed-point units (primaries/white in 1/50000, luminance in 0.0001 cd/m²), ready for
-/// DXGI `DXGI_HDR_METADATA_HDR10` / Apple `CAEDRMetadata` / Android `KEY_HDR_STATIC_INFO`.
+/// Static HDR metadata ([`punktfunk_connection_next_hdr_meta`]): ST.2086 mastering
+/// display + CEA-861.3 content light. HDR10 SEI units (primaries/white 1/50000,
+/// luminance 0.0001 cd/m²) for DXGI / `CAEDRMetadata` / `KEY_HDR_STATIC_INFO`.
 #[cfg(feature = "quic")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PunktfunkHdrMeta {
-    /// Display-primaries x-chromaticities in 1/50000 units, ST.2086 order [green, blue, red].
+    /// Display-primaries x-chromaticities, 1/50000 units, ST.2086 order [green, blue, red].
     pub display_primaries_x: [u16; 3],
-    /// Display-primaries y-chromaticities in 1/50000 units, ST.2086 order [green, blue, red].
+    /// Display-primaries y-chromaticities, 1/50000 units, ST.2086 order [green, blue, red].
     pub display_primaries_y: [u16; 3],
     /// White-point x-chromaticity, 1/50000 units.
     pub white_point_x: u16,
     /// White-point y-chromaticity, 1/50000 units.
     pub white_point_y: u16,
-    /// Max display mastering luminance, 0.0001 cd/m² units.
+    /// Max display mastering luminance, 0.0001 cd/m².
     pub max_display_mastering_luminance: u32,
-    /// Min display mastering luminance, 0.0001 cd/m² units.
+    /// Min display mastering luminance, 0.0001 cd/m².
     pub min_display_mastering_luminance: u32,
-    /// Maximum content light level (MaxCLL), nits. 0 = unknown.
+    /// Max content light level (MaxCLL), nits. 0 = unknown.
     pub max_cll: u16,
-    /// Maximum frame-average light level (MaxFALL), nits. 0 = unknown.
+    /// Max frame-average light level (MaxFALL), nits. 0 = unknown.
     pub max_fall: u16,
 }
 
@@ -1374,41 +1105,35 @@ impl PunktfunkHdrMeta {
     }
 }
 
-/// One access unit's host-side processing time ([`punktfunk_connection_next_host_timing`]):
-/// capture → fully sent, i.e. the whole host pipeline (capture read/convert, encode, FEC+seal,
-/// paced send). Correlate to the AU whose `PunktfunkFrame::pts_ns` equals `pts_ns`, then
-/// `network = (received_instant + clock_offset − pts_ns) − host_us` — the unified stats HUD's
-/// `host` / `network` split (design/stats-unification.md Phase 2). Best-effort: a lost datagram
-/// means that frame simply contributes no sample.
+/// Host capture→sent duration for one AU ([`punktfunk_connection_next_host_timing`]).
+/// Correlate by `pts_ns`; `network = (received + clock_offset − pts_ns) − host_us`.
+/// Lost datagram: no sample. See `design/stats-unification.md`.
 #[cfg(feature = "quic")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PunktfunkHostTiming {
-    /// The AU's capture stamp (host capture clock — matches `PunktfunkFrame::pts_ns` exactly).
+    /// AU capture stamp (host capture clock — matches `PunktfunkFrame::pts_ns`).
     pub pts_ns: u64,
     /// Host capture→sent duration, µs.
     pub host_us: u32,
 }
 
-/// `PunktfunkRichInput::kind` — a touchpad contact (`finger`/`active`/`x`/`y` valid).
+/// `PunktfunkRichInput::kind`: a touchpad contact (`finger`/`active`/`x`/`y` valid).
 pub const PUNKTFUNK_RICH_TOUCHPAD: u8 = 1;
-/// `PunktfunkRichInput::kind` — a motion sample (`gyro`/`accel` valid).
+/// `PunktfunkRichInput::kind`: a motion sample (`gyro`/`accel` valid).
 pub const PUNKTFUNK_RICH_MOTION: u8 = 2;
-/// `RichInput::TouchpadEx` kind on the wire — an extended trackpad contact that identifies the
-/// surface (0 single / 1 Steam-left / 2 Steam-right) and carries click + pressure. The host decodes
-/// it today; *sending* it from a C client needs the size-prefixed `PunktfunkRichInputEx` +
-/// `punktfunk_connection_send_rich_input2` (added with client capture).
+/// `RichInput::TouchpadEx` on the wire: surface (0 single / 1 Steam-left / 2
+/// Steam-right) plus click + pressure. C send path is size-prefixed
+/// `PunktfunkRichInputEx` via `punktfunk_connection_send_rich_input2`.
 pub const PUNKTFUNK_RICH_TOUCHPAD_EX: u8 = 3;
-/// `RichInput::HidReport` kind on the wire (`[0xCC][0x04][pad][len][data…]`) — one raw HID input
-/// report from a client-captured controller, forwarded verbatim for the host's as-is virtual pad
-/// (the Steam Controller 2 passthrough, `PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2`). A C client sends it
-/// through [`punktfunk_connection_send_hid_report`], never by building the datagram itself; the
-/// constant exists so client-side tests can pin the wire byte against this header.
+/// `RichInput::HidReport` on the wire (`[0xCC][0x04][pad][len][data…]`): raw HID
+/// input for the host as-is pad (`PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2`). C clients
+/// send via [`punktfunk_connection_send_hid_report`], never by building the datagram.
 pub const PUNKTFUNK_RICH_HID_REPORT: u8 = 4;
 
-/// One rich client→host input for the host's virtual DualSense
-/// ([`punktfunk_connection_send_rich_input`]): a touchpad contact or a motion sample. Set `kind`
-/// and the matching fields; the others are ignored.
+/// One rich client→host input for the host virtual DualSense
+/// ([`punktfunk_connection_send_rich_input`]): touchpad contact or motion sample.
+/// Set `kind` and the matching fields; the others are ignored.
 #[cfg(feature = "quic")]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1453,17 +1178,13 @@ impl PunktfunkRichInput {
     }
 }
 
-/// Forward-compatible superset of [`PunktfunkRichInput`] that can also express the rich Steam
-/// surfaces: a *second* trackpad (`surface`), a distinct `click` vs touch, signed coordinates, and
-/// pressure. Sent via [`punktfunk_connection_send_rich_input2`] — the only way a C client can emit a
-/// `TouchpadEx`. The caller MUST set `struct_size = sizeof(PunktfunkRichInputEx)` (the ABI-skew
-/// guard, like [`PunktfunkConfig`]); the legacy [`PunktfunkRichInput`] +
-/// [`punktfunk_connection_send_rich_input`] stay byte-for-byte for existing callers.
+/// Superset of [`PunktfunkRichInput`] for `TouchpadEx` (second pad, click, signed
+/// coords, pressure). Set `struct_size = sizeof(PunktfunkRichInputEx)`.
 #[cfg(feature = "quic")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PunktfunkRichInputEx {
-    /// MUST equal `sizeof(PunktfunkRichInputEx)`.
+    /// Must equal `sizeof(PunktfunkRichInputEx)`.
     pub struct_size: u32,
     /// One of `PUNKTFUNK_RICH_*` (`TOUCHPAD` / `MOTION` / `TOUCHPAD_EX`).
     pub kind: u8,
@@ -1473,16 +1194,16 @@ pub struct PunktfunkRichInputEx {
     pub finger: u8,
     /// Touchpad/TouchpadEx: 1 = finger down / touching, 0 = lifted.
     pub active: u8,
-    /// TouchpadEx: which surface — 0 = single/DualSense, 1 = Steam left pad, 2 = Steam right pad.
+    /// TouchpadEx: surface — 0 = single/DualSense, 1 = Steam left pad, 2 = Steam right pad.
     pub surface: u8,
-    /// TouchpadEx: 1 = the pad is physically clicked (depressed), distinct from a touch contact.
+    /// TouchpadEx: 1 = the pad is physically clicked, distinct from a touch contact.
     pub click: u8,
     /// Reserved for alignment; set to 0.
     pub _reserved: [u8; 2],
-    /// TouchpadEx: x coordinate — **signed**, centred at 0 (the real Steam report convention). For a
-    /// legacy `TOUCHPAD` kind sent through this struct, store the unsigned `0..=65535` value's bits.
+    /// TouchpadEx: x, **signed**, centred at 0 (Steam report convention). For a
+    /// `TOUCHPAD` kind through this struct, store the unsigned `0..=65535` bits.
     pub x: i16,
-    /// TouchpadEx: y coordinate — signed, centred at 0.
+    /// TouchpadEx: y, signed, centred at 0.
     pub y: i16,
     /// TouchpadEx: contact pressure (`0` if the surface has no force sensor).
     pub pressure: u16,
@@ -1534,8 +1255,8 @@ pub const PUNKTFUNK_PEN_BARREL1: u8 = 0x04;
 pub const PUNKTFUNK_PEN_BARREL2: u8 = 0x08;
 /// [`PunktfunkPenSample::tool`]: the pen tip.
 pub const PUNKTFUNK_PEN_TOOL_PEN: u8 = 0;
-/// [`PunktfunkPenSample::tool`]: the eraser (a client-side mode — Apple Pencil has no
-/// hardware eraser end; the squeeze/double-tap mapping usually drives this).
+/// [`PunktfunkPenSample::tool`]: the eraser. Client-side mode — no hardware eraser
+/// end; squeeze/double-tap mapping usually drives this.
 pub const PUNKTFUNK_PEN_TOOL_ERASER: u8 = 1;
 /// Most samples one [`punktfunk_connection_send_pen`] call accepts (one wire batch).
 pub const PUNKTFUNK_PEN_BATCH_MAX: u32 = 8;
@@ -1546,12 +1267,9 @@ pub const PUNKTFUNK_PEN_ANGLE_UNKNOWN: u16 = 0xFFFF;
 /// [`PunktfunkPenSample::distance`] sentinel: no hover-distance reading.
 pub const PUNKTFUNK_PEN_DISTANCE_UNKNOWN: u16 = 0xFFFF;
 
-/// One complete stylus state at one instant ([`punktfunk_connection_send_pen`];
-/// design/pen-tablet-input.md). STATE-FULL, never an edge event: fill every field on every
-/// sample (unknown axes take their `*_UNKNOWN` sentinel) — the host diffs consecutive samples
-/// and synthesizes down/up/button transitions itself, which is what makes a lost datagram
-/// self-heal. `x`/`y` are normalized `0.0..=1.0` in VIDEO-FRAME space (map your letterbox
-/// before filling, exactly like wire touches).
+/// Full stylus state at one instant ([`punktfunk_connection_send_pen`];
+/// `design/pen-tablet-input.md`). Fill every field (`*_UNKNOWN` if missing); the
+/// host diffs samples. `x`/`y` are `0.0..=1.0` in video-frame space.
 #[cfg(feature = "quic")]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1569,7 +1287,7 @@ pub struct PunktfunkPenSample {
     /// Barrel roll (Apple Pencil Pro `rollAngle`), degrees `0..=359`, or
     /// `PUNKTFUNK_PEN_ANGLE_UNKNOWN`.
     pub roll_deg: u16,
-    /// µs since the previous sample in the same call (`0` for the first) — the coalesced
+    /// µs since the previous sample in the same call (`0` for the first) — coalesced
     /// capture spacing.
     pub dt_us: u16,
     /// Bitfield of `PUNKTFUNK_PEN_*` state bits. Unknown bits are rejected (`InvalidArg`).
@@ -1584,8 +1302,8 @@ pub struct PunktfunkPenSample {
 
 #[cfg(feature = "quic")]
 impl PunktfunkPenSample {
-    /// `None` = invalid field (non-finite coordinate, unknown state bit, unknown tool) —
-    /// embedder input is validated strictly, unlike the loss-tolerant wire decode.
+    /// `None` = invalid field (non-finite coordinate, unknown state bit, unknown tool).
+    /// Embedder input is validated strictly, unlike the loss-tolerant wire decode.
     fn to_sample(self) -> Option<crate::quic::PenSample> {
         use crate::quic as q;
         let known = q::PEN_IN_RANGE | q::PEN_TOUCHING | q::PEN_BARREL1 | q::PEN_BARREL2;
@@ -1612,24 +1330,22 @@ impl PunktfunkPenSample {
     }
 }
 
-/// Read an optional NUL-terminated UTF-8 string parameter; `Err` = invalid pointer/UTF-8.
+/// Read an optional NUL-terminated UTF-8 string; `Err` = invalid pointer/UTF-8.
 #[cfg(feature = "quic")]
 unsafe fn opt_cstr<'a>(p: *const std::os::raw::c_char) -> std::result::Result<Option<&'a str>, ()> {
     if p.is_null() {
         return Ok(None);
     }
-    // SAFETY: per the ABI contract - a caller-supplied C string, NUL-terminated or null, borrowed
-    // only for this call.
+    // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
     unsafe { std::ffi::CStr::from_ptr(p) }
         .to_str()
         .map(Some)
         .map_err(|_| ())
 }
 
-/// Compositor preference for [`punktfunk_connect_ex`] (`compositor` arg). `AUTO` lets the host
-/// pick (auto-detect from its running desktop); a concrete value is honored only if that backend
-/// is available on the host right now, else the host falls back to auto-detect. The resolved
-/// choice is reported back over the protocol (see `punktfunk/1` `Welcome`).
+/// Compositor preference for [`punktfunk_connect_ex`]. `AUTO` lets the host pick.
+/// A concrete value is honored only if that backend is available now; else auto-detect.
+/// Resolved choice is on `Welcome`.
 pub const PUNKTFUNK_COMPOSITOR_AUTO: u32 = 0;
 /// KWin / KDE Plasma.
 pub const PUNKTFUNK_COMPOSITOR_KWIN: u32 = 1;
@@ -1640,152 +1356,109 @@ pub const PUNKTFUNK_COMPOSITOR_MUTTER: u32 = 3;
 /// gamescope (spawned nested).
 pub const PUNKTFUNK_COMPOSITOR_GAMESCOPE: u32 = 4;
 
-/// Gamepad-backend preference for [`punktfunk_connect_ex2`] (`gamepad` arg): which virtual pad
-/// the host creates for this session's controllers. Precedence host-side: an explicit client
-/// choice > the host's `PUNKTFUNK_GAMEPAD` env var > X-Box 360. `AUTO` (or any unrecognized
-/// value) = host decides. The resolved choice is echoed over the protocol (`Welcome`) and
-/// readable via [`punktfunk_connection_gamepad`].
+/// Gamepad-backend preference for [`punktfunk_connect_ex2`]: which virtual pad
+/// the host creates. Precedence: client choice > `PUNKTFUNK_GAMEPAD` env > X-Box 360.
+/// `AUTO` (or unrecognized) = host decides. Resolved via [`punktfunk_connection_gamepad`].
 pub const PUNKTFUNK_GAMEPAD_AUTO: u32 = 0;
-/// uinput X-Box 360 pad (the universal default — every game speaks XInput).
+/// uinput X-Box 360 pad (default — every game speaks XInput).
 pub const PUNKTFUNK_GAMEPAD_XBOX360: u32 = 1;
-/// UHID DualSense (kernel `hid-playstation`): adaptive triggers, lightbar, touchpad, motion —
-/// feedback arrives on the HID-output plane ([`punktfunk_connection_next_hidout`]). Honored on
-/// Linux (UHID) and Windows (UMDF minidriver) hosts; otherwise the host falls back to X-Box 360.
+/// UHID DualSense (`hid-playstation`): adaptive triggers, lightbar, touchpad, motion.
+/// Feedback on [`punktfunk_connection_next_hidout`]. Linux UHID / Windows UMDF; else X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_DUALSENSE: u32 = 2;
-/// uinput X-Box One / Series pad — the X-Box 360 backend with the One/Series USB identity, so
-/// games show One/Series glyphs. XInput-identical to `XBOX360` otherwise (no game-visible gain;
-/// impulse-trigger rumble is unreachable through THIS pad — evdev's `FF_RUMBLE` is two
-/// magnitudes and has no third, so a uinput backend can never source it. The Windows HID Xbox
-/// backend can, off its output report `0x03`; see
-/// [`punktfunk_connection_next_rumble_cmd2`]). Useful for glyph-matching a
-/// physical X-Box One/Series controller on the client.
+/// X-Box One/Series identity on the 360 backend (glyphs). No impulse-trigger rumble:
+/// evdev `FF_RUMBLE` has two magnitudes. Windows HID Xbox can; see `next_rumble_cmd2`.
 pub const PUNKTFUNK_GAMEPAD_XBOXONE: u32 = 3;
-/// UHID DualShock 4 (kernel `hid-playstation` ≥ 6.2): lightbar, touchpad, motion, rumble — the
-/// touchpad/motion arrive over the rich-input plane and lightbar over the HID-output plane, like
-/// DualSense (minus adaptive triggers / player LEDs / mute). Honored on Linux (UHID) and Windows
-/// (UMDF minidriver) hosts; otherwise the host falls back to X-Box 360.
+/// UHID DualShock 4 (`hid-playstation`): lightbar, touchpad, motion, rumble.
+/// Rich-input + HID-output planes, no adaptive triggers / player LEDs / mute.
+/// Linux UHID / Windows UMDF; else X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_DUALSHOCK4: u32 = 4;
-/// UHID classic Steam Controller (Valve `28DE:1102`, kernel `hid-steam`): one stick + dual
-/// trackpads + two grip paddles. Honored only where available (Linux hosts); else Xbox 360.
+/// UHID classic Steam Controller (`hid-steam`): one stick + dual trackpads + two
+/// grip paddles. Linux only; else Xbox 360.
 pub const PUNKTFUNK_GAMEPAD_STEAMCONTROLLER: u32 = 5;
-/// Steam Deck controller (Valve `28DE:1205`): full Deck gamepad incl. the four back grips, both
-/// trackpads, and the IMU; re-grabbed by Steam Input with native glyphs when Steam runs on the
-/// host. Honored on Linux AND Windows hosts; else folds to X-Box 360.
+/// Steam Deck controller: four back grips, both trackpads, IMU. Steam Input
+/// re-grabs with native glyphs when Steam runs on the host. Linux/Windows; else X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_STEAMDECK: u32 = 6;
-/// DualSense Edge (Sony `054C:0DF2`): the DualSense plus two back buttons + two Fn buttons, so a
-/// client's back paddles land on native slots. Honored on Linux (UHID `hid-playstation`) and
-/// Windows (UMDF) hosts; otherwise the host falls back to X-Box 360.
+/// DualSense Edge: DualSense plus two back buttons + two Fn buttons, so client
+/// paddles land on native slots. Linux UHID / Windows UMDF; else X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_DUALSENSEEDGE: u32 = 7;
-/// Nintendo Switch Pro Controller (Nintendo `057E:2009`, kernel `hid-nintendo`): Nintendo glyphs +
-/// positional layout, gyro/accel, HD rumble. Honored only where available (Linux hosts, UHID
-/// `hid-nintendo`); otherwise the host falls back to X-Box 360.
+/// Nintendo Switch Pro: Nintendo glyphs + positional layout, gyro/accel, HD rumble.
+/// Linux UHID `hid-nintendo` only; else X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_SWITCHPRO: u32 = 8;
-/// New Steam Controller (2026, Valve `28DE:1302`) passed through AS-IS: the host mirrors the
-/// client's raw Triton input reports out of a virtual SC2 with the real identity, and Steam's
-/// hidraw writes (lizard mode, IMU enable, rumble/haptics) come back raw for the physical pad.
-/// Steam Input is the consumer (no kernel driver binds the PID). Honored on Linux (UHID);
-/// else folds to X-Box 360.
+/// Steam Controller 2 as-is passthrough. Linux UHID; else X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2: u32 = 9;
-/// Steam Controller Puck dongle (`28DE:1304`) passed through with its native seven-interface
-/// topology and four controller slots. Used by capture clients that own the physical Puck;
-/// ordinary wired/BLE SC2 capture remains `STEAMCONTROLLER2`.
+/// Steam Controller Puck dongle: native seven-interface topology, four slots.
+/// For capture clients that own the physical Puck; wired/BLE SC2 stays `STEAMCONTROLLER2`.
 pub const PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2_PUCK: u32 = 10;
-/// Xbox Elite Wireless Controller Series 2 (`045E:0B22`, Bluetooth): a Windows-only HID identity
-/// through the UMDF minidriver, so glyphs and the device name read Elite. Folds to X-Box 360
-/// elsewhere. ⚠️ Identity only — the four paddles still fold/drop exactly as on the other X-Box
-/// classes (`DUALSENSEEDGE` is the pad with native back-button slots).
+/// Xbox Elite identity (Windows UMDF). Identity only — paddles still fold. Else X-Box 360.
 pub const PUNKTFUNK_GAMEPAD_XBOXELITE: u32 = 11;
 
-/// Extended `InputEvent` gamepad button bits for embedders building raw events: the four back grips
-/// (Steam L4/L5/R4/R5 ≙ Xbox-Elite P1–P4) + the misc/capture button, in Moonlight's
-/// `buttonFlags2 << 16` namespace. Mirror `input::gamepad::BTN_PADDLE1..4` / `BTN_MISC1`.
+/// Extended `InputEvent` gamepad button bits: four back grips (Steam L4/L5/R4/R5 ≙
+/// Xbox-Elite P1–P4) + misc/capture, in Moonlight's `buttonFlags2 << 16` namespace.
+/// Mirror `input::gamepad::BTN_PADDLE1..4` / `BTN_MISC1`.
 pub const PUNKTFUNK_GAMEPAD_BTN_PADDLE1: u32 = 0x0001_0000;
 pub const PUNKTFUNK_GAMEPAD_BTN_PADDLE2: u32 = 0x0002_0000;
 pub const PUNKTFUNK_GAMEPAD_BTN_PADDLE3: u32 = 0x0004_0000;
 pub const PUNKTFUNK_GAMEPAD_BTN_PADDLE4: u32 = 0x0008_0000;
 pub const PUNKTFUNK_GAMEPAD_BTN_MISC1: u32 = 0x0020_0000;
 
-/// Connect to a `punktfunk/1` host and start a session at `width`x`height`@`refresh_hz`.
-/// Blocks up to `timeout_ms` for the handshake. Returns NULL on failure. Equivalent to
-/// [`punktfunk_connect_ex`] with `compositor = PUNKTFUNK_COMPOSITOR_AUTO`.
+/// Connect to a `punktfunk/1` host at `width`x`height`@`refresh_hz`. Blocks up to
+/// `timeout_ms`. NULL on failure. Same as [`punktfunk_connect_ex`] with
+/// `compositor = PUNKTFUNK_COMPOSITOR_AUTO`.
 ///
-/// Video-capability bit for [`punktfunk_connect_ex5`] (`video_caps`): the client can decode a
-/// 10-bit (Main10) HEVC stream. (Mirrors `quic::VIDEO_CAP_10BIT`.)
+/// Video-capability bit for [`punktfunk_connect_ex5`]: the client can decode
+/// 10-bit (Main10) HEVC.
 pub const PUNKTFUNK_VIDEO_CAP_10BIT: u8 = 0x01;
-/// Video-capability bit for [`punktfunk_connect_ex5`] (`video_caps`): the client can present
-/// BT.2020 PQ HDR10 (implies 10-bit). (Mirrors `quic::VIDEO_CAP_HDR`.)
+/// Video-capability bit: the client can present BT.2020 PQ HDR10 (implies 10-bit).
 pub const PUNKTFUNK_VIDEO_CAP_HDR: u8 = 0x02;
-/// Video-capability bit for [`punktfunk_connect_ex5`] (`video_caps`): the client can decode a
-/// full-chroma 4:4:4 HEVC stream (Range Extensions). The host emits 4:4:4 only when this is set,
-/// the host opted in, the codec is HEVC, and the GPU supports it — else the stream stays 4:2:0 and
-/// [`punktfunk_connection_chroma_format`] reports the real value. (Mirrors `quic::VIDEO_CAP_444`.)
+/// Video-capability bit: the client can decode full-chroma 4:4:4 HEVC. The host
+/// emits 4:4:4 only when this is set, the host opted in, the codec is HEVC, and
+/// the GPU supports it — else 4:2:0. Read [`punktfunk_connection_chroma_format`].
 pub const PUNKTFUNK_VIDEO_CAP_444: u8 = 0x04;
 
-/// Codec bit for [`punktfunk_connect_ex7`] (`video_codecs` / `preferred_codec`) and the value
-/// [`punktfunk_connection_codec`] returns: H.264 / AVC. (Mirrors `quic::CODEC_H264`.)
+/// Codec bit for [`punktfunk_connect_ex7`] and [`punktfunk_connection_codec`]: H.264 / AVC.
 pub const PUNKTFUNK_CODEC_H264: u8 = 0x01;
-/// Codec bit: H.265 / HEVC — the default codec. (Mirrors `quic::CODEC_HEVC`.)
+/// Codec bit: H.265 / HEVC — the default codec.
 pub const PUNKTFUNK_CODEC_HEVC: u8 = 0x02;
-/// Codec bit: AV1. (Mirrors `quic::CODEC_AV1`.)
+/// Codec bit: AV1.
 pub const PUNKTFUNK_CODEC_AV1: u8 = 0x04;
-/// Codec bit: PyroWave — the opt-in wired-LAN intra-only wavelet codec. Never auto-selected:
-/// the host picks it ONLY when the client also passes it as `preferred_codec`
-/// (design/pyrowave-codec-plan.md §3). (Mirrors `quic::CODEC_PYROWAVE`.)
+/// PyroWave. Never auto-selected; pass it as `preferred_codec` (`design/pyrowave-codec-plan.md`).
 pub const PUNKTFUNK_CODEC_PYROWAVE: u8 = 0x08;
 
-/// Host-capability bit in [`punktfunk_connection_host_caps`]: the host applies gamepad-state
-/// snapshots (a capable client sends full-state snapshots instead of per-transition events).
-/// (Mirrors `quic::HOST_CAP_GAMEPAD_STATE`.)
+/// Host-capability bit: the host applies gamepad-state snapshots (a capable client
+/// sends full-state snapshots instead of per-transition events).
 pub const PUNKTFUNK_HOST_CAP_GAMEPAD_STATE: u8 = 0x01;
-/// Host-capability bit in [`punktfunk_connection_host_caps`]: the host supports the shared
-/// clipboard, so a client may offer the toggle. (Mirrors `quic::HOST_CAP_CLIPBOARD`.)
+/// Host-capability bit: the host supports the shared clipboard; a client may offer the toggle.
 pub const PUNKTFUNK_HOST_CAP_CLIPBOARD: u8 = 0x02;
-/// Host-capability bit in [`punktfunk_connection_host_caps`]: the host injects full-fidelity
-/// stylus input, so a capable client splits pen contacts out of its touch path and sends them
-/// via [`punktfunk_connection_send_pen`]; without the bit that call returns `Unsupported` and
-/// the client keeps its pen-as-touch fallback. (Mirrors `quic::HOST_CAP_PEN`;
-/// design/pen-tablet-input.md.)
+/// Host injects stylus. Without it [`punktfunk_connection_send_pen`] is `Unsupported`.
+/// (`design/pen-tablet-input.md`.)
 pub const PUNKTFUNK_HOST_CAP_PEN: u8 = 0x10;
-/// Host-capability bit in [`punktfunk_connection_host_caps`]: the host can capture per-gamepad
-/// audio (DualSense voice-coil haptics + speaker) and emit it on the 0xD1 plane toward pads
-/// declared capable via [`punktfunk_connection_set_pad_audio_caps`]. Set only when the client
-/// asked via [`PUNKTFUNK_CLIENT_CAP_PAD_AUDIO`]. (Mirrors `quic::HOST_CAP_PAD_AUDIO`.)
+/// Host-capability bit: per-gamepad audio (DualSense voice-coil + speaker) on
+/// the 0xD1 plane toward pads declared via [`punktfunk_connection_set_pad_audio_caps`].
+/// Set only when the client asked via [`PUNKTFUNK_CLIENT_CAP_PAD_AUDIO`].
 pub const PUNKTFUNK_HOST_CAP_PAD_AUDIO: u8 = 0x40;
-/// Host-capability bit in [`punktfunk_connection_host_caps`]: the host resolved this session onto
-/// the LOSSLESS audio plane (`0xD3`) instead of Opus. Set only when the client asked via
-/// [`punktfunk_connect_ex11`]; it is a statement about the wire, not an offer to decline — the
-/// session runs one plane or the other for its whole life.
-///
-/// A C embedder needs it for exactly one thing: telling the two planes apart when it drains raw
-/// frames through [`punktfunk_connection_next_audio`], because a 48 kHz/16-bit lossless session
-/// and a 48 kHz Opus session report identical rate, depth and channels. Embedders on
-/// [`punktfunk_connection_next_audio_pcm`] never need it — core decodes both planes behind it —
-/// but they should still read [`punktfunk_connection_audio_sample_rate`] to size their ring.
-/// (Mirrors `quic::HOST_CAP_AUDIO_HIRES`.)
+/// Session is on lossless `0xD3`, not Opus. Distinguishes 48 kHz/16-bit PCM from
+/// 48 kHz Opus when draining [`punktfunk_connection_next_audio`]. PCM decode path
+/// does not need it; still read [`punktfunk_connection_audio_sample_rate`].
 pub const PUNKTFUNK_HOST_CAP_AUDIO_HIRES: u8 = 0x80;
 
-/// Host-capability bit in [`punktfunk_connection_host_caps2`] (the SECOND byte): the host's
-/// injector puts wire touch contacts on its desktop. A client offering a touch-passthrough model
-/// tests this before routing fingers as contacts; without the bit it should fall back to a
-/// cursor model and say so, because the host drops every contact silently. (Mirrors
-/// `quic::HOST_CAP2_TOUCH`.)
+/// Host-capability bit in [`punktfunk_connection_host_caps2`] (second byte): the
+/// host injector puts wire touch contacts on its desktop. Without the bit, fall
+/// back to a cursor model — the host drops every contact silently.
 pub const PUNKTFUNK_HOST_CAP2_TOUCH: u8 = 0x02;
 
-/// Pad-audio `kind` ([`punktfunk_connection_next_pad_audio`]): the BACK channel pair — DualSense
-/// voice-coil haptics, 5 ms Opus frames. (Mirrors `quic::PAD_AUDIO_KIND_HAPTICS`.)
+/// Pad-audio `kind` ([`punktfunk_connection_next_pad_audio`]): BACK channel pair —
+/// DualSense voice-coil haptics, 5 ms Opus frames.
 pub const PUNKTFUNK_PAD_AUDIO_KIND_HAPTICS: u8 = 0;
-/// Pad-audio `kind`: the FRONT channel pair — the controller's built-in speaker, 10 ms Opus
-/// frames. (Mirrors `quic::PAD_AUDIO_KIND_SPEAKER`.)
+/// Pad-audio `kind`: FRONT channel pair — the controller's built-in speaker, 10 ms Opus frames.
 pub const PUNKTFUNK_PAD_AUDIO_KIND_SPEAKER: u8 = 1;
 
-/// [`punktfunk_connection_set_pad_audio_caps`] `audio_caps` bit: the pad renders the HAPTICS
-/// stream (a real DualSense's voice coils).
+/// [`punktfunk_connection_set_pad_audio_caps`] bit: the pad renders the HAPTICS stream
+/// (DualSense voice coils).
 pub const PUNKTFUNK_PAD_AUDIO_CAP_HAPTICS: u8 = 0x01;
-/// [`punktfunk_connection_set_pad_audio_caps`] `audio_caps` bit: the pad renders the SPEAKER
-/// stream.
+/// [`punktfunk_connection_set_pad_audio_caps`] bit: the pad renders the SPEAKER stream.
 pub const PUNKTFUNK_PAD_AUDIO_CAP_SPEAKER: u8 = 0x02;
 
-// Keep the ABI cap bits in lockstep with the wire constants (compile-time guard against drift).
+// ABI cap bits must match the wire constants.
 #[cfg(feature = "quic")]
 const _: () = {
     assert!(PUNKTFUNK_VIDEO_CAP_10BIT == crate::quic::VIDEO_CAP_10BIT);
@@ -1806,8 +1479,7 @@ const _: () = {
     assert!(PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO == crate::quic::CLIENT_CAP_KEEP_HOST_AUDIO);
     assert!(PUNKTFUNK_PAD_AUDIO_KIND_HAPTICS == crate::quic::PAD_AUDIO_KIND_HAPTICS);
     assert!(PUNKTFUNK_PAD_AUDIO_KIND_SPEAKER == crate::quic::PAD_AUDIO_KIND_SPEAKER);
-    // The setter's caps bits are the arrival flags bits 8/9 shifted down (the wire packing
-    // `input::encode_gamepad_arrival` applies).
+    // Setter cap bits are arrival flags 8/9 shifted down.
     assert!(
         (PUNKTFUNK_PAD_AUDIO_CAP_HAPTICS as u32) << 8
             == crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS
@@ -1826,7 +1498,7 @@ const _: () = {
     assert!(PUNKTFUNK_PEN_DISTANCE_UNKNOWN == crate::quic::PEN_DISTANCE_UNKNOWN);
 };
 
-// Keep the ABI gamepad constants in lockstep with the wire enum (compile-time guard against drift).
+// ABI gamepad constants must match the wire enum.
 const _: () = {
     use crate::config::GamepadPref;
     use crate::input::gamepad as g;
@@ -1852,32 +1524,27 @@ const _: () = {
     assert!(PUNKTFUNK_GAMEPAD_BTN_MISC1 == g::BTN_MISC1);
 };
 
-// Neither struct has a `struct_size` guard, so a layout change corrupts old-built callers'
-// buffers — an ADDITIVE kind (the M3 TouchpadEx / TrackpadHaptic precedent) must never grow
-// them, and any deliberate widening has to arrive with an [`crate::ABI_VERSION`] bump so the
-// version equality check is what an old binary fails, not a memory write.
-// `PunktfunkRichInput` is frozen at its original 20 bytes. `PunktfunkHidOutput` was widened
-// ONCE, deliberately, with ABI v27 (19 → 85: the `hid_kind`/`raw_len`/`raw` tail for
-// `PUNKTFUNK_HIDOUT_HID_RAW`, appended so the pre-v27 prefix layout is unchanged) — see the v27
-// entry on [`crate::ABI_VERSION`] for why a new pull symbol was NOT the right shape there.
+// No `struct_size`: growing these corrupts old callers. Additive kinds must not
+// grow them; a deliberate widen needs an [`crate::ABI_VERSION`] bump. RichInput
+// is frozen at 20. HidOutput is 19 + 2 + `HID_REPORT_MAX`.
 #[cfg(feature = "quic")]
 const _: () = {
     assert!(core::mem::size_of::<PunktfunkRichInput>() == 20);
     assert!(core::mem::size_of::<PunktfunkHidOutput>() == 19 + 2 + crate::quic::HID_REPORT_MAX);
 };
 
-/// Trust: `pin_sha256` (NULL or 32 bytes) is the expected SHA-256 fingerprint of the host's
-/// certificate — a mismatching host is rejected. NULL = trust on first use; persist the
-/// fingerprint written to `observed_sha256_out` (NULL or 32 bytes, filled on success) and
-/// pass it as the pin on every later connect.
+/// Trust: `pin_sha256` (NULL or 32 bytes) is the expected SHA-256 of the host
+/// certificate — a mismatch is rejected. NULL = trust on first use; persist
+/// `observed_sha256_out` (NULL or 32 bytes, filled on success) and pass it as
+/// the pin on every later connect.
 ///
-/// Identity: `client_cert_pem`/`client_key_pem` (both NULL, or both NUL-terminated PEM
-/// strings — see [`punktfunk_generate_identity`]) are presented via TLS client auth so a
-/// host can recognize this client once paired ([`punktfunk_pair`]). NULL = anonymous;
-/// hosts running `--require-pairing` reject anonymous sessions.
+/// Identity: `client_cert_pem`/`client_key_pem` (both NULL, or both NUL-terminated
+/// PEM — [`punktfunk_generate_identity`]) are TLS client auth so a host can
+/// recognize this client once paired ([`punktfunk_pair`]). NULL = anonymous;
+/// `--require-pairing` hosts reject anonymous sessions.
 ///
 /// # Safety
-/// `host` is a NUL-terminated UTF-8 string (IP or hostname resolvable by the platform);
+/// `host` is a NUL-terminated UTF-8 string (IP or resolvable hostname);
 /// `pin_sha256`/`observed_sha256_out` are each NULL or valid for 32 bytes;
 /// `client_cert_pem`/`client_key_pem` are each NULL or NUL-terminated UTF-8.
 #[cfg(feature = "quic")]
@@ -1894,8 +1561,7 @@ pub unsafe extern "C" fn punktfunk_connect(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
-    // applies the same ABI contract to them; this shim dereferences nothing itself.
+    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
     unsafe {
         punktfunk_connect_ex(
             host,
@@ -1913,11 +1579,9 @@ pub unsafe extern "C" fn punktfunk_connect(
     }
 }
 
-/// Like [`punktfunk_connect`], but requests a specific `compositor` backend on the host (one of
-/// the `PUNKTFUNK_COMPOSITOR_*` values). `PUNKTFUNK_COMPOSITOR_AUTO` (or any unrecognized value)
-/// lets the host decide; a concrete value is honored only if available, else the host falls back
-/// to auto-detect. The resolved choice is logged host-side and returned over the protocol.
-/// Equivalent to [`punktfunk_connect_ex2`] with `gamepad = PUNKTFUNK_GAMEPAD_AUTO`.
+/// [`punktfunk_connect`] plus a `compositor` (`PUNKTFUNK_COMPOSITOR_*`). `AUTO`
+/// (or unrecognized) lets the host decide; a concrete value is honored only if
+/// available. Same as [`punktfunk_connect_ex2`] with `gamepad = PUNKTFUNK_GAMEPAD_AUTO`.
 ///
 /// # Safety
 /// Same as [`punktfunk_connect`].
@@ -1936,8 +1600,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
-    // applies the same ABI contract to them; this shim dereferences nothing itself.
+    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
     unsafe {
         punktfunk_connect_ex2(
             host,
@@ -1956,12 +1619,10 @@ pub unsafe extern "C" fn punktfunk_connect_ex(
     }
 }
 
-/// Like [`punktfunk_connect_ex`], but additionally requests which virtual `gamepad` backend the
-/// host creates for this session's pads (one of the `PUNKTFUNK_GAMEPAD_*` values).
-/// `PUNKTFUNK_GAMEPAD_AUTO` (or any unrecognized value) lets the host decide (its
-/// `PUNKTFUNK_GAMEPAD` env var, else X-Box 360); a concrete value is honored only if that
-/// backend is available on the host. The resolved choice is readable via
-/// [`punktfunk_connection_gamepad`] — only a DualSense session emits HID-output feedback.
+/// [`punktfunk_connect_ex`] plus a virtual `gamepad` (`PUNKTFUNK_GAMEPAD_*`).
+/// `AUTO` (or unrecognized) lets the host decide (`PUNKTFUNK_GAMEPAD` env, else
+/// X-Box 360). Resolved via [`punktfunk_connection_gamepad`]. Only DualSense
+/// emits HID-output feedback.
 ///
 /// # Safety
 /// Same as [`punktfunk_connect`].
@@ -1981,8 +1642,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex2(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
-    // applies the same ABI contract to them; this shim dereferences nothing itself.
+    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
     unsafe {
         punktfunk_connect_ex3(
             host,
@@ -1992,7 +1652,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex2(
             refresh_hz,
             compositor,
             gamepad,
-            0, // bitrate_kbps = 0: let the host pick its default
+            0, // bitrate_kbps = 0: host default
             pin_sha256,
             observed_sha256_out,
             client_cert_pem,
@@ -2002,11 +1662,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex2(
     }
 }
 
-/// Like [`punktfunk_connect_ex2`], but additionally requests the video encoder `bitrate_kbps`
-/// (kilobits per second). `0` lets the host pick its default; any other value is clamped to the
-/// host's supported range. After a speed test ([`punktfunk_connection_speed_test`]) a client can
-/// reconnect (or pick at connect time) with the measured rate. The value the host actually
-/// configured is readable via [`punktfunk_connection_bitrate`].
+/// [`punktfunk_connect_ex2`] plus encoder `bitrate_kbps`. `0` = host default;
+/// other values clamp to the host range. Read [`punktfunk_connection_bitrate`].
 ///
 /// # Safety
 /// Same as [`punktfunk_connect`].
@@ -2027,9 +1684,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex3(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
-    // Delegate to the launch-aware variant with no game requested (the host's default session).
-    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
-    // applies the same ABI contract to them; this shim dereferences nothing itself.
+    // No game requested: the host's default session.
+    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
     unsafe {
         punktfunk_connect_ex4(
             host,
@@ -2050,14 +1706,12 @@ pub unsafe extern "C" fn punktfunk_connect_ex3(
     }
 }
 
-/// Like [`punktfunk_connect_ex3`], but additionally asks the host to launch a library title in
-/// this session. `launch_id` is a store-qualified [`crate::library`-style] id as returned by the
-/// host's `GET /api/v1/library` (`steam:<appid>` / `custom:<id>`); the host resolves it against
-/// its OWN library and runs the matching recipe — the client never sends a raw command. `NULL`
-/// (or an empty / unknown id) ⇒ the host's default session, no game launched.
+/// [`punktfunk_connect_ex3`] plus a library title. `launch_id` is a store-qualified
+/// id (`steam:<appid>` / `custom:<id>`); the host resolves it against its own
+/// library. `NULL` / empty / unknown ⇒ default session, no game.
 ///
 /// # Safety
-/// Same as [`punktfunk_connect`]; `launch_id`, when non-NULL, must be a NUL-terminated C string.
+/// Same as [`punktfunk_connect`]; non-NULL `launch_id` is a NUL-terminated C string.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connect_ex4(
@@ -2076,10 +1730,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex4(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
-    // Back-compat: ex4 advertises no video caps (8-bit BT.709 SDR). HDR-capable embedders call
-    // `punktfunk_connect_ex5` with the cap bits.
-    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
-    // applies the same ABI contract to them; this shim dereferences nothing itself.
+    // No video caps: 8-bit BT.709 SDR. HDR embedders pass bits via `ex5`.
+    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
     unsafe {
         punktfunk_connect_ex5(
             host,
@@ -2101,16 +1753,12 @@ pub unsafe extern "C" fn punktfunk_connect_ex4(
     }
 }
 
-/// Like [`punktfunk_connect_ex4`], but additionally advertises the embedder's video decode/present
-/// capabilities as `video_caps` — a bitfield of `PUNKTFUNK_VIDEO_CAP_10BIT` (can decode 10-bit
-/// Main10) and `PUNKTFUNK_VIDEO_CAP_HDR` (can present BT.2020 PQ HDR10). The host upgrades to a
-/// 10-bit / HDR encode ONLY when the matching bit is set (and the host opted in); `0` keeps the
-/// 8-bit BT.709 SDR stream. After connecting, read the resolved colour via
-/// [`punktfunk_connection_color_info`] and drain the mastering metadata via
-/// [`punktfunk_connection_next_hdr_meta`].
+/// [`punktfunk_connect_ex4`] plus `video_caps` (`PUNKTFUNK_VIDEO_CAP_*`).
+/// Host upgrades only when the bit is set. Read colour via
+/// [`punktfunk_connection_color_info`] / [`punktfunk_connection_next_hdr_meta`].
 ///
 /// # Safety
-/// Same as [`punktfunk_connect`]; `launch_id`, when non-NULL, must be a NUL-terminated C string.
+/// Same as [`punktfunk_connect`]; non-NULL `launch_id` is a NUL-terminated C string.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
@@ -2131,9 +1779,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex5(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
-    // Delegate to the surround-aware variant requesting stereo (the pre-surround behaviour).
-    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
-    // applies the same ABI contract to them; this shim dereferences nothing itself.
+    // Stereo (2 channels). Surround embedders pass 6/8 via `ex6`.
+    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
     unsafe {
         punktfunk_connect_ex6(
             host,
@@ -2156,11 +1803,10 @@ pub unsafe extern "C" fn punktfunk_connect_ex5(
     }
 }
 
-/// Like [`punktfunk_connect_ex5`], but additionally requests the audio channel count:
-/// `2` (stereo, the default behaviour of every earlier variant), `6` (5.1) or `8` (7.1). The host
-/// clamps the request to what it can actually capture and echoes the resolved count via
-/// [`punktfunk_connection_audio_channels`]. Advertises HEVC-only with no codec preference (call
-/// [`punktfunk_connect_ex7`] to negotiate the codec).
+/// [`punktfunk_connect_ex5`] plus audio channel count: `2` (stereo), `6` (5.1) or
+/// `8` (7.1). Host clamps to what it can capture; read
+/// [`punktfunk_connection_audio_channels`]. Advertises HEVC-only, no codec
+/// preference ([`punktfunk_connect_ex7`] negotiates).
 ///
 /// # Safety
 /// Same as [`punktfunk_connect`].
@@ -2185,8 +1831,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex6(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
-    // applies the same ABI contract to them; this shim dereferences nothing itself.
+    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
     unsafe {
         punktfunk_connect_ex7(
             host,
@@ -2199,7 +1844,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex6(
             bitrate_kbps,
             video_caps,
             audio_channels,
-            PUNKTFUNK_CODEC_HEVC, // pre-negotiation default: HEVC-only, no preference
+            PUNKTFUNK_CODEC_HEVC, // HEVC-only, no preference
             0,
             launch_id,
             pin_sha256,
@@ -2211,12 +1856,9 @@ pub unsafe extern "C" fn punktfunk_connect_ex6(
     }
 }
 
-/// Like [`punktfunk_connect_ex6`], but additionally advertises the codecs the client can decode
-/// (`video_codecs` — a bitfield of [`PUNKTFUNK_CODEC_H264`] / [`PUNKTFUNK_CODEC_HEVC`] /
-/// [`PUNKTFUNK_CODEC_AV1`]) and a soft `preferred_codec` (a single codec bit, `0` = no preference).
-/// The host resolves the codec it emits from these (preference honored when it can also produce it,
-/// else best shared codec) and reports it via [`punktfunk_connection_codec`]. A client that omits
-/// this (calls `ex6`) advertises HEVC-only, no preference — the pre-negotiation behaviour.
+/// [`punktfunk_connect_ex6`] plus `video_codecs` (`PUNKTFUNK_CODEC_*` bits) and a
+/// soft `preferred_codec` (one codec bit, `0` = none). Host honors preference when
+/// it can produce it, else best shared codec. Read [`punktfunk_connection_codec`].
 ///
 /// # Safety
 /// Same as [`punktfunk_connect`].
@@ -2243,13 +1885,12 @@ pub unsafe extern "C" fn punktfunk_connect_ex7(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
-    // applies the same ABI contract to them; this shim dereferences nothing itself.
+    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
     unsafe {
         connect_ex_impl(
             host,
             port,
-            0, // pre-v11 variant: no client caps
+            0, // no client caps
             width,
             height,
             refresh_hz,
@@ -2265,12 +1906,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex7(
             observed_sha256_out,
             client_cert_pem,
             client_key_pem,
-            std::ptr::null(), // pre-v21 variant: no device name, so the OS default stands
-            // pre-v24 variant: the audio format is UNSPECIFIED (0/0), not "48 kHz/16-bit". The
-            // distinction is load-bearing — `advertised_client_caps` reads any non-zero value as
-            // "the caller asked for the lossless plane", so passing an explicit 48 000/16 here
-            // would make every legacy C embedder start requesting it. 0/0 is what keeps this
-            // variant's Hello byte-identical to what it has always sent.
+            std::ptr::null(), // no device name: OS default
+            // 0/0 = unspecified (Opus). Any non-zero rate/bits is a lossless ask.
             0,
             0,
             timeout_ms,
@@ -2279,16 +1916,11 @@ pub unsafe extern "C" fn punktfunk_connect_ex7(
     }
 }
 
-/// Like [`punktfunk_connect_ex7`], but additionally reports WHY a failed connect failed:
-/// `status_out` (nullable — null is exactly `ex7`) receives a [`PunktfunkStatus`] as `i32` —
-/// `Ok` on success, the mapped error otherwise, including the typed host-rejection block
-/// (`PUNKTFUNK_STATUS_REJECTED_NOT_ARMED` … `PUNKTFUNK_STATUS_REJECTED_BUSY`) decoded from the
-/// host's application close. That lets an embedder tell "denied in the console" / "nobody
-/// approved in time" / "host busy" / "versions don't match" apart from plain unreachability
-/// (`Io`/`Timeout`) — a NULL return alone can't say which.
+/// [`punktfunk_connect_ex7`] plus `status_out` (nullable): the mapped
+/// [`PunktfunkStatus`], including typed host rejections. NULL alone cannot say why.
 ///
 /// # Safety
-/// Same as [`punktfunk_connect`]; `status_out`, when non-null, must point to a writable `i32`.
+/// Same as [`punktfunk_connect`]; non-null `status_out` points to a writable `i32`.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
@@ -2313,13 +1945,12 @@ pub unsafe extern "C" fn punktfunk_connect_ex8(
     timeout_ms: u32,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
-    // applies the same ABI contract to them; this shim dereferences nothing itself.
+    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
     unsafe {
         connect_ex_impl(
             host,
             port,
-            0, // pre-v11 variant: no client caps
+            0, // no client caps
             width,
             height,
             refresh_hz,
@@ -2335,12 +1966,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex8(
             observed_sha256_out,
             client_cert_pem,
             client_key_pem,
-            std::ptr::null(), // pre-v21 variant: no device name, so the OS default stands
-            // pre-v24 variant: the audio format is UNSPECIFIED (0/0), not "48 kHz/16-bit". The
-            // distinction is load-bearing — `advertised_client_caps` reads any non-zero value as
-            // "the caller asked for the lossless plane", so passing an explicit 48 000/16 here
-            // would make every legacy C embedder start requesting it. 0/0 is what keeps this
-            // variant's Hello byte-identical to what it has always sent.
+            std::ptr::null(), // no device name: OS default
+            // 0/0 = unspecified (Opus). Any non-zero rate/bits is a lossless ask.
             0,
             0,
             timeout_ms,
@@ -2349,12 +1976,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex8(
     }
 }
 
-/// Like [`punktfunk_connect_ex8`], plus `client_caps` (ABI v11): a bitfield of
-/// `PUNKTFUNK_CLIENT_CAP_CURSOR` (0x01). Setting the cursor bit asks the host to STOP
-/// compositing the pointer into the video and forward it out-of-band instead — the embedder
-/// MUST then drain [`punktfunk_connection_next_cursor_shape`] /
-/// [`punktfunk_connection_next_cursor_state`] and draw the pointer itself, or the session has
-/// no visible cursor at all. Pass 0 for the composited behavior of every earlier variant.
+/// [`punktfunk_connect_ex8`] plus `client_caps`. Cursor bit: host stops compositing;
+/// the embedder must drain shape/state or there is no pointer. Pass 0 for composited.
 ///
 /// # Safety
 /// Same as [`punktfunk_connect_ex8`].
@@ -2383,8 +2006,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex9(
     timeout_ms: u32,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
-    // applies the same ABI contract to them; this shim dereferences nothing itself.
+    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
     unsafe {
         connect_ex_impl(
             host,
@@ -2405,12 +2027,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex9(
             observed_sha256_out,
             client_cert_pem,
             client_key_pem,
-            std::ptr::null(), // pre-v21 variant: no device name, so the OS default stands
-            // pre-v24 variant: the audio format is UNSPECIFIED (0/0), not "48 kHz/16-bit". The
-            // distinction is load-bearing — `advertised_client_caps` reads any non-zero value as
-            // "the caller asked for the lossless plane", so passing an explicit 48 000/16 here
-            // would make every legacy C embedder start requesting it. 0/0 is what keeps this
-            // variant's Hello byte-identical to what it has always sent.
+            std::ptr::null(), // no device name: OS default
+            // 0/0 = unspecified (Opus). Any non-zero rate/bits is a lossless ask.
             0,
             0,
             timeout_ms,
@@ -2419,23 +2037,12 @@ pub unsafe extern "C" fn punktfunk_connect_ex9(
     }
 }
 
-/// Like [`punktfunk_connect_ex9`], plus `device_name` (ABI v21): the human-readable label this
-/// device knocks with — what the host's **pending-approval** list (and the web console's
-/// outstanding-pairings view and its approve dialog) shows for an unpaired client, and what the
-/// trust store files it under once approved. Pass the name the user already recognises this
-/// device by: `Host.current().localizedName` on macOS, `UIDevice.current.name` on iOS/tvOS,
-/// `Settings.Global.DEVICE_NAME` on Android.
-///
-/// NULL / empty = the [`crate::client::device_name`] default, exactly as every earlier variant.
-/// That default is an OS hostname, which no Apple GUI process could reach until v21 — every one
-/// of them knocked as the literal "This device", so a console with three of them pending showed
-/// three identical rows. Longer than [`crate::quic::HELLO_NAME_MAX`] bytes of UTF-8 is truncated
-/// (on a character boundary) rather than rejected: a too-long label is a cosmetic problem, and
-/// failing a connect over it would be a much worse one.
+/// [`punktfunk_connect_ex9`] plus `device_name` — the label this device knocks
+/// with. NULL/empty = [`crate::client::device_name`]. Longer than
+/// [`HELLO_NAME_MAX`] is truncated on a character boundary, not rejected.
 ///
 /// # Safety
-/// Same as [`punktfunk_connect_ex9`]; `device_name`, when non-null, must be a NUL-terminated C
-/// string that stays valid for the duration of the call.
+/// Same as [`punktfunk_connect_ex9`]; non-null `device_name` is a NUL-terminated C string.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
@@ -2462,8 +2069,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex10(
     timeout_ms: u32,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
-    // applies the same ABI contract to them; this shim dereferences nothing itself.
+    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
     unsafe {
         connect_ex_impl(
             host,
@@ -2485,11 +2091,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex10(
             client_cert_pem,
             client_key_pem,
             device_name,
-            // pre-v24 variant: the audio format is UNSPECIFIED (0/0), not "48 kHz/16-bit". The
-            // distinction is load-bearing — `advertised_client_caps` reads any non-zero value as
-            // "the caller asked for the lossless plane", so passing an explicit 48 000/16 here
-            // would make every legacy C embedder start requesting it. 0/0 is what keeps this
-            // variant's Hello byte-identical to what it has always sent.
+            // 0/0 = unspecified (Opus). Any non-zero rate/bits is a lossless ask.
             0,
             0,
             timeout_ms,
@@ -2498,51 +2100,15 @@ pub unsafe extern "C" fn punktfunk_connect_ex10(
     }
 }
 
-/// Like [`punktfunk_connect_ex10`], plus the audio format this client is **asking** for (ABI v24):
-/// `audio_rate_hz` — `48000`, `96000`, or the 44.1 kHz family `44100` / `88200` / `176400` — and
-/// `audio_bits` (`16` or `24`).
+/// [`punktfunk_connect_ex10`] plus an audio-format ask (`audio_rate_hz` /
+/// `audio_bits`). Any non-zero pair — including `48000`/`16` — sets
+/// `CLIENT_CAP_AUDIO_HIRES` and asks for lossless `0xD3`. `0`/`0` is unspecified
+/// (Opus). Do not pass 48 kHz/16 as a stand-in for default.
 ///
-/// Passing a format AT ALL — any non-zero `audio_rate_hz`/`audio_bits`, `48000`/`16` included —
-/// sets `CLIENT_CAP_AUDIO_HIRES` in the `Hello` and asks the host for the LOSSLESS `0xD3` plane,
-/// bit-exact PCM instead of Opus. (This line once said "anything other than `48000`/`16`", which
-/// was the rule until the cheapest rung turned out to be the one nobody could ask for; the ⚠ below
-/// is the whole story.) That is an opt-in on both ends, and it is meant to be: it costs
-/// **1.5–4.6 Mbps** taken off the top of the link (audio rides QUIC datagrams outside the ABR
-/// loop, so ABR can neither see it nor reclaim it), against the ~256 kbps Opus this replaces. Only
-/// pass a format when the user turned the feature on AND this embedder can genuinely open an
-/// output device at it.
-///
-/// **The request is not the answer.** The host runs a five-condition gate
-/// (`design/hi-res-audio.md` §8.4 — client asked, operator policy allows, stereo, the capture
-/// path can *really* deliver the rate, and the link can afford it) and any failure resolves the
-/// session back to Opus at 48 kHz. That is not an error and the connect still succeeds. Read
-/// [`punktfunk_connection_audio_sample_rate`] / [`punktfunk_connection_audio_bits`] afterwards
-/// and open the device from THOSE — opening at what you asked for is
-/// `design/hi-res-audio.md` §4.3's failure repeated at the client end.
-///
-/// ⚠ **Passing `48000`/`16` is NOT the same as [`punktfunk_connect_ex10`], and an earlier version
-/// of this comment claimed it was.** `ex10` passes `0`/`0` — *unspecified* — and the capability bit
-/// keys on "the caller specified a format", not on "the format differs from the default". So an
-/// explicit 48 kHz/16-bit is a genuine request for the cheapest lossless rung: the `Hello` carries
-/// [`quic::CLIENT_CAP_AUDIO_HIRES`](crate::quic::CLIENT_CAP_AUDIO_HIRES), the host's gate accepts
-/// 48/16 as a supported format, and a host with the operator policy on will resolve the session
-/// onto the lossless plane at 1.5 Mbps.
-///
-/// That is the intended behaviour — 48/16 would otherwise be the one rung on the ladder nobody
-/// could ask for — but it makes `0`/`0` load-bearing. **An embedder whose user chose "Opus" must
-/// pass `0`/`0` here, or call [`punktfunk_connect_ex10`].** Forwarding a hardcoded 48 000/16 as a
-/// stand-in for "default" silently opts every ordinary session into the lossless plane.
-///
-/// The 44.1 kHz family is on the ladder, and was not always: core's de-jitter policy divided the
-/// rate by 1 000 before it multiplied, which made 44 100 Hz "44 samples per millisecond" and every
-/// buffer figure 2.3 % low, so §4.1 deferred those rates behind fixing that arithmetic. It is
-/// fixed. Note what it does NOT buy: at 44 100 Hz **no** rung of the frame ladder is a whole
-/// number of samples, so [`punktfunk_connection_audio_frame_us`] becomes a nominal length rather
-/// than a duration. An embedder that advances any clock by it runs 0.23 % fast forever; the honest
-/// figure is the samples it actually rendered, divided by
-/// [`punktfunk_connection_audio_sample_rate`].
-///
-/// A NEW symbol, not a widened one — `ex10` keeps its parameter list AND its behaviour.
+/// The host may still resolve Opus (`design/hi-res-audio.md`); open the device
+/// from [`punktfunk_connection_audio_sample_rate`] / `_bits`, not from the ask.
+/// At 44.1 kHz, [`punktfunk_connection_audio_frame_us`] is a nominal length —
+/// advance clocks from samples / rate, not from that figure.
 ///
 /// # Safety
 /// Same as [`punktfunk_connect_ex10`].
@@ -2574,8 +2140,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex11(
     timeout_ms: u32,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
-    // applies the same ABI contract to them; this shim dereferences nothing itself.
+    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
     unsafe {
         connect_ex_impl(
             host,
@@ -2605,52 +2170,32 @@ pub unsafe extern "C" fn punktfunk_connect_ex11(
     }
 }
 
-/// [`punktfunk_connect_ex9`] `client_caps` bit: render the host cursor locally (the cursor
-/// channel, `design/remote-desktop-sweep.md` M2).
+/// [`punktfunk_connect_ex9`] `client_caps` bit: render the host cursor locally
+/// (`design/remote-desktop-sweep.md`).
 pub const PUNKTFUNK_CLIENT_CAP_CURSOR: u8 = 0x01;
 
-/// [`punktfunk_connect_ex9`] `client_caps` bit: this client's presenter is vsync-aware and
-/// feeds [`punktfunk_connection_report_phase`] (design/phase-locked-capture.md). Advisory in
-/// v1 — the host arms on report receipt — but honest advertisement keeps the negotiation
-/// forward-compatible.
+/// [`punktfunk_connect_ex9`] `client_caps` bit: presenter is vsync-aware and
+/// feeds [`punktfunk_connection_report_phase`] (`design/phase-locked-capture.md`).
+/// Advisory: the host arms on report receipt.
 pub const PUNKTFUNK_CLIENT_CAP_PHASE_LOCK: u8 = 0x02;
 
-/// [`punktfunk_connect_ex9`] `client_caps` bit: the client understands the pad-audio plane
-/// (0xD1 — per-gamepad DualSense voice-coil haptics + speaker). The embedder MUST then drain
-/// [`punktfunk_connection_next_pad_audio`] and declare each capable pad via
-/// [`punktfunk_connection_set_pad_audio_caps`]; the host emits pad audio only when it answers
-/// with [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`]. (Mirrors `quic::CLIENT_CAP_PAD_AUDIO`.)
+/// [`punktfunk_connect_ex9`] `client_caps` bit: pad-audio plane (0xD1 — DualSense
+/// voice-coil + speaker). Drain [`punktfunk_connection_next_pad_audio`] and declare
+/// pads via [`punktfunk_connection_set_pad_audio_caps`]. Host emits only with
+/// [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`].
 pub const PUNKTFUNK_CLIENT_CAP_PAD_AUDIO: u8 = 0x08;
 
-/// [`punktfunk_connect_ex9`] `client_caps` bit: ask for the LOSSLESS audio plane (`0xD3`).
-///
-/// **Normally you do not set this by hand** — pass a non-default `audio_rate_hz`/`audio_bits` to
-/// [`punktfunk_connect_ex11`] and core sets it for you, which keeps "the bit" and "the format it
-/// is asking for" from ever disagreeing. The one case that needs it explicitly is asking for
-/// lossless at the DEFAULT 48 kHz/16-bit, whose parameters are indistinguishable from a legacy
-/// request; core ORs the derived bit into what you pass rather than replacing it, so setting it
-/// here works. Do it only if this embedder can genuinely open a 48 kHz/16-bit output and its user
-/// asked for lossless — 1.5 Mbps to sound like transparent 256 kbps Opus is a poor trade, and
-/// 24-bit is where the plane earns its bandwidth. (Mirrors `quic::CLIENT_CAP_AUDIO_HIRES`.)
+/// Ask for lossless `0xD3`. Usually derived from a non-zero `audio_rate_hz`/
+/// `audio_bits` on [`punktfunk_connect_ex11`]. Set by hand only for 48 kHz/16-bit
+/// lossless (indistinguishable from an unspecified ask).
 pub const PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES: u8 = 0x10;
 
-/// [`punktfunk_connect_ex9`] `client_caps` bit: ask the host to leave its OWN audio devices
-/// alone for this session — capture whatever the operator's default playback device already
-/// is, instead of parking the desktop mix on a silent endpoint. The host keeps playing (the
-/// headphones plugged into the host PC stay live) and this client hears the same audio:
-/// Moonlight's "Mute host PC speakers" box, unchecked, per session.
-///
-/// REQUEST-only — there is no host-cap echo. An older host ignores the bit and re-routes as it
-/// always did, which degrades to "audio still works, the host went quiet", so an embedder may
-/// set it unconditionally from its user's setting. (Mirrors `quic::CLIENT_CAP_KEEP_HOST_AUDIO`.)
+/// Keep host speakers live this session (do not park the mix). Request-only;
+/// hosts that do not know the bit ignore it.
 pub const PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO: u8 = 0x20;
 
-/// A [`punktfunk_connect_ex10`] device name cut to what a [`crate::quic::Hello`] carries.
-/// [`crate::quic::HELLO_NAME_MAX`] is a BYTE cap while the cut must land on a character
-/// boundary — "Wohnzimmer-Fernseher überm Sofa" is 33 characters and 34 bytes, and slicing a
-/// name mid-scalar panics. Too long is truncated rather than rejected: the wire encoder would
-/// truncate it anyway, and failing a connect over a cosmetic label would be far worse than
-/// showing a shortened one.
+/// Cut a device name to [`HELLO_NAME_MAX`] bytes on a character boundary.
+/// Truncate, don't reject: a too-long label must not fail connect.
 #[cfg(feature = "quic")]
 fn clamp_device_name(s: &str) -> String {
     let end = s
@@ -2662,30 +2207,15 @@ fn clamp_device_name(s: &str) -> String {
     s[..end].to_string()
 }
 
-/// Every connect option in one **growable** struct — the terminal form of the
-/// [`punktfunk_connect`] … [`punktfunk_connect_ex11`] chain, consumed by
-/// [`punktfunk_connect_opts`]. Eleven generations each minted a new exported symbol to add a
-/// field or two (`ex11` over `ex10`: exactly `audio_rate_hz` + `audio_bits`, for a 24-parameter
-/// signature and a full forwarding shim). This struct ends that: a new option is a new field
-/// appended HERE, guarded by `struct_size` exactly like [`PunktfunkConfig`].
-///
-/// Usage: zero-initialize the whole struct, set `struct_size = sizeof(PunktfunkConnectOpts)`,
-/// then set the fields you mean. Every zero field keeps the auto/legacy behaviour of the `ex`
-/// chain (null pointer = absent, `0` = auto/unspecified) — `audio_rate_hz = 0` is `ex10`'s
-/// UNSPECIFIED audio format, an explicit pair is `ex11`'s hi-res request, so the load-bearing
-/// `ex11`-vs-`ex10` symbol choice becomes a field value.
-///
-/// Growth discipline (for this crate): append only — never reorder, never widen an existing
-/// field; a new field's zero value must mean "unspecified/auto"; keep the struct free of TAIL
-/// padding on both pointer widths (the const asserts below lock 96/68 bytes), so an appended
-/// field can never land inside bytes an older caller's `sizeof` already covered; bump
-/// [`crate::ABI_VERSION`].
+/// Growable connect options for [`punktfunk_connect_opts`]. Zero-init, set
+/// `struct_size = sizeof(PunktfunkConnectOpts)`, then the fields you mean.
+/// Zero = auto/unspecified (`audio_rate_hz = 0` is Opus; a non-zero pair is
+/// lossless). Append only; no tail padding (96/68-byte asserts); bump ABI.
 #[cfg(feature = "quic")]
 #[repr(C)]
 pub struct PunktfunkConnectOpts {
-    /// `sizeof(PunktfunkConnectOpts)` as THIS caller was compiled — the skew guard
-    /// ([`punktfunk_connect_opts`] rejects smaller than the v26 introduction size, and when the
-    /// struct grows, an older caller's shorter size defaults the tail instead of misreading it).
+    /// `sizeof(PunktfunkConnectOpts)` as this caller was compiled. Smaller than
+    /// the frozen minimum is rejected; a shorter prefix defaults the tail.
     pub struct_size: u32,
     /// Required: NUL-terminated UTF-8 IP or hostname (the one non-nullable pointer here).
     pub host: *const std::os::raw::c_char,
@@ -2699,7 +2229,7 @@ pub struct PunktfunkConnectOpts {
     pub client_cert_pem: *const std::os::raw::c_char,
     /// See `client_cert_pem`.
     pub client_key_pem: *const std::os::raw::c_char,
-    /// The label this device knocks with, or null for the OS default
+    /// Label this device knocks with, or null for the OS default
     /// ([`punktfunk_connect_ex10`]).
     pub device_name: *const std::os::raw::c_char,
     /// Requested mode ([`punktfunk_connect`]).
@@ -2712,11 +2242,10 @@ pub struct PunktfunkConnectOpts {
     pub compositor: u32,
     /// `PUNKTFUNK_GAMEPAD_*`; `0`/unrecognized = auto ([`punktfunk_connect_ex2`]).
     pub gamepad: u32,
-    /// Session wire budget in kbps; `0` = the host default ([`punktfunk_connect_ex3`]).
+    /// Session wire budget in kbps; `0` = host default ([`punktfunk_connect_ex3`]).
     pub bitrate_kbps: u32,
-    /// Audio format ask; `0`/`0` = UNSPECIFIED (the legacy Opus path), an explicit pair is a
-    /// hi-res request that derives `PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES`
-    /// ([`punktfunk_connect_ex11`] — including why explicit 48000/16 is a genuine lossless ask).
+    /// Audio format ask; `0`/`0` = unspecified (Opus). An explicit pair — including
+    /// 48000/16 — is lossless and derives `PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES`.
     pub audio_rate_hz: u32,
     /// Connect timeout in milliseconds.
     pub timeout_ms: u32,
@@ -2733,15 +2262,11 @@ pub struct PunktfunkConnectOpts {
     /// The one `PUNKTFUNK_CODEC_*` bit to prefer; `0` = host's choice
     /// ([`punktfunk_connect_ex7`]).
     pub preferred_codec: u8,
-    /// `PUNKTFUNK_CLIENT_CAP_*` bits ([`punktfunk_connect_ex8`]).
+    /// `PUNKTFUNK_CLIENT_CAP_*` bits ([`punktfunk_connect_ex9`]).
     pub client_caps: u8,
 }
 
-// The no-tail-padding lock the growth contract rests on (see the struct doc): if either width's
-// size moves under an edit that meant to change nothing, fields were reordered/widened or tail
-// padding appeared — all append-contract breaks. On APPENDING a field: keep
-// `CONNECT_OPTS_MIN_SIZE` frozen at these v26 values and update these literals to the new
-// (still padding-free) sizes.
+// No tail padding (append contract). On grow: freeze `CONNECT_OPTS_MIN_SIZE`, update these sizes.
 #[cfg(feature = "quic")]
 const _: () = {
     #[cfg(target_pointer_width = "64")]
@@ -2750,26 +2275,25 @@ const _: () = {
     assert!(core::mem::size_of::<PunktfunkConnectOpts>() == 68);
 };
 
-/// The v26 introduction size of [`PunktfunkConnectOpts`] — the MINIMUM `struct_size`
-/// [`punktfunk_connect_opts`] ever accepts. FROZEN: when the struct grows, this stays put so
-/// v26-built callers keep connecting; only the const asserts above move.
+/// Minimum `struct_size` [`punktfunk_connect_opts`] accepts. Frozen: when the
+/// struct grows this stays put so older callers keep connecting; only the size
+/// asserts above move.
 #[cfg(all(feature = "quic", target_pointer_width = "64"))]
 const CONNECT_OPTS_MIN_SIZE: usize = 96;
 #[cfg(all(feature = "quic", target_pointer_width = "32"))]
 const CONNECT_OPTS_MIN_SIZE: usize = 68;
 
-/// Connect with every option in one growable [`PunktfunkConnectOpts`] (ABI v26) — semantics are
-/// exactly [`punktfunk_connect_ex11`]'s, field for field. The `ex` chain stays supported and
-/// byte-identical forever, but it is CLOSED: new options land only in the struct.
+/// Connect with every option in one growable [`PunktfunkConnectOpts`]. Semantics
+/// match [`punktfunk_connect_ex11`] field for field. The `ex` chain stays
+/// byte-identical; new options land only in this struct.
 ///
-/// `status_out` (nullable) is written on every path, like the whole connect family;
-/// `observed_sha256_out` (null or 32 bytes) receives the host certificate's fingerprint on
-/// success, per [`punktfunk_connect`]'s trust contract.
+/// `status_out` (nullable) is written on every path; `observed_sha256_out`
+/// (null or 32 bytes) receives the host fingerprint on success.
 ///
 /// # Safety
-/// `opts` is null or points to at least `opts->struct_size` readable bytes laid out as its
-/// declared version of [`PunktfunkConnectOpts`]; its pointer fields follow
-/// [`punktfunk_connect_ex11`]'s contract; `observed_sha256_out` is null or valid for 32 bytes.
+/// `opts` is null or points to at least `opts->struct_size` readable bytes laid
+/// out as its declared [`PunktfunkConnectOpts`]; pointer fields follow
+/// [`punktfunk_connect_ex11`]; `observed_sha256_out` is null or valid for 32 bytes.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connect_opts(
@@ -2779,8 +2303,7 @@ pub unsafe extern "C" fn punktfunk_connect_opts(
 ) -> *mut PunktfunkConnection {
     let set_status = |s: crate::error::PunktfunkStatus| {
         if !status_out.is_null() {
-            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
-            // written once by value.
+            // SAFETY: caller out-param, non-null on this path, written once.
             unsafe { *status_out = s as i32 };
         }
     };
@@ -2788,26 +2311,18 @@ pub unsafe extern "C" fn punktfunk_connect_opts(
         set_status(crate::error::PunktfunkStatus::NullPointer);
         return std::ptr::null_mut();
     }
-    // Read only the 4-byte size prefix first to bound the subsequent read — `config_from_ptr`'s
-    // guard, with the growth direction added: older (shorter, but never shorter than v26)
-    // callers get their missing tail defaulted instead of misread.
-    // SAFETY: `addr_of!` forms a raw pointer WITHOUT creating a reference, which is the point:
-    // the caller's struct may be a different size than ours, so the field is read by offset
-    // rather than through a `&`.
+    // Size prefix first; a shorter caller gets a zeroed tail, not a misread.
+    // SAFETY: `addr_of!` does not form a `&`; the caller may have a different size.
     let declared = unsafe { std::ptr::addr_of!((*opts).struct_size).read_unaligned() } as usize;
     if declared < CONNECT_OPTS_MIN_SIZE {
         set_status(crate::error::PunktfunkStatus::InvalidArg);
         return std::ptr::null_mut();
     }
-    // Copy the known prefix over an all-zero struct: today that is the whole struct; once the
-    // struct has grown past a caller's vintage, the copy stops at THEIR `struct_size` and the
-    // appended fields stay zero = unspecified (zeroed raw pointers are null). A NEWER caller's
-    // extra tail is ignored the same way.
+    // Copy the known prefix over zeros so a shorter caller's missing tail stays unspecified.
     // SAFETY: all-zero is a valid `PunktfunkConnectOpts` — null pointers and zero scalars.
     let mut o: PunktfunkConnectOpts = unsafe { std::mem::zeroed() };
     let take = declared.min(std::mem::size_of::<PunktfunkConnectOpts>());
-    // SAFETY: per the ABI contract `opts` is readable for `declared >= take` bytes; `o` is a
-    // local of at least `take` bytes; a local cannot overlap a caller-owned region.
+    // SAFETY: `opts` is readable for `declared >= take`; `o` is a local and cannot overlap.
     unsafe {
         std::ptr::copy_nonoverlapping(
             opts.cast::<u8>(),
@@ -2815,8 +2330,7 @@ pub unsafe extern "C" fn punktfunk_connect_opts(
             take,
         );
     }
-    // SAFETY: the pointer fields are forwarded UNCHANGED to the shared body, which applies the
-    // same ABI contract to them; the copy above dereferenced nothing they point at.
+    // SAFETY: pointer fields forwarded unchanged; the copy did not deref what they point at.
     unsafe {
         connect_ex_impl(
             o.host,
@@ -2846,14 +2360,8 @@ pub unsafe extern "C" fn punktfunk_connect_opts(
     }
 }
 
-/// Shared body of the whole connect family — [`punktfunk_connect`] through
-/// [`punktfunk_connect_ex11`] and [`punktfunk_connect_opts`]: `status_out`
-/// (nullable) is written on EVERY path — `Ok`, the mapped [`PunktfunkError`],
-/// `InvalidArg` for bad arguments, `Panic` if the connect panicked. `device_name` (nullable,
-/// [`punktfunk_connect_ex10`]) is the label this device knocks with; null = the OS default.
-/// `audio_rate_hz`/`audio_bits` ([`punktfunk_connect_ex11`]) are the audio format being asked
-/// for; every earlier variant passes the legacy 48 kHz/16-bit pair, which is what keeps their
-/// `Hello` byte-identical to the pre-hi-res one.
+/// Shared body of the connect family. `status_out` is written on every path.
+/// Null `device_name` = OS default. `audio_rate_hz`/`audio_bits` 0/0 is unspecified.
 #[cfg(feature = "quic")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn connect_ex_impl(
@@ -2883,8 +2391,7 @@ unsafe fn connect_ex_impl(
 ) -> *mut PunktfunkConnection {
     let set_status = |s: crate::error::PunktfunkStatus| {
         if !status_out.is_null() {
-            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
-            // written once by value.
+            // SAFETY: caller out-param, non-null on this path, written once.
             unsafe { *status_out = s as i32 };
         }
     };
@@ -2893,8 +2400,7 @@ unsafe fn connect_ex_impl(
             set_status(crate::error::PunktfunkStatus::InvalidArg);
             return std::ptr::null_mut();
         }
-        // SAFETY: per the ABI contract - a caller-supplied C string, NUL-terminated or null,
-        // borrowed only for this call.
+        // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
         let host = match unsafe { std::ffi::CStr::from_ptr(host) }.to_str() {
             Ok(s) => s,
             Err(_) => {
@@ -2902,19 +2408,14 @@ unsafe fn connect_ex_impl(
                 return std::ptr::null_mut();
             }
         };
-        // A bad-UTF-8 launch id is non-fatal — treat it as "no game" rather than failing connect.
-        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
-        // and are null-checked or handle-validated on this path before they are read.
+        // Bad-UTF-8 launch id is non-fatal: treat it as "no game" rather than failing connect.
+        // SAFETY: pointers are caller-supplied and null-checked on this path.
         let launch = match unsafe { opt_cstr(launch_id) } {
             Ok(Some(s)) if !s.is_empty() => Some(s.to_string()),
             _ => None,
         };
-        // The label the host's pending-approval list shows. Same non-fatal treatment as `launch`:
-        // an absent / empty / bad-UTF-8 name falls back to the OS default rather than failing a
-        // connect over a cosmetic field. Truncation is on a CHARACTER boundary — `HELLO_NAME_MAX`
-        // is a byte cap, and slicing a multi-byte name mid-scalar would panic.
-        // SAFETY: per the ABI contract - a caller-supplied C string, NUL-terminated or null,
-        // borrowed only for this call.
+        // Bad/empty name is non-fatal (OS default). Truncate on a character boundary.
+        // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
         let name = match unsafe { opt_cstr(device_name) } {
             Ok(Some(s)) if !s.trim().is_empty() => clamp_device_name(s.trim()),
             _ => crate::client::device_name(),
@@ -2924,8 +2425,8 @@ unsafe fn connect_ex_impl(
             height,
             refresh_hz,
         };
-        // "Any unrecognized value = Auto" must hold for the FULL u32 domain — `as u8`
-        // would wrap 0x101 into a concrete choice before from_u8's fallback could apply.
+        // Unrecognized = Auto must hold for the full u32 domain: `as u8` would wrap
+        // 0x101 into a concrete choice before `from_u8`'s fallback could apply.
         let pref = u8::try_from(compositor)
             .map(crate::config::CompositorPref::from_u8)
             .unwrap_or_default();
@@ -2936,13 +2437,11 @@ unsafe fn connect_ex_impl(
             None
         } else {
             let mut p = [0u8; 32];
-            // SAFETY: per the ABI contract - a caller-supplied pointer/length pair describing one
-            // readable region, borrowed only for this call.
+            // SAFETY: caller pointer/length; borrowed for this call only.
             p.copy_from_slice(unsafe { std::slice::from_raw_parts(pin_sha256, 32) });
             Some(p)
         };
-        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
-        // and are null-checked or handle-validated on this path before they are read.
+        // SAFETY: pointers are caller-supplied and null-checked on this path.
         let identity = match (unsafe { opt_cstr(client_cert_pem) }, unsafe {
             opt_cstr(client_key_pem)
         }) {
@@ -2963,46 +2462,29 @@ unsafe fn connect_ex_impl(
             bitrate_kbps,
             video_caps,
             crate::audio::normalize_channels(audio_channels),
-            // The audio format asked for ([`punktfunk_connect_ex11`]); the legacy 48 kHz/16-bit
-            // pair from every earlier variant. Passed through UNVALIDATED on purpose: a rate or
-            // depth this plane cannot carry is the host's to decline (it answers with what it
-            // resolved, and the client opens from that), and rejecting a connect over an audio
-            // preference would be a far worse failure than a session that plays Opus.
+            // Unvalidated on purpose: a bad rate is the host's to decline, not a failed connect.
             audio_rate_hz,
             audio_bits,
             video_codecs,
             preferred_codec,
-            // No display-HDR-volume parameter in the C ABI yet: Apple/Android clients tone-map
-            // themselves (EDR / MediaCodec), so the host's EDID defaults are fine there. An `ex8`
-            // variant can carry it if a passthrough embedder ever needs it.
+            // No display-HDR-volume in the C ABI; host EDID defaults stand.
             None,
-            // ABI v11 ([`punktfunk_connect_ex9`]): CLIENT_CAP_CURSOR here asks the host to STOP
-            // compositing the pointer — only an embedder that renders the cursor planes
-            // ([`punktfunk_connection_next_cursor_shape`]/`_state`) may set it. ex7/ex8 pass 0.
+            // CLIENT_CAP_CURSOR: host stops compositing; only if the embedder draws the cursor.
             client_caps,
-            // The C ABI cannot carry slice-progressive parts yet — `PunktfunkFrame` has no
-            // part/completeness fields, so a part would be indistinguishable from a whole AU.
-            // An `ex11` variant adds the opt-in together with those fields when an ABI embedder
-            // (Apple) grows a partial-feed decode path.
+            // No slice-progressive parts: `PunktfunkFrame` cannot tell a part from a whole AU.
             false,
             launch,
-            // What the host's pending-approval list shows when this embedder knocks unpaired, and
-            // the trust-store label on approval. [`punktfunk_connect_ex10`]'s `device_name` when
-            // the embedder supplied one (the name the USER knows the device by — an Apple app has
-            // it and the OS default cannot reach it), else that OS default.
+            // Knock label: embedder `device_name`, else OS default.
             Some(name),
             pin,
             identity,
             std::time::Duration::from_millis(timeout_ms as u64),
-            // No abort switch in the C ABI: `punktfunk_connect*` is a blocking call with
-            // nothing to poll a flag from. An `ex` variant can take one when an ABI embedder
-            // grows a cancelable connect screen.
+            // No abort switch: connect is blocking with nothing to poll.
             None,
         ) {
             Ok(c) => {
                 if !observed_sha256_out.is_null() {
-                    // SAFETY: per the ABI contract - a caller-owned output buffer of exactly the
-                    // documented fixed length, non-null on this path and written once.
+                    // SAFETY: caller output buffer of the documented length, written once.
                     unsafe {
                         std::slice::from_raw_parts_mut(observed_sha256_out, 32)
                             .copy_from_slice(&c.host_fingerprint);
@@ -3030,11 +2512,11 @@ unsafe fn connect_ex_impl(
     })
 }
 
-/// Generate a persistent client identity: a self-signed certificate + private key, both
-/// PEM, NUL-terminated, written into the caller's buffers. Generate ONCE, store both
-/// strings (Keychain etc.), pass them to [`punktfunk_pair`] and every
-/// [`punktfunk_connect`] — the certificate's fingerprint is how hosts recognize this
-/// client. 4096-byte buffers are ample.
+/// Generate a persistent client identity: self-signed certificate + private key,
+/// both PEM, NUL-terminated, written into the caller's buffers. Generate once,
+/// store both, pass them to [`punktfunk_pair`] and every [`punktfunk_connect`].
+/// Hosts recognize this client by the certificate fingerprint. 4096-byte buffers
+/// are ample.
 ///
 /// # Safety
 /// `cert_pem_out` is writable for `cert_cap` bytes; `key_pem_out` for `key_cap`.
@@ -3057,11 +2539,9 @@ pub unsafe extern "C" fn punktfunk_generate_identity(
         if cert.len() + 1 > cert_cap || key.len() + 1 > key_cap {
             return PunktfunkStatus::InvalidArg;
         }
-        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
-        // and are null-checked or handle-validated on this path before they are read.
+        // SAFETY: pointers are caller-supplied and null-checked on this path.
         unsafe {
-            // `.cast()`, not `as *mut u8`: `c_char` is i8 on x86_64 but u8 on aarch64, so the
-            // `as` form is a REQUIRED conversion on one and a no-op clippy rejects on the other.
+            // `.cast()`: `c_char` is i8 on x86_64 and u8 on aarch64; `as *mut u8` is not portable.
             std::ptr::copy_nonoverlapping(cert.as_ptr(), cert_pem_out.cast::<u8>(), cert.len());
             *cert_pem_out.add(cert.len()) = 0;
             std::ptr::copy_nonoverlapping(key.as_ptr(), key_pem_out.cast::<u8>(), key.len());
@@ -3071,16 +2551,11 @@ pub unsafe extern "C" fn punktfunk_generate_identity(
     })
 }
 
-/// Reachability probe: attempt the QUIC handshake to `host:port` and report whether the host
-/// answered — trust-agnostic and mDNS-INDEPENDENT. A host reached over a routed network
-/// (Tailscale/VPN/another subnet) answers here even though it never advertises on mDNS, so the
-/// clients' saved-host "online" pips can reflect real reachability instead of LAN presence (the
-/// display-side companion to the dial-first connect fix). Returns [`PunktfunkStatus::Ok`] when
-/// reachable, [`PunktfunkStatus::Timeout`] when not (or on any connect error). Blocks up to
-/// `timeout_ms`; call off the UI thread.
+/// QUIC reachability probe, trust-agnostic and mDNS-independent. `Ok` if the
+/// host answered, `Timeout` otherwise. Blocks up to `timeout_ms`; off the UI thread.
 ///
 /// # Safety
-/// `host` must be a NUL-terminated UTF-8 string.
+/// `host` is a NUL-terminated UTF-8 string.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_probe(
@@ -3089,8 +2564,7 @@ pub unsafe extern "C" fn punktfunk_probe(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
-        // and are null-checked or handle-validated on this path before they are read.
+        // SAFETY: pointers are caller-supplied and null-checked on this path.
         let Ok(Some(host)) = (unsafe { opt_cstr(host) }) else {
             return PunktfunkStatus::NullPointer;
         };
@@ -3106,12 +2580,10 @@ pub unsafe extern "C" fn punktfunk_probe(
     })
 }
 
-/// Run the PIN pairing ceremony against a host (see the protocol docs in punktfunk-core):
-/// the host displays a short PIN; the user types it into the client app, which passes it
-/// here. On success the host has stored this client's identity, the now-verified host
-/// fingerprint is written to `host_sha256_out` (32 bytes) — persist it and pass it as
-/// `pin_sha256` to [`punktfunk_connect`] from then on. Returns
-/// [`PunktfunkStatus::Crypto`] for a wrong PIN.
+/// PIN pairing: the host displays a PIN; pass it here. On success the host has
+/// stored this client's identity and the verified host fingerprint is written to
+/// `host_sha256_out` (32 bytes) — persist it as `pin_sha256` for
+/// [`punktfunk_connect`]. [`PunktfunkStatus::Crypto`] for a wrong PIN.
 ///
 /// # Safety
 /// `host`/`client_cert_pem`/`client_key_pem`/`pin`/`name` are NUL-terminated UTF-8;
@@ -3130,20 +2602,15 @@ pub unsafe extern "C" fn punktfunk_pair(
 ) -> PunktfunkStatus {
     guard(|| {
         let (Ok(Some(host)), Ok(Some(cert)), Ok(Some(key)), Ok(Some(pin)), Ok(Some(name))) = (
-            // SAFETY: per the ABI contract - the pointer operands in this block are caller-
-            // supplied and are null-checked or handle-validated on this path before they are read.
+            // SAFETY: pointers are caller-supplied and null-checked on this path.
             unsafe { opt_cstr(host) },
-            // SAFETY: per the ABI contract - the pointer operands in this block are caller-
-            // supplied and are null-checked or handle-validated on this path before they are read.
+            // SAFETY: pointers are caller-supplied and null-checked on this path.
             unsafe { opt_cstr(client_cert_pem) },
-            // SAFETY: per the ABI contract - the pointer operands in this block are caller-
-            // supplied and are null-checked or handle-validated on this path before they are read.
+            // SAFETY: pointers are caller-supplied and null-checked on this path.
             unsafe { opt_cstr(client_key_pem) },
-            // SAFETY: per the ABI contract - the pointer operands in this block are caller-
-            // supplied and are null-checked or handle-validated on this path before they are read.
+            // SAFETY: pointers are caller-supplied and null-checked on this path.
             unsafe { opt_cstr(pin) },
-            // SAFETY: per the ABI contract - the pointer operands in this block are caller-
-            // supplied and are null-checked or handle-validated on this path before they are read.
+            // SAFETY: pointers are caller-supplied and null-checked on this path.
             unsafe { opt_cstr(name) },
         ) else {
             return PunktfunkStatus::NullPointer;
@@ -3160,8 +2627,7 @@ pub unsafe extern "C" fn punktfunk_pair(
             std::time::Duration::from_millis(timeout_ms as u64),
         ) {
             Ok(fp) => {
-                // SAFETY: per the ABI contract - a caller-owned output buffer of exactly the
-                // documented fixed length, non-null on this path and written once.
+                // SAFETY: caller output buffer of the documented length, written once.
                 unsafe {
                     std::slice::from_raw_parts_mut(host_sha256_out, 32).copy_from_slice(&fp);
                 }
@@ -3172,14 +2638,14 @@ pub unsafe extern "C" fn punktfunk_pair(
     })
 }
 
-/// Pull the next reassembled access unit, waiting up to `timeout_ms`. Returns
-/// [`PunktfunkStatus::NoFrame`] on timeout and [`PunktfunkStatus::Closed`] once the session ended.
-/// On `Ok`, `*out` borrows connection memory **until the next `next_au` call** on this
-/// handle (the audio/rumble planes do not invalidate it).
+/// Pull the next reassembled access unit, waiting up to `timeout_ms`.
+/// [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once ended.
+/// On `Ok`, `*out` borrows until the next `next_au` on this handle (audio/rumble
+/// planes do not invalidate it).
 ///
 /// # Safety
-/// `c` is a valid connection handle; `out` is writable. At most one thread pulls video —
-/// it may run concurrently with one audio-pulling and one rumble-pulling thread.
+/// `c` is a valid connection handle; `out` is writable. At most one thread pulls
+/// video; it may run concurrently with one audio and one rumble puller.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_au(
@@ -3188,10 +2654,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_au(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // Shared reference only: video and audio threads must never alias a `&mut`.
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // Shared ref only: video and audio threads must not alias a `&mut`.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3206,8 +2670,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_au(
             Ok(frame) => {
                 let mut slot = lock_recover(&c.last);
                 let f = slot.insert(frame);
-                // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
-                // matching `#[repr(C)]` type, written once by value.
+                // SAFETY: `out` is a caller-owned `#[repr(C)]` slot, written once by value.
                 unsafe {
                     *out = PunktfunkFrame {
                         data: f.data.as_ptr(),
@@ -3225,16 +2688,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_au(
     })
 }
 
-/// One audio packet pulled off a `punktfunk/1` connection — an Opus frame (48 kHz, 5 ms) on
-/// every ordinary session, or one lossless PCM frame on a session that resolved the `0xD3` plane.
-/// `data` borrows connection memory until the next `punktfunk_connection_next_audio` call.
-///
-/// Nothing here says which: the plane is a property of the SESSION, read once via
-/// `punktfunk_connection_host_caps() & PUNKTFUNK_HOST_CAP_AUDIO_HIRES` (with the format itself
-/// from [`punktfunk_connection_audio_sample_rate`] / [`punktfunk_connection_audio_bits`]). An
-/// embedder that never asks for the lossless plane can only ever be handed Opus, so this struct's
-/// meaning is unchanged for it — and one that does is far better off on
-/// [`punktfunk_connection_next_audio_pcm`], which decodes both planes in core.
+/// One audio packet. Opus on ordinary sessions, PCM on `0xD3`. `data` borrows
+/// until the next `next_audio`. Plane is `host_caps & HOST_CAP_AUDIO_HIRES`.
 #[cfg(feature = "quic")]
 #[repr(C)]
 pub struct PunktfunkAudioPacket {
@@ -3244,15 +2699,14 @@ pub struct PunktfunkAudioPacket {
     pub pts_ns: u64,
 }
 
-/// Pull the next audio packet (see [`PunktfunkAudioPacket`] for what it holds), waiting up to
-/// `timeout_ms`. Returns [`PunktfunkStatus::NoFrame`] on timeout and [`PunktfunkStatus::Closed`]
-/// once the session ended. On `Ok`, `out->data` borrows connection memory **until the next audio
-/// call** on this handle (independent of the video slot). Drain from a dedicated audio thread —
-/// Opus packets arrive every 5 ms (lossless ones every 1–5 ms, per the negotiated frame length)
-/// and the internal queue holds 320 ms.
+/// Pull the next audio packet, waiting up to `timeout_ms`.
+/// [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once ended.
+/// On `Ok`, `out->data` borrows until the next audio call (independent of video).
+/// Drain from a dedicated thread — Opus every 5 ms, lossless every 1–5 ms; queue
+/// holds 320 ms.
 ///
 /// # Safety
-/// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio —
+/// `c` is a valid connection handle; `out` is writable. At most one audio puller;
 /// it may run concurrently with the video/rumble pullers.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
@@ -3262,9 +2716,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3279,8 +2731,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio(
             Ok(pkt) => {
                 let mut slot = lock_recover(&c.last_audio);
                 let p = slot.insert(pkt);
-                // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
-                // matching `#[repr(C)]` type, written once by value.
+                // SAFETY: `out` is a caller-owned `#[repr(C)]` slot, written once by value.
                 unsafe {
                     *out = PunktfunkAudioPacket {
                         data: p.data.as_ptr(),
@@ -3296,12 +2747,10 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio(
     })
 }
 
-/// Read the audio channel count the host resolved for this session (from its Welcome): `2`
-/// (stereo), `6` (5.1) or `8` (7.1). `*out` is filled when non-NULL. The `0xC9` Opus frames are
-/// (multistream-)encoded for this layout; an embedder decoding raw frames itself must build its
-/// decoder from THIS value (see [`crate::audio::layout_for`]) — or use
-/// [`punktfunk_connection_next_audio_pcm`], which decodes in-core. Available immediately after a
-/// successful connect (it doesn't change without a reconfigure).
+/// Host-resolved audio channel count: `2` (stereo), `6` (5.1) or `8` (7.1).
+/// `*out` is filled when non-NULL. Raw `0xC9` Opus is encoded for this layout
+/// ([`crate::audio::layout_for`]); or use [`punktfunk_connection_next_audio_pcm`].
+/// Fixed until a reconfigure.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -3312,9 +2761,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_channels(
     out: *mut u8,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3327,23 +2774,8 @@ pub unsafe extern "C" fn punktfunk_connection_audio_channels(
     })
 }
 
-/// Read the sample rate the host resolved for this session (from its Welcome): `48000` for every
-/// Opus session — and for every host older than the lossless plane — or the rate a hi-res session
-/// actually landed on, which may be LOWER than the client asked for. `*out` is filled when
-/// non-NULL. Available immediately after a successful connect; it never changes mid-session.
-///
-/// ⚠ **Open the output device from this, not from `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ`.** That
-/// compile-time constant keeps its value and its meaning — it is the DEFAULT/legacy rate, and
-/// every ring sized from it is still correct for every session that resolves to Opus — but on a
-/// hi-res session it is simply not the rate on the wire. Opening at 96 kHz because you asked for
-/// 96 kHz, when the host answered 48 kHz, is `design/hi-res-audio.md` §4.3's failure repeated at
-/// the other end of the link: everything audits clean and the content is wrong.
-///
-/// An ACCESSOR rather than a field on [`PunktfunkAudioPcm`] or `PunktfunkStats`: both are
-/// `#[repr(C)]` with no `struct_size` guard and are allocated by value by C embedders, so growing
-/// either would break every one of them at once. Same rule ABI 18 set with
-/// `punktfunk_connection_next_rumble_cmd2` — added, not widened — so an embedder that never calls
-/// this behaves exactly as it did before it existed.
+/// Resolved sample rate. Open the device from this, not `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ`
+/// (the Opus default). Accessor, not a field: `PunktfunkAudioPcm` has no size guard.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u32`.
@@ -3354,9 +2786,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_sample_rate(
     out: *mut u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3369,20 +2799,8 @@ pub unsafe extern "C" fn punktfunk_connection_audio_sample_rate(
     })
 }
 
-/// Read the sample depth the host resolved for this session (from its Welcome): `16` on every
-/// Opus session and every older host, `16` or `24` on the lossless plane. `*out` is filled when
-/// non-NULL. Available immediately after a successful connect; it never changes mid-session.
-///
-/// Only sessions on the lossless plane can report `24`, and only they need it: the depth is the
-/// stride the `0xD3` payload is unpacked at, and [`punktfunk_connection_next_audio_pcm`] already
-/// does that unpacking in core — it hands out f32 either way. This is here so an embedder can
-/// *report* the format honestly (a UI that says "24-bit" while the host declined is the same
-/// class of lie as claiming a rate you did not get) and so one draining raw frames through
-/// [`punktfunk_connection_next_audio`] can unpack them itself. Which PLANE a session is on is
-/// `punktfunk_connection_host_caps() & PUNKTFUNK_HOST_CAP_AUDIO_HIRES`, not this: 48 kHz/16-bit
-/// reads identically on both.
-///
-/// ADDED, not widened — see [`punktfunk_connection_audio_sample_rate`] for why.
+/// Resolved sample depth (`16`, or `24` on lossless). Plane is
+/// `host_caps & PUNKTFUNK_HOST_CAP_AUDIO_HIRES`, not this: 48 kHz/16-bit matches both.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -3393,9 +2811,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_bits(
     out: *mut u8,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3408,30 +2824,10 @@ pub unsafe extern "C" fn punktfunk_connection_audio_bits(
     })
 }
 
-/// The resolved audio frame length in MICROSECONDS — how much audio one datagram carries.
-///
-/// `PUNKTFUNK_AUDIO_FRAME_MS` is the Opus plane's 5 ms and stays that way, but the lossless plane
-/// sizes its frame to the path MTU: 4 ms at 48 kHz/24-bit and 2 ms at 96 kHz/24-bit under the
-/// default ceiling. An embedder that ports the de-jitter policy (rather than draining
-/// [`punktfunk_connection_next_audio_pcm`] and letting core do it) needs the real figure — the
-/// shed drops exactly one frame and the target floor is a device quantum plus one frame, so a
-/// policy compiled against 5 ms sheds 2.5 frames at a time on a 96 kHz session.
-///
-/// Microseconds rather than milliseconds because the ladder has sub-millisecond rungs; `0` means
-/// the host did not state one, in which case `PUNKTFUNK_AUDIO_FRAME_MS × 1000` is correct.
-///
-/// ⚠⚠ **A NOMINAL length, not a duration, and on the 44.1 kHz family they differ.** A frame
-/// carries a whole number of samples per channel, and 44 100 Hz divides no rung of the ladder: a
-/// 5 ms frame there is 220 samples per channel, which is 4 988 662 ns. Sizing a ring from this is
-/// right (that is what it is for); advancing a **clock** by it is not — it invents 2.3 ms of time
-/// per second, indefinitely, and every stat downstream will agree with the lie because the
-/// timestamps stay self-consistent. Derive elapsed time from the samples rendered and
-/// [`punktfunk_connection_audio_sample_rate`] instead.
-///
-/// **Not derivable from `next_audio_pcm`'s `frame_count`.** That call prepends concealed frames
-/// into the same buffer, so its count is "how many samples you got", not "how long one frame is".
-///
-/// ADDED, not widened — see [`punktfunk_connection_audio_sample_rate`] for why.
+/// Resolved frame length in µs (ladder has sub-ms rungs). `0` = use
+/// `PUNKTFUNK_AUDIO_FRAME_MS × 1000`. On 44.1 kHz this is a nominal length, not a
+/// duration — size rings from it, advance clocks from samples / rate.
+/// Not derivable from `next_audio_pcm`'s `frame_count` (that includes concealment).
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u16`.
@@ -3442,9 +2838,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_frame_us(
     out: *mut u16,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3457,21 +2851,8 @@ pub unsafe extern "C" fn punktfunk_connection_audio_frame_us(
     })
 }
 
-/// WHY this session ended: `*out` receives a [`PunktfunkEndReason`] byte
-/// (`PUNKTFUNK_END_REASON_*`). The return status reports only whether the handle was usable.
-///
-/// Read it once a plane has returned [`PunktfunkStatus::Closed`] (or the embedder's own
-/// end-of-session signal fired); before that it reads `NONE`. It latches, so it is still readable
-/// while the connection is torn down, and a client that never calls it behaves exactly as it did
-/// before this existed.
-///
-/// **Most endings are not failures.** Before this, a client had no way to tell a player quitting
-/// their game from a host falling off the network, so every client wrote one message for all of
-/// them and every client chose an error. Use `LOCAL`/`GAME_EXITED`/`HOST_ENDED` to stay quiet (and
-/// `GAME_EXITED` to return to the library the title was launched from), and keep the alarming copy
-/// for `HOST_ERROR` and `LOST`.
-///
-/// Treat an unrecognized value as `NONE` — this crosses an ABI and the core may be newer than you.
+/// Why the session ended (`PUNKTFUNK_END_REASON_*`). Latches after `Closed`.
+/// `LOCAL`/`GAME_EXITED`/`HOST_ENDED` are not failures. Unknown values = `NONE`.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -3482,8 +2863,7 @@ pub unsafe extern "C" fn punktfunk_connection_end_reason(
     out: *mut u8,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_ref` reports as `None` and the `match` handles.
+        // SAFETY: caller handle or null; `as_ref` never dereferences null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3496,20 +2876,10 @@ pub unsafe extern "C" fn punktfunk_connection_end_reason(
     })
 }
 
-/// One decoded audio frame from [`punktfunk_connection_next_audio_pcm`]: interleaved 32-bit
-/// float PCM in the canonical wire channel order `FL FR FC LFE RL RR SL SR` (the first
-/// `channels` of it). `samples` points at `frame_count * channels` floats and borrows
-/// connection memory **until the next PCM call** on this handle.
-///
-/// **The sample rate is not in this struct and never will be.** It was 48 kHz for every session
-/// until the lossless plane, and it is still 48 kHz for every Opus one — but a hi-res session
-/// resolves its own rate and depth, and this is a `#[repr(C)]` type with no `struct_size` guard
-/// that C embedders allocate BY VALUE. Adding a field would silently change its layout under
-/// every one of them. So the format is read through
-/// [`punktfunk_connection_audio_sample_rate`] / [`punktfunk_connection_audio_bits`] instead —
-/// accessors ADDED, not structs widened, which is the rule ABI 18 set with
-/// `punktfunk_connection_next_rumble_cmd2`. An embedder that never calls them keeps sizing its
-/// ring for 48 kHz, which is exactly right for the sessions it can already play.
+/// One decoded audio frame from [`punktfunk_connection_next_audio_pcm`]: interleaved
+/// f32 in wire order `FL FR FC LFE RL RR SL SR` (first `channels` of it). `samples`
+/// points at `frame_count * channels` floats and borrows until the next PCM call.
+/// Rate/depth are accessors, not fields: this type has no `struct_size`.
 #[cfg(feature = "quic")]
 #[repr(C)]
 pub struct PunktfunkAudioPcm {
@@ -3525,37 +2895,13 @@ pub struct PunktfunkAudioPcm {
     pub pts_ns: u64,
 }
 
-/// Pull the next audio frame and **decode it in-core** to interleaved f32 PCM — for embedders
-/// without a multistream-capable Opus decoder (e.g. Apple, whose AudioToolbox Opus path is
-/// stereo-only). The decoder is built once from the negotiated channel count and handles 2/6/8
-/// channels (a 1-coupled-stream multistream decoder is exactly a stereo decoder). Same
-/// timeout/closed semantics as [`punktfunk_connection_next_audio`]; `out->samples` borrows
-/// connection memory until the next PCM call on this handle. Use EITHER this or
-/// [`punktfunk_connection_next_audio`] on a given connection, from one dedicated audio thread —
-/// not both (they share the underlying queue).
-///
-/// **Both audio planes come out of this one call.** On a session that resolved the lossless
-/// `0xD3` plane there is no Opus decoder at all — the samples are unpacked at the negotiated
-/// depth — but the output is the same interleaved f32 in the same borrowed buffer, so an embedder
-/// needs no branch. It DOES need [`punktfunk_connection_audio_sample_rate`] to size its ring and
-/// open its device: `frame_count` is samples per channel, and at 96 kHz they arrive twice as fast.
-///
-/// **Loss concealment**: packets the wire lost (a gap in the sequence, after the redundant-plane
-/// recovery has had its chance) are synthesized and returned IN FRONT of the arriving frame in
-/// the same buffer — `out->frame_count` then covers the concealed frames plus the real one
-/// (`out->seq`/`out->pts_ns` are the real packet's). The embedder just writes the whole buffer to
-/// its ring, same as any other frame; gaps arrive pre-healed, exactly as they do on the clients
-/// that decode outside core. That covers a gap a LATER packet reveals; when the wire goes quiet
-/// instead, see [`punktfunk_connection_audio_plc`].
-///
-/// What synthesizes them differs by plane, and has to: Opus gaps use libopus PLC, which
-/// extrapolates from the decoder's model of the signal. A lossless frame has no such model — only
-/// the signal — so `0xD3` gaps are concealed by repeating the last good frame under a raised-cosine
-/// fade, decaying to silence across a sustained gap (`design/hi-res-audio.md` §4.5). Same shape,
-/// same buffer, same cap; only the material differs.
+/// Decode the next audio frame in-core to interleaved f32. Both planes share this
+/// call; size the ring from [`punktfunk_connection_audio_sample_rate`]. Seq-gap
+/// concealment is prepended in the same buffer. Quiet-wire droughts:
+/// [`punktfunk_connection_audio_plc`]. Mutually exclusive with `next_audio`.
 ///
 /// # Safety
-/// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio.
+/// `c` is a valid connection handle; `out` is writable. At most one audio puller.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
@@ -3564,9 +2910,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3585,11 +2929,10 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
         };
         let mut state = lock_recover(&c.audio_pcm);
         match state.decode_packet(&pkt.data, pkt.seq, fmt) {
-            // Nothing to hand out this call: a DTX silence marker with no loss owed before it.
+            // Nothing to hand out: a DTX silence marker with no loss owed before it.
             Ok(0) => PunktfunkStatus::NoFrame,
             Ok(samples) => {
-                // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
-                // matching `#[repr(C)]` type, written once by value.
+                // SAFETY: `out` is a caller-owned `#[repr(C)]` slot, written once by value.
                 unsafe {
                     *out = PunktfunkAudioPcm {
                         samples: state.pcm.as_ptr(),
@@ -3606,42 +2949,14 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
     })
 }
 
-/// Synthesize ONE frame of concealment from the in-core decoder's own state — no packet involved,
-/// nothing pulled off the wire (design/host-source-stutter-fixes.md, WP-C1).
-///
-/// [`punktfunk_connection_next_audio_pcm`] heals a gap the SEQUENCE reveals, which needs a later
-/// packet to arrive and reveal it. When the wire simply goes quiet — a delivery stall on a
-/// bunching Wi-Fi link, or a host whose capture stalled — nothing arrives to reveal anything: the
-/// embedder's playout ring drains to empty, its callback runs short, and its de-jitter policy
-/// de-primes and then re-primes a whole target's worth of fresh silence. The artifact is far
-/// longer than the audio actually missing.
-///
-/// So on a `NO_FRAME` timeout with a DRAINING ring, ask for this instead. The policy stays on the
-/// embedder's side because that is where its two ingredients live — the ring depth and the clock
-/// since the last packet — and it must be: bounded in TIME (roughly twice the ring's own de-prime
-/// fuse), never in callbacks or frames, and gated on the ring genuinely running out. A drought a
-/// deep ring covers is inaudible, and concealing it would insert audio the late packets are about
-/// to duplicate, pushing the stream permanently later. Core supplies only the mechanism, one frame
-/// per call, at the cadence the embedder drains at.
-///
-/// Works on both audio planes, using each one's own concealer — libopus PLC on `0xC9`, the
-/// repeat-and-fade of [`crate::audio::pcm::PcmConceal`] on `0xD3` (a lossless frame carries no
-/// model of the signal for PLC to extrapolate from; `design/hi-res-audio.md` §4.5).
-///
-/// Returns [`PunktfunkStatus::NoFrame`] when nothing has decoded yet — both concealers build on
-/// the last decoded frame, so before there is one there is nothing to build from — and if libopus
-/// declines to interpolate. Both mean "write nothing this tick", exactly like a timeout.
-///
-/// `out->seq` and `out->pts_ns` read 0: this frame was never on the wire, so it has no sequence
-/// number and no capture instant, and it must never be fed to an A/V-sync observation.
-/// `out->samples` borrows connection memory until the next PCM call on this handle — the SAME
-/// slot [`punktfunk_connection_next_audio_pcm`] hands out, so call both from the one audio thread.
-///
-/// Frames taken this way are subtracted from the concealment the next arriving packet asks for, so
-/// a packet genuinely lost inside a covered drought is not concealed twice.
+/// One drought concealment frame with no packet (`design/host-source-stutter-fixes.md`).
+/// Call on `NO_FRAME` when the ring is draining. Policy stays on the embedder:
+/// bound in time, gated on a real underrun. `seq`/`pts_ns` are 0 — never feed A/V
+/// sync. Same PCM slot as `next_audio_pcm`; drought frames are subtracted from
+/// the next packet's gap so a covered loss is not concealed twice.
 ///
 /// # Safety
-/// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio.
+/// `c` is a valid connection handle; `out` is writable. At most one audio puller.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_audio_plc(
@@ -3649,9 +2964,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_plc(
     out: *mut PunktfunkAudioPcm,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3665,8 +2978,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_plc(
         match state.conceal(fmt) {
             Ok(0) => PunktfunkStatus::NoFrame,
             Ok(samples) => {
-                // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
-                // matching `#[repr(C)]` type, written once by value.
+                // SAFETY: `out` is a caller-owned `#[repr(C)]` slot, written once by value.
                 unsafe {
                     *out = PunktfunkAudioPcm {
                         samples: state.pcm.as_ptr(),
@@ -3683,22 +2995,11 @@ pub unsafe extern "C" fn punktfunk_connection_audio_plc(
     })
 }
 
-/// Pull the next pad-audio frame (0xD1) — one Opus frame of DualSense voice-coil haptics
-/// (`kind` = [`PUNKTFUNK_PAD_AUDIO_KIND_HAPTICS`], 5 ms) or built-in-speaker audio
-/// ([`PUNKTFUNK_PAD_AUDIO_KIND_SPEAKER`], 10 ms) for gamepad `*out_pad` — waiting up to
-/// `timeout_ms`. The payload is COPIED into `buf` (no borrow-until-next-call slot); the return
-/// value is its length in bytes, `0` = nothing this poll (timeout — or a DTX/oversized frame,
-/// both of which an embedder treats the same way), `-1` = the session ended (or an invalid
-/// handle/buffer). All pads/kinds share one queue — fan out by `*out_pad`/`*out_kind` to
-/// per-actuator Opus decoders. A frame larger than `buf_len` is dropped like the timeout case
-/// (the plane is lossy by design; any real Opus frame fits a 1500-byte buffer). Only a session
-/// connected with [`PUNKTFUNK_CLIENT_CAP_PAD_AUDIO`] against a
-/// [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`] host — with the pad declared via
-/// [`punktfunk_connection_set_pad_audio_caps`] — ever receives any. Drain from a dedicated
-/// thread (one puller, may run alongside the other planes' pullers).
+/// Next 0xD1 pad-audio Opus frame, copied into `buf`. Return length, `0` =
+/// nothing this poll, `-1` = ended. Fan out by pad/kind. One puller.
 ///
 /// # Safety
-/// `c` is a valid connection handle; the `out_*` pointers are writable (NULLs are skipped);
+/// `c` is a valid connection handle; the `out_*` pointers are writable (NULLs skipped);
 /// `buf` is writable for `buf_len` bytes.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
@@ -3713,9 +3014,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_pad_audio(
     timeout_ms: u32,
 ) -> i32 {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return -1,
@@ -3729,15 +3028,10 @@ pub unsafe extern "C" fn punktfunk_connection_next_pad_audio(
         {
             Some(f) => {
                 if f.opus.is_empty() || f.opus.len() > buf_len {
-                    // DTX silence (skipped like the audio-PCM path — decoding an empty payload
-                    // as loss would synthesize concealment) or doesn't fit — report "nothing
-                    // this poll" and let the embedder's poll loop continue (truncated Opus
-                    // would be undecodable anyway).
+                    // Empty/oversized: skip like DTX; truncated Opus is undecodable anyway.
                     return 0;
                 }
-                // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-
-                // checked before it is written; `buf` is a caller-owned writable region of
-                // `buf_len` bytes and the copy length was just bounds-checked against it.
+                // SAFETY: optional out-params null-checked; `buf` copy length was just bounded.
                 unsafe {
                     if !out_pad.is_null() {
                         *out_pad = f.pad;
@@ -3756,7 +3050,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_pad_audio(
                 f.opus.len() as i32
             }
             // `None` folds timeout and closed; the shutdown flag tells them apart so the
-            // embedder's plane loop can exit instead of polling a dead session forever.
+            // plane loop can exit instead of polling a dead session forever.
             None if c.inner.is_session_ended() => -1,
             None => 0,
         }
@@ -3764,13 +3058,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_pad_audio(
     r.unwrap_or(-1)
 }
 
-/// Declare wire pad `pad`'s pad-audio render capabilities (`audio_caps`: OR of
-/// [`PUNKTFUNK_PAD_AUDIO_CAP_HAPTICS`] / [`PUNKTFUNK_PAD_AUDIO_CAP_SPEAKER`]) — how a client
-/// tells the host WHICH pads can actually play the 0xD1 streams. Call at controller attach,
-/// BEFORE the pad's arrival event is sent (the [`punktfunk_connection_set_rumble_quirks`]
-/// timing): the core folds the bits into the arrival's flags (bits 8/9), and only toward a
-/// [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`] host — never calling this leaves the wire bytes exactly as
-/// before. Latest-wins per pad; unknown bits are masked off.
+/// Declare pad `pad`'s 0xD1 render caps. Call at attach, before arrival; bits
+/// fold into arrival flags 8/9. Latest-wins; unknown bits masked.
 ///
 /// # Safety
 /// `c` is a valid connection handle. Callable from any thread.
@@ -3782,9 +3071,7 @@ pub unsafe extern "C" fn punktfunk_connection_set_pad_audio_caps(
     audio_caps: u8,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3794,17 +3081,14 @@ pub unsafe extern "C" fn punktfunk_connection_set_pad_audio_caps(
     })
 }
 
-/// Pull the next rumble (force-feedback) update, waiting up to `timeout_ms`. Amplitudes
-/// are 0..0xFFFF (`low` = low-frequency motor, `high` = high-frequency), `(0, 0)` = stop.
-/// Same timeout/closed semantics as [`punktfunk_connection_next_audio`].
-///
-/// This drops the self-terminating TTL of a v2 rumble envelope — an embedder that only calls this
-/// keeps its own staleness policy, exactly as before. Use [`punktfunk_connection_next_rumble2`] to
-/// honor the host-supplied lease and delete the client-side timeout heuristics.
+/// Pull the next rumble update, waiting up to `timeout_ms`. Amplitudes are
+/// 0..0xFFFF (`low`/`high` motors), `(0, 0)` = stop. Same timeout/closed as
+/// [`punktfunk_connection_next_audio`]. Drops the v2 self-terminating TTL —
+/// use [`punktfunk_connection_next_rumble2`] for the host-supplied lease.
 ///
 /// # Safety
-/// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At
-/// most one thread pulls rumble — it may run concurrently with the video/audio pullers.
+/// `c` is a valid connection handle; out pointers are writable (NULLs skipped).
+/// At most one rumble puller; it may run concurrently with video/audio.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_rumble(
@@ -3815,9 +3099,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3827,8 +3109,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble(
             .next_rumble(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok((p, l, h)) => {
-                // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-
-                // checked before it is written; a non-null one is a caller-owned writable slot.
+                // SAFETY: each out-param is optional; null-checked before write.
                 unsafe {
                     if !pad.is_null() {
                         *pad = p;
@@ -3847,21 +3128,18 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble(
     })
 }
 
-/// `*ttl_ms` sentinel written by [`punktfunk_connection_next_rumble2`] for a legacy (v1) rumble
-/// datagram — an old host that sent no self-termination lease. The client then falls back to its
-/// own staleness heuristic for that update instead of a host-supplied deadline.
+/// `*ttl_ms` sentinel from [`punktfunk_connection_next_rumble2`] when the host sent
+/// no self-termination lease. Fall back to a client-side staleness heuristic.
 pub const PUNKTFUNK_RUMBLE_NO_TTL: u32 = 0xFFFF_FFFF;
 
-/// Pull the next rumble update *including its self-termination TTL* (v2 envelopes), waiting up to
-/// `timeout_ms`. Same `pad`/`low`/`high` semantics as [`punktfunk_connection_next_rumble`], plus
-/// `*ttl_ms`: how long (milliseconds) to render this level before silencing unless the host renews
-/// it. [`PUNKTFUNK_RUMBLE_NO_TTL`] means "no lease" — a legacy host; fall back to a client-side
-/// timeout. The reorder gate (seq) is applied inside the core before the update surfaces here, so a
-/// stale/reordered envelope never reaches the caller.
+/// Pull the next rumble update including its self-termination TTL. Same
+/// `pad`/`low`/`high` as [`punktfunk_connection_next_rumble`], plus `*ttl_ms`:
+/// milliseconds to render this level unless the host renews. [`PUNKTFUNK_RUMBLE_NO_TTL`]
+/// = no lease; fall back to a client-side timeout. Reorder gate is applied inside.
 ///
 /// # Safety
-/// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
-/// thread pulls rumble — it may run concurrently with the video/audio pullers.
+/// `c` is a valid connection handle; out pointers are writable (NULLs skipped).
+/// At most one rumble puller; it may run concurrently with video/audio.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_rumble2(
@@ -3873,9 +3151,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble2(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3885,8 +3161,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble2(
             .next_rumble_ttl(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok((p, l, h, ttl)) => {
-                // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-
-                // checked before it is written; a non-null one is a caller-owned writable slot.
+                // SAFETY: each out-param is optional; null-checked before write.
                 unsafe {
                     if !pad.is_null() {
                         *pad = p;
@@ -3908,40 +3183,19 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble2(
     })
 }
 
-/// `flags` bit for [`punktfunk_connection_set_rumble_quirks`]: alternate the low motor's LSB on
-/// keepalive re-emits (imperceptible) so an SDL-class layer that no-ops identical values still
-/// writes the device — the Steam Deck's dedupe-defeat.
+/// `flags` bit for [`punktfunk_connection_set_rumble_quirks`]: alternate the low
+/// motor's LSB on keepalive re-emits so an SDL-class layer that no-ops identical
+/// values still writes the device.
 pub const PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER: u32 = 1;
 
-/// Pull the next EFFECTIVE rumble command from the shared policy engine — the uniform replacement
-/// for per-platform rumble policy. Unlike [`punktfunk_connection_next_rumble2`], the caller never
-/// sees a TTL and never owns a deadline: the engine emits the level on every wire update (renewals
-/// re-arm duration-parameterized APIs), an explicit zero at lease expiry / legacy-host staleness
-/// (a uniform 1 s) / connection close, and any keepalives declared via
-/// [`punktfunk_connection_set_rumble_quirks`]. Apply commands verbatim: `(0, 0)` = stop now;
-/// non-zero = run at this level, with `*backstop_ms` as the safety-net duration for platform APIs
-/// that take one (explicit-stop APIs ignore it; it is `0` on stop commands).
-/// [`PunktfunkStatus::NoFrame`] on timeout; [`PunktfunkStatus::Closed`] once the session ended AND
-/// every close-drain stop was delivered — silence all actuators on it.
-///
-/// **Handle motors only.** A pad also carries two Xbox impulse-trigger levels, which this entry
-/// point has no out-params for and never will —
-/// [`punktfunk_connection_next_rumble_cmd2`] is the four-motor pull. Staying here is a supported
-/// choice, not a deprecation: for a controller with no trigger motors — every pad but an Xbox
-/// One/Series/Elite — the two views are identical, and where they differ, "the handles are silent"
-/// is exactly the right instruction for the motors this API owns.
-///
-/// The one observable difference against a trigger-driving host: a rumble that moves only the
-/// triggers still produces commands here, carrying `low == high == 0`. They are idempotent stops
-/// for the handles; the engine's redundant-stop suppression cannot fold them away, because the
-/// command is not silent — some motor on that pad is running.
-///
-/// An embedder uses EITHER this (or its `2` form) or `next_rumble`/`next_rumble2` for a
-/// connection's lifetime, never both (they consume the same wire plane).
+/// Effective rumble from the shared policy engine. No TTL: apply `(0, 0)` as
+/// stop, else run at this level; `*backstop_ms` is a safety-net duration (`0` on
+/// stop). Handle motors only — triggers are [`punktfunk_connection_next_rumble_cmd2`].
+/// Mutually exclusive with `next_rumble`/`next_rumble2`.
 ///
 /// # Safety
-/// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
-/// thread pulls rumble — it may run concurrently with the video/audio pullers.
+/// `c` is a valid connection handle; out pointers are writable (NULLs skipped).
+/// At most one rumble puller; it may run concurrently with video/audio.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd(
@@ -3953,9 +3207,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -3965,8 +3217,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd(
             .next_rumble_command(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(cmd) => {
-                // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-
-                // checked before it is written; a non-null one is a caller-owned writable slot.
+                // SAFETY: each out-param is optional; null-checked before write.
                 unsafe {
                     if !pad.is_null() {
                         *pad = cmd.pad;
@@ -3988,41 +3239,14 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd(
     })
 }
 
-/// [`punktfunk_connection_next_rumble_cmd`] with the two Xbox impulse-trigger motors: the same
-/// command, all four of its levels. `*left_trigger` / `*right_trigger` are on the same
-/// `0..=0xFFFF` scale as `low`/`high`, and a stop is all four at zero.
-///
-/// A NEW symbol rather than a wider signature on the old one, following the
-/// `next_rumble` → `next_rumble2` precedent in this file: an exported entry point's parameter list
-/// is part of the contract, and silently growing one breaks every out-of-tree embedder at once,
-/// with a stack-corruption signature rather than a link error. Old callers keep the old symbol and
-/// simply never see the trigger levels.
-///
-/// **Render the trigger levels only on a pad that actually has trigger motors, and drop them
-/// otherwise** — do not fold them into the handles. Impulse-trigger content is continuous
-/// (a racing title drives engine RPM and tyre slip into the triggers while the handles stay near
-/// silent), so folding it produces a handle motor droning flat-out for the whole race at a level
-/// the game never asked for. Query the hardware: SDL's
-/// `SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN`, Apple's `GCDeviceHaptics.supportedLocalities`
-/// (`GCHapticsLocalityLeftTrigger`/`…RightTrigger`). A pad without them is the common case and not
-/// an error — do not log per command.
-///
-/// **Nothing has driven these levels non-zero end to end yet, and that is structural, not an
-/// oversight.** Exactly one producer can ever source them — the Windows HID Xbox pad's output
-/// report `0x03` — because classic XInput's `XINPUT_VIBRATION` has two members and evdev's
-/// `FF_RUMBLE` has two, so no other host backend on any OS has the channel. That producer is
-/// reachable only through GameInput/WGI, and an xinputhid-promoted Xbox pad is not enumerated by
-/// GameInput at all (measured against a real Microsoft Elite, which is equally invisible there
-/// while XInput reads it live). So this delivery path is deliberately built ahead of its producer:
-/// the wire, the engine and this entry point are exercised only by synthetic levels.
-///
-/// Same threading, timeout and close semantics as
-/// [`punktfunk_connection_next_rumble_cmd`]; the two share one wire plane and one policy engine,
-/// so an embedder calls exactly one of them.
+/// [`punktfunk_connection_next_rumble_cmd`] plus Xbox impulse-trigger motors.
+/// New symbol — growing the old signature would stack-corrupt old embedders.
+/// Render triggers only on pads that have them; never fold into handles.
+/// Same plane as `next_rumble_cmd`; call exactly one.
 ///
 /// # Safety
-/// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
-/// thread pulls rumble — it may run concurrently with the video/audio pullers.
+/// `c` is a valid connection handle; out pointers are writable (NULLs skipped).
+/// At most one rumble puller; it may run concurrently with video/audio.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd2(
@@ -4036,9 +3260,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd2(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -4048,8 +3270,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd2(
             .next_rumble_command(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(cmd) => {
-                // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-
-                // checked before it is written; a non-null one is a caller-owned writable slot.
+                // SAFETY: each out-param is optional; null-checked before write.
                 unsafe {
                     if !pad.is_null() {
                         *pad = cmd.pad;
@@ -4077,15 +3298,9 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd2(
     })
 }
 
-/// Declare a physical actuator's quirks for wire pad `pad` — how a platform parameterizes the
-/// shared rumble policy engine instead of forking it (typically called at controller attach).
-/// `keepalive_ms`: re-emit an unchanged non-zero level at this cadence for actuators whose
-/// hardware output decays between wire renewals (the Steam Deck's ≈ 40 is the one in-tree user);
-/// `0` = none. `min_pulse_ms`: floor for `backstop_ms` on non-zero commands — no in-tree caller
-/// sets it, it exists for embedders whose duration-taking API rejects short values. `flags`:
-/// [`PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER`]. All-zero (the initial state) describes a well-behaved
-/// actuator. See [`ActuatorQuirks`](crate::client::rumble::ActuatorQuirks) for why a renderer that
-/// dedupes its own writes (the Apple HID path) cannot use `keepalive_ms` and keeps its own.
+/// Per-pad rumble quirks (call at attach). `keepalive_ms`: re-emit non-zero
+/// (Steam Deck ≈ 40); `0` = none. `min_pulse_ms`: floor for `backstop_ms`.
+/// A renderer that dedupes its own writes cannot use `keepalive_ms`.
 ///
 /// # Safety
 /// `c` is a valid connection handle. Callable from any thread.
@@ -4099,9 +3314,7 @@ pub unsafe extern "C" fn punktfunk_connection_set_rumble_quirks(
     flags: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -4118,12 +3331,10 @@ pub unsafe extern "C" fn punktfunk_connection_set_rumble_quirks(
     })
 }
 
-/// Pull the next HID-output feedback event the host's virtual pad received from a game
-/// (DualSense lightbar / player LEDs / adaptive trigger — or, on an as-is Steam Controller 2
-/// passthrough session, a raw `PUNKTFUNK_HIDOUT_HID_RAW` report to replay verbatim), into
-/// `*out`. [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once the session
-/// ended. Only the DualSense and SC2 host backends emit these. Same threading rules as
-/// [`punktfunk_connection_next_rumble`] (one puller, may run alongside the other planes).
+/// Pull the next HID-output feedback (DualSense lightbar / player LEDs / adaptive
+/// trigger, or SC2 `PUNKTFUNK_HIDOUT_HID_RAW`) into `*out`.
+/// [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once ended.
+/// DualSense and SC2 backends only. One puller, may run alongside other planes.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable for one `PunktfunkHidOutput`.
@@ -4135,9 +3346,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_hidout(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -4150,8 +3359,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_hidout(
             .next_hidout(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(h) => {
-                // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this
-                // path, written once by value.
+                // SAFETY: `out` is non-null on this path; written once by value.
                 unsafe { *out = PunktfunkHidOutput::from_hid(&h) };
                 PunktfunkStatus::Ok
             }
@@ -4160,13 +3368,10 @@ pub unsafe extern "C" fn punktfunk_connection_next_hidout(
     })
 }
 
-/// Pull the next static HDR metadata update (ST.2086 mastering display + content light level) for
-/// an HDR session, into `*out`. [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`]
-/// once the session ended. The host sends one near session start and re-sends it on mastering
-/// changes / keyframes; apply the latest to the display (`SetHDRMetaData` / `CAEDRMetadata` /
-/// `KEY_HDR_STATIC_INFO`). Only an HDR session (`punktfunk_connection_color_info` reports a PQ
-/// transfer) ever emits these. Same threading rules as [`punktfunk_connection_next_rumble`] (one
-/// puller, may run alongside the other planes).
+/// Pull the next static HDR metadata (ST.2086 + content light) into `*out`.
+/// [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once ended.
+/// Apply the latest to the display. Only an HDR session (PQ transfer from
+/// `punktfunk_connection_color_info`) emits these. One puller.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable for one `PunktfunkHdrMeta`.
@@ -4178,9 +3383,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_hdr_meta(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -4193,8 +3396,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_hdr_meta(
             .next_hdr_meta(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(m) => {
-                // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
-                // written once by value.
+                // SAFETY: caller out-param, non-null on this path, written once.
                 unsafe { *out = PunktfunkHdrMeta::from_meta(&m) };
                 PunktfunkStatus::Ok
             }
@@ -4203,9 +3405,9 @@ pub unsafe extern "C" fn punktfunk_connection_next_hdr_meta(
     })
 }
 
-/// One forwarded host-cursor shape (ABI v11, the cursor channel): straight-alpha RGBA8, no
-/// padding, `len == w * h * 4`, hotspot within `w`×`h`. `serial` is the identity
-/// [`PunktfunkCursorState`] refers to — cache the built OS cursor by it.
+/// Forwarded host-cursor shape: straight-alpha RGBA8, no padding, `len == w * h * 4`,
+/// hotspot within `w`×`h`. `serial` is the identity [`PunktfunkCursorState`] refers
+/// to — cache the built OS cursor by it.
 #[repr(C)]
 pub struct PunktfunkCursorShape {
     pub serial: u32,
@@ -4213,15 +3415,14 @@ pub struct PunktfunkCursorShape {
     pub h: u16,
     pub hot_x: u16,
     pub hot_y: u16,
-    /// Borrows connection memory until the NEXT cursor-shape call (the audio contract).
+    /// Borrows connection memory until the next cursor-shape call.
     pub rgba: *const u8,
     pub len: usize,
 }
 
-/// Per-frame host-cursor state (ABI v11): position (the pointer/hotspot point in the host
-/// video's pixel space), visibility, and the host-driven relative-mode hint. `flags` bit 0 =
-/// visible, bit 1 = relative hint (a host app grabbed/hid the pointer — run captured
-/// relative; clear = return to absolute, reappearing at `x`/`y`).
+/// Per-frame host-cursor state: position in host video pixels, visibility, and
+/// relative-mode hint. `flags` bit 0 = visible, bit 1 = relative (host app
+/// grabbed/hid the pointer — run captured relative; clear = absolute at `x`/`y`).
 #[repr(C)]
 pub struct PunktfunkCursorState {
     pub serial: u32,
@@ -4230,14 +3431,13 @@ pub struct PunktfunkCursorState {
     pub y: i32,
 }
 
-/// Pull the next forwarded cursor SHAPE (sent on pointer-bitmap change over the reliable
-/// control stream; only a session connected with `PUNKTFUNK_CLIENT_CAP_CURSOR` against a
-/// capable host receives any). On `Ok`, `out->rgba` borrows connection memory until the next
-/// cursor-shape call on this handle. Drain from a dedicated thread (one thread per plane).
+/// Pull the next forwarded cursor shape (pointer-bitmap change on the control
+/// stream; only `PUNKTFUNK_CLIENT_CAP_CURSOR` sessions receive any). On `Ok`,
+/// `out->rgba` borrows until the next cursor-shape call. One puller per plane.
 ///
 /// # Safety
-/// `c` is a valid connection handle; `out` is writable. At most one thread pulls cursor
-/// shapes; it may run concurrently with every other plane's puller.
+/// `c` is a valid connection handle; `out` is writable. At most one cursor-shape
+/// puller; it may run concurrently with every other plane.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_cursor_shape(
@@ -4246,9 +3446,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_cursor_shape(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -4263,8 +3461,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_cursor_shape(
             Ok(shape) => {
                 let mut slot = lock_recover(&c.last_cursor_shape);
                 let sh = slot.insert(shape);
-                // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
-                // matching `#[repr(C)]` type, written once by value.
+                // SAFETY: `out` is a caller-owned `#[repr(C)]` slot, written once by value.
                 unsafe {
                     *out = PunktfunkCursorShape {
                         serial: sh.serial,
@@ -4283,13 +3480,13 @@ pub unsafe extern "C" fn punktfunk_connection_next_cursor_shape(
     })
 }
 
-/// Pull the next cursor STATE (a `0xD0` datagram per host encode tick — latest-wins; drain
+/// Pull the next cursor state (`0xD0` per host encode tick — latest-wins; drain
 /// the queue and apply only the newest). Same negotiation gate as
 /// [`punktfunk_connection_next_cursor_shape`].
 ///
 /// # Safety
-/// `c` is a valid connection handle; `out` is writable. At most one thread pulls cursor
-/// state; it may run concurrently with every other plane's puller.
+/// `c` is a valid connection handle; `out` is writable. At most one cursor-state
+/// puller; it may run concurrently with every other plane.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_next_cursor_state(
@@ -4298,9 +3495,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_cursor_state(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -4313,8 +3508,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_cursor_state(
             .next_cursor_state(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(st) => {
-                // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
-                // matching `#[repr(C)]` type, written once by value.
+                // SAFETY: `out` is a caller-owned `#[repr(C)]` slot, written once by value.
                 unsafe {
                     *out = PunktfunkCursorState {
                         serial: st.serial,
@@ -4330,12 +3524,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_cursor_state(
     })
 }
 
-/// Tell the host who renders the pointer (design/remote-desktop-sweep.md §8 — the mid-stream
-/// mouse-model flip): `client_draws = true` = this client draws it locally (the desktop mouse
-/// model; the host excludes the pointer from the video and forwards shape/state), `false` =
-/// the host composites it into the video (the capture model — full fidelity, the pre-channel
-/// look). Idempotent, latest-wins; harmless against hosts without the cursor cap (an unknown
-/// control message type, ignored). ABI v12.
+/// Who draws the pointer (`design/remote-desktop-sweep.md`). `true` = client
+/// draws (host forwards shape/state); `false` = host composites. Latest-wins.
 ///
 /// # Safety
 /// `c` is a valid connection handle.
@@ -4346,9 +3536,7 @@ pub unsafe extern "C" fn punktfunk_connection_set_cursor_render(
     client_draws: bool,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -4360,13 +3548,11 @@ pub unsafe extern "C" fn punktfunk_connection_set_cursor_render(
     })
 }
 
-/// Pull the next per-AU host timing (0xCF) into `*out`: the host's capture→sent duration for one
-/// access unit, correlated to the AU by `pts_ns` (see [`PunktfunkHostTiming`]).
-/// [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once the session ended.
-/// A stats consumer drains this non-blockingly (`timeout_ms = 0`) alongside its frame samples;
-/// an older host never emits any — keep showing the combined `host+network` stage then. Same
-/// threading rules as [`punktfunk_connection_next_rumble`] (one puller, may run alongside the
-/// other planes).
+/// Pull the next per-AU host timing (0xCF) into `*out`: capture→sent duration,
+/// correlated by `pts_ns` (see [`PunktfunkHostTiming`]).
+/// [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once ended.
+/// Drain non-blockingly (`timeout_ms = 0`). A host that never emits any: keep
+/// showing the combined `host+network` stage. One puller.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable for one `PunktfunkHostTiming`.
@@ -4378,9 +3564,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_host_timing(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -4393,8 +3577,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_host_timing(
             .next_host_timing(std::time::Duration::from_millis(timeout_ms as u64))
         {
             Ok(t) => {
-                // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
-                // matching `#[repr(C)]` type, written once by value.
+                // SAFETY: `out` is a caller-owned `#[repr(C)]` slot, written once by value.
                 unsafe {
                     *out = PunktfunkHostTiming {
                         pts_ns: t.pts_ns,
@@ -4408,12 +3591,11 @@ pub unsafe extern "C" fn punktfunk_connection_next_host_timing(
     })
 }
 
-/// Read the session's resolved colour signalling + encode bit depth (from the host's Welcome).
-/// Each out pointer is filled when non-NULL: `primaries`/`transfer`/`matrix` are CICP code points
-/// (BT.709 = 1; BT.2020 = 9; PQ transfer = 16, HLG = 18; BT.2020-NCL matrix = 9), `full_range` is
-/// 0 (limited) or 1 (full), `bit_depth` is 8 or 10. A `transfer` of 16/18 means HDR — configure an
-/// HDR present path and drain [`punktfunk_connection_next_hdr_meta`]. Available immediately after a
-/// successful connect (these don't change without a reconfigure).
+/// Resolved colour signalling + encode bit depth. Each out pointer is filled when
+/// non-NULL: `primaries`/`transfer`/`matrix` are CICP (BT.709 = 1; BT.2020 = 9;
+/// PQ = 16, HLG = 18; BT.2020-NCL = 9), `full_range` 0/1, `bit_depth` 8 or 10.
+/// Transfer 16/18 is HDR — drain [`punktfunk_connection_next_hdr_meta`]. Fixed
+/// until a reconfigure.
 ///
 /// # Safety
 /// `c` is a valid connection handle; each out pointer is NULL or writable for its scalar.
@@ -4428,16 +3610,13 @@ pub unsafe extern "C" fn punktfunk_connection_color_info(
     bit_depth: *mut u8,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
         let color = c.inner.color;
-        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
-        // before it is written; a non-null one is a caller-owned writable slot.
+        // SAFETY: each out-param is optional; null-checked before write.
         unsafe {
             if !primaries.is_null() {
                 *primaries = color.primaries;
@@ -4459,11 +3638,9 @@ pub unsafe extern "C" fn punktfunk_connection_color_info(
     })
 }
 
-/// Read the session's resolved chroma subsampling (from the host's Welcome) as the HEVC
-/// `chroma_format_idc`: `1` = 4:2:0 (the default every pre-4:4:4 host produced), `3` = full-chroma
-/// 4:4:4. `*out` is filled when non-NULL. The in-band SPS is authoritative; this lets the embedder
-/// pre-size its decoder / pick a 4:4:4 pixel format up front. Available immediately after a
-/// successful connect (it doesn't change without a reconfigure).
+/// Resolved chroma as HEVC `chroma_format_idc`: `1` = 4:2:0, `3` = 4:4:4.
+/// `*out` is filled when non-NULL. In-band SPS is authoritative; this lets the
+/// embedder pre-size the decoder. Fixed until a reconfigure.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -4474,9 +3651,7 @@ pub unsafe extern "C" fn punktfunk_connection_chroma_format(
     out: *mut u8,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -4489,11 +3664,9 @@ pub unsafe extern "C" fn punktfunk_connection_chroma_format(
     })
 }
 
-/// Read the video codec the host resolved for this session (from its Welcome): one of
-/// [`PUNKTFUNK_CODEC_H264`] / [`PUNKTFUNK_CODEC_HEVC`] / [`PUNKTFUNK_CODEC_AV1`]. The embedder builds
-/// its decoder from THIS (never assuming HEVC). `*out` is filled when non-NULL. Available
-/// immediately after a successful connect (it doesn't change without a reconfigure). An older host
-/// that didn't negotiate a codec reports [`PUNKTFUNK_CODEC_HEVC`].
+/// Host-resolved video codec: [`PUNKTFUNK_CODEC_H264`] / [`PUNKTFUNK_CODEC_HEVC`] /
+/// [`PUNKTFUNK_CODEC_AV1`]. Build the decoder from this (never assume HEVC).
+/// `*out` is filled when non-NULL. A host that did not negotiate reports HEVC.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -4504,9 +3677,7 @@ pub unsafe extern "C" fn punktfunk_connection_codec(
     out: *mut u8,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -4519,11 +3690,10 @@ pub unsafe extern "C" fn punktfunk_connection_codec(
     })
 }
 
-/// Read the session's negotiated wire shard payload (the `Welcome`'s value, bytes). This is the
-/// parse-window size of a [`USER_FLAG_CHUNK_ALIGNED`] AU (PyroWave datagram-aligned mode,
-/// design/pyrowave-codec-plan.md §4.4): every `shard_payload`-sized window of the frame buffer
-/// starts a fresh self-delimiting chunk. Clients that decode PyroWave natively (the Apple Metal
-/// port) need it to walk those AUs; other codecs never need this.
+/// Negotiated wire shard payload (Welcome, bytes). Parse-window size of a
+/// chunk-aligned AU (PyroWave datagram-aligned, `design/pyrowave-codec-plan.md`):
+/// every `shard_payload`-sized window starts a self-delimiting chunk. Other
+/// codecs never need this.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u32`.
@@ -4534,9 +3704,7 @@ pub unsafe extern "C" fn punktfunk_connection_shard_payload(
     out: *mut u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -4550,8 +3718,7 @@ pub unsafe extern "C" fn punktfunk_connection_shard_payload(
 }
 
 /// Send one input event to the host as a QUIC datagram (non-blocking enqueue).
-///
-/// Returns `InvalidArg` if `ev->kind` is not a recognized event kind.
+/// `InvalidArg` if `ev->kind` is not a recognized event kind.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `ev` points to a readable `InputEvent`-sized allocation.
@@ -4562,15 +3729,12 @@ pub unsafe extern "C" fn punktfunk_connection_send_input(
     ev: *const InputEvent,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: `read_input_event` upholds this file's failures-become-status-codes principle
-        // for the one field where a reference formed too early would be UB instead.
+        // SAFETY: `read_input_event` validates the tag before forming `&InputEvent` (else UB).
         let ev = match unsafe { read_input_event(ev) } {
             Ok(e) => e,
             Err(status) => return status,
@@ -4582,14 +3746,13 @@ pub unsafe extern "C" fn punktfunk_connection_send_input(
     })
 }
 
-/// Send one Opus mic frame to the host as a QUIC datagram (48 kHz; the host decodes it into a
-/// virtual microphone source its apps can record). Non-blocking enqueue; the host uses `seq`/
-/// `pts_ns` (the caller's own counters) only for diagnostics. `opus_data`/`len` may be empty
-/// (a DTX silence frame). The data is copied; the caller may reuse the buffer after this returns.
+/// Send one Opus mic frame (48 kHz) as a QUIC datagram. The host decodes it into
+/// a virtual microphone. Non-blocking; `seq`/`pts_ns` are diagnostics only.
+/// Empty `opus_data`/`len` is DTX. Data is copied before return.
 ///
 /// # Safety
-/// `c` is a valid connection handle. For a representable nonzero `len`, `opus_data` points to
-/// that many readable bytes; it may be NULL when `len == 0`.
+/// `c` is a valid connection handle. For a representable nonzero `len`, `opus_data`
+/// points to that many readable bytes; it may be NULL when `len == 0`.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_send_mic(
@@ -4600,9 +3763,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_mic(
     pts_ns: u64,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -4627,10 +3788,8 @@ pub unsafe extern "C" fn punktfunk_connection_send_mic(
     })
 }
 
-/// Send one rich input event (DualSense touchpad contact or motion sample) to the host as a QUIC
-/// datagram (non-blocking enqueue). The host applies it to its virtual DualSense pad — a no-op
-/// unless the host runs the DualSense gamepad backend. [`PunktfunkStatus::InvalidArg`] on an
-/// unknown `kind`.
+/// Send one rich input (DualSense touchpad contact or motion) as a QUIC datagram.
+/// No-op unless the host runs the DualSense backend. `InvalidArg` on unknown `kind`.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `rich` points to a valid [`PunktfunkRichInput`].
@@ -4641,16 +3800,12 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input(
     rich: *const PunktfunkRichInput,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let rich = match unsafe { rich.as_ref() } {
             Some(r) => r,
             None => return PunktfunkStatus::NullPointer,
@@ -4665,9 +3820,9 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input(
     })
 }
 
-/// Send a rich client→host input via the forward-compatible [`PunktfunkRichInputEx`] — the only way
-/// a C client can emit a `TouchpadEx` (a second trackpad / signed coords / pressure). Set
-/// `rich->struct_size = sizeof(PunktfunkRichInputEx)`; a smaller (older-layout) value is rejected.
+/// Send rich input via [`PunktfunkRichInputEx`] — the C path for `TouchpadEx`
+/// (second trackpad / signed coords / pressure). Set
+/// `rich->struct_size = sizeof(PunktfunkRichInputEx)`; a smaller layout is rejected.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `rich` is null or points to at least its declared
@@ -4679,9 +3834,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input2(
     rich: *const PunktfunkRichInputEx,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -4689,17 +3842,13 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input2(
         if rich.is_null() {
             return PunktfunkStatus::NullPointer;
         }
-        // Read only the 4-byte size prefix first to bound the subsequent full read (the
-        // `PunktfunkConfig` ABI-skew precedent).
-        // SAFETY: `addr_of!` forms a raw pointer WITHOUT creating a reference, which is the point:
-        // the caller's struct may be an older, smaller version, so the field is read by offset
-        // rather than through a `&`.
+        // Size prefix first so the full read is bounded by what the caller declared.
+        // SAFETY: `addr_of!` does not form a `&`; the caller may have a smaller older layout.
         let declared = unsafe { std::ptr::addr_of!((*rich).struct_size).read_unaligned() } as usize;
         if declared < std::mem::size_of::<PunktfunkRichInputEx>() {
             return PunktfunkStatus::InvalidArg;
         }
-        // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
-        // and are null-checked or handle-validated on this path before they are read.
+        // SAFETY: pointers are caller-supplied and null-checked on this path.
         match unsafe { *rich }.to_rich() {
             Some(r) => match c.inner.send_rich_input(r) {
                 Ok(()) => PunktfunkStatus::Ok,
@@ -4710,11 +3859,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input2(
     })
 }
 
-/// The clamp behind [`punktfunk_connection_send_hid_report`], split out so the tests reach it
-/// without a live connection: `pad` masked into the 16-pad wire space and the report bounded to
-/// [`HID_REPORT_MAX`](crate::quic::HID_REPORT_MAX) — the same rules the Android JNI shim applies
-/// (`clients/android/native/src/session/input.rs`, `nativeSendPadHidReport`), so the two client
-/// entry points can never disagree about what reaches the wire.
+/// Clamp `pad` to 16 and the report to `HID_REPORT_MAX` — same rules as the Android shim.
 #[cfg(feature = "quic")]
 fn hid_report_rich_input(pad: u8, report: &[u8]) -> crate::quic::RichInput {
     let n = report.len().min(crate::quic::HID_REPORT_MAX);
@@ -4727,15 +3872,8 @@ fn hid_report_rich_input(pad: u8, report: &[u8]) -> crate::quic::RichInput {
     }
 }
 
-/// Send one raw HID input report from a client-captured controller — the as-is Steam Controller 2
-/// passthrough's up direction (`[0xCC][0x04]` on the wire, [`RichInput::HidReport`](crate::quic::RichInput))
-/// — as a QUIC datagram (non-blocking enqueue). `data[..len]` is the report exactly as the device
-/// produced it on its interrupt endpoint / GATT notify, id byte first (`0x42`/`0x45`/`0x47` state,
-/// `0x43` battery, …); `len` is clamped to `PUNKTFUNK_HID_REPORT_MAX` and `pad` masked into the
-/// 16-pad wire space. Best-effort/lossy by design — state reports are idempotent snapshots at the
-/// device's own rate, so a lost datagram self-heals on the next one. A no-op unless the pad
-/// declared `PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2` and the host runs the as-is backend.
-/// [`PunktfunkStatus::InvalidArg`] on an empty report.
+/// Send one raw HID input report (SC2 as-is, `[0xCC][0x04]`). `len` clamps to
+/// `HID_REPORT_MAX`; `pad` masks to 16. Lossy snapshots; empty is `InvalidArg`.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `data` points to `len` readable bytes.
@@ -4748,9 +3886,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_hid_report(
     len: usize,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -4761,8 +3897,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_hid_report(
         if len == 0 {
             return PunktfunkStatus::InvalidArg;
         }
-        // SAFETY: per the ABI contract - a caller-supplied pointer/length pair describing one
-        // readable region, borrowed only for this call (the clamp copies before returning).
+        // SAFETY: caller pointer/length; borrowed for this call only. The clamp copies.
         let report =
             unsafe { std::slice::from_raw_parts(data, len.min(crate::quic::HID_REPORT_MAX)) };
         match c.inner.send_rich_input(hid_report_rich_input(pad, report)) {
@@ -4772,14 +3907,11 @@ pub unsafe extern "C" fn punktfunk_connection_send_hid_report(
     })
 }
 
-/// Send one stylus sample batch — `count` (`1..=PUNKTFUNK_PEN_BATCH_MAX`) state-full
-/// [`PunktfunkPenSample`]s, oldest first (a capture callback's coalesced samples) — as one
-/// `0xCC/0x05` pen datagram (non-blocking enqueue; design/pen-tablet-input.md). Split longer
-/// runs into consecutive calls. Gate on `punktfunk_connection_host_caps() &
-/// PUNKTFUNK_HOST_CAP_PEN`: toward a host without the bit this returns
-/// [`PunktfunkStatus::Unsupported`] — keep the pen-as-touch fallback there.
-/// [`PunktfunkStatus::InvalidArg`] on a bad count or a bad sample (non-finite coordinate,
-/// unknown state bit / tool).
+/// Send one stylus sample batch — `count` (`1..=PUNKTFUNK_PEN_BATCH_MAX`)
+/// [`PunktfunkPenSample`]s, oldest first — as one `0xCC/0x05` pen datagram
+/// (`design/pen-tablet-input.md`). Split longer runs. Gate on
+/// `host_caps & PUNKTFUNK_HOST_CAP_PEN`; without it this is `Unsupported` (keep
+/// pen-as-touch). `InvalidArg` on a bad count or sample.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `samples` is null or points to `count` valid
@@ -4792,9 +3924,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_pen(
     count: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -4805,8 +3935,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_pen(
         if count == 0 || count > PUNKTFUNK_PEN_BATCH_MAX {
             return PunktfunkStatus::InvalidArg;
         }
-        // SAFETY: per the ABI contract - a caller-supplied pointer/length pair describing one
-        // readable region, borrowed only for this call.
+        // SAFETY: caller pointer/length; borrowed for this call only.
         let raw = unsafe { std::slice::from_raw_parts(samples, count as usize) };
         let mut batch = [crate::quic::PenSample::default(); crate::quic::PEN_BATCH_MAX];
         for (slot, s) in batch.iter_mut().zip(raw) {
@@ -4822,11 +3951,11 @@ pub unsafe extern "C" fn punktfunk_connection_send_pen(
     })
 }
 
-/// The currently active session mode — the Welcome's, until an accepted
+/// Currently active session mode — Welcome's, until an accepted
 /// [`punktfunk_connection_request_mode`] switches it. Safe any time after connect.
 ///
 /// # Safety
-/// `c` is a valid connection handle; out pointers are writable (NULLs are skipped).
+/// `c` is a valid connection handle; out pointers are writable (NULLs skipped).
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_mode(
@@ -4836,16 +3965,13 @@ pub unsafe extern "C" fn punktfunk_connection_mode(
     refresh_hz: *mut u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
         let mode = c.inner.mode();
-        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
-        // before it is written; a non-null one is a caller-owned writable slot.
+        // SAFETY: each out-param is optional; null-checked before write.
         unsafe {
             if !width.is_null() {
                 *width = mode.width;
@@ -4861,10 +3987,9 @@ pub unsafe extern "C" fn punktfunk_connection_mode(
     })
 }
 
-/// The virtual gamepad backend the host actually resolved for this session (one of the
-/// `PUNKTFUNK_GAMEPAD_*` values; the `Welcome`'s echo of the [`punktfunk_connect_ex2`]
-/// preference). `PUNKTFUNK_GAMEPAD_AUTO` = an older host that didn't say — assume X-Box 360,
-/// no HID-output feedback. Safe any time after connect.
+/// Virtual gamepad the host resolved (`PUNKTFUNK_GAMEPAD_*`; Welcome echo of
+/// [`punktfunk_connect_ex2`]). `AUTO` = a host that didn't say — assume X-Box 360,
+/// no HID-output. Safe any time after connect.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `gamepad` is writable (NULL is skipped).
@@ -4875,15 +4000,12 @@ pub unsafe extern "C" fn punktfunk_connection_gamepad(
     gamepad: *mut u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
-        // before it is written; a non-null one is a caller-owned writable slot.
+        // SAFETY: each out-param is optional; null-checked before write.
         unsafe {
             if !gamepad.is_null() {
                 *gamepad = c.inner.resolved_gamepad.to_u8() as u32;
@@ -4893,29 +4015,26 @@ pub unsafe extern "C" fn punktfunk_connection_gamepad(
     })
 }
 
-// ============================================================================================
-// Shared clipboard (design/clipboard-and-file-transfer.md §5.1). Additive, ABI v6. All poll/serve
-// bytes ride the mTLS-pinned QUIC session; nothing here opens a new listener or port.
-// ============================================================================================
+// Shared clipboard (`design/clipboard-and-file-transfer.md`). All poll/serve
+// bytes ride the mTLS-pinned QUIC session; nothing here opens a new listener.
 
-/// [`PunktfunkClipEvent::kind`] — the host announced clipboard content is available
-/// (`transfer_id` = the offer `seq`; `data`/`len` = a `\n`-separated `"<mime>\t<size_hint>"`
-/// format list). Fetch it lazily (only on a local paste) via
-/// [`punktfunk_connection_clipboard_fetch`].
+/// [`PunktfunkClipEvent::kind`]: host announced clipboard content
+/// (`transfer_id` = offer `seq`; `data`/`len` = `\n`-separated `"<mime>\t<size_hint>"`).
+/// Fetch lazily on local paste via [`punktfunk_connection_clipboard_fetch`].
 pub const PUNKTFUNK_CLIP_REMOTE_OFFER: u8 = 1;
-/// [`PunktfunkClipEvent::kind`] — host ack / policy / backend update (`enabled`/`policy`/`reason`
-/// valid). Reflect it in the toggle UI.
+/// [`PunktfunkClipEvent::kind`]: host ack / policy / backend update
+/// (`enabled`/`policy`/`reason` valid). Reflect it in the toggle UI.
 pub const PUNKTFUNK_CLIP_STATE: u8 = 2;
-/// [`PunktfunkClipEvent::kind`] — the host is pasting our offered data: answer with
-/// [`punktfunk_connection_clipboard_serve`] (`transfer_id` = `req_id`; `seq`/`file_index` valid;
-/// `data`/`len` = the requested MIME).
+/// [`PunktfunkClipEvent::kind`]: host is pasting our offered data. Answer with
+/// [`punktfunk_connection_clipboard_serve`] (`transfer_id` = `req_id`;
+/// `seq`/`file_index` valid; `data`/`len` = requested MIME).
 pub const PUNKTFUNK_CLIP_FETCH_REQUEST: u8 = 3;
-/// [`PunktfunkClipEvent::kind`] — bytes for a fetch we started (`transfer_id` = `xfer_id`;
-/// `data`/`len` = the payload, borrowed until the next `next_clipboard`; `last` = final chunk).
+/// [`PunktfunkClipEvent::kind`]: bytes for a fetch we started (`transfer_id` = `xfer_id`;
+/// `data`/`len` borrowed until the next `next_clipboard`; `last` = final chunk).
 pub const PUNKTFUNK_CLIP_DATA: u8 = 4;
-/// [`PunktfunkClipEvent::kind`] — a transfer was cancelled (`transfer_id` = the id).
+/// [`PunktfunkClipEvent::kind`]: a transfer was cancelled (`transfer_id` = the id).
 pub const PUNKTFUNK_CLIP_CANCELLED: u8 = 5;
-/// [`PunktfunkClipEvent::kind`] — a transfer failed (`transfer_id` = the id; `status` = a
+/// [`PunktfunkClipEvent::kind`]: a transfer failed (`transfer_id` = the id; `status` = a
 /// `PunktfunkStatus` code).
 pub const PUNKTFUNK_CLIP_ERROR: u8 = 6;
 
@@ -4929,8 +4048,8 @@ pub struct PunktfunkClipKind {
     pub size_hint: u64,
 }
 
-/// A shared-clipboard event, filled by [`punktfunk_connection_next_clipboard`]. A flat tagged
-/// struct (like `PunktfunkHidOutput`): read the fields named in the `kind`'s doc; the rest are 0.
+/// Shared-clipboard event from [`punktfunk_connection_next_clipboard`]. Flat tagged
+/// struct: read the fields named in the `kind`'s doc; the rest are 0.
 #[cfg(feature = "quic")]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -4945,7 +4064,7 @@ pub struct PunktfunkClipEvent {
     pub reason: u8,
     /// `Data`: 1 = final chunk of this transfer.
     pub last: u8,
-    /// Per-transfer id: the offer `seq` (RemoteOffer), the `req_id` (FetchRequest), or the
+    /// Per-transfer id: offer `seq` (RemoteOffer), `req_id` (FetchRequest), or
     /// `xfer_id` (Data/Cancelled/Error).
     pub transfer_id: u32,
     /// `FetchRequest`: the offer `seq` the request is against.
@@ -4954,15 +4073,15 @@ pub struct PunktfunkClipEvent {
     pub file_index: u32,
     /// `Error`: a `PunktfunkStatus` code (negative); 0 otherwise.
     pub status: i32,
-    /// RemoteOffer/FetchRequest/Data: a pointer into a per-connection slot, valid until the next
-    /// `next_clipboard` call; NULL for the other kinds.
+    /// RemoteOffer/FetchRequest/Data: pointer into a per-connection slot, valid
+    /// until the next `next_clipboard`; NULL for the other kinds.
     pub data: *const u8,
     /// Byte length of `data` (0 when `data` is NULL).
     pub len: usize,
 }
 
-/// Fill a [`PunktfunkClipEvent`] from a core event, parking any variable-length bytes in `slot`
-/// (borrow-until-next-call) and pointing `data`/`len` at them.
+/// Fill a [`PunktfunkClipEvent`] from a core event, parking variable-length bytes
+/// in `slot` (borrow-until-next-call) and pointing `data`/`len` at them.
 #[cfg(feature = "quic")]
 fn build_clip_event(
     ev: crate::clipboard::ClipEventCore,
@@ -5045,15 +4164,8 @@ fn build_clip_event(
     out
 }
 
-/// The host's management-API port, from this session's `Welcome` — where its game library is
-/// served (distinct from the streaming ports). `0` means the host did not advertise one: an older
-/// host, or the standalone `punktfunk1-host` binary, which has no management API. Treat `0` as
-/// "unknown" and fall back to your own default (47990), never as a port to dial.
-///
-/// This exists so a client does NOT need mDNS to find the library. The port used to live only in
-/// the host's mDNS TXT, so a host that had moved it off 47990 — the supported way to coexist with
-/// a Sunshine fork, whose web UI owns that port — was reachable only where multicast worked. Read
-/// this after connect and prefer it over any cached or default value. Safe any time after connect.
+/// Host management-API port from `Welcome`. `0` = unknown (do not dial 0; fall
+/// back to 47990). Prefer this over mDNS/cached after connect.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `port` is writable (NULL is skipped).
@@ -5064,14 +4176,12 @@ pub unsafe extern "C" fn punktfunk_connection_mgmt_port(
     port: *mut u16,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_ref` reports as `None` and the `match` handles.
+        // SAFETY: caller handle or null; `as_ref` never dereferences null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: per the ABI contract - the out-param is OPTIONAL, so it is null-checked before
-        // it is written; a non-null one is a caller-owned writable slot.
+        // SAFETY: out-param is optional; null-checked before write.
         unsafe {
             if !port.is_null() {
                 *port = c.inner.mgmt_port();
@@ -5081,11 +4191,9 @@ pub unsafe extern "C" fn punktfunk_connection_mgmt_port(
     })
 }
 
-/// The host capability bitfield the session's `Welcome` carried — a bitfield of
-/// `PUNKTFUNK_HOST_CAP_GAMEPAD_STATE` / `PUNKTFUNK_HOST_CAP_CLIPBOARD` /
-/// `PUNKTFUNK_HOST_CAP_PEN`. A client tests `caps & PUNKTFUNK_HOST_CAP_CLIPBOARD` to decide
-/// whether to offer the shared-clipboard toggle, `caps & PUNKTFUNK_HOST_CAP_PEN` before
-/// sending stylus batches. Safe any time after connect.
+/// Host capability bitfield from `Welcome` (`PUNKTFUNK_HOST_CAP_*`). Test
+/// `CLIPBOARD` before offering the toggle, `PEN` before sending stylus batches.
+/// Safe any time after connect.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `caps` is writable (NULL is skipped).
@@ -5096,15 +4204,12 @@ pub unsafe extern "C" fn punktfunk_connection_host_caps(
     caps: *mut u8,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
-        // before it is written; a non-null one is a caller-owned writable slot.
+        // SAFETY: each out-param is optional; null-checked before write.
         unsafe {
             if !caps.is_null() {
                 *caps = c.inner.host_caps();
@@ -5114,9 +4219,8 @@ pub unsafe extern "C" fn punktfunk_connection_host_caps(
     })
 }
 
-/// The SECOND host capability byte the session's `Welcome` carried — today
-/// `PUNKTFUNK_HOST_CAP2_TOUCH`. `0` toward an older host, which never sends the byte. Safe any
-/// time after connect.
+/// Second host capability byte from `Welcome` — today `PUNKTFUNK_HOST_CAP2_TOUCH`.
+/// `0` toward a host that never sends the byte. Safe any time after connect.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `caps` is writable (NULL is skipped).
@@ -5127,15 +4231,12 @@ pub unsafe extern "C" fn punktfunk_connection_host_caps2(
     caps: *mut u8,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: per the ABI contract - the out-param is OPTIONAL, so it is null-checked before
-        // it is written; a non-null one is a caller-owned writable slot.
+        // SAFETY: out-param is optional; null-checked before write.
         unsafe {
             if !caps.is_null() {
                 *caps = c.inner.host_caps2();
@@ -5145,17 +4246,9 @@ pub unsafe extern "C" fn punktfunk_connection_host_caps2(
     })
 }
 
-/// The session's LIVE effective access grants — a `PUNKTFUNK_GRANT_*` bitmask
-/// (per-client access, `design/per-client-access.md` §7): seeded from the `Welcome` advert
-/// and moved by every mid-session `AccessUpdate` the host sends (latest wins), so this is
-/// current state, NOT a connect-time snapshot. An old host advertises nothing and this reads
-/// `PUNKTFUNK_GRANT_ALL` — full control, the pre-grants behavior, so an embedder keying UI
-/// off it changes nothing there.
-///
-/// Courtesy truth only: the HOST enforces the mask whatever a client renders. Use it to not
-/// capture what can't land (no pointer lock / keyboard grab without the bits) and to label
-/// the session ("Controller only"). Cheap (one relaxed atomic load) — poll it alongside a
-/// stats tick rather than caching it for the session. Safe any time after connect.
+/// Live `PUNKTFUNK_GRANT_*` mask (`design/per-client-access.md`). Latest
+/// `AccessUpdate` wins; hosts that omit it read `PUNKTFUNK_GRANT_ALL`. Courtesy
+/// only — the host enforces. Poll; do not cache for the session.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `grants` is writable (NULL is skipped).
@@ -5166,14 +4259,12 @@ pub unsafe extern "C" fn punktfunk_connection_grants(
     grants: *mut u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_ref` reports as `None` and the `match` handles.
+        // SAFETY: caller handle or null; `as_ref` never dereferences null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: per the ABI contract - the out-param is OPTIONAL, so it is null-checked before
-        // it is written; a non-null one is a caller-owned writable slot.
+        // SAFETY: out-param is optional; null-checked before write.
         unsafe {
             if !grants.is_null() {
                 *grants = c.inner.access_grants();
@@ -5183,18 +4274,9 @@ pub unsafe extern "C" fn punktfunk_connection_grants(
     })
 }
 
-/// Seconds until this session's access expires, LIVE — counted down from the `Welcome`'s
-/// `expires_in_secs` and re-anchored by every mid-session `AccessUpdate`, so successive reads
-/// shrink on their own (render a countdown by polling this, ~1 Hz). `0` = permanent: today's
-/// default, and everything an old host's Welcome decodes to — show nothing then. The deadline
-/// is anchored to the CLIENT's clock at receipt (the wire carries relative seconds), so
-/// host/client skew never moves the countdown.
-///
-/// While a deadline exists the value never reads `0`: in the sliver between the deadline
-/// passing and the host's typed expiry close (`PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED`
-/// via [`punktfunk_connection_end_reject`]) it clamps to `1`, so `0` stays unambiguous.
-/// The T−5 m / T−1 m warnings are the embedder's to derive from the countdown crossing
-/// those marks. Safe any time after connect.
+/// Seconds until access expires. `0` = permanent. While a deadline is set the
+/// value never reads `0` (clamps to 1 past expiry until the typed close).
+/// Anchored to the client clock at receipt.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `secs` is writable (NULL is skipped).
@@ -5205,8 +4287,7 @@ pub unsafe extern "C" fn punktfunk_connection_access_expires_in(
     secs: *mut u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_ref` reports as `None` and the `match` handles.
+        // SAFETY: caller handle or null; `as_ref` never dereferences null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -5221,8 +4302,7 @@ pub unsafe extern "C" fn punktfunk_connection_access_expires_in(
                     .max(1)
             }
         };
-        // SAFETY: per the ABI contract - the out-param is OPTIONAL, so it is null-checked before
-        // it is written; a non-null one is a caller-owned writable slot.
+        // SAFETY: out-param is optional; null-checked before write.
         unsafe {
             if !secs.is_null() {
                 *secs = remaining;
@@ -5232,15 +4312,8 @@ pub unsafe extern "C" fn punktfunk_connection_access_expires_in(
     })
 }
 
-/// The typed rejection a MID-SESSION close carried, as its `PUNKTFUNK_STATUS_REJECTED_*`
-/// value (`0` = none — every ordinary end). Exists because
-/// [`punktfunk_connection_end_reason`] can only file an unrecognized deliberate close under
-/// `PUNKTFUNK_END_REASON_HOST_ERROR`, and "the host ended the session with an error" is the
-/// wrong sentence for an access expiry (`PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED`) — the
-/// case this was added for; any future typed mid-session close surfaces the same way. Ask
-/// AFTER the session ended, before freeing the handle, exactly like `end_reason` (the two
-/// latch together); connect-time rejections never land here — they come back from the
-/// connect call itself.
+/// Mid-session typed rejection (`PUNKTFUNK_STATUS_REJECTED_*`); `0` = none.
+/// Ask after `Closed`, before free. Connect-time rejections come from connect.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `status` is writable (NULL is skipped).
@@ -5251,8 +4324,7 @@ pub unsafe extern "C" fn punktfunk_connection_end_reject(
     status: *mut i32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_ref` reports as `None` and the `match` handles.
+        // SAFETY: caller handle or null; `as_ref` never dereferences null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -5261,8 +4333,7 @@ pub unsafe extern "C" fn punktfunk_connection_end_reject(
             Some(reason) => crate::error::PunktfunkError::Rejected(reason).status() as i32,
             None => 0,
         };
-        // SAFETY: per the ABI contract - the out-param is OPTIONAL, so it is null-checked before
-        // it is written; a non-null one is a caller-owned writable slot.
+        // SAFETY: out-param is optional; null-checked before write.
         unsafe {
             if !status.is_null() {
                 *status = value;
@@ -5272,9 +4343,9 @@ pub unsafe extern "C" fn punktfunk_connection_end_reject(
     })
 }
 
-/// Enable or disable the shared clipboard for this session (`design` §3.1). Opt-in: nothing is
-/// announced or served until this is called with `enabled = true`. `flags` carries
-/// `quic::CLIP_FLAG_FILES` (allow file transfer). The host replies with a `State` event.
+/// Enable or disable the shared clipboard. Opt-in: nothing is announced or served
+/// until `enabled = true`. `flags` carries `quic::CLIP_FLAG_FILES`. The host
+/// replies with a `State` event.
 ///
 /// # Safety
 /// `c` is a valid connection handle.
@@ -5286,9 +4357,7 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_control(
     flags: u8,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -5300,13 +4369,13 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_control(
     })
 }
 
-/// Announce that the local clipboard changed — the lazy format-list offer. `seq` is a monotonic
-/// per-sender counter (newest wins); `kinds`/`n` is the advertised formats (≤ 16). The bytes cross
-/// only if the host later fetches.
+/// Announce that the local clipboard changed — the lazy format-list offer. `seq`
+/// is monotonic per sender (newest wins); `kinds`/`n` is the advertised formats
+/// (≤ 16). Bytes cross only if the host later fetches.
 ///
 /// # Safety
-/// `c` is a valid connection handle. For `n <= 16`, `kinds` points to `n` `PunktfunkClipKind`s
-/// (NULL only for zero), each with a valid NUL-terminated UTF-8 `mime`.
+/// `c` is a valid connection handle. For `n <= 16`, `kinds` points to `n`
+/// `PunktfunkClipKind`s (NULL only for zero), each with a NUL-terminated UTF-8 `mime`.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_clipboard_offer(
@@ -5316,9 +4385,7 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_offer(
     n: usize,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -5331,15 +4398,13 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_offer(
         }
         let mut out = Vec::with_capacity(n);
         if n != 0 {
-            // SAFETY: the ABI contract supplies `n` entries; the cap and `ffi_slice_bytes` prove
-            // the extent is representable, and the slice is borrowed only for this call.
+            // SAFETY: `n` is capped and `ffi_slice_bytes`-checked; borrowed for this call.
             let slice = unsafe { std::slice::from_raw_parts(kinds, n) };
             for k in slice {
                 let mime = if k.mime.is_null() {
                     String::new()
                 } else {
-                    // SAFETY: per the ABI contract - a caller-supplied C string, NUL-terminated or
-                    // null, borrowed only for this call.
+                    // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
                     match unsafe { std::ffi::CStr::from_ptr(k.mime) }.to_str() {
                         Ok(s) => s.to_string(),
                         Err(_) => return PunktfunkStatus::InvalidArg,
@@ -5358,14 +4423,13 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_offer(
     })
 }
 
-/// Start pulling one format (`mime`) of the host's current offer `seq` — lazily, on a local paste.
-/// `file_index` selects a file for a file transfer, or `quic::CLIP_FILE_INDEX_NONE` for a non-file
-/// format. Writes the transfer id (echoed on the resulting `Data`/`Error`/`Cancelled` event) to
-/// `xfer_id_out`.
+/// Start pulling one format (`mime`) of the host's current offer `seq` — lazily,
+/// on a local paste. `file_index` selects a file, or `quic::CLIP_FILE_INDEX_NONE`.
+/// Writes the transfer id to `xfer_id_out`.
 ///
 /// # Safety
-/// `c` is a valid connection handle; `mime` is a valid NUL-terminated UTF-8 string; `xfer_id_out`
-/// is writable (NULL is skipped).
+/// `c` is a valid connection handle; `mime` is a NUL-terminated UTF-8 string;
+/// `xfer_id_out` is writable (NULL is skipped).
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_clipboard_fetch(
@@ -5376,9 +4440,7 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_fetch(
     xfer_id_out: *mut u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -5386,16 +4448,14 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_fetch(
         if mime.is_null() {
             return PunktfunkStatus::NullPointer;
         }
-        // SAFETY: per the ABI contract - a caller-supplied C string, NUL-terminated or null,
-        // borrowed only for this call.
+        // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
         let mime = match unsafe { std::ffi::CStr::from_ptr(mime) }.to_str() {
             Ok(s) => s.to_string(),
             Err(_) => return PunktfunkStatus::InvalidArg,
         };
         match c.inner.clip_fetch(seq, mime, file_index) {
             Ok(xfer_id) => {
-                // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-
-                // checked before it is written; a non-null one is a caller-owned writable slot.
+                // SAFETY: each out-param is optional; null-checked before write.
                 unsafe {
                     if !xfer_id_out.is_null() {
                         *xfer_id_out = xfer_id;
@@ -5408,13 +4468,13 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_fetch(
     })
 }
 
-/// Provide bytes answering a `FetchRequest` event (the host is pasting our offered data). Call
-/// repeatedly to stream a large payload; `last = true` completes it. `data` may be NULL only when
-/// `len == 0` (e.g. a final empty chunk). `punktfunk_connection_clipboard_cancel(req_id)` aborts.
+/// Provide bytes answering a `FetchRequest` (the host is pasting our offered data).
+/// Call repeatedly to stream; `last = true` completes. `data` may be NULL only when
+/// `len == 0`. `punktfunk_connection_clipboard_cancel(req_id)` aborts.
 ///
 /// # Safety
-/// `c` is a valid connection handle. For a representable nonzero `len`, `data` points to that
-/// many readable bytes; it may be NULL when `len == 0`.
+/// `c` is a valid connection handle. For a representable nonzero `len`, `data` points
+/// to that many readable bytes; it may be NULL when `len == 0`.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_clipboard_serve(
@@ -5425,9 +4485,7 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_serve(
     last: bool,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -5452,8 +4510,8 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_serve(
     })
 }
 
-/// Cancel a clipboard transfer by id — either an outbound fetch (`xfer_id` from
-/// [`punktfunk_connection_clipboard_fetch`]) or an inbound serve (`req_id` from a `FetchRequest`).
+/// Cancel a clipboard transfer by id — outbound fetch (`xfer_id` from
+/// [`punktfunk_connection_clipboard_fetch`]) or inbound serve (`req_id` from a `FetchRequest`).
 ///
 /// # Safety
 /// `c` is a valid connection handle.
@@ -5464,9 +4522,7 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_cancel(
     id: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -5478,10 +4534,9 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_cancel(
     })
 }
 
-/// Pull the next shared-clipboard event into `*out`. [`PunktfunkStatus::NoFrame`] on timeout,
-/// [`PunktfunkStatus::Closed`] once the session ended. A native client drains this on its own
-/// thread and drives the OS pasteboard from it. The `data`/`len` pointer (when non-NULL) borrows a
-/// per-connection buffer valid until the next `next_clipboard` call on this handle.
+/// Pull the next shared-clipboard event into `*out`. [`PunktfunkStatus::NoFrame`]
+/// on timeout, [`PunktfunkStatus::Closed`] once ended. `data`/`len` (when non-NULL)
+/// borrows until the next `next_clipboard` on this handle.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable for one `PunktfunkClipEvent`.
@@ -5493,9 +4548,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_clipboard(
     timeout_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -5510,16 +4563,12 @@ pub unsafe extern "C" fn punktfunk_connection_next_clipboard(
             Ok(ev) => {
                 let mut slot = lock_recover(&c.last_clip);
                 let out_ev = build_clip_event(ev, &mut slot);
-                // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
-                // written once by value.
+                // SAFETY: caller out-param, non-null on this path, written once.
                 unsafe { *out = out_ev };
                 PunktfunkStatus::Ok
             }
             Err(e) => {
-                // Release the parked payload once the embedder polls past it: clipboard
-                // traffic is sporadic, so without this a one-off 50 MiB paste stays resident
-                // for the rest of the session (there is no other release entry point). The
-                // borrow contract already says `out` data is valid only until the next call.
+                // Drop the parked payload: no other release, and a 50 MiB paste would linger.
                 *lock_recover(&c.last_clip) = None;
                 e.status()
             }
@@ -5527,12 +4576,9 @@ pub unsafe extern "C" fn punktfunk_connection_next_clipboard(
     })
 }
 
-/// The compositor backend the host actually resolved for this session (one of the
-/// `PUNKTFUNK_COMPOSITOR_*` values; the `Welcome`'s echo of the [`punktfunk_connect_ex`]
-/// preference). `PUNKTFUNK_COMPOSITOR_AUTO` = an older host that didn't say. Clients use it for
-/// compositor-specific behavior — e.g. a client-side cursor by default on
-/// `PUNKTFUNK_COMPOSITOR_GAMESCOPE`, whose PipeWire capture carries no cursor. Safe any time after
-/// connect.
+/// Compositor the host resolved (`PUNKTFUNK_COMPOSITOR_*`; Welcome echo of
+/// [`punktfunk_connect_ex`]). `AUTO` = a host that didn't say. Gamescope PipeWire
+/// capture carries no cursor — default to a client-side cursor there.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `compositor` is writable (NULL is skipped).
@@ -5543,15 +4589,12 @@ pub unsafe extern "C" fn punktfunk_connection_compositor(
     compositor: *mut u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
-        // before it is written; a non-null one is a caller-owned writable slot.
+        // SAFETY: each out-param is optional; null-checked before write.
         unsafe {
             if !compositor.is_null() {
                 *compositor = c.inner.resolved_compositor.to_u8() as u32;
@@ -5561,9 +4604,9 @@ pub unsafe extern "C" fn punktfunk_connection_compositor(
     })
 }
 
-/// The video encoder bitrate (kilobits per second) the host actually configured for this session
-/// — the [`punktfunk_connect_ex3`] request clamped to the host's range, or its default when `0`
-/// was requested. `0` = an older host that didn't report it. Safe any time after connect.
+/// Video encoder bitrate (kbps) the host configured — the [`punktfunk_connect_ex3`]
+/// request clamped to the host range, or its default when `0` was requested.
+/// `0` = a host that didn't report it. Safe any time after connect.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `bitrate_kbps` is writable (NULL is skipped).
@@ -5574,15 +4617,12 @@ pub unsafe extern "C" fn punktfunk_connection_bitrate(
     bitrate_kbps: *mut u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
-        // before it is written; a non-null one is a caller-owned writable slot.
+        // SAFETY: each out-param is optional; null-checked before write.
         unsafe {
             if !bitrate_kbps.is_null() {
                 *bitrate_kbps = c.inner.resolved_bitrate_kbps;
@@ -5592,13 +4632,8 @@ pub unsafe extern "C" fn punktfunk_connection_bitrate(
     })
 }
 
-/// The host↔client wall-clock offset (nanoseconds, **host minus client**) measured by the
-/// connect-time skew handshake. Add it to a local receive/present timestamp (same realtime clock,
-/// `CLOCK_REALTIME` / `gettimeofday`-epoch nanoseconds) to express that instant in the host's
-/// capture clock — the clock the per-access-unit `pts_ns` is stamped in — so glass-to-glass latency
-/// (e.g. present-time minus `pts_ns`) is valid across machines. `0` = no correction: either an older
-/// host that didn't answer the handshake, or genuinely synchronized clocks. Safe any time after
-/// connect.
+/// Connect-time wall-clock offset, ns, host minus client. Add to a local
+/// realtime stamp to express it in the host capture clock (`pts_ns`). `0` = none.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `offset_ns` is writable (NULL is skipped).
@@ -5609,15 +4644,12 @@ pub unsafe extern "C" fn punktfunk_connection_clock_offset_ns(
     offset_ns: *mut i64,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
-        // before it is written; a non-null one is a caller-owned writable slot.
+        // SAFETY: each out-param is optional; null-checked before write.
         unsafe {
             if !offset_ns.is_null() {
                 *offset_ns = c.inner.clock_offset_ns;
@@ -5627,12 +4659,8 @@ pub unsafe extern "C" fn punktfunk_connection_clock_offset_ns(
     })
 }
 
-/// The **live** host↔client wall-clock offset (nanoseconds, host minus client): the
-/// connect-time estimate of [`punktfunk_connection_clock_offset_ns`], updated by every applied
-/// mid-stream clock re-sync. Ongoing latency math (per-frame `received − pts` splits, the
-/// glass-to-glass meter) must use this one — after a wall-clock step/slew the frozen
-/// connect-time value reads tens of milliseconds wrong for the rest of the session, while the
-/// core itself has already re-synced. Same clock contract as the connect-time getter.
+/// Live wall-clock offset (updated by mid-stream re-sync). Use this for ongoing
+/// latency math, not the frozen connect-time value.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `offset_ns` is writable (NULL is skipped).
@@ -5643,15 +4671,12 @@ pub unsafe extern "C" fn punktfunk_connection_clock_offset_now_ns(
     offset_ns: *mut i64,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
-        // before it is written; a non-null one is a caller-owned writable slot.
+        // SAFETY: each out-param is optional; null-checked before write.
         unsafe {
             if !offset_ns.is_null() {
                 *offset_ns = c.inner.clock_offset_now_ns();
@@ -5661,12 +4686,8 @@ pub unsafe extern "C" fn punktfunk_connection_clock_offset_now_ns(
     })
 }
 
-/// Ask the host to switch the live session to `width`x`height`@`refresh_hz` without
-/// reconnecting (window resized, refresh changed). Non-blocking enqueue: on acceptance the
-/// stream continues at the new mode — the first new-mode access unit is an IDR with
-/// in-band parameter sets (rebuild the decoder from it) — and
-/// [`punktfunk_connection_mode`] reflects the switch. A rejected request leaves the
-/// session unchanged.
+/// Request a live mode switch. On accept, the first new-mode AU is an IDR with
+/// in-band parameter sets — rebuild the decoder from it.
 ///
 /// # Safety
 /// `c` is a valid connection handle.
@@ -5679,9 +4700,7 @@ pub unsafe extern "C" fn punktfunk_connection_request_mode(
     refresh_hz: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -5697,12 +4716,8 @@ pub unsafe extern "C" fn punktfunk_connection_request_mode(
     })
 }
 
-/// Ask the host's encoder to emit a fresh IDR keyframe now — client recovery when the
-/// decoder has stalled (the infinite-GOP stream sends one opening IDR then P-frames only, so
-/// a wedged decoder would otherwise freeze until the next loss-triggered recovery keyframe).
-/// Non-blocking, fire-and-forget; the recovered keyframe is the only ack. The caller should
-/// THROTTLE — the decode stays wedged for several frames until the IDR lands, so requesting
-/// every frame would flood the control stream.
+/// Request an IDR now. Infinite GOP has one opening IDR; throttle — a wedged
+/// decoder stays stuck for several frames, so per-frame requests flood control.
 ///
 /// # Safety
 /// `c` is a valid connection handle.
@@ -5712,9 +4727,7 @@ pub unsafe extern "C" fn punktfunk_connection_request_keyframe(
     c: *const PunktfunkConnection,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -5726,15 +4739,8 @@ pub unsafe extern "C" fn punktfunk_connection_request_keyframe(
     })
 }
 
-/// Ask the host to recover from loss by **reference-frame invalidation** rather than a full IDR:
-/// report the range `[first_frame, last_frame]` of access units the client can no longer trust
-/// (the first missing `frame_index` through the newest received). An RFI-capable host (AMD LTR /
-/// NVENC) re-references a known-good picture before `first_frame` and emits a clean P-frame tagged
-/// `USER_FLAG_RECOVERY_ANCHOR` — no 20-40x IDR spike; a host that can't RFI forces an IDR instead
-/// (same effect as [`punktfunk_connection_request_keyframe`]). Non-blocking, fire-and-forget; the
-/// recovered frame is the only ack, so THROTTLE it exactly like the keyframe request. Prefer this
-/// over the keyframe request on loss so AMD/RFI hosts avoid the spike; keep the keyframe request as
-/// the backstop for when the recovery frame itself is lost.
+/// Ask the host to recover `[first_frame, last_frame]` by RFI (P-frame tagged
+/// `USER_FLAG_RECOVERY_ANCHOR`) instead of a full IDR. Throttle; keyframe is the backstop.
 ///
 /// # Safety
 /// `c` is a valid connection handle.
@@ -5746,9 +4752,7 @@ pub unsafe extern "C" fn punktfunk_connection_request_rfi(
     last_frame: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -5760,16 +4764,8 @@ pub unsafe extern "C" fn punktfunk_connection_request_rfi(
     })
 }
 
-/// Feed each received frame's `frame_index` (the [`PunktfunkFrame::frame_index`] field, in receive
-/// order) so the client recovers from loss with a cheap reference-frame invalidation instead of a
-/// full IDR. On a forward gap (a `frame_index` jump = the intervening frames were lost and the
-/// following AUs reference a picture that never arrived) this fires a THROTTLED
-/// [`punktfunk_connection_request_rfi`] for the lost range; an RFI-capable host (AMD LTR / NVENC)
-/// then recovers with a clean P-frame instead of a 20-40x IDR spike. Call it for every received
-/// frame — it is cheap and idempotent, and the [`punktfunk_connection_frames_dropped`]-driven
-/// keyframe request stays the backstop. Writes whether a forward gap was detected this call to
-/// `gap_out` (nullable — a client with a post-loss display freeze can use it to re-arm; most
-/// clients pass NULL and ignore it).
+/// Note each received `frame_index`. A forward gap fires throttled RFI; keyframe
+/// on `frames_dropped` is the backstop. `gap_out` (nullable) is whether a gap was seen.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `gap_out` is writable or NULL.
@@ -5781,29 +4777,24 @@ pub unsafe extern "C" fn punktfunk_connection_note_frame_index(
     gap_out: *mut bool,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
         let gap = c.inner.note_frame_index(frame_index);
         if !gap_out.is_null() {
-            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
-            // written once by value.
+            // SAFETY: caller out-param, non-null on this path, written once.
             unsafe { *gap_out = gap > 0 };
         }
         PunktfunkStatus::Ok
     })
 }
 
-/// [`punktfunk_connection_note_frame_index`] with the gap WIDTH instead of a yes/no: writes to
-/// `gap_width_out` how many frames this arrival revealed as missing (0 = contiguous/straggler).
-/// A client with a post-loss display freeze passes the width to
-/// [`punktfunk_reanchor_gate_arm_expecting_drops`] so the reassembler's later `frames_dropped`
-/// climb for the SAME loss cannot re-freeze a stream an RFI anchor already healed (the double-arm
-/// race — see the gate function's doc).
+/// [`punktfunk_connection_note_frame_index`] with the gap width: writes how many
+/// frames this arrival revealed as missing (0 = contiguous/straggler). Pass the
+/// width to [`punktfunk_reanchor_gate_arm_expecting_drops`] so a later
+/// `frames_dropped` climb for the same loss cannot re-freeze a healed stream.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `gap_width_out` is writable or NULL.
@@ -5815,29 +4806,22 @@ pub unsafe extern "C" fn punktfunk_connection_note_frame_index_ex(
     gap_width_out: *mut u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
         let gap = c.inner.note_frame_index(frame_index);
         if !gap_width_out.is_null() {
-            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
-            // written once by value.
+            // SAFETY: caller out-param, non-null on this path, written once.
             unsafe { *gap_width_out = gap };
         }
         PunktfunkStatus::Ok
     })
 }
 
-/// Cumulative access units the host→client reassembler dropped as unrecoverable (FEC couldn't
-/// rebuild them). A video loop polls this and calls [`punktfunk_connection_request_keyframe`]
-/// when it climbs — the correct loss trigger under the host's infinite GOP, where unrecoverable
-/// loss yields reference-missing delta frames the decoder *silently conceals* (frozen / garbage
-/// picture, no decode error), so a decode-error trigger rarely fires. Monotonic for the session;
-/// compare against the last observed value. Writes 0 to `out` on a NULL connection.
+/// Unrecoverable reassembler drops. Poll and request a keyframe when it climbs —
+/// infinite GOP conceals missing refs with no decode error. Writes 0 on NULL.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable (NULL is skipped).
@@ -5848,22 +4832,17 @@ pub unsafe extern "C" fn punktfunk_connection_frames_dropped(
     out: *mut u64,
 ) -> PunktfunkStatus {
     guard(|| {
-        // The header promises "writes 0 on a NULL connection" — honor it BEFORE the handle
-        // check, so an embedder that skips the status never reads an uninitialized slot.
+        // Write 0 on a NULL connection before the handle check (header contract).
         if !out.is_null() {
-            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
-            // written once by value.
+            // SAFETY: caller out-param, non-null on this path, written once.
             unsafe { *out = 0 };
         }
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
-        // before it is written; a non-null one is a caller-owned writable slot.
+        // SAFETY: each out-param is optional; null-checked before write.
         unsafe {
             if !out.is_null() {
                 *out = c.inner.frames_dropped();
@@ -5873,16 +4852,9 @@ pub unsafe extern "C" fn punktfunk_connection_frames_dropped(
     })
 }
 
-/// Report one decoded frame's decode-stage latency, in microseconds: the wall-clock elapsed from
-/// the access unit leaving [`punktfunk_connection_next_au`] to its decoded output becoming
-/// available (VideoToolbox/D3D11VA/… produced the frame). This feeds the "Automatic" bitrate
-/// controller's decode signal — the only one that sees the client's own decoder, so the rate is
-/// capped at the real decode limit instead of climbing to the network link ceiling and choking a
-/// slower hardware decoder (a fast LAN feeding a mobile-class decoder). Measure from the AU pull,
-/// NOT from the decoder-submit call, so decoder-input backpressure (the backlog) is included;
-/// exclude the presenter's vsync wait so a paced/capped frame rate doesn't read as decode latency.
-/// Cheap — the client may call it every frame; the controller ignores it unless armed (query
-/// [`punktfunk_connection_wants_decode_latency`] once to skip the measurement entirely when it's not).
+/// Decode-stage latency in µs: AU leave [`next_au`] to decoded output. Include
+/// decoder-input backlog; exclude vsync wait. Feeds Automatic bitrate. Skip if
+/// [`punktfunk_connection_wants_decode_latency`] is false.
 ///
 /// # Safety
 /// `c` is a valid connection handle.
@@ -5893,9 +4865,7 @@ pub unsafe extern "C" fn punktfunk_connection_report_decode_us(
     us: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -5905,14 +4875,11 @@ pub unsafe extern "C" fn punktfunk_connection_report_decode_us(
     })
 }
 
-/// Report this client's display-latch grid so the host can phase-lock its capture tick
-/// (design/phase-locked-capture.md). `next_latch_host_ns` must already be host clock — convert
-/// with the connection's clock offset (`T_host = T_client + offset`). Fire-and-forget; call ~1 Hz
-/// from a vsync-aware presenter. No-op toward a host that never negotiated the capability.
+/// Report the display-latch grid (`design/phase-locked-capture.md`).
+/// `next_latch_host_ns` is already host clock. ~1 Hz; no-op if unnegotiated.
 ///
 /// # Safety
-/// `c` is an opaque handle from a `*_new`/`*_pair` the caller has not yet freed, or null (an
-/// error, not UB).
+/// `c` is a caller handle or null (error, not UB).
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_report_phase(
@@ -5924,8 +4891,7 @@ pub unsafe extern "C" fn punktfunk_connection_report_phase(
     coherence_milli: u16,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_ref` reports as `None` and the `match` handles.
+        // SAFETY: caller handle or null; `as_ref` never dereferences null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -5941,11 +4907,9 @@ pub unsafe extern "C" fn punktfunk_connection_report_phase(
     })
 }
 
-/// Whether [`punktfunk_connection_report_decode_us`] is worth calling this session: writes 1 to
-/// `out` only when the adaptive-bitrate controller is armed (Automatic bitrate, non-PyroWave), so a
-/// client can skip the per-frame decode-latency measurement entirely for explicit-bitrate and
-/// PyroWave sessions (where the signal is ignored). Constant for the session — query once. Writes 0
-/// on a NULL connection.
+/// Whether [`punktfunk_connection_report_decode_us`] is worth calling: writes true
+/// only when Automatic bitrate is armed (non-PyroWave). Skip the per-frame
+/// measurement otherwise. Constant for the session. Writes false on a NULL connection.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable (NULL is skipped).
@@ -5956,22 +4920,17 @@ pub unsafe extern "C" fn punktfunk_connection_wants_decode_latency(
     out: *mut bool,
 ) -> PunktfunkStatus {
     guard(|| {
-        // The header promises "writes 0 on a NULL connection" — honor it BEFORE the handle
-        // check: an uninitialized byte is not even a valid C++/Swift bool to read.
+        // Write false on a NULL connection before the handle check (uninitialized is not a bool).
         if !out.is_null() {
-            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
-            // written once by value.
+            // SAFETY: caller out-param, non-null on this path, written once.
             unsafe { *out = false };
         }
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
         };
-        // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-checked
-        // before it is written; a non-null one is a caller-owned writable slot.
+        // SAFETY: each out-param is optional; null-checked before write.
         unsafe {
             if !out.is_null() {
                 *out = c.inner.wants_decode_latency();
@@ -5981,11 +4940,11 @@ pub unsafe extern "C" fn punktfunk_connection_wants_decode_latency(
     })
 }
 
-/// A speed-test measurement, filled by [`punktfunk_connection_probe_result`]. `done` is 0 until
-/// the host's end-of-burst report lands, then 1 (the numbers are final). `throughput_kbps` is the
-/// delivered wire throughput to drive a bitrate choice from; `loss_pct` is the link loss and
-/// `host_drop_pct` the host-side send-buffer drop (raise `net.core.wmem_max`) — they're measured
-/// separately so a host that can't keep up reads differently from a lossy link.
+/// Speed-test measurement from [`punktfunk_connection_probe_result`]. `done` is 0
+/// until the host's end-of-burst report, then 1. `throughput_kbps` is delivered
+/// wire throughput; `loss_pct` is link loss; `host_drop_pct` is send-buffer drop
+/// (raise `net.core.wmem_max`). Measured separately so a host that can't keep up
+/// reads differently from a lossy link.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PunktfunkProbeResult {
@@ -5997,11 +4956,10 @@ pub struct PunktfunkProbeResult {
     /// Application goodput bytes / access units the host offered.
     pub host_bytes: u64,
     pub host_packets: u32,
-    /// The throughput denominator, milliseconds: the client-measured burst receive interval
-    /// (first → last probe-packet arrival) once `done`; the host's measured send-window
-    /// duration when fewer than two probe packets arrived (no interval to measure from). The
-    /// host duration alone overstates throughput — its window closes while the bottleneck
-    /// queue is still draining toward the client.
+    /// Throughput denominator, ms: client-measured burst receive interval once
+    /// `done`; host send-window duration when fewer than two probe packets arrived.
+    /// Host duration alone overstates throughput — its window closes while the
+    /// bottleneck queue is still draining.
     pub elapsed_ms: u32,
     /// Delivered wire throughput = `recv_bytes * 8 / elapsed_ms` (kilobits/second).
     pub throughput_kbps: u32,
@@ -6009,15 +4967,15 @@ pub struct PunktfunkProbeResult {
     pub loss_pct: f32,
     /// Host-side send-buffer drop `send_dropped / (wire_packets_sent + send_dropped)`, percent.
     pub host_drop_pct: f32,
-    /// Wire packets the host put on the link, and the ones its send buffer dropped (raw counts).
+    /// Wire packets the host put on the link, and the ones its send buffer dropped.
     pub wire_packets_sent: u32,
     pub send_dropped: u32,
 }
 
-/// Start a bandwidth speed test: ask the host to burst filler over the data plane at
-/// `target_kbps` of goodput for `duration_ms` (each clamped host-side to ≤ 10 Gbps / ≤ 5 s),
-/// *briefly pausing video*. Non-blocking — poll [`punktfunk_connection_probe_result`] until its
-/// `done` field is 1. Starting a probe resets any prior measurement.
+/// Start a bandwidth speed test: host bursts filler at `target_kbps` goodput for
+/// `duration_ms` (clamped ≤ 10 Gbps / ≤ 5 s), briefly pausing video. Non-blocking —
+/// poll [`punktfunk_connection_probe_result`] until `done` is 1. Starting a probe
+/// resets any prior measurement.
 ///
 /// # Safety
 /// `c` is a valid connection handle.
@@ -6029,9 +4987,7 @@ pub unsafe extern "C" fn punktfunk_connection_speed_test(
     duration_ms: u32,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -6043,12 +4999,12 @@ pub unsafe extern "C" fn punktfunk_connection_speed_test(
     })
 }
 
-/// Read the current speed-test measurement into `*out` (partial until `out->done == 1`). Safe to
-/// poll repeatedly after [`punktfunk_connection_speed_test`]; before any probe it reports zeros.
+/// Read the current speed-test measurement into `*out` (partial until `out->done == 1`).
+/// Safe to poll after [`punktfunk_connection_speed_test`]; before any probe it reports zeros.
 ///
 /// # Safety
-/// `c` is a valid connection handle; `out` is writable for one `PunktfunkProbeResult` (NULL is an
-/// error).
+/// `c` is a valid connection handle; `out` is writable for one `PunktfunkProbeResult`
+/// (NULL is an error).
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_probe_result(
@@ -6056,9 +5012,7 @@ pub unsafe extern "C" fn punktfunk_connection_probe_result(
     out: *mut PunktfunkProbeResult,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let c = match unsafe { c.as_ref() } {
             Some(c) => c,
             None => return PunktfunkStatus::NullPointer,
@@ -6067,8 +5021,7 @@ pub unsafe extern "C" fn punktfunk_connection_probe_result(
             return PunktfunkStatus::NullPointer;
         }
         let o = c.inner.probe_result();
-        // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the matching
-        // `#[repr(C)]` type, written once by value.
+        // SAFETY: `out` is a caller-owned `#[repr(C)]` slot, written once by value.
         unsafe {
             *out = PunktfunkProbeResult {
                 done: o.done as u8,
@@ -6088,21 +5041,18 @@ pub unsafe extern "C" fn punktfunk_connection_probe_result(
     })
 }
 
-/// Signal a **deliberate quit** (a user "stop", not a network drop) before closing: the connection
-/// closes with [`QUIT_CLOSE_CODE`] instead of code 0, so the host tears the session down immediately
-/// (skips the keep-alive linger) rather than holding it for a reconnect. Call this right before
-/// [`punktfunk_connection_close`] on a user-initiated disconnect; a plain close (network drop,
-/// backgrounding) leaves the linger intact. NULL is a no-op.
+/// Signal a deliberate quit (user stop, not a network drop) before closing: the
+/// connection closes with [`QUIT_CLOSE_CODE`] instead of 0, so the host skips the
+/// keep-alive linger. Call before [`punktfunk_connection_close`] on a user disconnect;
+/// a plain close leaves the linger intact. NULL is a no-op.
 ///
 /// # Safety
-/// `c` was returned by [`punktfunk_connect`] and remains valid (closed via `punktfunk_connection_close`).
+/// `c` was returned by [`punktfunk_connect`] and remains valid until `punktfunk_connection_close`.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_connection_disconnect_quit(c: *mut PunktfunkConnection) {
     guard_void(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller has
-        // not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match` here
-        // handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         if let Some(c) = unsafe { c.as_ref() } {
             c.inner.disconnect_quit();
         }
@@ -6118,28 +5068,18 @@ pub unsafe extern "C" fn punktfunk_connection_disconnect_quit(c: *mut PunktfunkC
 pub unsafe extern "C" fn punktfunk_connection_close(c: *mut PunktfunkConnection) {
     guard_void(|| {
         if !c.is_null() {
-            // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
-            // and are null-checked or handle-validated on this path before they are read.
+            // SAFETY: pointers are caller-supplied and null-checked on this path.
             drop(unsafe { Box::from_raw(c) });
         }
     });
 }
 
-// ---- Post-loss re-anchor freeze gate ----
-//
-// The shared [`ReanchorGate`](crate::reanchor::ReanchorGate) exposed for the Swift client (Rust
-// embedders — Android/Windows/Linux — use the struct directly). After an unrecoverable reference
-// loss the decoder silently conceals the missing-reference deltas (gray/garbage picture, no error);
-// the client freezes on the last good frame and lifts only on a proven clean re-anchor. The gate
-// takes time internally (`Instant::now`) so no timestamps cross the boundary. Drive it per session:
-// `arm` on a loss (frame-index gap from `punktfunk_connection_note_frame_index`, a decoder
-// wedge/demotion), `on_decoded` per decoded frame to gate presentation, `on_no_output` per AU that
-// produced nothing, and `poll` each iteration for the dropped-count climb + overdue backstop. Route
-// the returned keyframe intents through the client's existing request throttle.
+// C wrapper for [`ReanchorGate`]. Time stays inside (`Instant::now`).
+// `arm` on loss, `on_decoded` per frame, `on_no_output` per empty AU, `poll` each tick.
 
-/// Create a re-anchor gate seeded with the session's current `frames_dropped` (so the first
-/// [`punktfunk_reanchor_gate_poll`] doesn't read the baseline as a loss). Free with
-/// [`punktfunk_reanchor_gate_free`]. Never returns NULL.
+/// Create a re-anchor gate seeded with the session's current `frames_dropped` (so
+/// the first [`punktfunk_reanchor_gate_poll`] doesn't read the baseline as a loss).
+/// Free with [`punktfunk_reanchor_gate_free`]. Never returns NULL.
 #[unsafe(no_mangle)]
 pub extern "C" fn punktfunk_reanchor_gate_new(frames_dropped: u64) -> *mut ReanchorGate {
     Box::into_raw(Box::new(ReanchorGate::new(frames_dropped)))
@@ -6153,37 +5093,30 @@ pub extern "C" fn punktfunk_reanchor_gate_new(frames_dropped: u64) -> *mut Reanc
 pub unsafe extern "C" fn punktfunk_reanchor_gate_free(g: *mut ReanchorGate) {
     guard_void(|| {
         if !g.is_null() {
-            // SAFETY: per the ABI contract - the pointer operands in this block are caller-supplied
-            // and are null-checked or handle-validated on this path before they are read.
+            // SAFETY: pointers are caller-supplied and null-checked on this path.
             drop(unsafe { Box::from_raw(g) });
         }
     });
 }
 
-/// Arm the freeze: a loss was detected (a frame-index gap, or a decoder wedge/demotion). Zeroes the
-/// recovery-mark count and (re-)sets the backstop deadline. NULL is a no-op.
+/// Arm the freeze: a loss was detected (frame-index gap, or decoder wedge/demotion).
+/// Zeroes the recovery-mark count and (re-)sets the backstop deadline. NULL is a no-op.
 ///
 /// # Safety
 /// `g` is a valid gate handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_reanchor_gate_arm(g: *mut ReanchorGate) {
     guard_void(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller has
-        // not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match` here
-        // handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         if let Some(g) = unsafe { g.as_mut() } {
             g.arm(std::time::Instant::now());
         }
     });
 }
 
-/// [`punktfunk_reanchor_gate_arm`] for a loss detected as a **frame-index gap**, where the caller
-/// knows how many frames the gap skipped ([`punktfunk_connection_note_frame_index_ex`]). On top of
-/// arming, the gate pre-credits the reassembler's `frames_dropped` climb those same lost frames
-/// will produce up to ~120 ms later, so [`punktfunk_reanchor_gate_poll`] does not treat that
-/// delayed bookkeeping as a SECOND loss — without the credit, a fast LTR-RFI anchor lifts the
-/// freeze between the two signals and the stale climb re-freezes a healed stream (the double-arm
-/// race). Use the plain arm for non-gap loss signals (decoder wedge/demotion). NULL is a no-op.
+/// Arm for a frame-index gap, pre-crediting `expected_drops` so a later
+/// `frames_dropped` climb is not a second loss (double-arm race). Plain `arm`
+/// for decoder wedge/demotion. NULL is a no-op.
 ///
 /// # Safety
 /// `g` is a valid gate handle.
@@ -6193,29 +5126,17 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_arm_expecting_drops(
     expected_drops: u64,
 ) {
     guard_void(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller has
-        // not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match` here
-        // handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         if let Some(g) = unsafe { g.as_mut() } {
             g.arm_expecting_drops(std::time::Instant::now(), expected_drops);
         }
     });
 }
 
-/// Fold one decoded frame and write to `out_present` whether to display it (`true`) or withhold it as
-/// a post-loss concealment (`false`). `flags` is the AU's `user_flags` word ([`PunktfunkFrame::flags`]):
-/// the gate reads `FLAG_SOF` (the host's IDR marker), `USER_FLAG_RECOVERY_ANCHOR` and
-/// `USER_FLAG_RECOVERY_POINT`. Pass `decoder_keyframe = false` where the platform decoder doesn't flag
-/// IDRs (VideoToolbox/MediaCodec) — the wire `FLAG_SOF` covers it.
-///
-/// This is the uncorroborated entry point and deliberately stays that way. Rust embedders whose
-/// decoder parses the bitstream call [`ReanchorGate::on_decoded_corroborated`] to let their own
-/// parser refute a `USER_FLAG_RECOVERY_ANCHOR` that names a picture they had to conceal; every
-/// client reachable through THIS surface (Apple VideoToolbox, Android MediaCodec) uses a platform
-/// decoder that surfaces no such fact, so it would have nothing to pass but
-/// `AnchorEvidence::Unavailable` — which is exactly what this wrapper already means. Growing a
-/// second export for a corroboration no C caller can supply would spend an ABI version bump on
-/// dead surface.
+/// Fold one decoded frame; `out_present` is whether to display it. Reads `FLAG_SOF`,
+/// `USER_FLAG_RECOVERY_ANCHOR`, `USER_FLAG_RECOVERY_POINT`. Platform decoders that
+/// do not flag IDRs pass `decoder_keyframe = false` — wire `FLAG_SOF` covers it.
+/// Uncorroborated: C callers cannot supply bitstream evidence.
 ///
 /// # Safety
 /// `g` is a valid gate handle; `out_present` is writable or NULL.
@@ -6227,9 +5148,7 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_on_decoded(
     out_present: *mut bool,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let g = match unsafe { g.as_mut() } {
             Some(g) => g,
             None => return PunktfunkStatus::NullPointer,
@@ -6237,17 +5156,16 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_on_decoded(
         let present = g.on_decoded(flags, decoder_keyframe, std::time::Instant::now())
             == GateVerdict::Present;
         if !out_present.is_null() {
-            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
-            // written once by value.
+            // SAFETY: caller out-param, non-null on this path, written once.
             unsafe { *out_present = present };
         }
         PunktfunkStatus::Ok
     })
 }
 
-/// A received AU produced no decoded frame. Writes to `out_request_kf` whether the no-output streak has
-/// tripped and the client should (throttled) request a keyframe — the gate arms the freeze at the same
-/// time.
+/// A received AU produced no decoded frame. Writes to `out_request_kf` whether the
+/// no-output streak has tripped and the client should (throttled) request a keyframe
+/// — the gate arms the freeze at the same time.
 ///
 /// # Safety
 /// `g` is a valid gate handle; `out_request_kf` is writable or NULL.
@@ -6257,26 +5175,23 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_on_no_output(
     out_request_kf: *mut bool,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let g = match unsafe { g.as_mut() } {
             Some(g) => g,
             None => return PunktfunkStatus::NullPointer,
         };
         let request = g.on_no_output(std::time::Instant::now());
         if !out_request_kf.is_null() {
-            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
-            // written once by value.
+            // SAFETY: caller out-param, non-null on this path, written once.
             unsafe { *out_request_kf = request };
         }
         PunktfunkStatus::Ok
     })
 }
 
-/// Periodic fold of the session's `frames_dropped` counter plus the overdue backstop. Writes to
-/// `out_request_kf` whether the client should (throttled) request a keyframe (a drop-count climb armed
-/// a fresh freeze, or the freeze is overdue and re-asks while it keeps holding).
+/// Periodic fold of `frames_dropped` plus the overdue backstop. Writes to
+/// `out_request_kf` whether the client should (throttled) request a keyframe
+/// (a drop-count climb armed a freeze, or the freeze is overdue and re-asks).
 ///
 /// # Safety
 /// `g` is a valid gate handle; `out_request_kf` is writable or NULL.
@@ -6287,25 +5202,22 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_poll(
     out_request_kf: *mut bool,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let g = match unsafe { g.as_mut() } {
             Some(g) => g,
             None => return PunktfunkStatus::NullPointer,
         };
         let request = g.poll(frames_dropped, std::time::Instant::now());
         if !out_request_kf.is_null() {
-            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
-            // written once by value.
+            // SAFETY: caller out-param, non-null on this path, written once.
             unsafe { *out_request_kf = request };
         }
         PunktfunkStatus::Ok
     })
 }
 
-/// Whether the gate is currently withholding concealed frames (frozen on the last good picture).
-/// Writes `false` on a NULL gate.
+/// Whether the gate is currently withholding concealed frames (frozen on the last
+/// good picture). Writes `false` on a NULL gate.
 ///
 /// # Safety
 /// `g` is a valid gate handle; `out_holding` is writable or NULL.
@@ -6315,13 +5227,10 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_is_holding(
     out_holding: *mut bool,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
-        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
-        // here handles.
+        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let holding = unsafe { g.as_ref() }.is_some_and(ReanchorGate::is_holding);
         if !out_holding.is_null() {
-            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
-            // written once by value.
+            // SAFETY: caller out-param, non-null on this path, written once.
             unsafe { *out_holding = holding };
         }
         PunktfunkStatus::Ok
@@ -6330,15 +5239,10 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_is_holding(
 
 #[cfg(test)]
 mod abi_version_tests {
-    /// Pin [`crate::ABI_VERSION`] — the value [`super::punktfunk_abi_version`] reports and every
-    /// embedder equality-checks against its header's `PUNKTFUNK_ABI_VERSION` (the Apple client
-    /// refuses to run on a mismatch; the v27 `PunktfunkHidOutput` widening's safety argument
-    /// rests on that check). A bump must be DELIBERATE: it arrives with its own
-    /// [`crate::ABI_VERSION`] doc entry AND this pin updated in the same change — the test
-    /// exists so an accidental edit cannot drift the version silently.
+    /// Pin [`crate::ABI_VERSION`]. A bump must update this test in the same change.
     #[test]
     fn abi_version_is_pinned() {
-        // v28: `punktfunk_connection_host_caps2` + `PUNKTFUNK_HOST_CAP2_TOUCH` (additive).
+        // Current ABI. A bump must update this pin.
         assert_eq!(crate::ABI_VERSION, 28);
         assert_eq!(super::punktfunk_abi_version(), 28);
     }
@@ -6357,7 +5261,7 @@ mod abi_version_tests {
     #[test]
     fn wake_rejects_an_unrepresentable_mac_array_before_reading_it() {
         let pointer = std::ptr::NonNull::<u8>::dangling().as_ptr();
-        // SAFETY: an unrepresentable count is rejected before `pointer` is read, so the function's
+        // SAFETY: an unrepresentable count is rejected before `pointer` is read, so the
         // readable-region precondition does not apply.
         let status =
             unsafe { super::punktfunk_wake_on_lan(pointer, usize::MAX / 6 + 1, std::ptr::null()) };
@@ -6370,9 +5274,8 @@ mod log_sink_tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// `(level, target, message, user token)` per delivered line. The collector asserts nothing
-    /// itself (an `extern "C"` fn must not panic — the hygiene gate enforces it); the test body
-    /// checks what landed.
+    /// `(level, target, message, user token)` per delivered line. The collector
+    /// asserts nothing (`extern "C"` must not panic); the test body checks what landed.
     static LINES: Mutex<Vec<(u8, String, String, usize)>> = Mutex::new(Vec::new());
 
     unsafe extern "C" fn collect(
@@ -6391,13 +5294,12 @@ mod log_sink_tests {
         ));
     }
 
-    /// End to end through both doors: a `log` record and a `tracing` event (via tracing's `log`
-    /// feature) reach the C callback with level, real target, message and the user token; an
-    /// interior NUL is dropped rather than truncating the line; the level ceiling is honoured;
-    /// NULL detaches.
+    /// A `log` record and a `tracing` event reach the C callback with level, target,
+    /// message and user token; an interior NUL is dropped; the level ceiling is
+    /// honoured; NULL detaches.
     #[test]
     fn callback_receives_log_and_tracing_lines() {
-        // SAFETY: `collect` is a valid fn for the life of the test binary, the user token is an
+        // SAFETY: `collect` is a valid fn for the life of the test binary; the user token is an
         // opaque integer.
         let st = unsafe { punktfunk_set_log_callback(3, Some(collect), 0x5151 as *mut c_void) };
         assert_eq!(st, PunktfunkStatus::Ok);
@@ -6443,12 +5345,7 @@ mod log_sink_tests {
 mod tests {
     use super::*;
 
-    /// The [`PunktfunkConnectOpts`] size-prefix guard: null and undersized structs come back as
-    /// status codes, not reads — and a well-sized struct takes the copy path all the way into
-    /// the shared body (null `host` = `InvalidArg`, before any dialing). The growth half of the
-    /// contract (an older, shorter caller gets its tail defaulted) cannot be exercised until the
-    /// struct actually grows; what CAN regress today is this guard and the no-tail-padding
-    /// layout the const asserts beside the struct lock.
+    /// Size-prefix guard: null/undersized is a status, not a read.
     #[test]
     fn connect_opts_guards_size_prefix() {
         let mut status = 0i32;
@@ -6460,7 +5357,7 @@ mod tests {
 
         // SAFETY: an all-zero struct is a valid value (null pointers, zero scalars).
         let mut o: PunktfunkConnectOpts = unsafe { std::mem::zeroed() };
-        o.struct_size = 4; // an impossible, pre-v26 size
+        o.struct_size = 4; // smaller than CONNECT_OPTS_MIN_SIZE
                            // SAFETY: `o` outlives the call; out-params are null or a live local.
         let c = unsafe { punktfunk_connect_opts(&o, std::ptr::null_mut(), &mut status) };
         assert!(c.is_null());
@@ -6473,9 +5370,7 @@ mod tests {
         assert_eq!(status, PunktfunkStatus::InvalidArg as i32);
     }
 
-    /// The `ex10` device name is cut to the Hello's BYTE budget on a CHARACTER boundary — the
-    /// naive `s[..HELLO_NAME_MAX]` panics on any multi-byte name that straddles it, and an
-    /// operator naming a device in German or Japanese is not an edge case.
+    /// Truncation lands on a character boundary; `s[..HELLO_NAME_MAX]` would panic mid-scalar.
     #[test]
     fn device_name_truncates_on_a_character_boundary() {
         let max = crate::quic::HELLO_NAME_MAX;
@@ -6491,14 +5386,12 @@ mod tests {
             "must drop the whole ü, not half of it"
         );
 
-        // A name whose FIRST character already exceeds the cap has nothing to keep — the
-        // `unwrap_or(0)` path, which must yield "" rather than panicking on an empty iterator.
+        // A name whose first character already exceeds the cap has nothing to keep —
+        // `unwrap_or(0)` must yield "" rather than panicking on an empty iterator.
         assert_eq!(clamp_device_name(&"あ".repeat(max)), "あ".repeat(max / 3));
     }
 
-    /// A C embedder writing `ev->kind = 42` must come back as a status code, not UB. The test
-    /// stages the event in `MaybeUninit` storage so no `&InputEvent` to an invalid value ever
-    /// exists on the test's own side either.
+    /// Invalid `kind` is a status, not UB. Staged in `MaybeUninit` so no `&InputEvent` to 42.
     #[test]
     fn read_input_event_rejects_null_and_bad_discriminant() {
         // SAFETY: null is the documented reported-not-UB case.
@@ -6520,9 +5413,7 @@ mod tests {
         assert_eq!(ev.kind, crate::input::InputKind::KeyDown);
     }
 
-    /// The `AudioCtl` → `PunktfunkHidOutput` mapping: kind 5, pad narrowed, `which` carries the
-    /// flags byte, `effect[0..6]` the raw audio region with `effect_len = 6` (the TrackpadHaptic
-    /// packing idiom — no per-kind struct growth; the v27 `raw` tail stays zero here).
+    /// AudioCtl packs as kind 5, `which` = flags, `effect[0..6]`, `effect_len = 6`.
     #[test]
     fn hidout_abi_maps_audio_ctl() {
         let out = PunktfunkHidOutput::from_hid(&crate::quic::HidOutput::AudioCtl {
@@ -6539,13 +5430,10 @@ mod tests {
         assert_eq!(out.raw_len, 0);
     }
 
-    /// The v27 inversion of the old HidRaw skip: a raw as-is passthrough report (Steam's hidraw
-    /// write to the host's virtual SC2) now HAS a C representation — kind 6, the device channel
-    /// in `hid_kind`, and the whole report in `raw`/`raw_len` — so the Apple client's SC2 capture
-    /// can replay it on the physical controller instead of the pull site dropping it as NoFrame.
+    /// HidRaw maps to kind 6 + `hid_kind`/`raw`/`raw_len`, not a skip.
     #[test]
     fn hidout_abi_maps_hid_raw() {
-        // An OUTPUT report (Triton grip rumble 0x80, host-trimmed to its declared 10 bytes).
+        // OUTPUT report (id 0x80), host-trimmed to its declared 10 bytes.
         let rumble: Vec<u8> = vec![0x80, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
         let out = PunktfunkHidOutput::from_hid(&crate::quic::HidOutput::HidRaw {
             pad: 2,
@@ -6561,8 +5449,8 @@ mod tests {
         // The other fields stay zero — `kind` alone says which ones are meaningful.
         assert_eq!(out.effect_len, 0);
 
-        // A FEATURE frame arrives WHOLE (64 bytes, zero-padded — Steam sends settings frames
-        // un-trimmed) and must round-trip whole; anything longer clamps instead of overrunning.
+        // A FEATURE frame arrives whole (zero-padded) and must round-trip whole;
+        // anything longer clamps instead of overrunning.
         let mut lizard = vec![0u8; crate::quic::HID_REPORT_MAX + 8];
         lizard[..6].copy_from_slice(&[0x01, 0x87, 0x03, 0x09, 0x00, 0x00]);
         let out = PunktfunkHidOutput::from_hid(&crate::quic::HidOutput::HidRaw {
@@ -6575,12 +5463,11 @@ mod tests {
         assert_eq!(out.raw[..], lizard[..crate::quic::HID_REPORT_MAX]);
     }
 
-    /// `punktfunk_connection_send_hid_report`'s clamp, via its pure core: `pad` masked to the
-    /// 16-pad wire space and the report bounded to `HID_REPORT_MAX` — byte-for-byte the Android
-    /// JNI shim's rules, so both clients put identical `[0xCC][0x04]` bodies on the wire.
+    /// `punktfunk_connection_send_hid_report`'s clamp: `pad` masked to 16 and the
+    /// report bounded to `HID_REPORT_MAX` — same rules as the Android JNI shim.
     #[test]
     fn send_hid_report_clamps_like_the_android_shim() {
-        // A BLE state report (0x45-first, 46 bytes) passes through unclamped.
+        // A 46-byte state report (id 0x45) passes through unclamped.
         let mut state = vec![0u8; 46];
         state[0] = 0x45;
         state[1] = 0xE5; // seq
@@ -6605,8 +5492,7 @@ mod tests {
         }
     }
 
-    /// The legacy audio format: Opus on `0xC9`, 48 kHz, 16-bit, stereo. What every session ran
-    /// before the lossless plane existed, and what every embedder that does not call
+    /// Opus on `0xC9`, 48 kHz, 16-bit, stereo — what an embedder that does not call
     /// `punktfunk_connect_ex11` still gets.
     const OPUS_48K: AudioFormat = AudioFormat {
         codec: crate::quic::AUDIO_CODEC_OPUS,
@@ -6616,7 +5502,7 @@ mod tests {
         frame_us: crate::audio::FRAME_MS * 1000,
     };
 
-    /// A lossless session at the depth the feature exists for.
+    /// Lossless session at 48 kHz / 24-bit.
     const PCM_48K_24: AudioFormat = AudioFormat {
         codec: crate::quic::AUDIO_CODEC_PCM,
         rate_hz: crate::audio::SAMPLE_RATE_HZ,
@@ -6625,12 +5511,11 @@ mod tests {
         frame_us: crate::audio::pcm::FRAME_US_LADDER[0],
     };
 
-    /// The concealment run a 5 ms session owes: ten frames — exactly the flat count the cap used
-    /// to be, which is what keeps every geometry assertion below the pre-hi-res one.
+    /// Concealment run a 5 ms session owes: ten frames (50 ms cap).
     const CONCEAL_RUN: u32 = crate::audio::max_conceal_packets(crate::audio::FRAME_MS * 1000);
 
-    /// One `0xD3` payload of `n` interleaved stereo samples at `bits`, built from a deterministic
-    /// ramp across the full code range so any stride or sign-extension error is visible.
+    /// One `0xD3` payload of `n` interleaved stereo samples at `bits`, from a
+    /// deterministic ramp so any stride or sign-extension error is visible.
     fn pcm_frame(n: usize, bits: u8) -> (Vec<f32>, Vec<u8>) {
         let mut samples = Vec::with_capacity(n);
         for i in 0..n {
@@ -6638,16 +5523,14 @@ mod tests {
         }
         let mut wire = Vec::new();
         crate::audio::pcm::from_f32(&samples, bits, &mut wire);
-        // Quantised once, so the expectation is what the wire really carries rather than the
+        // Quantised once, so the expectation is what the wire carries rather than the
         // pre-quantisation floats.
         let mut expect = Vec::new();
         crate::audio::pcm::to_f32(&wire, bits, &mut expect).expect("whole samples");
         (expect, wire)
     }
 
-    /// The claim the lossless plane exists to make, at the ABI boundary an embedder actually sees:
-    /// what `next_audio_pcm` hands out must be the samples the host quantised, not merely
-    /// something close to them. Anything less and the plane is spending 2.3 Mbps for a label.
+    /// PCM decode is bit-exact at the ABI boundary.
     #[test]
     fn the_pcm_plane_decodes_bit_exactly() {
         for bits in [crate::audio::pcm::BITS_16, crate::audio::pcm::BITS_24] {
@@ -6663,18 +5546,15 @@ mod tests {
                 "{bits}-bit PCM must reach the embedder unchanged"
             );
 
-            // …and it stays exact packet after packet, at the buffer offsets a real session uses.
+            // Stays exact packet after packet, at the buffer offsets a real session uses.
             let (expect2, wire2) = pcm_frame(240 * 2, bits);
             let n2 = state.decode_packet(&wire2, 1, fmt).expect("decodes");
             assert_eq!(&state.pcm[..n2], &expect2[..]);
         }
     }
 
-    /// A missing `0xD3` frame must be concealed by `PcmConceal`, NOT by libopus PLC — there is no
-    /// decoder on this plane to ask, and a lossless frame carries no model of the signal to
-    /// extrapolate from (`design/hi-res-audio.md` §4.5). The tell is structural rather than
-    /// aesthetic: no Opus decoder is ever constructed, and the concealed frame is built from the
-    /// last real one (first sample equal, tail faded) rather than synthesized.
+    /// PCM gaps use `PcmConceal`, never libopus. No decoder is built; the conceal
+    /// frame repeats the last real one (`design/hi-res-audio.md`).
     #[test]
     fn a_missing_pcm_frame_is_concealed_without_libopus() {
         let bits = crate::audio::pcm::BITS_24;
@@ -6682,8 +5562,8 @@ mod tests {
         let mut state = AudioPcmState::default();
         assert_eq!(state.decode_packet(&wire, 0, PCM_48K_24), Ok(expect.len()));
 
-        // Seq 2 is lost: one concealed frame lands in front of the real one, contiguously — the
-        // same shape the Opus path produces, so nothing downstream branches on the plane.
+        // Seq 2 is lost: one concealed frame lands in front of the real one,
+        // same shape as Opus so nothing downstream branches on the plane.
         let (expect3, wire3) = pcm_frame(240 * 2, bits);
         let n = state.decode_packet(&wire3, 2, PCM_48K_24).expect("decodes");
         assert_eq!(
@@ -6695,9 +5575,8 @@ mod tests {
             state.decoder.is_none(),
             "a libopus decoder must never be built on the lossless plane"
         );
-        // The concealed frame is the previous one faded, so it starts essentially where the real
-        // audio was (the raised cosine is ~1.0 at the head) and ends at silence. A PLC-synthesized
-        // frame would match neither end.
+        // Concealed frame is the previous one faded: head matches last good sample
+        // (raised cosine ~1.0), tail is silence. PLC-synthesized would match neither.
         assert!(
             (state.pcm[0] - expect[0]).abs() < 1e-3,
             "concealment must repeat the last good frame, got {} vs {}",
@@ -6709,35 +5588,31 @@ mod tests {
             tail.abs() < 0.01,
             "the fade must land on silence, got {tail}"
         );
-        // And the real frame follows it, still bit-exact.
+        // The real frame follows it, still bit-exact.
         assert_eq!(&state.pcm[expect3.len()..n], &expect3[..]);
 
-        // The drought path takes the same route: PcmConceal, one frame, credited against the
-        // next arrival's loss so the gap is never concealed twice.
+        // Drought path takes the same route: PcmConceal, one frame, credited against
+        // the next arrival's loss so the gap is never concealed twice.
         let before = state.drought_frames;
         assert_eq!(state.conceal(PCM_48K_24), Ok(expect.len()));
         assert_eq!(state.drought_frames, before + 1);
         assert!(state.decoder.is_none());
     }
 
-    /// ⚠ The buffer the embedder holds a pointer INTO must never be reallocated: a `Vec` growth
-    /// would dangle it, on a path where the embedder is reading concurrently and the failure
-    /// would not reproduce wherever the allocator happened to grow in place. Pin both halves —
-    /// the allocation never moves, and an oversized/malformed datagram truncates instead of
-    /// extending it.
+    /// `pcm` must never reallocate: the embedder holds a pointer into it.
     #[test]
     fn the_pcm_buffer_is_never_reallocated() {
         for fmt in [OPUS_48K, PCM_48K_24] {
             let mut state = AudioPcmState::default();
             let (_, wire) = pcm_frame(240 * 2, fmt.bits);
-            // Prime it. (On the Opus arm the payload is undecodable, which is fine: the buffer is
-            // sized before the packet is looked at, which is the property under test.)
+            // Prime it. On the Opus arm the payload is undecodable: the buffer is
+            // sized before the packet is looked at, which is the property under test.
             let _ = state.decode_packet(&wire, 0, fmt);
             let ptr = state.pcm.as_ptr();
             let len = state.pcm.len();
             assert!(len > 0, "sizing must have happened on the first packet");
 
-            // A datagram far longer than any rung of the ladder — the case that would otherwise
+            // A datagram far longer than any ladder rung — the case that would otherwise
             // grow the buffer.
             let (_, huge) = pcm_frame(200_000, fmt.bits);
             let _ = state.decode_packet(&huge, 1, fmt);
@@ -6751,9 +5626,8 @@ mod tests {
         }
     }
 
-    /// A truncated `0xD3` payload — not a whole number of samples at the negotiated depth — must
-    /// be refused rather than decoded as a shifted frame, which would desync every sample after
-    /// it. Same disposal as an undecodable Opus packet: concealment already earned still goes out.
+    /// A truncated `0xD3` payload (not a whole number of samples) must be refused
+    /// rather than decoded as a shifted frame. Concealment already earned still goes out.
     #[test]
     fn a_torn_pcm_datagram_is_refused_not_shifted() {
         let mut state = AudioPcmState::default();
@@ -6769,8 +5643,8 @@ mod tests {
             Ok(240 * 2),
             "the gap before a torn packet is still concealed"
         );
-        // An empty payload must NOT wipe the concealment source: PCM has no DTX, so this is a
-        // torn datagram, and clearing `prev` would leave the next loss with nothing to repeat.
+        // Empty payload must not wipe the concealment source: PCM has no DTX, so this
+        // is a torn datagram; clearing `prev` would leave the next loss with nothing to repeat.
         assert_eq!(state.decode_packet(&[], 4, PCM_48K_24), Ok(0));
         assert_eq!(
             state.decode_packet(&wire, 6, PCM_48K_24),
@@ -6779,9 +5653,8 @@ mod tests {
         );
     }
 
-    /// A legacy session must be untouched by all of the above: the same libopus decoder at the
-    /// same 48 kHz, the same buffer geometry, and `PcmConceal` never involved. This is the
-    /// regression the whole hi-res pass has to not cause.
+    /// An Opus session stays on libopus at 48 kHz with the same buffer geometry;
+    /// `PcmConceal` is never involved.
     #[test]
     fn an_opus_session_is_unaffected_by_the_lossless_plane() {
         let l = crate::audio::LAYOUT_STEREO;
@@ -6805,23 +5678,20 @@ mod tests {
         let mut state = AudioPcmState::default();
         assert_eq!(state.decode_packet(&out, 0, OPUS_48K), Ok(240 * 2));
         assert!(state.decoder.is_some(), "still a libopus decoder");
-        // Byte-for-byte the pre-hi-res geometry: 120 ms of Opus plus a full concealment run.
+        // 120 ms of Opus plus a full concealment run.
         assert_eq!(state.pcm.len(), (1 + CONCEAL_RUN as usize) * 5760 * 2);
-        // Gaps and droughts still go through libopus PLC, and PcmConceal is never fed.
+        // Gaps and droughts still go through libopus PLC; PcmConceal is never fed.
         assert_eq!(state.decode_packet(&out, 2, OPUS_48K), Ok(2 * 240 * 2));
         assert_eq!(state.conceal(OPUS_48K), Ok(240 * 2));
         assert_eq!(state.conceal_pcm.run(), 0, "PcmConceal must be untouched");
         assert!(state.scratch_pcm.is_empty());
 
-        // And the format an old embedder sees is exactly the legacy one — the accessors report
-        // 48 kHz / 16-bit, which is what `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ` has always said.
+        // Accessors report 48 kHz / 16-bit, matching `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ`.
         assert_eq!(OPUS_48K.rate_hz, crate::audio::SAMPLE_RATE_HZ);
         assert!(!OPUS_48K.is_pcm());
     }
 
-    /// 96 kHz doubles every sample count, and the buffer has to follow the negotiated rate rather
-    /// than the 48 kHz constant it used to hardcode — otherwise a hi-res session's concealment run
-    /// would be clamped to half the audio it owes.
+    /// Buffer is sized from the negotiated rate, not a hardcoded 48 kHz.
     #[test]
     fn the_buffer_follows_the_negotiated_rate() {
         let hi = AudioFormat {
@@ -6845,15 +5715,8 @@ mod tests {
         assert_eq!(n, (1 + CONCEAL_RUN as usize) * expect.len());
     }
 
-    /// The concealment run is 50 ms of audio, so a SHORT frame owes more frames — 25 at 2 ms, not
-    /// 10 — and this buffer has to have been sized for the run the tracker will actually ask for.
-    ///
-    /// ⚠ This is the invariant with teeth: [`punktfunk_connection_next_audio_pcm`] hands the
-    /// embedder a raw pointer INTO `pcm` and it reads from there until its next call, so the `Vec`
-    /// must never grow. A cap that outran the buffer would not crash — `stage_scratch` clamps —
-    /// it would silently truncate a concealment run, which is exactly the kind of quiet
-    /// almost-right this plane is being built against. Driven at 44 100 Hz because that is the
-    /// rate where a frame is no longer `rate × µs`: the frames are 88 samples per channel.
+    /// 50 ms cap at 2 ms/frame is 25 frames, not 10. Buffer must be sized for
+    /// that run: growth would dangle the embedder pointer.
     #[test]
     fn a_short_frame_owes_more_concealment_and_the_buffer_was_sized_for_it() {
         let short = AudioFormat {
@@ -6864,19 +5727,19 @@ mod tests {
         let run = crate::audio::max_conceal_packets(short.frame_us);
         assert_eq!(run, 25, "50 ms of 2 ms frames");
 
-        // 2 ms at 44 100 Hz stereo: 88 samples per channel, NOT 88.2.
+        // 2 ms at 44 100 Hz stereo: 88 samples per channel, not 88.2.
         let frame = crate::audio::pcm::samples_per_frame(44_100, 2_000, 2);
         assert_eq!(frame, 176);
         let (expect, wire) = pcm_frame(frame, short.bits);
 
         let mut state = AudioPcmState::default();
         assert_eq!(state.decode_packet(&wire, 0, short), Ok(expect.len()));
-        // Sized for the run at THIS frame, from the longest rung's frame size (5 ms = 220/ch).
+        // Sized for the run at this frame, from the longest rung's frame size (5 ms = 220/ch).
         assert_eq!(state.pcm.len(), (1 + run as usize) * 220 * 2);
         let base = state.pcm.as_ptr();
 
-        // A maximal gap: 25 concealed frames plus the real one, contiguous, and the buffer did
-        // not move under the embedder's pointer.
+        // A maximal gap: 25 concealed frames plus the real one, contiguous; the buffer
+        // did not move under the embedder's pointer.
         let n = state.decode_packet(&wire, 1 + run, short).expect("decodes");
         assert_eq!(n, (1 + run as usize) * expect.len());
         assert!(n <= state.pcm.len(), "the run must fit what was allocated");
@@ -6886,10 +5749,9 @@ mod tests {
         );
     }
 
-    /// The in-core PCM decoder heals seq gaps with concealment, exactly like the decode loops
-    /// the other clients run themselves: a lost packet's worth of PLC lands in front of the
-    /// arriving frame, DTX markers advance the accounting without being decoded, and a gap is
-    /// capped at the tracker's 50 ms.
+    /// In-core PCM decoder heals seq gaps with concealment: a lost packet's PLC
+    /// lands in front of the arriving frame, DTX markers advance accounting without
+    /// being decoded, and a gap is capped at 50 ms.
     #[test]
     fn audio_pcm_decode_conceals_seq_gaps() {
         const FRAME: usize = 240; // 5 ms @ 48 kHz, per channel
@@ -6934,11 +5796,11 @@ mod tests {
             state.decode_packet(&packet(0.06), 3, OPUS_48K),
             Ok(FRAME * 2)
         );
-        // DTX marker, nothing lost before it: nothing to emit (the ABI maps 0 to NoFrame)...
+        // DTX marker, nothing lost before it: nothing to emit (the ABI maps 0 to NoFrame).
         assert_eq!(state.decode_packet(&[], 4, OPUS_48K), Ok(0));
-        // ...but a DTX marker AFTER a loss still flushes the concealment owed (seq 5 lost).
+        // A DTX marker after a loss still flushes the concealment owed (seq 5 lost).
         assert_eq!(state.decode_packet(&[], 6, OPUS_48K), Ok(FRAME * 2));
-        // And the DTX slot itself was accounted, not treated as a loss.
+        // The DTX slot itself was accounted, not treated as a loss.
         assert_eq!(
             state.decode_packet(&packet(0.07), 7, OPUS_48K),
             Ok(FRAME * 2)
@@ -6950,11 +5812,7 @@ mod tests {
         );
     }
 
-    /// Drought concealment (WP-C1): the embedder asks for a frame at a time while the wire is
-    /// quiet, and the loss path must then charge only for what the drought did NOT already cover
-    /// — concealing a packet lost inside a covered drought a second time would insert audio the
-    /// stream never carried and push everything after it later. The subtraction lives here
-    /// because the gap tracker does; the embedder driving the drought cannot see it.
+    /// Drought frames must be subtracted from the next gap so a covered loss is not concealed twice.
     #[test]
     fn drought_concealment_is_not_charged_again_by_the_loss_path() {
         const FRAME: usize = 240; // 5 ms @ 48 kHz, per channel
@@ -6996,7 +5854,7 @@ mod tests {
             state.decode_packet(&packet(0.06), 7, OPUS_48K),
             Ok(3 * FRAME * 2)
         );
-        // …and the next drought starts from nothing owed, not from a stale credit.
+        // The next drought starts from nothing owed, not from a stale credit.
         assert_eq!(
             state.decode_packet(&packet(0.06), 9, OPUS_48K),
             Ok(2 * FRAME * 2)

@@ -1,40 +1,18 @@
-//! XFixes cursor source for the gamescope capture path (remote-desktop-sweep Phase C).
+//! XFixes cursor source for the gamescope capture path.
 //!
-//! gamescope draws the pointer on a DRM hardware-cursor plane and its `paint_pipewire()`
-//! deliberately excludes the cursor from the frame it feeds its built-in PipeWire node — so
-//! `SPA_META_Cursor` never arrives and the ordinary [`cursor_live`](super::PortalCapturer) slot
-//! stays empty (a KWin/GNOME session gets its cursor from that meta; gamescope can't embed one
-//! either, its `set_hw_cursor` is inert). We instead read the pointer from gamescope's nested
-//! Xwayland via X11 — the trick Sunshine uses — and publish a [`CursorOverlay`] into that same
-//! slot, so the encoder blend composites the pointer into the video exactly like the portal path.
+//! gamescope paints the pointer on a DRM cursor plane and omits it from the
+//! PipeWire frame, so `SPA_META_Cursor` never arrives. This module reads the
+//! nested Xwayland pointer via X11 and publishes a [`CursorOverlay`] into the
+//! same slot the portal path uses.
 //!
-//! **Multiple Xwaylands.** gamescope runs one Xwayland per `--xwayland-count` (Steam Gaming Mode
-//! uses 2: one for Big Picture, one for the game). The pointer lives on whichever is FOCUSED — an
-//! inactive display's pointer is frozen. So the source connects to ALL of them and publishes from
-//! the one gamescope is actually drawing the pointer on; it reads that display's shape too, since
-//! each Xwayland has its own current cursor. This is why a single-display read froze the pointer
-//! the moment a game on the OTHER Xwayland took focus.
+//! Connect to every nested Xwayland (`--xwayland-count`); the pointer lives
+//! on the focused display only. Follow [`GS_CURSOR_FEEDBACK`] on the root —
+//! gamescope hides by warping the pointer to `(w-1, h-1)` and leaving the last
+//! opaque cursor, so motion and `XFixesGetCursorImage` both report the parked
+//! arrow. Poll position at [`POLL`]; refresh shape on `CursorNotify`; re-read
+//! the atom on `PropertyNotify` (and [`FEEDBACK_RESYNC`] if a notify is missed).
 //!
-//! Three X sources per display, split by cost (Sunshine's split, plus gamescope's own verdict):
-//! * **Position** — core `QueryPointer` on the root, polled fast. Cheap (a few-byte reply, no
-//!   bitmap), so it can out-pace the stream fps and keep the composited pointer smooth.
-//! * **Shape / hotspot** — `XFixesGetCursorImage`, refreshed only after an XFixes `CursorNotify`
-//!   (a real cursor change). A fully-transparent image reads as hidden.
-//! * **Visibility + focus** — [`GAMESCOPE_CURSOR_VISIBLE_FEEDBACK`](GS_CURSOR_FEEDBACK) on the
-//!   root, read at connect and re-read on its `PropertyNotify`.
-//!
-//! **Why the feedback atom and not pointer motion.** gamescope hides its pointer by WARPING the X
-//! pointer to the root's bottom-right corner pixel — it does NOT swap in a transparent X cursor, so
-//! `XFixesGetCursorImage` keeps handing back the last opaque arrow. The original "follow whichever
-//! display's pointer moved" heuristic therefore stuck to the parked display (a parked pointer never
-//! moves again) and composited that arrow at `(w-1, h-1)`: a sliver of cursor welded to the corner
-//! of the stream for the rest of the session, while the real pointer went undrawn. Reported
-//! on-glass as "part of cursor shows up on bottom right … isn't where it really is", in every game
-//! (a game grabs the pointer, so the hide is permanent). Measured on a live 1920x1080 Gaming Mode
-//! session: real motion ⇒ pointer live + feedback `1`; 3 s idle (`--hide-cursor-delay 3000`) ⇒
-//! pointer `(1919, 1079)` + feedback `0`. The atom answers BOTH questions correctly for a static
-//! pointer, which motion cannot: which Xwayland owns it, and whether to draw it at all — so
-//! honouring it also gives the stream gamescope's own idle auto-hide, which this source never had.
+//! Pin: `pick_active` and [`scale_to_frame`] tests in this module.
 
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -55,56 +33,48 @@ use x11rb::rust_connection::{DefaultStream, RustConnection};
 
 use crate::GamescopeCursorTargets;
 
-/// The `MIT-MAGIC-COOKIE-1` auth-protocol name, as it appears in an `.Xauthority` entry.
 const MIT_MAGIC_COOKIE_1: &[u8] = b"MIT-MAGIC-COOKIE-1";
 
-/// Re-run the targets provider this often: adopt Xwaylands that appeared after the stream started
-/// (gamescope spawns the game's on launch and advertises only the first in any child's environ) and
-/// retry ones whose connection died. Two seconds is far below a human's tolerance for a missing
-/// pointer and costs one cheap socket probe per known display.
+/// Adopt Xwaylands spawned after start and retry dead connections. 2 s is
+/// far below a missing-pointer notice; one socket probe per known display.
 const REDISCOVER: Duration = Duration::from_secs(2);
 
-/// Position out-paces the stream fps (`POLL`); shape rides `CursorNotify` events drained each tick.
-/// 4 ms ≈ 250 Hz matches the Windows GDI poller — the polled position IS the composited position
-/// and must out-run a 240 fps session or the pointer stutters.
+/// 4 ms ≈ 250 Hz, matching the Windows GDI poller. The polled position is
+/// the composited position and must out-run a 240 fps session.
 const POLL: Duration = Duration::from_millis(4);
 
-/// gamescope's own pointer verdict, published on EVERY nested Xwayland's root: `1` on the server
-/// whose pointer gamescope is currently drawing, `0` on the others — and `0` on all of them once
-/// the pointer is hidden (a game grabbed it, or `--hide-cursor-delay` fired). See the module docs
-/// for why this, and not pointer motion, is the signal this source follows.
+/// gamescope's pointer verdict on every nested root: `1` on the drawing
+/// server, `0` elsewhere and on all of them once hidden. Motion cannot
+/// answer this — see the module docs.
 const GS_CURSOR_FEEDBACK: &str = "GAMESCOPE_CURSOR_VISIBLE_FEEDBACK";
 
-/// Self-heal cadence for the feedback re-read: `PropertyNotify` drives it, this only covers a
-/// missed/coalesced event (and a gamescope that publishes the atom after we connected). One
-/// `GetProperty` per display per interval is nothing next to the 250 Hz pointer poll.
+/// Covers a missed `PropertyNotify` and an atom published after connect.
+/// One `GetProperty` per display per interval vs the 250 Hz pointer poll.
 const FEEDBACK_RESYNC: Duration = Duration::from_millis(250);
 
-/// A running XFixes cursor reader. Dropping it stops the worker thread and waits — bounded — for it
-/// to release the X connections, so it lives (at most) as long as the capturer that owns it.
+/// Running XFixes cursor reader. Drop stops the worker and waits — bounded —
+/// for it to release the X connections.
 pub(super) struct XFixesCursorSource {
     stop: Arc<AtomicBool>,
-    /// Signalled by the worker just before it returns — lets `Drop` bound its wait (see there).
+    /// Signalled just before the worker returns so `Drop` can bound its wait.
     done: std::sync::mpsc::Receiver<()>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl XFixesCursorSource {
-    /// Start publishing cursor overlays into `slot` from whichever of gamescope's nested Xwaylands
-    /// it is drawing the pointer on. `targets` is re-run every [`REDISCOVER`] to adopt Xwaylands
-    /// that appear later and retry dead ones; `frame_size` is the negotiated capture size, packed
-    /// `(w << 32) | h`, `0` until the first negotiation (see [`scale_to_frame`]).
+    /// Publish overlays into `slot` from the nested Xwayland gamescope is drawing.
+    /// `targets` is re-run every [`REDISCOVER`]; `frame_size` is `(w << 32) | h`,
+    /// `0` until the first negotiation (see [`scale_to_frame`]).
     ///
-    /// Returns `None` only if the thread cannot be spawned. An empty or entirely-unusable target
-    /// list is NOT a failure: the worker idles and keeps re-running the provider, so a stream that
-    /// starts before the game converges instead of being cursorless for the session.
+    /// `None` only if the thread cannot spawn. An empty target list is not a
+    /// failure: the worker idles and retries so a stream that starts before the
+    /// game still converges.
     pub(super) fn spawn(
         targets: GamescopeCursorTargets,
         slot: Arc<Mutex<Option<CursorOverlay>>>,
         frame_size: Arc<AtomicU64>,
     ) -> Option<Self> {
-        // First pass on the caller's thread: the common case connects here, so the log line below
-        // reports the real state instead of "starting…".
+        // Connect here so the log below is the live set, not "starting…".
         let mut displays = Vec::new();
         rediscover(&mut displays, &targets, true);
         let names: Vec<&str> = displays.iter().map(|d| d.name.as_str()).collect();
@@ -146,15 +116,14 @@ impl XFixesCursorSource {
 impl Drop for XFixesCursorSource {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // BOUNDED join. The worker blocks in `RustConnection` replies with no read timeout, so a
-        // peer that stops answering while keeping its socket open (a hung Xwayland) would hang
-        // capturer teardown — and teardown runs on the session path. On timeout we detach: the
-        // thread only ever touches its own X connections and an `Arc`'d slot, so leaving it to
-        // finish on its own is safe (it observes `stop` and exits the moment its reply lands).
+        // The worker blocks in `RustConnection` replies with no read timeout.
+        // A hung Xwayland would hang session-path teardown. On timeout detach:
+        // the thread only touches its own X connections and an `Arc`'d slot,
+        // and exits the moment `stop` is visible and the reply lands.
         let joinable = self.done.recv_timeout(Duration::from_millis(250)).is_ok();
         if let Some(j) = self.join.take() {
             if joinable {
-                let _ = j.join(); // returns at once: `done` already fired
+                let _ = j.join(); // `done` already fired
             } else {
                 tracing::warn!(
                     "gamescope cursor: worker did not stop within 250ms (blocked on an X reply?) — \
@@ -165,9 +134,8 @@ impl Drop for XFixesCursorSource {
     }
 }
 
-/// Re-run the targets provider and reconcile `displays` with it: connect to any target we do not
-/// track yet, and re-connect one whose display died. Existing healthy displays are left alone, so
-/// their shape cache and last position survive.
+/// Connect new targets and retry dead ones. Leave healthy displays so their
+/// shape cache and last position survive.
 fn rediscover(displays: &mut Vec<XDisplay>, targets: &GamescopeCursorTargets, first: bool) {
     for (dpy, xauth) in targets() {
         let existing = displays.iter().position(|d| d.name == dpy);
@@ -190,8 +158,8 @@ fn rediscover(displays: &mut Vec<XDisplay>, targets: &GamescopeCursorTargets, fi
                     }
                 }
             }
-            // Debug, not warn: with a 2 s retry a warn would flood for every Xwayland a
-            // `--xwayland-count` reports but that never comes up.
+            // Debug, not warn: a 2 s retry would flood for every advertised
+            // Xwayland that never comes up.
             Err(e) if first => tracing::warn!(
                 dpy = %dpy, error = %e,
                 "gamescope cursor: skipping a nested Xwayland we can't use (will retry)"
@@ -201,16 +169,15 @@ fn rediscover(displays: &mut Vec<XDisplay>, targets: &GamescopeCursorTargets, fi
     }
 }
 
-/// Open the X connection, negotiate XFixes, and select cursor-change + root-property events —
-/// returning the connection, root window, the root's pixel size (for [`scale_to_frame`]) and this
-/// display's initial [`GAMESCOPE_CURSOR_FEEDBACK`](GS_CURSOR_FEEDBACK) reading (`(atom, value)`;
-/// the value is `None` when gamescope publishes no such property here).
+/// Connection, root, root pixel size (for [`scale_to_frame`]), and this
+/// display's initial [`GS_CURSOR_FEEDBACK`] reading. Value is `None` when
+/// gamescope publishes no such property here.
 type Connected = (RustConnection, Window, (u16, u16), (Atom, Option<bool>));
 
 fn connect(dpy: &str, xauthority: Option<&str>) -> Result<Connected, String> {
     let (conn, screen_num) = connect_conn(dpy, xauthority)?;
 
-    // XFixes ≥ 1 gives GetCursorImage / SelectCursorInput; ask for a modern minor, take what we get.
+    // XFixes ≥ 1 is GetCursorImage / SelectCursorInput; ask 5.0, take what we get.
     conn.xfixes_query_version(5, 0)
         .map_err(ReplyError::from)
         .and_then(|c| c.reply())
@@ -222,20 +189,18 @@ fn connect(dpy: &str, xauthority: Option<&str>) -> Result<Connected, String> {
         .get(screen_num)
         .ok_or_else(|| format!("no X screen {screen_num}"))?;
     let root = screen.root;
-    // gamescope's nested root can be a DIFFERENT size from the output/PipeWire node it publishes
-    // (`-w/-h` vs `-W/-H` are independent knobs), and this is the space `QueryPointer` answers in.
-    // Free here — the setup reply is already parsed.
+    // Nested root can differ from the PipeWire node (`-w/-h` vs `-W/-H`).
+    // `QueryPointer` answers in this space. Setup reply is already parsed.
     let root_size = (screen.width_in_pixels, screen.height_in_pixels);
 
-    // Wake the worker's event drain whenever the cursor shape changes (incl. hide/show).
     conn.xfixes_select_cursor_input(root, xfixes::CursorNotifyMask::DISPLAY_CURSOR)
         .map_err(ReplyError::from)
         .and_then(|c| c.check())
         .map_err(|e| format!("SelectCursorInput: {e}"))?;
 
-    // …and whenever gamescope republishes its cursor verdict. Interned with `only_if_exists=false`
-    // so we hold a matchable atom id even on a gamescope that sets the property later; a failure to
-    // select PROPERTY_CHANGE is NOT fatal — the resync re-read still tracks it, just at 250 ms.
+    // Intern with `only_if_exists=false` so we have an id if gamescope sets
+    // the property later. PROPERTY_CHANGE failure is not fatal: resync still
+    // tracks it at [`FEEDBACK_RESYNC`].
     let feedback_atom = conn
         .intern_atom(false, GS_CURSOR_FEEDBACK.as_bytes())
         .map_err(ReplyError::from)
@@ -253,26 +218,17 @@ fn connect(dpy: &str, xauthority: Option<&str>) -> Result<Connected, String> {
     Ok((conn, root, root_size, (feedback_atom, feedback)))
 }
 
-/// Establish the X connection for `dpy` using `xauthority`'s cookie, WITHOUT touching this process's
+/// Open `dpy` with `xauthority`'s cookie without touching this process's
 /// environment.
 ///
-/// `RustConnection::connect` reads `XAUTHORITY` from the env, so the original implementation
-/// `set_var`'d it around each connect under a mutex. That is unsound from a live multithreaded
-/// host: the lock serialised this source against itself, but `getenv` takes no lock, so any
-/// concurrent reader (libspa's plugin load, EGL/CUDA init — running at exactly this moment, since
-/// the PipeWire thread is starting up) could read the swapped value or race the environ rewrite
-/// outright. The project already has a process-wide env-lock discipline elsewhere, but sharing it
-/// would be the wrong layer AND would still not fix `getenv`.
-///
-/// So: parse the MIT-MAGIC-COOKIE-1 entry out of the file ourselves and hand it to
-/// `connect_to_stream_with_auth_info`, which is what `RustConnection::connect` does internally with
-/// the cookie IT found. Where that finds nothing usable we connect with an explicitly empty token
-/// ([`connect_unauthenticated`]) rather than swapping the environment — this process no longer
-/// writes `environ` at all.
+/// `RustConnection::connect` reads `XAUTHORITY` from the env. Swapping it
+/// around each connect is unsound in a live multithreaded host: `getenv`
+/// takes no lock. Parse the MIT-MAGIC-COOKIE-1 entry and pass it to
+/// `connect_to_stream_with_auth_info`. If nothing usable, connect with an
+/// empty token ([`connect_unauthenticated`]) rather than rewriting `environ`.
 fn connect_conn(dpy: &str, xauthority: Option<&str>) -> Result<(RustConnection, usize), String> {
     let Some(path) = xauthority else {
-        // No per-display cookie file to inject: the ambient environment is already what this
-        // connect should use, so there is nothing to swap and nothing to parse.
+        // Ambient environment is already what this connect should use.
         return RustConnection::connect(Some(dpy)).map_err(|e| format!("connect: {e}"));
     };
     match mit_magic_cookie(path, dpy) {
@@ -292,8 +248,7 @@ fn connect_conn(dpy: &str, xauthority: Option<&str>) -> Result<(RustConnection, 
     connect_unauthenticated(dpy)
 }
 
-/// Connect to `dpy` and complete the setup handshake with an explicit cookie — the same two steps
-/// `RustConnection::connect` performs, minus its env-derived auth lookup.
+/// Same two steps as `RustConnection::connect`, minus its env-derived auth lookup.
 fn connect_with_cookie(
     dpy: &str,
     auth_name: Vec<u8>,
@@ -322,56 +277,36 @@ fn connect_with_cookie(
         .map_err(|e| format!("setup: {e}"))
 }
 
-/// Last-resort fallback (see [`connect_conn`]): connect with an EXPLICITLY EMPTY auth token.
+/// Connect with an explicitly empty auth token. Do not `setenv` `XAUTHORITY`:
+/// glibc rewrites process-global `environ` and `getenv` takes no lock.
 ///
-/// This replaces a `set_var("XAUTHORITY", …)` / connect / restore dance, which was unsound and is
-/// not fixable in place. `setenv`/`unsetenv` rewrite the process-global `environ`; glibc
-/// *reallocates* that array when a variable is added, and the host is emphatically multithreaded
-/// at this moment — `attach_gamescope_cursor` runs while the PipeWire thread is inside `pw_init`'s
-/// `dlopen` and a dozen bare `getenv()` calls, with EGL/CUDA init alongside. A mutex here
-/// serialised this source against itself and against nothing else, because `getenv` takes no lock.
-/// The damaging branch is the one where `XAUTHORITY` is ABSENT and therefore gets *added* — which
-/// `scripts/punktfunk-host.service` makes the normal configuration, since the unit deliberately
-/// does not import the login shell's environment. And `rediscover` re-runs this every 2 s for the
-/// whole session, because a display whose connect fails is never recorded and so is never skipped.
-///
-/// Connecting with an empty token is what the swap actually achieved. We only reach here when our
-/// own lookup found no usable `MIT-MAGIC-COOKIE-1` entry, and x11rb's internal lookup reads the
-/// same file with a STRICTER matcher (it also matches family/address, which we deliberately do
-/// not) — so where we find nothing, it finds nothing too, and connects unauthenticated. That is
-/// precisely why the swap "worked" against a nested Xwayland started without `-auth`.
-///
-/// The one case this gives up is an `.Xauthority` whose entry uses an auth family we decline to
-/// guess at but x11rb would have handled. A gamescope Xwayland writes a single-entry
-/// MIT-MAGIC-COOKIE-1 file, so that case is not reachable here — and a cursor overlay that
-/// declines to attach is the correct outcome anyway, against a torn `environ` in a live session.
+/// Reached only when [`mit_magic_cookie`] found no usable entry. x11rb's
+/// lookup also matches family/address, so it would find nothing too. A
+/// gamescope Xwayland writes a single-entry MIT-MAGIC-COOKIE-1 file.
 fn connect_unauthenticated(dpy: &str) -> Result<(RustConnection, usize), String> {
     connect_with_cookie(dpy, Vec::new(), Vec::new())
 }
 
-/// The `MIT-MAGIC-COOKIE-1` `(name, data)` for `dpy` from the `.Xauthority`-format file at `path`.
+/// MIT-MAGIC-COOKIE-1 `(name, data)` for `dpy` from the `.Xauthority` file.
 ///
-/// Entry layout, all integers big-endian: `u16 family`, then four length-prefixed byte strings —
-/// `address`, `number` (the display number in ASCII), `name`, `data`. An entry with an empty
+/// Wire: big-endian `u16 family`, then four length-prefixed byte strings —
+/// `address`, `number` (display number in ASCII), `name`, `data`. Empty
 /// `number` matches any display.
 ///
-/// Deliberately does NOT match on family/address, unlike libxcb's own lookup. A gamescope Xwayland
-/// gets its own single-entry cookie file, so there is nothing to disambiguate; and a wrong pick
-/// cannot do damage — the server rejects the cookie, and [`connect_conn`] falls back to the env
-/// path, which does the full match. Guessing the peer address for a `LOCAL`-family unix socket, on
-/// the other hand, is exactly the sort of detail that would rot.
+/// Does not match family/address (unlike libxcb). A gamescope Xwayland has
+/// a single-entry cookie file; a wrong pick is rejected by the server and
+/// [`connect_conn`] falls back. Guessing a `LOCAL` unix peer address would rot.
 fn mit_magic_cookie(path: &str, dpy: &str) -> Option<(Vec<u8>, Vec<u8>)> {
     let bytes = std::fs::read(path).ok()?;
     let want = display_number(dpy);
-    // An entry whose `number` is empty matches any display — only used if no exact match is found.
     let mut wildcard = None;
     let mut p = 0usize;
     'entries: while p + 2 <= bytes.len() {
-        p += 2; // family
+        p += 2; // skip family (we do not match on it)
         let mut fields: [&[u8]; 4] = [&[]; 4];
         for f in fields.iter_mut() {
             let Some(lb) = bytes.get(p..p + 2) else {
-                break 'entries; // truncated — keep whatever we already found
+                break 'entries; // truncated: keep whatever we already found
             };
             let len = usize::from(u16::from_be_bytes([lb[0], lb[1]]));
             p += 2;
@@ -395,16 +330,15 @@ fn mit_magic_cookie(path: &str, dpy: &str) -> Option<(Vec<u8>, Vec<u8>)> {
     wildcard
 }
 
-/// The display NUMBER of an X display string as ASCII bytes: `":2"`, `"host:2"` and `":2.0"` all
-/// yield `b"2"`. `None` when there is no numeric display component to match on.
+/// Display number as ASCII bytes: `":2"`, `"host:2"`, `":2.0"` → `b"2"`.
+/// `None` when there is no numeric component to match.
 fn display_number(dpy: &str) -> Option<Vec<u8>> {
     let num = dpy.rsplit_once(':')?.1.split('.').next()?;
     (!num.is_empty() && num.bytes().all(|b| b.is_ascii_digit())).then(|| num.as_bytes().to_vec())
 }
 
-/// Read `GAMESCOPE_CURSOR_VISIBLE_FEEDBACK` off `root`. `None` = the property is absent or
-/// unreadable (not a gamescope that publishes it) — the caller then falls back to the pointer-motion
-/// heuristic rather than blanking the cursor, so an older gamescope keeps today's behaviour.
+/// `None` = property absent or unreadable — caller falls back to motion
+/// rather than blanking, so an older gamescope keeps a cursor.
 fn read_cursor_feedback(conn: &RustConnection, root: Window, atom: Atom) -> Option<bool> {
     if atom == 0 {
         return None;
@@ -418,26 +352,22 @@ fn read_cursor_feedback(conn: &RustConnection, root: Window, atom: Atom) -> Opti
     Some(value != 0)
 }
 
-/// One gamescope Xwayland the source tracks.
 struct XDisplay {
     name: String,
     conn: RustConnection,
     root: Window,
-    /// The nested root's size in pixels — the space `QueryPointer` reports in, which is NOT
-    /// necessarily the captured frame's (see [`scale_to_frame`]).
+    /// Nested root size — `QueryPointer` space, not necessarily the captured
+    /// frame (see [`scale_to_frame`]).
     root_size: (u16, u16),
-    /// Last polled pointer position — a change since the previous tick marks this display FOCUSED.
+    /// Last polled position; a change since the previous tick marks focus.
     last_pos: Option<(i32, i32)>,
-    /// Cached cursor shape, refreshed only after this display's XFixes `CursorNotify`.
     shape: Shape,
-    /// A `CursorNotify` (or first read) is pending — fetch the shape when this display is active.
+    /// Dirty after CursorNotify; fetch only while this display is active.
     need_shape: bool,
-    /// Interned [`GS_CURSOR_FEEDBACK`] atom (`0` = intern failed — treated as absent).
+    /// Interned [`GS_CURSOR_FEEDBACK`] (`0` = intern failed, treated as absent).
     feedback_atom: Atom,
-    /// gamescope's verdict for THIS display: `Some(true)` = it is drawing the pointer here,
-    /// `Some(false)` = it is not, `None` = this gamescope publishes no verdict at all.
+    /// `Some(true)` = drawing here, `Some(false)` = not, `None` = no verdict.
     gs_visible: Option<bool>,
-    /// The X connection died (game/Xwayland exited) — skip it.
     dead: bool,
 }
 
@@ -463,8 +393,8 @@ impl XDisplay {
         }
     }
 
-    /// Re-read gamescope's verdict, keeping a previously-seen one if the read fails (a transient
-    /// failure must not look like "this gamescope has no feedback" and re-arm the motion heuristic).
+    /// Keep a previously-seen verdict if the read fails: a transient miss
+    /// must not look like "no feedback" and re-arm the motion heuristic.
     fn resync_feedback(&mut self) {
         let fresh = read_cursor_feedback(&self.conn, self.root, self.feedback_atom);
         if fresh.is_some() || self.gs_visible.is_none() {
@@ -473,34 +403,28 @@ impl XDisplay {
     }
 }
 
-/// Cached cursor shape for one display.
 #[derive(Default)]
 struct Shape {
-    /// Straight-alpha RGBA (`w*h*4`, bytes R,G,B,A); empty before the first image arrives.
+    /// Straight-alpha RGBA (`w*h*4`); empty before the first image.
     rgba: Arc<Vec<u8>>,
     w: u32,
     h: u32,
     hot_x: u32,
     hot_y: u32,
-    /// XFixes' own per-display cursor serial — bumps on every shape change.
+    /// XFixes per-display cursor serial; not comparable across displays.
     serial: u64,
-    /// A hidden pointer arrives as an all-transparent image; kept so a position-only tick preserves
-    /// the last known visibility.
+    /// All-transparent image = hidden. Kept so a position-only tick preserves it.
     visible: bool,
 }
 
-/// Map a root-space pointer position into FRAME space.
+/// Map a root-space pointer into frame pixels.
 ///
-/// `QueryPointer` answers in the nested root's coordinates, but `CursorOverlay::x/y`'s contract is
-/// FRAME pixels — and gamescope's `-w/-h` (nested root) and `-W/-H` (output + PipeWire node) are
-/// independent knobs. Measured on this box with gamescope 3.16.23 at `-W 1280 -H 720 -w 640 -h 360`
-/// the two spaces differ by 2×, so publishing root coordinates verbatim drew the pointer at a
-/// fraction of its real position. `frame` is `(0, 0)` until the PipeWire format negotiates, in which
-/// case the position passes through unscaled — the same as before, and correct for the common case
-/// where the two spaces agree.
+/// `QueryPointer` answers in the nested root; `CursorOverlay::x/y` is frame
+/// pixels. gamescope's `-w/-h` and `-W/-H` are independent, so root coords
+/// verbatim land at a fraction of the real position. `(0, 0)` frame (not yet
+/// negotiated) passes through unscaled.
 ///
-/// The cursor BITMAP is not scaled: it stays at the shape's native size, so on a mismatched session
-/// the pointer lands in the right place but is drawn at root scale.
+/// The bitmap is not scaled: the pointer lands in the right place at root size.
 fn scale_to_frame((x, y): (i32, i32), root: (u16, u16), frame: (u32, u32)) -> (i32, i32) {
     let (rw, rh) = (u32::from(root.0), u32::from(root.1));
     let (fw, fh) = frame;
@@ -523,38 +447,35 @@ fn run(
     let mut last_discover = std::time::Instant::now();
     let mut warned_scale = false;
     let mut active = 0usize;
-    // The overlay serial must bump whenever the DRAWN cursor changes — either the active display's
-    // shape OR which display is active (per-display XFixes serials aren't comparable across
-    // displays, so switching could reuse a number and the encoder would keep the old texture).
+    // Overlay serial must bump when the drawn cursor changes — active display
+    // or its shape. Per-display XFixes serials are not comparable, so a switch
+    // could reuse a number and the encoder would keep the old texture.
     let mut out_serial = 0u64;
     let mut last_key = (usize::MAX, u64::MAX);
     let mut warned_image = false;
     let mut last_resync = std::time::Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
-        // A missed/coalesced PropertyNotify would otherwise strand the verdict — re-read on a slow
-        // cadence so the source always converges (also picks the atom up if gamescope adds it late).
+        // Re-read on a slow cadence so a missed PropertyNotify still converges.
         let resync = last_resync.elapsed() >= FEEDBACK_RESYNC;
         if resync {
             last_resync = std::time::Instant::now();
         }
-        // Adopt Xwaylands that appeared since we started (a game's, above all) and retry dead ones.
         if last_discover.elapsed() >= REDISCOVER {
             last_discover = std::time::Instant::now();
             rediscover(&mut displays, &targets, false);
         }
 
-        // 1) Poll every display's pointer; note which moved since last tick (the fallback focus
-        //    signal, used only when this gamescope publishes no cursor verdict).
+        // Pointer motion is the fallback focus signal when no display publishes
+        // a cursor verdict.
         let mut active_moved = false;
         let mut other_moved: Option<usize> = None;
         for (i, d) in displays.iter_mut().enumerate() {
             if d.dead {
                 continue;
             }
-            // Drain pending events. Two kinds are selected: XFixes CursorNotify (the shape
-            // changed) and root PropertyNotify (gamescope republished its cursor verdict, among
-            // the many other properties it keeps on the root — hence the atom match).
+            // CursorNotify = shape changed. PropertyNotify on the feedback atom
+            // = gamescope republished its verdict (the root has many properties).
             let mut need_feedback = resync;
             loop {
                 match d.conn.poll_for_event() {
@@ -586,12 +507,11 @@ fn run(
                         }
                     }
                 }
-                Ok(_) => {} // pointer on another screen — keep the last position.
+                Ok(_) => {} // other screen — keep the last position.
                 Err(_) => d.dead = true,
             }
         }
 
-        // 2) Pick the display to publish from, and decide whether a pointer should be drawn at all.
         let states: Vec<(bool, Option<bool>)> =
             displays.iter().map(|d| (d.dead, d.gs_visible)).collect();
         let hidden_by_gamescope;
@@ -600,13 +520,12 @@ fn run(
             match displays.iter().position(|d| !d.dead) {
                 Some(k) => active = k,
                 None => {
-                    std::thread::sleep(POLL); // all connections dead — idle until Drop.
+                    std::thread::sleep(POLL); // all dead — idle until Drop.
                     continue;
                 }
             }
         }
 
-        // 3) Fetch the active display's shape if a CursorNotify (or a focus switch) left it stale.
         if displays[active].need_shape {
             match fetch_cursor_image(&displays[active].conn) {
                 Ok(img) => {
@@ -622,15 +541,13 @@ fn run(
             }
         }
 
-        // 4) Publish the ACTIVE display's pointer + shape (or clear the slot when it has no cursor
-        //    of its own — so a focus switch never leaves the other display's stale pointer showing).
-        //    A pointer gamescope is not drawing is published `visible: false`, NOT dropped: the
-        //    encode loop overwrites the frame's overlay from this slot and strips invisible ones, so
-        //    a `None` here would leave the last visible overlay standing on repeat frames.
+        // Publish `visible: false` rather than `None` for a hidden pointer:
+        // the encode loop copies this slot and strips invisible overlays, so
+        // `None` would leave the last visible overlay standing on repeat frames.
         let d = &displays[active];
         let drawn = d.shape.visible && !hidden_by_gamescope;
-        // Root space → frame space (see `scale_to_frame`). The negotiated size arrives from the
-        // PipeWire thread's `param_changed`, packed `(w << 32) | h`; `0` = not negotiated yet.
+        // Negotiated size from PipeWire `param_changed`, packed `(w << 32) | h`;
+        // `0` = not negotiated yet.
         let packed = frame_size.load(Ordering::Relaxed);
         let frame = ((packed >> 32) as u32, packed as u32);
         if !warned_scale
@@ -656,7 +573,7 @@ fn run(
                     last_key = key;
                 }
                 Some(CursorOverlay {
-                    // Top-left = pointer position − hotspot (the overlay contract).
+                    // Overlay top-left is pointer − hotspot.
                     x: px - d.shape.hot_x as i32,
                     y: py - d.shape.hot_y as i32,
                     w: d.shape.w,
@@ -678,16 +595,12 @@ fn run(
     }
 }
 
-/// Which display to publish from, and whether gamescope is drawing NO pointer right now —
-/// `(active, hidden)`. `states` is one `(dead, gs_visible)` per display, in `displays` order.
+/// `(active, hidden)` from per-display `(dead, gs_visible)`.
 ///
-/// PREFERRED: gamescope's own verdict. It is authoritative for a STATIC pointer, which is exactly
-/// the case motion cannot read — a game grabs the pointer, gamescope parks it in the bottom-right
-/// corner, and "follow whichever moved" then never switches again (see the module docs).
-///
-/// FALLBACK, only when NO live display publishes the verdict: the original motion heuristic —
-/// sticky to the active display while its pointer moves (no flapping), else follow another that
-/// moved. `hidden` is never asserted on this path, so an older gamescope keeps today's behaviour.
+/// Prefer gamescope's verdict: it is right for a static pointer, which motion
+/// cannot read (gamescope parks the pointer at `(w-1, h-1)`). Fallback, only
+/// when no live display publishes a verdict: sticky while the active pointer
+/// moves, else follow another that moved. `hidden` is never set on fallback.
 fn pick_active(
     states: &[(bool, Option<bool>)],
     active: usize,
@@ -697,11 +610,9 @@ fn pick_active(
     let live = |&(dead, _): &(bool, Option<bool>)| !dead;
     if states.iter().filter(|s| live(s)).any(|(_, v)| v.is_some()) {
         return match states.iter().position(|s| live(s) && s.1 == Some(true)) {
-            // gamescope is drawing the pointer here — publish from it.
             Some(i) => (i, false),
-            // Drawing none of them (a game grabbed it, or the idle auto-hide fired). Keep `active`
-            // so the shape cache and last position stay warm for the re-show; the caller publishes
-            // the overlay `visible: false` instead of dropping it.
+            // Drawing none. Keep `active` so shape + last position stay warm;
+            // the caller publishes `visible: false` instead of dropping.
             None => (active, true),
         };
     }
@@ -711,8 +622,8 @@ fn pick_active(
     }
 }
 
-/// Update `shape` from a fresh `GetCursorImage` reply. A hidden pointer (all-transparent) keeps the
-/// last bitmap (instant re-show) but flips visibility; the serial still bumps so the change shows.
+/// A hidden (all-transparent) pointer keeps the last bitmap for instant
+/// re-show but flips visibility; the serial still bumps.
 fn update_shape(shape: &mut Shape, img: &GetCursorImageReply) {
     let visible =
         img.width > 0 && img.height > 0 && img.cursor_image.iter().any(|&p| (p >> 24) & 0xff != 0);
@@ -727,8 +638,8 @@ fn update_shape(shape: &mut Shape, img: &GetCursorImageReply) {
     shape.serial = u64::from(img.cursor_serial);
 }
 
-/// One request+reply — x11rb splits errors (the request is `ConnectionError`, `reply()` is
-/// `ReplyError` which is `From<ConnectionError>`), so the request `?` converts into the reply error.
+/// x11rb splits request (`ConnectionError`) and `reply()` (`ReplyError`);
+/// `?` on the request converts into the reply error.
 fn fetch_cursor_image(conn: &RustConnection) -> Result<GetCursorImageReply, ReplyError> {
     conn.xfixes_get_cursor_image()?.reply()
 }
@@ -737,10 +648,9 @@ fn fetch_pointer(conn: &RustConnection, root: Window) -> Result<QueryPointerRepl
     conn.query_pointer(root)?.reply()
 }
 
-/// XFixes cursor pixels are packed `0xAARRGGBB` with **premultiplied** alpha (the Xrender / Xcursor
-/// convention). The overlay + both blend paths want **straight** alpha RGBA (R,G,B,A bytes), like
-/// the `SPA_META_Cursor` path — so un-premultiply here. (If on-glass shows over-bright fringes the
-/// source wasn't premultiplied after all; drop the divide.)
+/// XFixes pixels are packed `0xAARRGGBB` with premultiplied alpha (Xrender /
+/// Xcursor). The overlay and both blend paths want straight RGBA, like
+/// `SPA_META_Cursor`.
 fn argb_premul_to_straight_rgba(argb: &[u32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(argb.len() * 4);
     for &px in argb {
@@ -768,7 +678,6 @@ mod tests {
         display_number, mit_magic_cookie, pick_active, scale_to_frame, MIT_MAGIC_COOKIE_1,
     };
 
-    /// One `.Xauthority` entry in wire form: `u16 family` + four length-prefixed byte strings.
     fn entry(family: u16, address: &[u8], number: &[u8], name: &[u8], data: &[u8]) -> Vec<u8> {
         let mut v = family.to_be_bytes().to_vec();
         for f in [address, number, name, data] {
@@ -779,8 +688,8 @@ mod tests {
     }
 
     fn write_xauth(bytes: &[u8]) -> std::path::PathBuf {
-        // The scratch file lives beside the test binary's temp dir; unique per call via the address
-        // of a local (no rand dependency, and the tests do not run concurrently on one path).
+        // Unique per call via the address of a local — no rand, and tests do
+        // not share one path concurrently.
         let mut p = std::env::temp_dir();
         let uniq = format!(
             "pf-xauth-test-{}-{:p}",
@@ -797,21 +706,15 @@ mod tests {
         assert_eq!(display_number(":2").as_deref(), Some(&b"2"[..]));
         assert_eq!(display_number(":2.0").as_deref(), Some(&b"2"[..]));
         assert_eq!(display_number("host:13.1").as_deref(), Some(&b"13"[..]));
-        // Nothing to match on — the caller then accepts only a wildcard entry.
         assert_eq!(display_number("bogus"), None);
         assert_eq!(display_number(":"), None);
         assert_eq!(display_number(":abc"), None);
     }
 
-    /// The cookie reader is the one PARSER in this file fed a file we did not write, so it gets the
-    /// hostile-input treatment: exact-match, wildcard fallback, skipping other auth protocols, and
-    /// truncation.
     #[test]
     fn mit_magic_cookie_picks_the_matching_entry() {
         let mut file = Vec::new();
-        // A different protocol on the display we want — must be skipped, not returned.
         file.extend(entry(256, b"host", b"2", b"XDM-AUTHORIZATION-1", b"nope"));
-        // Another display's cookie.
         file.extend(entry(
             256,
             b"host",
@@ -819,7 +722,6 @@ mod tests {
             MIT_MAGIC_COOKIE_1,
             b"other-display",
         ));
-        // Ours.
         file.extend(entry(256, b"host", b"2", MIT_MAGIC_COOKIE_1, b"the-cookie"));
         let p = write_xauth(&file);
         let got = mit_magic_cookie(p.to_str().unwrap(), ":2");
@@ -827,14 +729,12 @@ mod tests {
             got,
             Some((MIT_MAGIC_COOKIE_1.to_vec(), b"the-cookie".to_vec()))
         );
-        // A display with no entry at all yields nothing (⇒ the caller falls back to the env path).
         assert_eq!(mit_magic_cookie(p.to_str().unwrap(), ":9"), None);
         let _ = std::fs::remove_file(p);
     }
 
     #[test]
     fn mit_magic_cookie_falls_back_to_a_wildcard_entry() {
-        // An empty `number` matches any display — but an exact match still wins.
         let mut file = entry(256, b"host", b"", MIT_MAGIC_COOKIE_1, b"wildcard");
         file.extend(entry(256, b"host", b"3", MIT_MAGIC_COOKIE_1, b"exact"));
         let p = write_xauth(&file);
@@ -853,11 +753,9 @@ mod tests {
     #[test]
     fn a_truncated_xauthority_keeps_what_it_already_parsed() {
         let mut file = entry(256, b"host", b"", MIT_MAGIC_COOKIE_1, b"wildcard");
-        // A second entry cut off mid-length-prefix.
         file.extend(entry(256, b"host", b"5", MIT_MAGIC_COOKIE_1, b"truncated"));
         file.truncate(file.len() - 4);
         let p = write_xauth(&file);
-        // No panic, no over-read: the wildcard found before the truncation still serves.
         assert_eq!(
             mit_magic_cookie(p.to_str().unwrap(), ":5").map(|(_, d)| d),
             Some(b"wildcard".to_vec())
@@ -867,37 +765,31 @@ mod tests {
 
     #[test]
     fn a_garbage_xauthority_is_declined_not_fatal() {
-        // A length prefix that claims far more than the file holds.
         let p = write_xauth(&[0, 0, 0xff, 0xff, 1, 2, 3]);
         assert_eq!(mit_magic_cookie(p.to_str().unwrap(), ":0"), None);
         let _ = std::fs::remove_file(p);
-        // A missing file is simply "no cookie".
         assert_eq!(mit_magic_cookie("/nonexistent/pf-xauth", ":0"), None);
     }
 
-    /// L6: gamescope's `-w/-h` (nested root, the space `QueryPointer` answers in) and `-W/-H`
-    /// (output + PipeWire node, the space `CursorOverlay` is contracted in) are independent.
     #[test]
     fn pointer_positions_are_mapped_into_frame_space() {
-        // The measured case: root 640x360 inside a 1280x720 output — 2x.
         assert_eq!(
             scale_to_frame((320, 180), (640, 360), (1280, 720)),
             (640, 360)
         );
         assert_eq!(scale_to_frame((0, 0), (640, 360), (1280, 720)), (0, 0));
-        // Down-scaling works the same way.
         assert_eq!(
             scale_to_frame((1280, 720), (1280, 720), (640, 360)),
             (640, 360)
         );
-        // Equal spaces are a pass-through (the common case — no rounding drift).
+        // Equal spaces: pass-through, no rounding drift.
         assert_eq!(scale_to_frame((7, 9), (1920, 1080), (1920, 1080)), (7, 9));
-        // Not negotiated yet, or a degenerate root: pass through rather than divide by zero.
+        // Not negotiated, or a degenerate root: pass through rather than divide by zero.
         assert_eq!(scale_to_frame((7, 9), (1920, 1080), (0, 0)), (7, 9));
         assert_eq!(scale_to_frame((7, 9), (0, 0), (1920, 1080)), (7, 9));
     }
 
-    /// A 5K frame times a 5K coordinate overflows `i32` — the scale must be computed wide.
+    /// A 5K frame times a 5K coordinate overflows `i32` — scale in `i64`.
     #[test]
     fn scaling_does_not_overflow_at_5k() {
         assert_eq!(
@@ -906,26 +798,21 @@ mod tests {
         );
     }
 
-    /// Steam Gaming Mode shape: display 0 = Big Picture's Xwayland, 1 = the game's.
+    /// Display 0 = Big Picture Xwayland, 1 = the game's.
     const BPM: usize = 0;
     const GAME: usize = 1;
 
     #[test]
     fn follows_the_display_gamescope_draws_on() {
-        // Verdict beats motion: gamescope says the game's Xwayland owns the pointer, so we publish
-        // from it even though only BPM's (parked) pointer looks like it moved.
+        // Verdict beats motion, including when only the parked display moved.
         let states = [(false, Some(false)), (false, Some(true))];
         assert_eq!(pick_active(&states, BPM, false, Some(BPM)), (GAME, false));
     }
 
-    /// THE REGRESSION: gamescope hides the pointer by warping it to the root's bottom-right corner
-    /// and leaves the opaque arrow as the X cursor. Nothing moves ever again, so the motion
-    /// heuristic stayed on the parked display and composited that arrow at (w-1, h-1) — a sliver of
-    /// cursor welded to the corner of the stream for the whole session, in every game.
     #[test]
     fn a_pointer_gamescope_draws_nowhere_is_hidden_not_parked() {
         let states = [(false, Some(false)), (false, Some(false))];
-        // `active` is kept (shape cache + last position stay warm for the re-show) but hidden.
+        // Keep `active` (shape + last position stay warm) but hidden.
         assert_eq!(pick_active(&states, GAME, false, None), (GAME, true));
     }
 
@@ -937,11 +824,11 @@ mod tests {
 
     #[test]
     fn a_dead_displays_verdict_is_ignored() {
-        // The game's Xwayland exited mid-session with a stale `Some(true)`; BPM is the live one.
+        // Stale `Some(true)` on an exited Xwayland must not win.
         let states = [(false, Some(true)), (true, Some(true))];
         assert_eq!(pick_active(&states, GAME, false, None), (BPM, false));
-        // …and a dead display's `Some` must not count as "this gamescope publishes a verdict",
-        // which would blank the cursor forever on a gamescope that publishes none.
+        // A dead display's `Some` must not count as "this gamescope publishes
+        // a verdict" — that would blank the cursor forever.
         let states = [(false, None), (true, Some(false))];
         assert_eq!(pick_active(&states, BPM, false, Some(GAME)), (GAME, false));
     }
@@ -949,12 +836,9 @@ mod tests {
     #[test]
     fn no_verdict_falls_back_to_the_motion_heuristic() {
         let none = [(false, None), (false, None)];
-        // Sticky while the active display's own pointer moves…
         assert_eq!(pick_active(&none, BPM, true, Some(GAME)), (BPM, false));
-        // …otherwise follow the one that moved…
         assert_eq!(pick_active(&none, BPM, false, Some(GAME)), (GAME, false));
-        // …and never assert `hidden` on this path (that would regress an older gamescope to a
-        // cursorless stream).
+        // Never `hidden` on this path (would blank an older gamescope).
         assert_eq!(pick_active(&none, BPM, false, None), (BPM, false));
     }
 }

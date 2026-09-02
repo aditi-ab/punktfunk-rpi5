@@ -1,37 +1,19 @@
-//! The libva decode buffer layouts for H.265, hand-declared — the HEVC twin of
-//! [`crate::va`], measured the same way and pinned the same way.
+//! Hand-declared libva H.265 decode-buffer layouts — HEVC twin of [`crate::va`].
 //!
-//! Sizes and offsets come from the committed `layout-probe.c` run against libva
-//! **2.23.0** headers: `VAPictureHEVC` **28**, `VAPictureParameterBufferHEVC` **604**,
-//! `VASliceParameterBufferHEVC` **264**, `VAIQMatrixBufferHEVC` **1016**. Every bit
-//! position below was read back off a real header too, not counted by eye.
+//! Layouts from `layout-probe.c` against libva **2.23.0**, pinned below:
+//! `VAPictureHEVC` 28, `VAPictureParameterBufferHEVC` 604,
+//! `VASliceParameterBufferHEVC` 264, `VAIQMatrixBufferHEVC` 1016.
 //!
-//! # HEVC's reference plumbing is a THIRD convention
+//! VAAPI marks RPS membership as flags on the DPB entries
+//! (`VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE` / `_AFTER` / `_LT_CURR`), not Vulkan
+//! DPB slot indices and not DXVA `RefPicList[]` positions. Per-slice
+//! `RefPicList[2][15]` holds indices into `ReferenceFrames` (`0xff` unused).
 //!
-//! This program has now met three different ways of saying which pictures a short-term
-//! reference set contains, and they are not interchangeable:
-//!
-//! * **Vulkan** takes DPB *slot* indices in `RefPicSetStCurrBefore/After/LtCurr` —
-//!   writing reference-list positions there is what made HEVC unplayable on every
-//!   driver until it was root-caused.
-//! * **DXVA** takes positions into `RefPicList[]` in identically named arrays.
-//! * **VAAPI** takes neither: it marks membership as **flags on the DPB entries
-//!   themselves** (`VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE` / `_AFTER` / `_LT_CURR`), and
-//!   the per-slice `RefPicList[2][15]` holds **indices into `ReferenceFrames`** rather
-//!   than pictures.
-//!
-//! Three spellings of one idea, one of which has already cost this project a
-//! shipped defect — so the conversion states which it is writing, every time.
-//!
-//! # And the offset is a BYTE offset
-//!
-//! H.264's `slice_data_bit_offset` counts bits; HEVC's `slice_data_byte_offset` counts
-//! bytes, over the same definition (from and including the NAL header byte, with
-//! emulation-prevention bytes removed). `slice_data()` is byte-aligned by
-//! `byte_alignment()`, so the parser's `header_bit_size / 8` is exact rather than
-//! rounded — and the conversion asserts that rather than assuming it.
+//! `slice_data_byte_offset` counts **bytes** from and including the NAL header
+//! (emulation-prevention bytes removed). H.264's `slice_data_bit_offset` counts
+//! bits over the same span. `slice_data()` is byte-aligned by `byte_alignment()`,
+//! so `header_bit_size / 8` is exact; the conversion asserts that.
 
-/// Flags for [`VaPictureHEVC::flags`].
 pub const VA_PICTURE_HEVC_INVALID: u32 = 0x0000_0001;
 pub const VA_PICTURE_HEVC_FIELD_PIC: u32 = 0x0000_0002;
 pub const VA_PICTURE_HEVC_BOTTOM_FIELD: u32 = 0x0000_0004;
@@ -43,18 +25,17 @@ pub const VA_PICTURE_HEVC_RPS_LT_CURR: u32 = 0x0000_0040;
 /// `ReferenceFrames` length — 15, not 16 as in H.264.
 pub const REFERENCE_FRAMES_LEN_H265: usize = 15;
 
-/// `RefPicList[2][15]`'s inner length, and the value an unused entry carries
-/// (`0xff`, libva's "no entry" for an index into `ReferenceFrames`).
 pub const REF_PIC_LIST_LEN_H265: usize = 15;
+/// Unused list entry: index into `ReferenceFrames`, not a picture.
 pub const REF_PIC_LIST_UNUSED: u8 = 0xff;
 
-/// `VAPictureHEVC` — one DPB entry, or the current picture.
+/// One DPB entry, or the current picture.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VaPictureHEVC {
     pub picture_id: u32,
     pub pic_order_cnt: i32,
-    /// Long-term marking AND the picture's RPS membership, ORed together.
+    /// Long-term mark and RPS membership, ORed.
     pub flags: u32,
     pub va_reserved: [u32; 4],
 }
@@ -195,12 +176,11 @@ impl LongSliceFlagsH265 {
     }
 }
 
-/// `VAPictureParameterBufferHEVC`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VaPictureParameterBufferHEVC {
     pub curr_pic: VaPictureHEVC,
-    /// The DPB — 15 entries, each carrying its own RPS membership flags.
+    /// Each entry carries its own RPS membership flags.
     pub reference_frames: [VaPictureHEVC; REFERENCE_FRAMES_LEN_H265],
     /// LUMA SAMPLES, not macroblocks: HEVC states the picture size directly.
     pub pic_width_in_luma_samples: u16,
@@ -237,13 +217,11 @@ pub struct VaPictureParameterBufferHEVC {
     pub pps_beta_offset_div2: i8,
     pub pps_tc_offset_div2: i8,
     pub num_extra_slice_header_bits: u8,
-    /// Bit length of the short-term RPS coded in THIS slice header, or 0 when the
-    /// slice referenced an SPS set instead.
+    /// Bit length of the short-term RPS in this slice header; 0 if the slice used an SPS set.
     pub st_rps_bits: u32,
     pub va_reserved: [u32; 8],
 }
 
-/// `VAIQMatrixBufferHEVC` — four list sizes plus the two DC tables.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VaIqMatrixBufferHEVC {
@@ -256,19 +234,16 @@ pub struct VaIqMatrixBufferHEVC {
     pub va_reserved: [u32; 4],
 }
 
-/// `VASliceParameterBufferHEVC`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VaSliceParameterBufferHEVC {
     pub slice_data_size: u32,
     pub slice_data_offset: u32,
     pub slice_data_flag: u32,
-    /// BYTES from and including the NAL header byte to `slice_data()`, with
-    /// emulation-prevention bytes removed (module docs).
+    /// Bytes from the NAL header through `slice_data()`, emulation-prevention bytes removed.
     pub slice_data_byte_offset: u32,
     pub slice_segment_address: u32,
-    /// Indices into [`VaPictureParameterBufferHEVC::reference_frames`], NOT pictures
-    /// and NOT surfaces. `0xff` marks an unused entry.
+    /// Indices into `reference_frames`, not pictures or surfaces; `0xff` unused.
     pub ref_pic_list: [[u8; REF_PIC_LIST_LEN_H265]; 2],
     pub long_slice_flags: u32,
     pub collocated_ref_idx: u8,
@@ -298,7 +273,7 @@ pub struct VaSliceParameterBufferHEVC {
 }
 
 impl VaSliceParameterBufferHEVC {
-    /// An all-zero record with both reference lists marked unused.
+    /// Lists are `0xff`, not zero.
     pub const fn zeroed() -> Self {
         VaSliceParameterBufferHEVC {
             slice_data_size: 0,
@@ -335,9 +310,7 @@ impl VaSliceParameterBufferHEVC {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Layout proofs — the probe's output, pinned (libva 2.23.0, x86_64-linux-gnu).
-// ---------------------------------------------------------------------------
+// Layout proofs from `layout-probe.c` (libva 2.23.0, x86_64-linux-gnu).
 
 const _: () = {
     use std::mem::offset_of;
@@ -453,8 +426,7 @@ mod tests {
         );
     }
 
-    /// Each field alone must light only its own bits — two probe vectors per word
-    /// would not catch a shift typo that overlapped two neighbours.
+    /// One field at a time: two probe vectors would miss a shift that overlaps a neighbour.
     #[test]
     fn every_hevc_pic_field_owns_a_distinct_bit_range() {
         let mut seen = 0u32;
@@ -495,7 +467,7 @@ mod tests {
             set(&mut f);
             check(f.pack());
         }
-        // Nothing may reach into the 11 reserved bits.
+        // Packed bits occupy [0, 20]; 11 high bits stay reserved.
         assert_eq!(seen & !0x001f_ffff, 0);
     }
 

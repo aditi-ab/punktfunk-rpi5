@@ -1,5 +1,4 @@
-//! Client/pairing-tagged management endpoints: paired Moonlight clients and the GameStream
-//! pairing PIN flow. Split out of the `mgmt` facade (plan §W5).
+//! Paired Moonlight clients and the GameStream pairing PIN flow.
 
 use super::shared::*;
 use sha2::{Digest, Sha256};
@@ -10,16 +9,12 @@ pub(crate) struct PairedClient {
     /// Lowercase hex SHA-256 of the client certificate DER — the client's stable id here.
     #[schema(example = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")]
     fingerprint: String,
-    /// Certificate subject (e.g. `CN=NVIDIA GameStream Client`), if the DER parses.
-    ///
-    /// Do not display this as a device name. Every moonlight-common-c client self-signs with that
-    /// same fixed subject, so it identifies the *protocol*, not the device — a list of paired
-    /// phones, TVs and handhelds all read identically. [`Self::label`] is the field to show.
+    /// Certificate subject if the DER parses. Do not display as a device name: every
+    /// moonlight-common-c client self-signs `CN=NVIDIA GameStream Client`, so this names
+    /// the protocol. [`Self::label`] is the field to show.
     subject: Option<String>,
-    /// Operator-assigned display name for this device, if one has been set (`PATCH /clients/{fp}`).
-    ///
-    /// This is the ONLY thing that can tell two paired Moonlight devices apart in a list, because
-    /// their certificates cannot: see [`Self::subject`]. Absent until somebody names the device.
+    /// Operator-assigned display name (`PATCH /clients/{fp}`). The only way to tell two
+    /// paired Moonlight devices apart; absent until somebody names the device.
     #[schema(example = "Living Room TV")]
     label: Option<String>,
     /// Certificate validity start (unix seconds).
@@ -32,11 +27,9 @@ pub(crate) struct PairedClient {
 #[cfg(feature = "gamestream")]
 #[derive(Serialize, ToSchema)]
 pub(crate) struct PairingStatus {
-    /// True while a pairing handshake is parked waiting for the user's PIN.
     pin_pending: bool,
-    /// The parked ceremonies. Show these next to the PIN prompt — the operator should answer a
-    /// NAMED request, and echo the identity back in the submit so the PIN is addressed to the
-    /// ceremony they saw (security-review 2026-08-31 H-4).
+    /// Parked ceremonies. Echo this identity in the submit so the PIN addresses the
+    /// ceremony the operator saw, not a later arrival.
     pending: Vec<PendingCeremony>,
 }
 
@@ -52,7 +45,7 @@ pub(crate) struct PendingCeremony {
     peer_ip: String,
 }
 
-/// The PIN and exact ceremony selected from `GET /pair`.
+/// PIN plus the exact ceremony selected from `GET /pair`.
 #[cfg(feature = "gamestream")]
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct SubmitPin {
@@ -115,25 +108,19 @@ pub(crate) fn client_info(
 /// Body of `PATCH /clients/{fingerprint}` — the device's display name.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct RenameClient {
-    /// The name to show for this device. `null` (or an empty/whitespace-only string) clears it and
-    /// the device goes back to being listed by fingerprint alone.
+    /// Display name. `null` or empty/whitespace clears it (listed by fingerprint alone).
     ///
-    /// Scrubbed before storage by the same sanitizer the native plane runs on device names:
-    /// control characters and Unicode bidi overrides are stripped (they could make one paired
-    /// device impersonate another in this very list), whitespace collapsed, and the result capped
-    /// at 64 characters.
+    /// Scrubbed with the native-plane sanitizer: control characters and Unicode bidi
+    /// overrides stripped (one device could impersonate another in this list), whitespace
+    /// collapsed, capped at 64 characters.
     #[schema(example = "Living Room TV")]
     label: Option<String>,
 }
 
 /// Rename a paired client
 ///
-/// Sets or clears the operator-visible display name for one paired Moonlight client. This is
-/// purely cosmetic — it touches no certificate and no trust decision — but it is the only way to
-/// tell paired devices apart: every moonlight-common-c client self-signs with the identical
-/// subject `CN=NVIDIA GameStream Client`, so an unnamed list is a row of clones distinguishable
-/// only by fingerprint. The name is stored beside the pairing store and survives host restarts;
-/// unpairing the device forgets it.
+/// Cosmetic: no certificate, no trust change. Stored beside the pairing store; unpairing
+/// the device forgets it.
 #[utoipa::path(
     patch,
     path = "/clients/{fingerprint}",
@@ -162,9 +149,8 @@ pub(crate) async fn rename_client(
             "fingerprint must be the 64-char hex SHA-256 of the client certificate DER",
         );
     }
-    // Only name a device that is actually paired: a label for an unknown fingerprint would be
-    // invisible (nothing lists it) and would sit in the file forever, since the unpair cleanup
-    // only ever removes labels whose device WAS paired.
+    // A label for an unknown fingerprint is invisible and sits in the file forever: unpair
+    // cleanup only removes labels whose device was paired.
     let paired = st.app.paired.lock().unwrap_or_else(|e| e.into_inner());
     let Some(der) = paired
         .iter()
@@ -177,8 +163,8 @@ pub(crate) async fn rename_client(
         );
     };
     drop(paired);
-    // An all-whitespace name is a cleared name, not a device called "   ": the sanitizer would
-    // otherwise turn it into the "device <fp8>" fallback and the row would look renamed.
+    // All-whitespace is a clear, not a device named "   ": the sanitizer would otherwise
+    // turn it into the "device <fp8>" fallback and the row would look renamed.
     let wanted = body
         .label
         .as_deref()
@@ -191,13 +177,10 @@ pub(crate) async fn rename_client(
 
 /// Unpair a client
 ///
-/// Removes the client's certificate from the pairing store (persisted — the removal survives a
-/// host restart). Revocation is complete: a LIVE GameStream session owned by this certificate is
-/// ended (the client gets the standard TERMINATION+disconnect), and removing the last pairing
-/// also closes the ENet control port (UDP 47999), which is only bound while at least one pairing
-/// exists. The nvhttp TLS layer still completes a handshake with any well-formed client cert BY
-/// DESIGN (authorization is per-request via the paired-fingerprint check) — an unpaired client
-/// that reconnects is rejected at every post-pair endpoint.
+/// Persisted. A live GameStream session owned by this certificate is ended
+/// (TERMINATION+disconnect). Removing the last pairing closes the ENet control port.
+/// nvhttp TLS still completes a handshake with any well-formed client cert — authorization
+/// is per-request via the paired-fingerprint check.
 #[utoipa::path(
     delete,
     path = "/clients/{fingerprint}",
@@ -228,19 +211,16 @@ pub(crate) async fn unpair_client(
     let before = paired.len();
     paired.retain(|der| !hex::encode(Sha256::digest(der)).eq_ignore_ascii_case(&fingerprint));
     if paired.len() < before {
-        // Persist the removal — without this the unpair lasted only until the next host
-        // restart, which now also matters below: a resurrected pairing would silently
-        // re-open the control port.
+        // Without this, a restart would resurrect the pairing and silently re-open the
+        // control port.
         crate::gamestream::save_paired(&paired);
-        // Forget this device's display name with it, so the file can't grow without bound and a
-        // later re-pairing of the same certificate starts unnamed.
+        // Forget the label with the pairing so the file cannot grow without bound; a later
+        // re-pair of the same cert starts unnamed.
         crate::gamestream::retain_client_labels(&paired);
         drop(paired);
-        // Revocation reaches a LIVE session too: a mid-stream client whose pairing was just
-        // removed must not keep streaming until it chooses to leave. Clearing the launch makes
-        // the ENet control thread give it the standard TERMINATION+disconnect farewell. (An
-        // owner-less launch — the cert was unreadable at /launch — cannot be attributed and is
-        // left to the port teardown below when this was the last pairing.)
+        // A mid-stream client must not keep streaming. Clearing the launch makes the ENet
+        // thread send TERMINATION+disconnect. An owner-less launch (cert unreadable at
+        // /launch) cannot be attributed; last-pairing port teardown covers it.
         let removed_fp: Option<[u8; 32]> = hex::decode(&fingerprint)
             .ok()
             .and_then(|v| v.try_into().ok());
@@ -253,9 +233,8 @@ pub(crate) async fn unpair_client(
         if removed_fp.is_some() && removed_fp == live_owner {
             st.app.quit_session("client unpaired");
         }
-        // The last pairing going away closes the ENet control port (rust-safety WP0). A
-        // no-op while other pairings remain — or on a native-only host, where the gate is
-        // never armed.
+        // Last pairing closes the ENet control port. No-op while others remain, or on a
+        // native-only host where the gate is never armed.
         if let Err(e) = crate::gamestream::sync_control(&st.app) {
             tracing::warn!(error = %format!("{e:#}"), "control port sync after unpair failed");
         }
@@ -271,14 +250,9 @@ pub(crate) async fn unpair_client(
 
 /// Unpair every client
 ///
-/// The collection form of [`unpair_client`]: empties the pairing store in ONE persisted write,
-/// carrying the same revocation guarantees across the whole set. A LIVE GameStream session is
-/// ended (its owning certificate is necessarily one of those just removed), and the ENet control
-/// port (UDP 47999) closes, because no pairing is left to hold it open.
-///
-/// Idempotent, and so a 200 rather than the single unpair's 204/404 pair: "unpair everything" is
-/// satisfied by an already-empty store, and the operator still wants to know whether that meant
-/// three devices or none.
+/// Collection form of [`unpair_client`]: one persisted write, same revocation across the
+/// set. Idempotent, so 200 rather than 204/404 — an already-empty store still satisfies
+/// "unpair everything", and the body says whether that was three devices or none.
 #[utoipa::path(
     delete,
     path = "/clients",
@@ -292,7 +266,6 @@ pub(crate) async fn unpair_client(
 pub(crate) async fn unpair_all_clients(State(st): State<Arc<MgmtState>>) -> Response {
     let mut paired = st.app.paired.lock().unwrap_or_else(|e| e.into_inner());
     if paired.is_empty() {
-        // Nothing to persist, no port to sync — an empty store is already the requested state.
         return Json(UnpairAllResult { unpaired: 0 }).into_response();
     }
     let removed: Vec<[u8; 32]> = paired
@@ -300,16 +273,13 @@ pub(crate) async fn unpair_all_clients(State(st): State<Arc<MgmtState>>) -> Resp
         .map(|der| Sha256::digest(der).into())
         .collect();
     paired.clear();
-    // Persist under the lock, as the single unpair does: a pairing resurrected by a restart would
-    // silently re-open the control port.
+    // Persist under the lock, as the single unpair does: a pairing resurrected by a restart
+    // would silently re-open the control port.
     crate::gamestream::save_paired(&paired);
-    // Nothing is paired any more, so no label can still belong to anyone.
     crate::gamestream::retain_client_labels(&paired);
     drop(paired);
-    // A mid-stream client must not keep streaming once its pairing is gone. Clearing the launch
-    // makes the ENet control thread send the standard TERMINATION+disconnect. (An owner-less
-    // launch — the cert was unreadable at /launch — cannot be attributed, and is left to the port
-    // teardown below, which here always fires: no pairing remains.)
+    // Clearing the launch sends TERMINATION+disconnect. An owner-less launch cannot be
+    // attributed; port teardown always fires here because no pairing remains.
     let live_owner = st
         .app
         .launch
@@ -329,7 +299,7 @@ pub(crate) async fn unpair_all_clients(State(st): State<Arc<MgmtState>>) -> Resp
 
 /// Pairing-flow status
 ///
-/// Poll this to know when to prompt the user for the PIN Moonlight displays.
+/// Poll this to know when to prompt for the PIN Moonlight displays.
 #[cfg(feature = "gamestream")]
 #[utoipa::path(
     get,
@@ -362,8 +332,7 @@ pub(crate) async fn get_pairing_status(State(st): State<Arc<MgmtState>>) -> Json
 
 /// Submit the pairing PIN
 ///
-/// Delivers the PIN the Moonlight client is displaying, completing the out-of-band half
-/// of the pairing handshake.
+/// Completes the out-of-band half of the handshake.
 #[cfg(feature = "gamestream")]
 #[utoipa::path(
     post,

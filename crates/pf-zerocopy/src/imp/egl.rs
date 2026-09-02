@@ -1,15 +1,14 @@
-//! EGL side of the zero-copy path: open a headless EGLDisplay on the NVIDIA GPU (GBM platform on
-//! the render node) and import a PipeWire dmabuf as an `EGLImage` with `EGL_LINUX_DMA_BUF_EXT`.
-//! The DRM format **modifier** is mandatory on NVIDIA (its buffers are tiled; importing without
-//! the modifier yields a corrupt image or `EGL_BAD_MATCH`).
+//! Headless NVIDIA EGL importer: GBM display on the render node, PipeWire dmabuf → `EGLImage`
+//! (`EGL_LINUX_DMA_BUF_EXT`). The DRM modifier is mandatory — NVIDIA buffers are tiled; omitting
+//! it is `EGL_BAD_MATCH` or a corrupt image.
 //!
-//! Desktop NVIDIA can't register a dmabuf `EGLImage` with CUDA directly — `cuGraphicsEGLRegisterImage`
-//! is Tegra-only and `cuGraphicsGLRegisterImage` rejects EGLImage-backed textures (their internal
-//! format is opaque). So we follow OBS/Sunshine: bind the `EGLImage` to a GL texture
-//! (`glEGLImageTargetTexture2DOES`), render it through a fullscreen-triangle shader into a plain
-//! immutable `GL_RGBA8` texture (de-tiling and swizzling to the BGRx the encoder wants), then
-//! register *that* texture with CUDA (`cuda::RegisteredTexture`) and copy it device-to-device into an
-//! owned [`DeviceBuffer`] so the dmabuf can be returned to the compositor immediately.
+//! Desktop NVIDIA cannot register a dmabuf `EGLImage` with CUDA (`cuGraphicsEGLRegisterImage` is
+//! Tegra-only; `cuGraphicsGLRegisterImage` rejects EGLImage-backed textures). Bind the image to a
+//! GL texture (`glEGLImageTargetTexture2DOES`), blit into an immutable `GL_RGBA8` (or NV12 / YUV444
+//! convert targets), register that texture, then device-copy into an owned [`DeviceBuffer`] so the
+//! dmabuf can return to the compositor immediately.
+//!
+//! Pin: `picks_the_nvidia_node_not_the_first_one`. LINEAR dmabufs go through [`super::vulkan`].
 
 #![allow(non_upper_case_globals)]
 
@@ -19,7 +18,7 @@ use khronos_egl as egl;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::raw::{c_int, c_void};
 
-// EGL_EXT_image_dma_buf_import / _modifiers + platform enums (not defined by khronos-egl).
+// Not in khronos-egl: EGL_EXT_image_dma_buf_import(_modifiers) and the GBM platform enum.
 const EGL_LINUX_DMA_BUF_EXT: egl::Enum = 0x3270;
 const EGL_PLATFORM_GBM_KHR: egl::Enum = 0x31D7;
 const EGL_LINUX_DRM_FOURCC_EXT: egl::Attrib = 0x3271;
@@ -33,38 +32,27 @@ const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: egl::Attrib = 0x3444;
 mod gl;
 use gl::*;
 
-/// PCI vendor id of the only GPU this importer can drive — everything below it ends in a CUDA
-/// context. Same constant the Vulkan bridge selects its physical device by.
+/// NVIDIA PCI vendor. This importer and the Vulkan bridge both key the physical device on it.
 const PCI_VENDOR_NVIDIA: u32 = 0x10de;
 
-/// The NVIDIA DRM render node: `PUNKTFUNK_ZEROCOPY_RENDER_NODE` > the first `/dev/dri/renderD*`
-/// whose sysfs PCI vendor is NVIDIA > `/dev/dri/renderD128`.
+/// NVIDIA DRM render node: `PUNKTFUNK_ZEROCOPY_RENDER_NODE`, else the first `/dev/dri/renderD*`
+/// whose sysfs PCI vendor is NVIDIA, else `/dev/dri/renderD128`.
 ///
-/// The fallback used to be the *whole* selection, which quietly assumed NVIDIA owns the first
-/// render node. On a hybrid laptop it does not — the iGPU is bound first, so `renderD128` is
-/// Intel, and this importer opened a Mesa GBM display, asked it for a pbuffer-capable OpenGL
-/// config (Mesa's GBM platform only ever advertises window-capable ones), got none, and reported
-/// "no EGL config for OpenGL" on a machine whose NVIDIA EGL stack was working perfectly. Pick the
-/// device by what it *is*.
-///
-/// Deliberately a local scan rather than a `pf_gpu` dependency: this crate is a leaf (the import
-/// worker is its own process, spawned for fault isolation), and `pf_gpu::linux_render_node` answers
-/// a different question anyway — it follows the operator's VAAPI/GPU *preference*, which may well
-/// name the iGPU. The answer needed here is not "which GPU should we use" but "where is CUDA".
+/// Scan by vendor, not first node: on a hybrid host `renderD128` is the iGPU. Do not call
+/// `pf_gpu::linux_render_node` — this crate is a leaf worker, and that helper follows the
+/// operator VAAPI preference, which may name the iGPU. The question here is where CUDA lives.
 fn nvidia_render_node() -> std::path::PathBuf {
     use std::path::{Path, PathBuf};
     if let Some(p) = std::env::var_os("PUNKTFUNK_ZEROCOPY_RENDER_NODE").filter(|s| !s.is_empty()) {
         return PathBuf::from(p);
     }
-    // No NVIDIA node found — sysfs may simply not be mounted (a container without /sys). Keep the
-    // historical guess; the CUDA context below is what actually fails if this host has no NVIDIA.
+    // No NVIDIA node (or no /sys): keep `/dev/dri/renderD128`. CUDA construction fails if it is wrong.
     nvidia_render_node_in(Path::new("/dev/dri"), Path::new("/sys/class/drm"))
         .unwrap_or_else(|| PathBuf::from("/dev/dri/renderD128"))
 }
 
-/// The scan half of [`nvidia_render_node`], parameterized on its two roots so a test can pin the
-/// sysfs shape it depends on (`<sys_class_drm>/renderD129/device/vendor` holding `0x10de`). Nodes
-/// are visited in name order so the choice is stable across boots.
+/// Scan half of [`nvidia_render_node`]. Roots are parameters so tests can pin
+/// `<sys_class_drm>/<node>/device/vendor`. Name order keeps the pick stable across boots.
 fn nvidia_render_node_in(
     dri: &std::path::Path,
     sys_class_drm: &std::path::Path,
@@ -89,13 +77,9 @@ fn nvidia_render_node_in(
         .map(|node| dri.join(node))
 }
 
-/// Bare GL names created mid-constructor, deleted on unwind if the constructor fails before its
-/// struct (whose `Drop` then owns deletion) exists. The blit constructors interleave GL-object
-/// creation with fallible steps (FBO-completeness checks, CUDA registration, pool allocation) and
-/// are retried per frame — without this, a late failure leaked every name, unbounded, under
-/// exactly the VRAM pressure that causes such failures. `defuse()` hands ownership to the built
-/// struct. `RegisteredTexture` locals unwind themselves (their own `Drop`), and they drop before
-/// this guard (declared after it), preserving the unregister-before-delete order.
+/// GL names created mid-constructor, deleted on unwind if the struct never takes ownership.
+/// `defuse()` hands them to the built struct's `Drop`. Declare this guard *before* any
+/// `RegisteredTexture` local so CUDA unregisters before `glDelete*` on unwind.
 #[derive(Default)]
 struct GlNameGuard {
     textures: Vec<u32>,
@@ -105,7 +89,6 @@ struct GlNameGuard {
 }
 
 impl GlNameGuard {
-    /// Construction succeeded — the final struct's `Drop` owns the names from here.
     fn defuse(mut self) {
         self.textures.clear();
         self.fbos.clear();
@@ -116,11 +99,9 @@ impl GlNameGuard {
 
 impl Drop for GlNameGuard {
     fn drop(&mut self) {
-        // SAFETY: every name held was created by the guarded constructor on the GL context still
-        // current on this thread (constructors run and unwind on the single capture thread). Each
-        // `glDelete*` gets a count of 1 and a pointer to one live element; names reaching this
-        // `Drop` were never handed to a final struct (`defuse` clears the Vecs), so each is
-        // deleted exactly once.
+        // SAFETY: each name was created on the GL context still current on this thread
+        // (constructors run and unwind on the capture thread). `glDelete*` n=1, pointer to one
+        // live element. Names here were never `defuse`d, so each is deleted exactly once.
         unsafe {
             for t in &self.textures {
                 glDeleteTextures(1, t);
@@ -138,12 +119,8 @@ impl Drop for GlNameGuard {
     }
 }
 
-/// The GBM device and the DRM render-node fd it borrows, owned together so every exit path —
-/// including each `?` in `EglImporter::new` after their creation (most realistically a host where
-/// EGL comes up but CUDA does not) — releases both, in order: destroy the device, then close the
-/// fd (`OwnedFd`'s drop). Also what makes `EglImporter` teardown ordering structural: the importer
-/// has no `Drop` of its own, so its fields drop in declaration order — GL/CUDA objects first, this
-/// device (and the display it backs) last.
+/// GBM device plus the render-node fd it borrows. Drop order is destroy-device then close-fd.
+/// `EglImporter` has no `Drop`, so this field is last: GL/CUDA objects release against a live display.
 struct GbmDevice {
     raw: *mut c_void,
     _fd: std::os::fd::OwnedFd,
@@ -151,43 +128,39 @@ struct GbmDevice {
 
 impl Drop for GbmDevice {
     fn drop(&mut self) {
-        // SAFETY: `raw` is the non-null `gbm_device*` from `gbm_create_device` (null-checked at
-        // construction), owned exclusively by this struct and destroyed exactly once here — before
-        // `_fd` (the render-node fd the device borrows) closes via its own drop.
+        // SAFETY: `raw` is the non-null `gbm_device*` from `gbm_create_device`, owned exclusively
+        // here and destroyed once — before `_fd` (the borrowed render-node fd) closes.
         unsafe { gbm_device_destroy(self.raw) };
     }
 }
 
-/// Per-size GL machinery to blit a dmabuf EGLImage into a CUDA-registrable `GL_RGBA8` texture.
+/// Per-size blit: dmabuf EGLImage → CUDA-registrable `GL_RGBA8`.
 struct GlBlit {
     program: u32,
     vao: u32,
     fbo: u32,
-    /// CUDA-registrable destination (immutable GL_RGBA8).
     dst_tex: u32,
-    /// Source texture re-targeted to each frame's EGLImage.
+    /// Retargeted to each frame's EGLImage.
     src_tex: u32,
     width: u32,
     height: u32,
-    /// `dst_tex` registered with CUDA once (not per frame); mapped+copied each frame.
+    /// `dst_tex` registered once; mapped and copied each frame.
     registered: cuda::RegisteredTexture,
-    /// Recycled CUDA device buffers (the imported frames handed to the encoder).
     pool: cuda::BufferPool,
 }
 
 impl GlBlit {
     unsafe fn new(width: u32, height: u32) -> Result<GlBlit> {
-        // SAFETY: caller contract (`import_inner`): the GL context and the shared CUDA context are
-        // current on this thread. Raw GL calls pass live locals whose pointers outlive each
-        // synchronous call; every created name is owned by `guard` until the struct exists.
+        // SAFETY: caller contract (`import_inner`): GL and the shared CUDA context are current
+        // on this thread. GL calls pass live locals; every created name is owned by `guard`
+        // until the struct exists.
         unsafe {
-            // Declared before every GL name so it drops LAST on unwind — after the CUDA registration
-            // (declared below) has unregistered itself.
+            // Guard first so it drops last on unwind, after CUDA unregisters.
             let mut guard = GlNameGuard::default();
             let program = compile_program()?;
             guard.programs.push(program);
             let mut vao = 0u32;
-            glGenVertexArrays(1, &mut vao); // core profile needs a bound VAO for glDrawArrays
+            glGenVertexArrays(1, &mut vao); // core profile: glDrawArrays needs a bound VAO
             guard.vaos.push(vao);
             let mut fbo = 0u32;
             glGenFramebuffers(1, &mut fbo);
@@ -223,9 +196,6 @@ impl GlBlit {
                 status == GL_FRAMEBUFFER_COMPLETE,
                 "blit FBO incomplete ({status:#x})"
             );
-            // Register the (immutable, reused) destination texture with CUDA once, and stand up the
-            // device-buffer pool — both per-resolution, not per-frame. Requires the CUDA context to be
-            // current (the caller makes it current before constructing the blit).
             let registered = cuda::RegisteredTexture::register_gl(dst_tex)?;
             let pool = cuda::BufferPool::new(width, height)?;
             guard.defuse();
@@ -243,8 +213,6 @@ impl GlBlit {
         }
     }
 
-    /// Bind `image` to the source texture and render it into `dst_tex`.
-    ///
     /// # Safety: the GL context is current on this thread; `image` is a valid `EGLImage`.
     unsafe fn run(&self, egl_image_target: EglImageTargetFn, image: *mut c_void) -> Result<()> {
         // SAFETY: caller contract (`# Safety` above): GL context current, `image` a valid EGLImage.
@@ -266,7 +234,7 @@ impl GlBlit {
             glDrawArrays(GL_TRIANGLES, 0, 3);
             glBindVertexArray(0);
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            glFlush(); // submit GL work before CUDA maps the texture
+            glFlush(); // GL must finish before CUDA maps the texture
             Ok(())
         }
     }
@@ -274,17 +242,11 @@ impl GlBlit {
 
 impl Drop for GlBlit {
     fn drop(&mut self) {
-        // Unregister the CUDA graphics resource BEFORE deleting the GL texture it wraps (see
-        // `Nv12Blit::drop` — same ordering hazard). Previously `GlBlit` had no `Drop` at all, so
-        // its GL objects leaked on every size change and on importer teardown.
+        // Unregister CUDA before `glDelete*` on the texture it wraps — same hazard as `Nv12Blit::drop`.
         self.registered.release();
-        // SAFETY: these GL names were all created by THIS `GlBlit` in `GlBlit::new` on the current
-        // GL context, still current here (the owning `EglImporter` — which never releases the
-        // context — drops on its single capture thread and has no `Drop` of its own, so this blit
-        // field drops before the `GbmDevice` backing the display). Each `glDelete*` gets a count
-        // of 1 and a `&u32` to one live field; the symbols dispatch through libGL to the driver
-        // for the current context. Each name is deleted exactly once, after its CUDA registration
-        // was released.
+        // SAFETY: these names were created by this `GlBlit` on the GL context still current here
+        // (`EglImporter` never releases it; capture thread; no `Drop` of its own, so this field
+        // drops before `GbmDevice`). Each `glDelete*` is n=1 on a live field, after CUDA release.
         unsafe {
             glDeleteTextures(1, &self.dst_tex);
             glDeleteTextures(1, &self.src_tex);
@@ -295,47 +257,40 @@ impl Drop for GlBlit {
     }
 }
 
-/// Per-size GL machinery to convert a dmabuf EGLImage into an NV12 (BT.709 limited-range) pair —
-/// the [`GlBlit`] analogue for the `PUNKTFUNK_NV12` path. Two passes share `src_tex`: a full-res Y
-/// pass into a CUDA-registrable `GL_R8` texture and a half-res UV pass into a `GL_RG8` texture.
-/// Feeding NVENC native NV12 deletes its internal RGB→YUV CSC (which otherwise runs on the SM that a
-/// saturating game pins at 100%); the convert here replaces the BGRx swizzle [`GlBlit`] did, at ~the
-/// same 3D cost.
+/// Per-size NV12 convert (BT.709 limited): full-res Y into `GL_R8`, half-res UV into `GL_RG8`.
+/// Native NV12 lets NVENC skip its RGB→YUV CSC. Replaces the BGRx swizzle [`GlBlit`] did.
 struct Nv12Blit {
     y_program: u32,
     uv_program: u32,
     vao: u32,
     y_fbo: u32,
     uv_fbo: u32,
-    /// CUDA-registrable luma target (immutable `GL_R8`, W×H).
+    /// Immutable `GL_R8` luma, W×H.
     y_tex: u32,
-    /// CUDA-registrable chroma target (immutable `GL_RG8`, W/2 × H/2).
+    /// Immutable `GL_RG8` chroma, W/2 × H/2.
     uv_tex: u32,
-    /// Source texture re-targeted to each frame's EGLImage. `GL_LINEAR` so the UV pass averages 2×2.
+    /// Retargeted per frame. `GL_LINEAR` so the UV pass averages 2×2.
     src_tex: u32,
     width: u32,
     height: u32,
     y_registered: cuda::RegisteredTexture,
     uv_registered: cuda::RegisteredTexture,
-    /// Recycled NV12 device buffers (two-plane) handed to the encoder.
     pool: cuda::BufferPool,
-    /// Self-test only: whether `src_tex` has had immutable RGBA8 storage allocated for the upload
-    /// path (the live path retargets `src_tex` via EGLImage instead, never allocating storage).
+    /// Test path only: `src_tex` already has immutable RGBA8 storage. Live path retargets via EGLImage.
     test_src_storage: bool,
 }
 
 impl Nv12Blit {
     unsafe fn new(width: u32, height: u32) -> Result<Nv12Blit> {
-        // SAFETY: caller contract (`import_inner`): the GL context and the shared CUDA context are
-        // current on this thread. Raw GL calls pass live locals whose pointers outlive each
-        // synchronous call; every created name is owned by `guard` until the struct exists.
+        // SAFETY: caller contract (`import_inner`): GL and the shared CUDA context are current
+        // on this thread. GL calls pass live locals; every created name is owned by `guard`
+        // until the struct exists.
         unsafe {
             ensure!(
                 width % 2 == 0 && height % 2 == 0,
                 "NV12 convert needs even dimensions (got {width}x{height})"
             );
-            // Declared before every GL name so it drops LAST on unwind — after the CUDA registrations
-            // (declared below) have unregistered themselves.
+            // Guard first so it drops last on unwind, after CUDA unregisters.
             let mut guard = GlNameGuard::default();
             let y_program = compile_program_with(FRAG_Y_SRC)?;
             guard.programs.push(y_program);
@@ -349,7 +304,6 @@ impl Nv12Blit {
             guard.fbos.extend_from_slice(&fbos);
             let (y_fbo, uv_fbo) = (fbos[0], fbos[1]);
 
-            // Luma target: GL_R8 at full resolution.
             let mut y_tex = 0u32;
             glGenTextures(1, &mut y_tex);
             guard.textures.push(y_tex);
@@ -358,7 +312,7 @@ impl Nv12Blit {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-            // Chroma target: GL_RG8 at half resolution (R=U, G=V).
+            // GL_RG8 half-res: R=U, G=V.
             let mut uv_tex = 0u32;
             glGenTextures(1, &mut uv_tex);
             guard.textures.push(uv_tex);
@@ -373,7 +327,6 @@ impl Nv12Blit {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-            // Source: GL_LINEAR so the half-res UV pass averages the 2×2 chroma footprint.
             let mut src_tex = 0u32;
             glGenTextures(1, &mut src_tex);
             guard.textures.push(src_tex);
@@ -392,7 +345,6 @@ impl Nv12Blit {
                     "NV12 blit FBO incomplete ({status:#x}) — GL_R8/GL_RG8 not renderable?"
                 );
             }
-            // Register both convert targets with CUDA once (per-resolution), + the NV12 two-plane pool.
             let y_registered = cuda::RegisteredTexture::register_gl(y_tex)?;
             let uv_registered = cuda::RegisteredTexture::register_gl(uv_tex)?;
             let pool = cuda::BufferPool::new_nv12(width, height)?;
@@ -416,8 +368,6 @@ impl Nv12Blit {
         }
     }
 
-    /// Bind `image` to the source texture and run both convert passes into `y_tex`/`uv_tex`.
-    ///
     /// # Safety: the GL context is current on this thread; `image` is a valid `EGLImage`.
     unsafe fn run(&self, egl_image_target: EglImageTargetFn, image: *mut c_void) -> Result<()> {
         // SAFETY: caller contract (`# Safety` above): GL context current, `image` a valid EGLImage.
@@ -433,8 +383,7 @@ impl Nv12Blit {
         }
     }
 
-    /// Run the two convert passes from whatever is currently in `src_tex` (caller populated it).
-    /// Shared by [`run`](Self::run) (EGLImage source) and the self-test (uploaded RGBA source).
+    /// Convert from whatever currently sits in `src_tex` (EGLImage bind or test upload).
     ///
     /// # Safety: the GL context is current on this thread.
     unsafe fn run_passes(&self) -> Result<()> {
@@ -443,13 +392,11 @@ impl Nv12Blit {
         unsafe {
             glActiveTexture(GL_TEXTURE0);
             glBindVertexArray(self.vao);
-            // Y pass: full-res into the R8 target.
             glBindFramebuffer(GL_FRAMEBUFFER, self.y_fbo);
             glViewport(0, 0, self.width as c_int, self.height as c_int);
             glUseProgram(self.y_program);
             glBindTexture(GL_TEXTURE_2D, self.src_tex);
             glDrawArrays(GL_TRIANGLES, 0, 3);
-            // UV pass: half-res into the RG8 target (GL_LINEAR averages the 2×2).
             glBindFramebuffer(GL_FRAMEBUFFER, self.uv_fbo);
             glViewport(0, 0, (self.width / 2) as c_int, (self.height / 2) as c_int);
             glUseProgram(self.uv_program);
@@ -458,7 +405,7 @@ impl Nv12Blit {
 
             glBindVertexArray(0);
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            glFlush(); // submit GL work before CUDA maps the textures
+            glFlush(); // GL must finish before CUDA maps the textures
             Ok(())
         }
     }
@@ -466,22 +413,14 @@ impl Nv12Blit {
 
 impl Drop for Nv12Blit {
     fn drop(&mut self) {
-        // Unregister the CUDA graphics resources BEFORE deleting the GL textures they wrap.
-        // `Drop::drop` runs before the fields' own drops, so without this the `glDeleteTextures`
-        // below would destroy `y_tex`/`uv_tex` while still CUDA-registered — leaving the driver a
-        // registration onto freed GL state (the stale-driver-state class that crashed this path).
+        // Unregister CUDA before `glDelete*` — `Drop::drop` runs before field drops, so deleting
+        // first would leave a registration on freed GL state.
         self.y_registered.release();
         self.uv_registered.release();
-        // SAFETY: these GL names (textures/FBOs/VAO/programs) were all created by THIS `Nv12Blit`
-        // in `Nv12Blit::new` on the current GL context, which is still current because the owning
-        // `EglImporter` (which never releases the context) drops on its single capture thread and
-        // has no `Drop` of its own — its fields drop in declaration order, this blit before the
-        // `GbmDevice` backing the display. `glDelete*` takes a count + a
-        // pointer to that many names: `&self.y_tex`/`&self.vao` are `&u32` to one live field (n=1);
-        // `[self.y_fbo, self.uv_fbo].as_ptr()` points at a 2-element temporary that lives for the
-        // whole `glDeleteFramebuffers` call (n=2 matches). The symbols dispatch through libGL
-        // (libglvnd) to the driver for the current context. Each name is deleted exactly once,
-        // after its CUDA registration was released above.
+        // SAFETY: names created by this `Nv12Blit` on the GL context still current (`EglImporter`
+        // never releases it; capture thread; this field drops before `GbmDevice`). `glDelete*` n=1
+        // on a live `&u32`; `[y_fbo, uv_fbo].as_ptr()` is a 2-element temporary that lives for the
+        // call (n=2). Each name is deleted once, after CUDA release above.
         unsafe {
             glDeleteTextures(1, &self.y_tex);
             glDeleteTextures(1, &self.uv_tex);
@@ -494,33 +433,28 @@ impl Drop for Nv12Blit {
     }
 }
 
-/// Per-size GL machinery to convert a dmabuf EGLImage into planar **YUV444** (BT.709; studio or
-/// full range per `PUNKTFUNK_444_FULLRANGE`) — the [`Nv12Blit`] analogue for a 4:4:4 session.
-/// Three full-res passes share `src_tex`, each into its own CUDA-registrable `GL_R8` texture
-/// (Y/U/V — no subsampling, so no half-res pass and no siting question). The pooled destination
-/// is ONE stacked allocation (`BufferPool::new_yuv444`), which keeps the worker↔host wire
-/// single-plane. This is what lets a 4:4:4 NVENC session stay zero-copy instead of falling to
-/// the CPU swscale path.
+/// Per-size planar YUV444 convert (BT.709; studio or full range via `PUNKTFUNK_444_FULLRANGE`).
+/// Three full-res `GL_R8` passes share `src_tex`. The pool is one stacked allocation
+/// (`BufferPool::new_yuv444`) so the worker↔host wire stays single-plane.
 struct Yuv444Blit {
     programs: [u32; 3],
     vao: u32,
     fbos: [u32; 3],
-    /// CUDA-registrable full-res `GL_R8` targets: Y, U, V.
+    /// Full-res `GL_R8` targets: Y, U, V.
     texs: [u32; 3],
-    /// Source texture re-targeted to each frame's EGLImage.
+    /// Retargeted to each frame's EGLImage.
     src_tex: u32,
     width: u32,
     height: u32,
     registered: [cuda::RegisteredTexture; 3],
-    /// Recycled stacked-YUV444 device buffers handed to the encoder.
     pool: cuda::BufferPool,
 }
 
 impl Yuv444Blit {
     unsafe fn new(width: u32, height: u32) -> Result<Yuv444Blit> {
-        // SAFETY: caller contract (`import_inner`): the GL context and the shared CUDA context are
-        // current on this thread. Raw GL calls pass live locals whose pointers outlive each
-        // synchronous call; every created name is owned by `guard` until the struct exists.
+        // SAFETY: caller contract (`import_inner`): GL and the shared CUDA context are current
+        // on this thread. GL calls pass live locals; every created name is owned by `guard`
+        // until the struct exists.
         unsafe {
             ensure!(
                 width % 2 == 0 && height % 2 == 0,
@@ -529,8 +463,7 @@ impl Yuv444Blit {
             let full_range =
                 std::env::var("PUNKTFUNK_444_FULLRANGE").is_ok_and(|v| v.trim() == "1");
             let (y_src, u_src, v_src) = yuv444_frag_sources(full_range);
-            // Declared before every GL name so it drops LAST on unwind — after the CUDA registrations
-            // (declared below) have unregistered themselves.
+            // Guard first so it drops last on unwind, after CUDA unregisters.
             let mut guard = GlNameGuard::default();
             let mut programs = [0u32; 3];
             for (p, src) in programs.iter_mut().zip([&y_src, &u_src, &v_src]) {
@@ -552,8 +485,7 @@ impl Yuv444Blit {
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
             }
-            // Source: LINEAR is exact at the 1:1 mapping every pass uses (texel centres), matching
-            // the Nv12Blit source setup.
+            // LINEAR is exact at 1:1 (texel centres), matching Nv12Blit.
             let mut src_tex = 0u32;
             glGenTextures(1, &mut src_tex);
             guard.textures.push(src_tex);
@@ -595,8 +527,6 @@ impl Yuv444Blit {
         }
     }
 
-    /// Bind `image` to the source texture and run the three plane passes.
-    ///
     /// # Safety: the GL context is current on this thread; `image` is a valid `EGLImage`.
     unsafe fn run(&self, egl_image_target: EglImageTargetFn, image: *mut c_void) -> Result<()> {
         // SAFETY: caller contract (`# Safety` above): GL context current, `image` a valid EGLImage.
@@ -619,7 +549,7 @@ impl Yuv444Blit {
             }
             glBindVertexArray(0);
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            glFlush(); // submit GL work before CUDA maps the textures
+            glFlush(); // GL must finish before CUDA maps the textures
             Ok(())
         }
     }
@@ -627,17 +557,13 @@ impl Yuv444Blit {
 
 impl Drop for Yuv444Blit {
     fn drop(&mut self) {
-        // Unregister the CUDA graphics resources BEFORE deleting the GL textures they wrap
-        // (same teardown-order hazard as `Nv12Blit::drop`).
+        // Unregister CUDA before `glDelete*` — same teardown-order hazard as `Nv12Blit::drop`.
         for r in &mut self.registered {
             r.release();
         }
-        // SAFETY: these GL names were all created by THIS `Yuv444Blit` in `new` on the current GL
-        // context (still current — the owning `EglImporter` drops on its single capture thread,
-        // and having no `Drop` of its own, this blit field drops before the `GbmDevice` backing
-        // the display). Each `glDelete*` takes a count + a pointer to that many names; the arrays
-        // are live fields (or a live temporary for the whole call). Each name is deleted exactly
-        // once, after its CUDA registration was released above.
+        // SAFETY: names created by this `Yuv444Blit` on the GL context still current (`EglImporter`
+        // never releases it; capture thread; this field drops before `GbmDevice`). `glDelete*` n
+        // matches live arrays/fields. Each name is deleted once, after CUDA release above.
         unsafe {
             glDeleteTextures(3, self.texs.as_ptr());
             glDeleteTextures(1, &self.src_tex);
@@ -650,19 +576,18 @@ impl Drop for Yuv444Blit {
     }
 }
 
-/// Which GPU conversion `import_inner` runs on the de-tiled EGLImage — mirrors the three tiled
-/// [`super::proto::ImportKind`] entry points.
+/// GPU conversion `import_inner` runs on the de-tiled EGLImage; mirrors tiled [`super::proto::ImportKind`].
 #[derive(Clone, Copy)]
 enum Convert {
-    /// BGRx swizzle only ([`GlBlit`]).
+    /// BGRx swizzle ([`GlBlit`]).
     Rgb,
     /// RGB → NV12, BT.709 limited ([`Nv12Blit`]).
     Nv12,
-    /// RGB → planar YUV444, BT.709 ([`Yuv444Blit`]) — the 4:4:4 zero-copy path.
+    /// RGB → planar YUV444, BT.709 ([`Yuv444Blit`]).
     Yuv444,
 }
 
-/// One dmabuf plane as delivered by PipeWire (single-plane for BGRx).
+/// One PipeWire dmabuf plane (BGRx is single-plane).
 #[derive(Clone, Copy, Debug)]
 pub struct DmabufPlane {
     pub fd: i32,
@@ -672,75 +597,57 @@ pub struct DmabufPlane {
 
 type Egl = egl::DynamicInstance<egl::EGL1_5>;
 
-/// Headless EGLDisplay (NVIDIA device platform) + a surfaceless desktop-GL context used to
-/// import dmabufs and bridge them to CUDA via a GL texture. Lives on the capture thread (the GL
-/// context is made current there once).
+/// Headless GBM EGLDisplay plus a surfaceless desktop-GL context. Lives on the capture thread;
+/// the GL context is made current there once and never released.
 pub struct EglImporter {
     egl: Egl,
     display: egl::Display,
     no_ctx: egl::Context,
-    /// Surfaceless GL context (current on the capture thread) for the EGLImage→texture bind.
     _gl_ctx: egl::Context,
     egl_image_target: EglImageTargetFn,
-    /// Lazily-created GL blit machinery (recreated if the frame size changes).
+    /// Recreated when the frame size changes.
     blit: Option<GlBlit>,
-    /// Lazily-created NV12 convert machinery (`PUNKTFUNK_NV12` path; recreated on size change).
+    /// Recreated on size change (`PUNKTFUNK_NV12`).
     nv12_blit: Option<Nv12Blit>,
-    /// Lazily-created planar-YUV444 convert machinery (4:4:4 sessions; recreated on size change).
+    /// Recreated on size change (4:4:4 sessions).
     yuv444_blit: Option<Yuv444Blit>,
-    /// LINEAR-dmabuf path (gamescope): a Vulkan bridge (dmabuf → exportable OPAQUE_FD → CUDA),
-    /// created lazily on the first LINEAR frame, + the destination pool.
+    /// LINEAR path: Vulkan bridge (dmabuf → exportable OPAQUE_FD → CUDA), lazy on first frame.
     vk: Option<super::vulkan::VkBridge>,
     linear_pool: Option<cuda::BufferPool>,
-    /// NV12 twin of [`linear_pool`](Self::linear_pool) for the bridge's compute-CSC output
-    /// (T2.5b) — separate pools because a session may fall back RGB mid-stream.
+    /// NV12 twin of [`linear_pool`](Self::linear_pool). Separate because a session may fall back to RGB mid-stream.
     linear_nv12_pool: Option<cuda::BufferPool>,
-    /// Declared LAST deliberately: with no `Drop` impl on `EglImporter`, fields drop in
-    /// declaration order, so every GL blit / CUDA registration / Vulkan bridge above releases its
-    /// driver objects BEFORE the gbm device backing the EGLDisplay (and its fd) go away — the
-    /// stale-driver-state class the blit destructors' ordering comments cite.
+    /// Last on purpose: `EglImporter` has no `Drop`, so fields drop in declaration order.
+    /// Blits / CUDA / Vulkan must release against a live GBM display.
     _gbm: GbmDevice,
 }
 
-// SAFETY: `EglImporter` owns thread-affine handles — an EGLDisplay/contexts made current on one
-// thread, a loaded GL proc pointer, a `gbm_device*`, a raw fd, and CUDA-registered GL textures —
-// none safe to touch concurrently. It is constructed inside `pipewire_thread` on the dedicated
-// `punktfunk-pipewire` thread, and every method (`import*`, `supported_modifiers`, `Drop`) runs on
-// that same thread; it is never accessed through a shared `&` from another thread. `Send` asserts
-// only that transferring *ownership* is sound (needed so the importer can live in the PipeWire
-// stream's user-data, whose API imposes a `Send` bound) — the live handles are never used
-// off-thread. `Sync` is deliberately NOT implied.
+// SAFETY: `EglImporter` owns thread-affine handles (EGL display/contexts current on one thread,
+// a GL proc, `gbm_device*`, fd, CUDA-registered textures). Constructed on the dedicated
+// PipeWire thread; every method runs there. `Send` is only for transferring ownership into
+// stream user-data (that API requires `Send`). Live handles are never used off-thread. Not `Sync`.
 unsafe impl Send for EglImporter {}
 
 impl EglImporter {
-    /// Open a headless EGLDisplay on the NVIDIA EGL device. Also forces the shared CUDA context
-    /// to exist (so a later `import` only touches the hot path).
+    /// Open a headless EGLDisplay on the NVIDIA GBM device. Creates the shared CUDA context so
+    /// later `import` is hot-path only.
     pub fn new() -> Result<EglImporter> {
-        // GBM platform on the NVIDIA render node: this ties the EGLDisplay (and its GL contexts)
-        // to the same DRM device CUDA-GL interop associates with, which the EGL device platform
-        // did not (cuGraphicsGLRegisterImage rejected device-platform GL textures).
+        // GBM on the NVIDIA render node so the EGLDisplay shares the DRM device CUDA-GL interop
+        // uses. The EGL *device* platform does not — `cuGraphicsGLRegisterImage` rejects those textures.
         let node = nvidia_render_node();
         let path = std::ffi::CString::new(node.as_os_str().as_encoded_bytes())
             .with_context(|| format!("render node path {} has an interior NUL", node.display()))?;
-        // SAFETY: `path` is a live local `CString` (its constructor rejected interior NULs, so it
-        // is NUL-terminated); `path.as_ptr()` is a valid pointer to that buffer which outlives this
-        // synchronous `open`. `open` only reads the path and returns a new fd (or -1); it neither
-        // retains the pointer nor writes through it, so there is no aliasing or lifetime hazard.
+        // SAFETY: `path` is a live local `CString` (constructor rejected interior NULs, so it is
+        // NUL-terminated). `open` only reads the pointer for this call and does not retain it.
         let render_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         ensure!(render_fd >= 0, "open {} for GBM", node.display());
-        // SAFETY: `open` just returned this fd (checked `>= 0`) and nothing else owns it, so
-        // `OwnedFd` takes sole ownership — every exit path below (including each `?`) now closes
-        // it exactly once, after the gbm device borrowing it is destroyed (`GbmDevice`'s drop
-        // order).
+        // SAFETY: `open` returned this fd (`>= 0`) and nothing else owns it. `OwnedFd` takes sole
+        // ownership; every `?` closes it after `GbmDevice` destroys the device that borrows it.
         let render_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(render_fd) };
-        // SAFETY: `render_fd` is the live DRM render-node fd just opened. `gbm_create_device`
-        // (libgbm, linked above) builds a `gbm_device` over that fd and returns a
-        // `*mut gbm_device` (or null); it borrows but does not take ownership of the fd, which
-        // `GbmDevice` keeps open until after `gbm_device_destroy`. No Rust-owned memory is
-        // passed, so there is nothing to alias.
+        // SAFETY: `render_fd` is the live DRM render-node fd. `gbm_create_device` borrows it and
+        // returns `*mut gbm_device` (or null); `GbmDevice` keeps the fd open until after
+        // `gbm_device_destroy`. No Rust-owned memory is passed.
         let raw_gbm = unsafe { gbm_create_device(render_fd.as_raw_fd()) };
         if raw_gbm.is_null() {
-            // `render_fd` closes via its own drop.
             anyhow::bail!("gbm_create_device failed on {}", node.display());
         }
         let gbm = GbmDevice {
@@ -748,18 +655,14 @@ impl EglImporter {
             _fd: render_fd,
         };
 
-        // SAFETY: `Egl::load_required` dlopens the system libEGL and binds its entry points,
-        // trusting that libEGL (libglvnd) is a genuine EGL 1.5 implementation whose core symbols
-        // match the ABI the `khronos_egl` `EGL1_5` bindings declare. No Rust memory is passed; the
-        // returned instance is afterwards used only through the safe `khronos_egl` wrappers.
+        // SAFETY: `Egl::load_required` dlopens libEGL and binds EGL 1.5 entry points matching
+        // the `khronos_egl` `EGL1_5` ABI. No Rust memory is passed; later use is through the
+        // safe wrappers.
         let egl: Egl =
             unsafe { Egl::load_required() }.context("load libEGL (EGL 1.5 dynamic instance)")?;
-        // SAFETY: `gbm.raw` is the non-null `gbm_device*` created just above (checked), and
-        // `EGL_PLATFORM_GBM_KHR` is exactly the platform enum that pairs with a GBM device as the
-        // native-display handle, so the `gbm.raw as NativeDisplayType` cast hands EGL a valid native
-        // display for the requested platform. `&[egl::ATTRIB_NONE]` is a properly terminated, empty
-        // attribute array borrowed for this synchronous call; EGL only reads it and returns an
-        // `EGLDisplay`, retaining no pointer into Rust memory.
+        // SAFETY: `gbm.raw` is the non-null `gbm_device*` just created; `EGL_PLATFORM_GBM_KHR`
+        // is the platform enum that pairs with a GBM device as native display. `&[ATTRIB_NONE]`
+        // is a terminated empty attrib list borrowed for this call; EGL does not retain it.
         let display = unsafe {
             egl.get_platform_display(
                 EGL_PLATFORM_GBM_KHR,
@@ -784,21 +687,14 @@ impl EglImporter {
             "EGL lacks EGL_EXT_image_dma_buf_import_modifiers (needed for NVIDIA tiled dmabufs)"
         );
 
-        // A surfaceless desktop-GL context so we can bind the dmabuf EGLImage to a GL texture
-        // (cuGraphicsEGLRegisterImage is Tegra-only; desktop CUDA interop goes through GL).
+        // Surfaceless desktop-GL so we can bind the dmabuf EGLImage to a texture.
+        // `cuGraphicsEGLRegisterImage` is Tegra-only; desktop CUDA interop goes through GL.
         egl.bind_api(egl::OPENGL_API)
             .context("eglBindAPI(OpenGL)")?;
-        // The default EGL_SURFACE_TYPE in eglChooseConfig is WINDOW_BIT, which a headless device
-        // display has none of — ask for a pbuffer-capable config first (NVIDIA's GBM platform has
-        // them, and this is the request every working host has been served for a year).
-        //
-        // Then fall back to no surface-type constraint at all, because a config's surface type is
-        // irrelevant to us: we never create an EGLSurface, we `eglMakeCurrent` surfaceless. Mesa's
-        // GBM platform advertises ONLY window-capable configs (gbm_surface is the whole point of
-        // the platform there), so the pbuffer request finds nothing on any Mesa device — which is
-        // how a hybrid host that landed on the iGPU reported "no EGL config for OpenGL" while its
-        // NVIDIA EGL stack was fine. The node is picked correctly now; this keeps the failure from
-        // being fatal (and unreadable) if some other driver makes the same choice Mesa did.
+        // Default SURFACE_TYPE is WINDOW_BIT; a headless display has none. Ask pbuffer first
+        // (NVIDIA GBM has those). Fall back to no surface-type constraint: we never create an
+        // EGLSurface (`eglMakeCurrent` surfaceless). Mesa GBM advertises only window configs, so
+        // the pbuffer request is empty on a Mesa device.
         let want_pbuffer = [
             egl::SURFACE_TYPE,
             egl::PBUFFER_BIT,
@@ -839,13 +735,10 @@ impl EglImporter {
             .context("eglCreateContext(OpenGL)")?;
         egl.make_current(display, None, None, Some(gl_ctx))
             .context("eglMakeCurrent surfaceless (needs EGL_KHR_surfaceless_context)")?;
-        // SAFETY: the GL context was made current on this thread just above, which `eglGetProcAddress`
-        // requires to return a usable pointer. The non-null (`?`-checked) pointer it returns for
-        // "glEGLImageTargetTexture2DOES" is the driver's implementation of that GL-OES entry point,
-        // whose real ABI is `void(GLenum, GLeglImageOES)` = `(u32, *mut c_void)` `extern "system"`.
-        // `EglImageTargetFn` is declared with exactly that signature, so the transmute only retypes a
-        // same-size, same-ABI thin function pointer (no value/representation change). The function is
-        // present because `EGL_EXT_image_dma_buf_import` was asserted on this display above.
+        // SAFETY: GL is current (required for a usable `eglGetProcAddress`). The non-null pointer
+        // for `glEGLImageTargetTexture2DOES` has ABI `void(GLenum, GLeglImageOES)` =
+        // `(u32, *mut c_void)` `extern "system"`, matching `EglImageTargetFn`. Present because
+        // `EGL_EXT_image_dma_buf_import` was asserted on this display.
         let egl_image_target: EglImageTargetFn = unsafe {
             std::mem::transmute(
                 egl.get_proc_address("glEGLImageTargetTexture2DOES")
@@ -853,13 +746,10 @@ impl EglImporter {
             )
         };
 
-        // Create the shared CUDA context up front so import() is pure hot path.
         cuda::context().context("create CUDA context")?;
 
-        // SAFETY: `egl::NO_CONTEXT` is EGL's defined sentinel (a null handle) for "no context";
-        // `Context::from_ptr` only stores the handle (it never dereferences it), so wrapping the
-        // null sentinel is sound and yields exactly the `EGL_NO_CONTEXT` value that
-        // `eglCreateImage(EGL_LINUX_DMA_BUF_EXT)` requires as its context argument later.
+        // SAFETY: `egl::NO_CONTEXT` is the null sentinel. `Context::from_ptr` only stores the
+        // handle; `eglCreateImage(EGL_LINUX_DMA_BUF_EXT)` requires `EGL_NO_CONTEXT`.
         let no_ctx = unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) };
         tracing::info!(
             node = %node.display(),
@@ -881,9 +771,8 @@ impl EglImporter {
         })
     }
 
-    /// Import a LINEAR dmabuf via the Vulkan bridge (no EGL/GL involved — NVIDIA's EGL can't
-    /// sample LINEAR, and the CUDA driver rejects raw dmabuf fds; Vulkan imports the dmabuf,
-    /// GPU-copies into an exportable allocation, and CUDA reads that). See [`super::vulkan`].
+    /// Import a LINEAR dmabuf via the Vulkan bridge. NVIDIA EGL cannot sample LINEAR; CUDA
+    /// rejects raw dmabuf fds. See [`super::vulkan`].
     pub fn import_linear(
         &mut self,
         plane: &DmabufPlane,
@@ -906,21 +795,16 @@ impl EglImporter {
         )
     }
 
-    /// Like [`import_linear`](Self::import_linear), but the bridge's compute CSC converts to a
-    /// two-plane **NV12** buffer (latency plan T2.5b) — the gamescope/LINEAR analogue of
-    /// [`import_nv12`](Self::import_nv12), so NVENC encodes native YUV on the dedicated-session
-    /// path too instead of paying its internal RGB→YUV CSC on the contended SM.
+    /// LINEAR analogue of [`import_nv12`](Self::import_nv12): the bridge's compute CSC writes a
+    /// two-plane NV12 buffer so NVENC encodes native YUV.
     pub fn import_linear_nv12(
         &mut self,
         plane: &DmabufPlane,
         width: u32,
         height: u32,
     ) -> Result<DeviceBuffer> {
-        // Even dimensions only: the UV copy walks `height.div_ceil(2)` chroma rows (the correct NV12
-        // count), but the pooled UV plane is sized at `height/2` rows — for an odd height those
-        // disagree by one row and the copy writes a full `uv_pitch` past the allocation (OOB device
-        // write / CUDA_ERROR_ILLEGAL_ADDRESS that poisons the shared context). Reject here, matching
-        // the guards `Nv12Blit::new`/`Yuv444Blit::new` already carry.
+        // Even dimensions only: UV copy walks `height.div_ceil(2)` rows, the pool is `height/2`.
+        // Odd height writes one `uv_pitch` past the allocation and poisons the shared CUDA context.
         anyhow::ensure!(
             width % 2 == 0 && height % 2 == 0,
             "LINEAR NV12 needs even dimensions (got {width}x{height})"
@@ -947,25 +831,22 @@ impl EglImporter {
         )
     }
 
-    /// Drop the Vulkan bridge's cached per-fd import (see [`super::vulkan::VkBridge::forget_fd`]).
-    /// No-op when the bridge hasn't been built (tiled-only captures).
+    /// Drop the Vulkan bridge's cached per-fd import ([`super::vulkan::VkBridge::forget_fd`]).
+    /// No-op if the bridge was never built (tiled-only captures).
     pub fn forget_linear_fd(&mut self, fd: i32) {
         if let Some(vk) = self.vk.as_mut() {
             vk.forget_fd(fd);
         }
     }
 
-    /// Tear down the whole LINEAR-path import cache (the Vulkan bridge and every per-fd source
-    /// buffer in it). Called when the PipeWire stream renegotiates — the buffer pool the cache
-    /// keyed on is gone, and a recycled fd number must never resolve to a stale import. The
-    /// bridge lazily rebuilds on the next LINEAR frame (renegotiations are rare).
+    /// Drop the LINEAR import cache (Vulkan bridge and every per-fd source). PipeWire renegotiate
+    /// invalidates the keyed pool; a recycled fd must not resolve to a stale import.
     pub fn clear_linear_cache(&mut self) {
         self.vk = None;
     }
 
-    /// The DRM format modifiers the NVIDIA EGL stack can import for `fourcc`, via
-    /// `eglQueryDmaBufModifiersEXT`. We advertise these to PipeWire so the compositor allocates
-    /// a dmabuf in a layout we can import. Empty on failure (caller falls back).
+    /// DRM modifiers NVIDIA EGL can import for `fourcc` (`eglQueryDmaBufModifiersEXT`), advertised
+    /// to PipeWire so the compositor allocates a layout we can import. Empty on failure.
     pub fn supported_modifiers(&self, fourcc: u32) -> Vec<u64> {
         type QueryFn = unsafe extern "system" fn(
             dpy: *mut c_void,
@@ -978,21 +859,15 @@ impl EglImporter {
         let Some(sym) = self.egl.get_proc_address("eglQueryDmaBufModifiersEXT") else {
             return Vec::new();
         };
-        // SAFETY: `sym` is the non-null pointer `eglGetProcAddress("eglQueryDmaBufModifiersEXT")`
-        // returned (the `let-else` already bailed on `None`) — the driver's implementation of that
-        // EGL extension entry point. `QueryFn` is declared with that function's exact documented ABI
-        // (`EGLDisplay, EGLint, EGLint, EGLuint64* , EGLBoolean*, EGLint* -> EGLBoolean`), all
-        // `extern "system"`, so the transmute only retypes a same-size, same-ABI thin fn pointer.
+        // SAFETY: `sym` is the non-null `eglQueryDmaBufModifiersEXT` proc. `QueryFn` matches that
+        // ABI (`EGLDisplay, EGLint, EGLint, EGLuint64*, EGLBoolean*, EGLint* -> EGLBoolean`)
+        // `extern "system"`; the transmute retypes a same-size thin fn pointer.
         let query: QueryFn = unsafe { std::mem::transmute(sym) };
         let dpy = self.display.as_ptr();
-        // SAFETY: `dpy` is this importer's live, initialized `EGLDisplay`; `query` is the proc loaded
-        // just above. The first call passes null out-arrays with `max_modifiers == 0`, which the
-        // extension defines as "write only the count" — it writes solely through `&mut count` (a live
-        // local `i32`). For the second call, `mods`/`ext` are freshly allocated `Vec`s of exactly
-        // `count` elements and `max_modifiers == count`, so the driver writes at most `count`
-        // `u64`/`u32` entries (in bounds) plus the actual count through `&mut n` (a live local). All
-        // four Rust addresses outlive these synchronous calls and alias nothing else. `truncate` only
-        // shrinks, so even a misbehaving `n > count` cannot read out of bounds.
+        // SAFETY: `dpy` is this importer's live `EGLDisplay`. First call: null out-arrays,
+        // `max_modifiers == 0` → write only `&mut count`. Second: `mods`/`ext` are `Vec`s of
+        // `count` elements, `max_modifiers == count`, so writes stay in bounds; `&mut n` is a
+        // live local. `truncate` only shrinks, so `n > count` cannot read out of bounds.
         unsafe {
             let mut count: i32 = 0;
             if query(
@@ -1026,10 +901,8 @@ impl EglImporter {
         }
     }
 
-    /// Import one dmabuf and copy it device-to-device into a fresh owned CUDA buffer. `fourcc`
-    /// is the DRM FourCC; `modifier` is the explicit 64-bit DRM format modifier when one was
-    /// negotiated, or `None` to import with the buffer's implicit modifier (base
-    /// `EGL_EXT_image_dma_buf_import`, which the NVIDIA driver resolves for its own buffers).
+    /// Import one dmabuf into an owned CUDA buffer. `modifier` is the negotiated 64-bit DRM
+    /// modifier, or `None` for the buffer's implicit modifier (`EGL_EXT_image_dma_buf_import`).
     pub fn import(
         &mut self,
         plane: &DmabufPlane,
@@ -1041,10 +914,8 @@ impl EglImporter {
         self.import_inner(plane, width, height, fourcc, modifier, Convert::Rgb)
     }
 
-    /// Like [`import`](Self::import), but de-tiles **and converts** the dmabuf to NV12 (BT.709
-    /// limited range) on the GPU — the `PUNKTFUNK_NV12` path — so NVENC can encode native YUV with
-    /// no internal RGB→YUV CSC. The returned [`DeviceBuffer`] carries both NV12 planes
-    /// (`DeviceBuffer::is_nv12`). Only the tiled EGL/GL path supports this (LINEAR/Vulkan stays RGB).
+    /// Like [`import`](Self::import), then GPU-convert to NV12 (BT.709 limited) so NVENC encodes
+    /// native YUV. Tiled EGL/GL only — LINEAR/Vulkan stays RGB. See [`DeviceBuffer::is_nv12`].
     pub fn import_nv12(
         &mut self,
         plane: &DmabufPlane,
@@ -1056,9 +927,8 @@ impl EglImporter {
         self.import_inner(plane, width, height, fourcc, modifier, Convert::Nv12)
     }
 
-    /// Like [`import_nv12`](Self::import_nv12), but converts to planar **YUV444** (full chroma —
-    /// a 4:4:4 session) into one stacked 3-plane [`DeviceBuffer`] (`DeviceBuffer::yuv444`). Only
-    /// the tiled EGL/GL path supports this.
+    /// Like [`import_nv12`](Self::import_nv12), but planar YUV444 into one stacked
+    /// [`DeviceBuffer`] (`DeviceBuffer::yuv444`). Tiled EGL/GL only.
     pub fn import_yuv444(
         &mut self,
         plane: &DmabufPlane,
@@ -1102,10 +972,8 @@ impl EglImporter {
             ]);
         }
         attrs.push(egl::ATTRIB_NONE);
-        // SAFETY: `eglCreateImage(EGL_LINUX_DMA_BUF_EXT, ...)` mandates a NULL `EGLClientBuffer`
-        // (the source is described entirely by the attribute list built above), so wrapping
-        // `null_mut()` is the required value. `from_ptr` only stores the pointer without
-        // dereferencing it, so constructing it from null is sound.
+        // SAFETY: `eglCreateImage(EGL_LINUX_DMA_BUF_EXT, ...)` requires a NULL `EGLClientBuffer`
+        // (the source is the attribute list). `from_ptr` only stores the pointer.
         let client = unsafe { egl::ClientBuffer::from_ptr(std::ptr::null_mut()) };
         let image = self
             .egl
@@ -1118,10 +986,8 @@ impl EglImporter {
             )
             .context("eglCreateImage(EGL_LINUX_DMA_BUF_EXT) — modifier mismatch?")?;
 
-        // EGLImage → (sampled by a shader) → GL_RGBA8 texture (or NV12 R8+RG8 pair, or the three
-        // YUV444 R8 planes) → register *that* with CUDA → map → array → copy out. Registering the
-        // EGLImage texture directly fails (its layout isn't a CUDA-registrable format); the
-        // render targets are.
+        // Blit into a CUDA-registrable render target. Registering the EGLImage texture itself
+        // fails — its layout is not a CUDA-registrable format.
         let result = match convert {
             Convert::Nv12 => self.blit_and_copy_nv12(image.as_ptr(), width, height),
             Convert::Yuv444 => self.blit_and_copy_yuv444(image.as_ptr(), width, height),
@@ -1131,8 +997,8 @@ impl EglImporter {
         result
     }
 
-    /// Render the dmabuf `image` into the registrable RGBA8 texture and copy it to an owned CUDA
-    /// buffer. (Re)creates the per-size GL blit machinery as needed.
+    /// Blit `image` into the registrable RGBA8 texture and copy to an owned CUDA buffer.
+    /// Recreates the per-size GL blit when the frame size changes.
     fn blit_and_copy(
         &mut self,
         image: *mut c_void,
@@ -1141,32 +1007,25 @@ impl EglImporter {
     ) -> Result<DeviceBuffer> {
         cuda::make_current()?;
         if self.blit.as_ref().map(|b| (b.width, b.height)) != Some((width, height)) {
-            // SAFETY: `GlBlit::new` requires the GL context current on the calling thread and a
-            // current CUDA context. Both hold: this runs on the capture thread where
-            // `EglImporter::new` made the GL context current and never released it, and
-            // `cuda::make_current()?` ran at the top of this function. `width`/`height` are plain
-            // `Copy` frame dimensions.
+            // SAFETY: `GlBlit::new` needs GL and CUDA current. Both hold: capture thread, GL
+            // made current in `EglImporter::new` and never released; `cuda::make_current()?` ran
+            // above.
             self.blit = Some(unsafe { GlBlit::new(width, height)? });
         }
         let egl_image_target = self.egl_image_target;
         let blit = self.blit.as_mut().unwrap();
-        // SAFETY: `GlBlit::run` requires a current GL context and a valid `EGLImage`. The GL context
-        // is current on this capture thread (made current in `EglImporter::new`, never released) and
-        // `cuda::make_current()` ran above; `egl_image_target` is the `glEGLImageTargetTexture2DOES`
-        // pointer loaded in `new`; `image` is the raw handle of the live `EGLImage` that
-        // `import_inner` created with `eglCreateImage` and destroys only AFTER this call returns, so
-        // it stays valid for the whole synchronous `run`.
+        // SAFETY: `GlBlit::run` needs GL current and a valid `EGLImage`. GL is current on this
+        // capture thread (never released); `image` is the live `eglCreateImage` handle
+        // `import_inner` destroys only after this call returns.
         unsafe { blit.run(egl_image_target, image)? };
-        // Persistent registration (mapped per frame) + a pooled buffer — no per-frame
-        // cuGraphicsGLRegisterImage / cuMemAllocPitch.
+        // Persistent registration + pool: do not `cuGraphicsGLRegisterImage` / `cuMemAllocPitch` per frame.
         let dst = blit.pool.get()?;
         blit.registered.copy_mapped_to(&dst)?;
         Ok(dst)
     }
 
-    /// Convert the dmabuf `image` to NV12 (Y in an R8 texture, UV in an RG8 texture) and copy both
-    /// planes into a pooled NV12 [`DeviceBuffer`]. (Re)creates the per-size convert machinery as
-    /// needed. The `PUNKTFUNK_NV12` analogue of [`blit_and_copy`].
+    /// Convert `image` to NV12 and copy both planes into a pooled [`DeviceBuffer`]. Recreates
+    /// the per-size convert when the frame size changes.
     fn blit_and_copy_nv12(
         &mut self,
         image: *mut c_void,
@@ -1175,30 +1034,24 @@ impl EglImporter {
     ) -> Result<DeviceBuffer> {
         cuda::make_current()?;
         if self.nv12_blit.as_ref().map(|b| (b.width, b.height)) != Some((width, height)) {
-            // SAFETY: `Nv12Blit::new` requires the GL context current on the calling thread and a
-            // current CUDA context. Both hold: this runs on the capture thread where
-            // `EglImporter::new` made the GL context current and never released it, and
-            // `cuda::make_current()?` ran at the top of this function. `width`/`height` are plain
-            // `Copy` frame dimensions.
+            // SAFETY: `Nv12Blit::new` needs GL and CUDA current. Both hold: capture thread, GL
+            // made current in `EglImporter::new` and never released; `cuda::make_current()?` ran
+            // above.
             self.nv12_blit = Some(unsafe { Nv12Blit::new(width, height)? });
         }
         let egl_image_target = self.egl_image_target;
         let blit = self.nv12_blit.as_mut().unwrap();
-        // SAFETY: `Nv12Blit::run` requires a current GL context and a valid `EGLImage`. The GL
-        // context is current on this capture thread (made current in `EglImporter::new`, never
-        // released) and `cuda::make_current()` ran above; `egl_image_target` is the
-        // `glEGLImageTargetTexture2DOES` pointer loaded in `new`; `image` is the raw handle of the
-        // live `EGLImage` that `import_inner` created with `eglCreateImage` and destroys only AFTER
-        // this call returns, so it stays valid for the whole synchronous `run`.
+        // SAFETY: `Nv12Blit::run` needs GL current and a valid `EGLImage`. GL is current on this
+        // capture thread (never released); `image` is the live `eglCreateImage` handle
+        // `import_inner` destroys only after this call returns.
         unsafe { blit.run(egl_image_target, image)? };
         let dst = blit.pool.get()?;
         cuda::copy_mapped_nv12(&mut blit.y_registered, &mut blit.uv_registered, &dst)?;
         Ok(dst)
     }
 
-    /// Convert the dmabuf `image` to planar YUV444 (three full-res `R8` textures) and copy the
-    /// planes into a pooled stacked [`DeviceBuffer`]. (Re)creates the per-size convert machinery
-    /// as needed — the 4:4:4 analogue of [`blit_and_copy_nv12`](Self::blit_and_copy_nv12).
+    /// Convert `image` to planar YUV444 and copy into a pooled stacked [`DeviceBuffer`].
+    /// Recreates the per-size convert when the frame size changes.
     fn blit_and_copy_yuv444(
         &mut self,
         image: *mut c_void,
@@ -1207,21 +1060,16 @@ impl EglImporter {
     ) -> Result<DeviceBuffer> {
         cuda::make_current()?;
         if self.yuv444_blit.as_ref().map(|b| (b.width, b.height)) != Some((width, height)) {
-            // SAFETY: `Yuv444Blit::new` requires the GL context current on the calling thread and
-            // a current CUDA context. Both hold: this runs on the capture thread where
-            // `EglImporter::new` made the GL context current and never released it, and
-            // `cuda::make_current()?` ran at the top of this function. `width`/`height` are plain
-            // `Copy` frame dimensions.
+            // SAFETY: `Yuv444Blit::new` needs GL and CUDA current. Both hold: capture thread, GL
+            // made current in `EglImporter::new` and never released; `cuda::make_current()?` ran
+            // above.
             self.yuv444_blit = Some(unsafe { Yuv444Blit::new(width, height)? });
         }
         let egl_image_target = self.egl_image_target;
         let blit = self.yuv444_blit.as_mut().unwrap();
-        // SAFETY: `Yuv444Blit::run` requires a current GL context and a valid `EGLImage`. The GL
-        // context is current on this capture thread (made current in `EglImporter::new`, never
-        // released) and `cuda::make_current()` ran above; `egl_image_target` is the
-        // `glEGLImageTargetTexture2DOES` pointer loaded in `new`; `image` is the raw handle of the
-        // live `EGLImage` that `import_inner` created with `eglCreateImage` and destroys only
-        // AFTER this call returns, so it stays valid for the whole synchronous `run`.
+        // SAFETY: `Yuv444Blit::run` needs GL current and a valid `EGLImage`. GL is current on this
+        // capture thread (never released); `image` is the live `eglCreateImage` handle
+        // `import_inner` destroys only after this call returns.
         unsafe { blit.run(egl_image_target, image)? };
         let dst = blit.pool.get()?;
         let [y, u, v] = &mut blit.registered;
@@ -1229,10 +1077,8 @@ impl EglImporter {
         Ok(dst)
     }
 
-    /// Self-test entry: upload a packed `width`×`height` RGBA8 host pattern into a GL texture, run
-    /// the NV12 convert passes on the GPU, and copy both planes into a pooled NV12 [`DeviceBuffer`].
-    /// Exercises the exact shaders + CUDA copy the live path uses, but sourced from an uploaded
-    /// texture instead of a dmabuf EGLImage (no compositor needed). `rgba` is tightly packed, 4 B/px.
+    /// Test helper: upload packed RGBA8 (`rgba` is 4 B/px, no row padding), run the live NV12
+    /// shaders + CUDA copy, return a pooled NV12 [`DeviceBuffer`]. No compositor / EGLImage.
     pub fn convert_rgba_for_test(
         &mut self,
         rgba: &[u8],
@@ -1248,25 +1094,17 @@ impl EglImporter {
         );
         cuda::make_current()?;
         if self.nv12_blit.as_ref().map(|b| (b.width, b.height)) != Some((width, height)) {
-            // SAFETY: `Nv12Blit::new` requires the GL context current on the calling thread and a
-            // current CUDA context. Both hold: this self-test path runs on the thread that owns this
-            // `EglImporter` with its GL context current, and `cuda::make_current()?` ran just above.
-            // `width`/`height` are plain `Copy` scalars.
+            // SAFETY: `Nv12Blit::new` needs GL and CUDA current. This test path runs on the
+            // thread that owns this `EglImporter` with GL current; `cuda::make_current()?` ran above.
             self.nv12_blit = Some(unsafe { Nv12Blit::new(width, height)? });
         }
         let blit = self.nv12_blit.as_mut().unwrap();
-        // SAFETY: runs on the thread that owns this `EglImporter` with its GL context current.
-        // `blit.src_tex` is a texture this `Nv12Blit` owns; `glTexStorage2D` allocates immutable
-        // RGBA8 storage exactly once (guarded by `test_src_storage`) sized `width×height`.
-        // `glTexSubImage2D` then uploads exactly `width×height` RGBA8 texels, reading `width*height*4`
-        // bytes from `rgba.as_ptr()`; the caller already asserted `rgba.len() == width*height*4`, rows
-        // are `width*4` bytes (a multiple of the default 4-byte unpack alignment, so no row-padding
-        // over-read), and `rgba` is a live borrow that outlives this synchronous upload. `run_passes`
-        // then needs only the current GL context (no further Rust pointers). All GL names are this
-        // blit's own, alias no other live object, and nothing is retained past the calls.
+        // SAFETY: GL is current on the owning thread. `src_tex` is this blit; `glTexStorage2D`
+        // allocates immutable RGBA8 once (`test_src_storage`). `glTexSubImage2D` uploads
+        // `width×height` RGBA8 texels from `rgba.as_ptr()`; caller asserted
+        // `rgba.len() == width*height*4`, rows are `width*4` (multiple of 4-byte unpack
+        // alignment). `rgba` outlives the upload. `run_passes` needs only current GL.
         unsafe {
-            // Upload the host RGBA into `src_tex` (an immutable GL_RGBA8 backing must exist first;
-            // the live path never allocates it — it retargets `src_tex` via EGLImage instead).
             glBindTexture(GL_TEXTURE_2D, blit.src_tex);
             if !blit.test_src_storage {
                 glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, width as c_int, height as c_int);
@@ -1295,19 +1133,16 @@ impl EglImporter {
     }
 }
 
-// No `Drop` impl on `EglImporter` — deliberately. `Drop::drop` runs BEFORE field drops, so the
-// old impl destroyed the gbm device and closed the render-node fd while the blits' destructors
-// (which call `cuGraphicsUnregisterResource`/`glDeleteTextures` into the driver) still had to
-// run. With teardown expressed purely as field order (blits and bridge first, `GbmDevice` last —
-// see the field comments), the driver objects always release against a live native display.
+// No `Drop` on `EglImporter`: `Drop::drop` runs before field drops, which would destroy the GBM
+// device while blit destructors still call into the driver. Teardown is field order: blits and
+// bridge first, `GbmDevice` last.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
-    /// A fake `/dev/dri` + `/sys/class/drm` pair: every `(node, vendor)` gets a device node file
-    /// and, when `vendor` is `Some`, the sysfs `device/vendor` that identifies it.
+    /// Fake `/dev/dri` + `/sys/class/drm`. `vendor: Some` writes sysfs `device/vendor`.
     fn fixture(nodes: &[(&str, Option<&str>)]) -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let dri = tmp.path().join("dev/dri");
@@ -1324,8 +1159,7 @@ mod tests {
         (tmp, dri, sys)
     }
 
-    /// The hybrid-laptop case this selection exists for: the iGPU is bound first, so the NVIDIA
-    /// GPU is NOT renderD128 — which is what the old hardcoded path assumed.
+    /// Hybrid host: iGPU owns `renderD128`; NVIDIA is a later node.
     #[test]
     fn picks_the_nvidia_node_not_the_first_one() {
         let (_t, dri, sys) = fixture(&[
@@ -1338,21 +1172,19 @@ mod tests {
         );
     }
 
-    /// No NVIDIA GPU (or no readable sysfs) ⇒ no answer, and the caller keeps the historical
-    /// `/dev/dri/renderD128` guess rather than inventing one.
+    /// No NVIDIA node / no sysfs → `None`; the caller keeps `/dev/dri/renderD128`.
     #[test]
     fn no_nvidia_node_yields_nothing() {
         let (_t, dri, sys) = fixture(&[("renderD128", Some("0x8086\n")), ("renderD129", None)]);
         assert_eq!(nvidia_render_node_in(&dri, &sys), None);
-        // Missing roots entirely (a container without /sys, or without /dev/dri).
+        // Missing `/dev/dri` or `/sys`.
         assert_eq!(
             nvidia_render_node_in(Path::new("/nonexistent/dri"), &sys),
             None
         );
     }
 
-    /// Ignore card/control nodes, and visit render nodes in name order so a two-NVIDIA host picks
-    /// the same one every boot.
+    /// Skip card/control nodes; name order so two NVIDIA GPUs pick the same node every boot.
     #[test]
     fn scans_render_nodes_only_and_in_order() {
         let (_t, dri, sys) = fixture(&[

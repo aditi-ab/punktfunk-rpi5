@@ -1,26 +1,21 @@
-//! The client's own recent-log ring + the "send logs to host" uploader.
+//! Client-side recent-log ring and the "send logs to host" uploader.
 //!
-//! Why: on locked-down platforms (a Steam Deck in Gaming Mode, tvOS, webOS) the user cannot get
-//! the client's log off the device, so field reports arrive host-log-only and the client half of
-//! any stutter/latency story is invisible. The cure is inverted collection: the client keeps its
-//! newest few thousand log lines here, and an explicit user action posts them to the PAIRED host
-//! (`POST /api/v1/client-logs`, authenticated by the same mTLS identity the stream uses), where
-//! the web console lists them next to the host's own logs.
+//! Locked-down shells cannot export a log file, so the client keeps the newest
+//! few thousand lines here. An explicit user action posts them to the paired host
+//! (`POST /api/v1/client-logs`, same mTLS as the stream). The web console lists
+//! them next to the host's own logs.
 //!
-//! The ring itself is dependency-free (std only — Android renders it too). The [`RingLayer`]
-//! that feeds it from `tracing` lives right beside it, desktop-gated: it started as
-//! `punktfunk-session`'s private `ring_layer`, and the moment the GTK and WinUI shells wanted
-//! "Send logs to host" too, a copy per bin was exactly the drift this crate exists to prevent.
-//! Bounded by lines AND bytes so a log-storm can't grow memory; the byte budget stays under the
-//! host's 1 MiB upload cap so a full ring always uploads whole.
+//! Std-only ring so Android can render it; [`RingLayer`] (desktop) feeds it from
+//! `tracing`. Bounded by [`MAX_LINES`] and [`MAX_BYTES`] so a log-storm cannot
+//! grow memory; the byte budget stays under the host's 1 MiB upload cap.
 
 use std::collections::VecDeque;
 use std::sync::{LazyLock, Mutex};
 
-/// Newest lines kept (matches the host's own ring depth).
+/// Same depth as the host's own ring.
 pub const MAX_LINES: usize = 4096;
 
-/// Byte budget for the ring — under the host's 1 MiB bundle cap with headroom for the header.
+/// Under the host's 1 MiB bundle cap, with headroom for the header.
 pub const MAX_BYTES: usize = 768 * 1024;
 
 struct Ring {
@@ -37,8 +32,7 @@ static RING: LazyLock<Mutex<Ring>> = LazyLock::new(|| {
     })
 });
 
-/// Append one formatted log line (no trailing newline). Oversized lines are truncated to keep a
-/// single event from evicting the whole ring.
+/// No trailing newline. Truncates at 2048 bytes so one event cannot evict the whole ring.
 pub fn note(mut line: String) {
     if line.len() > 2048 {
         line.truncate(2048);
@@ -57,10 +51,9 @@ pub fn note(mut line: String) {
     }
 }
 
-/// `2026-08-15T12:03:47.123Z` from the system clock — wall time, so a bundle correlates with
-/// the host log it lands next to. No chrono dep; same civil-date derivation the host uses.
-/// Lives here (not in a shell) because every ring FEEDER wants the same stamp: the session's
-/// `ring_layer` and the Android client's logcat tee both prefix their lines with it.
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` from the system clock. Wall time so a bundle
+/// correlates with the host log beside it. No chrono; same civil-date math the
+/// host uses. Shared by every feeder (`ring_layer`, Android logcat tee).
 pub fn wallclock() -> String {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -87,8 +80,8 @@ pub fn wallclock() -> String {
     )
 }
 
-/// The ring rendered as one text bundle, oldest first, prefixed by `header` (the shell's own
-/// identity line — binary name, version, platform) and an eviction note when the ring wrapped.
+/// Oldest-first text bundle. `header` is the shell identity line; an eviction
+/// note is prefixed when the ring wrapped.
 pub fn render(header: &str) -> String {
     let r = RING.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = String::with_capacity(r.bytes + header.len() + 64);
@@ -107,10 +100,9 @@ pub fn render(header: &str) -> String {
     out
 }
 
-/// Upload the ring to the paired host `addr` and return the stored bundle id. Same transport +
-/// trust as the library fetch: TLS client auth with the device identity, host pinned by
-/// fingerprint. Errors reuse the library's classification (401/403 ⇒ `NotPaired`, a pin-verifier
-/// rejection ⇒ `PinMismatch`), so the shell's existing error strings apply.
+/// POST the ring to the paired host; returns the stored bundle id. Same TLS
+/// client auth and pin as the library fetch. Errors reuse that classification
+/// (`NotPaired`, `PinMismatch`) so existing shell strings apply.
 #[cfg(any(target_os = "linux", windows))]
 pub fn send_to_host(
     addr: &str,
@@ -146,29 +138,20 @@ pub fn send_to_host(
     }
 }
 
-/// Thin `tracing` layer feeding the ring — the source for "Send logs to host" in the session
-/// binary and both desktop shells. Install it beside the visible (stderr/file) layer with its
-/// own `LevelFilter::DEBUG`, NOT under the env filter: the whole point is that a field report
-/// carries the diagnostics nobody thought to enable beforehand. Mirrors the host's
+/// `tracing` layer that feeds the ring. Installed beside the visible layer with
+/// its own `LevelFilter::DEBUG`, not under the env filter: a field bundle must
+/// carry diagnostics nobody enabled beforehand. Mirrors the host's
 /// `log_capture::RingLayer`.
 ///
-/// …which is exactly why it also has to keep OUT the chatter that would evict them. The ring
-/// holds [`MAX_LINES`] lines. The vendored H.265 parser (`cros_codecs`, behind `pf-bitstream`)
-/// DEBUG-logs its DPB bookkeeping — "Retaining pic POC", "Stored picture", "Set reference",
-/// "Bumping POC", one `find_short_term_ref_by_poc` per reference — a dozen lines PER FRAME, so
-/// at 120 fps the ring turns over in about three seconds. The 2026-08-17 field bundle from a
-/// Steam Deck read `… 2037456 older lines evicted from the ring …` followed by 3.5 s of DPB
-/// chatter: the whole 27-minute session, including the 10 s `audio playback buffer_ms=
-/// underruns=` line three investigation rounds had been waiting for, was gone. A field ring
-/// that a healthy decoder can flush is worse than no ring, because it looks like diagnostics
-/// and carries none.
+/// DEBUG/TRACE from [`NOISY_DEBUG_TARGETS`] is dropped. The vendored H.265
+/// parser logs DPB bookkeeping every frame; at 120 fps that turns the ring over
+/// in seconds and flushes the session the bundle exists to keep.
 #[cfg(any(target_os = "linux", windows))]
 pub struct RingLayer;
 
-/// Targets whose DEBUG/TRACE output is steady-state per-frame chatter, not diagnostics. The ring
-/// keeps their INFO-and-up. Prefix-matched on module-path boundaries, so `cros_codecs::codec::…`
-/// is gated and a hypothetical `cros_codecs_probe` is not. Same shape as the host's
-/// `log_capture::NOISY_DEBUG_TARGETS`.
+/// DEBUG/TRACE from these module-path prefixes is chatter, not diagnostics.
+/// Prefix-matched on `::` boundaries so `cros_codecs::…` is gated and
+/// `cros_codecs_probe` is not. Same shape as the host's `NOISY_DEBUG_TARGETS`.
 #[cfg(any(target_os = "linux", windows))]
 const NOISY_DEBUG_TARGETS: &[&str] = &["cros_codecs"];
 
@@ -190,12 +173,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingLayer {
     ) {
         use std::fmt::Write as _;
         use tracing::field::{Field, Visit};
-        // Events from `log`-crate dependencies (the vendored decoder among them) arrive through
-        // the tracing-log bridge under the shim target "log", with the record's real module path
-        // tucked into `log.target=`. Normalize back to the real metadata so the noise gate below
-        // and the target column both see `cros_codecs::…` — under the shim target every bridged
-        // event is indistinguishable from every other, and the field bundle's target column read
-        // `log` for two million lines.
+        // `log` crate events arrive under tracing-log's shim target "log", with the
+        // real module in `log.target`. Normalize so the noise gate and the target
+        // column both see `cros_codecs::…`.
         use tracing_log::NormalizeEvent;
         let normalized = event.normalized_metadata();
         let meta = normalized.as_ref().unwrap_or_else(|| event.metadata());
@@ -206,15 +186,13 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingLayer {
         impl Visit for V {
             fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
                 if field.name() == "message" {
-                    // The message leads; fields follow. Events put it first anyway, so
-                    // this is belt-and-braces against odd macro orderings.
+                    // Belt-and-braces against odd macro field order.
                     let rest = std::mem::take(&mut self.0);
                     let _ = write!(self.0, "{value:?}");
                     self.0.push_str(&rest);
                 } else if !field.name().starts_with("log.") {
-                    // `log.target`/`log.module_path`/`log.file`/`log.line` are the bridge's own
-                    // bookkeeping — already surfaced through the normalized target above, and
-                    // 150 bytes of repeated path per line otherwise.
+                    // Bridge bookkeeping (`log.target` / `log.module_path` / …) already lives in
+                    // the normalized target; keeping it would add ~150 bytes of path per line.
                     let _ = write!(self.0, " {}={:?}", field.name(), value);
                 }
             }
@@ -231,14 +209,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingLayer {
     }
 }
 
-/// Forward a spawned session child's stderr: every line goes to OUR stderr (a dev terminal
-/// keeps the interleaved output it always had) AND into the ring, so this shell's "Send logs
-/// to host" bundle carries the session's whole receive/decode/present trail — the half of any
-/// field report that matters. Line-buffered so child lines never interleave mid-line with the
-/// shell's own. Returns immediately; the thread dies with the pipe (child exit).
-///
-/// The WinUI shell has its own forwarder (its tee also feeds the client log file); this one is
-/// for callers whose stderr is the only other sink — `orchestrate`'s spawn.
+/// Line-buffered tee of a spawned session child's stderr into ours and the ring.
+/// Returns immediately; the thread dies with the pipe. WinUI has its own
+/// forwarder (it also tees the client log file); this is for `orchestrate`'s spawn.
 #[cfg(any(target_os = "linux", windows))]
 pub fn forward_child_stderr(stderr: impl std::io::Read + Send + 'static) {
     let _ = std::thread::Builder::new()
@@ -259,8 +232,8 @@ pub fn forward_child_stderr(stderr: impl std::io::Read + Send + 'static) {
 mod tests {
     use super::*;
 
-    /// The ring is process-global; every test that writes it takes this, so a parallel run
-    /// can't interleave lines into an order-sensitive assertion.
+    /// Process-global ring; every writer test takes this so a parallel run cannot
+    /// interleave lines into an order-sensitive assertion.
     static RING_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -277,13 +250,11 @@ mod tests {
             "oldest line survived eviction"
         );
         assert!(text.ends_with(&format!("line {}\n", MAX_LINES + 9)));
-        // A pathological line is truncated, not ring-flushing.
         note("x".repeat(10_000));
         let text = render("h");
         assert!(text.contains('…'));
     }
 
-    /// The gate is a prefix match on module-path boundaries, nothing looser.
     #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn noisy_gate_matches_the_crate_and_its_modules_only() {
@@ -294,14 +265,7 @@ mod tests {
         assert!(!is_noisy_debug("pf_client_core::audio"));
     }
 
-    /// End to end through the bridge: a `log::debug!` from the vendored decoder's module path
-    /// must NOT reach the ring, its `warn!` must (under its real target, without the bridge's
-    /// bookkeeping fields), and a DEBUG event from our own audio module — the very line the gate
-    /// exists to protect — must land.
-    ///
-    /// The ring is process-global, so the assertions look for lines this test wrote (unique
-    /// markers) rather than at the ring's size, and the subscriber is installed only for the
-    /// duration of the test.
+    /// Markers, not ring size: the ring is process-global.
     #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn bridged_decoder_debug_is_dropped_and_the_audio_line_survives() {
@@ -310,8 +274,8 @@ mod tests {
         let _own = RING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let sub = tracing_subscriber::registry()
             .with(RingLayer.with_filter(tracing_subscriber::filter::LevelFilter::DEBUG));
-        // The bridge may already be installed by another test in this binary; either way the
-        // `log` max level has to admit DEBUG for the planted records to be dispatched at all.
+        // The bridge may already be installed by another test; either way DEBUG must
+        // be admitted or the planted records never dispatch.
         let _ = tracing_log::LogTracer::builder()
             .with_max_level(log::LevelFilter::Debug)
             .init();

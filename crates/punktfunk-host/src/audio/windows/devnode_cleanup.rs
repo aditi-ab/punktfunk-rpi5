@@ -1,28 +1,19 @@
-//! Uninstall-time removal of every audio device punktfunk minted on this box — the
-//! `punktfunk-host driver uninstall --audio` leg the installer's Inno `[UninstallRun]` calls.
+//! Uninstall-time sweep of MEDIA-class audio DEVNODEs this host minted.
 //!
-//! The field report this exists for: uninstalling punktfunk left "Punktfunk Speakers",
-//! "Punktfunk Microphone" and the per-pad "Wireless Controller" endpoints sitting in Windows'
-//! Sound settings forever. They are not files and no uninstaller deletes them by walking a
-//! payload list — they are DEVNODES this host created at runtime, and they persist exactly
-//! because they are designed to ([`minted`](super::minted) and
-//! [`pad_endpoint`](super::pad_endpoint) both re-resolve their devnodes across host restarts
-//! rather than re-minting them). Persistent across restarts must not mean permanent.
+//! `punktfunk-host driver uninstall --audio` (Inno `[UninstallRun]`). DEVNODEs
+//! persist across restarts by design ([`minted`](super::minted),
+//! [`pad_endpoint`](super::pad_endpoint)); uninstall must still remove them.
+//! Match owner markers, never names — our instances share VALVE streaming-audio
+//! HWIDs and display names with Steam.
 //!
-//! What gets swept: every MEDIA-class devnode carrying one of the three durable owner markers
-//! this product writes into `Device Parameters`, whatever minted it —
+//! `Device Parameters` markers:
+//! * [`pad_endpoint::PAD_INDEX_VALUE`](super::pad_endpoint::PAD_INDEX_VALUE) — per-pad speakers
+//! * [`minted::ROLE_MARKER`](super::minted::ROLE_MARKER) — Speakers/Microphone substrate
+//! * [`audio_probe::PROBE_MARKER`](super::audio_probe::PROBE_MARKER) — leftover probe DEVNODEs
 //!
-//! * [`pad_endpoint::PAD_INDEX_VALUE`](super::pad_endpoint::PAD_INDEX_VALUE) — the per-pad
-//!   DualSense speaker endpoints,
-//! * [`minted::ROLE_MARKER`](super::minted::ROLE_MARKER) — the Speakers/Microphone substrate,
-//! * [`audio_probe::PROBE_MARKER`](super::audio_probe::PROBE_MARKER) — devtest leftovers, so a
-//!   probe run on an operator's box cannot outlive the product either.
-//!
-//! Marker-matched, never name-matched: our devnodes are instances of VALVE's streaming-audio
-//! drivers and are name-identical to Steam's own (the same reason the wiring plan works by
-//! recorded id). Steam's devnodes, its driver packages, and a VB-CABLE from the era when we
-//! bundled one all carry no marker and are therefore untouchable here — uninstalling punktfunk
-//! removes what punktfunk created, and nothing else.
+//! Unmarked `ROOT\MEDIA\*` with [`MINTED_HWIDS`] is a host that died before the
+//! marker write. Steam's own devices use the same HWIDs under
+//! `ROOT\SteamStreamingSpeakers\*` / `ROOT\SteamStreamingMicrophone\*`.
 
 use super::{audio_control, audio_probe, minted, pad_endpoint as pe};
 use anyhow::Result;
@@ -30,24 +21,20 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiEnumDeviceInfo, SPDRP_HARDWAREID,
 };
 
-/// The `Device Parameters` REG_DWORD each punktfunk-minted devnode family stamps on itself. The
-/// VALUE is what differs per family; presence of the NAME is "this one is ours", which is all a
-/// sweep needs.
+/// `Device Parameters` REG_DWORD names. Presence of the name is "ours"; the value is family-specific.
 pub(crate) const OWNER_MARKERS: [&str; 3] = [
     pe::PAD_INDEX_VALUE,
     minted::ROLE_MARKER,
     audio_probe::PROBE_MARKER,
 ];
 
-/// The Steam streaming hardware ids every audio devnode this product mints is created with —
-/// the second half of the ABANDONED-devnode test in [`owned_devnodes`].
+/// Steam streaming HWIDs we mint with. Second half of the abandoned-devnode test in [`owned_devnodes`].
 const MINTED_HWIDS: [&str; 2] = [
     "ROOT\\SteamStreamingSpeakers",
     "ROOT\\SteamStreamingMicrophone",
 ];
 
-/// What one sweep removed. `endpoint_records` is counted separately from `devnodes` because the
-/// registry half is best-effort by design — see [`delete_endpoint_record`].
+/// Sweep counts. `endpoint_records` is best-effort; see [`delete_endpoint_record`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Removed {
     pub devnodes: usize,
@@ -55,28 +42,20 @@ pub(crate) struct Removed {
     pub endpoint_records: usize,
 }
 
-/// Restore the default playback/recording devices if we left them parked, then remove every
-/// audio devnode this product minted, newest registry record and all.
+/// Unpark defaults, then sweep minted DEVNODEs.
 ///
-/// Best-effort throughout, like the rest of the (un)install path: a devnode that refuses to go
-/// is counted and reported, never fatal — a non-zero exit here would abort the whole uninstaller
-/// over a virtual speaker.
+/// Stuck devices are counted, never fatal: a non-zero exit aborts the uninstaller.
 pub(crate) fn purge() -> Result<Removed> {
-    // FIRST, before the sweep deletes the endpoint the default may still point at. A host that
-    // died mid-stream leaves the box's default playback parked on our loopback sink; Windows
-    // would re-pick on its own once the device vanishes, but by its own ranking rather than by
-    // what the operator had. Putting it back is the difference between "the box works again"
-    // and "the box works again, on the device it started with".
+    // Restore first: the parked default may still point at a device this sweep is about to delete.
+    // Windows would re-pick by its own ranking, not the operator's original device.
     if audio_control::unpark_default_for_uninstall() {
         println!("restored the default audio device(s) this host had parked");
     }
 
     let mut out = Removed::default();
     for inst in owned_devnodes()? {
-        // Resolve the endpoint records BEFORE the devnode goes. An endpoint's MMDevices key is
-        // tied to us only through its `{1}.<instance id>` devnode link — once the devnode is
-        // removed, nothing left in the store says the record was ever ours, and a sweep that
-        // guessed by NAME is exactly the mistake this module refuses to make.
+        // Resolve MMDevices records before the DEVNODE goes. After removal the `{1}.<instance id>`
+        // link is gone, and name-matching is exactly what this module refuses to do.
         let records: Vec<(&str, String)> = [
             (pe::MMDEV_RENDER_PATH, pe::find_endpoint_for_devnode(&inst)),
             (
@@ -90,7 +69,7 @@ pub(crate) fn purge() -> Result<Removed> {
 
         if !remove_devnode(&inst) {
             out.devnode_failures += 1;
-            // The device is still there, so its record still belongs to a live endpoint.
+            // Still present; its MMDevices record still belongs to a live endpoint.
             continue;
         }
         out.devnodes += 1;
@@ -103,9 +82,8 @@ pub(crate) fn purge() -> Result<Removed> {
     Ok(out)
 }
 
-/// Every MEDIA-class devnode carrying one of [`OWNER_MARKERS`]. Enumerated WITHOUT `DIGCF_PRESENT`
-/// (that is what [`pe::media_class_devs`] gives us), so a phantom left by a crashed host is swept
-/// too — the same "ghost in Device Manager forever" complaint the pad and vdisplay legs fixed.
+/// MEDIA-class DEVNODEs with an [`OWNER_MARKERS`] value, including phantoms.
+/// Enumerated without `DIGCF_PRESENT` (see [`pe::media_class_devs`]).
 fn owned_devnodes() -> Result<Vec<String>> {
     let set = pe::media_class_devs()?;
     let mut out = Vec::new();
@@ -128,16 +106,8 @@ fn owned_devnodes() -> Result<Vec<String>> {
             out.push(inst);
             continue;
         }
-        // ABANDONED: `ROOT\MEDIA\NNNN` carrying one of our minting hardware ids but no marker at
-        // all — a devnode registered by a host that died before the marker write landed. It is
-        // still bound and still serving endpoints, so leaving it behind is the "uninstalling
-        // punktfunk left Sound settings full of Punktfunk devices forever" report all over again.
-        //
-        // The instance prefix is what makes this safe, and it is NOT redundant with
-        // [`is_removable_instance`]: Steam's own devnodes carry these very hardware ids and are
-        // ROOT-enumerated too, but live under `ROOT\SteamStreamingSpeakers\*` /
-        // `ROOT\SteamStreamingMicrophone\*`. Only `ROOT\MEDIA\*` can have come from our
-        // `SetupDiCreateDeviceInfoW(… DICD_GENERATE_ID)`.
+        // Unmarked `ROOT\MEDIA\*` with a minting HWID: the host died before the marker write.
+        // Prefix is required — Steam's devices share these HWIDs under `ROOT\SteamStreaming*\*`.
         if is_abandoned_mint(
             &inst,
             &pe::devnode_multi_sz_prop(&set, &did, SPDRP_HARDWAREID),
@@ -148,8 +118,7 @@ fn owned_devnodes() -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// The ABANDONED-devnode test, split out from the PnP enumeration so the rule that keeps this
-/// sweep off VALVE'S OWN devices is checkable without a live devinfo set. See [`owned_devnodes`].
+/// Abandoned-mint test, extracted so it is checkable without a live devinfo set.
 fn is_abandoned_mint(instance_id: &str, hwids: &[String]) -> bool {
     instance_id
         .to_ascii_uppercase()
@@ -169,7 +138,6 @@ mod abandoned_tests {
 
     #[test]
     fn adopts_our_own_unmarked_devnodes() {
-        // What a host that died mid-mint leaves behind, either role.
         assert!(is_abandoned_mint(
             r"ROOT\MEDIA\0004",
             &hw(r"ROOT\SteamStreamingMicrophone")
@@ -178,7 +146,7 @@ mod abandoned_tests {
             r"ROOT\MEDIA\0002",
             &hw(r"ROOT\SteamStreamingSpeakers")
         ));
-        // PnP casing is not guaranteed on either half.
+        // PnP casing is not guaranteed.
         assert!(is_abandoned_mint(
             r"root\media\0009",
             &hw(r"root\steamstreamingspeakers")
@@ -187,8 +155,6 @@ mod abandoned_tests {
 
     #[test]
     fn never_matches_valves_own_devices() {
-        // THE safety rule: Steam's devnodes carry the very same hardware ids and are ROOT-
-        // enumerated too — only the instance prefix separates them from ours.
         assert!(!is_abandoned_mint(
             r"ROOT\STEAMSTREAMINGMICROPHONE\0000",
             &hw(r"ROOT\SteamStreamingMicrophone")
@@ -201,7 +167,7 @@ mod abandoned_tests {
 
     #[test]
     fn never_matches_other_vendors_or_real_hardware() {
-        // VB-Cable mints ROOT\MEDIA devnodes too — a different hardware id is all that saves it.
+        // VB-Cable also mints `ROOT\MEDIA\*`; HWID is the discriminator.
         assert!(!is_abandoned_mint(r"ROOT\MEDIA\0000", &hw("VBAudioVACWDM")));
         assert!(!is_abandoned_mint(
             r"HDAUDIO\FUNC_01&VEN_10EC&DEV_0897",
@@ -211,18 +177,14 @@ mod abandoned_tests {
     }
 }
 
-/// A devnode this sweep is allowed to remove: ROOT-enumerated, i.e. software-created.
+/// ROOT-enumerated (software-created) only.
 ///
-/// Every devnode we mint comes from `SetupDiCreateDeviceInfoW(… DICD_GENERATE_ID)` on the MEDIA
-/// class, which always yields `ROOT\MEDIA\NNNN`. Nothing else can be ours — so if a marker name
-/// we own ever collides with a value some vendor writes under a REAL sound card's `Device
-/// Parameters`, this guard is what stops an uninstall from taking the user's hardware with it.
+/// A marker name colliding under a real sound card's `Device Parameters` must not take hardware.
 fn is_removable_instance(instance_id: &str) -> bool {
     instance_id.to_ascii_uppercase().starts_with("ROOT\\")
 }
 
-/// `pnputil /remove-device` — the same teardown `audio-probe cleanup` and the driver legs use.
-/// Called by absolute path: an uninstaller must not depend on the invoking shell's `%PATH%`.
+/// `pnputil /remove-device` by absolute path: an uninstaller must not depend on `%PATH%`.
 fn remove_devnode(instance_id: &str) -> bool {
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
     match std::process::Command::new(format!(r"{windir}\System32\pnputil.exe"))
@@ -248,17 +210,9 @@ fn remove_devnode(instance_id: &str) -> bool {
     }
 }
 
-/// Delete one endpoint's MMDevices record — the `{guid}` subkey holding its name, its stamped
-/// formats and its per-endpoint volume/settings.
-///
-/// BEST-EFFORT ON PURPOSE, and quiet when it fails. These keys are owned by SYSTEM and grant
-/// Administrators read only (the same ACL that forces the stamping path through
-/// `grant_system_full_control`), while the uninstaller runs elevated but as a USER — so on a
-/// stock box this is denied and the record stays. What stays is inert: with the devnode gone the
-/// endpoint is NOTPRESENT, which Sound settings surface only behind "Show Disconnected Devices",
-/// and nothing re-animates it without a devnode to link to. Buying that last cosmetic scrap would
-/// mean an uninstaller seizing ownership of SYSTEM-owned registry keys — a worse thing to ship
-/// than the leftover. The DEVICE, which is what the field report was about, is gone either way.
+/// Delete one MMDevices `{guid}` subkey. Best-effort and quiet: SYSTEM-owned keys grant
+/// Administrators read-only, and the uninstaller is elevated as a user. A leftover is
+/// inert (NOTPRESENT without a DEVNODE). Do not seize SYSTEM ownership to finish the cosmetic.
 fn delete_endpoint_record(reg_path: &str, endpoint_id: &str) -> bool {
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS};
     use winreg::RegKey;
@@ -283,19 +237,18 @@ mod tests {
         assert!(is_removable_instance(r"ROOT\MEDIA\0003"));
         // PnP casing is not guaranteed.
         assert!(is_removable_instance(r"root\media\0004"));
-        // A real sound card, however it got a marker-shaped value written under it.
+        // Real hardware, even if a marker-shaped value landed under it.
         assert!(!is_removable_instance(
             r"HDAUDIO\FUNC_01&VEN_10EC&DEV_0900\4&1c4a4e5&0&0001"
         ));
         assert!(!is_removable_instance(r"USB\VID_046D&PID_0A38\ABCDEF"));
-        // Not a prefix match on the string "ROOT" appearing anywhere.
+        // `ROOT` as a later path component is not ROOT-enumerated.
         assert!(!is_removable_instance(r"SWD\ROOT\MEDIA\0003"));
     }
 
     #[test]
     fn every_minted_family_is_swept() {
-        // The sweep is only as complete as this list — a new minted-devnode family that forgets
-        // to register here would ship the same leak again.
+        // A new minted family that omits itself here ships as a leftover after uninstall.
         assert!(OWNER_MARKERS.contains(&"PunktfunkPadIndex"));
         assert!(OWNER_MARKERS.contains(&"PunktfunkAudioRole"));
         assert!(OWNER_MARKERS.contains(&"PunktfunkAudioProbe"));

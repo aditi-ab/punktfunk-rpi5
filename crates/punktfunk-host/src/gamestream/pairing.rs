@@ -1,7 +1,16 @@
-//! The 4-phase GameStream pairing state machine (over HTTP), keyed by `uniqueid`. Proves
-//! both sides know the PIN (via the SHA-256(salt||pin) AES-ECB key) and own their certs
-//! (RSA signatures), then pins the client cert. The final `pairchallenge` happens over
-//! HTTPS (handled in `nvhttp`). Byte-exact spec: `design/research/…-research.json`.
+//! Four-phase GameStream pairing over HTTP, keyed by `uniqueid`. Both sides prove
+//! they know the PIN (`SHA-256(salt||pin)` as the AES-ECB key) and own their
+//! certs (RSA signatures); the host then pins the client cert. `pairchallenge`
+//! runs over HTTPS in `nvhttp`.
+//!
+//! The PIN arrives through the management API. Each parked handshake is keyed by
+//! client-cert fingerprint, `uniqueid`, and source address; submit must echo that
+//! whole identity. One source parks one ceremony; the host holds at most four;
+//! each expires in two minutes. Drop of `take` removes the slot so a PIN cannot
+//! outlive its waiter.
+//!
+//! Spec: `design/research/gamestream-protocol-research.json`. Sign-once vs. RSA
+//! timing: `.cargo/audit.toml`.
 
 use super::cert::ServerIdentity;
 use super::crypto;
@@ -10,28 +19,18 @@ use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::signature::{SignatureEncoding, Signer, Verifier};
 use rsa::RsaPublicKey;
-// `rsa`'s own re-export — `VerifyingKey<Sha256>` below is an `rsa 0.9` / `digest 0.10` type
-// parameter, distinct from the crate-wide `sha2 0.11`. See Cargo.toml.
+// `rsa`'s Sha256 re-export (`digest` 0.10). Distinct from crate-wide `sha2` 0.11.
 use rsa::sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::Notify;
 
-/// Out-of-band PIN delivery through the authenticated management API only.
-///
-/// Every parked handshake is keyed by client certificate, wire id and source address. Submissions
-/// must echo that complete identity; no global or sole-waiter shortcut exists. One source may park
-/// one ceremony, the host holds at most four, and each expires after two minutes.
-///
-/// A network peer cannot submit or brute-force the four-digit PIN. GameStream remains trusted-LAN
-/// only because an on-path attacker can replace the unauthenticated HTTP ceremony itself.
 const MAX_PARKED_WAITERS: usize = 4;
 const MAX_PARKED_PER_IP: usize = 1;
 const PAIRING_PIN_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Identity of one parked pairing ceremony. The certificate fingerprint is the cryptographic
-/// identity; `uniqueid` and source address give the operator recognizable context.
+/// One parked ceremony. Fingerprint is the identity; `uniqueid` and peer IP are operator labels.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct CeremonyId {
     pub uniqueid: String,
@@ -47,9 +46,7 @@ pub enum SubmitOutcome {
 }
 
 pub struct PinGate {
-    /// Parked ceremonies → the PIN addressed to each (`None` until the operator submits). An
-    /// entry exists exactly while its handshake is parked in [`take`](Self::take), so a PIN can
-    /// only ever be written toward a live, named waiter and dies with it.
+    /// PIN slot (`None` until submit). Lives only while `take` is parked; Drop removes it.
     waiters: Mutex<HashMap<CeremonyId, Option<String>>>,
     notify: Notify,
 }
@@ -62,7 +59,6 @@ impl PinGate {
         }
     }
 
-    /// Deliver the operator's PIN only to the exact ceremony selected from pairing status.
     pub fn submit(&self, pin: String, target: &CeremonyId) -> SubmitOutcome {
         let mut waiters = self.waiters.lock().unwrap();
         if waiters.is_empty() {
@@ -91,13 +87,11 @@ impl PinGate {
         SubmitOutcome::Delivered(id)
     }
 
-    /// True while at least one pairing handshake is parked waiting for the user's PIN.
     pub fn awaiting_pin(&self) -> bool {
         !self.waiters.lock().unwrap().is_empty()
     }
 
-    /// The parked ceremonies, for the management API's pairing status — the console shows these
-    /// identities so the operator answers a NAMED prompt rather than a bare one.
+    /// Identities the console lists so the operator addresses a named ceremony.
     pub fn pending(&self) -> Vec<CeremonyId> {
         let mut v: Vec<CeremonyId> = self.waiters.lock().unwrap().keys().cloned().collect();
         v.sort_by(|a, b| {
@@ -115,8 +109,7 @@ impl PinGate {
                 tracing::warn!(peer_ip = %id.peer_ip, "pairing: PIN waiter limit reached");
                 return None;
             }
-            // A twin park under the SAME identity would race one addressed PIN between two
-            // tasks; a real client runs one handshake at a time, so the twin is refused.
+            // Same identity twice would race one PIN across two tasks.
             if w.contains_key(id) {
                 tracing::warn!(
                     uniqueid = %id.uniqueid,
@@ -126,9 +119,7 @@ impl PinGate {
             }
             w.insert(id.clone(), None);
         }
-        // Remove the entry on every exit path (PIN delivered, timeout, or future cancellation) —
-        // an addressed-but-unconsumed PIN dies with its ceremony instead of waiting to
-        // authenticate whoever knocks next (security-review 2026-08-25).
+        // Drop removes the slot on every exit so an unconsumed PIN cannot outlive this waiter.
         struct WaiterGuard<'a> {
             gate: &'a PinGate,
             id: &'a CeremonyId,
@@ -142,9 +133,7 @@ impl PinGate {
 
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            // Register interest BEFORE checking the slot: `notify_waiters` only wakes futures
-            // already polled/enabled, so the reverse order can lose the one wakeup a submit
-            // sends and leave a delivered PIN unread until the deadline.
+            // Subscribe before reading the slot. Reverse order can miss the one wakeup submit sends.
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -164,7 +153,7 @@ impl PinGate {
     }
 }
 
-/// Per-client pairing session carried across the 4 separate HTTP GETs.
+/// Pairing state carried across the four HTTP GETs.
 struct Session {
     aes_key: [u8; 16],
     client_cert_der: Vec<u8>,
@@ -172,11 +161,9 @@ struct Session {
     client_pubkey: RsaPublicKey,
     serversecret: [u8; 16],
     server_challenge: [u8; 16],
-    /// The client's phase-3 hash, recomputed + checked in phase 4.
+    /// Phase-3 hash; phase 4 recomputes and compares.
     client_hash: Vec<u8>,
-    /// Set once phase 3 has produced the RSA-signed serversecret. A repeated phase 3 is refused so a
-    /// peer past phase 1 can't loop phase2/phase3 to harvest many signing-time samples (a passive
-    /// timing-oracle amplifier vs. the rsa-crate Marvin side-channel; see `.cargo/audit.toml`).
+    /// Set after the one RSA sign. A repeat would harvest signing-time samples (`.cargo/audit.toml`).
     responded: bool,
 }
 
@@ -193,7 +180,6 @@ impl Pairing {
         }
     }
 
-    /// Phase 1: store the client cert, await the PIN, derive the AES key, return our cert.
     pub async fn getservercert(
         &self,
         id: &ServerIdentity,
@@ -211,9 +197,7 @@ impl Pairing {
         let pem_bytes = hex::decode(clientcert_hex).context("clientcert hex")?;
         let (der, sig, pubkey) = parse_client_cert(&pem_bytes)?;
 
-        // The ceremony parks under ITS identity — uniqueid plus the fingerprint of the very cert
-        // phase 4 would pin — so the operator's PIN can be addressed to this handshake and no
-        // other (security-review 2026-08-31 H-4).
+        // Park under the cert phase 4 will pin, so the PIN addresses this handshake only.
         let ceremony = CeremonyId {
             uniqueid: uniqueid.to_string(),
             fingerprint: hex::encode(crypto::sha256(&[der.as_slice()])),
@@ -256,7 +240,6 @@ impl Pairing {
         Ok(paired_xml(&inner, true))
     }
 
-    /// Phase 2: decrypt the client challenge, return our hash + server challenge.
     pub fn clientchallenge(
         &self,
         id: &ServerIdentity,
@@ -287,7 +270,6 @@ impl Pairing {
         Ok(paired_xml(&inner, true))
     }
 
-    /// Phase 3: store the client's hash, return our RSA-signed serversecret.
     pub fn serverchallengeresp(
         &self,
         id: &ServerIdentity,
@@ -304,10 +286,6 @@ impl Pairing {
             bail!("short challenge response");
         }
         s.client_hash = client_hash[..32].to_vec();
-        // Sign the serversecret exactly ONCE per ceremony: refuse a repeated phase 3 so a peer that
-        // cleared phase 1 (operator PIN) can't replay it to collect many RSA signing-time samples
-        // (timing-oracle amplifier vs. RUSTSEC-2023-0071; see `.cargo/audit.toml`). A legit client
-        // signs once. The session stays for phase 4 (the cert-pin step) but won't re-sign.
         if s.responded {
             bail!("serverchallengeresp already answered for this pairing session");
         }
@@ -320,8 +298,6 @@ impl Pairing {
         Ok(paired_xml(&inner, true))
     }
 
-    /// Phase 4: verify the client knew the PIN (hash match) and owns its cert (RSA verify);
-    /// on success, pin the client cert.
     pub fn clientpairingsecret(
         &self,
         uniqueid: &str,
@@ -342,26 +318,19 @@ impl Pairing {
         // Constant-time compare so a timing side-channel can't probe the expected hash.
         let hash_ok = crypto::ct_eq(&expected, &s.client_hash);
         let sig_ok = verify256(&s.client_pubkey, client_secret, client_sig).is_ok();
-        // Clone what the success branch needs so the `&mut map` borrow (`s`) is released before we
-        // mutate the map below.
         let client_cert_der = s.client_cert_der.clone();
-        // The pairing session is single-use: remove it now, WHATEVER the outcome. Phase 4 runs over
-        // plain HTTP, so a passive observer captures the request; without this, a replay re-passes the
-        // hash/sig check and re-pins the (same) cert over and over — unbounded `paired`/paired.json
-        // growth + PairingCompleted event spam until restart (security-review 2026-07-17).
+        // Drop the session now, any outcome. Phase 4 is plain HTTP; a replay would re-pin the cert.
         map.remove(uniqueid);
         if hash_ok && sig_ok {
             {
                 let mut store = paired_store.lock().unwrap();
-                // De-dup: re-pairing an already-trusted cert must not append a duplicate DER.
                 if !store.iter().any(|der| der == &client_cert_der) {
                     store.push(client_cert_der.clone());
                     super::save_paired(&store);
                 }
             }
             tracing::info!(uniqueid, "pairing phase 4 complete — client cert pinned");
-            // Lifecycle event, plane parity with `NativePairing::add` (RFC §4). GameStream
-            // pairing has no device name — the client's uniqueid is the identity it presents.
+            // GameStream has no device name; uniqueid is the identity the client presents.
             crate::events::emit(crate::events::EventKind::PairingCompleted {
                 device: crate::events::DeviceRef {
                     name: uniqueid.to_string(),
@@ -401,7 +370,6 @@ fn parse_client_cert(pem_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, RsaPublicKey
     Ok((der, sig, pubkey))
 }
 
-/// `<root status_code="200"><paired>0|1</paired> inner </root>`.
 fn paired_xml(inner: &str, paired: bool) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"200\">\n<paired>{}</paired>\n{}</root>\n",
@@ -427,8 +395,6 @@ mod tests {
         cid_at(tag, "127.0.0.1".parse().unwrap())
     }
 
-    /// `awaiting_pin`/`pending` flip on while `take` is parked and back off on every exit
-    /// path (delivered + timeout) — the management API's pairing UX depends on it.
     #[tokio::test]
     async fn pin_gate_reports_waiting() {
         let pairing = Arc::new(Pairing::new());
@@ -451,7 +417,6 @@ mod tests {
         assert_eq!(waiter.await.unwrap().as_deref(), Some("1234"));
         assert!(!pairing.pin.awaiting_pin());
 
-        // Timeout path also clears the entry.
         assert_eq!(
             pairing
                 .pin
@@ -462,8 +427,6 @@ mod tests {
         assert!(!pairing.pin.awaiting_pin());
     }
 
-    /// With nothing parked a submit stores nothing: a PIN can never sit waiting to authenticate
-    /// whoever knocks next (security-review 2026-08-25 — structural now, the slot is per-ceremony).
     #[tokio::test]
     async fn pin_without_a_waiter_is_refused_and_never_stored() {
         let pairing = Pairing::new();
@@ -471,7 +434,6 @@ mod tests {
             pairing.pin.submit("1234".into(), &cid("dev-a")),
             SubmitOutcome::NoWaiter
         );
-        // The handshake arriving right after gets no inherited PIN.
         assert_eq!(
             pairing
                 .pin
@@ -511,9 +473,6 @@ mod tests {
         assert_eq!(racer.await.unwrap(), None);
     }
 
-    /// Two parked ceremonies sharing a `uniqueid` (an attacker mimicking the legit device's id)
-    /// stay distinguishable by certificate fingerprint — the id alone is ambiguous, the
-    /// fingerprint resolves it.
     #[tokio::test]
     async fn shared_uniqueid_is_resolved_by_fingerprint() {
         let pairing = Arc::new(Pairing::new());
@@ -547,9 +506,6 @@ mod tests {
         assert_eq!(wb.await.unwrap(), None);
     }
 
-    /// A pre-auth peer flood can park at most `MAX_PARKED_WAITERS` pairing handshakes; the next
-    /// `take` is refused immediately (returns `None` without parking), bounding the 300s-waiter DoS
-    /// (security-review 2026-06-28 #12). A twin park under one identity is refused too.
     #[tokio::test]
     async fn pin_gate_caps_parked_waiters() {
         let pairing = Arc::new(Pairing::new());
@@ -563,11 +519,9 @@ mod tests {
                     .await
             }));
         }
-        // Wait until all the slots are taken.
         while pairing.pin.pending().len() < MAX_PARKED_WAITERS {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        // One more is refused right away (no parking), even with a long timeout.
         assert_eq!(
             pairing
                 .pin

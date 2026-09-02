@@ -1,39 +1,31 @@
-//! Client settings profiles — named bundles of setting overrides applied on top of the
-//! global [`Settings`] (design/client-settings-profiles.md §4).
+//! Named setting-override bundles applied on top of global [`Settings`].
 //!
-//! A profile overrides only the fields the user touched; everything else keeps following the
-//! global defaults *live*, so fixing a global once fixes it everywhere. That is why an overlay
-//! is sparse `Option`s rather than a snapshot copy, and why `Some(x)` is written on touch and
-//! `None` on an explicit "reset to default" — never by diffing against the current global (a
-//! `Some` equal to today's global is a legitimate *pin*: the profile keeps `x` when the global
-//! later moves).
+//! An overlay is sparse `Option`s, not a snapshot. `Some(x)` is written on
+//! touch and `None` on an explicit reset — never by diffing against the
+//! current global. A `Some` equal to today's global is a pin: the profile
+//! keeps `x` when the global later moves.
 //!
-//! The catalog lives in its own `client-profiles.json` beside the settings file, deliberately
-//! NOT inside it: the settings file has five whole-file load-modify-save writers (two shells,
-//! the console settings screen, the session's resize callback, Decky) with no merge, so a
-//! profile written by one would be dropped by the next. This file is touched only by
-//! profile-aware code, and written temp+rename.
+//! The catalog is `client-profiles.json` beside the settings file, not
+//! inside it: settings writers load-modify-save the whole file with no
+//! merge. Written temp+rename. Host→profile binding lives on
+//! [`crate::trust::KnownHost`], not here.
 //!
-//! Which host uses which profile is a field on the host record ([`crate::trust::KnownHost`]),
-//! not a map keyed here — see §4.1 of the design for why the catalog owns no host keys.
+//! Design: `design/client-settings-profiles.md`.
 
 use crate::trust::{config_dir, write_atomic, Settings, StatsVerbosity};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// The catalog file's schema version. Bumped only for a breaking shape change — additive
-/// fields ride the unknown-key preservation below.
+/// Bumped only for a breaking shape change; additive fields ride `extra`.
 pub const PROFILES_VERSION: u32 = 1;
 
-/// Every profileable ("tier P") setting, as `Option<T>`: `None` = inherit the global value,
-/// live. Tier-H fields (host properties like `clipboard_sync`) and tier-G ones (this
-/// device's hardware/endpoints) are deliberately absent — see the design's §3 curation.
+/// Sparse overlay of profileable (tier-P) settings. `None` inherits the
+/// live global. Host properties (tier H) and this device's hardware
+/// (tier G) are absent.
 ///
-/// `extra` preserves keys this build doesn't know (a newer client's tier-P field): the
-/// don't-clobber rule that already governs the GTK `ChoiceRow` pickers extends to the whole
-/// overlay — opening and saving a profile on an older client must not erase what a newer one
-/// stored.
+/// `extra` is the don't-clobber bag: a load→save on an older client must
+/// not erase a newer client's unknown key.
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SettingsOverlay {
@@ -61,11 +53,8 @@ pub struct SettingsOverlay {
     pub compositor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_channels: Option<u8>,
-    /// The requested audio format (`crate::audio_format::AUDIO_FORMATS`' stored value). Profileable
-    /// because it is about how a HOST is streamed — a wired desktop on the LAN can afford the
-    /// 2.3–4.6 Mbps lossless takes off the top of the link, the same laptop on a hotel Wi-Fi
-    /// cannot — rather than about this device's hardware. Apple and Android carry it under the
-    /// same key, so one catalog covers all four clients.
+    /// How the host is streamed, not this device's hardware — that is why
+    /// it is profileable rather than tier-G. Shared key across clients.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -80,8 +69,7 @@ pub struct SettingsOverlay {
     pub mouse_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invert_scroll: Option<bool>,
-    /// The whole ring blob (design/touch-client-overlay.md D10): a profile either inherits the
-    /// default ring entirely or owns its own ring and shortcuts.
+    /// Whole ring blob: inherit the default, or own the ring and shortcuts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overlay_actions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,10 +86,8 @@ pub struct SettingsOverlay {
     pub stats_verbosity: Option<StatsVerbosity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fullscreen_on_stream: Option<bool>,
-    /// The presentation cluster — the keys the Apple client already writes into this
-    /// same catalog shape (`present_priority`/`smooth_buffer`/`vsync`/`allow_vrr`;
-    /// Android carries the first two). First-class here so a profile authored on any
-    /// client applies on all of them instead of riding `extra` unapplied.
+    /// First-class so a profile authored on any client applies here
+    /// instead of riding `extra` unapplied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub present_priority: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,15 +96,11 @@ pub struct SettingsOverlay {
     pub vsync: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_vrr: Option<bool>,
-    /// Overlay keys a newer client wrote and this one doesn't model — carried through a
-    /// load→save round-trip untouched.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl SettingsOverlay {
-    /// The one resolution seam: this overlay on top of `base`. Pure — no store reads, no
-    /// clock, no environment — so it is fully testable field by field.
     pub fn apply(&self, base: &Settings) -> Settings {
         let mut s = base.clone();
         if let Some(v) = self.width {
@@ -197,8 +179,7 @@ impl SettingsOverlay {
             s.guide_gesture = v.clone();
         }
         if let Some(v) = self.stats_verbosity {
-            // Through the setter so the legacy `show_stats` bool stays coherent for
-            // pre-tier binaries reading the same settings file.
+            // Through the setter so the legacy `show_stats` bool stays coherent.
             s.set_stats_verbosity(v);
         }
         if let Some(v) = self.fullscreen_on_stream {
@@ -219,18 +200,9 @@ impl SettingsOverlay {
         s
     }
 
-    /// Record, as overrides, every tier-P field that differs between two settings snapshots.
-    ///
-    /// This is for front-ends that commit PER CONTROL rather than per dialog (the WinUI shell
-    /// writes on every change; the GTK one writes once on close). They can't hand over a list
-    /// of touched fields, so they hand over "the effective settings before this control fired"
-    /// and "after": the only field that can differ is the one the user just touched.
-    ///
-    /// That is not the diff-on-save this design rejects. The comparison is against the
-    /// EFFECTIVE settings — what the control was showing — not against the globals, so setting
-    /// a value back to what the global happens to be still records an override, which is the
-    /// pin the design asks for. It only ever adds overrides; removing one is an explicit
-    /// reset, which is a different operation.
+    /// Pin every tier-P field that changed between two effective snapshots.
+    /// Compare against what the control showed, not globals — equal-to-global
+    /// is still a pin. Only adds; removal is `clear`.
     pub fn absorb(&mut self, before: &Settings, after: &Settings) {
         if after.width != before.width {
             self.width = Some(after.width);
@@ -327,10 +299,8 @@ impl SettingsOverlay {
         }
     }
 
-    /// Drop one override by its overlay field name, putting the row back to inheriting. The
-    /// names are the serialised ones, so a UI can carry them as plain strings; `resolution`
-    /// is the one alias, covering the width/height/match-window tri-state a single control
-    /// drives on every client. Returns false for a name this build doesn't know.
+    /// Drop one override by serialised field name. `resolution` is the alias
+    /// for the width/height/match-window tri-state one control drives.
     pub fn clear(&mut self, field: &str) -> bool {
         match field {
             "resolution" => {
@@ -374,36 +344,33 @@ impl SettingsOverlay {
         true
     }
 
-    /// True when the profile overrides nothing — "inherits everything", the state a freshly
-    /// created profile starts in. Unknown-key carry-through counts: a profile that only holds
-    /// a newer client's field is not empty.
+    /// True when nothing is overridden. Unknown-key carry-through counts:
+    /// a profile that only holds a newer client's field is not empty.
     pub fn is_empty(&self) -> bool {
         *self == SettingsOverlay::default()
     }
 }
 
-/// One named bundle of overrides. `id` is stable across renames — bindings, pins and deep
-/// links all point at it, never at the name.
+/// Named override bundle. `id` is stable across renames; bindings and
+/// deep links point at it, never at the name.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StreamProfile {
     pub id: String,
-    /// User-facing and editable; unique case-insensitively (menus are ambiguous otherwise —
-    /// enforced by the editing UIs via [`ProfilesFile::name_taken`]).
+    /// User-facing; unique case-insensitively (menus are ambiguous otherwise).
+    /// Editing UIs check [`ProfilesFile::name_taken`].
     pub name: String,
-    /// `#RRGGBB` chip color. The UI may ignore it; the schema reserves it (pinned cards use
-    /// it to tint their subtitle).
+    /// Optional `#RRGGBB` chip. The schema reserves it; a UI may ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accent: Option<String>,
     #[serde(default)]
     pub overrides: SettingsOverlay,
-    /// Profile keys a newer client wrote — preserved across a load→save round-trip.
+    /// Unknown keys a newer client wrote — preserved across a load→save round-trip.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl StreamProfile {
-    /// A new, empty profile: inherits everything (the right creation default under
-    /// inherit-by-exception — "Duplicate" covers starting from another profile).
+    /// Empty profile: inherits everything. Start from another via Duplicate.
     pub fn new(name: impl Into<String>) -> StreamProfile {
         StreamProfile {
             id: new_profile_id(),
@@ -415,9 +382,8 @@ impl StreamProfile {
     }
 }
 
-/// What a `profile=` / `--profile` reference resolved to. Ambiguity is reported rather than
-/// guessed: a link or flag naming two profiles must refuse, not pick one (design
-/// client-deep-links.md §8).
+/// Outcome of a `profile=` / `--profile` reference. Ambiguity refuses
+/// rather than picking the first match (`design/client-deep-links.md`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resolution {
     Found,
@@ -426,8 +392,7 @@ pub enum Resolution {
     Ambiguous,
 }
 
-/// The profile catalog — client-wide, not per host: "Work" applied to three hosts is one
-/// profile, and the per-host part is only the binding on the host record.
+/// Client-wide catalog. Per-host binding lives on the host record, not here.
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct ProfilesFile {
     #[serde(default)]
@@ -441,16 +406,15 @@ impl ProfilesFile {
         Ok(config_dir()?.join("client-profiles.json"))
     }
 
-    /// The stored catalog, or an empty one — a missing or unreadable file is "no profiles",
-    /// never an error: nothing about streaming may hinge on this file existing.
+    /// Stored catalog, or empty. A missing or unreadable file is "no profiles",
+    /// never an error — streaming must not hinge on this file existing.
     pub fn load() -> ProfilesFile {
         Self::path()
             .map(|p| crate::trust::load_json_or_default(&p))
             .unwrap_or_default()
     }
 
-    /// Persist temp+rename, so a crash or a full disk mid-write leaves the previous catalog
-    /// intact instead of a truncated one.
+    /// Persist temp+rename so a crash or full disk mid-write leaves the previous catalog intact.
     pub fn save(&mut self) -> anyhow::Result<()> {
         self.version = PROFILES_VERSION;
         let p = Self::path()?;
@@ -463,9 +427,8 @@ impl ProfilesFile {
         self.profiles.iter().find(|p| p.id == id)
     }
 
-    /// Resolve a reference the way every surface must: exact id first, then a unique
-    /// case-insensitive name. Ambiguous names resolve to [`Resolution::Ambiguous`], never to
-    /// the first match.
+    /// Exact id first, then a unique case-insensitive name. Ambiguous names
+    /// are [`Resolution::Ambiguous`], never the first match.
     pub fn resolve(&self, reference: &str) -> (Option<&StreamProfile>, Resolution) {
         if let Some(p) = self.find_by_id(reference) {
             return (Some(p), Resolution::Found);
@@ -481,9 +444,8 @@ impl ProfilesFile {
         }
     }
 
-    /// Is this name already used (case-insensitively) by a *different* profile? The
-    /// create/rename guard — `except` is the profile being renamed, so renaming "Work" to
-    /// "work" is allowed.
+    /// True if another profile already uses this name (case-insensitive).
+    /// `except` is the profile being renamed, so "Work" → "work" is allowed.
     pub fn name_taken(&self, name: &str, except: Option<&str>) -> bool {
         self.profiles
             .iter()
@@ -491,16 +453,14 @@ impl ProfilesFile {
     }
 }
 
-/// 12 lowercase hex chars — the `library::new_id` shape, minted from the OS RNG (no uuid
-/// dependency, no collision in any realistic catalog).
+/// 12 lowercase hex chars — the `library::new_id` shape, from the OS RNG.
 pub fn new_profile_id() -> String {
     let b: [u8; 6] = rand::random();
     hex_lower(&b)
 }
 
-/// A random UUID-v4 in the canonical 8-4-4-4-12 form — the stable host-record identity
-/// (design §4.5). Matches the shape Apple's `StoredHost.id` already has, so a deep link's
-/// host-ref grammar is one format on every platform.
+/// Random UUID-v4 in 8-4-4-4-12 form — host-record identity, matching
+/// Apple's `StoredHost.id` so a deep-link host-ref is one format everywhere.
 pub fn new_record_uuid() -> String {
     let mut b: [u8; 16] = rand::random();
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
@@ -524,8 +484,6 @@ fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// The overlay applies field by field: a `Some` wins, a `None` keeps the base's live
-    /// value — including values that happen to equal the base (an explicit pin).
     #[test]
     fn overlay_applies_only_what_it_overrides() {
         let base = Settings {
@@ -602,16 +560,13 @@ mod tests {
         assert_eq!(out.smooth_buffer, 3);
         assert!(!out.vsync);
         assert!(!out.allow_vrr);
-        // The tier goes through the setter, so the legacy bool a pre-tier binary reads
-        // stays coherent with it.
+        // Through the setter, so the legacy `show_stats` bool stays coherent.
         assert!(out.show_stats);
-        // Tier-G/H fields are not in the overlay at all — the device's decoder pick, its
-        // audio endpoints and the per-host clipboard decision survive any profile.
+        // Tier-G/H fields are not in the overlay — decoder, endpoints, clipboard survive.
         assert_eq!(out.decoder, base.decoder);
         assert_eq!(out.speaker_device, base.speaker_device);
 
-        // An overlay that only carries a value equal to the base is still an override: the
-        // profile pins it, so a later global change doesn't move it.
+        // Equal to the base is still an override: a later global change must not move it.
         let pin = SettingsOverlay {
             bitrate_kbps: Some(20000),
             ..Default::default()
@@ -622,8 +577,6 @@ mod tests {
         assert_eq!(pin.apply(&moved).bitrate_kbps, 20000);
     }
 
-    /// `absorb` records exactly the field a control changed, compares against the EFFECTIVE
-    /// settings (so a value equal to the global is still a pin), and never removes anything.
     #[test]
     fn absorb_records_the_touched_field_only() {
         let base = Settings {
@@ -633,7 +586,6 @@ mod tests {
         };
         let mut o = SettingsOverlay::default();
 
-        // One control fires: before = what it was showing, after = what the user picked.
         let before = o.apply(&base);
         let mut after = before.clone();
         after.codec = "av1".into();
@@ -641,8 +593,7 @@ mod tests {
         assert_eq!(o.codec.as_deref(), Some("av1"));
         assert_eq!(o.bitrate_kbps, None, "nothing else may be recorded");
 
-        // Setting it BACK to the global's value is still an override — the pin case. This is
-        // what makes absorb different from diffing against the globals at save time.
+        // Back to the global's value is still a pin — not a diff against globals at save.
         let before = o.apply(&base);
         let mut after = before.clone();
         after.codec = "hevc".into();
@@ -652,23 +603,19 @@ mod tests {
         moved.codec = "h264".into();
         assert_eq!(o.apply(&moved).codec, "hevc");
 
-        // The stats tier goes through the resolver, not the legacy bool.
+        // Stats tier goes through the resolver, not the legacy bool.
         let before = o.apply(&base);
         let mut after = before.clone();
         after.set_stats_verbosity(StatsVerbosity::Detailed);
         o.absorb(&before, &after);
         assert_eq!(o.stats_verbosity, Some(StatsVerbosity::Detailed));
 
-        // Identical snapshots record nothing.
         let before = o.apply(&base);
         let mut o2 = o.clone();
         o2.absorb(&before, &before);
         assert_eq!(o2, o);
     }
 
-    /// `echo_cancel` is a first-class overlay field, not an `extra` passenger: it applies,
-    /// absorbs, clears, and serialises under the `echo_cancel` key the Apple and Android
-    /// clients write — one catalog has to round-trip through all three.
     #[test]
     fn echo_cancel_is_a_first_class_override() {
         let base = Settings::default();
@@ -686,7 +633,6 @@ mod tests {
             "modelled fields must never land in the passthrough"
         );
 
-        // Serialised under the shared key, and read back from a foreign client's file.
         let text = serde_json::to_string(&o).unwrap();
         assert!(text.contains("\"echo_cancel\":false"), "{text}");
         let from_apple: SettingsOverlay =
@@ -699,9 +645,6 @@ mod tests {
         assert!(o.is_empty());
     }
 
-    /// `overlay_actions` is a first-class overlay field carrying the WHOLE ring blob
-    /// (design/touch-client-overlay.md D10): it applies, absorbs, clears, and serialises under
-    /// the key the Apple and Android clients write.
     #[test]
     fn overlay_actions_is_a_first_class_override() {
         let base = Settings::default();
@@ -731,14 +674,8 @@ mod tests {
         assert!(o.is_empty());
     }
 
-    /// `audio_format` is a first-class overlay field, not an `extra` passenger: it applies,
-    /// absorbs, clears, and serialises under the `audio_format` key with the exact raw values the
-    /// Apple and Android clients write — one catalog has to round-trip through all four.
-    ///
-    /// The failure this pins is silent. An unmodelled key survives a load→save (that is what
-    /// `extra` is for), so a profile authored on a phone would keep working on a TV and keep
-    /// round-tripping through this client while quietly never applying — a "lossless on the
-    /// living-room host" profile that streams Opus, with nothing anywhere saying so.
+    /// Unmodelled keys survive load→save in `extra` without applying. This
+    /// field must be first-class or a lossless profile would stream Opus.
     #[test]
     fn audio_format_is_a_first_class_override() {
         let base = Settings::default();
@@ -760,8 +697,6 @@ mod tests {
             "modelled fields must never land in the passthrough"
         );
 
-        // Serialised under the shared key, and read back from a foreign client's file — the two
-        // spellings a phone/TV profile can hold.
         let text = serde_json::to_string(&o).unwrap();
         assert!(text.contains("\"audio_format\":\"lossless96\""), "{text}");
         let from_android: SettingsOverlay =
@@ -773,18 +708,13 @@ mod tests {
         assert!(o.clear("audio_format"));
         assert_eq!(o.audio_format, None);
         assert!(o.is_empty());
-        // Back to inheriting the global — not a remembered "lossless96".
+        // Inherit the global — not a remembered "lossless96".
         assert_eq!(
             o.apply(&base).audio_format,
             crate::audio_format::AUDIO_FORMAT_OPUS
         );
     }
 
-    /// The presentation cluster is first-class, not `extra` passengers: it applies,
-    /// absorbs, clears, and serialises under the exact keys the Apple client already
-    /// writes (`present_priority`/`smooth_buffer`/`vsync`/`allow_vrr`) — one catalog
-    /// has to round-trip through every platform, and a mismatched key would be carried
-    /// but never applied.
     #[test]
     fn presentation_cluster_is_first_class() {
         let base = Settings::default();
@@ -809,7 +739,6 @@ mod tests {
             crate::trust::PresentPriority::Smooth { buffer: 1 }
         );
 
-        // Serialised under the shared keys, and read back from a foreign client's file.
         let text = serde_json::to_string(&o).unwrap();
         assert!(text.contains("\"present_priority\":\"smooth\""), "{text}");
         assert!(text.contains("\"smooth_buffer\":1"), "{text}");
@@ -833,7 +762,6 @@ mod tests {
         assert_eq!((vrr.vsync, vrr.allow_vrr), (None, None));
     }
 
-    /// `clear` is the explicit way back to inheriting, including the resolution tri-state.
     #[test]
     fn clear_drops_one_override() {
         let mut o = SettingsOverlay {
@@ -851,10 +779,8 @@ mod tests {
         assert!(!o.clear("no_such_field"));
     }
 
-    /// Controller forwarding defaults ON, so its interesting override is the FALSE one — and a
-    /// `false` that `apply` dropped would silently forward a pad the profile said not to.
-    /// `absorb` must record it, `clear` must undo it, and the serialized name both carry is the
-    /// one every client's reset button sends.
+    /// `false` is the interesting override (default is on). Dropping it in
+    /// `apply` would silently forward a pad the profile refused.
     #[test]
     fn gamepad_forwarding_overrides_off_and_resets_back() {
         let base = Settings::default();
@@ -870,12 +796,11 @@ mod tests {
         assert!(o.clear("gamepad_forwarding"));
         assert_eq!(o.gamepad_forwarding, None);
         assert!(o.is_empty());
-        // Back to inheriting: the global's live value, not a remembered false.
+        // Inherit the live global, not a remembered false.
         assert!(o.apply(&base).gamepad_forwarding);
     }
 
-    /// Stats verbosity Off must survive `apply` — it is a legitimate override, and going
-    /// through `set_stats_verbosity` keeps `show_stats` in sync in that direction too.
+    /// Off is a legitimate override. The setter keeps `show_stats` in sync.
     #[test]
     fn overlay_can_turn_the_stats_overlay_off() {
         let mut base = Settings::default();
@@ -889,9 +814,8 @@ mod tests {
         assert!(!out.show_stats);
     }
 
-    /// A catalog round-trips, and values this build can't represent survive it: an unknown
-    /// codec string (a newer client's option) stays as written, and an unknown overlay KEY
-    /// is carried through untouched rather than erased — the don't-clobber rule.
+    /// Unknown codec strings stay as written; unknown overlay keys survive
+    /// load→save rather than being erased.
     #[test]
     fn catalog_round_trips_and_preserves_what_it_cannot_represent() {
         // `r##` — the accent value below contains a `"#` pair that would close an `r#` literal.
@@ -922,7 +846,7 @@ mod tests {
             game.overrides.stats_verbosity,
             Some(StatsVerbosity::Compact)
         );
-        // A profile with no `overrides` key at all is the empty (inherit-everything) one.
+        // Missing `overrides` key = inherit everything.
         assert!(file
             .find_by_id("0f0f0f0f0f0f")
             .unwrap()
@@ -933,7 +857,7 @@ mod tests {
         assert!(text.contains("vvc-from-the-future"));
         assert!(text.contains("some_new_axis"));
         assert!(text.contains("future_profile_key"));
-        // Absent overrides serialize away entirely — the file stays readable.
+        // Absent overrides omit rather than serialize as null.
         assert!(!text.contains("null"));
         let round: ProfilesFile = serde_json::from_str(&text).unwrap();
         let game = round.find_by_id("a1b2c3d4e5f6").unwrap();
@@ -941,14 +865,11 @@ mod tests {
         assert_eq!(game.overrides.extra.len(), 1);
         assert_eq!(game.extra.len(), 1);
 
-        // The unknown value still applies: the session hands the string to the host, which
-        // is the component that decides what it can encode.
+        // Unknown codec still applies: the host, not this overlay, decides what it can encode.
         let applied = game.overrides.apply(&Settings::default());
         assert_eq!(applied.codec, "vvc-from-the-future");
     }
 
-    /// Resolution order: id first, then a unique case-insensitive name; two profiles sharing
-    /// a name resolve to Ambiguous (the caller refuses) rather than to whichever came first.
     #[test]
     fn resolve_prefers_ids_and_refuses_ambiguity() {
         let file = ProfilesFile {
@@ -978,14 +899,12 @@ mod tests {
         assert_eq!(file.resolve("nope").1, Resolution::NotFound);
         assert_eq!(file.resolve("").1, Resolution::NotFound);
 
-        // Duplicate-name guard, and the rename-in-place exemption.
         assert!(file.name_taken("GAME", None));
         assert!(!file.name_taken("GAME", Some("333333333333")));
         assert!(file.name_taken("GAME", Some("111111111111")));
         assert!(!file.name_taken("Travel", None));
     }
 
-    /// Minted ids have the documented shapes and don't repeat.
     #[test]
     fn minted_ids_are_well_formed() {
         let a = new_profile_id();

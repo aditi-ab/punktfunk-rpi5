@@ -1,12 +1,12 @@
-//! The text around the plan: the banner, the choices summary, and step 7's verify + next steps.
+//! The text around the plan: banner, choices summary, verify, next steps.
 //!
-//! Two honesty rules live here and are tested. The console URL is never printed as fact when
-//! `punktfunk-web-server` is not on the box — that is what sent a Fedora user looking for a
-//! page nothing was serving. And the NVIDIA warnings fire on a *successful* install, because
-//! the install did succeed and streaming still will not work until the driver does.
+//! Two honesty rules, both tested. Never print the console URL as fact when
+//! `punktfunk-web-server` is not on the box. NVIDIA warnings fire on a
+//! successful install: the install succeeded, and streaming still will not
+//! work until the driver does.
 //!
-//! Under `--yes` the choices summary is the only place the punktfunk-group grant is stated,
-//! so the row names it (`design/installer-v2.md` D4).
+//! Under `--yes` the choices summary is the only place the punktfunk-group
+//! grant is stated, so the row names it (`design/installer-v2.md`).
 
 use crate::choices::{Action, Choices};
 use crate::exec::{Opts, Outcome};
@@ -39,8 +39,8 @@ pub fn choices_summary(ui: &dyn Reporter, choices: &Choices) {
         return;
     }
     ui.say("Choices (nothing below has run yet)");
-    // A client listens on nothing fixed and joins no groups, so none of the host rows apply
-    // to it — asking would be four questions with no consequence (§5).
+    // A client listens on nothing fixed and joins no groups. Host rows would be
+    // four questions with no consequence.
     if !choices.components.host {
         ui.line(&format!("  Channel: {}", choices.channel.as_str()));
         return;
@@ -121,8 +121,7 @@ pub fn verify(
     next_steps(ui, run, facts, choices, outcome, opts);
 }
 
-/// GPU drivers are the docs pages' job — but these two failures are silent, and the install
-/// having succeeded is exactly what makes them worth saying out loud.
+/// The install succeeded; these two NVIDIA failures are silent and still block encode.
 fn nvidia_warnings(ui: &dyn Reporter, facts: &Facts) {
     match facts.nvidia {
         Nvidia::Absent => return,
@@ -155,9 +154,7 @@ fn next_steps(
     let ip = facts.ip.clone().unwrap_or_else(|| "<host-ip>".to_string());
     ui.blank();
     ui.line("  Done. Next:");
-    // Nothing on this box serves anything, so the console URL and the pairing side are the
-    // other machine's. Sending a client user to a console on localhost is the same mistake
-    // as printing one for a host that has none.
+    // This box serves nothing. Console URL and pairing belong on the host, not localhost.
     if !choices.components.host {
         ui.line(
             "  Open punktfunk and pick a host — then approve this device in that host's console.",
@@ -166,9 +163,8 @@ fn next_steps(
         ui.blank();
         return;
     }
-    // --dry-run installs nothing by definition, so it shows the normal text.
-    // Probed again here rather than read off Facts: the install that just ran is usually what
-    // put the console on the box, and step 1 must not deny a console that now exists.
+    // Probe again, not Facts: the install that just ran is usually what put the
+    // console on the box. `--dry-run` shows the same text (it installs nothing).
     if run.which("punktfunk-web-server") || opts.dry {
         ui.line("  Connect with a client — a notification appears here to approve it.");
         ui.line(&format!(

@@ -82,20 +82,15 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         end_reject_code,
         ..
     } = args;
-    // Copies the pump needs after `negotiated` is handed over to `connect`.
     let clock_rtt_ns = negotiated.clock_rtt_ns;
     let resolved_bitrate_kbps = negotiated.bitrate_kbps;
     let negotiated_codec = negotiated.codec;
-    // Whether the host marks its idle-keepalive repeats (USER_FLAG_REPEAT — RFC §4.1). Only
-    // then can the ABR trust an unflagged AU as new content; an older host leaves the window
-    // arithmetic in its legacy form.
+    // Host marks idle-keepalive repeats (`USER_FLAG_REPEAT`). Only then is an
+    // unflagged AU new content; older hosts keep the legacy window arithmetic.
     let marks_repeats = negotiated.host_caps2 & crate::quic::HOST_CAP2_REPEAT_MARK != 0;
-    // RFC §5.1: the bitrate numbers are WIRE BUDGETS, so the controller's `actual` measures
-    // wire bytes plus this reservation for the audio plane — which rides the control
-    // connection and is spent whether or not video flows. Exact for PCM (the negotiated
-    // plane names its rate); the Opus mirror runs the host's own shared budget ladder at the
-    // default tier — an operator-pinned tier skews it by a few hundred kbps, well inside the
-    // utilization gate's ¾ tolerance.
+    // Wire budgets: `actual` is wire bytes plus this audio reservation, spent
+    // whether video flows or not. PCM is exact; Opus uses the default-tier ladder
+    // (a pinned tier skews a few hundred kbps, inside the ¾ utilization gate).
     let audio_reserved_kbps = if negotiated.audio_codec == crate::quic::AUDIO_CODEC_PCM {
         crate::audio::pcm::bitrate_kbps(
             negotiated.audio_rate_hz,
@@ -111,13 +106,11 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         )
         .kbps
     };
-    // Session constants a mode switch does not change — the pump recomputes the stream-shape
-    // cap from them for the switched geometry (review §2.1).
+    // Unchanged across a mode switch; the pump recomputes the stream-shape cap from them.
     let bit_depth = negotiated.bit_depth;
     let chroma_format = negotiated.chroma_format;
-    // What this session's mode + codec could plausibly use — the bound the ABR holds its
-    // probe-measured link ceiling to. Computed here because this is where the Welcome-resolved
-    // geometry lives; the data pump stays codec-agnostic.
+    // ABR holds the probe-measured link ceiling to this. Computed here (Welcome
+    // geometry); the data pump stays codec-agnostic.
     let stream_cap_kbps = crate::abr::stream_ceiling_kbps(
         negotiated.mode.width,
         negotiated.mode.height,
@@ -126,36 +119,27 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         negotiated.bit_depth,
         negotiated.chroma_format,
     );
-    // This session's frame budget, the unit the ABR's host-encode thresholds are expressed in
-    // (see [`crate::abr::BitrateController::encode_thresholds`]). The NEGOTIATED refresh, not the
-    // requested one — `mode_slot` still holds the request until the connect handshake seeds it,
-    // and a host that answered 60 to a 120 ask is exactly the session that must not be scored
-    // against a 120 Hz budget.
+    // ABR encode-threshold unit ([`BitrateController::encode_thresholds`]). Negotiated
+    // refresh, not the request still sitting in `mode_slot` (60-for-120 must score at 60).
     let refresh_hz = negotiated.mode.refresh_hz;
-    // Seed the live offset with the connect-time estimate BEFORE the embedder can observe the
-    // client (ready_tx): clock_offset_now_ns() never reads a pre-handshake 0 on a skewed pair.
+    // Seed before `ready_tx`: `clock_offset_now_ns` must not read a pre-handshake 0.
     clock_offset.store(negotiated.clock_offset_ns, Ordering::Relaxed);
-    // Same discipline for the live encoder target: the Welcome resolve is the starting truth
-    // (0 against an old host that reports none); every BitrateChanged ack moves it from there.
+    // Welcome is the starting encoder target (0 if the host reports none).
     live_bitrate.store(negotiated.bitrate_kbps, Ordering::Relaxed);
-    // …and for the live access truth: the Welcome advert seeds both slots before the embedder
-    // can observe the client, so `access_grants()` never reads a pre-handshake GRANT_ALL on a
-    // limited session. The deadline is anchored to the CLIENT's wall clock here — the wire
-    // carries a relative `expires_in_secs`, so host/client skew never moves the countdown.
+    // Seed before the embedder observes us, so `access_grants()` never reads
+    // GRANT_ALL on a limited session. Deadline is client wall clock: the wire
+    // carries relative `expires_in_secs`, so skew does not move the countdown.
     access_grants.store(negotiated.grants, Ordering::Relaxed);
     access_deadline_unix.store(
         access_deadline_from(wall_clock_ns(), negotiated.expires_in_secs),
         Ordering::Relaxed,
     );
-    // Bumped by the control task each time a re-sync batch is APPLIED; the pump watches it to
-    // reset its staleness counters and re-arm the clock-based jump-to-live detector.
+    // Bumped when a re-sync batch is applied; the pump resets staleness and re-arms jump-to-live.
     let clock_gen = Arc::new(AtomicU32::new(0));
     let _ = ready_tx.send(Ok(negotiated));
 
-    // Input task: embedder events → uplink datagrams, with per-transition gamepad events
-    // folded into idempotent seq-stamped snapshots toward a HOST_CAP_GAMEPAD_STATE host
-    // (see [`input_task`]). Pad-audio render caps ride arrival flags bits 8/9 ONLY toward a
-    // HOST_CAP_PAD_AUDIO host — an older host reads the whole flags word as the pad index.
+    // Snapshots only toward GAMEPAD_STATE. Flags 8/9 only toward PAD_AUDIO — an
+    // older host reads the whole flags word as the pad index.
     let gamepad_snapshots = host_caps & crate::quic::HOST_CAP_GAMEPAD_STATE != 0;
     let pad_audio_arrivals = host_caps & crate::quic::HOST_CAP_PAD_AUDIO != 0;
     tokio::spawn(input_task::run(
@@ -166,11 +150,8 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         pad_audio_caps,
     ));
 
-    // Mic task: embedder Opus mic frames → 0xCB uplink datagrams (best-effort, dropped on loss).
-    // Self-healing latency bound: every frame still queued once this task catches up is standing
-    // mic delay from then on, so a frame with more than [`MIC_BACKLOG_MAX`] successors already
-    // waiting is shed as stale instead of sent — a stall costs a short dropout, not a
-    // session-long lag (see [`MIC_QUEUE`]). The counters feed [`NativeClient::mic_stats`].
+    // 0xCB mic uplink. A frame with more than [`MIC_BACKLOG_MAX`] successors is
+    // shed: a stall costs a dropout, not session-long lag ([`MIC_QUEUE`]).
     let mic_conn = conn.clone();
     tokio::spawn(async move {
         while let Some((seq, pts_ns, opus)) = mic_rx.recv().await {
@@ -184,8 +165,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         }
     });
 
-    // Rich-input task: pre-encoded 0xCC uplink datagrams (DualSense touchpad / motion, pen
-    // batches — encoded at the NativeClient surface so new plane kinds never touch the pump).
+    // Pre-encoded 0xCC uplink. Encoded at NativeClient so new plane kinds never touch the pump.
     let rich_conn = conn.clone();
     tokio::spawn(async move {
         while let Some(d) = rich_input_rx.recv().await {
@@ -193,34 +173,22 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         }
     });
 
-    // Adaptive bitrate ack queue: the control task pushes every BitrateChanged; the pump's
-    // controller drains them in arrival order on its report tick. A QUEUE, not a latest-wins
-    // slot (review §2.4): a full resolve ack plus a corrective short retarget in the same
-    // 750 ms window used to collapse to whichever arrived last, and host-cap learning needs
-    // two CONSECUTIVE short acks — losing one delayed or prevented the cap and could
-    // reintroduce the encoder-overdrive sawtooth.
+    // BitrateChanged queue, drained in order. Not latest-wins: host-cap learning
+    // needs two consecutive short acks in the same 750 ms window.
     let bitrate_ack: Arc<Mutex<std::collections::VecDeque<u32>>> =
         Arc::new(Mutex::new(std::collections::VecDeque::new()));
-    // Decode-recovery keyframe asks (the ABR recovery signal): the control task counts every
-    // outbound `CtrlRequest::Keyframe` — the one choke point all emitters funnel through — and
-    // the pump drains the count per report window.
+    // Outbound `CtrlRequest::Keyframe` count (the one choke point). Pump drains per report window.
     let recovery_kf = Arc::new(AtomicU32::new(0));
-    // Host-announced capture/encode pipeline rebuilds (`PipelineGap`): the control task parks the
-    // gap's length here and the pump drains it every iteration, discarding the report window in
-    // flight. A host-local rebuild starves a window of stream without the link doing anything
-    // wrong, and the controller cannot tell that apart from congestion on its own.
+    // Host `PipelineGap` length. A local rebuild starves a window without the
+    // link failing; drain and discard the in-flight report or ABR sees congestion.
     let pipeline_gap = Arc::new(AtomicU32::new(0));
-    // Host-encode-latency accumulator (the ABR encode signal, see [`EncodeLatAcc`]): the
-    // datagram task adds one sample per 0xCF; the pump drains a window mean per report tick.
+    // ABR encode signal ([`EncodeLatAcc`]): datagram task samples 0xCF; pump drains a window mean.
     let encode_lat = Arc::new(Mutex::new(super::frame_channel::EncodeLatAcc::default()));
-    // Bumped by the control task on every accepted mode switch (the `clock_gen` pattern): the
-    // pump resets the controller's mode-scoped learned state (host cap, encode baseline).
+    // Bumped on an accepted mode switch (`clock_gen` pattern). Pump resets host cap and encode baseline.
     let mode_gen = Arc::new(AtomicU32::new(0));
 
-    // Control task (see [`control_task`]): the handshake stream stays open for mid-stream
-    // renegotiation, speed tests, clock re-sync, and clipboard metadata.
-    // The data pump re-reads the accepted mode when `mode_gen` moves, to re-size the ABR's
-    // frame-budget-scaled encode thresholds for the new refresh.
+    // Handshake stream stays open ([`control_task`]). When `mode_gen` moves, the
+    // data pump re-sizes ABR encode thresholds for the new refresh.
     let mode_slot_pump = mode_slot.clone();
     tokio::spawn(
         control_task::ControlTask {
@@ -246,7 +214,6 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         .run(),
     );
 
-    // Datagram demux (see [`datagram_task`]): host → client audio/rumble/HID/HDR/timing planes.
     tokio::spawn(datagram_task::run(
         conn.clone(),
         audio_tx,
@@ -260,30 +227,24 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         cursor_state_tx,
     ));
 
-    // Clipboard task: the fetch-stream accept loop (host pulls what we offered) + outbound fetches
-    // (we pull what the host offered). Metadata (enable/offer/state) rides the control task above;
-    // only bulk bytes flow here. Dies with the connection (accept_bi errors) or when the embedder
-    // drops the command sender. Always spawned — a host without HOST_CAP_CLIPBOARD simply never
-    // opens a clip stream, and our control-plane offers hit its "unknown message" arm harmlessly.
+    // Bulk clip bytes only; metadata rides the control task. Always spawned: a
+    // host without HOST_CAP_CLIPBOARD never opens a clip stream, and offers miss.
     tokio::spawn(crate::clipboard::run(
         conn.clone(),
         clip_event_tx,
         clip_cmd_rx,
     ));
 
-    // Watch for connection close → stop the pump, and classify WHY.
+    // Connection close: classify, then shutdown.
     {
         let shutdown = shutdown.clone();
         let end_reason = end_reason.clone();
         let conn = conn.clone();
         tokio::spawn(async move {
             let why = conn.closed().await;
-            // Latch the reason BEFORE `shutdown`: the two are observed by different threads, and a
-            // client that reacts to the shutdown flag must never find the reason still unset.
+            // Reason before `shutdown`: different threads observe the two; the flag must not win.
             let reason = crate::client::PunktfunkEndReason::from(&why);
-            // A typed rejection code on a MID-SESSION close (access expiry, and whatever the
-            // vocabulary grows next) rides beside the coarse reason, same ordering discipline,
-            // so the embedder's end path can say the real sentence instead of "host error".
+            // Mid-session typed close (access expiry, …) beside the coarse reason, same order.
             if let Some(r) = reject_from_close(&conn) {
                 end_reject_code.store(r.close_code(), Ordering::SeqCst);
             }
@@ -292,7 +253,6 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         });
     }
 
-    // Data-plane pump on a blocking thread (see [`data::DataPump`]).
     let pump = data::DataPump {
         session,
         frames,
@@ -323,19 +283,15 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     };
     let _ = tokio::task::spawn_blocking(move || pump.run()).await;
 
-    // Deliberate quit (a user "stop") closes with the quit code → the host skips the keep-alive
-    // linger; a plain drop / disconnect closes with 0 → the host lingers so a reconnect can resume.
+    // Quit code: host skips keep-alive linger. Close 0: host lingers for reconnect.
     let close_code = if quit.load(Ordering::SeqCst) {
         crate::quic::QUIT_CLOSE_CODE
     } else {
         0
     };
     conn.close(close_code.into(), b"client closed");
-    // Flush the CONNECTION_CLOSE before the runtime is dropped (the same discipline as the pairing
-    // + probe paths). `close` only queues the frame — the endpoint driver puts it on the wire, and
-    // this fn is the body of a `block_on` whose runtime is dropped the instant it returns, so
-    // without this the driver could simply never be polled again. The host then saw a deliberate
-    // quit as silence: no `QUIT_CLOSE_CODE`, an 8 s idle timeout, and the keep-alive linger meant
-    // for an UNWANTED disconnect. Bounded — a host already gone must not delay the client's exit.
+    // `close` only queues; this `block_on` drops the runtime on return, so flush
+    // or the driver never runs and a quit is silence. Bounded so a gone host
+    // does not delay exit.
     let _ = tokio::time::timeout(std::time::Duration::from_millis(300), ep.wait_idle()).await;
 }

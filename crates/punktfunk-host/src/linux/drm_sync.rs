@@ -1,22 +1,16 @@
-//! Minimal DRM timeline-syncobj operations — the consumer side of PipeWire explicit sync
-//! (`SPA_META_SyncTimeline`).
+//! Consumer-side DRM timeline-syncobj wait/signal for PipeWire
+//! `SPA_META_SyncTimeline`.
 //!
-//! RETAINED BUT CURRENTLY UNUSED: producer-driven explicit sync is the "right" fix, but no
-//! compositor we target produces a usable sync_fd today — Mutter+NVIDIA fails buffer allocation
-//! (`error alloc buffers`, no cogl sync_fd), KWin/gamescope blit so they don't race at all. We sync
-//! zero-copy from the consumer side instead (see `pf_zerocopy::dmabuf_fence`). This module is kept,
-//! verified (ioctl numbers + a live signal→wait round trip), ready to wire in the moment a producer
-//! gains working `SPA_META_SyncTimeline`.
+//! Unused: no target compositor ships a usable producer `sync_fd`.
+//! Zero-copy waits the consumer dmabuf fence instead
+//! (`pf_zerocopy::dmabuf_fence`). Kept compiled and ioctl-locked so a
+//! producer can be wired without rediscovering request numbers.
+//!
+//! Syncobjs are DRM-core; any render node can import and wait them.
+//! This opens `/dev/dri/renderD128` independently of the capture GPU.
+//!
+//! Pin: `ioctl_numbers_match_drm_h`, `signal_then_wait_roundtrip`.
 #![allow(dead_code)]
-//!
-//! Compositors that render directly into the PipeWire buffer pool (Mutter's virtual
-//! monitors) hand buffers over at GPU-submit time; on drivers without implicit dmabuf
-//! fencing (NVIDIA) reading immediately races the render and shows the buffer's
-//! *previous* contents. With explicit sync the producer attaches a timeline syncobj:
-//! wait the acquire point before touching the buffer, signal the release point when done.
-//!
-//! Syncobjs are DRM-core objects: any render node can import and wait them, so this
-//! opens its own fd independent of the capture GPU path.
 
 use anyhow::{bail, Result};
 use std::os::fd::RawFd;
@@ -90,7 +84,6 @@ impl DrmSync {
         Ok(DrmSync { fd })
     }
 
-    /// Import a syncobj fd into a (temporary) handle on our device.
     fn import(&self, syncobj_fd: RawFd) -> Result<u32> {
         let mut req = DrmSyncobjHandle {
             fd: syncobj_fd,
@@ -116,8 +109,7 @@ impl DrmSync {
         unsafe { libc::ioctl(self.fd, DRM_IOCTL_SYNCOBJ_DESTROY, &mut req) };
     }
 
-    /// Block until `point` on the producer's timeline is signaled (the buffer's contents
-    /// are ready), or `timeout_ms` passes.
+    /// Buffer contents are ready only after this returns Ok.
     pub fn wait_point(&self, syncobj_fd: RawFd, point: u64, timeout_ms: u64) -> Result<()> {
         let handle = self.import(syncobj_fd)?;
         let mut now = libc::timespec {
@@ -152,9 +144,7 @@ impl DrmSync {
         Ok(())
     }
 
-    /// Signal `point` on the consumer release timeline — the producer may reuse the
-    /// buffer. Must be called for every buffer that carried sync metadata, even when the
-    /// frame was skipped, or the producer stalls waiting for it.
+    /// Producer may reuse the buffer. Signal skipped frames too or it stalls.
     pub fn signal_point(&self, syncobj_fd: RawFd, point: u64) -> Result<()> {
         let handle = self.import(syncobj_fd)?;
         let handles = [handle];
@@ -191,13 +181,11 @@ fn errno() -> std::io::Error {
     std::io::Error::last_os_error()
 }
 
-// `DrmSync::open` must not panic the PipeWire thread; everything is Result-based and the
-// caller degrades to unsynchronized capture (with a loud warning) when it fails.
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The ioctl numbers must match drm.h exactly — computed, so lock them down.
+    /// Computed `_IOWR` numbers; lock them to drm.h.
     #[test]
     fn ioctl_numbers_match_drm_h() {
         assert_eq!(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, 0xC010_64C2);
@@ -206,14 +194,13 @@ mod tests {
         assert_eq!(DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, 0xC018_64CD);
     }
 
-    /// Round-trip against the real DRM device when one exists (CI containers skip).
+    /// Live render node; missing `/dev/dri` returns early (CI).
     #[test]
     fn signal_then_wait_roundtrip() {
         let Ok(sync) = DrmSync::open() else {
             eprintln!("no render node — skipping");
             return;
         };
-        // Create a fresh syncobj (CREATE = 0xBF), export it, signal point 1, wait point 1.
         #[repr(C)]
         #[derive(Default)]
         struct Create {
