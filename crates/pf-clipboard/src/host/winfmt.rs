@@ -1,51 +1,43 @@
-//! Pure byte conversions between the Win32 clipboard formats and the portable wire MIMEs
-//! (`design/clipboard-and-file-transfer.md` §3.5). Kept free of any `windows`-crate dependency so it
-//! compiles on every host and its unit tests exercise the fiddly bits (CF_HTML offset math, UTF-16
-//! (de)serialization) without a Windows box. The [`super::windows`] backend is the only production
-//! consumer; it wraps these with the actual `GetClipboardData`/`SetClipboardData` calls.
+//! Win32 clipboard format ↔ portable wire MIME conversions
+//! (`design/clipboard-and-file-transfer.md` §3.5). No `windows` crate, so the
+//! conversions compile and unit-test on every host. [`super::windows`] is the
+//! only production caller (`GetClipboardData` / `SetClipboardData`).
 //!
-//! Format map (Win32 ↔ wire):
 //! * `CF_UNICODETEXT` (UTF-16LE + NUL) ↔ `text/plain;charset=utf-8`
 //! * `"HTML Format"` (CF_HTML, UTF-8 + ASCII header) ↔ `text/html`
 //! * `"Rich Text Format"` (raw RTF) ↔ `text/rtf`
-//! * `"PNG"` (raw PNG) ↔ `image/png` — identity, handled inline by the backend.
+//! * `"PNG"` (raw PNG) ↔ `image/png` — identity, handled by the backend.
 
-// ---- CF_UNICODETEXT ↔ text/plain;charset=utf-8 -----------------------------------------------
-
-/// `CF_UNICODETEXT` HGLOBAL bytes → UTF-8 wire bytes. `raw` is the exact `GlobalSize`-length buffer;
-/// it holds little-endian UTF-16 code units terminated by a single `0x0000`.
+/// `CF_UNICODETEXT` HGLOBAL → UTF-8. `raw` is the `GlobalSize` buffer:
+/// little-endian UTF-16 with one trailing `0x0000`.
 pub fn text_from_utf16(raw: &[u8]) -> Vec<u8> {
-    // Reinterpret each LE 2-byte pair as a UTF-16 code unit; a stray odd trailing byte (never present
-    // in valid data) is dropped by `chunks_exact`.
+    // Odd trailing byte (invalid CF_UNICODETEXT) is dropped by `chunks_exact`.
     let mut units: Vec<u16> = raw
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
-    // Strip exactly one trailing NUL terminator if present (guard against eating a real code unit).
+    // One trailing NUL only — a real U+0000 code unit must survive.
     if units.last() == Some(&0) {
         units.pop();
     }
     String::from_utf16_lossy(&units).into_bytes()
 }
 
-/// UTF-8 wire bytes → `CF_UNICODETEXT` HGLOBAL bytes (UTF-16LE + a required `0x0000` terminator).
+/// UTF-8 → `CF_UNICODETEXT` (UTF-16LE + required `0x0000` terminator).
 pub fn text_to_utf16(wire: &[u8]) -> Vec<u8> {
     let s = String::from_utf8_lossy(wire);
     let mut out = Vec::with_capacity(wire.len() * 2 + 2);
     for u in s.encode_utf16() {
         out.extend_from_slice(&u.to_le_bytes());
     }
-    out.extend_from_slice(&0u16.to_le_bytes()); // REQUIRED NUL terminator for CF_UNICODETEXT
+    out.extend_from_slice(&0u16.to_le_bytes());
     out
 }
 
-// ---- "HTML Format" (CF_HTML) ↔ text/html -----------------------------------------------------
-//
-// CF_HTML is UTF-8: an ASCII `Key:Value\r\n` header carrying byte offsets, then the HTML with
-// `<!--StartFragment-->`/`<!--EndFragment-->` markers. Offsets are byte counts from buffer start;
-// the offsets live *inside* the header, so their digit-width feeds back into the header length. The
-// spec-blessed fix (Chromium/Firefox/LibreOffice) is fixed-width 10-digit zero-padded offsets, which
-// makes the header a compile-time constant and every offset a one-pass computation.
+// CF_HTML: ASCII `Key:Value\r\n` offsets, then HTML. Offsets are bytes from
+// buffer start and live *inside* the header, so digit width changes the
+// length. Fixed 10-digit zero-pad (Chromium/Firefox/LibreOffice) makes the
+// header a compile-time constant.
 
 const CF_HTML_HEADER: &str = "Version:0.9\r\n\
     StartHTML:0000000000\r\n\
@@ -55,13 +47,13 @@ const CF_HTML_HEADER: &str = "Version:0.9\r\n\
 const CF_HTML_PREFIX: &str = "<html><body>\r\n<!--StartFragment-->";
 const CF_HTML_SUFFIX: &str = "<!--EndFragment-->\r\n</body></html>";
 
-/// UTF-8 HTML fragment (wire bytes) → a `CF_HTML` buffer, NUL-terminated. The trailing NUL is the
-/// conventional CF_HTML expectation (§4); `EndHTML` still points at content end, before the NUL.
+/// UTF-8 fragment → `CF_HTML` + trailing NUL. `EndHTML` is the content end,
+/// before that NUL (CF_HTML §4).
 pub fn html_to_cf(wire: &[u8]) -> Vec<u8> {
     let fragment = String::from_utf8_lossy(wire);
-    let start_html = CF_HTML_HEADER.len(); // 105
-    let start_fragment = start_html + CF_HTML_PREFIX.len(); // 139
-    let end_fragment = start_fragment + fragment.len(); // byte length — fragment may be multibyte
+    let start_html = CF_HTML_HEADER.len();
+    let start_fragment = start_html + CF_HTML_PREFIX.len();
+    let end_fragment = start_fragment + fragment.len(); // UTF-8 bytes, not chars
     let end_html = end_fragment + CF_HTML_SUFFIX.len();
 
     let mut buf = Vec::with_capacity(end_html + 1);
@@ -70,24 +62,22 @@ pub fn html_to_cf(wire: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(fragment.as_bytes());
     buf.extend_from_slice(CF_HTML_SUFFIX.as_bytes());
 
-    // Overwrite the four zero-padded fields in place, restricting the search to the header region so a
-    // fragment that happens to contain "StartHTML:" can't fool the patcher.
+    // Patch only the header so a fragment containing "StartHTML:" cannot match.
     patch_offset(&mut buf[..start_html], b"StartHTML:", start_html);
     patch_offset(&mut buf[..start_html], b"EndHTML:", end_html);
     patch_offset(&mut buf[..start_html], b"StartFragment:", start_fragment);
     patch_offset(&mut buf[..start_html], b"EndFragment:", end_fragment);
 
-    buf.push(0); // conventional NUL terminator
+    buf.push(0);
     buf
 }
 
-/// A `CF_HTML` buffer → the UTF-8 HTML fragment (wire bytes). Uses the `StartFragment`/`EndFragment`
-/// offsets; falls back to `StartHTML`/`EndHTML`, then to the whole buffer, if the markers are absent.
+/// `CF_HTML` → UTF-8 fragment via `StartFragment`/`EndFragment`; falls back
+/// to `StartHTML`/`EndHTML`, then the whole buffer.
 pub fn html_from_cf(raw: &[u8]) -> Vec<u8> {
     let range = header_range(raw, b"StartFragment:", b"EndFragment:")
         .or_else(|| header_range(raw, b"StartHTML:", b"EndHTML:"));
     match range {
-        // Content is UTF-8 per spec; return the exact slice (drop any trailing NUL for cleanliness).
         Some((start, end)) => {
             let slice = &raw[start..end];
             strip_trailing_nul(slice).to_vec()
@@ -96,7 +86,6 @@ pub fn html_from_cf(raw: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Resolve `[start_label .. end_label]` into a validated byte range within `raw`.
 fn header_range(raw: &[u8], start_label: &[u8], end_label: &[u8]) -> Option<(usize, usize)> {
     let start = read_header_offset(raw, start_label)?;
     let end = read_header_offset(raw, end_label)?;
@@ -107,7 +96,6 @@ fn header_range(raw: &[u8], start_label: &[u8], end_label: &[u8]) -> Option<(usi
     }
 }
 
-/// Overwrite the 10 ASCII digits following `label` in `header` with `value`, zero-padded.
 fn patch_offset(header: &mut [u8], label: &[u8], value: usize) {
     if let Some(pos) = find(header, label) {
         let at = pos + label.len();
@@ -118,8 +106,8 @@ fn patch_offset(header: &mut [u8], label: &[u8], value: usize) {
     }
 }
 
-/// Read the decimal integer following `label:` in the ASCII header. The colon-suffixed labels only
-/// match in the header, never the marker comments (`<!--StartFragment-->`) or fragment text.
+/// Decimal after `label:` (`StartFragment:`). The colon keeps this off the
+/// `<!--StartFragment-->` marker and any fragment text.
 fn read_header_offset(raw: &[u8], label: &[u8]) -> Option<usize> {
     let mut at = find(raw, label)? + label.len();
     let mut n: usize = 0;
@@ -130,7 +118,7 @@ fn read_header_offset(raw: &[u8], label: &[u8]) -> Option<usize> {
             any = true;
             at += 1;
         } else {
-            break; // stops at '\r'
+            break;
         }
     }
     any.then_some(n)
@@ -143,10 +131,8 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-// ---- "Rich Text Format" ↔ text/rtf -----------------------------------------------------------
-
-/// `"Rich Text Format"` HGLOBAL bytes → RTF wire bytes. RTF is `{ }`-delimited; some producers append
-/// a NUL past the final `}`, so strip a single trailing NUL to keep the wire payload byte-clean.
+/// `"Rich Text Format"` HGLOBAL → RTF. Strip one trailing NUL some producers
+/// append past the final `}`.
 pub fn rtf_from_cf(raw: &[u8]) -> Vec<u8> {
     strip_trailing_nul(raw).to_vec()
 }
@@ -158,28 +144,16 @@ fn strip_trailing_nul(b: &[u8]) -> &[u8] {
     }
 }
 
-// ---- CF_DIB ↔ image/png ------------------------------------------------------------------------
-//
-// Most Windows apps speak the bitmap clipboard family (`CF_DIB`, from which Windows synthesizes
-// `CF_BITMAP`/`CF_DIBV5`), not the registered `"PNG"` format — so images only interoperate when
-// the backend converts. A CF_DIB HGLOBAL is a BMP file minus its 14-byte BITMAPFILEHEADER:
-// BITMAPINFOHEADER (or V4/V5) + optional palette/masks + pixel rows.
+// CF_DIB is a BMP minus the 14-byte BITMAPFILEHEADER (BITMAPINFOHEADER or
+// V4/V5, optional palette/masks, then rows). Windows synthesizes
+// `CF_BITMAP`/`CF_DIBV5` from it; the registered `"PNG"` format is rare.
 
-/// Image wire bytes (PNG / JPEG / GIF — any format the `image` crate sniffs) → `CF_DIB` HGLOBAL
-/// bytes (BITMAPINFOHEADER, 32bpp BGRA, BI_RGB, bottom-up). GIFs contribute their first frame.
-/// `None` when the bytes don't decode — the caller leaves the format unrendered (empty paste).
+/// PNG/JPEG/GIF (anything `image` sniffs) → `CF_DIB` (BITMAPINFOHEADER,
+/// 32bpp BGRA, BI_RGB, bottom-up). GIF uses frame 0. `None` = leave unrendered.
 pub fn image_to_dib(bytes: &[u8]) -> Option<Vec<u8>> {
-    // Bound the DECODE, not just the result.
-    //
-    // These bytes are client-supplied, and `load_from_memory` used the `image` crate's DEFAULT
-    // limits — 512 MiB of decode allowance — while the 32767 dimension check below only ran on the
-    // already-decoded image. So a small, valid PNG declaring enormous dimensions was allocated in
-    // full before anything rejected it: ~1000× amplification from a few KB of wire (2026-08-05
-    // review L-9). Limits applied here make the allocation refuse instead.
-    //
-    // The caps are the clipboard's own contract expressed up front: the same 32767 per side that
-    // is checked below (a CF_DIB cannot express more), and 256 MiB, which is more than the largest
-    // representable 32bpp image anyone pastes and far less than a memory-exhaustion primitive.
+    // Decode caps, not result caps: `image` defaults to 512 MiB and would
+    // allocate a huge declared size before the check below. 32767 is the
+    // CF_DIB per-side max; 256 MiB bounds the decode well below that.
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(32767);
     limits.max_image_height = Some(32767);
@@ -196,7 +170,7 @@ pub fn image_to_dib(bytes: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(40 + w * h * 4);
-    // BITMAPINFOHEADER: 32bpp BI_RGB needs no masks/palette; positive height = bottom-up rows.
+    // BITMAPINFOHEADER, 32bpp BI_RGB (no masks/palette). Positive height = bottom-up.
     out.extend_from_slice(&40u32.to_le_bytes()); // biSize
     out.extend_from_slice(&(w as i32).to_le_bytes()); // biWidth
     out.extend_from_slice(&(h as i32).to_le_bytes()); // biHeight (bottom-up)
@@ -205,7 +179,7 @@ pub fn image_to_dib(bytes: &[u8]) -> Option<Vec<u8>> {
     out.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
     out.extend_from_slice(&((w * h * 4) as u32).to_le_bytes()); // biSizeImage
     out.extend_from_slice(&[0u8; 16]); // XPels/YPels/ClrUsed/ClrImportant
-                                       // Rows bottom-up, pixels BGRA (32bpp rows are already 4-byte aligned).
+    // Bottom-up BGRA. 32bpp rows are already 4-byte aligned.
     for row in rgba.rows().rev() {
         for px in row {
             let [r, g, b, a] = px.0;
@@ -215,9 +189,8 @@ pub fn image_to_dib(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// `CF_DIB` HGLOBAL bytes → PNG wire bytes: prepend the BITMAPFILEHEADER a BMP decoder expects
-/// (computing the pixel offset from the header + palette/mask layout) and re-encode. `None` on
-/// any malformed input — the caller declines the fetch.
+/// `CF_DIB` → PNG: prepend the BITMAPFILEHEADER a BMP decoder expects
+/// (pixel offset from header + palette/masks). `None` on malformed input.
 pub fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
     if dib.len() < 40 {
         return None;
@@ -229,7 +202,7 @@ pub fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
     let bit_count = u16::from_le_bytes(dib[14..16].try_into().ok()?) as usize;
     let compression = u32::from_le_bytes(dib[16..20].try_into().ok()?);
     let clr_used = u32::from_le_bytes(dib[32..36].try_into().ok()?) as usize;
-    // Palette entries (≤8bpp) or BI_BITFIELDS masks follow the header before the pixels.
+    // Palette (≤8bpp) or BI_BITFIELDS masks sit between header and pixels.
     let palette = if bit_count <= 8 {
         (if clr_used != 0 {
             clr_used
@@ -237,8 +210,8 @@ pub fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
             1 << bit_count
         }) * 4
     } else if compression == 3 {
-        // BI_BITFIELDS: 3 DWORD masks (only when the header is a plain BITMAPINFOHEADER —
-        // V4/V5 headers already contain the masks within hdr_size).
+        // BI_BITFIELDS: 3 DWORD masks after a 40-byte BITMAPINFOHEADER.
+        // V4/V5 already store the masks inside `hdr_size`.
         if hdr_size == 40 {
             12
         } else {
@@ -267,36 +240,29 @@ mod tests {
 
     #[test]
     fn text_round_trips_and_handles_terminator() {
-        // UTF-8 → UTF-16LE+NUL → UTF-8.
         let wire = "héllo 🌍".as_bytes();
         let cf = text_to_utf16(wire);
-        // Ends with a single 0x0000 terminator.
         assert_eq!(&cf[cf.len() - 2..], &[0, 0]);
         assert_eq!(text_from_utf16(&cf), wire);
 
-        // A CF buffer *without* a terminator still decodes (no code unit eaten).
         let no_term: Vec<u8> = "hi".encode_utf16().flat_map(u16::to_le_bytes).collect();
         assert_eq!(text_from_utf16(&no_term), b"hi");
 
-        // Empty text → just the terminator → empty wire.
         assert_eq!(text_to_utf16(b""), vec![0, 0]);
         assert_eq!(text_from_utf16(&[0, 0]), b"");
     }
 
     #[test]
     fn cf_html_matches_the_spec_offsets() {
-        // The worked example from the format reference: fragment "Hello".
         let cf = html_to_cf(b"Hello");
         let s = String::from_utf8(cf.clone()).unwrap();
         assert!(s.contains("StartHTML:0000000105"), "{s}");
         assert!(s.contains("EndHTML:0000000178"), "{s}");
         assert!(s.contains("StartFragment:0000000139"), "{s}");
         assert!(s.contains("EndFragment:0000000144"), "{s}");
-        // The declared fragment range must slice back to exactly "Hello".
         let start = read_header_offset(&cf, b"StartFragment:").unwrap();
         let end = read_header_offset(&cf, b"EndFragment:").unwrap();
         assert_eq!(&cf[start..end], b"Hello");
-        // Trailing NUL present, and EndHTML points *before* it.
         assert_eq!(*cf.last().unwrap(), 0);
         assert_eq!(read_header_offset(&cf, b"EndHTML:").unwrap(), cf.len() - 1);
     }
@@ -316,8 +282,7 @@ mod tests {
 
     #[test]
     fn cf_html_extract_tolerates_foreign_producers() {
-        // A producer that adds SourceURL and uses Version 1.0 — offsets must still drive extraction,
-        // never a hardcoded 105-byte header.
+        // Offsets drive extraction; do not assume a 105-byte header.
         let fragment = "picked";
         let prefix = "<html><body><!--StartFragment-->";
         let header_body = format!(
@@ -328,7 +293,6 @@ mod tests {
             sf = 0,
             ef = 0,
         );
-        // Compute real offsets against this ad-hoc layout.
         let start_html = header_body.len();
         let start_fragment = start_html + prefix.len();
         let end_fragment = start_fragment + fragment.len();
@@ -343,7 +307,6 @@ mod tests {
 
     #[test]
     fn cf_html_extract_falls_back_without_markers() {
-        // No fragment markers at all → whole buffer (minus any NUL).
         let mut b = b"<p>no markers</p>".to_vec();
         assert_eq!(html_from_cf(&b), b"<p>no markers</p>");
         b.push(0);
@@ -354,13 +317,11 @@ mod tests {
     fn rtf_strips_one_trailing_nul() {
         assert_eq!(rtf_from_cf(br"{\rtf1 hi}"), br"{\rtf1 hi}");
         assert_eq!(rtf_from_cf(b"{\\rtf1 hi}\0"), br"{\rtf1 hi}");
-        // Only one NUL is stripped.
         assert_eq!(rtf_from_cf(b"x\0\0"), b"x\0");
     }
 
     #[test]
     fn png_dib_round_trip() {
-        // A 3x2 RGBA PNG with distinct corner pixels survives PNG -> DIB -> PNG.
         let mut png = Vec::new();
         let img = image::RgbaImage::from_fn(3, 2, |x, y| {
             image::Rgba([x as u8 * 40, y as u8 * 80, 200, 255])
@@ -369,7 +330,6 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
         let dib = image_to_dib(&png).expect("png -> dib");
-        // BITMAPINFOHEADER sanity: 40-byte header, 3x2, 32bpp.
         assert_eq!(u32::from_le_bytes(dib[0..4].try_into().unwrap()), 40);
         assert_eq!(i32::from_le_bytes(dib[4..8].try_into().unwrap()), 3);
         assert_eq!(i32::from_le_bytes(dib[8..12].try_into().unwrap()), 2);

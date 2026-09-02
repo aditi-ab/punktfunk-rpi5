@@ -1,21 +1,13 @@
-//! Host clipboard coordinator (`design/clipboard-and-file-transfer.md` §4.2).
+//! Host clipboard coordinator (`design/clipboard-and-file-transfer.md`).
 //!
-//! One async task per streaming session that bridges the real session clipboard (whichever
-//! [`super::HostClipboard`] backend this platform opened) to the QUIC clipboard plane. It owns all
-//! four data paths:
+//! One task per streaming session: the platform [`super::HostClipboard`] on one
+//! side, the QUIC clipboard plane on the other. Host copy becomes a [`ClipOffer`]
+//! on `offer_tx`; inbound `accept_bi` fetches read the host selection;
+//! [`ClipCoordCmd::RemoteOffer`] installs a lazy host source; [`ClipEvent::Paste`]
+//! opens an outbound fetch and fills the [`PasteResponder`].
 //!
-//! * **host copy → client** — a backend [`ClipEvent::Selection`] becomes a [`ClipOffer`] pushed to the
-//!   control loop (`offer_tx`), which forwards it to the client.
-//! * **client fetch of the host clipboard** — the fetch-stream `accept_bi` loop lives here; each
-//!   stream is answered by reading the current host selection ([`ClipboardBackend::read_current`]).
-//! * **client copy → host** — a [`ClipCoordCmd::RemoteOffer`] installs the client's formats as a lazy
-//!   host selection ([`HostClipboard::set_offer`]).
-//! * **host paste of client content** — a backend [`ClipEvent::Paste`] triggers an *outbound* fetch to
-//!   the client, whose bytes are handed to the backend's [`PasteResponder`].
-//!
-//! The coordinator is backend-agnostic (Linux data-control / Mutter, Windows Win32); the control loop
-//! reaches it through the portable [`ClipCoordCmd`] channel so the host's native control loop
-//! compiles on every host platform.
+//! Backend-agnostic. The control loop talks [`ClipCoordCmd`] so it compiles on
+//! every host platform.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -32,15 +24,11 @@ use punktfunk_core::quic::{
 use super::{ClipEvent, HostClipboard, PasteResponder};
 use crate::ClipCoordCmd;
 
-/// Upper bound on one outbound fetch (host pasting client content). A client that never answers must
-/// not hang the pasting host app's pipe read (§3.4) — the paste falls back to empty instead.
+/// 60 s: a silent client must not hang the host app's paste pipe; the paste then goes empty.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Open whichever host clipboard backend this session supports (data-control, else Mutter direct) and
-/// spawn the coordinator. Returns `true` when a live backend was bound (the caller's control loop
-/// then serves real clipboard data); `false` when none is available (gamescope, no live compositor),
-/// in which case the channels are dropped so the control loop reports `CLIP_REASON_BACKEND_UNAVAILABLE`
-/// and declines fetches defensively.
+/// `true` when a backend is bound. `false` drops the channels; the caller reports
+/// `CLIP_REASON_BACKEND_UNAVAILABLE` and declines fetches.
 pub async fn start(
     conn: quinn::Connection,
     clip_enabled: Arc<AtomicBool>,
@@ -66,8 +54,6 @@ pub async fn start(
     }
 }
 
-/// The coordinator loop. Multiplexes control-loop commands, backend clipboard events, and inbound
-/// fetch streams; exits when any of the three peers goes away (session ending).
 async fn run(
     conn: quinn::Connection,
     backend: Arc<HostClipboard>,
@@ -76,21 +62,19 @@ async fn run(
     mut cmd_rx: UnboundedReceiver<ClipCoordCmd>,
     offer_tx: UnboundedSender<ClipOffer>,
 ) {
-    // Seq of the offer the host most recently announced; a client fetch naming a different seq is
-    // stale (the host clipboard moved on) and is declined.
+    // Last announced host offer. A fetch naming another seq is stale.
     let host_seq = Arc::new(AtomicU32::new(0));
     let mut next_seq: u32 = 1;
-    // Seq of the client's most recent offer, echoed on the outbound fetch we open when a host app
-    // pastes client content (informational for the client's serve side).
+    // Client offer seq, echoed on the outbound fetch when a host app pastes.
     let mut client_seq: u32 = 0;
 
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
-                let Some(cmd) = cmd else { break }; // control loop gone → session ending
+                let Some(cmd) = cmd else { break };
                 match cmd {
                     ClipCoordCmd::SetEnabled(true) => {
-                        // A just-enabled client should see whatever the host already has copied.
+                        // Push the current host selection so enable is not a silent empty clipboard.
                         let mimes = backend.current_wire_mimes();
                         if !mimes.is_empty() {
                             let _ = offer_tx.send(build_offer(&mut next_seq, &host_seq, mimes));
@@ -102,11 +86,7 @@ async fn run(
                         }
                     }
                     ClipCoordCmd::RemoteOffer { seq, mimes } => {
-                        // Only while the client has sync on — with it off the device's grant was
-                        // revoked (or it never enabled sync at all), and its content must not go
-                        // on the host's real clipboard. Re-read HERE and not only at the sender:
-                        // the access lifecycle task clears the flag from another task, which can
-                        // land between the offer being queued and this arm running.
+                        // Re-check here: lifecycle can clear the flag after this offer was queued.
                         if clip_enabled.load(Ordering::SeqCst) {
                             client_seq = seq;
                             let res = if mimes.is_empty() {
@@ -122,21 +102,16 @@ async fn run(
                 }
             }
             ev = clip_rx.recv() => {
-                let Some(ev) = ev else { break }; // backend dispatch thread ended
+                let Some(ev) = ev else { break };
                 match ev {
                     ClipEvent::Selection { mimes } => {
-                        // Forward host copies (empty `mimes` = the clipboard was cleared) only while
-                        // the client has sync on — the offer is metadata; bytes still cross lazily.
                         if clip_enabled.load(Ordering::SeqCst) {
                             let _ = offer_tx.send(build_offer(&mut next_seq, &host_seq, mimes));
                         }
                     }
                     ClipEvent::Paste { mime, responder } => {
-                        // A host app is pasting the client's offered content: pull that format from
-                        // the client and hand it to the backend's responder. Off-task so the loop
-                        // keeps serving. The enable snapshot rides along like `serve_fetch`'s: a
-                        // paste that raced a revoke must not fetch from the client, even though
-                        // the selection it owned is being dropped in the same breath.
+                        // Off-task: the loop must keep serving. Snapshot `enabled` so a
+                        // revoke racing this paste cannot fetch from the client.
                         tokio::spawn(fetch_into_pipe(
                             conn.clone(),
                             client_seq,
@@ -149,9 +124,9 @@ async fn run(
                 }
             }
             accepted = conn.accept_bi() => {
-                let Ok((send, recv)) = accepted else { break }; // connection gone
-                // The control stream is already accepted at the handshake, so every stream here is a
-                // clipboard fetch. Serve it off-task (the read blocks on the source app's pipe).
+                let Ok((send, recv)) = accepted else { break };
+                // Handshake already took the control stream; every accept here is a fetch.
+                // Off-task: `read_current` blocks on the source app's pipe.
                 tokio::spawn(serve_fetch(
                     send,
                     recv,
@@ -162,12 +137,11 @@ async fn run(
             }
         }
     }
-    // Session ending: don't leave our lazy source as the compositor's active selection.
+    // Do not leave our lazy source as the compositor's selection after the session ends.
     let _ = backend.clear_offer();
 }
 
-/// Mint a [`ClipOffer`] for `mimes`, advancing the host offer seq (skipping 0, the "never offered"
-/// sentinel) and publishing it as the current one for staleness checks.
+/// Seq 0 is "never offered"; wrap skips it. Published on `host_seq` for staleness checks.
 fn build_offer(next_seq: &mut u32, host_seq: &AtomicU32, mimes: Vec<String>) -> ClipOffer {
     let seq = *next_seq;
     *next_seq = next_seq.wrapping_add(1);
@@ -182,8 +156,6 @@ fn build_offer(next_seq: &mut u32, host_seq: &AtomicU32, mimes: Vec<String>) -> 
     ClipOffer { seq, kinds }
 }
 
-/// Serve one inbound fetch stream (a client pulling the host clipboard): validate the header +
-/// request, then answer with the current host selection's bytes for the requested wire MIME.
 async fn serve_fetch(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
@@ -217,7 +189,6 @@ async fn serve_fetch(
         return;
     }
 
-    // `read_current` reads the host selection (a blocking pipe read, offloaded by the backend).
     match backend.read_current(&req.mime).await {
         Ok(data) => {
             let hdr = ClipFetchHdr {
@@ -228,17 +199,14 @@ async fn serve_fetch(
                 let _ = clipstream::write_data(&mut send, &data).await;
             }
         }
-        // The format vanished (clipboard changed mid-fetch) or the read failed → nothing to send.
+        // Clipboard moved or the read failed: decline UNAVAILABLE, not STALE (seq still matched).
         Err(_) => {
             let _ = clipstream::write_fetch_hdr(&mut send, &decline(CLIP_FETCH_UNAVAILABLE)).await;
         }
     }
 }
 
-/// Pull `mime` of the client's current offer (`seq`) over an outbound fetch stream and hand the bytes
-/// to the backend's paste `responder`. Any failure (timeout, decline, I/O) — or `enabled` being false,
-/// the client having lost the clipboard since the paste started — responds with empty bytes so the
-/// pasting host app gets an empty paste instead of hanging.
+/// Any failure or `enabled == false` responds empty so the host paste pipe does not hang.
 async fn fetch_into_pipe(
     conn: quinn::Connection,
     seq: u32,
@@ -264,7 +232,7 @@ async fn fetch_into_pipe(
         let data = clipstream::read_data(&mut recv, CLIP_FETCH_CAP)
             .await
             .ok()?;
-        drop(send); // clean close of our half
+        drop(send); // Finish our send half; do not `reset`.
         Some(data)
     })
     .await
