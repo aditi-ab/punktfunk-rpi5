@@ -34,6 +34,14 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 
 ### Added
 
+- **Windows connector and PnP mutations are leases.** Every monitor devnode the stream disables
+  is journaled before the mutation as a lease naming the node, its prior state, which selector
+  picked it (the default standby-sink treatment stays limited to displays that were dark before
+  the acquire; the opt-in path over displays the isolate switched off is tagged apart) and the
+  topology generation of the acquire transaction that owns it; a node the operator had already
+  disabled is never touched. The AMD EDID lock records the connectors it pinned and unlocks only
+  those, leaving a pre-existing emulation pin alone. The acquire isolate itself now runs as a
+  topology transaction. Older journals from a previous host still recover.
 - **Three Windows launch kinds: `uplay`, `amazon` and `battlenet`.** A library plugin publishes
   a validated store id and the host builds the launch itself: `explorer.exe "uplay://launch/<id>/0"`,
   `explorer.exe "amazon-games://play/<id>"`, and `Battle.net.exe --exec="launch <code>"`. All three

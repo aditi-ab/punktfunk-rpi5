@@ -243,7 +243,9 @@ fn isolate_displays_ccd_seam(keep: &[CcdTargetKey]) -> Option<SavedConfig> {
 
 /// [`isolate_displays_ccd_checked`] behind the same test seam — the re-assert watchdog's variant,
 /// whose recovery generation must follow the OBSERVED outcome (immunity plan WP10 item 4).
-fn isolate_displays_ccd_checked_seam(keep: &[CcdTargetKey]) -> Option<IsolateOutcome> {
+fn isolate_displays_ccd_checked_seam(
+    keep: &[CcdTargetKey],
+) -> Option<(SavedConfig, IsolateOutcome)> {
     #[cfg(test)]
     {
         use std::sync::atomic::Ordering;
@@ -256,7 +258,18 @@ fn isolate_displays_ccd_checked_seam(keep: &[CcdTargetKey]) -> Option<IsolateOut
             return None;
         }
     }
-    isolate_displays_ccd_checked(keep).map(|(_, outcome)| outcome)
+    isolate_displays_ccd_checked(keep)
+}
+
+/// The transaction outcome an isolate observed (immunity plan WP10 item 4 / WP11): only paths
+/// that verifiably switched off count as a change.
+fn isolate_txn_outcome(outcome: Option<IsolateOutcome>) -> pf_win_display::topology_churn::Outcome {
+    use pf_win_display::topology_churn::Outcome;
+    match outcome {
+        Some(IsolateOutcome::Verified { deactivated, .. }) if deactivated > 0 => Outcome::Changed,
+        Some(IsolateOutcome::Verified { .. } | IsolateOutcome::NothingActive) => Outcome::Unchanged,
+        Some(IsolateOutcome::Unverified { .. }) | None => Outcome::Unknown,
+    }
 }
 
 /// Consecutive re-assert rounds before the watchdog CONCEDES the fixed cadence (immunity plan
@@ -1087,7 +1100,7 @@ impl VirtualDisplayManager {
                             "re-asserting exclusive topology"
                         ),
                     }
-                    let outcome = isolate_displays_ccd_checked_seam(&keep);
+                    let outcome = isolate_displays_ccd_checked_seam(&keep).map(|(_, o)| o);
                     let changed = matches!(
                         outcome,
                         Some(IsolateOutcome::Verified { deactivated, .. }) if deactivated > 0
@@ -1339,7 +1352,21 @@ impl VirtualDisplayManager {
                                 inner.group.edid_locked =
                                     pf_win_display::adl_emul::lock_for_stream();
                             }
-                            inner.group.ccd_saved = isolate_displays_ccd_seam(&keep);
+                            // The acquire isolate is a topology TRANSACTION (immunity plan
+                            // WP10/WP11): descriptor-following holds for its deadline, the
+                            // generation moves only on an OBSERVED change, and the PnP leases
+                            // below are stamped with it.
+                            let txn = pf_win_display::topology_churn::begin(
+                                "acquire-isolate",
+                                Duration::from_secs(3),
+                            );
+                            let isolated = isolate_displays_ccd_checked_seam(&keep);
+                            let outcome = isolated.as_ref().map(|(_, o)| *o);
+                            inner.group.ccd_saved = isolated.map(|(saved, _)| saved);
+                            let finished = pf_win_display::topology_churn::finish(
+                                txn,
+                                isolate_txn_outcome(outcome),
+                            );
                             // After isolate, disable deactivated monitor PnP
                             // devnodes so standby wake events do not cascade.
                             // Evidence: `windows/monitor_devnode.rs`.
@@ -1347,7 +1374,9 @@ impl VirtualDisplayManager {
                                 if let Some(saved) = &inner.group.ccd_saved {
                                     inner.group.pnp_disabled =
                                         pf_win_display::monitor_devnode::disable_for_deactivated(
-                                            saved, added_key,
+                                            saved,
+                                            added_key,
+                                            finished.generation,
                                         );
                                 }
                             }
@@ -1453,6 +1482,7 @@ impl VirtualDisplayManager {
                     for id in pf_win_display::monitor_devnode::disable_connected_inactive(
                         &keep,
                         &baseline_active,
+                        pf_win_display::topology_churn::generation(),
                     ) {
                         if !inner.group.pnp_disabled.contains(&id) {
                             inner.group.pnp_disabled.push(id);
