@@ -10,7 +10,8 @@
 //!   subnet-directed broadcast and `255.255.255.255`;
 //! - from an unbound socket to `255.255.255.255` and, when known, the last
 //!   unicast IP;
-//! on ports 9 and 7, [`BURST`] times.
+//!
+//! Each MAC's packet goes to ports 9 and 7, [`BURST`] times.
 //!
 //! WoWLAN uses the same path: the AP buffers broadcast for sleeping stations
 //! and flushes on DTIM, but only if egress is the wireless NIC. Host-side
