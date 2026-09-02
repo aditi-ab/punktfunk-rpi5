@@ -45,6 +45,49 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 - **Six new library sources ship as plugins**: Ubisoft Connect, Amazon Games and Battle.net on
   Windows; desktop entries and Flatpak, Bottles and itch.io on Linux, itch.io on Windows too.
   Install them from the console's Game sources once they reach the catalog.
+- **Topology writes are transactions with an observed outcome.** `topology_churn::begin` /
+  `finish` name a mutation, hold descriptor-following for its deadline, and bump a topology
+  generation only when the verification read saw a change; `isolate_displays_ccd_checked`
+  reports Verified / NothingActive / Unverified instead of a snapshot that hides a failed isolate.
+  The exclusive re-assert watchdog bumps the stream's recovery generation only on an observed
+  change, and after four consecutive fights concedes the fixed cadence (2 s doubling to 60 s).
+  Descriptor samples name the generation they were taken under, so two strikes straddling a
+  transaction never pass the debounce, and a same-mode ring recovery refuses a target with no
+  active display path.
+- **`pf_frame::recovery` sequences staged recovery.** A pure coordinator opens one episode per
+  `Stalled` verdict and walks the ladder EncoderReset, RingReset, SwapChainReset,
+  PresentationReset, MonitorCycle, DriverCycle, CaptureFallback from the class's first actuator,
+  running each stage once under a deadline; a stage that applied still has to prove itself with
+  three new source sequences (republishes and cursor regens never count). Four episodes per ten
+  minutes, a doubling cooldown after failed ones (10 s to 5 min), one summary per episode, and
+  `owns_episode` so passive descriptor reactions stand down. Actuators wire in with WP6/WP7/WP14.
+- **IDD-push fence-ring protocol layer (`pf_driver_proto::frame::fence`).** A v4 header appends
+  a 32-byte per-slot record (state, seq, producer-ready and consumer-retire fence values) after
+  the v3 tail; `SetFrameChannelRequestV2` carries the two shared fence handles behind the v1
+  request as an exact prefix, on the same IOCTL. Pure claim/pick rules (free, else oldest
+  published, else drop; newest-wins consume with older publishes freed) and a randomized
+  two-party trace test. The pf-vdisplay driver implements its arm: it opens delivered fences
+  with `ID3D11Device5::OpenSharedFence`, advertises `CAP_FENCE_RING` when that succeeds, and
+  runs the fence protocol only where the host advertised it too (CAS claim, GPU `Wait` on the
+  consumer-retire value, copy, `Signal` producer-ready, then PUBLISHED); the v2 request is told
+  from v1 by input length. The host arm follows; until then every ring stays on the keyed mutex.
+  two-party trace test. Both sides still run the keyed-mutex ring; the driver and host arms
+  that negotiate `CAP_FENCE_RING` follow.
+- **`pf_win_display` has a display actor with a cached snapshot.** The display-events pump now
+  owns the CCD inventory read for hot paths: every `WM_DISPLAYCHANGE` / device broadcast schedules
+  one coalesced refresh (150 ms) instead of querying inside the window procedure, a 15 s safety
+  timer covers a missed broadcast, and a failed query keeps the last-known-good snapshot labelled
+  with its age and backs off (1 s doubling to 15 s). `display_events::{snapshot, request_refresh,
+  wait_for_change, refresh_and_wait}` are the API; `TargetInventory` gains `hdr`, `source_id` and
+  `source_adapter_luid`, and `CcdTargetKey` / `TargetInventory` move to the platform-neutral
+  `snapshot` module (re-exported from `win_display`).
+- **Hot display readers take the snapshot, not the display-config lock.** The descriptor poller
+  (HDR flag + active mode), the cursor poller's target rect, the compose kick's geometry, the
+  absolute-input stream rect, the scanline probe's retarget, the exclusive re-assert watchdog and
+  the management monitor listing all read `display_events::snapshot`; the watchdog wakes on a
+  topology generation instead of polling. At rest a session makes zero CCD reads beyond the
+  actor's 15 s safety refresh. The host starts the actor at `serve`, and a not-yet-started actor
+  falls back to one direct read (`snapshot_or_query`).
 - **IDD-push shared header v3 carries ring health.** The 88-byte header grows a 64-byte tail:
   a health state (`Initializing`/`Active`/`Rebuilding`/`Dead`), driver and host capability
   words negotiated by intersection, assignment and D3D-device epochs, a source sequence that
@@ -117,6 +160,16 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 - **`inhibit_shortcuts` applies under the desktop mouse model on the Apple client.** It gated the
   ⌘-chord passthrough and the system-shortcut tap on the capture model only, unlike the SDL
   clients; turn the setting off to keep the chords local.
+- **Pairing toasts fire once, on a live knock only.** The event stream closes its ring replay
+  with one `event: live` frame, the console and `ctl watch` stay quiet before it, and the Omarchy
+  panel leaves the toast to the `pairing-pending` hook. A `ctl watch` consumer that wants the
+  replay passes `--since 0`.
+- **Menu backs out of every tvOS screen: the Shortcuts page, the connect takeover and a drilled
+  library shelf, and the quick-action ring shows one highlight.** Nothing to do; the Siri Remote
+  now drives the ring too (swipe steps, click fires, Play/Pause recentres, Back closes).
+- **The Siri Remote pointer no longer jumps toward wherever the surface is touched.** Contact
+  and lift now come from the surface's touch report and the first 60 ms after contact are
+  dropped, so only a swipe moves the host cursor; nothing to do.
 
 ### Fixed
 

@@ -53,13 +53,16 @@ pub(super) fn kick_dwm_compose(ccd: pf_win_display::win_display::CcdTargetKey) {
     let mut pos = POINT::default();
     // SAFETY: `pos` is a valid out-param for this call.
     let have_pos = unsafe { GetCursorPos(&mut pos) }.is_ok();
-    let rect = pf_win_display::win_display::source_desktop_rect(ccd);
+    // Geometry from the display actor's snapshot (immunity plan WP9): CCD-derived (the global
+    // database, NOT per-session GDI metrics, so the aim is right even from a non-console session)
+    // without a display-config query on this capture/encode thread.
+    let snap = pf_win_display::display_events::snapshot();
+    let rect = snap.source_rect(ccd);
     // HID-first (see the doc comment): the registered virtual-mouse kick works from any
-    // session/desktop and wakes an off display. Both geometries come from CCD (global database),
-    // NOT per-session GDI metrics, so the aim is right even from a non-console session. Fall
-    // through to SendInput only when the hook isn't registered / the mouse isn't up.
+    // session/desktop and wakes an off display. Fall through to SendInput only when the hook
+    // isn't registered / the mouse isn't up.
     if let (Some(kick), Some(rect)) = (crate::HID_COMPOSE_KICK.get(), rect) {
-        let bounds = pf_win_display::win_display::desktop_bounds();
+        let bounds = snap.desktop_bounds();
         if let Some(bounds) = bounds {
             if kick(rect, bounds) {
                 return;

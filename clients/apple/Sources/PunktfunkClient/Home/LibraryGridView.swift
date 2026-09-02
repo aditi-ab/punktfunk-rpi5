@@ -46,8 +46,11 @@ struct LibraryGridView: View {
     @State private var input = GamepadMenuInput(manager: .shared)
     @State private var haptics = MenuHaptics(manager: .shared)
     #if os(tvOS)
-    /// tvOS: the focus engine is the navigation authority — `focusID` chases it.
+    /// tvOS: the focus engine is the navigation authority — `focusID` chases it, and a poll-driven
+    /// jump (L1/R1) chases back into it.
     @FocusState private var tvFocus: String?
+    /// When the engine last moved focus — see `wire` for the ▲-off-the-top-row race.
+    @State private var lastEngineMove = Date.distantPast
     #endif
     /// The column the user last CHOSE (a horizontal move), carried across vertical ones.
     @State private var colHint = 0
@@ -174,6 +177,11 @@ struct LibraryGridView: View {
             .onChange(of: contentReady) { _, _ in armEntrance() }
             .onChange(of: controllerActive) { _, active in
                 if active { input.start() } else { input.stop() }
+                #if os(tvOS)
+                // The cells were disabled meanwhile, so the engine dropped focus: seat it back
+                // on the cursor once they are enabled again (next pass, hence the hop).
+                if active { DispatchQueue.main.async { tvFocus = focusID } }
+                #endif
             }
             #if os(tvOS)
             // Land initial focus on the seeded cell, then chase focus into `focusID`.
@@ -181,10 +189,18 @@ struct LibraryGridView: View {
             .onChange(of: tvFocus) { _, id in
                 guard let id, id != focusID, let i = games.firstIndex(where: { $0.id == id })
                 else { return }
+                lastEngineMove = Date()
                 haptics.move()
                 colHint = shape.cell(of: i).col
                 focusID = id
             }
+            // The other direction: a shoulder page or a list reconcile moved the cursor, so real
+            // focus follows — otherwise the ring sat on one cell and the next dpad press moved
+            // from another.
+            .onChange(of: focusID) { _, id in
+                if let id, tvFocus != id { tvFocus = id }
+            }
+            .gamepadExitCommand(onBack)
             #endif
             .onDisappear {
                 input.stop()
@@ -225,6 +241,9 @@ struct LibraryGridView: View {
                     cell(game, index: index, width: g.cellW, height: g.cellH, k: g.k, shape: g.shape)
                 }
                 .buttonStyle(ConsoleBareButtonStyle())
+                // Unfocusable while the tray or a menu owns the pad — the engine kept moving the
+                // ring under the tray on every ◀▶ meant for the sort.
+                .disabled(!controllerActive)
                 .focused($tvFocus, equals: game.id)
                 #else
                 cell(game, index: index, width: g.cellW, height: g.cellH, k: g.k, shape: g.shape)
@@ -342,12 +361,27 @@ struct LibraryGridView: View {
     }
 
     private func wire() {
-        input.onMove = { move($0) }
-        input.onConfirm = { activate() }
         input.onSecondary = onSecondary
         input.onTertiary = onTertiary
-        input.onBack = onBack
         input.onShoulder = { right in page(forward: right) }
+        #if os(tvOS)
+        // The focus engine owns move/confirm/back (the carousel's rule) — stepping here as well
+        // double-moved every dpad press. ▲ off the top row is the one move it cannot make, and
+        // the poll may read the press before or after the engine moves focus up a row, so wait
+        // a few frames: only a press that moved nothing leaves the field.
+        input.onMove = { direction in
+            guard direction == .up else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                guard Date().timeIntervalSince(lastEngineMove) > 0.08,
+                      shape.cell(of: cursor).row == 0 else { return }
+                onUp?()
+            }
+        }
+        #else
+        input.onMove = { move($0) }
+        input.onConfirm = { activate() }
+        input.onBack = onBack
+        #endif
     }
 
     private func move(_ direction: GamepadMenuInput.Direction) {

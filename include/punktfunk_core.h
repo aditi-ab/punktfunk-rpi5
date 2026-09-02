@@ -12,278 +12,66 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-// Bump on any breaking change to the [C ABI](crate::abi). Mirrors
-// `punktfunk_abi_version()` and is checked by clients before use.
+// C-ABI generation. Mirrors `punktfunk_abi_version()`; embedders abort on mismatch.
 //
-// v2: `punktfunk_connect` gained `client_cert_pem`/`client_key_pem` (pairing identities);
-// added `punktfunk_pair` / `punktfunk_generate_identity` / `punktfunk_connection_request_mode`.
-// v3: added `punktfunk_wake_on_lan` (Wake-on-LAN magic packet; the host's wake MAC(s) reach
-// clients out-of-band via the mDNS `mac` TXT record, so no connection is required to wake).
-// v4: added `punktfunk_probe` (bounded, trust-agnostic, mDNS-independent reachability handshake —
-// the display-side companion to dial-first, so saved-host "online" pips reflect real reachability).
-// v5: added `punktfunk_connection_next_rumble2` (rumble pull that also yields the self-terminating
-// TTL of a v2 envelope; `punktfunk_connection_next_rumble` is unchanged and drops it). Additive —
-// the wire is backward-compatible (the envelope is a length-tolerant tail on 0xCA), so
-// [`WIRE_VERSION`] is unchanged.
-// v6: added the `punktfunk_reanchor_gate_*` surface (post-loss freeze-until-reanchor gate for the
-// Swift client; Rust embedders use [`reanchor::ReanchorGate`] directly). Additive, client-local —
-// no wire change, so [`WIRE_VERSION`] is unchanged.
-// v7: added `punktfunk_connect_ex8` (`status_out` — typed connect-failure reporting, including
-// the host-rejection block `PUNKTFUNK_STATUS_REJECTED_*` decoded from the host's QUIC
-// application close) and the `PunktfunkStatus` −20 block itself. Additive — the close codes are
-// new application-close vocabulary an old peer simply never sends/reads, so [`WIRE_VERSION`] is
-// unchanged.
-// v8: added the shared-clipboard client surface — `punktfunk_connection_host_caps` and
-// `punktfunk_connection_clipboard_{control,offer,fetch,serve,cancel}` +
-// `punktfunk_connection_next_clipboard`. Additive; the wire grows only backward-compatible control
-// messages (0x40-0x44) and a new `Welcome::host_caps` bit, so [`WIRE_VERSION`] is unchanged.
-// v9: `PunktfunkFrame` grew `received_ns` — the reassembly-completion receipt stamp, so
-// embedders stop stamping receipt at the hand-off pull (which folds the pre-decode queue wait
-// into apparent network latency). Struct-size change on the frame poll surface = a hard ABI
-// break for embedders reading `PunktfunkFrame`; nothing on the wire moved, so [`WIRE_VERSION`]
-// is unchanged.
-// v10: added `punktfunk_connection_clock_offset_now_ns` — the LIVE (mid-stream re-synced)
-// clock offset ongoing latency math must use; the connect-time getter stays frozen by
-// contract. Additive, client-local — no wire change, so [`WIRE_VERSION`] is unchanged.
-// v11: added `punktfunk_connect_ex9` — `connect_ex8` plus a `client_caps` bitfield
-// (`PUNKTFUNK_CLIENT_CAP_CURSOR`, later `…_PHASE_LOCK`), which is how a client tells the host it
-// renders the pointer itself. Additive; the caps ride the existing Hello, so [`WIRE_VERSION`] is
-// unchanged. (Documented late — the bump shipped without its line here.)
-// v12: added `punktfunk_connection_set_cursor_render` — the mid-stream cursor-render flip
-// (design/remote-desktop-sweep.md §8): the client's mouse-model chord tells the host who
-// renders the pointer. Additive; rides the existing control stream (a new message TYPE, which
-// pre-§8 hosts ignore), so [`WIRE_VERSION`] is unchanged.
-// v13: added `punktfunk_connection_send_pen` — the stylus wire plane
-// (design/pen-tablet-input.md): a client sends `RICH_PEN` sample batches once the host
-// advertises `HOST_CAP_PEN`. Additive and capability-gated, so [`WIRE_VERSION`] is unchanged.
-// v14: added `punktfunk_connection_report_phase` + the `PUNKTFUNK_CLIENT_CAP_PHASE_LOCK` mirror
-// — the phase-locked capture reporter (design/phase-locked-capture.md): a client that advertises
-// the cap reports its next display latch (already converted to host clock), the panel period, an
-// uncertainty and the circular arrival-lead statistic the host's controller steers on. Additive;
-// the wire grows only a new control message (`PhaseReport`, 0x32) an old host never reads and a
-// strict-prefix append on the 0xCF host-timing tail, so [`WIRE_VERSION`] is unchanged.
-// v15: versions the shared rumble policy engine's C surface —
-// `punktfunk_connection_next_rumble_cmd`, `punktfunk_connection_set_rumble_quirks` and the
-// `PUNKTFUNK_RUMBLE_QUIRK_*` bits. These symbols are NOT new: they landed while this constant
-// still read 7 and no bump was made, so every core since has exported them while advertising a
-// version that never promised them. That cannot be corrected retroactively — a shipped binary
-// says what it says — so v15 is the floor that *guarantees* them: at or above it the surface is
-// present, below it an embedder must probe for the symbol. Purely a version statement; no code
-// changed with this bump, and no wire change, so [`WIRE_VERSION`] is unchanged.
-// v16: added the pad-audio client surface — `punktfunk_connection_next_pad_audio` (the 0xD1
-// per-gamepad DualSense haptics/speaker plane) + `punktfunk_connection_set_pad_audio_caps` and
-// the `PUNKTFUNK_CLIENT_CAP_PAD_AUDIO` / `PUNKTFUNK_HOST_CAP_PAD_AUDIO` mirrors. Additive and
-// capability-gated end to end: the wire grows a new datagram tag (0xD1) an old client never
-// receives (double-gated caps), a new 0xCD kind (0x06, dropped as unknown by old clients) and
-// arrival flag bits 8/9 sent only toward a capable host, so [`WIRE_VERSION`] is unchanged.
-// v17: added `punktfunk_connection_end_reason` + the `PUNKTFUNK_END_REASON_*` vocabulary — asks,
-// once a session has ended, WHY: this client closed it, the host's launched game exited (its close
-// carried [`quic::APP_EXITED_CLOSE_CODE`], which the host has sent since long before this bump
-// with nothing consuming it), the host ended it cleanly, the host reported a failure, or the
-// connection was simply lost. Purely a read of state the core already had: no new call is required
-// of an embedder, a client that never calls it is unchanged, and the host sends exactly the same
-// bytes either way, so [`WIRE_VERSION`] is unchanged.
-// v18: added `punktfunk_connection_next_rumble_cmd2` — the policy engine's rumble command with the
-// two Xbox impulse-trigger motor levels off the 0xCA v3 tail
-// (`design/trigger-rumble-plane.md`), which the fixed out-params of
-// `punktfunk_connection_next_rumble_cmd` have no room for. A NEW symbol, not a widened one: an
-// exported parameter list is part of the contract, and growing one in place breaks every
-// out-of-tree embedder at once. The old entry point is unchanged in signature AND in the levels
-// it reports — it keeps writing the two handle motors, which is the correct instruction for the
-// actuators it owns, so an embedder that never adopts the new symbol behaves exactly as before.
-// Additive and client-local: the v3 tail has been on the wire (and length-tolerant in both
-// decoders) since it landed, and the host sends the same bytes either way, so [`WIRE_VERSION`] is
-// unchanged.
-// v19: added `punktfunk_connection_note_frame_index_ex` and
-// `punktfunk_reanchor_gate_arm_expecting_drops` — the width-carrying half of the reanchor gate.
-// `note_frame_index_ex` reports how MANY frames an arrival revealed as missing where
-// `punktfunk_connection_note_frame_index` reports only whether any were; passing that width to
-// `arm_expecting_drops` pre-credits the reassembler's `frames_dropped` climb that the same loss
-// produces up to ~120 ms later, so the gate does not read one loss as two and re-freeze a stream a
-// fast LTR-RFI anchor has already healed. NEW symbols, not widened ones — the same rule v18 states:
-// both originals keep their signatures and their behaviour, so an embedder that never adopts either
-// is unchanged (it simply keeps the double-arm race the pair exists to close). Additive and
-// client-local: nothing new goes on the wire — the width is computed from frame indices the client
-// already receives — so [`WIRE_VERSION`] is unchanged.
-// v20: `punktfunk_connection_mgmt_port` — reads the host's management-API port out of the
-// session's `Welcome`, so a client can find the game library WITHOUT mDNS. The port previously
-// existed only in the host's mDNS TXT, which made a host that had moved it off 47990 (the
-// supported way to share a machine with a Sunshine fork, whose web UI owns that port) reachable
-// only where multicast worked — over a VPN, a routed subnet, or for a host added by IP, the
-// library silently fell back to a port nothing was listening on. A NEW symbol, not a widened one:
-// every existing function keeps its signature and behaviour, and an embedder that never calls it
-// is unchanged. The `Welcome` grew a trailing field, which older peers skip in both directions
-// (see `Welcome::encode`), so [`WIRE_VERSION`] is unchanged.
-// v21: added `punktfunk_connect_ex10` — `connect_ex9` plus `device_name`, the label an unpaired
-// client knocks with: what the host's pending-approval list (and the web console's
-// outstanding-pairings view and approve dialog) shows, and the trust-store name on approval. The
-// C ABI had no such parameter, so every embedder took [`client::device_name`]'s OS default —
-// which resolves through `COMPUTERNAME`/`HOSTNAME`, neither of which exists in an Apple GUI
-// process, leaving every Mac, iPad, iPhone and Apple TV knocking as the literal "This device"
-// (a console with three of them pending showed three identical rows). A NEW symbol, not a
-// widened one: `ex9` keeps its parameter list AND its behaviour — it passes a null name, which
-// selects that same default. Additive and client-local: the name rides the `Hello::name` field
-// hosts have read since the pending list existed, so [`WIRE_VERSION`] is unchanged.
-// v22: the per-client access surface (`design/per-client-access.md` §7) —
-// `punktfunk_connection_grants` and `punktfunk_connection_access_expires_in` read the session's
-// LIVE access state (the `PUNKTFUNK_GRANT_*` mask and the countdown to its expiry — Welcome
-// snapshot first, then latest-wins over every mid-session `AccessUpdate` the control task
-// folds in), and `punktfunk_connection_end_reject` reports the typed rejection a mid-session
-// close carried (`PUNKTFUNK_STATUS_REJECTED_*`; `0` = none), because `end_reason` can only
-// file an access-expiry close under HOST_ERROR and that is the wrong sentence for "your
-// access expired". NEW symbols, not widened ones — the same rule v18 states: every existing
-// function keeps its signature and behaviour, and an embedder that never adopts any of the
-// three is unchanged (it simply lacks the courtesy UX; the HOST enforces the grants either
-// way). Additive and client-local: the mask, the expiry and the `AccessUpdate` message all
-// shipped with the Welcome's trailing-field append (old peers skip them in both directions),
-// so [`WIRE_VERSION`] is unchanged.
-// v23: added `punktfunk_connection_audio_plc` — one frame of libopus packet-loss concealment,
-// synthesized from the connection's OWN decoder state, for an embedder whose playout ring is
-// draining because nothing is arriving (design/host-source-stutter-fixes.md WP-C1). The three
-// Rust clients conceal a packet drought on their decode thread; Apple's ring is Swift and its
-// decoder sits behind this ABI, so without a call it had no way to reach the one thing that can
-// extrapolate the missing audio — a second decoder would conceal from empty state, because PLC
-// extrapolates from the last decoded frame. A NEW symbol: every existing function keeps its
-// signature and behaviour, and an embedder that never calls it behaves exactly as before (it
-// simply de-primes over droughts, as all four clients used to). Frames it returns carry `seq`
-// and `pts_ns` of `0` — concealed audio was never on the wire and must not reach an A/V-sync
-// observation. Additive and client-local: nothing new is sent or parsed, so [`WIRE_VERSION`] is
-// unchanged.
-// v24: the lossless audio plane's client surface (`design/hi-res-audio.md` §7) —
-// `punktfunk_connect_ex11` asks for a sample rate and depth (whatever
-// `audio::pcm::rate_is_supported` admits — 48/96 kHz plus the 44.1 kHz family — and 16/24-bit;
-// the accepted rates grew after v24 shipped, which is not an ABI change: no symbol, signature or
-// struct moved, an older header stays correct, and a host that cannot carry a rate declines it to
-// Opus exactly as it always has. Anything but
-// the legacy pair also sets `CLIENT_CAP_AUDIO_HIRES`), and `punktfunk_connection_audio_sample_rate`
-// / `punktfunk_connection_audio_bits` report what the host actually RESOLVED — which may be
-// lower, because the host runs a five-condition gate and every decline lands back on Opus at
-// 48 kHz. `punktfunk_connection_next_audio_pcm` decodes both planes behind the same call, using
-// `pcm::PcmConceal` for gaps on the lossless one (libopus PLC extrapolates from a decoder's
-// model of the signal, and a raw frame has none).
+// Bump on any breaking change to the [C ABI](crate::abi). Additive bumps add
+// symbols and leave every existing function's signature and behaviour alone.
+// New connect options append to [`abi::PunktfunkConnectOpts`] behind `struct_size`;
+// do not mint another `connect_ex*` or grow `PunktfunkAudioPcm` / `PunktfunkStats`
+// (no size guard, allocated by value). v27 is the exception: `PunktfunkHidOutput`
+// grew 19 → 85 bytes and the version check is the overrun guard — a second pull
+// symbol would fork the hidout drain forever.
 //
-// ADDED, not widened, and this time the distinction has teeth: the natural place for a rate is a
-// field on `PunktfunkAudioPcm`, which is `#[repr(C)]` with no `struct_size` guard and is
-// allocated BY VALUE by every C embedder — growing it would change its layout under all of them
-// at once. `PunktfunkStats` is in the same position. So the format is read through accessors, the
-// same rule v18 set with `next_rumble_cmd2`, and `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ` keeps its value
-// and its meaning as the DEFAULT/legacy rate — a ring sized from it stays correct for every
-// session that resolves to Opus, which is every session an ABI-23 embedder can ask for. An
-// embedder that adopts none of this behaves exactly as before.
-//
-// Client-local in the C sense but NOT wire-free in the usual one: the `Hello`/`Welcome` fields
-// this reads and writes landed with the plane itself, appended behind the existing trailing-field
-// discipline (old peers skip them in both directions, and a legacy request encodes byte-identical
-// to the pre-hi-res messages), so [`WIRE_VERSION`] is still unchanged.
-// **v25** adds [`abi::punktfunk_set_log_callback`] — a `log` backend behind a C callback, so an
-// embedder that installs no Rust subscriber (the Swift clients, any C host) can receive the
-// core's own log lines: transport warnings, quinn connection events, rustls handshake notes,
-// everything this crate and its dependencies say through `tracing`/`log`. Until now those went
-// nowhere on Apple, and a client log bundle sent to the host carried the shell's half only.
-// ADDED, not widened: one new function and one callback typedef; nothing existing moved, and an
-// embedder that never calls it behaves exactly as on v24. Client-local in every sense — the host
-// never sees it and [`WIRE_VERSION`] is unchanged. It relies on tracing's `log` feature, now
-// declared explicitly by this crate (it was on transitively through quinn's defaults, which is
-// not a thing an ABI promise should rest on).
-// **v26** adds [`abi::punktfunk_connect_opts`] + [`abi::PunktfunkConnectOpts`] — the whole
-// connect surface in ONE size-prefixed, growable struct, closing the eleven-generation
-// `punktfunk_connect_ex*` chain (each new option used to mint a new exported symbol plus a
-// 20-something-parameter forwarding shim; `ex11` over `ex10` was two fields). ADDED, not
-// widened: every `ex` variant keeps its symbol, signature and byte-identical behaviour, and an
-// embedder that never calls the new form behaves exactly as on v25. New connect options land
-// only in the struct from here on — appended behind its `struct_size` guard, zero meaning
-// unspecified/auto — so they stop being ABI events at all. Client-local; [`WIRE_VERSION`] is
-// unchanged.
-//
-// **v27** closes the two C-ABI gaps of the as-is Steam Controller 2 passthrough
-// (`PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2`), whose Rust internals both directions already carried:
-// `punktfunk_connection_send_hid_report` sends one raw captured report up as
-// `RichInput::HidReport` (`[0xCC][0x04]`, the clamp rules shared verbatim with the Android JNI
-// shim), and `punktfunk_connection_next_hidout` now SURFACES `HidOutput::HidRaw` (`[0xCD][0x05]`
-// — Steam's hidraw write to the host's virtual SC2) instead of skipping it as NoFrame: a new
-// `PUNKTFUNK_HIDOUT_HID_RAW` kind with the report in a `hid_kind`/`raw_len`/`raw[64]` tail
-// appended to `PunktfunkHidOutput`.
-//
-// ⚠ WIDENED, not just added — the first deliberate widening this surface has made, and the
-// v18/v24 rule ("growing one in place breaks every out-of-tree embedder at once") is why it is
-// spelled out here rather than slipped in. `PunktfunkHidOutput` grows 19 → 85 bytes (the
-// pre-v27 prefix layout is byte-identical; the tail is appended), so a binary built against a
-// v26 header passes a 19-byte out-slot that a v27 core would overrun. The version equality check IS the
-// guard: `punktfunk_abi_version()` mismatch has always meant "incompatible core", and every
-// in-tree embedder (the Apple xcframework, whose header and dylib build together) recompiles
-// against the regenerated header. A second struct + second pull symbol was considered and
-// rejected: the hidout plane has ONE puller by contract, and forking its drain loop across two
-// symbols so one of them could stay 19 bytes would push the fork into every embedder forever,
-// for a struct only poll-written by the core into caller memory. No wire change — both datagram
-// forms shipped with the passthrough itself — so [`WIRE_VERSION`] is unchanged.
-// **v28** adds [`abi::punktfunk_connection_host_caps2`] and `PUNKTFUNK_HOST_CAP2_TOUCH` — the
-// Welcome's second capability byte, which no embedder could read before. A client offering a
-// touch-passthrough model gates it on the bit and falls back to a cursor model with a notice,
-// because a host without it drops every contact silently (design/touch-client-overlay.md §5.4).
-// ADDED, not widened: one function and one constant; an embedder that never calls it behaves
-// exactly as on v27. The byte itself has ridden the Welcome as a trailing field since the repeat
-// mark, so [`WIRE_VERSION`] is unchanged.
+// Not [`WIRE_VERSION`]. The C surface can grow without a wire byte changing.
+// Pin the integer in `abi.rs` (`abi_version_is_pinned`). Per-bump notes live
+// in `CHANGELOG.md`.
 #define PUNKTFUNK_ABI_VERSION 28
 
-// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
-// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
-// (functions a client links), which can grow without changing a single wire byte — v3's
-// `punktfunk_wake_on_lan` is client-local, and riding the C-ABI bump onto the wire locked
-// every new client out of every deployed host ("ABI mismatch: client 3 host 2", observed
-// live). Bump this ONLY when the handshake/planes actually change incompatibly.
+// punktfunk/1 wire version. `Hello`/`Welcome` carry it; hosts equality-check it.
+//
+// Separate from [`ABI_VERSION`]: the C surface can grow without a wire byte changing.
+// Bump only when the handshake or a plane changes incompatibly. Riding a C-only bump
+// onto the wire locks new clients out of every deployed host.
 #define PUNKTFUNK_WIRE_VERSION 2
 
-// `PunktfunkHidOutput::kind` — lightbar RGB (`r`/`g`/`b` valid).
+// `PunktfunkHidOutput::kind`: lightbar RGB (`r`/`g`/`b` valid).
 #define PUNKTFUNK_HIDOUT_LED 1
 
-// `PunktfunkHidOutput::kind` — player-indicator LEDs (`player_bits` valid, low 5 bits).
+// `PunktfunkHidOutput::kind`: player-indicator LEDs (`player_bits` valid, low 5 bits).
 #define PUNKTFUNK_HIDOUT_PLAYER_LEDS 2
 
-// `PunktfunkHidOutput::kind` — one adaptive-trigger effect (`which` + `effect`/`effect_len` valid).
+// `PunktfunkHidOutput::kind`: one adaptive-trigger effect (`which` + `effect`/`effect_len` valid).
 #define PUNKTFUNK_HIDOUT_TRIGGER 3
 
-// `PunktfunkHidOutput::kind` — a trackpad haptic pulse (Steam Controller voice-coils). `which` =
-// side (0 = right pad, 1 = left pad); `effect[0..6]` packs `amplitude` / `period` / `count` as
-// little-endian `u16`s with `effect_len = 6`. Clients without trackpad coils drop it.
+// Trackpad haptic pulse. `which` = side (0 right, 1 left); `effect[0..6]` =
+// amplitude/period/count as LE `u16`, `effect_len = 6`. Drop if no coils.
 #define PUNKTFUNK_HIDOUT_TRACKPAD_HAPTIC 4
 
-// `PunktfunkHidOutput::kind` — the audio-control region of a DS5 output report (pad-audio
-// routing/volumes; the audio SAMPLES arrive via [`punktfunk_connection_next_pad_audio`]).
-// `which` = the condensed audio flags (bit0 = haptics-select, bits1..4 = the report's
-// audio-valid flags); `effect[0..6]` = bytes 5..=10 of the report verbatim
-// (headphone/speaker/mic volumes + routing) with `effect_len = 6`. Forwarded change-only.
+// DS5 audio-control region. Samples arrive via [`punktfunk_connection_next_pad_audio`].
+// `which` = flags; `effect[0..6]` = report bytes 5..=10; `effect_len = 6`. Change-only.
 #define PUNKTFUNK_HIDOUT_AUDIO_CTL 5
 
-// `PunktfunkHidOutput::kind` — a raw report the host's hidraw consumer (Steam) wrote to an
-// as-is passthrough pad (`HidOutput::HidRaw`, the reverse of
-// [`punktfunk_connection_send_hid_report`]): `hid_kind` (`PUNKTFUNK_HID_RAW_OUTPUT` /
-// `PUNKTFUNK_HID_RAW_FEATURE`) + `raw`/`raw_len` valid. Replay it verbatim on the physical
-// device — an OUTPUT report on the interrupt-OUT endpoint / per-report GATT characteristic
-// (Triton rumble `0x80`, haptic pulse `0x81`, …), a FEATURE report as `SET_REPORT` / a GATT
-// feature write (lizard mode, IMU enable). Only an as-is passthrough session
-// (`PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2`) emits these; clients without such a capture drop them.
+// Raw hidraw report to replay (`HidRaw`). `hid_kind` + `raw`/`raw_len` valid.
+// Only `PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2` emits these; others drop.
 #define PUNKTFUNK_HIDOUT_HID_RAW 6
 
-// Capacity of `PunktfunkHidOutput::effect` (the DualSense trigger parameter block).
+// Capacity of `PunktfunkHidOutput::effect` (DualSense trigger parameter block).
 #define PUNKTFUNK_HID_EFFECT_MAX 11
 
-// `PunktfunkRichInput::kind` — a touchpad contact (`finger`/`active`/`x`/`y` valid).
+// `PunktfunkRichInput::kind`: a touchpad contact (`finger`/`active`/`x`/`y` valid).
 #define PUNKTFUNK_RICH_TOUCHPAD 1
 
-// `PunktfunkRichInput::kind` — a motion sample (`gyro`/`accel` valid).
+// `PunktfunkRichInput::kind`: a motion sample (`gyro`/`accel` valid).
 #define PUNKTFUNK_RICH_MOTION 2
 
-// `RichInput::TouchpadEx` kind on the wire — an extended trackpad contact that identifies the
-// surface (0 single / 1 Steam-left / 2 Steam-right) and carries click + pressure. The host decodes
-// it today; *sending* it from a C client needs the size-prefixed `PunktfunkRichInputEx` +
-// `punktfunk_connection_send_rich_input2` (added with client capture).
+// `RichInput::TouchpadEx` on the wire: surface (0 single / 1 Steam-left / 2
+// Steam-right) plus click + pressure. C send path is size-prefixed
+// `PunktfunkRichInputEx` via `punktfunk_connection_send_rich_input2`.
 #define PUNKTFUNK_RICH_TOUCHPAD_EX 3
 
-// `RichInput::HidReport` kind on the wire (`[0xCC][0x04][pad][len][data…]`) — one raw HID input
-// report from a client-captured controller, forwarded verbatim for the host's as-is virtual pad
-// (the Steam Controller 2 passthrough, `PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2`). A C client sends it
-// through [`punktfunk_connection_send_hid_report`], never by building the datagram itself; the
-// constant exists so client-side tests can pin the wire byte against this header.
+// `RichInput::HidReport` on the wire (`[0xCC][0x04][pad][len][data…]`): raw HID
+// input for the host as-is pad (`PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2`). C clients
+// send via [`punktfunk_connection_send_hid_report`], never by building the datagram.
 #define PUNKTFUNK_RICH_HID_REPORT 4
 
 // [`PunktfunkPenSample::state`] bit: the pen hovers in range (implied by `TOUCHING`).
@@ -301,8 +89,8 @@
 // [`PunktfunkPenSample::tool`]: the pen tip.
 #define PUNKTFUNK_PEN_TOOL_PEN 0
 
-// [`PunktfunkPenSample::tool`]: the eraser (a client-side mode — Apple Pencil has no
-// hardware eraser end; the squeeze/double-tap mapping usually drives this).
+// [`PunktfunkPenSample::tool`]: the eraser. Client-side mode — no hardware eraser
+// end; squeeze/double-tap mapping usually drives this.
 #define PUNKTFUNK_PEN_TOOL_ERASER 1
 
 // Most samples one [`punktfunk_connection_send_pen`] call accepts (one wire batch).
@@ -317,10 +105,9 @@
 // [`PunktfunkPenSample::distance`] sentinel: no hover-distance reading.
 #define PUNKTFUNK_PEN_DISTANCE_UNKNOWN 65535
 
-// Compositor preference for [`punktfunk_connect_ex`] (`compositor` arg). `AUTO` lets the host
-// pick (auto-detect from its running desktop); a concrete value is honored only if that backend
-// is available on the host right now, else the host falls back to auto-detect. The resolved
-// choice is reported back over the protocol (see `punktfunk/1` `Welcome`).
+// Compositor preference for [`punktfunk_connect_ex`]. `AUTO` lets the host pick.
+// A concrete value is honored only if that backend is available now; else auto-detect.
+// Resolved choice is on `Welcome`.
 #define PUNKTFUNK_COMPOSITOR_AUTO 0
 
 // KWin / KDE Plasma.
@@ -335,76 +122,56 @@
 // gamescope (spawned nested).
 #define PUNKTFUNK_COMPOSITOR_GAMESCOPE 4
 
-// Gamepad-backend preference for [`punktfunk_connect_ex2`] (`gamepad` arg): which virtual pad
-// the host creates for this session's controllers. Precedence host-side: an explicit client
-// choice > the host's `PUNKTFUNK_GAMEPAD` env var > X-Box 360. `AUTO` (or any unrecognized
-// value) = host decides. The resolved choice is echoed over the protocol (`Welcome`) and
-// readable via [`punktfunk_connection_gamepad`].
+// Gamepad-backend preference for [`punktfunk_connect_ex2`]: which virtual pad
+// the host creates. Precedence: client choice > `PUNKTFUNK_GAMEPAD` env > X-Box 360.
+// `AUTO` (or unrecognized) = host decides. Resolved via [`punktfunk_connection_gamepad`].
 #define PUNKTFUNK_GAMEPAD_AUTO 0
 
-// uinput X-Box 360 pad (the universal default — every game speaks XInput).
+// uinput X-Box 360 pad (default — every game speaks XInput).
 #define PUNKTFUNK_GAMEPAD_XBOX360 1
 
-// UHID DualSense (kernel `hid-playstation`): adaptive triggers, lightbar, touchpad, motion —
-// feedback arrives on the HID-output plane ([`punktfunk_connection_next_hidout`]). Honored on
-// Linux (UHID) and Windows (UMDF minidriver) hosts; otherwise the host falls back to X-Box 360.
+// UHID DualSense (`hid-playstation`): adaptive triggers, lightbar, touchpad, motion.
+// Feedback on [`punktfunk_connection_next_hidout`]. Linux UHID / Windows UMDF; else X-Box 360.
 #define PUNKTFUNK_GAMEPAD_DUALSENSE 2
 
-// uinput X-Box One / Series pad — the X-Box 360 backend with the One/Series USB identity, so
-// games show One/Series glyphs. XInput-identical to `XBOX360` otherwise (no game-visible gain;
-// impulse-trigger rumble is unreachable through THIS pad — evdev's `FF_RUMBLE` is two
-// magnitudes and has no third, so a uinput backend can never source it. The Windows HID Xbox
-// backend can, off its output report `0x03`; see
-// [`punktfunk_connection_next_rumble_cmd2`]). Useful for glyph-matching a
-// physical X-Box One/Series controller on the client.
+// X-Box One/Series identity on the 360 backend (glyphs). No impulse-trigger rumble:
+// evdev `FF_RUMBLE` has two magnitudes. Windows HID Xbox can; see `next_rumble_cmd2`.
 #define PUNKTFUNK_GAMEPAD_XBOXONE 3
 
-// UHID DualShock 4 (kernel `hid-playstation` ≥ 6.2): lightbar, touchpad, motion, rumble — the
-// touchpad/motion arrive over the rich-input plane and lightbar over the HID-output plane, like
-// DualSense (minus adaptive triggers / player LEDs / mute). Honored on Linux (UHID) and Windows
-// (UMDF minidriver) hosts; otherwise the host falls back to X-Box 360.
+// UHID DualShock 4 (`hid-playstation`): lightbar, touchpad, motion, rumble.
+// Rich-input + HID-output planes, no adaptive triggers / player LEDs / mute.
+// Linux UHID / Windows UMDF; else X-Box 360.
 #define PUNKTFUNK_GAMEPAD_DUALSHOCK4 4
 
-// UHID classic Steam Controller (Valve `28DE:1102`, kernel `hid-steam`): one stick + dual
-// trackpads + two grip paddles. Honored only where available (Linux hosts); else Xbox 360.
+// UHID classic Steam Controller (`hid-steam`): one stick + dual trackpads + two
+// grip paddles. Linux only; else Xbox 360.
 #define PUNKTFUNK_GAMEPAD_STEAMCONTROLLER 5
 
-// Steam Deck controller (Valve `28DE:1205`): full Deck gamepad incl. the four back grips, both
-// trackpads, and the IMU; re-grabbed by Steam Input with native glyphs when Steam runs on the
-// host. Honored on Linux AND Windows hosts; else folds to X-Box 360.
+// Steam Deck controller: four back grips, both trackpads, IMU. Steam Input
+// re-grabs with native glyphs when Steam runs on the host. Linux/Windows; else X-Box 360.
 #define PUNKTFUNK_GAMEPAD_STEAMDECK 6
 
-// DualSense Edge (Sony `054C:0DF2`): the DualSense plus two back buttons + two Fn buttons, so a
-// client's back paddles land on native slots. Honored on Linux (UHID `hid-playstation`) and
-// Windows (UMDF) hosts; otherwise the host falls back to X-Box 360.
+// DualSense Edge: DualSense plus two back buttons + two Fn buttons, so client
+// paddles land on native slots. Linux UHID / Windows UMDF; else X-Box 360.
 #define PUNKTFUNK_GAMEPAD_DUALSENSEEDGE 7
 
-// Nintendo Switch Pro Controller (Nintendo `057E:2009`, kernel `hid-nintendo`): Nintendo glyphs +
-// positional layout, gyro/accel, HD rumble. Honored only where available (Linux hosts, UHID
-// `hid-nintendo`); otherwise the host falls back to X-Box 360.
+// Nintendo Switch Pro: Nintendo glyphs + positional layout, gyro/accel, HD rumble.
+// Linux UHID `hid-nintendo` only; else X-Box 360.
 #define PUNKTFUNK_GAMEPAD_SWITCHPRO 8
 
-// New Steam Controller (2026, Valve `28DE:1302`) passed through AS-IS: the host mirrors the
-// client's raw Triton input reports out of a virtual SC2 with the real identity, and Steam's
-// hidraw writes (lizard mode, IMU enable, rumble/haptics) come back raw for the physical pad.
-// Steam Input is the consumer (no kernel driver binds the PID). Honored on Linux (UHID);
-// else folds to X-Box 360.
+// Steam Controller 2 as-is passthrough. Linux UHID; else X-Box 360.
 #define PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2 9
 
-// Steam Controller Puck dongle (`28DE:1304`) passed through with its native seven-interface
-// topology and four controller slots. Used by capture clients that own the physical Puck;
-// ordinary wired/BLE SC2 capture remains `STEAMCONTROLLER2`.
+// Steam Controller Puck dongle: native seven-interface topology, four slots.
+// For capture clients that own the physical Puck; wired/BLE SC2 stays `STEAMCONTROLLER2`.
 #define PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2_PUCK 10
 
-// Xbox Elite Wireless Controller Series 2 (`045E:0B22`, Bluetooth): a Windows-only HID identity
-// through the UMDF minidriver, so glyphs and the device name read Elite. Folds to X-Box 360
-// elsewhere. ⚠️ Identity only — the four paddles still fold/drop exactly as on the other X-Box
-// classes (`DUALSENSEEDGE` is the pad with native back-button slots).
+// Xbox Elite identity (Windows UMDF). Identity only — paddles still fold. Else X-Box 360.
 #define PUNKTFUNK_GAMEPAD_XBOXELITE 11
 
-// Extended `InputEvent` gamepad button bits for embedders building raw events: the four back grips
-// (Steam L4/L5/R4/R5 ≙ Xbox-Elite P1–P4) + the misc/capture button, in Moonlight's
-// `buttonFlags2 << 16` namespace. Mirror `input::gamepad::BTN_PADDLE1..4` / `BTN_MISC1`.
+// Extended `InputEvent` gamepad button bits: four back grips (Steam L4/L5/R4/R5 ≙
+// Xbox-Elite P1–P4) + misc/capture, in Moonlight's `buttonFlags2 << 16` namespace.
+// Mirror `input::gamepad::BTN_PADDLE1..4` / `BTN_MISC1`.
 #define PUNKTFUNK_GAMEPAD_BTN_PADDLE1 65536
 
 #define PUNKTFUNK_GAMEPAD_BTN_PADDLE2 131072
@@ -415,255 +182,196 @@
 
 #define PUNKTFUNK_GAMEPAD_BTN_MISC1 2097152
 
-// Connect to a `punktfunk/1` host and start a session at `width`x`height`@`refresh_hz`.
-// Blocks up to `timeout_ms` for the handshake. Returns NULL on failure. Equivalent to
-// [`punktfunk_connect_ex`] with `compositor = PUNKTFUNK_COMPOSITOR_AUTO`.
+// Connect to a `punktfunk/1` host at `width`x`height`@`refresh_hz`. Blocks up to
+// `timeout_ms`. NULL on failure. Same as [`punktfunk_connect_ex`] with
+// `compositor = PUNKTFUNK_COMPOSITOR_AUTO`.
 //
-// Video-capability bit for [`punktfunk_connect_ex5`] (`video_caps`): the client can decode a
-// 10-bit (Main10) HEVC stream. (Mirrors `quic::VIDEO_CAP_10BIT`.)
+// Video-capability bit for [`punktfunk_connect_ex5`]: the client can decode
+// 10-bit (Main10) HEVC.
 #define PUNKTFUNK_VIDEO_CAP_10BIT 1
 
-// Video-capability bit for [`punktfunk_connect_ex5`] (`video_caps`): the client can present
-// BT.2020 PQ HDR10 (implies 10-bit). (Mirrors `quic::VIDEO_CAP_HDR`.)
+// Video-capability bit: the client can present BT.2020 PQ HDR10 (implies 10-bit).
 #define PUNKTFUNK_VIDEO_CAP_HDR 2
 
-// Video-capability bit for [`punktfunk_connect_ex5`] (`video_caps`): the client can decode a
-// full-chroma 4:4:4 HEVC stream (Range Extensions). The host emits 4:4:4 only when this is set,
-// the host opted in, the codec is HEVC, and the GPU supports it — else the stream stays 4:2:0 and
-// [`punktfunk_connection_chroma_format`] reports the real value. (Mirrors `quic::VIDEO_CAP_444`.)
+// Video-capability bit: the client can decode full-chroma 4:4:4 HEVC. The host
+// emits 4:4:4 only when this is set, the host opted in, the codec is HEVC, and
+// the GPU supports it — else 4:2:0. Read [`punktfunk_connection_chroma_format`].
 #define PUNKTFUNK_VIDEO_CAP_444 4
 
-// Codec bit for [`punktfunk_connect_ex7`] (`video_codecs` / `preferred_codec`) and the value
-// [`punktfunk_connection_codec`] returns: H.264 / AVC. (Mirrors `quic::CODEC_H264`.)
+// Codec bit for [`punktfunk_connect_ex7`] and [`punktfunk_connection_codec`]: H.264 / AVC.
 #define PUNKTFUNK_CODEC_H264 1
 
-// Codec bit: H.265 / HEVC — the default codec. (Mirrors `quic::CODEC_HEVC`.)
+// Codec bit: H.265 / HEVC — the default codec.
 #define PUNKTFUNK_CODEC_HEVC 2
 
-// Codec bit: AV1. (Mirrors `quic::CODEC_AV1`.)
+// Codec bit: AV1.
 #define PUNKTFUNK_CODEC_AV1 4
 
-// Codec bit: PyroWave — the opt-in wired-LAN intra-only wavelet codec. Never auto-selected:
-// the host picks it ONLY when the client also passes it as `preferred_codec`
-// (design/pyrowave-codec-plan.md §3). (Mirrors `quic::CODEC_PYROWAVE`.)
+// PyroWave. Never auto-selected; pass it as `preferred_codec` (`design/pyrowave-codec-plan.md`).
 #define PUNKTFUNK_CODEC_PYROWAVE 8
 
-// Host-capability bit in [`punktfunk_connection_host_caps`]: the host applies gamepad-state
-// snapshots (a capable client sends full-state snapshots instead of per-transition events).
-// (Mirrors `quic::HOST_CAP_GAMEPAD_STATE`.)
+// Host-capability bit: the host applies gamepad-state snapshots (a capable client
+// sends full-state snapshots instead of per-transition events).
 #define PUNKTFUNK_HOST_CAP_GAMEPAD_STATE 1
 
-// Host-capability bit in [`punktfunk_connection_host_caps`]: the host supports the shared
-// clipboard, so a client may offer the toggle. (Mirrors `quic::HOST_CAP_CLIPBOARD`.)
+// Host-capability bit: the host supports the shared clipboard; a client may offer the toggle.
 #define PUNKTFUNK_HOST_CAP_CLIPBOARD 2
 
-// Host-capability bit in [`punktfunk_connection_host_caps`]: the host injects full-fidelity
-// stylus input, so a capable client splits pen contacts out of its touch path and sends them
-// via [`punktfunk_connection_send_pen`]; without the bit that call returns `Unsupported` and
-// the client keeps its pen-as-touch fallback. (Mirrors `quic::HOST_CAP_PEN`;
-// design/pen-tablet-input.md.)
+// Host injects stylus. Without it [`punktfunk_connection_send_pen`] is `Unsupported`.
+// (`design/pen-tablet-input.md`.)
 #define PUNKTFUNK_HOST_CAP_PEN 16
 
-// Host-capability bit in [`punktfunk_connection_host_caps`]: the host can capture per-gamepad
-// audio (DualSense voice-coil haptics + speaker) and emit it on the 0xD1 plane toward pads
-// declared capable via [`punktfunk_connection_set_pad_audio_caps`]. Set only when the client
-// asked via [`PUNKTFUNK_CLIENT_CAP_PAD_AUDIO`]. (Mirrors `quic::HOST_CAP_PAD_AUDIO`.)
+// Host-capability bit: per-gamepad audio (DualSense voice-coil + speaker) on
+// the 0xD1 plane toward pads declared via [`punktfunk_connection_set_pad_audio_caps`].
+// Set only when the client asked via [`PUNKTFUNK_CLIENT_CAP_PAD_AUDIO`].
 #define PUNKTFUNK_HOST_CAP_PAD_AUDIO 64
 
-// Host-capability bit in [`punktfunk_connection_host_caps`]: the host resolved this session onto
-// the LOSSLESS audio plane (`0xD3`) instead of Opus. Set only when the client asked via
-// [`punktfunk_connect_ex11`]; it is a statement about the wire, not an offer to decline — the
-// session runs one plane or the other for its whole life.
-//
-// A C embedder needs it for exactly one thing: telling the two planes apart when it drains raw
-// frames through [`punktfunk_connection_next_audio`], because a 48 kHz/16-bit lossless session
-// and a 48 kHz Opus session report identical rate, depth and channels. Embedders on
-// [`punktfunk_connection_next_audio_pcm`] never need it — core decodes both planes behind it —
-// but they should still read [`punktfunk_connection_audio_sample_rate`] to size their ring.
-// (Mirrors `quic::HOST_CAP_AUDIO_HIRES`.)
+// Session is on lossless `0xD3`, not Opus. Distinguishes 48 kHz/16-bit PCM from
+// 48 kHz Opus when draining [`punktfunk_connection_next_audio`]. PCM decode path
+// does not need it; still read [`punktfunk_connection_audio_sample_rate`].
 #define PUNKTFUNK_HOST_CAP_AUDIO_HIRES 128
 
-// Host-capability bit in [`punktfunk_connection_host_caps2`] (the SECOND byte): the host's
-// injector puts wire touch contacts on its desktop. A client offering a touch-passthrough model
-// tests this before routing fingers as contacts; without the bit it should fall back to a
-// cursor model and say so, because the host drops every contact silently. (Mirrors
-// `quic::HOST_CAP2_TOUCH`.)
+// Host-capability bit in [`punktfunk_connection_host_caps2`] (second byte): the
+// host injector puts wire touch contacts on its desktop. Without the bit, fall
+// back to a cursor model — the host drops every contact silently.
 #define PUNKTFUNK_HOST_CAP2_TOUCH 2
 
-// Pad-audio `kind` ([`punktfunk_connection_next_pad_audio`]): the BACK channel pair — DualSense
-// voice-coil haptics, 5 ms Opus frames. (Mirrors `quic::PAD_AUDIO_KIND_HAPTICS`.)
+// Pad-audio `kind` ([`punktfunk_connection_next_pad_audio`]): BACK channel pair —
+// DualSense voice-coil haptics, 5 ms Opus frames.
 #define PUNKTFUNK_PAD_AUDIO_KIND_HAPTICS 0
 
-// Pad-audio `kind`: the FRONT channel pair — the controller's built-in speaker, 10 ms Opus
-// frames. (Mirrors `quic::PAD_AUDIO_KIND_SPEAKER`.)
+// Pad-audio `kind`: FRONT channel pair — the controller's built-in speaker, 10 ms Opus frames.
 #define PUNKTFUNK_PAD_AUDIO_KIND_SPEAKER 1
 
-// [`punktfunk_connection_set_pad_audio_caps`] `audio_caps` bit: the pad renders the HAPTICS
-// stream (a real DualSense's voice coils).
+// [`punktfunk_connection_set_pad_audio_caps`] bit: the pad renders the HAPTICS stream
+// (DualSense voice coils).
 #define PUNKTFUNK_PAD_AUDIO_CAP_HAPTICS 1
 
-// [`punktfunk_connection_set_pad_audio_caps`] `audio_caps` bit: the pad renders the SPEAKER
-// stream.
+// [`punktfunk_connection_set_pad_audio_caps`] bit: the pad renders the SPEAKER stream.
 #define PUNKTFUNK_PAD_AUDIO_CAP_SPEAKER 2
 
-// [`punktfunk_connect_ex9`] `client_caps` bit: render the host cursor locally (the cursor
-// channel, `design/remote-desktop-sweep.md` M2).
+// [`punktfunk_connect_ex9`] `client_caps` bit: render the host cursor locally
+// (`design/remote-desktop-sweep.md`).
 #define PUNKTFUNK_CLIENT_CAP_CURSOR 1
 
-// [`punktfunk_connect_ex9`] `client_caps` bit: this client's presenter is vsync-aware and
-// feeds [`punktfunk_connection_report_phase`] (design/phase-locked-capture.md). Advisory in
-// v1 — the host arms on report receipt — but honest advertisement keeps the negotiation
-// forward-compatible.
+// [`punktfunk_connect_ex9`] `client_caps` bit: presenter is vsync-aware and
+// feeds [`punktfunk_connection_report_phase`] (`design/phase-locked-capture.md`).
+// Advisory: the host arms on report receipt.
 #define PUNKTFUNK_CLIENT_CAP_PHASE_LOCK 2
 
-// [`punktfunk_connect_ex9`] `client_caps` bit: the client understands the pad-audio plane
-// (0xD1 — per-gamepad DualSense voice-coil haptics + speaker). The embedder MUST then drain
-// [`punktfunk_connection_next_pad_audio`] and declare each capable pad via
-// [`punktfunk_connection_set_pad_audio_caps`]; the host emits pad audio only when it answers
-// with [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`]. (Mirrors `quic::CLIENT_CAP_PAD_AUDIO`.)
+// [`punktfunk_connect_ex9`] `client_caps` bit: pad-audio plane (0xD1 — DualSense
+// voice-coil + speaker). Drain [`punktfunk_connection_next_pad_audio`] and declare
+// pads via [`punktfunk_connection_set_pad_audio_caps`]. Host emits only with
+// [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`].
 #define PUNKTFUNK_CLIENT_CAP_PAD_AUDIO 8
 
-// [`punktfunk_connect_ex9`] `client_caps` bit: ask for the LOSSLESS audio plane (`0xD3`).
-//
-// **Normally you do not set this by hand** — pass a non-default `audio_rate_hz`/`audio_bits` to
-// [`punktfunk_connect_ex11`] and core sets it for you, which keeps "the bit" and "the format it
-// is asking for" from ever disagreeing. The one case that needs it explicitly is asking for
-// lossless at the DEFAULT 48 kHz/16-bit, whose parameters are indistinguishable from a legacy
-// request; core ORs the derived bit into what you pass rather than replacing it, so setting it
-// here works. Do it only if this embedder can genuinely open a 48 kHz/16-bit output and its user
-// asked for lossless — 1.5 Mbps to sound like transparent 256 kbps Opus is a poor trade, and
-// 24-bit is where the plane earns its bandwidth. (Mirrors `quic::CLIENT_CAP_AUDIO_HIRES`.)
+// Ask for lossless `0xD3`. Usually derived from a non-zero `audio_rate_hz`/
+// `audio_bits` on [`punktfunk_connect_ex11`]. Set by hand only for 48 kHz/16-bit
+// lossless (indistinguishable from an unspecified ask).
 #define PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES 16
 
-// [`punktfunk_connect_ex9`] `client_caps` bit: ask the host to leave its OWN audio devices
-// alone for this session — capture whatever the operator's default playback device already
-// is, instead of parking the desktop mix on a silent endpoint. The host keeps playing (the
-// headphones plugged into the host PC stay live) and this client hears the same audio:
-// Moonlight's "Mute host PC speakers" box, unchecked, per session.
-//
-// REQUEST-only — there is no host-cap echo. An older host ignores the bit and re-routes as it
-// always did, which degrades to "audio still works, the host went quiet", so an embedder may
-// set it unconditionally from its user's setting. (Mirrors `quic::CLIENT_CAP_KEEP_HOST_AUDIO`.)
+// Keep host speakers live this session (do not park the mix). Request-only;
+// hosts that do not know the bit ignore it.
 #define PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO 32
 
-// `*ttl_ms` sentinel written by [`punktfunk_connection_next_rumble2`] for a legacy (v1) rumble
-// datagram — an old host that sent no self-termination lease. The client then falls back to its
-// own staleness heuristic for that update instead of a host-supplied deadline.
+// `*ttl_ms` sentinel from [`punktfunk_connection_next_rumble2`] when the host sent
+// no self-termination lease. Fall back to a client-side staleness heuristic.
 #define PUNKTFUNK_RUMBLE_NO_TTL 4294967295
 
-// `flags` bit for [`punktfunk_connection_set_rumble_quirks`]: alternate the low motor's LSB on
-// keepalive re-emits (imperceptible) so an SDL-class layer that no-ops identical values still
-// writes the device — the Steam Deck's dedupe-defeat.
+// `flags` bit for [`punktfunk_connection_set_rumble_quirks`]: alternate the low
+// motor's LSB on keepalive re-emits so an SDL-class layer that no-ops identical
+// values still writes the device.
 #define PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER 1
 
-// [`PunktfunkClipEvent::kind`] — the host announced clipboard content is available
-// (`transfer_id` = the offer `seq`; `data`/`len` = a `\n`-separated `"<mime>\t<size_hint>"`
-// format list). Fetch it lazily (only on a local paste) via
-// [`punktfunk_connection_clipboard_fetch`].
+// [`PunktfunkClipEvent::kind`]: host announced clipboard content
+// (`transfer_id` = offer `seq`; `data`/`len` = `\n`-separated `"<mime>\t<size_hint>"`).
+// Fetch lazily on local paste via [`punktfunk_connection_clipboard_fetch`].
 #define PUNKTFUNK_CLIP_REMOTE_OFFER 1
 
-// [`PunktfunkClipEvent::kind`] — host ack / policy / backend update (`enabled`/`policy`/`reason`
-// valid). Reflect it in the toggle UI.
+// [`PunktfunkClipEvent::kind`]: host ack / policy / backend update
+// (`enabled`/`policy`/`reason` valid). Reflect it in the toggle UI.
 #define PUNKTFUNK_CLIP_STATE 2
 
-// [`PunktfunkClipEvent::kind`] — the host is pasting our offered data: answer with
-// [`punktfunk_connection_clipboard_serve`] (`transfer_id` = `req_id`; `seq`/`file_index` valid;
-// `data`/`len` = the requested MIME).
+// [`PunktfunkClipEvent::kind`]: host is pasting our offered data. Answer with
+// [`punktfunk_connection_clipboard_serve`] (`transfer_id` = `req_id`;
+// `seq`/`file_index` valid; `data`/`len` = requested MIME).
 #define PUNKTFUNK_CLIP_FETCH_REQUEST 3
 
-// [`PunktfunkClipEvent::kind`] — bytes for a fetch we started (`transfer_id` = `xfer_id`;
-// `data`/`len` = the payload, borrowed until the next `next_clipboard`; `last` = final chunk).
+// [`PunktfunkClipEvent::kind`]: bytes for a fetch we started (`transfer_id` = `xfer_id`;
+// `data`/`len` borrowed until the next `next_clipboard`; `last` = final chunk).
 #define PUNKTFUNK_CLIP_DATA 4
 
-// [`PunktfunkClipEvent::kind`] — a transfer was cancelled (`transfer_id` = the id).
+// [`PunktfunkClipEvent::kind`]: a transfer was cancelled (`transfer_id` = the id).
 #define PUNKTFUNK_CLIP_CANCELLED 5
 
-// [`PunktfunkClipEvent::kind`] — a transfer failed (`transfer_id` = the id; `status` = a
+// [`PunktfunkClipEvent::kind`]: a transfer failed (`transfer_id` = the id; `status` = a
 // `PunktfunkStatus` code).
 #define PUNKTFUNK_CLIP_ERROR 6
 
-// The protocol's audio frame, in milliseconds — every host datagram carries exactly one
-// ([`crate::quic::encode_audio_datagram`]), so it is also the smallest useful shed unit.
+// Opus-plane frame length in milliseconds, and the default. One datagram carries exactly one
+// ([`crate::quic::encode_audio_datagram`]), so it is also the smallest shed unit.
 //
-// ⚠ **This is the OPUS plane's frame, and the default. It is not the only one.** The lossless
-// plane negotiates shorter frames sized to the path MTU ([`pcm::frame_us_for`]): 4 ms at
-// 48 kHz/24-bit and 2 ms at 96 kHz/24-bit under the default ceiling. The resolved value rides the
-// `Welcome` as `audio_frame_us` and is on [`crate::client::NativeClient::audio_frame_us`].
-//
-// It is exported to C as `PUNKTFUNK_AUDIO_FRAME_MS` and is **kept at 5 with its meaning
-// unchanged**, exactly like `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ`: embedders size rings from it and
-// removing it would be a silent C break. But sizing a ring as *frames × `PUNKTFUNK_AUDIO_FRAME_MS`*
-// is wrong by up to 2.5× on a lossless session. An embedder that drains
-// [`crate::abi::punktfunk_connection_next_audio_pcm`] is safe without doing anything — that call
-// reports each frame's real length in `frame_count`, which is the figure to size from.
+// The lossless plane negotiates shorter frames ([`pcm::frame_us_for`]); the resolved value is
+// `audio_frame_us` on `Welcome`. Exported to C as `PUNKTFUNK_AUDIO_FRAME_MS` and kept at 5 —
+// embedders size rings from it. Sizing as *frames × this* is wrong by up to 2.5× on lossless;
+// drain [`crate::abi::punktfunk_connection_next_audio_pcm`] and use `frame_count` instead.
 #define PUNKTFUNK_AUDIO_FRAME_MS 5
 
-// Sample rate of every audio plane in the protocol.
+// Opus-plane sample rate, and the protocol default. Lossless negotiates via [`pcm`].
 #define PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ 48000
 
-// The `0xD3` datagram's fixed header: tag + `u32` seq + `u64` pts_ns, the same shape as `0xC9`
-// so the gap tracker and the A/V-sync plumbing work unchanged.
-// `quic::datagram` asserts this against its own encoder.
+// Tag + `u32` seq + `u64` pts_ns. Same shape as `0xC9` so the gap tracker and
+// A/V-sync plumbing stay shared. `quic::datagram` asserts this against its encoder.
 #define PUNKTFUNK_AUDIO_PCM_HEADER_LEN ((1 + 4) + 8)
 
-// Bit depths the plane carries. 32-bit float is deliberately absent: no source produces detail
-// 24 bits does not capture, and it would cost 33 % more for nothing.
+// 32-bit float is absent: 24 bits already captures the mix, and 32 would cost 33 % more.
 #define PUNKTFUNK_AUDIO_BITS_16 16
 
-// See [`BITS_16`].
 #define PUNKTFUNK_AUDIO_BITS_24 24
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// The uniform no-TTL-host staleness bound: a legacy host refreshes state every 500 ms, so two
-// missed refreshes = quiet host → silence. Replaces the per-platform zoo (1.6 s / 60 s / 1.5 s /
-// 1 s), and matches the ratio the Steam Deck ceiling shipped with.
+// Two missed 500 ms legacy refreshes. A quieter host is treated as gone.
 #define PUNKTFUNK_LEGACY_STALE_MS 1000
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Per-fetch requester-side size cap (bytes). A holder that streams more than this is treated as a
-// cap breach and the fetch fails rather than buffering unboundedly (§7). Phase 0 uses one fixed
-// value; a future host-policy `PUNKTFUNK_CLIP_MAX_MB` tightens it per session.
+// Per-fetch read cap, bytes (`design/clipboard-and-file-transfer.md`). A holder that
+// streams more is a cap breach: the fetch fails rather than buffering unboundedly.
 #define PUNKTFUNK_CLIP_FETCH_CAP (64 << 20)
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Inbound-serve `req_id`s carry this high bit so they never collide with the client-assigned
-// outbound-fetch `xfer_id`s (which count up from 1). A single [`ClipCommand::Cancel`] `id` can
-// then be routed to the right table.
+// High bit on inbound-serve `req_id`s so they never collide with outbound `xfer_id`s
+// (those count from 1). [`ClipCommand::Cancel`] then routes on one `id`.
 #define PUNKTFUNK_INBOUND_REQ_FLAG 2147483648
 #endif
 
-// Floor for a negotiated `shard_payload` (even, well under every real path). A path whose UDP
-// budget lands below this can't carry the QUIC control plane either (QUIC's own minimum is a
-// 1200-byte UDP payload), so shrinking video shards further buys nothing — the clamp helpers
-// bottom out here instead of producing degenerate confetti-sized shards.
+// Floor for a negotiated `shard_payload`. Below this the path cannot carry QUIC
+// either (QUIC's minimum UDP payload is 1200), so shrinking further buys nothing.
+// 512 is even and well under every real path.
 #define PUNKTFUNK_MIN_SHARD_PAYLOAD 512
 
-// 16-byte AEAD authentication tag appended by either session cipher.
 #define PUNKTFUNK_TAG_LEN 16
 
-// Wire tag distinguishing an input datagram from a video packet.
+// Wire tag: input datagram vs video packet.
 #define PUNKTFUNK_INPUT_MAGIC 200
 
-// Fixed serialized size of an [`InputEvent`] on the wire (tag + fields).
+// Serialized [`InputEvent`] size (tag + fields). The C struct is larger (`_pad`).
 #define PUNKTFUNK_INPUT_WIRE_LEN (((((1 + 1) + 4) + 4) + 4) + 4)
 
-// [`InputKind::GamepadArrival`] `flags` bit: this pad renders pad-audio HAPTICS — it is (or
-// forwards to) a real DualSense whose voice-coil actuators can play the
-// [`PAD_AUDIO_KIND_HAPTICS`](crate::quic::PAD_AUDIO_KIND_HAPTICS) stream. Rides above the pad
-// index byte; sent only toward a [`HOST_CAP_PAD_AUDIO`](crate::quic::HOST_CAP_PAD_AUDIO) host
-// (an older host reads the whole `flags` word as the index, so unexpected high bits would make
-// it drop the declaration).
+// [`InputKind::GamepadArrival`] `flags` bit 8: this pad renders haptics
+// ([`PAD_AUDIO_KIND_HAPTICS`](crate::quic::PAD_AUDIO_KIND_HAPTICS)). Sent only toward
+// a [`HOST_CAP_PAD_AUDIO`](crate::quic::HOST_CAP_PAD_AUDIO) host — an older host
+// reads the whole `flags` word as the index, so a high bit would drop the declaration.
 #define ARRIVAL_FLAG_PAD_AUDIO_HAPTICS (1 << 8)
 
-// [`InputKind::GamepadArrival`] `flags` bit: this pad renders pad-audio SPEAKER — the
-// [`PAD_AUDIO_KIND_SPEAKER`](crate::quic::PAD_AUDIO_KIND_SPEAKER) stream. Same wire discipline
-// as [`ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`].
+// [`InputKind::GamepadArrival`] `flags` bit 9: this pad renders speaker
+// ([`PAD_AUDIO_KIND_SPEAKER`](crate::quic::PAD_AUDIO_KIND_SPEAKER)). Same wire
+// discipline as [`ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`].
 #define ARRIVAL_FLAG_PAD_AUDIO_SPEAKER (1 << 9)
 
-// The number of gamepads addressable on the wire (`flags` pad index 0..15). Shared by the
-// client's snapshot fold and the host's per-pad accumulators.
+// Wire pad index 0..15. Shared by the client's snapshot fold and the host's per-pad
+// accumulators.
 #define PUNKTFUNK_MAX_PADS 16
 
 #define PUNKTFUNK_BTN_DPAD_UP 1
@@ -708,15 +416,13 @@
 // Back grip L5 — SDL `LeftPaddle2` / GameStream `PADDLE4`.
 #define PUNKTFUNK_BTN_PADDLE4 524288
 
-// DualSense touchpad click. Moonlight's extended-button position (`buttonFlags2`
-// merges in at `<< 16`, see `gamestream/gamepad.rs`), so GameStream clients land on
-// the same bit. Only the DualSense backend renders it; the xpad has no such button.
+// DualSense touchpad click. Moonlight `buttonFlags2 << 16` so GameStream clients
+// land on the same bit. Only the DualSense backend has this button.
 #define PUNKTFUNK_BTN_TOUCHPAD 1048576
 
-// Misc / capture button — the Deck `…`/quick-access, Share/Capture / GameStream `MISC`.
+// Misc / capture — Deck `…`/quick-access, Share/Capture / GameStream `MISC`.
 #define PUNKTFUNK_BTN_MISC1 2097152
 
-// Axis ids for `InputKind::GamepadAxis`.
 #define PUNKTFUNK_AXIS_LS_X 0
 
 #define PUNKTFUNK_AXIS_LS_Y 1
@@ -730,26 +436,18 @@
 
 #define PUNKTFUNK_AXIS_RT 5
 
-// Motion wire units — the DualSense convention, raw `i16` LSBs, carried by
-// `RichInput::Motion`. Gyro is angular velocity, accel is proper acceleration.
-//
-// Every capture path scales *into* these units (`pf-client-core::gamepad`, Swift
-// `GamepadWire`, the Android `DeviceGyro`) and every host backend decodes *from* them —
-// but the two sides never meet in one crate, which is how a virtual pad shipped for
-// months telling its consumers to read the same bytes 40× too fast. The host's virtual
-// pads carry fixed calibration blobs, and the resolution a consumer derives from those
-// blobs must land back on exactly these numbers; pf-inject's `motion_contract` test is
-// what pins that, for every backend, against these constants.
-//
-// Gyro saturates at `i16::MAX / 20` ≈ ±1638 °/s, below a real DualSense's ±2000; accel at
-// ±3.28 g against its ±4 g. Lifting those is a wire-v2 question, not a scale to quietly
-// re-tune here.
+// Gyro scale: DualSense raw `i16` LSBs per °/s, carried by `RichInput::Motion`.
+// Saturates at `i16::MAX / 20` ≈ ±1638 °/s (a real DualSense is ±2000). Every
+// capture path scales *into* these units and every host backend *from* them;
+// `pf-inject`'s `motion_contract` pins the calibration blobs against this number.
+// Lifting the clip is a wire-v2 change, not a quiet re-tune.
 #define MOTION_GYRO_LSB_PER_DEG_S 20
 
-// See [`MOTION_GYRO_LSB_PER_DEG_S`].
+// Accel scale: DualSense raw `i16` LSBs per g. Saturates at ±3.28 g (device ±4 g).
+// Same pin as [`MOTION_GYRO_LSB_PER_DEG_S`].
 #define MOTION_ACCEL_LSB_PER_G 10000
 
-// Identifies a punktfunk video packet (vs. an input datagram, see [`crate::input`]).
+// Video packet discriminator; input datagrams use a different magic ([`crate::input`]).
 #define PUNKTFUNK_MAGIC 201
 
 #define PUNKTFUNK_FLAG_PIC 1
@@ -758,805 +456,585 @@
 
 #define PUNKTFUNK_FLAG_SOF 4
 
-// Bandwidth-probe filler, not decodable video: a [`crate::quic::ProbeRequest`] speed test makes
-// the host burst access units carrying this flag so the client measures throughput/loss without
-// feeding them to the decoder. Punktfunk/1 only (GameStream never sets it).
+// Bandwidth-probe filler. Not decodable video — do not feed to the decoder.
+// Punktfunk/1 only; GameStream never sets this bit.
 #define PUNKTFUNK_FLAG_PROBE 8
 
-// Application `user_flags` bit (the u32 [`PacketHeader::user_flags`] word, surfaced to the client
-// as [`crate::session::Frame::flags`]) — NOT a transport packet flag. Marks the access unit that
-// **completes an intra-refresh wave**: the picture is loss-free from here even though the frame is
-// a coded `P` (no IDR, so the decoder never sets `AV_FRAME_FLAG_KEY`). The client lifts its
-// post-loss display freeze on this bit as well as on a real keyframe — the only bitstream-invisible
-// clean point it can honor without forcing a full IDR. Lives above the low nibble because the host
-// reuses `FLAG_PIC`/`FLAG_SOF`/`FLAG_PROBE` bit values inside `user_flags`; `0x10` clears all four.
+// `user_flags` bit, not a transport `flags` bit. Intra-refresh wave complete:
+// the picture is loss-free even though the AU is a coded P (no IDR, so the
+// decoder never sets `AV_FRAME_FLAG_KEY`). `0x10` sits above the FLAG_* nibble
+// because the host reuses those bit values inside `user_flags`.
 #define PUNKTFUNK_USER_FLAG_RECOVERY_POINT 16
 
-// Application `user_flags` bit — a **definitive single-frame clean re-anchor**. Unlike
-// [`USER_FLAG_RECOVERY_POINT`] (an intra-refresh wave boundary, where the first boundary after a loss
-// is only half-healed so the client waits for the second), this marks an access unit the host coded
-// to reference a **known-good** picture on purpose — an AMD **LTR reference-frame-invalidation**
-// recovery frame (`ForceLTRReferenceBitfield`): a clean P-frame off a long-term reference the client
-// already has, not an IDR. The picture is loss-free the instant this AU decodes, so the client lifts
-// its post-loss freeze on the **first** such mark. Coded `P` (no IDR), so the decoder never sets
-// `AV_FRAME_FLAG_KEY` — this host flag is the only signal.
+// `user_flags` bit. Single-frame clean re-anchor (LTR/RFI P-frame off a
+// known-good reference, not an IDR). Unlike [`USER_FLAG_RECOVERY_POINT`],
+// the picture is loss-free the instant this AU decodes — the first mark
+// is enough. Coded P, so the decoder never sets `AV_FRAME_FLAG_KEY`.
 #define PUNKTFUNK_USER_FLAG_RECOVERY_ANCHOR 32
 
-// `user_flags` bit: the AU's content is **shard-aligned self-delimiting chunks** — every
-// `shard_payload`-sized window of the frame buffer starts a fresh codec packet, padded to the
-// window with zeros (PyroWave datagram-aligned mode, design/pyrowave-codec-plan.md §4.4). Two
-// consequences: a receiver that opted into partial delivery can use an aged-out frame's buffer
-// AS-IS (missing shards stay zeroed; the codec's block walk skips zero windows), and even a
-// COMPLETE frame must be consumed window-by-window (the padding is not part of the stream).
+// `user_flags` bit. Each `shard_payload`-sized window of the frame buffer
+// is a self-delimiting codec packet, zero-padded. Missing shards stay zero
+// and the codec skips those windows; even a complete frame must be consumed
+// window-by-window (the padding is not in the stream).
 #define PUNKTFUNK_USER_FLAG_CHUNK_ALIGNED 64
 
-// `user_flags` bit: this AU was packetized as a **slice-streamed** frame (the P2 slice
-// pipeline): its sentinel blocks (`block_count == 0`) are SLICE-granularity and carry their
-// shard-aligned BASE byte offset in `frame_bytes` (the legacy fixed-geometry sentinel is the
-// degenerate base-0 case), and its FINAL block's base derives from the totals as
-// `(total_data_shards − final_data_shards) × shard_bytes` — variable-size blocks tile the
-// frame in shard units, so the uniform-geometry offset formula does not apply to ANY of its
-// blocks. On every packet of the AU (not just sentinels) because reorder can deliver the final
-// block first and its placement rule differs. Only emitted toward peers advertising
+// `user_flags` bit. Slice-streamed AU: sentinels (`block_count == 0`) carry
+// the shard-aligned base in `frame_bytes`; the final block's base is
+// `(total_data_shards − final_data_shards) × shard_bytes`. Uniform-geometry
+// offsets do not apply. Set on every packet of the AU — reorder can deliver
+// the final block first. Only toward peers advertising
 // [`VIDEO_CAP_STREAMED_AU`](crate::quic::VIDEO_CAP_STREAMED_AU) ∧
-// [`VIDEO_CAP_MULTI_SLICE`](crate::quic::VIDEO_CAP_MULTI_SLICE) — the pair whose receivers
-// know this contract.
+// [`VIDEO_CAP_MULTI_SLICE`](crate::quic::VIDEO_CAP_MULTI_SLICE).
 #define PUNKTFUNK_USER_FLAG_SLICE_STREAM 128
 
-// `user_flags` bit: this AU is a host-side **repeat** — the encode loop re-encoded a held
-// frame because the source produced nothing new (the idle keepalive), so it carries no new
-// content. The client's ABR uses it to tell an idle window from an active one (ABR overhaul
-// RFC §4.1): repeat-heavy windows must neither train the latency baselines nor read as "the
-// target wasn't utilized" — that is how a static stretch used to poison the controller
-// against the first moment of motion. Purely informational (no wire-shape change), so it is
-// set unconditionally; receivers that predate it ignore the bit, and a client only TRUSTS
-// its absence as "active frame" when the host advertised
-// [`HOST_CAP2_REPEAT_MARK`](crate::quic::HOST_CAP2_REPEAT_MARK) — against an older host,
-// zero repeat flags means "unknown", not "all active".
+// `user_flags` bit. Host re-encoded a held frame (idle keepalive); no new
+// content. Informational, set unconditionally. Trust a clear bit as "active"
+// only when the host advertised
+// [`HOST_CAP2_REPEAT_MARK`](crate::quic::HOST_CAP2_REPEAT_MARK) — against an
+// older host, zero means unknown, not all-active.
 #define PUNKTFUNK_USER_FLAG_REPEAT 256
 
-// Widest lost-frame range (frames, wrapping `last - first`) a reference-frame-invalidation
-// recovery may be asked to repair; anything wider goes straight to the keyframe path on BOTH
-// ends. RFI can only re-reference history the encoder still holds — NVENC keeps a 5-frame DPB,
-// AMD LTR ~1 s of marks — and a genuine loss this wide (>1 s even at 240 fps) has no valid
-// reference anywhere, so an RFI request for it is either hopeless or (worse) a phantom range
-// from a desynced counter. Shared by the host's RFI dispatch (range → keyframe fallback) and the
-// client-side gap detectors (huge gap → resync + keyframe request, no RFI).
+// Widest lost-frame range (`last - first`, wrapping) RFI may repair; wider
+// goes to the keyframe path on both ends. 256 frames is >1 s even at 240 Hz,
+// past any encoder DPB (NVENC 5 frames; AMD LTR ~1 s). A request this wide
+// has no valid reference, or the counters have desynced.
 #define PUNKTFUNK_RFI_MAX_RANGE 256
 
-// Largest UDP datagram the core will send or accept. `Config::validate` bounds
-// `shard_payload` so `HEADER_LEN + shard_payload + CRYPTO_OVERHEAD ≤ MAX_DATAGRAM_BYTES`.
-//
-// Sized for **jumbo frames** (design/shard-payload-reneg.md W0.2): a 9000-MTU LAN carries
-// ~8908-byte shards (sealed 8972-byte UDP payloads), and every receive path — the transport
-// `RECV_BUF`, the session's `recvmmsg` ring — is sized from this constant, so a deployed
-// client can accept a jumbo geometry the moment its host negotiates one. The ring cost is
-// 128 × ~9 KiB ≈ 1.1 MiB per **client** session (lazily allocated on first poll; hosts never
-// allocate it) — measured against the ~256 KiB it was at 2048, an acceptable static price
-// for never having to resize buffers on a mid-session grow. Senders still derive their
-// shard payload from the path MTU (`config::mtu1500_shard_payload*`, the wire-MTU clamps);
-// this is the acceptance ceiling, not a transmit size.
+// Acceptance ceiling, not a transmit size. 9216 fits a 9000-MTU jumbo
+// (sealed ~8972 B). `Config::validate` keeps
+// `HEADER_LEN + shard_payload + CRYPTO_OVERHEAD` under this. Receive rings
+// are sized from it so a jumbo geometry needs no mid-session resize.
 #define PUNKTFUNK_MAX_DATAGRAM_BYTES 9216
 
-// The slice-flush floor: a sentinel block below this many data shards costs disproportionate
-// per-block FEC parity (`ceil(k × pct/100)` ≥ 1 whatever `k`), so slice boundaries only flush
-// once this much has accumulated (~22 KB at the standard shard payload). Small slices simply
-// ride with the next one; the wire is never worse than one flush per slice.
+// Slice-flush floor. Below this, per-block FEC is `ceil(k × pct/100) ≥ 1` regardless of
+// `k` (~22 KB at the standard shard payload). Smaller slices ride with the next one.
 #define PUNKTFUNK_MIN_STREAM_BLOCK_SHARDS 16
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Controller input: gamepad button/axis/snapshot/remove/arrival events, plus everything that
-// rides with a pad — rich DualSense input (0xCC motion/touchpad), pad-audio, rumble return,
-// and virtual-pad creation itself (deny-at-setup: no bit, no uinput node).
+// DualSense `0xCC`, pad-audio, rumble, and virtual-pad creation (no bit, no uinput node).
 #define PUNKTFUNK_GRANT_GAMEPAD (1 << 0)
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pointing input: mouse rel/abs + buttons, scroll, touch, and the pen plane.
+// Mouse, scroll, touch, and the pen plane.
 #define PUNKTFUNK_GRANT_POINTER (1 << 1)
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Key input: key down/up and IME-committed text.
+// Key down/up and IME-committed text.
 #define PUNKTFUNK_GRANT_KEYBOARD (1 << 2)
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Shared clipboard — ANDed into the operator clipboard policy, never overriding it.
+// Clipboard coordinator. ANDed with the operator clipboard policy; never overrides it.
 #define PUNKTFUNK_GRANT_CLIPBOARD (1 << 3)
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Mic injection: the mic datagram plane + the per-session mic-service attach.
+// Mic datagram plane and the per-session mic-service attach.
 #define PUNKTFUNK_GRANT_MIC (1 << 4)
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Library launch: `Hello.launch` resolution (and any future in-session launch/end verbs).
+// `Hello.launch` resolution.
 #define PUNKTFUNK_GRANT_LAUNCH (1 << 5)
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Host power: invoking the `power.*` host actions (sleep/reboot/shutdown) over the mgmt cert
-// lane (`design/host-actions.md` §4). Route-gated like `CLIPBOARD`/`MIC`/`LAUNCH` — no
-// datagram ever carries it, so [`classify`] is untouched. Machine power ONLY: future
-// plugin/custom actions get their own class, never this bit.
+// `power.*` (sleep/reboot/shutdown) on the mgmt cert lane (`design/host-actions.md`).
+// Not a datagram; [`classify`] is untouched. Machine power only — never plugin actions.
 #define PUNKTFUNK_GRANT_POWER (1 << 6)
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Every defined grant. Also the value an *absent* mask means — a record from before grants
-// existed (or an old host's Welcome that omits the field) is full control, so existing
-// pairings keep today's behavior.
+// An omitted Welcome or registry mask reads as this.
 #define PUNKTFUNK_GRANT_ALL ((((((PUNKTFUNK_GRANT_GAMEPAD | PUNKTFUNK_GRANT_POINTER) | PUNKTFUNK_GRANT_KEYBOARD) | PUNKTFUNK_GRANT_CLIPBOARD) | PUNKTFUNK_GRANT_MIC) | PUNKTFUNK_GRANT_LAUNCH) | PUNKTFUNK_GRANT_POWER)
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`GRANT_ALL`] as it was before [`GRANT_POWER`] existed (hosts ≤ 0.32.x) — the mask an
-// explicitly saved "Full control" wrote back then. See [`normalize_legacy_full`].
+// Stored "Full control" before [`GRANT_POWER`]. [`normalize_legacy_full`] lifts it.
 #define PUNKTFUNK_GRANT_ALL_PRE_POWER (((((PUNKTFUNK_GRANT_GAMEPAD | PUNKTFUNK_GRANT_POINTER) | PUNKTFUNK_GRANT_KEYBOARD) | PUNKTFUNK_GRANT_CLIPBOARD) | PUNKTFUNK_GRANT_MIC) | PUNKTFUNK_GRANT_LAUNCH)
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// The reserved-must-be-zero region: a mask with any of these bits set is invalid today and is
-// rejected at the management API (never silently cleared — the caller meant *something* this
-// host doesn't understand, and clearing would grant less than they asked for without saying so).
+// The management API rejects these; it never silently clears unknown bits
+// (that would grant less than the caller asked).
 #define PUNKTFUNK_GRANT_RESERVED ~PUNKTFUNK_GRANT_ALL
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Preset: **Full control** — all bits; today's behavior and the default for absent grants.
+// UI preset "Full control".
 #define PUNKTFUNK_GRANT_PRESET_FULL PUNKTFUNK_GRANT_ALL
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Preset: **Controller only** — the guest/co-play preset. Deliberately excludes `LAUNCH`
-// (design §11 D2: in co-play the owner drives what runs).
+// UI preset "Controller only". No `LAUNCH` — the owner picks what runs.
 #define PUNKTFUNK_GRANT_PRESET_CONTROLLER_ONLY PUNKTFUNK_GRANT_GAMEPAD
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Preset: **View only** — spectator; sees and hears the stream, sends nothing.
+// UI preset "View only" — the spectator sends nothing.
 #define PUNKTFUNK_GRANT_PRESET_VIEW_ONLY 0
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) stream. Alone — without
-// [`VIDEO_CAP_HDR`] — it is the **10-bit SDR** ask (0.32, the client's "10-bit SDR" setting):
-// the host encodes the SDR desktop at Main10 precision under a BT.709 SDR VUI, and neither
-// display's colour state is touched. Every pre-0.32 client sets the two bits together.
+// [`Hello::video_caps`]: client can decode Main10. Without [`VIDEO_CAP_HDR`] this is
+// 10-bit SDR — Main10 under a BT.709 SDR VUI; neither display's colour state is touched.
 #define PUNKTFUNK_VIDEO_CAP_10BIT 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_caps`] bit: the client can present BT.2020 PQ HDR10 (implies 10-bit — set
-// together with [`VIDEO_CAP_10BIT`]).
+// [`Hello::video_caps`]: client can present BT.2020 PQ HDR10. Implies 10-bit; set with
+// [`VIDEO_CAP_10BIT`].
 #define PUNKTFUNK_VIDEO_CAP_HDR 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_caps`] bit: the client can decode a full-chroma **4:4:4** HEVC stream (HEVC
-// Range Extensions / Rec.ITU-T H.265 `chroma_format_idc = 3`) AND its user turned 4:4:4 on (a
-// client-side setting, default OFF — the per-session policy switch). The host emits 4:4:4 ONLY
-// when this bit is set, the host allows it (`PUNKTFUNK_444`, default on), the codec is HEVC,
-// **and** the GPU/driver actually supports a 4:4:4 encode (probed) — otherwise the session stays
-// 4:2:0 and [`Welcome::chroma_format`] reflects the real resolved value. Independent of
-// 10-bit/HDR (4:4:4 is a chroma decision, bit depth is a depth decision; the two may combine
-// where the hardware allows).
+// [`Hello::video_caps`]: client can decode HEVC 4:4:4 and asked for it. The host emits
+// 4:4:4 only when this bit is set, HEVC won, the operator allows it, and the GPU can
+// encode 4:4:4; otherwise the session stays 4:2:0 and [`Welcome::chroma_format`] is the
+// real value. Independent of 10-bit / HDR.
 #define PUNKTFUNK_VIDEO_CAP_444 4
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_caps`] bit: the client consumes per-AU host-timing datagrams
-// ([`HOST_TIMING_MAGIC`], 0xCF) — the host's capture→send duration per frame, letting the client
-// split its `host+network` latency stage into `host` and `network`
-// (design/stats-unification.md Phase 2). The host emits 0xCF ONLY when this bit is set (an older
-// host ignores it and simply never sends any); a client that doesn't set it keeps the combined
-// stage. Purely observability — never changes what the host encodes.
+// [`Hello::video_caps`]: client consumes per-AU host-timing datagrams (`HOST_TIMING_MAGIC`,
+// 0xCF). The host emits them only when this bit is set. Observability only.
 #define PUNKTFUNK_VIDEO_CAP_HOST_TIMING 8
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_caps`] bit: the client's reassembler keeps **speed-test probe filler in its own
-// frame-index space** (a second reassembly window keyed on the [`crate::packet::FLAG_PROBE`]
-// user-flag), so probe bursts no longer consume video `frame_index`es. Without this, a mid-session
-// speed test burns thousands of video indexes that are invisible to every client-side gap detector
-// (probe frames are filtered before the pump sees them) — the first real AU afterwards reads as a
-// phantom multi-thousand-frame loss (spurious freeze + a nonsense RFI). It also lets the host's
-// encode loop own the video numbering outright (the wire-index contract
-// [`crate::packet::Packetizer::packetize_each`] documents), which reference-frame invalidation
-// depends on. The host runs mid-session probe bursts ONLY against clients that set this bit — an
-// older client gets a declined (zeroed) [`ProbeResult`] instead of a measurement its single-window
-// reassembler would silently drop as stale.
+// [`Hello::video_caps`]: the reassembler keeps speed-test probe filler in its own
+// frame-index space ([`crate::packet::FLAG_PROBE`]). Without this, a mid-session probe
+// burns video indexes the pump never sees, so the next real AU looks like a multi-thousand
+// frame loss. The host probes only clients that set this bit; others get a zeroed
+// [`ProbeResult`].
 #define PUNKTFUNK_VIDEO_CAP_PROBE_SEQ 16
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_caps`] bit: the client's reassembler accepts **streamed access units**
-// (design/nvenc-subframe-slice-output.md Phase 2): the host may ship an AU's early FEC blocks
-// before the AU's total size exists — while the tail of the frame is still encoding — so the
-// AU's last packet leaves the host sooner (latency plan §7 LN1). Non-final blocks ride
-// SENTINEL headers (`block_count == 0` — a value no legacy sender emits — with
-// `frame_bytes == 0` and exactly `max_data_per_block` data shards, so the shard-offset
-// formula needs no total); the FINAL block's headers carry the real
-// `frame_bytes`/`block_count` (+ `FLAG_EOF`), which retro-validate the whole frame's geometry
-// — a mismatch drops the frame wholesale. The host streams ONLY to clients advertising this
-// bit; every other client gets today's whole-AU path (chunks concatenated before sealing), so
-// the fallback is zero-risk.
+// [`Hello::video_caps`]: the reassembler accepts streamed access units. Non-final blocks
+// use SENTINEL headers (`block_count == 0`, `frame_bytes == 0`, exactly
+// `max_data_per_block` data shards); the FINAL block carries real `frame_bytes` /
+// `block_count` and `FLAG_EOF`. A geometry mismatch drops the frame. Hosts stream only
+// to clients that set this bit; others get a whole-AU seal.
 #define PUNKTFUNK_VIDEO_CAP_STREAMED_AU 32
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_caps`] bit: the client can open **ChaCha20-Poly1305**-sealed session datagrams
-// AND requests them — set by clients without hardware AES (the soft-AES armv7 targets, e.g.
-// webOS TVs), where GCM's software AES + GHASH caps decrypt at ~100 Mbps while ChaCha's ARX
-// construction runs 4–7× faster in portable code (design/chacha20-session-cipher.md).
-// Support-plus-request in one bit mirrors [`VIDEO_CAP_444`]'s "capable AND turned on"
-// precedent. The host grants it only when its `PUNKTFUNK_CHACHA20` kill-switch (default on)
-// allows, answering with [`Welcome::cipher`] `= 1` + the 32-byte [`Welcome::key_chacha`];
-// toward every other client the Welcome stays byte-identical AES-128-GCM. Purely a
-// performance choice — both AEADs are full-strength, and Hello/Welcome ride the pinned-TLS
-// control channel, so there is no downgrade surface.
+// [`Hello::video_caps`]: client can open ChaCha20-Poly1305 session datagrams and wants
+// them (software-AES targets). The host grants only when `PUNKTFUNK_CHACHA20` allows,
+// answering [`Welcome::cipher`] `= 1` plus [`Welcome::key_chacha`]. Other clients keep
+// the AES-128-GCM Welcome byte-identical.
 #define PUNKTFUNK_VIDEO_CAP_CHACHA20 64
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_caps`] bit: the client's decoder accepts **multi-slice access units** — H.264/
-// HEVC frames carrying several slice NALs (latency plan §7 LN1: the encoder splits frames so
-// sub-frame readback can ship early slices while the tail encodes). Decoder-level, so the
-// EMBEDDER sets it from what its decode stack actually handles: every desktop decode stack
-// (Vulkan Video, D3D11VA, VAAPI, openh264/rav1d) is fine, but mobile/TV MediaCodec is per-SoC
-// — Amlogic HEVC decoders (Chromecast with Google TV, Fire TV) wedge the whole DEVICE on
-// multi-slice frames (the 0.17.0 field regression: the 4-slice Linux default froze streams on
-// first frame and watchdog-rebooted the CCwGTV), which is exactly why Moonlight requests 1
-// slice per frame for every hardware decoder. The host defaults to >1 slice ONLY toward a
-// client that sets this bit (`PUNKTFUNK_NVENC_SLICES` stays the explicit operator override in
-// both directions); every other client gets single-slice frames — the pre-0.17 wire shape.
-// NOTE: this takes the video_caps byte's last free bit — the next video cap needs a second
-// byte (ABI bump).
+// [`Hello::video_caps`]: the decoder accepts multi-slice AUs. The embedder sets this from
+// the decode stack — some mobile/TV SoCs wedge on multi-slice HEVC — not from a host
+// default. The host uses >1 slice only toward this bit (`PUNKTFUNK_NVENC_SLICES` still
+// overrides). Last free `video_caps` bit; the next cap needs a second byte (ABI bump).
 #define PUNKTFUNK_VIDEO_CAP_MULTI_SLICE 128
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Welcome::host_caps`] bit: the host applies [`InputKind::GamepadState`]
-// (crate::input::InputKind::GamepadState) snapshot events — full per-pad state with a reorder
-// sequence number. A capable client then sends gamepad state as snapshots (idempotent on the
-// lossy datagram plane, periodically refreshed) instead of the fragile per-transition
-// button/axis events; toward a host that doesn't set the bit it keeps the legacy events.
+// [`Welcome::host_caps`]: host applies
+// [`InputKind::GamepadState`](crate::input::InputKind::GamepadState) snapshots. A capable
+// client then sends full per-pad state (idempotent on the lossy datagram plane) instead
+// of per-transition button/axis events.
 #define PUNKTFUNK_HOST_CAP_GAMEPAD_STATE 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Welcome::host_caps`] bit: the host has a shared-clipboard service (a working OS backend)
-// **and** its operator policy does not hard-disable it, so the client may offer the clipboard
-// toggle. Absent (an older host, or `PUNKTFUNK_CLIPBOARD` off) ⇒ the client greys the toggle
-// out. Purely additive: nothing clipboard-related happens until a [`ClipControl`]`{ enabled:
-// true }` crosses (see `design/clipboard-and-file-transfer.md` §3.1). Packs into the existing
-// trailing `host_caps` byte — no wire-layout change.
+// [`Welcome::host_caps`]: host has a clipboard backend and the operator did not disable
+// it, so the client may offer the toggle. Nothing clipboard-related happens until a
+// [`ClipControl`] `{ enabled: true }` crosses (`design/clipboard-and-file-transfer.md`).
 #define PUNKTFUNK_HOST_CAP_CLIPBOARD 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Welcome::host_caps`] bit: the host's active inject backend can type **committed text**
-// ([`InputKind::TextInput`](crate::input::InputKind::TextInput) — one Unicode scalar per event):
-// Windows (`KEYEVENTF_UNICODE`) and Linux wlroots (dynamic Unicode keymap on a dedicated virtual
-// keyboard); the KWin/libei/gamescope backends can only press layout keycodes, so those sessions
-// don't set it. A capable client routes its IME's committed text (autocorrect, gesture typing,
-// non-Latin scripts, emoji) through `TextInput` instead of lossy VK synthesis; absent the bit it
-// keeps the VK fallback. Packs into the existing trailing `host_caps` byte — no wire-layout
-// change; an older host ignores the unknown input tag anyway (input is lossy by design).
+// [`Welcome::host_caps`]: the inject backend can type committed Unicode
+// ([`InputKind::TextInput`](crate::input::InputKind::TextInput)). Windows and wlroots
+// can; KWin / libei / gamescope only press layout keycodes and leave this clear. Absent
+// the bit, the client keeps VK synthesis.
 #define PUNKTFUNK_HOST_CAP_TEXT_INPUT 4
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::client_caps`] bit: the client renders the host cursor LOCALLY
-// (design/remote-desktop-sweep.md M2). It consumes [`CursorShape`](super::control::CursorShape)
-// control messages (RGBA bitmap + hotspot, cached by serial) and per-frame
-// [`CursorState`](super::datagram::CursorState) `0xD0` datagrams (position/visibility), and
-// draws the pointer itself — so the host must STOP compositing the cursor into the video
-// (`SessionPlan.cursor_blend = false`) or the user sees it twice. Active only when the host
-// answers with [`HOST_CAP_CURSOR`] (capable-and-agreed, the 444/clipboard precedent); toward
-// an older or incapable host nothing changes.
+// [`Hello::client_caps`]: the client draws the host cursor locally from
+// [`CursorShape`](super::control::CursorShape) and
+// [`CursorState`](super::datagram::CursorState) `0xD0`. When the host answers
+// [`HOST_CAP_CURSOR`], it must stop blending the cursor into the video
+// (`SessionPlan.cursor_blend = false`) or the user sees it twice.
 #define PUNKTFUNK_CLIENT_CAP_CURSOR 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// `Hello.client_caps` bit: this client runs a vsync-aware presenter and will send
-// [`PhaseReport`](super::control::PhaseReport)s (~1 Hz) so the host can phase-lock its
-// capture/send tick to the client's display latch (design/phase-locked-capture.md). Without
-// the bit the host never arms the phase controller; toward an older host the reports are
-// simply ignored — no behavior change in either direction.
+// [`Hello::client_caps`]: the presenter is vsync-aware and will send
+// [`PhaseReport`](super::control::PhaseReport)s so the host can phase-lock capture
+// (`design/phase-locked-capture.md`). Without the bit the host never arms the controller.
 #define PUNKTFUNK_CLIENT_CAP_PHASE_LOCK 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// `Hello.client_caps` bit: this client can decode the redundant desktop-audio plane
-// ([`AUDIO_RED_MAGIC`](super::datagram::AUDIO_RED_MAGIC), `0xD2`), where every datagram also
-// carries a copy of the previous frame so a single lost packet is reconstructed instead of
-// papered over with packet-loss concealment.
-//
-// Active only when the host answers with [`HOST_CAP_AUDIO_RED`] (capable-and-agreed, the
-// cursor/clipboard precedent). Toward an older host, or a host that declines because the link is
-// clean, the client keeps receiving the plain `0xC9` plane — so a client may always set this bit.
-// `0x04` — `0x01`/`0x02` are cursor / phase-lock.
+// [`Hello::client_caps`]: the client can decode the redundant desktop-audio plane
+// ([`AUDIO_RED_MAGIC`](super::datagram::AUDIO_RED_MAGIC), `0xD2`). Active only when the
+// host answers [`HOST_CAP_AUDIO_RED`]. A client may always set this bit: a host that
+// declines keeps the plain `0xC9` plane.
 #define PUNKTFUNK_CLIENT_CAP_AUDIO_RED 4
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::client_caps`] bit: the client understands the pad-audio plane
-// ([`PAD_AUDIO_MAGIC`](super::datagram::PAD_AUDIO_MAGIC), `0xD1`) — per-gamepad DualSense
-// voice-coil haptics + speaker Opus frames, plus the [`HidOutput::AudioCtl`]
-// (super::datagram::HidOutput) routing/volume events. Active only when the host answers with
-// [`HOST_CAP_PAD_AUDIO`] AND the pad's arrival declared a renderer for the kind
-// ([`crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/`_SPEAKER`) — the capable-and-agreed
-// precedent, per pad; toward an older or incapable host nothing changes. `0x08` — `0x01` is [`CLIENT_CAP_CURSOR`],
-// `0x02` is [`CLIENT_CAP_PHASE_LOCK`], `0x04` is [`CLIENT_CAP_AUDIO_RED`].
+// [`Hello::client_caps`]: the client understands the pad-audio plane
+// ([`PAD_AUDIO_MAGIC`](super::datagram::PAD_AUDIO_MAGIC), `0xD1`) and
+// [`HidOutput::AudioCtl`](super::datagram::HidOutput). Active only when the host answers
+// [`HOST_CAP_PAD_AUDIO`] and the pad's arrival declared a renderer
+// ([`crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`] / `_SPEAKER`).
 #define CLIENT_CAP_PAD_AUDIO 8
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Welcome::host_caps`] bit: the host CAN forward the cursor out-of-band (it captures cursor
-// metadata separately from the frame — the Linux portal `SPA_META_Cursor` path; NOT gamescope,
-// whose capture carries no cursor, and NOT Windows yet, where DWM composites into the IDD
-// frame). Set only when the client asked via [`CLIENT_CAP_CURSOR`]; when both bits agree the
-// host stops blending and ships [`CursorShape`](super::control::CursorShape) +
-// [`CursorState`](super::datagram::CursorState) instead. `0x08` — `0x04` is
-// [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
+// [`Welcome::host_caps`]: the host can forward the cursor out-of-band (Linux portal
+// `SPA_META_Cursor`). Not gamescope (capture has no cursor) and not Windows (DWM
+// composites into the IDD frame). Set only when the client asked via [`CLIENT_CAP_CURSOR`].
 #define PUNKTFUNK_HOST_CAP_CURSOR 8
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Welcome::host_caps`] bit: the host injects full-fidelity stylus input — it routes
-// [`PenBatch`](super::pen::PenBatch) `0xCC/0x05` datagrams (pressure, tilt, azimuth, barrel
-// roll, hover, eraser, barrel buttons) through the [`PenTracker`](super::pen::PenTracker)
-// into a virtual tablet device (design/pen-tablet-input.md). A capable client (Apple Pencil,
-// Android stylus) then splits pen contacts out of its finger/touch path and sends pen
-// batches; absent the bit it keeps folding the pen into touch/pointer like today, and
-// [`NativeClient::send_pen`](crate::client::NativeClient::send_pen) refuses to send. The
-// wire ships ahead of the backend (P0): no host sets this bit until the P1 injector lands —
-// which is exactly why the gate exists. `0x10` — `0x08` is [`HOST_CAP_CURSOR`], `0x04` is
-// [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
+// [`Welcome::host_caps`]: the host injects [`PenBatch`](super::pen::PenBatch) `0xCC/0x05`
+// into a virtual tablet (`design/pen-tablet-input.md`). Absent the bit, the client folds
+// pen into touch and [`NativeClient::send_pen`](crate::client::NativeClient::send_pen)
+// refuses.
 #define PUNKTFUNK_HOST_CAP_PEN 16
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Welcome::host_caps`] bit: the host is sending the REDUNDANT desktop-audio plane
-// ([`AUDIO_RED_MAGIC`](super::datagram::AUDIO_RED_MAGIC), `0xD2`) instead of plain `0xC9` — each
-// datagram carries its own frame plus a copy of the previous one.
-//
-// Set only when the client asked via [`CLIENT_CAP_AUDIO_RED`]. It is a statement about the WIRE,
-// not a negotiation the client can decline: with the bit set the client must decode `0xD2`, and
-// without it `0xC9`. The host may also drop back to `0xC9` mid-session (the redundancy is
-// loss-gated — a clean LAN shouldn't pay for it), which is why clients decode BOTH tags
-// unconditionally and treat this bit as "expect redundancy", not "only redundancy".
-// `0x20` — `0x10` is [`HOST_CAP_PEN`], `0x08` is [`HOST_CAP_CURSOR`].
+// [`Welcome::host_caps`]: the wire is the redundant desktop-audio plane
+// ([`AUDIO_RED_MAGIC`](super::datagram::AUDIO_RED_MAGIC), `0xD2`), not plain `0xC9`. Set
+// only when the client asked. The host may drop back to `0xC9` mid-session (loss-gated),
+// so clients decode both tags and treat this bit as "expect redundancy", not "only
+// redundancy".
 #define PUNKTFUNK_HOST_CAP_AUDIO_RED 32
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Welcome::host_caps`] bit: the host can capture pad audio — its virtual DualSense exposes
-// the pad's audio endpoints (voice-coil haptics + speaker), so a game's per-pad audio can be
-// captured and shipped on the [`PAD_AUDIO_MAGIC`](super::datagram::PAD_AUDIO_MAGIC) plane.
-// Set only when the client asked via [`CLIENT_CAP_PAD_AUDIO`]; when both bits agree, a
-// capable client marks its pads' render capabilities on their arrivals
-// ([`crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/`_SPEAKER`) and the host emits `0xD1`
-// toward exactly those pads. `0x40` — `0x20` is [`HOST_CAP_AUDIO_RED`], `0x10` is
-// [`HOST_CAP_PEN`], `0x08` is [`HOST_CAP_CURSOR`], `0x04` is [`HOST_CAP_TEXT_INPUT`],
-// `0x01`/`0x02` are gamepad-state / clipboard.
+// [`Welcome::host_caps`]: the host can capture pad audio onto
+// [`PAD_AUDIO_MAGIC`](super::datagram::PAD_AUDIO_MAGIC) `0xD1`. Set only when the client
+// asked via [`CLIENT_CAP_PAD_AUDIO`]. When both bits agree, the host emits `0xD1` toward
+// pads whose arrivals declared a renderer.
 #define HOST_CAP_PAD_AUDIO 64
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::client_caps`] bit: the client can play the LOSSLESS audio plane
-// ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`) at the rate and depth it asked
-// for in [`Hello::audio_rate_hz`](super::handshake::Hello::audio_rate_hz) /
-// [`audio_bits`](super::handshake::Hello::audio_bits).
-//
-// **Capable AND the user turned it on** — the [`VIDEO_CAP_444`] precedent, not a bare capability.
-// This plane costs 1.5–4.6 Mbps against Opus's 256 kbps and is taken off the top of the link
-// (audio rides datagrams outside the ABR loop, so ABR can neither see it nor reclaim it), so it
-// must be asked for on both ends. A client that cannot open an output at the format it is
-// requesting must not set this bit.
-//
-// `0x10` — `0x08` is [`CLIENT_CAP_PAD_AUDIO`], `0x04` is [`CLIENT_CAP_AUDIO_RED`], `0x02` is
-// [`CLIENT_CAP_PHASE_LOCK`], `0x01` is [`CLIENT_CAP_CURSOR`].
+// [`Hello::client_caps`]: the client can play the lossless audio plane
+// ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`) at the rate/depth it
+// asked in Hello, **and** the user turned it on. This plane costs 1.5–4.6 Mbps against
+// Opus's 256 kbps and sits outside the ABR loop, so both ends must ask. A client that
+// cannot open that output format must not set this bit.
 #define PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES 16
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::client_caps`] bit: this session asks the host to leave the host's OWN audio devices
-// alone — capture whatever the operator's default playback device already is, instead of
-// re-routing the desktop mix onto a silent (or preferred) endpoint. A loopback/monitor tap
-// doesn't silence the device it taps, so the host keeps playing (the headphones plugged into
-// the host PC stay live) and the client hears the same audio — Moonlight's "Mute host PC
-// speakers" box, unchecked, as a per-session client choice.
-//
-// The user's-setting precedent ([`CLIENT_CAP_AUDIO_HIRES`]), and REQUEST-only — no `HOST_CAP`
-// echo: an older host ignores the bit and re-routes as it always did, which degrades to
-// "audio still works, host went quiet", not a broken session. Per-session best-effort on the
-// host: with several concurrent sessions the wiring is host-global, so any live session that
-// asked wins for all of them until it ends. Composes with the host-wide
-// `PUNKTFUNK_AUDIO_OUTPUT_MODE=follow_default`, which is this behaviour for every session.
-// `0x20` — `0x10` is [`CLIENT_CAP_AUDIO_HIRES`]; `0x40`/`0x80` remain free.
+// [`Hello::client_caps`]: leave the host's own playback devices alone — tap the current
+// default instead of re-routing the mix onto a silent endpoint. Request-only: no
+// `HOST_CAP` echo; an older host ignores it and still re-routes. Concurrent sessions share
+// host-global wiring, so any live session that asked wins until it ends.
 #define PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO 32
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Welcome::host_caps`] bit: the host resolved the session onto the lossless audio plane
-// ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`). Like [`HOST_CAP_AUDIO_RED`]
-// this is a statement about the WIRE rather than an offer: with the bit set the client decodes
-// `0xD3` and MUST open its device from the resolved
+// [`Welcome::host_caps`]: the session is on the lossless audio plane
+// ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`). A wire statement, not
+// an offer: the client must open from
 // [`Welcome::audio_rate_hz`](super::handshake::Welcome::audio_rate_hz) /
 // [`audio_bits`](super::handshake::Welcome::audio_bits) /
-// [`audio_frame_us`](super::handshake::Welcome::audio_frame_us), never from what it asked for.
-//
-// Unlike `0xD2`, the host does NOT drop back mid-session: the client's device is open at a fixed
-// format, so a change would mean a re-open. The plane is resolved once, at handshake, by the
-// five-condition gate in `design/hi-res-audio.md` §8.4, and every decline resolves to Opus
-// 48 kHz with a logged reason.
-//
-// ⚠ `0x80` is the **LAST free `host_caps` bit**. The next host capability needs a second byte
-// and an ABI bump — the same wall [`VIDEO_CAP_MULTI_SLICE`] already hit on `video_caps`.
-// `0x40` is [`HOST_CAP_PAD_AUDIO`], `0x20` is [`HOST_CAP_AUDIO_RED`], `0x10` is
-// [`HOST_CAP_PEN`], `0x08` is [`HOST_CAP_CURSOR`], `0x04` is [`HOST_CAP_TEXT_INPUT`],
-// `0x01`/`0x02` are gamepad-state / clipboard.
+// [`audio_frame_us`](super::handshake::Welcome::audio_frame_us), never from what it asked.
+// Unlike `0xD2`, the host does not drop back mid-session (the device is open at a fixed
+// format). Last free `host_caps` bit; the next cap needs a second byte (already
+// [`Welcome::host_caps2`]).
 #define PUNKTFUNK_HOST_CAP_AUDIO_HIRES 128
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2) bit — the second capability byte
-// the `0x80` wall above predicted, delivered as a trailing Welcome field (absent → `0`, the
-// same append discipline as every field since `compositor`; no ABI bump needed).
-//
-// The host marks its idle-keepalive re-encodes with
-// [`USER_FLAG_REPEAT`](crate::packet::USER_FLAG_REPEAT), so the client's ABR can tell an
-// idle window from an active one (ABR overhaul RFC §4.1). The bit is what makes the flag's
-// ABSENCE meaningful: against a host that advertises it, an unflagged AU is genuinely new
-// content; against an older host the client must treat activity as unknown and keep the
-// legacy window arithmetic.
+// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): idle-keepalive re-encodes
+// carry [`USER_FLAG_REPEAT`](crate::packet::USER_FLAG_REPEAT). Against a host that
+// advertises this, an unflagged AU is new content; against an older host the client must
+// treat activity as unknown.
 #define PUNKTFUNK_HOST_CAP2_REPEAT_MARK 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2) bit: the host's live injector puts
-// wire touch contacts (`TouchDown` / `TouchMove` / `TouchUp`) on its desktop. Linux sets it on
-// the libei, gamescope-EIS and KWin backends; the wlroots virtual-pointer backend has no touch
-// protocol and drops every contact, and Windows below build 1809 cannot create a `PT_TOUCH`
-// device. A client whose touch model is passthrough falls back to its trackpad model without the
-// bit and says so — otherwise every contact vanishes with no error anywhere
-// (design/touch-client-overlay.md §5.4). `0x02` — `0x01` is [`HOST_CAP2_REPEAT_MARK`].
+// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the injector puts wire touch
+// contacts on the desktop. Linux libei / gamescope-EIS / KWin set it; wlroots
+// virtual-pointer has no touch protocol, and Windows below build 1809 cannot create
+// `PT_TOUCH`. Without the bit a passthrough client falls back to trackpad — otherwise
+// contacts vanish with no error (`design/touch-client-overlay.md`).
 #define PUNKTFUNK_HOST_CAP2_TOUCH 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
-// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
-// advertise this.
+// [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
+// that wants to stream from a GPU-less host must advertise this.
 #define PUNKTFUNK_CODEC_H264 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_codecs`] bit: the client can decode H.265 / HEVC — the default every existing
-// build produces and decodes (a peer that omits [`Hello::video_codecs`] is treated as HEVC-only).
+// [`Hello::video_codecs`]: H.265 / HEVC. A peer that omits [`Hello::video_codecs`] is
+// treated as HEVC-only.
 #define PUNKTFUNK_CODEC_HEVC 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_codecs`] bit: the client can decode AV1.
 #define PUNKTFUNK_CODEC_AV1 4
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_codecs`] bit: the client can decode **PyroWave** — the opt-in wired-LAN
-// intra-only wavelet codec (design/pyrowave-codec-plan.md; 100–400 Mbps class, 8-bit SDR,
-// every frame independently decodable). Deliberately **absent from [`resolve_codec`]'s
-// precedence ladder**: it is selected only when the client also names it
-// [`Hello::preferred_codec`] (or the host operator forces the advertisement mask) — a codec
-// that needs a wired-LAN bitrate must never win a negotiation just because both ends support
-// it. The bit means "PyroWave bitstream as of the punktfunk-vendored pin"
-// (`crates/pyrowave-sys/vendor/pyrowave/PUNKTFUNK-VENDOR.txt`): upstream has no bitstream
-// version field, so a vendored bump that changes the bitstream bumps the punktfunk protocol
-// version instead (plan §4.2).
+// [`Hello::video_codecs`]: PyroWave (opt-in wired-LAN intra-only wavelet,
+// `design/pyrowave-codec-plan.md`). Deliberately absent from [`resolve_codec`]'s ladder:
+// selected only when the client also names it [`Hello::preferred_codec`] (or the operator
+// forces the mask). The bit means the bitstream of the vendored pin
+// (`crates/pyrowave-sys/vendor/pyrowave/PUNKTFUNK-VENDOR.txt`); upstream has no version
+// field, so a bitstream-changing vendor bump bumps the punktfunk protocol instead.
 #define PUNKTFUNK_CODEC_PYROWAVE 8
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// HEVC `chroma_format_idc` for 4:2:0 — what every pre-4:4:4 build produced and the back-compat
-// default when a peer omits [`Welcome::chroma_format`].
+// HEVC `chroma_format_idc` 4:2:0. Default when a peer omits [`Welcome::chroma_format`].
 #define PUNKTFUNK_CHROMA_IDC_420 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// HEVC `chroma_format_idc` for full-chroma 4:4:4 (Range Extensions).
+// HEVC `chroma_format_idc` 4:4:4 (Range Extensions).
 #define PUNKTFUNK_CHROMA_IDC_444 3
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// CICP colour-primaries code point: BT.709.
 #define ColorInfo_CP_BT709 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// CICP colour-primaries code point: BT.2020.
 #define ColorInfo_CP_BT2020 9
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// CICP transfer code point: BT.709.
 #define ColorInfo_TRC_BT709 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// CICP transfer code point: PQ (SMPTE ST.2084).
 #define ColorInfo_TRC_PQ 16
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// CICP transfer code point: HLG (ARIB STD-B67 / BT.2100).
 #define ColorInfo_TRC_HLG 18
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// CICP matrix code point: BT.709.
 #define ColorInfo_MC_BT709 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// CICP matrix code point: BT.2020 non-constant-luminance. (Never emit 10 / constant-luminance —
-// no client decodes it.)
+// CICP matrix 9: BT.2020 NCL. Never emit 10 (constant-luminance) — no client decodes it.
 #define ColorInfo_MC_BT2020_NCL 9
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Rounds per batch — matches the connect-time [`clock_sync`].
+// Same round count as connect-time [`clock_sync`].
 #define ClockResync_ROUNDS 8
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Consecutive rejected batches tolerated before the best of them is applied anyway.
+// Rejections tolerated before the streak's best batch is applied anyway.
 #define ResyncGuard_MAX_REJECTED_STREAK 3
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`Reconfigure`] (first byte after the magic).
 #define PUNKTFUNK_MSG_RECONFIGURE 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`Reconfigured`].
 #define PUNKTFUNK_MSG_RECONFIGURED 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`RequestKeyframe`].
 #define PUNKTFUNK_MSG_REQUEST_KEYFRAME 3
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`LossReport`].
 #define PUNKTFUNK_MSG_LOSS_REPORT 4
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`SetBitrate`].
 #define PUNKTFUNK_MSG_SET_BITRATE 5
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`BitrateChanged`].
 #define PUNKTFUNK_MSG_BITRATE_CHANGED 6
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`RfiRequest`].
 #define PUNKTFUNK_MSG_RFI_REQUEST 7
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`ShardPayloadChanged`].
 #define PUNKTFUNK_MSG_SHARD_PAYLOAD_CHANGED 8
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`ShardPayloadAck`].
 #define PUNKTFUNK_MSG_SHARD_PAYLOAD_ACK 9
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`PipelineGap`]. 0x0A extends the video/rate-control block (0x01-0x09) it belongs
-// to: its only consumer is the same adaptive-bitrate controller [`LossReport`], [`SetBitrate`]
-// and [`BitrateChanged`] already feed. Deliberately NOT in the 0x30 clock block — it carries a
-// duration precisely so that no clock domain is involved.
+// [`PipelineGap`]. 0x0A stays in the 0x01–0x09 video/rate-control block
+// (same ABR consumer). Not 0x30: it carries a duration, no clock domain.
 #define PUNKTFUNK_MSG_PIPELINE_GAP 10
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`DeliveryReport`].
 #define PUNKTFUNK_MSG_DELIVERY_REPORT 11
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`ProbeRequest`].
 #define PUNKTFUNK_MSG_PROBE_REQUEST 32
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`ProbeResult`].
 #define PUNKTFUNK_MSG_PROBE_RESULT 33
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`ClockProbe`].
 #define PUNKTFUNK_MSG_CLOCK_PROBE 48
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`ClockEcho`].
 #define PUNKTFUNK_MSG_CLOCK_ECHO 49
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`PhaseReport`].
 #define PUNKTFUNK_MSG_PHASE_REPORT 50
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`ClipControl`] (client → host): enable/disable the shared clipboard for this
-// session. Idempotent; opt-in is enforced here, not just in UI.
+// Idempotent enable/disable. Opt-in is here, not just in UI.
 #define PUNKTFUNK_MSG_CLIP_CONTROL 64
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`ClipState`] (host → client): ack + unsolicited policy/backend updates.
 #define PUNKTFUNK_MSG_CLIP_STATE 65
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`ClipOffer`] (symmetric): the lazy announcement — format list only, no bytes.
+// Format list only — no clipboard bytes.
 #define PUNKTFUNK_MSG_CLIP_OFFER 66
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`ClipFetch`] (requester → holder, **fetch stream only**): pull one format of the
-// current offer.
+// Fetch stream only — never the control stream.
 #define PUNKTFUNK_MSG_CLIP_FETCH 67
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`ClipFetchHdr`] (holder → requester, **fetch stream only**): the fetch response
-// header that precedes the data chunks.
+// Fetch stream only — header that precedes the data chunks.
 #define PUNKTFUNK_MSG_CLIP_FETCH_HDR 68
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`ClipControl::flags`] bit: the client permits file kinds to be offered/fetched this session.
-// Absent ⇒ files are filtered out of offers in both directions (text/rich/image only).
+// Absent ⇒ files are filtered from offers in both directions.
 #define PUNKTFUNK_CLIP_FLAG_FILES 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`ClipState::policy`] bit: the host permits non-file formats (text/RTF/HTML/image). Always set
-// while enabled unless a future direction limit clears it.
+// Always set while enabled unless a future direction limit clears it.
 #define PUNKTFUNK_CLIP_POLICY_TEXT 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`ClipState::policy`] bit: the host permits file formats. Cleared by the operator `no-files`
-// / `text-only` policy so the client can grey out "Include files".
+// Cleared by operator `no-files` / `text-only`.
 #define PUNKTFUNK_CLIP_POLICY_FILES 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`ClipState::reason`]: normal ack, nothing exceptional.
 #define PUNKTFUNK_CLIP_REASON_OK 0
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`ClipState::reason`]: this session type has no working clipboard backend (e.g. a gamescope
-// session with no data-control global) — the client shows "not supported in this session type".
+// No working clipboard backend for this session type.
 #define PUNKTFUNK_CLIP_REASON_BACKEND_UNAVAILABLE 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`ClipState::reason`]: another client took over the single per-desktop clipboard binding; this
-// one was disabled (last `ClipControl{enabled}` wins).
+// Another client took the single per-desktop clipboard binding.
 #define PUNKTFUNK_CLIP_REASON_TAKEN_OVER 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`ClipState::reason`]: the host operator policy (`PUNKTFUNK_CLIPBOARD=off`) disables clipboard.
 #define PUNKTFUNK_CLIP_REASON_POLICY_DISABLED 3
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`ClipState::reason`]: enabled, but the host policy forbids file transfer (`no-files` /
-// `text-only`) — surfaced so the client greys "Include files" with a footnote.
+// Enabled, but host policy forbids file transfer.
 #define PUNKTFUNK_CLIP_REASON_NO_FILES 4
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`ClipState::reason`]: the operator policy allows clipboard, but THIS device's access grants
-// don't (`GRANT_CLIPBOARD` unbit — design/per-client-access.md §5.4). Distinct from
-// [`CLIP_REASON_POLICY_DISABLED`] so the client can say "not permitted for this device" instead
-// of "the host has clipboard off".
+// Distinct from [`CLIP_REASON_POLICY_DISABLED`]: host allows clipboard,
+// this device's grants do not (`GRANT_CLIPBOARD`).
 #define PUNKTFUNK_CLIP_REASON_NOT_PERMITTED 5
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`ClipFetchHdr::status`]: the requested format is being served; data chunks follow until FIN.
+// Data chunks follow until FIN.
 #define PUNKTFUNK_CLIP_FETCH_OK 0
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`ClipFetchHdr::status`]: the fetch named a `seq` that is no longer the holder's current offer;
-// the requester degrades the paste to "nothing inserted" rather than wrong data. No chunks follow.
+// `seq` is no longer current. Paste nothing rather than wrong data. No chunks.
 #define PUNKTFUNK_CLIP_FETCH_STALE 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`ClipFetchHdr::status`]: the format/index is not available (no backend, or it vanished). No
-// chunks follow.
+// Format/index not available. No chunks.
 #define PUNKTFUNK_CLIP_FETCH_UNAVAILABLE 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`ClipFetchHdr::status`]: policy/cap denies this fetch (e.g. a file fetch under `no-files`). No
-// chunks follow.
+// Policy/cap denies this fetch. No chunks.
 #define PUNKTFUNK_CLIP_FETCH_DENIED 3
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Maximum number of [`ClipKind`] entries in one [`ClipOffer`] (resource cap, §7).
 #define PUNKTFUNK_CLIP_MAX_KINDS 16
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Maximum length in bytes of a [`ClipKind::mime`] string (resource cap, §7).
 #define PUNKTFUNK_CLIP_MAX_MIME 128
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`ClipFetch::file_index`] sentinel meaning "not a file fetch" (a whole non-file format, or the
-// file *manifest* itself). Real file fetches use `0..n`.
+// Not a file fetch (a whole non-file format, or the file manifest).
 #define PUNKTFUNK_CLIP_FILE_INDEX_NONE UINT32_MAX
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`CursorShape`] (host → client): the pointer's bitmap + hotspot changed.
 #define PUNKTFUNK_MSG_CURSOR_SHAPE 80
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`CursorRenderMode`] (client → host): who renders the pointer right now.
 #define PUNKTFUNK_MSG_CURSOR_RENDER 81
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Per-side pixel cap for a forwarded cursor bitmap. The control-stream frame is length-prefixed
-// with a `u16`, so a whole message must fit 65535 bytes — 128×128 RGBA (65536 B) already
-// overshoots before the 17-byte header. 120² (57.6 KiB + header) fits with headroom and covers
-// real cursors (typically ≤ 64 px, ≤ 96 px at HiDPI scale); the HOST downscales anything
-// larger before forwarding, so the cap is invisible to clients.
+// Per-side pixel cap. Control frames are `u16`-length-prefixed (65535).
+// 128×128 RGBA is 65536 B before the 17-byte header; 120² (57.6 KiB +
+// header) fits. Host downscales anything larger.
 #define PUNKTFUNK_CURSOR_SHAPE_MAX_SIDE 120
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`AccessUpdate`] (host → client): the session's effective grants or remaining
-// lifetime changed. 0x58: the 0x50 block belongs to the cursor channel (0x50/0x51 taken),
-// so access sits at its top, clear of both the clipboard block (0x40-0x44) and any further
-// cursor growth.
+// [`AccessUpdate`]. 0x58: 0x50–0x51 are cursor; 0x40–0x44 are clipboard.
 #define PUNKTFUNK_MSG_ACCESS_UPDATE 88
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Datagram wire tags. Video rides UDP; everything low-rate rides QUIC datagrams,
-// demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8, client→host),
-// audio = [`AUDIO_MAGIC`] (0xC9, host→client), rumble = [`RUMBLE_MAGIC`] (0xCA, host→client),
-// mic = [`MIC_MAGIC`] (0xCB, client→host), rich-input = [`RICH_INPUT_MAGIC`] (0xCC, client→host),
-// HID-output = [`HIDOUT_MAGIC`] (0xCD, host→client), HDR metadata = [`HDR_META_MAGIC`]
-// (0xCE, host→client), host timing = [`HOST_TIMING_MAGIC`] (0xCF, host→client), cursor state =
-// [`CURSOR_STATE_MAGIC`] (0xD0, host→client), pad audio = [`PAD_AUDIO_MAGIC`] (0xD1,
-// host→client).
 #define PUNKTFUNK_AUDIO_MAGIC 201
 #endif
 
@@ -1565,477 +1043,348 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Microphone uplink: the client's mic, Opus-encoded, client → host (the inverse of
-// [`AUDIO_MAGIC`]). The host feeds it into a virtual PipeWire source so its apps can record it.
+// Client → host Opus. The host feeds a virtual PipeWire source so apps can record it.
 #define PUNKTFUNK_MIC_MAGIC 203
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Rich client→host input: events too big for the fixed 18-byte [`InputEvent`]
-// (crate::input::InputEvent) — the DualSense touchpad and motion sensors. Variable-length,
-// kind-tagged (see [`RichInput`]).
 #define PUNKTFUNK_RICH_INPUT_MAGIC 204
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// HID output, host → client: DualSense feedback a game wrote to the host's virtual controller
-// (lightbar, player LEDs, adaptive triggers) — the rich analog of [`RUMBLE_MAGIC`]. See
-// [`HidOutput`].
 #define PUNKTFUNK_HIDOUT_MAGIC 205
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Redundant audio datagram, host → client: the [`AUDIO_MAGIC`] plane plus a copy of the PREVIOUS
-// frame, so a single lost datagram is *reconstructed* rather than concealed.
+// Previous-frame copy on the successor datagram — a lost 0xC9 is reconstructed, not concealed.
 //
-// `[0xD2][u32 seq LE][u64 pts_ns LE][u16 primary_len LE][primary opus][previous opus]`
+// `[0xD2][u32 seq LE][u64 pts_ns LE][u16 primary_len LE][primary][previous]`.
+// Previous seq is `seq - 1`; empty tail = no predecessor.
 //
-// **Why this and not Opus in-band FEC.** LBRR is a SILK-layer feature: the desktop-audio encoder
-// runs `RESTRICTED_LOWDELAY` (CELT-only) at 5 ms frames, which is below SILK's 10 ms minimum, so
-// `set_inband_fec(true)` on that encoder is a no-op. Nothing in libopus can protect this plane —
-// the redundancy has to be at the application layer. (The mic uplink is a different encoder, VoIP
-// mode at 10 ms, and *does* use real in-band FEC.)
+// Not Opus LBRR: `RESTRICTED_LOWDELAY` is CELT-only at 5 ms, below SILK's 10 ms, so
+// `set_inband_fec` is a no-op. Mic uplink (VoIP, 10 ms) does use in-band FEC.
+// Recovery sits in the client's 15–90 ms de-jitter buffer; the copy is not extra delay.
 //
-// **Why it costs no latency.** The copy rides the SUCCESSOR of the frame it protects, and the
-// client is already holding 15–90 ms of de-jitter buffer — far more than the 5 ms the successor
-// takes to arrive. So the recovery happens inside slack that already exists.
-//
-// The previous frame's sequence is implicitly `seq - 1`; a host with nothing to duplicate yet
-// (the first frame of a session, or straight after a capture reopen) simply sends an empty tail,
-// which decodes to `None`.
-//
-// Sent ONLY when the client advertised [`CLIENT_CAP_AUDIO_RED`](super::caps::CLIENT_CAP_AUDIO_RED)
-// and the host answered [`HOST_CAP_AUDIO_RED`](super::caps::HOST_CAP_AUDIO_RED) — the
-// capable-and-agreed handshake the cursor and 4:4:4 planes already use. Every other session keeps
-// the plain [`AUDIO_MAGIC`] wire byte-for-byte.
-//
-// NB `0xD1` is deliberately skipped: the DualSense pad-audio program has reserved it for the
-// per-pad audio plane.
+// Sent only when both peers advertised [`CLIENT_CAP_AUDIO_RED`](super::caps::CLIENT_CAP_AUDIO_RED)
+// / [`HOST_CAP_AUDIO_RED`](super::caps::HOST_CAP_AUDIO_RED). `0xD1` is pad audio; this tag is `0xD2`.
 #define PUNKTFUNK_AUDIO_RED_MAGIC 210
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Fixed header length of an [`AUDIO_RED_MAGIC`] datagram (tag + seq + pts + primary length).
 #define PUNKTFUNK_AUDIO_RED_HEADER (((1 + 4) + 8) + 2)
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Lossless PCM audio, host → client: `[0xD3][u32 seq LE][u64 pts_ns LE][interleaved LE samples]`.
+// Lossless PCM. Header matches [`AUDIO_MAGIC`] so
+// [`AudioGapTracker`](crate::audio::AudioGapTracker) and pts / A-V sync stay unchanged.
 //
-// **Deliberately the same header as [`AUDIO_MAGIC`]**, so
-// [`AudioGapTracker`](crate::audio::AudioGapTracker) and the pts / A-V-sync plumbing work
-// unchanged and the only new logic on this plane is the payload format and its concealment
-// ([`crate::audio::pcm`]).
+// `[0xD3][u32 seq LE][u64 pts_ns LE][interleaved LE samples]`.
+// A session runs `0xC9`/`0xD2` **or** `0xD3`, never both, never mid-session:
+// the output device is open at a fixed rate/depth. Capture format change ends
+// the plane rather than switching tags.
 //
-// A session runs `0xC9`/`0xD2` **or** `0xD3`, never both, and never switches mid-session: the
-// client's output device is open at a fixed rate and depth, so a change means a re-open. If the
-// capture dies and comes back at a different format the host ends the audio plane rather than
-// changing tags underneath a client that cannot follow.
-//
-// One frame per datagram, `audio_frame_us` long, **never fragmented** — the frame duration is
-// chosen at session start by [`crate::audio::pcm::frame_us_for`] so the payload cannot exceed
-// the path MTU. Redundancy ([`AUDIO_RED_MAGIC`]) is not defined for this plane and is never
-// sent with it: it would double a bitrate that is already the largest on the connection, and
-// `plan_audio_budget`'s ladder would never choose it.
+// One frame per datagram, sized by [`crate::audio::pcm::frame_us_for`] so it
+// fits the path MTU — never fragmented. No [`AUDIO_RED_MAGIC`]: it would
+// double the largest bitrate on the connection.
 #define PUNKTFUNK_AUDIO_PCM_MAGIC 211
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Wire length of a v1 (legacy, level) rumble datagram.
 #define PUNKTFUNK_RUMBLE_V1_LEN 7
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Wire length of a v2 (envelope) rumble datagram — the v1 body plus a `[u8 seq][u16 ttl_ms LE]`
-// tail. Decoders are length-tolerant (see [`decode_rumble_envelope`]): an old client reads the
-// first 7 bytes as a plain level and ignores the tail, so no wire-version bump is needed — the
-// same dual-size idiom the HDR-luminance `AddRequest` tail uses.
+// v1 body + `[u8 seq][u16 ttl_ms LE]`. Length-tolerant: an old client reads the first 7 bytes
+// and ignores the tail — no wire-version bump.
 #define PUNKTFUNK_RUMBLE_V2_LEN 10
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Wire length of a v3 (envelope + impulse-trigger motors) rumble datagram — the v2 form plus a
-// `[u16 left_trigger LE][u16 right_trigger LE]` tail (see [`encode_rumble_datagram_v3`]). Second
-// use of the same append-extension the v2 tail introduced, and for the same reason: every reader
-// on this plane gates with `>=`, so a 14-byte datagram satisfies the v1 predicate (level only),
-// the v2 predicate (level + envelope) and this one, and each peer takes the prefix it knows.
+// v2 + `[u16 left_trigger LE][u16 right_trigger LE]`. Same `>=` prefix as v2: a 14-byte
+// datagram satisfies v1, v2, and v3 readers.
 #define PUNKTFUNK_RUMBLE_V3_LEN 14
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Longest raw HID report a [`RichInput::HidReport`] / [`HidOutput::HidRaw`] can carry — the
-// 64-byte interrupt/feature report size every Valve controller uses (Triton input reports are
-// 46–54 bytes; feature and output reports are at most 64).
+// Longest raw HID report on [`RichInput::HidReport`] / [`HidOutput::HidRaw`].
+// Valve interrupt/feature reports are 64 bytes.
 #define PUNKTFUNK_HID_REPORT_MAX 64
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Longest [`HidOutput::Trigger`] `effect` the wire carries: the DualSense adaptive-trigger
-// parameter block is a mode byte plus ten parameters, and every consumer copies at most this many
-// into its report.
-//
-// The single source for the clamp on BOTH sides. `Trigger` was the only variable-length variant
-// bounded on neither: encode appended whatever it was handed and decode took the entire tail, so
-// an attacker-sized datagram was reproduced verbatim into a `Vec` while its sibling `HidRaw` had
-// been bounded on both ends all along.
+// Longest [`HidOutput::Trigger`] `effect`: DualSense mode byte plus ten parameters.
+// Encode and decode both clamp here — the only variable-length HID-output variant.
 #define PUNKTFUNK_TRIGGER_EFFECT_MAX 11
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`HidOutput::HidRaw`] `kind`: an OUTPUT report — what the host's hidraw client wrote with
-// `write()`/`SDL_hid_write` (Triton rumble `0x80`, haptic pulse `0x81`, …). The client replays
-// it on the physical device's interrupt-OUT endpoint / GATT write.
+// [`HidOutput::HidRaw`] `kind`: interrupt-OUT / GATT write (`write` / `SDL_hid_write`).
 #define PUNKTFUNK_HID_RAW_OUTPUT 0
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`HidOutput::HidRaw`] `kind`: a FEATURE report — what the host's hidraw client sent with
-// `SET_REPORT` (`SDL_hid_send_feature_report`: lizard mode, IMU enable, settings). The client
-// replays it as a USB `SET_REPORT(Feature)` control transfer / GATT feature write.
+// [`HidOutput::HidRaw`] `kind`: SET_REPORT / GATT feature write (`SDL_hid_send_feature_report`).
 #define PUNKTFUNK_HID_RAW_FEATURE 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// HDR static-metadata datagram tag, host → client (the static analog of the per-frame VUI;
-// see [`HdrMeta`]). Next tag after [`HIDOUT_MAGIC`].
 #define PUNKTFUNK_HDR_META_MAGIC 206
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Wire length of an [`HdrMeta`] body (no tag byte): 6×u16 primaries + 2×u16 white + 2×u32
-// luminance + 2×u16 CLL/FALL = 28 bytes. Shared by the [`HDR_META_MAGIC`] datagram (which
-// prefixes the tag) and the `Hello::display_hdr` trailing field (which carries the bare body).
+// [`HdrMeta`] body (no tag): 6×u16 primaries + 2×u16 white + 2×u32 luminance +
+// 2×u16 CLL/FALL = 28. Shared by the [`HDR_META_MAGIC`] datagram and `Hello::display_hdr`.
 #define PUNKTFUNK_HDR_META_BODY_LEN (((12 + 4) + 8) + 4)
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Per-AU host-timing datagram tag, host → client (see [`HostTiming`]). Next tag after
-// [`HDR_META_MAGIC`]. Emitted once per access unit, right after its last packet left the host's
-// socket, and only when the client advertised [`VIDEO_CAP_HOST_TIMING`].
+// Per-AU host timing. Once per access unit, after its last packet left the socket,
+// and only when the client advertised [`VIDEO_CAP_HOST_TIMING`].
 #define PUNKTFUNK_HOST_TIMING_MAGIC 207
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Cursor-state datagram tag, host → client (design/remote-desktop-sweep.md M2). Next tag after
-// [`HOST_TIMING_MAGIC`]. Sent once per captured frame while the cursor channel is negotiated
-// ([`CLIENT_CAP_CURSOR`](super::caps::CLIENT_CAP_CURSOR) ∧
-// [`HOST_CAP_CURSOR`](super::caps::HOST_CAP_CURSOR)) — per-frame resend makes the plane
-// self-healing under loss (latest-wins, no refresh timer). The bitmap itself rides the
-// reliable control stream ([`CursorShape`](super::control::CursorShape)); this 14-byte
-// datagram only moves/hides the pointer.
+// Cursor state. Once per captured frame while
+// [`CLIENT_CAP_CURSOR`](super::caps::CLIENT_CAP_CURSOR) ∧
+// [`HOST_CAP_CURSOR`](super::caps::HOST_CAP_CURSOR) — per-frame resend is
+// latest-wins under loss. The bitmap rides the control stream
+// ([`CursorShape`](super::control::CursorShape)); this datagram only moves/hides.
 #define PUNKTFUNK_CURSOR_STATE_MAGIC 208
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`CursorState::flags`] bit: the host cursor is visible.
 #define PUNKTFUNK_CURSOR_VISIBLE 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`CursorState::flags`] bit: a host app captured/hid the pointer — the client SHOULD run
-// relative/captured (M3 auto-flip; advisory, user override always wins).
+// Host app captured/hid the pointer — the client should run relative/captured.
+// Advisory; user override always wins.
 #define PUNKTFUNK_CURSOR_RELATIVE_HINT 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pad-audio datagram tag, host → client: per-gamepad audio a game routed
-// to the host's virtual DualSense — voice-coil haptics and the built-in speaker — for the client
-// to render on the matching real controller. Next tag after [`CURSOR_STATE_MAGIC`]. The
-// per-pad AUDIO plane (Opus frames, the [`AUDIO_MAGIC`]/[`MIC_MAGIC`] shape plus pad + kind);
-// the routing/volume CONTROL side rides [`HidOutput::AudioCtl`]. Emitted only when the session
-// negotiated it ([`CLIENT_CAP_PAD_AUDIO`](super::caps::CLIENT_CAP_PAD_AUDIO) ∧
-// [`HOST_CAP_PAD_AUDIO`](super::caps::HOST_CAP_PAD_AUDIO)) and the pad's arrival declared a
-// renderer for the kind ([`crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/`_SPEAKER`).
-// Best-effort like every audio datagram: a lost frame is a concealed gap, never state.
+// Per-gamepad DualSense audio (voice-coil haptics and speaker) for the matching
+// real controller. Samples on this plane; routing/volume on [`HidOutput::AudioCtl`].
+// Emitted only when the session negotiated
+// [`CLIENT_CAP_PAD_AUDIO`](super::caps::CLIENT_CAP_PAD_AUDIO) ∧
+// [`HOST_CAP_PAD_AUDIO`](super::caps::HOST_CAP_PAD_AUDIO) and the pad arrival
+// declared a renderer
+// ([`crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/`_SPEAKER`).
+// A lost frame is a concealed gap, never state.
 #define PAD_AUDIO_MAGIC 209
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`PadAudioFrame::kind`]: the BACK channel pair — the DualSense voice-coil actuators (audio
-// haptics). 5 ms Opus frames, matching the [`AUDIO_MAGIC`] cadence: haptics are felt latency.
+// DualSense voice-coil actuators. 5 ms Opus, same cadence as [`AUDIO_MAGIC`]: haptics are felt latency.
 #define PAD_AUDIO_KIND_HAPTICS 0
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`PadAudioFrame::kind`]: the FRONT channel pair — the controller's built-in speaker. 10 ms
-// Opus frames (speaker content tolerates the extra buffering for the better coding efficiency).
+// Controller speaker. 10 ms Opus — speaker content can buffer for coding efficiency.
 #define PAD_AUDIO_KIND_SPEAKER 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// QUIC application error code a punktfunk/1 client closes the control connection with on a
-// **deliberate quit** (a user "stop", not a network drop). The host reads it off the connection's
-// `ApplicationClosed` reason and tears the session's virtual display down immediately, skipping the
-// keep-alive linger; any other close reason (idle timeout, reset, a bare code 0) still lingers so a
-// reconnect can resume. Shared so host + every client agree on the code.
+// QUIC application close: client deliberate quit. Host tears the virtual display down
+// immediately (no keep-alive linger). Any other close still lingers for reconnect.
 #define PUNKTFUNK_QUIT_CLOSE_CODE 81
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// QUIC application error code the **host** closes the control connection with when a **dedicated game
-// session's game process exits** (the nested gamescope died — the user quit the game), so a launcher
-// client can distinguish "the game ended" from an error and return to its library cleanly rather than
-// surfacing a failure (`design/gamemode-and-dedicated-sessions.md` §5.3). Sibling of
-// [`QUIT_CLOSE_CODE`]; a client that doesn't special-case it still ends the session (every client
-// returns to its launcher on session end), so it is purely refinement. Shared so host + clients agree.
+// QUIC application close: dedicated-session game process exited. Sibling of
+// [`QUIT_CLOSE_CODE`]; clients that ignore it still end the session.
 #define PUNKTFUNK_APP_EXITED_CLOSE_CODE 82
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Longest device name carried in a [`Hello`] (bytes of UTF-8; longer names are truncated on
-// encode, rejected on decode — a one-byte length prefix caps it at 255 anyway).
+// Longest [`Hello`] device name (UTF-8 bytes). Truncated on encode, rejected on decode.
 #define PUNKTFUNK_HELLO_NAME_MAX 64
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Longest library id carried in a [`Hello::launch`] (bytes of UTF-8). Ids are short
-// (`steam:<appid>` / `custom:<12 hex>`); the cap just bounds an attacker-controlled field.
+// Longest [`Hello::launch`] id (UTF-8 bytes). Ids are short; 128 bounds the length prefix.
 #define PUNKTFUNK_HELLO_LAUNCH_MAX 128
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Welcome::cipher`] id: AES-128-GCM — the default session AEAD every peer speaks (and the
-// only one pre-cipher builds know).
+// [`Welcome::cipher`]: AES-128-GCM. Default; the only id pre-cipher builds know.
 #define PUNKTFUNK_CIPHER_AES_128_GCM 0
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Welcome::cipher`] id: ChaCha20-Poly1305 (RFC 8439) — negotiated via
-// [`VIDEO_CAP_CHACHA20`] for clients without hardware AES.
+// [`Welcome::cipher`]: ChaCha20-Poly1305 (RFC 8439), via [`VIDEO_CAP_CHACHA20`].
 #define PUNKTFUNK_CIPHER_CHACHA20_POLY1305 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Welcome::audio_codec`] id: **Opus on the `0xC9` plane** — the legacy default, 48 kHz, what
-// every pre-hi-res build sends and what every declined hi-res negotiation resolves back to
-// (`design/hi-res-audio.md` §8.4: a fallback to today's transparent 256 kbps Opus is not a
-// defeat; silence is the one unacceptable outcome). `0`, so an absent field and an older host
-// both read as Opus and the common Welcome stays byte-identical to the pre-hi-res wire form.
+// [`Welcome::audio_codec`]: Opus on `0xC9` (48 kHz). `0` so absence and older hosts both
+// read as Opus; a declined hi-res session resolves here — silence is the unacceptable outcome.
 #define PUNKTFUNK_AUDIO_CODEC_OPUS 0
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Welcome::audio_codec`] id **reserved for FLAC** on the `0xD3` plane — deliberately reserved
-// and deliberately **unimplemented**.
-//
-// The design doc numbers the audio codecs `0` = Opus, `1` = FLAC, `2` = PCM, and this project has
-// been bitten before by wire ids that drifted from the document that specifies them. The id is
-// therefore burned rather than compacted: `AUDIO_CODEC_PCM` is `2` because the doc says `2`.
-//
-// FLAC lost on the merits, and the reasoning is recorded in `crate::audio::pcm`'s module docs so
-// it does not have to be re-derived: the plane is never fragmented, so a frame must be sized from
-// the codec's WORST case (a FLAC VERBATIM subframe — raw samples plus a header), which means FLAC
-// and PCM negotiate the same frame duration, the same packet rate and the same send-buffer
-// sizing. A codec would buy average bytes on a plane that is provisioned for peak, at the cost of
-// a new dependency in the NDK / xcframework / flatpak / MSIX / Arch packaging targets. No host
-// emits this id and no client should accept it; it exists so that a future one could.
+// [`Welcome::audio_codec`] id `1`, reserved and unimplemented. The design numbers Opus=0,
+// FLAC=1, PCM=2; this id is burned so [`AUDIO_CODEC_PCM`] stays `2`. Why FLAC lost lives in
+// `crate::audio::pcm`. No host emits this; no client should accept it.
 #define PUNKTFUNK_AUDIO_CODEC_FLAC_RESERVED 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Welcome::audio_codec`] id: **raw interleaved LE PCM on the `0xD3` plane** (`crate::audio::pcm`)
-// — the lossless format this negotiation exists to reach, at the resolved
-// [`Welcome::audio_rate_hz`] / [`audio_bits`](Welcome::audio_bits) /
-// [`audio_frame_us`](Welcome::audio_frame_us).
-//
-// `2` rather than `1` because [`AUDIO_CODEC_FLAC_RESERVED`] holds `1` — see there.
+// [`Welcome::audio_codec`]: raw interleaved LE PCM on `0xD3` (`crate::audio::pcm`).
+// `2` because [`AUDIO_CODEC_FLAC_RESERVED`] holds `1`.
 #define PUNKTFUNK_AUDIO_CODEC_PCM 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`PairRequest`].
 #define PUNKTFUNK_MSG_PAIR_REQUEST 16
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`PairChallenge`].
 #define PUNKTFUNK_MSG_PAIR_CHALLENGE 17
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`PairProof`].
 #define PUNKTFUNK_MSG_PAIR_PROOF 18
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Type byte of [`PairResult`].
 #define PUNKTFUNK_MSG_PAIR_RESULT 19
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`PenSample::state`] bit: the pen is in the hover range of the surface. Implied by
-// [`PEN_TOUCHING`] (decode normalizes, so a client that only sets TOUCHING still produces a
-// coherent contact).
+// Implied by [`PEN_TOUCHING`]; [`PenTracker`] ORs it so a client that only sets TOUCHING still looks in-range.
 #define PUNKTFUNK_PEN_IN_RANGE 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`PenSample::state`] bit: the tip is in contact with the surface.
 #define PUNKTFUNK_PEN_TOUCHING 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`PenSample::state`] bit: the primary barrel button (or the client's squeeze mapping) is held.
+// Primary barrel, or the client's squeeze mapping.
 #define PUNKTFUNK_PEN_BARREL1 4
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`PenSample::state`] bit: the secondary barrel button (or the client's double-tap mapping)
-// is held.
+// Secondary barrel, or the client's double-tap mapping.
 #define PUNKTFUNK_PEN_BARREL2 8
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`PenSample::state`] bit, RESERVED: a predicted (not yet observed) sample. Never sent v1;
-// receivers MUST ignore samples carrying it until a capability negotiates otherwise
-// (design/pen-tablet-input.md §8).
+// Reserved: predicted sample. Never sent v1; [`PenTracker::apply`] skips it until a capability says otherwise.
 #define PUNKTFUNK_PEN_PREDICTED 128
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`PenSample::tilt_deg`] sentinel: the client has no tilt sensor / no reading.
 #define PUNKTFUNK_PEN_TILT_UNKNOWN 255
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`PenSample::azimuth_deg`] / [`PenSample::roll_deg`] sentinel: no reading.
 #define PUNKTFUNK_PEN_ANGLE_UNKNOWN 65535
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`PenSample::distance`] sentinel: no hover-distance reading.
 #define PUNKTFUNK_PEN_DISTANCE_UNKNOWN 65535
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Most samples one [`PenBatch`] can carry. Sized for coalesced capture at video-frame cadence
-// (240 Hz pen ÷ 30 fps = 8); a client producing more splits into consecutive batches.
+// Coalesced capture at video-frame cadence: 240 Hz ÷ 30 fps = 8. More samples split across batches.
 #define PUNKTFUNK_PEN_BATCH_MAX 8
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Wire length of one encoded [`PenSample`].
 #define PUNKTFUNK_PEN_SAMPLE_WIRE_LEN 21
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Host-side failsafe (design/pen-tablet-input.md §2): a tracker still in range after this
-// many ms without a sample force-releases ([`PenTracker::force_release`]) — a client that
-// died mid-stroke must not leave the host's virtual pen inked-down forever. This makes the
-// **client heartbeat a wire contract**: capture APIs only fire on change, so a stationary
-// pen is naturally silent — senders MUST repeat the last sample at least every ~100 ms while
-// the pen is in range or touching (it re-decodes as pure Motion, harmless), keeping a live
-// stationary stroke two heartbeats clear of the deadline.
+// Force-release if still in range after this many ms with no sample (dead client).
+// Capture only fires on change, so senders repeat the last sample every ~100 ms while
+// in range — two heartbeats clear of this deadline. Repeats re-decode as Motion.
 #define PUNKTFUNK_PEN_TOUCH_TIMEOUT_MS 200
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Stream-kind byte: a clipboard fetch (request/response of one format). Future stream kinds
-// (e.g. a bulk file-content push) mux under the same [`STREAM_MAGIC`] with a different byte.
+// Other stream kinds mux under [`STREAM_MAGIC`] with a different byte.
 #define PUNKTFUNK_CLIP_STREAM_KIND_FETCH 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// QUIC application error code used to `reset`/`stop` a clipboard fetch stream on cancel — sync
-// disabled mid-transfer, paste timed out, size cap exceeded, teardown. Distinct from the
-// connection close codes ([`super::QUIT_CLOSE_CODE`] `0x51` / [`super::APP_EXITED_CLOSE_CODE`]
-// `0x52`), the connection reject code `0x42`, and the pairing-rejection close block
-// `0x60`–`0x67` — stream reset codes and connection close codes are separate QUIC namespaces,
-// but the vocabularies stay disjoint on purpose so a captured code is unambiguous.
+// Stream-reset / stop code for a cancelled fetch. Distinct from connection close
+// codes (`0x51`/`0x52` quit/exit, `0x42` reject, `0x60`–`0x67` pairing) so a
+// captured code is unambiguous even though QUIC already namespaces them.
 #define PUNKTFUNK_CLIP_CANCELLED_CODE 112
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Chunk size for streaming fetch data (64 KiB writes — matches the control-frame bound).
+// 64 KiB write size; matches the control-frame bound.
 #define PUNKTFUNK_CLIP_CHUNK (64 * 1024)
 #endif
 
-// Consecutive no-output AUs that force a keyframe request. ~50 ms at 60 Hz — long enough not to fire
-// on a one-frame decoder hiccup, short enough that a lost initial IDR (or a mid-GOP join) unfreezes
-// almost immediately instead of never.
+// Consecutive no-output AUs that force a keyframe request. 3 ≈ 50 ms at 60 Hz: skip a one-frame
+// decoder hiccup, still recover a lost initial IDR before the picture stays dark.
 #define PUNKTFUNK_NO_OUTPUT_KEYFRAME_STREAK 3
 
-// How many host intra-refresh recovery marks ([`USER_FLAG_RECOVERY_POINT`]) must arrive since the
-// latest loss before the gate lifts its freeze on an IDR-free stream. TWO, not one: with a continuous
-// rolling wave the host marks phase-fixed wave boundaries, so the FIRST boundary after a loss is only
-// partially healed — stripes swept BEFORE the loss still reference the lost frame — and lifting there
-// would flash a partially-stale picture. The SECOND boundary guarantees a full wave swept entirely
-// after the loss, so the picture is clean. This stays correct under repeated loss because every fresh
-// arm resets the count. The cost is up to ~2 wave periods of holding the last good frame — the
-// deliberate "hold longer, never show garbage" trade.
+// Intra-refresh [`USER_FLAG_RECOVERY_POINT`]s since the latest loss before the freeze lifts
+// without an IDR. Two, not one: the first wave boundary after a loss is only half-healed
+// (stripes swept before the loss still reference the lost frame). Every arm resets the count.
 //
 // [`USER_FLAG_RECOVERY_POINT`]: crate::packet::USER_FLAG_RECOVERY_POINT
 #define PUNKTFUNK_REANCHOR_MARKS_TO_LIFT 2
 
-// QUIC application error code the host closes with on a `mode_conflict = reject` admission
-// refusal, carrying the human-readable busy reason (live mode + client label). A distinct code
-// lets a client tell "host busy" apart from a transport failure. Shared so clients can render it.
+// `mode_conflict = reject` admission close. Distinct from a transport
+// failure so a client can render "host busy". Reason bytes carry live mode
+// + client label.
 #define PUNKTFUNK_REJECT_BUSY_CLOSE_CODE 66
 
-// QUIC application close codes the host sends on **pairing-gate rejections**, so a client can
-// tell the user WHY it was turned away instead of collapsing every close into a generic
-// "not accepted" (the failure mode behind more than one support thread: a PIN attempt against a
-// disarmed host, an operator denial, and a dead network path all looked identical). Grouped in
-// their own 0x60 block, disjoint from [`REJECT_BUSY_CLOSE_CODE`] (0x42) and the deliberate-end
-// codes (0x51/0x52). Purely additive: an older client treats them as a bare close (exactly the
-// pre-code behavior), an older host never sends them. Decode with [`RejectReason::from_close_code`].
+// Pairing-gate close. Occupies 0x60.., disjoint from
+// [`REJECT_BUSY_CLOSE_CODE`] (0x42) and the deliberate-end codes (0x51/0x52).
+// Decode with [`RejectReason::from_close_code`].
 #define PUNKTFUNK_PAIR_NOT_ARMED_CLOSE_CODE 96
 
-// Pairing window armed, but bound to a DIFFERENT device fingerprint (the attempt does not
-// consume the window). See [`PAIR_NOT_ARMED_CLOSE_CODE`] for the block's contract.
+// Armed window is bound to a different fingerprint; the attempt does not
+// consume it.
 #define PUNKTFUNK_PAIR_BOUND_OTHER_CLOSE_CODE 97
 
-// PIN attempt inside the host's global pairing cooldown — retry shortly.
+// Inside the host's global pairing cooldown.
 #define PUNKTFUNK_PAIR_RATE_LIMITED_CLOSE_CODE 98
 
-// Unpaired client presented no certificate: nothing to approve, and the SPAKE2 ceremony needs an
-// identity to bind — the PIN flow with a client identity is the way in.
+// No client certificate: SPAKE2 has nothing to bind.
 #define PUNKTFUNK_PAIR_NO_IDENTITY_CLOSE_CODE 99
 
-// The operator explicitly denied this pairing request in the host console.
 #define PUNKTFUNK_PAIR_DENIED_CLOSE_CODE 100
 
-// Nobody decided on the parked pairing request before the host's approval wait elapsed.
 #define PUNKTFUNK_PAIR_APPROVAL_TIMEOUT_CLOSE_CODE 101
 
-// This parked knock was superseded by a newer connection from the same device — only the
-// newest is admitted on approval.
+// Only the newest knock from this device is admitted.
 #define PUNKTFUNK_PAIR_SUPERSEDED_CLOSE_CODE 102
 
-// The client's wire (protocol) version does not match the host's — one side needs updating.
 #define PUNKTFUNK_WIRE_VERSION_CLOSE_CODE 103
 
-// The host admitted the connection but could not stand the stream session up (compositor /
-// capture / encoder setup failed host-side). The close reason bytes carry the specific error
-// text for logs/diagnostics; clients render a stable "host-side failure" sentence. Before this
-// code, a setup failure reached the client as a bare dropped connection ("control stream
-// finished mid-frame") — indistinguishable from transport trouble.
+// Admitted, then compositor / capture / encoder setup failed. Reason bytes
+// carry the host error; clients render a stable "host-side failure" sentence.
 #define PUNKTFUNK_SETUP_FAILED_CLOSE_CODE 104
 
-// This device's temporary access ran out (per-client access, `design/per-client-access.md` §4)
-// — sent when the deadline fires mid-session, and by "Expire now" in the console. Only the
-// expiring device's sessions close with it; a reconnect lands in the console's pending list
-// for a one-click re-grant.
+// Per-client access deadline, or console "Expire now". Only this device's
+// sessions close; a reconnect parks in the pending list.
+// `design/per-client-access.md`.
 #define PUNKTFUNK_ACCESS_EXPIRED_CLOSE_CODE 105
 
-// The `Hello.launch` request named a game this device's grants don't cover (no `LAUNCH` bit).
-// Refused AT the handshake — a crisp typed reason beats silently dropping the user onto a
-// bare desktop they didn't ask for. Connecting *without* a launch request still works.
+// `Hello.launch` named a game this device's grants lack the `LAUNCH` bit
+// for. Refused at handshake; connecting without a launch request still works.
 #define PUNKTFUNK_LAUNCH_NOT_PERMITTED_CLOSE_CODE 106
 
-// A host power action (`power.sleep`/`reboot`/`shutdown`, `design/host-actions.md`) is ending
-// every session: the host is going to sleep or shutting down, deliberately — not a crash, not
-// the network. Old clients render the generic close; acceptable degrade.
+// Host power action (`power.sleep` / `reboot` / `shutdown`) is ending every
+// session. `design/host-actions.md`.
 #define PUNKTFUNK_HOST_POWER_CLOSE_CODE 107
 
-// Minimum supported multiplier (renders under native, upscaled on present).
+// Under-render floor; presenter upscales.
 #define PUNKTFUNK_MIN_SCALE 0.5
 
-// Maximum supported multiplier (supersamples, clamped to the codec ceiling per axis).
+// Supersample cap; still clamped per axis by [`max_dimension`].
 #define PUNKTFUNK_MAX_SCALE 4.0
 
-// Stable C ABI status codes. `Ok` is 0; all errors are negative so callers can
-// test `rc < 0`. Do not renumber existing variants — only append.
+// Stable C ABI status codes. `Ok` is 0; errors are negative so callers can
+// test `rc < 0`. Existing variants must not be renumbered — only append.
 enum PunktfunkStatus
 #if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
   : int32_t
@@ -2075,7 +1424,7 @@ typedef int32_t PunktfunkStatus;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
-// Kinds of input event. `#[repr(u8)]` so it crosses the C ABI as a byte tag.
+// `#[repr(u8)]` so the C ABI sees a byte tag.
 enum PunktfunkInputKind
 #if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
   : uint8_t
@@ -2085,10 +1434,8 @@ enum PunktfunkInputKind
     PUNKTFUNK_INPUT_KIND_KEY_UP = 1,
     // Relative motion: `x`/`y` carry `dx`/`dy`.
     PUNKTFUNK_INPUT_KIND_MOUSE_MOVE = 2,
-    // Absolute motion: `x`/`y` carry pixel coordinates and `flags` packs the client's
-    // coordinate-space size as `(width << 16) | height` (the same contract as
-    // [`TouchDown`](Self::TouchDown)) — injectors normalize against it before mapping
-    // into the output region and **drop the event when it is zero**.
+    // Absolute: `x`/`y` pixels, `flags` = `(width << 16) | height` (same as
+    // [`TouchDown`](Self::TouchDown)). Injectors drop the event when flags is 0.
     PUNKTFUNK_INPUT_KIND_MOUSE_MOVE_ABS = 3,
     PUNKTFUNK_INPUT_KIND_MOUSE_BUTTON_DOWN = 4,
     PUNKTFUNK_INPUT_KIND_MOUSE_BUTTON_UP = 5,
@@ -2096,65 +1443,41 @@ enum PunktfunkInputKind
     PUNKTFUNK_INPUT_KIND_MOUSE_SCROLL = 6,
     // `code` = button bit ([`gamepad`] `BTN_*`), `x` ≠ 0 = pressed, `flags` = pad index.
     PUNKTFUNK_INPUT_KIND_GAMEPAD_BUTTON = 7,
-    // `code` = axis id ([`gamepad`] `AXIS_*`), `x` = axis value, `flags` = pad index.
-    // Sticks are i16 range (−32768..32767) in the XInput/Moonlight convention — **+y =
-    // up** (unlike mouse coordinates); triggers 0..255.
+    // `code` = [`gamepad`] `AXIS_*`, `x` = value, `flags` = pad. Sticks i16 with **+y =
+    // up** (unlike mouse); triggers 0..255.
     PUNKTFUNK_INPUT_KIND_GAMEPAD_AXIS = 8,
-    // Touch begins. `code` = touch id (which finger; reusable after `TouchUp`), `x`/`y` =
-    // pixel coordinates and `flags` = `(width << 16) | height` of the client's touch surface
-    // — the same absolute mapping as [`MouseMoveAbs`](Self::MouseMoveAbs).
+    // `code` = touch id (reusable after [`TouchUp`](Self::TouchUp)), `x`/`y` pixels,
+    // `flags` = `(width << 16) | height` — same absolute mapping as [`MouseMoveAbs`](Self::MouseMoveAbs).
     PUNKTFUNK_INPUT_KIND_TOUCH_DOWN = 9,
-    // Touch moves. Same field meaning as [`TouchDown`](Self::TouchDown).
+    // Same field meaning as [`TouchDown`](Self::TouchDown).
     PUNKTFUNK_INPUT_KIND_TOUCH_MOVE = 10,
-    // Touch ends. Only `code` (the touch id) is used.
+    // Only `code` (the touch id) is used.
     PUNKTFUNK_INPUT_KIND_TOUCH_UP = 11,
-    // Full gamepad state in one event ([`GamepadSnapshot`]) — idempotent, sequence-numbered.
-    //
-    // The per-transition [`GamepadButton`](Self::GamepadButton)/[`GamepadAxis`](Self::GamepadAxis)
-    // events are fragile on the unreliable datagram plane: a dropped or reordered event corrupts
-    // the host's accumulated pad state until the *next* change (a held trigger stays wrong
-    // indefinitely). A snapshot carries the whole pad, so loss heals on the next send and the
-    // sequence number lets the host drop stale reorders — the same idempotent-state discipline
-    // as the host→client rumble refresh. Sent only when the host advertised
+    // Full pad in one event ([`GamepadSnapshot`]). A dropped transition corrupts
+    // accumulated host state until the next change; a snapshot heals on the next send
+    // and `seq` drops reorders. Sent only when the host advertised
     // [`HOST_CAP_GAMEPAD_STATE`](crate::quic::HOST_CAP_GAMEPAD_STATE); older hosts keep
-    // receiving the per-transition events.
+    // the per-transition events.
     PUNKTFUNK_INPUT_KIND_GAMEPAD_STATE = 12,
-    // A pad was unplugged client-side (the native plane's answer to GameStream's
-    // `activeGamepadMask`, which the per-transition/snapshot planes otherwise lack — see
-    // [`encode_gamepad_remove`]). `flags` packs `seq << 24 | pad`: the low byte is the pad
-    // index, the high byte a per-pad wrapping seq sharing the [`GamepadSnapshot`] sequence
-    // space. The host clears the pad's `active_mask` bit so its virtual device is torn down,
-    // seq-gated against snapshots so one the network reordered past the removal can't resurrect
-    // the pad, and the shared seq space keeps the same index reusable by a later re-plug. Sent
-    // only to a host that advertised [`HOST_CAP_GAMEPAD_STATE`](crate::quic::HOST_CAP_GAMEPAD_STATE);
-    // an older host ignores the unknown tag (the pad then lingers until session end — the
-    // pre-existing behaviour).
+    // Pad unplugged. `flags` = [`encode_gamepad_remove`] (`seq << 24 | pad`, shared
+    // seq space with [`GamepadSnapshot`]) so a snapshot reordered past the removal
+    // cannot re-create the pad. Sent only to a
+    // [`HOST_CAP_GAMEPAD_STATE`](crate::quic::HOST_CAP_GAMEPAD_STATE) host; older
+    // hosts ignore the tag and the pad lingers until session end.
     PUNKTFUNK_INPUT_KIND_GAMEPAD_REMOVE = 13,
-    // Declares which controller KIND a pad presents so a session can MIX types (pad 0 a
-    // DualSense, pad 1 an Xbox pad). `code` = the [`GamepadPref`](crate::config::GamepadPref)
-    // wire byte, `flags` = pad index in the low byte plus the pad's render capabilities in bits
-    // 8/9 ([`ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/[`ARRIVAL_FLAG_PAD_AUDIO_SPEAKER`] — sent only
-    // toward a [`HOST_CAP_PAD_AUDIO`](crate::quic::HOST_CAP_PAD_AUDIO) host, so an older host
-    // keeps reading the whole word as the index; hosts decode via [`decode_gamepad_arrival`]).
-    // Sent when the client opens a pad slot — before that pad's
-    // first input — and re-sent a few times against datagram loss (like [`GamepadRemove`]). The
-    // host resolves the kind to a buildable backend and routes that pad's virtual device to it; a
-    // pad the client never declares (an older client, or a fully-lost declaration) falls back to
-    // the session-default kind from the handshake. Idempotent (no seq): re-declaring the same kind
-    // is a no-op. Meaningful only to a host that advertised
-    // [`HOST_CAP_GAMEPAD_STATE`](crate::quic::HOST_CAP_GAMEPAD_STATE); an older host ignores the
-    // unknown tag (every pad then uses the session-default kind — the pre-existing behaviour).
+    // Kind this pad presents (`code` = [`GamepadPref`](crate::config::GamepadPref)
+    // wire byte) so a session can mix types. `flags` = pad in the low byte; bits 8/9
+    // are [`ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/[`ARRIVAL_FLAG_PAD_AUDIO_SPEAKER`] and
+    // ride only toward a [`HOST_CAP_PAD_AUDIO`](crate::quic::HOST_CAP_PAD_AUDIO) host
+    // (an older host reads the whole word as the index). Decode with
+    // [`decode_gamepad_arrival`]. Idempotent, no seq. A pad that never arrives
+    // uses the handshake default; older hosts ignore the unknown tag.
     PUNKTFUNK_INPUT_KIND_GAMEPAD_ARRIVAL = 14,
-    // One Unicode scalar of **committed text** — `code` = the scalar value, everything else 0.
-    //
-    // The IME path: the layout-independent VK key events cannot express text an input method
-    // *commits* (autocorrect, gesture typing, non-Latin scripts, emoji), so a capable client
-    // sends the committed characters verbatim and the host injects them directly (Windows
-    // `KEYEVENTF_UNICODE`; Linux wlroots via a dynamically-grown Unicode keymap on a dedicated
-    // virtual keyboard). A multi-character commit is consecutive events in order. Sent only when
-    // the host advertised [`HOST_CAP_TEXT_INPUT`](crate::quic::HOST_CAP_TEXT_INPUT) — toward an
-    // older host (or one whose inject backend can't type text) clients keep the best-effort VK
-    // synthesis, and an older host ignores the unknown tag entirely.
+    // One Unicode scalar of committed text (`code` = the scalar; other fields 0).
+    // Layout-independent VK events cannot express IME commits, so a capable client
+    // sends characters verbatim. Sent only when the host advertised
+    // [`HOST_CAP_TEXT_INPUT`](crate::quic::HOST_CAP_TEXT_INPUT); older hosts ignore
+    // the tag and clients keep best-effort VK synthesis.
     PUNKTFUNK_INPUT_KIND_TEXT_INPUT = 15,
 };
 #ifndef __cplusplus
@@ -2166,50 +1489,38 @@ typedef uint8_t PunktfunkInputKind;
 #endif // __cplusplus
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Why a session ended — [`NativeClient::end_reason`], and `punktfunk_connection_end_reason` on the
-// C surface.
+// Why a session ended — [`NativeClient::end_reason`], `punktfunk_connection_end_reason` on C.
 //
-// The distinction that matters to a UI is **normal vs alarming**, and it is not a spectrum: a
-// player quitting their game and a host falling off the network both arrive as "the session
-// ended", and a client with no way to separate them has to word all of them the same. Every client
-// worded them as failures.
-//
-// Ordered loosely from "the user did this on purpose" to "something went wrong". Values are part
-// of the C ABI: append only, never renumber.
+// Discriminator for a UI: normal finish vs alarm. Values are C ABI: append only, never
+// renumber. Ordered from user-initiated to fault.
 enum PunktfunkEndReason
 #if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
   : uint8_t
 #endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
  {
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-    // Not ended (or ended before a reason could be observed). Also what an unknown future value
-    // decodes to, so an older client reading a newer core degrades to "no opinion".
+    // Not ended, or unknown future ABI value: an older reader degrades to "no opinion".
     PUNKTFUNK_END_REASON_NONE = 0,
 #endif
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-    // **This client** closed the session — the user pressed stop, or the handle was dropped.
-    // Nothing to report: the UI already knows, it initiated it.
+    // This client closed it (stop or drop). The UI already knows.
     PUNKTFUNK_END_REASON_LOCAL = 1,
 #endif
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-    // The host's launched game exited ([`crate::quic::APP_EXITED_CLOSE_CODE`]). A normal finish,
-    // and the one reason a launcher client can act on: go back to the library the title was
-    // launched from rather than all the way out to host selection.
+    // Host launched-game exit ([`crate::quic::APP_EXITED_CLOSE_CODE`]). Normal; a launcher
+    // should return to the library, not host selection.
     PUNKTFUNK_END_REASON_GAME_EXITED = 2,
 #endif
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-    // The host ended the session cleanly and deliberately — an operator "End" in the console, or
-    // the session simply finishing. Normal; say so plainly or say nothing.
+    // Host ended cleanly (operator End, or session finished). Normal.
     PUNKTFUNK_END_REASON_HOST_ENDED = 3,
 #endif
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-    // The host closed reporting a failure of its own. Worth showing, and the host's log has the
-    // detail.
+    // Host closed with a failure. Host log has the detail.
     PUNKTFUNK_END_REASON_HOST_ERROR = 4,
 #endif
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-    // The connection died rather than being closed: idle timeout, reset, the network going away.
-    // This — and only this — is the "the host may be asleep, wake it" case.
+    // Link died (idle timeout, reset, network). The only "host may be asleep, wake it" case.
     PUNKTFUNK_END_REASON_LOST = 5,
 #endif
 };
@@ -2223,77 +1534,47 @@ typedef uint8_t PunktfunkEndReason;
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Per-session colour signalling (CICP / ITU-T H.273 code points) the host resolved for the
-// encoded video, carried on [`Welcome`]. A client configures its decoder/presenter from these
-// instead of inferring them from the bitstream VUI. An older host omits the bytes on the wire →
-// [`ColorInfo::SDR_BT709`] (the 8-bit BT.709 limited stream every pre-HDR build produced).
-//
-// The *static* HDR mastering metadata (ST.2086 + content light level) is larger and can change
-// mid-stream, so it rides the [`HDR_META_MAGIC`] datagram rather than this fixed struct.
+// Per-session CICP (ITU-T H.273) the host resolved, on [`Welcome`]. Configure the
+// decoder/presenter from these; do not infer from bitstream VUI. An older host omits the
+// bytes → [`ColorInfo::SDR_BT709`]. ST.2086 + CLL can change mid-stream, so they ride
+// [`HDR_META_MAGIC`] rather than this fixed struct.
 typedef struct ColorInfo ColorInfo;
 #endif
 
-// Tuning for [`JitterPolicy`], in MILLISECONDS.
-//
-// Denominating the depth in time rather than in device quanta is the point. Every client used to
-// compute its target as `3 × quantum`, which is a sane 15 ms at a 5 ms quantum and a silent 64 ms
-// at a 20 ms one — the same source line meaning two very different latencies depending on what
-// else happened to be using the audio graph that day.
+// Tuning for [`JitterPolicy`], in milliseconds. Depth is time, not device quanta: `3 × quantum`
+// is 15 ms at 5 ms and 64 ms at 20 ms.
 typedef struct JitterTuning JitterTuning;
 
-// What a client's OWN bitstream parser saw about intra-refresh recovery on one decoded frame — the
-// in-band counterpart of the wire's [`USER_FLAG_RECOVERY_POINT`](crate::packet::USER_FLAG_RECOVERY_POINT).
-//
-// Two facts rather than one verdict, because the gate needs both and only the gate knows how to
-// combine them. A recovery point SEI promises: *a decoder that starts at THIS AU has a correct
-// picture N frames later*. That promise covers a decoder which lost references BEFORE the SEI (the
-// wave re-codes every stripe after it, so the stale content is fully overwritten) and says nothing
-// at all about one which lost references AFTER it (the already-swept stripes still reference the
-// lost picture). So a recovery point may only lift a freeze when its SEI was observed at or after
-// the loss — which is the pairing [`ReanchorGate::on_local_recovery`] performs, since the gate is
-// the only party that knows when the loss was.
-//
-// Produced by pf-vkdecode's `RecoveryWatch` on the native decode lane. Every other lane leaves it
-// [`Default`] and nothing changes.
+// Local bitstream-parser view of intra-refresh recovery on one frame — the in-band counterpart
+// of [`USER_FLAG_RECOVERY_POINT`](crate::packet::USER_FLAG_RECOVERY_POINT). Two facts, not one
+// verdict: a recovery-point SEI promises a correct picture N frames later for a decoder that
+// lost references *before* the SEI, and nothing for a loss *after* it. Only
+// [`ReanchorGate::on_local_recovery`] pairs the SEI against the arm, because only the gate
+// knows when the loss was. Lanes without a parser leave this [`Default`].
 typedef struct LocalRecovery LocalRecovery;
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Opaque handle to a live `punktfunk/1` connection (QUIC control plane + UDP data plane, all
-// pumped on internal threads).
-//
-// Thread contract: each plane (video `next_au`, audio `next_audio`, rumble `next_rumble`)
-// may be pulled from its own thread, at most one thread per plane. The accessors only
-// take shared references internally (per-plane mutexed borrow slots), so cross-plane
-// concurrency is sound — never two threads on the *same* plane.
+// Live `punktfunk/1` connection (QUIC control + UDP data, pumped on internal threads).
+// One puller thread per plane; never two threads on the same plane.
 typedef struct PunktfunkConnection PunktfunkConnection;
 #endif
 
-// Opaque session handle. Pointer-only from C.
+// Opaque session handle. C sees only the pointer.
 typedef struct PunktfunkSession PunktfunkSession;
 
-// The shared post-loss freeze state machine. A client feeds it three kinds of event — an *arm* (a
-// loss was detected: a frame-index gap, a dropped-count climb, or a decoder wedge/demotion), each
-// *decoded frame* ([`on_decoded`](Self::on_decoded), which decides present-vs-hold and interprets the
-// re-anchor wire flags), and each *no-output* AU ([`on_no_output`](Self::on_no_output)) — plus a
-// periodic [`poll`](Self::poll) that folds the dropped counter and fires the overdue backstop.
-//
-// The gate emits *intents* only: [`on_no_output`](Self::on_no_output) and [`poll`](Self::poll) return
-// `true` when the client should ask the host for a keyframe. The client routes that through its own
-// ~100 ms request throttle (and the precise RFI-vs-keyframe range decision stays in the loss-range
-// tracker behind [`crate::client::NativeClient::note_frame_index`]) — the gate never touches the wire.
+// Shared post-loss freeze. A client feeds *arm* (loss), each decoded frame
+// ([`on_decoded`](Self::on_decoded)), each no-output AU ([`on_no_output`](Self::on_no_output)),
+// and a periodic [`poll`](Self::poll). The gate emits *intents* only: `true` means the client
+// should ask for a keyframe through its own ~100 ms throttle. The gate never touches the wire.
 typedef struct ReanchorGate ReanchorGate;
 
-// A log line from the core (ABI v25, [`punktfunk_set_log_callback`]). `level` is 1 = error,
-// 2 = warn, 3 = info, 4 = debug, 5 = trace. `target` is the Rust module path the line came from
-// (`punktfunk_core::transport::udp`, `quinn::connection`, …) and `message` the formatted text;
-// both are NUL-terminated UTF-8, borrowed for the duration of the call only — copy them out.
-// Called from whichever thread logged, so the callback must be thread-safe, must not block for
-// long (it sits on the transport and pump threads), and must not call back into the core's
-// logging (it would be re-entered).
+// Log sink for [`punktfunk_set_log_callback`]. `level` 1..=5 (error…trace).
+// `target` and `message` are NUL-terminated UTF-8, borrowed for this call —
+// copy them out. Any thread may call; thread-safe, non-blocking, no re-entry.
 typedef void (*PunktfunkLogCb)(uint8_t level, const char *target, const char *message, void *user);
 
-// Forward-compatible session configuration. The caller MUST set `struct_size` to
-// `sizeof(PunktfunkConfig)`; the core uses it to detect ABI skew.
+// Session configuration. Set `struct_size` to `sizeof(PunktfunkConfig)`; a
+// smaller prefix is rejected rather than over-read.
 typedef struct {
     uint32_t struct_size;
     // 0 = host, 1 = client.
@@ -2311,28 +1592,24 @@ typedef struct {
     uint8_t salt[4];
     // Test hook for the loopback transport; 0 in production.
     uint32_t loopback_drop_period;
-    // Largest encoded access unit the receiver will accept (bounds reassembler memory).
+    // Largest encoded access unit the receiver accepts (reassembler memory bound).
     uint64_t max_frame_bytes;
 } PunktfunkConfig;
 
-// A reassembled access unit. `data`/`len` borrow session-owned memory valid until the
-// next `punktfunk_client_poll_frame`/`punktfunk_session_free` on the same session.
+// Reassembled access unit. `data`/`len` borrow session memory until the next
+// `punktfunk_client_poll_frame` / `punktfunk_session_free` on this session.
 typedef struct {
     const uint8_t *data;
     uintptr_t len;
     uint32_t frame_index;
     uint64_t pts_ns;
     uint32_t flags;
-    // Wall-clock reassembly-completion instant (ns since the Unix epoch, CLOCK_REALTIME — the
-    // clock `pts_ns` and the skew handshake use). THIS is the receipt stamp for latency math:
-    // a stamp the embedder takes itself at the poll return additionally contains the
-    // pre-decode hand-off queue wait, so a client-side standing backlog would masquerade as
-    // network latency (ABI v9 — the 2026-07 two-pair standing-latency investigation).
+    // Reassembly-complete instant, ns since Unix epoch (`CLOCK_REALTIME`, same
+    // clock as `pts_ns`). A stamp at poll return includes pre-decode queue wait.
     uint64_t received_ns;
 } PunktfunkFrame;
 
-// A single input event. `#[repr(C)]` — shared verbatim with the C ABI as
-// `PunktfunkInputEvent`.
+// `#[repr(C)]` as `PunktfunkInputEvent`.
 typedef struct {
     PunktfunkInputKind kind;
     uint8_t _pad[3];
@@ -2346,7 +1623,7 @@ typedef struct {
     uint32_t flags;
 } PunktfunkInputEvent;
 
-// Snapshot of session counters.
+// Session counters.
 typedef struct {
     uint64_t frames_submitted;
     uint64_t frames_completed;
@@ -2354,8 +1631,7 @@ typedef struct {
     uint64_t packets_sent;
     uint64_t packets_received;
     uint64_t packets_dropped;
-    // Packets dropped on the host send path because the kernel buffer was full (WouldBlock) — the
-    // dominant loss mode at very high bitrate; distinct from `packets_dropped` (recv-side).
+    // Host send-path drops (`WouldBlock`). Distinct from recv-side `packets_dropped`.
     uint64_t packets_send_dropped;
     uint64_t fec_recovered_shards;
     uint64_t bytes_sent;
@@ -2363,28 +1639,13 @@ typedef struct {
 } PunktfunkStats;
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Every connect option in one **growable** struct — the terminal form of the
-// [`punktfunk_connect`] … [`punktfunk_connect_ex11`] chain, consumed by
-// [`punktfunk_connect_opts`]. Eleven generations each minted a new exported symbol to add a
-// field or two (`ex11` over `ex10`: exactly `audio_rate_hz` + `audio_bits`, for a 24-parameter
-// signature and a full forwarding shim). This struct ends that: a new option is a new field
-// appended HERE, guarded by `struct_size` exactly like [`PunktfunkConfig`].
-//
-// Usage: zero-initialize the whole struct, set `struct_size = sizeof(PunktfunkConnectOpts)`,
-// then set the fields you mean. Every zero field keeps the auto/legacy behaviour of the `ex`
-// chain (null pointer = absent, `0` = auto/unspecified) — `audio_rate_hz = 0` is `ex10`'s
-// UNSPECIFIED audio format, an explicit pair is `ex11`'s hi-res request, so the load-bearing
-// `ex11`-vs-`ex10` symbol choice becomes a field value.
-//
-// Growth discipline (for this crate): append only — never reorder, never widen an existing
-// field; a new field's zero value must mean "unspecified/auto"; keep the struct free of TAIL
-// padding on both pointer widths (the const asserts below lock 96/68 bytes), so an appended
-// field can never land inside bytes an older caller's `sizeof` already covered; bump
-// [`crate::ABI_VERSION`].
+// Growable connect options for [`punktfunk_connect_opts`]. Zero-init, set
+// `struct_size = sizeof(PunktfunkConnectOpts)`, then the fields you mean.
+// Zero = auto/unspecified (`audio_rate_hz = 0` is Opus; a non-zero pair is
+// lossless). Append only; no tail padding (96/68-byte asserts); bump ABI.
 typedef struct {
-    // `sizeof(PunktfunkConnectOpts)` as THIS caller was compiled — the skew guard
-    // ([`punktfunk_connect_opts`] rejects smaller than the v26 introduction size, and when the
-    // struct grows, an older caller's shorter size defaults the tail instead of misreading it).
+    // `sizeof(PunktfunkConnectOpts)` as this caller was compiled. Smaller than
+    // the frozen minimum is rejected; a shorter prefix defaults the tail.
     uint32_t struct_size;
     // Required: NUL-terminated UTF-8 IP or hostname (the one non-nullable pointer here).
     const char *host;
@@ -2398,7 +1659,7 @@ typedef struct {
     const char *client_cert_pem;
     // See `client_cert_pem`.
     const char *client_key_pem;
-    // The label this device knocks with, or null for the OS default
+    // Label this device knocks with, or null for the OS default
     // ([`punktfunk_connect_ex10`]).
     const char *device_name;
     // Requested mode ([`punktfunk_connect`]).
@@ -2411,11 +1672,10 @@ typedef struct {
     uint32_t compositor;
     // `PUNKTFUNK_GAMEPAD_*`; `0`/unrecognized = auto ([`punktfunk_connect_ex2`]).
     uint32_t gamepad;
-    // Session wire budget in kbps; `0` = the host default ([`punktfunk_connect_ex3`]).
+    // Session wire budget in kbps; `0` = host default ([`punktfunk_connect_ex3`]).
     uint32_t bitrate_kbps;
-    // Audio format ask; `0`/`0` = UNSPECIFIED (the legacy Opus path), an explicit pair is a
-    // hi-res request that derives `PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES`
-    // ([`punktfunk_connect_ex11`] — including why explicit 48000/16 is a genuine lossless ask).
+    // Audio format ask; `0`/`0` = unspecified (Opus). An explicit pair — including
+    // 48000/16 — is lossless and derives `PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES`.
     uint32_t audio_rate_hz;
     // Connect timeout in milliseconds.
     uint32_t timeout_ms;
@@ -2432,22 +1692,14 @@ typedef struct {
     // The one `PUNKTFUNK_CODEC_*` bit to prefer; `0` = host's choice
     // ([`punktfunk_connect_ex7`]).
     uint8_t preferred_codec;
-    // `PUNKTFUNK_CLIENT_CAP_*` bits ([`punktfunk_connect_ex8`]).
+    // `PUNKTFUNK_CLIENT_CAP_*` bits ([`punktfunk_connect_ex9`]).
     uint8_t client_caps;
 } PunktfunkConnectOpts;
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// One audio packet pulled off a `punktfunk/1` connection — an Opus frame (48 kHz, 5 ms) on
-// every ordinary session, or one lossless PCM frame on a session that resolved the `0xD3` plane.
-// `data` borrows connection memory until the next `punktfunk_connection_next_audio` call.
-//
-// Nothing here says which: the plane is a property of the SESSION, read once via
-// `punktfunk_connection_host_caps() & PUNKTFUNK_HOST_CAP_AUDIO_HIRES` (with the format itself
-// from [`punktfunk_connection_audio_sample_rate`] / [`punktfunk_connection_audio_bits`]). An
-// embedder that never asks for the lossless plane can only ever be handed Opus, so this struct's
-// meaning is unchanged for it — and one that does is far better off on
-// [`punktfunk_connection_next_audio_pcm`], which decodes both planes in core.
+// One audio packet. Opus on ordinary sessions, PCM on `0xD3`. `data` borrows
+// until the next `next_audio`. Plane is `host_caps & HOST_CAP_AUDIO_HIRES`.
 typedef struct {
     const uint8_t *data;
     uintptr_t len;
@@ -2457,20 +1709,10 @@ typedef struct {
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// One decoded audio frame from [`punktfunk_connection_next_audio_pcm`]: interleaved 32-bit
-// float PCM in the canonical wire channel order `FL FR FC LFE RL RR SL SR` (the first
-// `channels` of it). `samples` points at `frame_count * channels` floats and borrows
-// connection memory **until the next PCM call** on this handle.
-//
-// **The sample rate is not in this struct and never will be.** It was 48 kHz for every session
-// until the lossless plane, and it is still 48 kHz for every Opus one — but a hi-res session
-// resolves its own rate and depth, and this is a `#[repr(C)]` type with no `struct_size` guard
-// that C embedders allocate BY VALUE. Adding a field would silently change its layout under
-// every one of them. So the format is read through
-// [`punktfunk_connection_audio_sample_rate`] / [`punktfunk_connection_audio_bits`] instead —
-// accessors ADDED, not structs widened, which is the rule ABI 18 set with
-// `punktfunk_connection_next_rumble_cmd2`. An embedder that never calls them keeps sizing its
-// ring for 48 kHz, which is exactly right for the sessions it can already play.
+// One decoded audio frame from [`punktfunk_connection_next_audio_pcm`]: interleaved
+// f32 in wire order `FL FR FC LFE RL RR SL SR` (first `channels` of it). `samples`
+// points at `frame_count * channels` floats and borrows until the next PCM call.
+// Rate/depth are accessors, not fields: this type has no `struct_size`.
 typedef struct {
     // Interleaved f32 samples (wire channel order), `frame_count * channels` long.
     const float *samples;
@@ -2486,12 +1728,8 @@ typedef struct {
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// One HID-output feedback event a game wrote to the host's virtual pad
-// ([`punktfunk_connection_next_hidout`]). `kind` selects which fields are meaningful — replay it
-// on the real controller: DualSense feedback (lightbar color, player LEDs, an adaptive-trigger
-// effect via the platform's `GCDualSenseAdaptiveTrigger`-style API), or — on an as-is Steam
-// Controller 2 passthrough session — a raw report to forward verbatim
-// (`PUNKTFUNK_HIDOUT_HID_RAW`).
+// HID-output feedback from the host virtual pad ([`punktfunk_connection_next_hidout`]).
+// `kind` selects which fields to replay on the physical controller.
 typedef struct {
     // One of `PUNKTFUNK_HIDOUT_*`.
     uint8_t kind;
@@ -2509,68 +1747,58 @@ typedef struct {
     uint8_t which;
     // Trigger: number of valid bytes in `effect` (≤ `PUNKTFUNK_HID_EFFECT_MAX`).
     uint8_t effect_len;
-    // Trigger: the raw DualSense trigger parameter block (mode + params).
-    // Sized off [`PUNKTFUNK_HID_EFFECT_MAX`] rather than a second literal `11` — the constant is
-    // exported precisely so embedders can size their own buffers against it, and it declaring one
-    // number while the struct it describes hardcoded another was the whole hazard.
+    // DualSense trigger parameter block. Length is [`PUNKTFUNK_HID_EFFECT_MAX`], not a second `11`.
     uint8_t effect[PUNKTFUNK_HID_EFFECT_MAX];
-    // HidRaw: `PUNKTFUNK_HID_RAW_OUTPUT` (an OUTPUT report — a hidraw `write()`) or
-    // `PUNKTFUNK_HID_RAW_FEATURE` (a FEATURE report — `SET_REPORT`). Distinct from `kind`,
-    // which says this event IS a raw report; this says which device channel replays it.
+    // HidRaw channel: `PUNKTFUNK_HID_RAW_OUTPUT` or `PUNKTFUNK_HID_RAW_FEATURE`.
     uint8_t hid_kind;
     // HidRaw: number of valid bytes in `raw` (≤ `PUNKTFUNK_HID_REPORT_MAX`).
     uint8_t raw_len;
-    // HidRaw: the full report, id byte first — exactly what the host's hidraw consumer wrote
-    // (Steam writes feature frames whole, so trailing zero-padding is normal; OUTPUT frames
-    // arrive host-trimmed to the declared report length on current hosts). Sized off
-    // [`HID_REPORT_MAX`](crate::quic::HID_REPORT_MAX), the wire bound for the same bytes.
+    // HidRaw report, id byte first. Feature frames may be zero-padded; sized off `HID_REPORT_MAX`.
     uint8_t raw[PUNKTFUNK_HID_REPORT_MAX];
 } PunktfunkHidOutput;
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Static HDR metadata for an HDR session ([`punktfunk_connection_next_hdr_meta`]): SMPTE ST.2086
-// mastering display colour volume + CEA-861.3 content light level. All fields are in the standard
-// HDR10 SEI fixed-point units (primaries/white in 1/50000, luminance in 0.0001 cd/m²), ready for
-// DXGI `DXGI_HDR_METADATA_HDR10` / Apple `CAEDRMetadata` / Android `KEY_HDR_STATIC_INFO`.
+// Static HDR metadata ([`punktfunk_connection_next_hdr_meta`]): ST.2086 mastering
+// display + CEA-861.3 content light. HDR10 SEI units (primaries/white 1/50000,
+// luminance 0.0001 cd/m²) for DXGI / `CAEDRMetadata` / `KEY_HDR_STATIC_INFO`.
 typedef struct {
-    // Display-primaries x-chromaticities in 1/50000 units, ST.2086 order [green, blue, red].
+    // Display-primaries x-chromaticities, 1/50000 units, ST.2086 order [green, blue, red].
     uint16_t display_primaries_x[3];
-    // Display-primaries y-chromaticities in 1/50000 units, ST.2086 order [green, blue, red].
+    // Display-primaries y-chromaticities, 1/50000 units, ST.2086 order [green, blue, red].
     uint16_t display_primaries_y[3];
     // White-point x-chromaticity, 1/50000 units.
     uint16_t white_point_x;
     // White-point y-chromaticity, 1/50000 units.
     uint16_t white_point_y;
-    // Max display mastering luminance, 0.0001 cd/m² units.
+    // Max display mastering luminance, 0.0001 cd/m².
     uint32_t max_display_mastering_luminance;
-    // Min display mastering luminance, 0.0001 cd/m² units.
+    // Min display mastering luminance, 0.0001 cd/m².
     uint32_t min_display_mastering_luminance;
-    // Maximum content light level (MaxCLL), nits. 0 = unknown.
+    // Max content light level (MaxCLL), nits. 0 = unknown.
     uint16_t max_cll;
-    // Maximum frame-average light level (MaxFALL), nits. 0 = unknown.
+    // Max frame-average light level (MaxFALL), nits. 0 = unknown.
     uint16_t max_fall;
 } PunktfunkHdrMeta;
 #endif
 
-// One forwarded host-cursor shape (ABI v11, the cursor channel): straight-alpha RGBA8, no
-// padding, `len == w * h * 4`, hotspot within `w`×`h`. `serial` is the identity
-// [`PunktfunkCursorState`] refers to — cache the built OS cursor by it.
+// Forwarded host-cursor shape: straight-alpha RGBA8, no padding, `len == w * h * 4`,
+// hotspot within `w`×`h`. `serial` is the identity [`PunktfunkCursorState`] refers
+// to — cache the built OS cursor by it.
 typedef struct {
     uint32_t serial;
     uint16_t w;
     uint16_t h;
     uint16_t hot_x;
     uint16_t hot_y;
-    // Borrows connection memory until the NEXT cursor-shape call (the audio contract).
+    // Borrows connection memory until the next cursor-shape call.
     const uint8_t *rgba;
     uintptr_t len;
 } PunktfunkCursorShape;
 
-// Per-frame host-cursor state (ABI v11): position (the pointer/hotspot point in the host
-// video's pixel space), visibility, and the host-driven relative-mode hint. `flags` bit 0 =
-// visible, bit 1 = relative hint (a host app grabbed/hid the pointer — run captured
-// relative; clear = return to absolute, reappearing at `x`/`y`).
+// Per-frame host-cursor state: position in host video pixels, visibility, and
+// relative-mode hint. `flags` bit 0 = visible, bit 1 = relative (host app
+// grabbed/hid the pointer — run captured relative; clear = absolute at `x`/`y`).
 typedef struct {
     uint32_t serial;
     uint8_t flags;
@@ -2579,14 +1807,11 @@ typedef struct {
 } PunktfunkCursorState;
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// One access unit's host-side processing time ([`punktfunk_connection_next_host_timing`]):
-// capture → fully sent, i.e. the whole host pipeline (capture read/convert, encode, FEC+seal,
-// paced send). Correlate to the AU whose `PunktfunkFrame::pts_ns` equals `pts_ns`, then
-// `network = (received_instant + clock_offset − pts_ns) − host_us` — the unified stats HUD's
-// `host` / `network` split (design/stats-unification.md Phase 2). Best-effort: a lost datagram
-// means that frame simply contributes no sample.
+// Host capture→sent duration for one AU ([`punktfunk_connection_next_host_timing`]).
+// Correlate by `pts_ns`; `network = (received + clock_offset − pts_ns) − host_us`.
+// Lost datagram: no sample. See `design/stats-unification.md`.
 typedef struct {
-    // The AU's capture stamp (host capture clock — matches `PunktfunkFrame::pts_ns` exactly).
+    // AU capture stamp (host capture clock — matches `PunktfunkFrame::pts_ns`).
     uint64_t pts_ns;
     // Host capture→sent duration, µs.
     uint32_t host_us;
@@ -2594,9 +1819,9 @@ typedef struct {
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// One rich client→host input for the host's virtual DualSense
-// ([`punktfunk_connection_send_rich_input`]): a touchpad contact or a motion sample. Set `kind`
-// and the matching fields; the others are ignored.
+// One rich client→host input for the host virtual DualSense
+// ([`punktfunk_connection_send_rich_input`]): touchpad contact or motion sample.
+// Set `kind` and the matching fields; the others are ignored.
 typedef struct {
     // One of `PUNKTFUNK_RICH_*`.
     uint8_t kind;
@@ -2618,14 +1843,10 @@ typedef struct {
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Forward-compatible superset of [`PunktfunkRichInput`] that can also express the rich Steam
-// surfaces: a *second* trackpad (`surface`), a distinct `click` vs touch, signed coordinates, and
-// pressure. Sent via [`punktfunk_connection_send_rich_input2`] — the only way a C client can emit a
-// `TouchpadEx`. The caller MUST set `struct_size = sizeof(PunktfunkRichInputEx)` (the ABI-skew
-// guard, like [`PunktfunkConfig`]); the legacy [`PunktfunkRichInput`] +
-// [`punktfunk_connection_send_rich_input`] stay byte-for-byte for existing callers.
+// Superset of [`PunktfunkRichInput`] for `TouchpadEx` (second pad, click, signed
+// coords, pressure). Set `struct_size = sizeof(PunktfunkRichInputEx)`.
 typedef struct {
-    // MUST equal `sizeof(PunktfunkRichInputEx)`.
+    // Must equal `sizeof(PunktfunkRichInputEx)`.
     uint32_t struct_size;
     // One of `PUNKTFUNK_RICH_*` (`TOUCHPAD` / `MOTION` / `TOUCHPAD_EX`).
     uint8_t kind;
@@ -2635,16 +1856,16 @@ typedef struct {
     uint8_t finger;
     // Touchpad/TouchpadEx: 1 = finger down / touching, 0 = lifted.
     uint8_t active;
-    // TouchpadEx: which surface — 0 = single/DualSense, 1 = Steam left pad, 2 = Steam right pad.
+    // TouchpadEx: surface — 0 = single/DualSense, 1 = Steam left pad, 2 = Steam right pad.
     uint8_t surface;
-    // TouchpadEx: 1 = the pad is physically clicked (depressed), distinct from a touch contact.
+    // TouchpadEx: 1 = the pad is physically clicked, distinct from a touch contact.
     uint8_t click;
     // Reserved for alignment; set to 0.
     uint8_t _reserved[2];
-    // TouchpadEx: x coordinate — **signed**, centred at 0 (the real Steam report convention). For a
-    // legacy `TOUCHPAD` kind sent through this struct, store the unsigned `0..=65535` value's bits.
+    // TouchpadEx: x, **signed**, centred at 0 (Steam report convention). For a
+    // `TOUCHPAD` kind through this struct, store the unsigned `0..=65535` bits.
     int16_t x;
-    // TouchpadEx: y coordinate — signed, centred at 0.
+    // TouchpadEx: y, signed, centred at 0.
     int16_t y;
     // TouchpadEx: contact pressure (`0` if the surface has no force sensor).
     uint16_t pressure;
@@ -2656,12 +1877,9 @@ typedef struct {
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// One complete stylus state at one instant ([`punktfunk_connection_send_pen`];
-// design/pen-tablet-input.md). STATE-FULL, never an edge event: fill every field on every
-// sample (unknown axes take their `*_UNKNOWN` sentinel) — the host diffs consecutive samples
-// and synthesizes down/up/button transitions itself, which is what makes a lost datagram
-// self-heal. `x`/`y` are normalized `0.0..=1.0` in VIDEO-FRAME space (map your letterbox
-// before filling, exactly like wire touches).
+// Full stylus state at one instant ([`punktfunk_connection_send_pen`];
+// `design/pen-tablet-input.md`). Fill every field (`*_UNKNOWN` if missing); the
+// host diffs samples. `x`/`y` are `0.0..=1.0` in video-frame space.
 typedef struct {
     // Normalized `0.0..=1.0` across the video frame. Must be finite.
     float x;
@@ -2676,7 +1894,7 @@ typedef struct {
     // Barrel roll (Apple Pencil Pro `rollAngle`), degrees `0..=359`, or
     // `PUNKTFUNK_PEN_ANGLE_UNKNOWN`.
     uint16_t roll_deg;
-    // µs since the previous sample in the same call (`0` for the first) — the coalesced
+    // µs since the previous sample in the same call (`0` for the first) — coalesced
     // capture spacing.
     uint16_t dt_us;
     // Bitfield of `PUNKTFUNK_PEN_*` state bits. Unknown bits are rejected (`InvalidArg`).
@@ -2701,8 +1919,8 @@ typedef struct {
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// A shared-clipboard event, filled by [`punktfunk_connection_next_clipboard`]. A flat tagged
-// struct (like `PunktfunkHidOutput`): read the fields named in the `kind`'s doc; the rest are 0.
+// Shared-clipboard event from [`punktfunk_connection_next_clipboard`]. Flat tagged
+// struct: read the fields named in the `kind`'s doc; the rest are 0.
 typedef struct {
     // One of `PUNKTFUNK_CLIP_*`.
     uint8_t kind;
@@ -2714,7 +1932,7 @@ typedef struct {
     uint8_t reason;
     // `Data`: 1 = final chunk of this transfer.
     uint8_t last;
-    // Per-transfer id: the offer `seq` (RemoteOffer), the `req_id` (FetchRequest), or the
+    // Per-transfer id: offer `seq` (RemoteOffer), `req_id` (FetchRequest), or
     // `xfer_id` (Data/Cancelled/Error).
     uint32_t transfer_id;
     // `FetchRequest`: the offer `seq` the request is against.
@@ -2723,19 +1941,19 @@ typedef struct {
     uint32_t file_index;
     // `Error`: a `PunktfunkStatus` code (negative); 0 otherwise.
     int32_t status;
-    // RemoteOffer/FetchRequest/Data: a pointer into a per-connection slot, valid until the next
-    // `next_clipboard` call; NULL for the other kinds.
+    // RemoteOffer/FetchRequest/Data: pointer into a per-connection slot, valid
+    // until the next `next_clipboard`; NULL for the other kinds.
     const uint8_t *data;
     // Byte length of `data` (0 when `data` is NULL).
     uintptr_t len;
 } PunktfunkClipEvent;
 #endif
 
-// A speed-test measurement, filled by [`punktfunk_connection_probe_result`]. `done` is 0 until
-// the host's end-of-burst report lands, then 1 (the numbers are final). `throughput_kbps` is the
-// delivered wire throughput to drive a bitrate choice from; `loss_pct` is the link loss and
-// `host_drop_pct` the host-side send-buffer drop (raise `net.core.wmem_max`) — they're measured
-// separately so a host that can't keep up reads differently from a lossy link.
+// Speed-test measurement from [`punktfunk_connection_probe_result`]. `done` is 0
+// until the host's end-of-burst report, then 1. `throughput_kbps` is delivered
+// wire throughput; `loss_pct` is link loss; `host_drop_pct` is send-buffer drop
+// (raise `net.core.wmem_max`). Measured separately so a host that can't keep up
+// reads differently from a lossy link.
 typedef struct {
     // 1 once the host's end-of-burst report arrived (measurement final); else 0 (partial).
     uint8_t done;
@@ -2745,11 +1963,10 @@ typedef struct {
     // Application goodput bytes / access units the host offered.
     uint64_t host_bytes;
     uint32_t host_packets;
-    // The throughput denominator, milliseconds: the client-measured burst receive interval
-    // (first → last probe-packet arrival) once `done`; the host's measured send-window
-    // duration when fewer than two probe packets arrived (no interval to measure from). The
-    // host duration alone overstates throughput — its window closes while the bottleneck
-    // queue is still draining toward the client.
+    // Throughput denominator, ms: client-measured burst receive interval once
+    // `done`; host send-window duration when fewer than two probe packets arrived.
+    // Host duration alone overstates throughput — its window closes while the
+    // bottleneck queue is still draining.
     uint32_t elapsed_ms;
     // Delivered wire throughput = `recv_bytes * 8 / elapsed_ms` (kilobits/second).
     uint32_t throughput_kbps;
@@ -2757,7 +1974,7 @@ typedef struct {
     float loss_pct;
     // Host-side send-buffer drop `send_dropped / (wire_packets_sent + send_dropped)`, percent.
     float host_drop_pct;
-    // Wire packets the host put on the link, and the ones its send buffer dropped (raw counts).
+    // Wire packets the host put on the link, and the ones its send buffer dropped.
     uint32_t wire_packets_sent;
     uint32_t send_dropped;
 } PunktfunkProbeResult;
@@ -2772,56 +1989,19 @@ typedef struct {
 
 // Frame durations the plane may negotiate, longest first.
 //
-// Every rung divides the **48 kHz family** into a whole number of samples per channel, so on
-// those rates the host pacer and the client ring carry an exact frame:
+// Every rung divides the 48 kHz family into whole samples per channel.
+// The 44.1 kHz family does not: a rung is a whole sample only when
+// `rate_hz × µs` is a multiple of 1_000_000, so 44_100 has none of these
+// rungs, 88_200 has 5000, 176_400 has 5000 and 2500. Other pairings floor
+// in [`samples_per_frame`] and run shorter than the label.
 //
-// | µs | samples/ch @48 kHz | samples/ch @96 kHz |
-// |---|---|---|
-// | 5000 | 240 | 480 |
-// | 4000 | 192 | 384 |
-// | 3000 | 144 | 288 |
-// | 2500 | 120 | 240 |
-// | 2000 | 96 | 192 |
-// | 1500 | 72 | 144 |
-// | 1000 | 48 | 96 |
-//
-// ⚠⚠ **The 44.1 kHz family does not divide, and this doc used to claim every rate did.** A rung
-// lands on a whole sample only when `rate_hz × µs` is a multiple of 1 000 000, which needs a
-// multiple of **10 000 µs** at 44 100 Hz, **5 000 µs** at 88 200 and **2 500 µs** at 176 400. So
-// of the seven rungs, 44 100 has **none**, 88 200 has only 5 000, and 176 400 has 5 000 and
-// 2 500. Every other pairing carries [`samples_per_frame`]'s FLOOR and is therefore *shorter*
-// than the rung it is labelled with: 5 ms at 44 100 Hz is 220 samples per channel — 4 988 662 ns,
-// 0.23 % short.
-//
-// That is safe for the two things this ladder decides, and unsafe for a third:
-//
-// - **Payload sizing** — a floored frame is *fewer* bytes, so [`frame_us_for`]'s fit against the
-//   datagram holds with margin rather than being eroded (the payload must never exceed the
-//   datagram; that invariant is absolute and this rounds the right way for it).
-// - **Buffer sizing** — both ends size from [`samples_per_frame`], so they agree by construction.
-// - **⚠ Timing — no.** A rung is a *nominal* length for the wire and the ring, never a duration.
-//   Anything advancing a `pts_ns` must use [`frame_duration_ns`] of the frame's real sample
-//   count; adding 5 000 µs to a frame that carries 4 988 662 ns runs the clock 0.23 % fast
-//   forever, and the A/V sync loop will fight that drift and never win.
+// A rung is a wire/ring size, not a duration. Advance `pts_ns` with
+// [`frame_duration_ns`] of the real sample count, never `frame_us`.
 #define PUNKTFUNK_AUDIO_FRAME_US_LADDER { 5000, 4000, 3000, 2500, 2000, 1500, 1000, }
 
-// What a controller sitting still, face up, actually puts on the wire: **1 g along the UP
-// axis** — which is index 1 — and nothing on the other two.
-//
-// This is a measured fact, not a convention we chose. On 2026-08-07 a real DualSense was read
-// over raw HID: at rest it reports `+0.997 g` on report axis 1, and the same session pinned
-// the frame as (Right, Up, Backward) — axis 0 carries pitch, 1 yaw, 2 roll. The wire is a unit
-// passthrough into that report, so the wire's up axis is the pad's.
-//
-// It exists because the alternative is worse than imprecise. A virtual pad that has never
-// received a motion sample used to report `[0, 0, 0]`, and zero acceleration is not "no
-// information" — it is a controller in **free fall**, which is a claim about the physical
-// world that is never true of a pad on a desk. A game deriving orientation from it gets a
-// definite wrong answer instead of a boring right one. `switch_proto`'s neutral has always
-// done this correctly (1 g on its own up axis); the DualSense family and the Deck did not.
-//
-// Backends whose units differ rescale this like any other sample rather than hard-coding
-// their own version of 1 g — see `steam_remap::motion_wire_to_deck`.
+// Rest pose: 1 g along up (index 1), zeros on the other two. `[0, 0, 0]` is
+// free-fall, not "no sample". Backends that use different units rescale this
+// like any other sample (`steam_remap::motion_wire_to_deck`).
 #define MOTION_NEUTRAL_ACCEL { 0, (int16_t)MOTION_ACCEL_LSB_PER_G, 0, }
 
 
@@ -2830,108 +2010,87 @@ typedef struct {
 
 
 
-// The multipliers a picker offers. `1.0` (Native) is the default; the rest are the round stops
-// users reason about. Shared so every client's list stays identical.
+// Picker stops; `1.0` is Native. Shared so every client's list matches.
 #define PUNKTFUNK_PRESETS { 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, }
 
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
 
-// Current ABI version. Mismatch with [`crate::ABI_VERSION`] means incompatible core.
+// Current ABI version. Mismatch with [`crate::ABI_VERSION`] is an incompatible core.
 uint32_t punktfunk_abi_version(void);
 
-// Receive the core's log lines (ABI v25). The core logs through `tracing`; on the desktop and
-// Android shells a subscriber/logger installed by the shell picks those up, but an embedder that
-// installs none (Swift, any C host) saw NOTHING — every transport warning (socket-buffer clamp,
-// QoS refusal), every quinn connection event and every rustls handshake note vanished, and a
-// client log bundle carried the shell's half of the story only. This routes them to `cb`.
-//
-// `max_level` is the most verbose level delivered (1 = error … 5 = trace; 0 = nothing) —
-// `log::set_max_level`, so anything above it costs no formatting. 3 (info) is the right default
-// for a field log ring; quinn's debug/trace is per-packet and would churn any bounded ring.
-// `cb == NULL` detaches the sink (lines are dropped again). `user` is handed back on every call.
-//
-// Returns `Ok`, or `Unsupported` when another `log` backend is already installed in this
-// process (e.g. the Android shell's `android_logger`) — the core cannot replace it, and that
-// backend already receives everything this one would. Idempotent: call again to change the
-// level or the sink.
+// Route core `log`/`tracing` lines to `cb`. `max_level` 1..=5 (error…trace), 0 = off.
+// 3 (info) is the usual default; debug/trace is per-packet. `cb == NULL` detaches.
+// `Unsupported` if another `log` backend is already installed. Idempotent.
 //
 // # Safety
-// `cb`, if non-null, must remain a valid function for as long as it is installed (until the next
-// call with NULL), and `user` must stay valid for every call the core may make meanwhile.
+// Non-null `cb` stays valid until the next NULL call; `user` stays valid for every callback.
 PunktfunkStatus punktfunk_set_log_callback(uint8_t max_level, PunktfunkLogCb cb, void *user);
 
-// Send a Wake-on-LAN magic packet to wake sleeping host NIC(s).
-//
-// `macs` points to `mac_count` contiguous 6-byte MAC addresses (`mac_count * 6` bytes total) —
-// a host may report several NICs; all are woken. `last_known_ip`, if non-NULL, is an IPv4
-// dotted-quad string additionally targeted by unicast (pass NULL to skip). The packet is
-// broadcast to every local interface's subnet-directed broadcast and to `255.255.255.255` on
-// ports 9 and 7. This does NOT require an open connection and is not part of the QUIC surface.
-//
-// Returns `Ok` if at least one datagram was sent. Call off the UI thread.
+// Wake-on-LAN magic packet. `macs` is `mac_count` contiguous 6-byte MACs.
+// `last_known_ip` is an optional IPv4 dotted-quad unicast target. Broadcasts
+// subnet-directed and `255.255.255.255` on ports 9 and 7. No session needed.
+// `Ok` if at least one datagram was sent. Call off the UI thread.
 //
 // # Safety
-// For a representable nonzero count, `macs` must point to `mac_count * 6` readable bytes.
-// `last_known_ip`, if non-NULL, must be a NUL-terminated string.
+// Nonzero representable `mac_count`: `macs` is `mac_count * 6` readable bytes.
+// `last_known_ip`, if non-NULL, is a NUL-terminated string.
 PunktfunkStatus punktfunk_wake_on_lan(const uint8_t *macs,
                                       uintptr_t mac_count,
                                       const char *last_known_ip);
 
-// Create a session over a real UDP transport (`local`/`peer` are `host:port` strings).
-// Returns NULL on error.
+// Create a session over UDP (`local`/`peer` are `host:port` strings). NULL on error.
 //
 // # Safety
-// `cfg`, `local`, `peer` must be valid pointers; the strings must be NUL-terminated.
+// `cfg`, `local`, `peer` are valid pointers; the strings are NUL-terminated.
 PunktfunkSession *punktfunk_session_new(const PunktfunkConfig *cfg,
                                         const char *local,
                                         const char *peer);
 
-// Create a connected host+client session pair sharing an in-process loopback
-// transport. Test/dev only — exercises the full FEC + framing path without a network.
+// Connected host+client pair on in-process loopback. Test/dev only: full FEC
+// + framing without a network.
 //
 // # Safety
-// All four pointers must be valid; the two out-params receive owned handles.
+// All four pointers are valid; the two out-params receive owned handles.
 PunktfunkStatus punktfunk_test_loopback_pair(const PunktfunkConfig *host_cfg,
                                              const PunktfunkConfig *client_cfg,
                                              PunktfunkSession **out_host,
                                              PunktfunkSession **out_client);
 
-// Free a session handle. Safe to call with NULL.
+// Free a session handle. NULL is a no-op.
 //
 // # Safety
-// `s` must be a handle from `punktfunk_session_new`/`punktfunk_test_loopback_pair`, freed once.
+// `s` is a handle from `punktfunk_session_new` / `punktfunk_test_loopback_pair`, freed once.
 void punktfunk_session_free(PunktfunkSession *s);
 
-// Host: FEC-protect, packetize, seal and send one encoded access unit.
+// Host: FEC-protect, packetize, seal, and send one encoded access unit.
 //
 // # Safety
-// `s` is a valid host handle. For a representable nonzero `len`, `data` points to that many
-// readable bytes; `data` may be NULL when `len == 0`.
+// `s` is a valid host handle. For a representable nonzero `len`, `data` points
+// to that many readable bytes; `data` may be NULL when `len == 0`.
 PunktfunkStatus punktfunk_host_submit_frame(PunktfunkSession *s,
                                             const uint8_t *data,
                                             uintptr_t len,
                                             uint64_t pts_ns,
                                             uint32_t flags);
 
-// Client: poll for the next reassembled access unit. Returns [`PunktfunkStatus::NoFrame`]
-// when nothing is ready yet. On `Ok`, `*out` borrows session memory until the next poll.
+// Client: poll for the next reassembled access unit. [`PunktfunkStatus::NoFrame`]
+// when nothing is ready. On `Ok`, `*out` borrows session memory until the next poll.
 //
 // # Safety
 // `s` is a valid client handle; `out` points to a writable `PunktfunkFrame`.
 PunktfunkStatus punktfunk_client_poll_frame(PunktfunkSession *s, PunktfunkFrame *out);
 
 // Client: serialize and send one input event to the host.
-//
-// Returns `InvalidArg` if `ev->kind` is not a recognized event kind.
+// `InvalidArg` if `ev->kind` is not a recognized event kind.
 //
 // # Safety
 // `s` is a valid client handle; `ev` points to a readable `InputEvent`-sized allocation.
 PunktfunkStatus punktfunk_send_input(PunktfunkSession *s, const PunktfunkInputEvent *ev);
 
-// Register the host-side input callback (pass a NULL fn pointer to clear). The callback
-// fires from within [`punktfunk_host_poll_input`], on the calling thread.
+// Register the host-side input callback (NULL fn pointer clears). Fires from
+// [`punktfunk_host_poll_input`] on the calling thread.
 //
 // # Safety
 // `s` is a valid host handle; `user` is passed back verbatim to `cb`.
@@ -2939,7 +2098,7 @@ PunktfunkStatus punktfunk_set_input_callback(PunktfunkSession *s,
                                              void (*cb)(const PunktfunkInputEvent *event, void *user),
                                              void *user);
 
-// Host: drain all pending input events, invoking the registered callback for each.
+// Host: drain pending input events, invoking the registered callback for each.
 // Returns the count dispatched (≥ 0), or a negative [`PunktfunkStatus`] on error.
 //
 // # Safety
@@ -2953,18 +2112,18 @@ int32_t punktfunk_host_poll_input(PunktfunkSession *s);
 PunktfunkStatus punktfunk_get_stats(PunktfunkSession *s, PunktfunkStats *out);
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Trust: `pin_sha256` (NULL or 32 bytes) is the expected SHA-256 fingerprint of the host's
-// certificate — a mismatching host is rejected. NULL = trust on first use; persist the
-// fingerprint written to `observed_sha256_out` (NULL or 32 bytes, filled on success) and
-// pass it as the pin on every later connect.
+// Trust: `pin_sha256` (NULL or 32 bytes) is the expected SHA-256 of the host
+// certificate — a mismatch is rejected. NULL = trust on first use; persist
+// `observed_sha256_out` (NULL or 32 bytes, filled on success) and pass it as
+// the pin on every later connect.
 //
-// Identity: `client_cert_pem`/`client_key_pem` (both NULL, or both NUL-terminated PEM
-// strings — see [`punktfunk_generate_identity`]) are presented via TLS client auth so a
-// host can recognize this client once paired ([`punktfunk_pair`]). NULL = anonymous;
-// hosts running `--require-pairing` reject anonymous sessions.
+// Identity: `client_cert_pem`/`client_key_pem` (both NULL, or both NUL-terminated
+// PEM — [`punktfunk_generate_identity`]) are TLS client auth so a host can
+// recognize this client once paired ([`punktfunk_pair`]). NULL = anonymous;
+// `--require-pairing` hosts reject anonymous sessions.
 //
 // # Safety
-// `host` is a NUL-terminated UTF-8 string (IP or hostname resolvable by the platform);
+// `host` is a NUL-terminated UTF-8 string (IP or resolvable hostname);
 // `pin_sha256`/`observed_sha256_out` are each NULL or valid for 32 bytes;
 // `client_cert_pem`/`client_key_pem` are each NULL or NUL-terminated UTF-8.
 PunktfunkConnection *punktfunk_connect(const char *host,
@@ -2980,11 +2139,9 @@ PunktfunkConnection *punktfunk_connect(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Like [`punktfunk_connect`], but requests a specific `compositor` backend on the host (one of
-// the `PUNKTFUNK_COMPOSITOR_*` values). `PUNKTFUNK_COMPOSITOR_AUTO` (or any unrecognized value)
-// lets the host decide; a concrete value is honored only if available, else the host falls back
-// to auto-detect. The resolved choice is logged host-side and returned over the protocol.
-// Equivalent to [`punktfunk_connect_ex2`] with `gamepad = PUNKTFUNK_GAMEPAD_AUTO`.
+// [`punktfunk_connect`] plus a `compositor` (`PUNKTFUNK_COMPOSITOR_*`). `AUTO`
+// (or unrecognized) lets the host decide; a concrete value is honored only if
+// available. Same as [`punktfunk_connect_ex2`] with `gamepad = PUNKTFUNK_GAMEPAD_AUTO`.
 //
 // # Safety
 // Same as [`punktfunk_connect`].
@@ -3002,12 +2159,10 @@ PunktfunkConnection *punktfunk_connect_ex(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Like [`punktfunk_connect_ex`], but additionally requests which virtual `gamepad` backend the
-// host creates for this session's pads (one of the `PUNKTFUNK_GAMEPAD_*` values).
-// `PUNKTFUNK_GAMEPAD_AUTO` (or any unrecognized value) lets the host decide (its
-// `PUNKTFUNK_GAMEPAD` env var, else X-Box 360); a concrete value is honored only if that
-// backend is available on the host. The resolved choice is readable via
-// [`punktfunk_connection_gamepad`] — only a DualSense session emits HID-output feedback.
+// [`punktfunk_connect_ex`] plus a virtual `gamepad` (`PUNKTFUNK_GAMEPAD_*`).
+// `AUTO` (or unrecognized) lets the host decide (`PUNKTFUNK_GAMEPAD` env, else
+// X-Box 360). Resolved via [`punktfunk_connection_gamepad`]. Only DualSense
+// emits HID-output feedback.
 //
 // # Safety
 // Same as [`punktfunk_connect`].
@@ -3026,11 +2181,8 @@ PunktfunkConnection *punktfunk_connect_ex2(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Like [`punktfunk_connect_ex2`], but additionally requests the video encoder `bitrate_kbps`
-// (kilobits per second). `0` lets the host pick its default; any other value is clamped to the
-// host's supported range. After a speed test ([`punktfunk_connection_speed_test`]) a client can
-// reconnect (or pick at connect time) with the measured rate. The value the host actually
-// configured is readable via [`punktfunk_connection_bitrate`].
+// [`punktfunk_connect_ex2`] plus encoder `bitrate_kbps`. `0` = host default;
+// other values clamp to the host range. Read [`punktfunk_connection_bitrate`].
 //
 // # Safety
 // Same as [`punktfunk_connect`].
@@ -3050,14 +2202,12 @@ PunktfunkConnection *punktfunk_connect_ex3(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Like [`punktfunk_connect_ex3`], but additionally asks the host to launch a library title in
-// this session. `launch_id` is a store-qualified [`crate::library`-style] id as returned by the
-// host's `GET /api/v1/library` (`steam:<appid>` / `custom:<id>`); the host resolves it against
-// its OWN library and runs the matching recipe — the client never sends a raw command. `NULL`
-// (or an empty / unknown id) ⇒ the host's default session, no game launched.
+// [`punktfunk_connect_ex3`] plus a library title. `launch_id` is a store-qualified
+// id (`steam:<appid>` / `custom:<id>`); the host resolves it against its own
+// library. `NULL` / empty / unknown ⇒ default session, no game.
 //
 // # Safety
-// Same as [`punktfunk_connect`]; `launch_id`, when non-NULL, must be a NUL-terminated C string.
+// Same as [`punktfunk_connect`]; non-NULL `launch_id` is a NUL-terminated C string.
 PunktfunkConnection *punktfunk_connect_ex4(const char *host,
                                            uint16_t port,
                                            uint32_t width,
@@ -3075,16 +2225,12 @@ PunktfunkConnection *punktfunk_connect_ex4(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Like [`punktfunk_connect_ex4`], but additionally advertises the embedder's video decode/present
-// capabilities as `video_caps` — a bitfield of `PUNKTFUNK_VIDEO_CAP_10BIT` (can decode 10-bit
-// Main10) and `PUNKTFUNK_VIDEO_CAP_HDR` (can present BT.2020 PQ HDR10). The host upgrades to a
-// 10-bit / HDR encode ONLY when the matching bit is set (and the host opted in); `0` keeps the
-// 8-bit BT.709 SDR stream. After connecting, read the resolved colour via
-// [`punktfunk_connection_color_info`] and drain the mastering metadata via
-// [`punktfunk_connection_next_hdr_meta`].
+// [`punktfunk_connect_ex4`] plus `video_caps` (`PUNKTFUNK_VIDEO_CAP_*`).
+// Host upgrades only when the bit is set. Read colour via
+// [`punktfunk_connection_color_info`] / [`punktfunk_connection_next_hdr_meta`].
 //
 // # Safety
-// Same as [`punktfunk_connect`]; `launch_id`, when non-NULL, must be a NUL-terminated C string.
+// Same as [`punktfunk_connect`]; non-NULL `launch_id` is a NUL-terminated C string.
 PunktfunkConnection *punktfunk_connect_ex5(const char *host,
                                            uint16_t port,
                                            uint32_t width,
@@ -3103,11 +2249,10 @@ PunktfunkConnection *punktfunk_connect_ex5(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Like [`punktfunk_connect_ex5`], but additionally requests the audio channel count:
-// `2` (stereo, the default behaviour of every earlier variant), `6` (5.1) or `8` (7.1). The host
-// clamps the request to what it can actually capture and echoes the resolved count via
-// [`punktfunk_connection_audio_channels`]. Advertises HEVC-only with no codec preference (call
-// [`punktfunk_connect_ex7`] to negotiate the codec).
+// [`punktfunk_connect_ex5`] plus audio channel count: `2` (stereo), `6` (5.1) or
+// `8` (7.1). Host clamps to what it can capture; read
+// [`punktfunk_connection_audio_channels`]. Advertises HEVC-only, no codec
+// preference ([`punktfunk_connect_ex7`] negotiates).
 //
 // # Safety
 // Same as [`punktfunk_connect`].
@@ -3130,12 +2275,9 @@ PunktfunkConnection *punktfunk_connect_ex6(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Like [`punktfunk_connect_ex6`], but additionally advertises the codecs the client can decode
-// (`video_codecs` — a bitfield of [`PUNKTFUNK_CODEC_H264`] / [`PUNKTFUNK_CODEC_HEVC`] /
-// [`PUNKTFUNK_CODEC_AV1`]) and a soft `preferred_codec` (a single codec bit, `0` = no preference).
-// The host resolves the codec it emits from these (preference honored when it can also produce it,
-// else best shared codec) and reports it via [`punktfunk_connection_codec`]. A client that omits
-// this (calls `ex6`) advertises HEVC-only, no preference — the pre-negotiation behaviour.
+// [`punktfunk_connect_ex6`] plus `video_codecs` (`PUNKTFUNK_CODEC_*` bits) and a
+// soft `preferred_codec` (one codec bit, `0` = none). Host honors preference when
+// it can produce it, else best shared codec. Read [`punktfunk_connection_codec`].
 //
 // # Safety
 // Same as [`punktfunk_connect`].
@@ -3160,16 +2302,11 @@ PunktfunkConnection *punktfunk_connect_ex7(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Like [`punktfunk_connect_ex7`], but additionally reports WHY a failed connect failed:
-// `status_out` (nullable — null is exactly `ex7`) receives a [`PunktfunkStatus`] as `i32` —
-// `Ok` on success, the mapped error otherwise, including the typed host-rejection block
-// (`PUNKTFUNK_STATUS_REJECTED_NOT_ARMED` … `PUNKTFUNK_STATUS_REJECTED_BUSY`) decoded from the
-// host's application close. That lets an embedder tell "denied in the console" / "nobody
-// approved in time" / "host busy" / "versions don't match" apart from plain unreachability
-// (`Io`/`Timeout`) — a NULL return alone can't say which.
+// [`punktfunk_connect_ex7`] plus `status_out` (nullable): the mapped
+// [`PunktfunkStatus`], including typed host rejections. NULL alone cannot say why.
 //
 // # Safety
-// Same as [`punktfunk_connect`]; `status_out`, when non-null, must point to a writable `i32`.
+// Same as [`punktfunk_connect`]; non-null `status_out` points to a writable `i32`.
 PunktfunkConnection *punktfunk_connect_ex8(const char *host,
                                            uint16_t port,
                                            uint32_t width,
@@ -3192,12 +2329,8 @@ PunktfunkConnection *punktfunk_connect_ex8(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Like [`punktfunk_connect_ex8`], plus `client_caps` (ABI v11): a bitfield of
-// `PUNKTFUNK_CLIENT_CAP_CURSOR` (0x01). Setting the cursor bit asks the host to STOP
-// compositing the pointer into the video and forward it out-of-band instead — the embedder
-// MUST then drain [`punktfunk_connection_next_cursor_shape`] /
-// [`punktfunk_connection_next_cursor_state`] and draw the pointer itself, or the session has
-// no visible cursor at all. Pass 0 for the composited behavior of every earlier variant.
+// [`punktfunk_connect_ex8`] plus `client_caps`. Cursor bit: host stops compositing;
+// the embedder must drain shape/state or there is no pointer. Pass 0 for composited.
 //
 // # Safety
 // Same as [`punktfunk_connect_ex8`].
@@ -3224,23 +2357,12 @@ PunktfunkConnection *punktfunk_connect_ex9(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Like [`punktfunk_connect_ex9`], plus `device_name` (ABI v21): the human-readable label this
-// device knocks with — what the host's **pending-approval** list (and the web console's
-// outstanding-pairings view and its approve dialog) shows for an unpaired client, and what the
-// trust store files it under once approved. Pass the name the user already recognises this
-// device by: `Host.current().localizedName` on macOS, `UIDevice.current.name` on iOS/tvOS,
-// `Settings.Global.DEVICE_NAME` on Android.
-//
-// NULL / empty = the [`crate::client::device_name`] default, exactly as every earlier variant.
-// That default is an OS hostname, which no Apple GUI process could reach until v21 — every one
-// of them knocked as the literal "This device", so a console with three of them pending showed
-// three identical rows. Longer than [`crate::quic::HELLO_NAME_MAX`] bytes of UTF-8 is truncated
-// (on a character boundary) rather than rejected: a too-long label is a cosmetic problem, and
-// failing a connect over it would be a much worse one.
+// [`punktfunk_connect_ex9`] plus `device_name` — the label this device knocks
+// with. NULL/empty = [`crate::client::device_name`]. Longer than
+// [`HELLO_NAME_MAX`] is truncated on a character boundary, not rejected.
 //
 // # Safety
-// Same as [`punktfunk_connect_ex9`]; `device_name`, when non-null, must be a NUL-terminated C
-// string that stays valid for the duration of the call.
+// Same as [`punktfunk_connect_ex9`]; non-null `device_name` is a NUL-terminated C string.
 PunktfunkConnection *punktfunk_connect_ex10(const char *host,
                                             uint16_t port,
                                             uint32_t width,
@@ -3265,51 +2387,15 @@ PunktfunkConnection *punktfunk_connect_ex10(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Like [`punktfunk_connect_ex10`], plus the audio format this client is **asking** for (ABI v24):
-// `audio_rate_hz` — `48000`, `96000`, or the 44.1 kHz family `44100` / `88200` / `176400` — and
-// `audio_bits` (`16` or `24`).
+// [`punktfunk_connect_ex10`] plus an audio-format ask (`audio_rate_hz` /
+// `audio_bits`). Any non-zero pair — including `48000`/`16` — sets
+// `CLIENT_CAP_AUDIO_HIRES` and asks for lossless `0xD3`. `0`/`0` is unspecified
+// (Opus). Do not pass 48 kHz/16 as a stand-in for default.
 //
-// Passing a format AT ALL — any non-zero `audio_rate_hz`/`audio_bits`, `48000`/`16` included —
-// sets `CLIENT_CAP_AUDIO_HIRES` in the `Hello` and asks the host for the LOSSLESS `0xD3` plane,
-// bit-exact PCM instead of Opus. (This line once said "anything other than `48000`/`16`", which
-// was the rule until the cheapest rung turned out to be the one nobody could ask for; the ⚠ below
-// is the whole story.) That is an opt-in on both ends, and it is meant to be: it costs
-// **1.5–4.6 Mbps** taken off the top of the link (audio rides QUIC datagrams outside the ABR
-// loop, so ABR can neither see it nor reclaim it), against the ~256 kbps Opus this replaces. Only
-// pass a format when the user turned the feature on AND this embedder can genuinely open an
-// output device at it.
-//
-// **The request is not the answer.** The host runs a five-condition gate
-// (`design/hi-res-audio.md` §8.4 — client asked, operator policy allows, stereo, the capture
-// path can *really* deliver the rate, and the link can afford it) and any failure resolves the
-// session back to Opus at 48 kHz. That is not an error and the connect still succeeds. Read
-// [`punktfunk_connection_audio_sample_rate`] / [`punktfunk_connection_audio_bits`] afterwards
-// and open the device from THOSE — opening at what you asked for is
-// `design/hi-res-audio.md` §4.3's failure repeated at the client end.
-//
-// ⚠ **Passing `48000`/`16` is NOT the same as [`punktfunk_connect_ex10`], and an earlier version
-// of this comment claimed it was.** `ex10` passes `0`/`0` — *unspecified* — and the capability bit
-// keys on "the caller specified a format", not on "the format differs from the default". So an
-// explicit 48 kHz/16-bit is a genuine request for the cheapest lossless rung: the `Hello` carries
-// [`quic::CLIENT_CAP_AUDIO_HIRES`](crate::quic::CLIENT_CAP_AUDIO_HIRES), the host's gate accepts
-// 48/16 as a supported format, and a host with the operator policy on will resolve the session
-// onto the lossless plane at 1.5 Mbps.
-//
-// That is the intended behaviour — 48/16 would otherwise be the one rung on the ladder nobody
-// could ask for — but it makes `0`/`0` load-bearing. **An embedder whose user chose "Opus" must
-// pass `0`/`0` here, or call [`punktfunk_connect_ex10`].** Forwarding a hardcoded 48 000/16 as a
-// stand-in for "default" silently opts every ordinary session into the lossless plane.
-//
-// The 44.1 kHz family is on the ladder, and was not always: core's de-jitter policy divided the
-// rate by 1 000 before it multiplied, which made 44 100 Hz "44 samples per millisecond" and every
-// buffer figure 2.3 % low, so §4.1 deferred those rates behind fixing that arithmetic. It is
-// fixed. Note what it does NOT buy: at 44 100 Hz **no** rung of the frame ladder is a whole
-// number of samples, so [`punktfunk_connection_audio_frame_us`] becomes a nominal length rather
-// than a duration. An embedder that advances any clock by it runs 0.23 % fast forever; the honest
-// figure is the samples it actually rendered, divided by
-// [`punktfunk_connection_audio_sample_rate`].
-//
-// A NEW symbol, not a widened one — `ex10` keeps its parameter list AND its behaviour.
+// The host may still resolve Opus (`design/hi-res-audio.md`); open the device
+// from [`punktfunk_connection_audio_sample_rate`] / `_bits`, not from the ask.
+// At 44.1 kHz, [`punktfunk_connection_audio_frame_us`] is a nominal length —
+// advance clocks from samples / rate, not from that figure.
 //
 // # Safety
 // Same as [`punktfunk_connect_ex10`].
@@ -3339,29 +2425,28 @@ PunktfunkConnection *punktfunk_connect_ex11(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Connect with every option in one growable [`PunktfunkConnectOpts`] (ABI v26) — semantics are
-// exactly [`punktfunk_connect_ex11`]'s, field for field. The `ex` chain stays supported and
-// byte-identical forever, but it is CLOSED: new options land only in the struct.
+// Connect with every option in one growable [`PunktfunkConnectOpts`]. Semantics
+// match [`punktfunk_connect_ex11`] field for field. The `ex` chain stays
+// byte-identical; new options land only in this struct.
 //
-// `status_out` (nullable) is written on every path, like the whole connect family;
-// `observed_sha256_out` (null or 32 bytes) receives the host certificate's fingerprint on
-// success, per [`punktfunk_connect`]'s trust contract.
+// `status_out` (nullable) is written on every path; `observed_sha256_out`
+// (null or 32 bytes) receives the host fingerprint on success.
 //
 // # Safety
-// `opts` is null or points to at least `opts->struct_size` readable bytes laid out as its
-// declared version of [`PunktfunkConnectOpts`]; its pointer fields follow
-// [`punktfunk_connect_ex11`]'s contract; `observed_sha256_out` is null or valid for 32 bytes.
+// `opts` is null or points to at least `opts->struct_size` readable bytes laid
+// out as its declared [`PunktfunkConnectOpts`]; pointer fields follow
+// [`punktfunk_connect_ex11`]; `observed_sha256_out` is null or valid for 32 bytes.
 PunktfunkConnection *punktfunk_connect_opts(const PunktfunkConnectOpts *opts,
                                             uint8_t *observed_sha256_out,
                                             int32_t *status_out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Generate a persistent client identity: a self-signed certificate + private key, both
-// PEM, NUL-terminated, written into the caller's buffers. Generate ONCE, store both
-// strings (Keychain etc.), pass them to [`punktfunk_pair`] and every
-// [`punktfunk_connect`] — the certificate's fingerprint is how hosts recognize this
-// client. 4096-byte buffers are ample.
+// Generate a persistent client identity: self-signed certificate + private key,
+// both PEM, NUL-terminated, written into the caller's buffers. Generate once,
+// store both, pass them to [`punktfunk_pair`] and every [`punktfunk_connect`].
+// Hosts recognize this client by the certificate fingerprint. 4096-byte buffers
+// are ample.
 //
 // # Safety
 // `cert_pem_out` is writable for `cert_cap` bytes; `key_pem_out` for `key_cap`.
@@ -3372,26 +2457,19 @@ PunktfunkStatus punktfunk_generate_identity(char *cert_pem_out,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Reachability probe: attempt the QUIC handshake to `host:port` and report whether the host
-// answered — trust-agnostic and mDNS-INDEPENDENT. A host reached over a routed network
-// (Tailscale/VPN/another subnet) answers here even though it never advertises on mDNS, so the
-// clients' saved-host "online" pips can reflect real reachability instead of LAN presence (the
-// display-side companion to the dial-first connect fix). Returns [`PunktfunkStatus::Ok`] when
-// reachable, [`PunktfunkStatus::Timeout`] when not (or on any connect error). Blocks up to
-// `timeout_ms`; call off the UI thread.
+// QUIC reachability probe, trust-agnostic and mDNS-independent. `Ok` if the
+// host answered, `Timeout` otherwise. Blocks up to `timeout_ms`; off the UI thread.
 //
 // # Safety
-// `host` must be a NUL-terminated UTF-8 string.
+// `host` is a NUL-terminated UTF-8 string.
 PunktfunkStatus punktfunk_probe(const char *host, uint16_t port, uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Run the PIN pairing ceremony against a host (see the protocol docs in punktfunk-core):
-// the host displays a short PIN; the user types it into the client app, which passes it
-// here. On success the host has stored this client's identity, the now-verified host
-// fingerprint is written to `host_sha256_out` (32 bytes) — persist it and pass it as
-// `pin_sha256` to [`punktfunk_connect`] from then on. Returns
-// [`PunktfunkStatus::Crypto`] for a wrong PIN.
+// PIN pairing: the host displays a PIN; pass it here. On success the host has
+// stored this client's identity and the verified host fingerprint is written to
+// `host_sha256_out` (32 bytes) — persist it as `pin_sha256` for
+// [`punktfunk_connect`]. [`PunktfunkStatus::Crypto`] for a wrong PIN.
 //
 // # Safety
 // `host`/`client_cert_pem`/`client_key_pem`/`pin`/`name` are NUL-terminated UTF-8;
@@ -3407,29 +2485,28 @@ PunktfunkStatus punktfunk_pair(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pull the next reassembled access unit, waiting up to `timeout_ms`. Returns
-// [`PunktfunkStatus::NoFrame`] on timeout and [`PunktfunkStatus::Closed`] once the session ended.
-// On `Ok`, `*out` borrows connection memory **until the next `next_au` call** on this
-// handle (the audio/rumble planes do not invalidate it).
+// Pull the next reassembled access unit, waiting up to `timeout_ms`.
+// [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once ended.
+// On `Ok`, `*out` borrows until the next `next_au` on this handle (audio/rumble
+// planes do not invalidate it).
 //
 // # Safety
-// `c` is a valid connection handle; `out` is writable. At most one thread pulls video —
-// it may run concurrently with one audio-pulling and one rumble-pulling thread.
+// `c` is a valid connection handle; `out` is writable. At most one thread pulls
+// video; it may run concurrently with one audio and one rumble puller.
 PunktfunkStatus punktfunk_connection_next_au(PunktfunkConnection *c,
                                              PunktfunkFrame *out,
                                              uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pull the next audio packet (see [`PunktfunkAudioPacket`] for what it holds), waiting up to
-// `timeout_ms`. Returns [`PunktfunkStatus::NoFrame`] on timeout and [`PunktfunkStatus::Closed`]
-// once the session ended. On `Ok`, `out->data` borrows connection memory **until the next audio
-// call** on this handle (independent of the video slot). Drain from a dedicated audio thread —
-// Opus packets arrive every 5 ms (lossless ones every 1–5 ms, per the negotiated frame length)
-// and the internal queue holds 320 ms.
+// Pull the next audio packet, waiting up to `timeout_ms`.
+// [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once ended.
+// On `Ok`, `out->data` borrows until the next audio call (independent of video).
+// Drain from a dedicated thread — Opus every 5 ms, lossless every 1–5 ms; queue
+// holds 320 ms.
 //
 // # Safety
-// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio —
+// `c` is a valid connection handle; `out` is writable. At most one audio puller;
 // it may run concurrently with the video/rumble pullers.
 PunktfunkStatus punktfunk_connection_next_audio(PunktfunkConnection *c,
                                                 PunktfunkAudioPacket *out,
@@ -3437,12 +2514,10 @@ PunktfunkStatus punktfunk_connection_next_audio(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Read the audio channel count the host resolved for this session (from its Welcome): `2`
-// (stereo), `6` (5.1) or `8` (7.1). `*out` is filled when non-NULL. The `0xC9` Opus frames are
-// (multistream-)encoded for this layout; an embedder decoding raw frames itself must build its
-// decoder from THIS value (see [`crate::audio::layout_for`]) — or use
-// [`punktfunk_connection_next_audio_pcm`], which decodes in-core. Available immediately after a
-// successful connect (it doesn't change without a reconfigure).
+// Host-resolved audio channel count: `2` (stereo), `6` (5.1) or `8` (7.1).
+// `*out` is filled when non-NULL. Raw `0xC9` Opus is encoded for this layout
+// ([`crate::audio::layout_for`]); or use [`punktfunk_connection_next_audio_pcm`].
+// Fixed until a reconfigure.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -3450,45 +2525,17 @@ PunktfunkStatus punktfunk_connection_audio_channels(PunktfunkConnection *c, uint
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Read the sample rate the host resolved for this session (from its Welcome): `48000` for every
-// Opus session — and for every host older than the lossless plane — or the rate a hi-res session
-// actually landed on, which may be LOWER than the client asked for. `*out` is filled when
-// non-NULL. Available immediately after a successful connect; it never changes mid-session.
-//
-// ⚠ **Open the output device from this, not from `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ`.** That
-// compile-time constant keeps its value and its meaning — it is the DEFAULT/legacy rate, and
-// every ring sized from it is still correct for every session that resolves to Opus — but on a
-// hi-res session it is simply not the rate on the wire. Opening at 96 kHz because you asked for
-// 96 kHz, when the host answered 48 kHz, is `design/hi-res-audio.md` §4.3's failure repeated at
-// the other end of the link: everything audits clean and the content is wrong.
-//
-// An ACCESSOR rather than a field on [`PunktfunkAudioPcm`] or `PunktfunkStats`: both are
-// `#[repr(C)]` with no `struct_size` guard and are allocated by value by C embedders, so growing
-// either would break every one of them at once. Same rule ABI 18 set with
-// `punktfunk_connection_next_rumble_cmd2` — added, not widened — so an embedder that never calls
-// this behaves exactly as it did before it existed.
+// Resolved sample rate. Open the device from this, not `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ`
+// (the Opus default). Accessor, not a field: `PunktfunkAudioPcm` has no size guard.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u32`.
-PunktfunkStatus punktfunk_connection_audio_sample_rate(PunktfunkConnection *c,
-                                                       uint32_t *out);
+PunktfunkStatus punktfunk_connection_audio_sample_rate(PunktfunkConnection *c, uint32_t *out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Read the sample depth the host resolved for this session (from its Welcome): `16` on every
-// Opus session and every older host, `16` or `24` on the lossless plane. `*out` is filled when
-// non-NULL. Available immediately after a successful connect; it never changes mid-session.
-//
-// Only sessions on the lossless plane can report `24`, and only they need it: the depth is the
-// stride the `0xD3` payload is unpacked at, and [`punktfunk_connection_next_audio_pcm`] already
-// does that unpacking in core — it hands out f32 either way. This is here so an embedder can
-// *report* the format honestly (a UI that says "24-bit" while the host declined is the same
-// class of lie as claiming a rate you did not get) and so one draining raw frames through
-// [`punktfunk_connection_next_audio`] can unpack them itself. Which PLANE a session is on is
-// `punktfunk_connection_host_caps() & PUNKTFUNK_HOST_CAP_AUDIO_HIRES`, not this: 48 kHz/16-bit
-// reads identically on both.
-//
-// ADDED, not widened — see [`punktfunk_connection_audio_sample_rate`] for why.
+// Resolved sample depth (`16`, or `24` on lossless). Plane is
+// `host_caps & PUNKTFUNK_HOST_CAP_AUDIO_HIRES`, not this: 48 kHz/16-bit matches both.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -3496,30 +2543,10 @@ PunktfunkStatus punktfunk_connection_audio_bits(PunktfunkConnection *c, uint8_t 
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// The resolved audio frame length in MICROSECONDS — how much audio one datagram carries.
-//
-// `PUNKTFUNK_AUDIO_FRAME_MS` is the Opus plane's 5 ms and stays that way, but the lossless plane
-// sizes its frame to the path MTU: 4 ms at 48 kHz/24-bit and 2 ms at 96 kHz/24-bit under the
-// default ceiling. An embedder that ports the de-jitter policy (rather than draining
-// [`punktfunk_connection_next_audio_pcm`] and letting core do it) needs the real figure — the
-// shed drops exactly one frame and the target floor is a device quantum plus one frame, so a
-// policy compiled against 5 ms sheds 2.5 frames at a time on a 96 kHz session.
-//
-// Microseconds rather than milliseconds because the ladder has sub-millisecond rungs; `0` means
-// the host did not state one, in which case `PUNKTFUNK_AUDIO_FRAME_MS × 1000` is correct.
-//
-// ⚠⚠ **A NOMINAL length, not a duration, and on the 44.1 kHz family they differ.** A frame
-// carries a whole number of samples per channel, and 44 100 Hz divides no rung of the ladder: a
-// 5 ms frame there is 220 samples per channel, which is 4 988 662 ns. Sizing a ring from this is
-// right (that is what it is for); advancing a **clock** by it is not — it invents 2.3 ms of time
-// per second, indefinitely, and every stat downstream will agree with the lie because the
-// timestamps stay self-consistent. Derive elapsed time from the samples rendered and
-// [`punktfunk_connection_audio_sample_rate`] instead.
-//
-// **Not derivable from `next_audio_pcm`'s `frame_count`.** That call prepends concealed frames
-// into the same buffer, so its count is "how many samples you got", not "how long one frame is".
-//
-// ADDED, not widened — see [`punktfunk_connection_audio_sample_rate`] for why.
+// Resolved frame length in µs (ladder has sub-ms rungs). `0` = use
+// `PUNKTFUNK_AUDIO_FRAME_MS × 1000`. On 44.1 kHz this is a nominal length, not a
+// duration — size rings from it, advance clocks from samples / rate.
+// Not derivable from `next_audio_pcm`'s `frame_count` (that includes concealment).
 //
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u16`.
@@ -3527,21 +2554,8 @@ PunktfunkStatus punktfunk_connection_audio_frame_us(PunktfunkConnection *c, uint
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// WHY this session ended: `*out` receives a [`PunktfunkEndReason`] byte
-// (`PUNKTFUNK_END_REASON_*`). The return status reports only whether the handle was usable.
-//
-// Read it once a plane has returned [`PunktfunkStatus::Closed`] (or the embedder's own
-// end-of-session signal fired); before that it reads `NONE`. It latches, so it is still readable
-// while the connection is torn down, and a client that never calls it behaves exactly as it did
-// before this existed.
-//
-// **Most endings are not failures.** Before this, a client had no way to tell a player quitting
-// their game from a host falling off the network, so every client wrote one message for all of
-// them and every client chose an error. Use `LOCAL`/`GAME_EXITED`/`HOST_ENDED` to stay quiet (and
-// `GAME_EXITED` to return to the library the title was launched from), and keep the alarming copy
-// for `HOST_ERROR` and `LOST`.
-//
-// Treat an unrecognized value as `NONE` — this crosses an ABI and the core may be newer than you.
+// Why the session ended (`PUNKTFUNK_END_REASON_*`). Latches after `Closed`.
+// `LOCAL`/`GAME_EXITED`/`HOST_ENDED` are not failures. Unknown values = `NONE`.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -3549,99 +2563,36 @@ PunktfunkStatus punktfunk_connection_end_reason(PunktfunkConnection *c, uint8_t 
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pull the next audio frame and **decode it in-core** to interleaved f32 PCM — for embedders
-// without a multistream-capable Opus decoder (e.g. Apple, whose AudioToolbox Opus path is
-// stereo-only). The decoder is built once from the negotiated channel count and handles 2/6/8
-// channels (a 1-coupled-stream multistream decoder is exactly a stereo decoder). Same
-// timeout/closed semantics as [`punktfunk_connection_next_audio`]; `out->samples` borrows
-// connection memory until the next PCM call on this handle. Use EITHER this or
-// [`punktfunk_connection_next_audio`] on a given connection, from one dedicated audio thread —
-// not both (they share the underlying queue).
-//
-// **Both audio planes come out of this one call.** On a session that resolved the lossless
-// `0xD3` plane there is no Opus decoder at all — the samples are unpacked at the negotiated
-// depth — but the output is the same interleaved f32 in the same borrowed buffer, so an embedder
-// needs no branch. It DOES need [`punktfunk_connection_audio_sample_rate`] to size its ring and
-// open its device: `frame_count` is samples per channel, and at 96 kHz they arrive twice as fast.
-//
-// **Loss concealment**: packets the wire lost (a gap in the sequence, after the redundant-plane
-// recovery has had its chance) are synthesized and returned IN FRONT of the arriving frame in
-// the same buffer — `out->frame_count` then covers the concealed frames plus the real one
-// (`out->seq`/`out->pts_ns` are the real packet's). The embedder just writes the whole buffer to
-// its ring, same as any other frame; gaps arrive pre-healed, exactly as they do on the clients
-// that decode outside core. That covers a gap a LATER packet reveals; when the wire goes quiet
-// instead, see [`punktfunk_connection_audio_plc`].
-//
-// What synthesizes them differs by plane, and has to: Opus gaps use libopus PLC, which
-// extrapolates from the decoder's model of the signal. A lossless frame has no such model — only
-// the signal — so `0xD3` gaps are concealed by repeating the last good frame under a raised-cosine
-// fade, decaying to silence across a sustained gap (`design/hi-res-audio.md` §4.5). Same shape,
-// same buffer, same cap; only the material differs.
+// Decode the next audio frame in-core to interleaved f32. Both planes share this
+// call; size the ring from [`punktfunk_connection_audio_sample_rate`]. Seq-gap
+// concealment is prepended in the same buffer. Quiet-wire droughts:
+// [`punktfunk_connection_audio_plc`]. Mutually exclusive with `next_audio`.
 //
 // # Safety
-// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio.
+// `c` is a valid connection handle; `out` is writable. At most one audio puller.
 PunktfunkStatus punktfunk_connection_next_audio_pcm(PunktfunkConnection *c,
                                                     PunktfunkAudioPcm *out,
                                                     uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Synthesize ONE frame of concealment from the in-core decoder's own state — no packet involved,
-// nothing pulled off the wire (design/host-source-stutter-fixes.md, WP-C1).
-//
-// [`punktfunk_connection_next_audio_pcm`] heals a gap the SEQUENCE reveals, which needs a later
-// packet to arrive and reveal it. When the wire simply goes quiet — a delivery stall on a
-// bunching Wi-Fi link, or a host whose capture stalled — nothing arrives to reveal anything: the
-// embedder's playout ring drains to empty, its callback runs short, and its de-jitter policy
-// de-primes and then re-primes a whole target's worth of fresh silence. The artifact is far
-// longer than the audio actually missing.
-//
-// So on a `NO_FRAME` timeout with a DRAINING ring, ask for this instead. The policy stays on the
-// embedder's side because that is where its two ingredients live — the ring depth and the clock
-// since the last packet — and it must be: bounded in TIME (roughly twice the ring's own de-prime
-// fuse), never in callbacks or frames, and gated on the ring genuinely running out. A drought a
-// deep ring covers is inaudible, and concealing it would insert audio the late packets are about
-// to duplicate, pushing the stream permanently later. Core supplies only the mechanism, one frame
-// per call, at the cadence the embedder drains at.
-//
-// Works on both audio planes, using each one's own concealer — libopus PLC on `0xC9`, the
-// repeat-and-fade of [`crate::audio::pcm::PcmConceal`] on `0xD3` (a lossless frame carries no
-// model of the signal for PLC to extrapolate from; `design/hi-res-audio.md` §4.5).
-//
-// Returns [`PunktfunkStatus::NoFrame`] when nothing has decoded yet — both concealers build on
-// the last decoded frame, so before there is one there is nothing to build from — and if libopus
-// declines to interpolate. Both mean "write nothing this tick", exactly like a timeout.
-//
-// `out->seq` and `out->pts_ns` read 0: this frame was never on the wire, so it has no sequence
-// number and no capture instant, and it must never be fed to an A/V-sync observation.
-// `out->samples` borrows connection memory until the next PCM call on this handle — the SAME
-// slot [`punktfunk_connection_next_audio_pcm`] hands out, so call both from the one audio thread.
-//
-// Frames taken this way are subtracted from the concealment the next arriving packet asks for, so
-// a packet genuinely lost inside a covered drought is not concealed twice.
+// One drought concealment frame with no packet (`design/host-source-stutter-fixes.md`).
+// Call on `NO_FRAME` when the ring is draining. Policy stays on the embedder:
+// bound in time, gated on a real underrun. `seq`/`pts_ns` are 0 — never feed A/V
+// sync. Same PCM slot as `next_audio_pcm`; drought frames are subtracted from
+// the next packet's gap so a covered loss is not concealed twice.
 //
 // # Safety
-// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio.
+// `c` is a valid connection handle; `out` is writable. At most one audio puller.
 PunktfunkStatus punktfunk_connection_audio_plc(PunktfunkConnection *c, PunktfunkAudioPcm *out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pull the next pad-audio frame (0xD1) — one Opus frame of DualSense voice-coil haptics
-// (`kind` = [`PUNKTFUNK_PAD_AUDIO_KIND_HAPTICS`], 5 ms) or built-in-speaker audio
-// ([`PUNKTFUNK_PAD_AUDIO_KIND_SPEAKER`], 10 ms) for gamepad `*out_pad` — waiting up to
-// `timeout_ms`. The payload is COPIED into `buf` (no borrow-until-next-call slot); the return
-// value is its length in bytes, `0` = nothing this poll (timeout — or a DTX/oversized frame,
-// both of which an embedder treats the same way), `-1` = the session ended (or an invalid
-// handle/buffer). All pads/kinds share one queue — fan out by `*out_pad`/`*out_kind` to
-// per-actuator Opus decoders. A frame larger than `buf_len` is dropped like the timeout case
-// (the plane is lossy by design; any real Opus frame fits a 1500-byte buffer). Only a session
-// connected with [`PUNKTFUNK_CLIENT_CAP_PAD_AUDIO`] against a
-// [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`] host — with the pad declared via
-// [`punktfunk_connection_set_pad_audio_caps`] — ever receives any. Drain from a dedicated
-// thread (one puller, may run alongside the other planes' pullers).
+// Next 0xD1 pad-audio Opus frame, copied into `buf`. Return length, `0` =
+// nothing this poll, `-1` = ended. Fan out by pad/kind. One puller.
 //
 // # Safety
-// `c` is a valid connection handle; the `out_*` pointers are writable (NULLs are skipped);
+// `c` is a valid connection handle; the `out_*` pointers are writable (NULLs skipped);
 // `buf` is writable for `buf_len` bytes.
 int32_t punktfunk_connection_next_pad_audio(PunktfunkConnection *c,
                                             uint8_t *out_pad,
@@ -3654,13 +2605,8 @@ int32_t punktfunk_connection_next_pad_audio(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Declare wire pad `pad`'s pad-audio render capabilities (`audio_caps`: OR of
-// [`PUNKTFUNK_PAD_AUDIO_CAP_HAPTICS`] / [`PUNKTFUNK_PAD_AUDIO_CAP_SPEAKER`]) — how a client
-// tells the host WHICH pads can actually play the 0xD1 streams. Call at controller attach,
-// BEFORE the pad's arrival event is sent (the [`punktfunk_connection_set_rumble_quirks`]
-// timing): the core folds the bits into the arrival's flags (bits 8/9), and only toward a
-// [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`] host — never calling this leaves the wire bytes exactly as
-// before. Latest-wins per pad; unknown bits are masked off.
+// Declare pad `pad`'s 0xD1 render caps. Call at attach, before arrival; bits
+// fold into arrival flags 8/9. Latest-wins; unknown bits masked.
 //
 // # Safety
 // `c` is a valid connection handle. Callable from any thread.
@@ -3670,17 +2616,14 @@ PunktfunkStatus punktfunk_connection_set_pad_audio_caps(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pull the next rumble (force-feedback) update, waiting up to `timeout_ms`. Amplitudes
-// are 0..0xFFFF (`low` = low-frequency motor, `high` = high-frequency), `(0, 0)` = stop.
-// Same timeout/closed semantics as [`punktfunk_connection_next_audio`].
-//
-// This drops the self-terminating TTL of a v2 rumble envelope — an embedder that only calls this
-// keeps its own staleness policy, exactly as before. Use [`punktfunk_connection_next_rumble2`] to
-// honor the host-supplied lease and delete the client-side timeout heuristics.
+// Pull the next rumble update, waiting up to `timeout_ms`. Amplitudes are
+// 0..0xFFFF (`low`/`high` motors), `(0, 0)` = stop. Same timeout/closed as
+// [`punktfunk_connection_next_audio`]. Drops the v2 self-terminating TTL —
+// use [`punktfunk_connection_next_rumble2`] for the host-supplied lease.
 //
 // # Safety
-// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At
-// most one thread pulls rumble — it may run concurrently with the video/audio pullers.
+// `c` is a valid connection handle; out pointers are writable (NULLs skipped).
+// At most one rumble puller; it may run concurrently with video/audio.
 PunktfunkStatus punktfunk_connection_next_rumble(PunktfunkConnection *c,
                                                  uint16_t *pad,
                                                  uint16_t *low,
@@ -3689,16 +2632,14 @@ PunktfunkStatus punktfunk_connection_next_rumble(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pull the next rumble update *including its self-termination TTL* (v2 envelopes), waiting up to
-// `timeout_ms`. Same `pad`/`low`/`high` semantics as [`punktfunk_connection_next_rumble`], plus
-// `*ttl_ms`: how long (milliseconds) to render this level before silencing unless the host renews
-// it. [`PUNKTFUNK_RUMBLE_NO_TTL`] means "no lease" — a legacy host; fall back to a client-side
-// timeout. The reorder gate (seq) is applied inside the core before the update surfaces here, so a
-// stale/reordered envelope never reaches the caller.
+// Pull the next rumble update including its self-termination TTL. Same
+// `pad`/`low`/`high` as [`punktfunk_connection_next_rumble`], plus `*ttl_ms`:
+// milliseconds to render this level unless the host renews. [`PUNKTFUNK_RUMBLE_NO_TTL`]
+// = no lease; fall back to a client-side timeout. Reorder gate is applied inside.
 //
 // # Safety
-// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
-// thread pulls rumble — it may run concurrently with the video/audio pullers.
+// `c` is a valid connection handle; out pointers are writable (NULLs skipped).
+// At most one rumble puller; it may run concurrently with video/audio.
 PunktfunkStatus punktfunk_connection_next_rumble2(PunktfunkConnection *c,
                                                   uint16_t *pad,
                                                   uint16_t *low,
@@ -3708,35 +2649,14 @@ PunktfunkStatus punktfunk_connection_next_rumble2(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pull the next EFFECTIVE rumble command from the shared policy engine — the uniform replacement
-// for per-platform rumble policy. Unlike [`punktfunk_connection_next_rumble2`], the caller never
-// sees a TTL and never owns a deadline: the engine emits the level on every wire update (renewals
-// re-arm duration-parameterized APIs), an explicit zero at lease expiry / legacy-host staleness
-// (a uniform 1 s) / connection close, and any keepalives declared via
-// [`punktfunk_connection_set_rumble_quirks`]. Apply commands verbatim: `(0, 0)` = stop now;
-// non-zero = run at this level, with `*backstop_ms` as the safety-net duration for platform APIs
-// that take one (explicit-stop APIs ignore it; it is `0` on stop commands).
-// [`PunktfunkStatus::NoFrame`] on timeout; [`PunktfunkStatus::Closed`] once the session ended AND
-// every close-drain stop was delivered — silence all actuators on it.
-//
-// **Handle motors only.** A pad also carries two Xbox impulse-trigger levels, which this entry
-// point has no out-params for and never will —
-// [`punktfunk_connection_next_rumble_cmd2`] is the four-motor pull. Staying here is a supported
-// choice, not a deprecation: for a controller with no trigger motors — every pad but an Xbox
-// One/Series/Elite — the two views are identical, and where they differ, "the handles are silent"
-// is exactly the right instruction for the motors this API owns.
-//
-// The one observable difference against a trigger-driving host: a rumble that moves only the
-// triggers still produces commands here, carrying `low == high == 0`. They are idempotent stops
-// for the handles; the engine's redundant-stop suppression cannot fold them away, because the
-// command is not silent — some motor on that pad is running.
-//
-// An embedder uses EITHER this (or its `2` form) or `next_rumble`/`next_rumble2` for a
-// connection's lifetime, never both (they consume the same wire plane).
+// Effective rumble from the shared policy engine. No TTL: apply `(0, 0)` as
+// stop, else run at this level; `*backstop_ms` is a safety-net duration (`0` on
+// stop). Handle motors only — triggers are [`punktfunk_connection_next_rumble_cmd2`].
+// Mutually exclusive with `next_rumble`/`next_rumble2`.
 //
 // # Safety
-// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
-// thread pulls rumble — it may run concurrently with the video/audio pullers.
+// `c` is a valid connection handle; out pointers are writable (NULLs skipped).
+// At most one rumble puller; it may run concurrently with video/audio.
 PunktfunkStatus punktfunk_connection_next_rumble_cmd(PunktfunkConnection *c,
                                                      uint16_t *pad,
                                                      uint16_t *low,
@@ -3746,41 +2666,14 @@ PunktfunkStatus punktfunk_connection_next_rumble_cmd(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`punktfunk_connection_next_rumble_cmd`] with the two Xbox impulse-trigger motors: the same
-// command, all four of its levels. `*left_trigger` / `*right_trigger` are on the same
-// `0..=0xFFFF` scale as `low`/`high`, and a stop is all four at zero.
-//
-// A NEW symbol rather than a wider signature on the old one, following the
-// `next_rumble` → `next_rumble2` precedent in this file: an exported entry point's parameter list
-// is part of the contract, and silently growing one breaks every out-of-tree embedder at once,
-// with a stack-corruption signature rather than a link error. Old callers keep the old symbol and
-// simply never see the trigger levels.
-//
-// **Render the trigger levels only on a pad that actually has trigger motors, and drop them
-// otherwise** — do not fold them into the handles. Impulse-trigger content is continuous
-// (a racing title drives engine RPM and tyre slip into the triggers while the handles stay near
-// silent), so folding it produces a handle motor droning flat-out for the whole race at a level
-// the game never asked for. Query the hardware: SDL's
-// `SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN`, Apple's `GCDeviceHaptics.supportedLocalities`
-// (`GCHapticsLocalityLeftTrigger`/`…RightTrigger`). A pad without them is the common case and not
-// an error — do not log per command.
-//
-// **Nothing has driven these levels non-zero end to end yet, and that is structural, not an
-// oversight.** Exactly one producer can ever source them — the Windows HID Xbox pad's output
-// report `0x03` — because classic XInput's `XINPUT_VIBRATION` has two members and evdev's
-// `FF_RUMBLE` has two, so no other host backend on any OS has the channel. That producer is
-// reachable only through GameInput/WGI, and an xinputhid-promoted Xbox pad is not enumerated by
-// GameInput at all (measured against a real Microsoft Elite, which is equally invisible there
-// while XInput reads it live). So this delivery path is deliberately built ahead of its producer:
-// the wire, the engine and this entry point are exercised only by synthetic levels.
-//
-// Same threading, timeout and close semantics as
-// [`punktfunk_connection_next_rumble_cmd`]; the two share one wire plane and one policy engine,
-// so an embedder calls exactly one of them.
+// [`punktfunk_connection_next_rumble_cmd`] plus Xbox impulse-trigger motors.
+// New symbol — growing the old signature would stack-corrupt old embedders.
+// Render triggers only on pads that have them; never fold into handles.
+// Same plane as `next_rumble_cmd`; call exactly one.
 //
 // # Safety
-// `c` is a valid connection handle; out pointers are writable (NULLs are skipped). At most one
-// thread pulls rumble — it may run concurrently with the video/audio pullers.
+// `c` is a valid connection handle; out pointers are writable (NULLs skipped).
+// At most one rumble puller; it may run concurrently with video/audio.
 PunktfunkStatus punktfunk_connection_next_rumble_cmd2(PunktfunkConnection *c,
                                                       uint16_t *pad,
                                                       uint16_t *low,
@@ -3792,15 +2685,9 @@ PunktfunkStatus punktfunk_connection_next_rumble_cmd2(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Declare a physical actuator's quirks for wire pad `pad` — how a platform parameterizes the
-// shared rumble policy engine instead of forking it (typically called at controller attach).
-// `keepalive_ms`: re-emit an unchanged non-zero level at this cadence for actuators whose
-// hardware output decays between wire renewals (the Steam Deck's ≈ 40 is the one in-tree user);
-// `0` = none. `min_pulse_ms`: floor for `backstop_ms` on non-zero commands — no in-tree caller
-// sets it, it exists for embedders whose duration-taking API rejects short values. `flags`:
-// [`PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER`]. All-zero (the initial state) describes a well-behaved
-// actuator. See [`ActuatorQuirks`](crate::client::rumble::ActuatorQuirks) for why a renderer that
-// dedupes its own writes (the Apple HID path) cannot use `keepalive_ms` and keeps its own.
+// Per-pad rumble quirks (call at attach). `keepalive_ms`: re-emit non-zero
+// (Steam Deck ≈ 40); `0` = none. `min_pulse_ms`: floor for `backstop_ms`.
+// A renderer that dedupes its own writes cannot use `keepalive_ms`.
 //
 // # Safety
 // `c` is a valid connection handle. Callable from any thread.
@@ -3812,12 +2699,10 @@ PunktfunkStatus punktfunk_connection_set_rumble_quirks(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pull the next HID-output feedback event the host's virtual pad received from a game
-// (DualSense lightbar / player LEDs / adaptive trigger — or, on an as-is Steam Controller 2
-// passthrough session, a raw `PUNKTFUNK_HIDOUT_HID_RAW` report to replay verbatim), into
-// `*out`. [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once the session
-// ended. Only the DualSense and SC2 host backends emit these. Same threading rules as
-// [`punktfunk_connection_next_rumble`] (one puller, may run alongside the other planes).
+// Pull the next HID-output feedback (DualSense lightbar / player LEDs / adaptive
+// trigger, or SC2 `PUNKTFUNK_HIDOUT_HID_RAW`) into `*out`.
+// [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once ended.
+// DualSense and SC2 backends only. One puller, may run alongside other planes.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is writable for one `PunktfunkHidOutput`.
@@ -3827,13 +2712,10 @@ PunktfunkStatus punktfunk_connection_next_hidout(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pull the next static HDR metadata update (ST.2086 mastering display + content light level) for
-// an HDR session, into `*out`. [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`]
-// once the session ended. The host sends one near session start and re-sends it on mastering
-// changes / keyframes; apply the latest to the display (`SetHDRMetaData` / `CAEDRMetadata` /
-// `KEY_HDR_STATIC_INFO`). Only an HDR session (`punktfunk_connection_color_info` reports a PQ
-// transfer) ever emits these. Same threading rules as [`punktfunk_connection_next_rumble`] (one
-// puller, may run alongside the other planes).
+// Pull the next static HDR metadata (ST.2086 + content light) into `*out`.
+// [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once ended.
+// Apply the latest to the display. Only an HDR session (PQ transfer from
+// `punktfunk_connection_color_info`) emits these. One puller.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is writable for one `PunktfunkHdrMeta`.
@@ -3843,39 +2725,34 @@ PunktfunkStatus punktfunk_connection_next_hdr_meta(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pull the next forwarded cursor SHAPE (sent on pointer-bitmap change over the reliable
-// control stream; only a session connected with `PUNKTFUNK_CLIENT_CAP_CURSOR` against a
-// capable host receives any). On `Ok`, `out->rgba` borrows connection memory until the next
-// cursor-shape call on this handle. Drain from a dedicated thread (one thread per plane).
+// Pull the next forwarded cursor shape (pointer-bitmap change on the control
+// stream; only `PUNKTFUNK_CLIENT_CAP_CURSOR` sessions receive any). On `Ok`,
+// `out->rgba` borrows until the next cursor-shape call. One puller per plane.
 //
 // # Safety
-// `c` is a valid connection handle; `out` is writable. At most one thread pulls cursor
-// shapes; it may run concurrently with every other plane's puller.
+// `c` is a valid connection handle; `out` is writable. At most one cursor-shape
+// puller; it may run concurrently with every other plane.
 PunktfunkStatus punktfunk_connection_next_cursor_shape(PunktfunkConnection *c,
                                                        PunktfunkCursorShape *out,
                                                        uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pull the next cursor STATE (a `0xD0` datagram per host encode tick — latest-wins; drain
+// Pull the next cursor state (`0xD0` per host encode tick — latest-wins; drain
 // the queue and apply only the newest). Same negotiation gate as
 // [`punktfunk_connection_next_cursor_shape`].
 //
 // # Safety
-// `c` is a valid connection handle; `out` is writable. At most one thread pulls cursor
-// state; it may run concurrently with every other plane's puller.
+// `c` is a valid connection handle; `out` is writable. At most one cursor-state
+// puller; it may run concurrently with every other plane.
 PunktfunkStatus punktfunk_connection_next_cursor_state(PunktfunkConnection *c,
                                                        PunktfunkCursorState *out,
                                                        uint32_t timeout_ms);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Tell the host who renders the pointer (design/remote-desktop-sweep.md §8 — the mid-stream
-// mouse-model flip): `client_draws = true` = this client draws it locally (the desktop mouse
-// model; the host excludes the pointer from the video and forwards shape/state), `false` =
-// the host composites it into the video (the capture model — full fidelity, the pre-channel
-// look). Idempotent, latest-wins; harmless against hosts without the cursor cap (an unknown
-// control message type, ignored). ABI v12.
+// Who draws the pointer (`design/remote-desktop-sweep.md`). `true` = client
+// draws (host forwards shape/state); `false` = host composites. Latest-wins.
 //
 // # Safety
 // `c` is a valid connection handle.
@@ -3883,13 +2760,11 @@ PunktfunkStatus punktfunk_connection_set_cursor_render(PunktfunkConnection *c, b
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pull the next per-AU host timing (0xCF) into `*out`: the host's capture→sent duration for one
-// access unit, correlated to the AU by `pts_ns` (see [`PunktfunkHostTiming`]).
-// [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once the session ended.
-// A stats consumer drains this non-blockingly (`timeout_ms = 0`) alongside its frame samples;
-// an older host never emits any — keep showing the combined `host+network` stage then. Same
-// threading rules as [`punktfunk_connection_next_rumble`] (one puller, may run alongside the
-// other planes).
+// Pull the next per-AU host timing (0xCF) into `*out`: capture→sent duration,
+// correlated by `pts_ns` (see [`PunktfunkHostTiming`]).
+// [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once ended.
+// Drain non-blockingly (`timeout_ms = 0`). A host that never emits any: keep
+// showing the combined `host+network` stage. One puller.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is writable for one `PunktfunkHostTiming`.
@@ -3899,12 +2774,11 @@ PunktfunkStatus punktfunk_connection_next_host_timing(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Read the session's resolved colour signalling + encode bit depth (from the host's Welcome).
-// Each out pointer is filled when non-NULL: `primaries`/`transfer`/`matrix` are CICP code points
-// (BT.709 = 1; BT.2020 = 9; PQ transfer = 16, HLG = 18; BT.2020-NCL matrix = 9), `full_range` is
-// 0 (limited) or 1 (full), `bit_depth` is 8 or 10. A `transfer` of 16/18 means HDR — configure an
-// HDR present path and drain [`punktfunk_connection_next_hdr_meta`]. Available immediately after a
-// successful connect (these don't change without a reconfigure).
+// Resolved colour signalling + encode bit depth. Each out pointer is filled when
+// non-NULL: `primaries`/`transfer`/`matrix` are CICP (BT.709 = 1; BT.2020 = 9;
+// PQ = 16, HLG = 18; BT.2020-NCL = 9), `full_range` 0/1, `bit_depth` 8 or 10.
+// Transfer 16/18 is HDR — drain [`punktfunk_connection_next_hdr_meta`]. Fixed
+// until a reconfigure.
 //
 // # Safety
 // `c` is a valid connection handle; each out pointer is NULL or writable for its scalar.
@@ -3917,11 +2791,9 @@ PunktfunkStatus punktfunk_connection_color_info(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Read the session's resolved chroma subsampling (from the host's Welcome) as the HEVC
-// `chroma_format_idc`: `1` = 4:2:0 (the default every pre-4:4:4 host produced), `3` = full-chroma
-// 4:4:4. `*out` is filled when non-NULL. The in-band SPS is authoritative; this lets the embedder
-// pre-size its decoder / pick a 4:4:4 pixel format up front. Available immediately after a
-// successful connect (it doesn't change without a reconfigure).
+// Resolved chroma as HEVC `chroma_format_idc`: `1` = 4:2:0, `3` = 4:4:4.
+// `*out` is filled when non-NULL. In-band SPS is authoritative; this lets the
+// embedder pre-size the decoder. Fixed until a reconfigure.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -3929,24 +2801,20 @@ PunktfunkStatus punktfunk_connection_chroma_format(PunktfunkConnection *c, uint8
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Read the video codec the host resolved for this session (from its Welcome): one of
-// [`PUNKTFUNK_CODEC_H264`] / [`PUNKTFUNK_CODEC_HEVC`] / [`PUNKTFUNK_CODEC_AV1`]. The embedder builds
-// its decoder from THIS (never assuming HEVC). `*out` is filled when non-NULL. Available
-// immediately after a successful connect (it doesn't change without a reconfigure). An older host
-// that didn't negotiate a codec reports [`PUNKTFUNK_CODEC_HEVC`].
+// Host-resolved video codec: [`PUNKTFUNK_CODEC_H264`] / [`PUNKTFUNK_CODEC_HEVC`] /
+// [`PUNKTFUNK_CODEC_AV1`]. Build the decoder from this (never assume HEVC).
+// `*out` is filled when non-NULL. A host that did not negotiate reports HEVC.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
-PunktfunkStatus punktfunk_connection_codec(PunktfunkConnection *c,
-                                           uint8_t *out);
+PunktfunkStatus punktfunk_connection_codec(PunktfunkConnection *c, uint8_t *out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Read the session's negotiated wire shard payload (the `Welcome`'s value, bytes). This is the
-// parse-window size of a [`USER_FLAG_CHUNK_ALIGNED`] AU (PyroWave datagram-aligned mode,
-// design/pyrowave-codec-plan.md §4.4): every `shard_payload`-sized window of the frame buffer
-// starts a fresh self-delimiting chunk. Clients that decode PyroWave natively (the Apple Metal
-// port) need it to walk those AUs; other codecs never need this.
+// Negotiated wire shard payload (Welcome, bytes). Parse-window size of a
+// chunk-aligned AU (PyroWave datagram-aligned, `design/pyrowave-codec-plan.md`):
+// every `shard_payload`-sized window starts a self-delimiting chunk. Other
+// codecs never need this.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u32`.
@@ -3955,8 +2823,7 @@ PunktfunkStatus punktfunk_connection_shard_payload(PunktfunkConnection *c, uint3
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Send one input event to the host as a QUIC datagram (non-blocking enqueue).
-//
-// Returns `InvalidArg` if `ev->kind` is not a recognized event kind.
+// `InvalidArg` if `ev->kind` is not a recognized event kind.
 //
 // # Safety
 // `c` is a valid connection handle; `ev` points to a readable `InputEvent`-sized allocation.
@@ -3965,14 +2832,13 @@ PunktfunkStatus punktfunk_connection_send_input(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Send one Opus mic frame to the host as a QUIC datagram (48 kHz; the host decodes it into a
-// virtual microphone source its apps can record). Non-blocking enqueue; the host uses `seq`/
-// `pts_ns` (the caller's own counters) only for diagnostics. `opus_data`/`len` may be empty
-// (a DTX silence frame). The data is copied; the caller may reuse the buffer after this returns.
+// Send one Opus mic frame (48 kHz) as a QUIC datagram. The host decodes it into
+// a virtual microphone. Non-blocking; `seq`/`pts_ns` are diagnostics only.
+// Empty `opus_data`/`len` is DTX. Data is copied before return.
 //
 // # Safety
-// `c` is a valid connection handle. For a representable nonzero `len`, `opus_data` points to
-// that many readable bytes; it may be NULL when `len == 0`.
+// `c` is a valid connection handle. For a representable nonzero `len`, `opus_data`
+// points to that many readable bytes; it may be NULL when `len == 0`.
 PunktfunkStatus punktfunk_connection_send_mic(PunktfunkConnection *c,
                                               const uint8_t *opus_data,
                                               uintptr_t len,
@@ -3981,10 +2847,8 @@ PunktfunkStatus punktfunk_connection_send_mic(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Send one rich input event (DualSense touchpad contact or motion sample) to the host as a QUIC
-// datagram (non-blocking enqueue). The host applies it to its virtual DualSense pad — a no-op
-// unless the host runs the DualSense gamepad backend. [`PunktfunkStatus::InvalidArg`] on an
-// unknown `kind`.
+// Send one rich input (DualSense touchpad contact or motion) as a QUIC datagram.
+// No-op unless the host runs the DualSense backend. `InvalidArg` on unknown `kind`.
 //
 // # Safety
 // `c` is a valid connection handle; `rich` points to a valid [`PunktfunkRichInput`].
@@ -3993,9 +2857,9 @@ PunktfunkStatus punktfunk_connection_send_rich_input(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Send a rich client→host input via the forward-compatible [`PunktfunkRichInputEx`] — the only way
-// a C client can emit a `TouchpadEx` (a second trackpad / signed coords / pressure). Set
-// `rich->struct_size = sizeof(PunktfunkRichInputEx)`; a smaller (older-layout) value is rejected.
+// Send rich input via [`PunktfunkRichInputEx`] — the C path for `TouchpadEx`
+// (second trackpad / signed coords / pressure). Set
+// `rich->struct_size = sizeof(PunktfunkRichInputEx)`; a smaller layout is rejected.
 //
 // # Safety
 // `c` is a valid connection handle; `rich` is null or points to at least its declared
@@ -4005,15 +2869,8 @@ PunktfunkStatus punktfunk_connection_send_rich_input2(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Send one raw HID input report from a client-captured controller — the as-is Steam Controller 2
-// passthrough's up direction (`[0xCC][0x04]` on the wire, [`RichInput::HidReport`](crate::quic::RichInput))
-// — as a QUIC datagram (non-blocking enqueue). `data[..len]` is the report exactly as the device
-// produced it on its interrupt endpoint / GATT notify, id byte first (`0x42`/`0x45`/`0x47` state,
-// `0x43` battery, …); `len` is clamped to `PUNKTFUNK_HID_REPORT_MAX` and `pad` masked into the
-// 16-pad wire space. Best-effort/lossy by design — state reports are idempotent snapshots at the
-// device's own rate, so a lost datagram self-heals on the next one. A no-op unless the pad
-// declared `PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2` and the host runs the as-is backend.
-// [`PunktfunkStatus::InvalidArg`] on an empty report.
+// Send one raw HID input report (SC2 as-is, `[0xCC][0x04]`). `len` clamps to
+// `HID_REPORT_MAX`; `pad` masks to 16. Lossy snapshots; empty is `InvalidArg`.
 //
 // # Safety
 // `c` is a valid connection handle; `data` points to `len` readable bytes.
@@ -4024,14 +2881,11 @@ PunktfunkStatus punktfunk_connection_send_hid_report(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Send one stylus sample batch — `count` (`1..=PUNKTFUNK_PEN_BATCH_MAX`) state-full
-// [`PunktfunkPenSample`]s, oldest first (a capture callback's coalesced samples) — as one
-// `0xCC/0x05` pen datagram (non-blocking enqueue; design/pen-tablet-input.md). Split longer
-// runs into consecutive calls. Gate on `punktfunk_connection_host_caps() &
-// PUNKTFUNK_HOST_CAP_PEN`: toward a host without the bit this returns
-// [`PunktfunkStatus::Unsupported`] — keep the pen-as-touch fallback there.
-// [`PunktfunkStatus::InvalidArg`] on a bad count or a bad sample (non-finite coordinate,
-// unknown state bit / tool).
+// Send one stylus sample batch — `count` (`1..=PUNKTFUNK_PEN_BATCH_MAX`)
+// [`PunktfunkPenSample`]s, oldest first — as one `0xCC/0x05` pen datagram
+// (`design/pen-tablet-input.md`). Split longer runs. Gate on
+// `host_caps & PUNKTFUNK_HOST_CAP_PEN`; without it this is `Unsupported` (keep
+// pen-as-touch). `InvalidArg` on a bad count or sample.
 //
 // # Safety
 // `c` is a valid connection handle; `samples` is null or points to `count` valid
@@ -4042,11 +2896,11 @@ PunktfunkStatus punktfunk_connection_send_pen(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// The currently active session mode — the Welcome's, until an accepted
+// Currently active session mode — Welcome's, until an accepted
 // [`punktfunk_connection_request_mode`] switches it. Safe any time after connect.
 //
 // # Safety
-// `c` is a valid connection handle; out pointers are writable (NULLs are skipped).
+// `c` is a valid connection handle; out pointers are writable (NULLs skipped).
 PunktfunkStatus punktfunk_connection_mode(const PunktfunkConnection *c,
                                           uint32_t *width,
                                           uint32_t *height,
@@ -4054,10 +2908,9 @@ PunktfunkStatus punktfunk_connection_mode(const PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// The virtual gamepad backend the host actually resolved for this session (one of the
-// `PUNKTFUNK_GAMEPAD_*` values; the `Welcome`'s echo of the [`punktfunk_connect_ex2`]
-// preference). `PUNKTFUNK_GAMEPAD_AUTO` = an older host that didn't say — assume X-Box 360,
-// no HID-output feedback. Safe any time after connect.
+// Virtual gamepad the host resolved (`PUNKTFUNK_GAMEPAD_*`; Welcome echo of
+// [`punktfunk_connect_ex2`]). `AUTO` = a host that didn't say — assume X-Box 360,
+// no HID-output. Safe any time after connect.
 //
 // # Safety
 // `c` is a valid connection handle; `gamepad` is writable (NULL is skipped).
@@ -4065,15 +2918,8 @@ PunktfunkStatus punktfunk_connection_gamepad(const PunktfunkConnection *c, uint3
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// The host's management-API port, from this session's `Welcome` — where its game library is
-// served (distinct from the streaming ports). `0` means the host did not advertise one: an older
-// host, or the standalone `punktfunk1-host` binary, which has no management API. Treat `0` as
-// "unknown" and fall back to your own default (47990), never as a port to dial.
-//
-// This exists so a client does NOT need mDNS to find the library. The port used to live only in
-// the host's mDNS TXT, so a host that had moved it off 47990 — the supported way to coexist with
-// a Sunshine fork, whose web UI owns that port — was reachable only where multicast worked. Read
-// this after connect and prefer it over any cached or default value. Safe any time after connect.
+// Host management-API port from `Welcome`. `0` = unknown (do not dial 0; fall
+// back to 47990). Prefer this over mDNS/cached after connect.
 //
 // # Safety
 // `c` is a valid connection handle; `port` is writable (NULL is skipped).
@@ -4081,11 +2927,9 @@ PunktfunkStatus punktfunk_connection_mgmt_port(const PunktfunkConnection *c, uin
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// The host capability bitfield the session's `Welcome` carried — a bitfield of
-// `PUNKTFUNK_HOST_CAP_GAMEPAD_STATE` / `PUNKTFUNK_HOST_CAP_CLIPBOARD` /
-// `PUNKTFUNK_HOST_CAP_PEN`. A client tests `caps & PUNKTFUNK_HOST_CAP_CLIPBOARD` to decide
-// whether to offer the shared-clipboard toggle, `caps & PUNKTFUNK_HOST_CAP_PEN` before
-// sending stylus batches. Safe any time after connect.
+// Host capability bitfield from `Welcome` (`PUNKTFUNK_HOST_CAP_*`). Test
+// `CLIPBOARD` before offering the toggle, `PEN` before sending stylus batches.
+// Safe any time after connect.
 //
 // # Safety
 // `c` is a valid connection handle; `caps` is writable (NULL is skipped).
@@ -4093,9 +2937,8 @@ PunktfunkStatus punktfunk_connection_host_caps(const PunktfunkConnection *c, uin
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// The SECOND host capability byte the session's `Welcome` carried — today
-// `PUNKTFUNK_HOST_CAP2_TOUCH`. `0` toward an older host, which never sends the byte. Safe any
-// time after connect.
+// Second host capability byte from `Welcome` — today `PUNKTFUNK_HOST_CAP2_TOUCH`.
+// `0` toward a host that never sends the byte. Safe any time after connect.
 //
 // # Safety
 // `c` is a valid connection handle; `caps` is writable (NULL is skipped).
@@ -4103,17 +2946,9 @@ PunktfunkStatus punktfunk_connection_host_caps2(const PunktfunkConnection *c, ui
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// The session's LIVE effective access grants — a `PUNKTFUNK_GRANT_*` bitmask
-// (per-client access, `design/per-client-access.md` §7): seeded from the `Welcome` advert
-// and moved by every mid-session `AccessUpdate` the host sends (latest wins), so this is
-// current state, NOT a connect-time snapshot. An old host advertises nothing and this reads
-// `PUNKTFUNK_GRANT_ALL` — full control, the pre-grants behavior, so an embedder keying UI
-// off it changes nothing there.
-//
-// Courtesy truth only: the HOST enforces the mask whatever a client renders. Use it to not
-// capture what can't land (no pointer lock / keyboard grab without the bits) and to label
-// the session ("Controller only"). Cheap (one relaxed atomic load) — poll it alongside a
-// stats tick rather than caching it for the session. Safe any time after connect.
+// Live `PUNKTFUNK_GRANT_*` mask (`design/per-client-access.md`). Latest
+// `AccessUpdate` wins; hosts that omit it read `PUNKTFUNK_GRANT_ALL`. Courtesy
+// only — the host enforces. Poll; do not cache for the session.
 //
 // # Safety
 // `c` is a valid connection handle; `grants` is writable (NULL is skipped).
@@ -4121,18 +2956,9 @@ PunktfunkStatus punktfunk_connection_grants(const PunktfunkConnection *c, uint32
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Seconds until this session's access expires, LIVE — counted down from the `Welcome`'s
-// `expires_in_secs` and re-anchored by every mid-session `AccessUpdate`, so successive reads
-// shrink on their own (render a countdown by polling this, ~1 Hz). `0` = permanent: today's
-// default, and everything an old host's Welcome decodes to — show nothing then. The deadline
-// is anchored to the CLIENT's clock at receipt (the wire carries relative seconds), so
-// host/client skew never moves the countdown.
-//
-// While a deadline exists the value never reads `0`: in the sliver between the deadline
-// passing and the host's typed expiry close (`PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED`
-// via [`punktfunk_connection_end_reject`]) it clamps to `1`, so `0` stays unambiguous.
-// The T−5 m / T−1 m warnings are the embedder's to derive from the countdown crossing
-// those marks. Safe any time after connect.
+// Seconds until access expires. `0` = permanent. While a deadline is set the
+// value never reads `0` (clamps to 1 past expiry until the typed close).
+// Anchored to the client clock at receipt.
 //
 // # Safety
 // `c` is a valid connection handle; `secs` is writable (NULL is skipped).
@@ -4141,15 +2967,8 @@ PunktfunkStatus punktfunk_connection_access_expires_in(const PunktfunkConnection
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// The typed rejection a MID-SESSION close carried, as its `PUNKTFUNK_STATUS_REJECTED_*`
-// value (`0` = none — every ordinary end). Exists because
-// [`punktfunk_connection_end_reason`] can only file an unrecognized deliberate close under
-// `PUNKTFUNK_END_REASON_HOST_ERROR`, and "the host ended the session with an error" is the
-// wrong sentence for an access expiry (`PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED`) — the
-// case this was added for; any future typed mid-session close surfaces the same way. Ask
-// AFTER the session ended, before freeing the handle, exactly like `end_reason` (the two
-// latch together); connect-time rejections never land here — they come back from the
-// connect call itself.
+// Mid-session typed rejection (`PUNKTFUNK_STATUS_REJECTED_*`); `0` = none.
+// Ask after `Closed`, before free. Connect-time rejections come from connect.
 //
 // # Safety
 // `c` is a valid connection handle; `status` is writable (NULL is skipped).
@@ -4157,9 +2976,9 @@ PunktfunkStatus punktfunk_connection_end_reject(const PunktfunkConnection *c, in
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Enable or disable the shared clipboard for this session (`design` §3.1). Opt-in: nothing is
-// announced or served until this is called with `enabled = true`. `flags` carries
-// `quic::CLIP_FLAG_FILES` (allow file transfer). The host replies with a `State` event.
+// Enable or disable the shared clipboard. Opt-in: nothing is announced or served
+// until `enabled = true`. `flags` carries `quic::CLIP_FLAG_FILES`. The host
+// replies with a `State` event.
 //
 // # Safety
 // `c` is a valid connection handle.
@@ -4169,13 +2988,13 @@ PunktfunkStatus punktfunk_connection_clipboard_control(const PunktfunkConnection
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Announce that the local clipboard changed — the lazy format-list offer. `seq` is a monotonic
-// per-sender counter (newest wins); `kinds`/`n` is the advertised formats (≤ 16). The bytes cross
-// only if the host later fetches.
+// Announce that the local clipboard changed — the lazy format-list offer. `seq`
+// is monotonic per sender (newest wins); `kinds`/`n` is the advertised formats
+// (≤ 16). Bytes cross only if the host later fetches.
 //
 // # Safety
-// `c` is a valid connection handle. For `n <= 16`, `kinds` points to `n` `PunktfunkClipKind`s
-// (NULL only for zero), each with a valid NUL-terminated UTF-8 `mime`.
+// `c` is a valid connection handle. For `n <= 16`, `kinds` points to `n`
+// `PunktfunkClipKind`s (NULL only for zero), each with a NUL-terminated UTF-8 `mime`.
 PunktfunkStatus punktfunk_connection_clipboard_offer(const PunktfunkConnection *c,
                                                      uint32_t seq,
                                                      const PunktfunkClipKind *kinds,
@@ -4183,14 +3002,13 @@ PunktfunkStatus punktfunk_connection_clipboard_offer(const PunktfunkConnection *
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Start pulling one format (`mime`) of the host's current offer `seq` — lazily, on a local paste.
-// `file_index` selects a file for a file transfer, or `quic::CLIP_FILE_INDEX_NONE` for a non-file
-// format. Writes the transfer id (echoed on the resulting `Data`/`Error`/`Cancelled` event) to
-// `xfer_id_out`.
+// Start pulling one format (`mime`) of the host's current offer `seq` — lazily,
+// on a local paste. `file_index` selects a file, or `quic::CLIP_FILE_INDEX_NONE`.
+// Writes the transfer id to `xfer_id_out`.
 //
 // # Safety
-// `c` is a valid connection handle; `mime` is a valid NUL-terminated UTF-8 string; `xfer_id_out`
-// is writable (NULL is skipped).
+// `c` is a valid connection handle; `mime` is a NUL-terminated UTF-8 string;
+// `xfer_id_out` is writable (NULL is skipped).
 PunktfunkStatus punktfunk_connection_clipboard_fetch(const PunktfunkConnection *c,
                                                      uint32_t seq,
                                                      const char *mime,
@@ -4199,13 +3017,13 @@ PunktfunkStatus punktfunk_connection_clipboard_fetch(const PunktfunkConnection *
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Provide bytes answering a `FetchRequest` event (the host is pasting our offered data). Call
-// repeatedly to stream a large payload; `last = true` completes it. `data` may be NULL only when
-// `len == 0` (e.g. a final empty chunk). `punktfunk_connection_clipboard_cancel(req_id)` aborts.
+// Provide bytes answering a `FetchRequest` (the host is pasting our offered data).
+// Call repeatedly to stream; `last = true` completes. `data` may be NULL only when
+// `len == 0`. `punktfunk_connection_clipboard_cancel(req_id)` aborts.
 //
 // # Safety
-// `c` is a valid connection handle. For a representable nonzero `len`, `data` points to that
-// many readable bytes; it may be NULL when `len == 0`.
+// `c` is a valid connection handle. For a representable nonzero `len`, `data` points
+// to that many readable bytes; it may be NULL when `len == 0`.
 PunktfunkStatus punktfunk_connection_clipboard_serve(const PunktfunkConnection *c,
                                                      uint32_t req_id,
                                                      const uint8_t *data,
@@ -4214,8 +3032,8 @@ PunktfunkStatus punktfunk_connection_clipboard_serve(const PunktfunkConnection *
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Cancel a clipboard transfer by id — either an outbound fetch (`xfer_id` from
-// [`punktfunk_connection_clipboard_fetch`]) or an inbound serve (`req_id` from a `FetchRequest`).
+// Cancel a clipboard transfer by id — outbound fetch (`xfer_id` from
+// [`punktfunk_connection_clipboard_fetch`]) or inbound serve (`req_id` from a `FetchRequest`).
 //
 // # Safety
 // `c` is a valid connection handle.
@@ -4223,10 +3041,9 @@ PunktfunkStatus punktfunk_connection_clipboard_cancel(const PunktfunkConnection 
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pull the next shared-clipboard event into `*out`. [`PunktfunkStatus::NoFrame`] on timeout,
-// [`PunktfunkStatus::Closed`] once the session ended. A native client drains this on its own
-// thread and drives the OS pasteboard from it. The `data`/`len` pointer (when non-NULL) borrows a
-// per-connection buffer valid until the next `next_clipboard` call on this handle.
+// Pull the next shared-clipboard event into `*out`. [`PunktfunkStatus::NoFrame`]
+// on timeout, [`PunktfunkStatus::Closed`] once ended. `data`/`len` (when non-NULL)
+// borrows until the next `next_clipboard` on this handle.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is writable for one `PunktfunkClipEvent`.
@@ -4236,12 +3053,9 @@ PunktfunkStatus punktfunk_connection_next_clipboard(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// The compositor backend the host actually resolved for this session (one of the
-// `PUNKTFUNK_COMPOSITOR_*` values; the `Welcome`'s echo of the [`punktfunk_connect_ex`]
-// preference). `PUNKTFUNK_COMPOSITOR_AUTO` = an older host that didn't say. Clients use it for
-// compositor-specific behavior — e.g. a client-side cursor by default on
-// `PUNKTFUNK_COMPOSITOR_GAMESCOPE`, whose PipeWire capture carries no cursor. Safe any time after
-// connect.
+// Compositor the host resolved (`PUNKTFUNK_COMPOSITOR_*`; Welcome echo of
+// [`punktfunk_connect_ex`]). `AUTO` = a host that didn't say. Gamescope PipeWire
+// capture carries no cursor — default to a client-side cursor there.
 //
 // # Safety
 // `c` is a valid connection handle; `compositor` is writable (NULL is skipped).
@@ -4249,9 +3063,9 @@ PunktfunkStatus punktfunk_connection_compositor(const PunktfunkConnection *c, ui
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// The video encoder bitrate (kilobits per second) the host actually configured for this session
-// — the [`punktfunk_connect_ex3`] request clamped to the host's range, or its default when `0`
-// was requested. `0` = an older host that didn't report it. Safe any time after connect.
+// Video encoder bitrate (kbps) the host configured — the [`punktfunk_connect_ex3`]
+// request clamped to the host range, or its default when `0` was requested.
+// `0` = a host that didn't report it. Safe any time after connect.
 //
 // # Safety
 // `c` is a valid connection handle; `bitrate_kbps` is writable (NULL is skipped).
@@ -4259,13 +3073,8 @@ PunktfunkStatus punktfunk_connection_bitrate(const PunktfunkConnection *c, uint3
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// The host↔client wall-clock offset (nanoseconds, **host minus client**) measured by the
-// connect-time skew handshake. Add it to a local receive/present timestamp (same realtime clock,
-// `CLOCK_REALTIME` / `gettimeofday`-epoch nanoseconds) to express that instant in the host's
-// capture clock — the clock the per-access-unit `pts_ns` is stamped in — so glass-to-glass latency
-// (e.g. present-time minus `pts_ns`) is valid across machines. `0` = no correction: either an older
-// host that didn't answer the handshake, or genuinely synchronized clocks. Safe any time after
-// connect.
+// Connect-time wall-clock offset, ns, host minus client. Add to a local
+// realtime stamp to express it in the host capture clock (`pts_ns`). `0` = none.
 //
 // # Safety
 // `c` is a valid connection handle; `offset_ns` is writable (NULL is skipped).
@@ -4274,12 +3083,8 @@ PunktfunkStatus punktfunk_connection_clock_offset_ns(const PunktfunkConnection *
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// The **live** host↔client wall-clock offset (nanoseconds, host minus client): the
-// connect-time estimate of [`punktfunk_connection_clock_offset_ns`], updated by every applied
-// mid-stream clock re-sync. Ongoing latency math (per-frame `received − pts` splits, the
-// glass-to-glass meter) must use this one — after a wall-clock step/slew the frozen
-// connect-time value reads tens of milliseconds wrong for the rest of the session, while the
-// core itself has already re-synced. Same clock contract as the connect-time getter.
+// Live wall-clock offset (updated by mid-stream re-sync). Use this for ongoing
+// latency math, not the frozen connect-time value.
 //
 // # Safety
 // `c` is a valid connection handle; `offset_ns` is writable (NULL is skipped).
@@ -4288,12 +3093,8 @@ PunktfunkStatus punktfunk_connection_clock_offset_now_ns(const PunktfunkConnecti
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Ask the host to switch the live session to `width`x`height`@`refresh_hz` without
-// reconnecting (window resized, refresh changed). Non-blocking enqueue: on acceptance the
-// stream continues at the new mode — the first new-mode access unit is an IDR with
-// in-band parameter sets (rebuild the decoder from it) — and
-// [`punktfunk_connection_mode`] reflects the switch. A rejected request leaves the
-// session unchanged.
+// Request a live mode switch. On accept, the first new-mode AU is an IDR with
+// in-band parameter sets — rebuild the decoder from it.
 //
 // # Safety
 // `c` is a valid connection handle.
@@ -4304,12 +3105,8 @@ PunktfunkStatus punktfunk_connection_request_mode(const PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Ask the host's encoder to emit a fresh IDR keyframe now — client recovery when the
-// decoder has stalled (the infinite-GOP stream sends one opening IDR then P-frames only, so
-// a wedged decoder would otherwise freeze until the next loss-triggered recovery keyframe).
-// Non-blocking, fire-and-forget; the recovered keyframe is the only ack. The caller should
-// THROTTLE — the decode stays wedged for several frames until the IDR lands, so requesting
-// every frame would flood the control stream.
+// Request an IDR now. Infinite GOP has one opening IDR; throttle — a wedged
+// decoder stays stuck for several frames, so per-frame requests flood control.
 //
 // # Safety
 // `c` is a valid connection handle.
@@ -4317,15 +3114,8 @@ PunktfunkStatus punktfunk_connection_request_keyframe(const PunktfunkConnection 
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Ask the host to recover from loss by **reference-frame invalidation** rather than a full IDR:
-// report the range `[first_frame, last_frame]` of access units the client can no longer trust
-// (the first missing `frame_index` through the newest received). An RFI-capable host (AMD LTR /
-// NVENC) re-references a known-good picture before `first_frame` and emits a clean P-frame tagged
-// `USER_FLAG_RECOVERY_ANCHOR` — no 20-40x IDR spike; a host that can't RFI forces an IDR instead
-// (same effect as [`punktfunk_connection_request_keyframe`]). Non-blocking, fire-and-forget; the
-// recovered frame is the only ack, so THROTTLE it exactly like the keyframe request. Prefer this
-// over the keyframe request on loss so AMD/RFI hosts avoid the spike; keep the keyframe request as
-// the backstop for when the recovery frame itself is lost.
+// Ask the host to recover `[first_frame, last_frame]` by RFI (P-frame tagged
+// `USER_FLAG_RECOVERY_ANCHOR`) instead of a full IDR. Throttle; keyframe is the backstop.
 //
 // # Safety
 // `c` is a valid connection handle.
@@ -4335,16 +3125,8 @@ PunktfunkStatus punktfunk_connection_request_rfi(const PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Feed each received frame's `frame_index` (the [`PunktfunkFrame::frame_index`] field, in receive
-// order) so the client recovers from loss with a cheap reference-frame invalidation instead of a
-// full IDR. On a forward gap (a `frame_index` jump = the intervening frames were lost and the
-// following AUs reference a picture that never arrived) this fires a THROTTLED
-// [`punktfunk_connection_request_rfi`] for the lost range; an RFI-capable host (AMD LTR / NVENC)
-// then recovers with a clean P-frame instead of a 20-40x IDR spike. Call it for every received
-// frame — it is cheap and idempotent, and the [`punktfunk_connection_frames_dropped`]-driven
-// keyframe request stays the backstop. Writes whether a forward gap was detected this call to
-// `gap_out` (nullable — a client with a post-loss display freeze can use it to re-arm; most
-// clients pass NULL and ignore it).
+// Note each received `frame_index`. A forward gap fires throttled RFI; keyframe
+// on `frames_dropped` is the backstop. `gap_out` (nullable) is whether a gap was seen.
 //
 // # Safety
 // `c` is a valid connection handle; `gap_out` is writable or NULL.
@@ -4354,12 +3136,10 @@ PunktfunkStatus punktfunk_connection_note_frame_index(const PunktfunkConnection 
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`punktfunk_connection_note_frame_index`] with the gap WIDTH instead of a yes/no: writes to
-// `gap_width_out` how many frames this arrival revealed as missing (0 = contiguous/straggler).
-// A client with a post-loss display freeze passes the width to
-// [`punktfunk_reanchor_gate_arm_expecting_drops`] so the reassembler's later `frames_dropped`
-// climb for the SAME loss cannot re-freeze a stream an RFI anchor already healed (the double-arm
-// race — see the gate function's doc).
+// [`punktfunk_connection_note_frame_index`] with the gap width: writes how many
+// frames this arrival revealed as missing (0 = contiguous/straggler). Pass the
+// width to [`punktfunk_reanchor_gate_arm_expecting_drops`] so a later
+// `frames_dropped` climb for the same loss cannot re-freeze a healed stream.
 //
 // # Safety
 // `c` is a valid connection handle; `gap_width_out` is writable or NULL.
@@ -4369,12 +3149,8 @@ PunktfunkStatus punktfunk_connection_note_frame_index_ex(const PunktfunkConnecti
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Cumulative access units the host→client reassembler dropped as unrecoverable (FEC couldn't
-// rebuild them). A video loop polls this and calls [`punktfunk_connection_request_keyframe`]
-// when it climbs — the correct loss trigger under the host's infinite GOP, where unrecoverable
-// loss yields reference-missing delta frames the decoder *silently conceals* (frozen / garbage
-// picture, no decode error), so a decode-error trigger rarely fires. Monotonic for the session;
-// compare against the last observed value. Writes 0 to `out` on a NULL connection.
+// Unrecoverable reassembler drops. Poll and request a keyframe when it climbs —
+// infinite GOP conceals missing refs with no decode error. Writes 0 on NULL.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is writable (NULL is skipped).
@@ -4382,32 +3158,21 @@ PunktfunkStatus punktfunk_connection_frames_dropped(const PunktfunkConnection *c
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Report one decoded frame's decode-stage latency, in microseconds: the wall-clock elapsed from
-// the access unit leaving [`punktfunk_connection_next_au`] to its decoded output becoming
-// available (VideoToolbox/D3D11VA/… produced the frame). This feeds the "Automatic" bitrate
-// controller's decode signal — the only one that sees the client's own decoder, so the rate is
-// capped at the real decode limit instead of climbing to the network link ceiling and choking a
-// slower hardware decoder (a fast LAN feeding a mobile-class decoder). Measure from the AU pull,
-// NOT from the decoder-submit call, so decoder-input backpressure (the backlog) is included;
-// exclude the presenter's vsync wait so a paced/capped frame rate doesn't read as decode latency.
-// Cheap — the client may call it every frame; the controller ignores it unless armed (query
-// [`punktfunk_connection_wants_decode_latency`] once to skip the measurement entirely when it's not).
+// Decode-stage latency in µs: AU leave [`next_au`] to decoded output. Include
+// decoder-input backlog; exclude vsync wait. Feeds Automatic bitrate. Skip if
+// [`punktfunk_connection_wants_decode_latency`] is false.
 //
 // # Safety
 // `c` is a valid connection handle.
-PunktfunkStatus punktfunk_connection_report_decode_us(const PunktfunkConnection *c,
-                                                      uint32_t us);
+PunktfunkStatus punktfunk_connection_report_decode_us(const PunktfunkConnection *c, uint32_t us);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Report this client's display-latch grid so the host can phase-lock its capture tick
-// (design/phase-locked-capture.md). `next_latch_host_ns` must already be host clock — convert
-// with the connection's clock offset (`T_host = T_client + offset`). Fire-and-forget; call ~1 Hz
-// from a vsync-aware presenter. No-op toward a host that never negotiated the capability.
+// Report the display-latch grid (`design/phase-locked-capture.md`).
+// `next_latch_host_ns` is already host clock. ~1 Hz; no-op if unnegotiated.
 //
 // # Safety
-// `c` is an opaque handle from a `*_new`/`*_pair` the caller has not yet freed, or null (an
-// error, not UB).
+// `c` is a caller handle or null (error, not UB).
 PunktfunkStatus punktfunk_connection_report_phase(const PunktfunkConnection *c,
                                                   uint64_t next_latch_host_ns,
                                                   uint32_t latch_period_ns,
@@ -4417,23 +3182,20 @@ PunktfunkStatus punktfunk_connection_report_phase(const PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Whether [`punktfunk_connection_report_decode_us`] is worth calling this session: writes 1 to
-// `out` only when the adaptive-bitrate controller is armed (Automatic bitrate, non-PyroWave), so a
-// client can skip the per-frame decode-latency measurement entirely for explicit-bitrate and
-// PyroWave sessions (where the signal is ignored). Constant for the session — query once. Writes 0
-// on a NULL connection.
+// Whether [`punktfunk_connection_report_decode_us`] is worth calling: writes true
+// only when Automatic bitrate is armed (non-PyroWave). Skip the per-frame
+// measurement otherwise. Constant for the session. Writes false on a NULL connection.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is writable (NULL is skipped).
-PunktfunkStatus punktfunk_connection_wants_decode_latency(const PunktfunkConnection *c,
-                                                          bool *out);
+PunktfunkStatus punktfunk_connection_wants_decode_latency(const PunktfunkConnection *c, bool *out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Start a bandwidth speed test: ask the host to burst filler over the data plane at
-// `target_kbps` of goodput for `duration_ms` (each clamped host-side to ≤ 10 Gbps / ≤ 5 s),
-// *briefly pausing video*. Non-blocking — poll [`punktfunk_connection_probe_result`] until its
-// `done` field is 1. Starting a probe resets any prior measurement.
+// Start a bandwidth speed test: host bursts filler at `target_kbps` goodput for
+// `duration_ms` (clamped ≤ 10 Gbps / ≤ 5 s), briefly pausing video. Non-blocking —
+// poll [`punktfunk_connection_probe_result`] until `done` is 1. Starting a probe
+// resets any prior measurement.
 //
 // # Safety
 // `c` is a valid connection handle.
@@ -4443,25 +3205,24 @@ PunktfunkStatus punktfunk_connection_speed_test(const PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Read the current speed-test measurement into `*out` (partial until `out->done == 1`). Safe to
-// poll repeatedly after [`punktfunk_connection_speed_test`]; before any probe it reports zeros.
+// Read the current speed-test measurement into `*out` (partial until `out->done == 1`).
+// Safe to poll after [`punktfunk_connection_speed_test`]; before any probe it reports zeros.
 //
 // # Safety
-// `c` is a valid connection handle; `out` is writable for one `PunktfunkProbeResult` (NULL is an
-// error).
+// `c` is a valid connection handle; `out` is writable for one `PunktfunkProbeResult`
+// (NULL is an error).
 PunktfunkStatus punktfunk_connection_probe_result(const PunktfunkConnection *c,
                                                   PunktfunkProbeResult *out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Signal a **deliberate quit** (a user "stop", not a network drop) before closing: the connection
-// closes with [`QUIT_CLOSE_CODE`] instead of code 0, so the host tears the session down immediately
-// (skips the keep-alive linger) rather than holding it for a reconnect. Call this right before
-// [`punktfunk_connection_close`] on a user-initiated disconnect; a plain close (network drop,
-// backgrounding) leaves the linger intact. NULL is a no-op.
+// Signal a deliberate quit (user stop, not a network drop) before closing: the
+// connection closes with [`QUIT_CLOSE_CODE`] instead of 0, so the host skips the
+// keep-alive linger. Call before [`punktfunk_connection_close`] on a user disconnect;
+// a plain close leaves the linger intact. NULL is a no-op.
 //
 // # Safety
-// `c` was returned by [`punktfunk_connect`] and remains valid (closed via `punktfunk_connection_close`).
+// `c` was returned by [`punktfunk_connect`] and remains valid until `punktfunk_connection_close`.
 void punktfunk_connection_disconnect_quit(PunktfunkConnection *c);
 #endif
 
@@ -4473,9 +3234,9 @@ void punktfunk_connection_disconnect_quit(PunktfunkConnection *c);
 void punktfunk_connection_close(PunktfunkConnection *c);
 #endif
 
-// Create a re-anchor gate seeded with the session's current `frames_dropped` (so the first
-// [`punktfunk_reanchor_gate_poll`] doesn't read the baseline as a loss). Free with
-// [`punktfunk_reanchor_gate_free`]. Never returns NULL.
+// Create a re-anchor gate seeded with the session's current `frames_dropped` (so
+// the first [`punktfunk_reanchor_gate_poll`] doesn't read the baseline as a loss).
+// Free with [`punktfunk_reanchor_gate_free`]. Never returns NULL.
 ReanchorGate *punktfunk_reanchor_gate_new(uint64_t frames_dropped);
 
 // Free a gate created by [`punktfunk_reanchor_gate_new`]. NULL is a no-op.
@@ -4484,39 +3245,25 @@ ReanchorGate *punktfunk_reanchor_gate_new(uint64_t frames_dropped);
 // `g` was returned by [`punktfunk_reanchor_gate_new`] and is not used after this call.
 void punktfunk_reanchor_gate_free(ReanchorGate *g);
 
-// Arm the freeze: a loss was detected (a frame-index gap, or a decoder wedge/demotion). Zeroes the
-// recovery-mark count and (re-)sets the backstop deadline. NULL is a no-op.
+// Arm the freeze: a loss was detected (frame-index gap, or decoder wedge/demotion).
+// Zeroes the recovery-mark count and (re-)sets the backstop deadline. NULL is a no-op.
 //
 // # Safety
 // `g` is a valid gate handle.
 void punktfunk_reanchor_gate_arm(ReanchorGate *g);
 
-// [`punktfunk_reanchor_gate_arm`] for a loss detected as a **frame-index gap**, where the caller
-// knows how many frames the gap skipped ([`punktfunk_connection_note_frame_index_ex`]). On top of
-// arming, the gate pre-credits the reassembler's `frames_dropped` climb those same lost frames
-// will produce up to ~120 ms later, so [`punktfunk_reanchor_gate_poll`] does not treat that
-// delayed bookkeeping as a SECOND loss — without the credit, a fast LTR-RFI anchor lifts the
-// freeze between the two signals and the stale climb re-freezes a healed stream (the double-arm
-// race). Use the plain arm for non-gap loss signals (decoder wedge/demotion). NULL is a no-op.
+// Arm for a frame-index gap, pre-crediting `expected_drops` so a later
+// `frames_dropped` climb is not a second loss (double-arm race). Plain `arm`
+// for decoder wedge/demotion. NULL is a no-op.
 //
 // # Safety
 // `g` is a valid gate handle.
 void punktfunk_reanchor_gate_arm_expecting_drops(ReanchorGate *g, uint64_t expected_drops);
 
-// Fold one decoded frame and write to `out_present` whether to display it (`true`) or withhold it as
-// a post-loss concealment (`false`). `flags` is the AU's `user_flags` word ([`PunktfunkFrame::flags`]):
-// the gate reads `FLAG_SOF` (the host's IDR marker), `USER_FLAG_RECOVERY_ANCHOR` and
-// `USER_FLAG_RECOVERY_POINT`. Pass `decoder_keyframe = false` where the platform decoder doesn't flag
-// IDRs (VideoToolbox/MediaCodec) — the wire `FLAG_SOF` covers it.
-//
-// This is the uncorroborated entry point and deliberately stays that way. Rust embedders whose
-// decoder parses the bitstream call [`ReanchorGate::on_decoded_corroborated`] to let their own
-// parser refute a `USER_FLAG_RECOVERY_ANCHOR` that names a picture they had to conceal; every
-// client reachable through THIS surface (Apple VideoToolbox, Android MediaCodec) uses a platform
-// decoder that surfaces no such fact, so it would have nothing to pass but
-// `AnchorEvidence::Unavailable` — which is exactly what this wrapper already means. Growing a
-// second export for a corroboration no C caller can supply would spend an ABI version bump on
-// dead surface.
+// Fold one decoded frame; `out_present` is whether to display it. Reads `FLAG_SOF`,
+// `USER_FLAG_RECOVERY_ANCHOR`, `USER_FLAG_RECOVERY_POINT`. Platform decoders that
+// do not flag IDRs pass `decoder_keyframe = false` — wire `FLAG_SOF` covers it.
+// Uncorroborated: C callers cannot supply bitstream evidence.
 //
 // # Safety
 // `g` is a valid gate handle; `out_present` is writable or NULL.
@@ -4525,18 +3272,17 @@ PunktfunkStatus punktfunk_reanchor_gate_on_decoded(ReanchorGate *g,
                                                    bool decoder_keyframe,
                                                    bool *out_present);
 
-// A received AU produced no decoded frame. Writes to `out_request_kf` whether the no-output streak has
-// tripped and the client should (throttled) request a keyframe — the gate arms the freeze at the same
-// time.
+// A received AU produced no decoded frame. Writes to `out_request_kf` whether the
+// no-output streak has tripped and the client should (throttled) request a keyframe
+// — the gate arms the freeze at the same time.
 //
 // # Safety
 // `g` is a valid gate handle; `out_request_kf` is writable or NULL.
-PunktfunkStatus punktfunk_reanchor_gate_on_no_output(ReanchorGate *g,
-                                                     bool *out_request_kf);
+PunktfunkStatus punktfunk_reanchor_gate_on_no_output(ReanchorGate *g, bool *out_request_kf);
 
-// Periodic fold of the session's `frames_dropped` counter plus the overdue backstop. Writes to
-// `out_request_kf` whether the client should (throttled) request a keyframe (a drop-count climb armed
-// a fresh freeze, or the freeze is overdue and re-asks while it keeps holding).
+// Periodic fold of `frames_dropped` plus the overdue backstop. Writes to
+// `out_request_kf` whether the client should (throttled) request a keyframe
+// (a drop-count climb armed a freeze, or the freeze is overdue and re-asks).
 //
 // # Safety
 // `g` is a valid gate handle; `out_request_kf` is writable or NULL.
@@ -4544,8 +3290,8 @@ PunktfunkStatus punktfunk_reanchor_gate_poll(ReanchorGate *g,
                                              uint64_t frames_dropped,
                                              bool *out_request_kf);
 
-// Whether the gate is currently withholding concealed frames (frozen on the last good picture).
-// Writes `false` on a NULL gate.
+// Whether the gate is currently withholding concealed frames (frozen on the last
+// good picture). Writes `false` on a NULL gate.
 //
 // # Safety
 // `g` is a valid gate handle; `out_holding` is writable or NULL.

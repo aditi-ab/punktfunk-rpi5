@@ -207,39 +207,6 @@ enum AcquireClass {
     Fatal,
 }
 
-/// What the stale-source watchdog does this tick (see
-/// [`IddPushCapturer::stale_source_watchdog`]) — pure over its inputs so the floor/evidence/
-/// budget rules are testable without a ring.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StaleAction {
-    None,
-    Rebuild,
-    Fail,
-}
-
-fn stale_source_action(
-    gap: Duration,
-    floor: Duration,
-    cursor_px: u32,
-    evidence_px: u32,
-    offered_delta: u64,
-    trips: u32,
-) -> StaleAction {
-    if gap < floor {
-        return StaleAction::None;
-    }
-    // Activity evidence: the user's input moved the cursor over the frozen image, or the driver
-    // kept offering frames the ring never delivered. Neither = plain idle = no recovery.
-    if cursor_px < evidence_px && offered_delta == 0 {
-        return StaleAction::None;
-    }
-    if trips == 0 {
-        StaleAction::Rebuild
-    } else {
-        StaleAction::Fail
-    }
-}
-
 fn classify_acquire(hr: i32) -> AcquireClass {
     match hr {
         0 => AcquireClass::Acquired,
@@ -358,6 +325,9 @@ mod dxgkrnl_etw;
 mod probes;
 #[path = "idd_push/stall.rs"]
 mod stall;
+// Live health classification + the staged-recovery ladder (immunity plan WP12/WP13).
+#[path = "idd_push/recovery.rs"]
+mod recovery;
 use channel::ChannelBroker;
 use descriptor::{DescriptorPoller, DisplayDescriptor};
 use stall::{StallEvidence, StallWatch};
@@ -375,10 +345,10 @@ pub struct IddPushCapturer {
     /// provenance sequence. Survives ring recreates by construction: it lives on the capturer,
     /// not the ring.
     source_seq: u64,
-    /// Consecutive stale-source watchdog trips (WP3b): 1 = the one in-place rebuild ran; a
-    /// second trip is terminal. Reset only when CONTINUOUS source flow resumes — a single stash
-    /// republish after the rebuild must not re-arm another silent stale floor.
-    stale_trips: u32,
+    /// Health classifier + staged-recovery ladder over this capturer's clocks (WP12/WP13).
+    recovery: recovery::Supervisor,
+    /// A closed episode's measured outage, until the stream loop takes it (WP14).
+    recovered_outage: Option<Duration>,
     /// Owns the shared-header file mapping + its mapped view (RAII unmap-then-close). Declared BEFORE
     /// `header`, which is a raw pointer borrowed into this view via [`MappedSection::ptr`]. Also the
     /// duplication source for the driver's header handle on every [`ChannelBroker::send`].
@@ -471,6 +441,8 @@ pub struct IddPushCapturer {
     /// Two-strikes debounce: act only when a second consecutive sample agrees,
     /// so a topology re-probe blip never tears the ring down.
     pending_desc: Option<DisplayDescriptor>,
+    /// The topology generation `pending_desc` was sampled under ([`poll_display_hdr`]).
+    pending_desc_gen: u64,
     /// Ring recreate in flight; if still set past the window, `try_consume` drops
     /// the session (recover-or-drop, no DDA).
     recovering_since: Option<Instant>,
@@ -910,9 +882,14 @@ impl IddPushCapturer {
             self.pending_desc = None;
             return;
         }
-        if self.pending_desc != Some(now) {
+        // Samples name the topology generation they were observed under (immunity plan WP10 item
+        // 5): two strikes straddling a finished topology transaction are two different desktops,
+        // never one confirmed change.
+        let topo_gen = pf_win_display::topology_churn::generation();
+        if self.pending_desc != Some(now) || self.pending_desc_gen != topo_gen {
             // First strike — act only when a second consecutive sample agrees.
             self.pending_desc = Some(now);
+            self.pending_desc_gen = topo_gen;
             return;
         }
         self.pending_desc = None;
@@ -1401,77 +1378,112 @@ impl IddPushCapturer {
         }
     }
 
-    /// Stale floor for the interim stale-source watchdog (WP3b). Anchored ABOVE the recorded
-    /// benign vendor-hole envelope — field holes run 1.6–10 s during link/power/modeset servicing
-    /// (vdisplay-disturbance-immunity §1), and a transient adapter pause must never trigger
-    /// recovery. The staged-recovery classifier (WP12) inherits this value as its starting floor.
-    const STALE_SOURCE_FLOOR: Duration = Duration::from_secs(15);
-    /// Cursor motion across the gap that counts as ACTIVITY evidence — a couple of real mouse
-    /// movements, comfortably above sub-pixel jitter.
-    const STALE_EVIDENCE_PX: u32 = 64;
-
-    /// Interim stale-source watchdog (immunity plan WP3b; retired when the WP13 recovery ladder
-    /// owns the decision). A wedged-but-ALIVE presentation path answers `Ok(None)` forever — the
-    /// 20 s `next_frame` bail is unreachable after a first frame, and the driver-death watch only
-    /// catches an EXITED WUDFHost — so a known-active display could stream one stale texture
-    /// indefinitely (F1). When no fresh driver frame has arrived through the floor while activity
-    /// evidence exists (the user's cursor moved over the frozen image, or the driver kept
-    /// offering frames the ring never delivered), run ONE same-mode in-place rebuild; a second
-    /// expiry is terminal (typed `RingFault::SourceStalled`). No evidence = plain idle = no
-    /// recovery: a static desktop composes nothing, and that is healthy.
-    fn stale_source_watchdog(&mut self) -> Result<()> {
-        if self.recovering_since.is_some() {
-            return Ok(()); // a recreate is in flight — its own 3 s recover-or-drop governs
-        }
-        let gap = self.last_fresh.elapsed();
-        let offered_delta = self.telemetry().map_or(0, |(_, offered)| {
-            offered.saturating_sub(self.offered_at_fresh)
-        });
-        match stale_source_action(
-            gap,
-            Self::STALE_SOURCE_FLOOR,
-            self.cursor_gap_px,
-            Self::STALE_EVIDENCE_PX,
-            offered_delta,
-            self.stale_trips,
-        ) {
-            StaleAction::None => Ok(()),
-            StaleAction::Rebuild => {
-                self.stale_trips += 1;
-                tracing::warn!(
-                    target = %self.ccd,
-                    gap_s = gap.as_secs(),
-                    cursor_moved_px = self.cursor_gap_px,
-                    offered_delta,
-                    "IDD push: no source frame through the stale floor with activity evidence — \
-                     one same-mode ring rebuild (interim stale-source watchdog)"
-                );
-                if !self.recreate_ring_in_place() {
+    /// Staged recovery (immunity plan WP12/WP13). A wedged-but-ALIVE presentation path answers
+    /// `Ok(None)` forever — the 20 s `next_frame` bail is unreachable after a first frame, and
+    /// the driver-death watch only catches an EXITED WUDFHost — so a known-active display could
+    /// stream one stale texture indefinitely (F1). The classifier names the gap from the clocks
+    /// this capturer keeps (worker heartbeat, driver acquires, ring publish, source frames,
+    /// cursor travel, an unanswered canary); the coordinator walks the ladder from that class,
+    /// one rung at a time under a deadline, and proves each rung with NEW source frames. No
+    /// evidence = plain idle = no recovery: a static desktop composes nothing, and that is
+    /// healthy. An exhausted ladder ends the plane with the typed `RingFault::SourceStalled`; the
+    /// host's pipeline rebuild is the rung above.
+    fn recovery_tick(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let telemetry = self.telemetry();
+        let health = self.ring_health();
+        let inputs = recovery::Inputs {
+            now,
+            last_source: self.last_fresh,
+            source_seq: self.source_seq,
+            heartbeat_age: telemetry.map(|(hb, _)| Duration::from_micros(Self::qpc_age_us(hb))),
+            offered: telemetry.map(|(_, offered)| offered),
+            publish_age: health
+                .as_ref()
+                .filter(|h| h.last_publish_qpc != 0)
+                .map(|h| Duration::from_micros(Self::qpc_age_us(h.last_publish_qpc))),
+            cursor_gap_px: self.cursor_gap_px,
+            ring: health.map(|h| h.state),
+            recreating: self.recovering_since.is_some(),
+            secure_desktop: self.secure_active,
+            topology_held: pf_win_display::topology_churn::held(),
+        };
+        let mut step = self.recovery.tick(inputs);
+        loop {
+            match step {
+                recovery::Step::Nothing => return Ok(()),
+                recovery::Step::Canary => {
+                    tracing::info!(
+                        target = %self.ccd,
+                        "IDD push: source suspect on weak evidence — presenting the compose canary"
+                    );
+                    kick_dwm_compose(self.ccd);
+                    return Ok(());
+                }
+                recovery::Step::Run(stage) => {
+                    let outcome = self.run_stage(stage);
+                    tracing::warn!(
+                        target = %self.ccd,
+                        ?stage,
+                        ?outcome,
+                        "IDD push: recovery stage"
+                    );
+                    step = self.recovery.stage_done(Instant::now(), stage, outcome);
+                }
+                recovery::Step::Recovered(summary) => {
+                    tracing::info!(
+                        target = %self.ccd,
+                        ?summary,
+                        "IDD push: recovery episode closed"
+                    );
+                    return Ok(());
+                }
+                recovery::Step::Failed { gap, summary } => {
                     let fault = crate::RingFault::SourceStalled {
                         secs: gap.as_secs() as u32,
                     };
+                    tracing::error!(
+                        target = %self.ccd,
+                        %fault,
+                        ?summary,
+                        "IDD push: recovery ladder exhausted"
+                    );
                     return Err(anyhow::Error::new(fault).context(
-                        "IDD-push: stale-source rebuild failed — ending the video plane",
+                        "IDD-push: a known-active display delivered no source frame through the \
+                         recovery ladder — ending the video plane with a typed error",
                     ));
                 }
-                Ok(())
             }
-            StaleAction::Fail => {
-                self.stale_trips += 1;
-                let fault = crate::RingFault::SourceStalled {
-                    secs: gap.as_secs() as u32,
-                };
-                tracing::error!(
-                    target = %self.ccd,
-                    %fault,
-                    trips = self.stale_trips,
-                    "IDD push: stale-source watchdog exhausted its one rebuild"
-                );
-                Err(anyhow::Error::new(fault).context(
-                    "IDD-push: a known-active display delivered no source frame through the \
-                     stale floor and a rebuild — ending the video plane with a typed error",
-                ))
+        }
+    }
+
+    /// Run one ladder rung. Only the capture-thread actuators exist yet; the rest report
+    /// `Unsupported` and the ladder moves on without penalty.
+    fn run_stage(&mut self, stage: pf_frame::recovery::Stage) -> pf_frame::recovery::StageOutcome {
+        use pf_frame::recovery::{Stage, StageOutcome};
+        match stage {
+            Stage::RingReset => {
+                self.recovering_since.get_or_insert_with(Instant::now);
+                match self.recreate_ring(self.display_hdr, self.width, self.height) {
+                    Ok(()) => StageOutcome::Applied,
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "IDD push: ring reset failed");
+                        StageOutcome::Failed
+                    }
+                }
             }
+            Stage::PresentationReset => {
+                if self.recreate_ring_in_place() {
+                    StageOutcome::Applied
+                } else {
+                    StageOutcome::Failed
+                }
+            }
+            Stage::EncoderReset
+            | Stage::SwapChainReset
+            | Stage::MonitorCycle
+            | Stage::DriverCycle
+            | Stage::CaptureFallback => StageOutcome::Unsupported,
         }
     }
 
@@ -1485,7 +1497,8 @@ impl IddPushCapturer {
         self.poll_display_hdr();
         // Recover-or-drop: a recreate that never resumes a fresh frame ends the session.
         if let Some(since) = self.recovering_since {
-            if since.elapsed() > Duration::from_secs(3) {
+            // Under a recovery episode the ladder's stage deadlines govern instead.
+            if since.elapsed() > Duration::from_secs(3) && !self.recovery.owns_episode() {
                 // `recreate_ring` cleared these; whatever they hold is this generation's re-attach.
                 let (st, detail, lo, hi) = self.driver_diag();
                 bail!(
@@ -1525,9 +1538,9 @@ impl IddPushCapturer {
                 );
             }
         }
-        // Interim stale-source watchdog (WP3b) — after the driver-death watch, so a trip means
-        // the WUDFHost is ALIVE and the presentation path is what stopped.
-        self.stale_source_watchdog()?;
+        // Staged recovery — after the driver-death watch, so an episode means the WUDFHost is
+        // ALIVE and the presentation path is what stopped.
+        self.recovery_tick()?;
         // Stall-attribution evidence (v2 telemetry): record the STALEST the driver's drain
         // heartbeat ever reads between fresh frames. A heartbeat that goes quiet for the hole
         // convicts our worker (starved/dead WUDFHost); one that stays fresh through it acquits the
@@ -1752,11 +1765,16 @@ impl IddPushCapturer {
                      above cover at most its first hole"
                 );
             }
-            // The stale-source watchdog's episode ends only when CONTINUOUS flow resumes: one
-            // stash republish after its rebuild arrives as a lone fresh frame at the end of a
-            // long gap and must NOT re-arm another silent stale floor over a frozen image.
-            if self.last_fresh.elapsed() < Duration::from_secs(5) {
-                self.stale_trips = 0;
+            // A recovery episode closes only on the budgeted count of NEW source frames: one
+            // stash republish after a rebuild is one frame, never proof.
+            if let Some((summary, outage)) = self.recovery.source_frame(now) {
+                tracing::info!(
+                    target = %self.ccd,
+                    ?summary,
+                    outage_ms = outage.as_millis() as u64,
+                    "IDD push: recovery episode closed"
+                );
+                self.recovered_outage = Some(outage);
             }
             // A fresh driver frame: feed the driver-death watch and roll the stall-evidence
             // trackers (a regen re-encodes OLD content — it is not evidence of driver progress).
@@ -2027,7 +2045,23 @@ impl Capturer for IddPushCapturer {
         true
     }
 
+    fn take_recovered_outage(&mut self) -> Option<Duration> {
+        self.recovered_outage.take()
+    }
+
     fn recreate_ring_in_place(&mut self) -> bool {
+        // A target with no ACTIVE path cannot be recovered in place (immunity plan WP10 item 7):
+        // a same-mode reset would attach to a known-inactive display. Fail fast — on a FRESH
+        // snapshot only; a last-known-good one is not evidence either way.
+        let snap = pf_win_display::display_events::snapshot_or_query();
+        if snap.is_fresh() && !snap.target(self.ccd).is_some_and(|t| t.active) {
+            tracing::warn!(
+                target = %self.ccd,
+                "IDD push: same-mode recovery refused — the target has no active display path \
+                 (topology removed it); a topology recovery must precede a ring rebuild"
+            );
+            return false;
+        }
         // Same-mode ring recreate (trait doc: swap-chain bounce recovery) — deliberately NOT
         // routed through `resize_output`, whose same-size fast path would no-op exactly the
         // case this exists for. Same recover-or-drop arming as the resize recreate.
@@ -2089,43 +2123,6 @@ impl Drop for IddPushCapturer {
 mod tests {
     use super::stall::Stall;
     use super::*;
-
-    /// The stale-source watchdog's whole contract (WP3b): under the floor nothing happens; over
-    /// it, NO evidence stays idle (a static desktop is healthy), evidence buys exactly one
-    /// rebuild, and the next expiry is terminal — never an indefinite repeat.
-    #[test]
-    fn stale_source_watchdog_is_one_rebuild_then_terminal() {
-        let (floor, px) = (Duration::from_secs(15), 64u32);
-        let s = Duration::from_secs;
-        // Under the floor: nothing, whatever the evidence says.
-        assert_eq!(
-            stale_source_action(s(14), floor, 999, px, 5, 0),
-            StaleAction::None
-        );
-        // Over the floor with no activity evidence: plain idle — no recovery.
-        assert_eq!(
-            stale_source_action(s(60), floor, 0, px, 0, 0),
-            StaleAction::None
-        );
-        assert_eq!(
-            stale_source_action(s(60), floor, px - 1, px, 0, 0),
-            StaleAction::None
-        );
-        // Cursor motion over a frozen image, or undelivered driver offers: one rebuild…
-        assert_eq!(
-            stale_source_action(s(16), floor, px, px, 0, 0),
-            StaleAction::Rebuild
-        );
-        assert_eq!(
-            stale_source_action(s(16), floor, 0, px, 1, 0),
-            StaleAction::Rebuild
-        );
-        // …and the second expiry is terminal.
-        assert_eq!(
-            stale_source_action(s(16), floor, px, px, 0, 1),
-            StaleAction::Fail
-        );
-    }
 
     /// Every `AcquireSync` HRESULT class routes to a DISTINCT consequence (F4): timeout retries,
     /// abandoned poisons, negative fails typed — none may collapse into an ordinary no-frame.

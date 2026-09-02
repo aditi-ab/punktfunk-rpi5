@@ -66,13 +66,14 @@ export interface PunktfunkHostService {
 	) => Effect.Effect<A, RequestError | VersionSkew>;
 	/**
 	 * The lifecycle-event stream: decoded [`HostEvent`]s with automatic reconnect +
-	 * `Last-Event-ID` resume. Unknown kinds and the `dropped` marker surface on
-	 * [`eventsRaw`] (and the warning callback), never as a failure here.
+	 * `Last-Event-ID` resume. Unknown kinds and the `dropped` / `live` markers surface on
+	 * [`eventsRaw`] (and, for `dropped` and unknown kinds, the warning callback), never as a
+	 * failure here.
 	 */
 	readonly events: (
 		opts?: EventStreamOptions,
 	) => Stream.Stream<HostEvent, EventStreamError>;
-	/** Every SSE frame verbatim — the `dropped` marker and unknown kinds included. */
+	/** Every SSE frame verbatim — the `dropped` / `live` markers and unknown kinds included. */
 	readonly eventsRaw: (
 		opts?: EventStreamOptions,
 	) => Stream.Stream<SseFrame, EventStreamError>;
@@ -130,6 +131,8 @@ export const makeService = (cfg: ResolvedConfig): PunktfunkHostService => {
 					);
 					return Stream.empty;
 				}
+				// End of the host's catch-up; not an event, and not worth a warning per connect.
+				if (frame.event === "live") return Stream.empty;
 				let json: unknown;
 				try {
 					json = JSON.parse(frame.data);

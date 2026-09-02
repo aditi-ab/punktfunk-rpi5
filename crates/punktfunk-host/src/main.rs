@@ -371,6 +371,10 @@ fn real_main() -> Result<()> {
             // monitors exist for the EXTEND preset (the snapshot was process memory).
             #[cfg(target_os = "windows")]
             isolate_journal::startup_recover();
+            // The display actor (cached CCD snapshot) — up before the first session or management
+            // read, so nothing else has to touch the display-config lock for inventory.
+            #[cfg(target_os = "windows")]
+            pf_win_display::display_events::spawn_once();
             gamestream::serve(mgmt_opts, native, gamestream)
         }
         Some("detect-conflicts") => {

@@ -129,6 +129,8 @@ export const connect = async (options?: ConnectOptions): Promise<Punktfunk> => {
 						dispatch("dropped", frame);
 						continue;
 					}
+					// End of the host's catch-up, not an event: never an `"unknown"` dispatch.
+					if (frame.event === "live") continue;
 					let json: unknown;
 					try {
 						json = JSON.parse(frame.data);
