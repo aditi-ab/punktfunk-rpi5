@@ -515,16 +515,16 @@ pub(crate) fn invalidate_cached_device(why: &str) {
     }
 }
 
-/// Force a REAL mode-set at the target's current mode under the `state` lock
-/// (sole topology mutator). The OS reverts a path to software-cursor only on a
-/// mode commit; a same-config CCD apply is no commit, so after one the secure
-/// desktop still never presents. `false` before the first backend open.
-pub fn force_recommit(target_id: u32) -> bool {
+/// Force a REAL mode-set at the keyed target's current mode under the `state`
+/// lock (sole topology mutator). The OS reverts a path to software-cursor only
+/// on a mode commit; a same-config CCD apply is no commit, so after one the
+/// secure desktop still never presents. `false` before the first backend open.
+pub fn force_recommit(key: pf_win_display::win_display::CcdTargetKey) -> bool {
     let Some(m) = VDM.get() else {
         return false;
     };
     let _guard = m.state.lock().unwrap();
-    let Some(gdi) = pf_win_display::win_display::resolve_gdi_name(target_id) else {
+    let Some(gdi) = pf_win_display::win_display::resolve_gdi_name(key) else {
         return false;
     };
     pf_win_display::win_display::force_mode_reset(&gdi)
