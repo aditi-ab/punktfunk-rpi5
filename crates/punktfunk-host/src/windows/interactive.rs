@@ -1,15 +1,15 @@
-//! Launch a process into the interactive user session from the SYSTEM host.
+//! Launch processes as the signed-in user of the host process's WTS session.
 //!
-//! The host is a LocalSystem SCM service. A store launcher needs the logged-in
-//! user's token so `HKCU\Software\Classes` handlers, UWP/appx activation, and
-//! store auth resolve against that user — not SYSTEM, not session 0.
+//! Store handlers, appx activation, hooks, and the tray need that user's token
+//! so per-user registry and authentication state resolve for the same seat as
+//! the streaming host. The host itself stays LocalSystem.
 //!
-//! Used by [`crate::library::launch_title`]. Token is `WTSQueryUserToken` of
-//! the console session, then `CreateProcessAsUserW` on `winsta0\default`.
-//! Do not reuse the session-retargeted SYSTEM token in [`crate::service`];
-//! that token is for launching our own streamer. The host stays SYSTEM.
+//! [`ProcessIdToSessionId`] binds the launch to the host's session, then
+//! `WTSQueryUserToken` and `CreateProcessAsUserW` target `winsta0\default`.
+//! The SCM supervisor in [`crate::service`] separately selects the active
+//! console session when it starts the ordinary host.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use std::path::Path;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -17,52 +17,52 @@ use windows::Win32::Security::{
     DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
 };
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
-use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
+use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, CREATE_BREAKAWAY_FROM_JOB, CREATE_UNICODE_ENVIRONMENT,
-    PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessAsUserW, GetCurrentProcessId, CREATE_BREAKAWAY_FROM_JOB,
+    CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
-/// `Some((own_session, console_session))` when this process is not in the
-/// active console session. Display writes then fail `ERROR_ACCESS_DENIED`,
-/// GDI describes the wrong session, and `SendInput` goes nowhere.
-///
-/// `None` when already on the console, or when the query cannot answer
-/// (boot, session transition, or the session call failed): unknown stays
-/// quiet; this only names the known-bad state.
-pub fn console_session_mismatch() -> Option<(u32, u32)> {
-    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
-    use windows::Win32::System::Threading::GetCurrentProcessId;
-    let mut own: u32 = 0;
-    // SAFETY: `own` is a live local out-param for this synchronous call; no pointer escapes it.
-    if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut own) }.is_err() {
-        return None;
-    }
-    // SAFETY: takes no arguments and returns the console session id by value.
-    let console = unsafe { WTSGetActiveConsoleSessionId() };
-    (console != 0xFFFF_FFFF && own != console).then_some((own, console))
+/// Resolves one process through an injected WTS session query. A failed query
+/// returns its error even if it wrote the out-parameter first.
+fn query_process_session<E>(
+    process_id: u32,
+    query: impl FnOnce(u32, &mut u32) -> std::result::Result<(), E>,
+) -> std::result::Result<u32, E> {
+    let mut session = 0;
+    query(process_id, &mut session)?;
+    Ok(session)
 }
 
-/// Spawn `cmdline` in the console session under the logged-in user's token
-/// on `winsta0\default`. Returns the new process id.
+/// The WTS session that contains this host process.
+fn current_process_session_id() -> Result<u32> {
+    // SAFETY: this takes no arguments and returns the caller's process id by value.
+    let process_id = unsafe { GetCurrentProcessId() };
+    query_process_session(process_id, |id, session| {
+        // SAFETY: `id` names the live current process and `session` is a local out-parameter that
+        // remains valid for this synchronous call.
+        unsafe { ProcessIdToSessionId(id, session) }
+    })
+    .context("ProcessIdToSessionId(current host process)")
+}
+
+/// Spawns `cmdline` as the signed-in user of this process's WTS session on
+/// `winsta0\default`. Returns the new process id.
 ///
 /// Fire-and-forget: child handles close before return; the process keeps
 /// running. Environment is the user's block plus this process's
 /// `PUNKTFUNK_*` / `RUST_LOG` (see [`merged_env_block`]).
 ///
-/// Needs SYSTEM (`WTSQueryUserToken` requires `SE_TCB`). Fails when no
-/// interactive user is logged on.
-pub fn spawn_in_active_session(cmdline: &str, workdir: Option<&Path>) -> Result<u32> {
-    // SAFETY: takes no arguments and returns the console session id by value.
-    let session = unsafe { WTSGetActiveConsoleSessionId() };
-    if session == 0xFFFF_FFFF {
-        bail!("no active console session (no interactive user is logged on)");
-    }
+/// Needs SYSTEM (`WTSQueryUserToken` requires `SE_TCB`). Fails when this
+/// process's session has no signed-in user.
+pub fn spawn_as_current_session_user(cmdline: &str, workdir: Option<&Path>) -> Result<u32> {
+    let session = current_process_session_id()?;
     let mut user_token = HANDLE::default();
     // SAFETY: `session` is a plain id and `user_token` a live local out-param; on `Ok` the call
     // yields an owned token handle, closed exactly once below.
-    unsafe { WTSQueryUserToken(session, &mut user_token) }
-        .context("WTSQueryUserToken (host must be SYSTEM; needs a logged-on interactive user)")?;
+    unsafe { WTSQueryUserToken(session, &mut user_token) }.context(
+        "WTSQueryUserToken (host must be SYSTEM; its WTS session needs a signed-in user)",
+    )?;
 
     let mut primary = HANDLE::default();
     // SAFETY: `user_token` is the live token just opened; `primary` is a live local out-param that
@@ -94,7 +94,7 @@ pub fn spawn_in_active_session(cmdline: &str, workdir: Option<&Path>) -> Result<
         let _ = unsafe { DestroyEnvironmentBlock(env_block) };
     }
 
-    // Captured interactive desktop, not the caller's (session 0 has no UI).
+    // The target user's interactive desktop is not inherited from the LocalSystem caller.
     let mut desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
     let si = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
@@ -116,10 +116,8 @@ pub fn spawn_in_active_session(cmdline: &str, workdir: Option<&Path>) -> Result<
     };
 
     let mut pi = PROCESS_INFORMATION::default();
-    // The caller in `crate::service` sits in a kill-on-close job with
-    // BREAKAWAY_OK. Without this flag the child joins that job and dies when
-    // the service stops. Retry without the flag if the job forbids breakaway
-    // (ACCESS_DENIED); launching inside that job beats not launching.
+    // The streaming host sits in a kill-on-close job that permits breakaway. A detached user
+    // process must outlive that host; retry inside the job when policy refuses breakaway.
     let mut flags = CREATE_UNICODE_ENVIRONMENT | CREATE_BREAKAWAY_FROM_JOB;
     let created = loop {
         // SAFETY: `primary` is the live primary token; `cmd`, `desktop` (via `si.lpDesktop`),
@@ -149,7 +147,7 @@ pub fn spawn_in_active_session(cmdline: &str, workdir: Option<&Path>) -> Result<
     };
     // SAFETY: `primary` is live and owned here, closed exactly once and not used after.
     let _ = unsafe { CloseHandle(primary) };
-    created.context("CreateProcessAsUserW (interactive-session launch)")?;
+    created.context("CreateProcessAsUserW (current-session user launch)")?;
 
     let pid = pi.dwProcessId;
     // SAFETY: `created` was `Ok`, so `pi` holds two owned handles; each is closed exactly once here
@@ -207,4 +205,28 @@ pub(crate) unsafe fn merged_env_block(user_block: *const u16) -> Vec<u16> {
     }
     block.push(0);
     block
+}
+
+#[cfg(test)]
+mod tests {
+    use super::query_process_session;
+
+    #[test]
+    fn process_session_query_uses_requested_process() {
+        let session = query_process_session(41, |process_id, out| {
+            assert_eq!(process_id, 41);
+            *out = 7;
+            Ok::<(), ()>(())
+        });
+        assert_eq!(session, Ok(7));
+    }
+
+    #[test]
+    fn failed_process_session_query_preserves_error() {
+        let session = query_process_session(41, |_, out| {
+            *out = 7;
+            Err("query failed")
+        });
+        assert_eq!(session, Err("query failed"));
+    }
 }

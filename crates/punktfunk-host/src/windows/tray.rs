@@ -5,17 +5,17 @@
 //! The tray is a per-user, per-session GUI with no recovery of its own. HKLM
 //! `Run` fires at sign-in only; [`supervise`] restarts a tray that dies after.
 //!
-//! [`start`] tries the session-crossing path first, then a plain spawn:
+//! [`start`] tries the user-token path first, then a plain spawn:
 //!
-//! * **From the host service (SYSTEM)** — land in the active console session
-//!   under the logged-in user's token via
-//!   [`crate::interactive::spawn_in_active_session`] (`WTSQueryUserToken` +
-//!   `CreateProcessAsUserW`). Needs `SE_TCB`, which only SYSTEM holds.
-//! * **From an interactive shell** — the caller is already the user in the
-//!   right session, so `WTSQueryUserToken` fails and a plain spawn is correct.
+//! * **From a streaming host (SYSTEM)** — launch as the signed-in user of that
+//!   host's WTS session via
+//!   [`crate::interactive::spawn_as_current_session_user`] (`WTSQueryUserToken`
+//!   + `CreateProcessAsUserW`). Only SYSTEM holds the required `SE_TCB`.
+//! * **From an interactive shell** — the caller already has the right user and
+//!   session token, so `WTSQueryUserToken` fails and a plain spawn is correct.
 //!
-//! Trying the privileged path first discriminates the two without a token
-//! inspection and without adding `unsafe` to this crate.
+//! Seat hosts do not supervise a tray: the seat manager is their control surface.
+//! An explicit seat-local start still uses that session's user and mutex.
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -78,7 +78,12 @@ pub fn is_running() -> bool {
 /// Two misses restart the tray, so this is half the grace window.
 const WATCH_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// HKLM `Run` `PunktfunkTray` is the only "this box wants an icon" signal. The exe is always on disk.
+/// Whether this host belongs to an add-on-managed seat rather than the console.
+fn seat_host() -> bool {
+    std::env::var("PUNKTFUNK_SEAT_SESSION").as_deref() == Ok("1")
+}
+
+/// Reads the console install's HKLM `Run` opt-in for tray supervision.
 fn wanted() -> bool {
     winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
         .open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run")
@@ -86,12 +91,16 @@ fn wanted() -> bool {
         .is_ok()
 }
 
-/// Keep a status tray alive while the host runs. Spawned once from `mgmt::run`.
+/// Keeps the console status tray alive while the ordinary host runs.
 ///
-/// First check is immediate. Later ticks need two consecutive misses before
-/// [`ensure`]: one miss is the tray's own Exit, which stops this service a few
-/// seconds later.
+/// Seat hosts return before spawning the watcher because their manager is the
+/// control surface. On the console, two misses trigger [`ensure`]; one miss is
+/// the tray's own Exit racing the service shutdown.
 pub fn supervise() {
+    if seat_host() {
+        tracing::debug!("seat host: status-tray supervision disabled");
+        return;
+    }
     std::thread::spawn(|| {
         if !wanted() {
             tracing::debug!("no HKLM Run entry for the status tray — not supervising it");
@@ -119,56 +128,48 @@ fn ensure() {
     }
 }
 
-/// Start the tray if it is not already up.
+/// Starts a tray for the caller's WTS session.
 ///
-/// `Ok(None)` = already running. The tray also holds `Local\PunktfunkTray`, so a lost race just
-/// exits the second instance. The `&'static str` names the launch path.
-///
-/// An elevated interactive spawn inherits this token; UIPI then blocks a medium-integrity `--quit`.
-/// Prefer `tray start` from a normal shell, or let the host service do it.
+/// Console callers avoid a duplicate visible in the process snapshot. Seat
+/// callers launch and let the tray's session-local mutex resolve duplicates;
+/// a console tray must not suppress theirs. SYSTEM drops to the session user,
+/// while an interactive caller keeps its token.
 pub fn start() -> Result<(Option<u32>, &'static str)> {
     let Some(exe) = tray_exe() else {
         bail!("{TRAY_EXE} is not installed next to this executable");
     };
-    if is_running() {
+    if !seat_host() && is_running() {
         return Ok((None, "already running"));
     }
-    // Quoted: the install directory is operator-chosen and routinely contains spaces.
+    // Quoting preserves an operator-chosen install path that contains spaces.
     let quoted = format!("\"{}\"", exe.display());
-    let session_err = match crate::interactive::spawn_in_active_session(&quoted, None) {
-        Ok(pid) => return Ok((Some(pid), "into the active console session")),
-        Err(e) => e,
-    };
-    // Only SYSTEM holds SE_TCB. A fallback spawn is correct only in the console session; from
-    // ssh/RDP it would land in a session nobody is looking at and still report success.
-    if let Some((own, console)) = crate::interactive::console_session_mismatch() {
-        bail!(
-            "cannot place the tray in session {console} from session {own}: {session_err}\n\
-             crossing sessions needs SE_TCB, which only SYSTEM holds — run this from the console \
-             session itself, or let the host service do it"
-        );
+    if let Ok(pid) = crate::interactive::spawn_as_current_session_user(&quoted, None) {
+        return Ok((Some(pid), "as this session's user"));
     }
+    // WTSQueryUserToken is privileged; an interactive caller's plain spawn preserves its seat.
     let child = std::process::Command::new(&exe)
         .spawn()
         .with_context(|| format!("spawn {}", exe.display()))?;
     Ok((Some(child.id()), "in this session"))
 }
 
-/// Stop every tray instance. Returns whether one was running.
+/// Stops the tray in this session; the console path can reap stale peers.
 ///
-/// [`supervise`] puts one back within a minute while this host runs — a diagnostic, not an off
-/// switch. Clearing the HKLM `Run` value (see [`wanted`]) is the off switch.
-///
-/// `--quit` posts WM_CLOSE so the tray can `NIM_DELETE` its icon; skip that and the shell keeps a
-/// ghost. `--quit` only reaches this session, so `taskkill` reaps any instance in another.
+/// `--quit` posts `WM_CLOSE` through the session-local tray mutex so the icon is
+/// removed cleanly. A seat host never uses global `taskkill`, which would kill
+/// other seats. Console supervision restarts its tray while the HKLM opt-in
+/// remains present.
 pub fn stop() -> bool {
     let was_running = is_running();
-    if !was_running {
+    if !was_running && !seat_host() {
         return false;
     }
     if let Some(exe) = tray_exe() {
         if let Ok(mut child) = std::process::Command::new(&exe).arg("--quit").spawn() {
             let _ = child.wait();
+        }
+        if seat_host() {
+            return true;
         }
         for _ in 0..8 {
             if !is_running() {

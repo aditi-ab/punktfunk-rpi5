@@ -49,7 +49,7 @@ use windows::Win32::System::Threading::{
 const SERVICE_NAME: &str = "PunktfunkHost";
 const SERVICE_DISPLAY: &str = "Punktfunk Host";
 const SERVICE_DESCRIPTION: &str =
-    "Low-latency desktop/game streaming host. Launches the punktfunk host into the active session.";
+    "Low-latency desktop/game streaming host. Launches the ordinary host into the active console session.";
 
 /// Default `PUNKTFUNK_HOST_CMD`. `--gamestream` adds Moonlight compat (plain-HTTP pairing).
 /// Drop it for a native-only host.
@@ -305,8 +305,9 @@ fn run_service() -> Result<()> {
     result
 }
 
-/// (Re)launch the host into the active console session. Every wait goes through `WebSlot::wait`
-/// so the web console is supervised regardless of which host arm is blocking.
+/// Supervises the ordinary host in the active console session and the web console
+/// in session 0. Every wait passes through [`WebSlot::wait`] so both children
+/// remain covered while either supervision arm blocks.
 fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
     let exe = std::env::current_exe().context("current_exe")?;
     let host_cmd = std::env::var("PUNKTFUNK_HOST_CMD").unwrap_or_else(|_| DEFAULT_HOST_CMD.into());
@@ -319,8 +320,8 @@ fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
         .chain(std::iter::once(0))
         .collect();
 
-    // KILL_ON_JOB_CLOSE so a service crash cannot orphan the SYSTEM host. BREAKAWAY_OK so the
-    // host can still spawn the WGC helper. Drop at exit reaps stragglers.
+    // KILL_ON_JOB_CLOSE prevents an orphaned SYSTEM host. BREAKAWAY_OK lets that host detach
+    // session-user launches and update installers; dropping the job reaps everything else.
     let job = make_job(JOB_OBJECT_LIMIT_BREAKAWAY_OK).context("create job object")?;
 
     let mut web = WebSlot::new(&exe);
@@ -446,9 +447,11 @@ fn wait_any(handles: &[HANDLE], ms: u32) -> Option<usize> {
     (idx < handles.len() as u32).then_some(idx as usize)
 }
 
-/// Kill-on-close job as `OwnedHandle`. Host adds `BREAKAWAY_OK` (WGC helper); the web console
-/// does not — nothing it runs may outlive the service. The handle is owned before any fallible
-/// step, so there is no caller precondition.
+/// Creates a kill-on-close job and returns its owned handle.
+///
+/// The host job permits breakaway for detached session-user launches and update
+/// installers. The web-console job does not permit children to outlive the
+/// service. Ownership starts before the first fallible configuration call.
 fn make_job(limits: JOB_OBJECT_LIMIT) -> Result<OwnedHandle> {
     // SAFETY: a null security descriptor and a null name are "unnamed, default security";
     // the returned handle is checked by `?` and owned on the next line.

@@ -1,7 +1,7 @@
 //! Fire-and-forget operator commands and webhooks for host lifecycle events.
 //!
 //! `hooks.json` is operator-privileged (`/api/v1/hooks`). Commands get event JSON and
-//! `PF_EVENT_*` env; Windows services run them in the interactive user session.
+//! `PF_EVENT_*` env; Windows SYSTEM hosts run them as their WTS session user.
 //! Webhooks use verified TLS, do not follow redirects or attach host credentials,
 //! and may carry an HMAC signature.
 //!
@@ -601,8 +601,8 @@ fn running_as_system() -> bool {
 
 #[cfg(not(unix))]
 fn exec_path_check(_cmd: &str) -> Result<(), String> {
-    // Windows: the command runs in the interactive session, never SYSTEM; hooks.json sits
-    // in the SYSTEM/Admins-DACL'd config dir. No per-script ACL walk here.
+    // Windows commands use the host session's user, while hooks.json has a SYSTEM/Admins DACL.
+    // The Windows path therefore has no per-script ownership walk.
     Ok(())
 }
 
@@ -672,10 +672,12 @@ fn run_hook_process(
     }
 }
 
-/// Windows: SYSTEM hosts spawn in the interactive session (never SYSTEM) via
-/// [`crate::interactive::spawn_in_active_session`]. That path has no env/stdin, so
-/// event JSON is a private temp file appended as the last argument. A console host
-/// falls back to in-process spawn with Unix-style env + stdin.
+/// Runs a Windows hook as the signed-in user of the host's WTS session.
+///
+/// [`crate::interactive::spawn_as_current_session_user`] has no env or stdin,
+/// so the event JSON path is the last argument. A non-SYSTEM host falls back to
+/// its own token with the event environment and JSON on stdin. The call blocks
+/// for the configured timeout while the detached user process runs.
 #[cfg(windows)]
 fn run_hook_process(
     cmd: &str,
@@ -698,32 +700,30 @@ fn run_hook_process(
         tracing::warn!(cmd = %label, "hook: could not write event JSON temp file");
     }
     let cmdline = format!("{cmd} \"{}\"", json_path.display());
-    match crate::interactive::spawn_in_active_session(&cmdline, None) {
+    match crate::interactive::spawn_as_current_session_user(&cmdline, None) {
         Ok(pid) => {
-            tracing::debug!(cmd = %label, pid, "hook command launched in the interactive session");
-            // No child handle — wait out the timeout, then remove the temp file.
+            tracing::debug!(cmd = %label, pid, "hook command launched as the current WTS session user");
+            // The launch returns no child handle, so cleanup waits for the configured ceiling.
             std::thread::sleep(timeout);
             let _ = std::fs::remove_file(&json_path);
-            // Detached in the user session: exit status is unobservable.
-            // Report ran so prep `undo`s stay armed.
+            // A detached user process has no observable status; successful launch arms prep undo.
             true
         }
         Err(e) if running_as_system() => {
-            // No in-process fallback as SYSTEM. spawn_in_active_session fails with no
-            // interactive user; cmd.exe /C here would be LocalSystem. Skip: no user, nothing to run as.
+            // A SYSTEM fallback would change the hook's principal, so a missing session user skips it.
             tracing::warn!(
                 cmd = %label,
                 error = %format!("{e:#}"),
-                "hook SKIPPED: no interactive user session to run it in, and this host is SYSTEM — \
-                 hooks run as the logged-in user by design and are never elevated to SYSTEM"
+                "hook SKIPPED: the host's WTS session has no user token, and this host is SYSTEM — \
+                 hooks run as the session user and never fall back to SYSTEM"
             );
             let _ = std::fs::remove_file(&json_path);
             false
         }
         Err(e) => {
-            // Console host: in-process is the operator's own privilege, not an elevation.
+            // The caller's own token is the non-SYSTEM fallback principal.
             tracing::debug!(error = %format!("{e:#}"),
-                "interactive-session spawn unavailable — running hook in-console");
+                "session-user spawn unavailable — running hook with the caller's token");
             let mut ok = false;
             let mut c = std::process::Command::new("cmd.exe");
             c.arg("/C")
