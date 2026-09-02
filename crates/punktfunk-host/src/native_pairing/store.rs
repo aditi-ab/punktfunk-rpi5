@@ -256,3 +256,27 @@ impl TrustStore {
         self.paired.lock().unwrap().clients.clients.len() as u32
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_store_files_open_empty() {
+        let cases: [&[u8]; 3] = [b"", br#"{"clients":["#, b"not json"];
+
+        for (index, contents) in cases.into_iter().enumerate() {
+            let path = std::env::temp_dir().join(format!(
+                "punktfunk-pairing-corrupt-{}-{index}.json",
+                std::process::id()
+            ));
+            std::fs::write(&path, contents).unwrap();
+
+            let store = TrustStore::open(Some(path.clone())).unwrap();
+
+            assert_eq!(store.count(), 0);
+            assert!(store.list().is_empty());
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
