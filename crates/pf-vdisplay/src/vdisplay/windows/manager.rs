@@ -2245,7 +2245,11 @@ pub(crate) fn force_release(slot: Option<u64>) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{needs_resize, shrink_action, Mode, ShrinkAction};
+    use super::{
+        needs_resize, reassert_backoff, shrink_action, Mode, ShrinkAction, REASSERT_BACKOFF_CAP,
+        REASSERT_BREAKER_ROUNDS,
+    };
+    use std::time::Duration;
 
     const fn m(width: u32, height: u32, refresh_hz: u32) -> Mode {
         Mode {
