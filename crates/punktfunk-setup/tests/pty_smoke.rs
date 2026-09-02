@@ -30,7 +30,11 @@ fn run_with_home(args: &[&str], keys: &[u8], until: &str, home: Option<&str>) ->
             pixel_height: 0,
         })
         .expect("openpty");
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_punktfunk-setup"));
+    let binary = match option_env!("CARGO_BIN_EXE_punktfunk-setup") {
+        Some(path) => path,
+        None => panic!("Cargo did not provide the punktfunk-setup test binary"),
+    };
+    let mut cmd = CommandBuilder::new(binary);
     for arg in args {
         cmd.arg(arg);
     }
