@@ -210,6 +210,7 @@ mod tests {
             web_task: super::super::TaskState::Absent,
             scripting_task: super::super::TaskState::Absent,
             inno_uninstaller: false,
+            client_installed: None,
         }
     }
 

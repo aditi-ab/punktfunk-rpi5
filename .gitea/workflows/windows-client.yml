@@ -309,6 +309,46 @@ jobs:
             -Version $env:MSIX_VERSION -Arch ${{ matrix.arch }} `
             -LayoutDir ${{ matrix.td }}\msix\layout -OutDir ${{ matrix.td }}\installer
 
+      # M4 (design/installer-v2-windows-implementation-plan.md WP4.1): the engine packer as a
+      # PARALLEL gate — same stage, its own OutDir, so the published artifact stays the ISCC one
+      # until M5; GITHUB_ENV withheld so the publish step keeps its paths. Then the smoke: inspect,
+      # a signature present, and (x64, where the runner can run it) the packed client exe's silent
+      # dry-run — unelevated, the client twin carries no UAC manifest — writing the client plan
+      # into /LOG=.
+      - name: Pack with the engine + smoke (parallel gate)
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          AZURE_CODESIGNING_ENDPOINT: https://neu.codesigning.azure.net/
+          AZURE_CODESIGNING_ACCOUNT: unomsigning
+          AZURE_CODESIGNING_PROFILE: unom-io
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          MSIX_CERT_PFX_B64: ${{ secrets.MSIX_CERT_PFX_B64 }}
+          MSIX_CERT_PASSWORD: ${{ secrets.MSIX_CERT_PASSWORD }}
+        run: |
+          Remove-Item Env:GITHUB_ENV -ErrorAction SilentlyContinue
+          & clients/windows/packaging/pack-client-installer.ps1 `
+            -Version $env:MSIX_VERSION -Arch ${{ matrix.arch }} `
+            -LayoutDir ${{ matrix.td }}\msix\layout -OutDir ${{ matrix.td }}\installer-engine -Engine
+          $setup = "${{ matrix.td }}\installer-engine\punktfunk-client-setup-$($env:MSIX_VERSION)_${{ matrix.arch }}.exe"
+          $sig = Get-AuthenticodeSignature $setup
+          Write-Output "engine client installer Authenticode: $($sig.Status) ($($sig.SignerCertificate.Subject))"
+          if (-not $sig.SignerCertificate) { throw "engine client installer is unsigned" }
+          if ('${{ matrix.arch }}' -eq 'x64') {
+            $log = "${{ matrix.td }}\installer-engine\smoke.log"
+            $p = Start-Process -FilePath $setup -PassThru -Wait `
+              -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/LOG=$log", '--dry-run'
+            if ($p.ExitCode -ne 0) { throw "silent dry-run exited $($p.ExitCode)" }
+            $text = Get-Content $log -Raw
+            foreach ($line in @('client installer', 'would unpack the payload', 'Punktfunk.lnk', 'Done. Next:')) {
+              if (-not $text.Contains($line)) { throw "smoke transcript lacks: $line" }
+            }
+            Get-Content $log
+          }
+          Write-Output "engine client installer: $([math]::Round((Get-Item $setup).Length / 1MB, 1)) MB"
+
       - name: Publish to Gitea generic registry
         if: github.event_name != 'pull_request'
         shell: pwsh

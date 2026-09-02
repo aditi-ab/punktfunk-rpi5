@@ -21,6 +21,12 @@ publish = false
 name = "punktfunk-setup-win"
 path = "src/main.rs"
 
+# The client artifact's twin (M4): the same source, but build.rs gives only the host bin the
+# requireAdministrator manifest — the client installs per user and never elevates (D1/D2).
+[[bin]]
+name = "punktfunk-setup-client"
+path = "src/main.rs"
+
 # The console-subsystem packer: PowerShell's `&` neither waits for nor captures a GUI exe
 # (S2), so every tool verb lives in a sibling bin.
 [[bin]]
@@ -53,6 +59,11 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
     "fileapi",
     "sddl",
     "winbase",
+    # The bootstrap asks its own token whether it is elevated: the host extracts into the
+    # admin-only ProgramData dir, the per-user client into LOCALAPPDATA.
+    "handleapi",
+    "processthreadsapi",
+    "securitybaseapi",
 ] }
 
 [target.'cfg(windows)'.build-dependencies]
