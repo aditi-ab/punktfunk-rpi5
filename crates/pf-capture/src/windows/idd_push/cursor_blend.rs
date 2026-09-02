@@ -1,14 +1,13 @@
-//! Host-side cursor compositing for the CAPTURE mouse model (design/remote-desktop-sweep.md §8).
+//! Host-side cursor compositing for the capture mouse model
+//! (`design/remote-desktop-sweep.md`).
 //!
-//! Why the host draws it: once a monitor has ever declared an IddCx hardware cursor, DWM will
-//! not composite the software cursor back into its frames — there is no un-declare DDI (the
-//! empty-caps re-setup is rejected `STATUS_INVALID_PARAMETER`), and a successful same-mode
-//! re-commit with the driver's re-declare provably suppressed still leaves the pointer excluded
-//! (all observed on-glass, 26100). So the driver keeps its hardware cursor declared for the
-//! session's whole life — the state that works — and when the client flips to the capture model
-//! the HOST composites the pointer into the frame itself: a slot→scratch copy plus one
-//! alpha-blended quad (the GDI poller's full-fidelity shape at its polled position), entirely
-//! GPU-side on the capture device, before the normal conversion runs from the scratch.
+//! Once a monitor has declared an IddCx hardware cursor, DWM will not composite the
+//! software cursor back into its frames: there is no un-declare DDI (empty-caps re-setup
+//! is `STATUS_INVALID_PARAMETER`), and a same-mode re-commit with the declare suppressed
+//! still leaves the pointer excluded. The driver keeps the hardware cursor declared for
+//! the session. When the client uses the capture model, the host blends the pointer into
+//! the frame itself (slot→scratch copy + one alpha-blended quad) on the capture device
+//! before conversion.
 
 use super::*;
 use windows::core::s;
@@ -23,10 +22,10 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
 
-/// Straight-alpha sample of the cursor bitmap. `linear_scale` = 0 passes sRGB through (SDR
-/// ring); non-zero linearizes sRGB→scRGB AND multiplies by the target's SDR-white scale
-/// (`sdr_white_level_scale` — 1.0 would put cursor-white at 80 nits, visibly DARKER than the
-/// surrounding SDR desktop content DWM composes at the user's SDR-brightness setting).
+/// Straight-alpha sample of the cursor bitmap. `linear_scale` = 0 is SDR passthrough;
+/// non-zero linearizes sRGB→scRGB and multiplies by the target's SDR-white scale.
+/// `1.0` would put cursor-white at 80 nits, darker than DWM's desktop at the user's
+/// SDR-brightness setting.
 const CURSOR_PS: &str = r"
 Texture2D<float4> tx : register(t0);
 SamplerState sm : register(s0);
@@ -40,7 +39,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {
 }
 ";
 
-/// The cursor-quad blend pass + its shape-texture cache. One per capturer (device-scoped).
+/// Cursor-quad blend pass and shape-texture cache. One per capturer (device-scoped).
 pub(super) struct CursorBlendPass {
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
@@ -48,15 +47,15 @@ pub(super) struct CursorBlendPass {
     blend: ID3D11BlendState,
     cbuf: ID3D11Buffer,
     cbuf_scale: Option<f32>,
-    /// The uploaded shape (serial-keyed): SRV + dims in host pixels.
+    /// Uploaded shape, keyed by overlay serial; dims are host pixels.
     shape: Option<(u64, ID3D11ShaderResourceView, u32, u32)>,
 }
 
 impl CursorBlendPass {
     pub(super) fn new(device: &ID3D11Device) -> Result<Self> {
-        // SAFETY: `?`-checked D3D11 resource creation on the live `device` borrow, over
-        // fully-initialized stack descriptors and live out-params; `compile_shader` receives `s!()`
-        // literals (its contract).
+        // SAFETY: `?`-checked D3D11 creation on the live `device` borrow, over
+        // fully-initialized stack descriptors. `compile_shader` receives `s!()` literals
+        // (its contract).
         unsafe {
             let vsb = crate::dxgi::compile_shader(crate::dxgi::HDR_VS, s!("main"), s!("vs_5_0"))?;
             let psb = crate::dxgi::compile_shader(CURSOR_PS, s!("main"), s!("ps_5_0"))?;
@@ -65,7 +64,7 @@ impl CursorBlendPass {
             let mut ps = None;
             device.CreatePixelShader(&psb, None, Some(&mut ps))?;
             let sd = D3D11_SAMPLER_DESC {
-                // LINEAR: the quad is drawn 1:1 in frame pixels, so this only matters at the
+                // Linear: the quad is 1:1 in frame pixels, so this only matters at
                 // half-texel edges; linear keeps them soft instead of ringing.
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
                 AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
@@ -92,7 +91,7 @@ impl CursorBlendPass {
             let mut blend = None;
             device.CreateBlendState(&bd, Some(&mut blend))?;
             let cbd = D3D11_BUFFER_DESC {
-                ByteWidth: 16, // float to_linear + float3 pad
+                ByteWidth: 16, // `float linear_scale` + float3 pad
                 Usage: D3D11_USAGE_DYNAMIC,
                 BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
                 CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
@@ -112,12 +111,11 @@ impl CursorBlendPass {
         }
     }
 
-    /// Upload `ov`'s bitmap if its serial is new; reuse the cached SRV otherwise.
     fn ensure_shape(&mut self, device: &ID3D11Device, ov: &pf_frame::CursorOverlay) -> Result<()> {
-        // SAFETY: `CreateTexture2D`/`CreateShaderResourceView` are `?`-checked calls on the live
-        // `device` borrow. `init.pSysMem` points into `ov.rgba`, which the length check above proves
-        // holds at least `ov.w * ov.h * 4` bytes for the declared `SysMemPitch = ov.w * 4`, and which
-        // outlives the synchronous upload.
+        // SAFETY: `CreateTexture2D`/`CreateShaderResourceView` are `?`-checked on the live
+        // `device` borrow. `init.pSysMem` points into `ov.rgba`; the length check in this
+        // block proves it holds `ov.w * ov.h * 4` bytes for `SysMemPitch = ov.w * 4`, and
+        // the overlay outlives the upload.
         unsafe {
             if self.shape.as_ref().is_some_and(|(s, ..)| *s == ov.serial) {
                 return Ok(());
@@ -158,11 +156,10 @@ impl CursorBlendPass {
         }
     }
 
-    /// Alpha-blend `ov` onto `dst` (frame-sized, RENDER_TARGET-capable — the blend scratch).
-    /// `linear_scale`: 0 = SDR passthrough; non-zero = the frame is FP16 scRGB (HDR
-    /// composition) — linearize and scale to the target's SDR white. The quad is placed purely
-    /// via the viewport (the fullscreen-triangle VS fills whatever viewport is set), clipped by
-    /// the target automatically.
+    /// Alpha-blend `ov` onto `dst` (frame-sized, `RENDER_TARGET`). `linear_scale` 0 = SDR
+    /// passthrough; non-zero = FP16 scRGB — linearize and scale to the target's SDR white.
+    /// The quad is placed via the viewport (the fullscreen-triangle VS fills it); the OS
+    /// clips to the target.
     pub(super) fn blend(
         &mut self,
         device: &ID3D11Device,
@@ -171,12 +168,10 @@ impl CursorBlendPass {
         ov: &pf_frame::CursorOverlay,
         linear_scale: f32,
     ) -> Result<()> {
-        // SAFETY: all D3D11 work on the caller's live `device`/`ctx` borrows. The
-        // `copy_nonoverlapping` writes `cb.len()` `f32`s into the pointer the immediately preceding
-        // `Map` of `self.cbuf` (16 bytes = 4×`f32`, DYNAMIC/WRITE_DISCARD) returned, inside the
-        // `is_ok()` arm and before the paired `Unmap`. `ensure_shape` forwards this fn's `device`
-        // borrow, and every `*Set*`/`Draw` takes borrowed slices of live locals or clones of live COM
-        // interfaces.
+        // SAFETY: D3D11 work on the caller's live `device`/`ctx` borrows. The
+        // `copy_nonoverlapping` writes `cb.len()` `f32`s into the pointer `Map` of
+        // `self.cbuf` (16 bytes, DYNAMIC/WRITE_DISCARD) returned, inside the `is_ok()`
+        // arm and before the paired `Unmap`. `ensure_shape` forwards this `device` borrow.
         unsafe {
             self.ensure_shape(device, ov)?;
             let (_, srv, w, h) = self.shape.as_ref().expect("shape just ensured");
@@ -189,11 +184,9 @@ impl CursorBlendPass {
                 {
                     std::ptr::copy_nonoverlapping(cb.as_ptr(), mapped.pData as *mut f32, cb.len());
                     ctx.Unmap(&self.cbuf, 0);
-                    // Cache ONLY on a successful upload. Caching unconditionally meant one transient
-                    // `Map` failure wedged the HDR/SDR cursor scale for the rest of the session: the
-                    // buffer still held the OLD value while this believed it held the new one, and
-                    // no later call would retry. On failure the cache is left alone and the next
-                    // blend tries again — a stale scale for a frame instead of forever.
+                    // Cache only after a successful `Map`. A failed upload must not mark
+                    // the new scale as current: the buffer still holds the old value, and
+                    // no later call would retry.
                     self.cbuf_scale = Some(linear_scale);
                 }
             }
@@ -212,7 +205,7 @@ impl CursorBlendPass {
             ctx.PSSetConstantBuffers(0, Some(&[Some(self.cbuf.clone())]));
             ctx.IASetInputLayout(None);
             ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            // Placement IS the viewport: the VS fills it, the OS clips it to the target.
+            // Placement is the viewport: the VS fills it; the OS clips to the target.
             let vp = D3D11_VIEWPORT {
                 TopLeftX: ov.x as f32,
                 TopLeftY: ov.y as f32,
@@ -223,7 +216,7 @@ impl CursorBlendPass {
             };
             ctx.RSSetViewports(Some(&[vp]));
             ctx.Draw(3, 0);
-            // Unbind so the scratch can be bound as a conversion INPUT without a hazard warning.
+            // Unbind so the scratch can be a conversion input without a hazard warning.
             ctx.OMSetRenderTargets(None, None);
             let none_srv: [Option<ID3D11ShaderResourceView>; 1] = [None];
             ctx.PSSetShaderResources(0, Some(&none_srv));

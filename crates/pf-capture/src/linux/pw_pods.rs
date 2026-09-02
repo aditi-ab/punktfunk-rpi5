@@ -1,10 +1,10 @@
-//! The PipeWire `EnumFormat` / `Buffers` / `Meta` param pods the capture stream offers, and the
-//! `Pod` serializer they all end in.
+//! PipeWire `EnumFormat` / `Buffers` / `Meta` pods the capture stream offers.
 //!
-//! Split out of `linux/pipewire.rs` (sweep Phase 5.2) because it is the crate's WIRE surface: what
-//! these builders put in a pod is what the compositor intersects against, and a missing property is
-//! not a compile error but a link that silently stalls in `negotiating`. Nothing here touches the
-//! stream, the buffers or the frames — every function is a pure `facts -> Vec<u8>`.
+//! These builders are the crate's wire surface: the compositor intersects
+//! whatever they put in a pod. A missing property is not a compile error; it
+//! stalls the link in `negotiating`. Pin the offers with the tests in this
+//! module. Every function is `facts -> Vec<u8>` — nothing here owns the stream,
+//! the buffers, or the frames.
 
 use anyhow::{Context, Result};
 use pipewire as pw;
@@ -21,8 +21,7 @@ pub(super) fn serialize_pod(obj: pw::spa::pod::Object) -> Result<Vec<u8>> {
     .into_inner())
 }
 
-/// Build a LINEAR/modifier DMA-BUF `EnumFormat` pod. Packed BGRx is the existing import path;
-/// NV12 is gamescope's producer-side RGB→YUV path (opt-in during bring-up).
+/// NV12 also pins BT.709 limited; packed RGB must not — it is not YUV.
 pub(super) fn build_dmabuf_format(
     format: VideoFormat,
     modifiers: &[u64],
@@ -96,63 +95,28 @@ pub(super) fn build_dmabuf_format(
     serialize_pod(obj)
 }
 
-/// Build one GNOME 50+ HDR format pod: `format` (xRGB_210LE / xBGR_210LE) as a LINEAR-only
-/// dmabuf with **MANDATORY** BT.2020 primaries + SMPTE ST.2084 (PQ) transfer-function props —
-/// the exact colorimetry Mutter's monitor stream advertises while the mirrored monitor is in
-/// HDR mode (its HDR pods carry the same props MANDATORY, so both sides must speak them for
-/// the intersection to exist; an SDR or pre-50 producer can never match this pod).
-///
-/// LINEAR-only because every 10-bit consumer we have reads the buffer without a de-tile pass:
-/// the CPU path mmaps it, and the VAAPI passthrough imports it into a VA surface. The tiled
-/// EGL de-tile blit renders into an 8-bit `GL_RGBA8` texture — it would silently crush the
-/// depth — so tiled modifiers are deliberately NOT advertised (a zero-copy 10-bit de-tile is
-/// the follow-up). SHM is excluded entirely: Mutter's SHM record path paints 8-bit ARGB32
-/// regardless of the negotiated format.
-/// `SPA_VIDEO_TRANSFER_SMPTE2084` (PQ) — spelled out rather than taken from `pw::spa::sys`
-/// because libspa only grew the constant with the BT2020_10/SMPTE2084/ARIB_STD_B67 block, and
-/// the distro builders (Ubuntu 24.04 noble for the .deb) ship headers predating it — bindgen
-/// then emits no such constant and the host fails to compile there, even though the code never
-/// runs on those systems (the HDR path needs GNOME 50+).
-///
-/// 14 is the enum's position in `spa/param/video/color.h` and is wire ABI, not a private
-/// detail: SPA mirrors GStreamer's `GstVideoTransferFunction`, where that block was added
-/// together, so the value is identical on every libspa that has the symbol at all. On one that
-/// doesn't, PipeWire simply fails to intersect this format offer and the session negotiates
-/// SDR — the same outcome as not offering HDR.
+/// PQ (`SPA_VIDEO_TRANSFER_SMPTE2084`). 14 is the wire ABI in
+/// `spa/param/video/color.h` (same index as GStreamer's
+/// `GstVideoTransferFunction`). Not taken from `pw::spa::sys` because older
+/// distro headers omit the symbol and bindgen then fails the host compile.
+/// A libspa without it fails to intersect this offer and the session stays SDR.
 const SPA_VIDEO_TRANSFER_SMPTE2084: u32 = 14;
 
-/// The two 10-bit PQ formats an HDR session offers, **in negotiation order**. The order is not a
-/// style choice — on NVIDIA it is the difference between correct colour and red/blue swapped.
+/// 10-bit PQ formats in negotiation order. The first compatible consumer pod
+/// wins, so this is colour correctness, not style: NVIDIA does not implement
+/// linear-tiled `A2R10G10B10`, and gamescope's mappable capture then writes
+/// XBGR bytes under an `XRGB2101010` label. Host mappings all look right, so
+/// nothing downstream can detect the swap.
 ///
-/// `xBGR_210LE` (DRM `XBGR2101010`, Vulkan `A2B10G10R10_UNORM_PACK32`) comes FIRST because the
-/// first compatible consumer pod wins, and it is the only one gamescope fills correctly on every
-/// vendor:
-///
-/// * `A2R10G10B10_UNORM_PACK32` **linear-tiled storage** is an optional Vulkan feature that
-///   NVIDIA does not implement. gamescope's capture textures are mappable, hence linear, so on
-///   NVIDIA its composite `imageStore` into that image lands in XBGR order — the bytes come out
-///   byte-reversed while the buffer is still LABELLED `XRGB2101010`.
-/// * The host believes the label: `xRGB_210LE → PixelFormat::X2Rgb10 →`
-///   `NV_ENC_BUFFER_FORMAT_ARGB10`. Every mapping in that chain is individually correct, which is
-///   exactly why the bug is invisible from this side — the *content* is what's wrong.
-/// * Upstream gamescope hit the same wall and fixed it with `vulkan_get_rgb10_capture_format()`,
-///   which probes `linearTilingFeatures` for STORAGE+SAMPLED and falls back to `XBGR2101010`.
-///   That landed AFTER 3.16.25, so the pinned `punktfunk-gamescope` (3.16.25-7-g60561e2 +pfhdr4)
-///   predates it and cannot self-correct — hence fixing the preference host-side, where it ships
-///   in the host binary with no gamescope rebuild.
-///
-/// Preferring xBGR costs nothing anywhere else: `A2B10G10R10_UNORM_PACK32` is the universally
-/// supported packed-10 format (it is the standard HDR10 swapchain format), it is what upstream
-/// falls back to, and `X2Bgr10` has a first-class encoder path (NVENC `ABGR10`, VAAPI
-/// `X2BGR10LE`). `xRGB_210LE` stays as the second pod so a producer that somehow offers only it
-/// can still negotiate HDR rather than falling off to the SDR downgrade.
-///
-/// ⚠ The real fix belongs upstream in the patch set: `spa_format_to_drm()` should offer only the
-/// format `vulkan_get_rgb10_capture_format()` reports. Until the gamescope pin moves past that
-/// commit, THIS ORDER is what keeps NVIDIA HDR sessions correct — do not "tidy" it.
+/// `xRGB_210LE` stays second so a producer that offers only it can still
+/// negotiate HDR instead of dropping to SDR. Do not reorder.
 pub(super) const HDR_FORMAT_ORDER: [VideoFormat; 2] =
     [VideoFormat::xBGR_210LE, VideoFormat::xRGB_210LE];
 
+/// LINEAR-only 10-bit PQ `EnumFormat`. Tiled modifiers are omitted because the
+/// EGL de-tile blit renders into `GL_RGBA8` and would crush the depth. BT.2020
+/// primaries and PQ transfer are **MANDATORY** — Mutter's HDR pods are too, so
+/// the intersection only exists if both sides speak them.
 pub(super) fn build_hdr_dmabuf_format(
     format: VideoFormat,
     preferred: Option<(u32, u32, u32)>,
@@ -213,8 +177,7 @@ pub(super) fn build_hdr_dmabuf_format(
     serialize_pod(obj)
 }
 
-/// The default (shm/CPU-path) format offer: raw video in any encoder-mappable layout, any
-/// size, any framerate (0/1 = variable allowed — gamescope fixates exactly that).
+/// SHM/CPU `EnumFormat`. Framerate 0/1 is variable; gamescope fixates that.
 pub(super) fn build_default_format_obj(preferred: Option<(u32, u32, u32)>) -> pw::spa::pod::Object {
     let (dw, dh, dhz) = preferred.unwrap_or((1920, 1080, 60));
     pw::spa::pod::object!(
@@ -230,10 +193,9 @@ pub(super) fn build_default_format_obj(preferred: Option<(u32, u32, u32)>) -> pw
             Id,
             pw::spa::param::format::MediaSubtype::Raw
         ),
-        // Offer the layouts the encoder can map to an NVENC input format. wlroots
-        // commonly fixates packed RGB (3 bpp); other compositors offer 4 bpp. Only
-        // these are requested, so negotiation fails loudly rather than handing us a
-        // format we'd misinterpret.
+        // Encoder-mappable layouts only. wlroots often fixates packed RGB
+        // (3 bpp); others offer 4 bpp. Restricting the enum fails loudly
+        // instead of handing us a format we would misinterpret.
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::VideoFormat,
             Choice,
@@ -277,11 +239,10 @@ pub(super) fn build_default_format_obj(preferred: Option<(u32, u32, u32)>) -> pw
     )
 }
 
-/// Build a Buffers param for the CPU path accepting anything mappable: MemPtr, MemFd, and
-/// DmaBuf. The DmaBuf bit matters for producers like gamescope whose format intersection
-/// lands on their modifier-bearing (LINEAR) pod: they then offer *only* DmaBuf buffers, and
-/// without this bit the buffer-type intersection is empty and the link silently stalls in
-/// "negotiating". A LINEAR dmabuf is mmap-able by MAP_BUFFERS, so the CPU de-pad copy works.
+/// CPU-path Buffers: MemPtr, MemFd, and DmaBuf. Gamescope's modifier-bearing
+/// (LINEAR) pod then offers *only* DmaBuf; without that bit the type
+/// intersection is empty and the link stalls in `negotiating`. A LINEAR
+/// dmabuf is mmap-able, so the CPU de-pad copy still works.
 pub(super) fn build_mappable_buffers() -> Result<Vec<u8>> {
     serialize_pod(pw::spa::pod::Object {
         type_: pw::spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
@@ -298,14 +259,10 @@ pub(super) fn build_mappable_buffers() -> Result<Vec<u8>> {
     })
 }
 
-/// Build a Buffers param for a TRUE SHM path: MemPtr + MemFd only, NO DmaBuf. Forces the
-/// producer to download into mappable memory (Mutter's `glReadPixels`), which orders against its
-/// render — so the frame is complete and current by construction. This is the only race-free
-/// capture of Mutter's virtual monitor on NVIDIA: the compositor renders straight into the buffer
-/// pool, NVIDIA attaches no implicit dmabuf fence (verified: `EXPORT_SYNC_FILE` waited=false) and
-/// can't produce an explicit sync_fd, so any dmabuf read (zero-copy OR mmap) races the render and
-/// flashes the buffer's previous frame. Excluding DmaBuf is what makes the difference vs.
-/// `build_mappable_buffers` (which still let Mutter hand dmabufs).
+/// SHM Buffers: MemPtr + MemFd, no DmaBuf. Mutter on NVIDIA renders into the
+/// pool with no implicit dmabuf fence and no explicit sync_fd, so any dmabuf
+/// read races the render and flashes the previous frame. Excluding DmaBuf
+/// forces `glReadPixels` into mappable memory, which orders against render.
 pub(super) fn build_shm_only_buffers() -> Result<Vec<u8>> {
     serialize_pod(pw::spa::pod::Object {
         type_: pw::spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
@@ -320,34 +277,17 @@ pub(super) fn build_shm_only_buffers() -> Result<Vec<u8>> {
     })
 }
 
-/// PW5 stage 2: the buffer-pool depth we ASK for on the zero-copy path, as a Choice range.
+/// Zero-copy pool depth, as a Choice range. A fixed count a producer cannot
+/// afford empties the Buffers intersection and the link stalls in
+/// `negotiating` (same trap as `build_cursor_meta_param`'s size).
 ///
-/// The raw-passthrough arm now WITHHOLDS each published buffer from the producer until the
-/// consumer's hold drops (`DeferredRequeue` in `pipewire.rs` — the fix for the producer
-/// rewriting a buffer mid-encode), spending up to `pool - HOLD_POOL_RESERVE` buffers of this
-/// depth. A pool at the old floor of 2 has nothing to spend and falls back to the racy
-/// immediate requeue, where only the producer round-robining a pool deeper than our
-/// import+encode latency keeps capture untorn. Until PW5 stage 1 nobody had ever counted what
-/// that pool was; we never even asked for a size (`build_dmabuf_buffers` set `dataType` and
-/// nothing else).
-///
-/// A **range**, deliberately, not a fixed count: SPA intersects the consumer's and producer's
-/// Buffers params, so a fixed 8 against a producer that can only afford 4 empties the intersection
-/// and the link silently stalls in "negotiating" — the exact failure mode the cursor-meta `size`
-/// property already cost this codebase once (see `build_cursor_meta_param`). With a range the
-/// producer clamps into it and negotiation still succeeds.
-///
-/// The numbers: `min` stays at 2 so nothing that works today stops working; `default` 8 is ~133 ms
-/// of buffer at 60 Hz and ~33 ms at 240 Hz, comfortably past the ~3-4 ms capture→fence latency
-/// measured in PW3/PW4 even with a second frame in flight; `max` 16 is a ceiling, not a request
-/// (a 4K 4:4:4 buffer is ~25 MB, so 16 is ~400 MB of compositor allocation and worth capping).
-/// **What the producer actually picks is logged by the stage-1 census — trust that line, not
-/// these constants.**
+/// `min` 2 matches what already works. `default` 8 is ~133 ms at 60 Hz /
+/// ~33 ms at 240 Hz, past capture→fence latency with a second frame in
+/// flight. `max` 16 caps compositor RAM (~25 MB per 4K 4:4:4 buffer).
 const POOL_MIN: i32 = 2;
 const POOL_DEFAULT: i32 = 8;
 const POOL_MAX: i32 = 16;
 
-/// Build a Buffers param requesting dmabuf-only buffers, with pool headroom (see [`POOL_DEFAULT`]).
 pub(super) fn build_dmabuf_buffers() -> Result<Vec<u8>> {
     serialize_pod(pw::spa::pod::Object {
         type_: pw::spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
@@ -376,11 +316,8 @@ pub(super) fn build_dmabuf_buffers() -> Result<Vec<u8>> {
     })
 }
 
-/// Request the compositor attach `SPA_META_Cursor` to each buffer, so the pointer travels as
-/// metadata (position + an occasional bitmap) instead of being burned into the frame. Paired
-/// with the portal's `CursorMode::Metadata`; producers that don't support it simply don't
-/// attach it (harmless). Size is a range up to a 1024×1024 bitmap — see the note on `max` below for
-/// why this is not the "bigger than any real cursor" 256² it used to be.
+/// `SPA_META_Cursor` on each buffer, paired with the portal's
+/// `CursorMode::Metadata`. Unsupported producers omit it (harmless).
 pub(super) fn build_cursor_meta_param() -> Result<Vec<u8>> {
     fn meta_size(w: u32, h: u32) -> i32 {
         (std::mem::size_of::<spa::sys::spa_meta_cursor>()
@@ -402,13 +339,10 @@ pub(super) fn build_cursor_meta_param() -> Result<Vec<u8>> {
                 value: pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Int(
                     pw::spa::utils::Choice(
                         pw::spa::utils::ChoiceFlags::empty(),
-                        // The max must cover the producer's offer or the Meta param silently
-                        // fails to negotiate and NO buffer ever carries the meta region:
-                        // Mutter offers a FIXED `SPA_POD_Int(CURSOR_META_SIZE(384, 384))`
-                        // (meta-screen-cast-stream-src.c, GNOME 50) — a 256² max made the
-                        // intersection empty, which cost the whole Linux cursor channel
-                        // on-glass. 1024² is headroom, not an allocation: the negotiated
-                        // region follows the producer's value.
+                        // `max` must cover the producer's offer or Meta fails
+                        // silently and no buffer carries a cursor region.
+                        // Mutter offers a fixed 384²; 1024² is headroom, not
+                        // an allocation — the negotiated size is the producer's.
                         pw::spa::utils::ChoiceEnum::Range {
                             default: meta_size(64, 64),
                             min: meta_size(1, 1),
@@ -425,12 +359,12 @@ pub(super) fn build_cursor_meta_param() -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// The `SPA_PARAM_BUFFERS_dataType` bitmask a serialized Buffers pod carries.
+    /// `SPA_PARAM_BUFFERS_dataType` bitmask from a serialized Buffers pod.
     ///
-    /// A deliberately literal SPA reader rather than a heuristic scan: an object property is
-    /// `{ key: u32, flags: u32, value: spa_pod }` and a `spa_pod` is `{ size: u32, type: u32, body }`,
-    /// so the `i32` sits exactly 16 bytes past the key — and the intervening `size` word is itself
-    /// `4`, which is why "find the first plausible-looking int" reads the wrong field.
+    /// Literal SPA reader: a property is `{ key: u32, flags: u32, value: spa_pod }`
+    /// and a pod is `{ size: u32, type: u32, body }`, so the `i32` sits 16 bytes
+    /// past the key. The size word is itself `4`, which is why a heuristic
+    /// "first plausible int" reads the wrong field.
     fn buffers_data_type(pod: &[u8]) -> i32 {
         let key = spa::sys::SPA_PARAM_BUFFERS_dataType.to_ne_bytes();
         let at = pod
@@ -451,13 +385,6 @@ mod tests {
     const MEM_FD: i32 = 1 << spa::sys::SPA_DATA_MemFd;
     const DMABUF: i32 = 1 << spa::sys::SPA_DATA_DmaBuf;
 
-    /// The three Buffers pods differ ONLY in this bitmask, and each bit is load-bearing:
-    /// `build_mappable_buffers` must include DmaBuf or gamescope's modifier-bearing pod wins the
-    /// format intersection and the BUFFER intersection is then empty (a link stuck in
-    /// "negotiating"); `build_shm_only_buffers` must EXCLUDE it or Mutter hands dmabufs and the
-    /// race-free download path is not race-free; `build_dmabuf_buffers` must exclude the mappable
-    /// types or an HDR session can be handed a MemFd buffer, which Mutter paints 8-bit ARGB32
-    /// regardless of the negotiated 10-bit format.
     #[test]
     fn each_buffers_pod_requests_exactly_its_own_data_types() {
         assert_eq!(
@@ -477,8 +404,7 @@ mod tests {
         );
     }
 
-    /// Every pod builder must produce a pod libspa will accept back — a serializer that silently
-    /// emitted a malformed object would fail only at negotiation, on a live compositor.
+    /// A malformed pod fails only at live negotiation, not at serialize.
     #[test]
     fn every_pod_round_trips_through_pod_from_bytes() {
         let mut pods: Vec<(&str, Vec<u8>)> = vec![
@@ -517,9 +443,6 @@ mod tests {
         }
     }
 
-    /// The HDR pods carry BOTH colorimetry properties MANDATORY — Mutter's HDR pods do the same, so
-    /// the intersection only exists if we speak them. Dropping either would negotiate an SDR-labelled
-    /// 10-bit stream (or nothing at all).
     #[test]
     fn the_hdr_pods_carry_mandatory_pq_and_bt2020() {
         for fmt in [VideoFormat::xRGB_210LE, VideoFormat::xBGR_210LE] {
@@ -537,7 +460,6 @@ mod tests {
                     "{fmt:?} pod is missing {name}"
                 );
             }
-            // The PQ id and BT.2020 id must both appear as values.
             assert!(
                 pod.windows(4)
                     .any(|w| w == SPA_VIDEO_TRANSFER_SMPTE2084.to_ne_bytes()),
@@ -551,8 +473,6 @@ mod tests {
         }
     }
 
-    /// An NV12 offer pins BT.709 limited so gamescope's producer-side RGB→YUV shader matches OUR
-    /// bitstream colorimetry; the packed-RGB offer must NOT carry those (it is not YUV).
     #[test]
     fn only_the_nv12_offer_pins_the_colour_matrix() {
         let nv12 = build_dmabuf_format(VideoFormat::NV12, &[0], None).unwrap();
@@ -572,14 +492,8 @@ mod tests {
         }
     }
 
-    /// Pin our hand-written PQ transfer id against the real libspa binding. We can't take the
-    /// constant from `pw::spa::sys` directly (older distro headers don't export it — see
-    /// [`super::SPA_VIDEO_TRANSFER_SMPTE2084`]), so assert the two agree wherever the symbol
-    /// DOES exist. Any libspa that renumbers the enum fails this instead of silently tagging
-    /// the HDR offer with the wrong transfer function.
-    ///
-    /// Only builds where tests are compiled — the .deb/.rpm builders run plain `cargo build`,
-    /// so this never reintroduces the compile failure it exists to prevent.
+    /// Hand-written PQ id vs the real libspa binding, wherever the symbol
+    /// exists. A renumbered enum would silently tag HDR with the wrong transfer.
     #[test]
     fn pq_transfer_id_matches_libspa() {
         assert_eq!(
@@ -589,13 +503,8 @@ mod tests {
         );
     }
 
-    /// PW5 stage 2: the pool request must be a **Choice Range**, never a fixed Int.
-    ///
-    /// This is the whole safety argument for asking at all: SPA intersects the two sides' Buffers
-    /// params, so a fixed count a producer cannot afford empties the intersection and the link
-    /// stalls in "negotiating" with no error anywhere — the same trap that cost this codebase the
-    /// entire Linux cursor channel once (see `build_cursor_meta_param`). Asserting the pod shape
-    /// is what keeps a later "simplify" from turning the range back into a number.
+    /// Pool depth must be a Choice Range. A fixed Int a producer cannot afford
+    /// empties the Buffers intersection and stalls the link with no error.
     #[test]
     fn the_dmabuf_pool_request_is_a_range_not_a_fixed_count() {
         let pod = build_dmabuf_buffers().unwrap();
@@ -605,8 +514,8 @@ mod tests {
             .position(|w| w == key)
             .expect("the dmabuf Buffers pod must carry a buffers count");
         let word = |off: usize| u32::from_ne_bytes(pod[off..off + 4].try_into().unwrap());
-        // Property = { key, flags, value_pod }; value_pod = { size, type, body }. A Choice body
-        // is { type: u32, flags: u32, child_size: u32, child_type: u32, values… }.
+        // Property = { key, flags, value_pod }; value_pod = { size, type, body }.
+        // Choice body = { type, flags, child_size, child_type, values… }.
         assert_eq!(
             word(at + 12),
             spa::sys::SPA_TYPE_Choice,
@@ -632,16 +541,6 @@ mod tests {
         const { assert!(POOL_MIN <= 2) };
     }
 
-    /// xBGR_210LE must be offered FIRST, and this is a correctness test, not a style one.
-    ///
-    /// The first compatible consumer pod wins the negotiation. Leading with `xRGB_210LE` makes an
-    /// NVIDIA gamescope session land on `XRGB2101010`, whose linear-tiled `A2R10G10B10` storage
-    /// NVIDIA does not support — gamescope's composite `imageStore` writes XBGR bytes under an
-    /// XRGB label and the whole stream comes out with red and blue swapped. Every format mapping
-    /// on the host side is individually correct, so nothing downstream can detect it.
-    ///
-    /// Field-confirmed 2026-08-09 on the RTX 5070 Ti Bazzite host with 0.26.0. See the
-    /// [`HDR_FORMAT_ORDER`] docs for the upstream fix this predates.
     #[test]
     fn hdr_offers_xbgr_before_xrgb() {
         assert_eq!(
