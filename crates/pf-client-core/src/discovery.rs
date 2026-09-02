@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 /// DNS-SD type hosts advertise. See host crate `punktfunk_host::discovery`.
 const SERVICE_TYPE: &str = "_punktfunk._udp.local.";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DiscoveredHost {
     /// Advertised host id, or the mDNS fullname when `id` is absent.
     pub key: String,

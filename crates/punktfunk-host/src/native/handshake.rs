@@ -451,180 +451,6 @@ async fn negotiate_video_format(
     Ok((bit_depth, session_hdr, chroma))
 }
 
-struct WelcomeArgs {
-    source: Punktfunk1Source,
-    frames: u32,
-    udp_port: u16,
-    shard_payload: usize,
-    key: [u8; 16],
-    salt: [u8; 4],
-    compositor: Option<crate::vdisplay::Compositor>,
-    gamepad: GamepadPref,
-    bitrate_kbps: u32,
-    bit_depth: u8,
-    session_hdr: bool,
-    chroma: crate::encode::ChromaFormat,
-    audio_channels: u8,
-    codec: crate::encode::Codec,
-    codec_bit: u8,
-    audio_plane: AudioPlane,
-    grants: u32,
-    expires_in_secs: u32,
-    chacha: bool,
-    key_chacha: Option<[u8; 32]>,
-}
-
-fn build_welcome(hello: &Hello, args: WelcomeArgs) -> Welcome {
-    let WelcomeArgs {
-        source,
-        frames,
-        udp_port,
-        shard_payload,
-        key,
-        salt,
-        compositor,
-        gamepad,
-        bitrate_kbps,
-        bit_depth,
-        session_hdr,
-        chroma,
-        audio_channels,
-        codec,
-        codec_bit,
-        audio_plane,
-        grants,
-        expires_in_secs,
-        chacha,
-        key_chacha,
-    } = args;
-    Welcome {
-        abi_version: punktfunk_core::WIRE_VERSION,
-        udp_port,
-        mode: hello.mode,
-        fec: FecConfig {
-            scheme: FecScheme::Gf16,
-            // Static override pins it; otherwise start at the adaptive midpoint and resize from LossReports.
-            fec_percent: fec_static_override().unwrap_or(FEC_ADAPTIVE_START),
-            max_data_per_block: 4096,
-        },
-        // Largest even payload whose sealed datagram fits an unfragmented UDP packet on a
-        // 1500 MTU for this client's address family (1408 IPv4, 1388 IPv6 — v6 routers do
-        // not fragment). Order: jumbo re-proof, `PUNKTFUNK_WIRE_MTU`, a prior session's
-        // learned path budget, then this family default. See `wire_mtu.rs`.
-        shard_payload: shard_payload as u16,
-        encrypt: true,
-        key,
-        salt,
-        frames: match source {
-            Punktfunk1Source::Synthetic => frames,
-            Punktfunk1Source::Virtual => 0, // unbounded; client streams until we close
-        },
-        // Auto for the synthetic source (no compositor).
-        compositor: compositor
-            .map(|c| c.as_pref())
-            .unwrap_or(CompositorPref::Auto),
-        gamepad,
-        bitrate_kbps,
-        bit_depth,
-        // HDR verdict, not bit depth: 10-bit SDR is Main10 under BT.709 and must say SDR.
-        // Mastering metadata (ST.2086 + CLL) rides the 0xCE datagram.
-        color: if session_hdr {
-            ColorInfo::HDR10_BT2020_PQ
-        } else {
-            ColorInfo::SDR_BT709
-        },
-        chroma_format: chroma.idc(),
-        audio_channels,
-        // Negotiated codec; the client must not assume HEVC.
-        codec: codec_bit,
-        // Sequence-gated gamepad snapshots; capable clients send those, not per-transition events.
-        // Clipboard only when operator policy and a platform backend both exist.
-        host_caps: punktfunk_core::quic::HOST_CAP_GAMEPAD_STATE
-            | if pf_clipboard::cap_advertised() {
-                punktfunk_core::quic::HOST_CAP_CLIPBOARD
-            } else {
-                0
-            }
-            // Text injection only where the backend can type (SendInput UNICODE; wlroots keymap).
-            // Clients without the bit keep VK-synthesis for IME.
-            | if crate::inject::text_input_supported() {
-                punktfunk_core::quic::HOST_CAP_TEXT_INPUT
-            } else {
-                0
-            }
-            // Client turns its local renderer on only when it sees this bit; serve_session
-            // wires forwarding by reading the bit back.
-            | if cursor_forward(hello.client_caps, compositor, codec, bit_depth) {
-                punktfunk_core::quic::HOST_CAP_CURSOR
-            } else {
-                0
-            }
-            // Pen batches → per-session uinput tablet. Without the bit, clients fold pen into
-            // touch/pointer and `NativeClient::send_pen` refuses.
-            | if crate::inject::pen_supported() {
-                punktfunk_core::quic::HOST_CAP_PEN
-            } else {
-                0
-            }
-            // `0xD2` only when offered, budgeted, and not PCM: it is undefined on `0xD3` and
-            // the client has no PCM-side decoder for it. Stated here, not left to the audio thread.
-            | if !audio_plane.is_pcm()
-                && audio_budget(
-                    redundancy_offered(hello.client_caps),
-                    bitrate_kbps,
-                    audio_channels,
-                )
-                .redundancy
-            {
-                punktfunk_core::quic::HOST_CAP_AUDIO_RED
-            } else {
-                0
-            }
-            | if super::pad_audio::host_cap(hello.client_caps) {
-                punktfunk_core::quic::HOST_CAP_PAD_AUDIO
-            } else {
-                0
-            }
-            // Set only when the gate resolved to PCM, not "host could". `0x80` is the last
-            // `host_caps` bit; the next capability needs a second byte and an ABI bump.
-            | if audio_plane.is_pcm() {
-                punktfunk_core::quic::HOST_CAP_AUDIO_HIRES
-            } else {
-                0
-            },
-        // `0` on the standalone binary (no management API); the client then keeps its default.
-        mgmt_port: crate::mgmt::effective_port(),
-        // Mask and remaining lifetime from admission. Full-control permanent is `GRANT_ALL, 0`.
-        grants,
-        expires_in_secs,
-        // Cipher 0 keeps Welcome byte-identical to the pre-cipher form, unless a mgmt port
-        // forces the placeholder (`Welcome::encode`). Data plane reads `welcome.session_config`.
-        cipher: if chacha {
-            punktfunk_core::quic::CIPHER_CHACHA20_POLY1305
-        } else {
-            punktfunk_core::quic::CIPHER_AES_128_GCM
-        },
-        key_chacha,
-        // Resolved plane. Opus 48 kHz / 16-bit makes `Welcome::encode` omit the four fields
-        // so the Welcome stays byte-identical to the pre-hi-res form. Client opens from these,
-        // never from what it asked. `audio_frame_us` is `0` on Opus (fixed 5 ms).
-        audio_codec: audio_plane.codec,
-        audio_rate_hz: audio_plane.rate_hz,
-        audio_bits: audio_plane.bits,
-        audio_frame_us: audio_plane.frame_us,
-        // Idle-keepalive re-encodes are marked `USER_FLAG_REPEAT` so client ABR treats an
-        // unflagged AU as new content.
-        host_caps2: punktfunk_core::quic::HOST_CAP2_REPEAT_MARK
-            // Without the bit the client falls back to trackpad instead of sending contacts
-            // the injector cannot land (wlroots) or cannot create a device for (Windows < 1809).
-            | if crate::inject::touch_supported() {
-                punktfunk_core::quic::HOST_CAP2_TOUCH
-            } else {
-                0
-            },
-    }
-}
-
 /// Hello → Welcome → Start. Borrows the control streams; the caller keeps them for mid-stream
 /// renegotiation. `first` is the already-read first control message.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
@@ -758,8 +584,6 @@ pub(super) async fn negotiate(
     // Env/cfg only; pads are created lazily by the input thread.
     let gamepad = resolve_gamepad(hello.gamepad);
 
-    // Bitrate is resolved after depth + chroma: PyroWave's automatic ~bpp pin scales with both.
-
     let audio_channels = negotiate_audio_channels(&hello);
 
     let (bit_depth, session_hdr, chroma) =
@@ -840,31 +664,132 @@ pub(super) async fn negotiate(
         conn.max_datagram_size(),
     );
 
-    let welcome = build_welcome(
-        &hello,
-        WelcomeArgs {
-            source,
-            frames,
-            udp_port,
-            shard_payload,
-            key,
-            salt,
-            compositor,
-            gamepad,
-            bitrate_kbps,
-            bit_depth,
-            session_hdr,
-            chroma,
-            audio_channels,
-            codec,
-            codec_bit,
-            audio_plane,
-            grants,
-            expires_in_secs,
-            chacha,
-            key_chacha,
+    let welcome = Welcome {
+        abi_version: punktfunk_core::WIRE_VERSION,
+        udp_port,
+        mode: hello.mode,
+        fec: FecConfig {
+            scheme: FecScheme::Gf16,
+            // Static override pins it; otherwise start at the adaptive midpoint and resize from LossReports.
+            fec_percent: fec_static_override().unwrap_or(FEC_ADAPTIVE_START),
+            max_data_per_block: 4096,
         },
-    );
+        // Largest even payload whose sealed datagram fits an unfragmented UDP packet on a
+        // 1500 MTU for this client's address family (1408 IPv4, 1388 IPv6 — v6 routers do
+        // not fragment). Order: jumbo re-proof, `PUNKTFUNK_WIRE_MTU`, a prior session's
+        // learned path budget, then this family default. See `wire_mtu.rs`.
+        shard_payload: shard_payload as u16,
+        encrypt: true,
+        key,
+        salt,
+        frames: match source {
+            Punktfunk1Source::Synthetic => frames,
+            Punktfunk1Source::Virtual => 0, // unbounded; client streams until we close
+        },
+        // Auto for the synthetic source (no compositor).
+        compositor: compositor
+            .map(|c| c.as_pref())
+            .unwrap_or(CompositorPref::Auto),
+        gamepad,
+        bitrate_kbps,
+        bit_depth,
+        // HDR verdict, not bit depth: 10-bit SDR is Main10 under BT.709 and must say SDR.
+        // Mastering metadata (ST.2086 + CLL) rides the 0xCE datagram.
+        color: if session_hdr {
+            ColorInfo::HDR10_BT2020_PQ
+        } else {
+            ColorInfo::SDR_BT709
+        },
+        chroma_format: chroma.idc(),
+        audio_channels,
+        // Negotiated codec; the client must not assume HEVC.
+        codec: codec_bit,
+        // Sequence-gated gamepad snapshots; capable clients send those, not per-transition events.
+        // Clipboard only when operator policy and a platform backend both exist.
+        host_caps: punktfunk_core::quic::HOST_CAP_GAMEPAD_STATE
+            | if pf_clipboard::cap_advertised() {
+                punktfunk_core::quic::HOST_CAP_CLIPBOARD
+            } else {
+                0
+            }
+            // Text injection only where the backend can type (SendInput UNICODE; wlroots keymap).
+            // Clients without the bit keep VK-synthesis for IME.
+            | if crate::inject::text_input_supported() {
+                punktfunk_core::quic::HOST_CAP_TEXT_INPUT
+            } else {
+                0
+            }
+            // Client turns its local renderer on only when it sees this bit; serve_session
+            // wires forwarding by reading the bit back.
+            | if cursor_forward(hello.client_caps, compositor, codec, bit_depth) {
+                punktfunk_core::quic::HOST_CAP_CURSOR
+            } else {
+                0
+            }
+            // Pen batches → per-session uinput tablet. Without the bit, clients fold pen into
+            // touch/pointer and `NativeClient::send_pen` refuses.
+            | if crate::inject::pen_supported() {
+                punktfunk_core::quic::HOST_CAP_PEN
+            } else {
+                0
+            }
+            // `0xD2` only when offered, budgeted, and not PCM: it is undefined on `0xD3` and
+            // the client has no PCM-side decoder for it. Stated here, not left to the audio thread.
+            | if !audio_plane.is_pcm()
+                && audio_budget(
+                    redundancy_offered(hello.client_caps),
+                    bitrate_kbps,
+                    audio_channels,
+                )
+                .redundancy
+            {
+                punktfunk_core::quic::HOST_CAP_AUDIO_RED
+            } else {
+                0
+            }
+            | if super::pad_audio::host_cap(hello.client_caps) {
+                punktfunk_core::quic::HOST_CAP_PAD_AUDIO
+            } else {
+                0
+            }
+            // Set only when the gate resolved to PCM, not "host could". `0x80` is the last
+            // `host_caps` bit; the next capability needs a second byte and an ABI bump.
+            | if audio_plane.is_pcm() {
+                punktfunk_core::quic::HOST_CAP_AUDIO_HIRES
+            } else {
+                0
+            },
+        // `0` on the standalone binary (no management API); the client then keeps its default.
+        mgmt_port: crate::mgmt::effective_port(),
+        // Mask and remaining lifetime from admission. Full-control permanent is `GRANT_ALL, 0`.
+        grants,
+        expires_in_secs,
+        // Cipher 0 keeps Welcome byte-identical to the pre-cipher form, unless a mgmt port
+        // forces the placeholder (`Welcome::encode`). Data plane reads `welcome.session_config`.
+        cipher: if chacha {
+            punktfunk_core::quic::CIPHER_CHACHA20_POLY1305
+        } else {
+            punktfunk_core::quic::CIPHER_AES_128_GCM
+        },
+        key_chacha,
+        // Resolved plane. Opus 48 kHz / 16-bit makes `Welcome::encode` omit the four fields
+        // so the Welcome stays byte-identical to the pre-hi-res form. Client opens from these,
+        // never from what it asked. `audio_frame_us` is `0` on Opus (fixed 5 ms).
+        audio_codec: audio_plane.codec,
+        audio_rate_hz: audio_plane.rate_hz,
+        audio_bits: audio_plane.bits,
+        audio_frame_us: audio_plane.frame_us,
+        // Idle-keepalive re-encodes are marked `USER_FLAG_REPEAT` so client ABR treats an
+        // unflagged AU as new content.
+        host_caps2: punktfunk_core::quic::HOST_CAP2_REPEAT_MARK
+            // Without the bit the client falls back to trackpad instead of sending contacts
+            // the injector cannot land (wlroots) or cannot create a device for (Windows < 1809).
+            | if crate::inject::touch_supported() {
+                punktfunk_core::quic::HOST_CAP2_TOUCH
+            } else {
+                0
+            },
+    };
     io::write_msg(send, &welcome.encode()).await?;
     bringup.mark("welcome");
 

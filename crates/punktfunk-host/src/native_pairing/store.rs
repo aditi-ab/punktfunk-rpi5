@@ -263,20 +263,17 @@ mod tests {
 
     #[test]
     fn corrupt_store_files_open_empty() {
+        let dir = tempfile::tempdir().unwrap();
         let cases: [&[u8]; 3] = [b"", br#"{"clients":["#, b"not json"];
 
         for (index, contents) in cases.into_iter().enumerate() {
-            let path = std::env::temp_dir().join(format!(
-                "punktfunk-pairing-corrupt-{}-{index}.json",
-                std::process::id()
-            ));
+            let path = dir.path().join(format!("{index}.json"));
             std::fs::write(&path, contents).unwrap();
 
-            let store = TrustStore::open(Some(path.clone())).unwrap();
+            let store = TrustStore::open(Some(path)).unwrap();
 
             assert_eq!(store.count(), 0);
             assert!(store.list().is_empty());
-            let _ = std::fs::remove_file(path);
         }
     }
 }

@@ -389,9 +389,9 @@ mod tests {
         assert!(!gamescope_cursor_for(false));
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
     #[test]
-    fn cursor_rules_are_disabled_off_linux() {
+    fn cursor_rules_are_disabled_on_windows() {
         for cursor_forward in [false, true] {
             for gamescope in [false, true] {
                 assert!(!cursor_blend_for(
