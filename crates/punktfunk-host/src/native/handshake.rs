@@ -255,6 +255,376 @@ pub(super) fn cursor_forward(
     }
 }
 
+async fn negotiate_compositor(
+    source: Punktfunk1Source,
+    hello: &Hello,
+) -> Result<(
+    Option<crate::vdisplay::Compositor>,
+    Option<crate::vdisplay::GamescopeRoute>,
+)> {
+    // Resolve now so Welcome reports the backend we will drive. Synthetic has no compositor.
+    // Blocking probes → spawn_blocking.
+    let compositor = match source {
+        Punktfunk1Source::Virtual => {
+            let pref = hello.compositor;
+            // Dedicated gamescope only if the launch id resolves to a command; an unknown id
+            // must not spawn a blank "sleep infinity" gamescope. `launch_is_resolvable`, not
+            // `resolve_launch`: a plugin command is loopback I/O and this is the async path.
+            #[cfg(not(target_os = "windows"))]
+            let has_resolvable_launch = hello
+                .launch
+                .as_deref()
+                .is_some_and(crate::library::launch_is_resolvable);
+            #[cfg(target_os = "windows")]
+            let has_resolvable_launch = false;
+            let dedicated = crate::vdisplay::wants_dedicated_game_session(has_resolvable_launch);
+            Some(
+                tokio::task::spawn_blocking(move || resolve_compositor(pref, dedicated))
+                    .await
+                    .context("resolve compositor task")??,
+            )
+        }
+        Punktfunk1Source::Synthetic => None,
+    };
+    // Split the pair: compositor for Welcome/cursor; gamescope route as a value, not process env.
+    let gamescope_route = compositor.as_ref().and_then(|(_, r)| r.clone());
+    let compositor = compositor.map(|(c, _)| c);
+    Ok((compositor, gamescope_route))
+}
+
+fn negotiate_audio_channels(hello: &Hello) -> u8 {
+    // Capturer opens at this count (PipeWire pads silence; WASAPI AUTOCONVERTPCM up/downmixes).
+    // Welcome echoes the value the audio thread will encode.
+    let audio_channels = resolve_audio_channels(hello.audio_channels);
+    tracing::info!(
+        requested = hello.audio_channels,
+        resolved = audio_channels,
+        "audio channels"
+    );
+    audio_channels
+}
+
+fn negotiate_bitrate_kbps(
+    hello: &Hello,
+    codec: crate::encode::Codec,
+    chroma: crate::encode::ChromaFormat,
+    bit_depth: u8,
+) -> u32 {
+    // After depth + chroma: PyroWave Automatic is a ~bpp pin that scales with both.
+    let bitrate_kbps =
+        resolve_bitrate_kbps_for(codec, hello.bitrate_kbps, &hello.mode, chroma, bit_depth);
+    tracing::info!(
+        requested_kbps = hello.bitrate_kbps,
+        resolved_kbps = bitrate_kbps,
+        "encoder bitrate"
+    );
+    bitrate_kbps
+}
+
+async fn negotiate_video_format(
+    hello: &Hello,
+    codec: crate::encode::Codec,
+    compositor: Option<crate::vdisplay::Compositor>,
+) -> Result<(u8, bool, crate::encode::ChromaFormat)> {
+    // 10-bit only when host, client, codec, capture, and GPU all allow it. Resolved before
+    // Welcome so `color` matches the stream (a can't-10-bit GPU yields 8-bit SDR).
+    let host_wants_10bit = pf_host_config::config().ten_bit;
+    let client_supports_10bit = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_10BIT != 0;
+    // `VIDEO_CAP_HDR` is BT.2020 PQ. `VIDEO_CAP_10BIT` alone is 10-bit SDR (Main10, display untouched).
+    let client_wants_hdr = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_HDR != 0;
+    // Source-aware: Linux HDR depends on the compositor just resolved. Gamescope folds in
+    // `hdr_capture_failed(VirtualOutput)`; GameStream's rtsp.rs check has no twin here because
+    // that latch is per-source and this gate already used this session's source.
+    let capture_supports_hdr = crate::capture::capturer_supports_hdr_for(compositor);
+    // SDR-10: Windows IDD expands BGRA 8→10 (`Rgb10a2Sdr`); only direct-NVENC ingests that
+    // packed RGB. HEVC only — NVENC packed-RGB → 10-bit AV1 is unverified. Linux has no
+    // SDR-10 chain (`resolved_backend_ingests_rgb_444` is false off Windows).
+    let sdr10_chain_ok =
+        codec == crate::encode::Codec::H265 && crate::encode::resolved_backend_ingests_rgb_444();
+    let depth_reachable = (client_wants_hdr && capture_supports_hdr) || sdr10_chain_ok;
+    // Probe may open a tiny encoder; spawn_blocking, short-circuited behind the cheap gates.
+    let gpu_can_10bit =
+        if host_wants_10bit && client_supports_10bit && codec.supports_10bit() && depth_reachable {
+            tokio::task::spawn_blocking(move || crate::encode::can_encode_10bit(codec))
+                .await
+                .context("10-bit capability probe task")?
+        } else {
+            false
+        };
+    let bit_depth: u8 = if gpu_can_10bit { 10 } else { 8 };
+    // Colour label, capturer mandate, and vdisplay HDR all read this, never `bit_depth >= 10`
+    // (10-bit without it is SDR: BT.709 VUI, display untouched).
+    let session_hdr = gpu_can_10bit && client_wants_hdr && capture_supports_hdr;
+    tracing::info!(
+        bit_depth,
+        session_hdr,
+        host_wants_10bit,
+        client_supports_10bit,
+        client_wants_hdr,
+        capture_supports_hdr,
+        sdr10_chain_ok,
+        codec = ?codec,
+        gpu_can_10bit,
+        client_video_caps = hello.video_caps,
+        "encode bit depth"
+    );
+
+    // 4:4:4 only when host, client, ingest chain, and GPU all allow it. Resolved before
+    // Welcome so the client sizes its decoder from what we will actually emit.
+    let host_wants_444 = pf_host_config::config().four_four_four;
+    let client_supports_444 = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_444 != 0;
+    // Ingest chain, not capturer: Windows 4:4:4 needs direct-NVENC RGB ingest (AMF cannot;
+    // QSV/ffmpeg has no RGB 4:4:4 wiring). PyroWave does its own RGB→YCbCr; its gate is
+    // `can_encode_444`. HDR does not cost chroma (HEVC Main 4:4:4 10).
+    let ingest_chain_supports_444 = codec == crate::encode::Codec::PyroWave
+        || crate::capture::capturer_supports_444(crate::encode::resolved_backend_ingests_rgb_444());
+    // Probe opens a tiny encoder; spawn_blocking, short-circuited. A negative latches until
+    // restart — a GPU either supports HEVC 4:4:4 or it does not.
+    let gpu_supports_444 = if matches!(
+        codec,
+        crate::encode::Codec::H265 | crate::encode::Codec::PyroWave
+    ) && host_wants_444
+        && client_supports_444
+        && ingest_chain_supports_444
+    {
+        tokio::task::spawn_blocking(move || crate::encode::can_encode_444(codec))
+            .await
+            .context("4:4:4 capability probe task")?
+    } else {
+        false
+    };
+    // Client asked (VIDEO_CAP_444) but we still resolve 4:2:0: name the losing gate.
+    if host_wants_444 && client_supports_444 && !gpu_supports_444 {
+        let reason = if !matches!(
+            codec,
+            crate::encode::Codec::H265 | crate::encode::Codec::PyroWave
+        ) {
+            "the negotiated codec only carries 4:2:0 — 4:4:4 needs HEVC or PyroWave"
+        } else if !ingest_chain_supports_444 {
+            "this host's encoder backend can't ingest full chroma — 4:4:4 needs direct \
+             NVENC (NVIDIA) or the PyroWave codec"
+        } else {
+            "the GPU declined the 4:4:4 encode profile probe"
+        };
+        tracing::info!(reason, "4:4:4 requested but the session negotiates 4:2:0");
+    }
+    let chroma = if gpu_supports_444 {
+        crate::encode::ChromaFormat::Yuv444
+    } else {
+        crate::encode::ChromaFormat::Yuv420
+    };
+    // PyroWave RDO packs the block index in 16 bits; ~8K 4:4:4 overflows. Downgrade to 4:2:0
+    // before Welcome.
+    let chroma = if codec == crate::encode::Codec::PyroWave
+        && chroma.is_444()
+        && !crate::encode::pyrowave_mode_fits_rdo(hello.mode.width, hello.mode.height, true)
+    {
+        tracing::warn!(
+            mode = %format_args!("{}x{}", hello.mode.width, hello.mode.height),
+            "PyroWave 4:4:4 at this mode exceeds the rate controller's block-index range — \
+             negotiating 4:2:0"
+        );
+        crate::encode::ChromaFormat::Yuv420
+    } else {
+        chroma
+    };
+    tracing::info!(
+        chroma = ?chroma,
+        host_wants_444,
+        client_supports_444,
+        ingest_chain_supports_444,
+        "encode chroma"
+    );
+
+    // Linux 4:4:4 is CPU swscale → 8-bit `YUV444P`; a 10-bit session would silently encode
+    // 8-bit. Clamp depth before Welcome. Windows NVENC keeps 10 (Main 4:4:4 10 from RGB).
+    #[cfg(target_os = "linux")]
+    let bit_depth: u8 = if chroma.is_444() && bit_depth == 10 {
+        tracing::info!("4:4:4 on the Linux path encodes 8-bit YUV444P — resolving bit depth 8");
+        8
+    } else {
+        bit_depth
+    };
+    // Follows the depth clamp: an 8-bit stream is never labelled HDR.
+    let session_hdr = session_hdr && bit_depth == 10;
+
+    Ok((bit_depth, session_hdr, chroma))
+}
+
+struct WelcomeArgs {
+    source: Punktfunk1Source,
+    frames: u32,
+    udp_port: u16,
+    shard_payload: usize,
+    key: [u8; 16],
+    salt: [u8; 4],
+    compositor: Option<crate::vdisplay::Compositor>,
+    gamepad: GamepadPref,
+    bitrate_kbps: u32,
+    bit_depth: u8,
+    session_hdr: bool,
+    chroma: crate::encode::ChromaFormat,
+    audio_channels: u8,
+    codec: crate::encode::Codec,
+    codec_bit: u8,
+    audio_plane: AudioPlane,
+    grants: u32,
+    expires_in_secs: u32,
+    chacha: bool,
+    key_chacha: Option<[u8; 32]>,
+}
+
+fn build_welcome(hello: &Hello, args: WelcomeArgs) -> Welcome {
+    let WelcomeArgs {
+        source,
+        frames,
+        udp_port,
+        shard_payload,
+        key,
+        salt,
+        compositor,
+        gamepad,
+        bitrate_kbps,
+        bit_depth,
+        session_hdr,
+        chroma,
+        audio_channels,
+        codec,
+        codec_bit,
+        audio_plane,
+        grants,
+        expires_in_secs,
+        chacha,
+        key_chacha,
+    } = args;
+    Welcome {
+        abi_version: punktfunk_core::WIRE_VERSION,
+        udp_port,
+        mode: hello.mode,
+        fec: FecConfig {
+            scheme: FecScheme::Gf16,
+            // Static override pins it; otherwise start at the adaptive midpoint and resize from LossReports.
+            fec_percent: fec_static_override().unwrap_or(FEC_ADAPTIVE_START),
+            max_data_per_block: 4096,
+        },
+        // Largest even payload whose sealed datagram fits an unfragmented UDP packet on a
+        // 1500 MTU for this client's address family (1408 IPv4, 1388 IPv6 — v6 routers do
+        // not fragment). Order: jumbo re-proof, `PUNKTFUNK_WIRE_MTU`, a prior session's
+        // learned path budget, then this family default. See `wire_mtu.rs`.
+        shard_payload: shard_payload as u16,
+        encrypt: true,
+        key,
+        salt,
+        frames: match source {
+            Punktfunk1Source::Synthetic => frames,
+            Punktfunk1Source::Virtual => 0, // unbounded; client streams until we close
+        },
+        // Auto for the synthetic source (no compositor).
+        compositor: compositor
+            .map(|c| c.as_pref())
+            .unwrap_or(CompositorPref::Auto),
+        gamepad,
+        bitrate_kbps,
+        bit_depth,
+        // HDR verdict, not bit depth: 10-bit SDR is Main10 under BT.709 and must say SDR.
+        // Mastering metadata (ST.2086 + CLL) rides the 0xCE datagram.
+        color: if session_hdr {
+            ColorInfo::HDR10_BT2020_PQ
+        } else {
+            ColorInfo::SDR_BT709
+        },
+        chroma_format: chroma.idc(),
+        audio_channels,
+        // Negotiated codec; the client must not assume HEVC.
+        codec: codec_bit,
+        // Sequence-gated gamepad snapshots; capable clients send those, not per-transition events.
+        // Clipboard only when operator policy and a platform backend both exist.
+        host_caps: punktfunk_core::quic::HOST_CAP_GAMEPAD_STATE
+            | if pf_clipboard::cap_advertised() {
+                punktfunk_core::quic::HOST_CAP_CLIPBOARD
+            } else {
+                0
+            }
+            // Text injection only where the backend can type (SendInput UNICODE; wlroots keymap).
+            // Clients without the bit keep VK-synthesis for IME.
+            | if crate::inject::text_input_supported() {
+                punktfunk_core::quic::HOST_CAP_TEXT_INPUT
+            } else {
+                0
+            }
+            // Client turns its local renderer on only when it sees this bit; serve_session
+            // wires forwarding by reading the bit back.
+            | if cursor_forward(hello.client_caps, compositor, codec, bit_depth) {
+                punktfunk_core::quic::HOST_CAP_CURSOR
+            } else {
+                0
+            }
+            // Pen batches → per-session uinput tablet. Without the bit, clients fold pen into
+            // touch/pointer and `NativeClient::send_pen` refuses.
+            | if crate::inject::pen_supported() {
+                punktfunk_core::quic::HOST_CAP_PEN
+            } else {
+                0
+            }
+            // `0xD2` only when offered, budgeted, and not PCM: it is undefined on `0xD3` and
+            // the client has no PCM-side decoder for it. Stated here, not left to the audio thread.
+            | if !audio_plane.is_pcm()
+                && audio_budget(
+                    redundancy_offered(hello.client_caps),
+                    bitrate_kbps,
+                    audio_channels,
+                )
+                .redundancy
+            {
+                punktfunk_core::quic::HOST_CAP_AUDIO_RED
+            } else {
+                0
+            }
+            | if super::pad_audio::host_cap(hello.client_caps) {
+                punktfunk_core::quic::HOST_CAP_PAD_AUDIO
+            } else {
+                0
+            }
+            // Set only when the gate resolved to PCM, not "host could". `0x80` is the last
+            // `host_caps` bit; the next capability needs a second byte and an ABI bump.
+            | if audio_plane.is_pcm() {
+                punktfunk_core::quic::HOST_CAP_AUDIO_HIRES
+            } else {
+                0
+            },
+        // `0` on the standalone binary (no management API); the client then keeps its default.
+        mgmt_port: crate::mgmt::effective_port(),
+        // Mask and remaining lifetime from admission. Full-control permanent is `GRANT_ALL, 0`.
+        grants,
+        expires_in_secs,
+        // Cipher 0 keeps Welcome byte-identical to the pre-cipher form, unless a mgmt port
+        // forces the placeholder (`Welcome::encode`). Data plane reads `welcome.session_config`.
+        cipher: if chacha {
+            punktfunk_core::quic::CIPHER_CHACHA20_POLY1305
+        } else {
+            punktfunk_core::quic::CIPHER_AES_128_GCM
+        },
+        key_chacha,
+        // Resolved plane. Opus 48 kHz / 16-bit makes `Welcome::encode` omit the four fields
+        // so the Welcome stays byte-identical to the pre-hi-res form. Client opens from these,
+        // never from what it asked. `audio_frame_us` is `0` on Opus (fixed 5 ms).
+        audio_codec: audio_plane.codec,
+        audio_rate_hz: audio_plane.rate_hz,
+        audio_bits: audio_plane.bits,
+        audio_frame_us: audio_plane.frame_us,
+        // Idle-keepalive re-encodes are marked `USER_FLAG_REPEAT` so client ABR treats an
+        // unflagged AU as new content.
+        host_caps2: punktfunk_core::quic::HOST_CAP2_REPEAT_MARK
+            // Without the bit the client falls back to trackpad instead of sending contacts
+            // the injector cannot land (wlroots) or cannot create a device for (Windows < 1809).
+            | if crate::inject::touch_supported() {
+                punktfunk_core::quic::HOST_CAP2_TOUCH
+            } else {
+                0
+            },
+    }
+}
+
 /// Hello → Welcome → Start. Borrows the control streams; the caller keeps them for mid-stream
 /// renegotiation. `first` is the already-read first control message.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
@@ -380,33 +750,7 @@ pub(super) async fn negotiate(
     crate::encode::validate_dimensions(codec, hello.mode.width, hello.mode.height)
         .context("client-requested mode")?;
 
-    // Resolve now so Welcome reports the backend we will drive. Synthetic has no compositor.
-    // Blocking probes → spawn_blocking.
-    let compositor = match source {
-        Punktfunk1Source::Virtual => {
-            let pref = hello.compositor;
-            // Dedicated gamescope only if the launch id resolves to a command; an unknown id
-            // must not spawn a blank "sleep infinity" gamescope. `launch_is_resolvable`, not
-            // `resolve_launch`: a plugin command is loopback I/O and this is the async path.
-            #[cfg(not(target_os = "windows"))]
-            let has_resolvable_launch = hello
-                .launch
-                .as_deref()
-                .is_some_and(crate::library::launch_is_resolvable);
-            #[cfg(target_os = "windows")]
-            let has_resolvable_launch = false;
-            let dedicated = crate::vdisplay::wants_dedicated_game_session(has_resolvable_launch);
-            Some(
-                tokio::task::spawn_blocking(move || resolve_compositor(pref, dedicated))
-                    .await
-                    .context("resolve compositor task")??,
-            )
-        }
-        Punktfunk1Source::Synthetic => None,
-    };
-    // Split the pair: compositor for Welcome/cursor; gamescope route as a value, not process env.
-    let gamescope_route = compositor.as_ref().and_then(|(_, r)| r.clone());
-    let compositor = compositor.map(|(c, _)| c);
+    let (compositor, gamescope_route) = negotiate_compositor(source, &hello).await?;
 
     // Library launch is resolved after Welcome into `SessionContext.launch`. Do not write
     // `PUNKTFUNK_GAMESCOPE_APP`: process env races concurrent sessions and only gamescope's bare spawn reads it.
@@ -416,145 +760,12 @@ pub(super) async fn negotiate(
 
     // Bitrate is resolved after depth + chroma: PyroWave's automatic ~bpp pin scales with both.
 
-    // Capturer opens at this count (PipeWire pads silence; WASAPI AUTOCONVERTPCM up/downmixes).
-    // Welcome echoes the value the audio thread will encode.
-    let audio_channels = resolve_audio_channels(hello.audio_channels);
-    tracing::info!(
-        requested = hello.audio_channels,
-        resolved = audio_channels,
-        "audio channels"
-    );
+    let audio_channels = negotiate_audio_channels(&hello);
 
-    // 10-bit only when host, client, codec, capture, and GPU all allow it. Resolved before
-    // Welcome so `color` matches the stream (a can't-10-bit GPU yields 8-bit SDR).
-    let host_wants_10bit = pf_host_config::config().ten_bit;
-    let client_supports_10bit = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_10BIT != 0;
-    // `VIDEO_CAP_HDR` is BT.2020 PQ. `VIDEO_CAP_10BIT` alone is 10-bit SDR (Main10, display untouched).
-    let client_wants_hdr = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_HDR != 0;
-    // Source-aware: Linux HDR depends on the compositor just resolved. Gamescope folds in
-    // `hdr_capture_failed(VirtualOutput)`; GameStream's rtsp.rs check has no twin here because
-    // that latch is per-source and this gate already used this session's source.
-    let capture_supports_hdr = crate::capture::capturer_supports_hdr_for(compositor);
-    // SDR-10: Windows IDD expands BGRA 8→10 (`Rgb10a2Sdr`); only direct-NVENC ingests that
-    // packed RGB. HEVC only — NVENC packed-RGB → 10-bit AV1 is unverified. Linux has no
-    // SDR-10 chain (`resolved_backend_ingests_rgb_444` is false off Windows).
-    let sdr10_chain_ok =
-        codec == crate::encode::Codec::H265 && crate::encode::resolved_backend_ingests_rgb_444();
-    let depth_reachable = (client_wants_hdr && capture_supports_hdr) || sdr10_chain_ok;
-    // Probe may open a tiny encoder; spawn_blocking, short-circuited behind the cheap gates.
-    let gpu_can_10bit =
-        if host_wants_10bit && client_supports_10bit && codec.supports_10bit() && depth_reachable {
-            tokio::task::spawn_blocking(move || crate::encode::can_encode_10bit(codec))
-                .await
-                .context("10-bit capability probe task")?
-        } else {
-            false
-        };
-    let bit_depth: u8 = if gpu_can_10bit { 10 } else { 8 };
-    // Colour label, capturer mandate, and vdisplay HDR all read this, never `bit_depth >= 10`
-    // (10-bit without it is SDR: BT.709 VUI, display untouched).
-    let session_hdr = gpu_can_10bit && client_wants_hdr && capture_supports_hdr;
-    tracing::info!(
-        bit_depth,
-        session_hdr,
-        host_wants_10bit,
-        client_supports_10bit,
-        client_wants_hdr,
-        capture_supports_hdr,
-        sdr10_chain_ok,
-        codec = ?codec,
-        gpu_can_10bit,
-        client_video_caps = hello.video_caps,
-        "encode bit depth"
-    );
+    let (bit_depth, session_hdr, chroma) =
+        negotiate_video_format(&hello, codec, compositor).await?;
 
-    // 4:4:4 only when host, client, ingest chain, and GPU all allow it. Resolved before
-    // Welcome so the client sizes its decoder from what we will actually emit.
-    let host_wants_444 = pf_host_config::config().four_four_four;
-    let client_supports_444 = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_444 != 0;
-    // Ingest chain, not capturer: Windows 4:4:4 needs direct-NVENC RGB ingest (AMF cannot;
-    // QSV/ffmpeg has no RGB 4:4:4 wiring). PyroWave does its own RGB→YCbCr; its gate is
-    // `can_encode_444`. HDR does not cost chroma (HEVC Main 4:4:4 10).
-    let ingest_chain_supports_444 = codec == crate::encode::Codec::PyroWave
-        || crate::capture::capturer_supports_444(crate::encode::resolved_backend_ingests_rgb_444());
-    // Probe opens a tiny encoder; spawn_blocking, short-circuited. A negative latches until
-    // restart — a GPU either supports HEVC 4:4:4 or it does not.
-    let gpu_supports_444 = if matches!(
-        codec,
-        crate::encode::Codec::H265 | crate::encode::Codec::PyroWave
-    ) && host_wants_444
-        && client_supports_444
-        && ingest_chain_supports_444
-    {
-        tokio::task::spawn_blocking(move || crate::encode::can_encode_444(codec))
-            .await
-            .context("4:4:4 capability probe task")?
-    } else {
-        false
-    };
-    // Client asked (VIDEO_CAP_444) but we still resolve 4:2:0: name the losing gate.
-    if host_wants_444 && client_supports_444 && !gpu_supports_444 {
-        let reason = if !matches!(
-            codec,
-            crate::encode::Codec::H265 | crate::encode::Codec::PyroWave
-        ) {
-            "the negotiated codec only carries 4:2:0 — 4:4:4 needs HEVC or PyroWave"
-        } else if !ingest_chain_supports_444 {
-            "this host's encoder backend can't ingest full chroma — 4:4:4 needs direct \
-             NVENC (NVIDIA) or the PyroWave codec"
-        } else {
-            "the GPU declined the 4:4:4 encode profile probe"
-        };
-        tracing::info!(reason, "4:4:4 requested but the session negotiates 4:2:0");
-    }
-    let chroma = if gpu_supports_444 {
-        crate::encode::ChromaFormat::Yuv444
-    } else {
-        crate::encode::ChromaFormat::Yuv420
-    };
-    // PyroWave RDO packs the block index in 16 bits; ~8K 4:4:4 overflows. Downgrade to 4:2:0
-    // before Welcome.
-    let chroma = if codec == crate::encode::Codec::PyroWave
-        && chroma.is_444()
-        && !crate::encode::pyrowave_mode_fits_rdo(hello.mode.width, hello.mode.height, true)
-    {
-        tracing::warn!(
-            mode = %format_args!("{}x{}", hello.mode.width, hello.mode.height),
-            "PyroWave 4:4:4 at this mode exceeds the rate controller's block-index range — \
-             negotiating 4:2:0"
-        );
-        crate::encode::ChromaFormat::Yuv420
-    } else {
-        chroma
-    };
-    tracing::info!(
-        chroma = ?chroma,
-        host_wants_444,
-        client_supports_444,
-        ingest_chain_supports_444,
-        "encode chroma"
-    );
-
-    // Linux 4:4:4 is CPU swscale → 8-bit `YUV444P`; a 10-bit session would silently encode
-    // 8-bit. Clamp depth before Welcome. Windows NVENC keeps 10 (Main 4:4:4 10 from RGB).
-    #[cfg(target_os = "linux")]
-    let bit_depth: u8 = if chroma.is_444() && bit_depth == 10 {
-        tracing::info!("4:4:4 on the Linux path encodes 8-bit YUV444P — resolving bit depth 8");
-        8
-    } else {
-        bit_depth
-    };
-    // Follows the depth clamp: an 8-bit stream is never labelled HDR.
-    let session_hdr = session_hdr && bit_depth == 10;
-
-    // After depth + chroma: PyroWave Automatic is a ~bpp pin that scales with both.
-    let bitrate_kbps =
-        resolve_bitrate_kbps_for(codec, hello.bitrate_kbps, &hello.mode, chroma, bit_depth);
-    tracing::info!(
-        requested_kbps = hello.bitrate_kbps,
-        resolved_kbps = bitrate_kbps,
-        "encoder bitrate"
-    );
+    let bitrate_kbps = negotiate_bitrate_kbps(&hello, codec, chroma, bit_depth);
 
     // Hold the socket through streaming — no bind→read→drop→rebind race on a fixed port.
     // Bound to this connection's local IP, not wildcard: the client accepts video only from
@@ -629,132 +840,31 @@ pub(super) async fn negotiate(
         conn.max_datagram_size(),
     );
 
-    let welcome = Welcome {
-        abi_version: punktfunk_core::WIRE_VERSION,
-        udp_port,
-        mode: hello.mode,
-        fec: FecConfig {
-            scheme: FecScheme::Gf16,
-            // Static override pins it; otherwise start at the adaptive midpoint and resize from LossReports.
-            fec_percent: fec_static_override().unwrap_or(FEC_ADAPTIVE_START),
-            max_data_per_block: 4096,
+    let welcome = build_welcome(
+        &hello,
+        WelcomeArgs {
+            source,
+            frames,
+            udp_port,
+            shard_payload,
+            key,
+            salt,
+            compositor,
+            gamepad,
+            bitrate_kbps,
+            bit_depth,
+            session_hdr,
+            chroma,
+            audio_channels,
+            codec,
+            codec_bit,
+            audio_plane,
+            grants,
+            expires_in_secs,
+            chacha,
+            key_chacha,
         },
-        // Largest even payload whose sealed datagram fits an unfragmented UDP packet on a
-        // 1500 MTU for this client's address family (1408 IPv4, 1388 IPv6 — v6 routers do
-        // not fragment). Order: jumbo re-proof, `PUNKTFUNK_WIRE_MTU`, a prior session's
-        // learned path budget, then this family default. See `wire_mtu.rs`.
-        shard_payload: shard_payload as u16,
-        encrypt: true,
-        key,
-        salt,
-        frames: match source {
-            Punktfunk1Source::Synthetic => frames,
-            Punktfunk1Source::Virtual => 0, // unbounded; client streams until we close
-        },
-        // Auto for the synthetic source (no compositor).
-        compositor: compositor
-            .map(|c| c.as_pref())
-            .unwrap_or(CompositorPref::Auto),
-        gamepad,
-        bitrate_kbps,
-        bit_depth,
-        // HDR verdict, not bit depth: 10-bit SDR is Main10 under BT.709 and must say SDR.
-        // Mastering metadata (ST.2086 + CLL) rides the 0xCE datagram.
-        color: if session_hdr {
-            ColorInfo::HDR10_BT2020_PQ
-        } else {
-            ColorInfo::SDR_BT709
-        },
-        chroma_format: chroma.idc(),
-        audio_channels,
-        // Negotiated codec; the client must not assume HEVC.
-        codec: codec_bit,
-        // Sequence-gated gamepad snapshots; capable clients send those, not per-transition events.
-        // Clipboard only when operator policy and a platform backend both exist.
-        host_caps: punktfunk_core::quic::HOST_CAP_GAMEPAD_STATE
-            | if pf_clipboard::cap_advertised() {
-                punktfunk_core::quic::HOST_CAP_CLIPBOARD
-            } else {
-                0
-            }
-            // Text injection only where the backend can type (SendInput UNICODE; wlroots keymap).
-            // Clients without the bit keep VK-synthesis for IME.
-            | if crate::inject::text_input_supported() {
-                punktfunk_core::quic::HOST_CAP_TEXT_INPUT
-            } else {
-                0
-            }
-            // Client turns its local renderer on only when it sees this bit; serve_session
-            // wires forwarding by reading the bit back.
-            | if cursor_forward(hello.client_caps, compositor, codec, bit_depth) {
-                punktfunk_core::quic::HOST_CAP_CURSOR
-            } else {
-                0
-            }
-            // Pen batches → per-session uinput tablet. Without the bit, clients fold pen into
-            // touch/pointer and `NativeClient::send_pen` refuses.
-            | if crate::inject::pen_supported() {
-                punktfunk_core::quic::HOST_CAP_PEN
-            } else {
-                0
-            }
-            // `0xD2` only when offered, budgeted, and not PCM: it is undefined on `0xD3` and
-            // the client has no PCM-side decoder for it. Stated here, not left to the audio thread.
-            | if !audio_plane.is_pcm()
-                && audio_budget(
-                    redundancy_offered(hello.client_caps),
-                    bitrate_kbps,
-                    audio_channels,
-                )
-                .redundancy
-            {
-                punktfunk_core::quic::HOST_CAP_AUDIO_RED
-            } else {
-                0
-            }
-            | if super::pad_audio::host_cap(hello.client_caps) {
-                punktfunk_core::quic::HOST_CAP_PAD_AUDIO
-            } else {
-                0
-            }
-            // Set only when the gate resolved to PCM, not "host could". `0x80` is the last
-            // `host_caps` bit; the next capability needs a second byte and an ABI bump.
-            | if audio_plane.is_pcm() {
-                punktfunk_core::quic::HOST_CAP_AUDIO_HIRES
-            } else {
-                0
-            },
-        // `0` on the standalone binary (no management API); the client then keeps its default.
-        mgmt_port: crate::mgmt::effective_port(),
-        // Mask and remaining lifetime from admission. Full-control permanent is `GRANT_ALL, 0`.
-        grants,
-        expires_in_secs,
-        // Cipher 0 keeps Welcome byte-identical to the pre-cipher form, unless a mgmt port
-        // forces the placeholder (`Welcome::encode`). Data plane reads `welcome.session_config`.
-        cipher: if chacha {
-            punktfunk_core::quic::CIPHER_CHACHA20_POLY1305
-        } else {
-            punktfunk_core::quic::CIPHER_AES_128_GCM
-        },
-        key_chacha,
-        // Resolved plane. Opus 48 kHz / 16-bit makes `Welcome::encode` omit the four fields
-        // so the Welcome stays byte-identical to the pre-hi-res form. Client opens from these,
-        // never from what it asked. `audio_frame_us` is `0` on Opus (fixed 5 ms).
-        audio_codec: audio_plane.codec,
-        audio_rate_hz: audio_plane.rate_hz,
-        audio_bits: audio_plane.bits,
-        audio_frame_us: audio_plane.frame_us,
-        // Idle-keepalive re-encodes are marked `USER_FLAG_REPEAT` so client ABR treats an
-        // unflagged AU as new content.
-        host_caps2: punktfunk_core::quic::HOST_CAP2_REPEAT_MARK
-            // Without the bit the client falls back to trackpad instead of sending contacts
-            // the injector cannot land (wlroots) or cannot create a device for (Windows < 1809).
-            | if crate::inject::touch_supported() {
-                punktfunk_core::quic::HOST_CAP2_TOUCH
-            } else {
-                0
-            },
-    };
+    );
     io::write_msg(send, &welcome.encode()).await?;
     bringup.mark("welcome");
 
