@@ -1,49 +1,20 @@
-//! [`VkH265Decoder`]: the assembled native H.265 decoder — [`crate::decoder`] one
-//! codec over, over pf-bitstream's H.265 planner and M3's CPU half.
+//! [`VkH265Decoder`]: native Vulkan Video H.265 decode over pf-bitstream's planner.
 //!
-//! Per AU: `plan_au` → `plan_to_vk_h265` → slices-only upload into the bitstream
-//! ring → record (barriers, `vkCmdBeginVideoCodingKHR` with every bound DPB slot,
-//! the one-time session RESET control, a caps-gated `RESULT_STATUS_ONLY` query
-//! bracketing `vkCmdDecodeVideoKHR`) → submit on the decode queue under the
-//! caller's [`QueueLock`] with a per-image timeline signal.
+//! Per AU: `plan_au` → `plan_to_vk_h265` → slices-only ring upload → record
+//! (barriers, `vkCmdBeginVideoCodingKHR` with every bound DPB slot, one-shot
+//! session RESET, a caps-gated `RESULT_STATUS_ONLY` query around
+//! `vkCmdDecodeVideoKHR`) → submit on the decode queue under the caller's
+//! [`QueueLock`] with a per-image timeline signal.
 //!
-//! Everything codec-agnostic is SHARED with the H.264 decoder rather than
-//! re-implemented: the picture pool and its zero-copy hand-off contract
-//! ([`crate::images`]), the bitstream ring and its slices-only packing, the op ring
-//! (command buffers + status queries), the pending/ready/graveyard bookkeeping,
-//! and `settle_dpb`/`build_frame` from [`crate::decoder`]. What is genuinely
-//! H.265's own lives here:
+//! Picture format is the stream's ([`H265ProfileKey`]): Main → NV12, Main 10 →
+//! P010, RExt 4:4:4 → two-plane 4:4:4. Refuse a combination the device cannot
+//! host before a session exists. `RefPicSetStCurr*`/`LtCurr` name DPB slot
+//! indices — bind every referenced slot or fail closed ([`crate::pic_h265`]).
+//! Slice offsets are rebased onto [`pack_slices`] output (VCL only, three-byte
+//! Annex-B prefix). A RASL after an open-GOP CRA is not an error (8.1.3 NOTE).
 //!
-//! - **The picture format is the stream's, not a constant.** Main decodes to NV12,
-//!   Main 10 to P010, RExt 4:4:4 to the two-plane 4:4:4 formats — and the same
-//!   facts shape the Vulkan profile every object is created against
-//!   ([`H265ProfileKey`]). A device that cannot host the combination is refused
-//!   BEFORE a session exists, so the ladder demotes cleanly.
-//! - **Every referenced slot must be BOUND by this decode op.**
-//!   `StdVideoDecodeH265PictureInfo`'s `RefPicSetStCurrBefore`/`StCurrAfter`/
-//!   `LtCurr` arrays name DPB SLOT INDICES ([`crate::pic_h265`] builds them, and
-//!   its `DecodePlanVkH265::std_pic` docs carry the full argument for why they are
-//!   slots rather than positions in the reference list). The recording below lays
-//!   the op's references out in exactly [`DecodePlanVkH265::refs`] order — the set
-//!   of slots those arrays can name — and FAILS CLOSED if any of them has no bound
-//!   image: a named slot the op does not bind is unresolvable for the hardware.
-//!   (H.264 has no such arrays and only traces the case.)
-//! - **Slice SEGMENT offsets, rebased and prefix-normalised.** The plan's offsets
-//!   are AU-relative and start-code-inclusive; the ring carries the slice NALUs
-//!   ALONE (non-VCL NALUs inside the decode range hang VCN firmware — the
-//!   `vcn_unified_0` ring timeout), so `pSliceSegmentOffsets` gets
-//!   [`pack_slices`]' ([`crate::ring`]) output, which also trims each segment to a
-//!   three-byte Annex-B prefix so drivers that reach the slice header by a fixed
-//!   `+3 +2` skip land on it.
-//! - **RASL skips are not failures.** A RASL picture after an open-GOP CRA join is
-//!   undecodable by definition (8.1.3 NOTE); [`VkH265Decoder::decode`] answers it
-//!   like any other decode that produced no new picture — the next frame already
-//!   queued, or `None` — leaving the planner and the DPB untouched. No re-anchor,
-//!   no keyframe request: the very next AU plans normally.
-//!
-//! Codec dispatch (which decoder a stream gets) is the client wiring's job, not
-//! this crate's: the public surface here mirrors [`crate::VkH264Decoder`]
-//! method-for-method so the dispatch is a two-arm enum.
+//! Pool, ring, op ring, pending/ready/graveyard, and `settle_dpb`/`build_frame`
+//! are shared with [`crate::VkH264Decoder`]. Codec dispatch is the client's.
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
@@ -96,81 +67,50 @@ use crate::session_h265::VideoSessionH265;
 use crate::session_h265::VpsSource;
 use crate::slots::SlotMap;
 
-/// Everything tied to ONE H.265 session generation. A stream renegotiation
-/// (extent, DPB depth, profile — including a bit-depth or chroma-format switch)
-/// retires it and builds fresh.
+/// One H.265 session generation. Extent, DPB depth, or profile change retires it.
 struct SessionStateH265 {
     session: VideoSessionH265,
     slots: SlotMap,
-    /// Distinct mode's reference-only DPB backing; `None` in coincide mode (the
-    /// picture pool backs the DPB there).
+    /// Distinct-mode reference DPB. `None` in coincide mode (the picture pool
+    /// backs those slots).
     dpb: Option<DpbPool>,
     pool: PicturePool,
     ring: BitstreamRing,
     ops: OpRing,
-    /// Last-known Std reference info per DPB slot — `vkCmdBeginVideoCodingKHR`
-    /// wants codec reference info for EVERY bound slot, including ones this AU's
-    /// RPS does not reference; refreshed from each plan's setup/ref entries so
-    /// marking transitions (short-term → long-term promotion, which in HEVC only
-    /// ever happens through a LATER picture's `RefPicSetLtCurr`) propagate.
+    /// Last Std reference info per DPB slot. `vkCmdBeginVideoCodingKHR` wants
+    /// codec info for every bound slot, including ones this AU does not
+    /// reference. HEVC long-term promotion arrives only via a later picture's
+    /// `RefPicSetLtCurr`, so the cache is refreshed from each plan.
     slot_refs: Vec<Option<hh::StdVideoDecodeH265ReferenceInfo>>,
-    /// Coincide mode: which pool image each DPB slot currently binds (rebound at
-    /// every activation — the decoupling that keeps delivered images safe).
+    /// Coincide mode: pool image currently bound to each DPB slot. Rebound at
+    /// every activation so a delivered image is never a live decode target.
     slot_image: Vec<Option<usize>>,
     /// Per command-buffer completion tokens (reuse gate).
     cmd_marks: Vec<Option<(vk::Semaphore, u64)>>,
-    /// Per query-slot submission ordinals (staleness validation).
+    /// Per query-slot submission ordinals (staleness check).
     query_marks: Vec<u64>,
-    /// Submissions recorded on this session (cmd/query indexing).
     submitted: u64,
-    /// The newest submission's completion token (session drain).
+    /// Newest submission's completion token (session drain).
     last_submit: Option<(vk::Semaphore, u64)>,
-    /// The STREAM's coded extent (renegotiation comparison).
+    /// Stream coded extent (renegotiation comparison).
     coded_extent: vk::Extent2D,
-    /// The granularity-aligned allocation extent (picture resources + frames).
+    /// Granularity-aligned allocation extent (picture resources and frames).
     image_extent: vk::Extent2D,
 }
 
-/// The post-failure recovery latch: set when an AU failed after its planning had
-/// already advanced, consumed by the next `decode`, which flushes to the next
-/// IRAP before planning anything new.
+/// Set when an AU fails after planning has already advanced. The next `decode`
+/// consumes it and flushes to the next IRAP before planning anything new.
 ///
-/// Why this exists at all — the fail-closed/recover split:
+/// Fail closed: `RefPicSetStCurr*`/`LtCurr` are indices into this op's
+/// reference array, so dropping a missing binding re-points every later index
+/// at the wrong picture. By the time that error returns, `plan_to_vk_h265` has
+/// already mutated [`SlotMap`] and coincide sync has cleared the setup image,
+/// so planner and slots both claim picture N is resident with no image holding
+/// it — every later AU then fails [`build_scope`] with `UnboundReferenceSlot`.
 ///
-/// This decoder FAILS CLOSED, and that stays: when an AU cannot be carried
-/// through to a submitted decode, it returns an error rather than substituting a
-/// reference or decoding against a slot whose image is gone. The structural argument
-/// is that `StdVideoDecodeH265PictureInfo`'s
-/// `RefPicSetStCurrBefore`/`StCurrAfter`/`LtCurr` arrays hold INDICES into the
-/// decode op's reference array — dropping one entry re-points every later index
-/// at the wrong picture, which is the corruption-hiding class this crate refuses.
-///
-/// ⚠ H.264 used to soft-degrade here (trace the missing binding, drop that reference,
-/// decode anyway) on the grounds that it carries no such index arrays. It now fails
-/// closed and carries this same latch: the arrays were never the point, the OUTPUT
-/// was. A P-picture decoded against a reference that was never bound is a gray plate
-/// with motion painted over it, and because the planner raises no warning for it, that
-/// frame reached the screen and cleared the consumer's demotion streak. Both codecs
-/// now fail closed, and both recover through this latch rather than wedging.
-///
-/// But failing closed once must not wedge the stream FOREVER, and without this
-/// latch it did: by the time an AU reaches a failure exit, `plan_to_vk_h265` has
-/// already mutated the [`SlotMap`] (releases + the setup assignment) and the
-/// coincide binding sync has already cleared the setup slot's image binding. The
-/// planner and the slot map then both believe picture N is resident while no
-/// image holds it, so every later AU referencing N fails in
-/// [`build_scope`] with `UnboundReferenceSlot` — a transient consumer
-/// backpressure (`NoFreeSlot` on AU N) turned into a permanently dead stream.
-///
-/// The recovery is a FLUSH TO THE NEXT IRAP, not H.264-style reference
-/// substitution: `H265Planner::flush` drops the whole DPB and refuses everything
-/// until the next IRAP, this decoder resets the slot ledger and image bindings to
-/// match, and the integration layer — which already sets `want_keyframe` on EVERY
-/// decode error — has an IDR on the way. So the stream re-anchors on real,
-/// complete data instead of resuming over a DPB nobody can vouch for.
-///
-/// Its own type (the [`crate::session::ResetArm`] idiom one module over) so the
-/// latch/consume cycle is unit-testable without a live device.
+/// Recovery is a flush to the next IRAP (`H265Planner::flush` plus
+/// [`reset_slot_bindings`]), not reference substitution. Own type so the
+/// latch/consume cycle is testable without a device ([`crate::session::ResetArm`]).
 #[derive(Debug, Default)]
 pub(crate) struct RecoveryLatch(bool);
 
@@ -181,8 +121,8 @@ impl RecoveryLatch {
         self.0 = true;
     }
 
-    /// Whether recovery is owed, CLEARING the latch — the recovery runs once per
-    /// failure run, not on every later decode.
+    /// Whether recovery is owed, clearing the latch — once per failure run, not
+    /// on every later decode.
     pub(crate) fn take(&mut self) -> bool {
         std::mem::take(&mut self.0)
     }
@@ -193,74 +133,62 @@ impl RecoveryLatch {
     }
 }
 
-/// The native Vulkan Video H.265 decoder. Mirrors [`crate::VkH264Decoder`]'s
-/// public surface exactly.
+/// Native Vulkan Video H.265 decoder. Public surface matches [`crate::VkH264Decoder`].
 pub struct VkH265Decoder {
     dev: DecodeDevice,
     lock: Box<dyn QueueLock>,
     planner: H265Planner,
-    /// Caps per profile key, queried once per profile (a Main→Main 10 switch is a
-    /// different key and re-queries).
+    /// Caps per profile key. A Main→Main 10 switch is a different key and re-queries.
     caps: Option<(H265ProfileKey, DecodeCaps)>,
     state: Option<SessionStateH265>,
-    /// Decoded pictures awaiting their planner output verdict, keyed by [`PicId`].
+    /// Pictures awaiting their planner output verdict, keyed by [`PicId`].
     pending: BTreeMap<PicId, PendingPic>,
-    /// Display-ready frames not yet handed out.
     ready: VecDeque<DecodedVkFrame>,
-    /// Retired generations' pools with consumer-held images (die on their last
-    /// release token).
+    /// Retired generations' pools with consumer-held images (die on last release).
     graveyard: Vec<RetiredPool>,
-    /// The most recent plan's warnings ([`Self::take_warnings`]).
+    /// Most recent plan's warnings ([`Self::take_warnings`]).
     last_warnings: Vec<PlanWarning>,
-    /// The outstanding recovery point SEI, if any — see [`crate::recovery`].
-    /// Named apart from [`Self::recovery`], which is this decoder's DPB-recovery
-    /// latch: the two are unrelated (one is a fact about the stream's prediction
-    /// structure, the other about this decoder's own wedged state).
+    /// Outstanding recovery-point SEI ([`crate::recovery`]). Named apart from
+    /// [`Self::recovery`]: stream prediction structure vs this decoder's wedged
+    /// DPB state — unrelated.
     recovery_watch: crate::recovery::RecoveryWatch,
-    /// Pictures planned so far — stamped onto each one as
-    /// [`DecodedVkFrame::decode_order`]. Survives session rebuilds for the same
-    /// reason the watch does.
+    /// Pictures planned so far, stamped as [`DecodedVkFrame::decode_order`].
+    /// Survives session rebuilds (it describes the stream, not the Vulkan objects).
     decoded: u64,
     /// Session generation: bumped on every rebuild, stamped into frames.
     generation: u64,
     device_lost: bool,
     /// Recovery owed after a failed AU whose planning had already advanced
-    /// ([`RecoveryLatch`] docs for the whole argument).
+    /// ([`RecoveryLatch`]).
     recovery: RecoveryLatch,
-    /// The over-declared-level warning has fired (once per decoder — the condition
-    /// is a property of the stream's SPS, so repeating it per AU is noise).
+    /// Over-declared-level warning has fired. Once per decoder: the condition is
+    /// a property of the stream's SPS, so repeating it per AU is noise.
     level_clamp_warned: bool,
 }
 
 impl VkH265Decoder {
-    /// Wrap the borrowed device. Sessions/pools are built lazily from the first
-    /// AU's SPS (their shape is the stream's, not the device's).
+    /// Wrap the borrowed device. Sessions and pools are built lazily from the
+    /// first AU's SPS (their shape is the stream's, not the device's).
     ///
     /// # Safety
     ///
-    /// The full [`DeviceHandles`] caller contract (liveness, enabled extensions
-    /// and features, truthful queue families) — held for this decoder's whole
-    /// lifetime, not just this call. The device must additionally have been
-    /// created with `VK_KHR_video_decode_h265` enabled; that part of the contract
-    /// is checked below AS FAR AS IT CAN BE — the check reads the decode queue
-    /// family's advertised `videoCodecOperations`, which is the
-    /// device's own claim about the family, not proof that the client enabled the
-    /// extension at `vkCreateDevice`. (punktfunk's presenter enables h264 + h265 +
-    /// av1, filtered by what the device supports — `pf-presenter/src/vk/setup.rs`
-    /// — so the two coincide there.) Getting it wrong is undefined behaviour at
-    /// session creation rather than an error, which is why the family check runs
-    /// before anything is queried or created.
+    /// The [`DeviceHandles`] contract (liveness, enabled extensions and
+    /// features, truthful queue families) is held for this decoder's lifetime,
+    /// not just this call. The device must have been created with
+    /// `VK_KHR_video_decode_h265` enabled. The check below reads the decode
+    /// queue family's advertised `videoCodecOperations` — the device's claim
+    /// about the family, not proof the client enabled the extension at
+    /// `vkCreateDevice`. Missing the extension is UB at session creation, so
+    /// the family check runs before any query or create.
     pub unsafe fn new(
         handles: &DeviceHandles,
         lock: Box<dyn QueueLock>,
     ) -> Result<Self, VkDecodeError> {
         // SAFETY: forwarded caller contract.
         let dev = unsafe { DecodeDevice::wrap(handles)? };
-        // Before anything is queried or created: does this queue family actually
-        // run H.265 decode ops? `query_h265_caps` would succeed on capable
-        // hardware regardless (physical-device query), and the first
-        // `vkCreateVideoSessionKHR` with a DECODE_H265 profile on a device that
-        // never enabled the extension is UB — this is the ladder's clean demote.
+        // Queue family must advertise DECODE_H265 before any query or create:
+        // `query_h265_caps` is a physical-device query and succeeds without the
+        // extension; `vkCreateVideoSessionKHR` with DECODE_H265 then is UB.
         dev.require_codec_op(vk::VideoCodecOperationFlagsKHR::DECODE_H265, "H.265 decode")?;
         Ok(Self {
             dev,
@@ -281,26 +209,18 @@ impl VkH265Decoder {
         })
     }
 
-    /// Ask the device, BEFORE a single AU is fed, whether it can decode a stream of
-    /// the negotiated (chroma format, bit depth) shape — the construction-time half
-    /// of what the lazy `ensure_state` path would otherwise only discover at the
-    /// first SPS.
+    /// Ask whether the device can host a stream of this (chroma, bit-depth)
+    /// shape, before any AU is fed.
     ///
-    /// Why it exists: the session's picture format is the STREAM's, and a device
-    /// that advertises H.265 decode need not advertise a picture format for every
-    /// shape of it — 4:4:4 RExt is absent everywhere but NVIDIA, and 10-bit is
-    /// absent on some older silicon. Discovering that lazily makes the refusal a
-    /// mid-stream ERROR STREAK, which demotes past the FFmpeg rungs to
-    /// VAAPI/D3D11VA/software; discovering it here makes it a construction failure,
-    /// which the client's ladder answers by falling through to the next rung with
-    /// the session's hardware decode intact. Same query, same derivation, same
-    /// [`crate::CapsError`] — only the timing differs.
+    /// Picture format is the stream's; advertising H.265 decode does not
+    /// advertise every shape (4:4:4 RExt and 10-bit are commonly absent).
+    /// Discovering that in `ensure_state` makes the refusal a mid-stream error
+    /// streak and demotes past later hardware rungs. Same query as
+    /// `ensure_state`; only the timing differs.
     ///
-    /// The negotiated facts are a HINT (the in-band SPS is authoritative), so this
-    /// is deliberately not a promise that decode will succeed: the level ceiling and
-    /// an SPS that disagrees with the Welcome still surface at the first AU. What it
-    /// does guarantee is that a shape the device provably cannot host never gets a
-    /// session built for it.
+    /// Negotiated facts are a hint — the in-band SPS is authoritative — so this
+    /// is not a promise decode will succeed. It does guarantee a shape the
+    /// device cannot host never gets a session.
     pub fn probe_stream_support(
         &self,
         chroma_format_idc: u8,
@@ -321,16 +241,15 @@ impl VkH265Decoder {
     /// Decode one access unit. Returns the next display-ready frame, if the
     /// planner declared one.
     ///
-    /// A RASL picture the planner refuses after an open-GOP join is NOT an error:
-    /// it is undecodable BY DEFINITION (8.1.3 NOTE — its references precede the
-    /// join), so this returns `Ok` with whatever was already display-ready (a
-    /// frame an earlier AU decoded, or `None`) and leaves the planner, the DPB and
-    /// the slot ledger untouched; the next AU plans normally. Treating it as an
-    /// error would make every CRA join request a keyframe the host has no reason
-    /// to send. The warning ledger IS cleared, per [`Self::take_warnings`].
+    /// A RASL the planner refuses after an open-GOP join is not an error: it
+    /// is undecodable by definition (8.1.3 NOTE — its references precede the
+    /// join). Returns `Ok` with whatever is already display-ready and leaves
+    /// planner, DPB, and slot ledger untouched. Treating it as an error would
+    /// request a keyframe the host has no reason to send. Warnings are cleared
+    /// per [`Self::take_warnings`].
     ///
-    /// Never panics. `VkDecodeError::DeviceLost` latches: every later call fails
-    /// fast until the owner rebuilds the decoder on fresh handles.
+    /// Never panics. `VkDecodeError::DeviceLost` latches: every later call
+    /// fails fast until the owner rebuilds on fresh handles.
     pub fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedVkFrame>, VkDecodeError> {
         if self.device_lost {
             return Err(VkDecodeError::DeviceLost);
@@ -343,18 +262,14 @@ impl VkH265Decoder {
     }
 
     fn decode_inner(&mut self, au: &[u8]) -> Result<Option<DecodedVkFrame>, VkDecodeError> {
-        // A previous AU failed after its planning had advanced: clear the stale
-        // DPB residency BEFORE planning this one, or every AU referencing the
-        // stranded picture fails forever ([`RecoveryLatch`] docs).
+        // A previous AU failed after planning advanced: clear stale DPB
+        // residency before planning this one, or later AUs fail forever
+        // ([`RecoveryLatch`]).
         if self.recovery.take() {
             self.recover_dpb();
         }
-        // Cleared BEFORE planning for the same reason the RASL arm below clears it:
-        // "cleared by the next decode" must hold for an AU that fails to plan at
-        // all, or the previous AU's warnings could be re-read as fresh damage. The
-        // ledger is drained after every successful decode (`take_warnings` is a
-        // `mem::take`), so the failed-plan case is the only one that could carry
-        // over — a hole closed by construction, not a fix for a field symptom.
+        // Cleared before planning so "cleared by the next decode" holds for an
+        // AU that fails to plan. Successful decode drains via `take_warnings`.
         self.last_warnings.clear();
         let plan = match self.planner.plan_au(au) {
             Ok(plan) => plan,
@@ -365,18 +280,17 @@ impl VkH265Decoder {
             Err(e) => return Err(VkDecodeError::PlanH265(e)),
         };
         for warning in &plan.warnings {
-            // The recovery verdict is the integration layer's
-            // ([`Self::take_warnings`]); never silent here though.
+            // Integration reads these via [`Self::take_warnings`]; never silent.
             trace!(?warning, "plan warning");
         }
         self.last_warnings = plan.warnings.clone();
-        // One picture per AU under this envelope: stamp its DECODE-order ordinal
-        // before anything can reorder it (see `DecodedVkFrame::decode_order`).
+        // One picture per AU: stamp decode-order before anything reorders it
+        // (`DecodedVkFrame::decode_order`).
         self.decoded = self.decoded.saturating_add(1);
         let decode_order = self.decoded;
-        // The recovery-point watch, folded ONCE per successfully planned AU and in
-        // DECODE order — the order the SEI's POC delta is measured in. The mark
-        // rides the pending picture into display order (crate::recovery).
+        // Folded once per planned AU, in decode order — the SEI's POC delta
+        // is measured in that order. The mark rides the pending picture into
+        // display order ([`crate::recovery`]).
         let recovery = self.recovery_watch.note_h265(
             plan.picture.pic_order_cnt,
             plan.picture.is_irap,
@@ -391,15 +305,10 @@ impl VkH265Decoder {
             );
         }
 
-        // From here the PLANNER has already advanced past this AU — its DPB holds
-        // the picture whatever happens next — so any failure below leaves the
-        // planner's DPB and this decoder's slot/image ledgers able to disagree.
-        // Latch the recovery for the next decode rather than returning into a
-        // permanently wedged state. (Deliberately wider than the paths that
-        // mutate the SlotMap: a failure BEFORE `plan_to_vk_h265` mutates it —
-        // `UnresolvedReference`, an `ensure_state` refusal — strands the picture
-        // the other way round, planner-resident with no slot at all, and wedges
-        // just as hard. One flush cures both.)
+        // Planner has advanced: a failure below can leave its DPB and this
+        // decoder's slot/image ledgers disagreeing, including failures before
+        // `plan_to_vk_h265` (planner-resident, no slot). Latch recovery rather
+        // than return into a wedged stream.
         let result = self.decode_planned(&plan, au, recovery, decode_order);
         if result.is_err() {
             self.recovery.latch();
@@ -407,13 +316,11 @@ impl VkH265Decoder {
         result
     }
 
-    /// The submission half of one decode, from the point the planner has already
-    /// advanced. Split out so [`Self::decode_inner`] can latch recovery on ANY
-    /// failure past that line without threading a flag through every exit.
-    /// `au` is the same buffer `plan`'s slice ranges index into; `recovery` is the
-    /// recovery-point verdict already folded for this AU and `decode_order` its
-    /// decode-order ordinal (both advance in decode order, so neither can be
-    /// derived here — this path is not reached for every planned AU).
+    /// Submission half of one decode, after the planner has advanced. Split
+    /// out so [`Self::decode_inner`] can latch recovery on any failure past
+    /// that line without a flag on every exit. `au` is the buffer `plan`'s
+    /// slice ranges index; `recovery` and `decode_order` are already folded
+    /// for this AU — this path is not reached for every planned AU.
     fn decode_planned(
         &mut self,
         plan: &AuPlan,
@@ -423,16 +330,16 @@ impl VkH265Decoder {
     ) -> Result<Option<DecodedVkFrame>, VkDecodeError> {
         self.ensure_state(plan)?;
 
-        // The VPS this SPS activates: the stream's own, or the fallback identity
-        // for a stream joined after its VPS NALU (session_h265 module docs).
+        // Stream VPS, or the fallback identity when the join missed the VPS
+        // NALU ([`crate::session_h265`]).
         let vps = VpsSource::for_sps(&plan.sps);
 
-        // Convert, with ONE rebuild retry on CapacityMismatch — the designed
-        // trigger for a DPB-depth renegotiation (pic_h265.rs docs).
+        // One rebuild retry on CapacityMismatch — DPB-depth renegotiation
+        // ([`crate::pic_h265`]).
         let mut vk_plan: Option<DecodePlanVkH265> = None;
         for attempt in 0..2 {
-            // A parameters RECREATE destroys the old object, which an in-flight
-            // decode may still be executing against: drain first.
+            // Recreate destroys the old parameters object; an in-flight decode
+            // may still be executing against it: drain first.
             if self
                 .state
                 .as_ref()
@@ -470,9 +377,8 @@ impl VkH265Decoder {
         let vk_plan = vk_plan.expect("the rebuilt session matches its own plan");
 
         let state = self.state.as_mut().expect("ensured above");
-        // The per-AU active-reference gate: the session was created with
-        // maxActiveReferencePictures; binding more in one decode op would be a
-        // silent VUID violation on the drivers that matter most.
+        // Session was created with maxActiveReferencePictures; binding more in
+        // one op is a silent VUID violation on the drivers that matter.
         let max_active = state.session.config.max_active_references as usize;
         if vk_plan.refs.len() > max_active {
             return Err(VkDecodeError::Unsupported(format!(
@@ -481,9 +387,8 @@ impl VkH265Decoder {
             )));
         }
 
-        // Coincide binding sync: slots the planner released no longer bind their
-        // images (the pictures may still be pending/held — untouched), and the
-        // setup slot's PREVIOUS binding is cleared before it binds fresh.
+        // Coincide: released slots unbind (pending/held pictures stay);
+        // the setup slot's previous binding is cleared before it binds fresh.
         let setup = usize::from(vk_plan.setup_slot);
         if state.dpb.is_none() {
             let mut held = vec![false; state.slot_image.len()];
@@ -500,8 +405,7 @@ impl VkH265Decoder {
             }
         }
 
-        // The decode target: a FREE pool image (never one a consumer holds — the
-        // whole point of the pool model).
+        // Never a consumer-held image — the pool model's whole point.
         let Some(dst) = state.pool.free_index() else {
             debug!(
                 held = state.pool.held_total(),
@@ -510,10 +414,9 @@ impl VkH265Decoder {
             return Err(VkDecodeError::NoFreeSlot);
         };
 
-        // Cross-queue waits (the AVVkFrame contract): the dst image's last known
-        // timeline value (covers a presenter write-back after release), plus —
-        // coincide mode — every referenced image's value, so reference reads
-        // order after any presenter layout restore already reported back.
+        // AVVkFrame contract: dst's last timeline value (presenter write-back
+        // after release), plus — coincide — every referenced image's value so
+        // reference reads order after any layout restore already reported back.
         let mut waits: Vec<(vk::Semaphore, u64)> = Vec::new();
         {
             let dst_pic = &state.pool.pictures[dst];
@@ -533,7 +436,6 @@ impl VkH265Decoder {
         }
         let signal_value = state.pool.pictures[dst].value + 1;
 
-        // Command buffer + query slot for this submission.
         let submission = state.submitted;
         let cmd_index = (submission % state.ops.cmds.len() as u64) as usize;
         if let Some((sem, value)) = state.cmd_marks[cmd_index] {
@@ -542,7 +444,6 @@ impl VkH265Decoder {
         }
         let query_index = (submission % u64::from(state.ops.query_count)) as u32;
 
-        // Upload the AU (recycles/grows against submission-completion tokens).
         let device = self.dev.ash().clone();
         let mut poll = |token: &(vk::Semaphore, u64)| -> Result<bool, VkDecodeError> {
             // SAFETY: live device; the token's semaphore is a pool semaphore.
@@ -555,23 +456,15 @@ impl VkH265Decoder {
             // SAFETY: as above.
             unsafe { wait_timeline(&device2, token.0, token.1, "bitstream slot drain") }
         };
-        // SLICE SEGMENT NALUs only, concatenated — an HEVC AU opens with AUD/SEI
-        // (and, at IRAPs, VPS/SPS/PPS) NALUs, and feeding those to the VCN
-        // firmware inside the decode range HANGS it (the .25 `vcn_unified_0 ring
-        // timeout` the H.264 path was built around; the parameter sets ride the
-        // session parameters object instead). The plan's AU-relative offsets are
-        // rebased into the packed buffer.
+        // Slice-segment NALUs only. Non-VCL (AUD/SEI, IRAP VPS/SPS/PPS) inside
+        // the decode range hangs VCN; parameter sets ride the session object.
+        // Plan offsets are AU-relative and get rebased into the packed buffer.
         let plan_segments: Vec<std::ops::Range<usize>> =
             plan.slices.iter().map(|s| s.data.clone()).collect();
-        // One rebased offset per slice segment, in plan order — the same count and
-        // order as `vk_plan.slice_offsets` (both are built by walking
-        // `plan.slices`), so `pSliceSegmentOffsets` and `sliceSegmentCount` agree
-        // by construction rather than by check. `pack_slices` additionally
-        // normalises each segment's Annex-B prefix to THREE bytes and computes the
-        // offsets from the normalised lengths, in one call, so the bytes and the
-        // offsets cannot drift apart (`crate::ring::three_byte_prefix` — the
-        // four-byte prefix this vector's 249 TRAIL segments carry is what shifted
-        // NVIDIA's slice-header parse by a byte).
+        // One rebased offset per slice, in plan order — same walk as
+        // `vk_plan.slice_offsets`, so count and order agree by construction.
+        // `pack_slices` also trims each Annex-B prefix to three bytes; a
+        // four-byte prefix shifts drivers that skip a fixed `+3 +2` off the header.
         let Some(packed) = pack_slices(au, &plan_segments) else {
             return Err(VkDecodeError::Unsupported(
                 "packed slice data exceeds the u32 offsets Vulkan submits".into(),
@@ -588,7 +481,6 @@ impl VkH265Decoder {
                 .upload(&self.dev, au, &packed.segments, &mut poll, &mut wait)?
         };
 
-        // Record + submit, signalling the dst image's next timeline value.
         // SAFETY: live device; every handle recorded below belongs to this
         // session generation, and the packed slices sit uploaded in the ring slot.
         unsafe {
@@ -607,7 +499,6 @@ impl VkH265Decoder {
             )?;
         }
 
-        // Post-submit bookkeeping.
         let dst_sem = state.pool.pictures[dst].semaphore;
         state.pool.pictures[dst].value = signal_value;
         state.pool.pictures[dst].pending = true;
@@ -624,7 +515,6 @@ impl VkH265Decoder {
             .pending
             .set_pending(upload.slot, (dst_sem, signal_value));
 
-        // Refresh the per-slot reference cache from this AU's facts.
         state.slot_refs[setup] = Some(vk_plan.setup_ref);
         for r in &vk_plan.refs {
             state.slot_refs[usize::from(r.slot)] = Some(r.std);
@@ -647,8 +537,7 @@ impl VkH265Decoder {
             },
         );
 
-        // The plan's DPB verdicts over the pending map: outputs become ready
-        // frames (their images move pending → held until released);
+        // Outputs become ready frames (images pending → held until released);
         // removed-but-never-output pictures free their images.
         let (ready, dropped) = settle_dpb(&mut self.pending, &plan.dpb);
         let state = self.state.as_mut().expect("ensured above");
@@ -672,12 +561,11 @@ impl VkH265Decoder {
         Ok(self.ready.pop_front())
     }
 
-    /// Hand a delivered frame back. `presenter_signaled` reports whether the
-    /// consumer SAMPLED the image (and therefore enqueued the `value + 1`
-    /// timeline signal per the [`DecodedVkFrame`] contract) — the decoder then
-    /// waits that write-back before the image's next use. Every frame
-    /// `decode`/`take_ready` returns must come back exactly once, including
-    /// stale-generation frames (their retired pool dies on its last token).
+    /// Hand a delivered frame back. `presenter_signaled` is whether the consumer
+    /// sampled the image (and enqueued the `value + 1` timeline signal per
+    /// [`DecodedVkFrame`]); the decoder waits that write-back before reuse.
+    /// Every frame `decode`/`take_ready` returns must come back exactly once,
+    /// including stale-generation frames (retired pool dies on last token).
     pub fn release_frame(
         &mut self,
         frame: &DecodedVkFrame,
@@ -726,8 +614,8 @@ impl VkH265Decoder {
         if presenter_signaled {
             picture.value = picture.value.max(frame.value + 1);
         }
-        // A retired pool dies on its last token (presenter fence-waited before
-        // the token per the release contract; decode work drained at retirement).
+        // Retired pool dies on its last token (presenter fence-waited before
+        // the token; decode work drained at retirement).
         if frame.generation != self.generation {
             self.graveyard
                 .retain(|r| r.generation != frame.generation || r.pool.held_total() > 0);
@@ -735,13 +623,13 @@ impl VkH265Decoder {
         Ok(())
     }
 
-    /// A display-ready frame beyond the one `decode` returned, if any. Drain after
-    /// every decode; frames left here still occupy pool images.
+    /// A display-ready frame beyond the one `decode` returned, if any. Drain
+    /// after every decode; frames left here still occupy pool images.
     pub fn take_ready(&mut self) -> Option<DecodedVkFrame> {
         self.ready.pop_front()
     }
 
-    /// The warnings of the most recent successfully planned AU (concealment
+    /// Warnings of the most recent successfully planned AU (concealment
     /// signals — the integration layer's want_keyframe hook). Cleared by the
     /// next `decode`.
     pub fn take_warnings(&mut self) -> Vec<PlanWarning> {
@@ -754,22 +642,20 @@ impl VkH265Decoder {
         self.generation
     }
 
-    /// The DECODE-order ordinal of the most recently planned picture — the
-    /// watermark a consumer compares [`DecodedVkFrame::decode_order`] against to
-    /// tell a frame decoded before a loss from one decoded after it. Especially
-    /// load-bearing here: [`Self::recover_dpb`] flushes every buffered picture
-    /// into `ready` at once, so a pre-loss picture routinely reaches the consumer
-    /// after the loss that flushed it. 0 before the first AU plans.
+    /// Decode-order ordinal of the most recently planned picture. A consumer
+    /// compares [`DecodedVkFrame::decode_order`] against this to tell a frame
+    /// decoded before a loss from one decoded after it. [`Self::recover_dpb`]
+    /// flushes every buffered picture into `ready` at once, so a pre-loss
+    /// picture routinely arrives after the loss that flushed it. 0 before the
+    /// first AU plans.
     pub fn decode_order(&self) -> u64 {
         self.decoded
     }
 
-    /// One-line state snapshot for failure paths and field logs (not a stable
-    /// format).
+    /// One-line state snapshot for failure paths. Not a stable format.
     pub fn debug_snapshot(&self) -> String {
-        // A latched recovery is the single most useful thing to see next to a
-        // failure: it says the NEXT decode flushes to an IRAP rather than
-        // resuming (RecoveryLatch docs).
+        // Next to a failure: the next decode flushes to an IRAP rather than
+        // resuming ([`RecoveryLatch`]).
         let recovery = if self.recovery.is_latched() {
             " recovery=owed"
         } else {
@@ -812,29 +698,23 @@ impl VkH265Decoder {
         }
     }
 
-    /// Read `frame`'s decode status WITHOUT waiting.
+    /// Read `frame`'s decode status without waiting.
     ///
-    /// [`DecodeStatus::Failed`] covers driver-reported errors AND a query slot
-    /// re-armed before it was read (the status is then unprovable — same
-    /// conservative verdict).
-    ///
-    /// On drivers whose decode family lacks `queryResultStatusSupport` (RADV)
-    /// there is no per-op verdict to read: `Ok` then means "the decode op
-    /// COMPLETED on the timeline" — the same information FFmpeg has on every
-    /// driver, no worse.
+    /// [`DecodeStatus::Failed`] covers driver-reported errors and a query slot
+    /// re-armed before it was read (status then unprovable — same conservative
+    /// verdict). Without `queryResultStatusSupport`, `Ok` means the decode op
+    /// completed on the timeline — no per-op integrity verdict.
     pub fn poll_status(&mut self, frame: &DecodedVkFrame) -> DecodeStatus {
         self.read_status(frame, false)
     }
 
-    /// Does this decode queue family answer per-op `RESULT_STATUS` queries at all?
-    /// See [`crate::VkH264Decoder::status_queries`] — the fact is the DEVICE's, identical
-    /// for both codecs, and it is what tells a clean integrity report apart from
-    /// an undetectable one.
+    /// Whether this decode queue family answers per-op `RESULT_STATUS` queries.
+    /// Device fact, identical for both codecs ([`crate::VkH264Decoder::status_queries`]).
     pub fn status_queries(&self) -> bool {
         self.dev.result_status_queries()
     }
 
-    /// [`Self::poll_status`], but WAITs for the op to complete first.
+    /// [`Self::poll_status`], but waits for the op to complete first.
     pub fn wait_status(&mut self, frame: &DecodedVkFrame) -> DecodeStatus {
         self.read_status(frame, true)
     }
@@ -853,8 +733,7 @@ impl VkH265Decoder {
             return DecodeStatus::Failed;
         };
         let Some(query_pool) = state.ops.query_pool else {
-            // No queries on this driver: the verdict degrades to timeline
-            // completion (poll_status docs).
+            // No queries: verdict degrades to timeline completion (`poll_status`).
             if block {
                 // SAFETY: live device; pool-owned semaphore.
                 return match unsafe {
@@ -918,10 +797,9 @@ impl VkH265Decoder {
         }
     }
 
-    /// Wait — bounded by `timeout_ns` — for a delivered frame's decode-complete
-    /// signal. Pure measurement (the integration layer's sampled decode-latency
-    /// stat): touches no decoder state. `frame` must be unreleased, which pins its
-    /// pool — and with it the semaphore — alive.
+    /// Wait, bounded by `timeout_ns`, for a delivered frame's decode-complete
+    /// signal. Pure measurement: touches no decoder state. `frame` must be
+    /// unreleased, which pins its pool — and with it the semaphore — alive.
     pub fn wait_decoded(&self, frame: &DecodedVkFrame, timeout_ns: u64) -> bool {
         if frame.generation != self.generation {
             return false;
@@ -938,9 +816,9 @@ impl VkH265Decoder {
     }
 
     /// Drain the planner (teardown / stream discontinuity): every buffered
-    /// picture becomes display-ready via [`Self::take_ready`] (zero-copy — the
-    /// images already hold the content), all DPB slots free, and any picture
-    /// removed without ever reaching output frees its image.
+    /// picture becomes display-ready via [`Self::take_ready`] (images already
+    /// hold the content), all DPB slots free, and pictures removed without
+    /// ever reaching output free their images.
     pub fn flush(&mut self) {
         let update = self.planner.flush();
         let (ready, dropped) = settle_dpb(&mut self.pending, &update);
@@ -959,8 +837,8 @@ impl VkH265Decoder {
             for entry in dropped {
                 state.pool.pictures[entry.image].pending = false;
             }
-            // Defensive: a pending picture neither output nor removed should not
-            // exist after a flush; free any leftover.
+            // A pending picture neither output nor removed should not exist
+            // after a flush; free any leftover.
             for (_, entry) in std::mem::take(&mut self.pending) {
                 debug!(poc = entry.poc, "pending picture survived a flush — freed");
                 state.pool.pictures[entry.image].pending = false;
@@ -970,21 +848,17 @@ impl VkH265Decoder {
         }
     }
 
-    /// Clear the DPB state a failed AU left behind, so planning resumes at the
-    /// next IRAP instead of erroring on residency nothing can honour.
+    /// Clear DPB state a failed AU left behind so planning resumes at the next
+    /// IRAP instead of erroring on residency nothing can honour.
     ///
-    /// Three ledgers have to agree and, after a post-planning failure, do not:
-    /// the PLANNER's DPB, this decoder's [`SlotMap`], and the slot→image
-    /// bindings. [`Self::flush`] settles the first (and hands back any picture
-    /// that did reach output — those frames are real and are still delivered),
-    /// then [`reset_slot_bindings`] empties the other two. Pool images the stale
-    /// bindings pinned go back on the free list; images a consumer still HOLDS
-    /// stay pinned by their own `held` counts, exactly as they would across a
-    /// session rebuild.
+    /// Three ledgers must agree and, after a post-planning failure, do not:
+    /// the planner's DPB, this decoder's [`SlotMap`], and the slot→image
+    /// bindings. [`Self::flush`] settles the first (pictures that reached
+    /// output are still delivered); [`reset_slot_bindings`] empties the other
+    /// two. Stale bindings' pool images return to free; consumer-held images
+    /// stay pinned by `held`, as across a session rebuild.
     ///
-    /// Deliberately not a session rebuild: the session, pools and ring are all
-    /// still valid — only the DPB bookkeeping is stale — and a rebuild would
-    /// churn every image allocation for a condition an IDR fixes anyway.
+    /// Not a session rebuild: session, pools, and ring are still valid.
     fn recover_dpb(&mut self) {
         debug!(
             snapshot = %self.debug_snapshot(),
@@ -1003,10 +877,9 @@ impl VkH265Decoder {
         }
     }
 
-    /// Session/caps for THIS plan exist and match its extent + profile, and the
-    /// stream sits inside the device's level ceiling. DPB-depth mismatches
-    /// surface later as `plan_to_vk_h265`'s `CapacityMismatch` (the designed
-    /// trigger) and take the same rebuild path.
+    /// Session/caps for this plan exist and match its extent + profile.
+    /// DPB-depth mismatches surface later as `plan_to_vk_h265`'s
+    /// `CapacityMismatch` and take the same rebuild path.
     fn ensure_state(&mut self, plan: &AuPlan) -> Result<(), VkDecodeError> {
         let key = profile_key_for(plan)?;
         if self.caps.as_ref().map(|(k, _)| *k) != Some(key) {
@@ -1017,17 +890,10 @@ impl VkH265Decoder {
             let raw = unsafe { query_h265_caps(&self.dev, key) }.map_err(VkDecodeError::from)?;
             self.caps = Some((key, derive_caps_h265(&raw, wanted)?));
         }
-        // The declared level vs the device ceiling: a DECLARED level above
-        // `maxLevelIdc` is NOT a refusal. The level in an SPS is a claim, and
-        // encoders over-claim in the wild — AMF stamps 6.2 (the codec maximum)
-        // on 4K120 streams that need 5.2, which on an RTX 5060 (ceiling 6.1)
-        // demoted every HEVC session to D3D11VA (2026-08-12 field report). The
-        // stream's REAL demands are enforced where they are physical facts:
-        // coded extent and DPB depth, checked in `rebuild_state`. The session's
-        // parameter sets are clamped to the ceiling (`SessionConfigH265::
-        // max_level_idc`) so the driver is never handed a level above its caps,
-        // and the comparison stays within one codec's Std code space
-        // (`MaxLevelIdc`'s tag carries that argument).
+        // A declared level above `maxLevelIdc` is not a refusal. SPS level is
+        // a claim; encoders over-declare. Real limits are coded extent and DPB
+        // depth in `rebuild_state`. Parameter sets clamp to the ceiling so the
+        // driver never sees a level above its caps.
         let caps_max_level = self.caps.as_ref().expect("queried above").1.max_level_idc;
         let stream_level = level_to_std_h265(plan.picture.level_idc);
         if stream_level > caps_max_level.code_point() && !self.level_clamp_warned {
@@ -1052,16 +918,14 @@ impl VkH265Decoder {
         }
     }
 
-    /// Tear down the current session generation (draining its decode work,
-    /// retiring its picture pool to the graveyard when the consumer still holds
-    /// images) and build a fresh one shaped by `plan`, bumping
-    /// [`Self::generation`] so frames of the old one route to the graveyard.
+    /// Tear down the current session generation (drain decode work; retire the
+    /// picture pool to the graveyard when the consumer still holds images) and
+    /// build a fresh one shaped by `plan`. Bumps [`Self::generation`] so old
+    /// frames route to the graveyard.
     ///
-    /// The renegotiation-safety argument is [`crate::VkH264Decoder`]'s, unchanged:
-    /// pools with consumer holds retire INTACT to the graveyard, every frame and
-    /// token carries its generation, and the session objects (query pool included)
-    /// die only after [`Self::drain_gpu`] with no consumer-facing handle pointing
-    /// at them.
+    /// Pools with consumer holds retire intact; every frame and token carries
+    /// its generation. Session objects (query pool included) die only after
+    /// [`Self::drain_gpu`], with no consumer-facing handle pointing at them.
     fn rebuild_state(&mut self, plan: &AuPlan) -> Result<(), VkDecodeError> {
         self.drain_gpu()?;
         if let Some(state) = self.state.take() {
@@ -1105,8 +969,8 @@ impl VkH265Decoder {
             width: plan.picture.coded_width,
             height: plan.picture.coded_height,
         };
-        // Bounds-checked at the ALLOCATION extent (granularity-rounded): that is
-        // what the images are created at and what maxCodedExtent must cover.
+        // Bounds-checked at the allocation extent (granularity-rounded): that
+        // is what the images are created at and what maxCodedExtent must cover.
         let image_extent = caps.aligned_extent(coded);
         if coded.width < caps.min_coded_extent.width
             || coded.height < caps.min_coded_extent.height
@@ -1134,10 +998,9 @@ impl VkH265Decoder {
             max_level_idc: caps.max_level_idc.code_point(),
         };
         let mut pool_plan = plan_pools(caps, required_slots);
-        // TEST-ONLY readback hook, exactly as the H.264 decoder's: the parity
-        // test copies decoded pictures back to hash them, and
-        // `vkCmdCopyImageToBuffer` needs TRANSFER_SRC on the source — a bit the
-        // zero-copy production pools deliberately do not carry.
+        // Test-only: parity copies decoded pictures back to hash them, and
+        // `vkCmdCopyImageToBuffer` needs TRANSFER_SRC — a bit production pools
+        // deliberately do not carry.
         if std::env::var("PF_VKD_TEST_READBACK").is_ok_and(|v| v == "1") {
             pool_plan.picture_usage |= vk::ImageUsageFlags::TRANSFER_SRC;
         }
@@ -1212,10 +1075,9 @@ impl VkH265Decoder {
 
 impl Drop for VkH265Decoder {
     fn drop(&mut self) {
-        // Best-effort decode drain so the pools' Drop impls never destroy
-        // in-flight decode work; a wedged driver falls through after the bounded
-        // timeout. Presenter-side sampling of graveyarded/held images is the
-        // CALLER's teardown contract (the H.264 decoder's Drop docs).
+        // Best-effort drain so pool Drop never destroys in-flight decode work;
+        // a wedged driver falls through after the bounded timeout. Presenter
+        // sampling of graveyarded/held images is the caller's teardown contract.
         if let Err(e) = self.drain_gpu() {
             debug!(error = %e, "drain on drop failed; tearing down anyway");
         }
@@ -1229,11 +1091,9 @@ impl Drop for VkH265Decoder {
     }
 }
 
-/// The Vulkan profile this AU's stream needs — profile idc plus the chroma format
-/// and bit depths, all of which the SPS carries and the profile must restate.
-/// (`separate_colour_plane_flag` comes off the active SPS rather than the picture
-/// plan, which does not carry it: the planner has no use for it, the profile gate
-/// does.)
+/// Vulkan profile this AU needs. `separate_colour_plane_flag` comes off the
+/// active SPS, not the picture plan — the planner has no use for it, the
+/// profile gate does.
 fn profile_key_for(plan: &AuPlan) -> Result<H265ProfileKey, VkDecodeError> {
     H265ProfileKey::from_stream(
         plan.picture.general_profile_idc,
@@ -1245,28 +1105,21 @@ fn profile_key_for(plan: &AuPlan) -> Result<H265ProfileKey, VkDecodeError> {
     .map_err(VkDecodeError::ParamsH265)
 }
 
-/// Empty the three per-slot ledgers a recovery resets: DPB residency, the
-/// slot→image bindings and the cached per-slot reference info. Returns the pool
-/// image indices the cleared bindings were pinning, for the caller to unbind
-/// (pure over the ledgers so the recovery is testable without a device — the pool
-/// is the one piece that needs one).
+/// Empty the three per-slot ledgers a recovery resets: DPB residency,
+/// slot→image bindings, and cached per-slot reference info. Returns the pool
+/// image indices the cleared bindings were pinning, for the caller to unbind.
+/// Pure over the ledgers so recovery is testable without a device.
 ///
-/// All three are emptied TOGETHER on purpose: leaving reference info behind would
-/// let [`build_scope`] bind a slot the planner no longer knows about, which is the
-/// same "plausible-looking picture in the wrong place" the unbound-reference
-/// refusal exists to prevent.
-///
-/// Generic over the cached reference-info type so H.264's recovery uses this exact
-/// code rather than a twin: the three ledgers and the "empty them together" rule are
-/// codec-independent (`SlotMap` is already shared), and only the `StdVideo*` type in
-/// `slot_refs` differs.
+/// All three empty together: leftover reference info would let [`build_scope`]
+/// bind a slot the planner no longer knows. Generic over the cached Std type
+/// so H.264 uses this same function (`SlotMap` is already shared).
 pub(crate) fn reset_slot_bindings<S>(
     slots: &mut SlotMap,
     slot_image: &mut [Option<usize>],
     slot_refs: &mut [Option<S>],
 ) -> Vec<usize> {
-    // `release` is the only way a slot is freed (SlotMap docs); the collect is
-    // because `held` borrows the map the releases mutate.
+    // `release` is the only way a slot is freed ([`SlotMap`]); collect because
+    // `held` borrows the map the releases mutate.
     for (_slot, id) in slots.held().collect::<Vec<_>>() {
         slots.release(id);
     }
@@ -1277,8 +1130,8 @@ pub(crate) fn reset_slot_bindings<S>(
     unbound
 }
 
-/// The picture resource view bound for DPB `slot`: the bound pool image
-/// (coincide) or the DPB array layer (distinct).
+/// Picture resource view for DPB `slot`: bound pool image (coincide) or DPB
+/// array layer (distinct).
 fn slot_view(state: &SessionStateH265, slot: u8) -> Option<vk::ImageView> {
     match &state.dpb {
         Some(dpb) => Some(dpb.dpb_view(slot)),
@@ -1286,11 +1139,9 @@ fn slot_view(state: &SessionStateH265, slot: u8) -> Option<vk::ImageView> {
     }
 }
 
-/// One entry of a coding scope's bound-slot list: the DPB slot index it binds
-/// (`-1` for the setup ACTIVATION entry), the picture resource view, and the
-/// codec reference info that slot's association carries.
-/// (No derived equality: `StdVideoDecodeH265ReferenceInfo` is a plain-C bindgen
-/// struct without it. Assertions compare the fields that carry meaning.)
+/// One bound-slot list entry: DPB slot index (`-1` for the setup activation),
+/// picture resource view, and that slot's codec reference info.
+/// No derived equality: the Std bindgen struct has none; tests compare fields.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScopeEntry<S> {
     pub(crate) slot_index: i32,
@@ -1298,29 +1149,22 @@ pub(crate) struct ScopeEntry<S> {
     pub(crate) std: S,
 }
 
-/// One of this AU's references, as [`build_scope`] needs to see it: a DPB slot and
-/// the codec reference info to bind with it.
+/// One of this AU's references as [`build_scope`] sees it: a DPB slot and the
+/// codec reference info to bind with it.
 ///
-/// It exists so H.264 and H.265 share ONE scope builder instead of two hand-copies of
-/// a function whose whole job is refusing to guess — the property most in need of a
-/// single implementation. Their `VkRef`/`VkRefH265` differ only in the `StdVideo*`
-/// type they carry, so the shape generalises exactly.
-///
-/// ⚠ AV1 deliberately keeps its own ([`crate::decoder_av1`]'s `build_scope_av1`): its
-/// reference array is indexed by reference NAME and may hold HOLES, so its walk is a
-/// different algorithm rather than the same one over a different Std type. Folding it
-/// in here would mean a builder with a mode flag, which is how the two would drift.
+/// H.264 and H.265 share one builder so "refuse to guess" has a single
+/// implementation. AV1 keeps its own ([`crate::decoder_av1`]): its reference
+/// array is indexed by name and may hold holes, so the walk is a different
+/// algorithm. Folding it in would be a mode flag, which is how the two drift.
 pub(crate) trait ScopeRef {
-    /// The codec's `StdVideoDecode*ReferenceInfo`.
     type Std: Copy;
-    /// The DPB slot this reference is bound in.
     fn slot(&self) -> u8;
     fn std(&self) -> Self::Std;
 }
 
-/// [`build_scope`]'s answer: the bound-slot list, and how many of its LEADING entries
-/// are this AU's own references (the prefix the decode op takes as its reference
-/// array — see the ordering note in `build_scope`'s docs).
+/// [`build_scope`]'s answer: bound-slot list, and how many leading entries are
+/// this AU's own references (the prefix the decode op takes as its reference
+/// array — ordering note in `build_scope`).
 pub(crate) type Scope<R> = (Vec<ScopeEntry<<R as ScopeRef>::Std>>, usize);
 
 impl ScopeRef for crate::pic_h265::VkRefH265 {
@@ -1343,38 +1187,22 @@ impl ScopeRef for crate::pic::VkRef {
     }
 }
 
-/// Build the coding scope's bound-slot list and say how many leading entries are
-/// THIS AU's references.
+/// Build the coding scope's bound-slot list and how many leading entries are
+/// this AU's references.
 ///
-/// The layout:
+/// Layout: (1) every `refs` entry in order — the decode op takes this prefix;
+/// (2) every other still-held slot, so its association survives the scope;
+/// (3) the setup slot as the activation entry, slot index `-1`.
 ///
-/// 1. every entry of `refs`, IN ORDER — the decode op takes exactly this prefix;
-/// 2. every other still-held slot, so its association survives the scope (their
-///    resources must stay bound even when this AU does not reference them);
-/// 3. the setup slot as the activation entry, slot index `-1`.
+/// A reference whose slot binds no image is a hard error, never a skip.
+/// H.265 `RefPicSetStCurr*`/`LtCurr` name DPB slots, and every named slot is
+/// one of `refs` ([`crate::pic_h265`]); dropping an entry leaves hardware a
+/// named slot this op never bound.
 ///
-/// A reference whose slot binds no image is a hard error, never a skip. For H.265 the
-/// argument is `StdVideoDecodeH265PictureInfo`'s `RefPicSetStCurrBefore`/`StCurrAfter`/
-/// `LtCurr` arrays: they name DPB slots, every slot they name is one of `refs`'
-/// ([`crate::pic_h265`]), so dropping an entry leaves the hardware with a named slot
-/// this op never bound — which it can only answer by guessing or failing.
-///
-/// H.264 has no such index arrays, and it used to skip the case with a `trace!` on
-/// exactly that reasoning. The reasoning was wrong about the OUTPUT: the hardware
-/// still decodes a P-picture against a reference that was never bound, which on the
-/// DPB-and-output-COINCIDE path is a gray plate with the new frame's motion painted
-/// over it — and because the planner raised no warning (its DPB genuinely holds the
-/// picture; the breakage is in this ledger), the frame was shipped, presented, and
-/// cleared the consumer's demotion streak on its way past. Both codecs fail closed
-/// here now; the recovery latch is what keeps failing closed from wedging the stream.
-///
-/// `reference_count` is captured the instant the `refs` loop ends, BEFORE the
-/// held-slot pass appends anything. That ordering is load-bearing: the decode op takes
-/// `scope[..reference_count]` as its reference list, so a count computed after the
-/// second pass could hand it a still-held slot that this AU does not reference, in
-/// place of one that failed to resolve. (Fail-closed above makes that unreachable —
-/// but the construction must be correct on its own, not by depending on a check
-/// somewhere else.)
+/// `reference_count` is captured the instant the `refs` loop ends, before the
+/// held-slot pass appends. The decode op takes `scope[..reference_count]` as
+/// its reference list; a count after the second pass could hand it a
+/// still-held slot this AU does not reference.
 pub(crate) fn build_scope<R: ScopeRef>(
     refs: &[R],
     held_slots: impl Iterator<Item = u8>,
@@ -1409,7 +1237,7 @@ pub(crate) fn build_scope<R: ScopeRef>(
                 view,
                 std,
             }),
-            // Unreachable in practice: every held slot was a setup slot once.
+            // Every held slot was a setup slot once; leave unbound rather than fake.
             _ => trace!(
                 slot,
                 "held slot without reference info/binding — left unbound"
@@ -1453,10 +1281,8 @@ unsafe fn record_and_submit_h265(
     let coded_extent = state.coded_extent;
     let coincide = state.dpb.is_none();
 
-    // ---- the reference layout, decided BEFORE anything is recorded ----
-    // `refs` order is the contract (build_scope docs): the Std picture info's RPS
-    // arrays index into this exact array, so a missing entry is fatal, not
-    // skippable — and it must fail before the command buffer is even begun.
+    // `refs` order is the contract ([`build_scope`]): RPS arrays index into this
+    // exact array, so a missing entry is fatal — fail before the buffer is begun.
     let setup_view = if coincide {
         state.pool.pictures[dst].view
     } else {
@@ -1487,8 +1313,8 @@ unsafe fn record_and_submit_h265(
             .map_err(VkDecodeError::from)?
     };
 
-    // ---- barriers (outside the video coding scope) ----
-    // Prior reconstructions must be visible to this op's reference reads.
+    // Barriers outside the video coding scope. Prior reconstructions must be
+    // visible to this op's reference reads.
     let memory_barriers = [vk::MemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
         .src_access_mask(vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR)
@@ -1496,7 +1322,7 @@ unsafe fn record_and_submit_h265(
         .dst_access_mask(
             vk::AccessFlags2::VIDEO_DECODE_READ_KHR | vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
         )];
-    // Decode targets are fully overwritten: discard via UNDEFINED with an
+    // Decode targets are fully overwritten: discard via UNDEFINED, with an
     // execution+memory dependency on earlier ops that touched them.
     let decode_layer_barrier = |image: vk::Image, layer: u32, new_layout: vk::ImageLayout| {
         vk::ImageMemoryBarrier2::default()
@@ -1524,7 +1350,7 @@ unsafe fn record_and_submit_h265(
     let dst_image = state.pool.pictures[dst].image;
     let mut image_barriers = Vec::new();
     if coincide {
-        // The dst pool image IS the setup DPB picture.
+        // Coincide: dst pool image is the setup DPB picture.
         image_barriers.push(decode_layer_barrier(
             dst_image,
             0,
@@ -1551,18 +1377,17 @@ unsafe fn record_and_submit_h265(
     // the DeviceHandles feature contract.
     unsafe { device.cmd_pipeline_barrier2(cmd, &dependency) };
 
-    // This op's status query slot, reset before the coding scope (encoder idiom).
-    // None on drivers without queryResultStatusSupport (RADV — recording a query
-    // there hangs the VCN; OpRing docs). NEVER remove this gate.
+    // Status query, reset before the coding scope. `None` when the family
+    // lacks `queryResultStatusSupport` — recording a query there hangs VCN
+    // ([`OpRing`]).
     if let Some(query_pool) = state.ops.query_pool {
         // SAFETY: recording; `query_index` is within the pool's count (fn contract).
         unsafe { device.cmd_reset_query_pool(cmd, query_pool, query_index, 1) };
     }
 
-    // ---- bound-slot staging ----
-    // Staged arrays over the scope decided above: resources → std infos → codec
-    // slot infos → slot infos. Each vector is fully built before the next borrows
-    // it, so nothing reallocates under a stored pointer.
+    // Staged arrays: resources → std infos → codec slot infos → slot infos.
+    // Each vector is fully built before the next borrows it, so nothing
+    // reallocates under a stored pointer.
     let resources: Vec<vk::VideoPictureResourceInfoKHR<'_>> = scope
         .iter()
         .map(|entry| {
@@ -1589,15 +1414,14 @@ unsafe fn record_and_submit_h265(
     for (slot_info, dpb_info) in begin_slots.iter_mut().zip(dpb_infos.iter_mut()) {
         *slot_info = (*slot_info).push_next(dpb_info);
     }
-    // The decode op's reference list: exactly this AU's references, in `refs`
-    // order — `RefPicSetStCurrBefore`/`StCurrAfter`/`LtCurr` index into THIS
-    // array (module docs), which is why the entries were built refs-first and why
-    // a missing binding failed the whole op above rather than compacting.
+    // This AU's references in `refs` order. `RefPicSetStCurr*`/`LtCurr` index
+    // into this array, which is why entries were built refs-first and a missing
+    // binding failed the op rather than compacting.
     let decode_refs: Vec<vk::VideoReferenceSlotInfoKHR<'_>> =
         begin_slots[..reference_count].to_vec();
 
-    // The setup slot as the decode op sees it: its REAL index (the begin list's
-    // twin entry carries -1), same resource, its own codec info chain.
+    // Setup slot as the decode op sees it: its real index (the begin list's
+    // twin carries -1), same resource, its own codec info chain.
     let setup_std = vk_plan.setup_ref;
     let mut setup_dpb = vk::VideoDecodeH265DpbSlotInfoKHR::default().std_reference_info(&setup_std);
     let setup_resource = resources[scope.len() - 1];
@@ -1606,8 +1430,6 @@ unsafe fn record_and_submit_h265(
         .picture_resource(&setup_resource)
         .push_next(&mut setup_dpb);
 
-    // Decode destination: the setup picture itself (coincide) or the pool image
-    // (distinct).
     let dst_resource = if coincide {
         setup_resource
     } else {
@@ -1618,8 +1440,8 @@ unsafe fn record_and_submit_h265(
     };
 
     let std_pic = vk_plan.std_pic;
-    // Offsets rebased into the packed slices-only buffer (NOT the plan's
-    // AU-absolute offsets — the AU's non-slice NALUs were never uploaded).
+    // Offsets rebased into the packed slices-only buffer, not the plan's
+    // AU-absolute offsets — non-slice NALUs were never uploaded.
     let mut h265_pic = vk::VideoDecodeH265PictureInfoKHR::default()
         .std_picture_info(&std_pic)
         .slice_segment_offsets(slice_offsets);
@@ -1638,10 +1460,10 @@ unsafe fn record_and_submit_h265(
         .video_session(state.session.session())
         .video_session_parameters(state.session.parameters())
         .reference_slots(&begin_slots);
-    // The one-shot session RESET, consumed HERE but re-armed on every error path
-    // below — a RESET recorded into a command buffer that never reaches the
-    // queue initialized nothing, and the next successful recording must carry it
-    // or the session runs its whole life uninitialized.
+    // One-shot session RESET, consumed here but re-armed on every error path
+    // below. A RESET recorded into a buffer that never reaches the queue
+    // initialized nothing; the next successful recording must carry it or the
+    // session runs uninitialized for its whole life.
     let did_reset = state.session.take_needs_reset();
     // SAFETY: recording into the begun buffer, through end_command_buffer; every
     // pointed-to struct above is a local (or session-state field) that outlives
@@ -1649,7 +1471,7 @@ unsafe fn record_and_submit_h265(
     let recorded: Result<(), vk::Result> = unsafe {
         (dev.video_queue().fp().cmd_begin_video_coding_khr)(cmd, &begin_coding);
         if did_reset {
-            // Session first-use initialization — ONCE, before its first decode.
+            // Session first-use initialization — once, before its first decode.
             let control = vk::VideoCodingControlInfoKHR::default()
                 .flags(vk::VideoCodingControlFlagsKHR::RESET);
             (dev.video_queue().fp().cmd_control_video_coding_khr)(cmd, &control);
@@ -1674,7 +1496,6 @@ unsafe fn record_and_submit_h265(
         return Err(VkDecodeError::from(e));
     }
 
-    // ---- submit, under the caller's queue lock ----
     let cmd_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
     let wait_infos: Vec<vk::SemaphoreSubmitInfo<'_>> = waits
         .iter()
@@ -1699,7 +1520,7 @@ unsafe fn record_and_submit_h265(
     let result = unsafe { device.queue_submit2(dev.decode_queue(), &submits, vk::Fence::null()) };
     drop(guard);
     if let Err(e) = result {
-        // The recorded RESET never executed: the next recording must redo it.
+        // Recorded RESET never executed: the next recording must redo it.
         if did_reset {
             state.session.re_arm_reset();
         }
@@ -1715,7 +1536,7 @@ mod tests {
     use super::*;
     use crate::pic_h265::VkRefH265;
 
-    /// A reference-info value carrying just the two fields the assertions read.
+    /// Reference-info carrying the two fields the assertions read.
     fn std_ref(poc: i32, long_term: bool) -> hh::StdVideoDecodeH265ReferenceInfo {
         // SAFETY: StdVideoDecodeH265ReferenceInfo is a plain-C bindgen struct of a
         // bitfield word and one integer; all-zero is valid for every field.
@@ -1734,17 +1555,17 @@ mod tests {
         }
     }
 
-    /// A distinguishable fake view per slot (never dereferenced — the scope only
-    /// carries handles around).
+    /// Distinguishable fake view per slot. Never dereferenced; the scope only
+    /// carries handles.
     fn fake_view(slot: u8) -> vk::ImageView {
         vk::ImageView::from_raw(u64::from(slot) + 1)
     }
 
     #[test]
     fn the_scopes_leading_entries_are_the_refs_in_plan_order() {
-        // The plan's refs are NOT in slot order (they are in RPS set order:
-        // StCurrBefore, StCurrAfter, LtCurr) — and the Std index arrays point at
-        // positions in THAT order, so the scope must not sort or dedup them.
+        // Plan refs are in RPS set order (StCurrBefore, StCurrAfter, LtCurr),
+        // not slot order. Std index arrays point at positions in that order, so
+        // the scope must not sort or dedup them.
         let refs = vec![
             vk_ref(5, 40, false),
             vk_ref(1, 60, false),
@@ -1781,7 +1602,6 @@ mod tests {
             );
         }
 
-        // Then the other still-held slot (7), then the setup ACTIVATION entry.
         assert_eq!(scope[3].slot_index, 7);
         let last = scope.last().unwrap();
         assert_eq!(
@@ -1799,8 +1619,8 @@ mod tests {
 
     #[test]
     fn a_reference_slot_without_a_bound_image_fails_the_whole_op() {
-        // Compacting past it would shift every later RefPicSetStCurr* index onto
-        // the wrong picture — plausible-looking, wrong output. Fail closed.
+        // Compacting past it would shift every later RefPicSetStCurr* index
+        // onto the wrong picture. Fail closed.
         let refs = vec![vk_ref(4, 10, false), vk_ref(6, 20, false)];
         let slot_refs = vec![Some(std_ref(0, false)); 8];
         let err = build_scope(
@@ -1821,10 +1641,10 @@ mod tests {
 
     #[test]
     fn held_slots_are_bound_once_and_the_setup_slot_never_twice() {
-        // Slot 3 is BOTH a reference and still held; slot 2 is the setup slot and
-        // also held (the previous picture in it). Neither may appear twice: a
-        // duplicate slot index in one coding scope is invalid, and a second entry
-        // for a reference would also break the index arrays.
+        // Slot 3 is both a reference and still held; slot 2 is setup and also
+        // held. Neither may appear twice: a duplicate slot index in one coding
+        // scope is invalid, and a second entry for a reference would also
+        // break the index arrays.
         let refs = vec![vk_ref(3, 12, false)];
         let slot_refs = vec![Some(std_ref(99, false)); 8];
         let (scope, reference_count) = build_scope(
@@ -1853,9 +1673,8 @@ mod tests {
 
     #[test]
     fn a_held_slot_with_no_cached_reference_info_is_left_unbound_not_faked() {
-        // Only reachable if a slot was never a setup slot on this session; the
-        // scope drops it rather than binding zeroed reference info (which would
-        // claim POC 0, short-term, for a picture that is neither).
+        // Only reachable if a slot was never a setup slot on this session.
+        // Drop it rather than bind zeroed reference info (POC 0, short-term).
         let refs: Vec<VkRefH265> = Vec::new();
         let mut slot_refs: Vec<Option<hh::StdVideoDecodeH265ReferenceInfo>> = vec![None; 4];
         slot_refs[1] = Some(std_ref(7, false));
@@ -1879,22 +1698,17 @@ mod tests {
 
     #[test]
     fn a_post_mutation_failure_wedges_every_later_au_until_the_ledgers_are_reset() {
-        // The exact shape the recovery exists for. An AU planned, `plan_to_vk_h265`
-        // assigned it slot 2 in the SlotMap, the coincide binding sync cleared
-        // slot 2's image binding — and THEN the decode failed (pool exhausted, ring
-        // upload, submit, any of them). Nothing restores the state, so the planner
-        // and the SlotMap both believe the picture is resident while no image holds
-        // it.
+        // AU planned, slot assigned, setup image unbound, then decode failed.
+        // Planner and SlotMap still claim the picture is resident.
         let mut slots = SlotMap::new(3);
-        slots.assign(100).unwrap(); // slot 0, an older reference, image bound
-        slots.assign(200).unwrap(); // slot 1, another, image bound
-        slots.assign(300).unwrap(); // slot 2, THIS AU's setup — binding cleared
+        slots.assign(100).unwrap(); // slot 0, bound
+        slots.assign(200).unwrap(); // slot 1, bound
+        slots.assign(300).unwrap(); // slot 2, this AU's setup — binding cleared
         let mut slot_image: Vec<Option<usize>> = vec![Some(7), Some(8), None, None];
         let mut slot_refs: Vec<Option<hh::StdVideoDecodeH265ReferenceInfo>> =
             vec![Some(std_ref(10, false)); 4];
 
-        // Every later AU that references slot 2 fails, forever: build_scope will
-        // not silently compact past an unbound reference (the RPS index arrays).
+        // Later AUs that reference slot 2 fail closed (RPS index arrays).
         let err = build_scope(
             &[vk_ref(2, 30, false)],
             [0u8, 1, 2].into_iter(),
@@ -1910,7 +1724,6 @@ mod tests {
             "{err}"
         );
 
-        // The recovery: flush to the next IRAP and empty all three ledgers.
         let unbound = reset_slot_bindings(&mut slots, &mut slot_image, &mut slot_refs);
         assert_eq!(
             unbound,
@@ -1930,13 +1743,11 @@ mod tests {
              planner no longer knows about"
         );
 
-        // And the IRAP that follows plans against an empty DPB: it references
-        // nothing, takes the lowest slot, and its scope builds.
         let setup_slot = slots.assign(400).unwrap();
         assert_eq!(setup_slot, 0, "the freed slots are assignable again");
         slot_image[usize::from(setup_slot)] = Some(9);
-        // The empty slice needs its element type named now that `build_scope` is
-        // generic over the two codecs' reference types.
+        // Empty slice needs its element type named: `build_scope` is generic
+        // over the two codecs' reference types.
         let no_refs: [VkRefH265; 0] = [];
         let (scope, reference_count) = build_scope(
             &no_refs,
@@ -1958,9 +1769,9 @@ mod tests {
 
     #[test]
     fn the_recovery_latch_is_owed_once_and_consumed_by_exactly_one_decode() {
-        // Two failures in a row still owe ONE flush, and the decode that performs
-        // it clears the debt — otherwise every later decode would re-flush and the
-        // stream could never build a DPB again.
+        // Two failures in a row still owe one flush; the decode that performs
+        // it clears the debt. Otherwise every later decode would re-flush and
+        // the stream could never build a DPB again.
         let mut latch = RecoveryLatch::default();
         assert!(!latch.is_latched(), "a fresh decoder owes nothing");
         assert!(!latch.take());
@@ -1978,10 +1789,9 @@ mod tests {
 
     #[test]
     fn the_picture_info_carries_the_rebased_offsets_and_the_h265_std_struct() {
-        // The submission-final wiring, without a device: `pSliceSegmentOffsets`
-        // must be the REBASED array (one entry per slice segment, counted by
-        // ash from the slice's length), and the picture info must point at the
-        // plan's own Std struct.
+        // Without a device: `pSliceSegmentOffsets` must be the rebased array
+        // (one entry per slice, counted by ash from the slice length), and the
+        // picture info must point at the plan's own Std struct.
         let mut au = vec![0xAAu8; 2000];
         for start in [40usize, 900, 1500] {
             au[start..start + 3].copy_from_slice(&[0, 0, 1]);
@@ -2013,7 +1823,6 @@ mod tests {
             assert_eq!((*picture_info.p_std_picture_info).PicOrderCntVal, 42);
         }
 
-        // And a DPB slot info chains the H.265 reference info, not the H.264 one.
         let std = std_ref(17, true);
         let dpb_info = vk::VideoDecodeH265DpbSlotInfoKHR::default().std_reference_info(&std);
         assert_eq!(

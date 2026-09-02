@@ -1,12 +1,10 @@
 //! Per-AU conversion: one [`AuPlan`] into the `StdVideoDecodeH264*` structs, slice
-//! offsets and DPB slot bindings a `vkCmdDecodeVideoKHR` call is built from (WP-B).
+//! offsets and DPB slot bindings a `vkCmdDecodeVideoKHR` call is built from.
 //!
-//! Progressive envelope: pf-bitstream's planner rejects interlaced streams before a
-//! plan exists, so every field/bottom FLAG here is written 0. The top/bottom
-//! PicOrderCnt pairs are still real pairs — a progressive frame's bottom count
-//! differs from its top whenever the PPS carries
-//! `bottom_field_pic_order_in_frame_present_flag` — and ride through from
-//! pf-bitstream verbatim.
+//! Progressive envelope: pf-bitstream rejects interlaced streams before a plan
+//! exists, so every field/bottom FLAG here is written 0. Top/bottom PicOrderCnt
+//! pairs still ride through; they differ when the PPS codes
+//! `bottom_field_pic_order_in_frame_present_flag`.
 
 use ash::vk::native as hh;
 use pf_bitstream::h264::AuPlan;
@@ -16,8 +14,7 @@ use pf_bitstream::h264::RefPic;
 use crate::slots::SlotError;
 use crate::slots::SlotMap;
 
-/// One active reference of the AU: its DPB slot, its Std reference info, and the
-/// planner id it resolves (kept so the backend can map the slot to its image).
+/// Active reference. `id` is kept so the backend can map the slot to its image.
 #[derive(Debug, Clone)]
 pub struct VkRef {
     pub slot: u8,
@@ -25,64 +22,39 @@ pub struct VkRef {
     pub id: PicId,
 }
 
-/// Everything CPU-derivable of one AU's decode submission. WP-B adds the live
-/// objects: bitstream buffer, DPB images, session and command recording.
+/// CPU-derivable half of one AU's decode submission. The recording layer adds
+/// the bitstream buffer, DPB images, session and command recording.
 #[derive(Debug, Clone)]
 pub struct DecodePlanVk {
     pub std_pic: hh::StdVideoDecodeH264PictureInfo,
-    /// Byte offset of each slice NALU in the AU as planned, START CODE INCLUDED.
-    /// AU-relative, NOT submission-final: the recording layer packs the SLICE
-    /// NALUs alone into the bitstream buffer and rebases these offsets while
-    /// doing so (non-VCL NALUs inside the decode range hang VCN firmware — see
-    /// the slices-only packing in `decoder.rs`); Vulkan's `pSliceOffsets`
-    /// receives the rebased offsets, each pointing at a start code within the
-    /// packed buffer.
+    /// Slice NALU byte offsets in the AU as planned, start code included.
+    /// AU-relative, not submission-final: the recording layer packs SLICE
+    /// NALUs only (non-VCL in the decode range hangs VCN) and rebases these
+    /// for Vulkan's `pSliceOffsets`.
     pub slice_offsets: Vec<u32>,
     /// The slot the decoded picture activates (`pSetupReferenceSlot`).
     pub setup_slot: u8,
-    /// Reference info for the setup slot: the picture's own FrameNum/POC, with the
-    /// long-term flag already set when this very AU marks itself long-term (IDR
-    /// `long_term_reference_flag` or MMCO 6).
+    /// Setup-slot identity: this picture's FrameNum/POC, already long-term when
+    /// the AU self-marks (IDR `long_term_reference_flag` or MMCO 6).
     pub setup_ref: hh::StdVideoDecodeH264ReferenceInfo,
-    /// The planner id of the decoded picture (`AuPlan.dpb.stored`) — the backend
-    /// keys its image bookkeeping by it.
+    /// Planner id of the decoded picture (`AuPlan.dpb.stored`).
     pub setup_id: PicId,
-    /// Whether the decoded picture is a reference. When `false` the setup slot
-    /// exists for the decode itself (plus any remaining DPB residency the planner
-    /// grants the picture) and must never be bound as a reference for later AUs —
-    /// it may even have been released already, via this very AU's `removed`, when
-    /// the picture bypassed the DPB.
+    /// Whether later AUs may reference this picture. When `false` the setup slot
+    /// exists for this decode plus remaining DPB residency, and this AU's
+    /// `removed` may already have released it.
     pub setup_is_reference: bool,
     /// The unique referenced pictures across all slices, in first-appearance order.
     pub refs: Vec<VkRef>,
-    /// Slots this access unit's own end-of-picture bookkeeping retires while the
-    /// decode op still BINDS them. Release them once that op is recorded — never
-    /// inside the conversion, and never dropped.
+    /// Pictures this AU's end-of-picture bookkeeping retires while the decode
+    /// op still binds them. Release once that op is recorded — never inside
+    /// the conversion, and never dropped: a leak per AU reaches
+    /// `SlotError::Full`. Apply on failure paths too.
     ///
-    /// The H.264 twin of [`crate::pic_av1::DecodePlanVkAv1::release_after_decode`],
-    /// and it exists for exactly the same reason: [`SlotMap::assign`] takes the lowest
-    /// free slot, so a release here hands the setup assignment two lines later the
-    /// slot a reference of this very AU still occupies. `pf_bitstream`'s `H264Planner`
-    /// snapshots `dpb_refs` in `begin_picture`, BEFORE `finish_picture` runs 8.2.5's
-    /// marking and C.4.5.3's bump, so a picture the sliding window unmarks and the
-    /// bump evicts is in both `dpb_refs` and `dpb.removed` for one AU — which needs
-    /// the eviction to be of an already-OUTPUT picture, i.e. low-delay H.264.
-    ///
-    /// **Measured 2026-08-07 on this rung as well as the DXVA one:** 297 of 300 AUs of
-    /// every stream a punktfunk host emits, at 720p, 1080p and 2160p alike. See
-    /// [`pf_dxvadec::pic::DecodePlanDxva::release_after_decode`]'s docs for the full
-    /// measurement and for why `test-25fps.h264` measures zero.
-    ///
-    /// Both of this rung's DPB modes break on it, differently and neither loudly:
-    /// in DISTINCT mode `slot_view` hands the aliased reference the same DPB array
-    /// layer the setup writes, a read-write alias of one subresource; in COINCIDE mode
-    /// the binding sync clears `slot_image[setup]` (it is the setup slot now) and the
-    /// reference resolves to no bound image at all, dropping out of `pReferenceSlots`
-    /// with a `trace!` and nothing else.
-    ///
-    /// The caller must apply these on its FAILURE paths too. They are slot-ledger
-    /// bookkeeping the planner already committed, not something this AU's fate can
-    /// undo — dropping them leaks a slot per AU and reaches `SlotError::Full`.
+    /// [`SlotMap::assign`] takes the lowest free slot. Release here and setup
+    /// reuses a slot this AU still references. `H264Planner` snapshots
+    /// `dpb_refs` in `begin_picture`, before 8.2.5 marking and C.4.5.3 bump,
+    /// so a sliding-window unmark plus bump can land the same picture in both
+    /// `dpb_refs` and `dpb.removed`.
     pub release_after_decode: Vec<PicId>,
 }
 
@@ -90,21 +62,17 @@ pub struct DecodePlanVk {
 /// [`pf_bitstream::h264::PlanWarning`]s upstream; these are caller/session bugs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanToVkError {
-    /// The plan holds no slices; there is nothing to submit.
     NoSlices,
     /// The plan's `DpbUpdate.stored` is `None`. `plan_au` always stores; only
     /// `flush()` produces such updates, and those go to [`SlotMap::apply`] directly.
     NoStoredId,
-    /// A reference list entry's id holds no slot: an earlier plan of this stream
-    /// never went through this [`SlotMap`].
+    /// A reference id holds no slot — an earlier plan never went through this map.
     UnresolvedReference(PicId),
     Slot(SlotError),
-    /// A slice offset exceeds `u32` (Vulkan submits offsets as `u32`).
     OffsetOverflow(usize),
-    /// The map was built for a different DPB depth than this plan's
-    /// `max_dpb_frames` — an SPS renegotiation resized the DPB. The session (WP-C)
-    /// must rebuild the video session and its [`SlotMap`]; converting against the
-    /// stale map would hand out slot indices the session's image pool does not have.
+    /// Map DPB depth differs from this plan's `max_dpb_frames` — SPS
+    /// renegotiation. Rebuild the video session and its [`SlotMap`]; converting
+    /// against the stale map would hand out slot indices the image pool lacks.
     CapacityMismatch {
         required: usize,
         capacity: usize,
@@ -154,50 +122,29 @@ impl From<SlotError> for PlanToVkError {
     }
 }
 
-/// One [`RefPic`] as Std reference info.
 fn ref_info(rp: &RefPic) -> hh::StdVideoDecodeH264ReferenceInfo {
     // SAFETY: StdVideoDecodeH264ReferenceInfo is a plain-C bindgen struct of a
     // bitfield word and integers; all-zero is a valid value for every field.
     let mut std: hh::StdVideoDecodeH264ReferenceInfo = unsafe { std::mem::zeroed() };
     std.flags
         .set_used_for_long_term_reference(u32::from(rp.is_long_term));
-    // top/bottom_field_flag stay 0 and is_non_existing stays 0: progressive envelope,
-    // and pf-bitstream never emits a gap placeholder as an id (it substitutes and
-    // warns instead).
-    //
-    // FrameNum carries exactly the pair-key the Std struct wants: frame_num for
-    // short-term references, LongTermFrameIdx for long-term ones.
+    // FrameNum is the Std pair-key: frame_num short-term, LongTermFrameIdx
+    // long-term. Field flags and is_non_existing stay 0 (module docs).
     std.FrameNum = rp.frame_num_or_lt_idx;
-    // The stored picture's real 8.2.1 pair: top != bottom whenever the PPS carried
-    // bottom_field_pic_order_in_frame_present_flag and the slice a nonzero
-    // delta_pic_order_cnt_bottom — even for progressive frames.
     std.PicOrderCnt = [rp.top_field_order_cnt, rp.bottom_field_order_cnt];
     std
 }
 
 /// Convert one planned AU, driving `slots` through the AU's slot lifecycle.
 ///
-/// `sps_id` is the id of the active SPS: an [`AuPlan`] names the active PPS (each
-/// slice header carries `pic_parameter_set_id`) but not the SPS that PPS references —
-/// the caller resolves it through its parameter-set table (in WP-B,
-/// [`crate::OwnedStdPps`]'s `seq_parameter_set_id` keyed by the first slice's PPS id).
+/// `sps_id` is the active SPS: an [`AuPlan`] names the PPS, not the SPS that
+/// PPS references — the caller resolves it through its parameter-set table.
 ///
-/// Atomicity contract: every fallible step runs before any mutation of `slots`, so
-/// an error leaves the map exactly as it was. In order:
-/// 1. capacity is validated against the plan's `max_dpb_frames` (read-only);
-/// 2. references resolve against the PRE-removal state (read-only) — this AU's own
-///    end-of-picture marking (8.2.5) can evict a picture its slices legitimately
-///    reference, e.g. the sliding window dropping the oldest short-term reference,
-///    so `removed` must not be applied before the lists are mapped;
-/// 3. slice offsets are validated (read-only);
-/// 4. the setup slot is assigned last (its failures are caller bugs; nothing is ever
-///    half-applied). `removed` is NOT applied here — it leaves as
-///    [`DecodePlanVk::release_after_decode`] for the caller to apply once the decode
-///    op is recorded, because applying it now would give the assignment back a slot
-///    this AU's own references occupy (that field's docs carry the measurement).
-///    Released slots become assignable to later pictures; keeping the underlying
-///    images alive until in-flight decodes complete is WP-B's synchronization, not
-///    this map's.
+/// Atomicity: every fallible step runs before any mutation of `slots`.
+/// Capacity first (read-only); references resolve against the pre-removal
+/// state (this AU's 8.2.5 marking can evict a picture its slices still name);
+/// setup is assigned last, and `removed` leaves as
+/// [`DecodePlanVk::release_after_decode`].
 pub fn plan_to_vk(
     plan: &AuPlan,
     slots: &mut SlotMap,
@@ -206,8 +153,6 @@ pub fn plan_to_vk(
     let first_slice = plan.slices.first().ok_or(PlanToVkError::NoSlices)?;
     let setup_id = plan.dpb.stored.ok_or(PlanToVkError::NoStoredId)?;
 
-    // The map must match THIS plan's DPB depth; a mismatch means an SPS
-    // renegotiation resized the DPB and the session must be rebuilt (WP-C).
     let required = plan.picture.max_dpb_frames + 1;
     if slots.capacity() != required {
         return Err(PlanToVkError::CapacityMismatch {
@@ -216,9 +161,8 @@ pub fn plan_to_vk(
         });
     }
 
-    // Unique referenced pictures across every slice's two lists, first appearance
-    // first. Per-slice list ORDER (ref_idx mapping) lives in the SlicePlans; this Vec
-    // is the AU-level slot binding set Vulkan wants (each slot listed once).
+    // Unique pictures across both slice lists, first appearance first.
+    // Per-slice `ref_idx` order lives in the SlicePlans, not here.
     let mut refs: Vec<VkRef> = Vec::new();
     for slice in &plan.slices {
         for rp in slice.ref_list0.iter().chain(&slice.ref_list1) {
@@ -248,8 +192,6 @@ pub fn plan_to_vk(
     std_pic.flags.set_is_intra(u32::from(is_intra));
     std_pic.flags.set_is_reference(u32::from(pic.is_reference));
     std_pic.flags.set_IdrPicFlag(u32::from(pic.is_idr));
-    // field_pic_flag / bottom_field_flag / complementary_field_pair stay 0 by the
-    // progressive envelope (module docs).
     std_pic.seq_parameter_set_id = sps_id;
     std_pic.pic_parameter_set_id = first_slice.header.pic_parameter_set_id;
     std_pic.frame_num = pic.frame_num;
@@ -260,21 +202,13 @@ pub fn plan_to_vk(
     };
     std_pic.PicOrderCnt = [pic.top_field_order_cnt, pic.bottom_field_order_cnt];
 
-    // The setup slot's reference info: this picture's own identity. When the AU marks
-    // ITSELF long-term — an IDR's long_term_reference_flag, or an MMCO 6 assigning an
-    // index (8.2.5) — the slot activates as a long-term reference keyed by
-    // LongTermFrameIdx, mirroring how ref_info keys long-term entries.
-    //
-    // ACTIVATION-vs-REFERENCE asymmetry under MMCO 5 (spec-legal, deliberately NOT
-    // rejected): these are the picture's 8.2.1 values as decoded, but an MMCO 5 in
-    // this same AU rebases the STORED frame_num/POC to zero after decoding
-    // (8.2.5.4.5), so later AUs reference this slot by the rebased pair (RefPic
-    // carries the stored values). punktfunk hosts never emit MMCO 5;
-    // pf_bitstream::h264::PlanWarning::Mmco5Rebase flags any occurrence so field
-    // logs tell us if that assumption ever breaks.
     // SAFETY: as above — all-zero is a valid StdVideoDecodeH264ReferenceInfo.
     let mut setup_ref: hh::StdVideoDecodeH264ReferenceInfo = unsafe { std::mem::zeroed() };
     setup_ref.PicOrderCnt = [pic.top_field_order_cnt, pic.bottom_field_order_cnt];
+    // Self-marking (IDR long_term_reference_flag or MMCO 6) keys the slot by
+    // LongTermFrameIdx, matching `ref_info`. MMCO 5 is spec-legal and not
+    // rejected: these are decoded 8.2.1 values; 8.2.5.4.5 rebases stored
+    // frame_num/POC to 0 (`PlanWarning::Mmco5Rebase`).
     let marking = &first_slice.header.dec_ref_pic_marking;
     let self_lt_idx = if pic.is_idr {
         marking.long_term_reference_flag.then_some(0u32)
@@ -299,26 +233,16 @@ pub fn plan_to_vk(
 
     let mut slice_offsets = Vec::with_capacity(plan.slices.len());
     for slice in &plan.slices {
-        // SlicePlan.data starts at the slice NALU's start code — exactly the offset
-        // Vulkan wants (struct docs).
         slice_offsets.push(
             u32::try_from(slice.data.start)
                 .map_err(|_| PlanToVkError::OffsetOverflow(slice.data.start))?,
         );
     }
 
-    // Mutations LAST, after every fallible step above (fn docs).
-    //
-    // The removals are handed back rather than applied: releasing one here returns
-    // its slot to the setup assignment below, and this AU's own references sit in
-    // those slots (`DecodePlanVk::release_after_decode`).
-    //
-    // The AU's own picture can itself appear in `removed`: a non-reference picture
-    // with no free frame buffer bypasses the DPB and is stored-and-evicted within
-    // one plan. Its slot must still exist for the decode itself, so it is assigned
-    // here and released right after — see `DecodePlanVk::setup_is_reference`. That
-    // is the one removal that is NOT deferred: handing the caller the slot being
-    // decoded into is the very aliasing the deferral exists to prevent.
+    // Mutations last (fn docs). Removals are not applied here.
+    // The AU's own picture can appear in `removed`: a non-reference with no
+    // free frame buffer is stored-and-evicted in one plan. Assign it, then
+    // release immediately — deferring would hand the caller the decode target.
     let setup_evicted = plan.dpb.removed.contains(&setup_id);
     let release_after_decode: Vec<PicId> = plan
         .dpb
@@ -364,16 +288,13 @@ mod tests {
 
     use super::*;
 
-    // The same vendored vector pf-bitstream's tests plan (its goldens: 250 AUs, 500
-    // slices), included from the same path rather than copied.
+    /// Shared vendored vector (same path as pf-bitstream goldens).
     const TEST_25FPS: &[u8] = include_bytes!(
         "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
     );
 
-    /// Test-only AU splitter, mirroring pf-bitstream's `split_into_aus` helper (which
-    /// is `#[cfg(test)]`-private there): a new AU starts at a non-slice NALU following
-    /// slices, or at a slice with `first_mb_in_slice == 0` (whose ue(v) encoding makes
-    /// the first RBSP bit 1) when the current AU already has slices.
+    /// Test-only AU splitter. A new AU starts at a non-slice NALU following
+    /// a slice, or at a slice whose `first_mb_in_slice` is 0 following a slice.
     fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
         let mut aus = Vec::new();
         let mut cursor = Cursor::new(stream);
@@ -398,12 +319,9 @@ mod tests {
         aus
     }
 
-    /// The decoder's picture-pool occupancy (`bound`/`pending`/`held`, exactly
-    /// `decode_inner`'s bookkeeping minus the GPU) over the WHOLE vendored
-    /// vector, with a consumer that HOLDS `hold` delivered frames before
-    /// releasing the oldest — the real client's shape (~4-7 held across its
-    /// channels, preroll and in-flight present). Returns the first starved AU
-    /// index, if any.
+    /// Picture-pool occupancy (`bound`/`pending`/`held`) over the vendored
+    /// vector, with a consumer that holds `hold` delivered frames before
+    /// releasing the oldest. Returns the first starved AU index, if any.
     fn simulate_pool_occupancy(pool_size: usize, hold: usize) -> Option<usize> {
         use std::collections::VecDeque;
 
@@ -419,9 +337,7 @@ mod tests {
         let mut slots: Option<SlotMap> = None;
         let mut pictures = vec![SimPicture::default(); pool_size];
         let mut slot_image: Vec<Option<usize>> = Vec::new();
-        // id -> pool image of the decoded picture awaiting its output verdict.
         let mut pending: BTreeMap<PicId, usize> = BTreeMap::new();
-        // Delivered frames the consumer holds, oldest first.
         let mut consumer: VecDeque<usize> = VecDeque::new();
 
         for (index, au) in aus.iter().enumerate() {
@@ -432,10 +348,8 @@ mod tests {
             });
             let vk = plan_to_vk(&plan, slots, 0).expect("the clean vector converts");
 
-            // Binding sync: released slots unbind; the setup slot rebinds fresh. The
-            // deferred releases have deliberately NOT run yet — that is the whole
-            // point of `DecodePlanVk::release_after_decode`, and doing it in the wrong
-            // order here would unbind the images this AU's own references read.
+            // Binding sync before deferred releases: releasing first would
+            // unbind images this AU's own references still read.
             let setup = usize::from(vk.setup_slot);
             let mut held_slots = vec![false; slot_image.len()];
             for (slot, _id) in slots.held() {
@@ -450,7 +364,6 @@ mod tests {
                 }
             }
 
-            // The decode target: a free pool image.
             let Some(dst) = pictures
                 .iter()
                 .position(|p| !p.bound && !p.pending && p.held == 0)
@@ -462,13 +375,11 @@ mod tests {
             slot_image[setup] = Some(dst);
             pending.insert(vk.setup_id, dst);
 
-            // Post-submit: the slots the conversion held back, exactly where
-            // `Decoder::decode` applies them.
+            // Deferred releases, as `Decoder::decode` applies them.
             for id in &vk.release_after_decode {
                 assert!(slots.release(*id), "a deferred id held no slot");
             }
 
-            // Settle: outputs deliver to the consumer; removed-never-output free.
             for id in &plan.dpb.outputs {
                 if let Some(picture) = pending.remove(id) {
                     pictures[picture].pending = false;
@@ -481,7 +392,7 @@ mod tests {
                     pictures[picture].pending = false;
                 }
             }
-            // The hold-N consumer: releases only once it holds MORE than `hold`.
+            // Releases only once the consumer holds more than `hold`.
             while consumer.len() > hold {
                 let released = consumer.pop_front().expect("nonempty");
                 pictures[released].held -= 1;
@@ -490,16 +401,12 @@ mod tests {
         None
     }
 
-    /// The .25 field-failure regression, pool-model edition: the vendored vector
-    /// keeps up to `max_dpb_frames + 1 = 8` pictures resident AND the real
-    /// client holds ~4 delivered frames — the pool must absorb BOTH at once.
-    /// `required_slots + HOLD_HEADROOM` never starves; the counterfactual shows
-    /// an under-headroomed pool starving on the same clean stream, which is the
-    /// exact class the fixed-size ring shipped in the first WP-B round.
+    /// The pool must absorb DPB residency (`max_dpb_frames + 1`) and four
+    /// held delivered frames at once. `required_slots + HOLD_HEADROOM` never
+    /// starves; an under-headroomed pool on the same stream does.
     #[test]
     fn the_full_vector_with_a_hold_four_consumer_never_starves_the_picture_pool() {
-        // This vector: max_dpb_frames = 7 → required_slots = 8 (measured;
-        // asserted inside via SlotMap sizing).
+        // This vector: max_dpb_frames = 7 → required_slots = 8.
         let required_slots = 8;
         let headroom = crate::images::HOLD_HEADROOM as usize;
         assert_eq!(
@@ -507,8 +414,6 @@ mod tests {
             None,
             "the shipped sizing must survive the whole vector with 4 held frames"
         );
-        // Counterfactual: holds beyond the headroom starve — the documented
-        // NoFreeSlot condition, now meaning exactly what it says.
         assert!(
             simulate_pool_occupancy(required_slots + 2, 4).is_some(),
             "an under-headroomed pool must starve (else this regression proves nothing)"
@@ -520,7 +425,6 @@ mod tests {
         let aus = split_into_aus(TEST_25FPS);
         let mut planner = H264Planner::new();
         let mut slots: Option<SlotMap> = None;
-        // PicId -> the slot it was assigned; entries leave only on `removed`.
         let mut held: BTreeMap<PicId, u8> = BTreeMap::new();
         let mut converted = 0usize;
 
@@ -530,8 +434,6 @@ mod tests {
             let vk = plan_to_vk(&plan, slots, 0).expect("the clean vector converts");
             converted += 1;
 
-            // Slot stability: every reference resolves to the slot its picture was
-            // assigned when IT was decoded, and no ref shares the setup slot.
             for r in &vk.refs {
                 assert_eq!(
                     held.get(&r.id),
@@ -541,8 +443,6 @@ mod tests {
                 assert_ne!(r.slot, vk.setup_slot, "a reference aliases the setup slot");
             }
 
-            // Slice offsets: one per slice, each at a start-code boundary of the AU,
-            // and exactly where the plan said the slice begins.
             assert_eq!(vk.slice_offsets.len(), plan.slices.len());
             for (offset, slice) in vk.slice_offsets.iter().zip(&plan.slices) {
                 let offset = *offset as usize;
@@ -564,12 +464,8 @@ mod tests {
                 plan.picture.top_field_order_cnt
             );
 
-            // Mirror the map's bookkeeping: record the new picture, drop the removed.
-            //
-            // The removals are dropped only after the deferred releases run, because
-            // that is when the MAP drops them — before that the conversion is still
-            // holding them so this AU's submission can name their slots
-            // (`DecodePlanVk::release_after_decode`).
+            // Drop `removed` only after the deferred releases run — that is
+            // when the map drops them.
             let stored = plan.dpb.stored.unwrap();
             assert_eq!(vk.setup_id, stored);
             assert_eq!(vk.setup_is_reference, plan.picture.is_reference);
@@ -591,23 +487,19 @@ mod tests {
                 held.remove(id);
             }
 
-            // held() must mirror the plan-driven bookkeeping exactly, every AU.
             let ledger: BTreeMap<PicId, u8> = slots.held().map(|(slot, id)| (id, slot)).collect();
             assert_eq!(ledger, held);
         }
 
         assert_eq!(converted, 250, "the vector's own golden");
 
-        // Teardown: the flush update releases every remaining slot.
         let mut slots = slots.unwrap();
         slots.apply(&planner.flush());
         assert_eq!(slots.active(), 0);
     }
 
-    /// Byte-level authoring, mirroring pf-bitstream's MMCO/LTR test (its helpers are
-    /// `#[cfg(test)]`-private): parameter sets via the vendored builders +
-    /// synthesizer, slice headers hand-written with the vendored `NaluWriter`. The
-    /// planner only reads headers, so no slice data follows the rbsp stop bit.
+    /// Authored 64x64 Main SPS/PPS for long-term marking (no vendored vector
+    /// carries MMCO). Slice headers are written by hand.
     fn authored_sps_pps() -> (Rc<Sps>, Rc<Pps>) {
         let sps = SpsBuilder::new()
             .seq_parameter_set_id(0)
@@ -628,10 +520,10 @@ mod tests {
         (sps, pps)
     }
 
-    /// `bottom_delta` writes `delta_pic_order_cnt_bottom` — only legal when the PPS
-    /// the slice references sets `bottom_field_pic_order_in_frame_present_flag`
-    /// (the parser reads the field iff the flag is set, so writer and PPS must
-    /// agree).
+    /// One IDR slice NALU. `bottom_delta` writes `delta_pic_order_cnt_bottom`,
+    /// legal only when the referenced PPS sets
+    /// `bottom_field_pic_order_in_frame_present_flag` — writer and PPS must agree.
+    /// The planner reads headers only, so no slice data follows the rbsp stop bit.
     fn write_idr_slice(bottom_delta: Option<i32>) -> Vec<u8> {
         let mut buf = Vec::new();
         {
@@ -657,10 +549,9 @@ mod tests {
         buf
     }
 
-    /// One P slice NALU. `mmco_ops` = `None` for sliding-window marking, `Some(ops)`
-    /// for adaptive marking with `(operation, single-argument)` pairs (ops 2/4/6 all
-    /// take exactly one) — the writer appends the terminating op 0. `bottom_delta`
-    /// as in [`write_idr_slice`].
+    /// One P slice NALU. `mmco_ops = None` is sliding-window; `Some` is
+    /// adaptive `(operation, arg)` pairs (ops 2/4/6 take one). The writer
+    /// appends terminating op 0. `bottom_delta` as in [`write_idr_slice`].
     fn write_p_slice(
         frame_num: u32,
         poc_lsb: u32,
@@ -710,8 +601,6 @@ mod tests {
         Synthesizer::<'_, Sps, _>::synthesize(3, &sps, &mut au0, true).unwrap();
         Synthesizer::<'_, Pps, _>::synthesize(3, &pps, &mut au0, true).unwrap();
         au0.extend(write_idr_slice(None));
-        // AU1 marks itself long-term: MMCO 4 admits long-term index 0, MMCO 6
-        // assigns it to the current picture.
         let au1 = write_p_slice(1, 2, None, 1, Some(&[(4, 1), (6, 0)]));
         let au2 = write_p_slice(2, 4, None, 2, None);
 
@@ -730,8 +619,6 @@ mod tests {
         assert!(vk0.setup_is_reference, "an IDR is a reference");
         assert!(vk0.refs.is_empty());
 
-        // AU1: the setup slot activates LONG-TERM (its own MMCO 6), keyed by
-        // LongTermFrameIdx 0, not by frame_num 1.
         let p1 = planner.plan_au(&au1).unwrap();
         let lt_id = p1.dpb.stored.unwrap();
         let vk1 = plan_to_vk(&p1, &mut slots, 0).unwrap();
@@ -743,8 +630,6 @@ mod tests {
         assert_eq!(vk1.refs[0].id, idr_id);
         assert_eq!(vk1.refs[0].std.flags.used_for_long_term_reference(), 0);
 
-        // AU2 references both: the IDR short-term (keyed by frame_num) and AU1
-        // long-term (keyed by LongTermFrameIdx), each on its stable slot.
         let p2 = planner.plan_au(&au2).unwrap();
         let vk2 = plan_to_vk(&p2, &mut slots, 0).unwrap();
         let by_id: BTreeMap<PicId, &VkRef> = vk2.refs.iter().map(|r| (r.id, r)).collect();
@@ -779,8 +664,8 @@ mod tests {
         let idr_id = p0.dpb.stored.unwrap();
         let p1 = planner.plan_au(&au1).unwrap();
 
-        // A right-sized map that never saw AU0, holding one unrelated slot: the
-        // reference must fail loudly, not resolve to a fabricated slot.
+        // Right-sized map that never saw AU0: the reference must fail, not
+        // resolve to a fabricated slot.
         let mut fresh = SlotMap::new(p1.picture.max_dpb_frames);
         fresh.assign(999).unwrap();
         assert_eq!(
@@ -788,13 +673,11 @@ mod tests {
             PlanToVkError::UnresolvedReference(idr_id)
         );
 
-        // Atomicity: the failed conversion mutated nothing.
         assert_eq!(fresh.active(), 1);
         assert_eq!(fresh.held().collect::<Vec<_>>(), vec![(0, 999)]);
 
-        // And the session recovers: the next valid AU (an IDR restart) still
-        // converts on the same map. Its `removed` names ids this map never assigned
-        // (planned before the map existed) — tolerated by design.
+        // Next valid AU (IDR restart) still converts. Its `removed` names ids
+        // this map never assigned — tolerated by design.
         let p2 = planner.plan_au(&write_idr_slice(None)).unwrap();
         let vk2 = plan_to_vk(&p2, &mut fresh, 0).unwrap();
         assert_eq!(vk2.setup_slot, 1, "the lowest free slot after the held one");
@@ -803,8 +686,7 @@ mod tests {
 
     #[test]
     fn an_sps_switch_that_resizes_the_dpb_is_a_capacity_mismatch_not_a_guess() {
-        // Two SPSes whose only planning-relevant difference is DPB depth: Level 1 at
-        // 320x240 gives MaxDpbMbs 396 / 300 = 1 frame; Level 4 gives 16.
+        // Level 1 at 320x240: MaxDpbMbs 396/300 = 1 frame. Level 4: 16.
         let authored = |level: Level, max_refs: u8| -> (Rc<Sps>, Rc<Pps>) {
             let sps = SpsBuilder::new()
                 .seq_parameter_set_id(0)
@@ -842,9 +724,6 @@ mod tests {
         let mut slots = SlotMap::new(p0.picture.max_dpb_frames);
         plan_to_vk(&p0, &mut slots, 0).unwrap();
 
-        // The renegotiated stream needs a deeper DPB than this map was built for:
-        // refuse, so the session (WP-C) rebuilds session + map instead of handing
-        // out slots the image pool does not have.
         let p1 = planner.plan_au(&au1).unwrap();
         assert_eq!(p1.picture.max_dpb_frames, 16);
         assert_eq!(
@@ -858,24 +737,10 @@ mod tests {
 
     #[test]
     fn a_full_dpb_bump_reuses_the_slot_but_the_pool_model_binds_a_fresh_image() {
-        // Depth-1 DPB (Level 1 at 320x240 ⇒ max_dpb_frames 1, capacity 2): every
-        // stored P evicts the previous picture, and that picture's id lands in
-        // BOTH `outputs` and `removed` of the SAME plan.
-        //
-        // ⚠ This test used to assert that `plan_to_vk` freed the evicted slot and
-        // re-assigned it as THIS AU's setup, calling that "the planner's normal
-        // behaviour". It was not: AU1 is a P picture that REFERENCES the picture it
-        // was evicting, so the submission named one slot as both `pSetupReferenceSlot`
-        // and a reference — a decode into the surface being predicted from. The same
-        // defect the AV1 rung was fixed for on 2026-08-07, authored here in miniature
-        // and asserted as correct. `DecodePlanVk::release_after_decode` is the fix, and
-        // this depth-1 stream is its tightest possible case: capacity 2, so the setup
-        // has exactly one slot to go to and it is the spare.
-        //
-        // What the test still proves, and what it was really written for, is the pool
-        // decoupling: the delivered picture's IMAGE is never the new decode target
-        // while the consumer holds it (the HIGH overwrite bug of the adversarial
-        // round, and the .25 field failure's class).
+        // Depth-1 DPB (Level 1 at 320x240 → max_dpb_frames 1, capacity 2):
+        // every stored P evicts the previous picture into both `outputs` and
+        // `removed` of the same plan. AU1 still references that picture, so
+        // setup must take the spare; the pool must not rebind a held image.
         let sps = SpsBuilder::new()
             .seq_parameter_set_id(0)
             .profile_idc(Profile::Main)
@@ -902,8 +767,7 @@ mod tests {
         let mut slots = SlotMap::new(p0.picture.max_dpb_frames);
         let vk0 = plan_to_vk(&p0, &mut slots, 0).unwrap();
 
-        // Decoder-side pool bookkeeping (mirrors decode_inner): image 0 hosts
-        // picture 0; the consumer receives and HOLDS its frame.
+        // Image 0 hosts picture 0; the consumer holds the delivered frame.
         let pool = 2 + 1; // required_slots + 1 of headroom is enough here
         let mut bound = vec![false; pool];
         let mut held = vec![0u32; pool];
@@ -914,17 +778,14 @@ mod tests {
         bound[img0] = true;
         slot_image[usize::from(vk0.setup_slot)] = Some(img0);
 
-        // AU1 bumps AU0's picture: outputs+removed carry id0, and plan_to_vk
-        // hands the SAME slot back as the setup.
         let p1 = planner
             .plan_au(&write_p_slice(1, 2, None, 1, None))
             .unwrap();
         assert!(p1.dpb.outputs.contains(&vk0.setup_id) && p1.dpb.removed.contains(&vk0.setup_id));
         let vk1 = plan_to_vk(&p1, &mut slots, 0).unwrap();
 
-        // AU1 REFERENCES the very picture it evicts — so the eviction is deferred and
-        // the setup goes to the spare slot instead. Without the deferral these two
-        // assertions are what fails, and they are the whole defect in two lines.
+        // AU1 still references the picture it evicts, so the eviction is
+        // deferred and setup takes the spare slot.
         assert!(
             vk1.refs.iter().any(|r| r.id == vk0.setup_id),
             "AU1 must reference the picture it evicts, or this proves nothing"
@@ -942,10 +803,8 @@ mod tests {
             "the eviction is handed back, not applied"
         );
 
-        // Binding sync: the setup slot is fresh, so nothing is unbound for it;
-        // picture 0's image is delivered to the consumer (held), NOT freed. Its slot
-        // is still HELD at this point — which is exactly what keeps its image bound
-        // while the decode op reads it as a reference.
+        // Slot still held through the submit, so picture 0's image stays bound
+        // as a reference while the consumer holds the delivered frame.
         assert!(
             slots
                 .held()
@@ -953,9 +812,8 @@ mod tests {
             "the referenced picture must still hold its slot through the submission"
         );
         bound[img0] = false;
-        held[img0] += 1; // outputs → delivered, consumer holds it
+        held[img0] += 1;
 
-        // The pool hands the re-activated slot a FRESH image — never image 0.
         let img1 = free(&bound, &held).expect("headroom guarantees a free image");
         assert_ne!(
             img1, img0,
@@ -965,9 +823,7 @@ mod tests {
         bound[img1] = true;
         slot_image[usize::from(vk1.setup_slot)] = Some(img1);
 
-        // Post-submit: the deferred release lands, and NOW the evicted slot is free —
-        // a picture later than this submission may have it, which is the only thing
-        // the deferral ever postponed.
+        // Deferred release lands after submit; only then is the evicted slot free.
         for id in &vk1.release_after_decode {
             assert!(slots.release(*id));
         }
@@ -976,17 +832,14 @@ mod tests {
             "the deferred release must actually free the slot"
         );
 
-        // Once the consumer releases frame 0, image 0 returns to the free list.
         held[img0] -= 1;
         assert_eq!(free(&bound, &held), Some(img0));
     }
 
     #[test]
     fn a_nonzero_delta_bottom_reaches_setup_and_reference_poc_pairs_distinctly() {
-        // A PPS with bottom_field_pic_order_in_frame_present_flag: progressive
-        // frames then carry delta_pic_order_cnt_bottom and bottom != top. The
-        // builder has no setter for the flag, so the Pps is constructed directly
-        // (its fields are public) and synthesized from there.
+        // Builder has no setter for bottom_field_pic_order_in_frame_present_flag,
+        // so the Pps is constructed directly (fields are public) and synthesized.
         let sps = SpsBuilder::new()
             .seq_parameter_set_id(0)
             .profile_idc(Profile::Main)
@@ -1040,8 +893,7 @@ mod tests {
         );
         let mut slots = SlotMap::new(p0.picture.max_dpb_frames);
         let vk0 = plan_to_vk(&p0, &mut slots, 0).unwrap();
-        // BOTH orders, both structs: a top/bottom swap or a collapse to one value
-        // must fail here.
+        // Both structs, both orders: a swap or a collapse to one value must fail.
         assert_eq!(vk0.std_pic.PicOrderCnt, [0, 2]);
         assert_eq!(vk0.setup_ref.PicOrderCnt, [0, 2]);
 
@@ -1049,8 +901,7 @@ mod tests {
         let vk1 = plan_to_vk(&p1, &mut slots, 0).unwrap();
         assert_eq!(vk1.std_pic.PicOrderCnt, [4, 5]);
         assert_eq!(vk1.setup_ref.PicOrderCnt, [4, 5]);
-        // The reference carries the STORED pair of the IDR — through RefPic, not a
-        // fabricated bottom.
+        // Stored IDR pair through RefPic, not a fabricated bottom.
         assert_eq!(vk1.refs.len(), 1);
         assert_eq!(vk1.refs[0].id, p0.dpb.stored.unwrap());
         assert_eq!(vk1.refs[0].std.PicOrderCnt, [0, 2]);
