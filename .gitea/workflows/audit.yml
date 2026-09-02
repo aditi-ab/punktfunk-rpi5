@@ -90,10 +90,9 @@ jobs:
         run: |
           git config --global --add safe.directory "$PWD"
           command -v cargo-audit >/dev/null 2>&1 || cargo install --locked cargo-audit
-          # Bare `cargo audit` scans ONLY the root Cargo.lock. The other three Rust workspaces are
-          # separate locks and were silently never scanned — the drivers one despite already being
-          # in this job's `paths:` filter, so edits to it triggered a run that then ignored it.
-          # Each needs its own `--file`. `pf-vkhdr-layer` had no lockfile at all until 2026-08-13.
+          # Bare `cargo audit` scans only the root lock. Scan each separate workspace
+          # explicitly. `--deny unsound` fails memory-safety advisories while
+          # unmaintained findings remain visible warnings.
           cargo audit --deny unsound
           cargo audit --deny unsound --file packaging/windows/drivers/Cargo.lock
           cargo audit --deny unsound --file packaging/windows/pf-vkhdr-layer/Cargo.lock

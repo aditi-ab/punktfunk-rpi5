@@ -4,11 +4,8 @@
 # or an accepted, documented risk. Keep this list TIGHT and justify every entry — an ignore here
 # means the audit job stops flagging it, so the reasoning must hold up.
 #
-# ⚠ NOTE: `cargo audit` (no `--deny warnings`) fails only on *vulnerabilities* — `unmaintained` AND
-# `unsound` advisories are warnings that do NOT fail CI. That is deliberate for the two unmaintained
-# crates below, but it does mean an unsoundness can sit here unnoticed: RUSTSEC-2026-0221
-# (event-listener) did exactly that until the 2026-08-13 sweep. Read the job's warnings, not just
-# its exit code.
+# The workflow's `--deny unsound` fails vulnerabilities and unsound advisories.
+# Unmaintained advisories stay visible without failing CI for the two crates below.
 #
 # The two unmaintained ones, both transitive with no successor to bump to, left visible on purpose
 # so we keep getting the maintenance signal:
