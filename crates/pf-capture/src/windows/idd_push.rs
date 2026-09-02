@@ -347,6 +347,8 @@ pub struct IddPushCapturer {
     source_seq: u64,
     /// Health classifier + staged-recovery ladder over this capturer's clocks (WP12/WP13).
     recovery: recovery::Supervisor,
+    /// A closed episode's measured outage, until the stream loop takes it (WP14).
+    recovered_outage: Option<Duration>,
     /// Owns the shared-header file mapping + its mapped view (RAII unmap-then-close). Declared BEFORE
     /// `header`, which is a raw pointer borrowed into this view via [`MappedSection::ptr`]. Also the
     /// duplication source for the driver's header handle on every [`ChannelBroker::send`].
@@ -1758,12 +1760,14 @@ impl IddPushCapturer {
             }
             // A recovery episode closes only on the budgeted count of NEW source frames: one
             // stash republish after a rebuild is one frame, never proof.
-            if let Some(summary) = self.recovery.source_frame(now) {
+            if let Some((summary, outage)) = self.recovery.source_frame(now) {
                 tracing::info!(
                     target = %self.ccd,
                     ?summary,
+                    outage_ms = outage.as_millis() as u64,
                     "IDD push: recovery episode closed"
                 );
+                self.recovered_outage = Some(outage);
             }
             // A fresh driver frame: feed the driver-death watch and roll the stall-evidence
             // trackers (a regen re-encodes OLD content — it is not evidence of driver progress).
@@ -2032,6 +2036,10 @@ impl Capturer for IddPushCapturer {
             return false;
         }
         true
+    }
+
+    fn take_recovered_outage(&mut self) -> Option<Duration> {
+        self.recovered_outage.take()
     }
 
     fn recreate_ring_in_place(&mut self) -> bool {

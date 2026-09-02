@@ -27,9 +27,8 @@ pub enum RingFault {
     /// producer, so the generation cannot be trusted either.
     ReleaseFailed { hr: i32, removed: i32 },
     /// A known-ACTIVE display (input/cursor moving, or the driver still offering frames)
-    /// delivered no new source frame through the stale floor and one in-place rebuild — the
-    /// interim stale-source watchdog's terminal verdict (immunity plan WP3b; retired when the
-    /// staged recovery ladder owns the decision).
+    /// delivered no new source frame through the stale floor and the staged recovery ladder
+    /// (immunity plan WP13) — its terminal verdict; `secs` is the source gap at that point.
     SourceStalled { secs: u32 },
 }
 
@@ -173,6 +172,14 @@ pub trait Capturer: Send {
     /// so the two-strike debounce never trips. `true` handled; `false` unrecoverable.
     fn recreate_ring_in_place(&mut self) -> bool {
         false
+    }
+
+    /// A staged-recovery episode closed on new source frames since the last
+    /// call: the measured local outage, from the last source frame before the
+    /// stall to the frame that proved recovery. The stream loop forces an IDR
+    /// and announces the gap. `None` = nothing recovered.
+    fn take_recovered_outage(&mut self) -> Option<std::time::Duration> {
+        None
     }
 }
 

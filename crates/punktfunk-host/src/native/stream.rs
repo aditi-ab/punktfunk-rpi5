@@ -2142,6 +2142,21 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             }
         }
         let mut want_kf = false;
+        // Staged recovery closed on real source frames (WP14): the client held the last image
+        // through the hole, so the next AU is an IDR, owed in-flight records are invalid, and
+        // the measured local outage is announced so the straddling window is not scored as
+        // congestion.
+        if let Some(outage) = capturer.take_recovered_outage() {
+            let outage_ms = outage.as_millis().min(u32::MAX as u128) as u32;
+            tracing::info!(
+                outage_ms,
+                "capture recovered from a source stall — forcing an IDR, announcing the gap"
+            );
+            want_kf = true;
+            inflight.clear();
+            last_forced_idr = Some(std::time::Instant::now());
+            announce_pipeline_gap(&gap_tx, outage_ms);
+        }
         while keyframe.try_recv().is_ok() {
             want_kf = true;
         }
