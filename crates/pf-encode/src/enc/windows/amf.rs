@@ -1,7 +1,7 @@
 //! AMD **AMF** hardware encoder (Windows, D3D11 input). Direct-SDK analogue of [`super::nvenc`].
 //!
 //! Drives the AMF **C vtable ABI** (GPUOpen headers; FFmpeg's `amfenc.c` uses the same surface,
-//! not the C++ classes). FFI is header **v1.4.36**; load accepts runtimes down to **v1.4.34**
+//! not the C++ classes). FFI is header **v1.4.36**; load accepts runtimes down to **v1.4.30**
 //! ([`sys::AMF_MIN_VERSION`]). Newer encoder features are string-keyed properties that degrade
 //! per driver, not vtable changes. Loads `amfrt64.dll` at runtime — no build feature. Missing or
 //! old runtime fails [`AmfEncoder::open`] and the session.
@@ -181,7 +181,7 @@ fn load_factory() -> std::result::Result<AmfLib, String> {
         if version < sys::AMF_MIN_VERSION {
             return Err(format!(
                 "AMF runtime {amf} (loaded from {dll_desc}) is older than the minimum supported \
-                 1.4.34 — update the AMD driver (Adrenalin 24.6.1+; 25.1.1+ for the \
+                 1.4.30 — update the AMD driver (Adrenalin 23.5.2+; 25.1.1+ for the \
                  fully-validated feature set). If the display driver already reports a newer \
                  version, this amfrt64.dll did not update — reboot, then DDU + reinstall so \
                  System32's copy is refreshed.",
@@ -212,7 +212,8 @@ fn load_factory() -> std::result::Result<AmfLib, String> {
                  encode ABI is stable), but advanced features (LTR / intra-refresh recovery, AV1 \
                  coded-size alignment, in-band HDR metadata) validated on 1.4.36 may be \
                  unavailable on this driver and will degrade individually (see the per-property \
-                 logs below). Update to AMD Adrenalin 25.1.1+ for the fully-validated path."
+                 logs below). Update to AMD Adrenalin 25.1.1+ for the fully-validated path \
+                 (Polaris/Vega drivers stay on 1.4.31 and only get the core path)."
             );
         }
         Ok(AmfLib { factory, version })
