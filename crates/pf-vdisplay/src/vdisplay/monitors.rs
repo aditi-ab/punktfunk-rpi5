@@ -303,6 +303,9 @@ mod windows_tests {
             height: 1080,
             refresh_mhz: 59940,
             primary: active,
+            hdr: active.then_some(false),
+            source_id: target_id,
+            source_adapter_luid: 0,
         }
     }
 
