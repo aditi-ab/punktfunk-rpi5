@@ -1,24 +1,14 @@
 //! Ask a devnode which process is serving it — the host half of
 //! [`pf_driver_proto::gamepad::ChannelProof`].
 //!
-//! This is what the pad channel trusts instead of the bootstrap mailbox's `driver_pid`. The mailbox
-//! has to be openable by LocalService (that is what the driver's own WUDFHost runs as), and the
-//! delivery gate `verify_is_wudfhost` only checks that the named process's IMAGE is the system
-//! `WUDFHost.exe` — which is world-executable. So through gamepad proto v2 any LocalService
-//! principal, notably the deliberately de-privileged plugin runner, could spawn its own WUDFHost,
-//! publish that pid, and be handed the pad's live DATA section: forged HID input into the interactive
-//! desktop and a read of the remote user's controller state (security-review 2026-07-28).
+//! The pad channel duplicates the unnamed DATA section into this pid, not the
+//! bootstrap mailbox's `driver_pid`. The mailbox is LocalService-writable (WUDFHost
+//! must open it) and `verify_is_wudfhost` only checks the image path of a
+//! world-executable `WUDFHost.exe`. I/O to the instance id `SwDeviceCreate` returned
+//! reaches only the driver PnP bound to that device.
 //!
-//! No host-side check could tell the two apart. Everything the real driver can read at LocalService —
-//! the devnode's Location, its `Device Parameters` key, the object namespace — an attacker at
-//! LocalService can read too, and both are session-0 LocalService processes running the same image,
-//! so token, session and image checks all discriminate nothing. The one thing an attacker cannot
-//! forge is **being the driver bound to the devnode we created**: I/O sent to that device reaches
-//! only the driver PnP bound to it, and we look the device up by the instance id `SwDeviceCreate`
-//! handed back, so a planted look-alike devnode is not in the running either.
-//!
-//! Three transports, one per driver shape — see [`ProofTransport`] for what each of them cost
-//! and why the obvious ones did not survive contact with hidclass.
+//! Three transports, one per driver shape — see [`ProofTransport`]. Evidence:
+//! `design/gamepad-channel-sealing.md`, `pf_umdf_util::hid`.
 
 use anyhow::{anyhow, bail, Context, Result};
 use pf_driver_proto::gamepad::{
@@ -43,41 +33,30 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::DeviceIoControl;
 
-/// `GUID_DEVINTERFACE_XUSB` {EC87F1E3-C13B-4100-B5F7-8B84D54260CB} — the interface `pf_xusb`
-/// registers on its own devnode (and what `xinput1_4` enumerates).
+/// Interface `pf_xusb` registers on its own devnode — also what `xinput1_4` enumerates.
 const GUID_DEVINTERFACE_XUSB: GUID = GUID::from_u128(0xEC87F1E3_C13B_4100_B5F7_8B84D54260CB);
 
-/// How a driver answers the proof — one variant per driver shape, because what Windows actually
-/// carries to each shape differs (all three measured on .173 / Win11 26200, 2026-07-28).
+/// How a driver answers the proof. One variant per driver shape: hidclass sits on the HID
+/// minidrivers and swallows a private IOCTL, so they cannot share `pf_xusb`'s path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProofTransport {
-    /// `pf_xusb`: a private IOCTL on `GUID_DEVINTERFACE_XUSB`, the interface it registers on its own
-    /// devnode. Works because it is NOT a HID minidriver — nothing sits above it, so it owns both
-    /// `IRP_MJ_CREATE` and its own IOCTL dispatch.
+    /// `pf_xusb`: private IOCTL on [`GUID_DEVINTERFACE_XUSB`]. Not a HID minidriver, so it owns
+    /// `IRP_MJ_CREATE` and its own IOCTL dispatch — hidclass is not sitting above it.
     XusbIoctl,
-    /// `pf_mouse`: the proof arrives as the HID **serial-number string**. The one transport that
-    /// survived measurement against a UMDF HID minidriver — `HidD_GetSerialNumberString` on a
-    /// zero-access handle, verified end to end (`PFCP:3:0:7296`, and 7296 was a real
-    /// service-spawned `WUDFHost.exe`). Safe here because nothing reads the virtual mouse's serial.
+    /// `pf_mouse`: the proof is the HID serial-number string. `HidD_GetSerialNumberString` on a
+    /// zero-access handle is the named-string IOCTL hidclass forwards to a UMDF HID minidriver.
+    /// Safe here because nothing reads the virtual mouse's serial.
     HidSerialString,
-    /// `pf_gamepad` (DualSense / DualShock 4 / Edge / Deck): a HID **feature report**.
-    ///
-    /// The pads cannot use the serial string — it is what SDL and Steam dedup controllers on, and
-    /// Steam is known to mangle a pad's displayed name over serial FORMAT alone. They get a feature
-    /// report instead, and it costs NO report-descriptor change, because the captured descriptors
-    /// already declare far more feature ids than the driver ever served: `0x85` is declared as a
-    /// Feature report on DualSense, DualShock 4 and Edge alike and used to fail with
-    /// `STATUS_INVALID_PARAMETER`. The Deck declares one UNNUMBERED feature report driven as
-    /// command→response, so its proof rides that existing contract via a private two-byte command.
+    /// `pf_gamepad`: a HID feature report. Pad serials are what SDL and Steam dedup on, so they
+    /// cannot share the mouse's serial transport. Costs no descriptor change: DualSense / DualShock 4
+    /// / Edge already declare unused feature `0x85`; the Deck's unnumbered feature is command→response
+    /// and the proof rides a private two-byte command.
     HidFeatureReport,
 }
 
-/// Ask the devnode `instance_id` (as `SwDeviceCreate` reported it) which process serves it, and
-/// return that pid — already checked against `expect_pad_index` and this build's protocol version.
-///
-/// Every failure is a refusal to deliver, so the errors say exactly which step failed: an operator
-/// staring at a dead gamepad needs to know whether the devnode is missing, the interface has not
-/// appeared yet, or a driver answered something we did not mint.
+/// Ask the `SwDeviceCreate` instance `instance_id` which process serves it. The pid is already
+/// checked against `expect_pad_index` and this build's protocol version; every error is a
+/// refusal to deliver (missing devnode vs. unbound vs. a proof we did not mint).
 pub(super) fn query(
     instance_id: &str,
     transport: ProofTransport,
@@ -103,7 +82,7 @@ pub(super) fn query(
              is not bound to this devnode at all)"
         );
     }
-    // A devnode can publish more than one collection; ask each and take the first well-formed proof.
+    // One devnode can publish several collections; take the first well-formed proof, not the first answer.
     let mut last_err = None;
     for path in &paths {
         let r = match transport {
@@ -119,7 +98,7 @@ pub(super) fn query(
     Err(last_err.unwrap_or_else(|| anyhow!("no interface answered a channel proof")))
 }
 
-/// Open `path` and put the proof IOCTL to it (the private pad-control interface, and `pf_xusb`'s own).
+/// Private IOCTL on `pf_xusb`'s own interface (not a HID collection).
 fn ask_ioctl(path: &str, expect_pad_index: u32) -> Result<u32> {
     let handle = open_device(path)?;
     let proof = ask_xusb(HANDLE(handle.as_raw_handle()))?;
@@ -128,16 +107,13 @@ fn ask_ioctl(path: &str, expect_pad_index: u32) -> Result<u32> {
         .map_err(|why| anyhow!("{why}"))
 }
 
-/// Open a HID collection and read the proof out of a FEATURE report — the pad transport.
 fn ask_feature_path(path: &str, expect_pad_index: u32) -> Result<u32> {
     let handle = open_device(path)?;
     ask_feature(HANDLE(handle.as_raw_handle()), expect_pad_index)
 }
 
-/// Take a parsed answer only if it VALIDATES; otherwise remember why and let the caller keep
-/// looking. Parsing is not evidence: [`ChannelProof::from_feature_report`] happily reinterprets any
-/// 17 bytes, so a transport that answers with something else entirely yields a proof-shaped struct
-/// full of another report's bytes.
+/// Return a pid only if [`ChannelProof::check`] accepts it. [`ChannelProof::from_feature_report`]
+/// reinterprets any 17 bytes, so a foreign report becomes a proof-shaped struct of junk.
 fn accept(
     p: Option<ChannelProof>,
     expect: u32,
@@ -152,11 +128,9 @@ fn accept(
     }
 }
 
-/// Parse a SET→GET command reply into a validated pid. The driver answers with the payload
-/// `[DECK_PROOF_CMD, ChannelProof, zeros…]`; Windows hands it back either as served (offset 0) or
-/// one byte in, behind the report-id slot (the unnumbered-report marshalling). Accept either
-/// placement rather than pinning a marshalling detail that differs between the descriptors this
-/// one driver serves.
+/// Parse a SET→GET reply. The driver writes `[DECK_PROOF_CMD, ChannelProof, zeros…]`; hidclass
+/// returns it either as served (offset 0) or one byte in, behind the report-id slot. Accept both
+/// rather than pinning a marshalling that differs across the descriptors this one driver serves.
 fn proof_from_reply(reply: &[u8], expect: u32, rejected: &mut Option<&'static str>) -> Option<u32> {
     for off in [0usize, 1] {
         let Some(body) = reply.get(off..) else {
@@ -171,27 +145,22 @@ fn proof_from_reply(reply: &[u8], expect: u32, rejected: &mut Option<&'static st
     None
 }
 
-/// The PS identities answer on the declared-but-unserved report `0x85`; the Deck answers its
-/// unnumbered report after a private SET_FEATURE command; the Triton answers that SAME command on
-/// its declared feature id `0x01` — a numbered-report collection, where hidclass refuses the other
-/// two frames outright (see the third leg below). All are tried — one driver binary serves every
-/// pad identity and the host does not know which one this devnode became until the DATA section
-/// is attached, which is precisely what we are trying to earn the right to do.
+/// Probe every identity this one driver binary can become. DualSense / DualShock 4 / Edge answer
+/// on declared-but-unserved `0x85`; the Deck answers its unnumbered report after a private
+/// SET_FEATURE command; Triton answers that same command on declared feature id `0x01`. The host
+/// does not know which identity this devnode became until the DATA section is attached — the
+/// thing this proof is trying to earn.
 ///
-/// So neither answer can be trusted on shape alone: a Deck serves its ONE unnumbered feature report
-/// for *any* requested id, which means it answers the `0x85` probe with Steam attribute bytes that
-/// parse into a proof and fail on magic. Returning that first answer stopped the search and refused
-/// the delivery while the real proof sat one transport away.
+/// Shape is not enough: a Deck serves its one unnumbered feature for *any* requested id, so the
+/// `0x85` probe returns Steam attribute bytes that parse as a proof and fail on magic. Returning
+/// that first answer stopped the search while the real proof sat one transport away.
 fn ask_feature(h: HANDLE, expect_pad_index: u32) -> Result<u32> {
-    // `HidD_GetFeature`/`HidD_SetFeature` REJECT any buffer shorter than the collection's
-    // `FeatureReportByteLength` — so it must come from the descriptor, not from a constant. The PS
-    // identities land on 64 (63-byte reports + a report id); the Deck's ONE feature report is
-    // unnumbered and 64 bytes wide, which Windows reports as 65 (payload + the report-id slot it
-    // always reserves). Hardcoding 64 silently failed every call on a correctly-enumerated Deck.
+    // HidD_{Get,Set}Feature reject a buffer shorter than `FeatureReportByteLength`. PS identities
+    // land on 64 (63 + report id); the Deck's unnumbered 64-byte feature is reported as 65
+    // (payload + the reserved report-id slot). Hardcoding 64 failed every correctly-enumerated Deck.
     let buf_len = feature_report_len(h).unwrap_or(64).max(64);
     let mut rejected = None;
 
-    // PS identities: GET_FEATURE 0x85.
     let mut buf = vec![0u8; buf_len];
     buf[0] = HID_FEATURE_REPORT_CHANNEL_PROOF;
     // SAFETY: `h` is the live HID interface handle; `buf` is a valid `buf_len`-sized in/out buffer.
@@ -202,7 +171,7 @@ fn ask_feature(h: HANDLE, expect_pad_index: u32) -> Result<u32> {
         }
     }
 
-    // Deck: SET the private command, then GET the reply. Byte 0 is the (unnumbered) report id 0.
+    // Deck: SET the private command, then GET. Byte 0 stays 0 — unnumbered report id.
     let mut cmd = vec![0u8; buf_len];
     cmd[1..1 + DECK_PROOF_CMD.len()].copy_from_slice(&DECK_PROOF_CMD);
     // SAFETY: `h` is live; `cmd` is a valid `buf_len`-sized buffer.
@@ -217,17 +186,10 @@ fn ask_feature(h: HANDLE, expect_pad_index: u32) -> Result<u32> {
         }
     }
 
-    // Numbered-report collections (Triton): the SAME SET→GET command contract, framed id-first.
-    // hidclass rejects a `HidD_SetFeature`/`HidD_GetFeature` buffer whose byte 0 is not a declared
-    // NONZERO feature report id (the gating the driver's XBOX_RDESC feature-report note records:
-    // built without a declared feature id the pad "enumerates perfectly and then delivers
-    // NOTHING"), and the Triton descriptor declares feature ids 0x01/0x02 while `0x85` is one of
-    // its OUTPUT reports — so on that collection BOTH legs above die at hidclass before the driver
-    // ever sees them. Ride the proof on declared id 0x01 instead: the driver strips a leading
-    // 0x00 OR 0x01 before matching the command (`triton_proof_requested`), so this frame lands on
-    // the same proof machine, and its `[DECK_PROOF_CMD, proof…]` answer parses through the same
-    // offset-0/offset-1 logic as the Deck's. Defensive-in-depth, like the whole function: the legs
-    // run in order and whichever one the transport accepts wins.
+    // Triton (numbered): same SET→GET command, framed id-first. hidclass rejects a feature
+    // buffer whose byte 0 is not a declared nonzero feature id — Triton's 0x85 is OUTPUT, so
+    // both legs above die at hidclass. Ride declared id 0x01; the driver strips a leading
+    // 0x00 or 0x01 before matching (`triton_proof_requested`).
     let mut cmd = vec![0u8; buf_len];
     cmd[0] = 0x01;
     cmd[1..1 + DECK_PROOF_CMD.len()].copy_from_slice(&DECK_PROOF_CMD);
@@ -244,8 +206,7 @@ fn ask_feature(h: HANDLE, expect_pad_index: u32) -> Result<u32> {
             return Ok(pid);
         }
     }
-    // A well-formed answer that failed validation is a different fault from no answer at all, and
-    // says which check refused — do not bury it under the generic "no proof here".
+    // A well-formed answer that failed validation is not "no proof" — surface the check that refused.
     if let Some(why) = rejected {
         bail!("{why}");
     }
@@ -267,7 +228,7 @@ fn ask_feature(h: HANDLE, expect_pad_index: u32) -> Result<u32> {
     )
 }
 
-/// This collection's `FeatureReportByteLength` — the exact buffer size `HidD_GetFeature` /
+/// This collection's `FeatureReportByteLength` — the buffer size `HidD_GetFeature` /
 /// `HidD_SetFeature` demand. `None` when the preparsed data can't be read (caller falls back).
 fn feature_report_len(h: HANDLE) -> Option<usize> {
     let mut pp = PHIDP_PREPARSED_DATA::default();
@@ -283,7 +244,6 @@ fn feature_report_len(h: HANDLE) -> Option<usize> {
     (st.0 >= 0 && caps.FeatureReportByteLength > 0).then_some(caps.FeatureReportByteLength as usize)
 }
 
-/// Open a HID collection and read the proof out of a string.
 fn ask_hid_path(path: &str, expect_pad_index: u32) -> Result<u32> {
     let handle = open_device(path)?;
     let proof = ask_hid(HANDLE(handle.as_raw_handle()))?;
@@ -292,8 +252,8 @@ fn ask_hid_path(path: &str, expect_pad_index: u32) -> Result<u32> {
         .map_err(|why| anyhow!("{why}"))
 }
 
-/// [`query`] for the `channel-proof-probe` subcommand — same call the delivery path makes, so the
-/// probe reports the production answer rather than a re-implementation of it.
+/// Same call the delivery path makes, for the `channel-proof-probe` subcommand — reports the
+/// production answer rather than a re-implementation of it.
 pub fn probe_pid(
     instance_id: &str,
     transport: ProofTransport,
@@ -302,14 +262,10 @@ pub fn probe_pid(
     query(instance_id, transport, expect_pad_index)
 }
 
-/// A human-readable walk of the same lookup [`query`] does, reporting each step and — for the HID
-/// leg — which of the two IOCTLs Windows actually forwarded to the minidriver.
-///
-/// This exists because exactly one thing in this design could not be settled by reading: whether
-/// hidclass forwards `IOCTL_HID_GET_INDEXED_STRING` (and/or an arbitrary-index `IOCTL_HID_GET_STRING`)
-/// down to a UMDF HID minidriver. Both are wired up so the answer only has to be "at least one", but
-/// a maintainer should be able to find out which on a real box in one command rather than by
-/// inference — hence `punktfunk-host channel-proof-probe`.
+/// Walk the same lookup [`query`] does, reporting each step. For the HID serial transport,
+/// print which of `HidD_GetIndexedString` / `HidD_GetSerialNumberString` hidclass actually
+/// forwarded — hidclass currently swallows an arbitrary indexed-string request to a UMDF HID
+/// minidriver (`punktfunk-host channel-proof-probe`).
 pub fn diagnose(instance_id: &str, transport: ProofTransport, expect_pad_index: u32) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -382,7 +338,6 @@ pub fn diagnose(instance_id: &str, transport: ProofTransport, expect_pad_index: 
                 }
             }
             ProofTransport::HidSerialString => {
-                // Report each path separately — this is the whole point of the probe.
                 let (indexed, serial, control) = ask_hid_both(h);
                 let _ = writeln!(out, "    HidD_GetSerialNumberString   -> {serial}");
                 let _ = writeln!(out, "    HidD_GetIndexedString(proof) -> {indexed}");
@@ -393,12 +348,9 @@ pub fn diagnose(instance_id: &str, transport: ProofTransport, expect_pad_index: 
     out
 }
 
-/// The probe's raw material: the proof index alongside a KNOWN-GOOD control, so a failure can be
-/// told apart from "user mode cannot reach this driver at all".
-///
-/// The control is `HidD_GetProductString`, which on-glass succeeds against a UMDF HID minidriver on
-/// the very same 0-access handle where `HidD_GetIndexedString` fails for every index — the
-/// measurement that established the indexed-string transport is unusable (see [`ask_hid`]).
+/// Indexed-string, serial, and `HidD_GetProductString` on the same zero-access handle. The
+/// product string is a known-good control: it succeeds against a UMDF HID minidriver on the
+/// handle where `HidD_GetIndexedString` fails for every index (see [`ask_hid`]).
 fn ask_hid_both(h: HANDLE) -> (String, String, String) {
     let text = |ok: bool, buf: &[u16]| -> String {
         if !ok {
@@ -442,9 +394,9 @@ fn ask_hid_both(h: HANDLE) -> (String, String, String) {
     (indexed, serial, control)
 }
 
-/// `CreateFileW` with **no** access rights: enough to send `FILE_ANY_ACCESS` IOCTLs and to run the
-/// `HidD_*` helpers, and the only thing that works on a HID mouse/keyboard collection, which Windows
-/// refuses to open for read from user mode.
+/// `CreateFileW` with no access rights. Enough for `FILE_ANY_ACCESS` IOCTLs and `HidD_*`,
+/// and the only open that works on a HID mouse/keyboard collection — Windows refuses a
+/// user-mode read handle on those.
 fn open_device(path: &str) -> Result<OwnedHandle> {
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: `wide` is a valid NUL-terminated UTF-16 path for the duration of the call; the returned
@@ -465,7 +417,7 @@ fn open_device(path: &str) -> Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(h.0 as _) })
 }
 
-/// `pf_xusb`: a private METHOD_BUFFERED IOCTL returning the 16 proof bytes.
+/// Private METHOD_BUFFERED IOCTL; 16 is [`ChannelProof`]'s wire size.
 fn ask_xusb(h: HANDLE) -> Result<ChannelProof> {
     let mut buf = [0u8; 16];
     let mut returned = 0u32;
@@ -489,26 +441,11 @@ fn ask_xusb(h: HANDLE) -> Result<ChannelProof> {
     })
 }
 
-/// `pf_gamepad` / `pf_mouse`: the reserved HID string index.
+/// `pf_mouse` serial-number string. Named string IOCTLs (`HidD_GetSerialNumberString` and
+/// friends) reach a UMDF HID minidriver; an arbitrary indexed-string request does not.
 ///
-/// ⚠️ **ON-HARDWARE FINDING, .173 (Win11 26200), 2026-07-28 — this transport DOES NOT WORK.**
-/// Probed against a live `pf_mouse` devnode with the installed driver: on the SAME 0-access handle,
-/// `HidD_GetManufacturerString` / `GetProductString` / `GetSerialNumberString` all succeeded and
-/// returned the driver's OWN strings (so user mode does reach a UMDF HID minidriver, and hidclass
-/// does translate the named string IOCTLs down to its `IOCTL_HID_GET_STRING` handler) — while
-/// `HidD_GetIndexedString` failed for EVERY index tried: 1, 2, 4, 0x0E and 0x5046. Indices 2 and
-/// 0x0E are ones the driver demonstrably serves through the named wrappers, so this is not our
-/// reserved index being out of range: hidclass does not carry an arbitrary indexed-string request to
-/// a UMDF HID minidriver at all.
-///
-/// The call is kept because it costs one failed IOCTL and is the correct thing to ask first if a
-/// later Windows starts forwarding it. What was REMOVED here is a second "fallback" that issued
-/// `IOCTL_HID_GET_STRING` directly: that IOCTL is METHOD_NEITHER and **kernel-facing** — hidclass
-/// sends it DOWN to the minidriver, user mode never sends it up — so it could not have worked, and
-/// on-glass it returned `ERROR_INVALID_FUNCTION` for a control index the device definitely serves.
-/// Do not re-add it.
-///
-/// The HID pads/mouse therefore still need a working proof transport; see the module docs.
+/// Do not re-add a user-mode `IOCTL_HID_GET_STRING`: METHOD_NEITHER and kernel-facing —
+/// hidclass sends it down to the minidriver. User mode never sends it up.
 fn ask_hid(h: HANDLE) -> Result<ChannelProof> {
     let mut buf = [0u16; 128];
     let bytes = (buf.len() * 2) as u32;
@@ -527,14 +464,12 @@ fn ask_hid(h: HANDLE) -> Result<ChannelProof> {
     bail!("HidD_GetSerialNumberString failed on this HID collection")
 }
 
-/// Decode a NUL-terminated UTF-16 HID string answer into a proof.
 fn decode_proof(buf: &[u16]) -> Option<ChannelProof> {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     let s = String::from_utf16(&buf[..end]).ok()?;
     ChannelProof::from_hid_string(&s)
 }
 
-/// Every present device-interface path of `class` on `device_id`.
 fn interface_paths(class: &GUID, device_id: &str) -> Result<Vec<String>> {
     let wide: Vec<u16> = device_id.encode_utf16().chain(std::iter::once(0)).collect();
     let mut len = 0u32;
@@ -571,8 +506,8 @@ fn interface_paths(class: &GUID, device_id: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-/// The instance ids of `instance_id`'s immediate children — for a HID minidriver, the collection
-/// PDOs hidclass created under our devnode.
+/// Immediate children of `instance_id`. For a HID minidriver those are the collection PDOs
+/// hidclass created under our devnode — the HID interface lives there, not on the parent.
 fn child_device_ids(instance_id: &str) -> Result<Vec<String>> {
     let wide: Vec<u16> = instance_id
         .encode_utf16()

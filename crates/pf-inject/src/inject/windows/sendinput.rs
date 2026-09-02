@@ -1,18 +1,14 @@
-//! Windows input injection via `SendInput` (Win32 KeyboardAndMouse) — the Windows analogue of
-//! [`super::wlr`]: absolute mouse mapped over the streamed output's rect
-//! ([`crate::stream_target`]), relative mouse for games, scancode keyboard, scroll, buttons. Survives UAC/lock desktop switches with Sunshine's
-//! retry-on-failure model: the thread stays bound to its desktop and only reattaches
-//! (`OpenInputDesktop`/`SetThreadDesktop`) when `SendInput` reports a short write (the input
-//! desktop switched) — no per-event reattach overhead.
+//! Windows `SendInput` injection (Win32 KeyboardAndMouse) — analogue of [`super::wlr`]:
+//! absolute mouse over the streamed output ([`crate::stream_target`]), relative mouse
+//! for games, scancode keyboard, scroll, buttons. Survives UAC/lock by Sunshine's
+//! retry-on-failure: the thread stays bound and only reattaches
+//! (`OpenInputDesktop`/`SetThreadDesktop`) when `SendInput` reports a short write.
 //!
-//! **Keyboard conventions** (see [`crate::KEY_FLAG_SEMANTIC_VK`]): first-party punktfunk
-//! clients send **US-positional** VKs (the physical key's US-layout VK — layout-independent by
-//! construction, the mirror of the Linux host's `vk_to_evdev`), resolved here through the fixed
-//! [`positional_vk_to_scan`] table. GameStream/Moonlight clients send **layout-semantic** VKs
-//! (Sunshine's model), resolved under the foreground app's layout. Never resolve a positional VK
-//! through a layout: this thread runs in the SYSTEM service, whose layout is unrelated to the
-//! user's, and any layout re-reads a *position* as a *character* — on a German host that is
-//! exactly the y↔z swap / ü-on-ö scramble.
+//! Keyboard (`crate::KEY_FLAG_SEMANTIC_VK`): first-party clients send US-positional
+//! VKs, resolved through [`positional_vk_to_scan`]. GameStream/Moonlight send
+//! layout-semantic VKs, resolved under the foreground app's layout. Never resolve a
+//! positional VK through a layout: this thread is the SYSTEM service, whose layout
+//! is not the user's — a German host would y↔z / ü-on-ö scramble.
 
 use anyhow::Result;
 use punktfunk_core::input::{InputEvent, InputKind};
@@ -39,20 +35,16 @@ const XBUTTON2: u32 = 0x0002;
 
 pub struct SendInputInjector {
     desktop: Option<HDESK>,
-    /// PT_TOUCH synthetic device, created on the first wire-touch event (a session that never
-    /// touches never creates one). `None` after a failed create (pre-1809) — touch then stays
-    /// the historical no-op.
+    /// PT_TOUCH device, created on the first wire-touch. `None` after a failed
+    /// create (pre-1809) — touch then stays a no-op.
     touch: Option<crate::pen::SyntheticTouch>,
     touch_failed: bool,
 }
 
-// SAFETY: the only field that is not already `Send` is the `Option<HDESK>` (`touch_failed` is a
-// `bool`, and `SyntheticTouch` is `Send` on its own — `Arc<Mutex<..>>` + `JoinHandle`, with the
-// device handle carrying its own proof). The host creates and drives the injector from a single
-// dedicated thread; the desktop handle is opened, rebound, and closed on whichever thread owns the
-// value, and the type is not `Sync`, so there is never concurrent access. A desktop `HDESK` is not
-// thread-affine for ownership (`CloseDesktop` works from any thread; `SetThreadDesktop` rebinds the
-// current thread), so transferring ownership via `Send` is sound.
+// SAFETY: the only non-`Send` field is `Option<HDESK>` (`SyntheticTouch` is `Send`
+// on its own). The host drives this from one dedicated thread; the type is not
+// `Sync`. An `HDESK` is not thread-affine for ownership (`CloseDesktop` works from
+// any thread; `SetThreadDesktop` rebinds the current thread).
 unsafe impl Send for SendInputInjector {}
 
 impl SendInputInjector {
@@ -67,7 +59,7 @@ impl SendInputInjector {
         Ok(me)
     }
 
-    /// Bind this thread to the desktop currently receiving input. UAC / lock screen / Ctrl-Alt-Del
+    /// Bind this thread to the desktop currently receiving input. UAC / lock / Ctrl-Alt-Del
     /// swap the input desktop; `SendInput` silently no-ops unless our thread is on it.
     fn reattach_input_desktop(&mut self) {
         // SAFETY: `OpenInputDesktop`/`SetThreadDesktop`/`CloseDesktop` are FFI calls passed only
@@ -96,11 +88,9 @@ impl SendInputInjector {
         }
     }
 
-    /// Inject with Sunshine's retry-on-failure model: the thread stays bound to whatever desktop it
-    /// last attached to (no per-event `OpenInputDesktop`/`SetThreadDesktop` — two syscalls saved on
-    /// every mouse move), and only when `SendInput` reports a short write (0 = the input desktop
-    /// switched out from under us, e.g. into UAC/lock) do we reattach to the now-current input desktop
-    /// and retry once. This serves both the normal and secure desktops with no steady-state overhead.
+    /// Inject with Sunshine's retry-on-failure: stay bound to the last desktop, and only
+    /// when `SendInput` reports a short write (0 = input desktop switched) reattach and
+    /// retry once. No per-event `OpenInputDesktop`/`SetThreadDesktop`.
     fn send(&mut self, inputs: &[INPUT]) -> Result<()> {
         // SAFETY: `inputs` is a live `&[INPUT]` slice that outlives this synchronous `SendInput`
         // call; `size_of::<INPUT>()` is the exact per-element stride Win32 requires as `cbSize`. The
@@ -139,8 +129,6 @@ impl Drop for SendInputInjector {
 
 impl InputInjector for SendInputInjector {
     fn inject(&mut self, event: &InputEvent) -> Result<()> {
-        // No per-event desktop reattach — `send` reattaches lazily only on a short write (desktop
-        // switch). The injector is bound to the input desktop at open() and follows switches on demand.
         match event.kind {
             InputKind::MouseMove => {
                 let mi = MOUSEINPUT {
@@ -159,12 +147,10 @@ impl InputInjector for SendInputInjector {
                 if w == 0 || h == 0 {
                     return Ok(()); // contract: drop zero extent
                 }
-                // Client (0..w,0..h) → the STREAMED output's desktop rect
-                // ([`crate::stream_target`]; the whole virtual desktop only as fallback) →
-                // 0..65535 over the virtual desktop for MOUSEEVENTF_VIRTUALDESK. Mapping over
-                // the desktop alone is the Extend-topology offset bug the pen plane exposed
-                // (design/pen-tablet-input.md): correct only when the streamed display IS the
-                // whole desktop.
+                // Client (0..w,0..h) → STREAMED output rect ([`crate::stream_target`];
+                // whole virtual desktop only as fallback) → 0..65535 over the virtual
+                // desktop for MOUSEEVENTF_VIRTUALDESK. Mapping over the desktop alone
+                // is the Extend-topology offset bug (design/pen-tablet-input.md).
                 let cx = (event.x.clamp(0, w as i32)) as f64 / w as f64;
                 let cy = (event.y.clamp(0, h as i32)) as f64 / h as f64;
                 let px = crate::stream_target::map_normalized(cx, cy);
@@ -235,8 +221,8 @@ impl InputInjector for SendInputInjector {
                 self.send(&[mouse(mi)])
             }
             InputKind::MouseScroll => {
-                // GameStream WHEEL_DELTA(120) units. Windows WHEEL positive=up (matches GameStream —
-                // no flip, unlike Wayland); HWHEEL positive=right (matches). x is 120-scaled already.
+                // GameStream WHEEL_DELTA(120) units. Windows WHEEL positive=up (matches
+                // GameStream — no flip, unlike Wayland); HWHEEL positive=right. x is already 120-scaled.
                 let horizontal = event.code == 1;
                 let mi = MOUSEINPUT {
                     dx: 0,
@@ -256,14 +242,9 @@ impl InputInjector for SendInputInjector {
                 let down = event.kind == InputKind::KeyDown;
                 let vk = (event.code & 0xff) as u16;
                 let semantic = (event.flags & crate::KEY_FLAG_SEMANTIC_VK) != 0;
-                // Positional wire VKs (first-party clients) resolve through the fixed US table —
-                // never through a layout (module docs). The table covers only the layout-VARIANT
-                // typing area; everything else (F-row, nav, numpad, modifiers) is layout-invariant
-                // and falls through to `MapVirtualKeyExW` (same result under any layout, and it
-                // keeps the proven extended-bit handling). Semantic VKs (Moonlight) skip the table
-                // and resolve under the FOREGROUND app's layout — the layout the receiving app
-                // will decode our scancode with (Sunshine's model; the service thread's own layout
-                // is not the user's).
+                // Positional VKs: US table for the layout-variant typing area; everything
+                // else falls through to `MapVirtualKeyExW` (layout-invariant, extended bit).
+                // Semantic VKs skip the table and use the foreground app's layout.
                 let table = if semantic {
                     None
                 } else {
@@ -305,10 +286,8 @@ impl InputInjector for SendInputInjector {
             }
             InputKind::TextInput => {
                 // Committed IME text: one Unicode scalar per event, injected as
-                // `KEYEVENTF_UNICODE` packets (wScan = UTF-16 unit, no scancode/layout involved
-                // — the receiving app gets the character verbatim via WM_CHAR). An astral-plane
-                // scalar (emoji) is its surrogate pair, each unit down+up in order — exactly how
-                // Windows expects supplementary characters from unicode injection.
+                // `KEYEVENTF_UNICODE` (wScan = UTF-16 unit, no scancode/layout). An
+                // astral-plane scalar is its surrogate pair, each unit down+up in order.
                 let Some(ch) = char::from_u32(event.code) else {
                     return Ok(()); // lone surrogate / out of range — drop
                 };
@@ -336,9 +315,8 @@ impl InputInjector for SendInputInjector {
             | InputKind::GamepadState
             | InputKind::GamepadRemove
             | InputKind::GamepadArrival => Ok(()),
-            // Wire touch → the PT_TOUCH synthetic pointer device (design/pen-tablet-input.md
-            // §6; closes the historical SendInput no-op). Lazily created — a session that never
-            // touches never creates one; a pre-1809 create failure latches back to the no-op.
+            // Wire touch → PT_TOUCH (design/pen-tablet-input.md). Lazy: a session that
+            // never touches never creates one; a pre-1809 create failure latches the no-op.
             InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp => {
                 if self.touch.is_none() && !self.touch_failed {
                     match crate::pen::SyntheticTouch::create() {
@@ -386,13 +364,10 @@ fn forced_extended(vk: u16) -> bool {
     )
 }
 
-/// US-positional VK → set-1 make scancode for the layout-**variant** typing area (letters, the
-/// digit row, OEM punctuation, the ISO 102nd key). The exact mirror of the Linux host's
-/// `crate::vk_to_evdev` — for these keys the evdev code IS the set-1 scancode — and of
-/// every first-party client's capture table, so the positional round trip is
-/// identity-by-construction. Layout-invariant keys are deliberately absent (the
-/// `MapVirtualKeyExW` fallback resolves them identically under any layout, with its proven
-/// extended-key handling). All listed keys are plain make codes — never E0-extended.
+/// US-positional VK → set-1 make scancode for the layout-variant typing area (letters,
+/// digit row, OEM punctuation, ISO 102nd key). Mirror of Linux `crate::vk_to_evdev` —
+/// for these keys the evdev code IS the set-1 scancode. Layout-invariant keys are
+/// absent (`MapVirtualKeyExW` resolves them under any layout). Never E0-extended.
 fn positional_vk_to_scan(vk: u16) -> Option<u16> {
     Some(match vk {
         0x30 => 0x0B,                    // VK_0
@@ -439,10 +414,9 @@ fn positional_vk_to_scan(vk: u16) -> Option<u16> {
     })
 }
 
-/// The keyboard layout of the thread owning the foreground window — the layout the app receiving
-/// our injected scancodes will decode them under (Sunshine's model for semantic Moonlight VKs).
-/// `None` when there is no foreground window (secure desktop, transient) — the caller then falls
-/// back to the current thread's layout, today's behavior.
+/// Keyboard layout of the thread owning the foreground window — the layout the
+/// receiving app will decode our scancodes under. `None` when there is no
+/// foreground window (secure desktop) — caller falls back to this thread's layout.
 fn foreground_hkl() -> Option<HKL> {
     // SAFETY: three read-only queries. `GetForegroundWindow` takes nothing and returns a possibly
     // null `HWND` (checked). `GetWindowThreadProcessId` reads the window's owning thread id (the
@@ -464,9 +438,9 @@ fn foreground_hkl() -> Option<HKL> {
 mod tests {
     use super::*;
 
-    /// The positional table must mirror the Linux host's `vk_to_evdev` exactly — for the typing
-    /// area the evdev code IS the set-1 scancode, so any divergence would make the same wire VK
-    /// land on different physical keys on the two hosts.
+    /// The positional table must mirror Linux `vk_to_evdev` exactly — for the typing
+    /// area the evdev code IS the set-1 scancode, so a divergence lands the same wire
+    /// VK on different physical keys on the two hosts.
     #[test]
     fn positional_table_mirrors_linux_vk_to_evdev() {
         let mut checked = 0;
@@ -483,8 +457,7 @@ mod tests {
         assert_eq!(checked, 48, "typing-area coverage changed unexpectedly");
     }
 
-    /// The German-scramble regression pins: the US-position VKs the first-party clients send for
-    /// the physical Y/Z/ö/ü keys must resolve to those physical positions, not through a layout.
+    /// US-position VKs for physical Y/Z/ö/ü must resolve to those positions, not a layout.
     #[test]
     fn positional_pins_for_the_qwertz_scramble() {
         assert_eq!(positional_vk_to_scan(0x59), Some(0x15)); // VK_Y → US-Y position (QWERTZ: Z key)

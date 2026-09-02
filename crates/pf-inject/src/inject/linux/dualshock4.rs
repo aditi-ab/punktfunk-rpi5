@@ -1,18 +1,13 @@
-//! Virtual Sony DualShock 4 (PS4) via UHID — the PS4 sibling of the DualSense backend
-//! ([`super::dualsense`]). A UHID device presents a *real* DualShock 4 HID interface to the kernel:
-//! `hid-playstation` binds it (matched by VID `054C`/PID `09CC`, since Linux 6.2) and exposes the
-//! full controller — gamepad, motion sensors, touchpad, lightbar, rumble — to games. We write HID
-//! **input** reports (report `0x01`, our controller state) and read HID **output** reports (report
-//! `0x05`, a game's rumble/lightbar feedback) back, forwarding them to the client.
+//! Virtual DualShock 4 via `/dev/uhid`.
 //!
-//! It carries everything the DualSense does *except* adaptive triggers, player LEDs and the mute
-//! button (the DS4 hardware has none), so the only feedback it surfaces is motor rumble (universal
-//! 0xCA plane) and the lightbar (HID-output 0xCD `Led`). The button/stick/dpad/touchpad mapping is
-//! identical to the DualSense, so we reuse its pure [`DsState`] + [`DsState::from_gamepad`]; the
-//! report codec (input `0x01` serializer, output `0x05` parser, touch dims, and the feature blobs
-//! the kernel GET_REPORTs) is the pure [`super::dualshock4_proto`], shared with the Windows UMDF
-//! backend — this module is only the `/dev/uhid` transport plus the report descriptor and the
-//! handshake that answers those GET_REPORTs.
+//! `hid-playstation` binds VID `054C` / PID `09CC` (Linux ≥ 6.2). Input is report
+//! `0x01`; OUTPUT `0x05` is rumble (0xCA) and lightbar (`HidOutput::Led`, 0xCD).
+//! There are no adaptive triggers, player LEDs, or mute.
+//!
+//! Codec, feature blobs, and GET_REPORT answers live in [`super::dualshock4_proto`]
+//! (shared with the Windows UMDF backend). This file is the UHID transport, the
+//! report descriptor, and the handshake. Pin with the tests here and
+//! `crates/pf-inject/tests/motion_contract.rs`.
 
 use super::dualsense_proto::DsState;
 use super::dualshock4_proto::{
@@ -33,10 +28,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::time::Instant;
 
-/// Sony DualShock 4 v2 USB HID report descriptor (507 bytes) — a verbatim real-device capture
-/// (CUH-ZCT2E, `054C:09CC`). Declares input `0x01` (64 B), output `0x05` (32 B), and the feature
-/// reports `0x02`/`0x12`/`0xa3` so the kernel's GET_REPORTs route. The kernel binds DS4 by VID/PID,
-/// but HID core still needs these reports declared.
+/// HID core answers GET_REPORT only for ids declared here: `0x01` in, `0x05` out,
+/// `0x02`/`0x12`/`0xa3` feature. Bind is VID/PID, not this blob.
 #[rustfmt::skip]
 const DS4_RDESC: &[u8] = &[
     0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01, 0x09, 0x30, 0x09, 0x31,
@@ -84,8 +77,7 @@ const DS4_RDESC: &[u8] = &[
     0xB1, 0x02, 0xC0,
 ];
 
-/// A virtual DualShock 4 backed by `/dev/uhid` (hand-rolled codec mirroring the DualSense pad's).
-/// Dropping it destroys the device (the kernel tears down the bound `hid-playstation` interface).
+/// Drop sends `UHID_DESTROY` and unbinds `hid-playstation`.
 pub struct DualShock4Pad {
     fd: File,
     counter: u8,
@@ -93,7 +85,7 @@ pub struct DualShock4Pad {
 }
 
 impl DualShock4Pad {
-    /// Create the UHID DualShock 4 for pad `index` (used only to make the device name/uniq unique).
+    /// `index` is only the name/uniq suffix, not a HID slot.
     pub fn open(index: u8) -> Result<DualShock4Pad> {
         let fd = OpenOptions::new()
             .read(true)
@@ -115,25 +107,23 @@ impl DualShock4Pad {
     fn send_create2(&mut self, index: u8) -> Result<()> {
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_CREATE2.to_ne_bytes());
-        // union (uhid_create2_req) starts at byte 4.
-        put_cstr(&mut ev, 4, 128, &format!("Punktfunk DualShock 4 {index}")); // name[128]
-        put_cstr(&mut ev, 132, 64, &format!("punktfunk/dualshock4/{index}")); // phys[64]
+        // uhid_create2_req at 4: name[128] phys[64] uniq[64] rd_size bus vid pid version country rd_data.
+        put_cstr(&mut ev, 4, 128, &format!("Punktfunk DualShock 4 {index}"));
+        put_cstr(&mut ev, 132, 64, &format!("punktfunk/dualshock4/{index}"));
 
-        // A unique uniq[64] keeps the sysfs nodes tidy when several pads coexist (the kernel's
-        // duplicate-device check itself keys off the per-pad MAC in the pairing feature report).
-        put_cstr(&mut ev, 196, 64, &format!("punktfunk-ds4-{index}")); // uniq[64]
-        ev[260..262].copy_from_slice(&(DS4_RDESC.len() as u16).to_ne_bytes()); // rd_size
-        ev[262..264].copy_from_slice(&BUS_USB.to_ne_bytes()); // bus
+        // uniq is cosmetic; hid-playstation keys uniqueness off the pairing-report MAC.
+        put_cstr(&mut ev, 196, 64, &format!("punktfunk-ds4-{index}"));
+        ev[260..262].copy_from_slice(&(DS4_RDESC.len() as u16).to_ne_bytes());
+        ev[262..264].copy_from_slice(&BUS_USB.to_ne_bytes());
         ev[264..268].copy_from_slice(&(DS4_VENDOR as u32).to_ne_bytes());
         ev[268..272].copy_from_slice(&(DS4_PRODUCT as u32).to_ne_bytes());
-        ev[272..276].copy_from_slice(&0x0100u32.to_ne_bytes()); // version
-        ev[276..280].copy_from_slice(&0u32.to_ne_bytes()); // country
-        ev[280..280 + DS4_RDESC.len()].copy_from_slice(DS4_RDESC); // rd_data
+        ev[272..276].copy_from_slice(&0x0100u32.to_ne_bytes());
+        ev[276..280].copy_from_slice(&0u32.to_ne_bytes());
+        ev[280..280 + DS4_RDESC.len()].copy_from_slice(DS4_RDESC);
         self.fd.write_all(&ev).context("write UHID_CREATE2")?;
         Ok(())
     }
 
-    /// Serialize `st` into report `0x01` and write it to the kernel (UHID_INPUT2).
     pub fn write_state(&mut self, st: &DsState) -> Result<()> {
         self.counter = self.counter.wrapping_add(1);
         let ts = self.clock.ds4_ticks(Instant::now());
@@ -142,17 +132,15 @@ impl DualShock4Pad {
 
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_INPUT2.to_ne_bytes());
-        ev[4..6].copy_from_slice(&(r.len() as u16).to_ne_bytes()); // input2.size
-        ev[6..6 + r.len()].copy_from_slice(&r); // input2.data
+        // uhid_input2_req: size u16 at 4, data at 6.
+        ev[4..6].copy_from_slice(&(r.len() as u16).to_ne_bytes());
+        ev[6..6 + r.len()].copy_from_slice(&r);
         self.fd.write_all(&ev).context("write UHID_INPUT2")?;
         Ok(())
     }
 
-    /// Service the device, non-blocking: answer the kernel's feature-report GET_REPORTs (pairing /
-    /// calibration / firmware — the pairing reply is required during `hid-playstation` init, or no
-    /// input devices appear) and parse any HID OUTPUT reports (rumble / lightbar) into a
-    /// [`Ds4Feedback`] for pad `pad`. Call frequently — especially right after [`open`] so the
-    /// init handshake completes.
+    /// Pairing GET_REPORT (`0x12`) must be answered during `hid-playstation` bind or no
+    /// input nodes appear. Call right after [`open`].
     pub fn service(&mut self, pad: u8) -> Ds4Feedback {
         let mut fb = Ds4Feedback::default();
         let mut ev = [0u8; UHID_EVENT_SIZE];
@@ -180,12 +168,11 @@ impl DualShock4Pad {
                     let _ = self.reply_get_report(id, data);
                 }
                 UHID_SET_REPORT => {
-                    // Ack (err=0) so a SET_REPORT writer doesn't block on the kernel's 5 s
-                    // timeout; DS4 feedback arrives as OUTPUT reports (handled above).
+                    // Ack SET_REPORT (err=0): kernel waits 5 s otherwise. DS4 feedback is OUTPUT, not SET_REPORT.
                     let id = u32::from_ne_bytes([ev[4], ev[5], ev[6], ev[7]]);
                     let _ = self.reply_set_report(id);
                 }
-                _ => {} // Start/Stop/Open/Close — ignore
+                _ => {}
             }
         }
         fb
@@ -196,7 +183,7 @@ impl DualShock4Pad {
         ev[0..4].copy_from_slice(&UHID_GET_REPORT_REPLY.to_ne_bytes());
         // uhid_get_report_reply_req: id u32 [4..8], err u16 [8..10], size u16 [10..12], data [12..].
         ev[4..8].copy_from_slice(&id.to_ne_bytes());
-        let err: u16 = if data.is_empty() { 5 } else { 0 }; // EIO if we don't know the report
+        let err: u16 = if data.is_empty() { 5 } else { 0 }; // EIO if unknown report
         ev[8..10].copy_from_slice(&err.to_ne_bytes());
         ev[10..12].copy_from_slice(&(data.len() as u16).to_ne_bytes());
         ev[12..12 + data.len()].copy_from_slice(data);
@@ -211,7 +198,7 @@ impl DualShock4Pad {
         ev[0..4].copy_from_slice(&UHID_SET_REPORT_REPLY.to_ne_bytes());
         // uhid_set_report_reply_req: id u32 [4..8], err u16 [8..10].
         ev[4..8].copy_from_slice(&id.to_ne_bytes());
-        ev[8..10].copy_from_slice(&0u16.to_ne_bytes()); // err 0 (ack)
+        ev[8..10].copy_from_slice(&0u16.to_ne_bytes());
         self.fd
             .write_all(&ev)
             .context("write UHID_SET_REPORT_REPLY")?;
@@ -227,15 +214,11 @@ impl Drop for DualShock4Pad {
     }
 }
 
-/// The DualShock-4-specific half of the shared stateful manager (see [`PadProto`]): UHID transport
-/// open, the [`DsState`] mappers, and the kernel-handshake service pass. Lifecycle (slot table,
-/// unplug sweep, heartbeat, dedup) lives in [`UhidManager`]; the lightbar dedup that used to be a
-/// bespoke `last_led` vec (the kernel bundles the lightbar into every output report, incl.
-/// rumble-only writes) now rides the shared `HidoutDedup` — identical semantics, `Led` compared
-/// against the last-forwarded value and re-armed on create/unplug.
+/// Slot table, heartbeat, and `HidoutDedup` live in [`UhidManager`]. The kernel restamps
+/// the lightbar on every OUTPUT (including rumble-only); `Led` is compared to the last
+/// forwarded value and re-armed on create/unplug.
 pub struct Ds4LinuxProto {
-    /// Fallback policy for the Steam back grips a client may send (the DS4 has no back-button HID
-    /// slot). `PUNKTFUNK_STEAM_REMAP=paddles=…`; default drop.
+    /// Steam back-grip fold. DS4 has no paddle HID slot; `PUNKTFUNK_STEAM_REMAP=paddles=…`, default drop.
     remap: crate::steam_remap::RemapConfig,
 }
 
@@ -267,11 +250,8 @@ impl PadProto for Ds4LinuxProto {
         DsState::neutral()
     }
 
-    /// Merge buttons/sticks/triggers from the frame, preserving touch + motion + pad clicks (those
-    /// arrive on the rich-input plane and must survive a button-only frame).
+    /// Keep prev touch/motion/click — they arrive on the rich plane, not this button frame.
     fn merge_frame(&self, prev: &DsState, f: &punktfunk_core::input::GamepadFrame) -> DsState {
-        // Steam back grips have no DS4 slot — fold them onto standard buttons per the configured
-        // policy (default drop) so they aren't silently lost.
         let buttons = crate::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
         let mut s = DsState::from_gamepad(
             buttons,
@@ -289,8 +269,7 @@ impl PadProto for Ds4LinuxProto {
         s
     }
 
-    /// The shared DualSense-family mapping (dualsense_proto::DsState::apply_rich): Steam dual pads
-    /// split the one touchpad left/right, pad clicks ride touch_click.
+    /// Steam dual pads split the one touchpad left/right; clicks ride `touch_click`.
     fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
         st.apply_rich(rich, DS4_TOUCH_W, DS4_TOUCH_H);
     }
@@ -307,10 +286,7 @@ impl PadProto for Ds4LinuxProto {
         let _ = pad.write_state(st);
     }
 
-    /// Answer the kernel's init handshake (it blocks `hid-playstation` init until its GET_REPORTs
-    /// are answered — call frequently) and parse a game's feedback: motor rumble on the universal
-    /// 0xCA plane, the lightbar as a 0xCD `Led` event (a DS4 has no player LEDs / adaptive
-    /// triggers).
+    /// Rumble on 0xCA, lightbar as 0xCD `Led`. No player LEDs or adaptive triggers.
     fn service(&self, pad: &mut DualShock4Pad, idx: u8) -> PadFeedback {
         let fb = pad.service(idx);
         PadFeedback {
@@ -321,21 +297,15 @@ impl PadProto for Ds4LinuxProto {
                 .map(|(r, g, b)| HidOutput::Led { pad: idx, r, g, b })
                 .into_iter()
                 .collect(),
-            // Rumble-plane liveness (arms the shared abandoned-rumble force-off) — see the Linux
-            // DualSense backend for the hidraw-writer rationale; `parse_ds4_output` gates rumble
-            // on flag0 bit0 the same way.
+            // Arms abandoned-rumble force-off. `parse_ds4_output` sets rumble only when flag0 bit0 is on.
             rumble_drove: Some(fb.rumble.is_some()),
             resync: false,
         }
     }
 }
 
-/// All virtual DualShock 4 pads of a session — the PS4 analog of
-/// [`DualSenseManager`](super::dualsense::DualSenseManager), selected with `PUNKTFUNK_GAMEPAD=ps4`.
-/// Like the DualSense, the shared [`UhidManager`] keeps each pad's full [`DsState`], re-emits the
-/// merged report whenever buttons/sticks or touchpad/motion change, and heartbeats it through
-/// input silence (a real DS4 streams report `0x01` continuously — `hid-playstation`/SDL treat a
-/// multi-second gap as an unplug).
+/// `PUNKTFUNK_GAMEPAD=ps4`. [`UhidManager`] heartbeats report `0x01` through input silence;
+/// `hid-playstation`/SDL treat a multi-second gap as unplug.
 pub type DualShock4Manager = UhidManager<Ds4LinuxProto>;
 
 #[cfg(test)]
@@ -343,10 +313,8 @@ mod tests {
     use super::*;
     use crate::dualshock4_proto::DS4_FEATURE_PAIRING;
 
-    // The report 0x01 serializer + output 0x05 parser are covered in `dualshock4_proto` (the codec
-    // is shared with the Windows backend); only the UHID-transport-specific pieces are tested here.
+    // Codec tests live in `dualshock4_proto`. This module pins UHID-side feature-report shapes.
 
-    /// Feature-report arrays carry the right report id + length the kernel expects.
     #[test]
     fn feature_report_shapes() {
         assert_eq!(DS4_FEATURE_PAIRING.len(), 16);
@@ -357,15 +325,14 @@ mod tests {
         assert_eq!(DS4_FEATURE_FIRMWARE[0], 0xA3);
     }
 
-    /// The pairing reply keeps the report id and differs across pads ONLY in the MAC low octet —
-    /// distinct serials so SDL/Steam never dedup two virtual pads into one controller.
+    /// Pairing MAC low octet is per-pad. SDL/Steam dedup controllers by that serial.
     #[test]
     fn pairing_reply_mac_is_per_pad() {
         assert_eq!(ds4_pairing_reply(0).as_slice(), DS4_FEATURE_PAIRING);
         let (a, b) = (ds4_pairing_reply(1), ds4_pairing_reply(2));
-        assert_eq!(a[0], 0x12); // report id untouched
+        assert_eq!(a[0], 0x12);
         assert_eq!(a[1], DS4_FEATURE_PAIRING[1].wrapping_add(1));
         assert_eq!(b[1], DS4_FEATURE_PAIRING[1].wrapping_add(2));
-        assert_eq!(a[2..], b[2..]); // everything but the low octet identical
+        assert_eq!(a[2..], b[2..]);
     }
 }

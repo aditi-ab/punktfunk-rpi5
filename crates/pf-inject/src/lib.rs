@@ -1,19 +1,15 @@
-//! Input injection (plan §4): turn client [`punktfunk_core::input::InputEvent`]s into host input.
+//! Host-side input injection: [`punktfunk_core::input::InputEvent`] → compositor or OS input.
 //!
-//! The headless Sway compositor runs with `WLR_LIBINPUT_NO_DEVICES=1`, so kernel `uinput`
-//! devices are never picked up. Instead we inject through the wlroots virtual-input Wayland
-//! protocols — `zwlr_virtual_pointer_manager_v1` + `zwp_virtual_keyboard_manager_v1` — which
-//! Sway always advertises. We connect as an ordinary Wayland client (the host process
-//! inherits Sway's `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`), bind the two managers, and translate
-//! events into virtual pointer/keyboard requests. Keyboard codes are Linux evdev; we upload an
-//! xkb keymap built from the box's configured layout (`pf_host_config::layout` — `XKB_DEFAULT_*`,
-//! then what `localectl` recorded) and track modifier state so the compositor resolves shifted
-//! keysyms correctly.
+//! Headless Sway sets `WLR_LIBINPUT_NO_DEVICES=1`, so kernel `uinput` is never a seat device.
+//! Injection uses wlroots virtual-input (`zwlr_virtual_pointer_manager_v1` +
+//! `zwp_virtual_keyboard_manager_v1`) as an ordinary Wayland client on Sway's
+//! `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`. Keyboard codes are Linux evdev; the keymap is the
+//! box layout (`pf_host_config::layout` — `XKB_DEFAULT_*`, then `localectl`) and modifiers
+//! are tracked so the compositor resolves shifted keysyms.
 //!
-//! Extracted into a subsystem crate (plan §W6): consumes `punktfunk_core::input` (the neutral
-//! event vocabulary) + `pf-driver-proto` (the HID wire contract), never the orchestrator.
+//! Consumes `punktfunk_core::input` and `pf-driver-proto`. Not the orchestrator.
 
-// Scaffold: trait methods + per-OS backends are defined ahead of the target that uses them.
+// Per-OS backends are defined before any target uses them.
 #![allow(dead_code)]
 use anyhow::Result;
 use punktfunk_core::input::{InputEvent, InputKind};
@@ -23,61 +19,55 @@ mod keymap;
 #[cfg(target_os = "linux")]
 pub(crate) use keymap::gs_button_to_evdev;
 pub use keymap::KEY_FLAG_SEMANTIC_VK;
-// vk_to_evdev is consumed by the Linux injectors (kwin/libei/wlr) and — on Windows — only by the
-// SendInput mirror test; keep the shared `crate::vk_to_evdev` re-export unconditionally.
+// Linux injectors always call this; Windows only the SendInput mirror test. Keep the re-export.
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub use keymap::vk_to_evdev;
 
-/// Device-agnostic dedup for the rich HID-output feedback plane (0xCD), shared by the virtual-pad
-/// managers ([`uhid_manager`]).
+/// Dedup for HID-output reports (0xCD), shared by [`uhid_manager`].
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/hidout_dedup.rs"]
 pub mod hidout_dedup;
 
-/// Injects input events into the host session. Not `Send`: an injector owns compositor
-/// resources (a Wayland connection, an xkb state) and lives entirely on the control thread
-/// that creates it.
+/// Host-session injector. Not `Send`: owns compositor resources and stays on the control
+/// thread that created it.
 pub trait InputInjector {
     fn inject(&mut self, event: &InputEvent) -> Result<()>;
 }
 
-/// Preferred injection backend. Which variants exist is **per-OS**: the factory ([`open`]) is a
-/// single per-target block, so it can only be handed a backend that exists on the target — an
-/// impossible OS/backend pairing is a compile error, not a runtime `bail!` (plan §2.3).
+/// Preferred injection backend. Variants are per-OS so [`open`] cannot name a backend the
+/// target lacks — that is a compile error, not `bail!`.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
-    /// wlroots virtual pointer + keyboard Wayland protocols — the headless-Sway path.
+    /// wlroots virtual pointer + keyboard. Headless Sway.
     WlrVirtual,
-    /// KWin `org_kde_kwin_fake_input` — direct injection, no RemoteDesktop portal / approval dialog
-    /// (authorized by the host's `.desktop`). The headless KDE-Desktop path; what krdpserver uses.
+    /// KWin `org_kde_kwin_fake_input`. Direct; no RemoteDesktop portal. Authorized by the
+    /// host `.desktop`.
     KwinFakeInput,
-    /// libei via `reis` — Wayland-native. Reaches EIS through the RemoteDesktop portal, or on
-    /// GNOME through Mutter's direct RemoteDesktop API (see `libei_ei_source`).
+    /// libei via `reis`. RemoteDesktop portal, or Mutter's direct RemoteDesktop API on GNOME
+    /// (`libei_ei_source`).
     Libei,
-    /// libei directly against gamescope's own EIS socket (no portal): input lands in the
-    /// nested game — the SteamOS-like session.
+    /// libei against gamescope's EIS socket (no portal). Nested-game / SteamOS-like session.
     GamescopeEi,
 }
 
-/// Preferred injection backend. Windows has exactly one path (`SendInput`).
+/// Preferred injection backend. Windows has only `SendInput`.
 #[cfg(target_os = "windows")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
-    /// Windows `SendInput` (Win32 KeyboardAndMouse) — the Windows host path.
     SendInput,
 }
 
-/// Preferred injection backend. No injector exists on this platform; [`open`] rejects it.
+/// Preferred injection backend. [`open`] rejects it.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
-    /// Placeholder so the host still builds; the platform has no input injection.
+    /// Placeholder so the host still builds.
     Unsupported,
 }
 
-/// Open the injector for `backend`. The body is one per-OS block: on each target `backend` can only
-/// name a backend that platform has, so there are no cross-OS `bail!` arms (plan §2.3).
+/// Open the injector for `backend`. One per-OS body; `backend` can only name a backend this
+/// target has.
 #[cfg(target_os = "linux")]
 pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
     match backend {
@@ -92,13 +82,12 @@ pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
     }
 }
 
-/// Open a libei injector pinned to a SPECIFIC gamescope EIS relay file — the per-session spelling
-/// of [`Backend::GamescopeEi`] (`design/gamescope-multiuser.md`): an isolated multi-user spawn
-/// writes its `LIBEI_SOCKET` to its own relay file, and this session's injector must read exactly
-/// that one, never the global file a concurrent spawn may rewrite. A separate function rather than
-/// a `Backend` variant so [`Backend`] stays `Copy` (the published `SESSION_BACKEND` slot and the
-/// knob parser lean on it). The libei worker polls the relay file itself (`connect_socket_file`),
-/// so calling this before the gamescope is up is fine.
+/// libei injector pinned to this session's gamescope EIS relay file.
+///
+/// Isolated multi-user spawns write `LIBEI_SOCKET` to their own file; this must read that
+/// one, never the global file a concurrent spawn may rewrite. Separate from [`Backend`] so
+/// the enum stays `Copy` (`SESSION_BACKEND` and the knob parser). The worker polls the
+/// relay itself, so calling this before gamescope is up is fine.
 #[cfg(target_os = "linux")]
 pub fn open_gamescope_at(relay: std::path::PathBuf) -> Result<Box<dyn InputInjector>> {
     Ok(Box::new(libei::LibeiInjector::open_with(
@@ -106,7 +95,6 @@ pub fn open_gamescope_at(relay: std::path::PathBuf) -> Result<Box<dyn InputInjec
     )?))
 }
 
-/// Open the injector for `backend` (Windows: always `SendInput`).
 #[cfg(target_os = "windows")]
 pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
     match backend {
@@ -114,30 +102,22 @@ pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
     }
 }
 
-/// No input-injection backend exists on this platform.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn open(_backend: Backend) -> Result<Box<dyn InputInjector>> {
     anyhow::bail!("no input-injection backend on this platform")
 }
 
-/// Which output the session's **absolute** coordinates belong to, by identity rather than by size.
+/// Which output absolute coordinates belong to, by identity rather than size.
 ///
-/// libei hands the injector one region per logical monitor and the region set carries no output
-/// name, so the backend has to decide which one a normalized client position maps into. Matching on
-/// *size* — all it could do before — is a coin flip the moment two heads share a mode, and it
-/// resolved wrong on-glass once already (GNOME, a dummy HDMI beside the virtual primary: the seat
-/// cursor never entered the streamed monitor). These are the two keys that actually identify a
-/// region: the protocol's own `mapping_id`, and the origin (two outputs can share a size; they can
-/// never share a top-left).
-///
-/// Best-effort by design: an anchor that matches no region warns and falls back to the size ladder,
-/// because the region set is the truth and the anchor is our belief about it.
+/// libei regions have no output name. Matching on size is a coin flip when two heads share
+/// a mode. `mapping_id` is the protocol's correlate; origin is unique because two outputs
+/// cannot share a top-left. An unmatched anchor warns and falls back to the size ladder —
+/// the region set is the truth.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AbsoluteAnchor {
-    /// The target output's top-left in the compositor's global logical space.
+    /// Target output's top-left in compositor global logical space.
     pub origin: Option<(i32, i32)>,
-    /// The EI `mapping_id` of the target output, when the capture side knows it — the protocol's
-    /// blessed way to correlate a region with a video stream, so it wins over the origin.
+    /// EI `mapping_id` of the target output. Wins over origin when both are set.
     pub mapping_id: Option<String>,
 }
 
@@ -148,39 +128,26 @@ impl AbsoluteAnchor {
     }
 }
 
-/// The current absolute-coordinate anchor. A `RwLock` rather than an env var: the injector is
-/// host-lifetime and lives behind a channel, so a *session* can only reach it through process
-/// state — and process state that is typed and lock-guarded beats a `set_var`
-/// (security-review 2026-06-28 #7). The backend-select was the last holdout on that pattern and has
-/// since joined this one — see `SESSION_BACKEND`.
+/// Current absolute-coordinate anchor. `RwLock` not env: the injector is host-lifetime behind
+/// a channel, so a session reaches it only through typed process state. See `SESSION_BACKEND`.
 static ABSOLUTE_ANCHOR: std::sync::RwLock<Option<AbsoluteAnchor>> = std::sync::RwLock::new(None);
 
-/// Anchor absolute coordinates at a specific output. `None` (the default) keeps the size-matched
-/// behavior.
+/// Pin absolute coordinates to a specific output. `None` keeps size-matching.
 ///
-/// ⚠️ **This is a HOST-level pin, not per-session state.** The injector is host-lifetime and every
-/// concurrent session's input flows through the same one, so an anchor set per session would apply
-/// to all of them — the last connect silently re-aiming everyone else's pointer. That is fine for
-/// what this exists for (`PUNKTFUNK_CAPTURE_MONITOR`, a host-wide pin — the host-pinned decision of
-/// record in `design/per-monitor-portal-capture.md` §5.3) and wrong for anything per-client. A
-/// per-session anchor needs the injector to become session-aware first; don't call this from a
-/// session path until it is.
+/// Host-level, not per-session: the injector is host-lifetime and every session shares it, so
+/// a per-session write would re-aim every other pointer. Fine for `PUNKTFUNK_CAPTURE_MONITOR`
+/// (host-wide pin; `design/per-monitor-portal-capture.md`). Do not call from a session path.
 ///
-/// The wlroots backend does **not** consult this — it aims at a named output via
-/// `stream_output::set_stream_output` (Linux), which the host DOES publish per session and which
-/// therefore takes exactly the last-bring-up-wins trade this warning describes: on purpose, and
-/// stated in the open in that module's doc, matching the Windows `stream_target` slot that already
-/// made the same call. The two are separate slots because they answer different questions and are
-/// written by different owners: this anchor is the operator's host-wide capture pin, recomputed
-/// from policy whenever the console writes it — which would wipe a per-session value written here —
-/// while the stream output is whatever head the session's capture actually attached to.
+/// The wlroots backend ignores this and aims via `stream_output::set_stream_output`, which
+/// the host publishes per session (last-bring-up-wins, same as Windows `stream_target`).
+/// Separate slots: this is the operator's host-wide capture pin, recomputed from policy;
+/// stream output is the head the session's capture actually attached to.
 pub fn set_absolute_anchor(anchor: Option<AbsoluteAnchor>) {
     let anchor = anchor.filter(|a| !a.is_empty());
     tracing::debug!(?anchor, "input: absolute-coordinate anchor set");
     *ABSOLUTE_ANCHOR.write().unwrap_or_else(|e| e.into_inner()) = anchor;
 }
 
-/// The anchor an injector should map absolute coordinates into, if any.
 pub fn absolute_anchor() -> Option<AbsoluteAnchor> {
     ABSOLUTE_ANCHOR
         .read()
@@ -188,20 +155,12 @@ pub fn absolute_anchor() -> Option<AbsoluteAnchor> {
         .clone()
 }
 
-/// The backend the LIVE SESSION resolved to, published by the host from
-/// `pf_vdisplay::input_backend_id` when it routes a connect or a mid-stream Desktop↔Game switch.
+/// Backend the live session resolved to. Host writes this from `pf_vdisplay::input_backend_id`
+/// on connect and on mid-stream Desktop↔Game switch.
 ///
-/// A `RwLock` rather than an env var, for the reason [`ABSOLUTE_ANCHOR`] already gives: the injector
-/// is host-lifetime and lives behind a channel, so a *session* can only reach it through process
-/// state — and typed, lock-guarded process state beats `set_var`. This slot IS the backend-select
-/// that doc pointed at as the last holdout. It was a process-environment write in
-/// `pf_vdisplay::apply_input_env` read back here by `getenv`, and [`default_backend`] runs once per
-/// input batch on the injector service thread: a `getenv` on a hot path racing a per-session
-/// `setenv` is the `environ` data race, on a live streaming host, with no attacker needed
-/// (security-review 2026-08-25).
-///
-/// Host-lifetime and last-write-wins, exactly as the env var was: the host serves one session's
-/// input at a time, and nothing clears this when a session ends (the env value persisted too).
+/// `RwLock` not env, same reason as [`ABSOLUTE_ANCHOR`]. [`default_backend`] runs once per
+/// input batch; a `getenv` racing a per-session `setenv` is an `environ` data race with no
+/// attacker needed. Host-lifetime, last-write-wins; nothing clears it when a session ends.
 #[cfg(target_os = "linux")]
 static SESSION_BACKEND: std::sync::RwLock<Option<Backend>> = std::sync::RwLock::new(None);
 
@@ -210,8 +169,8 @@ fn session_backend() -> Option<Backend> {
     *SESSION_BACKEND.read().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The [`Backend`] an id names, in every spelling the `PUNKTFUNK_INPUT_BACKEND` knob accepts.
-/// Shared by that knob and by [`set_backend_id`], so the two can never drift apart.
+/// The [`Backend`] an id names, in every spelling `PUNKTFUNK_INPUT_BACKEND` accepts.
+/// Shared by that knob and [`set_backend_id`], so the two cannot drift.
 #[cfg(target_os = "linux")]
 fn backend_from_id(id: &str) -> Option<Backend> {
     Some(match id.trim().to_ascii_lowercase().as_str() {
@@ -223,14 +182,12 @@ fn backend_from_id(id: &str) -> Option<Backend> {
     })
 }
 
-/// Point input at the backend this session's VIDEO resolved to (the two must not diverge). `id` is
-/// `pf_vdisplay::input_backend_id`'s verdict — `gamescope`/`kwin`/`libei`/`wlr`.
+/// Point input at the backend this session's video resolved to; the two must not diverge.
+/// `id` is `pf_vdisplay::input_backend_id` (`gamescope`/`kwin`/`libei`/`wlr`).
 ///
-/// Threaded from the host rather than published through `PUNKTFUNK_INPUT_BACKEND`, the way
-/// `VirtualDisplay::set_launch_command` took the launch command off the env before it. Call it
-/// wherever a session's compositor is decided or re-decided; the operator-pinned
-/// `PUNKTFUNK_COMPOSITOR` path deliberately does not, which is what leaves the operator's own knob
-/// in charge there.
+/// Host-threaded, not `PUNKTFUNK_INPUT_BACKEND`. Call wherever a session compositor is
+/// decided. The operator-pinned `PUNKTFUNK_COMPOSITOR` path deliberately does not, so that
+/// knob stays in charge.
 #[cfg(target_os = "linux")]
 pub fn set_backend_id(id: &str) {
     let Some(backend) = backend_from_id(id) else {
@@ -248,24 +205,17 @@ pub fn set_backend_id(id: &str) {
 #[cfg(not(target_os = "linux"))]
 pub fn set_backend_id(_id: &str) {}
 
-/// Pick the injection backend for the current session. gamescope hosts its own EIS server (no
-/// portal), so a gamescope session injects directly into it. wlroots/Sway only implements the
-/// ScreenCast portal (no RemoteDesktop), so libei can't run there — use the wlr virtual-input
-/// protocols. **KWin** exposes `org_kde_kwin_fake_input` (direct injection, no portal / approval
-/// dialog — authorized by the host's `.desktop`; what krdpserver uses), so prefer it there.
-/// **GNOME** has neither fake_input nor the wlr protocols, so it uses libei — reaching EIS through
-/// Mutter's *direct* `org.gnome.Mutter.RemoteDesktop` API rather than the portal
-/// (`libei_ei_source`), so it is headless-capable too: no interactive approval to answer.
-/// `PUNKTFUNK_INPUT_BACKEND=wlr|kwin|libei|gamescope` overrides the auto-detection.
+/// Pick the injection backend for the current session.
 ///
-/// Resolution order, unchanged from when the session's pick arrived through the process env:
-/// **the live session's published backend** ([`set_backend_id`]) — which the host writes from
-/// `pf_vdisplay::input_backend_id`, and which used to be a `set_var` of `PUNKTFUNK_INPUT_BACKEND`
-/// that overwrote the operator's own value — then the operator's `PUNKTFUNK_INPUT_BACKEND`, then
-/// the `PUNKTFUNK_COMPOSITOR` pin, then the `XDG_CURRENT_DESKTOP` sniff. The env rungs are reached
-/// only before any session has published (and on the operator-pinned path, which deliberately
-/// publishes nothing), so this stays off `getenv` entirely once a stream is up — see
-/// [`SESSION_BACKEND`].
+/// gamescope hosts its own EIS (no portal) — inject there. Sway implements ScreenCast only,
+/// so libei cannot run — wlr virtual-input. KWin `org_kde_kwin_fake_input` is direct (host
+/// `.desktop`, no portal). GNOME has neither; libei via Mutter's direct
+/// `org.gnome.Mutter.RemoteDesktop` (`libei_ei_source`), so headless-capable.
+///
+/// Order: live [`set_backend_id`] (from `pf_vdisplay::input_backend_id`), then
+/// `PUNKTFUNK_INPUT_BACKEND`, then `PUNKTFUNK_COMPOSITOR`, then `XDG_CURRENT_DESKTOP`.
+/// Env rungs run only before a session publishes (and on the operator-pinned path, which
+/// publishes nothing), so a live stream never `getenv`s — see [`SESSION_BACKEND`].
 #[cfg(target_os = "linux")]
 pub fn default_backend() -> Backend {
     if let Some(b) = session_backend() {
@@ -280,7 +230,7 @@ pub fn default_backend() -> Backend {
             ),
         }
     }
-    // An explicit compositor pick (set per connect / mid-stream) is the strongest signal.
+    // Explicit compositor pick (per connect / mid-stream) outranks the desktop sniff.
     let compositor = pf_host_config::config().compositor.clone();
     if let Some(c) = compositor.as_deref() {
         let c = c.trim();
@@ -292,8 +242,7 @@ pub fn default_backend() -> Backend {
         }
         if c.eq_ignore_ascii_case("wlroots")
             || c.eq_ignore_ascii_case("sway")
-            // Hyprland kept the wlr virtual-input protocols, so it injects through the same
-            // backend as sway/river (design/hyprland-support.md D4).
+            // Hyprland kept the wlr virtual-input protocols; same backend as sway/river.
             || c.eq_ignore_ascii_case("hyprland")
         {
             return Backend::WlrVirtual;
@@ -311,69 +260,59 @@ pub fn default_backend() -> Backend {
     }
 }
 
-/// The Windows host has a single injection backend.
 #[cfg(target_os = "windows")]
 pub fn default_backend() -> Backend {
     Backend::SendInput
 }
 
-/// No injector on this platform.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn default_backend() -> Backend {
     Backend::Unsupported
 }
 
-/// Whether the session's inject backend can type **committed text**
-/// ([`InputKind::TextInput`] — see `HOST_CAP_TEXT_INPUT`): Windows always (`KEYEVENTF_UNICODE`);
-/// Linux only on the wlroots backend (a dedicated virtual keyboard with a dynamically-grown
-/// Unicode keymap) — KWin fake-input/libei/gamescope can only press keycodes of the host layout.
-/// Consulted at Welcome time to advertise the cap; a mid-session backend switch away from a
-/// capable one just degrades to dropped text events (input is lossy by design).
+/// Whether this backend can type committed text ([`InputKind::TextInput`], `HOST_CAP_TEXT_INPUT`).
+/// Windows always (`KEYEVENTF_UNICODE`). Linux only on wlroots (Unicode virtual keyboard);
+/// KWin/libei/gamescope can only press host-layout keycodes. Welcome-time cap; a mid-session
+/// switch away from a capable backend drops text events (input is lossy by design).
 #[cfg(target_os = "windows")]
 pub fn text_input_supported() -> bool {
     true
 }
 
-/// See the Windows variant: Linux types text only through the wlroots virtual-keyboard backend.
+/// Linux types text only through the wlroots virtual-keyboard backend.
 #[cfg(target_os = "linux")]
 pub fn text_input_supported() -> bool {
     matches!(default_backend(), Backend::WlrVirtual)
 }
 
-/// No injector ⇒ no text.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn text_input_supported() -> bool {
     false
 }
 
-/// Whether the session's inject backend puts wire touch contacts on the desktop
-/// (`HOST_CAP2_TOUCH` — design/touch-client-overlay.md §5.4). Linux: libei (portal or gamescope
-/// EIS) and KWin fake-input carry touch; the wlroots virtual-pointer backend has no touch protocol
-/// and drops every contact. Consulted at Welcome time so a client can fall back from passthrough
-/// instead of sending contacts nowhere.
+/// Whether wire touch contacts land on the desktop (`HOST_CAP2_TOUCH`).
+/// libei and KWin carry touch; wlroots virtual-pointer has no touch protocol and drops
+/// contacts. Welcome-time so a client can fall back from passthrough.
 #[cfg(target_os = "linux")]
 pub fn touch_supported() -> bool {
     !matches!(default_backend(), Backend::WlrVirtual)
 }
 
-/// Windows: touch injects through a `PT_TOUCH` synthetic pointer device, which exists from build
-/// 1809 — the same probe as [`pen_supported`], without the pen kill-switch.
+/// `PT_TOUCH` synthetic pointer, same 1809 probe as [`pen_supported`], without the pen
+/// kill-switch.
 #[cfg(target_os = "windows")]
 pub fn touch_supported() -> bool {
     pen::synthetic_pen_available()
 }
 
-/// No injector ⇒ no touch.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn touch_supported() -> bool {
     false
 }
 
-/// Whether this host can inject full-fidelity stylus input (`HOST_CAP_PEN` —
-/// design/pen-tablet-input.md): Linux only, via the [`pen::VirtualPen`] uinput tablet, so the
-/// probe is "can we open /dev/uinput" (the same permission the virtual gamepads need) plus the
-/// `PUNKTFUNK_PEN=0` operator kill-switch. Consulted at Welcome time; clients without the bit
-/// keep folding pen into touch/pointer. Windows PT_PEN synthetic pointers are the design's P3.
+/// Full-fidelity stylus (`HOST_CAP_PEN`). Linux only: [`pen::VirtualPen`] uinput tablet.
+/// Probe is "can we open /dev/uinput" (same permission as virtual gamepads) plus
+/// `PUNKTFUNK_PEN=0`. Welcome-time; clients without the bit fold pen into touch/pointer.
 #[cfg(target_os = "linux")]
 pub fn pen_supported() -> bool {
     if std::env::var("PUNKTFUNK_PEN").as_deref() == Ok("0") {
@@ -395,10 +334,9 @@ pub fn pen_supported() -> bool {
     true
 }
 
-/// Windows: pen (and touch) inject via synthetic pointer devices — available on Win10 1809+,
-/// probed by actually creating (and immediately destroying) a PT_PEN device. Same
-/// `PUNKTFUNK_PEN=0` kill-switch as Linux. The probe result also stands in for PT_TOUCH
-/// (both APIs arrived together in 1809).
+/// Synthetic PT_PEN/PT_TOUCH on Win10 1809+. Probe creates then destroys a PT_PEN device.
+/// Same `PUNKTFUNK_PEN=0` kill-switch. Result also stands in for PT_TOUCH (both APIs arrived
+/// in 1809).
 #[cfg(target_os = "windows")]
 pub fn pen_supported() -> bool {
     if std::env::var("PUNKTFUNK_PEN").as_deref() == Ok("0") {
@@ -407,27 +345,24 @@ pub fn pen_supported() -> bool {
     pen::synthetic_pen_available()
 }
 
-/// See the Linux/Windows variants — no pen injection elsewhere.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn pen_supported() -> bool {
     false
 }
 
-/// What an open probe of the input device nodes found — [`uinput_probe`].
+/// Result of [`uinput_probe`].
 ///
-/// [`pen_supported`] asks the same question and throws the answer away: it returns a bare `bool`,
-/// so "the module was never installed" and "you are not in the `input` group" look identical, and
-/// the two need completely different remedies. This keeps the errno so the host's diagnostics can
-/// tell an operator which one they have. A plain verdict enum on purpose — this crate must never
-/// learn about the host's wire types.
+/// [`pen_supported`] returns a bool, so "module missing" and "not in `input` group" look the
+/// same and need different remedies. This keeps the errno. A verdict enum on purpose — this
+/// crate must not learn the host's wire types.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UinputVerdict {
-    /// Every node opened — virtual gamepads and the pen can be created.
+    /// Virtual gamepads and the pen can be created.
     Ok,
-    /// `EACCES`/`EPERM`: the node is there but this process may not open it. Either the user is not
-    /// in the `input` group, or the udev rule granting that group access was never installed.
+    /// `EACCES`/`EPERM`: node present, this process may not open it. User not in `input`, or
+    /// the udev rule granting that group was never installed.
     PermissionDenied { path: &'static str },
-    /// `ENOENT` and friends: the node does not exist at all — the module or the rule is missing.
+    /// `ENOENT` and friends: the node does not exist — module or rule missing.
     Missing { path: &'static str },
     /// Some other errno; carried verbatim rather than guessed at.
     Error { path: &'static str, message: String },
@@ -435,15 +370,14 @@ pub enum UinputVerdict {
     Inapplicable,
 }
 
-/// The device nodes every virtual input device needs, in the order they are worth reporting:
-/// `/dev/uinput` kills the pen and the evdev gamepads, `/dev/uhid` kills the DualSense/Switch Pro
-/// backends that need a real HID transport.
+/// Nodes every virtual input device needs, in report order: `/dev/uinput` kills pen and
+/// evdev pads; `/dev/uhid` kills DualSense/Switch Pro HID.
 #[cfg(target_os = "linux")]
 const INPUT_NODES: &[(&std::ffi::CStr, &str)] =
     &[(c"/dev/uinput", "/dev/uinput"), (c"/dev/uhid", "/dev/uhid")];
 
-/// Probe `/dev/uinput` and `/dev/uhid` the way the backends will, **keeping the errno**. Cheap (two
-/// `open()`s), so the diagnostics refresh can re-run it on demand.
+/// Probe `/dev/uinput` and `/dev/uhid` as the backends will, keeping the errno. Two
+/// `open()`s; diagnostics can re-run on demand.
 #[cfg(target_os = "linux")]
 pub fn uinput_probe() -> UinputVerdict {
     for &(c_path, path) in INPUT_NODES {
@@ -460,7 +394,7 @@ pub fn uinput_probe() -> UinputVerdict {
             unsafe { libc::close(fd) };
             continue;
         }
-        // Read the errno IMMEDIATELY: any further libc call (including the close above) clobbers it.
+        // Read errno immediately: any further libc call (including the close above) clobbers it.
         let err = std::io::Error::last_os_error();
         return match err.raw_os_error() {
             Some(libc::EACCES) | Some(libc::EPERM) => UinputVerdict::PermissionDenied { path },
@@ -476,36 +410,33 @@ pub fn uinput_probe() -> UinputVerdict {
     UinputVerdict::Ok
 }
 
-/// See the Linux variant — uinput/uhid are Linux interfaces; Windows injects through its own driver
-/// stack, whose health is a separate check.
+/// uinput/uhid are Linux; Windows injects through its own driver stack.
 #[cfg(not(target_os = "linux"))]
 pub fn uinput_probe() -> UinputVerdict {
     UinputVerdict::Inapplicable
 }
 
-/// What the usbip/vhci attach node looks like from here — [`vhci_probe`].
+/// usbip/vhci attach node as seen from here — [`vhci_probe`].
 ///
-/// Deliberately reports **device facts only**: whether the module is there and whether this process
-/// can write the node. It does NOT reason about group membership, because the interesting
-/// distinction (in the group on disk vs. in the group in this process) needs the user database, and
-/// that is the host's business, not this crate's.
+/// Device facts only: module present, process can write the node. Does not reason about
+/// group membership; in-group-on-disk vs in-group-in-this-process needs the user database,
+/// which is the host's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VhciVerdict {
-    /// The module is loaded and this process can write `attach` — the virtual Deck can come up.
+    /// Module loaded and this process can write `attach`.
     Ok,
-    /// No `/sys/devices/platform/vhci_hcd*/status`: the module is not loaded.
+    /// No `/sys/devices/platform/vhci_hcd*/status`: module not loaded.
     ModuleMissing,
-    /// The node is there and this process cannot write it. Why is the host's question to answer.
+    /// Node present; this process cannot write it. Why is the host's question.
     NotWritable { path: String },
-    /// The virtual-Deck-over-usbip route does not apply here.
+    /// Virtual-Deck-over-usbip does not apply here.
     Inapplicable { why: &'static str },
 }
 
-/// Probe the vhci attach node: module present, and writable by *this process*?
+/// Probe the vhci attach node: module present, writable by this process.
 ///
-/// Writability is the ground truth rather than a group-name comparison, because that is exactly what
-/// the attach will attempt — `60-punktfunk.rules` `chgrp punktfunk` + `chmod 0660` the node, so a
-/// member of the group whose process actually carries it gets `W_OK` and nobody else does.
+/// Writability is what attach will attempt. `60-punktfunk.rules` `chgrp punktfunk` +
+/// `chmod 0660`, so only a process that actually carries the group gets `W_OK`.
 #[cfg(target_os = "linux")]
 pub fn vhci_probe() -> VhciVerdict {
     use std::os::unix::ffi::OsStrExt;
@@ -536,7 +467,7 @@ pub fn vhci_probe() -> VhciVerdict {
     }
 }
 
-/// See the Linux variant — usbip/vhci is a Linux kernel facility.
+/// usbip/vhci is Linux-only.
 #[cfg(not(target_os = "linux"))]
 pub fn vhci_probe() -> VhciVerdict {
     VhciVerdict::Inapplicable {
@@ -548,10 +479,9 @@ pub fn vhci_probe() -> VhciVerdict {
 mod service;
 pub use service::InjectorService;
 
-/// How the libei backend reaches its EIS server. KWin goes through the `RemoteDesktop` *portal*
-/// (with a pre-seeded grant), but GNOME's portal `Start()` needs an interactive approval a
-/// headless host can't answer — so GNOME goes straight to Mutter's *direct* RemoteDesktop EIS
-/// (`org.gnome.Mutter.RemoteDesktop`), the same direct API the Mutter video backend uses.
+/// How libei reaches EIS. KWin uses the RemoteDesktop portal (pre-seeded grant). GNOME
+/// portal `Start()` needs interactive approval a headless host cannot answer, so GNOME uses
+/// Mutter's direct `org.gnome.Mutter.RemoteDesktop` — same API as the Mutter video backend.
 #[cfg(target_os = "linux")]
 fn libei_ei_source() -> libei::EiSource {
     let gnome = pf_host_config::config()
@@ -569,214 +499,194 @@ fn libei_ei_source() -> libei::EiSource {
     }
 }
 
-// Goal-1 stage 6: Linux UHID/uinput/libei/wlr backends under `inject/linux/`, the Windows UMDF/SendInput
-// backends under `inject/windows/`, and the transport-independent HID codecs under `inject/proto/`;
-// `#[path]` keeps every `crate::*` module name flat.
-/// Windows: asks a devnode which process is serving it (`pf_driver_proto::gamepad::ChannelProof`) —
-/// the unforgeable answer the sealed pad channel duplicates its DATA section into, replacing the
-/// LocalService-writable bootstrap mailbox as the source of that decision.
+/// Which process serves a Windows devnode (`pf_driver_proto::gamepad::ChannelProof`).
+/// Unforgeable; the sealed pad channel duplicates DATA from it instead of a
+/// LocalService-writable mailbox.
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/channel_proof.rs"]
 pub mod channel_proof;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/dualsense.rs"]
 pub mod dualsense;
-/// Windows: virtual DualSense **Edge** via the same UMDF minidriver + shared-memory channel
-/// (device-type 2) — the wire back grips land on the Edge's native back/Fn buttons.
+/// Virtual DualSense Edge via UMDF + shm (device-type 2). Wire back grips land on the Edge
+/// native back/Fn buttons.
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/dualsense_edge_windows.rs"]
 pub mod dualsense_edge_windows;
-/// Transport-independent DualSense HID contract, shared by the Linux UHID backend ([`dualsense`])
-/// and the Windows UMDF-driver backend ([`dualsense_windows`]).
+/// DualSense HID contract, shared by Linux UHID ([`dualsense`]) and Windows UMDF
+/// ([`dualsense_windows`]).
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/dualsense_proto.rs"]
 pub mod dualsense_proto;
-/// Linux: virtual DualSense over **USB/IP** (`vhci_hcd`) carrying its own USB Audio Class sound
-/// card — the pad with *real* USB topology, so wine can derive a ContainerId for it and GE-Proton
-/// finds a real ALSA card. The uhid pad ([`dualsense`]) can satisfy neither.
+/// Virtual DualSense over USB/IP (`vhci_hcd`) with its own USB Audio Class card — real USB
+/// topology so wine can derive a ContainerId and GE-Proton finds an ALSA card. [`dualsense`]
+/// uhid can do neither.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/dualsense_usbip.rs"]
 pub mod dualsense_usbip;
-/// Windows: virtual DualSense via the UMDF minidriver + a shared-memory host channel.
+/// Virtual DualSense via UMDF minidriver + shm host channel.
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/dualsense_windows.rs"]
 pub mod dualsense_windows;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/dualshock4.rs"]
 pub mod dualshock4;
-/// Transport-independent DualShock 4 HID codec, shared by the Linux UHID backend ([`dualshock4`])
-/// and the Windows UMDF-driver backend ([`dualshock4_windows`]).
+/// DualShock 4 HID codec, shared by Linux UHID ([`dualshock4`]) and Windows UMDF
+/// ([`dualshock4_windows`]).
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/dualshock4_proto.rs"]
 pub mod dualshock4_proto;
-/// Windows: virtual DualShock 4 via the same UMDF minidriver + shared-memory channel (device-type 1).
+/// Virtual DualShock 4 via UMDF + shm (device-type 1).
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/dualshock4_windows.rs"]
 pub mod dualshock4_windows;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/gamepad.rs"]
 pub mod gamepad;
-/// Windows: virtual Xbox 360 pads via the in-tree XUSB companion UMDF driver (classic XInput).
+/// Virtual Xbox 360 pads via the in-tree XUSB companion UMDF driver (classic XInput).
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/gamepad_windows.rs"]
 pub mod gamepad;
-/// Windows: small RAII wrappers (`Shm` section+view, `SwDevice` devnode) shared by the three gamepad
-/// backends (DualSense / DualShock 4 / XUSB), so each per-pad resource closes deterministically on drop.
+/// RAII wrappers (`Shm` section+view, `SwDevice` devnode) shared by DualSense / DualShock 4
+/// / XUSB so each resource closes on drop.
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/gamepad_raii.rs"]
 mod gamepad_raii;
-/// Windows: the RESIDENT virtual HID mouse via the pf-mouse UMDF minidriver — keeps
-/// `SM_MOUSEPRESENT` true on headless hosts so DWM composites a cursor into the IDD frame
-/// (`SendInput` alone moves an invisible pointer when no physical mouse is attached).
+/// Resident virtual HID mouse via pf-mouse UMDF. Keeps `SM_MOUSEPRESENT` true on headless
+/// hosts so DWM composites a cursor into the IDD frame — `SendInput` alone moves an
+/// invisible pointer with no physical mouse.
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/mouse_windows.rs"]
 pub mod mouse_windows;
-/// Shared virtual-pad creation-retry policy ([`pad_gate::PadGate`]), driven by [`pad_slots`] for
-/// every backend manager — replaces the per-backend permanent `broken` latch with capped-backoff
-/// retry.
+/// Virtual-pad creation-retry ([`pad_gate::PadGate`]), driven by [`pad_slots`]. Replaces a
+/// per-backend permanent `broken` latch with capped-backoff retry.
 ///
-/// Built on every target, not just the two that have pad backends: it is pure timing arithmetic
-/// over `std::time`, and gating it meant its tests — and [`pad_slots`]', which need it — could not
-/// run on a developer machine at all. See [`pad_slots`].
+/// Built on every target: pure `std::time` arithmetic. Gating it meant its tests — and
+/// [`pad_slots`]' — could not run off a host box.
 #[path = "inject/pad_gate.rs"]
 pub mod pad_gate;
-/// Host-wide allocation of the OS-level pad slots ([`pad_pool::PadSlotPool`]) and the per-session
-/// wire-index → slot mapping over it ([`pad_pool::PadSlotMap`]).
+/// Host-wide OS pad slots ([`pad_pool::PadSlotPool`]) and per-session wire-index → slot map
+/// ([`pad_pool::PadSlotMap`]).
 ///
-/// Every OS name a virtual pad needs — the `Global\pf…-boot-<i>` mailboxes, the `SwDeviceCreate`
-/// instance ids, the DualSense pairing MAC, the Deck serial, the Switch MAC — is derived from a
-/// pad index, while every client numbers its first controller wire pad 0 and the host serves
-/// several sessions at once. This is what keeps those two facts from colliding.
+/// Every OS name a virtual pad needs (mailboxes, `SwDeviceCreate` ids, DualSense MAC, Deck
+/// serial, Switch MAC) is derived from a pad index, while every client numbers its first
+/// pad 0 and the host serves several sessions. This is what keeps those from colliding.
 ///
-/// Built on every target, like [`pad_gate`] and [`pad_slots`]: it is a bitmap and an array, it
-/// touches no OS pad API, and the collision it prevents is one only a multi-session host box can
-/// demonstrate — so the policy either has tests that run everywhere, or none that anyone runs.
+/// Built on every target like [`pad_gate`]: a bitmap and an array, no OS pad API. The
+/// collision only a multi-session host can show, so the policy has tests everywhere or
+/// nowhere.
 #[path = "inject/pad_pool.rs"]
 pub mod pad_pool;
-/// Shared virtual-pad slot table + creation lifecycle ([`pad_slots::PadSlots`]) — the
-/// `Vec<Option<Pad>>` table, `active_mask` unplug sweep, and gate-checked create every backend
-/// manager used to copy-paste (G12).
+/// Virtual-pad slot table + create lifecycle ([`pad_slots::PadSlots`]): `Vec<Option<Pad>>`,
+/// `active_mask` unplug sweep, gate-checked create.
 ///
-/// Built on every target for the same reason as [`pad_gate`]: nothing in it touches an OS pad API
-/// (the backend supplies the pad type and the `open` closure), so the platform gate bought
-/// nothing and cost the ability to run the table's tests off a host box. That matters most for
-/// [`pad_slots::PadCreateFault`], whose whole job is to describe a `cfg(windows)` failure that
-/// only a Windows box can produce — the classification either has tests that run everywhere, or
-/// it has none that anyone runs.
+/// Built on every target like [`pad_gate`]: the backend supplies the pad type and `open`
+/// closure, so a platform gate only blocked tests. [`pad_slots::PadCreateFault`] describes
+/// a `cfg(windows)` failure only a Windows box produces — classification tests run
+/// everywhere or nowhere.
 #[path = "inject/pad_slots.rs"]
 pub mod pad_slots;
-/// The `sensor_timestamp` every virtual Sony pad stamps into its input reports
-/// ([`sensor_clock::SensorClock`]) — real elapsed time in the DualSense's 1/3 µs and the
-/// DualShock 4's 5.33 µs units, shared by all four backends.
+/// `sensor_timestamp` every virtual Sony pad stamps into its input reports
+/// ([`sensor_clock::SensorClock`]) — elapsed time in DualSense 1/3 µs and DualShock 4
+/// 5.33 µs units, shared by all four backends.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/sensor_clock.rs"]
 pub mod sensor_clock;
-/// Linux: virtual Steam Deck via UHID — the kernel `hid-steam` driver binds it as a real Deck.
+/// Virtual Steam Deck via UHID — kernel `hid-steam` binds it as a real Deck.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_controller.rs"]
 pub mod steam_controller;
-/// Linux: virtual Steam Controller 2 (Triton, `28DE:1302`) via UHID — as-is raw passthrough of a
-/// client-captured physical pad; Steam Input drives the hidraw node (no kernel driver binds it).
+/// Virtual Steam Controller 2 (Triton, `28DE:1302`) via UHID — raw passthrough of a
+/// client-captured physical pad; Steam Input drives hidraw (no kernel driver binds it).
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_controller2.rs"]
 pub mod steam_controller2;
-/// Windows: virtual Steam Deck via the same UMDF minidriver + shared-memory channel
-/// (device-type 3) — promoted by Steam Input thanks to the `&MI_02` hardware-id synthesis.
+/// Virtual Steam Deck via UMDF + shm (device-type 3). Steam Input promotes it because of
+/// the `&MI_02` hardware-id synthesis.
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/steam_deck_windows.rs"]
 pub mod steam_deck_windows;
-/// Linux: virtual Steam Deck via the USB gadget subsystem (`raw_gadget` + `dummy_hcd`) — the only
-/// virtual-Deck transport Steam Input promotes (presents the controller on USB interface 2).
-/// SteamOS-host only (needs `dummy_hcd` + `raw_gadget`).
+/// Virtual Steam Deck via USB gadget (`raw_gadget` + `dummy_hcd`). Only virtual-Deck
+/// transport Steam Input promotes (controller on USB interface 2). SteamOS-host only.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_gadget.rs"]
 pub mod steam_gadget;
-/// Transport-independent Steam Controller / Steam Deck HID contract (descriptor, byte-exact Deck
-/// serializer, XInput/rich mappers, rumble parser), used by the Linux UHID backend
-/// ([`steam_controller`]) and the Windows UMDF backend ([`steam_deck_windows`]).
+/// Steam Controller / Steam Deck HID contract (descriptor, byte-exact Deck serializer,
+/// XInput/rich mappers, rumble parser). Linux UHID ([`steam_controller`]) and Windows UMDF
+/// ([`steam_deck_windows`]).
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/steam_proto.rs"]
 pub mod steam_proto;
-/// Pure fallback-remap policy (Steam-only inputs onto a non-Steam backend) + the Deck motion rescale.
-/// Shared by the Linux and Windows DualSense/DS4 backends (the slot-less pads that must fold the
-/// Steam back grips); the Deck motion rescale is Linux-only but harmless to compile on Windows.
+/// Fallback remap of Steam-only inputs onto a non-Steam backend, plus Deck motion rescale.
+/// Shared by DualSense/DS4 (slot-less pads that must fold Steam back grips). Deck rescale
+/// is Linux-only but harmless to compile on Windows.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/steam_remap.rs"]
 pub mod steam_remap;
-/// Linux: virtual Steam Deck over **USB/IP** (`vhci_hcd`) — the shippable, Secure-Boot-clean,
-/// Steam-Input-promotable virtual-Deck transport on non-SteamOS hosts (Bazzite/generic), where
-/// `dummy_hcd`/`raw_gadget` aren't built. In-tree + signed; no module build, no MOK.
+/// Virtual Steam Deck over USB/IP (`vhci_hcd`). Steam-Input-promotable on non-SteamOS hosts
+/// where `dummy_hcd`/`raw_gadget` are not built. In-tree and signed; no MOK.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_usbip.rs"]
 pub mod steam_usbip;
-/// Linux: virtual Nintendo Switch Pro Controller via UHID (kernel `hid-nintendo`).
+/// Virtual Switch Pro via UHID (kernel `hid-nintendo`).
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/switch_pro.rs"]
 pub mod switch_pro;
-/// Transport-independent Switch Pro Controller codec + the canned `hid-nintendo` handshake
-/// replies, used by the Linux UHID backend (`switch_pro`). Deliberately NOT cfg-gated like
-/// `switch_pro` (and for the same reason as `triton_proto` below): pure byte-packing with no
-/// OS surface, so its layout tests — and the cross-backend motion **unit contract** in
-/// `tests/motion_contract.rs`, which pins this codec's IMU units alongside every other
-/// backend's — compile and run on any host, Windows included.
+/// Switch Pro codec + canned `hid-nintendo` handshake replies, used by [`switch_pro`].
+/// Not cfg-gated (same reason as `triton_proto`): pure byte-packing, so layout tests and
+/// the IMU unit contract in `tests/motion_contract.rs` run on any host, Windows included.
 #[path = "inject/proto/switch_proto.rs"]
 pub mod switch_proto;
-/// Transport-independent Steam Controller 2 (Triton) contract: state layout, feature
-/// query-dance, rumble parse. Deliberately NOT cfg-gated like `steam_controller2`: it is
-/// pure byte-packing with no OS surface, so its layout tests compile and run on any host —
-/// consumers are the Linux uhid/usbip leg and the Windows `triton_windows` backend.
+/// Steam Controller 2 (Triton) contract: state layout, feature query-dance, rumble parse.
+/// Not cfg-gated like `steam_controller2`: pure byte-packing, so layout tests run on any
+/// host — consumers are Linux uhid/usbip and Windows `triton_windows`.
 #[path = "inject/proto/triton_proto.rs"]
 pub mod triton_proto;
-/// Linux: virtual Steam Controller 2 over **USB/IP** — a real USB device byte-matched to the
-/// physical wired pad's captured descriptors, so Steam lists it (the UHID leg is confirmed
-/// invisible to Steam). Preferred transport of [`steam_controller2`].
+/// Virtual Steam Controller 2 over USB/IP — USB device byte-matched to the physical wired
+/// pad's captured descriptors, so Steam lists it (UHID is invisible to Steam). Preferred
+/// transport of [`steam_controller2`].
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/triton_usbip.rs"]
 pub mod triton_usbip;
-/// Windows: virtual Steam Controller 2 (Triton, `28DE:1302`) over the same UMDF minidriver +
-/// shared-memory channel (device-type 7) — as-is raw passthrough of a client-captured physical
-/// pad, with Steam's feature/output writes drained back kind-tagged (FEATURE vs OUTPUT) for
-/// replay on the client's real controller.
+/// Virtual Steam Controller 2 (Triton, `28DE:1302`) via UMDF + shm (device-type 7). Raw
+/// passthrough of a client-captured physical pad; Steam feature/output writes drain back
+/// kind-tagged (FEATURE vs OUTPUT) for replay on the client's real controller.
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/triton_windows.rs"]
 pub mod triton_windows;
-/// Linux: the `/dev/uhid` event ABI shared by every UHID gamepad backend — the constants each
-/// used to transcribe for itself, plus the field accessors that read a payload's real length.
+/// `/dev/uhid` event ABI shared by every UHID gamepad backend — constants each used to
+/// transcribe, plus field accessors that read a payload's real length.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/uhid_abi.rs"]
 pub mod uhid_abi;
-/// The generic stateful virtual-pad manager ([`uhid_manager::UhidManager`]) — event routing, frame
-/// merge, heartbeat, and feedback pump shared by the five UHID/UMDF backends; each supplies only
-/// its per-controller protocol via [`uhid_manager::PadProto`] (G12).
+/// Stateful virtual-pad manager ([`uhid_manager::UhidManager`]) — event routing, frame
+/// merge, heartbeat, and feedback pump shared by the five UHID/UMDF backends; each supplies
+/// only its protocol via [`uhid_manager::PadProto`].
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/uhid_manager.rs"]
 pub mod uhid_manager;
-/// Linux: byte-level tracing of the USB/IP socket (`PUNKTFUNK_USBIP_TRACE`). A framing bug in that
-/// stream is only ever visible as damage the kernel notices somewhere later, so the wire itself has
-/// to be recoverable.
+/// Byte-level tracing of the USB/IP socket (`PUNKTFUNK_USBIP_TRACE`). A framing bug in that
+/// stream is only visible as damage the kernel notices later, so the wire itself has to be
+/// recoverable.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/usbip_trace.rs"]
 pub mod usbip_trace;
-/// Transport-independent Xbox HID codec — the report the `pf-gamepad` UMDF driver serves under
-/// device-types 4, 5 and 6 (Xbox Wireless / One S / Elite Series 2, which share one descriptor and
-/// differ only in VID/PID), giving an Xbox pad the HID footing `pf-xusb` never had
-/// (Steam / WGI / GameInput / DirectInput cannot see an XUSB-interface-only device).
+/// Xbox HID codec — report `pf-gamepad` serves as device-types 4/5/6 (Wireless / One S /
+/// Elite Series 2). Same descriptor, VID/PID differ. Gives HID footing `pf-xusb` never had:
+/// Steam / WGI / GameInput / DirectInput cannot see an XUSB-interface-only device.
 ///
-/// Deliberately NOT cfg-gated to linux/windows like its siblings: it is pure byte-packing with no
-/// OS surface, so its layout tests compile and run on any host — including the macOS dev machines
-/// where the Windows backends cannot be built at all. That is the only automated check this codec
-/// has until a Windows box is reachable.
+/// Not cfg-gated: pure byte-packing, so layout tests run on any host — including machines
+/// that cannot build the Windows backends.
 #[path = "inject/proto/xbox_proto.rs"]
 pub mod xbox_proto;
-/// Windows: virtual Xbox pads via the same UMDF minidriver — Xbox Wireless (device-type 4),
-/// Xbox One S (5) and Xbox Elite Series 2 (6), the HID-visible alternative to
-/// [`gamepad_windows`]'s XUSB companion, which Steam / WGI / GameInput / DirectInput cannot
-/// enumerate at all because it registers only the XUSB device interface. The three identities
-/// share one report descriptor and differ only in VID/PID, product string and INF model line.
+/// Virtual Xbox pads via UMDF — Wireless (device-type 4), One S (5), Elite Series 2 (6).
+/// HID-visible alternative to [`gamepad`]'s XUSB companion, which Steam / WGI / GameInput
+/// / DirectInput cannot enumerate (XUSB interface only). Three identities share one
+/// descriptor; VID/PID, product string, and INF model line differ.
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/xbox_windows.rs"]
 pub mod xbox_windows;
-/// Stub — virtual gamepads need Linux uinput or the Windows UMDF drivers; events are dropped elsewhere.
+/// Stub — virtual gamepads need Linux uinput or Windows UMDF; events are dropped elsewhere.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub mod gamepad {
     #[derive(Default)]
@@ -789,36 +699,34 @@ pub mod gamepad {
         pub fn pump_rumble(&mut self, _send: impl FnMut(u16, u16, u16, u16, u16)) {}
     }
 }
-/// Linux: the "Punktfunk Pen" uinput virtual tablet (design/pen-tablet-input.md §5) — the
-/// per-session stylus device the native pen plane injects through.
+/// "Punktfunk Pen" uinput virtual tablet — per-session stylus the native pen plane injects
+/// through.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/pen.rs"]
 pub mod pen;
-/// Windows: PT_PEN/PT_TOUCH synthetic pointer devices (design/pen-tablet-input.md §6).
-/// `pen::VirtualPen` here is the PT_PEN device; `pen::SyntheticTouch` backs the SendInput
-/// injector's wire-touch path.
+/// PT_PEN/PT_TOUCH synthetic pointer devices. `pen::VirtualPen` is the PT_PEN device;
+/// `pen::SyntheticTouch` backs the SendInput injector's wire-touch path.
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/pointer_windows.rs"]
 pub mod pen;
-/// Windows: the streamed output's desktop rect that every absolute coordinate (pen, touch,
-/// absolute mouse) maps into — published by the host at capture bring-up, resolved through the
-/// CCD source rect (the cursor-readback poller's resolver, so both directions agree). Mapping
-/// over the whole virtual desktop instead is the Extend-topology offset bug the pen exposed
-/// (design/pen-tablet-input.md).
+/// Streamed output's desktop rect that every absolute coordinate (pen, touch, absolute
+/// mouse) maps into — published at capture bring-up, resolved through the CCD source rect
+/// (cursor-readback poller's resolver, so both directions agree). Mapping over the whole
+/// virtual desktop is the Extend-topology offset bug.
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/stream_target.rs"]
 pub mod stream_target;
 #[cfg(target_os = "windows")]
 pub use stream_target::set_stream_target;
-/// Linux: the streamed compositor output (by name) that absolute coordinates map into — the
-/// counterpart of the Windows `stream_target` module, published by the host at capture bring-up and
-/// consumed by the wlroots virtual-pointer backend, which binds its pointer to that `wl_output`.
+/// Streamed compositor output (by name) that absolute coordinates map into — counterpart
+/// of Windows `stream_target`. Published at capture bring-up; wlroots binds its pointer to
+/// that `wl_output`.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/stream_output.rs"]
 pub mod stream_output;
 #[cfg(target_os = "linux")]
 pub use stream_output::{set_stream_output, stream_output};
-/// Stub — pen injection needs the Linux uinput tablet or Windows synthetic pointers;
+/// Stub — pen injection needs the Linux uinput tablet or Windows synthetic pointers.
 /// `pen_supported()` is false here, so no host advertises the cap and no batches arrive.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub mod pen {
@@ -848,15 +756,10 @@ mod wlr;
 mod backend_select_tests {
     use super::*;
 
-    /// The session's backend reaches the injector as a published VALUE ([`set_backend_id`]) and
-    /// outranks every env rung below it — which is exactly the precedence the old
-    /// `set_var("PUNKTFUNK_INPUT_BACKEND", ..)` had, since it OVERWROTE whatever was there. It is a
-    /// `RwLock` read now because [`default_backend`] runs once per input batch on the injector
-    /// service thread, and a `getenv` there raced the connect path's `setenv`
-    /// (security-review 2026-08-25).
-    ///
-    /// Deliberately makes no claim about the environment: the point is that nothing needs to write
-    /// it, so the test does not write one either.
+    /// Session backend is a published value ([`set_backend_id`]) and outranks every env
+    /// rung. [`default_backend`] runs per input batch; a `getenv` there raced connect-path
+    /// `setenv`. Makes no claim about the environment: nothing needs to write it, so the
+    /// test does not.
     #[test]
     fn the_session_backend_threads_through_instead_of_the_process_env() {
         set_backend_id("gamescope");
@@ -864,17 +767,17 @@ mod backend_select_tests {
         // A mid-stream Game→Desktop switch re-publishes; input follows, with no env write.
         set_backend_id("kwin");
         assert_eq!(default_backend(), Backend::KwinFakeInput);
-        // An id nobody recognises must leave routing where it was rather than silently retargeting
-        // input at a backend the video side did not choose.
+        // An unrecognised id must leave routing where it was, not retarget a backend the
+        // video side did not choose.
         set_backend_id("not-a-backend");
         assert_eq!(default_backend(), Backend::KwinFakeInput);
     }
 
-    /// Every id `pf_vdisplay::input_backend_id` can emit must be one this crate accepts. The two are
-    /// halves of one contract across a crate boundary that no compiler checks — pf-vdisplay must not
-    /// depend on pf-inject (its manifest says so), so it emits `&'static str` and this pins the
-    /// receiving end. Its counterpart is pf-vdisplay's
-    /// `every_compositor_names_the_injector_backend_that_matches_it`.
+    /// Every id `pf_vdisplay::input_backend_id` can emit must be one this crate accepts.
+    /// The two are halves of one contract across a crate boundary the compiler cannot
+    /// check — pf-vdisplay must not depend on pf-inject, so it emits `&'static str` and
+    /// this pins the receiving end. Counterpart:
+    /// `every_compositor_names_the_injector_backend_that_matches_it` in pf-vdisplay.
     #[test]
     fn every_id_the_video_side_emits_maps_to_a_backend() {
         for (id, want) in [
