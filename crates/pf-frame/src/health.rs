@@ -208,6 +208,14 @@ pub fn classify(th: &Thresholds, snap: &Snapshot, start: Instant) -> Verdict {
         }
         return verdict(HealthClass::Healthy, false);
     }
+    let heartbeat_stale = snap
+        .worker_heartbeat
+        .is_none_or(|t| snap.now.saturating_duration_since(t) >= th.heartbeat_stale);
+    // The drain heartbeat ticks every pass, frames or not: silent past the floor it convicts the
+    // worker by itself. A frozen driver over a still desktop has no other witness.
+    if source_gap >= th.stall_floor && snap.worker_heartbeat.is_some() && heartbeat_stale {
+        return verdict(HealthClass::Stalled(StallClass::Worker), false);
+    }
     let Some(kind) = evidence else {
         return verdict(HealthClass::Idle, false);
     };
@@ -219,9 +227,6 @@ pub fn classify(th: &Thresholds, snap: &Snapshot, start: Instant) -> Verdict {
         // Ask for the canary; the next snapshot decides.
         return verdict(HealthClass::Suspect, true);
     }
-    let heartbeat_stale = snap
-        .worker_heartbeat
-        .is_none_or(|t| snap.now.saturating_duration_since(t) >= th.heartbeat_stale);
     let class = if heartbeat_stale {
         StallClass::Worker
     } else if advanced(snap.last_acquire) && !advanced(snap.last_publish) {
@@ -532,6 +537,30 @@ mod tests {
             classify(&th, &snap, s).class,
             HealthClass::Stalled(StallClass::Worker)
         );
+    }
+
+    /// A frozen driver over a still desktop: no acquire, no input, no canary — only the silent
+    /// heartbeat. That alone names the worker past the floor; a pre-v2 driver with no heartbeat
+    /// at all keeps the activity gate and reads idle.
+    #[test]
+    fn silent_heartbeat_over_a_still_desktop_is_worker() {
+        let th = Thresholds::default();
+        let s = t0();
+        let last = s + 10 * S;
+        let now = last + 16 * S;
+        let snap = Snapshot {
+            worker_heartbeat: Some(last),
+            ..flowing(s, last, 100).at(now)
+        };
+        assert_eq!(
+            classify(&th, &snap, s).class,
+            HealthClass::Stalled(StallClass::Worker)
+        );
+        let snap = Snapshot {
+            worker_heartbeat: None,
+            ..snap
+        };
+        assert_eq!(classify(&th, &snap, s).class, HealthClass::Idle);
     }
 
     #[test]

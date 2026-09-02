@@ -408,6 +408,48 @@ jobs:
       - name: Typecheck
         run: bun run lint
 
+  sdk-plugin-kit:
+    runs-on: ubuntu-24.04
+    container:
+      image: oven/bun:1
+    timeout-minutes: 15
+    steps:
+      - name: Install git + CA certs
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Typecheck SDK
+        working-directory: sdk
+        run: |
+          bash ../scripts/ci/retry.sh 3 bun install --frozen-lockfile --ignore-scripts
+          bun run typecheck
+          bun run build
+      - name: Typecheck plugin kit
+        working-directory: plugin-kit
+        run: |
+          bash ../scripts/ci/retry.sh 3 bun install --frozen-lockfile --ignore-scripts
+          if ! test -f node_modules/@punktfunk/host/package.json; then
+            rm -rf node_modules/@punktfunk/host
+            cp -R ../sdk node_modules/@punktfunk/host
+          fi
+          bun run typecheck
+
+  decky-typecheck:
+    runs-on: ubuntu-24.04
+    container:
+      image: node:22-bookworm
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: clients/decky
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Typecheck
+        run: |
+          corepack enable
+          corepack prepare pnpm@9 --activate
+          pnpm install --frozen-lockfile
+          pnpm run typecheck
+
   # web/bun.nix and sdk/bun.nix are GENERATED from their bun.lock (bun2nix) and committed; the Nix
   # build fetches node_modules from nothing else. They regenerate only on a local `bun install` that
   # runs lifecycle scripts — never under CI's `--ignore-scripts`, and never on a merge or rebase,

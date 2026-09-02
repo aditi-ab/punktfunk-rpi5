@@ -256,3 +256,24 @@ impl TrustStore {
         self.paired.lock().unwrap().clients.clients.len() as u32
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_store_files_open_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases: [&[u8]; 3] = [b"", br#"{"clients":["#, b"not json"];
+
+        for (index, contents) in cases.into_iter().enumerate() {
+            let path = dir.path().join(format!("{index}.json"));
+            std::fs::write(&path, contents).unwrap();
+
+            let store = TrustStore::open(Some(path)).unwrap();
+
+            assert_eq!(store.count(), 0);
+            assert!(store.list().is_empty());
+        }
+    }
+}

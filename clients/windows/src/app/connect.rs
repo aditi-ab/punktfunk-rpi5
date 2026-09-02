@@ -6,8 +6,8 @@
 use super::lucide;
 use super::style::*;
 use super::{AppCtx, Screen, Svc, Target};
-use crate::discovery::DiscoveredHost;
 use crate::trust::{self, KnownHost, KnownHosts};
+use pf_client_core::discovery::{DiscoveredHost, DiscoveryEvent};
 use pf_client_core::orchestrate::{WakeOutcome, WakeWait};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -491,7 +491,7 @@ fn wake_and_connect(
 
     let (ctx, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
     std::thread::spawn(move || {
-        let (rx, rescan) = crate::discovery::browse();
+        let (rx, rescan) = pf_client_core::discovery::browse();
         let mut seen: Vec<DiscoveredHost> = Vec::new();
         let mut wait = WakeWait::new();
         // A waking host starts advertising at a moment we can't predict, and `mdns-sd`'s own
@@ -504,7 +504,10 @@ fn wake_and_connect(
                 return;
             }
             // Drain freshly-resolved adverts into the accumulator (newest wins per key).
-            while let Ok(h) = rx.try_recv() {
+            while let Ok(event) = rx.try_recv() {
+                let DiscoveryEvent::Resolved(h) = event else {
+                    continue;
+                };
                 if let Some(e) = seen.iter_mut().find(|e| e.key == h.key) {
                     *e = h;
                 } else {

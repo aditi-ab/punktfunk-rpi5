@@ -17,8 +17,8 @@
 #     vendor dir by `name-version`, so those same-name-same-version-different-source entries collide;
 #     crane vendors per-source and handles it. (Those crates are `cfg(windows)`-gated and never
 #     COMPILE on Linux — they only need to be vendored to satisfy the lock.)
-#   * crane fetches git deps with `builtins.fetchGit` (the rev is a full sha ⇒ pure-eval-safe), so
-#     no hand-maintained `outputHashes` for the windows-rs checkout.
+#   * Git checkouts have unpacked hashes so evaluation does not fetch GitHub. This keeps
+#     `nix flake check --no-build` offline after its flake inputs are available.
 #
 # The whole workspace is built from real source (no crane dep-only "dummy" pre-build): pyrowave-sys
 # runs CMake over its committed `vendor/pyrowave` tree in build.rs, which a dummy src would omit —
@@ -76,6 +76,13 @@ let
   commonArgs = {
     inherit src version;
     strictDeps = true;
+
+    outputHashes = {
+      "git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc#acb5a1a7441033d9312b16842af02eb0c2b403dc" =
+        "sha256-i92qO/7YO4XB9LQ2w9etTAwGebM/SdwSi8hJaGoGq/Y=";
+      "git+https://github.com/unom-io/usbfs-iso?rev=f3de1fd62cec271d07f45664dc464f23e423e721#f3de1fd62cec271d07f45664dc464f23e423e721" =
+        "sha256-RWQgE6AHnvXKwbBRw0dVavZy0TLngCs3C+OZENqYG2c=";
+    };
 
     # nixpkgs ships CMake ≥ 4, which errors on `cmake_minimum_required(VERSION <3.5)`. Several
     # vendored C libraries built through the `cmake` crate still declare a pre-3.5 minimum

@@ -30,8 +30,6 @@ mod couch;
 #[cfg(windows)]
 mod deeplink;
 #[cfg(windows)]
-mod discovery;
-#[cfg(windows)]
 mod gpu;
 #[cfg(windows)]
 mod logfile;
@@ -240,11 +238,14 @@ fn run_headless_cli(args: &[String], identity: (String, String)) {
 fn discover_and_print() {
     use std::time::{Duration, Instant};
     println!("Browsing the LAN for Punktfunk hosts (~5 s)…");
-    let (rx, _rescan) = discovery::browse();
+    let (rx, _rescan) = pf_client_core::discovery::browse();
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut seen = std::collections::HashSet::new();
     while Instant::now() < deadline {
-        while let Ok(h) = rx.try_recv() {
+        while let Ok(event) = rx.try_recv() {
+            let pf_client_core::discovery::DiscoveryEvent::Resolved(h) = event else {
+                continue;
+            };
             if seen.insert(h.key.clone()) {
                 println!(
                     "  {}  {}:{}  pair={}  fp={}",

@@ -1,16 +1,17 @@
-//! App-lifetime SDL3 gamepad service: Settings pad list, one forwarded pad 0, and
-//! in-session buttons/axes, DualSense touchpad + motion (`0xCC`), rumble, lightbar,
-//! and DualSense raw effects. Held state is zeroed on pad switch or detach.
+//! App-lifetime SDL3 gamepad service: Settings pad list, a forwarded slot per connected
+//! pad (a user pin narrows it to one), and in-session buttons/axes, DualSense touchpad +
+//! motion (`0xCC`), rumble, lightbar, and DualSense raw effects. Held state is zeroed on
+//! slot close or detach.
 //!
 //! Idle never opens a device and keeps Valve HIDAPI off ([`set_valve_hidapi`]): the
 //! Deck driver kills lizard mode (trackpad-mouse) at *enumeration*. Settings uses
 //! ID-based metadata getters. Menu mode ([`GamepadService::set_menu_mode`]) is the
-//! exception: the active pad stays open for [`MenuEvent`]s; Valve HIDAPI stays off;
-//! an attached session supersedes. This thread is the single rumble/HID-output
-//! consumer. Menu types live in `menu_nav`.
+//! exception: the same pads stay open for [`MenuEvent`]s, folded into one sample so any
+//! of them navigates; Valve HIDAPI stays off; an attached session supersedes. This
+//! thread is the single rumble/HID-output consumer. Menu types live in `menu_nav`.
 
+use crate::menu_nav::{ring_sector, MenuNav, MenuSample};
 pub use crate::menu_nav::{MenuDir, MenuEvent, MenuPulse, PadBattery, PadInfo};
-use crate::menu_nav::{MenuNav, MenuSample};
 use punktfunk_core::client::{ActuatorQuirks, NativeClient};
 use punktfunk_core::config::GamepadPref;
 use punktfunk_core::input::{gamepad as wire, InputEvent, InputKind};
@@ -455,6 +456,60 @@ fn button_bit(b: sdl3::gamepad::Button) -> Option<u32> {
     })
 }
 
+/// The menu-navigation state of one open pad. Read off the handle, not from events — the
+/// console polls, so a stick that never moves again still holds its direction.
+fn menu_sample(pad: &sdl3::gamepad::Gamepad) -> MenuSample {
+    use sdl3::gamepad::{Axis, Button};
+    MenuSample {
+        buttons: [
+            pad.button(Button::South),
+            pad.button(Button::East),
+            pad.button(Button::West),
+            pad.button(Button::North),
+            pad.button(Button::LeftShoulder),
+            pad.button(Button::RightShoulder),
+        ],
+        lx: pad.axis(Axis::LeftX),
+        ly: pad.axis(Axis::LeftY),
+        dpad: [
+            pad.button(Button::DPadUp),
+            pad.button(Button::DPadDown),
+            pad.button(Button::DPadLeft),
+            pad.button(Button::DPadRight),
+        ],
+    }
+}
+
+/// Fold every open pad into the one sample [`MenuNav`] steps: buttons and dpad OR'd, stick
+/// from whoever is furthest off centre. Two pads pushing at once read as one hand instead of
+/// cancelling, and one `MenuNav` keeps one repeat clock — per-pad ones race on the same list.
+/// The Skia console already merges this way (`console/mod.rs`); this is the desktop half.
+fn merge_samples(samples: &[MenuSample]) -> MenuSample {
+    let mut out = MenuSample::default();
+    let mut best = -1i32;
+    for s in samples {
+        for i in 0..out.buttons.len() {
+            out.buttons[i] |= s.buttons[i];
+        }
+        for i in 0..out.dpad.len() {
+            out.dpad[i] |= s.dpad[i];
+        }
+        let mag = i32::from(s.lx).pow(2) + i32::from(s.ly).pow(2);
+        if mag > best {
+            best = mag;
+            out.lx = s.lx;
+            out.ly = s.ly;
+        }
+    }
+    out
+}
+
+/// This pad is the one in someone's hands right now — a detent buzzes it, not its idle
+/// neighbour. The stick test is the engage deadzone, so resting drift never claims the pulse.
+fn is_acting(s: &MenuSample) -> bool {
+    s.buttons.iter().chain(&s.dpad).any(|&b| b) || ring_sector(s.lx, s.ly, None).is_some()
+}
+
 /// SDL sticks are +y = down; the wire (XInput) is +y = up. Triggers 0..32767 → 0..255.
 fn axis_value(axis: sdl3::gamepad::Axis, v: i16) -> (u32, i32) {
     use sdl3::gamepad::Axis;
@@ -725,8 +780,12 @@ struct Worker {
     active_out: Arc<Mutex<Option<PadInfo>>>,
     /// Open only while a session is attached; opening grabs hardware.
     slots: Vec<Slot>,
-    /// Menu pad while menu mode is on and no session; mutually exclusive with `slots`.
-    menu_open: Option<(u32, sdl3::gamepad::Gamepad)>,
+    /// Menu pads while menu mode is on and no session; mutually exclusive with `slots`.
+    /// EVERY connected pad, not the newest one: a second controller is otherwise dead on
+    /// the console, and one left shut keeps the dark lightbar `reset_slot_feedback` gave it.
+    menu_open: Vec<(u32, sdl3::gamepad::Gamepad)>,
+    /// Menu pad that last had a button or stick engaged — the one a detent pulse belongs in.
+    menu_last: Option<u32>,
     /// Menu pad power, `(id, level)`. Cached: [`publish`](Self::publish) runs on every hotplug.
     battery: Option<(u32, PadBattery)>,
     battery_at: Option<Instant>,
@@ -826,12 +885,19 @@ impl Worker {
         })
     }
 
-    /// Pin: only that pad. Automatic: every real pad, or the most-recent virtual one when
-    /// that is all Steam Input exposes (Deck game-mode — else gyro/paddles have nowhere to land).
+    /// Pin: only that pad. Automatic: every real pad, or every virtual one when that is all
+    /// Steam Input exposes (Deck game-mode — else gyro/paddles have nowhere to land).
     fn forwarded_ids(&self) -> Vec<u32> {
         if !self.forwarding {
             return Vec::new();
         }
+        self.candidate_ids()
+    }
+
+    /// [`forwarded_ids`](Self::forwarded_ids) without the forwarding gate — what menu mode
+    /// holds open. Console navigation is local, so a user who turned wire forwarding off
+    /// still drives the launcher with the pad in their hands.
+    fn candidate_ids(&self) -> Vec<u32> {
         if let Some(key) = &self.pinned {
             if let Some(id) = self
                 .order
@@ -851,38 +917,47 @@ impl Worker {
             .filter(|&id| self.pad_info(id).is_some_and(|p| !p.steam_virtual))
             .collect();
         if !real.is_empty() {
-            real
-        } else {
-            self.order.last().copied().into_iter().collect()
+            return real;
         }
+        // Every pad is virtual: Steam Input is wrapping all of them, so none is a shadow of
+        // another and forwarding the lot double-counts nothing. Taking only the newest is
+        // what left a Deck with two controllers seeing just one.
+        self.order.clone()
     }
 
     /// The one place that opens (= grabs) hardware. Dropping a handle is `SDL_CloseGamepad`;
     /// on a Deck the firmware watchdog then restores lizard mode.
     fn sync_open(&mut self) {
         if self.attached.is_some() {
-            self.menu_open = None;
+            self.menu_open.clear();
+            self.menu_last = None;
             self.reconcile_slots();
             return;
         }
         self.close_all_slots();
         let want = if self.menu_mode {
-            self.active_id()
+            self.candidate_ids()
         } else {
-            None
+            Vec::new()
         };
-        if self.menu_open.as_ref().map(|(id, _)| *id) == want {
-            return;
-        }
-        self.menu_open = None;
-        let Some(id) = want else { return };
-        match self.subsystem.open(sdl3::sys::joystick::SDL_JoystickID(id)) {
-            Ok(pad) => {
-                self.menu_open = Some((id, pad));
-                // Hot-plug under the launcher: adopt held state instead of firing it. No sensors.
-                self.menu_nav.reset();
+        let before = self.menu_open.len();
+        self.menu_open.retain(|(id, _)| want.contains(id));
+        let mut changed = self.menu_open.len() != before;
+        for id in want {
+            if self.menu_open.iter().any(|(open, _)| *open == id) {
+                continue;
             }
-            Err(e) => tracing::warn!(id, error = %e, "gamepad open failed"),
+            match self.subsystem.open(sdl3::sys::joystick::SDL_JoystickID(id)) {
+                Ok(pad) => {
+                    self.menu_open.push((id, pad));
+                    changed = true;
+                }
+                Err(e) => tracing::warn!(id, error = %e, "gamepad open failed"),
+            }
+        }
+        if changed {
+            // Hot-plug under the launcher: adopt held state instead of firing it. No sensors.
+            self.menu_nav.reset();
         }
     }
 
@@ -1415,9 +1490,17 @@ impl Worker {
         *self.active_out.lock().unwrap() = self.active_id().and_then(with_battery);
     }
 
-    /// Polled: nothing reports a battery changing. Menu pad only (the one open on the console).
+    /// Polled: nothing reports a battery changing. Menu pads only (the ones the console holds).
     fn battery_poll(&mut self) {
-        let Some((id, pad)) = &self.menu_open else {
+        // The UI shows one level, for the pad it calls active; with several open that is the
+        // only one worth a poll (`publish` matches it back by id).
+        let active = self.active_id();
+        let Some((id, pad)) = self
+            .menu_open
+            .iter()
+            .find(|(id, _)| Some(*id) == active)
+            .or_else(|| self.menu_open.first())
+        else {
             if self.battery.take().is_some() {
                 self.publish();
             }
@@ -1550,7 +1633,14 @@ impl Worker {
                 }
                 Ok(Ctl::MenuRumble(pulse)) => {
                     if self.attached.is_none() {
-                        if let Some((_, pad)) = self.menu_open.as_mut() {
+                        // The pad that last acted, not the newest: with two on the console the
+                        // detent belongs in the hands that moved the cursor.
+                        let i = self
+                            .menu_open
+                            .iter()
+                            .position(|(id, _)| Some(*id) == self.menu_last)
+                            .unwrap_or(0);
+                        if let Some((_, pad)) = self.menu_open.get_mut(i) {
                             let (low, high, ms) = match pulse {
                                 MenuPulse::Move => (0, 0x3000, 25),
                                 MenuPulse::Confirm => (0x5000, 0x5000, 60),
@@ -1798,39 +1888,27 @@ impl Worker {
     }
 
     fn menu_poll(&mut self) {
-        use sdl3::gamepad::{Axis, Button};
-        // Ring: first forwarded pad (masked off the wire). Else skip if overlay-masked so
-        // the same stick cannot scroll Steam's UI and ours.
-        let pad = if self.ring_nav {
-            self.slots.first().map(|s| &s.pad)
+        // Ring: every forwarded pad (masked off the wire) — the ring opens from whichever pad
+        // pressed Select+A, which is not always slot 0. Else skip if overlay-masked so the
+        // same stick cannot scroll Steam's UI and ours.
+        let pads: Vec<(u32, &sdl3::gamepad::Gamepad)> = if self.ring_nav {
+            self.slots.iter().map(|s| (s.id, &s.pad)).collect()
         } else if !self.menu_mode || self.attached.is_some() || self.masked {
             return;
         } else {
-            self.menu_open.as_ref().map(|(_, p)| p)
+            self.menu_open.iter().map(|(id, p)| (*id, p)).collect()
         };
-        let Some(pad) = pad else {
+        if pads.is_empty() {
             return;
-        };
-        let s = MenuSample {
-            buttons: [
-                pad.button(Button::South),
-                pad.button(Button::East),
-                pad.button(Button::West),
-                pad.button(Button::North),
-                pad.button(Button::LeftShoulder),
-                pad.button(Button::RightShoulder),
-            ],
-            lx: pad.axis(Axis::LeftX),
-            ly: pad.axis(Axis::LeftY),
-            dpad: [
-                pad.button(Button::DPadUp),
-                pad.button(Button::DPadDown),
-                pad.button(Button::DPadLeft),
-                pad.button(Button::DPadRight),
-            ],
-        };
+        }
+        let samples: Vec<MenuSample> = pads.iter().map(|(_, p)| menu_sample(p)).collect();
+        // Latest connected wins a tie, matching the active-pad rule everywhere else.
+        if let Some(i) = samples.iter().rposition(is_acting) {
+            self.menu_last = Some(pads[i].0);
+        }
+        let merged = merge_samples(&samples);
         let mut out = Vec::new();
-        self.menu_nav.poll(&s, Instant::now(), &mut out);
+        self.menu_nav.poll(&merged, Instant::now(), &mut out);
         for e in out {
             let _ = self.menu_tx.try_send(e);
         }
@@ -1963,7 +2041,8 @@ impl Worker {
             pads_out,
             active_out,
             slots: Vec::new(),
-            menu_open: None,
+            menu_open: Vec::new(),
+            menu_last: None,
             battery: None,
             battery_at: None,
             order: Vec::new(),
@@ -2043,6 +2122,50 @@ fn run(
         w.menu_poll();
         w.battery_poll();
         w.render_feedback();
+    }
+}
+
+#[cfg(test)]
+mod menu_merge_tests {
+    use super::*;
+    use crate::menu_nav::MENU_DEADZONE;
+
+    fn held(dpad_right: bool, lx: i16) -> MenuSample {
+        MenuSample {
+            dpad: [false, false, false, dpad_right],
+            lx,
+            ..MenuSample::default()
+        }
+    }
+
+    #[test]
+    fn either_pad_drives_the_menu() {
+        let idle = MenuSample::default();
+        let pressing = MenuSample {
+            buttons: [true, false, false, false, false, false],
+            ..MenuSample::default()
+        };
+        // Player 2's A must survive the fold: the bug was that only one pad was ever
+        // polled, so a second controller confirmed nothing until a session attached.
+        assert!(merge_samples(&[idle, pressing]).buttons[0]);
+        assert!(merge_samples(&[pressing, idle]).buttons[0]);
+        assert!(!merge_samples(&[idle, idle]).buttons[0]);
+    }
+
+    #[test]
+    fn the_furthest_stick_wins_so_idle_drift_cannot_cancel_it() {
+        let pushed = held(false, 30000);
+        let drifting = held(false, -300);
+        assert_eq!(merge_samples(&[drifting, pushed]).lx, 30000);
+        assert_eq!(merge_samples(&[pushed, drifting]).lx, 30000);
+    }
+
+    #[test]
+    fn acting_needs_a_press_or_a_stick_past_the_deadzone() {
+        assert!(!is_acting(&MenuSample::default()));
+        assert!(!is_acting(&held(false, MENU_DEADZONE as i16 - 1)));
+        assert!(is_acting(&held(false, MENU_DEADZONE as i16 + 1)));
+        assert!(is_acting(&held(true, 0)));
     }
 }
 

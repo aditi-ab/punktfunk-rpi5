@@ -58,9 +58,9 @@ mod speed;
 mod stream;
 mod style;
 
-use crate::discovery::{self, DiscoveredHost};
 use crate::trust::{KnownHosts, Settings};
 use hosts::HostsProps;
+use pf_client_core::discovery::{self, DiscoveredHost, DiscoveryEvent};
 use pf_client_core::gamepad::GamepadService;
 use punktfunk_core::client::NativeClient;
 use speed::{SpeedProps, SpeedState};
@@ -470,11 +470,20 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
             *ctx.shared.rescan.lock().unwrap() = Some(rescan);
             std::thread::spawn(move || {
                 let mut acc: Vec<DiscoveredHost> = Vec::new();
-                while let Ok(h) = rx.recv_blocking() {
-                    if let Some(e) = acc.iter_mut().find(|e| e.key == h.key) {
-                        *e = h;
-                    } else {
-                        acc.push(h);
+                while let Ok(event) = rx.recv_blocking() {
+                    match event {
+                        DiscoveryEvent::Resolved(h) => {
+                            if let Some(e) = acc.iter_mut().find(|e| e.key == h.key) {
+                                *e = h;
+                            } else {
+                                acc.push(h);
+                            }
+                        }
+                        // Goodbye or TTL expiry drops the advert from the live list; a
+                        // saved host stays on the page from the trust store.
+                        DiscoveryEvent::Removed { fullname } => {
+                            acc.retain(|e| e.fullname != fullname);
+                        }
                     }
                     set_hosts.call(acc.clone());
                 }

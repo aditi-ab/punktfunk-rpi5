@@ -133,6 +133,10 @@ proptest = "1"
 # CI just needs the measurement + target/criterion/**/estimates.json for the regression compare).
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
+[[example]]
+name = "mu-smoke"
+required-features = ["quic"]
+
 [[bench]]
 name = "pipeline"
 harness = false

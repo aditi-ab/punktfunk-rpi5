@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # shellcheck shell=bash
 # Single source of truth for punktfunk release/canary version numbers (Linux + macOS runners).
 #

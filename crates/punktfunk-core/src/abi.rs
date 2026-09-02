@@ -5370,6 +5370,41 @@ mod tests {
         assert_eq!(status, PunktfunkStatus::InvalidArg as i32);
     }
 
+    #[test]
+    fn null_session_and_connection_handles_return_status() {
+        // SAFETY: null handles are the documented reported-not-UB case.
+        let session = unsafe { punktfunk_get_stats(std::ptr::null_mut(), std::ptr::null_mut()) };
+        assert_eq!(session, PunktfunkStatus::NullPointer);
+
+        // SAFETY: null handles are the documented reported-not-UB case.
+        let connection = unsafe {
+            punktfunk_connection_audio_channels(std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(connection, PunktfunkStatus::NullPointer);
+    }
+
+    #[test]
+    fn identity_rejects_undersized_buffers_without_writing() {
+        let mut cert: [std::os::raw::c_char; 2] = [0x5a; 2];
+        let mut key: [std::os::raw::c_char; 2] = [0x5a; 2];
+
+        // SAFETY: each array is writable for the one-byte capacity reported to the core.
+        let status =
+            unsafe { punktfunk_generate_identity(cert.as_mut_ptr(), 1, key.as_mut_ptr(), 1) };
+
+        assert_eq!(status, PunktfunkStatus::InvalidArg);
+        assert_eq!(cert, [0x5a; 2]);
+        assert_eq!(key, [0x5a; 2]);
+    }
+
+    #[test]
+    fn guard_maps_panics_to_panic_status() {
+        assert_eq!(
+            guard(|| panic!("test panic must stay inside the ABI guard")),
+            PunktfunkStatus::Panic
+        );
+    }
+
     /// Truncation lands on a character boundary; `s[..HELLO_NAME_MAX]` would panic mid-scalar.
     #[test]
     fn device_name_truncates_on_a_character_boundary() {

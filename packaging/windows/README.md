@@ -1,7 +1,13 @@
-# Windows host packaging — signed Inno Setup installer
+# Windows host packaging — the signed installer
 
 A one-file, signed `setup.exe` for the punktfunk streaming **host** on Windows, published to Gitea's
 generic package registry (`punktfunk-host-windows`) by `.gitea/workflows/windows-host.yml`.
+
+> **M5 (2026-09):** the published artifact is the engine exe — `crates/punktfunk-setup-win`
+> packed by `pack-host-installer.ps1 -Engine` (design: `installer-v2-windows.md` in the planning
+> repo). `punktfunk-host.iss` stays buildable for one release as the revert path (a stable tag
+> still packs it, unpublished); the Inno-specific text below describes that script and goes with
+> it in WP5.3. The silent flags, the ARP key and `unins000.exe` are the same either way.
 
 > Full picture (drivers-from-source, toolchain, CI, dev loop): **punktfunk-planning: `windows-build-and-packaging.md`** (internal planning repo). This README is the `packaging/windows/` file index.
 

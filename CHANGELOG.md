@@ -160,6 +160,17 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 
 ### Changed
 
+- **The Windows installers are punktfunk's own.** `punktfunk-host-setup-<version>.exe` and
+  `punktfunk-client-setup-<version>_<arch>.exe` are now built by `punktfunk-setup-win`, the
+  engine behind the Linux installer, with a self-contained WinUI 3 wizard (Recommended or
+  Custom, a stepper, the web-console password shown once behind a reveal, next steps on the
+  finish page) instead of Inno Setup. Nothing a script or a fielded box relies on changes: the
+  same silent flags (`/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /LOG= /MERGETASKS`), the
+  same Add/Remove entry and `unins000.exe`, the same install dir, the same Authenticode
+  signer. A host installed by the old installer upgrades in place and its Inno uninstaller data
+  is retired on that first upgrade. winget: the host manifest's `InstallerType` is `exe` from
+  this version; `winget upgrade` keeps tracking the same `ProductCode`. The wizard needs
+  Windows 11; a silent install runs anywhere the host does.
 - **The streaming overlay sizes itself for a TV.** The stats HUD and the quick-action ring draw
   1.75x larger on Android TV and tvOS, where `dp` and `pt` normalise pixel density but not the
   viewing distance a living-room set adds. Nothing to set — it follows the device — and
@@ -198,12 +209,24 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 - **The Siri Remote pointer no longer jumps toward wherever the surface is touched.** Contact
   and lift now come from the surface's touch report and the first 60 ms after contact are
   dropped, so only a swipe moves the host cursor; nothing to do.
+- **Every connected controller drives the desktop launcher, not just the newest one.** Menu mode
+  held one pad open, so a second controller was dead until a session attached and stayed dark
+  after the disconnect chord; it now holds them all and folds their input into one sample, and
+  the in-stream ring reads whichever pad opened it. Nothing to do — a pinned pad still forwards
+  alone.
+- **A Deck in Game Mode forwards every controller Steam Input wraps, not only the newest.** When
+  each connected pad is a Steam virtual gamepad none of them shadows a real one, so all are
+  forwarded instead of just the last. Nothing to do.
 
 ### Fixed
 
 - **`AVSampleBufferVideoRenderer` is the tvOS 17.4+ default for 4:2:0 streams, removing Metal's
   two-refresh reservation.** Older tvOS,
   4:4:4, PyroWave and Smoothness retain Metal; users need no setting changes.
+- **AMF runtime floor is 1.4.30.** The native AMD encoder rejected anything below 1.4.34, which
+  the Polaris/Vega driver branch (frozen at 1.4.31) never reaches, so RX 400/500 and Vega hosts
+  failed every session. Nothing to do; such a host now encodes on the core path and the newer
+  optional properties degrade individually.
 
 ---
 

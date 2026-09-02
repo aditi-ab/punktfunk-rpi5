@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # shellcheck shell=bash
 # Run a command, retrying with linear backoff:  bash scripts/ci/retry.sh <attempts> <cmd> [args…]
 #

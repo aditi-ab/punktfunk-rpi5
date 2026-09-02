@@ -7,8 +7,8 @@ use super::lucide;
 use super::speed::SpeedState;
 use super::style::*;
 use super::{Screen, Svc, Target};
-use crate::discovery::DiscoveredHost;
 use crate::trust::KnownHosts;
+use pf_client_core::discovery::DiscoveredHost;
 use std::collections::HashMap;
 use windows_reactor::*;
 

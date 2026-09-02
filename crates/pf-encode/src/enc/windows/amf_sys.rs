@@ -7,7 +7,7 @@
 //! C index. `AMF_STD_CALL` is `extern "system"`; the two DLL entries are
 //! `extern "C"` (`AMF_CDECL_CALL`).
 //!
-//! Layout is stable on every runtime at or above [`AMF_MIN_VERSION`] (1.4.34).
+//! Layout is stable on every runtime at or above [`AMF_MIN_VERSION`] (1.4.30).
 //! `const` size/offset asserts below pin the PODs and the slots `amf.rs` calls.
 //! Evidence: `design/native-amf-encoder.md`.
 
@@ -61,11 +61,12 @@ pub fn result_name(r: AmfResult) -> &'static str {
 /// ABI it actually provides.
 pub const AMF_HEADER_VERSION: u64 = (1u64 << 48) | (4u64 << 32) | (36u64 << 16);
 
-/// ABI floor (`AMF_FULL_VERSION` 1.4.34.0), not a feature floor. Every mirrored
-/// slot is a base-interface entry stable since before 1.4.34; 1.4.35/1.4.36
-/// additions this path uses are string-keyed properties (`required=false`). Below
-/// this version the loader declines; the vtable offsets are not guaranteed.
-pub const AMF_MIN_VERSION: u64 = (1u64 << 48) | (4u64 << 32) | (34u64 << 16);
+/// ABI floor (`AMF_FULL_VERSION` 1.4.30.0), not a feature floor. Every mirrored
+/// vtable is byte-identical in the 1.4.30 and 1.4.34 headers (Result.h only appends
+/// a code); later additions this path uses are string-keyed properties
+/// (`required=false`). 1.4.30 admits the Polaris/Vega driver branch, frozen at
+/// 1.4.31. Below it the loader declines; the vtable offsets are not guaranteed.
+pub const AMF_MIN_VERSION: u64 = (1u64 << 48) | (4u64 << 32) | (30u64 << 16);
 
 pub const AMF_SURFACE_NV12: i32 = 1;
 pub const AMF_SURFACE_P010: i32 = 10;

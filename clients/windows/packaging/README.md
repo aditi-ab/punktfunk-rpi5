@@ -6,7 +6,9 @@ The Windows client ships **three ways, packed from one assembled layout** by CI
 touches the client (canary) and on `vX.Y.Z` release tags (stable) — see
 [Release Channels](https://punktfunk.unom.io/docs/channels):
 
-1. **Inno Setup installer** (`punktfunk-client-setup_<arch>.exe`) — the **default download**. A
+1. **The installer** (`punktfunk-client-setup_<arch>.exe`) — the **default download**. Since M5
+   it is the engine exe (`punktfunk-setup-client`, packed by `pack-client-installer.ps1 -Engine`);
+   `punktfunk-client.iss` stays buildable for one release as the revert path. A
    per-user, no-UAC install to `%LOCALAPPDATA%\Programs\Punktfunk`. It exists because the MSIX
    install shape breaks the top user-reported flows: the exe lands under the ACL'd
    `C:\Program Files\WindowsApps`, which Steam's *Add a Non-Steam Game* picker can't browse, and
