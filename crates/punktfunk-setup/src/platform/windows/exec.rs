@@ -5,10 +5,12 @@
 //! `schtasks` for tasks and the de-elevated tray. SCM stop/wait, `.lnk` writing, the env-change
 //! broadcast, and Appx presence live in `sys.rs` (`cfg(windows)`; error stubs elsewhere).
 //!
-//! Placeholders (`<staging>`, `<temp>`, `<version>`) stay literal in a dry run and come from
-//! `Subst` on a real one. Goldens enter through [`render`].
+//! Placeholders (`<staging>`, `<temp>`, `<version>`, and the client's `%LocalAppData%`,
+//! `<start menu>`, `<desktop>`) render verbatim in a dry run and are substituted from
+//! `Subst` on a real one — except in the PATH edit, where `%LocalAppData%` stays literal on
+//! purpose (`REG_EXPAND_SZ` expands it per user, the way the `.iss` wrote it). Goldens enter through [`render`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::plan::{join_argv, WinAction, WinPlan};
 use super::sys;
@@ -25,6 +27,10 @@ pub struct Subst {
     pub staging: String,
     /// Same ACLs as staging; password file and generated task XML.
     pub temp: String,
+    /// The per-user roots the client plan names symbolically (M4).
+    pub local_app_data: String,
+    pub start_menu: String,
+    pub desktop: String,
 }
 
 pub trait PayloadSource {
@@ -97,6 +103,9 @@ impl WinExecutor<'_> {
         s.replace("<staging>", &self.subst.staging)
             .replace("<temp>", &self.subst.temp)
             .replace("<version>", &self.subst.version)
+            .replace("<start menu>", &self.subst.start_menu)
+            .replace("<desktop>", &self.subst.desktop)
+            .replace("%LocalAppData%", &self.subst.local_app_data)
     }
 
     /// `lenient`: non-zero exit and a missing binary both succeed. Absence is the goal — a
@@ -158,8 +167,26 @@ impl WinExecutor<'_> {
                     self.ui.ok(&format!("would unpack the payload into {dest}"));
                     return Ok(());
                 }
-                self.payload.deploy(Path::new(dest)).map_err(Failed)?;
+                self.payload
+                    .deploy(Path::new(&self.sub(dest)))
+                    .map_err(Failed)?;
                 self.ui.ok(&format!("payload unpacked into {dest}"));
+                Ok(())
+            }
+            WinAction::DeleteFiles { paths } => {
+                if self.dry {
+                    self.ui.ok(&format!("would delete {}", paths.join(", ")));
+                    return Ok(());
+                }
+                for path in paths {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => self.ui.ok(&format!("deleted {path}")),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            self.ui.detail(&format!("{path} — already gone"));
+                        }
+                        Err(e) => self.ui.warn(&format!("could not delete {path}: {e}")),
+                    }
+                }
                 Ok(())
             }
             WinAction::RemoveFiles { dir } => {
@@ -167,10 +194,36 @@ impl WinExecutor<'_> {
                     self.ui.ok(&format!("would remove {dir}"));
                     return Ok(());
                 }
-                // Best-effort: the uninstaller still lives here; a locked file must not fail teardown.
-                match std::fs::remove_dir_all(dir) {
-                    Ok(()) => self.ui.ok(&format!("removed {dir}")),
-                    Err(e) => self.ui.warn(&format!("could not fully remove {dir}: {e}")),
+                // Best-effort: the uninstaller still lives here; a locked file must not fail
+                // teardown, and must not stop the sweep either (`remove_dir_all` aborts at
+                // the first one — WP3.5's VM smoke left 862 files behind that way).
+                let mut locked = Vec::new();
+                sweep(Path::new(dir), &mut locked);
+                if locked.is_empty() {
+                    self.ui.ok(&format!("removed {dir}"));
+                } else {
+                    let deferred = locked
+                        .iter()
+                        .filter(|p| super::sys::delete_on_reboot(p))
+                        .count();
+                    // The dir itself goes last, after its files — Windows replays the list
+                    // in order at boot.
+                    let dir_deferred =
+                        deferred == locked.len() && super::sys::delete_on_reboot(Path::new(dir));
+                    self.ui.warn(&format!(
+                        "{} in-use file(s) under {dir} ({}) go with the next restart{}",
+                        locked.len(),
+                        locked
+                            .iter()
+                            .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        if dir_deferred {
+                            ""
+                        } else {
+                            " - or remove the folder by hand"
+                        }
+                    ));
                 }
                 Ok(())
             }
@@ -196,7 +249,7 @@ impl WinExecutor<'_> {
                     self.ui.ok(&format!("would create {link} → {target}"));
                     return Ok(());
                 }
-                match sys::create_shortcut(link, target) {
+                match sys::create_shortcut(&self.sub(link), &self.sub(target)) {
                     Ok(()) => self.ui.ok(&format!("created {link}")),
                     Err(e) => self.ui.warn(&format!("could not create {link}: {e}")),
                 }
@@ -341,12 +394,13 @@ impl WinExecutor<'_> {
             ));
             return Ok(());
         }
+        let location = self.sub(location);
         let uninstall = format!("\"{location}\\unins000.exe\"");
         let values: [(&str, &str, String); 8] = [
             ("DisplayName", "REG_SZ", display_name.into()),
             ("DisplayVersion", "REG_SZ", self.sub(version)),
             ("Publisher", "REG_SZ", "unom".into()),
-            ("InstallLocation", "REG_SZ", location.into()),
+            ("InstallLocation", "REG_SZ", location.clone()),
             (
                 "DisplayIcon",
                 "REG_SZ",
@@ -610,14 +664,16 @@ fn pids_listening_on(netstat: &str, ports: &[u16]) -> Vec<String> {
 }
 
 /// XML because `schtasks` flags cannot express restart backoff. Boot, LocalService, 999×/1 min,
-/// battery-tolerant.
+/// battery-tolerant. No `<LogonType>`: `schtasks /XML` rejects an explicit `ServiceAccount`
+/// ("value malformed or out of range"), and a bare service SID registers as one anyway —
+/// exactly what `Export-ScheduledTask` prints for the cmdlet-registered task.
 fn scripting_task_xml(app_dir: &str) -> String {
     let cmd = format!("{app_dir}\\scripting\\scripting-run.cmd");
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers>
-  <Principals><Principal id="LocalService"><UserId>S-1-5-19</UserId><LogonType>ServiceAccount</LogonType></Principal></Principals>
+  <Principals><Principal id="LocalService"><UserId>S-1-5-19</UserId></Principal></Principals>
   <Settings>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
@@ -628,6 +684,24 @@ fn scripting_task_xml(app_dir: &str) -> String {
 </Task>
 "#
     )
+}
+
+/// Remove everything under `dir` that will go, then `dir` itself; what stays (locked, or a
+/// dir that still holds something locked) lands in `locked`.
+fn sweep(dir: &Path, locked: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            sweep(&path, locked);
+            let _ = std::fs::remove_dir(&path);
+        } else if std::fs::remove_file(&path).is_err() {
+            locked.push(path);
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
 }
 
 fn to_utf16le_bom(text: &str) -> Vec<u8> {
@@ -663,6 +737,8 @@ mod tests {
             vulkan_layer_registered: false,
             web_task: TaskState::Absent,
             scripting_task: TaskState::Absent,
+            inno_uninstaller: false,
+            client_installed: None,
         }
     }
 
@@ -686,8 +762,34 @@ mod tests {
                 version: "9.9.9".into(),
                 staging: r"C:\stage".into(),
                 temp: std::env::temp_dir().display().to_string(),
+                local_app_data: r"C:\Users\me\AppData\Local".into(),
+                start_menu: r"C:\Users\me\Start Menu\Programs".into(),
+                desktop: r"C:\Users\me\Desktop".into(),
             },
         }
+    }
+
+    // M4: the client plan names per-user roots symbolically (so its goldens render on every
+    // OS); a real run lands the payload where the user actually lives.
+    #[test]
+    fn a_real_client_run_expands_the_per_user_roots() {
+        let (ui, _buf) = Plain::capture();
+        let run = FakeRunner::new();
+        let (net, payload) = (FakeNet::default(), FakePayload::default());
+        let paths = BasePaths::rooted(Path::new("/box"));
+        let exec = executor(&run, &net, &payload, &paths, &ui);
+        exec.step(&WinAction::DeployFiles {
+            dest: r"%LocalAppData%\Programs\Punktfunk".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            payload.deployed.borrow().as_slice(),
+            [r"C:\Users\me\AppData\Local\Programs\Punktfunk"]
+        );
+        assert_eq!(
+            exec.sub(r"<start menu>\Punktfunk.lnk"),
+            r"C:\Users\me\Start Menu\Programs\Punktfunk.lnk"
+        );
     }
 
     #[test]
@@ -861,10 +963,25 @@ mod tests {
     }
 
     #[test]
+    fn the_sweep_takes_the_whole_tree_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(app.join("web/static")).unwrap();
+        std::fs::write(app.join("web/static/a.js"), b"1").unwrap();
+        std::fs::write(app.join("host.exe"), b"2").unwrap();
+        let mut locked = Vec::new();
+        sweep(&app, &mut locked);
+        assert!(locked.is_empty());
+        assert!(!app.exists());
+    }
+
+    #[test]
     fn scripting_task_xml_carries_the_iss_semantics() {
         let xml = scripting_task_xml(r"C:\app");
         assert!(xml.contains(r"C:\app\scripting\scripting-run.cmd"));
         assert!(xml.contains("<UserId>S-1-5-19</UserId>"));
+        // WP3.5's VM smoke: schtasks exits 1 on an explicit ServiceAccount LogonType.
+        assert!(!xml.contains("LogonType"));
         assert!(xml.contains("<Count>999</Count>"));
         assert!(xml.contains("<DisallowStartIfOnBatteries>false"));
         assert_eq!(to_utf16le_bom("ab"), [0xFF, 0xFE, b'a', 0, b'b', 0]);

@@ -113,7 +113,7 @@ private struct SelectableText: ViewModifier {
 /// (see Licenses.chunked), so each focus step reads as a page turn. The chunks must be SMALL
 /// focus stops all the way down — one tall focusable block would strand focus at its top and the
 /// next stop could sit past the LazyVStack's instantiation window.
-private struct TVFocusable: ViewModifier {
+struct TVFocusable: ViewModifier {
     func body(content: Content) -> some View {
         #if os(tvOS)
             content.focusable()

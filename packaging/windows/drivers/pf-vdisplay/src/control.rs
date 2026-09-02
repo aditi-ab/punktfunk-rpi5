@@ -262,22 +262,36 @@ unsafe fn set_cursor_forward(request: WDFREQUEST) {
 }
 
 unsafe fn set_frame_channel(request: WDFREQUEST) {
-    // SAFETY: `request` is the framework WDFREQUEST.
-    let Some(req) = (unsafe { read_input::<control::SetFrameChannelRequest>(request) }) else {
+    // The v2 request (WP7: two shared-fence handles behind the v1 prefix) is told apart by input
+    // LENGTH; a v1-sized buffer fails the v2 read and takes the v1 path. Either way a malformed
+    // request adopts nothing (no FrameChannel is built, so no Drop can close anything).
+    // SAFETY: `request` is the framework WDFREQUEST; both reads copy a Pod prefix out of it.
+    let (target_id, ch) = unsafe {
+        if let Some(req) = read_input::<control::SetFrameChannelRequestV2>(request) {
+            (
+                req.v1.target_id,
+                crate::frame_transport::FrameChannel::from_request_v2(&req),
+            )
+        } else if let Some(req) = read_input::<control::SetFrameChannelRequest>(request) {
+            (
+                req.target_id,
+                crate::frame_transport::FrameChannel::from_request(&req),
+            )
+        } else {
+            complete(request, STATUS_INVALID_PARAMETER);
+            return;
+        }
+    };
+    let Some(ch) = ch else {
         complete(request, STATUS_INVALID_PARAMETER);
         return;
     };
-    // A malformed request adopts nothing (no FrameChannel is built, so no Drop can close anything).
-    let Some(ch) = crate::frame_transport::FrameChannel::from_request(&req) else {
-        complete(request, STATUS_INVALID_PARAMETER);
-        return;
-    };
-    match crate::monitor::set_frame_channel(req.target_id, ch) {
+    match crate::monitor::set_frame_channel(target_id, ch) {
         Ok(()) => complete(request, STATUS_SUCCESS),
         Err(ch) => {
             dbglog!(
                 "[pf-vd] SET_FRAME_CHANNEL: no monitor with target_id {} — rejecting (host reaps the handles)",
-                req.target_id
+                target_id
             );
             // NOT adopted: disarm the channel so its Drop does NOT close the handles (see the contract
             // above — the host's error path reaps them remotely).

@@ -41,6 +41,8 @@ fn fresh() -> WinFacts {
         vulkan_layer_registered: false,
         web_task: TaskState::Absent,
         scripting_task: TaskState::Absent,
+        inno_uninstaller: false,
+        client_installed: None,
     }
 }
 

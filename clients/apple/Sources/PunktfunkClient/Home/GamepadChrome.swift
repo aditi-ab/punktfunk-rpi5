@@ -660,6 +660,14 @@ struct ConsoleBareButtonStyle: ButtonStyle {
             .animation(.smooth(duration: 0.15), value: configuration.isPressed)
     }
 }
+
+extension View {
+    /// Menu backs out of a screen that HAS a back action. One without (the launcher) lets the
+    /// press through: a swallowed Menu at the root is an app you cannot leave.
+    @ViewBuilder func gamepadExitCommand(_ action: (() -> Void)?) -> some View {
+        if let action { onExitCommand(perform: action) } else { self }
+    }
+}
 #endif
 
 /// "Which pad is driving this UI" — the active controller's name and battery, worn as a quiet
