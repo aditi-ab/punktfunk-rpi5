@@ -546,12 +546,22 @@ mod tests {
         let mut s = String::new();
         File::from(fd).read_to_string(&mut s).unwrap();
         assert_eq!(s, "1");
-        // `recv` closed the extra fd; once the local read end goes, the writer
-        // sees EPIPE.
+        // A concurrent spawn may briefly inherit this CLOEXEC fd before exec.
+        // Once that window closes, EPIPE proves `recv` dropped its extra copy.
         drop(second.0);
         let mut pw = second.1;
+        let mut closed = None;
+        for _ in 0..50 {
+            match pw.write_all(b"x") {
+                Ok(()) => std::thread::sleep(Duration::from_millis(1)),
+                Err(err) => {
+                    closed = Some(err);
+                    break;
+                }
+            }
+        }
         assert_eq!(
-            pw.write_all(b"x").unwrap_err().kind(),
+            closed.expect("extra read fd stayed open").kind(),
             io::ErrorKind::BrokenPipe
         );
     }
