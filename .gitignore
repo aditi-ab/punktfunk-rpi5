@@ -32,9 +32,6 @@ xcuserdata/
 __pycache__/
 *.pyc
 
-# Claude Code project instructions — local to each dev box, not part of the repo.
-CLAUDE.md
-
 # Local flatpak-builder output (build-flatpak.sh) — ostree repo + build dir at the repo root.
 .flatpak-repo/
 .flatpak-build/
