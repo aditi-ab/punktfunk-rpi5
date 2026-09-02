@@ -289,3 +289,88 @@ pub fn capture_virtual_output(
 ) -> Result<Box<dyn Capturer>> {
     anyhow::bail!("virtual-output capture requires Linux or Windows")
 }
+
+#[cfg(all(test, target_os = "windows"))]
+mod live_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// LIVE gate for the IDD-push ring end to end (immunity plan WP5/WP7): a real virtual
+    /// display, the capturer opened exactly as a session opens it, the desktop kept composing by
+    /// pointer motion, and real `Source` frames counted. The attach log line names the
+    /// negotiated capabilities (`CAP_FENCE_RING` on a fence-capable driver) — read it from the
+    /// run's output. Elevated console session, host service stopped.
+    #[test]
+    #[ignore = "live: needs the pf-vdisplay driver, a console session, the host service stopped"]
+    fn live_idd_push_ring_delivers_source_frames() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info,pf_capture=debug"))
+            .with_test_writer()
+            .try_init();
+        // `compositor` is unused on Windows: the IddCx driver is the sole backend.
+        let mut vd = crate::vdisplay::open(crate::vdisplay::Compositor::Kwin)
+            .expect("open the pf-vdisplay backend");
+        let vout = vd
+            .create(punktfunk_core::Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            })
+            .expect("create a virtual display");
+        let want = OutputFormat {
+            gpu: true,
+            hdr: false,
+            ten_bit_sdr: false,
+            chroma_444: false,
+            pyrowave: false,
+            nv12_native: false,
+            hw_cursor: false,
+        };
+        let mut cap = capture_virtual_output(
+            vout,
+            want,
+            crate::session_plan::CaptureBackend::IddPush,
+            false,
+        )
+        .expect("open the IDD-push capturer");
+        // A static desktop composes nothing: walk the pointer so every tick has a new image.
+        let (mut source, mut regen, mut repeat, mut errors) = (0u32, 0u32, 0u32, 0u32);
+        let start = Instant::now();
+        let mut x = 100i32;
+        while start.elapsed() < Duration::from_secs(12) && source < 300 {
+            x = 100 + ((x - 100 + 7) % 600);
+            // SAFETY: plain FFI; the pointer is parked on the operator's desktop for the test.
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetCursorPos(x, 100 + x / 3);
+            }
+            if cap.supports_arrival_wait() {
+                cap.wait_arrival(Instant::now() + Duration::from_millis(40));
+            }
+            match cap.try_latest() {
+                Ok(Some(f)) => match f.provenance.origin {
+                    pf_frame::FrameOrigin::Source => source += 1,
+                    _ => regen += 1,
+                },
+                Ok(None) => {
+                    repeat += 1;
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+                Err(e) => {
+                    errors += 1;
+                    eprintln!("capture error: {e:#}");
+                    assert!(errors <= 3, "the ring keeps failing: {e:#}");
+                }
+            }
+        }
+        eprintln!(
+            "ring: source={source} regen={regen} repeat={repeat} errors={errors} in {:?}",
+            start.elapsed()
+        );
+        assert!(
+            source >= 60,
+            "expected a steady stream of NEW source frames from the ring, got {source}"
+        );
+        drop(cap);
+        drop(vd);
+    }
+}
