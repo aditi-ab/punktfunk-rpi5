@@ -610,14 +610,16 @@ fn pids_listening_on(netstat: &str, ports: &[u16]) -> Vec<String> {
 }
 
 /// XML because `schtasks` flags cannot express restart backoff. Boot, LocalService, 999×/1 min,
-/// battery-tolerant.
+/// battery-tolerant. No `<LogonType>`: `schtasks /XML` rejects an explicit `ServiceAccount`
+/// ("value malformed or out of range"), and a bare service SID registers as one anyway —
+/// exactly what `Export-ScheduledTask` prints for the cmdlet-registered task.
 fn scripting_task_xml(app_dir: &str) -> String {
     let cmd = format!("{app_dir}\\scripting\\scripting-run.cmd");
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers>
-  <Principals><Principal id="LocalService"><UserId>S-1-5-19</UserId><LogonType>ServiceAccount</LogonType></Principal></Principals>
+  <Principals><Principal id="LocalService"><UserId>S-1-5-19</UserId></Principal></Principals>
   <Settings>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
@@ -865,6 +867,8 @@ mod tests {
         let xml = scripting_task_xml(r"C:\app");
         assert!(xml.contains(r"C:\app\scripting\scripting-run.cmd"));
         assert!(xml.contains("<UserId>S-1-5-19</UserId>"));
+        // WP3.5's VM smoke: schtasks exits 1 on an explicit ServiceAccount LogonType.
+        assert!(!xml.contains("LogonType"));
         assert!(xml.contains("<Count>999</Count>"));
         assert!(xml.contains("<DisallowStartIfOnBatteries>false"));
         assert_eq!(to_utf16le_bom("ab"), [0xFF, 0xFE, b'a', 0, b'b', 0]);
