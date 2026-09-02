@@ -12,7 +12,7 @@
 //!
 //! The host runs as SYSTEM inside the interactive session on `winsta0\default`
 //! (`windows/service.rs` `spawn_host`), so this thread reads the session cursor
-//! directly. Pin via the overlay snapshot and `secure_desktop`. Invert/mask
+//! directly. Pin via the overlay snapshot and `pf_win_display::secure_desktop`. Invert/mask
 //! contracts are tested below; design in `design/remote-desktop-sweep.md`.
 
 use super::*;
@@ -21,8 +21,8 @@ use windows::Win32::Graphics::Gdi::{
     BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
 };
 use windows::Win32::System::StationsAndDesktops::{
-    CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
-    DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, HDESK, UOI_NAME,
+    CloseDesktop, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
+    HDESK,
 };
 use windows::Win32::UI::HiDpi::{
     SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -49,9 +49,6 @@ struct Shape {
 pub(super) struct CursorPoller {
     slot: Arc<Mutex<Option<pf_frame::CursorOverlay>>>,
     stop: Arc<AtomicBool>,
-    /// Input desktop is Winlogon (UAC/lock/logon). The capturer uses this to stand
-    /// the IddCx hardware-cursor declare down (`IddPushCapturer::poll_secure_desktop`).
-    secure: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -60,8 +57,9 @@ impl CursorPoller {
     /// it must out-pace a 240 fps session; 16 ms reused a stale spot for ~4 frames.
     const INTERVAL: Duration = Duration::from_millis(4);
     /// Unconditional input-desktop reattach. `GetCursorInfo` on a stale desktop
-    /// *succeeds* with stale data, so there is no failure signal. 250 ms, not 2 s:
-    /// this also feeds [`Self::secure_desktop`], and a 2 s freeze at UAC is visible.
+    /// *succeeds* with stale data, so there is no failure signal. Each reattach also
+    /// refreshes `pf_win_display::secure_desktop`, the fallback for the
+    /// desktop-switch WinEvent; 250 ms keeps a missed event's freeze short.
     const REATTACH: Duration = Duration::from_millis(250);
     /// Same-handle extent re-probe. Scale changes are human-timescale; the probe
     /// reads dimensions only, so 4 Hz is ample and a ≤250 ms size lag is invisible.
@@ -85,31 +83,20 @@ impl CursorPoller {
     ) -> Self {
         let slot: Arc<Mutex<Option<pf_frame::CursorOverlay>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
-        let secure = Arc::new(AtomicBool::new(false));
-        let (slot_t, stop_t, secure_t) = (slot.clone(), stop.clone(), secure.clone());
+        let (slot_t, stop_t) = (slot.clone(), stop.clone());
         let thread = std::thread::Builder::new()
             .name("pf-cursor-poll".into())
-            .spawn(move || run(ccd, rect, &slot_t, &stop_t, &secure_t))
+            .spawn(move || run(ccd, rect, &slot_t, &stop_t))
             .ok();
         if thread.is_none() {
             tracing::warn!("cursor poller thread spawn failed — cursor falls back to driver shm");
         }
-        Self {
-            slot,
-            stop,
-            secure,
-            thread,
-        }
+        Self { slot, stop, thread }
     }
 
     /// Latest overlay; `None` until the first successful rasterise.
     pub(super) fn read(&self) -> Option<pf_frame::CursorOverlay> {
         self.slot.lock().unwrap_or_else(|p| p.into_inner()).clone()
-    }
-
-    /// Secure-desktop latch; at most [`Self::REATTACH`] stale.
-    pub(super) fn secure_desktop(&self) -> bool {
-        self.secure.load(Ordering::Relaxed)
     }
 
     /// Worker still running; `false` degrades the capturer to the shm read.
@@ -132,7 +119,6 @@ fn run(
     mut rect: (i32, i32, i32, i32),
     slot: &Mutex<Option<pf_frame::CursorOverlay>>,
     stop: &AtomicBool,
-    secure: &AtomicBool,
 ) {
     // Physical pixels on this thread: `rect` is CCD (always physical). A
     // DPI-virtualized `GetCursorInfo` would miss the frame pixel on a scaled display.
@@ -143,7 +129,7 @@ fn run(
 
     let mut desktop = DesktopBinding::default();
     // best-effort: already on winsta0\default if this fails
-    publish_secure(secure, desktop.reattach());
+    desktop.reattach();
     let mut last_attach = Instant::now();
 
     let mut shape: Option<Shape> = None;
@@ -157,7 +143,7 @@ fn run(
         std::thread::sleep(CursorPoller::INTERVAL);
         if last_attach.elapsed() >= CursorPoller::REATTACH {
             last_attach = Instant::now();
-            publish_secure(secure, desktop.reattach());
+            desktop.reattach();
             // …and re-read the target's desktop rect from the display actor's snapshot (no CCD
             // call here): a resize, an HDR recreate or the user moving this display changes BOTH
             // the origin positions are made relative to and the extent `in_rect` tests against,
@@ -186,7 +172,7 @@ fn run(
         if unsafe { GetCursorInfo(&mut ci) }.is_err() {
             // Desktop gone (secure-desktop switch mid-call) — rebind next tick;
             // the slot keeps its last snapshot.
-            publish_secure(secure, desktop.reattach());
+            desktop.reattach();
             last_attach = Instant::now();
             continue;
         }
@@ -279,23 +265,15 @@ fn run(
     }
 }
 
-/// `None` = classification unavailable: keep the previous state rather than
-/// flapping the capturer's hardware-cursor stand-down.
-fn publish_secure(secure: &AtomicBool, verdict: Option<bool>) {
-    if let Some(s) = verdict {
-        secure.store(s, Ordering::Relaxed);
-    }
-}
-
 /// Owned input-desktop handle: keep the current binding, swap on demand, close
 /// exactly once (same reattach model as [`SendInputInjector`] in `pf-inject`).
 #[derive(Default)]
 struct DesktopBinding(Option<HDESK>);
 
 impl DesktopBinding {
-    /// Rebind to the current input desktop. `Some(secure)` from `UOI_NAME` !=
-    /// "Default"; `None` if the desktop could not be opened (binding stays put).
-    fn reattach(&mut self) -> Option<bool> {
+    /// Rebind to the current input desktop (the binding stays put if it cannot be
+    /// opened), then refresh the process-wide secure-desktop verdict.
+    fn reattach(&mut self) {
         const GENERIC_ALL: u32 = 0x1000_0000;
         // SAFETY: `OpenInputDesktop`/`SetThreadDesktop`/`CloseDesktop` take only by-value args.
         // `OpenInputDesktop` yields an owned `HDESK` only on `Ok`; it is either installed (and the
@@ -303,52 +281,22 @@ impl DesktopBinding {
         // or used after close. `SetThreadDesktop` rebinds only this calling thread (which owns
         // no windows/hooks, so the rebind cannot fail on that account).
         unsafe {
-            match OpenInputDesktop(
+            if let Ok(h) = OpenInputDesktop(
                 DESKTOP_CONTROL_FLAGS(0),
                 false,
                 DESKTOP_ACCESS_FLAGS(GENERIC_ALL),
             ) {
-                Ok(h) => {
-                    let secure = desktop_is_secure(h);
-                    if SetThreadDesktop(h).is_ok() {
-                        if let Some(old) = self.0.replace(h) {
-                            let _ = CloseDesktop(old);
-                        }
-                    } else {
-                        let _ = CloseDesktop(h);
+                if SetThreadDesktop(h).is_ok() {
+                    if let Some(old) = self.0.replace(h) {
+                        let _ = CloseDesktop(old);
                     }
-                    Some(secure)
+                } else {
+                    let _ = CloseDesktop(h);
                 }
-                Err(_) => None, // not privileged for this desktop; stay put
             }
         }
+        pf_win_display::refresh_secure_desktop();
     }
-}
-
-/// `UOI_NAME` != "Default" (Winlogon UAC/lock/logon, or a screen-saver) — both
-/// need the OS software-cursor path. Unnameable desktops read as not secure:
-/// the only in-contract failure is a too-small buffer, and misreading
-/// secure-as-normal keeps today's behaviour for a beat.
-fn desktop_is_secure(h: HDESK) -> bool {
-    let mut name = [0u16; 64]; // "Default"/"Winlogon"/"Screen-saver" all fit with room to spare
-    let mut needed = 0u32;
-    // SAFETY: `h` is the live desktop handle the caller just opened; `name`/`needed` are live
-    // out-params sized exactly as passed; the call writes at most `nlength` bytes.
-    let ok = unsafe {
-        GetUserObjectInformationW(
-            windows::Win32::Foundation::HANDLE(h.0),
-            UOI_NAME,
-            Some(name.as_mut_ptr().cast()),
-            (name.len() * 2) as u32,
-            Some(&mut needed),
-        )
-    };
-    if ok.is_err() {
-        return false;
-    }
-    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
-    let name = String::from_utf16_lossy(&name[..len]);
-    !name.eq_ignore_ascii_case("Default")
 }
 
 impl Drop for DesktopBinding {

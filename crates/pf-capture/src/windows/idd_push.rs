@@ -1538,10 +1538,7 @@ impl IddPushCapturer {
         if self.cursor_shared.is_none() && !self.composite_forced {
             return;
         }
-        let secure = self
-            .cursor_poll
-            .as_ref()
-            .is_some_and(|p| p.secure_desktop());
+        let secure = pf_win_display::secure_desktop();
         if secure == self.secure_active {
             return;
         }
