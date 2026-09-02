@@ -1,12 +1,12 @@
-//! The core suite: every Facts preset renders its Plan to dry-run text, compared against
-//! `tests/golden/*.txt`. Regenerate with `UPDATE_GOLDEN=1 cargo test -p punktfunk-setup`.
+//! Golden dry-run transcripts for every Facts preset, pinned under `tests/golden/*.txt`.
 //!
-//! The goldens deliberately embed `data/platforms.json`'s install lines, so a platforms.json
-//! edit is *supposed* to show up here as a diff to read in review — that is the drift alarm,
-//! not a failure to paper over.
+//! Regenerate with `UPDATE_GOLDEN=1 cargo test -p punktfunk-setup`.
 //!
-//! Below the goldens, one named test per §4 trap of `design/installer-v2.md`. Those assert on
-//! the command list rather than the rendering, so they keep meaning when the text moves.
+//! Goldens embed `data/platforms.json` install lines. An edit there must fail this suite
+//! until the golden is accepted — that is the drift alarm.
+//!
+//! Named `trap_*` tests assert on the command list, not the rendering, so they stay
+//! meaningful when the text moves. See `design/installer-v2.md`.
 
 use std::path::Path;
 
@@ -18,10 +18,7 @@ use punktfunk_setup::report;
 use punktfunk_setup::seam::{BasePaths, FakeRunner};
 use punktfunk_setup::ui::Plain;
 
-// ------------------------------------------------------------------------------- presets
-
-/// A box with nothing punktfunk on it. Every preset below is this with fields moved, so a
-/// golden diff shows the one thing that changed.
+/// Baseline: no punktfunk packages. Other presets overlay this so a golden names one change.
 fn fresh(id: &str, family: Family) -> Facts {
     let docs = match family {
         Family::Apt if id == "ubuntu" => "ubuntu",
@@ -71,7 +68,6 @@ fn fresh(id: &str, family: Family) -> Facts {
     }
 }
 
-/// A box that already has all three binaries, on `channel`.
 fn installed(id: &str, family: Family, channel: Channel) -> Facts {
     let pkgs = match family {
         Family::Dnf => vec!["punktfunk", "punktfunk-web", "punktfunk-scripting"],
@@ -93,9 +89,7 @@ fn pins() -> Pins {
     Pins::default()
 }
 
-// -------------------------------------------------------------------------- the mechanism
-
-/// The full dry-run transcript: what `--dry-run` prints, minus the constant banner.
+/// `--dry-run` text without the constant banner.
 fn render(facts: &Facts, choices: &Choices) -> String {
     let (ui, buf) = Plain::capture();
     let paths = BasePaths::rooted(Path::new("/box"));
@@ -158,8 +152,6 @@ fn plan_for(facts: &Facts, pins: &Pins) -> Plan {
     plan::build(facts, &Choices::derive(facts, pins))
 }
 
-// ----------------------------------------------------------------------------- the goldens
-
 #[test]
 fn fresh_installs() {
     check("arch-fresh", &fresh("arch", Family::Pacman), &pins());
@@ -193,7 +185,7 @@ fn fresh_installs_on_canary() {
     );
 }
 
-/// Fedora 43 resolves to the `bazzite` RPM group, which is a sed over the written repo file.
+/// `rpm_group = "bazzite"` is a sed of the written repo file, not the Bazzite distro.
 #[test]
 fn fedora_43_uses_the_bazzite_rpm_group() {
     let mut facts = fresh("fedora", Family::Dnf);
@@ -276,7 +268,6 @@ fn a_re_run_on_a_complete_box_updates_in_place() {
     );
 }
 
-/// The console is missing, so the next-steps text must NOT hand out a URL for it.
 #[test]
 fn a_box_without_the_console_is_told_so_instead_of_given_a_url() {
     let mut facts = installed("debian", Family::Apt, Channel::Stable);
@@ -314,12 +305,7 @@ fn an_nvidia_box_without_a_driver_is_warned_after_a_successful_install() {
     check("fedora-nvidia-nodriver", &facts, &pins());
 }
 
-// ------------------------------------------------------------------------- M3, the client
-
-/// The client comes from the same family repo, so host+client is one transaction.
-///
-/// The `install` assertions are not decoration: a client-only plan once rendered its heading
-/// and then no commands at all, because the host guard also gated the family backend.
+/// Client shares the family repo, so host+client is one transaction.
 #[test]
 fn client_installs_per_family() {
     let client = Pins {
@@ -331,9 +317,8 @@ fn client_installs_per_family() {
         client: true,
         ..pins()
     };
-    // The expected line keeps the family's own flags. `pacman -Syu`, not `-S`: a client-only
-    // run adds the repo and installs in one go, and `-S` against a database that has never
-    // been fetched dies with "target not found" (measured in a container).
+    // `-Syu`, not `-S`: a client-only run adds the repo and installs in one go. `-S` against
+    // an unfetched database dies with "target not found".
     for (name, facts, line) in [
         (
             "debian-client-only",
@@ -372,8 +357,7 @@ fn client_installs_per_family() {
     );
 }
 
-/// A couch box has no `punktfunk-client` package, so the client arrives as a flatpak beside
-/// the sysext host rather than not at all.
+/// Couch images have no `punktfunk-client` package; the client is a user flatpak.
 #[test]
 fn a_couch_box_gets_the_client_as_a_flatpak() {
     let both = Pins {
@@ -398,8 +382,7 @@ fn a_couch_box_gets_the_client_as_a_flatpak() {
     );
 }
 
-/// §5: a client install on a distro with no punktfunk repo takes the flatpak line instead of
-/// dying. The host punt stays — `main` enforces that, this proves the plan exists at all.
+/// No punktfunk repo: client is still a flatpak plan. Host punt is `main`'s job.
 #[test]
 fn an_unsupported_distro_still_installs_a_client() {
     let mut facts = fresh("voidlinux", Family::Flatpak);
@@ -418,7 +401,7 @@ fn an_unsupported_distro_still_installs_a_client() {
     assert!(cmds[0].starts_with("flatpak install --user"), "{cmds:?}");
 }
 
-/// The per-family sweep cannot see a flatpak, so uninstall needs its own leg for it.
+/// Family uninstall does not see a flatpak client.
 #[test]
 fn uninstall_sweeps_a_flatpak_client_too() {
     let mut facts = installed("debian", Family::Apt, Channel::Stable);
@@ -433,7 +416,6 @@ fn uninstall_sweeps_a_flatpak_client_too() {
             .any(|c| c == "flatpak uninstall --user io.unom.Punktfunk"),
         "the flatpak client was left behind: {cmds:?}"
     );
-    // A box without one must not be told to remove what is not there.
     let mut bare = installed("debian", Family::Apt, Channel::Stable);
     bare.has_flatpak_client = false;
     assert!(!plan_for(&bare, &un)
@@ -442,7 +424,6 @@ fn uninstall_sweeps_a_flatpak_client_too() {
         .any(|c| c.contains("flatpak")));
 }
 
-/// Client-only asks almost nothing: no groups, gamestream, linger or firewall.
 #[test]
 fn a_client_only_plan_wires_none_of_the_host_setup() {
     let client = Pins {
@@ -464,7 +445,6 @@ fn a_client_only_plan_wires_none_of_the_host_setup() {
     );
 }
 
-/// The flatpak line is platforms.json's, verbatim — the same one the docs give.
 #[test]
 fn the_flatpak_line_is_carried_verbatim() {
     let client = Pins {
@@ -507,8 +487,8 @@ fn trap_channel_follows_the_box_without_an_explicit_flag() {
     );
 }
 
-/// apt cannot walk back to a lower candidate, so the switch names exact versions and allows
-/// the downgrade. In dry-run the version is a placeholder, which is what sh prints too.
+/// apt will not walk to a lower candidate, so the switch pins versions and allows the
+/// downgrade. Dry-run prints `<version>`, not a resolved pin.
 #[test]
 fn trap_apt_switch_pins_versions_and_allows_downgrades() {
     let facts = installed("debian", Family::Apt, Channel::Canary);
@@ -522,7 +502,7 @@ fn trap_apt_switch_pins_versions_and_allows_downgrades() {
         "{text}"
     );
     assert!(text.contains("punktfunk-host=<version>"), "{text}");
-    // The repo is rewritten to the TARGET channel first, so madison's first row is its newest.
+    // Repo rewrite first: madison's first row is then the target channel's newest.
     let repo = text
         .find(" stable main")
         .expect("the sources line names the target channel");
@@ -547,7 +527,7 @@ fn trap_pacman_switch_uses_sy_then_s_and_never_syu() {
         !cmds.iter().any(|c| c.starts_with("sudo pacman -Syu")),
         "{cmds:?}"
     );
-    // The old section goes first, or both repos end up enabled.
+    // Drop the old repo section first, or both stay enabled.
     assert!(
         cmds[0].contains("sed -i"),
         "the old repo section must be dropped first: {cmds:?}"
@@ -640,7 +620,7 @@ fn trap_omarchy_installs_with_sy_then_s_not_syu() {
     );
 }
 
-/// `punktfunk-omarchy remove` ships IN the host package, so it must run before pacman takes it.
+/// `punktfunk-omarchy remove` ships in the host package, so it must run before pacman takes it.
 #[test]
 fn trap_omarchy_uninstall_runs_remove_before_pacman_rns() {
     let facts = installed("omarchy", Family::Pacman, Channel::Stable);
@@ -663,7 +643,7 @@ fn trap_omarchy_uninstall_runs_remove_before_pacman_rns() {
     );
 }
 
-/// The hand-off does the groups, firewall and autostart itself, so nothing generic runs after.
+/// The hand-off does groups, firewall, and autostart; nothing generic runs after.
 #[test]
 fn trap_the_omarchy_hand_off_ends_the_run() {
     let plan = plan_for(&fresh("omarchy", Family::Pacman), &pins());
@@ -738,15 +718,13 @@ fn trap_the_hand_off_can_be_declined() {
             .any(|c| c.starts_with("punktfunk-omarchy setup")),
         "{cmds:?}"
     );
-    // Declining continues generically; nothing is lost.
     assert!(
         cmds.iter().any(|c| c.contains("usermod -aG punktfunk")),
         "{cmds:?}"
     );
 }
 
-/// A switch must MOVE every installed punktfunk package, or the ones this installer does not
-/// itself install are stranded on the channel the box just left.
+/// Packages this installer never added stay on the old channel unless the switch names them.
 #[test]
 fn trap_switch_pkgs_carries_packages_the_installer_never_installed() {
     let mut facts = installed("arch", Family::Pacman, Channel::Canary);
@@ -807,7 +785,7 @@ fn trap_linger_is_planned_before_the_unit_enable() {
     assert!(linger < start, "the user manager would not exist yet");
 }
 
-/// Three packages, so "is the host there?" is the wrong question to skip the install on.
+/// Missing is per package; host present is not enough to skip install.
 #[test]
 fn trap_a_box_with_the_host_but_no_console_still_installs() {
     let mut facts = installed("debian", Family::Apt, Channel::Stable);
@@ -820,7 +798,7 @@ fn trap_a_box_with_the_host_but_no_console_still_installs() {
     );
 }
 
-/// Only Bazzite and Nobara. Silverblue and Bluefin ship rpm-ostree and ujust and are desktops.
+/// Linger defaults only for Bazzite and Nobara. Silverblue and Bluefin are workstations.
 #[test]
 fn trap_couch_defaults_do_not_reach_a_workstation_image() {
     let couch = Choices::derive(&fresh("bazzite", Family::Sysext), &pins());
@@ -830,7 +808,7 @@ fn trap_couch_defaults_do_not_reach_a_workstation_image() {
     assert!(!Choices::derive(&workstation, &pins()).linger);
 }
 
-/// User units come off first: package removal cannot see the enable symlinks in $HOME.
+/// User units come off first: package removal cannot see the enable symlinks in `$HOME`.
 #[test]
 fn trap_uninstall_disables_user_units_before_removing_packages() {
     for (id, family, verb) in [
@@ -852,7 +830,6 @@ fn trap_uninstall_disables_user_units_before_removing_packages() {
     }
 }
 
-/// An uninstall names only the packages actually installed — never a fixed list.
 #[test]
 fn trap_uninstall_removes_only_what_is_installed() {
     let mut facts = installed("debian", Family::Apt, Channel::Stable);
@@ -868,7 +845,7 @@ fn trap_uninstall_removes_only_what_is_installed() {
     );
 }
 
-/// Nothing punktfunk installed: there is no purge line at all to fail on.
+/// A bare box has no purge line; a fixed package list would fail.
 #[test]
 fn trap_uninstall_on_a_bare_box_skips_the_package_removal() {
     let facts = fresh("debian", Family::Apt);

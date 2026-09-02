@@ -1,13 +1,11 @@
-//! The Windows option set: today's Inno task checkboxes as engine choices (WP1.2).
+//! The Windows option set: Inno task checkboxes as engine choices.
 //!
-//! Defaults derive from `WinFacts` (`design/installer-v2-windows.md` §3): fresh installs get
-//! the `.iss` defaults; upgrades pre-fill from what is observably on the box instead of
-//! Inno's remembered-checkbox registry. The two settings the service persists itself
-//! (GameStream compat, the public-firewall opt-in) are `Option<bool>`: `None` means the plan
-//! passes nothing and the box keeps its state — the `.iss` passed those flags on fresh
-//! installs only, and a default must never rewrite an upgrade. An explicit task flag or the
-//! D12 network answer sets `Some`, which deliberately reaches the plan even on upgrades:
-//! that is what makes Reconfigure able to fix a fielded box.
+//! Defaults derive from `WinFacts` (`design/installer-v2-windows.md`). Fresh installs get
+//! the `.iss` defaults; upgrades pre-fill from the box, not Inno's remembered-checkbox
+//! registry. GameStream and the public-firewall opt-in are `Option<bool>`: `None` means the
+//! plan passes nothing and the box keeps its state. A default must never rewrite an upgrade.
+//! An explicit task flag or the D12 network answer sets `Some` even on upgrades, which is
+//! what lets Reconfigure change a box.
 
 use std::path::PathBuf;
 
@@ -16,17 +14,17 @@ use crate::seam::Env;
 use super::args::{InnoArgs, TaskFlag};
 use super::{NetCategory, WinFacts};
 
-/// The D12 answer. `Skip` is the silent default — a profile change needs a consent surface.
+/// D12. `Skip` is the silent default: a profile change needs a consent surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkAnswer {
-    /// Set the named network's NLA category to Private (the recommended fix).
+    /// Set the named network's NLA category to Private.
     MakePrivate(String),
     /// Keep it Public and add the public-profile firewall rules.
     OpenPublicRules,
     Skip,
 }
 
-/// Environment twins for the Windows rows, same `1`/`0` reading as the Linux set.
+/// Same `1`/`0` reading as the Linux env twins.
 const ENV_TWINS: [(&str, Task); 8] = [
     ("PUNKTFUNK_INSTALL_DRIVER", Task::Driver),
     ("PUNKTFUNK_INSTALL_GAMEPAD", Task::Gamepad),
@@ -38,8 +36,7 @@ const ENV_TWINS: [(&str, Task); 8] = [
     ("PUNKTFUNK_INSTALL_DESKTOP_ICON", Task::DesktopIcon),
 ];
 
-/// The task vocabulary — the `/MERGETASKS` names are a published contract (winget manifest,
-/// troubleshooting docs), so the strings here can never change.
+/// `/MERGETASKS` names are a published contract (winget, troubleshooting docs). Never rename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Task {
     Driver,
@@ -68,7 +65,6 @@ impl Task {
     }
 }
 
-/// Everything the Windows plan lets the user decide.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WinChoices {
     pub install_driver: bool,
@@ -82,11 +78,9 @@ pub struct WinChoices {
     pub tray_autostart: bool,
     /// Client artifact only; the host creates no shortcuts.
     pub desktop_icon: bool,
-    /// Fresh installs only. `None` = the executor generates one (24 hex chars, real RNG);
-    /// the wizard's password row edits it. Never rendered into a transcript or argv.
+    /// Fresh only. `None` = executor generates 24 hex chars. Never render into a transcript or argv.
     pub web_password: Option<String>,
-    /// Where the files go. Upgrades pre-fill the ARP location and ignore `/DIR`, as Inno's
-    /// `UsePreviousAppDir` did.
+    /// Upgrades pre-fill the ARP location and ignore `/DIR` (Inno `UsePreviousAppDir`).
     pub dir: Option<PathBuf>,
     pub network: NetworkAnswer,
 }
@@ -117,7 +111,6 @@ impl WinChoices {
         }
     }
 
-    /// D12's trigger: a Public network, the host leg, and no public rules already chosen.
     pub fn needs_network_step(&self, facts: &WinFacts) -> bool {
         self.allow_public_fw != Some(true)
             && self.network == NetworkAnswer::Skip
@@ -127,8 +120,7 @@ impl WinChoices {
                 .any(|n| n.category == NetCategory::Public)
     }
 
-    /// Apply the Inno dialect over the derived defaults. Returns the warning lines the
-    /// caller renders — unknown task names, an ignored `/DIR` — never an error (D5).
+    /// Warnings only — unknown task names, an ignored `/DIR`. Never an error (D5).
     pub fn apply(&mut self, args: &InnoArgs, env: &Env) -> Vec<String> {
         let mut warnings = Vec::new();
         for (key, task) in ENV_TWINS {
@@ -136,7 +128,7 @@ impl WinChoices {
                 self.set(task, v == "1");
             }
         }
-        // /TASKS replaces the defaults (Inno's semantics): everything off, then the list.
+        // /TASKS replaces defaults (Inno): everything off, then the list.
         if let Some(tasks) = &args.tasks {
             for task in [
                 Task::Driver,
@@ -225,7 +217,6 @@ mod tests {
         }
     }
 
-    // The .iss defaults, literally: all install tasks on, both opt-ins off.
     #[test]
     fn fresh_defaults_match_the_iss_task_table() {
         let c = WinChoices::derive(&fresh_facts());
@@ -237,8 +228,7 @@ mod tests {
         assert!(c.dir.is_none());
     }
 
-    // Defaults must never rewrite an upgrade: the persisted settings pass nothing, and the
-    // observable ones pre-fill from the box (the user who removed the tray keeps no tray).
+    // Persisted settings pass nothing; observable ones pre-fill from the box.
     #[test]
     fn upgrade_defaults_leave_box_state_alone() {
         let c = WinChoices::derive(&upgrade_facts());
@@ -252,7 +242,6 @@ mod tests {
         );
     }
 
-    // The D12 Reconfigure story: an explicit ask reaches the plan even on an upgrade.
     #[test]
     fn an_explicit_task_overrides_even_on_upgrade() {
         let mut c = WinChoices::derive(&upgrade_facts());
@@ -287,7 +276,6 @@ mod tests {
         assert_eq!(c, WinChoices::derive(&fresh_facts()));
     }
 
-    // Inno's UsePreviousAppDir, ported: an upgrade stays where it is, and says so.
     #[test]
     fn dir_is_honoured_fresh_and_ignored_with_a_warning_on_upgrade() {
         let mut c = WinChoices::derive(&fresh_facts());
@@ -312,7 +300,7 @@ mod tests {
         c.apply(&InnoArgs::parse(&[]), &env);
         assert!(!c.tray_autostart);
 
-        // A task flag wins over the twin, matching the sh installer's env-then-args order.
+        // A task flag wins over the twin (env, then args).
         let mut c = WinChoices::derive(&fresh_facts());
         let args = InnoArgs::parse(&[r#"/MERGETASKS="trayicon""#.to_string()]);
         c.apply(&args, &env);

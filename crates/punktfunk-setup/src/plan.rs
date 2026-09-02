@@ -1,13 +1,11 @@
 //! Stage three: `(Facts, Choices) → Plan`. Pure — no I/O, no spawns, no env reads.
 //!
-//! A `Step` is data: what to do, which phase it belongs to and the one-line why. `--dry-run`
-//! is therefore "render the Plan" by construction, and uninstall and channel-switch are not
-//! modes with their own I/O but Plans from a different `Action`.
+//! A `Step` is data. `--dry-run` renders the Plan; uninstall and channel-switch are Plans
+//! from a different `Action`, not modes with their own I/O.
 //!
-//! Four actions carry intent the plan cannot resolve without running something first — the apt
-//! madison pins, the pacman availability split, linger, and the unit enable. They stay
-//! `StepAction` variants rather than command strings so `exec` owns the trap and the plan
-//! stays pure; `design/installer-v2.md` §4 explains each.
+//! Four actions cannot be command strings: apt madison pins, the pacman availability split,
+//! linger, and unit enable each need something the previous step created. They stay
+//! `StepAction` variants so `exec` owns the trap. `design/installer-v2.md`.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +19,6 @@ pub enum Level {
     Warn,
 }
 
-/// The phases the progress checklist shows, in the order they run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     Uninstall,
@@ -38,30 +35,24 @@ pub enum Phase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepAction {
-    /// A shell snippet, echoed as `+ cmd` then run.
     Run(String),
-    /// One `KEY=VALUE` line replaced or appended in `host.env`.
+    /// Replaced or appended in `host.env`.
     SetEnv { key: String, value: String },
-    /// Text only — an `ok` or `!!` line with no command behind it.
     Note(Level, String),
-    /// apt will not walk back to a lower candidate on its own, so the exact version has to be
-    /// looked up with `apt-cache madison` *after* the repo is rewritten.
+    /// apt will not walk back to a lower candidate; madison after the repo rewrite.
     AptSwitch { pkgs: Vec<String> },
-    /// A package the target channel does not carry can neither be named nor kept, so the split
-    /// into `-Rdd` and `-S` needs `pacman -Si` against the repo the previous step just added.
+    /// Split `-Rdd` / `-S` from `pacman -Si` against the repo the previous step just added.
     PacmanSwitch { pkgs: Vec<String> },
-    /// Run `cmd` only when `program` is on PATH. Dry-run renders it regardless: the Omarchy
-    /// hand-off is planned before the install that ships the binary, and `--dry-run` reports
-    /// what a real box would do rather than what this one can do yet.
+    /// Dry-run renders this even when `program` is missing: the Omarchy hand-off is
+    /// planned before the install that ships the binary.
     RunIfPresent {
         program: String,
         cmd: String,
         warn_if_missing: Option<String>,
     },
-    /// Skipped with a warning where systemd is not PID 1 — a container has no logind and
-    /// nothing would honour it.
+    /// No-op with a warning where systemd is not PID 1: a container has no logind.
     Linger,
-    /// Re-probes the user manager, which the linger step above may have just created.
+    /// Re-probes the user manager linger may have just created.
     StartUnits { units: Vec<String> },
     /// Files the console's certificate in the user's NSS store. Resolved in `exec`: the host
     /// mints the certificate on its first start, so the step has to wait for the file.
@@ -71,8 +62,8 @@ pub enum StepAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
     pub action: StepAction,
-    /// On success nothing after this runs. Only the Omarchy hand-off sets it: `punktfunk-omarchy
-    /// setup` does the groups, firewall and autostart work itself, better than the generic path.
+    /// On success, skip every later phase. Only Omarchy sets it: that command already did
+    /// groups, firewall, and autostart.
     pub ends_run: bool,
 }
 
@@ -105,7 +96,6 @@ impl Step {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanPhase {
     pub kind: Phase,
-    /// The `==>` heading. Dynamic — it names the channel, the missing packages, the switch.
     pub title: String,
     pub steps: Vec<Step>,
 }
@@ -120,7 +110,6 @@ impl Plan {
         self.phases.iter().flat_map(|p| p.steps.iter())
     }
 
-    /// Every command this plan would run, in order — what the trap tests assert against.
     pub fn commands(&self) -> Vec<String> {
         self.steps()
             .filter_map(|s| match &s.action {
@@ -139,14 +128,13 @@ impl Plan {
     }
 }
 
-/// The whole engine: probe results in, ordered work out.
 pub fn build(facts: &Facts, choices: &Choices) -> Plan {
     let mut plan = Plan::default();
     let backend = platform::backend(facts.family);
 
     if choices.action == Action::Uninstall {
         let mut steps = backend.uninstall(facts);
-        // The per-family sweep catches a native client; a flatpak one is invisible to it.
+        // The family sweep cannot see a flatpak client.
         if facts.has_flatpak_client && facts.family != Family::Flatpak {
             steps.extend(platform::backend(Family::Flatpak).uninstall(facts));
         }
@@ -175,8 +163,7 @@ pub fn build(facts: &Facts, choices: &Choices) -> Plan {
         plan.push(Phase::Omarchy, "Omarchy", omarchy_steps(facts, choices));
     }
 
-    // A client-only install wires nothing: no groups, no gamestream, no linger, no firewall —
-    // the client listens on nothing fixed.
+    // A client listens on nothing fixed, so skip groups, firewall, linger, and start.
     if !choices.components.host {
         return plan;
     }
@@ -198,8 +185,8 @@ pub fn build(facts: &Facts, choices: &Choices) -> Plan {
     );
     plan.push(Phase::Firewall, "Firewall", firewall_steps(facts, choices));
 
-    // Linger is configuration, not starting, so --no-start still honours it. It also creates
-    // the user manager on a seatless box, so it MUST land before the unit enable below.
+    // Linger is configuration, not start, so --no-start still honours it. It also creates
+    // the user manager on a seatless box, so it must land before the unit enable below.
     if choices.linger {
         plan.push(
             Phase::Linger,
@@ -226,8 +213,8 @@ fn install_phase(
     choices: &Choices,
     backend: &dyn platform::PkgBackend,
 ) {
-    // Ask per binary, not "is the host there": host, console and plugin runner are three
-    // packages, and a weak-deps-off box would never grow a console otherwise.
+    // Host, console, and plugin runner are three packages. A weak-deps-off box never
+    // grows a console if we only ask "is the host there".
     if facts.fully_installed() && choices.components.host {
         let version = facts.host_version.clone().unwrap_or_default();
         // No repo means this build came from somewhere else — source, a hand-placed package —
@@ -274,14 +261,13 @@ fn install_phase(
         String::new()
     };
     let mut steps = vec![];
-    // The family backend covers the host and, where the repo carries it, the client in the
-    // same transaction — so it also runs for a client-only install on apt, dnf and pacman.
+    // The family backend also installs a native client in the same transaction, including
+    // a client-only run on apt, dnf, and pacman.
     let native_client = choices.components.client && facts.family.has_native_client();
     if choices.components.host || native_client {
         steps.extend(backend.install(facts, choices));
     }
-    // Where the family has no `punktfunk-client`, the client arrives as a user-scope flatpak
-    // instead of not at all — the same line the docs give for any other distro.
+    // Families with no `punktfunk-client` take the user-scope flatpak instead of skipping.
     if choices.components.client {
         if !what.is_empty() {
             what.push(' ');
@@ -377,7 +363,7 @@ fn group_steps(facts: &Facts, choices: &Choices) -> Vec<Step> {
     if facts.in_input_group {
         steps.push(Step::note(Level::Ok, "already in the input group"));
     } else if facts.has_ujust {
-        // Bazzite: the input group is recipe-managed, so usermod is the wrong tool.
+        // Bazzite's input group is recipe-managed; usermod is the wrong tool.
         steps.push(Step::run("ujust add-user-to-input-group"));
     } else if !facts.has_input_group {
         steps.push(Step::note(
@@ -417,7 +403,7 @@ fn option_steps(facts: &Facts, choices: &Choices) -> Vec<Step> {
     steps
 }
 
-/// Packages never open ports; they install firewalld services and ufw profiles by these names.
+/// Packages install firewalld services and ufw profiles by name; they never open ports.
 fn firewall_steps(facts: &Facts, choices: &Choices) -> Vec<Step> {
     let moved = choices.move_mgmt_port.then_some(choices.mgmt_port);
     match facts.firewall {
@@ -472,7 +458,7 @@ fn start_steps(facts: &Facts, choices: &Choices) -> Vec<Step> {
             ),
         ));
     }
-    // The plugin runner fills the game library; apt/dnf/sysext start it themselves, Arch does not.
+    // apt/dnf/sysext already start the plugin runner; Arch does not.
     if facts.scripting_unit_disabled {
         units.push("punktfunk-scripting".to_string());
     }
@@ -490,9 +476,8 @@ fn start_steps(facts: &Facts, choices: &Choices) -> Vec<Step> {
     steps
 }
 
-/// The packages a switch must land on the new channel: the family's own three, plus anything
-/// else punktfunk already installed, or `punktfunk-gamescope` and `punktfunk-client` are
-/// stranded on the channel the box just left.
+/// Union the family's three with anything already installed, or `punktfunk-gamescope`
+/// and `punktfunk-client` stay on the channel the box just left.
 pub fn switch_pkgs(base: &[&str], installed: &[String]) -> Vec<String> {
     let mut out: Vec<String> = base.iter().map(|s| (*s).to_string()).collect();
     for pkg in installed {
@@ -503,7 +488,7 @@ pub fn switch_pkgs(base: &[&str], installed: &[String]) -> Vec<String> {
     out
 }
 
-/// Both channels write the repo in one place per family, so `Channel` never leaks into two.
+/// One suffix per family so `Channel` does not fork the write path.
 pub fn repo_channel_suffix(channel: Channel) -> &'static str {
     match channel {
         Channel::Stable => "",
