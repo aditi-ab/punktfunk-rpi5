@@ -1636,7 +1636,13 @@ impl IddPushCapturer {
                 .as_ref()
                 .filter(|h| h.last_publish_qpc != 0)
                 .map(|h| Duration::from_micros(Self::qpc_age_us(h.last_publish_qpc))),
-            cursor_gap_px: self.cursor_gap_px,
+            // With the pointer composited here, cursor travel dirties nothing and the input
+            // canary can never be answered: neither is evidence of a changed desktop.
+            cursor_gap_px: if self.composite_cursor {
+                0
+            } else {
+                self.cursor_gap_px
+            },
             ring: health.map(|h| h.state),
             recreating: self.recovering_since.is_some(),
             secure_desktop: self.secure_active,
