@@ -42,8 +42,9 @@ param(
     [ValidateSet('auto', 'true', 'false')][string]$RequireSignedCert = 'auto',
     [switch]$NoSign,                                                # skip signing (local debug)
     # M4 (design/installer-v2-windows.md D1): pack with the unelevated punktfunk-setup-client
-    # twin instead of ISCC. Same stage, same output name, same signing. ISCC stays the default
-    # until M5.
+    # twin instead of ISCC. Same stage, same output name, same signing. Since M5 the workflow
+    # passes it for the published artifact; ISCC (the default here) is the one-release revert
+    # path.
     [switch]$Engine
 )
 $ErrorActionPreference = 'Stop'

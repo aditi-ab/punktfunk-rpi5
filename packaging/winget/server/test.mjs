@@ -98,7 +98,8 @@ const post = (p, body) =>
   check("manifest: version has Installers", Array.isArray(v?.Installers) && v.Installers.length > 0);
   const inst = v?.Installers?.[0];
   check("manifest: installer has URL + sha256", !!inst?.InstallerUrl && /^[0-9A-F]{64}$/i.test(inst?.InstallerSha256 ?? ""));
-  check("manifest: installer-level fields folded into the entry", inst?.InstallerType === "inno" && inst?.Scope === "machine");
+  // `exe` from the M5 swap on; `inno` for every release before it (the catalogue carries both).
+  check("manifest: installer-level fields folded into the entry", ["exe", "inno"].includes(inst?.InstallerType) && inst?.Scope === "machine");
   check("manifest: ProductCode preserved for correlation", !!inst?.ProductCode || !!v?.ProductCodes?.length);
   // A Log switch is only useful if winget SUBSTITUTES the path. <LOGPATH> is the one token it
   // replaces; anything else is passed through verbatim, and `|LOGPATH|` shipped in 0.20.0 — Inno
