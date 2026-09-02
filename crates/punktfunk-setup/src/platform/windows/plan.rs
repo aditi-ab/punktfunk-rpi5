@@ -543,6 +543,30 @@ fn host_uninstall(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
             WinAction::ArpRemove {
                 key: super::HOST_ARP_KEY.into(),
             },
+            // The `.iss`'s uninsdelete* set: the tray autostart, its toast AUMID, the HDR
+            // layer's registration. Lenient — a Custom install may never have laid one down.
+            run_lenient(&[
+                "reg",
+                "delete",
+                r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "PunktfunkTray",
+                "/f",
+            ]),
+            run_lenient(&[
+                "reg",
+                "delete",
+                r"HKLM\SOFTWARE\Classes\AppUserModelId\unom.punktfunk.tray",
+                "/f",
+            ]),
+            run_lenient(&[
+                "reg",
+                "delete",
+                r"HKLM\SOFTWARE\Khronos\Vulkan\ImplicitLayers",
+                "/v",
+                &format!("{app}\\vklayer\\pf_vkhdr_layer.json"),
+                "/f",
+            ]),
             WinAction::RemoveFiles { dir: app.clone() },
             note(
                 Level::Ok,
