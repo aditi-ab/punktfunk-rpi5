@@ -551,6 +551,7 @@ impl IddPushCapturer {
                 ccd,
                 source_seq: 0,
                 recovery: super::recovery::Supervisor::new(Instant::now()),
+                recovered_outage: None,
                 section,
                 header,
                 event,

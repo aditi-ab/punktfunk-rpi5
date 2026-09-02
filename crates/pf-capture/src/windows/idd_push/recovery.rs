@@ -70,6 +70,8 @@ pub(super) struct Supervisor {
     last_tick: Instant,
     /// The last verdict's source gap, for the typed fault when a stage report ends the ladder.
     last_gap: Duration,
+    /// The source gap when the open episode began, and when: together they measure the outage.
+    opened: Option<(Duration, Instant)>,
     offered_last: u64,
     /// When `offered_total` last advanced (the driver acquired a composed frame).
     offered_at: Option<Instant>,
@@ -86,6 +88,7 @@ impl Supervisor {
             coordinator: Coordinator::new(Budget::default()),
             last_tick: now,
             last_gap: Duration::ZERO,
+            opened: None,
             offered_last: 0,
             offered_at: None,
             input_at: None,
@@ -145,10 +148,14 @@ impl Supervisor {
                 _ => tracing::debug!(class = ?verdict.class, "IDD push: capture health changed"),
             }
         }
+        let owned = self.owns_episode();
         let action = match self.coordinator.step(i.now, Event::Verdict(verdict.class)) {
             Action::None => self.coordinator.step(i.now, Event::Tick),
             a => a,
         };
+        if !owned && self.owns_episode() {
+            self.opened = Some((verdict.source_gap, i.now));
+        }
         match self.act(action, verdict.source_gap) {
             Step::Nothing => {}
             step => return step,
@@ -172,8 +179,9 @@ impl Supervisor {
     }
 
     /// A NEW source frame arrived (never a regen or hold). Clears the gap's evidence; closes a
-    /// proving episode once the budgeted count has landed.
-    pub(super) fn source_frame(&mut self, now: Instant) -> Option<Summary> {
+    /// proving episode once the budgeted count has landed, returning its summary and the
+    /// measured outage (last source frame before the stall to this one).
+    pub(super) fn source_frame(&mut self, now: Instant) -> Option<(Summary, Duration)> {
         self.input_at = None;
         self.canary_at = None;
         let progress = Event::Progress {
@@ -181,7 +189,15 @@ impl Supervisor {
             assignment_changed: false,
         };
         match self.coordinator.step(now, progress) {
-            Action::Recovered => self.coordinator.last_summary().cloned(),
+            Action::Recovered => {
+                let outage = self.opened.take().map_or(Duration::ZERO, |(gap, at)| {
+                    gap + now.saturating_duration_since(at)
+                });
+                self.coordinator
+                    .last_summary()
+                    .cloned()
+                    .map(|s| (s, outage))
+            }
             _ => None,
         }
     }
@@ -305,8 +321,10 @@ mod tests {
         );
         assert_eq!(sv.source_frame(s(17)), None);
         assert_eq!(sv.source_frame(s(17)), None);
-        let summary = sv.source_frame(s(17)).expect("three source frames recover");
+        let (summary, outage) = sv.source_frame(s(17)).expect("three source frames recover");
         assert!(summary.recovered);
+        // The outage is the whole hole: 16 s of missed source before the episode plus 1 s in it.
+        assert_eq!(outage, Duration::from_secs(17));
         assert!(!sv.owns_episode());
     }
 }
