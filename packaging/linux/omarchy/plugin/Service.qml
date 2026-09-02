@@ -91,7 +91,6 @@ Item {
   // say so instead of showing a plausible-looking "not running".
   property bool pinMismatch: false
   property string lastError: ""
-  property bool toasts: true
 
   readonly property int exitPin: 4
 
@@ -123,10 +122,6 @@ Item {
   // Open the ordinary login page; an admin bearer URL must never enter process arguments.
   function openConsole() {
     detached(["omarchy-launch-webapp", "https://localhost:47992"])
-  }
-
-  function notify(title, body) {
-    if (root.toasts) Quickshell.execDetached(["omarchy-notification-send", title, body])
   }
 
   Component {
@@ -292,17 +287,8 @@ Item {
     if (ev.kind === "ctl.resync") { refresh(); refreshClients(); refreshDisplays(); return }
     if (ev.kind === "ctl.disconnected") { root.state = "stopped"; return }
 
-    if (ev.kind === "pairing.pending") {
-      refresh()
-      // The claimed name AND the fingerprint tail, always both: the name is what the device says
-      // it is, the tail is the part it cannot forge. The toast never approves anything.
-      var dev = ev.data || {}
-      var fp = String(dev.fingerprint || "")
-      var tail = fp.length > 10 ? "…" + fp.slice(-10) : fp
-      notify("Punktfunk pairing request",
-             "\"" + (dev.name || "a device") + "\"" + (tail ? " · " + tail : ""))
-      return
-    }
+    // A knock only refreshes the badge. The toast — with Approve/Deny — is the `pairing-pending`
+    // hook's job; a second one here made every request ring twice.
     if (ev.kind === "pairing.completed" || ev.kind === "pairing.denied" || ev.kind === "host.started") {
       refresh(); refreshClients(); return
     }

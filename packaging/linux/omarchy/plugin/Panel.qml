@@ -69,7 +69,6 @@ Panel {
 
   Service {
     id: service
-    toasts: root.setting("toasts", true)
   }
 
   // Re-snapshot whenever the panel is opened: the widget's incremental state is good enough for an

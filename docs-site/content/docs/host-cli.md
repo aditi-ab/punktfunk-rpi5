@@ -151,7 +151,8 @@ the tables above are for humans and are not stable.
 ### Watching events
 
 `watch` holds one long-lived connection and reconnects by itself, which makes it the right shape for
-a status widget or a script:
+a status widget or a script. It starts at the live tail; `--since 0` replays the host's ring and
+`--since <seq>` resumes after an event you saw:
 
 ```sh
 punktfunk-host ctl watch --kinds pairing.pending,stream.'*' | while read -r line; do
