@@ -1,32 +1,16 @@
-//! Small ash/Vulkan leaf helpers shared by the Linux Vulkan encode backends
-//! (`vulkan_video.rs`, `pyrowave.rs`) — extracted verbatim from `vulkan_video.rs`
-//! when the PyroWave backend arrived so the two don't fork copies.
-// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
-// Cargo.toml). This body is raw ash/Vulkan object construction almost line for line; narrowing it
-// would add one `unsafe {}` plus one SAFETY comment per call that could only restate the signature.
-// Clearing this file means DELETING the markers that carry no caller contract, not wrapping the
-// calls — until then the lint is off HERE and enforced everywhere else.
+//! Shared ash/Vulkan leaf helpers for the Linux encode backends
+//! (`vulkan_video.rs`, `pyrowave.rs`).
+// `unsafe_op_in_unsafe_fn` off HERE. Wrapping each ash call would add a
+// SAFETY comment that only restates the signature. Exit: delete unmarked
+// calls; do not wrap them.
 #![allow(unsafe_op_in_unsafe_fn)]
-
-// Every unsafe block carries a `// SAFETY:` proof (parent module enforces it).
 
 use anyhow::Result;
 use ash::vk;
 use pf_frame::PixelFormat;
 
-/// Whether a device extension is in an enumerated properties list — the gate both Vulkan encode
-/// backends use before enabling `VK_EXT_queue_family_foreign` (Phase 8: the FOREIGN queue-family
-/// barriers were used without the extension ever being enabled; `pf-presenter/dmabuf.rs` is the
-/// in-repo precedent that enables it).
 pub(super) fn ext_advertised(exts: &[vk::ExtensionProperties], name: &std::ffi::CStr) -> bool {
-    // `extension_name_as_c_str()` is ash's BOUNDED accessor: it stops at
-    // `VK_MAX_EXTENSION_NAME_SIZE` and returns `Err` when the array holds no NUL, so a
-    // malformed driver entry is a non-match rather than a read past the array. The previous
-    // `CStr::from_ptr(e.extension_name.as_ptr())` had no in-Rust bound at all — its SAFETY
-    // comment asserted the spec guarantee instead of enforcing it, so a driver that filled all
-    // 256 bytes without a terminator ran the walk into the NEXT `ExtensionProperties` and, on
-    // the last element, past the allocation. Same accessor `pyrowave.rs` already uses for the
-    // identical job. No unsafe, no unchecked read, same answer on every well-formed driver.
+    // Bounded: a missing NUL is `Err` (non-match), not a walk past the array.
     exts.iter().any(|e| e.extension_name_as_c_str() == Ok(name))
 }
 
@@ -53,7 +37,7 @@ pub(crate) unsafe fn find_mem(
     0
 }
 
-/// DRM fourcc -> the VkFormat whose *color* components match (Vulkan handles the byte swizzle).
+/// DRM fourcc → VkFormat whose *color* components match; Vulkan does the byte swizzle.
 pub(crate) fn fourcc_to_vk(fourcc: u32) -> Option<vk::Format> {
     // fourcc_code(a,b,c,d) = a | b<<8 | c<<16 | d<<24
     const XR24: u32 = 0x3432_5258; // XRGB8888
@@ -61,16 +45,8 @@ pub(crate) fn fourcc_to_vk(fourcc: u32) -> Option<vk::Format> {
     const XB24: u32 = 0x3432_4258; // XBGR8888
     const AB24: u32 = 0x3432_4241; // ABGR8888
     const NV12: u32 = 0x3231_564e; // DRM_FORMAT_NV12
-                                   // The 10-bit HDR capture formats. DRM packs these as a little-endian 32-bit word — XR30 is
-                                   // x:R:G:B with B in bits 0-9 — which is exactly Vulkan's `A2R10G10B10_UNORM_PACK32` bit
-                                   // layout, so the mapping is an identity on the word and not a byte swizzle like the 8-bit
-                                   // pair above.
-                                   //
-                                   // ⚠ Only `A2B10G10R10_UNORM_PACK32` is a Vulkan-mandatory SAMPLED format; `A2R10G10B10` is
-                                   // optional (widely supported on RADV/ANV, and we only ever `texelFetch` it — no filtering).
-                                   // Both are offered to the producer, so which one a session lands on is the producer's pick;
-                                   // if a device ever rejects the XR30 import, the fix is to drop that format from the capture
-                                   // offer rather than to convert here.
+    // DRM word layout == Vulkan PACK32 (not a byte swizzle). A2R10G10B10 is
+    // optional; a reject means drop XR30 from the capture offer, not convert here.
     const XR30: u32 = 0x3033_5258; // DRM_FORMAT_XRGB2101010
     const XB30: u32 = 0x3033_4258; // DRM_FORMAT_XBGR2101010
     match fourcc {
@@ -87,40 +63,28 @@ pub(crate) fn pixel_to_vk(fmt: PixelFormat) -> Option<vk::Format> {
     match fmt {
         PixelFormat::Bgrx | PixelFormat::Bgra => Some(vk::Format::B8G8R8A8_UNORM),
         PixelFormat::Rgbx | PixelFormat::Rgba => Some(vk::Format::R8G8B8A8_UNORM),
-        // The packed 10-bit PQ/BT.2020 capture formats (an HDR gamescope output). Sampling one
-        // yields the PQ code values normalized to [0,1] — which is what `rgb2yuv10.comp` wants.
+        // Sampling yields PQ in [0,1], which `rgb2yuv10.comp` wants.
         PixelFormat::X2Rgb10 => Some(vk::Format::A2R10G10B10_UNORM_PACK32),
         PixelFormat::X2Bgr10 => Some(vk::Format::A2B10G10R10_UNORM_PACK32),
         _ => None,
     }
 }
 
-/// Normalize a CPU RGB payload for Vulkan upload. The packed 24-bpp `Rgb`/`Bgr` the PipeWire
-/// capturer can negotiate are expanded 3→4 into `scratch` (kept by the caller across frames — no
-/// per-frame allocation) with the pad byte = 0xFF; refusing them instead used to kill a session
-/// at its first frame (WP5.4). No packed 24-bpp VkFormat is reliably uploadable/sampleable on
-/// target GPUs, and this path is CPU-sourced by definition, so one cheap expand pass serves it
-/// (the same call NVENC answers with its swscale 3→4 expand, WP1.4).
+/// Expand packed 24-bpp CPU RGB into `scratch` (caller-owned, reused) as 4-bpp
+/// with pad 0xFF: no 24-bpp VkFormat is reliably sampleable.
 ///
-/// `bgra_target = false` (the CSC paths): channel order is preserved — the sampler reads through
-/// the matching view format, so any 4-bpp order works and 4-bpp inputs pass through borrowed.
-/// `bgra_target = true` (the RGB-direct encode source): the output byte order is forced to
-/// B,G,R,X, because the video session's `pictureFormat` is `B8G8R8A8_UNORM` and
-/// VUID-vkCmdEncodeVideoKHR-pEncodeInfo-08207 requires the source image to match it — an
-/// R-first source (`Rgbx`/`Rgba`/`Rgb`) is channel-swapped during the same pass. (Caught live on
-/// RADV by `vulkan_smoke_rgb_cpu24`; the mismatch predates the 24-bpp support for `Rgbx` CPU
-/// sources.)
+/// `bgra_target = false` keeps channel order (CSC views match). `true` forces
+/// B,G,R,X because VUID-vkCmdEncodeVideoKHR-pEncodeInfo-08207 requires the
+/// encode source to match the session `pictureFormat` (`B8G8R8A8_UNORM`).
 ///
-/// Payloads are tightly packed with no row padding (`FramePayload::Cpu`'s contract), so the
-/// conversion is row-agnostic; a truncated source yields a truncated output, which the upload
-/// paths already bound-check exactly as they did the raw bytes.
+/// Payloads are tightly packed (`FramePayload::Cpu`); a truncated source
+/// yields a truncated output — upload paths bound-check the bytes.
 pub(crate) fn normalize_cpu_rgb<'a>(
     fmt: PixelFormat,
     bytes: &'a [u8],
     scratch: &'a mut Vec<u8>,
     bgra_target: bool,
 ) -> (PixelFormat, &'a [u8]) {
-    // Per-pixel source layout: bytes-per-pixel + where R, G, B sit in each pixel.
     let (bpp, r, g, b) = match fmt {
         PixelFormat::Rgb => (3usize, 0usize, 1usize, 2usize),
         PixelFormat::Bgr => (3, 2, 1, 0),
@@ -129,7 +93,7 @@ pub(crate) fn normalize_cpu_rgb<'a>(
         _ => return (fmt, bytes),
     };
     if bpp == 4 && (!bgra_target || b == 0) {
-        return (fmt, bytes); // 4-bpp in an acceptable order: borrow untouched
+        return (fmt, bytes); // 4-bpp already in session order: borrow
     }
     let px = bytes.len() / bpp;
     scratch.clear();
@@ -164,12 +128,9 @@ pub(crate) unsafe fn make_view(
     )?)
 }
 
-/// Whether a failed dmabuf import should count toward pf-zerocopy's raw-dmabuf degrade latch
-/// (`note_raw_dmabuf_import_failure` — 3 consecutive failures flip capture to CPU delivery for
-/// the process). Deterministic refusals (unsupported fourcc, the driver rejecting the buffer)
-/// must count — they repeat identically forever and the latch is their only recovery. Transient
-/// VRAM pressure must NOT: three tight allocation OOMs would otherwise permanently downgrade a
-/// working host to CPU capture.
+/// False for `ERROR_OUT_OF_{DEVICE,HOST}_MEMORY`: three tight OOMs must not
+/// permanently latch a working host onto CPU capture. Deterministic refusals
+/// (unsupported fourcc, driver reject) do count — they repeat forever.
 pub(crate) fn import_failure_feeds_latch(e: &anyhow::Error) -> bool {
     match e.downcast_ref::<vk::Result>() {
         Some(&r) => {
@@ -179,8 +140,7 @@ pub(crate) fn import_failure_feeds_latch(e: &anyhow::Error) -> bool {
     }
 }
 
-/// Import a packed-RGB dmabuf as a SAMPLED VkImage (explicit DRM modifier). Caller destroys all
-/// three returned handles. Extracted verbatim from `vulkan_video.rs`'s import path.
+/// Caller destroys all three returned handles.
 pub(crate) unsafe fn import_rgb_dmabuf(
     device: &ash::Device,
     ext_fd: &ash::khr::external_memory_fd::Device,
@@ -201,10 +161,8 @@ pub(crate) unsafe fn import_rgb_dmabuf(
     )
 }
 
-/// [`import_rgb_dmabuf`] with the image usage explicit and an optional video-profile list.
-/// Despite the historical name, this also imports gamescope's one-fd LINEAR NV12: the UV
-/// subresource layout comes from the producer's plane-1 chunk when it reported one, falling
-/// back to the shared-stride contiguous-plane contract.
+/// Also imports one-fd LINEAR NV12: UV layout from plane-1, else shared-stride
+/// contiguous planes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn import_rgb_dmabuf_as(
     device: &ash::Device,
@@ -220,11 +178,9 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
     use std::os::fd::{AsRawFd, IntoRawFd};
     let fmt = fourcc_to_vk(d.fourcc)
         .with_context(|| format!("unsupported dmabuf fourcc {:#x}", d.fourcc))?;
-    // Dup the fd FIRST, and keep it OWNED: ownership transfers to Vulkan only on a SUCCESSFUL
-    // `allocate_memory` (VK_KHR_external_memory_fd — from then on `vkFreeMemory` closes it), so
-    // the release below sits in exactly that arm. Every earlier failure drops the `OwnedFd` for
-    // a single clean close. An explicit `close` after a successful import would be a double
-    // close — and a recycled fd number then clobbers an unrelated descriptor in this process.
+    // Dup first, keep owned: Vulkan takes the fd only on successful
+    // `allocate_memory`; `vkFreeMemory` then closes it. Close-after-success
+    // is a double-close of a recycled number.
     let dup = d.fd.try_clone().context("dup dmabuf fd")?;
     let planes: Vec<vk::SubresourceLayout> = if fmt == vk::Format::G8_B8R8_2PLANE_420_UNORM {
         let (uv_offset, uv_stride) = d.plane1.map(|(o, s)| (o as u64, s as u64)).unwrap_or((
@@ -270,12 +226,10 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
         ci = ci.push_next(pl);
     }
     let img = device.create_image(&ci, None)?;
-    // Unwind discipline below mirrors `make_plain_image`: every failure destroys what this call
-    // created (and ONLY that — the caller's `DmabufFrame` fd stays theirs).
+    // Destroy only what this call created; the caller's `DmabufFrame` fd stays theirs.
     let fd_props = {
         let mut p = vk::MemoryFdPropertiesKHR::default();
-        // Borrow-only query (no ownership transfer); an error leaves memory_type_bits = 0 and
-        // the fallback below uses the image requirements alone.
+        // Borrow-only; error leaves `memory_type_bits = 0` and the fallback uses image reqs.
         let _ = (ext_fd.fp().get_memory_fd_properties_khr)(
             device.handle(),
             vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
@@ -314,7 +268,7 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
         }
         Err(e) => {
             device.destroy_image(img, None);
-            return Err(e.into()); // `dup` drops here: the one close of the failed import's fd
+            return Err(e.into()); // `dup` drops: the one close of the failed import
         }
     };
     if let Err(e) = device.bind_image_memory(img, mem, 0) {
@@ -340,10 +294,7 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
     Ok((img, mem, view))
 }
 
-/// Create + allocate + bind a host-visible/coherent buffer with `make_plain_image`'s unwind
-/// discipline: on any failure everything this call created is destroyed before returning, so
-/// callers can `?` freely. Both `ensure_cpu_rgb` staging twins open-coded this sequence and
-/// leaked the buffer (and then buffer+memory) on the allocate/bind failure arms.
+/// On failure every handle this call created is destroyed, so callers can `?`.
 pub(crate) unsafe fn make_host_buffer(
     device: &ash::Device,
     mp: &vk::PhysicalDeviceMemoryProperties,
@@ -405,7 +356,7 @@ pub(crate) unsafe fn make_plain_image(
         None,
     )?;
     let req = device.get_image_memory_requirements(img);
-    // Unwind on failure: callers (the encoders' open paths) only ever see the completed triple.
+    // Unwind: callers only ever see the completed triple.
     let mem = match device.allocate_memory(
         &vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)
@@ -457,34 +408,21 @@ mod tests {
         ));
     }
 
-    /// A driver entry with NO terminator anywhere in `extension_name` must be a non-match, not a
-    /// read past the array.
-    ///
-    /// This is the case the old `CStr::from_ptr(e.extension_name.as_ptr())` could not survive:
-    /// with every one of VK_MAX_EXTENSION_NAME_SIZE bytes non-NUL it walked into the NEXT
-    /// `ExtensionProperties`, and on the LAST element past the allocation entirely. The old test
-    /// only ever built well-formed, NUL-terminated entries, so it proved nothing about the bound
-    /// — which is why the hazard survived a SAFETY comment that asserted the spec guarantee
-    /// rather than enforcing it.
     #[test]
     fn ext_advertised_rejects_unterminated_name_without_overrunning() {
         let mut bad = ash::vk::ExtensionProperties::default();
         bad.extension_name.fill(b'A' as std::ffi::c_char);
-        // Deliberately LAST, so an unbounded walk would leave the whole array.
+        // Last so an unbounded walk would leave the array.
         let exts = [ash::vk::ExtensionProperties::default(), bad];
         assert!(!super::ext_advertised(
             &exts,
             ash::ext::queue_family_foreign::NAME
         ));
-        // And a name that is a prefix of the garbage still must not match.
         assert!(!super::ext_advertised(&exts, c"AAAA"));
     }
 
     use super::*;
 
-    /// CSC mode (`bgra_target = false`): the 3→4 expand is a pure byte shuffle — no channel
-    /// reorder, pad byte 0xFF, truncated tail pixels dropped (never overrun) — and 4-bpp inputs
-    /// pass through borrowed untouched.
     #[test]
     fn normalize_cpu_rgb_expands_24bpp_and_borrows_4bpp() {
         let mut scratch = Vec::new();
@@ -497,12 +435,11 @@ mod tests {
         assert_eq!(f, PixelFormat::Bgrx);
         assert_eq!(b, &[9, 8, 7, 0xFF]);
 
-        // Truncated tail: 5 bytes = one whole pixel + a 2-byte remainder that must be dropped.
+        // 5 bytes = one pixel + a 2-byte remainder that must be dropped.
         let mut scratch = Vec::new();
         let (_, b) = normalize_cpu_rgb(PixelFormat::Rgb, &[1, 2, 3, 4, 5], &mut scratch, false);
         assert_eq!(b, &[1, 2, 3, 0xFF]);
 
-        // 4-bpp passthrough: borrowed, scratch untouched.
         let src = [10u8, 20, 30, 40];
         let mut scratch = Vec::new();
         let (f, b) = normalize_cpu_rgb(PixelFormat::Bgrx, &src, &mut scratch, false);
@@ -510,7 +447,6 @@ mod tests {
         assert!(std::ptr::eq(b.as_ptr(), src.as_ptr()));
         assert!(scratch.is_empty());
 
-        // The 4-bpp mapping the expand lands on matches pixel_to_vk's existing table.
         assert_eq!(
             pixel_to_vk(PixelFormat::Rgbx),
             Some(vk::Format::R8G8B8A8_UNORM)
@@ -521,31 +457,24 @@ mod tests {
         );
     }
 
-    /// RGB-direct mode (`bgra_target = true`): everything lands in B,G,R,X order because the
-    /// video session's `pictureFormat` is `B8G8R8A8_UNORM` and the encode source must match it
-    /// (VUID-vkCmdEncodeVideoKHR-pEncodeInfo-08207 — caught live on RADV). B-first inputs pass
-    /// through borrowed; R-first inputs are channel-swapped, 3-bpp and 4-bpp alike.
     #[test]
     fn normalize_cpu_rgb_forces_bgra_for_the_encode_source() {
-        // Rgb (R,G,B) → B,G,R,X with the swap folded into the expand.
         let mut scratch = Vec::new();
         let (f, b) = normalize_cpu_rgb(PixelFormat::Rgb, &[1, 2, 3], &mut scratch, true);
         assert_eq!(f, PixelFormat::Bgrx);
         assert_eq!(b, &[3, 2, 1, 0xFF]);
 
-        // Bgr (B,G,R) → same order, expanded.
         let mut scratch = Vec::new();
         let (f, b) = normalize_cpu_rgb(PixelFormat::Bgr, &[9, 8, 7], &mut scratch, true);
         assert_eq!(f, PixelFormat::Bgrx);
         assert_eq!(b, &[9, 8, 7, 0xFF]);
 
-        // Rgbx: 4-bpp but R-first — swapped, alpha replaced by the 0xFF pad.
+        // R-first 4-bpp: swap; source alpha replaced by the 0xFF pad.
         let mut scratch = Vec::new();
         let (f, b) = normalize_cpu_rgb(PixelFormat::Rgbx, &[1, 2, 3, 4], &mut scratch, true);
         assert_eq!(f, PixelFormat::Bgrx);
         assert_eq!(b, &[3, 2, 1, 0xFF]);
 
-        // Bgrx/Bgra already match the session order: borrowed untouched.
         let src = [10u8, 20, 30, 40];
         let mut scratch = Vec::new();
         let (f, b) = normalize_cpu_rgb(PixelFormat::Bgra, &src, &mut scratch, true);

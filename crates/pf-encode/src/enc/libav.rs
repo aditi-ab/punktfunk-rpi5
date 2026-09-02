@@ -1,7 +1,6 @@
-//! Shared libavcodec (FFmpeg) glue for the three libav encode backends — Linux NVENC
-//! (`encode/linux/mod.rs`), VAAPI (`encode/linux/vaapi.rs`), and Windows AMF/QSV
-//! (`encode/windows/ffmpeg_win.rs`) — so the byte-identical pieces live once (plan §2.2, the Tier-2
-//! gap). Free functions and consts over borrowed handles; nothing here is per-frame `dyn`,
+//! Shared libavcodec glue for the Linux NVENC, VAAPI, and Windows AMF/QSV backends.
+//!
+//! Free functions and consts over borrowed handles. Nothing here is per-frame `dyn`,
 //! allocating, or on the zero-copy ingest path.
 use crate::EncodedFrame;
 use anyhow::{Context, Result};
@@ -11,42 +10,28 @@ use ffmpeg_next::format::Pixel;
 use ffmpeg_next::{encoder, Packet, Rational};
 use std::os::raw::c_int;
 
-/// swscale: nearest-neighbour scaler flag (`SWS_POINT`). We never rescale (src dims == dst dims), so
-/// the resampler choice only governs the colour-conversion path; POINT is the cheapest.
+/// `SWS_POINT` (nearest-neighbour). Src dims == dst dims, so this only picks the CSC path;
+/// POINT is cheapest.
 pub(crate) const SWS_POINT: c_int = 0x10;
-/// swscale colorspace id for ITU-R BT.709 (`SWS_CS_ITU709`) — the CSC coefficients for our RGB→YUV.
+/// `SWS_CS_ITU709`. RGB→YUV CSC coefficients.
 pub(crate) const SWS_CS_ITU709: c_int = 1;
-/// swscale colorspace id for ITU-R BT.2020 non-constant-luminance (`SWS_CS_BT2020`) — the CSC
-/// coefficients for the HDR X2BGR10→P010 path (Windows only today).
+/// `SWS_CS_BT2020` (non-constant luminance). HDR X2BGR10→P010 CSC coefficients.
 pub(crate) const SWS_CS_BT2020: c_int = 9;
 
-/// `Pixel` → `AVPixelFormat`. `Pixel` is `#[repr(i32)]`-compatible with `AVPixelFormat` (the bindgen
-/// enum) via this documented conversion in ffmpeg-next.
+/// `Pixel` is `#[repr(i32)]`-compatible with bindgen `AVPixelFormat`; ffmpeg-next's
+/// documented conversion.
 pub(crate) fn pixel_to_av(p: Pixel) -> ffi::AVPixelFormat {
     ffi::AVPixelFormat::from(p)
 }
 
-/// An owned `AVBufferRef` — unref'd exactly once, when it drops.
+/// Owned `AVBufferRef`; unref'd once, on drop.
 ///
-/// The hwdevice/hwframes constructors used to unref by hand on *every* failure branch (three in the
-/// CUDA path, two in VAAPI) and then once more in a hand-written `Drop`. That shape leaks the moment
-/// somebody adds a branch and forgets the cleanup, and double-unrefs the moment two of them run —
-/// and neither mistake is visible at the call site or catchable by the compiler. Ownership lives in
-/// this type instead: an early `?` drops whatever was built so far, in reverse construction order,
-/// with no cleanup code at the call site at all.
-///
-/// **Drop order** matters to the callers holding two of these. A frames context internally holds its
-/// own reference on its device, and the code this replaced deliberately unref'd frames *before*
-/// device. Rust drops struct fields in DECLARATION order, so a struct holding both must declare
-/// frames before device to keep that. Refcounting makes either order sound in principle —
-/// the device cannot die while a frames ctx still references it — but the observable order is kept
-/// exactly as it shipped rather than quietly inverted by a field reorder.
+/// A frames ctx holds a ref on its device. Rust drops fields in declaration order, so a
+/// struct holding both must declare frames before device. Do not invert the fields.
 pub(crate) struct AvBuffer(*mut ffi::AVBufferRef);
 
 impl AvBuffer {
-    /// Take ownership of a freshly-created `AVBufferRef`, rejecting the null that an ffmpeg
-    /// allocator returns on failure (so the `is_null` check every caller used to open-code happens
-    /// once, here).
+    /// Take ownership of a freshly-created `AVBufferRef`. Null → `None`.
     ///
     // unsafe-fn-no-op-ok: contract-deferring constructor (`Vec::set_len` shape) — the body is
     // safe; the ownership transfer promised here is what Drop/as_ptr later rely on.
@@ -57,8 +42,7 @@ impl AvBuffer {
         (!p.is_null()).then_some(AvBuffer(p))
     }
 
-    /// The borrowed pointer, for the ffmpeg calls that read a ref without consuming it. Borrowed
-    /// only — the `AvBuffer` stays the owner, so callers must not unref what this returns.
+    /// Lends the pointer; this type stays the owner — callers must not unref it.
     pub(crate) fn as_ptr(&self) -> *mut ffi::AVBufferRef {
         self.0
     }
@@ -74,26 +58,16 @@ impl Drop for AvBuffer {
     }
 }
 
-/// An owned `AVFilterGraph`, freed exactly once when it drops.
+/// Owned `AVFilterGraph`; freed once, on drop.
 ///
-/// The dmabuf path built its graph beside three `AvBuffer`s and unwound all four by hand on each
-/// of eight failure branches — a four-line cleanup block copied eight times, once inside a macro.
-/// Freeing the graph is the same ownership question as unref'ing a buffer, so it gets the same
-/// answer.
-///
-/// Linux-only: the VAAPI dmabuf path is the sole filter-graph user in this crate. The Windows
-/// AMF/QSV backends feed the encoder directly and build no graph, so on Windows this type would be
-/// dead code — cfg'd out rather than `allow`ed, because "nothing here uses it" is the honest
-/// statement and an `allow` would keep it compiling after it stopped being true anywhere.
+/// Linux-only: VAAPI dmabuf is the only filter-graph user. Cfg'd out on Windows rather than
+/// `allow`ed — an `allow` would keep compiling after nothing used it.
 #[cfg(target_os = "linux")]
 pub(crate) struct AvFilterGraph(*mut ffi::AVFilterGraph);
 
 #[cfg(target_os = "linux")]
 impl AvFilterGraph {
-    /// Allocate a filter graph, rejecting the null `avfilter_graph_alloc` returns on OOM.
-    ///
-    /// Safe: the call takes no arguments and has no precondition a caller could violate — the only
-    /// contract is what happens to the result, and that is exactly what this type owns.
+    /// Parameterless allocator: no caller precondition. Null (OOM) → `None`.
     pub(crate) fn alloc() -> Option<Self> {
         // SAFETY: parameterless allocator; it returns either a fresh graph whose ownership passes
         // to the value returned here, or null (rejected below).
@@ -101,8 +75,7 @@ impl AvFilterGraph {
         (!g.is_null()).then_some(AvFilterGraph(g))
     }
 
-    /// The borrowed pointer, for the `avfilter_*` calls that build into the graph without taking
-    /// ownership of it.
+    /// Lends the pointer; this type stays the owner.
     pub(crate) fn as_ptr(&self) -> *mut ffi::AVFilterGraph {
         self.0
     }
@@ -119,36 +92,21 @@ impl Drop for AvFilterGraph {
     }
 }
 
-/// An owned `AVFrame`, freed exactly once when it drops.
+/// Owned `AVFrame`; freed once, on drop.
 ///
-/// The house pattern (`AvBuffer` above): `alloc` rejects the allocator's null once, `as_ptr`
-/// lends, `Drop` frees, no `Clone`. Before this type existed the crate held 8 `av_frame_alloc`
-/// sites matched by 22 hand-placed `av_frame_free`s — an ownership contract upheld by nobody,
-/// and broken in practice: the Windows zero-copy submit path leaked the frame AND a pooled
-/// hwframe surface on three `?` exits, under a comment asserting the opposite (fixed in the
-/// same change that introduced this type).
-///
-/// Why not ffmpeg-next's own RAII frame (`frame::Video::empty()`, already used as `VideoFrame`
-/// in the Linux NVENC path): `Frame::empty()` does not null-check — on allocator failure it
-/// wraps null and the next field write through it is UB — whereas every open-coded site here
-/// null-checked. This type keeps that: `alloc` returns `Option`, mirroring
-/// `AvFilterGraph::alloc`.
+/// Not ffmpeg-next's `Frame::empty()`: that wraps a null on allocator failure, and the next
+/// field write is UB. `alloc` returns `Option` instead.
 pub(crate) struct AvFrame(std::ptr::NonNull<ffi::AVFrame>);
 
 impl AvFrame {
-    /// Allocate a frame, rejecting the null `av_frame_alloc` returns on OOM.
-    ///
-    /// Safe: the call takes no arguments and has no precondition a caller could violate — the
-    /// only contract is what happens to the result, and that is exactly what this type owns.
+    /// Parameterless allocator: no caller precondition. Null (OOM) → `None`.
     pub(crate) fn alloc() -> Option<Self> {
         // SAFETY: parameterless allocator; it returns either a fresh, uniquely-owned frame whose
         // ownership passes to the value returned here, or null (rejected by NonNull::new).
         std::ptr::NonNull::new(unsafe { ffi::av_frame_alloc() }).map(AvFrame)
     }
 
-    /// The borrowed pointer, for the ffmpeg calls that fill or read the frame without taking
-    /// ownership of it. Borrowed only — the `AvFrame` stays the owner, so callers must not free
-    /// or move-from what this returns.
+    /// Lends the pointer; this type stays the owner — callers must not free or move-from it.
     pub(crate) fn as_ptr(&self) -> *mut ffi::AVFrame {
         self.0.as_ptr()
     }
@@ -165,16 +123,10 @@ impl Drop for AvFrame {
     }
 }
 
-/// An owned swscale context, freed exactly once when it drops.
-///
-/// Same ownership question as the frame above — `sws_getContext` at 3 sites was matched by 5
-/// hand-placed `sws_freeContext`s, two of them inside hand-written `Drop` impls whose real job
-/// this type absorbs.
 pub(crate) struct AvSwsContext(std::ptr::NonNull<ffi::SwsContext>);
 
 impl AvSwsContext {
-    /// Take ownership of a freshly-created `SwsContext`, rejecting the null `sws_getContext`
-    /// returns on failure (unsupported conversion or OOM).
+    /// Take ownership of a freshly-created `SwsContext`. Null → `None`.
     ///
     // unsafe-fn-no-op-ok: contract-deferring constructor (`Vec::set_len` shape) — the body is
     // safe; the ownership transfer promised here is what Drop/as_ptr later rely on.
@@ -185,8 +137,7 @@ impl AvSwsContext {
         std::ptr::NonNull::new(p).map(AvSwsContext)
     }
 
-    /// The borrowed pointer, for `sws_scale` calls. Borrowed only — the `AvSwsContext` stays
-    /// the owner.
+    /// Lends the pointer; this type stays the owner.
     pub(crate) fn as_ptr(&self) -> *mut ffi::SwsContext {
         self.0.as_ptr()
     }
@@ -201,28 +152,20 @@ impl Drop for AvSwsContext {
     }
 }
 
-/// One `receive_packet` attempt, with the not-ready states kept distinct so a blocking drain can
-/// tell "still encoding" (retry) from "stream over" (stop). The Linux NVENC/VAAPI polls collapse
-/// `Again`/`Eof` to `None`; the Windows AMF/QSV path keeps them apart for its deadline-driven loop.
+/// One `receive_packet` attempt. `Again` vs `Eof` stay distinct so a blocking drain can retry
+/// versus stop.
 pub(crate) enum PollOutcome {
     Packet(EncodedFrame),
     Again,
     Eof,
 }
 
-/// Apply the shared low-latency rate-control contract to a **not-yet-opened** encoder context: a
-/// fixed frame rate, CBR (target == max bitrate), B-frames off, and a tight ~1-frame VBV/HRD buffer.
+/// Shared low-latency RC on a **not-yet-opened** encoder: fixed fps, CBR (target == max),
+/// B-frames off, VBV ≈ 1 frame of bits (`bitrate/fps`, overridable via `PUNKTFUNK_VBV_FRAMES`).
 ///
-/// The VBV size bounds any single frame. Under CBR with no buffer set, libav's encoders use a loose
-/// default VBV, so a high-motion P-frame can balloon to many times the average; those extra packets
-/// overflow the bounded send queue + kernel socket buffer and get dropped, which the client sees as
-/// framedrops/jitter (and, on the infinite-GOP path, as old/stale frames flashing until the next
-/// RFI). A tight ~1-frame buffer makes the encoder hold frame size roughly constant and absorb motion
-/// as a momentary QP (quality) dip instead — the trade we want. Default = 1 frame of bits
-/// (bitrate/fps); `PUNKTFUNK_VBV_FRAMES` tunes it (larger = better motion quality, bigger bursts).
-///
-/// The caller still owns `set_format` (pixel format) and `gop_size` (GOP policy differs: NVENC's
-/// infinite/intra-refresh wave vs the VAAPI/AMF `i32::MAX`), since those are backend-specific.
+/// Libav's default VBV is loose; a high-motion P-frame then overflows the bounded send queue.
+/// A ~1-frame buffer holds size roughly constant and takes motion as a QP dip.
+/// Caller still sets pixel format and `gop_size` (backend-specific).
 pub(crate) fn apply_low_latency_rc(video: &mut encoder::video::Video, fps: u32, bitrate_bps: u64) {
     video.set_time_base(Rational(1, fps as i32));
     video.set_frame_rate(Some(Rational(fps as i32, 1)));
@@ -240,9 +183,6 @@ pub(crate) fn apply_low_latency_rc(video: &mut encoder::video::Video, fps: u32, 
     }
 }
 
-/// Drain the encoder for one packet (shared across the NVENC/VAAPI/AMF/QSV libav backends). The
-/// `EncodedFrame`'s only allocation is the `to_vec()` of the bitstream — the same copy each backend
-/// already made — so this stays off any per-frame `dyn`/`Box`/channel path.
 pub(crate) fn poll_encoder(enc: &mut encoder::video::Encoder, fps: u32) -> Result<PollOutcome> {
     let mut pkt = Packet::empty();
     match enc.receive_packet(&mut pkt) {
@@ -257,14 +197,12 @@ pub(crate) fn poll_encoder(enc: &mut encoder::video::Encoder, fps: u32) -> Resul
                 chunk_aligned: false,
             }))
         }
-        // No packet ready yet (need another input frame).
         Err(ffmpeg::Error::Other { errno })
             if errno == ffmpeg::util::error::EAGAIN
                 || errno == ffmpeg::util::error::EWOULDBLOCK =>
         {
             Ok(PollOutcome::Again)
         }
-        // Fully drained after flush().
         Err(ffmpeg::Error::Eof) => Ok(PollOutcome::Eof),
         Err(e) => Err(e).context("receive_packet"),
     }
