@@ -16,8 +16,12 @@ use super::policy::Linger;
 pub enum State {
     #[default]
     Idle,
-    Active { refs: u32 },
-    Lingering { until: Instant },
+    Active {
+        refs: u32,
+    },
+    Lingering {
+        until: Instant,
+    },
     Pinned,
 }
 

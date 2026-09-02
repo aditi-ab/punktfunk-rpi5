@@ -235,9 +235,7 @@ pub struct UnknownHost {
 pub enum PlanError {
     AmbiguousHost(String),
     UnresolvableHost(String),
-    PinConflict {
-        host: String,
-    },
+    PinConflict { host: String },
     UnknownProfile(String),
     AmbiguousProfile(String),
 }

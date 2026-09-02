@@ -66,12 +66,21 @@ pub struct Abs {
 /// free of core.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Act {
-    MoveRel { dx: i32, dy: i32 },
+    MoveRel {
+        dx: i32,
+        dy: i32,
+    },
     MoveAbs(Abs),
     /// GameStream button id; `down` is press/release.
-    Button { gs: u32, down: bool },
+    Button {
+        gs: u32,
+        down: bool,
+    },
     /// `axis` 0 = vertical, 1 = horizontal; `delta` in WHEEL(120) units.
-    Scroll { axis: u32, delta: i32 },
+    Scroll {
+        axis: u32,
+        delta: i32,
+    },
     /// Three-finger tap. The run loop owns the overlay tier.
     CycleStats,
     /// Armed twist driving the quick-action ring. `progress` 0…1; `x`/`y` are the

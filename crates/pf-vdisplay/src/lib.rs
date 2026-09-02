@@ -24,7 +24,9 @@ pub enum DisplayEvent {
         height: u32,
         refresh_hz: u32,
     },
-    Released { count: u32 },
+    Released {
+        count: u32,
+    },
 }
 
 /// Host SSE sink. Unset at startup: events before register are dropped.

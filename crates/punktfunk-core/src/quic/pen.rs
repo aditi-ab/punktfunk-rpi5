@@ -216,11 +216,18 @@ pub fn pen_seq_newer(new: u16, last: Option<u16>) -> bool {
 /// `ButtonsChanged?` → `TipUp?` → `ProximityOut` so nothing is left held.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PenTransition {
-    ProximityIn { tool: PenTool },
-    Motion { sample: PenSample },
+    ProximityIn {
+        tool: PenTool,
+    },
+    Motion {
+        sample: PenSample,
+    },
     TipDown,
     /// `pressed` / `released` are disjoint `PEN_BARREL*` subsets.
-    ButtonsChanged { pressed: u8, released: u8 },
+    ButtonsChanged {
+        pressed: u8,
+        released: u8,
+    },
     TipUp,
     ProximityOut,
 }

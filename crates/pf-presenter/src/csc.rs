@@ -132,7 +132,7 @@ impl CscPass {
         let push = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .size(64)]; // three vec4 rows + a params vec4 (mode, tonemap peak)
-        // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
+                        // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
         let pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()

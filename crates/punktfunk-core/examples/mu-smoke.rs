@@ -31,11 +31,11 @@ fn main() {
         mode,
         CompositorPref::Gamescope,
         GamepadPref::Auto,
-        0,     // host default
-        0,     // 8-bit SDR
-        2,     // stereo
-        0,     // 0 → HEVC-only
-        0,     // auto
+        0, // host default
+        0, // 8-bit SDR
+        2, // stereo
+        0, // 0 → HEVC-only
+        0, // auto
         None,
         0,
         false, // no part decoder

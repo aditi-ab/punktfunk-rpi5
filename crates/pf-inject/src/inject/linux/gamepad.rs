@@ -794,7 +794,7 @@ mod ff_state_tests {
         });
         assert_eq!(ff.mix(now, IDLE), Some((scaled(0x8000), 0)));
         assert_eq!(ff.mix(now, IDLE), None); // unchanged level; still playing
-        // FF plane quiet past the idle window: cut, exactly once.
+                                             // FF plane quiet past the idle window: cut, exactly once.
         ff.last_activity = now - Duration::from_millis(2600);
         assert_eq!(ff.mix(now, IDLE), Some((0, 0)));
         assert_eq!(ff.mix(now, IDLE), None); // already off — no repeat
@@ -931,7 +931,7 @@ mod ff_state_tests {
         });
         ff.last_activity = now - Duration::from_secs(60); // long stale
         assert_eq!(ff.mix(now, IDLE), None); // silent, but not cut
-        // Plays once the delay elapses.
+                                             // Plays once the delay elapses.
         assert_eq!(
             ff.mix(now + Duration::from_millis(5001), IDLE),
             Some((scaled(0x8000), 0))

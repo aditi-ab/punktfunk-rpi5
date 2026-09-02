@@ -225,10 +225,7 @@ pub enum EventKind {
         outcome: String,
     },
     #[serde(rename = "host.started")]
-    HostStarted {
-        version: String,
-        gamestream: bool,
-    },
+    HostStarted { version: String, gamestream: bool },
     #[serde(rename = "host.stopping")]
     HostStopping,
 }
