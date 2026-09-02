@@ -734,9 +734,8 @@ fn spawn_plane_threads(
             .ok()
     })
     .flatten();
-    // `set_live` makes the chord real: mic off in Settings, capture failed, or no
-    // MIC grant (host would drop the datagrams) leaves it false. `mut` because a
-    // mid-session AccessUpdate moves the grant and the uplink follows it live.
+    // `set_live` makes the chord real. Disabled settings, failed capture, or no
+    // MIC grant leaves it false because the host would drop uplink datagrams.
     let mic_uplink = (settings.mic_enabled && access.allows(punktfunk_core::quic::GRANT_MIC))
         .then(|| {
             audio::MicStreamer::spawn(connector.clone(), mic.flag(), settings.echo_cancel)
