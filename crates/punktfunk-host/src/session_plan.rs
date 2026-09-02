@@ -289,3 +289,119 @@ fn resolve_encoder() -> EncoderBackend {
         _ => EncoderBackend::PlatformAuto,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encode::{ChromaFormat, Codec};
+
+    #[test]
+    fn resolve_copies_negotiated_fields() {
+        let cases = [
+            (8, false, ChromaFormat::Yuv420, Codec::H264, false, false),
+            (10, true, ChromaFormat::Yuv444, Codec::H265, true, true),
+        ];
+
+        for (bit_depth, hdr, chroma, codec, cursor_blend, cursor_forward) in cases {
+            let plan = SessionPlan::resolve(
+                bit_depth,
+                hdr,
+                chroma,
+                codec,
+                cursor_blend,
+                cursor_forward,
+                true,
+            );
+
+            assert_eq!(plan.bit_depth, bit_depth);
+            assert_eq!(plan.hdr, hdr);
+            assert_eq!(plan.chroma, chroma);
+            assert_eq!(plan.codec, codec);
+            assert_eq!(plan.cursor_blend, cursor_blend);
+            assert_eq!(plan.cursor_forward, cursor_forward);
+            assert_eq!(plan.max_slices, 32);
+            assert_eq!(plan.wire_chunk, None);
+            assert!(!plan.gamescope_cursor);
+        }
+    }
+
+    #[test]
+    fn resolve_limits_single_slice_clients() {
+        let plan = SessionPlan::resolve(
+            8,
+            false,
+            ChromaFormat::Yuv420,
+            Codec::H264,
+            false,
+            false,
+            false,
+        );
+
+        assert_eq!(plan.max_slices, 1);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolve_uses_idd_push_on_windows() {
+        assert_eq!(CaptureBackend::resolve(), CaptureBackend::IddPush);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn resolve_uses_portal_off_windows() {
+        assert_eq!(CaptureBackend::resolve(), CaptureBackend::Portal);
+    }
+
+    #[test]
+    fn topology_is_always_single_process() {
+        assert_eq!(resolve_topology(), SessionTopology::SingleProcess);
+    }
+
+    #[test]
+    fn only_software_encoder_uses_cpu_staging() {
+        let cases = [
+            (EncoderBackend::PlatformAuto, true),
+            (EncoderBackend::Nvenc, true),
+            (EncoderBackend::Amf, true),
+            (EncoderBackend::Qsv, true),
+            (EncoderBackend::Software, false),
+        ];
+
+        for (backend, expected) in cases {
+            assert_eq!(backend.is_gpu(), expected);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cursor_forward_forces_blend_on_linux() {
+        assert!(cursor_blend_for(true, false, Codec::H264, 8));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gamescope_cursor_reader_matches_blend_rule() {
+        let cursor_blend = cursor_blend_for(false, true, Codec::H265, 10);
+        let gamescope_cursor = gamescope_cursor_for(true);
+
+        assert_eq!(cursor_blend, gamescope_cursor);
+        assert_eq!(cursor_blend, gamescope_needs_host_cursor(true));
+        assert!(!gamescope_cursor_for(false));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn cursor_rules_are_disabled_off_linux() {
+        for cursor_forward in [false, true] {
+            for gamescope in [false, true] {
+                assert!(!cursor_blend_for(
+                    cursor_forward,
+                    gamescope,
+                    Codec::H265,
+                    10
+                ));
+                assert!(!gamescope_cursor_for(gamescope));
+            }
+        }
+    }
+}
