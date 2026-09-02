@@ -1,28 +1,16 @@
-//! The Vulkan presenter: swapchain + several frame paths into one device-local RGBA video
-//! image, then a letterboxed `vkCmdBlitImage` composite.
+//! Swapchain presenter: every decode lane writes one device-local RGBA image, then a
+//! letterboxed `vkCmdBlitImage` composite.
 //!
-//! * **Software** (`FrameInput::Cpu`): since M8 the CPU rung hands over tightly-packed
-//!   8-bit I420 PLANES, not RGBA. They are staged into three R8 images
-//!   (`CpuPlanes`, no `buffer_row_length` — the planes carry no stride) and converted by
-//!   the PLANAR CSC render pass, the same pass and the same `csc_rows` coefficients the
-//!   hardware lanes use. That is what deleted this lane's second colour implementation
-//!   (swscale's BT.601 default) and its missing tone-map along with it.
-//! * **Hardware** (`FrameInput::Dmabuf`): the decoder's NV12 dmabuf imported per-plane
-//!   (`dmabuf.rs`) and converted by the two-plane CSC render pass (`csc.rs`) — zero-copy,
-//!   gated on the four import extensions at device creation; boxes without them (NVIDIA
-//!   proprietary by design) report `supports_dmabuf() == false` and the caller keeps the
-//!   decoder on software.
-//! * Plus the lanes that arrive already on this device: `NativeVk` (Vulkan Video —
-//!   pf-vkdecode on this very VkDevice), `D3d11` (Windows shared textures) and
-//!   `PyroWave` (three compute-decoded planes, through the same planar pass as the
-//!   software lane).
+//! CPU frames stage tightly-packed I420 into three R8 images (`CpuPlanes`) and share
+//! the planar CSC pass (`csc.rs`, `csc_rows`) with PyroWave. Linux dmabuf imports NV12
+//! per-plane (`dmabuf.rs`); without the four import extensions `supports_dmabuf()` is
+//! false and the caller keeps software decode. `NativeVk` and `D3d11` already live on
+//! this device.
 //!
-//! Pacing: one frame in flight (the submit fence is waited before each record), MAILBOX
-//! when available, FIFO otherwise (`PUNKTFUNK_PRESENT_MODE=fifo|mailbox|immediate`
-//! overrides — see `pick_present_mode` for why an arrival-paced presenter must not
-//! block in FIFO's present queue). Present is arrival-paced by the caller: a frame
-//! input on each decoded frame, `FrameInput::Redraw` re-blits the retained video image
-//! (expose/resize redraws).
+//! One frame in flight: wait the submit fence before recording. MAILBOX when offered,
+//! FIFO otherwise; `PUNKTFUNK_PRESENT_MODE=fifo|mailbox|immediate` pins the mode
+//! (`pick_present_mode` — FIFO's present queue must not block an arrival-paced caller).
+//! `FrameInput::Redraw` re-blits the retained image on expose/resize.
 
 use crate::csc::CscPass;
 #[cfg(target_os = "linux")]
@@ -43,86 +31,66 @@ mod setup;
 
 pub use setup::{list_adapters, probe_decode, AdapterDecode, PresentPref};
 
-/// The Vulkan version every instance this crate creates declares in
-/// `VkApplicationInfo::apiVersion`.
+/// Vulkan version every instance this crate creates puts in `VkApplicationInfo::apiVersion`.
 ///
-/// 1.3 because Vulkan Video decode and PyroWave's compute kernels both need a 1.3 device.
-/// It is deliberately a CEILING as well as a floor: the loader is routinely newer (Mesa 26
-/// answers `vkEnumerateInstanceVersion` with 1.4), but we only ever promised 1.3, so the
-/// entry points above it are not ours to call. Anything that must know how far the device
-/// side reaches — notably an overlay renderer sizing its own function table — reads this
-/// through [`crate::overlay::SharedDevice::api_version`] rather than asking the loader.
+/// 1.3 is the floor (Vulkan Video and PyroWave compute) and the ceiling: the loader may
+/// be newer, but entry points above 1.3 were never promised. Overlay renderers size
+/// their tables from [`crate::overlay::SharedDevice::api_version`], not the loader.
 pub const INSTANCE_API_VERSION: u32 = vk::API_VERSION_1_3;
 
-/// The clamp behind [`Presenter::overlay_api_version`], split out so the decision is provable
-/// without a device: the answer is the lower of what we declared and what the loader reports,
-/// and a loader too old to answer at all (`None`) can only be a 1.0 one.
+/// Clamp behind [`Presenter::overlay_api_version`], split out so tests can prove it
+/// without a device: min(declared, loader), and a loader that cannot answer is 1.0.
 fn overlay_api_version_of(declared: u32, loader: Option<u32>) -> u32 {
     declared.min(loader.unwrap_or(vk::API_VERSION_1_0))
 }
 
-/// The video-format probe behind [`AdapterDecode::formats`], re-exported so a caller
-/// that prints the report does not need its own `pf-vkdecode` dependency (and cannot
-/// end up printing a DIFFERENT crate version's idea of the flag names).
+/// Video-format probe behind [`AdapterDecode::formats`]. Re-exported so a printer
+/// cannot pick up a different `pf-vkdecode` version's flag names.
 pub use pf_vkdecode::probe;
 
-/// One presenter iteration's video input.
 pub enum FrameInput<'a> {
-    /// No new frame — re-composite the retained video image (expose/resize).
+    /// Re-blit the retained video image (expose / resize); no new decode.
     Redraw,
-    /// Software-decoded I420 planes (M8): uploaded into three R8 images and converted by
-    /// the planar CSC pass, exactly like the hardware lanes' planes — so PQ tone-mapping,
-    /// range and matrix all come from the ONE shader, and the CPU lane stops being the
-    /// odd one out that arrived pre-converted (and pre-converted wrong).
+    /// Tightly-packed I420 planes, staged into three R8 images and converted by the
+    /// planar CSC pass — same shader, range, matrix, and PQ tone-map as the hardware lanes.
     Cpu(&'a CpuPlanarFrame),
     #[cfg(target_os = "linux")]
     Dmabuf(DmabufFrame),
-    /// D3D11VA hand-off — a shareable NT-handle texture to import (`d3d11.rs`).
+    /// Shareable NT-handle texture; imported in `d3d11.rs`.
     #[cfg(windows)]
     D3d11(pf_client_core::video::D3d11Frame),
-    /// PyroWave planar output — three R8 plane views already on THIS device, decode
-    /// fence-complete, GENERAL layout (`pf_client_core::video_pyrowave`).
+    /// Three R8 plane views already on this device, decode fence-complete, GENERAL layout.
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     PyroWave(pf_client_core::video_pyrowave::PyroWavePlanarFrame),
-    /// Native Vulkan Video output (pf-vkdecode) — an NV12 image + plane views already
-    /// on THIS device: wait the frame's timeline pair on the submit, transition its
-    /// layer for sampling and BACK to its decode layout, CSC with the coded-vs-display
-    /// UV scale. Dropping the frame (after the sampling fence) releases the decoder's
-    /// slot via its guard.
+    /// NV12 image + plane views already on this device. Wait the frame's timeline on
+    /// submit, sample, then transition back to the decode layout; drop after the
+    /// sampling fence to release the decoder slot.
     NativeVk(NativeVkFrame),
 }
 
-/// The dmabuf/CSC machinery, present only when the device carries the import extensions.
 #[cfg(target_os = "linux")]
 struct HwCtx {
     ext_mem_fd: ash::khr::external_memory_fd::Device,
 }
 
-/// The D3D11 shared-texture import machinery, present only when the device carries
-/// `VK_KHR_external_memory_win32` + `VK_KHR_win32_keyed_mutex`.
+/// Win32 external-memory + keyed-mutex table; present only when both extensions exist.
 #[cfg(windows)]
 struct HwCtxWin {
     ext_mem_win32: ash::khr::external_memory_win32::Device,
 }
 
-/// A submitted hardware frame parked until the in-flight fence proves the GPU reads
-/// done: imported dmabuf planes, an imported D3D11 shared texture, or a native
-/// Vulkan-Video frame.
+/// Hardware frame held until the in-flight fence proves GPU reads are done.
 enum Retired {
     #[cfg(target_os = "linux")]
     Dmabuf(HwFrame),
     #[cfg(windows)]
     D3d11(crate::d3d11::HwFrame),
-    /// A native (pf-vkdecode) frame: image + views are the DECODER's — nothing to
-    /// destroy here; dropping the frame after the fence wait sends its release token,
-    /// which is what returns the decode slot (the release-after-fence contract).
+    /// Decoder-owned image + views: destroy nothing; drop after the fence to return the slot.
     NativeVk(NativeVkFrame),
 }
 
-/// The overlay composite: one premultiplied-alpha quad blended over the swapchain image
-/// after the video blit (the §6.1 contract's presenter half). Always built — it has no
-/// Skia dependency and costs nothing while no overlay frame arrives (the render pass
-/// isn't even recorded).
+/// Premultiplied-alpha quad blended over the swapchain image after the video blit.
+/// Recorded only when an overlay frame arrives.
 struct OverlayPipe {
     render_pass: vk::RenderPass,
     set_layout: vk::DescriptorSetLayout,
@@ -131,37 +99,27 @@ struct OverlayPipe {
     desc_pool: vk::DescriptorPool,
     desc_set: vk::DescriptorSet,
     sampler: vk::Sampler,
-    /// Per-swapchain-image render targets, rebuilt with the swapchain.
     views: Vec<vk::ImageView>,
     framebuffers: Vec<vk::Framebuffer>,
 }
 
-/// The software rung's plane images: three R8 pictures the CPU frame's tightly-packed
-/// I420 is uploaded into, then sampled by the planar CSC pass. Sized to the LUMA picture
-/// and its 4:2:0 chroma halves; rebuilt whenever the stream size changes.
-///
-/// Owned by the presenter rather than parked in `Retired` like the imported hardware
-/// frames: nothing outside this device ever refers to them, and the single in-flight
-/// fence is waited before each record, so re-uploading into the same images is safe
-/// without a ring.
+/// Three R8 images the CPU I420 is uploaded into. Owned here, not in `Retired`: nothing
+/// outside this device refers to them, and the in-flight fence is waited before each
+/// record, so re-uploading into the same images is safe without a ring.
 struct CpuPlanes {
     images: [vk::Image; 3],
     memory: [vk::DeviceMemory; 3],
     views: [vk::ImageView; 3],
-    /// Luma size; chroma is derived (`div_ceil(2)`), the same rule the frame uses.
+    /// Luma size; chroma is `div_ceil(2)`, matching the frame.
     width: u32,
     height: u32,
-    /// True once the images have been transitioned out of UNDEFINED at least once — the
-    /// first upload must come from UNDEFINED (nothing to preserve), every later one from
-    /// SHADER_READ_ONLY_OPTIMAL (where the previous frame's CSC pass left them).
+    /// False until the first upload (src UNDEFINED). Later uploads src from
+    /// SHADER_READ_ONLY_OPTIMAL, where the previous CSC pass left the images.
     initialized: bool,
 }
 
-/// The one video image: device-local RGBA the size of the decoded stream, the single
-/// target every lane converges on before the letterboxed blit. `view` + `framebuffer` are
-/// unconditional since M8 — the CSC pass renders into it on EVERY device, because the
-/// software lane goes through the planar pass too and there is no lane left that writes
-/// this image with a plain transfer.
+/// Device-local RGBA the size of the decoded stream; every lane's CSC target before the
+/// letterboxed blit.
 struct VideoImage {
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -171,8 +129,7 @@ struct VideoImage {
     height: u32,
 }
 
-/// The host-visible upload buffer the software rung's three planes are copied into before
-/// the record step's `vkCmdCopyBufferToImage`s. Grows, never shrinks.
+/// Host-visible upload buffer for the CPU planes. Grows, never shrinks.
 struct Staging {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -181,7 +138,7 @@ struct Staging {
 }
 
 pub struct Presenter {
-    // Field order = drop order documentation only; teardown is explicit in `Drop`.
+    // Field order is not drop order; teardown is explicit in `Drop`.
     entry: ash::Entry,
     instance: ash::Instance,
     surface_i: ash::khr::surface::Instance,
@@ -192,64 +149,45 @@ pub struct Presenter {
     swap_d: ash::khr::swapchain::Device,
     queue: vk::Queue,
     qfi: u32,
-    /// Dmabuf import — `None` when the device lacks the import extensions (the CSC
-    /// pass itself is unconditional: Vulkan-Video frames need it everywhere).
+    /// Dmabuf import. `None` without the import extensions; the CSC pass is still built
+    /// (Vulkan Video needs it on every device).
     #[cfg(target_os = "linux")]
     hw: Option<HwCtx>,
-    /// D3D11 shared-texture import — `None` when the device lacks the win32 external
-    /// memory / keyed-mutex extensions.
+    /// D3D11 import. `None` without win32 external-memory / keyed-mutex.
     #[cfg(windows)]
     hw_win: Option<HwCtxWin>,
     csc: CscPass,
-    /// The planar (3-plane) CSC variant. Unconditional since M8: the SOFTWARE rung
-    /// renders through it, and the software rung is the ladder's last one — a device that
-    /// failed the pyrowave probe (or a build without the feature) still has to be able to
-    /// show a picture.
+    /// Planar (3-plane) CSC. Always built: the CPU rung is the last decode fallback.
     csc_planar: CscPass,
-    /// The software rung's three uploaded plane images (Y/Cb/Cr, R8), rebuilt on a
-    /// stream-size change. `None` until the first CPU frame — a hardware session never
-    /// allocates them.
+    /// CPU-rung Y/Cb/Cr R8 images. `None` until the first CPU frame.
     cpu_planes: Option<CpuPlanes>,
-    /// The shared Vulkan device handles the decode lane runs on — `None` when the stack
-    /// can't do Vulkan Video at all.
+    /// Shared device handles for the Vulkan Video decode lane. `None` if the stack cannot.
     video_export: Option<pf_client_core::video::VulkanDecodeDevice>,
-    /// The console-UI composite quad (§6.1's presenter half).
     overlay_pipe: OverlayPipe,
-    /// The submitted hardware frame (dmabuf plane images + guard, an imported D3D11
-    /// texture, or a native Vulkan-Video frame): its GPU reads end with the in-flight
-    /// fence, so it's released right after the next fence wait.
+    /// In-flight hardware frame; released after the next fence wait.
     retired_hw: Option<Retired>,
-    /// External-sync lock over this device's queues, shared with the DECODE lane (via
-    /// [`pf_client_core::video::VulkanDecodeDevice::queue_lock`]) and the Skia overlay:
-    /// the decoder submits on the SAME graphics queue from the pump thread, so every
-    /// `vkQueueSubmit`/`vkQueuePresentKHR`/`vkQueueWaitIdle`/`vkDeviceWaitIdle` here must
-    /// hold it — the unsynchronized overlap was an intermittent `VK_ERROR_DEVICE_LOST`.
+    /// External-sync lock over this device's queues, shared with decode and the overlay.
+    /// The decoder submits on this same graphics queue from the pump thread; every
+    /// `vkQueueSubmit` / `vkQueuePresentKHR` / wait-idle here must hold it or the
+    /// overlap is `VK_ERROR_DEVICE_LOST`.
     queue_lock: std::sync::Arc<pf_client_core::video::QueueLock>,
     format: vk::SurfaceFormatKHR,
-    /// The surface's HDR10/ST.2084 pairing, when the stack offers one.
     hdr10_format: Option<vk::SurfaceFormatKHR>,
-    /// PQ frames are on screen and the swapchain is in HDR10 mode.
     hdr_active: bool,
-    /// One-shot latch: a PQ frame arrived but the surface offers no HDR10 colorspace, so the
-    /// CSC pass silently tone-maps to SDR. Warned once — the single most useful signal for
-    /// diagnosing "HDR isn't advertised" (e.g. gamescope's WSI layer invisible in a flatpak
-    /// sandbox) vs. the host simply not sending PQ.
+    /// One-shot: a PQ frame arrived and the surface has no HDR10 colorspace, so CSC
+    /// tone-maps to SDR. Distinguishes "surface cannot advertise HDR" from "host sent SDR".
     hdr_downgrade_warned: bool,
-    /// `VK_EXT_hdr_metadata` device fns when the driver offers them (gamescope/KDE do).
     hdr_metadata_d: Option<ash::ext::hdr_metadata::Device>,
-    /// The host's latest ST.2086/CLL metadata (the 0xCE plane) — pushed to the
-    /// swapchain whenever HDR10 mode is live; `None` until the first datagram lands
-    /// (a generic HDR10 baseline is pushed meanwhile).
+    /// Latest ST.2086/CLL metadata (0xCE plane). Pushed while HDR10 is live; until the
+    /// first datagram, a generic HDR10 baseline is pushed instead.
     hdr_meta: Option<punktfunk_core::quic::HdrMeta>,
-    /// The video image / CSC attachment format for the current mode.
     video_format: vk::Format,
     present_mode: vk::PresentModeKHR,
     swapchain: vk::SwapchainKHR,
     images: Vec<vk::Image>,
     extent: vk::Extent2D,
-    /// Per-swapchain-image render-finished semaphores (present consumes them on the
-    /// image's schedule — one shared semaphore could be re-submitted while a previous
-    /// present still holds it).
+    /// Per-swapchain-image render-finished semaphores. Present consumes them on the
+    /// image's schedule; one shared semaphore can still be held by a previous present.
     render_sems: Vec<vk::Semaphore>,
     acquire_sem: vk::Semaphore,
     fence: vk::Fence,
@@ -257,47 +195,40 @@ pub struct Presenter {
     cmd_buf: vk::CommandBuffer,
     staging: Option<Staging>,
     video: Option<VideoImage>,
-    /// The submit fence has a submission pending (wait before recording again — also
-    /// what makes the single staging buffer safe to overwrite).
+    /// Submit fence has work pending. Wait before recording; also what makes the single
+    /// staging buffer safe to overwrite.
     submitted: bool,
-    /// `VK_KHR_present_wait` on-glass timing (latency plan T0.2) — `None` when the
-    /// device lacks the present-id/present-wait pair; the run loop then keeps its
-    /// submit-time display stamp.
+    /// `VK_KHR_present_wait` on-glass timing. `None` without present-id/present-wait;
+    /// the run loop then keeps its submit-time display stamp.
     present_timer: Option<present_timing::PresentTimer>,
-    /// Monotonic present id (global counter — strictly increasing per swapchain, which
-    /// is all the spec asks). 0 = nothing presented with an id yet.
+    /// Strictly increasing present id (spec: per swapchain). 0 = none presented with an id.
     next_present_id: u64,
-    /// The last successful id-carrying present, awaiting its [`Presenter::note_presented`]
-    /// claim from the run loop (which owns the frame's pts/decode stamps).
+    /// Last successful id-carrying present, awaiting [`Presenter::note_presented`].
     last_presented: Option<(vk::SwapchainKHR, u64)>,
 }
 
 impl Presenter {
-    /// Whether the hardware (dmabuf) path exists on this device — callers keep the
-    /// decoder on software when it doesn't.
+    /// Whether dmabuf import exists. Callers keep the decoder on software when false.
     #[cfg(target_os = "linux")]
     pub fn supports_dmabuf(&self) -> bool {
         self.hw.is_some()
     }
 
-    /// Whether the D3D11 shared-texture path exists on this device — callers keep the
-    /// decoder on software when it doesn't.
+    /// Whether D3D11 shared-texture import exists. Callers keep software when false.
     #[cfg(windows)]
     pub fn supports_d3d11(&self) -> bool {
         self.hw_win.is_some()
     }
 
-    /// The Vulkan Video decode handle bundle — `None` when this stack can't
-    /// (device < 1.3, missing video extensions/queue/features). The decoder ladder
-    /// falls through to the platform rung / software then.
+    /// Vulkan Video decode handles. `None` when the device is < 1.3 or missing video
+    /// extensions / queue / features; the ladder then falls through.
     pub fn vulkan_decode(&self) -> Option<pf_client_core::video::VulkanDecodeDevice> {
         self.video_export.clone()
     }
 
-    /// Full device idle — TEARDOWN ONLY, and only after the session pump thread has
-    /// been joined (it submits decode work; wait-idle's external-sync rule
-    /// covers every queue on the device). Mid-session code uses the fence quiesce.
-    /// The queue lock is held as cheap insurance against a straggling submitter.
+    /// Full device idle. Teardown only, and only after the session pump thread has been
+    /// joined (it submits decode work). Mid-session code uses the fence. The queue lock
+    /// is held against a straggling submitter.
     pub fn wait_idle(&self) {
         let _q = self.queue_lock.guard();
         // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
@@ -305,20 +236,18 @@ impl Presenter {
         unsafe { self.device.device_wait_idle() }.ok();
     }
 
-    /// True when `VK_KHR_present_wait` drives the display stamp — the run loop then
-    /// defers its e2e/display windows to [`Presenter::take_presented_samples`] instead
-    /// of stamping at `present()` return.
+    /// True when `VK_KHR_present_wait` drives the display stamp. The run loop then
+    /// defers e2e/display windows to [`Presenter::take_presented_samples`].
     pub(crate) fn present_timing_active(&self) -> bool {
         self.present_timer.is_some()
     }
 
     /// Claim the just-submitted present for on-glass timing. Call right after a
-    /// `present()` that returned `true`, with that frame's capture + decode stamps
-    /// (the presenter itself never sees them). No-op when timing is inactive.
+    /// `present()` that returned `true`, with that frame's capture + decode stamps.
+    /// No-op when timing is inactive.
     pub(crate) fn note_presented(&mut self, pts_ns: u64, decoded_ns: u64) {
         if let (Some(t), Some((sc, id))) = (&self.present_timer, self.last_presented.take()) {
-            // The submit stamp: `present()` already returned, so "now" is within the
-            // present-call tail — the pace/latch split point.
+            // Submit stamp: `present()` has returned, so "now" is the present-call tail.
             t.enqueue(
                 sc,
                 id,
@@ -335,18 +264,15 @@ impl Presenter {
         self.present_timer.as_ref().map_or(0, |t| t.outstanding())
     }
 
-    /// Install the run loop's wake for present completions (an SDL event push). No-op
-    /// without present timing — there is nothing to wake on then.
+    /// Run-loop wake for present completions (SDL event push). No-op without timing.
     pub(crate) fn set_present_wake(&self, cb: Box<dyn Fn() + Send>) {
         if let Some(t) = &self.present_timer {
             t.set_wake(cb);
         }
     }
 
-    /// The live swapchain present mode, for the stats overlay: a mode is picked from
-    /// what the surface actually offers, so the requested one and this can differ (a
-    /// MAILBOX request lands on FIFO wherever the driver has no mailbox — AMD's Windows
-    /// driver, notably). Showing it is what makes that visible instead of puzzling.
+    /// Active swapchain present mode for the stats overlay. Can differ from the request
+    /// when the surface does not offer it.
     pub(crate) fn present_mode_name(&self) -> &'static str {
         match self.present_mode {
             vk::PresentModeKHR::MAILBOX => "mailbox",
@@ -358,13 +284,9 @@ impl Presenter {
         }
     }
 
-    /// The active present mode QUEUES presents — the only modes where the swapchain
-    /// itself can become a standing queue, and so the only ones the glass gate governs.
-    ///
-    /// MAILBOX and IMMEDIATE replace/flip and never queue. Nor does
-    /// `FIFO_LATEST_READY`, which retires stale images in the driver: gating on top of it
-    /// would hold frames back to emulate something the presentation engine is already
-    /// doing, paying the serialisation twice.
+    /// True when the swapchain itself can queue presents — the only modes the glass gate
+    /// governs. MAILBOX, IMMEDIATE, and `FIFO_LATEST_READY` replace or drop stale images
+    /// in the driver; gating on top would serialise twice.
     pub(crate) fn needs_glass_gate(&self) -> bool {
         matches!(
             self.present_mode,
@@ -372,11 +294,9 @@ impl Presenter {
         )
     }
 
-    /// The active present mode shows images ON THE VBLANK GRID — the premise the VRR
-    /// cadence probe rests on ("with VRR off, a present waits for vblank"). The whole
-    /// FIFO family qualifies, `FIFO_LATEST_READY` included: it drops stale images but
-    /// still presents on the refresh boundary. MAILBOX/IMMEDIATE do not, and under them
-    /// the probe reports Unknown rather than calling every session VRR.
+    /// True when presents land on the vblank grid — the VRR cadence probe's premise.
+    /// The whole FIFO family qualifies (`FIFO_LATEST_READY` drops stale images but still
+    /// presents on the refresh boundary). MAILBOX/IMMEDIATE do not.
     pub(crate) fn vblank_locked(&self) -> bool {
         matches!(
             self.present_mode,
@@ -386,7 +306,6 @@ impl Presenter {
         )
     }
 
-    /// Take the window's completed on-glass samples (empty when timing is inactive).
     pub(crate) fn take_presented_samples(&self) -> Vec<present_timing::PresentedSample> {
         self.present_timer
             .as_ref()
@@ -394,8 +313,8 @@ impl Presenter {
             .unwrap_or_default()
     }
 
-    /// The device handles the console-UI overlay renders on (§6.1). Valid for the
-    /// presenter's lifetime; the run loop drops the overlay first.
+    /// Device handles the overlay renders on. Valid for the presenter's lifetime; the
+    /// run loop drops the overlay first.
     pub fn shared_device(&self) -> SharedDevice {
         SharedDevice {
             entry: self.entry.clone(),
@@ -409,17 +328,12 @@ impl Presenter {
         }
     }
 
-    /// The Vulkan version an overlay renderer may size its function table to: the LOWER of
-    /// what our instance declared ([`INSTANCE_API_VERSION`]) and what the loader actually
-    /// provides.
+    /// Vulkan version an overlay renderer may size its function table to: the lower of
+    /// [`INSTANCE_API_VERSION`] and what the loader actually provides.
     ///
-    /// Both halves are load-bearing, in opposite directions. Taking only the loader's number
-    /// is the bug that killed the console UI in 0.28.0 — Mesa answers 1.4 where we asked for
-    /// 1.3, and the entry points in between resolve to null. Taking only ours would break the
-    /// mirror case: a loader older than 1.3 still accepts our 1.3 instance (1.1+ loaders treat
-    /// `apiVersion` as intent, not a contract), and claiming 1.3 to a renderer there promises
-    /// functions the loader has never heard of. The minimum is the only number that is true on
-    /// both sides.
+    /// Both halves are load-bearing. The loader can be newer than we declared — entry
+    /// points in between resolve to null. A 1.1+ loader can also accept our 1.3 instance
+    /// as intent without delivering 1.3. The minimum is the only number true on both sides.
     fn overlay_api_version(&self) -> u32 {
         // SAFETY: per the Vulkan contract above - `vkEnumerateInstanceVersion` is a global
         // command taking no handles, resolved through the loaded entry that owns it; it writes
@@ -433,21 +347,20 @@ impl Presenter {
 
 impl Drop for Presenter {
     fn drop(&mut self) {
-        // The present-wait waiter references the swapchain — stop it (its Drop joins
-        // after in-flight waits complete, bounded by their 250 ms cap) BEFORE the
-        // swapchain teardown below.
+        // The present-wait waiter holds the swapchain. Drop it (joins in-flight waits,
+        // 250 ms cap in `present_timing`) before swapchain teardown below.
         self.present_timer.take();
         // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
         // type and live for the call, and every builder struct is a local that outlives it.
         unsafe {
             {
-                // Insurance against a straggling submitter (the run loop joins the
-                // pump before dropping us, so this is normally uncontended).
+                // Against a straggling submitter. The run loop joins the pump first, so
+                // this is normally uncontended.
                 let _q = self.queue_lock.guard();
                 self.device.device_wait_idle().ok();
             }
             if let Some(f) = self.retired_hw.take() {
-                f.destroy(&self.device); // idle above — the GPU reads are done
+                f.destroy(&self.device); // GPU idle above — reads are done
             }
             if let Some(s) = self.staging.take() {
                 self.device.unmap_memory(s.memory);
@@ -485,7 +398,7 @@ impl Drop for Presenter {
             self.surface_i.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
         }
-        // `entry` (the libvulkan handle) drops last, after every vk call is done.
+        // `entry` (libvulkan) must outlive every vk call.
         let _ = &self.entry;
     }
 }
@@ -494,10 +407,6 @@ impl Drop for Presenter {
 mod tests {
     use super::*;
 
-    /// The 0.28.0 regression, as an assertion: a loader NEWER than the version we declared
-    /// must not raise the cap. Skia sized its function table to the loader's 1.4 here, then
-    /// could not resolve the entry points our 1.3 instance never exposed, and the console UI
-    /// refused to start (Steam Deck, Mesa loader 1.4.321).
     #[test]
     fn a_newer_loader_never_raises_the_cap() {
         let loader = vk::make_api_version(0, 1, 4, 321);
@@ -507,9 +416,8 @@ mod tests {
         );
     }
 
-    /// The mirror case, which is why this is a `min` and not "just use ours": a 1.1+ loader
-    /// accepts our 1.3 `apiVersion` as intent even when it cannot deliver 1.3, so promising
-    /// 1.3 to the overlay there would name functions the loader has never heard of.
+    /// A 1.1+ loader accepts our 1.3 `apiVersion` as intent even when it cannot deliver
+    /// 1.3, so the overlay must not be promised 1.3 functions the loader lacks.
     #[test]
     fn an_older_loader_lowers_the_cap() {
         let loader = vk::make_api_version(0, 1, 2, 198);
@@ -519,7 +427,6 @@ mod tests {
         );
     }
 
-    /// No `vkEnumerateInstanceVersion` at all is the one thing it can mean: a 1.0 loader.
     #[test]
     fn a_loader_that_cannot_answer_is_1_0() {
         assert_eq!(

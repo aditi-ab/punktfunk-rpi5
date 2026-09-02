@@ -1,21 +1,17 @@
-//! SEI payload parsing — the piece the vendored parser layer lacks: upstream classifies
-//! SEI NALUs but never reads a payload. punktfunk needs exactly one payload type per
-//! codec: the recovery point SEI, which hosts emit on RFI recovery so the client knows
-//! where a decode-from-here point lands. Every other payload type is skipped by its
-//! declared size.
+//! SEI payload parsing — the piece vendored cros-codecs lacks (it classifies SEI
+//! NALUs but never reads a payload). Only recovery-point SEI is parsed; every
+//! other payload type is skipped by its declared size.
 //!
-//! Both codecs put the recovery point at payload type 6 with the same D.1 message
-//! framing, but the payload syntax differs: H.264 (D.1.8/D.2.8) counts recovery in
-//! `frame_num` increments (`recovery_frame_cnt`, ue(v)) and carries a slice-group bit
-//! pair; H.265 (D.2.8/D.3.8) counts in picture order (`recovery_poc_cnt`, se(v) — it
-//! can be negative) and has no slice-group field. Hence two parsers over one shared
-//! message walk.
+//! Both codecs put recovery point at payload type 6 with the same D.1 framing;
+//! payload syntax differs. H.264 (D.1.8/D.2.8): `recovery_frame_cnt` in
+//! `frame_num` increments, ue(v), plus a slice-group bit pair. H.265 (D.2.8/D.3.8):
+//! `recovery_poc_cnt` in picture order, se(v), may be negative, no slice-group
+//! field. Two parsers, one shared message walk.
 
 /// Recovery point SEI (D.2.8).
 ///
-/// `recovery_frame_cnt` counts in `frame_num` increments from the AU carrying the SEI to
-/// the picture at which output is exact (`exact_match`) or approximate. `broken_link` set
-/// means pictures before the recovery point may be visually broken and must not be shown.
+/// `recovery_frame_cnt` is in `frame_num` increments, not POC. `broken_link` means
+/// pictures before the recovery point must not be shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryPoint {
     pub recovery_frame_cnt: u32,
@@ -23,12 +19,10 @@ pub struct RecoveryPoint {
     pub broken_link: bool,
 }
 
-/// Recovery point SEI, H.265 flavour (D.3.8).
+/// Recovery point SEI, H.265 (D.3.8).
 ///
-/// `recovery_poc_cnt` is the POC delta from the picture carrying the SEI to the
-/// recovery-point picture — se(v)-coded, so unlike H.264's `recovery_frame_cnt` it can
-/// be NEGATIVE (a recovery point among leading pictures). `exact_match`/`broken_link`
-/// keep their H.264 semantics.
+/// `recovery_poc_cnt` is a POC delta, se(v), so it can be negative (a recovery
+/// point among leading pictures). `exact_match` / `broken_link` match H.264.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryPointHevc {
     pub recovery_poc_cnt: i32,
@@ -36,11 +30,10 @@ pub struct RecoveryPointHevc {
     pub broken_link: bool,
 }
 
-/// Parse the first recovery point SEI message out of an H.264 SEI NALU.
+/// First recovery-point SEI in an H.264 SEI NALU.
 ///
-/// `sei_payload` are the bytes of the NALU after its one-byte NAL header, emulation
-/// prevention bytes still in place (they are removed here — 7.4.1 RBSP extraction).
-/// `Ok(None)` means the NALU parsed cleanly but carries no recovery point.
+/// `sei_payload` starts after the one-byte NAL header; emulation-prevention bytes
+/// are still in place (stripped here, 7.4.1). `Ok(None)`: parsed, no recovery point.
 pub fn parse_recovery_point(sei_payload: &[u8]) -> Result<Option<RecoveryPoint>, String> {
     let rbsp = strip_emulation_prevention(sei_payload);
     let Some(payload) = first_recovery_point_payload(&rbsp)? else {
@@ -51,8 +44,7 @@ pub fn parse_recovery_point(sei_payload: &[u8]) -> Result<Option<RecoveryPoint>,
     let recovery_frame_cnt = r.read_ue()?;
     let exact_match = r.read_bit()? != 0;
     let broken_link = r.read_bit()? != 0;
-    // changing_slice_group_idc u(2): parsed to keep the reader honest, unused —
-    // slice groups are outside every profile punktfunk hosts emit.
+    // changing_slice_group_idc u(2): consume so the cursor stays aligned; hosts never emit slice groups.
     let _changing_slice_group_idc = r.read_bits(2)?;
     Ok(Some(RecoveryPoint {
         recovery_frame_cnt,
@@ -61,12 +53,11 @@ pub fn parse_recovery_point(sei_payload: &[u8]) -> Result<Option<RecoveryPoint>,
     }))
 }
 
-/// Parse the first recovery point SEI message out of an H.265 prefix SEI NALU.
+/// First recovery-point SEI in an H.265 prefix SEI NALU (type 39).
 ///
-/// `sei_payload` are the bytes of the NALU after its TWO-byte NAL header (H.265 NALU
-/// headers are 16 bits), emulation prevention still in place. Only prefix SEI NALUs
-/// (type 39) can carry a recovery point — D.2.1 lists it as prefix-only, so suffix SEI
-/// NALUs (type 40) need never reach here.
+/// `sei_payload` starts after the two-byte NAL header; emulation-prevention still
+/// in place. D.2.1 lists recovery point as prefix-only; type-40 suffix must not
+/// reach here.
 pub fn parse_recovery_point_hevc(sei_payload: &[u8]) -> Result<Option<RecoveryPointHevc>, String> {
     let rbsp = strip_emulation_prevention(sei_payload);
     let Some(payload) = first_recovery_point_payload(&rbsp)? else {
@@ -84,17 +75,13 @@ pub fn parse_recovery_point_hevc(sei_payload: &[u8]) -> Result<Option<RecoveryPo
     }))
 }
 
-/// Walk the D.1 SEI message framing (shared verbatim between H.264 and H.265) and
-/// return the payload bytes of the first recovery point message (payload type 6 in
-/// both codecs), if any. `rbsp` is already emulation-prevention-stripped.
+/// First recovery-point payload (type 6) from D.1 message framing, shared by
+/// H.264 and H.265. `rbsp` is already emulation-prevention-stripped.
 fn first_recovery_point_payload(rbsp: &[u8]) -> Result<Option<&[u8]>, String> {
     let mut i = 0usize;
     while i < rbsp.len() && !is_rbsp_trailing(rbsp, i) {
-        // D.1: payload type and size are ff-coded — 0xFF bytes each add 255 until a
-        // non-0xFF byte terminates the value. The run length is unbounded, so the type
-        // accumulates saturating: an adversarial ~16M-byte 0xFF run must not overflow
-        // (a saturated type simply never matches 6). The size accumulator is a usize
-        // whose use is bounds-checked below.
+        // D.1 ff-coding: type saturates so a huge 0xFF run cannot overflow (a
+        // saturated type never matches 6). Size is a bounds-checked usize.
         let mut payload_type = 0u32;
         while i < rbsp.len() && rbsp[i] == 0xFF {
             payload_type = payload_type.saturating_add(255);
@@ -132,8 +119,7 @@ fn first_recovery_point_payload(rbsp: &[u8]) -> Result<Option<&[u8]>, String> {
     Ok(None)
 }
 
-/// 7.4.1: within the RBSP, `00 00 03` encodes two zero bytes; the `03` is the emulation
-/// prevention byte and is dropped.
+/// 7.4.1: `00 00 03` encodes two zeros; drop the `03`.
 fn strip_emulation_prevention(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     let mut zeros = 0usize;
@@ -148,17 +134,16 @@ fn strip_emulation_prevention(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `more_rbsp_data()` at a byte-aligned message boundary: the remainder is trailing bits
-/// iff it is the stop bit (0x80) followed by nothing but zero bytes.
+/// Byte-aligned `more_rbsp_data()`: stop bit 0x80, then only zeros.
 fn is_rbsp_trailing(rbsp: &[u8], i: usize) -> bool {
     rbsp[i] == 0x80 && rbsp[i + 1..].iter().all(|&b| b == 0)
 }
 
-/// Minimal MSB-first bit reader over an already-unescaped RBSP slice. The vendored
-/// `BitReader` is `pub(crate)` to the vendored crate, so this crate carries its own.
+/// MSB-first bit reader over an unescaped RBSP slice. Vendored `BitReader` is
+/// `pub(crate)` to that crate, so this one is local.
 struct BitCursor<'a> {
     data: &'a [u8],
-    /// Position in bits from the start of `data`.
+    /// Bit offset into `data` (not a byte index).
     pos: usize,
 }
 
@@ -201,7 +186,7 @@ impl<'a> BitCursor<'a> {
             .ok_or_else(|| "exp-Golomb value overflows u32".to_string())
     }
 
-    /// se(v), spec 9.1.1: the ue(v) code point k maps to (−1)^(k+1) · ⌈k/2⌉.
+    /// se(v), spec 9.1.1: k → (−1)^(k+1) · ⌈k/2⌉.
     fn read_se(&mut self) -> Result<i32, String> {
         let k = self.read_ue()?;
         let magnitude = k.div_ceil(2);
@@ -217,8 +202,7 @@ mod tests {
 
     #[test]
     fn a_minimal_recovery_point_message_parses_to_its_field_values() {
-        // Message: type 6, size 1. Payload bits: ue(0)='1', exact=0, broken=0, csg=00,
-        // then payload alignment '1' + zeros -> 0b1000_0100. NALU trailing 0x80.
+        // type 6, size 1; ue(0)='1', exact=0, broken=0, csg=00, align → 0x84; trailing 0x80.
         let sei = [0x06, 0x01, 0x84, 0x80];
         assert_eq!(
             parse_recovery_point(&sei).unwrap(),
@@ -246,8 +230,6 @@ mod tests {
 
     #[test]
     fn earlier_messages_and_ff_coded_types_are_skipped_to_reach_the_recovery_point() {
-        // First message: ff-coded payload type 255 (0xFF 0x00), size 1, payload 0x55.
-        // Second message: type 5 (user data), size 3. Third: the recovery point.
         let sei = [
             0xFF, 0x00, 0x01, 0x55, // type 255
             0x05, 0x03, 0xAA, 0xBB, 0xCC, // type 5
@@ -266,9 +248,8 @@ mod tests {
 
     #[test]
     fn emulation_prevention_bytes_inside_the_payload_are_removed_before_reading() {
-        // Unescaped payload (7 bytes): ue with a 22-zero prefix => recovery_frame_cnt
-        // 2^22-1 = 4194303, exact=1, broken=0, csg=00, alignment. Its first bytes are
-        // 00 00 02, which the escaper must have written as 00 00 03 02 on the wire.
+        // 22 leading zeros → recovery_frame_cnt = 2^22-1. Unescaped 00 00 02 becomes
+        // 00 00 03 02 on the wire.
         let sei = [
             0x06, 0x07, 0x00, 0x00, 0x03, 0x02, 0x00, 0x00, 0x04, 0x40, 0x80,
         ];
@@ -297,8 +278,7 @@ mod tests {
 
     #[test]
     fn the_hevc_recovery_point_parses_its_se_coded_poc_count() {
-        // recovery_poc_cnt se(0) = '1', exact = 0, broken = 0, payload alignment:
-        // 0b1001_0000.
+        // se(0)='1', exact=0, broken=0, align → 0x90.
         let sei = [0x06, 0x01, 0x90, 0x80];
         assert_eq!(
             parse_recovery_point_hevc(&sei).unwrap(),
@@ -309,8 +289,7 @@ mod tests {
             })
         );
 
-        // se(-1) = '011' (ue code point 2), exact = 1, broken = 0, alignment:
-        // 0b0111_0100 — the negative range H.264's ue(v) syntax cannot express.
+        // se(-1)='011' (ue k=2), exact=1, broken=0, align → 0x74. H.264 ue(v) cannot encode this.
         let sei = [0x06, 0x01, 0x74, 0x80];
         assert_eq!(
             parse_recovery_point_hevc(&sei).unwrap(),
@@ -324,8 +303,7 @@ mod tests {
 
     #[test]
     fn the_hevc_parser_skips_earlier_messages_and_reports_absence_as_none() {
-        // User-data message first, then the recovery point (poc_cnt se(3): ue code
-        // point 5 = '00110', exact = 1, broken = 1, alignment: 0b0011_0111).
+        // type 5 then recovery: se(3) k=5 → 0x37.
         let sei = [
             0x05, 0x02, 0xAA, 0xBB, // type 5
             0x06, 0x01, 0x37, // recovery point

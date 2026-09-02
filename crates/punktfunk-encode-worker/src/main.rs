@@ -1,22 +1,15 @@
-//! `punktfunk-encode-worker` — spawned by `punktfunk-host` for the duration of one PyroWave
-//! session, never run by hand. It reads its socket from the inherited fd 3 and speaks only to the
-//! parent that spawned it: no Wayland, no D-Bus, no network, no plugins.
+//! Linux helper spawned by `punktfunk-host` for one PyroWave session.
+//! The parent `dup2`s the socket onto fd 3 (`--fd` overrides); the run loop
+//! is [`pf_encode::worker`].
 //!
-//! Everything it does lives in [`pf_encode::worker`]; this file exists so the capability has a
-//! **file of its own** (see this crate's Cargo.toml for why that is not negotiable).
+//! Only this file may carry `cap_sys_nice=ep`. A hardlink or host subcommand
+//! shares the inode and the capability — see this crate's Cargo.toml.
 
-// This binary is the one that carries a CAPABILITY (`cap_sys_nice`), and the header above makes
-// a minimal-attack-surface claim: no Wayland, no D-Bus, no network, no plugins. `forbid` makes
-// the memory-safety half of that claim mechanical rather than aspirational — a capability-
-// carrying process is the last place a raw pointer should appear, and `forbid` (unlike `deny`)
-// cannot be re-opened by an `#[allow]` further down. The heavy lifting lives in
-// `pf_encode::worker`, which is a separate crate and keeps its own discipline.
+// `forbid`, not `deny`: an `#[allow]` below cannot reopen it.
 #![forbid(unsafe_code)]
 
 fn main() -> std::process::ExitCode {
-    // Stderr, inherited from the host, so the worker's lines land in the host's journal next to
-    // the session that spawned it. `RUST_LOG` is inherited too, so raising the host's level
-    // raises the worker's.
+    // Stderr is inherited from the host, so these lines land in the same journal.
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     tracing_subscriber::fmt()
@@ -30,17 +23,14 @@ fn main() -> std::process::ExitCode {
         match pf_encode::worker::run_from_args(&args) {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
-                // The host reads the dead socket long before it could read this, so the message is
-                // for a human running `journalctl` — say enough to place the failure.
+                // The host already saw the socket die; this line is for `journalctl`.
                 tracing::error!(error = %format!("{e:#}"), "punktfunk-encode-worker exiting");
                 std::process::ExitCode::FAILURE
             }
         }
     }
-    // Linux-only by construction: the worker exists for `VK_KHR_global_priority` under
-    // `CAP_SYS_NICE`, and the Windows host raises its GPU scheduling priority through WDDM
-    // instead (`D3DKMTSetProcessSchedulingPriorityClass`). Packaging never installs this
-    // elsewhere; the arm exists so a workspace build stays green on every platform.
+    // `VK_KHR_global_priority` + `CAP_SYS_NICE` is Linux. Windows uses WDDM
+    // (`D3DKMTSetProcessSchedulingPriorityClass`). Stub keeps the workspace green.
     #[cfg(not(target_os = "linux"))]
     {
         tracing::error!(

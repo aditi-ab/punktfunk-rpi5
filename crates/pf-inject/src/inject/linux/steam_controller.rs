@@ -1,23 +1,17 @@
-//! Virtual Steam Deck controller via UHID — the Steam analogue of the virtual DualSense
-//! ([`super::dualsense`]). A UHID device with Valve VID `28DE` / Deck PID `1205` is bound by the
-//! kernel `hid-steam` driver, which exposes a full Steam Deck gamepad evdev (incl. the four back
-//! grips) **plus** a separate IMU evdev, and — when Steam runs on the host — is re-grabbed by Steam
-//! Input with native glyphs + trackpad/gyro/back-button bindings.
+//! Virtual Steam Deck / Steam Controller on `/dev/uhid`.
 //!
-//! The transport-independent contract (descriptor, byte-exact serializer, the `XInput`/rich
-//! mappers, the rumble parser) lives in [`super::steam_proto`]; this module is the `/dev/uhid`
-//! plumbing + the two Steam-specific lifecycle quirks the DualSense path lacks:
+//! Valve VID `28DE` / Deck PID `1205` binds `hid-steam` (gamepad evdev including
+//! the four back grips, plus a separate IMU evdev). Steam Input re-grabs it when
+//! Steam runs. Descriptor, serializer, mappers, rumble parser: [`super::steam_proto`].
 //!
-//! 1. **`gamepad_mode` entry.** `steam_do_deck_input_event` early-returns under the default
-//!    `lizard_mode` until `gamepad_mode` is toggled on — which the kernel only does when the `b9.6`
-//!    Steam/menu-right button is held ~450 ms with no hidraw client open. So on the first pad we
-//!    best-effort clear `lizard_mode` via sysfs (needs root; bypasses the gate entirely) AND every
-//!    pad pulses `b9.6` for [`MODE_ENTER`] at creation. After that an **anti-toggle guard** caps any
-//!    continuous `b9.6` (a long in-game Start-hold) below the kernel's 450 ms threshold so play can
-//!    never accidentally flip `gamepad_mode` back off.
-//! 2. **`UHID_SET_REPORT`.** Steam feedback (`0xEB` rumble) + the kernel's settings/serial writes
-//!    arrive as FEATURE set-reports that MUST be answered `err = 0`, or the kernel stalls ~5 s per
-//!    command (the DualSense backend only services GET_REPORT + OUTPUT).
+//! Deck `hid-steam` drops events under default `lizard_mode` until `gamepad_mode`
+//! is on. The kernel toggles that only when `b9.6` is held ~450 ms with no hidraw
+//! client. This module writes sysfs `lizard_mode=N` (needs root) and pulses `b9.6`
+//! for [`MODE_ENTER`]. [`MENU_HOLD_CAP`] inserts a one-frame release so a long
+//! Start-hold cannot toggle off.
+//!
+//! Steam rumble (`0xEB`) and kernel settings writes are FEATURE SET_REPORT;
+//! answer `err = 0` or the kernel stalls ~5 s per command.
 
 use super::steam_proto::{
     btn, parse_steam_output, sc_from_gamepad, serial_reply, serialize_deck_state,
@@ -37,16 +31,13 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Hold the `b9.6` mode-switch this long at creation to toggle `gamepad_mode` on (the kernel needs
-/// ~450 ms continuous; give margin).
+/// ~450 ms of continuous `b9.6` toggles `gamepad_mode`; 650 ms is the margin.
 const MODE_ENTER: Duration = Duration::from_millis(650);
-/// Cap continuous `b9.6` (Start) below the kernel's 450 ms mode-switch threshold: after this long
-/// we insert a one-frame release so an in-game long-Start-hold can't toggle `gamepad_mode` off.
+/// Stay under the kernel's ~450 ms `b9.6` toggle; a one-frame release resets the timer.
 const MENU_HOLD_CAP: Duration = Duration::from_millis(350);
 
-/// Best-effort, once per process: clear `hid_steam`'s `lizard_mode` so `steam_do_deck_input_event`
-/// stops gating on `gamepad_mode` (gamepad events then always flow). Needs root; on failure the
-/// per-pad `b9.6` pulse + guard handle it instead.
+/// Once per process, write `hid_steam.lizard_mode=N` so Deck events are not gated. Needs root;
+/// on failure the per-pad `b9.6` pulse still enters `gamepad_mode`.
 fn try_clear_lizard_mode() {
     static TRIED: AtomicBool = AtomicBool::new(false);
     if TRIED.swap(true, Ordering::Relaxed) {
@@ -63,15 +54,13 @@ fn try_clear_lizard_mode() {
     }
 }
 
-/// A virtual Steam Deck **or classic Steam Controller** backed by `/dev/uhid` (same driver, two
-/// identities/report layouts — see [`SteamModel`]). Dropping it destroys the device (the kernel
-/// tears down the bound `hid-steam` interface + its evdevs).
+/// Virtual Steam Deck or classic Steam Controller on `/dev/uhid`. Drop unbinds `hid-steam`.
 pub struct SteamDeckPad {
     fd: File,
     model: SteamModel,
     seq: u32,
     created: Instant,
-    /// When `b9.6` started being continuously held in our OUTPUT (anti-toggle guard); `None` = not.
+    /// Continuous `b9.6` hold start for [`MENU_HOLD_CAP`]; `None` while released.
     menu_hold_since: Option<Instant>,
 }
 
@@ -80,9 +69,7 @@ impl SteamDeckPad {
         SteamDeckPad::open_model(index, SteamModel::Deck)
     }
 
-    /// Open under a specific Steam identity. The classic Controller's `ID_CONTROLLER_STATE` path
-    /// has NO `gamepad_mode` gate in the kernel (only the Deck's parser early-returns under
-    /// lizard mode), so the SC skips the whole mode-entry machinery.
+    /// Deck only: classic SC (`ID_CONTROLLER_STATE`) has no `gamepad_mode` gate.
     pub fn open_model(index: u8, model: SteamModel) -> Result<SteamDeckPad> {
         if model == SteamModel::Deck {
             try_clear_lizard_mode();
@@ -113,22 +100,22 @@ impl SteamDeckPad {
         };
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_CREATE2.to_ne_bytes());
-        put_cstr(&mut ev, 4, 128, &format!("Punktfunk {name} {index}")); // name[128]
-        put_cstr(&mut ev, 132, 64, &format!("punktfunk/{phys}/{index}")); // phys[64]
-        put_cstr(&mut ev, 196, 64, &format!("punktfunk-{uniq}-{index}")); // uniq[64]
-        ev[260..262].copy_from_slice(&(STEAMDECK_RDESC.len() as u16).to_ne_bytes()); // rd_size
-        ev[262..264].copy_from_slice(&BUS_USB.to_ne_bytes()); // bus
+        // uhid_create2_req at 4: name[128] phys[64] uniq[64] rd_size bus vid pid version country rd_data.
+        put_cstr(&mut ev, 4, 128, &format!("Punktfunk {name} {index}"));
+        put_cstr(&mut ev, 132, 64, &format!("punktfunk/{phys}/{index}"));
+        put_cstr(&mut ev, 196, 64, &format!("punktfunk-{uniq}-{index}"));
+        ev[260..262].copy_from_slice(&(STEAMDECK_RDESC.len() as u16).to_ne_bytes());
+        ev[262..264].copy_from_slice(&BUS_USB.to_ne_bytes());
         ev[264..268].copy_from_slice(&STEAM_VENDOR.to_ne_bytes());
         ev[268..272].copy_from_slice(&self.model.product().to_ne_bytes());
-        ev[272..276].copy_from_slice(&0x0100u32.to_ne_bytes()); // version
-        ev[276..280].copy_from_slice(&0u32.to_ne_bytes()); // country
+        ev[272..276].copy_from_slice(&0x0100u32.to_ne_bytes());
+        ev[276..280].copy_from_slice(&0u32.to_ne_bytes());
         ev[280..280 + STEAMDECK_RDESC.len()].copy_from_slice(STEAMDECK_RDESC);
         self.fd.write_all(&ev).context("write UHID_CREATE2")?;
         Ok(())
     }
 
-    /// Serialize `st` under this pad's model (Deck reports get the gamepad-mode entry overlay +
-    /// anti-toggle guard applied) and write it.
+    /// Deck: apply the mode-entry overlay and anti-toggle guard, then serialize.
     pub fn write_state(&mut self, st: &SteamState) -> Result<()> {
         self.seq = self.seq.wrapping_add(1);
         let mut r = [0u8; STEAM_REPORT_LEN];
@@ -143,20 +130,18 @@ impl SteamDeckPad {
 
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_INPUT2.to_ne_bytes());
-        ev[4..6].copy_from_slice(&(r.len() as u16).to_ne_bytes()); // input2.size
-        ev[6..6 + r.len()].copy_from_slice(&r); // input2.data
+        // uhid_input2_req: size u16 at 4, data at 6.
+        ev[4..6].copy_from_slice(&(r.len() as u16).to_ne_bytes());
+        ev[6..6 + r.len()].copy_from_slice(&r);
         self.fd.write_all(&ev).context("write UHID_INPUT2")?;
         Ok(())
     }
 
-    /// True while still pulsing the mode-switch at creation (the caller force-writes during this).
-    /// Deck-only — the SC's kernel parser has no mode gate.
+    /// Create-time `b9.6` pulse still running (Deck only).
     fn in_mode_entry(&self) -> bool {
         self.model == SteamModel::Deck && self.created.elapsed() < MODE_ENTER
     }
 
-    /// During mode entry, force `b9.6` held (override). Afterwards, pass the real buttons through but
-    /// drop `b9.6` for one frame whenever it's been continuously held past [`MENU_HOLD_CAP`].
     fn effective_buttons(&mut self, mut buttons: u64) -> u64 {
         if self.in_mode_entry() {
             return btn::STEAM_MENU_RIGHT;
@@ -166,7 +151,7 @@ impl SteamDeckPad {
             match self.menu_hold_since {
                 None => self.menu_hold_since = Some(now),
                 Some(since) if now.duration_since(since) >= MENU_HOLD_CAP => {
-                    buttons &= !btn::MENU; // one-frame release resets the kernel's mode-switch timer
+                    buttons &= !btn::MENU; // one-frame release; kernel ~450 ms toggle timer resets
                     self.menu_hold_since = None;
                 }
                 Some(_) => {}
@@ -177,9 +162,8 @@ impl SteamDeckPad {
         buttons
     }
 
-    /// Service the device, non-blocking: answer the kernel's GET_REPORT (serial) + SET_REPORT
-    /// (settings / rumble — ack `err=0`) and parse any rumble feedback (`0xEB`, on either the
-    /// SET_REPORT or OUTPUT path) into `(low, high)` for the universal rumble plane.
+    /// Non-blocking. Ack GET_REPORT (serial) and SET_REPORT (`err=0` or the kernel stalls ~5 s).
+    /// Parse `0xEB` rumble from SET_REPORT or OUTPUT.
     pub fn service(&mut self) -> Option<(u16, u16)> {
         let mut rumble = None;
         let mut ev = [0u8; UHID_EVENT_SIZE];
@@ -201,17 +185,13 @@ impl SteamDeckPad {
                 }
                 UHID_SET_REPORT => {
                     let id = request_id(&ev);
-                    // SET_REPORT data: [report-id 0, cmd, …]. Take exactly the bytes the kernel
-                    // declared — this used to read a fixed 16-byte window, which truncated any
-                    // longer report and, for a shorter one, fed the parser whatever the reused
-                    // event buffer still held past the payload. Every sibling backend that parses
-                    // SET_REPORT already read the size field; this one didn't.
+                    // Kernel-declared size; a fixed window truncates or parses leftover bytes in this reused buffer.
                     if let Some(r) = parse_steam_output(set_report_data(&ev)).rumble {
                         rumble = Some(r);
                     }
                     let _ = self.reply_set_report(id);
                 }
-                _ => {} // Start/Stop/Open/Close — ignore
+                _ => {}
             }
         }
         rumble
@@ -220,8 +200,9 @@ impl SteamDeckPad {
     fn reply_get_report(&mut self, id: u32, data: &[u8]) -> Result<()> {
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_GET_REPORT_REPLY.to_ne_bytes());
+        // uhid_get_report_reply_req: id u32 [4..8], err u16 [8..10], size u16 [10..12], data [12..].
         ev[4..8].copy_from_slice(&id.to_ne_bytes());
-        ev[8..10].copy_from_slice(&0u16.to_ne_bytes()); // err 0
+        ev[8..10].copy_from_slice(&0u16.to_ne_bytes());
         ev[10..12].copy_from_slice(&(data.len() as u16).to_ne_bytes());
         ev[12..12 + data.len()].copy_from_slice(data);
         self.fd.write_all(&ev).context("UHID_GET_REPORT_REPLY")?;
@@ -231,8 +212,9 @@ impl SteamDeckPad {
     fn reply_set_report(&mut self, id: u32) -> Result<()> {
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_SET_REPORT_REPLY.to_ne_bytes());
+        // uhid_set_report_reply_req: id u32 [4..8], err u16 [8..10].
         ev[4..8].copy_from_slice(&id.to_ne_bytes());
-        ev[8..10].copy_from_slice(&0u16.to_ne_bytes()); // err 0 (ack)
+        ev[8..10].copy_from_slice(&0u16.to_ne_bytes());
         self.fd.write_all(&ev).context("UHID_SET_REPORT_REPLY")?;
         Ok(())
     }
@@ -246,11 +228,8 @@ impl Drop for SteamDeckPad {
     }
 }
 
-/// The transport a manager pad drives. UHID is universal but Steam Input won't promote it (a UHID
-/// device has no USB interface number, `Interface: -1`); the USB **gadget** (`raw_gadget`, SteamOS)
-/// and **usbip** (`vhci_hcd`, universal) both present the controller on USB interface 2, which Steam
-/// Input *does* promote. Selected per-pad by [`open_transport`]. (`pub`: the type appears as
-/// `type Pad` in the `PadProto` impl, a public trait.)
+/// Per-pad transport from [`open_transport`]. UHID reports `Interface: -1`, so Steam
+/// Input will not promote it. Gadget and usbip present USB interface 2, which Steam Input promotes.
 pub enum DeckTransport {
     Uhid(SteamDeckPad),
     Gadget(crate::steam_gadget::SteamDeckGadget),
@@ -276,20 +255,15 @@ impl DeckTransport {
     }
     fn in_mode_entry(&self) -> bool {
         match self {
-            // Only the UHID pad needs the gamepad-mode entry pulse: the promoted transports are
-            // read raw via hidraw by Steam Input, which bypasses the kernel's evdev mode gate.
+            // Steam Input hidraw-reads promoted transports and bypasses hid-steam's evdev mode gate.
             DeckTransport::Uhid(p) => p.in_mode_entry(),
             DeckTransport::Gadget(_) | DeckTransport::Usbip(_) => false,
         }
     }
 }
 
-/// One-shot diagnostic: InputPlumber (shipped and enabled by default on Bazzite) hidraw-grabs
-/// controllers it decides to manage and re-emits them under a different identity — historically
-/// the Deck config re-emitted an Xbox Elite pad with the trackpads routed to a mouse target. If
-/// it grabs our virtual Deck, everything downstream of hid-steam looks wrong (trackpads surface
-/// as a stick/mouse, gyro vanishes) while punktfunk's own logs stay clean — so name the suspect
-/// up front. Best-effort process-name scan; no dependency on its D-Bus API.
+/// InputPlumber hidraw-grabs managed pads and re-emits them under another identity.
+/// A grab remaps the Deck (trackpads as stick/mouse, gyro gone). One-shot `/proc` comm scan.
 fn warn_if_inputplumber() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static ONCE: AtomicBool = AtomicBool::new(true);
@@ -314,15 +288,11 @@ fn warn_if_inputplumber() {
     }
 }
 
-/// Open the best Steam-Input-promotable Deck transport available, in preference order:
-/// **`raw_gadget` (SteamOS validated fast-path) → `usbip`/`vhci_hcd` (universal, Secure-Boot-clean)
-/// → UHID (universal, but `Interface: -1` so Steam Input won't promote it).** Each rung degrades to
-/// the next on failure, so a host lacking the gadget modules still gets a *promotable* Deck via
-/// usbip, and one lacking both still gets a working (if non-promoted) UHID pad.
+/// Steam-Input-promotable Deck: `raw_gadget` → `usbip`/`vhci_hcd` → UHID.
+/// UHID works everywhere; `Interface: -1` so Steam Input will not promote it.
 fn open_transport(idx: u8) -> Result<DeckTransport> {
     warn_if_inputplumber();
     use crate::{steam_gadget, steam_usbip};
-    // 1. raw_gadget — the validated SteamOS fast-path (default on there).
     if steam_gadget::gadget_preferred() {
         steam_gadget::ensure_modules();
         match steam_gadget::SteamDeckGadget::open(idx) {
@@ -338,7 +308,6 @@ fn open_transport(idx: u8) -> Result<DeckTransport> {
             }
         }
     }
-    // 2. usbip/vhci_hcd — the universal, in-tree, Secure-Boot-clean transport (default on elsewhere).
     if steam_usbip::usbip_preferred() {
         match steam_usbip::SteamDeckUsbip::open(idx) {
             Ok(u) => return Ok(DeckTransport::Usbip(u)),
@@ -347,12 +316,6 @@ fn open_transport(idx: u8) -> Result<DeckTransport> {
             }
         }
     }
-    // 3. UHID — universal fallback (works everywhere; Steam Input won't promote it). This is a
-    // DEGRADED outcome, not a normal one: a UHID device has no USB interface number (Interface: -1),
-    // so Steam Input ignores it and the controller never appears in Game Mode / can't navigate.
-    // Reaching here almost always means `vhci_hcd` isn't loaded (the host runs unprivileged and
-    // can't modprobe it) — load it at boot (packaging ships modules-load.d/punktfunk.conf +
-    // 60-punktfunk.rules; on a systemd-sysext host `punktfunk-sysext` mirrors both into /etc).
     let p = SteamDeckPad::open(idx)?;
     tracing::warn!(
         index = idx,
@@ -363,11 +326,9 @@ fn open_transport(idx: u8) -> Result<DeckTransport> {
     Ok(DeckTransport::Uhid(p))
 }
 
-/// The Steam-Deck-specific half of the shared stateful manager (see [`PadProto`]): the transport
-/// open (usbip → gadget → UHID fallback via [`open_transport`], which logs its own per-transport
-/// outcome), the [`SteamState`] mappers, and the kernel-handshake service pass. Lifecycle (slot
-/// table, unplug sweep, heartbeat, rumble dedup) lives in [`UhidManager`]; the gamepad-mode-entry
-/// pulse rides the [`force_heartbeat`](PadProto::force_heartbeat) hook.
+/// Deck [`PadProto`]: [`open_transport`], [`SteamState`] mappers, handshake `service`.
+/// Slot table / unplug / heartbeat / rumble dedup live in [`UhidManager`]. Mode-entry
+/// pulse rides [`force_heartbeat`](PadProto::force_heartbeat).
 #[derive(Default)]
 pub struct SteamProto;
 
@@ -386,8 +347,7 @@ impl PadProto for SteamProto {
         SteamState::neutral()
     }
 
-    /// Merge buttons/sticks/triggers, preserving the rich-plane fields (trackpad + motion arrive
-    /// separately and must survive a button-only frame).
+    /// Keep prev trackpad + motion; those arrive on the rich plane.
     fn merge_frame(
         &self,
         prev: &SteamState,
@@ -409,10 +369,7 @@ impl PadProto for SteamProto {
         s.gyro = prev.gyro;
         s.accel = prev.accel;
         s.buttons |= prev.buttons & (btn::RPAD_TOUCH | btn::LPAD_TOUCH);
-        // Trackpad CLICK arrives on the rich plane too and must survive a button-only frame,
-        // exactly like touch/coords/motion above. It lives in its own fields (not `buttons`,
-        // which `from_gamepad` just rebuilt) so preserving it can't strand the BTN_TOUCHPAD
-        // wire-button's RPAD_CLICK — the two are OR'd only at serialize.
+        // Click is its own field, not `buttons`. Serialize ORs `RPAD_CLICK`; preserving it cannot strand wire BTN_TOUCHPAD.
         s.lpad_click = prev.lpad_click;
         s.rpad_click = prev.rpad_click;
         s
@@ -434,49 +391,37 @@ impl PadProto for SteamProto {
         pad.write_state(st);
     }
 
-    /// Answer the kernel handshake and forward rumble on the universal plane. The Steam Deck has
-    /// no rich host→client feedback plane (no lightbar / adaptive triggers), so `hidout` stays
-    /// empty.
+    /// Handshake + rumble. No host→client rich feedback, so `hidout` stays empty.
     fn service(&self, pad: &mut DeckTransport, _idx: u8) -> PadFeedback {
         let rumble = pad.service();
         PadFeedback {
             // No trigger motors on this protocol — see `PadFeedback::rumble`.
             rumble: rumble.map(|(low, high)| (low, high, 0, 0)),
             hidout: Vec::new(),
-            // Rumble-plane liveness: a `0xEB` rumble command this poll. Steam Input drives this
-            // pad over hidraw (the same abandonment semantics as the Windows Deck backend), so
-            // the shared abandoned-rumble force-off applies.
+            // `Some` iff `0xEB` this poll. Arms abandoned-rumble force-off; hidraw never surfaces a stop.
             rumble_drove: Some(rumble.is_some()),
             resync: false,
         }
     }
 
-    /// Force a steady stream while a pad is still pulsing its gamepad-mode entry (so the `b9.6`
-    /// toggle completes even with no game input).
+    /// Keep writing while the create-time `b9.6` pulse is still running.
     fn force_heartbeat(&self, pad: &DeckTransport) -> bool {
         pad.in_mode_entry()
     }
 }
 
-/// All virtual Steam Deck pads of a session — the Steam analogue of
-/// [`DualSenseManager`](super::dualsense::DualSenseManager), selected with
-/// `PUNKTFUNK_GAMEPAD=steamdeck`. Button/stick frames arrive via `handle`; the trackpads + motion
-/// via `apply_rich`; `pump` services the kernel handshake + routes rumble back; `heartbeat` keeps
-/// the pad alive (and drives the mode-entry pulse) — all from the shared [`UhidManager`].
+/// Session Steam Deck pads (`PUNKTFUNK_GAMEPAD=steamdeck`).
 pub type SteamControllerManager = UhidManager<SteamProto>;
 
-/// The **classic Steam Controller** half of the shared stateful manager: the same `hid-steam`
-/// driver under the wired-SC identity (`28DE:1102`, `ID_CONTROLLER_STATE`), UHID-only in v1 —
-/// the usbip/gadget transports present the Deck's captured 3-interface USB device, and the SC's
-/// wired interface layout hasn't been captured, so there is no Steam-Input promotion (the same
-/// degraded-but-working state the Deck had pre-usbip; acceptable for discontinued hardware).
+/// Classic Steam Controller [`PadProto`]. `hid-steam` under wired-SC identity `28DE:1102`
+/// (`ID_CONTROLLER_STATE`). UHID only: usbip/gadget present the Deck's 3-interface USB
+/// layout, which Steam Input will not promote as an SC.
 ///
-/// Deltas vs the Deck (see [`sc_from_gamepad`]/[`serialize_sc_state`]): one stick + two pads +
-/// two grips — the wire right stick drives the right pad, a left-pad contact shadows the left
-/// stick, wire PADDLE1/2 land on the two grips (3/4 fold via the remap policy), and the kernel
-/// registers neither FF rumble nor a sensors evdev for this model (feedback stays empty).
+/// One stick + two pads + two grips ([`sc_from_gamepad`]/[`serialize_sc_state`]):
+/// wire right stick drives the right pad; left-pad contact shadows the left stick;
+/// PADDLE1/2 land on the two grips (3/4 fold via remap). No FF, no sensors evdev.
 pub struct ScProto {
-    /// Fallback policy for the wire paddles beyond the SC's two grips (PADDLE3/4).
+    /// Fold for wire paddles beyond the SC's two grips (PADDLE3/4).
     remap: crate::steam_remap::RemapConfig,
 }
 
@@ -508,9 +453,8 @@ impl PadProto for ScProto {
         SteamState::neutral()
     }
 
-    /// Merge buttons/sticks/triggers, preserving the rich-plane fields. PADDLE1/2 map natively to
-    /// the SC's two grips inside [`sc_from_gamepad`]; only 3/4 go through the fold policy — mask
-    /// the native pair out of the fold input so the policy can't double-fire them.
+    /// PADDLE1/2 map natively in [`sc_from_gamepad`]. Mask them out of the fold so 3/4 cannot
+    /// double-fire the same grips.
     fn merge_frame(
         &self,
         prev: &SteamState,
@@ -537,9 +481,7 @@ impl PadProto for ScProto {
         s.accel = prev.accel;
         s.buttons |= prev.buttons & btn::LPAD_TOUCH;
         s.lpad_click = prev.lpad_click;
-        // The right pad carries the wire right stick each frame; a rich right-pad contact
-        // (TouchpadEx surface 2) overrides it only while the stick is centered — the stick is
-        // the primary camera surface on this mapping.
+        // Right pad is the wire right stick; a rich contact (TouchpadEx surface 2) overrides only while the stick is centered.
         if f.rs_x == 0 && f.rs_y == 0 {
             s.rpad_x = prev.rpad_x;
             s.rpad_y = prev.rpad_y;
@@ -565,33 +507,27 @@ impl PadProto for ScProto {
         let _ = pad.write_state(st);
     }
 
-    /// Answer the kernel handshake (serial GET_REPORT + settings SET_REPORTs). The kernel
-    /// registers no FF device for the classic SC, so rumble feedback can only arrive from a
-    /// hidraw client (`0xEB`) — surfaced if it ever does.
+    /// Serial GET_REPORT + settings SET_REPORT. No FF device; rumble only from hidraw `0xEB`.
     fn service(&self, pad: &mut SteamDeckPad, _idx: u8) -> PadFeedback {
         let rumble = pad.service();
         PadFeedback {
             // No trigger motors on this protocol — see `PadFeedback::rumble`.
             rumble: rumble.map(|(low, high)| (low, high, 0, 0)),
             hidout: Vec::new(),
-            // Rumble-plane liveness: the kernel registers no FF device for the classic SC, so
-            // rumble only ever arrives from a hidraw writer (`0xEB`) — which is exactly the
-            // writer class the shared abandoned-rumble force-off exists for.
+            // `Some` iff hidraw `0xEB` this poll. Arms abandoned-rumble force-off; hidraw never surfaces a stop.
             rumble_drove: Some(rumble.is_some()),
             resync: false,
         }
     }
 }
 
-/// All virtual classic Steam Controllers of a session — `PUNKTFUNK_GAMEPAD=steamcontroller`, or
-/// the per-pad kind a client declares for a physical SC.
+/// Session classic Steam Controllers (`PUNKTFUNK_GAMEPAD=steamcontroller`).
 pub type SteamCtrlManager = UhidManager<ScProto>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Find the evdev node for a kernel input device by exact name (e.g. `"Steam Deck"`).
     fn find_node(name: &str) -> Option<String> {
         let devs = std::fs::read_to_string("/proc/bus/input/devices").ok()?;
         for block in devs.split("\n\n") {
@@ -612,7 +548,6 @@ mod tests {
         None
     }
 
-    /// Read the evdev's current key bitmap (`EVIOCGKEY`) and test whether `code` is down.
     fn key_is_down(node: &str, code: u16) -> bool {
         use std::os::unix::io::AsRawFd;
         let Ok(f) = std::fs::File::open(node) else {
@@ -620,30 +555,26 @@ mod tests {
         };
         let mut bits = [0u8; 96];
         const EVIOCGKEY: libc::c_ulong = (2 << 30) | (96 << 16) | (0x45 << 8) | 0x18;
-        // SAFETY: EVIOCGKEY copies the current key-state bitmap of the evdev behind the valid fd
-        // `f` into `bits`; 96 bytes covers KEY_MAX/8, so the kernel never writes past the buffer.
+        // SAFETY: `f` is a valid evdev fd. EVIOCGKEY copies the key-state bitmap into `bits`.
+        // 96 bytes is KEY_MAX/8, so the kernel never writes past the buffer.
         let rc = unsafe { libc::ioctl(f.as_raw_fd(), EVIOCGKEY, bits.as_mut_ptr()) };
         rc >= 0 && (bits[(code / 8) as usize] >> (code % 8)) & 1 == 1
     }
 
-    /// Read the current value of an absolute axis (`EVIOCGABS`) — the first `i32` of `input_absinfo`.
     fn abs_value(node: &str, abs: u16) -> Option<i32> {
         use std::os::unix::io::AsRawFd;
         let f = std::fs::File::open(node).ok()?;
         let mut info = [0u8; 24]; // struct input_absinfo { value, min, max, fuzz, flat, resolution }
         let req: libc::c_ulong =
             (2 << 30) | (24 << 16) | (0x45 << 8) | (0x40 + abs as libc::c_ulong);
-        // SAFETY: EVIOCGABS fills the 24-byte input_absinfo for the valid evdev fd `f`; we read only
-        // the leading i32 `value`. The buffer is exactly sizeof(input_absinfo), so no overflow.
+        // SAFETY: `f` is a valid evdev fd. EVIOCGABS writes 24-byte `input_absinfo` into `info`.
+        // We read only the leading i32 `value`; the buffer is exactly that size.
         let rc = unsafe { libc::ioctl(f.as_raw_fd(), req, info.as_mut_ptr()) };
         (rc >= 0).then(|| i32::from_ne_bytes([info[0], info[1], info[2], info[3]]))
     }
 
-    /// On-box smoke test for the real backend: a `SteamDeckPad` must bind `hid-steam` (creating both
-    /// the gamepad + IMU evdevs), enter `gamepad_mode` via the creation pulse, and land a held button
-    /// on the evdev (`BTN_A`, code 0x130) — proving the entry overlay + byte-exact serialize path —
-    /// then tear the device down on drop. Touches `/dev/uhid`, so it is `#[ignore]`d in CI; run on a
-    /// box with `hid-steam` + `input`-group access: `cargo test -p punktfunk-host -- --ignored`.
+    /// Bind `hid-steam` (gamepad + IMU), enter `gamepad_mode` via the create pulse, land
+    /// BTN_A and left-pad ABS_HAT0X, tear down on drop. Needs `hid-steam` + `input` group.
     #[test]
     #[ignore = "creates a real /dev/uhid device; needs hid-steam + the input group"]
     fn backend_binds_and_input_flows() {
@@ -651,9 +582,7 @@ mod tests {
         const BTN_A: u16 = 0x130;
         const ABS_HAT0X: u16 = 0x10; // left trackpad X
         let mut pad = SteamDeckPad::open(0).expect("open SteamDeckPad (/dev/uhid + input group?)");
-        // Drive the full M3 wire path: build state through `from_gamepad` (BTN_A + the L4 back grip)
-        // and `apply_rich` (a left-pad TouchpadEx contact), then hold it past MODE_ENTER (the b9.6
-        // pulse), servicing the handshake.
+        // Past MODE_ENTER so the b9.6 pulse finishes and the handshake is serviced.
         let mut st = SteamState::from_gamepad(gs::BTN_A | gs::BTN_PADDLE2, 0, 0, 0, 0, 0, 0);
         st.apply_rich(RichInput::TouchpadEx {
             pad: 0,
@@ -682,7 +611,6 @@ mod tests {
             key_is_down(&node, BTN_A),
             "BTN_A not down — gamepad_mode entry or serialize failed"
         );
-        // The left trackpad contact (TouchpadEx surface 1, gated on LPAD_TOUCH) reaches ABS_HAT0X.
         assert_eq!(
             abs_value(&node, ABS_HAT0X),
             Some(-8000),
@@ -697,10 +625,8 @@ mod tests {
         );
     }
 
-    /// On-box smoke for the classic-SC identity: binds `hid-steam` as `28DE:1102`, input flows
-    /// with NO mode-entry pulse (the SC parser has no gamepad_mode gate), a held A + right-stick
-    /// deflection land on the evdev (BTN_A + ABS_RX — the right PAD surface), and a grip lands
-    /// on BTN_GRIPR (0x2c5? — kernel BTN_GRIPR = 0x2c5 on new kernels / check via bitmap).
+    /// Classic-SC `28DE:1102`: bind with no mode-entry pulse; BTN_A and right-stick land
+    /// on ABS_RX (right pad).
     #[test]
     #[ignore = "creates a real /dev/uhid device; needs hid-steam + the input group"]
     fn sc_backend_binds_and_input_flows() {

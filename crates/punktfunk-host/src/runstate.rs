@@ -1,11 +1,10 @@
-//! Live game-liveness reports supplied by provider plugins when process scanning cannot infer
-//! the answer reliably.
+//! Provider-plugin liveness reports, used when process scanning cannot decide.
 //!
-//! A provider PUTs its complete running set, including a pid when known. Whole-set replacement
-//! makes missed events and restarts converge on the next update. Reports expire after
-//! [`REPORT_TTL`] so a dead plugin cannot keep a session alive indefinitely; expired entries fall
-//! back to [`crate::procscan`]. This complements the static recognition hints in
-//! [`crate::library::DetectHint`].
+//! A provider PUTs its complete running set, with a pid when known. Whole-set
+//! replacement makes missed events and restarts converge on the next update.
+//! Reports expire after [`REPORT_TTL`] so a dead plugin cannot keep a session
+//! alive; expired entries fall back to [`crate::procscan`]. Complements the
+//! static hints in [`crate::library::DetectHint`].
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -13,31 +12,24 @@ use std::time::{Duration, Instant};
 
 /// How long a provider's report stays authoritative without being restated.
 ///
-/// Generous enough that a plugin refreshing every 30s survives a slow reconcile or a paused runner,
-/// short enough that a *dead* plugin stops vetoing a session end within a couple of minutes. The
-/// cost of expiring too early is the pre-existing behaviour (scan-only); the cost of never expiring
-/// is a session that can never end on its own, which is the bug this whole area exists to kill.
+/// 90 s: a plugin refreshing every 30 s survives a slow reconcile; a dead
+/// plugin stops vetoing a session end within a couple of minutes. Expiring
+/// early falls back to scan-only; never expiring leaves a session that cannot end.
 pub const REPORT_TTL: Duration = Duration::from_secs(90);
 
-/// What a provider says about one of its titles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Liveness {
-    /// Whether the provider lists this title as running right now.
     pub running: bool,
-    /// The pid the provider started for it, when it knows one. Never trusted as a bare number —
-    /// every use re-verifies it through [`crate::procscan`], which pins it to its start time.
+    /// Never trusted as a bare number — every use re-verifies it through
+    /// [`crate::procscan`], which pins it to its start time.
     pub pid: Option<u32>,
 }
 
-/// One provider's most recent report.
 struct Report {
-    /// When it landed — the TTL clock.
     at: Instant,
-    /// Every library id this provider speaks for. What makes "not in `running`" mean *not running*
-    /// rather than *no opinion*: without it an omitted title is indistinguishable from a title
-    /// belonging to some other provider entirely.
+    /// Every library id this provider speaks for. Without this, an omitted title
+    /// is indistinguishable from a title belonging to some other provider.
     owned: HashSet<String>,
-    /// The subset that is running, each with the pid the provider started (when it has one).
     running: HashMap<String, Option<u32>>,
 }
 
@@ -56,9 +48,6 @@ fn table() -> MutexGuard<'static, HashMap<String, Report>> {
 }
 
 /// Record a provider's report, replacing whatever it said before.
-///
-/// `owned` is every library id the provider currently publishes; `running` is the subset that is
-/// running, keyed the same way, valued by pid where one is known.
 pub fn report(provider: &str, owned: HashSet<String>, running: HashMap<String, Option<u32>>) {
     table().insert(
         provider.to_string(),
@@ -70,15 +59,12 @@ pub fn report(provider: &str, owned: HashSet<String>, running: HashMap<String, O
     );
 }
 
-/// Forget everything a provider said — its entries are gone, so its opinions are meaningless.
 pub fn forget(provider: &str) {
     table().remove(provider);
 }
 
-/// What a *fresh* provider says about this library id, or `None` when none speaks for it.
-///
-/// `None` is the answer for every title on a host with no reporting plugin, which is what keeps
-/// this entirely inert until someone opts in.
+/// What a *fresh* provider says about this library id, or `None` when none
+/// speaks for it. `None` for every title with no reporting plugin: inert until opt-in.
 pub fn opinion(app_id: &str) -> Option<Liveness> {
     let table = table();
     table
@@ -97,12 +83,10 @@ pub fn opinion(app_id: &str) -> Option<Liveness> {
         })
 }
 
-/// Whether any fresh provider reports liveness for this title at all — regardless of what it
-/// currently says.
-///
-/// Asked once, when a lease opens: a title whose provider will tell us when it stops is trackable
-/// even with no detect signals whatsoever, which is the whole point (see
-/// [`crate::gamelease::LeaseKind::Reported`]).
+/// Whether any fresh provider reports liveness for this title, regardless of
+/// the current value. Asked when a lease opens: a title whose provider will
+/// say when it stops is trackable with no detect signals
+/// ([`crate::gamelease::LeaseKind::Reported`]).
 pub fn speaks_for(app_id: Option<&str>) -> bool {
     app_id.is_some_and(|id| opinion(id).is_some())
 }
@@ -119,14 +103,11 @@ mod tests {
         ids.iter().map(|(s, p)| ((*s).to_string(), *p)).collect()
     }
 
-    // The table is process-global and these tests run in parallel, so each takes a provider id and
-    // app ids only it uses, and cleans up only its own row. An earlier draft shared the id
-    // `playnite` and cleared the whole table between cases, which made the three of them flip each
-    // other's answers depending on scheduling — the same shape as `mgmt`'s `local_summary` race.
+    // The table is process-global and these tests run in parallel. Each case uses
+    // its own provider and app ids, and cleans up only its own row.
 
-    /// The three answers, and the distinction the whole module turns on: a title its provider omits
-    /// is *not running*, while a title nobody speaks for has *no opinion*. Conflating them would
-    /// make every unreported game on the box look like it had just quit.
+    /// Omitted by its provider is *not running*; a title nobody speaks for has
+    /// *no opinion*. Conflating them would make every unreported game look gone.
     #[test]
     fn omitted_is_not_running_but_unknown_is_no_opinion() {
         report(
@@ -155,9 +136,8 @@ mod tests {
         forget("answers-test");
     }
 
-    /// A report replaces its predecessor wholesale. The set is the message: a title that dropped out
-    /// of it has stopped, and carrying the old entry forward would be exactly the stuck-running
-    /// state this exists to prevent.
+    /// A report replaces its predecessor wholesale. A title that dropped out has
+    /// stopped; carrying the old entry forward is the stuck-running state.
     #[test]
     fn a_report_replaces_the_previous_one() {
         report(
@@ -177,8 +157,8 @@ mod tests {
         assert_eq!(opinion("replace:a"), None);
     }
 
-    /// A stale report stops counting — the bound that makes it safe to let a plugin's claim hold a
-    /// session open. Seeded with an aged timestamp rather than by sleeping for 90 seconds.
+    /// A stale report stops counting, so a plugin's claim cannot hold a session
+    /// open forever. Seeded with an aged timestamp rather than sleeping 90 s.
     #[test]
     fn a_stale_report_has_no_opinion() {
         table().insert(

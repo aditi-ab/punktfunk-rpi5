@@ -1,19 +1,15 @@
 //! Management-API bearer token resolution.
 //!
-//! The mgmt API always serves HTTPS (the host's identity cert) and now always requires auth — even
-//! on a loopback bind. This module guarantees the tokens always exist: an explicit env var wins
-//! (operator override, not persisted); otherwise the persisted file under the config dir is used;
-//! otherwise a fresh 32-byte hex token is generated and persisted. Files are written in
-//! `KEY=<hex>` form (0600) so the bundled web console can source them directly as a systemd
-//! `EnvironmentFile` — a single source of truth shared between the host and its consumers.
+//! HTTPS always, auth always (including loopback). Precedence: env (operator
+//! override, not persisted) → `<config-dir>` file → generate 32-byte hex and
+//! persist. Files are `KEY=<hex>` at 0600 so the console can source them as a
+//! systemd `EnvironmentFile`.
 //!
-//! Two tokens, two authorities:
-//! - **`mgmt-token`** (`PUNKTFUNK_MGMT_TOKEN`) — the operator/console token; authorizes the full
-//!   admin surface.
-//! - **`plugin-token`** (`PUNKTFUNK_PLUGIN_TOKEN`) — the scripting runner's capability-limited
-//!   credential (`mgmt::auth::plugin_may_access`): everything a plugin legitimately needs, but not
-//!   hook registration or pairing administration. The SDK's `connect()` prefers this file, so a
-//!   defect in an operator plugin can't rewrite `hooks.json` or admit new devices.
+//! Two tokens:
+//! - **`mgmt-token`** (`PUNKTFUNK_MGMT_TOKEN`) — full admin.
+//! - **`plugin-token`** (`PUNKTFUNK_PLUGIN_TOKEN`) — `mgmt::auth::plugin_may_access`.
+//!   The SDK `connect()` prefers this file so a plugin cannot rewrite
+//!   `hooks.json` or admit devices.
 
 use anyhow::{Context, Result};
 use rand::RngCore;
@@ -25,26 +21,25 @@ const FILE: &str = "mgmt-token";
 const PLUGIN_ENV_VAR: &str = "PUNKTFUNK_PLUGIN_TOKEN";
 const PLUGIN_FILE: &str = "plugin-token";
 
-/// Resolve the mgmt (full-admin) token (env > persisted file > generate+persist). Hex (not base64)
-/// so the persisted `KEY=VALUE` line is safe to source from a shell / systemd `EnvironmentFile`.
+/// Admin token: env > file > generate+persist. Hex so `KEY=VALUE` is safe
+/// to source from a shell or systemd `EnvironmentFile`.
 pub fn load_or_generate() -> Result<String> {
     load_or_generate_impl(ENV_VAR, FILE)
 }
 
-/// Resolve the scripting runner's scoped plugin token, same precedence as [`load_or_generate`].
-/// Persisted to `plugin-token` next to `mgmt-token`; on Windows `plugins enable` grants the
-/// runner's LocalService principal read on exactly this file (and `cert.pem`) — never `mgmt-token`.
+/// Plugin-lane token, same precedence as [`load_or_generate`].
+///
+/// On Windows, `plugins enable` grants LocalService read on this file and
+/// `cert.pem` — never `mgmt-token`.
 pub fn load_or_generate_plugin() -> Result<String> {
     load_or_generate_impl(PLUGIN_ENV_VAR, PLUGIN_FILE)
 }
 
-/// Read the persisted operator token from `dir`, or `None` when there isn't one. **Never mints.**
+/// Persisted operator token in `dir`, or `None`. Never mints.
 ///
-/// This is what `ctl` uses: a client that generated its own `mgmt-token` would be planting the
-/// credential the host then adopts — the `web-password` silent-adoption finding (security sweep
-/// 2026-08-15) with the roles reversed. The host is the only minter; every other reader either
-/// finds a token or fails loudly. It also deliberately ignores `PUNKTFUNK_MGMT_TOKEN`: a consumer
-/// that took the token from its environment would publish it in `/proc/<pid>/environ`.
+/// `ctl` must not generate: a client-minted file would become the host
+/// credential. Ignores `PUNKTFUNK_MGMT_TOKEN` so a consumer does not publish
+/// the token in `/proc/<pid>/environ`.
 pub(crate) fn read_persisted(dir: &Path) -> Option<String> {
     let contents = fs::read_to_string(dir.join(FILE)).ok()?;
     parse_token(&contents, ENV_VAR)
@@ -58,11 +53,8 @@ fn load_or_generate_impl(env_var: &str, file: &str) -> Result<String> {
         }
     }
     let dir = pf_paths::config_dir();
-    // Owner-private dir (0700 Unix / DACL-locked Windows) so the token can't leak via the config
-    // path — applied BEFORE the read, not just before the write (2026-08-05 review M-1). Reading an
-    // existing token out of a directory a local user could still write means adopting whatever they
-    // put there: the mgmt token IS full admin on this host, so a planted one is a handed-over
-    // control plane, and it would be honoured for the life of the install.
+    // Lock the dir (0700 / DACL) before the read. A world-writable config
+    // dir would let a local user plant the admin token this then adopts.
     pf_paths::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join(file);
     if let Ok(contents) = fs::read_to_string(&path) {
@@ -78,8 +70,7 @@ fn load_or_generate_impl(env_var: &str, file: &str) -> Result<String> {
     Ok(token)
 }
 
-/// Parse the token from the persisted file: accept either a bare token line or a
-/// `<KEY>=<token>` line (the form we write, also valid as an EnvironmentFile).
+/// First non-empty line: bare token or `<KEY>=<token>` (EnvironmentFile).
 fn parse_token(contents: &str, env_var: &str) -> Option<String> {
     let line = contents.lines().find(|l| !l.trim().is_empty())?.trim();
     let tok = line
@@ -90,10 +81,8 @@ fn parse_token(contents: &str, env_var: &str) -> Option<String> {
     (!tok.is_empty()).then(|| tok.to_string())
 }
 
-/// Write `<KEY>=<token>` to `path` as an owner-only secret — 0600 on Unix AND DACL-locked to
-/// SYSTEM/Administrators on Windows. Routes through the shared `write_secret_file` so both bearer
-/// tokens get the SAME Windows lockdown as the host key; the bespoke `cfg(unix)`-only writer used
-/// to leave the mgmt token readable by any local user (security-review 2026-06-28 #2).
+/// Owner-only `KEY=token` via `pf_paths::write_secret_file` (0600 Unix;
+/// SYSTEM/Administrators DACL on Windows). Same lockdown as the host key.
 fn write_token(path: &Path, env_var: &str, token: &str) -> Result<()> {
     let line = format!("{env_var}={token}\n");
     pf_paths::write_secret_file(path, line.as_bytes())

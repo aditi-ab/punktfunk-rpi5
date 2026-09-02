@@ -1,17 +1,15 @@
-//! Software H.264 encoder (openh264) — the GPU-less encode path for the Windows host (and a
-//! fallback when NVENC is unavailable). Low-latency screen-content config: single-reference,
-//! no B-frames (Baseline), bitrate rate-control, in-band SPS/PPS each IDR.
-//! Synchronous: `submit` encodes immediately and stashes the AU for `poll` (no internal queue).
+//! Software H.264 encoder (openh264): GPU-less path for the Windows host, and
+//! the fallback when NVENC is unavailable. Low-latency screen-content config:
+//! single-reference, Baseline (no B-frames), bitrate RC, in-band SPS/PPS each
+//! IDR. `submit` encodes immediately and stashes the AU for `poll`.
 //!
-//! The RGB→YUV conversion is OURS, BT.709 limited range, and the SPS VUI says so
-//! ([`VuiConfig::bt709`], applied in `open`). The crate's own `YUVBuffer` converter is BT.601
-//! (0.2578/0.5039/0.0977 + 16), which decoded-as-709 is a constant hue error; that's why it is
-//! NOT used here.
+//! RGB→YUV is ours, BT.709 limited range. The crate `YUVBuffer` converter is
+//! BT.601; decoded-as-709 that is a constant hue error, so it is not used.
+//! [`VuiConfig::bt709`] is written in `open`: vendor TV decoders guess
+//! colorimetry from resolution when VUI is unspecified (4K SDR as BT.2020).
 //!
-//! Signalling is not optional. This used to leave the VUI unwritten and lean on decoders
-//! defaulting to BT.709 limited — true of every punktfunk client (`csc_rows` falls back to 709 on
-//! "unspecified"), but NOT of vendor TV decoders, which guess colorimetry from RESOLUTION: an LG
-//! webOS panel reads a 4K SDR stream as BT.2020 and renders it visibly washed out.
+//! Pin the VUI bits with `sps_signals_bt709_limited`. Conversion anchors live
+//! in the tests below.
 
 use super::{EncodedFrame, Encoder};
 use anyhow::{bail, ensure, Context, Result};
@@ -30,43 +28,33 @@ pub struct OpenH264Encoder {
     height: u32,
     fps: u32,
     src_format: PixelFormat,
-    /// The converted I420 planes (our BT.709-limited CSC — see the module doc), reused across
-    /// frames: full-res luma + quarter-res Cb/Cr, tightly packed (stride = width, width/2).
+    /// Reused I420 planes (BT.709 limited CSC; see the module doc).
     y_plane: Vec<u8>,
     u_plane: Vec<u8>,
     v_plane: Vec<u8>,
     frame_idx: i64,
     force_kf: bool,
-    /// One AU per submit (no lookahead), handed back FIFO by `poll`. A queue, not an `Option`:
-    /// the session loop pipelines up to `capturer.pipeline_depth()` submits before polling, and a
-    /// single-slot pending would silently overwrite (lose) the older AUs — including the opening
-    /// IDR — and permanently skew the loop's FIFO pts pairing.
+    /// FIFO of AUs for `poll`. A single-slot `Option` would overwrite under
+    /// `pipeline_depth()` submits-before-poll and skew pts pairing (opening IDR).
     pending: VecDeque<EncodedFrame>,
 }
 
-// openh264's Encoder holds a raw C handle (not auto-Send); it lives on the single encode thread.
-// SAFETY: `OpenH264Encoder` wraps `Oh264` (openh264's `Encoder`), which holds a raw C handle to the
-// openh264 `ISVCEncoder` and is not auto-`Send`; the other fields (the plane `Vec`s, scalars,
-// `Option<EncodedFrame>`) are plain owned data. The session creates the encoder, calls
-// `submit`/`poll`/`flush`, and drops it all on one dedicated encode thread, never sharing it by
-// reference across threads, so the C handle is only ever touched from a single thread. Moving the
-// whole value to that thread is therefore sound — there is no concurrent access to the handle.
+// SAFETY: `Oh264` holds a raw `ISVCEncoder` handle and is not auto-`Send`;
+// the other fields (plane `Vec`s, scalars, `pending`) are owned. The session
+// creates this value, calls `submit`/`poll`/`flush`, and drops it on one
+// encode thread, never sharing it by reference, so the handle is only ever
+// touched from that thread.
 unsafe impl Send for OpenH264Encoder {}
 
-/// openh264's own ceiling: level 5.2, so 3840x2160 landscape or 2160x3840 portrait.
-///
-/// The long edge may reach 3840 and the short edge 2160 — the rule is orientation-aware, not a
-/// per-axis `w <= 3840 && h <= 2160`, so a portrait 2160x3840 session is legal.
+/// openh264 level 5.2: long edge ≤ 3840, short edge ≤ 2160. Orientation-aware,
+/// not `w <= 3840 && h <= 2160` — portrait 2160×3840 is legal.
 const OPENH264_MAX_LONG_EDGE: u32 = 3840;
 const OPENH264_MAX_SHORT_EDGE: u32 = 2160;
 
-/// Whether the bundled openh264 can encode this resolution at all.
-///
-/// Mirrors the check inside the crate we ship (openh264 0.9.3, `encoder.rs` `reinit`). That check
-/// runs on the FIRST ENCODE, not at encoder construction — so without this gate a too-large mode
-/// opens perfectly and then fails *every* submit, and the session connects and never delivers a
-/// frame. `Codec::max_dimension` does not cover it: it is keyed on the codec, and H.264 legitimately
-/// reaches 4096 on every hardware backend — this ceiling belongs to the software backend alone.
+/// Bundled openh264's `reinit` check, which runs on the first encode, not at
+/// construction. Without this, a too-large mode opens and then fails every
+/// `submit`. `Codec::max_dimension` is 4096 for H.264 hardware; this ceiling
+/// is software-only.
 fn openh264_supports_dimensions(width: u32, height: u32) -> bool {
     width.max(height) <= OPENH264_MAX_LONG_EDGE && width.min(height) <= OPENH264_MAX_SHORT_EDGE
 }
@@ -79,9 +67,8 @@ impl OpenH264Encoder {
         fps: u32,
         bitrate_bps: u64,
     ) -> Result<Self> {
-        // validate_dimensions() ran in open_video: even, non-zero, <= 4096. That leaves modes this
-        // encoder cannot serve (e.g. a legal 4096-wide H.264 mode), so refuse them here — at the
-        // open, where the caller still gets a real error — rather than at every submit.
+        // `validate_dimensions` already passed (even, ≤ 4096). Refuse here, at
+        // `open`, the 4096-wide modes this encoder cannot serve.
         ensure!(
             openh264_supports_dimensions(width, height),
             "openh264 cannot encode {width}x{height}: the software encoder tops out at \
@@ -103,8 +90,6 @@ impl OpenH264Encoder {
             .adaptive_quantization(true)
             .complexity(Complexity::Low) // latency over BD-rate
             .profile(Profile::Baseline) // no B-frames
-            // video_signal_type + colour_description in the SPS VUI: BT.709 primaries/transfer/
-            // matrix, video_full_range_flag = 0 — exactly what `convert_bt709` below produces.
             .vui(VuiConfig::bt709());
         let api = OpenH264API::from_source(); // statically-bundled build (default `source` feature)
         let enc = Oh264::with_api_config(api, cfg).context("openh264 Encoder::with_api_config")?;
@@ -128,10 +113,9 @@ impl OpenH264Encoder {
         })
     }
 
-    /// Convert one packed full-range RGB frame into the I420 planes, BT.709 limited range.
-    /// `bpp` is the source pixel stride; `ri`/`gi`/`bi` the channel byte offsets within a pixel.
-    /// Luma per pixel; Cb/Cr from the 2×2 block's averaged RGB (the same box filter the crate's
-    /// converter used, so only the matrix changed).
+    /// Packed full-range RGB → I420, BT.709 limited. Luma per pixel; Cb/Cr from
+    /// the 2×2 average (same box filter as the crate converter; only the matrix
+    /// changed).
     fn convert_bt709(&mut self, src: &[u8], bpp: usize, ri: usize, gi: usize, bi: usize) {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -154,19 +138,19 @@ impl OpenH264Encoder {
     }
 }
 
-/// BT.709 luma coefficients (Kg = 1 − Kr − Kb).
+/// Rec.709 Kr / Kb; Kg = 1 − Kr − Kb.
 const KR: f32 = 0.2126;
 const KB: f32 = 0.0722;
 const KG: f32 = 1.0 - KR - KB;
 
-/// One full-range RGB pixel (0..=255 channels) → the BT.709 limited-range 8-bit luma code
-/// (16..=235). Kept in lockstep with the client-side inverse (`pf-client-core::video::csc_rows`).
+/// Full-range RGB (0..=255) → BT.709 limited luma (16..=235). Lockstep with
+/// `pf-client-core::video::csc_rows`.
 fn luma709(r: f32, g: f32, b: f32) -> u8 {
-    let y = KR * r + KG * g + KB * b; // full-scale luma, 0..=255
+    let y = KR * r + KG * g + KB * b;
     (16.0 + y * (219.0 / 255.0) + 0.5) as u8 // `as` saturates — no manual clamp needed
 }
 
-/// (Averaged) full-range RGB → the BT.709 limited-range Cb/Cr codes (16..=240, neutral 128).
+/// Averaged full-range RGB → BT.709 limited Cb/Cr (16..=240, neutral 128).
 fn chroma709(r: f32, g: f32, b: f32) -> (u8, u8) {
     let y = KR * r + KG * g + KB * b;
     let cb = 128.0 + (b - y) * (224.0 / 255.0) / (2.0 * (1.0 - KB));
@@ -190,8 +174,7 @@ impl Encoder for OpenH264Encoder {
             captured.format,
             self.src_format
         );
-        // Refutable once the capture backend adds `FramePayload::D3d11`; today `Cpu` is the only
-        // non-Linux variant, so the pattern is (temporarily) irrefutable.
+        // `Cpu` is the only non-Linux payload today; becomes refutable when D3D11 lands.
         #[allow(irrefutable_let_patterns)]
         let FramePayload::Cpu(bytes) = &captured.payload
         else {
@@ -206,16 +189,13 @@ impl Encoder for OpenH264Encoder {
             self.src_format
         );
 
-        // Source pixel stride + R/G/B byte offsets within a pixel — one converter for every
-        // packed-RGB layout the capturers emit (no BGRA normalization pass needed).
+        // Packed-RGB layouts go straight to `convert_bt709`; no BGRA normalize pass.
         let (bpp, ri, gi, bi) = match self.src_format {
             PixelFormat::Rgb => (3, 0, 1, 2),
             PixelFormat::Bgr => (3, 2, 1, 0),
             PixelFormat::Rgba | PixelFormat::Rgbx => (4, 0, 1, 2),
             PixelFormat::Bgra | PixelFormat::Bgrx => (4, 2, 1, 0),
-            // 10-bit comes only from the GPU paths; the software 8-bit H.264 encoder can't
-            // represent it (and never receives it — neither HDR nor 10-bit SDR is negotiated on
-            // a software host).
+            // 10-bit is GPU-path only; this 8-bit encoder is never negotiated HDR/10-bit.
             PixelFormat::Rgb10a2
             | PixelFormat::Rgb10a2Sdr
             | PixelFormat::X2Rgb10
@@ -225,8 +205,7 @@ impl Encoder for OpenH264Encoder {
                     self.src_format
                 )
             }
-            // NV12/P010 are GPU-resident video-processor outputs for the NVENC path; the software
-            // encoder never receives them (it only gets CPU RGB frames).
+            // NV12/P010/YUV444 are GPU outputs for NVENC; this path only sees CPU RGB.
             PixelFormat::Nv12 | PixelFormat::P010 | PixelFormat::Yuv444 => {
                 anyhow::bail!(
                     "software encoder cannot encode YUV GPU frames (NV12/P010/YUV444 → NVENC only)"
@@ -275,7 +254,7 @@ impl Encoder for OpenH264Encoder {
     }
 }
 
-/// Approximate infinite-GOP: insert IDRs rarely (recovery is via `request_keyframe`/RFI). Env
+/// Rare automatic IDRs (recovery is `request_keyframe` / RFI). Env
 /// `PUNKTFUNK_OH264_GOP` overrides (0 = encoder-auto).
 fn intra_period_frames(fps: u32) -> u32 {
     if let Ok(v) = std::env::var("PUNKTFUNK_OH264_GOP") {
@@ -299,9 +278,7 @@ mod tests {
     use super::*;
     use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 
-    /// The BT.709 limited-range anchor points: reference white → (235,128,128), black →
-    /// (16,128,128), pure red's Cr must hit the positive extreme 240 (it does exactly:
-    /// 255(1−Kr)·(224/255)/(2(1−Kr)) = 112). ±1 code for float rounding.
+    /// Red Cr = 240 because 255(1−Kr)·(224/255)/(2(1−Kr)) = 112. ±1 for float rounding.
     #[test]
     fn bt709_conversion_anchor_points() {
         assert_eq!(luma709(255.0, 255.0, 255.0), 235);
@@ -315,9 +292,6 @@ mod tests {
         assert_eq!(cb, 240, "pure blue must reach the Cb extreme");
     }
 
-    /// The 601-vs-709 luma split on pure green (Kg 0.587 vs 0.7152) — guards against anyone
-    /// "simplifying" the coefficients back to the crate's BT.601 converter (the hue-shift bug
-    /// this module's own conversion exists to prevent).
     #[test]
     fn bt709_is_not_bt601() {
         // BT.601 green luma: 16 + 219·0.587 = 144.5; BT.709: 16 + 219·0.7152 = 172.6.
@@ -325,8 +299,7 @@ mod tests {
         assert!((172..=174).contains(&y), "709 green luma ~173, got {y}");
     }
 
-    /// A flat gray frame converts to neutral chroma and mid luma across every plane byte
-    /// (exercises the block loop + plane sizing, not just the per-pixel math).
+    /// Exercises the 2×2 block loop and plane sizing, not just per-pixel math.
     #[test]
     fn converts_flat_gray_to_neutral_planes() {
         let (w, h) = (16u32, 8u32);
@@ -349,7 +322,6 @@ mod tests {
         let (w, h, fps) = (1280u32, 720u32, 60u32);
         let mut enc =
             OpenH264Encoder::open(PixelFormat::Bgrx, w, h, fps, 8_000_000).expect("open openh264");
-        // A flat gray BGRx frame.
         let frame = CapturedFrame {
             provenance: Default::default(),
             width: w,
@@ -362,7 +334,6 @@ mod tests {
         enc.submit(&frame).expect("submit");
         let au = enc.poll().expect("poll").expect("an AU");
         assert!(au.keyframe, "first frame must be an IDR");
-        // AnnexB start code + an SPS NAL (type 7) somewhere in the first frame.
         assert!(
             au.data.starts_with(&[0, 0, 0, 1]) || au.data.starts_with(&[0, 0, 1]),
             "expected AnnexB start code"
@@ -374,7 +345,6 @@ mod tests {
         assert!(has_sps, "IDR must carry an SPS NAL (type 7)");
     }
 
-    /// Strip Annex-B framing + emulation-prevention bytes from the first SPS NAL in `au`.
     fn sps_rbsp(au: &[u8]) -> Vec<u8> {
         let start = au
             .windows(5)
@@ -401,9 +371,8 @@ mod tests {
         rbsp
     }
 
-    /// The colour signalling the SPS actually carries, walked per ITU-T H.264 §7.3.2.1.1: returns
-    /// `(video_full_range_flag, colour_primaries, transfer_characteristics, matrix_coefficients)`.
-    /// `None` when the stream is unsignalled — which is what this module used to emit.
+    /// SPS colour from ITU-T H.264 §7.3.2.1.1:
+    /// `(video_full_range_flag, primaries, transfer, matrix)`. `None` if unsignalled.
     fn sps_colour(rbsp: &[u8]) -> Option<(u8, u8, u8, u8)> {
         // Exp-Golomb ue(v): count leading zeros, then read that many trailing bits.
         fn ue(u: &mut dyn FnMut(u32) -> u32) -> u32 {
@@ -482,13 +451,9 @@ mod tests {
         Some((full_range, u(8) as u8, u(8) as u8, u(8) as u8))
     }
 
-    /// The SPS must SIGNAL BT.709 limited, not merely be encoded that way. `VuiConfig::bt709()`
-    /// is a request to a C library; this asserts it lands in the emitted bitstream.
-    ///
-    /// Unsignalled was the old behaviour and it looks fine on every punktfunk client (`csc_rows`
-    /// defaults to BT.709 on "unspecified"), so nothing in our own stack catches a regression
-    /// here — but vendor TV decoders guess colorimetry from RESOLUTION, and an LG webOS panel
-    /// reads a 4K SDR stream as BT.2020 and renders it visibly washed out.
+    /// `VuiConfig::bt709()` is a request to a C library; this asserts the
+    /// emitted SPS actually carries BT.709 limited. Unsignalled 4K SDR is
+    /// guessed as BT.2020 by vendor TV decoders.
     #[test]
     fn sps_signals_bt709_limited() {
         let (w, h, fps) = (1280u32, 720u32, 60u32);
@@ -513,8 +478,7 @@ mod tests {
         assert_eq!(colour, (0, 1, 1, 1), "expected BT.709 limited signalling");
     }
 
-    /// The modes the software encoder can actually serve — including the portrait orientation,
-    /// which a naive per-axis `w <= 3840 && h <= 2160` would wrongly reject.
+    /// Portrait 2160×3840 is legal; `w <= 3840 && h <= 2160` would reject it.
     #[test]
     fn openh264_accepts_up_to_4k_in_either_orientation() {
         assert!(openh264_supports_dimensions(1920, 1080));
@@ -523,24 +487,19 @@ mod tests {
         assert!(openh264_supports_dimensions(1080, 1920));
     }
 
-    /// Modes `validate_dimensions` lets through (H.264 legitimately reaches 4096 on hardware) but
-    /// openh264 rejects on the first encode. Catching them at open is the whole point of the gate:
-    /// otherwise the session opens and then fails every single submit.
     #[test]
     fn openh264_rejects_modes_that_would_fail_on_first_submit() {
         // 4096-wide is legal H.264 and passes `Codec::max_dimension`, but exceeds the long edge.
         assert!(!openh264_supports_dimensions(4096, 2160));
         assert!(!openh264_supports_dimensions(2160, 4096));
-        // Long edge is fine, short edge is not (e.g. an ultrawide-tall composite desktop).
+        // Long edge OK, short edge not.
         assert!(!openh264_supports_dimensions(3840, 2400));
         assert!(!openh264_supports_dimensions(2400, 3840));
     }
 
-    /// A too-large mode must fail at `open`, not silently at every `submit`.
     #[test]
     fn open_refuses_a_mode_openh264_cannot_encode() {
-        // Matched rather than `expect_err`: `OpenH264Encoder` is not `Debug` (it wraps a raw C
-        // handle), so `expect_err` would not compile.
+        // Match, not `expect_err`: `OpenH264Encoder` is not `Debug` (raw C handle).
         let err = match OpenH264Encoder::open(PixelFormat::Bgra, 4096, 2160, 60, 20_000_000) {
             Ok(_) => panic!("4096x2160 exceeds openh264's long-edge ceiling and must be refused"),
             Err(e) => e,

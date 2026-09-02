@@ -40,34 +40,19 @@ pub mod session_av1;
 pub mod session_h265;
 pub mod slots;
 
-/// Re-exported for the integration layer (WP-C): [`DecodedVkFrame`]'s handle fields are
-/// ash types, and the consumer (pf-client-core, whose own `ash` is optional/feature-gated)
-/// flattens them to raw `u64`s through `ash::vk::Handle` — via THIS instance of ash, so
-/// the versions can never skew.
+/// Ash re-export so consumers flatten [`DecodedVkFrame`] handles through this
+/// crate's `ash::vk::Handle`. Their own `ash` is optional; versions must not skew.
 pub use ash;
-// The pf-bitstream types a [`DecodedVkFrame`] consumer names, re-exported so it
-// doesn't grow a pf-bitstream dependency of its own:
-/// [`VkAv1Decoder::take_warnings`]'s warning type — the AV1 twin of
-/// [`PlanWarning`], renamed for the same reason [`H265PlanWarning`] is: the three
-/// enums are genuinely different (AV1 has `MissingShowExisting`, and its
-/// `MissingReference` needs no interpretation because no AV1 process empties a
-/// reference slot behind the stream's back) and a consumer dispatching per codec
-/// must be able to name all three.
+// pf-bitstream types a [`DecodedVkFrame`] consumer names, without taking that dep.
+/// [`VkAv1Decoder::take_warnings`] warning type. Distinct from [`PlanWarning`]:
+/// AV1 has `MissingShowExisting`; `MissingReference` has no legal substitute.
 pub use pf_bitstream::av1::PlanWarning as Av1PlanWarning;
-/// [`DecodedVkFrame::colour`]'s type.
 pub use pf_bitstream::h264::ColourDescription;
-/// [`DecodedVkFrame::crop`]'s type.
 pub use pf_bitstream::h264::DisplayCrop;
-/// [`VkH264Decoder::take_warnings`]'s warning type.
 pub use pf_bitstream::h264::PlanWarning;
-/// [`VkH265Decoder::take_warnings`]'s warning type — the H.265 twin of
-/// [`PlanWarning`], renamed rather than shadowed because the two enums are
-/// genuinely different (H.264 has `FrameNumGap`/`Mmco5Rebase`, H.265 has
-/// `NonZeroReorder`) and a consumer dispatching per codec must be able to name
-/// BOTH. Without it the client could only render warnings as strings — and it has
-/// to BRANCH on them: `NonZeroReorder` and `Mmco5Rebase` are spec-legal facts the
-/// planner planned in full, not concealment, and dropping their frames would cost
-/// a visible hitch at every SPS activation.
+/// [`VkH265Decoder::take_warnings`] warning type. Distinct from [`PlanWarning`].
+/// `NonZeroReorder` (and H.264 `Mmco5Rebase`) are planned in full; dropping
+/// those frames hitches every SPS activation.
 pub use pf_bitstream::h265::PlanWarning as H265PlanWarning;
 
 pub use caps::derive_caps;

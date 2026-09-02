@@ -1,23 +1,15 @@
-//! The client's bitstream layer for native decode (design/client-native-decode.md §3.1):
-//! everything a stateless hardware decoder needs to know about an AU before submission —
-//! parsed headers, POC, DPB state, reference lists (including MMCO/LTR, which the hosts'
-//! RFI recovery actively uses), recovery-point SEI — derived once here and consumed by
-//! every backend (Vulkan `StdVideo*`, DXVA picparams, libva buffers).
+//! Client bitstream layer for native decode (`design/client-native-decode.md`).
 //!
-//! Parsing primitives come from the vendored cros-codecs parser layer
-//! (`vendor/cros-codecs`, see its PROVENANCE.md); this crate owns what upstream keeps in
-//! its Linux-only `decoder::stateless` half — the per-AU orchestration — plus the pieces
-//! upstream lacks (SEI payload parsing: their parsers classify SEI NALUs but never read
-//! them).
+//! Per AU: headers, POC, DPB, reference lists (MMCO/LTR), recovery-point SEI —
+//! derived once, consumed by every stateless backend (Vulkan `StdVideo*`, DXVA,
+//! libva). Parsing primitives come from vendored `vendor/cros-codecs` (see its
+//! PROVENANCE.md). This crate owns the per-AU orchestration upstream keeps in
+//! Linux-only `decoder::stateless`, plus SEI payload parsing (upstream classifies
+//! SEI NALUs but never reads them).
 //!
-//! Scope discipline: punktfunk clients decode punktfunk hosts — zero-reorder, no
-//! B-frames, progressive, parameter sets from encoders we control. Implement to spec
-//! where cheap; reject-with-log outside that envelope rather than half-decode.
-//!
-//! Nothing in this crate may touch a GPU API, an OS handle, or the network: CPU-only by
-//! construction, so its tests run on every CI leg including macOS. And no `unsafe`,
-//! compiler-enforced — this layer exists to replace C parsers; it does not get to
-//! reintroduce their failure mode.
+//! Scope: punktfunk hosts — zero-reorder, no B-frames, progressive, controlled
+//! parameter sets. Implement to spec where cheap; reject-with-log outside that
+//! envelope. CPU-only: no GPU API, OS handle, or network.
 #![forbid(unsafe_code)]
 
 pub mod av1;
@@ -26,9 +18,8 @@ pub mod h264;
 pub mod h265;
 pub mod sei;
 
-// The vendor-pinning smoke tests below assert against byte counts and golden values from
-// the vendored snapshot's own test vectors; a cros-codecs re-sync that shifts parser
-// behavior must trip HERE, in our tree, not in a decode session.
+// Golden counts from the vendored snapshot's own vectors. A cros-codecs re-sync that
+// shifts parser behaviour must trip here, not in a decode session.
 #[cfg(test)]
 mod vendor_smoke {
     use std::io::Cursor;
@@ -73,7 +64,7 @@ mod vendor_smoke {
                 slices += 1;
             }
         }
-        // 759 is upstream's own golden for this stream (chromium h264_parser_unittest lineage).
+        // 759 is upstream's golden (chromium h264_parser_unittest lineage).
         assert_eq!(nalus, 759);
         assert_eq!(sps, 4);
         assert_eq!(slices, 500);
@@ -119,9 +110,7 @@ mod vendor_smoke {
                 };
                 consumed += obu.bytes_used;
                 obus += 1;
-                // `ref_frame_update` is the parser's ref-slot bookkeeping; without it,
-                // inter frames fail with "Reference is invalid" — the parser validates
-                // reference integrity rather than trusting the stream.
+                // Without `ref_frame_update` the next inter frame fails with "Reference is invalid".
                 match parser.parse_obu(obu).expect("parse_obu") {
                     ParsedObu::FrameHeader(fh) => {
                         frames += 1;
@@ -135,7 +124,7 @@ mod vendor_smoke {
                 }
             }
         }
-        // 525 is upstream's own golden (cross-checked against GStreamer's OBU walk).
+        // 525 is upstream's golden (cross-checked against GStreamer's OBU walk).
         assert_eq!(obus, 525);
         assert_eq!(frames, 274);
     }
@@ -152,7 +141,7 @@ mod vendor_smoke {
                 .len() as u32;
         }
         assert_eq!(chunks, 250);
-        // > chunks proves superframe splitting engaged.
+        // frames > chunks: superframe splitting engaged.
         assert_eq!(frames, 269);
     }
 }

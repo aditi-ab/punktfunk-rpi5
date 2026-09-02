@@ -1,18 +1,14 @@
-//! Pure policy for the buffers passed to
-//! `ID3D11VideoContext::SubmitDecoderBuffers`.
+//! Policy for the buffers passed to `ID3D11VideoContext::SubmitDecoderBuffers`.
 //!
-//! Descriptors are ordered picture parameters, optional inverse-quantization
-//! matrix, bitstream, then slice/tile control, matching FFmpeg's DXVA path.
-//! Every `DataOffset` is zero; every `DataSize` is the number of bytes written:
-//! full parameter structs, padded/aligned packed bitstream size, and exact
-//! slice/tile-record sizes (DXVA H.264/HEVC short slice records are 10 bytes).
-//! `NumMBsInBuffer` is H.264's macroblock count only for bitstream and slice
-//! control; it is zero for parameter/matrix buffers and for all HEVC/AV1 buffers.
-//! H.264 always submits its matrix, HEVC does so only when `qmatrix` is present,
-//! and AV1 never does, so AV1 submissions always contain three buffers.
-//! HEVC matrix construction must retain the default-list rules from H.265
-//! §7.4.5, Tables 7-5/7-6; presence alone must not produce zero matrices.
-//! The Windows submission layer must preserve these values and ordering.
+//! Order matches FFmpeg's DXVA path: picture parameters, optional inverse-
+//! quantization matrix, bitstream, slice/tile control. Every `DataOffset` is
+//! zero. Every `DataSize` is bytes written: full parameter structs, padded
+//! bitstream, exact slice/tile records (H.264/HEVC short records are 10 bytes).
+//! `NumMBsInBuffer` is H.264's macroblock count on bitstream and slice control
+//! only; it is zero on parameter/matrix buffers and on every HEVC/AV1 buffer.
+//! H.264 always submits a matrix, HEVC only when `qmatrix` is present, AV1
+//! never — so AV1 submissions are always three buffers.
+//! The Windows layer must preserve these values and this order.
 
 use std::mem::size_of;
 
@@ -38,33 +34,20 @@ pub const BUFFER_SLICE_CONTROL: u32 = 5;
 /// `D3D11_VIDEO_DECODER_BUFFER_BITSTREAM`.
 pub const BUFFER_BITSTREAM: u32 = 6;
 
-/// One buffer of a submission, reduced to the fields a caller DECIDES.
-///
-/// Deliberately not a `D3D11_VIDEO_DECODER_BUFFER_DESC`: that structure has
-/// fourteen members, of which ten are either for a mode this backend does not use
-/// (`BufferIndex`, `FirstMBaddress`, `Width`/`Height`/`Stride` — motion-compensation
-/// buffers), or for protected content (`pIV`, `IVSize`, `PartialEncryption`,
-/// `EncryptedBlockInfo`), or reserved. All ten are zero on every buffer this
-/// backend submits, which the Windows layer expresses as `..Default::default()`;
-/// the four here are the ones that carry a decision, and therefore the ones a
-/// comparison against libavcodec is about.
+/// The four `D3D11_VIDEO_DECODER_BUFFER_DESC` fields this backend decides.
+/// The other ten (motion-compensation, encryption, reserved) stay zero via
+/// `..Default::default()` on the Windows side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BufferDescriptor {
-    /// `BufferType` — one of this module's `BUFFER_*` code points. (The DXVA
-    /// specs and libavcodec's DXVA2 path call the same field
-    /// `CompressedBufferType`.)
+    /// `BufferType` / DXVA `CompressedBufferType`. One of `BUFFER_*`.
     pub buffer_type: u32,
-    /// `DataOffset` — 0 on every buffer of every submission (module docs).
     pub data_offset: u32,
-    /// `DataSize` — bytes written into the driver's mapping.
+    /// Bytes written into the driver's mapping, not the mapping's capacity.
     pub data_size: u32,
-    /// `NumMBsInBuffer` — codec-asymmetric; see the module docs.
     pub num_mbs_in_buffer: u32,
 }
 
 impl BufferDescriptor {
-    /// A descriptor with `DataOffset` 0, which is the only value this backend
-    /// ever submits.
     const fn new(buffer_type: u32, data_size: u32, num_mbs_in_buffer: u32) -> BufferDescriptor {
         BufferDescriptor {
             buffer_type,
@@ -75,20 +58,13 @@ impl BufferDescriptor {
     }
 }
 
-/// The slice-control buffer's `DataSize`: `n` short-format records back to back,
-/// exactly as [`crate::dxva::slice_bytes`] lays them out.
-///
-/// Saturating rather than panicking on the (unreachable) overflow: a `u32` holds
-/// 429 million ten-byte records, and an AU that produced more has already been
-/// refused by the packer.
+/// `n` short-format records, matching [`crate::dxva::slice_bytes`].
+/// Saturating: a `u32` holds 429 million ten-byte records; the packer already
+/// refused an AU that large.
 fn slice_control_size(record_size: usize, records: usize) -> u32 {
     u32::try_from(record_size.saturating_mul(records)).unwrap_or(u32::MAX)
 }
 
-/// The descriptor set of one H.264 submission, in libavcodec's order.
-///
-/// Four buffers, always: the quantization matrices travel on every H.264 picture
-/// (module docs).
 pub fn descriptors_h264(plan: &DecodePlanDxva, packed: &Packed) -> Vec<BufferDescriptor> {
     let mb_count = plan.mb_count;
     vec![
@@ -111,11 +87,6 @@ pub fn descriptors_h264(plan: &DecodePlanDxva, packed: &Packed) -> Vec<BufferDes
     ]
 }
 
-/// The descriptor set of one HEVC submission, in libavcodec's order.
-///
-/// THREE buffers when the sequence disables scaling lists (which is every
-/// punktfunk HEVC stream and the vendored vector with it), four when it enables
-/// them — and `NumMBsInBuffer` is 0 on all of them (module docs).
 pub fn descriptors_h265(plan: &DecodePlanDxvaH265, packed: &Packed) -> Vec<BufferDescriptor> {
     let mut out = Vec::with_capacity(4);
     out.push(BufferDescriptor::new(
@@ -139,14 +110,9 @@ pub fn descriptors_h265(plan: &DecodePlanDxvaH265, packed: &Packed) -> Vec<Buffe
     out
 }
 
-/// The descriptor set of one AV1 submission, in libavcodec's order.
-///
-/// **THREE buffers, always**, and `NumMBsInBuffer` 0 on every one of them (module
-/// docs). The slice-control buffer carries `DXVA_Tile_AV1` records — sixteen bytes
-/// each, one per TILE — where the other two codecs carry ten-byte slice records.
-///
-/// The bitstream `DataSize` is the packer's PADDED figure, which for AV1 is the
-/// only place the padding is accounted at all: no tile record grows by it
+/// AV1: three buffers, never a matrix. Slice control is `DXVA_Tile_AV1`
+/// (16 bytes per tile), not a 10-byte slice record. Bitstream `DataSize` is
+/// the packer's padded size — the only place AV1 padding is accounted
 /// ([`mod@crate::pack_av1`]).
 pub fn descriptors_av1(packed: &PackedAv1) -> Vec<BufferDescriptor> {
     vec![
@@ -171,10 +137,8 @@ mod tests {
     use crate::pack::SliceRecord;
     use crate::pic::DxvaRef;
 
-    /// A conversion result with nothing in it but the two fields the descriptors
-    /// read. Built by hand rather than planned from a vector: this module's job is
-    /// the descriptor SET, and the whole-stream evidence (250 H.264 + 250 HEVC AUs
-    /// through the real planners) is in `tests/libav_picparams_parity.rs`.
+    /// Stub plan: only `mb_count` is read. Whole-stream evidence lives in
+    /// `tests/libav_picparams_parity.rs`.
     fn h264_plan(mb_count: u32) -> DecodePlanDxva {
         DecodePlanDxva {
             pic_params: PicParamsH264::zeroed(),
@@ -201,8 +165,6 @@ mod tests {
         }
     }
 
-    /// `n` slices packed into `data_size` bytes; the record contents do not matter
-    /// here, only how many there are.
     fn packed(slices: usize, data_size: u32) -> Packed {
         Packed {
             records: (0..slices)
@@ -217,13 +179,8 @@ mod tests {
 
     #[test]
     fn the_buffer_type_code_points_are_the_ones_windows_rs_declares() {
-        // From the workspace's pinned windows-rs rev (`acb5a1a`),
-        // `crates/libs/windows/src/Windows/Win32/d3d11/mod.rs`:
-        // D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS = 0,
-        // …_INVERSE_QUANTIZATION_MATRIX = 4, …_SLICE_CONTROL = 5, …_BITSTREAM = 6.
-        // Nothing else in this crate can catch a transposed pair, and a
-        // transposition would hand the driver a bitstream where it expects slice
-        // control.
+        // windows-rs `D3D11_VIDEO_DECODER_BUFFER_*` code points; 1..=3 are unused
+        // here. A swap hands the driver a bitstream where it expects slice control.
         assert_eq!(BUFFER_PICTURE_PARAMETERS, 0);
         assert_eq!(BUFFER_INVERSE_QUANTIZATION_MATRIX, 4);
         assert_eq!(BUFFER_SLICE_CONTROL, 5);
@@ -250,9 +207,6 @@ mod tests {
 
     #[test]
     fn only_the_h264_bitstream_and_slice_control_buffers_carry_a_macroblock_count() {
-        // Review 13's defect, in the smallest form that can express it: the field
-        // is 0 on the two parameter buffers and mb_width*mb_height on the two the
-        // hardware parses.
         let descs = descriptors_h264(&h264_plan(300), &packed(1, 256));
         assert_eq!(descs[0].num_mbs_in_buffer, 0, "picture parameters");
         assert_eq!(descs[1].num_mbs_in_buffer, 0, "quantization matrices");
@@ -297,9 +251,7 @@ mod tests {
 
     #[test]
     fn the_hevc_descriptors_carry_no_macroblock_count_at_all() {
-        // The asymmetry, asserted rather than assumed: libavcodec's HEVC path
-        // writes 0 where its H.264 path writes mb_width*mb_height, and a CTB count
-        // here would be a divergence in the other direction.
+        // libavcodec writes 0 here; a CTB count would be the other-direction miss.
         for descs in [
             descriptors_h265(&h265_plan(None), &packed(1, 256)),
             descriptors_h265(&h265_plan(Some(QmatrixHevc::zeroed())), &packed(4, 1024)),
@@ -325,11 +277,8 @@ mod tests {
 
     #[test]
     fn the_slice_control_size_is_one_short_format_record_per_slice() {
-        // TEN bytes per record is the SHORT format, packed — measured against
-        // libavcodec on hardware, not derived from the field types (a `#[repr(C)]`
-        // `{u32, u32, u16}` would be twelve). The long format's record is an order of
-        // magnitude larger, so this size is also the check that the records match the
-        // `ConfigBitstreamRaw` this backend asks for.
+        // Short-format packed size is 10, not 12 (`#[repr(C)] {u32,u32,u16}`).
+        // Long format is an order of magnitude larger.
         assert_eq!(size_of::<SliceH264Short>(), 10);
         assert_eq!(size_of::<SliceHevcShort>(), 10);
         for slices in [1usize, 2, 5, 68] {
@@ -340,7 +289,6 @@ mod tests {
         }
     }
 
-    /// `n` tiles packed into `data_size` bytes.
     fn packed_av1(tiles: usize, data_size: u32) -> PackedAv1 {
         PackedAv1 {
             tiles: (0..tiles)
@@ -358,9 +306,8 @@ mod tests {
 
     #[test]
     fn an_av1_submission_carries_three_buffers_and_never_a_quantization_matrix() {
-        // `dxva2_av1_end_frame` passes `NULL, 0` for the matrix pair, so the
-        // generic layer's `if (qm_size > 0)` never fires. A fourth buffer here
-        // would be a matrix AV1 does not transmit at all.
+        // `dxva2_av1_end_frame` passes `NULL, 0` for the matrix; a fourth buffer
+        // would invent one AV1 does not transmit.
         let descs = descriptors_av1(&packed_av1(1, 384));
         assert_eq!(
             descs.iter().map(|d| d.buffer_type).collect::<Vec<_>>(),
@@ -377,9 +324,7 @@ mod tests {
 
     #[test]
     fn the_av1_descriptors_carry_no_macroblock_count_at_all() {
-        // The third spelling of the asymmetry: H.264 writes mb_width*mb_height,
-        // HEVC writes 0, AV1 writes 0 — and specifically NOT a tile count, which
-        // is the symmetric-looking value there is now a plausible field for.
+        // Not a tile count: that is the symmetric-looking wrong value.
         for tiles in [1usize, 4, 64] {
             for desc in descriptors_av1(&packed_av1(tiles, 4096)) {
                 assert_eq!(
@@ -394,10 +339,7 @@ mod tests {
 
     #[test]
     fn the_av1_tile_buffer_is_sixteen_bytes_per_tile_not_ten() {
-        // The slice-control buffer is the one place a codec's record SIZE is
-        // observable from outside, and AV1's record is a different structure from
-        // the other two: `DXVA_Tile_AV1` is 16 bytes (measured against the Windows
-        // SDK's `dxva.h`), where `DXVA_Slice_*_Short` is 10.
+        // `DXVA_Tile_AV1` is 16 bytes (`dxva.h`); H.264/HEVC short records are 10.
         assert_eq!(size_of::<TileAv1>(), 16);
         for tiles in [1usize, 2, 8, 64] {
             let descs = descriptors_av1(&packed_av1(tiles, 4096));
@@ -407,10 +349,6 @@ mod tests {
 
     #[test]
     fn a_reference_entry_in_the_plan_does_not_reach_the_descriptors() {
-        // A guard on the shape of this module rather than on a value: descriptors
-        // are a function of SIZES and the macroblock count, so nothing about the
-        // reference list may leak into them. (Also keeps `DxvaRef` in the test's
-        // vocabulary, so the plan built above stays a realistic one.)
         let mut plan = h264_plan(300);
         plan.refs.push(DxvaRef {
             slot: 2,

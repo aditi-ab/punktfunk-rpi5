@@ -1,13 +1,12 @@
-//! The in-stream quick-action ring on Skia (design/touch-client-overlay.md §2): six
-//! translucent discs on a circle under the fingers plus a centre "More" that opens the sheet —
-//! the complete catalogue with values. The twist drives the opening frame by frame
-//! (`RingInput::Turn`); the `⌃⌥⇧O` chord opens it at the window centre. Glass is an iOS material
-//! (D7): here a translucent disc with a hairline. The console has no icon font, so a button
-//! carries a SHORT text label, and a shortcut its keycap chord.
+//! In-stream quick-action ring (`design/touch-client-overlay.md`).
 //!
-//! Contract: nothing is drawn while closed; every pointer event is consumed while open (the
-//! scrim); commands go out through [`Ring::take_command`], host actions through the console's
-//! own bus ([`Ring::take_cmds`]).
+//! Six slots plus a centre "More" that opens the sheet. A twist (`RingInput::Turn`)
+//! drives the opening; `⌃⌥⇧O` opens it at the window centre. No icon font: a
+//! button carries a short text label, a shortcut its keycap chord.
+//!
+//! Contract: nothing is drawn while closed; every pointer event is consumed while
+//! open (the scrim). Commands leave via [`Ring::take_command`]; host actions via
+//! [`Ring::take_cmds`].
 
 use crate::anim::{approach, springs, Spring};
 use crate::input::Key;
@@ -24,17 +23,15 @@ use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
-/// Geometry in pixels at 100 % scale (`FrameCtx::scale` multiplies every metric) — the
-/// shared numbers every desktop drawing of the ring reads.
+/// Design units at 100 %; `FrameCtx::scale` multiplies every metric.
 const RADIUS: f32 = pf_client_core::ring::RING_RADIUS;
 const SLOT_D: f32 = pf_client_core::ring::SLOT_DIAMETER;
-/// The label band under the ring (design units): its 13 pt text inside an 8 pt pill. The
-/// editor sizes its stage by it so the label is never clipped.
+/// 13 pt text inside an 8 pt pill. The editor sizes its stage by this so the label is not clipped.
 pub(crate) const LABEL_H: f32 = 13.0 + 2.0 * 8.0;
 const CENTRE_D: f32 = pf_client_core::ring::CENTRE_DIAMETER;
 const IDLE_CLOSE: Duration = Duration::from_secs(8);
 const HINT_LIFE: Duration = Duration::from_secs(2);
-/// Button k lags the previous one by this much of the twist, so the ring visibly unwinds.
+/// Slot k lags the previous one by this fraction of the twist so the ring unwinds visibly.
 const SLOT_LAG: f32 = 0.06;
 const RES_PRESETS: [(&str, u32, u32); 3] = [
     ("1440p", 2560, 1440),
@@ -43,7 +40,6 @@ const RES_PRESETS: [(&str, u32, u32); 3] = [
 ];
 const HZ_PRESETS: [u32; 2] = [120, 60];
 
-/// One button as the ring draws it, and why it is dimmed.
 struct Spec {
     id: String,
     label: String,
@@ -52,12 +48,11 @@ struct Spec {
     reason: String,
     /// Destructive: two presses.
     armed: bool,
-    /// A toggle leaves the ring open so the new state is visible (D6).
+    /// Leave the ring open so the new state is visible.
     toggle: bool,
     state: String,
 }
 
-/// A row of the sheet.
 #[derive(Clone, PartialEq)]
 enum SheetRow {
     Slot(SlotId),
@@ -65,15 +60,12 @@ enum SheetRow {
     Refresh,
 }
 
-/// The editor's state on the ring (design §3.3, "the editor is the ring"): a press on a slot
-/// picks instead of firing, Y lifts the highlighted disc and A drops it on another slot, a
-/// pointer carries a disc onto another. The centre is inert, nothing fires, nothing closes on
-/// its own.
+/// Editor: a press picks, Y lifts, A drops, a pointer carries. Centre is inert;
+/// nothing fires or idle-closes.
 #[derive(Default)]
 struct Editing {
-    /// The disc a pad lifted (Y), waiting for the slot A drops it on.
+    /// Pad-lifted disc (Y), waiting for the slot A drops it on.
     lifted: Option<usize>,
-    /// The disc a pointer carries: its slot, where the press landed, and how far it went.
     drag: Option<Drag>,
 }
 
@@ -94,17 +86,14 @@ impl Drag {
     }
 }
 
-/// What the editor asks of its screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EditEvent {
-    /// Choose what slot `k` holds.
     Pick(usize),
-    /// Swap the contents of the two slots.
     Swap(usize, usize),
 }
 
-/// The three power actions as a host that offers all three would show them; a dimmed "does
-/// not offer it" in the editor would lie about the slot.
+/// Editor preview of the three power actions as offered. Dim-as-unavailable would
+/// describe a host this screen has not bound.
 fn preview_host_label(id: &str) -> &str {
     match id {
         "power.sleep" => "Sleep host",
@@ -119,34 +108,28 @@ pub(crate) struct Ring {
     committed: bool,
     clockwise: bool,
     centre: (f32, f32),
-    /// The drawn opening: the twist's progress until commit, then a spring toward 1.
+    /// Drawn opening: twist progress until commit, then a spring toward 1.
     shown: f32,
     sheet: bool,
     armed: Option<String>,
     hint: Option<String>,
     hint_at: Instant,
     last_touch: Instant,
-    /// The pad's highlight: a slot 0…5, or 6 for the centre (the initial one — `Select+A`
-    /// then `A` opens the sheet in two presses). `None` until a pad or key moves it.
+    /// Slot 0…5, or 6 for the centre. `None` until a pad or key moves it.
     highlight: Option<usize>,
-    /// The stick is past the deadzone and owns the highlight (design §2.6): its sector
-    /// picks the slot and the four-way moves it also raises are ignored; the D-pad steps
-    /// again once it lets go.
+    /// Stick past the deadzone owns the highlight: four-way moves are ignored until
+    /// it lets go.
     stick: bool,
-    /// Counts `tick`s, so the damage key changes every frame while something is still on
-    /// the move: the stream overlay redraws only when that key changes, and a spring or a
-    /// list entrance that nothing else touches would otherwise freeze on its first frame.
+    /// Tick count hashed into `damage` while animating, so a spring the overlay
+    /// would otherwise freeze on its first frame keeps redrawing.
     frame: u64,
-    /// The arrival: after the commit, `shown` springs to 1 from wherever the twist left it.
     spring: Spring,
-    /// Closed for input, still winding in: the discs spiral back and fade for a moment.
+    /// Closed for input, still winding in.
     closing: bool,
-    /// Each slot's highlight amount (the centre is 6), eased so the glow and the lift travel
-    /// between discs instead of snapping.
+    /// Per-slot highlight 0…1 (centre is 6), eased so the glow travels instead of snapping.
     hot: [f32; 7],
-    /// The sheet's rise, 0 → 1 as it opens.
     sheet_rise: f64,
-    /// Hit rects as drawn last frame: six slots, then the centre.
+    /// Hit rects from last draw: slots 0…5, centre 6.
     geom: Vec<Rect>,
     sheet_rect: Rect,
     list: MenuList,
@@ -194,26 +177,23 @@ impl Ring {
         self.committed || self.progress > 0.0
     }
 
-    /// Open, or closed and still winding in — what `render` and the damage key go by. Input
-    /// goes by [`Ring::open`]: a closing ring takes nothing.
+    /// Open, or closed and still winding in — what `render` and `damage` go by.
+    /// Input uses [`Ring::open`]: a closing ring takes nothing.
     fn visible(&self) -> bool {
         self.open() || self.closing
     }
 
-    /// The stick owns the highlight (a sector is engaged) — see `stick`.
     pub(crate) fn stick_engaged(&self) -> bool {
         self.stick
     }
 
-    /// A screen handing focus back while the stick is still held: the ring adopts the
-    /// stick as engaged, so the four-way repeats it keeps raising step nothing until the
-    /// stick lets go (`Sector(None)`).
+    /// Adopt stick-engaged when a screen hands focus back while the stick is still
+    /// held, so four-way repeats step nothing until `Sector(None)`.
     pub(crate) fn adopt_stick(&mut self, engaged: bool) {
         self.stick = engaged;
     }
 
-    /// Make this ring the editor (§3.3): open at `(x, y)`, never idle-closing, the first slot
-    /// highlighted so a pad has somewhere to start.
+    /// Open as the editor at `(x, y)`: no idle-close, slot 0 highlighted so a pad has a start.
     pub(crate) fn edit_at(&mut self, x: f32, y: f32) {
         self.editing = Some(Editing::default());
         self.centre = (x, y);
@@ -221,7 +201,6 @@ impl Ring {
         self.highlight = Some(0);
     }
 
-    /// Where the editor's ring is centred, for a screen laying out around it.
     pub(crate) fn recentre(&mut self, x: f32, y: f32) {
         self.centre = (x, y);
     }
@@ -230,12 +209,11 @@ impl Ring {
         self.highlight
     }
 
-    /// The pad's highlight, set by a screen handing focus back to the ring.
     pub(crate) fn set_highlight(&mut self, k: usize) {
         self.highlight = Some(k.min(5));
     }
 
-    /// A disc is lifted or carried: the screen keeps its focus on the ring.
+    /// True while a disc is lifted or carried — the screen must keep focus on the ring.
     pub(crate) fn carrying(&self) -> bool {
         self.editing
             .as_ref()
@@ -246,7 +224,7 @@ impl Ring {
         self.edits.pop_front()
     }
 
-    /// The session facts, per frame. The ring config is re-parsed only when the blob changes.
+    /// Overlay config is re-parsed only when the blob changes.
     pub(crate) fn set_facts(&mut self, facts: &RingFacts) {
         if facts.overlay_actions != self.facts.overlay_actions {
             self.cfg = OverlayConfig::parse(&facts.overlay_actions, RingPlatform::Desktop);
@@ -254,10 +232,9 @@ impl Ring {
         self.facts = facts.clone();
     }
 
-    // The next six are the IN-STREAM ring's surface, driven only by the desktop overlay
-    // (`skia_overlay`, Linux/Windows). The Android console holds the ring solely as the
-    // editor, so its clippy sees them unused — allowed rather than cfg'd out, because
-    // cfg'ing them would cascade into their parameter types' imports.
+    // In-stream surface (`skia_overlay`). Android uses this type only as the editor,
+    // so clippy sees these unused — `allow` rather than `cfg`, which would cascade
+    // into the parameter types' imports.
     #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn input(&mut self, input: RingInput) {
         match input {
@@ -297,8 +274,8 @@ impl Ring {
     fn close(&mut self) {
         self.committed = false;
         self.progress = 0.0;
-        // Not a snap to nothing: the discs wind back in (`render` runs `shown` down and
-        // clears `closing` when it lands). Reduce motion closes at once.
+        // Not a snap: `render` winds `shown` down and clears `closing` on land.
+        // Reduce motion closes at once.
         self.closing = self.shown > 0.0 && !crate::theme::reduce_motion();
         if !self.closing {
             self.shown = 0.0;
@@ -320,8 +297,8 @@ impl Ring {
         self.hint_at = Instant::now();
     }
 
-    /// Timeouts: the exit disc's 8 s idle rule (unless the sheet is up), and the 2 s life of
-    /// an armed slot or a hint. Once per frame, before the damage key is read.
+    /// Idle-close after `IDLE_CLOSE` unless the sheet or editor is up; drop arm/hint
+    /// after `HINT_LIFE`. Once per frame, before `damage` is read.
     pub(crate) fn tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
         if self.committed
@@ -347,7 +324,7 @@ impl Ring {
         std::mem::take(&mut self.cmds)
     }
 
-    /// Everything the drawing depends on, folded into one number for the damage gate.
+    /// Overlay damage key: redraw only when this changes.
     #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn damage(&self) -> u64 {
         if !self.visible() {
@@ -367,16 +344,15 @@ impl Ring {
         self.facts.stats_tier.hash(&mut h);
         self.facts.mic_muted.hash(&mut h);
         self.facts.mode.hash(&mut h);
-        // While anything is still on the move the key changes every frame, so the overlay
-        // keeps drawing until it has all landed.
+        // Hash `frame` while animating so the overlay keeps drawing until springs land.
         if self.animating() {
             self.frame.hash(&mut h);
         }
         h.finish().max(1)
     }
 
-    /// Is any spring, ease or entrance still short of where it is going? Read before a
-    /// frame, so it describes the state the last render left behind.
+    /// True while a spring, ease, or entrance is short of its target. Read before
+    /// the next frame: this is the state the last render left.
     #[cfg_attr(target_os = "android", allow(dead_code))]
     fn animating(&self) -> bool {
         if self.closing {
@@ -391,8 +367,6 @@ impl Ring {
         (0..7).any(|k| self.hot[k] != self.hot_target(k))
     }
 
-    /// Where slot `k`'s highlight amount is heading: lit for the pad's highlight and for a
-    /// lifted disc, dark otherwise.
     fn hot_target(&self, k: usize) -> f32 {
         let lifted = self.editing.as_ref().and_then(|e| e.lifted);
         if self.highlight == Some(k) || lifted == Some(k) {
@@ -402,9 +376,8 @@ impl Ring {
         }
     }
 
-    /// The host's pre-fetched actions. The cache is the desktop shell's; the Android console
-    /// only ever draws this ring as the editor, where the three power actions are previewed
-    /// (`preview_host_label`).
+    /// Desktop shell cache; empty on Android, where the editor previews via
+    /// [`preview_host_label`].
     fn actions(&self) -> Vec<ActionInfo> {
         #[cfg(any(target_os = "linux", windows))]
         {
@@ -521,8 +494,8 @@ impl Ring {
         }
     }
 
-    /// A slot was pressed (ring or sheet): dim ⇒ say why; destructive ⇒ arm, then fire on
-    /// the second press; toggles leave the ring open, commands close it.
+    /// Dim: say why. Destructive: arm, fire on the second press. Toggles stay
+    /// open; commands close.
     fn fire(&mut self, slot: &SlotId) {
         self.touch();
         let s = self.spec(slot);
@@ -576,13 +549,11 @@ impl Ring {
             }
         }
         if s.toggle {
-            // The state shown is the one BEFORE the command lands; the next frame's facts
-            // correct the label under the ring.
+            // Label is the state before the command; next frame's facts correct it.
             self.say(format!("{}: {}", s.label, s.state));
         }
     }
 
-    /// The sheet's rows in the fixed catalogue order (D2).
     fn sheet_rows(&self) -> Vec<SheetRow> {
         let mut rows = vec![
             SheetRow::Slot(SlotId::EndStream),
@@ -642,7 +613,7 @@ impl Ring {
         }
     }
 
-    /// Left/Right on the resolution rows cycles the presets (native first).
+    /// Cycle resolution/refresh presets; native is first.
     fn adjust(&mut self, row: &SheetRow, dir: i32) {
         self.touch();
         let (w, h, hz) = self.facts.mode;
@@ -691,9 +662,8 @@ impl Ring {
         }
     }
 
-    /// Pointer input while open; always consumed (the scrim owns the glass). The editor's
-    /// ring takes only what lands on a disc or belongs to a carry, so the screen's own
-    /// widgets under it keep their pointer.
+    /// Consumed while open (the scrim). Editor: only hits on a disc or an in-flight
+    /// carry, so widgets under the ring keep their pointer.
     pub(crate) fn pointer(&mut self, p: Pointer) -> bool {
         if !self.open() {
             return false;
@@ -742,8 +712,8 @@ impl Ring {
         true
     }
 
-    /// A press on a disc starts a carry; a release short of the slop is the pick, one over
-    /// another slot is the swap. Anything off the discs is the screen's.
+    /// Press starts a carry; release under slop is pick, over another slot is swap.
+    /// Off the discs: the screen's.
     fn edit_pointer(&mut self, p: Pointer) -> bool {
         let geom = self.geom.clone();
         let Some(ed) = self.editing.as_mut() else {
@@ -778,7 +748,7 @@ impl Ring {
                 let Some(d) = ed.drag.take() else {
                     return false;
                 };
-                // The carried disc's own rect has followed the pointer, so look past it.
+                // Carried disc's rect has followed the pointer, so look past it.
                 let target = (0..6).find(|&j| j != d.slot && p.hits(geom[j]));
                 match target {
                     Some(j) if d.moved() => self.edits.push_back(EditEvent::Swap(d.slot, j)),
@@ -795,8 +765,7 @@ impl Ring {
         }
     }
 
-    /// Keyboard while open — the pad's vocabulary on keys: arrows move the highlight, Return
-    /// activates, Escape backs out. Always consumed while open.
+    /// Pad vocabulary on keys. Always consumed while open, including unknown keys.
     #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn key(&mut self, key: Key) -> bool {
         if !self.open() {
@@ -816,10 +785,9 @@ impl Ring {
         true
     }
 
-    /// The pad while open (design §2.6): Right steps the highlight clockwise, Left
-    /// anticlockwise, Up jumps to 12 o'clock, Down to 6, Y returns it to the centre; A fires
-    /// the highlight (the centre opens the sheet), B closes (the sheet first). In the sheet,
-    /// the list takes the moves and Left/Right adjusts a resolution row.
+    /// Pad while open: Right/Left step the ring, Up is 12 o'clock, Down is 6, Y is
+    /// centre. A fires (centre opens the sheet); B closes (sheet first). In the sheet
+    /// the list takes moves; Left/Right adjust a resolution row.
     pub(crate) fn menu(&mut self, ev: MenuEvent) -> Option<MenuPulse> {
         if !self.open() {
             return None;
@@ -840,7 +808,7 @@ impl Ring {
         }
         let h = self.highlight.unwrap_or(6);
         match ev {
-            // The weapon-wheel idiom: the stick's angle is the slot, neutral is the centre.
+            // Stick angle is the slot; neutral is the centre.
             MenuEvent::Sector(sector) => {
                 self.stick = sector.is_some();
                 let next = sector.map_or(6, |k| usize::from(k) % 6);
@@ -890,16 +858,14 @@ impl Ring {
         }
     }
 
-    /// The pad in the editor (§3.3): Right and Left step the highlight round the ring, Up and
-    /// Down jump to 12 and 6 o'clock, A picks what the slot holds — or drops a lifted disc on
-    /// it — Y lifts the disc (Y again puts it down), B puts a lifted disc down; with nothing
-    /// lifted B is the screen's. The centre is inert.
+    /// Editor pad: Right/Left step, Up/Down jump to 12 and 6. A picks or drops a
+    /// lift; Y lifts (again puts down). B with a lift puts it down; else B is the
+    /// screen's. Centre is inert.
     fn edit_menu(&mut self, ev: MenuEvent) -> Option<MenuPulse> {
         let h = self.highlight.unwrap_or(0).min(5);
         let ed = self.editing.as_mut()?;
         match ev {
-            // The stick points at a slot; back to neutral it leaves the highlight where it
-            // is, since the centre is inert here.
+            // Neutral leaves the highlight: the centre is inert here.
             MenuEvent::Sector(sector) => {
                 self.stick = sector.is_some();
                 let next = usize::from(sector?) % 6;
@@ -946,7 +912,7 @@ impl Ring {
         }
     }
 
-    /// Draw the ring (and the sheet) over the stream chrome. `scale` is the chrome scale.
+    /// `scale` is the chrome scale.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render(
         &mut self,
@@ -960,10 +926,8 @@ impl Ring {
         if !self.visible() {
             return;
         }
-        // The twist drives the opening; the commit springs the rest of the way — a whisker
-        // past the seats and back, so the twist's momentum carries into the arrival. Reduce
-        // motion (design §2.3): a crossfade in place — no spring, no spiral, no scale
-        // travel; the twist still opens it. Closed, the discs wind back in and fade.
+        // Twist drives opening; after commit the spring overshoots then seats. Reduce
+        // motion: fade in place, no spring/spiral. Closing winds `shown` down.
         let reduce = crate::theme::reduce_motion();
         if self.closing {
             self.shown = approach(f64::from(self.shown), 0.0, dt, 0.045) as f32;
@@ -1027,11 +991,10 @@ impl Ring {
             .clamp(margin, (height as f32 - margin).max(margin));
         let white = |a: f32| Color4f::new(1.0, 1.0, 1.0, a);
 
-        // The scrim: nothing reaches the stream while the ring is open. The editor has its
-        // own backdrop and widgets under the ring, so it draws none.
+        // Scrim while open so nothing reaches the stream. Editor: none — its screen
+        // owns the backdrop and the widgets under the ring.
         let editing = self.editing.is_some();
         if !editing {
-            // A pool of shade around the ring, thinning to a light veil over the rest.
             canvas.draw_rect(
                 Rect::from_wh(width as f32, height as f32),
                 &ring_scrim(cx, cy, radius * 2.8, vis),
@@ -1051,14 +1014,9 @@ impl Ring {
                 self.geom[k] = Rect::new_empty();
                 continue;
             }
-            // Slot k sits at 12, 2, 4… o'clock and travels out along a short spiral that
-            // turns the way the hand turns; the spring's overshoot carries it a hair past
-            // its seat and back. Under reduce motion it sits in place from the start and
-            // only fades (`q` still drives the alpha below).
-            // The spring's excess past 1 is what overshoots. The stagger's own headroom is
-            // not: `q_raw` sits ABOVE 1 for the early slots whenever `shown` is near 1 (it
-            // divides the lag out), so clamping it high would park them past their seats
-            // for good — at rest every disc sits exactly on its seat.
+            // Overshoot is only `shown - 1`. Do not lift `q_raw` past 1: the lag
+            // divide puts early slots above 1 near rest, and they would park past
+            // their seats. Reduce motion: sit in place, `q` drives alpha only.
             let over = (shown - 1.0).max(0.0);
             let travel = if reduce { 1.0 } else { (q + over).min(1.15) };
             let turn = if self.clockwise { -40.0 } else { 40.0 };
@@ -1067,7 +1025,6 @@ impl Ring {
             let (mut x, mut y) = (cx + radius * travel * c, cy + radius * travel * s);
             let hot = self.hot[k];
             let mut r = slot_d / 2.0 * (0.6 + 0.4 * travel) * (1.0 + 0.08 * hot);
-            // Editing: a carried disc follows the pointer; a lifted one sits raised.
             if let Some((_, dx, dy)) = carried.filter(|(slot, _, _)| *slot == k) {
                 x += dx;
                 y += dy;
@@ -1097,7 +1054,7 @@ impl Ring {
                 white,
             );
             if spec.is_none() && editing {
-                // An empty slot in the editor invites; in-stream it stays plain glass.
+                // Editor: empty slot shows a plus. In-stream: plain glass.
                 crate::icons::draw_icon(canvas, crate::icons::PLUS, x, y, r * 0.7, white(0.35 * q));
             }
             canvas.draw_circle(
@@ -1108,16 +1065,15 @@ impl Ring {
             highlight_ring(canvas, x, y, r, hot * q, scale, white);
             self.geom[k] = Rect::from_xywh(x - r, y - r, 2.0 * r, 2.0 * r);
         }
-        // The centre arrives last and opens the sheet.
         let cq_raw = (shown - 6.0 * SLOT_LAG) / (1.0 - 6.0 * SLOT_LAG);
         let cq = cq_raw.clamp(0.0, 1.0);
         if cq > 0.0 {
-            // As with the slots: only the spring's excess overshoots.
+            // Overshoot is only `shown - 1`, same as the slots.
             let over = (shown - 1.0).max(0.0);
             let pop = if reduce { 1.0 } else { (cq + over).min(1.15) };
             let hot = self.hot[6];
             let r = CENTRE_D * scale / 2.0 * (0.6 + 0.4 * pop) * (1.0 + 0.06 * hot);
-            // In the editor the centre is not editable, so it sits dimmed and inert.
+            // Editor: centre is not a slot, so dimmed and inert.
             let more = Spec {
                 id: "more".into(),
                 label: "More".into(),
@@ -1155,8 +1111,6 @@ impl Ring {
         } else {
             self.geom[6] = Rect::new_empty();
         }
-        // The label under the ring: a hint, else the highlighted slot's name (the label a
-        // finger would reveal). The editor says what the next press does.
         let label = self.hint.clone().or_else(|| match self.highlight {
             _ if lifted.is_some() => Some("Move to a slot and press A to swap".into()),
             Some(6) => Some("More".into()),
@@ -1179,7 +1133,7 @@ impl Ring {
             let tw = fonts.measure(hint, W::Medium, size);
             let (px, py) = (14.0 * scale, 8.0 * scale);
             let (w, h) = (tw + 2.0 * px, LABEL_H * scale);
-            // Rides in with the ring: fades with it and settles up from a little below.
+            // Fade with the ring; 8 px rise as `vis` goes to 1.
             let (x, y) = (
                 cx - w / 2.0,
                 cy + radius + slot_d + (1.0 - vis) * 8.0 * scale,
@@ -1221,8 +1175,7 @@ impl Ring {
         let h = ((rows.len() as f32 * 50.0 + 24.0) * scale).min(height as f32 * 0.6);
         let rise = self.sheet_rise as f32;
         let x = (width as f32 - w) / 2.0;
-        // The sheet rises into its seat from a little below, fading in as it comes; its
-        // rows fan in on the list's own entrance.
+        // 28 px rise into seat; rows fan in on the list's own entrance.
         let y = height as f32 - h - 16.0 * scale + (1.0 - rise) * 28.0 * scale;
         let rect = Rect::from_xywh(x, y, w, h);
         let corner = 16.0 * scale;
@@ -1252,17 +1205,15 @@ impl Ring {
     }
 }
 
-/// The icon a built-in slot draws instead of a word (Lucide, via [`crate::icons`]) — the
-/// mic swaps to its struck form while muted. The mapping is the SHARED one, so a slot cannot
-/// carry one mark here and another in the GTK or Windows editor that configures it.
-/// `None` for what the set cannot know: a shortcut (its keycap chord IS its face) and any
-/// host action beyond the three powers.
+/// Shared slot icon (`overlay_actions::slot_icon` via [`crate::icons`]) so GTK/Windows
+/// editors cannot disagree. Mic swaps to its struck form while muted. `None` for a
+/// shortcut (the chord is the face) and any host action beyond the three powers.
 fn slot_icon(id: &str, state: &str) -> Option<crate::icons::Icon> {
     crate::icons::by_name(pf_client_core::overlay_actions::slot_icon(id, state)?)
 }
 
-/// The pad's highlight on a disc: a soft white glow past the edge and a crisp ring on it,
-/// both at `amount` — eased by the caller, so the mark travels between discs.
+/// Glow past the edge and a crisp ring, both at `amount`. Caller eases so the mark
+/// travels between discs.
 fn highlight_ring(
     canvas: &Canvas,
     x: f32,
@@ -1288,7 +1239,6 @@ fn highlight_ring(
     );
 }
 
-/// One translucent disc with its short label — the in-stream pill family's surface, round.
 #[allow(clippy::too_many_arguments)]
 fn draw_disc(
     canvas: &Canvas,
@@ -1322,14 +1272,11 @@ fn draw_disc(
         white(0.35 * alpha)
     };
     let size = f64::from(12.0 * scale * (r / (SLOT_D * scale / 2.0)).clamp(0.6, 1.2));
-    // A shortcut is a stacked keycap: the modifiers small on top, the key large under them —
-    // one line ran to the disc's edge and past it.
+    // Shortcut: stacked keycap. One line ran to the disc's edge and past it.
     if spec.id.starts_with("shortcut:") && spec.short.contains('+') {
         keycap_text(canvas, fonts, x, y, r, size, &spec.short, color);
         return;
     }
-    // Every built-in slot draws as its icon; only an id the set does not know — an unknown
-    // host action, a future slot — falls back to its short word.
     if let Some(icon) = slot_icon(&spec.id, &spec.state) {
         crate::icons::draw_icon(canvas, icon, x, y, r * 1.05, color);
         return;
@@ -1346,8 +1293,8 @@ fn draw_disc(
     );
 }
 
-/// A chord's legend (`Ctrl+Shift+Esc`) on a disc: the modifiers small on top, the key large
-/// under them. `size` is the disc's base text size.
+/// Chord on a disc: modifiers small on top, key large under them. `size` is the
+/// disc's base text size.
 #[allow(clippy::too_many_arguments)]
 fn keycap_text(
     canvas: &Canvas,
@@ -1397,8 +1344,7 @@ fn keycap_text(
     );
 }
 
-/// A shortcut's disc as the ring draws it, for the editors' previews: the translucent disc,
-/// the hairline, and the chord as a stacked keycap. `chip` empty draws an empty disc.
+/// Editor preview of a shortcut disc. Empty `chip` draws an empty disc.
 pub(crate) fn draw_keycap_disc(
     canvas: &Canvas,
     fonts: &Fonts,
@@ -1467,7 +1413,7 @@ mod tests {
             y: 300.0,
         });
         r.input(RingInput::Commit);
-        r.input(RingInput::Cancel); // wound back after a commit
+        r.input(RingInput::Cancel);
         assert!(!r.open());
     }
 
@@ -1553,15 +1499,12 @@ mod tests {
         r.menu(MenuEvent::Back);
         assert!(!r.sheet && r.open(), "B leaves the sheet, keeps the ring");
         r.menu(MenuEvent::Move(MenuDir::Up));
-        r.menu(MenuEvent::Confirm); // slot 0 of the desktop default = End stream: arms
+        r.menu(MenuEvent::Confirm); // desktop default slot 0 is End stream: arms
         assert_eq!(r.armed.as_deref(), Some("end_stream"));
         r.menu(MenuEvent::Back);
         assert!(!r.open(), "B closes the ring");
     }
 
-    /// The stream overlay redraws only when `damage` changes, so the ring reports itself
-    /// animating — and changes its key every tick — until every spring, ease and entrance
-    /// has landed; settled, a tick changes nothing. Closed, it stays visible to wind in.
     #[test]
     fn the_damage_key_keeps_changing_until_the_ring_has_settled() {
         let mut r = Ring::new();
@@ -1572,7 +1515,7 @@ mod tests {
         let a = r.damage();
         r.tick();
         assert_ne!(a, r.damage(), "a tick is a new key while animating");
-        // No canvas here: land the spring by hand, the way a render would.
+        // No canvas: land the spring the way `render` would.
         r.spring = Spring::rest(1.0);
         r.shown = 1.0;
         assert!(!r.animating(), "landed");
@@ -1590,9 +1533,6 @@ mod tests {
         );
     }
 
-    /// Design §2.6, D12: the stick's sector IS the slot, and while it is engaged the four-way
-    /// moves it also raises step nothing; neutral is the centre in-stream and leaves the
-    /// highlight alone in the editor; the D-pad steps again once the stick lets go.
     #[test]
     fn the_stick_points_at_a_slot_and_the_dpad_steps_only_when_it_lets_go() {
         let mut r = Ring::new();
@@ -1636,8 +1576,6 @@ mod tests {
         assert_eq!(e.highlight, Some(1));
     }
 
-    /// Every built-in slot the ring can hold draws as an icon, not a word; the muted mic
-    /// swaps to its struck form; shortcuts and unknown host actions stay text.
     #[test]
     fn every_built_in_slot_has_an_icon() {
         for id in [
@@ -1661,8 +1599,6 @@ mod tests {
         assert!(slot_icon("shortcut:s1", "").is_none());
     }
 
-    /// The editor (§3.3): A on a slot asks for a pick, Y lifts and A on another slot asks for
-    /// a swap, B with a disc lifted only puts it down, and the ring never closes by itself.
     #[test]
     fn the_editor_picks_lifts_and_swaps_without_ever_firing() {
         let mut r = Ring::new();
@@ -1673,11 +1609,11 @@ mod tests {
         assert_eq!(r.take_edit(), Some(EditEvent::Pick(0)));
         assert_eq!(r.take_command(), None, "End stream did not arm or fire");
         assert_eq!(r.armed, None);
-        r.menu(MenuEvent::Secondary); // lift slot 0
+        r.menu(MenuEvent::Secondary);
         assert!(r.carrying());
         r.menu(MenuEvent::Move(MenuDir::Right));
         r.menu(MenuEvent::Move(MenuDir::Right));
-        r.menu(MenuEvent::Confirm); // drop on slot 2
+        r.menu(MenuEvent::Confirm);
         assert_eq!(r.take_edit(), Some(EditEvent::Swap(0, 2)));
         assert!(!r.carrying());
         r.menu(MenuEvent::Secondary);
@@ -1693,14 +1629,12 @@ mod tests {
         assert!(r.open(), "and the ring stayed open");
     }
 
-    /// A pointer: a press and release on one disc is the pick; a press carried onto another
-    /// disc is the swap; a press between the discs is the screen's.
     #[test]
     fn the_editor_takes_a_click_as_a_pick_and_a_carry_as_a_swap() {
         let mut r = Ring::new();
         r.set_facts(&facts());
         r.edit_at(300.0, 300.0);
-        // Stand in for a frame: the slot rects at 12 and 2 o'clock, the ring fully shown.
+        // Stand-in slot rects at 12 and 2 o'clock; the ring is fully shown.
         r.geom[0] = Rect::from_xywh(272.0, 152.0, 56.0, 56.0);
         r.geom[1] = Rect::from_xywh(376.0, 212.0, 56.0, 56.0);
         let at = |x: f64, y: f64, kind: PointerKind| Pointer { x, y, kind };

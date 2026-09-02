@@ -1,10 +1,11 @@
-//! The generic stateful virtual-pad manager ([`UhidManager`]) shared by the five backends that
-//! keep a full per-pad report state (Linux UHID DualSense / DualShock 4 / Steam Deck, Windows UMDF
-//! DualSense / DualShock 4): event routing, the frame merge, rich-input application, the silence
-//! heartbeat, and the feedback pump with rumble + hidout dedup are written once here; a backend
-//! supplies only its per-controller pieces via [`PadProto`]. The stateless backends (Linux uinput,
-//! Windows XUSB) write frames straight through with no state vec / heartbeat / rich plane, so they
-//! use [`PadSlots`] directly instead.
+//! Stateful virtual-pad manager ([`UhidManager`]) shared by the five backends that keep a full
+//! per-pad report (Linux UHID DualSense / DualShock 4 / Steam Deck, Windows UMDF DualSense /
+//! DualShock 4). Event routing, frame merge, rich-input, silence heartbeat, and the rumble +
+//! hidout-dedup feedback pump live here; a backend supplies only its per-controller pieces via
+//! [`PadProto`].
+//!
+//! Stateless backends (Linux uinput, Windows XUSB) write frames through [`PadSlots`] with no
+//! state vec, heartbeat, or rich plane. Rumble plane: `design/trigger-rumble-plane.md`.
 
 use crate::hidout_dedup::HidoutDedup;
 use crate::pad_slots::PadSlots;
@@ -13,160 +14,112 @@ use punktfunk_core::input::{GamepadEvent, GamepadFrame, MAX_PADS};
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::time::{Duration, Instant};
 
-/// What one feedback pass extracted from a pad's driver/kernel channel. `rumble` rides the
-/// universal 0xCA plane (deduped against the last-forwarded level); `hidout` carries the rich
-/// 0xCD feedback events (lightbar / player LEDs / adaptive triggers), deduped via [`HidoutDedup`].
+/// One poll of a pad's driver/kernel channel. `rumble` is the 0xCA plane; `hidout` is 0xCD
+/// (lightbar / LEDs / adaptive triggers), both deduped before forward.
 #[derive(Default)]
 pub struct PadFeedback {
-    /// `(low, high, left_trigger, right_trigger)` motor levels, if the pass saw a rumble report.
-    ///
-    /// Range is `0..=0xFFFF` — this said `0..=0xFF00`, which is only true of the backends that
-    /// widen the device's 8-bit motor byte by `<< 8` (the UHID/DualSense path). The Windows
-    /// backend widens by `× 257` and does reach 0xFFFF, and this type carries both. Neither is a
-    /// defect: consumers narrow with `>> 8`, and 0xFF00 and 0xFFFF both narrow back to 255.
-    ///
-    /// The two trailing fields are the Xbox impulse-trigger motors, which ride the 0xCA plane's
-    /// v3 tail (design/trigger-rumble-plane.md). **Exactly one backend can ever set them non-zero**
-    /// — the Windows HID Xbox pad, whose output report `0x03` has fields for them. Every other
-    /// backend reports `(low, high, 0, 0)` because the packet it parses has nowhere to carry them:
-    /// XUSB's `SET_STATE` is `rumble_large`/`rumble_small`, evdev's `FF_RUMBLE` is strong/weak,
-    /// and a DualSense's trigger actuators are *adaptive* (force resistance, on the 0xCD plane)
-    /// rather than motors. That is a permanent property of those protocols, not a gap to fill.
+    /// `(low, high, left_trigger, right_trigger)` if this poll saw a rumble report.
+    /// Range is `0..=0xFFFF`; consumers narrow with `>> 8` (0xFF00 and 0xFFFF both become 255).
+    /// Trailing pair is Xbox impulse-trigger motors on the 0xCA v3 tail
+    /// (`design/trigger-rumble-plane.md`). Only the Windows HID Xbox pad ever sets them: its
+    /// `0x03` report has those fields. Every other protocol reports `(low, high, 0, 0)` —
+    /// DualSense trigger actuators are adaptive (0xCD), not motors.
     pub rumble: Option<(u16, u16, u16, u16)>,
     pub hidout: Vec<HidOutput>,
-    /// Whether the game drove this pad's RUMBLE plane this poll — at least one output report
-    /// asserted the vibration fields (valid-flag set, including an explicit zero), not merely any
-    /// report. Backends uphold `rumble_drove == Some(true)` ⇔ `rumble.is_some()`; the separate
-    /// field exists so `None` can mean "backend does not track activity" (force-off disabled).
-    /// Keying the abandoned-rumble force-off in [`UhidManager::pump`] on the rumble plane
-    /// specifically — not on general output traffic — is what keeps a title that streams
-    /// LED/adaptive-trigger reports every frame from feeding the watchdog forever while a latched
-    /// rumble level never re-asserts (the lost-stop case).
+    /// `Some(true)` iff this poll saw a vibration-asserting output report (including explicit
+    /// zero). `None` = backend does not track activity, so [`UhidManager::pump`] never force-offs.
+    /// Keyed on the rumble plane, not general output, so an LED/trigger stream cannot keep an
+    /// abandoned rumble alive.
     pub rumble_drove: Option<bool>,
-    /// The backend's driver-channel drain OVERFLOWED and dropped reports this poll — downstream
-    /// feedback state is unknown. [`UhidManager::pump`] resyncs: it forwards a rumble stop
-    /// (bounded and imperceptible — a game still rumbling re-asserts the level within a poll or
-    /// two) and re-arms the rich-plane dedup so the next LED/trigger state re-forwards. Only the
-    /// Windows ring drains can set it; Linux kernel channels drain losslessly.
+    /// Driver-channel drain overflowed this poll; downstream feedback state is unknown.
+    /// [`UhidManager::pump`] force-stops rumble and re-arms hidout dedup. Windows ring drains
+    /// only; Linux kernel channels drain losslessly.
     pub resync: bool,
 }
 
-/// The per-controller half of a stateful virtual-pad backend — everything [`UhidManager`] cannot
-/// share because it differs per protocol: the transport open, the report-state model and its
-/// GameStream/rich-input mappers, the state write, and the feedback poll.
-///
-/// The `&mut self` receivers let a backend carry configuration (the Steam-paddle remap policy, a
-/// pad identity); most implementations are otherwise stateless.
+/// Per-controller half of a stateful virtual-pad backend: transport open, report-state model,
+/// GameStream/rich-input mappers, state write, and feedback poll. `&mut self` lets a backend
+/// carry configuration (Steam-paddle remap, pad identity); most implementations are otherwise
+/// stateless.
 pub trait PadProto {
-    /// The per-pad transport (a UHID fd, a UMDF shared-memory channel, the Deck transport enum).
     type Pad;
-    /// The pad's full report state (`DsState`, `SteamState`) — `Copy` like both of those, so the
-    /// manager can hand a snapshot to [`write_state`](Self::write_state) without borrow gymnastics.
+    /// Full report state (`DsState`, `SteamState`). `Copy` so the manager can snapshot into
+    /// [`write_state`](Self::write_state) without holding the pad borrow.
     type State: Copy;
 
-    /// Backend tag in the shared lifecycle log lines, e.g. `"DualSense/Windows"`.
     const LABEL: &'static str;
-    /// Device name in the create-failure line ("virtual `<DEVICE>` creation failed …").
     const DEVICE: &'static str;
     /// Suffix for the create-failure line — empty on Linux, the driver-install hint on Windows.
     const CREATE_HINT: &'static str;
 
-    /// Open the virtual pad for wire index `idx`, logging its own success line (it knows the
-    /// transport detail worth printing); failures are logged by the manager's create gate.
+    /// Backend logs success; the manager logs create-gate failures.
     fn open(&mut self, idx: u8) -> Result<Self::Pad>;
-    /// The all-neutral report state a fresh or unplugged pad (re)starts from.
     fn neutral(&self) -> Self::State;
-    /// Fold one decoded button/stick frame into a new state, preserving from `prev` every field
-    /// that arrives on the rich plane instead (touch contacts / clicks, motion) — the G2 hook, in
-    /// one place per backend. Paddle remap policy is applied here too.
+    /// Fold one button/stick frame into a new state, preserving from `prev` every field that
+    /// arrives on the rich plane (touch / motion). Paddle remap applies here too.
     fn merge_frame(&self, prev: &Self::State, f: &GamepadFrame) -> Self::State;
-    /// Apply one rich client→host event (touchpad contact / motion sample) to the state.
     fn apply_rich(&self, st: &mut Self::State, rich: RichInput);
     /// Write the full state to the pad (best-effort; the next frame or heartbeat re-syncs).
     fn write_state(&self, pad: &mut Self::Pad, st: &Self::State);
-    /// Poll the pad's driver/kernel channel: answer any pending handshake and return the feedback
-    /// it carried. `idx` is the wire pad index (the DualSense GET_REPORT replies need it).
+    /// Poll the pad's driver/kernel channel: answer any pending handshake and return the
+    /// feedback it carried. `idx` is the wire pad index (DualSense GET_REPORT replies need it).
     fn service(&self, pad: &mut Self::Pad, idx: u8) -> PadFeedback;
-    /// Whether this pad needs a heartbeat write NOW regardless of the silence gap (the Steam
-    /// backend streams through its gamepad-mode-entry pulse).
+    /// Heartbeat write NOW regardless of the silence gap (Steam gamepad-mode-entry pulse).
     fn force_heartbeat(&self, _pad: &Self::Pad) -> bool {
         false
     }
 
-    /// Zero this state's **angular velocity**, keeping everything else — acceleration included.
-    /// Returns whether anything actually changed, so a pad already at rest costs no write.
+    /// Zero this state's angular velocity; keep acceleration (gravity is persistent). Returns
+    /// whether anything changed, so a pad already at rest costs no write.
     ///
-    /// Motion is a level-triggered plane: [`merge_frame`](Self::merge_frame) preserves the last
-    /// sample and the heartbeat re-emits it with a fresh sequence, so a client that stops sending
-    /// Motion — backgrounded app, a suspended session, a controller swapped for one with no gyro —
-    /// leaves the virtual pad reporting a constant rotation that anything integrating gyro aim
-    /// will happily spin on forever. Rumble and the pen plane each have an idle watchdog; this is
-    /// motion's, driven from [`MOTION_IDLE_TIMEOUT`].
-    ///
-    /// Acceleration is deliberately NOT zeroed: gravity is legitimately persistent, so a still pad
-    /// reporting 1 g down stays correct while a still pad reporting 200 °/s does not.
-    ///
-    /// Backends with no motion plane leave this a no-op and never take the extra write.
+    /// Motion is level-triggered: [`merge_frame`](Self::merge_frame) preserves the last sample
+    /// and the heartbeat re-emits it, so a client that stops sending Motion leaves a constant
+    /// rotation. Idle watchdog, driven from [`MOTION_IDLE_TIMEOUT`]. Backends with no motion
+    /// plane leave this a no-op.
     fn neutralize_gyro(&self, _st: &mut Self::State) -> bool {
         false
     }
 
-    /// Reset the rich-plane fields (touchpad contacts + motion) to what a fresh pad carries,
-    /// leaving buttons, sticks and every feedback cursor alone — for the replug-grace re-claim
-    /// ([`Sweep::reclaimed`](crate::pad_slots::Sweep::reclaimed)), where a different controller
-    /// inherits a live virtual pad without passing through the manager's `reset_pad`.
+    /// Reset rich-plane fields (touch + motion) to a fresh pad, leaving buttons, sticks, and
+    /// feedback cursors. Used on [`Sweep::reclaimed`](crate::pad_slots::Sweep::reclaimed): a
+    /// different controller inherits a live virtual pad without `reset_pad`.
     fn clear_rich(&self, _st: &mut Self::State) {}
 }
 
-/// All virtual pads of one stateful backend, driven from decoded controller events — the shared
-/// skeleton of the five UHID/UMDF managers. Method surface (`new` / `handle` / `apply_rich` /
-/// `pump` / `heartbeat`) is exactly what the session input thread already drives, so each backend
-/// re-exports itself as a `pub type … = UhidManager<…Proto>;` alias.
+/// All virtual pads of one stateful backend. Method surface (`new` / `handle` / `apply_rich` /
+/// `pump` / `heartbeat`) matches the session input thread, so each backend re-exports as
+/// `pub type … = UhidManager<…Proto>`.
 pub struct UhidManager<B: PadProto> {
     backend: B,
     slots: PadSlots<B::Pad>,
-    /// Each pad's current full report — buttons/sticks merged with persisted rich-plane fields.
     state: Vec<B::State>,
-    /// Last rumble forwarded per pad, so a report that only changes rich feedback doesn't re-send
-    /// it. All FOUR levels, deliberately: dedup on the handle pair alone would swallow a
-    /// trigger-only change — a racing title's impulse-trigger stream against silent handles — and
-    /// the pad would never rumble, with nothing logged anywhere.
+    /// Last rumble forwarded per pad. All four levels: dedup on the handle pair alone would
+    /// swallow a trigger-only change and the pad would never rumble.
     last_rumble: Vec<(u16, u16, u16, u16)>,
-    /// Last rich feedback forwarded per pad, so an output report that only changed the rumble
-    /// doesn't re-send unchanged lightbar/LED/trigger state.
+    /// Last rich feedback forwarded per pad, so a rumble-only report does not re-send LEDs.
     hidout_dedup: Vec<HidoutDedup>,
-    /// When each pad last wrote an input report — drives [`heartbeat`](Self::heartbeat).
     last_write: Vec<Instant>,
-    /// When the game last drove each pad's rumble plane (a backend that reports `rumble_drove`
-    /// saw a vibration-asserting output report). A non-zero `last_rumble` older than
-    /// [`RUMBLE_IDLE_TIMEOUT`] against this is a residual the game abandoned — see
-    /// [`pump`](Self::pump).
+    /// When the game last drove this pad's rumble plane. A non-zero `last_rumble` older than
+    /// [`RUMBLE_IDLE_TIMEOUT`] against this is an abandoned residual — see [`pump`](Self::pump).
     last_active: Vec<Instant>,
-    /// When each pad last received a `RichInput::Motion`. `None` before the first sample and again
-    /// once the gyro has been neutralized, so a pad with no motion feed costs nothing per tick —
-    /// see [`MOTION_IDLE_TIMEOUT`].
+    /// Last `RichInput::Motion` per pad. `None` before the first sample and after neutralize, so
+    /// a pad with no motion feed costs nothing per tick.
     last_motion: Vec<Option<Instant>>,
-    /// Per-pad rate limiter for the ring-overflow WARN — see [`OverflowWarn`].
     overflow_warn: Vec<OverflowWarn>,
 }
 
-/// Rate limiter for the per-poll ring-overflow WARN. A sustained >2 kHz output-report writer
-/// against a pre-v2.2 8-slot driver ring overflows EVERY ~4 ms poll; unlimited, that is ~230
-/// WARN lines/s — a field log's 5000-line web-console ring was 96 % this one line, which evicted
-/// the whole session history it was needed to diagnose (2026-07-30). One line per
-/// [`Self::PERIOD`] with a `suppressed` count keeps the signal and the log.
+/// Per-poll ring-overflow WARN limiter. A >2 kHz writer against an 8-slot ring overflows every
+/// ~4 ms poll; unlimited that is ~230 WARN/s. One line per [`Self::PERIOD`] with a `suppressed`
+/// count keeps the signal.
 #[derive(Default, Clone)]
 struct OverflowWarn {
-    /// When the last line was emitted (`None` = never — the next overflow logs immediately).
     last: Option<Instant>,
-    /// Overflow polls swallowed since `last` — carried on the next emitted line.
     suppressed: u32,
 }
 
 impl OverflowWarn {
     const PERIOD: Duration = Duration::from_secs(1);
 
-    /// Record one overflow poll; emit (rate-limited) the WARN for it.
     fn note(&mut self, now: Instant, backend: &'static str, index: usize) {
         if self
             .last
@@ -187,53 +140,31 @@ impl OverflowWarn {
     }
 }
 
-/// How long a latched, non-zero rumble may sit without the game driving the RUMBLE plane before it
-/// is forced off. DualSense/DS4/Deck motors are level-triggered — they run until an output report
-/// sets them to zero — so a game that latches a rumble and then stops asserting the vibration
-/// fields (a residual left at a menu / loading screen, a forgotten stop, or a stop report lost to
-/// the driver section's latest-report coalescing) would otherwise drone to the client forever: the
-/// resend loop in `native.rs` renews the latched level every ~120 ms and the client's envelope
-/// never expires. Keyed on the rumble plane specifically ([`PadFeedback::rumble_drove`]), not on
-/// general output traffic, so an LED/adaptive-trigger stream cannot keep an abandoned rumble
-/// alive — the same decay real DualSense-family firmware applies when vibration-flagged reports
-/// cease.
+/// How long a latched non-zero rumble may sit without the game driving the RUMBLE plane before
+/// it is forced off. DualSense/DS4/Deck motors are level-triggered — they run until an output
+/// report zeros them — and the host resend loop renews a latched level every ~120 ms. Keyed on
+/// [`PadFeedback::rumble_drove`], not general output, so an LED/trigger stream cannot keep an
+/// abandoned rumble alive.
 ///
-/// INVARIANT: must stay comfortably above SDL's ~2 s internal rumble resend
-/// (`SDL_RUMBLE_RESEND_MS`) — SDL-class writers re-assert a held level on that cadence *because*
-/// real firmware decays, and that re-assert is what keeps a legitimately-held long rumble alive
-/// here. The XUSB path shares this window via [`rumble_idle_timeout`] (every XUSB write IS a
-/// rumble write, so its any-activity keying is already rumble-keyed by construction).
+/// INVARIANT: stay above SDL's ~2 s resend (`SDL_RUMBLE_RESEND_MS`). SDL-class writers re-assert
+/// a held level on that cadence because real firmware decays; that re-assert keeps a
+/// legitimately-held rumble alive here. Shared with the XUSB path via [`rumble_idle_timeout`].
 ///
-/// KNOWN COST, deliberately accepted. That invariant only covers writers that re-assert. A game
-/// driving the pad through the kernel's *evdev* FF interface does not: `ff-memless` sends one
-/// output report when an effect starts and one when it stops, with nothing in between, so a finite
-/// effect longer than this window is cut in half here. The uinput path
-/// (`linux/gamepad.rs`) exempts exactly that case — but it can, because evdev FF hands it an
-/// explicit `replay.length`. Nothing equivalent reaches this layer: [`PadFeedback`] carries motor
-/// levels, and the protocols it speaks (DualSense / DS4 / Deck / Switch Pro) are all
-/// level-triggered with no duration field anywhere in a report. So the choice is between cutting a
-/// long finite effect and letting an abandoned residual drone forever, and the residual is the one
-/// with field evidence behind it (a stuck level resent every 500 ms for 5.5 minutes). Switch Pro is
-/// not affected either way — `hid-nintendo` re-sends rumble continuously, and a physical Pro's
-/// HD-rumble decays faster than this window regardless.
-///
-/// Do not "fix" this by widening or disabling the window without evidence about which failure real
-/// titles actually hit; the hatch below exists for exactly that experiment.
+/// KNOWN COST: `ff-memless` sends one report at start and one at stop, so a finite effect
+/// longer than this window is cut in half. The uinput path can exempt that because evdev FF
+/// hands it `replay.length`; nothing equivalent reaches this layer. Do not widen or disable
+/// without evidence; `PUNKTFUNK_RUMBLE_IDLE_MS` exists for that experiment.
 const RUMBLE_IDLE_TIMEOUT: Duration = Duration::from_millis(2500);
 
-/// How long a pad's motion feed may go quiet before its angular velocity is zeroed — see
-/// [`PadProto::neutralize_gyro`]. Wide enough to ride out a hiccup in a 250 Hz feed (~25 missed
-/// samples, and the client's own capture floors are ~4 ms), tight enough that a feed which stops
-/// for good doesn't hand the game a visible spin. Unlike [`RUMBLE_IDLE_TIMEOUT`] there is no
-/// "legitimately held" case to protect: a still controller sends a zero sample, it does not stop
-/// sending.
+/// How long a pad's motion feed may go quiet before angular velocity is zeroed — see
+/// [`PadProto::neutralize_gyro`]. 100 ms ≈ 25 missed samples of a 250 Hz feed (client capture
+/// floors ~4 ms); a still controller sends a zero sample, it does not stop sending.
 const MOTION_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// The abandoned-rumble force-off window, env-hatched: `PUNKTFUNK_RUMBLE_IDLE_MS` overrides
-/// [`RUMBLE_IDLE_TIMEOUT`]; `0` disables the watchdog entirely (the pre-watchdog behavior, for
-/// bisecting field reports). Non-zero overrides are floored just above SDL's ~2 s resend so the
-/// hatch cannot cut legitimately-held rumble (see the INVARIANT above). Shared by the UHID/UMDF
-/// pump, the Windows XUSB manager, and the Linux uinput FF mixer.
+/// Abandoned-rumble force-off window. `PUNKTFUNK_RUMBLE_IDLE_MS` overrides
+/// [`RUMBLE_IDLE_TIMEOUT`]; `0` disables. Non-zero values are floored at 2100 ms, just above
+/// SDL's ~2 s resend, so the hatch cannot cut a legitimately-held rumble. Shared by UHID/UMDF,
+/// Windows XUSB, and the Linux uinput FF mixer.
 pub(crate) fn rumble_idle_timeout() -> Option<Duration> {
     static VAL: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
     *VAL.get_or_init(|| match std::env::var("PUNKTFUNK_RUMBLE_IDLE_MS") {
@@ -274,20 +205,14 @@ impl<B: PadProto> UhidManager<B> {
         }
     }
 
-    /// How many virtual pads this manager has actually BUILT
-    /// ([`PadSlots::live`](crate::pad_slots::PadSlots::live)).
-    ///
-    /// For bring-up harnesses, which are the only callers that can act on it: a create failure
-    /// leaves the slot empty and only logs, so a harness that pushes frames regardless still
-    /// "works" — it just drives nothing, while whatever OTHER process owns that pad index keeps
-    /// answering every probe the operator then runs. That is how a stale pad's frozen XInput
-    /// packet count was once read as a measurement (2026-08-09, `.173`). A session has no use for
-    /// this: its pads come and go with the client's `active_mask` and zero is a normal state.
+    /// Bring-up harnesses only ([`PadSlots::live`](crate::pad_slots::PadSlots::live)): a create
+    /// failure leaves the slot empty and only logs, so a harness that still pushes frames
+    /// drives nothing while another process may own that index. A session has no use for this
+    /// — zero is a normal `active_mask` state.
     pub fn live_pads(&self) -> usize {
         self.slots.live()
     }
 
-    /// Handle one decoded controller event (create/destroy by mask, then merge button/stick state).
     pub fn handle(&mut self, ev: &GamepadEvent) {
         match ev {
             GamepadEvent::Arrival { index, kind, .. } => {
@@ -299,8 +224,8 @@ impl<B: PadProto> UhidManager<B> {
                 if idx >= MAX_PADS {
                     return;
                 }
-                // Unplugs: arm the grace for any pad whose mask bit cleared (the drop itself lands
-                // on a later `pump` tick — this frame is the only one the producer sends).
+                // Unplug: arm grace for any pad whose mask bit cleared. The drop lands on a later
+                // `pump` tick — this frame is the only one the producer sends.
                 let sweep = self.slots.sweep(f.active_mask);
                 self.reset_swept(sweep.dropped);
                 self.clear_reclaimed_rich(sweep.reclaimed);
@@ -308,17 +233,13 @@ impl<B: PadProto> UhidManager<B> {
                     return; // this event WAS the unplug
                 }
                 self.ensure(idx);
-                // Merge buttons/sticks/triggers from the frame, preserving the rich-plane fields
-                // (touch + motion arrive separately and must survive a button-only frame).
                 self.state[idx] = self.backend.merge_frame(&self.state[idx], f);
                 self.write(idx);
             }
         }
     }
 
-    /// Apply one rich client→host event (touchpad contact / motion sample) to an existing pad,
-    /// preserving its button/stick state. Rich events never create a pad (a controller must have
-    /// arrived first); they're dropped if the pad isn't present.
+    /// Never creates a pad; dropped if the pad is not present.
     pub fn apply_rich(&mut self, rich: RichInput) {
         let idx = match rich {
             RichInput::Touchpad { pad, .. }
@@ -336,10 +257,9 @@ impl<B: PadProto> UhidManager<B> {
         self.write(idx);
     }
 
-    /// Re-emit each live pad's CURRENT report if it's been silent for `max_gap` (or the backend
-    /// forces a write). The UHID/UMDF drivers treat a multi-second input silence — a held-steady
-    /// stick produces no wire events — as an unplugged controller; re-sending the current state is
-    /// idempotent (a stale-but-correct frame, never a phantom input).
+    /// Re-emit each live pad's current report if silent for `max_gap` (or the backend forces a
+    /// write). UHID/UMDF treat a multi-second input silence as unplug; a held stick produces no
+    /// wire events. Re-sending is idempotent: a stale-but-correct frame, never a phantom input.
     pub fn heartbeat(&mut self, max_gap: Duration) {
         let now = Instant::now();
         for i in 0..MAX_PADS {
@@ -347,10 +267,9 @@ impl<B: PadProto> UhidManager<B> {
                 continue;
             };
             let forced = self.backend.force_heartbeat(pad);
-            // A motion feed that stopped must not keep re-emitting its last angular velocity: the
-            // heartbeat below re-sends the current report forever, and with a real sensor clock
-            // each re-send carries an honestly larger dt — precisely the shape of phantom
-            // rotation. Zero the gyro once and stop watching until the feed comes back.
+            // A stopped motion feed must not keep re-emitting its last angular velocity: heartbeat
+            // re-sends the current report forever, and a real sensor clock grows dt each time —
+            // the shape of phantom rotation. Zero once and stop watching until the feed returns.
             let mut neutralized = false;
             if self.last_motion[i].is_some_and(|t| now.duration_since(t) >= MOTION_IDLE_TIMEOUT) {
                 self.last_motion[i] = None;
@@ -362,12 +281,10 @@ impl<B: PadProto> UhidManager<B> {
         }
     }
 
-    /// Service every pad: answer any pending driver/kernel handshake and route a game's feedback
-    /// back out. `rumble` is invoked `(index, low, high, left_trigger, right_trigger)` only when
-    /// the motor level *changes* (the universal 0xCA plane — the trigger pair is non-zero only on
-    /// the Windows HID Xbox pad, see [`PadFeedback::rumble`]); `hidout` is invoked per rich
-    /// feedback event that isn't an exact repeat of the last-forwarded value (the 0xCD plane).
-    /// Call frequently — kernel/driver init handshakes block until answered.
+    /// Service every pad: answer pending driver/kernel handshakes and route game feedback.
+    /// `rumble` is `(index, low, high, left_trigger, right_trigger)` only when the motor level
+    /// changes (0xCA; trigger pair non-zero only on Windows HID Xbox). `hidout` is each 0xCD
+    /// event that is not an exact repeat. Call frequently — init handshakes block until answered.
     pub fn pump(
         &mut self,
         mut rumble: impl FnMut(u16, u16, u16, u16, u16),
@@ -375,9 +292,8 @@ impl<B: PadProto> UhidManager<B> {
     ) {
         let now = Instant::now();
         // Finish any unplug whose removal frame only armed the grace. The producer emits that
-        // frame exactly once, so without this a detached pad — the single-pad session being the
-        // common case — would never be destroyed. Runs BEFORE the loop so a reaped index is
-        // already gone for `get_mut` here and for `heartbeat`'s `get` later in the same tick.
+        // frame once, so without this a detached pad is never destroyed. Run before the loop so
+        // a reaped index is gone for `get_mut` here and for `heartbeat`'s `get` later this tick.
         let swept = self.slots.reap();
         self.reset_swept(swept);
         for i in 0..MAX_PADS {
@@ -386,13 +302,9 @@ impl<B: PadProto> UhidManager<B> {
             };
             let fb = self.backend.service(pad, i as u8);
             if fb.resync {
-                // The driver's output-report ring overflowed — reports were dropped and the
-                // feedback state is unknown beyond what the drain salvaged from the legacy
-                // latest-report slot (delivered through `fb` like any report). Conservatively
-                // silence the pad FIRST (a plane the salvage didn't carry must not stay latched;
-                // the salvaged state re-applies right below) and re-arm the rich-plane dedup so
-                // the next LED/trigger state re-forwards. WARN through the per-pad rate limiter —
-                // a storm overflows every poll and the raw line once flooded a whole log export.
+                // Output-report ring overflowed: feedback state is unknown beyond what the drain
+                // salvaged. Silence the pad first (an unsaved plane must not stay latched; salvage
+                // re-applies below) and re-arm hidout dedup so the next LED/trigger re-forwards.
                 self.overflow_warn[i].note(now, B::LABEL, i);
                 if self.last_rumble[i] != (0, 0, 0, 0) {
                     self.last_rumble[i] = (0, 0, 0, 0);
@@ -400,10 +312,9 @@ impl<B: PadProto> UhidManager<B> {
                 }
                 self.hidout_dedup[i] = HidoutDedup::default();
             }
-            // Refresh the game-activity clock when the game drove the pad's RUMBLE plane this poll
-            // (a vibration-asserting report, even at an unchanged level). LED/trigger-only traffic
-            // does NOT refresh — see `PadFeedback::rumble_drove`. `None` = a backend that does not
-            // track activity: treated as always-active, so the force-off below never fires there.
+            // Refresh activity when the game drove the rumble plane this poll (even at an
+            // unchanged level). LED/trigger-only traffic does not. `None` = backend does not
+            // track activity: treated as always-active, so the force-off below never fires.
             if fb.rumble_drove != Some(false) {
                 self.last_active[i] = now;
             }
@@ -416,10 +327,9 @@ impl<B: PadProto> UhidManager<B> {
                 && rumble_idle_timeout()
                     .is_some_and(|t| now.duration_since(self.last_active[i]) >= t)
             {
-                // A non-zero rumble is latched but the game has not driven the rumble plane for
-                // the idle window — a residual it forgot to stop (or whose stop was lost). Force it
-                // off (and forward the zero) so `native.rs`'s resend loop stops droning it to the
-                // client. Mirrors the XUSB path's guard; see RUMBLE_IDLE_TIMEOUT.
+                // Latched non-zero rumble, game has not driven the rumble plane for the idle
+                // window. Force off so the host resend loop stops forwarding it. See
+                // RUMBLE_IDLE_TIMEOUT.
                 tracing::info!(
                     backend = B::LABEL,
                     index = i,
@@ -433,24 +343,20 @@ impl<B: PadProto> UhidManager<B> {
                 rumble(i as u16, 0, 0, 0, 0);
             }
             for h in fb.hidout {
-                // Skip rich feedback that repeats the last-forwarded value (a game's output report
-                // re-sends unchanged lightbar/LED/trigger state alongside every rumble update).
                 if self.hidout_dedup[i].should_forward(&h, now) {
                     hidout(h);
                 }
             }
-            // Re-assert the latched rich state on a slow cadence. Deduping a plane that rides
-            // unreliable datagrams means a dropped update is never re-derived from the game — it
-            // keeps sending the same value and the dedup eats every copy — so without this one
-            // lost datagram leaves the pad on the previous weapon's trigger effect indefinitely.
+            // Re-assert latched rich state on a slow cadence. Deduping a datagram plane means a
+            // dropped update is never re-derived: the game keeps sending the same value and
+            // dedup eats every copy, leaving the pad on the previous trigger effect.
             for h in self.hidout_dedup[i].renewals(i as u8, now) {
                 hidout(h);
             }
         }
     }
 
-    /// Write the pad's current state (if it exists) and reset its heartbeat clock — on every write
-    /// (real input or heartbeat), so an actively-used pad emits no extra reports.
+    /// Resets the heartbeat clock on every write so an actively-used pad emits no extra reports.
     fn write(&mut self, idx: usize) {
         let st = self.state[idx];
         if let Some(pad) = self.slots.get_mut(idx) {
@@ -459,7 +365,7 @@ impl<B: PadProto> UhidManager<B> {
         self.last_write[idx] = Instant::now();
     }
 
-    /// Gate-checked create; a FRESH pad starts from neutral state + re-armed dedups.
+    /// Gate-checked create. A fresh pad starts from neutral state and re-armed dedups.
     fn ensure(&mut self, idx: usize) {
         let backend = &mut self.backend;
         if self.slots.ensure(idx, |i| backend.open(i)) {
@@ -467,10 +373,9 @@ impl<B: PadProto> UhidManager<B> {
         }
     }
 
-    /// Reset the sibling state of every index a sweep or reap just dropped. Both halves of the
-    /// unplug land here, so a pad torn down on the pump tick clears exactly what one torn down on
-    /// a state frame would — in particular `hidout_dedup`, which has no watchdog to re-arm it and
-    /// would otherwise swallow an identical lightbar/trigger re-assert after a re-plug.
+    /// Reset sibling state of every index a sweep or reap just dropped. Both unplug halves land
+    /// here so a pump-tick teardown clears the same as a state-frame one — in particular
+    /// `hidout_dedup`, which has no watchdog and would swallow an identical re-assert after replug.
     fn reset_swept(&mut self, swept: u16) {
         for i in 0..MAX_PADS {
             if swept & (1 << i) != 0 {
@@ -479,10 +384,9 @@ impl<B: PadProto> UhidManager<B> {
         }
     }
 
-    /// Clear the rich-plane state of every slot a sweep re-claimed inside its grace window (see
-    /// [`Sweep::reclaimed`](crate::pad_slots::Sweep::reclaimed)). Rich fields only: rumble and the
-    /// hidout dedup deliberately survive a removal, and buttons/sticks arrive on the very frame
-    /// that re-set the mask bit.
+    /// Clear rich-plane state of every slot reclaimed inside the grace window (see
+    /// [`Sweep::reclaimed`](crate::pad_slots::Sweep::reclaimed)). Rumble and hidout dedup survive
+    /// a removal; buttons/sticks arrive on the frame that re-set the mask bit.
     fn clear_reclaimed_rich(&mut self, reclaimed: u16) {
         for i in 0..MAX_PADS {
             if reclaimed & (1 << i) != 0 {
@@ -492,7 +396,7 @@ impl<B: PadProto> UhidManager<B> {
         }
     }
 
-    /// Reset one pad's sibling state (on create and unplug) so the first frame/feedback after a
+    /// Reset one pad's sibling state (create and unplug) so the first frame/feedback after a
     /// (re)connect starts from scratch and is always forwarded.
     fn reset_pad(&mut self, idx: usize) {
         self.state[idx] = self.backend.neutral();
@@ -503,9 +407,9 @@ impl<B: PadProto> UhidManager<B> {
         self.last_motion[idx] = None;
     }
 
-    /// Backdate every pad's motion clock past [`MOTION_IDLE_TIMEOUT`], so the next
-    /// [`heartbeat`](Self::heartbeat) neutralizes a stale gyro without a wall-clock sleep — the
-    /// same test hatch `PadSlots::expire_grace` gives the unplug debounce. Test-only.
+    /// Backdate every pad's motion clock past [`MOTION_IDLE_TIMEOUT`] so the next
+    /// [`heartbeat`](Self::heartbeat) can neutralize a stale gyro without a wall-clock sleep.
+    /// Test-only; same hatch as `PadSlots::expire_grace`.
     #[cfg(test)]
     fn expire_motion(&mut self) {
         for t in self.last_motion.iter_mut().flatten() {
@@ -519,8 +423,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    /// Scripted mock: `open` fails while `fail_opens > 0`; `service` replays canned feedback;
-    /// `MockState` carries a marker for the frame-merge preserve check.
+    /// Scripted mock: `open` fails while `fail_opens > 0`; `service` replays canned feedback.
     #[derive(Default)]
     struct MockProto {
         fail_opens: RefCell<u32>,
@@ -531,16 +434,15 @@ mod tests {
     #[derive(Clone, Copy, Default, PartialEq, Debug)]
     struct MockState {
         buttons: u32,
-        /// Stands in for the rich-plane fields (touch/motion/clicks): set by `apply_rich`,
-        /// must survive `merge_frame`.
+        /// Stands in for rich-plane fields (touch/motion): set by `apply_rich`, must survive
+        /// `merge_frame`.
         rich_marker: u16,
         /// Stands in for angular velocity — zeroed by the idle-motion watchdog.
         gyro: i16,
-        /// Stands in for acceleration, which the watchdog must NOT zero (gravity is persistent).
+        /// Stands in for acceleration, which the watchdog must not zero (gravity is persistent).
         accel: i16,
     }
 
-    /// Per-pad transport stub recording every state write.
     #[derive(Default)]
     struct MockPad {
         writes: RefCell<Vec<MockState>>,
@@ -567,8 +469,8 @@ mod tests {
         fn merge_frame(&self, prev: &MockState, f: &GamepadFrame) -> MockState {
             MockState {
                 buttons: f.buttons,
-                // The preserve-rich-fields contract — and the reason a stale motion sample lives
-                // forever without a watchdog.
+                // Preserve-rich-fields contract: a stale motion sample lives forever without a
+                // watchdog.
                 rich_marker: prev.rich_marker,
                 gyro: prev.gyro,
                 accel: prev.accel,
@@ -641,10 +543,9 @@ mod tests {
         UhidManager::new()
     }
 
-    /// A motion feed that stops must not leave the pad rotating forever: past
-    /// [`MOTION_IDLE_TIMEOUT`] the heartbeat zeroes the angular velocity, keeps the acceleration,
-    /// and writes the corrected report. `max_gap` is huge here so the ONLY thing that can produce
-    /// a write is the neutralize.
+    /// A motion feed that stops must not leave the pad rotating: past [`MOTION_IDLE_TIMEOUT`]
+    /// the heartbeat zeroes angular velocity, keeps acceleration, and writes. `max_gap` is huge
+    /// so the only write is the neutralize.
     #[test]
     fn a_stalled_motion_feed_has_its_gyro_neutralized() {
         let mut m = mgr();
@@ -674,8 +575,7 @@ mod tests {
         );
     }
 
-    /// …and only when there is something to zero: a pad already at rest must not manufacture a
-    /// write on every tick.
+    /// A pad already at rest must not manufacture a write on every tick.
     #[test]
     fn neutralizing_an_already_still_pad_writes_nothing() {
         let mut m = mgr();
@@ -688,10 +588,8 @@ mod tests {
         assert_eq!(m.slots.get(0).unwrap().writes.borrow().len(), before);
     }
 
-    /// A controller that takes over a live pad inside the replug grace skips the create path, so
-    /// nothing else resets what the manager persists on the client's behalf. It must not inherit
-    /// the previous controller's finger or rotation — a pad with no gyro would carry that
-    /// rotation for the rest of the session, having no sample of its own to correct it with.
+    /// A controller that takes over a live pad inside replug grace skips create, so it must not
+    /// inherit the previous finger or rotation — a pad with no gyro has no sample to correct it.
     #[test]
     fn a_grace_reclaim_clears_the_previous_pads_rich_state() {
         let mut m = mgr();
@@ -707,8 +605,8 @@ mod tests {
         assert_eq!(m.state[0].gyro, 0, "inherited the last pad's rotation");
     }
 
-    /// The re-claim clear keys off the grace clock, not off presence — a steady mask must never
-    /// trip it, or the client's touch and motion would be wiped on every state frame.
+    /// Re-claim keys off the grace clock, not presence — a steady mask must never wipe touch
+    /// and motion on every state frame.
     #[test]
     fn a_steady_mask_never_clears_rich_state() {
         let mut m = mgr();
@@ -722,7 +620,6 @@ mod tests {
 
     #[test]
     fn arrival_eager_creates_the_pad() {
-        // G10 as a generic regression test: Arrival must build the device before the first frame.
         let mut m = mgr();
         m.handle(&GamepadEvent::Arrival {
             index: 2,
@@ -735,7 +632,6 @@ mod tests {
 
     #[test]
     fn button_frame_preserves_rich_fields_and_writes_merged_state() {
-        // G2 as a generic regression test: rich-plane state must survive a button-only frame.
         let mut m = mgr();
         m.handle(&frame(0, 0b1, 0));
         m.apply_rich(touch(0, 777));
@@ -744,35 +640,31 @@ mod tests {
         let writes = pad.writes.borrow();
         let last = writes.last().unwrap();
         assert_eq!(last.buttons, 0xA);
-        assert_eq!(last.rich_marker, 777); // preserved across the merge
+        assert_eq!(last.rich_marker, 777);
     }
 
     #[test]
     fn one_removal_frame_plus_a_pump_tick_completes_the_unplug() {
-        // The producer emits the cleared-mask frame exactly ONCE — `native/input.rs` guards it on
-        // the bit still being set — so the teardown has to finish on the periodic pump. The
-        // previous version of this test hand-fed a SECOND removal frame, which is what let the
-        // never-reaped pad hide: with one frame and no pump, the device outlived the session.
+        // The producer emits the cleared-mask frame once (`native/input.rs` guards on the bit
+        // still being set), so teardown has to finish on the periodic pump.
         let mut m = mgr();
         m.handle(&frame(1, 0b10, 0));
         assert!(m.slots.get(1).is_some());
-        // The one removal frame: arms the devnode-churn grace, drops nothing.
         m.handle(&frame(1, 0b00, 0));
         assert!(m.slots.get(1).is_some(), "inside the grace — not yet swept");
-        // A tick inside the grace must NOT flap the devnode (pad_slots::SWEEP_GRACE).
+        // A tick inside the grace must not flap the devnode (`pad_slots::SWEEP_GRACE`).
         m.pump(|_, _, _, _, _| {}, |_| {});
         assert!(
             m.slots.get(1).is_some(),
             "a tick inside the grace dropped it"
         );
-        // Grace elapsed: the next tick completes the unplug, with no further frame.
         m.slots.expire_grace();
         m.pump(|_, _, _, _, _| {}, |_| {});
         assert!(
             m.slots.get(1).is_none(),
             "the pump tick never completed the unplug"
         );
-        // …and a further cleared-mask frame must not resurrect it (the arm branch early-returns).
+        // A further cleared-mask frame must not resurrect it (the arm branch early-returns).
         m.handle(&frame(1, 0b00, 0));
         assert!(
             m.slots.get(1).is_none(),
@@ -785,7 +677,6 @@ mod tests {
         let mut m = mgr();
         m.apply_rich(touch(3, 42));
         assert!(m.slots.get(3).is_none());
-        // …and it left no state behind: a later create starts truly neutral.
         m.handle(&frame(3, 0b1000, 0));
         assert_eq!(m.state[3].rich_marker, 0);
     }
@@ -795,10 +686,8 @@ mod tests {
         let mut m = mgr();
         *m.backend.fail_opens.borrow_mut() = 1;
         m.handle(&frame(0, 0b1, 0x1));
-        // Open failed: no pad, but the merged state is tracked (matching the old managers).
         assert!(m.slots.get(0).is_none());
         assert_eq!(m.state[0].buttons, 0x1);
-        // Next frame inside the backoff window: still no pad, no panic.
         m.handle(&frame(0, 0b1, 0x3));
         assert!(m.slots.get(0).is_none());
         assert_eq!(m.state[0].buttons, 0x3);
@@ -827,11 +716,11 @@ mod tests {
             rumble((100, 0, 0, 0)),
             rumble((7, 7, 0, 0)),
         ];
-        assert_eq!(collect(&mut m), vec![(0, 100, 0, 0, 0)]); // first value forwards
-        assert_eq!(collect(&mut m), vec![]); // exact repeat deduped
-        assert_eq!(collect(&mut m), vec![(0, 7, 7, 0, 0)]); // change forwards
-                                                            // Unplug + recreate re-arms the dedup: the same level forwards again. The unplug completes
-                                                            // on a PUMP tick, not on a second frame — that is all production ever sends.
+        assert_eq!(collect(&mut m), vec![(0, 100, 0, 0, 0)]);
+        assert_eq!(collect(&mut m), vec![]);
+        assert_eq!(collect(&mut m), vec![(0, 7, 7, 0, 0)]);
+        // Unplug + recreate re-arms the dedup. Unplug completes on a pump tick, not a second
+        // frame — that is all production ever sends.
         m.handle(&frame(0, 0b0, 0)); // the one removal frame — arms the grace
         m.slots.expire_grace();
         assert_eq!(collect(&mut m), vec![]); // this tick reaps; nothing queued to forward
@@ -844,10 +733,8 @@ mod tests {
         assert_eq!(collect(&mut m), vec![(0, 7, 7, 0, 0)]);
     }
 
-    /// The dedup compares all FOUR levels. Comparing only the handle pair would swallow a
-    /// trigger-only change — which is the *normal* shape of impulse-trigger content, since racing
-    /// titles drive the triggers continuously against near-silent handles — and the pad would
-    /// simply never rumble, with nothing logged and nothing on the wire to look at.
+    /// Dedup compares all four levels. Handle-pair-only would swallow a trigger-only change —
+    /// the normal shape of impulse-trigger content — and the pad would never rumble.
     #[test]
     fn a_trigger_only_change_is_forwarded_not_deduped_away() {
         let mut m = mgr();
@@ -866,7 +753,6 @@ mod tests {
             rumble_drove: Some(true),
             resync: false,
         };
-        // Handles silent throughout; only the trigger motors move.
         *m.backend.feedback.borrow_mut() = vec![
             rumble((0, 0, 0x8000, 0)),
             rumble((0, 0, 0x8000, 0)),
@@ -891,7 +777,6 @@ mod tests {
             );
             out.into_inner()
         };
-        // The game latches a non-zero rumble (a fresh report drove the pad).
         *m.backend.feedback.borrow_mut() = vec![PadFeedback {
             rumble: Some((200, 0, 0, 0)),
             hidout: Vec::new(),
@@ -900,10 +785,8 @@ mod tests {
         }];
         assert_eq!(collect(&mut m), vec![(0, 200, 0, 0, 0)]);
 
-        // The game stops driving the RUMBLE plane — no output report at all, or (equivalently, the
-        // confirmed stuck-ON case) a stream of LED/adaptive-trigger reports that never assert the
-        // vibration fields — and never sent a stop. Before the idle window elapses, nothing is
-        // forwarded — the latched level is left asserting.
+        // Game stops driving the rumble plane (no report, or LED/trigger-only) and never sent a
+        // stop. Before the idle window elapses the latched level stays asserting.
         let idle = || PadFeedback {
             rumble: None,
             hidout: Vec::new(),
@@ -913,11 +796,10 @@ mod tests {
         *m.backend.feedback.borrow_mut() = vec![idle()];
         assert_eq!(collect(&mut m), vec![]);
 
-        // Simulate the game having abandoned the pad past the timeout: the residual is forced off
-        // exactly once, then stays off (no repeated zero spam).
+        // Past the timeout: residual is forced off once, then stays off (no repeated zero).
         m.last_active[0] = Instant::now() - (RUMBLE_IDLE_TIMEOUT + Duration::from_millis(50));
         *m.backend.feedback.borrow_mut() = vec![idle(), idle()];
-        assert_eq!(collect(&mut m), vec![(0, 0, 0, 0, 0)]); // forced off
+        assert_eq!(collect(&mut m), vec![(0, 0, 0, 0, 0)]);
         assert_eq!(collect(&mut m), vec![]); // already zero — no repeat
     }
 
@@ -941,10 +823,9 @@ mod tests {
         }];
         assert_eq!(collect(&mut m), vec![(0, 200, 0, 0, 0)]);
 
-        // Even with a stale clock, a poll where the game drove the rumble plane refreshes
-        // activity, so the held rumble is NOT cut. Backends report that as
-        // `rumble: Some(level), rumble_drove: Some(true)` (an unchanged level dedups, no forward);
-        // the manager also honors the bare `rumble_drove: Some(true)` shape defensively.
+        // A poll where the game drove the rumble plane refreshes activity, so a held rumble is
+        // not cut even with a stale clock. Unchanged level dedups; `rumble_drove: Some(true)`
+        // with no rumble is also honored.
         m.last_active[0] = Instant::now() - (RUMBLE_IDLE_TIMEOUT + Duration::from_millis(50));
         *m.backend.feedback.borrow_mut() = vec![PadFeedback {
             rumble: Some((200, 0, 0, 0)),
@@ -995,10 +876,10 @@ mod tests {
         m.handle(&frame(0, 0b1, 0x5));
         let writes = |m: &UhidManager<MockProto>| m.slots.get(0).unwrap().writes.borrow().len();
         let after_frame = writes(&m);
-        // A pad written just now is NOT re-emitted under a huge gap…
+        // A pad written just now is not re-emitted under a huge gap.
         m.heartbeat(Duration::from_secs(3600));
         assert_eq!(writes(&m), after_frame);
-        // …but a zero gap counts it as silent and re-emits the CURRENT state.
+        // A zero gap counts it as silent and re-emits the current state.
         m.heartbeat(Duration::ZERO);
         assert_eq!(writes(&m), after_frame + 1);
         assert_eq!(
@@ -1012,31 +893,30 @@ mod tests {
                 .buttons,
             0x5
         );
-        // The backend's force flag overrides the gap entirely (the Steam mode-entry pulse).
+        // Backend force flag overrides the gap (Steam mode-entry pulse).
         m.backend.force_hb = true;
         m.heartbeat(Duration::from_secs(3600));
         assert_eq!(writes(&m), after_frame + 2);
     }
-    /// The overflow WARN limiter: a storm overflowing every ~4 ms poll must emit one line per
-    /// [`OverflowWarn::PERIOD`] and carry the swallowed count — the raw per-poll line once made
-    /// up 96 % of a field log export and evicted the session history around it.
+    /// Overflow WARN limiter: a storm overflowing every ~4 ms poll must emit one line per
+    /// [`OverflowWarn::PERIOD`] and carry the swallowed count.
     #[test]
     fn overflow_warn_coalesces_within_the_period() {
         let mut w = OverflowWarn::default();
         let t0 = Instant::now();
-        w.note(t0, "Mock", 0); // first overflow logs immediately
+        w.note(t0, "Mock", 0);
         assert_eq!((w.last, w.suppressed), (Some(t0), 0));
         for _ in 0..250 {
             w.note(t0 + Duration::from_millis(4), "Mock", 0);
         }
         assert_eq!((w.last, w.suppressed), (Some(t0), 250), "storm coalesced");
         let t1 = t0 + OverflowWarn::PERIOD;
-        w.note(t1, "Mock", 0); // period elapsed — logs (with suppressed=250) and re-arms
+        w.note(t1, "Mock", 0);
         assert_eq!((w.last, w.suppressed), (Some(t1), 0));
     }
 
-    /// A ring-overflow resync must silence a latched rumble once and re-arm the rich-plane dedup,
-    /// so the game's next asserted state re-forwards even when it equals the pre-overflow state.
+    /// A ring-overflow resync must silence a latched rumble once and re-arm hidout dedup, so the
+    /// next asserted state re-forwards even when it equals the pre-overflow state.
     #[test]
     fn resync_forces_stop_and_rearms_dedup() {
         let mut m = mgr();
@@ -1057,7 +937,6 @@ mod tests {
             (rumbles.into_inner(), hidouts.into_inner())
         };
 
-        // Latch a rumble + an LED.
         *m.backend.feedback.borrow_mut() = vec![PadFeedback {
             rumble: Some((100, 0, 0, 0)),
             hidout: vec![led(10)],
@@ -1066,7 +945,7 @@ mod tests {
         }];
         assert_eq!(collect(&mut m), (vec![(0, 100, 0, 0, 0)], 1));
 
-        // Overflow poll: no reports survived, resync flagged → forced stop, exactly once.
+        // Overflow, no reports survived: forced stop, exactly once.
         *m.backend.feedback.borrow_mut() = vec![PadFeedback {
             rumble: None,
             hidout: Vec::new(),
@@ -1075,8 +954,7 @@ mod tests {
         }];
         assert_eq!(collect(&mut m), (vec![(0, 0, 0, 0, 0)], 0));
 
-        // The game re-asserts the SAME rumble + LED state: both must re-forward (the rumble
-        // because the forced stop reset `last_rumble`, the LED because the dedup was re-armed).
+        // Same rumble + LED must re-forward: forced stop reset `last_rumble`, dedup was re-armed.
         *m.backend.feedback.borrow_mut() = vec![PadFeedback {
             rumble: Some((100, 0, 0, 0)),
             hidout: vec![led(10)],
@@ -1085,7 +963,7 @@ mod tests {
         }];
         assert_eq!(collect(&mut m), (vec![(0, 100, 0, 0, 0)], 1));
 
-        // A resync with nothing latched forwards no spurious stop.
+        // Resync with nothing latched forwards no spurious stop.
         *m.backend.feedback.borrow_mut() = vec![
             PadFeedback {
                 rumble: Some((0, 0, 0, 0)),

@@ -1,11 +1,11 @@
-//! The host hot path (plan §7), wiring the platform stages to `punktfunk_core`:
+//! Host hot path: platform stages into `punktfunk_core`.
 //!
 //! ```text
 //! capture(dmabuf) → encode(NVENC/VAAPI) → core[FEC+packetize+pace+send]
 //! ```
 //!
-//! Each stage runs on its own native OS thread, connected by bounded SPSC channels with
-//! drop-oldest on overflow so the encoder is never blocked. No async runtime here.
+//! Each stage is a native OS thread, bounded SPSC, drop-oldest on overflow so
+//! the encoder is never blocked. No async runtime.
 
 use crate::capture::Capturer;
 use crate::encode::{EncodedFrame, Encoder};
@@ -13,8 +13,8 @@ use anyhow::Result;
 use punktfunk_core::packet::{FLAG_PIC, FLAG_SOF};
 use punktfunk_core::Session;
 
-/// Drive one capture→encode→submit step. The real pipeline spawns threads and uses
-/// bounded channels; this documents the data flow and the `punktfunk_core` submit contract.
+/// One capture→encode→submit step. The live pipeline is threaded with bounded
+/// channels; this is the `punktfunk_core` submit contract.
 pub fn pump_once(
     capturer: &mut dyn Capturer,
     encoder: &mut dyn Encoder,
@@ -37,7 +37,6 @@ pub fn pump_once(
         if recovery_anchor {
             flags |= punktfunk_core::packet::USER_FLAG_RECOVERY_ANCHOR;
         }
-        // core does FEC + packetize + pace + send.
         session.submit_frame(&data, pts_ns, flags)?;
     }
     Ok(())

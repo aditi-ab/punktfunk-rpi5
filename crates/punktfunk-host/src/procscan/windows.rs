@@ -1,17 +1,15 @@
-//! The Windows matcher: a Toolhelp snapshot plus each process's full image path.
+//! Windows matcher: Toolhelp snapshot plus each process's full image path.
 //!
-//! Contract and rules live in [`super`]. Two differences from the Linux side shape everything here:
+//! Contract: [`super`]. Two Windows facts load the two rules:
 //!
-//! * **The host is SYSTEM**, so it can open essentially any process. That makes rule 1 (never adopt a
-//!   process that predates the launch) load-bearing rather than a nicety — without it a scan would
-//!   happily adopt a copy of the game the player started an hour ago, and a session ending could kill
-//!   it.
-//! * **There is no launch reaper and no readable environment.** Steam's `SteamLaunch AppId=` argv
-//!   trick is Linux-only, and reading another process's environment block on Windows needs
-//!   `NtQueryInformationProcess` against an undocumented layout — not something to build a
-//!   game-killing decision on. So the recipe is the image path: exactly the game's executable, or any
-//!   executable under its install directory. Every Windows store the library scans reports one or
-//!   both ([`crate::library::DetectSpec`]).
+//! * The host is SYSTEM and can open almost any process, so rule 1 (never adopt
+//!   a process that predates the launch) is what keeps a pre-existing game from
+//!   being killed when the session ends.
+//! * There is no launch reaper and no readable environment. Do not query another
+//!   process's environment via `NtQueryInformationProcess` — the layout is
+//!   undocumented. Match on image path: the game's executable, or any executable
+//!   under its install directory. Every Windows store reports one or both
+//!   ([`crate::library::DetectSpec`]).
 
 use super::{ProcRef, START_SLACK_SECS};
 use crate::library::DetectSpec;
@@ -28,15 +26,13 @@ use windows::Win32::System::Threading::{
 /// 100-nanosecond `FILETIME` ticks per second — the unit every Win32 time API here reports in.
 const FILETIME_TICKS_PER_SEC: f64 = 10_000_000.0;
 
-/// Image-path buffer, in UTF-16 units. Deliberately well past `MAX_PATH` (260): a game installed under
-/// a deep library folder can exceed it, and a truncated path would silently fail to match. A path
-/// longer than this makes `QueryFullProcessImageNameW` fail, which skips that process — the same
-/// outcome as any other unreadable one.
+/// Image-path buffer, UTF-16 units. Past `MAX_PATH` (260): a truncated path would
+/// silently fail to match. Longer than this, `QueryFullProcessImageNameW` fails
+/// and the process is skipped.
 const IMAGE_PATH_MAX: usize = 4096;
 
-/// A process scanner over the live system. Unit (unlike the Linux one, which is parameterized for its
-/// fixture tests): there is no way to hand Win32 a fake process table, so the Windows matching logic
-/// is tested through its pure helpers ([`under_dir`], [`same_path`]) plus a live-process test.
+/// Live-system scanner. Unit: Win32 has no fake process table. Matching is
+/// tested via [`under_dir`] / [`same_path`] plus a live-process test.
 pub struct Scanner;
 
 impl Scanner {
@@ -44,12 +40,10 @@ impl Scanner {
         Self
     }
 
-    /// Seconds on the Windows process-start timeline — the `FILETIME` epoch, which is what
-    /// `GetProcessTimes` reports a creation time in. `None` if the clock could not be read.
+    /// Seconds on the `FILETIME` epoch (`GetProcessTimes` creation time). `None` if unread.
     ///
-    /// Derived from `SystemTime` rather than a Win32 call because both are the same UTC epoch offset
-    /// by a constant, and the only use is comparing against a creation time read moments later; a
-    /// clock step between the two would need to exceed [`START_SLACK_SECS`] to matter.
+    /// From `SystemTime`: same UTC epoch plus a constant. A clock step between this
+    /// and the later creation-time read must exceed [`START_SLACK_SECS`] to matter.
     pub fn now_stamp(&self) -> Option<f64> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -59,11 +53,10 @@ impl Scanner {
         Some(now.as_secs_f64() + FILETIME_EPOCH_OFFSET_SECS)
     }
 
-    /// Every process matching any of `spec`'s signals, restricted to those that started at or after
-    /// `min_start` (seconds on the [`Self::now_stamp`] timeline; `None` disables the filter).
+    /// `min_start` is seconds on the [`Self::now_stamp`] timeline. `None` disables the filter.
     pub fn find(&self, spec: &DetectSpec, min_start: Option<f64>) -> Vec<ProcRef> {
-        // Only the image-based signals exist on Windows: no reaper argv, no readable environment. A
-        // spec carrying none must match *nothing* — falling through would scan on an empty predicate.
+        // Windows has only image-based signals. A spec with none must match nothing;
+        // falling through would scan on an empty predicate.
         if spec.exe.is_none() && spec.install_dir.is_none() && spec.process_name.is_none() {
             return Vec::new();
         }
@@ -83,17 +76,16 @@ impl Scanner {
                 continue;
             }
             let Some((start, image)) = process_start_and_image(pid) else {
-                continue; // exited mid-scan, or a protected process we can't query — never a game
+                continue;
             };
             if let Some(min) = min_start {
                 if start as f64 / FILETIME_TICKS_PER_SEC + START_SLACK_SECS < min {
-                    continue; // predates this launch — never ours (rule 1)
+                    continue; // predates this launch (rule 1)
                 }
             }
             let hit = exe.as_deref().is_some_and(|w| same_path(&image, w))
                 || dir.as_deref().is_some_and(|d| under_dir(&image, d))
-                // The operator-supplied fallback: the image's file name alone. Windows paths are
-                // case-insensitive anyway, so this matches the platform rather than relaxing anything.
+                // Operator fallback: image file name, case-insensitive like the rest of Windows.
                 || spec
                     .process_name
                     .as_deref()
@@ -105,32 +97,23 @@ impl Scanner {
         out
     }
 
-    /// Pin a pid the host itself just spawned to *this* process, by reading its creation time.
-    ///
-    /// This is what lets a Windows launch be tracked at all when the title carries no detect
-    /// signals. `CreateProcessAsUserW` into the interactive session hands back a bare pid rather
-    /// than a `std::process::Child`, and that pid used to be logged and dropped — so a title whose
-    /// provider gave no `install_dir`/`exe` had **nothing** identifying it, the lease degraded to
-    /// [`crate::gamelease::LeaseKind::Untracked`], and neither its exit nor a request to end it
-    /// could be acted on. Resolving the pid immediately after the spawn is the one safe entry into
-    /// rule 2 from a bare pid: the number cannot have been recycled in that window, and everything
-    /// downstream re-verifies the (pid, creation time) pair through [`Self::alive`].
+    /// Pin a pid the host just spawned by reading its creation time. Call immediately
+    /// after spawn so the pid cannot have recycled (rule 2). Downstream re-verifies
+    /// via [`Self::alive`]. `CreateProcessAsUserW` returns a bare pid, not a `Child`.
     pub fn resolve(&self, pid: u32) -> Option<ProcRef> {
         let (start, _image) = process_start_and_image(pid)?;
         Some(ProcRef { pid, start })
     }
 
-    /// This process's image file name. Diagnostics only (see [`super::names`]); `?` for a process
-    /// that has already gone or cannot be opened, which is routine.
+    /// Image file name. Diagnostics only ([`super::names`]).
     pub fn name_of(&self, p: ProcRef) -> String {
         process_start_and_image(p.pid)
             .and_then(|(_, image)| image.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "?".into())
     }
 
-    /// Which of `procs` are still the same live processes — pid present **and** creation time
-    /// unchanged, so a recycled pid is never reported alive (rule 2). Windows reuses pids briskly, so
-    /// this check is what makes signalling a remembered pid safe at all.
+    /// Pid still present **and** creation time unchanged (rule 2). Windows reuses
+    /// pids quickly; without this, signalling a remembered pid is unsafe.
     pub fn alive(&self, procs: &[ProcRef]) -> Vec<ProcRef> {
         procs
             .iter()
@@ -140,19 +123,12 @@ impl Scanner {
     }
 }
 
-/// An out-of-band opinion on whether the game is still running, used only to **veto** declaring it
-/// gone (see [`super::running_hint`]).
+/// Steam `Running` flag, used only to **veto** declaring the game gone
+/// ([`super::running_hint`]). Steam also sets it during updates and DLC installs,
+/// and can leave it stale after a crash, so it is never a primary signal.
 ///
-/// For a Steam title: Steam records a per-app `Running` flag in the logged-in user's hive. That flag is
-/// not trustworthy on its own — Steam sets it around updates and DLC installs too, and leaves it stale
-/// if it crashes — but as a veto it is exactly right. If the matcher can't see the game (its executable
-/// lives outside the install dir the manifest named, or a nested launcher owns it) while Steam still
-/// says the app is running, ending the session would be a false positive the player feels immediately.
-/// Erring towards "still running" only ever leaves a stream up.
-///
-/// Reads every **loaded** user hive under `HKEY_USERS` rather than resolving the interactive user's SID
-/// through `WTSQueryUserToken`: only logged-in users' hives are loaded, which is the same set, and it
-/// avoids a token dance for a best-effort hint.
+/// Reads every loaded hive under `HKEY_USERS`. Do not resolve the interactive SID
+/// via `WTSQueryUserToken`: loaded hives are the logged-in set.
 pub fn steam_running_hint(appid: u32) -> Option<bool> {
     use winreg::enums::{HKEY_USERS, KEY_READ};
     use winreg::RegKey;
@@ -173,18 +149,14 @@ pub fn steam_running_hint(appid: u32) -> Option<bool> {
             return Some(true);
         }
     }
-    // A key that exists and says 0 is a real "not running"; no key at all means Steam has never run
-    // this app on this box, which is no opinion rather than a negative one.
+    // Key exists and is 0 → not running. No key → no opinion (Steam never ran this app here).
     saw_key.then_some(false)
 }
 
-/// Every pid in a Toolhelp snapshot. Mirrors the walk in [`crate::detect`]'s Windows facts, which
-/// wants basenames rather than pids.
 fn snapshot_pids() -> Vec<u32> {
     let mut out = Vec::new();
-    // SAFETY: the canonical Toolhelp walk. `entry` is zeroed with `dwSize` set before the first read
-    // (the 260-wide `szExeFile` array has no usable `Default`), and the snapshot handle is closed on
-    // every exit path.
+    // SAFETY: `entry` is zeroed with `dwSize` set before the first read (`szExeFile`
+    // has no usable `Default`). The snapshot handle is closed on every exit path.
     unsafe {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
             return out;
@@ -206,12 +178,9 @@ fn snapshot_pids() -> Vec<u32> {
     out
 }
 
-/// A process's creation time (`FILETIME` ticks) and full image path.
-///
-/// Opened with `PROCESS_QUERY_LIMITED_INFORMATION` — the least privilege that answers both questions,
-/// and the one that works against elevated and protected-ish processes without asking for the right to
-/// read their memory. `None` for anything that can't be opened or has already exited, which is the
-/// routine case during a scan and never a reason to log.
+/// Creation time (`FILETIME` ticks) and full image path.
+/// `PROCESS_QUERY_LIMITED_INFORMATION` is the least privilege that answers both
+/// and works on elevated processes without VM read. `None` if unopenable or exited.
 fn process_start_and_image(pid: u32) -> Option<(u64, PathBuf)> {
     // SAFETY: `OpenProcess` yields an owned handle only on `Ok`; it is closed exactly once below on
     // every path. `GetProcessTimes` writes four `FILETIME`s we fully own; `QueryFullProcessImageNameW`
@@ -226,9 +195,8 @@ fn process_start_and_image(pid: u32) -> Option<(u64, PathBuf)> {
 
         let mut buf = [0u16; IMAGE_PATH_MAX];
         let mut len = buf.len() as u32;
-        // `PROCESS_NAME_FORMAT(0)` is `PROCESS_NAME_WIN32` — a drive-letter path, which is what the
-        // library's store-derived paths look like (the alternative, `PROCESS_NAME_NATIVE`, yields
-        // `\Device\HarddiskVolume…` and would never compare equal to one).
+        // `PROCESS_NAME_FORMAT(0)` is `PROCESS_NAME_WIN32` (drive-letter path).
+        // `PROCESS_NAME_NATIVE` is `\Device\HarddiskVolume…` and never equals a store path.
         let named = QueryFullProcessImageNameW(
             handle,
             PROCESS_NAME_FORMAT(0),
@@ -247,14 +215,13 @@ fn process_start_and_image(pid: u32) -> Option<(u64, PathBuf)> {
     }
 }
 
-/// Is `image` the same file as `want`? Windows paths are case-insensitive, and the scanner compares a
-/// canonicalized store-derived path against a live image path, so the comparison must be too.
+/// Case-insensitive equality: canonicalized store path vs live image path.
 fn same_path(image: &Path, want: &Path) -> bool {
     eq_ignore_case(image, want)
 }
 
-/// Does `image` live under `dir`? Case-insensitive, and requires a separator after the directory so an
-/// install dir of `…\Games\X` is not satisfied by `…\Games\XY\game.exe`.
+/// Case-insensitive prefix, with a separator after the directory so
+/// `…\Games\X` does not match `…\Games\XY\game.exe`.
 fn under_dir(image: &Path, dir: &Path) -> bool {
     let (i, d) = (wide_lower(image), wide_lower(dir));
     let Some(rest) = i.strip_prefix(d.as_str()) else {
@@ -263,9 +230,8 @@ fn under_dir(image: &Path, dir: &Path) -> bool {
     rest.starts_with('\\') || rest.starts_with('/')
 }
 
-/// Is `image`'s file name `want`? The operator-supplied [`DetectSpec::process_name`] fallback: a bare
-/// name, compared against the image's last component only, so `Hades.exe` never matches a path that
-/// merely contains it.
+/// Image file name equals `want` ([`DetectSpec::process_name`]). Last component
+/// only, so `Hades.exe` does not match a path that merely contains it.
 fn same_name(image: &Path, want: &str) -> bool {
     image
         .file_name()
@@ -277,9 +243,8 @@ fn eq_ignore_case(a: &Path, b: &Path) -> bool {
     wide_lower(a) == wide_lower(b)
 }
 
-/// Lowercase a path for comparison, normalizing the `\\?\` prefix `canonicalize` prepends (a
-/// store-derived path canonicalizes to the verbatim form while a live image path does not, and the two
-/// must still compare equal).
+/// Lowercase for comparison. Strip the `\\?\` prefix `canonicalize` prepends;
+/// a live image path never has it.
 fn wide_lower(p: &Path) -> String {
     let s = p.to_string_lossy();
     let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
@@ -295,16 +260,13 @@ mod tests {
         let dir = Path::new(r"C:\Games\Hades");
         assert!(under_dir(Path::new(r"c:\games\hades\Hades.exe"), dir));
         assert!(under_dir(Path::new(r"C:\Games\Hades\bin\crash.exe"), dir));
-        // A sibling whose name merely starts with the same text is not under it.
         assert!(!under_dir(Path::new(r"C:\Games\HadesII\game.exe"), dir));
-        // The directory itself is not "under" itself (no process image is a bare directory anyway).
         assert!(!under_dir(dir, dir));
         assert!(!under_dir(Path::new(r"D:\Games\Hades\Hades.exe"), dir));
     }
 
     #[test]
     fn exe_match_is_case_insensitive_and_ignores_the_verbatim_prefix() {
-        // `canonicalize` yields the `\\?\` verbatim form; a live image path never has it.
         assert!(same_path(
             Path::new(r"C:\Games\Hades\Hades.exe"),
             Path::new(r"\\?\c:\games\hades\hades.exe")
@@ -315,8 +277,6 @@ mod tests {
         ));
     }
 
-    /// The operator-supplied fallback ([`DetectSpec::process_name`]): the image's own file name and
-    /// nothing else — never a path that merely contains the name.
     #[test]
     fn process_name_matches_the_image_name_only() {
         assert!(same_name(
@@ -327,18 +287,16 @@ mod tests {
             Path::new(r"C:\Games\Hades\Hades.exe"),
             " Hades.exe "
         ));
-        // A longer name that starts the same way is a different program.
         assert!(!same_name(
             Path::new(r"C:\Games\Hades\HadesLauncher.exe"),
             "Hades.exe"
         ));
-        // A directory called the same thing doesn't qualify its contents.
         assert!(!same_name(
             Path::new(r"C:\Games\Hades.exe\other.exe"),
             "Hades.exe"
         ));
 
-        // …and it reaches the live scan, which the `find` early-return would otherwise skip.
+        // Reaches the live scan: `find` would otherwise skip a process_name-only spec.
         let me = std::env::current_exe().expect("current exe");
         let name = me.file_name().and_then(|n| n.to_str()).expect("exe name");
         let spec = DetectSpec {
@@ -353,8 +311,6 @@ mod tests {
 
     #[test]
     fn a_spec_with_no_path_signal_matches_nothing() {
-        // No reaper and no environment reading on Windows: an appid-only or env-only spec has nothing
-        // to match here, and must not fall through to matching everything.
         let s = Scanner::system();
         assert!(s.find(&DetectSpec::steam(570), None).is_empty());
         assert!(s
@@ -366,9 +322,8 @@ mod tests {
         assert!(s.find(&DetectSpec::default(), None).is_empty());
     }
 
-    /// The live check: scan the real process table for this test process itself, which is the only way
-    /// to notice a wrong `PROCESSENTRY32W` size, a failing `OpenProcess` access mask, or creation
-    /// times read from the wrong `FILETIME` half.
+    /// Live process table: the only way to catch a wrong `PROCESSENTRY32W` size, a
+    /// bad `OpenProcess` mask, or creation times from the wrong `FILETIME` half.
     #[test]
     fn finds_this_process_by_its_own_image_path() {
         let me = std::env::current_exe().expect("current exe");
@@ -380,22 +335,19 @@ mod tests {
             "scanning the real process table did not find this test process ({pid}) as {}",
             me.display()
         );
-        // Its own directory finds it too.
         let dir = me.parent().expect("exe has a parent");
         assert!(s
             .find(&DetectSpec::dir(dir), None)
             .iter()
             .any(|p| p.pid == pid));
-        // The same process re-verifies as alive by (pid, creation time)…
         let mine: Vec<ProcRef> = found.into_iter().filter(|p| p.pid == pid).collect();
         assert_eq!(s.alive(&mine), mine);
-        // …and a wrong creation time for the same pid does not.
         let recycled = vec![ProcRef {
             pid,
             start: mine[0].start ^ 0xFFFF,
         }];
         assert!(s.alive(&recycled).is_empty());
-        // A launch reference in the future excludes it — rule 1, against a real creation time.
+        // Future launch stamp excludes it (rule 1 against a real creation time).
         let future = s.now_stamp().unwrap() + 3_600.0;
         assert!(s.find(&DetectSpec::exe(&me), Some(future)).is_empty());
     }

@@ -1,13 +1,11 @@
 //! One package family per implementation, behind `PkgBackend`.
 //!
-//! This trait is the Windows-port deliverable (`design/installer-v2.md` D3): a winget backend
-//! produces the same `Step`s and every UI renders them unchanged. Nothing above this module
-//! knows what apt or pacman are.
+//! A winget backend produces the same `Step`s and every UI renders them unchanged
+//! (`design/installer-v2.md` D3). Nothing above this module knows apt or pacman.
 //!
-//! The install commands are **generated from the embedded `data/platforms.json`**, not copied
-//! beside it, so the D6 promise ("the install lines are verbatim") holds by construction and
-//! not by a gate. What can still drift is the *shape* — which entry is the repo block and
-//! which is the install — so `shape` tests pin every family's split.
+//! Install commands are generated from the embedded `data/platforms.json`, so the D6
+//! "verbatim" promise holds by construction. What can still drift is the split — which
+//! entry is the repo block and which is the install — so `shape` tests pin every family.
 
 pub mod windows;
 
@@ -21,7 +19,7 @@ use crate::seam::{BasePaths, CommandRunner};
 /// The single source for every install line (`design/installer-v2.md` D6).
 const PLATFORMS_JSON: &str = include_str!("../../../../data/platforms.json");
 
-/// Drops whichever punktfunk section pacman.conf holds — the stable one, the canary one, or both.
+/// Removes the stable section, the canary section, or both.
 const PACMAN_RM_REPO: &str =
     r"sudo sed -i '/^\[punktfunk\(-canary\)\{0,1\}\]$/,/^Server = /d' /etc/pacman.conf";
 
@@ -32,7 +30,6 @@ fn platforms() -> &'static serde_json::Value {
     })
 }
 
-/// The `install` array platforms.json states for a platform id.
 pub fn install_lines(id: &str) -> Vec<String> {
     platforms()["platforms"]
         .as_array()
@@ -46,8 +43,7 @@ pub fn install_lines(id: &str) -> Vec<String> {
         .collect()
 }
 
-/// Split a platform's lines at the first one starting with `marker`: everything before is the
-/// repo block, the rest is the install.
+/// Lines before `marker` are the repo block; the rest is the install.
 fn split_at(id: &str, marker: &str) -> (Vec<String>, Vec<String>) {
     let lines = install_lines(id);
     let at = lines
@@ -58,8 +54,7 @@ fn split_at(id: &str, marker: &str) -> (Vec<String>, Vec<String>) {
 }
 
 pub trait PkgBackend {
-    /// The packages this family installs for a host. Note dnf's is `punktfunk`, not
-    /// `punktfunk-host`.
+    /// dnf's host package is `punktfunk`, not `punktfunk-host`.
     fn base_pkgs(&self) -> Vec<&'static str>;
     fn write_repo(&self, facts: &Facts, choices: &Choices) -> Vec<Step>;
     fn install(&self, facts: &Facts, choices: &Choices) -> Vec<Step>;
@@ -79,8 +74,7 @@ pub fn backend(family: Family) -> &'static dyn PkgBackend {
     }
 }
 
-/// The install line for the chosen components: the platforms.json one verbatim for a host,
-/// plus or replaced by the client package when `--client` asked for it.
+/// Keep the platforms.json line verbatim; append or swap in `punktfunk-client` when asked.
 fn compose_install(base_line: &str, choices: &Choices) -> String {
     match (choices.components.host, choices.components.client) {
         (true, true) => format!("{base_line} punktfunk-client"),
@@ -89,9 +83,8 @@ fn compose_install(base_line: &str, choices: &Choices) -> String {
     }
 }
 
-/// Swap the package list out of the family's own install line rather than rebuilding it from a
-/// verb. The flags matter: a hand-written `pacman -S` dropped the `-Syu`, and `-S` against a
-/// repo whose database has never been fetched fails with "target not found".
+/// Reuse the family's flags; a hand-written `pacman -S` dropped `-Syu` and failed
+/// "target not found" against a never-fetched repo.
 fn client_only(base_line: &str) -> String {
     let head: Vec<&str> = base_line
         .split_whitespace()
@@ -99,8 +92,6 @@ fn client_only(base_line: &str) -> String {
         .collect();
     format!("{} punktfunk-client", head.join(" "))
 }
-
-// ------------------------------------------------------------------------------------- apt
 
 struct Apt;
 
@@ -183,8 +174,6 @@ impl PkgBackend for Apt {
     }
 }
 
-// ------------------------------------------------------------------------------------- dnf
-
 struct Dnf;
 
 impl PkgBackend for Dnf {
@@ -192,8 +181,7 @@ impl PkgBackend for Dnf {
         vec!["punktfunk", "punktfunk-web", "punktfunk-scripting"]
     }
 
-    /// The repo block is one heredoc, so its lines rejoin into a single command; the group is
-    /// then edited in, exactly as the sh installer does it.
+    /// The repo block is one heredoc, so its lines rejoin into a single command.
     fn write_repo(&self, facts: &Facts, choices: &Choices) -> Vec<Step> {
         let (repo, _) = split_at("fedora", "sudo dnf install");
         let mut steps = vec![Step::run(repo.join("\n"))];
@@ -217,8 +205,7 @@ impl PkgBackend for Dnf {
         steps
     }
 
-    /// `install` covers stable→canary and anything missing; `distro-sync` is what pulls the set
-    /// back DOWN onto a lower stable version on the way home.
+    /// `install` covers up and missing; `distro-sync` is what walks a version back down.
     fn switch(&self, facts: &Facts, choices: &Choices) -> Vec<Step> {
         let (_, install) = split_at("fedora", "sudo dnf install");
         let mut steps = self.write_repo(facts, choices);
@@ -261,13 +248,10 @@ impl PkgBackend for Dnf {
     }
 }
 
-// ---------------------------------------------------------------------------------- pacman
-
 struct Pacman;
 
 impl Pacman {
-    /// Omarchy is the same repo and the same packages — only the transaction shape differs, so
-    /// it reads its own platforms.json entry rather than being a special case in the commands.
+    /// Same repo and packages; Omarchy's transaction shape is a different platforms.json entry.
     fn entry(facts: &Facts) -> &'static str {
         if facts.omarchy {
             "omarchy"
@@ -297,9 +281,8 @@ impl PkgBackend for Pacman {
             .collect()
     }
 
-    /// On Omarchy `-Sy` then `-S`: its libalpm hook aborts any transaction carrying both `-S`
-    /// and `-u`, so Arch's `-Syu` installs nothing there. The trailing hand-off line is the
-    /// Omarchy phase's, not this one's.
+    /// Omarchy's libalpm hook aborts `-S` with `-u`, so `-Sy` then `-S`. The trailing
+    /// hand-off line belongs to the Omarchy phase, not this one.
     fn install(&self, facts: &Facts, choices: &Choices) -> Vec<Step> {
         let (_, install) = split_at(Self::entry(facts), "sudo pacman -S");
         let mut steps = self.write_repo(facts, choices);
@@ -315,8 +298,8 @@ impl PkgBackend for Pacman {
         steps
     }
 
-    /// Drop the old section first or both repos end up enabled, then `-Sy` and `-S` — never
-    /// `-Syu`, which sees a lower version on the way home and does nothing at all.
+    /// Drop the old section first or both repos stay enabled. Then `-Sy` and `-S`, never
+    /// `-Syu`: a lower version on the way home is a no-op.
     fn switch(&self, facts: &Facts, choices: &Choices) -> Vec<Step> {
         let mut steps = vec![Step::run(PACMAN_RM_REPO)];
         steps.extend(self.write_repo(facts, choices));
@@ -330,13 +313,13 @@ impl PkgBackend for Pacman {
         steps
     }
 
-    /// `punktfunk-omarchy setup` put wiring OUTSIDE the packages, and its `remove` ships IN the
-    /// host package — so it has to run before pacman takes the binary away.
+    /// `punktfunk-omarchy remove` ships in the host package, so it must run before pacman
+    /// takes the binary away.
     fn uninstall(&self, facts: &Facts) -> Vec<Step> {
         let mut steps = vec![Step::run(UNIT_TEARDOWN)];
         if facts.omarchy {
-            // Idempotent, and silent when setup never ran — so it is skipped only when the
-            // binary is genuinely gone, not planned away.
+            // Idempotent, and silent if setup never ran. Skip only when the binary is gone,
+            // not planned away.
             steps.push(Step {
                 action: StepAction::RunIfPresent {
                     program: "punktfunk-omarchy".into(),
@@ -381,8 +364,6 @@ impl PkgBackend for Pacman {
     }
 }
 
-// ---------------------------------------------------------------------------------- sysext
-
 struct Sysext;
 
 impl PkgBackend for Sysext {
@@ -390,7 +371,7 @@ impl PkgBackend for Sysext {
         vec![]
     }
 
-    /// No repo file — punktfunk-sysext records the channel itself, in its own conf.
+    /// No repo file; punktfunk-sysext records the channel in its own conf.
     fn write_repo(&self, _facts: &Facts, _choices: &Choices) -> Vec<Step> {
         vec![]
     }
@@ -430,8 +411,8 @@ impl PkgBackend for Sysext {
         ]
     }
 
-    /// `punktfunk-sysext` writes its conf only when `--channel` was passed, so "absent" cannot
-    /// tell an untouched box from a stable one. The installed binary breaks the tie.
+    /// Conf is written only with `--channel`, so absence cannot tell untouched from stable.
+    /// The installed binary breaks the tie.
     fn current_channel(&self, paths: &BasePaths, run: &dyn CommandRunner) -> Option<Channel> {
         if !run.which("punktfunk-host") {
             return None;
@@ -451,11 +432,8 @@ impl PkgBackend for Sysext {
     }
 }
 
-// -------------------------------------------------------------------------------- flatpak
-
-/// The client where the family carries no package for it: the sysext boxes, and any distro
-/// with no punktfunk repo at all. User-scope, so it needs no root — and it is why a client
-/// install on an unsupported distro is not a dead end (§5).
+/// User-scope client for families with no native package. An unsupported distro is not
+/// a dead end for the client.
 struct Flatpak;
 
 impl PkgBackend for Flatpak {
@@ -467,8 +445,7 @@ impl PkgBackend for Flatpak {
         vec![]
     }
 
-    /// The flatpakref is one feed with no channel in it, so `--channel` has nothing to say
-    /// here and the line is platforms.json's verbatim.
+    /// One feed, no channel: `--channel` is a no-op and the line is platforms.json verbatim.
     fn install(&self, _facts: &Facts, _choices: &Choices) -> Vec<Step> {
         install_lines("linux-client")
             .into_iter()
@@ -501,7 +478,7 @@ const UNIT_TEARDOWN: &str =
 mod tests {
     use super::*;
 
-    // A bad platforms.json edit fails the build here rather than at install time on a box.
+    // Fail the build here, not at install time on a box.
     #[test]
     fn every_host_platform_parses_and_carries_install_lines() {
         for id in ["debian", "arch", "omarchy", "fedora", "bazzite"] {
@@ -509,8 +486,7 @@ mod tests {
         }
     }
 
-    // The split is the one assumption generating commands from platforms.json makes. If a line
-    // is inserted or reordered upstream, these fail instead of the box getting a wrong command.
+    // The split is the one assumption. A reordered line here fails instead of on a box.
     #[test]
     fn shape_of_every_family_split() {
         let (repo, install) = split_at("debian", "sudo apt install");

@@ -1,21 +1,14 @@
-//! GameStream (P1) control plane — what a stock Moonlight/Artemis client talks to around
-//! the media streams: mDNS discovery, the nvhttp serverinfo + pairing HTTP(S) API, RTSP,
-//! and the ENet control stream. `tokio`/`axum` live here (control plane, I/O-bound — never
-//! the per-frame hot path; that is `stream`/`video`/`audio` on their own threads). Shipped
-//! end-to-end against stock Moonlight since June 2026 — `design/gamestream-host-plan.md` is
-//! the original bring-up rationale, `design/gamestream-competitive-program.md` (planning
-//! repo) the current investigation + roadmap.
+//! GameStream control plane: mDNS, nvhttp (serverinfo + pairing), RTSP, and the
+//! ENet control stream. `tokio`/`axum` live here; the per-frame path is
+//! `stream`/`video`/`audio` on their own threads.
+//!
+//! Evidence: `design/gamestream-host-plan.md`.
 
-// The Moonlight-protocol modules exist only behind the `gamestream` cargo feature (rust-safety
-// WP19): a native-only build (`--no-default-features --features pyrowave`) contains none of this
-// code — and none of its dependencies (`rusty_enet`, `rsa`). What stays unconditional in this
-// module is the shared vocabulary history parked here: `AppState`, `Host`, the port/version
-// constants, the paired-list persistence, `serve` itself, and `tls` (the mgmt API's TLS lives
-// there; only its Moonlight-client-cert leniency is feature-gated).
+// Moonlight modules and `rusty_enet`/`rsa` exist only with `feature = "gamestream"`.
+// `AppState`, `Host`, ports, pairing persistence, `serve`, and `tls` stay in every build.
 #[cfg(feature = "gamestream")]
 pub mod apps;
-// Platform-neutral wire/negotiation logic + the Linux capture/encode pipeline (non-Linux
-// builds get a stub `start` inside the module).
+// Non-Linux builds get a stub `start` inside this module.
 #[cfg(feature = "gamestream")]
 mod audio;
 #[cfg(feature = "gamestream")]
@@ -34,7 +27,7 @@ mod mdns;
 mod nvhttp;
 #[cfg(feature = "gamestream")]
 pub mod pairing;
-/// Moonlight `SS_PEN`/`SS_TOUCH` → the native pen model / wire touch (design/pen-tablet-input.md §4).
+/// Moonlight `SS_PEN`/`SS_TOUCH` → native pen / wire touch. See `design/pen-tablet-input.md`.
 #[cfg(feature = "gamestream")]
 mod pen;
 #[cfg(feature = "gamestream")]
@@ -51,7 +44,7 @@ use anyhow::{Context, Result};
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::sync::Arc;
 
-/// nvhttp ports (Moonlight derives all stream ports by offset from the HTTP base 47989).
+/// nvhttp ports. Moonlight derives every stream port as an offset from HTTP 47989.
 pub const HTTP_PORT: u16 = 47989;
 pub const HTTPS_PORT: u16 = 47984;
 pub const RTSP_PORT: u16 = 48010;
@@ -59,26 +52,20 @@ pub const VIDEO_PORT: u16 = 47998;
 pub const CONTROL_PORT: u16 = 47999;
 pub const AUDIO_PORT: u16 = 48000;
 
-/// Length of the per-session A/V ping payload. The SETUP response carries it hex-encoded, so
-/// these 8 bytes are the 16 characters a client echoes back.
+/// Per-session A/V ping payload. SETUP hex-encodes these 8 bytes as 16 characters the client echoes.
 #[cfg(feature = "gamestream")]
 pub const AV_PING_LEN: usize = 8;
 
-/// How long [`learn_client_endpoint`] holds out for a datagram that actually carries the session's
-/// ping payload once an unverified one is already in hand.
+/// Grace after an unverified owner datagram, before adopting it as the media endpoint.
 #[cfg(feature = "gamestream")]
 const AV_PING_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How long a media plane waits for its client to show up at all.
+/// Hard wait for any owner datagram on a media port.
 #[cfg(feature = "gamestream")]
 const AV_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Decide whether a datagram carries this session's ping payload.
-///
-/// Accepts either encoding as a **prefix**: the SETUP header's ASCII hex, or its decoded bytes —
-/// and trailing bytes are fine, because a modern client wraps the payload in an `SS_PING`
-/// structure with a sequence number. Constant-time, so a peer can't probe the expected value a
-/// byte at a time by timing our answer.
+/// True when `datagram` starts with this session's ping: SETUP ASCII hex or the raw 8 bytes.
+/// Trailing bytes are allowed (`SS_PING` appends a sequence). Compared constant-time.
 #[cfg(feature = "gamestream")]
 fn ping_matches(datagram: &[u8], expect: &[u8; AV_PING_LEN]) -> bool {
     let hex = hex::encode(expect);
@@ -88,25 +75,15 @@ fn ping_matches(datagram: &[u8], expect: &[u8; AV_PING_LEN]) -> bool {
     ascii || raw
 }
 
-/// Learn a media stream's client UDP endpoint from the first datagram that proves it belongs to
-/// this session. Two guards, weakest to strongest:
+/// Learn a media stream's client UDP endpoint from the first datagram that belongs to this session.
 ///
-/// * **Source IP** — only the launch owner's datagrams are considered (security-review 2026-08-15
-///   finding 1). On its own this leaves the endpoint to whoever sends first from that address: a
-///   NAT neighbour sharing the owner's public IP, or an on-path peer spoofing it.
-/// * **Ping payload** — the per-session secret minted at `/launch`, handed out in the SETUP
-///   response, and echoed by the client as its first datagram. A racer who never saw it cannot
-///   produce it.
+/// Source IP is a filter, not a proof: only the launch owner's packets are considered, but a
+/// NAT neighbour or spoofed peer can share that address. The per-session ping minted at
+/// `/launch` is the proof; a racer who never saw it cannot produce it.
 ///
-/// The payload check **prefers** rather than **requires**, and that is deliberate. The sanctioned
-/// wire reference says the client echoes the payload, and that modern clients send it inside an
-/// `SS_PING` structure *with a sequence number* — but it gives neither that structure's layout nor
-/// whether the payload crosses as the header's ASCII or as its decoded bytes. [`ping_matches`]
-/// accepts every shape those unknowns allow, yet a hard gate resting on an unverified layout would
-/// black-screen every session it guessed wrong about, and compatibility is this plane's whole
-/// reason to exist. So an unverified datagram is held as a fallback, adopted only if the grace
-/// window passes with nothing better, and logged with the bytes that did arrive — one real session
-/// settles the question, and the fallback can go.
+/// The payload check prefers rather than requires. The wire reference does not pin the
+/// encoding, so a hard gate would black-screen a correct client. An unverified owner
+/// datagram is held and adopted only if the grace window expires with nothing better.
 #[cfg(feature = "gamestream")]
 pub fn learn_client_endpoint(
     sock: &UdpSocket,
@@ -117,9 +94,7 @@ pub fn learn_client_endpoint(
     let start = std::time::Instant::now();
     let deadline = start + AV_PING_TIMEOUT;
     let mut probe = [0u8; 256];
-    // The first owner datagram that did NOT carry the payload, kept with a copy of its opening
-    // bytes — `probe` is overwritten by every later datagram, and those bytes are the whole point
-    // of the warning below.
+    // First unverified owner datagram, copied because `probe` is overwritten by later reads.
     let mut fallback: Option<(std::net::SocketAddr, Vec<u8>)> = None;
     let mut grace = deadline;
     loop {
@@ -128,8 +103,7 @@ pub fn learn_client_endpoint(
             break;
         }
         sock.set_read_timeout(Some(remaining))?;
-        // Any read error ends the wait and falls through to the decision below — a timeout here is
-        // the grace window expiring, not a failure, once a fallback is in hand.
+        // Timeout here is the grace window, not a failure, once a fallback is in hand.
         let Ok((n, src)) = sock.recv_from(&mut probe) else {
             break;
         };
@@ -161,45 +135,29 @@ pub fn learn_client_endpoint(
 /// Advertised host version. Major ≥ 7 tells Moonlight to use SHA-256 for pairing.
 pub const APP_VERSION: &str = "7.1.431.-1";
 pub const GFE_VERSION: &str = "3.23.0.74";
-/// `ServerCodecModeSupport` flags, from moonlight-common-c `src/Limelight.h` (verified
-/// against master, 2026-06-10): SCM_H264 0x1, SCM_HEVC 0x100, SCM_HEVC_MAIN10 0x200,
-/// SCM_AV1_MAIN8 0x10000, SCM_AV1_MAIN10 0x20000 (+ 4:4:4 Sunshine extensions we don't do).
+/// `ServerCodecModeSupport` bits from moonlight-common-c `src/Limelight.h`:
+/// SCM_H264 0x1, SCM_HEVC 0x100, SCM_HEVC_MAIN10 0x200, SCM_AV1_MAIN8 0x10000, SCM_AV1_MAIN10 0x20000.
 pub const SCM_H264: u32 = 0x0000_0001;
 pub const SCM_HEVC: u32 = 0x0000_0100;
 pub const SCM_HEVC_MAIN10: u32 = 0x0000_0200;
 pub const SCM_AV1_MAIN8: u32 = 0x0001_0000;
 pub const SCM_AV1_MAIN10: u32 = 0x0002_0000;
-/// The **SDR baseline** codec mask: H.264, HEVC Main, AV1 Main 8-bit (= 65793). HEVC Main10 (HDR) is
-/// layered on top of this at runtime by `serverinfo::codec_mode_support` when — and only when — the
-/// host can actually deliver it ([`host_hdr_capable`]); it is never a static claim, because a non-HDR
-/// host (a host where `PUNKTFUNK_10BIT` was explicitly turned off, or a Linux host whose video
-/// source / encoder can't do Main10) must not invite a client into an HDR mode it can't produce. (The previous placeholder 3843 = 0xF03 wrongly claimed HEVC Main10 +
-/// 4:4:4 and *no* AV1.) 4:4:4 stays off entirely on GameStream: stock Moonlight is 4:2:0 —
-/// full-chroma is a punktfunk/1-native negotiation only (`crate::capture::capturer_supports_444`).
+/// SDR baseline: H.264 + HEVC Main + AV1 Main 8-bit. HEVC Main10 is layered at runtime by
+/// `serverinfo::codec_mode_support` only when [`host_hdr_capable`] is true — a non-HDR host
+/// must not advertise a mode it cannot produce. 4:4:4 stays off; stock Moonlight is 4:2:0.
 pub const SERVER_CODEC_MODE_SUPPORT: u32 = SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8;
 
-/// Whether this host can deliver an **HDR** (10-bit BT.2020 PQ) GameStream at all — the gate for
-/// `IsHdrSupported` per app, for layering the 10-bit codec bits in serverinfo, and (together with
-/// the live capture-side check and the session's own codec at RTSP time) for honoring a client's
-/// `dynamicRangeMode` request. Host-wide and codec-agnostic on purpose: the per-codec depth
-/// question belongs to whoever knows which codec is in play. Behind the host's `PUNKTFUNK_10BIT`
-/// policy gate — **default ON**, explicit-off grammar (`=0`/`false`/`off`/`no` disables), the same
-/// gate the native punktfunk/1 plane honors — on both OSes.
+/// Whether this host can deliver an HDR (10-bit BT.2020 PQ) GameStream.
 ///
-/// **Windows**: the IDD-push capturer streams HEVC Main10 PQ whenever the desktop is HDR, and a
-/// client HDR request proactively enables advanced color on the per-session virtual display so PQ
-/// flows even from an SDR desktop.
+/// Gates `IsHdrSupported`, the 10-bit codec bits in serverinfo, and (with the live
+/// capture check at RTSP) honoring `dynamicRangeMode`. Behind `PUNKTFUNK_10BIT`
+/// (default on; `=0`/`false`/`off`/`no` disables).
 ///
-/// **Linux**: two sources can do it, and they are gated differently because they fail differently.
-/// The GNOME 50+ portal **monitor mirror** (`video_source=portal`) negotiates the 10-bit PQ
-/// formats only while the mirrored monitor is in HDR mode — a LIVE box-state fact, re-checked at
-/// RTSP honor time ([`pf_capture::gnome_hdr_monitor_active`]), so this fn can only make the static
-/// claim. A **gamescope virtual output** negotiates them whenever the resolved gamescope offers
-/// them (our `pipewire-hdr` build) — a STATIC binary-identity fact, so
-/// [`crate::capture::capturer_supports_hdr_for`] is the whole answer and the RTSP gate has nothing
-/// live to add. Every other virtual output stays SDR (Mutter's RecordVirtual streams and the
-/// KWin/wlroots equivalents are 8-bit upstream). Both arms also need the encoders' probed Main10
-/// path ([`crate::encode::can_encode_10bit`]).
+/// Windows: always true once the policy is on — the IDD capturer can enable PQ on the
+/// virtual display. Linux: portal sessions claim yes (HDR is a live monitor fact, rechecked
+/// at RTSP via [`pf_capture::gnome_hdr_monitor_active`]); virtual output is HDR only when
+/// [`crate::capture::capturer_supports_hdr_for`] says so (gamescope). Both Linux arms also
+/// need [`crate::encode::can_encode_10bit`].
 pub fn host_hdr_capable() -> bool {
     if !pf_host_config::config().ten_bit {
         return false;
@@ -212,16 +170,14 @@ pub fn host_hdr_capable() -> bool {
     {
         let source_can_hdr = match pf_host_config::config().video_source.as_deref() {
             Some("portal") => true,
-            // A virtual-output GameStream session drives the host's configured compositor; the
-            // gamescope arm is the only one that can be HDR. `detect()` is the same resolution
-            // the session itself will do, and it is cheap + cached downstream.
+            // Only a gamescope virtual output can be HDR. `detect()` is the same compositor
+            // the session will pick, and it is cached downstream.
             _ => crate::vdisplay::detect()
                 .ok()
                 .is_some_and(|c| crate::capture::capturer_supports_hdr_for(Some(c))),
         };
-        // ANY 10-bit-capable codec makes the host HDR-capable; which BITS get advertised, and
-        // whether a given session's negotiated codec can carry it, are per-codec questions
-        // answered by `serverinfo::apply_hdr` and the RTSP honor respectively.
+        // Any 10-bit encoder makes the host HDR-capable. Which bits get advertised is
+        // `serverinfo::apply_hdr`; whether this session can carry it is the RTSP honor.
         source_can_hdr
             && (crate::encode::can_encode_10bit(crate::encode::Codec::H265)
                 || crate::encode::can_encode_10bit(crate::encode::Codec::Av1))
@@ -232,31 +188,25 @@ pub fn host_hdr_capable() -> bool {
     }
 }
 
-/// Cumulative client-loss telemetry from the control stream's periodic `0x0201` loss-stats
-/// message (GS competitive program WP2.2 — the plane's only in-stream quality signal). Pure
-/// monotonic counters: the control thread adds, the video thread's 1 Hz adaptation step reads
-/// deltas — no locking, no reset races.
+/// Cumulative client-loss telemetry from the control stream's periodic `0x0201` loss-stats.
+/// Control thread adds; video thread's 1 Hz step reads deltas — no lock, no reset.
 #[derive(Default)]
 pub struct GsLossStats {
-    /// Sum of the client's reported loss counts.
     pub lost: std::sync::atomic::AtomicU64,
-    /// How many loss-stats reports arrived (a report with `lost == 0` is a healthy heartbeat).
+    /// A report with `lost == 0` is a healthy heartbeat.
     pub reports: std::sync::atomic::AtomicU64,
 }
 
-/// Stable host identity + advertised capabilities, shared across control-plane handlers.
 pub struct Host {
     pub hostname: String,
-    /// Stable per-host id (persisted), echoed in serverinfo + matched on pairing.
+    /// Persisted per-host id. Echoed in serverinfo and matched on pairing.
     pub uniqueid: String,
     pub http_port: u16,
     pub https_port: u16,
-    /// OS identity chain (`windows` | `macos` | `linux[/<family>][/<id>]`), advertised in the
-    /// mDNS `os=` TXT record and `HostInfo.os` so clients can show an OS icon.
+    /// `windows` | `macos` | `linux[/<family>][/<id>]` — mDNS `os=` and `HostInfo.os`.
     pub os_chain: String,
-    /// Human-readable OS name (os-release `PRETTY_NAME`), surfaced as `HostInfo.os_name` only.
+    /// os-release `PRETTY_NAME`. Surfaced as `HostInfo.os_name` only.
     pub os_name: String,
-    // Pairing state (server cert, paired client certs) lands in the next P1.1 slice.
 }
 
 impl Host {
@@ -272,150 +222,114 @@ impl Host {
         })
     }
 
-    /// Best-effort primary LAN IP, re-read on every call.
+    /// Best-effort primary LAN IP, re-read every call — not a field.
     ///
-    /// Deliberately NOT a field: [`Host::detect`] runs as the host process starts, which on a cold
-    /// boot is before the machine has an address at all, and a snapshot taken there used to stick
-    /// for the life of the process — the host then advertised itself over mDNS as `127.0.0.1`,
-    /// handed Moonlight an `rtsp://127.0.0.1` session URL, and dropped its Wake-on-LAN MAC record,
-    /// until someone restarted it by hand. Reading live costs a `connect(2)` on an unconnected UDP
-    /// socket (no packets are sent), which is nothing beside the HTTP responses it is serialized
-    /// into. Loopback here means "still no LAN address", not a stale one.
+    /// [`Host::detect`] runs at process start, often before DHCP. A snapshot taken then
+    /// would advertise `127.0.0.1` for the life of the process. A `connect(2)` on an
+    /// unconnected UDP socket sends no packets. Loopback here means "still no LAN address".
     pub fn local_ip(&self) -> IpAddr {
         primary_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
     }
 }
 
-/// The stream parameters a client passes at `/launch`, shared with the RTSP + media stages.
+/// Client `/launch` parameters, shared with RTSP and the media stages.
 #[derive(Clone, Copy, Debug)]
 pub struct LaunchSession {
-    /// AES-128 key for the RTSP/control/video/audio planes (from `rikey`).
+    /// AES-128 key for RTSP/control/video/audio (`rikey`).
     pub gcm_key: [u8; 16],
-    /// `rikeyid` — seeds the per-stream GCM IVs.
+    /// Seeds the per-stream GCM IVs (`rikeyid`).
     pub rikeyid: i32,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-    /// `/launch?appid=N` — selects the app-catalog entry (session recipe).
+    /// `/launch?appid=N` — app-catalog entry for this session.
     pub appid: u32,
-    /// Source IP of the paired HTTPS client that issued `/launch`. The unauthenticated RTSP/UDP
-    /// media plane binds to this so only the launching peer can start/own the stream — an
-    /// unpaired RTSP peer cannot ride a paired client's launch (security-review 2026-06-28 #4).
-    /// `None` if the address could not be captured (then RTSP falls back to launch-present only).
+    /// Source IP of the paired HTTPS client that issued `/launch`. Unauthenticated
+    /// RTSP/UDP binds to this so an unpaired peer cannot ride the launch. `None` if
+    /// the address could not be captured (RTSP then falls back to launch-present only).
     pub peer_ip: Option<std::net::IpAddr>,
-    /// SHA-256 cert fingerprint of the paired client that owns this session — mode-conflict admission
-    /// (Stage 4) compares it against a launching client to tell a same-client re-launch (always
-    /// allowed) from a DIFFERENT client (subject to the `mode_conflict` policy). `[u8; 32]` keeps
-    /// [`LaunchSession`] `Copy`; `None` when the peer cert couldn't be read.
+    /// SHA-256 cert fingerprint of the paired client that owns this session. Mode-conflict
+    /// admission compares it to tell a same-client re-launch (always allowed) from a different
+    /// client (subject to `mode_conflict`). `[u8; 32]` keeps [`LaunchSession`] `Copy`; `None`
+    /// when the peer cert could not be read.
     pub owner_fp: Option<[u8; 32]>,
 }
 
-/// Shared control-plane state used as the axum app state.
 pub struct AppState {
     pub host: Host,
-    /// The GameStream (RSA-2048) identity — Moonlight pins it, its pairing hashes bind its X.509
-    /// signature bytes. The native planes present `crate::identity` instead (the identity split).
+    /// GameStream RSA-2048 identity. Moonlight pins it; pairing hashes bind its X.509 bytes.
+    /// Native planes present `crate::identity` instead.
     #[cfg(feature = "gamestream")]
     pub identity: cert::ServerIdentity,
     #[cfg(feature = "gamestream")]
     pub pairing: pairing::Pairing,
-    /// Pinned (paired) client certificate DERs — the post-pair allow-list. Unconditional on
-    /// purpose: the mgmt list/unpair endpoints stay in every build (a native-only host can still
-    /// list + revoke pairings made by a GameStream-featured build sharing the config dir).
+    /// Paired client certificate DERs. Unconditional so a native-only build can still list
+    /// and revoke pairings made by a GameStream-featured build sharing the config dir.
     pub paired: std::sync::Mutex<Vec<Vec<u8>>>,
-    /// The ENet control port's lifecycle gate (rust-safety WP0): 47999 is bound only while
-    /// `paired` is non-empty — see [`control::sync`] / [`sync_control`].
+    /// Bound only while `paired` is non-empty. See [`control::sync`] / [`sync_control`].
     #[cfg(feature = "gamestream")]
     pub(crate) control_gate: control::Gate,
-    /// The active launch session (set by `/launch`, consumed by RTSP/media).
+    /// Set by `/launch`, consumed by RTSP/media.
     pub launch: std::sync::Mutex<Option<LaunchSession>>,
-    /// This session's A/V ping payload ([`AV_PING_LEN`] bytes, big-endian in these 8) — minted
-    /// fresh by `/launch` and `/resume`, handed to the client in the SETUP response, and echoed
-    /// back by it as the first datagram on each media port. It is what lets the media planes tell
-    /// their client apart from anything else arriving at the port from the same address; see
-    /// [`learn_client_endpoint`]. Not in [`LaunchSession`]: the client does not supply it, we mint
-    /// it, and it re-mints on resume while that struct's keys may not.
+    /// This session's A/V ping payload, minted by `/launch` and `/resume`. Not in
+    /// [`LaunchSession`]: the client does not supply it, and resume re-mints while that
+    /// struct's keys may not. See [`learn_client_endpoint`].
     #[cfg(feature = "gamestream")]
     pub av_ping: std::sync::atomic::AtomicU64,
-    /// Negotiated video config from RTSP ANNOUNCE (consumed by the stream on PLAY).
+    /// RTSP ANNOUNCE video config, consumed on PLAY.
     #[cfg(feature = "gamestream")]
     pub stream: std::sync::Mutex<Option<stream::StreamConfig>>,
-    /// Negotiated audio parameters from RTSP ANNOUNCE (channels/quality/packet duration);
-    /// defaults to stereo when a client never ANNOUNCEs them.
+    /// RTSP ANNOUNCE audio parameters. Defaults to stereo when the client never ANNOUNCEs them.
     #[cfg(feature = "gamestream")]
     pub audio_params: std::sync::Mutex<audio::AudioParams>,
-    /// True while the video stream thread is running (also its keep-running flag).
+    /// Video thread running, and its keep-running flag.
     pub streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Whether the current session is ending **deliberately** — the compat plane's answer to the
-    /// native plane's `QUIT_CODE` close, which RTSP has no equivalent of.
+    /// Deliberate end (compat-plane stand-in for native `QUIT_CODE`; RTSP has none).
     ///
-    /// Set by the three things that mean "this is over": the client's `/cancel` (Moonlight's Quit
-    /// App), the management API's stop, and the launched game exiting. An ENet vanish or an
-    /// unreachable client leaves it clear — those are drops, and the difference decides whether the
-    /// virtual display skips its keep-alive linger and whether the end-game policy sees an intent or
-    /// a network blip. Cleared by `/launch`, which is where a session begins.
+    /// Set by `/cancel`, management stop, and the launched game exiting. An ENet vanish
+    /// leaves it clear. Virtual-display linger and end-game policy both read it. Cleared
+    /// by `/launch`.
     pub quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// True while the audio stream thread is running (also its keep-running flag).
+    /// Audio thread running, and its keep-running flag.
     pub audio_streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Bumped by each media thread (video, audio) as the LAST thing it does on exit — after its
-    /// teardown (capturer re-pool, lease guard, events) has fully run. `/resume` restarts the
-    /// media planes by clearing the run flags and then WAITING on this counter (WP3): the old
-    /// threads' teardown must complete before the resumed connection's threads start, or the
-    /// two race over the pooled capturer and the late exit path stomps the successor's state.
+    /// Bumped by each media thread as the last thing it does on exit, after teardown.
+    /// `/resume` waits on this so the old capturer-pool and lease teardown finish before
+    /// the successor starts.
     pub media_exited: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Set by the control stream when the client requests an IDR / invalidates reference
-    /// frames (recovery after loss); the video thread forces a keyframe and clears it.
+    /// Client IDR / reference-frame invalidation request. Video thread forces a keyframe and clears it.
     pub force_idr: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// A client reference-frame-invalidation request carrying the lost frame range (0x0301). The
-    /// video thread drains it and calls `Encoder::invalidate_ref_frames`, falling back to a full
-    /// IDR when the encoder can't invalidate (range too old / no NVENC RFI). `None` = nothing pending.
+    /// Client 0x0301 lost-frame range. Video thread drains it into `Encoder::invalidate_ref_frames`,
+    /// falling back to a full IDR when the encoder cannot invalidate. `None` = nothing pending.
     pub rfi_range: std::sync::Arc<std::sync::Mutex<Option<(i64, i64)>>>,
-    /// Client-reported loss telemetry from the periodic control loss-stats message (`0x0201`,
-    /// decoded in [`control`]) — the plane's only in-stream quality signal. Cumulative counters;
-    /// the video thread's 1 Hz adaptation step reads them as window deltas (GS competitive
-    /// program WP2.2).
+    /// Cumulative `0x0201` loss-stats from [`control`]. Video thread's 1 Hz step reads window deltas.
     pub loss_stats: std::sync::Arc<GsLossStats>,
-    /// Persistent screen capturer, reused across streams so reconnects don't spawn a second
-    /// (conflicting) screencast session. The video thread borrows it for the stream's duration
-    /// and returns it; `set_active` gates its cost while idle. The slot's `bool` records whether
-    /// it was opened with the HDR (10-bit PQ) offer — a stream whose negotiated `hdr` differs
-    /// drops the pooled capturer and opens a fresh screencast session at the right depth
-    /// (mirroring the audio capturer's channel-count reuse gate).
+    /// Persistent screen capturer, reused across streams. The slot's `bool` is whether it was
+    /// opened with the HDR offer; a stream whose negotiated `hdr` differs drops it and opens
+    /// a fresh session at the right depth.
     #[cfg(feature = "gamestream")]
     pub video_cap: stream::CapturerSlot,
-    /// Persistent audio capturer, reused across streams when the channel count still matches
-    /// (avoids a PipeWire stream setup per reconnect); drained on reuse so no stale audio is
-    /// sent, dropped + reopened when a session negotiates a different channel count.
+    /// Persistent audio capturer. Reused when channel count matches (drained so no stale
+    /// audio is sent); dropped and reopened when a session negotiates a different count.
     pub audio_cap: std::sync::Arc<std::sync::Mutex<Option<Box<dyn crate::audio::AudioCapturer>>>>,
-    /// Shared streaming-stats recorder (web-console capture/graph). The GameStream encode loop
-    /// reads `is_armed()` per frame and emits samples; the same `Arc` is shared with the mgmt API
-    /// and the native punktfunk/1 loops so one capture spans whichever path is streaming.
+    /// Shared streaming-stats recorder. The same `Arc` is handed to mgmt, GameStream, and
+    /// native loops so one capture spans whichever path is streaming.
     pub stats: Arc<crate::stats_recorder::StatsRecorder>,
-    /// The per-client access grants registry (design/per-client-access.md §8, WP13): the SAME
-    /// registry the native plane's trust store owns, keyed by certificate fingerprint hex — it
-    /// serves both paired stores. Set once by [`serve`] after the native-pairing handle exists;
-    /// unset (tests, exotic embedders) the Moonlight plane treats every paired peer as
-    /// ungoverned — full control, exactly the pre-grants behavior.
+    /// Per-client access grants, keyed by certificate fingerprint hex. Same registry as the
+    /// native trust store. Set once by [`serve`]; if unset, every paired peer is ungoverned.
     pub access: std::sync::OnceLock<Arc<crate::native_pairing::NativePairing>>,
 }
 
-/// Session-lost callback the media threads invoke when they detect the client is unreachable
-/// (a UDP send error): ends the WHOLE GameStream session via [`AppState::end_session`], not just
-/// the thread that noticed — video and audio otherwise stop independently and leave the launch
-/// state behind. Built by the RTSP PLAY handler (the one place with the `Arc<AppState>`).
+/// Callback media threads invoke on a UDP send error: ends the whole session via
+/// [`AppState::end_session`], not just the noticing thread. Built by the RTSP PLAY handler.
 pub(crate) type OnSessionLost = Arc<dyn Fn() + Send + Sync>;
 
 impl AppState {
-    /// End the GameStream session as one unit: signal BOTH media threads to stop (they observe
-    /// their `streaming`/`audio_streaming` flags) and clear the launch + negotiated stream
-    /// config. Idempotent — safe to call from every "the client is gone" site.
+    /// Stop both media threads and clear launch + negotiated stream config. Idempotent.
     ///
-    /// This is THE teardown for the compat plane. Anything less leaves a stale session behind:
-    /// a lingering `launch` 503-blocks a different client's `/launch` under
-    /// `mode_conflict = reject`, and a stale `streaming = true` makes a reconnect's RTSP PLAY
-    /// take its "stream already running" branch while the old threads still stream at the
-    /// vanished client's endpoint (no new threads are started — the reconnect gets no media).
-    /// Returns whether the video stream was live (for the caller's log line).
+    /// Anything less leaves a stale session: a lingering `launch` 503-blocks another
+    /// client's `/launch` under `mode_conflict = reject`, and `streaming = true` makes a
+    /// reconnect's PLAY take the "already running" branch while old threads still stream
+    /// at the vanished endpoint. Returns whether video was live.
     pub(crate) fn end_session(&self, reason: &str) -> bool {
         use std::sync::atomic::Ordering;
         let was_streaming = self.streaming.swap(false, Ordering::SeqCst);
@@ -440,20 +354,14 @@ impl AppState {
         was_streaming
     }
 
-    /// End the session as a **decision** rather than a drop: mark it deliberate, then tear it down.
-    ///
-    /// This is what a client's `/cancel`, the management stop, and a launched game's exit all use.
-    /// The flag is read by the virtual display's keep-alive lease (skip the linger — nobody is coming
-    /// back) and, at the video thread's teardown, by the end-game-on-session-end policy (which gives a
-    /// mere drop a reconnect window first). See [`AppState::quit`].
+    /// Mark the end deliberate, then tear down. Used by `/cancel`, management stop, and
+    /// game exit. See [`AppState::quit`].
     pub(crate) fn quit_session(&self, reason: &str) -> bool {
         self.quit.store(true, std::sync::atomic::Ordering::SeqCst);
         self.end_session(reason)
     }
 
-    /// Mint a fresh A/V ping payload for a session that is beginning (`/launch`) or re-beginning
-    /// (`/resume`), and return it. Must happen before the client's RTSP SETUP, which is what hands
-    /// it out.
+    /// Mint a fresh A/V ping for `/launch` or `/resume`. Must run before the client's RTSP SETUP.
     #[cfg(feature = "gamestream")]
     pub fn mint_av_ping(&self) -> [u8; AV_PING_LEN] {
         let payload = crypto::random::<AV_PING_LEN>();
@@ -464,7 +372,7 @@ impl AppState {
         payload
     }
 
-    /// This session's A/V ping payload — what SETUP advertises and the media planes expect back.
+    /// This session's A/V ping — what SETUP advertises and the media planes expect back.
     #[cfg(feature = "gamestream")]
     pub fn av_ping_payload(&self) -> [u8; AV_PING_LEN] {
         self.av_ping
@@ -472,10 +380,8 @@ impl AppState {
             .to_be_bytes()
     }
 
-    /// Fresh control-plane state: no active session; the pairing allow-list is loaded from
-    /// disk (pairings persist across restarts). `stats` is the shared recorder handed to both the
-    /// mgmt API and the streaming loops. (The native-only build's variant is below — same state
-    /// minus the Moonlight identity/pairing machinery.)
+    /// Fresh control-plane state. Pairing allow-list is loaded from disk. `stats` is the
+    /// shared recorder handed to mgmt and the streaming loops.
     #[cfg(feature = "gamestream")]
     pub fn new(
         host: Host,
@@ -506,9 +412,8 @@ impl AppState {
         }
     }
 
-    /// The native-only build's [`AppState::new`]: identical control-plane state minus the
-    /// Moonlight machinery (identity/pairing/control-gate and the RTSP-negotiated stream slots),
-    /// which does not exist in this build.
+    /// Native-only [`AppState::new`]: same control-plane state minus Moonlight identity,
+    /// pairing, control-gate, and RTSP stream slots.
     #[cfg(not(feature = "gamestream"))]
     pub fn new(host: Host, stats: Arc<crate::stats_recorder::StatsRecorder>) -> AppState {
         AppState {
@@ -529,40 +434,33 @@ impl AppState {
     }
 }
 
-/// Reconcile the ENet control port to the paired-client list — bound iff at least one pairing
-/// exists (rust-safety WP0; see [`control::sync`]). A crate-visible wrapper so callers outside
-/// `gamestream` (the management API's unpair) can reach it past the private `control` module.
-/// A no-op unless `serve` armed the gate (`--gamestream`).
+/// Bind the ENet control port iff at least one pairing exists. Crate-visible so mgmt
+/// unpair can reach past the private `control` module. No-op unless `serve` armed the gate.
 #[cfg(feature = "gamestream")]
 pub(crate) fn sync_control(state: &Arc<AppState>) -> Result<()> {
     control::sync(state)
 }
 
-/// Native-only build: there is no ENet control port to reconcile — the callers (the mgmt unpair)
-/// stay uniform and this is the whole implementation.
+/// Native-only: no ENet port. Callers (mgmt unpair) stay uniform.
 #[cfg(not(feature = "gamestream"))]
 pub(crate) fn sync_control(_state: &Arc<AppState>) -> Result<()> {
     Ok(())
 }
 
-/// Run the host (blocks): mDNS, the nvhttp servers, and the management REST API.
-/// `native = Some(cfg)` makes this the **unified** host — it also runs the native punktfunk/1
-/// QUIC server on `cfg.port` in the same process, sharing one [`crate::native_pairing`] handle with
-/// the management API so the web console can arm pairing and show the PIN. `None` = GameStream only
-/// (the mgmt API's native endpoints report `enabled: false`).
-/// Run the host. The **native punktfunk/1 plane + management API always run** (the secure default —
-/// SPAKE2 pairing, per-direction AEAD nonces); `gamestream` additionally brings up the
-/// GameStream/Moonlight-compat planes (nvhttp pairing, RTSP, ENet control, `_nvstream` mDNS), which
-/// carry inherent on-path weaknesses (plain-HTTP pairing + legacy GCM nonce reuse, security-review
-/// #5/#9) — so it is **opt-in** (`serve --gamestream`) and gated on a trusted LAN.
+/// Run the host (blocks).
+///
+/// Native punktfunk/1 (QUIC on `native.port`) and the management API always run and
+/// share one [`crate::native_pairing`] handle. `gamestream` additionally brings up
+/// nvhttp pairing, RTSP, ENet control, and `_nvstream` mDNS. Those planes pair over
+/// plain HTTP and can reuse GCM nonces, so they are opt-in (`serve --gamestream`)
+/// and for a trusted LAN only.
 pub fn serve(
     mgmt: crate::mgmt::Options,
     native: crate::native::NativeServe,
     gamestream: bool,
 ) -> Result<()> {
-    // WP19: `serve --gamestream` / PUNKTFUNK_GAMESTREAM=1 against a native-only binary is an
-    // explicit ask this build cannot honor — refuse loudly rather than quietly serve less than
-    // the operator configured.
+    // `serve --gamestream` against a native-only binary is an explicit ask this build
+    // cannot honor — refuse rather than quietly serve less than configured.
     #[cfg(not(feature = "gamestream"))]
     if gamestream {
         anyhow::bail!(
@@ -572,31 +470,15 @@ pub fn serve(
         );
     }
     let host = Host::detect()?;
-    // The shared streaming-stats recorder: one handle for the mgmt API, the GameStream encode loop
-    // (via `AppState`), and the native punktfunk/1 loops (passed to `native::serve`).
     let stats = crate::stats_recorder::StatsRecorder::new(crate::stats_recorder::default_dir());
-    // The native plane always runs, so the shared native-pairing handle (linking the QUIC ceremony
-    // and the management API) always exists.
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(None, None, false)
             .context("native pairing store")?,
     );
-    // The identity the native QUIC plane and the mgmt API present (the identity split): P-256 on
-    // hosts no native client ever pinned, the legacy RSA cert otherwise — resolved ONCE here so
-    // the two planes cannot race the first-run adoption. See `crate::identity`.
-    //
-    // Resolved BEFORE the legacy GameStream identity below, and that order is load-bearing twice
-    // over. (1) The web console gates its start on `cert.pem` existing and then serves the native
-    // pair sitting next to it (web/nitro-entry/tls-paths.mjs); minting the legacy pair first
-    // leaves a first-run window where the console starts, finds no native pair, and serves the
-    // SAN-less RSA cert no browser accepts — for the rest of that boot. Running first closes that
-    // window: whenever this call WRITES a native pair, it has done so before `cert.pem` appears.
-    // (It does not write one on an upgraded host whose native clients pinned the legacy cert —
-    // there the console correctly falls back to that same legacy pair.) (2) In the degenerate case
-    // (native clients paired, but the cert they pinned is gone from disk) the old order let
-    // `load_or_create` mint a BRAND-NEW cert.pem that `load_or_adopt` then adopted while logging
-    // that it was preserving their pins — stranding them silently. Reading the dir first means
-    // that case reaches the branch written for it.
+    // Native identity first. If GameStream writes `cert.pem` before a native pair
+    // exists, the console starts and serves the SAN-less RSA cert. Reading the dir
+    // first also stops `load_or_create` minting a new cert that `load_or_adopt`
+    // would then treat as the pin it was preserving.
     let native_ident = crate::identity::load_or_adopt(&np).context("native host identity")?;
     #[cfg(feature = "gamestream")]
     let state = {
@@ -605,9 +487,8 @@ pub fn serve(
     };
     #[cfg(not(feature = "gamestream"))]
     let state = Arc::new(AppState::new(host, stats.clone()));
-    // WP13: hand the GameStream planes the grants registry — the nvhttp launch surface and the
-    // ENet control thread resolve a Moonlight fingerprint's mask against the same registry the
-    // native plane enforces (design §8: it keys on fingerprint hex and serves both stores).
+    // Hand GameStream the grants registry so nvhttp launch and ENet resolve a Moonlight
+    // fingerprint against the same mask the native plane enforces.
     let _ = state.access.set(np.clone());
     tracing::info!(
         hostname = %state.host.hostname,
@@ -618,11 +499,8 @@ pub fn serve(
         gamestream,
         "punktfunk host"
     );
-    // Surface a conflicting Moonlight-compatible host (Sunshine/Apollo/…) as early as possible:
-    // scan once (cached for `/local/summary` → the web console) and warn loudly if one can actually
-    // clash. A dormant leftover (an uninstalled Sunshine's Program Files folder, a disabled service)
-    // is logged at INFO instead — it belongs in a support log, not in a warning that reads like a
-    // fault on every boot.
+    // Scan once (cached for `/local/summary`). Warn only when a clash is active;
+    // a dormant leftover logs at INFO so every boot is not a warning.
     let conflicts = crate::detect::init();
     if !conflicts.is_empty() {
         let report = crate::detect::render_report(conflicts);
@@ -653,29 +531,25 @@ pub fn serve(
         // rustls needs a process-wide crypto provider before any TLS config is built.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let native_opts = crate::native::native_serve_opts(&native);
-        // The hook runner consumes the live event tail for the host's lifetime — spawned BEFORE
-        // `host.started` is emitted so operator hooks observe the full lifecycle (RFC §6).
+        // Hook runner consumes the live event tail for the host's lifetime. Spawned
+        // before `host.started` so operator hooks observe the full lifecycle.
         tokio::spawn(crate::hooks::runner());
-        // Lifecycle events (RFC §4): `host.started` as the serve planes come up; `host.stopping`
-        // when they wind down (clean end OR error exit) — the ring holds it for a consumer that
-        // reconnects, and a graceful-signal path can move the emit earlier when one exists.
+        // `host.started` as the planes come up; `host.stopping` on clean or error exit
+        // so a consumer that reconnects still sees it.
         crate::events::emit(crate::events::EventKind::HostStarted {
             version: env!("CARGO_PKG_VERSION").to_string(),
             gamestream,
         });
         let served: anyhow::Result<()> = if gamestream {
-            // WP19: `gamestream` can only be true when the feature is compiled in — serve()'s
-            // top bails otherwise — so the native-only build's arm is a plain unreachable.
+            // `gamestream` is only true when the feature is compiled in; serve() bails otherwise.
             #[cfg(not(feature = "gamestream"))]
             {
                 unreachable!("serve() refuses --gamestream in a native-only build")
             }
             #[cfg(feature = "gamestream")]
             {
-                // Unified host: GameStream compat planes + native + mgmt. The `_nvstream` advert is
-                // fatal on failure when enabled (Moonlight clients can't find the host without it) —
-                // `--no-mdns` / PUNKTFUNK_MDNS=0 skips it for multicast-dead environments (stock
-                // Moonlight then needs a manually-added host).
+                // `_nvstream` advert is fatal on failure: Moonlight cannot find the host
+                // without it. `--no-mdns` / PUNKTFUNK_MDNS=0 skips it when multicast is dead.
                 let _advert = if native.mdns {
                     Some(mdns::advertise(&state.host).context("mDNS advertise")?)
                 } else {
@@ -685,11 +559,9 @@ pub fn serve(
                     None
                 };
                 rtsp::spawn(state.clone()).context("start RTSP server")?;
-                // WP0 (rust-safety): the ENet control port is the host's one pre-auth-reachable
-                // unsafe surface (`rusty_enet` is a transpiled C stack), so it binds only while a
-                // pairing exists — a never-paired host on a hostile LAN exposes no ENet at all.
-                // Pairing is HTTPS on nvhttp and never touches 47999; phase 4 re-syncs the port the
-                // moment the first client pins, so it is up before that client can `/launch`.
+                // ENet (`rusty_enet`, transpiled C) binds only while a pairing exists.
+                // Pairing is HTTPS on nvhttp and never touches 47999; the port re-syncs
+                // when the first client pins, before that client can `/launch`.
                 state.control_gate.enable();
                 sync_control(&state).context("start ENet control server")?;
                 tracing::info!(
@@ -717,7 +589,6 @@ pub fn serve(
                 .map(|_| ())
             }
         } else {
-            // Secure default: native punktfunk/1 + management API only (no GameStream surface).
             tracing::info!(
                 port = native.port,
                 "secure host: native punktfunk/1 (QUIC) + management API \
@@ -747,10 +618,9 @@ pub fn serve(
     })
 }
 
-/// Host wall clock, unix seconds — the clock every per-client-access deadline is stored in and
-/// evaluated against (design/per-client-access.md §4: wall time at each check, no cached
-/// monotonic offset, so an NTP step moves a deadline with the clock). Shared by the nvhttp
-/// launch gates and the control thread's expiry check.
+/// Host wall clock, unix seconds. Access deadlines are stored and evaluated in this
+/// clock so an NTP step moves them. Shared by nvhttp launch gates and the control
+/// thread's expiry check.
 #[cfg(feature = "gamestream")]
 pub(crate) fn wall_unix_now() -> i64 {
     std::time::SystemTime::now()
@@ -759,11 +629,8 @@ pub(crate) fn wall_unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// The name this host shows up under everywhere a human sees it: Moonlight's host tile (the
-/// serverinfo `<hostname>` element) and Punktfunk's own client lists (the mDNS service *instance*
-/// name of both adverts). `PUNKTFUNK_HOST_NAME` wins — that's the point of the knob, a box whose
-/// machine name is `bazzite-htpc` can present itself as "Living Room" — otherwise it's the machine's
-/// own hostname, as it always was.
+/// Display name for Moonlight's host tile and both mDNS instance names.
+/// `PUNKTFUNK_HOST_NAME` wins; otherwise the machine hostname.
 fn hostname_string() -> String {
     if let Some(n) = pf_host_config::config().host_name.as_deref() {
         return sanitize_display_name(n);
@@ -771,9 +638,8 @@ fn hostname_string() -> String {
     machine_hostname()
 }
 
-/// The raw machine hostname (no `PUNKTFUNK_HOST_NAME` override, no display sanitizing) — what a
-/// certificate SAN or a DNS-ish consumer wants, as opposed to [`hostname_string`]'s free-text
-/// display name.
+/// Raw machine hostname — no `PUNKTFUNK_HOST_NAME`, no display sanitizing.
+/// Certificate SAN and DNS-ish consumers want this, not [`hostname_string`].
 pub(crate) fn machine_hostname() -> String {
     #[cfg(target_os = "windows")]
     if let Some(n) = std::env::var_os("COMPUTERNAME") {
@@ -789,11 +655,9 @@ pub(crate) fn machine_hostname() -> String {
         .unwrap_or_else(|| "punktfunk-host".to_string())
 }
 
-/// Make an operator-supplied host name safe to carry as an mDNS service instance name. Spaces and
-/// punctuation are fine there ("Living Room PC" is a perfectly legal instance name), but two things
-/// are not: a `.` splits the instance label — and clients derive the display name as the first label
-/// of the fullname (`pf-client-core::discovery`), so "Ben's PC v1.2" would arrive as "Ben's PC v1" —
-/// and DNS-SD caps a label at 63 bytes. Control characters go too.
+/// Make an operator-supplied name safe as an mDNS service instance. `.` splits the
+/// instance label (clients take the first label of the fullname), and DNS-SD caps a
+/// label at 63 bytes. Control characters go too.
 fn sanitize_display_name(raw: &str) -> String {
     let cleaned: String = raw
         .trim()
@@ -801,7 +665,7 @@ fn sanitize_display_name(raw: &str) -> String {
         .filter(|c| !c.is_control())
         .map(|c| if c == '.' { '-' } else { c })
         .collect();
-    // Truncate on a char boundary so multi-byte names can't produce invalid UTF-8.
+    // Truncate on a char boundary so a multi-byte name cannot yield invalid UTF-8.
     let mut out = String::new();
     for c in cleaned.trim().chars() {
         if out.len() + c.len_utf8() > 63 {
@@ -817,7 +681,7 @@ fn sanitize_display_name(raw: &str) -> String {
     }
 }
 
-/// Load the persisted host uniqueid, or mint one (from the kernel UUID source) and store it.
+/// Load the persisted host uniqueid, or mint from `/proc/sys/kernel/random/uuid` and store it.
 fn load_or_create_uniqueid() -> Result<String> {
     let path = pf_paths::config_dir().join("uniqueid");
     if let Ok(s) = std::fs::read_to_string(&path) {
@@ -834,14 +698,12 @@ fn load_or_create_uniqueid() -> Result<String> {
     Ok(id)
 }
 
-/// Best-effort primary LAN IP: open a UDP socket "toward" a public address and read the
-/// local address the OS would route through. No packets are actually sent.
+/// Best-effort primary LAN IP: a UDP `connect` toward a public address, then read the
+/// local address the OS would route through. No packets are sent.
 ///
-/// Returns `None` — never loopback — when the machine has no LAN address yet, so callers have to
-/// decide what "unknown" means instead of silently inheriting `127.0.0.1`. During a cold boot the
-/// route probe fails outright (the host outruns DHCP: the Windows service is `AutoStart` with no
-/// network dependency), so it falls back to the first non-loopback interface address, which the
-/// NIC has as soon as it is configured even if the default route is not installed yet.
+/// Returns `None` — never loopback — when the machine has no LAN address yet. The
+/// route probe fails on a cold boot before DHCP; then the first non-loopback
+/// interface address is used, which the NIC has as soon as it is configured.
 pub(crate) fn primary_local_ip() -> Option<IpAddr> {
     let routed = UdpSocket::bind("0.0.0.0:0")
         .and_then(|sock| {
@@ -854,12 +716,10 @@ pub(crate) fn primary_local_ip() -> Option<IpAddr> {
     routed.or_else(first_lan_ipv4)
 }
 
-/// First reachable IPv4 an interface holds, ignoring the routing table entirely.
+/// First reachable IPv4 an interface holds, ignoring the routing table.
 ///
-/// Split out because this is the branch the boot race actually takes, and the one nothing would
-/// otherwise exercise: the route probe above needs a default route, which lands *after* the NIC
-/// has its address on a cold boot. Between those two moments the old code had no answer and fell
-/// back to loopback for good.
+/// The route probe needs a default route, which lands after the NIC has its address.
+/// Between those moments this is the only answer that is not loopback.
 fn first_lan_ipv4() -> Option<IpAddr> {
     if_addrs::get_if_addrs()
         .ok()?
@@ -868,20 +728,18 @@ fn first_lan_ipv4() -> Option<IpAddr> {
         .find(|ip| ip.is_ipv4() && usable_lan_ip(*ip))
 }
 
-/// Is `ip` an address a client could actually reach this host on? Loopback and the unspecified
-/// address are both "we don't know yet" dressed up as an answer, and advertising either is the
-/// boot race that made a freshly-restarted host publish itself as `127.0.0.1`.
+/// Loopback and unspecified are "we don't know yet"; advertising either publishes
+/// the host as `127.0.0.1` until restart.
 fn usable_lan_ip(ip: IpAddr) -> bool {
     !ip.is_loopback() && !ip.is_unspecified()
 }
 
-/// Where the paired-client allow-list persists (survives host restarts, like Sunshine).
+/// Where the paired-client allow-list persists across restarts.
 fn paired_path() -> Option<std::path::PathBuf> {
-    // Same dir as the host identity (HOME/.config/punktfunk on Linux, %APPDATA%\punktfunk on Windows).
     Some(pf_paths::config_dir().join("paired.json"))
 }
 
-/// Load the persisted paired-client certificate DERs (empty on first run / parse failure).
+/// Load persisted paired-client certificate DERs. Empty on first run or parse failure.
 fn load_paired() -> Vec<Vec<u8>> {
     let Some(path) = paired_path() else {
         return Vec::new();
@@ -901,9 +759,8 @@ fn load_paired() -> Vec<Vec<u8>> {
     }
 }
 
-/// Persist the paired-client allow-list (called after each successful pairing). Written
-/// atomically (temp file + rename) so a crash mid-write can't truncate `paired.json` — a partial
-/// write would otherwise lock out every paired client until they re-pair.
+/// Persist the paired-client allow-list after each successful pairing. Atomic temp-file
+/// + rename so a crash mid-write cannot truncate `paired.json` and lock out every client.
 pub(crate) fn save_paired(paired: &[Vec<u8>]) {
     let Some(path) = paired_path() else { return };
     if let Some(dir) = path.parent() {
@@ -916,8 +773,7 @@ pub(crate) fn save_paired(paired: &[Vec<u8>]) {
             return;
         }
     };
-    // Write to a sibling temp file (owner-only, so a local user can't tamper the allow-list), then
-    // rename over the target (atomic replace on Unix and Windows). Never write `path` in place.
+    // Sibling temp file (owner-only), then rename over the target. Never write `path` in place.
     let tmp = path.with_extension("json.tmp");
     if let Err(e) = pf_paths::write_secret_file(&tmp, &bytes) {
         tracing::warn!(error = %e, "persisting pairings failed (temp write)");
@@ -929,28 +785,25 @@ pub(crate) fn save_paired(paired: &[Vec<u8>]) {
     }
 }
 
-/// Where the operator's per-client display labels persist, keyed by certificate fingerprint.
+/// Operator-supplied per-client display labels, keyed by certificate fingerprint.
 ///
-/// A SIDECAR to [`paired_path`] rather than a field inside it, for two reasons. `paired.json` is a
-/// bare `Vec<Vec<u8>>` of certificate DERs — giving it a shape would be a migration on the one file
-/// that decides who may connect — and a label is not part of that trust decision, so a corrupt or
-/// missing label file must never be able to lock anybody out. Losing this file loses names, nothing
-/// else.
+/// Sidecar to [`paired_path`], not a field inside it: `paired.json` is a bare
+/// `Vec<Vec<u8>>` of DERs, and a label is not part of the trust decision — a
+/// corrupt labels file must never lock anyone out.
 ///
-/// Why labels have to exist at all: every moonlight-common-c client self-signs with the SAME
-/// subject (`CN=NVIDIA GameStream Client`), so the certificate carries no device identity
-/// whatsoever. Without an operator-supplied name, a list of five paired devices is five identical
-/// rows and the only way to tell them apart — or to know which one to unpair — is the fingerprint.
+/// Every moonlight-common-c client self-signs as `CN=NVIDIA GameStream Client`,
+/// so the certificate carries no device identity; without a label, five paired
+/// devices are five identical rows.
 fn labels_path() -> Option<std::path::PathBuf> {
     Some(pf_paths::config_dir().join("client-labels.json"))
 }
 
-/// Serializes the read-modify-write in [`set_client_label`]. Two concurrent renames would
-/// otherwise race on a whole-file rewrite and silently drop one of the two names.
+/// Serializes the read-modify-write in [`set_client_label`]. Two concurrent renames
+/// would otherwise race on a whole-file rewrite and drop one of the two names.
 static LABELS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Load the fingerprint → label map (empty on first run, unreadable file, or parse failure — a
-/// label is cosmetic, so every failure degrades to "no names" and never to an error).
+/// Fingerprint → label map. Empty on first run, unreadable file, or parse failure —
+/// a label is cosmetic, so every failure degrades to "no names".
 pub(crate) fn load_client_labels() -> std::collections::BTreeMap<String, String> {
     let Some(path) = labels_path() else {
         return Default::default();
@@ -964,9 +817,8 @@ pub(crate) fn load_client_labels() -> std::collections::BTreeMap<String, String>
     })
 }
 
-/// Set (`Some`) or clear (`None`) one client's label, persisted atomically. Returns the stored
-/// label. Fingerprints are normalized to lowercase hex so a rename and a later lookup agree
-/// regardless of how the caller cased the path parameter.
+/// Set (`Some`) or clear (`None`) one client's label, persisted atomically.
+/// Fingerprints are lowercased so a rename and a later lookup agree.
 pub(crate) fn set_client_label(fp_hex: &str, label: Option<&str>) -> Option<String> {
     let _guard = LABELS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fp = fp_hex.to_ascii_lowercase();
@@ -986,9 +838,8 @@ pub(crate) fn set_client_label(fp_hex: &str, label: Option<&str>) -> Option<Stri
     stored
 }
 
-/// Drop the labels of fingerprints that are no longer paired. Called from the unpair paths so the
-/// file cannot grow without bound as devices come and go, and so a re-pairing of the same
-/// certificate starts unnamed rather than inheriting a stranger's name.
+/// Drop labels whose fingerprints are no longer paired, so the file cannot grow
+/// without bound and a re-pair of the same cert starts unnamed.
 pub(crate) fn retain_client_labels(still_paired: &[Vec<u8>]) {
     use sha2::{Digest, Sha256};
     let _guard = LABELS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1004,8 +855,7 @@ pub(crate) fn retain_client_labels(still_paired: &[Vec<u8>]) {
     }
 }
 
-/// Persist the label map — same atomic temp-file + rename as [`save_paired`], so a crash mid-write
-/// cannot truncate it.
+/// Persist the label map with the same atomic temp-file + rename as [`save_paired`].
 fn save_client_labels(labels: &std::collections::BTreeMap<String, String>) {
     let Some(path) = labels_path() else { return };
     if let Some(dir) = path.parent() {
@@ -1033,20 +883,19 @@ fn save_client_labels(labels: &std::collections::BTreeMap<String, String>) {
 mod host_name_tests {
     use super::sanitize_display_name;
 
-    /// The display name rides the mDNS service INSTANCE label, and clients read it back as the
-    /// first label of the fullname — so a `.` truncates the name in every client list. Split from
-    /// the env read: `PUNKTFUNK_HOST_NAME` is process-global and must not race the parallel suite.
+    /// Display name rides the mDNS service instance label; a `.` truncates it in every
+    /// client list. Split from the env read: `PUNKTFUNK_HOST_NAME` is process-global
+    /// and must not race the parallel suite.
     #[test]
     fn display_name_survives_free_text_but_loses_the_label_breakers() {
         assert_eq!(sanitize_display_name("Living Room PC"), "Living Room PC");
         assert_eq!(sanitize_display_name("  Wohnzimmer  "), "Wohnzimmer");
-        // A dot would otherwise cut the name short client-side ("Ben's PC v1").
         assert_eq!(sanitize_display_name("Ben's PC v1.2"), "Ben's PC v1-2");
         assert_eq!(sanitize_display_name("Küche ☕"), "Küche ☕");
         assert_eq!(sanitize_display_name("tab\there"), "tabhere");
-        // Never empty — an empty instance name is not registerable.
+        // Empty instance names are not registerable.
         assert_eq!(sanitize_display_name("   "), "punktfunk-host");
-        // 63-byte DNS-SD label ceiling, truncated on a char boundary.
+        // DNS-SD label ceiling is 63 bytes; truncate on a char boundary.
         let long = sanitize_display_name(&"ü".repeat(100));
         assert!(long.len() <= 63, "{} bytes", long.len());
         assert_eq!(long, "ü".repeat(31));
@@ -1060,8 +909,6 @@ mod local_ip_tests {
 
     #[test]
     fn loopback_and_unspecified_are_never_advertisable() {
-        // The bug: a host that started before its network did advertised these as its address and
-        // kept doing so for the life of the process.
         for unusable in [
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -1084,17 +931,15 @@ mod local_ip_tests {
 
     #[test]
     fn probe_reports_no_address_rather_than_loopback() {
-        // Holds on a networked box and on an isolated CI runner alike: either we found a real LAN
-        // address, or we admit we have none. `None` is what lets `Host::local_ip()` and the mDNS
-        // advert keep retrying instead of freezing a wrong answer in place.
+        // Either a real LAN address or none. `None` lets `Host::local_ip()` and mDNS retry
+        // instead of freezing a wrong answer.
         assert!(primary_local_ip().is_none_or(usable_lan_ip));
     }
 
     #[test]
     fn interface_fallback_never_offers_loopback() {
-        // The branch a cold boot takes, before the default route exists. It may legitimately find
-        // nothing (a machine with no NIC up, e.g. an isolated CI container) — what it must never
-        // do is hand back the loopback that `get_if_addrs` also reports.
+        // Cold-boot branch, before the default route exists. Finding nothing is fine;
+        // handing back loopback from `get_if_addrs` is not.
         assert!(first_lan_ipv4().is_none_or(usable_lan_ip));
     }
 }
@@ -1117,7 +962,7 @@ mod session_tests {
             std::process::id(),
             &0u8 as *const u8
         )));
-        // Both build flavors: the session teardown under test is feature-independent.
+        // Session teardown under test is feature-independent; both `new` flavors.
         #[cfg(feature = "gamestream")]
         {
             let identity = cert::ServerIdentity::ephemeral().expect("ephemeral identity");
@@ -1129,10 +974,8 @@ mod session_tests {
         }
     }
 
-    /// Mint and read must agree on byte order — if they did not, every session would advertise
-    /// one payload in its SETUP response and expect another at the media ports, and no client
-    /// would ever be recognised. A resume must also not reuse the old value: it re-mints
-    /// precisely because the previous one may have been seen on the (plaintext) wire.
+    /// Mint and read must agree on byte order. A resume must not reuse the old value:
+    /// the previous payload may have been seen on the plaintext wire.
     #[cfg(feature = "gamestream")]
     #[test]
     fn av_ping_mint_round_trips_and_changes() {
@@ -1144,10 +987,8 @@ mod session_tests {
         assert_eq!(second, state.av_ping_payload());
     }
 
-    /// `end_session` is THE compat-plane teardown: one call must clear the whole session — both
-    /// media-thread flags, the launch, and the negotiated stream config — and be idempotent.
-    /// Guards the ENet-Disconnect / client-unreachable paths that previously stopped nothing
-    /// (the "session stays alive after the client disconnects" bug).
+    /// One call must clear both media flags, the launch, and the negotiated stream
+    /// config, and be idempotent.
     #[test]
     fn end_session_clears_the_whole_session() {
         use std::sync::atomic::Ordering;
@@ -1175,7 +1016,7 @@ mod session_tests {
                 codec: crate::encode::Codec::H265,
                 min_fec: 0,
                 hdr: false,
-                slices: 1, // the no-request default — hardware decoders get single-slice AUs
+                slices: 1, // no-request default; hardware decoders get single-slice AUs
                 encrypt_video: false,
             });
         }
@@ -1187,14 +1028,12 @@ mod session_tests {
         #[cfg(feature = "gamestream")]
         assert!(state.stream.lock().unwrap().is_none());
 
-        // Idempotent: a second end (e.g. `/cancel` racing the ENet Disconnect) is a no-op.
+        // Second end (`/cancel` racing ENet Disconnect) is a no-op.
         assert!(!state.end_session("test again"));
     }
 
-    /// The compat plane has no close code, so the difference between "the player stopped" and "the
-    /// client vanished" lives entirely in this flag — and it decides whether a display lingers and
-    /// whether an operator's end-game policy sees a decision or a network blip. A teardown that
-    /// forgets to set it silently downgrades a deliberate stop to a drop.
+    /// Compat plane has no close code, so this flag is the only difference between a
+    /// player stop and a vanished client. Forgetting it silently downgrades a stop to a drop.
     #[test]
     fn quit_marks_a_teardown_deliberate_and_a_plain_end_does_not() {
         use std::sync::atomic::Ordering;
@@ -1209,11 +1048,9 @@ mod session_tests {
         state.end_session("client unreachable");
         assert!(!state.quit.load(Ordering::SeqCst));
 
-        // `/cancel`, the management stop and a game exiting all go through `quit_session`.
         state.streaming.store(true, Ordering::SeqCst);
         assert!(state.quit_session("client /cancel"), "video was live");
         assert!(state.quit.load(Ordering::SeqCst));
-        // …and it still performs the full teardown.
         assert!(!state.streaming.load(Ordering::SeqCst));
     }
 }
@@ -1224,17 +1061,14 @@ mod av_ping_tests {
 
     const P: [u8; AV_PING_LEN] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
 
-    /// The wire reference does not say whether the client echoes the SETUP header's ASCII or its
-    /// decoded bytes, and says the modern form wraps the payload in a structure carrying a
-    /// sequence number. Every shape those unknowns allow has to be recognised, or a correct client
-    /// gets its endpoint refused.
+    /// The wire reference does not pin ASCII vs raw, and the modern form wraps the
+    /// payload with a sequence number. Every shape those unknowns allow must match.
     #[test]
     fn both_encodings_match_with_or_without_a_trailing_sequence() {
         let hex = b"0011223344556677";
         let raw = &P[..];
         assert!(ping_matches(hex, &P), "ASCII hex, exactly");
         assert!(ping_matches(raw, &P), "decoded bytes, exactly");
-        // …and each with an SS_PING-style sequence number appended.
         assert!(
             ping_matches(&[&hex[..], &[0, 0, 0, 1]].concat(), &P),
             "hex + seq"
@@ -1245,7 +1079,6 @@ mod av_ping_tests {
         );
     }
 
-    /// The point of the payload: a datagram that does not carry it is not this session's client.
     #[test]
     fn anything_else_does_not_match() {
         assert!(!ping_matches(b"", &P), "empty");
@@ -1259,7 +1092,7 @@ mod av_ping_tests {
         let mut near = P;
         near[7] ^= 1;
         assert!(!ping_matches(&near, &P), "last raw byte wrong");
-        // The old fixed constant, now that every session mints its own.
+        // Former fixed ping, now that every session mints its own.
         assert!(!ping_matches(b"0011223344556677", &[0xAB; AV_PING_LEN]));
     }
 }
@@ -1282,7 +1115,7 @@ mod tests {
         let fmode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
         assert_eq!(fmode, 0o600, "private key must be owner-only (0600)");
 
-        // Overwriting an existing secret keeps it 0600 (the truncate+reopen path).
+        // Overwrite must keep 0600 (truncate + reopen, not create).
         pf_paths::write_secret_file(&key, b"new contents").expect("rewrite secret");
         let fmode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
         assert_eq!(fmode, 0o600);

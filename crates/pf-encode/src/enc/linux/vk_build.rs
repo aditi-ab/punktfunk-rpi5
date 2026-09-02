@@ -1,21 +1,16 @@
-//! Session/frame **construction** for the Vulkan Video encoder — the unsafe builders
-//! (`make_frame*`, `make_video_image`, `probe_rgb_direct`) and the parameter-set bitstream
-//! writers (`build_parameters_h265`/`_av1`, the AV1 sequence-header OBU). Split from
-//! `vulkan_video.rs` (WP7.5) the way `amf_sys.rs` was split from `amf.rs`: a `#[path]` child
-//! module, so this file sees the parent's private items (`Frame` and friends) with zero
-//! visibility churn, and ~800 lines of construction `unsafe` get their own review surface.
-//! Steady-state encode logic stays in the parent.
+//! Session/frame construction for the Vulkan Video encoder: `make_frame*`, `make_video_image`,
+//! `probe_rgb_direct`, and the parameter-set writers (`build_parameters_h265`/`_av1`, the AV1
+//! sequence-header OBU). A `#[path]` child of `vulkan_video.rs`, so it sees the parent's private
+//! items (`Frame` and friends). Steady-state encode stays in the parent.
+//!
+//! RGB-direct probe: `design/vulkan-rgb-direct-encode.md`.
 
-// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
-// Cargo.toml). This body is raw ash/Vulkan object construction and bitstream writing almost line
-// for line; narrowing it would add one `unsafe {}` plus one SAFETY comment per call that could only
-// restate the signature. Clearing this file means DELETING the markers that carry no caller
-// contract, not wrapping the calls — until then the lint is off HERE and enforced everywhere else.
+// `unsafe_op_in_unsafe_fn` is off here: every call is already inside `unsafe fn` construction.
+// Clearing the allow means deleting markers with no caller contract, not wrapping each call.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-// The parent's whole item namespace (Frame, the consts, sibling helpers) — the point of the
-// child-module shape. External imports are this file's own; `vk_util` is a crate-root sibling,
-// so the path is `crate::`, not the parent-relative `super::` the parent uses.
+// `super::*` is the point of the child-module shape. `vk_util` is a crate-root sibling, so
+// `crate::` — not the parent-relative `super::` the parent uses.
 use super::*;
 use crate::vk_util::{ext_advertised, find_mem, make_plain_image, make_view};
 use anyhow::{bail, Result};
@@ -26,17 +21,16 @@ pub(super) fn align_up(v: u64, a: u64) -> u64 {
     v.div_ceil(a) * a
 }
 
-/// Probe for the RGB-direct encode source (design/vulkan-rgb-direct-encode.md): can this device
-/// take the captured RGB dmabuf directly, with the VCN EFC front-end doing the CSC, via
-/// `VK_VALVE_video_encode_rgb_conversion` (RADV since Mesa 26.0, gated on EFC hardware)?
-/// `Ok((x_offset, y_offset))` carries the chroma-siting bits a session must be created with
-/// (the preferred available bit per axis); `Err` is the first missing requirement, logged as
-/// the open-time verdict.
+/// Probe the RGB-direct encode source (`design/vulkan-rgb-direct-encode.md`): can this device
+/// take the captured RGB dmabuf directly, with the VCN EFC doing the CSC, via
+/// `VK_VALVE_video_encode_rgb_conversion`?
 ///
-/// `ten_bit` + `src_fmt` describe the session being planned: an HDR one needs the EFC to advertise
-/// the BT.2020 model (not 709) and the 10-bit packed-RGB `src_fmt` as an encode-source format.
-/// Both are hardware facts, so an EFC that cannot do HDR simply reports `Err` and the session
-/// takes the compute CSC — no fallback all the way out to VAAPI.
+/// `Ok((x_offset, y_offset))` is the chroma-siting bits the session must be created with
+/// (preferred available bit per axis). `Err` is the first missing requirement.
+///
+/// `ten_bit` + `src_fmt` describe the planned session: HDR needs the BT.2020 model and the
+/// 10-bit packed-RGB `src_fmt` as an encode-source format. An EFC that cannot do HDR returns
+/// `Err` and the session takes the compute CSC.
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn probe_rgb_direct(
     instance: &ash::Instance,
@@ -49,17 +43,12 @@ pub(super) unsafe fn probe_rgb_direct(
 ) -> Result<(u32, u32), &'static str> {
     use crate::vk_av1_encode as av1b;
     use crate::vk_valve_rgb as vrgb;
-    // 1. The device extension must exist (Mesa >= 26.0 AND the VCN has an EFC block).
     let Ok(exts) = instance.enumerate_device_extension_properties(pd) else {
         return Err("probe-failed(ext-enum)");
     };
-    // Route through `vk_util::ext_advertised` rather than open-coding the walk a second time:
-    // this copy used the same unbounded `CStr::from_ptr` and had the same read-past-the-array
-    // hazard on a driver that fills all VK_MAX_EXTENSION_NAME_SIZE bytes without a NUL.
     if !ext_advertised(&exts, vrgb::EXTENSION_NAME) {
         return Err("no-ext(mesa<26.0-or-no-efc)");
     }
-    // 2. Feature bit.
     let mut feat = vrgb::PhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE {
         s_type: vrgb::stype(vrgb::ST_PHYSICAL_DEVICE_FEATURES),
         p_next: std::ptr::null_mut(),
@@ -73,10 +62,8 @@ pub(super) unsafe fn probe_rgb_direct(
     if feat.video_encode_rgb_conversion == vk::FALSE {
         return Err("no-feature");
     }
-    // 3. Capabilities under the rgb-chained profile — the conversion must cover the colour math
-    //    the compute CSC would otherwise do (`rgb2yuv.comp`: BT.709 narrow; `rgb2yuv10.comp`:
-    //    BT.2020 narrow), at this session's depth. Chroma siting is looser, see below. The
-    //    profile chain is the same one every rgb-direct consumer presents.
+    // Caps under the rgb-chained profile: colour math must match the compute CSC
+    // (`rgb2yuv.comp` 709-narrow / `rgb2yuv10.comp` 2020-narrow). Same chain every consumer presents.
     let mut ps = RgbProfileStack::new(codec_op, ten_bit);
     let profile = *ps.wire(av1);
     let mut rgb_caps = vrgb::VideoEncodeRgbConversionCapabilitiesVALVE {
@@ -104,12 +91,9 @@ pub(super) unsafe fn probe_rgb_direct(
     if r != vk::Result::SUCCESS {
         return Err("no-rgb-profile(caps)");
     }
-    // Colour model + range must match the shader exactly (709 narrow). Chroma siting is looser
-    // BY ON-GLASS FINDING (RADV 26.0.4 / 780M): the VCN EFC advertises x=COSITED_EVEN only —
-    // the canonical H.26x left-cosited siting — while our 2x2-average shader is midpoint. The
-    // difference is a half-pel chroma-x phase, imperceptible (and EFC's is arguably the more
-    // correct one since nothing in our bitstream signals siting). Accept either bit per axis
-    // and choose the closest to the shader's math: midpoint if offered, else cosited-even.
+    // Model + range must match the shader. Siting is looser: EFC often offers only COSITED_EVEN
+    // (H.26x left-cosited) while the 2x2-average shader is midpoint. Accept either bit per axis;
+    // pick midpoint if offered, else cosited-even. Nothing in the bitstream signals siting.
     let pick = |offered: u32| -> Option<u32> {
         if offered & vrgb::CHROMA_OFFSET_MIDPOINT != 0 {
             Some(vrgb::CHROMA_OFFSET_MIDPOINT)
@@ -133,10 +117,8 @@ pub(super) unsafe fn probe_rgb_direct(
     ) else {
         return Err("no-chroma-siting");
     };
-    // 4. The encode-src format set under this profile must offer the CAPTURED format with
-    //    DRM-modifier tiling — LINEAR BGRx dmabufs (fourcc XR24) import as B8G8R8A8_UNORM, and a
-    //    10-bit PQ capture (XR30/XB30) as one of the packed 2:10:10:10 formats. A device whose
-    //    EFC handles 8-bit RGB but not 10-bit lands here rather than at the session create.
+    // Encode-src under this profile must offer `src_fmt` with DRM-modifier tiling.
+    // LINEAR XR24 imports as B8G8R8A8_UNORM; XR30/XB30 as packed 2:10:10:10.
     let profile_arr = [profile];
     let plist = vk::VideoProfileListInfoKHR::default().profiles(&profile_arr);
     let mut fmt_info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
@@ -166,9 +148,8 @@ pub(super) unsafe fn probe_rgb_direct(
     Ok((x_offset, y_offset))
 }
 
-/// The EFC colour model a session of this depth needs: BT.709 for SDR, BT.2020 for HDR — the same
-/// matrices the two compute-CSC shaders implement, so the encode source is interchangeable and the
-/// SPS/sequence-header colour signalling is correct either way.
+/// EFC colour model for this depth (709 SDR / 2020 HDR) — the same matrices the compute-CSC
+/// shaders use, so encode-src and SPS/sequence-header colour signalling stay interchangeable.
 pub(super) fn rgb_model_for(ten_bit: bool) -> u32 {
     use crate::vk_valve_rgb as vrgb;
     if ten_bit {
@@ -213,7 +194,7 @@ pub(super) unsafe fn make_video_image(
     }
     let img = device.create_image(&ci, None)?;
     let req = device.get_image_memory_requirements(img);
-    // Unwind on failure: callers (the open path) only ever see the completed pair.
+    // Destroy the image if alloc fails: callers only ever see the completed pair.
     let mem = match device.allocate_memory(
         &vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)
@@ -238,13 +219,11 @@ pub(super) unsafe fn make_video_image(
     Ok((img, mem))
 }
 
-/// Build one in-flight frame's private resources: NV12 encode-src, Y/UV CSC scratch, its CSC
-/// descriptor set (Y/UV bound now, RGB per use), the bitstream buffer + feedback query, and the
-/// per-frame command buffers + sync. `profile_list`/`profile` are borrowed only during creation.
+/// Build one in-flight frame's private resources into `f`. `profile_list`/`profile` are
+/// borrowed only during creation.
 ///
-/// Builds in place into `f` — a [`Frame::default`] the caller has already parked in its
-/// [`VkTeardown`] guard — so every handle is owned by the unwind the moment it exists and a
-/// mid-build failure leaks nothing.
+/// `f` is a [`Frame::default`] already parked in the caller's [`VkTeardown`] guard, so every
+/// handle is owned by the unwind the moment it exists.
 pub(super) unsafe fn make_frame(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -267,10 +246,8 @@ pub(super) unsafe fn make_frame(
 ) -> Result<()> {
     // "no cursor uploaded yet" sentinel — a real serial may be 0 (see `prep_cursor`).
     f.cursor_serial = u64::MAX;
-    // Padded-copy staging (unaligned-mode RGB-direct or native NV12): an aligned encode-src in
-    // the session's picture format, filled by a transfer blit each frame — concurrent compute
-    // (copy) + encode (source read). TRANSFER_SRC because the width-padding pass self-copies the
-    // staging image's own last visible column (see `record_pad_blit`).
+    // Padded-copy staging: aligned encode-src filled by a transfer blit each frame.
+    // TRANSFER_SRC: `record_pad_blit` self-copies the last visible column.
     if let Some(fmt) = pad_fmt {
         (f.pad_img, f.pad_mem) = make_video_image(
             device,
@@ -287,9 +264,8 @@ pub(super) unsafe fn make_frame(
         )?;
         f.pad_view = make_view(device, f.pad_img, fmt, 0)?;
     }
-    // RGB-direct sessions never touch the CSC pipeline: no NV12 encode-src, no Y/UV scratch, no
-    // cursor overlay, no descriptor set — the encode source is the imported RGB itself (or the
-    // CPU staging image, built lazily). Their Frame keeps the null handles (teardown-safe).
+    // RGB-direct skips CSC: encode-src is the imported RGB (or lazy CPU staging).
+    // Frame keeps the null handles; teardown treats them as empty.
     if csc {
         make_frame_csc(
             device,
@@ -318,7 +294,7 @@ pub(super) unsafe fn make_frame(
     )
 }
 
-/// The CSC-only half of [`make_frame`]: NV12 encode-src + Y/UV scratch + cursor + descriptors.
+/// CSC half of [`make_frame`]: NV12 encode-src, Y/UV scratch, cursor, descriptors.
 #[allow(clippy::too_many_arguments)]
 unsafe fn make_frame_csc(
     device: &ash::Device,
@@ -333,7 +309,6 @@ unsafe fn make_frame_csc(
     hdr: bool,
     f: &mut Frame,
 ) -> Result<()> {
-    // 4:2:0 encode-src (filled by the CSC copy) — concurrent compute+encode.
     let pic = yuv_format(hdr);
     (f.nv12_src, f.nv12_mem) = make_video_image(
         device,
@@ -347,12 +322,9 @@ unsafe fn make_frame_csc(
         fams,
     )?;
     f.nv12_view = make_view(device, f.nv12_src, pic, 0)?;
-    // CSC scratch: Y full-res + UV half-res, in a single-plane format the shader can declare as a
-    // storage image AND that is SIZE-COMPATIBLE with the picture's planes (`vkCmdCopyImage`
-    // between differing formats requires equal texel-block size). 8-bit: R8/RG8 vs the NV12
-    // planes' 1/2 bytes. 10-bit: R16/RG16 vs the 3PACK16 planes' 2/4 bytes — the 10-bit ycbcr
-    // plane formats themselves are not storage-image formats, which is why the scratch is 16-bit
-    // and `rgb2yuv10.comp` writes the value into the high bits by hand.
+    // Scratch is a storage-image format size-compatible with the picture planes (`vkCmdCopyImage`
+    // needs equal texel-block size). 10-bit ycbcr planes are not storage formats, so R16/RG16
+    // and `rgb2yuv10.comp` writes the value into the high bits.
     let (y_fmt, uv_fmt) = if hdr {
         (vk::Format::R16_UNORM, vk::Format::R16G16_UNORM)
     } else {
@@ -374,9 +346,8 @@ unsafe fn make_frame_csc(
         h / 2,
         vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
     )?;
-    // Cursor overlay: fixed CURSOR_MAX² RGBA8 sampled image + host staging (cursor-as-metadata). The
-    // view/descriptor is static (bound at binding 3 below); only the image *content* changes, and
-    // only when the pointer bitmap does — see `prep_cursor`.
+    // Cursor overlay: CURSOR_MAX² RGBA8 + host staging. View/descriptor stay bound;
+    // only the image content changes (`prep_cursor`).
     (f.cursor_img, f.cursor_mem, f.cursor_view) = make_plain_image(
         device,
         mem_props,
@@ -403,8 +374,8 @@ unsafe fn make_frame_csc(
         None,
     )?;
     device.bind_buffer_memory(f.cursor_stage, f.cursor_stage_mem, 0)?;
-    // Descriptor set — Y/UV storage bindings fixed; binding 0 (RGB) rewritten per use; binding 3
-    // (cursor) points at the static cursor image (its layout is SHADER_READ_ONLY once prepped).
+    // Y/UV storage fixed; binding 0 (RGB) is rewritten per use. Binding 3 is the static cursor
+    // (SHADER_READ_ONLY once prepped).
     let dsls = [csc_dsl];
     f.csc_set = device.allocate_descriptor_sets(
         &vk::DescriptorSetAllocateInfo::default()
@@ -444,8 +415,8 @@ unsafe fn make_frame_csc(
     Ok(())
 }
 
-/// The mode-independent half of [`make_frame`]: bitstream buffer (+ persistent map), feedback
-/// query, optional timestamp pool, command buffers and sync objects.
+/// Mode-independent half of [`make_frame`]: bitstream buffer (persistently mapped), feedback
+/// query, optional timestamp pool, command buffers, sync objects.
 #[allow(clippy::too_many_arguments)]
 unsafe fn make_frame_common(
     device: &ash::Device,
@@ -458,7 +429,6 @@ unsafe fn make_frame_common(
     with_ts: bool,
     f: &mut Frame,
 ) -> Result<()> {
-    // Bitstream buffer + feedback query.
     f.bs_buf = device.create_buffer(
         &vk::BufferCreateInfo::default()
             .size(bs_size)
@@ -478,12 +448,12 @@ unsafe fn make_frame_common(
         None,
     )?;
     device.bind_buffer_memory(f.bs_buf, f.bs_mem, 0)?;
-    // Map once for the slot's lifetime — read_slot copies AUs straight out of this (coherent
-    // memory, no per-frame map/unmap); vkFreeMemory implicitly unmaps at teardown.
+    // Map once for the slot's lifetime; `read_slot` copies AUs out of coherent memory.
+    // `vkFreeMemory` unmaps at teardown.
     f.bs_ptr = BsPtr(
         device.map_memory(f.bs_mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *const u8,
     );
-    // PUNKTFUNK_PERF: a 2-slot timestamp pool bracketing this slot's compute batch (CSC split).
+    // Two timestamps bracket this slot's compute batch (CSC split).
     if with_ts {
         f.ts_pool = device.create_query_pool(
             &vk::QueryPoolCreateInfo::default()
@@ -502,7 +472,6 @@ unsafe fn make_frame_common(
         .query_count(1);
     query_ci.p_next = &fb_ci as *const _ as *const c_void;
     f.query_pool = device.create_query_pool(&query_ci, None)?;
-    // Command buffers + per-frame sync.
     f.cmd = device.allocate_command_buffers(
         &vk::CommandBufferAllocateInfo::default()
             .command_pool(cmd_pool)
@@ -518,8 +487,8 @@ unsafe fn make_frame_common(
     Ok(())
 }
 
-/// Author VPS/SPS/PPS (Main, level 4.0, low-latency, conformance-window crop) and return the
-/// session-parameters object + the encoded header bytes (VPS+SPS+PPS NALs) for keyframes.
+/// Author VPS/SPS/PPS (Main/Main10, low-latency, conformance-window crop) and return the
+/// session-parameters object plus the encoded header bytes for keyframes.
 pub(super) unsafe fn build_parameters_h265(
     device: &ash::Device,
     vq_dev: &ash::khr::video_queue::Device,
@@ -530,9 +499,8 @@ pub(super) unsafe fn build_parameters_h265(
     rw: u32,
     rh: u32,
     quality_level: u32,
-    // 10-bit HDR session: Main10 + BT.2020/PQ colour signalling. Must agree with the video
-    // profile the session was CREATED with (`open_inner`'s `ten_bit`) — a Main SPS on a Main10
-    // session is a bitstream that says one thing and carries another.
+    // Main10 + BT.2020/PQ. Must match the profile the session was created with
+    // (`open_inner`'s `ten_bit`); a Main SPS on a Main10 session mislabels the samples.
     ten_bit: bool,
 ) -> Result<(vk::VideoSessionParametersKHR, Vec<u8>)> {
     use ash::vk::native as hh;
@@ -564,7 +532,7 @@ pub(super) unsafe fn build_parameters_h265(
     sps.pic_width_in_luma_samples = w;
     sps.pic_height_in_luma_samples = h;
     sps.log2_max_pic_order_cnt_lsb_minus4 = 4;
-    // Main10's `bit_depth_*_minus8 = 2`. Zeroed (= 8-bit) for Main, as before.
+    // Main10: `bit_depth_*_minus8 = 2`. Left 0 (8-bit) for Main.
     if ten_bit {
         sps.bit_depth_luma_minus8 = 2;
         sps.bit_depth_chroma_minus8 = 2;
@@ -581,22 +549,15 @@ pub(super) unsafe fn build_parameters_h265(
         sps.conf_win_bottom_offset = (h - rh) / 2; // 4:2:0 SubHeightC = 2
     }
 
-    // Colour signalling, exactly what this session's CSC produced: `rgb2yuv.comp` is BT.709
-    // limited 8-bit, `rgb2yuv10.comp` is BT.2020 NCL limited 10-bit with a PQ transfer (the
-    // samples arrive PQ-encoded from the compositor and the matrix does not touch the transfer).
-    // Without the VUI the stream is "unspecified" and each decoder applies its own default: the
-    // punktfunk clients fall back to BT.709 (`pf_client_core::video_color::csc_rows`), but vendor
-    // TV decoders guess from RESOLUTION — an LG webOS panel reads a 4K SDR stream as BT.2020 and
-    // renders it visibly washed out.
-    //
-    // `vui` must outlive `create_video_session_parameters_khr` below — it does, `sps_arr` only
-    // copies the pointer and both live to the end of this function.
+    // VUI names the CSC: 709 limited 8-bit, or 2020-NCL + PQ 10-bit (samples arrive PQ;
+    // the matrix does not touch transfer). Omit it and decoders guess colorimetry.
+    // `vui` must outlive `create_video_session_parameters_khr` — `sps_arr` copies the pointer.
     let mut vui: hh::StdVideoH265SequenceParameterSetVui = std::mem::zeroed();
     vui.flags.set_video_signal_type_present_flag(1);
     vui.flags.set_video_full_range_flag(0); // limited/studio swing
     vui.flags.set_colour_description_present_flag(1);
     vui.video_format = 5; // unspecified — the CICP triplet below is what matters
-                          // CICP code points: 1 = BT.709, 9 = BT.2020 primaries / BT.2020 NCL matrix, 16 = SMPTE 2084.
+    // CICP: 1 = BT.709, 9 = BT.2020 primaries / 2020-NCL matrix, 16 = SMPTE 2084.
     let (prim, trc, mat) = if ten_bit { (9, 16, 9) } else { (1, 1, 1) };
     vui.colour_primaries = prim;
     vui.transfer_characteristics = trc;
@@ -620,8 +581,8 @@ pub(super) unsafe fn build_parameters_h265(
         .max_std_sps_count(1)
         .max_std_pps_count(1)
         .parameters_add_info(&add);
-    // Bake the session's quality level into the parameters object — the spec requires it to match
-    // the level the first frame's ENCODE_QUALITY_LEVEL control installs.
+    // Quality level is baked into the parameters object; it must match the first frame's
+    // ENCODE_QUALITY_LEVEL control.
     let mut q_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(quality_level);
     let ci = vk::VideoSessionParametersCreateInfoKHR::default()
         .video_session(session)
@@ -659,7 +620,7 @@ pub(super) unsafe fn build_parameters_h265(
         std::ptr::null_mut(),
     );
     if r != vk::Result::SUCCESS {
-        // `params` is live but not yet the caller's guard's to unwind — destroy before bailing.
+        // `params` is live and not yet the caller's to unwind — destroy before bailing.
         (vq_dev.fp().destroy_video_session_parameters_khr)(
             device.handle(),
             params,
@@ -687,8 +648,7 @@ pub(super) unsafe fn build_parameters_h265(
     Ok((params, buf))
 }
 
-/// AV1 low-overhead OBU bit-writer (MSB-first), used to hand-pack the sequence-header OBU that
-/// Vulkan AV1 encode (unlike H26x) never emits itself.
+/// MSB-first OBU bit-writer. Vulkan AV1 encode never emits the sequence header (H.26x does).
 struct Av1BitWriter {
     buf: Vec<u8>,
     cur: u8,
@@ -726,7 +686,6 @@ impl Av1BitWriter {
     }
 }
 
-/// AV1 leb128 (little-endian base-128) encoding of an OBU size.
 fn leb128(mut v: u64) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
@@ -743,11 +702,10 @@ fn leb128(mut v: u64) -> Vec<u8> {
     out
 }
 
-/// Bit-pack a `sequence_header_obu` (AV1 spec §5.5) into a size-delimited OBU. The field values here
-/// MUST mirror the `StdVideoAV1SequenceHeader` handed to the driver in `build_parameters_av1` so the
-/// driver-emitted frame OBUs parse against this header. Single operating point, 4:2:0 at 8 or 10
-/// bits, order-hint on, CDEF+restoration+filter-intra allowed, everything exotic
-/// (compound/warp/superres) disabled — the profile our single-reference P-frame encoder uses.
+/// Bit-pack a `sequence_header_obu` (AV1 spec §5.5) into a size-delimited OBU. Field values
+/// MUST match the `StdVideoAV1SequenceHeader` in `build_parameters_av1` so driver-emitted
+/// frame OBUs parse against this header. Single operating point, 4:2:0 at 8 or 10 bits,
+/// order-hint on; CDEF, restoration, filter-intra, compound, warp, superres all off.
 #[allow(clippy::too_many_arguments)]
 fn av1_sequence_header_obu(
     sb128: bool,
@@ -792,17 +750,10 @@ fn av1_sequence_header_obu(
     w.bit(0); // enable_superres
     w.bit(0); // enable_cdef
     w.bit(0); // enable_restoration
-              // color_config() (AV1 spec §5.5.2): 4:2:0 at the session's depth, limited range,
-              // carrying the CSC this backend actually performed — BT.709 for `rgb2yuv.comp`,
-              // BT.2020 + PQ for `rgb2yuv10.comp` (or the EFC's equivalent). AV1 has no VUI, so
-              // the CICP triplet lives here; omitting it (color_description_present_flag = 0)
-              // left the stream "unspecified" and vendor TV decoders guess colorimetry from
-              // resolution. Neither triplet hits the spec's sRGB special case (which would force
-              // color_range = 1 and drop the explicit range bit), so the field order below is the
-              // same as the unspecified form plus the three CICP bytes.
-              //
-              // `high_bitdepth` alone encodes 10-bit here: `twelve_bit` follows it ONLY for
-              // seq_profile 2, and ours is MAIN (0).
+              // color_config() (AV1 spec §5.5.2). AV1 has no VUI; CICP lives here.
+              // Neither 709 nor 2020+PQ is the spec's sRGB special case (that would force
+              // color_range = 1 and drop the range bit). `high_bitdepth` alone is 10-bit:
+              // `twelve_bit` follows it only for seq_profile 2; ours is MAIN (0).
     w.bit(ten_bit as u32); // high_bitdepth -> BitDepth = 10
     w.bit(0); // mono_chrome
     w.bit(1); // color_description_present_flag
@@ -819,8 +770,8 @@ fn av1_sequence_header_obu(
     w.bit(0); // separate_uv_delta_q
     w.bit(0); // film_grain_params_present
 
-    // trailing_bits(): a stop `1` bit then zero-pad to a byte (the size field delimits the OBU, but
-    // the parser still requires the trailing_one_bit — dav1d/cbs reject a plain zero pad).
+    // trailing_bits(): stop `1` then zero-pad. Size delimits the OBU, but parsers still
+    // require trailing_one_bit (dav1d/cbs reject a plain zero pad).
     w.bit(1);
     let payload = w.finish();
     let mut obu = vec![0x0au8]; // obu_header: type=OBU_SEQUENCE_HEADER(1), has_size_field=1
@@ -829,8 +780,8 @@ fn av1_sequence_header_obu(
     obu
 }
 
-/// AV1 session parameters + header framing. Vulkan AV1 encode emits only the per-frame OBU, so we
-/// return the app-owned prefixes: a temporal-delimiter OBU that opens every temporal unit
+/// AV1 session parameters + header framing. Vulkan AV1 encode emits only the per-frame OBU, so
+/// the return is app-owned prefixes: a temporal-delimiter OBU every temporal unit
 /// (`frame_prefix`), and TD + the bit-packed sequence-header OBU for keyframes (`header`).
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn build_parameters_av1(
@@ -844,22 +795,20 @@ pub(super) unsafe fn build_parameters_av1(
     max_level: ash::vk::native::StdVideoAV1Level,
     sb128: bool,
     quality_level: u32,
-    // 10-bit HDR session — must agree with the video profile the session was CREATED with
-    // (`open_inner`'s `ten_bit`) and with the OBU packed below.
+    // Must match the profile the session was created with (`open_inner`'s `ten_bit`)
+    // and the OBU packed below.
     ten_bit: bool,
 ) -> Result<(vk::VideoSessionParametersKHR, Vec<u8>, Vec<u8>)> {
     use crate::vk_av1_encode as av1;
     use ash::vk::native as hh;
 
-    let fwb = 31 - w.leading_zeros(); // av_log2(w): enough bits for max_frame_width_minus_1 = w-1
+    let fwb = 31 - w.leading_zeros(); // bits for max_frame_width_minus_1 = w-1
     let fhb = 31 - h.leading_zeros();
     let order_hint_bits_minus_1: u32 = 7; // OrderHintBits = 8
     let seq_level_idx = max_level; // StdVideoAV1Level's numeric value IS the AV1 seq_level_idx
 
-    // ---- Std sequence header (must match the OBU packed below) ----
-    // Limited range at the session's depth, mirroring the `color_config()` bits
-    // `av1_sequence_header_obu` packs — the two MUST stay identical or the driver's frame OBUs
-    // parse against a header we didn't write. `color_range` stays 0 (studio swing).
+    // Std sequence header must match the OBU packed below or driver frame OBUs parse
+    // against a header we did not write. `color_range` stays 0 (studio swing).
     let mut cc_flags: hh::StdVideoAV1ColorConfigFlags = std::mem::zeroed();
     cc_flags.set_color_description_present_flag(1);
     let mut cc: hh::StdVideoAV1ColorConfig = std::mem::zeroed();
@@ -887,10 +836,9 @@ pub(super) unsafe fn build_parameters_av1(
     cc.chroma_sample_position =
         hh::StdVideoAV1ChromaSamplePosition_STD_VIDEO_AV1_CHROMA_SAMPLE_POSITION_UNKNOWN;
 
-    // Match FFmpeg's Vulkan AV1 encoder (proven on this RADV/VCN path): the ONLY coding tools
-    // enabled are order-hint and (per caps) 128x128 superblocks. CDEF, loop restoration, filter-
-    // intra, warped/compound motion, superres all OFF — enabling them made VCN emit frame-header
-    // sections whose bit layout our sequence header didn't match, desyncing every inter frame.
+    // Only order-hint and (per caps) 128×128 superblocks. Extra tools (CDEF, restoration,
+    // filter-intra, warp/compound, superres) make the driver emit frame-header sections
+    // whose bit layout does not match this sequence header, and every inter frame desyncs.
     let mut sh_flags: hh::StdVideoAV1SequenceHeaderFlags = std::mem::zeroed();
     if sb128 {
         sh_flags.set_use_128x128_superblock(1);
@@ -908,7 +856,6 @@ pub(super) unsafe fn build_parameters_av1(
     sh.seq_force_screen_content_tools = 2; // SELECT
     sh.pColorConfig = &cc;
 
-    // ---- single operating point conveying the level/tier the driver targets ----
     let op = av1::StdVideoEncodeAV1OperatingPointInfo {
         flags: std::mem::zeroed(),
         operating_point_idc: 0,
@@ -927,8 +874,8 @@ pub(super) unsafe fn build_parameters_av1(
         std_operating_point_count: 1,
         p_std_operating_points: ops.as_ptr() as *const c_void,
     };
-    // Bake the session's quality level into the parameters object (must match the level the first
-    // frame's ENCODE_QUALITY_LEVEL control installs); chained raw ahead of the vendored AV1 struct.
+    // Quality level must match the first frame's ENCODE_QUALITY_LEVEL control.
+    // Chained raw ahead of the vendored AV1 struct.
     let mut q_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(quality_level);
     q_info.p_next = &av1_spci as *const _ as *const c_void;
     let mut ci = vk::VideoSessionParametersCreateInfoKHR::default().video_session(session);
@@ -944,7 +891,6 @@ pub(super) unsafe fn build_parameters_av1(
         bail!("create_video_session_parameters (av1): {r:?}");
     }
 
-    // ---- header framing: TD every temporal unit; TD + seq-header OBU on keyframes ----
     let td = vec![0x12u8, 0x00]; // temporal_delimiter OBU (type=2, size=0)
     let seq_obu = av1_sequence_header_obu(
         sb128,
@@ -965,18 +911,16 @@ pub(super) unsafe fn build_parameters_av1(
 mod tests {
     use super::*;
 
-    /// Walks a bit-packed AV1 sequence header field-by-field (spec §5.5.1 order, for the fixed
-    /// configuration `av1_sequence_header_obu` emits) and returns the `color_config()` values.
-    /// Deliberately an INDEPENDENT walk rather than a mirror of the writer: it is the only thing
-    /// that catches a field width or ordering change upstream of `color_config`, which would leave
-    /// the colour bits parsing at the wrong offset — the exact desync the module doc warns about.
+    /// Independent walk of a packed sequence header (spec §5.5.1 order) returning
+    /// `color_config()`. Not a mirror of the writer: a field-width or ordering change
+    /// upstream of `color_config` would make the colour bits parse at the wrong offset.
     fn read_color_config(
         obu: &[u8],
         fwb: u32,
         fhb: u32,
         seq_level_idx: u32,
     ) -> (u8, u8, u8, u8, u8, u8) {
-        // obu_header (1 byte) + leb128 size — the payload starts after both.
+        // Payload starts after obu_header (1 byte) + leb128 size.
         assert_eq!(
             obu[0], 0x0a,
             "obu_header: OBU_SEQUENCE_HEADER + has_size_field"
@@ -1036,8 +980,7 @@ mod tests {
         take(1); // enable_cdef
         take(1); // enable_restoration
 
-        // color_config(). `high_bitdepth` is returned rather than asserted — the 10-bit case
-        // below is the whole point of reading it.
+        // `high_bitdepth` is returned, not asserted — the 10-bit case is why we read it.
         let high_bitdepth = take(1) as u8;
         assert_eq!(take(1), 0, "mono_chrome");
         let described = take(1) as u8;
@@ -1054,17 +997,13 @@ mod tests {
         (high_bitdepth, described, cp, tc, mc, range)
     }
 
-    /// The sequence header must SIGNAL BT.709 limited — the CSC `rgb2yuv.comp` actually performs.
-    /// An unsignalled ("unspecified") AV1 stream makes vendor TV decoders guess colorimetry from
-    /// resolution: an LG webOS panel reads 4K SDR as BT.2020 and renders it washed out.
-    ///
-    /// The values here must equal the `StdVideoAV1ColorConfig` in `build_parameters_av1` — the
-    /// driver packs its frame OBUs against that struct while clients parse this header, so a
-    /// mismatch desyncs every inter frame.
+    /// Sequence header must signal BT.709 limited — the CSC `rgb2yuv.comp` performs.
+    /// Values must equal `StdVideoAV1ColorConfig` in `build_parameters_av1`: the driver
+    /// packs frame OBUs against that struct while clients parse this header.
     #[test]
     fn av1_sequence_header_signals_bt709_limited() {
-        // 1920x1080: av_log2 gives 10/10 frame-size bits; level 4.0 (seq_level_idx 8) exercises
-        // the seq_tier branch, and sb128 both ways since it sits above color_config.
+        // 1920×1080 → 10/10 frame-size bits. Level 8 exercises seq_tier; sb128 both ways
+        // because it sits above color_config.
         for (sb128, level) in [(false, 8u32), (true, 5u32)] {
             let obu = av1_sequence_header_obu(sb128, 10, 10, 1919, 1079, 7, level, false);
             let (depth10, described, cp, tc, mc, range) = read_color_config(&obu, 10, 10, level);
@@ -1082,10 +1021,8 @@ mod tests {
         }
     }
 
-    /// …and a 10-bit session must signal BT.2020 + PQ with `high_bitdepth` set. Same reason the
-    /// 8-bit twin exists, plus one that is specific to AV1: `high_bitdepth` sits BEFORE the CICP
-    /// bytes in `color_config()`, so getting it wrong does not just mislabel the depth — every
-    /// field after it parses one bit out of phase.
+    /// 10-bit session must signal BT.2020 + PQ with `high_bitdepth` set. That bit sits
+    /// before the CICP bytes in `color_config()`, so a miss phases every field after it.
     #[test]
     fn av1_sequence_header_signals_bt2020_pq_at_10_bit() {
         for (sb128, level) in [(false, 8u32), (true, 5u32)] {

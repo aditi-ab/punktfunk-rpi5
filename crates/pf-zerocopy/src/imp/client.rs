@@ -1,10 +1,9 @@
-//! Host side of the isolated zero-copy GPU import (design:
-//! `design/zerocopy-worker-isolation.md`): spawns the `zerocopy-worker` subprocess on the shared
-//! [`super::ipc`] rails, mirrors the [`super::egl::EglImporter`] entry points over the
-//! [`super::proto`] vocabulary, and materializes the worker's pooled CUDA buffers in this process
-//! via CUDA IPC (each buffer's handles are opened exactly once and reused as the pool recycles).
-//! A worker death — the whole point of the isolation — surfaces as an `Err` with
-//! [`RemoteImporter::dead`] set, never as a host fault.
+//! Isolated zero-copy GPU import: spawn `zerocopy-worker` on [`super::ipc`],
+//! mirror [`super::egl::EglImporter`] over [`super::proto`], and open each
+//! pooled CUDA IPC handle once in this process as the pool recycles.
+//!
+//! Worker death is an `Err` with [`RemoteImporter::dead`] set, never a host
+//! fault. Design: `design/zerocopy-worker-isolation.md`.
 
 use super::cuda::{self, CUdeviceptr, DeviceBuffer, CU_IPC_HANDLE_SIZE};
 use super::egl::DmabufPlane;
@@ -20,23 +19,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Handshake budget: EGL + CUDA bring-up is ~200 ms; a cold driver load can take seconds.
+/// 20 s: EGL/CUDA bring-up is ~200 ms; a cold driver load can take seconds.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
-/// Per-request budget. An import is a few ms of GPU work; if the worker can't answer in this
-/// window it is wedged (GPU fault in progress) and gets treated as dead.
+/// 10 s: an import is a few ms of GPU work. Miss = wedged (GPU fault) = dead.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// State shared with in-flight frames: the socket (their release messages) and the CUDA IPC
-/// mappings (their device pointers). Lives until the LAST in-flight [`DeviceBuffer`] drops, so a
-/// mapping is never closed under a frame the encoder still reads — and only then does the socket
-/// close, which is what tells an idle worker to exit.
+/// Socket + CUDA IPC mappings, Arc-shared with in-flight [`DeviceBuffer`]s.
+/// Last drop closes mappings then the socket, which is the idle worker's EOF.
 struct Shared {
     sock: OwnedFd,
     mappings: Mutex<HashMap<u32, MapEntry>>,
     dead: AtomicBool,
 }
 
-/// One pooled worker buffer, opened in this process.
 #[derive(Clone, Copy)]
 struct Mapping {
     y: CUdeviceptr,
@@ -46,13 +41,10 @@ struct Mapping {
     height: u32,
 }
 
-/// A [`Mapping`] plus its lifecycle: how many in-flight [`DeviceBuffer`]s still point into it,
-/// and whether its pool generation was retired by a renegotiation ([`RemoteImporter::clear_cache`]).
-/// Retired-but-referenced entries linger as a graveyard and close when their last frame releases
-/// — without this, every renegotiation (mode change, HDR toggle, client reconnect) permanently
-/// pinned a pool's worth of host VA reservations to peer memory the worker had already freed.
-/// Worker buffer ids are never reused (its `next_id` only counts up), so retired entries can
-/// share the map with the next generation's.
+/// A [`Mapping`] with in-flight [`DeviceBuffer`] refs and a retired flag from
+/// [`RemoteImporter::clear_cache`]. Retired-but-referenced entries stay until
+/// last release; otherwise each renegotiation pins host VA to peer memory the
+/// worker already freed. Ids never reuse (`next_id` only counts up).
 struct MapEntry {
     m: Mapping,
     refs: u32,
@@ -61,8 +53,7 @@ struct MapEntry {
 
 impl Drop for Shared {
     fn drop(&mut self) {
-        // Last reference gone — no DeviceBuffer can still point into these mappings (current
-        // generation or graveyard alike).
+        // Last Arc gone: no DeviceBuffer still points into current or retired mappings.
         for (_, e) in self.mappings.lock().unwrap().drain() {
             close_mapping(&e.m);
         }
@@ -76,27 +67,22 @@ fn close_mapping(m: &Mapping) {
     }
 }
 
-/// The remote (isolated) importer — one per capture. Method-for-method mirror of the in-process
-/// [`super::egl::EglImporter`] surface the capture thread uses.
+/// Isolated importer, one per capture. Same surface as [`super::egl::EglImporter`].
 pub struct RemoteImporter {
     shared: Arc<Shared>,
     child: Option<Child>,
-    /// Reused receive scratch buffer (all replies are read by the single capture thread).
+    /// All replies are on the single capture thread.
     rbuf: Vec<u8>,
-    /// Dmabuf keys (`st_ino`) whose fd the worker already holds — the fd is passed only once.
+    /// `st_ino` keys whose fd the worker already holds — pass the fd once.
     sent_keys: HashSet<u64>,
 }
 
 impl RemoteImporter {
-    /// Spawn the worker from this host binary and complete the readiness handshake. The worker
-    /// is exec'd through the pinned [`ipc::self_exe`] fd, so it is always the exact image this
-    /// process runs — even after the installed binary was replaced mid-flight. An `Err` here
-    /// means "no isolated zero-copy available" — callers fall back to the CPU path, exactly like
-    /// an in-process `EglImporter::new()` failure.
-    ///
-    /// Self-exec is right *here* — host and worker are the same build by construction, so the
-    /// version check is a formality. It is the one thing the capability-carrying encode worker
-    /// must NOT copy: a shared inode shares the file capability.
+    /// Spawn this host binary as the worker and handshake. Exec is through the
+    /// pinned [`ipc::self_exe`] fd so a replaced install cannot change the
+    /// image. `Err` means no isolated zero-copy — same fallback as
+    /// `EglImporter::new()`. Do not copy this onto the capability-carrying
+    /// encode worker: a shared inode shares the file capability.
     pub fn spawn() -> Result<RemoteImporter> {
         match ipc::self_exe() {
             Some(exe) => Self::spawn_exe(&exe.exec_path()),
@@ -106,17 +92,15 @@ impl RemoteImporter {
         }
     }
 
-    /// [`Self::spawn`] with an explicit executable (separated for tests).
     fn spawn_exe(exe: &Path) -> Result<RemoteImporter> {
-        // `exe` is normally an opaque `/proc/self/fd/<n>` — the argv[0] keeps `ps` meaningful.
+        // `exe` is normally `/proc/self/fd/<n>`; argv[0] is what `ps` shows.
         let (host_end, child) =
             ipc::spawn_worker(exe, "punktfunk-host", &["zerocopy-worker", "--fd", "3"])
                 .context("spawn zerocopy-worker")?;
         Self::from_socket(host_end, Some(child))
     }
 
-    /// Complete the handshake on an already-connected socket (the unit tests drive this against
-    /// a mock server thread instead of a real subprocess).
+    /// Handshake on an already-connected socket (tests use a mock peer).
     fn from_socket(sock: OwnedFd, child: Option<Child>) -> Result<RemoteImporter> {
         let mut importer = RemoteImporter {
             shared: Arc::new(Shared {
@@ -147,7 +131,7 @@ impl RemoteImporter {
                 )
             }
             Ok((Reply::InitErr { message }, _)) => {
-                // The worker exits by itself after reporting; not a death, just "no GPU here".
+                // Worker exits after reporting; this is "no GPU", not a death.
                 bail!("zerocopy worker init failed: {message}")
             }
             Ok((other, _)) => {
@@ -161,8 +145,7 @@ impl RemoteImporter {
         }
     }
 
-    /// True once any exchange failed at the transport level — the worker is gone (or wedged) and
-    /// every further call fails fast. The capture layer poisons its stream on this.
+    /// Transport-level failure: worker gone or wedged. Further calls fail fast.
     pub fn dead(&self) -> bool {
         self.shared.dead.load(Ordering::Relaxed)
     }
@@ -171,8 +154,7 @@ impl RemoteImporter {
         self.shared.dead.store(true, Ordering::Relaxed);
     }
 
-    /// Mirror of [`super::egl::EglImporter::supported_modifiers`] (worker round-trip; empty on
-    /// any failure, which makes the capture fall back like an importless negotiation).
+    /// Empty on any failure so capture falls back like an importless negotiation.
     pub fn supported_modifiers(&mut self, fourcc: u32) -> Vec<u64> {
         if self.dead() {
             return Vec::new();
@@ -201,7 +183,6 @@ impl RemoteImporter {
         }
     }
 
-    /// Mirror of [`super::egl::EglImporter::import`] (tiled dmabuf → BGRx CUDA buffer).
     pub fn import(
         &mut self,
         plane: &DmabufPlane,
@@ -213,7 +194,6 @@ impl RemoteImporter {
         self.import_impl(plane, ImportKind::Tiled, width, height, fourcc, modifier)
     }
 
-    /// Mirror of [`super::egl::EglImporter::import_nv12`].
     pub fn import_nv12(
         &mut self,
         plane: &DmabufPlane,
@@ -232,8 +212,6 @@ impl RemoteImporter {
         )
     }
 
-    /// Mirror of [`super::egl::EglImporter::import_yuv444`] (tiled dmabuf → stacked 3-plane
-    /// YUV444 CUDA buffer — the 4:4:4 zero-copy path).
     pub fn import_yuv444(
         &mut self,
         plane: &DmabufPlane,
@@ -245,7 +223,6 @@ impl RemoteImporter {
         self.import_impl(plane, ImportKind::Tiled444, width, height, fourcc, modifier)
     }
 
-    /// Mirror of [`super::egl::EglImporter::import_linear`] (LINEAR dmabuf → Vulkan bridge).
     pub fn import_linear(
         &mut self,
         plane: &DmabufPlane,
@@ -255,8 +232,6 @@ impl RemoteImporter {
         self.import_impl(plane, ImportKind::Linear, width, height, 0, None)
     }
 
-    /// Mirror of [`super::egl::EglImporter::import_linear_nv12`] (LINEAR dmabuf → Vulkan-bridge
-    /// compute CSC → two-plane NV12 buffer, latency plan T2.5b).
     pub fn import_linear_nv12(
         &mut self,
         plane: &DmabufPlane,
@@ -279,8 +254,7 @@ impl RemoteImporter {
             bail!("zerocopy worker is dead");
         }
         let key = dmabuf_key(plane.fd)?;
-        // One retry: a `NeedFd` reply (the worker's fd cache evicted this key) clears our
-        // "already sent" note so the second attempt carries the fd again.
+        // One retry: NeedFd (worker evicted this key) clears sent_keys so the resend carries the fd.
         let mut attempts = 0;
         let reply = loop {
             attempts += 1;
@@ -328,8 +302,7 @@ impl RemoteImporter {
             Reply::Frame { id, desc } => {
                 if let Some(desc) = desc {
                     let mapping = open_mapping(&desc).with_context(|| {
-                        // An unopenable mapping poisons every future frame in this buffer —
-                        // treat it as a dead worker so the capture rebuilds cleanly.
+                        // Unopenable mapping poisons this buffer; mark dead so capture rebuilds.
                         self.mark_dead();
                         format!("open CUDA IPC mapping for worker buffer {id}")
                     })?;
@@ -358,13 +331,12 @@ impl RemoteImporter {
                     m.width,
                     m.height,
                     m.uv,
-                    // The wire carries no plane format — the buffer's layout is what WE requested.
+                    // Wire has no plane format; layout is the ImportKind we asked for.
                     kind == ImportKind::Tiled444,
                     Box::new(move || {
-                        // Fire-and-forget recycle; a dead worker just means EPIPE, ignored. The
-                        // captured `shared` Arc is what keeps the mapping + socket alive until
-                        // the last frame drops. A retired mapping (its generation renegotiated
-                        // away) closes here with its last reference.
+                        // Recycle is fire-and-forget (EPIPE if dead). This Arc keeps mapping
+                        // and socket alive until the last frame drops; a retired mapping
+                        // closes here with its last ref.
                         let _ = ipc::send(shared.sock.as_fd(), &Request::Release { id }, None);
                         let mut g = shared.mappings.lock().unwrap();
                         if let Some(entry) = g.get_mut(&id) {
@@ -385,10 +357,10 @@ impl RemoteImporter {
         }
     }
 
-    /// The PipeWire stream renegotiated — reset both sides' per-buffer caches, and retire the
-    /// outgoing generation's CUDA IPC mappings: the worker replaces its pool, so these host-side
-    /// mappings pin VA reservations to peer memory that is about to be (or already was) freed.
-    /// Unreferenced ones close now; ones still under an in-flight frame close with its release.
+    /// Stream renegotiated: drop fd-cache keys and retire this generation's CUDA
+    /// IPC mappings. The worker replaces its pool; live host mappings would pin
+    /// VA to peer memory already freed. Unreferenced close now; in-flight wait
+    /// for release.
     pub fn clear_cache(&mut self) {
         self.sent_keys.clear();
         {
@@ -414,9 +386,8 @@ impl RemoteImporter {
 
 impl Drop for RemoteImporter {
     fn drop(&mut self) {
-        // The worker exits on socket EOF, which happens when the last `Shared` reference (this
-        // importer, or the final in-flight frame on the encode side) drops. Reap what's already
-        // gone; park the rest for the next sweep.
+        // Worker exits on socket EOF (last Shared: this importer or the last
+        // in-flight frame). Reap if already gone; park the rest for the sweep.
         if let Some(mut child) = self.child.take() {
             if !matches!(child.try_wait(), Ok(Some(_))) {
                 ipc::park_child(child);
@@ -426,9 +397,9 @@ impl Drop for RemoteImporter {
     }
 }
 
-/// Identity of the dma-buf behind `fd`, stable across frames and across `SCM_RIGHTS` re-numbering:
-/// every dma-buf gets a unique inode on the kernel's dmabuf pseudo-fs for its lifetime. Used as
-/// the worker's fd-cache key so the fd itself is only passed once.
+/// dma-buf identity, stable across frames and SCM_RIGHTS re-numbering: the
+/// kernel gives each dma-buf a unique inode for its lifetime. Worker fd-cache
+/// key, so the fd itself is passed once.
 fn dmabuf_key(fd: i32) -> Result<u64> {
     // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value, so
     // `mem::zeroed()` is a sound initializer. `fd` is the caller's live dmabuf fd; `fstat` writes
@@ -443,7 +414,6 @@ fn dmabuf_key(fd: i32) -> Result<u64> {
     }
 }
 
-/// Open a worker buffer's CUDA IPC handles in this process.
 fn open_mapping(desc: &BufferDesc) -> Result<Mapping> {
     cuda::make_current()?;
     let y_handle: [u8; CU_IPC_HANDLE_SIZE] = desc
@@ -461,7 +431,7 @@ fn open_mapping(desc: &BufferDesc) -> Result<Mapping> {
             match cuda::ipc_open(&handle) {
                 Ok(ptr) => Some((ptr, *pitch)),
                 Err(e) => {
-                    // Don't leak the Y mapping on a half-open failure.
+                    // Close Y if UV open fails; otherwise the mapping leaks.
                     cuda::ipc_close(y);
                     return Err(e).context("open UV plane IPC handle");
                 }
@@ -487,9 +457,7 @@ mod tests {
     fn handshake_server(reply: Reply) -> OwnedFd {
         let (host, worker) = ipc::socketpair_seqpacket().unwrap();
         ipc::send(worker.as_fd(), &reply, None).unwrap();
-        // Keep the worker end alive alongside the host end for the test's duration by leaking it
-        // into the reply thread below? Not needed: the handshake reply is already queued in the
-        // socket buffer, so the worker end may drop — recv still delivers queued data first.
+        // Handshake is already queued; dropping the worker end still delivers it.
         drop(worker);
         host
     }
@@ -526,8 +494,7 @@ mod tests {
 
     #[test]
     fn spawning_a_non_worker_fails_cleanly() {
-        // `true` exits immediately without a handshake → EOF → clean spawn error, the same
-        // fallback path a GPU-less box takes.
+        // `true` exits with no handshake → EOF, same fallback as a GPU-less box.
         let Err(err) = RemoteImporter::spawn_exe(Path::new("true")) else {
             panic!("spawning a non-worker must fail")
         };
@@ -536,23 +503,20 @@ mod tests {
 
     #[test]
     fn spawn_execs_the_pinned_self_exe() {
-        // `spawn()` execs this very process's image via the pinned `/proc/self/fd/…` path. Here
-        // that image is the libtest harness, which rejects `--fd` and exits without a handshake
-        // — so a "handshake" error proves the exec itself succeeded (an exec failure would read
-        // "spawn zerocopy-worker" instead).
+        // `spawn()` execs the pinned `/proc/self/fd/…` image. Here that is the
+        // libtest harness, which rejects `--fd` and exits without a handshake
+        // — so "handshake" in the error proves exec succeeded (an exec failure
+        // would say "spawn zerocopy-worker").
         let Err(err) = RemoteImporter::spawn() else {
             panic!("the test harness is not a worker; spawn must fail at the handshake")
         };
         assert!(format!("{err:#}").contains("handshake"), "{err:#}");
     }
 
-    /// A request as the scripted peer saw it, paired with the identity (`st_ino`) of the
-    /// descriptor that actually arrived via SCM_RIGHTS — the `has_fd` boolean in the JSON body is
-    /// a *claim*; the received fd is the mechanism the whole worker design rests on, so tests
-    /// assert on it directly.
+    /// Request as the peer saw it, plus `st_ino` of any SCM_RIGHTS fd. `has_fd`
+    /// in the JSON is a claim; tests assert the descriptor actually arrived.
     type SeenRequest = (Request, Option<u64>);
 
-    /// A scripted peer: answers the handshake, then serves canned replies per request.
     fn scripted_server(
         replies: Vec<Reply>,
     ) -> (RemoteImporter, thread::JoinHandle<Vec<SeenRequest>>) {
@@ -625,14 +589,12 @@ mod tests {
             offset: 0,
             stride: 256,
         };
-        // First import: first sight of the key → fd rides along; the Err reply keeps the key
-        // marked as sent (the worker cached the fd before failing).
+        // First sight of the key: fd rides along. Err keeps the key marked sent
+        // (worker cached the fd before failing).
         assert!(imp.import(&plane, 64, 64, 1, Some(2)).is_err());
-        // Second import: no fd (already sent) → worker answers NeedFd → one retry WITH the fd.
         assert!(imp.import(&plane, 64, 64, 1, Some(2)).is_err());
         assert!(!imp.dead(), "NeedFd handling must not mark the worker dead");
-        // The identity the passed descriptor must carry — SCM_RIGHTS re-numbers the fd but
-        // preserves the open file description, so st_ino survives the crossing.
+        // SCM_RIGHTS re-numbers the fd; st_ino of the open file survives.
         let key = dmabuf_key(plane.fd).unwrap();
         drop(imp);
         let fd_sends: Vec<(bool, Option<u64>)> = join
@@ -644,9 +606,8 @@ mod tests {
                 other => panic!("unexpected request {other:?}"),
             })
             .collect();
-        // Not just the has_fd *claim* — the descriptor itself must have crossed, with the same
-        // identity the worker will key its cache on (`pass = None` at the send site would leave
-        // has_fd=true with no actual fd, which only this assertion catches).
+        // Assert the descriptor crossed, not just has_fd. `pass = None` with
+        // has_fd=true is the regression this would miss.
         assert_eq!(
             fd_sends,
             vec![(true, Some(key)), (false, None), (true, Some(key))]
@@ -658,7 +619,7 @@ mod tests {
         let (mut imp, join) = scripted_server(vec![Reply::Err {
             message: "EGL_BAD_MATCH".into(),
         }]);
-        // Any pipe works as a stand-in fd for key derivation.
+        // Stand-in fd; only the inode is used.
         let (pr, _pw) = std::io::pipe().unwrap();
         let plane = DmabufPlane {
             fd: pr.as_fd().as_raw_fd(),
@@ -671,7 +632,7 @@ mod tests {
         assert!(format!("{err:#}").contains("EGL_BAD_MATCH"));
         assert!(!imp.dead(), "an Err reply must not mark the worker dead");
 
-        // The scripted replies are exhausted → the server closes → the next import dies.
+        // Replies exhausted → server closes → next import dies.
         let Err(err) = imp.import(&plane, 64, 64, 1, Some(2)) else {
             panic!("a closed worker must fail the import")
         };
@@ -680,8 +641,6 @@ mod tests {
         let key = dmabuf_key(plane.fd).unwrap();
         drop(imp);
         let seen = join.join().unwrap();
-        // First import carried the fd (first sight of the key — and the DESCRIPTOR arrived, with
-        // the sender's identity); the retry didn't re-send it.
         match (&seen[0], &seen[1]) {
             (
                 (

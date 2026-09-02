@@ -437,7 +437,7 @@ if ($Engine) {
     $wizExe = Join-Path $wizRel 'punktfunk-setup-win.exe'
     $packer = Join-Path $wizRel 'punktfunk-setup-pack.exe'
 
-    # The {app} tree — the .iss [Files] table as directories (a missing input is simply absent,
+    # The {app} tree - the .iss [Files] table as directories (a missing input is simply absent,
     # exactly as its #ifdef was). The plan's DeployFiles lays this down verbatim.
     $appStage = Join-Path $OutDir 'app'
     if (Test-Path $appStage) { Remove-Item $appStage -Recurse -Force }
@@ -454,7 +454,7 @@ if ($Engine) {
     if ($wantWeb) { Copy-Item $webStage -Destination (Join-Path $appStage 'web\.output') -Recurse -Force }
     if ($wantScripting) { Copy-Item $scrStage -Destination (Join-Path $appStage 'scripting') -Recurse -Force }
     if ($layerStage -and (Test-Path $layerStage)) { Copy-Item $layerStage -Destination (Join-Path $appStage 'vklayer') -Recurse -Force }
-    # Driver payloads: extracted beside the wizard, handed to `driver install --dir <staging>\…`.
+    # Driver payloads: extracted beside the wizard, handed to `driver install --dir <staging>\...`.
     $stagingRoot = Join-Path $OutDir 'staging'
     if (Test-Path $stagingRoot) { Remove-Item $stagingRoot -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $stagingRoot | Out-Null

@@ -1,46 +1,39 @@
-//! The sealed frame channel's handle-duplication broker (plan §W4, carved out of the IDD-push
-//! capturer): duplicates the unnamed shared header / ring / event handles into the driver's WUDFHost
-//! and delivers them as bare handle values over the SYSTEM-only control device.
+//! Handle-duplication broker for the sealed IDD-push frame channel.
+//!
+//! Frame objects are unnamed. The driver reaches them only through handles this
+//! broker duplicates into its WUDFHost and delivers as bare values over the
+//! SYSTEM-only control device (`IOCTL_SET_FRAME_CHANNEL`). Evidence:
+//! `design/idd-push-security.md`.
+//!
+//! Pin a generation: [`ChannelBroker::open`] then [`ChannelBroker::send`]. The
+//! process handle is also the driver-death probe ([`ChannelBroker::driver_alive`]).
 
 use super::*;
 
-/// The sealed channel's handle-duplication broker (`design/idd-push-security.md`): the frame objects
-/// are unnamed, so the ONLY way the driver can reach them is handles this broker duplicates into its
-/// WUDFHost process and delivers — as bare handle VALUES — over the SYSTEM-only control device
-/// (`IOCTL_SET_FRAME_CHANNEL`). Ownership is a strict hand-off: on IOCTL success the DRIVER owns the
-/// duplicates (it closes them); on any failure [`Self::send`] reaps every duplicate it already made
-/// (`DUPLICATE_CLOSE_SOURCE`), so a half-delivered channel never leaks handles in WUDFHost.
+/// On IOCTL success the driver owns (and closes) the duplicates; on any failure
+/// [`Self::send`] reaps every duplicate already made (`DUPLICATE_CLOSE_SOURCE`).
 pub(super) struct ChannelBroker {
-    /// `PROCESS_DUP_HANDLE | SYNCHRONIZE` handle to the driver's WUDFHost (pid from the ADD reply;
-    /// `ProcessSharingDisabled` makes that process exclusively pf-vdisplay's). `SYNCHRONIZE` lets the
-    /// handle double as the driver-death probe ([`Self::driver_alive`]).
+    /// WUDFHost process (`ProcessSharingDisabled` — exclusively pf-vdisplay's).
+    /// `SYNCHRONIZE` doubles as the driver-death probe ([`Self::driver_alive`]).
     process: OwnedHandle,
-    /// The WUDFHost pid `process` refers to (diagnostics for the driver-death bail).
     pub(super) wudf_pid: u32,
-    /// Delivers a filled `SetFrameChannelRequest` to the pf-vdisplay driver
-    /// (`IOCTL_SET_FRAME_CHANNEL`). The host facade builds this from the vdisplay control device +
-    /// `send_frame_channel` IOCTL wrapper, so this crate delivers the channel without reaching into
-    /// the orchestrator's `vdisplay` module (plan §W6). Called once per generation, never per-frame.
+    /// `IOCTL_SET_FRAME_CHANNEL`. Once per generation, never per-frame.
     sender: crate::FrameChannelSender,
 }
 
 impl ChannelBroker {
-    /// Open the duplication target. Fails when the driver predates the sealed channel (`wudf_pid == 0`
-    /// can't survive the v2 version handshake, but guard anyway) or the WUDFHost is gone (device
-    /// restart mid-open) — either way the caller fails the capture open cleanly.
-    ///
-    /// `wudf_pid` comes from the driver's ADD reply, so before we duplicate whole-desktop frame handles
-    /// INTO it we VERIFY it is a genuine system WUDFHost ([`verify_is_wudfhost`]). Without that check a
-    /// spoofed devnode (same interface GUID) could name an arbitrary process and receive the frames; a
-    /// fully-compromised REAL pf_vdisplay driver is already a frame endpoint, so this specifically closes
-    /// the reachable-without-owning-the-driver case (`design/idd-push-security.md` §hardening).
+    /// Open the WUDFHost duplication target. `wudf_pid == 0` is a driver that
+    /// predates the sealed channel. [`verify_is_wudfhost`] runs before any
+    /// desktop-frame handle is duplicated into it: a spoofed ADD pid (same
+    /// interface GUID, different process) would otherwise receive the frames
+    /// (`design/idd-push-security.md`).
     pub(super) fn open(wudf_pid: u32, sender: crate::FrameChannelSender) -> Result<Self> {
         if wudf_pid == 0 {
             bail!("driver reported no WUDFHost pid for the frame channel");
         }
-        // SAFETY: plain FFI; `wudf_pid` is a copy. The handle (checked by `?`) is owned solely here and
-        // moved into the `OwnedHandle` (single owner, closes on drop); `verify_is_wudfhost` borrows it
-        // for the duration of the synchronous check and forms no lasting alias.
+        // SAFETY: `wudf_pid` is a copy. The handle (`?`-checked) is owned solely here and
+        // moved into `OwnedHandle`; `verify_is_wudfhost` borrows it for this call and forms
+        // no lasting alias.
         let process = unsafe {
             let h = OpenProcess(
                 PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
@@ -59,22 +52,18 @@ impl ChannelBroker {
         })
     }
 
-    /// Whether the driver's WUDFHost is still alive. The pinned process handle doubles as the
-    /// liveness probe (`SYNCHRONIZE` requested at open): signaled ⇔ the process exited. This is the
-    /// definitive "driver died mid-session" signal — at the ring, a dead driver and an idle desktop
-    /// are indistinguishable (both simply stop publishing).
+    /// `SYNCHRONIZE` wait: signaled ⇔ WUDFHost exited. At the ring a dead driver and an
+    /// idle desktop both just stop publishing, so this is the only driver-death signal.
     pub(super) fn driver_alive(&self) -> bool {
-        // SAFETY: `process` is the live `OwnedHandle` this broker owns (borrowed for this synchronous
-        // call); a 0 ms wait only reads the handle's signaled state.
+        // SAFETY: `process` is this broker's live `OwnedHandle` (borrowed for the call); a
+        // 0 ms wait only reads the handle's signaled state.
         unsafe { WaitForSingleObject(HANDLE(self.process.as_raw_handle()), 0) != WAIT_OBJECT_0 }
     }
 
-    /// Duplicate `h` into the WUDFHost handle table, returning the handle VALUE valid there (and only
-    /// there — the value is meaningless in any other process). `access = Some(rights)` grants the
-    /// driver's handle exactly those rights (least privilege — see [`SECTION_MAP_RW`]);
-    /// `access = None` copies the source handle's access (`DUPLICATE_SAME_ACCESS`), used only where the
-    /// source is already scoped (the DXGI shared-texture handles, minted by `CreateSharedHandle` with
-    /// just `DXGI_SHARED_RESOURCE_READ|WRITE`).
+    /// Duplicate `h` into the WUDFHost table. The returned value is valid only there.
+    /// `Some(rights)` grants exactly those rights; `None` copies the source
+    /// (`DUPLICATE_SAME_ACCESS`) — used only for DXGI shared textures already scoped at
+    /// `CreateSharedHandle` to `DXGI_SHARED_RESOURCE_READ|WRITE`.
     ///
     /// # Safety
     /// `h` must be a live handle of the current process.
@@ -84,9 +73,9 @@ impl ChannelBroker {
             Some(rights) => (rights, DUPLICATE_HANDLE_OPTIONS(0)),
             None => (0, DUPLICATE_SAME_ACCESS),
         };
-        // SAFETY: `h` is live per the contract; `self.process` is the live PROCESS_DUP_HANDLE target;
-        // `&mut out` is a valid out-param. Either an explicit least-privilege access mask (options == 0)
-        // or `DUPLICATE_SAME_ACCESS` (desired ignored) — never both.
+        // SAFETY: `h` is live per the contract; `self.process` is the live PROCESS_DUP_HANDLE
+        // target; `&mut out` is a valid out-param. Explicit mask (options == 0) or
+        // `DUPLICATE_SAME_ACCESS` (desired ignored) — never both.
         unsafe {
             DuplicateHandle(
                 GetCurrentProcess(),
@@ -102,31 +91,30 @@ impl ChannelBroker {
         Ok(out.0 as usize as u64)
     }
 
-    /// Duplicate the cursor section into WUDFHost (v5 cursor channel) with the same
-    /// least-privilege section rights as the frame header. Thin `pub(super)` face over
-    /// [`dup_into`](Self::dup_into) for the cursor-delivery path in `open_on`.
+    /// Duplicate a cursor section into WUDFHost with the same `SECTION_MAP_RW` as the
+    /// frame header.
     ///
     /// # Safety
     /// `h` must be a live handle of the current process.
     pub(super) unsafe fn dup_into_public(&self, h: HANDLE) -> Result<u64> {
-        // SAFETY: forwarded contract — `h` is live per this fn's own contract.
+        // SAFETY: forwarded — `h` is live per this fn's contract.
         unsafe { self.dup_into(h, Some(SECTION_MAP_RW)) }
     }
 
-    /// [`close_remote`](Self::close_remote) for the cursor-delivery failure path.
+    /// Failure-path reaper for a cursor-channel duplicate the driver never adopted.
     pub(super) fn close_remote_public(&self, value: u64) {
         self.close_remote(value);
     }
 
-    /// Close a handle VALUE inside the WUDFHost table (the failure-path reaper): `DUPLICATE_CLOSE_SOURCE`
-    /// with no target closes the source handle regardless of the (ignored) result.
+    /// Close a handle VALUE in the WUDFHost table. `DUPLICATE_CLOSE_SOURCE` with no
+    /// target closes the source; the result is ignored.
     fn close_remote(&self, value: u64) {
         if value == 0 {
             return;
         }
-        // SAFETY: `self.process` is the live duplication target and `value` is a handle value THIS
-        // broker just created in that process's table (callers only pass back `dup_into` results the
-        // driver never received); closing it there cannot touch any other process's handles.
+        // SAFETY: `self.process` is the live duplication target; `value` is a handle this
+        // broker just created there and the driver never received. Closing it cannot touch
+        // any other process's handles.
         unsafe {
             let _ = DuplicateHandle(
                 HANDLE(self.process.as_raw_handle()),
@@ -140,15 +128,13 @@ impl ChannelBroker {
         }
     }
 
-    /// Duplicate the whole ring (header + event + every slot texture) into WUDFHost and deliver the
-    /// values via `IOCTL_SET_FRAME_CHANNEL`. All-or-nothing: on any failure every duplicate already
-    /// made is reaped remotely and an error returns (the caller fails the open / logs the recreate).
-    /// The ownership contract with the driver is adopt-on-success only — it closes the handles iff the
-    /// IOCTL succeeded, we reap them iff it didn't, so no value is ever closed twice.
+    /// Duplicate the ring into WUDFHost and deliver via `IOCTL_SET_FRAME_CHANNEL`.
+    /// Adopt-on-success only: the driver closes the handles iff the IOCTL succeeded;
+    /// we reap them iff it did not. No value is closed twice.
     ///
     /// # Safety
-    /// `header` and `event` must be live handles of the current process (the capturer's own section +
-    /// event, borrowed for this synchronous call).
+    /// `header` and `event` must be live handles of the current process, borrowed for
+    /// this call.
     pub(super) unsafe fn send(
         &self,
         target_id: u32,
@@ -157,11 +143,9 @@ impl ChannelBroker {
         event: HANDLE,
         slots: &[HostSlot],
     ) -> Result<()> {
-        // An ERROR, not a `debug_assert`: in a release build the assert is compiled out and the
-        // over-long slice instead panics on `req.texture_handles[k]` in the middle of
-        // `duplicate_and_deliver` — after handles have already been planted in WUDFHost. That panic
-        // unwinds straight past the reap below, leaking every duplicate made so far into the driver
-        // process. Refuse before the first duplication, while there is nothing to reap.
+        // Error, not `debug_assert`: a release-build panic inside `duplicate_and_deliver`
+        // unwinds past the reap below and leaks every planted WUDFHost duplicate. Refuse
+        // before the first duplication.
         if slots.len() > control::RING_LEN_USIZE {
             anyhow::bail!(
                 "frame channel: {} ring slots exceeds the wire limit of {}",
@@ -180,11 +164,10 @@ impl ChannelBroker {
             event_handle: 0,
             texture_handles: [0; control::RING_LEN_USIZE],
         };
-        // SAFETY: `header`/`event` are live per this fn's contract; each slot's `shared` is the live
-        // `OwnedHandle` the slot keeps for exactly this purpose.
+        // SAFETY: `header`/`event` are live per this fn's contract; each slot's `shared` is
+        // the live `OwnedHandle` the slot keeps for this duplication.
         let result = unsafe { self.duplicate_and_deliver(&mut req, header, event, slots) };
         if result.is_err() {
-            // The driver never adopted the delivery — reap every remote duplicate so nothing lingers.
             self.close_remote(req.header_handle);
             self.close_remote(req.event_handle);
             for v in req.texture_handles {
@@ -194,8 +177,8 @@ impl ChannelBroker {
         result
     }
 
-    /// The fallible middle of [`Self::send`]: fill `req` with fresh duplicates, then issue the IOCTL.
-    /// Split out so `send` can reap whatever landed in `req` when any step errors.
+    /// Fill `req` with duplicates, then issue the IOCTL. Split out so [`Self::send`] can
+    /// reap whatever landed in `req` on error.
     ///
     /// # Safety
     /// As [`Self::send`].
@@ -206,13 +189,10 @@ impl ChannelBroker {
         event: HANDLE,
         slots: &[HostSlot],
     ) -> Result<()> {
-        // SAFETY: forwarded from the caller's contract — `header`/`event`/each `slot.shared` are live
-        // handles of this process. The `sender` closure encapsulates the manager's control handle +
-        // the `send_frame_channel` IOCTL (its precondition — a live control handle — is upheld by the
-        // host facade that built it).
+        // SAFETY: forwarded from the caller — `header`/`event`/each `slot.shared` are live
+        // handles of this process. `sender`'s live control-handle precondition is upheld by
+        // the host facade that built it.
         unsafe {
-            // Least privilege per handle: the header maps read/write, the event is only signalled, and
-            // the textures keep their already-scoped `CreateSharedHandle` access (see `dup_into`).
             req.header_handle = self.dup_into(header, Some(SECTION_MAP_RW))?;
             req.event_handle = self.dup_into(event, Some(EVENT_MODIFY_STATE))?;
             for (k, s) in slots.iter().enumerate() {

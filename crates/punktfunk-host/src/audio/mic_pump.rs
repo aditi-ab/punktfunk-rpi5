@@ -1,72 +1,60 @@
-//! Host-lifetime virtual-microphone pump: one thread owns the [`VirtualMic`] backend plus an Opus
-//! decoder, self-heals across backend deaths, and feeds decoded client-mic PCM into the source so
-//! the client's microphone reaches host apps. Split out of the `audio` facade (§2.1 — a
-//! self-contained stateful subsystem does not belong in the trait facade); the [`VirtualMic`]
-//! trait, its factory ([`open_virtual_mic`](super::open_virtual_mic)) and the audio-plane sample
-//! rate stay in `super`.
+//! Host-lifetime virtual-microphone pump.
+//!
+//! One thread owns the [`VirtualMic`] backend and an Opus decoder. Sessions
+//! `try_send` client `0xCB` frames onto a clonable sender; the thread de-jitters,
+//! decodes, and feeds PCM so host apps hear the client's mic. Opens at host
+//! start (games bind capture once and never re-follow), reopens a dead backend
+//! with backoff, and discards buffered audio after an uplink gap. Decode errors
+//! drop that frame only. The thread exits when every sender is dropped.
+//!
+//! Pin via [`MicPump::start`] / [`MicPump::start_named`]. Evidence: `pump_tests`.
+//! [`VirtualMic`], [`open_virtual_mic`](super::open_virtual_mic), and
+//! [`SAMPLE_RATE`](super::SAMPLE_RATE) stay in `super`.
 
 use super::mic_jitter::{Deliver, MicDejitter};
 use super::{VirtualMic, SAMPLE_RATE};
 use anyhow::Result;
 
-/// Mic is 48 kHz stereo — matches the Opus stereo decoder and the host→client audio layout.
+/// Stereo: the Opus decoder and the host→client layout are both 2ch.
 pub const MIC_CHANNELS: u32 = 2;
 
-/// One client mic frame off the wire (`0xCB` — `punktfunk_core::quic::decode_mic_datagram`).
-/// The datagram's seq + pts used to be decoded at ingest and thrown away; the pump's de-jitter
-/// needs them (reorder window, loss concealment, cadence/drift), so they ride the queue with
-/// the Opus payload.
+/// One `0xCB` uplink frame (`punktfunk_core::quic::decode_mic_datagram`).
+/// `seq`/`pts_ns` ride with the Opus payload so de-jitter can reorder, conceal, and track cadence.
 pub struct MicFrame {
     pub seq: u32,
     pub pts_ns: u64,
     pub opus: Vec<u8>,
 }
 
-/// Bound for the shared mic frame queue (drop-newest at the producer when full): the
-/// host-lifetime queue is shared across all concurrent sessions and must not grow without limit
-/// under a near-line-rate flood (security-review 2026-06-28 S6). 12 × 5–20 ms frames ≈
-/// 60–240 ms of slack — enough for a scheduling hiccup, and the consumer heals the rest (see
-/// [`DRAIN_ABOVE`]). The old cap of 64 could park 1.28 s of standing latency here that only a
-/// >600 ms silence gap ever flushed.
+/// Drop-newest bound on the host-lifetime queue: 12 × 5–20 ms ≈ 60–240 ms of slack.
+/// Shared across sessions; [`DRAIN_ABOVE`] heals anything deeper.
 const MIC_QUEUE_CAP: usize = 12;
-/// Consumer self-healing: a pump that wakes to a backlog deeper than this drops down to the
-/// newest [`DRAIN_KEEP`] frames before decoding — the oldest frames are already late, and
-/// playing them would turn a one-off stall into permanent mic delay.
+/// Wake deeper than this: keep the newest [`DRAIN_KEEP`]. Replaying late frames turns a stall into standing delay.
 const DRAIN_ABOVE: usize = 6;
 const DRAIN_KEEP: usize = 4;
 
-/// Cadence of the "mic uplink health" telemetry line (emitted only while frames flow).
 const TELEMETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Creep trim: the backend ring must sit more than this over its prime target, for
-/// [`TRIM_AFTER`], before the pump starts shedding — and then only near-silent frames, at most
-/// one per [`TRIM_SPACING`] (a 20 ms frame per 300 ms ≈ 7 ms per 100 ms). Depth built by a
-/// burst otherwise only ever comes back down at a full drain (the device consumes exactly what
-/// it plays).
+/// Shed only when depth stays > target by this many ms for [`TRIM_AFTER`], then at most
+/// one silent frame per [`TRIM_SPACING`] (20 ms / 300 ms ≈ 7 ms per 100 ms). A burst otherwise
+/// only comes back down on a full drain.
 const TRIM_MARGIN_MS: usize = 15;
 const TRIM_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 const TRIM_SPACING: std::time::Duration = std::time::Duration::from_millis(300);
-/// Peak below which a decoded frame counts as a silence stretch (≈ −48 dBFS).
+/// ≈ −48 dBFS; only near-silent frames may be shed.
 const TRIM_SILENCE_PEAK: f32 = 0.004;
 
-/// Tuning for [`MicPump`]'s open/reopen/flush behaviour — parameterized so the tests can run the
-/// real pump loop in milliseconds instead of seconds.
+/// Open/reopen/flush delays; tests pass millisecond values so the real loop still runs.
 #[derive(Clone, Copy)]
 struct PumpTuning {
-    /// First-retry delay after a failed backend open; doubles per failure up to `backoff_cap`
-    /// (a persistently-absent PipeWire session / audio endpoint isn't hammered), resets on
-    /// success.
+    /// First retry after a failed open; doubles up to `backoff_cap` so a missing endpoint is not hammered.
     backoff_start: std::time::Duration,
     backoff_cap: std::time::Duration,
-    /// Idle liveness-probe interval: with no frames flowing, the pump still notices a dead
-    /// backend this often and reopens — so the mic is healthy BEFORE the next session starts.
+    /// Idle liveness probe: a dead backend reopens before the next session starts.
     heartbeat: std::time::Duration,
-    /// An uplink gap longer than this discards the backend's buffered audio before pushing the
-    /// next frame (a recorder must never hear a stale burst from before a mute/session end).
+    /// Uplink gap longer than this: discard buffered audio so a recorder never hears a mute-era burst.
     stale_gap: std::time::Duration,
-    /// A backend that dies before living this long counts as a FAILED open for backoff purposes
-    /// (an open that succeeds but dies instantly — e.g. a flapping daemon — must not churn at
-    /// heartbeat rate); one that lived longer resets the backoff.
+    /// Died before this: treat as a failed open (flapping daemon must not churn at heartbeat rate). Lived longer: reset backoff.
     stable_after: std::time::Duration,
 }
 
@@ -78,42 +66,26 @@ const PUMP_TUNING: PumpTuning = PumpTuning {
     stable_after: std::time::Duration::from_secs(5),
 };
 
-/// Host-lifetime virtual-microphone pump: one thread owns the [`VirtualMic`] backend + an Opus
-/// decoder; sessions forward the client's Opus mic frames (0xCB) over a clonable `Send` sender,
-/// the thread decodes and feeds the backend.
+/// One thread owns [`VirtualMic`] plus an Opus decoder; sessions clone a `Send` sender for `0xCB`.
 ///
-/// The rock-solid properties live HERE, not in the backends:
-/// - **Eager**: the backend opens at host start (retrying with backoff), NOT on the first mic
-///   frame — so the virtual mic device already exists when host apps/games launch and bind
-///   their capture device (most games never re-follow a default-device change mid-run).
-/// - **Self-healing**: a dead backend (PipeWire restart, Windows endpoint churn) is detected on
-///   every push and on an idle heartbeat, and reopened with backoff. Sessions keep their
-///   senders; nothing upstream notices.
-/// - **Stale-flush**: buffered audio is discarded after an uplink gap (see [`PumpTuning`]).
-/// - **De-jittered**: frames pass a sequence-aware reorder window + loss concealment, and an
-///   adaptive target-depth estimator drives the backend rings' priming — see
-///   [`MicDejitter`](super::mic_jitter) (`PUNKTFUNK_MIC_LEGACY_BUFFER=1` restores the fixed
-///   pre-adaptive buffering).
-///
-/// Per-frame Opus DECODE errors stay non-fatal (dropped frame): the mic is shared across every
-/// concurrent session, so one paired client's junk frames must not deny everyone's mic
-/// (security-review 2026-06-28 S2). The thread exits when every sender is dropped (host
-/// shutdown), tearing the backend down.
+/// Opens at host start (games bind capture once). Reopens on push-fail or idle heartbeat
+/// without invalidating senders. Discards buffered audio after an uplink gap. De-jitters via
+/// [`MicDejitter`](super::mic_jitter) (`PUNKTFUNK_MIC_LEGACY_BUFFER=1` pins the old fixed prime).
+/// Per-frame decode errors drop that frame. Exits when every sender is dropped.
 pub struct MicPump {
     tx: std::sync::mpsc::SyncSender<MicFrame>,
 }
 
 impl MicPump {
-    /// Start the host-lifetime pump (Linux/Windows). On platforms without a virtual-mic backend
-    /// the thread just drains and drops frames (sessions still count the datagrams).
+    /// Host-lifetime pump. Linux/Windows open a backend; other platforms drain and drop (sessions still count datagrams).
     pub fn start() -> MicPump {
         Self::start_named(None)
     }
 
-    /// [`start`](Self::start) with a caller-chosen source `node.name` — a SESSION-lifetime pump
-    /// for an isolated gamescope session (`design/gamescope-multiuser.md`): its own
-    /// `punktfunk-mic-{id}` source, fed only by that session's uplink, torn down when the owner
-    /// (and the datagram task's sender clone) drops. `None` = the shared `punktfunk-mic`.
+    /// [`start`](Self::start) with a `node.name`. `Some` is a session-lifetime source for an
+    /// isolated gamescope session (`design/gamescope-multiuser.md`): `punktfunk-mic-{id}`, fed
+    /// only by that session, torn down when the owner and its sender clone drop. `None` is the
+    /// shared `punktfunk-mic`.
     pub fn start_named(source_name: Option<String>) -> MicPump {
         let (tx, rx) = std::sync::mpsc::sync_channel::<MicFrame>(MIC_QUEUE_CAP);
         let spawned = std::thread::Builder::new()
@@ -138,17 +110,14 @@ impl MicPump {
         MicPump { tx }
     }
 
-    /// A sender a session forwards the client's Opus mic frames to (`try_send` — never block a
-    /// datagram loop). Cloned per session; dropping a clone does NOT stop the pump (it holds
-    /// the original sender for the host life).
+    /// Session clone: `try_send` so a datagram loop never blocks. Dropping a clone does not stop
+    /// the pump — it holds the original sender for the host life.
     pub fn sender(&self) -> std::sync::mpsc::SyncSender<MicFrame> {
         self.tx.clone()
     }
 }
 
-/// Sleep for `dur` while draining (and dropping) queued frames, so a closed/reopening backend
-/// never accumulates a stale backlog and senders never see a wedged queue. Returns `false` when
-/// every sender is gone (host shutdown).
+/// Sleep `dur` while dropping queued frames so a closed backend cannot wedge senders or keep a stale backlog. `false` = every sender gone.
 #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
 fn drain_sleep(rx: &std::sync::mpsc::Receiver<MicFrame>, dur: std::time::Duration) -> bool {
     use std::sync::mpsc::RecvTimeoutError;
@@ -159,15 +128,14 @@ fn drain_sleep(rx: &std::sync::mpsc::Receiver<MicFrame>, dur: std::time::Duratio
             return true;
         }
         match rx.recv_timeout(left.min(std::time::Duration::from_millis(250))) {
-            Ok(_) => {}                                          // drop frames while closed
-            Err(RecvTimeoutError::Timeout) => {}                 // keep waiting
-            Err(RecvTimeoutError::Disconnected) => return false, // host shutdown
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return false,
         }
     }
 }
 
-/// The pump loop. `opener` is injected so the tests can run the REAL loop against a mock
-/// backend; production passes [`open_virtual_mic`](super::open_virtual_mic).
+/// Pump loop. `opener` is injected so tests run this loop against a mock; production uses [`open_virtual_mic`](super::open_virtual_mic).
 #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
 fn pump_thread<O>(rx: std::sync::mpsc::Receiver<MicFrame>, opener: O, tuning: PumpTuning)
 where
@@ -179,7 +147,6 @@ where
     let mut backoff = tuning.backoff_start;
     let mut open_fails: u64 = 0;
     loop {
-        // Open phase — eager, from thread start.
         let (mic, mut decoder) = loop {
             let opened = opener().and_then(|m| {
                 let d = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo)
@@ -189,8 +156,7 @@ where
             match opened {
                 Ok(pair) => break pair,
                 Err(e) => {
-                    // Throttle (1st, 2nd, 4th, 8th … failure): a box without a PipeWire session
-                    // or virtual audio device would otherwise log every backoff forever.
+                    // Power-of-two log: a missing endpoint would otherwise warn every backoff forever.
                     open_fails += 1;
                     if open_fails.is_power_of_two() {
                         tracing::warn!(error = %format!("{e:#}"), attempts = open_fails,
@@ -204,32 +170,28 @@ where
             }
         };
         tracing::info!("virtual mic ready (host-lifetime)");
-        // Drop anything queued while (re)opening — it predates the backend. (The backoff does
-        // NOT reset here: only an instance that proves stable resets it — see the death triage.)
+        // Queued frames predate this backend. Backoff resets only after a stable life (death triage below).
         while rx.try_recv().is_ok() {}
         let opened_at = Instant::now();
 
-        // Pump phase — runs until the backend dies (break) or the host shuts down (return).
         let legacy = super::mic_legacy_buffer();
         let mut decode_fails: u64 = 0;
         let mut drain_drops: u64 = 0;
         let mut trimmed: u64 = 0;
         let mut frames_seen: u64 = 0;
-        let mut pcm = vec![0f32; 5760 * MIC_CHANNELS as usize]; // up to 120 ms scratch
+        let mut pcm = vec![0f32; 5760 * MIC_CHANNELS as usize]; // 120 ms at 48 kHz
         let mut last_push = Instant::now();
         let mut batch: Vec<MicFrame> = Vec::new();
         let mut deliveries: Vec<Deliver> = Vec::new();
         let mut jitter = MicDejitter::new();
-        // Concealment must match the last real frame's duration — libopus sizes PLC from the
-        // output slice. One 20 ms frame until something decodes.
+        // libopus sizes PLC from the output slice; 960 = 20 ms until a real frame sets it.
         let mut plc_samples: usize = 960;
         let mut applied_target_ms: u32 = 0;
         let mut over_since: Option<Instant> = None;
         let mut last_trim = Instant::now();
         let mut last_log = Instant::now();
         'pump: loop {
-            // Wake for the next frame, the heartbeat, or a parked reorder hold aging out —
-            // whichever is soonest.
+            // Soonest of heartbeat and a parked reorder hold aging out.
             let timeout = jitter
                 .hold_deadline()
                 .map(|d| d.saturating_duration_since(Instant::now()))
@@ -238,9 +200,7 @@ where
             deliveries.clear();
             match rx.recv_timeout(timeout) {
                 Ok(first) => {
-                    // Take everything already queued in one gulp: normally that's just `first`,
-                    // but after a stall the backlog IS standing mic latency — heal by jumping
-                    // to the newest few frames instead of replaying the pile.
+                    // After a stall the backlog is standing latency; jump to the newest DRAIN_KEEP.
                     batch.clear();
                     batch.push(first);
                     while batch.len() <= MIC_QUEUE_CAP {
@@ -263,8 +223,7 @@ where
                     for frame in batch.drain(..) {
                         jitter.ingest(now, frame, &mut deliveries);
                     }
-                    // A hold whose window expired while traffic kept flowing (only late
-                    // duplicates arriving) must still flush — the timeout arm never fires then.
+                    // Traffic that is only late duplicates never hits the timeout arm; still flush an expired hold.
                     jitter.flush_expired_hold(now, &mut deliveries);
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -284,17 +243,15 @@ where
                 let samples_per_ch = match d {
                     Deliver::Frame(frame) => {
                         if frame.opus.is_empty() {
-                            continue; // DTX silence — the source underruns to silence on its own
+                            continue; // DTX — the source underruns to silence on its own
                         }
                         match decoder.decode_float(&frame.opus, &mut pcm, false) {
                             Ok(n) => {
-                                plc_samples = n.max(120); // ≥ 2.5 ms keeps PLC well-formed
+                                plc_samples = n.max(120); // ≥ 2.5 ms; shorter slices mis-size libopus PLC
                                 decode_fails = 0;
                                 n
                             }
                             Err(e) => {
-                                // Malformed/garbage frame: drop it, keep the shared mic +
-                                // decoder (see the struct docs). Throttled log (1, 2, 4, …).
                                 decode_fails += 1;
                                 if decode_fails.is_power_of_two() {
                                     tracing::warn!(error = %e, fails = decode_fails,
@@ -305,9 +262,7 @@ where
                         }
                     }
                     Deliver::Conceal => {
-                        // A lost datagram: an empty-input decode synthesizes libopus PLC for
-                        // exactly the slice's duration, so the backend ring doesn't starve
-                        // into a silence + re-prime cycle over one missing frame.
+                        // Empty-input decode = libopus PLC for this slice, so one gap does not starve the ring into a re-prime.
                         let want = (plc_samples * MIC_CHANNELS as usize).min(pcm.len());
                         match decoder.decode_float(&[], &mut pcm[..want], false) {
                             Ok(n) => n,
@@ -316,9 +271,7 @@ where
                     }
                 };
                 let total = (samples_per_ch * MIC_CHANNELS as usize).min(pcm.len());
-                // Creep trim: ring depth persistently over target sheds a near-silent frame at
-                // a time (a few ms per 100 ms) — never speech, never a hard clear. Without it,
-                // depth built by a burst only ever comes back down at a full drain.
+                // Persistently-over-target depth sheds one near-silent frame; never speech, never a hard clear.
                 let mut shed = false;
                 if !legacy {
                     match mic.depth() {
@@ -339,7 +292,7 @@ where
                     }
                 }
                 if shed {
-                    last_push = Instant::now(); // the uplink is live — a trim is not a stale gap
+                    last_push = Instant::now(); // trim is not a stale gap
                     continue;
                 }
                 if !mic.push(&pcm[..total]) {
@@ -349,9 +302,7 @@ where
                 last_push = Instant::now();
             }
 
-            // Drive the backend ring's prime target from the measured jitter. Legacy mode
-            // never calls this, which keeps the backend on its fixed constants (see
-            // `VirtualMic::set_target_depth`).
+            // Legacy mode leaves the backend on its fixed prime (`VirtualMic::set_target_depth`).
             if !legacy {
                 let t = jitter.target_ms(Instant::now());
                 if t != applied_target_ms {
@@ -360,7 +311,7 @@ where
                 }
             }
 
-            // One structured health line per interval while the mic is live (reset-on-read).
+            // Reset-on-read; skip the line when the window saw no frames.
             if last_log.elapsed() >= TELEMETRY_EVERY {
                 if frames_seen > 0 {
                     let js = jitter.take_stats();
@@ -398,10 +349,7 @@ where
             }
         }
 
-        // Death triage: an instance that lived is a one-off (PipeWire/audio-engine restart) —
-        // reopen immediately with the backoff reset. One that died right after opening is a
-        // failed open in disguise (flapping daemon, endpoint racing away): back off like the
-        // open loop, or the pump would churn open→die→reopen at heartbeat rate.
+        // Lived ≥ stable_after: one-off death, reset backoff. Died earlier: failed open — back off or the pump churns at heartbeat rate.
         if opened_at.elapsed() >= tuning.stable_after {
             backoff = tuning.backoff_start;
             open_fails = 0;
@@ -422,7 +370,6 @@ mod pump_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    /// Mock backend: records pushes/discards, dies on command.
     struct MockMic {
         alive: Arc<AtomicBool>,
         pushed: Arc<AtomicUsize>,
@@ -453,10 +400,8 @@ mod pump_tests {
         join: std::thread::JoinHandle<()>,
     }
 
-    /// Run the REAL pump loop against mock backends; `fail_first` opens fail before the first
-    /// success (exercises the eager retry/backoff path). `dead_on_arrival` opens every instance
-    /// pre-killed (exercises the rapid-death churn guard). `stable_after` mirrors the tuning
-    /// field (ZERO = every death counts as stable → immediate reopen, keeping tests fast).
+    /// Real loop vs mocks. `fail_first` = open failures before success. `dead_on_arrival` = every
+    /// instance pre-killed. `stable_after = ZERO` treats every death as stable so tests stay fast.
     fn start_tuned(fail_first: usize, dead_on_arrival: bool, stable_after: Duration) -> Harness {
         let (tx, rx) = std::sync::mpsc::sync_channel::<MicFrame>(MIC_QUEUE_CAP);
         let opens = Arc::new(AtomicUsize::new(0));
@@ -519,14 +464,11 @@ mod pump_tests {
         panic!("timed out waiting for: {what}");
     }
 
-    /// Keep a live uplink running until audio reaches the backend.
+    /// Keep sending until PCM hits the backend.
     ///
-    /// A single frame is NOT enough to prove a reopen recovered: a freshly opened backend
-    /// deliberately drops whatever queued while it was down (the `try_recv` drain after the
-    /// open — that audio predates the device), and `opens` counts from the START of the open,
-    /// so a frame sent the moment the counter moves lands inside that drain and is discarded
-    /// by design. A real uplink keeps sending, so the test does too. The sequence has to keep
-    /// advancing or the de-jitter reads the repeats as duplicates and drops them.
+    /// One frame is not enough after reopen: the open path drains the queue (that audio predates
+    /// the device), and `opens` ticks at the *start* of open, so a send on the counter bump lands
+    /// in that drain. Seq must advance or de-jitter drops repeats as duplicates.
     fn wait_until_pushed(what: &str, h: &Harness, from_seq: u32) {
         let mut seq = from_seq;
         for _ in 0..600 {
@@ -550,7 +492,7 @@ mod pump_tests {
         out
     }
 
-    /// A wire-shaped frame: `seq` with the matching 20 ms pts, payload from [`opus_frame`].
+    /// `pts_ns = seq * 20 ms`; payload from [`opus_frame`].
     fn mic_frame(seq: u32) -> MicFrame {
         MicFrame {
             seq,
@@ -559,7 +501,6 @@ mod pump_tests {
         }
     }
 
-    /// Eager: the backend opens (after transient failures) with NO frame ever sent.
     #[test]
     fn opens_eagerly_with_backoff() {
         let h = start(3);
@@ -570,7 +511,6 @@ mod pump_tests {
         h.join.join().unwrap();
     }
 
-    /// Frames flow: opus in → PCM pushed to the backend.
     #[test]
     fn decodes_and_pushes() {
         let h = start(0);
@@ -581,7 +521,6 @@ mod pump_tests {
         h.join.join().unwrap();
     }
 
-    /// A dead backend is noticed WHILE IDLE (heartbeat) and reopened without any traffic.
     #[test]
     fn reopens_after_idle_death() {
         let h = start(0);
@@ -592,7 +531,7 @@ mod pump_tests {
             .unwrap()
             .as_ref()
             .unwrap()
-            .store(false, Ordering::Release); // kill it
+            .store(false, Ordering::Release);
         wait_until("reopen after idle death", || {
             h.opens.load(Ordering::SeqCst) >= 2
         });
@@ -600,7 +539,6 @@ mod pump_tests {
         h.join.join().unwrap();
     }
 
-    /// A death detected on push (frame flowing) also reopens, and the frame after reopen flows.
     #[test]
     fn reopens_after_push_death() {
         let h = start(0);
@@ -611,21 +549,17 @@ mod pump_tests {
             .as_ref()
             .unwrap()
             .store(false, Ordering::Release);
-        h.tx.send(mic_frame(0)).unwrap(); // push sees death → reopen
+        h.tx.send(mic_frame(0)).unwrap();
         wait_until("reopen", || h.opens.load(Ordering::SeqCst) >= 2);
         wait_until_pushed("pcm after reopen", &h, 1);
         drop(h.tx);
         h.join.join().unwrap();
     }
 
-    /// Instances that die immediately after opening must be retried with BACKOFF, not at
-    /// heartbeat rate — a flapping backend (daemon up but dropping us instantly) would
-    /// otherwise churn open→die→reopen every heartbeat forever.
     #[test]
     fn rapid_death_backs_off() {
-        // Every instance is dead on arrival; stability threshold high so each death counts
-        // as a failed open. Without the guard: ~1 reopen per heartbeat (20 ms) ≈ 25 opens in
-        // 500 ms. With backoff 10→20→40 (cap): ≈ 7.
+        // Dead on arrival; high stable_after so each death is a failed open.
+        // Unguarded: ~25 opens / 500 ms at 20 ms heartbeat. Backoff 10→20→40: ≈ 7.
         let h = start_tuned(0, true, Duration::from_secs(10));
         std::thread::sleep(Duration::from_millis(500));
         let opens = h.opens.load(Ordering::SeqCst);
@@ -638,16 +572,14 @@ mod pump_tests {
         h.join.join().unwrap();
     }
 
-    /// A lost datagram is concealed: seq 0 then 2 (1 missing) must still push ~3 frames of PCM
-    /// (decode, PLC, decode) once the reorder window expires — the backend ring never starves
-    /// over a single missing frame.
+    /// seq 0 then 2 must push ~3 frames (decode, PLC, decode) once the reorder window expires.
     #[test]
     fn seq_gap_is_concealed() {
         let h = start(0);
         wait_until("instance", || h.alive.lock().unwrap().is_some());
         h.tx.send(mic_frame(0)).unwrap();
         h.tx.send(mic_frame(2)).unwrap();
-        // 0 plays immediately; 2 is held ≤ 30 ms for 1, then the gap is concealed and 2 plays.
+        // 0 plays now; 2 is held ≤ 30 ms for 1, then conceal + play 2.
         wait_until("conceal + late frame pushed", || {
             h.pushed.load(Ordering::SeqCst) >= 3 * 960 * 2
         });
@@ -655,7 +587,6 @@ mod pump_tests {
         h.join.join().unwrap();
     }
 
-    /// An uplink gap discards buffered-stale audio before the next frame plays.
     #[test]
     fn discards_after_gap() {
         let h = start(0);

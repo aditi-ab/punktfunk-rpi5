@@ -1,116 +1,92 @@
-//! `CtrlRequest` (the embedder's control-stream requests) and `Negotiated` (the handshake result).
+//! Worker-side `CtrlRequest` (one outbound `select!` writer) and `Negotiated` (handshake snapshot for [`NativeClient`]).
 
 use crate::config::{CompositorPref, GamepadPref, Mode};
 use crate::quic::{
     ClipControl, ClipOffer, ColorInfo, DeliveryReport, LossReport, ProbeRequest, RfiRequest,
 };
 
-/// A control-stream request the embedder makes on the open handshake stream: a mode switch or a
-/// speed test. One outbound channel carries both so the worker's `select!` has a single writer
-/// (two `&mut ctrl_send` borrows across select branches don't compile).
+/// One outbound enum so the worker's `select!` has a single writer — two `&mut ctrl_send`
+/// borrows across branches do not compile.
 pub(crate) enum CtrlRequest {
     Mode(Mode),
     Probe(ProbeRequest),
     Keyframe,
-    /// Reference-frame-invalidation recovery: the client saw a `frame_index` gap and reports the
-    /// invalidation range so an RFI-capable host re-references a known-good picture instead of
-    /// forcing a full IDR. See [`RfiRequest`].
+    /// Client saw a `frame_index` gap; an RFI-capable host re-references a known-good picture
+    /// instead of a full IDR.
     Rfi(RfiRequest),
     Loss(LossReport),
-    /// How many data-plane packets have reached us all session — sent straight after every
-    /// [`CtrlRequest::Loss`], because `loss_ppm` is ambiguous at zero (no loss and no packets look
-    /// identical) and only this separates them. See [`DeliveryReport`].
+    /// Follows every [`CtrlRequest::Loss`]. `loss_ppm` is 0 for both no loss and no packets;
+    /// this count is what separates them.
     Delivery(DeliveryReport),
-    /// Adaptive bitrate: ask the host to re-target its encoder (kbps). Sent by the pump's
-    /// [`BitrateController`] when the user's bitrate setting is Automatic.
+    /// The pump's [`BitrateController`] sends this (kbps) when bitrate is Automatic.
     SetBitrate(u32),
-    /// Start a mid-stream clock re-sync batch now (see [`ClockResync`]). Sent by the pump on
-    /// its report tick after the first no-op clock flush — the "the clock stepped under me"
-    /// signal; the control task also self-triggers one every [`CLOCK_RESYNC_INTERVAL`].
+    /// Pump sends this after the first no-op clock flush; the control task also fires one every
+    /// [`CLOCK_RESYNC_INTERVAL`].
     ClockResync,
-    /// Shared-clipboard enable/disable for this session (`design/clipboard-and-file-transfer.md`
-    /// §3.1). Idempotent; carries the file-permission flag.
+    /// Idempotent. File-permission flag is in the payload (`design/clipboard-and-file-transfer.md`).
     ClipControl(ClipControl),
-    /// Announce that the local clipboard changed — the lazy format-list offer (bytes cross later on
-    /// a fetch stream). Symmetric message; the host may send one too.
+    /// Lazy format-list only; bytes follow on a fetch stream. The host may send one too.
     ClipOffer(ClipOffer),
-    /// Who renders the pointer (cursor-forward sessions): `true` = client draws locally (the
-    /// desktop mouse model — host excludes + forwards), `false` = host composites into the
-    /// video (the capture model). Sent on every mouse-model flip; idempotent, latest-wins.
+    /// Who draws the pointer. Client-local = host excludes and forwards; host-composite = baked
+    /// into the video. Latest-wins.
     CursorRender(crate::quic::CursorRenderMode),
-    /// The client's display-latch grid, ~1 Hz, host-clock timestamps — feeds the host's
-    /// phase-locked capture (design/phase-locked-capture.md). Latest-wins; an old host
-    /// ignores the message.
+    /// ~1 Hz latch grid in host-clock time (`design/phase-locked-capture.md`). Latest-wins;
+    /// old hosts ignore it.
     Phase(crate::quic::PhaseReport),
 }
 
-/// What the worker reports to [`NativeClient::connect`] once the handshake lands: the
-/// [`Welcome`]-resolved session parameters (mode, backends, encode/colour/audio geometry) plus the
-/// host certificate fingerprint and the connect-time clock offset. Mirrored one-to-one onto the
-/// public `NativeClient` fields of the same names.
+/// Handshake snapshot the worker reports to [`NativeClient::connect`]. Field-for-field copy onto
+/// the public `NativeClient` of the same names.
 #[derive(Clone, Copy)]
 pub(crate) struct Negotiated {
     pub(crate) mode: Mode,
-    /// Wire shard payload — the chunk-aligned parse window (plan §4.4).
+    /// Chunk-aligned parse window for wire shards.
     pub(crate) shard_payload: u16,
     pub(crate) compositor: CompositorPref,
     pub(crate) gamepad: GamepadPref,
-    /// SHA-256 of the certificate the host actually presented (TOFU callers persist this).
+    /// SHA-256 of the presented host cert; TOFU callers persist this.
     pub(crate) host_fingerprint: [u8; 32],
-    /// The encoder bitrate the host actually configured (kbps); `0` = an older host.
+    /// `0` = older host.
     pub(crate) bitrate_kbps: u32,
-    /// Host clock minus client clock (ns); `0` = no skew handshake (old host / synced clocks).
+    /// Host clock minus client clock (ns). `0` = no skew handshake (old host or synced clocks).
     pub(crate) clock_offset_ns: i64,
-    /// Min RTT of the connect-time skew handshake (ns); `None` = the host never answered —
-    /// mid-stream re-syncs are pointless then and stay off. Seeds the re-sync admission
-    /// guard's session-floor baseline ([`ResyncGuard`]).
+    /// Connect-time min RTT (ns). `None` = host never answered, so mid-stream re-sync stays off.
+    /// Seeds [`ResyncGuard`]'s session-floor.
     pub(crate) clock_rtt_ns: Option<u64>,
-    /// Resolved encode bit depth: `8`, or `10` for a Main10 / HDR session.
+    /// `8`, or `10` for Main10 / HDR.
     pub(crate) bit_depth: u8,
-    /// Resolved CICP colour signalling.
     pub(crate) color: ColorInfo,
-    /// Resolved chroma subsampling as the HEVC `chroma_format_idc` (1 = 4:2:0, 3 = 4:4:4).
+    /// HEVC `chroma_format_idc`: 1 = 4:2:0, 3 = 4:4:4.
     pub(crate) chroma_format: u8,
-    /// Resolved audio channel count (2/6/8) — what the Opus decoders must be built from.
+    /// Channel count the audio decoder must be built from.
     pub(crate) audio_channels: u8,
-    /// Which audio plane the host resolved ([`crate::quic::Welcome::audio_codec`]):
-    /// [`crate::quic::AUDIO_CODEC_OPUS`] — Opus on `0xC9`, every legacy session — or
-    /// [`crate::quic::AUDIO_CODEC_PCM`] — lossless PCM on `0xD3`. It is what SELECTS the
-    /// decoder, and nothing else can: a 48 kHz/16-bit PCM session and a 48 kHz Opus session
-    /// are identical in every other resolved field.
+    /// Selects the decoder. A 48 kHz/16-bit PCM session and a 48 kHz Opus session match on every
+    /// other field.
     pub(crate) audio_codec: u8,
-    /// Resolved sample rate (Hz) — what the host is actually capturing, which may be lower
-    /// than the client asked for. The client opens its output device from THIS, never from
-    /// its request (`design/hi-res-audio.md` §4.3).
+    /// Host capture rate (Hz); may be lower than requested. Open the output device from this,
+    /// never the request (`design/hi-res-audio.md`).
     pub(crate) audio_rate_hz: u32,
-    /// Resolved sample depth (16 or 24) — the stride `0xD3` payloads are unpacked at. Reading
-    /// a 24-bit payload at 2 bytes per sample is not silence, it is noise.
+    /// Unpack stride for `0xD3` payloads (16 or 24). A 24-bit payload at 2 bytes/sample is noise,
+    /// not silence.
     pub(crate) audio_bits: u8,
-    /// Resolved `0xD3` frame duration (µs); `0` on an Opus session, whose frames are the
-    /// `0xC9` plane's fixed 5 ms. Negotiated from the path MTU, never assumed — see
-    /// [`crate::quic::Welcome::audio_frame_us`].
+    /// `0xD3` frame duration (µs). `0` on Opus (fixed 5 ms on `0xC9`). Negotiated from path MTU,
+    /// never assumed.
     pub(crate) audio_frame_us: u16,
-    /// The single codec the host will emit (`quic::CODEC_*`).
+    /// The one codec the host will emit (`quic::CODEC_*`).
     pub(crate) codec: u8,
-    /// The host capability bitfield ([`crate::quic::Welcome::host_caps`]):
-    /// [`crate::quic::HOST_CAP_GAMEPAD_STATE`], [`crate::quic::HOST_CAP_CLIPBOARD`]. Exposed to the
-    /// embedder via [`NativeClient::host_caps`] so a native client greys out unsupported toggles.
+    /// [`crate::quic::Welcome::host_caps`], surfaced as [`NativeClient::host_caps`] so the
+    /// embedder can grey out unsupported toggles.
     pub(crate) host_caps: u8,
-    /// The second capability byte ([`crate::quic::Welcome::host_caps2`]):
-    /// [`crate::quic::HOST_CAP2_REPEAT_MARK`] tells the ABR that unflagged AUs are genuinely
-    /// new content. `0` from an older host.
+    /// [`crate::quic::HOST_CAP2_REPEAT_MARK`]: unflagged AUs are new content. `0` from an older host.
     pub(crate) host_caps2: u8,
-    /// The host's management-API port ([`crate::quic::Welcome::mgmt_port`]), `0` when it did not
-    /// advertise one. Surfaced to the embedder via [`crate::NativeClient::mgmt_port`] so a client
-    /// can reach the game library without ever having seen an mDNS advert.
+    /// Host management-API port; `0` if not advertised. Lets a client reach the game library
+    /// without an mDNS advert.
     pub(crate) mgmt_port: u16,
-    /// The session's effective access grants ([`crate::quic::Welcome::grants`]) — the
-    /// [`crate::quic::GRANT_GAMEPAD`] family. An old host's Welcome decodes to
-    /// [`crate::quic::GRANT_ALL`], the pre-grants behavior. This is only the STARTING truth:
-    /// a mid-session [`crate::quic::AccessUpdate`] moves the live mask the control task keeps
+    /// Connect-time grants. An old host decodes to [`crate::quic::GRANT_ALL`]. Starting mask
+    /// only — [`crate::quic::AccessUpdate`] moves the live one on the control task
     /// (see [`crate::NativeClient::access_grants`]).
     pub(crate) grants: u32,
-    /// Seconds until this device's access expires ([`crate::quic::Welcome::expires_in_secs`]);
-    /// `0` = permanent. Like `grants`, the connect-time seed for the live deadline.
+    /// Seconds until access expires; `0` = permanent. Connect-time seed for the live deadline,
+    /// same as `grants`.
     pub(crate) expires_in_secs: u32,
 }

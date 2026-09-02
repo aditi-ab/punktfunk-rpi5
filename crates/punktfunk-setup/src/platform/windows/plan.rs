@@ -1,15 +1,14 @@
 //! Stage three, Windows: `(WinFacts, WinChoices) → WinPlan`. Pure — no I/O, no spawns.
 //!
-//! A sibling of `plan.rs` rather than an extension of it: the Linux `StepAction` and its
-//! executor thread Linux `Facts`/`Choices` everywhere and are golden-locked, so Windows gets
-//! its own data types over the same `Reporter` vocabulary and the same golden harness
-//! (`design/installer-v2-windows.md` D4's sibling-seam rule).
+//! Own types, not an extension of Linux `plan.rs`: Linux `StepAction` threads
+//! `Facts`/`Choices` and is golden-locked. Same `Reporter` vocabulary and golden
+//! harness (`design/installer-v2-windows.md`).
 //!
-//! Every path in a step is a literal string, never a `PathBuf::join` — the plans must render
-//! byte-identically on every OS that runs the goldens. The phase order is the `.iss` order,
-//! which is load-bearing (§5): stop → files → registry → network → coexistence → drivers →
-//! service → web → plugin runner → restore → tray. `<staging>` and `<temp>` are placeholders
-//! the executor substitutes at run time; dry-run renders them verbatim.
+//! Every path in a step is a literal string, never a `PathBuf::join` — goldens
+//! must render byte-identically on every OS. Phase order matches the `.iss` and
+//! is load-bearing: stop → files → registry → network → coexistence → drivers →
+//! service → web → plugin runner → restore → tray. `<staging>` and `<temp>` are
+//! placeholders the executor substitutes; dry-run renders them verbatim.
 
 use serde::{Deserialize, Serialize};
 
@@ -18,18 +17,17 @@ use super::{TaskState, WinFacts, MGMT_PORT_MOVED};
 use crate::facts::DOCS;
 use crate::plan::Level;
 
-/// Where the host lands without `/DIR`. Load-bearing: `pf-update-check` classifies an install
-/// by this path, and a different dir silently downgrades the box to notify-only updates.
+/// Default without `/DIR`. `pf-update-check` classifies by this path; a different
+/// dir silently downgrades the box to notify-only updates.
 pub const DEFAULT_HOST_DIR: &str = r"C:\Program Files\punktfunk";
 
-/// Rendered, not resolved: the client is per-user and the real profile path is the
-/// executor's business.
+/// Rendered, not resolved: the executor expands the per-user profile path.
 pub const DEFAULT_CLIENT_DIR: &str = r"%LocalAppData%\Programs\Punktfunk";
 
-/// The client installer's ARP key — Inno's `_is1` kept, same reasoning as the host's.
+/// Client ARP key. Keep Inno's `_is1`: winget ProductCode tracks this exact name.
 pub const CLIENT_ARP_KEY: &str = r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{52464E61-68A1-4621-B6B3-5B8BBB823D1A}_is1";
 
-/// Which payload this exe carries; the embedded manifest decides (design D1).
+/// Which payload this exe carries; the embedded manifest decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Artifact {
@@ -37,13 +35,12 @@ pub enum Artifact {
     Client,
 }
 
-/// One Windows step. `Run` is an argv, never a shell string — there is no `sh` here, and
+/// A step. `Run` is an argv, never a shell string — there is no `sh`, and
 /// re-deriving argv from a display string is a quoting bug farm.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WinAction {
     Run(Vec<String>),
-    /// Same spawn, but a non-zero exit is fine: taskkill with nothing to kill, schtasks on an
-    /// absent task, reg delete on a value that is not there — absence IS the goal state.
+    /// Same spawn; a non-zero exit is fine. Absence (no process, no task, no key) is the goal.
     RunLenient(Vec<String>),
     Note(Level, String),
     /// One `KEY=VALUE` line in `%ProgramData%\punktfunk\host.env`.
@@ -51,17 +48,15 @@ pub enum WinAction {
         key: String,
         value: String,
     },
-    /// Unpack the embedded payload into `dest`.
     DeployFiles {
         dest: String,
     },
-    /// Delete the install dir. The uninstaller lives inside it — the executor owns the
-    /// classic self-delete dance; the plan only states the intent.
+    /// The uninstaller lives in `dir`; the executor owns the self-delete. The plan states intent.
     RemoveFiles {
         dir: String,
     },
-    /// The surgical PATH edit: containment-checked append / entry-by-entry rebuild,
-    /// `REG_EXPAND_SZ`, never a substring delete. HKLM when `machine`, else HKCU.
+    /// Containment-checked PATH append / rebuild. `REG_EXPAND_SZ`, never a substring
+    /// delete. HKLM when `machine`, else HKCU.
     PathAdd {
         machine: bool,
         dir: String,
@@ -70,7 +65,7 @@ pub enum WinAction {
         machine: bool,
         dir: String,
     },
-    /// The Add/Remove Programs entry, key name frozen (winget ProductCode).
+    /// ARP entry. The key name is frozen: winget ProductCode.
     ArpRegister {
         key: String,
         display_name: String,
@@ -85,25 +80,25 @@ pub enum WinAction {
         link: String,
         target: String,
     },
-    /// D12's recommended fix, per network, consent given in the wizard. Never in silent runs.
+    /// Flip one network to Private. Wizard consent only; never in a silent run.
     MakeNetworkPrivate {
         network: String,
     },
-    /// Stop the service (SCM, waited), every tray, and the bun tasks — capturing nothing:
-    /// the restore data was captured into Facts before the plan existed.
+    /// Stop the service (SCM, waited), every tray, and the bun tasks. Captures nothing:
+    /// Facts already hold the restore data.
     StopHostRuntime,
     /// Re-enable only what was enabled before the stop. `None` = the task did not exist.
     RestoreTasks {
         web_enabled: Option<bool>,
         scripting_enabled: Option<bool>,
     },
-    /// `punktfunk-host web setup`; the password travels via an ACL'd temp file, never argv.
+    /// The password travels in an ACL'd temp file, never argv.
     WebSetup {
         app_dir: String,
         fresh_password: bool,
     },
-    /// Task Scheduler registration needs XML (restart backoff is inexpressible in flags);
-    /// the executor generates it. `start_now` only on a fresh registration.
+    /// Restart backoff needs task XML (inexpressible in flags); the executor writes it.
+    /// `start_now` only on a fresh registration.
     RegisterScriptingTask {
         app_dir: String,
         start_now: bool,
@@ -112,8 +107,8 @@ pub enum WinAction {
     LaunchTray {
         exe: String,
     },
-    /// Download + run `windowsappruntimeinstall --quiet` when the runtime is missing.
-    /// Best-effort, exactly as shipped: a failure warns and points at the docs.
+    /// Best-effort: a missing runtime downloads `windowsappruntimeinstall --quiet`.
+    /// Failure warns and points at the docs; it never aborts.
     EnsureAppRuntime {
         arch: String,
     },
@@ -139,7 +134,7 @@ impl WinPlan {
         self.phases.iter().flat_map(|p| p.steps.iter())
     }
 
-    /// Every argv this plan would spawn, joined for display — what the trap tests assert on.
+    /// Argv this plan would spawn, joined for display. Trap tests assert on this string.
     pub fn commands(&self) -> Vec<String> {
         self.steps()
             .filter_map(|s| match s {
@@ -187,7 +182,6 @@ fn note(level: Level, text: impl Into<String>) -> WinAction {
     WinAction::Note(level, text.into())
 }
 
-/// The whole Windows engine: probe results in, ordered work out.
 pub fn build(
     facts: &WinFacts,
     choices: &WinChoices,
@@ -265,8 +259,7 @@ fn host_install(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
     }
     plan.push("Drivers (a hiccup warns and never aborts)", drivers);
 
-    // Fresh installs pass the two persisted options explicitly; None passes nothing and the
-    // box keeps its state — the `.iss`'s fresh-only params, ported as data.
+    // `None` omits the flag and the box keeps its state. Only a `Some` rewrites.
     let mut service = vec![host_exe.clone(), "service".into(), "install".into()];
     if let Some(on) = choices.gamestream {
         service.push(format!("--gamestream={}", if on { "on" } else { "off" }));
@@ -355,7 +348,7 @@ fn registry_steps(facts: &WinFacts, choices: &WinChoices, app: &str) -> Vec<WinA
             "/f",
         ]));
     } else if facts.tray_autostart {
-        // Better than Inno's unchecked-box-changes-nothing: turning the row off removes it.
+        // Turning the row off deletes the value. Leaving it would keep a stale autostart.
         steps.push(run(&[
             "reg",
             "delete",
@@ -365,7 +358,7 @@ fn registry_steps(facts: &WinFacts, choices: &WinChoices, app: &str) -> Vec<WinA
             "/f",
         ]));
     }
-    // The tray's toast identity — must stay in lockstep with punktfunk-tray/src/win.rs.
+    // Toast AUMID; must stay in lockstep with `punktfunk-tray/src/win.rs`.
     let aumid = r"HKLM\SOFTWARE\Classes\AppUserModelId\unom.punktfunk.tray";
     steps.push(run(&[
         "reg",
@@ -423,7 +416,7 @@ fn registry_steps(facts: &WinFacts, choices: &WinChoices, app: &str) -> Vec<WinA
     steps
 }
 
-/// D12. Silent installs never touch a profile: the Skip arm's warning is all they render.
+/// Silent installs never touch a profile: Skip renders the warning and stops.
 fn network_steps(facts: &WinFacts, choices: &WinChoices) -> Vec<WinAction> {
     match &choices.network {
         NetworkAnswer::MakePrivate(name) => vec![
@@ -459,7 +452,7 @@ fn network_steps(facts: &WinFacts, choices: &WinChoices) -> Vec<WinAction> {
     }
 }
 
-/// D11: mirror of the Linux conflict steps, same wording where the situation is the same.
+/// Mirror of the Linux conflict steps; same wording where the situation matches.
 fn coexist_steps(facts: &WinFacts, choices: &WinChoices) -> Vec<WinAction> {
     if !facts.needs_coexistence() {
         if facts.mgmt_bind_set {
@@ -505,7 +498,7 @@ fn coexist_steps(facts: &WinFacts, choices: &WinChoices) -> Vec<WinAction> {
     ]
 }
 
-/// The `[UninstallRun]` order, verbatim — each position is load-bearing (§5).
+/// `[UninstallRun]` order, verbatim. Each position is load-bearing.
 fn host_uninstall(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
     let app = facts
         .installed
@@ -523,8 +516,8 @@ fn host_uninstall(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
             run(&[&host_exe, "service", "uninstall"]),
             run_lenient(&[&format!("{app}\\punktfunk-tray.exe"), "--quit"]),
             run_lenient(&["taskkill", "/F", "/IM", "punktfunk-tray.exe"]),
-            // All three legs unconditionally: an upgrade may have dropped a payload an
-            // earlier install laid down. `driver uninstall` also purges the trusted certs.
+            // All three legs even if this install never laid them down — an earlier
+            // upgrade may have. `driver uninstall` also purges the trusted certs.
             run(&[&host_exe, "driver", "uninstall"]),
             run(&[&host_exe, "driver", "uninstall", "--gamepad"]),
             run(&[&host_exe, "driver", "uninstall", "--audio"]),

@@ -1,4 +1,4 @@
-//! The console shell's per-frame screen compose/transition render path.
+//! Per-frame screen compose and transition.
 
 use crate::anim::approach;
 use crate::glyphs::{hint_bar, GlyphStyle};
@@ -18,8 +18,7 @@ use super::{
 
 impl Shell {
     #[allow(clippy::too_many_arguments)]
-    /// Render at `width`×`height` with no insets and the default scale — what a test means
-    /// by "render at w×h". See [`Self::render_in`], which the hosts call.
+    /// Test helper: no insets, default scale. Hosts call [`Self::render_in`].
     #[cfg(test)]
     pub(crate) fn render(
         &mut self,
@@ -41,10 +40,9 @@ impl Shell {
         );
     }
 
-    /// Render one frame into `viewport`. The backdrop paints the whole surface; every
-    /// piece of chrome and content lays out inside the viewport's insets, by translating
-    /// the canvas once — the screens never learn insets exist. `k` (device px per design
-    /// unit) is the viewport's `scale` when it has one, else the couch formula.
+    /// One frame. Backdrop paints the whole surface; chrome and content lay out
+    /// inside the insets by one canvas translate — screens never see insets.
+    /// `k` is `viewport.scale`, else the couch formula on full height.
     pub(crate) fn render_in(
         &mut self,
         canvas: &Canvas,
@@ -67,25 +65,20 @@ impl Shell {
             }
             None => dt,
         };
-        // The shaped-paragraph cache's clock, before anything asks it to draw.
+        // Shaped-paragraph cache clock, before anything draws.
         fonts.begin_frame();
         self.sync();
-        // Publish the palette's ink before ANYTHING draws — every widget, glyph and panel in
-        // the crate reads it (see `theme::set_ink`), so a frame that skipped this would paint
-        // the previous palette's text over the new palette's field.
+        // Publish ink before any draw. Widgets read `theme::set_ink`; skipping this
+        // paints the previous palette's text on the new field.
         crate::theme::set_ink(self.ink);
-        // Same contract as the ink: published once, before anything draws, so every widget
-        // that has a choice to make about travel this frame reads one answer. Also kept as
-        // a local — `LayerEnv` borrows `self.settings` mutably below, so the transition
-        // arms can no longer reach the field itself.
+        // Same publish-once contract as ink. Also a local: `LayerEnv` mut-borrows
+        // `settings`, so the transition arms cannot read the field.
         let reduce = self.settings.reduce_motion;
         crate::theme::set_reduce_motion(reduce);
         self.pads = pads.to_vec();
         self.glyphs = glyph_style(self.input_source, pad_pref, self.platform);
-        // Compared before it is rebuilt: this string changes when someone plugs a controller
-        // in, and was being re-allocated 60 times a second to say so. (`pads` above is left
-        // alone — it is at most a handful of small structs, and `PadInfo` would have to grow a
-        // `PartialEq` in another crate to be worth the same treatment.)
+        // Rebuild the chip string only when it changes. `pads` is left alone — a
+        // handful of small structs; `PadInfo` has no `PartialEq` in its crate.
         let chip = pad.unwrap_or(if self.glyphs == GlyphStyle::Remote {
             "TV remote — a controller works too"
         } else {
@@ -97,15 +90,13 @@ impl Shell {
 
         let (full_w, full_h) = (f64::from(viewport.width), f64::from(viewport.height));
         let ins = viewport.insets;
-        // The design-unit scale reads the FULL height even under insets: a phone's landscape
-        // cutout is a side inset and must not shrink the type, and on the desktop (no insets)
-        // this is byte for byte the formula it always was.
+        // Scale from FULL height even under insets: a landscape cutout is a side
+        // inset and must not shrink type.
         let k = viewport
             .scale
             .unwrap_or_else(|| (full_h / 800.0).clamp(0.75, 3.0));
-        // Everything below the backdrop lays out in the safe area: (0,0) is its top-left
-        // corner and (w,h) its size. Pointer input is brought into the same space by
-        // `Shell::pointer` via `last_insets`.
+        // Layout origin is the safe-area top-left. Pointers enter the same space
+        // via `last_insets` in `Shell::pointer`.
         let (w, h) = (
             full_w - f64::from(ins.left) - f64::from(ins.right),
             full_h - f64::from(ins.top) - f64::from(ins.bottom),
@@ -114,15 +105,12 @@ impl Shell {
         self.last_k = k;
         let t = self.t();
 
-        // Advance the transition. `None` means "settled" — which is also what makes the
-        // hint-rect invariant below still hold: with a spring, "settled" is
-        // `Motion::None`, exactly as it was with a timer. A reversed push takes its screen
-        // back off the stack here; a completed pop drops the one it was carrying.
+        // `None` is settled (`Motion::None`). A reversed push pops its screen here;
+        // a completed pop drops the one it was carrying.
         let motion_p = self.advance_nav(dt);
 
-        // The backdrop settles into (or out of) calm with the screen transition. It is the
-        // SAME living field either way — a form screen quiets it, it doesn't replace it —
-        // so this is one shader pass with a chased uniform, not two stacked backdrops.
+        // One shader pass: form screens quiet the same field via a chased `calm`
+        // uniform. Not a second backdrop.
         let bg_target = match self.stack.last().expect("non-empty").background() {
             Bg::Aurora => 0.0,
             Bg::Form => 1.0,
@@ -132,27 +120,22 @@ impl Shell {
             self.bg_mix = bg_target;
         }
         self.draw_aurora(canvas, full_w, full_h, t, self.bg_mix);
-        // Only an inset viewport takes the translate: with none this is the desktop's exact
-        // canvas state, and the screenshot dump is held byte-for-byte to that.
+        // Translate only when inset: with none this is the desktop canvas, and
+        // screenshot dumps stay byte-identical.
         let inset = ins.left != 0.0 || ins.top != 0.0;
         if inset {
             canvas.save();
             canvas.translate((ins.left, ins.top));
         }
 
-        // The screens, through the transition choreography.
         let content = Rect::from_ltrb(
             0.0,
             (TOP_BAND * k) as f32,
             w as f32,
             (h - BOTTOM_BAND * k) as f32,
         );
-        // How much room the heading has before it reaches the controller chip. The chip is
-        // painted last so it sits above every layer, but its geometry is known now — `chip`
-        // and `pads` are both set above — and the heading needs it: centred, the title had
-        // the whole width to spread symmetrically into, where left-aligned it runs AT the
-        // chip. The 12 is the gap Apple keeps between the two; the floor keeps a
-        // pathologically long chip string from squeezing the title to nothing.
+        // Heading budget left of the controller chip. 12 dp is the gap between them;
+        // the 0.35 w floor stops a long chip from squeezing the title to nothing.
         let title_max_w = {
             let chip_w = self.chip.as_ref().map_or(0.0, |c| {
                 chip_width(
@@ -164,8 +147,6 @@ impl Shell {
             });
             (w - 2.0 * EDGE_INSET * k - chip_w - 12.0 * k).max(w * 0.35)
         };
-        // One paint recipe per layer: (alpha, slide, scale). Everything below borrows
-        // disjoint fields of `self` per call, so the borrow checker stays happy.
         let mut env = LayerEnv {
             canvas,
             w,
@@ -186,22 +167,16 @@ impl Shell {
             device_name: &self.device_name,
             t,
             glyphs: self.glyphs,
-            // A modal card owns B/A while it's up — the screen's legend would lie.
+            // A modal owns B/A while up — do not also show the screen's legend.
             show_hints: self.connecting.is_none() && self.wake.is_none(),
         };
-        // Only a SETTLED top screen publishes clickable hint boxes. Mid-transition every
-        // layer is slid and scaled inside a `save_layer`, so the rects a `paint` reports
-        // aren't where the pixels are — and the shell drops pointer input during a
-        // transition anyway, exactly as it drops menu events.
+        // Only a settled top screen publishes hint hit-boxes. Mid-transition every
+        // layer is slid inside a `save_layer`, so reported rects are not the pixels.
         self.hint_rects.clear();
-        // Reduced motion keeps the CROSSFADE — the stack has to stay legible, and an
-        // instant swap loses the only spatial cue a console shell has — and drops the
-        // travel: no slide, no scale.
+        // Reduced motion keeps the crossfade (an instant swap loses the only spatial
+        // cue) and drops slide/scale.
         let slide = |dy: f64| if reduce { 0.0 } else { dy };
         let zoom = |s: f64| if reduce { 1.0 } else { s };
-        // The geometry below is UNCHANGED from the tween: same 36 dp slide, same
-        // 0.985/0.96 scales, same 0.4 reveal alpha. Only the time-course differs — `p` is
-        // now the spring's position where it used to be `ease_out_cubic(elapsed)`.
         match (&mut self.motion, motion_p) {
             (
                 Motion::Nav {
@@ -215,18 +190,14 @@ impl Shell {
                 let enter_scale = zoom(NAV_ENTER_SCALE + (1.0 - NAV_ENTER_SCALE) * p);
                 let enter_slide = slide(NAV_SLIDE_DP * k * (1.0 - p));
                 let recede = zoom(1.0 - (1.0 - NAV_EXIT_SCALE) * p);
-                // Outgoing recedes underneath…
                 if let Some(replaced) = leaving.as_mut() {
-                    // A REPLACE carries the screen it swapped out, because that screen is no
-                    // longer on the stack to be found under the incoming one. Painting the
-                    // stack's own n-2 here would recede the replaced screen's PARENT, which
-                    // is how choosing "Edit…" in a host menu used to flash the host list.
+                    // REPLACE paints the swapped-out screen. Painting stack n-2 recedes its
+                    // parent, so "Edit…" would flash the host list under the incoming editor.
                     env.paint(replaced.as_mut(), 1.0 - p, 0.0, recede);
                     env.paint(&mut self.stack[n - 1], p, enter_slide, enter_scale);
                 } else if n >= 2 {
                     let (below, top) = self.stack.split_at_mut(n - 1);
                     env.paint(&mut below[n - 2], 1.0 - p, 0.0, recede);
-                    // …while the incoming slides up out of a fade.
                     env.paint(&mut top[0], p, enter_slide, enter_scale);
                 } else {
                     env.paint(&mut self.stack[0], p, enter_slide, enter_scale);
@@ -240,7 +211,6 @@ impl Shell {
                 },
                 Some(p),
             ) => {
-                // The revealed screen grows back in…
                 let n = self.stack.len();
                 env.paint(
                     &mut self.stack[n - 1],
@@ -248,7 +218,6 @@ impl Shell {
                     0.0,
                     zoom(NAV_EXIT_SCALE + (1.0 - NAV_EXIT_SCALE) * p),
                 );
-                // …while the leaving one slides down into a fade.
                 env.paint(leaving.as_mut(), 1.0 - p, slide(NAV_SLIDE_DP * k * p), 1.0);
             }
             _ => {
@@ -257,9 +226,6 @@ impl Shell {
             }
         }
 
-        // Persistent chrome: the controller chip (top-right, above every layer). Reads
-        // left-to-right as kind · name · charge — a mark for what is connected, its name,
-        // and how long it has left.
         if let Some(chip) = &self.chip {
             let size = 12.0 * k;
             let tw = f64::from(fonts.measure(chip, W::Medium, size));
@@ -308,14 +274,9 @@ impl Shell {
     }
 }
 
-/// The controller chip's drawn width, device px. Its own function because two things need
-/// it — the chip itself, and the heading, which is left-aligned now and so has to stop short
-/// of it. A second copy of this arithmetic is a title that slides under the chip the day
-/// someone adds a field to it.
-///
-/// The battery only takes room when there IS one: a wired pad, a Steam virtual pad and "no
-/// controller" all report nothing, and the chip must not carry a gap where their charge
-/// would have been.
+/// Chip width in device px. Shared with the heading, which stops short of
+/// it — a second copy of this arithmetic puts the title under the chip the
+/// day a field is added. The pip takes room only when a charge exists.
 fn chip_width(fonts: &Fonts, chip: &str, has_battery: bool, k: f64) -> f64 {
     let tw = f64::from(fonts.measure(chip, W::Medium, 12.0 * k));
     let (pad_x, gap, mark_w) = (12.0 * k, 8.0 * k, 15.0 * k);
@@ -323,15 +284,13 @@ fn chip_width(fonts: &Fonts, chip: &str, has_battery: bool, k: f64) -> f64 {
     pad_x + mark_w + gap + tw + pip_w + pad_x
 }
 
-/// Everything one screen layer needs to paint — bundled so the transition arms stay
-/// readable and each `paint` call borrows `Shell` fields disjointly.
+/// One screen layer's paint args, so each `paint` borrows `Shell` fields disjointly.
 struct LayerEnv<'a> {
     canvas: &'a Canvas,
     w: f64,
     h: f64,
     content: Rect,
     k: f64,
-    /// The heading's width budget — everything left of the controller chip. See `Shell::render`.
     title_max_w: f64,
     dt: f64,
     fonts: &'a Fonts,
@@ -342,7 +301,6 @@ struct LayerEnv<'a> {
     platform: crate::platform::Platform,
     pads: &'a [PadInfo],
     deck: bool,
-    /// See [`crate::shell::ConsoleOptions::fallback_ui`] — a screen's row set can ask.
     fallback_ui: bool,
     device_name: &'a str,
     t: f64,
@@ -351,10 +309,9 @@ struct LayerEnv<'a> {
 }
 
 impl LayerEnv<'_> {
-    /// One screen composited as a unit: `alpha` fade, `dy` vertical slide, `scale`
-    /// about the screen center — its pinned title and hint bar ride inside the layer,
-    /// so chrome travels with content through a transition. Returns the hint bar's hit
-    /// boxes, which only the caller can know are worth keeping (see `Shell::render`).
+    /// One screen as a unit: fade, vertical slide, scale about centre. Title and
+    /// hint bar ride inside the layer so chrome travels with content. Hit-boxes
+    /// are only worth keeping on a settled top screen (see `Shell::render`).
     fn paint(
         &mut self,
         screen: &mut Screen,
@@ -363,24 +320,14 @@ impl LayerEnv<'_> {
         scale: f64,
     ) -> Vec<(crate::glyphs::HintKey, Rect)> {
         let canvas = self.canvas;
-        // Only RAISE the layer when it carries something. A settled screen is painted at full
-        // alpha, unscaled and unslid, and an unbounded `save_layer` allocates an offscreen the
-        // size of the whole SURFACE and composites it back — so the console was paying for one
-        // full-screen offscreen on every frame it sat still, to apply an alpha of 1. Skia does
-        // not elide it either: `SkCanvas::saveLayerAlphaf` forwards alpha ≥ 1 straight to
-        // `saveLayer(bounds, nullptr)`, whose only early-out is an empty clip.
-        //
-        // Dropping the layer is pixel-identical rather than merely close: nothing in this crate
-        // draws with a blend mode other than `SrcOver`, and `SrcOver` is associative, so
-        // compositing the draws into a transparent layer and then over the backdrop lands on
-        // exactly the value drawing them straight onto the backdrop does. (It is also why the
-        // text stays grayscale-AA — no LCD subpixel text to gain or lose an isolation.) Same
-        // reasoning `screens::home` already bounds its per-tile layer by.
+        // Raise a layer only when alpha/scale/slide actually change. Unbounded
+        // `save_layer` is a full-surface offscreen; Skia does not elide alpha ≥ 1.
+        // Settled SrcOver draws are pixel-identical without the isolation.
         let layered = alpha < 0.999 || (scale - 1.0).abs() > 0.001 || dy.abs() > 0.001;
         if layered {
             canvas.save_layer_alpha_f(None, alpha.clamp(0.0, 1.0) as f32);
         } else {
-            // Still a save: the transform below is undone by the same `restore`.
+            // Save anyway: the transform below is undone by the same `restore`.
             canvas.save();
         }
         canvas.translate((0.0, dy as f32));
@@ -432,11 +379,9 @@ impl LayerEnv<'_> {
     }
 }
 
-/// The glyph style for this frame: the last input source rules — keys speak the
-/// platform's key device (a TV remote on Android, a keyboard on the desktop), a pad
-/// speaks its own family ([`GlyphStyle::from_pref`]). Before anything has driven, the
-/// connected pad's family shows if there is one (a pad in hand is what a fresh console
-/// will most likely be driven by), else the platform's key device.
+/// Glyphs follow the last input source. Keys speak the platform's key device
+/// (Android remote, desktop keyboard); a pad speaks its family. Before any
+/// input, the connected pad's family if there is one, else the key device.
 fn glyph_style(
     source: Option<crate::console::InputSource>,
     pad_pref: Option<punktfunk_core::config::GamepadPref>,
@@ -460,15 +405,10 @@ mod glyph_style_tests {
     use crate::platform::Platform;
     use punktfunk_core::config::GamepadPref;
 
-    /// The matrix the field report walked: a Chromecast (Android, no pad) used to show
-    /// keyboard keycaps — Enter/Esc/Tab, none of which its remote has. Keys on Android
-    /// now read as the remote, keys on the desktop as the keyboard, a driving pad as its
-    /// own family — and a pad that vanishes mid-session falls back to the platform's key
-    /// device rather than freezing on the departed pad's letters.
+    /// Last input source wins; an unplugged pad falls back to the platform key device.
     #[test]
     fn the_legend_follows_what_drives() {
         let xbox = Some(GamepadPref::Xbox360);
-        // Untouched console: the connected pad's family, else the platform's key device.
         assert_eq!(
             glyph_style(None, xbox, Platform::Android),
             GlyphStyle::Letters
@@ -481,7 +421,6 @@ mod glyph_style_tests {
             glyph_style(None, None, Platform::Desktop),
             GlyphStyle::Keyboard
         );
-        // Keys drove last: the key device, even with a pad still connected.
         assert_eq!(
             glyph_style(Some(InputSource::Keys), xbox, Platform::Android),
             GlyphStyle::Remote
@@ -490,7 +429,6 @@ mod glyph_style_tests {
             glyph_style(Some(InputSource::Keys), xbox, Platform::Desktop),
             GlyphStyle::Keyboard
         );
-        // A pad drove last: its family — and Nintendo reads Nintendo.
         assert_eq!(
             glyph_style(
                 Some(InputSource::Pad),
@@ -507,7 +445,6 @@ mod glyph_style_tests {
             ),
             GlyphStyle::Shapes
         );
-        // The pad drove, then unplugged: back to the platform's key device.
         assert_eq!(
             glyph_style(Some(InputSource::Pad), None, Platform::Android),
             GlyphStyle::Remote

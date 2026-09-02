@@ -4,12 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-/// Monotonic now, in ns since an arbitrary process-wide epoch — the basis for the probe
-/// arrival stamps below. Monotonic on purpose: the stamps are only ever DIFFERENCED on this
-/// machine (the burst's receive interval), and a wall-clock step mid-burst — the exact event
-/// the clock re-sync machinery exists for — must not corrupt the one measurement the ABR
-/// ceiling is built from, so the CLOCK_REALTIME basis `pts_ns` uses is wrong here. Floored
-/// at 1 so a stamp can never collide with the 0 = "unset" sentinel.
+/// Monotonic ns since an arbitrary process-wide epoch. Probe arrival stamps are
+/// only ever differenced on this machine; a wall-clock step mid-burst would
+/// corrupt the interval, so `pts_ns`'s CLOCK_REALTIME basis is wrong here.
+/// Floored at 1 so a stamp never collides with the 0 = "unset" sentinel.
 pub(crate) fn now_monotonic_ns() -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     (EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64).max(1)
@@ -24,54 +22,40 @@ pub struct Stats {
     pub packets_sent: u64,
     pub packets_received: u64,
     pub packets_dropped: u64,
-    /// Packets the host could NOT hand to the kernel because the send buffer was full (WouldBlock)
-    /// — the dominant loss mode at very high bitrate. Distinct from `packets_dropped` (recv-side
-    /// reassembler rejects). A non-zero, growing value means the link/encoder is outrunning the
-    /// send path; raise `net.core.wmem_max` / lower the bitrate, or wait for paced batched sending.
+    /// WouldBlock on send: the kernel send buffer was full. Distinct from
+    /// `packets_dropped` (recv-side reassembler rejects).
     pub packets_send_dropped: u64,
     pub fec_recovered_shards: u64,
-    /// Shards counted into [`fec_recovered_shards`](Self::fec_recovered_shards) that later ARRIVED
-    /// — reordered delivery lets a block reconstruct early from parity, so the still-in-flight
-    /// shards it "recovered" were late, not lost. Loss estimators must net this out
-    /// (`recovered - late`, see [`window_loss_ppm`](crate::quic::window_loss_ppm)) or plain
-    /// reordering reads as packet loss and spooks adaptive FEC + the bitrate controller.
-    /// Deliberately NOT mirrored into the C-ABI `PunktfunkStats` (loss windows run in-core).
+    /// Recovered shards that later arrived: reordering reconstructed the block
+    /// from parity while the originals were still in flight. Loss estimators
+    /// must net this out (`recovered - late`, see [`window_loss_ppm`](crate::quic::window_loss_ppm))
+    /// or reordering reads as loss. Not mirrored into the C-ABI `PunktfunkStats`.
     pub fec_late_shards: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
-    /// Probe-scoped receive counters: wire packets / plaintext bytes carrying
-    /// [`FLAG_PROBE`](crate::packet::FLAG_PROBE) (speed-test filler), counted at the
-    /// reassembler's probe routing decision. `bytes_received` counts EVERY accepted datagram,
-    /// so a speed-test numerator built from it inherits whatever video was in flight around
-    /// the burst — these keep video out of the probe math. Deliberately NOT mirrored into the
-    /// C-ABI `PunktfunkStats` (probe measurements surface via `ProbeOutcome`).
-    /// Media bytes delivered to the video reassembler: DATA-shard payload only — no packet
-    /// headers, no FEC parity, no probe filler, no audio. This is the rate the encoder's target
-    /// is a promise about, and the only honest thing to compare that target against.
-    /// `bytes_received` counts every accepted datagram, so a "delivered throughput" built from
-    /// it rises with the FEC redundancy the host adds in answer to loss — which meant the
-    /// adaptive-bitrate utilization gate ("did the pipeline actually carry ~the target?") read
-    /// 25 % high exactly on the lossy links it exists for, and the never-decaying
-    /// proven-throughput mark inherited the same inflation. Deliberately NOT mirrored into the
-    /// C-ABI `PunktfunkStats`.
+    /// DATA-shard payload delivered to the video reassembler — no headers, FEC
+    /// parity, probe filler, or audio. `bytes_received` includes FEC redundancy,
+    /// so a utilization gate built from it inflates on lossy links. Not mirrored
+    /// into the C-ABI `PunktfunkStats`.
     pub media_bytes_received: u64,
+    /// Wire packets / plaintext bytes carrying [`FLAG_PROBE`](crate::packet::FLAG_PROBE).
+    /// `bytes_received` counts every accepted datagram, so a speed-test numerator
+    /// built from it inherits in-flight video. Not mirrored into the C-ABI
+    /// `PunktfunkStats` (probe measurements surface via `ProbeOutcome`).
     pub probe_packets_received: u64,
     pub probe_bytes_received: u64,
-    /// First / last probe-packet arrival (monotonic ns, see [`now_monotonic_ns`]; 0 = none
-    /// since the last probe arm). Their difference is the burst's client-side receive
-    /// interval — the honest speed-test denominator: the host's send window closes while the
-    /// switch/kernel queue toward the client is still draining, so dividing client bytes by
-    /// the HOST duration overstates the link (a 1 GbE link "measured" 1266 Mbps). The client
-    /// pump zeroes both when it arms a probe (`Session::reset_probe_arrivals`).
+    /// First / last probe-packet arrival (monotonic ns, see [`now_monotonic_ns`];
+    /// 0 = none since the last arm). Difference is the client receive interval:
+    /// the host send window closes while the path is still draining, so host
+    /// duration overstates the link. Zeroed on arm (`Session::reset_probe_arrivals`).
     pub probe_first_arrival_ns: u64,
     pub probe_last_arrival_ns: u64,
 }
 
-/// Atomic accumulators owned by a [`Session`](crate::session::Session). Snapshot to
-/// [`Stats`] for readers. `Relaxed` ordering is fine: these are monotonic counters
-/// read for display, never used to synchronize other memory. (The two probe arrival
-/// stamps are the exception — slots, not counters — but they carry no synchronization
-/// duty either: they are read hundreds of ms after the last write.)
+/// Atomic accumulators owned by a [`Session`](crate::session::Session). Snapshot
+/// to [`Stats`] for readers. `Relaxed` is enough: these never synchronize other
+/// memory. Probe arrival stamps are slots, not counters, and are read well after
+/// the last write.
 #[derive(Default)]
 pub struct StatsCounters {
     pub frames_submitted: AtomicU64,

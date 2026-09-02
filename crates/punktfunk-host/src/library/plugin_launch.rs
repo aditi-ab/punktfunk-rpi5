@@ -1,39 +1,33 @@
-//! Resolve a plugin-owned library entry to a command at launch time over the plugin's
-//! registered loopback UI surface.
+//! Resolve a plugin-owned library entry to a command at launch time over the
+//! plugin's registered loopback UI surface.
 //!
-//! Entries persist only an opaque key. Asking the owning plugin avoids storing executable
-//! content, rejects entries the plugin disowns, and picks up current emulator configuration.
-//! The host executes the answer so the process enters the captured session and game lifetime.
+//! Entries persist only an opaque key. The owning plugin returns the current
+//! command; the host runs it so the process enters the captured session.
+//! `None` if the plugin is down, disowns the key, or answers something unusable.
 //!
-//! This is not a boundary against a stolen `plugin-token`: the runner shares one credential,
-//! so its holder can replace any registration and control the command returned for that id.
-//! The per-boot UI secret authenticates the registered listener, not plugin ownership. Closing
-//! that principal gap requires runner isolation or executing as the runner, not validation here.
+//! The per-boot UI secret authenticates the registered listener, not plugin
+//! ownership — see `mgmt::plugins`. Pin: [`ask_plugin_launch`], tests below.
 
 use super::*;
 use std::time::Duration;
 
-/// The whole ask, end to end. A plugin resolving one of its own entries is a local lookup against
-/// state it already holds, so this is generous for a healthy plugin and short enough that a wedged
-/// one cannot hold a launch — or, on the GameStream plane, the data-plane thread that calls this —
-/// for longer than a player would keep staring at a tile that did nothing.
+/// 3 s covers a healthy local lookup; a wedged plugin cannot hold the launch
+/// (or the GameStream data-plane thread that calls this) longer than that.
 const ASK_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// A command LINE, not a script. Generous for `flatpak run … --core=… "/very/long/rom path"`,
-/// bounded so a malformed answer cannot land a megabyte in the logs or in a shell argument.
+/// 4 KiB: one command line (`flatpak run … --core=… "/very/long/rom path"`), not a script.
 const MAX_COMMAND: usize = 4096;
 
-/// Cap the whole response body — the shape is two short strings.
+/// 64 KiB ceiling for `{command, cwd}`; typical answers are two short strings.
 const MAX_BODY: usize = 64 * 1024;
 
-/// What a plugin answered: the command line to run, and optionally the directory to run it in
-/// (emulators that resolve cores or configs relative to their install dir need one).
+/// Optional `cwd`: emulators resolve cores/configs relative to their install dir.
 pub struct PluginLaunch {
     pub command: String,
     pub cwd: Option<PathBuf>,
 }
 
-/// The wire shape of `POST /__launch`'s response.
+/// `POST /__launch` body: `{command, cwd}`.
 #[derive(Deserialize)]
 struct LaunchReply {
     command: String,
@@ -41,22 +35,17 @@ struct LaunchReply {
     cwd: Option<String>,
 }
 
-/// The opaque per-entry key a `plugin` launch carries. It is echoed to the owning plugin as JSON and
-/// lands in log lines, so bound it and keep control characters out; everything else is the plugin's
-/// own namespace (rom-manager uses its `<platform>/<relpath>` external id).
+/// Opaque plugin key. Echoed as JSON and in logs: cap 512, no control chars.
 pub fn valid_plugin_entry_key(v: &str) -> bool {
     !v.is_empty() && v.len() <= 512 && !v.chars().any(char::is_control)
 }
 
-/// Ask `plugin` what to run for its entry `key`.
+/// Loopback `POST /__launch` for `plugin`'s entry `key`. `None` if unregistered,
+/// disowned, or unusable; every arm logs so the operator can tell which.
 ///
-/// `None` — the plugin is not registered/live, has no UI surface, disowns the entry, or answered
-/// something unusable. Every arm logs, because from a player's seat all of them look like "the tile
-/// did nothing", and the difference is exactly what an operator needs to fix it.
-///
-/// **Blocking** (`ureq`, the host's existing off-runtime HTTP client): callers run on a blocking
-/// thread. `resolve_launch`'s async callers hop through `spawn_blocking`, and the handshake's
-/// "is this launchable at all" probe uses [`super::launch_is_resolvable`], which never asks.
+/// Blocking (`ureq`). Callers sit on a blocking thread: `resolve_launch` hops
+/// through `spawn_blocking`. Handshake probes use [`super::launch_is_resolvable`],
+/// which never asks.
 pub fn ask_plugin_launch(plugin: &str, key: &str) -> Option<PluginLaunch> {
     if !valid_plugin_entry_key(key) {
         tracing::warn!(
@@ -73,16 +62,13 @@ pub fn ask_plugin_launch(plugin: &str, key: &str) -> Option<PluginLaunch> {
              nothing to launch"
         );
         return None;
-    };
+    }
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(ASK_TIMEOUT))
         .build()
         .into();
-    // Loopback + the plugin's own per-boot secret, exactly what the console proxy presents. The
-    // registration stores a PORT, never an address (mgmt::plugins D5), so this can only ever dial
-    // this machine.
-    // `send` with an explicit content type rather than `send_json`: that one needs ureq's `json`
-    // feature, and the body is one field.
+    // Registration stores a port, never an address: this always dials 127.0.0.1.
+    // `send` + Content-Type, not `send_json` — that needs ureq's `json` feature.
     let body = serde_json::json!({ "entry": key }).to_string();
     let resp = match agent
         .post(&format!("http://127.0.0.1:{}/__launch", cred.port))
@@ -91,8 +77,7 @@ pub fn ask_plugin_launch(plugin: &str, key: &str) -> Option<PluginLaunch> {
         .send(&body)
     {
         Ok(r) => r,
-        // A plugin that does not know the entry says so with a 404 — the answer a FORGED entry gets,
-        // and the reason planting one is not enough to make the host run anything.
+        // 404 = the plugin disowns the key (forged rows included).
         Err(ureq::Error::StatusCode(404)) => {
             tracing::warn!(
                 plugin,
@@ -152,7 +137,7 @@ pub fn ask_plugin_launch(plugin: &str, key: &str) -> Option<PluginLaunch> {
     validate_reply(plugin, key, reply)
 }
 
-/// The checks on what came back, split out so they can be tested without a plugin on a port.
+/// Reply checks, factored so tests need no listening plugin.
 fn validate_reply(plugin: &str, key: &str, reply: LaunchReply) -> Option<PluginLaunch> {
     let command = reply.command.trim().to_string();
     if command.is_empty() {
@@ -171,10 +156,7 @@ fn validate_reply(plugin: &str, key: &str, reply: LaunchReply) -> Option<PluginL
         );
         return None;
     }
-    // Hygiene rather than a security boundary — a plugin that wanted two commands could always write
-    // `a; b`, and composing the line is its job. But a launch command is ONE line: keeping control
-    // characters out is what makes the logged line the line that ran, and what stops a stray `\r`
-    // from mangling the Windows `cmd.exe /c` form.
+    // One line so the log is the line that ran. `\r` would mangle Windows `cmd.exe /c`.
     if command.chars().any(char::is_control) {
         tracing::warn!(
             plugin,
@@ -192,8 +174,7 @@ fn validate_reply(plugin: &str, key: &str, reply: LaunchReply) -> Option<PluginL
         None => None,
         Some(dir) => {
             let path = PathBuf::from(dir);
-            // Relative to WHAT? The host's cwd is not the plugin's, and a launch that silently ran
-            // somewhere unintended is worse than one that says why it did not.
+            // Host cwd ≠ plugin cwd; a relative path would run somewhere unintended.
             if !path.is_absolute() {
                 tracing::warn!(
                     plugin,
@@ -214,9 +195,8 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
-    /// A one-shot HTTP/1.1 stub on an ephemeral loopback port. Returns the port and a handle that
-    /// yields the raw request text — so the assertions about what the HOST sent (method, path,
-    /// bearer, body) live in the test thread, where a failure reads as a failure.
+    /// One-shot loopback stub. The join handle is the raw request so HOST-side
+    /// asserts fail in this thread.
     fn stub_plugin(status: u16, body: &'static str) -> (u16, std::thread::JoinHandle<String>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
@@ -260,10 +240,7 @@ mod tests {
 
     #[test]
     fn asks_the_registered_plugin_and_takes_its_answer() {
-        // The cwd has to be absolute FOR THE HOST PLATFORM: `/opt/emu` has no drive letter, so
-        // `Path::is_absolute` is false on Windows and `validate_reply` refuses the recipe — this
-        // test could never pass there. Same split as `a_working_directory_must_be_absolute`.
-        // (The `\\` is JSON escaping; the decoded value is `C:\emu`.)
+        // Absolute for this OS: `/opt/emu` is relative on Windows. `\\` is JSON for `C:\emu`.
         let (answer, cwd) = if cfg!(windows) {
             (
                 r#"{"command":"retroarch 'smw.sfc'","cwd":"C:\\emu"}"#,
@@ -284,12 +261,10 @@ mod tests {
 
         let req = server.join().expect("stub thread");
         assert!(req.starts_with("POST /__launch "), "request was {req:?}");
-        // The plugin's own per-boot secret, the same credential the console proxy presents.
         assert!(
             req.contains("Bearer s3cr3t"),
             "the ask must authenticate: {req:?}"
         );
-        // The entry key is what the plugin resolves against its own state — it must be on the wire.
         assert!(
             req.contains(r#""entry":"snes/smw.sfc""#),
             "body was {req:?}"
@@ -298,8 +273,6 @@ mod tests {
 
     #[test]
     fn a_404_means_the_plugin_disowns_the_entry() {
-        // The cross-provider case: a row planted under someone else's provider launches nothing,
-        // because that provider's plugin is the one asked and it never published the key.
         let (port, server) = stub_plugin(404, r#"{"error":"no launchable entry \"forged\""}"#);
         crate::mgmt::register_ui_for_test("stub-disowner", port, "s");
 
@@ -309,7 +282,6 @@ mod tests {
 
     #[test]
     fn an_unregistered_provider_resolves_to_nothing() {
-        // No live plugin, no port to dial, no launch — and no panic.
         assert!(ask_plugin_launch("no-such-plugin-is-registered", "k").is_none());
     }
 
@@ -345,7 +317,7 @@ mod tests {
     fn empty_and_oversized_and_control_char_commands_are_refused() {
         assert!(validate_reply("p", "k", reply("   ", None)).is_none());
         assert!(validate_reply("p", "k", reply(&"x".repeat(MAX_COMMAND + 1), None)).is_none());
-        // The interesting one: a second line smuggled into what the host logs as a single command.
+        // Newline: two lines in what the host logs as one command.
         assert!(validate_reply("p", "k", reply("retroarch rom\nrm -rf ~", None)).is_none());
     }
 

@@ -1,13 +1,11 @@
-//! A headless synthetic **NV12 D3D11** capture source for exercising the GPU encoders on Windows
-//! without a real capture session.
+//! Headless synthetic NV12 D3D11 capture for Windows GPU encoder tests.
 //!
-//! The native AMF path (and the D3D11 zero-copy NVENC/QSV paths) require an NV12 texture that lives
-//! on the GPU — the CPU-Bgrx [`SyntheticCapturer`](crate::SyntheticCapturer) can't provide
-//! one, and DXGI Desktop Duplication can't create one under an ssh session-0 (E_ACCESSDENIED). This
-//! source builds an NV12 texture on the selected render adapter and fills it with a **moving** luma
-//! ramp each frame, so the encoder sees genuine motion (P-frame residuals + the intra-refresh wave
-//! under content change) — exactly what an intra-refresh recovery validation needs. Driven by
-//! `spike --source synthetic-nv12`.
+//! AMF and the D3D11 zero-copy NVENC/QSV paths need an NV12 texture on the GPU.
+//! [`crate::SyntheticCapturer`] is CPU Bgrx, and DXGI Desktop Duplication is
+//! denied in session-0, so this source builds NV12 on the render adapter.
+//! Each frame is a moving luma ramp so the encoder sees real motion.
+//!
+//! Drive it with `spike --source synthetic-nv12`.
 
 use crate::dxgi::{make_device, D3d11Frame};
 use crate::{CapturedFrame, Capturer, FramePayload, PixelFormat};
@@ -20,10 +18,9 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
 
-/// Synthetic NV12 frames on the GPU. Owns its own D3D11 device + immediate context and two NV12
-/// textures: a CPU-writable STAGING scratch it fills each frame, and a DEFAULT texture it copies
-/// into and hands to the encoder. The encoder copies out of the DEFAULT texture synchronously
-/// (spike drives capture→submit→poll on one thread), so reusing one DEFAULT texture is sound.
+/// Staging is filled on the CPU; DEFAULT is what the encoder is handed.
+/// Spike is capture→submit→poll on one thread, so reusing one DEFAULT is safe:
+/// the encoder copies out before the next fill.
 pub struct SyntheticNv12Capturer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -35,11 +32,9 @@ pub struct SyntheticNv12Capturer {
     frame_idx: u64,
 }
 
-// SAFETY: mirrors `D3d11Frame`'s reasoning — the device is created free-threaded (`make_device`
-// passes no `SINGLETHREADED` flag) and D3D11 uses interlocked COM refcounting, so moving the whole
-// capturer (device + immediate context + textures) to its owning thread and using it only there is
-// sound. The value is moved, never aliased (no `Sync`), so the single-threaded immediate context is
-// never touched concurrently.
+// SAFETY: `make_device` omits `SINGLETHREADED`; D3D11 COM refcounts are interlocked.
+// The capturer is moved onto its owner thread and is `Send` not `Sync`, so the
+// single-threaded immediate context is never used concurrently.
 unsafe impl Send for SyntheticNv12Capturer {}
 
 impl SyntheticNv12Capturer {
@@ -47,8 +42,7 @@ impl SyntheticNv12Capturer {
         // NV12 is 4:2:0 — both dimensions must be even (the chroma plane is width/2 × height/2).
         let width = (width & !1).max(2);
         let height = (height & !1).max(2);
-        // SAFETY: a self-contained builder owning every handle it creates; each COM call is checked
-        // and the returned owners drop with their wrappers.
+        // SAFETY: every COM handle created here is owned by `Self` or dropped on `?`.
         unsafe {
             let adapter =
                 resolve_render_adapter().context("resolve render adapter for NV12 source")?;
@@ -98,7 +92,7 @@ impl Capturer for SyntheticNv12Capturer {
                 .context("Map(NV12 staging)")?;
             let pitch = map.RowPitch as usize;
             let base = map.pData as *mut u8;
-            // A diagonal luma ramp that shifts 4 codes/frame — strong, deterministic motion.
+            // Diagonal luma ramp, +4 codes/frame — deterministic motion the encoder must see.
             let shift = (self.frame_idx as u32).wrapping_mul(4);
             for y in 0..self.height {
                 let row = base.add(y as usize * pitch);
@@ -106,8 +100,7 @@ impl Capturer for SyntheticNv12Capturer {
                     *row.add(x as usize) = x.wrapping_add(y).wrapping_add(shift) as u8;
                 }
             }
-            // UV plane (neutral gray = 128) at offset RowPitch*H: H/2 rows, `width` bytes each
-            // (width/2 interleaved Cb,Cr pairs).
+            // Neutral chroma (128) at RowPitch*H: H/2 rows, `width` bytes (interleaved Cb,Cr).
             let uv = base.add(pitch * self.height as usize);
             for r in 0..(self.height / 2) {
                 let row = uv.add(r as usize * pitch);
@@ -135,15 +128,10 @@ impl Capturer for SyntheticNv12Capturer {
     }
 }
 
-/// Resolve the same render adapter the encoder will pick (`PUNKTFUNK_RENDER_ADAPTER` / preference /
-/// max-VRAM LUID), falling back to adapter 0.
-///
-/// Safe: it takes no arguments, so there is nothing a caller could get wrong — it creates the
-/// factory itself and returns an owned adapter. The `# Safety` section it used to carry ("calls
-/// DXGI enumeration; returns owned COM objects") described the body, which is not a contract.
+/// Same render adapter the encoder picks (`PUNKTFUNK_RENDER_ADAPTER` / preference /
+/// max-VRAM LUID), else adapter 0.
 fn resolve_render_adapter() -> Result<IDXGIAdapter1> {
-    // SAFETY: three `?`/`Ok`-checked DXGI enumeration calls over owned locals — the factory is
-    // created here and the adapters it returns own their own COM references. No raw pointers.
+    // SAFETY: DXGI enumeration over owned locals; factory and adapters own their COM refs.
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
         if let Some(luid) = pf_gpu::resolve_render_adapter_luid() {
@@ -155,11 +143,6 @@ fn resolve_render_adapter() -> Result<IDXGIAdapter1> {
     }
 }
 
-/// Create an NV12 `Texture2D` with the given usage/CPU-access/bind flags.
-///
-/// Safe: its old `# Safety` asked for "a live D3D11 device", which `&ID3D11Device` — a borrowed,
-/// reference-counted COM wrapper — already guarantees; the rest ("the returned texture is owned by
-/// the caller") is an ownership note, not a soundness obligation. Every flag is a plain scalar.
 fn create_nv12(
     device: &ID3D11Device,
     width: u32,

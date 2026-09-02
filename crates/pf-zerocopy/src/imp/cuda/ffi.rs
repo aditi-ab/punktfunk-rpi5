@@ -1,8 +1,12 @@
-//! Raw CUDA Driver API FFI (plan §W4, carved out of the zero-copy CUDA facade): the opaque handle
-//! typedefs + struct/const definitions, the `dlopen`'d `libcuda.so.1` symbol table ([`CudaApi`] +
-//! [`cuda_api`]), the `unsafe` `cuXxx` wrappers, and the `ck` result check. No higher-level state —
-//! the shared `CUcontext`, device buffers, GL/dmabuf interop, and cursor blend all live in [`super`]
-//! and drive this layer.
+//! CUDA Driver API FFI: opaque handles, `cuda.h` structs, the `dlopen`'d `libcuda.so.1`
+//! table ([`CudaApi`] / [`cuda_api`]), `unsafe` `cuXxx` wrappers, and [`ck`].
+//!
+//! No higher-level state. Shared `CUcontext`, device buffers, GL/dmabuf interop, and
+//! cursor blend live in [`super`] and drive this layer.
+//!
+//! Flattened struct layout is pinned by the `const` asserts below. A transcription slip
+//! compiles and does not crash — the driver reads a pitch, size, or fd from the wrong
+//! bytes. `Library` is leaked so the fn pointers stay process-lifetime.
 
 #![allow(non_camel_case_types, non_snake_case)]
 
@@ -24,16 +28,14 @@ pub type CUexternalSemaphore = *mut c_void; // opaque CUextSemaphore_st*
 pub const CU_MEMORYTYPE_DEVICE: c_uint = 2;
 pub const CU_MEMORYTYPE_ARRAY: c_uint = 3;
 
-/// `CUctx_flags` (cuda.h): block the CPU on an OS primitive while waiting for the GPU instead of
-/// busy-spinning. On this shared box (compositor + send thread on the same cores) spinning a core
-/// to detect copy completion steals CPU from the very threads we want scheduled; BLOCKING_SYNC
-/// frees it. Default (`CU_CTX_SCHED_AUTO=0`) heuristically picks SPIN vs YIELD by core count.
+/// `CUctx_flags` (cuda.h). Spin would steal compositor/send cores while waiting on a copy.
+/// AUTO (0) picks SPIN vs YIELD by core count; we force BLOCKING_SYNC.
 pub(crate) const CU_CTX_SCHED_BLOCKING_SYNC: c_uint = 0x04;
 
 /// `cuStreamCreateWithPriority` flag: don't implicitly synchronize with the legacy NULL stream.
 pub(crate) const CU_STREAM_NON_BLOCKING: c_uint = 0x01;
 
-/// `CUDA_MEMCPY2D` (cuda.h, `_v2` ABI). Field order is load-bearing.
+/// `CUDA_MEMCPY2D` (`cuda.h` `_v2` ABI). Field order is load-bearing; the driver reads by offset.
 #[repr(C)]
 #[derive(Default)]
 pub struct CUDA_MEMCPY2D {
@@ -55,13 +57,12 @@ pub struct CUDA_MEMCPY2D {
     pub Height: usize,
 }
 
-/// `CUDA_EXTERNAL_MEMORY_HANDLE_DESC` (cuda.h, 64-bit layout). `handle` is a union whose
-/// largest member is the win32 two-pointer struct (16 bytes, align 8); for the OPAQUE_FD type
-/// only the first 4 bytes (the `int fd`) are read.
+/// `CUDA_EXTERNAL_MEMORY_HANDLE_DESC` (`cuda.h`, 64-bit). `handle` is a union sized to the
+/// win32 two-pointer struct (16 bytes, align 8); OPAQUE_FD reads only the first 4 (`int fd`).
 #[repr(C)]
 #[derive(Default)]
 pub struct CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
-    pub type_: c_uint, // CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD = 1
+    pub type_: c_uint,
     pub(crate) _pad: u32,
     pub handle: [u64; 2], // union { int fd; {void*,void*} win32; void* nvSciBufObject }
     pub size: u64,
@@ -70,7 +71,6 @@ pub struct CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
     pub(crate) _pad2: u32,
 }
 
-/// `CUDA_EXTERNAL_MEMORY_BUFFER_DESC` (cuda.h, 64-bit layout).
 #[repr(C)]
 #[derive(Default)]
 pub struct CUDA_EXTERNAL_MEMORY_BUFFER_DESC {
@@ -83,14 +83,12 @@ pub struct CUDA_EXTERNAL_MEMORY_BUFFER_DESC {
 
 pub const CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: c_uint = 1;
 
-/// `CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC` (cuda.h, 64-bit layout). Same union-flattening as the
-/// memory desc above: `handle` is a union whose largest member is the win32 two-pointer struct
-/// (16 bytes, align 8); for the fd-carrying types only the first 4 bytes (the `int fd`) are read.
-/// No `size` field — a semaphore has none.
+/// `CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC` (`cuda.h`, 64-bit). Same union flatten as the
+/// memory desc; fd types read the first 4 bytes. No `size` — a semaphore has none.
 #[repr(C)]
 #[derive(Default)]
 pub struct CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC {
-    pub type_: c_uint, // CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD = 9
+    pub type_: c_uint,
     pub(crate) _pad: u32,
     pub handle: [u64; 2], // union { int fd; {void*,void*} win32; const void* nvSciSyncObj }
     pub flags: c_uint,
@@ -98,14 +96,12 @@ pub struct CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC {
     pub(crate) _pad2: u32,
 }
 
-/// `CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS` (cuda.h, 64-bit layout), flattened: `params` nests
-/// `fence.value` (the only member we set — the timeline value to signal), the `nvSciSync` union,
-/// `keyedMutex.key`, then 12 reserved words; `flags` + 16 reserved words follow. 144 bytes total
-/// (layout-asserted in `super`'s tests).
+/// `CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS` (`cuda.h`, 64-bit), flattened. Only
+/// `params.fence.value` is set; `flags` sits at offset 72. 144 bytes.
 #[repr(C)]
 #[derive(Default)]
 pub struct CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS {
-    pub value: u64, // params.fence.value — the timeline value this signal sets
+    pub value: u64, // params.fence.value — timeline value this signal sets
     pub(crate) _nv_sci_sync: u64,
     pub(crate) _keyed_mutex_key: u64,
     pub(crate) _params_reserved: [c_uint; 12],
@@ -114,9 +110,9 @@ pub struct CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS {
     pub(crate) _pad: u32,
 }
 
-/// `CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS` (cuda.h, 64-bit layout), flattened like the signal
-/// params. The C `keyedMutex` member is `{ u64 key; u32 timeoutMs; }` — size 16 with tail
-/// padding, hence the explicit pad word before the 10 reserved words. 144 bytes total.
+/// `CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS` (`cuda.h`, 64-bit), flattened like the signal
+/// params. C `keyedMutex` is `{ u64 key; u32 timeoutMs; }` = 16 with tail padding, hence
+/// the explicit pad before the 10 reserved words. 144 bytes.
 #[repr(C)]
 #[derive(Default)]
 pub struct CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS {
@@ -131,33 +127,23 @@ pub struct CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS {
     pub(crate) _pad: u32,
 }
 
-/// `CUexternalSemaphoreHandleType` (cuda.h): a Vulkan **timeline** semaphore exported as an
-/// OPAQUE_FD (`vkGetSemaphoreFdKHR`). Needs driver ≥ 460 (CUDA 11.2) — far below the NVENC 12.1
-/// floor this backend already requires, so import failure means "driver refused", not "too old
-/// to try".
+/// `CUexternalSemaphoreHandleType` (`cuda.h`): Vulkan **timeline** semaphore exported as
+/// OPAQUE_FD (`vkGetSemaphoreFdKHR`). Not a binary semaphore.
 pub const CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD: c_uint = 9;
 
-// LAYOUT GUARDS for the six hand-flattened cuda.h structs above.
-//
-// These are filled here and handed straight to the CUDA driver, which reads them by offset. A
-// transcription slip does not fail to compile and does not reliably crash — it makes the driver read
-// a pitch, a size or an fd from the wrong bytes. Three of the six were already asserted, but only in
-// `#[cfg(test)]`, so the check ran when someone ran the tests and never in a release build; these
-// are `const`, so they hold on every compilation and cannot be skipped. The other three
-// (`CUDA_MEMCPY2D` and the two external-memory descs) had no check at all until now, and
-// `CUDA_MEMCPY2D` is the one used on every zero-copy frame.
+// Driver reads these by offset. A transcription slip compiles and does not crash;
+// it copies the wrong pitch/size/fd. `const` so a release build cannot skip them.
 const _: () = {
     use std::mem::{offset_of, size_of};
 
-    // 16 fields, all pointer-sized or padded to it: 16 * 8 = 128. The two `c_uint` memory-type
-    // fields are each followed by padding to align the pointer after them, which is the part a
-    // hand-transcription gets wrong.
+    // 16 pointer-sized slots = 128. Each `c_uint` memory-type is padded to align the
+    // pointer after it — the part a hand transcription gets wrong.
     assert!(size_of::<CUDA_MEMCPY2D>() == 128);
     assert!(offset_of!(CUDA_MEMCPY2D, srcMemoryType) == 16);
-    assert!(offset_of!(CUDA_MEMCPY2D, srcHost) == 24); // padded past srcMemoryType
+    assert!(offset_of!(CUDA_MEMCPY2D, srcHost) == 24);
     assert!(offset_of!(CUDA_MEMCPY2D, srcPitch) == 48);
     assert!(offset_of!(CUDA_MEMCPY2D, dstMemoryType) == 72);
-    assert!(offset_of!(CUDA_MEMCPY2D, dstHost) == 80); // padded past dstMemoryType
+    assert!(offset_of!(CUDA_MEMCPY2D, dstHost) == 80);
     assert!(offset_of!(CUDA_MEMCPY2D, dstPitch) == 104);
     assert!(offset_of!(CUDA_MEMCPY2D, WidthInBytes) == 112);
     assert!(offset_of!(CUDA_MEMCPY2D, Height) == 120);
@@ -183,17 +169,15 @@ const _: () = {
     assert!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS, value) == 0);
     assert!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS, flags) == 72);
 
-    // As signal, but `keyedMutex` is `{u64 key; u32 timeoutMs;}` = 16 with tail padding, hence the
-    // explicit pad word before the 10 reserved words. Still 72 to `flags` → 144.
+    // As signal, but `keyedMutex` is `{u64 key; u32 timeoutMs;}` = 16 with tail padding
+    // (explicit pad before the 10 reserved words). Still 72 to `flags` → 144.
     assert!(size_of::<CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS>() == 144);
     assert!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS, value) == 0);
     assert!(offset_of!(CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS, flags) == 72);
 };
 
-/// `CUipcMemHandle` (cuda.h): an opaque 64-byte struct identifying a device allocation across
-/// processes. Produced by `cuIpcGetMemHandle` in the exporting process, consumed by
-/// `cuIpcOpenMemHandle` in the importer — passed **by value**, matching the C
-/// `struct { char reserved[64]; }`. Plain bytes — safe to ship over a socket.
+/// `CUipcMemHandle` (`cuda.h`): 64-byte opaque id for a device allocation across processes.
+/// Passed **by value** (`struct { char reserved[64]; }`). Plain bytes; ship over a socket.
 pub const CU_IPC_HANDLE_SIZE: usize = 64;
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -201,18 +185,13 @@ pub struct CUipcMemHandle {
     pub reserved: [u8; CU_IPC_HANDLE_SIZE],
 }
 
-/// `CUipcMem_flags`: lazily enable peer access on open (the documented flag for
-/// `cuIpcOpenMemHandle`; a no-op for a same-device open, which is our only case).
+/// `CUipcMem_flags`: lazy peer access on `cuIpcOpenMemHandle`. No-op for same-device open
+/// (our only case).
 pub(crate) const CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS: c_uint = 0x1;
 
-/// CUDA Driver API entry points, resolved at runtime from `libcuda.so.1` via `dlopen` rather than
-/// a link-time `#[link(name = "cuda")]`. This is what lets ONE host binary run on NVIDIA
-/// (zero-copy via CUDA → NVENC) *and* on AMD/Intel (VAAPI, where the NVIDIA driver — and thus
-/// `libcuda` — is absent): with a hard link the loader would refuse to start the binary at all.
-/// Every `cu*` call below goes through a same-named wrapper fn that forwards to this table; when
-/// the driver isn't present the table is `None` and the wrappers return a non-zero `CUresult`, so
-/// `context()` fails cleanly and the capturer falls back to the CPU path. The `cuda_api()` loader
-/// is memoised; the library handle is intentionally leaked (process-lifetime, like the context).
+/// Runtime Driver API table from `dlopen("libcuda.so.1")`, not `#[link(name = "cuda")]`.
+/// A hard link would refuse to start the binary where `libcuda` is absent. `cuda_api()`
+/// leaks the `Library` so the fn pointers stay process-lifetime.
 pub(crate) struct CudaApi {
     cuInit: unsafe extern "C" fn(c_uint) -> CUresult,
     cuDeviceGet: unsafe extern "C" fn(*mut CUdevice, c_int) -> CUresult,
@@ -266,29 +245,25 @@ pub(crate) struct CudaApi {
     cuIpcOpenMemHandle: unsafe extern "C" fn(*mut CUdeviceptr, CUipcMemHandle, c_uint) -> CUresult,
     cuIpcCloseMemHandle: unsafe extern "C" fn(CUdeviceptr) -> CUresult,
 }
-// `Send`/`Sync` need no `unsafe impl`: every field is a bare fn pointer, which is already both.
-// The addresses stay valid because `cuda_api` `forget`s the `Library`, so `libcuda` is never
-// unloaded.
+// `Send`/`Sync` need no `unsafe impl`: every field is a bare fn pointer, already both.
+// Addresses stay valid because `cuda_api` `forget`s the `Library`.
 
-/// `CUresult` returned by the wrappers when `libcuda` isn't loaded (no NVIDIA driver). Non-zero so
-/// the existing `ck()`/`!= 0` checks treat it as an ordinary driver error; distinct from any real
-/// `CUDA_ERROR_*` (all < 1000). Never produced by the actual driver.
+/// Wrapper `CUresult` when `libcuda` is not loaded. Non-zero so `ck()`/`!= 0` treat it as
+/// a driver error; distinct from real `CUDA_ERROR_*` (all < 1000). The driver never returns it.
 pub(crate) const CU_ERROR_NOT_LOADED: CUresult = 999;
 
 pub(crate) static CUDA_API: OnceLock<Option<CudaApi>> = OnceLock::new();
 
-/// Resolve `libcuda.so.1` and its symbols once. `None` when the NVIDIA driver isn't installed
-/// (the expected case on AMD/Intel hosts) — logged at debug, not an error.
+/// Resolve `libcuda.so.1` once. `None` when the NVIDIA driver is absent (expected on
+/// AMD/Intel) — debug, not an error.
 pub(crate) fn cuda_api() -> Option<&'static CudaApi> {
     CUDA_API
-        // SAFETY: `Library::new` runs `libcuda.so.1`'s initializers — it is the trusted NVIDIA
-        // driver library, so loading has no unexpected effects; `?`/`None` handle its absence.
-        // Each `lib.get::<T>(name)` asserts the symbol's real ABI equals `T`: every NUL-terminated
-        // name is a documented CUDA Driver API entry point and `T` is the exact
-        // `unsafe extern "C" fn(..)` signature from cuda.h/cudaGL.h (`_v2` for ctx/mem ops). Each
-        // `Symbol` only borrows `lib` until the end of the struct-literal statement; we deref-copy
-        // the raw fn-pointer out first, then `forget(lib)` leaks the mapping so those addresses
-        // stay valid for the whole process. Runs once under the `OnceLock` init — no aliasing.
+        // SAFETY: `Library::new` runs `libcuda.so.1` initializers (trusted NVIDIA driver);
+        // absence is `None`. Each `get::<T>(name)` requires the symbol ABI to match `T`:
+        // names are documented Driver API entry points and `T` is the cuda.h/`cudaGL.h`
+        // `unsafe extern "C" fn` (`_v2` for ctx/mem). Deref-copy the fn pointer out of
+        // `Symbol`, then `forget(lib)` so the mapping outlives the borrow. `OnceLock`
+        // runs this once — no aliasing.
         .get_or_init(|| unsafe {
             let lib = libloading::Library::new("libcuda.so.1")
                 .or_else(|_| libloading::Library::new("libcuda.so"))
@@ -296,9 +271,6 @@ pub(crate) fn cuda_api() -> Option<&'static CudaApi> {
                     tracing::debug!(error = %e, "libcuda not loadable — CUDA zero-copy unavailable (expected on AMD/Intel)");
                 })
                 .ok()?;
-            // Resolve all symbols; the field types drive `get`'s inference. `lib` is leaked after
-            // construction so the fn pointers stay valid for the process lifetime (the temporary
-            // `Symbol` borrows end with the struct-literal statement, before the forget).
             let api = CudaApi {
                 cuInit: *lib.get(b"cuInit\0").ok()?,
                 cuDeviceGet: *lib.get(b"cuDeviceGet\0").ok()?,
@@ -323,8 +295,6 @@ pub(crate) fn cuda_api() -> Option<&'static CudaApi> {
                     .get(b"cuExternalMemoryGetMappedBuffer\0")
                     .ok()?,
                 cuDestroyExternalMemory: *lib.get(b"cuDestroyExternalMemory\0").ok()?,
-                // External-semaphore interop (the stream-ordered cursor blend): all four are
-                // CUDA 10.0 entry points, far older than anything else this table requires.
                 cuImportExternalSemaphore: *lib.get(b"cuImportExternalSemaphore\0").ok()?,
                 cuDestroyExternalSemaphore: *lib.get(b"cuDestroyExternalSemaphore\0").ok()?,
                 cuSignalExternalSemaphoresAsync: *lib
@@ -332,24 +302,21 @@ pub(crate) fn cuda_api() -> Option<&'static CudaApi> {
                     .ok()?,
                 cuWaitExternalSemaphoresAsync: *lib.get(b"cuWaitExternalSemaphoresAsync\0").ok()?,
                 cuIpcGetMemHandle: *lib.get(b"cuIpcGetMemHandle\0").ok()?,
-                // CUDA 11 renamed the entry point (per-thread-stream ABI split); every modern
-                // driver exports `_v2`, but accept the unsuffixed one too (same signature).
+                // CUDA 11 split the ABI; try `_v2` first, then the unsuffixed name (same signature).
                 cuIpcOpenMemHandle: *lib
                     .get(b"cuIpcOpenMemHandle_v2\0")
                     .or_else(|_| lib.get(b"cuIpcOpenMemHandle\0"))
                     .ok()?,
                 cuIpcCloseMemHandle: *lib.get(b"cuIpcCloseMemHandle\0").ok()?,
             };
-            std::mem::forget(lib); // keep libcuda mapped for the fn pointers' lifetime (process)
+            std::mem::forget(lib); // leak the mapping so the fn pointers stay process-lifetime
             Some(api)
         })
         .as_ref()
 }
 
-// Same-named wrappers so the call sites below are unchanged. Each forwards through the dlopen'd
-// table, or returns `CU_ERROR_NOT_LOADED` when the driver is absent (AMD/Intel) — which the
-// `CUresult` checks already handle. Only `context()` is reachable before the driver is confirmed
-// present; every other entry runs after `context()` succeeded, so its wrapper always hits `Some`.
+// Forwards through the dlopen'd table; `CU_ERROR_NOT_LOADED` when the driver is absent.
+// Only `context()` runs before the table is confirmed; later wrappers always hit `Some`.
 pub(crate) unsafe fn cuInit(flags: c_uint) -> CUresult {
     match cuda_api() {
         // SAFETY: forwards this unsafe wrapper's arguments to the live dlopen'd entry point (the

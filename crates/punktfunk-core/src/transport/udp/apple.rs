@@ -1,20 +1,15 @@
-//! Apple/BSD batched UDP receive: Darwin `recvmsg_x`, `recv`-loop fallback on other BSDs.
-//! The platform body of [`super::UdpTransport`]'s `recv_batch` override.
+//! Apple/BSD batched UDP receive: Darwin `recvmsg_x`, `recv`-loop fallback on
+//! other BSDs. Platform body of [`super::UdpTransport`]'s `recv_batch`.
 
-// Crate-wide deny(unsafe_code) carve-out (lib.rs): platform syscall-batching glue — `recvmsg_x`
-// fills caller-owned buffers; nothing here interprets network bytes. Proofs at each site.
+// Crate-wide deny(unsafe_code) carve-out (lib.rs): platform syscall-batching glue —
+// `recvmsg_x` fills caller-owned buffers; nothing here interprets network bytes. Proofs at each site.
 #![allow(unsafe_code)]
 
 use super::{is_transient_io, UdpTransport};
 
-/// Apple (macOS/iOS) batched-receive enable state. Darwin has no `recvmmsg(2)`, so without this our
-/// macOS client does one `recv` syscall per packet — at a few hundred Mbps that's ~40-90k syscalls/s
-/// on one core, and when the recv loop can't drain fast enough the kernel socket buffer backs up and
-/// drops, which the client sees as a sustained stream stalling/freezing around 300-400 Mbps.
-/// `recvmsg_x(2)` is the batched equivalent (the recv counterpart of Linux `recvmmsg`), cutting the
-/// syscall rate ~30x. **Default ON** (the multi-Gbps Mac path); the `swift test` loopback on the
-/// Apple CI runner exercises it, and it auto-falls-back to the scalar loop if the syscall ever errors
-/// unexpectedly. Set `PUNKTFUNK_RECVMSG_X=0` to force the scalar fallback.
+/// Darwin batched-receive gate. No `recvmmsg(2)` here, so without `recvmsg_x`
+/// the client is one `recv` per packet. **Default ON**; a syscall error latches
+/// the scalar loop. `PUNKTFUNK_RECVMSG_X=0` forces the fallback.
 #[cfg(target_vendor = "apple")]
 mod recvx {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -25,7 +20,6 @@ mod recvx {
             1 => true,
             2 => false,
             _ => {
-                // On unless explicitly disabled with PUNKTFUNK_RECVMSG_X=0.
                 let on = std::env::var("PUNKTFUNK_RECVMSG_X")
                     .map(|v| v != "0")
                     .unwrap_or(true);
@@ -39,7 +33,7 @@ mod recvx {
     }
 }
 
-/// `struct msghdr_x` from Darwin `<sys/socket.h>` (the batched-I/O variant — not in the `libc` crate).
+/// Darwin `struct msghdr_x` (`<sys/socket.h>`); `libc` does not expose it.
 #[cfg(target_vendor = "apple")]
 #[repr(C)]
 struct MsghdrX {
@@ -53,11 +47,9 @@ struct MsghdrX {
     msg_datalen: libc::size_t,
 }
 
-// A hand-written mirror of Darwin's `struct msghdr_x` (sys/socket.h), which `libc` does not expose.
-// `sendmsg_x`/`recvmsg_x` read and write through it, so a wrong offset would hand the kernel the
-// wrong pointer or length — the two fields it uses to decide how much memory to touch. The layout is
-// not obvious by inspection because the 32-bit fields force padding before the pointers that follow
-// them, which is exactly the kind of thing an edit gets wrong silently.
+// Hand-written Darwin `msghdr_x` (`libc` has none). A wrong offset hands the
+// kernel a bad pointer or length. 32-bit fields pad before the following
+// pointers — easy to get wrong silently.
 const _: () = {
     use std::mem::{offset_of, size_of};
     assert!(size_of::<MsghdrX>() == 56);
@@ -73,8 +65,8 @@ const _: () = {
 
 #[cfg(target_vendor = "apple")]
 unsafe extern "C" {
-    /// Darwin batched receive: up to `cnt` datagrams in one syscall; returns the count received and
-    /// sets each `msg_datalen` to its byte length. Present in libSystem on all macOS/iOS.
+    /// Darwin batched receive: up to `cnt` datagrams in one syscall; returns the
+    /// count and sets each `msg_datalen`. In libSystem on every macOS/iOS.
     fn recvmsg_x(
         s: libc::c_int,
         msgp: *mut MsghdrX,
@@ -83,10 +75,10 @@ unsafe extern "C" {
     ) -> libc::ssize_t;
 }
 
-/// Apple batched receive via `recvmsg_x` — drains up to `out.len()` datagrams in one syscall into
-/// the caller's reused buffers (the recv counterpart of Linux `recvmmsg`, which Darwin lacks).
-/// SAFETY: each `MsghdrX` holds a raw pointer into `iovs`, which holds raw pointers into `out`'s
-/// buffers; both `iovs` and `msgs` stay alive and unmoved through the syscall.
+/// Batched receive via `recvmsg_x` into the caller's reused buffers.
+/// SAFETY: each `MsghdrX` holds a raw pointer into `iovs`, which holds raw
+/// pointers into `out`'s buffers; both `iovs` and `msgs` stay alive and
+/// unmoved through the syscall.
 #[cfg(target_vendor = "apple")]
 fn recv_batch_x(
     t: &UdpTransport,
@@ -145,8 +137,8 @@ pub(super) fn recv_batch(
     out: &mut [Vec<u8>],
     lens: &mut [usize],
 ) -> std::io::Result<usize> {
-    // Apple: prefer the batched `recvmsg_x` syscall when enabled; a surprise error disables it
-    // and falls through to the always-correct scalar loop below.
+    // Prefer `recvmsg_x` when enabled; a surprise error latches it off and
+    // falls through to the scalar loop.
     #[cfg(target_vendor = "apple")]
     if recvx::active() {
         match recv_batch_x(t, out, lens) {
@@ -173,10 +165,10 @@ pub(super) fn recv_batch(
         if r < 0 {
             let err = std::io::Error::last_os_error();
             if is_transient_io(&err) {
-                break; // socket drained, or a stale connected-socket ICMP — no data this poll
+                break; // drained or stale ICMP — no data this poll
             }
             if got > 0 {
-                break; // report what we have; surface the error on the next empty poll
+                break; // keep what we have; surface the error on the next empty poll
             }
             return Err(err);
         }

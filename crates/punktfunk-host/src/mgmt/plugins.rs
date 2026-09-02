@@ -1,9 +1,8 @@
 //! In-memory, lease-based directory of running plugins and their loopback UI surfaces.
 //!
 //! Plugins register a port, per-boot secret, title, and icon. The console obtains credentials
-//! server-side and proxies only to `127.0.0.1`; registrations are never persisted or health-
-//! checked and expire lazily after [`LEASE_TTL`]. Mutation routes require bearer authentication
-//! from loopback.
+//! server-side and proxies only to `127.0.0.1`. Registrations are never persisted or health-
+//! checked and expire lazily after [`LEASE_TTL`].
 //!
 //! The shared `plugin-token` authenticates the runner, not an individual plugin. Any holder can
 //! replace an id's registration, and [`crate::library::ask_plugin_launch`] treats that registration
@@ -16,76 +15,54 @@ use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-/// How long a registration stays live after its last renewal. The SDK helper renews every 30 s, so
-/// this tolerates two missed ticks before a plugin drops out of the listing.
+/// 90 s ≈ two missed 30 s SDK renewals before a plugin drops out of the listing.
 const LEASE_TTL: Duration = Duration::from_secs(90);
 
-/// Lines accepted per `POST /plugins/logs`. The runner batches on a short timer, so a batch this
-/// size means a plugin is logging faster than the ring can usefully hold — the shipper drops its
-/// own backlog (and says so in a line of its own) rather than letting one chatty plugin evict the
-/// whole ring in a single request.
+/// The runner batches on a timer; past this the shipper drops its own backlog rather than let
+/// one plugin fill the ring in a single request.
 const MAX_LOG_BATCH: usize = 256;
 
-// ---------------------------------------------------------------- wire shapes
-
-/// A plugin's UI surface as it registers it. Carries the secret — this shape is only ever a request
-/// body, never a response ([`PluginUiPublic`] is the secret-free view).
+/// Request body only — carries the secret. [`PluginUiPublic`] is the response view.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct PluginUi {
-    /// The **loopback** port the plugin serves its UI on. The host and console only ever dial
-    /// `127.0.0.1:<port>`; a registration can never carry a hostname.
+    /// Loopback only — the host dials `127.0.0.1:<port>`; a registration cannot carry a hostname.
     pub port: u16,
-    /// Per-boot shared secret the console proxy must present (as `Authorization: Bearer`) on every
-    /// request to the plugin's UI server. Rotated whenever the plugin restarts.
+    /// Per-boot; the console proxy presents it as `Authorization: Bearer`. Rotated on plugin restart.
     pub secret: String,
-    /// Optional lucide icon name for the console nav entry (`^[a-z0-9-]{1,48}$`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
 }
 
-/// Register/renew body for `PUT /plugins/{id}`.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct PluginRegistration {
-    /// Human-readable title for the console nav entry (1–64 chars; control chars stripped).
     pub title: String,
-    /// Optional plugin version, purely informational (≤32 chars).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// Present iff the plugin serves a UI surface. A registration with no `ui` is a liveness/phone-book
-    /// entry only (e.g. a future runner-management listing) and grows no nav entry.
+    /// Absent `ui` is a live listing with no nav entry — not an error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<PluginUi>,
-    /// What KIND of plugin this is (`^[a-z][a-z0-9-]{0,31}$`), top-level rather than under `ui`
-    /// because it describes the plugin, not its surface. The console knows one value today —
-    /// `library` — which it filters **out of the nav**: six installed scanner plugins would otherwise
-    /// flood the sidebar, and their real entry point is the Game sources surface (design D5). A
-    /// library plugin that genuinely wants its own page (rom-manager, which is much more than a
-    /// scanner) simply omits the category.
+    /// Plugin kind, not a UI field. Console hides `library` from the nav (those plugins already have
+    /// Game sources); omit the field to keep a nav page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
 }
 
-/// One log line produced by the runner or a plugin inside it (`POST /plugins/logs`).
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct PluginLogLine {
-    /// When the line was produced, unix milliseconds. Kept verbatim — see
-    /// [`crate::log_capture::LogRing::push_remote`].
+    /// Unix ms, kept verbatim — see [`crate::log_capture::LogRing::push_remote`].
     pub ts_ms: u64,
-    /// `ERROR` | `WARN` | `INFO` | `DEBUG` | `TRACE`. Anything else is coerced to `INFO`.
+    /// Normalized by [`crate::log_capture::LogRing::push_remote`]; unknown becomes INFO.
     pub level: String,
-    /// Which unit emitted it — a plugin's `definePlugin` name, a package name, or `runner`.
-    /// Surfaced in the console's target column as `plugin:<source>`.
     pub source: String,
     pub msg: String,
 }
 
-/// A batch of runner log lines.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct PluginLogBatch {
     pub entries: Vec<PluginLogLine>,
 }
 
-/// The secret-free view of a plugin's UI surface — what [`list_plugins`] returns to the browser.
+/// Secret-free UI view for the listing. The secret never goes here.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct PluginUiPublic {
     pub port: u16,
@@ -93,8 +70,7 @@ pub(crate) struct PluginUiPublic {
     pub icon: Option<String>,
 }
 
-/// One entry in `GET /plugins`. **Never carries the secret** — the browser learns a plugin exists
-/// and has a UI, nothing that lets it reach the plugin directly (it goes through the console proxy).
+/// Listing row. Never carries the secret — the browser reaches the UI only through the console proxy.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct PluginSummary {
     pub id: String,
@@ -103,22 +79,18 @@ pub(crate) struct PluginSummary {
     pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui: Option<PluginUiPublic>,
-    /// The plugin's kind — see [`PluginRegistration::category`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
 }
 
-/// `GET /plugins/{id}/ui-credential` — the console proxy's server-side lookup (bearer + loopback).
-/// This is the only endpoint that returns a secret; the console BFF denylists it from the browser.
+/// The only shape that returns a secret. The console BFF denylists this lookup from the browser.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct UiCredential {
     pub port: u16,
     pub secret: String,
 }
 
-// ---------------------------------------------------------------- registry core
-
-/// The stored UI surface (internal — parsed + validated, no wire derives).
+/// Internal, validated. No wire derives — must not leak the secret.
 #[derive(Clone, PartialEq)]
 struct StoredUi {
     port: u16,
@@ -126,7 +98,7 @@ struct StoredUi {
     icon: Option<String>,
 }
 
-/// One live registration. `expires_at` is a **monotonic** [`Instant`] (immune to wall-clock jumps).
+/// `expires_at` is monotonic [`Instant`] — a wall-clock jump must not expire a live lease.
 struct Stored {
     title: String,
     version: Option<String>,
@@ -136,9 +108,7 @@ struct Stored {
 }
 
 impl Stored {
-    /// Do the operator-visible fields match (ignoring the lease clock)? A pure lease renewal leaves
-    /// these unchanged and emits no event; a restart (new secret) or a re-scan (new title/icon/
-    /// category) does.
+    /// Operator-visible fields only. A pure lease renewal matches and emits no event.
     fn public_eq(&self, v: &Valid) -> bool {
         self.title == v.title
             && self.version == v.version
@@ -147,12 +117,10 @@ impl Stored {
     }
 }
 
-/// The process-wide plugin registry.
 pub(crate) struct PluginRegistry {
     inner: RwLock<HashMap<String, Stored>>,
 }
 
-/// A validated registration ready to store (title trimmed, ui fields checked).
 struct Valid {
     title: String,
     version: Option<String>,
@@ -167,14 +135,13 @@ impl PluginRegistry {
         }
     }
 
-    /// Insert or renew `id`. Returns `true` when an operator-visible field changed (new plugin,
-    /// restart, or re-scan) — the signal the caller emits `plugins.changed` on. A pure renewal
-    /// returns `false`.
+    /// `true` iff an operator-visible field changed (the caller emits `plugins.changed`). A pure
+    /// renewal is `false`.
     fn upsert(&self, id: &str, v: Valid) -> bool {
         let expires_at = Instant::now() + LEASE_TTL;
         let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let changed = match map.get(id) {
-            // An *expired* prior entry counts as a change (it had stopped listing).
+            // An expired prior entry counts as a change — it had stopped listing.
             Some(prev) => !prev.is_live() || !prev.public_eq(&v),
             None => true,
         };
@@ -191,9 +158,8 @@ impl PluginRegistry {
         changed
     }
 
-    /// The current listing (sorted by title, then id), plus the ids of entries that had expired and
-    /// were pruned by this call — the caller emits `plugins.changed` for those. Prunes under the
-    /// write lock so a stale entry is reaped exactly once.
+    /// Also returns ids pruned this call (caller emits `plugins.changed`). Write lock so a stale
+    /// entry is reaped exactly once.
     fn snapshot(&self) -> (Vec<PluginSummary>, Vec<String>) {
         let now = Instant::now();
         let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
@@ -223,8 +189,7 @@ impl PluginRegistry {
         (live, expired)
     }
 
-    /// The `{port, secret}` for a live plugin's UI, or `None` if unknown/expired/UI-less. Does not
-    /// prune (a read path) — a stale entry is reaped by the next [`snapshot`](Self::snapshot).
+    /// Does not prune — a stale entry is reaped by the next [`snapshot`](Self::snapshot).
     fn credential(&self, id: &str) -> Option<UiCredential> {
         let map = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let s = map.get(id)?;
@@ -238,7 +203,7 @@ impl PluginRegistry {
         })
     }
 
-    /// The ids of live registrations, without pruning or announcing anything.
+    /// Read-only; does not prune or emit.
     fn live_ids(&self) -> Vec<String> {
         let map = self.inner.read().unwrap_or_else(|e| e.into_inner());
         map.iter()
@@ -247,8 +212,7 @@ impl PluginRegistry {
             .collect()
     }
 
-    /// Remove `id`. Returns `true` if a **live** entry existed (a clean deregister); removing an
-    /// already-expired or unknown id returns `false` (nothing to announce).
+    /// `true` only if a live entry existed. Expired or unknown is silent.
     fn remove(&self, id: &str) -> bool {
         let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
         map.remove(id).is_some_and(|s| s.is_live())
@@ -261,37 +225,26 @@ impl Stored {
     }
 }
 
-/// The process-wide registry singleton (the [`crate::events::bus`] shape).
+/// Process-wide singleton, same shape as [`crate::events::bus`].
 pub(crate) fn registry() -> &'static PluginRegistry {
     static REG: OnceLock<PluginRegistry> = OnceLock::new();
     REG.get_or_init(PluginRegistry::new)
 }
 
-/// Which plugin ids are registered right now — the plugin store's "running" column
-/// ([`super::store::list_installed`]).
-///
-/// Deliberately **not** [`list_plugins`]: that one prunes expired leases and emits
-/// `plugins.changed` for each, which is right for the nav's poll but would turn the store's own
-/// polling into an event fire-hose. This is a pure read.
+/// Ids for the store's running column ([`super::store::list_installed`]). Not [`list_plugins`]:
+/// that prunes and emits `plugins.changed`, which would fire on every store poll.
 pub(crate) fn live_plugin_ids() -> Vec<String> {
     registry().live_ids()
 }
 
-/// The loopback `{port, secret}` a live plugin serves its UI on — the credential the **host itself**
-/// presents when it asks a library plugin what to run for one of its `plugin`-kind launch entries
-/// ([`crate::library::ask_plugin_launch`]).
-///
-/// The same lookup the console proxy gets from `GET /plugins/{id}/ui-credential`, exposed in-process
-/// so the launch path never round-trips through the management API to reach a port this process
-/// already holds. `None` for an unknown, expired, or UI-less plugin — which the launch path reports
-/// as "no recipe", exactly like any other unresolvable entry.
+/// In-process `{port, secret}` for [`crate::library::ask_plugin_launch`]. Same lookup as
+/// `GET /plugins/{id}/ui-credential`, without a management-API round trip to a port this process
+/// already holds.
 pub(crate) fn ui_credential(id: &str) -> Option<UiCredential> {
     registry().credential(id)
 }
 
-/// Put a live UI registration in the registry directly — **test only**, so the launch path
-/// ([`crate::library::ask_plugin_launch`]) can be driven against a stub server without standing up
-/// the whole management router just to reach `PUT /plugins/{id}`.
+/// Bypass the HTTP router so [`crate::library::ask_plugin_launch`] tests can hit a stub server.
 #[cfg(test)]
 pub(crate) fn register_ui_for_test(id: &str, port: u16, secret: &str) {
     registry().upsert(
@@ -309,10 +262,7 @@ pub(crate) fn register_ui_for_test(id: &str, port: u16, secret: &str) {
     );
 }
 
-// ---------------------------------------------------------------- validation
-
-/// A plugin id: `definePlugin`'s kebab-case name (`^[a-z][a-z0-9-]*$`, ≤64) — the same regex the SDK
-/// enforces, so a plugin's registration id always matches its package name.
+/// Same kebab-case regex the SDK enforces, so the registration id matches the package name.
 fn valid_plugin_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
@@ -322,8 +272,7 @@ fn valid_plugin_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// Strip control characters (defense against a title/version smuggling terminal escapes or newlines
-/// into a log line or the console nav), then trim.
+/// A title must not smuggle escapes or newlines into a log line or the nav.
 fn sanitize(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_control())
@@ -332,27 +281,21 @@ fn sanitize(s: &str) -> String {
         .to_string()
 }
 
-/// The console target for a runner-supplied line: `plugin:<source>`.
-///
-/// The source is NOT a [`valid_plugin_id`] — the runner names a unit by its `definePlugin` name
-/// (`virtualhere`), its package name (`@punktfunk/plugin-virtualhere`), a bare script's file stem,
-/// or `runner` for its own supervision lines, and all four are worth telling apart in the log. So
-/// this sanitizes rather than validates: control characters go (a log target is rendered in a
-/// terminal by `logs download` as readily as in the console), length is capped, and an empty source
+/// Source is not a [`valid_plugin_id`] — the runner names a unit by `definePlugin` name, package
+/// name, script stem, or `runner`. Sanitize, do not reject: controls go, length is capped, empty
 /// becomes `runner` so a line is never attributed to nothing.
 fn log_target(source: &str) -> String {
     let mut s = sanitize(source);
     if s.is_empty() {
         s = "runner".into();
     }
-    // Cap on CHARS, not bytes — truncating a multi-byte name mid-sequence would panic.
+    // Cap on chars, not bytes — truncating a multi-byte name mid-sequence would panic.
     if s.chars().count() > 64 {
         s = s.chars().take(64).collect();
     }
     format!("plugin:{s}")
 }
 
-/// Validate a registration body into the internal [`Valid`] form, or a human-readable reason.
 fn validate(reg: PluginRegistration) -> Result<Valid, String> {
     let title = sanitize(&reg.title);
     if title.is_empty() {
@@ -375,10 +318,8 @@ fn validate(reg: PluginRegistration) -> Result<Valid, String> {
         Some(u) => Some(validate_ui(u)?),
         None => None,
     };
-    // Categories are grouping keys the console switches on — a closed charset, but deliberately not
-    // a closed VOCABULARY: an unknown category is stored and simply matches no console rule, so a
-    // newer plugin registering against an older host degrades to "shows in the nav", never to a
-    // failed registration.
+    // Closed charset, open vocabulary: an unknown category is stored and matches no console rule,
+    // so a newer plugin still registers against an older host.
     let category = match reg.category {
         Some(c) => {
             let ok = (1..=32).contains(&c.len())
@@ -437,14 +378,10 @@ fn validate_ui(u: PluginUi) -> Result<StoredUi, String> {
     })
 }
 
-// ---------------------------------------------------------------- handlers
-
 /// Register or renew a plugin
 ///
-/// Upserts the plugin's directory entry and renews its lease (TTL 90 s). Idempotent: a plugin PUTs
-/// this every ~30 s while it runs. The optional `ui` block declares a loopback UI surface the console
-/// will proxy and add to its nav. Emits `plugins.changed` when an operator-visible field changed
-/// (first registration, restart, or re-scan) — a pure renewal is silent.
+/// Idempotent lease renew (~30 s). Emits `plugins.changed` only when an operator-visible field
+/// changed; a pure renewal is silent.
 #[utoipa::path(
     put,
     path = "/plugins/{id}",
@@ -481,18 +418,8 @@ pub(crate) async fn register_plugin(
 
 /// Ingest runner log lines
 ///
-/// The plugin/script runner ships its output here so the console's **Logs** page can show it.
-///
-/// Plugins are not host child processes — the runner is a separate `bun` process that `import()`s
-/// each plugin in-process — so nothing a plugin logs passes through the host's own `tracing`, and
-/// before this endpoint the console's log page could not show a single plugin line. On Linux the
-/// fallback was `journalctl --user -u punktfunk-scripting`; on Windows the runner task writes no
-/// log file at all, so a failing plugin was diagnosable only by stopping the scheduled task and
-/// re-running the runner by hand. Both are shell access on the host box, which is exactly what the
-/// console exists to avoid.
-///
-/// Lines land in the same ring as the host's own, sharing one `seq` cursor, targeted
-/// `plugin:<source>` — so `GET /logs` needs no second cursor and the console needs no second poll.
+/// Plugins are not host children — their output never hits the host `tracing` subscriber. Lines
+/// share the host ring as `plugin:<source>` so `GET /logs` needs no second cursor.
 #[utoipa::path(
     post,
     path = "/plugins/logs",
@@ -523,11 +450,10 @@ pub(crate) async fn ingest_plugin_logs(ApiJson(batch): ApiJson<PluginLogBatch>) 
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Strip control characters from an ingested message, keeping tabs.
+/// Strip controls from an ingested message, keep tabs.
 ///
-/// Same reasoning as [`sanitize`], one exception wider: a plugin's messages routinely carry a
-/// stack trace or a vendor CLI's output, and an embedded newline would let one line forge several
-/// in the downloaded log file. Tabs survive because they are load-bearing in that kind of output.
+/// A newline would let one line forge several in a downloaded log. Tabs stay — they are
+/// load-bearing in stack traces and CLI output.
 fn sanitize_msg(s: &str) -> String {
     s.chars()
         .map(|c| if c == '\t' || !c.is_control() { c } else { ' ' })
@@ -538,10 +464,7 @@ fn sanitize_msg(s: &str) -> String {
 
 /// List registered plugins
 ///
-/// The live plugin directory (lease not expired), sorted by title. **Secret-free**: each entry
-/// reports its id, title, optional version, and — for plugins that serve one — a UI descriptor
-/// (loopback port + icon). The console renders these as nav entries and proxies to the port; it
-/// fetches the secret separately, server-side.
+/// Live, secret-free directory. The console fetches the secret separately, server-side.
 #[utoipa::path(
     get,
     path = "/plugins",
@@ -554,8 +477,8 @@ fn sanitize_msg(s: &str) -> String {
 )]
 pub(crate) async fn list_plugins() -> Json<Vec<PluginSummary>> {
     let (plugins, expired) = registry().snapshot();
-    // Lazy expiry: an entry that aged out is reaped here (exactly once) and announced, so a consumer
-    // watching the event stream sees the departure even though nothing actively deregistered it.
+    // Lazy expiry: reaped here exactly once and announced, so the event stream sees a departure
+    // with no DELETE.
     for id in expired {
         tracing::info!(plugin = %id, "plugin lease expired");
         emit(EventKind::PluginsChanged { id });
@@ -565,9 +488,8 @@ pub(crate) async fn list_plugins() -> Json<Vec<PluginSummary>> {
 
 /// Fetch a plugin UI's proxy credential
 ///
-/// Returns `{port, secret}` for a live plugin's loopback UI — the console proxy's server-side lookup.
-/// Bearer + loopback only (like every mutation), and additionally excluded from the console's browser
-/// passthrough: the secret never reaches a browser.
+/// Server-side `{port, secret}` for the console proxy. The console BFF denylists this from the
+/// browser.
 #[utoipa::path(
     get,
     path = "/plugins/{id}/ui-credential",
@@ -589,9 +511,8 @@ pub(crate) async fn get_ui_credential(Path(id): Path<String>) -> Response {
 
 /// Deregister a plugin
 ///
-/// The clean-shutdown path: removes the plugin's directory entry immediately (the SDK helper calls
-/// this from its scope finalizer on `SIGTERM`). Emits `plugins.changed` when a live entry was
-/// removed. Idempotent — deleting an unknown/expired id is a no-op `204`.
+/// Immediate remove (SDK finalizer on SIGTERM). Emits `plugins.changed` only for a live entry;
+/// unknown/expired is a silent 204.
 #[utoipa::path(
     delete,
     path = "/plugins/{id}",
@@ -628,25 +549,24 @@ mod tests {
         }
     }
 
-    const SECRET: &str = "abcdefghijklmnop0123"; // 20 chars, valid alphabet
+    const SECRET: &str = "abcdefghijklmnop0123";
 
     #[test]
     fn id_validation() {
         assert!(valid_plugin_id("rom-manager"));
         assert!(valid_plugin_id("a"));
         assert!(valid_plugin_id("x9"));
-        assert!(!valid_plugin_id("")); // empty
-        assert!(!valid_plugin_id("9lives")); // must start with a letter
-        assert!(!valid_plugin_id("-lead")); // must start with a letter
-        assert!(!valid_plugin_id("Rom")); // no uppercase
-        assert!(!valid_plugin_id("rom_manager")); // no underscore
-        assert!(!valid_plugin_id(&"a".repeat(65))); // too long
+        assert!(!valid_plugin_id(""));
+        assert!(!valid_plugin_id("9lives"));
+        assert!(!valid_plugin_id("-lead"));
+        assert!(!valid_plugin_id("Rom"));
+        assert!(!valid_plugin_id("rom_manager"));
+        assert!(!valid_plugin_id(&"a".repeat(65)));
     }
 
     #[test]
     fn registration_validation() {
         assert!(validate(reg("ROM Manager", 49321, SECRET)).is_ok());
-        // control chars stripped from the title
         let v = validate(PluginRegistration {
             title: "Ro\u{7}m\n".into(),
             version: None,
@@ -655,9 +575,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(v.title, "Rom");
-        // Category charset (WP2.7): the console's one known value passes; the shapes that would
-        // break a grouping key don't. An UNKNOWN-but-well-formed category is accepted on purpose —
-        // a newer plugin must not fail to register against an older host.
         let lib = |c: &str| PluginRegistration {
             title: "X".into(),
             version: None,
@@ -670,33 +587,25 @@ mod tests {
         );
         assert!(validate(lib("some-future-kind")).is_ok());
         assert!(validate(lib("")).is_err());
-        assert!(validate(lib("Library")).is_err()); // no uppercase
-        assert!(validate(lib("9lives")).is_err()); // must start with a letter
-        assert!(validate(lib("lib_rary")).is_err()); // no underscore
-        assert!(validate(lib(&"a".repeat(33))).is_err()); // too long
-                                                          // privileged port rejected
+        assert!(validate(lib("Library")).is_err());
+        assert!(validate(lib("9lives")).is_err());
+        assert!(validate(lib("lib_rary")).is_err());
+        assert!(validate(lib(&"a".repeat(33))).is_err());
         assert!(validate(reg("x", 80, SECRET)).is_err());
-        // short secret rejected
         assert!(validate(reg("x", 49321, "tooshort")).is_err());
-        // bad secret alphabet rejected
         assert!(validate(reg("x", 49321, "bad secret with spaces!!")).is_err());
-        // empty title rejected
         assert!(validate(reg("   ", 49321, SECRET)).is_err());
     }
 
     #[test]
     fn upsert_reports_change_but_not_renewal() {
         let r = PluginRegistry::new();
-        // first registration is a change
         assert!(r.upsert("p", validate(reg("Title", 49321, SECRET)).unwrap()));
-        // identical renewal is not
         assert!(!r.upsert("p", validate(reg("Title", 49321, SECRET)).unwrap()));
-        // a new secret (restart) is a change
         assert!(r.upsert(
             "p",
             validate(reg("Title", 49321, "ZZZZZZZZZZZZZZZZ")).unwrap()
         ));
-        // a new title (re-scan) is a change
         assert!(r.upsert(
             "p",
             validate(reg("New Title", 49321, "ZZZZZZZZZZZZZZZZ")).unwrap()
@@ -712,9 +621,8 @@ mod tests {
         assert!(expired.is_empty());
         assert_eq!(
             plugins.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
-            vec!["alpha", "zeta"] // sorted by title
+            vec!["alpha", "zeta"]
         );
-        // the summary type has no secret field at all — check the credential path carries it
         assert_eq!(r.credential("alpha").unwrap().secret, SECRET);
         assert_eq!(r.credential("alpha").unwrap().port, 50001);
     }
@@ -732,25 +640,24 @@ mod tests {
             })
             .unwrap(),
         );
-        assert!(r.credential("headless").is_none()); // registered but no UI
-        assert!(r.credential("nope").is_none()); // unknown
+        assert!(r.credential("headless").is_none());
+        assert!(r.credential("nope").is_none());
     }
 
     #[test]
     fn expired_entries_drop_from_listing_and_credential() {
         let r = PluginRegistry::new();
         r.upsert("p", validate(reg("P", 49321, SECRET)).unwrap());
-        // Force the lease into the past.
         {
             let mut map = r.inner.write().unwrap();
             map.get_mut("p").unwrap().expires_at =
                 Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
         }
-        assert!(r.credential("p").is_none()); // expired → no credential
+        assert!(r.credential("p").is_none());
         let (plugins, expired) = r.snapshot();
         assert!(plugins.is_empty());
-        assert_eq!(expired, vec!["p".to_string()]); // reaped + announced once
-                                                    // second snapshot no longer reports it as freshly-expired
+        assert_eq!(expired, vec!["p".to_string()]);
+        // Second snapshot must not re-announce.
         assert!(r.snapshot().1.is_empty());
     }
 
@@ -758,7 +665,7 @@ mod tests {
     fn remove_reports_live_only() {
         let r = PluginRegistry::new();
         r.upsert("p", validate(reg("P", 49321, SECRET)).unwrap());
-        assert!(r.remove("p")); // live → announced
-        assert!(!r.remove("p")); // already gone → silent
+        assert!(r.remove("p"));
+        assert!(!r.remove("p"));
     }
 }

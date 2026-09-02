@@ -1,70 +1,47 @@
-//! Vulkan-allocated NVENC input slots + the Vulkan compute cursor blend — the driver-portable
-//! replacement for the retired `cursor_blend.cu` PTX kernels (design: remote-desktop-sweep §8,
-//! Phase A). A vendored PTX blob is JIT'd against the driver's ISA ceiling, so it silently dies
-//! on drivers older than the generating toolkit (CUDA errors 222/218 on-glass — the KWin leg's
-//! invisible composite cursor); SPIR-V has no such coupling.
+//! Vulkan-allocated NVENC input slots and the SPIR-V compute cursor blend.
 //!
 //! ```text
-//!   exportable VkBuffer ──vkGetMemoryFdKHR(OPAQUE_FD)──▶ cuImportExternalMemory ──▶ CUdeviceptr
-//!        ▲                                                     │ NVENC registers + encodes
-//!        └── cursor_blend.comp dispatch (cursor rect only) ◀───┘ CUDA copies frames in
+//!   exportable VkBuffer ──vkGetMemoryFdKHR(OPAQUE_FD)──▶ cuImportExternalMemory
+//!        ▲                                                     │ NVENC encodes
+//!        └── cursor_blend.comp (cursor rect) ◀── CUDA copies in ┘
 //! ```
 //!
-//! The direct-SDK NVENC encoder allocates its input ring through [`VkSlotBlend::alloc_slot`]
-//! instead of `cuMemAllocPitch`: same contiguous layouts (`InputSurface` docs), but the memory is
-//! Vulkan external memory both APIs address.
+//! Ring slots are Vulkan external memory both APIs address (`InputSurface`
+//! layouts via [`VkSlotBlend::alloc_slot`]). Pin the shader with
+//! `glslangValidator -V cursor_blend.comp -o cursor_blend.spv` (CI gates
+//! drift). SPIR-V, not PTX: a vendored PTX blob JIT-fails on older drivers.
 //!
-//! Cursor-bearing frames blend one of two ways:
-//!
-//! * **Stream-ordered** ([`blend_ref_ordered`](VkSlotBlend::blend_ref_ordered), the fast path
-//!   when the driver exports a timeline semaphore to CUDA): the encoder enqueues its CUDA copy
-//!   with no CPU sync, CUDA signals the shared timeline on the copy stream, the blend submission
-//!   waits for and then advances it on the Vulkan queue, and CUDA waits the advanced value
-//!   before the encode — the whole copy→blend→encode chain orders on-device, so a visible
-//!   cursor costs the submit path nothing. (Before this, EVERY cursor frame took the CPU-synced
-//!   path below; under gamescope — which composites the pointer into every frame — that
-//!   serialized submit behind the game's GPU load and capped a 120 fps session near 80.)
-//! * **CPU-synced** ([`blend_ref`](VkSlotBlend::blend_ref), the fallback when timeline bring-up
-//!   failed): the encoder blocks on its CUDA copy, the blend fence-waits — the same coherence
-//!   ceremony [`super::vulkan::VkBridge`] ships for its CSC (fence-ordered cross-API access on
-//!   NVIDIA, no queue-family transfer needed).
-//!
-//! Frames without a cursor never touch Vulkan at all.
-//!
-//! Falls back cleanly: if bring-up fails the encoder allocates plain CUDA surfaces and composite
-//! mode degrades to no cursor (warned once) — never a failed session.
+//! Cursor frames: [`VkSlotBlend::blend_ref_ordered`] (timeline exported to
+//! CUDA, copy→blend→encode on-device) or [`VkSlotBlend::blend_ref`] (CPU
+//! fence-wait, same as [`super::vulkan::VkBridge`]). No cursor → no Vulkan.
+//! Bring-up failure → plain CUDA surfaces and no cursor (warned once); the
+//! session still starts.
 
 use super::cuda::{self, CUdeviceptr};
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk;
 
-/// Max cursor-overlay bitmap edge (px) — matches [`cuda::CURSOR_MAX`] and the capture-side clamp.
+/// Bitmap edge clamp (px); same value as [`cuda::CURSOR_MAX`] and the capture side.
 pub const CURSOR_MAX: u32 = cuda::CURSOR_MAX;
 
-/// Number of `cursor_blend.comp` MODE variants — one specialized pipeline each, indexed by
-/// [`SlotFormat::mode`]. Bump together with the shader's MODE list.
+/// `cursor_blend.comp` MODE count — one pipeline each, indexed by [`SlotFormat::mode`]. Bump with the shader MODE list.
 const PIPELINE_MODES: u32 = 5;
 
-/// The vendored SPIR-V for `cursor_blend.comp` (beside this file; rebuild with
-/// `glslangValidator -V cursor_blend.comp -o cursor_blend.spv`; CI gates drift).
+/// Vendored `cursor_blend.comp` SPIR-V. Rebuild: `glslangValidator -V cursor_blend.comp -o cursor_blend.spv`.
 const CURSOR_SPV: &[u8] = include_bytes!("cursor_blend.spv");
 
-/// NVENC input-surface layout — selects the spec-constant `MODE` pipeline and the allocation
-/// arithmetic (mirroring `InputSurface`'s contiguous layouts).
+/// NVENC input layout: shader MODE spec-constant and allocation arithmetic.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SlotFormat {
-    /// Packed 4-byte ARGB (NVENC byte order B,G,R,A): `pitch × height`.
+    /// Packed 4-byte ARGB, NVENC byte order B,G,R,A. Size: `pitch × height`.
     Argb,
-    /// NV12: Y rows `[0, H)` + interleaved UV rows `[H, 3H/2)` under one pitch.
+    /// NV12: Y `[0, H)` then interleaved UV `[H, 3H/2)` under one pitch.
     Nv12,
-    /// Planar YUV444: three full-res planes stacked at `pitch × height` intervals.
+    /// Planar YUV444: three full-res planes at `pitch × height` intervals.
     Yuv444,
-    /// Packed 10-bit `x:R:G:B` 2:10:10:10 LE (NVENC `ARGB10`) — the HDR capture format, handed to
-    /// NVENC unconverted. Same 4-bytes-per-pixel geometry as [`Argb`](Self::Argb); it needs its
-    /// own mode only because the blend must unpack 10-bit channels instead of bytes.
+    /// Packed 10-bit `x:R:G:B` 2:10:10:10 LE (NVENC `ARGB10`). Same geometry as [`Argb`](Self::Argb); own MODE because the blend unpacks 10-bit channels.
     X2Rgb10,
-    /// Packed 10-bit `x:B:G:R` 2:10:10:10 LE (NVENC `ABGR10`) — [`X2Rgb10`](Self::X2Rgb10) with
-    /// R and B swapped.
+    /// Packed 10-bit `x:B:G:R` 2:10:10:10 LE (NVENC `ABGR10`). [`X2Rgb10`](Self::X2Rgb10) with R/B swapped.
     X2Bgr10,
 }
 
@@ -78,8 +55,7 @@ impl SlotFormat {
             SlotFormat::X2Bgr10 => 4,
         }
     }
-    /// True for the layouts that are one 32-bit word per pixel — the same slot geometry AND the
-    /// same one-invocation-per-pixel dispatch, whatever the per-channel packing inside the word.
+    /// One 32-bit word per pixel: same slot geometry and one-invocation-per-pixel dispatch.
     fn is_packed32(self) -> bool {
         matches!(
             self,
@@ -107,57 +83,53 @@ impl SlotFormat {
     }
 }
 
-/// What the encoder holds per ring slot: the CUDA view it registers with NVENC plus the id it
-/// hands back to [`VkSlotBlend::blend_ref`] / [`VkSlotBlend::blend_ref_ordered`]. The backing
-/// Vulkan objects + CUDA mapping live in the [`VkSlotBlend`] (freed by
-/// [`free_slots`](VkSlotBlend::free_slots) / drop), so this is Copy — the encoder's ring keeps
-/// its existing shape.
+/// Encoder-held view of one ring slot: the CUDA pointer NVENC registers and the id for
+/// [`VkSlotBlend::blend_ref`] / [`blend_ref_ordered`](VkSlotBlend::blend_ref_ordered). Vulkan
+/// objects live in [`VkSlotBlend`], so this is `Copy`.
 #[derive(Clone, Copy)]
 pub struct VkSlotRef {
-    /// Device pointer NVENC registers (CUDA's mapping of the Vulkan memory).
+    /// CUDA mapping of the Vulkan memory — what NVENC registers.
     pub ptr: CUdeviceptr,
-    /// Row stride in bytes (ours: row bytes rounded up to 256).
+    /// Row stride in bytes (row bytes rounded up to 256).
     pub pitch: usize,
-    /// Luma rows (the plane-stride multiplier, as in `InputSurface`).
+    /// Luma rows — the plane-stride multiplier, as in `InputSurface`.
     pub height: u32,
-    /// Index into the blend's slot table.
+    /// Index into [`VkSlotBlend`]'s slot table.
     pub id: usize,
 }
 
-/// One allocated slot's backing objects, freed together in reverse order (CUDA mapping first).
-/// Each slot carries its own command buffer + descriptor set so ordered blends can be in flight
-/// on several slots at once (the shared-single-set design raced the next recording against a
-/// still-executing submission); the set's bindings are written once here — the slot buffer never
-/// changes and the cursor staging buffer is shared.
+/// Per-slot Vulkan objects, freed CUDA-mapping-first. Own command buffer + descriptor set so
+/// ordered blends can be in flight on several slots (a shared set raced the next recording
+/// against a still-executing submit). Bindings are written once: slot buffer is immutable,
+/// cursor staging is shared.
 struct SlotAlloc {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
-    /// CUDA's import of the exported OPAQUE_FD — must drop BEFORE the Vulkan memory is freed.
+    /// CUDA import of the exported OPAQUE_FD — drop before the Vulkan memory is freed.
     cuda: cuda::ExternalDmabuf,
     cmd: vk::CommandBuffer,
     desc: vk::DescriptorSet,
 }
 
-/// The cross-API ordering state for stream-ordered blends: one Vulkan timeline semaphore,
-/// exported as an OPAQUE_FD and imported into CUDA. `None` when the driver lacks timeline
-/// semaphores or the export/import failed — blends then stay CPU-synced ([`VkSlotBlend::blend_ref`]).
+/// Shared Vulkan timeline, exported as OPAQUE_FD and imported into CUDA. `None` → CPU-synced
+/// blends only ([`VkSlotBlend::blend_ref`]).
 struct Timeline {
     sem: vk::Semaphore,
-    /// `vkWaitSemaphoresKHR` — the CPU-side quiesce for cursor-bitmap uploads and teardown
-    /// (the 1.1 device gets the entry point from `VK_KHR_timeline_semaphore`).
+    /// `vkWaitSemaphoresKHR` (1.1 device: `VK_KHR_timeline_semaphore`). CPU quiesce for bitmap
+    /// upload and teardown.
     ts: ash::khr::timeline_semaphore::Device,
-    /// CUDA's import; its `signal`/`wait` enqueue on the encode thread's copy stream.
+    /// CUDA import; `signal`/`wait` enqueue on the encode thread's copy stream.
     cuda: cuda::ExternalSemaphore,
-    /// Last timeline value handed out (monotonic for the device's lifetime, never reused —
-    /// each ordered blend consumes two: copy-done, then blend-done).
+    /// Last value handed out. Monotonic, never reused; each ordered blend takes two (copy-done,
+    /// then blend-done).
     ticket: u64,
-    /// Last blend-done value an ACCEPTED `vkQueueSubmit` will signal — what upload/teardown
-    /// quiesce on. Only advanced on submit success: a value from a failed submit would never
-    /// be signaled and a quiesce on it would time out.
+    /// Last blend-done value an accepted `vkQueueSubmit` will signal. Upload/teardown wait this.
+    /// Advanced only on submit success — a failed submit's value would never signal and a wait
+    /// would time out.
     last_blend: u64,
 }
 
-/// 28-byte push-constant block matching `cursor_blend.comp`'s `Push`.
+/// 28-byte push-constant block; must match `cursor_blend.comp`'s `Push`.
 #[repr(C)]
 struct Push {
     pitch: u32,
@@ -184,29 +156,27 @@ pub struct VkSlotBlend {
     desc_pool: vk::DescriptorPool,
     /// One pipeline per [`SlotFormat`], indexed by `mode()` (spec constant).
     pipelines: [vk::Pipeline; PIPELINE_MODES as usize],
-    /// Host-visible cursor bitmap staging (CURSOR_MAX²·4, tight rows), persistently mapped.
+    /// Host-visible cursor bitmap (CURSOR_MAX²·4, tight rows), persistently mapped.
     cur_buf: vk::Buffer,
     cur_mem: vk::DeviceMemory,
     cur_map: *mut u8,
     slots: Vec<SlotAlloc>,
-    /// Stream-ordered blend support (`None` = CPU-synced blends only). See [`Timeline`].
+    /// Stream-ordered blend (`None` = CPU-synced only). See [`Timeline`].
     timeline: Option<Timeline>,
 }
 
-// SAFETY: raw Vulkan handles + a persistently-mapped pointer, all uniquely owned by this struct
-// and destroyed exactly once in `Drop`; used from the encoder thread but moved with it. `Send`
-// only (not `Sync`), matching the single-thread use — transferring opaque handles cannot dangle.
+// SAFETY: Vulkan handles + a persistently-mapped pointer, uniquely owned and
+// destroyed once in `Drop`. Encoder-thread `Send` (not `Sync`): moving opaque
+// handles cannot dangle.
 unsafe impl Send for VkSlotBlend {}
 
 impl VkSlotBlend {
-    /// Bring up the device + blend pipelines. Requires the CUDA shared context (the encoder's) to
-    /// be established; picks the NVIDIA physical device (the NVENC path is NVIDIA by definition).
+    /// Create the device and blend pipelines. The encoder's CUDA shared context must already be
+    /// current; the physical device is NVIDIA (NVENC).
     pub fn new() -> Result<VkSlotBlend> {
-        // SAFETY: standard ash bring-up, same shape as `VkBridge::new` — every call is `unsafe`
-        // only because ash cannot statically verify handle/CreateInfo validity. Every
-        // `*CreateInfo`/`AllocateInfo` is built from locals that live for the duration of the
-        // synchronous call reading them; every handle passed was created and `?`-checked in this
-        // same function. Shares nothing across threads.
+        // SAFETY: ash cannot statically verify handle/CreateInfo validity. Every
+        // CreateInfo/AllocateInfo is a local that outlives the synchronous call;
+        // every handle was created and `?`-checked in this function. Single-threaded.
         unsafe {
             let entry = ash::Entry::load().context("load libvulkan")?;
             let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
@@ -244,10 +214,8 @@ impl VkSlotBlend {
             let qci = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(qf)
                 .queue_priorities(&prio)];
-            // Timeline-semaphore export to CUDA (the stream-ordered blend) is optional: probe the
-            // device extensions + feature bit and enable them only where present, so a driver
-            // without them still gets a working (CPU-synced) blend device. NVIDIA has shipped
-            // both extensions since ~2019; the probe is for exotic/legacy stacks.
+            // Timeline export to CUDA is optional: enable the extensions only when the
+            // device has them, so a driver without them still gets a CPU-synced blend.
             let want_timeline = {
                 let have_exts = instance
                     .enumerate_device_extension_properties(phys)
@@ -288,8 +256,7 @@ impl VkSlotBlend {
                     return Err(e).context("vkCreateDevice (external_memory_fd supported?)");
                 }
             };
-            // From here teardown-on-error goes through `destroy_partial`, which tolerates null
-            // handles — build everything into an incrementally-filled struct.
+            // From here Drop tears down; leftover null handles are no-ops.
             let ext_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
             let queue = device.get_device_queue(qf, 0);
             let mut me = VkSlotBlend {
@@ -313,11 +280,11 @@ impl VkSlotBlend {
                 timeline: None,
             };
             me.init_objects(qf).inspect_err(|_| {
-                // `Drop` runs the same teardown and tolerates the nulls left by a partial init.
+                // Drop tears down; null handles from a partial init are no-ops.
             })?;
             if want_timeline {
-                // Non-fatal: any failure (export refused, CUDA import refused) leaves
-                // `timeline` None and blends CPU-synced — never a failed bring-up.
+                // Non-fatal: export/import failure leaves `timeline` None (CPU-synced
+                // blends). Bring-up still succeeds.
                 if let Err(e) = me.init_timeline() {
                     tracing::info!(
                         error = %format!("{e:#}"),
@@ -333,14 +300,13 @@ impl VkSlotBlend {
         }
     }
 
-    /// Bring up the [`Timeline`]: create an exportable timeline semaphore, export its OPAQUE_FD,
-    /// import it into CUDA. Only called when the device was created with the timeline extensions.
+    /// Export a timeline semaphore as OPAQUE_FD and import it into CUDA. Caller enabled the
+    /// timeline extensions on this device.
     fn init_timeline(&mut self) -> Result<()> {
-        // SAFETY: ash calls on the live `self.device` with builder infos from locals outliving
-        // each synchronous call. The semaphore is destroyed on every failure path after its
-        // creation; the exported fd is owned by `import_owned_timeline_fd` (the driver takes it
-        // on success, it closes it on failure). The shared CUDA context is current: the encoder
-        // brings this device up from its encode thread with the context established.
+        // SAFETY: ash calls on the live device; CreateInfo locals outlive each
+        // synchronous call. The semaphore is destroyed on every post-create
+        // failure. `import_owned_timeline_fd` takes the fd on success and
+        // closes it on failure. CUDA context is current (encoder thread).
         unsafe {
             let mut type_ci = vk::SemaphoreTypeCreateInfo::default()
                 .semaphore_type(vk::SemaphoreType::TIMELINE)
@@ -386,11 +352,10 @@ impl VkSlotBlend {
         }
     }
 
-    /// The non-device objects: command machinery, cursor staging, descriptor + pipelines.
     fn init_objects(&mut self, qf: u32) -> Result<()> {
-        // SAFETY: same contract as `new` — ash calls on the live `self.device` with builder infos
-        // from locals outliving each synchronous call; created handles are stored into `self`
-        // immediately so the caller's `Drop` frees them on any later failure.
+        // SAFETY: ash calls on the live device; CreateInfo locals outlive each
+        // synchronous call. Created handles go into `self` immediately so Drop
+        // frees them if a later step fails.
         unsafe {
             let d = &self.device;
             self.cmd_pool = d
@@ -405,7 +370,6 @@ impl VkSlotBlend {
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .context("create fence")?;
 
-            // Cursor staging: host-visible+coherent SSBO, persistently mapped.
             let cur_size = (CURSOR_MAX * CURSOR_MAX * 4) as u64;
             self.cur_buf = d
                 .create_buffer(
@@ -436,7 +400,7 @@ impl VkSlotBlend {
                 .map_memory(self.cur_mem, 0, cur_size, vk::MemoryMapFlags::empty())
                 .context("map cursor memory")? as *mut u8;
 
-            // Descriptor set: binding 0 = surface SSBO (rebound per blend), 1 = cursor SSBO.
+            // Binding 0 = surface SSBO, 1 = cursor SSBO (written once in `alloc_slot`).
             let bindings = [
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(0)
@@ -467,9 +431,8 @@ impl VkSlotBlend {
                     None,
                 )
                 .context("create pipeline layout")?;
-            // Per-slot sets (one per ring slot, written once at `alloc_slot`; freed by
-            // `free_slots` on ring rebuilds, hence FREE_DESCRIPTOR_SET). 64 is comfortably
-            // above any ring depth (the encoder's POOL is 8).
+            // Per-slot sets, freed on ring rebuild (`FREE_DESCRIPTOR_SET`).
+            // 64 is well above encoder POOL (8). 128 descriptors = 2 bindings × 64 sets.
             let pool_sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(128)];
@@ -483,7 +446,7 @@ impl VkSlotBlend {
                 )
                 .context("create descriptor pool")?;
 
-            // The shader + one pipeline per MODE (spec constant 0).
+            // One pipeline per MODE; spec constant 0.
             if CURSOR_SPV.len() % 4 != 0 {
                 anyhow::bail!("cursor_blend.spv is not word-aligned");
             }
@@ -532,17 +495,15 @@ impl VkSlotBlend {
             .ok_or_else(|| anyhow!("no memory type for flags {flags:?}"))
     }
 
-    /// Allocate one NVENC input slot as exportable Vulkan memory mapped into CUDA. Layout matches
-    /// `InputSurface` (contiguous planes under one pitch); pitch = row bytes rounded to 256.
+    /// Allocate one NVENC input as exportable Vulkan memory mapped into CUDA. Layout matches
+    /// `InputSurface` (contiguous planes, one pitch); pitch = row bytes rounded to 256.
     pub fn alloc_slot(&mut self, fmt: SlotFormat, width: u32, height: u32) -> Result<VkSlotRef> {
         let pitch = (fmt.row_bytes(width) + 255) & !255;
         let size = pitch * fmt.rows(height);
-        // SAFETY: exportable-buffer allocation, the exact `VkBridge::ensure_dst` incantation:
-        // `ExternalMemoryBufferCreateInfo`/`ExportMemoryAllocateInfo` declare OPAQUE_FD,
-        // `MemoryDedicatedAllocateInfo` ties the memory to the buffer; every info is a local
-        // outliving its synchronous call and every failure path destroys the objects created so
-        // far exactly once. `get_memory_fd` hands us an fd that `import_owned_fd` either adopts
-        // (driver owns it) or closes on failure.
+        // SAFETY: `ExternalMemoryBufferCreateInfo`/`ExportMemoryAllocateInfo`
+        // declare OPAQUE_FD; `MemoryDedicatedAllocateInfo` ties memory to the
+        // buffer. Infos are locals outliving each call. Failure paths destroy
+        // created objects once. `import_owned_fd` adopts the fd or closes it.
         unsafe {
             let d = &self.device;
             let mut ext_info = vk::ExternalMemoryBufferCreateInfo::default()
@@ -608,9 +569,8 @@ impl VkSlotBlend {
                     return Err(e).context("cuImportExternalMemory(slot OPAQUE_FD)");
                 }
             };
-            // The slot's own descriptor set + command buffer (see `SlotAlloc`). Bindings are
-            // written once here: binding 0 is this slot's buffer (immutable for its lifetime),
-            // binding 1 the shared cursor staging buffer.
+            // Per-slot descriptor set + command buffer (see `SlotAlloc`).
+            // Binding 0 = this slot's buffer (immutable); 1 = shared cursor staging.
             let dls = [self.desc_layout];
             let desc = match d.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
@@ -619,7 +579,7 @@ impl VkSlotBlend {
             ) {
                 Ok(s) => s[0],
                 Err(e) => {
-                    drop(ext); // CUDA's view of the memory goes first
+                    drop(ext); // CUDA mapping first
                     d.free_memory(memory, None);
                     d.destroy_buffer(buffer, None);
                     return Err(e).context("allocate slot descriptor set");
@@ -655,7 +615,7 @@ impl VkSlotBlend {
                 Ok(c) => c[0],
                 Err(e) => {
                     let _ = d.free_descriptor_sets(self.desc_pool, &[desc]);
-                    drop(ext); // CUDA's view of the memory goes first
+                    drop(ext); // CUDA mapping first
                     d.free_memory(memory, None);
                     d.destroy_buffer(buffer, None);
                     return Err(e).context("allocate slot command buffer");
@@ -678,16 +638,12 @@ impl VkSlotBlend {
         }
     }
 
-    /// Free every allocated slot (encoder teardown, alongside its ring clear). CUDA mappings drop
-    /// first (field order in `SlotAlloc` frees `cuda` via its own `Drop` before we free the VK
-    /// objects explicitly here).
+    /// Free every slot (encoder teardown). CUDA mappings drop first — `SlotAlloc.cuda`'s `Drop`
+    /// runs before the Vulkan objects are freed below.
     pub fn free_slots(&mut self) {
-        // Ordered blends return with their work still on the queue — quiesce before freeing the
-        // buffers/sets it references. `device_wait_idle` (not a timeline wait) so a submission
-        // whose CUDA copy-done signal never fired is still covered. CPU-synced blends normally
-        // fence-wait before returning, but a blend whose wait TIMED OUT propagated an error with
-        // its submission still executing — so the drain runs unconditionally (it idles in
-        // microseconds on this tiny device outside the pathological cases it exists for).
+        // Ordered blends (and fence-wait timeouts) can still be on the queue.
+        // `device_wait_idle`, not a timeline wait: a submit whose CUDA copy-done
+        // never fired is still covered.
         if !self.slots.is_empty() {
             // SAFETY: single-threaded owner; no other thread touches this device or its queue.
             unsafe {
@@ -695,11 +651,9 @@ impl VkSlotBlend {
             }
         }
         for s in self.slots.drain(..) {
-            drop(s.cuda); // CUDA's view of the memory goes first
-                          // SAFETY: `buffer`/`memory`/`cmd`/`desc` were created in `alloc_slot`, are uniquely
-                          // owned by the drained `SlotAlloc`, and are destroyed exactly once here. No queue
-                          // work is in flight: CPU-synced blends fence-wait before returning, and ordered
-                          // blends were quiesced by the `device_wait_idle` above.
+            drop(s.cuda); // CUDA mapping first
+                          // SAFETY: uniquely owned by the drained `SlotAlloc`, created in
+                          // `alloc_slot`, destroyed once. Queue is idle (`device_wait_idle`).
             unsafe {
                 let _ = self.device.free_descriptor_sets(self.desc_pool, &[s.desc]);
                 self.device.free_command_buffers(self.cmd_pool, &[s.cmd]);
@@ -709,20 +663,16 @@ impl VkSlotBlend {
         }
     }
 
-    /// Upload the cursor RGBA (`cw*ch*4`, tight rows) into the mapped staging buffer. Call only
-    /// when the bitmap changes; position moves are push constants. Quiesces any in-flight
-    /// ordered blend first (bitmap changes are rare — pointer-shape flips — so the occasional
-    /// bounded CPU wait here is the trade that keeps the per-frame path sync-free).
+    /// Upload cursor RGBA (`cw*ch*4`, tight rows) into the mapped staging buffer. Call only when
+    /// the bitmap changes (position is a push constant). Quiesces any in-flight ordered blend first.
     pub fn upload_cursor(&mut self, rgba: &[u8], cw: u32, ch: u32) {
         if let Some(t) = &self.timeline {
             if t.last_blend > 0 {
                 let sems = [t.sem];
                 let values = [t.last_blend];
-                // SAFETY: `t.sem` is the live timeline semaphore; the wait info's arrays are
-                // locals outliving the synchronous call. `last_blend` only holds values an
-                // accepted submit will signal, so the wait terminates (the timeout is the
-                // backstop for a wedged queue — then we proceed and risk one torn cursor
-                // bitmap, never UB: the staging buffer stays alive regardless).
+                // SAFETY: `t.sem` is live; wait-info arrays outlive the call.
+                // `last_blend` is only a value an accepted submit will signal.
+                // Timeout: proceed (one torn bitmap); the staging buffer lives.
                 let r = unsafe {
                     t.ts.wait_semaphores(
                         &vk::SemaphoreWaitInfo::default()
@@ -744,31 +694,28 @@ impl VkSlotBlend {
         let ch = ch.min(CURSOR_MAX);
         let len = (cw * ch * 4) as usize;
         let len = len.min(rgba.len());
-        // SAFETY: `cur_map` is the live persistent mapping of the CURSOR_MAX²·4 host-coherent
-        // allocation (created in `init_objects`, unmapped only in `Drop`); `len` is clamped to
-        // both the source slice and the buffer capacity. No blend reads race this host write:
-        // CPU-synced blends fence-wait before returning, and ordered blends were quiesced via
-        // the timeline wait above.
+        // SAFETY: `cur_map` is the live CURSOR_MAX²·4 mapping (unmapped in
+        // `Drop`); `len` is clamped to the source and the buffer. No blend
+        // reads race: CPU-synced blends fence-wait; ordered blends quiesced.
         unsafe {
             std::ptr::copy_nonoverlapping(rgba.as_ptr(), self.cur_map, len);
         }
     }
 
-    /// Stream-ordered blends available: the timeline semaphore was exported to CUDA at bring-up,
-    /// so [`blend_ref_ordered`](Self::blend_ref_ordered) can order copy→blend→encode on-device.
+    /// Timeline was exported to CUDA, so [`blend_ref_ordered`](Self::blend_ref_ordered) can order
+    /// copy→blend→encode on-device.
     pub fn ordered_ready(&self) -> bool {
         self.timeline.is_some()
     }
 
-    /// Last timeline value handed out (0 = no ordered blend submitted yet) — test observability
-    /// for "did the ordered path actually run".
+    /// Last timeline value handed out (`0` = none). Test hook: did the ordered path run.
     pub fn ordered_ticket(&self) -> u64 {
         self.timeline.as_ref().map_or(0, |t| t.ticket)
     }
 
-    /// Push constants + dispatch geometry for one blend (must match cursor_blend.comp): ARGB =
-    /// per cursor px; NV12/YUV444 = per word-aligned 4-px span × (2-row blocks | rows). `None`
-    /// when the clamped cursor rect is empty (nothing to dispatch).
+    /// Push constants + dispatch groups for one blend (must match `cursor_blend.comp`). Packed
+    /// 32-bit: one invocation per cursor pixel. NV12/YUV444: word-aligned 4-px spans × (2-row
+    /// blocks | rows). `None` if the clamped rect is empty.
     fn blend_geometry(
         slot: &VkSlotRef,
         fmt: SlotFormat,
@@ -792,9 +739,8 @@ impl VkSlotBlend {
             ox,
             oy,
         };
-        // `is_packed32`, not `== Argb`: the two 10-bit HDR formats are packed 32-bit words too, so
-        // they take the one-invocation-per-pixel arm exactly as ARGB does. Everything else is the
-        // word-aligned-span arm.
+        // Packed 32-bit (ARGB and both 10-bit HDR layouts): one invocation per pixel.
+        // Everything else is the word-aligned-span arm.
         let (gx, gy) = if fmt.is_packed32() {
             // One invocation per cursor pixel = one exclusively-owned 32-bit word.
             (cw.div_ceil(8), ch.div_ceil(8))
@@ -803,9 +749,8 @@ impl VkSlotBlend {
             let spans = ((ox + cw as i32) - x0 + 3).div_euclid(4).max(1) as u32;
             let rows = match fmt {
                 SlotFormat::Nv12 => {
-                    // 2-row blocks anchored to the SURFACE chroma grid (cursor_blend.comp
-                    // derives the same y0): count the blocks covering luma rows
-                    // [oy, oy+ch) — one more than ch/2 when oy is odd.
+                    // 2-row blocks on the SURFACE chroma grid (shader uses the
+                    // same y0). Odd `oy` covers one extra block.
                     let first = oy.div_euclid(2);
                     let last = (oy + ch as i32 - 1).div_euclid(2);
                     (last - first + 1) as u32
@@ -817,13 +762,12 @@ impl VkSlotBlend {
         Some((push, gx, gy))
     }
 
-    /// Record the blend (barriers + bind + push constants + dispatch) into `id`'s own command
-    /// buffer and return it, ready for submission.
+    /// Record barriers + bind + push + dispatch into `id`'s command buffer.
     ///
     /// # Safety
-    /// The slot's previous submission must have completed: sync blends fence-wait before
-    /// returning; ordered blends rely on the encoder's ring-reuse discipline (a slot is reused
-    /// only after its encode — GPU-ordered after its blend — was polled).
+    /// The slot's previous submit must have completed: sync blends fence-wait;
+    /// ordered blends reuse a slot only after its encode (GPU-ordered after
+    /// the blend) was polled.
     unsafe fn record_blend(
         &self,
         id: usize,
@@ -832,10 +776,9 @@ impl VkSlotBlend {
         gx: u32,
         gy: u32,
     ) -> Result<vk::CommandBuffer> {
-        // SAFETY: caller contract (`# Safety` above): the slot's previous submission completed, so
-        // its command buffer is re-recordable. Handles are owned by `self` on this single thread;
-        // `bytes` reborrows `push` (repr(C), size_of::<Push>()) for the synchronous push-constant
-        // copy; builder infos are locals outliving each call.
+        // SAFETY: caller contract (`# Safety`): previous submit completed, so
+        // the command buffer is re-recordable. Single-thread owner. `bytes`
+        // reborrows `push` (`repr(C)`) for the synchronous copy.
         unsafe {
             let alloc = self
                 .slots
@@ -849,9 +792,7 @@ impl VkSlotBlend {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )
             .context("begin blend cmd")?;
-            // CUDA wrote the frame into this memory outside Vulkan's view — make it visible to
-            // the shader (external-memory coherence ceremony; NVIDIA honors this with the
-            // fence/semaphore ordering alone, the barrier is the spec-shaped belt-and-braces).
+            // CUDA wrote this memory outside Vulkan's view — acquire for the shader.
             let acquire = [vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
@@ -889,8 +830,7 @@ impl VkSlotBlend {
                 bytes,
             );
             d.cmd_dispatch(cmd, gx.max(1), gy.max(1), 1);
-            // Release the shader's writes so the downstream CUDA/NVENC reads (fence- or
-            // semaphore-ordered) see them.
+            // Release shader writes for the downstream CUDA/NVENC read.
             let release = [vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::MEMORY_READ)];
@@ -908,10 +848,9 @@ impl VkSlotBlend {
         }
     }
 
-    /// Blend the uploaded cursor into `slot` at `(ox, oy)`: record, submit, fence-wait. The
-    /// caller has CPU-synced its CUDA frame copy first; the fence wait makes the shader's writes
-    /// visible to the subsequent NVENC encode (the `VkBridge` precedent: fence-ordered cross-API
-    /// access, no queue-family transfer — NVIDIA-only path).
+    /// Blend the uploaded cursor into `slot` at `(ox, oy)`: record, submit, fence-wait.
+    /// Caller has CPU-synced the CUDA copy; the fence makes shader writes visible
+    /// to the following NVENC encode (NVIDIA fence-ordered access, no QF transfer).
     #[allow(clippy::too_many_arguments)] // surface geometry + cursor rect — unpacked kernel args
     pub fn blend_ref(
         &mut self,
@@ -926,13 +865,10 @@ impl VkSlotBlend {
         let Some((push, gx, gy)) = Self::blend_geometry(slot, fmt, surf_w, cw, ch, ox, oy) else {
             return Ok(());
         };
-        // SAFETY: single-threaded record/submit/wait on handles this struct owns. The slot's
-        // previous submission completed (`record_blend`'s contract: this path fence-waits every
-        // blend, and an earlier ORDERED blend on this slot finished before the encoder reused it
-        // — ring-reuse discipline). Submit-info arrays are locals outliving the synchronous
-        // calls. The dispatch's shader accesses stay in-bounds by the shader's own guards
-        // (surfW/surfH/curW/curH from `push`) against the slot allocation sized in `alloc_slot`
-        // for exactly that geometry.
+        // SAFETY: single-thread owner. Previous submit completed (`record_blend`
+        // contract: this path fence-waits; an earlier ordered blend finished
+        // before ring reuse). Submit-info arrays outlive the call. Shader
+        // accesses stay in-bounds via `push` vs the `alloc_slot` geometry.
         unsafe {
             let d = &self.device;
             let cmd = self.record_blend(slot.id, fmt, &push, gx, gy)?;
@@ -942,11 +878,8 @@ impl VkSlotBlend {
                 .context("submit blend")?;
             let r = d.wait_for_fences(&[self.fence], true, 1_000_000_000);
             if r.is_err() {
-                // TIMEOUT (or device loss): the submission may still be executing. Resetting a
-                // fence with a pending signal and re-recording this slot's command buffer next
-                // frame would race the GPU — drain the device first (what
-                // `VkBridge::import_linear` does on a failed wait). On this tiny device the
-                // idle completes in microseconds once the stall clears.
+                // Wait failed: the submit may still be running. Do not reset
+                // the fence (pending signal) — drain first, then reset.
                 let _ = d.device_wait_idle();
             }
             d.reset_fences(&[self.fence]).ok();
@@ -955,18 +888,14 @@ impl VkSlotBlend {
         Ok(())
     }
 
-    /// Stream-ordered blend — no CPU sync anywhere (the fix for cursor frames serializing the
-    /// NVENC submit path). The caller has ENQUEUED (not synced) its CUDA frame copy on this
-    /// thread's copy stream; this method then
-    /// 1. enqueues a CUDA signal of `copy_done` on that stream (fires once the copy completes),
-    /// 2. submits the blend waiting `copy_done` and signaling `blend_done` on the Vulkan queue,
-    /// 3. enqueues a CUDA wait of `blend_done` — so later stream work (the encode, via the
-    ///    session's IO-stream binding) orders after the blend's writes.
+    /// Stream-ordered blend: no CPU sync. Caller has enqueued (not synced) the
+    /// CUDA copy on this thread's copy stream. Then: CUDA-signal `copy_done`,
+    /// Vulkan-submit waiting it and signaling `blend_done`, CUDA-wait
+    /// `blend_done` so later stream work (the encode) sees the writes.
     ///
-    /// Timeline values are fresh per call and never reused. Failure leaves no dangling waiter:
-    /// the CUDA wait is enqueued only after the submit was accepted, and an orphaned CUDA
-    /// signal is legal (timeline signals may skip values — a later, larger signal satisfies
-    /// any waiter).
+    /// Fresh timeline values, never reused. CUDA wait is enqueued only after
+    /// submit is accepted. An orphaned CUDA signal is legal (later larger
+    /// signal satisfies waiters).
     #[allow(clippy::too_many_arguments)] // same unpacked kernel args as `blend_ref`
     pub fn blend_ref_ordered(
         &mut self,
@@ -989,21 +918,18 @@ impl VkSlotBlend {
             t.ticket += 2;
             (t.ticket - 1, t.ticket, t.sem)
         };
-        // Signal FIRST: if this fails nothing was submitted and the fresh values are simply
-        // skipped. (The reverse order could wedge the queue — a submitted blend waiting on a
-        // copy-done signal that never got enqueued.)
+        // Signal first: if this fails, nothing was submitted and the fresh
+        // values are skipped. Reverse order wedges the queue (blend waiting
+        // a copy-done that was never enqueued).
         self.timeline
             .as_ref()
             .expect("checked above")
             .cuda
             .signal(copy_done)
             .context("cuSignalExternalSemaphoresAsync (copy done)")?;
-        // SAFETY: single-threaded record/submit on handles this struct owns. The slot's previous
-        // submission completed (`record_blend`'s contract — ring-reuse discipline, see above).
-        // All submit-info arrays and the timeline-submit chain are locals outliving the
-        // synchronous `queue_submit`. No fence: completion is observed through the timeline
-        // (the encode polls it via the CUDA wait below; teardown quiesces via
-        // `device_wait_idle`).
+        // SAFETY: single-thread owner. Previous submit completed (`record_blend`
+        // / ring-reuse). Submit-info and timeline chain are locals outliving
+        // `queue_submit`. Completion is the timeline, not a fence.
         unsafe {
             let cmd = self.record_blend(slot.id, fmt, &push, gx, gy)?;
             let cmds = [cmd];
@@ -1026,17 +952,16 @@ impl VkSlotBlend {
                 .context("submit ordered blend")?;
         }
         let t = self.timeline.as_mut().expect("checked above");
-        // Only now: `blend_done` WILL be signaled, so quiesces may rely on it.
+        // `blend_done` will be signaled; upload/teardown may wait it.
         t.last_blend = blend_done;
         if let Err(e) = t.cuda.wait(blend_done) {
-            // The blend is in flight but the encode would no longer order after it — restore
-            // the ordering with a bounded CPU wait (the CPU-synced path's cost, once). The
-            // frame still composites correctly.
+            // Blend is in flight but encode would no longer wait it — restore
+            // ordering with one bounded CPU wait.
             let sems = [t.sem];
             let values = [blend_done];
-            // SAFETY: live timeline semaphore; wait-info arrays are locals outliving the
-            // synchronous call; `blend_done` was accepted for signaling just above, so the
-            // wait terminates (timeout backstops a wedged queue).
+            // SAFETY: live timeline; wait-info arrays outlive the call.
+            // `blend_done` was accepted for signaling, so the wait terminates
+            // (timeout backstops a wedged queue).
             let r = unsafe {
                 t.ts.wait_semaphores(
                     &vk::SemaphoreWaitInfo::default()
@@ -1060,19 +985,17 @@ impl Drop for VkSlotBlend {
     fn drop(&mut self) {
         self.free_slots();
         if let Some(t) = self.timeline.take() {
-            drop(t.cuda); // CUDA's import of the semaphore goes first (mirrors the slot order)
-                          // SAFETY: `sem` was created in `init_timeline`, is uniquely owned, and is destroyed
-                          // exactly once here. No submission still references it: ordered blends only exist
-                          // alongside allocated slots, and `free_slots` just quiesced (device_wait_idle) any
-                          // in-flight work before this point.
+            drop(t.cuda); // CUDA import of the semaphore before the Vulkan object
+                          // SAFETY: created in `init_timeline`, uniquely owned, destroyed
+                          // once. `free_slots` already `device_wait_idle`'d in-flight work.
             unsafe {
                 self.device.destroy_semaphore(t.sem, None);
             }
         }
-        // SAFETY: every handle below was created in `new`/`init_objects` (or is null from a
-        // partial init — Vulkan destroy/free calls are defined no-ops on null handles) and is
-        // uniquely owned; each is destroyed exactly once here, pipelines/layouts/pools before the
-        // device, the device before the instance. No work is in flight (`blend` fence-waits).
+        // SAFETY: created in `new`/`init_objects` (or null from a partial init
+        // — Vulkan destroy is a no-op on null). Uniquely owned, destroyed once,
+        // pipelines/layouts/pools before the device, device before instance.
+        // No work in flight (`free_slots` drained; CPU blends fence-wait).
         unsafe {
             let d = &self.device;
             for p in self.pipelines {
@@ -1130,15 +1053,13 @@ mod tests {
         VkSlotBlend::blend_geometry(&slot(), fmt, 1920, cw, ch, ox, oy)
     }
 
-    /// An empty (clamped-away) cursor rect dispatches nothing.
     #[test]
     fn empty_rect_is_none() {
         assert!(geo(SlotFormat::Argb, 0, 32, 10, 10).is_none());
         assert!(geo(SlotFormat::Nv12, 32, 0, 10, 10).is_none());
     }
 
-    /// Oversized bitmaps clamp to `CURSOR_MAX` — the push constants must agree with the staging
-    /// buffer's capacity, or the shader reads past the uploaded bitmap.
+    /// Clamp to `CURSOR_MAX` so push constants match the staging buffer.
     #[test]
     fn cursor_dims_clamp_to_max() {
         let (push, _, _) = geo(SlotFormat::Argb, CURSOR_MAX + 100, CURSOR_MAX + 1, 0, 0).unwrap();
@@ -1146,9 +1067,9 @@ mod tests {
         assert_eq!(push.cur_h, CURSOR_MAX);
     }
 
-    /// ARGB dispatches per cursor pixel; NV12/YUV444 per word-aligned 4-px span, NV12 walking
-    /// 2-row blocks and YUV444 single rows. A 32×32 cursor at ox=13: spans cover the aligned
-    /// x∈[12,48) → 9 spans → 2 groups of 8.
+    /// Packed 32-bit: per cursor pixel. NV12/YUV444: word-aligned 4-px spans;
+    /// NV12 walks 2-row blocks, YUV444 rows. 32×32 at ox=13: spans cover
+    /// aligned x∈[12,48) → 9 spans → 2 groups of 8.
     #[test]
     fn group_counts_per_format() {
         let (_, gx, gy) = geo(SlotFormat::Argb, 32, 32, 13, 0).unwrap();
@@ -1161,9 +1082,9 @@ mod tests {
         assert_eq!((gx, gy), (2, 4)); // 9 spans → 2 groups; 32 rows → 4 groups
     }
 
-    /// Negative `ox` must anchor spans with FLOOR alignment (`>>` on the signed value), not
-    /// truncating division: at ox=-5 the aligned start is -8, giving 9 spans over a 32-px cursor
-    /// (truncation would start at -4 and dispatch only 8 — silently dropping the right edge).
+    /// Negative `ox` anchors spans with floor alignment (`>>` on signed),
+    /// not truncating division: ox=-5 starts at -8 (9 spans for 32 px).
+    /// Truncation would start at -4 and drop the right edge.
     #[test]
     fn negative_ox_floor_aligns_the_span_origin() {
         let (push, gx, _) = geo(SlotFormat::Nv12, 32, 32, -5, 0).unwrap();
@@ -1171,9 +1092,8 @@ mod tests {
         assert_eq!(gx, 2, "9 spans from the floor-aligned start → 2 groups");
     }
 
-    /// NV12 block rows anchor to the SURFACE chroma grid, so an odd `oy` needs one extra block
-    /// to reach the cursor's last luma row (the cursor-anchored count left that row's chroma
-    /// unwritten). Negative odd `oy` floors the same way (`div_euclid`).
+    /// NV12 blocks sit on the SURFACE chroma grid: odd `oy` needs one extra
+    /// block for the last luma row. Negative odd `oy` uses `div_euclid`.
     #[test]
     fn odd_oy_nv12_adds_the_straddle_block() {
         let (_, _, gy) = geo(SlotFormat::Nv12, 32, 32, 0, 8).unwrap();

@@ -1,24 +1,17 @@
-//! Shared audio layout: the single source of truth for Opus (multi)stream surround across the
-//! host, the GameStream compatibility path, and every client decoder.
+//! Shared audio layout: Opus (multi)stream surround for the host, GameStream, and every
+//! client decoder.
 //!
-//! **Canonical wire channel order** is `FL FR FC LFE RL RR SL SR` (the GameStream/Moonlight
-//! order, and the PipeWire/PulseAudio default map for 6/8 channels). Every host capturer
-//! delivers PCM in this order and every client decodes into it, so the Opus multistream
-//! `mapping` is the **identity** (`[0, 1, …, channels-1]`) on both ends — punktfunk owns the
-//! encoder and every decoder, so the GFE-style pre-rotation Moonlight needs over SDP
-//! (`gamestream::audio::surround_params`) is a GameStream-only concern and never touches the
-//! native `punktfunk/1` path.
+//! Wire order is `FL FR FC LFE RL RR SL SR` (GameStream/Moonlight and the PipeWire/PulseAudio
+//! 6/8 map). Capturers and decoders both use it, so the Opus multistream `mapping` is identity.
+//! GFE pre-rotation (`gamestream::audio::surround_params`) is GameStream-only; it never
+//! touches `punktfunk/1`.
 //!
-//! Channel counts the protocol negotiates: `2` (stereo), `6` (5.1) and `8` (7.1). Anything
-//! else clamps to stereo ([`normalize_channels`]).
-//!
-//! Opus is 48 kHz by construction, so the lossless plane is a SECOND plane rather than a
-//! parameter change to this one — see [`pcm`] and `design/hi-res-audio.md`.
+//! Negotiated counts: `2`, `6`, `8`. Anything else clamps to stereo ([`normalize_channels`]).
+//! Opus is 48 kHz; the lossless plane is a second plane — [`pcm`], `design/hi-res-audio.md`.
 
 pub mod pcm;
 
-/// Canonical wire channel positions; the index is the channel's slot in the interleaved PCM
-/// frame. A count of N uses positions `0..N` (always a prefix of this 8-channel order).
+/// Slot in the interleaved PCM frame. A count of N uses `0..N` of this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WirePos {
@@ -47,31 +40,21 @@ pub const WIRE_ORDER_8: [WirePos; 8] = {
     ]
 };
 
-/// One Opus (multi)stream layout. `mapping` is the libopus multistream mapping we encode AND
-/// decode with — identity, since punktfunk owns both ends. `streams`/`coupled` give the
-/// normal-quality coupling (FL,FR)+(FC,LFE) [+(RL,RR) on 7.1] with the remaining channels as
-/// mono streams; high quality is one mono stream per channel. Bitrates match Sunshine's
-/// per-config values (stereo keeps punktfunk's live-validated 128 kbps).
+/// One Opus (multi)stream layout. `mapping` is identity: both native ends use [`WIRE_ORDER_8`].
+/// Normal quality couples (FL,FR)+(FC,LFE) [+(RL,RR) on 7.1]; high quality is one mono stream
+/// per channel. Stereo is 128 kbps; the rest match Sunshine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpusLayout {
-    /// Interleaved channel count (2, 6 or 8).
     pub channels: u8,
-    /// Number of Opus streams in the multistream packet.
     pub streams: u8,
-    /// How many of those streams are coupled (stereo) pairs.
     pub coupled: u8,
-    /// libopus multistream channel mapping — identity `[0, 1, …, channels-1]`.
+    /// libopus multistream mapping. Identity `[0, 1, …, channels-1]`.
     pub mapping: &'static [u8],
-    /// Target Opus bitrate in bits/sec at [`AudioTier::Standard`] — see
-    /// [`OpusLayout::bitrate_for`], which is what callers should use. These are the historical
-    /// values, kept exactly so `Standard` reproduces the pre-tier wire byte-for-byte.
-    ///
-    /// The GameStream plane encodes hard-CBR from these (its audio FEC needs a constant packet
-    /// size); the native plane uses constrained VBR, where that constraint does not apply.
+    /// [`AudioTier::Standard`] bitrate, bits/sec. GameStream encodes hard-CBR from this (FEC
+    /// needs a constant packet size); native uses constrained VBR.
     pub bitrate: i32,
 }
 
-/// Stereo: a plain coupled pair. The 128 kbps live-validated config.
 pub const LAYOUT_STEREO: OpusLayout = OpusLayout {
     channels: 2,
     streams: 1,
@@ -87,7 +70,7 @@ pub const LAYOUT_51: OpusLayout = OpusLayout {
     mapping: &[0, 1, 2, 3, 4, 5],
     bitrate: 256_000,
 };
-/// 5.1 high quality: one mono stream per channel.
+/// 5.1 high quality: uncoupled, one stream per channel.
 pub const LAYOUT_51_HQ: OpusLayout = OpusLayout {
     channels: 6,
     streams: 6,
@@ -103,7 +86,7 @@ pub const LAYOUT_71: OpusLayout = OpusLayout {
     mapping: &[0, 1, 2, 3, 4, 5, 6, 7],
     bitrate: 450_000,
 };
-/// 7.1 high quality: one mono stream per channel.
+/// 7.1 high quality: uncoupled, one stream per channel.
 pub const LAYOUT_71_HQ: OpusLayout = OpusLayout {
     channels: 8,
     streams: 8,
@@ -112,33 +95,28 @@ pub const LAYOUT_71_HQ: OpusLayout = OpusLayout {
     bitrate: 2_048_000,
 };
 
-/// Encode bitrate tier for the desktop-audio downlink. The layout table's `bitrate` is the
-/// [`AudioTier::Standard`] value, so `Standard` reproduces the pre-tier wire byte-for-byte.
+/// Encode bitrate for the desktop-audio downlink. The layout table's `bitrate` is
+/// [`AudioTier::Standard`].
 ///
-/// **Why a tier at all.** 5 ms Opus frames are markedly less efficient than 20 ms ones (shorter
-/// MDCT, a bigger per-packet overhead share), so the historical 128 kbps stereo buys roughly what
-/// ~100 kbps buys at 20 ms — audible on music, and the 2026-08-03 field report said exactly that.
-/// Meanwhile the same session carries tens of Mbps of video: at 256 kbps audio is ~1 % of the
-/// budget. [`AudioTier::High`] is therefore the DEFAULT; the lower tiers exist for a genuinely
-/// constrained link, not as the normal case.
+/// 5 ms Opus frames are less efficient than 20 ms, so 128 kbps stereo here is roughly 100 kbps
+/// at 20 ms. Video is tens of Mbps; 256 kbps audio is ~1 % of that budget, so [`AudioTier::High`]
+/// is the default. Lower tiers are for a constrained link.
 ///
-/// Purely a host-side encoder knob: every client decodes whatever bitrate arrives (libopus reads
-/// it from the packet), so changing tiers needs no protocol negotiation and no client change.
+/// Host-side only: libopus reads the bitrate from the packet. A tier change needs no negotiation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum AudioTier {
-    /// Constrained links — noticeably lossy on music, still fine for game/voice content.
+    /// Constrained links. Lossy on music; fine for game/voice.
     Low,
-    /// The historical values (stereo 128 kbps). Kept exactly so the tier machinery is provably
-    /// non-regressive against every pre-tier build.
+    /// The layout table's `bitrate` (stereo 128 kbps).
     Standard,
-    /// The default: effectively transparent at 5 ms frames, for ~1 % of a normal video budget.
+    /// The default. Transparent at 5 ms frames; ~1 % of a normal video budget.
     #[default]
     High,
 }
 
 impl AudioTier {
-    /// Parse a config/CLI spelling (`low` / `standard` / `high`); `None` for anything else so the
-    /// caller can warn and fall back rather than silently downgrading someone's audio.
+    /// Parse a config/CLI spelling (`low` / `standard` / `high`). `None` for anything else so the
+    /// caller can warn and fall back rather than silently changing the tier.
     pub fn parse(s: &str) -> Option<AudioTier> {
         match s.trim().to_ascii_lowercase().as_str() {
             "low" => Some(AudioTier::Low),
@@ -158,11 +136,9 @@ impl AudioTier {
 }
 
 impl OpusLayout {
-    /// This layout's target bitrate at `tier`. The uncoupled HIGH-QUALITY layouts
-    /// ([`LAYOUT_51_HQ`] / [`LAYOUT_71_HQ`]) are already far past transparency, so they are
-    /// tier-invariant — scaling 1.5 Mbps up would only waste wire.
+    /// Target bitrate at `tier`. HQ layouts ([`LAYOUT_51_HQ`] / [`LAYOUT_71_HQ`]) are already
+    /// past transparency, so they ignore the tier.
     pub fn bitrate_for(&self, tier: AudioTier) -> i32 {
-        // One mono stream per channel == the HQ layouts; nothing to gain from a tier there.
         if self.coupled == 0 && self.streams == self.channels {
             return self.bitrate;
         }
@@ -178,39 +154,25 @@ impl OpusLayout {
     }
 }
 
-/// What the audio plane will actually cost this session: the tier to encode at, and whether the
-/// redundant `0xD2` plane is affordable. Produced by [`plan_audio_budget`].
+/// Encode tier and whether the redundant `0xD2` plane fits. From [`plan_audio_budget`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioBudget {
     pub tier: AudioTier,
     pub redundancy: bool,
-    /// Total wire cost in kbps, redundancy included — what the decision was made against.
     pub kbps: u32,
 }
 
-/// Share of the session's video bitrate the audio plane may spend. Audio rides QUIC datagrams,
-/// OUTSIDE the ABR loop, so whatever it takes is taken off the top and adaptive bitrate can
-/// neither see nor reclaim it — which is exactly why it needs a budget of its own.
+/// Share of the session video bitrate audio may spend. Audio rides QUIC datagrams outside ABR,
+/// so whatever it takes is taken off the top and cannot be reclaimed.
 const AUDIO_BUDGET_PCT: u32 = 5;
-/// …but never squeeze audio below the Low tier. A stream with unintelligible audio is worse than
-/// one that spends a few percent more, and the floor is what stops a very low video bitrate from
-/// silently producing a useless audio plane.
+/// Never encode below Low. Unintelligible audio is worse than spending a few percent more.
 const AUDIO_BUDGET_FLOOR_KBPS: u32 = 96;
 
-/// Choose the encode tier and whether to send redundancy, given the session's resolved VIDEO
-/// bitrate.
+/// Choose encode tier and redundancy from the session's resolved VIDEO bitrate.
 ///
-/// **Why this exists.** Tier `High` and the redundant plane were introduced separately, each
-/// justified as "about 1 % of the video budget" — but they multiply: 256 kbps stereo sent twice is
-/// 512 kbps, which is ~2.5 % of a 20 Mbps session and ~10 % of a 5 Mbps one. Nothing added the two
-/// together, and nothing capped the total, so on a constrained link the audio plane quietly took a
-/// tenth of the bandwidth that ABR was carefully managing the rest of.
-///
-/// The ladder is ordered by preference, not by cost: transparent audio beats redundant audio (the
-/// complaint this whole program came from was quality, and the redundancy only pays off under
-/// loss), so `High` alone outranks `Standard` + redundancy even though they cost the same.
-/// `requested` lets an operator ask for a specific tier; the budget can lower it but never raises
-/// it above what was asked.
+/// The ladder is preference, not cost: transparent audio beats redundant audio (redundancy only
+/// pays under loss), so `High` alone outranks `Standard` + redundancy at the same cost.
+/// `requested` is a ceiling: the budget may lower the tier, never raise it.
 pub fn plan_audio_budget(
     video_kbps: u32,
     channels: u8,
@@ -227,8 +189,7 @@ pub fn plan_audio_budget(
             one
         }
     };
-    // Preference order, best first. An operator asking for `Low` must not be handed `High`, so
-    // candidates above the request are filtered out.
+    // Rank is a ceiling: a request of `Low` must not be handed `High`.
     let rank = |t: AudioTier| match t {
         AudioTier::Low => 0,
         AudioTier::Standard => 1,
@@ -254,7 +215,7 @@ pub fn plan_audio_budget(
             };
         }
     }
-    // Nothing fit — take the cheapest thing that still works rather than muting audio.
+    // Nothing fit. Encode Low rather than mute.
     AudioBudget {
         tier: AudioTier::Low,
         redundancy: false,
@@ -262,8 +223,7 @@ pub fn plan_audio_budget(
     }
 }
 
-/// Pick the layout for a negotiated channel count. Unknown counts fall back to stereo (clients
-/// only ever request 2/6/8). `high_quality` selects the uncoupled high-bitrate config.
+/// Layout for a negotiated channel count. Unknown counts fall back to stereo.
 pub fn layout_for(channels: u8, high_quality: bool) -> &'static OpusLayout {
     match (channels, high_quality) {
         (6, false) => &LAYOUT_51,
@@ -274,8 +234,7 @@ pub fn layout_for(channels: u8, high_quality: bool) -> &'static OpusLayout {
     }
 }
 
-/// Clamp an arbitrary (wire / requested) channel count to one the protocol negotiates. `0`,
-/// absent, or any unsupported value becomes stereo.
+/// Clamp to a negotiable count: 2, 6, or 8.
 pub fn normalize_channels(requested: u8) -> u8 {
     match requested {
         6 => 6,
@@ -286,23 +245,17 @@ pub fn normalize_channels(requested: u8) -> u8 {
 
 /// Loss detector for the client audio plane, shared by every platform decoder.
 ///
-/// The `0xC9` audio datagrams carry a per-packet sequence the host advances by 1 (wrapping), but
-/// ride the lossy datagram plane with no FEC — a lost 5 ms Opus packet used to play out as a hard
-/// gap (a click/pop; the jitter rings just emit silence). Feeding this tracker each received
-/// packet's sequence tells the decoder how many packets went missing *immediately before it*, so
-/// it can synthesize that many frames of libopus packet-loss concealment (`decode` with empty
-/// input) before decoding the real one — turning clicks into an inaudible interpolation.
+/// `0xC9` datagrams carry a wrapping per-packet sequence on the lossy plane, with no FEC. Each
+/// received sequence tells the decoder how many packets were missing immediately before it, so
+/// it can run that many frames of libopus PLC (`decode` with empty input) first.
 ///
-/// Reorders and duplicates conceal nothing (the plane has no reorder buffer; playing a late
-/// packet where it lands is the existing behaviour), and a gap is capped at
-/// [`MAX_CONCEAL_MS`] of audio — libopus PLC fades to silence after a few frames anyway, so past
-/// the cap the ring's underrun/re-prime path takes over as before.
+/// Reorders and duplicates conceal nothing (no reorder buffer). A gap is capped at
+/// [`MAX_CONCEAL_MS`]; past that, libopus PLC has faded to silence and the ring underrun path
+/// takes over.
 #[derive(Debug)]
 pub struct AudioGapTracker {
-    /// Sequence of the newest packet seen (`None` until the first).
     last_seq: Option<u32>,
-    /// One frame, in microseconds — what turns [`MAX_CONCEAL_MS`] into the packet count this type
-    /// actually caps at. [`FRAME_MS`] unless [`set_frame_us`](Self::set_frame_us) says otherwise.
+    /// One frame in microseconds; turns [`MAX_CONCEAL_MS`] into a packet cap. [`FRAME_MS`] until set.
     frame_us: u32,
 }
 
@@ -315,28 +268,18 @@ impl Default for AudioGapTracker {
     }
 }
 
-/// Longest gap a single loss event will synthesize concealment for, in MILLISECONDS.
+/// Longest gap one loss event conceals, in milliseconds — not a packet count, so a 2 ms lossless
+/// frame still buys 50 ms. Same family as [`DroughtConceal::new_at_frame_us`].
 ///
-/// It used to be a flat count of ten packets, documented as "50 ms at the protocol's 5 ms frames"
-/// — which it was, right up until the lossless plane started negotiating shorter ones. On a 2 ms
-/// frame the same ten packets are **20 ms**, so the cap silently tightened by two and a half times
-/// on precisely the sessions whose packet rate went up. Same family as the drought fuse
-/// ([`DroughtConceal::new_at_frame_us`]) and the near-miss margin, and the same cure: state the
-/// bound in time and derive the count from the frame that was actually resolved.
-///
-/// Crate-internal: callers only ever see [`AudioGapTracker::missing_before`]'s already-capped
-/// count, and cbindgen must not export either of these — they are not part of the C ABI.
+/// Crate-internal: callers see [`AudioGapTracker::missing_before`]'s already-capped count.
+/// Not part of the C ABI; cbindgen must not export this.
 pub(crate) const MAX_CONCEAL_MS: u32 = 50;
 
-/// [`MAX_CONCEAL_MS`] as a packet count at a given frame length: 10 at the Opus plane's 5 ms
-/// (bit-identical to the constant this replaced), 25 at a 2 ms lossless frame.
+/// [`MAX_CONCEAL_MS`] as a packet count at `frame_us`: 10 at 5 ms, 25 at 2 ms. Floors at 1 so a
+/// zero cap cannot disable concealment.
 ///
-/// Floors, so the cap is never *more* than the milliseconds it promises, with a floor of one
-/// frame — a cap of zero would disable concealment outright on an absurd `frame_us`.
-///
-/// `pub(crate)` for the in-core PCM decoder (`abi.rs`), which sizes its no-realloc output buffer
-/// from this and must be told the SAME frame length, or the buffer and the cap disagree about how
-/// many frames can arrive at once.
+/// `pub(crate)` so the PCM decoder in `abi.rs` can size its no-realloc buffer from the same
+/// frame length. Buffer and cap must agree on how many frames can arrive at once.
 pub(crate) const fn max_conceal_packets(frame_us: u32) -> u32 {
     let us = if frame_us == 0 {
         FRAME_MS * 1000
@@ -356,21 +299,15 @@ impl AudioGapTracker {
         Self::default()
     }
 
-    /// Tell the tracker how long one audio frame actually is, in microseconds — the resolved
-    /// `audio_frame_us` on a lossless session, unset (and so [`FRAME_MS`]) on every Opus one.
-    ///
-    /// Defaulted rather than taken in the constructor for the same reason
-    /// [`JitterPolicy::set_frame_us`] is: every Opus session and every existing caller stays
-    /// bit-identical, and the value only becomes known after the `Welcome`.
+    /// Frame length in microseconds — `audio_frame_us` on a lossless session, [`FRAME_MS`] on Opus.
+    /// Not a constructor argument: the value is known only after `Welcome`.
     pub fn set_frame_us(&mut self, frame_us: u32) {
         self.frame_us = frame_us.max(1);
     }
 
-    /// Feed the next received packet's sequence; returns how many packets are missing immediately
-    /// before it (`0` for in-order, the first packet, duplicates, and reorders), capped at
-    /// [`MAX_CONCEAL_MS`] of audio at the frame length this tracker was told about.
-    /// Wrapping-safe: a sequence in the backward half of the u32 space is a reorder, not a
-    /// 2³¹-packet gap.
+    /// Packets missing immediately before `seq` (`0` for in-order, first, duplicates, reorders),
+    /// capped at [`MAX_CONCEAL_MS`]. A sequence in the backward half of u32 is a reorder, not a
+    /// 2³¹ gap.
     pub fn missing_before(&mut self, seq: u32) -> u32 {
         let Some(last) = self.last_seq else {
             self.last_seq = Some(seq);
@@ -378,27 +315,22 @@ impl AudioGapTracker {
         };
         let delta = seq.wrapping_sub(last);
         if delta == 0 || delta > u32::MAX / 2 {
-            return 0; // duplicate, or a reorder older than the newest — nothing to conceal
+            return 0; // duplicate, or a reorder older than the newest
         }
         self.last_seq = Some(seq);
         (delta - 1).min(max_conceal_packets(self.frame_us))
     }
 }
 
-/// Rebuilds the audio stream from the redundant `0xD2` plane, so a single lost datagram is
-/// RECOVERED rather than concealed.
+/// Rebuilds the stream from the redundant `0xD2` plane so a single lost datagram is recovered,
+/// not concealed.
 ///
-/// Deliberately lives in core, on the demux side, rather than in the four client decoders. The
-/// recovered frame is re-inserted into the same queue in order, so every embedder — Linux,
-/// Windows, Android, Apple, and any C-ABI consumer — gets a complete stream with no change at all,
-/// and their [`AudioGapTracker`] simply stops seeing the gap.
-///
-/// **Only the immediately-preceding frame can be recovered**, because that is all the wire carries
-/// (see [`crate::quic::encode_audio_red_datagram`]). A longer burst still falls through to
-/// packet-loss concealment — but it falls through one frame shorter, which is strictly better.
+/// Lives in core on the demux side so every embedder sees a complete stream and
+/// [`AudioGapTracker`] stops seeing the gap. Only the immediately-preceding frame can be
+/// recovered — that is all the wire carries ([`crate::quic::encode_audio_red_datagram`]). A
+/// longer burst still conceals, one frame shorter.
 #[derive(Debug, Default)]
 pub struct AudioRedRecovery {
-    /// Sequence of the newest packet handed downstream.
     last_seq: Option<u32>,
 }
 
@@ -407,25 +339,22 @@ impl AudioRedRecovery {
         Self::default()
     }
 
-    /// Feed the arriving datagram's sequence and whether it carried a redundant copy. Returns
-    /// `true` when that copy should be emitted (as `seq - 1`) BEFORE the packet itself.
-    ///
-    /// Wrapping-safe, and conservative in both directions: a reorder or duplicate recovers
-    /// nothing, and neither does the first packet of a session (nothing is known to be missing).
+    /// Returns `true` when the redundant copy should be emitted as `seq - 1` BEFORE this packet.
+    /// Reorders, duplicates, and the first packet of a session recover nothing.
     pub fn recover_before(&mut self, seq: u32, has_prev: bool) -> bool {
         let recover = match self.last_seq {
-            // Nothing emitted yet: no evidence anything was lost, so inserting the predecessor
-            // would prepend audio the client never missed.
+            // First packet of the session: inserting the predecessor would prepend audio
+            // the client never missed.
             None => false,
             Some(last) => {
                 let delta = seq.wrapping_sub(last);
-                // `delta == 1` is in-order; `delta >= 2` (forward half of the space only) means
-                // at least the predecessor is missing.
+                // `delta == 1` is in-order. `delta >= 2` in the forward half means at least
+                // the predecessor is missing.
                 has_prev && (2..u32::MAX / 2).contains(&delta)
             }
         };
         self.last_seq = Some(match self.last_seq {
-            // A reorder must not drag the anchor backwards.
+            // A reorder must not move the anchor backwards.
             Some(last) if seq.wrapping_sub(last) > u32::MAX / 2 => last,
             _ => seq,
         });
@@ -433,65 +362,35 @@ impl AudioRedRecovery {
     }
 }
 
-// ---- the shared playback de-jitter policy -------------------------------------------------
+// ---- playback de-jitter -------------------------------------------------------------------
 
-/// The protocol's audio frame, in milliseconds — every host datagram carries exactly one
-/// ([`crate::quic::encode_audio_datagram`]), so it is also the smallest useful shed unit.
+/// Opus-plane frame length in milliseconds, and the default. One datagram carries exactly one
+/// ([`crate::quic::encode_audio_datagram`]), so it is also the smallest shed unit.
 ///
-/// ⚠ **This is the OPUS plane's frame, and the default. It is not the only one.** The lossless
-/// plane negotiates shorter frames sized to the path MTU ([`pcm::frame_us_for`]): 4 ms at
-/// 48 kHz/24-bit and 2 ms at 96 kHz/24-bit under the default ceiling. The resolved value rides the
-/// `Welcome` as `audio_frame_us` and is on [`crate::client::NativeClient::audio_frame_us`].
-///
-/// It is exported to C as `PUNKTFUNK_AUDIO_FRAME_MS` and is **kept at 5 with its meaning
-/// unchanged**, exactly like `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ`: embedders size rings from it and
-/// removing it would be a silent C break. But sizing a ring as *frames × `PUNKTFUNK_AUDIO_FRAME_MS`*
-/// is wrong by up to 2.5× on a lossless session. An embedder that drains
-/// [`crate::abi::punktfunk_connection_next_audio_pcm`] is safe without doing anything — that call
-/// reports each frame's real length in `frame_count`, which is the figure to size from.
+/// The lossless plane negotiates shorter frames ([`pcm::frame_us_for`]); the resolved value is
+/// `audio_frame_us` on `Welcome`. Exported to C as `PUNKTFUNK_AUDIO_FRAME_MS` and kept at 5 —
+/// embedders size rings from it. Sizing as *frames × this* is wrong by up to 2.5× on lossless;
+/// drain [`crate::abi::punktfunk_connection_next_audio_pcm`] and use `frame_count` instead.
 pub const FRAME_MS: u32 = 5;
 
-/// Tuning for [`JitterPolicy`], in MILLISECONDS.
-///
-/// Denominating the depth in time rather than in device quanta is the point. Every client used to
-/// compute its target as `3 × quantum`, which is a sane 15 ms at a 5 ms quantum and a silent 64 ms
-/// at a 20 ms one — the same source line meaning two very different latencies depending on what
-/// else happened to be using the audio graph that day.
+/// Tuning for [`JitterPolicy`], in milliseconds. Depth is time, not device quanta: `3 × quantum`
+/// is 15 ms at 5 ms and 64 ms at 20 ms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JitterTuning {
     /// Depth to prime to before the first sample plays, and the depth drift correction pulls
     /// back toward. The adaptive floor may raise the live target above this; it never goes below.
     pub base_target_ms: u32,
-    /// Ceiling for the adaptively-grown target (see [`JitterPolicy::note_read`]).
     pub max_target_ms: u32,
-    /// Slack above the live target before drop-oldest trimming starts. Absorbs an arrival burst
-    /// without overflowing.
-    ///
-    /// Drift correction sheds at the MIDDLE of this band (see [`JitterTuning::shed_excess_ms`]),
-    /// so the smooth correction always gets its chance before the hard trim. Setting this too
-    /// small is a real failure mode, not just a tuning choice: if the trim point sits below the
-    /// shed point, the ring is trimmed back before the depth average can ever reach the shed
-    /// threshold, drift correction becomes dead code, and every correction is once again the
-    /// audible drop it was supposed to replace.
+    /// Slack above the live target before drop-oldest trimming. Sheds at the middle of this band
+    /// ([`JitterTuning::shed_excess_ms`]). If the trim point sits below the shed point, drift
+    /// correction never fires and every correction is the audible drop it was meant to replace.
     pub headroom_ms: u32,
     /// Absolute bound on buffered audio — the only hard guarantee on added latency.
     pub hard_cap_ms: u32,
-    /// How long the ring may run short before it gives up and goes back to priming, in
-    /// MILLISECONDS of starvation — not a count of callbacks.
-    ///
-    /// It used to be a callback count, and that made the hysteresis mean something different on
-    /// every platform, because a callback is not a unit of time: the same `4` was ~40 ms of slack
-    /// on a 10 ms WASAPI quantum and **20 ms on iOS**, whose session asks for a 5 ms IO buffer —
-    /// the shortest fuse of any client, on the one with the burstiest transport. A 100 ms Wi-Fi
-    /// delivery stall then de-primed the Apple ring on every single bunching cycle (measured: 120
-    /// audible gaps in 10 minutes at a 5 ms quantum, versus 3 at 8 ms and 1 at 16 ms, on an
-    /// otherwise identical link) while the same policy rode it out everywhere else. Expressed in
-    /// time, one number means one thing on all four clients and a device's buffer size stops
-    /// silently re-tuning the de-prime behaviour.
-    ///
-    /// A floor of `MIN_DEPRIME_CALLBACKS` callbacks still applies, so a large-quantum device
-    /// keeps real hysteresis: `1` reproduces the old `if ring.is_empty() { primed = false }`, where
-    /// a single transient drain manufactured a whole target's worth of fresh silence.
+    /// Starvation before the ring re-primes, in milliseconds — not a callback count. A floor of
+    /// `MIN_DEPRIME_CALLBACKS` still applies so a large-quantum device keeps real hysteresis.
+    /// `1` is `if ring.is_empty() { primed = false }`: one drain manufactures a whole target
+    /// of silence.
     pub deprime_ms: u32,
 }
 
@@ -513,11 +412,8 @@ impl JitterTuning {
         hard_cap_ms: 90,
         deprime_ms: 50,
     };
-    /// CoreAudio via AVAudioEngine — comparable to WASAPI, but the transport is not: this is the
-    /// preset an iPad on Wi-Fi runs, so it gets the longer fuse for the same reason [`AAUDIO`]
-    /// does. (The old comment here read "the iOS IO buffer is already 5 ms" as grounds for using
-    /// WASAPI's callback count unchanged; that quantum is precisely why a count was the wrong unit
-    /// — see [`JitterTuning::deprime_ms`].)
+    /// CoreAudio via AVAudioEngine. Same engine as WASAPI; longer `deprime_ms` because wireless
+    /// clients stall more. See [`AAUDIO`].
     ///
     /// [`AAUDIO`]: JitterTuning::AAUDIO
     pub const COREAUDIO: JitterTuning = JitterTuning {
@@ -527,10 +423,8 @@ impl JitterTuning {
         hard_cap_ms: 90,
         deprime_ms: 60,
     };
-    /// AAudio hands us a raw realtime callback and makes us own the buffer, and Wi-Fi power-save
-    /// bunching lands as underruns = crackle. Android therefore starts DEEPER — but at 25 ms, not
-    /// the old fixed 40: the adaptive floor raises it only on the devices that actually underrun,
-    /// instead of every device pre-paying for the worst one.
+    /// AAudio: raw realtime callback, we own the buffer. Starts at 25 ms; the adaptive floor
+    /// raises it only on devices that underrun.
     pub const AAUDIO: JitterTuning = JitterTuning {
         base_target_ms: 25,
         max_target_ms: 90,
@@ -539,20 +433,15 @@ impl JitterTuning {
         deprime_ms: 60,
     };
 
-    /// How long a packet DROUGHT may be concealed before the ring is allowed to underrun and the
-    /// de-prime hysteresis is allowed to run (WP-C1). Twice the de-prime window: long enough to
-    /// ride out the delivery stalls that de-prime rings today, short enough that a genuinely dead
-    /// stream is not papered over. DERIVED rather than a fifth field, so it cannot drift away from
-    /// the fuse it exists to protect — and per-platform for free, since `deprime_ms` already is.
+    /// Longest packet drought to conceal before the ring may underrun. Twice `deprime_ms`: long
+    /// enough to ride a delivery stall, short enough not to paper over a dead stream. Derived so
+    /// it cannot drift from the fuse it protects.
     pub const fn plc_max_ms(&self) -> u32 {
         self.deprime_ms * 2
     }
 
-    /// How far above the live target the depth average must sit before drift correction sheds:
-    /// the middle of the headroom band, but never less than two protocol frames (so it cannot be
-    /// hair-triggered by one quantum of normal swing). Deriving it from `headroom_ms` rather than
-    /// fixing it absolutely is what keeps the smooth shed strictly BELOW the hard trim on every
-    /// preset — see the field on `headroom_ms`.
+    /// Depth-average excess that arms drift shed: middle of the headroom band, never less than
+    /// two protocol frames. Derived from `headroom_ms` so the shed stays strictly below the trim.
     pub const fn shed_excess_ms(&self) -> u32 {
         let half = self.headroom_ms / 2;
         if half > 2 * FRAME_MS {
@@ -563,40 +452,26 @@ impl JitterTuning {
     }
 }
 
-// The two drought thresholds — how long a quiet wire must stay quiet, and how empty the ring must
-// be — are both TWO PROTOCOL FRAMES, so they live on `DroughtConceal` as `after()`/`floor_ms()`
-// rather than as constants. They were `2 * FRAME_MS`, which on a 2 ms lossless frame waits five
-// frames instead of two before conceding there is a stall.
+// Drought thresholds (quiet-wire duration and ring-empty floor) are two protocol frames, so they
+// live on `DroughtConceal` as `after()`/`floor_ms()` rather than constants. `2 * FRAME_MS` waits
+// five frames on a 2 ms lossless frame.
 
-/// Bounded concealment of a packet DROUGHT — the client-side twin of the host's capture-hole
-/// infill (design/host-source-stutter-fixes.md, WP-C1).
+/// Bounded concealment of a packet drought. Client-side twin of the host capture-hole infill
+/// (`design/host-source-stutter-fixes.md`).
 ///
-/// The decode path already conceals a SEQ GAP: [`AudioGapTracker`] reports the packets missing
-/// before the one that arrived and libopus synthesizes each from the decoder's own state. But that
-/// only fires when a LATER packet arrives to reveal the gap. When the wire simply goes quiet — a
-/// delivery stall on a bunching Wi-Fi link, or a host whose capture stalled — nothing arrives to
-/// reveal anything: the ring drains to empty, the callback runs short, and
-/// [`JitterPolicy::note_read`] de-primes and then re-primes a whole target's worth of fresh
-/// silence. The artifact is far longer than the audio actually missing, and this is the shape the
-/// 2026-08-15 field session spent 3–16 % of its wall-clock in.
-///
-/// So a drought that is draining the ring gets concealed too, from the same decoder state, for a
-/// bounded time. Denominated in TIME, never in frames or callbacks: that is the recorded lesson
-/// from the very fuse this protects, where a count gave an iPad a third of a Mac's slack for no
-/// reason anyone intended.
-///
-/// Time is passed IN, so the policy stays as syscall-free and deterministic as the rest of this
-/// module.
+/// [`AudioGapTracker`] conceals a sequence gap once a later packet arrives. A quiet wire
+/// reveals nothing: the ring drains, [`JitterPolicy::note_read`] de-primes, and the re-prime
+/// is a whole target of silence. A drought that is draining the ring is concealed from the
+/// same decoder state, bounded in time (never frames or callbacks). Time is passed in so the
+/// policy stays syscall-free.
 pub struct DroughtConceal {
-    /// Frames concealed since the last real packet. Counted in FRAMES rather than milliseconds
-    /// because that is what [`packet`](Self::packet) owes its caller, and because the frame is no
-    /// longer a fixed 5 ms — see [`new_at_frame_us`](Self::new_at_frame_us).
+    /// Frames concealed since the last real packet — what [`packet`](Self::packet) returns, and
+    /// the unit that survives a non-5 ms frame. See [`new_at_frame_us`](Self::new_at_frame_us).
     concealed: u32,
     max_ms: u32,
-    /// One frame, in microseconds. Everything time-denominated here derives from it.
     frame_us: u32,
-    /// Concealed over the session — what the 10 s `plc_ms=` line reports. Concealment must be
-    /// visible: a policy that quietly papers over a failing link is a policy that hides the bug.
+    /// Session concealment, for the 10 s `plc_ms=` line. A policy that papers over a failing
+    /// link must be visible.
     total: u64,
 }
 
@@ -606,15 +481,8 @@ impl DroughtConceal {
         Self::new_at_frame_us(max_ms, FRAME_MS * 1000)
     }
 
-    /// At an explicitly negotiated frame length.
-    ///
-    /// This type charges one frame per concealed frame and bounds itself in WALL-CLOCK
-    /// milliseconds, so the two have to agree about how long a frame is. They did not: the frame
-    /// was assumed to be 5 ms, and on a 2 ms lossless frame that made the `max_ms` budget run out
-    /// after two fifths of the time it is meant to buy, and the reported `plc_ms` two and a half
-    /// times too high. The frame COUNT was always right — it charged 5 and divided by 5 — which is
-    /// exactly why this went unnoticed: the load-bearing number was fine and only the two
-    /// human-facing ones were wrong.
+    /// At an explicitly negotiated frame length. Charges one frame per concealed frame and bounds
+    /// itself in wall-clock milliseconds, so the two have to agree on how long a frame is.
     pub fn new_at_frame_us(max_ms: u32, frame_us: u32) -> DroughtConceal {
         DroughtConceal {
             concealed: 0,
@@ -624,7 +492,7 @@ impl DroughtConceal {
         }
     }
 
-    /// How long a drought must last before it is concealed at all — two frames, so an ordinary
+    /// How long a drought must last before it is concealed at all. Two frames, so an ordinary
     /// inter-packet gap is never mistaken for a stall.
     fn after(&self) -> std::time::Duration {
         std::time::Duration::from_micros(2 * self.frame_us as u64)
@@ -637,16 +505,13 @@ impl DroughtConceal {
         (2 * self.frame_us).div_ceil(1000)
     }
 
-    /// A packet arrived, ending any drought. Returns how many FRAMES were concealed for it, so the
-    /// caller can subtract them from the loss concealment [`AudioGapTracker`] is about to ask for:
-    /// packets genuinely lost inside a drought we already covered must not be covered twice, which
-    /// would insert audio the stream never had and push everything after it later.
+    /// A packet arrived. Returns frames already concealed so the caller can subtract them from
+    /// [`AudioGapTracker`]: loss inside a covered drought must not be covered twice.
     pub fn packet(&mut self) -> u32 {
         std::mem::take(&mut self.concealed)
     }
 
-    /// Should one more frame be concealed? `depth_ms` is the playout ring as the callback last
-    /// saw it.
+    /// Conceal one more frame? `depth_ms` is the playout ring as the callback last saw it.
     pub fn conceal(&mut self, since_last_packet: std::time::Duration, depth_ms: u32) -> bool {
         if since_last_packet < self.after()
             || depth_ms > self.floor_ms()
@@ -659,12 +524,10 @@ impl DroughtConceal {
         true
     }
 
-    /// Concealed since the last real packet, in ms — the figure the `max_ms` budget bounds.
     fn concealed_ms(&self) -> u32 {
         (self.concealed as u64 * self.frame_us as u64 / 1000) as u32
     }
 
-    /// Concealment over the session, ms.
     pub fn total_ms(&self) -> u64 {
         self.total * self.frame_us as u64 / 1000
     }
@@ -673,74 +536,39 @@ impl DroughtConceal {
 /// What one callback should do, from [`JitterPolicy::step`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct JitterStep {
-    /// Interleaved samples to discard from the FRONT of the ring before reading.
     pub drop_front: usize,
-    /// Interleaved samples to DUPLICATE at the front of the ring before reading — the mirror of
-    /// `drop_front` ([`crossfade_insert`] does it for a `VecDeque<f32>` ring). Never set in the
-    /// same step as `drop_front`. Zero when nothing is inserted.
-    ///
-    /// This is how the ring gets DEEPER without a re-prime. Before it existed the policy could
-    /// lower depth gently (one crossfaded frame per sustain window) but could only raise it by
-    /// de-priming — a whole `target − depth` of inserted silence plus the priming wait — and the
-    /// A/V sync loop asking for a deeper ring made that happen on the very next late packet: a
-    /// 15–60 ms gap, repeated every time a wandering video reference asked again. Now a sync
-    /// request for more depth is answered the way a request for less is: one crossfaded frame at
-    /// a time, and the de-prime is reserved for genuine starvation and for growth that was never
-    /// banked (see `hollow`).
+    /// Samples to duplicate at the front ([`crossfade_insert`]). Never set in the same step as
+    /// `drop_front`. How the ring gets deeper without a re-prime: one crossfaded frame at a time.
+    /// De-prime stays for genuine starvation and for growth that was never banked (`hollow`).
     pub insert_front: usize,
-    /// Interleaved samples of linear crossfade to apply across the seam left by `drop_front` or
-    /// `insert_front` ([`crossfade_drop`] / [`crossfade_insert`] do it for a `VecDeque<f32>`
-    /// ring). Zero only when nothing is dropped or inserted.
-    ///
-    /// BOTH kinds of drop are faded. The hard-cap trim used to splice raw, on the reasoning that a
-    /// ring which blew its ceiling "is already a discontinuity" — but that is a statement about the
-    /// ARRIVALS, not about the samples either side of the seam, which are ordinary continuous
-    /// audio. It is also the drop that actually fires in the field: a bunching Wi-Fi link trimmed
-    /// 120 times in 10 simulated minutes where the smooth shed fired for drift a handful of times.
-    /// The gentle path that almost never runs was the one being faded.
+    /// Linear crossfade across the `drop_front` / `insert_front` seam ([`crossfade_drop`] /
+    /// [`crossfade_insert`]). Zero only when nothing moved. Both hard-cap trims and drift sheds
+    /// fade: the samples either side of the seam are ordinary continuous audio.
     pub crossfade: usize,
-    /// `drop_front` was the hard-cap backstop (a burst blew the ceiling) rather than the smooth
-    /// drift shed. Both fade now, so the fade length no longer distinguishes them — and the two
-    /// mean very different things to anyone reading logs or a test: sheds are the policy working,
-    /// trims are the link outrunning the headroom.
+    /// `drop_front` was the hard-cap backstop, not the smooth shed. Both fade; the flag is for
+    /// logs and tests (sheds are the policy working, trims are the link outrunning the headroom).
     pub hard_trim: bool,
     /// Emit silence this callback: still priming, or re-priming after a sustained drain.
     pub silence: bool,
 }
 
-/// EWMA time constant for the depth average, in ms. Long enough that a burst doesn't trigger a
-/// shed, short enough to track real drift.
+/// EWMA time constant for the depth average, in ms. Long enough that a burst does not trigger a
+/// shed; short enough to track real drift.
 const EWMA_TAU_MS: u32 = 1_000;
-/// The depth EWMA must stay above the shed threshold for this much CONSUMED AUDIO. Deliberately long: a shed is the only
-/// thing here a listener could ever notice, so it must never fire on a transient.
+/// Consumed audio the depth EWMA must sit above the shed threshold. A shed is the only
+/// correction a listener could notice, so it must never fire on a transient.
 const SHED_SUSTAIN_MS: u32 = 2_000;
-/// The mirror for the sync-driven INSERT: the depth EWMA must sit below the target for this much
-/// consumed audio before one frame is duplicated. Starts equal to the shed's — the two corrections
-/// are then the same instrument in both directions (2.5 ms of correction per second at a 5 ms
-/// frame; ~8 s to answer a 20 ms request), and equal time constants are the safest thing against
-/// the pair ever fighting. Kept as its own constant so the insert can be sped up (a crossfaded
-/// 5 ms repeat every 500 ms is a 1 % time-stretch, which is what RFC 3550 playout adaptation
-/// does) without touching the shed, IF a listen test proves it inaudible. Not `pub` — cbindgen.
+/// Mirror of the shed for a sync-driven insert. Equal time constants so the pair cannot fight.
+/// Own constant so the insert can be sped up without touching the shed. Not `pub`: cbindgen.
 const INSERT_SUSTAIN_MS: u32 = SHED_SUSTAIN_MS;
-/// How far below the sync-requested target the depth AVERAGE must sit before the insert arms.
-///
-/// NOT the shed's `shed_excess_ms` (12–20 ms across the presets), though the branch is otherwise
-/// its mirror: the sync loop only ever asks for more depth once the offset has left its
-/// ±[`AV_DEADBAND_MS`] deadband, so a margin at or above the deadband would leave every request
-/// the loop is allowed to make — "audio is 10–20 ms early, deepen by that" — permanently
-/// unanswered, and the insert would be dead code for exactly the field shape it exists to fix.
-/// Half the deadband: small enough that every request is acted on, and — with the shed's
-/// threshold on the other side — a settling zone at least `shed_excess + this` wide, so a ring
-/// parked anywhere inside it is touched by neither. The insert never chases itself, either: the
-/// loop asks for `depth − offset`, and one inserted frame moves both by the same amount.
+/// How far below the sync-requested target the depth average must sit before the insert arms.
+/// Half [`AV_DEADBAND_MS`]: a margin at or above the deadband would leave every request the
+/// loop is allowed to make unanswered. With the shed on the other side, the settling zone is
+/// at least `shed_excess + this` wide.
 const INSERT_MARGIN_MS: u32 = AV_DEADBAND_MS / 2;
 const _: () = assert!(INSERT_MARGIN_MS < AV_DEADBAND_MS);
-/// Linear crossfade applied across a drift shed's seam.
-///
-/// Sized against the protocol's 5 ms Opus frame, where 2 ms is a comfortable fraction of what a
-/// shed drops. The lossless plane negotiates SHORTER frames — 2 ms at 96 kHz/24-bit under the
-/// default MTU — where a flat 2 ms would be the entire dropped frame. See
-/// [`JitterPolicy::set_frame_us`], which caps the fade at half a frame for exactly that reason.
+/// Linear crossfade across a drift shed. 2 ms is a fraction of a 5 ms Opus frame and the whole
+/// of a 2 ms lossless one. [`JitterPolicy::set_frame_us`] caps the fade at half a frame.
 const SHED_CROSSFADE_MS: u32 = 2;
 /// Underruns inside [`GROW_WINDOW_MS`] before the live target grows.
 const GROW_UNDERRUNS: u32 = 3;
@@ -748,63 +576,41 @@ const GROW_WINDOW_MS: u32 = 5_000;
 const GROW_STEP_MS: u32 = 10;
 /// Quiet time (no underrun) before a grown target relaxes one step back toward the base.
 const SHRINK_QUIET_MS: u32 = 30_000;
-/// The same, while the A/V sync loop is actively asking for a shallower ring — see the branch in
+/// The same, while the A/V sync loop is asking for a shallower ring. See the branch in
 /// [`JitterPolicy::note_read`] that selects between them.
 const SHRINK_QUIET_SYNC_MS: u32 = 5_000;
-// The NEAR-MISS margin is ONE PROTOCOL FRAME, so it is [`JitterPolicy::frame_samples`] rather
-// than a constant — see the use site in `step`.
-/// How long a shrink remains a PROBE, in consumed audio: an underrun or near-miss inside this
-/// window means the shrink was wrong, and the previous target is restored at once instead of
-/// being re-learned three audible underruns at a time.
+// The near-miss margin is one protocol frame, so it is [`JitterPolicy::frame_samples`] rather
+// than a constant. See the use site in `step`.
+/// How long a shrink remains a probe, in consumed audio. An underrun or near-miss inside this
+/// window means the shrink was wrong; the previous target is restored at once instead of being
+/// re-learned three audible underruns at a time.
 const SHRINK_PROBE_MS: u32 = 5_000;
-/// A ring is HOLLOW when its depth AVERAGE sits this far below the target: the target promises a
-/// depth the ring does not actually hold. Growth only ever raises the promise — the one thing
-/// that re-banks real depth is a re-prime — so an underrun in a hollow ring re-primes AT ONCE:
-/// the click has already happened, and spending it on the whole refill is strictly better than
-/// riding the knife edge and paying a click per bunching period indefinitely, which is what the
-/// consecutive-empties hysteresis alone converges to. A full ring's underrun (one packet a few
-/// ms late) is nowhere near hollow and keeps the hysteresis.
+/// A ring is hollow when its depth average sits this far below the target: the target promises
+/// a depth the ring does not hold. Growth only raises the promise; an underrun in a hollow ring
+/// re-primes at once. A full ring's underrun (one packet a few ms late) keeps the hysteresis.
 const DEPRIME_DEBT_MS: u32 = GROW_STEP_MS;
-/// Floor, in callbacks, under `JitterTuning::deprime_ms`: however short the starvation window works
-/// out to in time, a de-prime always needs at least this many consecutive short reads. A device
-/// with a quantum at or above `deprime_ms` would otherwise de-prime on the FIRST short read —
-/// exactly the "a single transient drain manufactures a whole target of fresh silence" defect the
-/// hysteresis exists to prevent, reintroduced at the other end of the quantum range.
-///
-/// Deliberately NOT `pub`: it is an internal detail of the policy, and cbindgen exports every
-/// public const into the C header, where this one would land unprefixed next to
-/// `PUNKTFUNK_AUDIO_*` and pollute every embedder's macro namespace.
+/// Floor under `JitterTuning::deprime_ms`, in callbacks. A device whose quantum is already
+/// `deprime_ms` would otherwise de-prime on the first short read. Not `pub`: cbindgen would
+/// export it unprefixed next to `PUNKTFUNK_AUDIO_*`.
 const MIN_DEPRIME_CALLBACKS: u32 = 2;
-// A de-prime on the FIRST short read is the defect the hysteresis exists to prevent, so hold the
-// floor at build time rather than in a test: tuning it to 1 should not compile.
+// A de-prime on the first short read is the defect the hysteresis exists to prevent, so hold
+// the floor at build time rather than in a test: tuning it to 1 should not compile.
 const _: () = assert!(MIN_DEPRIME_CALLBACKS >= 2);
-/// How long a failed probe keeps the sync loop from driving another shrink. Without this the
-/// loop pays an audible starvation event every [`SHRINK_QUIET_SYNC_MS`] on any link whose jitter
-/// genuinely needs the depth — sync asks for less, the ring shrinks, the link answers, the ring
-/// grows back, five quiet seconds later sync asks again, forever. Doubles per consecutive
-/// failure up to [`SYNC_BACKOFF_MAX_MS`]; a probe that survives its window resets it.
+/// How long a failed probe blocks another sync-driven shrink. Doubles per consecutive failure
+/// up to [`SYNC_BACKOFF_MAX_MS`]; a probe that survives its window resets it.
 const SYNC_BACKOFF_MS: u32 = 60_000;
 const SYNC_BACKOFF_MAX_MS: u32 = 480_000;
 
-// ---- the ms ⇄ interleaved-sample conversion both the policy and the sync loop run on ---------
-//
-// **Multiply first, divide last.** This is the whole of `design/hi-res-audio.md` §4.1: the two
-// types below used to precompute `per_ms = rate_hz / 1000 * channels` and express every figure
-// they own as `ms * per_ms`. That division happens FIRST, so 44 100 Hz became 44 samples per
-// millisecond and every depth, target, shed threshold, hard cap, de-prime fuse and reported
-// `buffer_ms`/`target_ms` came out **2.3 % low** — quietly, permanently, and in exactly the
-// subsystem two previous programs spent their time making trustworthy. 48 000 and 96 000 were
-// exact only because they happen to divide.
-//
-// Keeping `rate_hz` and `channels` as the two numbers they are, and doing the divide last, is
-// exact for every rate. That is all the rework §4.1 deferred the 44.1 kHz family behind; it costs
-// one integer division per conversion and buys three more rates.
+// ---- ms ⇄ interleaved-sample conversion ---------------------------------------------------
+// Multiply first, divide last. `per_ms = rate_hz / 1000 * channels` truncates 44 100 Hz to 44
+// samples/ms and puts every depth 2.3 % low. 48/96 kHz only look exact because they divide.
+// See `design/hi-res-audio.md`.
 
 /// Interleaved samples per second at a negotiated layout — the denominator both conversions
 /// share. `u64` because it is a factor in products that reach 10¹² below.
 const fn interleaved_per_sec(rate_hz: u32, channels: u8) -> u64 {
-    // `max(1)` on both: a degenerate layout must not divide by zero in a realtime callback. The
-    // constructors already clamp, so this is the belt to that pair of braces.
+    // `max(1)` on both: a degenerate layout must not divide by zero in a realtime callback.
+    // The constructors already clamp.
     let hz = if rate_hz == 0 { 1 } else { rate_hz };
     let ch = if channels == 0 { 1 } else { channels };
     hz as u64 * ch as u64
@@ -812,10 +618,8 @@ const fn interleaved_per_sec(rate_hz: u32, channels: u8) -> u64 {
 
 /// `ms` milliseconds of audio, in interleaved samples.
 ///
-/// u64 intermediates because the product is large where a `usize` may be 32 bits:
-/// [`SYNC_BACKOFF_MAX_MS`] (480 000 ms) at 176 400 Hz × 8 ch is 6.8 × 10¹¹ before the divide
-/// brings it back to 6.8 × 10⁸. Saturating rather than wrapping, because a wrapped window is a
-/// *tiny* one — a fuse that blows instantly instead of one that never blows.
+/// u64 intermediates: [`SYNC_BACKOFF_MAX_MS`] at 176 400 Hz × 8 ch is 6.8 × 10¹¹ before the
+/// divide. Saturating: a wrapped window would fire immediately instead of never.
 fn ms_to_samples(rate_hz: u32, channels: u8, ms: u32) -> usize {
     let n = ms as u64 * interleaved_per_sec(rate_hz, channels) / 1000;
     if n > u32::MAX as u64 {
@@ -825,13 +629,11 @@ fn ms_to_samples(rate_hz: u32, channels: u8, ms: u32) -> usize {
     }
 }
 
-/// Interleaved samples back to whole milliseconds — the exact inverse of [`ms_to_samples`], and
-/// the reason `depth_ms(target)` round-trips to `target_ms()` at every rate on the ladder. §4.1
-/// names that round trip as the tell that this rework is incomplete, so it is also the shape of
-/// the test that guards it.
+/// Interleaved samples back to whole milliseconds — the inverse of [`ms_to_samples`], so
+/// `depth_ms(target)` round-trips to `target_ms()` at every rate.
 ///
-/// u128 because `samples` arrives from a caller through [`JitterPolicy::depth_ms`] and nothing
-/// bounds it: `usize::MAX * 1000` overflows a u64 on a 64-bit target.
+/// u128 because `samples` arrives unbounded through [`JitterPolicy::depth_ms`]:
+/// `usize::MAX * 1000` overflows a u64 on a 64-bit target.
 fn samples_to_ms(rate_hz: u32, channels: u8, samples: usize) -> u32 {
     let ms = samples as u128 * 1000 / interleaved_per_sec(rate_hz, channels) as u128;
     if ms > u32::MAX as u128 {
@@ -841,116 +643,74 @@ fn samples_to_ms(rate_hz: u32, channels: u8, samples: usize) -> u32 {
     }
 }
 
-/// The playback de-jitter state machine shared by every client's audio ring.
+/// Playback de-jitter state machine shared by every client's audio ring.
 ///
-/// **The defect it exists to fix.** Every client's ring primed *up* to a target and clamped at a
-/// ceiling, and none of them walked the depth back *down*. Any transient — a Wi-Fi arrival burst, a
-/// host stall, or plain host-DAC-vs-client-DAC clock skew of a few dozen ppm — therefore added
-/// latency permanently, until an underrun happened to re-prime. Android, with no shed at all,
-/// converged on its hard cap and stayed there; Apple shed 40 ms at once and its own comment called
-/// that "one audible blip". Here, a depth EWMA that sits [`SHED_EXCESS_MS`] above target for
-/// [`SHED_SUSTAIN_MS`] of consumed audio sheds ONE 5 ms frame with a crossfade, so latency returns
-/// to target instead of ratcheting.
+/// Rings that only prime up and clamp at a ceiling ratchet latency under burst, stall, or DAC
+/// skew. A depth EWMA above target for [`SHED_SUSTAIN_MS`] sheds one frame with a crossfade.
+/// The mirror: when A/V sync asks for a deeper ring, an EWMA [`INSERT_MARGIN_MS`] below the
+/// request for [`INSERT_SUSTAIN_MS`] duplicates one frame ([`JitterStep::insert_front`]).
 ///
-/// **And the mirror.** When the A/V sync loop asks for a DEEPER ring than the adaptive target,
-/// the depth is raised the same way — a depth EWMA that sits [`INSERT_MARGIN_MS`] below the
-/// request for [`INSERT_SUSTAIN_MS`] duplicates ONE frame with a crossfade
-/// ([`JitterStep::insert_front`]). Until that existed the only way UP was a de-prime, and a
-/// sync request for more depth made the ring `hollow` at once, so the next single late packet
-/// bought a full `target − depth` of silence: the "audio gaps track the A/V offset" field
-/// shape, on every client, since sync steering shipped.
-///
-/// **Driven by the audio clock, not the wall clock**: every duration is measured in samples
-/// consumed. That makes it allocation-free, syscall-free (safe in a realtime callback) and
-/// deterministic under test.
+/// Driven by samples consumed, not wall clock: allocation-free, syscall-free, deterministic
+/// under test.
 #[derive(Clone, Debug)]
 pub struct JitterPolicy {
     tuning: JitterTuning,
-    /// The negotiated sample rate and interleaved channel count, kept as the two numbers they are
-    /// rather than pre-divided into samples-per-millisecond — see the conversion helpers above for
-    /// why that division was the defect. Both are clamped to ≥ 1 by the constructor.
+    /// Negotiated rate and interleaved channel count, kept as two numbers rather than pre-divided
+    /// into samples-per-ms. Both clamped to ≥ 1 by the constructor.
     rate_hz: u32,
     channels: u8,
-    /// One protocol audio frame, in microseconds. [`FRAME_MS`] for the Opus plane; the lossless
-    /// plane negotiates shorter frames ([`pcm::frame_us_for`]). Set via
-    /// [`set_frame_us`](Self::set_frame_us); the default keeps every Opus session bit-identical.
+    /// One protocol frame, microseconds. [`FRAME_MS`] for Opus; lossless negotiates shorter
+    /// ([`pcm::frame_us_for`]). Default is the Opus 5 ms frame.
     frame_us: u32,
-    /// The live target, in interleaved samples — `base_target_ms` grown by underrun pressure.
     target: usize,
     primed: bool,
-    /// Consecutive short reads, and the audio they starved for in interleaved samples. BOTH gate
-    /// the de-prime: the run must be at least [`JitterTuning::deprime_ms`] long AND at least
-    /// [`MIN_DEPRIME_CALLBACKS`] callbacks, so the hysteresis means the same span of time whatever
-    /// the device's quantum, without collapsing to a hair trigger on a large-quantum device.
+    /// Consecutive short reads, and the audio they starved, in interleaved samples. Both gate
+    /// de-prime: ≥ [`JitterTuning::deprime_ms`] AND ≥ [`MIN_DEPRIME_CALLBACKS`] callbacks.
     empties: u32,
     empties_run: usize,
-    /// EWMA of ring depth, interleaved samples.
     depth_avg: f32,
-    /// Consumed samples for which the EWMA has stayed above the shed threshold.
     over_run: usize,
-    /// The mirror: consumed samples for which the EWMA has stayed below the sync-requested
-    /// target by more than [`INSERT_MARGIN_MS`] — see the insert branch in [`step`](Self::step).
+    /// Consumed samples the EWMA has sat below the sync target by more than [`INSERT_MARGIN_MS`].
     under_run: usize,
-    /// Underruns seen in the current growth window, and the window's consumed-sample count.
     underruns: u32,
     window_run: usize,
-    /// Consumed samples since the last underrun (drives the relax-back-down step).
     quiet_run: usize,
-    /// `want` from the most recent [`step`](Self::step), so [`note_read`](Self::note_read) can
-    /// advance the sample-denominated timers without the caller repeating it.
+    /// `want` from the last [`step`](Self::step), so [`note_read`](Self::note_read) can tick
+    /// sample-denominated timers without the caller repeating it.
     last_want: usize,
-    /// Depth the A/V sync loop would like, in interleaved samples ([`AvSync::desired_depth`]).
-    /// `None` — the default, and what every un-wired ring keeps — reproduces the pre-sync
-    /// behaviour exactly, which is what lets the four client rings adopt this one at a time
-    /// without diverging in the meantime.
+    /// Depth the A/V sync loop wants ([`AvSync::desired_depth`]). `None` = unsynchronised.
     sync_target: Option<usize>,
     /// Set by [`step`](Self::step) when the read it authorised leaves less than
     /// one protocol frame buffered; consumed by [`note_read`](Self::note_read).
     near_miss: bool,
-    /// A near-miss already grew the target this window — one step per window, so a single
-    /// bunching episode (which lands as a RUN of consecutive near-misses while the ring refills)
-    /// buys one measured step, not a sprint to the ceiling.
+    /// A near-miss already grew the target this window. One step, so a run of near-misses
+    /// while the ring refills does not sprint to the ceiling.
     near_miss_grown: bool,
-    /// Set by [`step`](Self::step): the depth average sits more than [`DEPRIME_DEBT_MS`] below
-    /// the ADAPTIVE target (the one underrun pressure grew — never the sync-inflated one), so an
-    /// underrun should re-prime at once instead of waiting out the hysteresis.
+    /// Depth average more than [`DEPRIME_DEBT_MS`] below the adaptive target (never the
+    /// sync-inflated one), so an underrun should re-prime at once.
     hollow: bool,
-    /// Consumed samples left in the current shrink-probe window (0 = no probe outstanding).
     probe_run: usize,
-    /// The live target before the probed shrink, restored if the probe fails.
     probe_prev_target: usize,
-    /// Consumed samples before the sync loop may drive another shrink (0 = allowed now).
+    /// Consumed samples before the sync loop may drive another shrink (`0` = allowed).
     sync_backoff_run: usize,
-    /// Length of the NEXT backoff, in ms — doubles per consecutive failed probe, capped.
     sync_backoff_ms: u32,
 }
 
 impl JitterPolicy {
-    /// `channels` is the negotiated interleaved channel count (2/6/8), at the protocol's default
-    /// [`SAMPLE_RATE_HZ`]. Hi-res sessions use [`new_at_rate`](Self::new_at_rate).
+    /// `channels` is 2/6/8 at [`SAMPLE_RATE_HZ`]. Hi-res uses [`new_at_rate`](Self::new_at_rate).
     pub fn new(tuning: JitterTuning, channels: u8) -> JitterPolicy {
         Self::new_at_rate(tuning, channels, SAMPLE_RATE_HZ)
     }
 
     /// As [`new`](Self::new), at an explicitly negotiated `rate_hz`.
     ///
-    /// **Every rate on the lossless ladder is exact here** — 44 100 / 48 000 / 88 200 / 96 000 /
-    /// 176 400 ([`pcm::rate_is_supported`]). It was not always: every figure this type computes —
-    /// target, EWMA depth, shed threshold, hard cap, the de-prime fuse, and the
-    /// `buffer_ms`/`target_ms` a client reports — used to be `ms × (rate_hz / 1000 × channels)`,
-    /// and that leading division truncated 44 100 Hz to 44 samples/ms and put all of them 2.3 %
-    /// low. The 44.1 kHz family was deferred behind fixing exactly that, and nothing else
-    /// (`design/hi-res-audio.md` §4.1). The conversions now multiply first and divide last, so
-    /// there is no rate this type cannot represent and no tripwire left to trip.
-    ///
-    /// The tell that a future change has broken it again is still the one §4.1 named:
-    /// [`depth_ms`](Self::depth_ms)`(target)` not round-tripping to [`target_ms`](Self::target_ms).
-    /// That is asserted for the whole ladder in
+    /// Conversions multiply first and divide last, so 44 100 / 48 000 / 88 200 / 96 000 / 176 400
+    /// are exact. The tell that a change has broken it: [`depth_ms`](Self::depth_ms)`(target)`
+    /// not round-tripping to [`target_ms`](Self::target_ms) — asserted in
     /// `the_shipping_rate_ladder_round_trips_ms_to_samples_exactly`.
     ///
-    /// A `rate_hz` or `channels` of zero is clamped to 1 rather than rejected: this type is built
-    /// from wire-supplied values on a path that must not panic in a realtime callback, and it used
-    /// to divide by `per_ms` unguarded.
+    /// A `rate_hz` or `channels` of zero is clamped to 1: this type is built from wire values on
+    /// a path that must not panic in a realtime callback.
     pub fn new_at_rate(tuning: JitterTuning, channels: u8, rate_hz: u32) -> JitterPolicy {
         let rate_hz = rate_hz.max(1);
         let channels = channels.max(1);
@@ -981,86 +741,62 @@ impl JitterPolicy {
         }
     }
 
-    /// Tell the policy how long one audio frame actually is, in microseconds.
+    /// Frame length in microseconds.
     ///
-    /// Two of its decisions are denominated in *frames* rather than milliseconds — the floor under
-    /// the effective target (a device quantum plus one frame) and the smooth shed (drop exactly one
-    /// frame) — and both were written when [`FRAME_MS`] was the only frame this protocol had. The
-    /// lossless plane negotiates shorter ones: 4 ms at 48 kHz/24-bit, 2 ms at 96 kHz/24-bit under
-    /// the default MTU. Left unset, a 96 kHz session would shed 2.5 frames at a time and fade
-    /// across an entire frame.
-    ///
-    /// Defaulting to [`FRAME_MS`] rather than taking this in the constructor is deliberate: every
-    /// Opus session, and all seventeen policy tests, stay bit-identical, and the value that matters
-    /// here (`audio_frame_us`) is resolved by the host and only known to the client after the
-    /// `Welcome` — later than the ring is built.
+    /// The floor under the effective target (quantum plus one frame) and the smooth shed (drop
+    /// exactly one frame) are denominated in frames. Default [`FRAME_MS`] is the Opus frame;
+    /// `audio_frame_us` is known only after `Welcome`.
     pub fn set_frame_us(&mut self, frame_us: u32) {
         self.frame_us = frame_us.max(1);
     }
 
-    /// `ms` of audio in interleaved samples at this session's layout — see [`ms_to_samples`].
     fn ms_samples(&self, ms: u32) -> usize {
         ms_to_samples(self.rate_hz, self.channels, ms)
     }
 
-    /// The inverse, for the figures this type reports — see [`samples_to_ms`].
     fn samples_ms(&self, samples: usize) -> u32 {
         samples_to_ms(self.rate_hz, self.channels, samples)
     }
 
     /// One frame in interleaved samples.
     ///
-    /// Taken from [`pcm::samples_per_frame`] rather than re-derived from `frame_us`, because that
-    /// function is the single source of truth for how many samples a frame carries and the host
-    /// fills its buffers from it. The two figures are only interchangeable when the rate divides
-    /// the frame: at 44 100 Hz a 5 ms frame is 220 samples per channel, not 220.5, and a policy
-    /// that computed 441 interleaved samples where the wire delivers 440 would put the near-miss
-    /// margin and the shed size — both of which mean *exactly one packet* — one sample away from
-    /// the packet they are describing. Computed in µs, so a sub-millisecond frame does not
-    /// truncate: 2 500 µs at 48 kHz stereo is 240 samples, not 192.
+    /// From [`pcm::samples_per_frame`], the source the host fills from. At 44 100 Hz a 5 ms frame
+    /// is 220 samples/channel, not 220.5 — computing 441 where the wire delivers 440 puts the
+    /// near-miss margin and the shed one sample off the packet they describe. Computed in µs so
+    /// 2 500 µs at 48 kHz stereo is 240 samples, not 192.
     fn frame_samples(&self) -> usize {
         pcm::samples_per_frame(self.rate_hz, self.frame_us, self.channels).max(1)
     }
 
     /// The seam crossfade, capped at half a frame. [`SHED_CROSSFADE_MS`]'s flat 2 ms is a
-    /// comfortable slice of a 5 ms Opus frame and the whole of a 2 ms lossless one, and a fade
-    /// as long as the material it is fading is not a crossfade.
+    /// fraction of a 5 ms Opus frame and the whole of a 2 ms lossless one. A fade as long as
+    /// the material it is fading is not a crossfade.
     fn crossfade_samples(&self) -> usize {
         self.ms_samples(SHED_CROSSFADE_MS)
             .min(self.frame_samples() / 2)
     }
 
-    /// Hand the ring the depth the A/V sync loop wants ([`AvSync::desired_depth`]), or `None` to
-    /// run unsynchronised.
-    ///
-    /// This is a REQUEST, not a command. [`effective_target`](Self::effective_target) clamps it
-    /// between the underrun-driven adaptive floor and the hard cap, so sync can never starve the
-    /// ring: if the link's jitter needs more buffer than the picture is away, the floor wins and
-    /// the residual shows up on the HUD instead of as a dropout. That ordering is the whole safety
-    /// argument for steering playback depth from a network measurement at all.
+    /// Depth the A/V sync loop wants ([`AvSync::desired_depth`]), or `None` to run unsynchronised.
+    /// A request, not a command: [`effective_target`](Self::effective_target) clamps it between
+    /// the underrun-driven floor and the hard cap, so sync can never starve the ring.
     pub fn set_sync_target(&mut self, target: Option<usize>) {
         self.sync_target = target;
     }
 
-    /// The sync loop is asking to run shallower than the adaptive target has grown to.
     fn sync_wants_less(&self) -> bool {
         self.sync_target.is_some_and(|s| s < self.target)
     }
 
-    /// The sync loop is asking to run DEEPER than the adaptive target — audio is playing early
-    /// against the picture. This is what arms the insert branch in [`step`](Self::step); without
-    /// a sync request the policy never adds depth on its own, so an un-wired ring (`sync_target
-    /// == None`) behaves exactly as it did before the insert existed.
+    /// Sync is asking for a deeper ring than the adaptive target. Without a request the policy
+    /// never adds depth on its own, so `sync_target == None` never inserts.
     fn sync_wants_more(&self) -> bool {
         self.sync_target.is_some_and(|s| s > self.target)
     }
 
-    /// The live target depth in ms (grows under underrun pressure; never below the base).
     pub fn target_ms(&self) -> u32 {
         self.samples_ms(self.target)
     }
 
-    /// Convert a ring depth in interleaved samples to milliseconds — for stats/HUD reporting.
     pub fn depth_ms(&self, depth: usize) -> u32 {
         self.samples_ms(depth)
     }
@@ -1075,33 +811,20 @@ impl JitterPolicy {
         self.primed
     }
 
-    /// The ADAPTIVE target for a device asking for `want` samples per callback: the live target
-    /// underrun pressure has grown, lifted so it can always serve one quantum plus a packet. A
-    /// ring can never sustain a target below one device quantum, so a large-buffer device (a
-    /// 20 ms PipeWire graph quantum, a legacy AAudio path) is lifted to `want` plus one protocol
-    /// frame rather than oscillating prime → dropout → re-prime forever. This is the floor the
-    /// sync loop's request is clamped against, and — because it is what underrun evidence has
-    /// PROVEN this link needs — the depth `hollow` is judged against.
+    /// Live target grown by underrun pressure, lifted to serve one quantum plus a packet. A
+    /// large-buffer device is lifted to `want` plus one frame rather than oscillating
+    /// prime → dropout → re-prime. The floor sync is clamped against, and what `hollow` is judged against.
     fn adaptive_target(&self, want: usize) -> usize {
         self.target.max(want + self.frame_samples())
     }
 
-    /// The effective target: [`adaptive_target`](Self::adaptive_target), or the sync loop's
-    /// request clamped into `[adaptive, hard_cap]`. Never below the adaptive one.
+    /// [`adaptive_target`](Self::adaptive_target), or the sync request clamped into `[adaptive, hard_cap]`.
     fn effective_target(&self, want: usize) -> usize {
         let floor = self.adaptive_target(want);
         match self.sync_target {
-            // Continuity outranks sync — see `set_sync_target`. The loop may pull the ring
-            // shallower to catch the picture up, or push it deeper when audio runs early, but
-            // never below what underrun pressure has proven this link needs, and never past the
-            // hard cap that bounds added latency.
-            //
-            // The ceiling is raised to the floor rather than passed to `clamp` as-is: a device
-            // whose callback quantum alone exceeds the preset's `hard_cap_ms` makes `floor > cap`,
-            // and `Ord::clamp` PANICS when min > max. That would be a panic in a realtime audio
-            // callback on exactly the awkward hardware this code exists to survive — and the same
-            // reasoning `step` already applies when it computes its own cap with `.max(target +
-            // want)`.
+            // Continuity outranks sync — see `set_sync_target`. Ceiling is raised to the floor
+            // rather than passed to `clamp`: a quantum above `hard_cap_ms` makes `floor > cap`,
+            // and `Ord::clamp` panics when min > max, in a realtime audio callback.
             Some(s) => {
                 let cap = self.ms_samples(self.tuning.hard_cap_ms).max(floor);
                 s.clamp(floor, cap)
@@ -1116,23 +839,21 @@ impl JitterPolicy {
         self.last_want = want;
         let target = self.effective_target(want);
 
-        // Track depth with a callback-rate-independent EWMA: weighting by `want` keeps the time
-        // constant at EWMA_TAU_MS whether the device pulls 5 ms or 20 ms at a time.
+        // Weight by `want` so the time constant stays EWMA_TAU_MS whether the device pulls
+        // 5 ms or 20 ms at a time.
         let alpha = (want as f32 / self.ms_samples(EWMA_TAU_MS) as f32).clamp(0.0, 1.0);
         self.depth_avg += (depth as f32 - self.depth_avg) * alpha;
 
-        // The hard cap must always leave room to serve this callback, or a large-quantum device
-        // would trim itself into a permanent underrun.
+        // The hard cap must leave room to serve this callback, or a large-quantum device
+        // trims itself into a permanent underrun.
         let cap = (target + self.ms_samples(self.tuning.headroom_ms))
             .min(self.ms_samples(self.tuning.hard_cap_ms))
             .max(target + want);
 
         let mut out = JitterStep::default();
         if depth > cap {
-            // Blew the ceiling: a burst arrived, or we were wedged. Discard down to the cap and
-            // reset the drift timer so the trim isn't double-counted as drift. Faded like any
-            // other drop — see `JitterStep::crossfade` for why this used to splice raw and why
-            // that was backwards.
+            // Burst or wedged: discard down to the cap and reset the drift timer so the trim
+            // is not counted as drift. Faded like any other drop.
             out.drop_front = depth - cap;
             out.hard_trim = true;
             out.crossfade = self
@@ -1154,16 +875,9 @@ impl JitterPolicy {
             && self.sync_wants_more()
             && (self.depth_avg as usize + self.ms_samples(INSERT_MARGIN_MS)) < target
         {
-            // The mirror of the shed. The sync loop has asked for a DEEPER ring than the adaptive
-            // target (audio is early against the picture), and the depth AVERAGE has sat more
-            // than the margin below what it asked for, for the sustain window of consumed audio:
-            // duplicate ONE frame at the front, crossfaded. Below-target-only, so it can never
-            // fight the trim; sync-only, so an un-wired ring never adds depth by itself and the
-            // hollow re-prime keeps its job for growth that was never banked; primed-only, so a
-            // ring filling from silence is not padded with copies of what little it holds.
-            //
-            // The ring must hold a whole frame to duplicate. If it does not, it is not "a little
-            // shallow", it is running dry — and the drought/PLC path is the tool for that.
+            // Mirror of the shed: sync asked for a deeper ring and the depth average has sat
+            // below it for the sustain window. Duplicate one frame, crossfaded. Below-target,
+            // sync-only, primed-only. A ring that cannot hold a whole frame is running dry.
             self.over_run = 0;
             self.under_run += want;
             if self.under_run >= self.ms_samples(INSERT_SUSTAIN_MS) && depth >= self.frame_samples()
@@ -1176,8 +890,8 @@ impl JitterPolicy {
             self.over_run = 0;
             self.under_run = 0;
         }
-        // Whatever we shed is no longer buffered, and whatever we duplicated now is — reflect
-        // both immediately so the next callbacks don't re-fire on a stale average.
+        // Shed is no longer buffered; insert is. Reflect both now so the next callback does
+        // not re-fire on a stale average.
         self.depth_avg =
             (self.depth_avg - out.drop_front as f32 + out.insert_front as f32).max(0.0);
 
@@ -1185,55 +899,30 @@ impl JitterPolicy {
             self.primed = true;
             self.empties = 0;
             self.empties_run = 0;
-            // The refill just banked this much: seed the average with it rather than letting it
-            // climb from wherever the drought left it — a freshly-primed ring would otherwise
-            // read as hollow for the EWMA's whole settling time, and the FIRST late packet
-            // would re-prime a ring that is actually full.
+            // Seed the average with the refill. Leaving it at the drought value reads as hollow
+            // for the EWMA's settling time, and the first late packet re-primes a full ring.
             self.depth_avg = depth.saturating_sub(out.drop_front) as f32;
         }
         out.silence = !self.primed;
-        // Near-miss: this read will be served, but with less than one frame left over — the
-        // next callback starves unless a packet lands within one frame time. Unconditional
-        // assignment, so a stale flag can never survive a de-prime into the next primed read.
+        // Unconditional so a stale near-miss cannot survive a de-prime into the next primed read.
         let after = depth.saturating_sub(out.drop_front) + out.insert_front;
         self.near_miss = self.primed
             && after >= want
-            // Post-read depth below which a served callback counts as a NEAR-MISS: the device got
-            // its samples, but less than ONE PROTOCOL FRAME was left in hand, so the next callback
-            // starves unless a packet lands inside one frame time. On a healthy link the post-read
-            // depth hovers a whole target above this, which is what makes a near-miss evidence of
-            // real delivery jitter — the same evidence as an underrun, except nobody heard it yet.
-            //
-            // Denominated in the RESOLVED frame, not a fixed 5 ms. Against a 2 ms lossless frame a
-            // frozen 5 ms margin stops meaning "one packet in hand" and starts meaning two and a
-            // half, so it would grow the target on a ring that was never close to starving —
-            // inverting the thing it exists to detect. Identical on every Opus session.
+            // Served, but less than one resolved frame left. Against a 2 ms lossless frame a
+            // frozen 5 ms margin would grow the target on a ring that was never close.
             && after - want < self.frame_samples();
-        // Hollow: the depth AVERAGE runs a debt against the target — the promise has been raised
-        // but the depth was never re-banked (see `DEPRIME_DEBT_MS`). Judged on the average, not
-        // this instant: a single late packet empties the ring for a callback without making it
-        // hollow, and must keep the consecutive-empties hysteresis.
-        //
-        // Judged against the ADAPTIVE target, never the sync-inflated one. The debt this exists
-        // to call in is GROWTH that was never banked — underrun evidence raised the promise —
-        // and only a re-prime cashes that. A sync request is not evidence of starvation; it is a
-        // request for alignment, and it now has its own gentle instrument (the insert above).
-        // Measured against the effective target, a request for ≥ `DEPRIME_DEBT_MS` more depth
-        // made the ring hollow on the very next callback and turned the next single late packet
-        // into a full re-prime: the field's "audio gaps track the A/V offset" shape. The
-        // effective target is never below the adaptive one, so this can only be LESS hollow.
+        // Hollow: depth average runs a debt against the adaptive target — growth that was
+        // never banked. A sync request is alignment, not starvation. Judged on the average
+        // so one late packet keeps the consecutive-empties hysteresis.
         let adaptive = self.adaptive_target(want);
         self.hollow =
             self.primed && (self.depth_avg as usize + self.ms_samples(DEPRIME_DEBT_MS)) < adaptive;
         out
     }
 
-    /// Report the outcome of the read `step` authorised. `ran_short` = the ring could not fill the
-    /// callback (a genuine underrun), which drives both the de-prime hysteresis and the adaptive
-    /// target floor.
-    ///
-    /// A callback that `step` told to emit silence is NOT an underrun — the ring is deliberately
-    /// re-priming — so calls made while un-primed are ignored and callers need not special-case it.
+    /// Outcome of the read `step` authorised. `ran_short` is a genuine underrun and drives
+    /// de-prime hysteresis and the adaptive floor. Silence from `step` is not an underrun —
+    /// the ring is re-priming — so un-primed calls are ignored.
     pub fn note_read(&mut self, ran_short: bool) {
         if !self.primed {
             return;
@@ -1251,21 +940,17 @@ impl JitterPolicy {
         if self.probe_run > 0 {
             self.probe_run = self.probe_run.saturating_sub(want);
             if ran_short || near_miss {
-                // The probe FAILED: the link answered a shrink with (nearly) starving the ring.
-                // Take the depth straight back — re-learning it three audible underruns at a
-                // time is what made the sync-vs-growth tug-of-war audible — and keep the sync
-                // loop from probing again for a while, doubling per consecutive failure. The
-                // residual A/V offset is reported instead; continuity outranks sync. The
-                // restore CONSUMES this event as growth evidence: it answered a depth the ring
-                // is no longer at, so growing past the proven target on top would overshoot.
+                // Probe failed: restore the proven depth at once and back the sync loop off,
+                // doubling per consecutive failure. Consumed as growth evidence so growing
+                // past the proven target on top would overshoot.
                 self.probe_run = 0;
                 self.target = self.target.max(self.probe_prev_target);
                 self.sync_backoff_run = self.ms_samples(self.sync_backoff_ms);
                 self.sync_backoff_ms = (self.sync_backoff_ms * 2).min(SYNC_BACKOFF_MAX_MS);
                 restored = true;
             } else if self.probe_run == 0 {
-                // Survived the whole window: the shallower depth is genuinely safe here, so the
-                // next probe starts from a clean slate.
+                // Survived the window: the shallower depth is safe here, so the next probe
+                // starts from a clean slate.
                 self.sync_backoff_ms = SYNC_BACKOFF_MS;
             }
         }
@@ -1274,17 +959,14 @@ impl JitterPolicy {
             self.empties += 1;
             self.empties_run += want;
             // Starved for `deprime_ms` of audio, over at least MIN_DEPRIME_CALLBACKS callbacks.
-            // Both, because either alone is wrong at one end of the quantum range: time alone is a
-            // hair trigger on a device whose single quantum already exceeds the window, and a
-            // callback count alone is the platform-dependent fuse this replaced.
+            // Time alone is a hair trigger when one quantum already exceeds the window; a
+            // callback count alone is a different fuse on every device.
             let starved = self.empties_run >= self.ms_samples(self.tuning.deprime_ms)
                 && self.empties >= MIN_DEPRIME_CALLBACKS;
             if starved || self.hollow {
-                // The starvation hysteresis protects a FULL ring from one late packet. A hollow
-                // ring is the opposite case: the target has been raised but the depth never
-                // re-banked (growth is a promise; only a re-prime cashes it), and riding that out
-                // is a click per bunching period, forever. The click just heard has already paid
-                // for the refill — take it now.
+                // Hysteresis protects a full ring from one late packet. A hollow ring is the
+                // opposite: the target rose but depth never re-banked. The underrun already
+                // paid for the refill.
                 self.primed = false;
                 self.empties = 0;
                 self.empties_run = 0;
@@ -1293,21 +975,16 @@ impl JitterPolicy {
                 self.underruns += 1;
             }
             if self.underruns >= GROW_UNDERRUNS {
-                // This device genuinely needs more slack than the base target. Grow ONCE per
-                // window, capped — the alternative (every device pre-paying the worst device's
-                // depth) is what the fixed 40 ms Android floor was.
+                // This device needs more slack than the base. Grow once per window, capped.
                 self.underruns = 0;
                 self.window_run = 0;
                 let grown = self.target + self.ms_samples(GROW_STEP_MS);
                 self.target = grown.min(self.ms_samples(self.tuning.max_target_ms));
             }
         } else if near_miss {
-            // Came within one frame of an underrun — the same evidence as one, heard by no one.
-            // Growing here, BEFORE the click, is what "no audible jitter" means: waiting for
-            // the third audible underrun means the user heard two. One step per window (a
-            // bunching episode is a RUN of near-misses while the ring refills, and must buy one
-            // measured step, not a sprint to the ceiling); if it worsens into real underruns
-            // the path above takes over. A near-miss is pressure, not quiet.
+            // Within one frame of an underrun: same evidence, inaudible. Grow here, before
+            // the underrun. One step per window (a bunching episode is a run of near-misses).
+            // A near-miss is pressure, not quiet.
             self.quiet_run = 0;
             self.empties = 0;
             self.empties_run = 0;
@@ -1320,14 +997,9 @@ impl JitterPolicy {
             self.empties = 0;
             self.empties_run = 0;
             self.quiet_run += want;
-            // A grown target normally relaxes only after a long quiet spell, because without other
-            // evidence the only thing that can justify giving up hard-won slack is time. When the
-            // sync loop is asking to run shallower it IS that evidence — a measurement saying the
-            // extra depth is costing alignment right now — so test a smaller target sooner. Every
-            // shrink is armed as a PROBE: answered by an underrun or near-miss it is undone at
-            // once (see above), and a failed sync-driven guess is not retried for a backoff —
-            // without that, a link whose jitter genuinely needs the depth pays an audible
-            // starvation event every five seconds, forever.
+            // A grown target relaxes after a long quiet spell. Sync asking for less is
+            // evidence the extra depth costs alignment now, so test sooner. Every shrink is
+            // a probe: a failed sync-driven guess is not retried for a backoff.
             let sync_shrink = self.sync_wants_less() && self.sync_backoff_run == 0;
             let quiet_needed = if sync_shrink {
                 SHRINK_QUIET_SYNC_MS
@@ -1335,8 +1007,8 @@ impl JitterPolicy {
                 SHRINK_QUIET_MS
             };
             if self.quiet_run >= self.ms_samples(quiet_needed) {
-                // Long quiet spell: give a grown target one step back, so a single bad minute
-                // doesn't cost latency for the rest of the session.
+                // Give a grown target one step back, so a short bad spell does not cost
+                // latency for the rest of the session.
                 self.quiet_run = 0;
                 let base = self.ms_samples(self.tuning.base_target_ms);
                 let prev = self.target;
@@ -1353,17 +1025,12 @@ impl JitterPolicy {
     }
 }
 
-/// Sample rate of every audio plane in the protocol.
+/// Opus-plane sample rate, and the protocol default. Lossless negotiates via [`pcm`].
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 
-/// Discard `drop` interleaved samples from the front of `ring`, linearly crossfading the seam over
-/// `fade` samples so a drift correction is inaudible rather than a click.
-///
-/// The dropped region's tail fades out while the surviving head fades in, so the waveform is
-/// continuous across the splice. `fade == 0` discards hard; no caller in the policy asks for that
-/// any more (see [`JitterStep::crossfade`]), but it stays honoured for callers that splice at a
-/// point they know is already discontinuous. Shared by the three `VecDeque<f32>` rings; the Apple
-/// ring is index-based and mirrors this in Swift.
+/// Discard `drop` interleaved samples from the front of `ring`, linearly crossfading the seam
+/// over `fade` samples. `fade == 0` discards hard — honoured for callers that splice at a point
+/// they know is already discontinuous. Shared by the three `VecDeque<f32>` rings.
 pub fn crossfade_drop(ring: &mut std::collections::VecDeque<f32>, drop: usize, fade: usize) {
     if drop == 0 || ring.len() < drop {
         return;
@@ -1373,23 +1040,10 @@ pub fn crossfade_drop(ring: &mut std::collections::VecDeque<f32>, drop: usize, f
         ring.drain(..drop);
         return;
     }
-    // The FIRST `fade` samples of what we are about to discard are the fade-OUT source — they are
-    // the continuation of the sample the device just played — and they blend into the first
-    // `fade` samples of what survives, whose own continuation the stream then follows. Both ends
-    // of the seam are continuous: the splice smears `drop` samples of waveform advance over the
-    // fade instead of stepping.
-    //
-    // (It used to fade out from the LAST `fade` discarded samples, `drop - fade + i`. That end is
-    // adjacent to the survivors, so the fade-in side was smooth — but the sample the device had
-    // just played was adjacent to `ring[0]`, not to `ring[drop - fade]`, so the seam still opened
-    // with a step of `drop - fade` samples of waveform: 3 ms of a 5 ms shed. The old test only
-    // bounded steps INSIDE the faded region and never looked at the one before it.)
-    //
-    // Blended in place and BEFORE the drain, with no scratch buffer: the fade-OUT sources are
-    // `i < fade <= drop`, strictly below every write at `drop + i`, so a written value is never
-    // read again. One ascending pass is therefore safe — and this runs inside realtime audio
-    // callbacks, where the `Vec` this used to allocate had no business being. It runs on every
-    // hard-cap trim too, which is the common case on a bunching link.
+    // Fade-out is the first `fade` discarded (continuation of the sample just played), not the
+    // last — that end is adjacent to the survivors but the device just played `ring[0]`. Writes
+    // at `drop + i` sit above every fade-out read (`i < fade <= drop`), so one in-place
+    // ascending pass is safe in a realtime callback.
     for i in 0..fade {
         let old = ring[i];
         let new = ring[drop + i];
@@ -1399,20 +1053,10 @@ pub fn crossfade_drop(ring: &mut std::collections::VecDeque<f32>, drop: usize, f
     ring.drain(..drop);
 }
 
-/// The mirror of [`crossfade_drop`]: DUPLICATE the first `insert` interleaved samples of `ring`
-/// at its front — the ring plays them, then plays them again — linearly crossfading the seam over
-/// `fade` samples so the sync-driven deepening ([`JitterStep::insert_front`]) is a continuous
-/// waveform rather than a click. Net length change is exactly `+insert`.
-///
-/// Allocation-free when the ring has `insert` samples of spare capacity, which the three
-/// `VecDeque<f32>` rings that call this reserve up front (they are sized for the hard cap plus
-/// slack, and the policy only inserts BELOW its target): the copy is built with `push_front`,
-/// which never reallocates inside capacity, and the seam is blended in place. It runs inside
-/// realtime audio callbacks, like its twin. The Apple ring is index-based and mirrors this in
-/// Swift (`AudioRing.insertOneFrame`).
-///
-/// A no-op on `insert == 0` or a ring shorter than `insert` (nothing to duplicate); `fade` is
-/// clamped to `insert` and to what the ring holds beyond the copy, and `fade == 0` splices hard.
+/// Mirror of [`crossfade_drop`]: duplicate the first `insert` samples at the front and
+/// crossfade the seam. Net length `+insert`. Allocation-free when the ring has spare capacity
+/// (`push_front` inside capacity). No-op on `insert == 0` or a ring shorter than `insert`;
+/// `fade == 0` splices hard.
 pub fn crossfade_insert(ring: &mut std::collections::VecDeque<f32>, insert: usize, fade: usize) {
     if insert == 0 || ring.len() < insert {
         return;
@@ -1426,12 +1070,9 @@ pub fn crossfade_insert(ring: &mut std::collections::VecDeque<f32>, insert: usiz
         let s = ring[insert - 1];
         ring.push_front(s);
     }
-    // Seam: the device plays the copy — `orig[0..insert]` — and then `orig[0..]` again. What
-    // would have followed the copy's last sample is `orig[insert..]`, so THAT is the fade-out
-    // source (at `2·insert + i`), blending into the original's head `orig[i]` (at
-    // `insert + i`), in place. Both ends of the seam are continuous, exactly as in the drop.
-    // The fade-out reads sit at or above `2·insert`, above every write, and the fade-in read is
-    // the very cell about to be written — one ascending pass is safe.
+    // Seam: after the copy the original head plays again. Fade-out is `orig[insert..]` at
+    // `2·insert + i`, blended into `orig[i]` at `insert + i`. Fade-out reads sit at or above
+    // `2·insert`, above every write, so one ascending pass is safe.
     for i in 0..fade {
         let old = ring[2 * insert + i];
         let new = ring[insert + i];
@@ -1441,43 +1082,25 @@ pub fn crossfade_insert(ring: &mut std::collections::VecDeque<f32>, insert: usiz
 }
 
 /// Where [`apply_gain`]'s soft knee begins, in linear amplitude (≈ −3.1 dBFS). Below this the
-/// gained signal is passed through EXACTLY — a boost whose peaks never reach the knee is plain
-/// multiplication, sample for sample, so the limiter costs nothing on material that does not need
-/// it.
+/// gained signal is passed through exactly: a boost whose peaks never reach the knee is plain
+/// multiplication, sample for sample, so the limiter costs nothing on material that does not
+/// need it.
 pub const SOFT_LIMIT_KNEE: f32 = 0.7;
 
-/// Multiply `samples` by `gain`, bending anything that would overshoot full scale into a soft knee
-/// instead of slicing it flat.
+/// Multiply `samples` by `gain`, bending anything that would overshoot full scale into a soft
+/// knee instead of a hard clip. `(s * gain).clamp(-1.0, 1.0)` replaces peaks with flat tops —
+/// a discontinuity in the first derivative that radiates high-order harmonics.
 ///
-/// **Why this is not a `clamp`.** The GameStream plane's gain was `(s * gain).clamp(-1.0, 1.0)`,
-/// which is a hard clip: the waveform's peaks are replaced by literal flat tops, and a flat top is
-/// a discontinuity in the first derivative. That radiates high-order harmonics — the harsher and
-/// more aliasing-prone the higher they go — which is why a field report of "+18 dB and everything
-/// warbles" is the expected outcome of that code and not a bug in anything downstream. Any operator
-/// who set `PUNKTFUNK_AUDIO_GAIN` much above ~1.5 was hearing this.
+/// The curve is `tanh`-based:
+/// 1. C¹-continuous at the knee: slope at `m == KNEE` is 1, matching the linear branch.
+/// 2. Bounded: `tanh` is asymptotic to 1; `±inf` maps to `±1.0`.
+/// 3. Odd-symmetric: `f(-x) == -f(x)`, so distortion is odd-harmonic with no DC.
 ///
-/// The curve here is `tanh`-based and chosen for three properties, in this order:
-///
-/// 1. **C¹-continuous at the knee.** The shaped branch's slope at `m == KNEE` is
-///    `(1-K) · sech²(0) · 1/(1-K) == 1`, exactly the slope of the linear branch it meets. There is
-///    no corner in the transfer curve, so the onset of limiting is not itself an audible event —
-///    the failure mode of a naïve piecewise limiter, which trades one discontinuity for another.
-/// 2. **Bounded by construction.** `tanh` is asymptotic to 1, so the output approaches but never
-///    exceeds full scale for any finite input, and `±inf` maps to `±1.0`. No sample can leave here
-///    out of range, which is what the encoder downstream assumes.
-/// 3. **Odd-symmetric.** `f(-x) == -f(x)`, so the distortion it does introduce is odd-harmonic and
-///    adds no DC offset — the benign, "saturating" flavour rather than the rectifying one.
-///
-/// Callers gate on `gain != 1.0`, so the default path is untouched and the wire stays byte-for-byte
-/// identical to a build without this. Note this is a WAVESHAPER, not a lookahead limiter: it is
-/// memoryless and therefore costs zero latency, which is the trade that makes it acceptable in the
-/// realtime encode path. It raises headroom; it does not raise *loudness* the way a compressor
-/// with a real time constant would, and it should not be sold as one.
+/// Callers gate on `gain != 1.0`. Memoryless (zero latency), not a lookahead limiter.
 pub fn apply_gain(samples: &mut [f32], gain: f32) {
-    // Unity is a no-op, not "multiply by one and shape": the shaper is only correct to apply to a
-    // signal somebody asked to boost. Without this, calling at unity would bend every peak above
-    // the knee — a silent quality change for anyone who forgot to gate the call, and the reason
-    // the callers' `gain != 1.0` guards are a convenience rather than a load-bearing contract.
+    // Unity is a no-op, not "multiply by one and shape". The shaper is only correct on a
+    // signal somebody asked to boost. Calling at unity would bend every peak above the knee;
+    // the callers' `gain != 1.0` guards are a convenience, not a load-bearing contract.
     if gain == 1.0 {
         return;
     }
@@ -1486,8 +1109,7 @@ pub fn apply_gain(samples: &mut [f32], gain: f32) {
     }
 }
 
-/// The waveshaper behind [`apply_gain`]: identity below [`SOFT_LIMIT_KNEE`], asymptotic to ±1.0
-/// above it. Exposed so the clients can mirror the curve if they ever grow a gain of their own.
+/// Waveshaper behind [`apply_gain`]: identity below [`SOFT_LIMIT_KNEE`], asymptotic to ±1.0 above.
 pub fn soft_limit(x: f32) -> f32 {
     let m = x.abs();
     if m <= SOFT_LIMIT_KNEE {
@@ -1506,7 +1128,7 @@ pub fn soft_limit(x: f32) -> f32 {
 
 /// Windows `WAVEFORMATEXTENSIBLE.dwChannelMask` for the wire layout.
 ///
-/// NB 7.1 == `0x63F` (FL FR FC LFE **BL BR SL SR**), NOT `0xFF` — `0xFF` selects the
+/// 7.1 is `0x63F` (FL FR FC LFE **BL BR SL SR**), not `0xFF`. `0xFF` selects the
 /// front-of-center pair FLC/FRC, the wrong speakers. WASAPI delivers channels in ascending
 /// mask-bit order, which equals the wire order, so the decoded PCM needs no permutation.
 pub const fn wasapi_channel_mask(channels: u8) -> u32 {
@@ -1514,7 +1136,7 @@ pub const fn wasapi_channel_mask(channels: u8) -> u32 {
     const FR: u32 = 0x2;
     const FC: u32 = 0x4;
     const LFE: u32 = 0x8;
-    const BL: u32 = 0x10; // back left  (wire RL)
+    const BL: u32 = 0x10; // back left (wire RL)
     const BR: u32 = 0x20; // back right (wire RR)
     const SL: u32 = 0x200; // side left
     const SR: u32 = 0x400; // side right
@@ -1540,21 +1162,17 @@ pub fn spa_positions(channels: u8) -> &'static [u32] {
     }
 }
 
-/// The lock-free hand-off between the thread that knows the TIMESTAMPS (the decode/pull thread,
-/// which sees each packet's `pts_ns`) and the one that knows the RING (the realtime audio
-/// callback, which owns the depth and the [`JitterPolicy`]). Neither can do the job alone and the
-/// callback must not block, so they trade two words.
+/// Lock-free hand-off between the decode/pull thread (timestamps) and the realtime callback
+/// (ring + [`JitterPolicy`]). The callback must not block, so they trade two words.
 ///
-/// `usize::MAX` encodes "no target" rather than `0`, because `0` is a perfectly ordinary depth to
-/// ask for and conflating the two would silently mean "run the ring dry".
+/// `usize::MAX` encodes "no target", not `0` — `0` is a valid depth and would silently drain
+/// the ring.
 #[derive(Debug)]
 pub struct AudioSyncCell {
     depth: std::sync::atomic::AtomicUsize,
     target: std::sync::atomic::AtomicUsize,
-    /// Concealment the decode side has synthesized this session, ms — telemetry travelling the
-    /// same way the target does. It rides here because the counter is produced on the decode
-    /// thread and the 10 s playback line is emitted from the callback, and concealment that
-    /// nobody can see is concealment that hides the bug it is covering (WP-C1, risk R6).
+    /// Concealment the decode side has synthesized this session, ms. Produced on decode, read
+    /// from the callback's 10 s playback line.
     plc_ms: std::sync::atomic::AtomicU64,
 }
 
@@ -1569,28 +1187,24 @@ impl Default for AudioSyncCell {
 }
 
 impl AudioSyncCell {
-    /// Callback side: publish the ring's current depth in interleaved samples.
     pub fn publish_depth(&self, depth: usize) {
         self.depth
             .store(depth, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Decode side: the ring depth as last seen by the audio callback.
     pub fn depth(&self) -> usize {
         self.depth.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Decode side: publish total concealment synthesized for packet droughts.
     pub fn publish_plc_ms(&self, ms: u64) {
         self.plc_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Callback side: that total, for the periodic playback line.
     pub fn plc_ms(&self) -> u64 {
         self.plc_ms.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Decode side: ask the ring to aim for this depth (`None` = run unsynchronised).
+    /// Decode side: ask the ring to aim for this depth (`None` = unsynchronised).
     pub fn set_target(&self, target: Option<usize>) {
         self.target.store(
             target.unwrap_or(usize::MAX),
@@ -1598,7 +1212,6 @@ impl AudioSyncCell {
         );
     }
 
-    /// Callback side: the depth the sync loop wants, if any.
     pub fn target(&self) -> Option<usize> {
         match self.target.load(std::sync::atomic::Ordering::Relaxed) {
             usize::MAX => None,
@@ -1607,87 +1220,64 @@ impl AudioSyncCell {
     }
 }
 
-/// Smoothing time constant for the measured A/V offset, in ms of consumed audio. Long enough that
-/// network jitter and a single late datagram do not move it; short enough to track real drift.
+/// Smoothing time constant for the measured A/V offset, in ms of consumed audio. Long enough
+/// that network jitter and a single late datagram do not move it; short enough to track real
+/// drift.
 const AV_EWMA_TAU_MS: u32 = 2_000;
-/// Offsets inside this band are left alone. Correcting a few ms costs a (crossfaded, but real)
-/// discontinuity and buys nothing a listener can perceive — detectability for A/V misalignment sits
-/// an order of magnitude above it. The deadband is what keeps the loop from hunting forever around
-/// zero, which would be audible in a way the misalignment it was chasing was not.
+/// Offsets inside this band are left alone. Correcting a few ms costs a real discontinuity and
+/// buys nothing a listener can perceive; the deadband stops the loop hunting around zero.
 const AV_DEADBAND_MS: u32 = 10;
-/// Observations folded before the first correction is offered. The offset is derived from a clock
-/// skew estimate and a video figure that both need a moment to settle after connect; acting on the
-/// first sample would chase the handshake, not the stream.
+/// Observations folded before the first correction is offered. The offset is derived from a
+/// clock skew estimate and a video figure that both need a moment to settle after connect;
+/// acting on the first sample would chase the handshake, not the stream.
 const AV_MIN_OBSERVATIONS: u32 = 100;
-/// An offset larger than this is not believed. A wall-clock step, a paused host, or a stale video
-/// figure can all produce an enormous apparent misalignment, and steering the ring by it would
-/// empty or overfill it outright. Beyond this the loop reports and waits rather than acting.
+/// An offset larger than this is not believed. A wall-clock step, a paused host, or a stale
+/// video figure can all produce an enormous apparent misalignment, and steering the ring by
+/// it would empty or overfill it. Beyond this the loop reports and waits rather than acting.
 const AV_SANE_LIMIT_MS: u32 = 1_000;
 
-/// The A/V synchronisation controller: turns "when will this audio actually play" and "when did the
-/// picture it belongs with reach the glass" into a ring depth the [`JitterPolicy`] should aim for.
+/// Turns "when will this audio play" and "when did its picture reach the glass" into a ring
+/// depth [`JitterPolicy`] should aim for.
 ///
-/// **The defect it exists to fix.** The host stamps `pts_ns` on every audio datagram and the client
-/// decoded it into `AudioPacket` — and then never read it. Video's `pts_ns`, by contrast, is used
-/// end to end (the presenter computes a true glass-to-glass `displayed + clock_offset − pts`). So
-/// audio free-ran at whatever depth its jitter ring happened to settle at, video was presented on a
-/// wholly independent path, and nothing ever compared them: the A/V offset was an accident of
-/// buffer depths. It moved whenever the ring ratcheted under underrun pressure, and — the way this
-/// surfaced in the field — it got WORSE every time video got faster, because a quicker decoder
-/// lowers the video leg while leaving the audio leg exactly where it was.
-///
-/// **Video is the master.** In a game streamer the video leg is the input-feel budget and must
-/// never be inflated to satisfy the audio clock; audio tolerates small, crossfaded, rate-limited
-/// corrections that are inaudible, and [`crossfade_drop`] already applies them. So audio moves.
-///
-/// **Continuity outranks sync.** This type only ever proposes a depth. [`JitterPolicy`] clamps the
-/// proposal to its own underrun-driven floor, so a link whose jitter genuinely needs more buffer
-/// than the picture is away keeps its buffer and the residual is reported instead of being taken
-/// out of the listener's stream. See [`JitterPolicy::set_sync_target`].
+/// Video is the master: the video leg is the input-feel budget and must not inflate to satisfy
+/// the audio clock. Audio moves, via small crossfaded corrections ([`crossfade_drop`]).
+/// Continuity outranks sync: this type only proposes a depth; [`JitterPolicy`] clamps it to
+/// the underrun-driven floor. See [`JitterPolicy::set_sync_target`].
 #[derive(Clone, Debug)]
 pub struct AvSync {
-    /// The negotiated layout, in the same two numbers [`JitterPolicy`] keeps and for the same
-    /// reason — this type's proposal is denominated in the ring's own units, so the two have to
-    /// agree about what a millisecond is down to the sample.
+    /// Negotiated layout, same two numbers [`JitterPolicy`] keeps, so a millisecond agrees down
+    /// to the sample.
     rate_hz: u32,
     channels: u8,
-    /// EWMA of the measured offset in ns. Positive = audio is scheduled to play LATE relative to
-    /// the picture it belongs with.
+    /// EWMA of the measured offset in ns. Positive = audio is scheduled to play late relative
+    /// to the picture it belongs with.
     offset_avg_ns: f32,
     observations: u32,
-    /// Set once an observation lands outside [`AV_SANE_LIMIT_MS`], for reporting.
     implausible: bool,
 }
 
-/// One measurement handed to [`AvSync::observe`]. Every field is in the units its source already
-/// produces, so no caller has to do clock arithmetic to use it correctly.
+/// One measurement for [`AvSync::observe`]. Each field is in the units its source already produces.
 #[derive(Clone, Copy, Debug)]
 pub struct AvSyncObservation {
-    /// The host capture timestamp carried by the audio frame being queued (host clock).
     pub pts_ns: u64,
     /// Local wall-clock now, same basis the client's video latency math uses (CLOCK_REALTIME).
     pub now_local_ns: i128,
     /// Host clock minus client clock, from the skew handshake (`clock_offset_now_ns`).
     pub clock_offset_ns: i64,
-    /// How much audio is already queued AHEAD of this frame, in interleaved samples — everything
-    /// that must play before it does.
+    /// How much audio is already queued ahead of this frame, in interleaved samples.
     pub buffered_ahead: usize,
-    /// The video plane's current end-to-end figure in ns: `displayed + clock_offset − pts`, as the
-    /// presenter already computes it. `None` while no frame has been presented yet.
+    /// Video end-to-end in ns: `displayed + clock_offset − pts`. `None` until a frame is presented.
     pub video_e2e_ns: Option<u64>,
 }
 
 impl AvSync {
-    /// `channels` is the negotiated interleaved channel count (2/6/8), at the protocol's default
-    /// [`SAMPLE_RATE_HZ`]. Hi-res sessions use [`new_at_rate`](Self::new_at_rate).
+    /// `channels` is 2/6/8 at [`SAMPLE_RATE_HZ`]. Hi-res uses [`new_at_rate`](Self::new_at_rate).
     pub fn new(channels: u8) -> AvSync {
         Self::new_at_rate(channels, SAMPLE_RATE_HZ)
     }
 
-    /// As [`new`](Self::new), at an explicitly negotiated `rate_hz` — every rate on the lossless
-    /// ladder, exactly, for the reason [`JitterPolicy::new_at_rate`] gives: the ms ⇄ sample
-    /// conversion multiplies before it divides, so the 44.1 kHz family is representable here too
-    /// and the depth this type proposes lands in the same units the ring measures itself in.
+    /// As [`new`](Self::new), at an explicitly negotiated `rate_hz`. Multiply-before-divide so
+    /// the 44.1 kHz family is representable and the proposed depth is in the ring's units.
     pub fn new_at_rate(channels: u8, rate_hz: u32) -> AvSync {
         AvSync {
             rate_hz: rate_hz.max(1),
@@ -1698,27 +1288,19 @@ impl AvSync {
         }
     }
 
-    /// Interleaved samples to whole milliseconds — see [`samples_to_ms`].
     fn samples_ms(&self, samples: usize) -> u32 {
         samples_to_ms(self.rate_hz, self.channels, samples)
     }
 
-    /// Fold one measurement. Returns the smoothed offset in ns once there is enough evidence to
-    /// believe it (positive = audio late), or `None` while still settling.
-    ///
-    /// Rejecting the implausible rather than clamping it is deliberate: a wall-clock step or a
-    /// stale video figure produces a huge apparent offset, and a clamped-but-wrong value would be
-    /// acted on as though it were a small real one.
+    /// Fold one measurement. Smoothed offset in ns once there is enough evidence (positive =
+    /// audio late), or `None` while settling. Rejects the implausible rather than clamping it:
+    /// a clamped wrong value would be acted on as a small real one.
     pub fn observe(&mut self, o: AvSyncObservation) -> Option<i64> {
-        // No frame on the glass yet ⇒ no reference to align against, so nothing to say.
+        // No frame on the glass yet: no reference to align against.
         let video_e2e_ns = o.video_e2e_ns?;
-        // When this frame's samples will actually reach the speaker, expressed in the host's
-        // capture clock — the same clock, and the same shape, as the video figure it is compared
-        // against.
-        // Deliberately still rounded to whole MILLISECONDS rather than converted straight to ns:
-        // it keeps every 48/96 kHz session bit-identical to the shipped behaviour, and the
-        // ≤ 1 ms it discards is an order of magnitude inside [`AV_DEADBAND_MS`], which is the
-        // resolution this loop acts on at all. The conversion itself is now exact at every rate.
+        // Play-at in the host capture clock, same shape as the video figure. Rounded to whole
+        // milliseconds; ≤ 1 ms is inside [`AV_DEADBAND_MS`]. The conversion itself is exact at
+        // every rate.
         let buffered_ns = self.samples_ms(o.buffered_ahead) as i128 * 1_000_000;
         let play_at_host = o.now_local_ns + buffered_ns + o.clock_offset_ns as i128;
         let audio_e2e_ns = play_at_host - o.pts_ns as i128;
@@ -1730,8 +1312,8 @@ impl AvSync {
         }
         self.implausible = false;
 
-        // Weight by one protocol frame so the time constant means the same thing regardless of how
-        // often the caller observes.
+        // Weight by one protocol frame so the time constant means the same thing regardless of
+        // how often the caller observes.
         let alpha = (FRAME_MS as f32 / AV_EWMA_TAU_MS as f32).clamp(0.0, 1.0);
         if self.observations == 0 {
             self.offset_avg_ns = offset_ns as f32;
@@ -1742,19 +1324,16 @@ impl AvSync {
         self.settled().then_some(self.offset_avg_ns as i64)
     }
 
-    /// Enough evidence folded to act on.
     pub fn settled(&self) -> bool {
         self.observations >= AV_MIN_OBSERVATIONS
     }
 
-    /// The smoothed offset in ms (positive = audio late), for the HUD. Reported as soon as it is
-    /// measured, including while still settling — a number the operator can watch converge is more
-    /// useful than a blank that hides whether the loop is working at all.
+    /// Smoothed offset in ms (positive = audio late), for the HUD. Reported while still settling
+    /// so the operator can watch it converge.
     pub fn offset_ms(&self) -> i32 {
         (self.offset_avg_ns / 1_000_000.0) as i32
     }
 
-    /// The last observation was outside the believable range and was discarded.
     pub fn implausible(&self) -> bool {
         self.implausible
     }
@@ -1772,12 +1351,9 @@ impl AvSync {
         if offset_ms.abs() < AV_DEADBAND_MS as f32 {
             return None;
         }
-        // One millisecond of samples as a float, so a fractional offset scales smoothly. The
-        // division is done on the constant, not on the product: `x * 96000.0 / 1000.0` rounds
-        // twice and can land one ulp — and so one sample — away from the `x * 96.0` every shipped
-        // 48 kHz session computes today. This way it is exactly 96.0 / 192.0 there, and correctly
-        // 88.2 at 44 100 Hz stereo, where the old integer `per_ms` said 88 and steered every
-        // correction 0.23 % short.
+        // One millisecond of samples as a float, so a fractional offset scales smoothly.
+        // Divide the constant, not the product: `x * 96000.0 / 1000.0` can land one sample off
+        // the `x * 96.0` every 48 kHz session computes. This way 44 100 Hz stereo is 88.2, not 88.
         let per_ms = interleaved_per_sec(self.rate_hz, self.channels) as f32 / 1000.0;
         let delta = (offset_ms * per_ms) as i64;
         Some((current_depth as i64 - delta).max(0) as usize)
@@ -1797,12 +1373,11 @@ mod tests {
             &LAYOUT_71,
             &LAYOUT_71_HQ,
         ] {
-            // Mapping is identity and exactly `channels` entries long.
             assert_eq!(l.mapping.len(), l.channels as usize);
             for (i, &m) in l.mapping.iter().enumerate() {
                 assert_eq!(m as usize, i, "mapping must be identity for {l:?}");
             }
-            // libopus invariant: total channels == coupled*2 + (streams - coupled).
+            // libopus: channels == coupled*2 + (streams - coupled).
             assert_eq!(
                 l.coupled * 2 + (l.streams - l.coupled),
                 l.channels,
@@ -1820,7 +1395,6 @@ mod tests {
         assert_eq!(layout_for(6, true), &LAYOUT_51_HQ);
         assert_eq!(layout_for(8, false), &LAYOUT_71);
         assert_eq!(layout_for(8, true), &LAYOUT_71_HQ);
-        // Unknown / 0 → stereo.
         assert_eq!(layout_for(0, false), &LAYOUT_STEREO);
         assert_eq!(layout_for(3, false), &LAYOUT_STEREO);
         assert_eq!(layout_for(7, true), &LAYOUT_STEREO);
@@ -1850,26 +1424,23 @@ mod tests {
         assert_eq!(t.missing_before(105 + 1001), 0);
     }
 
-    /// The cap is 50 ms of audio, not ten packets — and it was ten packets, documented as "50 ms
-    /// at the protocol's 5 ms frames", which was true until the lossless plane negotiated 2 ms and
-    /// quietly made it 20 ms. The default must stay bit-identical (every Opus session and every
-    /// existing caller depends on it) and a short frame must buy the milliseconds it says.
+    /// The cap is 50 ms of audio, not ten packets. A short frame must still buy the
+    /// milliseconds it says.
     #[test]
     fn the_conceal_cap_is_fifty_milliseconds_of_the_negotiated_frame() {
-        // The Opus plane: ten 5 ms frames, exactly the flat count this replaced.
+        // Opus: ten 5 ms frames.
         assert_eq!(max_conceal_packets(FRAME_MS * 1000), 10);
         let mut t = AudioGapTracker::new();
         t.missing_before(0);
         assert_eq!(t.missing_before(9_999), 10);
 
-        // A 2 ms lossless frame: twenty-five frames for the same 50 ms, not ten.
+        // 2 ms lossless: twenty-five frames for the same 50 ms.
         assert_eq!(max_conceal_packets(2_000), 25);
         let mut p = AudioGapTracker::new();
         p.set_frame_us(2_000);
         p.missing_before(0);
         assert_eq!(p.missing_before(9_999), 25);
 
-        // Every rung of the ladder buys at most 50 ms and never zero frames.
         for &us in &pcm::FRAME_US_LADDER {
             let n = max_conceal_packets(us);
             assert!(n >= 1, "{us} µs must conceal at least one frame");
@@ -1878,7 +1449,6 @@ mod tests {
                 "{us} µs × {n} frames exceeds the {MAX_CONCEAL_MS} ms this cap promises"
             );
         }
-        // A degenerate frame length must not divide by zero or disable concealment.
         assert_eq!(max_conceal_packets(0), 10, "0 µs falls back to the default");
         assert_eq!(max_conceal_packets(u32::MAX), 1);
     }
@@ -1897,13 +1467,10 @@ mod tests {
     #[test]
     fn red_recovery_rebuilds_exactly_the_single_missing_frame() {
         let mut r = AudioRedRecovery::new();
-        // First packet: nothing is known to be missing, so nothing is prepended.
         assert!(!r.recover_before(10, true));
-        // In order.
         assert!(!r.recover_before(11, true));
         // 12 lost: 13 carries it.
         assert!(r.recover_before(13, true));
-        // Back in order from the new anchor.
         assert!(!r.recover_before(14, true));
     }
 
@@ -1911,9 +1478,7 @@ mod tests {
     fn red_recovery_is_conservative() {
         let mut r = AudioRedRecovery::new();
         r.recover_before(10, true);
-        // A datagram with no redundant copy recovers nothing, however big the gap.
         assert!(!r.recover_before(20, false));
-        // Duplicates and reorders recover nothing, and must not move the anchor backwards.
         let mut r = AudioRedRecovery::new();
         r.recover_before(10, true);
         r.recover_before(11, true);
@@ -1925,8 +1490,7 @@ mod tests {
         );
     }
 
-    /// A longer burst still recovers its last frame — the gap the client has to conceal gets one
-    /// frame shorter, which is strictly better than concealing all of it.
+    /// A longer burst still recovers its last frame. The remaining gap is one frame shorter.
     #[test]
     fn red_recovery_shortens_a_longer_burst() {
         let mut r = AudioRedRecovery::new();
@@ -1949,8 +1513,8 @@ mod tests {
         assert!(!r.recover_before(2, true));
     }
 
-    /// The two halves must agree: whatever `AudioRedRecovery` rebuilds, `AudioGapTracker` must
-    /// then see as no gap at all — that is the whole point of doing recovery on the demux side.
+    /// Whatever `AudioRedRecovery` rebuilds, `AudioGapTracker` must then see as no gap. Recovery
+    /// lives on the demux side so every embedder sees a complete stream.
     #[test]
     fn recovery_and_the_gap_tracker_agree() {
         let mut rec = AudioRedRecovery::new();
@@ -1978,12 +1542,10 @@ mod tests {
         );
     }
 
-    // ---- drought concealment (WP-C1) -----------------------------------------------------
+    // ---- drought concealment --------------------------------------------------------------
 
-    /// Concealment is for a ring that is running OUT. A drought a deep ring can cover is
-    /// inaudible, and synthesizing over it would insert audio the late packets are about to
-    /// duplicate — the stream would then run permanently later and the drift shed would have to
-    /// cut it back out, audibly.
+    /// Concealment is for a ring that is running out. A drought a deep ring can cover is
+    /// inaudible, and synthesizing over it would duplicate the late packets.
     #[test]
     fn a_drought_is_concealed_only_while_the_ring_is_running_out() {
         let mut c = DroughtConceal::new(JitterTuning::PIPEWIRE.plc_max_ms());
@@ -1996,8 +1558,6 @@ mod tests {
         assert_eq!(c.total_ms(), FRAME_MS as u64);
     }
 
-    /// Ordinary arrival jitter is not a drought — this policy must be invisible until the wire
-    /// has genuinely stopped.
     #[test]
     fn ordinary_jitter_is_not_a_drought() {
         let mut c = DroughtConceal::new(JitterTuning::AAUDIO.plc_max_ms());
@@ -2008,9 +1568,8 @@ mod tests {
         assert_eq!(c.packet(), 0);
     }
 
-    /// The window is bounded, and bounded in TIME — the whole reason `deprime_ms` stopped being a
-    /// callback count. Every preset must get exactly twice its own de-prime fuse, so no platform
-    /// silently gets a third of another's protection again.
+    /// Every preset gets twice its own de-prime fuse, so no platform silently gets a third of
+    /// another's protection.
     #[test]
     fn drought_concealment_is_bounded_at_twice_the_deprime_fuse() {
         for t in [
@@ -2030,9 +1589,8 @@ mod tests {
         }
     }
 
-    /// Packets genuinely lost INSIDE a drought we already covered must not be covered a second
-    /// time by the loss path: doing both would insert audio the stream never carried and push
-    /// everything after it later.
+    /// Packets lost inside a drought already covered must not be covered a second time by the
+    /// loss path: doing both would insert audio the stream never carried.
     #[test]
     fn concealment_already_paid_for_is_not_paid_for_twice() {
         let mut c = DroughtConceal::new(JitterTuning::WASAPI.plc_max_ms());
@@ -2045,14 +1603,12 @@ mod tests {
         let already = c.packet();
         assert_eq!(already, 4);
         assert_eq!(gaps.missing_before(17).saturating_sub(already), 2);
-        // …and the next drought starts from a full budget.
         assert!(c.conceal(drought_after(), 0));
     }
 
     // ---- bitrate tiers -------------------------------------------------------------------
 
-    /// `Standard` must reproduce the historical table EXACTLY — that is what makes the tier
-    /// machinery provably non-regressive against every pre-tier build.
+    /// `Standard` must equal the layout table's `bitrate`.
     #[test]
     fn standard_tier_is_the_legacy_table() {
         for l in [
@@ -2076,7 +1632,6 @@ mod tests {
             );
             assert!(lo < std && std < hi, "{l:?}: {lo} < {std} < {hi}");
         }
-        // The uncoupled HQ layouts are already past transparency — no tier may move them.
         for l in [&LAYOUT_51_HQ, &LAYOUT_71_HQ] {
             for t in [AudioTier::Low, AudioTier::Standard, AudioTier::High] {
                 assert_eq!(l.bitrate_for(t), l.bitrate, "{l:?} at {t:?}");
@@ -2092,31 +1647,25 @@ mod tests {
         }
         assert_eq!(AudioTier::parse("  HIGH "), Some(AudioTier::High));
         assert_eq!(AudioTier::parse("normal"), Some(AudioTier::Standard));
-        // Unknown spellings must be rejected, not silently downgraded.
         assert_eq!(AudioTier::parse("transparent"), None);
         assert_eq!(AudioTier::parse(""), None);
     }
 
     // ---- the audio bandwidth budget --------------------------------------------------------
 
-    /// THE regression this guards: `High` (256 kbps stereo) and the redundant plane (x2) were
-    /// each justified as "~1 % of the video budget" and nobody added them together. 512 kbps is
-    /// ~10 % of a 5 Mbps session — and audio is outside the ABR loop, so ABR cannot reclaim it.
+    /// `High` (256 kbps stereo) times the redundant plane is 512 kbps — ~10 % of a 5 Mbps
+    /// session — and audio is outside ABR, so ABR cannot reclaim it.
     #[test]
     fn budget_steps_down_as_the_link_narrows() {
         let plan = |kbps| plan_audio_budget(kbps, 2, AudioTier::High, true);
-        // Roomy link: everything on.
         let b = plan(20_000);
         assert_eq!((b.tier, b.redundancy), (AudioTier::High, true));
         assert_eq!(b.kbps, 512);
-        // Halve it and redundancy is the first thing to go — quality is what the field report
-        // was about, and redundancy only pays under loss.
+        // Halve it and redundancy goes first: quality outranks recovery that only pays under loss.
         assert_eq!(plan(10_000).tier, AudioTier::High);
         assert!(!plan(10_000).redundancy);
-        // Tighter still: down to Standard.
         assert_eq!(plan(5_000).tier, AudioTier::Standard);
         assert!(!plan(5_000).redundancy);
-        // A genuinely narrow link lands on Low, and never below it.
         assert_eq!(plan(1_000).tier, AudioTier::Low);
         assert_eq!(plan(1).tier, AudioTier::Low);
         assert_eq!(
@@ -2126,7 +1675,6 @@ mod tests {
         );
     }
 
-    /// The budget must never spend more than its share, at any bitrate or channel count.
     #[test]
     fn budget_never_exceeds_its_share() {
         for kbps in [0u32, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 100_000] {
@@ -2144,23 +1692,23 @@ mod tests {
         }
     }
 
-    /// Surround costs more per tier, so the same link must step it down sooner than stereo —
-    /// the budget is about total wire cost, not about the tier name.
+    /// Surround costs more per tier, so the same link must step it down sooner than stereo.
+    /// The budget is total wire cost, not the tier name.
     #[test]
     fn budget_accounts_for_the_channel_count() {
         let stereo = plan_audio_budget(10_000, 2, AudioTier::High, true);
         let surround = plan_audio_budget(10_000, 8, AudioTier::High, true);
         assert_eq!(stereo.tier, AudioTier::High);
         assert!(surround.kbps <= stereo.kbps.max(surround.kbps), "sanity");
-        // 7.1 at High is 768 kbps — far past a 500 kbps allowance, so it must have stepped down.
+        // 7.1 High is 768 kbps, past a 500 kbps allowance.
         assert!(
             surround.kbps < 768,
             "7.1 High must not fit a 10 Mbps budget"
         );
     }
 
-    /// The budget may LOWER what was asked for, never raise it: an operator who set `low` gets
-    /// `low` on a 100 Mbps link, and a client that never asked for redundancy never gets it.
+    /// The budget may lower what was asked for, never raise it. An operator who set `low` gets
+    /// `low` on a 100 Mbps link; a client that never asked for redundancy never gets it.
     #[test]
     fn budget_respects_the_request() {
         let b = plan_audio_budget(100_000, 2, AudioTier::Low, true);
@@ -2178,26 +1726,25 @@ mod tests {
 
     // ---- the de-jitter policy ------------------------------------------------------------
 
-    /// Interleaved samples per ms at `channels`.
     fn per_ms(channels: u8) -> usize {
         (SAMPLE_RATE_HZ / 1000) as usize * channels as usize
     }
 
-    /// One simulated run's outcome.
     #[derive(Debug, Default)]
     struct Sim {
         final_ms: u32,
         peak_ms: u32,
-        /// Smooth drift corrections (crossfaded, one frame each) — the good kind.
+        /// Smooth drift corrections (crossfaded, one frame each).
         soft_sheds: u32,
-        /// Hard-cap trims — the backstop. Any of these in a plain-drift run means the smooth
-        /// correction is not doing its job.
+        /// Hard-cap trims. Any of these in a plain-drift run means the smooth correction is
+        /// not doing its job.
         hard_trims: u32,
         underruns: u32,
     }
 
-    /// Drive a policy through `ms` of simulated audio at a `quantum_ms` device, where the producer
-    /// delivers `drift_ppm` more (or less) than the consumer takes — i.e. host-vs-client clock skew.
+    /// Drive a policy through `ms` of simulated audio at a `quantum_ms` device, where the
+    /// producer delivers `drift_ppm` more (or less) than the consumer takes — host-vs-client
+    /// clock skew.
     fn simulate(
         tuning: JitterTuning,
         channels: u8,
@@ -2214,7 +1761,6 @@ mod tests {
         // Fractional producer accumulator, so a sub-sample-per-callback drift still accumulates.
         let mut carry: i64 = 0;
         for _ in 0..(ms / quantum_ms) {
-            // Producer: one quantum of audio plus the drift.
             carry += want as i64 * drift_ppm;
             let extra = carry / 1_000_000;
             carry -= extra * 1_000_000;
@@ -2222,7 +1768,7 @@ mod tests {
 
             let s = p.step(depth, want);
             if s.drop_front > 0 {
-                // Told apart by `hard_trim`, not by the fade length — both kinds fade now.
+                // Told apart by `hard_trim`, not fade length — both kinds fade.
                 if s.hard_trim {
                     out.hard_trims += 1;
                 } else {
@@ -2235,8 +1781,8 @@ mod tests {
                 );
                 depth -= s.drop_front.min(depth);
             }
-            // No sync target here, so the insert must never fire: an un-wired ring adds no
-            // depth by itself. Pinned on every drift run rather than in one test.
+            // No sync target: an unsynchronised ring must not insert. Pinned on every drift
+            // run rather than in one test.
             assert_eq!(s.insert_front, 0, "an unsynced ring inserted");
             if s.silence {
                 p.note_read(false);
@@ -2254,12 +1800,9 @@ mod tests {
         out
     }
 
-    /// The invariant that makes drift correction real rather than decorative: on every preset the
-    /// smooth shed point must sit strictly BELOW the hard trim point. Invert it — by tuning
-    /// `headroom_ms` down — and the ring is trimmed back before the depth average can ever reach
-    /// the shed threshold, so the smooth path becomes dead code and every correction is the
-    /// audible drop it was meant to replace. (That inversion was present in the first draft of
-    /// this module and only surfaced because `a_transient_burst_does_not_shed` failed.)
+    /// On every preset the smooth shed point must sit strictly below the hard trim point.
+    /// Invert it and the ring is trimmed before the depth average can reach the shed
+    /// threshold, so the smooth path becomes dead code.
     #[test]
     fn every_preset_sheds_before_it_trims() {
         for (name, t) in [
@@ -2279,16 +1822,15 @@ mod tests {
                 "{name}: the headroom band is cut short by the hard cap"
             );
             assert!(t.max_target_ms >= t.base_target_ms, "{name}");
-            // Real hysteresis, in time: a drought has to outlast several protocol frames before
-            // the ring gives up, or one late packet manufactures a whole target of fresh silence.
+            // A drought has to outlast several protocol frames before the ring gives up, or
+            // one late packet manufactures a whole target of silence.
             assert!(
                 t.deprime_ms >= 4 * FRAME_MS,
                 "{name}: de-primes after {} ms — a single late packet would trip it",
                 t.deprime_ms
             );
-            // ...and never longer than the deepest buffer this preset would ever hold: past that
-            // point the drought has already cost more than the re-prime it is trying to avoid, and
-            // every callback in between is dribbling partial reads at the listener.
+            // Never longer than the deepest buffer this preset would ever hold: past that the
+            // drought has already cost more than the re-prime it is trying to avoid.
             assert!(
                 t.deprime_ms <= t.max_target_ms,
                 "{name}: waits {} ms to de-prime but never buffers more than {} ms",
@@ -2298,13 +1840,11 @@ mod tests {
         }
     }
 
-    /// THE headline behaviour, and the defect this policy exists for: with the host clock running
-    /// fast, the old rings grew to their ceiling and stayed pinned there for the rest of the
-    /// session. Drift correction must hold the depth near target — and must do it with the SMOOTH
-    /// crossfaded shed, never by letting the hard cap chop the backlog.
+    /// Host clock running fast must not pin the ring at the ceiling. Drift correction holds
+    /// depth near target with the smooth crossfaded shed, never the hard cap.
     #[test]
     fn drift_does_not_ratchet_latency_to_the_ceiling() {
-        // +200 ppm is a deliberately harsh skew (real DAC pairs are tens of ppm); 5 minutes.
+        // +200 ppm is a harsh skew (real DAC pairs are tens of ppm); 5 minutes.
         let s = simulate(JitterTuning::AAUDIO, 2, 300_000, 5, 200, 25);
         assert!(
             s.soft_sheds > 0,
@@ -2318,7 +1858,6 @@ mod tests {
             s.underruns, 0,
             "shedding must never cause an underrun: {s:?}"
         );
-        // The old Android ring pinned at its 120 ms hard cap. Ours must stay inside the band.
         let ceiling = JitterTuning::AAUDIO.base_target_ms + JitterTuning::AAUDIO.headroom_ms;
         assert!(
             s.peak_ms <= ceiling,
@@ -2327,7 +1866,6 @@ mod tests {
         );
     }
 
-    /// Same skew, every preset: none of them may ratchet.
     #[test]
     fn no_preset_ratchets_under_drift() {
         for (name, t) in [
@@ -2346,8 +1884,8 @@ mod tests {
         }
     }
 
-    /// The mirror case: a host clock running SLOW must not be "corrected" into permanent
-    /// underruns. The adaptive floor may grow the target, but nothing may be shed.
+    /// A host clock running slow must not be "corrected" into permanent underruns. The
+    /// adaptive floor may grow the target, but nothing may be shed.
     #[test]
     fn negative_drift_grows_the_target_instead_of_stuttering() {
         let s = simulate(JitterTuning::AAUDIO, 2, 120_000, 5, -200, 25);
@@ -2358,9 +1896,9 @@ mod tests {
         assert_eq!(s.hard_trims, 0, "{s:?}");
     }
 
-    /// A shed must never fire on a transient — a burst that arrives and drains is normal jitter,
-    /// and shedding it would cost an audible artefact for nothing. The spike here sits ABOVE the
-    /// shed threshold but below the trim point, so only the sustain requirement can reject it.
+    /// A shed must never fire on a transient. A burst that arrives and drains is normal jitter.
+    /// The spike here sits above the shed threshold but below the trim point, so only the
+    /// sustain requirement can reject it.
     #[test]
     fn a_transient_burst_does_not_shed() {
         let t = JitterTuning::AAUDIO;
@@ -2394,7 +1932,7 @@ mod tests {
         );
     }
 
-    /// The hard cap is the only absolute latency guarantee — it trims immediately, without
+    /// The hard cap is the only absolute latency guarantee. It trims immediately, without
     /// waiting for the drift timer.
     #[test]
     fn hard_cap_trims_at_once() {
@@ -2406,11 +1944,7 @@ mod tests {
             "a 500 ms backlog must be trimmed on the spot"
         );
         assert!(s.hard_trim, "a cap trim must announce itself as one");
-        // ...and it is FADED. This used to assert the opposite ("a blown cap is already a
-        // discontinuity"), which confused the arrivals with the audio: the samples either side of
-        // the splice are ordinary continuous sound, and a raw seam through them is a click. It is
-        // also the drop that actually fires in the field — a bunching Wi-Fi link trims far more
-        // often than drift sheds — so the one path that was left unfaded was the audible one.
+        // Faded: the samples either side of the splice are ordinary continuous sound.
         assert!(
             s.crossfade > 0,
             "a cap trim splices real audio and must be faded"
@@ -2426,19 +1960,17 @@ mod tests {
         );
     }
 
-    /// One transient drain must not manufacture a fresh target's worth of silence — the bug
-    /// Android fixed and Linux/Windows still carried.
+    /// One transient drain must not manufacture a fresh target's worth of silence.
     #[test]
     fn deprime_requires_hysteresis() {
         let pm = per_ms(2);
         let want = 5 * pm;
         let mut p = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
-        // An EMPTY ring must emit silence and stay un-primed, however many callbacks it sees.
+        // An empty ring must emit silence and stay un-primed, however many callbacks it sees.
         for _ in 0..10 {
             assert!(p.step(0, want).silence, "an empty ring cannot play");
         }
         assert!(!p.is_primed());
-        // A ring already holding well over target primes on the first callback that sees it.
         assert!(
             !p.step(50 * pm, want).silence,
             "a ring holding well over target must start immediately"
@@ -2453,12 +1985,8 @@ mod tests {
         assert!(!p.is_primed(), "a sustained drain must re-prime");
     }
 
-    /// THE regression this replaced a callback count for: the de-prime fuse must be the same
-    /// SPAN OF TIME whatever the device's IO quantum. As a count it was not — the same `4` was
-    /// ~40 ms on a 10 ms WASAPI quantum and 20 ms on iOS, whose session asks for a 5 ms IO buffer.
-    /// A Wi-Fi delivery stall therefore de-primed the Apple ring on every bunching cycle while the
-    /// identical policy rode it out everywhere else. Plant the defect by restoring a fixed count
-    /// and the two quanta below stop agreeing.
+    /// The de-prime fuse is the same span of time whatever the device's IO quantum. A callback
+    /// count is not: the same `4` is ~40 ms at 10 ms and 20 ms at 5 ms.
     #[test]
     fn deprime_fuse_is_a_duration_not_a_callback_count() {
         for quantum_ms in [5usize, 8, 10, 16, 21] {
@@ -2475,7 +2003,7 @@ mod tests {
                 starved_ms += quantum_ms;
             }
             assert!(!p.is_primed(), "q={quantum_ms}ms: never de-primed at all");
-            // One quantum of granularity either side — the fuse can only be checked per callback.
+            // One quantum of granularity either side: the fuse can only be checked per callback.
             let floor = (t.deprime_ms as usize).min(quantum_ms * MIN_DEPRIME_CALLBACKS as usize);
             assert!(
                 starved_ms >= floor && starved_ms < t.deprime_ms as usize + quantum_ms,
@@ -2492,18 +2020,16 @@ mod tests {
     fn target_lifts_above_a_large_device_quantum() {
         let pm = per_ms(2);
         let mut p = JitterPolicy::new(JitterTuning::PIPEWIRE, 2); // base target 15 ms
-        let want = 40 * pm; // a 40 ms graph quantum — far above the base target
-                            // At exactly the base target the ring must NOT claim to be primed.
+        let want = 40 * pm; // a 40 ms graph quantum, far above the base target
         assert!(
             p.step(15 * pm, want).silence,
             "15 ms cannot serve a 40 ms quantum"
         );
-        // Once it holds the quantum plus a frame, it may play.
         let s = p.step((40 + FRAME_MS as usize) * pm, want);
         assert!(!s.silence, "quantum + one frame must be enough to start");
     }
 
-    /// The rate parameter must move SAMPLES without moving MILLISECONDS. A 96 kHz ring holds
+    /// The rate parameter must move samples without moving milliseconds. A 96 kHz ring holds
     /// twice the samples for the same latency, and every ms-denominated figure a client reports
     /// — `target_ms`, `depth_ms`, `avg_depth_ms` — must read identically at both rates. If this
     /// ever fails, the hi-res plane is buying latency it did not intend to.
@@ -2523,7 +2049,6 @@ mod tests {
                     hi.target_ms(),
                     "96 kHz must start at the same latency as 48 kHz ({t:?}, {ch}ch)"
                 );
-                // …and the sample counts behind those milliseconds really did double.
                 assert_eq!(
                     hi.depth_ms(2 * lo.ms_samples(1)),
                     lo.depth_ms(lo.ms_samples(1)),
@@ -2538,21 +2063,18 @@ mod tests {
         }
     }
 
-    /// The shed drops exactly ONE frame and fades across part of it. Both were written when 5 ms
-    /// was the only frame this protocol had; the lossless plane negotiates shorter ones. The
-    /// default must stay bit-identical (every Opus session depends on it), and a short frame must
-    /// shed a short frame rather than 2.5 of them.
+    /// The shed drops exactly one frame and fades across part of it. A short frame must shed a
+    /// short frame rather than 2.5 of them.
     #[test]
     fn the_shed_follows_the_negotiated_frame_length() {
         let pm = per_ms(2);
 
-        // Default: one 5 ms frame dropped, a 2 ms fade — exactly the pre-hi-res numbers.
+        // Default: one 5 ms frame dropped, a 2 ms fade.
         let p = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
         assert_eq!(p.frame_samples(), FRAME_MS as usize * pm);
         assert_eq!(p.crossfade_samples(), SHED_CROSSFADE_MS as usize * pm);
 
-        // A 2 ms lossless frame sheds 2 ms, and the fade is capped at half of it rather than
-        // consuming the whole dropped frame.
+        // 2 ms lossless sheds 2 ms; fade is capped at half a frame.
         let mut q = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
         q.set_frame_us(2_000);
         assert_eq!(q.frame_samples(), 2 * pm);
@@ -2562,27 +2084,23 @@ mod tests {
             "a fade as long as the frame is not a crossfade"
         );
 
-        // Sub-millisecond precision: 2 500 µs at 48 kHz stereo is 240 interleaved samples, and
-        // must not truncate to 192 by going through integer milliseconds first.
+        // 2 500 µs at 48 kHz stereo is 240 interleaved samples, and must not truncate to 192
+        // by going through integer milliseconds first.
         let mut r = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
         r.set_frame_us(2_500);
         assert_eq!(r.frame_samples(), 240);
 
-        // At 96 kHz the same 2 ms frame is twice the samples for the same duration.
         let mut h = JitterPolicy::new_at_rate(JitterTuning::PIPEWIRE, 2, 96_000);
         h.set_frame_us(2_000);
         assert_eq!(h.frame_samples(), 2 * per_ms_at(96_000, 2));
 
-        // A degenerate value must not panic or produce a zero-length frame.
         let mut z = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
         z.set_frame_us(0);
         assert!(z.frame_samples() >= 1);
     }
 
-    /// The drought budget is wall-clock, and it is spent one frame at a time — so the two have to
-    /// agree about how long a frame is. They did not: a 2 ms lossless frame was charged 5 ms, so
-    /// the fuse blew after two fifths of the time it is meant to buy and `plc_ms` over-reported by
-    /// the same factor. The frame COUNT was always right, which is why it hid.
+    /// The drought budget is wall-clock, spent one frame at a time, so the two have to agree
+    /// about how long a frame is.
     #[test]
     fn the_drought_budget_is_spent_at_the_negotiated_frame_length() {
         // Opus: 100 ms of budget is twenty 5 ms frames, and the reported total agrees.
@@ -2595,8 +2113,7 @@ mod tests {
         assert_eq!(o.total_ms(), 100);
         assert_eq!(o.packet(), 20, "the caller is owed a FRAME count");
 
-        // The same budget at a 2 ms frame must buy the same WALL CLOCK — fifty frames, not the
-        // twenty that a 5 ms charge would have allowed.
+        // Same budget at 2 ms must buy the same wall clock: fifty frames, not twenty.
         let mut p = DroughtConceal::new_at_frame_us(100, 2_000);
         let mut m = 0;
         while p.conceal(std::time::Duration::from_millis(10), 0) {
@@ -2612,15 +2129,14 @@ mod tests {
         assert_eq!(DroughtConceal::new(100).after(), drought_after());
     }
 
-    /// The near-miss margin is "less than one packet left in hand". Frozen at 5 ms it would mean
-    /// two and a half packets on a 2 ms lossless frame — growing the target on a ring that was
-    /// never close to starving, which inverts what the near-miss detects. Identical on Opus.
+    /// The near-miss margin is less than one packet left in hand. Frozen at 5 ms it would mean
+    /// two and a half packets on a 2 ms lossless frame. Identical on Opus.
     #[test]
     fn the_near_miss_margin_is_one_negotiated_frame() {
         let pm = per_ms(2);
         let want = 5 * pm;
 
-        // A depth one sample short of a full frame in hand is a near miss…
+        // A depth one sample short of a full frame in hand is a near miss.
         let mut p = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
         p.set_frame_us(2_000);
         p.step(60 * pm, want); // prime
@@ -2628,8 +2144,7 @@ mod tests {
         p.step(want + 2 * pm - 1, want);
         assert!(p.near_miss, "under one 2 ms frame in hand is a near miss");
 
-        // …and a full frame in hand is not. Under the old fixed 5 ms margin this depth would
-        // have counted, and the target would have grown for nothing.
+        // A full frame in hand is not a near miss.
         let mut q = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
         q.set_frame_us(2_000);
         q.step(60 * pm, want);
@@ -2645,14 +2160,11 @@ mod tests {
         (rate / 1000) as usize * channels as usize
     }
 
-    /// Two default frames — what `DroughtConceal::after()` returns for an Opus session.
     fn drought_after() -> std::time::Duration {
         std::time::Duration::from_millis(2 * FRAME_MS as u64)
     }
 
-    /// `new` is exactly `new_at_rate` at the protocol default — the property that let every
-    /// existing caller and all 17 policy tests keep their behaviour when the rate became a
-    /// parameter.
+    /// `new` is exactly `new_at_rate` at the protocol default.
     #[test]
     fn the_default_constructor_is_the_default_rate() {
         let a = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
@@ -2665,15 +2177,8 @@ mod tests {
         assert_eq!((x.rate_hz, x.channels), (y.rate_hz, y.channels));
     }
 
-    /// §4.1's tripwire, as an assertion rather than a comment — and now the proof that the
-    /// deferral it guarded is lifted.
-    ///
-    /// §4.1 named exactly one tell for "the rework is incomplete": `depth_ms(target)` not
-    /// round-tripping to `target_ms()`. Under the old `per_ms = rate_hz / 1000 × channels` that
-    /// held at 48 000 and 96 000 by luck of divisibility and failed at 44 100, where 44.1
-    /// samples/ms truncated to 44 and put every depth, target, shed threshold, hard cap, de-prime
-    /// fuse and reported buffer figure 2.3 % low. Multiplying before dividing makes it hold for
-    /// the whole ladder, which is the entire claim.
+    /// `depth_ms(target)` must round-trip to `target_ms()`. Multiply-before-divide holds for the
+    /// whole ladder; `per_ms = rate_hz / 1000 × channels` truncated 44 100 Hz to 44 samples/ms.
     #[test]
     fn the_shipping_rate_ladder_round_trips_ms_to_samples_exactly() {
         let presets = [
@@ -2690,7 +2195,6 @@ mod tests {
             for ch in [2u8, 6, 8] {
                 for t in presets {
                     let p = JitterPolicy::new_at_rate(t, ch, rate);
-                    // §4.1's named tell.
                     assert_eq!(
                         p.depth_ms(p.target),
                         p.target_ms(),
@@ -2701,9 +2205,8 @@ mod tests {
                         t.base_target_ms,
                         "the base target must be exactly the preset's ms at {rate} Hz / {ch}ch"
                     );
-                    // And so does every other ms the preset names — each is a threshold something
-                    // in `step`/`note_read` compares a sample count against. A rate that skewed
-                    // 2.3 % skewed all of them together, which is what kept the defect invisible.
+                    // Every other ms the preset names is a threshold `step`/`note_read` compares
+                    // a sample count against.
                     for ms in [
                         t.base_target_ms,
                         t.max_target_ms,
@@ -2723,8 +2226,8 @@ mod tests {
                             "{ms} ms does not survive ms → samples → ms at {rate} Hz / {ch}ch"
                         );
                     }
-                    // The conversion itself, against the arithmetic done the honest way rather
-                    // than against itself: `ms × rate × ch` and only THEN the divide by 1000.
+                    // Against `ms × rate × ch` and only then the divide by 1000, not against
+                    // itself.
                     for ms in [1u32, 12, 15, 47, 1000, SYNC_BACKOFF_MAX_MS] {
                         let want = ms as u64 * rate as u64 * ch as u64 / 1000;
                         assert_eq!(
@@ -2737,30 +2240,21 @@ mod tests {
             }
         }
 
-        // The worked example, spelled out, so the 2.3 % is a number rather than an adjective.
         let p = JitterPolicy::new_at_rate(JitterTuning::PIPEWIRE, 2, 44_100);
         assert_eq!(p.ms_samples(15), 1_323, "15 ms of 44.1 kHz stereo");
         assert_eq!(15 * (44_100 / 1000) * 2, 1_320, "what it used to compute");
 
-        // ⚠ Exact is not the same as lossless-in-both-directions, and the difference is worth
-        // stating rather than discovering. A millisecond is 88.2 samples at 44 100 Hz stereo, so
-        // an ms figure that is not a multiple of 5 genuinely has no whole-sample answer:
-        // `shed_excess_ms()` of 12 ms lands on 1 058 samples, which reads back as 11 ms. That is a
-        // floor of at most ONE SAMPLE on a threshold inside a 25 ms band — as opposed to the 2.3 %
-        // the old arithmetic was wrong by on EVERY figure, in the same direction, permanently.
+        // Exact is not lossless both ways: 12 ms at 44 100 Hz stereo is 1 058.4 samples, which
+        // floors to 1 058 and reads back as 11 ms — at most one sample on a threshold inside a
+        // 25 ms band, not 2.3 % on every figure.
         assert_eq!(JitterTuning::PIPEWIRE.shed_excess_ms(), 12);
-        assert_eq!(p.ms_samples(12), 1_058); // the true 1 058.4, floored
+        assert_eq!(p.ms_samples(12), 1_058); // 1 058.4, floored
         assert_eq!(p.samples_ms(1_058), 11);
     }
 
-    /// The policy's idea of a frame must be the WIRE's idea of a frame, at a rate where the two
-    /// are no longer the same arithmetic.
-    ///
-    /// A frame carries a whole number of samples per channel, so 5 ms at 44 100 Hz stereo is 440
-    /// interleaved samples — not the 441 that `frame_us × samples-per-ms` produces. Both the
-    /// near-miss margin and the shed size mean *exactly one packet*, so a policy that computed its
-    /// own answer would be describing a packet that does not exist. Delegating to
-    /// `pcm::samples_per_frame` is what makes them agree by construction.
+    /// The policy's idea of a frame must be the wire's. A frame carries a whole number of samples
+    /// per channel, so 5 ms at 44 100 Hz stereo is 440 interleaved samples, not the 441 that
+    /// `frame_us × samples-per-ms` produces. Near-miss and shed both mean exactly one packet.
     #[test]
     fn the_policys_frame_is_the_wires_frame() {
         for rate in [44_100u32, 48_000, 88_200, 96_000, 176_400] {
@@ -2776,10 +2270,8 @@ mod tests {
                 }
             }
         }
-        // The concrete disagreement this prevents: five milliseconds of 44.1 kHz stereo audio is
-        // 441 interleaved samples, and a five-millisecond FRAME of it carries 440 — because the
-        // frame has to be whole in each channel and 220.5 is not a sample count. Those are two
-        // different questions with two different answers, and only one of them is the packet.
+        // 5 ms of 44.1 kHz stereo audio is 441 interleaved samples; a 5 ms frame of it carries
+        // 440 — whole samples per channel, and 220.5 is not a sample count.
         let mut p = JitterPolicy::new_at_rate(JitterTuning::PIPEWIRE, 2, 44_100);
         p.set_frame_us(5_000);
         assert_eq!(p.frame_samples(), 440, "220 samples per channel, not 220.5");
@@ -2787,7 +2279,7 @@ mod tests {
     }
 
     /// Clustered underruns raise the floor (that device needs the slack); a long quiet spell
-    /// gives it back, so one bad minute doesn't cost latency for the whole session.
+    /// gives it back, so a short bad spell does not cost latency for the whole session.
     #[test]
     fn target_grows_on_underruns_and_relaxes_when_quiet() {
         let pm = per_ms(2);
@@ -2812,7 +2304,6 @@ mod tests {
             grown <= JitterTuning::AAUDIO.max_target_ms,
             "growth must respect max_target_ms"
         );
-        // Now a long clean run relaxes it back.
         for _ in 0..(SHRINK_QUIET_MS as usize * 3 / 5) {
             p.step(grown as usize * pm + want, want);
             p.note_read(false);
@@ -2834,7 +2325,7 @@ mod tests {
         let (drop, fade) = (240, 96);
         crossfade_drop(&mut ring, drop, fade);
         assert_eq!(ring.len(), 1000 - drop);
-        // Across the whole faded region the step between neighbours stays bounded — a hard drop
+        // Across the whole faded region the step between neighbours stays bounded. A hard drop
         // would show a `drop`-sized jump at index 0.
         for i in 0..fade {
             let step = (ring[i + 1] - ring[i]).abs();
@@ -2843,7 +2334,6 @@ mod tests {
                 "sample {i}: step {step} looks like a hard splice"
             );
         }
-        // Tail is untouched.
         assert_eq!(ring[ring.len() - 1], 999.0);
     }
 
@@ -2863,8 +2353,7 @@ mod tests {
     fn wasapi_masks_are_correct() {
         assert_eq!(wasapi_channel_mask(2), 0x3);
         assert_eq!(wasapi_channel_mask(6), 0x3F);
-        assert_eq!(wasapi_channel_mask(8), 0x63F); // NOT 0xFF
-                                                   // Bit count must equal the channel count.
+        assert_eq!(wasapi_channel_mask(8), 0x63F); // not 0xFF
         assert_eq!(wasapi_channel_mask(2).count_ones(), 2);
         assert_eq!(wasapi_channel_mask(6).count_ones(), 6);
         assert_eq!(wasapi_channel_mask(8).count_ones(), 8);
@@ -2880,16 +2369,13 @@ mod tests {
         assert_eq!(spa_positions(8).len(), 8);
     }
 
-    /// Real-libopus proof that the shared layout round-trips with channel identity: a tone fed
-    /// into wire channel N (host `opus::MSEncoder`) comes back out on channel N (client
-    /// `opus::MSDecoder`), for stereo / 5.1 / 7.1. This is the single guarantee the whole
-    /// feature rests on — encoder layout == decoder layout == identity mapping — so if a layout
-    /// constant is ever wrong, this fails. Gated on `quic` (where `opus` is a dependency).
+    /// A tone fed into wire channel N comes back out on channel N for stereo / 5.1 / 7.1.
+    /// Encoder layout == decoder layout == identity mapping. Gated on `quic`.
     #[cfg(feature = "quic")]
     #[test]
     fn multistream_layout_roundtrips_with_channel_identity() {
         const SR: u32 = 48_000;
-        const SAMPLES: usize = 240; // 5 ms @ 48 kHz
+        const SAMPLES: usize = 240; // 5 ms at 48 kHz
         for &channels in &[2u8, 6, 8] {
             let l = layout_for(channels, false);
             let ch = l.channels as usize;
@@ -2940,12 +2426,11 @@ mod tests {
         }
     }
 
-    // ---- A/V sync (audio latency overhaul) ----------------------------------------------
+    // ---- A/V sync ------------------------------------------------------------------------
 
-    /// Build an observation whose measured offset is exactly `offset_ms` (positive = audio late).
     fn obs(offset_ms: i64, depth: usize, per_ms: usize) -> AvSyncObservation {
-        // audio_e2e = buffered + (now + skew - pts); pin now/skew/pts so the only free term is the
-        // buffered depth, then choose video_e2e so the difference lands on `offset_ms`.
+        // audio_e2e = buffered + (now + skew - pts). Pin now/skew/pts so the only free term is
+        // the buffered depth, then choose video_e2e so the difference lands on `offset_ms`.
         let buffered_ms = (depth / per_ms) as i64;
         let audio_e2e_ms = buffered_ms + 40; // 40 ms of transport, arbitrary but fixed
         let video_e2e_ms = audio_e2e_ms - offset_ms;
@@ -2968,8 +2453,6 @@ mod tests {
     fn av_sync_needs_evidence_before_acting() {
         let pm = per_ms(2);
         let mut s = AvSync::new(2);
-        // One sample is never enough — the skew estimate and the video figure both settle after
-        // connect, and acting on the first would chase the handshake.
         assert!(s.observe(obs(50, 30 * pm, pm)).is_none());
         assert!(!s.settled());
         assert!(s.desired_depth(30 * pm).is_none());
@@ -2990,7 +2473,6 @@ mod tests {
             want < depth,
             "audio late must aim shallower: {want} vs {depth}"
         );
-        // The correction is the offset, not a guess at it.
         let shed_ms = (depth - want) / pm;
         assert!(
             (35..=45).contains(&shed_ms),
@@ -3038,9 +2520,9 @@ mod tests {
         let mut s = AvSync::new(2);
         settle(&mut s, 30, depth, pm, AV_MIN_OBSERVATIONS * 4);
         let before = s.offset_ms();
-        // A wall-clock step / stale video figure. Built directly rather than through `obs`: that
-        // helper floors the video figure at zero, which would cap the offset at a merely LARGE
-        // value and let this test pass without ever exercising the rejection.
+        // A wall-clock step / stale video figure. Built directly rather than through `obs`:
+        // that helper floors the video figure at zero, which would cap the offset at a merely
+        // large value and let this test pass without ever exercising the rejection.
         let wild = AvSyncObservation {
             pts_ns: 0,
             now_local_ns: 5_000_000_000,
@@ -3059,8 +2541,8 @@ mod tests {
 
     #[test]
     fn sync_can_never_starve_the_ring() {
-        // THE safety invariant: sync only ever proposes. Continuity — the underrun-driven floor —
-        // outranks it on every preset, or a lossy link would be "synced" into dropouts.
+        // Sync only ever proposes. Continuity — the underrun-driven floor — outranks it, or a
+        // lossy link would be "synced" into dropouts.
         for (name, t) in [
             ("PIPEWIRE", JitterTuning::PIPEWIRE),
             ("WASAPI", JitterTuning::WASAPI),
@@ -3071,14 +2553,12 @@ mod tests {
             let want = 5 * pm;
             let mut p = JitterPolicy::new(t, 2);
             let floor = p.effective_target(want);
-            // Ask for an absurdly shallow ring — zero.
             p.set_sync_target(Some(0));
             assert_eq!(
                 p.effective_target(want),
                 floor,
                 "{name}: sync pulled the target below the continuity floor"
             );
-            // And it may not blow past the hard cap either.
             p.set_sync_target(Some(usize::MAX / 2));
             assert!(
                 p.effective_target(want) <= t.hard_cap_ms as usize * pm,
@@ -3089,9 +2569,8 @@ mod tests {
 
     #[test]
     fn a_huge_device_quantum_does_not_panic_the_clamp() {
-        // `Ord::clamp` panics when min > max. A device whose callback quantum alone exceeds the
-        // preset's hard cap pushes the continuity floor above the ceiling, and this runs inside a
-        // realtime audio callback — so the ceiling yields to the floor instead.
+        // `Ord::clamp` panics when min > max. A quantum above the hard cap pushes the continuity
+        // floor above the ceiling, in a realtime callback — so the ceiling yields to the floor.
         let t = JitterTuning::PIPEWIRE; // hard_cap 80 ms
         let pm = per_ms(2);
         let want = 500 * pm; // a 500 ms quantum: absurd, but not a reason to abort the process
@@ -3106,8 +2585,8 @@ mod tests {
 
     #[test]
     fn no_sync_target_leaves_the_policy_exactly_as_it_was() {
-        // The four rings adopt sync one at a time; an un-wired ring must behave bit-identically to
-        // before. `None` is the default, so this also pins the constructor.
+        // An unsynchronised ring must match one that never called `set_sync_target`. `None` is
+        // the default, so this also pins the constructor.
         let t = JitterTuning::PIPEWIRE;
         let pm = per_ms(2);
         let want = 5 * pm;
@@ -3126,17 +2605,17 @@ mod tests {
 
     #[test]
     fn sync_pressure_relaxes_a_grown_target_sooner_than_time_alone() {
-        // A ring that ratcheted during a transient must not hold audio late for minutes after the
-        // cause is gone. With sync asking for less, the relax window is the short one.
+        // A ring that ratcheted during a transient must not hold audio late after the cause is
+        // gone. With sync asking for less, the relax window is the short one.
         let t = JitterTuning::PIPEWIRE;
         let pm = per_ms(2);
         let want = 5 * pm;
 
         let grow = |p: &mut JitterPolicy| {
-            // Drive underruns until the target has grown above the base. Each round hands `step` a
-            // DEEP ring first: `note_read` ignores everything while un-primed (a priming silence is
-            // not an underrun), and `deprime_after` short reads in a row un-prime the ring — so
-            // hammering a zero-depth ring would report nothing and grow nothing, forever.
+            // Drive underruns until the target has grown above the base. Each round hands `step`
+            // a deep ring first: `note_read` ignores everything while un-primed (a priming
+            // silence is not an underrun), and consecutive short reads un-prime the ring — so
+            // hammering a zero-depth ring would report nothing and grow nothing.
             for _ in 0..10_000 {
                 if p.target_ms() > t.base_target_ms {
                     return;
@@ -3146,7 +2625,6 @@ mod tests {
             }
             panic!("the adaptive floor never grew — the test cannot measure a relax");
         };
-        // Quiet reads needed to relax one step, with and without sync pressure.
         let quiet_to_relax = |p: &mut JitterPolicy| -> usize {
             let start = p.target_ms();
             let mut reads = 0usize;
@@ -3165,7 +2643,6 @@ mod tests {
 
         let mut fast = JitterPolicy::new(t, 2);
         grow(&mut fast);
-        // Ask for something strictly shallower than the grown target.
         fast.set_sync_target(Some(pm));
         let fast_reads = quiet_to_relax(&mut fast);
 
@@ -3175,12 +2652,11 @@ mod tests {
         );
     }
 
-    // ---- near-miss growth and shrink probes (the audible-limit-cycle fixes) ---------------
+    // ---- near-miss growth and shrink probes ----------------------------------------------
 
-    /// A primed read that is served but leaves less than one frame buffered is a NEAR-MISS —
-    /// the same evidence as an underrun, heard by no one — and must grow the target BEFORE the
-    /// click, not after the third one. One step per window: a bunching episode lands as a run of
-    /// consecutive near-misses while the ring refills, and must not sprint to the ceiling.
+    /// A primed read that is served but leaves less than one frame buffered is a near-miss —
+    /// the same evidence as an underrun, inaudible — and must grow the target before the
+    /// underrun. One step per window: a bunching episode is a run of near-misses.
     #[test]
     fn a_near_miss_grows_the_target_without_an_underrun() {
         let t = JitterTuning::COREAUDIO;
@@ -3192,17 +2668,15 @@ mod tests {
         let base = p.target_ms();
         // Serve the callback with less than one frame left over: depth = want + (margin − 1).
         p.step(want + FRAME_MS as usize * pm - 1, want);
-        p.note_read(false); // NOT short — the device got its samples
+        p.note_read(false); // not short — the device got its samples
         assert_eq!(
             p.target_ms(),
             base + GROW_STEP_MS,
             "a near-miss must buy one step"
         );
-        // A second near-miss in the same window is the same episode: no further growth.
         p.step(want + pm, want);
         p.note_read(false);
         assert_eq!(p.target_ms(), base + GROW_STEP_MS, "one step per window");
-        // A healthy read does not grow anything.
         let grown = p.target_ms();
         p.step(grown as usize * pm + want, want);
         p.note_read(false);
@@ -3225,16 +2699,14 @@ mod tests {
         assert_eq!(p.target_ms(), t.base_target_ms);
     }
 
-    /// A shrink answered by an underrun (or near-miss) inside its probe window is undone AT
-    /// ONCE — re-learning the depth three audible underruns at a time is what made the
-    /// sync-vs-growth tug-of-war audible in the field.
+    /// A shrink answered by an underrun or near-miss inside its probe window is undone at once.
     #[test]
     fn a_failed_shrink_probe_is_undone_at_once() {
         let t = JitterTuning::COREAUDIO;
         let pm = per_ms(2);
         let want = 5 * pm;
         let mut p = JitterPolicy::new(t, 2);
-        // Grow the floor two steps the audible way.
+        // Grow the floor two steps via underruns.
         for _ in 0..(2 * GROW_UNDERRUNS) {
             while !p.is_primed() {
                 p.step(200 * pm, want);
@@ -3252,7 +2724,6 @@ mod tests {
             p.note_read(false);
         }
         assert_eq!(p.target_ms(), grown - GROW_STEP_MS);
-        // ONE near-miss — nobody heard anything yet — and the depth is back.
         p.step(want + pm, want);
         p.note_read(false);
         assert_eq!(
@@ -3263,7 +2734,7 @@ mod tests {
     }
 
     /// After a failed probe the sync loop may not drive another shrink at the accelerated
-    /// cadence — the slow, pre-sync window still applies, the five-second one does not.
+    /// cadence. The slow window still applies; the five-second one does not.
     #[test]
     fn a_failed_probe_backs_the_sync_shrink_off() {
         let t = JitterTuning::COREAUDIO;
@@ -3288,8 +2759,7 @@ mod tests {
         p.step(want + pm, want);
         p.note_read(false);
         assert_eq!(p.target_ms(), grown, "restored");
-        // Twice the accelerated window of clean audio: the backed-off loop must NOT have
-        // shrunk again (before the fix this was exactly one audible failure per five seconds).
+        // Twice the accelerated window of clean audio: the backed-off loop must not have shrunk.
         for _ in 0..(2 * SHRINK_QUIET_SYNC_MS / 5) {
             p.step(depth, want);
             p.note_read(false);
@@ -3299,7 +2769,6 @@ mod tests {
             grown,
             "the accelerated cadence must be suspended after a failure"
         );
-        // The slow pre-sync window still relaxes it eventually — backoff is not a freeze.
         for _ in 0..(2 * SHRINK_QUIET_MS / 5) {
             p.step(depth, want);
             p.note_read(false);
@@ -3310,29 +2779,24 @@ mod tests {
         );
     }
 
-    /// One simulated bunching run's outcome.
     #[derive(Debug, Default)]
     struct BunchSim {
-        /// Reads that actually starved the device — each one is audible.
+        /// Reads that starved the device — each one is audible.
         audible: u32,
-        /// Audible reads in the second half of the run: non-zero means the policy never
-        /// converged and the user hears it forever.
+        /// Audible reads in the second half: non-zero means the policy never converged.
         audible_tail: u32,
-        /// Sync-driven inserts (one crossfaded frame each) — the gentle deepening.
         inserts: u32,
-        /// Times the ring de-primed AFTER its first prime: each is a `target` worth of silence.
+        /// Times the ring de-primed after its first prime: each is a `target` of silence.
         reprimes: u32,
-        /// Simulated ms at which the depth AVERAGE first came within `INSERT_MARGIN_MS` of the
-        /// sync target — how long the deepening took. `None` = never (or no sync target).
+        /// Simulated ms when the depth average first came within `INSERT_MARGIN_MS` of the
+        /// sync target. `None` = never (or no sync target).
         settle_ms: Option<u32>,
     }
 
-    /// Drive a policy over a link that BUNCHES: delivery pauses for `gap_ms` every `period_ms`,
-    /// then the withheld audio arrives at once — the Wi-Fi power-save pattern from the field
-    /// reports, where the total rate is fine and only the spacing is wrong. `drift_ppm` is the
-    /// host-vs-DAC clock skew; a slightly slow host (negative) erodes the depth over minutes,
-    /// which is what keeps re-testing whatever target the policy has settled on — without it a
-    /// simulated ring freezes wherever priming left it and a wrong target is never punished.
+    /// Drive a policy over a link that bunches: delivery pauses for `gap_ms` every `period_ms`,
+    /// then the withheld audio arrives at once. `drift_ppm` is host-vs-DAC skew; a slightly slow
+    /// host erodes depth so a wrong target is re-tested. Without it a simulated ring freezes
+    /// wherever priming left it.
     fn simulate_bunching(
         tuning: JitterTuning,
         sync_target: Option<usize>,
@@ -3350,10 +2814,9 @@ mod tests {
         let mut out = BunchSim::default();
         let mut was_primed = false;
         // The sync loop speaks only once it has evidence (`AV_MIN_OBSERVATIONS`), which is
-        // always after the ring has primed at its own base — so the request lands on a PRIMED
-        // ring, never on one still filling. Modelled the same way here: a request for less is
-        // clamped at the base anyway, and a request for more must be answered by the insert,
-        // not by the ring happening to prime straight to it.
+        // always after the ring has primed at its own base — so the request lands on a primed
+        // ring, never on one still filling. A request for less is clamped at the base anyway;
+        // a request for more must be answered by the insert, not by priming straight to it.
         let mut sync_pending = sync_target;
         for cb in 0..(ms / 5) {
             // The host keeps producing (want ± drift per callback); the link decides delivery.
@@ -3409,17 +2872,11 @@ mod tests {
         out
     }
 
-    /// THE field regression this whole change is for. A link that bunches needs ~30 ms of ring;
-    /// the sync loop wants less. Before this change the policy paid an audible event nearly
-    /// every bunching period, indefinitely — this exact simulation measured ~2000 over ten
-    /// minutes: the sync loop re-probed a proven depth every five quiet seconds, growth needed
-    /// three audible underruns to answer, and a grown target was never re-banked (growth raises
-    /// a threshold; only a re-prime deepens the ring), so the depth rode the knife edge. Now
-    /// near-misses grow the target before the first click, a failed shrink probe is undone at
-    /// once and backs the sync loop off, and a hollow ring cashes the whole refill on the click
-    /// it already paid. What remains is the clock-skew re-anchor — a slightly slow host
-    /// genuinely starves the ring every few minutes, and only rate adaptation (which no client
-    /// has) could remove that — so the bound is "a handful over ten minutes", not zero.
+    /// A bunching link needs ~30 ms of ring; the sync loop wants less. Near-misses grow the
+    /// target before the first underrun, a failed shrink probe is undone at once, and a hollow
+    /// ring cashes the refill on the underrun it already paid. Clock-skew re-anchor remains —
+    /// a slightly slow host starves the ring — so the bound is a handful over ten minutes, not
+    /// zero.
     #[test]
     fn sync_pressure_on_a_bunching_link_converges_instead_of_clicking_forever() {
         // 25 ms gaps every 300 ms, a slightly slow host, ten minutes, sync permanently asking
@@ -3443,7 +2900,7 @@ mod tests {
     }
 
     /// The same link without sync pressure — the plain adaptive-growth behaviour — must land in
-    /// the same place: sync steering may not add a persistent audible cost over not steering.
+    /// the same place. Sync steering may not add a persistent audible cost over not steering.
     #[test]
     fn a_bunching_link_without_sync_stays_clean_after_growing() {
         let s = simulate_bunching(JitterTuning::COREAUDIO, None, 600_000, 25, 300, -50);
@@ -3452,16 +2909,10 @@ mod tests {
         assert_eq!(s.inserts, 0, "an unsynced ring must never insert: {s:?}");
     }
 
-    // ---- sync-driven DEEPENING: the insert, the mirror of the shed -----------------------
+    // ---- sync-driven deepening: the insert, the mirror of the shed -----------------------
 
-    /// THE field shape this exists for ("started at 0.24/0.25", every client). The sync loop
-    /// asks for a DEEPER ring — audio is early against a picture whose latency wandered (a
-    /// 53–74 fps KWin source, an ABR retarget, a keyframe burst). Before the insert existed the
-    /// policy could only raise depth by de-priming: the sync-inflated target made the ring
-    /// `hollow` on the very next callback, and the next single late packet bought a full
-    /// `target − depth` of silence plus the priming wait — 15–60 ms of gap, repeated every time
-    /// the reference asked again. Now the request is answered the way a request for LESS is:
-    /// one crossfaded frame per sustain window, and no de-prime at all on a clean link.
+    /// Sync asking for a deeper ring is answered with one crossfaded frame per sustain window,
+    /// not a de-prime. A clean link must not gap.
     #[test]
     fn a_sync_request_for_more_depth_deepens_without_a_de_prime_on_a_clean_link() {
         // Ring primes at PIPEWIRE's 15 ms base; sync asks for 35 ms — 20 ms deeper. No gaps.
@@ -3479,26 +2930,21 @@ mod tests {
             s.inserts > 0,
             "the deepening has to come from somewhere: {s:?}"
         );
-        // 20 ms at one 5 ms frame per INSERT_SUSTAIN_MS, plus the EWMA's settling — well
-        // inside the bound the handoff set.
         let settle = s.settle_ms.expect("the ring never reached the sync target");
         assert!(
             settle <= 20_000,
             "deepening by 20 ms took {settle} ms — too slow to track a wandering reference: {s:?}"
         );
-        // …and, having settled, it STOPS: the insert is below-target-only and must not keep
-        // duplicating once the average sits inside the margin. Four frames cover 20 ms; allow
-        // the EWMA a couple more, not a stream of them.
+        // Having settled it stops: below-target-only. Four frames cover 20 ms; allow the EWMA
+        // a couple more, not a stream of them.
         assert!(
             s.inserts <= 8,
             "the insert kept firing after the ring was deep enough: {s:?}"
         );
     }
 
-    /// The same request on the bunching link the two convergence tests above use — sync asking
-    /// for MORE where they ask for less. The insert must not make a bunching link worse than
-    /// the unsynced case (same "handful over ten minutes" bound), and the deepening must not be
-    /// paid for in re-primes.
+    /// Same bunching link, sync asking for more. The insert must not make a bunching link worse
+    /// than the unsynced case, and the deepening must not be paid for in re-primes.
     #[test]
     fn a_sync_request_for_more_depth_stays_clean_on_a_bunching_link() {
         let s = simulate_bunching(
@@ -3517,10 +2963,9 @@ mod tests {
         );
     }
 
-    /// Unit pin of the two mechanisms in isolation: a primed ring asked for +30 ms is NOT hollow
-    /// (`hollow` is judged against the adaptive target), so one short read leaves it primed; and
-    /// once the average has sat below the request for `INSERT_SUSTAIN_MS` of consumed audio the
-    /// step carries `insert_front` of exactly one frame, faded, and the average reflects it.
+    /// A primed ring asked for +30 ms is not hollow (`hollow` is judged against the adaptive
+    /// target), so one short read leaves it primed. Once the average has sat below the request
+    /// for `INSERT_SUSTAIN_MS`, the step inserts exactly one faded frame.
     #[test]
     fn a_sync_request_for_more_depth_never_de_primes() {
         let pm = per_ms(2);
@@ -3534,9 +2979,8 @@ mod tests {
         depth -= want;
         p.note_read(false);
         p.set_sync_target(Some(45 * pm));
-        // Hold the depth flat at ~15 ms while the sync target sits 30 ms above it, and count
-        // consumed audio until the insert arms. 100 ms in, ONE late packet: the read runs short.
-        // Before the fix that de-primed at once (the sync-inflated target made the ring hollow).
+        // Hold depth at ~15 ms while the sync target sits 30 ms above it. 100 ms in, one late
+        // packet: a sync request is not growth debt, so the hysteresis must hold.
         let mut consumed = 0usize;
         let mut short_read_done = false;
         let mut first = None;
@@ -3569,8 +3013,7 @@ mod tests {
                     "the average must reflect the inserted frame at once: {before} -> {}",
                     p.depth_avg
                 );
-                // The arming step's own `want` is part of the sustain (the policy counts it
-                // when it decides, before the read).
+                // The arming step's own `want` is part of the sustain (counted before the read).
                 first = Some(consumed + want);
                 break;
             }
@@ -3580,7 +3023,6 @@ mod tests {
         }
         assert!(short_read_done, "the short read never happened");
         let first = first.expect("the insert never armed");
-        // At least the sustain window; the EWMA is already settled at 15 ms so not much more.
         assert!(
             first >= p.ms_samples(INSERT_SUSTAIN_MS),
             "armed after {} ms — before the sustain window",
@@ -3593,9 +3035,8 @@ mod tests {
         );
     }
 
-    /// The surviving `hollow` path: growth that was never banked STILL re-primes on the click it
-    /// already paid — that is what the hollow re-prime is for, and it must not be lost in
-    /// moving its yardstick from the effective target to the adaptive one. No sync target here.
+    /// Growth that was never banked still re-primes on the underrun it already paid. Judged
+    /// against the adaptive target, not the effective one. No sync target here.
     #[test]
     fn growth_not_banked_still_re_primes() {
         let pm = per_ms(2);
@@ -3612,24 +3053,21 @@ mod tests {
             depth -= s.drop_front + want;
             p.note_read(false);
         }
-        // Grow the target twice (two windows of three underruns) WITHOUT letting the depth
-        // follow: the average stays ~15 ms while the promise climbs to 35.
+        // Grow the target twice without letting the depth follow: average stays ~15 ms while
+        // the promise climbs to 35.
         for _round in 0..2 {
             for _ in 0..GROW_UNDERRUNS {
-                // A short read: the device asked for `want`, the ring had less.
                 let s = p.step(want / 2, want);
                 assert!(
                     !s.silence,
                     "the hysteresis must hold through a single short read"
                 );
                 p.note_read(true);
-                // Refill to the base depth so the average is not dragged down by the run.
                 for _ in 0..8 {
                     let s = p.step(15 * pm + want, want);
                     p.note_read(s.silence);
                 }
             }
-            // Roll the growth window over so the next three count as a fresh window.
             let mut consumed = 0;
             while consumed < p.ms_samples(GROW_WINDOW_MS) {
                 let s = p.step(15 * pm + want, want);
@@ -3637,17 +3075,15 @@ mod tests {
                 consumed += want;
             }
         }
-        // Growth may already have de-primed the ring in the loop above via exactly the path
-        // under test; either way, by now the target is grown and the ring, if primed, is
-        // hollow against it.
+        // Growth may already have de-primed via the path under test; either way the target is
+        // grown and the ring, if primed, is hollow against it.
         assert!(
             p.target_ms() >= 25,
             "the target must have grown, got {} ms",
             p.target_ms()
         );
-        // Re-prime at the grown target if the loop above already spent the click, and drain
-        // the average back down to the base without an underrun — the ring stays PRIMED (no
-        // short read) while its promise runs 20 ms above what it holds.
+        // Re-prime at the grown target if the loop already spent the underrun, then drain the
+        // average to the base without an underrun: primed, promise 20 ms above what it holds.
         let target = p.effective_target(want);
         let s = p.step(target + want, want);
         assert!(!s.silence);
@@ -3659,7 +3095,6 @@ mod tests {
         }
         assert!(p.is_primed());
         assert!(p.hollow, "a grown promise the depth never banked is hollow");
-        // ONE short read: the click has been paid; the hollow ring cashes the refill at once.
         let s = p.step(want / 2, want);
         assert!(!s.silence);
         p.note_read(true);
@@ -3669,10 +3104,8 @@ mod tests {
         );
     }
 
-    /// A ring at the hard cap being asked deeper: `effective_target` clamps the request at the
-    /// cap, the insert is below-target-only, and so it can never fight the trim. Pinned, since
-    /// the trim and the insert both move the depth and a fight between them would be a
-    /// continuous stream of faded corrections.
+    /// A ring at the hard cap being asked deeper: `effective_target` clamps at the cap, the
+    /// insert is below-target-only, so it can never fight the trim.
     #[test]
     fn the_insert_never_fights_the_trim() {
         let pm = per_ms(2);
@@ -3709,8 +3142,8 @@ mod tests {
         );
     }
 
-    /// The insert on the lossless plane: 2 ms frames at 96 kHz/24-bit. `frame_samples` follows
-    /// `set_frame_us`, and the seam fade is capped at half a frame (1 ms) — a fade as long as
+    /// The insert on the lossless plane: 2 ms frames at 96 kHz. `frame_samples` follows
+    /// `set_frame_us`, and the seam fade is capped at half a frame (1 ms). A fade as long as
     /// the material it fades is not a crossfade.
     #[test]
     fn the_insert_follows_the_negotiated_frame_length() {
@@ -3742,13 +3175,12 @@ mod tests {
         assert_eq!(s.crossfade, frame / 2, "the fade is capped at half a frame");
     }
 
-    /// Mirror of `crossfade_drop_splices_without_a_step`, and stricter: BOTH ends of the seam are
-    /// checked, including against the sample the device played just before the ring's head —
-    /// which is where the old drop stepped (see `crossfade_drop`).
+    /// Mirror of `crossfade_drop_splices_without_a_step`, and stricter: both ends of the seam,
+    /// including against the sample the device played just before the ring's head.
     #[test]
     fn crossfade_insert_adds_exactly_one_frame_and_the_seam_is_continuous() {
         use std::collections::VecDeque;
-        // A slow ramp starting at 1000 — "the device just played 999".
+        // A slow ramp starting at 1000 — the device just played 999.
         let mut ring: VecDeque<f32> = (1000..2000).map(|i| i as f32).collect();
         let (insert, fade) = (240, 96);
         crossfade_insert(&mut ring, insert, fade);
@@ -3757,15 +3189,14 @@ mod tests {
             1000 + insert,
             "net length change is exactly +insert"
         );
-        // The copy is verbatim: the device plays the head once…
+        // The copy is verbatim: the device plays the head once.
         for (i, &s) in ring.iter().take(insert).enumerate() {
             assert_eq!(s, (1000 + i) as f32, "copy sample {i}");
         }
-        // …and the whole played sequence — including the step from the previously played
-        // sample (999) into the ring — never jumps by more than the fade's slope. The seam sits
-        // at `insert`: what the copy's last sample (1239) leads into is blended from 1240… down
-        // toward the replayed 1000… over the fade, so the local slope is at most
-        // (insert / fade + 1) per sample and no sample steps by anything like `insert`.
+        // The whole played sequence — including the step from the previously played sample
+        // (999) into the ring — never jumps by more than the fade's slope. The seam sits at
+        // `insert`: the copy's last sample (1239) blends from 1240 toward the replayed 1000,
+        // so the local slope is at most (insert / fade + 1) per sample.
         let max_slope = (insert as f32 / fade as f32) + 2.0;
         let mut prev = 999.0f32;
         for (i, &s) in ring.iter().enumerate() {
@@ -3776,7 +3207,6 @@ mod tests {
             );
             prev = s;
         }
-        // Past the fade the original is untouched, and the tail is intact.
         for (i, &s) in ring.iter().enumerate().skip(insert + fade) {
             assert_eq!(s, (1000 + i - insert) as f32, "original sample {i}");
         }
@@ -3803,9 +3233,8 @@ mod tests {
         assert_eq!(ring.len(), 108);
     }
 
-    /// The RT-safety claim: with the spare capacity the client rings reserve, an insert must not
-    /// reallocate. `VecDeque::push_front` never grows inside capacity; pin that the helper does
-    /// nothing else that would.
+    /// With the spare capacity the client rings reserve, an insert must not reallocate.
+    /// `VecDeque::push_front` never grows inside capacity.
     #[test]
     fn crossfade_insert_does_not_reallocate_inside_capacity() {
         use std::collections::VecDeque;
@@ -3817,9 +3246,8 @@ mod tests {
         assert_eq!(ring.len(), 1240);
     }
 
-    /// The drop's seam, checked the way the insert's is: against the sample played just BEFORE
-    /// the ring's head. This is the check the original test lacked, and the one the old
-    /// `drop - fade + i` fade-out source failed by a step of `drop - fade` samples.
+    /// The drop's seam, checked against the sample played just before the ring's head. Fade-out
+    /// at `drop - fade + i` fails by a step of `drop - fade` samples.
     #[test]
     fn crossfade_drop_is_continuous_with_what_was_just_played() {
         use std::collections::VecDeque;
@@ -3837,15 +3265,13 @@ mod tests {
             );
             prev = s;
         }
-        // Past the fade the survivors are untouched.
         for (i, &s) in ring.iter().enumerate().skip(fade) {
             assert_eq!(s, (1000 + drop + i) as f32, "survivor {i}");
         }
     }
 
-    /// Unity must be bit-exact. The callers gate on `gain != 1.0` anyway, but if this ever stopped
-    /// holding, every default session's wire would shift and the "byte-for-byte identical" claim
-    /// the tier machinery rests on would quietly become false.
+    /// Unity must be bit-exact. Callers gate on `gain != 1.0`, but if this ever stopped holding,
+    /// every default session's wire would shift.
     #[test]
     fn unity_gain_is_bit_exact() {
         let src: Vec<f32> = (0..512).map(|i| (i as f32 / 512.0) * 2.0 - 1.0).collect();
@@ -3854,7 +3280,7 @@ mod tests {
         assert_eq!(got, src, "unity gain must not touch a single sample");
     }
 
-    /// Below the knee the limiter is not in circuit at all: a boost whose peaks stay under
+    /// Below the knee the limiter is not in circuit at all. A boost whose peaks stay under
     /// `SOFT_LIMIT_KNEE` must be plain multiplication, or quiet material pays for a limiter it
     /// never needed.
     #[test]
@@ -3866,9 +3292,8 @@ mod tests {
         }
     }
 
-    /// The property the hard `clamp` violated and this exists to restore: no input, however
-    /// absurdly gained, may leave the shaper out of range — and non-finite input must not escape
-    /// as something the encoder would choke on.
+    /// No input, however absurdly gained, may leave the shaper out of range. Non-finite input
+    /// must not escape as something the encoder would choke on.
     #[test]
     fn nothing_escapes_full_scale() {
         for gain in [1.5f32, 4.0, 8.0, 64.0, 1000.0] {
@@ -3882,8 +3307,8 @@ mod tests {
         assert_eq!(soft_limit(f32::NEG_INFINITY), -1.0);
     }
 
-    /// Monotonic and odd-symmetric. Monotonicity is what keeps the shaper a limiter rather than a
-    /// fold-back distortion; odd symmetry is what keeps its harmonics benign and its DC at zero.
+    /// Monotonicity keeps the shaper a limiter rather than a fold-back distortion. Odd
+    /// symmetry keeps its harmonics odd-only and its DC at zero.
     #[test]
     fn the_curve_is_monotonic_and_odd() {
         let mut prev = f32::NEG_INFINITY;
@@ -3899,9 +3324,9 @@ mod tests {
         }
     }
 
-    /// The knee must not itself be an audible event. Both branches meet at the same value AND the
-    /// same slope, so the transfer curve has no corner — a piecewise limiter that gets this wrong
-    /// just swaps the clip's discontinuity for a softer one.
+    /// The knee must not itself be an audible event. Both branches meet at the same value and
+    /// the same slope, so the transfer curve has no corner. A piecewise limiter that gets this
+    /// wrong just swaps the clip's discontinuity for a softer one.
     #[test]
     fn the_knee_has_no_corner() {
         let k = SOFT_LIMIT_KNEE;

@@ -1,32 +1,15 @@
-//! `punktfunk-host ctl` — the operator surface as a **subcommand**, not a second binary.
+//! `punktfunk-host ctl` — operator verbs over the local management API.
 //!
-//! Everything the web console's daily 95 % does — approve a pending device, type a Moonlight PIN,
-//! rename or unpair, change an access preset, stop a session, watch events — reachable from a
-//! terminal, a shell script, or a Quickshell `Process`. Its first consumer is the Omarchy shell
-//! plugin (design D10/D13), but nothing here is Omarchy-specific: the surface is a loopback client
-//! of the mgmt API, and `watch`'s line-JSON is as usable from a waybar module or `while read`.
+//! Approve, PIN, rename, unpair, access, stop, watch: a loopback client of mgmt, not a
+//! second binary. `main.rs` already dispatches verbs, and the client deserialises the
+//! types the server serialises. Lift `ctl/` behind a thin bin if `ctl status --json` p50
+//! exceeds ~150 ms; the module boundary makes that mechanical.
 //!
-//! **Why a subcommand.** A new binary touches every Linux artifact we ship (the Arch PKGBUILD, the
-//! deb/rpm builders, the sysext, the Nix module, signing and manifests) to buy nothing: `main.rs`
-//! already dispatches a dozen verbs, and in-crate means the client deserialises what the server
-//! serialises with no second declaration of the types to drift. The one cost is startup — the host
-//! binary links the world — and it is paid once per *action*, not per poll, because the
-//! interactive consumer holds one long-lived `watch`. Measured threshold, recorded so the decision
-//! is falsifiable: if `ctl status --json` p50 exceeds ~150 ms on the target box, lift `ctl/` behind
-//! a thin bin; the module boundary makes that mechanical.
+//! Token and pin come from the host config directory (see [`client`]). `approve`/`deny`
+//! take an id, never "the newest".
 //!
-//! **Security** is [`client`]'s module docs: pin before token (I2), no credential on argv or in
-//! the environment (I1), no server-side change at all (I4 — this crate's `mgmt/auth.rs` is
-//! untouched by the whole surface). ctl consumes the token the host persists; it never mints one.
-//!
-//! **Approval UX (I6)** is enforced here rather than left to each front-end: `approve`/`deny` take
-//! an **id**, never "the newest", and every listing prints the claimed name next to the
-//! fingerprint tail so an operator approving a device is looking at what the device claims *and*
-//! at something it cannot forge.
-//!
-//! Exit codes: 0 success, 1 the host refused, 2 usage, 3 no host reachable, 4 certificate pin
-//! mismatch. 4 is separate on purpose — it is the security signal, and a script that treats it as
-//! "host down" would retry straight into a squatter.
+//! Exit codes: 0 ok, 1 host refused, 2 usage, 3 no host, 4 pin mismatch. 4 is distinct
+//! so a "host down" retry does not walk into a squatter.
 
 pub mod client;
 mod watch;
@@ -38,7 +21,7 @@ use punktfunk_core::quic::{
 use serde_json::{json, Value};
 
 pub fn main(args: &[String]) -> anyhow::Result<()> {
-    // `--json` is positionless: it is a mode, not an argument to any one verb.
+    // `--json` is a mode, not an argument of any verb.
     let json = args.iter().any(|a| a == "--json");
     let rest: Vec<&str> = args
         .iter()
@@ -49,8 +32,7 @@ pub fn main(args: &[String]) -> anyhow::Result<()> {
         Ok(()) => Ok(()),
         Err(f) => {
             if json {
-                // Machine consumers get the failure on stdout in the same envelope as a success,
-                // so a QML `Process` parses one shape and reads `error` or `data`.
+                // JSON errors share the success envelope on stdout so a QML Process parses one shape.
                 println!(
                     "{}",
                     json!({"v": SCHEMA_VERSION, "error": {"code": f.code, "message": f.message}})
@@ -92,9 +74,7 @@ fn run(args: &[&str], json: bool) -> Result<()> {
             out(json, &slice, render_sessions);
             Ok(())
         }
-        // `/status` deliberately exposes no device names, so it cannot answer "who is streaming".
-        // `/local/summary` is the one endpoint that does — one label, the streaming client's — and
-        // it folds in the host version and the conflicting-host warning a status surface wants.
+        // `/status` has no device names. `/local/summary` is the one endpoint that names the client.
         "summary" => {
             let v = Client::connect(None)?.get("/api/v1/local/summary")?;
             out(json, &v, render_summary);
@@ -142,8 +122,7 @@ fn run(args: &[&str], json: bool) -> Result<()> {
         }
         "clients" => {
             let c = Client::connect(None)?;
-            // Both planes, labelled — a device list that silently covered only one of them is how
-            // "I unpaired it and it still connects" happens.
+            // Both planes, labelled. A one-plane list is how "I unpaired it and it still connects" happens.
             let both = json!({
                 "native": c.get("/api/v1/native/clients")?,
                 "gamestream": c.get("/api/v1/clients")?,
@@ -174,8 +153,6 @@ fn run(args: &[&str], json: bool) -> Result<()> {
     }
 }
 
-// ── verbs with enough argument shape to deserve their own function ─────────────────────────────
-
 fn pair(args: &[&str], json: bool) -> Result<()> {
     let c = Client::connect(None)?;
     match args.first().copied() {
@@ -190,9 +167,7 @@ fn pair(args: &[&str], json: bool) -> Result<()> {
             if let Some(g) = preset_flag(args)? {
                 body["grants"] = json!(g);
             }
-            // Binding the window to one fingerprint is the difference between "a device may pair"
-            // and "any LAN peer may burn my pairing window" (security review #9) — so it is a
-            // first-class flag here, not console-only.
+            // `--fingerprint` binds the window to one device; without it any LAN peer can consume it.
             if let Some(fp) = flag_value(args, "--fingerprint") {
                 body["fingerprint"] = json!(fp);
             }
@@ -207,8 +182,7 @@ fn pair(args: &[&str], json: bool) -> Result<()> {
         }
         Some("status") | None => {
             let v = c.get("/api/v1/native/pair")?;
-            // The GameStream PIN flow lives on a different route; fold it in so one command
-            // answers "is anything waiting for me?" for both planes.
+            // GameStream PIN is a different route; fold it in so one command covers both planes.
             let mut v = v;
             if let Ok(gs) = c.get("/api/v1/pair") {
                 v["pin_pending"] = gs.get("pin_pending").cloned().unwrap_or(json!(false));
@@ -246,9 +220,7 @@ fn rename(args: &[&str], json: bool) -> Result<()> {
         _ => return Err(Failure::usage("rename: <fingerprint> <name>")),
     };
     let c = Client::connect(None)?;
-    // The two planes keep separate stores and separate routes, and a fingerprint belongs to
-    // exactly one of them. Try native first (the default plane), fall back to GameStream, so the
-    // operator does not have to know which store a device they can see in `ctl clients` lives in.
+    // Native first, GameStream on API error: a fingerprint lives in exactly one store.
     let native = c.patch(
         &format!("/api/v1/native/clients/{fp}"),
         &json!({ "name": name }),
@@ -267,9 +239,7 @@ fn rename(args: &[&str], json: bool) -> Result<()> {
 fn unpair(args: &[&str], json: bool) -> Result<()> {
     let c = Client::connect(None)?;
     if args.contains(&"--all") {
-        // Unpairing everything is the one destructive verb here — every device on the box has to
-        // be re-paired by hand afterwards. Human mode asks; machine mode demands `--yes`, because
-        // a plugin cannot answer a prompt and must not be able to do this by accident.
+        // `--all` is the only mass-destructive verb. JSON cannot prompt, so it needs `--yes`.
         if !args.contains(&"--yes") {
             if json {
                 return Err(Failure::usage(
@@ -311,9 +281,7 @@ fn access(args: &[&str], json: bool) -> Result<()> {
             ))
         }
     };
-    // Presets only. The full grant matrix is the console's job (per-client-access design): a
-    // bitmask on a command line is exactly the kind of thing that gets a digit wrong and silently
-    // hands a device the keyboard.
+    // Presets only. A bitmask on argv is how a digit-wrong grant hands a device the keyboard.
     let grants = grants_for(preset)?;
     let v = Client::connect(None)?.patch(
         &format!("/api/v1/native/clients/{fp}"),
@@ -323,21 +291,14 @@ fn access(args: &[&str], json: bool) -> Result<()> {
     Ok(())
 }
 
-// ── displays ───────────────────────────────────────────────────────────────────────────────────
-
-/// The virtual-display policy and what is live right now, in one answer.
+/// Virtual-display policy and live heads, in one answer.
 ///
-/// Two GETs rather than one because the API keeps them apart on purpose — `/display/settings` is
-/// the stored policy and its preset catalogue, `/display/state` is the displays that exist this
-/// second — and a caller that had to make two calls to answer one question would show them at two
-/// different instants.
+/// Two GETs because the API keeps them apart: `/display/settings` is stored policy,
+/// `/display/state` is this second. One verb so they are not shown at two instants.
 ///
-/// ⚠ `displays` is EMPTY on wlroots, and not because nothing is streaming: a wlroots capture
-/// arrives over a sandboxed xdp portal fd the host cannot re-open per attach, so
-/// `vdisplay::registry` passes those displays through rather than owning them (its own module docs
-/// say so) and never lists them. Measured on an Omarchy box: a live 2414x1188@240 head,
-/// `displays: []`. Read an empty list as "this host does not track them", never as "there are
-/// none" — the Omarchy panel shows no live-display section for exactly this reason.
+/// `displays` is empty on wlroots: the registry passes portal-fd heads through rather
+/// than owning them, so it never lists them. Read `[]` as "this host does not track
+/// them", never as "there are none".
 fn display(args: &[&str], json: bool) -> Result<()> {
     let c = Client::connect(None)?;
     match args.first().copied() {
@@ -351,9 +312,7 @@ fn display(args: &[&str], json: bool) -> Result<()> {
             Ok(())
         }
         Some("release") => {
-            // The slot is optional and releases exactly one head; omitting it releases every KEPT
-            // display. Never an active one — that is `stop-session`, and conflating the two would
-            // make "give me my screen back" able to kill somebody's stream.
+            // Slot optional; omit it to release every KEPT head. Active heads are `stop-session`.
             let mut body = json!({});
             if let Some(slot) = args.get(1) {
                 let n: u32 = slot
@@ -372,8 +331,7 @@ fn display(args: &[&str], json: bool) -> Result<()> {
         }
         None | Some("status") => {
             let mut v = c.get("/api/v1/display/settings")?;
-            // `/display/state` is unavailable on a build with no vdisplay backend; the policy half
-            // is still worth answering, so an empty list beats failing the whole verb.
+            // No vdisplay backend: empty `displays` rather than failing the whole verb.
             let live = c
                 .get("/api/v1/display/state")
                 .map(|s| s["displays"].clone())
@@ -388,25 +346,21 @@ fn display(args: &[&str], json: bool) -> Result<()> {
     }
 }
 
-/// Switch the stored policy to `id`, preserving every axis a preset does not own.
+/// Switch stored policy to `id`, keeping every axis a preset does not own.
 ///
-/// `PUT /display/settings` replaces the whole object, so this reads the stored policy first and
-/// edits it — the console does exactly this (`web/src/sections/Displays/DisplayCard.tsx`), and for
-/// the same reason: `capture_monitor` and the experimental Windows axes are NOT preset behavior,
-/// and a PUT that dropped them would swap the streamed screen out from under the operator because
-/// they picked a different lifecycle.
+/// `PUT /display/settings` replaces the whole object, so this reads first and edits:
+/// `capture_monitor` and the Windows axes are not preset behaviour, and dropping them
+/// would swap the streamed screen.
 ///
-/// A saved custom preset has no apply route of its own: applying it means writing a `Custom` policy
-/// carrying its saved fields. That asymmetry is the API's, mirrored here so both kinds of id work.
+/// A saved custom preset has no apply route; applying it writes a `Custom` policy with
+/// its saved fields so both kinds of id work.
 fn display_apply_preset(c: &Client, id: &str) -> Result<Value> {
     let state = c.get("/api/v1/display/settings")?;
     let policy = policy_with_preset(&state, id)?;
     c.put("/api/v1/display/settings", &policy)
 }
 
-/// The edit itself, split from the two HTTP calls so it can be checked against a settings body
-/// without a running host. Everything that can go wrong here — dropping an orthogonal axis,
-/// accepting an id no preset has — is in this function, not in the transport around it.
+/// Policy edit, split from HTTP so tests can feed a settings body without a host.
 fn policy_with_preset(state: &Value, id: &str) -> Result<Value> {
     let mut policy = state["settings"].clone();
     if !policy.is_object() {
@@ -425,7 +379,7 @@ fn policy_with_preset(state: &Value, id: &str) -> Result<Value> {
         for (k, val) in p["fields"].as_object().into_iter().flatten() {
             policy[k.as_str()] = val.clone();
         }
-        // `game_session` is the one orthogonal axis a saved preset does carry.
+        // `game_session` is the one orthogonal axis a saved preset carries.
         if let Some(gs) = p.get("game_session") {
             policy["game_session"] = gs.clone();
         }
@@ -436,8 +390,7 @@ fn policy_with_preset(state: &Value, id: &str) -> Result<Value> {
             .flatten()
             .any(|p| p["id"].as_str() == Some(id));
         if !known {
-            // Listing what exists beats "invalid preset": the built-ins and the operator's saved
-            // ones share one id space, and only the host knows the saved half.
+            // Built-ins and saved presets share one id space; only the host knows the saved half.
             return Err(Failure::usage(format!(
                 "display preset: no preset '{id}' — run `ctl display` for the list"
             )));
@@ -494,19 +447,12 @@ fn render_display(v: &Value) {
     }
 }
 
-// ── stats ──────────────────────────────────────────────────────────────────────────────────────
-
-/// What the stream is doing right now.
+/// Live stream readout: mode, codec, encoder target; frame timings only while armed.
 ///
-/// Two layers, because they cost different things. The **free** layer is `/status`: the negotiated
-/// mode and codec plus `bitrate_kbps`, which is the live encoder target and moves with every
-/// adaptive-bitrate change — so it is a real read-out, not a copy of the handshake. The **detail**
-/// layer (per-frame drops and stage percentiles) only exists while a performance capture is armed,
-/// because that is when the streaming loops emit samples at all.
-///
-/// This verb never arms a capture as a side effect of being read. Arming has a consequence a reader
-/// did not ask for — `stats record stop` writes a recording to disk, and the capture is a single
-/// host-wide slot the web console also drives — so it stays an explicit verb.
+/// `/status` is free. Per-frame drops and stage percentiles exist only while a
+/// performance capture is armed — that is when the loops emit samples. This verb never
+/// arms as a side effect of being read: arming writes a recording on `stop`, and the
+/// capture is one host-wide slot the console also drives.
 fn stats(args: &[&str], json: bool) -> Result<()> {
     let c = Client::connect(None)?;
     match args.first().copied() {
@@ -519,7 +465,7 @@ fn stats(args: &[&str], json: bool) -> Result<()> {
             Some("stop") => {
                 let v = c.post("/api/v1/stats/capture/stop", &json!({}))?;
                 out(json, &v, |v| {
-                    // 204 when nothing was recording — `finish` gives that back as a null body.
+                    // 204 / null body: nothing was recording.
                     match v["id"].as_str() {
                         Some(id) => println!("capture saved as {id}"),
                         None => println!("nothing was recording"),
@@ -534,9 +480,7 @@ fn stats(args: &[&str], json: bool) -> Result<()> {
             let capture = c
                 .get("/api/v1/stats/capture/status")
                 .unwrap_or_else(|_| json!({ "armed": false }));
-            // The live capture holds its WHOLE time-series (up to 5400 samples). A read-out wants
-            // the newest one, so the tail is taken here rather than shipping the series to every
-            // caller that only ever renders one row of numbers.
+            // Live capture holds the whole series (up to 5400 samples). Take the tail; callers render one row.
             let mut sample = Value::Null;
             let mut meta = Value::Null;
             if capture["armed"].as_bool().unwrap_or(false) {
@@ -568,9 +512,8 @@ fn stats(args: &[&str], json: bool) -> Result<()> {
     }
 }
 
-/// A stage duration in the unit that shows it. Encode lands around 2 300 µs and `send` around
-/// 15 µs, so one fixed unit loses an end: printing everything in ms flattens `send` to `0.0`, and
-/// printing everything in µs makes encode a five-digit number to squint at.
+/// Stage duration in a unit that keeps both ends visible.
+/// Encode is ~2300 µs and `send` ~15 µs: ms flattens send to `0.0`, µs makes encode five digits.
 fn dur_us(us: f64) -> String {
     if us >= 1000.0 {
         format!("{:.1} ms", us / 1000.0)
@@ -591,10 +534,7 @@ fn render_stats(v: &Value) {
             s["fps"].as_i64().unwrap_or(0),
             s["codec"].as_str().unwrap_or("—")
         );
-        // The ENCODER TARGET, which is where adaptive bitrate has settled — not the throughput.
-        // Labelled as a target because the two differ by an order of magnitude on a still screen,
-        // and a single "300 Mbps" next to 11 Mbps of actual traffic is the kind of number that
-        // sends someone hunting a bandwidth problem that does not exist.
+        // Encoder target (ABR), not throughput. On a still screen they differ by an order of magnitude.
         println!(
             "target    {:.1} Mbps",
             s["bitrate_kbps"].as_f64().unwrap_or(0.0) / 1000.0
@@ -625,9 +565,7 @@ fn render_stats(v: &Value) {
         return;
     }
     println!("sent      {:.1} Mbps", p["mbps"].as_f64().unwrap_or(0.0));
-    // `fps` counts NEW frames and `repeat_fps` the re-sent last one. Capture is damage-driven, so a
-    // still desktop legitimately reads 0 new fps while the stream is perfectly healthy — printing
-    // only `fps` there says "the stream is dead" about a stream that is not.
+    // `fps` is new frames; `repeat_fps` is the last one re-sent. A still desktop reads 0 new fps while healthy.
     let new_fps = p["fps"].as_f64().unwrap_or(0.0);
     let repeat_fps = p["repeat_fps"].as_f64().unwrap_or(0.0);
     println!("frames    {new_fps:.1} fps new · {repeat_fps:.1} fps repeated");
@@ -661,8 +599,6 @@ fn grants_for(preset: &str) -> Result<u32> {
     }
 }
 
-// ── argument helpers ───────────────────────────────────────────────────────────────────────────
-
 fn flag_value(args: &[&str], flag: &str) -> Option<String> {
     let i = args.iter().position(|a| *a == flag)?;
     args.get(i + 1).map(|s| (*s).to_string())
@@ -684,9 +620,8 @@ fn preset_flag(args: &[&str]) -> Result<Option<u32>> {
         .transpose()
 }
 
-/// The pending-device id, which is always the **first** argument. Deliberately not "the first
-/// thing that parses as a number anywhere in the line": that would let `--expires-in 3600` be read
-/// as the device to approve, which is the one mistake I6 exists to make impossible.
+/// Pending-device id: always the first argument, never the first number on the line.
+/// `--expires-in 3600` must not become "approve device 3600".
 fn one_id(args: &[&str], verb: &str) -> Result<u32> {
     let raw = args
         .first()
@@ -704,10 +639,7 @@ fn confirm(prompt: &str) -> bool {
     std::io::stdin().read_line(&mut line).is_ok() && matches!(line.trim(), "y" | "Y" | "yes")
 }
 
-// ── output ─────────────────────────────────────────────────────────────────────────────────────
-
-/// One shape for every verb: the versioned envelope in `--json` mode, the terse table otherwise.
-/// Nothing we ship parses the human half (I8), which is what lets it stay readable.
+/// Versioned envelope in `--json`; terse table otherwise. Nothing we ship parses the human half.
 fn out(json: bool, v: &Value, human: impl FnOnce(&Value)) {
     if json {
         println!("{}", json!({ "v": SCHEMA_VERSION, "data": v }));
@@ -777,8 +709,7 @@ fn render_summary(v: &Value) {
     if waiting > 0 {
         println!("pending   {waiting} awaiting approval");
     }
-    // Another Moonlight-compatible host on this box binds the same ports, and the symptom is a
-    // client that pairs with the wrong one. Worth a line whenever it is true.
+    // Another Moonlight-compatible host on this box binds the same ports.
     for c in v["conflicts"].as_array().into_iter().flatten() {
         println!("conflict  {}", c.as_str().unwrap_or(""));
     }
@@ -805,8 +736,7 @@ fn render_pending(v: &Value) {
         println!("no devices waiting for approval");
         return;
     };
-    // I6: the claimed name AND the fingerprint tail, always — the name is what the device says it
-    // is, the tail is what it can't lie about.
+    // Claimed name next to the fingerprint tail: the name is asserted, the tail is not.
     println!("ID    NAME                      FINGERPRINT  AGE      ACCESS");
     for r in rows {
         println!(
@@ -837,8 +767,7 @@ fn render_clients(v: &Value) {
         );
     }
     for r in v["gamestream"].as_array().into_iter().flatten() {
-        // The GameStream store has no grants and no expiry — its devices are pinned certificates,
-        // full stop. Two dashes rather than borrowed native semantics.
+        // GameStream devices are pinned certificates: no grants, no expiry.
         println!(
             "{:<11} {:<25} {:<12} {:<11} —",
             "gamestream",
@@ -881,7 +810,7 @@ fn render_pair(v: &Value) {
     println!("paired    {}", v["paired_clients"].as_i64().unwrap_or(0));
 }
 
-/// Last 10 hex characters for compact device-list display.
+/// Last 10 hex characters: enough to tell devices apart in a compact list.
 fn tail(fp: &str) -> String {
     match fp.len() {
         0 => "—".to_string(),
@@ -898,8 +827,7 @@ fn trunc(s: &str, max: usize) -> String {
 }
 
 fn print_usage() {
-    // A plain `&str`, printed through `{USAGE}` rather than as a format string: the `watch`
-    // example below contains JSON braces, which a literal format string would try to interpolate.
+    // `{USAGE}` not a format string: the `watch` example contains JSON braces.
     const USAGE: &str = r#"punktfunk-host ctl — operator control over the local management API
 
 USAGE:
@@ -974,7 +902,6 @@ mod tests {
             GRANT_PRESET_CONTROLLER_ONLY
         );
         assert_eq!(grants_for("view").unwrap(), GRANT_PRESET_VIEW_ONLY);
-        // A typo must be usage (2), never a silently-wrong mask.
         assert_eq!(grants_for("fulll").unwrap_err().code, client::EXIT_USAGE);
     }
 
@@ -992,7 +919,6 @@ mod tests {
         assert_eq!(num_flag(&args, "--ttl").unwrap(), Some(120));
         assert_eq!(preset_flag(&args).unwrap(), Some(GRANT_PRESET_VIEW_ONLY));
         assert_eq!(num_flag(&args, "--expires-in").unwrap(), None);
-        // A non-numeric TTL is usage, not a silently-dropped flag.
         assert_eq!(
             num_flag(&["--ttl", "soon"], "--ttl").unwrap_err().code,
             client::EXIT_USAGE
@@ -1002,15 +928,13 @@ mod tests {
     #[test]
     fn approve_takes_an_id_and_never_guesses() {
         assert_eq!(one_id(&["7", "--name", "tv"], "approve").unwrap(), 7);
-        // A flag's VALUE must never be read as the id — `approve --expires-in 3600` naming
-        // device 3600 is precisely the accident I6 forbids.
+        // A flag value must never be the id.
         assert!(one_id(&["--expires-in", "3600"], "approve").is_err());
         assert!(one_id(&["newest"], "approve").is_err());
         assert!(one_id(&[], "approve").is_err());
     }
 
-    /// A settings body shaped like `GET /display/settings`: a stored policy carrying axes no preset
-    /// owns, one built-in preset and one saved one.
+    /// Fixture: stored policy with axes no preset owns, one built-in, one saved.
     fn display_state() -> Value {
         json!({
             "settings": {
@@ -1036,17 +960,14 @@ mod tests {
     fn a_preset_switch_keeps_the_axes_no_preset_owns() {
         let p = policy_with_preset(&display_state(), "gaming-rig").unwrap();
         assert_eq!(p["preset"], "gaming-rig");
-        // The streamed screen is not display BEHAVIOR. A whole-object PUT that rebuilt the policy
-        // from the verb's arguments would drop this and silently move the stream to a virtual
-        // display — the on-glass regression the console carries the same guard against.
+        // `capture_monitor` is not preset behaviour. A whole-object PUT from the verb args would drop it.
         assert_eq!(p["capture_monitor"], "DP-2");
         assert_eq!(p["ddc_power_off"], true);
     }
 
     #[test]
     fn a_saved_preset_is_applied_as_a_custom_policy_carrying_its_fields() {
-        // Saved presets have no apply route of their own — the API expects `custom` plus the
-        // fields. Getting this wrong stores the id in a field that only accepts the built-in names.
+        // Saved presets have no apply route: the API expects `custom` plus the fields.
         let p = policy_with_preset(&display_state(), "p-couch").unwrap();
         assert_eq!(p["preset"], "custom");
         assert_eq!(p["topology"], "exclusive");
@@ -1057,8 +978,6 @@ mod tests {
 
     #[test]
     fn stage_durations_keep_the_small_stages_visible() {
-        // Real numbers off an Omarchy box: `send` p50 15 µs against `encode` p50 2321 µs. One
-        // fixed unit loses an end of that range — ms prints send as "0.0 ms".
         assert_eq!(dur_us(15.0), "15 µs");
         assert_eq!(dur_us(0.0), "0 µs");
         assert_eq!(dur_us(999.0), "999 µs");
@@ -1068,7 +987,7 @@ mod tests {
     #[test]
     fn an_unknown_preset_is_refused_rather_than_stored() {
         assert!(policy_with_preset(&display_state(), "hologram").is_err());
-        // No stored policy at all is the host's answer, not a preset the caller can fix.
+        // Empty settings is the host's answer, not a preset the caller can fix.
         assert!(policy_with_preset(&json!({}), "gaming-rig").is_err());
     }
 }

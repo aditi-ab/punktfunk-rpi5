@@ -1,41 +1,36 @@
-//! Display-tagged management endpoints: virtual-display policy, state, layout, and custom
-//! presets. Split out of the `mgmt` facade (plan §W5).
+//! Display-tagged management endpoints: policy, live state, physical monitors, layout, and
+//! custom presets.
+//!
+//! A PUT stores the next-session policy; a running session keeps the display it opened on.
+//! `keep_alive: forever` pins until `POST /display/release`. Off Linux, `capture_monitor` is
+//! dropped on write — there is no mirror backend.
+//!
+//! See `design/display-management.md` and `design/per-monitor-portal-capture.md`.
 
 use super::shared::*;
 
-/// One preset's human-facing description + the fields it expands to, so the console can render a
-/// preset picker with an accurate "what this does" preview without hardcoding the expansion.
+/// Picker row. `fields` is the expansion so the console does not hardcode it.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct PresetInfo {
-    /// The preset id (`default` | `gaming-rig` | `shared-desktop` | `hotdesk` | `workstation`).
+    /// `default` | `gaming-rig` | `shared-desktop` | `hotdesk` | `workstation`.
     id: String,
-    /// One-line story shown next to the option.
     summary: String,
-    /// The effective policy this preset expands to (the same fields a `custom` policy carries).
+    /// Same fields a `Custom` policy carries.
     fields: crate::vdisplay::policy::EffectivePolicy,
 }
 
-/// Full display-management state for the console: the stored policy, every preset's expansion, the
-/// resolved effective policy, and which options this build actually enforces yet (Stage 0 wires
-/// keep-alive linger + topology; the rest are stored but not yet acted on).
+/// Stored policy, preset expansions, effective policy, and which options this build enforces.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct DisplaySettingsState {
-    /// The stored policy (preset + custom fields), or the built-in default when unconfigured.
+    /// Stored policy, or the built-in default when unconfigured.
     settings: crate::vdisplay::policy::DisplayPolicy,
-    /// True once a `display-settings.json` exists (the console has configured this host).
+    /// True once `display-settings.json` exists.
     configured: bool,
-    /// The effective (preset-expanded) policy currently in force.
     effective: crate::vdisplay::policy::EffectivePolicy,
-    /// Every named preset and what it expands to (for the picker's preview).
     presets: Vec<PresetInfo>,
-    /// The operator's saved custom presets (`display-presets.json`) — named field-bundles rendered
-    /// alongside the built-ins. Managed via `POST/PUT/DELETE /display/presets`; applied by writing a
-    /// `Custom` policy carrying the preset's fields.
+    /// Saved custom presets (`display-presets.json`). Apply via a `Custom` policy of their fields.
     custom_presets: Vec<crate::vdisplay::policy::CustomPreset>,
-    /// Option names this build enforces right now. All five axes are now acted on (keep_alive +
-    /// topology since Stage 0-2, identity Stage 3, mode_conflict Stage 4, layout Stage 5) — the console
-    /// reads this to know which controls are live vs. "coming soon" (per-backend nuance, e.g. layout
-    /// position apply being KWin-only, is reported per display in `/display/state`).
+    /// Names this build acts on (live vs coming-soon). Per-backend nuance is on `/display/state`.
     enforced: Vec<String>,
 }
 
@@ -78,21 +73,14 @@ pub(crate) fn display_settings_state() -> DisplaySettingsState {
         "identity".into(),
         "layout".into(),
         "game_session".into(),
-        // EXPERIMENTAL, Windows-only in effect: acted on at the `exclusive` isolate
-        // (`vdisplay/windows/manager.rs`); stored-but-inert elsewhere.
+        // Windows-only at the exclusive isolate (`vdisplay/windows/manager.rs`); inert elsewhere.
         "ddc_power_off".into(),
         "pnp_disable_monitors".into(),
-        // EXPERIMENTAL, Windows + AMD-driver-only in effect (the ADL connector-emulation lever;
-        // inert wherever `atiadlxx.dll` is absent). The console additionally gates the toggle's
-        // VISIBILITY on an AMD GPU being present, so only the hosts it can act on ever see it.
+        // Windows + ADL only; inert without `atiadlxx.dll`. Console hides the toggle unless an AMD GPU is present.
         "edid_lock".into(),
     ];
-    // `capture_monitor` routes every session to the MIRROR backend, and that backend exists only on
-    // Linux — `vdisplay::open`'s mirror arm is `#[cfg(target_os = "linux")]`, because `pf-capture`
-    // has no Windows entry point that can capture an arbitrary head. This list is precisely the
-    // "which controls are live vs. coming soon" contract, so claiming it unconditionally is what let
-    // the Windows console offer a picker that saved and then did nothing
-    // (`design/per-monitor-portal-capture.md` §5.3).
+    // Linux-only: `capture_monitor` needs the MIRROR backend (`vdisplay::open`). Do not
+    // advertise it off Linux — a stored pin would never take effect.
     if cfg!(target_os = "linux") {
         enforced.push("capture_monitor".into());
     }
@@ -108,9 +96,8 @@ pub(crate) fn display_settings_state() -> DisplaySettingsState {
 
 /// Display-management policy
 ///
-/// The stored virtual-display policy (lifecycle, topology, conflict handling, identity, layout),
-/// every preset's expansion, and which options this build enforces yet. See
-/// `design/display-management.md`.
+/// Stored policy, preset expansions, and which options this build enforces.
+/// See `design/display-management.md`.
 #[utoipa::path(
     get,
     path = "/display/settings",
@@ -127,9 +114,8 @@ pub(crate) async fn get_display_settings() -> Json<DisplaySettingsState> {
 
 /// Set the display-management policy
 ///
-/// Persists a new policy (validated + clamped) and applies it from the next connect/teardown — a
-/// running session keeps the display it opened on. `keep_alive: forever` (the gaming-rig preset) is
-/// honored (the display is Pinned; free it via `POST /display/release`).
+/// Persists (validated + clamped). Applies on the next connect/teardown; a running session keeps
+/// the display it opened on. `keep_alive: forever` pins until `POST /display/release`.
 #[utoipa::path(
     put,
     path = "/display/settings",
@@ -148,15 +134,9 @@ pub(crate) async fn set_display_settings(
 ) -> Response {
     #[cfg_attr(target_os = "linux", allow(unused_mut))]
     let mut policy = policy;
-    // A pin nothing can honor must not be STORED as though it were. Off Linux there is no mirror
-    // backend (`MonitorsResponse::pin_supported`), so drop the field rather than persisting a
-    // setting whose only effect would be to mislead: the console re-reads this state after the PUT
-    // and would otherwise render a screen as "streamed" while every session kept creating a virtual
-    // display. Coerced rather than rejected with a 400 on purpose — this PUT is WHOLE-OBJECT, so a
-    // host that already stored a pin (before this build) would have every later settings save
-    // rejected over a field the operator cannot even see, taking the other axes down with it. This
-    // way such a policy self-heals on the next write, and the response body shows the truth
-    // immediately.
+    // Off Linux there is no mirror backend. Drop `capture_monitor` rather than 400: this PUT is
+    // whole-object, so a stored pin would reject every later save over a field the operator cannot
+    // see. Self-heals on write; the response shows what was stored.
     #[cfg(not(target_os = "linux"))]
     if let Some(dropped) = policy.capture_monitor.take() {
         tracing::warn!(
@@ -164,8 +144,6 @@ pub(crate) async fn set_display_settings(
              monitor is Linux-only (no Windows mirror backend); the pin was NOT stored"
         );
     }
-    // `keep_alive: forever` (the gaming-rig preset) is now honored: the display is Pinned (Linux
-    // registry + Windows `MgrState::Pinned`) and freed via `POST /display/release` (the escape hatch).
     if let Err(e) = crate::vdisplay::policy::prefs().set(policy) {
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -173,8 +151,7 @@ pub(crate) async fn set_display_settings(
         );
     }
     tracing::info!("management API: display policy updated");
-    // The policy carries the capture-monitor pin, so a picker change must re-aim absolute input now
-    // rather than at the next host restart — and must clear the anchor when the pin is cleared.
+    // Re-aim absolute input now (and clear it when the pin is cleared); do not wait for a restart.
     #[cfg(target_os = "linux")]
     crate::refresh_capture_monitor_anchor("display policy updated");
     Json(display_settings_state()).into_response()
@@ -185,7 +162,7 @@ pub(crate) async fn set_display_settings(
 pub(crate) struct ApiDisplayInfo {
     /// Stable-enough id for the `/display/release` `slot` argument.
     slot: u64,
-    /// Backend name (`pf-vdisplay`, `kwin`, …).
+    /// `pf-vdisplay`, `kwin`, …
     backend: String,
     /// `WIDTHxHEIGHT@HZ`.
     mode: String,
@@ -193,88 +170,70 @@ pub(crate) struct ApiDisplayInfo {
     state: String,
     /// Milliseconds until a lingering display is torn down (absent when active/pinned).
     expires_in_ms: Option<u64>,
-    /// Live sessions holding the display.
     sessions: u32,
-    /// Short client label, when the owner tracks it.
     client: Option<String>,
-    /// Display group (shared desktop) id — several displays with the same group form one desktop (§6A).
+    /// Shared-desktop group id; same group = one desktop.
     group: u32,
-    /// This display's ordinal within its group, in acquire order (0-based).
+    /// Ordinal within the group, acquire order, 0-based.
     display_index: u32,
-    /// Desktop-space top-left `x` (auto-row or the console's manual arrangement, §6.2).
+    /// Desktop-space top-left (auto-row or manual layout).
     x: i32,
-    /// Desktop-space top-left `y`.
     y: i32,
-    /// Stable per-client identity slot keying persistent config + manual layout (absent = shared/anonymous).
+    /// Per-client identity slot (absent = shared/anonymous). Keys persistent config and manual layout.
     identity_slot: Option<u32>,
-    /// Effective topology for this display's group (`extend` | `primary` | `exclusive`).
+    /// Group topology: `extend` | `primary` | `exclusive`.
     topology: String,
 }
 
-/// The host's managed virtual displays right now.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct DisplayStateResponse {
     displays: Vec<ApiDisplayInfo>,
 }
 
-/// One physical monitor this host has, as the compositor reports it.
+/// Physical monitor as the compositor reports it.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ApiMonitorInfo {
-    /// Connector name (`DP-1`, `HDMI-A-2`) — the value `PUNKTFUNK_CAPTURE_MONITOR` takes.
+    /// Connector (`DP-1`, `HDMI-A-2`) — the value `PUNKTFUNK_CAPTURE_MONITOR` takes.
     connector: String,
-    /// Human label for a picker (`make model`, else the connector).
+    /// Picker label (`make model`, else the connector).
     description: String,
     /// `WIDTHxHEIGHT@HZ` of the current mode (size only when the refresh is unknown).
     mode: String,
-    /// Desktop-space top-left — what makes a head identifiable when two share a size.
+    /// Desktop-space top-left. Distinguishes two heads of the same size.
     x: i32,
     y: i32,
-    /// Logical scale factor.
     scale: f64,
-    /// The compositor's primary/focused head.
     primary: bool,
-    /// Driven right now. A disabled head is still listed, so it can be explained rather than missing.
+    /// Driven right now. Disabled heads stay listed so they are not missing from the picker.
     enabled: bool,
-    /// Best-effort: this is one of OUR virtual displays, not a real head (reliable on KWin only).
+    /// Best-effort: one of our virtual displays, not a real head. Reliable on KWin only.
     managed: bool,
     /// True when `PUNKTFUNK_CAPTURE_MONITOR` currently names this monitor.
     selected: bool,
 }
 
-/// The host's physical monitors + which one capture is pinned to.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct MonitorsResponse {
-    /// Compositor backend the enumeration came from (`kwin`, `mutter`, …), when one was resolved.
+    /// Enumeration source (`kwin`, `mutter`, `windows`), when resolved.
     compositor: Option<String>,
-    /// The heads, ordered left-to-right by desktop position.
+    /// Heads, ordered left-to-right by desktop position.
     monitors: Vec<ApiMonitorInfo>,
-    /// The configured `PUNKTFUNK_CAPTURE_MONITOR`, if any — reported even when it matches nothing,
-    /// so the console can show "pinned to DP-2, which this host doesn't have".
+    /// Configured pin, even when it matches no head (console can show a dangling pin).
     pinned: Option<String>,
-    /// Whether this build can actually STREAM one of these monitors.
+    /// True when this build can stream a chosen physical head.
     ///
-    /// Enumeration and capture are separate capabilities, and on Windows only the first exists: the
-    /// heads below are real and worth showing (they explain the topology, and `/display/state`
-    /// cross-references them), but `pf-capture`'s sole Windows entry point is `open_idd_push` — a
-    /// frame channel pushed by our OWN IddCx virtual display. There is no desktop-duplication
-    /// capturer to point at a chosen head (DXGI Desktop Duplication was deliberately removed), so
-    /// `vdisplay::open` has no mirror arm outside Linux and a pin could not be honored.
-    ///
-    /// The console renders the picker read-only on `false`. Reported as a capability rather than
-    /// sniffed client-side from the OS so the answer comes from the build that would have to honor
-    /// it — when a Windows mirror backend lands, this flips and the UI needs no change.
+    /// Enumeration and capture are separate. Off Linux, heads are listed but there is no
+    /// mirror backend (`vdisplay::open` has no Windows arm; `pf-capture` only has
+    /// `open_idd_push`). The console treats `false` as a read-only picker.
     pin_supported: bool,
-    /// Why the list is empty, when enumeration failed (compositor unreachable, unsupported
-    /// platform). `None` with an empty list means "asked, and there are none".
+    /// Enumeration failure. `None` with an empty list means the host has no heads.
     error: Option<String>,
 }
 
 /// Physical monitors
 ///
-/// The heads this host actually has — for pinning capture at one (`PUNKTFUNK_CAPTURE_MONITOR`) and
-/// for rendering a picker. Read-only: this never creates, moves or disables anything. Note these
-/// are *not* the managed virtual displays — those are `/display/state`. See
-/// `design/per-monitor-portal-capture.md` §5.1.
+/// Heads this host has, for a capture-pin picker. Read-only; does not create, move, or disable.
+/// Managed virtual displays are `/display/state`. See `design/per-monitor-portal-capture.md`.
 #[utoipa::path(
     get,
     path = "/display/monitors",
@@ -286,25 +245,18 @@ pub(crate) struct MonitorsResponse {
     )
 )]
 pub(crate) async fn get_display_monitors() -> Json<MonitorsResponse> {
-    // The EFFECTIVE pin (env override, else the stored policy) — so the picker highlights what
-    // sessions will actually mirror, not just what the console last wrote.
+    // Effective pin (env override, else stored policy): highlight what sessions will mirror.
     #[cfg(target_os = "linux")]
     let pinned = crate::vdisplay::capture_monitor();
-    // Off Linux there is no mirror backend, so there is nothing a pin could aim (see
-    // `MonitorsResponse::pin_supported`). Kept `None` DELIBERATELY rather than reporting the stored
-    // value: `pinned` is what the console highlights as "this is the screen sessions stream", and a
-    // highlight on a head nothing will ever capture is precisely the lie this endpoint is here to
-    // stop telling. `pin_supported: false` is how the unsupportedness is reported instead.
+    // No mirror backend. Report `None` even if a pin is stored — highlighting a head nothing will
+    // capture is the false signal this field exists to avoid. `pin_supported: false` is the flag.
     #[cfg(not(target_os = "linux"))]
     let pinned: Option<String> = None;
-    // Enumeration works on Windows; capture of an enumerated head does not.
     let pin_supported = cfg!(target_os = "linux");
-    // Enumeration shells out / round-trips D-Bus + Wayland (and on Windows walks the CCD
-    // database, which can serialize on the display-config lock), so keep it off the async worker.
+    // Shells out / D-Bus / Wayland, and on Windows walks CCD (can serialize on the display-config
+    // lock). Off the async worker.
     let (compositor, listed) = tokio::task::spawn_blocking(|| {
-        // Windows has no compositor to detect — asking used to fail with Linux advice about
-        // XDG_CURRENT_DESKTOP, which landed verbatim in `error` below and was the console's only
-        // explanation for an empty picker. Report the display API we actually used instead.
+        // No compositor to detect. Label the CCD walk as `windows` instead of Linux XDG advice.
         #[cfg(windows)]
         {
             (
@@ -359,18 +311,15 @@ pub(crate) struct ReleaseDisplayRequest {
     slot: Option<u64>,
 }
 
-/// Result of a `/display/release`.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ReleaseDisplayResult {
-    /// Number of kept displays torn down.
     released: usize,
 }
 
 /// Live virtual displays
 ///
-/// The host's managed virtual displays right now — active (streaming), lingering (kept after
-/// disconnect, counting down to teardown), or pinned (kept indefinitely). See
-/// `design/display-management.md`.
+/// Active (streaming), lingering (countdown to teardown), or pinned.
+/// See `design/display-management.md`.
 #[utoipa::path(
     get,
     path = "/display/state",
@@ -408,9 +357,8 @@ pub(crate) async fn get_display_state() -> Json<DisplayStateResponse> {
 
 /// Release kept virtual displays
 ///
-/// Tear down lingering/pinned displays now — so a physical-screen user gets their screen back
-/// without waiting out the linger. `slot` releases one; omit it to release all kept displays.
-/// Active (streaming) displays are never torn down here (that is session control).
+/// Tear down lingering/pinned displays now. `slot` releases one; omit to release all.
+/// Active (streaming) displays are never torn down here — that is session control.
 #[utoipa::path(
     post,
     path = "/display/release",
@@ -430,22 +378,20 @@ pub(crate) async fn release_display(
     Json(ReleaseDisplayResult { released })
 }
 
-/// Request body for `setDisplayLayout`: per-identity-slot desktop offsets, keyed by the identity-slot
-/// id as a string (the same id `/display/state` reports as `identity_slot`).
+/// Manual layout: identity-slot id as string (same id `/display/state` reports) → desktop offset.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct DisplayLayoutRequest {
-    /// `{"<identity_slot>": {"x": …, "y": …}}` — where each arranged display's top-left sits.
+    /// `{"<identity_slot>": {"x": …, "y": …}}` desktop top-left per slot.
     #[serde(default)]
     positions: std::collections::BTreeMap<String, crate::vdisplay::policy::Position>,
 }
 
 /// Arrange virtual displays
 ///
-/// Set the **manual** desktop arrangement — per-identity-slot `(x, y)` offsets so a multi-monitor
-/// group (§6A/§6B) comes back where the operator placed it. Persisted into the policy's layout block
-/// and switched to manual mode; applied from the next connect (a live group re-applies on its next
-/// acquire). Locks in the current effective behavior as explicit fields, so arranging displays never
-/// silently changes keep-alive/topology/conflict/identity. See `design/display-management.md` §6.2.
+/// Persist per-identity-slot `(x, y)` offsets and switch the layout to manual. Applies on the next
+/// connect (a live group re-applies on its next acquire). Locks current effective behavior into
+/// explicit fields so arranging never silently changes keep-alive/topology/conflict/identity.
+/// See `design/display-management.md`.
 #[utoipa::path(
     put,
     path = "/display/layout",
@@ -460,9 +406,6 @@ pub(crate) struct DisplayLayoutRequest {
 )]
 pub(crate) async fn set_display_layout(ApiJson(req): ApiJson<DisplayLayoutRequest>) -> Response {
     let store = crate::vdisplay::policy::prefs();
-    // Lock the current effective behavior into explicit fields + set the manual arrangement (pure
-    // transform, unit-tested in `policy.rs`) — so arranging displays is orthogonal to the other policy
-    // axes. (`effective` keep_alive is never `Forever` via the API — the settings PUT rejects it.)
     let policy = store.get().effective().with_manual_layout(
         req.positions,
         store.game_session(),
@@ -486,8 +429,7 @@ pub(crate) async fn set_display_layout(ApiJson(req): ApiJson<DisplayLayoutReques
 
 /// List the saved custom presets
 ///
-/// The operator's named field-bundles (`display-presets.json`). These also ride the
-/// `GET /display/settings` response (`custom_presets`), so the console rarely needs this directly.
+/// Named field-bundles in `display-presets.json`. Also on `GET /display/settings` as `custom_presets`.
 #[utoipa::path(
     get,
     path = "/display/presets",
@@ -504,9 +446,8 @@ pub(crate) async fn list_custom_presets() -> Json<Vec<crate::vdisplay::policy::C
 
 /// Save a custom preset
 ///
-/// Stores a named bundle of the display-behavior axes (+ the game-session axis) the operator can
-/// apply later. The host assigns a stable id, returned in the body. Applying a preset is a
-/// `PUT /display/settings` with a `Custom` policy carrying its `fields` — no separate apply route.
+/// Named bundle of the display-behavior axes. Host assigns a stable id in the body. Apply with
+/// `PUT /display/settings` carrying a `Custom` policy of its `fields` — no separate apply route.
 #[utoipa::path(
     post,
     path = "/display/presets",
@@ -564,8 +505,8 @@ pub(crate) async fn update_custom_preset(
 
 /// Delete a custom preset
 ///
-/// Removes it from the catalog. The active policy is untouched — if this preset was the one applied,
-/// the running behavior stays exactly as it was (the catalog and `display-settings.json` are decoupled).
+/// Removes it from the catalog. The active policy is untouched — catalog and
+/// `display-settings.json` are decoupled.
 #[utoipa::path(
     delete,
     path = "/display/presets/{id}",

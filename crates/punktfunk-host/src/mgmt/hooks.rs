@@ -1,13 +1,11 @@
-//! Hooks management endpoints (scripting-and-hooks RFC §6): read and replace the operator's
-//! `hooks.json` — validated on write, applied immediately (the runner reads the store per
-//! event, so no restart is needed).
+//! Read and replace `hooks.json`. Validated on write; the runner rereads the store per event
+//! so a PUT applies without a restart.
 
 use super::shared::*;
 
 /// Get the hook configuration
 ///
-/// The operator's `hooks.json`: commands and webhooks fired on host lifecycle events. Empty
-/// when unconfigured.
+/// Empty document when none is stored.
 #[utoipa::path(
     get,
     path = "/hooks",
@@ -24,9 +22,8 @@ pub(crate) async fn get_hooks() -> Json<crate::hooks::HooksConfig> {
 
 /// Replace the hook configuration
 ///
-/// Validates and persists a full `hooks.json` document (this is a whole-document PUT, not a
-/// patch). Applies from the next event — no restart. Hook commands run as the host user
-/// (interactive user session on Windows): treat this configuration as operator-privileged.
+/// Whole-document PUT, not a patch. Applies from the next event. Commands run as the host
+/// user (the interactive session on Windows).
 #[utoipa::path(
     put,
     path = "/hooks",

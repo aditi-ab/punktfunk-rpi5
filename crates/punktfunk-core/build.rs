@@ -1,7 +1,7 @@
-//! Generate the C header (`include/punktfunk_core.h`) from the `extern "C"` surface.
+//! Generate `include/punktfunk_core.h` from the `extern "C"` surface.
 //!
-//! cbindgen failure is a warning, not a hard error, so the crate still builds in minimal
-//! environments (e.g. a CI image without the full toolchain); the header is checked in.
+//! cbindgen failure is a warning, not a hard error, so the crate still builds without the
+//! full toolchain. The header is checked in.
 
 use std::env;
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ fn main() {
     println!("cargo:rerun-if-changed=cbindgen.toml");
 
     let crate_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    // Workspace-level include/ dir: crates/punktfunk-core/ -> ../../include/
+    // Workspace `include/`, two levels above this crate — not `OUT_DIR`.
     let out = PathBuf::from(&crate_dir)
         .join("..")
         .join("..")

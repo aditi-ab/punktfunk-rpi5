@@ -1,43 +1,28 @@
-//! `punktfunk-host plugins …` — the one-liner plugin CLI.
+//! `punktfunk-host plugins …` — install plugins and opt in the runner.
 //!
-//! Installing a plugin used to be a hand ritual: create the plugins dir, hand-write a `bunfig.toml`
-//! registry scope map, `bun add` the package, then hand-enable a systemd unit (Linux) or a scheduled
-//! task (Windows) — all with platform-divergent paths. This subcommand collapses that to
-//! `punktfunk-host plugins add playnite` + `punktfunk-host plugins enable`.
+//! Package ops (`add`/`remove`/`list`) go to the bun runner (`sdk/src/plugins.ts`):
+//! this binary locates it; it owns the vendored bun, `@punktfunk` scope, and plugins dir.
+//! Service ops (`enable`/`disable`/`status`) run here — `systemctl --user` or the
+//! `PunktfunkScripting` scheduled task — so they work without the runner package.
 //!
-//! Split of duties (matching where the machinery already lives):
-//! - **Package ops** (`add`/`remove`/`list`) are forwarded to the bun runner (`sdk/src/plugins.ts`),
-//!   which owns the vendored bun, the `@punktfunk` registry scope, and the plugins dir. We locate the
-//!   runner rather than reimplementing npm resolution in Rust.
-//! - **Service ops** (`enable`/`disable`/`status`) run natively here — `systemctl --user` on Linux,
-//!   the `PunktfunkScripting` scheduled task on Windows — so they work even without the runner
-//!   package present.
+//! Windows: both halves need elevation (`%ProgramData%\punktfunk` is ACL'd;
+//! the task is admin-owned). Refuse unelevated rather than a bare EACCES from `bun add`.
 //!
-//! Windows needs elevation for both halves: the plugins dir lives under the ACL'd
-//! `%ProgramData%\punktfunk` (see `pf_paths::create_private_dir`) and the task is admin-owned. We
-//! check up front and print one actionable line instead of letting `bun add` fail with a bare
-//! EACCES.
+//! The task runs as `NT AUTHORITY\LocalService`, not SYSTEM. `enable` converges the
+//! principal and grants LocalService read on `plugin-token` plus the TLS-pin cert
+//! (`native-cert.pem` or legacy `cert.pem`) — never `mgmt-token`.
 //!
-//! The task itself runs as **`NT AUTHORITY\LocalService`**, not SYSTEM: plugins are
-//! operator-installed code, and a plugin defect must cost a throwaway service account, not the
-//! most privileged principal on the box. `enable` converges the principal (migrating tasks an
-//! older installer registered as SYSTEM) and grants LocalService read on exactly the files the
-//! runner's `connect()` needs — the scoped `plugin-token` and the TLS-pin cert
-//! (`native-cert.pem` on identity-split hosts, `cert.pem` on legacy ones) — never the
-//! full-admin `mgmt-token`.
+//! Runner discovery is pinned in this module's tests.
 
 use anyhow::{bail, Context, Result};
 use std::process::Command;
 
-/// The systemd user unit / Windows scheduled task that supervises plugins.
 #[cfg(target_os = "linux")]
 const UNIT: &str = "punktfunk-scripting";
 #[cfg(target_os = "windows")]
 const TASK: &str = "PunktfunkScripting";
 
-/// The runner executable's name. Every non-Windows package installs a wrapper under exactly this
-/// name — the deb/rpm at `/usr/bin`, the SteamOS installer at `~/.local/bin`, Nix at
-/// `$out/bin` — so one name covers every layout the resolver walks.
+/// Wrapper name every non-Windows package installs (`/usr/bin`, `~/.local/bin`, `$out/bin`).
 #[cfg(not(target_os = "windows"))]
 const RUNNER_BIN: &str = "punktfunk-scripting";
 
@@ -45,7 +30,6 @@ pub fn main(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("add") | Some("remove") | Some("rm") | Some("uninstall") | Some("list")
         | Some("ls") => {
-            // Package ops write into the (ACL'd, on Windows) plugins dir.
             #[cfg(target_os = "windows")]
             if !matches!(args.first().map(String::as_str), Some("list") | Some("ls")) {
                 require_elevation("installing or removing plugins")?;
@@ -105,13 +89,10 @@ NOTES:
 
 // ---- package ops: forward to the bun runner ---------------------------------------------------
 
-/// Locate the runner and hand it the argv verbatim, inheriting stdio so bun's progress output goes
-/// straight to the user's terminal. Exits with the runner's own status code.
 fn forward_to_runner(args: &[String]) -> Result<()> {
-    // `bun add` installs into the nearest ancestor `package.json`, not into its working directory,
-    // so the plugins dir has to own one before the runner runs or a stray `~/package.json` captures
-    // the install — silently, exit 0 (see `store::ensure_plugin_root`). The runner seeds it too, but
-    // the installed scripting package can predate this binary, so do it on this side as well.
+    // `bun add` walks up to the nearest `package.json`, so seed the plugins dir first or a
+    // stray `~/package.json` captures the install (exit 0). The installed runner may predate
+    // this binary (`store::ensure_plugin_root`).
     if args.first().map(String::as_str) == Some("add") {
         let dir = args
             .iter()
@@ -129,23 +110,19 @@ fn forward_to_runner(args: &[String]) -> Result<()> {
         .status()
         .with_context(|| format!("failed to run the plugin runner ({})", program.display()))?;
     if !status.success() {
-        // The runner already printed the reason; propagate its code without a second error line.
+        // The runner already printed the reason; do not add a second error line.
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
 }
 
-/// Resolve how to invoke the runner CLI: the program plus any leading args (the bundled bun needs
-/// the runner script path passed to it).
+/// Bundled bun needs the runner script path as a leading arg.
 ///
-/// Also the plugin store's executor seam ([`crate::store::jobs`]): a console-triggered install runs
-/// the *same* package ops through the *same* runner as the CLI, so there is exactly one
-/// implementation of "install a plugin" on the box (design D4).
+/// Also the store job executor ([`crate::store::jobs`]): console installs use this same
+/// invocation so the box has one "install a plugin" path.
 pub(crate) fn runner_command() -> Result<(std::path::PathBuf, Vec<String>)> {
     #[cfg(target_os = "windows")]
     {
-        // The installer lays the payload out as {app}\punktfunk-host.exe, {app}\bun\bun.exe and
-        // {app}\scripting\runner-cli.js (packaging/windows/punktfunk-host.iss).
         let app = std::env::current_exe()
             .context("resolve current exe")?
             .parent()
@@ -161,8 +138,8 @@ pub(crate) fn runner_command() -> Result<(std::path::PathBuf, Vec<String>)> {
                 runner.display()
             );
         }
-        // Tail expression, not `return`: after cfg-stripping this block is the whole fn body on
-        // Windows, and a `return` here trips clippy's needless_return under CI's -D warnings.
+        // Tail expression, not `return`: after cfg-stripping this is the whole fn body,
+        // and `return` trips clippy needless_return under -D warnings.
         Ok((bun, vec![runner.to_string_lossy().into_owned()]))
     }
     #[cfg(not(target_os = "windows"))]
@@ -181,8 +158,7 @@ pub(crate) fn runner_command() -> Result<(std::path::PathBuf, Vec<String>)> {
     }
 }
 
-/// What to say when no rung matched. Shared with [`runtime_status`], so the CLI and the console
-/// tell an operator the same thing.
+/// Shared with [`runtime_status`] so CLI and console say the same thing.
 #[cfg(not(target_os = "windows"))]
 pub(crate) const RUNNER_MISSING: &str =
     "the plugin runner isn't installed — install it first (Debian/Ubuntu: `sudo apt install \
@@ -190,15 +166,11 @@ pub(crate) const RUNNER_MISSING: &str =
      `services.punktfunk.scripting`). If it is installed somewhere else, point PUNKTFUNK_SCRIPTING \
      at the punktfunk-scripting executable.";
 
-/// The rungs, in order: `PUNKTFUNK_SCRIPTING` → beside the host binary → `PATH` → the packaged
-/// `/usr` layout → the user-scoped SteamOS layout. Pure and fully injected so the table can be
-/// tested without mutating process env, which races `getenv` in parallel tests.
+/// Rungs: `PUNKTFUNK_SCRIPTING` → beside the host → `PATH` → `/usr` → `~/.local`.
+/// Injected so tests do not mutate process env (races `getenv` in parallel).
 ///
-/// `PATH` is load-bearing rather than a nicety: it is the ONLY rung a Nix install can land on.
-/// `punktfunk-scripting` is a derivation of its own there (packaging/nix/packages.nix), so its
-/// wrapper is neither beside the host binary nor anywhere under `/usr` — the layouts this
-/// resolver used to check exclusively, which is why a fully working NixOS box reported the runner
-/// as not installed.
+/// `PATH` is the only rung a Nix install can land on: `punktfunk-scripting` is its
+/// own derivation, neither beside the host nor under `/usr`.
 #[cfg(not(target_os = "windows"))]
 fn resolve_runner_in(
     env: Option<&str>,
@@ -209,20 +181,17 @@ fn resolve_runner_in(
 ) -> Option<(std::path::PathBuf, Vec<String>)> {
     use std::path::{Path, PathBuf};
 
-    // The two-file layout: a private bun plus the runner bundle, which the deb/rpm and the SteamOS
-    // installer both lay down beside their wrapper. Only a rung when BOTH halves are present.
+    // Two-file layout (private bun + runner bundle). A rung only when both exist.
     let pair = |bun: PathBuf, runner: PathBuf| -> Option<(PathBuf, Vec<String>)> {
         (exists(&bun) && exists(&runner))
             .then(|| (bun, vec![runner.to_string_lossy().into_owned()]))
     };
 
-    // The operator's own override, and deliberately NOT existence-checked: whoever names a path is
-    // entitled to a failure that names it back, where falling through to a runner that happens to
-    // be installed would hide the typo behind a working install.
+    // Operator override: not existence-checked, so a typo fails naming that path
+    // instead of silently using some other installed runner.
     if let Some(v) = env.map(str::trim).filter(|v| !v.is_empty()) {
         return Some((PathBuf::from(v), Vec::new()));
     }
-    // Beside the host binary — a source tree or any relocatable layout shipping both in one prefix.
     if let Some(p) = exe_dir.map(|d| d.join(RUNNER_BIN)).filter(|p| exists(p)) {
         return Some((p, Vec::new()));
     }
@@ -235,8 +204,7 @@ fn resolve_runner_in(
     {
         return Some((p, Vec::new()));
     }
-    // The packaged /usr layout (packaging/debian/build-scripting-deb.sh). Still checked explicitly
-    // after `PATH` because a systemd unit can carry a PATH that does not include /usr/bin.
+    // Packaged `/usr` after `PATH`: a systemd unit PATH may omit `/usr/bin`.
     let wrapper = Path::new("/usr/bin").join(RUNNER_BIN);
     if exists(&wrapper) {
         return Some((wrapper, Vec::new()));
@@ -249,8 +217,7 @@ fn resolve_runner_in(
     ) {
         return Some(cmd);
     }
-    // Immutable-/usr distros (SteamOS): scripts/steamdeck/install.sh lays the SAME payload out
-    // user-scoped under ~/.local, because a system package can't exist there.
+    // Immutable `/usr` (SteamOS): the same payload, user-scoped under `~/.local`.
     let home = home?;
     let wrapper = home.join(".local/bin").join(RUNNER_BIN);
     if exists(&wrapper) {
@@ -307,24 +274,16 @@ fn status() -> Result<()> {
 
 // ---- runtime state, shared by the CLI and the plugin store's mgmt API --------------------------
 
-/// Whether the plugin runner is present, switched on, and up.
-///
-/// The store's console surface needs this as data (to offer "enable the runner" before the first
-/// install, and to explain why a freshly installed plugin isn't running yet), so it lives here
-/// rather than being formatted straight to stdout like the CLI once did.
+/// Data for the store console (offer enable before first install; explain why a
+/// just-installed plugin is not running). Not formatted for stdout.
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeStatus {
-    /// Is the runner payload / service unit on this box at all?
     pub installed: bool,
-    /// Is it configured to start (systemd `enabled`, or a non-`Disabled` scheduled task)?
+    /// systemd `enabled`, or a non-`Disabled` scheduled task.
     pub enabled: bool,
-    /// Is it up right now?
     pub running: bool,
-    /// The unit / task name, so operator-facing copy can name the thing to look at.
     pub unit: &'static str,
-    /// Windows: the account the task runs as (the SYSTEM→LocalService migration is visible here).
     pub principal: Option<String>,
-    /// One line of human-readable context, mostly for the "not installed" case.
     pub detail: String,
 }
 
@@ -332,8 +291,8 @@ pub(crate) struct RuntimeStatus {
 pub(crate) fn runtime_status() -> RuntimeStatus {
     let enabled_raw = systemctl_output(&["is-enabled", UNIT]);
     let active = systemctl_output(&["is-active", UNIT]).unwrap_or_default();
-    // `is-enabled` answers `not-found` when the unit file isn't installed at all; the runner
-    // payload being present is the other half of "can we install plugins".
+    // `is-enabled` is `not-found` when the unit file is missing; the runner payload
+    // is the other half of "can we install plugins".
     let unit_known = enabled_raw.as_deref().is_some_and(|s| s != "not-found");
     let installed = unit_known || runner_command().is_ok();
     RuntimeStatus {
@@ -392,9 +351,8 @@ pub(crate) fn runtime_status() -> RuntimeStatus {
     }
 }
 
-/// Switch the runner on or off — the [`enable`]/[`disable`] the CLI runs, exposed for the store's
-/// `POST /store/runtime`. On Windows this is reached from the SYSTEM service, which already clears
-/// the elevation bar the CLI has to check for.
+/// [`enable`]/[`disable`], also `POST /store/runtime`. Windows: the SYSTEM service
+/// already clears the elevation bar the CLI checks.
 pub(crate) fn set_runtime_enabled(enabled: bool) -> Result<()> {
     if enabled {
         enable()
@@ -403,12 +361,11 @@ pub(crate) fn set_runtime_enabled(enabled: bool) -> Result<()> {
     }
 }
 
-/// Restart the runner so it rediscovers installed units. Returns `false` (not an error) when it
-/// isn't running — there is nothing to restart, and the store reports that as "installed, but the
-/// runner is off" rather than as a failure.
+/// Restart so the runner rediscovers units. `false` when it is not running — not an
+/// error; the store reports "installed, but off".
 ///
-/// Unit discovery happens once at runner startup ([`sdk/src/runner.ts`]), so this restart *is* the
-/// activation step for a newly installed plugin.
+/// Discovery runs once at runner startup ([`sdk/src/runner.ts`]); this restart is
+/// how a newly installed plugin becomes active.
 pub(crate) fn restart_runtime() -> Result<bool> {
     let st = runtime_status();
     if !st.installed || !st.running {
@@ -421,8 +378,8 @@ pub(crate) fn restart_runtime() -> Result<bool> {
     }
     #[cfg(target_os = "windows")]
     {
-        // Stop then start: `Restart-ScheduledTask` does not exist, and a Start on an already-
-        // running task is a no-op rather than a restart.
+        // Stop then start: there is no `Restart-ScheduledTask`, and Start on a
+        // running task is a no-op.
         powershell(&format!(
             "Stop-ScheduledTask -TaskName {TASK} -ErrorAction SilentlyContinue; \
              Start-ScheduledTask -TaskName {TASK} -ErrorAction Stop"
@@ -451,8 +408,8 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Trimmed stdout of a `systemctl --user` query, or `None` if it couldn't run. These queries exit
-/// non-zero for a normal "inactive"/"disabled" answer, so the status text is what matters.
+/// Trimmed `systemctl --user` stdout, or `None` if it could not run. Queries exit
+/// non-zero for a normal "inactive"/"disabled", so the text is the answer.
 #[cfg(target_os = "linux")]
 fn systemctl_output(args: &[&str]) -> Option<String> {
     let out = Command::new("systemctl")
@@ -468,45 +425,34 @@ fn systemctl_output(args: &[&str]) -> Option<String> {
     }
 }
 
-/// `NT AUTHORITY\LocalService` — the runner task's principal — in icacls SID form.
+/// `NT AUTHORITY\LocalService` in icacls SID form.
 #[cfg(target_os = "windows")]
 const LOCAL_SERVICE_SID: &str = "*S-1-5-19";
 
-/// The secrets the runner needs to read to reach the mgmt API: the scoped plugin token and the
-/// host identity cert it pins TLS against — `native-cert.pem` when the identity split minted
-/// one (what mgmt then serves), `cert.pem` on legacy hosts. `mgmt-token` (full admin) is
-/// deliberately NOT here. The grant loop tolerates absent files, so listing both is safe on
-/// either kind of host.
+/// Secrets the runner may read: scoped `plugin-token` and the TLS-pin cert
+/// (`native-cert.pem` after the identity split, else `cert.pem`). Never `mgmt-token`.
+/// Absent files are skipped, so listing both certs is safe on either host.
 #[cfg(target_os = "windows")]
 const RUNNER_SECRET_FILES: [&str; 3] = ["plugin-token", "native-cert.pem", "cert.pem"];
 
-/// The unit directories the runner imports code from. LocalService gets an inheritable
-/// read+execute+write-attributes grant on these: bun's module loader opens unit files
-/// requesting FILE_WRITE_ATTRIBUTES on top of read (plain `(RX)` makes every import die with
-/// EPERM — found on-glass), and WA can only touch timestamps/readonly bits, never content —
-/// the runner's own integrity check (`windowsSddlUnsafeReason`) treats it as harmless.
+/// Unit dirs the runner imports. Inheritable `(RX,WA)`: bun's loader opens unit
+/// files with FILE_WRITE_ATTRIBUTES; plain `(RX)` is EPERM on every import. WA
+/// can only touch timestamps/readonly bits — `windowsSddlUnsafeReason` treats it
+/// as harmless.
 #[cfg(target_os = "windows")]
 const RUNNER_UNIT_DIRS: [&str; 2] = ["plugins", "scripts"];
 
-/// The runner's writable state root: `<config_dir>\plugin-state`. A plugin persists its config +
-/// cache under `plugin-state\<name>` (`@punktfunk/host`'s `pluginStateDir`), so LocalService needs
-/// real **Modify** here — unlike the code dirs (RX,WA) and the secrets (R). This keeps the
-/// three-way split crisp: code is read-only (a plugin can't rewrite itself), secrets are
-/// read-only, only this one dir is writable. Inheritable so per-plugin subdirs the runner creates
-/// carry the grant. Users stay read-only (config-dir default), so another non-admin still can't
-/// tamper with a plugin's launch templates.
+/// Writable state: `<config_dir>\plugin-state`. Plugins persist under
+/// `plugin-state\<name>`, so LocalService needs Modify here — code dirs are
+/// (RX,WA), secrets are (R). Inheritable onto per-plugin subdirs. Users stay
+/// read-only (config-dir default).
 #[cfg(target_os = "windows")]
 const RUNNER_STATE_DIRS: [&str; 1] = ["plugin-state"];
 
-/// The plugin **ingest** inbox: `<config_dir>\ingest`. The INVERSE grant of `plugin-state` —
-/// `BUILTIN\Users` gets **Modify**, so an app running as the interactive user (e.g. the Playnite
-/// exporter, a Playnite extension) can drop data (`ingest\<plugin>\…`) that the de-privileged
-/// LocalService runner then READS (LocalService is a member of Users, so it inherits read here).
-/// This is the one place a plugin can receive data produced by *another* account — the runner can
-/// no longer traverse the interactive user's profile the way the old SYSTEM runner could. Scoped
-/// to this one inbox: the rest of the config tree stays Users-read-only, so the widening is a
-/// well-defined drop box, not a general write hole. (Accepted tradeoff: any local user can drop a
-/// file here — trusted-single-user model, and the runner it feeds is only LocalService.)
+/// Ingest inbox: `<config_dir>\ingest`. Inverse of `plugin-state`: `BUILTIN\Users`
+/// gets Modify so an interactive-user app can drop `ingest\<plugin>\…` for the
+/// LocalService runner to read. The rest of the config tree stays Users-read-only.
+/// Any local user can drop a file here (trusted-single-user; the reader is LocalService).
 #[cfg(target_os = "windows")]
 const RUNNER_INGEST_DIRS: [&str; 1] = ["ingest"];
 
@@ -516,10 +462,8 @@ const USERS_SID: &str = "*S-1-5-32-545";
 
 #[cfg(target_os = "windows")]
 fn enable() -> Result<()> {
-    // Converge the task principal BEFORE starting it: the installer registers it as LocalService,
-    // but a task from an older install (or a hand-registered dev box) still runs as SYSTEM, and
-    // enabling that unmigrated would hand operator plugins the highest privilege on the box.
-    // Idempotent; -LogonType ServiceAccount needs no stored password.
+    // Converge the principal before start: an older task may still be SYSTEM.
+    // Idempotent; `-LogonType ServiceAccount` needs no stored password.
     powershell(&format!(
         "$p = New-ScheduledTaskPrincipal -UserId 'LocalService' -LogonType ServiceAccount; \
          Set-ScheduledTask -TaskName {TASK} -Principal $p -ErrorAction Stop | Out-Null"
@@ -544,13 +488,10 @@ fn disable() -> Result<()> {
     Ok(())
 }
 
-/// Grant LocalService **read** on the runner's two secret files. Both are written by the host's
-/// `serve` with a SYSTEM/Administrators-only DACL (`pf_paths::write_secret_file`), which the
-/// de-privileged runner cannot read — this is the one, narrow widening it needs. `/grant:r`
-/// replaces only LocalService's ACE, leaving the lockdown otherwise intact. Files the host hasn't
-/// minted yet get an actionable note instead of a failed icacls: the grant re-runs on the next
-/// `plugins enable`. NOTE: the host re-locks a secret's DACL whenever it rewrites the file (e.g.
-/// a regenerated identity cert) — re-running `plugins enable` restores the grant.
+/// Grant LocalService read on the runner secrets. `serve` writes them with a
+/// SYSTEM/Administrators-only DACL (`pf_paths::write_secret_file`); `/grant:r`
+/// replaces only LocalService's ACE. A later rewrite of the file drops the ACE —
+/// re-run `plugins enable`. Missing files get a note; the grant retries next enable.
 #[cfg(target_os = "windows")]
 fn grant_runner_secret_reads() {
     let cfg = pf_paths::config_dir();
@@ -580,10 +521,8 @@ fn grant_runner_secret_reads() {
             );
         }
     }
-    // The unit dirs: inheritable (RX,WA) so the runner can import what lives there (see
-    // RUNNER_UNIT_DIRS). Created here if absent — an elevated create inherits the config dir's
-    // protected DACL, and granting now means files the operator adds later are covered by
-    // inheritance rather than needing another `plugins enable`.
+    // Unit dirs: inheritable (RX,WA). Create now so later files inherit rather
+    // than needing another `plugins enable`.
     for name in RUNNER_UNIT_DIRS {
         let dir = cfg.join(name);
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -605,8 +544,6 @@ fn grant_runner_secret_reads() {
             );
         }
     }
-    // The state root: inheritable Modify so plugins can persist config/cache under
-    // `plugin-state\<name>` (see RUNNER_STATE_DIRS). This is the ONLY writable grant.
     for name in RUNNER_STATE_DIRS {
         let dir = cfg.join(name);
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -628,9 +565,6 @@ fn grant_runner_secret_reads() {
             );
         }
     }
-    // The ingest inbox: inheritable Modify for BUILTIN\Users, so an interactive-user app (the
-    // Playnite exporter) can drop `ingest\<plugin>\…` for the LocalService runner to read (see
-    // RUNNER_INGEST_DIRS). The one Users-writable carve-out in the otherwise Users-read-only tree.
     for name in RUNNER_INGEST_DIRS {
         let dir = cfg.join(name);
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -652,18 +586,9 @@ fn grant_runner_secret_reads() {
             );
         }
     }
-    // The runner's OWN bundle, in the install dir rather than under the config dir. Same reason as
-    // RUNNER_UNIT_DIRS: bun opens the file it is asked to run requesting FILE_WRITE_ATTRIBUTES on
-    // top of read, and {app}\scripting only carries Users:(RX), which LocalService reaches through
-    // Authenticated Users. So `bun runner-cli.js` died with
-    //   error: EPERM reading "C:\Program Files\punktfunk\scripting\runner-cli.js"
-    // the task exited 1 within a second of every start, and the console showed the runner as
-    // enabled-but-not-running with nothing to explain it. The unit dirs were given (RX,WA) when
-    // that behaviour was first found on-glass; the entry script itself was missed, so the runner
-    // could never start at all. Verified on glass: without this the task is Ready/lastResult=1,
-    // with it the task is Running and `GET /store/runtime` reports running:true.
-    // WA touches timestamps and the read-only bit, never content, so "code is read-only — a plugin
-    // cannot rewrite itself" still holds for the runner's own bundle.
+    // `{app}\scripting` is not under the config dir. Same (RX,WA) as the unit
+    // dirs: bun opens the entry script with FILE_WRITE_ATTRIBUTES, and the
+    // install tree only carries Users:(RX). WA cannot change content.
     if let Some(dir) = runner_bundle_dir() {
         let ok = Command::new(icacls_path())
             .arg(&dir)
@@ -682,17 +607,13 @@ fn grant_runner_secret_reads() {
     }
 }
 
-/// `{app}\scripting` — where the installer lays down `runner-cli.js` + `scripting-run.cmd`
-/// (packaging/windows/punktfunk-host.iss), resolved from the running exe like
-/// [`runner_command`] does. `None` when the exe path cannot be resolved; callers treat that as
-/// "nothing to grant" rather than failing the whole enable.
+/// `None` if the exe path cannot be resolved; callers skip the grant rather than fail enable.
 #[cfg(target_os = "windows")]
 fn runner_bundle_dir() -> Option<std::path::PathBuf> {
     Some(std::env::current_exe().ok()?.parent()?.join("scripting"))
 }
 
-/// Best-effort removal of the LocalService read grants when the runner is switched off — the
-/// mirror of [`grant_runner_secret_reads`]; `enable` re-grants.
+/// Drop the LocalService grants when the runner is switched off. `enable` re-grants.
 #[cfg(target_os = "windows")]
 fn revoke_runner_secret_reads() {
     let cfg = pf_paths::config_dir();
@@ -712,8 +633,8 @@ fn revoke_runner_secret_reads() {
             .stderr(std::process::Stdio::null())
             .status();
     }
-    // The ingest inbox was opened to Users, not LocalService — remove that explicit grant (the
-    // inherited Users:RX from the config dir remains, so it reverts to read-only, not orphaned).
+    // Ingest was granted to Users, not LocalService. Removing that ACE leaves
+    // the inherited Users:RX, so the dir reverts to read-only.
     for name in RUNNER_INGEST_DIRS {
         let path = cfg.join(name);
         if !path.exists() {
@@ -726,9 +647,8 @@ fn revoke_runner_secret_reads() {
             .stderr(std::process::Stdio::null())
             .status();
     }
-    // …and the bundle dir in the install tree, which is not under `cfg` so the loop above misses
-    // it. Removing the explicit ACE leaves the inherited Users:(RX) from Program Files, so it
-    // reverts to plain read-only rather than losing access altogether.
+    // Bundle dir is not under `cfg`. Removing the ACE leaves inherited
+    // Users:(RX) from Program Files — read-only, not inaccessible.
     if let Some(dir) = runner_bundle_dir().filter(|d| d.exists()) {
         let _ = Command::new(icacls_path())
             .arg(&dir)
@@ -739,8 +659,7 @@ fn revoke_runner_secret_reads() {
     }
 }
 
-/// Resolve icacls by full System32 path rather than PATH — same planted-binary reasoning as
-/// [`powershell_path`]; matches `pf_paths`.
+/// System32 `icacls`, not PATH — same planted-binary rule as [`powershell_path`].
 #[cfg(target_os = "windows")]
 fn icacls_path() -> String {
     std::env::var("SystemRoot")
@@ -748,9 +667,9 @@ fn icacls_path() -> String {
         .unwrap_or_else(|_| "icacls".to_string())
 }
 
-/// Resolve powershell by full System32 path rather than PATH — CreateProcess searches the launching
-/// EXE's own directory first, so a planted `powershell.exe` beside the host binary would otherwise
-/// run with our privileges (security-review 2026-07-17; matches service.rs / pf_vdisplay).
+/// System32 powershell, not PATH. CreateProcess searches the launching EXE's
+/// directory first, so a planted `powershell.exe` beside the host would run
+/// with these privileges.
 #[cfg(target_os = "windows")]
 fn powershell_path() -> String {
     std::env::var("SystemRoot")
@@ -789,16 +708,14 @@ fn powershell_output(command: &str) -> Option<String> {
 
 // ---- elevation --------------------------------------------------------------------------------
 
-/// Refuse early, with an actionable message, when an admin-only operation is run unelevated. We do
-/// NOT self-elevate via UAC: that spawns a separate console window which closes on exit, hiding
-/// bun's install output and any error the user needs to read.
+/// Refuse unelevated admin-only ops. Do not self-elevate via UAC: that opens a
+/// new console that closes on exit, hiding bun's output.
 #[cfg(target_os = "windows")]
 fn require_elevation(what: &str) -> Result<()> {
     if is_elevated() {
         return Ok(());
     }
-    // ASCII only: the Windows console's default codepage drops non-ASCII (an em-dash or arrow
-    // renders as a blank), which mangles the one message the user most needs to read.
+    // ASCII only: the default Windows console codepage drops em-dashes and arrows.
     bail!(
         "{what} needs administrator rights (the plugins directory under %ProgramData%\\punktfunk \
          and the runner task are admin-owned).\n\nOpen an elevated prompt: Start -> type \
@@ -806,16 +723,11 @@ fn require_elevation(what: &str) -> Result<()> {
     )
 }
 
-/// Does this process have local-Administrator rights *in effect*?
+/// Effective local-Administrator membership via `CheckTokenMembership`.
 ///
-/// Deliberately `CheckTokenMembership` against the built-in Administrators group, NOT
-/// `GetTokenInformation(TokenElevation)`. `TokenElevation` answers "was this token elevated via
-/// UAC", which is not the same question: a restricted/SAFER token derived from an elevated one
-/// (`runas /trustlevel:0x20000`) still reports `TokenIsElevated = 1` while the Administrators SID
-/// is deny-only, so the guard waved through a process that then failed on the ACL'd plugins dir.
-/// Verified on-glass 2026-07-19: under such a token this returns false where `TokenElevation`
-/// returned true. `CheckTokenMembership(None, …)` uses the effective token and honors deny-only
-/// SIDs — the same test PowerShell's `IsInRole([…]::Administrator)` performs.
+/// Not `TokenElevation`: a restricted/SAFER token from an elevated one
+/// (`runas /trustlevel:0x20000`) still reports `TokenIsElevated = 1` while
+/// Administrators is deny-only.
 #[cfg(target_os = "windows")]
 fn is_elevated() -> bool {
     use windows::Win32::Foundation::HANDLE;
@@ -823,10 +735,8 @@ fn is_elevated() -> bool {
         AllocateAndInitializeSid, CheckTokenMembership, FreeSid, PSID, SID_IDENTIFIER_AUTHORITY,
     };
 
-    // The well-known BUILTIN\Administrators SID, S-1-5-32-544: NT authority (5) + the
-    // SECURITY_BUILTIN_DOMAIN_RID (32) and DOMAIN_ALIAS_RID_ADMINS (544) sub-authorities. Spelled
-    // out rather than imported so this doesn't depend on which module the crate exposes the RID
-    // constants from.
+    // BUILTIN\Administrators, S-1-5-32-544. Spelled out so this does not depend
+    // on which windows crate module exports the RID constants.
     const NT_AUTHORITY: SID_IDENTIFIER_AUTHORITY = SID_IDENTIFIER_AUTHORITY {
         Value: [0, 0, 0, 0, 0, 5],
     };
@@ -863,7 +773,6 @@ fn is_elevated() -> bool {
     }
 }
 
-// Non-Linux, non-Windows (macOS dev builds): the runner and its service manager don't exist there.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn enable() -> Result<()> {
     bail!("the plugin runner is only available on Linux and Windows hosts")
@@ -879,21 +788,17 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
-    /// Build an `exists` probe over a fixed set of paths.
     fn present(ps: Vec<PathBuf>) -> impl Fn(&Path) -> bool {
         move |p: &Path| ps.iter().any(|q| q == p)
     }
 
-    /// Every layout the resolver has to serve, in one table — the regression guard for the NixOS
-    /// report (a runner on `PATH` and nowhere else read as "not installed").
+    /// Layouts the resolver must serve. Nix lands on `PATH` and nowhere else.
     #[test]
     fn runner_resolution_table() {
         let beside = Path::new("/opt/punktfunk/bin");
         let nix = Path::new("/run/current-system/sw/bin");
         let home = Path::new("/home/deck");
 
-        // The rung a Nix install lands on: NOT beside the host binary, NOT under /usr — `PATH`
-        // only. This is the whole bug.
         let exists = present(vec![nix.join(RUNNER_BIN)]);
         assert_eq!(
             resolve_runner_in(
@@ -906,7 +811,6 @@ mod tests {
             Some((nix.join(RUNNER_BIN), Vec::new()))
         );
 
-        // An explicit override wins over every discovery…
         let exists = present(vec![beside.join(RUNNER_BIN)]);
         assert_eq!(
             resolve_runner_in(
@@ -918,18 +822,16 @@ mod tests {
             ),
             Some(("/nix/store/abc/bin/punktfunk-scripting".into(), Vec::new()))
         );
-        // …and is not existence-checked, so a typo surfaces as a spawn failure naming the path
-        // rather than silently running some other runner.
+        // Override is not existence-checked: a typo fails naming that path.
         assert_eq!(
             resolve_runner_in(Some("/nope/pf"), Some(beside), None, None, &exists),
             Some(("/nope/pf".into(), Vec::new()))
         );
-        // Empty/whitespace reads as unset, not as a path.
+        // Empty/whitespace is unset, not a path.
         assert_eq!(
             resolve_runner_in(Some("  "), Some(beside), None, None, &exists),
             Some((beside.join(RUNNER_BIN), Vec::new()))
         );
-        // Beside the host binary beats PATH.
         let exists = present(vec![beside.join(RUNNER_BIN), nix.join(RUNNER_BIN)]);
         assert_eq!(
             resolve_runner_in(
@@ -941,7 +843,7 @@ mod tests {
             ),
             Some((beside.join(RUNNER_BIN), Vec::new()))
         );
-        // PATH is walked entry by entry, skipping empties.
+        // PATH is walked entry by entry; empty entries skipped.
         let exists = present(vec![nix.join(RUNNER_BIN)]);
         assert_eq!(
             resolve_runner_in(
@@ -954,7 +856,7 @@ mod tests {
             Some((nix.join(RUNNER_BIN), Vec::new()))
         );
 
-        // The deb/rpm wrapper, found even when the unit's PATH omits /usr/bin.
+        // Packaged wrapper even when the unit PATH omits `/usr/bin`.
         let exists = present(vec![PathBuf::from("/usr/bin").join(RUNNER_BIN)]);
         assert_eq!(
             resolve_runner_in(
@@ -966,7 +868,7 @@ mod tests {
             ),
             Some((PathBuf::from("/usr/bin").join(RUNNER_BIN), Vec::new()))
         );
-        // …and its private two-file layout when the wrapper is absent.
+        // Private two-file layout when the wrapper is absent.
         let bun = PathBuf::from("/usr/lib").join(RUNNER_BIN).join("bun");
         let cli = PathBuf::from("/usr/share")
             .join(RUNNER_BIN)
@@ -976,12 +878,11 @@ mod tests {
             resolve_runner_in(None, None, None, None, &exists),
             Some((bun, vec![cli.to_string_lossy().into_owned()]))
         );
-        // Half of that layout is not a rung — a partial install must fall through, not spawn a
-        // bun with no script.
+        // Half of that layout is not a rung — do not spawn bun with no script.
         let exists = present(vec![PathBuf::from("/usr/lib").join(RUNNER_BIN).join("bun")]);
         assert_eq!(resolve_runner_in(None, None, None, None, &exists), None);
 
-        // SteamOS: the same payload, user-scoped. Reached only via HOME.
+        // SteamOS payload is user-scoped; reached only via HOME.
         let exists = present(vec![home.join(".local/bin").join(RUNNER_BIN)]);
         assert_eq!(
             resolve_runner_in(None, None, None, Some(home), &exists),
@@ -999,7 +900,6 @@ mod tests {
             Some((bun, vec![cli.to_string_lossy().into_owned()]))
         );
 
-        // Nothing anywhere: the "not installed" rung the error text speaks for.
         let exists = present(vec![]);
         assert_eq!(
             resolve_runner_in(None, Some(beside), Some("/nope"), Some(home), &exists),
@@ -1007,8 +907,7 @@ mod tests {
         );
     }
 
-    /// The operator-facing miss must name NixOS — the report's second half was that the error
-    /// pointed a NixOS operator at `apt`.
+    /// Miss text must name every install path, including NixOS (not only `apt`).
     #[test]
     fn the_missing_runner_error_names_every_platform_it_can_be_installed_on() {
         for hint in [

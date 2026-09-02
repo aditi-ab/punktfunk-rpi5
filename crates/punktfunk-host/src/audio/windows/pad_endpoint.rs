@@ -1,45 +1,23 @@
-//! DualSense pad-audio endpoint provisioning (Windows) — mint a per-pad render endpoint that
-//! games recognise as the pad's SPEAKER, and loopback-capture what they play into it.
+//! DualSense pad-audio endpoint provisioning (Windows).
 //!
-//! Games find a DualSense's audio endpoint by (a) ContainerId — the first render endpoint whose
-//! `PKEY_Device_ContainerId` equals the pad's HID container — and/or (b) a FriendlyName
-//! containing "Wireless Controller"; the endpoint must be 4 ch / 48 kHz (all verified on-glass
-//! 2026-08-01). The punktfunk virtual pad already stamps the deterministic per-pad container
-//! `{50464453-0000-0000-0000-00000000000<idx>}` ("PFDS" — see
-//! `pf-inject/src/inject/windows/dualsense_windows.rs`, `create_swdevice`), so this module's
-//! whole job is to produce a render endpoint carrying the SAME container + name + formats:
+//! Mints a per-pad render endpoint games recognise as the pad SPEAKER, then
+//! loopback-captures what they play. Games match `PKEY_Device_ContainerId` to
+//! the pad HID container and/or a FriendlyName containing "Wireless Controller";
+//! format is 4 ch / 48 kHz. The virtual pad stamps PFDS
+//! `{50464453-0000-0000-0000-00000000000<idx>}` (`pf-inject` `create_swdevice`).
 //!
-//! 1. **Devnode** ([`ensure`], idempotent, host startup — NOT per session): one extra devnode of
-//!    Valve's Steam Streaming Speakers driver per pad slot (hwid `ROOT\SteamStreamingSpeakers`,
-//!    present whenever Steam is installed; the driver happily multi-instances — each devnode
-//!    yields a fresh render endpoint). Registered via `SetupDiRegisterDeviceInfo`, NOT
-//!    `SetupDiCallClassInstaller(DIF_REGISTERDEVICE)`, which needs an interactive window
-//!    station and fails with error 1459 from a service. The pad slot is persisted in the
-//!    devnode's `Device Parameters` key (`PunktfunkPadIndex`) — the INF rewrites DeviceDesc at
-//!    driver install, so the marker value is the durable "this one is ours" signal.
-//! 2. **Stamp**: the new endpoint gets the MINIMAL DualSense identity — description + device
-//!    name, the PFDS container, and the 4 ch/48 kHz format triplet. Never hardware-id or
-//!    devicepath properties: an inconsistent stamp makes AudioEndpointBuilder DELETE the
-//!    endpoint and re-mint it under a new GUID. The cleaner `IPropertyStore` route is tried
-//!    first (audiosrv notices immediately); keys it rejects fall back to raw registry writes
-//!    behind the measured MMDevices ACL repair (see [`grant_system_full_control`]).
-//! 3. **Capture**: sessions loopback-capture the endpoint ([`PadLoopbackCapturer`], 4 ch f32
-//!    interleaved) and ship the PCM to the client's pad speaker/haptics.
-//! 4. **Visibility** ([`set_visibility`]): the endpoint parks HIDDEN (`DEVICE_STATE_DISABLED`)
-//!    whenever no client pad is attached — provisioning hides it at startup, the per-pad
-//!    streamer shows it for exactly the pad's lifetime. The DualSense disguise that makes games
-//!    route haptics at it during a session makes idle libScePad titles STALL on it otherwise
-//!    (Helldivers 2, field-confirmed 2026-08-14: 2–5 FPS 1% lows with the host idle). The
-//!    devnode, driver binding and stamps stay put, so flips raise no PnP traffic.
-//!
-//! The wiring plan must never route desktop audio or the virtual mic onto these endpoints —
-//! [`audio_control`](super::audio_control) collects the exclusion ids via
-//! [`is_pad_render_endpoint`] and the pure plan filters them. A default-playback flip onto a
-//! freshly minted pad endpoint is undone inside [`ensure`] (the IPolicyConfig machinery
-//! `audio_control` already owns).
-//!
-//! COM discipline matches the sibling modules: WASAPI/COM objects live on the thread that made
-//! them (the provisioning worker, the capture thread); only channels and plain data cross.
+//! [`ensure`] (host startup, not per session) creates one extra Steam Streaming
+//! Speakers devnode per slot (`ROOT\SteamStreamingSpeakers`). Register with
+//! `SetupDiRegisterDeviceInfo`, not `DIF_REGISTERDEVICE` — that needs an
+//! interactive window station and fails with 1459 from a service. Persist the
+//! slot in `Device Parameters\PunktfunkPadIndex`; the INF rewrites DeviceDesc.
+//! Stamp only description, name, PFDS container, and the 4 ch/48 kHz triplet.
+//! Hardware-id or devicepath writes make AudioEndpointBuilder delete and remint
+//! under a new GUID. [`PadLoopbackCapturer`] captures. [`set_visibility`] parks
+//! `DEVICE_STATE_DISABLED` with no client pad attached; idle libScePad titles
+//! stall on a visible DualSense-named speaker. Flips raise no PnP. Wiring-plan
+//! exclusion is [`is_pad_render_endpoint`]. COM objects stay on the thread
+//! that made them.
 
 use super::{audio_control, AudioCapturer, SAMPLE_RATE};
 use anyhow::{anyhow, bail, Context, Result};
@@ -79,66 +57,45 @@ use windows::Win32::System::Registry::{
 use windows::Win32::System::Variant::{VT_BLOB, VT_CLSID, VT_LPWSTR};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
-/// Data1 of the deterministic per-pad container GUID ("PFDS") — MUST equal the
-/// `container_tag` pf-inject stamps on the virtual DualSense devnodes, or games will never
-/// match the endpoint to the pad.
+/// Data1 of the per-pad container GUID. Must equal pf-inject's `container_tag`
+/// or games never match the endpoint to the pad.
 pub(crate) const PFDS_TAG: u32 = 0x5046_4453;
-/// DeviceDesc our devnodes are created with (the INF overwrites it at driver install, so this
-/// only identifies a devnode whose install never completed — [`PAD_INDEX_VALUE`] is the
-/// durable marker).
+/// Creation DeviceDesc. The INF overwrites it; [`PAD_INDEX_VALUE`] is the durable marker.
 const DEVNODE_DESC: &str = "Punktfunk Pad Audio";
-/// The multi-instancing Steam Remote Play render driver we ride on.
 const SSS_HWID: &str = "ROOT\\SteamStreamingSpeakers";
-/// Registry value under the devnode's `Device Parameters` key persisting which pad slot the
-/// devnode serves (REG_DWORD). pub(crate): the uninstall sweep
-/// ([`devnode_cleanup`](super::devnode_cleanup)) matches devnodes on it.
+/// Devnode `Device Parameters` slot (REG_DWORD). The uninstall sweep matches on it.
 pub(crate) const PAD_INDEX_VALUE: &str = "PunktfunkPadIndex";
-/// The endpoint store for render endpoints (each subkey = one endpoint GUID).
 pub(crate) const MMDEV_RENDER_PATH: &str =
     r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render";
-/// The capture-direction sibling of [`MMDEV_RENDER_PATH`] — where a paired device's microphone
-/// half registers (the `audio-probe` devtest's S3 lookup).
 pub(crate) const MMDEV_CAPTURE_PATH: &str =
     r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture";
-/// WASAPI endpoint-id prefix for render endpoints (`{0.0.0.00000000}.{guid}`).
 const ENDPOINT_ID_PREFIX: &str = "{0.0.0.00000000}.";
-/// …and for CAPTURE endpoints, whose ids carry `{0.0.1.…}` (measured: the enumeration returns
-/// this form, and an id built with the render prefix never string-matches it — the minted
-/// mic's capture side resolved to nothing until this was split).
+/// Capture ids use `{0.0.1.…}`. A render prefix never string-matches, so the
+/// minted mic's capture side resolves to nothing.
 const CAPTURE_ENDPOINT_ID_PREFIX: &str = "{0.0.1.00000000}.";
-/// How long [`ensure`] waits for the new render endpoint to materialise after driver install.
+/// Audiosrv registers the endpoint asynchronously after driver install.
 const ENDPOINT_WAIT: Duration = Duration::from_secs(10);
-/// How many times [`ensure`] re-stamps before giving up and asking for an AudioEndpointBuilder
-/// kick (AEB reverts the format keys behind a fresh endpoint — see the loop in [`ensure`]).
+/// AEB reverts format keys on a fresh endpoint; [`ensure`] re-stamps this many
+/// times before asking for an AEB kick.
 const STAMP_ATTEMPTS: usize = 5;
-/// How long to let AudioEndpointBuilder settle after a stamp BEFORE checking whether it held.
-/// Checking immediately always reports success, including on the passes that get reverted.
+/// AEB settle after a stamp. An immediate check reports success even on passes that get reverted.
 const STAMP_SETTLE: Duration = Duration::from_millis(1200);
 
-/// One provisioned pad-audio endpoint. Persistent by design (endpoints survive host restarts);
-/// [`remove`] exists for tests + the `pad-endpoint remove` escape hatch only.
+/// One provisioned pad-audio endpoint. Persistent across host restarts;
+/// [`remove`] is tests and the `pad-endpoint remove` hatch only.
 #[derive(Debug, Clone)]
 pub struct PadEndpoint {
-    /// Full WASAPI endpoint id (`{0.0.0.00000000}.{guid}`) — what [`PadLoopbackCapturer::open`]
-    /// takes. Empty only from [`find`] when the devnode exists but the endpoint never
-    /// registered (driver install incomplete).
+    /// WASAPI id. Empty from [`find`] when the devnode exists but the endpoint never registered.
     pub endpoint_id: String,
-    /// PnP device instance id of the devnode (`ROOT\MEDIA\00NN`).
     pub device_instance: String,
-    /// The pad slot this endpoint serves — byte 23 of the stamped container GUID.
+    /// Byte 23 of the stamped container GUID.
     pub pad_index: u8,
-    /// True when at least one stamp is STORED but not SERVED: the audio stack must restart
-    /// (AudioEndpointBuilder + Audiosrv) before games see the DualSense identity. Never acted
-    /// on mid-flight — host startup may do ONE restart before any session exists
-    /// ([`provision_at_startup`]); everyone else just reads the flag.
+    /// Stamp stored but not served: AudioEndpointBuilder + Audiosrv must restart.
+    /// Startup may do one restart; nobody else acts on this mid-flight.
     pub needs_aeb_kick: bool,
 }
 
-// --- the stamp set -------------------------------------------------------------------------
-
-/// One endpoint property to stamp: the property-store key, the value, a short log label.
-/// pub(crate): the minted-audio provider stamps its endpoint names through the same machinery
-/// (store-first, registry fallback, served-check) — see [`write_stamps`].
+/// One property-store key to stamp. Shared with the minted-audio provider via [`write_stamps`].
 pub(crate) struct Stamp {
     pub(crate) label: &'static str,
     pub(crate) key: PROPERTYKEY,
@@ -147,9 +104,9 @@ pub(crate) struct Stamp {
 
 pub(crate) enum StampValue {
     Str(&'static str),
-    /// The PFDS container (VT_CLSID / serialized-CLSID registry blob).
+    /// PFDS container (VT_CLSID / serialized-CLSID registry blob).
     Container(GUID),
-    /// A `WAVEFORMATEXTENSIBLE` (VT_BLOB / serialized-blob registry value).
+    /// `WAVEFORMATEXTENSIBLE` (VT_BLOB / serialized-blob registry value).
     Format(&'static [u8; 40]),
 }
 
@@ -160,25 +117,24 @@ const fn pkey(fmtid: u128, pid: u32) -> PROPERTYKEY {
     }
 }
 
-/// `PKEY_Device_DeviceDesc` — the "description" half of the endpoint display name.
+/// Description half of the endpoint display name.
 pub(crate) const PKEY_DEVICE_DESC: PROPERTYKEY = pkey(0xa45c254e_df1c_4efd_8020_67d146a850e0, 2);
-/// Endpoint-store "device name" half of the display name.
+/// Device-name half of the display name.
 pub(crate) const PKEY_ENDPOINT_DEVICE_NAME: PROPERTYKEY =
     pkey(0xb3f8fa53_0004_438e_9003_51a46e139bfc, 6);
-/// Endpoint-store devnode link: `"{1}.<device instance id>"` — how an endpoint is tied back to
-/// the devnode that owns it.
+/// Endpoint-store devnode link: `"{1}.<device instance id>"`.
 const PKEY_ENDPOINT_DEVNODE: PROPERTYKEY = pkey(0xb3f8fa53_0004_438e_9003_51a46e139bfc, 2);
-/// `PKEY_Device_ContainerId` — what games match against the pad's HID container.
+/// What games match against the pad's HID container.
 const PKEY_CONTAINER_ID: PROPERTYKEY = pkey(0x8c7ed206_3f8a_4827_b3ab_ae9e1faefc6c, 2);
-/// `PKEY_AudioEngine_DeviceFormat` (16-bit PCM leg of the format set).
+/// 16-bit PCM leg of the format set.
 pub(crate) const PKEY_DEVICE_FORMAT: PROPERTYKEY = pkey(0xf19f064d_082c_4e27_bc73_6882a1bb8e4c, 0);
-/// Endpoint format pair (float leg) — pids 2 and 3 of the same fmtid.
+/// Float-leg format pair — pids 2 and 3 of the same fmtid.
 pub(crate) const PKEY_MIX_FORMAT_2: PROPERTYKEY = pkey(0x3d6e1656_2e50_4c4c_8d85_d0acae3c6c68, 2);
 pub(crate) const PKEY_MIX_FORMAT_3: PROPERTYKEY = pkey(0x3d6e1656_2e50_4c4c_8d85_d0acae3c6c68, 3);
 /// Host processing format (float leg).
 pub(crate) const PKEY_HOST_FORMAT: PROPERTYKEY = pkey(0xe4870e26_3cc5_4cd2_ba46_ca0a9a70ed04, 0);
 
-/// `WAVEFORMATEXTENSIBLE`: 4 ch / 48 kHz / 16-bit PCM, mask 0x33 (FL FR BL BR), PCM subtype.
+/// 4 ch / 48 kHz / 16-bit PCM, mask 0x33 (FL FR BL BR), PCM subtype.
 const WFX_PCM16_4CH_48K: [u8; 40] = [
     0xfe, 0xff, // wFormatTag = WAVE_FORMAT_EXTENSIBLE
     0x04, 0x00, // nChannels = 4
@@ -192,7 +148,7 @@ const WFX_PCM16_4CH_48K: [u8; 40] = [
     0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b,
     0x71, // KSDATAFORMAT_SUBTYPE_PCM
 ];
-/// `WAVEFORMATEXTENSIBLE`: 4 ch / 48 kHz / 32-bit float, mask 0x33, IEEE-float subtype.
+/// 4 ch / 48 kHz / 32-bit float, mask 0x33, IEEE-float subtype.
 const WFX_F32_4CH_48K: [u8; 40] = [
     0xfe, 0xff, // wFormatTag = WAVE_FORMAT_EXTENSIBLE
     0x04, 0x00, // nChannels = 4
@@ -207,14 +163,14 @@ const WFX_F32_4CH_48K: [u8; 40] = [
     0x71, // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
 ];
 
-/// The deterministic per-pad container GUID — identical to pf-inject's
-/// `GUID::from_values(container_tag, 0, 0, [0,0,0,0,0,0,0,index])` for the DualSense family.
+/// Per-pad container GUID — identical to pf-inject's DualSense
+/// `GUID::from_values(container_tag, 0, 0, [0,0,0,0,0,0,0,index])`.
 pub(crate) fn pfds_container_guid(pad_index: u8) -> GUID {
     GUID::from_values(PFDS_TAG, 0, 0, [0, 0, 0, 0, 0, 0, 0, pad_index])
 }
 
-/// The MINIMAL stamp set — nothing more (hardware-id/devicepath writes make
-/// AudioEndpointBuilder delete + re-mint the endpoint under a new GUID).
+/// Minimal stamp set. Hardware-id or devicepath writes make AudioEndpointBuilder
+/// delete the endpoint and remint it under a new GUID.
 fn stamps_for(pad_index: u8) -> [Stamp; 7] {
     [
         Stamp {
@@ -255,14 +211,13 @@ fn stamps_for(pad_index: u8) -> [Stamp; 7] {
     ]
 }
 
-/// The stamps to actually apply, honouring the `PUNKTFUNK_PAD_AUDIO_STAMPS` bisect hook.
+/// Stamps to apply, honouring `PUNKTFUNK_PAD_AUDIO_STAMPS`.
 ///
-/// Unset (the shipping path) means all seven. Set to a comma-separated list of labels — e.g.
-/// `desc,name,container` — and only those are written or checked. This exists because a fully
-/// stamped endpoint cannot be opened at all (`IAudioClient::Initialize` → `AUDCLNT_E_UNSUPPORTED
-/// _FORMAT` for EVERY format, including its own mix format) while a bare one opens fine, and the
-/// MMDevices ACL blocks editing the values directly — so the only way to find the poison stamp is
-/// to re-provision with subsets.
+/// Unset means all seven. Set to a comma-separated label list and only those
+/// are written. A fully stamped endpoint fails `IAudioClient::Initialize` with
+/// `AUDCLNT_E_UNSUPPORTED_FORMAT` for every format including its own mix
+/// format; a bare one opens. MMDevices ACL blocks editing in place, so the
+/// poison stamp is found by re-provisioning subsets.
 fn active_stamps(pad_index: u8) -> Vec<Stamp> {
     let all = stamps_for(pad_index);
     match std::env::var("PUNKTFUNK_PAD_AUDIO_STAMPS") {
@@ -274,14 +229,10 @@ fn active_stamps(pad_index: u8) -> Vec<Stamp> {
     }
 }
 
-// --- small encoding helpers ----------------------------------------------------------------
-
-/// NUL-terminated UTF-16.
 pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// REG_MULTI_SZ bytes (UTF-16LE, item NULs + terminating NUL).
 fn multi_sz_bytes(items: &[&str]) -> Vec<u8> {
     let mut units: Vec<u16> = items
         .iter()
@@ -291,12 +242,10 @@ fn multi_sz_bytes(items: &[&str]) -> Vec<u8> {
     units.iter().flat_map(|u| u.to_le_bytes()).collect()
 }
 
-/// REG_SZ bytes (UTF-16LE incl. the NUL).
 fn sz_bytes(s: &str) -> Vec<u8> {
     wide(s).iter().flat_map(|u| u.to_le_bytes()).collect()
 }
 
-/// Lowercase registry spelling of a GUID (no braces).
 fn guid_str(g: &GUID) -> String {
     format!(
         "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
@@ -314,13 +263,13 @@ fn guid_str(g: &GUID) -> String {
     )
 }
 
-/// The registry value name MMDevices uses for a property key: `"{fmtid},pid"`.
+/// MMDevices property-key name: `"{fmtid},pid"`.
 fn reg_value_name(k: &PROPERTYKEY) -> String {
     format!("{{{}}},{}", guid_str(&k.fmtid), k.pid)
 }
 
-/// GUID in registry byte order (Data1/2/3 little-endian, Data4 as-is) — byte 23 of the full
-/// serialized container blob ends up being the pad index.
+/// Registry byte order (Data1/2/3 LE, Data4 as-is). Byte 23 of the serialized
+/// container blob is the pad index.
 fn guid_registry_bytes(g: &GUID) -> [u8; 16] {
     let mut out = [0u8; 16];
     out[..4].copy_from_slice(&g.data1.to_le_bytes());
@@ -330,9 +279,8 @@ fn guid_registry_bytes(g: &GUID) -> [u8; 16] {
     out
 }
 
-/// The stamped value in the endpoint store's on-disk shape: strings are plain REG_SZ;
-/// container + formats are serialized PROPVARIANTs (8-byte header `vt, 0x00000001`, then the
-/// payload) as REG_BINARY.
+/// On-disk shape: strings are REG_SZ; container and formats are serialized
+/// PROPVARIANTs (8-byte header `vt, 0x00000001`, then payload) as REG_BINARY.
 fn reg_registry_value(v: &StampValue) -> winreg::RegValue<'static> {
     use winreg::enums::{REG_BINARY, REG_SZ};
     match v {
@@ -359,9 +307,8 @@ fn reg_registry_value(v: &StampValue) -> winreg::RegValue<'static> {
     }
 }
 
-/// The per-endpoint GUID portion of a WASAPI endpoint id (`{0.0.0.00000000}.{guid}` →
-/// `{guid}`) — the endpoint's MMDevices registry key name. pub(crate): the uninstall sweep
-/// deletes those keys by name.
+/// WASAPI id `{0.0.0.00000000}.{guid}` → `{guid}` (MMDevices key name).
+/// The uninstall sweep deletes keys by this.
 pub(crate) fn endpoint_guid_part(endpoint_id: &str) -> Result<&str> {
     endpoint_id
         .rfind('{')
@@ -370,17 +317,12 @@ pub(crate) fn endpoint_guid_part(endpoint_id: &str) -> Result<&str> {
         .ok_or_else(|| anyhow!("unrecognised endpoint id shape: {endpoint_id}"))
 }
 
-// --- PROPVARIANT plumbing -------------------------------------------------------------------
-//
-// ⚠ `windows 0.62` DOES implement `Drop for PROPVARIANT`, as `PropVariantClear(self)`. Every
-// variant below points at memory Rust owns — a `Vec<u16>`, a borrowed `&GUID`, a `&'static
-// [u8]` — so letting one drop hands that pointer to `CoTaskMemFree` and corrupts the heap. The
-// symptom is not local: provisioning died later with STATUS_HEAP_CORRUPTION (0xC0000374),
-// leaving the endpoint half-stamped, which then looked like a stamping-permissions problem.
-// Hence `ManuallyDrop`: these variants borrow, so nothing must ever clear them. (Variants that
-// come back OWNED from `GetValue` are a different matter and ARE cleared, in `stamp_served`.)
+// `windows 0.62` Drop for PROPVARIANT is PropVariantClear. These variants
+// borrow Rust-owned memory (Vec<u16>, &GUID, &'static [u8]); a drop would
+// CoTaskMemFree it. ManuallyDrop: never clear borrows. GetValue-owned
+// variants ARE cleared, in `stamp_served`.
 
-/// A `VT_LPWSTR` variant borrowing `w`, which must outlive it and stay NUL-terminated.
+/// `VT_LPWSTR` borrowing `w`, which must outlive it and stay NUL-terminated.
 fn pv_lpwstr(w: &[u16]) -> ManuallyDrop<PROPVARIANT> {
     ManuallyDrop::new(PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
@@ -397,7 +339,7 @@ fn pv_lpwstr(w: &[u16]) -> ManuallyDrop<PROPVARIANT> {
     })
 }
 
-/// A `VT_CLSID` variant borrowing `g`, which must outlive it.
+/// `VT_CLSID` borrowing `g`, which must outlive it.
 fn pv_clsid(g: &GUID) -> ManuallyDrop<PROPVARIANT> {
     ManuallyDrop::new(PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
@@ -414,7 +356,7 @@ fn pv_clsid(g: &GUID) -> ManuallyDrop<PROPVARIANT> {
     })
 }
 
-/// A `VT_BLOB` variant borrowing `b`, which must outlive it.
+/// `VT_BLOB` borrowing `b`, which must outlive it.
 fn pv_blob(b: &[u8]) -> ManuallyDrop<PROPVARIANT> {
     ManuallyDrop::new(PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
@@ -452,7 +394,7 @@ fn pv_string(pv: &PROPVARIANT) -> Option<String> {
 }
 
 fn pv_guid(pv: &PROPVARIANT) -> Option<GUID> {
-    // SAFETY: as in `pv_string` — puuid is only dereferenced when vt == VT_CLSID and non-null.
+    // SAFETY: puuid is only dereferenced when vt == VT_CLSID and non-null.
     unsafe {
         let inner = &pv.Anonymous.Anonymous;
         if inner.vt != VT_CLSID {
@@ -467,8 +409,8 @@ fn pv_guid(pv: &PROPVARIANT) -> Option<GUID> {
 }
 
 fn pv_bytes(pv: &PROPVARIANT) -> Option<Vec<u8>> {
-    // SAFETY: as in `pv_string` — the blob pointer/length pair is only read when vt == VT_BLOB
-    // and the pointer is non-null; the variant owns cbSize bytes there.
+    // SAFETY: the blob pointer/length pair is only read when vt == VT_BLOB and
+    // the pointer is non-null; the variant owns cbSize bytes there.
     unsafe {
         let inner = &pv.Anonymous.Anonymous;
         if inner.vt != VT_BLOB {
@@ -482,9 +424,6 @@ fn pv_bytes(pv: &PROPVARIANT) -> Option<Vec<u8>> {
     }
 }
 
-// --- devnode management (SetupAPI) ----------------------------------------------------------
-
-/// Owns an HDEVINFO and destroys it on drop.
 pub(crate) struct DevInfoSet(pub(crate) HDEVINFO);
 impl Drop for DevInfoSet {
     fn drop(&mut self) {
@@ -526,7 +465,6 @@ pub(crate) fn instance_id(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<Str
     Some(String::from_utf16_lossy(&buf[..len]))
 }
 
-/// A REG_MULTI_SZ SetupDi registry property (e.g. SPDRP_HARDWAREID) as strings.
 pub(crate) fn devnode_multi_sz_prop(
     set: &DevInfoSet,
     did: &SP_DEVINFO_DATA,
@@ -553,8 +491,7 @@ pub(crate) fn devnode_multi_sz_prop(
         .collect()
 }
 
-/// The devnode's installed-driver INF filename (`DEVPKEY_Device_DriverInfPath`, e.g.
-/// `oem32.inf`) — absent on a devnode whose driver never installed.
+/// Installed-driver INF (`DEVPKEY_Device_DriverInfPath`). Absent if the driver never installed.
 pub(crate) fn devnode_inf_path(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
     let mut ty = DEVPROPTYPE(0);
     let mut buf = vec![0u8; 1024];
@@ -584,9 +521,7 @@ pub(crate) fn devnode_inf_path(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Optio
     (len > 0).then(|| String::from_utf16_lossy(&units[..len]))
 }
 
-/// Read a REG_DWORD from a devnode's `Device Parameters` key — the durable owner-marker
-/// mechanism every punktfunk-minted devnode family uses (pad slot, minted-audio role, probe
-/// marker). `None`: no key, no value, or wrong type — a foreign devnode.
+/// REG_DWORD from `Device Parameters`. `None` = no key, no value, or wrong type — foreign.
 pub(crate) fn read_devparam_dword(
     set: &DevInfoSet,
     did: &SP_DEVINFO_DATA,
@@ -627,8 +562,7 @@ pub(crate) fn read_devparam_dword(
     (rc.is_ok() && ty == REG_DWORD && len == 4).then(|| u32::from_le_bytes(data))
 }
 
-/// Write a REG_DWORD into a devnode's `Device Parameters` key, creating the key on a fresh
-/// devnode — the write side of [`read_devparam_dword`].
+/// Write side of [`read_devparam_dword`]; creates the key on a fresh devnode.
 pub(crate) fn write_devparam_dword(
     set: &DevInfoSet,
     did: &mut SP_DEVINFO_DATA,
@@ -682,14 +616,11 @@ pub(crate) fn write_devparam_dword(
     rc.ok().with_context(|| format!("write {value_name}"))
 }
 
-/// The persisted pad slot of a devnode (the `PunktfunkPadIndex` value under its
-/// `Device Parameters` key), or `None` for foreign devnodes.
 fn devnode_pad_index(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<u32> {
     read_devparam_dword(set, did, PAD_INDEX_VALUE)
 }
 
-/// Find the devnode previously created for `pad_index` (see the module doc: the persisted
-/// index value is the durable marker; DeviceDesc only survives until the INF installs).
+/// Find the devnode for `pad_index`. DeviceDesc only survives until the INF installs.
 fn find_devnode(pad_index: u8) -> Result<Option<String>> {
     let set = media_class_devs()?;
     for i in 0.. {
@@ -711,11 +642,9 @@ fn find_devnode(pad_index: u8) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// Create + register a fresh MEDIA-class root devnode carrying `hwid`, then let `mark` write
-/// the caller's durable owner marker into its `Device Parameters` key (DeviceDesc only
-/// survives until the INF installs — see the module doc). Shared by the pad provisioner and
-/// the `audio-probe` devtest: the first slice of the shared minting surface the
-/// audio-substrate design (`windows-audio-endpoints-and-vbcable.md` §C1) extracts.
+/// Create + register a MEDIA-class root devnode carrying `hwid`, then `mark`
+/// writes the durable owner marker. DeviceDesc only survives until the INF
+/// installs. Shared by the pad provisioner and the `audio-probe` devtest.
 pub(crate) fn create_media_devnode(
     desc: &str,
     hwid: &str,
@@ -745,9 +674,8 @@ pub(crate) fn create_media_devnode(
     // SAFETY: live set + element; the multi-sz property bytes travel with the slice.
     unsafe { SetupDiSetDeviceRegistryPropertyW(set.0, &mut did, SPDRP_HARDWAREID, Some(&hwid)) }
         .context("set SPDRP_HARDWAREID")?;
-    // NOT SetupDiCallClassInstaller(DIF_REGISTERDEVICE): that requires an interactive window
-    // station and fails with error 1459 from a service. Plain registration is all a root
-    // devnode needs before UpdateDriverForPlugAndPlayDevices binds the driver.
+    // NOT SetupDiCallClassInstaller(DIF_REGISTERDEVICE): needs an interactive
+    // window station and fails with 1459 from a service.
     // SAFETY: live set + element; no compare callback.
     unsafe { SetupDiRegisterDeviceInfo(set.0, &mut did, 0, None, None, None) }
         .context("SetupDiRegisterDeviceInfo")?;
@@ -755,8 +683,6 @@ pub(crate) fn create_media_devnode(
     instance_id(&set, &did).context("read the new devnode's instance id")
 }
 
-/// Create + register a fresh MEDIA-class root devnode carrying the Steam Streaming Speakers
-/// hardware id, and persist the pad slot in its `Device Parameters` key.
 fn create_devnode(pad_index: u8) -> Result<String> {
     let inst = create_media_devnode(DEVNODE_DESC, SSS_HWID, |set, did| {
         write_pad_index(set, did, pad_index)
@@ -765,15 +691,12 @@ fn create_devnode(pad_index: u8) -> Result<String> {
     Ok(inst)
 }
 
-/// Persist `pad_index` in the devnode's `Device Parameters` key (created on a fresh devnode).
 fn write_pad_index(set: &DevInfoSet, did: &mut SP_DEVINFO_DATA, pad_index: u8) -> Result<()> {
     write_devparam_dword(set, did, PAD_INDEX_VALUE, pad_index as u32)
 }
 
-/// The Steam Streaming Speakers INF to feed `UpdateDriverForPlugAndPlayDevices`: prefer the
-/// INSTALLED driver's `oemNN.inf` (via `DEVPKEY_Device_DriverInfPath` on any devnode already
-/// bound to the SSS hwid — Steam's own SSS devnode, or a pad devnode from an earlier run);
-/// fall back to Steam's driver directory when no bound devnode exists yet.
+/// Prefer the installed driver's `oemNN.inf` on any SSS-bound devnode; fall
+/// back to Steam's driver directory when none exists yet.
 fn resolve_sss_inf() -> Result<String> {
     let set = media_class_devs()?;
     for i in 0.. {
@@ -809,8 +732,8 @@ fn resolve_sss_inf() -> Result<String> {
     )
 }
 
-/// Bind `inf` to every unbound devnode carrying `hwid`. Idempotent: "nothing needed an
-/// update" is success. Shared with the `audio-probe` devtest (§C1 minting surface).
+/// Bind `inf` to every unbound devnode carrying `hwid`. Idempotent: nothing
+/// needed an update is success. Shared with the `audio-probe` devtest.
 pub(crate) fn bind_driver(hwid: &str, inf: &str) -> Result<()> {
     let inf_w = wide(inf);
     let hwid_w = wide(hwid);
@@ -830,8 +753,8 @@ pub(crate) fn bind_driver(hwid: &str, inf: &str) -> Result<()> {
             tracing::info!(hwid = %hwid, inf = %inf, "bound the driver to the unbound devnode(s)");
             Ok(())
         }
-        // ERROR_NO_MORE_ITEMS (0x80070103): every matching devnode already runs this (or a
-        // better) driver — the idempotent-reissue case, not a failure.
+        // ERROR_NO_MORE_ITEMS (0x80070103): every matching devnode already runs
+        // this (or a better) driver — idempotent reissue, not a failure.
         Err(e) if e.code().0 as u32 == 0x8007_0103 => Ok(()),
         Err(e) => {
             Err(anyhow!(e)).with_context(|| format!("UpdateDriverForPlugAndPlayDevices({inf})"))
@@ -839,23 +762,17 @@ pub(crate) fn bind_driver(hwid: &str, inf: &str) -> Result<()> {
     }
 }
 
-/// Bind the SSS driver to every unbound devnode carrying its hardware id (i.e. the pad
-/// devnodes just created). Idempotent: "nothing needed an update" is success.
 fn install_sss_driver() -> Result<()> {
     bind_driver(SSS_HWID, &resolve_sss_inf()?)
 }
 
-// --- endpoint discovery + stamping ----------------------------------------------------------
-
-/// The render endpoint owned by `instance_id`, identified through the endpoint store's devnode
-/// link (`"{1}.<instance id>"` under `…\MMDevices\Audio\Render\{ep}\Properties`).
+/// Render endpoint owned by `instance_id`, via the store's `"{1}.<instance id>"` link.
 pub(crate) fn find_endpoint_for_devnode(instance_id: &str) -> Result<Option<String>> {
     endpoint_for_devnode_in(MMDEV_RENDER_PATH, ENDPOINT_ID_PREFIX, instance_id)
 }
 
-/// The CAPTURE endpoint owned by `instance_id` — the microphone half of a paired device like
-/// the Steam Streaming Microphone. Pad devices are render-only; the minted-audio provider and
-/// the `audio-probe` devtest need this direction.
+/// Capture endpoint owned by `instance_id`. Pad devices are render-only; the
+/// minted-audio provider and the `audio-probe` devtest need this direction.
 pub(crate) fn find_capture_endpoint_for_devnode(instance_id: &str) -> Result<Option<String>> {
     endpoint_for_devnode_in(MMDEV_CAPTURE_PATH, CAPTURE_ENDPOINT_ID_PREFIX, instance_id)
 }
@@ -885,7 +802,7 @@ fn endpoint_for_devnode_in(
     Ok(None)
 }
 
-/// Poll for the endpoint after driver install (audiosrv registers it asynchronously).
+/// Poll after driver install; audiosrv registers the endpoint asynchronously.
 fn wait_for_endpoint(instance_id: &str) -> Result<String> {
     let deadline = Instant::now() + ENDPOINT_WAIT;
     loop {
@@ -915,32 +832,17 @@ fn open_mmdevice(endpoint_id: &str) -> Result<IMMDevice> {
     }
 }
 
-/// Open a [`wasapi::Device`] for an endpoint id WITHOUT the crate's `DeviceEnumerator::get_device`.
-///
-/// Through `wasapi 0.23` that call built its argument as
-/// `PCWSTR::from_raw(HSTRING::from(device_id).as_ptr())`. The `HSTRING` was a temporary, so it was
-/// dropped at the end of THAT statement and `IMMDeviceEnumerator::GetDevice` read freed memory on
-/// the next line. Whether the endpoint was found then depended on what the allocator happened to
-/// leave behind — a heisenbug whose failure mode is `0x80070002` (ERROR_FILE_NOT_FOUND) for an id
-/// that is perfectly valid. **`wasapi 0.24` fixed this upstream** (the `HSTRING` is now bound to a
-/// local that outlives the call), so this helper is no longer load-bearing for correctness.
-///
-/// We still resolve here, because the `IMMDevice` is wanted in its own right: [`probe_activation`]
-/// and the property-store readers below need the raw interface, so routing every lookup through
-/// [`open_mmdevice`] keeps ONE resolution path whose errors name the endpoint id.
+/// Wrap [`open_mmdevice`] as a [`wasapi::Device`]. One resolution path so
+/// errors name the endpoint id; the raw `IMMDevice` is also what
+/// [`probe_activation`] and the property-store readers need.
 pub(crate) fn open_wasapi_device(endpoint_id: &str) -> Result<wasapi::Device> {
     let dev = open_mmdevice(endpoint_id)?;
     wasapi::Device::from_immdevice(dev)
         .map_err(|e| anyhow!("wrap IMMDevice {endpoint_id} as a wasapi Device: {e}"))
 }
 
-/// Log whether this endpoint can be activated IN THIS PROCESS, at both layers.
-///
-/// The whole pad-audio bring-up stalled on an `IAudioClient: 0x80070002` that named no layer: the
-/// endpoint resolved, the property store opened, and only activation failed — which is equally
-/// consistent with a dead endpoint, a process that cannot activate anything, and a bad argument
-/// handed to the COM call. Reporting the raw `IMMDevice::Activate` result next to the crate's
-/// tells them apart in one run instead of one rebuild each.
+/// Log raw `IMMDevice::Activate` vs crate wrap, so a `0x80070002` names
+/// the layer (dead endpoint, process cannot activate, bad argument).
 fn probe_activation(endpoint_id: &str) {
     match open_mmdevice(endpoint_id) {
         Err(e) => tracing::error!(endpoint = %endpoint_id, error = %format!("{e:#}"),
@@ -959,7 +861,6 @@ fn probe_activation(endpoint_id: &str) {
     }
 }
 
-/// Does the property store SERVE this stamp's value right now?
 fn stamp_served(store: &IPropertyStore, s: &Stamp) -> bool {
     // SAFETY: the key is a valid PROPERTYKEY; GetValue returns an owned variant that is
     // cleared below, exactly once.
@@ -1000,17 +901,12 @@ fn set_store_value(store: &IPropertyStore, s: &Stamp) -> Result<()> {
     Ok(())
 }
 
-/// Write the still-missing stamps: IPropertyStore first (audiosrv notices immediately, no
-/// restart), raw registry for whatever it rejects. Idempotent — already-served keys are
-/// skipped entirely.
 fn stamp_endpoint(endpoint_id: &str, pad_index: u8) -> Result<()> {
     write_stamps(endpoint_id, &active_stamps(pad_index))
 }
 
-/// The generic stamp writer behind [`stamp_endpoint`], shared with the minted-audio provider
-/// (which stamps "Punktfunk Speakers/Microphone" names — field-measured necessity: without
-/// them even the box's owner could not tell the minted instances from Steam's primaries in
-/// the Sound settings zoo).
+/// Stamp writer: IPropertyStore first (audiosrv notices immediately), registry
+/// for rejects. Already-served keys are skipped. Shared with minted-audio.
 pub(crate) fn write_stamps(endpoint_id: &str, stamps: &[Stamp]) -> Result<()> {
     let dev = open_mmdevice(endpoint_id)?;
     let pending: Vec<&Stamp> = {
@@ -1041,8 +937,8 @@ pub(crate) fn write_stamps(endpoint_id: &str, stamps: &[Stamp]) -> Result<()> {
             if !via_store.is_empty() {
                 // SAFETY: committing the writes above on the same store/thread.
                 if let Err(e) = unsafe { rw.Commit() } {
-                    // A failed commit may have dropped every store-side write — re-route them
-                    // all through the registry rather than trust half a stamp.
+                    // A failed commit may have dropped every store-side write —
+                    // re-route all pending through the registry, not half a stamp.
                     tracing::debug!(error = %format!("{e:#}"),
                         "IPropertyStore::Commit failed — registry route for all pending stamps");
                     via_store.clear();
@@ -1068,14 +964,11 @@ pub(crate) fn write_stamps(endpoint_id: &str, stamps: &[Stamp]) -> Result<()> {
     Ok(())
 }
 
-/// MEASURED ACL trap (on-glass 2026-08-01): `…\MMDevices\Audio\Render\{ep}\Properties` denies
-/// writes even to SYSTEM — SYSTEM is the key OWNER but the DACL carries no write ACE for it.
-/// The owner's IMPLICIT right to WRITE_DAC still applies, so: open with
-/// READ_CONTROL|WRITE_DAC, append a FullControl ACE for S-1-5-18, write the DACL back.
-/// Principals are resolved BY SID (a well-known-SID build), never by name — account-name
-/// lookups like "BUILTIN\Administrators" fail to translate on localized (e.g. German) Windows.
-/// Works when running as SYSTEM (the production host service); a dev run fails here and the
-/// caller degrades with the error.
+/// MMDevices `…\Properties` denies writes even to SYSTEM: SYSTEM owns the
+/// key but the DACL has no write ACE. Open with READ_CONTROL|WRITE_DAC
+/// (owner-implicit), append a FullControl ACE for S-1-5-18, write the DACL
+/// back. Resolve principals by SID, never by name — localized Windows
+/// fails account-name lookups. Works as SYSTEM; a dev run fails here.
 fn grant_system_full_control(subkey_path: &str) -> Result<()> {
     use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
     use windows::Win32::Security::Authorization::{
@@ -1192,9 +1085,8 @@ fn grant_system_full_control(subkey_path: &str) -> Result<()> {
     result
 }
 
-/// The MMDevices hive an endpoint's record lives in, chosen by the direction its id encodes
-/// (`{0.0.1.…}` = capture, anything else = render). Render is the safe default: it is what every
-/// non-capture id resolves to, and the pad program only ever has render endpoints.
+/// MMDevices hive from the id (`{0.0.1.…}` = capture, else render). Render is
+/// the safe default: every non-capture id, and all pad endpoints, live there.
 fn mmdev_path_for(endpoint_id: &str) -> &'static str {
     if endpoint_id.starts_with(CAPTURE_ENDPOINT_ID_PREFIX) {
         MMDEV_CAPTURE_PATH
@@ -1203,20 +1095,14 @@ fn mmdev_path_for(endpoint_id: &str) -> &'static str {
     }
 }
 
-/// The raw-registry stamp route: repair the Properties key ACL, then write the serialized
-/// values (see [`reg_registry_value`]). Values written here are STORED but possibly not
-/// SERVED until an AudioEndpointBuilder restart — the caller's read-back decides.
+/// Registry stamp route: repair the Properties ACL, then write serialized
+/// values. Stored, possibly not served until an AEB restart — caller reads back.
 fn registry_stamp(endpoint_id: &str, stamps: &[&Stamp]) -> Result<()> {
     use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
     let guid = endpoint_guid_part(endpoint_id)?;
-    // The hive follows the endpoint's DIRECTION. This was hardcoded to Render, which is
-    // invisible for the pad program (its endpoints are render-only) but wrong for the minted
-    // provider, which stamps the virtual microphone's CAPTURE endpoint through the same
-    // writer: the fallback then reached for `…\Render\{capture-guid}\Properties`, a key that
-    // cannot exist, so every registry-route stamp of a capture endpoint failed on a box where
-    // the property store was denied — silently, since the caller degrades to "keeps the
-    // driver's default name".
+    // Hive follows direction. Hardcoding Render made the minted mic's capture
+    // fallback stamp a non-existent `…\Render\{capture-guid}\Properties`.
     let path = format!(r"{}\{guid}\Properties", mmdev_path_for(endpoint_id));
     grant_system_full_control(&path)
         .with_context(|| format!("make {path} writable (registry stamp route)"))?;
@@ -1230,14 +1116,13 @@ fn registry_stamp(endpoint_id: &str, stamps: &[&Stamp]) -> Result<()> {
     Ok(())
 }
 
-/// True when EVERY stamp reads back — through a fresh property store — with the stamped value,
-/// i.e. the audio stack SERVES the identity rather than merely storing it. Any error counts as
-/// "not served" (the only consumer is the needs-AEB-kick decision).
+/// Fresh property store reads back every stamp: served, not merely stored.
+/// Any error is "not served" (feeds the needs-AEB-kick decision).
 fn all_served(endpoint_id: &str, pad_index: u8) -> bool {
     stamps_served(endpoint_id, &active_stamps(pad_index))
 }
 
-/// [`all_served`]'s generic body — shared with the minted-audio provider.
+/// Shared with the minted-audio provider.
 pub(crate) fn stamps_served(endpoint_id: &str, stamps: &[Stamp]) -> bool {
     let Ok(dev) = open_mmdevice(endpoint_id) else {
         return false;
@@ -1249,13 +1134,9 @@ pub(crate) fn stamps_served(endpoint_id: &str, stamps: &[Stamp]) -> bool {
     stamps.iter().all(|s| stamp_served(&store, s))
 }
 
-// --- public provisioning API ----------------------------------------------------------------
-
-/// Idempotently provision the pad-audio endpoint for one pad slot: reuse (or create) the
-/// devnode, bind the Steam Streaming Speakers driver, wait for the endpoint, stamp the
-/// DualSense identity, and undo any default-playback flip onto the new endpoint. Called at
-/// host startup (pre-provisioning) — NOT per session. Must run on (or become) a
-/// COM-initialized thread; WASAPI objects never leave it.
+/// Idempotent pad-audio provision for one slot: reuse or create the devnode,
+/// bind SSS, wait, stamp DualSense identity, undo a default-playback flip.
+/// Host startup, not per session. COM thread; WASAPI objects never leave it.
 pub fn ensure(pad_index: u8) -> Result<PadEndpoint> {
     anyhow::ensure!(pad_index < 8, "pad index out of range (0..=7): {pad_index}");
     wasapi::initialize_mta()
@@ -1273,18 +1154,10 @@ pub fn ensure(pad_index: u8) -> Result<PadEndpoint> {
             wait_for_endpoint(&device_instance)?
         }
     };
-    // Stamp until it STAYS stamped. On a freshly created endpoint the write lands — a check run
-    // straight afterwards reports all seven served — and AudioEndpointBuilder then quietly reverts
-    // the three format keys behind us, leaving 4/7 for good. So the check has to happen after a
-    // settle, not immediately: verifying too early is exactly how this looked like "the stamps
-    // never took" for one debugging session and "the stamps took fine" for the next.
-    //
-    // Converging here matters beyond tidiness: `needs_aeb_kick` is what makes
-    // [`provision_at_startup`] restart AudioEndpointBuilder + Audiosrv, so latching the transient
-    // means bouncing the whole machine's audio stack on EVERY host start, forever, chasing stamps
-    // a re-pass would have landed. Once the endpoint has finished settling a re-stamp sticks
-    // permanently (measured stable over 30 s), and `stamp_endpoint` skips already-served keys, so
-    // the extra passes cost nothing once it has taken.
+    // Stamp until it stays. On a fresh endpoint the write lands, an immediate
+    // check reports served, then AEB reverts the three format keys. Check after
+    // STAMP_SETTLE. A false `needs_aeb_kick` restarts the machine audio stack
+    // on every host start.
     let mut served = false;
     for attempt in 0..STAMP_ATTEMPTS {
         stamp_endpoint(&endpoint_id, pad_index)
@@ -1302,9 +1175,8 @@ pub fn ensure(pad_index: u8) -> Result<PadEndpoint> {
             break;
         }
     }
-    // Default-device guard: a freshly registered render endpoint can grab the default. A pad
-    // "speaker" as default playback would swallow ALL desktop audio — put the previous default
-    // back via the IPolicyConfig machinery audio_control already owns.
+    // A freshly registered render endpoint can grab the default. A pad speaker
+    // as default swallows desktop audio — put the previous one back.
     if audio_control::default_render_id().as_deref() == Some(endpoint_id.as_str())
         && prev_default.as_deref() != Some(endpoint_id.as_str())
     {
@@ -1327,9 +1199,8 @@ pub fn ensure(pad_index: u8) -> Result<PadEndpoint> {
     })
 }
 
-/// Best-effort teardown by devnode removal (`pnputil /remove-device`). Not called in normal
-/// operation — endpoints are persistent by design; this backs tests and the
-/// `pad-endpoint remove` escape hatch.
+/// Best-effort teardown (`pnputil /remove-device`). Tests and the
+/// `pad-endpoint remove` hatch only; endpoints are persistent.
 pub fn remove(pe: &PadEndpoint) {
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
     let pnputil = format!(r"{windir}\System32\pnputil.exe");
@@ -1348,8 +1219,8 @@ pub fn remove(pe: &PadEndpoint) {
     }
 }
 
-/// Locate (never create) the provisioned state for a pad slot — the `status`/`remove` devtest
-/// path. `endpoint_id` is empty when the devnode exists but its endpoint never registered.
+/// Locate, never create. `endpoint_id` is empty when the devnode exists but
+/// the endpoint never registered.
 pub(crate) fn find(pad_index: u8) -> Result<Option<PadEndpoint>> {
     wasapi::initialize_mta()
         .ok()
@@ -1367,7 +1238,6 @@ pub(crate) fn find(pad_index: u8) -> Result<Option<PadEndpoint>> {
     }))
 }
 
-/// `pad-endpoint status` devtest body: devnode, endpoint, and per-stamp stored/served state.
 pub(crate) fn print_status(pad_index: u8) -> Result<()> {
     use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
@@ -1413,19 +1283,12 @@ pub(crate) fn print_status(pad_index: u8) -> Result<()> {
     Ok(())
 }
 
-// --- wiring-plan exclusion data -------------------------------------------------------------
-
-/// Is this render endpoint one of ours (a pad "speaker" that must never become a mic target,
-/// loopback source, or default device)? Registry-only — callable off the COM threads and cheap
-/// enough for every wiring pass. Rules (either suffices):
-///
-/// * the STORED ContainerId is a PFDS container (`Data1 == "PFDS"`), or
-/// * the endpoint's devnode is one of ours — the `PunktfunkPadIndex` marker (or, pre-install,
-///   the creation DeviceDesc).
-///
-/// Positives are cached (a pad endpoint never becomes a normal one); negatives are recomputed
-/// each time, because an endpoint the wiring plan saw BEFORE `ensure()` stamped it must flip
-/// to excluded on the next pass.
+/// Is this render endpoint a pad speaker (never a mic target, loopback
+/// source, or default)? Registry-only, callable off COM threads. Either:
+/// the stored ContainerId is PFDS (`Data1 == "PFDS"`), or the owning
+/// devnode carries `PunktfunkPadIndex` (or pre-install, the creation
+/// DeviceDesc). Positives are cached; negatives are recomputed because an
+/// endpoint seen before `ensure()` stamped it must flip on the next pass.
 pub(crate) fn is_pad_render_endpoint(endpoint_id: &str) -> bool {
     static KNOWN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let known = KNOWN.get_or_init(|| Mutex::new(HashSet::new()));
@@ -1449,13 +1312,13 @@ fn compute_is_pad_endpoint(endpoint_id: &str) -> bool {
     let Ok(props) = hklm.open_subkey(format!(r"{MMDEV_RENDER_PATH}\{guid}\Properties")) else {
         return false;
     };
-    // (a) stamped container: serialized VT_CLSID whose Data1 spells "PFDS".
+    // Stamped container: serialized VT_CLSID whose Data1 spells "PFDS".
     if let Ok(v) = props.get_raw_value(reg_value_name(&PKEY_CONTAINER_ID)) {
         if v.bytes.len() >= 12 && v.bytes[0] == 0x48 && v.bytes[8..12] == PFDS_TAG.to_le_bytes() {
             return true;
         }
     }
-    // (b) created-but-not-yet-stamped: the owning devnode carries our marker.
+    // Created but not yet stamped: the owning devnode carries our marker.
     let Ok(link) = props.get_value::<String, _>(reg_value_name(&PKEY_ENDPOINT_DEVNODE)) else {
         return false;
     };
@@ -1476,14 +1339,10 @@ fn compute_is_pad_endpoint(endpoint_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-// --- host-startup integration ---------------------------------------------------------------
-
-/// `PUNKTFUNK_PAD_AUDIO`: unset or anything but "0" = on; "0" = off.
 fn pad_audio_enabled() -> bool {
     std::env::var_os("PUNKTFUNK_PAD_AUDIO").is_none_or(|v| v != "0")
 }
 
-/// `PUNKTFUNK_PAD_AUDIO_SLOTS`: how many pad slots to pre-provision (default 1, max 4).
 fn pad_audio_slots() -> u8 {
     std::env::var("PUNKTFUNK_PAD_AUDIO_SLOTS")
         .ok()
@@ -1492,32 +1351,28 @@ fn pad_audio_slots() -> u8 {
         .clamp(1, 4)
 }
 
-/// The endpoints provisioned at startup, set exactly once by the worker thread — and only on
-/// SUCCESS. See [`provision_at_startup`] for why the failure path deliberately leaves it unset.
+/// Set only on success. Failure leaves it unset so [`ensure_provisioned`] can retry.
 static PROVISIONED: OnceLock<Arc<Vec<PadEndpoint>>> = OnceLock::new();
 
-/// A provisioning attempt is in flight. Guards the retry in [`ensure_provisioned`] against
-/// spawning a second COM worker while the first is still enumerating.
+/// Guards the retry in [`ensure_provisioned`] against a second COM worker.
 static PROVISIONING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Host-startup pre-provisioning (Windows, env-gated): spawn a COM worker that `ensure()`s
-/// endpoints for slots `0..N`, performs at most ONE AudioEndpointBuilder+Audiosrv restart if
-/// any stamp is stored-but-not-served (then re-verifies), and publishes the results for the
-/// session layer ([`endpoint_for`]). Any failure logs one warning and leaves the feature off —
-/// the pad itself keeps working, just without audio.
+/// Host-startup pre-provision: COM worker `ensure()`s slots `0..N`, at most
+/// one AEB+Audiosrv restart if a stamp is stored-but-not-served, then
+/// publishes for [`endpoint_for`]. Failure logs once and leaves the feature
+/// off — the pad still works, without audio.
 pub(crate) fn provision_at_startup() {
     if !pad_audio_enabled() {
         tracing::info!("pad audio disabled (PUNKTFUNK_PAD_AUDIO=0)");
-        // Endpoints a previous run provisioned persist and stay VISIBLE — and a visible idle
-        // pad speaker is exactly what libScePad titles stall on (see [`set_visibility`]).
-        // Turning the feature off must also park the leftovers.
+        // Previous-run endpoints persist and stay visible; idle libScePad
+        // titles stall on them. Turning the feature off must park leftovers.
         hide_leftover_endpoints();
         return;
     }
     if PROVISIONED.get().is_some() {
         return;
     }
-    // R5: one attempt at a time. Without this the retry below could stack COM workers.
+    // One attempt at a time; without this the retry could stack COM workers.
     if PROVISIONING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
@@ -1542,7 +1397,7 @@ pub(crate) fn provision_at_startup() {
                 }
             }
             if eps.iter().any(|p| p.needs_aeb_kick) {
-                // One restart, at startup, before any session exists — never mid-flight.
+                // One restart, at startup, before any session — never mid-flight.
                 match restart_audio_endpoint_services() {
                     Ok(()) => {
                         for pe in &mut eps {
@@ -1559,23 +1414,14 @@ pub(crate) fn provision_at_startup() {
                          stored-but-not-served until the next reboot"),
                 }
             }
-            // Park every provisioned endpoint HIDDEN until a client pad actually attaches. The
-            // expensive work (devnode, driver bind, stamps, the AEB kick above) stays at boot —
-            // the #185 lesson: no PnP traffic at session boundaries — but the ENDPOINT must not
-            // sit visible on an idle box: libScePad titles (Helldivers 2, field-confirmed
-            // 2026-08-14) find the "Wireless Controller" speaker BY IDENTITY, engage their
-            // DualSense-haptics path against it, and stall on an endpoint nothing services —
-            // 1% lows of 2–5 FPS with the host completely idle. The per-pad streamer shows it
-            // for exactly the pad's lifetime, like a real DualSense arriving.
+            // Hide until a client pad attaches. Devnode/driver/stamps/AEB stay
+            // at boot (no PnP at session boundaries). A visible idle DualSense-
+            // named speaker makes libScePad titles stall on an unserviced endpoint.
             for pe in &eps {
                 set_visibility(&pe.endpoint_id, pe.pad_index, false);
             }
-            // R5: latch the result ONLY if we actually provisioned something. This used to store
-            // whatever `eps` held even when the loop broke on the first error — an empty vec —
-            // and `OnceLock` made that permanent: one transient failure (a busy audio stack, a
-            // service mid-restart) disabled pad audio for the entire life of the host process,
-            // with the only evidence a single warning at startup. An empty result now leaves the
-            // cell unset so `ensure_provisioned` can try again when a session next asks.
+            // Latch only if something provisioned. Storing an empty vec on the
+            // first error made OnceLock disable pad audio for the process life.
             if eps.is_empty() {
                 tracing::warn!(
                     "pad-audio provisioning produced no endpoints — leaving it unlatched so the \
@@ -1592,35 +1438,25 @@ pub(crate) fn provision_at_startup() {
     }
 }
 
-/// All endpoints provisioned at startup (`None` while provisioning runs / when disabled).
 #[allow(dead_code)]
 pub(crate) fn provisioned_endpoints() -> Option<Arc<Vec<PadEndpoint>>> {
     PROVISIONED.get().cloned()
 }
 
-/// R5: ask for provisioning again if the startup attempt produced nothing. Cheap and idempotent —
-/// a successful latch returns immediately, and `PROVISIONING` keeps concurrent askers to one
-/// worker. Called where a session first wants to know whether pad audio exists, so a host that
-/// started while the audio stack was busy recovers on the next connect instead of at the next
-/// reboot.
+/// Retry if startup produced nothing. Cheap and idempotent: a successful latch
+/// returns immediately; `PROVISIONING` keeps concurrent askers to one worker.
+/// Recovers on the next connect, not the next reboot.
 pub(crate) fn ensure_provisioned() {
     if PROVISIONED.get().is_none() {
         provision_at_startup();
     }
 }
 
-/// Show or hide a pad endpoint (best-effort, logged). Hidden = `DEVICE_STATE_DISABLED` via
-/// [`audio_control::set_endpoint_visibility`] — the endpoint keeps its devnode, driver binding
-/// and DualSense stamps, but vanishes from every ACTIVE enumeration and cannot be opened.
-///
-/// WHY pad endpoints park hidden: the stamp set exists so libScePad titles read the endpoint as
-/// a real DualSense speaker and route haptics audio at it — during a pad session that is the
-/// feature, on an idle box it is a trap. Helldivers 2 (field-confirmed 2026-08-14) finds the
-/// idle "Wireless Controller" speaker, engages its DualSense-haptics path against an endpoint
-/// nothing services, and drops to 2–5 FPS 1% lows with the host completely idle; the manual
-/// community remedy is disabling the device in mmsys.cpl — this is that remedy, automated and
-/// scoped to "no pad attached". Visibility flips raise no PnP traffic (the #185 lesson), only
-/// an endpoint state notification — the same event a real pad's arrival/departure raises.
+/// Show or hide a pad endpoint. Hidden = `DEVICE_STATE_DISABLED`; the
+/// devnode, driver, and DualSense stamps stay, but the endpoint vanishes
+/// from ACTIVE enumeration and cannot be opened. Idle libScePad titles
+/// treat a visible DualSense-named speaker as a real pad and stall on it.
+/// Flips raise an endpoint-state notification, not PnP.
 pub(crate) fn set_visibility(endpoint_id: &str, pad_index: u8, visible: bool) {
     match audio_control::set_endpoint_visibility(endpoint_id, visible) {
         Ok(()) => tracing::info!(pad = pad_index, endpoint = %endpoint_id,
@@ -1633,9 +1469,8 @@ pub(crate) fn set_visibility(endpoint_id: &str, pad_index: u8, visible: bool) {
     }
 }
 
-/// Hide any pad endpoints a previous run left behind — the `PUNKTFUNK_PAD_AUDIO=0` path, where
-/// the provisioning worker never runs but persisted endpoints would otherwise stay visible (and
-/// stall idle libScePad titles) forever.
+/// Hide leftovers on the `PUNKTFUNK_PAD_AUDIO=0` path, where the worker never
+/// runs but persisted endpoints would stay visible and stall idle libScePad titles.
 fn hide_leftover_endpoints() {
     let spawned = thread::Builder::new()
         .name("punktfunk-pad-audio-hide".into())
@@ -1657,8 +1492,6 @@ fn hide_leftover_endpoints() {
     }
 }
 
-/// The provisioned endpoint for one pad slot — what a session queries when a client pad with
-/// speaker support arrives, to attach a [`PadLoopbackCapturer`].
 #[allow(dead_code)]
 pub(crate) fn endpoint_for(pad_index: u8) -> Option<PadEndpoint> {
     PROVISIONED
@@ -1668,15 +1501,14 @@ pub(crate) fn endpoint_for(pad_index: u8) -> Option<PadEndpoint> {
         .cloned()
 }
 
-/// Restart AudioEndpointBuilder + Audiosrv (dependency order: the dependent Audiosrv stops
-/// first, starts last) so registry-routed stamps get served. Mirrors the SCM idioms of
-/// `service.rs::restart`.
+/// Restart AudioEndpointBuilder + Audiosrv so registry-routed stamps get served.
+/// Dependent Audiosrv stops first, starts last.
 fn restart_audio_endpoint_services() -> Result<()> {
     use windows_service::service::{Service, ServiceAccess, ServiceState};
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
     fn stop_and_wait(svc: &Service, name: &str) -> Result<()> {
-        let _ = svc.stop(); // ERROR_SERVICE_NOT_ACTIVE just means it is already down
+        let _ = svc.stop(); // ERROR_SERVICE_NOT_ACTIVE: already down
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let state = svc
@@ -1725,23 +1557,16 @@ fn restart_audio_endpoint_services() -> Result<()> {
     }
 }
 
-// --- loopback capture -----------------------------------------------------------------------
-
-/// The pad endpoint's channel count (quad).
 pub const PAD_CHANNELS: u32 = 4;
-/// `dwChannelMask` for the 4-ch pad layout (FL FR BL BR) — what the endpoint is stamped with.
-/// NOT `punktfunk_core::audio::wasapi_channel_mask`, which only speaks the GameStream
-/// stereo/5.1/7.1 layouts.
+/// 4-ch pad layout (FL FR BL BR). Not `punktfunk_core::audio::wasapi_channel_mask`,
+/// which only speaks GameStream stereo/5.1/7.1.
 const PAD_CHANNEL_MASK: u32 = 0x33;
-/// 4 ch × f32.
 const PAD_BLOCK_ALIGN: usize = PAD_CHANNELS as usize * 4;
 
-/// WASAPI loopback capture of one pad endpoint: whatever a game renders into the pad
-/// "speaker" comes out as interleaved 4-ch f32 at 48 kHz, ready for the pad-audio downlink.
-/// Same COM discipline as [`super::wasapi_cap`]: the WASAPI objects live on a dedicated
-/// thread; the struct holds only the channel + stop flag + join handle. Any device error
-/// (endpoint invalidated, engine restart) ends the thread — [`AudioCapturer::next_chunk`]
-/// then returns `Err` and the caller reopens.
+/// WASAPI loopback of one pad endpoint: interleaved 4-ch f32 at 48 kHz.
+/// Same COM discipline as [`super::wasapi_cap`]: WASAPI objects live on a
+/// dedicated thread; the struct holds channel + stop + join. A device error
+/// ends the thread — [`AudioCapturer::next_chunk`] returns `Err` and the caller reopens.
 pub struct PadLoopbackCapturer {
     chunks: Receiver<Vec<f32>>,
     stop: Arc<AtomicBool>,
@@ -1749,13 +1574,10 @@ pub struct PadLoopbackCapturer {
 }
 
 impl PadLoopbackCapturer {
-    /// Open a loopback capture on a provisioned pad endpoint (its full WASAPI endpoint id —
-    /// [`PadEndpoint::endpoint_id`]).
     pub fn open(endpoint_id: &str) -> Result<PadLoopbackCapturer> {
         let (tx, rx) = sync_channel::<Vec<f32>>(64);
         let stop = Arc::new(AtomicBool::new(false));
-        // Bring-up handshake: surface an open failure as Err (caller retries/reopens), never a
-        // silent dead thread — the crate-wide capture idiom.
+        // Surface an open failure as Err (caller retries), never a silent dead thread.
         let (ready_tx, ready_rx) = sync_channel::<Result<()>>(1);
         let (stop_t, id) = (stop.clone(), endpoint_id.to_string());
         let join = thread::Builder::new()
@@ -1774,12 +1596,9 @@ impl PadLoopbackCapturer {
             }),
             Ok(Err(e)) => Err(e),
             Err(_) => {
-                // R6: signal AND reap. Dropping `join` here detached the WASAPI thread, and the
-                // streamer's reopen loop retries this every ~2 s — so a wedged activation leaked
-                // one thread (each holding COM apartment state and a channel end) per attempt,
-                // indefinitely. The join is bounded in practice because the thread's own loop
-                // observes `stop` between waits; give it a moment and, if it is genuinely stuck
-                // inside a blocking WASAPI call, say so rather than leaking in silence.
+                // Signal and reap. Dropping `join` leaked one WASAPI thread per
+                // ~2 s reopen. If it is stuck in a blocking call, fail rather
+                // than leak.
                 stop.store(true, Ordering::SeqCst);
                 match reap_with_timeout(join, Duration::from_secs(2)) {
                     true => Err(anyhow!("pad loopback init timed out")),
@@ -1793,11 +1612,6 @@ impl PadLoopbackCapturer {
     }
 }
 
-/// Join `join`, giving it `budget` to notice a stop flag. `true` if it exited.
-///
-/// A detached thread is the wrong answer at a retry point (see [`PadLoopbackCapturer::open`]):
-/// the caller reopens on a timer, so "leak one and move on" compounds. Waiting is bounded, and a
-/// thread that outlasts the budget is reported instead of silently accumulating.
 fn reap_with_timeout(join: JoinHandle<()>, budget: Duration) -> bool {
     let deadline = std::time::Instant::now() + budget;
     while !join.is_finished() {
@@ -1810,29 +1624,18 @@ fn reap_with_timeout(join: JoinHandle<()>, budget: Duration) -> bool {
     true
 }
 
-/// Render a test tone straight into a pad's audio endpoint.
-///
-/// The point is iteration speed. Without this, exercising the pad-audio chain means launching a
-/// game that renders DualSense haptics and hoping it targets the right endpoint — minutes per
-/// attempt, and a failure tells you nothing about *which* link broke. This drives the endpoint
-/// directly, so the rest of the chain (loopback capture → gate → Opus → 0xD1 → client → the pad's
-/// actuators) can be tested in seconds and in isolation from whether any game cooperates.
-///
-/// Which channel pair carries the tone. The pad's 4 channels split FL|FR|BL|BR: the FRONT pair is
-/// the pad's built-in speaker, the BACK pair the voice coils. Driving one and leaving the other
-/// silent is what makes a result attributable — the capture (and the client) can then say which
-/// kind the framer actually routed, instead of "some audio arrived".
+/// Channel pair for [`render_test_tone`]. Front = pad speaker (FL FR);
+/// Back = voice coils (BL BR). Driving one pair and silencing the other
+/// is how a result names which kind the framer routed.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum TonePair {
-    /// The pad's built-in speaker.
     Front,
-    /// The voice coils.
     Back,
     Both,
 }
 
 impl TonePair {
-    /// Parse the `--pair` devtest argument; anything unrecognised keeps the haptics default.
+    /// `--pair` argument; anything unrecognised keeps the haptics (Back) default.
     pub(crate) fn parse(s: &str) -> TonePair {
         match s {
             "front" | "speaker" => TonePair::Front,
@@ -1847,7 +1650,6 @@ impl TonePair {
             TonePair::Both => "BOTH pairs (speaker + voice coils)",
         }
     }
-    /// Does channel `c` (0..4, FL|FR|BL|BR) carry the tone?
     fn carries(self, c: usize) -> bool {
         match self {
             TonePair::Front => c < 2,
@@ -1857,10 +1659,9 @@ impl TonePair {
     }
 }
 
-/// The tone defaults to the BACK channel pair, because that is the pair the framer routes to the
-/// haptics kind — the voice coils. The front pair then stays silent, so a pass is felt in the grips
-/// and cannot be confused with the pad's speaker. `--pair front` drives the speaker instead, which
-/// is the only way to exercise the speaker kind without a game that renders one.
+/// Render a test tone into a pad endpoint. Default BACK (voice coils) so a
+/// pass is felt in the grips and cannot be the speaker; `--pair front` is
+/// the speaker kind without a game.
 pub(crate) fn render_test_tone(
     endpoint_id: &str,
     seconds: u32,
@@ -1872,16 +1673,12 @@ pub(crate) fn render_test_tone(
         .context("initialize COM (MTA) for the tone render")?;
 
     probe_activation(endpoint_id);
-    // By id, never a default-device resolve: the whole question being answered is whether THIS
-    // endpoint is the one the capture sees.
+    // By id, never a default-device resolve: the question is whether THIS endpoint is heard.
     let device = open_wasapi_device(endpoint_id)
         .with_context(|| format!("pad endpoint {endpoint_id} not found"))?;
     let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
-    // B11: the SAME mask the endpoint and the loopback capture use. Passing `None` let wasapi
-    // derive `(1 << 4) - 1` = 0x0F (FL FR FC LFE) instead of 0x33 (FL FR BL BR), so this devtest
-    // — the instrument for "which coil is which" — put its tone on a different channel pairing
-    // than the real path. It could not exercise the coil route at all, and read as an inverted
-    // pair when it appeared to.
+    // Same mask as the endpoint and loopback. `None` lets wasapi derive
+    // `(1 << 4) - 1` = 0x0F (FL FR FC LFE) instead of 0x33 (FL FR BL BR).
     let desired = WaveFormat::new(
         32,
         32,
@@ -1907,7 +1704,7 @@ pub(crate) fn render_test_tone(
         .context("IAudioRenderClient")?;
     let buf_frames = audio_client.get_buffer_size().context("buffer size")? as usize;
     let block = PAD_CHANNELS as usize * std::mem::size_of::<f32>();
-    // Start on silence so the stream opens without a glitch, exactly as the mic pump does.
+    // Start on silence so the stream opens without a glitch, as the mic pump does.
     let _ = render.write_to_device(buf_frames, &vec![0u8; buf_frames * block], None);
     audio_client.start_stream().context("start render stream")?;
 
@@ -1951,19 +1748,10 @@ pub(crate) fn render_test_tone(
     Ok(())
 }
 
-/// `pad-endpoint capture` devtest body: open the REAL loopback capture on a pad endpoint and
-/// report what actually arrives, split by channel pair.
-///
-/// The other half of [`render_test_tone`]. Run the two together — tone in one process, this in
-/// another — and the entire host side is exercised with no game and no client: a render client
-/// opens the endpoint, the engine loops it back, and the capture must see the tone in the BACK
-/// pair only. That is the exact signal the `0xD1` framer routes to the voice coils, so a pass here
-/// means everything upstream of the wire is sound.
-///
-/// Reading the result: `peak_back` well above zero with `peak_front` at exactly zero is a pass.
-/// Front energy means the pair routing is wrong. Silence in both means the endpoint provisioned
-/// but carries no audio — which is what a stamped-but-unservable endpoint looked like, and is
-/// precisely the state that used to be invisible until a client sat on an empty plane.
+/// Open the real loopback on a pad endpoint and report peaks by pair.
+/// Run with [`render_test_tone`]: BACK-only is the 0xD1 coil signal;
+/// front energy means pair routing is wrong; both silent means the
+/// endpoint carries no audio.
 pub(crate) fn capture_probe(endpoint_id: &str, seconds: u32) -> Result<()> {
     let mut cap = PadLoopbackCapturer::open(endpoint_id)
         .with_context(|| format!("open pad loopback on {endpoint_id}"))?;
@@ -1981,9 +1769,7 @@ pub(crate) fn capture_probe(endpoint_id: &str, seconds: u32) -> Result<()> {
         "pad-endpoint capture: {frames} frames over {seconds}s, peak_front={peak_front:.4} \
          peak_back={peak_back:.4}"
     );
-    // The capture cannot know which pair the tone was aimed at, so it reports what it SAW rather
-    // than judging against an assumed one — an earlier haptics-shaped verdict called a perfectly
-    // good `--pair front` run "silent".
+    // Report what arrived, not a haptics-shaped verdict: `--pair front` is a pass too.
     const FLOOR: f32 = 0.0001;
     match (frames, peak_front > FLOOR, peak_back > FLOOR) {
         (0, _, _) => println!("  VERDICT: FAIL — the capture opened but delivered nothing."),
@@ -2020,9 +1806,8 @@ impl AudioCapturer for PadLoopbackCapturer {
     fn next_chunk(&mut self) -> Result<Vec<f32>> {
         match self.chunks.recv_timeout(Duration::from_secs(5)) {
             Ok(c) => Ok(c),
-            // A quiet pad (no game renders into it) is NOT a failure — empty chunk, keep the
-            // capturer. Err is reserved for a dead capture thread (device invalidated), which
-            // tells the caller to reopen.
+            // Quiet pad is not a failure — empty chunk, keep the capturer. Err
+            // is a dead capture thread (device invalidated); the caller reopens.
             Err(RecvTimeoutError::Timeout) => Ok(Vec::new()),
             Err(RecvTimeoutError::Disconnected) => Err(anyhow!("pad loopback thread ended")),
         }
@@ -2048,10 +1833,9 @@ fn pad_capture_thread(
         let _ = ready.send(Err(e));
         return Ok(());
     }
-    // Open the endpoint EXPLICITLY by id (never a default-device resolve — pad endpoints must
-    // never be anyone's default). 48 kHz 4-ch f32 with shared-mode autoconvert, so the engine
-    // hands us the contract format regardless of the endpoint's current mix format; capturing
-    // a RENDER device with Direction::Capture in shared mode is WASAPI loopback.
+    // By id, never a default-device resolve. Shared-mode autoconvert so the
+    // engine hands us 48 kHz 4-ch f32 regardless of mix format. Capture on a
+    // render device in shared mode is WASAPI loopback.
     let setup = (|| -> Result<(wasapi::AudioClient, wasapi::AudioCaptureClient, wasapi::Handle)> {
         let device = open_wasapi_device(endpoint_id)
             .map_err(|e| anyhow!("open pad endpoint {endpoint_id}: {e:#}"))?;
@@ -2089,12 +1873,10 @@ fn pad_capture_thread(
     let _ = ready.send(Ok(()));
     tracing::info!(endpoint = %endpoint_id, "pad loopback capturing (4 ch / 48 kHz f32)");
 
-    // Any error below (endpoint invalidated/removed, engine restart) ends the thread; the
-    // channel disconnect surfaces as next_chunk() -> Err and the caller reopens.
+    // Endpoint invalidated or engine restart ends the thread; next_chunk Err, caller reopens.
     let mut bytes: VecDeque<u8> = VecDeque::new();
     while !stop.load(Ordering::Relaxed) {
-        // Loopback fires events only while a game renders into the pad; the finite timeout
-        // keeps `stop` responsive across silence.
+        // Loopback fires events only while a game renders; the timeout keeps `stop` responsive.
         let _ = h_event.wait_for_event(100);
         loop {
             match capture_client.get_next_packet_size() {
@@ -2114,21 +1896,17 @@ fn pad_capture_thread(
             for c in raw.chunks_exact(4) {
                 samples.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
             }
-            let _ = tx.try_send(samples); // non-blocking, lossy — the crate's capture discipline
+            let _ = tx.try_send(samples); // non-blocking, lossy — crate capture discipline
         }
     }
     audio_client.stop_stream().ok();
     Ok(())
 }
 
-// --- pure-logic tests (no devnodes, no COM) -------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The registry stamp route must reach for the hive matching the endpoint's DIRECTION —
-    /// it was hardcoded to Render, so a capture endpoint's fallback stamp could never land.
     #[test]
     fn registry_stamp_hive_follows_the_endpoint_direction() {
         assert_eq!(
@@ -2140,12 +1918,10 @@ mod tests {
             mmdev_path_for("{0.0.0.00000000}.{5da9b5c9-8a10-4b54-8cf6-ce02b8354f16}"),
             MMDEV_RENDER_PATH,
         );
-        // Anything unrecognised keeps the old behaviour rather than inventing a hive.
+        // Unrecognised ids keep Render rather than inventing a hive.
         assert_eq!(mmdev_path_for("nonsense"), MMDEV_RENDER_PATH);
     }
 
-    /// The serialized container blob for pad 0 must be byte-for-byte the on-glass-measured
-    /// value, and byte 23 must be the pad index.
     #[test]
     fn container_registry_blob_matches_measured() {
         let v = reg_registry_value(&StampValue::Container(pfds_container_guid(0)));
@@ -2162,8 +1938,6 @@ mod tests {
         }
     }
 
-    /// Both WAVEFORMATEXTENSIBLE legs: 4 ch, 48 kHz, mask 0x33, and internally consistent
-    /// block alignment / byte rate.
     #[test]
     fn wfx_blobs_are_4ch_48k() {
         for (wfx, bits) in [(&WFX_PCM16_4CH_48K, 16u16), (&WFX_F32_4CH_48K, 32u16)] {
@@ -2181,13 +1955,12 @@ mod tests {
             assert_eq!(byte_rate, rate * align as u32);
             assert_eq!(mask, PAD_CHANNEL_MASK);
         }
-        // The serialized registry shape adds the 8-byte VT_BLOB header.
+        // Serialized registry shape adds the 8-byte VT_BLOB header.
         let v = reg_registry_value(&StampValue::Format(&WFX_F32_4CH_48K));
         assert_eq!(v.bytes.len(), 48);
         assert_eq!(&v.bytes[..8], &[0x41, 0, 0, 0, 1, 0, 0, 0]);
     }
 
-    /// Registry value names use the lowercase `{fmtid},pid` spelling MMDevices uses.
     #[test]
     fn reg_value_names() {
         assert_eq!(
@@ -2214,7 +1987,7 @@ mod tests {
         assert!(endpoint_guid_part("bogus").is_err());
     }
 
-    /// The string stamps stay REG_SZ (UTF-16LE + NUL), not serialized blobs.
+    /// String stamps stay REG_SZ (UTF-16LE + NUL), not serialized blobs.
     #[test]
     fn string_stamp_is_reg_sz() {
         let v = reg_registry_value(&StampValue::Str("Wireless Controller"));

@@ -1,33 +1,26 @@
-//! The second seal lane (plan Phase 1.5): a persistent worker thread that AES-GCM-seals
-//! the back half of a large frame's wire packets while the send thread seals the front.
-//! [`Session`](super::Session)`::seal_frame_inner` owns the split policy; this module owns
-//! the lane machinery and the shared per-slice seal loop.
+//! Persistent worker that AES-GCM-seals the back half of a large frame while the
+//! send thread seals the front. [`Session`](super::Session) owns the split;
+//! this module owns the lane and [`seal_wire_slice`]. Byte-identical to a
+//! sequential pass; pinned by `zero_copy_seal_matches_wrapper_path`.
 
 use crate::crypto::SessionCrypto;
 use crate::error::Result;
 
-/// Wire-packet count at which a frame's sealing splits across two lanes (plan Phase 1.5):
-/// below it the channel rendezvous (~µs) isn't worth it; at it the halved AES-GCM span
-/// (≥ ~125 µs of ~1 µs/packet work) dwarfs the hand-off. ≈300 KB of wire, i.e. ≥150 Mbps
-/// at 60 fps — small frames and the probe's ~17-packet AUs stay strictly single-lane.
+/// Rendezvous is ~µs; AES-GCM is ~1 µs/packet. At 256 packets the halved span
+/// (≥ ~125 µs) dwarfs the hand-off. ≈300 KB of wire, ≥150 Mbps at 60 fps.
 pub(super) const TWO_LANE_MIN_PACKETS: usize = 256;
 
-/// One two-lane seal hand-off: the frame's back-half wire buffers, sealed by the worker with
-/// nonces `seq_base + i` (the nonce order is deterministic per shard index, which is what
-/// makes the split sound). Round-trips through the channels so the buffers return to the pool.
+/// Round-trips through the channels so the buffers return to the pool.
 pub(super) struct SealJob {
     pub(super) bufs: Vec<Vec<u8>>,
     pub(super) seq_base: u64,
     pub(super) timed: bool,
-    /// Worker-lane CPU ns (when `timed`) and the seal outcome, filled in by the worker.
     pub(super) ns: u64,
     pub(super) result: Result<()>,
 }
 
-/// The persistent second seal lane: a worker thread that AES-GCM-seals the back half of a
-/// large frame's packets while the send thread seals the front half. Rendezvous channels
-/// (bound 1) — the send thread submits, seals its half, then waits; no per-frame spawn.
-/// Dropping the struct closes the channel and the worker exits.
+/// Bound-1 rendezvous, not a per-frame spawn. Drop closes the channel and the
+/// worker exits.
 pub(super) struct SealLane {
     pub(super) to_worker: std::sync::mpsc::SyncSender<SealJob>,
     pub(super) from_worker: std::sync::mpsc::Receiver<SealJob>,
@@ -59,9 +52,8 @@ impl SealLane {
     }
 }
 
-/// Seal a run of pre-written wire buffers in place: buffer `i` is `seq(8) ‖ plaintext ‖ tag
-/// scratch` and seals over `[8..]` with sequence `seq_base + i` — the exact per-packet layout
-/// and nonce order of the fused single-lane path. Shared by both lanes.
+/// Buffer `i` is `seq(8) ‖ plaintext ‖ tag scratch`; seals `[8..]` under nonce
+/// `seq_base + i`. Same layout and nonce order as the fused single-lane path.
 pub(super) fn seal_wire_slice(
     c: &SessionCrypto,
     wires: &mut [Vec<u8>],
