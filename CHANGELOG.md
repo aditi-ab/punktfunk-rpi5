@@ -34,6 +34,13 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 
 ### Added
 
+- **IDD-push shared header v3 carries ring health.** The 88-byte header grows a 64-byte tail:
+  a health state (`Initializing`/`Active`/`Rebuilding`/`Dead`), driver and host capability
+  words negotiated by intersection, assignment and D3D-device epochs, a source sequence that
+  advances only on new desktop frames, the last publish QPC, published/dropped totals and a
+  terminal error. `SetFrameChannelRequest` spends its padding word on `header_bytes`; the driver
+  touches the tail only when the version AND the declared size both allow it, so any v2/v3
+  pairing keeps working on the 88-byte prefix.
 - **`--host` / `--client` choose what to install.** `--client` installs `punktfunk-client` from
   the family repo, or a user-scope flatpak where the family has none, so a distro with no
   punktfunk repo can run the client.

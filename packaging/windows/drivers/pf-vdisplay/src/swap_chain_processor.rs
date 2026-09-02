@@ -22,11 +22,16 @@ use std::{
     mem::size_of,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+/// One tick per swap-chain assignment (`run_core` entry), process-wide — the v3 header's
+/// `assignment_epoch`. Distinct per assignment is all the host needs; it never compares epochs
+/// across monitors.
+static ASSIGNMENT_EPOCH: AtomicU32 = AtomicU32::new(0);
 
 use wdk_sys::iddcx::{
     self, IDARG_IN_RELEASEANDACQUIREBUFFER2, IDARG_IN_REPORTFRAMESTATISTICS,
@@ -314,6 +319,7 @@ impl SwapChainProcessor {
         render_luid_low: u32,
         render_luid_high: i32,
     ) {
+        ASSIGNMENT_EPOCH.fetch_add(1, Ordering::AcqRel);
         // SetDevice fails (0x887A0026, FACILITY_DXGI) when the monitor briefly flaps INACTIVE during
         // topology activation — the OS unassigns + re-assigns the swap-chain, and a fresh run_core thread
         // can lose the race to the unassign. Retry briefly so a stable re-assign binds the device instead
@@ -487,6 +493,9 @@ impl SwapChainProcessor {
                 // dead) previous ring, so that slot holds the CURRENT desktop image — exactly what
                 // the new ring's attach below republishes as its instant first frame.
                 if let Some(p) = publisher.take() {
+                    // v3: tell the host this generation is being superseded, so a quiet ring reads
+                    // REBUILDING rather than stalled (the fresh attach below marks ACTIVE again).
+                    p.mark_rebuilding();
                     p.harvest_into(&device.device, &mut stash);
                 }
             }
@@ -511,6 +520,12 @@ impl SwapChainProcessor {
                     &device.device_context,
                 )
             {
+                // v3 epochs go in BEFORE the first publish, so the host never reads an ACTIVE
+                // ring without knowing which device/assignment its frames come from.
+                p.stamp_epochs(
+                    ASSIGNMENT_EPOCH.load(Ordering::Acquire),
+                    crate::direct_3d_device::device_epoch(),
+                );
                 // FIRST-FRAME GUARANTEE: republish the retained desktop image into the fresh ring
                 // immediately. On an idle desktop DWM composes nothing, so without this the host
                 // would wait (and kick synthetic input) for a frame that may never come. A

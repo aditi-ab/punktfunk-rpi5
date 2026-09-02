@@ -142,6 +142,16 @@ impl Drop for Direct3DDevice {
 /// thread set: the processors borrow an `Arc`, so the device outlives them and is never re-created.
 static DEVICE_POOL: Mutex<Option<(i64, Arc<Direct3DDevice>)>> = Mutex::new(None);
 
+/// Bumped on EVERY successful `Direct3DDevice::init` — a TDR recreate on the same LUID mints a new
+/// epoch, so LUID equality is never mistaken for device-object compatibility (immunity plan D2).
+/// Reported to the host in the v3 header (`device_epoch`).
+static DEVICE_EPOCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The current device epoch (0 = no device created yet).
+pub fn device_epoch() -> u32 {
+    DEVICE_EPOCH.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Get-or-create the pooled D3D device for `luid`. Re-creates only if the render adapter changes
 /// (e.g. a GPU hot-swap), which drops the old `Arc` once its last processor releases it.
 pub fn pooled_device(luid: LUID) -> Option<Arc<Direct3DDevice>> {
@@ -163,6 +173,7 @@ pub fn pooled_device(luid: LUID) -> Option<Arc<Direct3DDevice>> {
     }
     match Direct3DDevice::init(luid) {
         Ok(d) => {
+            DEVICE_EPOCH.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
             let a = Arc::new(d);
             *pool = Some((key, a.clone()));
             Some(a)
