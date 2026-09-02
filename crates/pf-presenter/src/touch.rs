@@ -1,61 +1,48 @@
-//! Touchscreen fingers → host mouse for the `trackpad`/`pointer` touch-input models — an
-//! incremental port of the Android client's gesture engine (clients/android
-//! `TouchInput.kt`) and its Apple twin (`TouchMouse.swift`) so all three touch clients feel
-//! identical. The third model, `touch`, never reaches here: those fingers go on the wire as
-//! real multi-touch contacts (`Capture::on_touch_*`).
+//! SDL fingers → host mouse for the `trackpad`/`pointer` models.
 //!
-//! Two mouse models share one gesture vocabulary:
-//!  * **trackpad** (default): the cursor STAYS PUT on touch-down and moves by the finger's
-//!    relative delta with mild acceleration — swipe to nudge, lift and re-swipe to walk it
-//!    across, tap to click where it is. What makes a cursor reachable on a small screen.
-//!  * **pointer**: the cursor jumps to the finger and follows it (absolute moves through the
-//!    aspect-fit letterbox) — direct pointing.
+//! Incremental port of Android `TouchInput.kt` and Apple `TouchMouse.swift`.
+//! The `touch` model never reaches here: those contacts go on the wire as
+//! real multi-touch (`Capture::on_touch_*`).
 //!
-//! Shared gestures: tap = left click · two-finger tap = right click · two-finger drag =
-//! scroll · tap-then-press-and-drag = held left drag · three-finger tap = cycle the stats
-//! overlay tier. Three or more fingers never scroll: the Android/Apple twins map a
-//! three-finger vertical SWIPE to their local soft keyboard, and SDL builds have none to
-//! summon, so here a three-finger drag does nothing but disqualify the tap.
+//! `trackpad` (default): cursor stays put on down; relative delta with mild
+//! acceleration. `pointer`: cursor jumps to the finger (absolute, letterbox).
+//! Tap = left click · two-finger tap = right · two-finger drag = scroll ·
+//! tap-then-press = held left drag · three-finger tap = cycle stats overlay.
+//! Three or more fingers never scroll (the twins map a three-finger swipe to
+//! their keyboard; SDL builds have none).
 //!
-//! Unlike the Android/Apple hosts (which hand the engine a whole event's worth of changed
-//! touches at once), SDL delivers ONE finger transition per event, so this is a strictly
-//! incremental state machine: it keeps every live finger's position and recomputes the
-//! centroid itself. Positions are in physical window pixels (the caller multiplies SDL's
-//! normalized 0..1 finger coordinates by the window's pixel size) so the pixel-based
-//! ballistics constants port from Android 1:1; timestamps are milliseconds.
+//! SDL delivers one finger transition per event, so this machine keeps every
+//! live finger and recomputes the centroid. Positions are physical window
+//! pixels so ballistics port from Android 1:1; timestamps are milliseconds.
 
 use std::collections::HashMap;
 
-// Gesture/ballistics tuning (physical px / ms), matching the Android reference exactly.
-/// Movement under this (px) still counts as a tap, not a drag.
+/// px; under this, a lift is still a tap.
 const TAP_SLOP: f32 = 12.0;
-/// A new touch this soon (ms) after a tap, near it, starts a held left-button drag.
+/// ms after a tap, nearby: the next down starts a held left drag.
 const TAP_DRAG_MS: f64 = 250.0;
-/// One finger held still this long (ms) presses the left button and drags until it lifts —
-/// the touch idiom for "pick this up" (windows, text, files).
+/// ms of a still single finger: press left and hold until lift.
 const LONG_PRESS_MS: f64 = 500.0;
-/// Two-finger pan distance (px) per 120-unit wheel notch (smaller = faster scroll).
+/// px of two-finger pan per WHEEL(120) notch.
 const SCROLL_DIV: f32 = 4.0;
-/// The dial (design/touch-client-overlay.md §2.1): a two-finger TWIST opens the quick-action
-/// ring. Below this rotation the gesture is still a scroll candidate — natural scrolls rotate a
-/// few degrees, and this is what absorbs them; much below 8° two-finger scrolling gets flaky.
+/// Degrees of two-finger twist before the quick-action ring arms. Natural scrolls
+/// rotate a few degrees; much below 8° two-finger scrolling gets flaky.
 const DIAL_ARM_DEG: f32 = 10.0;
-/// At this rotation the ring commits: it stays open after the fingers lift.
+/// Degrees at which the ring stays open after lift.
 const DIAL_COMMIT_DEG: f32 = 30.0;
 /// Centroid travel (px) beyond this before arming means scroll, not dial.
 const DIAL_SLOP: f32 = 2.0 * TAP_SLOP;
-/// SDL reports the fingers of one input frame as separate events with the same timestamp, so
-/// the twist is judged only when the other finger's position is from the same frame (its event
-/// is at most this far back) — halfway through a plain scroll step the finger-to-finger vector
+/// ms. SDL splits one frame's fingers into separate events with the same timestamp.
+/// Judge twist only against a position this fresh — a mid-scroll pair otherwise
 /// looks rotated by tens of degrees.
 const DIAL_FRAME_MS: f64 = 4.0;
-/// …or when the other finger has not moved for this long: a thumb pivot, one finger turning
-/// around a still one, is a real twist and never completes a pair.
+/// ms of stillness on the other finger: a thumb-pivot is a real twist and never
+/// completes a same-frame pair.
 const DIAL_PIVOT_MS: f64 = 50.0;
-/// Base finger-px → host-px gain (~1:1, never twitchy).
+/// Finger-px → host-px gain (~1:1).
 const POINTER_SENS: f32 = 1.3;
-/// Above `ACCEL_SPEED_FLOOR` px/ms the gain ramps by `ACCEL_GAIN` per px/ms, capped at
-/// `ACCEL_MAX` so a fast swipe can't fling the cursor uncontrollably.
+/// Extra gain per px/ms above `ACCEL_SPEED_FLOOR`. `ACCEL_MAX` stops a fast swipe
+/// flinging the cursor.
 const ACCEL_GAIN: f32 = 0.6;
 const ACCEL_SPEED_FLOOR: f32 = 0.3;
 const ACCEL_MAX: f32 = 3.0;
@@ -64,9 +51,8 @@ const ACCEL_MAX: f32 = 3.0;
 const BTN_LEFT: u32 = 1;
 const BTN_RIGHT: u32 = 3;
 
-/// A finger's position in the letterboxed video content rect (absolute host pixels + the
-/// content surface size) — what `pointer` mode's absolute moves carry. Mirrors the
-/// `MouseMoveAbs` packing the host rescales into its output.
+/// Letterbox mapping: host pixels plus content size. `pointer` absolute moves carry
+/// this; it matches the `MouseMoveAbs` packing the host rescales into its output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Abs {
     pub x: i32,
@@ -75,89 +61,78 @@ pub struct Abs {
     pub h: u32,
 }
 
-/// A wire intent the engine emits; the owner (`Capture` in `input.rs`, which also holds the
-/// intent → `InputKind` translation) sends each one, and folds [`CycleStats`](Act::CycleStats)
-/// back to the run loop.
+/// Wire intent. `Capture` in `input.rs` sends each one and folds `CycleStats` back
+/// to the run loop; the `InputKind` translation lives there so this crate stays
+/// free of core.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Act {
-    /// Relative cursor motion (`MouseMove`).
     MoveRel { dx: i32, dy: i32 },
-    /// Absolute cursor position through the letterbox (`MouseMoveAbs`).
     MoveAbs(Abs),
-    /// A mouse button transition (`gs` = GameStream id; `down` = press/release).
+    /// GameStream button id; `down` is press/release.
     Button { gs: u32, down: bool },
-    /// A wheel step: `axis` 0 = vertical, 1 = horizontal; `delta` in WHEEL(120) units.
+    /// `axis` 0 = vertical, 1 = horizontal; `delta` in WHEEL(120) units.
     Scroll { axis: u32, delta: i32 },
-    /// Three-finger tap: cycle the stats-overlay verbosity tier (the run loop owns it).
+    /// Three-finger tap. The run loop owns the overlay tier.
     CycleStats,
-    /// A two-finger twist is turning the quick-action ring: `progress` 0…1 drives its unwind
-    /// frame by frame, `clockwise` is the hand's direction, `x`/`y` (window px) the centroid
-    /// the ring is centred on. Emitted on every move once the twist has armed.
+    /// Armed twist driving the quick-action ring. `progress` 0…1; `x`/`y` are the
+    /// centroid in window px. Emitted on every move once armed.
     Dial {
         progress: f32,
         clockwise: bool,
         x: f32,
         y: f32,
     },
-    /// The twist reached `DIAL_COMMIT_DEG`: the ring stays open after the fingers lift.
+    /// Reached `DIAL_COMMIT_DEG`; the ring stays open after lift.
     DialCommit,
-    /// The twist ended short of commit, or wound back below the arm angle after committing:
-    /// the ring winds back in and nothing was sent — no scroll, no click.
+    /// Ended short of commit, or wound back below the arm angle after commit.
     DialCancel,
 }
 
-/// The dial's share of a two-finger gesture: the finger-to-finger vector the moment the second
-/// finger landed, compared against the live one on every move.
+/// Finger-to-finger vector at the second finger's landing, compared on every move.
 #[derive(Clone, Copy)]
 struct Dial {
     ids: (u64, u64),
     vec: (f32, f32),
-    /// The centroid at the second finger's landing — travel past `DIAL_SLOP` before arming
-    /// means the hand is scrolling, not turning.
+    /// Centroid at second-finger landing. Travel past `DIAL_SLOP` before arming is a scroll.
     anchor: (f32, f32),
     armed: bool,
     committed: bool,
 }
 
-/// The trackpad/pointer gesture state machine. One per session; `trackpad` picks the model
-/// (false = pointer). Fed only DIRECT touchscreen fingers.
+/// Trackpad/pointer state machine. One per session; `trackpad` false is pointer.
+/// Fed only direct touchscreen fingers.
 pub struct Gestures {
     trackpad: bool,
-    /// `-1` with the invert-scroll setting on: applied where the notch is made (the twins do
-    /// the same), so the touch path honours the setting the wheel path already did.
+    /// `-1` when invert-scroll is on. Applied where the notch is made, matching the
+    /// twins and the wheel path.
     scroll_sign: i32,
-    /// Live fingers → current window-pixel position (the centroid needs every finger, but a
-    /// move event only carries the one that changed).
+    /// Live fingers → window px. A move event carries only the finger that changed.
     positions: HashMap<u64, (f32, f32)>,
-    /// Live fingers → the time (ms) of their last event; the dial's same-frame test.
+    /// Live fingers → last-event time (ms). The dial's same-frame test.
     times: HashMap<u64, f64>,
-    /// A gesture is in flight (≥ 1 finger down since the first touch).
     active: bool,
     start: (f32, f32),
-    /// When the first finger landed (ms) — the long-press clock.
+    /// First-finger down time (ms). Long-press clock.
     down_t: f64,
     max_fingers: usize,
     moved: bool,
     scrolling: bool,
     scroll_anchor: (f32, f32),
-    /// A scroll notch went on the wire this gesture: it is a scroll for its lifetime, never a
-    /// dial.
+    /// A notch went on the wire this gesture: scroll for its lifetime, never a dial.
     scroll_emitted: bool,
-    /// The two-finger twist in flight, from the second finger's landing to any lift.
     dial: Option<Dial>,
-    /// Three-or-more-finger centroid anchor, per finger count (0 = none): real fingers never
-    /// land or lift in the same event, so a count change must re-anchor, not read as travel.
+    /// Many-finger centroid, per finger count (0 = none). Fingers never land and lift
+    /// in the same event, so a count change must re-anchor, not read as travel.
     many_count: usize,
     many_anchor: (f32, f32),
-    /// A tap-then-press-and-drag is holding the left button down for this whole gesture.
     drag_held: bool,
-    // Trackpad relative-motion state: the tracked finger, its last position/time, and the
-    // sub-pixel remainder so a slow drag isn't lost to integer truncation.
+    // Tracked finger, last position/time, and sub-pixel remainder so a slow drag
+    // is not lost to integer truncation.
     track_id: Option<u64>,
     prev: (f32, f32),
     prev_t: f64,
     carry: (f32, f32),
-    // Tap-drag arming: a quick tap leaves a window in which the next nearby touch drags.
+    // Last tap's up-time and point: a nearby down inside TAP_DRAG_MS holds left.
     last_tap_up: f64,
     last_tap_pt: (f32, f32),
 }
@@ -190,8 +165,7 @@ impl Gestures {
         }
     }
 
-    /// A finger touched down. `abs` is its letterbox mapping (pointer mode jumps the cursor
-    /// there on the first finger). `t` is milliseconds.
+    /// Pointer mode jumps the cursor to `abs` on the first finger. `t` is ms.
     pub fn down(&mut self, id: u64, wx: f32, wy: f32, abs: Abs, t: f64) -> Vec<Act> {
         let mut acts = Vec::new();
         let first = self.positions.is_empty() && !self.active;
@@ -207,7 +181,6 @@ impl Gestures {
             self.scroll_emitted = false;
             self.dial = None;
             self.many_count = 0;
-            // A touch landing just after a quick tap nearby = tap-and-drag.
             self.drag_held = t - self.last_tap_up < TAP_DRAG_MS
                 && (wx - self.last_tap_pt.0).abs() < TAP_SLOP
                 && (wy - self.last_tap_pt.1).abs() < TAP_SLOP;
@@ -228,8 +201,7 @@ impl Gestures {
         }
         self.max_fingers = self.max_fingers.max(self.positions.len());
         match self.positions.len() {
-            // The second finger: remember the finger-to-finger vector — the dial's reference —
-            // unless this gesture already scrolled (then it is a scroll for its lifetime).
+            // Second finger: snapshot the pair vector unless this gesture already scrolled.
             2 if !self.scroll_emitted && self.dial.is_none() => {
                 if let Some((&other, &op)) = self.positions.iter().find(|(k, _)| **k != id) {
                     self.dial = Some(Dial {
@@ -241,22 +213,20 @@ impl Gestures {
                     });
                 }
             }
-            // A third finger ends the twist: wound back if it had armed and not committed.
             n if n > 2 => acts.extend(self.end_dial(false)),
             _ => {}
         }
         acts
     }
 
-    /// A finger moved.
     pub fn motion(&mut self, id: u64, wx: f32, wy: f32, abs: Abs, t: f64) -> Vec<Act> {
         if !self.active || !self.positions.contains_key(&id) {
             return Vec::new();
         }
         self.positions.insert(id, (wx, wy));
         self.times.insert(id, t);
-        // Dropping below three fingers forgets the many-finger anchor, so a 3→2→3 bounce
-        // re-anchors instead of reading the count change as travel.
+        // Below three fingers, drop the many-finger anchor so a 3→2→3 bounce re-anchors
+        // instead of reading the count change as travel.
         if self.positions.len() < 3 {
             self.many_count = 0;
         }
@@ -268,15 +238,13 @@ impl Gestures {
                 self.many_fingers();
                 Vec::new()
             }
-            // One finger, and the gesture never became a scroll (dropping back from two
-            // fingers to one must not jerk the cursor).
+            // One finger and never a scroll: dropping 2→1 must not jerk the cursor.
             _ if !self.scrolling => self.single_finger(id, wx, wy, abs, t),
             _ => Vec::new(),
         }
     }
 
-    /// A finger lifted. Only when the LAST finger lifts does the gesture conclude (into a
-    /// click / drag-end / stats cycle). `t` is the up-time in milliseconds.
+    /// The gesture concludes only on the last lift (click / drag-end / stats). `t` is ms.
     pub fn up(&mut self, id: u64, t: f64) -> Vec<Act> {
         let mut acts = Vec::new();
         self.positions.remove(&id);
@@ -284,12 +252,12 @@ impl Gestures {
         if self.track_id == Some(id) {
             self.track_id = None;
         }
-        // Any lift ends the twist. Committed: the ring stays open and the UI owns it from
-        // here. Short of commit: it winds back in, and the finger still down (if any) must
-        // not start moving the cursor — the gesture stays "scrolling", i.e. inert.
+        // Any lift ends the twist. Committed: the ring stays open. Short of commit: wind
+        // back, and keep the remaining finger inert (`scrolling`) so it cannot move the
+        // cursor.
         acts.extend(self.end_dial(true));
         if !self.positions.is_empty() || !self.active {
-            return acts; // other fingers still down (or no live gesture)
+            return acts;
         }
         self.active = false;
         if self.drag_held {
@@ -297,7 +265,7 @@ impl Gestures {
             acts.push(Act::Button {
                 gs: BTN_LEFT,
                 down: false,
-            }); // end the held drag
+            });
         } else if !self.moved {
             match self.max_fingers {
                 n if n >= 3 => acts.push(Act::CycleStats),
@@ -320,7 +288,7 @@ impl Gestures {
                         gs: BTN_LEFT,
                         down: false,
                     });
-                    self.last_tap_up = t; // arm tap-drag
+                    self.last_tap_up = t;
                     self.last_tap_pt = self.start;
                 }
             }
@@ -328,10 +296,8 @@ impl Gestures {
         acts
     }
 
-    /// Time passes with fingers down. A still finger produces no event, so the long-press
-    /// arm needs the clock: one finger, never a second, under the tap slop, held for
-    /// `LONG_PRESS_MS` → the left button goes down and the lift releases it exactly like a
-    /// tap-then-drag. Call once per run-loop iteration; `t` is the finger events' clock.
+    /// A still finger produces no event, so long-press needs the clock. Call once per
+    /// run-loop iteration. `t` is ms.
     pub fn tick(&mut self, t: f64) -> Vec<Act> {
         let mut acts = Vec::new();
         if self.active
@@ -350,9 +316,8 @@ impl Gestures {
         acts
     }
 
-    /// Forget all in-flight gesture state (capture release / session teardown). Any left
-    /// button the engine is holding is released by the owner's held-button flush, so this
-    /// only clears state — it never re-emits wire events.
+    /// Drop in-flight state (capture release / session teardown). Never re-emits; the
+    /// owner's held-button flush releases any left button the engine was holding.
     pub fn reset(&mut self) {
         self.positions.clear();
         self.times.clear();
@@ -366,22 +331,21 @@ impl Gestures {
         self.last_tap_up = 0.0;
     }
 
-    /// The dial's share of a two-finger move; `Some` when the twist owns the gesture (the
-    /// scroll path then never runs), `None` when the hand is scrolling, or might still be.
+    /// Two-finger move. `Some` when the twist owns the gesture (scroll never runs);
+    /// `None` when the hand is scrolling, or might still be.
     ///
-    /// Rules, in order (design §2.1): a scroll notch already sent ⇒ never a dial; centroid
-    /// travel past `DIAL_SLOP` before arming ⇒ scroll; rotation ≥ `DIAL_ARM_DEG` ⇒ the twist
-    /// arms and owns the gesture; progress `(|Δφ| − arm) / (commit − arm)` feeds the ring; at
-    /// 1 the ring commits, and winding back to 0 after a commit closes it again. A pinch with
-    /// no rotation is nothing: it never arms and moves no centroid.
+    /// Order: a notch already sent ⇒ never a dial; centroid past `DIAL_SLOP` before
+    /// arming ⇒ scroll; rotation ≥ `DIAL_ARM_DEG` ⇒ the twist owns it. Progress is
+    /// `(|Δφ| − arm) / (commit − arm)`. At 1 the ring commits; winding back to 0 after
+    /// a commit closes it. A pinch with no rotation never arms and moves no centroid.
     fn dial_step(&mut self, id: u64, t: f64) -> Option<Vec<Act>> {
         let dial = self.dial?;
         if !dial.armed && self.scroll_emitted {
             return None;
         }
-        // Judge the rotation only against a position of the other finger that is current:
-        // from this same input frame, or older than a pivot's stillness. In between, the
-        // other finger's event for this frame is still to come, and the vector would lie.
+        // Judge rotation only against a current other-finger position: this same input
+        // frame, or older than a pivot's stillness. In between, that finger's event for
+        // this frame has not arrived, and the pair vector is stale.
         let other = if dial.ids.0 == id {
             dial.ids.1
         } else {
@@ -398,8 +362,7 @@ impl Gestures {
         let v = (b.0 - a.0, b.1 - a.1);
         let cross = dial.vec.0 * v.1 - dial.vec.1 * v.0;
         let dot = dial.vec.0 * v.0 + dial.vec.1 * v.1;
-        // Signed rotation of the finger-to-finger vector; positive = clockwise on a y-down
-        // screen.
+        // Signed rotation of the pair vector; positive is clockwise on a y-down screen.
         let phi = cross.atan2(dot).to_degrees();
         let (cx, cy) = self.centroid();
         if !dial.armed {
@@ -407,11 +370,9 @@ impl Gestures {
             if travel >= DIAL_SLOP {
                 return None;
             }
-            // Undecided: under the slop and under the arm angle the pair may still become a
-            // twist, so no scroll notch goes out yet — a notch is final (`scroll_emitted`),
-            // and a real twist drifts its centroid past `SCROLL_DIV` long before it turns
-            // 10°. The anchor follows the centroid so the scroll starts smoothly once the
-            // slop is crossed.
+            // Undecided: no notch yet — a notch is final, and a real twist drifts past
+            // `SCROLL_DIV` long before 10°. Follow the centroid so a later scroll starts
+            // smoothly once the slop is crossed.
             if phi.abs() < DIAL_ARM_DEG {
                 self.scrolling = true;
                 self.scroll_anchor = (cx, cy);
@@ -440,8 +401,8 @@ impl Gestures {
         Some(acts)
     }
 
-    /// The twist is over (a finger lifted or a third landed). `cancel_uncommitted` winds an
-    /// armed-but-uncommitted ring back in; a committed ring stays open for the UI.
+    /// The twist is over (a finger lifted or a third landed). An armed-but-uncommitted
+    /// ring winds back in; a committed ring stays open for the UI.
     fn end_dial(&mut self, _lift: bool) -> Vec<Act> {
         match self.dial.take() {
             Some(d) if d.armed && !d.committed => vec![Act::DialCancel],
@@ -449,7 +410,6 @@ impl Gestures {
         }
     }
 
-    /// The live fingers' centroid.
     fn centroid(&self) -> (f32, f32) {
         let n = self.positions.len() as f32;
         let (mut sx, mut sy) = (0.0f32, 0.0f32);
@@ -460,9 +420,8 @@ impl Gestures {
         (sx / n, sy / n)
     }
 
-    /// Exactly two fingers → scroll by the centroid delta; never move the cursor. Fires a
-    /// notch per `SCROLL_DIV` px of pan and re-anchors on fire; finger up scrolls up, finger
-    /// right scrolls right (the host WHEEL(120) convention).
+    /// Two fingers: scroll by centroid delta, never move the cursor. One notch per
+    /// `SCROLL_DIV` px, then re-anchor. Finger-up / finger-right match host WHEEL(120).
     fn scroll_by_centroid(&mut self) -> Vec<Act> {
         let mut acts = Vec::new();
         let (cx, cy) = self.centroid();
@@ -493,10 +452,9 @@ impl Gestures {
         acts
     }
 
-    /// Three or more fingers: no scroll, no cursor motion. Centroid travel beyond `TAP_SLOP`
-    /// disqualifies the tap (else a short three-finger swipe would still cycle the stats).
-    /// Leaving the scroll state stale would read the 3→2 centroid jump as a wheel notch, and
-    /// the tracked finger's position froze meanwhile, so both re-anchor fresh on the way back.
+    /// Three or more fingers: no scroll, no cursor. Travel past `TAP_SLOP` disqualifies
+    /// the tap. Clear scroll and the tracked finger so a 3→2 drop cannot fire a notch
+    /// from the centroid jump or a stale track position.
     fn many_fingers(&mut self) {
         let (cx, cy) = self.centroid();
         if self.positions.len() != self.many_count {
@@ -511,18 +469,17 @@ impl Gestures {
         self.track_id = None;
     }
 
-    /// One finger, not scrolling: trackpad relative ballistics, or pointer absolute follow.
     fn single_finger(&mut self, id: u64, wx: f32, wy: f32, abs: Abs, t: f64) -> Vec<Act> {
         let mut acts = Vec::new();
         if (wx - self.start.0).abs() > TAP_SLOP || (wy - self.start.1).abs() > TAP_SLOP {
             self.moved = true;
         }
         if !self.trackpad {
-            acts.push(Act::MoveAbs(abs)); // the cursor follows the finger
+            acts.push(Act::MoveAbs(abs));
             return acts;
         }
-        // Re-anchor (zero delta this frame) if the tracked finger changed, so lifting one of
-        // several fingers never jumps the cursor.
+        // Zero delta this frame if the tracked finger changed, so lifting one of several
+        // fingers never jumps the cursor.
         if self.track_id != Some(id) {
             self.track_id = Some(id);
             self.prev = (wx, wy);
@@ -534,12 +491,12 @@ impl Gestures {
         let dt_ms = (t - self.prev_t).max(1.0) as f32;
         self.prev = (wx, wy);
         self.prev_t = t;
-        let speed = dx.hypot(dy) / dt_ms; // finger px per ms
+        let speed = dx.hypot(dy) / dt_ms;
         let accel = (1.0 + ACCEL_GAIN * (speed - ACCEL_SPEED_FLOOR).max(0.0)).min(ACCEL_MAX);
         let gain = POINTER_SENS * accel;
         self.carry.0 += dx * gain;
         self.carry.1 += dy * gain;
-        let out_x = self.carry.0 as i32; // truncates toward zero → remainder kept with sign
+        let out_x = self.carry.0 as i32; // toward zero; remainder keeps the sign
         let out_y = self.carry.1 as i32;
         if out_x != 0 || out_y != 0 {
             acts.push(Act::MoveRel {
@@ -553,22 +510,20 @@ impl Gestures {
     }
 }
 
-/// No finger drag moves this far in one SDL event; a leaked absolute position routinely does
-/// (the field capture read 300 to 450).
+/// px. No finger drag moves this far in one SDL event; a leaked absolute position does.
 const LEAK_PX: f32 = 150.0;
 
-/// Design §5.5: in Gaming Mode Steam Input owns the touchscreen and replays it as a mouse whose
-/// "relative" deltas are absolute positions — hundreds of pixels per event, which under the
-/// stream's relative-mouse lock walk the host cursor into a corner. SDL sees no fingers at all,
-/// so every touch model is bypassed, and `SDL_TOUCH_MOUSE_EVENTS` cannot help: the events are
-/// Steam's, not SDL's. This recognises that shape — a gamescope session, no finger event yet,
-/// a delta no finger drag produces — and drops the leaked motion. A real mouse in Gaming Mode
-/// keeps working: its deltas are small.
+/// Gaming Mode: Steam Input owns the touchscreen and replays it as a mouse whose
+/// "relative" deltas are absolute positions. Under the stream's relative-mouse lock
+/// those walk the host cursor into a corner. SDL sees no fingers, so every touch
+/// model is bypassed; `SDL_TOUCH_MOUSE_EVENTS` cannot help (the events are Steam's).
+/// Drop a gamescope session with no finger yet and a delta no finger drag produces.
+/// A real mouse in Gaming Mode keeps working: its deltas are small.
 pub struct SteamTouchMouse {
     game_mode: bool,
-    /// A direct-touch finger reached SDL this session: the touchscreen is ours, nothing leaks.
+    /// A direct-touch finger reached SDL this session: the touchscreen is ours.
     pub fingers_seen: bool,
-    /// A finger from a NON-direct device was ignored this session — said once in the log.
+    /// A non-direct finger was ignored this session — said once in the log.
     pub indirect_seen: bool,
     leaked: bool,
     noticed: bool,
@@ -585,7 +540,6 @@ impl SteamTouchMouse {
         }
     }
 
-    /// Whether this relative motion is a leaked touch position, to be dropped.
     pub fn leaks(&mut self, xrel: f32, yrel: f32) -> bool {
         if !self.game_mode || self.fingers_seen {
             return false;
@@ -612,15 +566,13 @@ mod tests {
     #[test]
     fn gaming_mode_drops_leaked_touch_positions_until_a_finger_is_seen() {
         let mut m = super::SteamTouchMouse::new(true);
-        // A mouse's deltas pass, and there is nothing to say.
         assert!(!m.leaks(4.0, -3.0));
         assert!(!m.take_notice());
-        // A leaked position is dropped, and said once.
         assert!(m.leaks(340.0, 12.0));
         assert!(m.take_notice());
         assert!(!m.take_notice());
         assert!(m.leaks(0.0, -420.0));
-        // A real finger reached SDL: the touchscreen is ours, nothing leaks any more.
+        // A real finger reached SDL: stop treating large deltas as leaks.
         m.fingers_seen = true;
         assert!(!m.leaks(340.0, 12.0));
         // Outside Gaming Mode a mouse may move that far in one event.
@@ -652,7 +604,6 @@ mod tests {
         let mut g = Gestures::new(true, false);
         let mut acts = g.down(1, 50.0, 50.0, ABS, 0.0);
         acts.extend(g.up(1, 40.0));
-        // A trackpad tap places no cursor and moves nothing — just a click.
         assert_eq!(
             acts,
             vec![
@@ -727,7 +678,7 @@ mod tests {
     fn trackpad_drag_emits_relative_motion() {
         let mut g = Gestures::new(true, false);
         assert!(g.down(1, 100.0, 100.0, ABS, 0.0).is_empty());
-        // A big move over 16 ms — relative, with acceleration, so it should exceed 1:1.
+        // 40 px in 16 ms: acceleration should exceed 1:1.
         let acts = g.motion(1, 140.0, 100.0, ABS, 16.0);
         match acts.as_slice() {
             [Act::MoveRel { dx, dy }] => {
@@ -736,7 +687,7 @@ mod tests {
             }
             other => panic!("expected one MoveRel, got {other:?}"),
         }
-        // The gesture moved, so the lift is not a tap (no click).
+        // Moved: the lift is not a tap.
         assert!(g.up(1, 32.0).is_empty());
     }
 
@@ -753,7 +704,7 @@ mod tests {
         let mut g = Gestures::new(true, false);
         let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
         let _ = g.down(2, 120.0, 200.0, ABS, 2.0);
-        // Both fingers slide up 40 px → the centroid rises 40 px → +ve (finger-up) notches.
+        // Both up 40 px: centroid up → positive (finger-up) notches.
         let a1 = g.motion(1, 100.0, 160.0, ABS, 10.0);
         let a2 = g.motion(2, 120.0, 160.0, ABS, 12.0);
         let scrolls: Vec<_> = a1.into_iter().chain(a2).collect();
@@ -773,7 +724,6 @@ mod tests {
         let a1 = g.motion(1, 100.0, 160.0, ABS, 10.0);
         let a2 = g.motion(2, 120.0, 160.0, ABS, 12.0);
         let scrolls: Vec<_> = a1.into_iter().chain(a2).collect();
-        // Fingers up, setting on → the notch goes the other way.
         assert!(
             scrolls
                 .iter()
@@ -791,13 +741,11 @@ mod tests {
         let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
         let _ = g.down(2, 130.0, 200.0, ABS, 2.0);
         let _ = g.down(3, 160.0, 200.0, ABS, 4.0);
-        // All three slide up 40 px: the twins reserve this for their keyboard swipe, so the
-        // desktop must neither scroll nor move the cursor…
+        // Twins use a three-finger swipe for a keyboard; emit nothing, and travel kills the tap.
         let mut acts = g.motion(1, 100.0, 160.0, ABS, 10.0);
         acts.extend(g.motion(2, 130.0, 160.0, ABS, 12.0));
         acts.extend(g.motion(3, 160.0, 160.0, ABS, 14.0));
         assert_eq!(acts, vec![], "a three-finger drag must emit nothing");
-        // …and the travel disqualifies the three-finger tap on lift.
         acts.extend(g.up(1, 40.0));
         acts.extend(g.up(2, 41.0));
         acts.extend(g.up(3, 42.0));
@@ -807,7 +755,6 @@ mod tests {
     #[test]
     fn tap_then_press_drag_holds_the_left_button() {
         let mut g = Gestures::new(true, false);
-        // Tap at (50,50), lifting at t=10.
         let _ = g.down(1, 50.0, 50.0, ABS, 0.0);
         let click = g.up(1, 10.0);
         assert_eq!(
@@ -823,8 +770,6 @@ mod tests {
                 },
             ]
         );
-        // A new touch nearby within the window arms a held drag: button down on touch, and
-        // the whole gesture holds it until the lift.
         let down2 = g.down(2, 52.0, 51.0, ABS, 120.0);
         assert_eq!(
             down2,
@@ -833,7 +778,7 @@ mod tests {
                 down: true
             }]
         );
-        let _ = g.motion(2, 90.0, 51.0, ABS, 140.0); // drag
+        let _ = g.motion(2, 90.0, 51.0, ABS, 140.0);
         let end = g.up(2, 160.0);
         assert_eq!(
             end,
@@ -885,7 +830,7 @@ mod tests {
         let _ = g.down(1, p1.0, p1.1, ABS, 0.0);
         let _ = g.down(2, p2.0, p2.1, ABS, 2.0);
         let mut commit_at = None;
-        // 7° steps: no sample sits on a threshold, where float rounding decides the side.
+        // 7° steps so no sample sits on a threshold where float rounding picks the side.
         for step in 1..=5 {
             let deg = 7.0 * step as f32;
             let (p1, p2) = twisted(c, deg);
@@ -927,7 +872,7 @@ mod tests {
             Some(35.0),
             "commits exactly once, at the first sample past the commit angle"
         );
-        // Committed: the lift leaves the ring open — no cancel, no click.
+        // Committed: lift leaves the ring open.
         let mut acts = g.up(1, 100.0);
         acts.extend(g.up(2, 101.0));
         assert_eq!(acts, vec![]);
@@ -955,9 +900,8 @@ mod tests {
 
     #[test]
     fn a_drifting_twist_still_arms_and_scrolls_nothing() {
-        // Real fingers never pivot about a fixed point: the centroid drifts a few px per
-        // sample while the pair turns. Under the slop that drift is not a scroll — a single
-        // notch would lock the gesture as a scroll before the twist could reach 10°.
+        // Real fingers drift a few px per sample while turning. Under the slop that
+        // drift is not a scroll — one notch would lock the gesture before 10°.
         let mut g = Gestures::new(true, false);
         let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
         let _ = g.down(2, 140.0, 200.0, ABS, 2.0);
@@ -986,9 +930,9 @@ mod tests {
         let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
         let _ = g.down(2, 140.0, 200.0, ABS, 2.0);
         let mut acts = g.motion(1, 100.0, 170.0, ABS, 10.0); // 30 px up: past the slop
-        acts.extend(g.motion(2, 140.0, 170.0, ABS, 11.0)); // notches fire
+        acts.extend(g.motion(2, 140.0, 170.0, ABS, 11.0));
         assert!(acts.iter().any(|a| matches!(a, Act::Scroll { .. })));
-        let (p1, p2) = twisted((c.0, 170.0), 40.0); // then a big twist around the new centroid
+        let (p1, p2) = twisted((c.0, 170.0), 40.0); // twist after the scroll already owns it
         acts = g.motion(1, p1.0, p1.1, ABS, 20.0);
         acts.extend(g.motion(2, p2.0, p2.1, ABS, 21.0));
         assert!(
@@ -1010,7 +954,7 @@ mod tests {
             }]
         );
         assert!(g.tick(600.0).is_empty(), "arms once");
-        let _ = g.motion(1, 90.0, 50.0, ABS, 620.0); // drags with the button held
+        let _ = g.motion(1, 90.0, 50.0, ABS, 620.0);
         assert_eq!(
             g.up(1, 700.0),
             vec![Act::Button {
@@ -1026,11 +970,11 @@ mod tests {
         let _ = g.down(1, 50.0, 50.0, ABS, 0.0);
         let _ = g.motion(1, 90.0, 50.0, ABS, 100.0); // past the slop: a swipe, not a press
         assert!(g.tick(600.0).is_empty());
-        assert!(g.up(1, 700.0).is_empty()); // and a swipe is not a click either
+        assert!(g.up(1, 700.0).is_empty());
 
         let _ = g.down(2, 50.0, 50.0, ABS, 1000.0);
         let _ = g.down(3, 80.0, 50.0, ABS, 1010.0);
-        let _ = g.up(3, 1020.0); // a second finger came and went: no press
+        let _ = g.up(3, 1020.0); // second finger came and went: no press
         assert!(g.tick(1600.0).is_empty());
     }
 
@@ -1038,10 +982,10 @@ mod tests {
     fn reset_clears_a_drag_without_re_emitting() {
         let mut g = Gestures::new(true, false);
         let _ = g.down(1, 50.0, 50.0, ABS, 0.0);
-        let _ = g.up(1, 5.0); // arm
-        let _ = g.down(2, 51.0, 50.0, ABS, 50.0); // drag begins (left held)
+        let _ = g.up(1, 5.0);
+        let _ = g.down(2, 51.0, 50.0, ABS, 50.0);
         g.reset();
-        // After a reset a fresh tap is an ordinary click (no stuck drag state).
+        // Reset must not leave a stuck drag: a later tap is an ordinary click.
         let mut acts = g.down(3, 400.0, 400.0, ABS, 500.0);
         acts.extend(g.up(3, 510.0));
         assert_eq!(
