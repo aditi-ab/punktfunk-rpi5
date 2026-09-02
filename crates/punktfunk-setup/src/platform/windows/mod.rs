@@ -166,6 +166,8 @@ pub struct WinFacts {
     /// Inno's `unins000.dat` sits in the install dir: the box was installed by the `.iss`, and
     /// the first upgrade over it retires that data (D6 — never run Inno's uninstaller).
     pub inno_uninstaller: bool,
+    /// The client artifact's own ARP key (per user, HKCU). `installed` above is the host's.
+    pub client_installed: Option<WinInstall>,
 }
 
 impl WinFacts {
@@ -209,6 +211,16 @@ impl WinFacts {
             web_task: task_state(run, "PunktfunkWeb"),
             scripting_task: task_state(run, "PunktfunkScripting"),
             inno_uninstaller,
+            client_installed: arp_install_at(run, plan::CLIENT_ARP_KEY),
+        }
+    }
+
+    /// The install this artifact upgrades or removes: the host's under HKLM, the client's
+    /// under HKCU — two products, two keys (D1).
+    pub fn installed_for(&self, artifact: plan::Artifact) -> Option<&WinInstall> {
+        match artifact {
+            plan::Artifact::Host => self.installed.as_ref(),
+            plan::Artifact::Client => self.client_installed.as_ref(),
         }
     }
 
@@ -240,9 +252,11 @@ fn arch(env: &Env) -> String {
 }
 
 fn arp_install(run: &dyn CommandRunner) -> Option<WinInstall> {
-    let out = run
-        .probe("reg", &["query", HOST_ARP_KEY])
-        .filter(|o| o.ok())?;
+    arp_install_at(run, HOST_ARP_KEY)
+}
+
+fn arp_install_at(run: &dyn CommandRunner, key: &str) -> Option<WinInstall> {
+    let out = run.probe("reg", &["query", key]).filter(|o| o.ok())?;
     Some(WinInstall {
         version: parse_reg_value(&out.stdout, "DisplayVersion"),
         location: parse_reg_value(&out.stdout, "InstallLocation"),
@@ -470,6 +484,27 @@ mod tests {
             .with_path("schtasks");
         let env = Env::of(&[("PROCESSOR_ARCHITECTURE", "AMD64")]);
         (run, env, FakeNet::default(), tempfile::tempdir().unwrap())
+    }
+
+    #[test]
+    fn the_client_key_is_probed_apart_from_the_hosts() {
+        let (mut run, env, net, tmp) = fresh_box();
+        run = run.answer(
+            &format!("reg query {}", plan::CLIENT_ARP_KEY),
+            0,
+            &reg_out(plan::CLIENT_ARP_KEY, "DisplayVersion", "REG_SZ", "0.33.1"),
+        );
+        let facts = probe(&run, &env, &net, tmp.path());
+        assert!(facts.installed.is_none());
+        assert_eq!(
+            facts
+                .installed_for(plan::Artifact::Client)
+                .unwrap()
+                .version
+                .as_deref(),
+            Some("0.33.1")
+        );
+        assert!(facts.installed_for(plan::Artifact::Host).is_none());
     }
 
     #[test]

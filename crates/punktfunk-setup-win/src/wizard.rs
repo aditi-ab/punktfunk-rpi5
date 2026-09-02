@@ -522,6 +522,9 @@ impl DemoSeams {
             subst: Subst {
                 version: concat!(env!("CARGO_PKG_VERSION"), "-demo").to_string(),
                 staging: format!("{tmp}\\staging"),
+                local_app_data: format!("{tmp}\\localappdata"),
+                start_menu: format!("{tmp}\\startmenu"),
+                desktop: format!("{tmp}\\desktop"),
                 temp: tmp,
             },
         }
@@ -901,16 +904,12 @@ fn welcome_page(ctx: &Ctx) -> Element {
     };
     // Manage mode (D9): an installed box re-titles Welcome. The uninstaller exe (D6) offers
     // the teardown only; the installer offers Reconfigure — the upgrade path — or Uninstall.
-    let subtitle = ctx
-        .screen
-        .facts
-        .installed
-        .as_ref()
-        .map(|inst| match &inst.version {
-            Some(v) => format!("{v} · {what} installed"),
-            None => format!("{what} installed"),
-        });
-    let fresh_install = !ctx.preset.uninstall && ctx.screen.facts.installed.is_none();
+    let installed = ctx.screen.facts.installed_for(ctx.preset.artifact);
+    let subtitle = installed.map(|inst| match &inst.version {
+        Some(v) => format!("{v} · {what} installed"),
+        None => format!("{what} installed"),
+    });
+    let fresh_install = !ctx.preset.uninstall && installed.is_none();
     let (sentence, buttons): (&str, Vec<Element>) = if ctx.preset.uninstall {
         (
             "This removes punktfunk from this PC. Identity, pairings and passwords stay — a reinstall picks them up.",

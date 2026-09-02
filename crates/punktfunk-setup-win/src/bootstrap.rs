@@ -3,10 +3,12 @@
 //! `PUNKTFUNK_SETUP_ROOT` plus the same argv; the parent waits and returns the child's exit
 //! code, so winget and a terminal see one process with one result.
 //!
-//! The dir is created with an explicit SDDL — owner Administrators, SYSTEM + Administrators
-//! only, protected, inherited — so it passes the host's `ensure_admin_only_source` by
-//! construction: driver staging and the password temp file are served from it. Cleanup is
-//! left to a later run: a process cannot delete the directory it runs from.
+//! Elevated (the host installer), the dir is created with an explicit SDDL — owner
+//! Administrators, SYSTEM + Administrators only, protected, inherited — so it passes the
+//! host's `ensure_admin_only_source` by construction: driver staging and the password temp
+//! file are served from it. Unelevated (the per-user client, M4) it is a plain dir under
+//! LOCALAPPDATA. Cleanup is left to a later run: a process cannot delete the directory it
+//! runs from.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -68,16 +70,61 @@ fn extract_and_run(exe: &Path, data: &[u8], payload: &[u8]) -> Result<ExitCode, 
     ))
 }
 
-/// `%ProgramData%\punktfunk\setup\<pid>-<hex>`, protected before anything lands in it.
+/// Elevated: `%ProgramData%\punktfunk\setup\<pid>-<hex>`, protected before anything lands in
+/// it. Unelevated: the same layout under `%LOCALAPPDATA%` — the client has no driver staging
+/// and nothing there needs the admin-only guarantee.
 fn fresh_root() -> Result<PathBuf, String> {
-    let data = std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    let elevated = elevated();
+    let data = std::env::var_os(if elevated {
+        "ProgramData"
+    } else {
+        "LOCALAPPDATA"
+    })
+    .map(PathBuf::from)
+    .ok_or("neither ProgramData nor LOCALAPPDATA is set")?;
     let base = data.join("punktfunk").join("setup");
     std::fs::create_dir_all(&base).map_err(|e| format!("{}: {e}", base.display()))?;
     let root = base.join(format!("{}-{}", std::process::id(), sys::random_hex(4)?));
-    protected_dir(&root)?;
+    if elevated {
+        protected_dir(&root)?;
+    } else {
+        std::fs::create_dir(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+    }
     Ok(root)
+}
+
+/// Whether this process runs with an elevated token — the host bin's manifest asks for one,
+/// the client twin's does not.
+fn elevated() -> bool {
+    use windows::Win32::handleapi::CloseHandle;
+    use windows::Win32::processthreadsapi::{GetCurrentProcess, OpenProcessToken};
+    use windows::Win32::securitybaseapi::GetTokenInformation;
+    use windows::Win32::{TokenElevation, HANDLE, TOKEN_ELEVATION, TOKEN_QUERY};
+
+    let mut token = HANDLE::default();
+    // SAFETY: plain token query — open our own process token, read one fixed-size struct
+    // into a stack local of exactly that size, close the handle on every path.
+    unsafe {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY as u32, &mut token)
+            .ok()
+            .is_err()
+        {
+            return false;
+        }
+        let mut info = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        let read = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(std::ptr::from_mut(&mut info).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+        .ok()
+        .is_ok();
+        let _ = CloseHandle(token);
+        read && info.TokenIsElevated != 0
+    }
 }
 
 /// Owner Administrators; SYSTEM and Administrators full control, inherited; nothing else,
