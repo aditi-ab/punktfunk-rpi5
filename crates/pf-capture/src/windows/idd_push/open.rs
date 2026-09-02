@@ -687,7 +687,7 @@ impl IddPushCapturer {
     /// republishes on attach (`FrameStash` in `frame_transport.rs`), so a healthy
     /// idle desktop clears in milliseconds. Otherwise DWM compose after activate
     /// (~1 s) plus the kick below; no frame in the window is genuinely broken.
-    fn wait_for_attach(&self) -> Result<()> {
+    pub(super) fn wait_for_attach(&self) -> Result<()> {
         // Our stamp; nothing legitimate rewrites it. A mismatch is a host-side
         // stash/capturer cross-wire — the same class the driver refuses from
         // the other end.
