@@ -13,13 +13,16 @@ agreements and installation notes stay under normal code review.
 
 ## Why these choices
 
-- **`InstallerType: inno`, `Scope: machine`, `ElevationRequirement: elevatesSelf`.** The host
-  registers a SYSTEM service, installs drivers and opens firewall ports; `PrivilegesRequired=admin`
-  in the `.iss` means Setup raises its own UAC prompt. There is no per-user scope.
-- **`ProductCode: {7C9E6A52-…}_is1`** — Inno's ARP key is `<AppId>_is1`. This is what correlates an
-  installed host with the package for `winget list` / `winget upgrade`. **It must track `AppId` in
-  `packaging/windows/punktfunk-host.iss`** — if that GUID ever changes, change it here too or
-  upgrades silently stop being detected.
+- **`InstallerType: exe`, `Scope: machine`, `ElevationRequirement: elevatesSelf`.** The installer
+  is punktfunk-setup-win (the self-contained engine exe), which speaks the Inno Setup silent
+  dialect verbatim but is not an Inno binary. The host registers a SYSTEM service, installs
+  drivers and opens firewall ports; the exe's `requireAdministrator` manifest raises its own UAC
+  prompt. There is no per-user scope.
+- **`ProductCode: {7C9E6A52-…}_is1`** — the ARP key keeps Inno's `<AppId>_is1` name forever. This
+  is what correlates an installed host with the package for `winget list` / `winget upgrade`, and
+  it is what lets an Inno-installed host upgrade onto the engine. **It must track `HOST_ARP_KEY` in
+  `crates/punktfunk-setup/src/platform/windows/mod.rs`** — if that GUID ever changes, change it
+  here too or upgrades silently stop being detected.
 - **`interactive` is in `InstallModes`.** `winget install unom.PunktfunkHost --interactive` runs the
   full existing wizard: every task checkbox and the web-console password page.
   Nothing about the installer changes to support it.
@@ -28,12 +31,12 @@ agreements and installation notes stay under normal code review.
   default is a support trap ("it works when I install it by hand"). The disclosures the wizard puts
   on screen are carried by `Agreements` instead, which winget shows *before* install and requires
   the user to accept.
-- **`UpgradeBehavior: install`** — Inno upgrades in place (`UsePreviousAppDir=yes`). Uninstalling
-  first would run the `[UninstallRun]` service + driver teardown between versions.
+- **`UpgradeBehavior: install`** — the engine upgrades in place (it follows `InstallLocation`).
+  Uninstalling first would run the service + driver teardown between versions.
 
 ## Opting out of individual tasks
 
-Inno's `/MERGETASKS` takes `!` prefixes to deselect a default-checked task. Use `--override`
+The Inno-dialect `/MERGETASKS` takes `!` prefixes to deselect a default-checked task. Use `--override`
 (replaces winget's switches) rather than `--custom` (appends — you would end up with two
 `/MERGETASKS` on one command line):
 

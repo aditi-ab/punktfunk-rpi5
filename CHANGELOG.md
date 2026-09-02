@@ -160,6 +160,17 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 
 ### Changed
 
+- **The Windows installers are punktfunk's own.** `punktfunk-host-setup-<version>.exe` and
+  `punktfunk-client-setup-<version>_<arch>.exe` are now built by `punktfunk-setup-win`, the
+  engine behind the Linux installer, with a self-contained WinUI 3 wizard (Recommended or
+  Custom, a stepper, the web-console password shown once behind a reveal, next steps on the
+  finish page) instead of Inno Setup. Nothing a script or a fielded box relies on changes: the
+  same silent flags (`/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /LOG= /MERGETASKS`), the
+  same Add/Remove entry and `unins000.exe`, the same install dir, the same Authenticode
+  signer. A host installed by the old installer upgrades in place and its Inno uninstaller data
+  is retired on that first upgrade. winget: the host manifest's `InstallerType` is `exe` from
+  this version; `winget upgrade` keeps tracking the same `ProductCode`. The wizard needs
+  Windows 11; a silent install runs anywhere the host does.
 - **The install commands are generated from `data/platforms.json`.** They were copied beside it
   and kept in step by a CI substring check; the binary embeds the file, so the docs and the
   installer cannot drift. Nothing to do.

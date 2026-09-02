@@ -54,7 +54,8 @@ param(
     [switch]$NoDriver,                                              # build without the bundled pf-vdisplay driver
     [switch]$NoSign,                                                # skip signing (local debug)
     # WP3.1 (design/installer-v2-windows.md D3/D6): pack with punktfunk-setup-win instead of ISCC.
-    # Same staging inputs, same output name, same signing. ISCC stays the default until M5.
+    # Same staging inputs, same output name, same signing. Since M5 the workflow passes it for
+    # the published artifact; ISCC (the default here) is the one-release revert path.
     [switch]$Engine,
     # 'auto' (default) = required iff this is a v* tag build; 'true'/'false' to force. See below.
     [ValidateSet('auto', 'true', 'false')][string]$RequireSignedCert = 'auto'

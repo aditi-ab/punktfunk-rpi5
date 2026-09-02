@@ -1,15 +1,21 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
 #
-# Installer manifest for the Windows host (packaging/windows/punktfunk-host.iss -> Inno Setup 6).
+# Installer manifest for the Windows host: punktfunk-setup-win, the self-contained engine exe
+# (crates/punktfunk-setup-win, packed by packaging/windows/pack-host-installer.ps1 -Engine).
+# It speaks the Inno Setup silent dialect verbatim (design/installer-v2-windows.md D5) and keeps
+# Inno's ARP key + unins000.exe (D6), which is why everything below except InstallerType reads
+# as it did for the Inno Setup years.
 #
 # The host is a machine-wide, elevated install: it registers a SYSTEM service, installs the
 # pf-vdisplay + gamepad drivers, and opens firewall ports. There is no per-user scope.
 PackageIdentifier: unom.PunktfunkHost
 PackageVersion: 0.19.2
 
-InstallerType: inno
+# `exe`, not `inno`: winget's inno defaults would also work (same switches), but the artifact is
+# not an Inno Setup binary and must not be treated as one.
+InstallerType: exe
 Scope: machine
-# PrivilegesRequired=admin in the .iss -> Setup raises its own UAC prompt.
+# The exe's manifest asks for requireAdministrator -> it raises its own UAC prompt.
 ElevationRequirement: elevatesSelf
 # Windows 11 22H2 floor: pf-vdisplay is built against IddCx 1.10 with no runtime downgrade, so on
 # anything older the device fails to start with Code 10 (see the MinVersion gate in the .iss).
@@ -23,14 +29,14 @@ InstallModes:
   - silentWithProgress
 
 InstallerSwitches:
-  # Spelled out rather than relying on winget's built-in `inno` defaults, so the unattended
+  # Spelled out: an `exe` manifest has no built-in switches, and this way the unattended
   # behaviour is reviewable here. No /MERGETASKS: a silent install deliberately takes the SAME
   # task defaults the wizard shows, so the product does not differ by install channel. The
   # disclosures the wizard puts on screen are carried by Agreements/InstallationNotes in the
   # locale manifest instead.
   #
-  # To CHANGE individual tasks, callers pass Inno's /MERGETASKS via --override: a bare name adds a
-  # task, a `!` prefix removes one. GameStream is opt-in (its plane pairs over plain HTTP), so
+  # To CHANGE individual tasks, callers pass the Inno-dialect /MERGETASKS via --override: a bare
+  # name adds a task, a `!` prefix removes one. GameStream is opt-in (its plane pairs over plain HTTP), so
   # enabling it unattended is the additive form:
   #   winget install unom.PunktfunkHost --override "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /MERGETASKS=gamestream"
   # and dropping a default-on task is the negated form, e.g. /MERGETASKS=!trayicon
@@ -41,17 +47,18 @@ InstallerSwitches:
   # <LOGPATH> is winget's OWN token and the only spelling it substitutes (see the schema this file
   # declares: "…<LOGPATH> token can be included in the switch value so that winget will replace the
   # token with user provided path"). It was written |LOGPATH| — not a token, so winget passed the
-  # literal string through and Inno rejected it: `|` is not legal in a Windows filename, giving
-  # "Error creating log file: The filename, directory name, or volume label syntax is incorrect."
-  # That aborted the install in EVERY mode, interactive included, for any caller that asks for a
-  # log — UniGetUI does so by default, which is how it was reported.
+  # literal string through and the installer rejected it: `|` is not legal in a Windows filename,
+  # giving "Error creating log file: The filename, directory name, or volume label syntax is
+  # incorrect." That aborted the install in EVERY mode, interactive included, for any caller that
+  # asks for a log — UniGetUI does so by default, which is how it was reported.
   Log: /LOG="<LOGPATH>"
 
-# Inno writes its ARP entry under <AppId>_is1; this is what correlates an installed host with the
-# package for `winget list` / `winget upgrade`. Must track AppId in the .iss.
+# The ARP entry stays under Inno's `<AppId>_is1` name forever (HOST_ARP_KEY in
+# crates/punktfunk-setup/src/platform/windows/mod.rs): this is what correlates an installed host
+# with the package for `winget list` / `winget upgrade`, across the Inno -> engine boundary too.
 ProductCode: '{7C9E6A52-1F4B-4E8D-A3C7-2B5D8F1E0A93}_is1'
-# Inno upgrades in place (UsePreviousAppDir=yes) — do not uninstall first, that would run the
-# [UninstallRun] service/driver teardown between versions.
+# The engine upgrades in place (it follows InstallLocation) — do not uninstall first, that would
+# run the service/driver teardown between versions.
 UpgradeBehavior: install
 
 Installers:
