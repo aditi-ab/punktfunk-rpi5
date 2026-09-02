@@ -96,7 +96,17 @@ jobs:
           PKG="$(node -p "require('./package.json').version")"
           test "$TAG" = "$PKG" || { echo "tag $GITHUB_REF_NAME does not match package version $PKG"; exit 1; }
 
+      # A version published by hand (the runner queue was deep) must not turn the tag's lane red:
+      # the registry refuses a second upload of the same version, so skip it instead.
+      - name: Skip a version the registry already serves
+        id: published
+        working-directory: plugin-kit
+        run: |
+          if bun -e 'const p = require("./package.json"); (async () => { const r = await fetch("https://git.unom.io/api/packages/unom/npm/" + encodeURIComponent(p.name)); if (!r.ok) process.exit(1); const d = await r.json(); process.exit(d.versions && d.versions[p.version] ? 0 : 1); })()'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Publish to Gitea registry
+        if: steps.published.outputs.skip != 'true'
         working-directory: plugin-kit
         env:
           NODE_AUTH_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
