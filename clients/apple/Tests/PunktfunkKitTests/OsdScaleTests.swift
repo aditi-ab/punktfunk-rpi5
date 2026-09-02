@@ -74,6 +74,18 @@ final class OsdScaleTests: XCTestCase {
         XCTAssertNotEqual(OsdScale.customTag, OsdScale.auto)
     }
 
+    func testStepWalksAutomaticAndThePresetsAndWraps() {
+        XCTAssertEqual(OsdScale.step(1.0, dir: 1), 1.25)
+        XCTAssertEqual(OsdScale.step(1.0, dir: -1), 0.75)
+        XCTAssertEqual(OsdScale.step(1.0, dir: 0), 1.0)
+        XCTAssertEqual(OsdScale.step(OsdScale.auto, dir: 1), OsdScale.presets.first)
+        XCTAssertEqual(OsdScale.step(OsdScale.presets.first!, dir: -1), OsdScale.auto)
+        XCTAssertEqual(OsdScale.step(OsdScale.presets.last!, dir: 1), OsdScale.auto)
+        // A custom entry has no rung; the first step snaps to Automatic.
+        XCTAssertEqual(OsdScale.step(1.6, dir: 1), OsdScale.auto)
+        XCTAssertEqual(OsdScale.step(1.6, dir: -1), OsdScale.auto)
+    }
+
     func testLabelsNameTheAutoValue() {
         XCTAssertEqual(OsdScale.label(OsdScale.auto, for: .tv), "Automatic (175%)")
         XCTAssertEqual(OsdScale.label(OsdScale.auto, for: .desktop), "Automatic (100%)")

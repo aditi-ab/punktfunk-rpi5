@@ -67,8 +67,9 @@ You can also set the level a stream starts at in each client's
 
 The overlay follows your display's scaling, so it should already be readable. To nudge it, set
 **Overlay size** in [Settings](/docs/client-settings#overlay) — Automatic already enlarges it on a
-TV. `PUNKTFUNK_OSD_SCALE` in the **client's** environment overrides that setting for one launch
-(0.5×–4×) — see [Configuration →
+TV. Mid-stream, the quick-action wheel's **More** sheet carries the same row and resizes the
+overlay as you step it. `PUNKTFUNK_OSD_SCALE` in the **client's** environment overrides that
+setting for one launch (0.5×–4×) — see [Configuration →
 Client-side](/docs/configuration#client-side-native-clients).
 
 ## Reading the overlay

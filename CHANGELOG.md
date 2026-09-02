@@ -34,6 +34,12 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 
 ### Added
 
+- **The overlay size steps live and from the wheel.** `punktfunk_core::osd_scale::step` owns the
+  rung walk (Kotlin and Swift twins included), the quick-action wheel's More sheet gains an
+  Overlay-size row on every client, the Windows settings page gains the combo, and the presenter
+  applies a step to the running stream instead of the next one. The step rebases on
+  `Settings::load()` before saving, so it cannot clobber a concurrent edit from a desktop
+  settings dialog.
 - **`punktfunk_core::osd_scale` sizes the streaming chrome.** The stats HUD and the quick-action
   ring take a multiplier on top of each platform's density unit, `AUTO` (`0.0`) resolving from a
   `DeviceClass` — 1.0 in the hand or at a desk, 1.75 on a TV, where `dp`/`pt` assume a viewing

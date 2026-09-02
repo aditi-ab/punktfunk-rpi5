@@ -705,6 +705,14 @@ extension RingOverlay {
             let n = options.count
             a.requestMode(mode.w, mode.h, options[((i + dir) % n + n) % n])
         }
+        // The ring re-renders through ContentView's `@AppStorage`, so a UserDefaults write here
+        // rescales the mounted overlay with the sheet still up.
+        func adjustOsd(_ dir: Int) {
+            let cur = UserDefaults.standard.double(forKey: DefaultsKey.osdScale)
+            UserDefaults.standard.set(OsdScale.step(cur, dir: dir), forKey: DefaultsKey.osdScale)
+        }
+        let osdLabel = OsdScale.label(
+            UserDefaults.standard.double(forKey: DefaultsKey.osdScale), for: OsdScale.deviceClass)
         var rows: [SheetRowSpec] = []
         rows.append(SheetRowSpec(header: "Session", label: "End stream",
                                  value: state.armed == "end_stream" ? "tap again" : "") { [state] in
@@ -731,6 +739,7 @@ extension RingOverlay {
             if pad.enabled { a.togglePad() }
         })
         rows.append(SheetRowSpec(header: "View", label: "Statistics", value: a.stats().label) { a.cycleStats() })
+        rows.append(SheetRowSpec(label: "Overlay size", value: osdLabel, adjust: adjustOsd) { adjustOsd(1) })
         let mic = spec(.mic, cfg, a)
         rows.append(SheetRowSpec(header: "Audio", label: mic.label, value: mic.enabled ? mic.state : mic.reason,
                                  enabled: mic.enabled) { if mic.enabled { a.toggleMic() } })

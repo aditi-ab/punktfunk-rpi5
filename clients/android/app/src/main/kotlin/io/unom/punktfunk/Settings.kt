@@ -778,12 +778,29 @@ object OsdScale {
     /** `1.25` -> `125`, the percentage the picker speaks. */
     fun toPercent(scale: Double): Int = Math.round(sanitize(scale) * 100.0).toInt()
 
-    /**
-     * Parse a typed percentage. Out-of-range input clamps rather than falling back to [AUTO] -
+    /** Parse a typed percentage. Out-of-range input clamps rather than falling back to [AUTO] -
      * someone typing 500 wants the largest chrome offered, not the default.
      */
     fun fromPercent(percent: Int): Double =
         if (percent == 0) AUTO else (percent / 100.0).coerceIn(MIN_SCALE, MAX_SCALE)
+
+    /**
+     * Step the ring's picker ladder one [dir] from [cur], wrapping. Automatic is rung 0, then
+     * [PRESETS]; a value off the ladder (a typed custom entry) has no rung and snaps to Automatic
+     * on the first step.
+     */
+    fun step(cur: Double, dir: Int): Double {
+        val rungs = PRESETS.size + 1
+        val at = if (isAuto(cur)) {
+            0
+        } else {
+            PRESETS.indexOf(cur).takeIf { it >= 0 }?.plus(1) ?: return AUTO
+        }
+        return when (val target = (at + dir).mod(rungs)) {
+            0 -> AUTO
+            else -> PRESETS[target - 1]
+        }
+    }
 
     /** Picker label: "Automatic (175%)" for [AUTO] on [deviceClass], else "125%". */
     fun label(pref: Double, deviceClass: DeviceClass): String =

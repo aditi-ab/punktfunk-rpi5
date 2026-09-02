@@ -84,6 +84,24 @@ public enum OsdScale {
         return min(max(Double(percent) / 100, range.lowerBound), range.upperBound)
     }
 
+    /// Step the ring's picker ladder one `dir` from `cur`, wrapping. Automatic is rung 0, then
+    /// `presets`; a value off the ladder (a typed custom entry) has no rung and snaps to `auto`
+    /// on the first step.
+    public static func step(_ cur: Double, dir: Int) -> Double {
+        let rungs = presets.count + 1
+        let at: Int
+        if isAuto(cur) {
+            at = 0
+        } else if let i = presets.firstIndex(of: cur) {
+            at = i + 1
+        } else {
+            // Off the ladder there is no rung to stand on: the step lands on Automatic.
+            return auto
+        }
+        let target = ((at + dir) % rungs + rungs) % rungs
+        return target == 0 ? auto : presets[target - 1]
+    }
+
     /// Picker label: "Automatic (175%)" for `auto` on `deviceClass`, else "125%".
     public static func label(_ pref: Double, for deviceClass: DeviceClass) -> String {
         isAuto(pref)

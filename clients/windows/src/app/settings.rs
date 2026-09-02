@@ -50,6 +50,11 @@ fn render_scale_label(scale: f64) -> String {
         format!("{scale}\u{00D7}")
     }
 }
+
+/// A percentage label for an overlay-scale preset: "50%"…"200%".
+fn osd_scale_label(scale: f64) -> String {
+    format!("{}%", punktfunk_core::osd_scale::to_percent(scale))
+}
 /// Decode backend presets: `(stored value, display label)`.
 // A stored legacy value that matches no preset (the D3D11VA-era "hardware", and since M10
 // the bare "vulkan"/"d3d11va" that named libavcodec's rungs) shows as Automatic — which is
@@ -864,6 +869,32 @@ pub(crate) fn settings_page(
     };
     let scale_combo = setting_combo(ctx, scope, (rev, set_rev), scale_names, scale_i, |s, i| {
         s.render_scale = RENDER_SCALES[i];
+    });
+    // Rung 0 is Automatic; an off-ladder stored value (a hand-edited store) snaps to it, the
+    // rule the ring's stepper and the GTK entry both apply.
+    let (osd_names, osd_i) = {
+        use punktfunk_core::osd_scale;
+        let mut names = vec![osd_scale::label(
+            osd_scale::AUTO,
+            osd_scale::DeviceClass::Desktop,
+        )];
+        names.extend(osd_scale::PRESETS.iter().map(|&x| osd_scale_label(*x)));
+        let i = if osd_scale::is_auto(s.osd_scale) {
+            0
+        } else {
+            osd_scale::PRESETS
+                .iter()
+                .position(|&x| (x - s.osd_scale).abs() < 1e-6)
+                .map_or(0, |i| i + 1)
+        };
+        (names, i)
+    };
+    let osd_combo = setting_combo(ctx, scope, (rev, set_rev), osd_names, osd_i, |s, i| {
+        s.osd_scale = if i == 0 {
+            punktfunk_core::osd_scale::AUTO
+        } else {
+            punktfunk_core::osd_scale::PRESETS[i - 1]
+        };
     });
     let (comp_names, comp_i) = presets(COMPOSITORS, |v| *v == s.compositor);
     let comp_combo = setting_combo(ctx, scope, (rev, set_rev), comp_names, comp_i, |s, i| {
@@ -1715,8 +1746,21 @@ pub(crate) fn settings_page(
                     "Live session stats in a corner overlay \u{2014} Compact is a one-line pill, \
                      Detailed adds the latency stage breakdown. Ctrl+Alt+Shift+S cycles the \
                      tiers any time.",
-                )],
-                None,
+                )]
+                .into_iter()
+                // Overlay size is a fact about this screen, not a profiled field — like
+                // Auto-wake it stays global (the shared range is punktfunk_core::osd_scale).
+                .chain((!profile_mode).then(|| {
+                    described_labeled(
+                        "Overlay size",
+                        osd_combo,
+                        "How large the stats HUD and the quick-action ring draw, in percent of \
+                         this screen\u{2019}s normal UI. Automatic follows the device \u{2014} larger \
+                         on a TV, which is read from across a room.",
+                    )
+                }))
+                .collect(),
+                Some("Applies from the next session."),
             ));
             ("General", out)
         }

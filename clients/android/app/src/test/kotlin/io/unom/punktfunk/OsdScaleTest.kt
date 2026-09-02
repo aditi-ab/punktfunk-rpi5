@@ -90,6 +90,19 @@ class OsdScaleTest {
     }
 
     @Test
+    fun stepWalksAutomaticAndThePresetsAndWraps() {
+        assertEquals(1.25, OsdScale.step(1.0, 1), 0.0)
+        assertEquals(0.75, OsdScale.step(1.0, -1), 0.0)
+        assertEquals(1.0, OsdScale.step(1.0, 0), 0.0)
+        assertEquals(OsdScale.PRESETS.first(), OsdScale.step(OsdScale.AUTO, 1), 0.0)
+        assertEquals(OsdScale.AUTO, OsdScale.step(OsdScale.PRESETS.first(), -1), 0.0)
+        assertEquals(OsdScale.AUTO, OsdScale.step(OsdScale.PRESETS.last(), 1), 0.0)
+        // A custom entry has no rung; the first step snaps to Automatic.
+        assertEquals(OsdScale.AUTO, OsdScale.step(1.6, 1), 0.0)
+        assertEquals(OsdScale.AUTO, OsdScale.step(1.6, -1), 0.0)
+    }
+
+    @Test
     fun labelsNameTheAutoValue() {
         assertEquals("Automatic (175%)", OsdScale.label(OsdScale.AUTO, OsdScale.DeviceClass.TV))
         assertEquals("Automatic (100%)", OsdScale.label(OsdScale.AUTO, OsdScale.DeviceClass.DESKTOP))
