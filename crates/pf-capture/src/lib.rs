@@ -53,6 +53,50 @@ impl std::fmt::Display for RingFault {
 }
 
 impl std::error::Error for RingFault {}
+
+/// The capturer's live health for the operator surface (immunity plan WP18): the classifier's
+/// last verdict, the ring's self-report, and the last recovery episode. Plain data, no I/O —
+/// the management layer maps it into its wire shape. Names are the classifier's own, lowercased.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureHealth {
+    /// `healthy` / `idle` / `suspect` / `stalled` / `recovering` / `rebuilding` / `secure_desktop`.
+    pub class: &'static str,
+    /// The stall class when `class == "stalled"`: `worker` / `transport` / `conversion` /
+    /// `presentation`.
+    pub stall_class: Option<&'static str>,
+    /// Time since the last real source frame.
+    pub source_gap: std::time::Duration,
+    /// The evidence the verdict rests on: `recent_source` / `input` / `canary` / `presents`.
+    pub evidence: Option<&'static str>,
+    /// The ring's own state word (`active` / `rebuilding` / `dead` / `initializing`); `None` on a
+    /// pre-v3 driver.
+    pub ring_state: Option<&'static str>,
+    /// The fence protocol is negotiated on the current ring.
+    pub fence_ring: bool,
+    pub published_total: u64,
+    pub dropped_total: u64,
+    /// The recovery stage running now, if an episode is open.
+    pub current_stage: Option<&'static str>,
+    /// The last closed episode.
+    pub last_episode: Option<CaptureEpisode>,
+    /// Stalled verdicts refused for budget or cooldown since the last episode.
+    pub episodes_suppressed: u32,
+    /// Time left in the post-failure cooldown.
+    pub cooldown_remaining: Option<std::time::Duration>,
+}
+
+/// One closed recovery episode, as [`CaptureHealth`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureEpisode {
+    pub stall_class: &'static str,
+    pub recovered: bool,
+    pub took: std::time::Duration,
+    /// `(stage, outcome, took)` in ladder order; `outcome` is `applied` / `failed` /
+    /// `unsupported` / `timed_out`.
+    pub stages: Vec<(&'static str, &'static str, std::time::Duration)>,
+    pub consecutive_failures: u32,
+    pub cooldown: std::time::Duration,
+}
 // The Linux capturer reaches `DmabufFrame` through `super::`; `CursorOverlay` it names directly as
 // `pf_frame::CursorOverlay`, so only `DmabufFrame` needs to sit in this crate root's scope.
 #[cfg(target_os = "linux")]
@@ -179,6 +223,12 @@ pub trait Capturer: Send {
     /// stall to the frame that proved recovery. The stream loop forces an IDR
     /// and announces the gap. `None` = nothing recovered.
     fn take_recovered_outage(&mut self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Live capture health for the operator surface (WP18). `None` = this
+    /// capturer does not classify (Linux portal, synthetic sources).
+    fn health(&self) -> Option<CaptureHealth> {
         None
     }
 }

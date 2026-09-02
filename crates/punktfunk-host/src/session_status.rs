@@ -44,6 +44,9 @@ struct LiveSession {
     last_resize_ms: Arc<AtomicU32>,
     /// Launched title's lease, if any — what [`games`] reports for this session.
     game: Option<Arc<crate::gamelease::LeaseShared>>,
+    /// The capturer's live health, published by the video loop (WP18). `None` until the
+    /// first publish, or on a capturer that does not classify.
+    capture_health: Arc<Mutex<Option<pf_capture::CaptureHealth>>>,
 }
 
 /// Resolved read of one live session for `/status`.
@@ -56,6 +59,8 @@ pub struct SessionSnapshot {
     pub codec: Codec,
     /// Display name (trust-store, else sanitized Hello). `None` if nameless.
     pub client_name: Option<String>,
+    /// The capturer's live health, if it classifies.
+    pub capture_health: Option<pf_capture::CaptureHealth>,
     /// Bring-up total (hello → first packet), ms. 0 while still bringing up.
     pub time_to_first_frame_ms: u32,
     /// Last mid-stream resize total, ms. 0 = no resize this session.
@@ -108,6 +113,8 @@ pub struct Registration {
     pub last_resize_ms: Arc<AtomicU32>,
     /// Launched title's lease, if this session launched one.
     pub game: Option<Arc<crate::gamelease::LeaseShared>>,
+    /// The video loop's capture-health slot; it stores the capturer's report on its own cadence.
+    pub capture_health: Arc<Mutex<Option<pf_capture::CaptureHealth>>>,
 }
 
 /// Publish a live native session. The guard removes it on drop and pairs
@@ -126,6 +133,7 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
         ttff_ms,
         last_resize_ms,
         game,
+        capture_health,
     } = reg;
     let id = next_id();
     let session = LiveSession {
@@ -142,6 +150,7 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
         ttff_ms,
         last_resize_ms,
         game,
+        capture_health,
     };
     crate::events::emit(crate::events::EventKind::SessionStarted {
         session: session_ref(&session),
@@ -193,6 +202,11 @@ pub fn snapshot() -> Vec<SessionSnapshot> {
                 bitrate_kbps: s.bitrate_kbps.load(Ordering::Relaxed),
                 codec: s.codec,
                 client_name: s.client_name.clone(),
+                capture_health: s
+                    .capture_health
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
                 time_to_first_frame_ms: s.ttff_ms.load(Ordering::Relaxed),
                 last_resize_ms: s.last_resize_ms.load(Ordering::Relaxed),
             }

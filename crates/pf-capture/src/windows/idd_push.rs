@@ -2376,6 +2376,11 @@ impl Capturer for IddPushCapturer {
         self.recovered_outage.take()
     }
 
+    fn health(&self) -> Option<crate::CaptureHealth> {
+        let ring = self.ring_health();
+        Some(self.recovery.report(Instant::now(), ring.as_ref()))
+    }
+
     fn recreate_ring_in_place(&mut self) -> bool {
         // A target with no ACTIVE path cannot be recovered in place (immunity plan WP10 item 7):
         // a same-mode reset would attach to a known-inactive display. Fail fast — on a FRESH

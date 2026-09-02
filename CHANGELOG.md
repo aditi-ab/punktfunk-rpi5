@@ -34,6 +34,15 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 
 ### Added
 
+- **Capture health on the Status page and in `GET /api/v1/status`.** A native Windows session's
+  `session.capture` block carries the live capture-health class (`healthy`, `idle`, `suspect`,
+  `stalled` with its class, `recovering`, `rebuilding`, `secure_desktop`), the evidence behind
+  it, the ring's own state and whether the fence-ring protocol is negotiated, the stage running
+  now, and the last staged-recovery episode (stall class, recovered or not, each rung's outcome
+  and time, cooldown). A host-wide `display` block reports the topology generation, the last
+  topology transaction and the outstanding monitor-devnode leases. The console's session card
+  shows the class and the last recovery line, so a freeze is read there instead of grepped
+  out of the logs.
 - **Windows connector and PnP mutations are leases.** Every monitor devnode the stream disables
   is journaled before the mutation as a lease naming the node, its prior state, which selector
   picked it (the default standby-sink treatment stays limited to displays that were dark before
