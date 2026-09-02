@@ -591,8 +591,10 @@ mod live_tests {
                 // The framework may terminate the frozen host at any topology write — on a
                 // box whose exclusive watchdog is re-asserting, that can be before the floor —
                 // so the end time is reported, not bounded from below.
+                // The two typed ends: the death watch ("WUDFHost … exited") or the ladder's
+                // `RingFault::SourceStalled` ("no source frame for Ns …").
                 assert!(
-                    e.contains("WUDFHost") || e.contains("SourceStalled") || e.contains("stale"),
+                    e.contains("WUDFHost") || e.contains("no source frame"),
                     "the plane must end with a typed driver/source fault, got: {e}"
                 );
             }
