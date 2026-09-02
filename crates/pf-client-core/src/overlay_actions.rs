@@ -1,23 +1,23 @@
-//! The in-stream quick-action ring's configuration: the `overlay_actions` setting, one JSON
-//! blob (schema `v: 2`, design/touch-client-overlay.md §3.2). Six ring slots clockwise from 12
-//! o'clock, the custom shortcuts, and the virtual pad's preset.
+//! In-stream quick-action ring: the `overlay_actions` JSON blob (schema `v: 2`).
+//! Six slots clockwise from 12 o'clock, custom shortcuts, and the virtual pad
+//! preset. Design: `design/touch-client-overlay.md`.
 //!
-//! Contract: [`OverlayConfig::parse`] never fails. Fewer than six slots pad with empty, more are
-//! truncated, an unknown slot id or a dangling `shortcut:` reference is an empty slot, an absent
-//! field takes its default, and an unparseable blob is the platform default. Profiles sync
-//! between client versions, so a newer client's ring must degrade quietly on an older one.
+//! [`OverlayConfig::parse`] never fails. Short rings pad empty, long ones
+//! truncate; unknown ids and dangling `shortcut:` refs become empty slots;
+//! absent fields take defaults; unparseable blobs take the platform default.
+//! Profiles sync across client versions, so a newer ring must degrade quietly.
 //!
-//! The Swift (`OverlayActions.swift`) and Kotlin (`OverlayActions.kt`) ports mirror this file;
-//! the tests here are the contract they port.
+//! Swift (`OverlayActions.swift`) and Kotlin (`OverlayActions.kt`) mirror this
+//! file; the tests here are the contract they port.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Slots on the ring, clockwise from 12 o'clock.
+/// Clockwise from 12 o'clock.
 pub const RING_SLOTS: usize = 6;
 
-/// What a ring slot does. `Host` carries a host-advertised action id (`power.sleep`);
-/// `Shortcut` refers into [`OverlayConfig::shortcuts`] by id.
+/// `Host` is a host-advertised id (`power.sleep`); `Shortcut` is an id in
+/// [`OverlayConfig::shortcuts`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlotId {
     EndStream,
@@ -33,7 +33,7 @@ pub enum SlotId {
 }
 
 impl SlotId {
-    /// The wire id back, the inverse of [`SlotId::parse`].
+    /// Inverse of [`SlotId::parse`].
     pub fn id(&self) -> String {
         match self {
             SlotId::EndStream => "end_stream".into(),
@@ -49,7 +49,7 @@ impl SlotId {
         }
     }
 
-    /// An id from the blob; `None` for one this build does not know (an empty slot).
+    /// `None` is an empty slot: unknown to this build.
     pub fn parse(s: &str) -> Option<SlotId> {
         Some(match s {
             "end_stream" => SlotId::EndStream,
@@ -73,9 +73,8 @@ impl SlotId {
     }
 }
 
-/// A custom key chord. `keys` are names from the shared keymap tables (`ctrl`, `shift`,
-/// `escape`, `tab`, `f4`, `a`…), never raw virtual-key codes, so one profile works on every
-/// client.
+/// Chord stored as keymap names (`ctrl`, `f4`, `a`), never VKs, so one
+/// profile fires on every client.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shortcut {
     pub id: String,
@@ -85,10 +84,8 @@ pub struct Shortcut {
     pub keys: Vec<String>,
 }
 
-/// The Windows virtual-key code a shortcut key name stands for — the wire speaks VKs, and a
-/// profile written on one client must fire on every other, so names, not codes, are stored.
-/// Modifiers, navigation keys, `f1`…`f24`, `a`…`z`, `0`…`9`; `None` for a name this build does
-/// not know (the chord then does not fire, and the editor shows the key as unknown).
+/// Windows VK for a stored key name. The wire is VKs; profiles store names.
+/// `None` means this build does not know the name — the chord does not fire.
 pub fn key_vk(name: &str) -> Option<u8> {
     let n = name.trim().to_ascii_lowercase();
     let vk = match n.as_str() {
@@ -131,7 +128,6 @@ pub fn key_vk(name: &str) -> Option<u8> {
     Some(vk)
 }
 
-/// A chord as a legend reads it: `Ctrl+Shift+Esc`.
 pub fn chord_chip(keys: &[String]) -> String {
     keys.iter()
         .map(|k| key_legend(k))
@@ -139,8 +135,8 @@ pub fn chord_chip(keys: &[String]) -> String {
         .join("+")
 }
 
-/// One key's legend: the word a keyboard prints on it (`Ctrl`, `Esc`, `PgUp`), arrows as
-/// arrows. Symbols like ❖ or ⇧ read as nothing to most people, so none are used here.
+/// Keycap word (`Ctrl`, `Esc`, `PgUp`); arrows as arrows. No ❖/⇧ — they read
+/// as nothing to most people.
 pub fn key_legend(k: &str) -> String {
     match k.trim().to_ascii_lowercase().as_str() {
         "ctrl" | "control" => "Ctrl".to_string(),
@@ -170,13 +166,13 @@ pub fn key_legend(k: &str) -> String {
     }
 }
 
-/// A per-control tweak's `scale` bounds; the twins clamp what a blob claims.
+/// Scale a blob may claim for one pad control; ports clamp to this range.
 pub const PAD_TWEAK_SCALE_MIN: f32 = 0.5;
 pub const PAD_TWEAK_SCALE_MAX: f32 = 2.0;
 
-/// One control's layout override: `x` and `y` place its centre as fractions of the layer's
-/// width and height, `scale` sizes it about that centre, `hidden` takes it out of the stream
-/// (the editor still shows it, ghosted). An absent field keeps the preset's value.
+/// Per-control override. `x`/`y` are centre as fractions of the layer;
+/// `hidden` drops it from the stream (the editor still ghosts it). Absent
+/// fields keep the preset.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PadTweak {
@@ -190,12 +186,10 @@ pub struct PadTweak {
     pub hidden: bool,
 }
 
-/// The virtual controller (Android and Apple only): `layout` is `full`, `sticks` or `dpad`;
-/// `opacity` and `scale` are the two sliders. `controls` carries the per-control overrides,
-/// keyed by control id — `ls`, `rs`, `dpad`, `face`, `lb`, `rb`, `lt`, `rt`, `select`, `guide`,
-/// `start` — and `controls_narrow` the same for a narrow (upright) layer, the two classes the
-/// preset already lays out differently. An id this build does not know rides along untouched,
-/// the same courtesy the ring's unknown slots get.
+/// Virtual controller (Android and Apple). `layout` is `full`, `sticks` or
+/// `dpad`. `controls` / `controls_narrow` are keyed by id (`ls`, `rs`,
+/// `dpad`, `face`, `lb`/`rb`, `lt`/`rt`, `select`, `guide`, `start`);
+/// unknown ids ride through a rewrite, same as unknown ring slots.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PadConfig {
@@ -220,15 +214,14 @@ impl Default for PadConfig {
     }
 }
 
-/// Which platform default ring applies: phones and tablets carry the keyboard and the virtual
-/// pad; desktops carry the linger disconnect and send-text instead.
+/// Touch rings include keyboard and pad; desktop rings include linger and
+/// send-text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RingPlatform {
     Touch,
     Desktop,
 }
 
-/// The parsed setting.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OverlayConfig {
     pub ring: [Option<SlotId>; RING_SLOTS],
@@ -236,7 +229,7 @@ pub struct OverlayConfig {
     pub pad: PadConfig,
 }
 
-/// The blob's shape on disk. Lenient by construction: every field defaults.
+/// On-disk blob. Every field defaults so parse stays lenient.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 struct Raw {
@@ -275,8 +268,7 @@ impl OverlayConfig {
         }
     }
 
-    /// Parse the setting. An empty or unparseable blob is the platform default; everything
-    /// else degrades slot by slot (module docs).
+    /// Empty or unparseable → platform default; else slot-by-slot (module docs).
     pub fn parse(json: &str, platform: RingPlatform) -> Self {
         if json.trim().is_empty() {
             return Self::platform_default(platform);
@@ -304,7 +296,6 @@ impl OverlayConfig {
         }
     }
 
-    /// The blob to store — always the current schema version.
     pub fn to_json(&self) -> String {
         let raw = Raw {
             v: Self::SCHEMA_VERSION,
@@ -319,14 +310,12 @@ impl OverlayConfig {
         serde_json::to_string(&raw).expect("plain data serializes")
     }
 
-    /// The shortcut a `shortcut:<id>` slot refers to.
     pub fn shortcut(&self, id: &str) -> Option<&Shortcut> {
         self.shortcuts.iter().find(|s| s.id == id)
     }
 
-    /// Write a shortcut: over its own entry when `id` names one, else appended with the next
-    /// `s<n>` id and into the first empty slot (design §3.3). Returns the id it went under.
-    /// One implementation for every editor, so a shortcut made on any client lands the same.
+    /// Insert or replace. New ids are `s<n>` into the first empty ring slot.
+    /// One implementation for every editor so a shortcut lands the same everywhere.
     pub fn upsert_shortcut(&mut self, id: Option<&str>, label: &str, keys: Vec<String>) -> String {
         let label = label.trim().to_string();
         if let Some(sc) = id.and_then(|id| self.shortcuts.iter_mut().find(|s| s.id == id)) {
@@ -353,8 +342,8 @@ impl OverlayConfig {
         id
     }
 
-    /// Drop a shortcut and empty the slot that pointed at it (`parse` would on the next read;
-    /// doing it here shows it at once).
+    /// Drop the shortcut and empty the ring slot that pointed at it (`parse`
+    /// would on the next read; doing it here shows it at once).
     pub fn remove_shortcut(&mut self, id: &str) {
         self.shortcuts.retain(|s| s.id != id);
         for slot in self.ring.iter_mut() {
@@ -365,8 +354,8 @@ impl OverlayConfig {
     }
 }
 
-/// One thing a slot can hold, as an editor lists it: the wire id (empty for the empty slot),
-/// the label, and the note that says where it is unavailable (empty when it is not).
+/// One catalogue row. Empty `id` is the empty slot; empty `note` means
+/// available on this platform.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogueEntry {
     pub id: String,
@@ -374,17 +363,15 @@ pub struct CatalogueEntry {
     pub note: String,
 }
 
-/// A group of the catalogue, in the order every editor shows them.
+/// Editor group, in display order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogueGroup {
     pub title: &'static str,
     pub entries: Vec<CatalogueEntry>,
 }
 
-/// The catalogue by group (design §3.3): Session, Input, View, Audio, Host, the blob's own
-/// Shortcuts (when there are any), Empty last. One table for every editor — the shells render
-/// it, they do not restate it. The notes are the platform's: a desktop has no virtual
-/// controller and no typed-text path; a phone has both.
+/// One table every editor renders. Notes are the platform's: desktop has no
+/// virtual pad and no typed-text path; a phone has both. Empty last.
 pub fn catalogue(cfg: &OverlayConfig, platform: RingPlatform) -> Vec<CatalogueGroup> {
     let e = |id: &str, label: &str, note: &str| CatalogueEntry {
         id: id.into(),
@@ -467,15 +454,10 @@ pub fn catalogue(cfg: &OverlayConfig, platform: RingPlatform) -> Vec<CatalogueGr
     g
 }
 
-/// The Lucide icon a slot draws instead of a word, by wire id — the mic swaps to its struck
-/// form while muted, and `more` is the ring's own centre. `None` for what the set cannot know:
-/// a shortcut (its keycap chord IS its face) and any host action beyond the three powers.
-///
-/// One table for every shell that draws the ring — the in-stream Skia console, its editor, the
-/// GTK shell's editor and the Windows client's — so a slot cannot carry one mark in the stream
-/// and another in the editor that configures it (design tenet 8). The name keys
-/// [`crate::lucide`] on the two Rust shells that stroke the path, and the baked PNG on the
-/// Windows shell, which cannot.
+/// Lucide name for a wire id. `mic` swaps to `mic-off` while muted; `more` is
+/// the ring centre. `None` for a shortcut (the chord is the face) and any host
+/// action beyond the three powers. One table so stream and editor cannot
+/// disagree; Rust shells key [`crate::lucide`], Windows keys a baked PNG.
 pub fn slot_icon(id: &str, state: &str) -> Option<&'static str> {
     Some(match id {
         "end_stream" => "square",
@@ -499,9 +481,6 @@ pub fn slot_icon(id: &str, state: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    /// The catalogue is one list in one order on every editor: the groups, the desktop notes
-    /// a phone does not carry, the blob's shortcuts by name with the legend as the note, and
-    /// Empty last — with no Shortcuts group when there are none.
     #[test]
     fn the_catalogue_is_grouped_noted_per_platform_and_ends_with_empty() {
         let blob = r#"{"v":2,"ring":[],"shortcuts":[{"id":"s1","label":"Task Manager","keys":["ctrl","shift","escape"]},{"id":"s2","keys":["alt","f4"]}]}"#;
@@ -544,8 +523,6 @@ mod tests {
         assert!(none.iter().all(|g| g.title != "Shortcuts"));
     }
 
-    /// A new shortcut takes the next id and the first empty slot; written again under its id
-    /// it changes in place; removed, its slot empties.
     #[test]
     fn a_shortcut_is_upserted_by_id_and_takes_the_first_empty_slot() {
         let mut cfg = OverlayConfig::parse(
@@ -628,15 +605,11 @@ mod tests {
         );
         assert_eq!(touch.ring[5], Some(SlotId::Pad));
         assert_eq!(desktop.ring[5], Some(SlotId::SendText));
-        // Absent fields take their defaults; a present ring does not disturb the pad.
         let cfg = OverlayConfig::parse(r#"{"v":2,"ring":[]}"#, RingPlatform::Touch);
         assert_eq!(cfg.pad, PadConfig::default());
         assert!(cfg.ring.iter().all(Option::is_none));
     }
 
-    /// Per-control overrides ride the pad: partial fields parse with the rest defaulted, an
-    /// unknown control id is carried through a rewrite, and an untouched pad keeps its blob
-    /// clean — no empty maps, no null fields.
     #[test]
     fn pad_control_tweaks_round_trip_and_carry_unknown_ids() {
         let blob = r#"{"v":2,"pad":{"layout":"full","opacity":0.45,"scale":1.0,
@@ -712,16 +685,13 @@ mod tests {
         }
     }
 
-    /// Every built-in slot the ring can hold names an icon, that icon really ships, and the
-    /// mic's muted form is its own mark. A slot with no icon draws its short word instead —
-    /// fine for an unknown host action, wrong for a slot the catalogue offers.
     #[test]
     fn every_built_in_slot_names_an_icon_that_ships() {
         let cfg = OverlayConfig::platform_default(RingPlatform::Desktop);
         for group in catalogue(&cfg, RingPlatform::Desktop) {
             for entry in group.entries {
                 if entry.id.is_empty() {
-                    continue; // the empty slot draws a plus, not a slot icon
+                    continue; // empty slot draws a plus, not a slot icon
                 }
                 let name =
                     slot_icon(&entry.id, "").unwrap_or_else(|| panic!("{} has no icon", entry.id));

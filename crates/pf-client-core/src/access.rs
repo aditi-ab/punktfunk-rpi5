@@ -1,36 +1,32 @@
-//! The session's effective access, client-side (design/per-client-access.md §7): one
-//! snapshot type over the shared grant vocabulary, the preset label derived from the mask
-//! (never stored — §3.2), the overlay chip's text, and the toast wording for a mid-session
-//! [`AccessUpdate`](punktfunk_core::quic::AccessUpdate). Pure presentation logic on purpose —
-//! the HOST enforces the mask whatever a client renders; everything here is the courtesy
-//! that makes a limited session say what it is instead of feeling broken.
+//! Client-side session access: grant mask, derived preset label, overlay chip, toast.
 //!
-//! The Apple/Android clients mirror these rules rather than link them — the labels, the
-//! chip/notice wording and the derive-not-store rule below are the contract they copy.
+//! One snapshot over the shared grant vocabulary. The preset name is derived from
+//! the mask, never stored (`design/per-client-access.md`). Mid-session
+//! [`AccessUpdate`](punktfunk_core::quic::AccessUpdate) replaces the snapshot
+//! (latest wins). Apple and Android clients copy these labels and the
+//! derive-not-store rule rather than linking this crate.
+//!
+//! Presentation only. Tests in this module pin the labels, chip text, and notices.
 
 use punktfunk_core::quic::{
     normalize_legacy_full, GRANT_ALL, GRANT_PRESET_CONTROLLER_ONLY, GRANT_PRESET_VIEW_ONLY,
 };
 use std::time::{Duration, Instant};
 
-/// The mask as THIS build's vocabulary reads it: an old host's explicit pre-power "Full
-/// control" normalizes to the current `GRANT_ALL` (the legacy-full rule, host-actions §4.3),
-/// and bits newer than this build are dropped — so a new host's Full session never renders as
-/// "Custom" on an older client (the #408-family rider fix: `preset_label` used to compare the
-/// raw wire mask against `GRANT_ALL` unmasked).
+/// Current-build grant vocabulary: legacy pre-power Full becomes `GRANT_ALL`,
+/// and bits this build does not know are dropped so a newer host's Full
+/// session never labels as "Custom".
 fn effective_mask(grants: u32) -> u32 {
     normalize_legacy_full(grants) & GRANT_ALL
 }
 
-/// What this session may do and for how long — the client-side snapshot of the host's
-/// [`Welcome`](punktfunk_core::quic::Welcome) advert, revised by every mid-session
-/// [`AccessUpdate`](punktfunk_core::quic::AccessUpdate) (latest wins). Carried on
-/// [`SessionEvent::Access`](crate::session::SessionEvent::Access); the default — full
-/// control, permanent — is exactly what an old host's Welcome decodes to, so a session
-/// against one renders today's chrome unchanged (no chip, everything enabled).
+/// Client snapshot of the host [`Welcome`](punktfunk_core::quic::Welcome)
+/// advert, replaced by each [`AccessUpdate`](punktfunk_core::quic::AccessUpdate)
+/// (latest wins). Default is full and permanent: an old host's Welcome
+/// renders with no chip and every control enabled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionAccess {
-    /// The effective grant bitmask ([`punktfunk_core::quic::GRANT_GAMEPAD`] family).
+    /// Grant bitmask ([`punktfunk_core::quic::GRANT_GAMEPAD`] family).
     pub grants: u32,
     /// When this access ends, on the CLIENT's monotonic clock; `None` = permanent.
     /// Monotonic so the chip's countdown never jumps with a wall-clock step.
@@ -47,8 +43,8 @@ impl Default for SessionAccess {
 }
 
 impl SessionAccess {
-    /// Snapshot the connector's live access truth (grants + deadline), converting the
-    /// wall-clock deadline the core keeps into this process's monotonic clock.
+    /// Grants plus deadline from the connector. Core stores Unix time; this
+    /// converts it onto this process's monotonic clock.
     pub fn from_connector(c: &punktfunk_core::client::NativeClient) -> SessionAccess {
         let deadline = c.access_deadline_unix().map(|deadline_unix| {
             let now_unix = std::time::SystemTime::now()
@@ -62,27 +58,23 @@ impl SessionAccess {
         }
     }
 
-    /// Whether traffic needing `bit` (one `GRANT_*` constant) may land on the host.
     pub fn allows(&self, bit: u32) -> bool {
         self.grants & bit != 0
     }
 
-    /// Full control, permanent — today's default look, which must stay unchanged: no chip,
-    /// no gating, no toasts (design §7; old-host degrade). Compared through
-    /// [`effective_mask`], so neither an old host's pre-power full mask nor a future host's
-    /// wider one puts a chip on a session that is simply Full.
+    /// Full control and no deadline. Compared through [`effective_mask`] so neither
+    /// a legacy pre-power full mask nor unknown future bits put a chip on Full.
     pub fn is_default(&self) -> bool {
         effective_mask(self.grants) == GRANT_ALL && self.deadline.is_none()
     }
 
-    /// Time left before this access expires — `None` = permanent, zero = already due
-    /// (the host's expiry close is on its way).
+    /// Time left; `None` is permanent, zero is already due.
     pub fn remaining(&self, now: Instant) -> Option<Duration> {
         self.deadline.map(|d| d.saturating_duration_since(now))
     }
 
-    /// The overlay chip's text — "Controller only · ends in 1 h 58 m" — or `None` for the
-    /// default session, which shows no chip at all.
+    /// Overlay chip text (`"Controller only · ends in 1 h 58 m"`), or `None` when
+    /// [`Self::is_default`] — no chip on a full permanent session.
     pub fn chip_text(&self, now: Instant) -> Option<String> {
         if self.is_default() {
             return None;
@@ -95,10 +87,9 @@ impl SessionAccess {
     }
 }
 
-/// The user-facing preset name DERIVED from the mask (design §3.2 — never stored, no
-/// drift): the three presets, and "Custom" for any other combination. Matches on
-/// [`effective_mask`] so a host with a different grant vocabulary (older: pre-power full;
-/// newer: bits this build doesn't know) still labels a Full session "Full control".
+/// Preset name derived from the mask, never stored. Matches on [`effective_mask`]
+/// so a legacy or future Full mask still labels "Full control"; anything off
+/// the three presets is "Custom".
 pub fn preset_label(grants: u32) -> &'static str {
     match effective_mask(grants) {
         GRANT_ALL => "Full control",
@@ -108,8 +99,8 @@ pub fn preset_label(grants: u32) -> &'static str {
     }
 }
 
-/// A remaining-time figure the chip/toast can wear: "1 h 58 m", "2 h", "58 m", and
-/// "under 1 m" below the resolution the wire's whole seconds can honestly promise.
+/// Chip/toast remaining-time text. Sub-minute is `"under 1 m"`: the wire
+/// carries whole seconds, so a second-level countdown would overclaim.
 pub fn format_remaining(left: Duration) -> String {
     let mins = left.as_secs() / 60;
     match (mins / 60, mins % 60) {
@@ -120,10 +111,9 @@ pub fn format_remaining(left: Duration) -> String {
     }
 }
 
-/// The toast for a mid-session access change (design §7 "end honestly"): a grants edit
-/// names the new level; an unchanged-grants update is the host's expiry warning (T−5 m /
-/// T−1 m) and names the time left. `None` = nothing worth interrupting for (an update
-/// that reaffirmed a permanent, unchanged mask).
+/// Toast for a mid-session access change. A grants edit names the new level;
+/// same grants with a deadline is the host's T−5 m / T−1 m warning.
+/// `None` if the mask was reaffirmed and is still permanent.
 pub fn update_notice(prev_grants: u32, next: &SessionAccess, now: Instant) -> Option<String> {
     if next.grants != prev_grants {
         return Some(format!("Access is now {}", preset_label(next.grants)));
@@ -146,13 +136,8 @@ mod tests {
         assert_eq!(preset_label(GRANT_ALL), "Full control");
         assert_eq!(preset_label(GRANT_GAMEPAD), "Controller only");
         assert_eq!(preset_label(0), "View only");
-        // Anything off the three presets is Custom — including "controller + clipboard",
-        // the media-remote example, and a full mask missing one bit.
         assert_eq!(preset_label(GRANT_GAMEPAD | GRANT_CLIPBOARD), "Custom");
         assert_eq!(preset_label(GRANT_ALL & !GRANT_KEYBOARD), "Custom");
-        // The two vocabulary-drift cases (host-actions §4.3): an old host's pre-power full
-        // mask, and a future host's full mask with a bit this build doesn't know — both are
-        // simply Full, never "Custom".
         assert_eq!(
             preset_label(punktfunk_core::quic::GRANT_ALL_PRE_POWER),
             "Full control"
@@ -165,7 +150,6 @@ mod tests {
         let now = Instant::now();
         assert!(SessionAccess::default().is_default());
         assert_eq!(SessionAccess::default().chip_text(now), None);
-        // …and each departure from the default brings one: a narrower mask, or a deadline.
         let limited = SessionAccess {
             grants: GRANT_GAMEPAD,
             deadline: None,
@@ -197,7 +181,7 @@ mod tests {
     #[test]
     fn notices_name_a_grants_change_first_and_warnings_by_time_left() {
         let now = Instant::now();
-        // A console edit: the new level is the news, even with a deadline running.
+        // Grants change wins over a running deadline: name the new level.
         let narrowed = SessionAccess {
             grants: GRANT_GAMEPAD,
             deadline: Some(now + Duration::from_secs(300)),
@@ -206,7 +190,6 @@ mod tests {
             update_notice(GRANT_ALL, &narrowed, now).as_deref(),
             Some("Access is now Controller only")
         );
-        // The host's T−5 m warning: same grants, a deadline — name the time.
         let warned = SessionAccess {
             grants: GRANT_GAMEPAD,
             deadline: Some(now + Duration::from_secs(300)),
@@ -215,7 +198,6 @@ mod tests {
             update_notice(GRANT_GAMEPAD, &warned, now).as_deref(),
             Some("Access ends in 5 m")
         );
-        // An update that reaffirmed a permanent, unchanged mask: nothing to say.
         let same = SessionAccess {
             grants: GRANT_POINTER,
             deadline: None,

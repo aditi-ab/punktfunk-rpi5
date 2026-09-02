@@ -1,16 +1,12 @@
-//! Local key/button codes → the punktfunk input wire contract.
+//! Linux evdev / GDK button codes → GameStream Windows VK on the input wire.
 //!
-//! The wire carries Windows Virtual-Key codes (the GameStream convention; the host maps
-//! them back with `inject::vk_to_evdev`). GTK hands us the hardware keycode, which on
-//! Wayland (and X11) is the evdev code + 8 — so this table is the exact inverse of the
-//! host's, keyed on evdev codes. Layout-independent by construction: positional keys map
-//! positionally, exactly what a game expects.
+//! The host maps those VKs back with `inject::vk_to_evdev`. GTK's hardware keycode is
+//! evdev + 8 on Wayland and X11, so this table is that host table inverted, keyed on
+//! evdev. Unmapped keys (`None`) are dropped — media keys are not in the wire contract.
 
-/// Map a Linux evdev key code to the Windows VK code the host expects. `None` = a key the
-/// wire contract doesn't cover (media keys etc.) — drop it rather than guess.
+/// `None` is a key the wire contract does not cover (media keys). Drop it; do not guess.
 pub fn evdev_to_vk(evdev: u16) -> Option<u8> {
     Some(match evdev {
-        // --- Navigation / editing / whitespace ---
         14 => 0x08,  // KEY_BACKSPACE -> VK_BACK
         15 => 0x09,  // KEY_TAB       -> VK_TAB
         28 => 0x0D,  // KEY_ENTER     -> VK_RETURN
@@ -30,7 +26,7 @@ pub fn evdev_to_vk(evdev: u16) -> Option<u8> {
         110 => 0x2D, // KEY_INSERT    -> VK_INSERT
         111 => 0x2E, // KEY_DELETE    -> VK_DELETE
 
-        // --- Digit row (KEY_1..KEY_9 are 2..10, KEY_0 is 11) ---
+        // KEY_1..KEY_9 are 2..10; KEY_0 is 11.
         11 => 0x30,
         2 => 0x31,
         3 => 0x32,
@@ -42,7 +38,7 @@ pub fn evdev_to_vk(evdev: u16) -> Option<u8> {
         9 => 0x38,
         10 => 0x39,
 
-        // --- Letters (evdev order is QWERTY rows, not alphabetical) ---
+        // Evdev letters are QWERTY-row order; arms are VK order (A = 0x41).
         30 => 0x41, // A
         48 => 0x42, // B
         46 => 0x43, // C
@@ -70,12 +66,10 @@ pub fn evdev_to_vk(evdev: u16) -> Option<u8> {
         21 => 0x59, // Y
         44 => 0x5A, // Z
 
-        // --- Meta / context-menu ---
         125 => 0x5B, // KEY_LEFTMETA  -> VK_LWIN
         126 => 0x5C, // KEY_RIGHTMETA -> VK_RWIN
         127 => 0x5D, // KEY_COMPOSE   -> VK_APPS
 
-        // --- Numpad ---
         82 => 0x60, // KP0
         79 => 0x61,
         80 => 0x62,
@@ -93,7 +87,6 @@ pub fn evdev_to_vk(evdev: u16) -> Option<u8> {
         83 => 0x6E, // KEY_KPDOT      -> VK_DECIMAL
         98 => 0x6F, // KEY_KPSLASH    -> VK_DIVIDE
 
-        // --- Function keys ---
         59 => 0x70, // F1
         60 => 0x71,
         61 => 0x72,
@@ -107,11 +100,10 @@ pub fn evdev_to_vk(evdev: u16) -> Option<u8> {
         87 => 0x7A, // F11
         88 => 0x7B, // F12
 
-        // --- Locks ---
         69 => 0x90, // KEY_NUMLOCK    -> VK_NUMLOCK
         70 => 0x91, // KEY_SCROLLLOCK -> VK_SCROLL
 
-        // --- Left/right modifiers (specific VKs; the host maps both generics here too) ---
+        // Specific L/R VKs. The host maps generic VK_SHIFT/CONTROL/MENU onto these too.
         42 => 0xA0,  // KEY_LEFTSHIFT  -> VK_LSHIFT
         54 => 0xA1,  // KEY_RIGHTSHIFT -> VK_RSHIFT
         29 => 0xA2,  // KEY_LEFTCTRL   -> VK_LCONTROL
@@ -119,7 +111,7 @@ pub fn evdev_to_vk(evdev: u16) -> Option<u8> {
         56 => 0xA4,  // KEY_LEFTALT    -> VK_LMENU
         100 => 0xA5, // KEY_RIGHTALT   -> VK_RMENU
 
-        // --- OEM punctuation (US-layout positions) ---
+        // OEM punctuation at US-layout positions.
         39 => 0xBA, // KEY_SEMICOLON  -> VK_OEM_1
         13 => 0xBB, // KEY_EQUAL      -> VK_OEM_PLUS
         51 => 0xBC, // KEY_COMMA      -> VK_OEM_COMMA
@@ -137,8 +129,7 @@ pub fn evdev_to_vk(evdev: u16) -> Option<u8> {
     })
 }
 
-/// Map a GTK/GDK mouse button number to the GameStream button id the wire expects
-/// (1=left, 2=middle, 3=right, 4=X1, 5=X2). GDK reports back/forward as 8/9.
+/// GDK back/forward are 8/9; GameStream wants X1/X2 as 4/5. Other buttons are 1:1.
 pub fn gdk_button_to_gs(button: u32) -> Option<u32> {
     Some(match button {
         1 => 1,
@@ -154,12 +145,10 @@ pub fn gdk_button_to_gs(button: u32) -> Option<u32> {
 mod tests {
     use super::*;
 
-    /// The table must be the exact inverse of the host's `vk_to_evdev` for every key the
-    /// host knows (modulo the generic-modifier VKs, which collapse onto the same evdev
-    /// codes as the specific left-hand ones).
+    /// Inverse of host `inject::vk_to_evdev`. Generic-modifier VKs collapse onto the
+    /// left-hand evdev codes and are omitted here.
     #[test]
     fn roundtrips_through_the_host_table() {
-        // Mirror of the host's table (inject::vk_to_evdev), generic modifiers excluded.
         let host_pairs: &[(u8, u16)] = &[
             (0x08, 14),
             (0x09, 15),

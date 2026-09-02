@@ -1,23 +1,16 @@
-//! **Is a newer client available, and can this box install it?** (Linux)
+//! Linux client update check and apply routing.
 //!
-//! The counterpart to `punktfunk-host::update`, sharing its trust machinery through
-//! [`pf_update_check`]: the same per-channel Ed25519-signed manifest, the same validation
-//! rules, the same "is this newer?" comparison. The host and the client ship from one repo at
-//! one version, so one manifest answers for both — only the install kind and what can be done
-//! about it differ, and that is what this module works out.
+//! Counterpart to `punktfunk-host::update`. Trust — per-channel Ed25519-signed
+//! manifest, validation, "is this newer?" — lives in [`pf_update_check`] so host
+//! and client cannot disagree about who may announce a release.
 //!
-//! **Why this lives in the client and not in the Decky plugin.** The plugin's backend is
-//! unprivileged Python with no crypto dependency it could verify a signature with, and the
-//! plugin is not the only surface that wants this (the GTK About page and a bare
-//! `punktfunk-client --check-update` want the same answer). So the client is the engine and
-//! every UI is a caller — exactly how `--pair`, `--library` and `--list-hosts` already work.
+//! This crate is the engine. Decky, GTK About, and `punktfunk-client --check-update`
+//! call it; the plugin cannot verify a signature (unprivileged Python, no crypto).
 //!
-//! **Privilege.** Nothing here is privileged. A flatpak updates through flatpak; a
-//! system-packaged client updates through the root helper (`pf-update`, started as a fixed,
-//! parameterless systemd oneshot that polkit authorises for members of the `punktfunk-update`
-//! group); everything else reports the command to run and stops. The request we can make
-//! carries no version, URL or package name — the helper derives all of it from root-owned
-//! state, so being able to trigger it grants only "run this box's normal update".
+//! Nothing here is privileged. Flatpak updates through flatpak. A packaged client
+//! starts the parameterless `pf-update` oneshot (polkit, group `punktfunk-update`).
+//! Everything else returns the command. The helper request carries no version, URL,
+//! or package name — it derives those from root-owned state.
 
 #![cfg(target_os = "linux")]
 
@@ -29,41 +22,35 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-/// The unit the client-side polkit rule scopes to. Its presence is the "root helper is
-/// installed" probe — the client packages ship unit + helper + rule together.
+/// The unit the polkit rule scopes to. Its presence is the "helper is installed" probe.
 const HELPER_UNIT: &str = "punktfunk-client-update.service";
 const HELPER_UNIT_PATH: &str = "/usr/lib/systemd/system/punktfunk-client-update.service";
 
-/// Where the helper's `apply-client` verb writes its outcome. Separate from the host's record
-/// so a box running both never reads the other product's run as its own.
+/// Outcome of `apply-client`. Separate from the host's record so a dual-product box cannot
+/// read the other run.
 const HELPER_RESULT: &str = "/var/lib/punktfunk/client-update-result.json";
 
-/// The pacman escape hatch (root-owned; see the design's §5 pacman stance). Shared with the
-/// host — one box, one answer to "may something run a full sysupgrade unattended".
+/// Pacman full-sysupgrade hatch (root-owned). Shared with the host: one box, one answer.
 const PACMAN_OPTIN_CONF: &str = "/etc/punktfunk/update.conf";
 
-/// The opt-in group. Mirrors `packaging/linux/49-punktfunk-client-update.rules`.
+/// Mirrors `packaging/linux/49-punktfunk-client-update.rules`.
 const OPT_IN_GROUP: &str = "punktfunk-update";
 
-/// Wall-clock cap on one helper run (a stale box's package manager is slow; a stuck one must
-/// still surface as an error eventually).
+/// Cap on one helper run. A stale package manager is slow; a stuck one must still error.
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// What the box can do about a pending update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Apply {
-    /// One action installs it now.
     Full,
-    /// One action stages it; a reboot finishes (rpm-ostree).
+    /// A reboot finishes it (rpm-ostree).
     Staged,
     /// Nothing here can install it — show [`Status::command`].
     Notify,
 }
 
-/// Who performs the apply. The client can drive the root helper itself, but it can never
-/// update its own flatpak (inside the sandbox there is no host `flatpak` to run) — that one
-/// belongs to whoever launched it, which on a Deck is the Decky plugin.
+/// Who runs the apply. This process can drive the root helper; it cannot update its own
+/// flatpak (no host `flatpak` inside the sandbox) — that belongs to whoever launched it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Applier {
@@ -71,50 +58,39 @@ pub enum Applier {
     Flatpak,
     /// `punktfunk-client --apply-update` drives the packaged root helper.
     Helper,
-    /// Manual only.
     None,
 }
 
-/// The whole answer, as the CLI serialises it for the Decky plugin and the GTK About page.
+/// Check answer as the CLI serialises it for Decky and GTK About.
 #[derive(Debug, Clone, Serialize)]
 pub struct Status {
-    /// Install kind (`flatpak`, `apt`, `dnf`, `sysext`, …).
     pub kind: String,
-    /// `stable` | `canary`.
     pub channel: String,
-    /// The running client's version.
     pub current: String,
-    /// The channel's newest version, or `current` when the check couldn't run.
+    /// Newest on the channel, or `current` when the check could not run.
     pub latest: String,
     pub update_available: bool,
     pub apply: Apply,
     pub applier: Applier,
-    /// One copy-pastable line that updates this install, always populated.
+    /// Copy-pastable install line; always populated.
     pub command: String,
-    /// Set when one-click COULD work but the operator hasn't joined the group yet.
+    /// Set when one-click would work after the operator joins the group.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opt_in_hint: Option<String>,
-    /// Release-notes link from the manifest (validated to our forge), empty when unknown.
+    /// Manifest notes URL (forge-validated), empty when unknown.
     pub notes_url: String,
-    /// Why the check couldn't complete. `update_available` is always false when set.
+    /// Why the check could not complete. `update_available` is false when set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// The feed answered, but this channel has **no release published yet** — an expected
-    /// state rather than a malfunction, so a caller can say so plainly instead of showing a
-    /// raw "HTTP 404".
-    ///
-    /// Deliberately NOT symmetric with the host's `UpdateStatus`, which clears `last_error`
-    /// for this case: there the consumer is a human reading a console, and a red "last check
-    /// failed" on an empty feed is the bug being fixed. Here the consumer is a shell script
-    /// reading an exit code, so `error` stays set and `--check-update` keeps returning 1.
-    /// An empty channel is not evidence that this build is current, and a mistyped
-    /// `PUNKTFUNK_UPDATE_FEED` is indistinguishable from one out here.
+    /// Feed answered, but this channel has no release. Not a malfunction.
+    /// Unlike the host's `UpdateStatus`, `error` stays set and `--check-update` exits 1:
+    /// an empty channel is not evidence this build is current, and a mistyped
+    /// `PUNKTFUNK_UPDATE_FEED` is indistinguishable from here.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub not_published: bool,
 }
 
-/// The Ed25519 keys trusted for update manifests — pinned once in [`pf_update_check`] so the
-/// host and the client can never disagree about who may announce a release.
+/// Keys trusted for manifests. Pinned in [`pf_update_check`] so host and client cannot disagree.
 fn pinned_keys() -> Vec<PublicKey> {
     pf_update_check::OFFICIAL_UPDATE_KEYS
         .iter()
@@ -123,7 +99,7 @@ fn pinned_keys() -> Vec<PublicKey> {
         .collect()
 }
 
-/// Update checks disabled by operator config — same switch name the host honours.
+/// Operator kill switch for checks. Same env name the host honours.
 pub fn check_disabled() -> bool {
     matches!(
         std::env::var("PUNKTFUNK_UPDATE_CHECK").as_deref(),
@@ -131,8 +107,7 @@ pub fn check_disabled() -> bool {
     )
 }
 
-/// One-click apply disabled by operator config (the kill switch): the box still reports what
-/// is available and how to install it by hand.
+/// Operator kill switch for apply. Status still reports what is available and the hand command.
 pub fn apply_disabled() -> bool {
     matches!(
         std::env::var("PUNKTFUNK_UPDATE_APPLY").as_deref(),
@@ -140,33 +115,27 @@ pub fn apply_disabled() -> bool {
     )
 }
 
-/// This box's install kind + channel for the CLIENT (not the host — separate marker files;
-/// see [`Product`]).
+/// Client install kind + channel (marker files are per-[`Product`], not shared with the host).
 ///
-/// `current` is the calling binary's own version string. It is a parameter rather than an
-/// `env!` here because only the BINARY is version-stamped (`clients/linux/build.rs` reads
-/// `PUNKTFUNK_BUILD_VERSION`, which is what carries the canary `~ciN` suffix the channel
-/// comparison needs); a library crate baking in its own build-time constant would quietly
-/// report the workspace version instead.
+/// `current` is a parameter, not `env!`: only the binary is version-stamped
+/// (`clients/linux/build.rs` / `PUNKTFUNK_BUILD_VERSION`, including canary `~ciN`).
+/// A library `env!` would report the workspace version.
 pub fn detect_install(current: &str) -> (InstallKind, Channel) {
     detect::classify(&detect::gather(Product::Client, current), Product::Client)
 }
 
-/// The root helper (+ its unit) is installed on this box.
 fn helper_installed() -> bool {
     Path::new(HELPER_UNIT_PATH).exists()
 }
 
-/// The pacman full-sysupgrade escape hatch is explicitly enabled (root-owned config).
 fn pacman_opted_in() -> bool {
     std::fs::read_to_string(PACMAN_OPTIN_CONF)
         .map(|c| c.lines().any(|l| l.trim() == "PACMAN_FULL_SYSUPGRADE=1"))
         .unwrap_or(false)
 }
 
-/// Is this user in the opt-in group, **by NSS** (matching how polkit will decide) rather than
-/// by our possibly-stale process credentials — so a fresh `usermod -aG` counts without a
-/// re-login. Mirrors `punktfunk-host::update::linux::opted_in`.
+/// Group membership via NSS, matching polkit — not this process's (possibly stale) credentials,
+/// so a fresh `usermod -aG` counts without re-login.
 fn opted_in() -> bool {
     let Some(user) = capture(Command::new("id").arg("-un")) else {
         return false;
@@ -184,23 +153,17 @@ fn capture(cmd: &mut Command) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The opt-in instruction shown instead of an apply button.
 pub fn opt_in_hint() -> String {
     format!("sudo usermod -aG {OPT_IN_GROUP} $USER   # enables one-tap client updates on this box")
 }
 
-/// Everything about the BOX that decides what an apply may do — gathered once, so the routing
-/// below is a pure function of (kind, caps). Env vars and root-owned files are read here and
-/// nowhere else, which is what lets the routing rules be tested exhaustively without a box.
+/// Box capabilities, probed once so [`apply_route`] is a pure function of (kind, caps).
+/// Env and root-owned files are read here only — tests can exhaust the routes without a box.
 #[derive(Debug, Clone, Copy)]
 struct Caps {
-    /// Operator kill switch (`PUNKTFUNK_UPDATE_APPLY=0`).
     apply_disabled: bool,
-    /// The packaged root helper + its unit are installed.
     helper: bool,
-    /// This user is in the opt-in group.
     opted_in: bool,
-    /// The root-owned pacman full-sysupgrade escape hatch is set.
     pacman_optin: bool,
 }
 
@@ -210,34 +173,31 @@ impl Caps {
         Self {
             apply_disabled: apply_disabled(),
             helper,
-            // Both of these shell out or read root-owned config; skip them entirely when no
-            // helper is installed, since nothing they could say would change the answer.
+            // Skip: both shell out / read root-owned config, and neither can change the answer
+            // when no helper is installed.
             opted_in: helper && opted_in(),
             pacman_optin: helper && pacman_opted_in(),
         }
     }
 }
 
-/// What this install can do about an update, and who would do it.
 fn apply_route(kind: InstallKind, c: Caps) -> (Apply, Applier) {
     if c.apply_disabled {
         return (Apply::Notify, Applier::None);
     }
     let helper_ready = c.helper && c.opted_in;
     match kind {
-        // Always available and needs no opt-in: it is a per-user install the user already owns.
+        // Per-user install the user already owns — no helper, no group.
         InstallKind::Flatpak => (Apply::Full, Applier::Flatpak),
         InstallKind::Apt | InstallKind::Dnf if helper_ready => (Apply::Full, Applier::Helper),
         InstallKind::RpmOstree if helper_ready => (Apply::Staged, Applier::Helper),
         InstallKind::Pacman if helper_ready && c.pacman_optin => (Apply::Full, Applier::Helper),
-        // The signed sysext feed carries the HOST image only — there is nothing for a client
-        // sysext to update FROM, so this is honestly notify-only rather than a button that
-        // would fail. Same for nix, source builds and the Deck's own tree.
+        // Client sysext has no feed (the signed image is the host). Nix, source, Deck tree: same.
         _ => (Apply::Notify, Applier::None),
     }
 }
 
-/// Would this box one-click apply if the operator joined the group? (Drives the hint.)
+/// True when joining the group would change [`apply_route`] — drives [`Status::opt_in_hint`].
 fn opt_in_would_help(kind: InstallKind, c: Caps) -> bool {
     !c.apply_disabled
         && c.helper
@@ -247,8 +207,6 @@ fn opt_in_would_help(kind: InstallKind, c: Caps) -> bool {
             InstallKind::Apt | InstallKind::Dnf | InstallKind::RpmOstree | InstallKind::Pacman
         )
 }
-
-// ---------------------------------------------------------------- serial floor
 
 fn state_path() -> Option<PathBuf> {
     crate::trust::config_dir()
@@ -270,11 +228,8 @@ fn load_floor(path: &Path, channel: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Raise (never lower) the floor, through the crate's one config writer — this used to
-/// hand-roll its own tmp+rename, which meant it neither cleaned up its temp on a failed
-/// rename nor picked up [`crate::trust::write_atomic`]'s in-place fallback, so on an install
-/// where the rename cannot work the floor silently never rose and a declined update came
-/// back forever.
+/// Raise (never lower) the floor. Goes through [`crate::trust::write_atomic`] so the
+/// in-place fallback still raises it when rename cannot work.
 fn store_floor(path: &Path, channel: &str, serial: u64) {
     let mut file: FloorFile = std::fs::read(path)
         .ok()
@@ -294,11 +249,8 @@ fn store_floor(path: &Path, channel: &str, serial: u64) {
     let _ = crate::trust::write_atomic(path, &bytes);
 }
 
-// ---------------------------------------------------------------- check
-
-/// Detect the install, fetch + verify the channel manifest, and report. Blocking (one HTTPS
-/// round trip); never panics — a failed check reports `error` and `update_available: false`,
-/// because "we could not tell" must never render as "you are up to date".
+/// Fetch and verify the channel manifest. Blocking. A failed check sets `error` and
+/// `update_available: false` — "could not tell" must never render as "up to date".
 pub fn check(current: &str) -> Status {
     let (kind, channel) = detect_install(current);
     let caps = Caps::probe();
@@ -340,8 +292,7 @@ pub fn check(current: &str) -> Status {
         }
     };
 
-    // Anti-rollback: a validly-signed but OLDER manifest replayed at us is an error, not a
-    // silent downgrade of what we believe the channel holds.
+    // Anti-rollback: a validly signed older manifest is an error, not a silent downgrade.
     if let Some(path) = state_path() {
         let floor = load_floor(&path, channel.as_str());
         if manifest.serial < floor {
@@ -360,9 +311,6 @@ pub fn check(current: &str) -> Status {
     status
 }
 
-// ---------------------------------------------------------------- apply
-
-/// What an apply attempt did.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApplyOutcome {
     pub ok: bool,
@@ -413,12 +361,10 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Run the packaged root helper for this install, if that is the applier for it. Blocking for
-/// as long as the package manager takes.
+/// Drive the packaged root helper when that is this install's applier. Blocking.
 ///
-/// Deliberately refuses every kind it does not own rather than trying something clever: a
-/// flatpak can only be updated from outside its sandbox, and there is no feed behind a client
-/// sysext or a source build. Callers read [`Status::applier`] first.
+/// Refuses every other kind: a flatpak updates only from outside the sandbox, and a client
+/// sysext / source build has no feed. Callers read [`Status::applier`] first.
 pub fn apply(current: &str) -> ApplyOutcome {
     let (kind, _) = detect_install(current);
     let caps = Caps::probe();
@@ -469,8 +415,8 @@ pub fn apply(current: &str) -> ApplyOutcome {
         });
     }
 
-    // The unit succeeded; its record is the ground truth. A record older than this run means
-    // the helper never wrote one — surface that instead of reporting a previous run's success.
+    // The unit succeeded; the record is ground truth. `finished_unix + 5 < started` means
+    // the helper never wrote (5 s covers clock skew) — do not report a previous run.
     let result: HelperResult = match std::fs::read(HELPER_RESULT)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -506,7 +452,7 @@ pub fn apply(current: &str) -> ApplyOutcome {
     }
 }
 
-/// The helper's wall-clock cap, exposed so a caller can size its own timeout above ours.
+/// [`HELPER_TIMEOUT`], so a caller can size its wait above the helper's cap.
 pub const fn helper_timeout() -> Duration {
     HELPER_TIMEOUT
 }
@@ -515,7 +461,6 @@ pub const fn helper_timeout() -> Duration {
 mod tests {
     use super::*;
 
-    /// A fully-enabled box: helper installed, user opted in, pacman hatch open.
     fn ready() -> Caps {
         Caps {
             apply_disabled: false,
@@ -525,9 +470,7 @@ mod tests {
         }
     }
 
-    /// The kill switch must reach BOTH halves of the answer: no applier, and the notify tier.
-    /// It is the operator's "stop offering this" and has to beat every kind, including the
-    /// flatpak one that needs no other permission.
+    /// Kill switch beats every kind, including flatpak (needs no other permission).
     #[test]
     fn kill_switch_forces_notify() {
         let off = Caps {
@@ -550,8 +493,7 @@ mod tests {
         }
     }
 
-    /// Kinds with no feed behind them must never claim an apply route, however permissive the
-    /// box is — a button that cannot work is worse than a command the user can run.
+    /// No feed ⇒ notify, however permissive the box. A button that cannot work is worse.
     #[test]
     fn feedless_kinds_are_notify_only() {
         for kind in [
@@ -570,8 +512,6 @@ mod tests {
         }
     }
 
-    /// The package-manager kinds are gated on BOTH the helper being installed and the group
-    /// opt-in; neither alone may produce a Helper applier.
     #[test]
     fn helper_kinds_need_helper_and_opt_in() {
         for kind in [InstallKind::Apt, InstallKind::Dnf, InstallKind::RpmOstree] {
@@ -594,7 +534,6 @@ mod tests {
             }
             let (tier, applier) = apply_route(kind, ready());
             assert_eq!(applier, Applier::Helper, "{}", kind.as_str());
-            // rpm-ostree activates on reboot; the others land immediately.
             let want = if kind == InstallKind::RpmOstree {
                 Apply::Staged
             } else {
@@ -604,7 +543,7 @@ mod tests {
         }
     }
 
-    /// pacman carries the extra root-owned hatch (a full `-Syu` is a whole-system action).
+    /// Pacman also needs the root-owned hatch: a full `-Syu` is a whole-system action.
     #[test]
     fn pacman_needs_its_own_opt_in() {
         assert_eq!(
@@ -623,8 +562,6 @@ mod tests {
         );
     }
 
-    /// A flatpak is a per-user install the user already owns — no group, no helper, and the
-    /// caller (not the sandboxed client) performs it.
     #[test]
     fn flatpak_needs_no_opt_in_and_is_applied_by_the_caller() {
         let bare = Caps {
@@ -639,8 +576,6 @@ mod tests {
         );
     }
 
-    /// The opt-in hint is only worth showing when joining the group would actually change the
-    /// answer: a helper must already be installed, and the kind must be one it serves.
     #[test]
     fn opt_in_hint_only_where_it_would_help() {
         let not_opted = Caps {
@@ -657,7 +592,6 @@ mod tests {
                 ..not_opted
             }
         ));
-        // Already in the group ⇒ nothing to hint at.
         assert!(!opt_in_would_help(InstallKind::Apt, ready()));
     }
 

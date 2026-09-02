@@ -1,54 +1,23 @@
-//! Best-effort scheduling priority for the client's audio threads.
+//! Best-effort priority for the client's audio feeder threads (decode, pad-audio, WASAPI
+//! render/mic). Device callbacks already run on the OS realtime path; these threads do not.
+//! A decode thread descheduled past ring depth becomes an underrun.
 //!
-//! The device callbacks already run where the OS puts realtime audio: the PipeWire playback
-//! callback is on the graph's data loop (`RT_PROCESS`), and WASAPI's event-driven render loop
-//! is woken by the engine. The threads that FEED them are ordinary threads: the decode leg
-//! (`punktfunk-audio-rx` — receive, conceal, decode, queue), the pad-audio renderer, and on
-//! Windows the render/mic loops themselves. Their lateness is absorbed by the jitter ring — a
-//! decode thread descheduled past the ring depth is a drought the callback conceals — but on a
-//! Steam Deck the same four cores decode 1440p120 and present it, and on a loaded Windows box
-//! the render loop competes with the game and the compositor. This module is the one place that
-//! asks the OS for priority for those threads, on the sanctioned unprivileged paths only.
+//! Linux, first success wins: `setpriority(-10)` (needs `RLIMIT_NICE`; a no-op when the limit
+//! is 0); then the Realtime portal when `/.flatpak-info` exists (rtkit looks up `/proc/<pid>`
+//! with sandbox numbers and gets ENOENT); otherwise rtkit `MakeThreadHighPriorityWithPID` on
+//! the system bus. Polkit `acquire-high-priority` allows the user's session and session-less
+//! user services, not ssh. Never `setcap`/`SCHED_RR`: `cap_sys_nice` took down KDE sessions,
+//! and nice is enough.
 //!
-//! **Linux.** Three rungs, first one that works wins:
-//! 1. `setpriority(-10)` — honoured wherever `RLIMIT_NICE` allows (a developer's shell, most
-//!    desktops). On SteamOS the user's `RLIMIT_NICE` is 0 and this is a no-op.
-//! 2. Inside a flatpak (`/.flatpak-info` exists): the **Realtime portal**
-//!    (`org.freedesktop.portal.Realtime` on the session bus). The sandbox has its own PID
-//!    namespace, and rtkit-daemon (0.14 verified on the Deck) does NOT translate — it looks up
-//!    `/proc/<pid>/task/<tid>/stat` with the numbers it is given, so a direct call from a
-//!    sandbox is answered with ENOENT. The portal maps the sandboxed pid/tid to the host's and
-//!    calls rtkit on the app's behalf; portals are reachable from every sandbox without a
-//!    `--talk-name`. This is the same split PipeWire's own `module-rt` makes.
-//! 3. Otherwise **rtkit** directly (`org.freedesktop.RealtimeKit1` on the system bus,
-//!    `MakeThreadHighPriorityWithPID`) — what gives PipeWire's data loop its priority on the
-//!    Deck, and what `pf_frame::thread_qos` uses on the host.
-//!
-//! Both bus rungs are gated by polkit's `acquire-high-priority` action with the TARGET process
-//! as the subject — allowed for the user's active session and for their session-less user
-//! services (a client launched by Steam is one), refused for a remote (ssh) session. Verified on
-//! the Deck 2026-08-18 by renicing a live active-session thread and a `steam` user-service thread
-//! through both rungs, and restoring them.
-//!
-//! **Never** `setcap`/`SCHED_RR` here — the `cap_sys_nice` route is the one that killed KDE
-//! sessions in the field, and a nice level is all the decode leg needs.
-//!
-//! **Windows.** MMCSS "Pro Audio" + `THREAD_PRIORITY_HIGHEST` for the calling thread — the
-//! same pair every audio engine on the platform uses; the MMCSS handle is intentionally leaked
-//! (thread-lifetime; the OS reverts it at exit), as `pf_frame::session_tuning::on_hot_thread`
-//! does on the host.
-//!
-//! Every path is best-effort and logs at debug what it got; a refusal is exactly what the thread
-//! had before this existed.
+//! Windows: MMCSS "Pro Audio" plus `THREAD_PRIORITY_HIGHEST`. The MMCSS handle is leaked
+//! (thread-lifetime; the OS reverts at exit), matching `pf_frame::session_tuning::on_hot_thread`.
+//! Refusal leaves the thread as it was.
 
-/// Nice level asked for on Linux. `-10` is comfortably inside rtkit's default `MinNiceLevel`
-/// (−15 on the Deck) and what the host's own hot threads ask for.
+/// `-10` sits inside rtkit's default `MinNiceLevel` (−15), matching the host hot threads.
 #[cfg(target_os = "linux")]
 const NICE: i32 = -10;
 
-/// Raise the CALLING thread's priority for audio work. Call at the top of the thread, before
-/// any audio state is touched, from a plain worker thread (the bus calls block); returns what
-/// happened for the caller's log line.
+/// Call at thread start, before audio state; the bus calls block.
 #[cfg(target_os = "linux")]
 pub fn boost_current_thread() -> Boost {
     // SAFETY: three by-value integers, no pointers; `PRIO_PROCESS` with `who == 0` targets the
@@ -75,16 +44,12 @@ pub fn boost_current_thread() -> Boost {
 
 #[cfg(target_os = "linux")]
 mod linux_bus {
-    /// One-shot blocking system-bus call to rtkit. Per-call connection rather than cached: this
-    /// runs a handful of times per session (thread starts), and holding a bus connection for the
-    /// session's lifetime to save microseconds is a bad trade against a wedged bus daemon
-    /// pinning a socket in every session forever. Mirrors `pf_frame::thread_qos`.
+    /// One-shot system-bus rtkit call. Do not cache the connection: a wedged daemon would pin a
+    /// socket for the whole session. Mirrors `pf_frame::thread_qos`.
     pub(super) fn rtkit_high_priority(pid: u64, tid: u64, nice: i32) -> Result<(), zbus::Error> {
         let conn = zbus::blocking::Connection::system()?;
-        // `MakeThreadHighPriorityWithPID(u64 process, u64 thread, i32 priority)` — priority is a
-        // nice level, floored by rtkit's MinNiceLevel. The WithPID variant with our own pid is
-        // the explicit spelling of "this thread of this process"; rtkit still authenticates the
-        // caller via the bus and hands the target process to polkit.
+        // `MakeThreadHighPriorityWithPID(u64, u64, i32)`: the i32 is a nice level, floored by
+        // MinNiceLevel. WithPID + our pid means this thread of this process.
         conn.call_method(
             Some("org.freedesktop.RealtimeKit1"),
             "/org/freedesktop/RealtimeKit1",
@@ -95,9 +60,8 @@ mod linux_bus {
         Ok(())
     }
 
-    /// The same request through the Realtime portal on the SESSION bus — the sandbox's own
-    /// pid/tid, which the portal maps before it calls rtkit. Same method name and signature
-    /// (`tti`), on `org.freedesktop.portal.Desktop` at `/org/freedesktop/portal/desktop`.
+    /// Same request via the Realtime portal on the session bus. Pass the sandbox pid/tid; the
+    /// portal maps them onto the host before calling rtkit.
     pub(super) fn portal_high_priority(pid: u64, tid: u64, nice: i32) -> Result<(), zbus::Error> {
         let conn = zbus::blocking::Connection::session()?;
         conn.call_method(
@@ -111,14 +75,10 @@ mod linux_bus {
     }
 }
 
-/// Raise the CALLING thread's priority for audio work: MMCSS "Pro Audio" plus the highest
-/// normal-class thread priority. Returns what happened for the caller's log line.
 #[cfg(windows)]
 pub fn boost_current_thread() -> Boost {
-    // Declared here rather than through the `windows` crate's feature list: two calls, both
-    // stable Win32 exports, and `pf_frame::session_tuning` already spells
-    // `AvSetMmThreadCharacteristicsW` this way. A raw HANDLE is a pointer-sized integer; NULL
-    // means failure for AvSet…, and SetThreadPriority returns a BOOL.
+    // Local FFI, not the `windows` crate: two stable Win32 exports, same spelling as
+    // `pf_frame::session_tuning`.
     #[link(name = "avrt")]
     unsafe extern "system" {
         fn AvSetMmThreadCharacteristicsW(task_name: *const u16, task_index: *mut u32) -> isize;
@@ -150,27 +110,21 @@ pub fn boost_current_thread() -> Boost {
     }
 }
 
-/// What [`boost_current_thread`] managed. Logged, never acted on: every path is best-effort.
+/// Logged only; every path is best-effort.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Boost {
-    /// Linux: `setpriority` was honoured (RLIMIT_NICE allowed it).
     #[cfg(target_os = "linux")]
     Setpriority,
-    /// Linux, sandboxed: the Realtime portal granted the nice level.
     #[cfg(target_os = "linux")]
     Portal,
-    /// Linux: rtkit granted the nice level after `setpriority` was refused (SteamOS).
     #[cfg(target_os = "linux")]
     Rtkit,
-    /// Windows: MMCSS "Pro Audio" plus `THREAD_PRIORITY_HIGHEST`.
     #[cfg(windows)]
     Mmcss,
-    /// Nothing was granted; the thread runs exactly as it did before. The string says why.
     Refused(String),
 }
 
 impl Boost {
-    /// The one-word tag for a log line.
     pub fn as_str(&self) -> &'static str {
         match self {
             #[cfg(target_os = "linux")]
@@ -186,8 +140,6 @@ impl Boost {
     }
 }
 
-/// Boost the calling thread and log the outcome under `what` — the shape every audio thread
-/// start uses.
 pub fn boost_and_log(what: &'static str) {
     match boost_current_thread() {
         Boost::Refused(why) => {

@@ -1,14 +1,14 @@
-//! Render per-gamepad DualSense haptics and speaker streams (`0xD1`) on a wired pad's
-//! four-channel USB audio device. Bluetooth pads have no audio sibling and are unsupported.
+//! DualSense haptics and speaker (`0xD1`) on a wired pad's four-channel USB audio
+//! device. Bluetooth pads have no audio sibling.
 //!
-//! [`spawn`] correlates each pad with its WASAPI or PipeWire endpoint, decodes both Opus
-//! streams with gap concealment, and interleaves speaker on channels 0/1 and voice coils on
-//! 2/3. Linux requires the physical card's four-channel profile, index-based `AUX0..AUX3`
-//! mapping, and exclusion of host-created look-alike sinks; `ensure_pro_audio` manages the
-//! profile for the session.
+//! [`spawn`] correlates the pad with its WASAPI or PipeWire endpoint, decodes both
+//! Opus streams with gap concealment, and interleaves speaker on 0/1 and voice coils
+//! on 2/3. Linux needs the card's four-channel profile, index-based `AUX0..AUX3`
+//! mapping, and exclusion of host-minted look-alike sinks; `ensure_pro_audio` moves
+//! the profile for the session and restores it on exit.
 //!
-//! `pad_haptics` and `pad_speaker` gate capability advertisement. Speaker mode `"mix"` is
-//! not implemented and currently behaves as `"off"`.
+//! `pad_haptics` and `pad_speaker` gate capability advertisement. Speaker `"mix"`
+//! is not implemented and behaves as `"off"`.
 
 use punktfunk_core::audio::AudioGapTracker;
 use punktfunk_core::client::NativeClient;
@@ -17,26 +17,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// The render layout: 4 interleaved f32 channels — speaker FL/FR on 0/1, haptics (rear pair
-/// on the wire layout, the voice coils on the device) on 2/3.
+/// Speaker FL/FR on 0/1, voice coils on 2/3. Matches the DualSense USB audio function.
 const PAD_CHANNELS: usize = 4;
 
-/// Mixer depth bound (frames @48 kHz — 100 ms). Only guards a wedged/absent output; the live
-/// latency bound is the platform ring policy's cap.
+/// 4800 frames = 100 ms @ 48 kHz. Caps a wedged/absent output; live latency is the platform ring.
 const MAX_BUFFER_FRAMES: usize = 4800;
 
-/// Device (re)correlation backoff bounds: a missing DualSense audio device is polled at
-/// [`RETRY_MIN`] doubling to [`RETRY_MAX`] — correlation enumerates the audio graph, so it must
-/// not run per frame.
+/// Correlation walks the audio graph; poll a missing device from 1 s doubling to 8 s, not per frame.
 const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(8);
 
-// ---- settings vocabulary --------------------------------------------------------------------
-
-/// Whether the `pad_speaker` setting asks for a renderer: `"pad"` = the physical pad's speaker
-/// (the only implemented target). `"mix"` — fold the speaker stream into the main session
-/// audio — is a declared TODO: it logs once and renders as `"off"` so the setting name can ship
-/// before the mixer leg does. Anything else (including `"off"`) = no renderer.
+/// `"pad"` opens the physical speaker. `"mix"` is unimplemented and treated as `"off"` so the name can ship.
 pub fn speaker_active(mode: &str) -> bool {
     match mode {
         "pad" => true,
@@ -54,25 +45,15 @@ pub fn speaker_active(mode: &str) -> bool {
     }
 }
 
-// ---- tier-A detection -----------------------------------------------------------------------
-
-/// Tier A = a physical DualSense (`054C:0CE6`) or DualSense Edge (`054C:0DF2`) on a WIRED
-/// connection — only USB exposes the pad's 4-ch audio device (Bluetooth pads are tier B/C,
-/// out of scope here). Pure so the policy is testable; the wired signal comes from
-/// `SDL_GetGamepadConnectionState`, falling back to the audio-sibling probe
-/// ([`wired_audio_sibling`]) when SDL answers Unknown.
+/// Wired DualSense / DualSense Edge only: USB exposes the 4-ch audio device; Bluetooth does not.
+/// `wired` is `SDL_GetGamepadConnectionState`, else [`wired_audio_sibling`] when SDL says Unknown.
 pub(crate) fn is_tier_a_ds5(vid: u16, pid: u16, wired: bool) -> bool {
     vid == 0x054C && matches!(pid, 0x0CE6 | 0x0DF2) && wired
 }
 
-/// The wired fallback when SDL cannot say (`ConnectionState::Unknown`): does the pad's audio
-/// sibling exist? A Bluetooth DS5 exposes no audio device at all, so a DualSense sound CARD in
-/// the graph IS the wired signal. Linux ignores the HID path (the card match is
-/// identity-based); Windows resolves the path's container against the render endpoints.
-///
-/// Deliberately weaker than what the renderer needs: any profile proves the pad is plugged in,
-/// even the stereo one that cannot carry the coils — moving the card to a four-channel profile
-/// is `ensure_pro_audio`'s job, and it must not be gated on the answer to this question.
+/// SDL `ConnectionState::Unknown` fallback: a DualSense sound card in the graph is the wired
+/// signal (Bluetooth DS5 has none). Any profile counts, including stereo that cannot carry the
+/// coils — `ensure_pro_audio` moves the profile and must not be gated on this.
 #[cfg(target_os = "linux")]
 pub(crate) fn wired_audio_sibling(_hid_path: Option<&str>) -> bool {
     match walk_graph() {
@@ -91,36 +72,28 @@ pub(crate) fn wired_audio_sibling(hid_path: Option<&str>) -> bool {
     hid_path.is_some_and(|p| correlate_pad_endpoint(p).is_ok())
 }
 
-// ---- tier-A pad registry (gamepad worker → renderer worker) ---------------------------------
-
-/// One tier-A pad the gamepad worker holds open: its wire index and (Windows correlation) the
-/// SDL HID device path. Registered at slot open, dropped at slot close.
 struct TierAPad {
     index: u8,
-    /// Read by the Windows correlation only — Linux matches the sink by signature.
+    /// Windows correlation only; Linux matches the sink by signature.
     #[cfg_attr(not(windows), allow(dead_code))]
     hid_path: Option<String>,
 }
 
-/// The tier-A pads currently open, shared between the gamepad worker (writer, at slot
-/// open/close) and the session renderer worker (reader, at device correlation). A process-wide
-/// static because the two workers meet nowhere else: the gamepad service is app-lifetime, the
-/// renderer is per-session.
+/// Shared by the app-lifetime gamepad worker (write at slot open/close) and the per-session
+/// renderer (read at correlation). Process-wide because the two workers share no other path.
 static TIER_A_PADS: Mutex<Vec<TierAPad>> = Mutex::new(Vec::new());
 
-/// Gamepad worker: a tier-A slot opened on wire index `index` (idempotent per index).
 pub(crate) fn register_tier_a(index: u8, hid_path: Option<String>) {
     let mut pads = TIER_A_PADS.lock().unwrap();
     pads.retain(|p| p.index != index);
     pads.push(TierAPad { index, hid_path });
 }
 
-/// Gamepad worker: the tier-A slot on `index` closed (no-op for non-tier-A indices).
 pub(crate) fn unregister_tier_a(index: u8) {
     TIER_A_PADS.lock().unwrap().retain(|p| p.index != index);
 }
 
-/// The first registered tier-A pad's HID path (v1 renders one physical DS5).
+/// First registered pad's HID path — v1 renders one DualSense.
 #[cfg(windows)]
 fn first_tier_a_hid_path() -> Option<String> {
     TIER_A_PADS
@@ -130,13 +103,7 @@ fn first_tier_a_hid_path() -> Option<String> {
         .and_then(|p| p.hid_path.clone())
 }
 
-// ---- correlation: Linux (the pad's own four-channel card node) -------------------------------
-
-/// Does this PipeWire object's name/description look like a DualSense? The ALSA node name
-/// carries the USB vendor string (`Sony_Interactive_Entertainment`), descriptions carry the
-/// product (`DualSense`), and the kernel's fallback device name is `Wireless Controller` —
-/// any of the three identifies the pad. The weaker half of the identity: the USB ids in the
-/// proplist are the strong one, and this covers the cards that publish neither.
+/// Weaker DualSense identity: name/description when the proplist has no USB ids.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn is_ds5_sink(name: &str, description: &str) -> bool {
     let hit = |s: &str| {
@@ -147,18 +114,13 @@ pub(crate) fn is_ds5_sink(name: &str, description: &str) -> bool {
     hit(name) || hit(description)
 }
 
-/// The DualSense audio function's USB ids — the strong half of the identity, and the same pair
-/// GE-Proton matches on (`vendor.id == 0x054c && product.id ∈ {0ce6, 0df2}`).
+/// DualSense / DualSense Edge USB ids — same pair GE-Proton matches.
 #[cfg(any(target_os = "linux", test))]
 const DS5_VENDOR: u32 = 0x054C;
 #[cfg(any(target_os = "linux", test))]
 const DS5_PRODUCTS: [u32; 2] = [0x0CE6, 0x0DF2];
 
-/// Read a PipeWire `*.vendor.id` / `*.product.id` proplist value. These are written BASE 16 —
-/// sometimes `0x`-prefixed (the ALSA monitor's own stamp), sometimes bare (udev's
-/// `ID_VENDOR_ID`) — and both spellings mean the same number. Reading `"054c"` as decimal
-/// would simply fail here rather than mis-match, but `"0994"` would not, which is why this is
-/// a function and not an inline parse.
+/// PipeWire USB ids are hex, with or without `0x`. Decimal parse of `"0994"` would succeed and be wrong.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn parse_usb_id(v: &str) -> Option<u32> {
     let v = v.trim();
@@ -169,8 +131,6 @@ pub(crate) fn parse_usb_id(v: &str) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok()
 }
 
-/// The full identity test over a proplist's four relevant keys: the USB ids when the object
-/// publishes them, the name/description signature otherwise.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn props_say_ds5(
     vendor: Option<&str>,
@@ -185,42 +145,26 @@ pub(crate) fn props_say_ds5(
     ids || is_ds5_sink(name, description)
 }
 
-/// One PipeWire sink node reduced to what the pad matcher needs. Pure data, so the entire
-/// selection is unit-testable off-box — the graph walk is the only part that needs a daemon.
 #[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct SinkNode {
-    /// The registry's global id for this node — what [`pin_sink_volume`] binds to set the
-    /// node's `Props`. Zero for a node no walk produced (test fixtures, and the split parent
-    /// named by a sink we can see but never shown to us as an object of its own).
+    /// Registry global id for [`pin_sink_volume`]. `0` = no walk produced this node (fixtures, named-but-unseen split parent).
     pub(crate) id: u32,
-    /// `node.name` — what a stream targets via `target.object`.
+    /// `node.name` — stream `target.object`.
     pub(crate) name: String,
     pub(crate) description: String,
-    /// `device.id`: the CARD this node belongs to, and the object whose profile has to move
-    /// when no four-channel node exists. `None` means the node is not a card's at all — which
-    /// is how a Punktfunk host's own minted pad sink (full DualSense identity, deliberately)
-    /// is told apart from a pad in the user's hands.
+    /// Card this node belongs to. `None` is a host-minted pad sink (full DualSense identity, no card) — skip it.
     pub(crate) device_id: Option<u32>,
-    /// `audio.channels`, falling back to the length of `audio.position`.
     pub(crate) channels: u32,
-    /// `audio.position`, already split on commas. Empty when the node publishes none.
     pub(crate) positions: Vec<String>,
-    /// `api.alsa.split.name` — WirePlumber's hidden four-channel parent behind a split card
-    /// (the `HiFi` verb's mono `Speaker` / stereo `Headphones` sinks both name it). GE-Proton's
-    /// preferred haptic leg opens exactly this node.
+    /// `api.alsa.split.name` — hidden four-channel parent of a split card. GE-Proton's haptic target.
     pub(crate) split_parent: Option<String>,
-    /// This node's OWN proplist said DualSense (cards state it more reliably — see
-    /// `pick_pad_sink`, which accepts either).
+    /// This node's own proplist said DualSense. `pick_pad_sink` also accepts the card.
     pub(crate) ds5: bool,
-    /// `media.class` was `Audio/Sink/Internal` (or the node called itself
-    /// `api.alsa.split.parent`): the hidden RAW node behind a split card, carrying the
-    /// hardware's own channels. Usable, but the LAST four-channel choice — see
-    /// `pick_pad_sink` for the measurement that says so.
+    /// Hidden raw parent (`Audio/Sink/Internal`). Last four-channel choice — AUX0 is dead on that node.
     pub(crate) internal: bool,
 }
 
-/// A PipeWire `Device` — an ALSA card — reduced to the same shape.
 #[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CardDevice {
@@ -230,22 +174,16 @@ pub(crate) struct CardDevice {
     pub(crate) ds5: bool,
 }
 
-/// What the graph walk found for the pad.
 #[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PadSinkPick {
-    /// Render here: a four-channel node belonging to a DualSense card (or the hidden parent
-    /// one of its split sinks names).
+    /// Four-channel DualSense node (or the split parent a public sink names).
     Node(String),
-    /// The pad is here but exposes no four-channel node — its card profile has to move first.
-    /// Carries the `device.id` to move.
+    /// Pad present, no four-channel node. `device.id` to move.
     NeedsProfile(u32),
 }
 
-/// Is this channel map unpositioned — the `AUX0..AUX3` / unknown shape that no part of the
-/// graph will position-remix? The Pro Audio profile and WirePlumber's split parents both
-/// produce it; a `FL,FR,RL,RR` "surround 4.0" profile does not (that one still works, but only
-/// because the stream sets `stream.dont-remix`).
+/// `AUX*` / unknown maps are index-routed. `FL,FR,RL,RR` is positioned and only works with `stream.dont-remix`.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn is_unpositioned(positions: &[String]) -> bool {
     positions.is_empty()
@@ -255,36 +193,20 @@ pub(crate) fn is_unpositioned(positions: &[String]) -> bool {
         })
 }
 
-/// Choose the node the renderer should open, or the card whose profile is in the way.
+/// Pick the DualSense four-channel node, or the card whose profile is in the way.
 ///
-/// The whole requirement is four channels on a DualSense's own card: the voice coils ARE
-/// channels 3 and 4, so a stereo or mono node opens perfectly and renders the haptics into the
-/// headphone jack. v1 renders ONE physical DS5 — with two plugged in the first match wins.
+/// Coils are channels 3 and 4; a stereo/mono node opens and dumps haptics into the
+/// headphone jack. First match wins (v1: one pad).
 ///
-/// ⚠⚠ **A card's PUBLIC four-channel sink beats its hidden parent, even though the parent is
-/// the "rawer" node.** Measured on a Steam Deck (SteamOS 3.7, `alsa-ucm-conf` with
-/// `DualSense-PS5.conf`), where the card offers both:
-///
-/// | node | `audio.position` | what our channels reach |
-/// |---|---|---|
-/// | `HiFi__SpeakerHaptic__sink` (public, 4 ch) | `FL,FR,RL,RR` | split `[AUX1,AUX1,AUX2,AUX3]` |
-/// | `alsa_output.hw_Controller_0` (`Audio/Sink/Internal`, 4 ch) | `AUX0..AUX3` | the hardware |
-///
-/// The hardware map is **AUX1 = the mono speaker, AUX2/AUX3 = the two voice coils, AUX0 =
-/// nothing**. Our stream is speaker on 0/1 and haptics on 2/3, so index-exact into the PARENT
-/// puts speaker-left into the dead AUX0 and only speaker-right into the speaker — half the
-/// speaker signal thrown away. The public split sink maps BOTH of our speaker channels onto
-/// AUX1 (the fold the UCM author intended) and passes the coil pair straight through. Haptics
-/// are identical either way; the speaker is not, so the public sink wins.
-///
-/// The parent stays as the next choice for cards that publish nothing else — and Pro Audio's
-/// `pro-output-0`, which is a PUBLIC `AUX` quad, is caught by the first rule.
+/// Public four-channel sinks beat the hidden `Audio/Sink/Internal` parent. On UCM
+/// split cards the parent is `AUX0..AUX3` with AUX0 dead / AUX1 = speaker, so
+/// index-exact speaker-on-0/1 throws away the left speaker. The public
+/// `SpeakerHaptic` sink folds 0/1 onto AUX1 and passes the coils. Pro Audio's
+/// public `AUX` quad is caught first.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn pick_pad_sink(sinks: &[SinkNode], cards: &[CardDevice]) -> Option<PadSinkPick> {
     let ds5_card = |id: u32| cards.iter().any(|c| c.id == id && c.ds5);
-    // A card node only — see the module docs on `device.id`. The identity may come from either
-    // end: split sinks routinely publish neither vendor ids nor a recognisable name, and it is
-    // their CARD that says DualSense.
+    // Card nodes only (`device.id`). Split sinks often have no USB ids; the card does.
     let mine: Vec<&SinkNode> = sinks
         .iter()
         .filter(|s| s.device_id.is_some_and(|id| s.ds5 || ds5_card(id)))
@@ -293,8 +215,7 @@ pub(crate) fn pick_pad_sink(sinks: &[SinkNode], cards: &[CardDevice]) -> Option<
         return None;
     }
     let quad = |s: &&&SinkNode| s.channels == 4;
-    // Public quads first — unpositioned (Pro Audio) ahead of positioned only for determinism,
-    // since `stream.dont-remix` makes the two equivalent to us.
+    // Public quads first. Unpositioned ahead of positioned for determinism; `dont-remix` makes them equivalent.
     if let Some(s) = mine
         .iter()
         .filter(|s| !s.internal)
@@ -306,44 +227,36 @@ pub(crate) fn pick_pad_sink(sinks: &[SinkNode], cards: &[CardDevice]) -> Option<
     if let Some(s) = mine.iter().filter(|s| !s.internal).find(quad) {
         return Some(PadSinkPick::Node(s.name.clone()));
     }
-    // Only now the hidden parent (see the table above for what this costs the speaker).
+    // Hidden parent last: index-exact into AUX0..3 drops speaker-left into dead AUX0.
     if let Some(s) = mine.iter().find(quad) {
         return Some(PadSinkPick::Node(s.name.clone()));
     }
-    // A split card whose four-channel parent we cannot see in the registry (it is an
-    // `Audio/Sink/Internal` node, and a restricted client may not be shown it) still names it
-    // on every public split sink. Target it by name — that is GE-Proton's leg 1.
+    // Restricted clients may not see `Audio/Sink/Internal`; the public split still names it.
     if let Some(parent) = mine
         .iter()
         .find_map(|s| s.split_parent.clone().filter(|p| !p.is_empty()))
     {
         return Some(PadSinkPick::Node(parent));
     }
-    // A pad, but only positioned stereo/mono profiles: the card has to move to Pro Audio.
     mine.first()
         .and_then(|s| s.device_id)
         .map(PadSinkPick::NeedsProfile)
 }
 
-/// Read a sink node's facts out of a proplist. Split out because it has to run against the
-/// node's INFO props, not the registry's — see [`walk_graph`].
+/// Build a [`SinkNode`] from the node's INFO props, not the registry announce subset.
 ///
-/// Linux-only, unlike its pure-logic neighbours: `DictRef` comes from `pipewire`, which is a
-/// `cfg(target_os = "linux")` dependency. Widening this to `any(…, test)` the way the testable
-/// helpers around it do puts the item into the Windows `lib test` target, where the crate does
-/// not exist — E0433, visible only under `--all-targets`, and so only on the Windows CI leg.
+/// Linux-only: `DictRef` is `pipewire`. `any(..., test)` would compile this into the Windows
+/// `lib test` target, where the crate is missing (E0433, `--all-targets` only).
 #[cfg(target_os = "linux")]
 pub(crate) fn sink_from_props(props: &pipewire::spa::utils::dict::DictRef) -> Option<SinkNode> {
-    // Both spellings: PipeWire's own objects use the `device.`-prefixed keys, the pulse-facing
-    // proplist GE reads uses the bare ones. Cheap to accept both.
+    // `device.vendor.id` (PipeWire) or `vendor.id` (pulse/GE). Accept both.
     let vendor = props
         .get("device.vendor.id")
         .or_else(|| props.get("vendor.id"));
     let product = props
         .get("device.product.id")
         .or_else(|| props.get("product.id"));
-    // `Audio/Sink` and `Audio/Sink/Internal` alike: the hidden four-channel parent behind a
-    // split card wears the latter, and it is a usable (if second-choice) target.
+    // `Audio/Sink` and `Audio/Sink/Internal` (hidden four-channel parent).
     let class = props.get("media.class")?;
     if !class.starts_with("Audio/Sink") {
         return None;
@@ -364,7 +277,7 @@ pub(crate) fn sink_from_props(props: &pipewire::spa::utils::dict::DictRef) -> Op
         })
         .unwrap_or_default();
     Some(SinkNode {
-        // Filled by the caller from the node's own `info` — the proplist does not carry it.
+        // Caller's `info.id()`; the proplist has no registry id.
         id: 0,
         device_id: props.get("device.id").and_then(|v| v.parse().ok()),
         channels: props
@@ -383,20 +296,12 @@ pub(crate) fn sink_from_props(props: &pipewire::spa::utils::dict::DictRef) -> Op
     })
 }
 
-/// Walk the graph on a private mainloop: every `Audio/Sink…` node and every `Device`, reduced
-/// to the matcher's shapes. [`crate::audio::devices`]'s discipline (a few ms against a live
-/// daemon, a clean error when there is none) — a separate walk because that one is the settings
-/// picker's and deliberately publishes only name + description.
+/// Walk every `Audio/Sink…` node and `Device` on a private mainloop.
 ///
-/// ⚠⚠ **TWO rounds, because a registry `global` event does NOT carry the node's whole
-/// proplist.** It carries a small announce subset — enough for `media.class`, `node.name` and
-/// `device.id`, which is exactly why this looked like it worked — but `audio.channels` and
-/// `audio.position` are NOT in it. Reading them from there yields 0 channels for every node on
-/// a real machine, which then reads as "this card has no four-channel node" and sends the
-/// renderer off to change the card's profile for no reason. They live in the node's INFO
-/// props, so each candidate is bound and its `info` event awaited. (`pw-dump` and `pactl` show
-/// these fields because they bind every object too; that is what made the registry-only version
-/// look plausible against their output.)
+/// Separate from [`crate::audio::devices`]: that walk publishes name + description only.
+/// Two rounds: a registry `global` announce has `media.class` / `node.name` / `device.id`
+/// but not `audio.channels` or `audio.position` (those live on the bound node's INFO).
+/// Reading the announce yields 0 channels and a needless profile swap.
 #[cfg(target_os = "linux")]
 fn walk_graph() -> anyhow::Result<(Vec<SinkNode>, Vec<CardDevice>)> {
     use anyhow::Context;
@@ -416,7 +321,7 @@ fn walk_graph() -> anyhow::Result<(Vec<SinkNode>, Vec<CardDevice>)> {
 
     let sinks: Rc<RefCell<Vec<SinkNode>>> = Rc::default();
     let cards: Rc<RefCell<Vec<CardDevice>>> = Rc::default();
-    // The bound node proxies and their listeners have to outlive the callback that made them.
+    // Proxies and listeners must outlive the callback that created them.
     let bound: Rc<RefCell<Vec<(pw::node::Node, pw::node::NodeListener)>>> = Rc::default();
 
     let _reg_listener = registry
@@ -432,8 +337,7 @@ fn walk_graph() -> anyhow::Result<(Vec<SinkNode>, Vec<CardDevice>)> {
                 let Some(props) = g.props else { return };
                 match g.type_ {
                     pw::types::ObjectType::Node => {
-                        // The announce subset is enough to know this is a sink; everything the
-                        // matcher weighs comes from the info props below.
+                        // Announce is enough to classify a sink; matcher facts come from `info`.
                         if !props
                             .get("media.class")
                             .is_some_and(|c| c.starts_with("Audio/Sink"))
@@ -452,7 +356,7 @@ fn walk_graph() -> anyhow::Result<(Vec<SinkNode>, Vec<CardDevice>)> {
                                     if let Some(mut s) = sink_from_props(p) {
                                         s.id = info.id();
                                         let mut v = sinks.borrow_mut();
-                                        // `info` can fire more than once per node; keep one.
+                                        // `info` can fire more than once; keep one entry per name.
                                         if let Some(old) = v.iter_mut().find(|o| o.name == s.name) {
                                             *old = s;
                                         } else {
@@ -465,8 +369,7 @@ fn walk_graph() -> anyhow::Result<(Vec<SinkNode>, Vec<CardDevice>)> {
                         bound.borrow_mut().push((node, listener));
                     }
                     pw::types::ObjectType::Device => {
-                        // Cards DO announce their identity keys, and nothing else about them
-                        // is weighed, so these need no second round.
+                        // Cards announce identity keys; nothing else is weighed, so no bind.
                         let vendor = props
                             .get("device.vendor.id")
                             .or_else(|| props.get("vendor.id"));
@@ -491,8 +394,7 @@ fn walk_graph() -> anyhow::Result<(Vec<SinkNode>, Vec<CardDevice>)> {
         })
         .register();
 
-    // Round 1 delivers the globals (and binds the sinks); round 2 collects the `info` events
-    // those binds provoked. Each round parks its sync seq for the one `done` listener.
+    // Round 1: globals + bind. Round 2: `info` from those binds. Each parks its sync seq.
     let awaited: Rc<Cell<Option<pw::spa::utils::result::AsyncSeq>>> = Rc::new(Cell::new(None));
     let _round_listener = core
         .add_listener_local()
@@ -510,33 +412,23 @@ fn walk_graph() -> anyhow::Result<(Vec<SinkNode>, Vec<CardDevice>)> {
         mainloop.run();
     }
     let out = (sinks.borrow().clone(), cards.borrow().clone());
-    // Drop the bound proxies before the core that owns them.
+    // Drop bound proxies before the core that owns them.
     bound.borrow_mut().clear();
     Ok(out)
 }
 
-// ---- the Pro Audio profile swap (Linux) ------------------------------------------------------
-
-/// One profile a card offers, reduced to what the chooser needs.
 #[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CardProfile {
     pub(crate) index: u32,
     pub(crate) name: String,
     pub(crate) description: String,
-    /// `SPA_PARAM_PROFILE_available` said anything other than `no`. An unavailable profile is
-    /// one the card cannot currently enter (an unplugged jack, a busy PCM) — selecting it
-    /// would silently leave the card where it was.
+    /// `SPA_PARAM_PROFILE_available` ≠ `no`. Selecting `no` leaves the card where it was.
     pub(crate) available: bool,
 }
 
-/// Which profile carries the pad's four channels. **Pro Audio** first: PipeWire adds it to
-/// every ALSA card, it exposes each PCM raw as `AUX` channels, and it is the one the community
-/// fix names. Failing that, a positioned four-channel output ("surround 4.0") at least HAS the
-/// coil channels — `stream.dont-remix` keeps them in place once we are on it.
-///
-/// Everything else — stereo, mono, the `HiFi` splits — is a profile the coils cannot be
-/// reached through at all, so no fallback below these two is worth taking.
+/// Pro Audio first (raw `AUX` on every ALSA card). Else a positioned 4-ch (`surround-40` /
+/// `quad` / `direct`) — `stream.dont-remix` holds the coils. Stereo/mono/`HiFi` cannot reach them.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn pick_profile(profiles: &[CardProfile]) -> Option<&CardProfile> {
     let usable = |p: &&CardProfile| p.available;
@@ -551,7 +443,7 @@ pub(crate) fn pick_profile(profiles: &[CardProfile]) -> Option<&CardProfile> {
         })
 }
 
-/// A profile we moved and owe the user back. One card at a time — v1 renders one physical DS5.
+/// Profile we moved and owe back. One card — v1 renders one DualSense.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
 struct ProfileSwap {
@@ -562,28 +454,20 @@ struct ProfileSwap {
 #[cfg(target_os = "linux")]
 static PROFILE_SWAP: Mutex<Option<ProfileSwap>> = Mutex::new(None);
 
-/// Cards whose profile we already moved WITHOUT getting a four-channel node out of it. One
-/// failed swap is information; repeating it on every backoff retry would flip a device in the
-/// user's sound settings back and forth for as long as the session lasts.
+/// Cards already moved with no four-channel node. Retrying would flip the user's sound settings all session.
 #[cfg(target_os = "linux")]
 static PROFILE_TRIED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
-/// Which profile a [`set_card_profile`] call is after.
 #[cfg(target_os = "linux")]
 enum ProfileTarget {
-    /// Pick by [`pick_profile`] — the four-channel one.
     FourChannel,
-    /// Select this index verbatim (the restore leg).
     Index(u32),
 }
 
-/// Move the pad's card onto a four-channel profile, remembering what it was so the session can
-/// put it back. Idempotent: a card already on a four-channel profile is left alone.
+/// Move the pad's card to a four-channel profile and remember the previous index.
 ///
-/// This changes a device the user can see in their sound settings, so it is loud in the log,
-/// always reverted at session end ([`restore_profile`]), never persisted (`save = false`, so
-/// WirePlumber does not adopt it as the card's remembered choice), and switchable off entirely
-/// with `PUNKTFUNK_PAD_AUDIO_PROFILE=0` for anyone who would rather drive their own card.
+/// User-visible, reverted at session end, `save = false` so WirePlumber does not remember it.
+/// `PUNKTFUNK_PAD_AUDIO_PROFILE=0` leaves the card alone.
 #[cfg(target_os = "linux")]
 fn ensure_pro_audio(device_id: u32) -> anyhow::Result<()> {
     if matches!(
@@ -598,8 +482,7 @@ fn ensure_pro_audio(device_id: u32) -> anyhow::Result<()> {
     }
     let previous = set_card_profile(device_id, ProfileTarget::FourChannel)?;
     let mut swap = PROFILE_SWAP.lock().unwrap();
-    // Only the FIRST swap is the user's own setting; a later re-correlation must not record
-    // our own Pro Audio pick as the thing to restore.
+    // First swap is the user's setting; a later re-correlation must not restore our Pro Audio pick.
     if swap.is_none() {
         *swap = Some(ProfileSwap {
             device_id,
@@ -609,7 +492,6 @@ fn ensure_pro_audio(device_id: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Put a swapped card back the way we found it (session end, or the renderer giving up).
 #[cfg(target_os = "linux")]
 fn restore_profile() {
     let Some(swap) = PROFILE_SWAP.lock().unwrap().take() else {
@@ -621,8 +503,7 @@ fn restore_profile() {
             profile = swap.previous,
             "DualSense card profile restored"
         ),
-        // An unplugged pad is the ordinary way this fails — its card is gone, and so is the
-        // profile we owed back.
+        // Unplug is the ordinary failure — the card (and the owed profile) is gone.
         Err(e) => tracing::debug!(
             error = %format!("{e:#}"),
             "DualSense card profile not restored (pad unplugged?)"
@@ -630,12 +511,8 @@ fn restore_profile() {
     }
 }
 
-/// Select a profile on a card, returning the index it had before. The one live half of the
-/// swap: bind the `Device`, enumerate `EnumProfile` + the active `Profile`, choose, `set_param`.
-///
-/// Three mainloop rounds rather than one, because each depends on the previous round's replies:
-/// the registry has to deliver the card before we can bind it, and the bound proxy has to
-/// answer `enum_params` before we know which index to ask for.
+/// Select a profile, returning the index it had. Three mainloop rounds: registry bind, then
+/// `enum_params`, then `set_param` — each waits on the previous replies.
 #[cfg(target_os = "linux")]
 fn set_card_profile(device_id: u32, want: ProfileTarget) -> anyhow::Result<u32> {
     use anyhow::{anyhow, Context};
@@ -694,7 +571,7 @@ fn set_card_profile(device_id: u32, want: ProfileTarget) -> anyhow::Result<u32> 
         })
         .register();
 
-    // One `done` listener drives every round; each round parks its sync seq here first.
+    // One `done` listener for every round; each parks its sync seq here first.
     let awaited: Rc<Cell<Option<pw::spa::utils::result::AsyncSeq>>> = Rc::new(Cell::new(None));
     let _core_listener = core
         .add_listener_local()
@@ -714,7 +591,7 @@ fn set_card_profile(device_id: u32, want: ProfileTarget) -> anyhow::Result<u32> 
         Ok(())
     };
 
-    round(&|| Ok(()))?; // 1: the registry replays its globals; our card gets bound
+    round(&|| Ok(()))?; // registry replays globals; the card is bound
     round(&|| {
         let d = device.borrow();
         let d = d
@@ -723,14 +600,12 @@ fn set_card_profile(device_id: u32, want: ProfileTarget) -> anyhow::Result<u32> 
         d.enum_params(0, Some(ParamType::EnumProfile), 0, u32::MAX);
         d.enum_params(1, Some(ParamType::Profile), 0, 1);
         Ok(())
-    })?; // 2: profile list + the active one
+    })?; // EnumProfile + active Profile
 
     let previous = active
         .get()
         .ok_or_else(|| anyhow!("card {device_id} did not report an active profile"))?;
-    // Decide with the borrow SCOPED: round 3 runs the mainloop again, and the param listener
-    // that fills this list runs from inside it — holding a shared borrow across that call
-    // would turn a re-emitted `EnumProfile` into a `RefCell` panic.
+    // Scope the borrow: round 3 re-enters the mainloop and the param listener may re-emit EnumProfile.
     let pick = {
         let list = profiles.borrow();
         match want {
@@ -772,15 +647,14 @@ fn set_card_profile(device_id: u32, want: ProfileTarget) -> anyhow::Result<u32> 
             pw::spa::pod::Pod::from_bytes(&pod).ok_or_else(|| anyhow!("bad Profile pod"))?,
         );
         Ok(())
-    })?; // 3: flush the set_param before the loop and its proxies drop
+    })?; // flush set_param before the loop and its proxies drop
     Ok(previous)
 }
 
-/// Parse one `EnumProfile` / `Profile` object pod.
 #[cfg(target_os = "linux")]
 fn parse_profile(pod: &pipewire::spa::pod::Pod) -> Option<CardProfile> {
     use pipewire::spa::pod::{deserialize::PodDeserializer, Value};
-    // `SPA_PARAM_AVAILABILITY_no` — the one availability that means "cannot be selected".
+    // `SPA_PARAM_AVAILABILITY_no` — the only availability that cannot be selected.
     const AVAILABILITY_NO: u32 = 1;
     let (_, value) = PodDeserializer::deserialize_any_from(pod.as_bytes()).ok()?;
     let Value::Object(obj) = value else {
@@ -806,9 +680,7 @@ fn parse_profile(pod: &pipewire::spa::pod::Pod) -> Option<CardProfile> {
     Some(p)
 }
 
-/// The `Profile` object pod that selects `index`. `save = false` on purpose: this is a
-/// borrowed profile for the length of a session, not a preference to write into the user's
-/// WirePlumber state.
+/// Profile pod for `index`. `save = false`: session borrow, not a WirePlumber preference.
 #[cfg(target_os = "linux")]
 fn profile_pod(index: u32) -> anyhow::Result<Vec<u8>> {
     use anyhow::Context;
@@ -839,12 +711,8 @@ fn profile_pod(index: u32) -> anyhow::Result<Vec<u8>> {
     .into_inner())
 }
 
-/// The `Props` object pod that puts every channel of a sink at unity gain.
-///
-/// Unity is 1.0 in `channelVolumes`, which is NOT the "100%" a mixer shows: pulse (and every UI
-/// built on it) displays a CUBED scale, so WirePlumber's 0.4 default reads as 40% on screen and
-/// is 0.4³ = 0.064 — a hair under −24 dB — in the linear units this pod speaks. 1.0 is unity in
-/// both, which is the whole reason this pins to unity rather than to some other number.
+/// Unity gain: 1.0 in `channelVolumes`. Pulse UIs cube the scale, so WirePlumber's 0.4 default
+/// is 0.4³ ≈ −24 dB in linear units. 1.0 is unity on both scales.
 #[cfg(target_os = "linux")]
 fn unity_volume_pod(channels: u32) -> anyhow::Result<Vec<u8>> {
     use anyhow::Context;
@@ -875,23 +743,9 @@ fn unity_volume_pod(channels: u32) -> anyhow::Result<Vec<u8>> {
     .into_inner())
 }
 
-/// Put the pad's sink at unity gain, because nobody chose the level it arrives at.
-///
-/// WirePlumber starts every new card's sink at `device.routes.default-sink-volume` — 0.4, which
-/// is −23.88 dB — and that setting is global: it cannot be scoped to one device in config, so
-/// there is no configuration fix to ship. It is a sane default for a laptop speaker somebody is
-/// about to turn up, and wrong for this sink twice over. The pad's is not a listening volume a
-/// user reaches for; and BOTH ends of a session mint one, so the two stack: −47.8 dB by the time
-/// a game's haptics reach a voice coil, which is felt as "the haptics are weak, maybe dead"
-/// rather than as a volume anyone would think to look at.
-///
-/// Deliberately NOT restored the way [`restore_profile`] restores a borrowed profile. A profile
-/// swap overrides a choice the user made; this overrides a default nobody made, and putting
-/// −24 dB back on the way out would be restoring the bug.
-///
-/// Best effort throughout: every failure here costs attenuation, never audio, so the caller logs
-/// and carries on. `PUNKTFUNK_PAD_SINK_VOLUME=0` leaves the sink exactly where it was found, for
-/// bisecting against a box where something else is doing the attenuating.
+/// Pin the pad sink to unity. WirePlumber starts new cards at 0.4 (−24 dB, cubed UI 40%)
+/// globally, so both session ends stack. Not restored: putting −24 dB back would restore the
+/// bug. Failures cost attenuation, never audio. `PUNKTFUNK_PAD_SINK_VOLUME=0` skips.
 #[cfg(target_os = "linux")]
 fn pin_sink_volume(node_id: u32, channels: u32) -> anyhow::Result<()> {
     use anyhow::{anyhow, Context};
@@ -942,7 +796,7 @@ fn pin_sink_volume(node_id: u32, channels: u32) -> anyhow::Result<()> {
         Ok(())
     };
 
-    round(&|| Ok(()))?; // 1: the registry replays its globals; our node gets bound
+    round(&|| Ok(()))?; // registry replays globals; the node is bound
     let pod = unity_volume_pod(channels).context("serialize Props pod")?;
     round(&|| {
         let n = node.borrow();
@@ -955,15 +809,11 @@ fn pin_sink_volume(node_id: u32, channels: u32) -> anyhow::Result<()> {
             pw::spa::pod::Pod::from_bytes(&pod).ok_or_else(|| anyhow!("bad Props pod"))?,
         );
         Ok(())
-    })?; // 2: flush the set_param before the loop and its proxies drop
+    })?; // flush set_param before the loop and its proxies drop
     Ok(())
 }
 
-/// Pass a picked node name through, pinning that node to unity gain on the way — see
-/// [`pin_sink_volume`] for why the level it arrives at is nobody's choice.
-///
-/// Runs on every (re)correlation rather than once, so a card that re-minted its nodes (a profile
-/// change, a replug) is pinned again without anything having to notice that it did.
+/// Pin the picked node to unity on every (re)correlation — a profile change remints nodes.
 #[cfg(target_os = "linux")]
 fn pin_picked(name: String, sinks: &[SinkNode]) -> String {
     if matches!(
@@ -972,9 +822,7 @@ fn pin_picked(name: String, sinks: &[SinkNode]) -> String {
     ) {
         return name;
     }
-    // Only a node the walk actually saw. The `split_parent` pick is a NAME lifted off another
-    // node's proplist — there may be no object behind it we are allowed to bind, and pinning the
-    // sink that named it would be pinning the wrong node.
+    // `split_parent` is a name on another node's proplist; there may be no bindable object.
     let Some(s) = sinks.iter().find(|s| s.name == name && s.id != 0) else {
         return name;
     };
@@ -990,8 +838,6 @@ fn pin_picked(name: String, sinks: &[SinkNode]) -> String {
     name
 }
 
-/// Correlate: walk the graph, pick the pad's four-channel node, and move the card's profile if
-/// that is what stands between us and one. Returns the `node.name` to target.
 #[cfg(target_os = "linux")]
 pub fn correlate_pad_sink() -> anyhow::Result<String> {
     use anyhow::anyhow;
@@ -1006,8 +852,7 @@ pub fn correlate_pad_sink() -> anyhow::Result<String> {
                 ));
             }
             ensure_pro_audio(device_id)?;
-            // The card re-mints its nodes on a profile change; give the graph a moment to
-            // publish them rather than failing into the caller's multi-second backoff.
+            // Profile change remints nodes; wait ~2 s rather than the caller's multi-second backoff.
             let mut last = Vec::new();
             for _ in 0..20 {
                 std::thread::sleep(Duration::from_millis(100));
@@ -1017,18 +862,11 @@ pub fn correlate_pad_sink() -> anyhow::Result<String> {
                 }
                 last = sinks;
             }
-            // The swap did not help, so it is pure cost to the user: put the card back before
-            // reporting, and remember not to move this one again.
+            // Swap was pure cost: restore now, and do not move this card again.
             PROFILE_TRIED.lock().unwrap().push(device_id);
             restore_profile();
-            // Name what we saw: a card whose nodes publish no `audio.channels` at all looks
-            // exactly like a card stuck on stereo from here, and the two want different fixes.
-            //
-            // ⚠ The other way to land here is a profile change the session manager REFUSED —
-            // `set_param` on a device is a write, and a sandboxed (flatpak) client is commonly
-            // granted read-only permission on objects it does not own. There is no reply to
-            // read, so this is where that shows up. Hence the manual instruction: switching the
-            // card by hand is the same fix, and it always works.
+            // 0 channels and stereo look the same here. A sandbox (flatpak) often cannot
+            // `set_param` on a device it does not own — no error reply, so this is where it shows.
             Err(anyhow!(
                 "the DualSense card has no four-channel node, and moving its profile did not \
                  produce one — set the controller's Profile to \"Pro Audio\" in your sound \
@@ -1045,21 +883,12 @@ pub fn correlate_pad_sink() -> anyhow::Result<String> {
     }
 }
 
-// ---- the on-glass devtest (Linux) ------------------------------------------------------------
-
-/// `punktfunk-session --pad-audio-test`: report what the correlation sees, then drive a tone
-/// into the pad so "nothing happens" can be told apart from "nothing arrives".
-///
-/// The two failures this separates are the whole reason it exists. A silent pad with a host
-/// streaming could be the plane (nothing arriving), the graph (arriving and folded away), or
-/// the pad (arriving, routed, and the firmware muted). This walks the same correlation the
-/// renderer does, prints every DualSense object it found and the node it chose, and then puts a
-/// 200 Hz sine on the voice-coil pair — channels 3 and 4 — with the speaker pair silent. If the
-/// pad buzzes, everything below the plane is good.
+/// `punktfunk-session --pad-audio-test`: print correlation, then a tone so silence is
+/// "nothing arrives" vs "graph folded it" vs "firmware muted". 200 Hz on the coil pair
+/// (channels 3/4), speaker silent unless asked. Buzz means everything below the plane is good.
 #[cfg(target_os = "linux")]
 pub fn pad_audio_test(seconds: u64, coils: bool, speaker: bool) -> anyhow::Result<()> {
-    // Whatever happens in here, the card goes back the way we found it. An early `?` used to
-    // skip the restore and leave a real Deck sitting on Pro Audio.
+    // Restore even on `?` — otherwise a failed test leaves the card on Pro Audio.
     let out = pad_audio_test_inner(seconds, coils, speaker);
     restore_profile();
     out
@@ -1068,8 +897,7 @@ pub fn pad_audio_test(seconds: u64, coils: bool, speaker: bool) -> anyhow::Resul
 #[cfg(target_os = "linux")]
 fn pad_audio_test_inner(seconds: u64, coils: bool, speaker: bool) -> anyhow::Result<()> {
     let (sinks, cards) = walk_graph()?;
-    // The totals first: "no DualSense here" and "this walk saw nothing at all" print the same
-    // empty list otherwise, and they are completely different faults.
+    // Totals first: "no DualSense" and "walk saw nothing" both print an empty list.
     println!(
         "== DualSense objects in the PipeWire graph (of {} sinks, {} cards) ==",
         sinks.len(),
@@ -1123,9 +951,7 @@ fn pad_audio_test_inner(seconds: u64, coils: bool, speaker: bool) -> anyhow::Res
             (false, false) => "silence (both pairs off)",
         }
     );
-    // 200 Hz at half scale: low enough that the coils move air rather than click, loud enough
-    // to feel through a grip. 480-frame (10 ms) chunks, paced by the wall clock — this is a
-    // devtest, so the ring policy downstream is what absorbs the jitter.
+    // 200 Hz at 0.5: coils move air rather than click. 480-frame (10 ms) chunks, wall-clock paced.
     let mut phase = 0f32;
     let step = std::f32::consts::TAU * 200.0 / 48_000.0;
     let deadline = Instant::now() + Duration::from_secs(seconds);
@@ -1146,25 +972,15 @@ fn pad_audio_test_inner(seconds: u64, coils: bool, speaker: bool) -> anyhow::Res
     Ok(())
 }
 
-// ---- correlation: Windows (HID container → render endpoint) ---------------------------------
-
-/// One enumerated render endpoint reduced to what the matcher needs. Pure data so the container
-/// match is unit-testable off-box.
 #[cfg(any(windows, test))]
 pub(crate) struct EndpointCandidate {
-    /// The `IMMDevice` endpoint id (`{0.0.0.00000000}.{…}`) — what WASAPI's device targeting
-    /// takes.
+    /// `IMMDevice` id (`{0.0.0.00000000}.{…}`) — WASAPI device targeting.
     pub(crate) id: String,
-    /// The endpoint's `PKEY_Device_ContainerId` as a braced lowercase GUID string; `None` when
-    /// unreadable.
     pub(crate) container: Option<String>,
-    /// Channel count of the endpoint's device format.
     pub(crate) channels: u16,
 }
 
-/// The endpoint belonging to the pad: container match AND a 4-channel device format (the DS5
-/// audio function is the only 4-ch endpoint in its container — the mix-format gate keeps a
-/// hypothetical sibling stereo endpoint from winning).
+/// Container match AND 4-channel format — the DS5 audio function is the only 4-ch endpoint in its container.
 #[cfg(any(windows, test))]
 pub(crate) fn pick_pad_endpoint<'a>(
     endpoints: &'a [EndpointCandidate],
@@ -1178,11 +994,8 @@ pub(crate) fn pick_pad_endpoint<'a>(
     })
 }
 
-/// A device INSTANCE id from a device INTERFACE path: strip the `\\?\` (or `\\.\`) prefix,
-/// the `#` separators become `\`, and the trailing `{interface-class-guid}` segment drops —
-/// `\\?\HID#VID_054C&PID_0CE6#8&2de&0&0000#{4d1e55b2-…}` → `HID\VID_054C&PID_0CE6\8&2de&0&0000`.
-/// That instance id is the devnode's key under `HKLM\SYSTEM\CurrentControlSet\Enum`, where its
-/// `ContainerID` lives.
+/// Interface path → instance id: strip `\\?\` / `\\.`, `#` → `\`, drop trailing `{guid}`.
+/// That id is the Enum key where `ContainerID` lives.
 #[cfg(any(windows, test))]
 pub(crate) fn hid_instance_from_interface_path(path: &str) -> Option<String> {
     let p = path
@@ -1201,9 +1014,7 @@ pub(crate) fn hid_instance_from_interface_path(path: &str) -> Option<String> {
     Some(segs.join("\\"))
 }
 
-/// Parse a serialized `VT_CLSID` PROPVARIANT registry blob (the on-disk shape of the MMDevices
-/// property store: 8-byte header `[vt, 0, 0, 0, 1, 0, 0, 0]`, then the GUID in registry byte
-/// order) into a braced lowercase GUID string. `None` for anything else.
+/// `VT_CLSID` PROPVARIANT blob: 8-byte header `[vt,0,0,0,1,0,0,0]` then registry-order GUID.
 #[cfg(any(windows, test))]
 pub(crate) fn container_guid_from_blob(bytes: &[u8]) -> Option<String> {
     const VT_CLSID: u8 = 0x48;
@@ -1220,11 +1031,8 @@ pub(crate) fn container_guid_from_blob(bytes: &[u8]) -> Option<String> {
     ))
 }
 
-/// Resolve the SDL HID interface path to the matching 4-ch render endpoint id — the Windows
-/// correlation chain: interface path → instance id → devnode `ContainerID` (registry) → the
-/// active eRender endpoint whose stamped `PKEY_Device_ContainerId` matches with a 4-channel
-/// device format. Registry-only for the property reads (the MMDevices ACL denies writes, never
-/// reads); the endpoint enumeration runs on its own MTA thread like [`crate::audio::devices`].
+/// HID interface path → instance id → Enum `ContainerID` → 4-ch eRender endpoint with matching
+/// `PKEY_Device_ContainerId`. Registry for property reads (MMDevices ACL denies writes, not reads).
 #[cfg(windows)]
 pub(crate) fn correlate_pad_endpoint(hid_path: &str) -> anyhow::Result<String> {
     use anyhow::Context;
@@ -1244,8 +1052,6 @@ pub(crate) fn correlate_pad_endpoint(hid_path: &str) -> anyhow::Result<String> {
         })
 }
 
-/// The devnode's `ContainerID` value (a braced GUID string) under
-/// `HKLM\SYSTEM\CurrentControlSet\Enum\<instance>`.
 #[cfg(windows)]
 fn hid_container_id(instance: &str) -> anyhow::Result<String> {
     use anyhow::Context;
@@ -1256,9 +1062,7 @@ fn hid_container_id(instance: &str) -> anyhow::Result<String> {
         .context("read ContainerID")
 }
 
-/// Enumerate the active eRender endpoints with the container + channel facts the matcher needs.
-/// Its own short-lived MTA thread (the caller may sit in an STA — the [`crate::audio::devices`]
-/// discipline); one broken endpoint must not hide the rest.
+/// Active eRender endpoints. Own MTA thread (caller may be STA); one broken endpoint must not hide the rest.
 #[cfg(windows)]
 fn render_endpoints() -> anyhow::Result<Vec<EndpointCandidate>> {
     use anyhow::{anyhow, Context};
@@ -1297,9 +1101,7 @@ fn render_endpoints() -> anyhow::Result<Vec<EndpointCandidate>> {
         .map_err(|_| anyhow!("pad-audio enumeration thread panicked"))?
 }
 
-/// The endpoint's stamped `PKEY_Device_ContainerId`, read from its MMDevices property store in
-/// the registry (`…\MMDevices\Audio\Render\{ep-guid}\Properties`, value
-/// `"{8c7ed206-3f8a-4827-b3ab-ae9e1faefc6c},2"`, a serialized VT_CLSID blob).
+/// `PKEY_Device_ContainerId` from the MMDevices property store (`…\Render\{ep}\Properties`, VT_CLSID blob).
 #[cfg(windows)]
 fn endpoint_container_id(endpoint_id: &str) -> Option<String> {
     let guid = endpoint_id.rfind('{').map(|i| &endpoint_id[i..])?;
@@ -1314,21 +1116,12 @@ fn endpoint_container_id(endpoint_id: &str) -> Option<String> {
     container_guid_from_blob(&v.bytes)
 }
 
-// ---- the 4-channel mixer --------------------------------------------------------------------
-
-/// Interleave the two independent stereo streams into one 4-ch frame stream: speaker
-/// ([`PAD_AUDIO_KIND_SPEAKER`]) on channels 0/1, haptics ([`PAD_AUDIO_KIND_HAPTICS`]) on 2/3.
-/// Each kind has its own write cursor (they arrive on different cadences — 10 ms vs 5 ms);
-/// [`pop`](Self::pop) emits every frame the FURTHER-ahead kind has filled, with the lagging
-/// (or absent) kind's pair reading zeros — so a haptics-only session plays voice-coil audio
-/// with a silent speaker pair and vice versa. Pure logic (unit-tested); pacing and latency
-/// bounds live in the platform ring downstream.
+/// Independent write cursors (10 ms vs 5 ms); [`Self::pop`] emits the further-ahead kind,
+/// lagging pair zeros. Latency lives in the platform ring.
 pub(crate) struct QuadMixer {
-    /// Interleaved 4-ch samples; the front is the next frame to output. Length is always
-    /// `ready_frames() * 4` (pushes zero-extend for their own cursor only).
+    /// Interleaved 4-ch; front is next output. Length is always `ready_frames() * 4`.
     ring: std::collections::VecDeque<f32>,
-    /// Per-kind write cursor in FRAMES relative to the ring front (`[haptics, speaker]` —
-    /// indexed by the wire `kind`).
+    /// Per-kind write cursor in frames from the ring front (`[haptics, speaker]`, wire `kind`).
     written: [usize; 2],
 }
 
@@ -1340,9 +1133,7 @@ impl QuadMixer {
         }
     }
 
-    /// Write one decoded stereo chunk (interleaved L/R) for `kind` at that kind's cursor,
-    /// zero-extending the ring as needed. Depth is bounded by [`MAX_BUFFER_FRAMES`] — overflow
-    /// drops the oldest frames (both kinds shift together, so the interleave never skews).
+    /// Overflow drops oldest frames; both cursors shift so interleave does not skew.
     pub(crate) fn push(&mut self, kind: u8, stereo: &[f32]) {
         let k = (kind as usize).min(1);
         let off = if kind == PAD_AUDIO_KIND_SPEAKER { 0 } else { 2 };
@@ -1364,13 +1155,11 @@ impl QuadMixer {
         }
     }
 
-    /// Frames ready to output: the further-ahead kind's cursor (the other pair reads zeros).
     pub(crate) fn ready_frames(&self) -> usize {
         self.written[0].max(self.written[1])
     }
 
-    /// Append every ready frame (interleaved 4-ch) to `out`; returns the frame count. Both
-    /// cursors move back together, so a kind that lagged simply resumes at the new front.
+    /// Both cursors move back; a lagging kind resumes at the new front.
     pub(crate) fn pop(&mut self, out: &mut Vec<f32>) -> usize {
         let frames = self.ready_frames();
         let n = frames * PAD_CHANNELS;
@@ -1382,7 +1171,6 @@ impl QuadMixer {
         frames
     }
 
-    /// Throw the ready frames away (no output device right now).
     pub(crate) fn discard(&mut self) {
         let f = self.ready_frames();
         self.drop_front(f);
@@ -1398,20 +1186,15 @@ impl QuadMixer {
     }
 }
 
-// ---- decode + PLC ---------------------------------------------------------------------------
-
-/// Per-(pad, kind) decode state: a stereo 48 kHz Opus decoder, the seq-gap tracker, and the
-/// last decoded frame size (the PLC synthesis unit — session.rs's audio-thread discipline).
+/// `frame_samples` is the PLC synthesis unit (session audio-thread discipline).
 struct KindStream {
     dec: opus::Decoder,
     gaps: AudioGapTracker,
     frame_samples: usize,
 }
 
-/// How many concealment frames to synthesize before decoding `seq`: the tracker's capped gap
-/// count — but 0 until a first frame decoded (`frame_samples == 0`; there is nothing to size
-/// the PLC from). The tracker is ALWAYS fed, so a pre-first-frame gap can't replay later as a
-/// phantom gap. Pure (unit-tested).
+/// Concealment frames before `seq`. 0 until a first decode (`frame_samples == 0`); the tracker
+/// is always fed so a pre-first gap cannot replay later.
 fn plc_frames(gaps: &mut AudioGapTracker, seq: u32, frame_samples: usize) -> u32 {
     let missing = gaps.missing_before(seq);
     if frame_samples == 0 {
@@ -1421,14 +1204,8 @@ fn plc_frames(gaps: &mut AudioGapTracker, seq: u32, frame_samples: usize) -> u32
     }
 }
 
-// ---- the renderer worker --------------------------------------------------------------------
-
-/// Spawn the pad-audio renderer thread — the 0xD1 plane's single consumer, started by the
-/// session pump whenever the settings could render (`pad_haptics` / `pad_speaker == "pad"`).
-/// The output device is opened LAZILY on the first arriving frame: frames only flow once a
-/// tier-A pad declared render caps on its arrival, so a session without a wired DualSense
-/// costs one idle 10 ms poll loop and never touches the audio graph. Exits on the session
-/// stop flag (join it like the audio thread) or the plane closing.
+/// Pad-audio renderer: 0xD1 consumer. Opens the device on the first frame so a session without
+/// a wired DualSense is an idle 10 ms poll. Exits on the session stop flag or the plane closing.
 pub(crate) fn spawn(
     connector: Arc<NativeClient>,
     stop: Arc<AtomicBool>,
@@ -1443,14 +1220,12 @@ pub(crate) fn spawn(
 }
 
 fn run(connector: &NativeClient, stop: &AtomicBool, haptics: bool, speaker: bool) {
-    // The pad's audio is a haptic: a late decode is a rumble that lands after the hit. Same
-    // best-effort priority as the main decode leg (`audio_rt`).
+    // Late decode is rumble after the hit. Same best-effort RT as the main decode leg.
     crate::audio_rt::boost_and_log("pf-pad-audio");
-    // Per-kind decode state for the ONE rendered pad (v1: the first pad that streams; the
-    // spec's per-(pad, kind) fan-out degenerates to per-kind once the pad is latched).
+    // v1: first streaming pad; per-(pad, kind) degenerates to per-kind once latched.
     let mut streams: [Option<KindStream>; 2] = [None, None];
     let mut mixer = QuadMixer::new();
-    let mut pcm = vec![0f32; 5760 * 2]; // scratch: max Opus frame (120 ms) × stereo
+    let mut pcm = vec![0f32; 5760 * 2]; // max Opus frame (120 ms) × stereo
     let mut out: Option<PadOut> = None;
     let mut active_pad: Option<u8> = None;
     let mut other_pad_logged = false;
@@ -1464,15 +1239,14 @@ fn run(connector: &NativeClient, stop: &AtomicBool, haptics: bool, speaker: bool
             }
             continue;
         };
-        // The host only emits kinds the arrival declared, but the settings gate is re-checked
-        // here so a stale host can never force an undeclared renderer.
+        // Host only emits declared kinds; re-check settings so a stale host cannot force a renderer.
         if f.kind > 1
             || (f.kind == PAD_AUDIO_KIND_HAPTICS && !haptics)
             || (f.kind == PAD_AUDIO_KIND_SPEAKER && !speaker)
         {
             continue;
         }
-        // v1 renders ONE physical DualSense: latch the first streaming pad, drop the rest.
+        // v1: one DualSense. Latch the first streaming pad, drop the rest.
         match active_pad {
             None => active_pad = Some(f.pad),
             Some(p) if p != f.pad => {
@@ -1505,9 +1279,7 @@ fn run(connector: &NativeClient, stop: &AtomicBool, haptics: bool, speaker: bool
             }
         }
         let st = streams[k].as_mut().expect("inserted above");
-        // Conceal lost packets (a seq gap) with libopus PLC before decoding the arrival —
-        // the session audio thread's exact discipline. A frozen seq (the host paused the
-        // stream) produces no packets at all, which is silence by construction.
+        // Seq-gap PLC before decode. A frozen seq (host paused) produces no packets — silence.
         for _ in 0..plc_frames(&mut st.gaps, f.seq, st.frame_samples) {
             let n = st.frame_samples * 2;
             if let Ok(samples) = st.dec.decode_float(&[], &mut pcm[..n], false) {
@@ -1523,8 +1295,7 @@ fn run(connector: &NativeClient, stop: &AtomicBool, haptics: bool, speaker: bool
                 Err(e) => tracing::debug!(error = %e, kind = f.kind, "pad-audio opus decode"),
             }
         }
-        // Output: open lazily (frames flowing prove a tier-A pad exists), drop + re-correlate
-        // with backoff when the device goes away (USB unplug kills the sink/endpoint).
+        // Open lazily; drop + re-correlate with backoff when the USB sink/endpoint vanishes.
         if out.as_ref().is_some_and(PadOut::finished) {
             tracing::info!("pad-audio output ended (device gone?) — re-correlating");
             out = None;
@@ -1562,20 +1333,14 @@ fn run(connector: &NativeClient, stop: &AtomicBool, haptics: bool, speaker: bool
             None => mixer.discard(),
         }
     }
-    // Drop the output BEFORE the profile goes back: the card cannot leave a profile whose PCM
-    // we still hold open, and a failed restore would leave the user's pad on Pro Audio.
+    // Drop output before restoring the profile: the card cannot leave a profile whose PCM is still open.
     drop(out);
     #[cfg(target_os = "linux")]
     restore_profile();
     tracing::debug!("pad-audio pull thread exited");
 }
 
-// ---- platform output: Linux (PipeWire) ------------------------------------------------------
-
-/// The platform output half: a dedicated device thread fed interleaved 4-ch f32 chunks over a
-/// bounded channel with a recycle pool (the `AudioPlayer` shape), targeting the correlated
-/// DualSense device. `finished()` is the device-gone signal — the worker drops the handle and
-/// re-correlates with backoff.
+/// `finished()` is device-gone — the worker drops and re-correlates.
 #[cfg(target_os = "linux")]
 struct PadOut {
     pcm_tx: std::sync::mpsc::SyncSender<Vec<f32>>,
@@ -1586,22 +1351,18 @@ struct PadOut {
 
 #[cfg(target_os = "linux")]
 impl PadOut {
-    /// Correlate (the pad's four-channel card node, moving its profile if need be) and open the
-    /// PipeWire playback stream on it.
     fn open() -> anyhow::Result<PadOut> {
         use anyhow::Context;
         let target = correlate_pad_sink()?;
         tracing::info!(sink = %target, "pad-audio sink matched");
-        // 64 × 5 ms of slack between the renderer worker and the PipeWire loop, with the
-        // recycle pool keeping the steady state allocation-free (the AudioPlayer shape).
+        // 64 × 5 ms slack; recycle pool keeps steady state allocation-free.
         let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
         let (recycle_tx, recycle_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
         let (quit_tx, quit_rx) = pipewire::channel::channel::<()>();
         let thread = std::thread::Builder::new()
             .name("pf-pad-audio-out".into())
             .spawn(move || {
-                // The pad stream's `process` runs on THIS thread (no RT_PROCESS), so this is
-                // the thread that has to make the pad's device cycles. Best-effort.
+                // `process` runs here (no RT_PROCESS); this thread has to make the pad's device cycles.
                 crate::audio_rt::boost_and_log("pf-pad-audio-out");
                 if let Err(e) = pad_pw_thread(pcm_rx, recycle_tx, quit_rx, target) {
                     tracing::warn!(error = %format!("{e:#}"), "pad-audio playback thread ended");
@@ -1639,10 +1400,8 @@ impl Drop for PadOut {
     }
 }
 
-/// The PipeWire playback thread on the DualSense node: 4 unpositioned `AUX0..AUX3` channels
-/// (ch0/1 the pad's speaker, ch2/3 the voice coils), a 5 ms quantum, and the session player's
-/// adaptive ring policy at a SMALLER floor — haptics are felt latency, so the prime target is
-/// 3 quanta bounded to [240, 2400] frames instead of the main player's [720, 9600].
+/// Playback on the DualSense node: 4 unpositioned `AUX0..AUX3`, 5 ms quantum, ring floor
+/// 3 quanta in [240, 2400] frames (main player is [720, 9600] — haptics are felt latency).
 #[cfg(target_os = "linux")]
 fn pad_pw_thread(
     pcm_rx: std::sync::mpsc::Receiver<Vec<f32>>,
@@ -1676,20 +1435,14 @@ fn pad_pw_thread(
         *pw::keys::MEDIA_ROLE       => "Game",
         *pw::keys::NODE_NAME        => "punktfunk-pad-audio",
         *pw::keys::NODE_DESCRIPTION => "Punktfunk Pad Audio",
-        // ~5 ms quantum (one haptics Opus frame) keeps the ring — and the felt latency — small.
+        // ~5 ms quantum (one haptics Opus frame) keeps felt latency small.
         *pw::keys::NODE_LATENCY     => "240/48000",
-        // The correlated DualSense sink (raw key — the `keys::TARGET_OBJECT` constant is
-        // feature-gated on a newer libpipewire than we require; the wire name is stable).
+        // Raw key: `keys::TARGET_OBJECT` is feature-gated on a newer libpipewire than we require.
         "target.object"             => target.as_str(),
-        // The pad unplugging must END this stream (the worker re-correlates), not let the
-        // session manager re-route 4-ch haptics onto the desktop speakers.
+        // Unplug must END the stream (worker re-correlates), not re-route 4-ch haptics to desktop speakers.
         "node.dont-reconnect"       => "true",
-        // ⚠ LOAD-BEARING: without this the graph POSITION-remixes our quad into whatever the
-        // node's own channel map says, and on any positioned map the voice-coil pair is folded
-        // into the speaker pair and disappears — the exact failure the "set it to Pro Audio"
-        // advice exists to route around. With it, channel k goes to channel k, which is the
-        // only mapping the pad's firmware understands. GE-Proton's pulse leg forces the same
-        // thing (`PA_STREAM_NO_REMIX_CHANNELS` + a forced AUX map).
+        // Without this the graph position-remixes the quad and folds coils into the speaker.
+        // Channel k → channel k is the only map the firmware understands.
         *pw::keys::STREAM_DONT_REMIX => "true",
     };
     let stream =
@@ -1714,8 +1467,7 @@ fn pad_pw_thread(
             let mainloop = mainloop.clone();
             move |_s, _ud, old, new| {
                 tracing::debug!(?old, ?new, "pipewire pad-audio stream state");
-                // Device gone (USB unplug) with dont-reconnect: the stream errors out — end
-                // the thread so the worker's `finished()` check re-correlates with backoff.
+                // Unplug + dont-reconnect → Error. Quit so `finished()` re-correlates.
                 if matches!(new, pw::stream::StreamState::Error(_)) {
                     mainloop.quit();
                 }
@@ -1740,8 +1492,7 @@ fn pad_pw_thread(
                 let want_frames = data.data().map(|s| s.len() / stride).unwrap_or(0);
                 let want = want_frames * PAD_CHANNELS;
 
-                // The adaptive jitter buffer at the pad floor: prime to ~3 quanta within
-                // [240, 2400] frames, cap ~1 quantum of slack beyond, re-prime after a drain.
+                // Prime ~3 quanta in [240, 2400] frames; cap ~1 quantum of slack; re-prime after a drain.
                 let target = (3 * want).clamp(240 * PAD_CHANNELS, 2400 * PAD_CHANNELS);
                 while ud.ring.len() > target.max(want) + want {
                     ud.ring.pop_front();
@@ -1783,12 +1534,9 @@ fn pad_pw_thread(
     info.set_format(AudioFormat::F32LE);
     info.set_rate(48_000);
     info.set_channels(PAD_CHANNELS as u32);
-    // AUX0..AUX3 (`enum spa_audio_channel`: `SPA_AUDIO_CHANNEL_START_Aux` = 0x1000), NOT a
-    // positioned FL FR RL RR layout. Aux positions carry no spatial meaning, so they are what
-    // the pad's own Pro Audio profile and WirePlumber's split parents advertise, what GE-Proton
-    // forces on its own haptic streams, and what our host-side sink mints — one vocabulary end
-    // to end. `stream.dont-remix` above makes the routing index-exact regardless; this makes it
-    // index-exact by AGREEMENT as well, so nothing downstream has a position to reason about.
+    // AUX0..AUX3 (`SPA_AUDIO_CHANNEL_START_Aux` = 0x1000), not FL FR RL RR. Aux has no
+    // spatial meaning, so Pro Audio / split parents / GE-Proton / our host sink agree.
+    // `stream.dont-remix` already index-routes; this removes a position to remix against.
     const AUX0: u32 = 0x1000;
     let mut positions = [0u32; 64];
     positions[..4].copy_from_slice(&[AUX0, AUX0 + 1, AUX0 + 2, AUX0 + 3]);
@@ -1821,8 +1569,6 @@ fn pad_pw_thread(
     Ok(())
 }
 
-// ---- platform output: Windows (WASAPI) ------------------------------------------------------
-
 #[cfg(windows)]
 struct PadOut {
     pcm_tx: std::sync::mpsc::SyncSender<Vec<f32>>,
@@ -1833,8 +1579,7 @@ struct PadOut {
 
 #[cfg(windows)]
 impl PadOut {
-    /// Correlate (HID container → endpoint id) and open a shared event-driven render stream ON
-    /// that endpoint (`audio_wasapi::render_thread`'s shape — autoconvert, default period).
+    /// Shared event-driven render stream (`audio_wasapi::render_thread` shape).
     fn open() -> anyhow::Result<PadOut> {
         use anyhow::{anyhow, Context};
         let hid_path =
@@ -1889,11 +1634,8 @@ impl Drop for PadOut {
     }
 }
 
-/// The WASAPI render thread ON the correlated endpoint: shared event-driven, autoconvert, 4 ch
-/// f32 masked FL|FR|BL|BR (0x33 — the DS5 endpoint's own layout, so the map is identity), and
-/// the session player's ring policy at the pad floor ([240, 2400] frames instead of
-/// [720, 9600] — haptics are felt latency). Any device error (unplug) ends the thread; the
-/// worker's `finished()` check re-correlates with backoff.
+/// Shared event-driven WASAPI on the correlated endpoint. 4 ch f32 masked FL|FR|BL|BR (0x33 —
+/// the DS5 layout, identity map). Ring floor [240, 2400] frames. Any device error ends the thread.
 #[cfg(windows)]
 fn pad_render_thread(
     pcm_rx: std::sync::mpsc::Receiver<Vec<f32>>,
@@ -1914,14 +1656,12 @@ fn pad_render_thread(
     let res = (|| -> anyhow::Result<()> {
         const BLOCK_ALIGN: usize = PAD_CHANNELS * 4; // f32 interleaved
         let enumerator = wasapi::DeviceEnumerator::new().context("DeviceEnumerator")?;
-        // Not `get_device`: that helper resolved through a freed string through wasapi 0.23, and
-        // this path additionally wants the ACTIVE-only filter — see [`crate::audio::device_by_id`]
-        // (audio_wasapi.rs, mounted as `crate::audio` on Windows by lib.rs's `#[path]` swap —
-        // there is no `audio_wasapi` module name).
+        // Not `get_device`: wasapi 0.23 resolved through a freed string. Active-only filter:
+        // [`crate::audio::device_by_id`] (`audio_wasapi.rs` via lib.rs `#[path]`).
         let device = crate::audio::device_by_id(&enumerator, &Direction::Render, endpoint_id)
             .map_err(|e| anyhow!("correlated endpoint not found: {e:#}"))?;
         let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
-        // FL|FR|BL|BR: front pair = the pad's speaker, back pair = the voice coils.
+        // FL|FR|BL|BR: front = speaker, back = voice coils.
         let desired = WaveFormat::new(32, 32, &SampleType::Float, 48_000, PAD_CHANNELS, Some(0x33));
         let (default_period, _min_period) =
             audio_client.get_device_period().context("device period")?;
@@ -1941,7 +1681,7 @@ fn pad_render_thread(
             .context("start pad render stream")?;
         let _ = ready.send(Ok(()));
 
-        // The adaptive jitter buffer in f32-byte units, at the pad floor (see the module doc).
+        // Adaptive jitter buffer in f32-byte units, pad floor (see [`pad_render_thread`]).
         let mut ring: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
         let mut primed = false;
         let mut out = Vec::new();
@@ -1965,8 +1705,7 @@ fn pad_render_thread(
             }
             let want_bytes = avail_frames * BLOCK_ALIGN;
 
-            // Prime to ~3 quanta within [240, 2400] frames; cap ~1 quantum of slack beyond;
-            // instant re-prime on a genuine drain.
+            // Prime ~3 quanta in [240, 2400] frames; cap ~1 quantum of slack; re-prime on a drain.
             let target = (3 * want_bytes).clamp(240 * BLOCK_ALIGN, 2400 * BLOCK_ALIGN);
             let cap = target.max(want_bytes) + want_bytes;
             if ring.len() > cap {
@@ -2000,16 +1739,11 @@ fn pad_render_thread(
     res
 }
 
-// ---- tests ----------------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The unity pod is what the 0 dB pin IS, so it has to be the shape PipeWire reads: one
-    /// unity float per channel. PipeWire ignores a `channelVolumes` whose length does not match
-    /// the port count, and an ignored pod looks exactly like the pin silently not working —
-    /// which is the -23.88 dB this exists to undo, back again and just as invisible.
+    /// `channelVolumes` length must match the port count; a mismatch is ignored and looks like the pin silently failed.
     #[cfg(target_os = "linux")]
     #[test]
     fn unity_pod_is_one_float_per_channel() {
@@ -2034,30 +1768,25 @@ mod tests {
         }
     }
 
-    /// The speaker mode gate: only `"pad"` renders today; `"mix"` is the declared TODO and
-    /// reads as off; unknown values (a future store, a typo) fail safe to off.
     #[test]
     fn speaker_mode_gates() {
         assert!(speaker_active("pad"));
         assert!(!speaker_active("off"));
-        assert!(!speaker_active("mix")); // TODO leg — off until the mixer exists
+        assert!(!speaker_active("mix"));
         assert!(!speaker_active(""));
-        assert!(!speaker_active("Pad")); // stored names are lowercase; anything else is off
+        assert!(!speaker_active("Pad")); // stored names are lowercase
     }
 
-    /// Tier A needs all three facts: the DualSense/Edge VID:PID and a wired connection.
     #[test]
     fn tier_a_is_wired_ds5_or_edge_only() {
-        assert!(is_tier_a_ds5(0x054C, 0x0CE6, true)); // DualSense
-        assert!(is_tier_a_ds5(0x054C, 0x0DF2, true)); // DualSense Edge
-        assert!(!is_tier_a_ds5(0x054C, 0x0CE6, false)); // Bluetooth → no audio device
-        assert!(!is_tier_a_ds5(0x054C, 0x05C4, true)); // DualShock 4
-        assert!(!is_tier_a_ds5(0x045E, 0x0CE6, true)); // wrong vendor, right product id
-        assert!(!is_tier_a_ds5(0x28DE, 0x1205, true)); // Steam Deck
+        assert!(is_tier_a_ds5(0x054C, 0x0CE6, true));
+        assert!(is_tier_a_ds5(0x054C, 0x0DF2, true));
+        assert!(!is_tier_a_ds5(0x054C, 0x0CE6, false));
+        assert!(!is_tier_a_ds5(0x054C, 0x05C4, true));
+        assert!(!is_tier_a_ds5(0x045E, 0x0CE6, true));
+        assert!(!is_tier_a_ds5(0x28DE, 0x1205, true));
     }
 
-    /// The Linux sink signature: USB vendor string in the node name, product in the
-    /// description, or the kernel's bare "Wireless Controller" fallback — and nothing else.
     #[test]
     fn ds5_sink_signature_matching() {
         assert!(is_ds5_sink(
@@ -2074,26 +1803,21 @@ mod tests {
             "alsa_output.pci-0000_0a_00.4.analog-stereo",
             "Built-in Audio Analog Stereo"
         ));
-        // "Wireless Controller" must LEAD the string — a headset description mentioning
-        // "... for Wireless Controller" is not the pad.
+        // `starts_with("Wireless Controller")` — a headset "… for Wireless Controller" is not the pad.
         assert!(!is_ds5_sink("headset", "Adapter for Wireless Controller"));
     }
 
-    /// USB ids in a proplist are BASE 16, with or without an `0x` prefix. A decimal reading of
-    /// `"054c"` fails outright, but of `"0994"` would succeed and be wrong — hence the parse.
     #[test]
     fn usb_ids_are_hex_either_spelling() {
         assert_eq!(parse_usb_id("054c"), Some(0x054C));
         assert_eq!(parse_usb_id("0x054c"), Some(0x054C));
         assert_eq!(parse_usb_id("0X0CE6"), Some(0x0CE6));
         assert_eq!(parse_usb_id(" 0df2 "), Some(0x0DF2));
-        assert_eq!(parse_usb_id("0994"), Some(0x0994)); // NOT 994
+        assert_eq!(parse_usb_id("0994"), Some(0x0994)); // hex, not decimal 994
         assert_eq!(parse_usb_id(""), None);
         assert_eq!(parse_usb_id("Sony"), None);
     }
 
-    /// Identity from either half: the USB ids when published, the name signature otherwise —
-    /// and BOTH ids have to agree, so another Sony audio device is not the pad.
     #[test]
     fn ds5_identity_from_ids_or_name() {
         assert!(props_say_ds5(
@@ -2102,11 +1826,11 @@ mod tests {
             "alsa_card.usb-x",
             ""
         ));
-        assert!(props_say_ds5(Some("0x054C"), Some("0x0DF2"), "", "")); // Edge
-        assert!(!props_say_ds5(Some("054c"), Some("0104"), "", "")); // a Sony headset
-        assert!(!props_say_ds5(Some("046d"), Some("0ce6"), "", "")); // wrong vendor
+        assert!(props_say_ds5(Some("0x054C"), Some("0x0DF2"), "", ""));
+        assert!(!props_say_ds5(Some("054c"), Some("0104"), "", "")); // other Sony audio
+        assert!(!props_say_ds5(Some("046d"), Some("0ce6"), "", ""));
         assert!(!props_say_ds5(None, None, "alsa_card.pci-0000_0a_00.4", ""));
-        // No ids at all — the split sinks of a UCM card publish none — so the name carries it.
+        // Split UCM sinks publish no ids; the name carries identity.
         assert!(props_say_ds5(
             None,
             None,
@@ -2115,8 +1839,6 @@ mod tests {
         ));
     }
 
-    /// The unpositioned test: AUX (and the unknown markers) are index-routed, anything spatial
-    /// is not.
     #[test]
     fn aux_and_unknown_maps_are_unpositioned() {
         let v = |s: &str| -> Vec<String> { s.split(',').map(|p| p.trim().to_string()).collect() };
@@ -2130,8 +1852,7 @@ mod tests {
 
     fn sink(name: &str, channels: u32, positions: &str, device_id: Option<u32>) -> SinkNode {
         SinkNode {
-            // The picker never reads it (only the volume pin does), so these fixtures leave it
-            // at the "no walk produced this" value.
+            // Picker never reads `id` (only the volume pin does).
             id: 0,
             name: name.into(),
             description: String::new(),
@@ -2148,8 +1869,6 @@ mod tests {
         }
     }
 
-    /// Four channels on a real card is the whole requirement, and the unpositioned node wins
-    /// when both shapes are present.
     #[test]
     fn pad_sink_pick_needs_four_channels_on_a_card() {
         let cards = [CardDevice {
@@ -2166,12 +1885,11 @@ mod tests {
             pick_pad_sink(&sinks, &cards),
             Some(PadSinkPick::Node("ds5.pro-output-0".into()))
         );
-        // Without the AUX node the positioned quad is taken (dont-remix makes it equivalent).
+        // Positioned quad is equivalent under `dont-remix`.
         assert_eq!(
             pick_pad_sink(&sinks[..2], &cards),
             Some(PadSinkPick::Node("ds5.analog-surround-40".into()))
         );
-        // Stereo only: the pad is here, but the profile is in the way.
         assert_eq!(
             pick_pad_sink(&sinks[..1], &cards),
             Some(PadSinkPick::NeedsProfile(42))
@@ -2179,9 +1897,8 @@ mod tests {
         assert_eq!(pick_pad_sink(&[], &cards), None);
     }
 
-    /// A HOST's minted pad sink carries the full DualSense identity on purpose — and no
-    /// `device.id`, because it is a stream and not a card. Rendering into it would loop the
-    /// plane back at the host instead of driving a pad in someone's hands.
+    /// Host-minted pad sinks carry DualSense identity on purpose and have no `device.id`.
+    /// Rendering into one loops the plane at the host.
     #[test]
     fn pad_sink_pick_skips_a_virtual_host_sink() {
         let virtual_sink = sink(
@@ -2194,7 +1911,6 @@ mod tests {
             pick_pad_sink(std::slice::from_ref(&virtual_sink), &[]),
             None
         );
-        // With a real pad present as well, the real one is what gets picked.
         let cards = [CardDevice {
             id: 7,
             ds5: true,
@@ -2207,15 +1923,8 @@ mod tests {
         );
     }
 
-    /// The real thing, transcribed from a Steam Deck (SteamOS 3.7, `alsa-ucm-conf` with
-    /// `DualSense-PS5.conf`) with a wired DualSense: the card publishes a four-channel
-    /// `SpeakerHaptic` sink, a one-channel `Speaker` sink, AND a hidden four-channel parent.
-    ///
-    /// Two things this pins. The old name-only matcher would take whichever of the two public
-    /// sinks the registry happened to replay first — a coin flip against a MONO node that
-    /// cannot carry the coils at all. And the parent, despite being the unpositioned/raw one,
-    /// must NOT win: its AUX0 is a dead hardware channel, so index-exact into it drops half
-    /// the speaker signal (see `pick_pad_sink`'s table).
+    /// UCM split card: public 4-ch `SpeakerHaptic`, mono `Speaker`, hidden 4-ch parent.
+    /// Public 4-ch must win from any registry order; the parent is fallback (AUX0 is dead).
     #[test]
     fn pad_sink_pick_on_a_real_steamos_dualsense() {
         let cards = [CardDevice {
@@ -2234,7 +1943,7 @@ mod tests {
             Some(140),
         );
         parent.internal = true;
-        parent.ds5 = false; // the parent's own proplist carries no vendor ids or product name
+        parent.ds5 = false; // parent proplist has no vendor ids or product name
         let mut haptic = sink(
             &format!("{base}.HiFi__SpeakerHaptic__sink"),
             4,
@@ -2245,7 +1954,7 @@ mod tests {
         let mut mono = sink(&format!("{base}.HiFi__Speaker__sink"), 1, "MONO", Some(140));
         mono.split_parent = Some("alsa_output.hw_Controller_0".into());
 
-        // Registry replay order is not ours to choose, so it must not matter.
+        // Registry order is not ours; the public 4-ch sink must win from any of them.
         for order in [
             vec![parent.clone(), haptic.clone(), mono.clone()],
             vec![mono.clone(), parent.clone(), haptic.clone()],
@@ -2259,17 +1968,15 @@ mod tests {
                 "the four-channel public sink must win from any enumeration order"
             );
         }
-        // With only the mono sink and the parent visible, the parent is the right fallback —
-        // half a speaker beats no coils.
+        // Mono + parent: parent is the right fallback (coils over a full speaker).
         assert_eq!(
             pick_pad_sink(&[mono, parent], &cards),
             Some(PadSinkPick::Node("alsa_output.hw_Controller_0".into()))
         );
     }
 
-    /// A split card's public sinks are mono/stereo, and the four-channel parent they name is
-    /// the node the coils live behind — GE-Proton's preferred leg. The CARD carries the
-    /// identity there; the split sinks themselves need not.
+    /// Split public sinks are mono/stereo; the named four-channel parent holds the coils.
+    /// Identity is on the card, not the split sinks.
     #[test]
     fn pad_sink_pick_follows_a_split_parent() {
         let cards = [CardDevice {
@@ -2278,7 +1985,7 @@ mod tests {
             ..CardDevice::default()
         }];
         let mut speaker = sink("ds5.HiFi__Speaker__sink", 1, "MONO", Some(3));
-        speaker.ds5 = false; // identity comes from the card
+        speaker.ds5 = false; // identity is on the card
         speaker.split_parent = Some("alsa_output.hw_3_0".into());
         let mut phones = sink("ds5.HiFi__Headphones__sink", 2, "FL,FR", Some(3));
         phones.ds5 = false;
@@ -2288,8 +1995,6 @@ mod tests {
         );
     }
 
-    /// Profile choice: Pro Audio first, a four-channel positioned output as the fallback, and
-    /// an unavailable profile is never selected (it would silently leave the card put).
     #[test]
     fn profile_choice_prefers_pro_audio() {
         let p = |name: &str, index: u32, available: bool| CardProfile {
@@ -2307,7 +2012,7 @@ mod tests {
         assert_eq!(pick_profile(&all).map(|p| p.index), Some(3));
         assert_eq!(pick_profile(&all[..3]).map(|p| p.index), Some(2));
         assert_eq!(pick_profile(&all[..2]).map(|p| p.index), None);
-        // Unavailable Pro Audio falls through to the positioned quad rather than being picked.
+        // Unavailable Pro Audio must fall through, not be selected.
         let unavailable = [
             p("output:analog-surround-40", 2, true),
             p("pro-audio", 3, false),
@@ -2315,25 +2020,24 @@ mod tests {
         assert_eq!(pick_profile(&unavailable).map(|p| p.index), Some(2));
     }
 
-    /// The Windows container matcher: container equality (case-insensitive — registry GUIDs
-    /// come in both cases) AND the 4-channel format gate.
+    /// Container match is case-insensitive (Enum uppercase, MMDevices lowercase) and requires 4 channels.
     #[test]
     fn endpoint_pick_needs_container_and_four_channels() {
         let cands = [
             EndpointCandidate {
                 id: "{0.0.0.00000000}.{aaaa}".into(),
                 container: Some("{11111111-2222-3333-4444-555555555555}".into()),
-                channels: 2, // right container, stereo — not the pad function
+                channels: 2, // right container, stereo — not the pad
             },
             EndpointCandidate {
                 id: "{0.0.0.00000000}.{bbbb}".into(),
                 container: Some("{99999999-2222-3333-4444-555555555555}".into()),
-                channels: 4, // 4-ch but another container
+                channels: 4, // 4-ch, other container
             },
             EndpointCandidate {
                 id: "{0.0.0.00000000}.{cccc}".into(),
                 container: Some("{11111111-2222-3333-4444-555555555555}".into()),
-                channels: 4, // the pad
+                channels: 4,
             },
             EndpointCandidate {
                 id: "{0.0.0.00000000}.{dddd}".into(),
@@ -2343,7 +2047,6 @@ mod tests {
         ];
         let hit = pick_pad_endpoint(&cands, "{11111111-2222-3333-4444-555555555555}").unwrap();
         assert_eq!(hit.id, "{0.0.0.00000000}.{cccc}");
-        // Case-insensitive (Enum stores uppercase, MMDevices lowercase).
         let hit = pick_pad_endpoint(
             &cands,
             "{11111111-2222-3333-4444-555555555555}"
@@ -2355,8 +2058,6 @@ mod tests {
         assert!(pick_pad_endpoint(&cands, "{00000000-0000-0000-0000-000000000000}").is_none());
     }
 
-    /// Interface path → instance id: prefix stripped, `#` → `\`, interface-class GUID dropped;
-    /// garbage shapes are rejected rather than mis-keyed into the registry.
     #[test]
     fn hid_interface_path_to_instance_id() {
         assert_eq!(
@@ -2366,7 +2067,7 @@ mod tests {
             .as_deref(),
             Some(r"HID\VID_054C&PID_0CE6\8&2de99099&0&0000")
         );
-        // hidapi paths come lowercase and sometimes without the class GUID — both parse.
+        // hidapi: lowercase, sometimes no class GUID.
         assert_eq!(
             hid_instance_from_interface_path(r"\\?\hid#vid_054c&pid_0df2#7&1a2b3c4d&1&0000")
                 .as_deref(),
@@ -2381,8 +2082,6 @@ mod tests {
         }
     }
 
-    /// The serialized VT_CLSID blob (8-byte PROPVARIANT header + registry-order GUID) parses to
-    /// the braced string; short/foreign blobs don't.
     #[test]
     fn container_blob_parses_vt_clsid() {
         // {11223344-5566-7788-99aa-bbccddeeff00}: data1/2/3 little-endian on disk.
@@ -2395,19 +2094,15 @@ mod tests {
             container_guid_from_blob(&blob).as_deref(),
             Some("{11223344-5566-7788-99aa-bbccddeeff00}")
         );
-        assert_eq!(container_guid_from_blob(&blob[..20]), None); // truncated
+        assert_eq!(container_guid_from_blob(&blob[..20]), None);
         let mut wrong_vt = blob.clone();
-        wrong_vt[0] = 0x41; // VT_BLOB — a format value, not a container
+        wrong_vt[0] = 0x41; // VT_BLOB, not a container
         assert_eq!(container_guid_from_blob(&wrong_vt), None);
     }
 
-    /// The 4-ch interleave: speaker frames land on channels 0/1 at the speaker cursor, haptics
-    /// on 2/3 at theirs, and the pop emits exactly the further-ahead kind's frame count with
-    /// the lagging kind's tail zeroed.
     #[test]
     fn mixer_interleaves_kinds_into_quad_frames() {
         let mut m = QuadMixer::new();
-        // 2 speaker frames, 1 haptics frame.
         m.push(PAD_AUDIO_KIND_SPEAKER, &[1.0, 2.0, 3.0, 4.0]);
         m.push(PAD_AUDIO_KIND_HAPTICS, &[5.0, 6.0]);
         assert_eq!(m.ready_frames(), 2);
@@ -2415,15 +2110,13 @@ mod tests {
         assert_eq!(m.pop(&mut out), 2);
         assert_eq!(out, vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 0.0, 0.0]);
         assert_eq!(m.ready_frames(), 0);
-        // After the pop both cursors are back at the front: the next haptics frame starts a
-        // fresh quad frame with a silent speaker pair.
+        // After pop both cursors are at the front; next haptics starts a fresh frame.
         m.push(PAD_AUDIO_KIND_HAPTICS, &[7.0, 8.0]);
         let mut out = Vec::new();
         assert_eq!(m.pop(&mut out), 1);
         assert_eq!(out, vec![0.0, 0.0, 7.0, 8.0]);
     }
 
-    /// A single flowing kind never conjures data on the other pair (kind 1 → 0/1, kind 0 → 2/3).
     #[test]
     fn mixer_missing_kind_stays_zero() {
         let mut m = QuadMixer::new();
@@ -2438,44 +2131,39 @@ mod tests {
         assert_eq!(out, vec![0.5, -0.5, 0.0, 0.0]);
     }
 
-    /// The depth bound: a wedged output can't grow the mixer past [`MAX_BUFFER_FRAMES`]; the
-    /// oldest frames drop and both cursors shift together (no interleave skew).
+    /// Depth cap: wedged output cannot grow past [`MAX_BUFFER_FRAMES`]; oldest drop, cursors shift together.
     #[test]
     fn mixer_caps_depth_dropping_oldest() {
         let mut m = QuadMixer::new();
         let chunk = vec![1.0f32; 480 * 2]; // 480 frames per push
         for _ in 0..12 {
-            m.push(PAD_AUDIO_KIND_HAPTICS, &chunk); // 5760 frames pushed
+            m.push(PAD_AUDIO_KIND_HAPTICS, &chunk);
         }
         assert_eq!(m.ready_frames(), MAX_BUFFER_FRAMES);
-        // A late speaker push still lands at ITS cursor (0 after the drops) — front of ring.
+        // Late speaker push lands at its cursor (0 after the drops) — front of ring.
         m.push(PAD_AUDIO_KIND_SPEAKER, &[9.0, 9.0]);
         let mut out = Vec::new();
         m.pop(&mut out);
         assert_eq!(&out[..4], &[9.0, 9.0, 1.0, 1.0]);
-        // `discard` empties without output.
         m.push(PAD_AUDIO_KIND_HAPTICS, &chunk);
         m.discard();
         assert_eq!(m.ready_frames(), 0);
     }
 
-    /// Seq-gap PLC counting mirrors the session audio thread: nothing for the first packet or
-    /// in-order flow, the exact gap for a loss, the tracker's cap for a burst — and 0 before a
-    /// first decode (`frame_samples == 0`) while STILL consuming the gap (no phantom replay).
+    /// Seq-gap PLC: 0 for first/in-order, exact gap for a loss, tracker cap for a burst.
+    /// `frame_samples == 0` still consumes the gap so it cannot replay.
     #[test]
     fn plc_counts_gaps_like_the_session_audio_path() {
         let mut gaps = AudioGapTracker::new();
-        assert_eq!(plc_frames(&mut gaps, 0, 480), 0); // first packet
-        assert_eq!(plc_frames(&mut gaps, 1, 480), 0); // in-order
+        assert_eq!(plc_frames(&mut gaps, 0, 480), 0);
+        assert_eq!(plc_frames(&mut gaps, 1, 480), 0);
         assert_eq!(plc_frames(&mut gaps, 5, 480), 3); // 2,3,4 lost
-        assert_eq!(plc_frames(&mut gaps, 5, 480), 0); // duplicate
-        assert_eq!(plc_frames(&mut gaps, 4, 480), 0); // reorder — nothing to conceal
-        assert_eq!(plc_frames(&mut gaps, 1000, 480), 10); // burst, capped (MAX_CONCEAL_PACKETS)
-                                                          // Before the first decode there is no frame size to synthesize from — but the tracker
-                                                          // must still advance, or this gap would replay against the next packet.
+        assert_eq!(plc_frames(&mut gaps, 5, 480), 0);
+        assert_eq!(plc_frames(&mut gaps, 4, 480), 0);
+        assert_eq!(plc_frames(&mut gaps, 1000, 480), 10); // burst, capped
         let mut gaps = AudioGapTracker::new();
         assert_eq!(plc_frames(&mut gaps, 7, 0), 0);
         assert_eq!(plc_frames(&mut gaps, 12, 0), 0); // gap consumed silently
-        assert_eq!(plc_frames(&mut gaps, 13, 480), 0); // in-order once decoding starts
+        assert_eq!(plc_frames(&mut gaps, 13, 480), 0);
     }
 }
