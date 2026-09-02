@@ -967,6 +967,9 @@ impl LibraryScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        // Published before the sync that reads it: the poster cache is sized against the
+        // scale its covers will be drawn at, and a decode is not something this can redo.
+        self.art_k = k;
         self.sync(ctx.library);
         self.adopt_settings(ctx);
         self.frame = self.frame.wrapping_add(1);
