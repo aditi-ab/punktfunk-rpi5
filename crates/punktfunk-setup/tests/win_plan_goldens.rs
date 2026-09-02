@@ -38,6 +38,8 @@ fn fresh() -> WinFacts {
         vulkan_layer_registered: false,
         web_task: TaskState::Absent,
         scripting_task: TaskState::Absent,
+        inno_uninstaller: false,
+        client_installed: None,
     }
 }
 
@@ -53,6 +55,7 @@ fn upgrade() -> WinFacts {
         vulkan_layer_registered: true,
         web_task: TaskState::Disabled,
         scripting_task: TaskState::Enabled,
+        inno_uninstaller: true,
         ..fresh()
     }
 }
@@ -180,6 +183,41 @@ fn golden_client_fresh() {
         &render(&facts, &choices, Artifact::Client, false),
     );
 }
+
+// WP3.2: the first upgrade over an Inno install retires Inno's uninstaller data AFTER our
+// files (incl. the new unins000.exe) landed and BEFORE the ARP entry is rewritten in place
+// — the same key, so `winget upgrade` keeps tracking the box.
+#[test]
+fn an_upgrade_over_inno_retires_its_uninstaller_between_files_and_arp() {
+    let facts = upgrade();
+    let plan = host_plan(&facts, &WinChoices::derive(&facts));
+    let steps: Vec<&WinAction> = plan.steps().collect();
+    let at = |pred: &dyn Fn(&WinAction) -> bool| steps.iter().position(|s| pred(s)).unwrap();
+    let deploy = at(&|s| matches!(s, WinAction::DeployFiles { .. }));
+    let retire = at(&|s| matches!(s, WinAction::DeleteFiles { .. }));
+    let arp = at(&|s| matches!(s, WinAction::ArpRegister { .. }));
+    assert!(deploy < retire && retire < arp);
+    match steps[retire] {
+        WinAction::DeleteFiles { paths } => assert_eq!(
+            paths,
+            &[
+                r"C:\Program Files\punktfunk\unins000.dat".to_string(),
+                r"C:\Program Files\punktfunk\unins000.msg".to_string(),
+            ]
+        ),
+        other => panic!("{other:?}"),
+    }
+    // An upgrade over OUR installer has nothing to retire.
+    let ours = WinFacts {
+        inno_uninstaller: false,
+        ..upgrade()
+    };
+    assert!(!host_plan(&ours, &WinChoices::derive(&ours))
+        .steps()
+        .any(|s| matches!(s, WinAction::DeleteFiles { .. })));
+}
+
+// ------------------------------------------------------------------- named traps (§5, D11, D12)
 
 // Coexistence is a SetEnv, never an abort. The value is the Linux one.
 #[test]

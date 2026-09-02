@@ -32,7 +32,7 @@ fn main() -> std::process::ExitCode {
         usage: punktfunk-host-setup-<ver>.exe [/VERYSILENT] [/LOG=<file>] [/MERGETASKS=...]\n\
                punktfunk-setup-win --demo <preset>\n\
                punktfunk-setup-win /VERYSILENT [/LOG=<file>] (--dry-run | --demo <preset>)\n\
-        presets: win11-fresh win11-upgrade win11-sunshine win11-public win11-uninstall client-fresh client-win10";
+        presets: win11-fresh win11-upgrade win11-sunshine win11-public win11-uninstall client-fresh client-win10 client-upgrade";
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let inno = InnoArgs::parse(&args);

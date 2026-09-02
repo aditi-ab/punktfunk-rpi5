@@ -291,7 +291,7 @@ unsafe fn set_frame_channel(request: WDFREQUEST) {
         Err(ch) => {
             dbglog!(
                 "[pf-vd] SET_FRAME_CHANNEL: no monitor with target_id {} — rejecting (host reaps the handles)",
-                req.target_id
+                target_id
             );
             // NOT adopted: disarm the channel so its Drop does NOT close the handles (see the contract
             // above — the host's error path reaps them remotely).

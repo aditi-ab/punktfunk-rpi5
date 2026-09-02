@@ -18,8 +18,8 @@ use crate::seam::{CommandRunner, Output, RunFailed, Stdin};
 use super::plan::Artifact;
 use super::{NetCategory, NetProfile, TaskState, WinFacts, WinInstall};
 
-/// One per flow worth reviewing (WP2.3's list).
-pub const WIN_PRESETS: [&str; 7] = [
+/// One per flow worth reviewing (WP2.3's list, plus M4's client manage mode).
+pub const WIN_PRESETS: [&str; 8] = [
     "win11-fresh",
     "win11-upgrade",
     "win11-sunshine",
@@ -27,6 +27,7 @@ pub const WIN_PRESETS: [&str; 7] = [
     "win11-uninstall",
     "client-fresh",
     "client-win10",
+    "client-upgrade",
 ];
 
 /// A canned box plus the mode the payload manifest would have carried.
@@ -66,6 +67,8 @@ fn fresh_box() -> WinFacts {
         vulkan_layer_registered: false,
         web_task: TaskState::Absent,
         scripting_task: TaskState::Absent,
+        inno_uninstaller: false,
+        client_installed: None,
     }
 }
 
@@ -81,6 +84,7 @@ fn installed_box(location: String) -> WinFacts {
         vulkan_layer_registered: true,
         web_task: TaskState::Enabled,
         scripting_task: TaskState::Enabled,
+        inno_uninstaller: true,
         ..fresh_box()
     }
 }
@@ -119,6 +123,18 @@ pub fn win_preset(name: &str) -> Option<WinPreset> {
         "client-win10" => WinPreset {
             facts: WinFacts {
                 os_build: 17763,
+                ..fresh_box()
+            },
+            artifact: Artifact::Client,
+            uninstall: false,
+        },
+        // The client's key, not the host's: this box has no host and an old client.
+        "client-upgrade" => WinPreset {
+            facts: WinFacts {
+                client_installed: Some(WinInstall {
+                    version: Some("0.33.1".into()),
+                    location: Some(sandbox_app_dir()),
+                }),
                 ..fresh_box()
             },
             artifact: Artifact::Client,
@@ -199,7 +215,8 @@ mod tests {
     #[test]
     fn every_installed_preset_lives_in_the_sandbox() {
         for name in WIN_PRESETS {
-            let Some(installed) = win_preset(name).unwrap().facts.installed else {
+            let preset = win_preset(name).unwrap();
+            let Some(installed) = preset.facts.installed_for(preset.artifact).cloned() else {
                 continue;
             };
             let location = installed.location.unwrap();

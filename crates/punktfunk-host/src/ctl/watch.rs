@@ -1,8 +1,9 @@
 //! Line-JSON stdout for `punktfunk-host ctl watch`.
 //!
-//! One flushed object per line over the host SSE stream (`mgmt/events.rs`). Resume is
-//! `?since=` against the ~1024-event ring; every frame with an `id:` advances the cursor
-//! so a host restart mid-watch continues from the last delivered event.
+//! One flushed object per line over the host SSE stream (`mgmt/events.rs`). The first
+//! connect starts at the live tail unless `--since` names a cursor; every frame with an
+//! `id:` advances the cursor so a host restart mid-watch continues from the last
+//! delivered event. The host's `live` frame passes through as `{"kind":"live"}`.
 //!
 //! Synthetic kinds:
 //! - `ctl.resync` — after a `dropped` frame, or a reconnect that could not resume. The
@@ -24,7 +25,10 @@ const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 pub fn run(kinds: Option<&str>, since: Option<u64>) -> Result<()> {
-    let mut cursor = since;
+    // No `--since` = the live tail. A cursor past any real seq gets an empty catch-up and no
+    // `dropped`, so a widget restart does not replay 1024 events, nor a knock from an hour
+    // ago. The first frame's real id replaces it for reconnects. `--since 0` replays the ring.
+    let mut cursor = Some(since.unwrap_or(u64::MAX));
     let mut backoff = BACKOFF_MIN;
     // First connect may fail the process: a bad pin, missing token, or never-run host
     // cannot be retried; spinning forever hides that from the caller.

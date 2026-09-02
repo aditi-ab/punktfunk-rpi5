@@ -80,6 +80,11 @@ struct ConnectOverlay: View {
             #if os(iOS) || os(macOS) || os(tvOS)
             .background { ConnectControllerInput(waker: waker, onCancelConnect: onCancelConnect) }
             #endif
+            #if os(tvOS)
+            // Menu (a pad's B arrives as the same press). Reaches here because ContentView
+            // disables the home under the takeover, so focus has nowhere to sit but this overlay.
+            .onExitCommand { if waker.waking != nil { waker.cancel() } else { onCancelConnect() } }
+            #endif
         }
     }
 
@@ -148,8 +153,8 @@ struct ConnectOverlay: View {
 ///
 /// `GamepadMenuInput` needs an EXTENDED gamepad, which is the same thing `gamepadUIActive` needs,
 /// so this covers the console takeover exactly. A Siri Remote is not an extended gamepad and does
-/// not reach these buttons through here — that path is the tvOS focus engine's, and whether focus
-/// lands in this overlay at all is unverified.
+/// not reach these buttons through here — that path is the tvOS focus engine's, which lands in
+/// this overlay because ContentView disables everything under it.
 private struct ConnectControllerInput: View {
     @ObservedObject var waker: HostWaker
     var onCancelConnect: () -> Void

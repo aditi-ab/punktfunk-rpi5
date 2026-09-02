@@ -93,6 +93,7 @@ enum ShortcutsCatalog {
         // be deleted without putting the words somewhere findable first.
         groups.append(.init(title: "Siri Remote", items: [
             .init(keys: "Hold Back", text: "Disconnect"),
+            .init(keys: "Back", text: "Open the quick actions ring"),
             .init(keys: "Touch surface", text: "Move the pointer"),
             .init(keys: "Press", text: "Click"),
             .init(keys: "Play/Pause", text: "Right-click"),
@@ -140,6 +141,9 @@ struct ShortcutsView: View {
                             }
                         }
                     }
+                    // A pushed page with nothing focusable cannot route Menu — the app suspends
+                    // instead of popping (see TVFocusable). One stop per group.
+                    .modifier(TVFocusable())
                 }
             }
             .frame(maxWidth: 1000, alignment: .leading)

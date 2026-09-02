@@ -9,10 +9,10 @@
 // The remote is read through GameController as a GCMicroGamepad with
 // `reportsAbsoluteDpadValues = true`: the dpad axes then report the finger's ABSOLUTE position
 // on the surface (±1, +y up) while touched, and snap to exactly (0, 0) on lift. Successive
-// positions are differenced into relative mouse deltas; the exact-zero snap is treated as a
-// lift (a real touch at the mathematical centre is measure-zero, and one dropped delta there
-// is imperceptible). Handlers (not a poll) — the same in-session delivery GamepadCapture
-// relies on.
+// positions are differenced into relative mouse deltas. Contact and lift come from the
+// surface's own touch report (`buttonA.isTouched`) where the remote has one, else from the
+// exact-zero snap and a quiet gap. Handlers (not a poll) — the same in-session delivery
+// GamepadCapture relies on.
 //
 // Lifecycle mirrors GamepadCapture: started by SessionModel when streaming begins (never
 // during the trust prompt), stopped on disconnect; held buttons are released on stop so the
@@ -30,6 +30,13 @@ public final class SiriRemotePointer {
     private var bound: GCController?
     /// Finger position (±1 axes) at the last dpad callback while touched; nil = lifted.
     private var lastTouch: (x: Float, y: Float)?
+    /// When the finger landed; nil while lifted. Set by the touch report where the remote has
+    /// one, else by the first sample after a lift or a quiet gap.
+    private var contactAt: Date?
+    private var lastSampleAt = Date.distantPast
+    /// `buttonA.touchedChangedHandler` has fired: lifts are explicit, and a sample with no
+    /// contact is the release ramp — ignored.
+    private var reportsTouch = false
     /// Wire buttons currently held (1 = left, 3 = right) — released on stop/unbind.
     private var heldButtons: Set<UInt32> = []
     /// When Back/Menu went down; a release after `disconnectHold` fires the exit.
@@ -65,6 +72,12 @@ public final class SiriRemotePointer {
     /// (even a fast flick stays well under this per callback); the release tail arrives as one
     /// or two huge jumps — discard those (the anchor still follows, so nothing accumulates).
     private static let maxStep: Float = 0.4
+    /// Motion inside this of contact is dropped. The framework ramps the reported position
+    /// from the centre to the finger over the first callbacks of a touch — read as motion,
+    /// every touch was a jump toward wherever the surface was touched.
+    private static let contactSettle: TimeInterval = 0.06
+    /// No sample for this long is a lift the remote never snapped to (0, 0) for.
+    private static let quietGap: TimeInterval = 0.12
 
     /// Fired ON MAIN after Back/Menu was held ≥ `disconnectHold` and released.
     public var onDisconnectRequest: (() -> Void)?
@@ -72,6 +85,26 @@ public final class SiriRemotePointer {
     /// quick-action ring's opener on tvOS (design/touch-client-overlay.md §2.5). A long hold
     /// still exits.
     public var onShortBack: (() -> Void)?
+    /// A remote gesture while the ring owns the remote (`ringOpen`): a swipe steps the
+    /// highlight, a click fires it, Play/Pause recentres, a short Back closes.
+    public var onRingNav: ((RingNav) -> Void)?
+    /// The ring is up: gestures drive it (`onRingNav`) and nothing reaches the host — a click
+    /// already sent down is lifted now, GamepadCapture's own `ringOpen` rule.
+    public var ringOpen = false {
+        didSet {
+            guard ringOpen != oldValue else { return }
+            swipeAnchor = nil
+            if ringOpen {
+                cancelPlayPause()
+                releaseHeld()
+            }
+        }
+    }
+    /// The finger position the next ring step is measured from; nil = lifted.
+    private var swipeAnchor: (x: Float, y: Float)?
+    /// Finger travel that steps the ring once (axes span ±1): about a quarter of the surface,
+    /// so a held swipe walks several slots.
+    private static let swipeStep: Float = 0.45
 
     public init(connection: PunktfunkConnection) {
         self.connection = connection
@@ -112,6 +145,7 @@ public final class SiriRemotePointer {
         if let old = bound?.microGamepad {
             old.dpad.valueChangedHandler = nil
             old.buttonA.pressedChangedHandler = nil
+            old.buttonA.touchedChangedHandler = nil
             old.buttonX.pressedChangedHandler = nil
             old.buttonMenu.pressedChangedHandler = nil
         }
@@ -120,6 +154,8 @@ public final class SiriRemotePointer {
         cancelPlayPause()
         releaseHeld()
         lastTouch = nil
+        contactAt = nil
+        reportsTouch = false
         menuDownAt = nil
         bound = controller
         guard let micro = controller?.microGamepad else { return }
@@ -135,7 +171,10 @@ public final class SiriRemotePointer {
         // Surface click = left button; Play/Pause = right (the remote's only spare face button),
         // or — held — the stats-overlay cycle. See `playPauseChanged`.
         micro.buttonA.pressedChangedHandler = { [weak self] _, _, pressed in
-            MainActor.assumeIsolated { self?.setButton(1, down: pressed) }
+            MainActor.assumeIsolated { self?.clickChanged(pressed: pressed) }
+        }
+        micro.buttonA.touchedChangedHandler = { [weak self] _, _, _, touched in
+            MainActor.assumeIsolated { self?.touchChanged(touched) }
         }
         micro.buttonX.pressedChangedHandler = { [weak self] _, _, pressed in
             MainActor.assumeIsolated { self?.playPauseChanged(pressed: pressed) }
@@ -145,27 +184,80 @@ public final class SiriRemotePointer {
         }
     }
 
+    /// The surface's touch report: contact starts the settle, a lift ends the gesture at once
+    /// — nothing after it counts, the release ramp included.
+    private func touchChanged(_ touched: Bool) {
+        reportsTouch = true
+        lastTouch = nil
+        swipeAnchor = nil
+        contactAt = touched ? Date() : nil
+    }
+
     private func touchMoved(x: Float, y: Float) {
-        // Exact (0, 0) is the lift snap — drop the anchor so the next touch starts a fresh
-        // gesture instead of a jump-delta from the old position.
-        guard x != 0 || y != 0 else {
+        let now = Date()
+        let quiet = now.timeIntervalSince(lastSampleAt) > Self.quietGap
+        lastSampleAt = now
+        // Exact (0, 0) is the lift snap; with a touch report, a sample after the lift is the
+        // release ramp. Either way drop the anchor so the next touch starts fresh.
+        guard x != 0 || y != 0, contactAt != nil || !reportsTouch else {
             lastTouch = nil
+            swipeAnchor = nil
+            if !reportsTouch { contactAt = nil }
             return
         }
         defer { lastTouch = (x, y) }
-        guard let last = lastTouch else { return } // first contact anchors, moves nothing
+        // First contact — or the first sample after a quiet gap, a lift the remote never
+        // snapped for — anchors and moves nothing.
+        guard let last = lastTouch, !quiet else {
+            if contactAt == nil || quiet { contactAt = now }
+            swipeAnchor = (x, y)
+            return
+        }
+        // Inside the settle the anchor follows the ramp; the diff starts where it ends.
+        if let contactAt, now.timeIntervalSince(contactAt) < Self.contactSettle {
+            swipeAnchor = (x, y)
+            return
+        }
         let stepX = x - last.x
         let stepY = y - last.y
         // The release tail (and any tracking glitch) shows up as a single impossible jump —
         // see `maxStep`. Skip the emission; the deferred anchor update above still follows the
         // reported position, so the gesture cleanly re-anchors instead of retracing.
-        guard abs(stepX) < Self.maxStep, abs(stepY) < Self.maxStep else { return }
+        guard abs(stepX) < Self.maxStep, abs(stepY) < Self.maxStep else {
+            swipeAnchor = (x, y)
+            return
+        }
+        if ringOpen { return ringSwipe(x: x, y: y) }
         let dx = stepX * Self.pointerScale / 2 // axes span ±1 → full swipe = 2.0
         let dy = -stepY * Self.pointerScale / 2 // GC +y is up; mouse +y is down
         let ix = Int32(dx.rounded())
         let iy = Int32(dy.rounded())
         guard ix != 0 || iy != 0 else { return }
         connection.send(.mouseMove(dx: ix, dy: iy))
+    }
+
+    /// A ring step per `swipeStep` of travel from the anchor, along the dominant axis; the
+    /// anchor moves with each step so a long swipe keeps walking.
+    private func ringSwipe(x: Float, y: Float) {
+        guard let a = swipeAnchor else {
+            swipeAnchor = (x, y)
+            return
+        }
+        let dx = x - a.x
+        let dy = y - a.y
+        guard abs(dx) >= Self.swipeStep || abs(dy) >= Self.swipeStep else { return }
+        swipeAnchor = (x, y)
+        onRingNav?(abs(dx) >= abs(dy) ? (dx > 0 ? .right : .left) : (dy > 0 ? .up : .down))
+    }
+
+    /// Surface click: the left button — or, with the ring up, its confirm. A release after the
+    /// ring closed lifts a button the host never saw down, which is harmless.
+    private func clickChanged(pressed: Bool) {
+        if ringOpen {
+            if pressed { onRingNav?(.confirm) }
+            return
+        }
+        setButton(1, down: pressed)
     }
 
     private func setButton(_ button: UInt32, down: Bool) {
@@ -181,6 +273,11 @@ public final class SiriRemotePointer {
     /// is the hold-Select gesture's (`GamepadCapture.gestureFiltered`) — suppress, then deliver a
     /// tap on release or the gesture past the threshold — so the two behave alike.
     private func playPauseChanged(pressed: Bool) {
+        // With the ring up the spare button is the pad's Y: back to the centre.
+        if ringOpen {
+            if pressed { onRingNav?(.centre) }
+            return
+        }
         if pressed {
             statsHoldFired = false
             let timer = Timer(timeInterval: Self.statsHold, repeats: false) { [weak self] _ in
@@ -252,10 +349,13 @@ public final class SiriRemotePointer {
         menuDownAt = nil
         if heldFor >= Self.disconnectHold {
             onDisconnectRequest?()
+        } else if ringOpen {
+            // Back inside the ring is the pad's B: out of the sheet, else close.
+            onRingNav?(.back)
         } else {
-            // A short press opens (or closes) the quick-action ring. It is never forwarded as
-            // a host key — that would make trackpad fumbles type — and the accompanying UIKit
-            // menu press is swallowed in ContentView.
+            // A short press opens the quick-action ring. It is never forwarded as a host key —
+            // that would make trackpad fumbles type — and the accompanying UIKit menu press is
+            // swallowed in ContentView.
             onShortBack?()
         }
     }
