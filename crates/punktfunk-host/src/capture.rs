@@ -199,7 +199,7 @@ pub fn capture_virtual_output(
     // session drops. An open control handle vetoes the wake-from-sleep PnP cycle.
     let control_frame = control.clone();
     let sender: pf_capture::FrameChannelSender = std::sync::Arc::new(
-        move |req: &pf_driver_proto::control::SetFrameChannelRequest| {
+        move |req: &pf_driver_proto::control::SetFrameChannelRequestV2| {
             // SAFETY: the captured `control_frame` Arc keeps the control handle open across this
             // call — `send_frame_channel`'s precondition.
             unsafe {

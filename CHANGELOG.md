@@ -43,7 +43,13 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
   with `ID3D11Device5::OpenSharedFence`, advertises `CAP_FENCE_RING` when that succeeds, and
   runs the fence protocol only where the host advertised it too (CAS claim, GPU `Wait` on the
   consumer-retire value, copy, `Signal` producer-ready, then PUBLISHED); the v2 request is told
-  from v1 by input length. The host arm follows; until then every ring stays on the keyed mutex.
+  from v1 by input length. The host arm: every ring carries two fresh shared fences per
+  generation; the first ring on a box is a keyed-mutex probe, the attach teaches whether the driver
+  opened the fences (remembered process-wide), and a capable driver's probe ring is rebuilt on the
+  fence protocol before the first frame flows. The consumer takes the newest published slot from
+  the table, frees older and foreign-generation records, GPU-waits producer-ready, converts, and
+  signals consumer-retire before freeing the slot. A pre-D3D11.4 device or a driver without fences
+  keeps the keyed-mutex arm.
 - **IDD-push shared header v3 carries ring health.** The 88-byte header grows a 64-byte tail:
   a health state (`Initializing`/`Active`/`Rebuilding`/`Dead`), driver and host capability
   words negotiated by intersection, assignment and D3D-device epochs, a source sequence that

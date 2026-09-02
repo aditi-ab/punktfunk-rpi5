@@ -297,11 +297,15 @@ unsafe fn set_render_adapter(h: HANDLE, luid: LUID) -> Result<()> {
 }
 
 /// Deliver a monitor's sealed frame channel. On IOCTL success the driver owns the handles
-/// duplicated into WUDFHost; the caller reaps remote duplicates on failure so none leak.
+/// duplicated into WUDFHost; the caller reaps remote duplicates on failure so none leak. Always
+/// the v2 shape (WP7): a pre-fence driver reads the v1 prefix of the longer buffer unchanged.
 ///
 /// # Safety
 /// `dev` must be a live pf-vdisplay control handle (see [`super::manager::control_device_handle`]).
-pub unsafe fn send_frame_channel(dev: HANDLE, req: &control::SetFrameChannelRequest) -> Result<()> {
+pub unsafe fn send_frame_channel(
+    dev: HANDLE,
+    req: &control::SetFrameChannelRequestV2,
+) -> Result<()> {
     let mut none: [u8; 0] = [];
     // SAFETY: `dev` is the live control handle by this fn's contract. `bytes_of(req)` borrows the
     // caller's request for this synchronous call; `none` is empty, so there is no output buffer.
