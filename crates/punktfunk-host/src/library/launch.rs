@@ -6,7 +6,8 @@
 //! (design/library-scanner-plugins.md D1).
 //!
 //! Linux: the host runs the resolved shell command (nested gamescope or live
-//! session). Windows: [`launch_title`] spawns into the interactive session.
+//! session). Windows: [`launch_title`] uses the signed-in user of the host's
+//! WTS session.
 
 use super::*;
 
@@ -194,13 +195,13 @@ impl WindowsLaunch {
     }
 }
 
-/// Spawn a store-qualified library id into the interactive user session.
-/// Windows analogue of nested [`resolve_launch`]. Mapped by [`windows_launch_for`],
-/// spawned via [`crate::interactive::spawn_in_active_session`].
+/// Launches a store-qualified library id as the user of the host's WTS session.
 ///
-/// Called after capture is live so the title hits the already-captured desktop.
-/// Returns [`WindowsLaunch`]; the pid goes on [`crate::gamelease::LeaseRequest::spawned`]
-/// only when it belongs to the game.
+/// [`windows_launch_for`] maps the recipe and
+/// [`crate::interactive::spawn_as_current_session_user`] starts it after capture
+/// is live. The returned PID enters
+/// [`crate::gamelease::LeaseRequest::spawned`] only when it owns the game rather
+/// than a protocol hand-off.
 #[cfg(windows)]
 pub fn launch_title(id: &str) -> Result<WindowsLaunch> {
     let entry = all_games()
@@ -225,14 +226,14 @@ pub fn launch_title(id: &str) -> Result<WindowsLaunch> {
         workdir,
         owns_game,
     } = recipe;
-    let pid = crate::interactive::spawn_in_active_session(&cmdline, workdir.as_deref())
-        .with_context(|| format!("launch '{id}' in the interactive session"))?;
+    let pid = crate::interactive::spawn_as_current_session_user(&cmdline, workdir.as_deref())
+        .with_context(|| format!("launch '{id}' as the current WTS session user"))?;
     tracing::info!(
         launch_id = id,
         %cmdline,
         pid,
         owns_game,
-        "launched library title in the interactive session"
+        "launched library title as the current WTS session user"
     );
     Ok(WindowsLaunch { pid, owns_game })
 }
@@ -845,25 +846,26 @@ fn path_under(dir: &str, path: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('\\'))
 }
 
-/// Operator `apps.json` command into the interactive session, after capture
-/// (host is SYSTEM). Linux uses compositor-aware [`launch_session_command`].
+/// Launches an operator `apps.json` command as the host's WTS session user.
+///
+/// Capture is already live and the host remains SYSTEM. Linux instead uses
+/// compositor-aware [`launch_session_command`].
 #[cfg(windows)]
 pub fn launch_gamestream_command(cmd: &str) -> Result<WindowsLaunch> {
     let cmd = cmd.trim();
     anyhow::ensure!(!cmd.is_empty(), "empty command");
-    let pid = crate::interactive::spawn_in_active_session(&format!("cmd.exe /c {cmd}"), None)
-        .context("spawn gamestream command in the interactive session")?;
-    tracing::info!(command = %cmd, pid, "gamestream: launched app in the interactive session");
-    // `cmd.exe /c` waits, so this pid is the command's life. A forwarder that
-    // returns at once is the lease shim's problem, not a game-exit.
+    let pid = crate::interactive::spawn_as_current_session_user(&format!("cmd.exe /c {cmd}"), None)
+        .context("spawn gamestream command as the current WTS session user")?;
+    tracing::info!(command = %cmd, pid, "gamestream: launched app as the current WTS session user");
+    // `cmd.exe /c` waits, so its PID tracks the command; forwarders remain the lease shim's concern.
     Ok(WindowsLaunch {
         pid,
         owns_game: true,
     })
 }
 
-/// GameStream `/applist` title into the interactive session ([`launch_title`]).
-/// Linux uses [`resolve_launch`] then [`launch_session_command`].
+/// Launches a GameStream `/applist` title through [`launch_title`] in this host's
+/// WTS session. Linux uses [`resolve_launch`] then [`launch_session_command`].
 #[cfg(windows)]
 pub fn launch_gamestream_library(id: &str) -> Result<WindowsLaunch> {
     launch_title(id)

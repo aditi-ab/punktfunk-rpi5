@@ -243,6 +243,7 @@ pub fn capture_virtual_output(
     // worker from an earlier session. Never-declared targets answer NOT_FOUND,
     // which the capturer logs and ignores.
     let target_id = target.target_id;
+    let ccd = pf_win_display::win_display::CcdTargetKey::new(target.adapter_luid, target_id);
     let cursor_forward: Option<pf_capture::CursorForwardSender> = Some({
         std::sync::Arc::new(move |enable: bool| {
             let req = pf_driver_proto::control::SetCursorForwardRequest {
@@ -260,7 +261,7 @@ pub fn capture_virtual_output(
                 )?;
             }
             if !enable {
-                crate::vdisplay::manager::force_recommit(target_id);
+                crate::vdisplay::manager::force_recommit(ccd);
             }
             Ok(())
         }) as pf_capture::CursorForwardSender

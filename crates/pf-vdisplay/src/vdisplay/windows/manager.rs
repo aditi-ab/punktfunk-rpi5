@@ -515,30 +515,16 @@ pub(crate) fn invalidate_cached_device(why: &str) {
     }
 }
 
-/// Force a REAL mode-set at the target's current mode under the `state` lock
-/// (sole topology mutator). The OS reverts a path to software-cursor only on a
-/// mode commit; a same-config CCD apply is no commit, so after one the secure
-/// desktop still never presents. `false` before the first backend open, and
-/// for a target this manager does not own (a target id is only unique per
-/// adapter; the monitor's own CCD key is the identity).
-pub fn force_recommit(target_id: u32) -> bool {
+/// Force a REAL mode-set at the keyed target's current mode under the `state`
+/// lock (sole topology mutator). The OS reverts a path to software-cursor only
+/// on a mode commit; a same-config CCD apply is no commit, so after one the
+/// secure desktop still never presents. `false` before the first backend open.
+pub fn force_recommit(key: pf_win_display::win_display::CcdTargetKey) -> bool {
     let Some(m) = VDM.get() else {
         return false;
     };
-    let inner = m.state.lock().unwrap();
-    let Some(mon) = inner
-        .slots
-        .values()
-        .map(SlotState::mon)
-        .find(|mon| mon.target_id == target_id)
-    else {
-        return false;
-    };
-    let Some(gdi) = mon
-        .gdi_name
-        .clone()
-        .or_else(|| resolve_gdi_name(mon.ccd_key()))
-    else {
+    let _guard = m.state.lock().unwrap();
+    let Some(gdi) = pf_win_display::win_display::resolve_gdi_name(key) else {
         return false;
     };
     pf_win_display::win_display::force_mode_reset(&gdi)
@@ -2326,10 +2312,9 @@ mod tests {
     fn an_alternating_fight_reaches_the_breaker_through_the_window() {
         let t0 = Instant::now();
         let mut recent = std::collections::VecDeque::new();
-        let mut consecutive = 0u32;
         let mut rounds = 0;
         for i in 0..REASSERT_BREAKER_ROUNDS {
-            consecutive = 1; // a clean cycle in between reset it
+            let consecutive = 1u32; // a clean cycle in between reset it
             let now = t0 + Duration::from_secs(4 * u64::from(i));
             recent.push_back(now);
             rounds = consecutive.max(rounds_in_window(&mut recent, now, REASSERT_WINDOW));

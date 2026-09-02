@@ -111,9 +111,9 @@ A `run` command's shell one-liner vocabulary — the event flattened to env, val
 [ "$PF_EVENT_KIND" = stream.started ] && makoctl mode -a do-not-disturb
 ```
 
-Richer payloads (and the full document) are on stdin for `jq`. On a Windows host running as the
-service, the command runs **in your interactive session** (never as SYSTEM); that path can't carry
-per-process env or stdin, so the event JSON's path is appended as the command's last argument
+Richer payloads (and the full document) are on stdin for `jq`. On Windows, a SYSTEM host runs the
+command as the signed-in user of **that host's WTS session** (never as SYSTEM); that path can't
+carry per-process env or stdin, so the event JSON's path is appended as the command's last argument
 instead.
 
 Verify a signed webhook (Python):
@@ -126,8 +126,9 @@ ok = hmac.compare_digest(request.headers["X-Punktfunk-Signature"], expected)
 
 **Rules of the road:** hooks are fire-and-forget and bounded — at most 8 in flight (extra firings
 are dropped with a log line, never queued), and a command that outlives its timeout is killed.
-Hook commands run as the host user, so `hooks.json` is operator-privileged config. On Linux, when a
-command names a script by **absolute path**, the host checks that file *and every directory above
+Hook commands run without elevation (as the host user on Linux and its WTS session user on
+Windows), so `hooks.json` is operator-privileged config. On Linux, when a command names a script by
+**absolute path**, the host checks that file *and every directory above
 it* is owned by you (or root) and not group/world-writable, and refuses to run it — loudly, in the
 log — if it isn't: whoever can rename an entry in a directory chooses what runs out of it. (A
 world-writable directory with the sticky bit, like `/tmp`, passes — there only an entry's own owner

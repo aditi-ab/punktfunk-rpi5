@@ -667,6 +667,222 @@ pub(super) async fn negotiate(
     ))
 }
 
+/// Compositor for Welcome plus the gamescope route as a value; synthetic has neither.
+async fn negotiate_compositor(
+    source: Punktfunk1Source,
+    hello: &Hello,
+) -> Result<(
+    Option<crate::vdisplay::Compositor>,
+    Option<crate::vdisplay::GamescopeRoute>,
+)> {
+    // Resolve now so Welcome reports the backend we will drive. Synthetic has no compositor.
+    // Blocking probes → spawn_blocking.
+    let compositor = match source {
+        Punktfunk1Source::Virtual => {
+            let pref = hello.compositor;
+            // Dedicated gamescope only if the launch id resolves to a command; an unknown id
+            // must not spawn a blank "sleep infinity" gamescope. `launch_is_resolvable`, not
+            // `resolve_launch`: a plugin command is loopback I/O and this is the async path.
+            #[cfg(not(target_os = "windows"))]
+            let has_resolvable_launch = hello
+                .launch
+                .as_deref()
+                .is_some_and(crate::library::launch_is_resolvable);
+            #[cfg(target_os = "windows")]
+            let has_resolvable_launch = false;
+            let dedicated = crate::vdisplay::wants_dedicated_game_session(has_resolvable_launch);
+            Some(
+                tokio::task::spawn_blocking(move || resolve_compositor(pref, dedicated))
+                    .await
+                    .context("resolve compositor task")??,
+            )
+        }
+        Punktfunk1Source::Synthetic => None,
+    };
+    // Split the pair: compositor for Welcome/cursor; gamescope route as a value, not process env.
+    let gamescope_route = compositor.as_ref().and_then(|(_, r)| r.clone());
+    let compositor = compositor.map(|(c, _)| c);
+    Ok((compositor, gamescope_route))
+}
+
+/// Bit depth, HDR verdict, and chroma, each gated by host, client, codec, and GPU probes.
+async fn negotiate_video_format(
+    hello: &Hello,
+    codec: crate::encode::Codec,
+    compositor: Option<crate::vdisplay::Compositor>,
+) -> Result<(u8, bool, crate::encode::ChromaFormat)> {
+    // 10-bit only when host, client, codec, capture, and GPU all allow it. Resolved before
+    // Welcome so `color` matches the stream (a can't-10-bit GPU yields 8-bit SDR).
+    let host_wants_10bit = pf_host_config::config().ten_bit;
+    let client_supports_10bit = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_10BIT != 0;
+    // `VIDEO_CAP_HDR` is BT.2020 PQ. `VIDEO_CAP_10BIT` alone is 10-bit SDR (Main10, display untouched).
+    let client_wants_hdr = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_HDR != 0;
+    // Source-aware: Linux HDR depends on the compositor just resolved. Gamescope folds in
+    // `hdr_capture_failed(VirtualOutput)`; GameStream's rtsp.rs check has no twin here because
+    // that latch is per-source and this gate already used this session's source.
+    let capture_supports_hdr = crate::capture::capturer_supports_hdr_for(compositor);
+    // SDR-10: Windows IDD expands BGRA 8→10 (`Rgb10a2Sdr`); only direct-NVENC ingests that
+    // packed RGB. HEVC only — NVENC packed-RGB → 10-bit AV1 is unverified. Linux has no
+    // SDR-10 chain (`resolved_backend_ingests_rgb_444` is false off Windows).
+    let sdr10_chain_ok =
+        codec == crate::encode::Codec::H265 && crate::encode::resolved_backend_ingests_rgb_444();
+    let depth_reachable = (client_wants_hdr && capture_supports_hdr) || sdr10_chain_ok;
+    // Probe may open a tiny encoder; spawn_blocking, short-circuited behind the cheap gates.
+    let gpu_can_10bit =
+        if host_wants_10bit && client_supports_10bit && codec.supports_10bit() && depth_reachable {
+            tokio::task::spawn_blocking(move || crate::encode::can_encode_10bit(codec))
+                .await
+                .context("10-bit capability probe task")?
+        } else {
+            false
+        };
+    let bit_depth: u8 = if gpu_can_10bit { 10 } else { 8 };
+    // Colour label, capturer mandate, and vdisplay HDR all read this, never `bit_depth >= 10`
+    // (10-bit without it is SDR: BT.709 VUI, display untouched).
+    let session_hdr = gpu_can_10bit && client_wants_hdr && capture_supports_hdr;
+    tracing::info!(
+        bit_depth,
+        session_hdr,
+        host_wants_10bit,
+        client_supports_10bit,
+        client_wants_hdr,
+        capture_supports_hdr,
+        sdr10_chain_ok,
+        codec = ?codec,
+        gpu_can_10bit,
+        client_video_caps = hello.video_caps,
+        "encode bit depth"
+    );
+
+    // 4:4:4 only when host, client, ingest chain, and GPU all allow it. Resolved before
+    // Welcome so the client sizes its decoder from what we will actually emit.
+    let host_wants_444 = pf_host_config::config().four_four_four;
+    let client_supports_444 = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_444 != 0;
+    // Ingest chain, not capturer: Windows 4:4:4 needs direct-NVENC RGB ingest (AMF cannot;
+    // QSV/ffmpeg has no RGB 4:4:4 wiring). PyroWave does its own RGB→YCbCr; its gate is
+    // `can_encode_444`. HDR does not cost chroma (HEVC Main 4:4:4 10).
+    let ingest_chain_supports_444 = codec == crate::encode::Codec::PyroWave
+        || crate::capture::capturer_supports_444(crate::encode::resolved_backend_ingests_rgb_444());
+    // Probe opens a tiny encoder; spawn_blocking, short-circuited. A negative latches until
+    // restart — a GPU either supports HEVC 4:4:4 or it does not.
+    let gpu_supports_444 = if matches!(
+        codec,
+        crate::encode::Codec::H265 | crate::encode::Codec::PyroWave
+    ) && host_wants_444
+        && client_supports_444
+        && ingest_chain_supports_444
+    {
+        tokio::task::spawn_blocking(move || crate::encode::can_encode_444(codec))
+            .await
+            .context("4:4:4 capability probe task")?
+    } else {
+        false
+    };
+    // Client asked (VIDEO_CAP_444) but we still resolve 4:2:0: name the losing gate.
+    if host_wants_444 && client_supports_444 && !gpu_supports_444 {
+        let reason = if !matches!(
+            codec,
+            crate::encode::Codec::H265 | crate::encode::Codec::PyroWave
+        ) {
+            "the negotiated codec only carries 4:2:0 — 4:4:4 needs HEVC or PyroWave"
+        } else if !ingest_chain_supports_444 {
+            "this host's encoder backend can't ingest full chroma — 4:4:4 needs direct \
+             NVENC (NVIDIA) or the PyroWave codec"
+        } else {
+            "the GPU declined the 4:4:4 encode profile probe"
+        };
+        tracing::info!(reason, "4:4:4 requested but the session negotiates 4:2:0");
+    }
+    let chroma = if gpu_supports_444 {
+        crate::encode::ChromaFormat::Yuv444
+    } else {
+        crate::encode::ChromaFormat::Yuv420
+    };
+    // PyroWave RDO packs the block index in 16 bits; ~8K 4:4:4 overflows. Downgrade to 4:2:0
+    // before Welcome.
+    let chroma = if codec == crate::encode::Codec::PyroWave
+        && chroma.is_444()
+        && !crate::encode::pyrowave_mode_fits_rdo(hello.mode.width, hello.mode.height, true)
+    {
+        tracing::warn!(
+            mode = %format_args!("{}x{}", hello.mode.width, hello.mode.height),
+            "PyroWave 4:4:4 at this mode exceeds the rate controller's block-index range — \
+             negotiating 4:2:0"
+        );
+        crate::encode::ChromaFormat::Yuv420
+    } else {
+        chroma
+    };
+    tracing::info!(
+        chroma = ?chroma,
+        host_wants_444,
+        client_supports_444,
+        ingest_chain_supports_444,
+        "encode chroma"
+    );
+
+    // Linux 4:4:4 is CPU swscale → 8-bit `YUV444P`; a 10-bit session would silently encode
+    // 8-bit. Clamp depth before Welcome. Windows NVENC keeps 10 (Main 4:4:4 10 from RGB).
+    #[cfg(target_os = "linux")]
+    let bit_depth: u8 = if chroma.is_444() && bit_depth == 10 {
+        tracing::info!("4:4:4 on the Linux path encodes 8-bit YUV444P — resolving bit depth 8");
+        8
+    } else {
+        bit_depth
+    };
+    // Follows the depth clamp: an 8-bit stream is never labelled HDR.
+    let session_hdr = session_hdr && bit_depth == 10;
+
+    Ok((bit_depth, session_hdr, chroma))
+}
+
+/// Audio plane for Welcome: Opus, or lossless PCM when client, operator, and the
+/// capture-rate probe all allow it. Async for that blocking probe.
+async fn negotiate_audio_plane(
+    conn: &quinn::Connection,
+    hello: &Hello,
+    audio_channels: u8,
+    bitrate_kbps: u32,
+) -> Result<AudioPlane> {
+    // `conn.max_datagram_size()` is quinn's current value; MTU discovery has not settled at
+    // Welcome. Frame duration is a Welcome promise with no mid-session restatement, so the
+    // conservative initial MTU is the safe direction: a frame that fits now keeps fitting as
+    // MTU grows; a frame sized for a discovered MTU that then fails would not be sent.
+    let hires_asked = hello.client_caps & punktfunk_core::quic::CLIENT_CAP_AUDIO_HIRES != 0;
+    // Format without `CLIENT_CAP_AUDIO_HIRES` is contradictory (toggle vs resolved rate).
+    // Ordinary "no capability" is silent; this one is logged because something asked.
+    if !hires_asked && (hello.audio_rate_hz != 0 || hello.audio_bits != 0) {
+        tracing::warn!(
+            requested_rate_hz = hello.audio_rate_hz,
+            requested_bits = hello.audio_bits,
+            "client sent an audio format but not CLIENT_CAP_AUDIO_HIRES — ignoring it and \
+             staying on Opus; the capability and the format must be set together"
+        );
+    }
+    let hires_allowed = pf_host_config::config().audio_hires;
+    // Honest capture rate, asked of the device (both backends resample without error).
+    // Blocking on Windows, so spawn_blocking. Short-circuit on `hires_asked` first — the
+    // operator gate is default-on, so that bit is the only thing sparing ordinary sessions
+    // an endpoint enumeration. `Unknown` is correct when we did not ask.
+    let capture_rate = if hires_asked && hires_allowed {
+        tokio::task::spawn_blocking(crate::audio::probe_capture_rate)
+            .await
+            .context("audio capture-rate probe task")?
+    } else {
+        crate::audio::CaptureRate::Unknown
+    };
+    Ok(resolve_audio_plane(
+        hires_asked,
+        hires_allowed,
+        hello.audio_rate_hz,
+        hello.audio_bits,
+        audio_channels,
+        capture_rate,
+        bitrate_kbps,
+        conn.max_datagram_size(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1141,220 +1357,4 @@ mod tests {
         assert_eq!(p.frame_us, 0);
         assert!(!p.is_pcm());
     }
-}
-
-/// Compositor for Welcome plus the gamescope route as a value; synthetic has neither.
-async fn negotiate_compositor(
-    source: Punktfunk1Source,
-    hello: &Hello,
-) -> Result<(
-    Option<crate::vdisplay::Compositor>,
-    Option<crate::vdisplay::GamescopeRoute>,
-)> {
-    // Resolve now so Welcome reports the backend we will drive. Synthetic has no compositor.
-    // Blocking probes → spawn_blocking.
-    let compositor = match source {
-        Punktfunk1Source::Virtual => {
-            let pref = hello.compositor;
-            // Dedicated gamescope only if the launch id resolves to a command; an unknown id
-            // must not spawn a blank "sleep infinity" gamescope. `launch_is_resolvable`, not
-            // `resolve_launch`: a plugin command is loopback I/O and this is the async path.
-            #[cfg(not(target_os = "windows"))]
-            let has_resolvable_launch = hello
-                .launch
-                .as_deref()
-                .is_some_and(crate::library::launch_is_resolvable);
-            #[cfg(target_os = "windows")]
-            let has_resolvable_launch = false;
-            let dedicated = crate::vdisplay::wants_dedicated_game_session(has_resolvable_launch);
-            Some(
-                tokio::task::spawn_blocking(move || resolve_compositor(pref, dedicated))
-                    .await
-                    .context("resolve compositor task")??,
-            )
-        }
-        Punktfunk1Source::Synthetic => None,
-    };
-    // Split the pair: compositor for Welcome/cursor; gamescope route as a value, not process env.
-    let gamescope_route = compositor.as_ref().and_then(|(_, r)| r.clone());
-    let compositor = compositor.map(|(c, _)| c);
-    Ok((compositor, gamescope_route))
-}
-
-/// Bit depth, HDR verdict, and chroma, each gated by host, client, codec, and GPU probes.
-async fn negotiate_video_format(
-    hello: &Hello,
-    codec: crate::encode::Codec,
-    compositor: Option<crate::vdisplay::Compositor>,
-) -> Result<(u8, bool, crate::encode::ChromaFormat)> {
-    // 10-bit only when host, client, codec, capture, and GPU all allow it. Resolved before
-    // Welcome so `color` matches the stream (a can't-10-bit GPU yields 8-bit SDR).
-    let host_wants_10bit = pf_host_config::config().ten_bit;
-    let client_supports_10bit = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_10BIT != 0;
-    // `VIDEO_CAP_HDR` is BT.2020 PQ. `VIDEO_CAP_10BIT` alone is 10-bit SDR (Main10, display untouched).
-    let client_wants_hdr = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_HDR != 0;
-    // Source-aware: Linux HDR depends on the compositor just resolved. Gamescope folds in
-    // `hdr_capture_failed(VirtualOutput)`; GameStream's rtsp.rs check has no twin here because
-    // that latch is per-source and this gate already used this session's source.
-    let capture_supports_hdr = crate::capture::capturer_supports_hdr_for(compositor);
-    // SDR-10: Windows IDD expands BGRA 8→10 (`Rgb10a2Sdr`); only direct-NVENC ingests that
-    // packed RGB. HEVC only — NVENC packed-RGB → 10-bit AV1 is unverified. Linux has no
-    // SDR-10 chain (`resolved_backend_ingests_rgb_444` is false off Windows).
-    let sdr10_chain_ok =
-        codec == crate::encode::Codec::H265 && crate::encode::resolved_backend_ingests_rgb_444();
-    let depth_reachable = (client_wants_hdr && capture_supports_hdr) || sdr10_chain_ok;
-    // Probe may open a tiny encoder; spawn_blocking, short-circuited behind the cheap gates.
-    let gpu_can_10bit =
-        if host_wants_10bit && client_supports_10bit && codec.supports_10bit() && depth_reachable {
-            tokio::task::spawn_blocking(move || crate::encode::can_encode_10bit(codec))
-                .await
-                .context("10-bit capability probe task")?
-        } else {
-            false
-        };
-    let bit_depth: u8 = if gpu_can_10bit { 10 } else { 8 };
-    // Colour label, capturer mandate, and vdisplay HDR all read this, never `bit_depth >= 10`
-    // (10-bit without it is SDR: BT.709 VUI, display untouched).
-    let session_hdr = gpu_can_10bit && client_wants_hdr && capture_supports_hdr;
-    tracing::info!(
-        bit_depth,
-        session_hdr,
-        host_wants_10bit,
-        client_supports_10bit,
-        client_wants_hdr,
-        capture_supports_hdr,
-        sdr10_chain_ok,
-        codec = ?codec,
-        gpu_can_10bit,
-        client_video_caps = hello.video_caps,
-        "encode bit depth"
-    );
-
-    // 4:4:4 only when host, client, ingest chain, and GPU all allow it. Resolved before
-    // Welcome so the client sizes its decoder from what we will actually emit.
-    let host_wants_444 = pf_host_config::config().four_four_four;
-    let client_supports_444 = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_444 != 0;
-    // Ingest chain, not capturer: Windows 4:4:4 needs direct-NVENC RGB ingest (AMF cannot;
-    // QSV/ffmpeg has no RGB 4:4:4 wiring). PyroWave does its own RGB→YCbCr; its gate is
-    // `can_encode_444`. HDR does not cost chroma (HEVC Main 4:4:4 10).
-    let ingest_chain_supports_444 = codec == crate::encode::Codec::PyroWave
-        || crate::capture::capturer_supports_444(crate::encode::resolved_backend_ingests_rgb_444());
-    // Probe opens a tiny encoder; spawn_blocking, short-circuited. A negative latches until
-    // restart — a GPU either supports HEVC 4:4:4 or it does not.
-    let gpu_supports_444 = if matches!(
-        codec,
-        crate::encode::Codec::H265 | crate::encode::Codec::PyroWave
-    ) && host_wants_444
-        && client_supports_444
-        && ingest_chain_supports_444
-    {
-        tokio::task::spawn_blocking(move || crate::encode::can_encode_444(codec))
-            .await
-            .context("4:4:4 capability probe task")?
-    } else {
-        false
-    };
-    // Client asked (VIDEO_CAP_444) but we still resolve 4:2:0: name the losing gate.
-    if host_wants_444 && client_supports_444 && !gpu_supports_444 {
-        let reason = if !matches!(
-            codec,
-            crate::encode::Codec::H265 | crate::encode::Codec::PyroWave
-        ) {
-            "the negotiated codec only carries 4:2:0 — 4:4:4 needs HEVC or PyroWave"
-        } else if !ingest_chain_supports_444 {
-            "this host's encoder backend can't ingest full chroma — 4:4:4 needs direct \
-             NVENC (NVIDIA) or the PyroWave codec"
-        } else {
-            "the GPU declined the 4:4:4 encode profile probe"
-        };
-        tracing::info!(reason, "4:4:4 requested but the session negotiates 4:2:0");
-    }
-    let chroma = if gpu_supports_444 {
-        crate::encode::ChromaFormat::Yuv444
-    } else {
-        crate::encode::ChromaFormat::Yuv420
-    };
-    // PyroWave RDO packs the block index in 16 bits; ~8K 4:4:4 overflows. Downgrade to 4:2:0
-    // before Welcome.
-    let chroma = if codec == crate::encode::Codec::PyroWave
-        && chroma.is_444()
-        && !crate::encode::pyrowave_mode_fits_rdo(hello.mode.width, hello.mode.height, true)
-    {
-        tracing::warn!(
-            mode = %format_args!("{}x{}", hello.mode.width, hello.mode.height),
-            "PyroWave 4:4:4 at this mode exceeds the rate controller's block-index range — \
-             negotiating 4:2:0"
-        );
-        crate::encode::ChromaFormat::Yuv420
-    } else {
-        chroma
-    };
-    tracing::info!(
-        chroma = ?chroma,
-        host_wants_444,
-        client_supports_444,
-        ingest_chain_supports_444,
-        "encode chroma"
-    );
-
-    // Linux 4:4:4 is CPU swscale → 8-bit `YUV444P`; a 10-bit session would silently encode
-    // 8-bit. Clamp depth before Welcome. Windows NVENC keeps 10 (Main 4:4:4 10 from RGB).
-    #[cfg(target_os = "linux")]
-    let bit_depth: u8 = if chroma.is_444() && bit_depth == 10 {
-        tracing::info!("4:4:4 on the Linux path encodes 8-bit YUV444P — resolving bit depth 8");
-        8
-    } else {
-        bit_depth
-    };
-    // Follows the depth clamp: an 8-bit stream is never labelled HDR.
-    let session_hdr = session_hdr && bit_depth == 10;
-
-    Ok((bit_depth, session_hdr, chroma))
-}
-
-/// Audio plane for Welcome: Opus, or lossless PCM when client, operator, and the
-/// capture-rate probe all allow it. Async for that blocking probe.
-async fn negotiate_audio_plane(
-    conn: &quinn::Connection,
-    hello: &Hello,
-    audio_channels: u8,
-    bitrate_kbps: u32,
-) -> Result<AudioPlane> {
-    // `conn.max_datagram_size()` is quinn's current value; MTU discovery has not settled at
-    // Welcome. Frame duration is a Welcome promise with no mid-session restatement, so the
-    // conservative initial MTU is the safe direction: a frame that fits now keeps fitting as
-    // MTU grows; a frame sized for a discovered MTU that then fails would not be sent.
-    let hires_asked = hello.client_caps & punktfunk_core::quic::CLIENT_CAP_AUDIO_HIRES != 0;
-    // Format without `CLIENT_CAP_AUDIO_HIRES` is contradictory (toggle vs resolved rate).
-    // Ordinary "no capability" is silent; this one is logged because something asked.
-    if !hires_asked && (hello.audio_rate_hz != 0 || hello.audio_bits != 0) {
-        tracing::warn!(
-            requested_rate_hz = hello.audio_rate_hz,
-            requested_bits = hello.audio_bits,
-            "client sent an audio format but not CLIENT_CAP_AUDIO_HIRES — ignoring it and \
-             staying on Opus; the capability and the format must be set together"
-        );
-    }
-    let hires_allowed = pf_host_config::config().audio_hires;
-    // Honest capture rate, asked of the device (both backends resample without error).
-    // Blocking on Windows, so spawn_blocking. Short-circuit on `hires_asked` first — the
-    // operator gate is default-on, so that bit is the only thing sparing ordinary sessions
-    // an endpoint enumeration. `Unknown` is correct when we did not ask.
-    let capture_rate = if hires_asked && hires_allowed {
-        tokio::task::spawn_blocking(crate::audio::probe_capture_rate)
-            .await
-            .context("audio capture-rate probe task")?
-    } else {
-        crate::audio::CaptureRate::Unknown
-    };
-    Ok(resolve_audio_plane(
-        hires_asked,
-        hires_allowed,
-        hello.audio_rate_hz,
-        hello.audio_bits,
-        audio_channels,
-        capture_rate,
-        bitrate_kbps,
-        conn.max_datagram_size(),
-    ))
 }

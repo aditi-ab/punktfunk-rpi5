@@ -265,23 +265,11 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_Gdi",
-    # Windows.Graphics.Capture (WGC) backend — composed-desktop capture (overlay/MPO-correct HDR).
-    "Foundation",
-    "Graphics",
-    "Graphics_Capture",
-    "Graphics_DirectX",
-    "Graphics_DirectX_Direct3D11",
-    "Win32_System_WinRT_Direct3D11",
-    "Win32_System_WinRT_Graphics_Capture",
-    # WGC runs under SYSTEM via interactive-user impersonation (WGC won't activate as SYSTEM).
+    # Session-local user launches (interactive.rs) and the service's active-console host selection.
     "Win32_System_RemoteDesktop",
-    # Two-process secure-desktop design: the SYSTEM host spawns the WGC helper in the interactive
-    # user session (CreateProcessAsUserW) with stdout/stdin redirected to anonymous pipes.
     "Win32_System_Threading",
-    "Win32_System_Pipes",
     "Win32_System_Environment",
-    # Force-composed-flip overlay: a topmost layered window on the Winlogon desktop disqualifies the
-    # secure desktop's fullscreen independent-flip so Desktop Duplication can capture it.
+    # Module-path crash records and the System32-scoped AVRT loader.
     "Win32_System_LibraryLoader",
     # VirtualProtect — for the inline patch of the win32u GPU-preference shim (Apollo's MinHook port:
     # the hybrid-GPU output-reparenting hook that keeps Desktop Duplication stable on a 4090+iGPU box).
@@ -291,8 +279,8 @@ windows = { version = "0.62", features = [
     # Per-monitor-v2 DPI awareness — IDXGIOutput5::DuplicateOutput1 (the modern capture path Apollo
     # uses; FP16/format-list, robust to overlay/format churn) requires the process to be DPI-aware.
     "Win32_UI_HiDpi",
-    # Windows service supervisor (src/service.rs): a kill-on-close job object so a service crash never
-    # orphans the SYSTEM host it launched into the interactive session.
+    # Windows service supervisor (src/windows/service.rs): a kill-on-close job object so a service
+    # crash never orphans the SYSTEM host it launched into the active console session.
     "Win32_System_JobObjects",
     # CoCreateInstance(PolicyConfigClient) — set the default audio playback/recording endpoints via the
     # undocumented IPolicyConfig (audio/windows/audio_control.rs) so mic + desktop audio auto-wire.
