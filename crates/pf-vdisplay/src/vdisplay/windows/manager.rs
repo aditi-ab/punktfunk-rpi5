@@ -272,10 +272,31 @@ fn isolate_txn_outcome(outcome: Option<IsolateOutcome>) -> pf_win_display::topol
     }
 }
 
-/// Consecutive re-assert rounds before the watchdog CONCEDES the fixed cadence (immunity plan
-/// WP10 item 6): past this, something on the host demonstrably restores the path every cycle,
-/// and re-fighting it every two seconds only multiplies swap-chain bounces for the stream.
+/// Re-assert rounds before the watchdog CONCEDES the fixed cadence (immunity plan WP10 item 6):
+/// past this, something on the host demonstrably restores the path every cycle, and re-fighting
+/// it every two seconds only multiplies swap-chain bounces for the stream. Counted two ways and
+/// the larger wins: consecutive rounds, and rounds within [`REASSERT_WINDOW`] — a fight that
+/// alternates "lost" and "stable again" every cycle (measured on `.173`: the TV re-activates
+/// ~1 s after each re-assert) never grows a consecutive count, yet is the same fight.
 const REASSERT_BREAKER_ROUNDS: u32 = 4;
+/// The rolling window the second count uses.
+const REASSERT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Drop re-assert stamps older than `window` and return how many remain — the rolling count
+/// behind the breaker.
+fn rounds_in_window(
+    recent: &mut std::collections::VecDeque<Instant>,
+    now: Instant,
+    window: Duration,
+) -> u32 {
+    while recent
+        .front()
+        .is_some_and(|&t| now.saturating_duration_since(t) >= window)
+    {
+        recent.pop_front();
+    }
+    recent.len() as u32
+}
 /// Longest pause between re-asserts once conceded.
 const REASSERT_BACKOFF_CAP: Duration = Duration::from_secs(60);
 
@@ -1014,6 +1035,8 @@ impl VirtualDisplayManager {
                 // Consecutive eviction cycles. Resets when a cycle is clean,
                 // so a rare re-add WARNs each time; a fighter escalates once.
                 let mut fighting = 0u32;
+                // Every re-assert's stamp for the rolling count (the alternating fight).
+                let mut recent = std::collections::VecDeque::<Instant>::new();
                 'watch: loop {
                     // Subscribe to the display actor's topology generation (immunity plan WP9):
                     // wake early when a snapshot lands, else at the interval — sliced so stop+join
@@ -1070,6 +1093,12 @@ impl VirtualDisplayManager {
                         continue;
                     }
                     fighting += 1;
+                    recent.push_back(Instant::now());
+                    let rounds = fighting.max(rounds_in_window(
+                        &mut recent,
+                        Instant::now(),
+                        REASSERT_WINDOW,
+                    ));
                     // The re-assert is a topology TRANSACTION (immunity plan WP10): it holds
                     // descriptor-following (samples until "stable again" are the transient
                     // eviction state) for interval + 3 s, swap-chain bounce included, and is
@@ -1079,10 +1108,10 @@ impl VirtualDisplayManager {
                         "exclusive-reassert",
                         interval + Duration::from_secs(3),
                     );
-                    match fighting {
+                    match rounds {
                         1..=3 => tracing::warn!(
                             survivors,
-                            round = fighting,
+                            round = rounds,
                             "exclusive topology lost — a non-managed display re-activated after \
                              the verified isolate (hybrid-GPU driver / display-poller software \
                              restoring the saved layout?); re-asserting the isolate"
@@ -1096,7 +1125,7 @@ impl VirtualDisplayManager {
                         ),
                         _ => tracing::debug!(
                             survivors,
-                            round = fighting,
+                            round = rounds,
                             "re-asserting exclusive topology"
                         ),
                     }
@@ -1127,7 +1156,7 @@ impl VirtualDisplayManager {
                         TOPOLOGY_REASSERT_GEN.fetch_add(1, Ordering::Relaxed);
                     }
                     // Circuit breaker: past the breaker rounds, pause before the next round.
-                    let mut pause = reassert_backoff(fighting, interval);
+                    let mut pause = reassert_backoff(rounds, interval);
                     while !pause.is_zero() && !stop_t.load(Ordering::Relaxed) {
                         let slice = Duration::from_millis(250).min(pause);
                         thread::sleep(slice);
@@ -2276,10 +2305,35 @@ pub(crate) fn force_release(slot: Option<u64>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        needs_resize, reassert_backoff, shrink_action, Mode, ShrinkAction, REASSERT_BACKOFF_CAP,
-        REASSERT_BREAKER_ROUNDS,
+        needs_resize, reassert_backoff, rounds_in_window, shrink_action, Mode, ShrinkAction,
+        REASSERT_BACKOFF_CAP, REASSERT_BREAKER_ROUNDS, REASSERT_WINDOW,
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    /// The alternating fight (lost / stable / lost …) reaches the breaker through the rolling
+    /// window even though the consecutive count never leaves 1, and old rounds age out.
+    #[test]
+    fn an_alternating_fight_reaches_the_breaker_through_the_window() {
+        let t0 = Instant::now();
+        let mut recent = std::collections::VecDeque::new();
+        let mut consecutive = 0u32;
+        let mut rounds = 0;
+        for i in 0..REASSERT_BREAKER_ROUNDS {
+            consecutive = 1; // a clean cycle in between reset it
+            let now = t0 + Duration::from_secs(4 * u64::from(i));
+            recent.push_back(now);
+            rounds = consecutive.max(rounds_in_window(&mut recent, now, REASSERT_WINDOW));
+        }
+        assert_eq!(
+            rounds, REASSERT_BREAKER_ROUNDS,
+            "four rounds in 16 s trip the breaker"
+        );
+        assert!(!reassert_backoff(rounds + 1, Duration::from_secs(2)).is_zero());
+        // A minute later the window has drained and a lone re-add is a lone re-add again.
+        let later = t0 + REASSERT_WINDOW + Duration::from_secs(20);
+        recent.push_back(later);
+        assert_eq!(rounds_in_window(&mut recent, later, REASSERT_WINDOW), 1);
+    }
 
     const fn m(width: u32, height: u32, refresh_hz: u32) -> Mode {
         Mode {

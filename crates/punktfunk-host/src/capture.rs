@@ -335,9 +335,15 @@ mod live_tests {
         .expect("open the IDD-push capturer");
         // A static desktop composes nothing: walk the pointer so every tick has a new image.
         let (mut source, mut regen, mut repeat, mut errors) = (0u32, 0u32, 0u32, 0u32);
+        // `PF_LIVE_RING_SECS` stretches the run (default 12 s) so slower behaviours — the
+        // exclusive watchdog's breaker on a relight fight — have time to show in the log.
+        let secs: u64 = std::env::var("PF_LIVE_RING_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(12);
         let start = Instant::now();
         let mut x = 100i32;
-        while start.elapsed() < Duration::from_secs(12) && source < 300 {
+        while start.elapsed() < Duration::from_secs(secs) {
             x = 100 + ((x - 100 + 7) % 600);
             // SAFETY: plain FFI; the pointer is parked on the operator's desktop for the test.
             unsafe {
