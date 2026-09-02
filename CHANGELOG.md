@@ -37,7 +37,8 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 - **Three Windows launch kinds: `uplay`, `amazon` and `battlenet`.** A library plugin publishes
   a validated store id and the host builds the launch itself: `explorer.exe "uplay://launch/<id>/0"`,
   `explorer.exe "amazon-games://play/<id>"`, and `Battle.net.exe --exec="launch <code>"`. All three
-  are open to the plugin lane; nothing to do unless you write a plugin.
+  are open to the plugin lane; nothing to do unless you write a plugin. A cold Battle.net client
+  only opens itself on the first launch, so keep it running or pick the tile twice.
 - **`defineLibraryPlugin` takes a `launch` resolver** (`@punktfunk/plugin-kit` 0.4.5). A library
   plugin can publish `kind: "plugin"` tiles and answer the host's launch-time ask without composing
   its own UI server; plugins on 0.4.4 are unaffected.
