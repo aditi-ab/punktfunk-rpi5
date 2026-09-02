@@ -65,8 +65,9 @@ on iOS, tvOS and Android the excluded OS present floor.
 You can also set the level a stream starts at in each client's
 [Settings](/docs/client-settings#overlay). The examples below are the **Detailed** view.
 
-The overlay follows your display's scaling, so it should already be readable. To nudge it, set
-`PUNKTFUNK_OSD_SCALE` in the **client's** environment (0.5×–4×) — see [Configuration →
+The overlay follows your display's scaling, so it should already be readable. On Android TV it draws larger
+again, because a set across the room asks for more than pixel density accounts for. To nudge it on a desktop client, set `PUNKTFUNK_OSD_SCALE` in the **client's**
+environment (0.5×–4×) — see [Configuration →
 Client-side](/docs/configuration#client-side-native-clients).
 
 ## Reading the overlay

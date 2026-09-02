@@ -1084,11 +1084,13 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         // BEFORE the transparent gesture layer below, so it shows through and never eats touches.
         if (statsOn) {
             stats?.let {
-                StatsOverlay(
-                    it, statsVerbosity, decoderLabel, codecLabel, session.profileName,
-                    panelHz,
-                    Modifier.align(Alignment.TopStart).padding(12.dp),
-                )
+                val placement = Modifier.align(Alignment.TopStart).padding(12.dp)
+                OsdScaled {
+                    StatsOverlay(
+                        it, statsVerbosity, decoderLabel, codecLabel, session.profileName,
+                        panelHz, placement,
+                    )
+                }
             }
         }
         // The Access chip — what this session is allowed to do, said in the preset vocabulary
@@ -1243,55 +1245,57 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         }
         // The ring, above the gesture layer so its buttons take the finger first. Composed only
         // while open: a closed overlay costs nothing (tenet 1).
-        RingOverlay(
-            state = ring,
-            cfg = overlayCfg,
-            actions = RingActions(
-                endStream = { NativeBridge.nativeDisconnectQuit(handle); onSessionEnded(SessionEndReason.LOCAL) },
-                disconnectLinger = { onSessionEnded(SessionEndReason.LOCAL) },
-                touchMode = { touchMode },
-                cycleTouchMode = {
-                    // Passthrough is skipped toward a host that drops contacts (§5.4).
-                    val order = if (hostAcceptsTouch) TouchMode.entries else listOf(TouchMode.TRACKPAD, TouchMode.POINTER)
-                    touchMode = order[(order.indexOf(touchMode) + 1) % order.size]
-                },
-                keyboardGranted = { accessGrants and SessionAccess.KEYBOARD != 0 },
-                keyboard = { keyCapture?.setImeVisible(true) },
-                textSupported = NativeBridge.nativeTextInputSupported(handle),
-                sendText = { NativeBridge.nativeSendText(handle, it) },
-                stats = { statsVerbosity },
-                cycleStats = { statsVerbosity = statsVerbosity.next() },
-                micAvailable = { micRunning },
-                micMuted = { micMuted },
-                toggleMic = { setMicMuted(!micMuted) },
-                hostActions = { hostActions },
-                invokeHost = { act ->
-                    hostRecord?.let { kh ->
-                        scope.launch(Dispatchers.IO) {
-                            (IdentityStore(context).load() as? IdentityLoad.Ok)?.identity?.let { id ->
-                                HostActions.invoke(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.name, act.id, act.label)
+        OsdScaled {
+            RingOverlay(
+                state = ring,
+                cfg = overlayCfg,
+                actions = RingActions(
+                    endStream = { NativeBridge.nativeDisconnectQuit(handle); onSessionEnded(SessionEndReason.LOCAL) },
+                    disconnectLinger = { onSessionEnded(SessionEndReason.LOCAL) },
+                    touchMode = { touchMode },
+                    cycleTouchMode = {
+                        // Passthrough is skipped toward a host that drops contacts (§5.4).
+                        val order = if (hostAcceptsTouch) TouchMode.entries else listOf(TouchMode.TRACKPAD, TouchMode.POINTER)
+                        touchMode = order[(order.indexOf(touchMode) + 1) % order.size]
+                    },
+                    keyboardGranted = { accessGrants and SessionAccess.KEYBOARD != 0 },
+                    keyboard = { keyCapture?.setImeVisible(true) },
+                    textSupported = NativeBridge.nativeTextInputSupported(handle),
+                    sendText = { NativeBridge.nativeSendText(handle, it) },
+                    stats = { statsVerbosity },
+                    cycleStats = { statsVerbosity = statsVerbosity.next() },
+                    micAvailable = { micRunning },
+                    micMuted = { micMuted },
+                    toggleMic = { setMicMuted(!micMuted) },
+                    hostActions = { hostActions },
+                    invokeHost = { act ->
+                        hostRecord?.let { kh ->
+                            scope.launch(Dispatchers.IO) {
+                                (IdentityStore(context).load() as? IdentityLoad.Ok)?.identity?.let { id ->
+                                    HostActions.invoke(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.name, act.id, act.label)
+                                }
                             }
                         }
-                    }
-                },
-                sendShortcut = { sendChord(handle, it) },
-                padAvailable = { activity?.gamepadRouter?.sendsEnabled() == true },
-                padShown = { padShown },
-                togglePad = { padShown = !padShown },
-                currentMode = { requestedMode },
-                requestMode = { w, h, hz ->
-                    if (NativeBridge.nativeRequestMode(handle, w, h, hz)) {
-                        requestedMode = intArrayOf(w, h, hz)
-                        scope.launch {
-                            delay(500)
-                            NativeBridge.nativeVideoSize(handle)?.takeIf { it.size >= 3 }?.let { requestedMode = it }
+                    },
+                    sendShortcut = { sendChord(handle, it) },
+                    padAvailable = { activity?.gamepadRouter?.sendsEnabled() == true },
+                    padShown = { padShown },
+                    togglePad = { padShown = !padShown },
+                    currentMode = { requestedMode },
+                    requestMode = { w, h, hz ->
+                        if (NativeBridge.nativeRequestMode(handle, w, h, hz)) {
+                            requestedMode = intArrayOf(w, h, hz)
+                            scope.launch {
+                                delay(500)
+                                NativeBridge.nativeVideoSize(handle)?.takeIf { it.size >= 3 }?.let { requestedMode = it }
+                            }
                         }
-                    }
-                },
-            ),
-            containerSize = containerSize,
-            haptics = haptics,
-        )
+                    },
+                ),
+                containerSize = containerSize,
+                haptics = haptics,
+            )
+        }
         micHint?.let { MicChordHint(it, Modifier.align(Alignment.TopCenter).padding(top = 16.dp)) }
         // Bottom, not top: this can coincide with a mic-chord confirmation or the exit cue, and a
         // notice landing on top of one of those would cost the user both.

@@ -171,6 +171,10 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
   is retired on that first upgrade. winget: the host manifest's `InstallerType` is `exe` from
   this version; `winget upgrade` keeps tracking the same `ProductCode`. The wizard needs
   Windows 11; a silent install runs anywhere the host does.
+- **The streaming overlay sizes itself on Android TV.** The stats HUD and the quick-action ring
+  draw 1.75x larger there, where `dp` normalises pixel density but not the viewing distance a
+  living-room set adds — the Apple TV client already sizes its own chrome for the couch. Nothing
+  to set: it follows the device.
 - **The install commands are generated from `data/platforms.json`.** They were copied beside it
   and kept in step by a CI substring check; the binary embeds the file, so the docs and the
   installer cannot drift. Nothing to do.
