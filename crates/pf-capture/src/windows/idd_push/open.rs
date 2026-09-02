@@ -391,7 +391,10 @@ impl IddPushCapturer {
             let (device, context) = make_device(&adapter).context("make_device for IDD push")?;
 
             let sa = SharedObjectSa::new()?;
-            let bytes = std::mem::size_of::<SharedHeader>().max(64);
+            // The full v3 layout. A v2 driver maps the whole section and reads only its 88-byte
+            // prefix; the v3 tail is reachable to it only through `frame::v3_readable`, which its
+            // version gate fails.
+            let bytes = std::mem::size_of::<SharedHeader>();
 
             // Unnamed mapping: the driver receives a duplicated handle, not a name.
             let map = CreateFileMappingW(
@@ -420,6 +423,11 @@ impl IddPushCapturer {
             let header = section.ptr::<SharedHeader>();
             std::ptr::write_bytes(header.cast::<u8>(), 0, bytes);
             (*header).version = VERSION;
+            // What THIS host can act on (immunity plan WP4). The fence ring and the swap-chain
+            // reset actuator stay off until WP7/WP13 implement them; a transport activates only
+            // where `frame::negotiate` finds both sides agreeing.
+            (*header).host_capabilities = pf_driver_proto::frame::CAP_RING_HEALTH_V3
+                | pf_driver_proto::frame::CAP_SOURCE_SEQUENCE_QPC;
             (*header).generation = generation;
             (*header).ring_len = RING_LEN;
             (*header).width = w;

@@ -99,12 +99,7 @@ mod tests {
 
     #[test]
     fn cadence_coalesces_double_jolt_pairs() {
-        let out = cadence_run(&[
-            0, 700,
-            4_000, 4_700,
-            8_000, 8_650,
-            12_000,
-        ]);
+        let out = cadence_run(&[0, 700, 4_000, 4_700, 8_000, 8_650, 12_000]);
         assert!(out[..6].iter().all(Option::is_none));
         let period = out[6].expect("coalesced pairs must still read as a 4 s cycle");
         assert!(

@@ -175,7 +175,10 @@ pub enum VkDecodeError {
     /// Named a reference slot the planner no longer holds. Fatal: the planner
     /// compacting survivors into `AuPlan::refs` would make later names resolve
     /// to the wrong picture. `ref_index` is LAST_FRAME=0 … ALTREF_FRAME=6.
-    MissingReferenceAv1 { slot: u8, ref_index: u8 },
+    MissingReferenceAv1 {
+        slot: u8,
+        ref_index: u8,
+    },
     /// Every frame of this temporal unit was skipped while waiting for a key
     /// after a failure. Same kind as [`pf_bitstream::h264::PlanError::AwaitingIdr`]:
     /// an error per AU, so the consumer's demotion streak can fire. `Ok(None)`
@@ -205,7 +208,9 @@ pub enum VkDecodeError {
     /// names. H.264 has no such arrays but hardware still decodes against the
     /// unbound slot. Safe only because [`crate::decoder_h265::RecoveryLatch`]
     /// flushes to the next IRAP/IDR.
-    UnboundReferenceSlot { slot: u8 },
+    UnboundReferenceSlot {
+        slot: u8,
+    },
     /// Frame's generation has no retired pool (double release, or outlived the
     /// graveyard entry).
     StaleFrame {

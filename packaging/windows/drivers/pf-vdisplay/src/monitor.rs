@@ -4,7 +4,8 @@
 //! from the working upstream virtual-display-rs (`monitor.rs` + `context.rs::create_monitor`), with
 //! `guid: u128` → `session_id: u64` for the owned `pf_driver_proto` control plane.
 
-use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use wdk_sys::{NTSTATUS, WDFOBJECT, call_unsafe_wdf_function_binding, iddcx};
@@ -58,23 +59,19 @@ pub struct MonitorObject {
     /// closes an unconsumed channel's handles via [`FrameChannel`]'s `Drop`, so no delivery can leak
     /// handles in the WUDFHost table whatever the monitor's fate.
     pub frame_channel: Option<crate::frame_transport::FrameChannel>,
-    /// A live [`FramePublisher`](crate::frame_transport::FramePublisher) preserved across a swap-chain
-    /// unassign→reassign flap (STEP 6 sibling-join fix). The OS unassigns a monitor's swap-chain
-    /// whenever a SIBLING display churns the desktop topology (a second client joining / leaving /
-    /// resizing), which drops the swap-chain worker — but the HOST-owned ring (header / event /
-    /// textures) the publisher holds stays valid, and the host only re-delivers the frame channel on a
-    /// ring RECREATE (a descriptor change), so a fresh worker had nothing to re-attach from and the
-    /// first client's stream froze (repeat frames forever). The exiting worker stashes its still-live
-    /// publisher here ([`preserve_publisher`]); the next worker on the SAME render adapter takes it back
-    /// ([`take_preserved_publisher`]) and resumes publishing into the same ring. Dropped with the
-    /// `MonitorObject` on teardown (closing its ring handles) if no worker ever reclaims it.
-    pub preserved_publisher: Option<crate::frame_transport::FramePublisher>,
-    /// The worker's [`FrameStash`](crate::frame_transport::FrameStash) (the retained last composed
-    /// frame — the first-frame guarantee) preserved across a swap-chain unassign→reassign flap,
-    /// tagged with the render-adapter LUID its texture lives on: the next worker re-adopts it only
-    /// on the SAME adapter (same pooled device — a cross-device texture would be unusable). Dropped
-    /// with the `MonitorObject` on teardown (it holds only a driver-private texture, no handles).
-    pub preserved_stash: Option<(crate::frame_transport::FrameStash, u32, i32)>,
+    /// The monitor-OWNED ring endpoint (immunity plan D4 / WP5): the mapped host header + retained
+    /// sealed handles of the CURRENT ring generation. The swap-chain worker that turns a delivery
+    /// into an endpoint installs it here ([`set_endpoint`]); every later worker — the next one after
+    /// a swap-chain unassign→reassign flap — opens its OWN device-bound publisher on it
+    /// ([`endpoint`]). The OS reassigns a monitor's swap-chain whenever a SIBLING display churns the
+    /// topology, and the host re-delivers a channel only on a ring RECREATE, so without this the
+    /// fresh worker had nothing to attach to and the first client's stream froze. No device-bound
+    /// object crosses assignments any more. Dropped with the entry on teardown (the last `Arc`
+    /// holder unmaps + closes the ring handles).
+    pub endpoint: Option<Arc<crate::frame_transport::RingEndpoint>>,
+    /// The monitor's source sequence (D2): advanced only by NEW desktop frames, monotonic across
+    /// ring rebuilds — shared with every endpoint this monitor gets.
+    pub source_seq: Arc<AtomicU64>,
     /// The host asked for an IddCx hardware cursor (`AddRequest::hw_cursor`, proto v5): declared
     /// once the cursor channel arrives (`IOCTL_SET_CURSOR_CHANNEL`) — see [`set_cursor_channel`].
     pub hw_cursor: bool,
@@ -486,87 +483,64 @@ pub fn set_cursor_channel(
     Ok(())
 }
 
-/// Stash a swap-chain worker's still-live [`FramePublisher`](crate::frame_transport::FramePublisher) on
-/// its monitor across a swap-chain unassign→reassign flap (STEP 6 sibling-join fix; see the field docs
-/// on [`MonitorObject::preserved_publisher`]). Called from the EXITING worker thread — the caller must
-/// NOT hold `MONITOR_MODES` (this locks it), matching the same drop-outside-the-lock discipline the
-/// processor teardown paths use. Returns `Err(publisher)` when no monitor with `target_id` exists (a
-/// genuine teardown, not a flap: the entry was already removed) so the caller drops it, closing the ring
-/// handles. Replacing an already-stashed publisher (should not happen — one worker exits at a time)
-/// drops the old one, so it can never accumulate. Returning the publisher in the `Err` makes the
-/// `Result` itself `#[must_use]`, so a caller can't silently drop the not-preserved publisher; it
-/// rides boxed (the struct outgrew clippy's 128-byte `result_large_err` bar with the v2 telemetry
-/// fields, and this path runs once per worker exit — the allocation is free).
-pub fn preserve_publisher(
-    target_id: u32,
-    publisher: crate::frame_transport::FramePublisher,
-) -> Result<(), Box<crate::frame_transport::FramePublisher>> {
+/// Install the [`RingEndpoint`](crate::frame_transport::RingEndpoint) a worker built from a delivery
+/// on the monitor with `target_id`, replacing the previous generation's (which drops once its last
+/// publisher lets go). Called from the worker thread — the caller must NOT hold `MONITOR_MODES`.
+/// `false` (and `ep` dropped, closing its handles) when the monitor is gone — a genuine teardown.
+pub fn set_endpoint(target_id: u32, ep: Arc<crate::frame_transport::RingEndpoint>) -> bool {
     if target_id == 0 {
-        return Err(Box::new(publisher));
+        return false;
     }
     let mut lock = lock_monitors();
-    if let Some(m) = lock.iter_mut().find(|m| m.target_id == target_id) {
-        m.preserved_publisher = Some(publisher);
-        Ok(())
-    } else {
-        Err(Box::new(publisher))
+    match lock.iter_mut().find(|m| m.target_id == target_id) {
+        Some(m) => {
+            m.endpoint = Some(ep);
+            true
+        }
+        None => false,
     }
 }
 
-/// Take (remove) a preserved [`FramePublisher`](crate::frame_transport::FramePublisher) for a freshly-
-/// (re)assigned swap-chain worker (STEP 6 sibling-join fix). The caller re-adopts it ONLY when the new
-/// swap-chain's render adapter matches the publisher's ([`FramePublisher::render_adapter`]) — same
-/// pooled device, so its context + opened ring textures are still valid; on a mismatch the caller drops
-/// it and waits for a fresh channel delivery instead. `None` until a worker has stashed one.
-pub fn take_preserved_publisher(target_id: u32) -> Option<crate::frame_transport::FramePublisher> {
+/// The monitor's current ring endpoint, for a freshly-assigned worker to open on its own device.
+/// `None` until a delivery has been turned into one.
+pub fn endpoint(target_id: u32) -> Option<Arc<crate::frame_transport::RingEndpoint>> {
     if target_id == 0 {
         return None;
     }
     lock_monitors()
-        .iter_mut()
+        .iter()
         .find(|m| m.target_id == target_id)?
-        .preserved_publisher
-        .take()
+        .endpoint
+        .clone()
 }
 
-/// Preserve an EXITING worker's [`FrameStash`](crate::frame_transport::FrameStash) on its monitor
-/// across a swap-chain unassign→reassign flap, tagged with the render-adapter LUID it lives on
-/// (see [`MonitorObject::preserved_stash`]). An empty stash, or one for a monitor that no longer
-/// exists (genuine teardown), is simply dropped — unlike a publisher it owns no handles, so there
-/// is nothing to hand back.
-pub fn preserve_stash(
-    target_id: u32,
-    luid_low: u32,
-    luid_high: i32,
-    stash: crate::frame_transport::FrameStash,
-) {
-    if target_id == 0 || stash.texture().is_none() {
+/// Retire the monitor's endpoint IF it is still generation `generation` — a worker whose open of a
+/// FRESH delivery failed calls this so the failure stays terminal for that delivery (the host's
+/// wait-for-attach reads the status and fails the open; a retry is a new delivery). A newer endpoint
+/// installed meanwhile is left alone.
+pub fn clear_endpoint(target_id: u32, generation: u32) {
+    if target_id == 0 {
         return;
     }
     let mut lock = lock_monitors();
-    if let Some(m) = lock.iter_mut().find(|m| m.target_id == target_id) {
-        m.preserved_stash = Some((stash, luid_low, luid_high));
+    if let Some(m) = lock.iter_mut().find(|m| m.target_id == target_id)
+        && m.endpoint
+            .as_ref()
+            .is_some_and(|e| e.generation() == generation)
+    {
+        m.endpoint = None;
     }
 }
 
-/// Take (remove) the preserved [`FrameStash`](crate::frame_transport::FrameStash) for a freshly-
-/// (re)assigned swap-chain worker — returned only when the worker's render adapter matches the one
-/// the stash was preserved on (same pooled device); a mismatched stash is dropped (its texture
-/// would be cross-device).
-pub fn take_preserved_stash(
-    target_id: u32,
-    luid_low: u32,
-    luid_high: i32,
-) -> Option<crate::frame_transport::FrameStash> {
+/// The monitor's source-sequence counter (see [`MonitorObject::source_seq`]); `None` if it is gone.
+pub fn source_seq(target_id: u32) -> Option<Arc<AtomicU64>> {
     if target_id == 0 {
         return None;
     }
-    let (stash, low, high) = lock_monitors()
-        .iter_mut()
-        .find(|m| m.target_id == target_id)?
-        .preserved_stash
-        .take()?;
-    ((low, high) == (luid_low, luid_high)).then_some(stash)
+    lock_monitors()
+        .iter()
+        .find(|m| m.target_id == target_id)
+        .map(|m| m.source_seq.clone())
 }
 
 /// Re-issue the hardware-cursor setup for the monitor identified by its IddCx `object`, if it
@@ -765,8 +739,8 @@ pub fn create_monitor(
             adapter_luid_high: 0,
             swap_chain_processor: None,
             frame_channel: None,
-            preserved_publisher: None,
-            preserved_stash: None,
+            endpoint: None,
+            source_seq: Arc::new(AtomicU64::new(0)),
             hw_cursor,
             cursor_worker: None,
             cursor_forward_on: true,

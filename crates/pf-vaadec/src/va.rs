@@ -417,10 +417,17 @@ impl VaImage {
 /// reported; a guessed or truncated buffer would hash as a decode defect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageReadError {
-    UnsupportedFourcc { fourcc: u32 },
+    UnsupportedFourcc {
+        fourcc: u32,
+    },
     /// Driver substituted a different fourcc from the surface pool's.
-    Fourcc { got: u32, want: u32 },
-    NotTwoPlane { planes: u32 },
+    Fourcc {
+        got: u32,
+        want: u32,
+    },
+    NotTwoPlane {
+        planes: u32,
+    },
     TooSmall {
         image: (u32, u32),
         display: (u32, u32),

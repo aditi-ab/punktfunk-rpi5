@@ -739,9 +739,9 @@ impl Reassembler {
                 reconstructed_shards(&done.blocks, lim.max_data_shards),
             );
             *in_flight_bytes -= frame_cost(&done); // before the truncate below
-            // Slice-stream: bases were in range but may not TILE. A gap or overlap
-            // would stamp `complete` with wrong bytes and no loss counter would move.
-            // Refuse: index is already in `completed`, so count the drop.
+                                                   // Slice-stream: bases were in range but may not TILE. A gap or overlap
+                                                   // would stamp `complete` with wrong bytes and no loss counter would move.
+                                                   // Refuse: index is already in `completed`, so count the drop.
             if done.user_flags & crate::packet::USER_FLAG_SLICE_STREAM != 0 {
                 let total_data = done.frame_bytes.div_ceil(done.shard_bytes).max(1);
                 let mut next = 0usize;
@@ -761,9 +761,9 @@ impl Reassembler {
                 }
             }
             done.buf.truncate(done.frame_bytes); // drop trailing-shard zero padding
-            // Slice-progressive consumers already hold the prefix — hand up only
-            // the suffix (`last`), or the whole AU if nothing was delivered early.
-            // Probe filler stays whole: the speed test accounts AUs, not slices.
+                                                 // Slice-progressive consumers already hold the prefix — hand up only
+                                                 // the suffix (`last`), or the whole AU if nothing was delivered early.
+                                                 // Probe filler stays whole: the speed test accounts AUs, not slices.
             let (data, part) = if deliver_parts && !is_probe {
                 let lo = (done.delivered_shards * shard_bytes).min(done.frame_bytes);
                 let part = FramePart {

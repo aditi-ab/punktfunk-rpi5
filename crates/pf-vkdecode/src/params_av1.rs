@@ -23,7 +23,10 @@ pub const STD_PROFILE_PROFESSIONAL: hh::StdVideoAV1Profile = 2;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamsAv1Error {
     UnsupportedProfile(u8),
-    FieldOverflow { field: &'static str, value: u32 },
+    FieldOverflow {
+        field: &'static str,
+        value: u32,
+    },
     /// Sampling as H.264 `chroma_format_idc`: 0 = monochrome, 2 = 4:2:2, 4 = 4:4:0
     /// (no AV1 profile). None has a picture format here.
     UnsupportedChromaFormat(u8),

@@ -1097,10 +1097,10 @@ mod wire_equivalence_tests {
         let mut client = Session::new(mk(Role::Client), Box::new(ct)).unwrap();
 
         let phases: [(usize, &[usize]); 4] = [
-            (1408, &[3000, 3 * 1408]), // negotiated default (incl. exact multiple)
+            (1408, &[3000, 3 * 1408]),    // negotiated default (incl. exact multiple)
             (512, &[2000, 5 * 512 + 17]), // shrink
-            (8908, &[100_000]),        // grow to jumbo (9000-MTU)
-            (1216, &[2 * 1216 + 9]),   // revert
+            (8908, &[100_000]),           // grow to jumbo (9000-MTU)
+            (1216, &[2 * 1216 + 9]),      // revert
         ];
         let mut pts = 0u64;
         let mut delivered = 0usize;

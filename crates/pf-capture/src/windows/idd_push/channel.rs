@@ -157,7 +157,9 @@ impl ChannelBroker {
             target_id,
             generation,
             ring_len: slots.len() as u32,
-            _pad: 0,
+            // The section really is this large (open.rs allocates `size_of::<SharedHeader>()`), which
+            // is what lets a v3 driver touch the ring-health tail (`frame::v3_readable`).
+            header_bytes: pf_driver_proto::frame::HEADER_V3_SIZE as u32,
             header_handle: 0,
             event_handle: 0,
             texture_handles: [0; control::RING_LEN_USIZE],

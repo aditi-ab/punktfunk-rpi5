@@ -179,7 +179,7 @@ pub fn image_to_dib(bytes: &[u8]) -> Option<Vec<u8>> {
     out.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
     out.extend_from_slice(&((w * h * 4) as u32).to_le_bytes()); // biSizeImage
     out.extend_from_slice(&[0u8; 16]); // XPels/YPels/ClrUsed/ClrImportant
-    // Bottom-up BGRA. 32bpp rows are already 4-byte aligned.
+                                       // Bottom-up BGRA. 32bpp rows are already 4-byte aligned.
     for row in rgba.rows().rev() {
         for px in row {
             let [r, g, b, a] = px.0;

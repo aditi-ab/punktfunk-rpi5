@@ -557,7 +557,7 @@ pub(super) unsafe fn build_parameters_h265(
     vui.flags.set_video_full_range_flag(0); // limited/studio swing
     vui.flags.set_colour_description_present_flag(1);
     vui.video_format = 5; // unspecified — the CICP triplet below is what matters
-    // CICP: 1 = BT.709, 9 = BT.2020 primaries / 2020-NCL matrix, 16 = SMPTE 2084.
+                          // CICP: 1 = BT.709, 9 = BT.2020 primaries / 2020-NCL matrix, 16 = SMPTE 2084.
     let (prim, trc, mat) = if ten_bit { (9, 16, 9) } else { (1, 1, 1) };
     vui.colour_primaries = prim;
     vui.transfer_characteristics = trc;

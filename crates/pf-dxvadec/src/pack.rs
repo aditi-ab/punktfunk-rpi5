@@ -42,12 +42,21 @@ pub enum PackError {
     NoSlices,
     /// Slice range outside the AU: a plan paired with the wrong buffer. Checked
     /// because the alternative is an out-of-bounds index.
-    RangeOutsideAu { start: usize, end: usize, au: usize },
+    RangeOutsideAu {
+        start: usize,
+        end: usize,
+        au: usize,
+    },
     /// Range does not start with an Annex-B start code. The planner only emits
     /// Annex-B, so the AU was mutated between planning and packing.
-    NoStartCode { start: usize },
+    NoStartCode {
+        start: usize,
+    },
     /// Mapping cannot hold the packed AU. Refuse rather than truncate a picture.
-    BufferTooSmall { needed: usize, capacity: usize },
+    BufferTooSmall {
+        needed: usize,
+        capacity: usize,
+    },
     /// Offset or length exceeded `u32` (DXVA record width).
     Overflow(usize),
     /// AV1 ([`mod@crate::pack_av1`]): frame carried no tile data.
@@ -55,9 +64,15 @@ pub enum PackError {
     /// AV1: tile payload is in no tile-group region from the same walk.
     /// Unreachable via [`pf_vkdecode::plan_bitstream`]; the alternative is a
     /// record addressing another tile's bytes.
-    TileOutsideGroup { start: usize, end: usize },
+    TileOutsideGroup {
+        start: usize,
+        end: usize,
+    },
     /// AV1: template record count disagrees with the walk's tile list.
-    TileCountMismatch { records: usize, tiles: usize },
+    TileCountMismatch {
+        records: usize,
+        tiles: usize,
+    },
 }
 
 impl std::fmt::Display for PackError {

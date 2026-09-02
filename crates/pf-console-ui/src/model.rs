@@ -210,8 +210,13 @@ pub enum ConsoleCmd {
     },
     /// Drop a saved host. The next connect to that address has no pin, pairing, or
     /// pinned cards.
-    ForgetHost { key: String },
-    Wake { key: String, then_connect: bool },
+    ForgetHost {
+        key: String,
+    },
+    Wake {
+        key: String,
+        then_connect: bool,
+    },
     /// Stop the wake loop and clear its status.
     CancelWake,
     Probe,
@@ -232,16 +237,24 @@ pub enum ConsoleCmd {
     },
     /// Per-host clipboard share while streaming (`KnownHost::clipboard_sync`).
     /// Never global.
-    SetClipboard { key: String, on: bool },
+    SetClipboard {
+        key: String,
+        on: bool,
+    },
     /// Open a platform-owned overlay (`design/android-skia-console-port.md`).
     /// `id` is [`crate::platform::PlatformScreen::id`]. The host draws it and holds
     /// input; the console never sees the pixels. Desktop raises none.
-    OpenPlatformScreen { id: String },
+    OpenPlatformScreen {
+        id: String,
+    },
     /// Platform-only pad work. `action` is [`crate::screens::controllers::PadAction::id`];
     /// `pad_key` indexes [`crate::screens::Ctx::pads`] and is empty when the pad list
     /// cannot name the device. One command, not one per button: the host's answer is
     /// always "do it, report as a notice", and a command per grant would span three crates.
-    PadAction { action: String, pad_key: String },
+    PadAction {
+        action: String,
+        pad_key: String,
+    },
     /// Invoke a host action (`design/host-actions.md`). Same lane as [`Self::SendLogs`].
     /// Parameterised by `action_id` like [`Self::PadAction`]: a command per verb would
     /// span three crates. Outcome is a notice toast.

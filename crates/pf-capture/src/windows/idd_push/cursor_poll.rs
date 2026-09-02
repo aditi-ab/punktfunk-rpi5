@@ -761,10 +761,7 @@ mod tests {
 
     #[test]
     fn the_and_mask_supplies_alpha_for_an_alpha_less_cursor() {
-        let mut rgba = vec![
-            10, 20, 30, 0,
-            40, 50, 60, 0,
-        ];
+        let mut rgba = vec![10, 20, 30, 0, 40, 50, 60, 0];
         let mask = plane(&[1, 0]); // pixel 0 masked out, pixel 1 kept
         apply_and_mask_alpha(&mut rgba, &mask);
         assert_eq!(px(&rgba, 0), [10, 20, 30, 0], "masked ⇒ transparent");
@@ -787,12 +784,7 @@ mod tests {
     #[test]
     fn a_masked_color_invert_pixel_is_not_transparent() {
         //          (0,0) black  (0,1) red    (1,0) transparent  (1,1) invert
-        let color = vec![
-            0, 0, 0, 0,
-            0xCC, 0, 0, 0,
-            0, 0, 0, 0,
-            0xFF, 0xFF, 0xFF, 0,
-        ];
+        let color = vec![0, 0, 0, 0, 0xCC, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0];
         let mask = plane(&[0, 0, 1, 1]);
         let out = masked_color_to_rgba(&color, &mask, 4, 1);
         assert_eq!(px(&out, 0), OPAQUE_BLACK, "AND=0 colour=0 ⇒ black");

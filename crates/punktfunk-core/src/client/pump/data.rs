@@ -99,8 +99,8 @@ impl DataPump {
         } = self;
         pin_thread_user_interactive(); // frame channel → user-interactive video pump
         register_hot_tid(&pump_hot_tids); // UDP receive + FEC reassembly
-        // Adaptive-FEC loss window. FLAG_PROBE filler would skew it, so
-        // reports are suppressed for the whole speed-test burst.
+                                          // Adaptive-FEC loss window. FLAG_PROBE filler would skew it, so
+                                          // reports are suppressed for the whole speed-test burst.
         const ADAPT_REPORT_INTERVAL: Duration = Duration::from_millis(750);
         let mut last_report = Instant::now();
         // DeliveryReport: every window while packets_received is 0, once

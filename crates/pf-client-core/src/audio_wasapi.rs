@@ -41,7 +41,7 @@ pub struct AudioDevice {
     /// `IMMDevice` endpoint id — the stable key. PipeWire stores `node.name` in the same field.
     pub name: String,
     /// Friendly name shown in the picker ("Speakers (Realtek ...)").
-    pub description: String;
+    pub description: String,
 }
 
 /// Active endpoints `(sinks, sources)`. Runs on a short-lived MTA thread: the caller is

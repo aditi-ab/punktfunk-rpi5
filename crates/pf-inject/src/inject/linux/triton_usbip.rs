@@ -454,7 +454,7 @@ fn build_triton_device(
 ) -> UsbDevice {
     let ep = |addr: u8| UsbEndpoint {
         address: addr,
-        attributes: 0x03,    // interrupt
+        attributes: 0x03, // interrupt
         max_packet_size: 64,
         // Full-speed bInterval is milliseconds, not the HS 2^(n-1)×125 µs exponent.
         // 1 = 1 kHz. Do not "fix" to 4: that is 4 ms / 250 Hz on FS.
