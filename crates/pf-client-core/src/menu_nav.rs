@@ -1,34 +1,24 @@
-//! The controller **menu** vocabulary and its synthesizer, portable: [`MenuEvent`]s (what a
-//! console screen consumes), [`MenuNav`] (raw pad sample → events: edge-triggered buttons,
-//! snapshot-on-entry, stick/D-pad direction with initial-delay auto-repeat) and the pad
-//! descriptors the console's controller chip renders ([`PadInfo`], [`PadBattery`]).
+//! Controller menu vocabulary and synthesizer: [`MenuEvent`], [`MenuNav`], [`PadInfo`].
 //!
-//! Split out of `gamepad` (the SDL3 service, desktop-only) so the Skia console shell can run
-//! on Android, where Kotlin captures the raw pad and hands the same [`MenuSample`]s over JNI.
-//! One synthesizer means one navigation feel on every platform — the repeat cadence, the
-//! dead zone and the hysteresis are decided here and nowhere else.
+//! [`MenuNav`] maps a [`MenuSample`] to rising-edge buttons, snapshot-on-entry,
+//! and stick/D-pad moves with initial-delay auto-repeat. Cadence, dead zone, and
+//! hysteresis live here so desktop SDL and Android JNI share one feel.
 //!
-//! Apple `GamepadMenuInput` parity is the reference for the numbers.
+//! Numbers match Apple `GamepadMenuInput`. Tests in this file pin the cadence.
 
 use punktfunk_core::config::GamepadPref;
 use std::time::{Duration, Instant};
 
-/// Stick deflection below this is ignored for menu navigation (0.5 of full scale — Apple
-/// `GamepadMenuInput` parity; menus want deliberate flicks, not drift).
+/// 0.5 of full scale — Apple `GamepadMenuInput`.
 pub const MENU_DEADZONE: u16 = 16384;
-/// A held direction starts auto-repeating after this initial delay…
+/// Apple `GamepadMenuInput`: 380 ms before auto-repeat.
 pub const MENU_REPEAT_DELAY: Duration = Duration::from_millis(380);
-/// …and then repeats at this cadence until released or changed.
+/// Apple `GamepadMenuInput`: 160 ms between repeats.
 pub const MENU_REPEAT_INTERVAL: Duration = Duration::from_millis(160);
-/// Once a stick direction is ENGAGED it stays engaged until its own axis falls back below
-/// this (0.3 of full scale) — the release threshold of the hysteresis both the Apple and
-/// Android console inputs had to grow on glass. Without it a right flick that leaves the
-/// dead zone slightly diagonal reads UP-then-RIGHT (two moves for one gesture) and a held
-/// stick that wobbles across the dominant-axis boundary jitters between two directions.
+/// 0.3 of full scale. An engaged direction holds until its own axis drops here,
+/// so a diagonal flick does not fire two moves and a wobble does not jitter.
 pub const MENU_RELEASE: u16 = 9830;
-// The hysteresis is only a hysteresis if the release point sits below the engage point; a
-// future "tune the dead zone" edit that crosses them would silently turn this back into the
-// jittery stateless resolver — so the compiler holds the line.
+// Release must sit below engage; crossing them would drop hysteresis silently.
 const _: () = assert!(MENU_RELEASE > 0 && MENU_RELEASE < MENU_DEADZONE);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,31 +29,22 @@ pub enum MenuDir {
     Right,
 }
 
-/// One controller action for the launcher UI, translated from the open pad while menu
-/// mode is on and no session is attached. Buttons are edge-triggered; `Move` debounces
-/// the stick/dpad and auto-repeats ([`MENU_REPEAT_DELAY`]/[`MENU_REPEAT_INTERVAL`]).
+/// One pad action for the launcher UI. Buttons are rising-edge; `Move` auto-repeats
+/// after [`MENU_REPEAT_DELAY`] / [`MENU_REPEAT_INTERVAL`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuEvent {
     Move(MenuDir),
-    /// The left stick's angle as one of the ring's six 60° sectors (design §2.6, D12): fired
-    /// when the sector changes — `Some(k)` for slot `k`, `None` when the stick returns to
-    /// neutral. Only the ring reads it; every list keeps stepping on `Move`.
+    /// Six 60° ring slots. `Some(k)` on change, `None` at rest. Lists still `Move`.
     Sector(Option<u8>),
-    /// A — activate the focused item.
     Confirm,
-    /// B — back / quit.
     Back,
-    /// Y (Apple "secondary"; unused by the launcher today, kept for parity).
     Secondary,
-    /// X (Apple "tertiary"; unused).
     Tertiary,
-    /// L1 — jump back 5.
     JumpBack,
-    /// R1 — jump forward 5.
     JumpForward,
 }
 
-/// Menu haptic pulses — short rumble ticks on the menu pad (never during a stream).
+/// Menu haptic pulse. Never during a stream.
 #[derive(Clone, Copy, Debug)]
 pub enum MenuPulse {
     Move,
@@ -71,7 +52,6 @@ pub enum MenuPulse {
     Boundary,
 }
 
-/// Raw pad state sampled once per worker iteration for menu translation.
 #[derive(Clone, Copy, Default)]
 pub struct MenuSample {
     /// a, b, x, y, l1, r1 — the order [`MenuNav::poll`] maps to events.
@@ -83,36 +63,31 @@ pub struct MenuSample {
     pub dpad: [bool; 4],
 }
 
-/// The pure menu-input state machine (no SDL types — unit-tested below). Port of the
-/// Swift client's `GamepadMenuInput`: the poll after a [`reset`](Self::reset) adopts the
-/// currently-held buttons and direction WITHOUT firing, so a press that crossed a screen
-/// handoff (the B that closed a stream, a held A on mode entry) must be released before
-/// it can act; buttons fire on the rising edge only.
+/// Snapshot-on-reset: the poll after [`reset`](Self::reset) adopts held buttons
+/// and direction without firing; buttons fire on the rising edge only.
 pub struct MenuNav {
-    /// Adopt the next sample silently (set on mode entry / stream detach / pad change).
+    /// Next poll adopts held state without firing (mode entry, stream detach, pad change).
     snapshot_pending: bool,
-    /// Previous button states, [`MenuSample::buttons`] order.
     was: [bool; 6],
     dir: Option<MenuDir>,
-    /// When `dir` engaged — start of the initial-repeat delay.
+    /// Instant `dir` engaged; start of [`MENU_REPEAT_DELAY`].
     dir_since: Instant,
     last_repeat: Instant,
-    /// The ring sector the stick last resolved to (see [`ring_sector`]).
     sector: Option<u8>,
-    /// `sector` went out as an event. A sector the snapshot adopted never did, so its release
-    /// stays silent too — the ring never engaged that stick.
+    /// True once a sector event went out. A snapshot-adopted sector never did,
+    /// so its release stays silent.
     sector_announced: bool,
 }
 
-/// A sector, once engaged, keeps the stick until the angle is this far past its 30° edge —
-/// a stick resting on the boundary between two slots would otherwise flicker between them.
+/// Hold this many degrees past a 30° sector edge so a stick on the boundary does not flicker.
 pub const SECTOR_OVERLAP_DEG: f32 = 5.0;
 
-/// The ring slot the left stick points at, given the sector already engaged: past the
-/// deadzone (by magnitude — a diagonal counts) the angle falls into one of six 60° sectors
-/// centred on the slots (slot `k` sits at `-90° + 60°·k`, 12 o'clock first, clockwise). An
-/// engaged sector holds until the stick drops under [`MENU_RELEASE`] (then `None`) or the
-/// angle leaves it by [`SECTOR_OVERLAP_DEG`]. SDL sticks are +y = down.
+/// Ring slot for the left stick, given the sector already engaged.
+///
+/// Past the deadzone by magnitude (a diagonal counts), angle falls into six 60°
+/// sectors: slot `k` at `-90° + 60°·k`, 12 o'clock first, clockwise. An engaged
+/// sector holds until magnitude < [`MENU_RELEASE`] or the angle leaves by
+/// [`SECTOR_OVERLAP_DEG`]. SDL sticks are +y = down.
 pub fn ring_sector(lx: i16, ly: i16, current: Option<u8>) -> Option<u8> {
     let (x, y) = (f32::from(lx), f32::from(ly));
     let mag = x.hypot(y);
@@ -124,7 +99,7 @@ pub fn ring_sector(lx: i16, ly: i16, current: Option<u8>) -> Option<u8> {
     if mag <= floor {
         return None;
     }
-    // Degrees clockwise from 12 o'clock, so slot k's centre is at 60·k.
+    // Degrees clockwise from 12 o'clock; slot k's centre is 60·k.
     let deg = (y.atan2(x).to_degrees() + 90.0).rem_euclid(360.0);
     if let Some(k) = current {
         let off = (deg - 60.0 * f32::from(k) + 180.0).rem_euclid(360.0) - 180.0;
@@ -154,7 +129,7 @@ impl MenuNav {
         }
     }
 
-    /// Arm the snapshot: the next poll adopts held state without firing.
+    /// Next poll adopts held state without firing.
     pub fn reset(&mut self) {
         self.snapshot_pending = true;
         self.dir = None;
@@ -162,8 +137,7 @@ impl MenuNav {
         self.sector_announced = false;
     }
 
-    /// Direction from the left stick (dominant axis wins past the deadzone), falling back
-    /// to the discrete dpad. SDL sticks are +y = down.
+    /// Dominant axis past the deadzone, else dpad. SDL +y = down.
     pub fn resolve_dir(s: &MenuSample) -> Option<MenuDir> {
         let (ax, ay) = (s.lx.unsigned_abs(), s.ly.unsigned_abs());
         if ax > MENU_DEADZONE || ay > MENU_DEADZONE {
@@ -193,9 +167,8 @@ impl MenuNav {
         }
     }
 
-    /// Does the STICK still hold `d` past the release threshold? The hysteresis half of
-    /// direction resolution: an engaged direction is only re-resolved once its own axis has
-    /// let go, so the dominant-axis rule never flips a direction mid-gesture.
+    /// True while this stick axis is still past [`MENU_RELEASE`]. Holds the
+    /// engaged direction so dominant-axis cannot flip mid-gesture.
     fn stick_holds(s: &MenuSample, d: MenuDir) -> bool {
         match d {
             MenuDir::Left => s.lx < -(MENU_RELEASE as i16),
@@ -205,9 +178,6 @@ impl MenuNav {
         }
     }
 
-    /// The direction this sample resolves to GIVEN what is already engaged: a stick-held
-    /// direction persists until its own axis releases (see [`MENU_RELEASE`]); otherwise the
-    /// stateless [`Self::resolve_dir`] answers.
     fn resolve_engaged(&self, s: &MenuSample) -> Option<MenuDir> {
         match self.dir {
             Some(d) if Self::stick_holds(s, d) => Some(d),
@@ -228,9 +198,8 @@ impl MenuNav {
             self.sector_announced = false;
             return;
         }
-        // The sector goes out BEFORE the buttons and the four-way move of the same sample, so
-        // the ring has engaged the stick by the time the move that would step it arrives, and
-        // an A in the same sample lands on the slot the stick points at.
+        // Sector before buttons and Move of the same sample, so the ring is
+        // engaged before a step, and A lands on the slot the stick points at.
         if sector != self.sector {
             self.sector = sector;
             if sector.is_some() || self.sector_announced {
@@ -238,7 +207,6 @@ impl MenuNav {
             }
             self.sector_announced = sector.is_some();
         }
-        // buttons order a, b, x, y, l1, r1 → the matching event per index.
         const EVENTS: [MenuEvent; 6] = [
             MenuEvent::Confirm,
             MenuEvent::Back,
@@ -274,61 +242,38 @@ impl MenuNav {
 #[derive(Clone, Debug)]
 pub struct PadInfo {
     pub name: String,
-    /// Stable identity (`vid:pid:name`) for pinning across restarts — SDL instance ids are
-    /// per-run, so [`Settings::forward_pad`](crate::trust::Settings) persists this instead.
+    /// `vid:pid:name`. SDL instance ids are per-run; [`Settings::forward_pad`](crate::trust::Settings) persists this.
     pub key: String,
-    /// The virtual pad "Automatic" resolves to for this physical controller (so the host creates a
-    /// matching pad: DualSense → DualSense, DS4 → DualShock 4, Xbox One/Series → Xbox One, anything
-    /// else → Xbox 360). Drives [`GamepadService::auto_pref`] and the rich-feedback render path.
+    /// What "Automatic" resolves this physical pad to. Fallback is Xbox 360.
     pub pref: GamepadPref,
-    /// Steam Input's emulated pad ("Steam Virtual Gamepad", Valve 28de:11ff). It shadows the
-    /// physical controller and has no sensors/touchpad, so auto-selection skips it while a real
-    /// pad is connected — otherwise gyro silently dies on Bazzite/Deck game mode.
+    /// Steam Input's emulated pad (Valve 28de:11ff). Shadows the physical
+    /// controller and has no sensors, so auto-selection skips it while a real pad is connected.
     pub steam_virtual: bool,
-    /// The pad's own power state, when it reports one. Purely LOCAL SDL state — nothing about
-    /// this crosses the wire, so it is additive with no ABI implication whatever.
-    ///
-    /// `None` is the common case, not an error: a wired pad has nothing to report, and Steam's
-    /// virtual gamepad reports nothing about the physical device behind it. Anything reading
-    /// this must degrade to "no battery shown" rather than to "0 %".
+    /// Local SDL power state. `None` is wired / unreported — show no battery, not 0 %.
     pub battery: Option<PadBattery>,
-    /// The identity line the console's controllers screen shows under the name —
-    /// `VID:PID · gamepad · dpad`. Support's first question when a pad "doesn't work" is
-    /// whether the OS enumerated the pad or the adapter in front of it, and the name alone
-    /// never answers that. Written by whoever enumerated the device; empty is "nothing more
-    /// to say", never an error.
+    /// Line under the name (`VID:PID · gamepad · dpad`). Empty is not an error.
     pub detail: String,
-    /// Actually forwarded to the host: a real, non-virtual controller the OS classifies as a
-    /// GAMEPAD. A joystick-only node — an adapter that enumerates as a bare joystick, a
-    /// DualSense's motion-sensor sibling — is listed and NOT forwarded, which is the single
-    /// most common cause of "my pad is connected and nothing happens".
+    /// Forwarded: real, non-virtual, OS-classified GAMEPAD. Joystick siblings are listed, not forwarded.
     pub forwarded: bool,
-    /// The device reports a rumble motor. `false` is what turns the controllers screen's
-    /// rumble test into the sentence explaining why host rumble will be silent on this pad.
     pub rumble: bool,
 }
 
-/// A controller's power state, as SDL reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PadBattery {
-    /// 0–100. SDL gives −1 for "on power but level unknown", which callers map to `None`
-    /// rather than storing here.
+    /// 0–100. SDL −1 ("on power, level unknown") is mapped to `None` by callers.
     pub percent: u8,
-    /// On the cable (or dock) right now. Worth showing separately: a pad at 4 % that is
-    /// charging is not the problem a pad at 4 % that is not.
     pub charging: bool,
 }
 
 impl PadInfo {
-    /// A short controller-kind label for the Settings list (`""` for a plain Xbox/standard pad).
+    /// Settings-list kind; `""` for a plain Xbox / standard pad.
     pub fn kind_label(&self) -> &'static str {
         match self.pref {
             GamepadPref::DualSense => "DualSense",
             GamepadPref::DualSenseEdge => "DualSense Edge",
             GamepadPref::DualShock4 => "DualShock 4",
             GamepadPref::XboxOne => "Xbox One",
-            // Unreachable from `pref_for_type` today — SDL has no Elite `GamepadType` — but a
-            // pinned setting can carry it, and an empty label there reads as a plain Xbox pad.
+            // SDL has no Elite GamepadType, but a pinned setting can carry it.
             GamepadPref::XboxElite => "Xbox Elite Series 2",
             GamepadPref::SteamDeck => "Steam Deck",
             GamepadPref::SteamController => "Steam Controller",
@@ -359,14 +304,10 @@ mod menu_nav_tests {
         let mut nav = MenuNav::new();
         let t = Instant::now();
         let mut held = sample();
-        held.buttons[0] = true; // A held on entry
-        held.lx = 30000; // stick already deflected right
+        held.buttons[0] = true; // A
+        held.lx = 30000; // right
         assert!(events(&mut nav, &held, t).is_empty(), "snapshot poll fired");
-        // Still held: nothing (no rising edge, direction unchanged since snapshot).
         assert!(events(&mut nav, &held, t + Duration::from_millis(10)).is_empty());
-        // Release — silently, the adopted sector included — then press again → now it
-        // fires, the ring's sector first so an A in the same sample lands on the slot the
-        // stick points at.
         assert!(events(&mut nav, &sample(), t + Duration::from_millis(20)).is_empty());
         assert_eq!(
             events(&mut nav, &held, t + Duration::from_millis(30)),
@@ -384,7 +325,7 @@ mod menu_nav_tests {
         let t = Instant::now();
         events(&mut nav, &sample(), t); // consume the snapshot
         let mut s = sample();
-        s.buttons[1] = true; // B down
+        s.buttons[1] = true; // B
         assert_eq!(
             events(&mut nav, &s, t + Duration::from_millis(10)),
             vec![MenuEvent::Back]
@@ -417,27 +358,21 @@ mod menu_nav_tests {
         let t = Instant::now();
         events(&mut nav, &sample(), t);
         let mut s = sample();
-        s.dpad[3] = true; // dpad right
-                          // Engage: fires immediately.
+        s.dpad[3] = true; // right
         assert_eq!(
             events(&mut nav, &s, t + Duration::from_millis(10)),
             vec![MenuEvent::Move(MenuDir::Right)]
         );
-        // Inside the initial delay: silent.
         assert!(events(&mut nav, &s, t + Duration::from_millis(300)).is_empty());
-        // Past the delay: repeats…
         assert_eq!(
             events(&mut nav, &s, t + Duration::from_millis(400)),
             vec![MenuEvent::Move(MenuDir::Right)]
         );
-        // …but not faster than the interval…
         assert!(events(&mut nav, &s, t + Duration::from_millis(500)).is_empty());
-        // …and again once it elapses.
         assert_eq!(
             events(&mut nav, &s, t + Duration::from_millis(570)),
             vec![MenuEvent::Move(MenuDir::Right)]
         );
-        // Release cancels; re-engage fires immediately again.
         assert!(events(&mut nav, &sample(), t + Duration::from_millis(580)).is_empty());
         assert_eq!(
             events(&mut nav, &s, t + Duration::from_millis(590)),
@@ -454,8 +389,7 @@ mod menu_nav_tests {
         right.lx = 30000;
         let mut left = sample();
         left.lx = -30000;
-        // The ring's sector rides ahead of every stick move (3 o'clock is the edge between
-        // slots 1 and 2, 9 o'clock between 4 and 5).
+        // 3 o'clock is the 1/2 edge; 9 o'clock is 4/5.
         assert_eq!(
             events(&mut nav, &right, t + Duration::from_millis(10)),
             vec![MenuEvent::Sector(Some(2)), MenuEvent::Move(MenuDir::Right)]
@@ -468,7 +402,6 @@ mod menu_nav_tests {
 
     #[test]
     fn direction_resolution() {
-        // Below the deadzone: nothing.
         let mut s = sample();
         s.lx = MENU_DEADZONE as i16;
         assert_eq!(MenuNav::resolve_dir(&s), None);
@@ -482,18 +415,15 @@ mod menu_nav_tests {
         assert_eq!(MenuNav::resolve_dir(&s), Some(MenuDir::Right));
         s.lx = -26000;
         assert_eq!(MenuNav::resolve_dir(&s), Some(MenuDir::Left));
-        // Dpad fallback…
         let mut d = sample();
         d.dpad[1] = true;
         assert_eq!(MenuNav::resolve_dir(&d), Some(MenuDir::Down));
-        // …but the stick overrides it.
         d.lx = 30000;
         assert_eq!(MenuNav::resolve_dir(&d), Some(MenuDir::Right));
     }
 
     #[test]
     fn the_stick_angle_picks_a_ring_sector_with_hysteresis() {
-        // Neutral, and the deadzone by magnitude: a diagonal just past it counts.
         assert_eq!(ring_sector(0, 0, None), None);
         assert_eq!(
             ring_sector(12000, 12000, None),
@@ -501,17 +431,15 @@ mod menu_nav_tests {
             "16 971 > 16 384, 45° = slot 2"
         );
         assert_eq!(ring_sector(11000, 11000, None), None, "15 556 < 16 384");
-        // The six centres, 12 o'clock first, clockwise (SDL +y = down).
+        // Six centres, 12 o'clock first, clockwise (SDL +y = down).
         assert_eq!(ring_sector(0, -30000, None), Some(0));
         assert_eq!(ring_sector(26000, -15000, None), Some(1));
         assert_eq!(ring_sector(26000, 15000, None), Some(2));
         assert_eq!(ring_sector(0, 30000, None), Some(3));
         assert_eq!(ring_sector(-26000, 15000, None), Some(4));
         assert_eq!(ring_sector(-26000, -15000, None), Some(5));
-        // 28° off slot 0 toward slot 1 is still slot 0 …
         let (x, y) = (14084, -26489); // 30 000 at 28°
         assert_eq!(ring_sector(x, y, None), Some(0));
-        // … and 32° past the edge stays with an engaged slot 0, flips fresh to slot 1.
         let (x, y) = (15897, -25441); // 30 000 at 32°
         assert_eq!(
             ring_sector(x, y, Some(0)),
@@ -524,7 +452,7 @@ mod menu_nav_tests {
             Some(1),
             "36° from slot 5's edge lets go"
         );
-        // An engaged sector releases only under MENU_RELEASE, not at the deadzone.
+        // Engaged sector releases under MENU_RELEASE, not the deadzone.
         assert_eq!(ring_sector(0, -12000, Some(0)), Some(0));
         assert_eq!(ring_sector(0, -9000, Some(0)), None);
     }
@@ -556,9 +484,7 @@ mod menu_nav_tests {
 
     #[test]
     fn engaged_direction_holds_until_its_own_axis_releases() {
-        // The on-glass "random jumps": a stick engaged DOWN drifts right past the
-        // dominant-axis boundary while ly is still well above the release threshold. The
-        // stateless resolver would say RIGHT; the engaged direction must hold.
+        // Engaged DOWN holds while ly is above MENU_RELEASE even if lx dominates.
         let mut nav = MenuNav::new();
         let t = Instant::now();
         events(&mut nav, &sample(), t);
@@ -576,13 +502,12 @@ mod menu_nav_tests {
             "the dominant-axis flip fired RIGHT while DOWN was still engaged; the ring's \
              sector, which has no axis to hold, followed the angle to 4 o'clock"
         );
-        // Only once ly lets go does the stick re-resolve — to RIGHT, immediately.
         s.ly = 5_000;
         assert_eq!(
             events(&mut nav, &s, t + Duration::from_millis(30)),
             vec![MenuEvent::Move(MenuDir::Right)]
         );
-        // And a clean reversal on the same axis still fires at once (no hold across sign).
+        // No hold across sign.
         s.lx = -30_000;
         assert_eq!(
             events(&mut nav, &s, t + Duration::from_millis(40)),

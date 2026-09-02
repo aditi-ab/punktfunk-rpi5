@@ -1,62 +1,55 @@
-//! On-disk store for log bundles PAIRED CLIENTS upload to this host.
+//! On-disk store for log bundles paired clients upload to this host.
 //!
-//! Why this exists: on locked-down client platforms (a Steam Deck in Gaming Mode, tvOS, webOS)
-//! the user has no realistic way to get the client's own log off the device — so every field
-//! report from those platforms arrives host-log-only, and the client half of the story
-//! (de-jitter, decode rungs, playout underruns) is invisible. "Send logs to host" inverts that:
-//! the client POSTs its recent log over the management API with its paired mTLS cert, the bundle
-//! lands here, and the web console lists it next to the host's own log export — one place to
-//! collect both halves.
+//! Locked-down clients (Steam Deck Gaming Mode, tvOS, webOS) cannot export
+//! their own log, so a report would otherwise be host-only. The client POSTs
+//! recent log over the management API with its paired mTLS cert; the web
+//! console lists the bundle next to the host export.
 //!
-//! Deliberately a FILE store, not `log_capture::ring()`: the ring holds the host's newest ~4096
-//! entries, and ingesting a multi-thousand-line client bundle there would evict the host log —
-//! destroying the other half of the very report this feature exists to complete. The host log
-//! gets one INFO breadcrumb per received bundle instead.
+//! A file store, not `log_capture::ring()`: ingesting a multi-thousand-line
+//! bundle into the host's ~4096-entry ring would evict the host half. The host
+//! log gets one INFO breadcrumb per received bundle instead.
 //!
-//! Quota: a paired device may upload at will, so the store must be bounded without operator
-//! attention — per device (by fingerprint prefix) only the newest [`KEEP_PER_DEVICE`] bundles
-//! survive, and a single bundle is capped at [`MAX_BUNDLE_BYTES`] by the endpoint. Paired
-//! devices are operator-admitted and enumerable, so the total is bounded too.
+//! Quota: a paired device may upload at will. Only the newest
+//! [`KEEP_PER_DEVICE`] bundles per fingerprint prefix survive; the endpoint
+//! caps one bundle at [`MAX_BUNDLE_BYTES`]. Paired devices are enumerable, so
+//! the total is bounded too.
 
 use serde::Serialize;
 use std::path::PathBuf;
 use utoipa::ToSchema;
 
-/// Newest bundles kept per device; older ones are pruned on the next upload from that device.
+/// Pruned on that device's next upload; no sweeper.
 pub const KEEP_PER_DEVICE: usize = 5;
 
-/// Upload size cap, enforced by the endpoint before the store sees the body. Client rings render
-/// to a few hundred KiB; anything past this is not a log bundle.
+/// Endpoint size cap. Client rings render to a few hundred KiB; past 1 MiB is not a log.
 pub const MAX_BUNDLE_BYTES: usize = 1024 * 1024;
 
-/// The default store directory: `<config-dir>/client-logs/`, beside `captures/`.
+/// `<config-dir>/client-logs/`, beside `captures/`.
 pub fn default_dir() -> PathBuf {
     pf_paths::config_dir().join("client-logs")
 }
 
-/// One stored bundle, as the console lists it.
 #[derive(Clone, Serialize, ToSchema)]
 pub struct ClientLogMeta {
-    /// The bundle id (its filename stem) — pass to the fetch/delete endpoints.
+    /// Filename stem; pass to fetch/delete.
     pub id: String,
-    /// The paired device's name at upload time (sanitized for the filesystem).
+    /// Paired device name at upload, filesystem-sanitized.
     pub device_name: String,
-    /// First 16 hex chars of the device's pairing fingerprint — enough to correlate with the
-    /// paired-devices roster without repeating the full identity in every filename.
+    /// First 16 hex chars of the pairing fingerprint — enough to match the roster
+    /// without repeating the full identity in every filename.
     pub fingerprint_prefix: String,
-    /// Upload time (unix ms, from the file's mtime).
+    /// Upload time (unix ms from the file mtime, not the stem timestamp).
     pub received_ms: u64,
-    /// Bundle size in bytes.
     pub size_bytes: u64,
 }
 
-/// The store: a flat directory of `<ts>_<fp16>_<name>.log` files.
+/// Flat directory of `<ts>_<fp16>_<name>.log` files.
 pub struct ClientLogStore {
     dir: PathBuf,
 }
 
-/// Same id gate as `stats_recorder::valid_id`: the exact charset [`bundle_id`] emits, and the
-/// charset excludes `/` and `\`, so `dir.join(id + ".log")` is always a single child of `dir`.
+/// Same charset [`bundle_id`] emits. Excludes `/` and `\`, so `dir.join(id + ".log")`
+/// is always a single child of `dir`.
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id != "."
@@ -66,8 +59,8 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// Squeeze a paired device's display name into the id charset (never empty — the id must parse
-/// back into its three fields, and an all-symbols name would otherwise leave a dangling `_`).
+/// Never empty: the id must parse back into three fields, and an all-symbols
+/// name would leave a dangling `_`.
 fn sanitize_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -88,9 +81,9 @@ fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// `2026-08-15T10-22-33Z_9785592d05ef1234_SteamDeck` — timestamp first so a plain directory sort
-/// is newest-last, dashes (not colons) in the time so the stem is a valid Windows filename.
-/// Underscores separate the three fields, so name/fp keep to `[A-Za-z0-9.-]`.
+/// `{ISO-date}T{h-m-s}Z_{fp16}_{name}` — timestamp first so a directory sort is
+/// newest-last; dashes (not colons) so the stem is a valid Windows filename.
+/// Underscores separate the three fields; name/fp stay `[A-Za-z0-9.-]`.
 fn bundle_id(unix_ms: u64, fp_hex: &str, name: &str) -> String {
     let secs = (unix_ms / 1000) as i64;
     let days = secs.div_euclid(86_400);
@@ -109,11 +102,8 @@ fn bundle_id(unix_ms: u64, fp_hex: &str, name: &str) -> String {
 }
 
 impl ClientLogStore {
-    /// Open the store, creating `dir` (owner-private, best-effort) if missing. `create_secret_dir`,
-    /// not `create_private_dir`: on Windows the latter grants `BUILTIN\Users` an inheritable read,
-    /// which every stored bundle then inherited — any local user could read them straight off disk,
-    /// which is not the "reading them stays on the loopback-only bearer lane" split `mgmt::client_logs`
-    /// documents (security-review 2026-08-25).
+    /// `create_secret_dir`, not `create_private_dir`: on Windows the latter grants
+    /// `BUILTIN\Users` an inheritable read, and every stored bundle would inherit it.
     pub fn new(dir: PathBuf) -> std::sync::Arc<Self> {
         if let Err(e) = pf_paths::create_secret_dir(&dir) {
             tracing::warn!(dir = %dir.display(), error = %e, "could not create client-logs dir");
@@ -121,15 +111,12 @@ impl ClientLogStore {
         std::sync::Arc::new(ClientLogStore { dir })
     }
 
-    /// Store a bundle from the paired device `fp_hex` named `device_name`; returns the new id.
-    /// Prunes that device's older bundles past [`KEEP_PER_DEVICE`] (best-effort).
+    /// Prunes that device past [`KEEP_PER_DEVICE`].
     pub fn save(&self, fp_hex: &str, device_name: &str, body: &[u8]) -> std::io::Result<String> {
         let id = bundle_id(unix_ms_now(), fp_hex, device_name);
-        // A bundle is whatever the client logged (addresses, host names) — owner-only, like the
-        // host's own secrets, so the dir ACL is not the only thing keeping it off a local user.
+        // Body may contain addresses and host names; owner-only, like host secrets.
+        // The dir ACL is not the only gate.
         pf_paths::write_secret_file(&self.dir.join(format!("{id}.log")), body)?;
-        // Prune this device's older bundles. The fp16 field is position 2 of the stem, and ids
-        // sort chronologically because the timestamp leads.
         let fp16: String = fp_hex
             .chars()
             .filter(char::is_ascii_alphanumeric)
@@ -149,7 +136,6 @@ impl ClientLogStore {
         Ok(id)
     }
 
-    /// Every stored bundle's metadata, newest first.
     pub fn list(&self) -> Vec<ClientLogMeta> {
         let mut out: Vec<ClientLogMeta> = self
             .stems()
@@ -175,12 +161,12 @@ impl ClientLogStore {
                 })
             })
             .collect();
-        out.sort_by(|a, b| b.id.cmp(&a.id)); // timestamp-led stems ⇒ lexicographic = chronological
+        out.sort_by(|a, b| b.id.cmp(&a.id)); // timestamp-led stem ⇒ lex = chronological
         out
     }
 
-    /// The full bundle body for `id`. `NotFound` for unknown AND invalid ids — an id that fails
-    /// the charset gate must be indistinguishable from an absent one.
+    /// Bundle body for `id`. Unknown AND invalid ids are `NotFound` so a charset
+    /// miss is indistinguishable from absence.
     pub fn load(&self, id: &str) -> std::io::Result<Vec<u8>> {
         if !valid_id(id) {
             return Err(std::io::ErrorKind::NotFound.into());
@@ -188,7 +174,6 @@ impl ClientLogStore {
         std::fs::read(self.dir.join(format!("{id}.log")))
     }
 
-    /// Delete the bundle `id` (same invalid-id handling as [`Self::load`]).
     pub fn delete(&self, id: &str) -> std::io::Result<()> {
         if !valid_id(id) {
             return Err(std::io::ErrorKind::NotFound.into());
@@ -196,7 +181,6 @@ impl ClientLogStore {
         std::fs::remove_file(self.dir.join(format!("{id}.log")))
     }
 
-    /// Filename stems of every `.log` in the store (unsorted).
     fn stems(&self) -> Vec<String> {
         let Ok(rd) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
@@ -216,9 +200,9 @@ mod tests {
     use super::*;
 
     fn store() -> (std::sync::Arc<ClientLogStore>, PathBuf) {
-        // pid+timestamp alone COLLIDED: the tests run in parallel in one process and both can
-        // land on the same millisecond — then one test's cleanup deletes the other's live dir.
-        // A process-wide counter makes each call unique regardless of timing.
+        // pid+timestamp collided: tests run in parallel in one process and can
+        // share a millisecond, then one cleanup deletes the other's live dir.
+        // A process-wide counter is unique regardless of timing.
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "pf-client-logs-test-{}-{}",
@@ -268,14 +252,12 @@ mod tests {
     #[test]
     fn per_device_quota_prunes_oldest() {
         let (s, dir) = store();
-        // Same device, KEEP_PER_DEVICE + 2 uploads. Ids share a second-resolution timestamp in a
-        // fast test, so disambiguate chronology by writing distinct bodies and checking survival
-        // by count + the other device's bundle being untouched.
+        // Same device, KEEP_PER_DEVICE + 2. Ids share a 1 s timestamp in a fast
+        // test, so check survival by count; the other device must stay untouched.
         let other = s.save("ffff00000000000000", "other", b"keep me").unwrap();
         let mut ids = Vec::new();
         for i in 0..(KEEP_PER_DEVICE + 2) {
-            // Distinct mtime-independent ids: the timestamp field has 1 s resolution, so append
-            // uniqueness through the name (the id embeds it).
+            // Timestamp field is 1 s; uniqueness goes through the name (embedded in the id).
             ids.push(
                 s.save("abcdef0123456789", &format!("dev{i}"), b"x")
                     .unwrap(),
@@ -291,8 +273,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A bundle is stored owner-only — the unix half of "reading them stays on the loopback-only
-    /// bearer lane"; on Windows the same `write_secret_file` call applies the SYSTEM/Admins DACL.
     #[cfg(unix)]
     #[test]
     fn stored_bundles_are_not_world_readable() {

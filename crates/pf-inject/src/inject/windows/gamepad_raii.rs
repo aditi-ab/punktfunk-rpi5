@@ -1,57 +1,19 @@
-//! Per-pad Windows resource RAII + the **sealed gamepad channel** broker (DualSense / DualShock 4 /
-//! XUSB backends).
+//! Per-pad Windows RAII and the sealed gamepad channel (DualSense / DualShock 4 / XUSB).
 //!
-//! Each virtual pad owns three OS resources: the **unnamed** DATA section the `pf_gamepad`/`pf_xusb`
-//! driver works against (`XusbShm`/`PadShm`), the tiny **named** bootstrap mailbox
-//! (`pf_driver_proto::gamepad::PadBootstrap`) that hands the driver a duplicated handle to it, and the
-//! `SwDeviceCreate`'d software devnode the driver loads on. [`Shm`] and [`SwDevice`] own the resources
-//! with RAII; [`PadChannel`] owns the two sections plus the delivery handshake.
+//! Each pad owns three OS objects: an unnamed DATA section (`XusbShm`/`PadShm`), a named
+//! [`PadBootstrap`] mailbox, and a `SwDeviceCreate` devnode. [`Shm`] and [`SwDevice`] own the
+//! handles; [`PadChannel`] owns both sections and the delivery handshake.
 //!
-//! **Why the channel is sealed** (`design/gamepad-channel-sealing.md`): the DATA section used to be a
-//! `Global\pf…-shm-<index>` named section with an SY+LS DACL, which let any *sibling LocalService*
-//! process open it by name to read the live controller input or inject/forge input and rumble — the
-//! same name-open vector the frame ring closed (`design/idd-push-security.md`). The DATA section is now
-//! UNNAMED with a SYSTEM-only DACL and reaches the driver exclusively as a handle this host duplicated
-//! into its WUDFHost (a duplicated handle carries the source's access, so no LS ACE is needed). The pad
-//! drivers are UMDF HID minidrivers with **no control device** (hidclass owns the stack), so unlike the
-//! frame channel there is no IOCTL to deliver the handle or learn the WUDFHost pid — hence the
-//! late-bound [`PadBootstrap`] mailbox handshake, the one *named* object left.
+//! The DATA section is unnamed and SYSTEM-only; the driver receives it as a duplicated handle.
+//! The mailbox is the only named object because a UMDF HID minidriver has no control device.
+//! [`PadChannel::pump`] duplicates into the pid the bound devnode reports ([`channel_proof`]),
+//! never into the mailbox's `driver_pid`. A delivery stands until that process exits, judged on
+//! a retained `SYNCHRONIZE` handle. No `SwDeviceCreate` instance id → no delivery, unless
+//! [`TRUST_MAILBOX_ENV`] is set.
 //!
-//! **What the mailbox is worth to an attacker** (corrected, security-review 2026-07-28). It carries
-//! pids and a handle VALUE, and a handle value IS meaningless outside its process — but the mailbox
-//! also *chooses that process*, and it is writable by LocalService (the SDDL the driver's WUDFHost
-//! needs to open it by name). The delivery gate, [`pf_capture::verify_is_wudfhost`], authenticates an
-//! IMAGE PATH, and `%SystemRoot%\System32\WUDFHost.exe` is world-executable: a LocalService principal
-//! — the de-privileged plugin runner, or any other compromised LocalService service — can spawn its
-//! own suspended WUDFHost, publish that pid, and be handed `SECTION_MAP_READ|WRITE` on this pad's DATA
-//! section. That is forged HID input into the interactive desktop (the pf-mouse section drives a real
-//! absolute pointer) and a read of the remote user's live controller state — so the earlier claim that
-//! mailbox tampering "yields at worst a gamepad DoS, never a read or an injection" was wrong. (The
-//! frame channel is NOT exposed this way: its WUDFHost pid arrives over the pf-vdisplay control
-//! device, whose DACL is SYSTEM + Administrators.)
-//!
-//! **How v3 closes it.** The mailbox no longer decides anything. [`PadChannel::pump`] asks the
-//! DEVNODE which process is serving it — [`channel_proof`], the host half of
-//! `pf_driver_proto::gamepad::ChannelProof` — and duplicates into that answer. Only the driver PnP
-//! actually bound to the device we `SwDeviceCreate`d can answer that device's I/O, and the lookup is
-//! keyed by the instance id PnP handed back, so neither a spawned WUDFHost nor a planted look-alike
-//! devnode is in the running. `driver_pid` survives as a liveness hint and nothing more; a tamperer
-//! can still deny a pad, but denial was always available (squat the name) and is not what mattered.
-//!
-//! Two further rules make the state machine hold up around it:
-//! * **One live target.** A delivery stands until its target process EXITS, judged on a retained
-//!   `SYNCHRONIZE` handle so a recycled pid cannot fake it. UMDF's genuine
-//!   restart-the-host-after-a-driver-crash path still re-attaches; nothing else displaces a live one.
-//! * **No unproved delivery.** A pad with no `SwDeviceCreate` devnode (the out-of-band `devgen`
-//!   bring-up path) has nothing to ask, so it refuses to deliver rather than fall back to the
-//!   mailbox — unless an operator sets [`TRUST_MAILBOX_ENV`], which says so loudly in the log.
-//!
-//! What is NOT claimed: this authenticates the *devnode*, not the driver binary. An attacker who can
-//! already replace the installed, signed driver package owns the endpoint by definition — that is the
-//! same floor the frame channel accepts, and it sits above the SECURITY.md admin/SYSTEM boundary.
+//! Evidence: `design/gamepad-channel-sealing.md`.
 
 use super::channel_proof;
-/// Re-exported so a pad backend needs only one `use` to wire up its channel.
 pub(super) use super::channel_proof::ProofTransport;
 use crate::pad_slots::PadCreateFault;
 use anyhow::{anyhow, Context, Result};
@@ -85,30 +47,23 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
 };
 
-/// Least access the pad driver needs on the duplicated DATA section: it only MAPS it read/write, so
-/// `SECTION_MAP_READ | SECTION_MAP_WRITE` (== the driver's `FILE_MAP_RW`). Granted explicitly in
-/// [`PadChannel::deliver_to`] instead of `DUPLICATE_SAME_ACCESS` (least privilege for the sealed
-/// section — the driver's handle then can't take ownership / change security / delete the object).
+/// `SECTION_MAP_READ | SECTION_MAP_WRITE` — what the pad driver maps. Granted in
+/// [`PadChannel::deliver_to`] instead of `DUPLICATE_SAME_ACCESS`, so the remote handle
+/// cannot take ownership, change security, or delete the section.
 const SECTION_MAP_RW: u32 = 0x0004 | 0x0002;
 
-/// An anonymous (pagefile-backed) shared section + its mapped read/write view. RAII: drop unmaps the
-/// view, then the [`OwnedHandle`] closes the section handle (in that order). Created either
-/// [unnamed](Self::create_unnamed) (the sealed DATA section — reachable only by handle duplication) or
-/// [named](Self::create_named) (the bootstrap mailbox the driver opens by name).
+/// Pagefile-backed section plus its mapped RW view. Drop unmaps the view, then the
+/// [`OwnedHandle`] closes the section. Unnamed = sealed DATA; named = bootstrap mailbox.
 pub(super) struct Shm {
-    /// Owns the section handle (closed on drop). Also the duplication source for the sealed channel —
-    /// see [`Shm::raw_handle`].
+    /// Duplication source for the sealed channel.
     handle: OwnedHandle,
     view: MEMORY_MAPPED_VIEW_ADDRESS,
 }
 
-/// Owns an SDDL-derived `SECURITY_ATTRIBUTES` **and** the OS-allocated security descriptor its
-/// `lpSecurityDescriptor` points at (`ConvertStringSecurityDescriptorToSecurityDescriptorW`
-/// `LocalAlloc`s the descriptor). Drop `LocalFree`s it, so a `SecAttr` must outlive every
-/// `CreateFileMappingW` that borrows its `sa`: the section copies the security info at create time, so
-/// freeing after the create returns is safe — hence [`Shm::create_named`] builds one `SecAttr` before
-/// its squat-retry loop and reuses it across attempts instead of re-allocating (and re-leaking) per
-/// attempt.
+/// SDDL `SECURITY_ATTRIBUTES` plus the `LocalAlloc`'d descriptor it points at.
+/// Drop `LocalFree`s the descriptor. Must outlive every `CreateFileMappingW` that
+/// borrows `sa` — the section copies the DACL at create time, so free after return
+/// is safe. [`Shm::create_named`] builds one and reuses it across squat retries.
 struct SecAttr {
     sa: SECURITY_ATTRIBUTES,
     psd: PSECURITY_DESCRIPTOR,
@@ -117,18 +72,14 @@ struct SecAttr {
 impl Drop for SecAttr {
     fn drop(&mut self) {
         // SAFETY: `psd` is the descriptor `ConvertStringSecurityDescriptorToSecurityDescriptorW`
-        // allocated for us with `LocalAlloc`; release it with the matching `LocalFree`. Every
-        // `CreateFileMappingW` that borrowed `self.sa` has already returned (so has copied the
-        // security info into its section object), so no live `SECURITY_ATTRIBUTES` still points here.
+        // allocated with `LocalAlloc`; matching `LocalFree`. Every `CreateFileMappingW` that
+        // borrowed `self.sa` has returned and copied the DACL into the section object.
         unsafe {
             let _ = LocalFree(Some(HLOCAL(self.psd.0)));
         }
     }
 }
 
-/// Build a [`SecAttr`] from an SDDL literal — a `SECURITY_ATTRIBUTES` plus the descriptor it borrows,
-/// freed together on drop. The returned owner must outlive every `CreateFileMappingW` that borrows
-/// its `sa` (see [`SecAttr`]).
 fn sddl_sa(sddl: PCWSTR) -> Result<SecAttr> {
     let mut psd = PSECURITY_DESCRIPTOR::default();
     // SAFETY: the SDDL literal is valid; `psd` receives a `LocalAlloc`'d descriptor that `SecAttr`'s
@@ -152,42 +103,26 @@ fn sddl_sa(sddl: PCWSTR) -> Result<SecAttr> {
 }
 
 impl Shm {
-    /// Create + zero an **unnamed** `size`-byte section, mapped read/write — the sealed DATA section.
-    /// SDDL `D:P(A;;GA;;;SY)` (SYSTEM-only, protected): with no name there is nothing to enumerate,
-    /// open, or squat, and the driver reaches it through a duplicated handle, which carries the
-    /// source's access without re-checking the object DACL (the exact property the frame ring
-    /// validated on-glass — `design/idd-push-security.md`).
+    /// Unnamed `size`-byte section, mapped RW — the sealed DATA section.
+    /// SDDL `D:P(A;;GA;;;SY)`: no name to open or squat; the driver gets a duplicated handle
+    /// that carries this process's access without re-checking the DACL (`design/idd-push-security.md`).
     pub(super) fn create_unnamed(size: usize) -> Result<Shm> {
         let sa = sddl_sa(w!("D:P(A;;GA;;;SY)"))?;
-        // `sa` owns the descriptor and lives to the end of this fn, so it outlives the create.
         Self::create_inner(&sa.sa, PCWSTR::null(), size)
             .context("create unnamed gamepad DATA section")
     }
 
-    /// Create + zero a **named** `size`-byte section, mapped read/write — the bootstrap mailbox. SDDL
-    /// `D:(A;;GA;;;SY)(A;;GA;;;LS)`: SYSTEM (this host) + LocalService (the driver's WUDFHost opens it
-    /// by name). Safe to leave name-openable because it carries nothing exploitable (see the module
-    /// docs). **Squat-checked**: `Global\` names are creatable by any service holding
-    /// `SeCreateGlobalPrivilege` (LocalService has it), so if the name already exists —
-    /// `ERROR_ALREADY_EXISTS`, meaning `CreateFileMappingW` silently *opened* a pre-existing object we
-    /// don't control — we close and retry briefly (our own driver holds the name for microseconds per
-    /// poll tick), then fail loudly rather than run the handshake through an attacker-owned (or
-    /// another host instance's) mailbox.
+    /// Named `size`-byte section, mapped RW — the bootstrap mailbox.
+    /// SDDL `D:P(A;;GA;;;SY)(A;;GA;;;LS)`: SYSTEM plus LocalService (WUDFHost opens by name).
     ///
-    /// ⚠️ That squat check only ever sees the collisions we are ALLOWED to see. `CreateFileMappingW`
-    /// opens a pre-existing object with full access, so a caller the incumbent's DACL excludes is
-    /// refused with `ERROR_ACCESS_DENIED` and never reaches the `ERROR_ALREADY_EXISTS` branch at
-    /// all — and that is the collision the field actually produces, because this SDDL grants SYSTEM
-    /// and LocalService only, while the host service runs as LocalSystem and a hand-run devtest
-    /// runs as an elevated Administrator. So the "another punktfunk-host instance is serving this
-    /// pad index" diagnosis below was unreachable for the one pairing that happens: on `.173`
-    /// (2026-08-09) it surfaced as a bare `Zugriff verweigert (0x80070005)` under a line telling the
-    /// operator to reinstall the drivers. [`classify_named_create_failure`] is what restores it.
+    /// `Global\` names are creatable by any `SeCreateGlobalPrivilege` holder. If the name
+    /// already exists, `CreateFileMappingW` silently opens it (`ERROR_ALREADY_EXISTS`);
+    /// close and retry, then fail rather than handshake through a foreign mailbox.
+    /// A DACL we cannot open never reaches that branch: it is `ERROR_ACCESS_DENIED`,
+    /// which [`classify_named_create_failure`] splits from "cannot create Global\\".
     pub(super) fn create_named(name: &HSTRING, size: usize) -> Result<Shm> {
-        // Build the descriptor ONCE and reuse it across the squat-retry loop — it (and the OS
-        // allocation it owns) lives to the end of this fn, so it outlives every create below.
-        // `D:P` (protected) — strip any inherited ACEs so only SYSTEM + LocalService are granted,
-        // matching the intent of the other named objects (security-review 2026-07-17).
+        // One descriptor for the squat-retry loop. `D:P` strips inherited ACEs so only
+        // SYSTEM + LocalService are granted.
         let sa = sddl_sa(w!("D:P(A;;GA;;;SY)(A;;GA;;;LS)"))?;
         for attempt in 0..5 {
             if attempt > 0 {
@@ -206,10 +141,6 @@ impl Shm {
             }
             // `shm` drops here → unmap + close our handle to the foreign object, then retry.
         }
-        // Reached only when we COULD open the incumbent (same account — two hosts both as SYSTEM,
-        // or a LocalService squatter). The cross-account case exits through
-        // `classify_named_create_failure` above; both carry the same fault, because to everything
-        // downstream they are the same event: this index is taken.
         Err(anyhow!(
             "bootstrap mailbox {name} already exists and stayed alive across retries — another \
              punktfunk-host instance is serving this pad index, or a local service is squatting the \
@@ -232,9 +163,8 @@ impl Shm {
                 name,
             )?
         };
-        // SAFETY: `map` is a fresh section handle we own; take ownership immediately so that the early
-        // return below (and the eventual drop) closes it. `map` (a `Copy` `HANDLE`) stays usable for the
-        // `MapViewOfFile` borrow that follows — `from_raw_handle` only copies the inner pointer.
+        // SAFETY: `map` is a fresh section handle we own; take ownership immediately so the early
+        // return (and drop) closes it. `map` is `Copy`; `from_raw_handle` only copies the pointer.
         let handle = unsafe { OwnedHandle::from_raw_handle(map.0) };
         // SAFETY: `map` is a valid section handle; map the whole thing read/write.
         let view = unsafe { MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, size) };
@@ -247,13 +177,11 @@ impl Shm {
         Ok(Shm { handle, view })
     }
 
-    /// The mapped section's base pointer. Stable for the `Shm`'s lifetime (moving the `Shm` does not
-    /// relocate the OS mapping — the view address is fixed by `MapViewOfFile`).
+    /// Mapped base. Stable for this `Shm`'s lifetime — `MapViewOfFile` pins the address.
     pub(super) fn base(&self) -> *mut u8 {
         self.view.Value as *mut u8
     }
 
-    /// The section handle as a borrowed `HANDLE` (the sealed channel's duplication source).
     fn raw_handle(&self) -> HANDLE {
         HANDLE(self.handle.as_raw_handle())
     }
@@ -269,27 +197,16 @@ impl Drop for Shm {
     }
 }
 
-/// Turn a failed NAMED-section create into an error that names the cause, because
-/// `CreateFileMappingW` collapses two OPPOSITE situations into one `ERROR_ACCESS_DENIED`
-/// (`0x80070005`, and on a German box the entirely unsearchable "Zugriff verweigert" the field
-/// report carried):
+/// Split `CreateFileMappingW`'s `ERROR_ACCESS_DENIED` into two causes:
 ///
-/// * **the name is TAKEN, by someone whose object we may not open.** Creating over an existing name
-///   is really an open, and an open is access-checked against the incumbent's DACL. The mailbox
-///   SDDL grants SYSTEM + LocalService only, so the exact pairing that occurs on a dev box — the
-///   LocalSystem host service holding pad 0 for a live session while an operator runs
-///   `punktfunk-host.exe dualsense-windows-test` from an elevated Administrator console — is
-///   refused here rather than reported as the squat it is.
-/// * **the name is FREE and we may not create it.** `Global\` names need `SeCreateGlobalPrivilege`,
-///   which SYSTEM and services hold and an ordinary (even elevated) user token does not.
+/// * Name taken, DACL excludes us — creating over an existing name is an open.
+///   Mailbox SDDL is SYSTEM + LocalService, so a LocalSystem host vs an elevated
+///   Administrator console is this case, not `ERROR_ALREADY_EXISTS`.
+/// * Name free, we cannot create `Global\` — needs `SeCreateGlobalPrivilege`.
 ///
-/// `OpenFileMappingW` separates them, because the object-manager lookup happens BEFORE the access
-/// check: an absent name is `ERROR_FILE_NOT_FOUND`, a present one we are not in the DACL of is
-/// `ERROR_ACCESS_DENIED`. Everything else keeps the original wording.
-///
-/// The contended case additionally carries a [`PadCreateFault`], which is what stops the pad
-/// manager's failure line from telling the operator to reinstall a driver that is working
-/// perfectly (see [`crate::pad_slots::PadCreateFault`]).
+/// `OpenFileMappingW` looks up before the access check: missing → `ERROR_FILE_NOT_FOUND`,
+/// present-but-denied → `ERROR_ACCESS_DENIED`. The taken case carries
+/// [`PadCreateFault`] so the pad manager does not tell the operator to reinstall.
 fn classify_named_create_failure(name: &HSTRING, e: anyhow::Error) -> anyhow::Error {
     let denied = e
         .downcast_ref::<windows::core::Error>()
@@ -314,13 +231,9 @@ fn classify_named_create_failure(name: &HSTRING, e: anyhow::Error) -> anyhow::Er
     ))
 }
 
-/// Whether a section with this name exists right now, as seen from THIS process — the
-/// disambiguation [`classify_named_create_failure`] runs on. `true` also when the object is there
-/// but closed to us, which is the case that matters: ACCESS_DENIED from an OPEN means the name
-/// resolved and only the access check failed.
-///
-/// Deliberately not a security decision — a hostile squatter can make this say either thing. It
-/// only ever chooses which sentence to print.
+/// Whether a section with this name exists as seen from this process.
+/// `true` also when the object is present but closed to us (ACCESS_DENIED on open).
+/// Chooses error text only — a squatter can make this say either thing.
 fn named_section_exists(name: &HSTRING) -> bool {
     // SAFETY: `name` is a live NUL-terminated UTF-16 string for the duration of the call. Ask for
     // the least access there is (`FILE_MAP_READ`): the handle is closed immediately and never
@@ -339,63 +252,46 @@ fn named_section_exists(name: &HSTRING) -> bool {
     }
 }
 
-// ── The sealed-channel bootstrap broker ─────────────────────────────────────────────────────────
-
-/// Global delivery sequence for [`PadBootstrap::handle_seq`] — host-wide monotonic and never 0, so two
-/// consecutive pads on the same index can't hand the (persistent, out-of-band-devnode) driver the same
-/// seq twice. Starts at 1.
+/// Host-wide [`PadBootstrap::handle_seq`]. Never 0, so two pads on the same index
+/// cannot hand a persistent driver the same seq twice. Starts at 1.
 static BOOT_SEQ: AtomicU32 = AtomicU32::new(1);
 
-/// Hard cap on FAILED delivery attempts per pad: each attempt duplicates a handle into a WUDFHost, so
-/// a tampered mailbox flapping `driver_pid` must not mint unbounded remote handles (DoS containment).
-/// Only failures spend this budget — a SUCCESSFUL delivery stands until its target process exits
-/// ([`PadChannel::delivered`]), so what is left here is purely the retry allowance for a driver that
-/// published a pid and then died before we could reach it.
+/// Cap on FAILED deliveries per pad. Each attempt duplicates a handle into a WUDFHost;
+/// a flapping mailbox pid must not mint unbounded remote handles. Successes stand
+/// until the target exits ([`PadChannel::delivered`]).
 const MAX_DELIVERY_ATTEMPTS: u32 = 16;
 
-/// How often the delivery state machine may ask the devnode for its channel proof while unattached.
-/// The proof query opens a device interface and does real I/O, and the pad service pump ticks every
-/// few milliseconds — without this the poll would be a hot loop on the HID stack. A driver takes tens
-/// of milliseconds to publish its interface after `SwDeviceCreate`, so a quarter second costs nothing
-/// perceptible at pad open and keeps the steady-state cost at zero (once delivered, nothing polls).
+/// How often an unattached pad may ask the devnode for a channel proof.
+/// The pump ticks every few milliseconds; a proof query is a device open + I/O.
+/// 250 ms is past a healthy driver's attach (tens of ms) and idle once delivered.
 const PROOF_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Operator escape hatch for the one case the device stack cannot answer: an **out-of-band devnode**
-/// (`devgen`/`devcon`, the driver bring-up path) where `SwDeviceCreate` never ran, so the host has no
-/// instance id to look an interface up by. Set it and the channel falls back to the pre-v3 behaviour
-/// of trusting the mailbox's `driver_pid`, which is exactly the trust the security review removed —
-/// hence opt-in, per-boot, and loud in the log. Never needed for a normal host: every pad and the
-/// resident mouse are `SwDeviceCreate`d.
+/// Opt-in fallback when there is no `SwDeviceCreate` instance id (`devgen`/`devcon`).
+/// Trusts the mailbox `driver_pid` — the path [`PadChannel::pump`] otherwise refuses.
+/// Per-boot, logged loudly. Normal pads and the resident mouse never need it.
 const TRUST_MAILBOX_ENV: &str = "PUNKTFUNK_PAD_CHANNEL_TRUST_MAILBOX";
 
-/// Consecutive unanswered proof queries before the debug line escalates to one operator-facing warn.
-/// At [`PROOF_PROBE_INTERVAL`] this is ~5 s — comfortably past a healthy driver's attach (tens of
-/// milliseconds) and past the eager window, so it only fires when the pad really is not coming up.
+/// Unanswered proof queries before one operator-facing warn.
+/// At [`PROOF_PROBE_INTERVAL`] this is ~5 s — past attach and the eager window.
 const PROOF_FAILURES_BEFORE_WARN: u32 = 20;
 
-/// One pad's sealed host↔driver channel: the unnamed DATA section (the real `XusbShm`/`PadShm`), the
-/// named bootstrap mailbox, and the delivery state machine ([`Self::pump`]) that hands the driver's
-/// WUDFHost a duplicated DATA handle. Owns both sections (RAII teardown — dropping the channel closes
-/// the mailbox, whose *name* then disappears, which is how a persistent (out-of-band-devnode) driver
-/// detects the host is gone).
+/// One pad's sealed host↔driver channel: unnamed DATA, named mailbox, and the
+/// [`Self::pump`] state machine. Drop closes the mailbox; a persistent driver
+/// treats the vanished name as "host gone".
 pub(super) struct PadChannel {
     data: Shm,
     boot: Shm,
     boot_name: String,
-    /// The devnode to ask for a channel proof, and how ([`Self::bind_devnode`]). `None` until the
-    /// caller has a `SwDeviceCreate` instance id — and permanently `None` on the out-of-band devnode
-    /// path, which is what [`TRUST_MAILBOX_ENV`] exists for.
+    /// Instance id + transport for [`Self::bind_devnode`]. Stays `None` on the
+    /// out-of-band path ([`TRUST_MAILBOX_ENV`]).
     devnode: Option<(String, ProofTransport)>,
-    /// The pad index the proof must agree with, so a mis-resolved interface can't cross-wire two pads.
+    /// Must match the proof so a mis-resolved interface cannot cross-wire two pads.
     pad_index: u32,
-    /// When the devnode was last asked (throttle — see [`PROOF_PROBE_INTERVAL`]).
     last_probe: Option<Instant>,
-    /// Last pid acted on (delivered or rejected) — never retry the same value, so a failed verify
-    /// can't be spun into a hot loop.
+    /// Last pid delivered or rejected — never retry the same value (hot-loop trap).
     last_seen_pid: u32,
     attempts: u32,
-    /// The WUDFHost the DATA section was duplicated into. `Some` ⇒ this channel is spoken for and no
-    /// other process is served while that one lives (see [`Self::pump`]).
+    /// WUDFHost that holds the DATA handle. `Some` ⇒ no other process is served while it lives.
     delivered: Option<Delivered>,
     warned_proto: bool,
     warned_cap: bool,
@@ -404,13 +300,11 @@ pub(super) struct PadChannel {
     proof_failures: u32,
 }
 
-/// A completed delivery: the WUDFHost we handed the DATA section to, pinned by a live handle.
-/// Liveness is judged on the HANDLE, never the pid — the handle pins the process object, so a
-/// recycled pid can never read as "the process we served has exited".
+/// Completed delivery, pinned by a live process handle — never by pid.
+/// A recycled pid cannot read as "the process we served has exited".
 struct Delivered {
     pid: u32,
-    /// `SYNCHRONIZE` handle to the target; signaled ⇔ it exited. Same liveness idiom the frame
-    /// channel's `ChannelBroker::driver_alive` uses.
+    /// `SYNCHRONIZE`; signaled ⇔ exited. Same idiom as the frame channel's `driver_alive`.
     process: OwnedHandle,
 }
 
@@ -423,9 +317,8 @@ impl Delivered {
 }
 
 impl PadChannel {
-    /// Create the unnamed DATA section (`data_size` bytes, zeroed — the caller stamps its layout and
-    /// magic) plus the named bootstrap mailbox, stamped `host_proto` first and `BOOT_MAGIC` last so a
-    /// driver only trusts a fully-initialized mailbox.
+    /// Unnamed DATA (`data_size`, zeroed — caller stamps layout/magic) plus named mailbox.
+    /// Stamp `host_proto` first and `BOOT_MAGIC` last so a driver only trusts a complete mailbox.
     pub(super) fn create(boot_name: String, data_size: usize) -> Result<PadChannel> {
         let data = Shm::create_unnamed(data_size)?;
         let boot = Shm::create_named(
@@ -462,17 +355,14 @@ impl PadChannel {
         })
     }
 
-    /// The DATA section's mapped base (the host side of `XusbShm`/`PadShm`).
     pub(super) fn data_base(&self) -> *mut u8 {
         self.data.base()
     }
 
-    /// The bootstrap mailbox name (log labelling).
     pub(super) fn boot_name(&self) -> &str {
         &self.boot_name
     }
 
-    /// Atomic `u32` load from a mailbox field.
     fn boot_load(&self, off: usize) -> u32 {
         // SAFETY: the mailbox view is live (owned by `self.boot`), page-aligned, and every
         // `PadBootstrap` u32 field offset is 4-aligned (proto asserts), so the atomic view is valid;
@@ -480,12 +370,10 @@ impl PadChannel {
         unsafe { (*(self.boot.base().add(off) as *const AtomicU32)).load(Ordering::Acquire) }
     }
 
-    /// Bind this channel to the devnode the caller just `SwDeviceCreate`d, so [`Self::pump`] can ask
-    /// it for a channel proof. Call between `create_swdevice` and [`Self::deliver_eager`].
-    ///
-    /// `instance_id` is `None` when `SwDeviceCreate` failed and the caller fell back to an
-    /// out-of-band (`devgen`) devnode: there is then no device to ask, and the channel will refuse to
-    /// deliver unless [`TRUST_MAILBOX_ENV`] is set.
+    /// Bind to the `SwDeviceCreate` instance so [`Self::pump`] can ask for a channel proof.
+    /// Call between `create_swdevice` and [`Self::deliver_eager`].
+    /// `instance_id` is `None` on the `devgen` fallback: no device to ask, no delivery
+    /// unless [`TRUST_MAILBOX_ENV`] is set.
     pub(super) fn bind_devnode(
         &mut self,
         pad_index: u32,
@@ -496,12 +384,10 @@ impl PadChannel {
         self.devnode = instance_id.map(|id| (id, transport));
     }
 
-    /// One tick of the delivery state machine — called from the pad's regular service pump (≤4 ms
-    /// cadence) and from [`Self::deliver_eager`]. Cheap when idle: an atomic load, and once the
-    /// channel is delivered, one 0 ms wait.
+    /// One tick of the delivery state machine (pad service pump, ≤4 ms). Idle cost is
+    /// an atomic load; once delivered, a 0 ms wait.
     pub(super) fn pump(&mut self) {
-        // Version diagnostics: the driver writes its own proto version even when it refuses the
-        // handshake (host/driver mismatch), so the operator sees WHY the pad never attaches.
+        // Driver writes its proto even when it refuses the handshake, so a mismatch is visible.
         let drv_proto = self.boot_load(core::mem::offset_of!(PadBootstrap, driver_proto));
         if drv_proto != 0 && drv_proto != GAMEPAD_PROTO_VERSION && !self.warned_proto {
             self.warned_proto = true;
@@ -514,9 +400,8 @@ impl PadChannel {
             );
         }
 
-        // A delivery stands until its target process dies. Re-delivering to a *different* live
-        // process was the pre-v3 takeover (see the module docs); UMDF restarting a host whose driver
-        // crashed is the one legitimate case, and that one is visible here as an exited handle.
+        // A delivery stands until the target process dies. UMDF restarting a crashed host
+        // is the one legitimate re-attach, visible here as an exited handle.
         if let Some(d) = self.delivered.as_ref() {
             if !d.exited() {
                 return;
@@ -543,7 +428,6 @@ impl PadChannel {
             }
             return;
         }
-        // Throttle: asking costs a device open + an IOCTL, and this runs on the pad service pump.
         if self
             .last_probe
             .is_some_and(|t| t.elapsed() < PROOF_PROBE_INTERVAL)
@@ -582,13 +466,9 @@ impl PadChannel {
         }
     }
 
-    /// Which process to hand this pad's DATA section to.
-    ///
-    /// The answer comes from the DEVNODE ([`channel_proof`]), never from the bootstrap mailbox. That
-    /// is the whole security property: the mailbox is writable by LocalService, so anything in it —
-    /// including `driver_pid` — is attacker-choosable, whereas only the driver PnP actually bound to
-    /// the device we created can answer that device's I/O. See the module docs for the attack this
-    /// closes.
+    /// Pid to receive this pad's DATA section — from the DEVNODE ([`channel_proof`]),
+    /// never from the mailbox. Only the driver PnP-bound to the `SwDeviceCreate`'d
+    /// device can answer that I/O. Evidence: `design/gamepad-channel-sealing.md`.
     fn resolve_driver_pid(&mut self) -> Option<u32> {
         let Some((instance_id, transport)) = self.devnode.clone() else {
             return self.unproven_mailbox_pid("this pad has no SwDeviceCreate devnode to ask");
@@ -600,9 +480,7 @@ impl PadChannel {
             }
             Err(e) => {
                 self.proof_failures += 1;
-                // Chatty at debug (the driver simply may not have started yet); one warn once it is
-                // clearly not coming, so a dead pad names its own cause instead of just going quiet.
-                // `DriverAttach` prints the operator-facing remedy separately.
+                // Debug while the driver may still be starting; one warn once it is clearly not.
                 if self.proof_failures == PROOF_FAILURES_BEFORE_WARN {
                     tracing::warn!(
                         mailbox = %self.boot_name,
@@ -626,11 +504,8 @@ impl PadChannel {
         }
     }
 
-    /// The pre-v3 behaviour — trust the mailbox's `driver_pid` — for the one case that has no
-    /// devnode to ask: an out-of-band (`devgen`) devnode created outside `SwDeviceCreate`. Refused
-    /// unless [`TRUST_MAILBOX_ENV`] is set, because this is exactly the trust the security review
-    /// removed: any LocalService principal can write that field and be handed the pad's live input
-    /// surface.
+    /// Mailbox `driver_pid` for the `devgen` path that has no instance id to query.
+    /// Refused unless [`TRUST_MAILBOX_ENV`] is set: LocalService can write that field.
     fn unproven_mailbox_pid(&mut self, why: &str) -> Option<u32> {
         if std::env::var_os(TRUST_MAILBOX_ENV).is_none() {
             if !self.warned_unproven {
@@ -664,14 +539,12 @@ impl PadChannel {
         Some(pid)
     }
 
-    /// Duplicate the DATA section into `pid`'s handle table (after verifying it is a genuine
-    /// WUDFHost) and publish the handle value + owning pid, bumping `handle_seq` LAST. The driver
-    /// adopts the handle by consuming the delivery; an unconsumed duplicate dies with the target
-    /// process (nothing to reap — there is no fallible step after the duplication).
+    /// Duplicate the DATA section into `pid` after `verify_is_wudfhost`, then publish
+    /// handle value + owning pid, bumping `handle_seq` last. An unconsumed duplicate
+    /// dies with the target (nothing to reap after the duplication).
     ///
-    /// Returns `(handle_seq, process)` — the process handle is RETAINED by the caller so the
-    /// one-delivery rule in [`Self::pump`] can tell "our driver crashed and UMDF restarted it" from
-    /// "someone else is claiming this channel" on the handle rather than on a reusable pid.
+    /// Returns `(handle_seq, process)` — caller retains the handle so [`Self::pump`]
+    /// can tell a UMDF host restart from a different claimant without trusting a pid.
     fn deliver_to(&self, pid: u32) -> Result<(u32, OwnedHandle)> {
         // SAFETY: plain FFI; the handle (checked by `?`) is owned solely here and moved into the
         // `OwnedHandle` (single owner, closes on drop); `verify_is_wudfhost` borrows it for the
@@ -696,10 +569,8 @@ impl PadChannel {
         let mut remote = HANDLE::default();
         // SAFETY: `self.data.raw_handle()` is the live section handle this channel owns;
         // `process` is the live PROCESS_DUP_HANDLE target; `&mut remote` is a valid out-param.
-        // Least privilege: the pad driver only MAPS the DATA section read/write (its `FILE_MAP_RW` =
-        // `SECTION_MAP_READ | SECTION_MAP_WRITE`), so grant exactly that instead of copying our
-        // full-access creator handle via `DUPLICATE_SAME_ACCESS` (Chen: don't over-grant unnamed
-        // shared objects — a compromised driver's handle then can't `WRITE_DAC`/`DELETE` the section).
+        // Grant `SECTION_MAP_RW` only — not `DUPLICATE_SAME_ACCESS`. A compromised driver's
+        // handle then cannot `WRITE_DAC`/`DELETE` the unnamed section.
         unsafe {
             DuplicateHandle(
                 GetCurrentProcess(),
@@ -730,10 +601,8 @@ impl PadChannel {
         Ok((seq, process))
     }
 
-    /// Bounded wait at pad-open: pump until the mailbox produces a driver pid we act on (delivered or
-    /// rejected) or `timeout` passes. Closes the identity race for the DualShock 4 (the driver reads
-    /// `device_type` from the DATA section when hidclass asks for descriptors — the channel should be
-    /// attached by then); the regular service pump takes over afterwards either way.
+    /// Pump until a pid is acted on or `timeout` passes. Closes the DualShock 4 identity
+    /// race: the driver reads `device_type` from DATA when hidclass asks for descriptors.
     pub(super) fn deliver_eager(&mut self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
@@ -754,11 +623,8 @@ impl PadChannel {
     }
 }
 
-/// Context for the `SwDeviceCreate` completion callback: an event to signal, the HRESULT it reports,
-/// and the PnP instance id PnP assigned (captured for devnode health diagnostics). Shared by every
-/// Windows companion backend (XUSB / DualSense / DS4): each `create_swdevice` builds one, hands it to
-/// `SwDeviceCreate` alongside [`sw_create_cb`], and reads [`instance_id`](Self::instance_id) once the
-/// callback has signalled.
+/// `SwDeviceCreate` completion context: event, HRESULT, and PnP instance id.
+/// Shared by every Windows companion backend; the creator blocks on the event.
 #[repr(C)]
 pub(super) struct SwCreateCtx {
     pub(super) event: HANDLE,
@@ -766,8 +632,8 @@ pub(super) struct SwCreateCtx {
     pub(super) instance_id: [u16; 128],
 }
 
-/// `SwDeviceCreate` fires this once PnP has enumerated the device; stash the result and wake the
-/// creator, which blocks on the event (so there's no concurrent access to `*ctx`).
+/// `SwDeviceCreate` callback: stash result + instance id and wake the creator.
+/// The creator blocks on the event, so there is no concurrent access to `*ctx`.
 pub(super) unsafe extern "system" fn sw_create_cb(
     _dev: HSWDEVICE,
     result: HRESULT,
@@ -801,8 +667,6 @@ impl SwCreateCtx {
     }
 }
 
-/// A `SwDeviceCreate`'d software devnode; drop removes it via `SwDeviceClose`. Replaces the manual
-/// `SwDeviceClose` each backend used to call in its `Drop`.
 pub(super) struct SwDevice(HSWDEVICE);
 
 impl SwDevice {
@@ -818,32 +682,18 @@ impl Drop for SwDevice {
     }
 }
 
-// ── Driver health surfacing ─────────────────────────────────────────────────────────────────────
-//
-// The gamepad drivers have no IOCTL plane (hidclass gates the stack), so the only cross-process
-// signal is the shared section itself. The drivers stamp `driver_proto` into their section once
-// attached (pf_driver_proto::gamepad::GAMEPAD_PROTO_VERSION); [`DriverAttach`] watches that field
-// from the host's regular pump and turns silence into actionable WARN/ERROR log lines — the piece
-// that used to be missing entirely: a pad could be "created" with no driver installed and nothing
-// was ever logged until the user gave up ("host doesn't see my controller" bug reports).
-
-/// How long to give PnP to bind the driver + the driver to stamp the section before warning.
+/// PnP bind + driver stamp window before a diagnosis warn.
 const ATTACH_GRACE: Duration = Duration::from_secs(3);
 
-/// Per-pad driver-attach watcher: feed it the section's `driver_proto` on every service tick; it
-/// logs the attach (INFO), a version mismatch (WARN), or — after [`ATTACH_GRACE`] of silence — one
-/// diagnosis WARN combining the driver-store check and the devnode problem code. States never
-/// repeat their log line, so the pump can call this at full rate.
+/// Per-pad attach watcher. Feed `driver_proto` every service tick; logs attach,
+/// version mismatch, or — after [`ATTACH_GRACE`] of silence — one diagnosis.
+/// States never repeat a log line, so the pump can call this at full rate.
 pub(super) struct DriverAttach {
-    /// Driver label for log lines (`pf_xusb` / `pf_dualsense` / `pf_dualshock4`).
     driver: &'static str,
-    /// The INF the driver store must hold for this driver (`pf_xusb.inf` / `pf_dualsense.inf`).
     inf: &'static str,
-    /// The driver's own debug log, referenced in the diagnosis line.
     driver_log: &'static str,
-    /// Bootstrap-mailbox name, for log lines (the DATA section is unnamed).
     shm_name: String,
-    /// PnP instance id of the SwDeviceCreate'd devnode (`None` on the out-of-band fallback path).
+    /// `None` on the out-of-band fallback path.
     instance_id: Option<String>,
     created: Instant,
     state: AttachState,
@@ -875,7 +725,6 @@ impl DriverAttach {
         }
     }
 
-    /// `driver_proto` is the section field the driver stamps once attached (0 = not attached).
     pub(super) fn observe(&mut self, driver_proto: u32) {
         match self.state {
             AttachState::Attached => {}
@@ -906,19 +755,11 @@ impl DriverAttach {
         }
     }
 
-    /// One-shot WARN with everything the host can find out about WHY the driver isn't attached:
-    /// driver-store presence, the devnode's PnP status/problem code, and where to look next.
+    /// One-shot WARN: driver-store presence, devnode PnP problem, where to look next.
     ///
-    /// Runs on its own thread and returns immediately. The caller is the session's pad service
-    /// thread — the one feeding input and rumble — and everything below is slow: the driver-store
-    /// check waits up to [`INVENTORY_WAIT`] for a `pnputil` enumeration that can take tens of
-    /// seconds, and the devnode lookup is a synchronous PnP call. Blocking there stalled input for
-    /// up to two seconds *per unattached pad* (the wait is a deadline, not a one-off: while the
-    /// enumeration is still outstanding every pad pays it again), at exactly the moment a session
-    /// is already going wrong. Diagnostics must never be able to hurt the thing they diagnose.
-    ///
-    /// Off the hot path the wait also stops being a compromise — it can afford to be patient and
-    /// report what it actually found rather than "still enumerating".
+    /// Spawns a thread and returns. The caller is the pad service thread (input + rumble);
+    /// `pnputil` can block for tens of seconds and a deadline wait would stall every
+    /// unattached pad on that same wait.
     fn diagnose(&self) {
         let (driver, inf, driver_log) = (self.driver, self.inf, self.driver_log);
         let shm_name = self.shm_name.clone();
@@ -930,8 +771,7 @@ impl DriverAttach {
     }
 }
 
-/// The body of [`DriverAttach::diagnose`], on its own thread. Split out rather than inlined into
-/// the closure so the blocking calls stay visible as blocking.
+/// Split out of [`DriverAttach::diagnose`] so the blocking wait is visible as blocking.
 fn diagnose_blocking(
     driver: &'static str,
     inf: &'static str,
@@ -966,29 +806,21 @@ fn diagnose_blocking(
     );
 }
 
-/// How long [`driver_store_inventory`] waits for the background pnputil query before reporting
-/// without it. Only [`diagnose_blocking`] waits, and that has a thread to itself, so this is
-/// generous: pnputil routinely takes longer than a couple of seconds on a busy driver store, and
-/// the old two-second budget — chosen to limit the damage while this ran on the pad service thread
-/// — meant the diagnosis usually gave up and printed "still enumerating", which is the one answer
-/// that helps nobody. Nothing waits on this thread, so patience costs only a late log line.
+/// How long [`driver_store_inventory`] waits for pnputil. Only [`diagnose_blocking`]
+/// waits, on its own thread. pnputil routinely exceeds a couple of seconds on a
+/// busy driver store; 30 s is enough to report the inventory instead of "still enumerating".
 const INVENTORY_WAIT: Duration = Duration::from_secs(30);
 
-/// Driver-store inventory (`pnputil /enum-drivers`), lower-cased, fetched once per process — only
-/// consulted on the failure path, so the subprocess cost never hits a healthy session. The query
-/// runs on its OWN thread: pnputil can block for tens of seconds on a busy/wedged driver store,
-/// and this keeps one wedged query from being re-run per pad. `None` = not available yet (query
-/// still running past [`INVENTORY_WAIT`]) or
-/// failed; a query that outlives [`INVENTORY_WAIT`] still lands in the cache for later reports.
+/// `pnputil /enum-drivers`, lower-cased, once per process. Failure-path only.
+/// Query runs on its own thread so a wedged pnputil is not re-run per pad.
+/// `None` = still running past [`INVENTORY_WAIT`], or failed; a late result still caches.
 fn driver_store_inventory() -> Option<&'static str> {
     static INV: OnceLock<String> = OnceLock::new();
     static SPAWN: std::sync::Once = std::sync::Once::new();
     SPAWN.call_once(|| {
         std::thread::spawn(|| {
-            // Resolve pnputil by full System32 path — the host runs as SYSTEM and must not trust
-            // PATH / the CreateProcess search (which checks the launching EXE's own dir first), or
-            // a planted `pnputil.exe` beside the host binary would run elevated (security-review
-            // 2026-07-17).
+            // Resolve via `%SystemRoot%\System32\pnputil.exe`. SYSTEM must not search PATH /
+            // the EXE directory — a planted `pnputil.exe` beside the host would run elevated.
             let pnputil = std::env::var("SystemRoot")
                 .map(|r| format!(r"{r}\System32\pnputil.exe"))
                 .unwrap_or_else(|_| "pnputil.exe".to_string());
@@ -1012,8 +844,7 @@ fn driver_store_inventory() -> Option<&'static str> {
     }
 }
 
-/// Whether the driver store holds `inf` (e.g. `pf_xusb.inf`). `None` = pnputil unavailable,
-/// failed, or still enumerating.
+/// `None` = pnputil unavailable, failed, or still enumerating.
 fn driver_store_has(inf: &str) -> Option<bool> {
     let inv = driver_store_inventory()?;
     if inv.is_empty() {
@@ -1022,7 +853,6 @@ fn driver_store_has(inf: &str) -> Option<bool> {
     Some(inv.contains(&inf.to_ascii_lowercase()))
 }
 
-/// Human-readable PnP status of a devnode: driver bound/started or the CM problem code with a hint.
 fn devnode_status_line(instance_id: &str) -> String {
     let wide: Vec<u16> = instance_id
         .encode_utf16()
@@ -1066,7 +896,6 @@ fn devnode_status_line(instance_id: &str) -> String {
     )
 }
 
-/// The CM_PROB_* codes a virtual-pad devnode realistically hits, with the operator-facing cause.
 fn cm_problem_hint(problem: u32) -> &'static str {
     match problem {
         1 => "not configured — no driver bound; install the drivers",
@@ -1086,11 +915,9 @@ fn cm_problem_hint(problem: u32) -> &'static str {
 mod tests {
     use super::*;
 
-    /// The one-delivery rule ([`PadChannel::pump`]) rests entirely on [`Delivered::exited`] reading
-    /// the retained HANDLE rather than the pid, and both of its answers are load-bearing: "alive"
-    /// is what refuses a LocalService takeover of a live pad channel, and "exited" is what still
-    /// lets UMDF's restart-the-host-after-a-driver-crash path re-deliver. Neither half is
-    /// observable from the pad path without a real WUDFHost, so pin the primitive itself.
+    /// Pin [`Delivered::exited`] to the process object, not the pid.
+    /// Alive refuses a takeover; exited still lets UMDF restart re-deliver.
+    /// Neither half is observable from the pad path without a real WUDFHost.
     #[test]
     fn delivered_exited_tracks_the_process_object_not_the_pid() {
         // A child that parks long enough to be observed alive (no console needed, unlike `pause`).

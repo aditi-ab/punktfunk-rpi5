@@ -142,6 +142,7 @@ The three rules you need before your first commit:
   — `Breaking` / `Added` / `Changed` / `Fixed` / `Security` — plus the version table. Two
   sentences per bullet. Keep the existing sections as they are. CI fails the newest section at
   160 lines. What a *user* can do goes in `docs/releases/vX.Y.Z.md` instead.
-- **A comment states an invariant or a trap, not a recap of the diff.** `//` is four lines (CI
-  fails at six); a module `//!` is 8–20 (CI fails at 24). If a trust boundary matters, a type,
-  test or assertion has to enforce it — a comment alone never does.
+- **A comment states an invariant or a trap, not a recap of the diff.** Present tense: the
+  live rule, not the archaeology of old versions and not a poem. `//` is four lines (CI
+  fails at six); a module `//!` is 8–20 (CI fails at 24). Length is a backstop. If a trust
+  boundary matters, a type, test or assertion has to enforce it — a comment alone never does.

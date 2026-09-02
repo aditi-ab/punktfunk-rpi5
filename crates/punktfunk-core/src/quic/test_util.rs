@@ -1,9 +1,6 @@
-//! Shared in-process QUIC loopback plumbing for the quic submodule tests.
 use super::endpoint;
 
-/// Stand up two loopback quinn endpoints, connect, and return
-/// `(server_ep, client_ep, host_conn, client_conn)`. Both endpoints are returned so the caller
-/// keeps them in scope — dropping a `quinn::Endpoint` tears down its connections.
+/// Dropping a `quinn::Endpoint` closes its connections; keep both endpoints in the caller's scope.
 pub(crate) async fn connect_pair() -> (
     quinn::Endpoint,
     quinn::Endpoint,

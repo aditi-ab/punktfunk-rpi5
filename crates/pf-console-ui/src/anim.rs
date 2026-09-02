@@ -1,40 +1,29 @@
-//! The console shell's motion vocabulary. Two kinds of movement, deliberately kept apart:
+//! Console-shell motion: springs for anything the user can retarget, timed
+//! choreography for fire-and-forget arrivals.
 //!
-//! **Springs** ([`Spring`], wrapping `library::spring_advance`) for anything the user
-//! pushes around — cursors, trays, recoil, and now the screen transitions themselves —
-//! where velocity must carry across a retarget. [`SpringSpec`] and the [`springs`] table
-//! are how a feel is named rather than spelled out as a `k`/`c` pair.
+//! [`Spring`] wraps `library::spring_advance`. Velocity carries across a
+//! retarget, so a Back mid-push turns the screen around where it is.
+//! [`SpringSpec`] and [`springs`] name a feel instead of a `k`/`c` pair.
 //!
-//! **Timed choreography** ([`Entrance`] + the easing functions) for the fire-and-forget
-//! kind, where the shape over a fixed window matters more than momentum and there is
-//! nothing to interrupt. An entrance is a pure function of the clock, so a screen holds
-//! one and asks it per item instead of keeping per-item state.
-//!
-//! There used to be a general-purpose `Progress` timer here. It went when the screen
-//! transition — its last caller — became a spring: reversing a timer mid-flight means
-//! either a snap or a second animation, which is the whole reason that work happened.
+//! [`Entrance`] plus the easing functions are a pure function of the clock.
+//! A screen holds one and asks it per item; there is no per-item state.
+//! Evidence: `spring_spec_matches_the_tray_constants`, `entrance_envelope`.
 
 use crate::library::spring_advance;
 
-/// Ease-out cubic — fast start, gentle landing. The screen-transition curve (the WinUI
-/// shell's entrance tween uses the same shape).
 pub(crate) fn ease_out_cubic(t: f64) -> f64 {
     let u = 1.0 - t.clamp(0.0, 1.0);
     1.0 - u * u * u
 }
 
-/// Exponential approach: move `current` toward `target` with time-constant `tau`
-/// seconds. Frame-rate independent, never overshoots — the focus-scale smoothing
-/// (SwiftUI's `.smooth(0.18)` reads the same).
+/// `tau` is seconds. The exponential is frame-rate independent and never overshoots.
 pub(crate) fn approach(current: f64, target: f64, dt: f64, tau: f64) -> f64 {
     current + (target - current) * (1.0 - (-dt / tau).exp())
 }
 
-/// A spring named the way a designer reasons about one: `response` is the period of a
-/// full undamped oscillation in seconds ("how long does it take to get there"), `damping`
-/// is ζ (1.0 lands dead, below it overshoots). The integrator wants `k`/`c` instead, and
-/// [`SpringSpec::kc`] is the conversion — the same one SwiftUI's
-/// `.spring(response:dampingFraction:)` performs.
+/// `response` is the undamped period in seconds; `damping` is ζ (1.0 lands dead).
+/// [`SpringSpec::kc`] converts to the integrator's `k`/`c` the same way SwiftUI's
+/// `.spring(response:dampingFraction:)` does.
 #[derive(Clone, Copy)]
 pub(crate) struct SpringSpec {
     pub response: f64,
@@ -42,65 +31,52 @@ pub(crate) struct SpringSpec {
 }
 
 impl SpringSpec {
-    /// `(k, c)` for [`Spring::step`], from `ω = 2π/response`: `k = ω²`, `c = 2ζω`.
-    ///
-    /// `const` so [`springs`] costs nothing at runtime — which is also why it is written
-    /// with `ω` rather than `2ζ√k`: `√k` IS `ω`, and `f64::sqrt` is not callable in a
-    /// const context. Same numbers, no root.
+    /// `k = ω²`, `c = 2ζω` with `ω = 2π/response`. Written with `ω` not `2ζ√k`:
+    /// `√k` is `ω`, and `f64::sqrt` is not `const`.
     pub(crate) const fn kc(self) -> (f64, f64) {
         let w = std::f64::consts::TAU / self.response;
         (w * w, 2.0 * self.damping * w)
     }
 }
 
-/// The console's motion vocabulary: feel is chosen from this table rather than from
-/// constants scattered through the widgets, so "the focus pop" is one name with one
-/// definition instead of a τ someone picked in a hurry.
-///
-/// These are the SHELL's springs. The carousel's own pairs (`library::SPRING_K/C`,
-/// `BUMP_K/C`) deliberately stay raw: they are tuned numbers shared with the GTK
-/// launcher's math, and restating them as specs would invite a "tidy-up" that changes the
-/// coverflow's feel on both surfaces at once.
+/// Shell springs. Carousel pairs (`library::SPRING_K/C`, `BUMP_K/C`) stay raw:
+/// they are shared with the GTK launcher, and wrapping them as specs invites a
+/// tidy-up that retunes coverflow on both surfaces.
 pub(crate) mod springs {
     use super::SpringSpec;
 
-    /// Screen push/pop. Just under critical — a whole screen that visibly bounces reads as
-    /// broken rather than alive — but sprung rather than tweened because the velocity has
-    /// to carry: a Back pressed mid-push retargets this spring to 0 and the screen turns
-    /// around where it is, which a time-based curve cannot do without snapping.
+    /// Screen push/pop. Damping 0.88 is just under critical: a full-screen bounce
+    /// reads as broken. A spring, not a tween, so a mid-push Back retargets to 0
+    /// and the screen turns around where it is.
     pub(crate) const NAV: SpringSpec = SpringSpec {
         response: 0.42,
         damping: 0.88,
     };
-    /// Row and tile focus. Deliberately the loosest of the table: the whisker of overshoot
-    /// IS the pop that makes a focused row feel picked up rather than merely tinted.
+    /// Row and tile focus. Damping 0.80 leaves a whisker of overshoot; that is the pop.
     pub(crate) const FOCUS: SpringSpec = SpringSpec {
         response: 0.30,
         damping: 0.80,
     };
-    /// The tab pill and the keyboard tray. One spec because they are one gesture — a
-    /// single object gliding to a new seat — and it is the pair [`TRAY_K`]/[`TRAY_C`]
-    /// already encode (see `spring_spec_matches_the_tray_constants`).
+    /// Tab pill and keyboard tray: the [`TRAY_K`]/[`TRAY_C`] pair, pinned by
+    /// `spring_spec_matches_the_tray_constants`.
     pub(crate) const INDICATOR: SpringSpec = SpringSpec {
         response: 0.32,
         damping: 0.86,
     };
-    /// The confirm dip. Fast and loose, so a press reads as a press and not as a fade.
+    /// Confirm dip. Response 0.18 and damping 0.65 so a press reads as a press, not a fade.
     pub(crate) const PRESS: SpringSpec = SpringSpec {
         response: 0.18,
         damping: 0.65,
     };
-    /// The quick-action ring's arrival under the fingers. Looser than [`FOCUS`]: six discs
-    /// flying to their seats want a visible whisker past them and back, or the twist's
-    /// momentum reads as stopping dead at the commit.
+    /// Quick-action ring. Looser than [`FOCUS`]: without a whisker past the seats
+    /// the twist reads as stopping dead at the commit.
     pub(crate) const RING: SpringSpec = SpringSpec {
         response: 0.38,
         damping: 0.72,
     };
 }
 
-/// A damped spring with persistent velocity. `k`/`c` choose the feel; see the pairs in
-/// [`crate::library`] (cursor chase, boundary bump) and [`TRAY_K`]/[`TRAY_C`] below.
+/// `k`/`c` live in [`crate::library`] and [`TRAY_K`]/[`TRAY_C`].
 #[derive(Clone, Copy)]
 pub(crate) struct Spring {
     pub pos: f64,
@@ -116,13 +92,12 @@ impl Spring {
         (self.pos, self.vel) = spring_advance(self.pos, self.vel, target, k, c, dt);
     }
 
-    /// [`Spring::step`] with the feel named instead of spelled out.
     pub(crate) fn step_spec(&mut self, target: f64, spec: SpringSpec, dt: f64) {
         let (k, c) = spec.kc();
         self.step(target, k, c, dt);
     }
 
-    /// Snap onto `target` once the motion is imperceptible (stops per-frame damage).
+    /// Snap onto `target` once motion is imperceptible, so the frame loop stops dirtying.
     pub(crate) fn settle(&mut self, target: f64, eps_pos: f64, eps_vel: f64) {
         if (target - self.pos).abs() < eps_pos && self.vel.abs() < eps_vel {
             self.pos = target;
@@ -131,17 +106,13 @@ impl Spring {
     }
 }
 
-/// The keyboard tray's slide (SwiftUI `.spring(response: 0.32, dampingFraction: 0.86)`:
-/// k = (2π/response)², c = 2·ζ·√k).
+/// Tray slide: `.spring(response: 0.32, dampingFraction: 0.86)`, rounded
+/// (exact is 385.53 / 33.77). Pinned by `spring_spec_matches_the_tray_constants`.
 pub(crate) const TRAY_K: f64 = 385.0;
 pub(crate) const TRAY_C: f64 = 33.7;
 
-// --- Entrance choreography ------------------------------------------------------------
-
-/// Ease-out-back: crosses 1.0 near the end and settles back onto it, so an arriving card
-/// reads as THROWN into place rather than slid. `c1` is 1.2 rather than the CSS-standard
-/// 1.70158 — at full strength the overshoot reads as a bounce, which is a different (and
-/// sillier) gesture.
+/// Overshoots 1.0 then settles, so a card reads as thrown. `C1` is 1.2, not the CSS
+/// 1.70158: full strength reads as a bounce.
 pub(crate) fn ease_out_back(t: f64) -> f64 {
     const C1: f64 = 1.2;
     const C3: f64 = C1 + 1.0;
@@ -149,47 +120,33 @@ pub(crate) fn ease_out_back(t: f64) -> f64 {
     1.0 + C3 * u * u * u + C1 * u * u
 }
 
-/// The share of an item's window spent fading in. Short on purpose: the card is solid
-/// well before it stops moving, so what you read is the motion and not a dissolve.
+/// Fraction of `window` spent fading. 0.34 so the card is solid before it stops moving.
 const FADE_SHARE: f64 = 0.34;
 
-/// How a staggered entrance is shaped.
 #[derive(Clone, Copy)]
 pub(crate) struct EntranceSpec {
-    /// How long ONE item takes to arrive.
+    /// Seconds for one item to arrive.
     pub window: f64,
-    /// Delay added per step of distance from the anchor.
+    /// Seconds of delay per step from the anchor.
     pub stagger: f64,
-    /// Ceiling on that delay. Without it a 400-title shelf would still be arriving a
-    /// minute later; with it, everything past `cap / stagger` items away starts together —
-    /// five or six, for the specs below. Which is why the two move as a pair: that ratio IS
-    /// the number of steps anyone ever sees fan, so raising `stagger` alone buys a wider
-    /// offset across fewer steps and lands the far half of a shelf in one block.
+    /// Seconds, ceiling on delay. `cap / stagger` is how many steps ever fan;
+    /// raise `stagger` alone and the far half of a shelf lands in one block.
     pub cap: f64,
 }
 
 pub(crate) mod entrances {
     use super::EntranceSpec;
 
-    /// Carousel and coverflow cards — the loud one, and the reason this exists.
-    ///
-    /// The stagger is measured against a card's VISIBLE life, not against `window`: the fade
-    /// is over at `FADE_SHARE` and [`super::ease_out_back`] is already at 0.89 by that same
-    /// point, so the last two thirds of the window is a crawl nobody can see. What is left is
-    /// ~0.2 s of readable action, and a neighbour starting a little past halfway through it is
-    /// what makes a strip arrive as a sequence rather than as one soft event. Judged against
-    /// the whole 0.6 s a stagger half this size looks generous; judged against the 0.2 s that
-    /// reads it is four frames, and since every surface here culls to a handful of items,
-    /// four frames is the whole event and not the gap between two of its steps.
+    /// Carousel and coverflow. Stagger 0.12 is judged against the ~0.2 s of
+    /// readable action (`FADE_SHARE` of 0.6), not the full window: ease-out-back
+    /// is already at 0.89 by then, and every surface culls to a handful of items.
     pub(crate) const CARDS: EntranceSpec = EntranceSpec {
         window: 0.6,
         stagger: 0.12,
         cap: 0.6,
     };
-    /// Menu rows. Same language, deliberately quieter: a settings list that fans open like
-    /// a shelf of box art is a settings list showing off. Quieter still has to be countable,
-    /// though — under about three frames apart the rows read as one soft arrival rather than
-    /// as a ripple — so this is a shorter offset, not an absent one.
+    /// Menu rows. Shorter than [`CARDS`], not zero: under about three frames
+    /// apart the rows read as one arrival rather than a ripple.
     pub(crate) const ROWS: EntranceSpec = EntranceSpec {
         window: 0.42,
         stagger: 0.055,
@@ -197,43 +154,34 @@ pub(crate) mod entrances {
     };
 }
 
-/// One item's place in an entrance.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct EntranceAt {
-    /// 0 → 1 travel on [`ease_out_back`]. The SCREEN decides what travels (a card's
-    /// scale, its Y-turn, a row's rise) — this only says how far along it is.
+    /// Progress on [`ease_out_back`] (overshoots 1.0). The screen picks what moves.
     pub travel: f64,
-    /// 0 → 1 opacity.
     pub fade: f64,
 }
 
 impl EntranceAt {
-    /// At rest and fully opaque — what every item reads once the entrance is over.
     pub(crate) const SETTLED: EntranceAt = EntranceAt {
         travel: 1.0,
         fade: 1.0,
     };
 }
 
-/// The staggered card entrance, as a pure function of the shell clock: a screen holds ONE
-/// of these and asks it per item, so there is no per-card state to keep in step with a
-/// list that churns under discovery.
-///
-/// Armed once per screen MOUNT (the first frame after a push), not per frame-loop — the
-/// desktop equivalent of arming on `onAppear`.
+/// Pure function of the shell clock. A screen holds one and asks it per item;
+/// there is no per-card state. Arm once per mount, not per frame.
 #[derive(Clone, Copy)]
 pub(crate) struct Entrance {
     spec: EntranceSpec,
     anchor: usize,
     t0: f64,
-    /// Snapshotted when the entrance is armed rather than read per item, so one entrance
-    /// plays one way even if the setting is stepped while it runs.
+    /// Snapshotted at arm time so one entrance plays one way if the setting moves.
     reduced: bool,
 }
 
 impl Entrance {
-    /// Arm at `t0`, fanning out from `anchor` — which callers pass as the CURSOR, so a
-    /// restored selection assembles around the eye instead of sweeping in from a corner.
+    /// Arm at `t0`. Callers pass the cursor as `anchor` so a restored selection
+    /// assembles around the eye, not from a corner.
     pub(crate) fn new(spec: EntranceSpec, anchor: usize, t0: f64) -> Entrance {
         Entrance {
             spec,
@@ -246,7 +194,6 @@ impl Entrance {
     pub(crate) fn at(&self, i: usize, t: f64) -> EntranceAt {
         let elapsed = t - self.t0;
         if self.reduced {
-            // A plain crossfade: no travel, no stagger, everything together.
             return EntranceAt {
                 travel: 1.0,
                 fade: (elapsed / self.spec.window).clamp(0.0, 1.0),
@@ -260,9 +207,8 @@ impl Entrance {
         }
     }
 
-    /// Has every item landed? The farthest one starts at `cap` and takes `window`, so the
-    /// whole thing is over at their sum whatever `len` is — which is why callers can drop
-    /// the entrance entirely (and stop paying for its transforms) without counting items.
+    /// Over at `cap + window` regardless of `len`, so callers can drop the entrance
+    /// without counting items.
     pub(crate) fn done(&self, t: f64) -> bool {
         t - self.t0 >= self.spec.cap + self.spec.window
     }
@@ -300,11 +246,8 @@ mod tests {
         assert_eq!((s.pos, s.vel), (1.0, 0.0));
     }
 
-    /// The conversion, pinned against the one pair that predates the table. `TRAY_K`/`TRAY_C`
-    /// were hand-derived from `.spring(response: 0.32, dampingFraction: 0.86)` and written
-    /// ROUNDED (385.0/33.7 against an exact 385.53/33.77), so this asserts to 0.3 % rather
-    /// than exactly — the point is that the arithmetic in `kc` is the arithmetic those
-    /// constants came from, not that someone re-typed more digits.
+    /// `kc` vs [`TRAY_K`]/[`TRAY_C`]. Those are rounded (385.0/33.7 vs 385.53/33.77),
+    /// so the assert is 0.3 %, not exact.
     #[test]
     fn spring_spec_matches_the_tray_constants() {
         let (k, c) = springs::INDICATOR.kc();
@@ -318,15 +261,12 @@ mod tests {
         );
     }
 
-    /// The entrance envelope's four load-bearing properties. Asserted on FADE rather than
-    /// travel wherever "further along" is the question: travel rides an ease-out-BACK, so
-    /// it crosses 1.0 and comes back, and a card at 80 % of its window can legitimately be
-    /// further displaced than one that has already landed. Fade is the monotone channel.
+    /// Asserted on fade, not travel: ease-out-back overshoots, so a card at 80 % of
+    /// its window can be further displaced than one that has already landed.
     #[test]
     fn entrance_envelope() {
         let e = Entrance::new(entrances::CARDS, 5, 0.0);
 
-        // The anchor leads. It is the cursor, so the strip assembles around the eye.
         for t in [0.05, 0.2, 0.4, 0.7, 1.1] {
             let anchor = e.at(5, t).fade;
             for i in 0..14 {
@@ -335,17 +275,14 @@ mod tests {
                     "item {i} beat the anchor at t={t}"
                 );
             }
-            // …and symmetric neighbours arrive together.
             assert_eq!(e.at(3, t), e.at(7, t));
         }
 
-        // The cap holds: past `cap / stagger` steps out — five, for CARDS — everything starts
-        // at once. This is what keeps a 400-title shelf from still arriving a minute later.
-        // Derived rather than spelled out, so re-tuning the pair re-aims the probe with it.
+        // Past `cap / stagger` steps, everything starts together. Derived so a
+        // re-tune re-aims the probe.
         let beyond = (entrances::CARDS.cap / entrances::CARDS.stagger).ceil() as usize + 1;
         assert_eq!(e.at(5 + beyond, 0.3), e.at(5 + 250, 0.3));
 
-        // Monotone once started, and never outside 0..=1.
         let mut last = 0.0;
         for step in 0..=120 {
             let at = e.at(9, f64::from(step) * 0.01);
@@ -354,8 +291,6 @@ mod tests {
             last = at.fade;
         }
 
-        // Identity at the end — the whole thing is over at cap + window, whatever `len` is,
-        // which is what lets a screen drop the entrance instead of counting items.
         let over = entrances::CARDS.cap + entrances::CARDS.window;
         assert!(e.done(over));
         assert!(!e.done(over - 0.01));
@@ -364,15 +299,13 @@ mod tests {
         }
     }
 
-    /// Whether the strip reads as a SEQUENCE, which none of `entrance_envelope`'s shape
-    /// properties can see: a spec with `stagger` at zero satisfies every one of them and
-    /// arrives as a single soft event. Three numbers decide it, all derived from the specs
-    /// so that a re-tune which quietly undoes the fan fails here rather than on a couch.
+    /// `entrance_envelope` cannot see this: stagger 0 satisfies every shape property
+    /// and arrives as one event. Derived from the specs so a re-tune that undoes the
+    /// fan fails here.
     #[test]
     fn entrance_stagger_reads_as_a_sequence() {
-        // A neighbour must still be visibly behind while the anchor is halfway through its
-        // FADE — `window` flatters the stagger badly, because an item is perceptually done a
-        // third of the way through it, so this is measured against the part that reads.
+        // Measured against the fade, not `window`: an item is perceptually done a
+        // third of the way through the window, so `window` flatters the stagger.
         let separation = |spec: EntranceSpec| {
             let e = Entrance::new(spec, 5, 0.0);
             let t_mid = 0.5 * FADE_SHARE * spec.window;
@@ -387,26 +320,20 @@ mod tests {
             ("CARDS", entrances::CARDS, 1.25),
             ("ROWS", entrances::ROWS, 0.8),
         ] {
-            // `cap / stagger` is how many steps ever fan, and every surface culls to a
-            // handful of items — the coverflow shows five. Let this drop and a wider
-            // `stagger` buys a bigger offset across fewer steps, which is worse, not better.
+            // `cap / stagger` is how many steps ever fan. Drop this and a wider
+            // `stagger` buys more offset across fewer steps, which is worse.
             let steps = spec.cap / spec.stagger;
             assert!(steps >= 4.0, "{name} fans only {steps} steps");
-            // The other end: "too long" should be a failing test rather than an opinion. The
-            // item under the cursor is untouched by both — its delay is 0 — so this budget
-            // buys peripheral polish and never makes anyone wait.
+            // Cursor delay is 0, so this budget is peripheral polish. Fail here
+            // rather than treat "too long" as an opinion.
             let total = spec.cap + spec.window;
             assert!(total <= budget, "{name} takes {total} s to retire");
         }
     }
 
-    /// Ease-out-back must overshoot — that is the difference between a card being thrown
-    /// into place and slid there — and must still land exactly on 1.0.
     #[test]
     fn ease_out_back_overshoots_then_lands() {
-        // To a tolerance at 0, not exactly: the polynomial is `1 − 2.2 + 1.2`, which is
-        // zero in real arithmetic and −2.2e−16 in f64. The contract is "starts where the
-        // card starts", and a fifth of a femto-unit is that.
+        // Tolerance, not exact: `1 − 2.2 + 1.2` is 0 in reals and −2.2e−16 in f64.
         assert!(ease_out_back(0.0).abs() < 1e-12);
         assert_eq!(ease_out_back(1.0), 1.0);
         assert_eq!(ease_out_back(2.0), 1.0, "clamped");
@@ -417,8 +344,8 @@ mod tests {
         assert!(peak < 1.12, "overshoot reads as a bounce: {peak}");
     }
 
-    /// Reduced motion turns the entrance into a plain crossfade: no travel, no stagger.
-    /// Snapshotted at arm time, so one entrance plays one way even if the setting moves.
+    /// Snapshotted at arm time: the flag is flipped after `new` and the entrance
+    /// must still play as a staggerless crossfade.
     #[test]
     fn entrance_under_reduced_motion_is_a_staggerless_crossfade() {
         crate::theme::set_reduce_motion(true);
@@ -432,9 +359,8 @@ mod tests {
         assert_eq!(e.at(0, 0.6), EntranceAt::SETTLED);
     }
 
-    /// Peak of a unit step as a fraction over the target — 0.0 when the spring never
-    /// crosses. Integrated at 120 Hz so the measurement is the SPRING's shape and not the
-    /// sampling's.
+    /// Peak of a unit step as a fraction over the target. 120 Hz so this is the
+    /// spring's shape, not the sampling's.
     fn peak_overshoot(spec: SpringSpec) -> f64 {
         let mut s = Spring::rest(0.0);
         let mut peak: f64 = 0.0;
@@ -445,10 +371,8 @@ mod tests {
         (peak - 1.0).max(0.0)
     }
 
-    /// The table's damping choices, stated as behaviour rather than as numbers: FOCUS is
-    /// under-damped ENOUGH to read as a pop, INDICATOR is damped enough that a gliding pill
-    /// doesn't wobble at the end of its travel. A future re-tune that breaks either breaks
-    /// this.
+    /// FOCUS must overshoot enough to read as a pop; INDICATOR and NAV must not
+    /// wobble. A re-tune that breaks either fails here.
     #[test]
     fn spec_damping_choices_show_up_as_overshoot() {
         let focus = peak_overshoot(springs::FOCUS);

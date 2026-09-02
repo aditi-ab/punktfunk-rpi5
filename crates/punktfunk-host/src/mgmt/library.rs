@@ -1,32 +1,33 @@
-//! Library-tagged management endpoints: the game catalog (plugin-synced + custom entries), the
-//! source toggles, the provider reconcile API and box art. Split out of the `mgmt` facade (plan §W5).
+//! HTTP handlers for the game catalog, source toggles, provider reconcile, and box-art proxy.
+//!
+//! Domain logic lives in [`crate::library`] and [`crate::runstate`]; this is the `/api/v1/library`
+//! surface. Lanes split on [`super::auth::AuthLane`]:
+//! - **admin** — custom CRUD, hide/unhide, scanner toggles, and operator-only launch fields
+//!   (`command`, `prep`).
+//! - **plugin** — reconcile and liveness report for the store it publishes; privileged fields
+//!   403, unservable local art is stripped rather than refusing the set.
+//! - **paired cert** — `GET /library` (hidden titles filtered, `command` values cleared) and
+//!   the art proxy.
+//!
+//! Pin: `mgmt::tests` lane matrix and `crate::library` art/privilege tests.
 
 use super::auth::AuthLane;
 use super::shared::*;
 use axum::http::header;
 use axum::Extension;
 
-/// Refuse a write whose payload carries an operator-privileged field to a lane that may not set one
-/// (2026-08-05 review H-1), and refuse any local art path the proxy would not serve back (H-2).
+/// Refuse a custom-entry write that carries an operator-privileged field on a lane that may
+/// not set one, or local art the proxy would not serve.
 ///
-/// The **single-entry writes** — the operator creating or editing one custom entry. The provider
-/// reconcile takes [`check_privileged_fields`] and sanitizes art instead; the split is the whole
-/// point, and [`crate::library::sanitize_art_paths`] carries the reasoning.
+/// Single-entry writes only. Provider reconcile uses [`check_privileged_fields`] and
+/// [`crate::library::sanitize_art_paths`]: one bad cover must not drop the whole store.
+/// Route reachability is a different question — `PUT /library/provider/{p}` is a plugin
+/// route, but `prep` / a non-host-resolved `launch.kind` are operator-only.
 ///
-/// Both checks belong here rather than in the route gate: `PUT /library/provider/{p}` is a route a
-/// provider plugin must be able to call — reconciling its own entry set is the whole point of a
-/// scanner plugin — while `prep` / a `launch.kind` outside the host-resolved set inside that payload
-/// are the operator's authority alone. Route reachability and field authority are separate questions.
-///
-/// `Some((reason, response))` is the refusal to return; `None` means the payload may proceed.
-/// Deliberately not `Result<(), Response>`: the "error" here IS the response the handler sends, so
-/// there is no error value to propagate, and a 128-byte `Response` in an `Err` variant is what
-/// `clippy::result_large_err` objects to.
-///
-/// `reason` is the caller's log line. It exists because these are TWO different refusals — an
-/// operator-privileged field (403) and an unservable art path (400) — and logging both as "carries
-/// a field this lane may not set" sent the Lutris/Steam `file://` art rejection looking like an
-/// auth problem.
+/// Returns `Some((reason, response))` to send, `None` to proceed. Not `Result`: the
+/// "error" is the response, and a 128-byte `Response` in `Err` trips
+/// `clippy::result_large_err`. `reason` is the log line so a 403 (privileged field) and a
+/// 400 (unservable art) are not both logged as an auth failure.
 fn check_entry_fields(
     lane: AuthLane,
     art: &crate::library::Artwork,
@@ -41,12 +42,11 @@ fn check_entry_fields(
     })
 }
 
-/// The half of [`check_entry_fields`] that is about *authority* rather than about art: an
-/// operator-privileged field this lane may not set (403), or an unrepresentable icon token (400).
+/// Authority half of [`check_entry_fields`]: privileged field this lane may not set (403),
+/// or an unrepresentable icon token (400).
 ///
-/// Split out for the provider reconcile, which must apply exactly these two and NOT the art check —
-/// it sanitizes unservable covers instead of refusing the payload
-/// ([`crate::library::sanitize_art_paths`] explains why the two callers want different answers).
+/// Provider reconcile uses this and sanitizes unservable covers instead of 400-ing the
+/// payload. See [`crate::library::sanitize_art_paths`].
 fn check_privileged_fields(
     lane: AuthLane,
     launch: Option<&crate::library::LaunchSpec>,
@@ -69,10 +69,9 @@ fn check_privileged_fields(
             ));
         }
     }
-    // Shape-only, and on every lane: an icon token names no resource the host owns, so there is
-    // nothing here for an operator token to unlock — it is refused for being unrepresentable as a
-    // slug, not for being privileged. Clients interpolate the value, so the guard belongs upstream
-    // of all of them (`crate::library::validate_icon`).
+    // Shape, every lane: an icon token names no host resource, so an operator token cannot
+    // unlock it. Clients interpolate the value; refuse unrepresentable slugs here
+    // (`crate::library::validate_icon`).
     if let Err(e) = crate::library::validate_icon(icon) {
         return Some((e.clone(), api_error(StatusCode::BAD_REQUEST, &e)));
     }
@@ -81,24 +80,17 @@ fn check_privileged_fields(
 
 #[derive(Deserialize)]
 pub(crate) struct LibraryQuery {
-    /// Only entries owned by this external provider (RFC §8).
     provider: Option<String>,
-    /// Only entries on this platform (case-insensitive).
     platform: Option<String>,
 }
 
-/// List the game library
+/// List every title this host knows, sorted by title.
 ///
-/// Every title this host knows about, sorted by title: the entries each installed library plugin
-/// has synced (Steam, Lutris, Heroic, Epic, GOG, Xbox, Playnite, ROM managers, …) plus the user's
-/// own custom entries. Artwork fields are URLs the client fetches directly, except local files on
-/// the host, which are rewritten to this API's own art proxy. `?provider=` narrows to the entries a
-/// given external provider owns; `?platform=` to one platform (case-insensitive — whatever the
-/// source authored, conventionally `PC` for desktop stores).
+/// Plugin-synced entries plus custom ones. Local-file art is rewritten to this API's art
+/// proxy; remote URLs pass through. `?provider=` / `?platform=` (case-insensitive) narrow.
 ///
-/// **The operator's own lane additionally sees the titles they have HIDDEN**, each carrying
-/// `hidden: true`; every other lane gets them filtered out upstream and cannot tell they exist. The
-/// console needs them to offer "un-hide", and it is the only surface that does.
+/// The operator lane sees hidden titles (`hidden: true`) so the console can un-hide them.
+/// Every other lane is filtered upstream and cannot tell they exist.
 #[utoipa::path(
     get,
     path = "/library",
@@ -117,10 +109,9 @@ pub(crate) async fn get_library(
     Extension(lane): Extension<AuthLane>,
     Query(q): Query<LibraryQuery>,
 ) -> Response {
-    // The operator's list is a DIFFERENT TYPE, not the same one with a flag set — which is what
-    // makes "a hidden title never reaches a paired client" structural rather than a filter someone
-    // has to remember. The redaction below is skipped here because this arm is the operator's own
-    // token: the command line being redacted is the one they typed.
+    // Operator list is a different type, not a flag, so a hidden title cannot reach a paired
+    // client by forgetting a filter. Skip redaction here: this arm is the operator's token,
+    // and the command line being shown is the one they typed.
     if lane.is_operator() {
         let mut rows = crate::library::all_games_for_operator();
         rows.retain(|r| matches_query(&r.entry, &q));
@@ -131,26 +122,13 @@ pub(crate) async fn get_library(
     }
     let mut games = crate::library::all_games();
     games.retain(|g| matches_query(g, &q));
-    // Rewrite provider entries' local-file art into host art-proxy URLs so a client fetches covers
-    // from the host (a provider like Playnite stores on-host paths; the payload stays tiny at any
-    // library size, and the client never sees an unreachable `C:\…`).
+    // Provider covers are on-host paths; rewrite to the art proxy so the client never sees them.
     for g in &mut games {
         crate::library::proxy_local_art(&g.id, &mut g.art);
     }
-    // Redact the operator's command lines for every lane but their own (2026-08-05 review L-1).
-    //
-    // `cert_may_access` allows `GET /library`, so this response goes to every paired STREAMING
-    // client on the LAN — and for a custom entry `launch.value` is the raw shell command or
-    // absolute exe path the operator typed. The adjacent `detect` field is `#[serde(skip)]` for
-    // exactly this reason; `launch` simply never got the same treatment. Clients don't need it:
-    // a client picks a title by ID and the host resolves the recipe itself (`resolve_launch`),
-    // which is the invariant that stops a client injecting a command in the first place. The
-    // `kind` stays, so "this is launchable, and how" still renders.
-    //
-    // Unconditional now: the operator's lane returned above, so reaching here IS "some lane but
-    // theirs". Leaving the old `if !lane.may_set_privileged_fields()` would read as though an
-    // unredacted path still existed here, and would quietly stop redacting if that early return
-    // ever moved.
+    // `cert_may_access` allows GET /library, so paired clients see this body. For a custom
+    // entry `launch.value` is the operator's shell command; clear it. `kind` stays so the
+    // client can still render launchability. Unconditional: the operator arm returned above.
     for g in &mut games {
         if let Some(l) = g.launch.as_mut() {
             if l.kind == "command" {
@@ -161,7 +139,7 @@ pub(crate) async fn get_library(
     Json(games).into_response()
 }
 
-/// The `?provider=` / `?platform=` narrowing, shared by both lane arms so they cannot drift.
+/// Shared by both `get_library` arms so the filters cannot drift.
 fn matches_query(g: &crate::library::GameEntry, q: &LibraryQuery) -> bool {
     if let Some(provider) = q.provider.as_deref().filter(|p| !p.is_empty()) {
         if g.provider.as_deref() != Some(provider) {
@@ -181,34 +159,23 @@ fn matches_query(g: &crate::library::GameEntry, q: &LibraryQuery) -> bool {
     true
 }
 
-/// Request body for `setLibraryEntryHidden`.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct HiddenToggle {
-    /// Whether this title should be hidden from every play surface.
     hidden: bool,
 }
 
-/// What `setLibraryEntryHidden` echoes back.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct HiddenState {
-    /// The entry id the call addressed.
     id: String,
-    /// Its visibility after the call.
     hidden: bool,
 }
 
-/// Hide or un-hide one library title
+/// Hide or un-hide one library title.
 ///
-/// Curation, not access control: a hidden title disappears from every play surface — the console
-/// grid on a client, native clients, the GameStream app list, and launch resolution — while nothing
-/// is deleted and un-hiding restores it immediately. The operator's own console still lists it
-/// (flagged `hidden`) so it can be brought back.
-///
-/// Keyed by the entry's stable `<store>:<external_id>` id, which survives re-scans and reconciles by
-/// construction (D2). The id is **not** validated against the current library on purpose: a title
-/// can be legitimately absent at this moment (launcher closed, plugin mid-sync, drive unmounted),
-/// and refusing the operator's choice in that window would be worse than storing an id that
-/// currently matches nothing. Emits `library.changed` (source = the store) only on a real change.
+/// Curation, not access control: the title leaves every play surface and launch resolution
+/// but is not deleted. The operator console still lists it (`hidden: true`) so it can return.
+/// The id is not required to exist now — a plugin mid-sync or an unmounted drive would
+/// otherwise refuse a choice that should stick. Emits `library.changed` only on a real change.
 #[utoipa::path(
     put,
     path = "/library/hidden/{id}",
@@ -239,23 +206,16 @@ pub(crate) async fn set_library_entry_hidden(
     }
 }
 
-/// Request body for `setLibraryScanner`.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct ScannerToggle {
-    /// Whether this source should contribute titles on this host.
     enabled: bool,
 }
 
-/// List the library sources
+/// List every game source on this host with its enable state.
 ///
-/// Every game source on this host with its enable state — one row per installed library plugin
-/// (Steam, Lutris, Heroic, Epic, GOG, Xbox, Playnite, ROM managers, …), so the list reflects what
-/// the operator has actually installed rather than what this build happens to support. Sources
-/// default to enabled; disabling one hides its titles from every library surface from the next
-/// read. The user-curated custom store is not a source and is always on.
-///
-/// Older hosts (≤ v0.27.x) also listed the six scanners built into the host binary, with
-/// `origin: "builtin"`. Those are gone; every row now reports `origin: "plugin"`.
+/// One row per installed library plugin. Sources default to enabled; disabling hides titles
+/// from the next read. The custom store is not a source and is always on. Every row is
+/// `origin: "plugin"`.
 #[utoipa::path(
     get,
     path = "/library/scanners",
@@ -270,13 +230,10 @@ pub(crate) async fn list_library_scanners() -> Json<Vec<crate::library::ScannerI
     Json(crate::library::list_scanners())
 }
 
-/// Enable or disable a library source
+/// Enable or disable a library source.
 ///
-/// Persists the toggle and applies it from the next library read (no restart). Disabling a source
-/// hides its titles everywhere — the console grid, native clients, and the GameStream app list —
-/// and re-enabling brings them straight back. Nothing is deleted: the plugin may keep reconciling
-/// while its source is off, and those entries simply aren't surfaced. Emits `library.changed` with
-/// the source id as `source` when the state changed.
+/// Takes effect on the next library read. Disabling hides titles; the plugin may keep
+/// reconciling while off. Nothing is deleted. Emits `library.changed` when the state changes.
 #[utoipa::path(
     put,
     path = "/library/scanners/{id}",
@@ -309,10 +266,7 @@ pub(crate) async fn set_library_scanner(
     }
 }
 
-/// Add a custom library entry
-///
-/// Creates a user-curated title (e.g. a non-Steam game, an emulator, a ROM) with caller-supplied
-/// artwork URLs. The host assigns a stable id, returned in the body.
+/// Create a user-curated title. The host assigns a stable id, returned in the body.
 #[utoipa::path(
     post,
     path = "/library/custom",
@@ -348,7 +302,6 @@ pub(crate) async fn create_custom_game(
     }
 }
 
-/// Update a custom library entry
 #[utoipa::path(
     put,
     path = "/library/custom/{id}",
@@ -391,7 +344,7 @@ pub(crate) async fn update_custom_game(
             StatusCode::CONFLICT,
             &format!("entry is owned by provider `{p}` — update it through its reconcile"),
         ),
-        // Store claims are a reconcile-only concern — the manual CRUD never requests one.
+        // Manual CRUD never requests a store claim; this arm is a programming error.
         Ok(MutateOutcome::StoreClaimed { .. }) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "unexpected claim outcome",
@@ -400,7 +353,6 @@ pub(crate) async fn update_custom_game(
     }
 }
 
-/// Delete a custom library entry
 #[utoipa::path(
     delete,
     path = "/library/custom/{id}",
@@ -427,7 +379,7 @@ pub(crate) async fn delete_custom_game(Path(id): Path<String>) -> Response {
                 "entry is owned by provider `{p}` — remove it there, or DELETE the provider set"
             ),
         ),
-        // Store claims are a reconcile-only concern — the manual CRUD never requests one.
+        // Manual CRUD never requests a store claim; this arm is a programming error.
         Ok(MutateOutcome::StoreClaimed { .. }) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "unexpected claim outcome",
@@ -436,35 +388,26 @@ pub(crate) async fn delete_custom_game(Path(id): Path<String>) -> Response {
     }
 }
 
-/// The count envelope a provider uninstall returns.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ProviderRemoved {
-    /// How many entries the provider owned (and were removed).
     removed: usize,
 }
 
-/// Query for `reconcileProviderEntries` — the optional store claim (D2).
 #[derive(Deserialize)]
 pub(crate) struct ReconcileQuery {
-    /// Claim this store for the provider, so its entries take the store's own identity.
+    /// Claim this store so entries take `<store>:<external_id>` instead of `custom:<id>`.
     store: Option<String>,
 }
 
-/// Replace a provider's library entries (declarative reconcile)
+/// Replace a provider's library entries (declarative reconcile).
 ///
-/// Atomically replaces the full entry set owned by `{provider}` (RFC §8): the payload is the
-/// provider's desired list, keyed by its own stable `external_id` — the host diffs, keeps each
-/// surviving title's host id stable across reconciles, drops orphans, and never touches manual
-/// entries or other providers'. An empty array removes everything the provider owns. Emits
-/// `library.changed` with the provider as `source`.
+/// The payload is the desired set, keyed by `external_id`. The host diffs, keeps surviving
+/// host ids stable, and drops orphans. Empty array removes everything this provider owns.
+/// Emits `library.changed` with the provider as `source`.
 ///
-/// `?store=` additionally **claims** that store for the provider: its entries then surface with
-/// deterministic `<store>:<external_id>` ids and the store's own badge, instead of opaque
-/// `custom:<id>` ones — which is what let a library plugin reproduce the entries the in-host scanner
-/// used to produce, right down to the GameStream app ids and client-side art caches, and is why
-/// removing those scanners changed nothing downstream. One provider per store; a second claimant
-/// gets 409. The claim is released by `DELETE`, not by an empty reconcile (a store can legitimately
-/// have zero installed titles).
+/// `?store=` claims that store: entries surface as `<store>:<external_id>` with the store
+/// badge. One provider per store; a second claimant gets 409. Release the claim with
+/// `DELETE`, not an empty reconcile — a store can have zero installed titles.
 #[utoipa::path(
     put,
     path = "/library/provider/{provider}",
@@ -501,14 +444,9 @@ pub(crate) async fn reconcile_provider_entries(
     if let Err(e) = crate::library::validate_provider_payload(&inputs) {
         return api_error(StatusCode::BAD_REQUEST, &e);
     }
-    // Every entry in the payload, not just the first — a reconcile replaces a whole entry set, so
-    // one privileged field anywhere in it is one command execution.
-    //
-    // Art is deliberately NOT part of this refusal. A privileged field is the plugin overreaching
-    // and must fail the write; an unservable cover is a path mismatch between where a launcher keeps
-    // its art and where the host is allowed to read, and failing the payload over one of those threw
-    // away a working library to save a thumbnail. Those covers are stripped below instead, which
-    // holds the same "no unservable path is ever persisted" invariant.
+    // Check every entry: one privileged field anywhere is one command the host would run.
+    // Art is not in this refusal — an unservable cover is stripped below so one bad
+    // thumbnail cannot drop the store. Privileged fields still 403 the write.
     for (i, e) in inputs.iter().enumerate() {
         if let Some((reason, denied)) =
             check_privileged_fields(lane, e.launch.as_ref(), &e.prep, e.icon.as_deref())
@@ -523,9 +461,7 @@ pub(crate) async fn reconcile_provider_entries(
             return denied;
         }
     }
-    // A launcher this box cannot open is a fact about the box, not a defect in the payload, so it
-    // costs its own tile and nothing else. Before this, the Playnite plugin's single launcher entry
-    // 400'd every game it shipped alongside.
+    // A launcher this host cannot open is a fact about the box; drop that tile, not the set.
     for (title, value) in crate::library::sanitize_launcher_entries(&mut inputs) {
         tracing::warn!(
             provider,
@@ -535,8 +471,7 @@ pub(crate) async fn reconcile_provider_entries(
              payload still syncs. Install the launcher, or turn the tile off in the plugin's config"
         );
     }
-    // One aggregated line, not one per entry: a root mismatch misses EVERY cover in the payload, and
-    // a per-entry warn would bury the rest of the log under a thousand copies of one fact.
+    // One warn for the batch: a root mismatch misses every cover; per-entry would flood the log.
     let mut dropped_art = 0usize;
     let mut first_dropped: Option<(String, &'static str, String)> = None;
     for e in inputs.iter_mut() {
@@ -580,10 +515,8 @@ pub(crate) async fn reconcile_provider_entries(
     }
 }
 
-/// Remove a provider's library entries
-///
-/// Deletes every entry owned by `{provider}` — the clean-uninstall path for a provider plugin
-/// (RFC §8). Emits `library.changed` when anything was removed.
+/// Delete every entry owned by `{provider}` (plugin uninstall). Emits `library.changed`
+/// when anything was removed.
 #[utoipa::path(
     delete,
     path = "/library/provider/{provider}",
@@ -606,8 +539,7 @@ pub(crate) async fn delete_provider_entries(Path(provider): Path<String>) -> Res
             if removed > 0 {
                 tracing::info!(provider, removed, "library provider entries removed");
             }
-            // Its entries are gone, so its opinions about them are meaningless — and a lease must
-            // never be held open by a provider that no longer exists.
+            // Entries are gone; drop the liveness lease so a missing provider cannot hold it open.
             crate::runstate::forget(&provider);
             Json(ProviderRemoved { removed }).into_response()
         }
@@ -615,60 +547,41 @@ pub(crate) async fn delete_provider_entries(Path(provider): Path<String>) -> Res
     }
 }
 
-/// One running title in a provider's liveness report.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct RunningTitle {
-    /// The provider's own stable id for the title — the same key its reconcile payload uses.
+    /// Same key the reconcile payload uses.
     pub external_id: String,
-    /// The process id the provider started for it, when it knows one. Optional, and never trusted
-    /// as a bare number: the host re-resolves it and pins it to its start time before it is ever
-    /// signalled, so a stale or recycled pid simply contributes nothing.
+    /// Pid the provider started, when it knows one. Re-resolved and pinned to start time
+    /// before any signal; a stale or recycled pid contributes nothing.
     #[serde(default)]
     pub pid: Option<u32>,
 }
 
-/// Request body for `reportProviderRunning`.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct ProviderRunningInput {
-    /// Every title of this provider's that is running **right now**. The full set, not a delta:
-    /// anything absent from it is reported as stopped.
+    /// Complete running set, not a delta: anything absent is reported as stopped.
     #[serde(default)]
     pub running: Vec<RunningTitle>,
 }
 
-/// The result of a liveness report.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ProviderRunningAccepted {
-    /// How many reported titles matched an entry this provider currently publishes.
     matched: usize,
-    /// How many were ignored because no such entry exists (a report that raced a reconcile).
+    /// Ignored because no such entry exists (report raced a reconcile).
     unknown: usize,
-    /// Seconds this report stays authoritative without being restated — re-report inside it while
-    /// anything is running.
+    /// Seconds this report stays authoritative without being restated.
     ttl_s: u64,
 }
 
-/// Report which of a provider's titles are running
+/// Report which of a provider's titles are running.
 ///
-/// The **live** counterpart to the `detect` hints in a reconcile payload: that one says *how to
-/// recognize* a title's process, this one says *it is running now* (design §9,
-/// [`crate::runstate`]). For a provider that starts games itself and knows when they stop —
-/// Playnite tracks every launch and fires an event on both edges — this is a fact the host would
-/// otherwise have to re-derive by scanning, and for a title with nothing to scan for (an emulated
-/// game, a manually added one) could not derive at all.
+/// Live counterpart to reconcile `detect` hints: the body is the complete running set
+/// ([`crate::runstate`]). Missed events and plugin restarts self-correct on the next PUT.
 ///
-/// Declarative and idempotent, like the reconcile: the body is the provider's **complete** running
-/// set, so a missed event, a plugin restart or an install mid-game all self-correct on the next
-/// report rather than drifting.
-///
-/// The report **expires** after `ttl_s` (90s) unless restated, which is what makes it safe for a
-/// live provider to keep a streaming session open for a game the host cannot see: a plugin that
-/// dies with a game running stops counting shortly after, and the host falls back to process
-/// scanning exactly as it does without one. Re-report on every change **and** on a timer well
-/// inside the window.
-///
-/// Titles the provider does not currently publish are ignored (counted in `unknown`), not an error:
-/// a report may legitimately race its own reconcile.
+/// Authoritative for [`crate::runstate::REPORT_TTL`] unless restated; a dead plugin then
+/// falls back to process scanning. Re-report on change and on a timer inside the window.
+/// Titles the provider does not currently publish count as `unknown`, not an error — a
+/// report may race its own reconcile.
 #[utoipa::path(
     put,
     path = "/library/provider/{provider}/running",
@@ -689,10 +602,8 @@ pub(crate) async fn report_provider_running(
     if let Err(e) = crate::library::validate_provider_name(&provider) {
         return api_error(StatusCode::BAD_REQUEST, &e);
     }
-    // Resolve the provider's own keys to the ids the rest of the host uses. A plugin knows its
-    // titles by `external_id`; a lease knows them by the library id the catalog assigned
-    // (`playnite:<guid>`), and only the catalog can map between the two — which is also what makes
-    // this authorization-safe, since a provider can only ever speak about entries it published.
+    // Map the provider's `external_id`s to catalog library ids. Only published entries
+    // resolve, so a report cannot name a title it does not own.
     let mine: Vec<(String, String)> = crate::library::load_custom()
         .into_iter()
         .filter(|e| e.provider.as_deref() == Some(provider.as_str()))
@@ -730,16 +641,12 @@ pub(crate) async fn report_provider_running(
     .into_response()
 }
 
-/// Fetch one cover-art image for a library entry
+/// Stream one cover-art image for a library entry.
 ///
-/// Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for the given library id and streams
-/// the image bytes. Any id stored in the host's catalog (manual entries, provider-synced entries,
-/// and a library plugin's claimed-store entries) serves its local art file; anything else 404s and
-/// the client falls through to its next art candidate.
-///
-/// The host fetches nothing here. Art a plugin published as an `http(s)` URL is fetched by the
-/// client directly — this proxy exists for the *local* files a plugin finds on the host's own disk
-/// (a launcher's cover cache), which a client has no way to read.
+/// Resolves `kind` (`portrait` | `hero` | `logo` | `header`) for a catalog id and returns
+/// the local file bytes. Unknown id or kind is 404 so the client can try the next candidate.
+/// Remote `http(s)` art is fetched by the client; this proxy exists for launcher cover
+/// caches on the host disk.
 #[utoipa::path(
     get,
     path = "/library/art/{id}/{kind}",
@@ -759,11 +666,8 @@ pub(crate) async fn get_library_art(Path((id, kind)): Path<(String, String)>) ->
     let Some(kind) = crate::library::ArtKind::parse(&kind) else {
         return api_error(StatusCode::NOT_FOUND, "unknown art kind");
     };
-    // `library.json`, for ANY id (WP1.2): manual entries, provider-synced entries and a library
-    // plugin's claimed-store `steam:570` all serve their local art file from here, so the proxy never
-    // has to know which store an id belongs to. This was one of two branches — the second resolved a
-    // `steam:` id through the in-host Steam scanner's own cache/CDN ladder, and was retired with that
-    // scanner (M6). Steam ids now arrive here like every other claimed store's.
+    // Any catalog id (manual, provider, claimed-store) serves its local file from here.
+    // The proxy does not know which store the id belongs to.
     let stored = {
         let id = id.clone();
         tokio::task::spawn_blocking(move || crate::library::library_local_art_bytes(&id, kind))

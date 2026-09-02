@@ -1,20 +1,17 @@
-//! Headless input injection on KWin via the privileged `org_kde_kwin_fake_input` protocol — the
-//! exact path KDE's own headless RDP server (`krdpserver`) uses. KWin advertises this restricted
-//! global only to a client authorized through its installed `.desktop` `X-KDE-Wayland-Interfaces`
-//! (we ship `io.unom.Punktfunk.Host.desktop`, which lists `org_kde_kwin_fake_input` alongside
-//! `zkde_screencast_unstable_v1`). Binding the global IS the authorization, so injection needs **no
-//! RemoteDesktop portal and no "Allow remote control?" dialog** — it works with no user present,
-//! which the libei/portal path cannot. We connect as an ordinary Wayland client on the KWin session's
-//! `$WAYLAND_DISPLAY` and translate events into fake-input requests; keyboard keys are raw Linux
-//! evdev codes that KWin resolves through the session's own keymap (no keymap upload, unlike the wlr
-//! virtual-keyboard path), and absolute pointer/touch coordinates are global compositor space.
+//! Headless keyboard/mouse/touch on KWin via `org_kde_kwin_fake_input`.
 //!
-//! Global compositor space is *logical* pixels (post display-scaling), which only equals the streamed
-//! output's physical pixels at scale 1. Under a fractional/integer scale the logical edge sits at
-//! `physical / scale`, so feeding the raw streamed pixel coordinate lands the cursor `scale×` too far
-//! toward the bottom-right (top-left stays put). We therefore track each output's logical geometry
-//! (position + size) via `xdg-output` and map the normalized client position into the matching
-//! output's logical rectangle — the same shape the libei backend uses with its EI region.
+//! KWin advertises this restricted global only to a client whose installed `.desktop`
+//! lists it under `X-KDE-Wayland-Interfaces` (`io.unom.Punktfunk.Host.desktop`). Binding
+//! is the grant — no RemoteDesktop portal and no "Allow remote control?" dialog — so it
+//! works with nobody at the seat. Connect on the session `$WAYLAND_DISPLAY`. Keys are
+//! raw Linux evdev codes; KWin maps them through the session keymap (no keymap upload).
+//! Absolute pointer/touch use *logical* compositor pixels (post scale). At scale ≠ 1 the
+//! logical edge is `physical / scale`; a streamed pixel coordinate then lands `scale×`
+//! too far toward the bottom-right. Track each output's logical rectangle via
+//! `xdg-output` and map the normalized client position into it.
+//!
+//! Pin: install the host `.desktop` and re-login (KWin caches the grant per-exe).
+//! Same path as `krdpserver`. See `docs-site/content/docs/kde.md`.
 
 #![allow(clippy::all, dead_code, non_camel_case_types, non_snake_case, unused)]
 
@@ -30,8 +27,7 @@ use wayland_protocols::xdg::xdg_output::zv1::client::{
     zxdg_output_v1::{self, ZxdgOutputV1},
 };
 
-// Generate the client bindings for the vendored protocol XML inline (no build.rs), exactly like the
-// KWin virtual-output backend. Path is relative to CARGO_MANIFEST_DIR.
+// Inline scanner (no build.rs). Path is relative to CARGO_MANIFEST_DIR.
 #[allow(clippy::all, dead_code, non_camel_case_types, non_snake_case, unused)]
 pub mod fake {
     use wayland_client;
@@ -48,34 +44,29 @@ pub mod fake {
 
 use fake::org_kde_kwin_fake_input::OrgKdeKwinFakeInput as FakeInput;
 
-/// Highest interface version we drive. `keyboard_key` arrived at v4; KWin advertises ≥4.
+/// `keyboard_key` arrived at v4; bind no higher.
 const MAX_VERSION: u32 = 4;
 
-/// `wl_pointer.axis` values used by `axis`.
 const AXIS_VERTICAL: u32 = 0;
 const AXIS_HORIZONTAL: u32 = 1;
-/// `code` value marking a horizontal scroll event (mirrors `gamestream::input` / the wlr backend).
+/// GameStream `code` for a horizontal wheel (same as `gamestream::input`).
 const SCROLL_HORIZONTAL: u32 = 1;
 
-/// One tracked output: its physical mode (to match the streamed resolution) and its logical geometry
-/// (the global-compositor-space rectangle absolute coordinates are addressed in). `logical_w == 0`
-/// means xdg-output hasn't reported its size yet.
+/// Physical mode (match streamed WxH) plus logical rectangle (abs coords).
+/// `logical_w == 0` until xdg-output reports size.
 struct OutputTrack {
-    /// Registry global id — also the dispatch user-data, so events route back to this entry.
+    /// Registry id; also dispatch user-data so events find this entry.
     name: u32,
     wl_output: WlOutput,
     xdg_output: Option<ZxdgOutputV1>,
-    /// Physical pixel mode from `wl_output.mode` (the `current` mode); matched against the streamed WxH.
     mode_w: i32,
     mode_h: i32,
-    /// Logical (post-scale) geometry from `xdg-output`.
     logical_x: i32,
     logical_y: i32,
     logical_w: i32,
     logical_h: i32,
 }
 
-/// Registry-bound globals (the Wayland dispatch state).
 #[derive(Default)]
 struct State {
     fake: Option<FakeInput>,
@@ -84,7 +75,6 @@ struct State {
 }
 
 impl State {
-    /// Create the `xdg_output` for a tracked output once both it and the manager exist.
     fn ensure_xdg_output(o: &mut OutputTrack, mgr: &ZxdgOutputManagerV1, qh: &QueueHandle<State>) {
         if o.xdg_output.is_none() {
             o.xdg_output = Some(mgr.get_xdg_output(&o.wl_output, qh, o.name));
@@ -111,7 +101,7 @@ impl Dispatch<WlRegistry, ()> for State {
                     state.fake = Some(registry.bind(name, version.min(MAX_VERSION), qh, ()));
                 }
                 "wl_output" => {
-                    // v1 carries `mode` (all we need); bind no higher than the proxy's max (4).
+                    // `mode` is v1; bind ≤ the proxy max (4).
                     let wl_output: WlOutput = registry.bind(name, version.min(4), qh, name);
                     let mut o = OutputTrack {
                         name,
@@ -131,7 +121,6 @@ impl Dispatch<WlRegistry, ()> for State {
                 }
                 "zxdg_output_manager_v1" => {
                     let mgr: ZxdgOutputManagerV1 = registry.bind(name, version.min(3), qh, ());
-                    // Outputs bound before the manager have no xdg_output yet — create them now.
                     for o in state.outputs.iter_mut() {
                         State::ensure_xdg_output(o, &mgr, qh);
                     }
@@ -178,7 +167,7 @@ impl Dispatch<WlOutput, u32> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // Only the *current* mode matters — a real monitor also advertises its other supported modes.
+        // A monitor also advertises non-current modes; only Current is the live size.
         if let wl_output::Event::Mode {
             flags: WEnum::Value(flags),
             width,
@@ -239,14 +228,10 @@ pub struct KwinFakeInjector {
     queue: EventQueue<State>,
     state: State,
     fake: FakeInput,
-    /// When output geometry was last re-read; throttles the per-event roundtrip (see `refresh_geometry`).
     last_refresh: Option<Instant>,
 }
 
-/// How often the fake_input backend re-reads output geometry from the compositor. Output add/remove
-/// (a new session's virtual output) and live scale/resolution changes are infrequent, so a lazy
-/// poll on the injector's own thread is plenty and adds at most one local-socket roundtrip twice a
-/// second — versus a blocking roundtrip on every single mouse-move event.
+/// Cap geometry roundtrips at 2 Hz. A roundtrip on every mouse-move would stall the control path.
 const GEO_REFRESH: Duration = Duration::from_millis(500);
 
 impl KwinFakeInjector {
@@ -267,17 +252,14 @@ impl KwinFakeInjector {
              KWin authorizes it (the grant is cached per-exe on first connect), or this is not a \
              KWin session",
         )?;
-        // Authenticate (the legacy handshake; for an interface-authorized client KWin accepts it
-        // without a dialog — same as krdpserver/krfb headless).
+        // Legacy handshake; an interface-authorized client is accepted with no dialog.
         fake.authenticate("Punktfunk".into(), "remote streaming input".into());
         queue
             .roundtrip(&mut state)
             .context("fake_input authenticate roundtrip")?;
         conn.flush().ok();
 
-        // Settle output geometry (wl_output + xdg-output were bound during the registry roundtrip
-        // above; their logical_size arrives on a follow-up roundtrip). Best-effort — falls back to
-        // scale-1 mapping if xdg-output is absent.
+        // `logical_size` arrives after the registry roundtrip. Falls back to scale-1 if xdg-output is absent.
         let mut injector = Self {
             conn,
             queue,
@@ -293,10 +275,9 @@ impl KwinFakeInjector {
         Ok(injector)
     }
 
-    /// Re-read output geometry, throttled to [`GEO_REFRESH`]. A `roundtrip` both flushes any pending
-    /// `get_xdg_output` requests and reads the geometry events back. A wl_output that *appeared* this
-    /// round only gets its xdg_output created mid-dispatch, so its `logical_size` lands on a later
-    /// roundtrip — keep going (bounded) until every output is settled.
+    /// Throttled to [`GEO_REFRESH`]. A wl_output that appeared this round only gets
+    /// `xdg_output` mid-dispatch, so `logical_size` lands on a later roundtrip — loop
+    /// (bounded) until every output has a size.
     fn refresh_geometry(&mut self) {
         let now = Instant::now();
         if let Some(t) = self.last_refresh {
@@ -317,10 +298,8 @@ impl KwinFakeInjector {
         }
     }
 
-    /// Resolve the logical (global-compositor-space) rectangle to map a normalized client position
-    /// into. Prefer the output whose physical mode matches the streamed `phys_w`×`phys_h` (the
-    /// per-session virtual output); fall back to the sole output, then — if xdg-output is unavailable
-    /// — to the streamed pixels at the origin (the pre-scaling behavior, correct at scale 1).
+    /// Logical rectangle for a normalized client position: matching physical mode, else
+    /// the sole output, else streamed pixels at the origin (correct at scale 1).
     fn logical_target(&self, phys_w: i32, phys_h: i32) -> (f64, f64, f64, f64) {
         let usable = || {
             self.state
@@ -361,8 +340,6 @@ impl InputInjector for KwinFakeInjector {
                 if w > 0 && h > 0 {
                     self.refresh_geometry();
                     let (lx, ly, lw, lh) = self.logical_target(w, h);
-                    // Normalize in the streamed (physical) pixel space, then place inside the output's
-                    // logical rectangle — so display scaling no longer offsets the cursor.
                     let nx = (event.x as f64 / w as f64).clamp(0.0, 1.0);
                     let ny = (event.y as f64 / h as f64).clamp(0.0, 1.0);
                     self.fake
@@ -376,8 +353,7 @@ impl InputInjector for KwinFakeInjector {
                 }
             }
             InputKind::MouseScroll => {
-                // GameStream sends WHEEL_DELTA(120)-scaled units; a notch ≈ 15px. Vertical flips
-                // sign on the Wayland axis, horizontal passes through — same as the wlr backend.
+                // GameStream WHEEL_DELTA is 120; a notch ≈ 15 px. Vertical flips Wayland axis sign.
                 let horizontal = event.code == SCROLL_HORIZONTAL;
                 let axis = if horizontal {
                     AXIS_HORIZONTAL
@@ -389,8 +365,7 @@ impl InputInjector for KwinFakeInjector {
                 self.fake.axis(axis, sign * notches * 15.0);
             }
             InputKind::KeyDown | InputKind::KeyUp => {
-                // Raw evdev keycode; KWin resolves it through the session's own keymap (and tracks
-                // modifier state itself, so no separate modifiers request is needed).
+                // Evdev code; KWin owns the keymap and modifier state — no modifiers request.
                 if let Some(evdev) = vk_to_evdev(event.code as u8) {
                     let st = u32::from(event.kind == InputKind::KeyDown);
                     self.fake.keyboard_key(evdev as u32, st);
@@ -398,8 +373,7 @@ impl InputInjector for KwinFakeInjector {
                     tracing::debug!(vk = event.code, "unmapped VK keycode — dropped");
                 }
             }
-            // Touch: id = event.code, coords in the client surface w×h packed into flags (same
-            // absolute mapping as MouseMoveAbs). Each event is its own frame.
+            // `code` is the touch id; w×h packed in `flags` (same abs map as MouseMoveAbs). One frame per event.
             InputKind::TouchDown | InputKind::TouchMove => {
                 let w = ((event.flags >> 16) & 0xffff) as i32;
                 let h = (event.flags & 0xffff) as i32;
@@ -422,17 +396,15 @@ impl InputInjector for KwinFakeInjector {
                 self.fake.touch_up(event.code);
                 self.fake.touch_frame();
             }
-            // fake_input can only press host-layout keycodes — no committed-text path (the
-            // HOST_CAP_TEXT_INPUT cap is not advertised on this backend).
+            // Host-layout keycodes only; this backend does not advertise HOST_CAP_TEXT_INPUT.
             InputKind::TextInput => {}
-            // Gamepads are injected through uinput, not the compositor.
+            // Gamepads go through uinput, not the compositor.
             InputKind::GamepadState
             | InputKind::GamepadButton
             | InputKind::GamepadAxis
             | InputKind::GamepadRemove
             | InputKind::GamepadArrival => {}
         }
-        // Surface protocol errors / disconnects, then push the batch to the compositor.
         self.queue
             .dispatch_pending(&mut self.state)
             .context("wayland dispatch")?;

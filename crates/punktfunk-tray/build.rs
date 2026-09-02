@@ -1,11 +1,12 @@
-//! Embed the Windows version-info + icon resources into `punktfunk-tray.exe`: ordinal 1 is the
-//! exe/file icon, ordinals 2–6 are the status-variant tray icons `src/win.rs` loads by id
-//! (running / stopped / error / streaming / degraded). Same winresource pattern as
-//! `clients/windows/build.rs`.
+//! Embed version-info and icons into `punktfunk-tray.exe`.
+//!
+//! Ordinal 1 is the exe/file icon. Ordinals 2–6 are the status-variant tray
+//! icons `src/win.rs` loads by id (running / stopped / error / streaming /
+//! degraded). Same winresource pattern as `clients/windows/build.rs`.
 
 fn main() {
-    // cfg(windows) is the HOST (skips the Linux/macOS workspace stub build); CARGO_CFG_WINDOWS
-    // is the TARGET (mirrors the Windows client's build.rs).
+    // `cfg(windows)` is the host (skip the Linux/macOS workspace stub).
+    // `CARGO_CFG_WINDOWS` is the target, same as the Windows client's build.rs.
     #[cfg(windows)]
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
         let branding = "../../packaging/windows/branding";
@@ -22,11 +23,10 @@ fn main() {
             println!("cargo:rerun-if-changed={path}");
             res.set_icon_with_id(path, id);
         }
-        // Task Manager / Explorer identity (matches the host's "Punktfunk Host").
+        // Task Manager / Explorer identity. Matches the host's "Punktfunk Host".
         res.set("FileDescription", "Punktfunk Tray");
         res.set("ProductName", "Punktfunk");
-        // PerMonitorV2: without a DPI manifest the process is virtualized and its menu
-        // GDI-stretched — visibly blurry on any scaled display (most Windows 11 laptops).
+        // PerMonitorV2. Without a DPI manifest the process is virtualized and GDI-stretches the menu.
         res.set_manifest(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">

@@ -1,69 +1,50 @@
-//! The export descriptor — `vaExportSurfaceHandle`'s answer — and the walk that
+//! `VADRMPRIMESurfaceDescriptor` from `vaExportSurfaceHandle`, and the walk that
 //! turns it into the plane list a dmabuf import consumes.
 //!
-//! This is the one structure in the rung that the DRIVER writes and we read. Every
-//! other buffer here is one we fill, where a wrong field is at worst refused; a
-//! misread descriptor is plausible garbage — an fd taken from the middle of a
-//! pitch, a plane count read out of a modifier's high word — and it imports
-//! successfully into a texture of nonsense. So the layout is measured by
-//! `layout-probe.c` like everything else, and the walk lives here, pure, where
-//! macOS and the container run its tests.
+//! The DRIVER writes this structure; every other buffer in the crate is one we
+//! fill. Layout is measured by `layout-probe.c`. A wrong fd or plane count still
+//! imports, so [`flatten`] bounds-checks before walking.
 //!
-//! # The bug this walk exists to not repeat
-//!
-//! With `VA_EXPORT_SURFACE_SEPARATE_LAYERS` an NV12 surface comes back as **two
-//! layers** — an `R8` luma layer and a `GR88` chroma layer, one plane each — not as
-//! one two-plane `NV12` layer. Taking `layers[0]` and calling it the surface is how
-//! this project once painted the screen green: the importer saw a single-plane R8
-//! texture and the chroma was simply gone. Hence [`flatten`]: every plane of every
-//! layer, in declared order, and the surface's format comes from the descriptor's
-//! own top-level `fourcc` rather than from any layer's component format.
-//!
-//! (The alternative, `VA_EXPORT_SURFACE_COMPOSED_LAYERS`, asks the driver for one
-//! layer describing the whole surface. It is not universally implemented, and the
-//! separate-layers form is what the FFmpeg VAAPI path this rung replaces has always
-//! used — so it is the form the fleet's drivers are exercised on.)
+//! Under `VA_EXPORT_SURFACE_SEPARATE_LAYERS` an NV12 surface is two layers
+//! (`R8` luma, `GR88` chroma), one plane each — not one two-plane `NV12` layer.
+//! [`flatten`] walks every plane of every layer in declared order and takes
+//! fourcc from the descriptor's top-level field, never a layer's component
+//! format. `VA_EXPORT_SURFACE_COMPOSED_LAYERS` is not universally implemented.
 
 use std::os::raw::c_int;
 
-/// `VA_EXPORT_SURFACE_READ_ONLY` — the decoder keeps writing this surface's future
-/// siblings; the consumer only samples.
+/// Decoder may still write later surfaces; the consumer only samples.
 pub const VA_EXPORT_SURFACE_READ_ONLY: u32 = 0x0001;
 
-/// `VA_EXPORT_SURFACE_SEPARATE_LAYERS` — one layer per plane (module docs).
+/// One layer per plane, not one composed NV12 layer.
 pub const VA_EXPORT_SURFACE_SEPARATE_LAYERS: u32 = 0x0004;
 
-/// `VA_FOURCC_NV12` — identical to `DRM_FORMAT_NV12`; the two namespaces agree on
-/// the packed-fourcc value, which is why the descriptor's `fourcc` can be handed
-/// to a DRM importer unchanged.
+/// Packed `DRM_FORMAT_NV12`; a DRM importer takes it unchanged.
 pub const VA_FOURCC_NV12: u32 = 0x3231_564e;
 
-/// `VA_FOURCC_P010` — identical to `DRM_FORMAT_P010`.
+/// Packed `DRM_FORMAT_P010`; a DRM importer takes it unchanged.
 pub const VA_FOURCC_P010: u32 = 0x3031_3050;
 
-/// Fixed array bounds in the descriptor, measured (`layout-probe.c`).
+/// Descriptor array bounds, measured (`layout-probe.c`).
 pub const MAX_OBJECTS: usize = 4;
 pub const MAX_LAYERS: usize = 4;
 pub const MAX_PLANES_PER_LAYER: usize = 4;
 
-/// One buffer object backing the surface: an fd we OWN and must close.
+/// One BO. The fd is owned; the caller must close it.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct VaDrmPrimeObject {
-    /// DRM PRIME fd. `c_int` because that is what the header says; the caller
-    /// wraps it in an `OwnedFd` the moment the export succeeds.
+    /// PRIME fd as `c_int`. Wrap in `OwnedFd` on successful export.
     pub fd: c_int,
     pub size: u32,
     pub drm_format_modifier: u64,
 }
 
-/// One layer: under `SEPARATE_LAYERS` this is a single plane with its own
-/// component format.
+/// One layer: a single plane and its component format under `SEPARATE_LAYERS`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct VaDrmPrimeLayer {
-    /// The LAYER's DRM format (`R8`, `GR88`, …) — a component format, never the
-    /// surface's. See the module docs.
+    /// Component format (`R8`, `GR88`), never the surface fourcc.
     pub drm_format: u32,
     pub num_planes: u32,
     pub object_index: [u32; MAX_PLANES_PER_LAYER],
@@ -71,12 +52,11 @@ pub struct VaDrmPrimeLayer {
     pub pitch: [u32; MAX_PLANES_PER_LAYER],
 }
 
-/// `VADRMPRIMESurfaceDescriptor` (`va_drmcommon.h`).
+/// `va_drmcommon.h` `VADRMPRIMESurfaceDescriptor`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct VaDrmPrimeSurfaceDescriptor {
-    /// The SURFACE's fourcc (`VA_FOURCC_NV12`, `VA_FOURCC_P010`, …) — the combined
-    /// format, and the one a DRM importer wants.
+    /// Surface fourcc for the DRM importer, not a layer's component format.
     pub fourcc: u32,
     pub width: u32,
     pub height: u32,
@@ -87,11 +67,8 @@ pub struct VaDrmPrimeSurfaceDescriptor {
 }
 
 impl VaDrmPrimeSurfaceDescriptor {
-    /// A zeroed descriptor for the driver to fill.
-    ///
-    /// Zero is not a valid `num_objects`/`num_layers`, so a driver that returns
-    /// success without writing anything is caught by [`flatten`] rather than read
-    /// as a surface with no planes.
+    /// Zeroed for the driver to fill. Zero `num_objects`/`num_layers` is invalid:
+    /// success-without-write is a [`flatten`] refusal, not an empty surface.
     pub fn zeroed() -> Self {
         Self {
             fourcc: 0,
@@ -115,9 +92,8 @@ impl VaDrmPrimeSurfaceDescriptor {
     }
 }
 
-/// One plane of the flattened surface. `fd` is BORROWED from the descriptor's
-/// object list — several planes routinely name the same object — so the caller
-/// owns the objects and the planes reference them.
+/// One flattened plane. `fd` is BORROWED: several planes may share an object,
+/// so the caller owns the objects and the planes only reference them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExportedPlane {
     pub fd: c_int,
@@ -125,48 +101,40 @@ pub struct ExportedPlane {
     pub stride: u32,
 }
 
-/// The flattened surface: what an importer needs, in plane order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportedSurface {
-    /// The combined DRM fourcc, from the descriptor's own top-level field.
+    /// Descriptor top-level fourcc, never a layer's component format.
     pub fourcc: u32,
     pub width: u32,
     pub height: u32,
-    /// The tiling modifier. Every object must agree on it — see [`flatten`].
+    /// Tiling modifier. Every object must agree ([`flatten`]).
     pub modifier: u64,
-    /// Every plane of every layer, in declared order.
     pub planes: Vec<ExportedPlane>,
-    /// The fds the caller OWNS and must close, one per object.
+    /// Owned fds, one per object; the caller must close them.
     pub object_fds: Vec<c_int>,
 }
 
-/// Why a descriptor cannot be read as a surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportError {
-    /// Zero (a driver that "succeeded" without writing) or more than the arrays hold.
+    /// Zero (success without a write) or past the array bound.
     ObjectCount(u32),
     LayerCount(u32),
     PlaneCount {
         layer: usize,
         planes: u32,
     },
-    /// A plane named an object outside `num_objects` — reading it would take an fd
-    /// from uninitialised descriptor memory.
+    /// Index ≥ `num_objects` — that slot is unwritten memory.
     ObjectIndex {
         layer: usize,
         plane: usize,
         index: u32,
     },
-    /// An object came back without a usable fd.
+    /// Object fd is negative; the export did not produce a usable handle.
     BadFd {
         object: usize,
         fd: c_int,
     },
-    /// The objects disagree on the tiling modifier. A dmabuf import takes ONE
-    /// modifier for the whole image, so importing plane 1 under plane 0's tiling
-    /// would decode the chroma as if it were laid out some other way. Every fleet
-    /// driver puts the whole surface in one BO; a driver that does not needs code
-    /// that does not exist yet, and must say so rather than guess.
+    /// Objects disagree on tiling. A dmabuf import takes one modifier for the image.
     MixedModifiers {
         first: u64,
         other: u64,
@@ -212,14 +180,9 @@ impl std::fmt::Display for ExportError {
 
 impl std::error::Error for ExportError {}
 
-/// Flatten a descriptor into an importable surface: **every plane of every layer,
-/// in declared order** (module docs).
-///
-/// Validates before it walks, so a malformed descriptor is a typed refusal and
-/// never an out-of-bounds read of the fixed arrays. The caller owns
-/// [`ExportedSurface::object_fds`] on success; on failure it owns the descriptor's
-/// fds and must close them itself — this function takes no ownership either way,
-/// because it cannot know whether the export call succeeded.
+/// Bounds-checked walk. Takes no ownership: the caller owns the descriptor fds
+/// on failure and [`ExportedSurface::object_fds`] on success. This function
+/// cannot know whether the export succeeded.
 pub fn flatten(desc: &VaDrmPrimeSurfaceDescriptor) -> Result<ExportedSurface, ExportError> {
     let objects = desc.num_objects as usize;
     if objects == 0 || objects > MAX_OBJECTS {
@@ -284,7 +247,7 @@ pub fn flatten(desc: &VaDrmPrimeSurfaceDescriptor) -> Result<ExportedSurface, Ex
     })
 }
 
-// Measured by `layout-probe.c` against libva 2.23.0 headers, not transcribed.
+// Layout proofs — `layout-probe.c` output, pinned.
 const _: () = {
     use std::mem::align_of;
     use std::mem::offset_of;
@@ -306,15 +269,12 @@ const _: () = {
 mod tests {
     use super::*;
 
-    /// `DRM_FORMAT_R8` / `DRM_FORMAT_GR88` — the component formats a driver reports
-    /// per layer for NV12 under `SEPARATE_LAYERS`. Present only to build the
-    /// realistic fixture; nothing in the walk reads them, which is the point.
+    /// Fixture-only layer formats under `SEPARATE_LAYERS`; [`flatten`] never reads them.
     const DRM_FORMAT_R8: u32 = 0x2038_5220;
     const DRM_FORMAT_GR88: u32 = 0x3838_5247;
     const MOD: u64 = 0x0200_0000_0180_1002;
 
-    /// What radeonsi/iHD actually hand back for an NV12 decode surface: ONE object,
-    /// TWO layers of one plane each, chroma at a non-zero offset in the same buffer.
+    /// NV12: one object, two single-plane layers, chroma at a non-zero offset in the same BO.
     fn nv12_two_layers() -> VaDrmPrimeSurfaceDescriptor {
         let mut d = VaDrmPrimeSurfaceDescriptor::zeroed();
         d.fourcc = VA_FOURCC_NV12;
@@ -347,7 +307,6 @@ mod tests {
     #[test]
     fn both_layers_become_planes_and_the_surface_keeps_its_own_fourcc() {
         let out = flatten(&nv12_two_layers()).expect("a well-formed NV12 export");
-        // The green-screen regression, as an assertion: two planes, not one.
         assert_eq!(out.planes.len(), 2, "chroma was dropped");
         assert_eq!(
             out.fourcc, VA_FOURCC_NV12,
@@ -357,8 +316,7 @@ mod tests {
         assert_ne!(out.fourcc, DRM_FORMAT_R8);
         assert_eq!(out.planes[0].offset, 0);
         assert_eq!(out.planes[1].offset, 1920 * 1088);
-        // Both planes live in the SAME object, so both carry the same fd — and the
-        // caller must close it exactly once.
+        // Same object, same fd; close once via `object_fds`.
         assert_eq!(out.planes[0].fd, 7);
         assert_eq!(out.planes[1].fd, 7);
         assert_eq!(out.object_fds, vec![7]);
@@ -367,8 +325,7 @@ mod tests {
 
     #[test]
     fn a_multi_plane_layer_flattens_in_declared_order() {
-        // The COMPOSED-ish shape: one layer that declares both planes itself. The
-        // walk must handle it without caring which shape the driver chose.
+        // One layer, two planes (composed shape). The walk is shape-agnostic.
         let mut d = VaDrmPrimeSurfaceDescriptor::zeroed();
         d.fourcc = VA_FOURCC_P010;
         d.num_objects = 2;
@@ -424,8 +381,6 @@ mod tests {
 
     #[test]
     fn a_plane_naming_an_object_that_does_not_exist_is_refused() {
-        // `num_objects` is 1, so object_index 1 addresses descriptor memory the
-        // driver never wrote — an fd of -1 or worse, a stale one.
         let mut d = nv12_two_layers();
         d.layers[1].object_index[0] = 1;
         assert_eq!(

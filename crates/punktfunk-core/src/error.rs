@@ -1,8 +1,11 @@
-//! Error type and the stable C ABI status codes it maps to.
+//! Core error type and the C ABI status codes it maps to.
+//!
+//! `PunktfunkStatus` is stable: `Ok` is 0, errors are negative, existing
+//! variants must not be renumbered. Rejection codes live in the -20 block.
 
 use thiserror::Error;
 
-/// The core's internal error type. Crosses the C ABI as a [`PunktfunkStatus`] code.
+/// Internal error. Crosses the C ABI as a [`PunktfunkStatus`] code.
 #[derive(Debug, Error)]
 pub enum PunktfunkError {
     #[error("invalid argument: {0}")]
@@ -23,18 +26,17 @@ pub enum PunktfunkError {
     Timeout,
     #[error("session closed")]
     Closed,
-    /// The host deliberately turned this connection away and said why (a typed QUIC application
-    /// close, [`crate::reject::RejectReason`]) — distinct from transport trouble ([`Self::Io`] /
-    /// [`Self::Timeout`]) and from a failed PIN proof ([`Self::Crypto`]) so UIs can render the
-    /// real cause instead of a generic "not accepted".
+    /// Host turned this connection away with a typed
+    /// [`crate::reject::RejectReason`]. Distinct from transport
+    /// ([`Self::Io`] / [`Self::Timeout`]) and a failed PIN ([`Self::Crypto`]).
     #[error("rejected by host: {0}")]
     Rejected(crate::reject::RejectReason),
 }
 
 pub type Result<T> = core::result::Result<T, PunktfunkError>;
 
-/// Stable C ABI status codes. `Ok` is 0; all errors are negative so callers can
-/// test `rc < 0`. Do not renumber existing variants — only append.
+/// Stable C ABI status codes. `Ok` is 0; errors are negative so callers can
+/// test `rc < 0`. Existing variants must not be renumbered — only append.
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PunktfunkStatus {
@@ -49,9 +51,8 @@ pub enum PunktfunkStatus {
     NullPointer = -8,
     Timeout = -9,
     Closed = -10,
-    // -11..-19 reserved for future generic errors. The -20 block mirrors
-    // `crate::reject::RejectReason` one-to-one so FFI callers (Swift, JNI) can
-    // render the host's actual rejection reason.
+    // -11..-19 reserved. The -20 block mirrors `RejectReason` one-to-one
+    // so FFI callers can switch on the host's reason.
     RejectedNotArmed = -20,
     RejectedBoundOther = -21,
     RejectedRateLimited = -22,
@@ -69,7 +70,6 @@ pub enum PunktfunkStatus {
 }
 
 impl PunktfunkError {
-    /// Map to the C ABI status code.
     pub fn status(&self) -> PunktfunkStatus {
         match self {
             PunktfunkError::InvalidArg(_) => PunktfunkStatus::InvalidArg,

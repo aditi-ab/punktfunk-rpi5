@@ -1,33 +1,19 @@
-//! WASAPI loopback capture of the desktop mix (system output) — the Windows analogue of the
-//! PipeWire sink-monitor backend. Delivers interleaved f32 PCM at the requested rate (48 kHz
-//! unless a hi-res session negotiated more, and only ever as high as the endpoint's own engine
-//! genuinely runs — see [`WasapiLoopbackCapturer::opened_rate`]) in the requested channel count
-//! (stereo / 5.1 / 7.1, canonical wire order FL FR FC LFE RL RR SL SR via the explicit
-//! `dwChannelMask`), ready for the encode path with NO resampling in Rust (WASAPI shared-mode
-//! autoconvert does any SRC + up/downmix to the requested layout). WASAPI objects are
-//! COM-apartment-bound and not `Send`, so they live on a dedicated thread (mirrors
-//! `linux::PwAudioCapturer`); only the channel + stop flag + join handle are in the struct.
+//! WASAPI loopback capture of the desktop mix (Windows analogue of the PipeWire sink-monitor).
+//! Interleaved f32 PCM at the opened engine rate — never above it; see
+//! [`WasapiLoopbackCapturer::opened_rate`] — in the requested layout (stereo / 5.1 / 7.1,
+//! `dwChannelMask` FL FR FC LFE RL RR SL SR). Shared-mode autoconvert does SRC and up/downmix.
+//! WASAPI objects are COM-apartment-bound and `!Send`, so they live on a dedicated thread;
+//! the struct holds only the channel, stop flag, and join handle.
 //!
-//! **Which endpoint, and self-healing.** The capture thread opens the wiring plan's loopback
-//! endpoint EXPLICITLY — never "whatever the default happens to be": binding to the default
-//! raced the plan's own `IPolicyConfig` default change and captured duds when that change failed
-//! or the operator's default sat on a silent endpoint ("CABLE In 16ch", Steam Streaming
-//! Speakers) — the field-reported "no audio until I cycled output devices" failure. The plan
-//! also parks the default playback device on the loopback endpoint (a silent sink by default —
-//! client-only audio; see [`super::wiring_plan`]) so app streams migrate to it.
+//! Capture binds the wiring plan's loopback endpoint explicitly, never the current default
+//! (that races the plan's own `IPolicyConfig` write). A 1 s watchdog follows a capturable
+//! default change and snaps a known-dud back to the plan. Device errors reopen with capped
+//! exponential backoff cut short by an endpoint-set change. A plan with no loopback endpoint
+//! is never retried: [`wiring_plan::plan`](super::wiring_plan) is pure in the set, so the
+//! thread parks on a fingerprint poll until the set moves. On drop, parked default playback
+//! and recording devices are restored — both are session-scoped.
 //!
-//! The thread then self-heals for its whole life: a ~1 s watchdog notices the default render
-//! device changing under us — the operator picked a different output mid-stream — and reacts:
-//! a loopback-capturable choice is FOLLOWED (their explicit choice wins; audio then also plays
-//! on the host), a known-dud choice (cable/Steam Speakers/the mic target) snaps back to the
-//! plan. Device errors (endpoint invalidated, engine restart) reopen with a capped exponential
-//! backoff that an endpoint-set change cuts short. A plan with NO loopback endpoint at all is
-//! never retried: `wiring_plan::plan` is pure in the endpoint set, so that verdict holds until
-//! the set changes — the thread says why once, then parks on a cheap fingerprint poll and
-//! re-plans the instant the set moves (the 2026-08 field case hammered a full wiring pass —
-//! IPolicyConfig writes included — every 2 s for 8+ minutes without ever being able to
-//! succeed). On thread exit (capturer dropped at stream end) the parked default playback AND
-//! recording devices are restored — both defaults are strictly session-scoped.
+//! Pin: `design/hi-res-audio.md`, [`super::wiring_plan`], [`super::audio_control`].
 
 use super::capture_policy::{CaptureStats, FightDamper, FIGHT_BACKOFF, STATS_EVERY};
 use super::{audio_control, wiring_plan, AudioCapturer, SAMPLE_RATE};
@@ -45,24 +31,15 @@ pub struct WasapiLoopbackCapturer {
     channels: u32,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
-    /// Whether a session is currently CONSUMING this capturer, shared with the capture thread
-    /// so the drop counter can tell "the encode thread fell behind" from "nobody is reading".
-    /// The native/gamestream planes park a capturer between sessions
-    /// ([`idle`](AudioCapturer::idle)) instead of dropping it, and the hand-off channel is
-    /// bounded — so without this the thread fills it once, then counts every subsequent chunk
-    /// as a drop and warns that "the stream will click" with no stream to click. Proven on the
-    /// Linux twin by a 2026-08-13 field log (100 % drop rate across session gaps); the parking
-    /// call sites are platform-independent, so this half had the same defect.
+    /// Shared with the capture thread so drops mean "encode fell behind", not "nobody is reading".
+    /// Native/gamestream planes park a capturer between sessions ([`idle`](AudioCapturer::idle))
+    /// on a bounded channel; without this the thread fills it once and then warns that the
+    /// stream will click with no stream to click.
     active: Arc<AtomicBool>,
-    /// The rate the endpoint was ACTUALLY opened at, written by the capture thread before it
-    /// reports ready and read back by [`AudioCapturer::sample_rate`].
-    ///
-    /// This is the whole Windows half of `design/hi-res-audio.md`: in shared mode the engine's
-    /// mix format is authoritative and `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` reconciles our
-    /// request with it silently, in either direction. Asking a 48 kHz engine for 96 kHz
-    /// therefore SUCCEEDS and hands back interpolated samples (§4.3). So the open declines
-    /// instead of padding, and states here what it settled for — the caller compares it against
-    /// what it promised the client and resolves the plane from the answer (§8.2).
+    /// Rate the endpoint actually opened at. Written before the thread reports ready; read by
+    /// [`AudioCapturer::sample_rate`]. Shared-mode autoconvert succeeds on an upward request
+    /// with interpolated samples (`design/hi-res-audio.md`), so the open declines instead of
+    /// padding and stores what it settled for.
     opened_rate: Arc<AtomicU32>,
 }
 
@@ -75,16 +52,12 @@ impl WasapiLoopbackCapturer {
         anyhow::ensure!(rate_hz > 0, "audio capture rate must be positive");
         let (tx, rx) = sync_channel::<Vec<f32>>(64);
         let stop = Arc::new(AtomicBool::new(false));
-        // Bring-up handshake: report open success/failure before returning, so a missing render
-        // endpoint surfaces as Err (the native plane then keeps retrying the open with backoff)
-        // rather than a silent dead thread.
+        // Handshake: a missing render endpoint is Err (native plane retries), not a silent dead thread.
         let (ready_tx, ready_rx) = sync_channel::<Result<()>>(1);
         let stop_t = stop.clone();
-        // Opens at session start, so the consumer is live from the first chunk.
         let active = Arc::new(AtomicBool::new(true));
         let active_t = active.clone();
-        // Seeded with the request: it is the honest answer until the endpoint has been read, and
-        // on the overwhelmingly common 48 kHz path it is also the final one.
+        // Honest until the endpoint is read; also the final answer on the common 48 kHz path.
         let opened_rate = Arc::new(AtomicU32::new(rate_hz));
         let opened_rate_t = opened_rate.clone();
         let join = thread::Builder::new()
@@ -103,13 +76,10 @@ impl WasapiLoopbackCapturer {
                 }
             })
             .context("spawn wasapi audio thread")?;
-        // Generous handshake: the first open may auto-install the Steam Streaming pair (two
-        // driver installs, ~5 s of settling each) before the endpoint exists.
+        // 30 s: first open may auto-install the Steam Streaming pair (two driver installs, ~5 s each).
         match ready_rx.recv_timeout(Duration::from_secs(30)) {
             Ok(Ok(())) => {
-                // The rate the thread SETTLED on, which is not necessarily `rate_hz` — see
-                // `opened_rate`. Reported here rather than as a fixed "48 kHz" string so a log
-                // can never say one rate while the stream carries another.
+                // Settled rate, not `rate_hz` — a log must not print one rate while the stream carries another.
                 tracing::info!(
                     channels,
                     rate_hz = opened_rate.load(Ordering::Relaxed),
@@ -126,9 +96,7 @@ impl WasapiLoopbackCapturer {
             }
             Ok(Err(e)) => Err(e),
             Err(_) => {
-                // The thread outlived the handshake (stalled driver install / hung endpoint).
-                // Tell it to stop — otherwise it would keep capturing detached for the process
-                // lifetime WITH the playback default still parked (restore only runs on exit).
+                // Otherwise it captures for the process lifetime with the playback default still parked.
                 stop.store(true, Ordering::SeqCst);
                 Err(anyhow!("wasapi loopback init timed out"))
             }
@@ -138,8 +106,7 @@ impl WasapiLoopbackCapturer {
 
 impl Drop for WasapiLoopbackCapturer {
     fn drop(&mut self) {
-        // The receiver dies with us; anything the thread still pushes is unwanted by
-        // definition, and must not be reported as the encode thread falling behind.
+        // Receiver dies with us; leftover pushes must not count as encode lag.
         self.active.store(false, Ordering::Relaxed);
         self.stop.store(true, Ordering::SeqCst);
         if let Some(j) = self.join.take() {
@@ -155,8 +122,7 @@ impl AudioCapturer for WasapiLoopbackCapturer {
     fn next_chunk_within(&mut self, budget: Duration) -> Result<Vec<f32>> {
         match self.chunks.recv_timeout(budget) {
             Ok(c) => Ok(c),
-            // A quiet sink is NOT a failure — return an empty chunk so the caller keeps the capturer
-            // alive. Only a dead capture thread is an Err (→ caller reopens). Matches the Linux path.
+            // Quiet sink is not a failure — empty chunk keeps the capturer. Dead thread is Err.
             Err(RecvTimeoutError::Timeout) => Ok(Vec::new()),
             Err(RecvTimeoutError::Disconnected) => Err(anyhow!("wasapi audio thread ended")),
         }
@@ -169,67 +135,47 @@ impl AudioCapturer for WasapiLoopbackCapturer {
     }
     fn drain(&mut self) {
         while self.chunks.try_recv().is_ok() {}
-        // Ordered AFTER the backlog drain, so the capture thread never counts a drop against a
-        // channel this call is still emptying.
+        // After the drain so the capture thread never counts a drop this call is emptying.
         self.active.store(true, Ordering::Relaxed);
     }
     fn idle(&mut self) {
-        // Parked: from here the channel fills and stays full, and those drops are nobody's
-        // fault. See [`WasapiLoopbackCapturer::active`].
+        // Channel will fill and stay full; those drops are not encode lag. See `active`.
         self.active.store(false, Ordering::Relaxed);
     }
 }
 
-/// How one open chooses its capture endpoint.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TargetMode {
-    /// Capture the wiring plan's loopback endpoint and park the default playback device on it
-    /// (client-only audio when the plan found a silent sink). The initial and snap-back mode.
+    /// Plan's loopback endpoint; parks default playback on it (client-only when the sink is silent).
     Assert,
-    /// Capture the CURRENT default render endpoint — the operator changed the default mid-stream
-    /// to a capturable device and their choice wins (audio then also plays on the host). Also the
-    /// resolution under `PUNKTFUNK_KEEP_DEFAULT`.
+    /// Current default render — operator changed it mid-stream, or `PUNKTFUNK_KEEP_DEFAULT`.
     Follow,
 }
 
-/// Why one open's inner loop ended.
 enum Next {
-    /// `stop` was set — the capturer is being dropped.
     Stopped,
-    /// Reopen in the given mode (default-device change observed).
     Reopen(TargetMode),
 }
 
-/// Reopen backoff after a TRANSIENT capture failure: starts here and doubles per consecutive
-/// failure up to [`REOPEN_BACKOFF_CAP`], resetting on success or on an endpoint-set change
-/// (mirrors the mic pump's `PUMP_TUNING` shape). The predecessor was a FLAT 2 s retry whose
-/// every attempt re-ran the full wiring pass, IPolicyConfig writes included — tolerable for a
-/// genuinely transient error, an 8-minute hammer in the 2026-08 field case where the failure
-/// was structural.
+/// First reopen wait after a transient failure. Doubles per miss up to [`REOPEN_BACKOFF_CAP`];
+/// resets on success or an endpoint-set change. Do not retry flat at 2 s — each attempt re-runs
+/// the wiring pass, IPolicyConfig included.
 const REOPEN_BACKOFF_START: Duration = Duration::from_secs(2);
 const REOPEN_BACKOFF_CAP: Duration = Duration::from_secs(60);
-/// Endpoint-set poll cadence while waiting out a failure (both the transient backoff sleep and
-/// the unsatisfiable-plan wait): one enumerate-and-hash per tick, nothing else. A fingerprint
-/// change ends the wait immediately — a (re)arrived endpoint (the display coming back, plugged
-/// headphones) is exactly the recovery moment — so recovery stays as fast as the old 2 s hammer
-/// without its side effects.
+/// Fingerprint poll while backing off or waiting out an unsatisfiable plan: enumerate-and-hash
+/// only. A change ends the wait immediately so a re-arrived endpoint is not stuck behind the cap.
 const ENDPOINT_POLL_EVERY: Duration = Duration::from_secs(2);
-/// Watchdog cadence for "did the default render device change under us?" checks.
 const DEFAULT_CHECK_EVERY: Duration = Duration::from_secs(1);
-/// Total attempts for the FIRST open before its failure surfaces through the `ready` handshake.
-/// Session start is peak endpoint churn — the virtual-display attach and this module's own
-/// IPolicyConfig default flips race the activate, which then fails transiently (0x80070002,
-/// endpoint mid-re-registration) — so a couple of quick retries absorb it within the
-/// handshake budget.
+/// First-open tries before the handshake surfaces Err. Session start races virtual-display
+/// attach and this module's own IPolicyConfig flips; activate then fails with 0x80070002
+/// (endpoint mid-re-registration).
 const FIRST_OPEN_ATTEMPTS: u32 = 3;
-/// Pause between first-open attempts (endpoint churn settles in well under a second).
+/// Endpoint churn settles in well under a second.
 const FIRST_OPEN_RETRY_PAUSE: Duration = Duration::from_secs(1);
-/// How long the packet loop may go without a packet before the next `DATA_DISCONTINUITY` reads as
-/// the endpoint having idled rather than as a capture hole (WP-A2). Classic loopback delivers
-/// nothing at all while nothing renders and then flags the packet that resumes, so scoring that
-/// flag unconditionally would charge a gap — sized by the quiet — to every notification sound on an
-/// otherwise silent host. At the engine's ~10 ms period a whole second without a packet is far
-/// past anything this loop can still tell apart from that.
+/// Packet-less stretch after which `DATA_DISCONTINUITY` is idle-resume, not a hole.
+/// Classic loopback delivers nothing while nothing renders, then flags the resume packet;
+/// scoring that flag always would charge every notification on a silent host. ~10 ms engine
+/// period: 1 s is past anything this loop can still tell from a gap.
 const LOOPBACK_IDLE_AFTER: Duration = Duration::from_secs(1);
 
 fn capture_thread(
@@ -241,7 +187,7 @@ fn capture_thread(
     active: Arc<AtomicBool>,
     opened_rate: Arc<AtomicU32>,
 ) -> Result<()> {
-    // COM must be initialized on THIS thread (MTA), before any device call.
+    // COM is apartment-bound; MTA on this thread, before any device call.
     if let Err(e) = wasapi::initialize_mta()
         .ok()
         .context("CoInitializeEx (MTA)")
@@ -249,28 +195,17 @@ fn capture_thread(
         let _ = ready.send(Err(e));
         return Ok(());
     }
-    // This is the thread that produces the chunks the paced sender consumes — the one that
-    // has to wake on the engine's event every 10 ms and read the loopback packets before the
-    // engine's buffer wraps. The SENDER has carried `THREAD_PRIORITY_HIGHEST` + MMCSS since the
-    // data-plane QoS work; this reader ran at normal priority beside it, so a CPU-saturating
-    // game could hold it off long enough for `DATA_DISCONTINUITY` to fire — a hole the sender
-    // then dutifully covered. Same boost, same helper: it registers the MMCSS task and raises
-    // the class, and is a no-op where either is refused.
+    // Must wake on the engine event every ~10 ms or the loopback buffer wraps. Same MMCSS +
+    // `THREAD_PRIORITY_HIGHEST` boost as the paced sender; a no-op if refused.
     pf_frame::thread_qos::boost_thread_priority(true);
-    // Self-heal for the capturer's whole life: each `capture_once` is one endpoint open + inner
-    // capture loop; it returns to reopen (default-device change) or errors (device invalidated,
-    // engine restart). The FIRST open gets [`FIRST_OPEN_ATTEMPTS`] tries (session-start endpoint
-    // churn — see the constant) before its failure surfaces as `open()`'s Err; the caller keeps
-    // retrying the whole open with its own backoff after that, so a bad start delays audio
-    // rather than ending it.
+    // Each `capture_once` is one open + inner loop. First open gets [`FIRST_OPEN_ATTEMPTS`]
+    // tries before `open()` surfaces Err; the native plane then retries the whole open.
     let mut ready = Some(ready);
     let mut mode = TargetMode::Assert;
     let mut failures: u64 = 0;
     let mut first_attempts: u32 = 0;
     let mut backoff = REOPEN_BACKOFF_START;
-    // Endpoint-set fingerprint under which an unsatisfiable plan was already error-logged: an
-    // unchanged set means an unchanged verdict (`wiring_plan::plan` is pure), so the diagnosis
-    // is said once per topology — the field log drowned in 256+ copies of the same line.
+    // Plan is pure in the endpoint set: log the unsatisfiable diagnosis once per fingerprint.
     let mut unsat_logged: Option<u64> = None;
     while !stop.load(Ordering::Relaxed) {
         match capture_once(
@@ -291,11 +226,8 @@ fn capture_thread(
                 unsat_logged = None;
             }
             Err(e) if ready.is_some() => {
-                // An unsatisfiable PLAN cannot improve within the handshake window — the
-                // Steam-pair install latch already ran inside `capture_once` — so
-                // fail the open now with the full diagnosis instead of spending the transient
-                // retry budget on a structural verdict. The native plane owns first-open
-                // retries and backs off on its own.
+                // Unsatisfiable plan cannot improve inside the handshake — fail now rather than
+                // spending the transient retry budget. The native plane owns first-open retries.
                 if e.downcast_ref::<PlanUnsatisfiable>().is_some() {
                     let _ = ready.take().unwrap().send(Err(anyhow!("{e:#}")));
                     break;
@@ -307,7 +239,7 @@ fn capture_thread(
                 }
                 tracing::info!(error = %format!("{e:#}"), attempt = first_attempts,
                     "audio loopback first open failed — retrying");
-                // Stop-responsive pause (same discipline as the reopen backoff below).
+                // Stop-responsive; same 100 ms slices as the reopen wait below.
                 let until = Instant::now() + FIRST_OPEN_RETRY_PAUSE;
                 while Instant::now() < until && !stop.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_millis(100));
@@ -316,11 +248,8 @@ fn capture_thread(
             Err(e) => {
                 mode = TargetMode::Assert;
                 if let Some(unsat) = e.downcast_ref::<PlanUnsatisfiable>() {
-                    // Structural: retrying against the same endpoints repeats the same verdict,
-                    // and every retry used to re-run the wiring pass — IPolicyConfig writes
-                    // included, stomping any operator default-recording change within 2 s. Say
-                    // why once per topology, then park on the cheap fingerprint poll; the set
-                    // changing IS the recovery moment and re-plans immediately.
+                    // Same endpoints → same verdict. Wait on the fingerprint; a wiring retry
+                    // would IPolicyConfig-stomp an operator recording-default change.
                     failures = 0;
                     backoff = REOPEN_BACKOFF_START;
                     if unsat_logged != Some(unsat.fingerprint) {
@@ -342,9 +271,8 @@ fn capture_thread(
                             backoff_secs = backoff.as_secs(),
                             "audio loopback capture failed — reopening after backoff");
                     }
-                    // Capped exponential backoff, cut short (and reset) the moment the
-                    // endpoint set changes — a re-arrived device is the likeliest cure for
-                    // whatever killed the capture, and it must not wait out a 60 s sleep.
+                    // Cut short (and reset) when the set changes — a re-arrived device must not
+                    // sit out the 60 s cap.
                     let fp = audio_control::endpoint_fingerprint();
                     match wait_endpoint_change(&stop, fp, Some(Instant::now() + backoff)) {
                         EndpointWait::Stopped => break,
@@ -355,22 +283,16 @@ fn capture_thread(
             }
         }
     }
-    // Hand the default playback AND recording devices back to the operator (no-ops if we never
-    // parked them, or if they changed them themselves mid-stream). COM is initialized on this
-    // thread. The recording restore is what keeps the parked default session-scoped — an idle
-    // box holding the default microphone on a virtual mic nothing feeds is the 2026-08
-    // Helldivers 2 tank (see `audio_control`'s module docs).
+    // Restore both parked defaults (no-op if never parked, or if the operator moved them).
+    // Recording restore keeps the parked mic session-scoped; see `audio_control`.
     audio_control::restore_default_playback();
     audio_control::restore_default_recording();
     Ok(())
 }
 
-/// A wiring plan with NO loopback endpoint, as a typed error: [`wiring_plan::plan`] is pure in
-/// the enumerated endpoint set, so unlike every other capture error this one is PERMANENT until
-/// the topology changes — retrying it is guaranteed futile (the 2026-08 field case retried it
-/// flat-out for 8+ minutes, one full wiring pass per retry). Carries the set's fingerprint
-/// (what the reopen loop waits on) and the full diagnosis: inventory, per-endpoint rejection
-/// reasons, and only the remedies not already taken.
+/// Wiring plan with no loopback endpoint. [`wiring_plan::plan`] is pure in the enumerated set,
+/// so this is permanent until the topology changes — unlike every other capture error.
+/// Carries the fingerprint the reopen loop waits on, plus the diagnosis.
 #[derive(Debug)]
 struct PlanUnsatisfiable {
     fingerprint: u64,
@@ -395,22 +317,18 @@ impl std::fmt::Display for PlanUnsatisfiable {
 
 impl std::error::Error for PlanUnsatisfiable {}
 
-/// How a [`wait_endpoint_change`] ended.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EndpointWait {
-    /// `stop` was set — the capturer is being dropped.
     Stopped,
-    /// The endpoint-set fingerprint moved — re-plan NOW (this is the recovery moment).
+    /// Fingerprint moved — re-plan; this is the recovery.
     Changed,
-    /// The deadline passed without a change (backoff waits only; `deadline: None` never ends
-    /// this way).
+    /// Deadline passed with no change. `deadline: None` never returns this.
     Elapsed,
 }
 
-/// Stop-responsive wait that polls the endpoint-set fingerprint every [`ENDPOINT_POLL_EVERY`] —
-/// an enumerate-and-hash, no wiring pass, no IPolicyConfig writes, no logs — until the set
-/// changes, `deadline` passes, or `stop` is set. `deadline: None` waits indefinitely: used while
-/// the plan is unsatisfiable, where ONLY a topology change can alter the verdict.
+/// Poll the endpoint-set fingerprint every [`ENDPOINT_POLL_EVERY`] (enumerate-and-hash only —
+/// no wiring, no IPolicyConfig) until the set changes, `deadline` passes, or `stop` is set.
+/// `deadline: None` waits indefinitely: used while the plan is unsatisfiable.
 fn wait_endpoint_change(
     stop: &AtomicBool,
     fingerprint: u64,
@@ -434,17 +352,15 @@ fn wait_endpoint_change(
     }
 }
 
-/// The current default render endpoint, with its id (`None` on any enumeration failure —
-/// transient failures must not kill the capture).
+/// Current default render endpoint (`None` on enumeration failure — a miss must not kill capture).
 fn default_render(en: &DeviceEnumerator) -> Option<(Device, String)> {
     let d = en.get_default_device(&Direction::Render).ok()?;
     let id = d.get_id().ok()?;
     Some((d, id))
 }
 
-/// One endpoint open + capture loop. Returns how to continue ([`Next`]) or an error (first open:
-/// retried [`FIRST_OPEN_ATTEMPTS`] times, then fatal via the `ready` handshake; later: reopen
-/// with capped backoff — or, for a typed [`PlanUnsatisfiable`], an endpoint-set wait).
+/// One endpoint open + capture loop. First open: [`FIRST_OPEN_ATTEMPTS`] then fatal via `ready`.
+/// Later: capped backoff, or an endpoint-set wait for [`PlanUnsatisfiable`].
 #[allow(clippy::too_many_arguments)]
 fn capture_once(
     tx: &SyncSender<Vec<f32>>,
@@ -456,25 +372,20 @@ fn capture_once(
     active: &AtomicBool,
     opened_rate: &AtomicU32,
 ) -> Result<Next> {
-    // Interleaved f32: channels * 4 bytes per frame.
+    // 4 bytes per f32 sample, interleaved.
     let block_align = channels as usize * 4;
     let keep_default = audio_control::keep_default_devices();
-    // Assert-mode without KEEP_DEFAULT is the only shape that parks the playback default.
+    // Only this shape parks the playback default.
     let assert_plan = mode == TargetMode::Assert && !keep_default;
     let mut plan = audio_control::wire_now_full(assert_plan);
 
-    // Client-only audio needs a silent-on-host sink with a working loopback (the Steam Streaming
-    // Microphone's render side). If the plan had to settle for real hardware (or nothing), try to
-    // install the Steam pair (present when Steam is), then re-plan. The latch is once per
-    // INF-STATE, not once per process: an attempt made while Steam was absent re-arms when its
-    // driver INFs later appear (Steam installed mid-run) — files are invisible to the
-    // endpoint-set fingerprint, so nothing else would ever retry.
+    // Client-only audio wants a silent sink with working loopback. Latch is once per INF-STATE,
+    // not once per process: an attempt while Steam was absent re-arms when the driver INFs
+    // appear. Those files are invisible to the endpoint-set fingerprint, so nothing else retries.
     if assert_plan && !audio_control::host_audio_requested() {
-        // "Silent on the host" is true for the name-matched Streaming Microphone AND for the
-        // minted "Punktfunk Speakers" (identified by id — its NAME says Speakers, which the
-        // name rule rightly refuses). Without the id check, a session on the minted sink
-        // logged "desktop audio will also play on the host" (false) and re-attempted the
-        // Steam-pair install it doesn't need (observed live, first substrate session).
+        // Name-match plus minted-id: "Punktfunk Speakers" is silent but the name rule refuses
+        // "Speakers", so without the id check a minted session re-attempts a Steam-pair install
+        // it does not need.
         let have_silent = |w: &wiring_plan::Wiring| {
             w.loopback_render.as_ref().is_some_and(|(n, id)| {
                 wiring_plan::silent_sink(&n.to_lowercase())
@@ -507,23 +418,17 @@ fn capture_once(
         }
     }
     let wiring = &plan.wiring;
-    // Only the Assert path can knowingly sit on the plan's LAST-RESORT endpoint: Follow captures
-    // the operator's chosen default, and `judge_default` never routes Follow onto the Steam
-    // Speakers (they are `excluded_from_loopback` — a Dud that snaps back to the plan).
+    // Last-resort is Assert-only: Follow captures the operator default, and `judge_default`
+    // never routes Follow onto Steam Speakers (`excluded_from_loopback`).
     let last_resort = assert_plan && wiring.loopback_last_resort;
     let plan_fp = plan.fingerprint;
 
     let en = DeviceEnumerator::new().context("DeviceEnumerator")?;
-    // Resolve the endpoint to capture. ECHO GUARD (Follow/KEEP_DEFAULT shapes): the wiring plan
-    // reserves one endpoint for the virtual mic (`super::wasapi_mic` writes the client's voice
-    // there) — capturing THAT endpoint would stream the client's own mic straight back to it, so
-    // fall back to the plan's loopback endpoint, or refuse — no desktop audio beats an echo loop.
+    // Echo guard: the plan reserves `mic_render` for the virtual mic. Capturing it streams
+    // the client's voice back to them — fall back to the plan's loopback, or refuse.
     let (device, dev_name, dev_id) = if assert_plan {
         let Some(ep) = wiring.loopback_render.clone() else {
-            // Detected BEFORE any open attempt, and typed: the plan is a pure function of the
-            // endpoint set, so this cannot resolve until the set changes — the reopen loop
-            // waits on the fingerprint instead of retrying (the old untyped bail was retried
-            // flat-out every 2 s, forever, in the 2026-08 field case).
+            // Typed: the plan is a pure function of the set, so wait on the fingerprint.
             return Err(PlanUnsatisfiable::from_plan(&plan).into());
         };
         let d = audio_control::open_endpoint(&ep)?;
@@ -537,11 +442,8 @@ fn capture_once(
             .is_some_and(|(_, mic_id)| *mic_id == id);
         if default_is_mic {
             let Some(lb) = wiring.loopback_render.clone() else {
-                // Same inventory shape as the Assert bail, but NOT typed as unsatisfiable:
-                // Follow's inputs include the DEFAULT device, which the operator can change
-                // without a topology change (especially under PUNKTFUNK_KEEP_DEFAULT) — the
-                // capped backoff must keep retrying rather than a fingerprint wait sleeping
-                // through a default-only change.
+                // Not [`PlanUnsatisfiable`]: Follow's inputs include the default, which the
+                // operator can change without a topology change (esp. `PUNKTFUNK_KEEP_DEFAULT`).
                 anyhow::bail!(
                     "the default render endpoint is reserved for the virtual mic (capturing it \
                      would echo the client's voice back) — {}",
@@ -560,53 +462,11 @@ fn capture_once(
     };
 
     let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
-    // WP0.1 — the endpoint's ACTUAL engine mix format, read BEFORE we initialize. Everything the
-    // old log printed ("48 kHz f32 channels=2") was our REQUEST; with `autoconvert` WASAPI
-    // silently converts from whatever the endpoint really runs, so a voice-carrier endpoint
-    // narrowing the desktop mix to mono or 24 kHz was invisible in a 3,600-line field log. This
-    // line is what makes an audio-quality report triageable without a round trip.
+    // Mix format is authoritative in shared mode. `AUTOCONVERTPCM` succeeds on an upward
+    // request and returns interpolated samples — never pad; open at the engine rate.
+    // Floor is [`SAMPLE_RATE`], not the engine: libopus takes 8/12/16/24/48 kHz only, so a
+    // 44.1 kHz endpoint still opens at 48 kHz. `rate_hz > hz.max(SAMPLE_RATE)` is both rules.
     let engine = audio_client.get_mixformat().ok();
-    // …and, since the hi-res plane exists, this reading is no longer merely diagnostic — it
-    // DECIDES the rate we open at (`design/hi-res-audio.md` §4.3/§8.2).
-    //
-    // In shared mode the engine's mix format is authoritative, and
-    // `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` exists to reconcile our format with it in whichever
-    // direction is needed. So asking a 48 kHz engine for 96 kHz does not fail: it succeeds,
-    // returns no error, and hands back interpolated samples with nothing above 24 kHz in them —
-    // and the session would then advertise 96 000 in its `Welcome`, spend 3–4 Mbps, and be
-    // wrong in exactly the way the HDR RB-swap was wrong (both ends audit clean, the content is
-    // a lie). NEVER pad: open at the engine's own rate and say so, so the caller can decline
-    // hi-res rather than ship interpolation labelled as detail.
-    //
-    // Only an UPWARD request is refused. Asking for LESS than the engine runs at is an ordinary
-    // downsample — the legacy 48 kHz behaviour on a 96 kHz endpoint, which is what this host has
-    // always done and is lossy only in the way every previous release already was.
-    //
-    // ⚠⚠ …and the floor is the LEGACY rate, never the engine's — `hz.max(SAMPLE_RATE)`. That
-    // `max` serves the **OPUS** path and nothing else, and getting it backwards regresses every
-    // ordinary Windows box. An endpoint configured at 44 100 Hz is an unremarkable Windows
-    // configuration; libopus accepts 8/12/16/24/48 kHz only (RFC 6716), so the `0xC9` plane is
-    // 48 kHz by definition, and this host has always asked such an endpoint for 48 kHz and let
-    // autoconvert upsample. Settling down to 44 100 for an Opus session would hand libopus a rate
-    // it refuses — breaking the plane that works today to protect one that is not even running.
-    //
-    // What the 44.1 kHz family being admitted to the **PCM** plane changes is only which requests
-    // can reach here: a hi-res session may now legitimately ask for 44 100, and it settles at
-    // 44 100 rather than being floored to 48 000 — because the `max` is inside the `rate_hz >`
-    // test, so a request AT or BELOW the floor never trips this arm at all. The two rules read as
-    // one line and are genuinely two:
-    //
-    // - `rate_hz > hz` — the honesty rule, for either plane: never advertise a rate the engine
-    //   cannot produce. This is what declines 96 kHz on a 48 kHz engine.
-    // - `.max(SAMPLE_RATE)` — the Opus floor, for the `0xC9` plane: a 48 kHz open on a slower
-    //   engine is the legacy upsample every release has already shipped, and stays.
-    //
-    // So a HI-RES request loses here only when it is above the engine; the 48 kHz baseline claim
-    // every session makes is untouched, and a 44.1 kHz hi-res request is not a loss at all.
-    //
-    // The operator's lever is Windows' own device properties: set the endpoint to 96 kHz there
-    // and the host sees it here and honours it. Driving the engine format FROM the host would
-    // fight the OS and every other application on the box.
     let engine_hz = engine.as_ref().map(|f| f.get_samplespersec());
     let open_hz = match engine_hz {
         Some(hz) if hz > 0 && rate_hz > hz.max(SAMPLE_RATE) => {
@@ -622,9 +482,7 @@ fn capture_once(
             );
             settled
         }
-        // No mix format readable: the endpoint is answering nothing about itself, so the only
-        // defensible rate is the legacy one. Declining here costs a hi-res session and can
-        // never cost a working 48 kHz one.
+        // Unreadable mix format: declining hi-res cannot cost a working 48 kHz session.
         None if rate_hz != SAMPLE_RATE => {
             tracing::info!(
                 device = %dev_name,
@@ -635,14 +493,11 @@ fn capture_once(
         }
         _ => rate_hz,
     };
-    // Published BEFORE the initialize can fail, because it is the answer to "what did we settle
-    // for" and that answer is already decided. `sample_rate()` reads it back.
+    // Before Initialize can fail — `sample_rate()` already has a decided answer.
     opened_rate.store(open_hz, Ordering::Relaxed);
-    // f32 interleaved at `open_hz` in the requested channel layout; autoconvert lets WASAPI's
-    // shared-mode SRC match the engine mix format to ours (incl. up/downmix to the requested
-    // channel count), so we never resample/remix in Rust. The explicit dwChannelMask pins the
-    // wire order (FL FR FC LFE RL RR SL SR; 7.1 = 0x63F, not 0xFF). Loopback is implied by
-    // capturing a RENDER device with Direction::Capture in shared mode (STREAMFLAGS_LOOPBACK).
+    // Autoconvert matches the engine mix to this layout. `dwChannelMask` pins wire order
+    // (FL FR FC LFE RL RR SL SR; 7.1 = 0x63F, not 0xFF). Loopback is implied by capturing a
+    // RENDER device with `Direction::Capture` in shared mode.
     let mask = punktfunk_core::audio::wasapi_channel_mask(channels as u8);
     let desired = WaveFormat::new(
         32,
@@ -652,13 +507,9 @@ fn capture_once(
         channels as usize,
         Some(mask),
     );
-    // NB the plan's WP4.5 ("open the loopback at the MINIMUM device period, worth ~5–10 ms") is
-    // deliberately NOT done here, because its premise is wrong: in shared mode
-    // `IAudioClient::Initialize` cannot change the engine period at all — `hnsBufferDuration` sizes
-    // the buffer, and the callback still fires at the engine's fixed default period. Lowering it
-    // needs `IAudioClient3::InitializeSharedAudioStream`, which the `wasapi` crate does not wrap.
-    // Passing `min_period` here would therefore be a no-op at best and a new Initialize failure
-    // path at worst, on a device this tree cannot compile for, let alone test. Left as real work.
+    // Do not pass `min_period`: shared-mode `Initialize` cannot change the engine period
+    // (`hnsBufferDuration` sizes the buffer; the callback still fires at the default).
+    // Lowering it needs `IAudioClient3::InitializeSharedAudioStream`, which `wasapi` does not wrap.
     let (default_period, min_period) = audio_client.get_device_period().context("device period")?;
     let stream_mode = StreamMode::EventsShared {
         autoconvert: true,
@@ -681,12 +532,10 @@ fn capture_once(
     tracing::info!(device = %dev_name,
         follow = matches!(mode, TargetMode::Follow) || keep_default,
         last_resort,
-        // What we asked for, and what we settled on — the two differ only when the engine
-        // refused an upward request (see the decline above), and a reader has to be able to
-        // see which happened without inferring it.
+        // Asked vs settled — they differ only when an upward request was declined.
         requested_hz = rate_hz,
         opened_hz = open_hz,
-        // The endpoint's own format — NOT the one we asked for.
+        // Endpoint mix format, not the request.
         engine_hz = engine.as_ref().map(|f| f.get_samplespersec()),
         engine_ch = engine.as_ref().map(|f| f.get_nchannels()),
         engine_bits = engine.as_ref().map(|f| f.get_bitspersample()),
@@ -698,11 +547,9 @@ fn capture_once(
             "capturing an endpoint that {why} — the stream cannot sound better than this source");
     }
 
-    // Watchdog seed: the default as it stands right after our open. In Assert mode the plan just
-    // parked the default on our endpoint — if it did NOT stick (IPolicyConfig denied) converge
-    // instead of churning: follow a capturable default (audio plays on both ends), warn once on a
-    // dud. Afterwards only a CHANGE of the observed default id triggers a reaction, so a
-    // permanently-denied default set can never reopen-loop.
+    // Seed is the default right after open. If Assert's park did not stick, converge: follow a
+    // capturable default, warn once on a dud. Only a later CHANGE of that id reacts, so a
+    // permanently-denied default set cannot reopen-loop.
     let mut seen_default = default_render(&en).map(|(_, id)| id);
     if assert_plan {
         if let Some(d) = seen_default.as_deref() {
@@ -726,40 +573,27 @@ fn capture_once(
     let mut bytes: VecDeque<u8> = VecDeque::new();
     let mut last_check = Instant::now();
     let mut last_fp_check = Instant::now();
-    // Triage breadcrumb: a broken loopback (endpoint renders but its loopback tap delivers
-    // nothing — the Steam Streaming Speakers failure shape) is indistinguishable from a simply
-    // quiet desktop, so after 30 s with zero packets say so ONCE. Info, not warn — an idle host
-    // is legitimately silent — EXCEPT on a last-resort endpoint, where the plan already knew
-    // the loopback is silent and zero packets all but confirms the quality risk materialized.
+    // 30 s with zero packets: a broken loopback looks like a quiet desktop. Info, not warn —
+    // idle hosts are silent — except last-resort, where the plan already knew the tap is silent.
     let opened_at = Instant::now();
     let mut saw_packets = false;
     let mut silence_noted = false;
-    // WP0.2 — the audio plane's own vitals, logged periodically. Before this, a host log said
-    // nothing whatsoever about audio between "capturing" and the session ending: no level, no
-    // cadence, and in particular no sign of the SILENT, uncounted drop below, where a stalled
-    // encode thread loses chunks and the encoder simply concatenates across the hole (a click,
-    // and a permanent A/V offset, with nothing in any log).
+    // Periodic vitals. A stalled encode drops chunks with no other log line; the encoder
+    // concatenates across the hole (click + permanent A/V offset).
     let mut stats = CaptureStats::default();
     let mut last_stats = Instant::now();
-    // WP-A2 — where the gap counters come from on Windows. `delivered_pct` proves audio is missing
-    // but not whether it went in one hole or three hundred, and no clock can answer that here: this
-    // is a POLLING loop over a tap that stops delivering entirely while the endpoint idles, so
-    // "time since the last data" — the rule the Linux capture callback uses — would score every
-    // quiet moment on the host as a hole. WASAPI says it outright instead: a packet flagged
-    // discontinuous is one the tap admits is not contiguous with the previous, and the device
-    // position it carries (`next_index` is where the next packet must start if nothing was lost)
-    // sizes the missing audio in the device's own clock, not in how late we happened to poll.
+    // Gap source: this polling tap stops while the endpoint idles, so "time since last data"
+    // would score every quiet as a hole. `DATA_DISCONTINUITY` plus `index` (next packet start
+    // if nothing was lost) sizes missing audio in the device clock.
     let mut last_packet: Option<Instant> = None;
     let mut next_index: u64 = 0;
-    // WP2.4 — damping for the default-playback tug-of-war.
     let mut fight = FightDamper::new(Instant::now());
     loop {
         if stop.load(Ordering::Relaxed) {
             audio_client.stop_stream().ok();
             return Ok(Next::Stopped);
         }
-        // Loopback fires events only while audio renders; the finite timeout keeps `stop` (and
-        // the watchdog) responsive.
+        // Events fire only while audio renders; finite timeout keeps `stop` and the watchdog alive.
         let _ = h_event.wait_for_event(100);
         loop {
             match capture_client.get_next_packet_size() {
@@ -771,17 +605,13 @@ fn capture_once(
                         .read_from_device_to_deque(&mut bytes)
                         .context("read loopback")?;
                     let now = Instant::now();
-                    // Judged BEFORE the stamp moves: a discontinuity on the first packet after a
-                    // packet-less stretch is the tap waking up, which is what an idle endpoint
-                    // does here, not a hole in anything that was playing.
+                    // Before the stamp moves: discontinuity on the first packet after a quiet
+                    // stretch is idle-resume, not a hole in anything that was playing.
                     let flowing =
                         last_packet.is_some_and(|t| now.duration_since(t) < LOOPBACK_IDLE_AFTER);
                     let frames = ((bytes.len() - before) / block_align) as u64;
                     if frames == 0 {
-                        // Told a packet was ready, then handed none: the same fault the Linux twin
-                        // counts when a callback runs with no buffer to dequeue, and equally
-                        // invisible before — a tap spinning like this looked exactly like a quiet
-                        // desktop.
+                        // Packet-ready then zero frames: a spinning tap looks like a quiet desktop.
                         stats.missed_dequeues += 1;
                     } else {
                         if info.flags.data_discontinuity && flowing {
@@ -820,13 +650,9 @@ fn capture_once(
                 samples.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
             }
             stats.observe(&samples, channels);
-            // Non-blocking, lossy — same discipline as PipeWire. COUNTED, and only while a
-            // session is actually reading: a full channel under a LIVE consumer means the encode
-            // thread is not keeping up, and every dropped chunk is a click plus a permanent
-            // shift of everything after it. A full channel under a PARKED capturer means nothing
-            // — the planes park capturers between sessions rather than dropping them, so the
-            // channel fills once and then refuses everything
-            // ([`WasapiLoopbackCapturer::active`]).
+            // Lossy, non-blocking. Count only while a session is reading: a full channel under
+            // a live consumer is encode lag (click + permanent shift). A parked capturer fills
+            // once and then refuses everything ([`WasapiLoopbackCapturer::active`]).
             if tx.try_send(samples).is_err() && active.load(Ordering::Relaxed) {
                 stats.dropped_chunks += 1;
             }
@@ -846,15 +672,11 @@ fn capture_once(
                 peak_db = format!("{peak_db:.1}"),
                 rms_db = format!("{rms_db:.1}"),
                 delivered_pct = format!("{delivered_pct:.0}"),
-                // The shape of whatever `delivered_pct` is short by (WP-A2): one long hole and
-                // three hundred short ones read the same in the percentage and mean entirely
-                // different things. Sourced from WASAPI's own discontinuity flag here rather than
-                // from the callback cadence the Linux twin measures, so an endpoint that idles and
-                // resumes is not among them — see [`LOOPBACK_IDLE_AFTER`].
+                // Shape of whatever `delivered_pct` is short by. From WASAPI discontinuity, not
+                // callback cadence — an idle-then-resume endpoint is not a gap. See [`LOOPBACK_IDLE_AFTER`].
                 gaps = stats.gaps,
                 max_gap_ms = stats.max_gap_ms(),
-                // Their shape (bucket counts under 20/50/100 ms and ≥ 100 ms) and their total
-                // cost — same fields, same meaning as the Linux line.
+                // Bucket counts (<20/50/100 ms, ≥100 ms) and total cost; same fields as Linux.
                 gap_hist = %stats.gap_hist(),
                 missing_ms = stats.missing_ms(),
                 missed_dequeues = stats.missed_dequeues,
@@ -865,18 +687,15 @@ fn capture_once(
             stats = CaptureStats::default();
         }
 
-        // Watchdog: react when the default render device CHANGES from what we last observed —
-        // the operator picked a different output mid-stream (the old code never noticed and
-        // captured the stale endpoint forever; "cycle your output devices" was the workaround).
+        // Default render id changed — operator picked a different output mid-stream.
         if last_check.elapsed() >= DEFAULT_CHECK_EVERY {
             last_check = Instant::now();
             if let Some((_, nid)) = default_render(&en) {
                 if seen_default.as_deref() != Some(nid.as_str()) {
                     seen_default = Some(nid.clone());
                     if nid != dev_id {
-                        // NB the stream is stopped per-branch below, NOT here: the WP2.4 Dud
-                        // path deliberately keeps capturing, and stopping first would have made
-                        // the "no teardown" fix silently useless.
+                        // Stop per-branch, not here: the Dud path keeps capturing, and a
+                        // stop-first would make that keep-alive a no-op.
                         if keep_default {
                             audio_client.stop_stream().ok();
                             tracing::info!(
@@ -893,28 +712,19 @@ fn capture_once(
                                      it (audio now also plays on the host)");
                                 return Ok(Next::Reopen(TargetMode::Follow));
                             }
-                            // WP2.4 — a DUD default does not affect what we are capturing:
-                            // Assert mode binds the capture to the plan's endpoint EXPLICITLY,
-                            // not to whatever the default happens to be. Only where *apps*
-                            // render has moved. So put the default back and KEEP THE STREAM —
-                            // the old full reopen tore the capture down for nothing, and the
-                            // 2026-08-03 field log shows what that cost: something re-set the
-                            // default to CABLE Input every ~4 s and each round trip was a
-                            // teardown, a re-plan with IPolicyConfig writes, and an audible
-                            // dropout — seven of them in sixteen seconds, one ending in a 2 s
-                            // error backoff.
+                            // Assert binds capture to the plan's endpoint, not the default.
+                            // Only where apps render has moved — put the default back, keep the
+                            // stream. A full reopen is a dropout on every dud-default fight.
                             DefaultKind::Dud(name) => {
                                 if !assert_plan {
-                                    // Follow/KEEP_DEFAULT shapes still need the old behaviour:
-                                    // there the capture IS bound to the default.
+                                    // Follow/KEEP_DEFAULT capture IS the default — reopen on Assert.
                                     audio_client.stop_stream().ok();
                                     return Ok(Next::Reopen(TargetMode::Assert));
                                 }
                                 fight.observed_at(Instant::now());
                                 if fight.should_reassert() {
                                     audio_control::reassert_default_playback(&dev_id);
-                                    // Believe our own write: the next watchdog tick sees the
-                                    // default back on our endpoint and stays quiet.
+                                    // Next watchdog tick sees our endpoint and stays quiet.
                                     seen_default = Some(dev_id.clone());
                                     if fight.warn_now() {
                                         tracing::warn!(device = %name, planned = %dev_name,
@@ -941,13 +751,8 @@ fn capture_once(
             }
         }
 
-        // A LAST-RESORT capture is a stopgap, not a steady state: the plan chose the
-        // known-silent Steam Speakers only because nothing better existed, so any endpoint-set
-        // change — the display's audio endpoint re-arriving, headphones plugged in — may unlock
-        // a real plan. Re-plan on the change; without this the session would ride the silent
-        // loopback forever AFTER the real endpoint returned (the original field defect in a
-        // quieter costume). Preferred endpoints don't get this watch: mid-stream re-routing
-        // there is the default-device watchdog's job, on the operator's terms.
+        // Last-resort is a stopgap: any endpoint-set change may unlock a real plan. Preferred
+        // endpoints don't watch this — mid-stream re-routing is the default-device watchdog.
         if last_resort && last_fp_check.elapsed() >= ENDPOINT_POLL_EVERY {
             last_fp_check = Instant::now();
             if audio_control::endpoint_fingerprint() != plan_fp {
@@ -961,21 +766,19 @@ fn capture_once(
     }
 }
 
-/// The watchdog's verdict on a newly-observed default render endpoint.
+/// Watchdog verdict on a newly-observed default render endpoint.
 enum DefaultKind {
-    /// Loopback-capturable — following it yields working audio (audible on the host too).
+    /// Following it yields working audio (audible on the host too).
     Capturable(String),
-    /// The mic target or a known-silent/echoing loopback (cable, Steam Streaming Speakers) —
-    /// following it can only produce silence or an echo loop.
+    /// Mic target, pad endpoint, or known-silent/echoing loopback. Following it is silence or echo.
     Dud(String),
-    /// Could not resolve the endpoint (transient churn).
+    /// Enumeration miss (transient churn).
     Unknown,
 }
 
-/// Resolves through [`super::pad_endpoint::open_wasapi_device`] rather than the `wasapi` crate's
-/// `DeviceEnumerator::get_device`: that one handed `GetDevice` a freed string through 0.23, and a
-/// spurious miss here silently downgrades a capturable default to `Unknown`. `wasapi 0.24` fixed
-/// that, but we keep the one resolution path — see the helper's docs.
+/// Resolve via [`super::pad_endpoint::open_wasapi_device`], not `DeviceEnumerator::get_device`:
+/// that handed `GetDevice` a freed string through 0.23, and a miss here silently downgrades a
+/// capturable default to `Unknown`. Keep one resolution path — see the helper.
 fn judge_default(wiring: &wiring_plan::Wiring, id: &str) -> DefaultKind {
     let Ok(dev) = super::pad_endpoint::open_wasapi_device(id) else {
         return DefaultKind::Unknown;
@@ -986,13 +789,10 @@ fn judge_default(wiring: &wiring_plan::Wiring, id: &str) -> DefaultKind {
         .mic_render
         .as_ref()
         .is_some_and(|(_, mic_id)| mic_id == id);
-    // B10: a pad's audio endpoint is not ordinary hardware, and the name rules cannot see that —
-    // it is deliberately stamped with the controller's own name ("DualSense Wireless Controller")
-    // so games treat it as the pad's speaker, which means `excluded_from_loopback` passes it
-    // straight through as `Capturable`. The pure plan filtered these out, but the plan is not the
-    // only reader: this classifier drives the watchdog, Follow mode and the parked default, so a
-    // pad endpoint that happened to be the system default could be adopted as the desktop capture
-    // source — sending the whole desktop mix to a controller's voice coils. Identity, not name.
+    // Pad endpoints are stamped with the controller name so games treat them as the pad speaker;
+    // `excluded_from_loopback` therefore passes them as Capturable. This classifier also drives
+    // the watchdog and Follow, so a pad default would send the desktop mix to voice coils.
+    // Identity, not name.
     let is_pad = super::pad_endpoint::is_pad_render_endpoint(id);
     if is_mic || is_pad || wiring_plan::excluded_from_loopback(&ln) {
         DefaultKind::Dud(name)
@@ -1005,8 +805,7 @@ fn judge_default(wiring: &wiring_plan::Wiring, id: &str) -> DefaultKind {
 mod tests {
     use super::*;
 
-    /// Live loopback round trip — skipped unless `PUNKTFUNK_WASAPI_LIVE=1` and a render endpoint
-    /// exists. Opens the capturer and pulls one chunk of interleaved f32.
+    /// Live loopback round trip. Skipped unless `PUNKTFUNK_WASAPI_LIVE=1` and a render endpoint exists.
     #[test]
     fn live_open_and_read() {
         if std::env::var("PUNKTFUNK_WASAPI_LIVE").is_err() {
@@ -1020,8 +819,7 @@ mod tests {
             }
         };
         assert_eq!(cap.channels(), 2);
-        // Asking for the legacy rate can never be declined — no engine runs below it in a way
-        // that would make 48 kHz an upward request — so the settled rate must be what we asked.
+        // Legacy rate is never an upward request, so the settled rate must equal the ask.
         assert_eq!(cap.sample_rate(), SAMPLE_RATE);
         match cap.next_chunk() {
             Ok(samples) => assert!(

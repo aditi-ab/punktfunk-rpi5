@@ -1,57 +1,45 @@
-//! Host actions from a client (`design/host-actions.md` §7): discovering what the paired host
-//! offers — v1, sleep / restart / shut down — and invoking one by id.
+//! Client half of host power actions (`design/host-actions.md`): list what the paired
+//! host offers this device, then invoke one by id.
 //!
-//! Same lane, same trust, same agent as the library browse ([`crate::library`]): TLS client auth
-//! with the device identity, host pinned by fingerprint, over `mgmt_port`. Nothing new is asked
-//! of the transport, and the HOST is the only enforcer — [`ActionInfo::permitted`] is what the
-//! host says about *this* device's grants, so the client renders honestly instead of offering a
-//! row that will 403.
-//!
-//! Both calls work OUT of session, which is the point: "sleep the host" belongs on a host tile
-//! at the end of an evening, not only mid-stream.
+//! Same mTLS lane as [`crate::library`]: device identity, fingerprint pin, `mgmt_port`.
+//! [`ActionInfo::permitted`] is the host's grant for this device; ungranted rows are
+//! omitted rather than offered as a 403. Both calls work out of session so a host tile
+//! can sleep the box without a stream.
 
 use serde::Deserialize;
 
-/// One action as the host reports it to THIS caller (`GET /api/v1/actions`).
+/// One row from `GET /api/v1/actions` for this device.
 ///
-/// Unknown ids are expected and fine — a client renders [`Self::title`] verbatim for anything it
-/// has no local string for, which is what lets a later host add actions with no client release.
+/// Unknown ids are expected: render [`Self::title`] verbatim so a later host can add
+/// actions without a client release.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ActionInfo {
-    /// Stable id: `power.sleep`, `power.reboot`, `power.shutdown` today.
     pub id: String,
-    /// The host's own display title — the fallback label for an id this client doesn't know.
     #[serde(default)]
     pub title: String,
-    /// Action group (`power` for the built-ins).
     #[serde(default)]
     pub group: String,
-    /// Confirm twice before running it: the action loses state (restart, shut down).
+    /// Confirm first: the action drops host state (reboot, shutdown).
     #[serde(default)]
     pub danger: bool,
-    /// Whether the host can run it at all right now (a machine that cannot suspend, a foreign
-    /// inhibitor, a missing group membership).
+    /// Host can run it now. False for no-suspend, a foreign inhibitor, missing group.
     #[serde(default)]
     pub available: bool,
-    /// Why not, when `available` is false — shown rather than hidden, so "greyed out" always has
-    /// a reason attached.
+    /// Why `available` is false; shown on a disabled row, never used to hide it.
     #[serde(default)]
     pub unavailable_reason: Option<String>,
-    /// Whether THIS device's access covers it (the host's Host-power grant).
+    /// Host-power grant for this device. False hides the row ([`Self::offerable`]).
     #[serde(default)]
     pub permitted: bool,
 }
 
 impl ActionInfo {
-    /// Offer this row at all? Actions the device may not invoke are hidden (that is the access
-    /// level talking, and a permanently dead row is noise); actions it may invoke but the host
-    /// cannot run right now are SHOWN, disabled, with [`Self::unavailable_reason`].
+    /// Ungranted rows are omitted. Granted-but-unavailable rows stay, disabled, with [`Self::unavailable_reason`].
     pub fn offerable(&self) -> bool {
         self.permitted
     }
 
-    /// The client's own label for a known id, else the host's title. Keeps a familiar action
-    /// worded the way the rest of this client words it, without hiding an unfamiliar one.
+    /// Local wording for known ids; [`Self::title`] for anything else so a new host action still shows.
     pub fn label(&self) -> &str {
         match self.id.as_str() {
             "power.sleep" => "Sleep host",
@@ -69,12 +57,9 @@ struct ActionList {
     actions: Vec<ActionInfo>,
 }
 
-/// What this host offers this device, from `GET /api/v1/actions`.
+/// `GET /api/v1/actions`. Empty on any miss, never an error — same contract as [`crate::library::fetch_running`].
 ///
-/// **Best-effort by contract**, exactly like [`crate::library::fetch_running`]: an older host
-/// (which has no such route), an unreachable one, or a shape we don't recognize yields an empty
-/// list rather than an error. A missing row costs a menu entry; failing a host card over it
-/// would cost the screen.
+/// An older host has no such route. A missing menu row is cheaper than failing the host card.
 #[cfg(any(target_os = "linux", windows))]
 pub fn fetch_actions(
     addr: &str,
@@ -100,12 +85,10 @@ pub fn fetch_actions(
         .unwrap_or_default()
 }
 
-/// Invoke one action by id (`POST /api/v1/actions/{id}`, empty body).
+/// `POST /api/v1/actions/{id}` with an empty body.
 ///
-/// `Ok(())` means the host ACCEPTED it (202) — it now ends every session and acts about a second
-/// later, so this is the last word the client will get on the subject. The error is already
-/// user-facing: the host's own refusal sentence (another device is streaming, a foreign sleep
-/// inhibitor, the platform said no), or the library lane's classified transport error.
+/// `Ok(())` is 202 Accepted: the host then ends every session and acts ~1 s later.
+/// 4xx becomes [`crate::library::LibraryError::Unreachable`]; other failures go through [`crate::library::classify`].
 #[cfg(any(target_os = "linux", windows))]
 pub fn invoke(
     addr: &str,
@@ -116,18 +99,13 @@ pub fn invoke(
 ) -> Result<(), crate::library::LibraryError> {
     use crate::library::LibraryError;
     let agent = crate::library::agent(identity, pin)?;
-    // The id is the whole request — the body stays empty (the host's rule: no request field ever
-    // reaches the privileged path). Percent-encoding is unnecessary and would be wrong: ids are
-    // `[a-z.]` by grammar, and anything else is an id this host will 404 anyway.
+    // Empty body: no request field reaches the privileged path. Do not percent-encode; ids are `[a-z.]`.
     let url = format!(
         "{}/api/v1/actions/{action_id}",
         crate::library::base_url(addr, mgmt_port)
     );
     match agent.post(&url).send_empty() {
         Ok(_) => Ok(()),
-        // A refusal carries the host's reason in the `ApiError` envelope; surface THAT, because
-        // "409" tells a person nothing and "another device is streaming from this host right
-        // now" tells them exactly what to do.
         Err(ureq::Error::StatusCode(code)) if (400..500).contains(&code) => Err(
             LibraryError::Unreachable(format!("the host refused ({code})")),
         ),
@@ -135,20 +113,15 @@ pub fn invoke(
     }
 }
 
-/// How long a host's answer stays fresh before [`refresh`] will ask again. Long on purpose:
-/// what it governs — whether this device holds the Host-power grant, whether the box can
-/// suspend — changes when an operator edits access, not minute to minute, and every refresh is
-/// a TLS handshake against a host that is otherwise idle.
+/// 300 s. Grant and suspend-capability change when an operator edits access, not
+/// minute-to-minute; each refresh is a TLS handshake against an idle host.
 #[cfg(any(target_os = "linux", windows))]
 pub const TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// The process-wide answer cache, by host fingerprint.
+/// Process-wide, keyed by host fingerprint.
 ///
-/// Every desktop shell needs the same thing — a list settled BEFORE a menu draws (rows that
-/// appear under a cursor already moving toward something else are a hazard when two of them
-/// shut a machine down), refreshed rarely, shared across the screens that show it. One cache
-/// with one TTL rule beats the same 40 lines in the console, the GTK page and the Windows
-/// tile — which is how three shells end up disagreeing about what a host offers.
+/// Settled before a menu draws: a row that appears under a cursor already moving toward
+/// it can shut the machine down. One cache so the console, GTK, and Windows tiles agree.
 #[cfg(any(target_os = "linux", windows))]
 type Cache =
     std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<ActionInfo>)>>;
@@ -159,9 +132,7 @@ fn cache() -> &'static Cache {
     C.get_or_init(Default::default)
 }
 
-/// What this host last said it lets this device do — the OFFERABLE rows only, so a caller
-/// renders what it gets. Empty until a [`refresh`] has answered, and empty for a host with no
-/// such route or a device without the grant.
+/// Offerable rows last stored for this fingerprint. Empty until [`refresh`] answers, and for no-route / no-grant hosts.
 #[cfg(any(target_os = "linux", windows))]
 pub fn cached(fp_hex: &str) -> Vec<ActionInfo> {
     cache()
@@ -172,17 +143,14 @@ pub fn cached(fp_hex: &str) -> Vec<ActionInfo> {
         .unwrap_or_default()
 }
 
-/// Ask this host again, off the caller's thread, unless the cached answer is still inside
-/// [`TTL`]. Cheap and idempotent: call it on whatever refresh tick a shell already has.
+/// Spawn a worker unless the cache is still inside [`TTL`]. Idempotent; call it on any shell tick.
 ///
-/// The freshness stamp is taken BEFORE the request, so a slow or hanging host cannot make
-/// every tick spawn another worker for it. The device identity is loaded on the worker rather
-/// than taken as an argument — it is the same one file every shell already reads, and asking
-/// for it here would mean threading it through three menus that have no other use for it.
+/// The freshness stamp is taken before the request so a hang cannot spawn another worker
+/// every tick. Identity is loaded on the worker so menus do not have to thread it through.
 #[cfg(any(target_os = "linux", windows))]
 pub fn refresh(addr: &str, mgmt_port: u16, fp_hex: &str) {
     if fp_hex.is_empty() {
-        return; // no pinned identity ⇒ nothing to authenticate as, and nothing to key on
+        return; // empty fingerprint cannot authenticate or key the cache
     }
     {
         let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
@@ -199,13 +167,11 @@ pub fn refresh(addr: &str, mgmt_port: u16, fp_hex: &str) {
         .name("punktfunk-hostactions".into())
         .spawn(move || {
             let Ok(identity) = crate::trust::load_or_create_identity() else {
-                return; // no device identity ⇒ nothing to authenticate as
+                return;
             };
             let pin = crate::trust::parse_hex32(&fp_hex);
             let found: Vec<ActionInfo> = fetch_actions(&addr, mgmt_port, &identity, pin)
                 .into_iter()
-                // The host decides who may see a row; a device without the grant is told
-                // nothing about the action beyond that it exists, and shows nothing.
                 .filter(ActionInfo::offerable)
                 .collect();
             cache()
@@ -216,9 +182,7 @@ pub fn refresh(addr: &str, mgmt_port: u16, fp_hex: &str) {
         .ok();
 }
 
-/// Forget what this host said — call it right after invoking an action, because whatever it
-/// said is about to be wrong. Without this, a menu goes on offering "Sleep host" on a machine
-/// that is already asleep until the TTL lapses.
+/// Drop the cache after [`invoke`]: otherwise the menu still offers Sleep until [`TTL`] lapses on an already-asleep host.
 #[cfg(any(target_os = "linux", windows))]
 pub fn invalidate(fp_hex: &str) {
     cache()
@@ -231,8 +195,6 @@ pub fn invalidate(fp_hex: &str) {
 mod tests {
     use super::*;
 
-    /// Known ids wear this client's wording; an id from a future host wears the host's own
-    /// title, which is the whole no-client-release contract.
     #[test]
     fn labels_prefer_local_wording_and_fall_back_to_the_host() {
         let mk = |id: &str, title: &str| ActionInfo {
@@ -252,8 +214,6 @@ mod tests {
         );
     }
 
-    /// Not-permitted hides the row (that is the device's access level, and it will not change
-    /// while the menu is open); unavailable KEEPS it, so the reason can be shown.
     #[test]
     fn permission_hides_but_unavailability_only_disables() {
         let mut a = ActionInfo {

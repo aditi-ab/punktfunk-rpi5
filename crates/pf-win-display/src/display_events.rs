@@ -1,32 +1,20 @@
-//! OS display-event listener — the attribution sensor for the periodic-stutter disturbance class.
+//! OS display-event listener for capture-stall attribution.
 //!
-//! The capture-stall watch (the IDD-push capturer in `pf-capture`) can SAY "DWM stopped composing
-//! on a stable period", but not WHY. Field evidence (Apollo's Stuttering Clinic, Apollo #384,
-//! Tom's HW "stutter from disabled-but-connected monitors") points at a connected-but-idle sink
-//! (standby TV/monitor, active HDMI cable, KVM/AVR) re-probing the link every few seconds; the GPU
-//! driver services each probe below the topology layer, and on some boxes Windows additionally
-//! tears down + re-arrives the monitor's devnode each time. This module timestamps everything
-//! Windows lets user mode see of that reaction so the stall log can name the disturbance instead
-//! of guessing:
+//! The IDD-push capturer can report that DWM stopped composing on a period, not why. This thread
+//! timestamps the three user-mode signals Windows exposes:
 //!
-//! - `WM_DEVICECHANGE` + `RegisterDeviceNotificationW(GUID_DEVINTERFACE_MONITOR)`: monitor device
-//!   interface arrival/removal — fires on devnode churn even when the final topology is unchanged
-//!   (the "reaction cascade" class `pnp_disable_monitors` suppresses), with the interface path
-//!   naming WHICH monitor pulsed.
-//! - `DBT_DEVNODES_CHANGED`: the broadcast catch-all for PnP tree churn (no payload).
-//! - `WM_DISPLAYCHANGE`: an actual mode/topology commit reached the desktop (this one does NOT
-//!   fire for a pure probe with no mode delta — its absence is itself a signal).
+//! - `WM_DEVICECHANGE` + `RegisterDeviceNotificationW(GUID_DEVINTERFACE_MONITOR)`: monitor
+//!   interface arrival/removal, including devnode churn that leaves topology unchanged.
+//! - `DBT_DEVNODES_CHANGED`: PnP-tree churn with no payload.
+//! - `WM_DISPLAYCHANGE`: a mode/topology commit reached the desktop. Absence is a signal: a
+//!   probe with no mode delta does not fire this.
 //!
-//! A pure driver-internal probe (EDID/DDC read, DP link retrain) emits NONE of these — that
-//! absence, paired with metronomic stalls, is what discriminates "driver services a standby sink
-//! below the OS" from "Windows re-enumerates the monitor". Kernel-precise attribution (DxgKrnl ETW
-//! event 272 `DxgkCbIndicateChildStatus`) is a possible follow-up; this listener is the cheap
-//! always-on first stage.
+//! A driver-internal probe (EDID/DDC, DP retrain) emits none of these. Pair that silence with
+//! metronomic stalls to tell a KMD-below-OS sink from a Windows re-enumeration.
 //!
-//! The listener thread also keeps a cached CCD target inventory (refreshed on each event + a slow
-//! timer), so the capture thread can name connected-but-inactive external displays — the prime
-//! suspects — without ever touching the CCD lock itself (the display-config lock is exactly what
-//! stalls during churn; the capture thread must never block on it).
+//! CCD inventory is cached on each event and a slow timer so the capture thread can name
+//! connected-but-inactive physicals without taking the display-config lock (that lock is what
+//! stalls during churn).
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, Once, OnceLock};
@@ -44,24 +32,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_DISPLAYCHANGE, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
-/// One OS-visible display event, timestamped at receipt.
 #[derive(Clone)]
 pub struct DisplayEvent {
     pub at: Instant,
     pub kind: DisplayEventKind,
-    /// Monitor device instance id for arrival/removal (e.g. `DISPLAY\GSM83CD\...`), else `None`.
+    /// Monitor instance id on arrival/removal; `None` otherwise.
     pub detail: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DisplayEventKind {
-    /// A monitor device interface ARRIVED — a sink (re)connected as Windows sees it.
     MonitorArrival,
-    /// A monitor device interface was REMOVED — a sink dropped as Windows sees it.
     MonitorRemoval,
-    /// PnP device-tree churn (broadcast, no payload) — re-enumeration passed through.
+    /// PnP tree churn (broadcast, no payload).
     DevNodesChanged,
-    /// A mode/topology commit reached the desktop (resolution/layout actually changed).
     DisplayChange,
 }
 
@@ -77,14 +61,11 @@ impl DisplayEventKind {
 }
 
 struct State {
-    /// Recent events, oldest-first, capped at [`RING_CAP`].
     events: VecDeque<DisplayEvent>,
-    /// Cached CCD target inventory (see module docs for why the cache exists).
     inventory: Vec<crate::win_display::TargetInventory>,
 }
 
-/// Ring depth: at the observed worst case (a probe cycle every ~2 s, ≤4 events per cycle) this
-/// holds well over a minute of history — the stall correlator only ever asks about the last gap.
+/// 128 ≈ 1 min at a 2 s probe cycle with ≤4 events each. The correlator only reads the last gap.
 const RING_CAP: usize = 128;
 
 fn state() -> &'static Mutex<State> {
@@ -97,9 +78,7 @@ fn state() -> &'static Mutex<State> {
     })
 }
 
-/// Start the listener thread (idempotent). Degraded-not-fatal: if window/registration creation
-/// fails the ring just stays empty — the stall log then reports "listener unavailable" naturally
-/// via empty summaries, and streaming is unaffected.
+/// Window or registration failure leaves the ring empty; streaming continues.
 pub fn spawn_once() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -115,7 +94,6 @@ pub fn spawn_once() {
     });
 }
 
-/// Events with `from <= at <= to`, oldest-first.
 pub fn events_between(from: Instant, to: Instant) -> Vec<DisplayEvent> {
     let st = state().lock().unwrap();
     st.events
@@ -125,8 +103,7 @@ pub fn events_between(from: Instant, to: Instant) -> Vec<DisplayEvent> {
         .collect()
 }
 
-/// Compact one-line summary for log fields: `"monitor-removal x2 (DISPLAY\GSM83CD\...),
-/// devnodes-changed x1"`; `"none"` when empty.
+/// One log field: `"monitor-removal x2 (DISPLAY\\…), devnodes-changed x1"`; `"none"` if empty.
 pub fn summarize(events: &[DisplayEvent]) -> String {
     if events.is_empty() {
         return "none".into();
@@ -153,14 +130,8 @@ pub fn summarize(events: &[DisplayEvent]) -> String {
     out.join(", ")
 }
 
-/// The prime suspects for link-probe/dark-head disturbances, from the cached inventory: PHYSICAL
-/// displays — external connectors AND internal panels — that are CONNECTED but not part of the
-/// desktop. External = the classic standby TV / input-switched monitor; internal = the laptop
-/// panel the exclusive isolate deactivated, whose driver-level servicing produces the identical
-/// ~2 s metronome on hybrid laptops (field A/B 2026-07-27: reporter's Legion, exclusive
-/// 16.3 stalls/min vs primary 0 — the old external-only filter reported `none` there and steered
-/// the diagnosis AWAY from the real cause for hours). Virtual/indirect targets stay excluded
-/// (precision rule). Rendered as `"<friendly> (<connector>)"`. Never blocks on the CCD lock.
+/// External standby sinks and the laptop panel Exclusive isolate deactivated. Both get the same
+/// ~2 s driver-level probe. Virtual/indirect targets stay out. Never takes the CCD lock.
 pub fn connected_inactive_physicals() -> Vec<String> {
     let st = state().lock().unwrap();
     st.inventory
@@ -196,12 +167,11 @@ fn refresh_inventory() {
     }
 }
 
-/// Inventory refresh timer: 15 s keeps the "connected-but-inactive" suspect list fresh enough for
-/// a warn that rate-limits to 30 s, without measurable CCD traffic.
+/// 15 s keeps the suspect list fresher than the 30 s warn rate-limit, without extra CCD traffic.
 const INVENTORY_TIMER_MS: u32 = 15_000;
 
-/// `DBT_DEVNODES_CHANGED` arrives as `wParam` on `WM_DEVICECHANGE` without a registration; the
-/// interface arrivals/removals need the `RegisterDeviceNotificationW` below.
+/// `DBT_DEVNODES_CHANGED` arrives as `wParam` on `WM_DEVICECHANGE` without a registration; interface
+/// arrival/removal needs `RegisterDeviceNotificationW` below.
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -210,8 +180,7 @@ unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     match msg {
         WM_DISPLAYCHANGE => {
-            // lParam packs the new primary resolution — worth carrying: it distinguishes a real
-            // mode change from a same-mode re-commit when reading a field log.
+            // lParam is the new primary resolution. Distinguishes a real mode change from a same-mode re-commit.
             let (w, h) = (
                 (lparam.0 & 0xffff) as u32,
                 ((lparam.0 >> 16) & 0xffff) as u32,
@@ -231,9 +200,8 @@ unsafe extern "system" fn wnd_proc(
                 } else {
                     DisplayEventKind::MonitorRemoval
                 };
-                // SAFETY: for these two events lParam is documented to point at a
-                // DEV_BROADCAST_HDR (or be 0 — checked). We only read the header fields, and only
-                // reinterpret as DEV_BROADCAST_DEVICEINTERFACE_W after checking dbch_devicetype,
+                // SAFETY: for these two events lParam is a DEV_BROADCAST_HDR or 0 (checked). Header
+                // fields only, then DEV_BROADCAST_DEVICEINTERFACE_W after dbch_devicetype matches,
                 // reading at most dbch_size bytes — the size the sender declared.
                 let detail = unsafe {
                     let hdr = lparam.0 as *const DEV_BROADCAST_HDR;
@@ -267,18 +235,15 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
-/// The listener thread: a hidden TOP-LEVEL window (message-ONLY windows receive neither
-/// `WM_DISPLAYCHANGE` nor broadcast `WM_DEVICECHANGE` — the classic pitfall) + a device-interface
-/// registration for monitors + a blocking message pump. Runs for the process lifetime.
+/// Message-only windows receive neither `WM_DISPLAYCHANGE` nor broadcast `WM_DEVICECHANGE`.
 fn pump() {
-    refresh_inventory(); // baseline before any event arrives
+    refresh_inventory();
 
     let class: Vec<u16> = "pf-display-events\0".encode_utf16().collect();
-    // SAFETY: straight-line Win32 window bring-up on this thread. `class` outlives every use of
-    // its pointer (it lives to the end of the fn, the pump loops forever). All handles passed on
-    // are the ones the preceding calls returned; failure of any step returns out of the thread
-    // (degraded mode, see `spawn_once`). The DEV_BROADCAST_DEVICEINTERFACE_W filter is a fully
-    // initialised local read synchronously by RegisterDeviceNotificationW.
+    // SAFETY: Win32 window bring-up on this thread. `class` outlives every pointer use (lives to
+    // fn end; the pump loops forever). Handles are the preceding calls' returns; any failure
+    // returns from the thread (degraded, see `spawn_once`). The filter is a fully initialised
+    // local that RegisterDeviceNotificationW reads synchronously.
     unsafe {
         let Ok(hinstance) = GetModuleHandleW(None) else {
             tracing::warn!(
@@ -302,7 +267,7 @@ fn pump() {
             WINDOW_EX_STYLE(0),
             PCWSTR(class.as_ptr()),
             PCWSTR(class.as_ptr()),
-            WS_OVERLAPPED, // hidden: never shown, never gets focus — exists only to receive broadcasts
+            WS_OVERLAPPED, // hidden; exists only to receive broadcasts
             0,
             0,
             0,

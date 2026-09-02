@@ -1,10 +1,18 @@
-//! Off-thread display-descriptor polling (plan §W4, carved out of the IDD-push capturer): the
-//! live HDR state + active resolution of the virtual target, sampled off the capture loop via CCD.
+//! Off-thread CCD sampler for the virtual target's live HDR flag and active resolution.
+//!
+//! `QueryDisplayConfig` (twice per sample) serializes on the session-global display-config
+//! lock. A stall of tens of milliseconds on the capture thread misses frames, so
+//! [`DescriptorPoller`] samples on its own thread and publishes a snapshot. The capture
+//! loop's per-frame cost is one uncontended mutex read.
+//!
+//! Last-known-good per field: a `None` query — the target briefly missing from the active-path
+//! list during a topology re-probe — keeps the previous value. `seq` advances only when at
+//! least one query succeeded, so the consumer's debounce counts observations, never misses.
+//!
+//! Pin: [`DescriptorPoller::snapshot`]. Consumer: `poll_display_hdr` in the IDD-push capturer.
 
 use super::*;
 
-/// The display descriptor the capture loop follows: live HDR state + active resolution of the
-/// virtual target.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct DisplayDescriptor {
     pub(super) hdr: bool,
@@ -12,35 +20,16 @@ pub(super) struct DisplayDescriptor {
     pub(super) height: u32,
 }
 
-/// Off-thread poller for [`DisplayDescriptor`]. The CCD queries behind it (`QueryDisplayConfig`,
-/// twice per sample) serialize on the session-global display-configuration lock, which display-
-/// topology events and third-party display-poller software (the SteelSeries-GG class) can hold
-/// for tens-to-hundreds of milliseconds at a time. Polled inline — the old design — that stall
-/// landed ON the capture/encode thread: a periodic frame hitch on an otherwise healthy host, and
-/// invisible in any log. Now a dedicated thread samples every [`Self::INTERVAL`] and publishes a
-/// snapshot; the capture thread's per-frame cost is one uncontended mutex read, and a slow CCD
-/// sample is *measured and logged* instead of silently stalling the stream.
-///
-/// Failure policy is last-known-good, per field: a transient CCD failure — including the target
-/// briefly missing from the active-path list during a topology re-probe — keeps the previous
-/// value instead of reading as `hdr = false` (the old behavior, which on an HDR session turned
-/// every blip into TWO ring recreates: false, then true again a poll later). `seq` bumps only
-/// when at least one query succeeded, so the consumer's debounce counts real observations, never
-/// failures.
 pub(super) struct DescriptorPoller {
-    /// Latest merged sample + its sequence number; the poller holds the lock only to copy it.
     snap: Arc<Mutex<(DisplayDescriptor, u64)>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DescriptorPoller {
-    /// Poll cadence — the old inline throttle. With the consumer's two-strikes debounce on top, a
-    /// real "Use HDR" flip or mode-set is acted on within ~2 samples (≈ ½ s).
+    /// 250 ms. Two-strikes debounce in `poll_display_hdr` acts on a real flip in two samples (~½ s).
     const INTERVAL: Duration = Duration::from_millis(250);
-    /// A sample slower than this means something is sitting on the display-config lock (topology
-    /// churn / display-poller software) — the disturbance class behind periodic virtual-display
-    /// stream hitches. Logged (rate-limited) so an affected host self-diagnoses.
+    /// 50 ms. A healthy CCD sample is sub-millisecond; above this the display-config lock is held.
     const SLOW: Duration = Duration::from_millis(50);
 
     pub(super) fn spawn(
@@ -86,20 +75,18 @@ impl DescriptorPoller {
                         seq += 1;
                         *snap_t.lock().unwrap() = (last, seq);
                     }
-                    // Park (not sleep) so `drop` wakes the thread immediately via `unpark`.
+                    // `park_timeout`, not `sleep`: `Drop` unparks so join does not wait out INTERVAL.
                     std::thread::park_timeout(Self::INTERVAL);
                 }
             })
             .map_err(|e| {
-                // Degraded, not fatal: the session streams, it just never follows a mid-session
-                // HDR flip / mode-set (seq stays 0 → the consumer sees no changes).
+                // Not fatal: `seq` stays 0, so the capture loop never follows a mid-session flip.
                 tracing::warn!(error = %e, "IDD push: descriptor-poller thread failed to spawn — mid-session HDR/mode changes won't be followed");
             })
             .ok();
         Self { snap, stop, thread }
     }
 
-    /// The latest sample (lock held only for the copy — the poller writes at 4 Hz).
     pub(super) fn snapshot(&self) -> (DisplayDescriptor, u64) {
         *self.snap.lock().unwrap()
     }

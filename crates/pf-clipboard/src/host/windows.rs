@@ -1,24 +1,12 @@
-//! Host-side shared-clipboard backend for Windows (`design/clipboard-and-file-transfer.md` §4, Phase
-//! 3). The Win32 clipboard is thread-affine and message-driven, so the whole backend lives on one
-//! dedicated **message-loop thread** owning a hidden message-only window:
+//! Win32 shared-clipboard backend (`design/clipboard-and-file-transfer.md` §4).
 //!
-//! * **host copy → client** — `AddClipboardFormatListener` delivers `WM_CLIPBOARDUPDATE`; we map the
-//!   available formats to wire MIMEs, cache them, and emit [`ClipEvent::Selection`]. Our own offers
-//!   are suppressed by the owner-check (we never forward what we ourselves put on the clipboard).
-//! * **client fetch of the host clipboard** — a `Cmd::Read` reads the requested format's HGLOBAL and
-//!   converts it to wire bytes ([`super::winfmt`]).
-//! * **client copy → host** — a `Cmd::SetOffer` installs the client's formats via OLE **delayed
-//!   rendering**: `SetClipboardData(fmt, NULL)`, so no bytes cross until a host app actually pastes.
-//! * **host paste of client content** — the paste triggers `WM_RENDERFORMAT`; the message-loop thread
-//!   blocks (bounded) while the coordinator fetches the bytes from the client, then `SetClipboardData`s
-//!   them for the pasting app.
+//! The clipboard is thread-affine, so one message-loop thread owns a hidden message-only
+//! window. `AddClipboardFormatListener` announces host copies; `Cmd::SetOffer` installs
+//! client formats via delayed rendering (`SetClipboardData(fmt, NULL)`); `WM_RENDERFORMAT`
+//! blocks this thread (bounded) while the coordinator fetches paste bytes.
 //!
-//! The async coordinator drives the thread through a [`Cmd`] channel woken by `PostMessage(WM_APP_CMD)`
-//! (`PostMessage` is the documented thread-safe way to poke a message loop). Per-window state hangs
-//! off `GWLP_USERDATA`, so multiple concurrent sessions each get their own window + state.
-
-// Every `unsafe` block in this file carries a `// SAFETY:` proof; the deny enforcing it sits at
-// the crate root (lib.rs), covering every backend.
+//! The async side pokes the pump with `PostMessage(WM_APP_CMD)`. Per-window state hangs
+//! off `GWLP_USERDATA`, so concurrent sessions each get their own window.
 
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
@@ -52,73 +40,54 @@ use super::{
     ClipEvent, PasteResponder, WIRE_GIF, WIRE_HTML, WIRE_JPEG, WIRE_PNG, WIRE_RTF, WIRE_TEXT,
 };
 
-/// Custom app message that wakes the pump to drain the [`Cmd`] channel.
+/// `WM_APP + 1` so a `PostMessage` poke does not collide with `WM_APP` itself.
 const WM_APP_CMD: u32 = WM_APP + 1;
-/// Upper bound the message-loop thread waits for the client's bytes during a `WM_RENDERFORMAT` paste.
-/// The pasting app is frozen until we answer, so this caps how long a paste can hang; on expiry the
-/// format is left unrendered (an empty paste) rather than blocking indefinitely.
+/// 10 s cap on a `WM_RENDERFORMAT` wait. The pasting app is frozen until we answer.
 const RENDER_TIMEOUT: Duration = Duration::from_secs(10);
-/// `OpenClipboard` fails while another process transiently holds the clipboard (clipboard managers do
-/// this constantly); retry briefly before giving up.
+/// Clipboard managers hold the clipboard briefly; 20 tries × 5 ms before giving up.
 const OPEN_RETRIES: u32 = 20;
 const OPEN_RETRY_DELAY: Duration = Duration::from_millis(5);
 
-/// `RegisterClassW` returns this when the (process-global) class already exists — expected on the 2nd+
-/// concurrent session, and not an error (we never unregister the class).
+/// `RegisterClassW` error 1410: class already exists. Expected on a 2nd session; we never unregister.
 const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
 
 type ClipTx = tokio::sync::mpsc::UnboundedSender<ClipEvent>;
 
-/// A command from the async coordinator into the message-loop thread. Delivered over a tokio channel
-/// and drained on `WM_APP_CMD`.
 enum Cmd {
-    /// Install the client's wire MIMEs as a delayed-render host selection (empty ⇒ clear).
+    /// Empty vec clears. Otherwise delayed-render the listed wire MIMEs.
     SetOffer(Vec<String>),
-    /// Drop the selection we own.
     Clear,
-    /// Read one wire format of the current host selection for a client fetch.
     Read {
         wire: String,
         resp: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
     },
-    /// Tear the window + thread down.
     Shutdown,
 }
 
-/// Message-loop-thread-owned state, reached from the `WndProc` via `GWLP_USERDATA`. Only the message
-/// thread ever dereferences it, so the `RefCell`s are sound (no cross-thread sharing); the fields the
-/// async handle also touches (`current_wire`) are behind their own `Arc<Mutex>`.
+/// Message-thread state at `GWLP_USERDATA`. `RefCell`s are this thread only; `current_wire` is the
+/// shared `Arc<Mutex>` the async handle also reads.
 struct WinClip {
-    /// Backend → coordinator events.
     clip_tx: ClipTx,
-    /// The current host selection's wire MIMEs, shared with the [`WindowsClipboard`] handle.
     current_wire: Arc<Mutex<Vec<String>>>,
-    /// Coordinator → backend commands, drained on `WM_APP_CMD`.
     cmd_rx: RefCell<tokio::sync::mpsc::UnboundedReceiver<Cmd>>,
-    /// Clipboard format ids we currently promise via delayed rendering (for `WM_RENDERFORMAT`).
     offered: RefCell<Vec<u32>>,
     fmt_html: u32,
     fmt_rtf: u32,
     fmt_png: u32,
-    /// Registered `"JFIF"` — the conventional raw-JPEG clipboard format (Office/browsers).
+    /// `"JFIF"` atom — the conventional raw-JPEG clipboard format.
     fmt_jfif: u32,
-    /// Registered `"GIF"` — raw GIF bytes (animation preserved by verbatim pass-through).
+    /// `"GIF"` atom — raw bytes so animation survives.
     fmt_gif: u32,
-    /// The wire MIMEs of the offer currently promised via delayed rendering — `WM_RENDERFORMAT`
-    /// for the synthesized `CF_DIB` picks the richest image kind among them to fetch + convert.
+    /// Delayed-render wires. Synthesized `CF_DIB` picks the richest image among them.
     offered_wires: RefCell<Vec<String>>,
-    /// Our own message window — used for the owner-check and clipboard opens.
     own_hwnd: HWND,
 }
 
 impl WinClip {
-    /// `WM_CLIPBOARDUPDATE`: a host app copied (or the clipboard was cleared). Suppress our own
-    /// delayed-render echoes via the owner-check, else announce the new wire MIMEs.
     fn on_clipboard_update(&self, hwnd: HWND) {
         // SAFETY: GetClipboardOwner has no preconditions and needs no open clipboard.
         let owner = unsafe { GetClipboardOwner() }.unwrap_or_default();
         if owner.0 == hwnd.0 {
-            // Our own offer's echo (we own the clipboard) — not a host copy.
             return;
         }
         let mimes = self.available_wire_mimes();
@@ -126,7 +95,6 @@ impl WinClip {
         let _ = self.clip_tx.send(ClipEvent::Selection { mimes });
     }
 
-    /// The wire MIMEs the current clipboard advertises, in a stable order.
     fn available_wire_mimes(&self) -> Vec<String> {
         // SAFETY: IsClipboardFormatAvailable has no preconditions and needs no open clipboard.
         let avail = |fmt: u32| unsafe { IsClipboardFormatAvailable(fmt) }.is_ok();
@@ -140,15 +108,12 @@ impl WinClip {
         if avail(self.fmt_rtf) {
             out.push(WIRE_RTF.to_string());
         }
-        // Most apps put only the bitmap family on the clipboard (CF_DIB, from which Windows
-        // synthesizes CF_BITMAP/CF_DIBV5); browsers add the registered "PNG". Either serves a
-        // client image fetch — `read` converts DIB -> PNG when "PNG" itself is absent.
+        // Most apps offer only CF_DIB (Windows synthesizes CF_BITMAP/CF_DIBV5). Advertise PNG
+        // either way; `read` converts DIB → PNG when the PNG atom is missing.
         if avail(self.fmt_png) || avail(CF_DIB.0 as u32) {
             out.push(WIRE_PNG.to_string());
         }
-        // Original lossy/animated formats offered VERBATIM beside the PNG floor — the client
-        // picks the richest kind it can place, so a copied JPEG never balloons into PNG and a
-        // GIF keeps its animation.
+        // JPEG/GIF stay beside PNG so a lossy copy is not inflated and a GIF keeps animation.
         if avail(self.fmt_jfif) {
             out.push(WIRE_JPEG.to_string());
         }
@@ -158,8 +123,7 @@ impl WinClip {
         out
     }
 
-    /// `WM_APP_CMD`: run every queued coordinator command on this thread. Drained into a `Vec` first so
-    /// the `cmd_rx` borrow is released before any command runs (defensive against re-entry).
+    /// Drain `cmd_rx` into a `Vec` first so the `RefCell` borrow is gone before any command runs.
     fn drain_commands(&self, hwnd: HWND) {
         let mut cmds = Vec::new();
         {
@@ -176,8 +140,7 @@ impl WinClip {
                     let _ = resp.send(self.read(&wire));
                 }
                 Cmd::Shutdown => {
-                    // Drop our offer first so no WM_RENDERALLFORMATS fires as the window dies (we do
-                    // NOT want the client's content to outlive the session on the host clipboard).
+                    // Clear first: otherwise WM_RENDERALLFORMATS leaves the client's bytes on the host.
                     self.clear(hwnd);
                     // SAFETY: our own live window; triggers WM_DESTROY → PostQuitMessage → pump exit.
                     unsafe {
@@ -189,7 +152,6 @@ impl WinClip {
         }
     }
 
-    /// Install the client's offer as a delayed-render host selection.
     fn apply_offer(&self, hwnd: HWND, wire: &[String]) {
         let fmts = self.formats_for_offer(wire);
         if fmts.is_empty() {
@@ -213,7 +175,7 @@ impl WinClip {
         *self.offered_wires.borrow_mut() = wire.to_vec();
     }
 
-    /// Drop the selection we own (empty the clipboard iff we're still its owner).
+    /// Empty the clipboard only if we still own it.
     fn clear(&self, hwnd: HWND) {
         let had = {
             let mut o = self.offered.borrow_mut();
@@ -227,7 +189,7 @@ impl WinClip {
         // SAFETY: GetClipboardOwner has no preconditions.
         let owner = unsafe { GetClipboardOwner() }.unwrap_or_default();
         if owner.0 != hwnd.0 {
-            return; // someone else took the clipboard already
+            return;
         }
         if open_clipboard_retry(hwnd).is_err() {
             return;
@@ -239,20 +201,18 @@ impl WinClip {
         }
     }
 
-    /// Read one wire format of the current host selection (a client fetch).
     fn read(&self, wire: &str) -> anyhow::Result<Vec<u8>> {
         let mut fmt = self
             .format_for_wire(wire)
             .context("unsupported wire MIME")?;
-        // Image fetch with no native "PNG" on the clipboard (most apps): read CF_DIB and convert.
+        // PNG fetch with no PNG atom: read CF_DIB and convert.
         let mut via_dib = false;
         // SAFETY: IsClipboardFormatAvailable has no preconditions and needs no open clipboard.
         if wire == WIRE_PNG && unsafe { IsClipboardFormatAvailable(fmt) }.is_err() {
             fmt = CF_DIB.0 as u32;
             via_dib = true;
         }
-        // If we own the clipboard, its content is our own delayed-render offer (the client's copy),
-        // not a host selection — declining avoids GetClipboardData re-entering our own WM_RENDERFORMAT.
+        // Own delayed-render offer: GetClipboardData would re-enter our WM_RENDERFORMAT.
         // SAFETY: GetClipboardOwner has no preconditions.
         if unsafe { GetClipboardOwner() }.unwrap_or_default().0 == self.own_hwnd.0 {
             anyhow::bail!("clipboard currently held by our own offer");
@@ -281,12 +241,9 @@ impl WinClip {
         Ok(convert_from_win(wire, &raw))
     }
 
-    /// `WM_RENDERFORMAT`: a host app is pasting a format we promised. Fetch the bytes from the client
-    /// (blocking this thread, bounded) and `SetClipboardData` them for the paster.
+    /// `WM_RENDERFORMAT`: block this thread (bounded) for client bytes, then `SetClipboardData`.
     fn on_render_format(&self, fmt: u32) {
-        // The synthesized CF_DIB promise has no wire kind of its own: fetch the richest image
-        // kind the client offered (PNG first — lossless with alpha — then JPEG, then GIF's first
-        // frame) and convert. Every other format maps 1:1.
+        // Synthesized CF_DIB has no wire kind: PNG (lossless+alpha), then JPEG, then GIF frame 1.
         let wire: &str = if fmt == CF_DIB.0 as u32 {
             let offered = self.offered_wires.borrow();
             match [WIRE_PNG, WIRE_JPEG, WIRE_GIF]
@@ -308,15 +265,14 @@ impl WinClip {
             responder: PasteResponder::Sync(tx),
         };
         if self.clip_tx.send(ev).is_err() {
-            return; // coordinator gone
+            return;
         }
         let bytes = match rx.recv_timeout(RENDER_TIMEOUT) {
             Ok(b) => b,
-            Err(_) => return, // timeout / dropped → leave the format unrendered (empty paste)
+            Err(_) => return, // unrendered = empty paste
         };
         let win_bytes = if fmt == CF_DIB.0 as u32 {
-            // The app asked for a bitmap: convert whatever image kind the client served. Bytes
-            // that don't decode leave the format unrendered (empty paste), like the timeout path.
+            // Convert the served image; a decode miss leaves the format unrendered (empty paste).
             match winfmt::image_to_dib(&bytes) {
                 Some(d) => d,
                 None => return,
@@ -337,7 +293,6 @@ impl WinClip {
         }
     }
 
-    /// The Win32 clipboard format id for a wire MIME (`None` = unsupported).
     fn format_for_wire(&self, wire: &str) -> Option<u32> {
         match wire {
             WIRE_TEXT => Some(CF_UNICODETEXT.0 as u32),
@@ -350,7 +305,6 @@ impl WinClip {
         }
     }
 
-    /// The wire MIME for a Win32 clipboard format id (`None` = one we don't offer).
     fn wire_for_format(&self, fmt: u32) -> Option<&'static str> {
         if fmt == CF_UNICODETEXT.0 as u32 {
             Some(WIRE_TEXT)
@@ -369,8 +323,7 @@ impl WinClip {
         }
     }
 
-    /// The clipboard format ids to promise for a client offer (dedup, 1:1 with the wire MIMEs — the OS
-    /// auto-synthesizes CF_TEXT/CF_OEMTEXT from CF_UNICODETEXT, so no manual text fan-out is needed).
+    /// Promise one id per wire MIME. OS synthesizes CF_TEXT/CF_OEMTEXT from CF_UNICODETEXT; do not fan out.
     fn formats_for_offer(&self, wire: &[String]) -> Vec<u32> {
         let mut out = Vec::new();
         for w in wire {
@@ -379,10 +332,8 @@ impl WinClip {
                     out.push(f);
                 }
             }
-            // Image offers also promise CF_DIB — most pasting apps (Paint, Office, chat clients)
-            // ask for the bitmap family, not the registered image formats; Windows synthesizes
-            // CF_BITMAP/CF_DIBV5 from the promised CF_DIB. `on_render_format` fetches the richest
-            // offered image kind and converts on demand.
+            // Most pasting apps ask for CF_DIB, not PNG/JFIF/GIF. Windows synthesizes
+            // CF_BITMAP/CF_DIBV5 from it; `on_render_format` converts the richest offered image.
             if matches!(w.as_str(), WIRE_PNG | WIRE_JPEG | WIRE_GIF)
                 && !out.contains(&(CF_DIB.0 as u32))
             {
@@ -393,19 +344,16 @@ impl WinClip {
     }
 }
 
-/// The active Windows clipboard backend handle held by [`super::HostClipboard`]. All Win32 work runs
-/// on the message-loop thread; this is just the async-side control surface.
+/// Async-side handle. All Win32 work runs on the message-loop thread.
 pub struct WindowsClipboard {
     cmd_tx: tokio::sync::mpsc::UnboundedSender<Cmd>,
-    /// The message window's `HWND` as an `isize` (so the handle stays `Send`/`Sync`); rebuilt for the
-    /// `PostMessage` wakeups, which are documented thread-safe.
+    /// `HWND` as `isize` so this handle stays `Send`/`Sync`. Rebuilt only for `PostMessage` wakeups.
     hwnd: isize,
     current_wire: Arc<Mutex<Vec<String>>>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WindowsClipboard {
-    /// Spin up the message-loop thread + hidden window and return once it has bound (or failed).
     pub async fn open() -> anyhow::Result<(
         WindowsClipboard,
         tokio::sync::mpsc::UnboundedReceiver<ClipEvent>,
@@ -414,8 +362,7 @@ impl WindowsClipboard {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
         let current_wire = Arc::new(Mutex::new(Vec::new()));
 
-        // Register the three custom formats up front — process-global and thread-agnostic, so this is
-        // fine off the message thread and lets bring-up fail cleanly if the atoms can't be created.
+        // Process-global atoms: fine off the message thread, and bring-up fails before the pump starts.
         let fmt_html = register_format(w!("HTML Format"))?;
         let fmt_rtf = register_format(w!("Rich Text Format"))?;
         let fmt_png = register_format(w!("PNG"))?;
@@ -451,24 +398,20 @@ impl WindowsClipboard {
         ))
     }
 
-    /// The current host selection's wire MIMEs (empty = nothing to offer).
     pub fn current_wire_mimes(&self) -> Vec<String> {
         self.current_wire.lock().unwrap().clone()
     }
 
-    /// Install a client's offered formats as the host selection (fire-and-forget onto the thread).
     pub fn set_offer(&self, wire_mimes: &[String]) {
         let _ = self.cmd_tx.send(Cmd::SetOffer(wire_mimes.to_vec()));
         self.wake();
     }
 
-    /// Drop the host selection we own (fire-and-forget onto the thread).
     pub fn clear_offer(&self) {
         let _ = self.cmd_tx.send(Cmd::Clear);
         self.wake();
     }
 
-    /// Read one wire format of the current host selection (a client's fetch).
     pub async fn read_current(&self, wire_mime: &str) -> anyhow::Result<Vec<u8>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
@@ -482,7 +425,6 @@ impl WindowsClipboard {
             .map_err(|_| anyhow::anyhow!("clipboard read dropped"))?
     }
 
-    /// Poke the message loop so it drains the command channel.
     fn wake(&self) {
         // SAFETY: PostMessageW is documented thread-safe; `hwnd` is our message window (or already
         // destroyed, in which case the post harmlessly fails and is ignored).
@@ -507,8 +449,7 @@ impl Drop for WindowsClipboard {
     }
 }
 
-/// RAII `CloseClipboard` guard — pairs with a successful `open_clipboard_retry`, closing on scope exit
-/// (including early `?`/`bail!` returns).
+/// Pairs with a successful `open_clipboard_retry`; `CloseClipboard` on every exit, including `?`.
 struct ClipboardGuard;
 
 impl Drop for ClipboardGuard {
@@ -520,7 +461,6 @@ impl Drop for ClipboardGuard {
     }
 }
 
-/// Register (or resolve the existing id of) a custom clipboard format.
 fn register_format(name: PCWSTR) -> anyhow::Result<u32> {
     // SAFETY: RegisterClipboardFormatW is thread-agnostic and process-global; `name` is a static
     // NUL-terminated wide literal.
@@ -531,8 +471,7 @@ fn register_format(name: PCWSTR) -> anyhow::Result<u32> {
     Ok(id)
 }
 
-/// Allocate a moveable HGLOBAL holding `bytes` (zero-init so an empty payload is still a valid, locked
-/// buffer). Ownership is transferred to the clipboard by a following `SetClipboardData`.
+/// Moveable HGLOBAL. Zero-init so a 0-byte payload still locks; ownership moves on `SetClipboardData`.
 fn alloc_hglobal(bytes: &[u8]) -> anyhow::Result<HGLOBAL> {
     // SAFETY: allocate at least one byte (GlobalLock of a 0-size block is unreliable), lock it, copy
     // the payload in, unlock. Alloc/lock/unlock are balanced; on lock failure we free before erroring.
@@ -550,7 +489,6 @@ fn alloc_hglobal(bytes: &[u8]) -> anyhow::Result<HGLOBAL> {
     }
 }
 
-/// `OpenClipboard(hwnd)` with a brief retry loop (another process often holds it transiently).
 fn open_clipboard_retry(hwnd: HWND) -> anyhow::Result<()> {
     for _ in 0..OPEN_RETRIES {
         // SAFETY: OpenClipboard with our window as owner; balanced by ClipboardGuard/CloseClipboard.
@@ -562,26 +500,23 @@ fn open_clipboard_retry(hwnd: HWND) -> anyhow::Result<()> {
     anyhow::bail!("OpenClipboard failed after retries")
 }
 
-/// Convert a Win32 clipboard payload to wire bytes.
 fn convert_from_win(wire: &str, raw: &[u8]) -> Vec<u8> {
     match wire {
         WIRE_TEXT => winfmt::text_from_utf16(raw),
         WIRE_HTML => winfmt::html_from_cf(raw),
         WIRE_RTF => winfmt::rtf_from_cf(raw),
-        _ => raw.to_vec(), // PNG + anything else: verbatim
+        _ => raw.to_vec(), // PNG and unknown: identity
     }
 }
 
-/// Convert wire bytes to a Win32 clipboard payload.
 fn convert_to_win(wire: &str, wire_bytes: &[u8]) -> Vec<u8> {
     match wire {
         WIRE_TEXT => winfmt::text_to_utf16(wire_bytes),
         WIRE_HTML => winfmt::html_to_cf(wire_bytes),
-        _ => wire_bytes.to_vec(), // RTF + PNG + anything else: verbatim
+        _ => wire_bytes.to_vec(), // RTF/PNG and unknown: identity
     }
 }
 
-/// Create the hidden message-only window (registering the class once, process-wide).
 fn create_window() -> anyhow::Result<HWND> {
     // SAFETY: standard window-class registration + message-only window creation; every argument is a
     // valid handle / static literal, and `wndproc` matches the WNDPROC ABI.
@@ -621,7 +556,6 @@ fn create_window() -> anyhow::Result<HWND> {
     }
 }
 
-/// The message-loop thread body: build the window, wire up state, then pump until `WM_QUIT`.
 #[allow(clippy::too_many_arguments)]
 fn pump_thread(
     clip_tx: ClipTx,
@@ -642,7 +576,7 @@ fn pump_thread(
         }
     };
 
-    // A clone that outlives the boxed state, so we can announce Closed after the pump ends.
+    // Outlives the boxed state so `Closed` can fire after the pump ends.
     let closed_tx = clip_tx.clone();
 
     let state = Box::new(WinClip {
@@ -665,8 +599,7 @@ fn pump_thread(
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
     }
 
-    // Snapshot whatever is already on the host clipboard, so the first client `enable` announces it
-    // (AddClipboardFormatListener only delivers *subsequent* changes).
+    // Listener delivers only *subsequent* changes; seed `current_wire` from what is already there.
     {
         // SAFETY: `ptr` is the live state we just stored; only this thread dereferences it.
         let st = unsafe { &*ptr };
@@ -698,7 +631,6 @@ fn pump_thread(
         }
     }
 
-    // Pump exited (window destroyed): reclaim the leaked state box. No WndProc runs after this point.
     // SAFETY: `ptr` came from Box::into_raw above, is dereferenced only on this thread, and the
     // message loop has ended so no further access occurs.
     unsafe {
@@ -707,8 +639,7 @@ fn pump_thread(
     let _ = closed_tx.send(ClipEvent::Closed);
 }
 
-/// The window procedure. Reaches per-window state through `GWLP_USERDATA`; runs only on the message
-/// thread. Registered as the class `WNDPROC` (a safe fn coerces to the `unsafe extern "system"` ABI).
+/// Class `WNDPROC`. State at `GWLP_USERDATA`; this thread only. A safe fn coerces to the system ABI.
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // SAFETY: GWLP_USERDATA holds the `*const WinClip` stored right after window creation (0/null for
     // the WM_(NC)CREATE messages that fire before that — handled by the null check below).
@@ -741,7 +672,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             LRESULT(0)
         }
-        // SAFETY: default handling for every other message.
+        // SAFETY: arguments are the ones Windows delivered for this window.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }

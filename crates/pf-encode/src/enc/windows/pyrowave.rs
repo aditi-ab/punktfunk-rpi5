@@ -1,35 +1,23 @@
-//! PyroWave host encoder (Windows) — **separate-plane zero-copy D3D11→Vulkan** via pyrowave's own
-//! compat device (design/pyrowave-windows-host-zerocopy.md). The opt-in wired-LAN intra-only wavelet
-//! codec, the Windows twin of `enc/linux/pyrowave.rs`.
+//! Windows PyroWave host encoder: separate-plane zero-copy D3D11→Vulkan through
+//! pyrowave's own compat device (`design/pyrowave-windows-host-zerocopy.md`).
+//! Intra-only wavelet; Windows twin of `enc/linux/pyrowave.rs`.
 //!
-//! Shape (deliberately minimal — no `ash`, no hand-rolled external-memory import): pyrowave owns its
-//! OWN Vulkan device, selected by the render GPU's vendor/device-id
-//! (`pyrowave_create_device_by_compat`). The capturer's CSC produces TWO SEPARATE D3D11 plane
-//! textures — a full-res `R8` **Y** + a half-res `R8G8` **CbCr** (BT.709 limited, matching the Linux
-//! `rgb2yuv.comp` layout the wavelet clients decode) — each shared to that device as an NT handle
-//! (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT`) via `pyrowave_image_create`. Separate
-//! single/two-component textures import reliably on NVIDIA at any size, unlike a single planar NV12
-//! texture (the vendored interop test: "only very specific resource sizes"). A shared
-//! D3D11/D3D12 fence — signalled by the capturer *after* the convert — is imported as a Vulkan
-//! timeline semaphore (`pyrowave_sync_object_create`) so the wavelet read is ordered after the
-//! D3D11 convert. `pyrowave_encoder_encode_gpu_synchronous` performs the acquire (waiting the fence
-//! value), the encode, and the release in ONE pyrowave-owned submission, referencing the external
-//! image with `VK_QUEUE_FAMILY_EXTERNAL`. The dangerous cross-API import (incl. the NVIDIA
-//! video-layout workaround) stays entirely inside validated pyrowave/Granite. Every AU is a
-//! keyframe; the AU/wire-chunk framing is the shared [`crate::pyrowave_wire`] helper (byte-identical
-//! to Linux).
+//! Pyrowave owns the Vulkan device, selected by the render GPU's vendor/device-id
+//! (`pyrowave_create_device_by_compat`). Capture CSC writes two shareable D3D11
+//! planes — full-res R8 Y + half-res R8G8 CbCr, BT.709 limited — imported as NT
+//! handles. Separate single/two-component textures import at any size; a planar
+//! NV12 does not. A shared D3D11 fence imported as a Vulkan timeline orders the
+//! wavelet read after convert. `encode_gpu_synchronous` acquire/encode/release
+//! in one pyrowave submission (`VK_QUEUE_FAMILY_EXTERNAL`). Every AU is a
+//! keyframe; framing is [`crate::pyrowave_wire`].
 //!
-//! The capture side (a BGRA→YUV CSC into two shareable plane textures + a shared fence, gated on the
-//! pyrowave session flag) lives in `pf-capture` (`windows/idd_push.rs`); the CbCr plane + fence ride
-//! the frame on [`pf_frame::dxgi::D3d11Frame::pyro`], the Y plane on `D3d11Frame::texture`.
-// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
-// Cargo.toml). This body is `pyrowave-sys` C-API plus D3D11/Vulkan interop calls almost line for
-// line; narrowing it would add one `unsafe {}` plus one SAFETY comment per call that could only
-// restate the signature. Clearing this file means DELETING the markers that carry no caller
-// contract, not wrapping the calls — until then the lint is off HERE and enforced everywhere else.
+//! Capture: `pf-capture` `windows/idd_push.rs`. Y on `D3d11Frame::texture`,
+//! CbCr + fence on `D3d11Frame::pyro`.
+// `unsafe_op_in_unsafe_fn` off: this file is pyrowave-sys + D3D11/Vulkan interop.
+// Clearing it means deleting markers with no caller contract, not wrapping each call.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-// Every `unsafe` block in this module carries a `// SAFETY:` proof (the crate root enforces it).
+// Every `unsafe` block in this module carries a `// SAFETY:` proof (crate root enforces it).
 
 use crate::pyrowave_wire;
 use crate::{EncodedFrame, Encoder, EncoderCaps};
@@ -43,26 +31,22 @@ use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Graphics::Dxgi::IDXGIResource1;
 use windows::Win32::System::Threading::GetCurrentProcess;
 
-/// Headroom over the per-frame rate budget for the packetized bitstream (block headers + meta).
+/// Headroom over the per-frame rate budget for block headers + meta.
 const BS_SLACK: usize = 256 * 1024;
-/// Bound the per-texture image-import cache. The IDD out-ring is a small fixed set (OUT_RING=3);
-/// this only ever grows past it if the capturer recreates its out-ring within one encoder's life
-/// (a desktop-switch device recreate), in which case the stale imports are evicted + destroyed.
+/// Import-cache cap. IDD out-ring is OUT_RING=3; growth past that is a mid-life
+/// ring recreate, after which stale imports must be evicted.
 const IMPORT_CACHE_CAP: usize = 8;
 
-/// Plane-import cache key: the texture's COM address plus the extent it was imported at.
+/// Texture COM address plus the extent it was imported at (COM pointers recycle).
 type PlaneKey = (isize, u32, u32);
 
-// --- Vulkan enum values not surfaced by pyrowave-sys' bindgen (only enums *reachable* from the
-// pyrowave C API are generated; these plain #define / flags-typedef values are stable spec
-// constants). bindgen renders every reachable Vulkan enum as a `u32` type alias, so these u32
-// literals assign straight into the generated struct fields. ---
-// The usage the validated interop helper (`create_pyrowave_image_from_d3d11`) requests.
+// Vulkan #define / flags not emitted by pyrowave-sys bindgen (only C-API-reachable
+// enums are). bindgen aliases those as `u32`, so these spec literals assign as-is.
 const VK_IMAGE_USAGE_TRANSFER_SRC_BIT: u32 = 0x0000_0001;
 const VK_IMAGE_USAGE_TRANSFER_DST_BIT: u32 = 0x0000_0002;
 const VK_IMAGE_USAGE_SAMPLED_BIT: u32 = 0x0000_0004;
-/// `VK_QUEUE_FAMILY_EXTERNAL` (`~0u32 - 1`): the image is owned by an external (D3D11) queue family;
-/// pyrowave's acquire/release transitions ownership in/out across the interop boundary.
+/// `VK_QUEUE_FAMILY_EXTERNAL` (`~0u32 - 1`): D3D11 owns the image; pyrowave
+/// acquire/release transitions across the interop boundary.
 const VK_QUEUE_FAMILY_EXTERNAL: u32 = 0xFFFF_FFFE;
 
 fn pw_check(r: pw::pyrowave_result, what: &str) -> Result<()> {
@@ -77,25 +61,16 @@ fn budget_for(bitrate_bps: u64, fps: u32) -> usize {
     ((bitrate_bps / (8 * fps.max(1) as u64)) as usize).max(64 * 1024)
 }
 
-// GPU scheduling priority is deliberately NOT set here. `pf-frame`'s
-// `dxgi::elevate_process_gpu_priority` owns that policy process-wide (the
-// `PUNKTFUNK_GPU_PRIORITY_CLASS` knob, default `realtime`) and runs once from `make_device`,
-// which the Windows capture path always calls before any PyroWave texture exists — a second
-// owner here would race it, as this module's removed HIGH raise once did.
+// Do not raise GPU scheduling here. `pf-frame`'s `dxgi::elevate_process_gpu_priority`
+// owns that process-wide (`PUNKTFUNK_GPU_PRIORITY_CLASS`); a second owner races it.
 
 pub struct PyroWaveEncoder {
-    // pyrowave owns the whole Vulkan device (create_device_by_compat) — no ash on this side.
     pw_dev: pw::pyrowave_device,
     pw_enc: pw::pyrowave_encoder,
-    // The imported shared fence (a Vulkan timeline semaphore aliasing the capturer's D3D11 fence).
-    // Null until the capturer delivers the fence handle on the first frame (or after a rebuild).
+    // Vulkan timeline alias of the capturer's D3D11 fence; null until first-frame import.
     sync: pw::pyrowave_sync_object,
-    // Imported plane textures, cached by the out-ring texture's raw pointer (stable per ring slot):
-    // the full-res R8 Y plane and the half-res R8G8 CbCr plane, imported SEPARATELY (a single planar
-    // NV12 import is unreliable on NVIDIA at arbitrary sizes).
-    /// The capturer ring generation the cached plane imports below belong to. A recreate bumps it,
-    /// and every cached import is destroyed — the COM addresses they are keyed on can be recycled
-    /// by the allocator after a recreate, so identity cannot rest on the pointer alone.
+    /// Capturer ring generation the cached plane imports belong to. A recreate
+    /// bumps it; COM addresses recycle, so identity cannot rest on the pointer.
     ring_gen: Option<u32>,
     y_images: Vec<(PlaneKey, pw::pyrowave_image)>,
     cbcr_images: Vec<(PlaneKey, pw::pyrowave_image)>,
@@ -103,32 +78,27 @@ pub struct PyroWaveEncoder {
     width: u32,
     height: u32,
     fps: u32,
-    /// Session-fixed negotiated chroma: 4:4:4 = full-res CbCr plane + `Chroma444` pyrowave objects.
+    /// 4:4:4 = full-res CbCr plane + `Chroma444` pyrowave objects.
     chroma444: bool,
-    /// Session-fixed negotiated depth ≥10: the capturer's HDR CSC writes P010-style studio codes
-    /// into 16-bit UNORM planes (`R16_UNORM` Y + `R16G16_UNORM` CbCr) and the sequence header is
-    /// stamped BT.2020/PQ.
+    /// Depth ≥10: capturer HDR CSC writes P010-style studio codes into 16-bit
+    /// UNORM planes; sequence header is BT.2020/PQ.
     hdr16: bool,
     /// Per-frame bitstream budget (hard CBR): `bitrate / (8 * fps)`.
     frame_budget: usize,
-    /// Datagram-aligned mode (plan §4.4): packetize at this boundary. `None` = one dense packet/AU.
+    /// Datagram-aligned packetize boundary. `None` = one dense packet/AU.
     wire_chunk: Option<usize>,
-    /// Measured windowing inflation → rate-budget deflation, so the bitrate pin holds on the
-    /// WIRE, not just the raw bitstream (see [`pyrowave_wire::WireBudget`]).
+    /// Windowing inflation → rate-budget deflation so the pin holds on the wire.
     wire_budget: pyrowave_wire::WireBudget,
     bitstream: Vec<u8>,
     pending: VecDeque<EncodedFrame>,
-    /// The AU currently being handed out in streamed chunks (PW6 — `Some` strictly between a
-    /// `first` chunk and its `last`). See [`pyrowave_wire::AuChunker`]: this backend's encode is
-    /// synchronous, so the AU is COMPLETE before the first chunk leaves — the split is for the
-    /// send side, never an encode/send overlap.
+    /// AU being handed out in streamed chunks (`Some` between `first` and `last`).
+    /// Encode is synchronous, so the AU is complete before the first chunk leaves.
     chunker: Option<pyrowave_wire::AuChunker>,
 }
 
-// SAFETY: used only from the single encode thread; the pyrowave handles are owned and only touched
-// from that thread, and pyrowave only submits GPU work inside the API calls we make (mirrors the
-// Linux `PyroWaveEncoder`'s `unsafe impl Send`). The D3D11 texture pointers travel as plain `isize`
-// cache keys, never dereferenced here.
+// SAFETY: encode thread only; pyrowave handles are owned and only touched from
+// that thread. Pyrowave submits GPU work only inside the API calls we make.
+// D3D11 texture pointers travel as `isize` cache keys, never dereferenced here.
 unsafe impl Send for PyroWaveEncoder {}
 
 impl PyroWaveEncoder {
@@ -141,17 +111,12 @@ impl PyroWaveEncoder {
         bit_depth: u8,
     ) -> Result<Self> {
         let chroma444 = chroma.is_444();
-        // A negotiated 10-bit session rides 16-bit UNORM planes carrying the P010-style
-        // studio codes the capturer's HDR CSC writes (design/pyrowave-444-hdr.md §2.2) —
-        // the wire is depth-agnostic, only the plane formats and the CSC change.
         let hdr16 = bit_depth >= 10;
         if !chroma444 && (width % 2 != 0 || height % 2 != 0) {
             bail!("pyrowave 4:2:0 needs even dimensions (got {width}x{height})");
         }
-        // Checked against the chroma actually being opened, NOT hardcoded 4:4:4 — see the Linux
-        // twin (`enc/linux/pyrowave.rs`) for the full rationale: the negotiator's 4:4:4 → 4:2:0
-        // downgrade hands oversized modes to this open AS 4:2:0, so the old `chroma444`-gated
-        // check was skipped exactly when it was needed.
+        // Against the chroma actually being opened, not hardcoded 4:4:4. A 4:4:4 →
+        // 4:2:0 downgrade hands oversized modes here as 4:2:0.
         if !crate::pyrowave_mode_fits_rdo(width, height, chroma444) {
             bail!(
                 "pyrowave {} at {width}x{height} exceeds the rate controller's 16-bit block \
@@ -160,18 +125,15 @@ impl PyroWaveEncoder {
             );
         }
         let fps = fps.max(1);
-        // Select pyrowave's device by the SELECTED render adapter's vendor/device-id — NOT by LUID:
-        // in Session 0 (the host service context) the Vulkan ICD reports `deviceLUIDValid = false`,
-        // so a by-LUID match would find nothing, while the vendor/device-id match + the external
-        // import both work (design doc Stage 0; `pyrowave_c.cpp` guards LUID use behind validity).
+        // Vendor/device-id of the selected render adapter, not LUID: Session 0
+        // Vulkan ICDs report `deviceLUIDValid = false`, so a LUID match finds nothing.
         let (vid, pid) = pf_gpu::selected_gpu()
             .map(|s| (s.info.vendor_id, s.info.device_id))
             .unwrap_or((0, 0));
-        // SAFETY: `create_device_by_compat` builds pyrowave's own instance/device from the
-        // vendor/device-id (null uuids/luid = "don't constrain by those"); the out-param is a live
-        // local. `confirm_interop_support` / `encoder_create` take that just-created non-null
-        // device; on any failure we destroy what we created before returning. All pointers are
-        // freshly created and owned by the returned struct (or freed on the error path).
+        // SAFETY: `create_device_by_compat` builds pyrowave's instance/device from
+        // vendor/device-id (null uuids/luid = unconstrained); out-param is a live
+        // local. Later calls take that non-null device; failure destroys it first.
+        // Pointers are owned by the returned struct or freed on the error path.
         unsafe {
             let mut pw_dev: pw::pyrowave_device = std::ptr::null_mut();
             pw_check(
@@ -191,10 +153,8 @@ impl PyroWaveEncoder {
                 )
             })?;
 
-            // The make-or-break gate (design doc Risk 1): confirm this device can do the
-            // external-memory interop the zero-copy import needs. In a service context where the
-            // import is unavailable this fails HERE (clean HEVC renegotiation) instead of at the
-            // first frame's import.
+            // Fail here (HEVC renegotiation) if this device cannot import external
+            // memory, not at the first frame's import.
             if !pw::pyrowave_device_confirm_interop_support(pw_dev) {
                 pw::pyrowave_device_destroy(pw_dev);
                 bail!(
@@ -255,19 +215,15 @@ impl PyroWaveEncoder {
         }
     }
 
-    /// Import one capturer plane D3D11 texture (`R8_UNORM` Y or `R8G8_UNORM` CbCr) into pyrowave's
-    /// Vulkan device. Creates a fresh shared NT handle from the texture (the capturer marked the ring
-    /// `SHARED | SHARED_NTHANDLE`); `pyrowave_image_create` takes ownership of the handle and closes
-    /// it on SUCCESSFUL import only (pyrowave-sys patch 0006 — same contract as the fence import in
-    /// [`Self::import_fence`]), so this fn closes it on every failure return. Single/two-component
-    /// textures import reliably on NVIDIA at any size — unlike a planar NV12 — so no
-    /// MUTABLE_FORMAT / planar-layout workaround is involved.
+    /// Import one capturer plane (`R8`/`R16` Y or `R8G8`/`R16G16` CbCr) into
+    /// pyrowave's Vulkan device. Creates a fresh shared NT handle (`SHARED |
+    /// SHARED_NTHANDLE`); `pyrowave_image_create` takes ownership and closes it
+    /// only on success, so this fn closes on every failure return.
     ///
     /// # Safety
-    /// `texture` must be a live `ID3D11Texture2D` of format `vk_format`, sized `w`×`h`, created
-    /// shareable, on the same physical GPU as `pw_dev`. The returned `pyrowave_image` is owned by the
-    /// caller (destroyed in `Drop`/eviction). Takes `pw_dev` by value (not `&self`) so the cache
-    /// closures don't double-borrow the encoder.
+    /// `texture` is a live shareable `ID3D11Texture2D` of `vk_format`, size `w`×`h`,
+    /// on `pw_dev`'s GPU. The returned image is owned by the caller. `pw_dev` is
+    /// by value so cache closures do not double-borrow the encoder.
     unsafe fn import_plane(
         pw_dev: pw::pyrowave_device,
         texture: &ID3D11Texture2D,
@@ -275,17 +231,16 @@ impl PyroWaveEncoder {
         w: u32,
         h: u32,
     ) -> Result<pw::pyrowave_image> {
-        // The shared NT handle (mirrors the interop test's `create_pyrowave_image_from_d3d11`).
         let res: IDXGIResource1 = texture
             .cast()
             .context("ID3D11Texture2D -> IDXGIResource1 (plane not created shareable?)")?;
-        // GENERIC_ALL (0x1000_0000) — the access the interop test hands the shared handle.
+        // GENERIC_ALL (0x1000_0000): access the interop helper hands the shared handle.
         let handle: HANDLE = res
             .CreateSharedHandle(None, 0x1000_0000, PCWSTR::null())
             .context("IDXGIResource1::CreateSharedHandle(plane texture)")?;
 
-        // Zero-init then set the fields we need (pNext/queue-family/initialLayout stay 0 = null /
-        // UNDEFINED) — robust against however bindgen renders `Default` for the raw-pointer fields.
+        // Zeroed so pNext/queue-family/initialLayout stay 0 (null / UNDEFINED);
+        // bindgen `Default` for the raw-pointer fields is not reliable.
         let mut ici: pw::VkImageCreateInfo = std::mem::zeroed();
         ici.sType = pw::VkStructureType_VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         ici.imageType = pw::VkImageType_VK_IMAGE_TYPE_2D;
@@ -312,29 +267,21 @@ impl PyroWaveEncoder {
         };
         let mut image: pw::pyrowave_image = std::ptr::null_mut();
         if let Err(e) = pw_check(pw::pyrowave_image_create(&info, &mut image), "image_create") {
-            // pyrowave consumes the handle ONLY on a successful import (pyrowave-sys patch 0006
-            // pinned this at the API's success boundary) — so on EVERY failure return the handle
-            // is still ours and this close is the single one. Before the patch, an
-            // allocate-stage failure inside Granite had already closed it and this was a double
-            // close of a possibly-recycled handle value.
+            // pyrowave consumes the handle only on success; on failure it is still
+            // ours and this is the single close.
             let _ = CloseHandle(handle);
             return Err(e);
         }
         Ok(image)
     }
 
-    /// Import (cache) a plane texture by its stable per-slot pointer, evicting the oldest when the
-    /// cache is over cap (the out-ring is small + fixed; growth only happens on a mid-life ring
-    /// recreate). Returns the cached-or-fresh `pyrowave_image`.
+    /// Cache a plane import by `(texture address, width, height)`. Evict oldest
+    /// past [`IMPORT_CACHE_CAP`]. A COM pointer here carries no reference, so a
+    /// recycled address at a different size must not alias; same-size recycle is
+    /// the ring-generation flush in `encode_frame`.
     ///
     /// # Safety
     /// Same contract as [`import_plane`].
-    /// Keyed on `(texture address, width, height)` rather than the bare address: the COM pointer
-    /// carries no reference here, so a released texture's address can be recycled by a later
-    /// allocation and return an import describing the WRONG surface. Folding the extent in means a
-    /// recycled address at a different size can never alias. (A recycle at the SAME size is still
-    /// possible in principle — the complete fix is to key on the capturer's ring generation, which
-    /// needs that generation plumbed onto `PyroFrameShare`.)
     unsafe fn cached_plane(
         cache: &mut Vec<(PlaneKey, pw::pyrowave_image)>,
         make: impl FnOnce() -> Result<pw::pyrowave_image>,
@@ -352,14 +299,13 @@ impl PyroWaveEncoder {
         Ok(img)
     }
 
-    /// Import the capturer's shared fence as a Vulkan timeline semaphore. Called only when this
-    /// encoder has no timeline yet (the first frame, or a fresh encoder after a mode-switch rebuild).
-    /// pyrowave takes ownership of the handle and CLOSES it on import, so we hand it a private
-    /// **duplicate** of the capturer's persistent handle — leaving the original valid for the next
-    /// rebuild's re-import (the capturer passes the same handle on every frame).
+    /// Import the capturer's shared fence as a Vulkan timeline. Pyrowave takes
+    /// ownership and closes the handle, so this duplicates the capturer's
+    /// persistent handle (needed for a later rebuild's re-import).
     ///
     /// # Safety
-    /// `handle` must be the capturer's live shared D3D11/D3D12 fence NT handle on `self.pw_dev`'s GPU.
+    /// `handle` is the capturer's live shared D3D11/D3D12 fence NT handle on
+    /// `self.pw_dev`'s GPU.
     unsafe fn import_fence(&mut self, handle: isize) -> Result<()> {
         let mut dup = HANDLE::default();
         DuplicateHandle(
@@ -375,7 +321,7 @@ impl PyroWaveEncoder {
         let info = pw::pyrowave_sync_object_create_info {
             device: self.pw_dev,
             external_handle: dup.0 as usize as pw::pyrowave_os_handle,
-            // D3D11 fence == D3D12 fence on Windows 10+; must be imported as TIMELINE.
+            // D3D11 fence == D3D12 fence on Windows 10+; import as TIMELINE.
             handle_type:
                 pw::VkExternalSemaphoreHandleTypeFlagBits_VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT,
             semaphore_type: pw::VkSemaphoreType_VK_SEMAPHORE_TYPE_TIMELINE,
@@ -386,9 +332,7 @@ impl PyroWaveEncoder {
             pw::pyrowave_sync_object_create(&info, &mut sync),
             "sync_object_create",
         ) {
-            // pyrowave only closes the handle on a SUCCESSFUL import (Granite's semaphore import
-            // has always had these semantics; patch 0006 made the image import match) — close
-            // the dup on failure.
+            // pyrowave closes the handle only on success; close the dup on failure.
             let _ = CloseHandle(dup);
             return Err(e);
         }
@@ -396,15 +340,9 @@ impl PyroWaveEncoder {
         Ok(())
     }
 
-    /// One frame, synchronously: import (cache) the two plane textures + fence → encode (pyrowave
-    /// owns the submission: acquire waits the capturer's fence value, references both images as
-    /// `QUEUE_FAMILY_EXTERNAL`, release hands them back) → packetize into an `EncodedFrame`.
-    ///
-    /// # Safety
-    /// Runs on the single encode thread; all pyrowave calls take handles this struct owns.
-    /// The per-frame budget handed to pyrowave rate control: `frame_budget`, deflated by the
-    /// measured windowing inflation when the datagram-aligned wire is on — the bitrate pin is
-    /// a promise about the wire, not the raw bitstream (see [`pyrowave_wire::WireBudget`]).
+    /// Per-frame budget for pyrowave rate control. With datagram-aligned wire,
+    /// `frame_budget` is deflated by measured windowing inflation so the pin is
+    /// on the wire, not the raw bitstream ([`pyrowave_wire::WireBudget`]).
     fn rate_budget(&self) -> usize {
         match self.wire_chunk {
             Some(_) => self.wire_budget.deflate(self.frame_budget).max(64 * 1024),
@@ -412,19 +350,18 @@ impl PyroWaveEncoder {
         }
     }
 
+    /// One synchronous frame: cache-import planes + fence, encode, packetize.
+    ///
+    /// # Safety
+    /// Encode thread only; every pyrowave call takes handles this struct owns.
     unsafe fn encode_frame(&mut self, frame: &CapturedFrame) -> Result<()> {
-        // A failed `reset()` leaves the encoder destroyed and null — fail cleanly rather than
-        // handing null to pyrowave (see the Linux twin).
         anyhow::ensure!(
             !self.pw_enc.is_null(),
             "pyrowave: encode after a failed reset (encoder was destroyed and not rebuilt)"
         );
-        // The plane textures are imported at the encoder's CONFIGURED extent, not the frame's, so a
-        // capture that changed size would be read under a stale `VkImageCreateInfo`. This is
-        // reachable without any client Reconfigure: the IDD capturer autonomously recreates its ring
-        // on a confirmed display-descriptor change (e.g. a fullscreen game mode-setting the virtual
-        // display). Refuse instead — the session must reopen the encoder at the new mode. Mirrors
-        // the guard the QSV and AMF backends already carry.
+        // Planes are imported at the encoder's configured extent. A capturer ring
+        // recreate at a new mode would be read under a stale `VkImageCreateInfo`;
+        // refuse — the session must reopen the encoder.
         anyhow::ensure!(
             frame.width == self.width && frame.height == self.height,
             "pyrowave: captured frame {}x{} != encoder {}x{} (the capturer recreated its ring at a \
@@ -442,10 +379,8 @@ impl PyroWaveEncoder {
              in pyrowave mode (session_plan::output_format must set OutputFormat::pyrowave)",
         )?;
 
-        // Ring recreate ⇒ every cached plane import belongs to textures that no longer exist. Their
-        // COM addresses can be handed back out by the allocator, so a pointer-keyed hit could return
-        // an image bound to freed memory. Flush on the generation change rather than relying on the
-        // address (or the FIFO cap) to notice.
+        // Ring recreate: cached imports belong to freed textures whose COM
+        // addresses can be reused. Flush on generation, not pointer identity.
         if self.ring_gen != Some(share.ring_gen) {
             if self.ring_gen.is_some() {
                 tracing::info!(
@@ -461,9 +396,8 @@ impl PyroWaveEncoder {
             self.ring_gen = Some(share.ring_gen);
         }
 
-        // Import the fence whenever this encoder has no timeline yet — the first frame, OR a fresh
-        // encoder after a client mode-switch rebuild (the capturer passes the persistent handle on
-        // every frame precisely so a rebuilt encoder can re-import it).
+        // First frame, or a rebuilt encoder: the capturer repeats the persistent
+        // handle every frame so a fresh encoder can re-import it.
         if self.sync.is_null() {
             let h = share
                 .fence_handle
@@ -471,12 +405,9 @@ impl PyroWaveEncoder {
             self.import_fence(h)?;
         }
 
-        // Import (cache) the two SEPARATE plane textures by their stable per-slot pointers: the
-        // full-res R8 Y on `d3d.texture`, the half-res R8G8 CbCr on `share.cbcr`. `pw_dev` is a Copy
-        // handle so the cache closures don't borrow `self` alongside `&mut self.*_images`.
+        // `pw_dev` is Copy so the cache closures do not borrow `self` alongside
+        // `&mut self.*_images`.
         let (w, h) = (self.width, self.height);
-        // Plane geometry/formats follow the negotiated session: chroma half- or full-res,
-        // 8-bit (SDR BT.709) or 16-bit UNORM (HDR: P010-style studio codes from the CSC).
         let (cw, ch) = if self.chroma444 {
             (w, h)
         } else {
@@ -513,10 +444,8 @@ impl PyroWaveEncoder {
             )?
         };
 
-        // Plane views built BY HAND exactly like the Linux encoder (`enc/linux/pyrowave.rs`): Y from
-        // the R8 image (full-res, IDENTITY), Cb/Cr from the R8G8 image (half-res) with R/G swizzle to
-        // synthesize the two chroma planes from the interleaved CbCr — the documented NV12-style
-        // hand-off. All GENERAL layout (pyrowave's GPU-buffer contract accepts it without transitions).
+        // Y IDENTITY; Cb/Cr from the interleaved CbCr image via R/G swizzle
+        // (same hand-off as Linux). GENERAL layout: pyrowave accepts it as-is.
         let y_vk = pw::pyrowave_image_get_handle(y_img);
         let cbcr_vk = pw::pyrowave_image_get_handle(cbcr_img);
         let plane = |image, pw_w, pw_h, fmt, swizzle| pw::pyrowave_image_view {
@@ -557,9 +486,8 @@ impl PyroWaveEncoder {
             ],
         };
 
-        // Acquire the two external images (owned by the D3D11 queue family), waiting the capturer's
-        // fence value so the wavelet read is ordered after the D3D11 CSC; release hands them back.
-        // pyrowave owns the submission (no explicit command buffer).
+        // Acquire waits the capturer fence so the wavelet read is after CSC;
+        // release returns the images to D3D11. Pyrowave owns the submission.
         let refs = [
             pw::pyrowave_gpu_external_reference {
                 image: y_img,
@@ -581,9 +509,8 @@ impl PyroWaveEncoder {
         let release = pw::pyrowave_gpu_sync_operation {
             images: refs.as_ptr(),
             num_images: refs.len(),
-            // No release signal needed (null semaphore): encode is synchronous and the out-ring depth
-            // guarantees the slot is not reused before the next synchronous encode completes (the same
-            // contract the NVENC path relies on).
+            // Null semaphore: encode is synchronous and out-ring depth keeps the
+            // slot unused until the next encode completes (same as NVENC).
             sync: std::mem::zeroed(),
         };
         let rc = pw::pyrowave_rate_control {
@@ -600,7 +527,6 @@ impl PyroWaveEncoder {
             "encode_gpu_synchronous",
         )?;
 
-        // ---- packetize (shared framing helper — byte-identical to the Linux encoder) ----
         let cap = self.frame_budget + BS_SLACK;
         self.bitstream.resize(cap, 0);
         let boundary = pyrowave_wire::packet_boundary(self.wire_chunk, cap);
@@ -626,10 +552,8 @@ impl PyroWaveEncoder {
             "packetize",
         )?;
         packets.truncate(out_n.max(1));
-        // Correct pyrowave's zeroed sequence-header VUI: it signals ycbcr_range=FULL, but our CSC
-        // emits studio range — patch the bits HONEST so VUI-honoring clients don't wash out
-        // blacks; an HDR session additionally stamps BT.2020 primaries + PQ + BT.2020 matrix
-        // (matching the negotiated ColorInfo).
+        // Pyrowave zero-fills VUI as FULL; our CSC is studio range. Stamp LIMITED
+        // (and BT.2020/PQ on HDR) so VUI-honoring clients do not wash out blacks.
         if let Some(p) = packets.first() {
             pyrowave_wire::stamp_color_bits(&mut self.bitstream, p.offset, self.hdr16);
         }
@@ -642,7 +566,6 @@ impl PyroWaveEncoder {
         self.pending.push_back(EncodedFrame {
             data: au,
             pts_ns: frame.pts_ns,
-            // Every frame is independently decodable — the codec's whole recovery story.
             keyframe: true,
             recovery_anchor: false,
             chunk_aligned: self.wire_chunk.is_some(),
@@ -653,18 +576,16 @@ impl PyroWaveEncoder {
 
 impl Encoder for PyroWaveEncoder {
     fn submit(&mut self, frame: &CapturedFrame) -> Result<()> {
-        // SAFETY: single-threaded encoder; `encode_frame` records/submits on handles this struct
-        // owns and pyrowave waits its own fence before packetize returns.
+        // SAFETY: encode thread only; `encode_frame` uses handles this struct owns
+        // and pyrowave waits its own fence before packetize returns.
         unsafe { self.encode_frame(frame) }
     }
 
     fn caps(&self) -> EncoderCaps {
-        // No RFI (every frame is intra). Report the real opened chroma so the session glue's
-        // post-open cross-check stays quiet on a genuine 4:4:4 session (this codec gained 4:4:4
-        // after the caps() default was written — a hardcoded `default()` here mis-reports a 4:4:4
-        // open as 4:2:0 and fires a spurious "chroma disagrees with the negotiated Welcome" warn).
+        // No RFI (every frame is intra). Report the opened chroma: a hardcoded
+        // `default()` would report a 4:4:4 session as 4:2:0.
         EncoderCaps {
-            // The Windows capturer composites the pointer itself; this backend never reads it.
+            // The Windows capturer composites the pointer; this backend never reads it.
             blends_cursor: false,
             chroma_444: self.chroma444,
             ..EncoderCaps::default()
@@ -672,26 +593,23 @@ impl Encoder for PyroWaveEncoder {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
-        // Trait contract: each AU is drained through ONE method. Erroring beats double-emitting
-        // the bytes the chunk cursor already handed out (which would reach the wire twice, under
-        // the same frame index, and fail the receiver's retro-validation).
+        // Each AU drains through one method. Polling here while `chunker` is live
+        // would emit the same bytes twice under the same frame index.
         if self.chunker.is_some() {
             bail!("pyrowave: poll() on an AU already being drained through poll_chunk");
         }
         Ok(self.pending.pop_front())
     }
 
-    // --- streamed AU (PW6) — see `pyrowave_wire::AuChunker` for what this does and does NOT buy.
-    // Byte-identical to the Linux twin BY CONSTRUCTION: all of the cutting lives in the shared
-    // helper, which compiles and unit-tests on every platform. This file cannot be compiled from
-    // a Linux/macOS dev box, so anything written here directly would ship unverified.
+    // Cutting lives in [`pyrowave_wire::AuChunker`] (compiles on every platform).
+    // This file cannot be built off Windows, so the helper is the verified path.
     fn supports_chunked_poll(&self) -> bool {
         pyrowave_wire::stream_chunk_step(self.wire_chunk).is_some()
     }
 
     fn poll_chunk(&mut self) -> Result<Option<crate::AuChunk>> {
-        // Finish the AU already in flight before opening the next one — the host's `handle_chunk`
-        // keys begin/finish off `first`/`last` and cannot interleave two AUs.
+        // Drain the in-flight AU first; the host keys begin/finish off `first`/`last`
+        // and cannot interleave two AUs.
         if let Some(c) = self.chunker.as_mut() {
             if let Some(chunk) = c.next() {
                 return Ok(Some(chunk));
@@ -701,41 +619,33 @@ impl Encoder for PyroWaveEncoder {
         let Some(f) = self.pending.pop_front() else {
             return Ok(None);
         };
-        // No blocking wait here (the trait allows one): `submit` already ran the whole encode
-        // synchronously, so an AU in `pending` is complete by construction.
+        // No wait: `submit` already encoded synchronously, so `pending` is complete.
         match pyrowave_wire::stream_chunk_step(self.wire_chunk) {
             Some(step) => Ok(self
                 .chunker
                 .insert(pyrowave_wire::AuChunker::new(f, step))
                 .next()),
-            // Unarmed / dense: the trait's own default shape, so a host that polls chunks anyway
-            // still gets whole AUs.
+            // Dense: the trait default, so a host that polls chunks still gets whole AUs.
             None => Ok(Some(crate::AuChunk::whole(f))),
         }
     }
 
     fn reset(&mut self) -> bool {
-        // A rebuild forfeits every in-flight frame — including an AU only half-handed-out through
-        // `poll_chunk`. Dropping the cursor here (ahead of every `pending.clear()` arm below) is
-        // what keeps the next `poll_chunk` from splicing the tail of a dead AU onto a fresh one;
-        // the host sees a `first` without the previous `last`, logs "streamed AU abandoned
-        // mid-flight" and lets the client age that frame out.
+        // Drop the cursor before `pending.clear()` so the next `poll_chunk` cannot
+        // splice a dead AU's tail onto a fresh one.
         self.chunker = None;
-        // Cheap in-place rebuild: recreate only the pyrowave encoder object (no rate-control /
-        // reference state to preserve). The device, imported textures and fence survive.
+        // Recreate only the encoder object; device, imported textures and fence survive.
         // SAFETY: encode is synchronous (no work in flight); the device outlives the swapped encoder.
         unsafe {
             pw::pyrowave_encoder_destroy(self.pw_enc);
-            // Publish the null IMMEDIATELY — see the Linux twin. The create below is fallible and
-            // `pyrowave_encoder_destroy` is a plain `delete` with no null check, so leaving the
-            // freed pointer in the field makes `Drop` a double free.
+            // Null immediately: create below is fallible and destroy is not
+            // null-safe, so a leftover freed pointer is a `Drop` double-free.
             self.pw_enc = std::ptr::null_mut();
             let einfo = pw::pyrowave_encoder_create_info {
                 device: self.pw_dev,
                 width: self.width as i32,
                 height: self.height as i32,
-                // Rebuild at the session's real chroma — a hardcoded 420 here would leave a 4:4:4
-                // session's full-res chroma plane + CSC feeding a 4:2:0 pyrowave encoder.
+                // Session chroma, not hardcoded 420: a 4:4:4 CSC must not feed a 4:2:0 encoder.
                 chroma: if self.chroma444 {
                     pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_444
                 } else {
@@ -746,7 +656,7 @@ impl Encoder for PyroWaveEncoder {
             let r = pw::pyrowave_encoder_create(&einfo, &mut enc);
             if r != pw::pyrowave_result_PYROWAVE_SUCCESS {
                 tracing::error!(result = ?r, "pyrowave: encoder rebuild failed");
-                // `pw_enc` stays null — `Drop` and `encode_frame` both guard on it.
+                // `pw_enc` stays null; `Drop` and `encode_frame` both guard on it.
                 self.pending.clear();
                 return false;
             }
@@ -757,9 +667,7 @@ impl Encoder for PyroWaveEncoder {
     }
 
     fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
-        // Rate control is a plain per-frame byte budget — an in-place retarget is free (no IDR,
-        // nothing in flight). Phase 3 pins the session rate and bypasses ABR; this faithfully
-        // applies whatever the caller asks until then.
+        // Per-frame byte budget; retarget is free (no IDR, nothing in flight).
         self.frame_budget = budget_for(bps.max(1_000_000), self.fps);
         tracing::debug!(
             mbps = bps / 1_000_000,
@@ -770,7 +678,7 @@ impl Encoder for PyroWaveEncoder {
     }
 
     fn set_wire_chunking(&mut self, shard_payload: usize) {
-        // Sanity floor: a boundary below one block header + payload word is meaningless.
+        // Below one block header + payload word the boundary is meaningless.
         if shard_payload >= 64 {
             self.wire_chunk = Some(shard_payload);
             tracing::info!(
@@ -781,18 +689,16 @@ impl Encoder for PyroWaveEncoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        // Synchronous per-frame encode: nothing buffered beyond `pending`.
         Ok(())
     }
 }
 
 impl Drop for PyroWaveEncoder {
     fn drop(&mut self) {
-        // SAFETY: owned handles, destroyed exactly once; pyrowave objects (encoder, images, sync) go
-        // before the device they borrow (per pyrowave.h).
+        // SAFETY: owned handles, destroyed once; encoder/images/sync go before
+        // the device they borrow (pyrowave.h).
         unsafe {
-            // Null when a failed `reset()` already destroyed it — `pyrowave_encoder_destroy`
-            // is not null-safe (same guard `sync` below has had all along).
+            // Null after a failed `reset()`; `pyrowave_encoder_destroy` is not null-safe.
             if !self.pw_enc.is_null() {
                 pw::pyrowave_encoder_destroy(self.pw_enc);
             }
@@ -826,11 +732,10 @@ mod tests {
         DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
     };
 
-    /// Decode a dense PyroWave AU with upstream's own decoder → YUV420P plane means (the golden
-    /// oracle, mirroring the Linux `decode_plane_means`).
+    /// Decode a dense PyroWave AU with upstream's decoder; return YUV plane means.
     ///
     /// # Safety
-    /// `au` must be a complete dense PyroWave AU for a `w`×`h` 4:2:0 frame.
+    /// `au` is a complete dense PyroWave AU for a `w`×`h` frame at `chroma444`.
     unsafe fn decode_plane_means(w: u32, h: u32, au: &[u8], chroma444: bool) -> (f64, f64, f64) {
         let mut dev: pw::pyrowave_device = std::ptr::null_mut();
         assert_eq!(
@@ -887,12 +792,11 @@ mod tests {
         (mean(&y), mean(&cb), mean(&cr))
     }
 
-    /// Create a shareable `format` plane texture (`bpp` bytes/texel), fill each texel with `bytes`
-    /// via a CPU staging copy, and return it. Mirrors the capturer's SHARED|SHARED_NTHANDLE +
-    /// RENDER_TARGET out-ring textures.
+    /// Shareable plane texture (`bpp` bytes/texel) filled with `bytes` via staging.
+    /// Same SHARED|SHARED_NTHANDLE + RENDER_TARGET flags as the capturer out-ring.
     ///
     /// # Safety
-    /// `bytes.len() == bpp`; runs on a live D3D11 device/context.
+    /// `bytes.len() == bpp`; `device`/`context` are live.
     unsafe fn make_plane(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
@@ -951,16 +855,12 @@ mod tests {
         tex
     }
 
-    /// End-to-end zero-copy smoke: distinct solid Y/Cb/Cr filled into SEPARATE shareable plane
-    /// textures (full-res R8 Y + half-res R8G8 CbCr) → shared to pyrowave's own Vulkan device (the
-    /// SESSION-0-relevant `create_device_by_compat` + `D3D11_TEXTURE_BIT` import + shared-fence path)
-    /// → encode → upstream-decode. Returns the decoded plane means. A flat gray can't detect a plane
-    /// swap / spatial error, so this fills Y≠Cb≠Cr.
+    /// Zero-copy smoke: solid Y≠Cb≠Cr in separate shareable planes → encode →
+    /// decode. Distinct fills so a plane swap cannot hide. Returns plane means.
     ///
     /// # Safety
-    /// Runs on a real D3D11 + Vulkan-1.3 GPU; all COM/FFI handles are locally owned.
+    /// Real D3D11 + Vulkan 1.3 GPU; all COM/FFI handles are locally owned.
     unsafe fn run_case(w: u32, h: u32, hdr: bool, chroma444: bool) -> (f64, f64, f64) {
-        // A fresh D3D11 device on the default hardware adapter.
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
         D3D11CreateDevice(
@@ -978,9 +878,8 @@ mod tests {
         let device = device.unwrap();
         let context = context.unwrap();
 
-        // Distinct plane fills at the session's plane formats/geometry. 16-bit fills use
-        // v16 = v8 * 257 (0xVV,0xVV LE), whose UNORM value equals v8/255 EXACTLY — so the
-        // 8-bit decode means expect the same 100/180/60 in every mode.
+        // 16-bit fills are v8 * 257 (0xVV,0xVV LE); UNORM equals v8/255 exactly,
+        // so 8-bit decode means stay 100/180/60 in every mode.
         let (cw, ch) = if chroma444 { (w, h) } else { (w / 2, h / 2) };
         let (y_tex, cbcr_tex) = if hdr {
             (
@@ -1018,7 +917,7 @@ mod tests {
             )
         };
 
-        // Shared fence signalled after the fills (mirrors the capturer's convert→signal ordering).
+        // Signalled after the fills (capturer convert→signal order).
         let dev5: ID3D11Device5 = device.cast().expect("ID3D11Device5");
         let mut fence: Option<ID3D11Fence> = None;
         dev5.CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence)
@@ -1031,7 +930,6 @@ mod tests {
         ctx4.Signal(&fence, 1).expect("Signal");
         context.Flush();
 
-        // Encode the shared textures through the real backend.
         let mut enc = PyroWaveEncoder::open(
             w,
             h,
@@ -1058,8 +956,7 @@ mod tests {
                     cbcr: cbcr_tex,
                     fence_handle: Some(fence_handle.0 as isize),
                     fence_value: 1,
-                    // One synthetic ring for the whole case: a constant generation exercises the
-                    // steady-state cache-hit path (a changing one would flush every frame).
+                    // Constant generation: the cache-hit path. A changing one would flush every frame.
                     ring_gen: 1,
                 }),
             }),
@@ -1069,9 +966,8 @@ mod tests {
         let au = enc.poll().expect("poll").expect("one AU per frame");
         assert!(au.keyframe, "every pyrowave AU is a keyframe");
         assert!(!au.data.is_empty(), "AU is non-empty");
-        // The dense AU starts with the 8-byte BitstreamSequenceHeader; the range VUI must read
-        // LIMITED (bit 30 = byte 7 bit 6 = 0x40) — `mark_limited_range` corrects pyrowave's zeroed
-        // default so VUI-honoring clients (Apple) don't wash out blacks.
+        // Dense AU starts with the 8-byte sequence header; LIMITED is bit 30
+        // (byte 7 bit 6 = 0x40). Pyrowave zeros this as FULL.
         assert_eq!(
             au.data[7] & 0x40,
             0x40,
@@ -1087,18 +983,15 @@ mod tests {
         decode_plane_means(w, h, &au.data, chroma444)
     }
 
-    /// The Windows NV12 zero-copy path end-to-end on a real GPU. `#[ignore]`d (needs D3D11 + a
-    /// Vulkan-1.3 device); build anywhere, run on the GPU host:
-    ///   cargo test -p pf-encode --features pyrowave --no-run
-    ///   <bin> --ignored --nocapture pyrowave_win_smoke
-    /// Runs both a known-good square size and real streaming sizes to characterize the documented
-    /// NVIDIA NV12 D3D11→Vulkan import size sensitivity (design doc Risk 4 / the interop-test note).
+    /// End-to-end on a real GPU. `#[ignore]`d; build anywhere, run on the GPU host:
+    /// `cargo test -p pf-encode --features pyrowave --no-run`
+    /// then `<bin> --ignored --nocapture pyrowave_win_smoke`.
+    /// Square plus real streaming sizes: NVIDIA D3D11→Vulkan import is size-sensitive.
     #[test]
     #[ignore = "needs a real D3D11 + Vulkan-1.3 GPU (run on the Windows host, not the build box)"]
     fn pyrowave_win_smoke() {
-        // The SDR 4:2:0 base case across real streaming sizes (the NVIDIA import
-        // size-sensitivity check), then every other (hdr, chroma) mode at two sizes —
-        // the R16/R16G16 and full-res-chroma imports are new surface for the same quirk.
+        // SDR 4:2:0 across streaming sizes (NVIDIA import size check), then the
+        // other (hdr, chroma) modes at two sizes — R16 and full-res-chroma imports.
         let mut cases = vec![
             (1024u32, 1024u32, false, false),
             (1280, 720, false, false),

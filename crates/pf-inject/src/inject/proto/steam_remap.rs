@@ -1,20 +1,17 @@
-//! Pure fallback-remap policy for the Steam Controller / Steam Deck rich inputs when the resolved
-//! host backend is **not** the virtual `hid-steam` device (DualSense / DualShock 4 / Xbox), so a
-//! client's Steam-only inputs aren't silently dropped — plus the cross-device motion rescale the
-//! Deck backend itself needs.
+//! Steam Controller / Deck rich-input fallback when the host backend is not
+//! virtual `hid-steam` (DualSense / DualShock 4 / Xbox), plus Deck motion rescale.
 //!
-//! Driven by the host's `PUNKTFUNK_STEAM_REMAP` env (`key=value`, `,`/`;`-separated, e.g.
-//! `paddles=stickclicks`). No I/O beyond [`RemapConfig::from_env`]; everything else is pure +
-//! unit-testable. The uinput Xbox pad already exposes the back grips as Elite paddles
-//! (`BTN_TRIGGER_HAPPY5-8`), so only the slot-less DualSense / DS4 backends fold them.
+//! `PUNKTFUNK_STEAM_REMAP`: `key=value`, `,`/`;`-separated (`paddles=stickclicks`).
+//! Pin paddles here; motion units in `crates/pf-inject/tests/motion_contract.rs`.
+//!
+//! uinput Xbox already exposes the grips as Elite paddles (`BTN_TRIGGER_HAPPY5-8`);
+//! only DualSense / DS4 (no native back-button slot) fold them.
 
 use punktfunk_core::input::gamepad as gs;
 
-/// Where the four Steam back grips go on a backend with no native back-button HID slot.
+/// Target for the four Steam back grips when the backend has no native HID slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PaddleFallback {
-    /// Drop them — the back buttons are simply absent on this pad. The honest default: don't fire
-    /// buttons the user didn't ask for. Set the env to map them instead.
     #[default]
     Drop,
     /// L4/L5 → left-stick click, R4/R5 → right-stick click.
@@ -23,21 +20,20 @@ pub enum PaddleFallback {
     Shoulders,
 }
 
-/// Fallback-remap knobs parsed from `PUNKTFUNK_STEAM_REMAP`.
+/// Parsed from `PUNKTFUNK_STEAM_REMAP`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RemapConfig {
     pub paddles: PaddleFallback,
 }
 
 impl RemapConfig {
-    /// Parse the host's `PUNKTFUNK_STEAM_REMAP` env (absent / unrecognized → defaults).
     pub fn from_env() -> RemapConfig {
         std::env::var("PUNKTFUNK_STEAM_REMAP")
             .map(|s| RemapConfig::parse(&s))
             .unwrap_or_default()
     }
 
-    /// Pure parse of the `key=value[,key=value…]` string (the testable core of [`from_env`]).
+    /// Unknown `paddles=` values → [`PaddleFallback::Drop`].
     pub fn parse(s: &str) -> RemapConfig {
         let mut cfg = RemapConfig::default();
         for kv in s.split([',', ';']) {
@@ -56,8 +52,7 @@ impl RemapConfig {
     }
 }
 
-/// Fold the wire back-grip bits (`BTN_PADDLE1..4`) into standard buttons per `policy` for a pad with
-/// no native back-button slot, clearing the paddle bits. Pure. PADDLE1/2/3/4 = R4/L4/R5/L5.
+/// Wire PADDLE1/2/3/4 = R4/L4/R5/L5, not L then R.
 pub fn fold_paddles(mut buttons: u32, policy: PaddleFallback) -> u32 {
     let left = buttons & (gs::BTN_PADDLE2 | gs::BTN_PADDLE4) != 0; // L4 | L5
     let right = buttons & (gs::BTN_PADDLE1 | gs::BTN_PADDLE3) != 0; // R4 | R5
@@ -76,11 +71,9 @@ pub fn fold_paddles(mut buttons: u32, policy: PaddleFallback) -> u32 {
     buttons
 }
 
-// Motion rescale. The wire uses the DualSense convention (`gs::MOTION_*` — the scale every client
-// capture applies); the Steam Deck's `hid-steam` fixes STEAM_DECK_GYRO_RES_PER_DPS = 16 and
-// STEAM_DECK_ACCEL_RES_PER_G = 16384, so the Deck backend rescales. The DualSense / DS4 backends
-// consume the wire 1:1 instead, because their calibration blobs declare the wire's own units.
-// pf-inject's `motion_contract` test pins both halves of that sentence.
+// hid-steam STEAM_DECK_GYRO_RES_PER_DPS = 16, ACCEL_RES_PER_G = 16384. Wire is DualSense
+// (`gs::MOTION_*`). DualSense / DS4 consume 1:1 (cal blobs declare wire units).
+// Pin: `crates/pf-inject/tests/motion_contract.rs`.
 const GYRO_NUM: i32 = 16;
 const GYRO_DEN: i32 = gs::MOTION_GYRO_LSB_PER_DEG_S;
 const ACCEL_NUM: i32 = 16384;
@@ -90,7 +83,7 @@ fn scale(v: i16, num: i32, den: i32) -> i16 {
     ((v as i32 * num) / den).clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
-/// Rescale a wire (DualSense-convention) motion sample into the Steam Deck's `hid-steam` units.
+/// Wire DualSense (`gs::MOTION_*`) → Deck `hid-steam` (16 LSB/°·s, 16384 LSB/g).
 pub fn motion_wire_to_deck(gyro: [i16; 3], accel: [i16; 3]) -> ([i16; 3], [i16; 3]) {
     (
         gyro.map(|g| scale(g, GYRO_NUM, GYRO_DEN)),
@@ -121,16 +114,12 @@ mod tests {
 
     #[test]
     fn fold_paddles_maps_and_clears() {
-        // All four grips set + a real A button.
         let b = gs::BTN_A | gs::BTN_PADDLE1 | gs::BTN_PADDLE2 | gs::BTN_PADDLE3 | gs::BTN_PADDLE4;
-        // Drop: paddle bits cleared, A preserved, nothing added.
         assert_eq!(fold_paddles(b, PaddleFallback::Drop), gs::BTN_A);
-        // StickClicks: left grips → L3, right grips → R3.
         assert_eq!(
             fold_paddles(b, PaddleFallback::StickClicks),
             gs::BTN_A | gs::BTN_LS_CLICK | gs::BTN_RS_CLICK
         );
-        // Only a left grip (L4 = PADDLE2) → only the left bumper under Shoulders.
         assert_eq!(
             fold_paddles(gs::BTN_PADDLE2, PaddleFallback::Shoulders),
             gs::BTN_LB

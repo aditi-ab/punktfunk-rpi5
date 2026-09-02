@@ -1,15 +1,18 @@
-//! The stream's per-frame colour signalling (`ColorDesc`) + the Y′CbCr→RGB CSC matrix (`csc_rows`).
+//! Per-frame H.273 (`ColorDesc`) and the Y′CbCr→RGB shader rows (`csc_rows`).
+//!
+//! `ColorDesc` is this frame's bitstream VUI / sequence header, not the
+//! session handshake. The host can switch PQ in-band; drawing that frame as
+//! BT.709 limited washes it out. H.273 2 is unspecified; [`csc_rows`] then
+//! uses BT.709.
+//!
+//! [`csc_rows`] is the shared coefficient table. Tests in this file pin
+//! limited-range white/black (8-bit and 10-bit P010) and the 601-vs-709 red
+//! excursion.
 
-/// The stream's colour signaling, read PER-FRAME out of the bitstream's own VUI /
-/// sequence header (pf-bitstream, on every rung — the libavcodec `AVFrame` CICP read this
-/// used to have went with M10's rungs). The Windows host switches an HDR desktop to
-/// Main10 BT.2020 PQ **in-band** (the Welcome still says SDR — clients are expected to
-/// follow the VUI, as the Windows/Apple/Android clients do), so rendering must follow the
-/// frames, not the handshake — else PQ content drawn as BT.709 comes out washed out and
-/// desaturated.
+/// Per-frame H.273. Follow this, not the session handshake.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ColorDesc {
-    /// H.273 code points as signaled (2 = unspecified → the renderer picks the SDR default).
+    /// H.273; 2 = unspecified.
     pub primaries: u8,
     pub transfer: u8,
     pub matrix: u8,
@@ -17,28 +20,20 @@ pub struct ColorDesc {
 }
 
 impl ColorDesc {
-    /// PQ (SMPTE ST.2084) transfer — the HDR10 signal.
+    /// H.273 transfer 16 (PQ / ST.2084).
     pub fn is_pq(&self) -> bool {
         self.transfer == 16
     }
 }
 
-/// The Y′CbCr→RGB conversion as three vec4 rows for a shader constant buffer / push-constant
-/// block: `rgb[i] = dot(r[i].xyz, yuv) + r[i].w` — bit-depth exact. The ONE coefficient
-/// implementation every presenter derives its CSC from (Vulkan push constants, the Windows
-/// client's D3D11 constant buffer), so a stream's signaled matrix/range is honored identically
-/// everywhere; the Apple client ports this function (and its tests) to Swift.
+/// Shader rows: `rgb[i] = dot(r[i].xyz, yuv) + r[i].w`.
 ///
-/// `depth` picks the limited-range code points (8-bit: 16/235/240 over 255; 10-bit:
-/// 64/940/960 over 1023 — NOT the same normalized values, the difference is ~half a
-/// code). `msb_packed` folds in the P010/X6 packing factor: 10 significant bits live in
-/// the MSBs of 16, so a UNORM16 sample reads `code·64/65535` — multiplying by
-/// `65535/65472` recovers exact `code/1023`.
+/// `depth` is the limited-range ladder: 8-bit 16/235/240 over 255, 10-bit
+/// 64/940/960 over 1023. Those are not the same normalized values (~½ code).
+/// `msb_packed` is P010/X6 (10 bits in the MSBs of 16): a UNORM16 sample is
+/// `code·64/65535`; multiply by `65535/65472` to recover `code/1023`.
 pub fn csc_rows(desc: ColorDesc, depth: u8, msb_packed: bool) -> [[f32; 4]; 3] {
-    // BT.601 (5/6), BT.2020 (9/10); everything else — incl. unspecified — is the host's
-    // BT.709 SDR default. Since M8 this is the ONLY coefficient choice in the client:
-    // the software rung's swscale (which defaulted to BT.601 and needed correcting) is
-    // gone, and its planes come through this function like every hardware lane's.
+    // H.273 5/6 = BT.601, 9/10 = BT.2020; unspecified and the rest are BT.709.
     let (kr, kb) = match desc.matrix {
         5 | 6 => (0.299, 0.114),
         9 | 10 => (0.2627, 0.0593),
@@ -57,9 +52,7 @@ pub fn csc_rows(desc: ColorDesc, depth: u8, msb_packed: bool) -> [[f32; 4]; 3] {
             pack * max / (224.0 * step),
         )
     };
-    // rgb = M * (yuv + off) = M*yuv + M*off — rows of M with the offset dot folded into
-    // w. `yuv` is the SAMPLED (packed) value, so the offsets divide by the packing
-    // factor to land on the same scale.
+    // Fold M*(yuv+off) into w. Sampled `yuv` is already packed, so off / pack.
     let off = [oy / pack, -0.5 / pack, -0.5 / pack];
     let m = [
         [sy, 0.0, 2.0 * (1.0 - kr) * sc],
@@ -95,8 +88,6 @@ mod tests {
         })
     }
 
-    /// 10-bit limited MSB-packed (P010/X6): reference white Y=940, black Y=64, neutral
-    /// chroma 512 — sampled as UNORM16 of `code << 6`.
     #[test]
     fn bt2020_10bit_limited_white_black() {
         let rows = csc_rows(desc(9, false), 10, true);
@@ -109,8 +100,6 @@ mod tests {
         }
     }
 
-    /// Reference white (Y=235, U=V=128 limited) → RGB 1.0; reference black (Y=16) → 0.0
-    /// — the GL presenter's test, in row form.
     #[test]
     fn bt709_limited_white_black() {
         let rows = csc_rows(desc(1, false), 8, false);
@@ -122,8 +111,6 @@ mod tests {
         }
     }
 
-    /// Full-range identity points + the 601-vs-709 red excursion (guards the
-    /// matrix-code dispatch), same as the GL presenter's test.
     #[test]
     fn full_range_and_red_excursion() {
         let rows = csc_rows(desc(5, true), 8, false);
@@ -140,14 +127,13 @@ mod tests {
         assert!((red[0] - red709[0]).abs() > 0.05);
     }
 
-    /// The row form must agree with the GL presenter's column-major `yuv_to_rgb` on a
-    /// grid of inputs — same math, different packing.
+    /// Same coefficients as `video_gl::yuv_to_rgb`, column-major packing.
     #[test]
     fn rows_match_the_gl_matrix_form() {
         for (matrix, full) in [(1u8, false), (1, true), (5, false), (9, false), (9, true)] {
             let d = desc(matrix, full);
             let rows = csc_rows(d, 8, false);
-            // Reimplementation of video_gl::yuv_to_rgb's application for comparison.
+            // Independent of `csc_rows`: GL's column-major apply, for the packing check.
             let (kr, kb) = match matrix {
                 5 | 6 => (0.299f32, 0.114f32),
                 9 | 10 => (0.2627, 0.0593),

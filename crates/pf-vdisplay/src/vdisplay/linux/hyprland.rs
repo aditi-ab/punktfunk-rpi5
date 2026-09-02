@@ -1,47 +1,21 @@
-//! Hyprland virtual-output backend via `hyprctl` IPC + the xdg ScreenCast portal
+//! Hyprland virtual-output backend via `hyprctl` IPC and the xdg ScreenCast portal
 //! (xdg-desktop-portal-hyprland / xdph). See `design/hyprland-support.md`.
 //!
-//! Hyprland dropped wlroots in v0.42 (aquamarine backend) but kept the client-facing wlr
-//! protocols, so it shares the wlr virtual-input path with sway — but it needs its own IPC and
-//! portal, so it is a **distinct backend** from [`super::wlroots`], not a branch inside it (D1):
+//! Distinct from [`super::wlroots`]: Hyprland names headless outputs explicitly
+//! (`hyprctl output create headless PF-<pid>-<n>`), so there is no before/after
+//! diff. The creator pid in the name is what [`reclaim_leftovers_once`] uses to
+//! drop leftovers whose owner is gone.
 //!
-//! 1. `hyprctl output create headless PF-<pid>-<n>` adds a named headless output — Hyprland supports
-//!    **explicit names**, so no before/after diffing like sway's `HEADLESS-N` (D6). We poll
-//!    `hyprctl -j monitors` until the name shows up. The creator's pid rides in the name so a
-//!    crashed host's leftovers are attributable, and only those (see [`reclaim_leftovers_once`]).
-//! 2. A monitor rule sets the client's exact mode. [`set_monitor_rule`] uses `hyprctl keyword
-//!    monitor NAME,WxH@Hz,auto,1` (the hyprlang path — the default config manager on every current
-//!    release, ≥0.55 included) and falls back to the Lua `hyprctl eval 'hl.monitor{…}'` only for a
-//!    user on the opt-in Lua config manager, confirming the output actually adopted the mode (D5).
-//! 3. The xdg ScreenCast portal (served by **xdph**) yields the output's PipeWire node. There is
-//!    no GUI to pick an output headlessly, so xdph is steered through its **custom picker**: a
-//!    managed config (`~/.config/hypr/xdph.conf`) points `screencopy:custom_picker_binary` at a tiny
-//!    installed shim that cats a per-session selection file we write right before the handshake —
-//!    `[SELECTION]/screen:<NAME>`, whose leading `/` is xdph's mandatory empty-flags separator (see
-//!    [`crate::portal_picker`], which owns the format and its tests).
-//! 4. Teardown is RAII **and ordered**: drop closes the ScreenCast session and WAITS for the portal
-//!    to confirm it, and only then runs `hyprctl output remove NAME`. Removing the output first is
-//!    what made every stream after the first one fail on Hyprland — see [`StopGuard`].
+//! A monitor rule sets the client's exact mode ([`set_monitor_rule`]). xdph is
+//! steered at that output through a custom picker ([`crate::portal_picker`]).
+//! Teardown is ordered: [`StopGuard`] waits for ScreenCast close, then
+//! [`OutputGuard`] removes the compositor output — the reverse wedges xdph.
 //!
-//! Requirements: the host runs inside (or can reach) the Hyprland session — either
-//! `HYPRLAND_INSTANCE_SIGNATURE` is inherited, or it is discovered from `$XDG_RUNTIME_DIR/hypr/`
-//! and handed to each `hyprctl` child ([`hyprctl_command`]) — with the ScreenCast interface routed
-//! to xdph (`scripts/headless/portals.conf`).
-//!
-//! The focus contract [`focus_output`] rests on is verified on **Hyprland 0.56.2** (2026-08-17,
-//! headless probe against a real instance): `output create headless` leaves the new head
-//! `focused: false` — which is the whole reason [`focus_output`] exists — `dispatch focusmonitor
-//! <name>` replies `ok` and moves `focused` onto it, and a client spawned afterwards maps onto that
-//! head. The bare `hyprctl focusmonitor <name>` (no `dispatch`) answers `unknown request` at
-//! **exit 0**, which is what [`hyprctl_dispatch`]'s `unknown` marker turns into an error.
-//!
-//! Contracts verified on **Hyprland 0.55.4 + xdph 1.3.x** (`design/hyprland-support.md` Phase 0):
-//! `hyprctl` subcommands / JSON shapes, the `[SELECTION]/screen:<name>` picker format (re-derived
-//! from xdph 1.3.12's own parser on 2026-08-14, which is when the missing `/` turned up), the
-//! `~/.config/hypr/xdph.conf` path + `screencopy:custom_picker_binary` key, and that `eval` needs
-//! the Lua config manager. Not yet exercised end-to-end on real DRM hardware: a headless output's
-//! GBM/dmabuf allocation (fails on a nested/NVIDIA test box — Sunshine#4197); `set_monitor_rule`
-//! surfaces that as a clear error instead of streaming a 0×0 output.
+//! Requires a reachable Hyprland instance (`HYPRLAND_INSTANCE_SIGNATURE` or
+//! `$XDG_RUNTIME_DIR/hypr/`) and ScreenCast routed to xdph
+//! (`scripts/headless/portals.conf`). `hyprctl focusmonitor` without `dispatch`
+//! answers `unknown request` at exit 0; [`hyprctl_dispatch`] turns that into
+//! an error.
 
 use super::{DisplayOwnership, Mode, VirtualDisplay, VirtualOutput};
 use anyhow::{anyhow, bail, Context, Result};
@@ -55,25 +29,21 @@ use std::sync::{Arc, Once};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Per-session file the xdph custom picker reads the selected output from. We write
-/// [`picker_selection_line`] here right before the portal handshake selects sources. Lives under
-/// `$XDG_RUNTIME_DIR` (per-user, 0700) — NOT a world-writable /tmp path another local user could
-/// pre-create or rewrite between our write and xdph's read (steer capture elsewhere). Mirrors the
-/// wlroots chooser file.
+/// Per-session picker file, under `$XDG_RUNTIME_DIR` (0700) — not world-writable
+/// `/tmp`, where another local user could rewrite it between our write and xdph's
+/// read.
 fn selection_file() -> String {
     let dir = crate::session::runtime_dir();
     format!("{dir}/punktfunk-xdph-output")
 }
 
-/// The installed custom-picker shim: a tiny script that cats [`selection_file`]. xdph runs
-/// `custom_picker_binary` and reads one selection line from its stdout; an empty read (no session
-/// has written the file) leaves xdph to its own fallback.
+/// Shim xdph runs as `custom_picker_binary`. Empty stdout (no session has written
+/// the selection file) leaves xdph to its own fallback.
 fn picker_shim_path() -> String {
     let dir = crate::session::runtime_dir();
     format!("{dir}/punktfunk-xdph-picker.sh")
 }
 
-/// The xdph config we manage one key in, and the key.
 fn xdph_config_path() -> Result<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
@@ -85,14 +55,8 @@ const XDPH_BLOCK: crate::portal_config::Block<'static> =
     crate::portal_config::Block::Hyprlang("screencopy");
 const XDPH_PICKER_KEY: &str = "custom_picker_binary";
 
-/// Is a picker command safe to paste into the shim's `exec` line?
-///
-/// The value comes from the user's own config, so this is not a privilege boundary — they already
-/// own both files and the shell that runs them. It is a *robustness* boundary: a newline would
-/// truncate the script into something that silently does the wrong thing, and command substitution
-/// in a file we generate is the kind of thing a reader has to stop and reason about. A picker is a
-/// command name with maybe some flags; anything else, we simply omit the fallback and behave
-/// exactly as before.
+/// Is `cmd` safe to paste into the shim's `exec` line? A newline would split
+/// the generated script; this is robustness, not a privilege boundary.
 fn picker_is_plain(cmd: &str) -> bool {
     !cmd.is_empty()
         && cmd.len() <= 512
@@ -101,24 +65,20 @@ fn picker_is_plain(cmd: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || " ._/@:+=-".contains(c))
 }
 
-/// The picker line for output `name` — `[SELECTION]/screen:<name>`, whose every byte is load-bearing.
-/// Lives in [`crate::portal_picker`] with a transcription of xdph's parser, because it is a wire
-/// format with no error report and this file only compiles on Linux.
+/// `[SELECTION]/screen:<name>` — every byte is load-bearing. Format lives in
+/// [`crate::portal_picker`] (this file is Linux-only).
 fn picker_selection_line(name: &str) -> String {
     crate::portal_picker::selection_line(name)
 }
 
-/// Monotonic per-process counter for headless output names (`PF-<pid>-1`, `PF-<pid>-2`, …). Named
-/// outputs kill the before/after diff race sway needs (D6).
+/// Per-process seq for `PF-<pid>-<n>`. Named outputs skip sway's before/after
+/// diff race.
 static OUTPUT_SEQ: AtomicU32 = AtomicU32::new(0);
 
-/// The name for our next headless output: `PF-<pid>-<n>`.
-///
-/// The pid is not decoration. `OutputGuard::drop` is the only thing that removes an output, so a
-/// host that was SIGKILLed leaves its outputs in the compositor — and a bare `PF-<n>` counter starts
-/// again at `PF-1` in the next process, colliding with the corpses it just inherited. Stamping the
-/// creator's pid into the name makes a leftover both recognisable and *attributable*, which is what
-/// lets [`reclaim_leftovers_once`] remove only the ones whose owner is gone.
+/// `PF-<pid>-<n>`. The pid is not decoration: `OutputGuard::drop` is the only
+/// unplug, so a SIGKILLed host leaves heads behind. A bare `PF-<n>` restarts
+/// at `PF-1` and collides; the pid lets [`reclaim_leftovers_once`] drop only
+/// leftovers whose owner is gone.
 fn next_output_name() -> String {
     format!(
         "PF-{}-{}",
@@ -127,9 +87,7 @@ fn next_output_name() -> String {
     )
 }
 
-/// Is `name` an output some punktfunk host created (`PF-<pid>-<n>`, or a legacy `PF-<n>`)? Pure —
-/// this is what [`list_monitors`] reports as `managed`, so a user's own monitor called `PF-office`
-/// must not qualify.
+/// `PF-<pid>-<n>` or legacy `PF-<n>`. A user's own `PF-office` must not match.
 pub(crate) fn is_managed_output(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("PF-") else {
         return false;
@@ -140,9 +98,8 @@ pub(crate) fn is_managed_output(name: &str) -> bool {
             .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// The pid of the host that created `name`, for `PF-<pid>-<n>` only. `None` for anything else —
-/// including a legacy `PF-<n>` from a host older than this naming scheme, which carries no owner and
-/// therefore may not be reclaimed on a guess.
+/// Owner pid for `PF-<pid>-<n>` only. `None` for legacy `PF-<n>` — no owner,
+/// so reclaim must not guess.
 fn output_owner_pid(name: &str) -> Option<u32> {
     let rest = name.strip_prefix("PF-")?;
     let (pid, seq) = rest.split_once('-')?;
@@ -150,60 +107,38 @@ fn output_owner_pid(name: &str) -> Option<u32> {
     pid.parse::<u32>().ok()
 }
 
-/// The Hyprland virtual-display driver. Stateless — each [`create`](VirtualDisplay::create) adds one
-/// named headless output and spins up a portal thread owning the cast on it.
+/// One named headless output per [`create`](VirtualDisplay::create). Stateless
+/// besides the fields below.
 pub struct HyprlandDisplay {
-    /// Out-of-band cursor request (`set_hw_cursor`, the negotiated cursor channel): PREFER portal
-    /// `CursorMode::Metadata` — shapes/positions ride `SPA_META_Cursor` for the channel + the
-    /// composite blend. Off (every non-channel session): prefer `Embedded` — the compositor paints
-    /// the pointer into frames, zero host-side cursor work (the pre-channel default this backend
-    /// always had).
-    ///
-    /// Both are only a PREFERENCE: [`crate::portal_cursor`] settles it against what xdph actually
-    /// advertises, because requesting an unadvertised mode makes xdg-desktop-portal fail the call.
-    /// This used to be asserted instead, which is exactly how a cursor-forward session here became
-    /// a black client.
-    ///
-    /// ⚠️ On current xdph the metadata arm is UNREACHABLE, not merely untested: measured on .21
-    /// 2026-08-14 (Hyprland 0.56.2, xdph 1.4.1) `AvailableCursorModes` = 3 — `Hidden|Embedded`
-    /// only. Every session on this backend therefore resolves to `Embedded` today; KWin/Mutter
-    /// remain the legs where the metadata channel is actually exercised.
+    /// Out-of-band cursor request. On: prefer portal `CursorMode::Metadata`.
+    /// Off: prefer `Embedded` (compositor paints the pointer). Both are only a
+    /// preference — [`crate::portal_cursor`] settles against what xdph advertises;
+    /// an unadvertised mode fails the portal call. Current xdph advertises
+    /// `Hidden|Embedded` only, so every session here resolves to `Embedded`.
     hw_cursor: bool,
-    /// What the portal actually gave us on the most recent [`create`](VirtualDisplay::create) — see
-    /// [`VirtualDisplay::last_portal_cursor_mode`], which is how the host learns that a cursor
-    /// overlay is never coming instead of inferring it from an absence.
+    /// What the portal actually gave the last successful `create`. How the host
+    /// learns a cursor overlay is never coming.
     last_cursor_mode: Option<crate::portal_cursor::Mode>,
-    /// The topology-restore action the FIRST `create` on this instance prepared (re-enable the heads
-    /// an `exclusive` topology disabled). Written only through
-    /// [`stash_topology_restore`](crate::backend::stash_topology_restore) — first-wins, because one
-    /// instance serves every attempt of the host's pipeline retry loop and only attempt 1 finds
-    /// heads to disable.
-    ///
-    /// ⚠️ Unlike KWin's field of the same name, this one is NOT picked up by the registry, and
-    /// [`Drop`] is therefore the ONLY thing that ever runs it — not a backstop. A Hyprland display
-    /// carries a portal fd, so `registry::acquire` returns it as pass-through *before* it reaches
-    /// `take_topology_restore()`; nothing lifts this into a display group. The comment that used to
-    /// sit here claimed the opposite, which is how a stranded restore read as a registry bug.
-    ///
-    /// The live consequence of that (unfixed, separate from the strand): the restore is effectively
-    /// per-SESSION here, so two concurrent `exclusive` sessions sharing this desk will have the
-    /// first one to end re-enable the heads under the second. Closing it means giving the
-    /// pass-through path group bookkeeping it does not have today — #284's territory.
+    /// Topology restore from the first `create` (re-enable heads `exclusive`
+    /// disabled). First-wins: this instance serves the pipeline retry loop and
+    /// only attempt 1 finds heads to disable. Unlike KWin's field of the same
+    /// name, the registry never takes this — a Hyprland display carries a portal
+    /// fd, so `registry::acquire` returns it as pass-through. [`Drop`] is the
+    /// only runner. Two concurrent `exclusive` sessions on this desk: the first
+    /// to end re-enables heads under the second.
     pending_restore: Option<Box<dyn FnOnce() + Send>>,
-    /// The output the last SUCCESSFUL [`create`](VirtualDisplay::create) on this instance minted.
-    /// A mid-stream resize replaces the head through this same instance (create-before-drop keeps
-    /// the old head alive while the replacement is built), so the next `create` can carry its
-    /// active workspace over — see [`adopt_active_workspace`]. Only set on success: the retry
-    /// loop's failed attempts must not make a half-created head the adoption source.
+    /// Output the last successful `create` minted. A mid-stream resize replaces
+    /// the head (create-before-drop); the next `create` carries its workspace
+    /// over ([`adopt_active_workspace`]). Unset on failure so a half-created
+    /// head is not the adoption source.
     prev_output: Option<String>,
 }
 
 impl Drop for HyprlandDisplay {
     fn drop(&mut self) {
-        // The ONLY path that runs it (see the field docs — the registry never takes a pass-through
-        // display's restore). This is what re-lights the desk when a pipeline build fails: the
-        // failure unwinds past `PreparedDisplay`, dropping the backend instance that still holds
-        // attempt 1's restore.
+        // The only path that runs it: the registry never takes a pass-through
+        // display's restore. A failed pipeline drops this instance still holding
+        // attempt 1's restore, which re-lights the desk.
         if let Some(restore) = self.pending_restore.take() {
             restore();
         }
@@ -220,19 +155,13 @@ impl HyprlandDisplay {
         })
     }
 
-    /// Apply the effective [`crate::policy::Topology`] for the just-created output `ours`, and stash
-    /// the restore this instance runs on drop (see [`Self::pending_restore`] — the registry does not
-    /// take a pass-through display's restore).
-    ///
-    /// Called at the very END of [`create`](VirtualDisplay::create), on purpose: nothing can fail
-    /// after it, so there is no path that disables the operator's heads and then unwinds past the
-    /// point where the restore is handed over. The cost is that the physical heads stay lit for the
-    /// duration of the portal handshake, which is the pre-existing `extend` behaviour anyway.
+    /// Apply [`crate::policy::Topology`] for `ours` and stash the restore this
+    /// instance runs on drop. Called at the END of `create` so nothing can fail
+    /// after it and unwind past the hand-off. Physical heads stay lit through
+    /// the portal handshake — that is also `extend`.
     fn apply_topology(&mut self, ours: &str) {
         use crate::policy::Topology;
         match crate::effective_topology() {
-            // Nothing to do — the headless output joins the desk as one more head, which is what
-            // `create` has already built.
             Topology::Extend | Topology::Auto => {}
             Topology::Primary => warn_primary_is_not_expressible(),
             Topology::Exclusive => {
@@ -240,28 +169,21 @@ impl HyprlandDisplay {
                 let prepared = (!disabled.is_empty()).then(|| {
                     Box::new(move || restore_heads(&disabled)) as Box<dyn FnOnce() + Send>
                 });
-                // Keep the FIRST restore, never the latest: the retry loop calls `create` up to
-                // eight times on this one instance, and only attempt 1 has heads to disable — so a
-                // plain assignment overwrote it with attempt 2's `None` and stranded the desk dark.
+                // First restore wins: the retry loop calls `create` up to eight
+                // times on this instance, and only attempt 1 has heads to disable.
+                // A plain assignment overwrote it with attempt 2's `None`.
                 crate::backend::stash_topology_restore(&mut self.pending_restore, prepared);
             }
         }
     }
 }
 
-/// Hyprland is usable when a live Hyprland instance for our uid is reachable — signalled by an
-/// INHERITED `HYPRLAND_INSTANCE_SIGNATURE` **or** a discoverable instance socket under
-/// `$XDG_RUNTIME_DIR/hypr/*/.socket.sock` (so the systemd `--user` host works without env import,
-/// unlike sway's `SWAYSOCK`). Cheap, side-effect-free — safe on the enumeration path.
+/// Usable when a live Hyprland instance for our uid is reachable: inherited
+/// `HYPRLAND_INSTANCE_SIGNATURE`, or a socket under `$XDG_RUNTIME_DIR/hypr/`
+/// (the systemd `--user` host has no env import). Cheap — safe on enumeration.
 ///
-/// Inherited is now all the signature can be: `apply_session_env` no longer exports it (the value
-/// goes to the `hyprctl` children instead — see [`hyprctl_command`]), so this reads only what the
-/// host was launched with. The socket scan below is the arm that matters, and it always was.
-///
-/// Both env reads take [`crate::with_env_lock`] — in ONE scope, so the pair is sampled from a single
-/// consistent view — which orders them against this crate's remaining env writers
-/// (`apply_session_env`'s four survivors) and nothing else. No caller holds the lock (it is not
-/// reentrant), and the `read_dir` below deliberately runs outside it.
+/// Both env reads take [`crate::with_env_lock`] in one scope so the pair is one
+/// consistent view. The lock is not reentrant; `read_dir` runs outside it.
 pub fn is_available() -> bool {
     let (sig, runtime) = crate::with_env_lock(|| {
         (
@@ -284,9 +206,8 @@ pub fn is_available() -> bool {
         .any(|e| e.path().join(".socket.sock").exists())
 }
 
-/// Pre-flight for the Hyprland backend: `hyprctl` must reach the compositor (a clear error now
-/// beats a create-time failure), and if the permission system is enforcing, warn about the silent
-/// black-frame / dropped-input failure mode.
+/// `hyprctl` must reach the compositor now, not at create-time. Warns if the
+/// permission system is enforcing (silent black frames / dropped input).
 pub fn probe() -> Result<()> {
     hyprctl(&["-j", "version"]).context(
         "hyprctl not reachable — is Hyprland running and HYPRLAND_INSTANCE_SIGNATURE set? (the \
@@ -321,38 +242,32 @@ impl VirtualDisplay for HyprlandDisplay {
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
-        // Log the permission-system caveat once per process (silent black frames otherwise).
         preflight_once();
-        // Remove any output a PREVIOUS host left in this compositor, before we mint our first.
         reclaim_leftovers_once();
 
         let name = next_output_name();
         hyprctl_dispatch(&["output", "create", "headless", &name]).with_context(|| {
             format!("hyprctl output create headless {name} (is hyprctl reachable?)")
         })?;
-        // Own the output from here on so any later error (or drop) removes it.
+        // Own from here so any later error (or drop) removes it.
         let output = OutputGuard(name.clone());
         wait_monitor_ready(&name, Duration::from_secs(5))
             .with_context(|| format!("waiting for headless output {name} to appear"))?;
 
-        // The client's exact mode (also the frame clock — a headless output is timer-paced from it).
+        // Client mode is also the frame clock: a headless output is timer-paced from it.
         set_monitor_rule(&name, mode).with_context(|| format!("set monitor rule for {name}"))?;
 
-        // Put the compositor's focus on the head we are about to stream, so the windows this
-        // session opens land where the client can see them.
         focus_output(&name);
 
-        // Steer xdph's custom picker at our new output, then run the portal handshake on its own
-        // thread (it parks to keep the cast alive, like the other backends). Serialized: the
-        // selection is one per-user file, so a concurrent session's write between ours and xdph's
-        // read would silently capture the wrong output (see `SELECTION_LOCK`).
+        // Steer xdph at this output, then handshake on its own thread. Serialized:
+        // the selection is one per-user file; a concurrent write between ours and
+        // xdph's read would capture the wrong output (`SELECTION_LOCK`).
         let (fd, node_id, cursor_mode, stop) = {
             let _sel = SELECTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             select_and_cast(&name, self.hw_cursor)?
         };
-        // Latched for `last_portal_cursor_mode`: on today's xdph this is `embedded` whatever we
-        // asked for, and the session's whole cursor behaviour follows from that fact rather than
-        // from `hw_cursor`.
+        // On today's xdph this is `embedded` regardless of `hw_cursor`; the
+        // session's cursor behaviour follows this, not the request.
         self.last_cursor_mode = Some(cursor_mode);
         tracing::info!(
             node_id,
@@ -363,15 +278,12 @@ impl VirtualDisplay for HyprlandDisplay {
             cursor = cursor_mode.name(),
             "hyprland headless output ready"
         );
-        // Display-management topology (design §5.2). Last, so no failure path unwinds past the
-        // hand-off of the restore — see [`HyprlandDisplay::apply_topology`].
+        // Last, so no failure path unwinds past the restore hand-off.
         self.apply_topology(&name);
-        // A mid-stream resize REPLACES the head (create-before-drop), and Hyprland hands every new
-        // monitor a fresh EMPTY workspace — so the client landed on that empty workspace while
-        // their windows stayed on the dying head's (field report, Omarchy .6, 2026-08-31). Carry
-        // the superseded head's active workspace over. After `apply_topology` like the restore
-        // hand-off: nothing can fail past this point, so no unwind path strands a moved workspace
-        // on a head the error cleanup is about to remove.
+        // A resize replaces the head (create-before-drop). Hyprland hands every
+        // new monitor an empty workspace, so carry the superseded head's active
+        // one over. After `apply_topology`: nothing fails past here, so no unwind
+        // strands a moved workspace on a head error cleanup is about to remove.
         if let Some(prev) = self.prev_output.take() {
             adopt_active_workspace(&prev, &name);
         }
@@ -385,32 +297,26 @@ impl VirtualDisplay for HyprlandDisplay {
                 _stop: stop,
                 _output: output,
             }),
-            // Owned (the compositor output is ours to tear down), but not registry-poolable: the
-            // portal fd can't be re-opened per attach, so the registry passes it through on
-            // `remote_fd.is_some()` — same as wlroots.
+            // Owned, but not registry-poolable: the portal fd can't be re-opened
+            // per attach, so the registry passes it through on `remote_fd.is_some()`.
             ownership: DisplayOwnership::Owned,
             reused_gen: None,
             pool_gen: None,
             expect_exact_dims: false,
-            // Hyprland is an EXTEND topology: this head sits BESIDE the operator's, so absolute
-            // input has to be aimed at it by name or it lands on their screen. `hyprctl`'s monitor
-            // name is the head's `wl_output.name`, which is what the injector matches.
+            // Extend topology: this head sits beside the operator's, so absolute
+            // input has to be aimed at it by name. `hyprctl`'s monitor name is
+            // `wl_output.name`, which the injector matches.
             output_name: Some(name),
         })
     }
 }
 
-/// Drop order matters, and it is the whole fix: [`StopGuard`] **blocks until the ScreenCast session
-/// is actually closed**, and only then does [`OutputGuard`] remove the compositor output (fields drop
-/// in declaration order).
-///
-/// 🛑 THIS ORDERING USED TO BE A LIE. `StopGuard::drop` only set an atomic and returned, while the
-/// portal thread noticed it 200 ms later — so `OutputGuard::drop` ran `hyprctl output remove` on an
-/// output xdph was still actively capturing, every single teardown. See [`StopGuard`] for what that
-/// did to xdph.
+/// Drop order is the fix: [`StopGuard`] blocks until the ScreenCast session is
+/// closed, then [`OutputGuard`] removes the compositor output (fields drop in
+/// declaration order). The reverse removes an output xdph is still capturing.
 struct Keepalive {
-    /// First, so the watcher is gone before the cast stops and the output is removed — it must
-    /// never re-apply a monitor rule onto a head this same teardown is about to delete.
+    /// First so the watcher is gone before the cast stops and the output is
+    /// removed — it must never re-apply a rule onto a head this teardown deletes.
     _reload: Option<ReloadWatcher>,
     _stop: StopGuard,
     _output: OutputGuard,
@@ -418,24 +324,14 @@ struct Keepalive {
 
 /// Puts the streamed head's monitor rule back after a `hyprctl reload`.
 ///
-/// 🛑 **A reload drops EVERY runtime `hyprctl keyword`** (see [`restore_heads`], which relies on
-/// exactly that) — and [`set_monitor_rule`]'s mode is one of them. So a reload silently returns the
-/// streamed head to its default size mid-stream, and the client sees a resolution change nobody
-/// asked for. Nothing in Hyprland re-applies it.
+/// A reload drops every runtime `hyprctl keyword` (see [`restore_heads`]),
+/// including [`set_monitor_rule`]'s mode. The compositor does not re-apply it.
+/// Subscribes to the event socket rather than polling so an idle session costs
+/// nothing.
 ///
-/// On Omarchy that is not an edge case, it is routine: `omarchy-theme-set` ends in
-/// `omarchy-restart-hyprctl`, which is literally `hyprctl reload`, so **every theme switch reset the
-/// stream's resolution** (field report 2026-08-28). Resizing the client window appeared to fix it
-/// only because a resize on Linux re-creates the output, which runs [`set_monitor_rule`] again.
-///
-/// This subscribes to the compositor's own event socket rather than polling, so the rule is back
-/// within a round trip and an idle session costs nothing. Any reload gets it — the operator's own
-/// `hyprctl reload`, `omarchy-refresh-config`, a theme switch — not just the one that was reported.
-///
-/// ponytail: the MODE only. A reload also undoes `topology: exclusive`'s head disables, but
-/// re-disabling them from here risks a permanently dark desk: teardown's own [`restore_heads`] runs
-/// a `hyprctl reload` to re-light them, and this watcher lives on a different object than that
-/// restore does, so nothing orders the two. Re-apply the disables here once they share a lifetime.
+/// The MODE only. A reload also undoes `topology: exclusive` head disables, but
+/// re-disabling them here races teardown's [`restore_heads`] (`hyprctl reload`
+/// to re-light): the watcher and that restore do not share a lifetime.
 fn watch_config_reloads(name: String, mode: Mode) -> Option<ReloadWatcher> {
     let path = event_socket_path()?;
     let sock = match UnixStream::connect(&path) {
@@ -449,12 +345,11 @@ fn watch_config_reloads(name: String, mode: Mode) -> Option<ReloadWatcher> {
             return None;
         }
     };
-    // The guard's copy: shutting THIS down is what unparks the blocking read below.
+    // Shutting this clone down is what unparks the blocking read below.
     let stopper = sock.try_clone().ok()?;
     thread::spawn(move || {
         for line in std::io::BufReader::new(sock).lines() {
-            // A read error — the guard's shutdown, or the compositor going away — ends the watch.
-            // There is nothing left to re-apply a rule to in either case.
+            // Guard shutdown or compositor gone — nothing left to re-apply to.
             let Ok(line) = line else { return };
             if !is_config_reload(&line) {
                 continue;
@@ -464,8 +359,8 @@ fn watch_config_reloads(name: String, mode: Mode) -> Option<ReloadWatcher> {
                 "hyprland: config reloaded — re-applying the streamed head's monitor rule"
             );
             if let Err(e) = set_monitor_rule(&name, mode) {
-                // `set_monitor_rule` only errors when the head has no framebuffer at all, which
-                // after a reload means it is gone (teardown, or the compositor restarted). Stop.
+                // Errors only when the head has no framebuffer — gone after a
+                // reload (teardown, or compositor restart). Stop.
                 tracing::warn!(
                     output = %name, error = %format!("{e:#}"),
                     "hyprland: could not re-apply the monitor rule after a config reload — the \
@@ -478,11 +373,11 @@ fn watch_config_reloads(name: String, mode: Mode) -> Option<ReloadWatcher> {
     Some(ReloadWatcher(stopper))
 }
 
-/// Ends [`watch_config_reloads`]'s thread by shutting its socket down underneath it.
+/// Ends [`watch_config_reloads`]'s thread by shutting its socket down.
 ///
-/// The thread is parked in a blocking read, so a plain stop flag would leave it alive until the
-/// compositor happened to emit an event — one stranded thread per session, and sessions are minted
-/// on every mid-stream resize. `shutdown` makes that read return immediately.
+/// The thread is parked in a blocking read. A stop flag would leave it alive
+/// until the compositor emitted an event — one stranded thread per session,
+/// and sessions are minted on every mid-stream resize.
 struct ReloadWatcher(UnixStream);
 
 impl Drop for ReloadWatcher {
@@ -491,9 +386,9 @@ impl Drop for ReloadWatcher {
     }
 }
 
-/// Hyprland's event socket for the instance we are driving, or `None` when there is none to find.
-/// Same signature [`hyprctl_command`] threads onto every child, so the watch and the commands can
-/// never end up aimed at different compositors.
+/// Event socket for the instance we are driving. Same signature [`hyprctl_command`]
+/// threads onto every child, so the watch and the commands cannot aim at
+/// different compositors.
 fn event_socket_path() -> Option<std::path::PathBuf> {
     let sig = crate::session::hypr_signature()?;
     let runtime = crate::with_env_lock(|| std::env::var_os("XDG_RUNTIME_DIR"))
@@ -504,70 +399,39 @@ fn event_socket_path() -> Option<std::path::PathBuf> {
     Some(runtime.join("hypr").join(sig).join(".socket2.sock"))
 }
 
-/// Is this event line the config reload?
-///
-/// Hyprland's `.socket2.sock` speaks `<name>>><data>`, so the match is on the NAME. A `contains`
-/// would also fire on any event whose DATA happens to hold the word — a window titled
-/// `configreloaded`, a workspace named after it — and every false hit is a `hyprctl` round trip and
-/// a mode re-apply on a live stream.
+/// Hyprland's `.socket2.sock` speaks `<name>>><data>`. Match the NAME: a
+/// `contains` would also fire on a window titled `configreloaded`, and every
+/// false hit is a `hyprctl` round trip on a live stream.
 fn is_config_reload(line: &str) -> bool {
     line.split(">>").next() == Some("configreloaded")
 }
 
-/// How long teardown waits for the portal to confirm the ScreenCast session is closed before giving
-/// up and removing the output anyway. One D-Bus round trip through xdg-desktop-portal to xdph; three
-/// seconds is generous. Bounded on purpose: a portal that has already wedged must not be able to
-/// wedge the host's teardown with it — every other blocking helper on this path is bounded the same
-/// way (see [`HYPRCTL_BUDGET`]).
+/// How long teardown waits for ScreenCast close before removing the output
+/// anyway. One D-Bus round trip; three seconds is generous. Bounded so a
+/// wedged portal cannot wedge the host — same as every blocking helper on
+/// this path ([`HYPRCTL_BUDGET`]).
 const CAST_CLOSE_BUDGET: Duration = Duration::from_secs(3);
 
-/// Ends the cast: signals the portal thread, then **waits for it to have closed the ScreenCast
-/// session**, so the caller may safely remove the output afterwards.
-///
-/// 🛑 THE WAIT IS THE POINT — "only the first stream after a portal start works" on Hyprland was
-/// this, root-caused 2026-08-14 against Hyprland 0.55.4 + xdph 1.3.12 + xdg-desktop-portal 1.20.4.
-///
-/// This used to be a bare `AtomicBool` that `drop` merely SET. The portal thread polled it every
-/// 200 ms and then just dropped its zbus connection, and xdph destroys a session on exactly one
-/// event — an explicit `org.freedesktop.impl.portal.Session.Close` (`Session.cpp:37`,
-/// `onCloseSession`); it has no peer-vanished watcher of its own. The frontend does have one
-/// (`xdg-desktop-portal.c:230` `peer_died_cb` → `close_sessions_for_sender`), but it only fires once
-/// our unique bus name goes away, which is *after* the 200 ms poll, and it runs asynchronously on a
-/// GTask thread. Meanwhile `OutputGuard::drop` had already removed the output — synchronously,
-/// microseconds after the flag was set.
-///
-/// So every teardown destroyed the `wl_output` out from under a live screencopy session. xdph's next
-/// `Start` then built a PipeWire stream against that wreckage and fell into
-///
-/// ```text
-/// while (pSession->sharingData.nodeID == SPA_ID_INVALID) {      // Screencopy.cpp:307-313
-///     int ret = pw_loop_iterate(g_pPortalManager->m_sPipewire.loop, 0);   // timeout 0 = NON-blocking
-/// ```
-///
-/// — an unbounded hot spin on xdph's ONLY event-loop thread, inside the `Start` handler, holding its
-/// `m_mEventLock`. From that moment xdph answers no D-Bus, no Wayland and no PipeWire, ever again, and
-/// every later `select_and_cast` dies on our 20 s timeout. MEASURED on the box: the wedged instance's
-/// unit reported `Consumed 3min 51.971s CPU time over 23min 41.092s wall clock`, and there were
-/// exactly 232.7 s of wall clock between its last log flush and its restart — 231.971 s of CPU
-/// against 232.7 s of wall, i.e. one core pinned solid for precisely the wedged interval.
-///
-/// Waiting here closes that window: `Session.Close` is answered synchronously by the frontend
-/// (`xdp-session.c:217` `handle_close` → `xdp_session_close` →
-/// `xdp_dbus_impl_session_call_close_sync`), so by the time `close()` returns, xdph has already run
-/// `destroyStream` and logged `Session destroyed`. The output we remove next is one nobody is
-/// capturing.
-/// How many casts of ours are live right now. The picker config is borrowed for exactly as long as
-/// this is non-zero (design D6(b): restore "the moment no punktfunk session needs the shim"), and a
-/// host that streams two outputs at once must not hand the picker back when the first one ends.
+/// Live casts of ours. The picker config is borrowed while this is non-zero;
+/// a host streaming two outputs must not hand the picker back when the first ends.
 static LIVE_CASTS: AtomicU32 = AtomicU32::new(0);
 
+/// Ends the cast: signals the portal thread, then waits for ScreenCast close
+/// so the caller may remove the output afterwards.
+///
+/// The wait is the point. xdph destroys a session only on explicit
+/// `org.freedesktop.impl.portal.Session.Close`; it has no peer-vanished
+/// watcher. Dropping a flag and removing the output while xdph is still
+/// capturing wedges its event-loop thread (unbounded `pw_loop_iterate` with
+/// timeout 0 inside `Start`). Waiting until `close()` returns means the
+/// output we remove next is one nobody is capturing.
 struct StopGuard {
     stop: Arc<AtomicBool>,
-    /// Signalled by the portal thread once it has closed the ScreenCast session.
+    /// Signalled once the portal thread has closed the ScreenCast session.
     ///
-    /// `None` on every path where no cast was ever established (a rejected or timed-out handshake):
-    /// there is nothing to close, and a portal that just failed to answer for 20 s is precisely the
-    /// one that would burn the whole budget here for nothing.
+    /// `None` when no cast was established (rejected or timed-out handshake):
+    /// nothing to close, and a portal that just failed for 20 s would burn
+    /// this budget for nothing.
     closed: Option<std::sync::mpsc::Receiver<()>>,
 }
 
@@ -575,34 +439,22 @@ impl Drop for StopGuard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         let Some(closed) = self.closed.take() else {
-            // No cast was ever established, so this guard never counted toward [`LIVE_CASTS`] —
-            // the increment happens in the same arm that arms `closed`.
+            // Never counted toward [`LIVE_CASTS`] — the increment is in the
+            // same arm that arms `closed`.
             return;
         };
         LIVE_CASTS.fetch_sub(1, Ordering::SeqCst);
-        // 🛑 **Do NOT hand the picker back here.** Restoring per-cast means the NEXT session finds
-        // the config changed, rewrites it, and restarts xdph — and a ScreenCast bound across an
-        // xdph restart never delivers a buffer. The portal runtime caches its D-Bus connection
-        // process-globally (see `portal_thread`), so the restart orphans the cached connection and
-        // the handshake then succeeds against a session nothing is alive to serve. Measured on
-        // Omarchy 4.0.1: every session after the first died on
-        // `no PipeWire frame within 10s … format negotiated but no buffers arrived`, which is a
-        // black screen on the client, with xdph's own log showing it starting up mid-cast.
-        //
-        // Leaving the shim installed is safe precisely because it DELEGATES: with no selection
-        // pending it execs the picker that was there before us, so an ordinary browser share
-        // behaves exactly as it did. That is what D6 actually asks for — the user's screen sharing
-        // keeps working — and it is why the takeover can be idempotent instead of churning.
-        // The config is put back by `punktfunk-omarchy remove`, from the marker we wrote.
+        // Do not restore the picker here. Per-cast restore rewrites the config
+        // and restarts xdph; a ScreenCast bound across that restart never
+        // delivers a buffer (D-Bus connection is process-global). The shim
+        // delegates when idle; `punktfunk-omarchy remove` puts the config back.
         match closed.recv_timeout(CAST_CLOSE_BUDGET) {
-            // Closed — xdph has torn the capture down, the output is safe to remove.
             Ok(()) => {}
-            // The thread is gone without confirming (it panicked, or the runtime died). Nothing is
-            // holding the cast either way, so there is nothing left to wait for.
+            // Thread gone without confirming (panic or runtime death). Nothing
+            // is holding the cast either way.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
-            // Still going after the budget. Fall through and remove the output anyway — a leaked
-            // output is worse than a racy one — but say so, because this is the state that wedges
-            // xdph and the next session will be the one that pays for it.
+            // Budget expired. A leaked output is worse than a racy one; this
+            // is the state that wedges xdph, and the next session pays for it.
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
                 budget_s = CAST_CLOSE_BUDGET.as_secs(),
                 "the ScreenCast session did not close in time — removing the output underneath it, \
@@ -612,24 +464,21 @@ impl Drop for StopGuard {
     }
 }
 
-/// Remove the `PF-<pid>-<n>` outputs left behind by host processes that are **gone**, once per
-/// process before we create our first.
+/// Remove `PF-<pid>-<n>` outputs whose owner pid is gone, once per process
+/// before we create our first.
 ///
-/// [`OutputGuard::drop`] is the only unplug path there is, so a host that was SIGKILLed, OOM-killed
-/// or crashed leaves its headless outputs in the compositor for as long as the Hyprland session
-/// lives — a dead `PF-…` head in the operator's layout, forever, with the next host start happily
-/// adding more beside it. Reclaim is keyed on the OWNER pid in the name and only removes an output
-/// whose creator no longer exists, so a second live host on the same session (or this very process)
-/// can never have its output pulled out from under it. `Once` puts the sweep strictly before this
-/// process owns anything, and blocks a concurrent first `create` until it is done.
+/// [`OutputGuard::drop`] is the only unplug, so a SIGKILLed host leaves heads
+/// in the compositor for the session's life. Keyed on the owner pid so a
+/// second live host (or this process) cannot have its output pulled. `Once`
+/// puts the sweep strictly before this process owns anything.
 fn reclaim_leftovers_once() {
     static RECLAIMED: Once = Once::new();
     RECLAIMED.call_once(|| {
         let Ok(names) = monitor_names() else { return };
         for name in names {
             let Some(pid) = output_owner_pid(&name) else {
-                // Either not ours, or a legacy `PF-<n>` with no owner recorded — which we must not
-                // remove on a guess, because a still-running older host may be streaming it.
+                // Not ours, or legacy `PF-<n>` with no owner — a still-running
+                // older host may be streaming it.
                 if is_managed_output(&name) {
                     tracing::debug!(output = %name, "a managed headless output with no owner pid in \
                          its name (an older host build) — left alone");
@@ -649,40 +498,18 @@ fn reclaim_leftovers_once() {
     });
 }
 
-/// Point Hyprland's focus at the head we are about to stream, so the windows this session opens
-/// land where the client can see them.
+/// Point Hyprland's focus at the head we are about to stream.
 ///
-/// Hyprland opens a new window on the **active workspace of the focused monitor**, and
-/// `output create headless` does not focus what it creates — focus stays wherever it already was,
-/// which on any box with a physical head is that head. Nothing else in the session ever moves it:
-/// the client's pointer is confined to the streamed output (the #240 cursor fix), so no amount of
-/// remote mouse motion can focus-follows-mouse its way over, and no window rule names our output.
-/// So without this, every app the host launches for the session — the whole game library — opens on
-/// a monitor the client cannot see, and the stream shows a bare desktop. This is the EXTEND-topology
-/// answer to that: it steers window placement without touching the operator's heads — which is also
-/// the whole of what `topology: primary` can mean here (see [`warn_primary_is_not_expressible`]).
-/// Under `exclusive` it is called a second time, after the heads are disabled, because that moves
-/// focus (see [`disable_other_heads`]).
+/// New windows open on the focused monitor's active workspace, and
+/// `output create headless` does not focus what it creates. The client's
+/// pointer is confined to the streamed output, so focus-follows-mouse cannot
+/// reach it. An unfocused headless output stays empty, empty produces no
+/// damage, and no damage means no PipeWire frames.
 ///
-/// Best-effort by construction: a failure costs window placement, not the session, and a box with no
-/// physical head was already placing windows correctly.
-///
-/// Two eras, same [`dpms_one`] shape and for the same reason. The classic
-/// `hyprctl dispatch focusmonitor <name>` is what a hyprlang box wants; under the **Lua** config
-/// manager `dispatch` is shorthand for `hl.dispatch(...)`, so those bare words parse as a Lua
-/// expression and die with `')' expected near '<name>'`.
-///
-/// ⭐ The Lua spelling is **`hl.dsp.focus({ monitor = "<name>" })`** — measured on Omarchy 4.0.1
-/// (Hyprland 0.56.2) 2026-08-28. The older note here said the fix could not reach a Lua box
-/// because "`hl.dsp.focusmonitor` does not exist"; that is true, and it was the wrong name. The
-/// compositor says so itself when asked with any other key:
-/// *"hl.focus: unrecognized arguments. Expected one of: direction, monitor, window,
-/// urgent_or_last, last"*.
-///
-/// This is not only about window placement on Omarchy. A headless output nothing has focused
-/// stays empty, an empty output produces no damage, and no damage means **no PipeWire frames** —
-/// the capture then fails its first-frame deadline and the client sees a black screen. So try
-/// classic, then Lua, and report both if neither lands.
+/// Classic `hyprctl dispatch focusmonitor <name>` for hyprlang. Under the Lua
+/// config manager `dispatch` is `hl.dispatch(...)`, so those bare words die
+/// with `')' expected near '<name>'`. Lua spelling is
+/// `hl.dsp.focus({ monitor = "<name>" })`. Try classic, then Lua.
 pub(crate) fn focus_output(name: &str) {
     let classic = match hyprctl_dispatch(&focus_argv(name)) {
         Ok(()) => None,
@@ -702,33 +529,24 @@ pub(crate) fn focus_output(name: &str) {
     }
 }
 
-/// The Lua-config-manager spelling of "focus this monitor". Pure, so a test pins the shape: the
-/// quoting and the `monitor =` key are the whole trick, and an unquoted argument is exactly what
-/// the classic form gets wrong on that manager.
+/// Lua-config-manager spelling of "focus this monitor". Pure so a test pins
+/// the shape: quoting and the `monitor =` key are the whole trick.
 fn lua_focus_expr(name: &str) -> String {
     format!("hl.dsp.focus({{ monitor = \"{name}\" }})")
 }
 
-/// The `hyprctl` argv that focuses `name`, split out so a test pins its SHAPE.
+/// `hyprctl` argv that focuses `name`, split so a test pins its shape.
 ///
-/// `focusmonitor` is a **dispatcher**, so it lives behind the `dispatch` subcommand. Getting that
-/// wrong is the one mistake here that no type can catch and that reads as success from the outside:
-/// `hyprctl` answers an unknown subcommand with an exit-0 error string (see [`hyprctl_dispatch`],
-/// which exists for exactly that), and the field symptom would be identical to the bug this fixes —
-/// a bare streamed desktop with every launched app on the operator's monitor.
+/// `focusmonitor` is a dispatcher — it lives behind `dispatch`. A bare
+/// `hyprctl focusmonitor` answers `unknown request` at exit 0
+/// ([`hyprctl_dispatch`]).
 fn focus_argv(name: &str) -> [&str; 3] {
     ["dispatch", "focusmonitor", name]
 }
 
-/// `topology: primary` has no expression on this compositor, and saying so once per create is the
-/// honest implementation (design §5.2 gives the whole wlr family "**unsupported** (no primary
-/// concept) → log + treat as extend").
-///
-/// Wayland has no primary-output concept at all, and Hyprland's nearest equivalent is the *focused*
-/// monitor — which [`focus_output`] already points at the streamed head for every session, whatever
-/// the topology says. So `primary` is not silently dropped so much as already granted, as far as
-/// this compositor can express it; what an operator does NOT get is a persistent designation other
-/// clients can read. Distinct from the `exclusive` path, which really does change the desk.
+/// `topology: primary` has no expression here. Wayland has no primary output;
+/// Hyprland's nearest is the focused monitor, which [`focus_output`] already
+/// points at the streamed head. Distinct from `exclusive`, which changes the desk.
 fn warn_primary_is_not_expressible() {
     tracing::info!(
         "hyprland: `topology: primary` has no equivalent here — Wayland has no primary output and \
@@ -737,14 +555,11 @@ fn warn_primary_is_not_expressible() {
     );
 }
 
-/// Which heads an `exclusive` topology should disable: enabled, not ours, and **not managed**.
+/// Which heads `exclusive` should disable: enabled, not ours, not managed.
 ///
-/// Pure so the group-awareness rule (design §6.1 — "exclusive means the *managed virtual displays*
-/// are the only enabled outputs; never disable a sibling slot") is unit-testable without a
-/// compositor. `managed` comes from [`list_monitors`], i.e. [`is_managed_output`]: `PF-<pid>-<n>`,
-/// which covers a SECOND host's outputs as well as our own, so a concurrent session's screen can
-/// never be blacked out by ours. `ours` is excluded by name too — belt and braces, since our own
-/// output is managed by construction and the one head that must survive.
+/// Pure so the group-awareness rule is unit-testable without a compositor.
+/// `managed` is [`is_managed_output`], covering a second host's outputs, so a
+/// concurrent session cannot be blacked out. `ours` is excluded by name too.
 fn heads_to_disable(heads: &[crate::monitors::PhysicalMonitor], ours: &str) -> Vec<String> {
     heads
         .iter()
@@ -753,20 +568,14 @@ fn heads_to_disable(heads: &[crate::monitors::PhysicalMonitor], ours: &str) -> V
         .collect()
 }
 
-/// DPMS every head that is not ours and not a sibling's off (or back on), for a **gamescope**
+/// DPMS every head that is not ours and not a sibling's, for a **gamescope**
 /// session honoring `Topology::Exclusive` — see [`crate::panel_dpms`].
 ///
-/// Distinct from [`disable_other_heads`], which is what the *Hyprland backend's own* exclusive
-/// topology does, and deliberately so on this compositor above all: disabling a Hyprland head is
-/// the operation whose only known undo is re-reading the operator's whole config
-/// ([`restore_heads`]), dropping every runtime override they set by hand. DPMS is a separate axis
-/// — this module's own notes record `dispatch dpms on <name>` failing to re-enable a *disabled*
-/// head for exactly that reason — so off/on round-trips cleanly and touches nothing else.
-///
-/// A gamescope spawn owns no Hyprland output, hence the empty `ours`; a concurrent session's
-/// `HEADLESS-*` is still spared by [`heads_to_disable`]'s `managed` filter.
-///
-/// Returns the heads actually changed, so the re-light undoes exactly those.
+/// Distinct from [`disable_other_heads`]: disabling a Hyprland head's only
+/// known undo is re-reading the operator's whole config ([`restore_heads`]),
+/// dropping every runtime override. DPMS is a separate axis (`dispatch dpms on
+/// <name>` does not re-enable a *disabled* head). A gamescope spawn owns no
+/// Hyprland output, hence empty `ours`.
 pub(crate) fn dpms_other_heads(on: bool) -> Vec<String> {
     let Ok(heads) = list_monitors() else {
         return Vec::new();
@@ -774,9 +583,9 @@ pub(crate) fn dpms_other_heads(on: bool) -> Vec<String> {
     let mut changed = Vec::new();
     for name in heads_to_disable(&heads, "") {
         match dpms_one(&name, on) {
-            // Only a head THIS call moved is recorded: one already in the wanted state was left
-            // alone (the dispatcher toggles, so "fixing" it would break it), and reporting it as
-            // changed would have the re-light toggle a head we never darkened.
+            // Only a head this call moved. The dispatcher toggles, so "fixing"
+            // one already in the wanted state would break it, and the re-light
+            // would then toggle a head we never darkened.
             Ok(true) => changed.push(name),
             Ok(false) => {}
             Err(e) => tracing::warn!(
@@ -788,12 +597,9 @@ pub(crate) fn dpms_other_heads(on: bool) -> Vec<String> {
     changed
 }
 
-/// The DPMS state Hyprland reports for `name` right now — `hyprctl -j monitors all`'s
-/// `dpmsStatus`. `None` when the monitor is not listed or the field is missing.
-///
-/// Measured on 0.55.4: this tracks the hardware exactly (`dpmsStatus:true` ⇔ the connector's sysfs
-/// `dpms=On`), in both states, and a DPMS-off monitor stays listed. It is the readback
-/// [`dpms_one`] is built around.
+/// DPMS state Hyprland reports for `name` (`hyprctl -j monitors all`'s
+/// `dpmsStatus`). `None` when unlisted or the field is missing. A DPMS-off
+/// monitor stays listed — the readback [`dpms_one`] is built around.
 fn monitor_dpms(name: &str) -> Option<bool> {
     let raw = hyprctl(&["-j", "monitors", "all"]).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -805,34 +611,20 @@ fn monitor_dpms(name: &str) -> Option<bool> {
         .as_bool()
 }
 
-/// Put ONE monitor into `want_on`, reporting whether this call actually changed it.
+/// Put one monitor into `want_on`, reporting whether this call changed it.
 ///
-/// ⚠ **The dispatcher is a TOGGLE, not a set** — measured on 0.55.4 (Lua) 2026-08-24, and the
-/// single most important fact in this function. It ignores the state word entirely:
+/// The dispatcher is a toggle, not a set — it ignores the state word. A blind
+/// "off" lights an already-dark head; a blind "on" at teardown darkens a lit
+/// one. Read → act only if it differs → verify. That shape is also correct
+/// where the call really is a set.
 ///
-/// ```text
-/// On  ==[ hl.dsp.dpms("on",  "HDMI-A-1") ]==>  Off      <- asked for ON, got OFF
-/// Off ==[ hl.dsp.dpms("on",  "HDMI-A-1") ]==>  On
-/// Off ==[ hl.dsp.dpms{state="off", ...}  ]==>  On       <- asked for OFF, got ON
-/// ```
-///
-/// So a blind "off" LIGHTS an already-dark head, and a blind "on" at teardown DARKENS a lit one —
-/// the operator's screen left off after the stream, which is the failure this whole policy exists
-/// to avoid. Hence read → act only if it differs → verify. That shape is also correct on a
-/// config manager where the call really is a set, so it is not conditional on detecting which.
-///
-/// The SPELLING differs too. The classic `hyprctl dispatch dpms off <name>` does not work on the
-/// Lua manager at all: `dispatch` is shorthand for `hl.dispatch(...)`, so the bare words parse as
-/// a Lua expression and it dies with `')' expected near 'off'`. A hyprlang box (0.56.2 was probed
-/// as one) wants the classic form. There is no stable probe for which manager is loaded, and
-/// [`hyprctl_dispatch`] already catches the exit-0 rejections both produce — so try classic, then
-/// Lua, and report both failures if neither lands.
-///
-/// ⚠ **Never omit the monitor name.** `hl.dsp.dpms("on")` answers `ok` and toggles *something*;
-/// with a name it is at least addressed at the head we mean.
+/// Classic `hyprctl dispatch dpms off <name>` dies under Lua (`dispatch` is
+/// `hl.dispatch(...)`). No stable probe for which manager is loaded, so try
+/// classic, then Lua. Never omit the monitor name: `hl.dsp.dpms("on")` answers
+/// `ok` and toggles *something*.
 fn dpms_one(name: &str, want_on: bool) -> Result<bool> {
     if monitor_dpms(name) == Some(want_on) {
-        return Ok(false); // already where we want it — toggling would break it
+        return Ok(false); // toggling would break it
     }
     let classic =
         match hyprctl_dispatch(&["dispatch", "dpms", if want_on { "on" } else { "off" }, name]) {
@@ -848,8 +640,8 @@ fn dpms_one(name: &str, want_on: bool) -> Result<bool> {
     if let Some(why) = classic {
         bail!("neither dispatch form was accepted for {name} — {why}");
     }
-    // Verify, because a toggle that fired against a state we misread is worse than one that did
-    // not fire at all.
+    // Verify: a toggle that fired against a state we misread is worse than one
+    // that did not fire at all.
     match monitor_dpms(name) {
         Some(now) if now == want_on => Ok(true),
         Some(now) => bail!(
@@ -860,9 +652,8 @@ fn dpms_one(name: &str, want_on: bool) -> Result<bool> {
     }
 }
 
-/// The Lua-config-manager spelling of a per-monitor DPMS. Pure, so a test pins the shape — the
-/// quoting is the whole trick, and an unquoted argument is exactly what the classic form gets
-/// wrong on that manager.
+/// Lua-config-manager spelling of per-monitor DPMS. Pure so a test pins the
+/// shape — quoting is the whole trick.
 fn lua_dpms_expr(name: &str, on: bool) -> String {
     format!(
         "hl.dsp.dpms(\"{}\", \"{name}\")",
@@ -870,9 +661,8 @@ fn lua_dpms_expr(name: &str, on: bool) -> String {
     )
 }
 
-/// The active workspace id Hyprland reports for monitor `name` — `hyprctl -j monitors`'s
-/// `activeWorkspace.id`. `None` when the monitor is not listed (already removed) or the field is
-/// missing.
+/// Active workspace id for monitor `name` (`hyprctl -j monitors`). `None` when
+/// the monitor is already gone or the field is missing.
 fn active_workspace_id(name: &str) -> Option<i64> {
     let raw = hyprctl(&["-j", "monitors"]).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -885,26 +675,21 @@ fn active_workspace_id(name: &str) -> Option<i64> {
         .as_i64()
 }
 
-/// Move the ACTIVE workspace of the head this create supersedes onto the new head, then switch
+/// Move the superseded head's active workspace onto the new head, then switch
 /// the new head to it.
 ///
-/// Hyprland assigns every new monitor a fresh empty workspace and re-homes a removed monitor's
-/// workspaces elsewhere — so a resize's head swap left the client staring at an empty workspace
-/// while the session's windows sat on whatever monitor inherited the old one (measured on the .6
-/// box, Hyprland 0.56.2/Lua: create → new head gets the next free id; remove → the old
-/// workspace re-homes; nothing follows the stream). Two dispatches because `workspace.move` alone
-/// does NOT activate the moved workspace on its target (measured: the target kept its own).
-///
-/// When the predecessor is no longer listed this is a reconnect after teardown, not a live
-/// resize — nothing to carry, so it returns without dispatching. Best-effort throughout: a
-/// failure costs workspace continuity, never the stream.
+/// Hyprland assigns every new monitor an empty workspace and re-homes a
+/// removed monitor's workspaces elsewhere. Two dispatches: `workspace.move`
+/// does not activate the moved workspace on its target. When the predecessor
+/// is no longer listed this is a reconnect, not a live resize — nothing to
+/// carry. Best-effort: a failure costs workspace continuity, never the stream.
 fn adopt_active_workspace(prev: &str, ours: &str) {
     let Some(id) = active_workspace_id(prev) else {
         return;
     };
     let ws = id.to_string();
-    // Classic first, Lua on rejection — same blind two-era probe as [`focus_output`]/[`dpms_one`]
-    // (there is no stable way to ask which config manager is loaded).
+    // Classic first, Lua on rejection — same two-era probe as [`focus_output`]
+    // / [`dpms_one`]. There is no stable way to ask which config manager is loaded.
     let both = |classic: &[&str], lua: &str| -> Result<()> {
         match hyprctl_dispatch(classic) {
             Ok(()) => Ok(()),
@@ -934,10 +719,10 @@ fn adopt_active_workspace(prev: &str, ours: &str) {
         );
         return;
     }
-    // Verify like `dpms_one`: both dispatchers answer `ok` even when the era mismatch made them
-    // do nothing, so the readback is the only real signal. An EMPTY adopted workspace evaporates
-    // on the move and the switch then re-creates it on the focused (new) head — converging on the
-    // same id — so the readback holds for that case too.
+    // Both dispatchers answer `ok` even when the era mismatch made them do
+    // nothing, so the readback is the only real signal. An empty adopted
+    // workspace evaporates on the move and the switch re-creates it on the
+    // focused (new) head — same id, so the readback holds for that case too.
     match active_workspace_id(ours) {
         Some(now) if now == id => tracing::info!(
             workspace = id, from = %prev, to = %ours,
@@ -951,25 +736,20 @@ fn adopt_active_workspace(prev: &str, ours: &str) {
     }
 }
 
-/// The Lua-config-manager spelling of "move workspace N to monitor M". Pure, so a test pins the
-/// shape: the workspace is a quoted STRING (Omarchy's own SUPER+SHIFT+n binds pass strings, and
-/// that is the measured-working form), and the monitor name is quoted for the same reason as
-/// [`lua_focus_expr`].
+/// Lua spelling of "move workspace N to monitor M". Pure so a test pins the
+/// shape: workspace is a quoted string, monitor quoted as in [`lua_focus_expr`].
 fn lua_workspace_move_expr(ws: &str, monitor: &str) -> String {
     format!("hl.dsp.workspace.move({{ workspace = \"{ws}\", monitor = \"{monitor}\" }})")
 }
 
-/// The Lua-config-manager spelling of "switch to workspace N" — `hl.dsp.focus` with a `workspace`
-/// argument. Its unrecognized-arguments error does not list `workspace`, but Omarchy's own
-/// SUPER+n binds use exactly this form and it was measured working on 0.56.2; there is no
-/// `hl.dsp.workspace.*` member that switches.
+/// Lua spelling of "switch to workspace N" — `hl.dsp.focus` with a `workspace`
+/// argument. There is no `hl.dsp.workspace.*` member that switches.
 fn lua_workspace_focus_expr(ws: &str) -> String {
     format!("hl.dsp.focus({{ workspace = \"{ws}\" }})")
 }
 
-/// Disable every non-managed head for an `exclusive` session, returning the ones actually disabled
-/// (the input to [`restore_heads`]). Best-effort per head: one that refuses costs exclusivity on
-/// that screen, not the session.
+/// Disable every non-managed head for an `exclusive` session, returning the
+/// ones actually disabled (input to [`restore_heads`]). Best-effort per head.
 fn disable_other_heads(ours: &str) -> Vec<String> {
     let heads = match list_monitors() {
         Ok(h) => h,
@@ -1005,23 +785,18 @@ fn disable_other_heads(ours: &str) -> Vec<String> {
             ?disabled,
             "hyprland: `topology: exclusive` — the streamed output is now the desk"
         );
-        // Disabling heads re-homes their workspaces, and the compositor picks the replacement
-        // focus itself. Re-assert ours so window placement still lands on the stream (the #283
-        // contract) rather than on whichever head Hyprland happened to choose.
+        // Disabling re-homes workspaces and the compositor picks the new
+        // focus. Re-assert ours so window placement still lands on the stream.
         focus_output(ours);
     }
     disabled
 }
 
-/// Disable one head, supporting **both config eras** and confirming by read-back.
+/// Disable one head, both config eras, confirming by read-back.
 ///
-/// Same two-era shape as [`set_monitor_rule`], and for the same reason: `hyprctl keyword` is the
-/// hyprlang form and is *rejected outright* under the Lua config manager ("keyword can't work with
-/// non-legacy parsers. Use eval."), while `hyprctl eval` is rejected under hyprlang ("eval is only
-/// supported with the lua config manager"). Both rejections come back at **exit 0**, so the read-back
-/// — not the exit status, and not the `ok` — is what decides. Measured 2026-08-18 on Hyprland
-/// 0.56.2 (hyprlang, `.21`) and 0.55.4 (Lua, `.138`); both spellings disable, both verified by
-/// `disabled: true` in `hyprctl -j monitors all`.
+/// Same two-era shape as [`set_monitor_rule`]: `hyprctl keyword` is rejected
+/// under Lua; `hyprctl eval` is rejected under hyprlang. Both at **exit 0**,
+/// so the read-back — not the exit status — decides.
 fn disable_head(name: &str) -> Result<()> {
     let spec = disable_rule_spec(name);
     let lua = disable_lua_expr(name);
@@ -1045,23 +820,21 @@ fn disable_head(name: &str) -> Result<()> {
     bail!("no hyprctl form disabled {name}: {}", attempts.join("; "))
 }
 
-/// The **hyprlang** disable rule for `name` (`hyprctl keyword monitor <this>`), split out so a test
-/// pins its shape. `disable` is a whole-rule verb and replaces the resolution field — there is no
-/// `<name>,<mode>,disable`, and (measured) no `<name>,enable` to undo it.
+/// Hyprlang disable rule (`hyprctl keyword monitor <this>`). `disable` is a
+/// whole-rule verb — there is no `<name>,<mode>,disable`, and no `<name>,enable`
+/// to undo it.
 fn disable_rule_spec(name: &str) -> String {
     format!("{name},disable")
 }
 
-/// The **Lua** disable rule for `name` (`hyprctl eval <this>`), split out so a test pins its shape.
-///
-/// The field is `disabled` (past tense) and takes a boolean. Measured on .138: `disable = true` is
-/// rejected with "unknown field 'disable'", and `mode = "disable"` with "error applying field
-/// 'mode'" — the hyprlang spelling does not carry over, so this is not a place to guess.
+/// Lua disable rule (`hyprctl eval <this>`). The field is `disabled` (past
+/// tense) and takes a boolean — `disable = true` and `mode = "disable"` are
+/// rejected, so this is not a place to guess from the hyprlang spelling.
 fn disable_lua_expr(name: &str) -> String {
     format!("hl.monitor{{ output = \"{name}\", disabled = true }}")
 }
 
-/// Poll until `name` reports `disabled: true` (the rule applies asynchronously), up to `timeout`.
+/// Poll until `name` reports `disabled: true` (the rule applies asynchronously).
 fn wait_head_disabled(name: &str, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -1075,9 +848,9 @@ fn wait_head_disabled(name: &str, timeout: Duration) -> bool {
     }
 }
 
-/// Is head `name` currently enabled? `None` if it is not present at all. Reads `-j monitors all`,
-/// which is the only listing that includes a DISABLED head (the plain `-j monitors` drops it, so
-/// asking that one "is it disabled?" cannot distinguish disabled from unplugged).
+/// Is head `name` enabled? `None` if absent. Reads `-j monitors all` — the
+/// plain listing drops a disabled head, so it cannot distinguish disabled
+/// from unplugged.
 fn head_is_enabled(name: &str) -> Result<Option<bool>> {
     let out = hyprctl(&["-j", "monitors", "all"])?;
     let monitors: serde_json::Value =
@@ -1095,39 +868,22 @@ fn head_is_enabled(name: &str) -> Result<Option<bool>> {
     Ok(None)
 }
 
-/// How long a `disable` (or the `reload` that undoes it) has to show up in `hyprctl -j monitors
-/// all`. Generous next to the measured near-instant apply; a miss is reported, never assumed.
+/// How long a `disable` (or the `reload` that undoes it) has to show up in
+/// `hyprctl -j monitors all`. A miss is reported, never assumed.
 const DISABLE_BUDGET: Duration = Duration::from_secs(3);
 
-/// Re-enable the heads an `exclusive` session disabled. Run by the REGISTRY when the display
-/// group's last member is torn down (design §6.1) and, critically, **before** that member's output
-/// is removed — so Hyprland never sees zero enabled outputs.
+/// Re-enable the heads an `exclusive` session disabled. Run **before** that
+/// member's output is removed, so Hyprland never sees zero enabled outputs.
 ///
-/// 🛑🛑 **`hyprctl reload` is the only thing that re-enables a disabled head, and that is measured,
-/// not chosen.** The obvious restore — re-apply the head's own mode/position/scale, which is what
-/// `design/display-management.md` §5.2 assumes and what the issue (#284) proposed — **does not
-/// work**: it answers `ok` and leaves `disabled: true`. Probed 2026-08-18 against Hyprland 0.56.2
-/// (hyprlang) and 0.55.4 (Lua); every one of these was accepted and changed nothing:
+/// `hyprctl reload` is the only thing that re-enables a disabled head. Re-
+/// applying the mode/position/scale answers `ok` and leaves `disabled: true`;
+/// a runtime `monitor` rule is additive and the `disable` in it keeps winning.
+/// Only re-reading the config clears runtime rules.
 ///
-/// * `keyword monitor <name>,<W>x<H>@<Hz>,<x>x<y>,<scale>` (the exact pre-disable rule)
-/// * `keyword monitor <name>,preferred,auto,1`
-/// * `keyword monitor <name>,enable` — not a verb: answers `invalid resolution`
-/// * `keyword monitorv2 output=<name>,…,disabled=false`
-/// * `keyword unset monitor`
-/// * `eval 'hl.monitor{ output = "<name>", disabled = false, … }'` (the Lua twin)
-/// * `dispatch dpms on <name>` — DPMS is a different axis; the head stays disabled
-/// * `dispatch forcerendererreload`
-///
-/// A runtime `monitor` rule is additive, and the `disable` in it keeps winning; only re-reading the
-/// config clears the runtime rules. So the restore is the operator's own config, re-applied — which
-/// for a config-driven compositor is exactly what "put it back how it was" means.
-///
-/// ⚠️ The side effects are real and worth knowing: a reload drops **every** runtime `hyprctl
-/// keyword`/`eval` override, including our own monitor rule for the streamed output (harmless — the
-/// output is removed moments later by the same teardown) and any the operator set by hand; and on a
-/// hyprlang config it re-runs `exec =` lines (`exec-once` is not re-run, and a Lua config's
-/// `hl.on("hyprland.start", …)` autostart does not re-fire either). This runs ONLY when we actually
-/// disabled something, so a box that never used `exclusive` never pays it.
+/// A reload drops every runtime `hyprctl keyword`/`eval` override, including
+/// our streamed-output rule (harmless — teardown removes the output next) and
+/// any the operator set by hand; a hyprlang config re-runs `exec =` lines
+/// (`exec-once` does not). Runs only when we actually disabled something.
 fn restore_heads(disabled: &[String]) {
     if let Err(e) = hyprctl_dispatch(&["reload"]) {
         tracing::error!(
@@ -1137,9 +893,8 @@ fn restore_heads(disabled: &[String]) {
         );
         return;
     }
-    // Report the OUTCOME, not the request: `reload` answers `ok` for "config parsed", which is not
-    // the same as "the head came back" (a head the operator's own config disables stays disabled,
-    // correctly). Read it back so a field report says which screens actually returned.
+    // `reload` answers `ok` for "config parsed", not "the head came back" (a
+    // head the operator's own config disables stays disabled). Read it back.
     let deadline = Instant::now() + DISABLE_BUDGET;
     let still_dark = loop {
         let dark: Vec<&String> = disabled
@@ -1165,7 +920,6 @@ fn restore_heads(disabled: &[String]) {
     }
 }
 
-/// Owns the created headless output; dropping it removes it from Hyprland.
 struct OutputGuard(String);
 
 impl Drop for OutputGuard {
@@ -1179,29 +933,25 @@ impl Drop for OutputGuard {
     }
 }
 
-/// Budget for one `hyprctl` call ([`crate::proc`]).
-///
-/// `hyprctl` is a client of the compositor it drives — it connects to the instance socket and waits
-/// for a reply, so against a wedged Hyprland it never returns. These calls run on the session's
-/// stream thread, whose only way to end a session is to return, so one hung query used to wedge the
-/// session for good. Generous next to a healthy call (single-digit milliseconds), and every call
-/// site already has a failed-query path.
-/// Ceiling on the whole ScreenCast handshake (`create_session` → `select_sources` → `start` →
-/// `open_pipe_wire_remote`). Deliberately under [`select_and_cast`]'s 20 s wait so a stuck portal is
-/// reported by the thread that owns it, with a reason, instead of the caller timing out on it — and,
-/// far more importantly, so that thread EXITS. See the note at the handshake itself.
+/// Ceiling on the ScreenCast handshake (`create_session` → `select_sources` →
+/// `start` → `open_pipe_wire_remote`). Under [`select_and_cast`]'s 20 s wait so
+/// a stuck portal is reported by the thread that owns it — and so that thread
+/// exits.
 const HANDSHAKE_BUDGET: Duration = Duration::from_secs(15);
 
+/// Budget for one `hyprctl` call ([`crate::proc`]). `hyprctl` waits on the
+/// instance socket, so against a wedged compositor it never returns. These
+/// run on the session's stream thread; a hung query wedges the session. Five
+/// seconds is generous next to a healthy call (single-digit milliseconds).
 const HYPRCTL_BUDGET: Duration = Duration::from_secs(5);
 
-/// Budget for the one-shot xdph restart. `systemctl --user try-restart` waits for the user manager's
-/// job to settle, so it is the slowest helper on this path — and its result is already ignored.
+/// Budget for the one-shot xdph restart. `systemctl --user try-restart` waits
+/// for the user manager's job; the result is already ignored.
 const PORTAL_RESTART_BUDGET: Duration = Duration::from_secs(10);
 
-/// Run `hyprctl <args>`, returning stdout. `hyprctl` needs `HYPRLAND_INSTANCE_SIGNATURE` to reach
-/// the right instance socket; it is set on THIS CHILD ([`hyprctl_command`]) rather than exported
-/// into the host's own environment. It exits non-zero on a hard failure, but for dispatch commands
-/// it can print an error with status 0 — see [`hyprctl_dispatch`].
+/// Run `hyprctl <args>`, returning stdout. `HYPRLAND_INSTANCE_SIGNATURE` is set
+/// on this child ([`hyprctl_command`]), not exported into the host. Non-zero on
+/// hard failure; dispatch can print an error at status 0 — see [`hyprctl_dispatch`].
 fn hyprctl(args: &[&str]) -> Result<String> {
     let mut cmd = hyprctl_command(args, crate::session::hypr_signature());
     let out = crate::proc::output_within(&mut cmd, HYPRCTL_BUDGET)
@@ -1217,15 +967,12 @@ fn hyprctl(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The `hyprctl` invocation, with the live instance signature threaded onto the child.
+/// `hyprctl` invocation with the live instance signature on the child.
 ///
-/// It used to ride the process env: `apply_session_env` `set_var`'d it per connect (and
-/// `remove_var`'d it for a non-Hyprland session) so this child inherited it. Nothing outside
-/// pf-vdisplay ever read it, so that bought a per-connect `setenv` — a data race with any `getenv`
-/// on any other thread of a live streaming host — for a value one child needs. `Command::env` gives
-/// it to exactly that child, the way `set_launch_command` carries the launch. `sig` is `None` when
-/// there is no live Hyprland instance we can find: leave the child's env alone then, so an
-/// inherited one (host started inside the session) still wins.
+/// `Command::env` gives it to exactly that child. A process-wide `set_var` was
+/// a `getenv` data race with every other thread of a live host. `sig` is `None`
+/// when no instance is findable: leave the child's env alone so an inherited
+/// signature (host started inside the session) still wins.
 fn hyprctl_command(args: &[&str], sig: Option<String>) -> Command {
     let mut cmd = Command::new("hyprctl");
     cmd.args(args);
@@ -1235,20 +982,18 @@ fn hyprctl_command(args: &[&str], sig: Option<String>) -> Command {
     cmd
 }
 
-/// Serializes **write-the-selection → complete-the-handshake**, process-wide — see the wlroots
-/// backend's `SELECTION_LOCK`. The xdph selection is likewise one per-user file, so a concurrent
-/// write between ours and xdph's read would silently steer capture at the other session's output.
+/// Serializes write-the-selection → complete-the-handshake, process-wide.
+/// One per-user file: a concurrent write between ours and xdph's read would
+/// steer capture at the other session's output.
 static SELECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The per-session selection file, removed when the handshake it steers is over.
+/// Per-session selection file, removed when the handshake it steers is over.
 ///
-/// Its lifetime is the HANDSHAKE, not the session: the shim cats it once, inside
-/// [`select_and_cast`]'s critical section, and everything after that is the cast's own business.
-/// Left behind (as it was) the stale `[SELECTION]screen:PF-…` outlives the output `Drop` has since
-/// removed, and it permanently shadows xdph's documented empty-read fallback — every later capture
-/// that reaches the picker without a session of ours is steered at an output that is gone. Tying
-/// removal to the CAST instead would be worse: the file is one per user, so a session ending hours
-/// later would delete a *sibling's* selection out from under its picker.
+/// Lifetime is the handshake, not the session: the shim cats it once inside
+/// [`select_and_cast`]'s critical section. Left behind, a stale
+/// `[SELECTION]screen:PF-…` permanently shadows xdph's empty-read fallback.
+/// Tying removal to the cast would be worse: the file is one per user, so a
+/// session ending later would delete a sibling's selection.
 struct SelectionFile(String);
 
 impl Drop for SelectionFile {
@@ -1261,8 +1006,8 @@ impl Drop for SelectionFile {
     }
 }
 
-/// Point xdph's custom picker at `output` and run the ScreenCast handshake, returning the portal fd
-/// + node id and the guard that stops the cast. The caller must hold [`SELECTION_LOCK`].
+/// Point xdph's custom picker at `output` and run the ScreenCast handshake.
+/// The caller must hold [`SELECTION_LOCK`].
 fn select_and_cast(
     output: &str,
     hw_cursor: bool,
@@ -1270,18 +1015,15 @@ fn select_and_cast(
     ensure_xdph_config()?;
     let sel = selection_file();
     std::fs::write(&sel, picker_selection_line(output)).with_context(|| format!("write {sel}"))?;
-    // Owned from the write on: every arm below (and every `?`) leaves the handshake, which is the
-    // only thing that reads it.
+    // Owned from the write on: every arm below (and every `?`) leaves the
+    // handshake, which is the only thing that reads it.
     let _sel_file = SelectionFile(sel);
-    // The NEGOTIATED cursor mode rides back with the fd and node id: it is decided inside the
-    // portal thread (only there is the proxy to ask), and nothing downstream can re-derive it —
-    // `hw_cursor` is the request, not the answer.
+    // Negotiated mode rides back with the fd: decided inside the portal
+    // thread (only there is the proxy to ask). `hw_cursor` is the request.
     let (setup_tx, setup_rx) =
         std::sync::mpsc::channel::<Result<(OwnedFd, u32, crate::portal_cursor::Mode), String>>();
-    // The teardown handshake: the thread signals this once it has closed the ScreenCast session, and
-    // `StopGuard::drop` waits on it before the output is removed (see `StopGuard`). Kept a SEPARATE
-    // channel from the setup one above — it fires at the other end of the cast's life, long after
-    // `setup_rx` has been consumed.
+    // Teardown handshake: the thread signals this once ScreenCast is closed.
+    // Separate from the setup channel — it fires at the other end of the cast.
     let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
@@ -1289,21 +1031,17 @@ fn select_and_cast(
         .name("punktfunk-hypr-cast".into())
         .spawn(move || portal_thread(setup_tx, closed_tx, stop_thread, hw_cursor))
         .context("spawn hyprland portal thread")?;
-    // Built BEFORE the wait so EVERY error arm below sets the flag on its way out — as Mutter's
-    // `create` does. Returning the bare `Arc` and letting the CALLER wrap it left the two failure
-    // arms dropping an un-set flag: the thread's `send` can still LAND in the queue in the window
-    // between `recv_timeout` giving up and `setup_rx` being dropped, so it reports success and then
-    // parks forever on `while !stop`, holding a live ScreenCast session, its zbus connection, an
-    // `OwnedFd` and a 2-worker tokio runtime — one more set per slow-portal connect, for the host's
-    // lifetime, against an output that no longer exists.
+    // Built before the wait so every error arm sets the flag on the way out.
+    // Returning a bare `Arc` left the failure arms dropping an un-set flag:
+    // the thread's `send` can still land after `recv_timeout` gives up, then
+    // park forever on `while !stop` holding a live ScreenCast.
     let mut guard = StopGuard { stop, closed: None };
     match setup_rx.recv_timeout(Duration::from_secs(20)) {
         Ok(Ok((fd, node_id, cursor_mode))) => {
-            // A cast exists now, so teardown has something to close and must wait for it. Only this
-            // arm arms the wait: see the field note on `StopGuard::closed`.
+            // A cast exists, so teardown must wait. Only this arm arms it.
             guard.closed = Some(closed_rx);
-            // …and only this arm counts toward the borrowed picker, for the same reason: a
-            // handshake that never produced a cast has nothing to hand back.
+            // Only this arm counts toward the borrowed picker: a handshake
+            // that never produced a cast has nothing to hand back.
             LIVE_CASTS.fetch_add(1, Ordering::SeqCst);
             Ok((fd, node_id, cursor_mode, guard))
         }
@@ -1312,11 +1050,9 @@ fn select_and_cast(
     }
 }
 
-/// Record an **existing** Hyprland monitor — the monitor-mirror path
-/// (`design/per-monitor-portal-capture.md` L3): the same custom-picker mechanism the virtual-output
-/// path uses, pointed at a physical connector, so no GUI picker is involved.
-///
-/// The keepalive stops the cast only — the monitor is Hyprland's, not ours.
+/// Stream an existing Hyprland monitor — same custom picker as the virtual
+/// path, pointed at a physical connector, no GUI picker. The keepalive stops
+/// the cast only; the monitor is Hyprland's, not ours.
 pub(crate) fn stream_existing_output(
     connector: &str,
     hw_cursor: bool,
@@ -1333,10 +1069,9 @@ pub(crate) fn stream_existing_output(
 
 /// Every head Hyprland reports, for [`crate::monitors::list`].
 ///
-/// `hyprctl -j monitors all` (rather than plain `monitors`) so **disabled** heads are listed too —
-/// a picker that silently omits the monitor the operator is trying to name is worse than one that
-/// shows it greyed out. Hyprland reports geometry post-transform in logical pixels, which is the
-/// space `crate::monitors` documents.
+/// `hyprctl -j monitors all` so disabled heads are listed too. Geometry is
+/// post-transform in logical pixels, which is the space `crate::monitors`
+/// documents.
 pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
     let raw = hyprctl(&["-j", "monitors", "all"])?;
     let parsed: serde_json::Value =
@@ -1348,8 +1083,8 @@ pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
         .filter_map(|m| {
             let connector = m.get("name")?.as_str()?.to_string();
             let num = |k: &str| m.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
-            // Hyprland's `description` is already a "make model (connector)" string; treat it as
-            // the make and let the shared helper drop it when it is empty/Unknown.
+            // `description` is already "make model (connector)"; treat it as
+            // the make and let the helper drop it when empty/Unknown.
             let description = crate::monitors::describe(
                 m.get("description").and_then(|v| v.as_str()).unwrap_or(""),
                 "",
@@ -1360,7 +1095,7 @@ pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
                 description,
                 width: num("width").max(0) as u32,
                 height: num("height").max(0) as u32,
-                // `refreshRate` is Hz as a float.
+                // `refreshRate` is Hz as a float; we store millihertz.
                 refresh_mhz: (m.get("refreshRate").and_then(|v| v.as_f64()).unwrap_or(0.0) * 1000.0)
                     as u32,
                 x: num("x") as i32,
@@ -1372,8 +1107,8 @@ pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
                     .unwrap_or(1.0),
                 primary: m.get("focused").and_then(|v| v.as_bool()).unwrap_or(false),
                 enabled: !m.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false),
-                // Our headless outputs are named `PF-<pid>-<n>` (see `next_output_name`); the shape
-                // is checked, not just the prefix, so a user's own `PF-office` stays theirs.
+                // Named `PF-<pid>-<n>`; the shape is checked, not just the
+                // prefix, so a user's `PF-office` stays theirs.
                 managed: m
                     .get("name")
                     .and_then(|v| v.as_str())
@@ -1385,10 +1120,10 @@ pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
     Ok(out)
 }
 
-/// Run a `hyprctl` **dispatch** command (`output …`, `keyword …`, `eval …`) that reports success by
-/// printing `ok`. hyprctl often exits 0 even when the command is rejected, printing the error to
-/// stdout, so treat a known error marker as failure (this is also how [`set_monitor_rule`] tells the
-/// two config eras apart).
+/// Run a `hyprctl` dispatch (`output …`, `keyword …`, `eval …`) that reports
+/// success by printing `ok`. hyprctl often exits 0 on rejection, printing the
+/// error to stdout — treat a known marker as failure (also how
+/// [`set_monitor_rule`] tells the two config eras apart).
 fn hyprctl_dispatch(args: &[&str]) -> Result<()> {
     let out = hyprctl(args)?;
     let t = out.trim();
@@ -1400,15 +1135,13 @@ fn hyprctl_dispatch(args: &[&str]) -> Result<()> {
         || lc.contains("unknown")
         || lc.contains("no such")
         || lc.contains("error")
-        // `hyprctl eval` on a hyprlang (non-Lua) config: "eval is only supported with the lua
-        // config manager" — a rejection hyprctl reports with exit 0 and no other marker.
+        // `hyprctl eval` on hyprlang: "eval is only supported with the lua
+        // config manager" — exit 0, no other marker.
         || lc.contains("only supported")
         || lc.contains("not supported")
-        // The MIRROR rejection, and it matched none of the markers above: `hyprctl keyword` on a
-        // Lua config answers "keyword can't work with non-legacy parsers. Use eval." — note
-        // "can't", not the "couldn't" that was already covered. Measured on .138 (0.55.4, Lua).
-        // Without this the wrong-era `keyword` read as SUCCESS, and every caller then had to
-        // notice the miss for itself by reading the state back.
+        // Lua `keyword` answers "keyword can't work with non-legacy parsers"
+        // at exit 0 — "can't", not the "couldn't" already covered. Without
+        // this the wrong-era `keyword` read as success.
         || lc.contains("can't")
         || lc.contains("cannot")
     {
@@ -1417,8 +1150,7 @@ fn hyprctl_dispatch(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Wait until the named headless output shows up in `hyprctl -j monitors` (it appears near-instantly
-/// in practice; poll briefly to be safe).
+/// Poll until `name` appears in `hyprctl -j monitors`. Create returns before it does.
 fn wait_monitor_ready(name: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -1432,9 +1164,8 @@ fn wait_monitor_ready(name: &str, timeout: Duration) -> Result<()> {
     }
 }
 
-/// Every monitor name Hyprland reports, **disabled ones included** (`-j monitors all`) — a leftover
-/// output from a dead host may well have ended up disabled, and [`reclaim_leftovers_once`] must see
-/// it anyway.
+/// Every monitor name, disabled included (`-j monitors all`). A leftover from
+/// a dead host may have ended up disabled; [`reclaim_leftovers_once`] must see it.
 fn monitor_names() -> Result<Vec<String>> {
     let out = hyprctl(&["-j", "monitors", "all"])?;
     let monitors: serde_json::Value =
@@ -1449,7 +1180,6 @@ fn monitor_names() -> Result<Vec<String>> {
         .unwrap_or_default())
 }
 
-/// Is a monitor named `name` present in `hyprctl -j monitors` (JSON)?
 fn monitor_exists(name: &str) -> Result<bool> {
     let out = hyprctl(&["-j", "monitors"])?;
     let monitors: serde_json::Value =
@@ -1463,18 +1193,14 @@ fn monitor_exists(name: &str) -> Result<bool> {
         .unwrap_or(false))
 }
 
-/// Set the client's exact mode on `name`, supporting both config eras (D5). Encapsulates the whole
-/// era split (D5). `hyprctl keyword monitor NAME,WxH@Hz,auto,1` is the hyprlang path — the default
-/// config manager on **every** current release, including ≥0.55 (verified on 0.55.4: version does
-/// NOT imply the Lua era — a stock 0.55.4 rejects `eval` with "only supported with the lua config
-/// manager"). So we try `keyword` first and fall back to the Lua `hyprctl eval 'hl.monitor{…}'` only
-/// for a user who opted into the Lua config manager (where `keyword` is gone). Either way we confirm
-/// the output actually adopted the mode — some forms print `ok` for a command they ignored.
+/// Set the client's exact mode on `name`, both config eras.
 ///
-/// A headless output starts at 0×0 and only gets a framebuffer once a mode commits; if neither form
-/// makes it adopt a usable (non-zero) size the compositor couldn't back the mode (a headless GBM /
-/// dmabuf allocation failure — Sunshine#4197, seen on some NVIDIA setups), which we surface clearly
-/// rather than streaming a 0×0 corpse.
+/// `hyprctl keyword monitor NAME,WxH@Hz,auto,1` is hyprlang (the default,
+/// including ≥0.55 — version does not imply Lua). Fall back to
+/// `hyprctl eval 'hl.monitor{…}'` only when `keyword` is gone. Either way,
+/// confirm the output adopted the mode — some forms print `ok` for a command
+/// they ignored. A headless output starts at 0×0; if neither form yields a
+/// usable size, the compositor could not back the mode.
 fn set_monitor_rule(name: &str, mode: Mode) -> Result<()> {
     let hz = mode.refresh_hz.max(1);
     let spec = format!("{name},{}x{}@{hz},auto,1", mode.width, mode.height);
@@ -1484,14 +1210,12 @@ fn set_monitor_rule(name: &str, mode: Mode) -> Result<()> {
     );
     let keyword: Vec<&str> = vec!["keyword", "monitor", &spec];
     let eval: Vec<&str> = vec!["eval", &lua];
-    // What each form actually said. hyprctl reports a rejection in its OUTPUT TEXT ("eval is only
-    // supported with the lua config manager", "invalid monitor rule", a permission denial), and
-    // dropping it on the floor with `.is_err()` is what left the failure below guessing at GBM when
-    // the compositor had already named the real cause.
+    // hyprctl reports rejection in the output text. Dropping it left the
+    // failure below guessing at GBM when the compositor had named the cause.
     let mut attempts: Vec<String> = Vec::new();
     for a in [&keyword, &eval] {
-        // A wrong-era command errors (`keyword` gone under Lua, or `eval` under hyprlang) — skip to
-        // the other form. A command that's accepted then has up to the timeout to take effect.
+        // Wrong-era command (`keyword` gone under Lua, or `eval` under
+        // hyprlang) — skip to the other form.
         if let Err(e) = hyprctl_dispatch(a) {
             let said = format!("{e:#}");
             tracing::debug!(output = %name, cmd = ?a, error = %said, "hyprctl rejected this monitor-rule form — trying the other config era");
@@ -1511,8 +1235,8 @@ fn set_monitor_rule(name: &str, mode: Mode) -> Result<()> {
     } else {
         attempts.join("; ")
     };
-    // Neither form produced the exact mode. Distinguish "usable but different size" (proceed with a
-    // warning — a working stream beats none) from "0×0 / gone" (the output has no framebuffer at all).
+    // Distinguish "usable but different size" (stream anyway) from "0×0 /
+    // gone" (no framebuffer at all).
     match monitor_size(name)? {
         Some((w, h)) if w > 0 && h > 0 => {
             tracing::warn!(
@@ -1524,10 +1248,9 @@ fn set_monitor_rule(name: &str, mode: Mode) -> Result<()> {
             );
             Ok(())
         }
-        // The output has no framebuffer at all. Lead with what hyprctl SAID: if every form was
-        // rejected the cause is named right there (wrong config era, a permission denial, a bad
-        // rule) and no allocation was ever attempted; only a form that was accepted and still left
-        // the output at 0×0 points at the compositor failing to back the mode.
+        // Lead with what hyprctl said: if every form was rejected, no
+        // allocation was attempted. Only an accepted form that left 0×0
+        // points at the compositor failing to back the mode.
         _ => bail!(
             "headless output {name} never got a framebuffer (stayed 0x0) after the monitor rule for \
              {}x{}@{hz}. hyprctl said: {said}. If a form was accepted, the compositor could not back \
@@ -1539,8 +1262,8 @@ fn set_monitor_rule(name: &str, mode: Mode) -> Result<()> {
     }
 }
 
-/// Poll until monitor `name` reports exactly `mode`'s width×height (the rule applies asynchronously),
-/// up to `timeout`. Returns `false` on timeout.
+/// Poll until `name` reports exactly `mode`'s width×height (the rule applies
+/// asynchronously). `false` on timeout.
 fn wait_exact_mode(name: &str, mode: Mode, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -1555,9 +1278,8 @@ fn wait_exact_mode(name: &str, mode: Mode, timeout: Duration) -> bool {
     }
 }
 
-/// Monitor `name`'s current `(width, height)` from `hyprctl -j monitors all` (includes a disabled
-/// output), or `None` if it isn't present. A freshly-created headless output reports `0×0` until a
-/// mode commits.
+/// `(width, height)` from `hyprctl -j monitors all` (includes disabled), or
+/// `None` if absent. A fresh headless output reports `0×0` until a mode commits.
 fn monitor_size(name: &str) -> Result<Option<(u64, u64)>> {
     let out = hyprctl(&["-j", "monitors", "all"])?;
     let monitors: serde_json::Value =
@@ -1575,15 +1297,15 @@ fn monitor_size(name: &str) -> Result<Option<(u64, u64)>> {
     Ok(None)
 }
 
-/// The running Hyprland `(major, minor, patch)` from `hyprctl -j version` (`tag` like `v0.55.4`),
-/// for a diagnostic log — the mode-rule path is version-independent (see [`set_monitor_rule`]).
+/// Running Hyprland `(major, minor, patch)` from `hyprctl -j version`, for a
+/// diagnostic log — the mode-rule path is version-independent.
 fn hyprland_version() -> Option<(u16, u16, u16)> {
     let out = hyprctl(&["-j", "version"]).ok()?;
     let json: serde_json::Value = serde_json::from_str(&out).ok()?;
     parse_version_tag(json.get("tag").and_then(|t| t.as_str())?)
 }
 
-/// Parse a Hyprland `tag` (`v0.55.4`, or a dev `v0.41.2-13-gabcdef`) to `(major, minor, patch)`.
+/// Parse a Hyprland `tag` (`v0.55.4`, or a dev `v0.41.2-13-gabcdef`).
 fn parse_version_tag(tag: &str) -> Option<(u16, u16, u16)> {
     let t = tag.trim().trim_start_matches(['v', 'V']);
     let mut it = t.split(['.', '-', '_', '+']);
@@ -1593,9 +1315,9 @@ fn parse_version_tag(tag: &str) -> Option<(u16, u16, u16)> {
     Some((major, minor, patch))
 }
 
-/// Log the permission-system caveat at most once per process: with
-/// `ecosystem.enforce_permissions = true` (0.49+, off by default), direct screencopy/virtual-input
-/// clients can be denied — and denial is **silent black frames / dropped input**, not an error.
+/// Permission-system caveat at most once per process: with
+/// `ecosystem.enforce_permissions = true` (0.49+, off by default), denial is
+/// silent black frames / dropped input, not an error.
 fn preflight_once() {
     static WARNED: Once = Once::new();
     WARNED.call_once(warn_if_permissions_enforced);
@@ -1618,26 +1340,20 @@ fn warn_if_permissions_enforced() {
     }
 }
 
-/// Make sure xdph uses our custom picker: install the shim (once) and write the managed config,
-/// restarting xdph if the config changed (it reads config only at startup). Mirrors the wlroots
-/// `ensure_xdpw_config` pattern.
+/// Point xdph at our custom picker: install the shim and write the managed
+/// config, restarting xdph if the config changed (it reads config only at
+/// startup).
 ///
-/// **The picker is the user's, borrowed — not taken** (design D6). `custom_picker_binary` is one
-/// key with one holder, and on a distro that ships its own (Omarchy sets
-/// `hyprland-preview-share-picker`, the picker every Chromium share on the box goes through)
-/// pointing it at us is pointing *every* share at us. Two things keep that honest:
-///
-///  * the shim **delegates**: with no selection pending it `exec`s whatever was configured before
-///    us, so an ordinary browser share behaves exactly as it did — during our session, after it,
-///    after a crash, and after a reboot that emptied `$XDG_RUNTIME_DIR`. This is the part that does
-///    not depend on us getting a teardown right;
-///  * the config edit records what it replaced, so [`restore_xdph_config`] can put their value
-///    back verbatim when the last cast ends.
+/// The picker is borrowed, not taken. `custom_picker_binary` is one key; a
+/// distro that ships its own (every Chromium share on the box) would have
+/// every share pointed at us. The shim delegates: with no selection pending
+/// it `exec`s whatever was configured before us. The config edit records
+/// what it replaced, so [`restore_xdph_config`] can put it back.
 fn ensure_xdph_config() -> Result<()> {
     let path = xdph_config_path()?;
-    // What the user had here before us — from our own marker if we have taken this over already
-    // (a second session, a moved `$XDG_RUNTIME_DIR`), else whatever is in the file now. Reading
-    // the marker FIRST is what stops the second takeover from recording our own shim as "theirs".
+    // Prior value: our marker if we have already taken over, else whatever
+    // is in the file. Marker first, or a second takeover records our shim
+    // as "theirs".
     let (current, prior) = crate::portal_config::peek(&path, XDPH_BLOCK, XDPH_PICKER_KEY);
     let fallback = match prior {
         Some(p) => p,
@@ -1645,27 +1361,24 @@ fn ensure_xdph_config() -> Result<()> {
     }
     .filter(|c| picker_is_plain(c));
 
-    // 1. Install the picker shim (idempotent — content is fixed for a given fallback).
+    // Install the picker shim (idempotent — content is fixed for a given fallback).
     let shim = picker_shim_path();
     let sel = selection_file();
-    // `-s` not `-f`: an empty selection file means "no selection", which is the fallback's case.
-    // Unquoted expansion on the `exec` line is deliberate — a picker may carry flags, and
-    // `picker_is_plain` is what makes word-splitting the only thing that can happen here.
+    // `-s` not `-f`: empty file means "no selection". Unquoted `exec` is
+    // deliberate — a picker may carry flags, and `picker_is_plain` is what
+    // makes word-splitting the only thing that can happen.
     let shim_body = match &fallback {
         Some(cmd) => format!(
             "#!/bin/sh\n# Managed by punktfunk. Hands xdph the output this host is streaming; with\n# no selection pending, defers to the picker configured before us.\n[ -s \"{sel}\" ] && exec cat \"{sel}\"\nexec {cmd} \"$@\"\n"
         ),
-        // Nothing to defer to: an empty read leaves xdph to its own fallback, as before.
         None => format!(
             "#!/bin/sh\n# Managed by punktfunk.\n[ -s \"{sel}\" ] && exec cat \"{sel}\"\nexit 0\n"
         ),
     };
     if std::fs::read_to_string(&shim).is_ok_and(|c| c == shim_body) {
-        // already installed
     } else {
-        // Mode set AT CREATION, not chmod-ed after: xdph EXECUTES this file, and a
-        // write-then-chmod leaves it briefly at the umask default. (It also lives in a 0700
-        // runtime dir now — see `session::runtime_dir` — so this is defence in depth.)
+        // Mode at creation, not chmod after: xdph executes this file, and
+        // write-then-chmod leaves it briefly at the umask default.
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = std::fs::OpenOptions::new()
@@ -1679,9 +1392,8 @@ fn ensure_xdph_config() -> Result<()> {
             .with_context(|| format!("write {shim}"))?;
     }
 
-    // 2. Write the managed xdph config and restart xdph on change.
-    // ONE key, in place. This used to `fs::write` a complete file over whatever the user had,
-    // destroying every other xdph setting they owned on first connect.
+    // One key, in place. Overwriting the whole file would destroy every
+    // other xdph setting the user owned.
     let changed = crate::portal_config::ensure_key(&path, XDPH_BLOCK, XDPH_PICKER_KEY, &shim)?;
     if !changed {
         return Ok(());
@@ -1695,18 +1407,14 @@ fn ensure_xdph_config() -> Result<()> {
     Ok(())
 }
 
-/// Hand `custom_picker_binary` back to whoever had it before us, and restart xdph so the change
-/// takes (it reads config only at startup).
+/// Hand `custom_picker_binary` back and restart xdph (it reads config only at
+/// startup). Called from the host's shutdown path, never per cast — see
+/// [`StopGuard::drop`]. Safe on a box we never touched (no-op).
 ///
-/// Called from the host's **shutdown** path ([`crate::restore_takeover_now`]), never per cast —
-/// see [`StopGuard::drop`] for why per-cast churn is a black screen. Safe to call on a box whose
-/// config we never touched, where it does nothing at all.
-///
-/// The restart is the acknowledged cost (design D6(d)): xdph has no way to tell us whether another
-/// application's cast is live, so a share started *during* our session can be cut here. That is the
-/// same restart the takeover above already performs, at the other end of the session, and it is the
-/// lesser of the two evils — the alternative is leaving a running xdph pointed at a shim whose
-/// selection file is gone, which breaks the box's screen sharing until the next login.
+/// The restart is the cost: xdph cannot tell us whether another application's
+/// cast is live, so a share started during our session can be cut. Leaving
+/// xdph pointed at a shim whose selection file is gone breaks screen sharing
+/// until the next login.
 pub(crate) fn restore_picker_on_shutdown() {
     restore_xdph_config();
 }
@@ -1728,9 +1436,9 @@ fn restore_xdph_config() {
     restart_xdph();
 }
 
-/// Bounded: `systemctl --user` blocks on the user manager's job queue, and this runs on the
-/// session's stream thread. The result is ignored — a timeout just means xdph picks the new config
-/// up whenever it next starts.
+/// Bounded: `systemctl --user` blocks on the user manager's job queue, and
+/// this runs on the session's stream thread. A timeout just means xdph picks
+/// the new config up whenever it next starts.
 fn restart_xdph() {
     let _ = crate::proc::status_within(
         Command::new("systemctl").args([
@@ -1742,11 +1450,10 @@ fn restart_xdph() {
     );
 }
 
-/// The ScreenCast portal handshake — the xdg ScreenCast portal is backend-neutral (served here by
-/// xdph), so this mirrors the wlroots portal thread: it reports the fd + node id and parks until
-/// stopped (the zbus connection is the cast's lifetime). xdph answers source selection via our
-/// custom picker, no dialog. (Kept separate from wlroots' copy so each wlr-family backend stays
-/// self-owned per D1; unify if they ever diverge no further.)
+/// ScreenCast handshake. Backend-neutral portal (served here by xdph); mirrors
+/// the wlroots portal thread: reports fd + node id and parks until stopped
+/// (the zbus connection is the cast's lifetime). xdph answers source selection
+/// via our custom picker, no dialog.
 fn portal_thread(
     setup_tx: Sender<Result<(OwnedFd, u32, crate::portal_cursor::Mode), String>>,
     closed_tx: Sender<()>,
@@ -1757,11 +1464,10 @@ fn portal_thread(
     use ashpd::desktop::PersistMode;
     use ashpd::enumflags2::BitFlags;
 
-    // 🛑 The SHARED, never-dropped runtime — NOT a per-cast one. ashpd caches its D-Bus connection
-    // process-globally, and a per-cast runtime takes that connection's background reader down with
-    // it when the cast ends, leaving every later handshake in this process awaiting a reply nothing
-    // is alive to read. That is the whole "the first stream works, the rest are black" bug. See
-    // [`crate::portal_rt`] for the measurement.
+    // Shared, never-dropped runtime — not per-cast. ashpd caches its D-Bus
+    // connection process-globally; a per-cast runtime takes that connection's
+    // background reader down with it, leaving later handshakes awaiting a
+    // reply nothing is alive to read. See [`crate::portal_rt`].
     let rt = match crate::portal_rt::portal_runtime() {
         Ok(rt) => rt,
         Err(e) => {
@@ -1773,9 +1479,9 @@ fn portal_thread(
 
     rt.block_on(async move {
         let result: Result<()> = async {
-            // Inside the bound below, deliberately: when the cached connection was orphaned this is
-            // where the thread hung — `Screencast::new()` itself, before a single handshake call —
-            // and a bound that started after it reported the caller's generic timeout instead.
+            // Inside the bound: when the cached connection was orphaned this
+            // is where the thread hung — `Screencast::new()` itself. A bound
+            // that started after it reported the caller's generic timeout.
             let connect = async {
                 Screencast::new().await.context(
                     "connect ScreenCast portal (is xdg-desktop-portal running with the hyprland backend/xdph?)",
@@ -1788,23 +1494,15 @@ fn portal_thread(
                     HANDSHAKE_BUDGET.as_secs()
                 ),
             };
-            // NEGOTIATED against what xdph advertises, never asserted from `hw_cursor` alone: a
-            // cursor mode the backend does not offer does not degrade — xdg-desktop-portal's
-            // FRONTEND fails the call ("Unavailable cursor mode %x") before xdph sees it.
-            // MEASURED on .21 2026-08-14, Hyprland 0.56.2 + xdph 1.4.1 (both current):
-            // `AvailableCursorModes` = 3 (Hidden|Embedded) — metadata is NOT offered. So the old
-            // hardcode killed EVERY cursor-forward session here, on today's packages, not just on
-            // old installs: `unavailable cursor mode 4`, "pipeline build failed", black client.
+            // Negotiated against what xdph advertises, never asserted from
+            // `hw_cursor` alone: an unadvertised mode does not degrade —
+            // xdg-desktop-portal fails the call before xdph sees it. Current
+            // xdph advertises Hidden|Embedded only.
             let cursor_mode = crate::portal_cursor::negotiate(&proxy, hw_cursor, "xdph").await;
-            // 🛑 BOUNDED, and that bound is load-bearing. `select_sources`/`start` await a D-Bus
-            // reply a wedged portal never sends, and an await that never returns CANNOT be cancelled
-            // by the `stop` flag — the thread never reaches the park loop that reads it. That is how
-            // one host accumulated NINE live cast threads (28 tokio workers) on 2026-08-14: each
-            // timed-out attempt left one behind holding a half-created portal session on this
-            // process's shared D-Bus connection, and from the first hang onwards EVERY later request
-            // from this process hung too — while a freshly-spawned process talking to the very same
-            // portal completed the identical handshake fine. Shorter than the caller's 20 s wait, so
-            // the failure is reported HERE with a reason instead of surfacing as a bare timeout.
+            // Bounded, and that bound is load-bearing. `select_sources`/`start`
+            // await a D-Bus reply a wedged portal never sends, and an await
+            // that never returns cannot be cancelled by `stop`. Shorter than
+            // the caller's 20 s wait so the failure is reported here.
             let handshake = async {
                 let session = proxy
                     .create_session(Default::default())
@@ -1857,24 +1555,17 @@ fn portal_thread(
                 .send(Ok((fd, node_id, cursor_mode)))
                 .map_err(|_| anyhow!("virtual-output opener went away"))?;
 
-            // Park, keeping `proxy` + `session` alive until stopped. Polled at 20 ms rather than the
-            // 200 ms this used to use, because the teardown now WAITS on what follows — every
-            // millisecond here is a millisecond of stream teardown.
+            // Park, keeping `proxy` + `session` alive until stopped. Polled at
+            // 20 ms not 200 ms: teardown now waits on what follows.
             let _keep_alive = (&proxy, &session);
             while !stop.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
 
-            // 🛑 CLOSE THE SESSION, AND CLOSE IT *BEFORE* THE OUTPUT GOES AWAY. Dropping the
-            // connection and trusting the peer to notice is what this used to do, and it is not the
-            // contract: xdph destroys a session only on an explicit
-            // `org.freedesktop.impl.portal.Session.Close` (`Session.cpp:37`). The caller is blocked
-            // in `StopGuard::drop` waiting for the signal below, and only removes the compositor
-            // output afterwards — that ordering is the whole fix; see `StopGuard`.
-            //
-            // Bounded: `close()` goes through xdg-desktop-portal to xdph, and an already-wedged xdph
-            // never answers. Timing out here still signals, so teardown pays the budget once and
-            // moves on rather than hanging on a portal that is already gone.
+            // Close the session before the output goes away. xdph destroys a
+            // session only on explicit `Session.Close`. `StopGuard::drop` waits
+            // on the signal below. Bounded: timeout still signals so teardown
+            // pays the budget once rather than hanging on an already-gone portal.
             match tokio::time::timeout(CAST_CLOSE_BUDGET, session.close()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => tracing::warn!(
@@ -1887,7 +1578,7 @@ fn portal_thread(
                      already wedged"
                 ),
             }
-            // Release the teardown. Best-effort: the receiver is gone if the caller already gave up.
+            // Best-effort: the receiver is gone if the caller already gave up.
             let _ = closed_tx.send(());
             Ok(())
         }
@@ -1903,14 +1594,13 @@ fn portal_thread(
 mod tests {
     use super::*;
 
-    /// The whole re-apply hangs off this one line match, and both ways of getting it wrong are
-    /// expensive: too strict and a theme switch still resets the stream's resolution; too loose
-    /// (a `contains`) and any window whose TITLE holds the word triggers a `hyprctl` round trip
-    /// plus a mode re-apply, on every keystroke that retitles it.
+    /// The re-apply hangs off this one-line match. Too strict and a reload
+    /// still resets the stream; too loose (`contains`) and a window titled
+    /// `configreloaded` triggers a `hyprctl` round trip on every retitle.
     #[test]
     fn only_the_config_reload_event_re_applies_the_monitor_rule() {
         assert!(is_config_reload("configreloaded>>"));
-        // Real lines from `.socket2.sock`, none of which is a reload.
+        // Real `.socket2.sock` lines, none of which is a reload.
         assert!(!is_config_reload("monitoradded>>PF-1234-1"));
         assert!(!is_config_reload("monitorremovedv2>>3,PF-1234-1,PF-1234-1"));
         assert!(!is_config_reload("activewindow>>kitty,~/src"));
@@ -1919,10 +1609,9 @@ mod tests {
         assert!(!is_config_reload("workspace>>configreloaded"));
     }
 
-    /// The Lua config manager parses a `dispatch` argument as a Lua expression, so the monitor
-    /// name and the state must both be QUOTED — an unquoted `dpms off HDMI-A-1` is what dies with
-    /// `')' expected near 'off'` on 0.55.4. Pinning the shape here because the quoting is the
-    /// entire difference between working and silently doing nothing.
+    /// Lua config manager parses a `dispatch` argument as a Lua expression,
+    /// so both arguments must be quoted. Pinning the shape because quoting is
+    /// the entire difference between working and silently doing nothing.
     #[test]
     fn the_lua_dpms_expression_quotes_both_arguments() {
         assert_eq!(
@@ -1930,18 +1619,15 @@ mod tests {
             r#"hl.dsp.dpms("off", "HDMI-A-1")"#
         );
         assert_eq!(lua_dpms_expr("DP-2", true), r#"hl.dsp.dpms("on", "DP-2")"#);
-        // The monitor name is never omitted: the no-name form answers `ok` and TOGGLES on 0.55.4,
-        // which would flip a just-restored head back off.
+        // Never omit the monitor name: the no-name form answers `ok` and
+        // toggles, which would flip a just-restored head back off.
         assert!(lua_dpms_expr("DP-2", true).contains("\"DP-2\""));
     }
 
-    /// The Lua spellings of the resize workspace hand-off, pinned for the same reason as the
-    /// dpms/focus expressions: both dispatchers answer `ok` on the wrong era, so a drifted string
-    /// fails silently and the only symptom is the field report this exists to close — the client
-    /// landing on an empty workspace after every resize. The workspace id is a quoted STRING in
-    /// both (Omarchy's own workspace binds pass strings; that is the measured-working form on
-    /// 0.56.2), and `hl.dsp.workspace.move`'s key set is `workspace`/`monitor` — `move` requires
-    /// `monitor` and there is no `hl.dsp.workspace` member that merely switches, which is why the
+    /// Lua spellings of the resize workspace hand-off. Both dispatchers answer
+    /// `ok` on the wrong era, so a drifted string fails silently. Workspace id
+    /// is a quoted string in both; `hl.dsp.workspace.move` requires `monitor`,
+    /// and there is no `hl.dsp.workspace` member that merely switches — the
     /// switch half goes through `hl.dsp.focus`.
     #[test]
     fn the_lua_workspace_expressions_quote_their_arguments() {
@@ -1966,10 +1652,9 @@ mod tests {
         assert_eq!(parse_version_tag("wat"), None);
     }
 
-    /// `focusmonitor` is a dispatcher, so it must go through `hyprctl dispatch`. A bare
-    /// `hyprctl focusmonitor NAME` is not a subcommand and hyprctl reports it with exit 0, so the
-    /// only signal would be the field symptom this whole call exists to remove: apps opening on the
-    /// operator's monitor while the stream shows a bare desktop.
+    /// `focusmonitor` is a dispatcher, so it must go through `hyprctl dispatch`.
+    /// A bare `hyprctl focusmonitor NAME` is not a subcommand and hyprctl
+    /// reports it with exit 0.
     #[test]
     fn focus_goes_through_the_dispatch_subcommand() {
         assert_eq!(
@@ -1978,27 +1663,24 @@ mod tests {
         );
     }
 
-    /// The Lua-era spelling, which is the half that was missing. Measured against Hyprland 0.56.2
-    /// on Omarchy 4.0.1: the key is `monitor` (the compositor lists the alternatives when it is
-    /// anything else) and the NAME MUST BE QUOTED — unquoted is precisely the classic form's
-    /// failure, `')' expected near 'PF'`, which is what left a headless output unfocused, empty,
-    /// and producing no frames at all.
+    /// Lua-era spelling. The key is `monitor` (the compositor lists the
+    /// alternatives when it is anything else) and the name must be quoted —
+    /// unquoted is the classic form's failure, `')' expected near 'PF'`.
     #[test]
     fn the_lua_focus_expression_quotes_the_monitor_name() {
         assert_eq!(
             lua_focus_expr("PF-1234-1"),
             "hl.dsp.focus({ monitor = \"PF-1234-1\" })"
         );
-        // The two eras must not converge on one string: each is rejected by the other's parser,
-        // and that is what makes "try one, then the other" safe to run blind.
+        // The two eras must not converge on one string: each is rejected by
+        // the other's parser, which is what makes "try one, then the other" safe.
         assert_ne!(lua_focus_expr("PF-1"), focus_argv("PF-1").join(" "));
     }
 
-    /// `HYPRLAND_INSTANCE_SIGNATURE` reaches `hyprctl` as a per-CHILD override, never as a `set_var`
-    /// on the host's own environment — that write was a `getenv` data race with every other thread
-    /// of a live session (security-review 2026-08-25). Pinning both arms: a discovered signature is
-    /// set on the child, and an undiscoverable one leaves the child's env untouched so an inherited
-    /// signature still reaches the compositor.
+    /// `HYPRLAND_INSTANCE_SIGNATURE` reaches `hyprctl` as a per-child override,
+    /// never as a `set_var` on the host — that write was a `getenv` data race
+    /// with every other thread of a live session. A discovered signature is
+    /// set on the child; an undiscoverable one leaves the child's env untouched.
     #[test]
     fn the_instance_signature_travels_on_the_child_not_the_process_env() {
         let overrides = |sig: Option<String>| -> Vec<(String, Option<String>)> {
@@ -2030,21 +1712,21 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// The name carries the creating host's pid, which is what makes a leftover attributable — a
-    /// reclaim that could not tell whose output it was would have to remove a LIVE sibling's or
-    /// nothing at all.
+    /// The name carries the creating host's pid, which is what makes a leftover
+    /// attributable. A reclaim that could not tell whose it was would have to
+    /// remove a live sibling's or nothing at all.
     #[test]
     fn a_name_carries_its_owner_pid_and_only_ours_does() {
         let mine = next_output_name();
         assert_eq!(output_owner_pid(&mine), Some(std::process::id()));
         assert!(is_managed_output(&mine));
 
-        // A legacy `PF-<n>` from an older host: recognisably managed, but with no owner recorded —
-        // so it may be reported, never reclaimed on a guess.
+        // Legacy `PF-<n>`: recognisably managed, but no owner — report, never
+        // reclaim on a guess.
         assert!(is_managed_output("PF-1"));
         assert_eq!(output_owner_pid("PF-1"), None);
 
-        // Not ours: a user's own monitor name that happens to start with the prefix, and the
+        // A user's own monitor that happens to start with the prefix, and the
         // connectors every wlr-family compositor mints.
         for theirs in ["PF-office", "PF-", "PF-12-abc", "HEADLESS-1", "DP-1", ""] {
             assert!(!is_managed_output(theirs), "{theirs:?} is not ours");
@@ -2052,8 +1734,8 @@ mod tests {
         }
     }
 
-    /// The backend hands the picker exactly what [`crate::portal_picker`] says — that module owns the
-    /// format and its xdph-parser tests, which run on every platform rather than only this leg.
+    /// The backend hands the picker exactly what [`crate::portal_picker`] says.
+    /// That module owns the format and its tests run on every platform.
     #[test]
     fn picker_line_is_the_shared_selection_format() {
         assert_eq!(picker_selection_line("PF-1"), "[SELECTION]/screen:PF-1\n");
@@ -2071,16 +1753,15 @@ mod tests {
             scale: 1.0,
             primary: false,
             enabled,
-            // The real `list_monitors` derives this with `is_managed_output`; mirror it here so the
-            // fixture can't drift into asserting a rule the backend doesn't actually apply.
+            // Real `list_monitors` derives this with `is_managed_output`;
+            // mirror it so the fixture cannot drift from the backend's rule.
             managed: is_managed_output(connector),
         }
     }
 
-    /// The group-awareness rule (design §6.1): `exclusive` disables the operator's heads and
-    /// **only** those. A sibling session's output — ours or another host's, both `PF-<pid>-<n>` —
-    /// must survive, or the second exclusive session blacks out the first one's screen, which is
-    /// the exact bug KWin's Stage 3 shipped and Stage 5 fixed.
+    /// `exclusive` disables the operator's heads and only those. A sibling
+    /// session's output — ours or another host's, both `PF-<pid>-<n>` — must
+    /// survive, or the second exclusive session blacks out the first.
     #[test]
     fn exclusive_disables_the_operators_heads_and_never_a_managed_sibling() {
         let ours = "PF-4242-1";
@@ -2091,25 +1772,24 @@ mod tests {
             // A concurrent session's output, and one from a second host — both managed.
             head("PF-4242-2", true),
             head("PF-99-1", true),
-            // Already off: nothing to disable, and it must NOT end up in the restore list, or
-            // teardown would switch on a head the operator had deliberately left dark.
+            // Already off: must not end up in the restore list, or teardown
+            // would switch on a head the operator had left dark.
             head("DP-3", false),
         ];
         assert_eq!(heads_to_disable(&heads, ours), vec!["DP-1", "HDMI-A-1"]);
     }
 
-    /// A box with no physical head (the CI/headless posture) has nothing to disable, so no restore
-    /// is prepared and teardown never runs a `hyprctl reload` — the reload's side effects are paid
-    /// only by a session that actually took a screen.
+    /// A box with no physical head has nothing to disable, so no restore is
+    /// prepared and teardown never runs a `hyprctl reload`.
     #[test]
     fn exclusive_on_a_headless_box_disables_nothing() {
         let ours = "PF-4242-1";
         assert!(heads_to_disable(&[head(ours, true)], ours).is_empty());
     }
 
-    /// Both config eras, pinned. These two strings are the whole contract with the compositor and
-    /// neither is guessable: `hyprctl` answers a wrong-era or malformed rule at **exit 0**, so a
-    /// typo here reads as success and the operator's screen simply stays lit under `exclusive`.
+    /// Both config eras, pinned. `hyprctl` answers a wrong-era or malformed
+    /// rule at exit 0, so a typo here reads as success and the operator's
+    /// screen stays lit under `exclusive`.
     #[test]
     fn disable_rules_are_pinned_for_both_config_eras() {
         assert_eq!(disable_rule_spec("DP-1"), "DP-1,disable");
@@ -2119,9 +1799,9 @@ mod tests {
         );
     }
 
-    /// `hyprctl keyword` under the Lua config manager answers "keyword can't work with non-legacy
-    /// parsers. Use eval." at exit 0 — the one rejection shape the marker list used to miss, so the
-    /// wrong-era form reported success. (Its mirror, `eval` under hyprlang, was already covered.)
+    /// `hyprctl keyword` under Lua answers "keyword can't work with non-legacy
+    /// parsers. Use eval." at exit 0. Without this marker the wrong-era form
+    /// reports success.
     #[test]
     fn a_wrong_era_rejection_is_an_error_not_a_success() {
         for said in [

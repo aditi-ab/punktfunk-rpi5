@@ -1,68 +1,32 @@
-//! Compositor-independent panel darkening over DRM — how a box with **no desktop compositor**
+//! Compositor-independent panel darkening over DRM — how a box with no desktop compositor
 //! honors [`Topology::Exclusive`](crate::policy::Topology::Exclusive).
 //!
-//! [`crate::panel_dpms`] asks KWin to turn the panels off, which is the right answer whenever there
-//! is a KDE desktop to ask. There often isn't. A box sitting in **Game Mode** runs gamescope and no
-//! KWin at all, so that path declines — and Game Mode is precisely the deployment where the
-//! operator's TV is lit by the box itself. Measured on the Nobara VM (2026-08-24): after the
-//! takeover idles the box's gaming session, `card0-HDMI-A-1` sits at `enabled=enabled dpms=On`
-//! indefinitely. Nothing blanks on its own — when no client holds DRM master the kernel simply
-//! keeps the CRTC configured, and fbcon owns it.
+//! [`crate::panel_dpms`] is the dispatcher; this is the "none at all" arm. Open `/dev/dri/cardN`
+//! (logind uaccess, session user), `SET_MASTER` (decline if another client is master), modeset
+//! each lit CRTC off (`SETCRTC` `fb_id=0, mode_valid=0, count_connectors=0`), `DROP_MASTER`,
+//! keep the fd. Darkness survives dropping master; the open fd is the hold. Relight is
+//! `close(fd)`: kernel last-close restores the console. No saved mode, no journal — a dead
+//! host lights the box. Best-effort: missing `/dev/dri`, a foreign master, or nothing lit
+//! contributes nothing and the stream proceeds.
 //!
-//! So ask the kernel directly. The sequence, all of it measured on that box:
-//!
-//! 1. `open("/dev/dri/cardN")` — permitted for the ordinary session user, because logind puts a
-//!    **uaccess ACL** on the node for whoever holds the active seat (`crw-rw----+`). No root, no
-//!    polkit, no group: this is the same access every local compositor gets.
-//! 2. `DRM_IOCTL_SET_MASTER` — succeeds while no one else is master, which is exactly the state the
-//!    takeover has just produced by idling the box's session. If it FAILS, someone else is driving
-//!    that card (a live compositor, a foreign gamescope) and we decline: darkening a panel out from
-//!    under its owner is not ours to do, and on the Attach route it would darken the very picture
-//!    being streamed.
-//! 3. `DRM_IOCTL_MODE_GETRESOURCES` (count pass, then data pass) for the CRTC ids, and
-//!    `DRM_IOCTL_MODE_SETCRTC` with `fb_id = 0, mode_valid = 0, count_connectors = 0` on each one
-//!    that is actually driving something. That is a modeset to "off": the connector goes
-//!    `enabled=disabled dpms=Off`, which is the same end state `kscreen-doctor --dpms off` reaches
-//!    through KWin.
-//! 4. `DRM_IOCTL_DROP_MASTER`, and **keep the fd open**.
-//!
-//! Step 4 is the part worth reading twice. The darkness **survives dropping master** (measured), so
-//! we hand mastering rights straight back — the box's own gamescope must be able to take the card
-//! when the restore relaunches its session, and a host still holding master would starve it. What
-//! holds the panel dark is the open fd, not the mastership.
-//!
-//! **The re-light is `close(fd)`, and that is the whole of it.** The kernel's last-close handling
-//! restores the console and the panel comes back lit (measured: `enabled=enabled dpms=On` within
-//! 2 s of the close). There is no saved mode to replay and no restore that can half-fail — which
-//! also means **crash safety comes free**, the same property [`crate::panel_dpms`] gets from DPMS
-//! being non-persistent: a host that dies holding this has its fds closed by the kernel, and the
-//! box lights up. Nothing to journal, nothing to sweep at startup. (Contrast the Windows
-//! `pnp_disable_monitors` path, which needs a recovery journal precisely because its disable
-//! survives everything.)
-//!
-//! Best-effort throughout, like every other arm of this policy: a box with no `/dev/dri` at all, a
-//! card whose master is held by someone else, or a card with nothing lit simply contributes
-//! nothing and the stream proceeds.
+//! Ioctl numbers encode payload size; layouts are pinned by the `const` asserts below.
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
-// ---------------------------------------------------------------- the kernel ABI
-//
-// `include/uapi/drm/drm.h` and `drm_mode.h`. Hand-declared rather than pulled from a crate: this is
-// four ioctls and three plain-old-data structs, and the const asserts below pin every layout that
-// could drift. `_IO('d', nr)` / `_IOWR('d', nr, T)` encoded by hand — the sizes are in the names.
+// Hand-declared from `drm.h` / `drm_mode.h`. `_IO('d', nr)` / `_IOWR('d', nr, T)` — payload
+// sizes live in the ioctl numbers; the `const` asserts below pin the structs to those sizes.
 
-/// `DRM_IOCTL_SET_MASTER` — `_IO('d', 0x1e)`.
+/// `_IO('d', 0x1e)`.
 const DRM_IOCTL_SET_MASTER: libc::c_ulong = 0x641e;
-/// `DRM_IOCTL_DROP_MASTER` — `_IO('d', 0x1f)`.
+/// `_IO('d', 0x1f)`.
 const DRM_IOCTL_DROP_MASTER: libc::c_ulong = 0x641f;
-/// `DRM_IOCTL_MODE_GETRESOURCES` — `_IOWR('d', 0xA0, drm_mode_card_res)`, 64-byte payload.
+/// `_IOWR('d', 0xA0, drm_mode_card_res)` — 0x40-byte payload.
 const DRM_IOCTL_MODE_GETRESOURCES: libc::c_ulong = 0xC040_64A0;
-/// `DRM_IOCTL_MODE_GETCRTC` — `_IOWR('d', 0xA1, drm_mode_crtc)`, 104-byte payload.
+/// `_IOWR('d', 0xA1, drm_mode_crtc)` — 0x68-byte payload.
 const DRM_IOCTL_MODE_GETCRTC: libc::c_ulong = 0xC068_64A1;
-/// `DRM_IOCTL_MODE_SETCRTC` — `_IOWR('d', 0xA2, drm_mode_crtc)`, 104-byte payload.
+/// `_IOWR('d', 0xA2, drm_mode_crtc)` — 0x68-byte payload.
 const DRM_IOCTL_MODE_SETCRTC: libc::c_ulong = 0xC068_64A2;
 
 #[repr(C)]
@@ -116,9 +80,8 @@ struct DrmModeCrtc {
     mode: DrmModeModeinfo,
 }
 
-// The ioctl numbers above encode their payload size (0x40 = 64, 0x68 = 104). If a struct here ever
-// disagrees with that, the kernel reads or writes the wrong number of bytes — so pin it at compile
-// time rather than discovering it as a corrupted modeset on someone's TV.
+// Ioctl numbers encode payload size (0x40 = 64, 0x68 = 104). A struct that disagrees is a
+// kernel read/write of the wrong length.
 const _: () = assert!(std::mem::size_of::<DrmModeCardRes>() == 0x40);
 const _: () = assert!(std::mem::size_of::<DrmModeModeinfo>() == 68);
 const _: () = assert!(std::mem::size_of::<DrmModeCrtc>() == 0x68);
@@ -132,8 +95,7 @@ impl Default for DrmModeCrtc {
     }
 }
 
-/// One card we have darkened: the open fd is the hold. Dropping this closes it, and the kernel
-/// re-lights — see the module docs.
+/// Open fds holding the panels dark. Drop closes them; kernel last-close re-lights.
 pub struct DrmDarken {
     /// Kept solely for its `Drop`. The panel stays dark exactly as long as these are open.
     _cards: Vec<File>,
@@ -141,10 +103,7 @@ pub struct DrmDarken {
     pub darkened: Vec<String>,
 }
 
-/// `ioctl(fd, req, &mut arg)` for the modeset structs, returning the raw `errno` on failure.
-///
-/// Split out so each call site is one line and there is exactly one `unsafe` block to justify
-/// instead of five near-identical ones.
+/// Shared `ioctl` so there is one `unsafe` to justify, not one per call site.
 fn ioctl<T>(fd: libc::c_int, req: libc::c_ulong, arg: &mut T) -> std::io::Result<()> {
     // SAFETY: `fd` is an open DRM node owned by the caller for the whole call; `req` is one of the
     // five `_IO`/`_IOWR` codes declared above, each paired with the `T` its size field names (the
@@ -180,11 +139,8 @@ pub fn darken() -> Option<DrmDarken> {
             Ok((card, n)) => {
                 tracing::debug!(card = name, crtcs = n, "DRM: CRTCs off");
                 darkened.push(name.to_string());
-                // ⚠ HOLD THE FD THAT DID THE WORK. Closing it and re-opening does not survive the
-                // round trip: the close is the kernel's LAST close on that device, which restores
-                // the console and re-lights the panel — the fresh fd then holds nothing. Measured
-                // on the Nobara VM 2026-08-24, where exactly that shape reported `darkened
-                // cards: ["card0"]` while the connector sat at `enabled=enabled dpms=On`.
+                // This exact fd. Close-then-reopen is last-close: the console restore
+                // re-lights, and the fresh fd holds nothing.
                 cards.push(card);
             }
             Err(why) => tracing::debug!(card = name, %why, "DRM: not ours to darken"),
@@ -199,16 +155,13 @@ pub fn darken() -> Option<DrmDarken> {
     })
 }
 
-/// Darken one card, returning the open fd **and** how many CRTCs were actually turned off.
-///
-/// The fd comes back with the count because the caller MUST keep this exact one to hold the panel
-/// dark: closing it is the kernel's last close on the device, which restores the console. A card
-/// that reports 0 can have its fd dropped freely — nothing was changed to undo.
+/// Darken one card. Return the open fd (the hold) and how many CRTCs went off.
+/// Closing that fd is last-close and restores the console; count 0 may drop it.
 fn darken_card(path: &Path) -> std::io::Result<(File, usize)> {
     let card = File::options().read(true).write(true).open(path)?;
     let fd = card.as_raw_fd();
-    // Someone else driving this card (a live compositor, a foreign gamescope) ⇒ not ours. This is
-    // also what keeps the Attach route honest without needing to know about it here.
+    // Foreign master (live compositor, other gamescope) ⇒ not ours. Also the Attach
+    // guard: do not darken the picture being streamed.
     ioctl(fd, DRM_IOCTL_SET_MASTER, &mut 0u64)?;
 
     // Count pass: every pointer NULL, the kernel fills in the counts.
@@ -240,13 +193,11 @@ fn darken_card(path: &Path) -> std::io::Result<(File, usize)> {
         if ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &mut crtc).is_err() {
             continue;
         }
-        // Only touch a CRTC that is actually driving a display. Disabling an already-dark one is a
-        // harmless no-op, but counting it would make the log claim a panel went off that never was
-        // on — and that verdict is the whole point of reporting a count at all.
+        // Skip an already-dark CRTC: disabling it is a no-op, but counting it would log a
+        // panel that was never on.
         if crtc.mode_valid == 0 && crtc.fb_id == 0 {
             continue;
         }
-        // The modeset to "off": no framebuffer, no mode, no connectors.
         let mut disable = DrmModeCrtc {
             crtc_id: id,
             ..Default::default()
@@ -255,9 +206,8 @@ fn darken_card(path: &Path) -> std::io::Result<(File, usize)> {
             off += 1;
         }
     }
-    // Hand mastering back immediately: the darkness does not depend on holding it (measured), and
-    // the box's own gamescope needs to be able to take this card when the restore relaunches its
-    // session. Keeping it would turn a dark panel into a session that cannot start.
+    // Darkness does not need master. Hand it back so the box's gamescope can take the card
+    // on restore; keeping it would leave a session that cannot start.
     let _ = ioctl(fd, DRM_IOCTL_DROP_MASTER, &mut 0u64);
     Ok((card, off))
 }
@@ -266,9 +216,8 @@ fn darken_card(path: &Path) -> std::io::Result<(File, usize)> {
 mod tests {
     use super::{DrmModeCardRes, DrmModeCrtc, DrmModeModeinfo};
 
-    /// The layouts the ioctl numbers encode. The `const` asserts above already fail the BUILD on
-    /// drift; this restates them as a test so the reason is greppable from a failure, and pins the
-    /// two field offsets the count/data-pass dance actually depends on.
+    /// Payload sizes the ioctl numbers encode, plus the two offsets the count/data-pass uses.
+    /// The `const` asserts fail the build; this restates them so a failure is greppable.
     #[test]
     fn the_abi_structs_match_the_ioctl_payload_sizes() {
         assert_eq!(std::mem::size_of::<DrmModeCardRes>(), 0x40, "_IOWR 0x40");
@@ -282,18 +231,9 @@ mod tests {
         assert_eq!(std::mem::offset_of!(DrmModeCrtc, mode), 36);
     }
 
-    /// ON GLASS. Darken this box's panels for real and read the verdict back out of sysfs.
-    ///
-    /// Run it on a box with a **connected head and no compositor holding the card** — i.e. exactly
-    /// the takeover state this module exists for. On the Nobara VM:
-    ///
-    /// ```sh
-    /// # idle the box's gaming session first (what stop_autologin_sessions does), then:
-    /// ./pf_vdisplay-<hash> --ignored --nocapture drm_dpms
-    /// ```
-    ///
-    /// Skips itself (rather than failing) when nothing was ours to darken, because that is the
-    /// honest outcome on a dev box with a live desktop — the card is already mastered.
+    /// Live: darken this box's panels and read sysfs. Needs a connected head and no compositor
+    /// holding `/dev/dri/card*` (the takeover state). Skips, rather than fails, when nothing
+    /// is ours — a live desktop already masters the card.
     #[test]
     #[ignore = "on glass: needs a connected head and no compositor holding /dev/dri/card*"]
     fn live_the_panels_go_dark_and_come_back() {
@@ -342,7 +282,6 @@ mod tests {
         let after = connectors();
         println!("after:  {after:?}");
 
-        // The claim: every head that was lit went dark, and every one of them came back.
         for (name, en, dpms) in &during {
             assert_eq!(dpms, "Off", "{name} should be DPMS-off while held ({en})");
         }
@@ -352,8 +291,7 @@ mod tests {
         );
     }
 
-    /// A zeroed `DrmModeCrtc` IS the disable request — that is the only thing `Default` is for
-    /// here, so a change that made it non-zero would silently stop disabling anything.
+    /// A zeroed `DrmModeCrtc` is the disable request — `Default`'s only job here.
     #[test]
     fn the_default_crtc_is_the_disable_request() {
         let c = DrmModeCrtc::default();

@@ -1,34 +1,19 @@
-//! Host half of `punktfunk-encode-worker` (design: `design/gpu-priority-capability-worker.md` §3;
-//! plan §2/WP2). The worker half and the vocabulary they share are [`super::worker`].
+//! Host half of `punktfunk-encode-worker`
+//! (design: `design/gpu-priority-capability-worker.md`). The worker half and the vocabulary
+//! they share are [`super::worker`].
 //!
-//! [`RemotePyroWave`] is an `Encoder` that forwards a PyroWave session to the capability-carrying
-//! worker process, and it sits **under** `TrackedEncoder` — session accounting, the encode-stall
-//! watchdog, encoder recovery and the forwarding rot-guard all apply to it unchanged.
+//! [`RemotePyroWave`] is an `Encoder` that forwards a PyroWave session to the
+//! capability-carrying worker. It sits under `TrackedEncoder`, so session accounting, the
+//! encode-stall watchdog, encoder recovery and the forwarding rot-guard apply unchanged.
 //!
-//! ## The ladder — no rung may kill a negotiated session
+//! A PyroWave open is only reached after the codec was negotiated, so a hard error here is a
+//! dead stream. Every rung therefore falls back to the in-process encoder at default GPU
+//! priority: env-off, missing binary, spawn, handshake, version skew, and encoder-init return
+//! the bare in-process encoder; a non-dmabuf frame, a worker encode error, or socket EOF
+//! mid-session pin a live proxy in-process (EOF gets one respawn first).
 //!
-//! A PyroWave open is only ever reached by a session that already negotiated PyroWave, so a hard
-//! error here is a dead stream, not a fallback to another codec. Every rung therefore ends at the
-//! **in-process encoder exactly as today**, at default GPU priority, with one warning:
-//!
-//! | rung | where | outcome |
-//! |---|---|---|
-//! | `PUNKTFUNK_ENCODE_WORKER=off` | [`resolve_worker_path`] | in-process, one info line |
-//! | binary not found | [`resolve_worker_path`] | in-process, one warn |
-//! | spawn failed | [`open_preferring_worker`] | in-process, one warn |
-//! | handshake timed out / worker died starting | [`spawn_link`] | in-process, one warn |
-//! | proto or workspace-version skew | [`spawn_link`] | in-process, one warn |
-//! | the worker could not open its encoder | [`spawn_link`] | in-process, one warn |
-//! | a non-dmabuf frame arrived | [`RemotePyroWave::submit`] | in-process for the session, one warn |
-//! | the worker failed a frame | [`RemotePyroWave::submit`] | in-process for the session, one warn |
-//! | socket EOF mid-session | [`RemotePyroWave::reset`] | one respawn, then in-process |
-//!
-//! The first six happen before any frame and return the bare in-process encoder — no proxy, no
-//! per-frame cost on the path that is still the overwhelming majority of hosts. The last three
-//! happen inside a live proxy, which keeps its own in-process encoder from then on.
-//!
-//! Every fallback line ends with the same clause — *"encoding in-process at default GPU
-//! priority"* — so one `grep` finds them all, whichever rung fired.
+//! Fallback logs share the clause *"encoding in-process at default GPU priority"* so one
+//! `grep` finds every rung.
 
 use super::worker::{self, FromWorker, PriorityOutcome, ToWorker, WireCursor};
 use crate::pyrowave_wire::{stream_chunk_step, AuChunker};
@@ -45,40 +30,35 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::Duration;
 
-/// The installed name every packaging channel writes — and the ONLY file that may carry
-/// `cap_sys_nice=ep`. Never a hardlink of `punktfunk-host` and never a subcommand of it: a shared
-/// inode shares the file capability, which makes the host unidentifiable to KWin and kills every
-/// KDE desktop session (0.26.0-1).
+/// Installed name. The only file that may carry `cap_sys_nice=ep`. Never a hardlink of
+/// `punktfunk-host`: a shared inode shares the file capability, KWin cannot identify the host,
+/// and the desktop session dies.
 const WORKER_BIN: &str = "punktfunk-encode-worker";
 
-/// Handshake budget — the same one the zerocopy worker's GPU bring-up gets. It covers a Vulkan
-/// instance + device create and the pyrowave object build; a cold driver load can take seconds.
-/// Blowing it means the driver is wedged, in which case the in-process encoder would wedge too,
-/// so a generous budget costs nothing that the fallback would have saved.
+/// Handshake budget, matching the zerocopy worker's GPU bring-up. Covers Vulkan instance +
+/// device create and the pyrowave object; a cold driver load can take seconds. Blowing it
+/// means the driver is wedged, which would wedge the in-process encoder too.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Per-request budget. A PyroWave encode is 2–5 ms and the encoder's own fence wait is capped at
 /// 5 s, so a worker silent for twice that is wedged inside a driver call, not slow.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Where the worker binary is, or why we are not using one.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum WorkerPath {
-    /// `PUNKTFUNK_ENCODE_WORKER=off` — the debug escape hatch that makes the worker/in-process
-    /// A/B a one-line change.
+    /// `PUNKTFUNK_ENCODE_WORKER=off` — debug hatch so worker vs in-process is a one-line change.
     Off,
     Found(PathBuf),
-    /// Not beside the host binary and not on `PATH` (a source build, or a partial install).
+    /// Not beside the host binary and not on `PATH`.
     Missing,
 }
 
 /// Resolve the worker binary: `PUNKTFUNK_ENCODE_WORKER` → alongside `/proc/self/exe` → `PATH`.
 ///
-/// The env override is **load-bearing on NixOS**, not a convenience: a file capability cannot live
-/// on a read-only store path, so the module exposes the worker through `security.wrappers` and
-/// points this variable at the wrapper (an ambient grant is fine *there* — the worker is not a KWin
-/// client). Pure and fully injected so the table can be tested without mutating process env, which
-/// races `getenv` in parallel tests.
+/// The env override is load-bearing on NixOS: a file capability cannot live on a read-only store
+/// path, so the module exposes the worker through `security.wrappers` and points this variable at
+/// the wrapper. Pure and injected so the table can be tested without mutating process env (races
+/// `getenv` in parallel tests).
 fn resolve_worker_path_in(
     env: Option<&str>,
     exe_dir: Option<&Path>,
@@ -89,9 +69,8 @@ fn resolve_worker_path_in(
         if v.eq_ignore_ascii_case("off") {
             return WorkerPath::Off;
         }
-        // Deliberately NOT existence-checked. An operator who names a path is entitled to a
-        // failure that names it back — the spawn rung's warn carries the path, where a silent
-        // fall-through to "beside the host binary" would hide the typo behind a working stream.
+        // Not existence-checked: an operator-named path must fail by that name. Falling through
+        // to "beside the host binary" would hide a typo behind a working stream.
         return WorkerPath::Found(PathBuf::from(v));
     }
     if let Some(p) = exe_dir.map(|d| d.join(WORKER_BIN)).filter(|p| exists(p)) {
@@ -109,12 +88,10 @@ fn resolve_worker_path_in(
     WorkerPath::Missing
 }
 
-/// [`resolve_worker_path_in`] against the real process.
 pub(crate) fn resolve_worker_path() -> WorkerPath {
-    // `current_exe()` readlinks `/proc/self/exe`, which reads `"<path> (deleted)"` after the
-    // binary was replaced under a running host — harmless HERE, because only the parent directory
-    // is used and the suffix lands on the file name. (The worker we then resolve is pinned by fd
-    // before it is exec'd, which is where that trap actually bites.)
+    // `current_exe()` readlinks `/proc/self/exe`, which becomes `"<path> (deleted)"` after a
+    // replace-under-run. Harmless here: only the parent directory is used. The worker we then
+    // resolve is pinned by fd before exec, which is where that trap bites.
     let exe_dir = std::env::current_exe().ok();
     let path_var = std::env::var("PATH").ok();
     resolve_worker_path_in(
@@ -125,8 +102,7 @@ pub(crate) fn resolve_worker_path() -> WorkerPath {
     )
 }
 
-/// The negotiated session's parameters, kept so the in-process fallback can be opened at ANY point
-/// mid-session with exactly what the worker was opened with.
+/// Session parameters, so an in-process fallback can open mid-session with the same values.
 #[derive(Clone, Copy)]
 struct Params {
     width: u32,
@@ -135,44 +111,36 @@ struct Params {
     chroma: ChromaFormat,
 }
 
-/// A per-frame failure and what it means for the session.
 enum Fail {
-    /// The transport broke: the worker is gone or wedged. Surfaces as an `Err` from `submit` so
-    /// the host's existing encoder-rebuild path runs — [`RemotePyroWave::reset`] is where the
-    /// single respawn attempt lives.
+    /// Transport broke. Surfaces as `submit` `Err` so the host rebuild path runs;
+    /// [`RemotePyroWave::reset`] is the one respawn.
     Dead(anyhow::Error),
-    /// The worker is alive and said no to this frame (an unimportable dmabuf, a frame that is not
-    /// the session's mode). Pins the session in-process, because the recovery machinery for those
-    /// causes lives there: the raw-dmabuf degrade latch is a process-wide static in the HOST, and
-    /// an import failure noted inside the worker dies with it.
+    /// Worker alive, this frame refused. Pin in-process: the raw-dmabuf degrade latch is a host
+    /// process-wide static, and an import failure noted inside the worker dies with it.
     Encode(String),
 }
 
-/// A live worker: its socket, its child, and the two caches that keep the steady state free of
-/// descriptors.
+/// Live worker: socket, child, and the caches that keep the steady state free of descriptors.
 #[derive(Debug)]
 struct Link {
     sock: OwnedFd,
     child: Option<Child>,
-    /// The worker's AU return buffer (a memfd), received once in `Ready`. Every AU is `pwrite`n at
-    /// offset 0 there and `pread` back here — see [`super::worker`] for why the bytes cannot ride
-    /// in the message body. `None` only between the spawn and the handshake, because the `Link`
-    /// exists that early so its `Drop` reaps the child on every failure path.
+    /// Worker's AU return memfd, received once in `Ready`. Bytes cannot ride in the message body
+    /// (see [`super::worker`]). `None` only between spawn and handshake so `Drop` can reap on every
+    /// failure path.
     au_buf: Option<File>,
     rbuf: Vec<u8>,
     /// Dmabuf keys whose fd the worker already holds; the fd crosses only on first sight.
     sent_keys: HashSet<u64>,
-    /// The cursor bitmap `serial` the worker has pixels for. A moving pointer re-sends position
-    /// only, exactly as the in-process blend re-uses its uploaded texture.
+    /// Cursor bitmap `serial` the worker has pixels for. A moving pointer re-sends position only.
     cursor_serial: Option<u64>,
 }
 
 impl Drop for Link {
     fn drop(&mut self) {
-        // The worker exits on socket EOF, which is `self.sock` dropping right after this. Hand the
-        // child to the shared reaper rather than waiting on it: a worker wedged inside a driver
-        // ioctl sits in D state and ignores SIGKILL, and session teardown must never block behind
-        // a process that may never die (plan §4 R3).
+        // Worker exits on socket EOF (`self.sock` drops after this). Park, don't wait: a worker
+        // wedged in a driver ioctl sits in D state and ignores SIGKILL; session teardown must
+        // not block on a process that may never die.
         if let Some(child) = self.child.take() {
             ipc::park_child(child);
         }
@@ -181,7 +149,7 @@ impl Drop for Link {
 
 impl Link {
     /// Send one request and take its single reply. Every host→worker message has exactly one
-    /// reply, so the two sides cannot desync into "whose turn is it".
+    /// reply, so the two sides cannot desync on turn-taking.
     fn request(&mut self, msg: &ToWorker, fds: &[BorrowedFd]) -> Result<FromWorker> {
         worker::send_eintr(self.sock.as_fd(), msg, fds).context("send to the encode worker")?;
         let (reply, _) = worker::recv_eintr::<FromWorker>(
@@ -193,23 +161,18 @@ impl Link {
         Ok(reply)
     }
 
-    /// Encode one frame across the socket. The reply doubles as the buffer-release signal, which
-    /// is exactly `Encoder::submit`'s existing lifetime contract — the caller already holds the
-    /// frame alive until its AU comes back.
+    /// Encode one frame. The reply is the buffer-release signal — the same lifetime as
+    /// `Encoder::submit`: the caller holds the frame until its AU comes back.
     fn encode(&mut self, frame: &CapturedFrame) -> Result<EncodedFrame, Fail> {
         let FramePayload::Dmabuf(d) = &frame.payload else {
-            // Unreachable: `submit` routes every non-dmabuf payload in-process before reaching here.
+            // `submit` routes every non-dmabuf payload in-process before this.
             return Err(Fail::Encode("not a dmabuf payload".into()));
         };
         let key = dmabuf_key(d.fd.as_fd()).map_err(|e| Fail::Dead(e.into()))?;
-        // The upload is built ONCE and re-sent on a `NeedFd` retry: the worker drops every
-        // descriptor of a frame it refuses, so a retry that dropped the cursor would blend a stale
-        // pointer for the rest of that bitmap's life.
-        // An EMPTY bitmap uploads too, deliberately: the invariant the worker checks is "the host
-        // has sent pixels for every serial it asks me to blend", and an empty overlay is a real,
-        // handled state (`prep_cursor` takes its no-cursor arm on one). Special-casing it here
-        // would make "no upload" mean two different things — new-and-empty, or already-sent — and
-        // the worker could no longer tell a desync from a blank pointer.
+        // Built once and re-sent on a `NeedFd` retry: the worker drops every descriptor of a
+        // refused frame, so a retry that dropped the cursor would blend a stale pointer.
+        // Empty bitmaps upload too: the worker's invariant is "pixels for every serial asked",
+        // and skipping empty would make "no upload" mean both new-and-empty and already-sent.
         let upload = match frame.cursor.as_ref() {
             Some(c) if self.cursor_serial != Some(c.serial) => Some(
                 worker::cursor_upload(&c.rgba)
@@ -247,7 +210,7 @@ impl Link {
                 format: frame.format.into(),
                 cursor: cursor.clone(),
             };
-            // Descriptor ORDER is the protocol: dmabuf first (iff first sight), cursor second.
+            // Descriptor order is the protocol: dmabuf first (iff first sight), cursor second.
             let mut fds: Vec<BorrowedFd> = Vec::new();
             if has_fd {
                 fds.push(d.fd.as_fd());
@@ -256,8 +219,8 @@ impl Link {
                 fds.push(f.as_fd());
             }
             match self.request(&msg, &fds).map_err(Fail::Dead)? {
-                // The worker's fd cache evicted this key (or the two diverged): forget our
-                // "already sent" note and retry ONCE, with the fd.
+                // Worker evicted this key (or the caches diverged): forget "already sent" and
+                // retry once, with the fd.
                 FromWorker::NeedFd if attempts == 1 => {
                     self.sent_keys.remove(&key);
                     continue;
@@ -311,9 +274,8 @@ impl Link {
     }
 }
 
-/// The dmabuf's identity across frames: its inode. dma-buf objects live on one anonymous inode
-/// filesystem and the number is unique per object, which is what makes the fd-identity cache
-/// possible — the same key the zerocopy worker's importer uses.
+/// Dmabuf identity across frames: its inode. dma-buf objects live on one anonymous inode
+/// filesystem and the number is unique per object — the same key the zerocopy importer uses.
 fn dmabuf_key(fd: BorrowedFd) -> io::Result<u64> {
     // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value; `fstat` writes
     // into the live, correctly-sized `&mut st` and only reads `fd`, which the caller keeps open
@@ -327,7 +289,6 @@ fn dmabuf_key(fd: BorrowedFd) -> io::Result<u64> {
     }
 }
 
-/// What a completed handshake told us about the worker.
 #[derive(Debug)]
 struct Handshake {
     link: Link,
@@ -339,15 +300,14 @@ struct Handshake {
 /// Spawn a worker on `exe` and complete the handshake. Any `Err` is a ladder rung: the caller
 /// warns once and encodes in-process.
 fn spawn_link(exe: &Path, p: &Params, bitrate_bps: u64) -> Result<Handshake> {
-    // Pin the WORKER's inode, never `self_exe()`: this binary is a different file from the host by
-    // construction (it carries the capability the host must never have). Pinning also means a
-    // package upgrade landing between here and the exec still runs the build we resolved.
+    // Pin the worker's inode, never `self_exe()`: this binary is a different file from the host
+    // (it carries the capability the host must never have). Pinning also means a package upgrade
+    // between here and exec still runs the build we resolved.
     let pinned =
         ipc::PinnedExe::open(exe).with_context(|| format!("open {} for exec", exe.display()))?;
     let (sock, child) = ipc::spawn_worker(&pinned.exec_path(), WORKER_BIN, &["--fd", "3"])
         .with_context(|| format!("spawn {}", exe.display()))?;
-    // Built before the handshake ON PURPOSE: its `Drop` is what hands the child to the reaper, so
-    // every `?` in `handshake` reaps rather than leaving a worker behind.
+    // Built before the handshake so `Drop` reaps the child on every `?` in `handshake`.
     handshake(
         Link {
             sock,
@@ -362,9 +322,7 @@ fn spawn_link(exe: &Path, p: &Params, bitrate_bps: u64) -> Result<Handshake> {
     )
 }
 
-/// The handshake itself, split from the spawn so the ladder's rungs are testable against a plain
-/// socket — and, more to the point, so the tests exercise THIS code rather than a copy of it that
-/// can drift from it.
+/// Handshake split from spawn so the ladder rungs are testable against a plain socket.
 fn handshake(mut link: Link, p: &Params, bitrate_bps: u64) -> Result<Handshake> {
     let hello = ToWorker::Hello {
         proto: worker::PROTO_VERSION,
@@ -375,18 +333,13 @@ fn handshake(mut link: Link, p: &Params, bitrate_bps: u64) -> Result<Handshake> 
         fps: p.fps,
         bitrate_bps,
         chroma444: p.chroma.is_444(),
-        // Resolved HERE and forwarded explicitly. The worker strips this variable from its own
-        // environment, so the operator's knob cannot silently mean something different across
-        // the process boundary.
+        // Resolved here and forwarded. The worker strips this variable from its own environment,
+        // so the operator's knob cannot silently mean something different across the boundary.
         priority_intent: std::env::var("PYROWAVE_QUEUE_PRIORITY").ok(),
     };
-    // Naming the handshake here is load-bearing, not decoration. A worker that dies during
-    // startup — no Vulkan 1.3 device, a missing feature, a half-installed binary that execs and
-    // exits — races this send: win the race and the death surfaces as the EOF the recv below
-    // reads, lose it and the socket is already closed, so the send takes EPIPE instead. One
-    // cause, so the operator must get one diagnosis; without this context the EPIPE side
-    // degrades the fallback warn to a bare "send Hello: Broken pipe (os error 32)", which names
-    // neither the worker nor the stage that failed.
+    // Naming the handshake is load-bearing. A worker that dies during startup races this send:
+    // win, and death is the EOF the recv reads; lose, and send takes EPIPE. One cause, one
+    // diagnosis — without this context the EPIPE side degrades to a bare "Broken pipe".
     worker::send_eintr(link.sock.as_fd(), &hello, &[])
         .context("encode worker handshake: send Hello (died on startup?)")?;
     let (ready, fds) = worker::recv_eintr::<FromWorker>(
@@ -404,10 +357,8 @@ fn handshake(mut link: Link, p: &Params, bitrate_bps: u64) -> Result<Handshake> 
             chroma444,
             blends_cursor,
         } => {
-            // Load-bearing, unlike the zerocopy worker's formality of a check: host and worker are
-            // different FILES here, so a channel that shipped them out of lockstep is a real
-            // deployment state — and it must degrade to the in-process encoder, not to a session
-            // that cannot decode its own peer.
+            // Host and worker are different files, so lockstep skew is a real deployment state
+            // and must degrade to the in-process encoder, not a session that cannot decode.
             if proto != worker::PROTO_VERSION || workspace_version != worker::WORKSPACE_VERSION {
                 bail!(
                     "encode worker version skew: worker proto {proto} v{workspace_version}, \
@@ -424,9 +375,8 @@ fn handshake(mut link: Link, p: &Params, bitrate_bps: u64) -> Result<Handshake> 
             Ok(Handshake {
                 link,
                 caps: EncoderCaps {
-                    // The REAL opened values, not a guess: a hardcoded default mis-reports a
-                    // 4:4:4 open and fires the session glue's spurious "chroma disagrees with the
-                    // negotiated Welcome" warn.
+                    // The values the worker actually opened. A hardcoded default mis-reports a
+                    // 4:4:4 open and fires a spurious "chroma disagrees with Welcome" warn.
                     blends_cursor,
                     chroma_444: chroma444,
                     ..EncoderCaps::default()
@@ -444,9 +394,8 @@ fn handshake(mut link: Link, p: &Params, bitrate_bps: u64) -> Result<Handshake> 
 
 /// Open a PyroWave session, preferring the capability-carrying worker.
 ///
-/// This is the ONE seam the Linux `open_video` PyroWave arms go through. It is deliberately not
-/// wired into the Windows arm: that platform has no such worker, and pointing it at a Linux-only
-/// binary would be a fallback rung firing on every Windows session.
+/// The one seam Linux `open_video` PyroWave arms go through. Not wired into Windows: that
+/// platform has no such worker.
 pub(crate) fn open_preferring_worker(
     width: u32,
     height: u32,
@@ -460,8 +409,6 @@ pub(crate) fn open_preferring_worker(
         fps,
         chroma,
     };
-    // Every rung below ends here — the in-process encoder, exactly as it opened before this
-    // worker existed.
     let inline = || -> Result<Box<dyn Encoder>> {
         super::pyrowave::PyroWaveEncoder::open(width, height, fps, bitrate_bps, chroma)
             .map(|e| Box::new(e) as Box<dyn Encoder>)
@@ -533,40 +480,35 @@ pub(crate) fn open_preferring_worker(
     }))
 }
 
-/// A PyroWave session encoded in `punktfunk-encode-worker`, with the in-process encoder underneath
-/// it as the floor. See the module docs for the ladder.
+/// A PyroWave session encoded in `punktfunk-encode-worker`, with the in-process encoder as the
+/// floor. See the module docs for the ladder.
 pub(crate) struct RemotePyroWave {
-    /// The live worker, or `None` once this session is pinned in-process.
+    /// Live worker, or `None` once this session is pinned in-process.
     link: Option<Link>,
-    /// The in-process encoder, opened lazily on any mid-session rung. Once open it serves the rest
-    /// of the session — the worker is not re-attempted per frame.
+    /// In-process encoder, opened lazily on any mid-session rung. Once open it serves the rest of
+    /// the session — the worker is not re-attempted per frame.
     inline: Option<super::pyrowave::PyroWaveEncoder>,
     params: Params,
-    /// The live rate, so a fallback opens the in-process encoder at the bitrate ABR last set
-    /// rather than the one the session started with.
+    /// Live rate, so a fallback opens at the bitrate ABR last set, not the session start rate.
     bitrate_bps: u64,
     worker_path: PathBuf,
     caps: EncoderCaps,
-    /// The datagram-aligned boundary, mirrored HERE as well as forwarded. It has to cross (it
-    /// changes the AU bytes), and it has to be kept (it decides this proxy's own chunked-poll
-    /// answers) — see [`Self::poll_chunk`].
+    /// Datagram-aligned boundary, mirrored here as well as forwarded. It changes the AU bytes
+    /// and this proxy's chunked-poll answers — see [`Self::poll_chunk`].
     wire_chunk: Option<usize>,
-    /// AUs the worker returned and the caller has not polled yet. Empty in in-process mode, where
-    /// the inline encoder owns its own queue — except for whatever was still here when the
-    /// fallback fired, which [`Self::poll_whole`] drains first.
+    /// AUs the worker returned that the caller has not polled. Empty in in-process mode except
+    /// leftovers from the fallback, which [`Self::poll_whole`] drains first.
     pending: VecDeque<EncodedFrame>,
-    /// The AU currently being handed out in streamed chunks — the proxy's, in BOTH modes, so
-    /// exactly one chunker can ever be open (see [`Self::poll_chunk`]).
+    /// AU currently being handed out in streamed chunks — the proxy's, in both modes, so exactly
+    /// one chunker can ever be open (see [`Self::poll_chunk`]).
     chunker: Option<AuChunker>,
-    /// One respawn per session. After that the in-process encoder is the answer: a worker that
-    /// dies twice is a worker that will keep dying, and burning the host's five-reset budget on it
-    /// costs the session.
+    /// One respawn per session. After that, in-process: a worker that dies twice will keep dying,
+    /// and burning the host's five-reset budget on it costs the session.
     respawn_used: bool,
 }
 
 impl RemotePyroWave {
-    /// Drop the worker and encode in-process for the rest of the session, with the one warn every
-    /// mid-session rung owes.
+    /// Drop the worker and encode in-process for the rest of the session.
     fn pin_inline(&mut self, reason: &str) {
         if self.link.take().is_some() {
             tracing::warn!(
@@ -578,8 +520,8 @@ impl RemotePyroWave {
         }
     }
 
-    /// The in-process encoder, opened on demand at the session's CURRENT parameters and with the
-    /// state the caller set through the trait replayed onto it.
+    /// In-process encoder, opened on demand at the session's current parameters with trait-set
+    /// state replayed onto it.
     fn inline_mut(&mut self) -> Result<&mut super::pyrowave::PyroWaveEncoder> {
         if self.inline.is_none() {
             let mut e = super::pyrowave::PyroWaveEncoder::open(
@@ -590,8 +532,8 @@ impl RemotePyroWave {
                 self.params.chroma,
             )
             .context("open the in-process PyroWave encoder after leaving the worker")?;
-            // Replay: the boundary changes the AU BYTES, so a fallback that forgot it would ship
-            // dense AUs flagged as datagram-aligned. (The bitrate needs no replay — it is an open
+            // Replay: the boundary changes the AU bytes, so a fallback that forgot it would ship
+            // dense AUs flagged as datagram-aligned. (Bitrate needs no replay — it is an open
             // parameter above.)
             if let Some(shard) = self.wire_chunk {
                 e.set_wire_chunking(shard);
@@ -601,7 +543,6 @@ impl RemotePyroWave {
         Ok(self.inline.as_mut().expect("just opened"))
     }
 
-    /// One whole AU from whichever half is live, worker leftovers first.
     fn poll_whole(&mut self) -> Result<Option<EncodedFrame>> {
         if let Some(f) = self.pending.pop_front() {
             return Ok(Some(f));
@@ -615,12 +556,9 @@ impl RemotePyroWave {
 
 impl Encoder for RemotePyroWave {
     fn submit(&mut self, frame: &CapturedFrame) -> Result<()> {
-        // A CPU-backed frame can genuinely reach this encoder — a 4:4:4 PyroWave session with
-        // zero-copy off takes the host's `force_cpu_for_nvenc_444` arm, and the process-wide
-        // raw-dmabuf degrade latch flips later sessions to CPU delivery — and it must never cross
-        // the socket: 1080p BGRA is ~8 MB, i.e. ~480 MB/s at 60 fps. The in-process encoder
-        // uploads it straight into its own device, which is what the CPU arm of `submit_frame`
-        // has always done, so this is just one more rung of the same ladder.
+        // CPU-backed frames reach this encoder (4:4:4 with zero-copy off; the raw-dmabuf degrade
+        // latch). 1080p BGRA is ~8 MB (~480 MB/s at 60 fps) and must not cross the socket; the
+        // in-process encoder uploads into its own device.
         if self.link.is_some() && !matches!(frame.payload, FramePayload::Dmabuf(_)) {
             self.pin_inline(
                 "capture delivered a non-dmabuf frame, which the worker path cannot take",
@@ -638,17 +576,14 @@ impl Encoder for RemotePyroWave {
                     return Ok(());
                 }
                 Err(Fail::Dead(e)) => {
-                    // The worker is gone. Surface it: the host's encoder-rebuild path runs, and
-                    // `reset` below is where the single respawn attempt lives.
+                    // Worker gone. Surface it so the host rebuild path runs; `reset` is the one
+                    // respawn.
                     self.link = None;
                     return Err(e.context("pyrowave encode worker"));
                 }
                 Err(Fail::Encode(message)) => {
-                    // The worker is alive but refused this frame. Re-run it in-process — the
-                    // recovery machinery for every cause of this lives on THIS side (the
-                    // raw-dmabuf degrade latch is a host-process static), so the caller gets the
-                    // in-process outcome, latch included, instead of a frame dropped in a
-                    // subprocess.
+                    // Worker alive but refused this frame. Re-run in-process: the recovery
+                    // machinery (raw-dmabuf degrade latch is a host-process static) lives here.
                     self.pin_inline(&format!("the worker failed a frame: {message}"));
                 }
             }
@@ -657,15 +592,15 @@ impl Encoder for RemotePyroWave {
     }
 
     fn submit_indexed(&mut self, frame: &CapturedFrame, wire_index: u32) -> Result<()> {
-        // Mirrors the in-process impl, which takes the trait default: every PyroWave AU is a
-        // keyframe, so there is no per-frame reference bookkeeping to pin to the wire index.
+        // Every PyroWave AU is a keyframe, so there is no per-frame reference bookkeeping to pin
+        // to the wire index.
         let _ = wire_index;
         self.submit(frame)
     }
 
     fn caps(&self) -> EncoderCaps {
         // Once in-process, the live encoder is authoritative; before that, the values the worker
-        // reported for the encoder it really opened.
+        // reported for the encoder it opened.
         match self.inline.as_ref() {
             Some(e) => e.caps(),
             None => self.caps,
@@ -673,7 +608,7 @@ impl Encoder for RemotePyroWave {
     }
 
     fn request_keyframe(&mut self) {
-        // Intra-only: every AU is already a keyframe (mirrors the in-process impl's default).
+        // Intra-only: every AU is already a keyframe.
     }
 
     fn set_hdr_meta(&mut self, _meta: Option<punktfunk_core::quic::HdrMeta>) {
@@ -686,25 +621,19 @@ impl Encoder for RemotePyroWave {
     }
 
     fn distrust_references(&mut self) {
-        // Nothing to distrust, for the same reason `invalidate_ref_frames` has nothing to
-        // invalidate and `request_keyframe` has nothing to request: PyroWave is intra-only, so
-        // every AU is already a keyframe and no RFI anchor trust exists to withdraw. The
-        // in-process encoder reaches the same answer by inheriting the trait's default.
-        //
-        // Written out rather than inherited BECAUSE this is the proxy. An unforwarded default here
-        // would mean the worker never hears the call — which for a method that does something is a
-        // feature silently dead on every worker-backed session, and is exactly what the
-        // trait-coverage test below exists to catch. The no-op has to be a visible decision.
+        // Intra-only: no RFI anchor trust to withdraw. Written out rather than inherited because
+        // this is the proxy — an unforwarded default would mean the worker never hears the call.
+        // The trait-coverage test below exists to catch that. The no-op is a visible decision.
     }
 
     fn set_pipelined(&mut self, _on: bool) -> bool {
-        // No pipelined-retrieve mode; the encode is synchronous by design.
+        // Encode is synchronous; no pipelined-retrieve mode.
         false
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
-        // Trait contract (PW6): each AU is drained through ONE method. Same wording as the
-        // in-process impl, because it is the same caller bug.
+        // Each AU is drained through one method. Same wording as the in-process impl: same
+        // caller bug.
         if self.chunker.is_some() {
             bail!("pyrowave: poll() on an AU already being drained through poll_chunk");
         }
@@ -712,17 +641,13 @@ impl Encoder for RemotePyroWave {
     }
 
     fn supports_chunked_poll(&self) -> bool {
-        // Exactly the in-process answer: the cut rule is a pure function of the boundary, and the
-        // boundary is mirrored here.
         stream_chunk_step(self.wire_chunk).is_some()
     }
 
     fn poll_chunk(&mut self) -> Result<Option<AuChunk>> {
-        // The streamed-AU cut needs NO protocol. `submit` is synchronous on both sides of the
-        // socket, so an AU that reached `pending` is complete by construction and the identical
-        // `AuChunker` runs here — sub-frame send latency survives at zero wire cost. The chunker
-        // is the proxy's in BOTH modes (the fallback's `poll_chunk` is never called), so exactly
-        // one cursor can ever be open.
+        // Streamed-AU cut needs no protocol. `submit` is synchronous, so an AU in `pending` is
+        // complete and the same `AuChunker` runs here. The chunker is the proxy's in both modes
+        // (the fallback's `poll_chunk` is never called), so exactly one cursor can be open.
         if let Some(c) = self.chunker.as_mut() {
             if let Some(chunk) = c.next() {
                 return Ok(Some(chunk));
@@ -739,23 +664,15 @@ impl Encoder for RemotePyroWave {
     }
 
     fn reset(&mut self) -> bool {
-        // A rebuild forfeits every in-flight frame, including an AU only half-handed-out — drop
-        // the cursor first so the next `poll_chunk` cannot splice the tail of a dead AU onto a
-        // fresh one.
+        // A rebuild forfeits every in-flight frame, including a half-handed-out AU — drop the
+        // cursor first so the next `poll_chunk` cannot splice a dead AU's tail onto a fresh one.
         self.chunker = None;
         self.pending.clear();
         if let Some(link) = self.link.as_mut() {
-            // A message, not a respawn, and deliberately: the expensive, capability-dependent
-            // thing is the priority-elevated DEVICE, and an in-worker reset keeps it. A respawn
-            // would re-run the whole global-priority ladder mid-session and could silently land on
-            // a different class than the one this session has been measured at — changing the very
-            // quantity the worker exists to protect — and it would pay the full Vulkan (and, until
-            // WP-D, FFmpeg) load inside the stall watchdog's recovery window. The in-process
-            // `reset` it forwards to is already the bounded, wedge-aware rebuild: it re-waits the
-            // in-flight fences under a 5 s cap and reports failure rather than destroying a
-            // pyrowave encoder under live GPU work. And if the worker is itself wedged, this
-            // request times out and falls through to the rung below — so respawn stays reachable
-            // as the failure path without being the policy.
+            // A Reset message, not a respawn: the expensive thing is the priority-elevated
+            // device. A respawn would re-run the global-priority ladder and could land on a
+            // different class than this session was measured at. A wedged worker times this
+            // out and falls through to the one-respawn rung below.
             match link.request(&ToWorker::Reset, &[]) {
                 Ok(FromWorker::Ack { ok }) => return ok,
                 Ok(other) => {
@@ -772,7 +689,6 @@ impl Encoder for RemotePyroWave {
                 }
             }
         }
-        // One respawn, and only while nothing has fallen back yet.
         if self.link.is_none() && self.inline.is_none() && !self.respawn_used {
             self.respawn_used = true;
             match spawn_link(&self.worker_path, &self.params, self.bitrate_bps) {
@@ -780,7 +696,7 @@ impl Encoder for RemotePyroWave {
                     self.caps = hs.caps;
                     self.link = Some(hs.link);
                     if let Some(shard) = self.wire_chunk {
-                        // Same replay the in-process fallback does, for the same reason.
+                        // Same replay the in-process fallback does: the boundary changes AU bytes.
                         self.set_wire_chunking(shard);
                     }
                     tracing::info!(
@@ -800,7 +716,7 @@ impl Encoder for RemotePyroWave {
         }
         let already_open = self.inline.is_some();
         match self.inline_mut() {
-            // A freshly opened in-process encoder IS the rebuild the caller asked for.
+            // A freshly opened in-process encoder is the rebuild the caller asked for.
             Ok(e) => {
                 if already_open {
                     e.reset()
@@ -820,8 +736,8 @@ impl Encoder for RemotePyroWave {
     }
 
     fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
-        // Kept regardless of which half is live: a later in-process fallback opens at the rate ABR
-        // actually settled on, not the one the session started with.
+        // Kept regardless of which half is live: a later fallback opens at the rate ABR settled
+        // on, not the session start rate.
         self.bitrate_bps = bps;
         if let Some(link) = self.link.as_mut() {
             match link.request(&ToWorker::Reconfigure { bitrate_bps: bps }, &[]) {
@@ -837,43 +753,40 @@ impl Encoder for RemotePyroWave {
                     "pyrowave: the encode worker did not accept a bitrate retarget"
                 ),
             }
-            // Not a lie to the ABR controller: report failure and let it use its rebuild path,
-            // which lands on `reset` above.
+            // Report failure and let ABR use its rebuild path, which lands on `reset`.
             return false;
         }
         match self.inline.as_mut() {
             Some(e) => e.reconfigure_bitrate(bps),
-            // Nothing is open yet, and the new rate is now the one the open will use.
+            // Nothing is open yet; the new rate is now the one the open will use.
             None => true,
         }
     }
 
     fn applied_bitrate_bps(&self) -> Option<u64> {
-        // Mirrors the in-process impl (the trait default): PyroWave applies the requested rate as
-        // a per-frame byte budget with no internal clamp to report.
+        // PyroWave applies the requested rate as a per-frame byte budget with no internal clamp
+        // to report.
         None
     }
 
     fn set_wire_chunking(&mut self, shard_payload: usize) {
-        // The same sanity floor as the in-process impl, applied HERE so the mirrored state and the
-        // worker's can never disagree about whether chunking is on.
+        // Same sanity floor as the in-process impl, applied here so mirrored state and the
+        // worker's cannot disagree about whether chunking is on.
         if shard_payload < 64 {
             return;
         }
         self.wire_chunk = Some(shard_payload);
         if let Some(link) = self.link.as_mut() {
-            // This one really does have to cross: it changes the packetize boundary and the rate
-            // budget, i.e. the AU BYTES. Only the streamed-AU CUT stays host-side.
+            // Must cross: it changes the packetize boundary and the rate budget (AU bytes).
+            // Only the streamed-AU cut stays host-side.
             if let Err(e) = link.request(&ToWorker::SetWireChunking { shard_payload }, &[]) {
                 tracing::warn!(
                     error = %format!("{e:#}"),
                     "pyrowave: the encode worker did not accept the datagram-aligned boundary"
                 );
             }
-            // Deliberately NOT word-for-word the in-process line: the worker emits that one
-            // itself (to inherited stderr), and two identical sentences from two processes read
-            // as a bug. This is the host-ring copy — the web console's Logs tab only ever sees
-            // this process — and it says what actually happened here.
+            // Not the in-process sentence: the worker emits that one itself, and two identical
+            // lines from two processes read as a bug. This is the host-ring copy.
             tracing::info!(
                 shard_payload,
                 "pyrowave: datagram-aligned packetization forwarded to the encode worker \
@@ -895,9 +808,8 @@ impl Encoder for RemotePyroWave {
     }
 
     fn flush(&mut self) -> Result<()> {
-        // Nothing is ever in flight ACROSS the socket: `submit` returns only once the AU is in
-        // `pending`, so there is no worker-side backlog a flush could drain — unlike the
-        // in-process encoder, whose `submit`/`poll` split really does leave a fence unwaited.
+        // Nothing is in flight across the socket: `submit` returns only once the AU is in
+        // `pending`. Unlike the in-process encoder, whose `submit`/`poll` split leaves a fence.
         match self.inline.as_mut() {
             Some(e) => e.flush(),
             None => Ok(()),
@@ -922,8 +834,8 @@ mod tests {
         }
     }
 
-    /// A `Link` wired to a socket the test drives itself — the shape pf-zerocopy's importer tests
-    /// use, and the only way to exercise the per-frame path without a GPU.
+    /// A `Link` wired to a socket the test drives itself — the only way to exercise the per-frame
+    /// path without a GPU.
     fn mock_link(sock: OwnedFd, au_buf: File) -> Link {
         Link {
             sock,
@@ -935,8 +847,7 @@ mod tests {
         }
     }
 
-    /// [`handshake`] driven against a socket instead of a spawned child — the process rungs get
-    /// their own tests; this one exercises what the worker SAYS.
+    /// [`handshake`] against a socket instead of a spawned child.
     fn handshake_on(sock: OwnedFd) -> Result<Handshake> {
         handshake(mock_link(sock, File::from(memfd())), &params(), 40_000_000)
     }
@@ -978,14 +889,14 @@ mod tests {
             move |p: &Path| p == a || p == b
         };
 
-        // `off`, in every spelling the row promises — the debug escape hatch.
+        // `off`, in every spelling the row promises.
         for v in ["off", "OFF", " Off "] {
             assert_eq!(
                 resolve_worker_path_in(Some(v), Some(here), Some("/usr/bin"), &exists),
                 WorkerPath::Off
             );
         }
-        // An explicit path wins over both discoveries — the NixOS wrapper case…
+        // An explicit path wins over both discoveries — the NixOS wrapper case.
         assert_eq!(
             resolve_worker_path_in(
                 Some("/run/wrappers/bin/punktfunk-encode-worker"),
@@ -995,8 +906,7 @@ mod tests {
             ),
             WorkerPath::Found("/run/wrappers/bin/punktfunk-encode-worker".into())
         );
-        // …and it is NOT existence-checked, so a typo surfaces as a spawn failure naming the path
-        // instead of silently falling through to a worker that happens to be installed.
+        // Not existence-checked, so a typo surfaces as a spawn failure naming the path.
         assert_eq!(
             resolve_worker_path_in(
                 Some("/nope/pf-worker"),
@@ -1026,7 +936,7 @@ mod tests {
             ),
             WorkerPath::Found(on_path)
         );
-        // Nothing anywhere: the "missing binary" rung.
+        // Nothing anywhere: the missing-binary rung.
         assert_eq!(
             resolve_worker_path_in(None, Some(Path::new("/nowhere")), Some("/nope"), &exists),
             WorkerPath::Missing
@@ -1039,8 +949,7 @@ mod tests {
 
     /// A binary that exists, execs, and exits at once. Resolved off `PATH` rather than hardcoded
     /// to `/bin/false`: NixOS ships only `/bin/sh` in `/bin`, and `PinnedExe::open` needs a real
-    /// path (so a bare name cannot stand in for one — it would fail the OPEN and take the
-    /// spawn-failure rung instead of the handshake rung this exercises).
+    /// path (a bare name would fail OPEN and take the spawn-failure rung).
     fn a_binary_that_exits_immediately() -> PathBuf {
         std::env::var_os("PATH")
             .as_deref()
@@ -1053,15 +962,9 @@ mod tests {
     }
 
     /// Ladder rung: the binary exists and runs but is not a worker — the same rung a worker that
-    /// dies during Vulkan bring-up takes.
-    ///
-    /// Which HALF of the handshake reports the death is a race this test deliberately does not
-    /// try to win: the child exits while the parent is still writing, so the send either lands in
-    /// a socket whose peer is still open (and the death surfaces as the EOF the recv reads) or
-    /// finds it already closed (EPIPE). CI, being slower and more loaded than a dev box, lands on
-    /// the EPIPE side often enough that pinning the EOF wording alone flakes — so what is pinned
-    /// is the operator-visible contract that holds on BOTH sides. The EPIPE half also has a
-    /// deterministic test of its own below; this one keeps a real spawn+exec in the ladder.
+    /// dies during Vulkan bring-up takes. Which half of the handshake reports the death is a
+    /// race this test does not pin: send-then-EOF vs EPIPE. What is pinned is that both name
+    /// the handshake.
     #[test]
     fn a_worker_that_exits_immediately_is_a_handshake_failure() {
         let err =
@@ -1073,10 +976,8 @@ mod tests {
         );
     }
 
-    /// The EPIPE half of the rung above, without the race: the peer is closed BEFORE the
-    /// handshake starts, so the Hello send cannot succeed. Deterministic, and it fails if anyone
-    /// trims the send's context back to a bare "send Hello" — which is exactly the drift that
-    /// made the spawn-driven test flake in CI.
+    /// EPIPE half of the rung above, without the race: the peer is closed before Hello, so the
+    /// send cannot succeed. Fails if the send's context is trimmed to a bare "send Hello".
     #[test]
     fn a_worker_that_died_before_hello_still_names_the_handshake() {
         let (host, peer) = ipc::socketpair_seqpacket().unwrap();
@@ -1089,8 +990,8 @@ mod tests {
         );
     }
 
-    /// Ladder rung: a binary that does not exist at all — an operator-set `PUNKTFUNK_ENCODE_WORKER`
-    /// typo, or a half-installed package.
+    /// Ladder rung: a binary that does not exist — operator-set path typo, or a half-installed
+    /// package.
     #[test]
     fn a_missing_binary_is_a_spawn_failure() {
         let err = spawn_link(
@@ -1102,10 +1003,8 @@ mod tests {
         assert!(format!("{err:#}").contains("punktfunk-encode-worker"));
     }
 
-    /// Ladder rung: the worker started, spoke, and could not open its encoder (no Vulkan 1.3
-    /// device, a missing feature). Not a death — an ANSWER, and the host encodes in-process,
-    /// where the same cause will either reproduce or turn out to have been the worker's own
-    /// environment.
+    /// Ladder rung: the worker started, spoke, and could not open its encoder. An answer, not a
+    /// death, so the host encodes in-process.
     #[test]
     fn an_init_error_fails_the_handshake_without_looking_like_a_death() {
         let (host, peer) = ipc::socketpair_seqpacket().unwrap();
@@ -1130,11 +1029,9 @@ mod tests {
         );
     }
 
-    /// Ladder rung: a dead worker gets **one** respawn from `reset`, then the session is
-    /// in-process for good. Driven with a dead socket and `/bin/false` as the worker binary, so
-    /// the respawn attempt is real and fails; what is pinned here is the budget, which is the part
-    /// that must not drift — a proxy that retried every `reset` would burn the host's five-reset
-    /// recovery budget on a worker that is not coming back and end the session.
+    /// Ladder rung: a dead worker gets one respawn from `reset`, then the session is in-process.
+    /// Driven with a dead socket and `/bin/false` so the respawn attempt is real and fails. A
+    /// proxy that retried every `reset` would burn the host's five-reset recovery budget.
     #[test]
     fn reset_respawns_the_worker_at_most_once() {
         let (host, peer) = ipc::socketpair_seqpacket().unwrap();
@@ -1153,8 +1050,7 @@ mod tests {
             chunker: None,
             respawn_used: false,
         };
-        // The reply never comes: the link dies, the one respawn is spent and fails, and the
-        // session is in-process from here.
+        // Reply never comes: the link dies, the one respawn is spent and fails, session in-process.
         let _ = proxy.reset();
         assert!(proxy.respawn_used, "the one respawn must have been spent");
         assert!(proxy.link.is_none(), "/bin/false cannot become a worker");
@@ -1164,11 +1060,10 @@ mod tests {
         assert!(proxy.link.is_none());
     }
 
-    /// Ladder rung: a CPU-backed frame. It genuinely reaches this encoder (a 4:4:4 session with
-    /// zero-copy off, or after the raw-dmabuf degrade latch fires), and ~8 MB per frame must never
-    /// cross the socket — so the session leaves the worker for good. Asserts the CLASSIFICATION
-    /// (the link is dropped) and not the submit result, which depends on whether the box running
-    /// the test has a Vulkan device to open the in-process encoder on.
+    /// Ladder rung: a CPU-backed frame. It reaches this encoder (4:4:4 with zero-copy off, or
+    /// after the raw-dmabuf degrade latch), and ~8 MB per frame must never cross the socket.
+    /// Asserts the classification (link dropped), not the submit result, which needs a Vulkan
+    /// device for the in-process encoder.
     #[test]
     fn a_cpu_frame_leaves_the_worker_for_the_rest_of_the_session() {
         let (host, peer) = ipc::socketpair_seqpacket().unwrap();
@@ -1256,9 +1151,8 @@ mod tests {
         }
     }
 
-    /// The per-frame path end to end, host side: the fd crosses ONCE, the cursor bitmap crosses
-    /// only when its serial changes, and the AU comes back through the memfd rather than the
-    /// message body.
+    /// Per-frame path, host side: the fd crosses once, the cursor bitmap only when its serial
+    /// changes, and the AU comes back through the memfd rather than the message body.
     #[test]
     fn frames_pass_the_fd_once_and_the_au_comes_back_through_the_buffer() {
         let (host, peer) = ipc::socketpair_seqpacket().unwrap();
@@ -1317,7 +1211,7 @@ mod tests {
                 visible: true,
             })
         };
-        // The SAME buffer three times (one memfd, re-passed), with the cursor bitmap changing once.
+        // Same buffer three times (one memfd, re-passed), with the cursor bitmap changing once.
         let dmabuf = memfd();
         for c in [cursor(1), cursor(1), cursor(2)] {
             let f = frame(dmabuf.try_clone().unwrap(), c);
@@ -1342,7 +1236,7 @@ mod tests {
         );
     }
 
-    /// A `NeedFd` (the worker evicted the key) is answered by ONE retry carrying the fd again.
+    /// A `NeedFd` (worker evicted the key) is answered by one retry carrying the fd again.
     #[test]
     fn need_fd_resends_the_descriptor_once() {
         let (host, peer) = ipc::socketpair_seqpacket().unwrap();
@@ -1389,8 +1283,8 @@ mod tests {
         assert_eq!(server.join().unwrap(), vec![(false, 0), (true, 1)]);
     }
 
-    /// Ladder rung: the worker dies mid-stream. The transport error must classify as `Dead` (the
-    /// host's rebuild path, then one respawn) and never as a per-frame encode error.
+    /// Ladder rung: the worker dies mid-stream. The transport error must classify as `Dead`
+    /// (host rebuild, then one respawn) and never as a per-frame encode error.
     #[test]
     fn a_worker_that_dies_mid_stream_is_a_transport_death() {
         let (host, peer) = ipc::socketpair_seqpacket().unwrap();
@@ -1404,8 +1298,8 @@ mod tests {
         }
     }
 
-    /// …and a worker that is alive and refuses the frame classifies as `Encode`, which pins the
-    /// session in-process so the raw-dmabuf degrade latch (a HOST-process static) still fires.
+    /// A live worker that refuses the frame classifies as `Encode`, which pins the session
+    /// in-process so the raw-dmabuf degrade latch (a host-process static) still fires.
     #[test]
     fn a_refused_frame_is_an_encode_error() {
         let (host, peer) = ipc::socketpair_seqpacket().unwrap();
@@ -1431,11 +1325,9 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// WP7.7 guard, applied to the proxy: every `Encoder` trait method must be explicitly written
-    /// here. The proxy has TWO backends under it, so an unforwarded default is worse than the
-    /// `TrackedEncoder` case it copies — it would silently disable a feature only in the
-    /// worker-backed half of the ladder, i.e. on exactly the hosts that got the new code path.
-    /// Source-text parse, same as `tracked_encoder_forwards_every_trait_method`.
+    /// Every `Encoder` trait method must be written here. The proxy has two backends, so an
+    /// unforwarded default silently disables a feature only on worker-backed sessions. Source-text
+    /// parse, same as `tracked_encoder_forwards_every_trait_method`.
     #[test]
     fn the_proxy_writes_every_trait_method() {
         fn item_block<'a>(src: &'a str, marker: &str) -> &'a str {

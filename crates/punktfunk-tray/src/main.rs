@@ -1,16 +1,18 @@
-//! punktfunk-tray — a small per-user system-tray companion for the punktfunk host service.
+//! Per-user system-tray companion for the punktfunk host.
 //!
-//! Shows at a glance whether the host is running / stopped / degraded / failed (no more digging
-//! through logs after a reboot or an update), and offers the common one-click actions: open the
-//! web console, start/stop/restart the service (UAC-elevated per action on Windows,
-//! `systemctl --user` on Linux), review a pending pairing request, exit.
+//! Icon and menu: running / stopped / degraded / failed, plus open-console,
+//! start/stop/restart (UAC per action on Windows, `systemctl --user` on Linux),
+//! pairing, and exit.
 //!
-//! Status comes from two sources, service manager FIRST (a fake listener on the mgmt port can
-//! never make a stopped service look running): the SCM / systemd user unit for the process state,
-//! then the host's loopback-only unauthenticated `GET /api/v1/local/summary` for the streaming
-//! details. Windows-subsystem binary — a console exe in the HKLM Run key would flash a terminal
-//! window at every sign-in.
-// Unsafe-proof program: every `unsafe {}` in the tray carries a `// SAFETY:` proof.
+//! Process state is SCM / the systemd user unit first; a listener on the mgmt
+//! port cannot make a stopped service look running. Streaming detail is
+//! loopback `GET /api/v1/local/summary`. `--mgmt-port` pins the port; otherwise
+//! it follows `<config_dir>/mgmt-endpoint`, then 47990.
+//!
+//! Poller: `status.rs`. Linux SNI: `linux.rs`. Windows notify-icon: `win.rs`.
+//!
+//! `#![windows_subsystem = "windows"]`: a console-subsystem exe in the HKLM
+//! Run key flashes a terminal at every sign-in.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(target_os = "linux")]
@@ -22,25 +24,17 @@ mod win;
 #[cfg(windows)]
 mod win_theme;
 
-/// CLI configuration (hand-rolled parse, house style). The mgmt address defaults to loopback; the
-/// port, when not given, follows what the host PUBLISHED (`<config_dir>/mgmt-endpoint`, rewritten
-/// on every host start — see `pf_paths::published_mgmt_port`), falling back to 47990. That file is
-/// how a moved `PUNKTFUNK_MGMT_BIND` reaches the tray: it cannot read `host.env` on Windows (DACL-
-/// locked to SYSTEM/Administrators), and before this an operator who moved the port had to know to
-/// edit the autostart command line — nobody did, and the tray reported a running host as
-/// unreachable (field report 2026-08-18). `--mgmt-port` still pins it explicitly.
+/// The tray cannot read `host.env` on Windows (DACL-locked to
+/// SYSTEM/Administrators); `--mgmt-port` still pins the port.
 pub struct Args {
-    /// Ask an already-running tray instance to exit (Windows; used by the uninstaller).
+    /// Windows uninstaller: ask this session's instance to exit.
     pub quit: bool,
-    /// Launched from the desktop autostart entry: exit silently when this box doesn't run a host
-    /// (Linux; the package installs the autostart file for every desktop user).
+    /// Autostart: exit silently when this user is not a host (Linux installs it for every user).
     pub autostart: bool,
-    /// Management API address to poll (loopback only; the summary route rejects anything else).
+    /// Loopback by default; the summary route rejects anything else.
     pub mgmt_addr: String,
-    /// `None` = follow the published endpoint (re-read on every poll, so a host restarted on a new
-    /// port is picked up without relaunching the tray).
+    /// `None` re-reads the published endpoint every poll.
     pub mgmt_port: Option<u16>,
-    /// Web console port for the "Open web console" action.
     pub web_port: u16,
 }
 
@@ -84,8 +78,7 @@ fn parse_args() -> anyhow::Result<Args> {
 }
 
 fn main() -> anyhow::Result<()> {
-    // punktfunk-core is a Windows/Linux-only dependency here (the macOS build is a stub), so the
-    // provider install follows the same cfg as `run`.
+    // Same cfg as `run`; other targets stub and never poll TLS.
     #[cfg(any(windows, target_os = "linux"))]
     punktfunk_core::tls::install_default_provider();
     let args = parse_args()?;
@@ -104,6 +97,5 @@ fn run(args: Args) -> anyhow::Result<()> {
 
 #[cfg(not(any(windows, target_os = "linux")))]
 fn run(_args: Args) -> anyhow::Result<()> {
-    // Workspace-stub build (macOS CI etc.) — the tray ships on Windows and Linux only.
     anyhow::bail!("punktfunk-tray supports Windows and Linux hosts only")
 }

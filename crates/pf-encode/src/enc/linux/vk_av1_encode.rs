@@ -1,17 +1,15 @@
-//! Vendored `VK_KHR_video_encode_av1` bindings — the AV1-encode structs, `StdVideoEncodeAV1*`
-//! types and struct-type constants that our pinned `ash 0.38.0+1.3.281` does not ship (the
-//! extension was finalized in Vulkan 1.3.290). Bumping `ash` to git-master (`+1.4.352`, which has
-//! them) breaks the *client*: it drops the lifetime on `vk::AllocationCallbacks`, and `sdl3-sys`'s
-//! `ash` feature still generates `AllocationCallbacks<'static>`, so the presenter's SDL/Vulkan
-//! surface path won't compile. Rather than churn the client for a host-only need, we vendor just
-//! the encode-side definitions here, **copied verbatim from ash-master's generated code** (so the
-//! layouts are correct-by-construction) and chain them into ash's generic video-encode-queue calls
-//! via raw `p_next`, exactly as the HEVC path already chains its rate-control struct.
+//! Vendored `VK_KHR_video_encode_av1` encode structs, `StdVideoEncodeAV1*` types, and
+//! `VkStructureType` constants that pinned `ash 0.38.0+1.3.281` does not ship (the
+//! extension landed in Vulkan 1.3.290). Copied from ash-master generated code and
+//! chained into ash's generic video-encode-queue calls via raw `p_next`.
 //!
-//! Everything *common* to AV1 (sequence header, tile/quant/loop-filter/CDEF/… sub-structs, the
-//! `StdVideoAV1*` enums) is already present in 1.3.281's `ash::vk::native` — AV1 **decode** brought
-//! it in — so we reuse those and vendor only the encode-specific pieces. Delete this module and
-//! switch to `ash::vk::*` once `ash` publishes a 1.4.x release and `sdl3-sys` regenerates.
+//! Do not bump `ash` to git-master for these: it drops the lifetime on
+//! `vk::AllocationCallbacks`, and `sdl3-sys`'s `ash` feature still generates
+//! `AllocationCallbacks<'static>`, so the presenter's SDL/Vulkan surface path will
+//! not compile. Common AV1 types (`StdVideoAV1*` sequence/tile/quant/…) already
+//! live in `ash::vk::native` from decode. Layout is pinned by the `const` ABI
+//! assertions below and `abi_tests` for bitfields. Delete this module once `ash`
+//! publishes 1.4.x and `sdl3-sys` regenerates.
 #![allow(non_snake_case, non_camel_case_types, dead_code)]
 
 use ash::vk;
@@ -21,11 +19,8 @@ use ash::vk::native::{
 };
 use std::ffi::{c_void, CStr};
 
-/// `VK_KHR_video_encode_av1` extension name — ash 0.38's `ash::khr::video_encode_av1` doesn't exist,
-/// so we pass this raw to `enabled_extension_names`.
 pub const EXTENSION_NAME: &CStr = c"VK_KHR_video_encode_av1";
 
-// ---------- struct-type (VkStructureType) values — construct via `vk::StructureType::from_raw` ----------
 pub const ST_CAPABILITIES: i32 = 1_000_513_000;
 pub const ST_SESSION_PARAMETERS_CREATE_INFO: i32 = 1_000_513_001;
 pub const ST_PICTURE_INFO: i32 = 1_000_513_002;
@@ -37,18 +32,15 @@ pub const ST_RATE_CONTROL_LAYER_INFO: i32 = 1_000_513_007;
 pub const ST_SESSION_CREATE_INFO: i32 = 1_000_513_009;
 pub const ST_GOP_REMAINING_FRAME_INFO: i32 = 1_000_513_010;
 
-/// `VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR` (bit 18).
+/// Bit 18 of `VkVideoCodecOperationFlagBitsKHR`.
 pub const VIDEO_CODEC_OPERATION_ENCODE_AV1: u32 = 0x0004_0000;
-/// `VK_MAX_VIDEO_AV1_REFERENCES_PER_FRAME_KHR` — LAST..ALTREF (the 7 inter reference names).
+/// LAST..ALTREF — the seven inter reference names.
 pub const MAX_VIDEO_AV1_REFERENCES_PER_FRAME: usize = 7;
-/// `STD_VIDEO_AV1_PRIMARY_REF_NONE` — a frame that inherits no CDF/context from any reference
-/// (the recovery-anchor lever: a clean P-frame independent of prior probability state).
+/// Sentinel past LAST..ALTREF: inherit no CDF/context from any reference.
 pub const PRIMARY_REF_NONE: u8 = 7;
-/// `VK_VIDEO_ENCODE_AV1_SUPERBLOCK_SIZE_128_BIT_KHR` (bit 1 of the superblock-size flags).
+/// Bit 1 of the superblock-size flags.
 pub const SUPERBLOCK_SIZE_128: u32 = 0x2;
 
-// `VkVideoEncodeAV1CapabilityFlagBitsKHR` — the two that decide whether the encode source may be a
-// different size from the declared frame. Both absent on RADV PHOENIX.
 /// Without this, the source's `codedExtent` MUST equal the sequence header's
 /// `max_frame_{width,height}_minus_1 + 1` (`VUID-vkCmdEncodeVideoKHR-flags-10324`).
 pub const CAPABILITY_FRAME_SIZE_OVERRIDE: u32 = 0x0000_0008;
@@ -56,18 +48,16 @@ pub const CAPABILITY_FRAME_SIZE_OVERRIDE: u32 = 0x0000_0008;
 /// (`VUID-vkCmdEncodeVideoKHR-flags-10325`).
 pub const CAPABILITY_MOTION_VECTOR_SCALING: u32 = 0x0000_0010;
 
-// `VkVideoEncodeAV1PredictionModeKHR`
 pub const PREDICTION_MODE_INTRA_ONLY: i32 = 0;
 pub const PREDICTION_MODE_SINGLE_REFERENCE: i32 = 1;
-// `VkVideoEncodeAV1RateControlGroupKHR`
 pub const RC_GROUP_INTRA: i32 = 0;
 pub const RC_GROUP_PREDICTIVE: i32 = 1;
 pub const RC_GROUP_BIPREDICTIVE: i32 = 2;
 
-// AV1 reference names (index into `reference_name_slot_indices`, which is 0-based over LAST..ALTREF).
-pub const REFERENCE_NAME_LAST_FRAME_IDX: usize = 0; // STD_VIDEO_AV1_REFERENCE_NAME_LAST_FRAME - 1
+// Index into `reference_name_slot_indices` (0-based LAST..ALTREF). The STD enum is 1-based.
+pub const REFERENCE_NAME_LAST_FRAME_IDX: usize = 0;
 
-// ---------- bindgen bitfield helper (copied verbatim from ash-master native.rs) ----------
+// Copied from ash-master `native.rs`; bit indices must stay bindgen's order.
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct __BindgenBitfieldUnit<Storage> {
@@ -140,7 +130,6 @@ where
     }
 }
 
-// ---------- Std encode structs (copied from ash-master native.rs; common Std types reused from ash) ----------
 #[repr(C, align(4))]
 #[derive(Debug, Copy, Clone)]
 pub struct StdVideoEncodeAV1PictureInfoFlags {
@@ -337,8 +326,8 @@ pub struct StdVideoEncodeAV1ExtensionHeader {
     pub spatial_id: u8,
 }
 
-// ---------- KHR extension structs (repr(C); lifetimes/PhantomData dropped — layout-identical,
-//            chained by raw p_next). Flag/enum newtypes flattened to their u32/i32 repr. ----------
+// Layout-identical to the KHR structs with ash lifetimes/`PhantomData` dropped; chain via raw
+// `p_next`. Flag/enum newtypes flattened to their `u32`/`i32` repr.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct VideoEncodeAV1ProfileInfoKHR {
@@ -347,9 +336,7 @@ pub struct VideoEncodeAV1ProfileInfoKHR {
     pub std_profile: StdVideoAV1Profile,
 }
 
-/// `VkPhysicalDeviceVideoEncodeAV1FeaturesKHR` — the `videoEncodeAV1` feature MUST be enabled at
-/// device creation for any `VK_VIDEO_CODEC_OPERATION_ENCODE_AV1` use (a spec requirement RADV may
-/// tolerate omitting but validation layers and stricter drivers do not).
+/// `videoEncodeAV1` must be enabled at device creation for any encode-AV1 use.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct PhysicalDeviceVideoEncodeAV1FeaturesKHR {
@@ -502,31 +489,15 @@ pub struct StdVideoEncodeAV1OperatingPointInfo {
     pub initial_display_delay_minus_1: u8,
 }
 
-/// `vk::StructureType` for a raw `ST_*` constant above.
 #[inline]
 pub fn stype(raw: i32) -> vk::StructureType {
     vk::StructureType::from_raw(raw)
 }
 
-// ---------- ABI layout guard ----------
-//
-// These structs are hand-copied and handed to the driver through raw `p_next` chains, so nothing in
-// the type system relates them to the C definitions any more: an edit that inserts, drops, widens or
-// re-pads a field is not a compile error, it is the driver reading our bytes at the wrong offsets.
-// The assertions below are the missing compile error. They are `const` rather than `#[cfg(test)]`
-// (the shape `amf.rs` uses) so they hold in every build, including the shipped one, and on any
-// target this module compiles for.
-//
-// What they catch: a changed field width, an inserted or removed field, a changed array length, a
-// padding assumption that only holds on one target. What they CANNOT catch: swapping two fields of
-// the same type — offsets are unchanged. That case is only caught by reading the registry, so the
-// field order here was diffed against `vulkan_core.h` and `vk_video/vulkan_video_codec_av1std_encode.h`
-// (Vulkan-Headers `main`, 2026-07-25) when these assertions were written, along with every `ST_*`,
-// flag-bit and enum value above; the bitfield member order is pinned by the test module below.
-//
-// Deliberately duplicated in `vk_valve_rgb.rs` rather than shared: both modules exist to be deleted
-// wholesale once `ash` ships these bindings, and a shared helper would make deleting one break the
-// other.
+// Hand-copied layouts go to the driver via raw `p_next`; a field insert/drop/widen is a silent
+// offset bug. `const` (not `#[cfg(test)]`) so every build catches size/align/offset. Same-type
+// field swaps are invisible here — order is pinned against the headers; bitfields by `abi_tests`.
+// Duplicated in `vk_valve_rgb.rs`: both modules delete when ash ships these, so do not share.
 macro_rules! assert_abi_layout {
     ($t:ty { size: $size:expr, align: $align:expr $(, $field:ident @ $off:expr)* $(,)? }) => {
         const _: () = {
@@ -546,8 +517,7 @@ macro_rules! assert_abi_layout {
     };
 }
 
-// Std encode structs. The three `*Flags` types are a single C `uint32_t` of bitfields, so only their
-// size and alignment are layout-checkable here; their member order is covered by `abi_tests`.
+// `*Flags` is a C `uint32_t` of bitfields: size/align only here; member order is `abi_tests`.
 assert_abi_layout!(StdVideoEncodeAV1PictureInfoFlags { size: 4, align: 4 });
 
 assert_abi_layout!(StdVideoEncodeAV1PictureInfo {
@@ -612,7 +582,6 @@ assert_abi_layout!(StdVideoEncodeAV1OperatingPointInfo {
     initial_display_delay_minus_1 @ 16,
 });
 
-// KHR extension structs.
 assert_abi_layout!(VideoEncodeAV1ProfileInfoKHR {
     size: 24, align: 8,
     s_type @ 0,
@@ -746,7 +715,6 @@ assert_abi_layout!(VideoEncodeAV1SessionCreateInfoKHR {
 mod abi_tests {
     use super::*;
 
-    /// Assert that `set` lights exactly one bit of the flags word, at `bit`.
     fn sets_only_bit(
         storage: __BindgenBitfieldUnit<[u8; 4]>,
         name: &str,
@@ -764,12 +732,9 @@ mod abi_tests {
         }
     }
 
-    /// A C bitfield allocates its members from bit 0 upward in declaration order, so the setter for
-    /// the Nth member of `StdVideoEncodeAV1PictureInfoFlags` must write bit N. The array below is
-    /// the member list of `vulkan_video_codec_av1std_encode.h` **in declaration order** — so this
-    /// pins the hand-copied bit indices to the header rather than merely to themselves. A silent
-    /// renumbering here would make the driver read, say, `use_superres` where we meant
-    /// `render_and_frame_size_different`.
+    /// C bitfields fill from bit 0 in declaration order. The array is
+    /// `vulkan_video_codec_av1std_encode.h` member order; a silent index shift
+    /// would light the wrong flag in the word the driver reads.
     #[test]
     fn picture_info_flag_setters_follow_the_c_declaration_order() {
         #[allow(clippy::type_complexity)]
@@ -837,8 +802,7 @@ mod abi_tests {
         }
     }
 
-    /// `reserved : 3` closes out the word — bits 29..32. Checking it is what proves the 29 members
-    /// above are the *whole* list: a dropped member would shift `reserved` down and fail here.
+    /// `reserved : 3` is bits 29..32. A dropped member above would shift it down.
     #[test]
     fn picture_info_reserved_occupies_the_top_three_bits() {
         let mut flags = StdVideoEncodeAV1PictureInfoFlags {
@@ -849,7 +813,6 @@ mod abi_tests {
         sets_only_bit(flags._bitfield_1, "reserved", 29, 3);
     }
 
-    /// The same invariant for the two-member reference-info flags word.
     #[test]
     fn reference_info_flag_setters_follow_the_c_declaration_order() {
         #[allow(clippy::type_complexity)]

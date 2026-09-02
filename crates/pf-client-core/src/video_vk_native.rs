@@ -1,21 +1,20 @@
-//! Native Vulkan Video backend using pf-vkdecode on the presenter's `VkDevice`; decoded
-//! images are sampled directly, without FFmpeg, copies, imports, or a second device.
-//! It supports H.264, H.265, and AV1 with NV12, P010, or 8/10-bit two-plane 4:4:4 output;
-//! [`crate::video::native_vulkan_gate`] and [`NativeVulkanDecoder::new`] check admission
-//! and stream shape, with failure falling through the ladder described by [`crate::video`].
+//! Native Vulkan Video backend: pf-vkdecode on the presenter's `VkDevice`.
+//! Decoded images are sampled in place — no FFmpeg, copies, imports, or a second device.
+//! H.264, H.265, and AV1; NV12, P010, or 8/10-bit two-plane 4:4:4.
 //!
-//! The backend is single-owner (`Send`, not `Sync`); [`submit_queues_collide`] selects the
-//! shared queue lock whenever decode and graphics use the same externally synchronized queue.
-//! A delivered [`NativeVkFrame`] pins its pool slot until [`NativeReleaseGuard`] is dropped
-//! after presentation retires; [`Codec::release_frame`] also waits for its status verdict,
-//! and teardown gives outstanding guards the bounded [`TEARDOWN_BUDGET`] before pool destruction.
+//! Admission and stream shape are [`crate::video::native_vulkan_gate`] and
+//! [`NativeVulkanDecoder::new`]; a refusal falls through the ladder in [`crate::video`].
+//! The backend is `Send` and not `Sync`. [`submit_queues_collide`] takes the shared
+//! queue lock when decode and graphics share an externally synchronized queue.
 //!
-//! [`Codec::poll_status`] turns failed or unreadable Vulkan status queries into rung errors.
-//! Integrity concealment instead drops the picture unshown and raises
-//! [`NativeVulkanDecoder::take_recovery_request`]; refusals and post-failure keyframe waits
-//! remain errors so ladder demotion can proceed. A clean `Ok(None)` is reserved for buffering
-//! or an H.265 RASL skip. AV1 temporal units may decode hidden frames but expose at most one
-//! displayable frame per [`NativeVulkanDecoder::decode`]; recovery-point SEI rides that frame.
+//! A delivered [`NativeVkFrame`] pins its pool slot until [`NativeReleaseGuard`] drops
+//! after present retires. [`Codec::release_frame`] also waits the status verdict;
+//! teardown waits [`TEARDOWN_BUDGET`] before destroying the pools.
+//! Failed or unreadable status queries are rung errors. Integrity concealment drops
+//! the picture unshown and raises [`NativeVulkanDecoder::take_recovery_request`].
+//! `Ok(None)` is buffering or an H.265 RASL skip — never a post-failure keyframe wait.
+//! AV1 may decode hidden frames but exposes at most one displayable frame per
+//! [`NativeVulkanDecoder::decode`].
 
 use crate::video::{
     ColorDesc, DecodeHealth, NativeReleaseGuard, NativeReleaseToken, NativeVkFrame, NativeVkLayout,
@@ -31,36 +30,23 @@ use pf_vkdecode::{
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// The queue index this backend submits on within the decode family: the presenter
-/// creates exactly ONE queue (index 0) per family it enables (`vk/setup.rs` — one
-/// `VkDeviceQueueCreateInfo` per family, `queue_count = 1`), so 0 is the only queue
-/// that exists.
+/// Queue index 0: the presenter creates one queue per enabled family (`vk/setup.rs`).
 const DECODE_QUEUE_INDEX: u32 = 0;
 
-/// Teardown budget for the presenter to hand back every outstanding frame token (its
-/// next present's fence wait, typically one frame). Generous against a paused stream,
-/// finite against a wedged presenter — after this the pools are destroyed anyway
-/// (warned; the realistic residue is a logically-held frame, not in-flight GPU work).
+/// 500 ms ≈ one present fence, plus slack for a paused stream. After this the pools die
+/// even if a token is still out; residue is a logically-held frame, not in-flight GPU work.
 const TEARDOWN_BUDGET: Duration = Duration::from_millis(500);
 
-/// Query-poll belt: a frame whose token has returned had its decode op complete on the
-/// GPU (the presenter's submit waited the decode timeline), so its status query MUST be
-/// readable — if it still reads Pending after this many polls, give the slot back
-/// anyway rather than strand it (debug-logged; the status is then simply unknown).
+/// Token back means the presenter's submit already waited decode, so the query must be
+/// readable. Three Pending polls after that give the slot back with an unknown verdict.
 const MAX_POLLS_AFTER_RELEASE: u32 = 3;
 
-/// Do the presenter's and the decoder's submit queues collide? Both sides use queue
-/// index 0 of their family by construction (the presenter's graphics queue is
-/// `get_device_queue(qfi, 0)`, the decoder's is [`DECODE_QUEUE_INDEX`] of `decode_qf`),
-/// so the collision test is family equality. Pure — the queue-lock decision is
-/// CPU-testable.
+/// Family equality is the collision test: both sides submit on queue index 0 of their family.
 fn submit_queues_collide(graphics_qf: u32, decode_qf: u32) -> bool {
     graphics_qf == decode_qf
 }
 
-/// The queue lock this device's decode lane submits under. One function so the
-/// pre-session shape probe ([`hevc_shape_supported`]) and the real decoder cannot pick
-/// different serialization for the same device.
+/// Shared with [`hevc_shape_supported`] so the probe and the session pick the same lock.
 fn queue_lock_for(vk: &VulkanDecodeDevice) -> Box<dyn pf_vkdecode::QueueLock> {
     if submit_queues_collide(vk.graphics_qf, vk.decode_qf) {
         Box::new(NativeQueueLock::Shared(vk.queue_lock.clone()))
@@ -69,8 +55,7 @@ fn queue_lock_for(vk: &VulkanDecodeDevice) -> Box<dyn pf_vkdecode::QueueLock> {
     }
 }
 
-/// The presenter's handles in pf-vkdecode's shape. Same reason as [`queue_lock_for`]:
-/// the probe must ask about the DEVICE THE SESSION WOULD USE, not a re-derived one.
+/// Presenter's live handles. The probe must ask about the device the session would use.
 fn device_handles(vk: &VulkanDecodeDevice) -> DeviceHandles {
     DeviceHandles {
         get_instance_proc_addr: vk.get_instance_proc_addr,
@@ -83,18 +68,14 @@ fn device_handles(vk: &VulkanDecodeDevice) -> DeviceHandles {
     }
 }
 
-/// Can this device hardware-decode HEVC at the given picture shape? Asked BEFORE the
-/// Hello, so the client never advertises a shape it would have to refuse a session over.
+/// Whether this device can hardware-decode HEVC at this picture shape, asked before Hello
+/// so the client never advertises a shape it would refuse.
 ///
-/// This is the same question, through the same code, that
-/// [`NativeVulkanDecoder::new`]'s H.265 arm asks at construction — `VkH265Decoder::new`
-/// then `probe_stream_support` — deliberately, so an advertisement and the rung that has
-/// to honour it cannot disagree. It creates and drops a decoder object; that costs a
-/// handful of driver capability queries and no session, no images and no submits.
-///
-/// `false` when the presenter has no Vulkan Video decode at all, which for 4:4:4 is the
-/// right answer rather than a missing one — see
-/// [`crate::video::hevc_444_hardware_decodable`] for why no other rung can be asked.
+/// Same construction as [`NativeVulkanDecoder::new`]'s H.265 arm (`VkH265Decoder::new`
+/// then `probe_stream_support`) so advertisement and the rung cannot disagree. Builds
+/// and drops a decoder: capability queries only, no session, images, or submits.
+/// `false` when the presenter has no Vulkan Video decode — for 4:4:4 that is the
+/// answer; see [`crate::video::hevc_444_hardware_decodable`].
 pub(crate) fn hevc_shape_supported(
     vk: &VulkanDecodeDevice,
     chroma_format_idc: u8,
@@ -103,16 +84,13 @@ pub(crate) fn hevc_shape_supported(
     if !vk.video_decode {
         return false;
     }
-    // The device-independent half first: a shape pf-vkdecode has no picture format for
-    // needs no driver to refuse it (and `probe_stream_support` would only re-derive it).
+    // No picture format in pf-vkdecode means no driver to ask (`probe_stream_support` would re-derive it).
     if pf_vkdecode::output_format_for(chroma_format_idc, bit_depth_luma_minus8).is_none() {
         return false;
     }
-    // SAFETY: the `DeviceHandles` contract exactly as `NativeVulkanDecoder::new` states
-    // it — these are the presenter's live instance/device, which outlive this call by
-    // construction (the presenter owns them for the whole process, and this runs on its
-    // thread while building the session's Hello). The decoder is dropped before return,
-    // so nothing outlives the borrow.
+    // SAFETY: `DeviceHandles` is the presenter's live instance/device; they outlive this
+    // call (presenter owns them for the process; this runs on its thread while building
+    // Hello). The decoder is dropped before return, so nothing outlives the borrow.
     let dec = unsafe { pf_vkdecode::VkH265Decoder::new(&device_handles(vk), queue_lock_for(vk)) };
     match dec {
         Ok(d) => d
@@ -122,13 +100,10 @@ pub(crate) fn hevc_shape_supported(
     }
 }
 
-/// [`pf_vkdecode::QueueLock`] over the device's shared [`crate::video::QueueLock`] —
-/// or over nothing, when the decode queue provably has no other submitter (see the
-/// module doc's queue-lock section).
+/// [`pf_vkdecode::QueueLock`] over the shared [`crate::video::QueueLock`], or nothing
+/// when the decode queue has no other submitter.
 enum NativeQueueLock {
-    /// Decode shares the presenter's graphics queue: serialize with everyone.
     Shared(std::sync::Arc<crate::video::QueueLock>),
-    /// A separate decode family/queue: this backend is its only submitter.
     Uncontended,
 }
 
@@ -145,15 +120,11 @@ impl pf_vkdecode::QueueLock for NativeQueueLock {
     }
 }
 
-/// The codecs pf-vkdecode has a decoder for — the native rung's whole vocabulary,
-/// named ash-free so `video.rs` can pick one from the negotiated wire codec without
-/// this module knowing about the wire's codec bits (and `video::native_vulkan_gate`
-/// stays the single admission decision).
+/// Codecs pf-vkdecode can decode, named ash-free so `video.rs` can pick from the wire
+/// codec without this module knowing wire bits.
 ///
-/// Being IN this enum is not the same as being in `auto`: this list says pf-vkdecode has
-/// a decoder, `video::native_vulkan_gate` says whether the automatic ladder may pick it
-/// (and the device's own codec-operation caps bit is half of that answer). All three legs
-/// are in `auto`, and that is the gate's decision to change, not this list's.
+/// Membership here is not admission: `video::native_vulkan_gate` decides whether `auto`
+/// may pick a codec. Changing that list does not belong here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeCodec {
     H264,
@@ -161,23 +132,11 @@ pub(crate) enum NativeCodec {
     Av1,
 }
 
-/// The decoder this backend drives, chosen ONCE from the negotiated codec.
-///
-/// Dispatch stops here. Everything the backend does around a decoder — the
-/// shipped-frame ledger, release tokens, status-query settling, timeline waits,
-/// teardown — is codec-agnostic, because [`VkH264Decoder`], [`VkH265Decoder`] and
-/// [`VkAv1Decoder`] expose the same surface over the same [`DecodedVkFrame`] contract
-/// (same pool/slot lifecycle, same `value + 1` write-back, same query slots, same
-/// generations). The forwarders below are therefore mechanically identical per arm on
-/// purpose: the H.264 path is hardware-verified bit-exact, and dispatch must not be
-/// able to change its behaviour.
-// Unboxed on purpose, against `large_enum_variant`: the arms differ by ~1.7 KB (every
-// decoder carries a planner, a slot ledger and pinned Std parameter sets), and exactly
-// ONE of these exists per session — inside the `Box<NativeVulkanDecoder>` the backend
-// already lives in. So the "waste" is 1.7 KB of slack in a single session-lifetime
-// allocation, while boxing would put a second indirection between the pump and the
-// decoder on the per-AU path and change how the hardware-verified H.264 decoder is
-// reached. Neither trade is worth 1.7 KB.
+/// Decoder chosen once from the negotiated codec. Ledger, tokens, status, and teardown
+/// are codec-agnostic: the three [`DecodedVkFrame`] surfaces match. Forwarders stay
+/// identical per arm so dispatch cannot change the hardware-verified H.264 path.
+// Unboxed against `large_enum_variant`: one of these lives in the session's
+// `Box<NativeVulkanDecoder>`. Boxing would add a per-AU indirection for ~1.7 KB.
 #[allow(clippy::large_enum_variant)]
 enum Codec {
     H264(VkH264Decoder),
@@ -186,23 +145,15 @@ enum Codec {
 }
 
 impl Codec {
-    /// Feed one access unit — see [`VkH264Decoder::decode`] /
-    /// [`VkH265Decoder::decode`] / [`VkAv1Decoder::decode`]. `Ok(None)` means "no
-    /// display-ready picture from this AU", which for H.265 also covers a RASL
-    /// picture skipped after an open-GOP join (the module doc's contract: never an
-    /// error).
+    /// One access unit. `Ok(None)` is "no display-ready picture" — including an H.265
+    /// RASL skip after an open-GOP join, never an error.
     ///
-    /// What `Ok(None)` deliberately does NOT cover on any arm is a decoder waiting
-    /// to re-anchor after a failure: H.264/H.265 answer that with their planners'
-    /// `PlanError::AwaitingIdr` and AV1 with `VkDecodeError::AwaitingKeyAv1`, one
-    /// `Err` per access unit for as long as the wait lasts. A clean `Ok(None)`
-    /// would clear the demotion streak once per frame and strand the session on a
-    /// rung that produces nothing (module doc).
+    /// Post-failure re-anchor waits are `Err` (`PlanError::AwaitingIdr` /
+    /// `VkDecodeError::AwaitingKeyAv1`). `Ok(None)` would clear the demotion streak
+    /// once per frame and strand a silent rung.
     ///
-    /// AV1 is the one arm where "an access unit" is not "a frame": its AU is a
-    /// TEMPORAL UNIT, the decoder walks every frame in it, and what comes back is
-    /// the FIRST displayable picture of the walk — the rest, if any, through
-    /// [`Self::take_ready`], exactly like H.265's burst output.
+    /// AV1's AU is a temporal unit: first displayable picture here, the rest via
+    /// [`Self::take_ready`].
     fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedVkFrame>, VkDecodeError> {
         match self {
             Codec::H264(d) => d.decode(au),
@@ -211,34 +162,20 @@ impl Codec {
         }
     }
 
-    /// Drain the plan warnings of the AU just decoded, TYPED — the three planners
-    /// have genuinely different enums ([`pf_vkdecode::PlanWarning`] has
-    /// `FrameNumGap`/`Mmco5Rebase`, [`pf_vkdecode::H265PlanWarning`] has
-    /// `NonZeroReorder`, [`pf_vkdecode::Av1PlanWarning`] has `MissingShowExisting`,
-    /// none a subset of another), so the set is carried as a three-armed value
-    /// rather than flattened.
-    ///
-    /// Typed and not rendered because the backend must BRANCH on them: only some
-    /// warnings mean the picture is damaged ([`PlanWarnings::integrity`]), and
-    /// dropping a frame for the others costs a visible hitch on a stream the
-    /// planner says it planned correctly. Strings would make that a substring
-    /// match on `Debug` output.
+    /// Typed per codec: the three warning enums are not subsets of each other, and
+    /// only some mean damage ([`PlanWarnings::integrity`]). Flattening to strings
+    /// would make that a `Debug` substring match.
     fn take_warnings(&mut self) -> PlanWarnings {
         match self {
             Codec::H264(d) => PlanWarnings::H264(d.take_warnings()),
             Codec::H265(d) => PlanWarnings::H265(d.take_warnings()),
-            // The AV1 decoder concatenates the WHOLE temporal unit's warnings, in
-            // decode order — one unit, one concealment verdict, which is what this
-            // backend already assumes for an AU.
+            // Whole temporal unit, decode order — one unit, one concealment verdict.
             Codec::Av1(d) => PlanWarnings::Av1(d.take_warnings()),
         }
     }
 
-    /// Pull the next already display-ready frame the last AU did not return
-    /// directly (H.265 burst output; on AV1 only a non-conformant or
-    /// multi-operating-point unit, since the spec admits one shown frame per
-    /// temporal unit — [`MAX_DELIVERABLE`]). Drained after EVERY decode, so a
-    /// burst can never be stranded inside the decoder.
+    /// Burst leftovers from the last AU (H.265 reorder; AV1 only if non-conformant).
+    /// Drain after every decode so a burst cannot strand inside the decoder.
     fn take_ready(&mut self) -> Option<DecodedVkFrame> {
         match self {
             Codec::H264(d) => d.take_ready(),
@@ -247,8 +184,7 @@ impl Codec {
         }
     }
 
-    /// Hand a delivered frame back to its pool; `presented` reports whether the
-    /// consumer enqueued the frame's `value + 1` timeline signal.
+    /// Return a delivered frame to its pool. `presented` is whether `value + 1` was enqueued.
     fn release_frame(
         &mut self,
         frame: &DecodedVkFrame,
@@ -261,8 +197,7 @@ impl Codec {
         }
     }
 
-    /// The decoder's current session generation (a frame from an older one has an
-    /// unknowable status verdict — see [`NativeVulkanDecoder::settle_statuses`]).
+    /// Session generation. A frame from an older one has an unknowable status verdict.
     fn generation(&self) -> u64 {
         match self {
             Codec::H264(d) => d.generation(),
@@ -271,7 +206,6 @@ impl Codec {
         }
     }
 
-    /// Non-blocking read of a frame's `RESULT_STATUS_ONLY` query.
     fn poll_status(&mut self, frame: &DecodedVkFrame) -> DecodeStatus {
         match self {
             Codec::H264(d) => d.poll_status(frame),
@@ -280,8 +214,7 @@ impl Codec {
         }
     }
 
-    /// Bounded host wait for a frame's decode-complete timeline signal (the pump's
-    /// sampled decode-latency stat).
+    /// Bounded host wait on the decode-complete timeline (pump's sampled decode-latency).
     fn wait_decoded(&self, frame: &DecodedVkFrame, timeout_ns: u64) -> bool {
         match self {
             Codec::H264(d) => d.wait_decoded(frame, timeout_ns),
@@ -290,9 +223,7 @@ impl Codec {
         }
     }
 
-    /// Does this device answer per-op decode-status queries at all? A device
-    /// fact, not a codec one — forwarded per arm only because the decoders own
-    /// the `DecodeDevice`.
+    /// Per-op decode-status queries. A device fact, forwarded because the decoder owns `DecodeDevice`.
     fn status_queries(&self) -> bool {
         match self {
             Codec::H264(d) => d.status_queries(),
@@ -301,10 +232,8 @@ impl Codec {
         }
     }
 
-    /// The newest planned picture's DECODE-order ordinal — the watermark the
-    /// pump stamps when it arms a freeze (see [`NativeVkFrame::decode_order`]).
-    /// On AV1 a `show_existing_frame` does not advance it, because it decodes
-    /// nothing — which is what the watermark is comparing against.
+    /// Newest planned picture's decode-order ordinal ([`NativeVkFrame::decode_order`]).
+    /// AV1 `show_existing_frame` does not advance it — it decodes nothing.
     fn decode_order(&self) -> u64 {
         match self {
             Codec::H264(d) => d.decode_order(),
@@ -314,29 +243,18 @@ impl Codec {
     }
 }
 
-/// What one pass of [`NativeVulkanDecoder::settle_statuses`] learned about the
-/// decode status of previously shipped frames.
+/// Status of previously shipped frames from one [`NativeVulkanDecoder::settle_statuses`].
 ///
-/// Two numbers, not one, because the SAME `DecodeStatus::Failed` means two
-/// different things depending on the device. Where the decode family answers
-/// `RESULT_STATUS` queries it is the driver's own verdict on its own decode — the
-/// Xbox Ally X signal, and the count `DecodeHealth::failed` reports. Where it does
-/// NOT (RADV, whose VCN ring hangs if a query is recorded anyway), `poll_status`
-/// degrades to reading the decode timeline, and a `Failed` there means the session
-/// generation is gone, the device was lost, or the semaphore could not be read —
-/// none of which the driver ever said anything about. Reporting those as driver
-/// verdicts renders `integrity: driver-failed 1 · no driver status`, which is
-/// self-contradictory and points a support engineer at hardware that never spoke.
-///
-/// Both cost the picture, so both release their frame unshown, both surface as an
-/// error, and both extend the concealed run.
+/// The same `DecodeStatus::Failed` is two facts: with `RESULT_STATUS` queries it is the
+/// driver's verdict (`DecodeHealth::failed`); without, `poll_status` reads the decode
+/// timeline and `Failed` is a lost generation, a lost device, or an unreadable semaphore.
+/// Counting the latter as driver-failed yields `driver-failed 1 · no driver status`.
+/// Both drop the picture, surface as an error, and extend the concealed run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct StatusVerdicts {
-    /// Frames the DRIVER reported corrupt. Only ever non-zero on a device that
-    /// answers status queries.
+    /// Driver-reported corrupt. Non-zero only when the device answers status queries.
     driver_failed: u32,
-    /// Frames whose status could not be established on a device with no query
-    /// support — the degraded timeline path.
+    /// Status unreadable on a device with no query support (degraded timeline path).
     unreadable: u32,
 }
 
@@ -346,34 +264,17 @@ impl StatusVerdicts {
     }
 }
 
-/// The plan warnings one AU produced, still in their codec's own enum.
+/// Plan warnings for one AU, still in the codec's own enum.
 ///
-/// The split that matters is INTEGRITY vs. spec-legal, not which codec. The
-/// planners emit two kinds of warning through one channel:
+/// Integrity (missing reference, `frame_num` gap, truncated AU) means the plan used a
+/// substitute: drop the picture unshown and request a re-anchor. Spec-legal envelope
+/// signals (`H265PlanWarning::NonZeroReorder`, `PlanWarning::Mmco5Rebase`) are fully
+/// planned; `NonZeroReorder` fires on SPS activation (opening IDR and every ABR IDR),
+/// so treating it as concealment hitches every renegotiation. Only integrity drops.
 ///
-/// - **Integrity** — a reference the DPB does not hold, a `frame_num` gap, an AU
-///   whose NALU walk stopped early. The plan was completed with a SUBSTITUTE in
-///   place of something lost: the picture is damaged, so its output is released
-///   unshown and a re-anchor is requested.
-/// - **Spec-legal envelope signals** — h265's `NonZeroReorder` (the activated SPS
-///   sets `sps_max_num_reorder_pics > 0`) and h264's `Mmco5Rebase`. pf-bitstream
-///   documents both as "spec-legal and fully planned"; they exist as the field
-///   signal that a punktfunk-host assumption broke, not as damage. `NonZeroReorder`
-///   in particular fires on the AU that ACTIVATES an SPS — the opening IDR, and the
-///   fresh IDR at every ABR resolution change — so treating it as concealment costs
-///   a released-unshown frame plus a keyframe round trip at every renegotiation, on
-///   a stream the planner planned correctly. pf-bitstream's own conformance harness
-///   excludes `NonZeroReorder` from its integrity set for exactly this reason.
-///
-/// Everything is logged either way; only integrity warnings drop the frame.
-///
-/// AV1 (M7) has an EMPTY right-hand column: its planner reports nothing that is
-/// spec-legal-but-notable, because AV1 has no reorder envelope to announce (no
-/// bumping process, no `max_num_reorder_pics`) and no MMCO to rebase. Every AV1
-/// warning is damage, and `pf_vkdecode::is_integrity_warning_av1` says so
-/// exhaustively so a warning added later cannot default to "clean". The branch
-/// below is therefore not dead code on that arm — it is the place a future
-/// spec-legal AV1 warning would land without costing a frame.
+/// AV1 has no reorder envelope and no MMCO; every warning is damage.
+/// [`pf_vkdecode::is_integrity_warning_av1`] is exhaustive so a new warning cannot
+/// default to clean. The spec-legal branch is the landing site for a future one.
 enum PlanWarnings {
     H264(Vec<pf_vkdecode::PlanWarning>),
     H265(Vec<pf_vkdecode::H265PlanWarning>),
@@ -389,15 +290,10 @@ impl PlanWarnings {
         }
     }
 
-    /// Just the warnings that mean the picture is damaged — the concealment set.
-    /// Allocates, but only off the clean path: [`Self::is_empty`] is true for every
-    /// AU of a healthy stream.
+    /// Integrity (concealment) subset. Allocates only off the clean path.
     ///
-    /// The predicate itself lives in pf-vkdecode
-    /// ([`pf_vkdecode::is_integrity_warning`]) rather than here, so the
-    /// fault-injection harness asserts detection against the SAME list this
-    /// conceals on. Two copies would let a test prove a detection production does
-    /// not actually perform.
+    /// Predicate lives in pf-vkdecode so the fault-injection harness asserts against
+    /// the same list production conceals on.
     fn integrity(&self) -> PlanWarnings {
         match self {
             PlanWarnings::H264(w) => PlanWarnings::H264(
@@ -429,20 +325,10 @@ impl PlanWarnings {
         }
     }
 
-    /// The concealment log. Per arm so the rendering is the codec's OWN enum —
-    /// `warnings=[FrameNumGap { .. }]`, exactly what the hardware-verified H.264
-    /// path emitted before dispatch existed (a `Vec<String>` renders
-    /// `["FrameNumGap { .. }"]`, and a wrapper enum would prefix the arm).
-    ///
-    /// `concealed` is how many of the rendered warnings are INTEGRITY warnings —
-    /// the count the frame was actually dropped for. Both numbers are carried
-    /// because they can differ: the list is every warning of the AU (a spec-legal
-    /// companion is context worth having), while the count is the damage. On H.264
-    /// the two coincide for every warning a punktfunk host can produce.
+    /// Concealment log, per arm, so tracing prints the codec's own enum (not a `Vec<String>`
+    /// or a wrapper prefix). `concealed` is the integrity count; the list is every warning.
     fn warn_concealment(&self, concealed: usize) {
-        // Spelled out per arm rather than shared through a `const`: this is the
-        // H.264 path's PRODUCTION log line, and a literal is what keeps it a static
-        // tracing message rather than a formatted one.
+        // Per arm so the message stays a static tracing string, not a formatted one.
         match self {
             PlanWarnings::H264(w) => tracing::warn!(
                 concealed,
@@ -465,12 +351,9 @@ impl PlanWarnings {
         }
     }
 
-    /// The spec-legal log: the planner flagged an envelope fact and planned the AU
-    /// in full, so the frame is SHOWN. Rare by construction (SPS activation, MMCO
-    /// 5), which is why it is a `warn` and not a per-frame `debug`. Unreachable on
-    /// the AV1 arm today — every AV1 warning is damage — and spelled out anyway so
-    /// a future spec-legal AV1 warning gets the same treatment rather than the
-    /// concealment branch's.
+    /// Spec-legal envelope: planned in full, frame shown. `warn` not `debug` because
+    /// it is rare (SPS activation, MMCO 5). Spelled on AV1 so a future spec-legal
+    /// warning does not take the concealment branch.
     fn warn_planned_in_full(&self) {
         match self {
             PlanWarnings::H264(w) => tracing::warn!(
@@ -492,26 +375,18 @@ impl PlanWarnings {
     }
 }
 
-/// One frame shipped to the presenter and not yet fully settled: settled = its release
-/// token came back (GPU reads proven done) AND its status query was read.
+/// Shipped to the presenter, not yet settled: token back (GPU reads done) and status read.
 struct Shipped {
     seq: u64,
     frame: DecodedVkFrame,
-    /// The presenter (or a drop on the way there) returned the token.
     released: bool,
-    /// The token said the sampling submission (with its `value + 1` timeline
-    /// signal) was enqueued — forwarded to `release_frame` so the decoder waits
-    /// the write-back before reusing the image.
+    /// Sampling submit enqueued `value + 1`; forwarded so the decoder waits write-back.
     presented: bool,
-    /// The status query read a conclusive verdict (or the poll belt expired).
     resolved: bool,
-    /// Polls attempted after the token returned — see [`MAX_POLLS_AFTER_RELEASE`].
     polls_after_release: u32,
 }
 
-/// Mark the shipped entry a token names as released. Returns false when nothing
-/// matches (a late token from before a demotion drain — benign). Pure bookkeeping,
-/// split out so the channel-drain behavior is CPU-testable.
+/// Mark the named shipped entry released. `false` is a late token after a demotion drain.
 fn note_token(outstanding: &mut [Shipped], token: NativeReleaseToken) -> bool {
     match outstanding.iter_mut().find(|s| s.seq == token.seq) {
         Some(s) => {
@@ -527,18 +402,11 @@ fn note_token(outstanding: &mut [Shipped], token: NativeReleaseToken) -> bool {
     }
 }
 
-/// Flatten a delivered [`DecodedVkFrame`] into the ash-free [`NativeVkFrame`] the
-/// presenter consumes. Pure over the frame (the guard is the caller's), so the
-/// projection — every fact the presenter can no longer look up for itself — is
-/// CPU-testable.
+/// Lift a [`DecodedVkFrame`] into the ash-free [`NativeVkFrame`] the presenter consumes.
 ///
-/// The one that is easy to get wrong is [`NativeVkFrame::vk_format`]: the picture
-/// format is the STREAM's, not the codec's. H.264 in this program is always the 8-bit
-/// 4:2:0 envelope (NV12), but an H.265 session decodes Main to NV12, Main 10 to P010
-/// and RExt 4:4:4 to the two-plane 4:4:4 formats — and can change format mid-stream
-/// when the host renegotiates. A consumer that assumes 8-bit 4:2:0 renders a Main 10
-/// picture with 8-bit transfer/range math: plausible-looking and wrong. So the format
-/// is carried, never inferred, all the way to the presenter's CSC pass.
+/// [`NativeVkFrame::vk_format`] is the stream's format, not the codec's. H.265 can
+/// switch NV12 / P010 / 4:4:4 mid-stream; inferring 8-bit 4:2:0 from the codec
+/// applies the wrong CSC. Carry it; never infer.
 fn project_frame(frame: &DecodedVkFrame, guard: NativeReleaseGuard) -> NativeVkFrame {
     NativeVkFrame {
         image: frame.image.as_raw(),
@@ -559,12 +427,9 @@ fn project_frame(frame: &DecodedVkFrame, guard: NativeReleaseGuard) -> NativeVkF
         coded_height: frame.coded_height,
         crop_x: frame.crop.x,
         crop_y: frame.crop.y,
-        // H.273 code points straight off the picture's ACTIVE SPS/VUI — per frame,
-        // never latched, because the Windows host switches an HDR desktop to
-        // PQ/BT.2020 IN-BAND (the Welcome still says SDR). pf-bitstream applies
-        // E.2.1's "unspecified" inference (2/2/2, limited) where the VUI is
-        // silent, and `csc_rows` resolves "unspecified" to its BT.709-limited
-        // SDR default — same verdicts libavcodec's CICP passthrough produced.
+        // Active SPS/VUI per frame, never latched: HDR can switch PQ/BT.2020 in-band
+        // after an SDR Welcome. pf-bitstream infers E.2.1 unspecified (2/2/2, limited);
+        // `csc_rows` maps that to BT.709-limited SDR.
         color: ColorDesc {
             primaries: frame.colour.colour_primaries,
             transfer: frame.colour.transfer_characteristics,
@@ -573,47 +438,30 @@ fn project_frame(frame: &DecodedVkFrame, guard: NativeReleaseGuard) -> NativeVkF
         },
         keyframe: frame.is_idr,
         poc: frame.poc,
-        // The recovery point SEI's verdict for THIS picture, folded by
-        // pf-vkdecode's `RecoveryWatch` at plan time and translated here into the
-        // shared gate's vocabulary. The two structs are deliberately separate
-        // types with the same shape: pf-vkdecode must not depend on punktfunk-core
-        // to describe a bitstream fact, and punktfunk-core must not depend on
-        // pf-vkdecode to accept one.
+        // Recovery-point SEI for this picture (`RecoveryWatch` at plan time). Separate
+        // types on purpose: pf-vkdecode must not depend on punktfunk-core for a
+        // bitstream fact, and the reverse for accepting one.
         recovery: punktfunk_core::reanchor::LocalRecovery {
             sei_here: frame.recovery.sei_here,
             is_recovery_point: frame.recovery.is_recovery_point,
         },
-        // Whether this picture's own references decoded cleanly — the corroboration
-        // the shared gate weighs a host `USER_FLAG_RECOVERY_ANCHOR` against. The
-        // planner already knows it (it is the one party that resolved this AU's
-        // reference lists), and it is the only thing that can catch the host
-        // asserting a re-anchor over a picture THIS decoder had to conceal.
+        // This picture's references decoded cleanly — the corroboration against a host
+        // `USER_FLAG_RECOVERY_ANCHOR`. Only the planner resolved this AU's lists.
         references_clean: frame.references_clean,
-        // Which side of a loss this picture was DECODED on. Carried beside the
-        // recovery mark because the mark is worthless without it: a post-failure
-        // DPB flush delivers pre-loss pictures after the loss, and their marks
-        // describe a wave that completed before it.
+        // Which side of a loss this picture was decoded on. A post-failure DPB flush
+        // can deliver pre-loss pictures whose recovery marks describe a finished wave.
         decode_order: frame.decode_order,
         guard,
     }
 }
 
-/// The picture format a session of the negotiated shape decodes to, or a named
-/// refusal for a shape pf-vkdecode has no output format for at all. `codec` names the
-/// codec in the refusal text and nothing else — the map is the CRATE's one
-/// (sampling, depth) → format table, shared by every codec it decodes.
+/// Picture format for a negotiated stream shape, or a named refusal. `codec` is the
+/// refusal label only; the map is the crate's (sampling, depth) → format table.
 ///
-/// The DEVICE-INDEPENDENT half of [`NativeVulkanDecoder::new`]'s shape check: 4:2:2,
-/// monochrome and 12-bit are legal H.265/AV1 that no punktfunk host emits and this
-/// client has no plumbing for, so no driver has to be asked about them. Pure, so the
-/// refusal is CPU-testable — the device-dependent half (a shape with a format that
-/// THIS driver does not advertise) is `probe_stream_support`, covered by
-/// pf-vkdecode's `derive_caps_h265`/`derive_caps_av1` refusal tests.
-///
-/// One function for both codecs because the ENVELOPE is identical: pf-vkdecode's
-/// AV1 profile builder admits exactly the four (sampling, depth) pairs
-/// [`pf_vkdecode::output_format_for`] maps, and refusing here in different terms
-/// than the probe refuses one line later would be two gates to keep in agreement.
+/// Device-independent half of [`NativeVulkanDecoder::new`]: 4:2:2, monochrome, and
+/// 12-bit have no plumbing here, so no driver is asked. Device-dependent refusal is
+/// `probe_stream_support`. One function for both codecs: AV1's profile builder admits
+/// exactly the pairs [`pf_vkdecode::output_format_for`] maps.
 fn picture_format(codec: &str, stream: crate::video::StreamFormat) -> Result<vk::Format> {
     let depth = stream.bit_depth_minus8().ok_or_else(|| {
         anyhow!(
@@ -631,120 +479,53 @@ fn picture_format(codec: &str, stream: crate::video::StreamFormat) -> Result<vk:
     })
 }
 
-/// The film-grain flag the AV1 construction-time probe asks the device about.
+/// Film-grain flag the AV1 construction-time probe asks. Grain is part of the decode
+/// profile and negotiation carries no grain bit, so this is an assumption.
 ///
-/// Grain synthesis is part of the AV1 decode PROFILE — a device that decodes AV1
-/// need not offer the grain-enabled one — and the negotiation carries no grain bit,
-/// so this is the one probe input that is an ASSUMPTION rather than a negotiated
-/// fact. `false` is the right assumption and the safe one:
-///
-/// * a punktfunk host encodes desktop capture, where film-grain synthesis is off
-///   (it exists to re-add grain a denoiser removed from camera footage);
-/// * and the failure directions are not symmetric. Probing `false` on a device that
-///   only offers the grain profile would REFUSE a session it could have run — but
-///   there is no such device (grain support is an added capability, never a
-///   replacement). Probing `true` on the far more common device that offers only
-///   the grain-LESS profile would refuse every session this rung can actually
-///   decode.
-///
-/// If a grain stream ever does arrive, `ensure_state` re-keys from the SEQUENCE
-/// header (never softened to make a query pass) and refuses at the first AU — which
-/// lands on the "never delivered a frame" arm in [`crate::video::Decoder`], the same
-/// backstop that already covers a level above `maxLevelIdc` and a sequence header
-/// disagreeing with the Welcome.
+/// `false`: punktfunk hosts encode desktop capture (grain off), and grain is an added
+/// capability, never a replacement — probing `true` would refuse every grain-less
+/// device. A grain stream still fails at the first AU via `ensure_state` (sequence
+/// header, never softened), same backstop as a level above `maxLevelIdc`.
 const AV1_PROBE_FILM_GRAIN: bool = false;
 
-/// What the CLIENT PIPELINE itself holds, at its worst moment: how many delivered
-/// frames are unreleased between this backend and the screen at once.
-///
-/// pf-vkdecode's [`pf_vkdecode::HOLD_HEADROOM`] docs enumerate them — two bounded(2)
-/// channels, the FrameStore's 1..=3 preroll, the in-flight present, the retired-frame
-/// slot — as 4-7 at steady state. Taken at the MAXIMUM, because a bound derived from
-/// the average is a bound that fails exactly when it is needed.
+/// Worst-case delivered-but-unreleased frames the client pipeline holds at once.
+/// [`pf_vkdecode::HOLD_HEADROOM`] enumerates 4–7; the bound uses the maximum.
 const PIPELINE_HOLD: usize = 7;
 
-/// How many display-ready frames the backend will hold back for LATER access units
-/// before it starts dropping the oldest (see [`trim_deliverable`]).
+/// Display-ready frames this backend may hold for later AUs ([`trim_deliverable`]).
 ///
-/// **Derived, not chosen.** [`pf_vkdecode::HOLD_HEADROOM`] is the TOTAL number of
-/// delivered-but-unreleased frames the pool is sized for (`picture_count =
-/// required_slots + HOLD_HEADROOM`), and a queued frame counts against it exactly
-/// like a shipped one: `build_frame` increments the picture's `held` the moment the
-/// decoder declares it ready, and it stays held until [`Codec::release_frame`]. So
-/// the queue's share of the headroom is whatever the pipeline does not already
-/// occupy, and a queue bounded any deeper does not prevent the failure it names —
-/// it merely caps the memory while the pool runs out anyway (8 queued + 7 in flight
-/// against a headroom of 8 is `NoFreeSlot` on the next AU).
+/// Derived: [`pf_vkdecode::HOLD_HEADROOM`] is total delivered-but-unreleased pool
+/// budget (`picture_count = required_slots + HOLD_HEADROOM`). A queued frame counts
+/// like a shipped one from `build_frame` until [`Codec::release_frame`]. Deeper than
+/// `HOLD_HEADROOM - PIPELINE_HOLD` still hits `NoFreeSlot` (queue + in-flight).
 ///
-/// The other bound it has to stay inside is the STATUS-QUERY ring, which is
-/// `picture_count` deep (17 on AV1: nine DPB slots plus the headroom) and is
-/// re-armed once per SUBMISSION — up to two per temporal unit. A frame's query is
-/// first read the AU after it ships, so a frame that waits `MAX_DELIVERABLE` access
-/// units in this queue burns roughly `2 * (MAX_DELIVERABLE + 1)` of those 17 slots
-/// before anyone looks at it. Overrun the ring and `read_status` reports the
-/// re-armed slot as `Failed`, which [`NativeVulkanDecoder::settle_statuses`]
-/// attributes to `driver_failed` — a FABRICATED driver-corruption verdict polluting
-/// the one signal [`DecodeHealth::failed`] exists to carry (the Xbox Ally X class).
-/// At the derived depth the wait is ~4 of 17 and the question does not arise.
+/// The status-query ring is `picture_count` deep and re-armed per submit (up to two
+/// per temporal unit). A frame waiting `MAX_DELIVERABLE` AUs burns
+/// `2 * (MAX_DELIVERABLE + 1)` slots unread; overrun reads as `Failed` and
+/// [`NativeVulkanDecoder::settle_statuses`] attributes it to `driver_failed`.
+/// At this depth the wait is ~4 of 17.
 ///
-/// The queue exists because a decoder can make several pictures display-ready from
-/// one AU while the caller takes exactly one per AU: H.265 bumping outputs a burst
-/// after a reordering stretch. AV1 cannot — the spec admits exactly one shown frame
-/// per temporal unit, and pf-bitstream's conformance golden pins it (250 shown
-/// frames across 250 units, no `show_existing_frame` at all) — so on that codec this
-/// is defence in depth against a non-conformant or multi-operating-point stream, not
-/// a routine case. Either way punktfunk hosts reorder nothing, so on the wire the
-/// queue is empty every single AU and the bound never engages.
-///
-/// It is a bound and not a plain queue because "transient" is an assumption about the
-/// HOST, and the failure it fails into is silent: a stream that reliably made two
-/// frames displayable per AU would grow this by one per AU until the pool ran out —
-/// after which every AU refuses with `NoFreeSlot`, three in a second demote the rung,
-/// and nothing in the log would say the cause was a queue that could never drain.
-///
-/// What the derived depth costs, stated plainly: a stream that really does bump a
-/// burst of more than two pictures at once loses the middle of the burst rather than
-/// queueing it. That is the right way round. The frames are already several AUs late
-/// by the time a burst exists, the stage after this one is newest-wins anyway, and
-/// the alternative — a queue deep enough to hold the burst — spends the pool's whole
-/// headroom on it and answers `NoFreeSlot` on the next access unit, which is a frozen
-/// screen and a demotion rather than a hitch. Reachable only on a reordering stream,
-/// which punktfunk hosts do not emit and which the planner already flags
-/// (`H265PlanWarning::NonZeroReorder`).
+/// H.265 bumping can produce a burst; AV1 spec admits one shown frame per temporal
+/// unit, so this is defence against a non-conformant stream. Oldest-first drop: the
+/// alternative (queue the burst) spends the whole headroom and `NoFreeSlot`s next AU.
 const MAX_DELIVERABLE: usize = pf_vkdecode::HOLD_HEADROOM as usize - PIPELINE_HOLD;
 
-// The derivation must leave the queue able to do its job: carry the one frame a
-// two-output access unit strands. A `PIPELINE_HOLD` raised to the headroom (or past
-// it) would silently turn every burst into a dropped frame — or underflow the const.
+// Must leave room for the one frame a two-output AU strands. `PIPELINE_HOLD >=
+// HOLD_HEADROOM` would drop every burst — or underflow this const.
 const _: () = assert!(
     MAX_DELIVERABLE >= 1,
     "the deliverable queue must be able to carry at least one frame between AUs"
 );
 
-/// One `warn` per this many dropped deliverable frames, after the first. The shape
-/// that drops at all drops on EVERY access unit, and a warn per frame at frame rate
-/// buries the log it exists to explain — while a single line at the start of a
-/// session that then goes quiet reads as a one-off. So: the first drop in full, then
-/// a heartbeat with the running total (~every 5 s at 60 fps).
+/// One `warn` per this many dropped deliverable frames after the first (~5 s at 60 fps).
+/// The shape that drops at all drops every AU; a warn per frame buries the log.
 const DROP_WARN_EVERY: u64 = 300;
 
-/// Trim the deliverable queue to `cap` by dropping from the FRONT, returning the
-/// dropped frames so the caller can release them unshown.
+/// Trim `queue` to `cap` by dropping from the front; caller releases the returned frames.
 ///
-/// Oldest-first, because by the time a queue this deep exists the front frame is
-/// several AUs stale and the consumer one stage on is itself newest-wins (the pump's
-/// `force_send` overwrites an unconsumed frame). Dropping the NEWEST would keep the
-/// stalest picture and present the stream in ever-lagging order; dropping the oldest
-/// keeps display order for everything that survives and costs the frames that were
-/// already too late to matter.
-///
-/// ⚠ Called AFTER this AU's own frame has been taken off the front, so `cap` bounds
-/// the CARRY-OVER — what is held back for later access units — exactly as
-/// [`MAX_DELIVERABLE`] says. Trimming before the take would make an AU that produced
-/// two outputs drop the FIRST of them and ship the second, which is display order
-/// inverted inside a single access unit.
-///
-/// Pure over the queue, so the bound is CPU-testable without a GPU.
+/// Oldest-first: the front is several AUs stale and the next stage is newest-wins.
+/// Call after this AU's own frame is taken off the front so `cap` bounds carry-over.
+/// Trimming before the take would drop the first of a two-output AU and ship the second.
 fn trim_deliverable(
     queue: &mut std::collections::VecDeque<DecodedVkFrame>,
     cap: usize,
@@ -753,91 +534,52 @@ fn trim_deliverable(
     while queue.len() > cap {
         match queue.pop_front() {
             Some(frame) => dropped.push(frame),
-            // Unreachable: `len() > cap >= 0` means the queue is non-empty. Written
-            // as a break rather than an `expect` so a bound of 0 on an empty queue
-            // could never be a panic in the decode path.
+            // `len() > cap` means non-empty. `break` not `expect`: a 0-cap empty
+            // queue must not panic on the decode path.
             None => break,
         }
     }
     dropped
 }
 
-/// The native backend: the decoder plus the shipped-frame ledger and release channel.
 pub(crate) struct NativeVulkanDecoder {
     dec: Codec,
-    /// Cloned into every shipped frame's guard. `Option` so teardown can DROP the
-    /// backend's own sender: only then does `release_rx` report Disconnected once
-    /// the last guard is gone — the teardown short-circuit signal.
+    /// Cloned into every shipped guard. `Option` so teardown can drop this sender;
+    /// then `release_rx` reports Disconnected once the last guard is gone.
     release_tx: Option<mpsc::Sender<NativeReleaseToken>>,
     release_rx: mpsc::Receiver<NativeReleaseToken>,
-    /// Display-ready frames not yet handed to the pump (an H.265 burst output, or a
-    /// temporal unit that declared more pictures displayable than AV1 permits —
-    /// decode delivers one per call; the rest wait here, oldest first, bounded by
-    /// [`MAX_DELIVERABLE`]). Every frame in here holds a picture-pool image.
+    /// Display-ready frames not yet handed to the pump (H.265 burst / extra AV1).
+    /// Oldest first, bounded by [`MAX_DELIVERABLE`]; each holds a pool image.
     deliverable: std::collections::VecDeque<DecodedVkFrame>,
     outstanding: Vec<Shipped>,
     next_seq: u64,
-    /// The session's integrity counters (M4). Plain adds on the decode path, read
-    /// once per stats window — no allocation, no per-frame work.
     health: DecodeHealth,
-    /// Stream damage happened and the host should be asked for a re-anchor.
-    /// Drained by `video::Decoder::decode_frame`, which routes it into the same
-    /// `want_keyframe` every other recovery ask uses (module doc's policy).
+    /// Stream damage; host should re-anchor. Drained into the shared `want_keyframe`.
     want_recovery: bool,
-    /// Corrupt the AU on its way into the decoder — `PUNKTFUNK_AU_FAULT`,
-    /// `None` unless armed. Lives at THIS boundary rather than in
-    /// `video::Decoder::decode_frame` on purpose: this is the lane whose detectors
-    /// the injector exists to fire, and putting the knob here means a faulted AU
-    /// is byte-identical to what the decoder would have been handed by a lossy
-    /// network — no other backend's behaviour can be perturbed by a typo'd
-    /// variable.
+    /// `PUNKTFUNK_AU_FAULT`. Armed here so a faulted AU is byte-identical to a lossy
+    /// network delivery; other backends cannot see a typo'd variable.
     fault: Option<pf_vkdecode::AuFault>,
 }
 
-// SAFETY: the decoder is used strictly serially through `&mut self` from whichever
-// single thread owns the enclosing `Decoder` (the session pump) — `Send` only moves
-// that ownership. The `Rc`s inside pf-vkdecode's planners (H.264 and H.265 alike)
-// never escape them, so they all move together; every queue submission runs under the
-// collision-aware queue lock; the mpsc endpoints are `Send`. Same contract, same shape
-// as the `VulkanDecoder` and `PyroWaveDecoder` impls above/beside it. Deliberately NOT
-// `Sync`.
+// SAFETY: used strictly serially through `&mut self` from the session pump that owns
+// the enclosing `Decoder`. `Send` only moves that ownership. Planner `Rc`s never
+// escape, so they move together; every queue submit runs under the collision-aware
+// lock; the mpsc endpoints are `Send`. Not `Sync`.
 unsafe impl Send for NativeVulkanDecoder {}
 
 impl NativeVulkanDecoder {
-    /// Build the backend over the presenter's device for `codec` — the codec the
-    /// session negotiated, already admitted by `video::native_vulkan_gate` (which
-    /// checked that the decode family advertises this codec's decode op; the
-    /// decoders re-check it themselves rather than trust the caller, because
-    /// creating a video session for a codec operation the family cannot run is
-    /// undefined behaviour rather than an error).
+    /// Build over the presenter's device for the negotiated `codec`, already admitted
+    /// by `video::native_vulkan_gate`. The decoder re-checks the family's codec op:
+    /// a video session for an operation the family cannot run is UB, not an error.
     ///
-    /// Sessions and pools are built lazily from the first AU's parameter sets, so
-    /// nothing BELOW this constructor depends on the stream's shape — which is why
-    /// the shape is checked HERE, against `stream` (the host's resolved Welcome
-    /// facts), rather than being discovered at the first decode.
+    /// Sessions and pools are lazy from the first AU, so stream shape is checked here
+    /// against Welcome. A mid-stream format miss is an error streak that demotes past
+    /// this rung, often to software. A construction failure walks the ladder instead.
     ///
-    /// The difference is which rung a refusal lands on. pf-vkdecode's picture format
-    /// is the STREAM's (Main → NV12, Main 10 → P010, RExt 4:4:4 → the two-plane 4:4:4
-    /// formats) and a device that advertises H.265 or AV1 decode need not advertise a
-    /// format for every shape of it: 4:4:4 is absent everywhere but NVIDIA. Discovered
-    /// lazily, that is a mid-stream ERROR STREAK, and the streak machinery demotes a
-    /// Vulkan rung to VAAPI/D3D11VA — which on NVIDIA/Linux (no usable VAAPI) means a
-    /// 4K HEVC session lands on SOFTWARE. Refused here it is an ordinary construction
-    /// failure, and `video::Decoder::new` simply walks on to the next rung.
-    ///
-    /// Three legs the probe cannot see, because they are stream facts no negotiation
-    /// carries: a level above the device's `maxLevelIdc`, an SPS (or AV1 sequence
-    /// header) that disagrees with the Welcome, and — AV1 only — a sequence that
-    /// enables FILM GRAIN, which is part of the decode profile and which the probe
-    /// therefore has to assume ([`AV1_PROBE_FILM_GRAIN`]). All three still surface at
-    /// the first decode, where the demotion walk's next candidate is the rung DIRECTLY
-    /// below this one — the property the pre-M10 "never delivered a frame" arm existed
-    /// to guarantee, now structural (see [`crate::video::Decoder::decode_frame`]).
-    ///
-    /// H.264 is deliberately NOT probed: its envelope is fixed at 8-bit 4:2:0, so the
-    /// only fact a probe could add is a profile idc guess — on the one path in this
-    /// program that is hardware-verified bit-exact against libavcodec. It keeps the
-    /// never-delivered arm as its backstop.
+    /// Level above `maxLevelIdc`, SPS/sequence disagreeing with Welcome, and AV1 film
+    /// grain ([`AV1_PROBE_FILM_GRAIN`]) still fail at first decode.
+    /// H.264 is not probed: envelope is fixed 8-bit 4:2:0; the never-delivered arm
+    /// is the backstop on the hardware-verified path.
     pub(crate) fn new(
         vk: &VulkanDecodeDevice,
         codec: NativeCodec,
@@ -848,24 +590,10 @@ impl NativeVulkanDecoder {
         }
         let lock = queue_lock_for(vk);
         let handles = device_handles(vk);
-        // The `DeviceHandles` caller contract, held for the decoder's whole lifetime
-        // and identical for both arms (it is the HANDLES' contract, not the codec's):
-        // the handles are the presenter's live instance/device, which outlives every
-        // session pump (the run loop tears the pump — and with it this decoder — down
-        // first: the exact liveness contract the PyroWave backend also relies on over
-        // the same bundle). `video_decode` (checked above) is set only
-        // when the presenter enabled the Vulkan Video decode extension stack +
-        // synchronization2/timelineSemaphore at device creation — including the
-        // per-codec `VK_KHR_video_decode_h264`/`_h265`/`_av1` extensions, one for
-        // every codec operation the decode family advertises (`vk/setup.rs` enables
-        // exactly those it finds). What the decoders then re-check for themselves is
-        // the QUEUE FAMILY's advertised `videoCodecOperations` — the device's own
-        // claim about the family, which is what `native_vulkan_gate` reads too. That
-        // is not a proof the extension was enabled at `vkCreateDevice`; it is the
-        // same fact `vk/setup.rs` derived its enable list FROM, so the two agree by
-        // construction here and the check catches a caller that got the family wrong.
-        // `decode_qf`/`graphics_qf` mirror the families the presenter created queues
-        // for (one queue, index 0, each).
+        // Presenter's live instance/device; they outlive the pump (torn down first).
+        // `video_decode` means the presenter enabled the decode extension stack and
+        // per-codec decode extensions. Decoders re-check the family's
+        // `videoCodecOperations` — same fact `native_vulkan_gate` and `vk/setup.rs` use.
         let dec = match codec {
             NativeCodec::H264 => {
                 // SAFETY: the handle contract stated directly above.
@@ -874,17 +602,13 @@ impl NativeVulkanDecoder {
                 Codec::H264(d)
             }
             NativeCodec::H265 => {
-                // The device-independent half of the shape check, first: a stream
-                // shape pf-vkdecode has NO picture format for (4:2:2, 12-bit) needs
-                // no driver to refuse it.
+                // Shape with no pf-vkdecode picture format (4:2:2, 12-bit) needs no driver.
                 let wanted = picture_format("HEVC", stream)?;
                 // SAFETY: the handle contract stated directly above.
                 let d = unsafe { VkH265Decoder::new(&handles, lock) }
                     .map_err(|e| anyhow!("VkH265Decoder init: {e}"))?;
-                // …and the device-dependent half: does THIS driver advertise that
-                // format for a decode session of this profile? Same query and same
-                // derivation `ensure_state` would run at the first AU — only the
-                // timing differs, and the timing is the whole point.
+                // Does this driver advertise that format for this profile? Same query
+                // `ensure_state` would run at the first AU — only the timing differs.
                 let depth = stream
                     .bit_depth_minus8()
                     .expect("picture_format accepted the depth");
@@ -900,22 +624,17 @@ impl NativeVulkanDecoder {
                 Codec::H265(d)
             }
             NativeCodec::Av1 => {
-                // Exactly the H.265 shape check, one codec over — AV1's decode
-                // profile is a (seq_profile, sampling, depth, film grain) tuple and
-                // a device that advertises the AV1 decode OPERATION need not offer
-                // every profile of it. Refused here, the ladder walks to the next
-                // rung; discovered at the first AU, the only exit is an error streak
-                // PAST that rung.
+                // AV1 profile is (seq_profile, sampling, depth, film grain). Advertising
+                // the AV1 decode op does not offer every profile. Refuse here so the
+                // ladder walks; discovered at first AU the only exit is an error streak.
                 let wanted = picture_format("AV1", stream)?;
                 // SAFETY: the handle contract stated directly above.
                 let d = unsafe { VkAv1Decoder::new(&handles, lock) }
                     .map_err(|e| anyhow!("VkAv1Decoder init: {e}"))?;
                 d.probe_stream_support(
                     stream.chroma_format_idc,
-                    // AV1's profile key takes the ABSOLUTE bit depth (8/10), not
-                    // H.265's `bit_depth_luma_minus8` — the two probes really do
-                    // want different numbers, and `picture_format` above is the
-                    // one that proved this depth is in the envelope at all.
+                    // AV1 profile key takes absolute bit depth (8/10), not H.265's
+                    // `bit_depth_luma_minus8`. `picture_format` already proved the envelope.
                     stream.bit_depth,
                     AV1_PROBE_FILM_GRAIN,
                 )
@@ -933,10 +652,8 @@ impl NativeVulkanDecoder {
         let (release_tx, release_rx) = mpsc::channel();
         let status_queries = dec.status_queries();
         if !status_queries {
-            // Said once, loudly, at construction rather than only in the stats
-            // line: on this device a clean integrity report means "nothing was
-            // detectable", not "nothing was wrong" — and a support engineer
-            // reading a log after the fact has no stats window to consult.
+            // Once at construction: a clean integrity report here means "nothing was
+            // detectable", not "nothing was wrong" — no stats window after the fact.
             tracing::warn!(
                 "native decode: this device's decode queue family does not support \
                  RESULT_STATUS queries — driver-reported corruption is not \
@@ -944,10 +661,8 @@ impl NativeVulkanDecoder {
                  completion — the only signal libavcodec's rungs ever had)"
             );
         }
-        // `PUNKTFUNK_AU_FAULT=<mode>[:<period>]` — the deliberate-corruption knob
-        // (pf_vkdecode::fault). Unset is the only normal state; a spec that does
-        // not parse leaves the injector disarmed and says so rather than half
-        // arming.
+        // `PUNKTFUNK_AU_FAULT=<mode>[:<period>]`. Unset is normal; a spec that does
+        // not parse leaves the injector disarmed rather than half-arming.
         let fault = std::env::var("PUNKTFUNK_AU_FAULT").ok().and_then(|spec| {
             match pf_vkdecode::AuFault::from_spec(&spec) {
                 Some(f) => {
@@ -984,88 +699,48 @@ impl NativeVulkanDecoder {
         })
     }
 
-    /// This session's integrity counters — see [`DecodeHealth`].
     pub(crate) fn health(&self) -> DecodeHealth {
         self.health
     }
 
-    /// The newest planned picture's DECODE-order ordinal — see
-    /// [`NativeVkFrame::decode_order`].
+    /// Newest planned picture's decode-order ordinal ([`NativeVkFrame::decode_order`]).
     pub(crate) fn decode_order(&self) -> u64 {
         self.dec.decode_order()
     }
 
-    /// Drain the "the stream was damaged; please ask the host to re-anchor" flag.
-    /// Deliberately separate from an `Err` return — see the module doc's recovery
-    /// policy: concealment is a fact about the STREAM and must not tick the
-    /// decoder-demotion streak.
+    /// Drain the re-anchor ask. Separate from `Err`: concealment is a stream fact
+    /// and must not tick the decoder-demotion streak.
     pub(crate) fn take_recovery_request(&mut self) -> bool {
         std::mem::take(&mut self.want_recovery)
     }
 
-    /// Feed one complete access unit.
+    /// One complete access unit; at most one displayable frame out.
     ///
-    /// One access unit, at most one DISPLAYABLE frame out. On AV1 the access unit is
-    /// a temporal unit and the decoder may decode several frames from it — hidden
-    /// frames included, which are never declared displayable and therefore never
-    /// reach this ledger at all. Anything a single AU makes displayable beyond the
-    /// first waits in [`Self::deliverable`] for the next call, bounded by
-    /// [`MAX_DELIVERABLE`].
+    /// AV1 may decode several frames (hidden ones never reach this ledger). Extra
+    /// displayable pictures wait in [`Self::deliverable`], bounded by [`MAX_DELIVERABLE`].
     ///
-    /// `Ok(Some)` = a display-ready picture. `Ok(None)` = no picture this AU, which
-    /// covers three unrelated things and the caller treats all three the same
-    /// (its no-output/re-anchor machinery): the decoder
-    /// buffered without output, an H.265 RASL picture was skipped after an open-GOP
-    /// join, or the AU's plan needed CONCEALMENT and its output was released
-    /// unshown. `Err` = the DECODER is in trouble — a Vulkan/session error, an AV1
-    /// reference the plan could not resolve (which AV1 refuses rather than
-    /// conceals — module doc), an AV1 temporal unit skipped in full while the
-    /// decoder waits for the next key frame (the H.26x planners' `AwaitingIdr`
-    /// under another name), or a driver `RESULT_STATUS` verdict of Failed on a
-    /// prior frame — which the caller's streak/demotion machinery is entitled to
-    /// act on.
+    /// `Ok(Some)` is display-ready. `Ok(None)` is buffer, H.265 RASL skip, or
+    /// concealment (output released unshown, [`Self::take_recovery_request`] raised).
+    /// `Err` is decoder trouble (Vulkan/session, unresolved AV1 ref, keyframe wait,
+    /// or a prior-frame `RESULT_STATUS` Failed) — streak/demotion may act.
     ///
-    /// That split is the M4 recovery policy and it is deliberate (module doc):
-    /// concealment says the STREAM lost data, not that this decoder is failing, so
-    /// it raises [`Self::take_recovery_request`] instead of an error. The ask
-    /// reaches the host at the same moment and through the same 100 ms throttle it
-    /// always did; what it no longer does is spend a life on the demotion streak
-    /// and cost the session its hardware rung on a lossy link.
-    ///
-    /// A skipped RASL picture is not trouble at all: the decoder never turns
-    /// `h265::PlanError::RaslSkipped` into a `VkDecodeError` and clears the warning
-    /// ledger on its way out, so the concealment branch cannot fire on it either.
-    /// Nothing is released unshown and no re-anchor is asked for (module doc;
-    /// pf-bitstream `h265`).
-    ///
-    /// Ordering: the CURRENT AU decodes FIRST — the planner's reference state must
-    /// advance even when a PRIOR frame's status turns out Failed, or the recovery
-    /// IDR would land on a decoder that skipped an AU and reports a phantom
-    /// reference gap. The prior-frame verdicts are checked after; a corrupt verdict
-    /// costs exactly this one AU's output (released unshown), never parser state.
+    /// Decode this AU first so planner state advances even if a prior frame's status
+    /// is Failed; otherwise a recovery IDR lands on a skipped AU and a phantom gap.
+    /// A RASL skip is not trouble: never a `VkDecodeError`, no concealment, no re-anchor.
     pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<NativeVkFrame>> {
         self.drain_releases();
 
-        // Fault injection, at the last possible moment before the decoder: a
-        // faulted AU is byte-for-byte what a lossy network would have delivered,
-        // so every detector below sees the real thing rather than a special case.
-        // Inert (and free — no branch cost worth naming, no copy) unless armed.
+        // Last moment before the decoder: a faulted AU is byte-for-byte a lossy
+        // delivery. Inert unless armed.
         let faulted;
         let au = match self.fault.as_mut().map(|f| f.apply(au)) {
             None | Some(pf_vkdecode::FaultAction::Pass) => au,
             Some(pf_vkdecode::FaultAction::Drop) => {
                 tracing::warn!(len = au.len(), "PUNKTFUNK_AU_FAULT: dropping this AU");
-                // Never fed, so nothing decodes and nothing is display-ready —
-                // the same observable state a lost AU produces. The NEXT AU is
-                // where detection happens.
-                //
-                // Prior frames' verdicts still have to SETTLE here, though, or a
-                // fault run defers every one of them by an AU and the query slots
-                // sit unread meanwhile. What is deliberately NOT folded is a
-                // clean verdict: the health ledger holds one entry per AU the
-                // decoder was FED, and an AU that never reached it is no evidence
-                // that anything is healthy — folding `note(false, false, 0)` here
-                // would reset the concealed run on the very AU that was lost.
+                // Never fed — same observable as a lost AU. Still settle prior
+                // verdicts so query slots do not sit unread. Do not fold a clean
+                // `note`: this AU never reached the decoder, so it is not evidence
+                // of health (that would reset the concealed run on a lost AU).
                 let verdicts = self.settle_statuses();
                 if verdicts.total() > 0 {
                     self.health.note(false, false, verdicts.total());
@@ -1084,53 +759,23 @@ impl NativeVulkanDecoder {
             }
         };
 
-        // A REFUSAL is the loudest thing this lane can say, and it has to reach
-        // the health ledger before it reaches the caller. Folded here rather than
-        // after the `?` because there is no after: a `PlanError`
-        // (`Parse`/`OutsideEnvelope`/`AwaitingIdr`/`NoActiveParamSet`) or a
-        // Vulkan/session failure returns straight out, and until M4's review this
-        // path incremented nothing at all — so a rung refusing EVERY AU (a host
-        // renegotiating outside the envelope: a frozen screen) reported
-        // `damaged 0 · failed 0 · run 0` and printed no integrity line whatsoever.
-        // A clean bill of health on a decoder that decoded nothing is the exact
-        // failure this program exists to end.
-        //
-        // Prior frames' status verdicts settle first, for the same reason the
-        // clean path settles before it folds: the refusal costs this AU, and the
-        // frames already shipped still owe their verdicts.
+        // Fold a refusal into the health ledger before returning: there is no
+        // after `?`. Prior-frame verdicts settle first (they still owe a read).
+        // A rung refusing every AU must not report `damaged 0 · failed 0 · run 0`.
         let delivered = match self.dec.decode(au) {
             Ok(delivered) => delivered,
             Err(e) => {
-                // NOTHING from a refused AU reaches the screen — the same rule the
-                // concealment branch below keeps, and it has to be enforced here
-                // too because a refusal can STRAND a frame inside the decoder.
-                // AV1's `decode_inner` settles each plan of a multi-frame temporal
-                // unit in turn, so frame 1 can already sit in `ready` when frame 2
-                // fails; left there, the NEXT access unit pops it out of
-                // `take_ready` and ships it with an empty warning ledger. That
-                // would put a picture from a REFUSED unit on screen, clear the
-                // demotion streak with it, and set `video.rs`'s `delivered` —
-                // reporting a rung as working on exactly the stream shapes that
-                // refuse every AU.
-                //
-                // On H.264/H.265 this also catches the pictures `recover_dpb`
-                // FLUSHES out of the DPB on the AU after a failure (that AU then
-                // answers `AwaitingIdr`, so it lands here). Releasing them costs
-                // nothing observable: they were decoded BEFORE the loss, they
-                // arrive while the pump's freeze is armed, and the freeze gate
-                // withholds a non-keyframe there anyway — `session.rs` goes further
-                // and discards their recovery marks by `decode_order` for exactly
-                // this reason. The pool image comes back an access unit sooner. On
-                // a punktfunk stream the set is empty regardless: zero reorder means
-                // the DPB buffers no output to flush.
+                // Nothing from a refused AU reaches the screen. AV1 can leave frame 1
+                // in `ready` when frame 2 fails; `take_ready` on the next AU would ship
+                // it with an empty warning ledger. H.26x `recover_dpb` flushes pre-loss
+                // pictures into `AwaitingIdr` here; release returns the pool slot sooner.
                 while let Some(frame) = self.dec.take_ready() {
                     if let Err(e) = self.dec.release_frame(&frame, false) {
                         tracing::debug!(error = %e, "releasing a stranded frame failed");
                     }
                 }
-                // …and the unit's warnings go with it. They describe a plan whose
-                // frames were all released unshown; carried over, the NEXT AU would
-                // read them as its own fresh damage.
+                // Warnings describe a plan whose frames were released unshown;
+                // carrying them would make the next AU look freshly damaged.
                 let _ = self.dec.take_warnings();
                 let verdicts = self.settle_statuses();
                 self.health.note(false, true, verdicts.total());
@@ -1143,8 +788,7 @@ impl NativeVulkanDecoder {
             }
         };
         let warnings = self.dec.take_warnings();
-        // Everything this AU made display-ready, oldest first (`take_ready` drained
-        // so burst outputs are never stranded inside the decoder).
+        // Oldest first. Drain `take_ready` so a burst cannot strand inside the decoder.
         let mut fresh: Vec<DecodedVkFrame> = Vec::new();
         if let Some(frame) = delivered {
             fresh.push(frame);
@@ -1154,31 +798,23 @@ impl NativeVulkanDecoder {
         }
 
         let verdicts = self.settle_statuses();
-        // ONLY integrity warnings are concealment (see [`PlanWarnings`]): a
-        // spec-legal envelope signal — h265's `NonZeroReorder` on every SPS
-        // activation, h264's `Mmco5Rebase` — is an AU the planner planned in FULL,
-        // and dropping its frame would hitch the picture at every renegotiation.
+        // Only integrity is concealment ([`PlanWarnings`]). Spec-legal envelope
+        // (`NonZeroReorder` on SPS activation, `Mmco5Rebase`) was planned in full.
         let integrity = warnings.integrity();
         let concealed = !integrity.is_empty();
-        // One fold per AU, whatever the verdict: a clean AU is what ENDS a run,
-        // and a counter that only ever counts damage cannot tell a lossy link
-        // apart from a stream that never came back.
+        // One fold per AU: a clean AU is what ends a run; a damage-only counter
+        // cannot tell a lossy link from a stream that never came back.
         self.health.note(concealed, false, verdicts.total());
         if concealed || verdicts.total() > 0 {
-            // Concealment planned into THIS AU, or a bad status verdict on a
-            // PRIOR frame (driver-reported corruption — the Ally X class,
-            // invisible to libavcodec's query-less decoder — or a status that could
-            // not be established at all): this call's output is released unshown
-            // either way, because the picture is not fit to present.
+            // This AU's plan needed concealment, or a prior frame's status is bad:
+            // output is released unshown either way.
             for frame in fresh {
                 if let Err(e) = self.dec.release_frame(&frame, false) {
                     tracing::debug!(error = %e, "releasing an unshown frame failed");
                 }
             }
             if verdicts.total() > 0 {
-                // A verdict about the DECODER rather than the stream: an error,
-                // streak-eligible, at the volume libavcodec's reference-miss errors
-                // had (never quieter).
+                // Decoder, not stream: streak-eligible, same volume as libavcodec ref-miss.
                 return Err(self.status_error(verdicts));
             }
             warnings.warn_concealment(integrity.len());
@@ -1190,24 +826,15 @@ impl NativeVulkanDecoder {
         }
 
         self.deliverable.extend(fresh);
-        // This AU's frame comes off the FRONT first: the bound is on the CARRY-OVER
-        // (see [`trim_deliverable`]), so a unit that produced two outputs ships the
-        // first and holds the second rather than dropping the first to ship the
-        // second.
+        // This AU's frame off the front first: the bound is carry-over
+        // ([`trim_deliverable`]), so two outputs ship the first and hold the second.
         let shipped = self.deliverable.pop_front().map(|frame| self.ship(frame));
-        // The queue can only ever hand ONE frame per AU to the caller, so anything
-        // it cannot drain is a frame holding a pool image forever — see
-        // [`MAX_DELIVERABLE`]. Inert on every stream a punktfunk host emits.
+        // One frame per AU to the caller; anything that cannot drain holds a pool image.
         let queued = self.deliverable.len();
         for frame in trim_deliverable(&mut self.deliverable, MAX_DELIVERABLE) {
             self.health.note_dropped();
-            // Rate-limited, because the shape this fires on is a stream producing a
-            // surplus frame on EVERY access unit: unthrottled that is a warn per
-            // frame at frame rate, which buries the log it is supposed to explain.
-            // The first one carries the diagnosis; the rest are a running count.
-            // `queued` is the PRE-trim depth — the number that says how far past the
-            // bound the queue actually got. Read after the trim it would be the
-            // constant `MAX_DELIVERABLE` every single time.
+            // First drop diagnoses; later ones heartbeat. `queued` is pre-trim depth
+            // — after trim it would be the constant `MAX_DELIVERABLE` every time.
             if self.health.dropped == 1 || self.health.dropped % DROP_WARN_EVERY == 0 {
                 tracing::warn!(
                     queued,
@@ -1224,8 +851,7 @@ impl NativeVulkanDecoder {
         Ok(shipped)
     }
 
-    /// Wrap a delivered [`DecodedVkFrame`] for the presenter and enter it into the
-    /// shipped ledger (the original stays here — release/poll need it).
+    /// Wrap for the presenter and enter the shipped ledger (release/poll need the original).
     fn ship(&mut self, frame: DecodedVkFrame) -> NativeVkFrame {
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -1255,13 +881,9 @@ impl NativeVulkanDecoder {
         native
     }
 
-    /// Bounded wait for a shipped frame's decode-complete signal — the pump's
-    /// sampled decode-latency stat (`Decoder::wait_hw_decoded`), one frame per
-    /// stats window. The raw pair names a frame still in the shipped ledger (the
-    /// pump waits on the same thread that just shipped it, before any settle
-    /// could retire it); the ledger lookup is the liveness proof — an unreleased
-    /// frame pins its pool, so a pair matching nothing (already settled, or a
-    /// stray) just declines the sample instead of touching unknown handles.
+    /// Bounded wait for a shipped frame's decode-complete signal (pump decode-latency).
+    /// Lookup is the liveness proof: an unreleased frame pins its pool; a pair matching
+    /// nothing (already settled, or stray) declines the sample instead of unknown handles.
     pub(crate) fn wait_timeline(&self, sem: u64, value: u64, timeout_ns: u64) -> bool {
         self.outstanding
             .iter()
@@ -1269,8 +891,7 @@ impl NativeVulkanDecoder {
             .is_some_and(|s| self.dec.wait_decoded(&s.frame, timeout_ns))
     }
 
-    /// Drain the release channel, marking returned frames (release itself waits for
-    /// the status read — see [`Self::settle_statuses`]).
+    /// Drain the release channel. Actual pool release waits for the status read.
     fn drain_releases(&mut self) {
         while let Ok(token) = self.release_rx.try_recv() {
             if !note_token(&mut self.outstanding, token) {
@@ -1283,9 +904,7 @@ impl NativeVulkanDecoder {
         }
     }
 
-    /// The error a bad status verdict surfaces as, worded for the device it came
-    /// from: a driver that reported corruption is named as such, a device that
-    /// cannot report one is not blamed for a verdict it never gave.
+    /// Worded for the device: do not blame a driver that cannot report corruption.
     fn status_error(&self, verdicts: StatusVerdicts) -> anyhow::Error {
         if verdicts.driver_failed > 0 {
             anyhow!(
@@ -1303,18 +922,15 @@ impl NativeVulkanDecoder {
         }
     }
 
-    /// Poll the status query of every unresolved shipped frame (non-blocking) and
-    /// release the ones that are both status-settled and token-returned. Returns the
-    /// frames that NEWLY read `Failed`, split by whether this device can produce a
-    /// driver verdict at all — see [`StatusVerdicts`].
+    /// Non-blocking poll of every unresolved shipped frame; release those both
+    /// status-settled and token-returned. Returns newly-`Failed` frames, split by
+    /// whether this device can produce a driver verdict ([`StatusVerdicts`]).
     ///
-    /// Polling an unreleased frame is always sound: its slot is pinned until
-    /// `release_frame`, so the query slot it names cannot have been recycled under it
-    /// (the false-`Failed` a recycled slot would read).
+    /// Polling an unreleased frame is sound: its slot is pinned until `release_frame`,
+    /// so the query slot cannot have been recycled (the false-`Failed` that would read).
     fn settle_statuses(&mut self) -> StatusVerdicts {
         let mut verdicts = StatusVerdicts::default();
-        // A device fact, read once: it decides which KIND of verdict a `Failed`
-        // read below is (`StatusVerdicts`), never whether the frame is dropped.
+        // Decides which kind of `Failed` this is ([`StatusVerdicts`]), never whether to drop.
         let status_queries = self.dec.status_queries();
         let Self {
             dec, outstanding, ..
@@ -1323,13 +939,9 @@ impl NativeVulkanDecoder {
             if s.resolved {
                 continue;
             }
-            // A session rebuild (stream renegotiation) already made this frame stale:
-            // its SESSION objects (query pool included) are gone — the picture pool
-            // lives on in the decoder's graveyard while we hold the image, but the
-            // query verdict is unknowable and poll_status would report the
-            // conservative Failed — which is NOT driver corruption. Resolve it
-            // quietly; the rebuild rode an IDR, so the stream has its re-anchor
-            // already.
+            // Rebuild retired this frame's session objects (query pool included).
+            // `poll_status` would report Failed, which is not driver corruption.
+            // The rebuild rode an IDR, so the stream already has its re-anchor.
             if s.frame.generation != dec.generation() {
                 tracing::debug!(
                     poc = s.frame.poc,
@@ -1351,12 +963,8 @@ impl NativeVulkanDecoder {
                             "decode status query: Failed (driver-reported corruption)"
                         );
                     } else {
-                        // No query pool on this device, so nothing here is the
-                        // driver's opinion of the decode: `poll_status` degraded
-                        // to reading the decode timeline and could not establish
-                        // completion (a lost device, an unreadable semaphore).
-                        // The picture is dropped exactly the same way — it is the
-                        // ATTRIBUTION that must not be invented (`StatusVerdicts`).
+                        // No query pool: this is not the driver's opinion of the decode.
+                        // Drop the picture the same way; do not invent attribution.
                         verdicts.unreadable += 1;
                         tracing::warn!(
                             poc = s.frame.poc,
@@ -1368,8 +976,7 @@ impl NativeVulkanDecoder {
                 }
                 DecodeStatus::Pending => {
                     if s.released {
-                        // Token back ⇒ the decode op completed before the presenter's
-                        // sampling ⇒ the query should be readable. Belt, not a path.
+                        // Token back ⇒ decode completed before sampling ⇒ query should be readable.
                         s.polls_after_release += 1;
                         if s.polls_after_release >= MAX_POLLS_AFTER_RELEASE {
                             tracing::debug!(
@@ -1389,11 +996,9 @@ impl NativeVulkanDecoder {
             }
             match dec.release_frame(&s.frame, s.presented) {
                 Ok(()) => {}
-                // Not a best-effort no-op: stale-generation frames release into the
-                // decoder's graveyard (a rebuild retires a still-held pool INTACT,
-                // and this very call is what lets it die on its last token). An Err
-                // is therefore a bookkeeping ghost — a double release — never a
-                // held image left dangling.
+                // Stale-generation frames release into the graveyard (rebuild retires
+                // a still-held pool intact). `Err` is a double-release ghost, not a
+                // dangling image.
                 Err(e) => tracing::debug!(error = %e, "release_frame: {e}"),
             }
             false
@@ -1404,31 +1009,20 @@ impl NativeVulkanDecoder {
 
 impl Drop for NativeVulkanDecoder {
     fn drop(&mut self) {
-        // Ordering contract: the run loop drops the PRESENTER's frame (its retired
-        // slot, fence-waited) before joining the pump that owns this backend — so
-        // by the time this Drop runs, outstanding tokens are either already in the
-        // channel or arrive imminently; the bounded wait below is for that hand-off,
-        // not for future GPU work.
-        //
-        // Frames never handed to the pump release directly (unsampled).
+        // Run loop drops the presenter's retired frame before joining this pump, so
+        // tokens are in-channel or imminent. Bound below is that hand-off, not GPU work.
+        // Frames never handed to the pump release unsampled.
         for frame in std::mem::take(&mut self.deliverable) {
             if let Err(e) = self.dec.release_frame(&frame, false) {
                 tracing::debug!(error = %e, "releasing an undelivered frame failed");
             }
         }
-        // Drop our own sender FIRST: once every shipped guard is gone too, the
-        // channel reports Disconnected — the "presenter can no longer produce
-        // tokens" signal that short-circuits the wait instead of burning the full
-        // budget against a presenter that is already gone.
+        // Drop our sender first: once every shipped guard is gone, Disconnected
+        // short-circuits the wait instead of burning the budget on a gone presenter.
         drop(self.release_tx.take());
-        // Wait (bounded) for the presenter to hand back every shipped frame before
-        // the decoder's Drop destroys the pool images: a returned token proves the
-        // sampling submission's fence was waited, i.e. no GPU work of the
-        // presenter's still reads the pools (the decoder's own drain covers only
-        // decode work). Graveyarded pools ride the same token contract — a
-        // mid-stream renegotiation retires a still-held pool INTACT, and the
-        // release calls below route stale-generation frames into the graveyard,
-        // so those pools too die only once their last presenter fence was waited.
+        // Wait for every shipped token before pool destroy: a token proves the
+        // sampling fence was waited. Graveyarded pools use the same contract —
+        // stale-generation releases route there, so those pools die after last fence.
         let deadline = Instant::now() + TEARDOWN_BUDGET;
         loop {
             self.drain_releases();
@@ -1463,9 +1057,8 @@ impl Drop for NativeVulkanDecoder {
                 Ok(token) => {
                     note_token(&mut self.outstanding, token);
                 }
-                // Every sender is gone (ours dropped above, every guard dropped):
-                // no more tokens can EVER arrive — anything still outstanding is a
-                // bookkeeping ghost, not a held frame. Stop waiting.
+                // Every sender gone: no more tokens can arrive. Outstanding is a
+                // bookkeeping ghost, not a held frame.
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     if !self.outstanding.is_empty() {
                         tracing::debug!(
@@ -1479,9 +1072,8 @@ impl Drop for NativeVulkanDecoder {
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
             }
         }
-        // `self.dec` drops after this body: it drains its own decode-side GPU work
-        // and destroys any remaining graveyard pools (warned — a forfeit here means
-        // the presenter kept frames past the budget).
+        // `self.dec` drops after this body: drains decode-side GPU work and destroys
+        // remaining graveyard pools (a forfeit means the presenter held past budget).
     }
 }
 
@@ -1489,14 +1081,8 @@ impl Drop for NativeVulkanDecoder {
 mod tests {
     use super::*;
 
-    /// A delivered frame whose every field carries a DISTINCT non-zero value.
-    ///
-    /// Deliberately not "inert handles, zeros elsewhere": [`project_frame`] is a
-    /// 20-field struct literal lifted out of `ship`, and the bugs it can hide are
-    /// field SWAPS and DROPS — `crop_x: frame.crop.y`, `semaphore_value: frame.poc
-    /// as u64`, a `keyframe` that stopped being carried. Against zeros every one of
-    /// those passes. So: no two numbers here are equal, no boolean is false, and
-    /// each CICP code point differs from the others.
+    /// Fixture whose every field is a distinct non-zero. [`project_frame`] bugs are
+    /// field swaps and drops; zeros hide them.
     fn decoded(format: vk::Format, layout: vk::ImageLayout, generation: u64) -> DecodedVkFrame {
         DecodedVkFrame {
             image: vk::Image::from_raw(0x1001),
@@ -1510,16 +1096,14 @@ mod tests {
             layout,
             coded_width: 1920,
             coded_height: 1088,
-            // A non-origin crop: punktfunk hosts emit origin crops only, but x != y
-            // here is what makes an x/y swap in the projection visible.
+            // Non-origin crop: x != y so an x/y swap in the projection is visible.
             crop: pf_vkdecode::DisplayCrop {
                 x: 8,
                 y: 4,
                 width: 1904,
                 height: 1072,
             },
-            // BT.2020 primaries / PQ transfer / a third code point for the matrix,
-            // so no two CICP fields share a value.
+            // Distinct CICP code points so no two colour fields share a value.
             colour: pf_vkdecode::ColourDescription {
                 colour_primaries: 9,
                 transfer_characteristics: 16,
@@ -1530,22 +1114,17 @@ mod tests {
             value: 7,
             poc: 5,
             is_idr: true,
-            // Both facts SET and distinct from the defaults, for the same reason
-            // every other field here is: a projection that dropped the recovery
-            // mark would silently reinstate the 500 ms freeze on every
-            // intra-refresh session, and against `false` that passes.
+            // Both set: dropping the recovery mark would reinstate the 500 ms freeze
+            // on every intra-refresh session, and `false` would hide it.
             recovery: pf_vkdecode::RecoveryMark {
                 sei_here: true,
                 is_recovery_point: true,
             },
-            // SET, per this fixture's no-boolean-is-false rule — and it earns the
-            // rule: a projection that dropped this would default it to `false`,
-            // which reads as "this picture's references were concealed" and would
-            // make the gate refuse EVERY host recovery anchor on a healthy stream.
+            // True per this fixture's no-false-boolean rule. Default `false` would
+            // make the gate refuse every host recovery anchor on a healthy stream.
             references_clean: true,
-            // Distinct from every other number here for the same reason: a
-            // projection that dropped the decode ordinal would make every frame
-            // look pre-loss (0) and silently disable the local-recovery path.
+            // Distinct from every other number: drop would make every frame look
+            // pre-loss (0) and disable local recovery.
             decode_order: 17,
             query_slot: 2,
             submission: 11,
@@ -1554,12 +1133,11 @@ mod tests {
         }
     }
 
-    /// A shipped-ledger entry with inert handles — the bookkeeping under test is pure.
+    /// Ledger entry with inert handles — the bookkeeping under test is pure.
     fn shipped(seq: u64, generation: u64) -> Shipped {
         Shipped {
             seq,
-            // The ledger under test never reads the picture format; NV12 is what an
-            // H.264 session always delivers.
+            // Ledger under test never reads picture format; NV12 is what H.264 delivers.
             frame: decoded(
                 pf_vkdecode::NV12,
                 vk::ImageLayout::VIDEO_DECODE_DST_KHR,
@@ -1572,7 +1150,6 @@ mod tests {
         }
     }
 
-    /// Project one frame with a throwaway guard (the channel is the caller's).
     fn project(frame: &DecodedVkFrame) -> NativeVkFrame {
         let (tx, _rx) = mpsc::channel();
         project_frame(
@@ -1588,12 +1165,8 @@ mod tests {
         )
     }
 
-    /// The picture format is the STREAM's, and it must reach the presenter intact:
-    /// H.264 and H.265 Main deliver NV12, Main 10 delivers P010, RExt 4:4:4 delivers
-    /// the two-plane 4:4:4 formats. The presenter picks bit depth, MSB packing and
-    /// chroma siting from exactly this number, so a projection that dropped or
-    /// defaulted it would render a Main 10 picture with 8-bit math — decoded
-    /// correctly, displayed wrong, and nothing would flag it.
+    /// Picture format is the stream's and must reach the presenter. Dropping it
+    /// would CSC a Main 10 picture with 8-bit math — decoded right, shown wrong.
     #[test]
     fn the_projection_carries_the_pictures_own_format_whatever_the_codec() {
         for format in [
@@ -1611,21 +1184,13 @@ mod tests {
         }
     }
 
-    /// EVERY field of the projection, against a frame whose values are all distinct
-    /// (see [`decoded`]): the display crop is what the presenter shows, the coded
-    /// extent is what it must divide by (the 1088-row lesson), the crop ORIGIN is
-    /// what its UV-scale path assumes is (0,0), the timeline pair is what it waits,
-    /// the CICP quadruple is what it does colour maths with, and the decode layout is
-    /// what it has to restore after sampling. A swap or a drop among any of them is a
-    /// silently wrong picture, so the list here is deliberately exhaustive — if
-    /// `NativeVkFrame` grows a field, this test should stop compiling before it can
-    /// go unchecked.
+    /// Every projected field, against distinct values (see [`decoded`]). A new
+    /// [`NativeVkFrame`] field should fail to compile here before it can go unchecked.
     #[test]
     fn the_projection_carries_every_field_the_presenter_can_no_longer_look_up() {
         let frame = decoded(pf_vkdecode::P010, vk::ImageLayout::VIDEO_DECODE_DST_KHR, 4);
         let p = project(&frame);
-        // Destructured, not field-accessed: a NEW field on NativeVkFrame breaks this
-        // pattern and lands the author right here.
+        // Destructure, not field access: a new NativeVkFrame field breaks this pattern.
         let NativeVkFrame {
             image,
             vk_format,
@@ -1704,8 +1269,7 @@ mod tests {
              frame decoded before a loss from one decoded after it"
         );
 
-        // Coincide mode: the picture IS a DPB slot, so the presenter must put the
-        // layer back in DPB layout after sampling.
+        // Coincide mode: the picture is a DPB slot; presenter must restore DPB layout.
         let dpb = project(&decoded(
             pf_vkdecode::NV12,
             vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
@@ -1714,11 +1278,8 @@ mod tests {
         assert_eq!(dpb.layout, NativeVkLayout::DecodeDpb);
     }
 
-    /// The construction-time shape refusal, device-independent half. A negotiated
-    /// shape pf-vkdecode has no picture format for must be refused where
-    /// `Decoder::new` can still walk to the next rung — NOT discovered at the first AU,
-    /// where the only exit is an error streak that demotes PAST that rung (and on
-    /// NVIDIA/Linux, where VAAPI is unusable, straight to software).
+    /// Device-independent shape refusal. A shape with no picture format must fail
+    /// where `Decoder::new` can still walk the ladder, not at the first AU.
     #[test]
     fn a_stream_shape_with_no_native_picture_format_is_refused_at_construction() {
         use crate::video::StreamFormat;
@@ -1731,8 +1292,6 @@ mod tests {
                 },
             )
         };
-        // What the envelope DOES admit resolves, and to the right format — Main,
-        // Main 10 and both RExt 4:4:4 depths.
         assert_eq!(f(1, 8).unwrap(), pf_vkdecode::NV12);
         assert_eq!(f(1, 10).unwrap(), pf_vkdecode::P010);
         assert_eq!(f(3, 8).unwrap(), pf_vkdecode::YUV444_8);
@@ -1742,11 +1301,9 @@ mod tests {
             pf_vkdecode::NV12,
             "the default/older-host shape is the ordinary one"
         );
-        // 4:2:2 and monochrome are legal H.265 with no output plumbing here.
         assert!(f(2, 8).is_err(), "4:2:2");
         assert!(f(0, 8).is_err(), "monochrome");
-        // 12-bit has no output format either, and a depth BELOW 8 must not wrap
-        // around into a plausible `bit_depth_luma_minus8`.
+        // 12-bit has no format; a depth below 8 must not wrap into `bit_depth_luma_minus8`.
         assert!(f(1, 12).is_err(), "12-bit");
         assert!(
             f(1, 0).is_err(),
@@ -1755,16 +1312,10 @@ mod tests {
         assert!(f(3, 6).is_err());
     }
 
-    /// AV1's construction-time shape gate is the SAME envelope, and it has to stay
-    /// that way: [`picture_format`] is what refuses first, and one line later
-    /// `VkAv1Decoder::probe_stream_support` builds an `Av1ProfileKey`, which refuses
-    /// exactly the same set (monochrome, 4:2:2, the planner's 4:4:0 sentinel, any
-    /// depth but 8/10). Two gates that disagreed would mean either a shape refused
-    /// here that the device could have decoded, or — worse — a shape admitted here
-    /// and then refused mid-stream, where the exit is an error streak past this rung.
-    ///
-    /// The label is checked too, because it is the only thing a support engineer
-    /// reading the refusal has to tell an AV1 session's refusal from an HEVC one.
+    /// AV1 construction-time gate is the same envelope: [`picture_format`] refuses
+    /// first, then `Av1ProfileKey` refuses the same set. Disagreement would either
+    /// refuse a decodable shape or admit one that fails mid-stream (error streak).
+    /// The label is checked because it is what distinguishes an AV1 refusal from HEVC.
     #[test]
     fn the_av1_shape_gate_admits_exactly_what_pf_vkdecodes_av1_profile_key_admits() {
         use crate::video::StreamFormat;
@@ -1777,13 +1328,10 @@ mod tests {
                 },
             )
         };
-        // AV1 Main 8-bit / Main 10 / High 4:4:4 at both depths — every combination
-        // `Av1ProfileKey::from_negotiated` maps to a profile.
         assert_eq!(f(1, 8).unwrap(), pf_vkdecode::NV12);
         assert_eq!(f(1, 10).unwrap(), pf_vkdecode::P010);
         assert_eq!(f(3, 8).unwrap(), pf_vkdecode::YUV444_8);
         assert_eq!(f(3, 10).unwrap(), pf_vkdecode::YUV444_10);
-        // …and the ones it refuses.
         assert!(f(0, 8).is_err(), "monochrome");
         assert!(f(2, 8).is_err(), "4:2:2");
         assert!(
@@ -1796,8 +1344,7 @@ mod tests {
             "an absurd depth refuses, never underflows"
         );
 
-        // The refusal names the codec — the label is the whole reason this function
-        // takes one.
+        // The refusal names the codec — the only reason this function takes one.
         let err = format!("{:#}", f(2, 8).unwrap_err());
         assert!(err.contains("AV1"), "{err}");
         let hevc = format!(
@@ -1813,9 +1360,7 @@ mod tests {
         );
         assert!(hevc.contains("HEVC"), "{hevc}");
 
-        // The probe's OWN gate, asked the same questions through pf-vkdecode's
-        // profile key: this is the agreement the comment above claims, asserted
-        // rather than assumed.
+        // The probe's own gate, same questions: the agreement above, asserted.
         for (chroma, depth) in [(1u8, 8u8), (1, 10), (3, 8), (3, 10)] {
             assert!(
                 pf_vkdecode::Av1ProfileKey::from_negotiated(chroma, depth, AV1_PROBE_FILM_GRAIN)
@@ -1832,41 +1377,18 @@ mod tests {
         }
     }
 
-    /// The deliverable queue can only hand ONE frame per AU to the pump, and every
-    /// frame waiting in it pins a picture-pool image. A stream that made two
-    /// pictures displayable per access unit would grow it by one per AU until the
-    /// pool ran out, after which every AU refuses with `NoFreeSlot`, three in a
-    /// second demote the rung, and nothing in the log would name a queue that could
-    /// never drain as the cause.
+    /// The deliverable queue hands one frame per AU and every waiter pins a pool
+    /// image. Unbounded growth hits `NoFreeSlot` and demotes with no log of the queue.
     ///
-    /// ⚠ Which stream that is, precisely — the earlier claim here was wrong and the
-    /// crate's own golden disproves it. AV1 permits exactly ONE shown frame per
-    /// temporal unit, so a `show_existing_frame` can never ride alongside a shown
-    /// frame; pf-bitstream's conformance test pins `shown = 250` across 250 units
-    /// with `show_existing = 0`, and its 24 two-frame units are a hidden ALTREF plus
-    /// the frame that shows it. The real producers are H.265 bumping after a
-    /// reordering stretch, and — as defence in depth — a non-conformant or
-    /// multi-operating-point AV1 stream. The bound is worth having for those; it is
-    /// not the routine case.
-    ///
-    /// So the bound drops from the FRONT: by the time the queue is this deep the
-    /// oldest frame is several AUs stale, and the stage after this one (the pump's
-    /// `force_send`) is itself newest-wins. Dropping the newest instead would keep
-    /// the stalest picture and present the stream in ever-lagging order.
-    ///
-    /// ⚠ What this exercises is [`trim_deliverable`] ALONE — the pure half. The
-    /// wiring it cannot see is the caller's: that the trim runs AFTER this AU's
-    /// frame is taken off the front, that every dropped frame is handed to
-    /// `release_frame(.., false)`, and that [`DecodeHealth::dropped`] counts it.
-    /// Replace those with `mem::forget` and this test stays green; only a device
-    /// (or the `NoFreeSlot` a leaked pool image eventually produces) would notice.
+    /// Drops from the front: the oldest is several AUs stale and the next stage is
+    /// newest-wins. This test is [`trim_deliverable`] alone — not that the caller
+    /// trims after taking this AU's frame, nor that drops go to `release_frame`.
     #[test]
     fn the_deliverable_queue_drops_its_oldest_rather_than_pinning_pool_images_forever() {
         let mut q: std::collections::VecDeque<DecodedVkFrame> = (0..5)
             .map(|i| {
                 let mut f = decoded(pf_vkdecode::NV12, vk::ImageLayout::VIDEO_DECODE_DST_KHR, 1);
-                // The only field this test reads — distinct per frame so "which
-                // ones were dropped" is decidable rather than merely counted.
+                // Distinct per frame so which were dropped is decidable, not merely counted.
                 f.poc = i;
                 f
             })
@@ -1884,20 +1406,12 @@ mod tests {
             "…and what survives stays in display order"
         );
 
-        // At or below the bound nothing moves: on every stream a punktfunk host
-        // emits this queue is empty, and the bound must be invisible there.
         assert!(trim_deliverable(&mut q, 3).is_empty());
         assert_eq!(q.len(), 3);
 
-        // The bound is DERIVED, and this is the arithmetic it is derived from: a
-        // queued frame holds a picture-pool image exactly like a shipped one, and
-        // pf-vkdecode sizes that pool at `required_slots + HOLD_HEADROOM`. So the
-        // queue at its bound PLUS what the pipeline itself holds must fit inside
-        // the headroom — otherwise the pool runs out, every AU refuses with
-        // `NoFreeSlot`, and the bound caps memory without preventing the failure it
-        // names. Pinned against pf-vkdecode's own constant so a hardcoded depth here
-        // (this shipped at 8, against a headroom of 8) fails the build rather than a
-        // field session.
+        // Queue at bound plus pipeline hold must fit in HOLD_HEADROOM; otherwise
+        // the bound caps memory without preventing `NoFreeSlot`. Pinned to
+        // pf-vkdecode's constant so a hardcoded depth fails the build.
         assert!(
             MAX_DELIVERABLE + PIPELINE_HOLD <= pf_vkdecode::HOLD_HEADROOM as usize,
             "a queue of {MAX_DELIVERABLE} on top of the pipeline's {PIPELINE_HOLD} \
@@ -1905,10 +1419,9 @@ mod tests {
             pf_vkdecode::HOLD_HEADROOM
         );
 
-        // The PRODUCTION bound, at the carry-over depth it is derived to: one AU's
-        // surplus frame is held (the burst this queue exists for), a second AU's is
-        // not. Asserted against `MAX_DELIVERABLE` itself so a change to
-        // `PIPELINE_HOLD` lands here rather than in a field log.
+        // Production bound: one AU's surplus is held (the burst this queue exists
+        // for); a second AU's is not. Against `MAX_DELIVERABLE` so a `PIPELINE_HOLD`
+        // change lands here.
         let mut q: std::collections::VecDeque<DecodedVkFrame> = (0..MAX_DELIVERABLE)
             .map(|i| {
                 let mut f = decoded(pf_vkdecode::NV12, vk::ImageLayout::VIDEO_DECODE_DST_KHR, 1);
@@ -1922,10 +1435,8 @@ mod tests {
         );
         assert_eq!(q.len(), MAX_DELIVERABLE);
 
-        // A zero bound drains rather than looping or panicking. Reachable only
-        // through a caller that asks for it — teardown does NOT come through here
-        // (`Drop` empties the queue with `mem::take` and releases each frame), so
-        // this pins termination and the empty-queue edge, not a production path.
+        // A zero bound drains rather than looping or panicking. Teardown does not
+        // come through here (`Drop` uses `mem::take`); this pins termination.
         let drained = q.len();
         assert_eq!(trim_deliverable(&mut q, 0).len(), drained);
         assert!(q.is_empty());
@@ -1950,8 +1461,7 @@ mod tests {
             "the token's presented flag rides into the ledger (the decoder waits \
              the presenter's value+1 write-back only when it was really enqueued)"
         );
-        // A stray token (frame already settled away — e.g. a post-demotion drain)
-        // matches nothing and must not panic or mis-mark.
+        // Stray token (already settled, e.g. post-demotion drain) matches nothing.
         assert!(!note_token(
             &mut outstanding,
             NativeReleaseToken {
@@ -1983,8 +1493,7 @@ mod tests {
 
     #[test]
     fn a_dropped_unpresented_frame_still_releases_through_the_same_guard() {
-        // The newest-wins channel/store displacement path: the frame never reaches a
-        // present, but dropping it must still return its slot.
+        // Newest-wins displacement: the frame never presents, but drop must return its slot.
         let (tx, rx) = mpsc::channel();
         let frame = NativeVkFrame {
             image: 0,
@@ -2036,8 +1545,7 @@ mod tests {
 
     #[test]
     fn a_dead_channel_is_ignored_not_fatal() {
-        // Demotion mid-stream: the backend (and its Receiver) are gone while the
-        // presenter still holds a frame — its drop must be a no-op, not a panic.
+        // Demotion mid-stream: Receiver is gone while the presenter still holds a frame.
         let (tx, rx) = mpsc::channel();
         drop(rx);
         let guard = NativeReleaseGuard::new(
@@ -2048,24 +1556,18 @@ mod tests {
                 presented: false,
             },
         );
-        drop(guard); // must not panic
+        drop(guard);
     }
 
-    /// Concealment is the INTEGRITY warnings, not "any warning at all".
+    /// Concealment is integrity warnings, not any warning.
     ///
-    /// h265's `NonZeroReorder` is emitted on the AU that ACTIVATES an SPS with
-    /// `sps_max_num_reorder_pics > 0` — the opening IDR, and the fresh IDR at every
-    /// ABR resolution change. pf-bitstream documents it as spec-legal and fully
-    /// planned (C.5.2 bumping honours the reordering) and excludes it from its own
-    /// integrity set. Treating it as concealment releases that IDR UNSHOWN, errors,
-    /// and begs the host for a keyframe: a visible hitch at every renegotiation, on
-    /// a stream the planner says it planned correctly.
+    /// `NonZeroReorder` fires on SPS activation (opening IDR and every ABR IDR).
+    /// Treating it as concealment releases that IDR unshown at every renegotiation.
     #[test]
     fn a_spec_legal_envelope_warning_is_not_concealment() {
         use pf_vkdecode::H265PlanWarning as H265;
         use pf_vkdecode::PlanWarning as H264;
 
-        // The case from the field: an SPS activation, nothing else.
         let reorder = PlanWarnings::H265(vec![H265::NonZeroReorder {
             max_num_reorder_pics: 1,
         }]);
@@ -2075,14 +1577,12 @@ mod tests {
             "…but it is not concealment: the frame must be shown, not dropped"
         );
 
-        // h264's twin: an MMCO 5 was planned in full too (the plan carries the
-        // pre-rebase 8.2.1 values).
+        // MMCO 5 was planned in full too (plan carries pre-rebase 8.2.1 values).
         let mmco5 = PlanWarnings::H264(vec![H264::Mmco5Rebase]);
         assert!(!mmco5.is_empty());
         assert!(mmco5.integrity().is_empty());
 
-        // Everything that means a reference or a slice was LOST still is — this is
-        // the H.264 behaviour the hardware-verified path shipped with.
+        // Missing reference or truncated AU is still concealment.
         for w in [
             H264::FrameNumGap {
                 expected: 4,
@@ -2108,8 +1608,7 @@ mod tests {
             assert_eq!(warnings.integrity().len(), 1);
         }
 
-        // Mixed AU: the damage decides, and the count the error reports is the
-        // damage count — the spec-legal companion rides along in the log only.
+        // Mixed AU: damage decides; spec-legal companion rides in the log only.
         let mixed = PlanWarnings::H265(vec![
             H265::NonZeroReorder {
                 max_num_reorder_pics: 2,
@@ -2120,18 +1619,10 @@ mod tests {
         assert_eq!(mixed.integrity().len(), 1);
     }
 
-    /// The AV1 arm of the same split (M7). AV1's planner has no spec-legal
-    /// companion to `NonZeroReorder`/`Mmco5Rebase` — it announces no reorder
-    /// envelope and has no MMCO to rebase — so every warning it emits is damage and
-    /// every one of them must conceal.
-    ///
-    /// Worth asserting despite being "all true", because the failure it catches is
-    /// silent: an arm wired to the wrong predicate (or to an empty vector) would
-    /// SHOW a picture the stream lost data for and ask for no re-anchor, which is
-    /// exactly the invisible-damage shape this program exists to end. The one that
-    /// carries most of the weight is `MissingShowExisting` — a frame that decoded
-    /// nothing and displayed nothing — because it is the one an author is most
-    /// likely to read as harmless.
+    /// AV1 has no spec-legal companion to `NonZeroReorder`/`Mmco5Rebase`, so every
+    /// warning conceals. An arm wired to the wrong predicate would show a damaged
+    /// picture and ask for no re-anchor. `MissingShowExisting` is the one most
+    /// likely to be read as harmless (decoded nothing, displayed nothing).
     #[test]
     fn every_av1_warning_conceals_because_av1_has_no_spec_legal_signal() {
         use pf_vkdecode::Av1PlanWarning as Av1;
@@ -2153,8 +1644,7 @@ mod tests {
             );
         }
 
-        // The whole vocabulary at once — the count the concealment log reports is
-        // the damage count, and here it is the full list.
+        // Concealment count is the damage count; here that is the full list.
         let all = PlanWarnings::Av1(vec![
             Av1::MissingReference {
                 slot: 0,
@@ -2165,24 +1655,18 @@ mod tests {
         ]);
         assert_eq!((all.len(), all.integrity().len()), (3, 3));
 
-        // A clean AU is clean: the AV1 arm must not manufacture concealment out of
-        // an empty ledger, which is what a stream with no damage produces on every
-        // single access unit.
+        // Empty ledger is clean — do not manufacture concealment on a healthy AU.
         assert!(PlanWarnings::Av1(Vec::new()).is_empty());
         assert!(PlanWarnings::Av1(Vec::new()).integrity().is_empty());
     }
 
-    /// The counter a support engineer reads first. A total alone cannot tell a
-    /// lossy link that keeps recovering apart from a stream that went down and
-    /// stayed down — `damaged 40 · run 0` and `damaged 40 · run 40` are the same
-    /// number and completely different problems. So the run must climb only while
-    /// damage is CONSECUTIVE, and the worst run must survive the recovery that
-    /// clears it (a once-per-second sample of `run` misses the bad moment almost
-    /// every time).
+    /// `run` climbs only while damage is consecutive; `worst_run` survives the
+    /// recovery that clears `run`. A total alone cannot tell a lossy recovering
+    /// link from a stream that stayed down.
     #[test]
     fn the_concealed_run_separates_a_lossy_link_from_a_stream_that_never_came_back() {
         let mut h = DecodeHealth::default();
-        // A lossy link: single damaged AUs with clean stretches between.
+        // Single damaged AUs with clean stretches between.
         for _ in 0..3 {
             h.note(true, false, 0);
             h.note(false, false, 0);
@@ -2192,27 +1676,17 @@ mod tests {
         assert_eq!(h.run, 0, "the last AU was clean");
         assert_eq!(h.worst_run, 1, "…and no two damaged AUs were adjacent");
 
-        // A stream that stopped recovering.
         let mut h = DecodeHealth::default();
         for _ in 0..7 {
             h.note(true, false, 0);
         }
         assert_eq!((h.damaged, h.run, h.worst_run), (7, 7, 7));
-        // One clean AU ends the run but never the record.
         h.note(false, false, 0);
         assert_eq!((h.damaged, h.run, h.worst_run), (7, 0, 7));
     }
 
-    /// A REFUSED AU — the decoder answering `Err` rather than concealing — has to
-    /// reach the ledger, and has to be told apart from concealment.
-    ///
-    /// This is the shape the M4 review found reporting a clean bill of health: a
-    /// host renegotiating outside the decode envelope makes every `plan_au` fail,
-    /// the picture freezes, and before this counter existed the stats surface read
-    /// `damaged 0 · failed 0 · run 0` and printed no integrity line at all. The
-    /// two counts must stay separate because they say opposite things about the
-    /// RUNG: concealment means the decoder coped with a damaged stream, refusal
-    /// means it could not run.
+    /// A refused AU (`Err`, not concealment) must reach the ledger and stay
+    /// separate: concealment means the decoder coped; refusal means it could not run.
     #[test]
     fn a_rung_refusing_every_au_cannot_report_a_clean_bill_of_health() {
         let mut h = DecodeHealth {
@@ -2230,15 +1704,11 @@ mod tests {
             (5, 5),
             "a refused AU is as absent from the screen as a concealed one"
         );
-        // A single good AU ends the run; the totals stand.
         h.note(false, false, 0);
         assert_eq!((h.refused, h.run, h.worst_run), (5, 0, 5));
     }
 
-    /// The three verdicts count apart and share one run — because "the bitstream
-    /// arrived incomplete", "the decoder refused it" and "the hardware failed the
-    /// decode" have three different causes and three different fixes, while "did
-    /// the picture ever come back" has one answer.
+    /// Three counts, one run: causes differ; "did the picture come back" does not.
     #[test]
     fn concealment_refusal_and_driver_failure_are_three_separate_counts() {
         let mut h = DecodeHealth {
@@ -2252,39 +1722,25 @@ mod tests {
         assert_eq!((h.run, h.worst_run), (3, 3), "one unbroken run of three");
     }
 
-    /// A driver `Failed` verdict counts apart from concealment and extends the same
-    /// run. Apart, because "the bitstream arrived incomplete" and "the hardware
-    /// could not decode what arrived" have different causes and different fixes,
-    /// and collapsing them is how "the stream is fine, it's your GPU" arguments
-    /// start. Same run, because a frame the driver failed is as absent from the
-    /// screen as a concealed one — and "did the picture ever come back" is what the
-    /// run answers.
+    /// Driver `Failed` counts apart from concealment and extends the same run.
+    /// Collapsing them is how "the stream is fine, it's your GPU" starts.
     #[test]
     fn driver_failures_count_separately_but_share_the_run() {
         let mut h = DecodeHealth {
             status_queries: true,
             ..DecodeHealth::default()
         };
-        h.note(false, false, 2); // two prior frames reported corrupt at once
+        h.note(false, false, 2);
         assert_eq!((h.damaged, h.failed, h.run), (0, 2, 1));
-        h.note(true, false, 1); // and an AU that ALSO needed concealment
+        h.note(true, false, 1);
         assert_eq!((h.damaged, h.failed, h.run), (1, 3, 2));
         h.note(false, false, 0);
         assert_eq!((h.run, h.worst_run), (0, 2));
     }
 
-    /// `status_queries` is set once from the device and never touched by the
-    /// per-AU fold — a counter update must not be able to turn "this driver cannot
-    /// report corruption" into "it reported none".
-    ///
-    /// And, the invariant the doc contracts on both sides of this boundary state:
-    /// where the device answers no status queries, `failed` can only ever read 0.
-    /// It is not a hypothetical. `read_status` returns `Failed` on such a device
-    /// for a lost device, a retired session generation or an unreadable semaphore,
-    /// and counting those would render `integrity: driver-failed 1 · no driver
-    /// status` — one line contradicting itself, pointing a support engineer at a
-    /// verdict the hardware cannot give. So this feeds `note` a real failure and
-    /// pins the zero; a test that only ever passed `0` would assert nothing.
+    /// `status_queries` is set once from the device; a fold must not turn "cannot
+    /// report" into "reported none". With queries off, `failed` stays 0 even when
+    /// `note` is fed a real failure — otherwise `driver-failed 1 · no driver status`.
     #[test]
     fn the_status_query_capability_survives_every_fold() {
         let mut h = DecodeHealth {
@@ -2307,7 +1763,6 @@ mod tests {
         );
         assert_eq!(h.worst_run, 1);
 
-        // The same fold on a device that CAN answer does count it.
         let mut h = DecodeHealth {
             status_queries: true,
             ..DecodeHealth::default()
@@ -2318,7 +1773,7 @@ mod tests {
 
     #[test]
     fn the_queue_lock_is_shared_only_when_the_families_collide() {
-        // Same family ⇒ same VkQueue (both sides use index 0) ⇒ shared lock.
+        // Same family ⇒ same VkQueue (both use index 0) ⇒ shared lock.
         assert!(submit_queues_collide(0, 0));
         assert!(submit_queues_collide(2, 2));
         // A separate decode family has exactly one submitter — no lock.

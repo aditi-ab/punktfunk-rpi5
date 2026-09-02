@@ -1,31 +1,27 @@
-//! The v1 check catalog: verdicts from the owning crates → [`HostCheck`]s.
+//! Check catalog: owning-crate verdicts mapped to [`HostCheck`]s.
 //!
-//! Everything user-visible lives here — the English fallback strings, the impact sentences, and the
-//! remedies. The probes themselves stay in `pf-vdisplay` / `pf-inject` / [`crate::detect`] and know
-//! nothing about this module; that direction is deliberate, because a reverse dependency would drag
-//! the host's wire types into two crates that must keep building for Windows and macOS.
+//! English fallback, impact, and remedy strings live here. Probes stay in `pf-vdisplay` /
+//! `pf-inject` / [`crate::detect`] so those crates never depend on host wire types.
 //!
-//! Two things here are easy to get subtly wrong and are therefore spelled out in the code:
+//! Two traps the mapping must not collapse:
 //!
-//! * **User-database membership and this process's groups are different questions.** `usermod -aG`
-//!   satisfies the first immediately and the second not until the next login, so "not in the group"
-//!   and "in the group but you haven't logged back in" need different remedies. Collapsing them
-//!   produces the single most maddening support state there is: *"I already added myself!"*
-//! * **`usermod` does not stick on an atomic OS.** On the Universal Blue images the remedy is
-//!   `ujust add-user-to-input-group`; everywhere else it is `usermod -aG input`.
+//! * User-database membership (`id -nG <user>`) and this process's groups (`id -nG`) are
+//!   different questions. `usermod -aG` updates the first immediately and the second only
+//!   after the next login, so they need different remedies.
+//! * `usermod` does not persist on an atomic OS. Universal Blue images want
+//!   `ujust add-user-to-input-group`; everywhere else, `usermod -aG input`.
 
 use super::{ids, CheckStatus, Diagnostics, HostCheck, Remedy, Severity};
 use crate::inject::{UinputVerdict, VhciVerdict};
 use crate::vdisplay::{TakeoverInapplicable, TakeoverVerdict};
 use std::process::Command;
 
-/// The group the packaged privilege helper authorizes on, and that owns the vhci attach nodes.
+/// Privilege-helper allowlist and vhci attach-node owner — one group, two gates.
 const PUNKTFUNK_GROUP: &str = "punktfunk";
-/// The group the uinput/uhid udev rules grant access to.
+/// udev grants uinput/uhid here; not the same group as the vhci nodes.
 const INPUT_GROUP: &str = "input";
 
-/// Register the v1 catalog on a registry. Separate from the global so tests can drive an isolated
-/// instance.
+/// Tests pass an isolated registry; the process-wide one is [`super::registry`].
 pub(crate) fn register_all(reg: &Diagnostics) {
     reg.register(takeover_privilege);
     reg.register(virtual_deck_vhci);
@@ -35,24 +31,15 @@ pub(crate) fn register_all(reg: &Diagnostics) {
     reg.register(omarchy_updates);
 }
 
-// ---------------------------------------------------------------------------------------------
-// hyprland_permissions
-// ---------------------------------------------------------------------------------------------
-
-/// Hyprland 0.49+ has `ecosystem.enforce_permissions`. It is off by default, but when it is on and
-/// the host has not been granted, screencopy and virtual input are **denied silently** — black
-/// frames and dropped input, with no error anywhere. That is the entire reason this check exists:
-/// every other failure on this path reports itself, and this one reports nothing at all.
-///
-/// Not Omarchy-specific — it applies to every Hyprland box — but Omarchy is exactly the kind of
-/// distro that might turn it on in a future release, which is what made it worth a row.
+/// Hyprland 0.49+ `ecosystem.enforce_permissions`. Off by default; when on and ungranted,
+/// screencopy and virtual input fail with no error from host or compositor.
 fn hyprland_permissions() -> HostCheck {
     let id = ids::HYPRLAND_PERMISSIONS;
     if !cfg!(target_os = "linux") {
         return HostCheck::inapplicable(id, "Hyprland's permission system is a Linux feature.");
     }
-    // `hyprctl` reachable at all is the "is this a Hyprland session?" test — the same one the
-    // backend uses. An absent binary or a compositor that is not Hyprland is not a problem here.
+    // Same Hyprland-session probe as the backend. Missing binary or a different compositor is
+    // inapplicable, not a failure.
     let Some(out) = command_output(
         "hyprctl",
         &["-j", "getoption", "ecosystem:enforce_permissions"],
@@ -76,9 +63,8 @@ fn hyprland_permissions() -> HostCheck {
     HostCheck::problem(
         id,
         CheckStatus::Warn,
-        // Warning, not Critical: enforcement being ON does not mean we are DENIED — a box where
-        // the host is already granted streams perfectly, and this probe cannot tell the two apart
-        // from outside the compositor. Claiming Critical here would cry wolf on a healthy box.
+        // Warn, not Critical: this probe sees enforcement, not grant. A granted host streams
+        // fine; from outside the compositor the two are indistinguishable.
         Severity::Warning,
         "Hyprland is enforcing permissions and this host may not be granted".to_string(),
         "Hyprland denies screencopy and virtual input SILENTLY — the client sees black frames and \
@@ -100,14 +86,8 @@ fn hyprland_permissions() -> HostCheck {
     })
 }
 
-// ---------------------------------------------------------------------------------------------
-// omarchy_updates
-// ---------------------------------------------------------------------------------------------
-
-/// On Omarchy, updates go through `omarchy update` and the console's apply button is deliberately
-/// absent (design D5). Without a row saying so, "the update button is missing on my box" is an
-/// unanswerable support question — the check exists to answer it in the place the operator is
-/// already looking.
+/// Omarchy has no console apply button; updates are `omarchy update`. This row exists so the
+/// diagnostics page says so instead of looking like the button is missing.
 fn omarchy_updates() -> HostCheck {
     let id = ids::OMARCHY_UPDATES;
     if !crate::osinfo::is_omarchy() {
@@ -125,9 +105,8 @@ fn omarchy_updates() -> HostCheck {
         .with_param("version", version)
 }
 
-/// Run a command and return its trimmed stdout, or `None` if it is absent or failed. Shared by the
-/// two checks above; deliberately not a general helper — the catalog's other probes ask the owning
-/// crate rather than shelling out, and these two have no owning crate to ask.
+/// Hyprland and Omarchy have no owning-crate probe, so these two rows shell out. Other catalog
+/// checks must not grow a third.
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(program).args(args).output().ok()?;
     if !out.status.success() {
@@ -136,10 +115,6 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!s.is_empty()).then_some(s)
 }
-
-// ---------------------------------------------------------------------------------------------
-// takeover_privilege
-// ---------------------------------------------------------------------------------------------
 
 fn takeover_privilege() -> HostCheck {
     let id = ids::TAKEOVER_PRIVILEGE;
@@ -175,9 +150,8 @@ fn takeover_privilege() -> HostCheck {
                  emulated USB devices — join it only on a machine you trust."
             ),
             command: Some(format!("sudo usermod -aG {group} {user}")),
-            // The display-manager helper reads the user database, so it is satisfied at once — but
-            // the pad half is a check against this process, which keeps the group set it started
-            // with. One re-login covers both, so ask for it.
+            // Helper reads the user database and is satisfied at once; this process keeps the
+            // group set it started with. One re-login covers both.
             relogin_required: true,
         })
         .with_param("user", user)
@@ -211,10 +185,6 @@ fn takeover_inapplicable_reason(why: TakeoverInapplicable) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// virtual_deck_vhci
-// ---------------------------------------------------------------------------------------------
-
 fn virtual_deck_vhci() -> HostCheck {
     let id = ids::VIRTUAL_DECK_VHCI;
     let group = PUNKTFUNK_GROUP;
@@ -236,8 +206,8 @@ fn virtual_deck_vhci() -> HostCheck {
             command: Some("sudo modprobe vhci-hcd".to_string()),
             relogin_required: false,
         }),
-        // The node is there and we cannot write it. WHICH of the three causes decides the remedy,
-        // and only the user database can tell them apart — see this module's docs.
+        // Node exists, not writable. The three causes need different remedies; only userdb vs
+        // process groups can tell them apart.
         VhciVerdict::NotWritable { path } => not_writable_check(id, group, path),
     }
 }
@@ -256,9 +226,8 @@ fn not_writable_check(id: &str, group: &str, path: String) -> HostCheck {
                       it — in Game Mode that means nothing can be navigated with a pad.";
 
     match (in_userdb, in_process) {
-        // In the group on disk, but this process does not carry it: the classic "I already added
-        // myself!" state. A `systemd --user` manager keeps the group set it started with, so only
-        // a re-login helps — and nothing in the logs says so today.
+        // Granted in the user database, not in this process. `systemd --user` keeps the group
+        // set it started with; only a re-login updates it.
         (Some(true), Some(false)) => base(
             &format!("The group “{group}” was granted but this session predates it"),
             pad_impact,
@@ -272,7 +241,6 @@ fn not_writable_check(id: &str, group: &str, path: String) -> HostCheck {
         })
         .with_param("user", user.unwrap_or_default()),
 
-        // Not a member at all.
         (Some(false), _) => {
             let user = user.unwrap_or_default();
             base(
@@ -291,9 +259,8 @@ fn not_writable_check(id: &str, group: &str, path: String) -> HostCheck {
             .with_param("user", user)
         }
 
-        // A member in the database AND in this process, yet the node is still not writable: the
-        // udev rule that chgrp's it was never installed (or has not run for this device). Blaming
-        // the group here would send someone to re-run a `usermod` that is already correct.
+        // Member in userdb and in this process: the udev rule never chgrp'd the node. Do not
+        // send the operator back through `usermod`.
         (Some(true), Some(true)) => base(
             "The vhci attach node is not owned by the expected group",
             pad_impact,
@@ -308,8 +275,8 @@ fn not_writable_check(id: &str, group: &str, path: String) -> HostCheck {
             relogin_required: false,
         }),
 
-        // We could not ask the user database. Report the fact without guessing at a cause: a wrong
-        // remedy here costs more than a vague one.
+        // User database unreachable. Do not guess a cause; a wrong remedy costs more than a
+        // vague one.
         _ => base(
             "The virtual Steam Deck controller's attach node is not writable",
             pad_impact,
@@ -325,10 +292,6 @@ fn not_writable_check(id: &str, group: &str, path: String) -> HostCheck {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// uinput_access
-// ---------------------------------------------------------------------------------------------
-
 fn uinput_access() -> HostCheck {
     let id = ids::UINPUT_ACCESS;
     match crate::inject::uinput_probe() {
@@ -339,8 +302,7 @@ fn uinput_access() -> HostCheck {
         ),
         UinputVerdict::Ok => HostCheck::ok(id, "The input device nodes are reachable."),
 
-        // The node exists and we may not open it: a group problem, and the remedy depends on
-        // whether this OS lets `usermod` stick.
+        // Node exists, open denied. Remedy depends on whether this OS persists `usermod`.
         UinputVerdict::PermissionDenied { path } => HostCheck::problem(
             id,
             CheckStatus::Fail,
@@ -354,7 +316,7 @@ fn uinput_access() -> HostCheck {
         .with_param("path", path)
         .with_param("group", INPUT_GROUP),
 
-        // The node is absent: nothing to have permission on. A group remedy here is a wrong turn.
+        // Node missing: a group-membership remedy is the wrong turn.
         UinputVerdict::Missing { path } => HostCheck::problem(
             id,
             CheckStatus::Fail,
@@ -391,11 +353,8 @@ fn uinput_access() -> HostCheck {
     }
 }
 
-/// The `input`-group remedy, branched on OS flavour.
-///
-/// On the Universal Blue images `usermod -aG input` appears to work and is silently reverted,
-/// because `/etc/group` is not writable state on an atomic OS — `packaging/README.md` has said so
-/// since the Bazzite port, and telling someone to run it there is worse than saying nothing.
+/// On Universal Blue, `usermod -aG input` looks successful and is reverted: `/etc/group` is not
+/// writable state. `packaging/README.md`.
 fn input_group_remedy() -> Remedy {
     let user = current_user().unwrap_or_else(|| "$USER".to_string());
     if is_universal_blue() {
@@ -419,11 +378,8 @@ fn input_group_remedy() -> Remedy {
     }
 }
 
-/// The Universal Blue images, which are the ones that ship `ujust`.
-///
-/// Matched on the chain's **leaf** (`ID`), never on the `fedora` family token: plain Fedora
-/// Workstation is a mutable OS and does want `usermod`. `osinfo`'s chain is `linux/fedora/bazzite`
-/// for Bazzite, so the leaf is the distro's own id.
+/// Match the chain's leaf (`ID`), never the `fedora` family. Workstation is mutable and wants
+/// `usermod`. Bazzite is `linux/fedora/bazzite`.
 fn is_universal_blue() -> bool {
     matches!(
         crate::osinfo::detect().chain.rsplit('/').next(),
@@ -431,15 +387,10 @@ fn is_universal_blue() -> bool {
     )
 }
 
-// ---------------------------------------------------------------------------------------------
-// server_conflict
-// ---------------------------------------------------------------------------------------------
-
 fn server_conflict() -> HostCheck {
     let id = ids::SERVER_CONFLICT;
-    // The cached startup scan — the same source the tray's summary and the Host page's card read.
-    // Empty also means "never scanned" on a build that skipped the GameStream planes, which reads
-    // as healthy here exactly as it already does on `LocalSummary.conflicts`.
+    // Same cached scan as the tray and Host card. Empty also means "never scanned" (no
+    // GameStream planes); treat that as healthy, matching `LocalSummary.conflicts`.
     let labels = crate::detect::summary_labels(crate::detect::snapshot());
     if labels.is_empty() {
         return HostCheck::ok(
@@ -467,26 +418,20 @@ fn server_conflict() -> HostCheck {
     .with_param("servers", servers)
 }
 
-// ---------------------------------------------------------------------------------------------
-// Group membership: two different questions
-// ---------------------------------------------------------------------------------------------
-
 /// This process's login name, resolved the way `pkexec` will (`id -un`).
 fn current_user() -> Option<String> {
     capture(Command::new("id").arg("-un"))
 }
 
-/// Is `user` in `group` **according to the user database** (`id -nG <user>`)? This is what a root
-/// helper sees, and what `usermod -aG` changes immediately. `None` when the question could not be
-/// asked — NSS can block or fail, and a false accusation sends people down the wrong path.
+/// User-database membership (`id -nG <user>`): what a root helper sees and what `usermod -aG`
+/// updates immediately. `None` if NSS fails — a false miss sends the operator down the wrong path.
 fn user_in_group_userdb(user: &str, group: &str) -> Option<bool> {
     let groups = capture(Command::new("id").args(["-nG", user]))?;
     Some(groups.split_whitespace().any(|g| g == group))
 }
 
-/// Is `group` among **this process's** supplementary groups (`id -nG`, no operand)? Fixed when the
-/// `systemd --user` manager started, so a fresh `usermod` does not show up here until the next
-/// login — which is exactly the distinction that makes the "log out and back in" remedy necessary.
+/// This process's supplementary groups (`id -nG`, no operand). Frozen at `systemd --user`
+/// start; a fresh `usermod` is invisible until the next login.
 fn process_in_group(group: &str) -> Option<bool> {
     let groups = capture(Command::new("id").arg("-nG"))?;
     Some(groups.split_whitespace().any(|g| g == group))
@@ -505,15 +450,12 @@ fn capture(cmd: &mut Command) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Every mapping arm, including the ones this machine cannot reach: the table is the point.
-    /// The three `NotWritable` shapes are what the design calls out as the easiest thing to get
-    /// wrong, so each is asserted to produce a *different* remedy.
+    /// This machine may not reach every arm; a `NotWritable` row is still Fail+Warning and
+    /// always carries a remedy.
     #[test]
     fn vhci_not_writable_shapes_produce_distinct_remedies() {
         let path = "/sys/devices/platform/vhci_hcd.0/attach".to_string();
         let check = not_writable_check(ids::VIRTUAL_DECK_VHCI, PUNKTFUNK_GROUP, path.clone());
-        // Whatever this machine answers, the shape contract holds: a failing check always carries a
-        // remedy, and the pad's impact is always stated.
         assert_eq!(check.status, CheckStatus::Fail);
         assert_eq!(check.severity, Severity::Warning);
         assert!(check.remedy.is_some());
@@ -541,8 +483,7 @@ mod tests {
         }
     }
 
-    /// The atomic-OS branch is the one that is silently wrong if it regresses: `usermod` looks like
-    /// it worked on Bazzite and is gone after a reboot.
+    /// Atomic-OS branch: `usermod` looks successful on Bazzite and is gone after reboot.
     #[test]
     fn input_remedy_matches_this_box_flavour() {
         let remedy = input_group_remedy();
@@ -560,8 +501,8 @@ mod tests {
         }
     }
 
-    /// `bazzite` is the chain's LEAF, and `fedora` is its family — matching the family would send
-    /// plain Fedora Workstation users to a `ujust` they do not have.
+    /// Match the leaf. Matching the `fedora` family would send Workstation users to a `ujust`
+    /// they do not have.
     #[test]
     fn universal_blue_is_matched_on_the_leaf_not_the_family() {
         fn leaf_is_ublue(chain: &str) -> bool {
@@ -579,8 +520,7 @@ mod tests {
 
     #[test]
     fn server_conflict_is_ok_when_nothing_was_detected() {
-        // `detect::snapshot()` is empty in a test binary (no startup scan ran), which is the same
-        // state a clean box reports.
+        // Test binaries never ran a startup scan; empty matches a clean box.
         let check = server_conflict();
         assert_eq!(check.status, CheckStatus::Ok);
         assert!(check.remedy.is_none());

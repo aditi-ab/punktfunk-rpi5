@@ -1,19 +1,16 @@
 //! SDL scancodes / mouse buttons → the punktfunk input wire contract.
 //!
-//! Same VK codes as `pf_client_core::keymap` (the wire carries Windows Virtual-Keys, the
-//! GameStream convention), keyed on SDL scancodes instead of evdev codes: SDL normalizes
-//! the platform keycode to its USB-HID-derived scancode table, so this stays
-//! layout-independent exactly like the evdev table. Coverage mirrors `keymap::evdev_to_vk`
-//! one-to-one — a key the wire contract doesn't cover (media keys etc.) returns `None`
-//! and is dropped rather than guessed.
+//! Same Windows VK codes as `pf_client_core::keymap` (GameStream wire). Keyed on
+//! SDL scancodes, not evdev: SDL maps the platform keycode onto its USB-HID
+//! scancode table, so this stays layout-independent like the evdev table.
+//! Coverage mirrors `keymap::evdev_to_vk` one-to-one. A key the wire does not
+//! cover (media keys, etc.) returns `None` and is dropped; never guessed.
 
 use sdl3::keyboard::Scancode;
 
-/// Map an SDL scancode to the Windows VK code the host expects.
 pub fn scancode_to_vk(sc: Scancode) -> Option<u8> {
     use Scancode as S;
     Some(match sc {
-        // --- Navigation / editing / whitespace ---
         S::Backspace => 0x08,
         S::Tab => 0x09,
         S::Return => 0x0D,
@@ -33,7 +30,6 @@ pub fn scancode_to_vk(sc: Scancode) -> Option<u8> {
         S::Insert => 0x2D,
         S::Delete => 0x2E,
 
-        // --- Digit row ---
         S::_0 => 0x30,
         S::_1 => 0x31,
         S::_2 => 0x32,
@@ -45,7 +41,6 @@ pub fn scancode_to_vk(sc: Scancode) -> Option<u8> {
         S::_8 => 0x38,
         S::_9 => 0x39,
 
-        // --- Letters ---
         S::A => 0x41,
         S::B => 0x42,
         S::C => 0x43,
@@ -73,12 +68,10 @@ pub fn scancode_to_vk(sc: Scancode) -> Option<u8> {
         S::Y => 0x59,
         S::Z => 0x5A,
 
-        // --- Meta / context-menu ---
         S::LGui => 0x5B,
         S::RGui => 0x5C,
         S::Application => 0x5D,
 
-        // --- Numpad ---
         S::Kp0 => 0x60,
         S::Kp1 => 0x61,
         S::Kp2 => 0x62,
@@ -91,13 +84,12 @@ pub fn scancode_to_vk(sc: Scancode) -> Option<u8> {
         S::Kp9 => 0x69,
         S::KpMultiply => 0x6A,
         S::KpPlus => 0x6B,
-        // KP-Enter → VK_SEPARATOR mirrors the evdev table (KEY_KPENTER → 0x6C).
+        // KP-Enter → 0x6C (VK_SEPARATOR), matching KEY_KPENTER — not VK_RETURN.
         S::KpEnter => 0x6C,
         S::KpMinus => 0x6D,
         S::KpPeriod => 0x6E,
         S::KpDivide => 0x6F,
 
-        // --- Function keys ---
         S::F1 => 0x70,
         S::F2 => 0x71,
         S::F3 => 0x72,
@@ -111,11 +103,9 @@ pub fn scancode_to_vk(sc: Scancode) -> Option<u8> {
         S::F11 => 0x7A,
         S::F12 => 0x7B,
 
-        // --- Locks ---
         S::NumLockClear => 0x90,
         S::ScrollLock => 0x91,
 
-        // --- Left/right modifiers ---
         S::LShift => 0xA0,
         S::RShift => 0xA1,
         S::LCtrl => 0xA2,
@@ -123,7 +113,7 @@ pub fn scancode_to_vk(sc: Scancode) -> Option<u8> {
         S::LAlt => 0xA4,
         S::RAlt => 0xA5,
 
-        // --- OEM punctuation (US-layout positions) ---
+        // OEM VKs are US-layout positions, not glyphs.
         S::Semicolon => 0xBA,
         S::Equals => 0xBB,
         S::Comma => 0xBC,
@@ -141,8 +131,7 @@ pub fn scancode_to_vk(sc: Scancode) -> Option<u8> {
     })
 }
 
-/// SDL mouse button → the GameStream button id the wire expects (1=left, 2=middle,
-/// 3=right, 4=X1, 5=X2) — the SDL twin of `keymap::gdk_button_to_gs`.
+/// SDL twin of `keymap::gdk_button_to_gs` — same GameStream button ids.
 pub fn mouse_button_to_gs(b: sdl3::mouse::MouseButton) -> Option<u32> {
     use sdl3::mouse::MouseButton as B;
     Some(match b {
@@ -155,15 +144,13 @@ pub fn mouse_button_to_gs(b: sdl3::mouse::MouseButton) -> Option<u32> {
     })
 }
 
-// Linux-only: the reference table it cross-checks (pf_client_core::keymap, evdev-keyed)
-// only exists there. The SDL table under test is itself cross-platform.
+// The evdev table only exists on Linux; the SDL table under test is cross-platform.
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use pf_client_core::keymap::evdev_to_vk;
 
-    /// Both tables feed the same wire: for every key the evdev table knows, the SDL
-    /// scancode of the same physical key must map to the same VK.
+    /// Same physical key → same VK as `evdev_to_vk`.
     #[test]
     fn agrees_with_the_evdev_table() {
         use Scancode as S;

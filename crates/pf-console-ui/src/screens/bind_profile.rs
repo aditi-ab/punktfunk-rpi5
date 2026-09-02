@@ -1,10 +1,9 @@
-//! "Default for “Desk”" — choose the profile a plain A-press on a saved host connects
-//! with (`KnownHost::profile_id`), reached from the host tile's menu. One row per catalog
-//! profile behind a leading "No default" row; choosing rides
-//! [`ConsoleCmd::BindProfile`] to the binary, which persists the binding and refreshes
-//! the rows — the checkmark follows the model, so what the list says is always what the
-//! store holds (and what the tile's chip shows). Pinning is the sibling decision
-//! (`pin_hosts.rs`): a pin adds a CARD, this changes what the primary tile itself does.
+//! Bind the profile a plain A-press on a saved host connects with
+//! (`KnownHost::profile_id`). Reached from the host tile's Options menu.
+//!
+//! Choosing emits [`ConsoleCmd::BindProfile`]; the checkmark is read back from
+//! the host row, never stored here. Pinning is the sibling (`pin_hosts.rs`):
+//! a pin adds a card, this changes what the primary tile itself does.
 
 use crate::glyphs::{Hint, HintKey};
 use crate::model::ConsoleCmd;
@@ -16,13 +15,11 @@ use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
 
 pub(crate) struct BindProfileScreen {
-    /// The HOST row's primary key (fingerprint or `addr:port`, never a pinned card's
-    /// composite) — what every [`ConsoleCmd::BindProfile`] here addresses.
+    /// Host primary key (fingerprint or `addr:port`), never a pinned-card composite.
     host_key: String,
     host_name: String,
-    /// The catalog's `(id, name)` pairs, loaded once at construction — same stability
-    /// assumption the settings screen's Profiles tab makes (the console can't create
-    /// profiles, so the list can't change under this screen).
+    /// Catalog snapshot at construction. The console cannot create profiles, so
+    /// this list cannot change while the screen is open.
     profiles: Vec<(String, String)>,
     list: MenuList,
 }
@@ -45,8 +42,6 @@ impl BindProfileScreen {
         &self.host_name
     }
 
-    /// The host's current binding, read from the model — the primary row's chip IS the
-    /// state, so the checkmark can never disagree with what the carousel shows.
     fn bound(&self, ctx: &Ctx) -> Option<String> {
         ctx.hosts
             .iter()
@@ -55,7 +50,6 @@ impl BindProfileScreen {
             .map(|p| p.id.clone())
     }
 
-    /// Row `i`'s meaning: 0 is "No default", the rest the catalog in order.
     fn choice(&self, i: usize) -> Option<Option<&str>> {
         if i == 0 {
             Some(None)
@@ -91,9 +85,7 @@ impl BindProfileScreen {
         true
     }
 
-    /// One list message against the focused row — shared by both input paths. A choice is
-    /// a radio press, not a toggle: A on the row that is already the binding is a boundary
-    /// thud, and ◀/▶ adjust nothing here.
+    /// Radio, not toggle: re-selecting the bound row is a boundary; ◀/▶ do nothing.
     fn choose(
         &mut self,
         msg: ListMsg,
@@ -154,7 +146,7 @@ impl BindProfileScreen {
             );
             return;
         }
-        // The explainer band under the list, like the settings screen's detail text.
+        // 34 px band under the list for the explainer, matching settings detail text.
         let detail_h = 34.0 * k;
         let list_rect = Rect::from_ltrb(
             rect.left,
@@ -261,7 +253,6 @@ mod tests {
             t: 0.0,
         };
         let mut s = screen();
-        // Row 2 = the second profile: binds it.
         let mut fx = Outbox::default();
         s.menu(MenuEvent::Move(MenuDir::Down), &mut ctx, &mut fx);
         s.menu(MenuEvent::Move(MenuDir::Down), &mut ctx, &mut fx);
@@ -275,7 +266,6 @@ mod tests {
         );
         assert!(matches!(pulse, Some(MenuPulse::Confirm)));
 
-        // Row 0 clears the binding.
         let mut fx = Outbox::default();
         s.menu(MenuEvent::Move(MenuDir::Up), &mut ctx, &mut fx);
         s.menu(MenuEvent::Move(MenuDir::Up), &mut ctx, &mut fx);
@@ -308,14 +298,12 @@ mod tests {
             t: 0.0,
         };
         let mut s = screen();
-        // Row 1 = "Work", already bound.
         let mut fx = Outbox::default();
         s.menu(MenuEvent::Move(MenuDir::Down), &mut ctx, &mut fx);
         let pulse = s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
         assert!(fx.cmds.is_empty());
         assert!(matches!(pulse, Some(MenuPulse::Boundary)));
 
-        // An unbound host: "No default" is already the state.
         let hosts = [host(None)];
         let mut settings = Settings::default();
         let mut ctx = Ctx {

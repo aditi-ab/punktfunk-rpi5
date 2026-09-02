@@ -1,24 +1,14 @@
-//! "Connected controllers" — everything the client can see about the attached pads, and the
-//! handful of actions only the platform can perform on them. Reached from the settings
-//! list's Controller tab.
+//! "Connected controllers": attached pads, their identity lines, and the grants
+//! and tests only the platform can perform. Reached from the settings Controller
+//! tab (Android; desktop has no USB capture and no grants).
 //!
-//! This exists for exactly one support case: a pad "doesn't work". Adapters and BT-to-USB
-//! dongles often enumerate with a different identity than the physical pad, or not as a
-//! gamepad at all, and only devices the OS classifies as a gamepad are forwarded — so the
-//! screen's real content is the identity line under each name, not the name.
+//! Only devices the OS classifies as a gamepad are forwarded. Adapters often
+//! enumerate as something else, so the identity line under each name is the
+//! support answer, not the name.
 //!
-//! It was a Compose screen the Android host drew OVER the console (the D7 platform-screen
-//! mechanism) until 2026-08. Drawing it here instead is what lets the console keep its own
-//! input on the page; what genuinely cannot move — the USB and Bluetooth grant dialogs, a
-//! rumble pulse on a real `InputDevice` — stays with the host and is asked for by
-//! [`ConsoleCmd::PadAction`].
-//
-// ponytail: the Compose screen's live input test (button grid + axis bars, entered with A,
-// left by holding B) did NOT move here — the console only receives the aggregated
-// `MenuSample` (6 buttons, lx/ly, dpad), nowhere near a per-device axis/trigger readout,
-// and the hold-to-exit gesture has no home in the edge-triggered MenuEvent grammar. The
-// touch Controllers screen keeps the full test, so the feature exists on-device; add it
-// here by widening the pad-sample bridge with a per-device payload while the test is open.
+//! Grant dialogs and a rumble pulse on a real `InputDevice` stay with the host
+//! via [`ConsoleCmd::PadAction`]. The console sees only aggregated `MenuSample`;
+//! a per-device axis test needs a wider pad-sample bridge.
 
 use crate::glyphs::{Hint, HintKey};
 use crate::model::ConsoleCmd;
@@ -30,30 +20,24 @@ use crate::widgets::{ListMsg, MenuList, RowSpec};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse, PadInfo};
 use skia_safe::{Canvas, Rect};
 
-/// Work on a controller that only the HOST can do — every one of these needs a permission
-/// dialog or a real device handle, neither of which exists on this side of the bridge.
-/// Ordered as they are listed.
+/// Host-only pad work: a permission dialog or a real device handle. Neither
+/// exists on this side of the bridge.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PadAction {
-    /// Pulse the focused pad's motor (the "is rumble even wired up" test).
+    /// Diagnostic: is the focused pad's motor wired.
     Rumble,
-    /// `BLUETOOTH_CONNECT`, without which a BLE-paired Steam Controller 2 is invisible —
-    /// not "detected and idle", absent, which is why the row is offered rather than hidden
-    /// behind a detection that cannot run.
+    /// Always shown: without `BLUETOOTH_CONNECT` a BLE SC2 is absent, not idle —
+    /// detection cannot run, so hiding the row behind it would hide the grant.
     Sc2Bluetooth,
-    /// USB access for a wired or Puck-dongle Steam Controller 2.
     Sc2Usb,
-    /// USB access for a wired Sony pad (DualSense, Edge, DualShock 4).
     DsUsb,
-    /// The DualSense pad-audio self test: can this phone drive the pad's audio endpoint at
-    /// all. Deliberately reachable with no stream running — it exists to rule the pad out
-    /// when a session misbehaves, and gating it behind a session would make it depend on
-    /// the very thing under suspicion.
+    /// Ungated by session: a stream that is not sending haptics must not hide
+    /// the pad-audio test that rules the pad out.
     DsHaptics,
 }
 
 impl PadAction {
-    /// The stable id the host matches on (crosses JNI inside [`ConsoleCmd::PadAction`]).
+    /// Stable id the host matches on (JNI inside [`ConsoleCmd::PadAction`]).
     pub(crate) fn id(self) -> &'static str {
         match self {
             PadAction::Rumble => "rumble",
@@ -65,9 +49,8 @@ impl PadAction {
     }
 }
 
-/// The passthrough rows, in list order. Platform-gated as one union exactly like the
-/// settings row table (`settings::row_on`): the desktop captures nothing over raw USB and
-/// asks for no grants, so it has no such rows — never a control that changes nothing.
+/// Grant/test rows, gated like `settings::row_on`. Desktop has no USB capture
+/// and no grants; a row here would change nothing.
 const PASSTHROUGH: [(PadAction, &str, &str); 4] = [
     (
         PadAction::Sc2Bluetooth,
@@ -79,15 +62,11 @@ const PASSTHROUGH: [(PadAction, &str, &str); 4] = [
     (PadAction::DsHaptics, "DualSense haptics self-test", "Test"),
 ];
 
-/// One line in the list. Pads first, then whatever the platform can be asked to do.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Row {
-    /// An index into [`Ctx::pads`].
     Pad(usize),
-    /// No pads at all — an inert row, so the list is never empty and the cursor always has
-    /// something to sit on while the passthrough rows below it stay reachable.
+    /// Inert placeholder so the list is never empty; grants below stay reachable.
     NoPads,
-    /// An index into [`PASSTHROUGH`].
     Passthrough(usize),
 }
 
@@ -139,8 +118,7 @@ impl ControllersScreen {
         true
     }
 
-    /// One list message against the focused row — shared by the pad path and the pointer's,
-    /// so a click and an A press can never drift apart.
+    /// Pad and pointer share this so a click and A cannot diverge.
     fn activate(
         &mut self,
         msg: ListMsg,
@@ -152,7 +130,7 @@ impl ControllersScreen {
         let Some(&focused) = rows.get(self.list.cursor) else {
             return pulse;
         };
-        // Nothing here steps: every row is a button or a statement.
+        // No row is adjustable; Adjust is always a thud.
         if matches!(msg, ListMsg::Adjust(_)) {
             return Some(MenuPulse::Boundary);
         }
@@ -162,15 +140,13 @@ impl ControllersScreen {
         let (action, pad_key) = match focused {
             Row::NoPads => return Some(MenuPulse::Boundary),
             Row::Pad(i) => {
-                // A pad with no motor has nothing to test; say so with the thud rather than
-                // sending a command the host would silently drop.
+                // No motor: thud. The host would drop a rumble command silently.
                 if !ctx.pads[i].rumble {
                     return Some(MenuPulse::Boundary);
                 }
                 (PadAction::Rumble, ctx.pads[i].key.clone())
             }
-            // The grants are about a device the pad list cannot name (an SC2 in lizard mode
-            // is no input device at all), so they carry no key.
+            // Empty key: the device is not an input device yet (SC2 keyboard/mouse mode).
             Row::Passthrough(i) => (PASSTHROUGH[i].0, String::new()),
         };
         fx.cmds.push(ConsoleCmd::PadAction {
@@ -207,9 +183,7 @@ impl ControllersScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
-        // The focused row's explainer takes a reserved band under the list — the settings
-        // screen's shape, and here it is the whole point: the identity of the device is the
-        // support answer, and it is far too long to live on the row.
+        // Identity line under the list — same 34 px band as settings; too long for the row.
         let detail_h = 34.0 * k;
         let rows = rows_for(ctx);
         let specs: Vec<RowSpec> = rows.iter().map(|r| spec(*r, ctx)).collect();
@@ -283,7 +257,6 @@ fn spec(row: Row, ctx: &Ctx) -> RowSpec {
     }
 }
 
-/// The band under the list: what this row is, in one sentence.
 fn detail(row: Row, ctx: &Ctx) -> String {
     match row {
         Row::NoPads => "Punktfunk only forwards devices the system classifies as a gamepad or \
@@ -312,14 +285,12 @@ fn detail(row: Row, ctx: &Ctx) -> String {
                  that cannot do haptics from a stream that is not sending them."
                     .into()
             }
-            // Not offered as a passthrough row — the pads carry it.
+            // Not a passthrough row; pads carry rumble.
             PadAction::Rumble => String::new(),
         },
     }
 }
 
-/// A pad's identity line: what the OS enumerated, whether it is forwarded, what the host
-/// will build for it, and its charge if it reports one.
 fn pad_detail(pad: &PadInfo) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !pad.detail.is_empty() {
@@ -412,7 +383,6 @@ mod tests {
 
     #[test]
     fn the_grant_rows_are_androids_alone_and_carry_no_pad_key() {
-        // Desktop: pads and nothing else — it asks for no grants and captures nothing raw.
         let pads = [pad("DualSense", true)];
         let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
@@ -444,7 +414,6 @@ mod tests {
             1 + PASSTHROUGH.len()
         );
 
-        // Down onto the first grant row, then A.
         let mut s = ControllersScreen::new();
         drive(
             &mut s,

@@ -1,56 +1,43 @@
-//! Session-scoped **default-sink claim** for the host-owned stream sink.
+//! Session-scoped default-sink claim for the host-owned stream sink.
 //!
-//! In stream-sink mode (see the module docs in [`super`]) the capture stream registers itself
-//! as an `Audio/Sink` node; for host apps to actually play into it, it must be the *default*
-//! sink for the duration of a stream session. WirePlumber elects the default from the
-//! `default.configured.audio.sink` metadata key (what `wpctl set-default` writes), and with
-//! `linking.follow-default-target` (default true) moves already-running app streams when it
-//! changes. So a claim is: save the current configured value, point it at our sink; a release
-//! restores it. Live-diagnosed motivation (bazzite host, 2026-07-14): the *hardware* default
-//! (HDMI audio on a TV) vanishes on every gamescope modeset, making WirePlumber ping-pong the
-//! default HDMI↔auto_null ~8×/s — a capture stream that follows the default relinks on every
-//! flip and the client hears crackle. A claimed stream sink is immune: nothing about it
-//! depends on display hardware.
+//! In stream-sink mode (see [`super`]) the capture stream is an `Audio/Sink`
+//! node and must be the session default so host apps play into it. A claim
+//! saves `default.configured.audio.sink` and points it at our sink; release
+//! restores. WirePlumber's `linking.follow-default-target` then moves running
+//! streams. A claimed sink does not depend on display hardware, so a modeset
+//! that drops HDMI cannot flip the default under capture.
 //!
-//! **Refcounted, latest-wins.** Concurrent sessions (GameStream + punktfunk/1) each hold a
-//! claim on their own capturer's sink; the newest claim points routing at *its* sink, and only
-//! the release of the last claim restores the pre-claim value — a session ending must never
-//! yank the default from under one still running. The ledger lock is held **across** the
-//! metadata round-trip so a racing claim/release pair can't interleave their writes (a stale
-//! restore overwriting a fresh claim would silence the surviving session).
+//! Refcounted, latest-wins: concurrent sessions each hold a claim; the newest
+//! routes to *its* sink, and only the last release restores. The ledger lock
+//! is held across the metadata round-trip so a stale restore cannot overwrite
+//! a fresh claim.
 //!
-//! **Crash self-healing.** If the host dies while claimed, the configured default is left
-//! pointing at a `punktfunk-speaker-*` node that no longer exists; WirePlumber then falls back
-//! to availability-based election (local audio keeps working) and the next claim overwrites
-//! the stale value. A stale punktfunk name is never saved as a restore target — restoring it
-//! would wedge routing on a ghost sink forever — the restore degrades to *deleting* the key,
-//! i.e. handing the choice back to WirePlumber's automatic election.
+//! Crash self-healing: a leftover `punktfunk-speaker-*` name is never saved as
+//! a restore target (that would wedge routing on a ghost). Restore then deletes
+//! the key and WirePlumber elects from availability.
 
 use anyhow::{anyhow, Context, Result};
 use std::sync::Mutex;
 
-/// `node.name` prefix for every host-owned stream sink (full names are uniqued per capturer:
-/// `punktfunk-speaker-<pid>-<seq>`, so overlapping capturers — mid-session reopen, concurrent
-/// sessions — never alias in `target`/metadata lookups). The staleness rule below matches on
-/// this prefix.
+/// `node.name` prefix for every host-owned stream sink. Full names uniqued
+/// per capturer (`punktfunk-speaker-<pid>-<seq>`) so overlapping capturers
+/// never alias. The staleness rule matches this prefix.
 pub(super) const SINK_NAME_PREFIX: &str = "punktfunk-speaker";
 
-/// The metadata key WirePlumber reads the user's preferred sink from (subject 0 on the
-/// `default` metadata object; value is `{"name":"<node.name>"}` typed `Spa:String:JSON`).
+/// WirePlumber preferred-sink key (subject 0 on `default` metadata;
+/// value is `{"name":"<node.name>"}` typed `Spa:String:JSON`).
 const CONFIGURED_SINK_KEY: &str = "default.configured.audio.sink";
 
-/// What the last release writes back.
 #[derive(Debug, PartialEq)]
 enum Restore {
-    /// Re-set the saved pre-claim value (the raw `{"name":"..."}` JSON).
+    /// Re-set the saved pre-claim JSON (`{"name":"..."}`).
     Value(String),
-    /// Remove the key: no pre-claim preference existed, or the saved one was a stale
-    /// punktfunk claim from a crashed host (see the module docs).
+    /// No pre-claim preference, or the saved one was a stale punktfunk claim.
     Delete,
 }
 
-/// Pure claim bookkeeping — separated from the PipeWire I/O so the refcount/restore rules are
-/// unit-testable on every platform.
+/// Claim bookkeeping, split from PipeWire I/O so the restore rules unit-test
+/// on every platform.
 struct Ledger {
     holders: u32,
     restore: Option<Restore>,
@@ -64,14 +51,13 @@ impl Ledger {
         }
     }
 
-    /// Count a new claim; `true` means this is the first holder and the caller must save the
-    /// pre-claim value via [`note_previous`](Self::note_previous).
+    /// Count a new claim. `true` = first holder; caller must [`note_previous`].
     fn on_claim(&mut self) -> bool {
         self.holders += 1;
         self.holders == 1
     }
 
-    /// Record what the first claim found, applying the staleness rule.
+    /// Apply the staleness rule to what the first claim found.
     fn note_previous(&mut self, prev: Option<String>) {
         self.restore = Some(match prev {
             Some(v) if !v.contains(SINK_NAME_PREFIX) => Restore::Value(v),
@@ -79,7 +65,7 @@ impl Ledger {
         });
     }
 
-    /// Count a release; the last holder gets the restore action to apply.
+    /// Count a release. Last holder returns the restore action.
     fn on_release(&mut self) -> Option<Restore> {
         self.holders = self.holders.saturating_sub(1);
         if self.holders == 0 {
@@ -92,9 +78,9 @@ impl Ledger {
 
 static LEDGER: Mutex<Ledger> = Mutex::new(Ledger::new());
 
-/// Point the configured default sink at `sink_name` (refcounted; see the module docs). Never
-/// fails the caller: a box where the metadata write doesn't work (WirePlumber absent) still
-/// gets a working capture — apps just aren't rerouted, which is exactly the legacy behaviour.
+/// Point the configured default at `sink_name` (refcounted; see module docs).
+/// Never fails the caller: missing WirePlumber still captures; apps just
+/// are not rerouted (legacy behaviour).
 pub(super) fn claim(sink_name: &str) {
     let mut ledger = LEDGER.lock().unwrap();
     let first = ledger.on_claim();
@@ -111,8 +97,8 @@ pub(super) fn claim(sink_name: &str) {
         }
         Err(e) => {
             if first {
-                // Nothing knowable to restore — the release will hand election back to
-                // WirePlumber (Delete), which is also correct if IT starts working by then.
+                // Nothing to restore — release hands election back to WirePlumber
+                // (`Delete`), which is also correct if it starts working by then.
                 ledger.note_previous(None);
             }
             tracing::warn!(error = %format!("{e:#}"),
@@ -121,7 +107,7 @@ pub(super) fn claim(sink_name: &str) {
     }
 }
 
-/// Release one claim; the last release restores the pre-claim configured default.
+/// Release one claim; the last restore writes the pre-claim default back.
 pub(super) fn release() {
     let mut ledger = LEDGER.lock().unwrap();
     let Some(restore) = ledger.on_release() else {
@@ -141,10 +127,9 @@ pub(super) fn release() {
     }
 }
 
-/// One-shot metadata round-trip: connect, find the `default` metadata object, read the current
-/// [`CONFIGURED_SINK_KEY`] value, then set it to `value` (`None` deletes the key). Returns the
-/// **previous** value. Runs its own short-lived main loop on the calling thread — claims come
-/// from session threads at start/end, never from a PipeWire callback.
+/// Connect, find `default` metadata, read [`CONFIGURED_SINK_KEY`], set `value`
+/// (`None` deletes). Returns the previous value. Own short-lived main loop on
+/// the calling thread — claims come from session start/end, never a PW callback.
 fn set_configured_sink(value: Option<&str>) -> Result<Option<String>> {
     use pipewire as pw;
     use std::cell::RefCell;
@@ -158,8 +143,8 @@ fn set_configured_sink(value: Option<&str>) -> Result<Option<String>> {
         .context("claim connect (is PipeWire running in this session?)")?;
     let registry = core.get_registry_rc().context("claim registry")?;
 
-    /// Round-trip phases: 0 = globals replaying, 1 = metadata properties replaying,
-    /// 2 = mutation flushing.
+    /// Round-trip phases: 0 = globals replaying, 1 = metadata properties
+    /// replaying, 2 = mutation flushing.
     struct Op {
         metadata: Option<pw::metadata::Metadata>,
         md_listener: Option<pw::metadata::MetadataListener>,
@@ -191,7 +176,7 @@ fn set_configured_sink(value: Option<&str>) -> Result<Option<String>> {
                 }
                 match registry.bind::<pw::metadata::Metadata, _>(global) {
                     Ok(md) => {
-                        // The server replays existing properties to a fresh bind; capture the
+                        // Fresh bind replays existing properties; capture the
                         // current configured sink before mutating it.
                         let listener = md
                             .add_listener_local()
@@ -234,7 +219,7 @@ fn set_configured_sink(value: Option<&str>) -> Result<Option<String>> {
                 }
                 match o.phase {
                     0 => {
-                        // All pre-existing globals replayed. No `default` metadata → no
+                        // Globals replayed. Missing `default` metadata means no
                         // session manager to negotiate with.
                         if o.metadata.is_none() {
                             o.outcome = Some(Err(anyhow!(
@@ -247,7 +232,6 @@ fn set_configured_sink(value: Option<&str>) -> Result<Option<String>> {
                         o.expected = core.sync(0).ok();
                     }
                     1 => {
-                        // Property replay complete — `previous` holds the pre-claim value.
                         let md = o.metadata.as_ref().unwrap();
                         md.set_property(
                             0,
@@ -277,8 +261,8 @@ fn set_configured_sink(value: Option<&str>) -> Result<Option<String>> {
         })
         .register();
 
-    // A sick-but-connected daemon must not wedge a session start/end (the ledger lock is held
-    // across this call) — bail out after a bounded wait.
+    // Ledger lock is held across this call — a sick-but-connected daemon must
+    // not wedge session start/end. Bail after 5 s.
     let timer = mainloop.loop_().add_timer({
         let op = op.clone();
         let mainloop = mainloop.clone();
@@ -306,7 +290,6 @@ fn set_configured_sink(value: Option<&str>) -> Result<Option<String>> {
 mod tests {
     use super::*;
 
-    /// First claim saves the pre-claim value; the last release yields it for restore.
     #[test]
     fn claim_release_roundtrip() {
         let mut l = Ledger::new();
@@ -318,7 +301,6 @@ mod tests {
         );
     }
 
-    /// Nested claims (concurrent sessions): only the FIRST saves, only the LAST restores.
     #[test]
     fn nested_claims_restore_once() {
         let mut l = Ledger::new();
@@ -335,8 +317,7 @@ mod tests {
         );
     }
 
-    /// A stale punktfunk claim left by a crashed host must NEVER become the restore target —
-    /// it degrades to deleting the key (automatic election).
+    /// A leftover `punktfunk-speaker-*` name must not become the restore target.
     #[test]
     fn stale_own_claim_degrades_to_delete() {
         let mut l = Ledger::new();
@@ -345,7 +326,6 @@ mod tests {
         assert_eq!(l.on_release(), Some(Restore::Delete));
     }
 
-    /// No pre-claim preference → restore deletes the key.
     #[test]
     fn unset_previous_deletes() {
         let mut l = Ledger::new();
@@ -354,7 +334,7 @@ mod tests {
         assert_eq!(l.on_release(), Some(Restore::Delete));
     }
 
-    /// Release without claim (defensive) must not underflow or restore.
+    /// Unbalanced release must not underflow or restore.
     #[test]
     fn unbalanced_release_is_harmless() {
         let mut l = Ledger::new();

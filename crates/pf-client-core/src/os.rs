@@ -1,19 +1,14 @@
-//! The client half of the host's OS-identity advertisement (the mDNS `os=` TXT record — see the
-//! host crate's `osinfo.rs` for the producer): sanitize the untrusted chain once, and turn it
-//! into the icon-lookup order every front-end walks.
+//! Client half of the host's OS-identity advertisement (mDNS `os=` TXT; producer
+//! is the host crate's `osinfo.rs`): sanitize the untrusted chain once, then the
+//! icon-lookup order every front-end walks.
 //!
-//! The chain is slash-separated, generic → specific (`windows`, `macos`,
-//! `linux[/<family>][/<id>]`, e.g. `linux/fedora/bazzite`). A UI resolves an icon by walking
-//! [`os_icon_tokens`] (most-specific-first, brand aliases applied) and taking the first token it
-//! has art for — so a client with no Bazzite mark lands on `fedora`, then generic `linux`, and an
-//! unknown chain simply falls through to the UI's fallback glyph. Kept UI-agnostic here so the
-//! GTK, Windows and console shells (and the Swift/Kotlin ports, held to the same rules) resolve
-//! identically.
+//! Slash-separated, generic → specific (`linux[/<family>][/<id>]`). A UI walks
+//! [`os_icon_tokens`] most-specific-first (brand aliases applied) and takes the
+//! first token it has art for. Empty or unknown chains fall through to the UI's
+//! fallback glyph. UI-agnostic so every shell resolves identically.
 
-/// Reduce a raw `os` TXT value to the trusted grammar: lowercase slash-separated tokens of
-/// `[a-z0-9._-]` (each capped at 32 chars, at most 5 of them). mDNS is unauthenticated input —
-/// anything outside the grammar is dropped, and a value that sanitizes to nothing becomes `""`
-/// (same rendering as an older host that doesn't advertise `os` at all).
+/// Untrusted mDNS `os=` TXT. Empty is an older host that does not advertise
+/// `os`.
 pub fn sanitize_os(raw: &str) -> String {
     let tokens: Vec<String> = raw
         .to_lowercase()
@@ -32,10 +27,7 @@ pub fn sanitize_os(raw: &str) -> String {
     tokens.join("/")
 }
 
-/// The icon-lookup order for a chain: sanitized tokens most-specific-first, with brand aliases
-/// applied (`macos` → `apple` art, `steamos` → `steam` art). A UI takes the first token it has
-/// art for; an empty result (empty/garbage chain) means "no OS icon", exactly like an older host
-/// that doesn't advertise one.
+/// Most-specific-first after sanitize. Empty means no OS icon.
 pub fn os_icon_tokens(chain: &str) -> Vec<String> {
     sanitize_os(chain)
         .split('/')

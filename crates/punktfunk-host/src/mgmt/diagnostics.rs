@@ -1,27 +1,13 @@
-//! Diagnostics endpoints: the host's health verdicts as one structured channel.
+//! HTTP handlers for [`crate::diagnostics`].
 //!
-//! **Admin lane only, deliberately.** Neither route is on `auth::plugin_may_access` nor
-//! `cert_may_access` — both are opt-in allowlists, so a route stays denied until someone classifies
-//! it, and these carry usernames, group layout and device-node state. Putting them on the plugin or
-//! paired-cert lanes would be a security regression, not a convenience; the unauthenticated
-//! loopback summary the tray reads may carry counts at most.
+//! `GET /diagnostics` returns the last report; `POST /diagnostics/refresh` re-runs
+//! probes. Both are absent from `auth::plugin_may_access` and `cert_may_access`:
+//! the body names users, groups, and device nodes. Pin: `mgmt::tests` lane matrix.
 
 use super::shared::*;
 use crate::diagnostics::{CheckSource, DiagnosticsReport};
 
-/// Host health checks
-///
-/// Every verdict this host computes about its own health — group membership the managed takeover
-/// needs, the input device nodes virtual controllers are built on, competing streaming servers —
-/// with the impact and a copy-pasteable remedy for each.
-///
-/// Cached: the probes run once at startup and on demand via `POST /diagnostics/refresh`, so this is
-/// cheap to poll. Checks whose status is `ok` and `inapplicable` are included — a troubleshooting
-/// page needs to show what is working and to answer "why isn't this check relevant here?".
-///
-/// `summary`, `impact` and `remedy.text` are always present in English. A console that recognizes
-/// the check's `id` replaces them with a localized string interpolated from `params`; one that does
-/// not renders the wire text as-is, which is what keeps a console paired with a newer host readable.
+/// Last cached health report. Probes run at startup and on `POST /diagnostics/refresh`.
 #[utoipa::path(
     get,
     path = "/diagnostics",
@@ -36,11 +22,8 @@ pub(crate) async fn get_diagnostics() -> Json<DiagnosticsReport> {
     Json(crate::diagnostics::registry().report())
 }
 
-/// Re-run the health checks
-///
-/// Runs every probe again and returns the refreshed verdicts. Most checks describe state that only
-/// changes when an operator changes it (a group membership, an installed udev rule), so this exists
-/// for exactly the moment after they have done so — a "did that fix it?" button, not a poll.
+/// Re-run every probe and return the new report. Poll GET; membership and udev
+/// rules only change after the operator changes them.
 #[utoipa::path(
     post,
     path = "/diagnostics/refresh",
@@ -52,8 +35,7 @@ pub(crate) async fn get_diagnostics() -> Json<DiagnosticsReport> {
     )
 )]
 pub(crate) async fn refresh_diagnostics() -> Json<DiagnosticsReport> {
-    // The probes stat sysfs and shell out to `id`, whose NSS lookup can block on a box with a
-    // remote directory — so they run on the blocking pool rather than stalling the executor.
+    // Probes `stat` sysfs and shell out to `id`; NSS on a remote directory can block.
     let report = tokio::task::spawn_blocking(|| {
         let reg = crate::diagnostics::registry();
         reg.run_all(CheckSource::Refresh);

@@ -1,29 +1,22 @@
-//! AMD ADL connector/EDID emulation — the shared implementation behind the `display-disturb
-//! adl-emul` probe AND the `edid_lock` display-policy axis (the software equivalent of an
-//! HPD-holding dummy plug).
+//! AMD ADL connector/EDID emulation, shared by the `display-disturb adl-emul`
+//! probe and the host `edid_lock` axis.
 //!
-//! Three field cases (ASUS VG32VQ1B/DP, Odyssey G60SD/DP, LG UltraGear 32GS95UE/HDMI — all
-//! RX 9070 XT hosts) share one mechanism: a connected-but-asleep sink whose standby HPD/DDC/link
-//! servicing the KMD performs below every OS lever (CCD deactivation, devnode disable and CRU
-//! EDID overrides are confirmed no-ops — `design/vdisplay-disturbance-immunity.md` §2a/§3). The
-//! one software lever that can stop the servicing at its SOURCE is the driver's own connector
-//! emulation: pin the live EDID with `ADL2_Adapter_ConnectionData_Set`, then
-//! `ADL2_Adapter_EmulationMode_Set(ADL_EMUL_MODE_ALWAYS)` so the driver stops caring what the
-//! physical pins report.
+//! A connected-but-asleep sink is still serviced by the KMD below every OS
+//! lever (CCD, devnode disable, CRU). Pinning the live EDID with
+//! `ADL2_Adapter_ConnectionData_Set` then `ADL_EMUL_MODE_ALWAYS` is the one
+//! software stop at the source. Evidence:
+//! `design/vdisplay-disturbance-immunity.md`.
 //!
-//! [`run`] performs one action across every AMD adapter's connectors and returns the per-op
-//! [`OpRecord`]s — the probe tool prints them as bench lines, the host tracing-logs them. The
-//! `edid_lock` axis drives [`lock_for_stream`]/[`unlock_after_stream`] at the Exclusive isolate
-//! (`pf-vdisplay`'s Windows manager), with a crash journal ([`startup_recover`]) because pinned
-//! emulation persists across host restarts — and can persist across REBOOTS, so every lock ships
-//! with its unlock (driver reinstall = the escape hatch of last resort).
+//! [`run`] walks every AMD adapter's connectors and returns per-op
+//! [`OpRecord`]s. `edid_lock` drives [`lock_for_stream`] /
+//! [`unlock_after_stream`] at Exclusive isolate; [`startup_recover`] clears
+//! leftovers because pinned emulation survives process death and can survive
+//! reboot. Driver reinstall is the last-resort escape.
 //!
-//! Everything is best-effort by design: no AMD driver (`atiadlxx.dll` absent) means the axis is
-//! inert, and each rc is preserved so a field log answers the consumer-vs-Pro gating question
-//! (`ADL_ERR_NOT_SUPPORTED(-8)` vs `ADL_OK`).
+//! Best-effort: missing `atiadlxx.dll` makes the axis inert. Each rc is kept
+//! so a log can tell `ADL_ERR_NOT_SUPPORTED(-8)` from `ADL_OK`.
 
-// FFI mirrors of ADL's C structs — keep AMD's field names verbatim so the header diff is
-// mechanical.
+// FFI mirrors of ADL C structs. AMD field names stay verbatim so a header diff is mechanical.
 #![allow(non_snake_case)]
 
 use std::ffi::c_void;
@@ -33,7 +26,7 @@ use windows::core::{s, PCSTR};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
 
-// ---- ADL constants (adl_defines.h, GPUOpen display-library) ----
+// adl_defines.h (GPUOpen display-library).
 
 const ADL_OK: i32 = 0;
 const ADL_MAX_PATH: usize = 256;
@@ -52,8 +45,7 @@ const ADL_EMUL_STATUS_EMULATED_DEVICE_USED: i32 = 0x4;
 
 const AMD_VENDOR_ID: i32 = 1002;
 
-/// Decode the rc values a field log will actually contain (adl_defines.h) — `-8` vs `-1` is the
-/// whole consumer-vs-Pro question, so spell them out.
+/// Named ADL rcs from adl_defines.h. `-8` vs `-1` is consumer vs Pro.
 pub fn rc_str(rc: i32) -> &'static str {
     match rc {
         0 => "ADL_OK",
@@ -87,7 +79,7 @@ fn connector_type_str(t: i32) -> &'static str {
     }
 }
 
-// ---- ADL structs (adl_structures.h, verbatim layouts) ----
+// adl_structures.h, verbatim layouts.
 
 #[repr(C)]
 struct AdapterInfo {
@@ -101,7 +93,7 @@ struct AdapterInfo {
     strAdapterName: [u8; ADL_MAX_PATH],
     strDisplayName: [u8; ADL_MAX_PATH],
     iPresent: i32,
-    // _WIN32 tail — this tool only builds for Windows.
+    // _WIN32 tail; this crate is Windows-only.
     iExist: i32,
     strDriverPath: [u8; ADL_MAX_PATH],
     strDriverPathExt: [u8; ADL_MAX_PATH],
@@ -124,7 +116,7 @@ struct ADLDevicePort {
 }
 
 impl ADLDevicePort {
-    /// A non-MST port at `connector` (MST RAD all-zero = "DP root / non-DP ignored" per header).
+    /// Non-MST port. All-zero RAD is "DP root / non-DP ignored" per the header.
     fn root(connector: i32) -> Self {
         Self {
             iConnectorIndex: connector,
@@ -177,7 +169,7 @@ struct ADLConnectorInfo {
     iLength: i32,
 }
 
-// ---- dynamic binding (atiadlxx.dll ships with every AMD driver; absent elsewhere) ----
+// Dynamic bind of atiadlxx.dll (ships with the AMD driver; absent elsewhere).
 
 type AdlContext = *mut c_void;
 type MallocCb = unsafe extern "C" fn(i32) -> *mut c_void;
@@ -218,29 +210,24 @@ struct Adl {
     emul_mode_set: FnEmulModeSet,
 }
 
-/// ADL's application-provided allocator: it hands buffers (board-layout arrays) back through
-/// out-pointers and expects the app to own them.
+/// ADL allocator callback: board-layout arrays come back as out-pointers the app owns.
 unsafe extern "C" fn adl_malloc(size: i32) -> *mut c_void {
     let size = size.max(1) as usize;
-    // Panic-free: a panic here would cross the extern boundary and abort the host. The Err arm
-    // is unreachable in practice (size ≤ i32::MAX can't overflow the layout), and ADL treats a
-    // null from its allocator as an ordinary failure.
+    // Do not panic: it would cross the extern boundary and abort the host. Null is an
+    // ordinary ADL failure; the Err arm is unreachable (size ≤ i32::MAX).
     let Ok(layout) = std::alloc::Layout::from_size_align(size, 16) else {
         return std::ptr::null_mut();
     };
-    // SAFETY: non-zero size with a fixed valid alignment; the resulting buffers are deliberately
-    // never freed — ADL's contract wants an ADL_Main_Memory_Free symmetry, and leaking the <1 KiB
-    // of board-layout arrays in a one-shot probe is simpler than proving allocator parity.
+    // SAFETY: non-zero size, align 16. Never freed: ADL wants ADL_Main_Memory_Free
+    // symmetry, and leaking the board-layout arrays is simpler than proving parity.
     unsafe { std::alloc::alloc(layout) as *mut c_void }
 }
 
 impl Adl {
     fn load() -> Option<Self> {
-        // SAFETY: plain LoadLibrary of the AMD-driver-installed ADL runtime by its well-known
-        // name; a foreign-DLL search-path attack would require writing to System32.
+        // SAFETY: LoadLibrary of the driver-installed ADL runtime by its well-known name.
         let lib: HMODULE = unsafe { LoadLibraryA(s!("atiadlxx.dll")) }.ok()?;
-        // One unsafe helper: resolve `name` or bail. Every Fn* type above matches the ADL
-        // header's C signature (x64 has a single calling convention, so `extern "C"` is exact).
+        // Each Fn* matches the ADL C signature (`extern "C"` is exact on x64).
         unsafe fn sym<T: Copy>(lib: HMODULE, name: PCSTR) -> Option<T> {
             debug_assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<usize>());
             // SAFETY: caller passes a fn-pointer type T of pointer size (asserted above);
@@ -268,8 +255,6 @@ impl Adl {
     }
 }
 
-// ---- the library surface ----
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum EmulAction {
     /// Read-only: caps + layout + per-connector state. Always safe.
@@ -280,9 +265,6 @@ pub enum EmulAction {
     Unlock,
 }
 
-/// One ADL call's outcome — op name, target, duration, rc (decoded via [`rc_str`]) and the
-/// op-specific fields. The probe tool prints these as its bench correlation lines; the host
-/// tracing-logs them. The rc IS the deliverable of a field run.
 pub struct OpRecord {
     pub op: &'static str,
     pub target: String,
@@ -298,7 +280,7 @@ impl OpRecord {
 }
 
 impl std::fmt::Display for OpRecord {
-    /// The bench line minus the caller's epoch prefix: `op target took_ms ok rc=N(STR) extra`.
+    /// `op target took_ms ok rc=N(STR) extra`. The caller adds its epoch prefix.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let sep = if self.extra.is_empty() { "" } else { " " };
         write!(
@@ -315,15 +297,12 @@ impl std::fmt::Display for OpRecord {
     }
 }
 
-/// How a [`run`] ended: the AMD runtime was absent entirely, died at init (nothing was touched),
-/// or walked the connectors (each op's rc in the records — a NOT_SUPPORTED driver still `Done`s).
+/// End of [`run`]. `ADL_ERR_NOT_SUPPORTED` still [`Done`]s; each op's rc is in the records.
 pub enum RunOutcome {
-    /// `atiadlxx.dll` not loadable (or an export missing) — not an AMD driver install; the
-    /// emulation lever does not exist on this box.
+    /// `atiadlxx.dll` missing (or an export). No emulation lever on this box.
     NoAdl,
-    /// `ADL2_Main_Control_Create` / adapter enumeration failed — records hold the failing rc.
+    /// Create or adapter enumeration failed; records hold the rc.
     InitFailed(Vec<OpRecord>),
-    /// The connector walk ran; every op's outcome is in the records.
     Done(Vec<OpRecord>),
 }
 
@@ -341,9 +320,8 @@ fn c_str(buf: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
-/// Perform `action` on every AMD adapter's connectors (or only `connector_filter`), returning the
-/// per-op records. Read-only for [`EmulAction::Probe`]; [`EmulAction::Lock`] pins occupied
-/// connectors only (unless the filter names one), matching an HPD dummy on the cables that exist.
+/// Apply `action` to every AMD adapter connector, or only `connector_filter`.
+/// [`EmulAction::Lock`] pins occupied connectors only unless the filter names one.
 pub fn run(action: EmulAction, connector_filter: Option<i32>) -> RunOutcome {
     let mut recs: Vec<OpRecord> = Vec::new();
     let mut rec = |op: &'static str, target: &str, took_ms: u128, rc: i32, extra: String| {
@@ -362,9 +340,8 @@ pub fn run(action: EmulAction, connector_filter: Option<i32>) -> RunOutcome {
 
     let mut ctx: AdlContext = std::ptr::null_mut();
     let t = Instant::now();
-    // SAFETY: documented init call — our allocator callback, iEnumConnectedAdapters=0 (ALL
-    // adapters: an exclusively-isolated streaming host may report no "connected" display on the
-    // physical GPU), and a valid out-slot for the context.
+    // SAFETY: documented init. Allocator callback; iEnumConnectedAdapters=0 (all adapters —
+    // Exclusive isolate may report no connected display); valid out-slot.
     let rc = unsafe { (adl.create)(adl_malloc, 0, &mut ctx) };
     rec(
         "adl-init",
@@ -401,14 +378,12 @@ pub fn run(action: EmulAction, connector_filter: Option<i32>) -> RunOutcome {
     let rc = unsafe { (adl.adapter_info)(ctx, infos.as_mut_ptr(), bytes) };
     rec("adl-adapters", "all", 0, rc, format!("count={count}"));
     if rc != ADL_OK {
-        // SAFETY: as above — context teardown, nothing ADL-owned used afterwards.
+        // SAFETY: destroying the context created above; nothing ADL-owned is used past this point.
         let _ = unsafe { (adl.destroy)(ctx) };
         return RunOutcome::InitFailed(recs);
     }
 
-    // What the filter below will see, one record per distinct (bus, vendor, present) — a probe
-    // that walks nothing must SAY why (first .173 run: 15 adapters enumerated, zero walked,
-    // zero explanation; "silence is not success" applies to the probe itself).
+    // One record per distinct (bus, vendor, present) so a walk of nothing still says why.
     let mut seen_shapes: Vec<(i32, i32, i32)> = Vec::new();
     for info in &infos {
         let shape = (info.iBusNumber, info.iVendorID, info.iPresent);
@@ -430,12 +405,9 @@ pub fn run(action: EmulAction, connector_filter: Option<i32>) -> RunOutcome {
         );
     }
 
-    // One GPU surfaces as many logical adapters — probe each bus once, AMD only. The read-only
-    // Probe walks NON-present adapters too (real buses only): a headless iGPU reports
-    // `iPresent=0` yet its driver still answers `EDIDManagement_Caps`, and that headless iGPU
-    // is precisely the lab rung of the edid_lock ladder (.173, 2026-08-26 — the old
-    // present-only gate walked nothing there). Lock/Unlock keep the present requirement: a
-    // connector pin on an adapter without displays is a different experiment.
+    // One GPU is many logical adapters; walk each bus once, AMD only.
+    // Probe includes non-present adapters (headless iGPU reports iPresent=0 and still answers caps).
+    // Lock/Unlock require present: pinning a connector with no displays is a different experiment.
     let mut seen_buses: Vec<i32> = Vec::new();
     for info in &infos {
         let present_ok =
@@ -552,19 +524,17 @@ pub fn run(action: EmulAction, connector_filter: Option<i32>) -> RunOutcome {
                 }
                 EmulAction::Lock => {
                     if !real && connector_filter.is_none() {
-                        continue; // nothing to pin — and pinning an EMPTY connector is a different experiment
+                        continue; // unoccupied and unfiltered: pinning empty is a different experiment
                     }
                     // SAFETY: as in Probe — zeroed then driver-filled.
                     let mut data: ADLConnectionData = unsafe { std::mem::zeroed() };
                     let t = Instant::now();
-                    // SAFETY: live context/port; REAL query first — we pin exactly what the
-                    // sink reports today, so the emulated display IS the user's monitor.
+                    // SAFETY: live context/port; REAL query first so the pin is the sink's current EDID.
                     let mut rc = unsafe {
                         (adl.conn_data_get)(ctx, idx, port, ADL_QUERY_REAL_DATA, &mut data)
                     };
                     if rc != ADL_OK {
-                        // Asleep sinks can refuse a live EDID read — fall back to whatever the
-                        // driver already has as emulation data (Radeon-Pro-UI parity).
+                        // Asleep sinks can refuse a live EDID read; fall back to the driver's emulated data.
                         // SAFETY: same contract, emulated-data query.
                         rc = unsafe {
                             (adl.conn_data_get)(ctx, idx, port, ADL_QUERY_EMULATED_DATA, &mut data)
@@ -616,8 +586,7 @@ pub fn run(action: EmulAction, connector_filter: Option<i32>) -> RunOutcome {
                         String::new(),
                     );
                     let t = Instant::now();
-                    // SAFETY: live context/port; removes emulation data set earlier (harmless
-                    // where none exists — the rc says so).
+                    // SAFETY: live context/port; removes earlier emulation data (harmless if none; the rc says so).
                     let rc = unsafe { (adl.conn_data_remove)(ctx, idx, port) };
                     rec(
                         "adl-unlock-remove",
@@ -636,25 +605,17 @@ pub fn run(action: EmulAction, connector_filter: Option<i32>) -> RunOutcome {
     RunOutcome::Done(recs)
 }
 
-// ---- the `edid_lock` display-policy axis (host-side) ----
-
-/// The crash-recovery journal: a marker that a lock was applied and not yet unlocked. Pinned
-/// emulation outlives the process (and can outlive a reboot), so a host that died mid-stream
-/// must unlock on its next start ([`startup_recover`]).
+/// Marker that a lock was applied and not yet unlocked. Pinned emulation outlives
+/// the process and can outlive a reboot; [`startup_recover`] clears leftovers.
 fn journal_path() -> std::path::PathBuf {
     pf_paths::config_dir().join("edid-lock-active.json")
 }
 
-/// A non-`ADL_OK` rc that is this call's documented no-op rather than a failure.
+/// Mode-off `ADL_ERR_NOT_SUPPORTED` is a documented no-op, not a failure.
 ///
-/// The unlock is deliberately idempotent and runs over EVERY connector — including the ones that
-/// were never pinned, and every connector at all on a host recovering from an unclean exit. Some
-/// drivers answer `ADL_ERR_NOT_SUPPORTED` to "turn emulation off" where there is no emulation to
-/// turn off, so a clean host start emitted one WARN per connector, every time, saying nothing.
-/// Four standing warnings are how a log stops being read.
-///
-/// Scoped to the mode-off call on purpose: `adl-unlock-remove` is the call that actually clears a
-/// pin, so its rc is the one that means something, and it keeps its warning.
+/// Unlock walks every connector, including ones never pinned. Some drivers
+/// answer NOT_SUPPORTED when there is no emulation to turn off.
+/// `adl-unlock-remove` is the call that clears a pin, so its rc still warns.
 fn is_expected_noop(r: &OpRecord) -> bool {
     const ADL_ERR_NOT_SUPPORTED: i32 = -8;
     r.op == "adl-unlock-mode-off" && r.rc == ADL_ERR_NOT_SUPPORTED
@@ -678,14 +639,13 @@ fn tracing_log(prefix: &str, outcome: &RunOutcome) {
     }
 }
 
-/// Apply the `edid_lock` axis at stream bring-up: pin the live EDID + `ADL_EMUL_MODE_ALWAYS` on
-/// every occupied AMD connector (the software HPD dummy), journaling first so a crash still
-/// unlocks on the next host start. Returns whether a later [`unlock_after_stream`] is owed —
-/// true whenever the ADL runtime exists, because even a partially-failed lock may have pinned
-/// some connectors (each rc is in the log).
+/// Pin live EDID + `ADL_EMUL_MODE_ALWAYS` on occupied AMD connectors at stream bring-up.
+/// Journal first so a crash still unlocks on the next start. Returns whether
+/// [`unlock_after_stream`] is owed: true whenever ADL exists, because a partial
+/// lock may have pinned some connectors.
 pub fn lock_for_stream() -> bool {
-    // Journal BEFORE touching the driver: a crash between the first `ConnectionData_Set` and the
-    // journal write would otherwise leave pinned connectors with no startup unlock owed.
+    // Journal before touching the driver: a crash between the first ConnectionData_Set
+    // and the journal write would leave pinned connectors with no startup unlock owed.
     if let Err(e) = std::fs::write(journal_path(), b"{\"locked\":true}") {
         tracing::warn!(
             error = %format!("{e:#}"),
@@ -712,18 +672,15 @@ pub fn lock_for_stream() -> bool {
     true
 }
 
-/// Undo [`lock_for_stream`] at teardown: `ADL_EMUL_MODE_OFF` + remove the pinned EDID on every
-/// AMD connector, then clear the crash journal. Idempotent and harmless where nothing is pinned.
+/// Undo [`lock_for_stream`]: mode off, remove pinned EDID, clear the journal. Idempotent.
 pub fn unlock_after_stream() {
     let outcome = run(EmulAction::Unlock, None);
     tracing_log("edid_lock", &outcome);
     let _ = std::fs::remove_file(journal_path());
 }
 
-/// Host-startup crash recovery: a previous host that died holding the lock left connector
-/// emulation pinned (it persists past the process — and can persist past a reboot). If the
-/// journal marker exists, unlock everything and clear it — before any new session touches the
-/// topology, mirroring `monitor_devnode::startup_recover`.
+/// If the journal marker exists, unlock leftover pins before any new session.
+/// Pinned emulation persists past process death and can persist past reboot.
 pub fn startup_recover() {
     if !journal_path().exists() {
         return;

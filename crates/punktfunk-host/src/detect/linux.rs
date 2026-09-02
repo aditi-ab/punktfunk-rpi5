@@ -1,20 +1,18 @@
-//! Linux conflicting-host facts: `/proc` for running processes, the standard systemd unit dirs +
-//! flatpak app dirs + `PATH` for install markers. All best-effort and dependency-free (no
-//! subprocess spawns) — a missing `/proc` or an unreadable dir simply yields no evidence.
+//! Linux facts for conflicting-host detection: `/proc` for running processes,
+//! systemd unit dirs plus flatpak app dirs plus `PATH` for install markers.
+//! Best-effort and spawn-free — a missing `/proc` or unreadable dir yields no evidence.
 
 use super::{Evidence, Known};
 use std::path::Path;
 
-/// Lowercased basenames of every process whose `/proc/<pid>/comm` we can read. `comm` is the
-/// kernel's 15-char command name — every host we match on (sunshine, apollo, vibeshine, vibepollo,
-/// luminalshine) fits within that, so no `/proc/<pid>/exe` readlink is needed.
+/// Lowercased `/proc/<pid>/comm` of every readable pid. `comm` is the kernel's
+/// 15-char command name; every host we match fits, so no `/proc/<pid>/exe` readlink.
 pub fn running_processes() -> Vec<String> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return out;
     };
     for entry in entries.flatten() {
-        // Only numeric (pid) directories.
         if !entry
             .file_name()
             .to_str()
@@ -30,11 +28,10 @@ pub fn running_processes() -> Vec<String> {
     out
 }
 
-/// systemd unit registration + flatpak + `PATH` binary presence — the "installed" evidence.
 pub fn static_evidence(known: &Known) -> Vec<Evidence> {
     let mut ev = Vec::new();
 
-    // systemd units, system + per-user, in the dirs systemd actually reads.
+    // System + user unit dirs systemd actually walks (not just `/etc`).
     let home = std::env::var_os("HOME");
     let mut unit_dirs: Vec<String> = vec![
         "/etc/systemd/system".into(),
@@ -58,7 +55,6 @@ pub fn static_evidence(known: &Known) -> Vec<Evidence> {
         }
     }
 
-    // flatpak app installs (system + per-user).
     let mut flatpak_roots: Vec<String> = vec!["/var/lib/flatpak/app".into()];
     if let Some(h) = &home {
         flatpak_roots.push(format!("{}/.local/share/flatpak/app", h.to_string_lossy()));
@@ -71,7 +67,7 @@ pub fn static_evidence(known: &Known) -> Vec<Evidence> {
         }
     }
 
-    // A matching binary on PATH (covers manual / package installs the unit/flatpak checks miss).
+    // PATH covers manual/package installs that have no unit or flatpak.
     let path = std::env::var_os("PATH");
     for bin in known.processes {
         if let Some(found) = find_on_path(bin, path.as_deref()) {
@@ -82,17 +78,11 @@ pub fn static_evidence(known: &Known) -> Vec<Evidence> {
     ev
 }
 
-/// Is `unit` (a `<name>.service` filename) **enabled** — i.e. will systemd start it on its own?
+/// True when systemd will start `unit` (`<name>.service`) on its own.
 ///
-/// `systemctl enable` works by symlinking the unit into a target's `.wants`/`.requires` directory,
-/// so the presence of that link is the enablement fact — readable without spawning `systemctl`
-/// (this module is deliberately subprocess-free, and the host often runs where `systemctl` output
-/// would need a bus connection anyway). A unit file that exists but is linked from no target is
-/// installed-but-inert: nothing starts it at boot, so it clashes with nothing.
-///
-/// Scans the `.wants`/`.requires` subdirectories of the drop-in roots systemd actually reads, rather
-/// than hardcoding `multi-user.target` — a unit pulled in by `graphical.target`, a user
-/// `default.target`, or any other target is just as enabled.
+/// Enablement is a symlink in a target's `.wants`/`.requires` under the drop-in
+/// roots systemd reads — no `systemctl` (often no bus here). Do not hardcode
+/// `multi-user.target`; any target counts. A unit file with no such link is inert.
 fn unit_enabled(unit: &str, home: Option<&std::ffi::OsStr>) -> bool {
     let mut roots: Vec<String> = vec![
         "/etc/systemd/system".into(),
@@ -115,8 +105,7 @@ fn unit_enabled(unit: &str, home: Option<&std::ffi::OsStr>) -> bool {
             if !(name.ends_with(".wants") || name.ends_with(".requires")) {
                 continue;
             }
-            // `symlink_metadata` so a DANGLING link still counts: a link into a target's .wants is
-            // what "enabled" means, and a broken one still says the operator enabled it.
+            // `symlink_metadata`: a dangling .wants link still means the operator enabled it.
             if std::fs::symlink_metadata(entry.path().join(unit)).is_ok() {
                 return true;
             }
@@ -127,7 +116,7 @@ fn unit_enabled(unit: &str, home: Option<&std::ffi::OsStr>) -> bool {
 
 fn find_on_path(bin: &str, path: Option<&std::ffi::OsStr>) -> Option<String> {
     let dirs = path.map(std::env::split_paths).into_iter().flatten();
-    // Always also probe the common bindirs, even if PATH is unset/narrow (e.g. a service context).
+    // Common bindirs even when PATH is unset or narrow (service context).
     let extra = ["/usr/bin", "/usr/local/bin", "/bin", "/usr/games"]
         .into_iter()
         .map(std::path::PathBuf::from);

@@ -1,9 +1,9 @@
-//! The no-TTY / `--yes` renderer: the sh installer's `==>` / `ok` / `!!` lines, unchanged.
+//! The no-TTY / `--yes` renderer: the sh installer's `==>` / `ok` / `!!` lines.
 //!
-//! D5 says a box with no terminal sees exactly today's output, so CI containers and scripts
-//! notice no regression. Warnings and the die line keep going to stderr for the same reason.
-//! The TUI (M2) renders the same `Plan` through a different surface; nothing below `ui` knows
-//! which one is attached.
+//! D5: a box with no terminal sees that output byte-for-byte, so CI containers
+//! and scripts do not notice a renderer swap. Warnings and the die line stay
+//! on stderr for the same reason. The TUI renders the same `Plan` through a
+//! different surface; nothing below `ui` knows which one is attached.
 //!
 //! `Sink::Buffer` is what the golden suite renders into — one stream, so the ordering of
 //! warnings against commands is part of what the goldens pin. `Sink::Writer` is the Windows
@@ -110,7 +110,7 @@ impl crate::ui::Reporter for Plain {
         self.emit(false, &format!("  + {cmd}"));
     }
 
-    /// Continuation text under a step, indented to line up with the `ok` column.
+    /// Continuation under a step, indented to the `ok` column.
     fn detail(&self, msg: &str) {
         self.emit(false, &format!("     {msg}"));
     }

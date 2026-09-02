@@ -1,4 +1,4 @@
-//! The clack-look screens: gutter rail, inline prompts, no alternate screen.
+//! Clack-look screens: gutter rail, inline prompts, no alternate screen.
 //!
 //! The transcript scrolls and stays the audit log, which is the constraint that shapes this
 //! file: a frame is only ever repainted while it is still the *live* one (the settings list,
@@ -11,8 +11,8 @@
 //! is nothing a repaint could overwrite. Warnings and failures still print above it, and `-v`
 //! restores the transcript.
 //!
-//! Everything reaches the terminal through `term::Terminal`, so `ScriptedTerm` can drive the
-//! whole flow with a key list and assert on the frame the user would be looking at.
+//! All I/O goes through `term::Terminal`, so `ScriptedTerm` can drive the
+//! flow with a key list and assert on the on-screen frame.
 
 use std::cell::RefCell;
 
@@ -151,12 +151,10 @@ impl<'a> Tui<'a> {
         self.dim(BAR)
     }
 
-    /// Cut every line to the terminal's width, counting printable columns only.
+    /// Truncate to terminal width in printable columns.
     ///
-    /// This is what keeps the repaint honest. A frame is rewound with `clear_last_lines`, which
-    /// counts *physical* rows, while the frame knows only how many lines it wrote — so one line
-    /// wider than the terminal wraps, the rewind comes up short, and the leftovers pile up on
-    /// every keystroke. Truncating makes the two counts the same number by construction.
+    /// `clear_last_lines` counts physical rows; a wrap makes rewind short and
+    /// leftovers pile up. Truncating keeps the two counts equal.
     fn fit(&self, text: &str) -> String {
         let width = usize::from(self.caps.width).max(20);
         let mut out = String::new();
@@ -190,11 +188,9 @@ impl<'a> Tui<'a> {
         out
     }
 
-    /// Word-wrap prose to the terminal, leaving room for the gutter.
+    /// Word-wrap prose, leaving room for the gutter.
     ///
-    /// Row values are truncated instead — they are a column, and a wrapped one stops lining up.
-    /// A why-text is a sentence, and half a sentence about what a permission grants is worse
-    /// than no sentence at all.
+    /// Row values are truncated instead: a wrapped column stops lining up.
     fn wrap(&self, text: &str) -> Vec<String> {
         let width = usize::from(self.caps.width).saturating_sub(3).max(24);
         let mut lines = Vec::new();
@@ -214,13 +210,12 @@ impl<'a> Tui<'a> {
         lines
     }
 
-    /// Can this terminal draw the mark at all?
     fn marked(&self) -> bool {
         logo::intro_level(&self.caps, false) != Intro::Plain
     }
 
-    /// The mark, animated or still, per D7's ladder. Returns the rows it left on screen, which
-    /// the settings loop clears before drawing its own copy — so the two never stack up.
+    /// Animated or still mark. Returns rows left on screen; `settings` clears
+    /// them before drawing its own copy so the two never stack.
     pub fn intro(&self, level: Intro, parts: logo::Parts) -> usize {
         match level {
             Intro::Plain => return 0,
@@ -241,10 +236,8 @@ impl<'a> Tui<'a> {
         MARK_TEXT_ROWS
     }
 
-    /// The settings list. Returns what the user chose to do with it.
-    ///
-    /// `already` is what the intro left on screen; the first repaint clears exactly that, so the
-    /// mark the intro animated is replaced by the one this frame owns rather than pushed down.
+    /// `already` is intro rows still on screen; the first repaint clears
+    /// exactly those so the animated mark is replaced, not pushed down.
     pub fn settings(&self, screen: &mut Screen, already: usize) -> Step {
         self.term.borrow_mut().hide_cursor();
         let mut drawn = already;
@@ -290,8 +283,7 @@ impl<'a> Tui<'a> {
         // The rule is decoration, so it yields to the terminal rather than forcing a wrap.
         let rule_cols = usize::from(self.caps.width).saturating_sub(6).min(58);
         let rule = self.dim(&"─".repeat(rule_cols));
-        // The mark is part of the frame, not a one-off banner, so muting follows the Components
-        // row live: pick Client and the host circle greys out under the cursor.
+        // The mark is part of the frame, so muting follows the Components row live.
         if self.marked() {
             let parts = logo::Parts {
                 host: screen.choices.components.host,
@@ -345,7 +337,6 @@ impl<'a> Tui<'a> {
         out
     }
 
-    /// Open the row's editor, then fold the answer back into the screen.
     fn edit(&self, screen: &mut Screen, field: Field) {
         let why = Screen::why(field);
         match field {
@@ -392,7 +383,7 @@ impl<'a> Tui<'a> {
         }
     }
 
-    /// One inline radio list. `None` when the user backed out.
+    /// Inline radio list. `None` if the user backed out.
     fn choose(&self, prompt: &str, options: &[&str], initial: usize) -> Option<usize> {
         let mut cursor = initial.min(options.len().saturating_sub(1));
         let mut drawn = 0usize;
@@ -433,9 +424,7 @@ impl<'a> Tui<'a> {
                 }
                 Key::Down | Key::Char('j') => cursor = (cursor + 1) % options.len(),
                 Key::Enter | Key::Space => {
-                    // No collapsed transcript line. A sequential wizard leaves one because the
-                    // answer would otherwise scroll away; here the row it belongs to is right
-                    // there in the frame below, so a second copy only piles up with each edit.
+                    // No collapsed transcript line: the row below already holds the answer.
                     self.term.borrow_mut().clear_last_lines(drawn);
                     return Some(cursor);
                 }
@@ -448,7 +437,6 @@ impl<'a> Tui<'a> {
         }
     }
 
-    /// Step 7's text, inside the rail.
     pub fn outro(&self, lines: &[String]) {
         self.write(&format!("{}\n", self.bar()));
         for line in lines {
@@ -467,7 +455,7 @@ impl<'a> Tui<'a> {
     }
 }
 
-/// During execution the same `Plan` reports through here instead of the plain transcript.
+/// Same `Plan`, reported through the rail instead of the plain transcript.
 impl Reporter for Tui<'_> {
     fn say(&self, msg: &str) {
         if self.progress_live() {
@@ -548,7 +536,6 @@ impl Reporter for Tui<'_> {
     }
 }
 
-/// What the caller does with a settings screen that ended.
 pub fn action_of(step: Step) -> Option<Action> {
     match step {
         Step::Run(action) => Some(action),

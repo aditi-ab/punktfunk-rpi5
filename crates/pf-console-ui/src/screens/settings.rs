@@ -1,16 +1,13 @@
-//! The console settings screen — the couch-relevant subset of the Settings store,
-//! restyled as glass rows and fully controller-navigable (the Swift
-//! `GamepadSettingsView`, re-homed): up/down moves focus, left/right steps the focused
-//! value (clamped — the boundary thud tells the thumb it's the last option), A cycles
-//! forward wrapping, L1/R1 change SECTION, B closes. Every change persists immediately;
-//! the desktop shells read the same file, so values round-trip freely.
+//! Console settings: the couch-facing subset of the shared Settings store.
 //!
-//! The rows are split across tabs (see [`TABS`]). They used to be one 30-row scroll with
-//! inline headers, which on a Deck meant thumbing past Video and Audio to reach the pad
-//! settings; a tab is one shoulder press, and each tab remembers where its cursor was.
-//! A tab is also one Tab keypress, and one click or tap on its pill — the strip shipped
-//! reachable by shoulder buttons alone, which left it unusable to everyone holding a
-//! mouse or touching the glass.
+//! One row per setting, grouped by [`TABS`]. Left/right steps the focused value
+//! (clamped); A cycles wrapping; L1/R1 change section; B closes. Every change
+//! writes the store immediately so desktop shells round-trip the same file.
+//! Each tab remembers its cursor. Profiles is built from the catalog at render
+//! time — the console never creates or edits profiles.
+//!
+//! Tab names match `clients/shared/console-vectors.json`. Platform split:
+//! [`row_on`]. Availability this frame: [`row_applies`].
 
 use crate::glyphs::{Hint, HintKey};
 use crate::pointer::Pointer;
@@ -24,14 +21,13 @@ use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use pf_client_core::trust::{MouseMode, StatsVerbosity, TouchMode};
 use skia_safe::{Canvas, Rect};
 
-/// Stable row identity — adjust/activate dispatch by id so nothing acts on a stale
-/// index when the pad list under the "Use controller" row churns.
+/// Dispatch key for adjust/activate. The pad list under "Use controller" can
+/// churn between frames, so an index would act on the wrong row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowId {
-    /// A catalog profile (index into [`SettingsScreen::profiles`]) — activating opens
-    /// the pin-to-hosts screen. The console never edits profiles (design §5.4).
+    /// Index into [`SettingsScreen::profiles`]. Activate opens pin-to-hosts;
+    /// the console never edits a profile.
     Profile(usize),
-    /// The Profiles section's placeholder while the catalog is empty.
     NoProfiles,
     Resolution,
     Refresh,
@@ -42,20 +38,16 @@ enum RowId {
     Decoder,
     Hdr,
     Chroma444,
-    /// The 10-bit SDR opt-in (`VIDEO_CAP_10BIT` without HDR). Desktop-only, like
-    /// [`RowId::Chroma444`]: the Android session derives its depth bits from the panel.
+    /// `VIDEO_CAP_10BIT` without HDR. Desktop-only: Android takes depth from the panel.
     TenBitSdr,
     PresentPriority,
     SmoothBuffer,
     Vsync,
     AllowVrr,
     Audio,
-    /// The lossless-PCM opt-in — the cross-client `audio_format` key. Off (Opus) by default, and
-    /// tied to the channel count above it for a reason that is NOT the one the design doc gives;
-    /// see the `enabled` note in [`row_spec`].
+    /// Cross-client `audio_format` key. Gated on stereo — see [`row_spec`].
     AudioFormat,
-    /// The per-session `CLIENT_CAP_KEEP_HOST_AUDIO` ask — the host keeps playing on its own
-    /// output while it streams. Every platform: the Android session advertises the bit too.
+    /// `CLIENT_CAP_KEEP_HOST_AUDIO`. Advertised on every platform, including Android.
     KeepHostAudio,
     Mic,
     EchoCancel,
@@ -64,85 +56,52 @@ enum RowId {
     PadType,
     SystemButtons,
     GuideGesture,
-    /// The DualSense voice-coil haptics stream, rendered on the (wired) pad itself — see
-    /// `trust::Settings::pad_haptics`. Negotiated: it changes nothing without a capable
-    /// host and a wired DS5, which is why the row says what it is for, not what it does.
+    /// `trust::Settings::pad_haptics`. Negotiated: needs a capable host and a wired DS5.
     PadHaptics,
-    /// Where the pad's built-in-speaker stream renders — `trust::Settings::pad_speaker`.
-    /// Offered as On (`"pad"`) / Off, exactly like the GTK switch over the same key: the
-    /// third stored value (`"mix"`) is a declared TODO that renders as off, and a picker
-    /// offering it would be a control that changes nothing.
+    /// `trust::Settings::pad_speaker`. On (`"pad"`) / Off only — stored `"mix"`
+    /// renders as off, so offering it would be a no-op control.
     PadSpeaker,
     Touch,
     Mouse,
     InvertScroll,
     Shortcuts,
-    /// The quick-action ring — `trust::Settings::overlay_actions`, the whole blob — edited
-    /// on the ring itself (an action row — opens [`super::ring_editor::RingEditorScreen`],
-    /// design touch-client-overlay.md §3.3).
+    /// `trust::Settings::overlay_actions`. Action row: opens [`super::ring_editor::RingEditorScreen`].
     QuickActions,
     Stats,
     Fullscreen,
     AutoWake,
-    /// Wear the desktop's own theme instead of a picked palette — see
-    /// `trust::Settings::follow_os_theme`. Shown only when the embedding binary publishes
-    /// one (today: the session binary on Omarchy); while on it rules, and
-    /// [`RowId::Palette`] hides beneath it.
+    /// `trust::Settings::follow_os_theme`. Shown only while the embedder publishes
+    /// a theme; [`RowId::Palette`] hides while it is on.
     FollowOsTheme,
-    /// The gamepad UI's background colour family — see [`crate::library::PALETTES`]. The
-    /// backdrop behind this very row re-colours as it steps, which is the whole reason the
-    /// picker lives on a screen rather than in a dialog.
     Palette,
-    /// Freeze the console's decorative motion — see `trust::Settings::reduce_motion`. Sits
-    /// beside the palette row for the same reason it does: both are presentation, and the
-    /// effect of stepping this one is visible on the backdrop behind it.
     ReduceMotion,
-    /// Draw the console at 1080p and let the display scale it up, instead of at the panel's
-    /// own resolution. Android-only, and beside [`RowId::ReduceMotion`] on purpose: both are
-    /// "give up some fidelity for a smoother console", and this is the one that matters on a
-    /// 4K TV or projector, where every pass the shell draws costs four times what it does at
-    /// 1080p on a GPU that is not four times faster.
+    /// Android-only. Draw the console at 1080p; a 4K panel otherwise pays 4× fill.
     ReduceUiResolution,
-    /// How the game library arranges its titles — see `library::LibraryView`. The library
-    /// changes it in place now, from the bar over its own field, which is where an
-    /// arrangement you want to SEE the effect of belongs; this row stays because both
-    /// surfaces write the one `library_view` key, so it is the same setting reached from a
-    /// list, and it is where the explanation of the two arrangements lives.
+    /// Same `library_view` key the library bar writes.
     LibraryView,
-    /// Whether opening a host's library lands on its collections rather than on the whole
-    /// shelf — see `trust::Settings::library_collections`. Beside the view row because both
-    /// answer "what does the library look like when I get there", and this one is the only
-    /// way to reach the collections screen without the shelf's Y.
+    /// `trust::Settings::library_collections`. Couch path besides the shelf's Y.
     LibraryCollections,
-    // --- Android-only rows (design android-skia-console-port.md D3). Their values live in
-    // `trust::Settings::extra` under `android.*` keys, so the desktop's settings struct never
-    // grows a field one platform reads; `row_on` keeps them off the desktop's list. ---
-    /// The Android decode pipeline's low-latency mode (slice-progressive delivery, DSCP).
+    // Android-only. Values live in `trust::Settings::extra` under `android.*`
+    // so the typed struct stays shared; [`row_on`] keeps them off desktop.
+    /// Slice-progressive decode plus DSCP. Android-only.
     LowLatency,
-    /// Render the host's rumble on the phone's own motor when no pad is attached.
     PhoneRumble,
-    /// Send the phone's gyro as the pad's motion when no pad is attached.
     PhoneGyro,
-    /// Steam Controller 2 passthrough (raw BLE/USB capture instead of the OS pad).
+    /// Raw BLE/USB capture instead of the OS pad.
     Sc2Passthrough,
-    /// DualSense raw-USB capture (touchpad, motion, adaptive triggers).
+    /// Raw USB: touchpad, motion, adaptive triggers.
     DsCapture,
-    /// Whether the console UI fronts the app at all — the touch settings' switch
-    /// (`Settings.gamepadUiEnabled`), reachable from inside the console it turns off.
-    /// Only offered where there is another interface to fall back to
-    /// ([`Ctx::fallback_ui`]): on a TV or the desktop session this console is the only
-    /// UI, and an off switch would strand the user in nothing.
+    /// `Settings.gamepadUiEnabled`. Only with [`Ctx::fallback_ui`] — otherwise
+    /// off strands the user with no UI.
     GamepadUi,
-    /// When the console UI fronts the app: with a controller attached, or always.
     GamepadUiMode,
-    /// The platform's connected-controllers view (an action row — opens a native screen).
+    /// Action row: opens the in-process controllers screen.
     Controllers,
-    /// The platform's open-source-licences view (an action row).
+    /// Action row: asks the host to open the platform licences screen.
     Licenses,
 }
 
-/// The `Settings::extra` keys the Android rows read and write. Kotlin writes the same keys
-/// from its own settings (`ConsoleJson.settings`) and folds them back on save.
+/// `Settings::extra` keys the Android rows share with Kotlin (`ConsoleJson.settings`).
 mod android_keys {
     pub const LOW_LATENCY: &str = "android.low_latency";
     pub const PHONE_RUMBLE: &str = "android.rumble_on_phone";
@@ -154,14 +113,12 @@ mod android_keys {
     pub const REDUCE_UI_RES: &str = "android.reduce_ui_resolution";
 }
 
-/// The Android console-UI mode's stored values (`GamepadUi.kt`).
+/// Stored `android.gamepad_ui_mode` values (`GamepadUi.kt`).
 const GAMEPAD_UI_MODES: [(&str, &str); 2] =
     [("connected", "With a controller"), ("always", "Always")];
 
-/// `pad_audio::speaker_active`'s answer, restated: only `"pad"` renders today ("mix" is
-/// the declared TODO that renders as off). Local because that module owns the actual
-/// renderer and is `cfg(linux|windows)` — this row also ships on Android, where the
-/// SETTING still travels with the stream request even though no local renderer exists.
+/// `"pad"` is the only live value; `"mix"` renders as off. Local copy because
+/// `pad_audio` is `cfg(linux|windows)` and Android still sends the setting.
 fn pad_speaker_on(mode: &str) -> bool {
     mode == "pad"
 }
@@ -182,7 +139,6 @@ fn extra_str<'a>(s: &'a pf_client_core::trust::Settings, key: &str, default: &'a
     s.extra.get(key).and_then(|v| v.as_str()).unwrap_or(default)
 }
 
-/// `toggle` over an `extra` boolean — same clamp/wrap grammar as the typed rows.
 fn toggle_extra(
     s: &mut pf_client_core::trust::Settings,
     key: &str,
@@ -196,16 +152,8 @@ fn toggle_extra(
     Some(())
 }
 
-// The couch-relevant subset grew 2026-07-31: this screen is the ONLY settings editor in
-// Gaming Mode, so a field it omits is simply unreachable there (render scale, 4:4:4,
-// scroll/shortcut behavior, fullscreen-on-stream, auto-wake and echo cancellation all
-// were). Still deliberately smaller than the desktop dialogs — device pickers
-// (GPU/speaker/mic) stay desktop-only, and profiles are pinnable here (the trailing
-// Profiles tab) but created and edited only in the desktop app (design §5.4).
-//
-// The tab names are shared with the Apple and Android gamepad settings, so a setting is
-// found under the same word on every client. Profiles is the trailing tab and is built
-// from the catalog at render time, which is why it carries no rows here.
+// Tab names match Apple/Android (`console-vectors.json`). Profiles is empty here:
+// its rows come from the catalog. Device pickers stay on the desktop dialogs.
 const TABS: [(&str, &[RowId]); 7] = [
     (
         "Stream",
@@ -289,37 +237,33 @@ const TABS: [(&str, &[RowId]); 7] = [
     ("Profiles", &[]),
 ];
 
-/// The index of the trailing Profiles tab (built from the catalog, not from [`TABS`]).
+/// Trailing Profiles tab — catalog-built, not [`TABS`] rows.
 const PROFILES_TAB: usize = TABS.len() - 1;
 
-/// How many sections the strip shows — for the shell's raster test, which walks all of them.
-/// `cfg(test)` because nothing in a shipping build needs the count: a plain `cargo build` would
-/// otherwise warn it dead, and this crate's lanes treat warnings as errors.
+/// Strip length for the shell's raster walk. `cfg(test)`: a shipping build
+/// would warn it dead, and this crate treats warnings as errors.
 #[cfg(test)]
 pub(crate) const TAB_COUNT: usize = TABS.len();
 
 const RESOLUTIONS: [(u32, u32); 6] = [
-    (0, 0), // native
+    (0, 0), // native: host follows the panel
     (1280, 720),
-    (1280, 800), // the Deck's panel
+    (1280, 800), // Steam Deck panel
     (1920, 1080),
     (2560, 1440),
     (3840, 2160),
 ];
 const REFRESH: [u32; 5] = [0, 30, 60, 90, 120];
-/// Mirrors [`punktfunk_core::render_scale::PRESETS`] (and the desktop pickers).
+/// Must stay in sync with [`punktfunk_core::render_scale::PRESETS`].
 const RENDER_SCALES: [f64; 9] = [0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
-/// The rungs left/right steps through, in kbps. Tight at the bottom, where one rung is the
-/// difference between watchable and a slideshow on a thin link, and coarse at the top, where
-/// a rung is noise; the ceiling is 2 Gbps. The list is deliberately long — a ladder no thumb
-/// can walk to the value it wants is what the Y field is for.
+/// Left/right rungs in kbps. Denser below ~20 Mbps; ceiling 2 Gbps. Off-ladder
+/// values go through the Y field rather than a longer ladder.
 const BITRATES: [u32; 30] = [
     0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 8_000, 10_000, 12_000, 15_000, 20_000, 25_000,
     30_000, 40_000, 50_000, 60_000, 80_000, 100_000, 125_000, 150_000, 200_000, 250_000, 300_000,
     400_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000,
 ];
-/// What the typed field accepts, in Mbps: the ladder's own ceiling. The host clamps to its
-/// range anyway (500 kbps – 8 Gbps), so this is about what a client should let you ask for.
+/// Typed-field ceiling in Mbps — the ladder's top. Host range is 500 kbps–8 Gbps.
 const CUSTOM_MAX_MBPS: u32 = 2_000;
 const COMPOSITORS: [(&str, &str); 5] = [
     ("auto", "Automatic"),
@@ -333,19 +277,12 @@ const CODECS: [(&str, &str); 5] = [
     ("hevc", "HEVC"),
     ("h264", "H.264"),
     ("av1", "AV1"),
-    // Opt-in wired-LAN low-latency codec (100-400 Mbps class, 8-bit SDR). Only ever
-    // selected when the host supports it too; anything else falls back to HEVC.
+    // 100–400 Mbps class, 8-bit SDR. Host must support it; else HEVC.
     ("pyrowave", "PyroWave (wired LAN)"),
 ];
-// Per-OS hardware rungs, like the shells' pickers: the console ships on Windows too
-// (`punktfunk-session --browse`), where "vaapi" was a dead option that ALSO hid the real
-// hardware path — `Decoder::new` has no VAAPI branch there.
-//
-// The STORED values are the `native-*` rung names since M10 (the libavcodec rungs those
-// bare names meant are deleted). The LABELS are unchanged and still true — native Vulkan
-// Video is Vulkan Video. A store written by an older client keeps working: the bare names
-// migrate on read (`pf_client_core::video`'s `migrate_decoder_pref`), they just will not
-// match a preset here, so the picker shows the first entry until the user re-picks.
+// Per-OS hardware rungs. Windows has no VAAPI (`Decoder::new` has no branch).
+// Stored values are `native-*`; `migrate_decoder_pref` rewrites a legacy store
+// on read, but until the user re-picks it will not match a preset here.
 #[cfg(not(windows))]
 const DECODERS: [(&str, &str); 4] = [
     ("auto", "Automatic"),
@@ -361,11 +298,10 @@ const DECODERS: [(&str, &str); 4] = [
     ("software", "Software"),
 ];
 const AUDIO: [(u8, &str); 3] = [(2, "Stereo"), (6, "5.1"), (8, "7.1")];
-/// Presentation intent — the `present_priority` key shared with the Apple and Android
-/// clients, so one profile reads the same on every device.
+/// Shared `present_priority` key — one profile reads the same on every client.
 const PRESENT_PRIORITIES: [(&str, &str); 2] =
     [("latency", "Lowest latency"), ("smooth", "Smoothness")];
-/// Smoothness buffer depth in frames; `0` = Automatic (resolves to 2).
+/// Depth in frames. `0` = Automatic, which resolves to 2.
 const SMOOTH_BUFFERS: [(u8, &str); 4] = [
     (0, "Automatic"),
     (1, "1 frame"),
@@ -380,48 +316,33 @@ const PAD_TYPES: [(&str, &str); 6] = [
     ("dualshock4", "DualShock 4"),
     ("steamdeck", "Steam Deck"),
 ];
-/// Where the guide (Xbox/PS/Steam) and quick-access presses land while streaming — the
-/// shared `system_buttons` key. Auto = host everywhere except Gaming Mode, where the
-/// local Steam UI reacts to the same press and both overlays would open at once.
+/// Shared `system_buttons` key. Auto sends to the host except in Gaming Mode,
+/// where Steam on this device would open a second overlay on the same press.
 const SYSTEM_BUTTONS: [(&str, &str); 3] = [
     ("auto", "Automatic"),
     ("forward", "Send to host"),
     ("local", "This device"),
 ];
-/// The hold-Select guide gesture — the shared `guide_gesture` key.
 const GUIDE_GESTURE: [(&str, &str); 3] = [("auto", "Automatic"), ("on", "On"), ("off", "Off")];
 
 pub(crate) struct SettingsScreen {
     list: MenuList,
     strip: TabStrip,
-    /// Which of [`TABS`] is showing.
     tab: usize,
-    /// Where each tab's cursor was when it was last left. Coming back to Controller after a
-    /// detour through Video should land where you were, not at the top.
+    /// Per-tab cursor so a detour does not reset the one you left.
     tab_cursors: [usize; TABS.len()],
-    /// The profile catalog's `(id, name)` pairs, loaded once at construction — the console
-    /// can't create profiles (design §5.4: the desktop app does), so the list is stable
-    /// for the screen's lifetime.
+    /// `(id, name)` loaded once. The console cannot create profiles, so this is
+    /// stable for the screen's lifetime.
     profiles: Vec<(String, String)>,
-    /// The tab strip holds the D-pad focus (Up from the list's top row steps onto it;
-    /// Down/A step back off). This is how a device with ONLY a D-pad — a Chromecast/Google
-    /// TV remote — switches tabs at all: the shoulder ring (L1/R1) and the Tab/PgUp/PgDn
-    /// keys don't exist there, and a field report lost every tab but the first to that.
+    /// D-pad focus on the strip. TV remotes have no shoulders and no Tab key.
     strip_focus: bool,
-    /// The Bitrate row's typed rate in Mbps while Y has the field open — `None` the rest of
-    /// the time. Every other row on this screen is a list of options, and a ladder is the
-    /// right shape for a list; a bitrate is a NUMBER, and the one a link actually carries is
-    /// rarely a round rung. Y rather than A so the A-cycles-forward grammar holds everywhere.
+    /// Typed Mbps while Y has the bitrate field open. Y, not A, so A still cycles.
     custom_bitrate: Option<String>,
-    /// The tray keyboard the field types through, where the platform has no keyboard of its
-    /// own (on a Deck, Steam's keyboard types and ours never draws — same rule as add-host).
+    /// Tray keyboard. Unused on Deck: Steam's keyboard types (same as add-host).
     keyboard: Keyboard,
 }
 
 impl SettingsScreen {
-    /// The settings screen over the host's profile catalog (`store.profiles()`), read once
-    /// here — the console can't create profiles, so the list is stable for the screen's
-    /// lifetime.
     pub(crate) fn new(store: &dyn crate::store::SettingsStore) -> SettingsScreen {
         Self::with_profiles(store.profiles())
     }
@@ -439,13 +360,12 @@ impl SettingsScreen {
         }
     }
 
-    /// A text field is open — the run loop keeps SDL text input started, so a hardware
-    /// keyboard (and Steam's, on a Deck) types straight into it.
+    /// True while the typed field is open; the run loop keeps SDL text input started.
     pub(crate) fn editing(&self) -> bool {
         self.custom_bitrate.is_some()
     }
 
-    /// Committed text from SDL. Digits only, four of them: 2000 Mbps is the ceiling.
+    /// SDL text. Digits only; four chars is 2000 Mbps, the ceiling.
     pub(crate) fn text_input(&mut self, text: &str) {
         for ch in text.chars() {
             self.type_char(ch);
@@ -467,7 +387,6 @@ impl SettingsScreen {
         self.custom_bitrate.as_mut().and_then(String::pop).is_some()
     }
 
-    /// Raw key edits while the field is open (Backspace repeats, Return/Escape are done).
     pub(crate) fn edit_key(&mut self, key: crate::input::Key, ctx: &mut Ctx) -> bool {
         use crate::input::Key as K;
         if self.custom_bitrate.is_none() {
@@ -486,9 +405,7 @@ impl SettingsScreen {
         }
     }
 
-    /// Close the field, storing what was typed. An empty field (or a typed `0`) leaves the
-    /// rate alone: a cleared field is an abandoned edit, and "let the host decide" is the
-    /// ladder's own first rung, not something to reach by deleting four digits.
+    /// Close the field. Empty or `0` is an abandoned edit, not Automatic (the first rung).
     fn commit_custom(&mut self, ctx: &mut Ctx) {
         let Some(text) = self.custom_bitrate.take() else {
             return;
@@ -499,18 +416,15 @@ impl SettingsScreen {
         if mbps == 0 {
             return;
         }
-        // The same rebase-then-save every other write here does: another writer may have
-        // stored the file while the keyboard was up.
+        // Rebase first: another writer may have stored the file while the keyboard was up.
         *ctx.settings = ctx.store.load();
         ctx.settings.bitrate_kbps = mbps.min(CUSTOM_MAX_MBPS) * 1000;
         ctx.store.save(ctx.settings);
     }
 
-    /// The field is modal while it is up: the tray takes the events, and closing commits.
     fn custom_menu(&mut self, ev: MenuEvent, ctx: &mut Ctx) -> Option<MenuPulse> {
         if ctx.deck {
-            // Steam's keyboard is doing the typing (text arrives through `text_input`); the
-            // pad is only here to say when it's done.
+            // Steam types via `text_input`; the pad only commits.
             return match ev {
                 MenuEvent::Back | MenuEvent::Confirm => {
                     self.commit_custom(ctx);
@@ -543,9 +457,7 @@ impl SettingsScreen {
         }
     }
 
-    /// The rows of the CURRENT tab, minus any whose setting has nothing to act on (see
-    /// [`row_applies`]). Profiles is built from the catalog: one row per profile, or the
-    /// explainer placeholder while there are none.
+    /// Filtered by [`row_on`] / [`row_applies`]. Profiles comes from the catalog.
     fn row_ids(&self, ctx: &Ctx) -> Vec<RowId> {
         if self.tab != PROFILES_TAB {
             return TABS[self.tab]
@@ -562,10 +474,8 @@ impl SettingsScreen {
         }
     }
 
-    /// Pull the cursor back onto the list. Every tab but Profiles used to be a fixed length,
-    /// so this only mattered on entry ([`show_tab`]); the smoothness buffer's row now comes
-    /// and goes, and another writer (a desktop shell, a session's match-window persist) can
-    /// take it away between frames while this screen is open.
+    /// Pull the cursor back. The smoothness buffer (and other writers) can shrink the list
+    /// between frames.
     fn clamp_cursor(&mut self, len: usize) {
         if self.list.cursor >= len {
             self.list.jump_to(len.saturating_sub(1));
@@ -577,37 +487,32 @@ impl SettingsScreen {
         self.tab
     }
 
-    /// Row `i`'s rect as last drawn — the shell's touch tests press real coordinates.
+    /// Last-drawn row rect — hit tests press real coordinates.
     #[cfg(test)]
     pub(crate) fn row_rect_for_test(&self, i: usize) -> Option<Rect> {
         self.list.row_rect(i)
     }
 
-    /// L1/R1 (and Tab/PgUp/PgDn) — move one tab, wrapping (the strip is a ring, like A's
-    /// value cycle), keeping each tab's own cursor.
     fn switch_tab(&mut self, delta: i32, ctx: &Ctx) -> Option<MenuPulse> {
         let n = TABS.len() as i32;
         self.show_tab((self.tab as i32 + delta).rem_euclid(n) as usize, ctx)
     }
 
-    /// Show `tab`, parking the cursor the outgoing tab was on. Also the pointer's path in:
-    /// a press on a pill names a tab outright rather than a direction to step in.
+    /// Park the outgoing tab's cursor, then jump. Pointer pills name a tab outright.
     fn show_tab(&mut self, tab: usize, ctx: &Ctx) -> Option<MenuPulse> {
         if tab >= TABS.len() {
             return None;
         }
         self.tab_cursors[self.tab] = self.list.cursor;
         self.tab = tab;
-        // Clamp the remembered cursor: the Profiles tab's length follows the catalog, and
-        // Video's follows whether the smoothness buffer is offered.
+        // Remembered cursor can outlive a shorter tab (Profiles catalog, smoothness buffer).
         let len = self.row_ids(ctx).len();
         self.list
             .jump_to(self.tab_cursors[self.tab].min(len.saturating_sub(1)));
         Some(MenuPulse::Move)
     }
 
-    /// Mouse/touch. The strip is checked first — its pills sit above the list and a press
-    /// there is never meant for a row.
+    /// Strip first: pills sit above the list, so a press there is never a row.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
         if self.custom_bitrate.is_some() && !ctx.deck {
             if !self.keyboard.covers(p) {
@@ -634,8 +539,7 @@ impl SettingsScreen {
             self.show_tab(tab, ctx);
             return true;
         }
-        // A pointer press on the rows takes the focus back from the strip — direct
-        // manipulation names its own target.
+        // A press on the rows takes D-pad focus back from the strip.
         if p.press() {
             self.strip_focus = false;
         }
@@ -659,9 +563,7 @@ impl SettingsScreen {
             return self.custom_menu(ev, ctx);
         }
         if self.strip_focus {
-            // The strip holds the D-pad focus: left/right travel the ring, down/A drop back
-            // to the rows, B still leaves the screen. This is the only tab path a device
-            // with no shoulders and no Tab key has (a TV remote).
+            // D-pad tab path for remotes with no shoulders and no Tab key.
             return match ev {
                 MenuEvent::Back => {
                     fx.pop();
@@ -673,7 +575,6 @@ impl SettingsScreen {
                     self.strip_focus = false;
                     Some(MenuPulse::Move)
                 }
-                // The top of the screen — the same recoil the list's ends answer with.
                 MenuEvent::Move(MenuDir::Up) => Some(MenuPulse::Boundary),
                 _ => None,
             };
@@ -685,8 +586,7 @@ impl SettingsScreen {
             }
             MenuEvent::JumpBack => return self.switch_tab(-1, ctx),
             MenuEvent::JumpForward => return self.switch_tab(1, ctx),
-            // Up from the top row steps onto the tab strip instead of recoiling — the
-            // D-pad-only path to the other tabs.
+            // Up from row 0 focuses the strip, not a boundary.
             MenuEvent::Move(MenuDir::Up) if self.list.cursor == 0 => {
                 self.strip_focus = true;
                 return Some(MenuPulse::Move);
@@ -695,9 +595,7 @@ impl SettingsScreen {
         }
         let ids = self.row_ids(ctx);
         self.clamp_cursor(ids.len());
-        // Y on the Bitrate row opens the typed rate; on every other row it means nothing,
-        // and the hint bar only offers it where it does. Not under PyroWave — the row is
-        // dimmed (see `row_spec`) and a typed rate would be as inert as the ladder.
+        // Y opens the typed bitrate. Skip under PyroWave: the row is inert (`row_spec`).
         if ev == MenuEvent::Secondary {
             return if ids.get(self.list.cursor) == Some(&RowId::Bitrate)
                 && ctx.settings.codec != "pyrowave"
@@ -712,8 +610,7 @@ impl SettingsScreen {
         self.apply_row(msg, pulse, &ids, ctx, fx)
     }
 
-    /// What a list message means on the focused row — shared by the pad/keyboard path and
-    /// the pointer's, so a click and an A press can never drift apart.
+    /// Shared by pad and pointer so a click and an A press cannot drift apart.
     fn apply_row(
         &mut self,
         msg: ListMsg,
@@ -722,13 +619,11 @@ impl SettingsScreen {
         ctx: &mut Ctx,
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
-        // A cursor with no row under it can only mean the list shrank between the clamp above
-        // and here, which nothing does today — but indexing on the assumption would turn that
-        // into a panic in a shipping console rather than a dropped keypress.
+        // List shrank between clamp and here: drop the keypress, do not panic.
         let Some(&focused) = ids.get(self.list.cursor) else {
             return pulse;
         };
-        // The Profiles rows navigate instead of editing the settings file.
+        // Profiles navigate; they must not hit the settings save path.
         match focused {
             RowId::Profile(i) => {
                 return match msg {
@@ -749,7 +644,7 @@ impl SettingsScreen {
                     ListMsg::None => pulse,
                 };
             }
-            // The ring is edited on the ring itself, on its own screen; ◀ ▶ thud.
+            // Action row: adjust is a boundary.
             RowId::QuickActions => {
                 return match msg {
                     ListMsg::Activate => {
@@ -762,8 +657,7 @@ impl SettingsScreen {
                     ListMsg::None => pulse,
                 };
             }
-            // Connected controllers is one of ours now — a shared Skia screen, so the console
-            // keeps its own input on the page and only the grant dialogs go back to the host.
+            // In-process Skia screen; grant dialogs still go to the host.
             RowId::Controllers => {
                 return match msg {
                     ListMsg::Activate => {
@@ -776,8 +670,7 @@ impl SettingsScreen {
                     ListMsg::None => pulse,
                 };
             }
-            // The one screen still the platform's: A asks the host to open it; nothing here
-            // edits.
+            // Platform screen: A asks the host to open it; nothing here edits.
             RowId::Licenses => {
                 return match msg {
                     ListMsg::Activate => {
@@ -792,12 +685,8 @@ impl SettingsScreen {
             }
             _ => {}
         }
-        // Rebase the shell-lifetime snapshot on the file before an adjust-then-save: this
-        // screen is one of the settings file's several whole-file writers (profiles.rs
-        // documents the no-merge debt), and adjusting a stale snapshot would silently
-        // revert what another writer (a session's match-window persist, a desktop shell)
-        // stored while the console was open. Only on the mutating events — a cursor move
-        // shouldn't touch the disk.
+        // Whole-file writer: rebase before mutate or another writer's store is reverted.
+        // Cursor moves must not touch the disk.
         if matches!(msg, ListMsg::Adjust(_) | ListMsg::Activate) {
             *ctx.settings = ctx.store.load();
         }
@@ -812,7 +701,6 @@ impl SettingsScreen {
                 }
             }
             ListMsg::Activate => {
-                // A cycles forward WRAPPING, so every option is reachable one-handed.
                 if adjust(focused, 1, true, ctx) {
                     ctx.store.save(ctx.settings);
                 }
@@ -837,8 +725,7 @@ impl SettingsScreen {
                 Hint::new(HintKey::Back, "Done"),
             ];
         }
-        // The strip has the focus (a D-pad-only remote's tab path): say what the D-pad does
-        // up here, not what the rows would do.
+        // Strip-focused: hints describe the D-pad, not the rows.
         if self.strip_focus {
             return vec![
                 Hint::new(HintKey::Adjust, "Section"),
@@ -847,7 +734,6 @@ impl SettingsScreen {
             ];
         }
         let ids = self.row_ids(ctx);
-        // The shoulders always change section, so that hint leads on every row.
         let mut hints = vec![Hint::new(HintKey::Shoulders, "Section")];
         hints.extend(match ids.get(self.list.cursor) {
             Some(RowId::Profile(_)) => vec![
@@ -859,12 +745,10 @@ impl SettingsScreen {
                 Hint::new(HintKey::Confirm, "Open"),
                 Hint::new(HintKey::Back, "Done"),
             ],
-            // Dimmed under PyroWave (row_spec): offering "Adjust" on an inert row would
-            // teach a control that answers with a thud.
+            // Inert under PyroWave (`row_spec`): no Adjust hint.
             Some(RowId::Bitrate) if ctx.settings.codec == "pyrowave" => {
                 vec![Hint::new(HintKey::Back, "Done")]
             }
-            // The one row with a value the ladder cannot name every version of.
             Some(RowId::Bitrate) => vec![
                 Hint::new(HintKey::Adjust, "Adjust"),
                 Hint::new(HintKey::Secondary, "Type a rate"),
@@ -888,8 +772,7 @@ impl SettingsScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
-        // The tab strip takes the top band, the focused row's explainer a reserved band
-        // under the list; the rows get what's between.
+        // Strip on top, explainer under the list; rows get the band between.
         let detail_h = 34.0 * k;
         let strip_h = TAB_STRIP_H * k;
         let labels: Vec<&str> = TABS.iter().map(|(name, _)| *name).collect();
@@ -923,8 +806,7 @@ impl SettingsScreen {
             .iter()
             .map(|id| row_spec(*id, ctx, &self.profiles))
             .collect();
-        // While the field is open the Bitrate row IS the field: it shows the digits typed so
-        // far and carries the caret, so the value being edited is where the value lives.
+        // Field-open: the Bitrate row shows the typed digits and the caret.
         if let (Some(text), Some(i)) = (
             self.custom_bitrate.as_ref(),
             ids.iter().position(|id| *id == RowId::Bitrate),
@@ -944,7 +826,7 @@ impl SettingsScreen {
             fonts,
             k,
             dt,
-            // The rows rest their focus ring while the keyboard tray or the strip holds it.
+            // No row focus ring while the tray or the strip holds it.
             self.custom_bitrate.is_none() && !self.strip_focus,
         );
         let detail = ids
@@ -974,22 +856,10 @@ impl SettingsScreen {
     }
 }
 
-/// Whether a row is OFFERED at all, as opposed to offered-but-inert.
+/// Whether this platform has the row at all.
 ///
-/// The two are a real distinction. Echo cancellation and the pad rows follow a switch the user
-/// can see a line or two above them, so dimming them shows the relationship — dropping them
-/// would just make settings appear and disappear as the switch flips. The smoothness buffer is
-/// different: it is not a sub-setting of a switch, it is a knob on ONE of two intents, and
-/// under Lowest latency it names a quantity that doesn't exist. Every other settings surface —
-/// the GTK and WinUI shells, the Apple touch/tvOS screens, the Android touch screen — hides it
-/// there. This screen was the lone exception because its row list was fixed; it is rebuilt from
-/// this filter each frame now, and the row it drops sits directly BELOW the row that drops it,
-/// so the cursor is never under anything that moves.
-/// Which platform HAS a row (design android-skia-console-port.md D3). The tables above are
-/// one union so a setting is found under the same word on every client; a row that names a
-/// concept the platform does not have — a decoder picker, vsync, fullscreen-on-stream, the
-/// keyboard-shortcut grab — is simply absent there, never a control that changes nothing.
-/// The desktop shows everything, exactly as before there was a second platform.
+/// [`TABS`] is the union so a setting sits under the same word on every client.
+/// A concept the platform does not have is absent, never a no-op control.
 fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
     use crate::platform::Platform;
     let android_only = matches!(
@@ -1021,36 +891,33 @@ fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
     }
 }
 
+/// Offered this frame, as opposed to offered-but-inert.
+///
+/// Echo cancel and pad rows dim under a parent switch so the relationship stays
+/// visible. Smoothness buffer is a knob on one of two intents — under Lowest
+/// latency the quantity does not exist, so the row is dropped. It sits directly
+/// below the intent row so the cursor is never on a row that vanishes.
 fn row_applies(id: RowId, ctx: &Ctx) -> bool {
     match id {
         RowId::SmoothBuffer => ctx.settings.present_priority == "smooth",
-        // The console-off switch needs somewhere for "off" to land: only clients with a
-        // fallback interface (an Android phone/tablet's touch shell) get the row — on a TV
-        // this console is the only UI, and off would strand the user (the touch settings'
-        // subtitle even promises "A TV always uses it").
+        // Needs `fallback_ui`; otherwise off strands the user with no UI.
         RowId::GamepadUi => ctx.fallback_ui,
-        // The same two conditions the mode decides anything under: a TV is in console mode
-        // whatever the mode says (`GamepadUi.kt`: the tv term alone satisfies the OR), and
-        // while the switch above is off nothing fronts the console at all. Hidden rather
-        // than dimmed, like the touch screen's picker, and it sits directly below the row
-        // that drops it so the cursor is never under anything that moves.
+        // Hidden unless fallback_ui and the switch above is on. Sits below that
+        // switch so the cursor is never on a row that vanishes. A TV is always
+        // console (`GamepadUi.kt`: the tv term alone satisfies the OR).
         RowId::GamepadUiMode => {
             ctx.fallback_ui && extra_bool(ctx.settings, android_keys::GAMEPAD_UI, true)
         }
-        // Availability, not platform: the row exists wherever the embedding binary actually
-        // publishes a desktop theme (today: the session binary on Omarchy), and a platform
-        // that starts publishing needs no edit here.
+        // `os_theme::available()`, not platform: a new publisher needs no edit here.
         RowId::FollowOsTheme => crate::os_theme::available(),
-        // Hidden while the system theme rules it — the GamepadUiMode pattern above: gone,
-        // not dimmed, and the row that drops it sits directly above where it was.
+        // Hidden while follow_os_theme; sits below the switch that drops it.
         RowId::Palette => !(ctx.settings.follow_os_theme && crate::os_theme::available()),
         _ => true,
     }
 }
 
 fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
-    // The Profiles section: name + how many hosts pin it (counted from the live rows, so
-    // it reflects what the carousel shows). Read-only here beyond opening the pin screen.
+    // Pin count from live host rows, matching the carousel.
     match id {
         RowId::Profile(i) => {
             let (pid, name) = &profiles[i];
@@ -1086,36 +953,15 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
         _ => {}
     }
     let s = &ctx.settings;
-    // Three rows follow a switch a line or two above them: echo cancellation only means
-    // anything while the mic streams, the audio format only while the stream is stereo, and
-    // the pad rows only while any controller is forwarded at all. All go dim and inert
-    // otherwise — the same relationship the desktop shells draw by greying a row out, and
-    // dimming (not dropping) is what shows the relationship. The smoothness buffer used to be
-    // listed here too; it is dropped from the list instead now — see [`row_applies`] for why
-    // that one is different.
+    // Dim under a parent switch (relationship stays visible). Smoothness buffer
+    // is dropped instead — see [`row_applies`].
     let enabled = match id {
         RowId::EchoCancel => s.mic_enabled,
-        // PyroWave is always Automatic bitrate (ABR overhaul RFC §5.2): the session sends 0
-        // whatever this row stores and the host pins a per-mode bpp rate. Dimmed, not live —
-        // a control that changes nothing must say so. The stored rate is kept: switching the
-        // codec back restores it.
+        // PyroWave ignores stored bitrate (session sends 0). Dim; keep the value.
         RowId::Bitrate => s.codec != "pyrowave",
-        // ⚠ Lossless follows the channel count for a reason that has MOVED, and the old reason
-        // is still written down in several places that are now wrong (`hi-res-audio.md` §4.2's
-        // blanket "surround does not fit a datagram", and `trust::Settings::audio_format`'s doc
-        // quoting it). The HOST's `channels != 2` decline is deleted: `pcm::frame_us_for` is
-        // channel-aware, so 48 kHz/24-bit 5.1 and 7.1 simply negotiate a SHORTER frame and fit
-        // an ordinary datagram — only 96 kHz surround has nowhere left on the ladder. The Apple
-        // and Android console screens dropped their gates on the strength of that, and this row
-        // would too if it could.
-        //
-        // It cannot, yet: `pf_client_core::session` still filters `audio_channels != 2` out of
-        // the request BEFORE it reaches the wire, so a lossless choice made here under 5.1/7.1
-        // is never even asked for — the session logs "lossless audio is stereo-only" and runs
-        // Opus. A live row would be a control that changes nothing, which is exactly the lie
-        // this screen dims rows to avoid, and it would also disagree with the GTK dialog
-        // reading the same settings file on this same machine. Delete this arm when that
-        // client-side filter learns the frame ladder — not before.
+        // Session still drops lossless unless `audio_channels == 2` (before the wire).
+        // A live row under surround would change nothing. Delete this arm when that
+        // filter learns the frame ladder — not before.
         RowId::AudioFormat => s.audio_channels == 2,
         RowId::Pad
         | RowId::PadType
@@ -1172,8 +1018,7 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             label_for(&COMPOSITORS, &s.compositor).into(),
         ),
         RowId::Codec => (None, "Video codec", label_for(&CODECS, &s.codec).into()),
-        // Migrated on the way in: a pre-M10 store holds `vulkan`/`vaapi`/`d3d11va`,
-        // which name no preset here and would otherwise render as "—".
+        // Migrate before lookup or a legacy store (`vulkan`/`vaapi`) shows "—".
         RowId::Decoder => (
             None,
             "Decoder",
@@ -1279,8 +1124,7 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             "Background",
             crate::library::palette(&s.ui_palette).name.into(),
         ),
-        // Phrased as the thing that is ON, not as the suppression, so "On" means the
-        // reduction is in effect — the same way every other toggle on this screen reads.
+        // Label is the reduction, so On means it is in effect.
         RowId::ReduceMotion => (None, "Reduce motion", on_off(s.reduce_motion).into()),
         RowId::ReduceUiResolution => (
             None,
@@ -1342,9 +1186,7 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
         ),
         RowId::GamepadUiMode => (
             None,
-            // The touch screen's word for the same picker, which now sits under the same
-            // switch it does there — "Controller UI" beside "Controller-optimized UI"
-            // would be two rows a reader has to tell apart by their tails.
+            // Not "Controller UI": that collides with the row above.
             "Show it",
             label_for(
                 &GAMEPAD_UI_MODES,
@@ -1371,9 +1213,7 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
     }
 }
 
-/// The focused row's one-line explainer. Takes the platform because two desktop rows
-/// advertise desktop-only live chords (Ctrl+Alt+Shift+…) that no Android build has — a
-/// shortcut the device cannot press must not be taught.
+/// One-line explainer. Platform so Android is not taught desktop-only chords.
 fn detail(id: RowId, ctx: &Ctx) -> &'static str {
     use crate::platform::Platform;
     let platform = ctx.platform;
@@ -1583,10 +1423,8 @@ fn detail(id: RowId, ctx: &Ctx) -> &'static str {
     }
 }
 
-/// A rate as the row says it: Mbps to a gigabit, Gbps above it, and a decimal only where
-/// dropping one would print two different rates the same way (12.5 Mbps, 1.5 Gbps). Rates
-/// off the ladder are real — the field below types them, and the desktop shells' free-form
-/// spinner has always been able to store one.
+/// Mbps below 1 Gbps, Gbps above. Decimal only when rounding would collide
+/// (12.5 Mbps, 1.5 Gbps). Off-ladder rates are real (typed field, desktop spinner).
 fn bitrate_label(kbps: u32) -> String {
     let unit = |v: f64, suffix: &str| {
         if (v - v.round()).abs() < 0.05 {
@@ -1618,13 +1456,8 @@ fn label_for<'a>(options: &'a [(&str, &'a str)], value: &str) -> &'a str {
         .map_or("—", |(_, l)| l)
 }
 
-/// The label for a stored `audio_format` value — [`label_for`] with a different miss, on purpose.
-///
-/// An unrecognized value is not a corrupt one here: the key travels verbatim through a profile
-/// catalog shared with the Apple and Android clients, so a rung a NEWER client offers can land in
-/// this file. The session resolves anything it doesn't know to Opus
-/// (`pf_client_core::audio_format::audio_format_wire`), so the row says Opus too. `label_for`'s "—"
-/// would name a format no session on this box will ever run.
+/// Label for a stored `audio_format`. Unknown → Opus (what the session runs), not
+/// [`label_for`]'s "—": a shared catalog can carry a newer client's rung.
 fn audio_format_label(value: &str) -> &'static str {
     AUDIO_FORMATS
         .iter()
@@ -1633,15 +1466,14 @@ fn audio_format_label(value: &str) -> &'static str {
         .map_or("", |(_, l)| *l)
 }
 
-/// Step (`wrap=false`, clamped — false = boundary) or cycle (`wrap=true`) a row's
-/// value. Toggles read left = off, right = on; a no-op is a boundary.
+/// Step (`wrap=false`, clamp; `None` = boundary) or cycle (`wrap=true`).
+/// Toggles: left = off, right = on. A no-op is a boundary.
 fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
     let s = &mut *ctx.settings;
     match id {
         RowId::Resolution => {
-            // The D1 tri-state as one picker: Native, Match window, then the explicit
-            // sizes (RESOLUTIONS keeps its (0,0) = Native head; Match window is the
-            // virtual index 1, stored as the `match_window` flag with w/h cleared).
+            // Native, Match window, then sizes. Match window is virtual index 1
+            // (`match_window` flag, w/h cleared); RESOLUTIONS[0] is Native.
             let cur = if s.match_window {
                 Some(1)
             } else {
@@ -1660,27 +1492,22 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             step_option(cur, REFRESH.len(), delta, wrap).map(|i| s.refresh_hz = REFRESH[i])
         }
         RowId::RenderScale => {
-            // Exact float compare is fine: every writer (here and the desktop pickers)
-            // stores one of these literals; a hand-edited oddball snaps to the first step.
+            // Writers store these literals; a hand-edited oddball snaps to the first step.
             let cur = RENDER_SCALES.iter().position(|v| *v == s.render_scale);
             step_option(cur, RENDER_SCALES.len(), delta, wrap)
                 .map(|i| s.render_scale = RENDER_SCALES[i])
         }
         RowId::Bitrate => {
-            // Inert under PyroWave — a boundary thud, matching what the dimmed row shows
-            // (the host pins the rate; see `row_spec`).
+            // Inert under PyroWave (host pins the rate; see `row_spec`).
             if s.codec == "pyrowave" {
                 return false;
             }
-            // A typed rate (or one a desktop shell's spinner stored) sits BETWEEN rungs, and
-            // the generic step snaps a value it cannot find to the first option — which here
-            // is Automatic, i.e. one nudge throws the custom rate away. Step to the rung the
-            // thumb is heading for instead.
+            // Off-ladder must not snap to Automatic (index 0). Step to the neighbour
+            // the thumb is heading for.
             let stepped = match BITRATES.iter().position(|b| *b == s.bitrate_kbps) {
                 Some(i) => step_option(Some(i), BITRATES.len(), delta, wrap),
                 None if delta < 0 => BITRATES.iter().rposition(|b| *b < s.bitrate_kbps),
-                // Above the top rung there is nothing higher to step to; A (which wraps) still
-                // comes back round to Automatic.
+                // Above the ceiling: wrap goes to Automatic; clamp thuds.
                 None => BITRATES
                     .iter()
                     .position(|b| *b > s.bitrate_kbps)
@@ -1691,9 +1518,7 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         RowId::Compositor => step_str(&COMPOSITORS, &mut s.compositor, delta, wrap),
         RowId::Codec => step_str(&CODECS, &mut s.codec, delta, wrap),
         RowId::Decoder => {
-            // …and on the way in here too, or stepping from a legacy value would start
-            // from "not found" and jump to the first/last entry instead of the neighbour
-            // of what the user actually has.
+            // Migrate first or a legacy value jumps to first/last instead of its neighbour.
             s.decoder = pf_client_core::decoder_pref::migrate_decoder_pref(&s.decoder);
             step_str(&DECODERS, &mut s.decoder, delta, wrap)
         }
@@ -1707,10 +1532,8 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             step_option(cur, PRESENT_PRIORITIES.len(), delta, wrap)
                 .map(|i| s.present_priority = PRESENT_PRIORITIES[i].0.to_string())
         }
-        // Under Lowest latency the row isn't offered at all ([`row_applies`]), so this branch
-        // is only reachable if another writer flipped the intent between the frame that built
-        // the list and the keypress that lands here — a boundary thud, not a stored value
-        // nothing will read.
+        // Not offered under latency ([`row_applies`]). Reachable only if another
+        // writer flipped intent between list-build and this keypress: thud, don't store.
         RowId::SmoothBuffer => {
             if s.present_priority == "smooth" {
                 let cur = SMOOTH_BUFFERS
@@ -1728,9 +1551,7 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             let cur = AUDIO.iter().position(|(v, _)| *v == s.audio_channels);
             step_option(cur, AUDIO.len(), delta, wrap).map(|i| s.audio_channels = AUDIO[i].0)
         }
-        // Inert under surround — a boundary thud, matching what the dimmed row shows. The gate is
-        // this client's own request filter rather than anything about the plane; the `enabled`
-        // note in `row_spec` is where that is written down, and where it gets deleted.
+        // Inert under surround (this client's request filter; see `row_spec`).
         RowId::AudioFormat => {
             if s.audio_channels == 2 {
                 step_str(AUDIO_FORMATS, &mut s.audio_format, delta, wrap)
@@ -1740,7 +1561,6 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         }
         RowId::KeepHostAudio => toggle(&mut s.keep_host_audio, delta, wrap),
         RowId::Mic => toggle(&mut s.mic_enabled, delta, wrap),
-        // Inert while the mic is off — a boundary thud, matching what the dimmed row shows.
         RowId::EchoCancel => {
             if s.mic_enabled {
                 toggle(&mut s.echo_cancel, delta, wrap)
@@ -1753,7 +1573,7 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             if !s.gamepad_forwarding {
                 return false;
             }
-            // Automatic first, then every connected pad by stable key.
+            // Automatic first, then connected pads by stable key.
             let keys: Vec<String> = std::iter::once(String::new())
                 .chain(ctx.pads.iter().map(|p| p.key.clone()))
                 .collect();
@@ -1788,9 +1608,7 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             if !s.gamepad_forwarding {
                 return false;
             }
-            // On/Off over the stored string, the way the GTK switch edits the same key: a
-            // stored "mix" reads as Off (it renders as off today) and any step writes the
-            // two values that do something.
+            // `"mix"` reads Off; a step writes only `"pad"` / `"off"`.
             let mut on = pad_speaker_on(&s.pad_speaker);
             toggle(&mut on, delta, wrap)
                 .map(|()| s.pad_speaker = if on { "pad" } else { "off" }.to_string())
@@ -1848,7 +1666,7 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
                 );
             })
         }
-        // Navigation rows, handled before the settings path in `menu` — never a value edit.
+        // Navigation rows: handled in `apply_row` before the settings path.
         RowId::Profile(_)
         | RowId::NoProfiles
         | RowId::Controllers
@@ -1858,13 +1676,9 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
     .is_some()
 }
 
-/// The shared stepping rule: clamp when adjusting, wrap when cycling; an unknown
-/// current value snaps to the first option on any step.
+/// Clamp when adjusting, wrap when cycling. Unknown current value snaps to first.
 ///
-/// Reachable from the sibling screens because the library's own view/sort bar edits two of
-/// the very values this screen's rows edit, and "◀ ▶ stops at the ends" is a grammar the
-/// console states once. A second copy of it there would be a second place for the boundary
-/// thud to go missing.
+/// `pub(super)` so the library view/sort bar shares the boundary thud.
 pub(super) fn step_option(
     current: Option<usize>,
     len: usize,
@@ -1900,21 +1714,14 @@ fn toggle(value: &mut bool, delta: i32, wrap: bool) -> Option<()> {
     }
 }
 
-// `pub(crate)`, not `pub(super)`: the shell's tests live outside `screens` and share
-// `fake_home` from here — the whole point of there being one copy.
+// `pub(crate)` so shell tests outside `screens` share `fake_home`.
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use pf_client_core::trust::Settings;
 
-    /// The section names, against the shared vectors. The comment above [`TABS`] claims a setting
-    /// is found under the same word on every client; this is what makes that claim checkable.
-    ///
-    /// The desktop has one tab the mobile clients do not — Input, holding touch mode, mouse,
-    /// invert-scroll and shortcuts, which are desktop-host settings with nothing to set on a phone
-    /// or a TV. The vectors model it with a `desktop_only` flag rather than omitting it, because a
-    /// flat six-name list would red this test on day one and a seven-name list would red both
-    /// mobile clients: the disagreement is real and belongs in the contract, not in prose.
+    /// Tab names vs `console-vectors.json`. Input is `desktop_only` in the vectors:
+    /// omitting it would fail this test; a seven-name list would fail the mobile clients.
     #[test]
     fn tab_names_match_the_shared_vectors() {
         let raw = include_str!("../../../../clients/shared/console-vectors.json");
@@ -1934,17 +1741,11 @@ pub(crate) mod tests {
         (Settings::default(), Vec::new())
     }
 
-    /// Point the settings store at a throwaway config dir. `apply_row` rebases on the FILE
-    /// before a mutating press and saves after it, so a test driving that path against the
-    /// real profile would rewrite the developer's own console settings.
+    /// Throwaway config dir. `apply_row` rebases on the file, so a test against
+    /// the real profile would rewrite the developer's settings.
     ///
-    /// Redirects whichever var `trust::config_dir` actually reads here: `HOME` on unix,
-    /// `APPDATA` on Windows. Setting only `HOME` redirected nothing on Windows — every test
-    /// wrote the machine's real `%APPDATA%\punktfunk` file and raced the others through it.
-    ///
-    /// Shared with the shell and library screen tests, which drive the same `Settings::save`:
-    /// one `OnceLock` for the whole binary is what keeps the write to the environment sound,
-    /// and a second copy of this would be exactly the race the SAFETY note below rules out.
+    /// Redirects `HOME` on unix, `APPDATA` on Windows (`trust::config_dir`).
+    /// One `OnceLock` for the binary — a second copy races `set_var`.
     pub(crate) fn fake_home() {
         use std::sync::OnceLock;
         static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
@@ -1952,18 +1753,15 @@ pub(crate) mod tests {
             let dir = std::env::temp_dir().join(format!("pf-settings-test-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let var = if cfg!(windows) { "APPDATA" } else { "HOME" };
-            // SAFETY: runs at most once, inside `get_or_init` — concurrent `fake_home` callers
-            // block until it returns, and nothing else in this binary mutates it. (The old
-            // set after the closure ran on EVERY call, so two parallel tests could race the
-            // write; setting once under the OnceLock is what makes this sound.)
+            // SAFETY: runs at most once, inside `get_or_init` — concurrent `fake_home`
+            // callers block until it returns, and nothing else in this binary mutates
+            // the env var.
             unsafe { std::env::set_var(var, &dir) };
             dir
         });
     }
 
-    /// Render the screen once so its strip and list carry real geometry, then hand back a
-    /// pointer aimed at the centre of `rect`. Hit-testing reads what was DRAWN, so a test
-    /// that skipped the render would be testing nothing.
+    /// Draw once so hit-testing reads real strip/list geometry.
     fn rendered(screen: &mut SettingsScreen) -> f64 {
         let fonts = crate::theme::build_fonts().unwrap();
         let (w, h) = (1280i32, 800i32);
@@ -2020,8 +1818,6 @@ pub(crate) mod tests {
         f(&mut ctx);
     }
 
-    /// The bug this all started from: the tabs answered the shoulder buttons and nothing
-    /// else, so a mouse or a touchscreen could not change section at all.
     #[test]
     fn a_press_on_a_pill_selects_that_tab() {
         let mut s = SettingsScreen::with_profiles(Vec::new());
@@ -2039,7 +1835,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// …and each tab still keeps its own cursor when a POINTER is what switched it.
     #[test]
     fn a_pressed_tab_restores_that_tabs_cursor() {
         let mut s = SettingsScreen::with_profiles(Vec::new());
@@ -2060,8 +1855,6 @@ pub(crate) mod tests {
         assert_eq!(s.list.cursor, 2, "coming back lands where it was left");
     }
 
-    /// A press on a row focuses AND activates it — one click changes the value, the way a
-    /// row that is its own control should behave.
     #[test]
     fn a_press_on_a_row_focuses_and_cycles_it() {
         fake_home();
@@ -2069,7 +1862,7 @@ pub(crate) mod tests {
         rendered(&mut s);
         let first = s.list.row_rect(0).expect("the list drew its rows");
         let (mut settings, pads) = ctx_parts();
-        settings.save(); // seat the fake HOME's file — `apply_row` rebases on it
+        settings.save(); // seat the fake HOME file — `apply_row` rebases on it
         let library = crate::library::LibraryShared::default();
         let mut ctx = Ctx {
             hosts: &[],
@@ -2083,8 +1876,6 @@ pub(crate) mod tests {
             device_name: "t",
             t: 0.0,
         };
-        // Row 0 of the leading tab is Resolution, whose first step is Native → Match
-        // window: one field, one unambiguous effect to assert on.
         assert_eq!(s.row_ids(&ctx)[0], RowId::Resolution);
         let mut fx = Outbox::default();
         assert!(!ctx.settings.match_window);
@@ -2096,8 +1887,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// A press that lands on neither a pill nor a row is refused, so the shell can let it
-    /// fall through rather than swallowing every stray click.
     #[test]
     fn a_press_on_empty_space_is_not_consumed() {
         let mut s = SettingsScreen::with_profiles(Vec::new());
@@ -2113,10 +1902,7 @@ pub(crate) mod tests {
         });
     }
 
-    /// The controller-audio rows: they follow the forwarding switch like every other pad
-    /// row, and the speaker row edits the stored STRING exactly the way the GTK switch
-    /// over the same key does — a stored "mix" (the declared TODO that renders as off)
-    /// reads as Off, and any step writes only the two values that do something.
+    /// Speaker row: stored `"mix"` reads Off; a step writes only `"pad"` / `"off"`.
     #[test]
     fn controller_audio_rows_follow_forwarding_and_speak_the_gtk_dialect() {
         let (mut settings, pads) = ctx_parts();
@@ -2133,7 +1919,6 @@ pub(crate) mod tests {
             device_name: "t",
             t: 0.0,
         };
-        // Defaults: haptics on, speaker on the pad.
         assert!(ctx.settings.pad_haptics);
         assert_eq!(ctx.settings.pad_speaker, "pad");
         assert!(adjust(RowId::PadHaptics, 1, true, &mut ctx));
@@ -2142,11 +1927,9 @@ pub(crate) mod tests {
         assert_eq!(ctx.settings.pad_speaker, "off");
         assert!(adjust(RowId::PadSpeaker, 1, true, &mut ctx));
         assert_eq!(ctx.settings.pad_speaker, "pad");
-        // A stored "mix" reads as Off and steps onto a value that works.
         ctx.settings.pad_speaker = "mix".into();
         assert!(adjust(RowId::PadSpeaker, 1, true, &mut ctx));
         assert_eq!(ctx.settings.pad_speaker, "pad");
-        // Forwarding off parks both, like the sibling pad rows.
         ctx.settings.gamepad_forwarding = false;
         assert!(!adjust(RowId::PadHaptics, 1, true, &mut ctx));
         assert!(!adjust(RowId::PadSpeaker, 1, true, &mut ctx));
@@ -2168,8 +1951,7 @@ pub(crate) mod tests {
             device_name: "t",
             t: 0.0,
         };
-        // Resolution starts at Native (index 0): left refuses, right steps — first onto
-        // Match window (the D1 tri-state's middle option), then the explicit sizes.
+        // Native (index 0): left refuses; right is Match window, then sizes.
         assert!(!adjust(RowId::Resolution, -1, false, &mut ctx));
         assert!(adjust(RowId::Resolution, 1, false, &mut ctx));
         assert!(ctx.settings.match_window, "Native → Match window");
@@ -2180,13 +1962,11 @@ pub(crate) mod tests {
             "explicit size clears the policy"
         );
         assert_eq!((ctx.settings.width, ctx.settings.height), (1280, 720));
-        // Stepping back from an explicit size returns to Match window, then Native.
         assert!(adjust(RowId::Resolution, -1, false, &mut ctx));
         assert!(ctx.settings.match_window);
         assert!(adjust(RowId::Resolution, -1, false, &mut ctx));
         assert!(!ctx.settings.match_window);
         assert_eq!(ctx.settings.width, 0, "back to Native");
-        // Cycle from the last option wraps to the first.
         (ctx.settings.width, ctx.settings.height) = (3840, 2160);
         assert!(adjust(RowId::Resolution, 1, true, &mut ctx));
         assert_eq!(ctx.settings.width, 0, "wrapped to Native");
@@ -2220,9 +2000,6 @@ pub(crate) mod tests {
         assert!(!ctx.settings.mic_enabled);
     }
 
-    /// Echo cancellation follows the microphone: inert and dimmed while the mic is off, live
-    /// the moment it goes on. A row that silently accepted a change nobody could act on would
-    /// be the same lie as an enabled-looking control.
     #[test]
     fn echo_cancellation_follows_the_microphone() {
         let (mut settings, pads) = ctx_parts();
@@ -2257,9 +2034,6 @@ pub(crate) mod tests {
         assert!(ctx.settings.echo_cancel);
     }
 
-    /// Bitrate follows the codec: dimmed and inert under PyroWave (the host pins a per-mode
-    /// rate and the session sends 0 — ABR overhaul RFC §5.2), live for every other codec,
-    /// and the stored rate survives the dim so switching back restores it.
     #[test]
     fn bitrate_dims_under_pyrowave() {
         let (mut settings, pads) = ctx_parts();
@@ -2291,10 +2065,6 @@ pub(crate) mod tests {
         assert!(adjust(RowId::Bitrate, 1, false, &mut ctx));
     }
 
-    /// The smoothness buffer is OFFERED only under Smoothness — under Lowest latency it names
-    /// a quantity that doesn't exist, so the row is gone from the Video tab rather than sitting
-    /// there dimmed. This is what the GTK and WinUI shells and the Apple/Android screens have
-    /// always done; this screen was the exception until its row list stopped being fixed.
     #[test]
     fn smoothness_buffer_is_offered_only_under_smoothness() {
         let (mut settings, pads) = ctx_parts();
@@ -2324,14 +2094,12 @@ pub(crate) mod tests {
             "latency hides the buffer row: {video:?}"
         );
         assert!(video.contains(&RowId::PresentPriority), "the intent stays");
-        // Even reached out of band it writes nothing — the list it came from is a frame old.
         assert!(
             !adjust(RowId::SmoothBuffer, 1, false, &mut ctx),
             "latency intent = thud"
         );
         assert_eq!(ctx.settings.smooth_buffer, 0, "and nothing was written");
 
-        // Stepping the intent to Smoothness brings the row into the list, directly under it.
         assert!(adjust(RowId::PresentPriority, 1, false, &mut ctx));
         assert_eq!(ctx.settings.present_priority, "smooth");
         let video = s.row_ids(&ctx);
@@ -2348,8 +2116,6 @@ pub(crate) mod tests {
         assert!(adjust(RowId::SmoothBuffer, 1, false, &mut ctx));
         assert_eq!(ctx.settings.smooth_buffer, 1);
 
-        // The intent wraps back and the row leaves again — with the cursor parked on the
-        // intent row, which is where a user who just stepped it necessarily is.
         s.list.cursor = intent;
         assert!(adjust(RowId::PresentPriority, -1, false, &mut ctx));
         assert_eq!(ctx.settings.present_priority, "latency");
@@ -2362,13 +2128,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// A cursor parked past the end of a list that shrank underneath it is pulled back rather
-    /// than indexed with — the console must not panic because another writer changed the
-    /// presentation intent while its settings screen was open.
+    /// Cursor past a list that shrank: pull back, do not index. Another writer can
+    /// flip presentation intent while this screen is open.
     #[test]
     fn a_shrinking_list_pulls_the_cursor_back() {
-        // `apply_row` rebases on the FILE before acting, so this has to be seated — and
-        // seated with the SHRUNKEN list's intent, which is the state being tested.
+        // Seat the FILE with the shrunken list: `apply_row` rebases on it.
         fake_home();
         let (mut settings, pads) = ctx_parts();
         settings.present_priority = "latency".into();
@@ -2392,10 +2156,8 @@ pub(crate) mod tests {
             .iter()
             .position(|(name, _)| *name == "Video")
             .expect("the Video tab");
-        // Park on the last row while the buffer row is still there…
         s.list.cursor = s.row_ids(&ctx).len() - 1;
         let parked = s.list.cursor;
-        // …then take it away behind the screen's back, as a desktop shell would.
         ctx.settings.present_priority = "latency".into();
         let mut fx = Outbox::default();
         let pulse = s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
@@ -2421,7 +2183,6 @@ pub(crate) mod tests {
             device_name: "t",
             t: 0.0,
         };
-        // Trackpad → Pointer → Touch, then a step past the end is a boundary.
         assert!(
             !adjust(RowId::Touch, -1, false, &mut ctx),
             "already first = thud"
@@ -2431,7 +2192,6 @@ pub(crate) mod tests {
         assert!(adjust(RowId::Touch, 1, false, &mut ctx));
         assert_eq!(ctx.settings.touch_mode, "touch");
         assert!(!adjust(RowId::Touch, 1, false, &mut ctx), "last = thud");
-        // A wraps back to the first.
         assert!(adjust(RowId::Touch, 1, true, &mut ctx));
         assert_eq!(ctx.settings.touch_mode, "trackpad");
     }
@@ -2453,7 +2213,6 @@ pub(crate) mod tests {
             device_name: "t",
             t: 0.0,
         };
-        // Capture → Desktop, then a step past the end is a boundary.
         assert!(
             !adjust(RowId::Mouse, -1, false, &mut ctx),
             "already first = thud"
@@ -2461,15 +2220,11 @@ pub(crate) mod tests {
         assert!(adjust(RowId::Mouse, 1, false, &mut ctx));
         assert_eq!(ctx.settings.mouse_mode, "desktop");
         assert!(!adjust(RowId::Mouse, 1, false, &mut ctx), "last = thud");
-        // A wraps back to the first.
         assert!(adjust(RowId::Mouse, 1, true, &mut ctx));
         assert_eq!(ctx.settings.mouse_mode, "capture");
     }
 
-    /// A rate that is not a rung — typed on the row, or stored by a desktop shell's
-    /// free-form spinner — steps to its NEIGHBOUR. Every other picker here snaps an
-    /// unrecognised value to its first option, which on this row is Automatic: one nudge
-    /// would throw away the exact rate the user went to the trouble of typing.
+    /// Off-ladder must not snap to Automatic (index 0). Step to the neighbour.
     #[test]
     fn an_off_ladder_rate_steps_to_its_neighbour() {
         let (mut settings, pads) = ctx_parts();
@@ -2492,24 +2247,18 @@ pub(crate) mod tests {
         ctx.settings.bitrate_kbps = 12_345;
         assert!(adjust(RowId::Bitrate, -1, false, &mut ctx));
         assert_eq!(ctx.settings.bitrate_kbps, 12_000, "the rung below");
-        // The ends still thud rather than wrap under left/right.
         ctx.settings.bitrate_kbps = 2_000_000;
         assert!(!adjust(RowId::Bitrate, 1, false, &mut ctx), "the ceiling");
-        // …and a rung it does know steps as it always did.
         ctx.settings.bitrate_kbps = 5_000;
         assert!(adjust(RowId::Bitrate, -1, false, &mut ctx));
         assert_eq!(ctx.settings.bitrate_kbps, 4_000);
     }
 
-    /// The typed rate: Y opens the field on the Bitrate row (and nowhere else), digits land
-    /// in it, and closing stores what was typed — clamped to the ceiling, because four
-    /// digits can ask for 9999 Mbps and no client should send that.
     #[test]
     fn a_typed_bitrate_is_stored_and_clamped() {
         let (mut settings, pads) = ctx_parts();
         let library = crate::library::LibraryShared::default();
-        // A snapshot store, not the file one: this test SAVES, and a unit test must not
-        // rewrite the machine's real settings file to prove it.
+        // Snapshot, not the file store: this test saves.
         let store = crate::store::SnapshotStore::new(settings.clone(), Vec::new());
         let mut ctx = Ctx {
             hosts: &[],
@@ -2532,25 +2281,23 @@ pub(crate) mod tests {
             .expect("the bitrate row");
         s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
         assert!(s.editing(), "Y opens the field");
-        s.text_input("13x7"); // digits only: the 'x' is refused, not typed
+        s.text_input("13x7"); // digits only: 'x' is refused
         assert!(s.edit_key(crate::input::Key::Return, &mut ctx));
         assert!(!s.editing(), "Return closes it");
         assert_eq!(ctx.settings.bitrate_kbps, 137_000);
 
         s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
-        s.text_input("99999"); // four digits fit; the fifth is refused
+        s.text_input("99999"); // four digits; the fifth is refused
         assert!(s.edit_key(crate::input::Key::Return, &mut ctx));
         assert_eq!(
             ctx.settings.bitrate_kbps, 2_000_000,
             "clamped to the ceiling"
         );
 
-        // An emptied field is an abandoned edit, not a request for Automatic.
         s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
         assert!(s.edit_key(crate::input::Key::Return, &mut ctx));
         assert_eq!(ctx.settings.bitrate_kbps, 2_000_000, "left alone");
 
-        // Y is the bitrate row's alone — on a neighbour it does nothing at all.
         s.list.cursor = 0;
         s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
         assert!(!s.editing());
@@ -2565,10 +2312,6 @@ pub(crate) mod tests {
         assert_eq!(bitrate_label(2_000_000), "2 Gbps");
     }
 
-    /// The Profiles section trails the settings rows: one row per catalog profile whose
-    /// value counts the pinned cards in the live model, activating opens the pin screen,
-    /// and left/right (which edits every other row) is a boundary — a profile row
-    /// navigates, it must never fall into the settings save path.
     #[test]
     fn profile_rows_navigate_instead_of_editing() {
         let (mut settings, pads) = ctx_parts();
@@ -2627,7 +2370,7 @@ pub(crate) mod tests {
         let spec = row_spec(RowId::Profile(1), &ctx, &s.profiles);
         assert_eq!(spec.value.as_deref(), Some("Not pinned"));
 
-        s.list.cursor = 0; // onto "Work"
+        s.list.cursor = 0;
         let mut fx = Outbox::default();
         s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
         assert!(
@@ -2646,8 +2389,6 @@ pub(crate) mod tests {
         assert!(fx.nav.is_none() && fx.cmds.is_empty());
     }
 
-    /// An empty catalog shows the explainer placeholder — present, inert, and dimmed —
-    /// so the section still tells the user where profiles come from.
     #[test]
     fn empty_catalog_shows_the_placeholder() {
         let (mut settings, pads) = ctx_parts();
@@ -2678,8 +2419,6 @@ pub(crate) mod tests {
         assert!(fx.nav.is_none());
     }
 
-    /// The quick-action row is an action row on every platform — the ring is edited on the
-    /// ring itself, not stepped here — and ◀ ▶ on it is never a value edit.
     #[test]
     fn the_quick_actions_row_opens_the_editor_and_steps_nothing() {
         let (mut settings, pads) = ctx_parts();
@@ -2709,11 +2448,6 @@ pub(crate) mod tests {
             .any(|(tab, rows)| *tab == "Input" && rows.contains(&RowId::QuickActions)));
     }
 
-    /// Every row the screen knows about must live in exactly one tab — a row missing from
-    /// [`TABS`] is a setting that became unreachable in Gaming Mode, which is precisely
-    /// what this screen exists to prevent.
-    /// The desktop row set is untouched by the platform split (the non-regression contract),
-    /// and Android drops exactly the desktop-only concepts — nothing else.
     #[test]
     fn platform_row_split_hides_only_the_other_platforms_concepts() {
         use crate::platform::Platform;
@@ -2721,8 +2455,6 @@ pub(crate) mod tests {
             .iter()
             .flat_map(|(_, rows)| rows.iter().copied())
             .collect();
-        // The desktop shows exactly what it showed before there was a second platform: the
-        // Android rows are the only ones missing there.
         let off_desktop: Vec<RowId> = all
             .iter()
             .copied()
@@ -2737,8 +2469,6 @@ pub(crate) mod tests {
                 RowId::Sc2Passthrough,
                 RowId::DsCapture,
                 RowId::Controllers,
-                // Between the Input tab's rows and the rest of Interface: this one sits under
-                // Reduce motion, which is earlier in that tab than the console-UI switch.
                 RowId::ReduceUiResolution,
                 RowId::GamepadUi,
                 RowId::GamepadUiMode,
@@ -2762,15 +2492,11 @@ pub(crate) mod tests {
                 RowId::Fullscreen,
             ]
         );
-        // Every row belongs to at least one platform.
         assert!(all
             .iter()
             .all(|id| row_on(*id, Platform::Desktop) || row_on(*id, Platform::Android)));
     }
 
-    /// The Android rows edit `Settings::extra` under their `android.*` keys and nothing
-    /// else — a toggle there must not touch a typed field, and a fresh store reads each row's
-    /// documented default.
     #[test]
     fn android_rows_live_in_extra() {
         with_ctx(|ctx| {
@@ -2787,32 +2513,24 @@ pub(crate) mod tests {
             assert!(extra_bool(ctx.settings, android_keys::GAMEPAD_UI, true));
             assert!(adjust(RowId::GamepadUi, 1, true, ctx));
             assert!(!extra_bool(ctx.settings, android_keys::GAMEPAD_UI, true));
-            // Only `extra` moved.
             let mut after = ctx.settings.clone();
             after.extra = before.extra.clone();
             assert_eq!(after, before);
         });
     }
 
-    /// The console-off switch exists only where there is a fallback interface for "off"
-    /// to land in, and the mode row under it only where the mode decides anything: not on
-    /// a TV (always console, whatever the mode says) and not while the switch is off.
     #[test]
     fn console_off_switch_needs_a_fallback_ui() {
         with_ctx(|ctx| {
             ctx.platform = crate::platform::Platform::Android;
-            // A TV: no off switch (it would strand the user), and no mode row either —
-            // `gamepadUiActive`'s tv term satisfies the OR on its own.
             assert!(
                 !row_applies(RowId::GamepadUi, ctx),
                 "a TV offers no off switch"
             );
             assert!(!row_applies(RowId::GamepadUiMode, ctx));
-            // A phone or tablet with the console on: both rows.
             ctx.fallback_ui = true;
             assert!(row_applies(RowId::GamepadUi, ctx));
             assert!(row_applies(RowId::GamepadUiMode, ctx));
-            // Switched off: the switch stays (it is the way back), the mode row goes.
             set_extra_bool(ctx.settings, android_keys::GAMEPAD_UI, false);
             assert!(row_applies(RowId::GamepadUi, ctx));
             assert!(
@@ -2831,30 +2549,18 @@ pub(crate) mod tests {
                 seen.push(*id);
             }
         }
-        // The pre-tab flat list, plus the palette row, the lossless-audio row, the
-        // reduce-motion row and the two controller-audio rows (haptics + speaker — the
-        // 2026-08 sweep found them bridged but unreachable) later passes added, minus the
-        // game-library toggle: this screen never read it, and the library is offered on any
-        // paired host now.
-        // 37 desktop rows (the daily-driver batch added 10-bit SDR and Keep host audio) +
-        // the ten Android-only ones (design android-skia-console-port.md D3): eight
-        // `extra`-backed settings and two platform-screen action rows + the quick-action
-        // ring's one action row (every platform; the editor is the ring itself).
-        // 49 = the 48 below plus the follow-system-theme switch (Omarchy).
         assert_eq!(seen.len(), 49, "{seen:?}");
         assert!(seen.contains(&RowId::FollowOsTheme));
         assert!(seen.contains(&RowId::Palette));
         assert!(seen.contains(&RowId::ReduceMotion));
         assert!(seen.contains(&RowId::ReduceUiResolution));
         assert!(seen.contains(&RowId::AudioFormat));
-        // The catalog rows belong to the trailing tab, which builds them at render time.
         assert!(TABS[PROFILES_TAB].1.is_empty());
         assert_eq!(TABS[PROFILES_TAB].0, "Profiles");
     }
 
-    /// ⚠ The ONE test in the crate that touches the process-wide `os_theme` slot — a
-    /// sibling anywhere would race it under libtest's parallel threads. It leaves the slot
-    /// cleared.
+    /// Only test that touches the process-wide `os_theme` slot. A sibling races
+    /// under libtest. Leaves the slot cleared.
     #[test]
     fn the_follow_system_row_exists_only_where_a_theme_is_published() {
         with_ctx(|ctx| {
@@ -2879,15 +2585,12 @@ pub(crate) mod tests {
                 "an unchanged publish is free"
             );
 
-            // The switch defaults ON — following the desk is the integration — so the
-            // moment a theme exists it rules, and the curated picker steps aside.
             assert!(row_applies(RowId::FollowOsTheme, ctx));
             assert!(
                 !row_applies(RowId::Palette, ctx),
                 "ruled by the system theme"
             );
 
-            // Off is the way back to the curated table.
             ctx.settings.follow_os_theme = false;
             assert!(row_applies(RowId::Palette, ctx));
 
@@ -2896,12 +2599,8 @@ pub(crate) mod tests {
         });
     }
 
-    /// The collections entry is a plain off-by-default toggle, and it sits directly under the
-    /// row that says what the library looks like — the two are one decision read in two
-    /// halves, and a user who wants the tiles goes looking beside the arrangement.
-    ///
-    /// Off by default matters more than the placement: this key decides where a deep link
-    /// lands, so an install that never opens this screen must keep the shelf it has.
+    /// Off by default: this key decides where a deep link lands, so an install
+    /// that never opens this screen must keep the shelf it has.
     #[test]
     fn the_collections_entry_sits_with_the_library_view_and_ships_off() {
         let (mut settings, pads) = ctx_parts();
@@ -2954,8 +2653,6 @@ pub(crate) mod tests {
         assert!(!ctx.settings.library_collections);
     }
 
-    /// L1/R1 wrap around the strip and each tab keeps its own cursor, so a detour into
-    /// another section doesn't lose your place.
     #[test]
     fn shoulders_cycle_tabs_and_keep_each_cursor() {
         let (mut settings, pads) = ctx_parts();
@@ -2975,28 +2672,22 @@ pub(crate) mod tests {
         let mut s = SettingsScreen::with_profiles(Vec::new());
         let mut fx = Outbox::default();
         assert_eq!(s.tab, 0);
-        s.list.cursor = 3; // "Bitrate", in Stream
+        s.list.cursor = 3; // Stream / Bitrate
         s.menu(MenuEvent::JumpForward, &mut ctx, &mut fx);
         assert_eq!(s.tab, 1);
         assert_eq!(s.list.cursor, 0, "a fresh tab starts at its first row");
-        s.list.cursor = 2; // "10-bit HDR", in Video
+        s.list.cursor = 2; // Video / 10-bit HDR
         s.menu(MenuEvent::JumpBack, &mut ctx, &mut fx);
         assert_eq!((s.tab, s.list.cursor), (0, 3), "Stream kept its place");
-        // Backwards off the first tab wraps to the last…
         s.menu(MenuEvent::JumpBack, &mut ctx, &mut fx);
         assert_eq!(s.tab, PROFILES_TAB);
-        // …whose (catalog-built) length clamps a remembered cursor that no longer fits.
         assert_eq!(s.list.cursor, 0);
         s.menu(MenuEvent::JumpForward, &mut ctx, &mut fx);
         assert_eq!(s.tab, 0);
-        // Switching sections is navigation, never a settings write.
         assert!(fx.nav.is_none() && fx.cmds.is_empty());
     }
 
-    /// A D-pad alone reaches every tab: Up from the top row steps onto the strip,
-    /// left/right travel it, Down drops back into the rows. This is the only tab path a
-    /// Chromecast/Google TV remote has — no shoulders, no Tab key — and it regressed to
-    /// "first tab only" when the rows were split across tabs.
+    /// TV remotes have no shoulders and no Tab key: Up from row 0 focuses the strip.
     #[test]
     fn dpad_alone_reaches_every_tab() {
         let (mut settings, pads) = ctx_parts();
@@ -3015,34 +2706,24 @@ pub(crate) mod tests {
         };
         let mut s = SettingsScreen::with_profiles(Vec::new());
         let mut fx = Outbox::default();
-        // Up from the top row focuses the strip instead of recoiling…
         assert_eq!(s.list.cursor, 0);
         s.menu(MenuEvent::Move(MenuDir::Up), &mut ctx, &mut fx);
         assert!(s.strip_focus, "Up from the top row lands on the strip");
-        // …right travels the ring…
         s.menu(MenuEvent::Move(MenuDir::Right), &mut ctx, &mut fx);
         assert_eq!(s.tab, 1);
         assert!(s.strip_focus, "switching keeps the strip focused");
         s.menu(MenuEvent::Move(MenuDir::Left), &mut ctx, &mut fx);
         s.menu(MenuEvent::Move(MenuDir::Left), &mut ctx, &mut fx);
         assert_eq!(s.tab, PROFILES_TAB, "the strip wraps like the shoulders do");
-        // …and Down returns to the rows of the tab that's showing.
         s.menu(MenuEvent::Move(MenuDir::Down), &mut ctx, &mut fx);
         assert!(!s.strip_focus, "Down drops back into the list");
-        // While the list has focus, Left/Right still adjust rows — only the top row's Up
-        // reaches the strip, so a value row's chevrons keep meaning what they say.
         s.menu(MenuEvent::Move(MenuDir::Down), &mut ctx, &mut fx);
         assert!(!s.strip_focus);
-        // Focusing the strip is navigation, never a settings write.
         assert!(fx.nav.is_none() && fx.cmds.is_empty());
     }
 
-    /// The lossless opt-in: it ships OFF, steps the cross-client table verbatim, sits directly
-    /// under the channel count, and follows it — dim and inert under 5.1/7.1, because this
-    /// client's session refuses to ASK for lossless surround (see the `enabled` note in
-    /// [`row_spec`]; the host's own decline is gone). Every value is asserted against
-    /// `pf_client_core::audio_format`'s constants rather than restated, so a spelling change there
-    /// reds this test instead of quietly making the console write a key nobody reads.
+    /// Assert against `audio_format` constants so a spelling change there reds this
+    /// instead of writing a key nobody reads. Dim under surround: see [`row_spec`].
     #[test]
     fn audio_format_ships_off_and_follows_the_channel_count() {
         use pf_client_core::audio_format::{AUDIO_FORMAT_LOSSLESS_48, AUDIO_FORMAT_LOSSLESS_96};
@@ -3078,7 +2759,6 @@ pub(crate) mod tests {
             "the row sits directly under the one that dims it, like every other pair here"
         );
 
-        // Steps the shared table in order, clamping at both ends…
         assert!(
             !adjust(RowId::AudioFormat, -1, false, &mut ctx),
             "already Opus = thud"
@@ -3091,12 +2771,9 @@ pub(crate) mod tests {
             !adjust(RowId::AudioFormat, 1, false, &mut ctx),
             "last = thud"
         );
-        // …and A wraps home, so every rung is reachable one-handed.
         assert!(adjust(RowId::AudioFormat, 1, true, &mut ctx));
         assert_eq!(ctx.settings.audio_format, AUDIO_FORMAT_OPUS);
 
-        // Surround dims it AND refuses the write. A row that accepted a change the session
-        // throws away is the same lie as an enabled-looking control.
         ctx.settings.audio_format = AUDIO_FORMAT_LOSSLESS_48.into();
         ctx.settings.audio_channels = 6;
         assert!(!row_spec(RowId::AudioFormat, &ctx, &[]).enabled);
@@ -3109,13 +2786,10 @@ pub(crate) mod tests {
             ctx.settings.audio_format, AUDIO_FORMAT_LOSSLESS_48,
             "and nothing was written — the stored preference survives the gate"
         );
-        // Dimmed, never dropped: it stays visible beside the row that dimmed it.
         assert!(s.row_ids(&ctx).contains(&RowId::AudioFormat));
         ctx.settings.audio_channels = 2;
         assert!(row_spec(RowId::AudioFormat, &ctx, &[]).enabled);
 
-        // A rung this build has no row for — a newer client's, arriving through a shared profile
-        // catalog — reads as the Opus the session will actually run, not as a blank "—".
         ctx.settings.audio_format = AUDIO_FORMAT_OPUS.into();
         let opus = row_spec(RowId::AudioFormat, &ctx, &[]).value;
         assert!(opus.is_some());
@@ -3123,8 +2797,6 @@ pub(crate) mod tests {
         assert_eq!(row_spec(RowId::AudioFormat, &ctx, &[]).value, opus);
     }
 
-    /// The palette row steps the shared `ui_palette` key through the table and wraps on A,
-    /// like every other choice row.
     #[test]
     fn palette_row_steps_the_shared_key() {
         let (mut settings, pads) = ctx_parts();
@@ -3152,7 +2824,6 @@ pub(crate) mod tests {
         );
         assert!(adjust(RowId::Palette, 1, false, &mut ctx));
         assert_eq!(ctx.settings.ui_palette, crate::library::PALETTES[1].id);
-        // A from the last entry wraps home.
         ctx.settings.ui_palette = crate::library::PALETTES
             .last()
             .expect("non-empty")
@@ -3160,7 +2831,6 @@ pub(crate) mod tests {
             .to_string();
         assert!(adjust(RowId::Palette, 1, true, &mut ctx));
         assert_eq!(ctx.settings.ui_palette, "violet");
-        // A store written by a newer client shows that client's value, not a blank row.
         ctx.settings.ui_palette = "chartreuse".into();
         assert_eq!(
             row_spec(RowId::Palette, &ctx, &[]).value.as_deref(),

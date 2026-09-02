@@ -154,7 +154,7 @@ pub fn broadcast_env_change() -> Result<(), String> {
     Err("WM_SETTINGCHANGE is Windows-only".into())
 }
 
-/// Is any WindowsAppRuntime 2.x framework package installed for this user?
+/// Package-family query for this user. `false` means "run the installer".
 #[cfg(windows)]
 pub fn app_runtime_present() -> bool {
     use ::windows::core::HSTRING;
@@ -176,8 +176,7 @@ pub fn app_runtime_present() -> bool {
     false
 }
 
-/// `n` random bytes as lowercase hex — the web password. Real RNG, never a timestamp hack:
-/// this is a credential.
+/// `n` random bytes as lowercase hex. Real RNG — this is a credential, not a timestamp.
 #[cfg(windows)]
 pub fn random_hex(n: usize) -> Result<String, String> {
     let mut bytes = vec![0u8; n];

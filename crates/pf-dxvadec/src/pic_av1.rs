@@ -1,41 +1,21 @@
-//! One AV1 [`AuPlan`] into the DXVA structures — M7's Windows conversion.
+//! One AV1 [`AuPlan`] into the DXVA picture-parameter and tile-control records
+//! `SubmitDecoderBuffers` takes — [`crate::dxva_av1`] layouts, [`crate::pic`] one
+//! codec over, twin of [`pf_vkdecode::pic_av1`].
 //!
-//! The layouts it fills are measured against the Windows SDK's own `dxva.h`
-//! ([`crate::dxva_av1`]); this module is where the AV1 frame header's meaning is
-//! mapped onto them, and where the three places DXVA disagrees with the other
-//! backends are handled.
+//! # Two arrays, two indices
 //!
-//! # The reference numbering — a FOURTH convention
+//! `frame_refs[7]` is indexed by reference NAME (`LAST`..`ALTREF`). Each entry
+//! holds the AV1 reference SLOT (`ref_frame_idx[name]`), that reference's coded
+//! size, and that reference's global motion. `RefFrameMapTextureIndex[8]` is
+//! indexed by that same slot and holds the surface — the whole store, the way
+//! `RefFrameList` does for H.264/H.265. The driver looks up one through the
+//! other, so `Index` must be the slot, never the surface.
 //!
-//! This program has now written down four spellings of "which pictures does this
-//! frame use":
+//! Global motion is also by NAME: `gm_params[LAST_FRAME + name]`. Reading it by
+//! DPB slot transposes every warp the moment reference `i` is not in slot `i+1`.
 //!
-//! * Vulkan H.265: DPB **slot** indices in `RefPicSetStCurr*`;
-//! * DXVA H.265: **positions into `RefPicList[]`** in identically named arrays;
-//! * VAAPI H.265: membership **flags** ORed onto each DPB entry;
-//! * **DXVA AV1: two arrays that mean different things at once.**
-//!   `frame_refs[7]` is indexed by reference NAME (`LAST`..`ALTREF`) and each entry
-//!   carries a **reference SLOT** (`ref_frame_idx[name]`), that reference's own
-//!   coded size, and that reference's own global motion; `RefFrameMapTextureIndex[8]`
-//!   is indexed by that same slot and holds the **surface** — it states the whole
-//!   reference store, the way `RefFrameList` does for the other two codecs. The
-//!   driver dereferences one through the other, so the slot is the only thing
-//!   `Index` may hold. Vulkan spells the first array's contents identically
-//!   (`referenceNameSlotIndices` — slot indices by name); DXVA differs from it only
-//!   in hanging the size and the warp off the same entry. Writing the surface into
-//!   `Index` is not a refusal, it is a frame predicted from whatever picture sits
-//!   in the slot numbered like that surface.
-//!
-//! # Global motion lives per reference
-//!
-//! Vulkan hangs one `StdVideoAV1GlobalMotion` block off the picture info, with an
-//! eight-entry array inside it. DXVA puts each reference's warp parameters in that
-//! reference's own `DXVA_PicEntry_AV1`. Both are indexed by reference NAME —
-//! `global_motion_params()` loops `ref = LAST_FRAME..ALTREF_FRAME` — so the
-//! Vulkan block is a straight copy and DXVA's per-entry read is
-//! `gm_params[LAST_FRAME + name]`. Reading it by DPB SLOT instead is the exact
-//! transposition that silently gives every warped reference somebody else's warp;
-//! it agrees with the truth only while reference `i` happens to sit in slot `i+1`.
+//! Pin: `the_whole_vendored_vector_converts`,
+//! `the_decode_target_never_aliases_a_surface_the_submission_names`.
 
 use pf_bitstream::av1::coded_cdef_sec_strength;
 use pf_bitstream::av1::AuPlan;
@@ -70,128 +50,75 @@ use crate::Av1TileError;
 use crate::SlotError;
 use crate::SlotMap;
 
-/// `DXVA_PicParams_AV1::tiles` holds at most 64 column and 64 row sizes.
+/// DXVA `widths`/`heights` array length, not the spec's tile ceiling.
 pub const MAX_TILE_DIM: usize = 64;
 
-/// As many `DXVA_Tile_AV1` records as one submission carries.
-///
-/// libavcodec's `MAX_TILES`, and its refusal is the whole comment: *"too many
-/// tiles, exceeding all defined levels in the AV1 spec"* — `dxva2_av1_decode_slice`
-/// answers `AVERROR(ENOSYS)` past it, and its `ctx_pic->tiles` is a fixed
-/// 256-entry array. The 64x64 grid [`MAX_TILE_DIM`] admits 4096, which no AV1
-/// level defines and no driver has been asked for.
+/// libavcodec's `MAX_TILES`: `dxva2_av1.c` has a 256-entry `tiles` array and
+/// refuses past it (`AVERROR(ENOSYS)`). [`MAX_TILE_DIM`] admits 4096, which no
+/// AV1 level defines.
 pub const MAX_TILES: usize = 256;
 
-/// `log2_restoration_unit_size` on a frame that restores nothing.
-///
-/// Not a meaningful size — every plane's `frame_restoration_type` is NONE and a
-/// driver reading the field at all has nothing to apply it to. It is 8 because
-/// that is what libavcodec's `dxva2_av1.c` writes, and 8 is the top of the range
-/// `dxva.h` documents (6..8); the parser's own array is still zero here, whose
-/// `trailing_zeros` would be 16.
+/// Off-frame `log2_restoration_unit_size`: libavcodec's 8, top of `dxva.h`'s
+/// 6..8 range. Parser leaves `[0,0,0]` when restoration is NONE;
+/// `0u16.trailing_zeros()` is 16.
 const LOG2_RESTORATION_UNIT_SIZE_UNUSED: u16 = 8;
 
-/// `qm_y`/`qm_u`/`qm_v` on a frame that uses no quantiser matrix.
-///
-/// `DXVA_PicParams_AV1::quantization` carries no `using_qmatrix` flag, so the three
-/// indices have to say it themselves; `0xFF` is what libavcodec's `dxva2_av1.c`
-/// writes and what `dxva.h` documents as the unused value. **Not** 0 — 0 selects a
-/// real matrix.
+/// Unused quantiser-matrix index. The DXVA block has no `using_qmatrix` flag;
+/// 0 selects matrix 0. libavcodec/`dxva.h` unused value is `0xFF`.
 const QM_UNUSED: u8 = 0xFF;
 
-/// `LAST_FRAME` (AV1 spec): the first reference NAME, and the offset between a
-/// position in `ref_frame_idx` and the index the spec's per-reference arrays
-/// (global motion, order hints, sign bias) use. `INTRA_FRAME` is 0.
+/// AV1 spec `LAST_FRAME`: first reference NAME, and the offset from a
+/// `ref_frame_idx` position into per-reference arrays. `INTRA_FRAME` is 0.
 const LAST_FRAME: usize = 1;
 
-/// Everything one AV1 `SubmitDecoderBuffers` call needs.
 #[derive(Debug, Clone)]
 pub struct DecodePlanDxvaAv1 {
     pub pic_params: PicParamsAv1,
-    /// One record per **tile** — not per tile GROUP — in decode order across the
-    /// frame's tile groups, exactly as libavcodec's `dxva2_av1.c` fills
-    /// `ctx_pic->tiles[tile_num]` for `tile_num` in `tg_start..=tg_end`.
-    ///
-    /// `row`, `column` and `anchor_frame` are final. `DataOffset`/`DataSize` are
-    /// ACCESS-UNIT-relative here and are replaced outright by
-    /// [`mod@crate::pack_av1`], exactly as the H.264 and H.265 slice-control
-    /// records are rebased by [`mod@crate::pack`].
+    /// One record per **tile**, not per tile group, in `tg_start..=tg_end`
+    /// order. `row`/`column`/`anchor_frame` are final; `DataOffset`/`DataSize`
+    /// are access-unit-relative until [`mod@crate::pack_av1`] rebases them.
     pub tiles: Vec<TileAv1>,
-    /// Where the tiles and the tile-group regions are in the access unit — what
-    /// the packer copies and what it rebases against.
+    /// Tile and tile-group ranges in the access unit — what the packer copies
+    /// and rebases against.
     pub bitstream: Av1Bitstream,
     pub setup_slot: u8,
     pub setup_id: PicId,
-    /// Pictures this frame's own `refresh_frame_flags` displaces from the store
-    /// while THIS submission still NAMES them — their surfaces may not be recycled
-    /// until the decode op has been issued, and the caller owes exactly that.
+    /// Pictures this frame's `refresh_frame_flags` displace while this
+    /// submission still names them. Release after the decode op, never here:
+    /// AV1 applies the refresh after decode (7.20), and [`SlotMap::assign`]
+    /// would recycle the vacated surface into [`Self::setup_slot`].
     ///
-    /// AV1 applies `refresh_frame_flags` AFTER the frame is decoded (7.20), so
-    /// `ref_frame_idx` resolves against the store as it stood BEFORE this frame and
-    /// a frame that reads a slot it then overwrites is the ORDINARY case, not an
-    /// exotic one: **268 of the vendored vector's 274 frames** do it, first at
-    /// frame 6. Releasing such a picture inside this conversion — which is what the
-    /// H.264 and H.265 siblings do with their whole `removed` list, and what this
-    /// one did until the parity harness caught it — hands its surface straight back to
-    /// [`Self::setup_slot`], because [`SlotMap::assign`] takes the lowest free slot
-    /// and the lowest free slot is the one just vacated. The submission then says
-    /// `CurrPicTextureIndex = N` and `RefFrameMapTextureIndex[k] = N` in the same
-    /// breath: decode into the surface you are predicting from.
-    ///
-    /// Neither vendored H.264 nor H.265 vector ever produces that shape (measured:
-    /// zero on the 250-AU clips), which is why the eager release survived two
-    /// codecs believed hardware-proven and opened on the first AV1 frame past the key
-    /// frame's neighbourhood.
-    ///
-    /// ⚠ That zero turned out to be a fact about the VECTORS. H.264 has the identical
-    /// defect on any low-delay stream — 117 of 120 access units of our own host's
-    /// output, wrong pixels on three GPUs — and now carries the identical deferral
-    /// ([`crate::pic::DecodePlanDxva::release_after_decode`], which records the
-    /// measurement). H.265 is the only one of the three that is genuinely safe, and
-    /// structurally: its planner snapshots `dpb_refs` after `decode_rps`. The Vulkan rung
-    /// carries the same contract for the same reason
-    /// (`pf_vkdecode::pic_av1::DecodePlanVkAv1::release_after_decode`), and this
-    /// rung's constraint is the STRICTER of the two: Vulkan binds only the references
-    /// the frame names, while `RefFrameMapTextureIndex` declares the whole store, so
-    /// every picture the store still names has to survive — not just the seven the
-    /// frame reads.
-    ///
-    /// This is exactly `dpb.removed` less the picture being stored, and that is not a
-    /// coincidence to be tidied into a filter: the planner snapshots `dpb_refs` before
-    /// any mutation, so every removal is by construction a picture the store named
-    /// (see the conversion's own comment). Applying the list completes the plan's
-    /// bookkeeping and never invents a removal. A caller that drops it holds a surface
-    /// on nearly every frame and runs the ledger dry within ten.
+    /// Stricter than Vulkan: `RefFrameMapTextureIndex` declares the whole
+    /// store, so every still-named picture must survive, not just the seven
+    /// this frame reads. Same contract as
+    /// [`crate::pic::DecodePlanDxva::release_after_decode`] and
+    /// `pf_vkdecode::pic_av1::DecodePlanVkAv1::release_after_decode`.
     pub release_after_decode: Vec<PicId>,
 }
 
-/// Why a plan cannot be expressed as DXVA AV1 buffers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanToDxvaAv1Error {
     /// A `show_existing_frame` plan decodes nothing and has no submission.
     NoDecode,
     NoTiles,
-    /// The access unit's tile OBUs could not be walked into per-tile payloads.
     Tiles(Av1TileError),
-    /// The frame header's tile GRID and the tiles the access unit actually carried
-    /// disagree — a dropped tile group, most likely, which nothing else reports.
-    /// Submitting anyway declares `cols * rows` tiles over a shorter buffer.
+    /// Header grid disagrees with tiles the access unit carried — a dropped
+    /// tile group, which nothing else reports. Submitting would announce
+    /// `cols * rows` over a shorter buffer.
     TileCountMismatch {
-        /// Tile-control records built from the access unit's tile-group spans.
+        /// Control records from the plan's tile-group spans.
         records: usize,
-        /// Tiles the bitstream walk found.
+        /// Payloads the bitstream walk found.
         walked: usize,
-        /// `tile_cols * tile_rows` — what the picture parameters announce.
+        /// `tile_cols * tile_rows` — what picture parameters announce.
         grid: usize,
     },
-    /// A reference the slot map does not hold.
     UnresolvedReference(PicId),
-    /// More tile columns or rows than the picture parameters can express.
     TooManyTiles {
         cols: u32,
         rows: u32,
     },
-    /// A field wider than its DXVA type.
+    /// Wider than the DXVA field type.
     FieldOverflow {
         field: &'static str,
         value: u32,
@@ -249,16 +176,10 @@ fn narrow16(field: &'static str, value: u32) -> Result<u16, PlanToDxvaAv1Error> 
 
 /// Convert one planned AV1 frame.
 ///
-/// `au` is the access unit `plan` was planned from: the tile-control records need
-/// the per-TILE byte ranges, and finding those means walking each tile group's
-/// header and its `tile_size_minus_1` fields — which is a walk over the bitstream,
-/// not over the plan. (The H.264 and H.265 conversions need no such thing: a slice
-/// NALU's range IS what the driver reads.)
-///
-/// ⚠ There is no `status_id` parameter, unlike the H.264 and H.265 conversions:
-/// `StatusReportFeedbackNumber` is left **zero** for AV1 (see where it is filled
-/// below), so a caller passing one would be handing over a number that goes
-/// nowhere. Nothing mutates `slots` until every fallible step has passed.
+/// `au` is the access unit `plan` was planned from: tile-control records need
+/// per-tile byte ranges from each group's `tile_size_minus_1` walk, which the
+/// plan does not store. No `status_id`: `StatusReportFeedbackNumber` stays
+/// zero (fn body). Nothing mutates `slots` until every fallible step has passed.
 pub fn plan_to_dxva_av1(
     au: &[u8],
     plan: &AuPlan,
@@ -271,10 +192,9 @@ pub fn plan_to_dxva_av1(
     let h = &*plan.header;
     let seq = &*plan.sequence;
 
-    // --- resolve, before any mutation ------------------------------------
-    // The reference store, by SLOT. This is `RefFrameMapTextureIndex`, and it is a
-    // statement about the whole store — the same thing `RefFrameList` is for the
-    // other two codecs, and the reason an LTR no slice names still has to appear.
+    // Resolve before any mutation. `RefFrameMapTextureIndex` is the whole
+    // store by SLOT — same job as `RefFrameList`; an LTR no slice names still
+    // has to appear.
     let mut ref_frame_map = [UNUSED_INDEX; NUM_REF_SLOTS];
     for r in &plan.dpb_refs {
         let slot = slots
@@ -283,13 +203,9 @@ pub fn plan_to_dxva_av1(
         ref_frame_map[usize::from(r.slot)] = slot;
     }
 
-    // The seven reference NAMES. Each carries a reference SLOT, that reference's
-    // own coded size, and that reference's own global motion (module docs).
-    //
-    // `plan.refs` is indexed BY NAME and a lost reference leaves a hole, so the
-    // name comes off the iterator and holes are skipped — they keep DXVA's
-    // `UNUSED_INDEX`. A compacted list (which is what this loop used to receive)
-    // renamed every reference after the first loss.
+    // Seven reference NAMES: slot, coded size, global motion (module docs).
+    // `plan.refs` is indexed by NAME; a hole keeps `UNUSED_INDEX`. Compacting
+    // first renamed every name after the first loss.
     let mut frame_refs = [PicEntryAv1::zeroed(); REFS_PER_FRAME];
     let inter = !matches!(
         h.frame_type,
@@ -298,58 +214,38 @@ pub fn plan_to_dxva_av1(
     if inter {
         for (name, r) in plan.refs.iter().enumerate() {
             let Some(r) = r else { continue };
-            // The reference must still be in the store — this rung's ledger has to
-            // hold a surface for it, or `ref_frame_map` above named nothing at
-            // `r.slot` and the driver would follow `Index` to an empty entry.
+            // Ledger must hold a surface, or `ref_frame_map` named nothing at
+            // `r.slot` and the driver follows `Index` to an empty entry.
             slots
                 .slot_of(r.id)
                 .ok_or(PlanToDxvaAv1Error::UnresolvedReference(r.id))?;
-            // ⚠ Global motion is indexed by reference NAME, never by DPB slot.
-            // AV1's `global_motion_params()` loops `ref = LAST_FRAME..ALTREF_FRAME`
-            // and the vendored parser stores it that way; libavcodec's
-            // `dxva2_av1.c` reads `gm_params[AV1_REF_FRAME_LAST + i]` for
-            // `frame_refs[i]`. Reading by slot instead happens to agree only while
-            // reference `i` sits in slot `i + 1`, and silently hands every warped
-            // reference somebody else's warp the moment it does not.
+            // Global motion is by reference NAME, never DPB slot.
+            // `gm_params[LAST_FRAME + name]`; by slot agrees only while
+            // reference `i` sits in slot `i + 1`.
             let gm_name = LAST_FRAME + name;
             let gm = &h.global_motion_params;
             frame_refs[name] = PicEntryAv1 {
-                // ⚠ The REFERENCE's own size, never this frame's. libavcodec:
-                // `pp->frame_refs[i].width = ref_frame->width` off the reference's
-                // `AVFrame`. AV1 lets every frame pick its own size up to the
-                // sequence maximum, and these two fields are how the driver knows
-                // to SCALE motion out of a differently-sized reference (7.11.3.3
-                // `xStep`/`yStep` are computed from `RefUpscaledWidth[refIdx]`).
-                // Sending the current frame's size makes every scaled prediction
-                // read as unscaled, and agrees with the truth only while nothing
-                // resizes.
+                // The REFERENCE's own size, never this frame's. AV1 lets each
+                // frame pick a size; the driver scales from `RefUpscaledWidth`
+                // (7.11.3.3). Current-frame size makes every scaled pred unscaled.
                 width: r.state.upscaled_width,
                 height: r.state.frame_height,
                 wmmat: gm.gm_params[gm_name],
                 global_motion_flags: GlobalMotionFlags {
-                    // `warp_valid` is the parser's `setup_shear` verdict — a warp
-                    // whose shear parameters are out of range is unusable, and
-                    // DXVA's flag is the inverse.
+                    // DXVA `wminvalid` is the inverse of the parser's
+                    // `setup_shear` verdict.
                     wminvalid: !gm.warp_valid[gm_name],
                     wmtype: gm.gm_type[gm_name] as u8,
                 }
                 .pack(),
-                // ⚠⚠ The AV1 reference SLOT — `ref_frame_idx[name]`, 0..8 — and NOT
-                // the surface index. `Index` is a subscript INTO
-                // `RefFrameMapTextureIndex`, which the loop above already filled by
-                // slot, so the driver resolves the surface itself. libavcodec:
-                // `pp->frame_refs[i].Index = ref_frame ? ref_idx : 0xFF` with
-                // `ref_idx = frame_header->ref_frame_idx[i]`; Chromium's
-                // `d3d11_av1_accelerator.cc` writes the same thing. `RefPic::slot`
-                // IS that index (`Av1Planner` reads the store at
-                // `ref_frame_idx[name]` and the entry carries the slot it sits in).
+                // AV1 reference SLOT (`ref_frame_idx[name]`, 0..8), not the
+                // surface. `Index` subscripts `RefFrameMapTextureIndex`.
                 index: r.slot,
                 reserved16: 0,
             };
         }
     }
 
-    // --- tiles ------------------------------------------------------------
     let t = &h.tile_info;
     if t.tile_cols as usize > MAX_TILE_DIM || t.tile_rows as usize > MAX_TILE_DIM {
         return Err(PlanToDxvaAv1Error::TooManyTiles {
@@ -361,14 +257,8 @@ pub fn plan_to_dxva_av1(
     tiles.cols = narrow("tiles.cols", t.tile_cols)?;
     tiles.rows = narrow("tiles.rows", t.tile_rows)?;
     tiles.context_update_id = t.context_update_tile_id as u16;
-    // `widths`/`heights` are each tile's size in SUPERBLOCKS — a count, where the
-    // parser (and the AV1 syntax) records `*_in_sbs_minus_1`. ⚠ The `+ 1` is the
-    // whole of it: libavcodec's `dxva2_av1.c` writes
-    // `pp->tiles.widths[i] = frame_header->width_in_sbs_minus_1[i] + 1`, and
-    // Chromium's `d3d11_av1_accelerator.cc` independently writes a count too.
-    // Sending the coded minus-one value understates EVERY tile by one superblock,
-    // on every frame — the vendored vector is five superblocks wide in one tile
-    // and would have told the driver four.
+    // Superblock COUNTS; the syntax codes `*_in_sbs_minus_1`. The `+ 1` is
+    // the conversion: a minus-one value understates every tile by one SB.
     for i in 0..t.tile_cols as usize {
         tiles.widths[i] = narrow16("tiles.widths", t.width_in_sbs_minus_1[i].saturating_add(1))?;
     }
@@ -379,32 +269,10 @@ pub fn plan_to_dxva_av1(
         )?;
     }
 
-    // The tile records. ONE PER TILE — `dxva2_av1.c` sizes its array
-    // `tile_cols * tile_rows` and fills it `for (tile_num = h->tg_start; tile_num
-    // <= h->tg_end; tile_num++)`, so a frame whose four tiles arrive in a single
-    // tile group is four records with four different `row`/`column` pairs. One
-    // record per tile GROUP pointing at the whole OBU is not a coarser version of
-    // this: it hands the driver the OBU header and the tile-group header as
-    // entropy-coded tile data.
-    //
-    // The BYTES come from the walk (`plan_bitstream`, shared with the Vulkan rung)
-    // and the tile NUMBERING comes from the plan's own tile-group spans, which is
-    // how libav numbers them.
-    //
-    // ⚠ The cross-check that matters is against the tile GRID, not between those
-    // two: both are computed from the same `tg_start`/`tg_end` pair, so comparing
-    // them is comparing an expression with itself. `tile_cols * tile_rows` is an
-    // independent statement — it comes from the frame header, it is what
-    // `pic_params.tiles.cols`/`rows` announce to the driver, and it is exactly
-    // libavcodec's own guard (`ctx_pic->tile_count = frame_header->tile_cols *
-    // frame_header->tile_rows; if (ctx_pic->tile_count > MAX_TILES) return
-    // AVERROR(ENOSYS)`).
-    //
-    // The failure it catches is a DROPPED TILE GROUP: an access unit that lost one
-    // in transit carries no `TruncatedAu` warning (the OBU walk simply never sees
-    // it), so nothing else in this rung notices — and the submission then declares
-    // a grid the tile-control buffer has too few records for, which is a driver
-    // reading past `DataSize`.
+    // One record per TILE, not per tile group: a group of four tiles is four
+    // `row`/`column` pairs. Bytes from `plan_bitstream`; numbering from the
+    // plan's `tg_start`/`tg_end`. Cross-check against the header GRID, not
+    // between those two — they share one expression. A dropped group is silent.
     let cols = t.tile_cols.max(1);
     let rows = t.tile_rows.max(1);
     let grid = (cols as usize).saturating_mul(rows as usize);
@@ -416,23 +284,21 @@ pub fn plan_to_dxva_av1(
     let bitstream = plan_bitstream(au, &plan.tiles, h).map_err(PlanToDxvaAv1Error::Tiles)?;
     let mut tile_records = Vec::with_capacity(bitstream.tiles.len());
     for tg in &plan.tiles {
-        // A group whose end precedes its start is malformed; the walk refuses it
-        // too, so this saturates rather than growing a second refusal path.
+        // Malformed `tg_end < tg_start`: the walk refuses too, so saturate
+        // rather than grow a second refusal path.
         let count = tg.tg_end.saturating_sub(tg.tg_start).saturating_add(1);
         for step in 0..count {
             let tile_num = tg.tg_start.saturating_add(step);
             tile_records.push(TileAv1 {
-                // Filled from the walk below, in ACCESS-UNIT coordinates;
-                // `pack_av1` then replaces both fields with buffer-relative ones
-                // (field docs).
+                // Access-unit coordinates; `pack_av1` replaces both with
+                // buffer-relative ones (field docs).
                 data_offset: 0,
                 data_size: 0,
                 row: (tile_num / cols) as u16,
                 column: (tile_num % cols) as u16,
                 reserved16: 0,
-                // libavcodec writes `0xFF` on every tile: `anchor_frame` selects a
-                // reference for large-scale tile decoding, which no punktfunk
-                // stream and no conformance vector here uses.
+                // Large-scale-tile reference; unused here. libavcodec writes
+                // `0xFF` on every tile.
                 anchor_frame: UNUSED_INDEX,
                 reserved8: 0,
             });
@@ -459,7 +325,6 @@ pub fn plan_to_dxva_av1(
         })?;
     }
 
-    // --- the blocks -------------------------------------------------------
     let lf = &h.loop_filter_params;
     let mut loop_filter = LoopFilterAv1::zeroed();
     loop_filter.filter_level = [lf.loop_filter_level[0], lf.loop_filter_level[1]];
@@ -476,23 +341,10 @@ pub fn plan_to_dxva_av1(
     loop_filter.ref_deltas = lf.loop_filter_ref_deltas;
     loop_filter.mode_deltas = lf.loop_filter_mode_deltas;
     loop_filter.delta_lf_res = lf.delta_lf_res;
-    // Loop restoration.
-    //
-    // ⚠ DXVA wants the LOG2 of the unit size where the parser records the size
-    // itself — and the parser records NOTHING when restoration is off. AV1 5.9.20
-    // only computes `LoopRestorationSize` inside `if ( UsesLr )`, so on a frame with
-    // every plane's restoration type NONE the vendored parser's array is still
-    // `[0, 0, 0]`, and `0u16.trailing_zeros()` is **16** — a restoration unit of
-    // 65536 samples, in a field `dxva.h` documents as 6, 7 or 8. That is 271 of the
-    // vendored vector's 274 frames.
-    //
-    // libavcodec's `dxva2_av1.c` sends `uses_lr ? 6 + lr_unit_shift : 8` for luma
-    // and `uses_lr ? 6 + lr_unit_shift - lr_uv_shift : 8` for the two chroma planes,
-    // and libavcodec is the implementation every driver was validated against, so
-    // the OFF value is 8 rather than 0 or 16. With restoration on, the parser's own
-    // `loop_restoration_size[i]` already carries the per-plane `>> lr_uv_shift`, so
-    // its `trailing_zeros` IS `6 + lr_unit_shift - lr_uv_shift` — the two agree
-    // wherever the field is read at all.
+    // DXVA wants log2 of the unit size. Parser records the size itself, and
+    // only inside `UsesLr` (5.9.20) — off is `[0,0,0]`, `trailing_zeros` 16.
+    // libavcodec sends 8 when off (`dxva.h` range 6..8). On, trailing_zeros
+    // already is `6 + lr_unit_shift - lr_uv_shift`.
     let lr = &h.loop_restoration_params;
     for i in 0..3 {
         loop_filter.frame_restoration_type[i] = lr.frame_restoration_type[i] as u8;
@@ -516,14 +368,8 @@ pub fn plan_to_dxva_av1(
     quantization.v_dc_delta_q = q.delta_q_v_dc as i8;
     quantization.u_ac_delta_q = q.delta_q_u_ac as i8;
     quantization.v_ac_delta_q = q.delta_q_v_ac as i8;
-    // ⚠ The quantiser-matrix indices need a SENTINEL when the frame uses no matrix.
-    // `DXVA_PicParams_AV1::quantization` has no `using_qmatrix` bit — 0xFF is the
-    // only way to say "none" — and the vendored parser only assigns `qm_y`/`qm_u`/
-    // `qm_v` inside `if using_qmatrix`, so a frame without one carries **0**, which
-    // is a perfectly valid matrix index. Left alone the driver dequantizes against
-    // matrix 0 on every such frame, which is every frame of both vendored vectors.
-    // libavcodec: `pp->quantization.qm_y = frame_header->using_qmatrix ?
-    // frame_header->qm_y : 0xFF` (Chromium the same).
+    // No `using_qmatrix` bit; 0xFF is "none". Parser leaves `qm_*` at 0
+    // inside `if using_qmatrix`, and 0 is a valid matrix index.
     let (qm_y, qm_u, qm_v) = if q.using_qmatrix {
         (
             narrow("qm_y", q.qm_y)?,
@@ -544,17 +390,9 @@ pub fn plan_to_dxva_av1(
         bits: narrow("cdef_bits", c.cdef_bits)?,
     }
     .pack();
-    // Two fields to a byte (module docs) — not the parallel arrays AV1's syntax
-    // and Vulkan's Std block use.
-    //
-    // ⚠ `secondary` gets TWO bits here, and the parser's value does not fit them:
-    // AV1 5.9.19 rewrites the syntax element in place (a coded 3 becomes 4) and
-    // cros-codecs follows the spec, while `DXVA_PicParams_AV1` — like VA-API,
-    // NVDEC and Vulkan — wants the coded two-bit read, which is what libavcodec's
-    // `dxva2_av1.c` sends. Passing the parser's 4 through `pack`'s `& 0x3` would
-    // turn the STRONGEST secondary filter into NO filter, silently, on every frame
-    // that codes one. `coded_cdef_sec_strength` is the inverse; its docs carry the
-    // evidence.
+    // Two fields packed into a byte. `secondary` is two bits: AV1 5.9.19
+    // rewrites a coded 3 to 4 in place, and `& 0x3` would turn the strongest
+    // filter into none. `coded_cdef_sec_strength` inverts that.
     for i in 0..8 {
         cdef.y_strengths[i] = CdefStrength {
             primary: c.cdef_y_pri_strength[i] as u8,
@@ -593,8 +431,7 @@ pub fn plan_to_dxva_av1(
         segmentation.feature_data[seg] = s.feature_data[seg];
     }
 
-    // Film grain: only where the sequence enables it AND the frame applies it —
-    // the same gate the Vulkan conversion uses, and for the same reason.
+    // Same film-grain gate as Vulkan: sequence present AND frame apply.
     let fg_on = seq.film_grain_params_present && h.film_grain_params.apply_grain;
     let mut film_grain = FilmGrainAv1::zeroed();
     if fg_on {
@@ -612,10 +449,9 @@ pub fn plan_to_dxva_av1(
         }
         .pack();
         film_grain.grain_seed = fg.grain_seed;
-        // ⚠ DXVA wants [value, scaling] PAIRS where the parser (and Vulkan) keep
-        // two parallel arrays. The counts are bounded by the DXVA capacity, and an
-        // over-count is refused rather than truncated: fewer scaling points than
-        // the stream declared is different grain, not less grain.
+        // DXVA wants [value, scaling] pairs; parser/Vulkan keep parallel
+        // arrays. Over-count is refused, not truncated: fewer points is
+        // different grain, not less grain.
         let pts = |name: &'static str, n: u8, cap: usize| -> Result<usize, PlanToDxvaAv1Error> {
             if usize::from(n) > cap {
                 return Err(PlanToDxvaAv1Error::FieldOverflow {
@@ -669,26 +505,10 @@ pub fn plan_to_dxva_av1(
         film_grain.cr_offset = fg.cr_offset as i16;
     }
 
-    // --- mutations, after every fallible step -----------------------------
-    // ⚠ EVERY removed picture is held back, and nothing is released here at all.
-    //
-    // A picture this submission NAMES may be displaced by this same frame's refresh;
-    // its surface is still in `ref_frame_map` above, so releasing it would hand that
-    // very surface to `setup_slot` below and the frame would decode into a picture it
-    // predicts from. What makes the rule "every removal" rather than "the removals
-    // the store names" is a property of the PLANNER: `Av1Planner::plan_frame`
-    // snapshots `dpb_refs` before any mutation, and `refresh_slots` can only report a
-    // picture that was in `self.slots` at that moment, so `dpb.removed` is always a
-    // SUBSET of the store `ref_frame_map` was built from. Filtering on `dpb_refs`
-    // here would be a condition that is never false wearing the clothes of a
-    // decision; the subset relation is asserted in
-    // `the_decode_target_never_aliases_a_surface_the_submission_names` instead, where
-    // a planner change that broke it fails loudly.
-    //
-    // `setup_id` is excluded as a safety property rather than as a live case: a
-    // picture this frame stores cannot also be one its own refresh displaced, because
-    // `refresh_slots` retains out any displaced id still held anywhere. Releasing it
-    // would return the surface being decoded into.
+    // Hold every removal; release nothing here. A named picture this refresh
+    // displaces is still in `ref_frame_map`; freeing it hands the surface to
+    // `setup_slot`. `dpb.removed` is a subset of that store (planner snapshot
+    // before mutation); `setup_id` cannot also be a displaced id.
     let release_after_decode: Vec<PicId> = plan
         .dpb
         .removed
@@ -703,27 +523,15 @@ pub fn plan_to_dxva_av1(
 
     let color = &seq.color_config;
     let mut pic_params = PicParamsAv1::zeroed();
-    // ⚠ UPSCALED width, where libavcodec sends the CODED one — a divergence that is
-    // inert on every stream that exists here and is written down rather than
-    // "fixed" because nothing can measure it.
-    //
-    // `dxva2_av1.c` sends `avctx->width`, and `update_context_with_frame_header`
-    // sets that from `frame_width_minus_1 + 1` — FrameWidth, the pre-superres coded
-    // width. The same goes for `frame_refs[i].width`, which libav reads off the
-    // reference's `AVFrame`. With superres OFF the two are equal by definition
-    // (7.20: `UpscaledWidth = FrameWidth` when `use_superres` is 0), which is every
-    // frame of both vendored vectors and every frame a punktfunk host emits — no
-    // encoder in this program codes superres. So the 250/250 parity result on two
-    // vendors says nothing either way about which is right, and changing it would
-    // be an unmeasured change to a rung that is finally proven. Revisit with a
-    // superres vector and a driver-by-driver measurement, not by reading.
+    // Upscaled width. libavcodec sends coded `FrameWidth` (`avctx->width`).
+    // Equal when superres is off (7.20), which is every stream here; revisit
+    // with a superres vector, not by reading.
     pic_params.width = h.upscaled_width;
     pic_params.height = h.frame_height;
     pic_params.max_width = u32::from(seq.max_frame_width_minus_1) + 1;
     pic_params.max_height = u32::from(seq.max_frame_height_minus_1) + 1;
     pic_params.curr_pic_texture_index = setup_slot;
-    // The superres denominator as DXVA wants it: the real one, not the coded one,
-    // and SUPERRES_NUM when superres is off.
+    // Real denominator, not the coded one; `SUPERRES_NUM` when superres is off.
     pic_params.superres_denom = if h.use_superres {
         narrow("superres_denom", h.superres_denom)?
     } else {
@@ -766,14 +574,9 @@ pub fn plan_to_dxva_av1(
         tx_mode: h.tx_mode as u8,
         use_ref_frame_mvs: h.use_ref_frame_mvs,
         enable_ref_frame_mvs: seq.enable_ref_frame_mvs,
-        // ⚠ A literal 1, and NOT `refresh_frame_flags != 0`. libavcodec writes
-        // `pp->coding.reference_frame_update = 1` unconditionally; Chromium writes
-        // `!(show_existing_frame && frame_type == KEY_FRAME)`, which is also 1
-        // everywhere this function runs (a `show_existing_frame` unit decodes
-        // nothing and is refused above with `NoDecode`). So both references agree on
-        // the value for every frame that reaches here, and a frame refreshing no
-        // slot — legal AV1, and what `refresh_frame_flags != 0` would have sent 0
-        // for — is not the exception either.
+        // Literal 1, not `refresh_frame_flags != 0`. libavcodec writes 1;
+        // Chromium writes `!(show_existing && KEY)`, which is also 1 here
+        // (`NoDecode` above). A no-refresh frame is legal AV1.
         reference_frame_update: true,
     }
     .pack();
@@ -789,8 +592,8 @@ pub fn plan_to_dxva_av1(
     pic_params.primary_ref_frame = narrow("primary_ref_frame", h.primary_ref_frame)?;
     pic_params.order_hint = narrow("order_hint", h.order_hint)?;
     pic_params.order_hint_bits = if seq.enable_order_hint {
-        // The parser types this one signed; a negative value would be a parse bug,
-        // and turning it into a huge unsigned one here would hide that.
+        // Parser types this signed; a negative would be a parse bug, and
+        // wrapping it unsigned here would hide that.
         narrow(
             "order_hint_bits",
             u32::try_from(seq.order_hint_bits_minus_1).map_err(|_| {
@@ -811,21 +614,9 @@ pub fn plan_to_dxva_av1(
     pic_params.interp_filter = h.interpolation_filter as u8;
     pic_params.segmentation = segmentation;
     pic_params.film_grain = film_grain;
-    // ⚠ `StatusReportFeedbackNumber` stays ZERO — the `zeroed()` value, written
-    // nowhere. This is AV1-SPECIFIC: libavcodec DOES tag its H.264 and HEVC
-    // submissions, and `dxva2_av1.c` alone has the line commented out with the
-    // reason —
-    //
-    //     // XXX: Setting the StatusReportFeedbackNumber breaks decoding on some
-    //     // drivers (tested on NVIDIA 457.09)
-    //     // Status Reporting is not used by FFmpeg, hence not providing a number
-    //     // does not cause any issues
-    //     //pp->StatusReportFeedbackNumber = 1 + DXVA_CONTEXT_REPORT_ID(avctx, ctx)++;
-    //
-    // Chromium's `d3d11_av1_accelerator.cc` reaches the same place from the other
-    // direction: "should not be equal to 0 ... but it crashes :|". Two independent
-    // implementations both ship the zero, so this rung ships it too — and does not
-    // even accept a number to drop (fn docs).
+    // Leave zero. libavcodec comments the assignment out for AV1 ("breaks
+    // decoding on some drivers"); Chromium ships zero too ("crashes"). This
+    // rung does not even take a number (fn docs).
 
     Ok(DecodePlanDxvaAv1 {
         pic_params,
@@ -857,26 +648,16 @@ mod tests {
         "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
     );
 
-    /// **Our own host's AV1 at 4K**, vendored beside the goldens the GPU legs decode it
-    /// against (`lowdelay-3840x2160-av1.nv12.sha256` carries the `punktfunk-host spike`
-    /// command and the ffmpeg cross-check).
-    ///
-    /// It is here for ONE property the vendored vector cannot supply: **two tiles**.
-    /// Every frame of `test-25fps.ivf.av1` is `tile_cols = tile_rows = 1`, so
-    /// [`the_tile_sizes_are_superblock_counts_not_the_coded_minus_one`] can only ever
-    /// read index 0 of the tile arrays and assert the rest are zero. This stream is
-    /// `tile_cols = 1, tile_rows = 2` on all 60 frames, with both tiles in a single
-    /// Tile Group OBU — the 4K split-encode shape the host ships.
+    /// Host 4K AV1, vendored for **two tiles**. `test-25fps.ivf.av1` is
+    /// `tile_cols = tile_rows = 1` on every frame, so the one-tile test can
+    /// only read index 0. This stream is `tile_cols = 1, tile_rows = 2` on
+    /// all 60 frames, both tiles in one Tile Group OBU.
     const LOWDELAY_3840X2160_AV1: &[u8] =
         include_bytes!("../../pf-vkdecode/tests/data/lowdelay-3840x2160.ivf.av1");
 
-    /// Convert one plan the way the RUNG must: the conversion, then the releases it
-    /// defers past the decode op ([`DecodePlanDxvaAv1::release_after_decode`]).
-    ///
-    /// Not a convenience — it is the caller's half of the contract, and the same
-    /// helper the Vulkan rung's tests carry for the same reason. A loop that
-    /// converts without it holds a surface on 268 of this vector's 274 frames and
-    /// runs the nine-slot ledger dry inside ten.
+    /// Convert, then apply the deferred releases
+    /// ([`DecodePlanDxvaAv1::release_after_decode`]). Caller's half of the
+    /// contract; same helper the Vulkan tests carry.
     fn convert(au: &[u8], plan: &AuPlan, slots: &mut SlotMap) -> DecodePlanDxvaAv1 {
         let dx = plan_to_dxva_av1(au, plan, slots).expect("the clean vector converts");
         for &id in &dx.release_after_decode {
@@ -888,26 +669,13 @@ mod tests {
         dx
     }
 
-    /// The decode target never shares a surface with a picture the submission names.
+    /// Decode target never shares a surface with a picture the submission names.
     ///
-    /// The defect this pins is the one the Windows parity harness caught and nothing
-    /// on the CPU could see. AV1 applies `refresh_frame_flags` AFTER the frame is
-    /// decoded (7.20), so a frame that reads a slot it then overwrites is ordinary —
-    /// **268 of this vector's 274 frames**, first at frame 6 — and releasing the
-    /// displaced picture inside the conversion handed its surface straight to
-    /// `setup_slot`, because [`SlotMap::assign`] takes the lowest free slot and the
-    /// lowest free slot is the one just vacated. The submission then said
-    /// `CurrPicTextureIndex = N` and `RefFrameMapTextureIndex[k] = N` at once.
-    ///
-    /// Measured on hardware before the fix: Intel Arc decoded 245 of 250 delivered
-    /// frames wrong (47% of luma at the first bad frame, max |delta| 242, chroma
-    /// wrong too — a frame predicted from the wrong picture), and the only late
-    /// frame it got right was the one intra frame, which names no reference and so
-    /// could not alias. NVIDIA tolerated it.
-    ///
-    /// The assertion is against the WHOLE STORE, not just the seven names this frame
-    /// reads: `RefFrameMapTextureIndex` declares every occupied slot, so a driver is
-    /// entitled to consult one the frame never names.
+    /// AV1 applies `refresh_frame_flags` after decode (7.20), so a frame that
+    /// overwrites a slot it still names is ordinary. Releasing inside the
+    /// conversion hands that surface to `setup_slot` (`SlotMap::assign` takes
+    /// the lowest free slot). Assert the whole store: `RefFrameMapTextureIndex`
+    /// declares every occupied slot, not just the seven this frame reads.
     #[test]
     fn the_decode_target_never_aliases_a_surface_the_submission_names() {
         let mut planner = Av1Planner::new();
@@ -920,8 +688,8 @@ mod tests {
                 if plan.dpb.stored.is_none() {
                     continue;
                 }
-                // Deliberately NOT `convert` — this test applies the deferred
-                // releases itself, after checking each one.
+                // Not `convert` — this test applies the deferred releases
+                // itself, after checking each one.
                 let dx = plan_to_dxva_av1(packet, &plan, &mut slots).expect("the vector converts");
                 frames += 1;
                 peak = peak.max(slots.active());
@@ -935,18 +703,10 @@ mod tests {
                      RefFrameMapTextureIndex entry — the frame decodes into a picture \
                      it predicts from"
                 );
-                // ⚠ THE PROPERTY THE DEFERRAL RESTS ON, asserted about the PLANNER
-                // rather than about the conversion's own output.
-                //
-                // The conversion holds back every removal, which is only safe-and-
-                // sufficient because `Av1Planner` snapshots `dpb_refs` before any
-                // mutation and `refresh_slots` can only report a picture that was in
-                // it — so `dpb.removed` is a subset of the store `ref_frame_map` was
-                // built from. Asserting instead that each DEFERRED id is in
-                // `dpb_refs` would be vacuous: the deferred list is filtered out of
-                // `removed`, so that check compares an expression with itself. This
-                // one can fail, and if a planner change ever makes it fail the
-                // conversion is releasing a surface the submission points at.
+                // Planner invariant the deferral rests on: `dpb.removed` is a
+                // subset of the pre-decode store `ref_frame_map` was built from.
+                // Checking deferred ids against `dpb_refs` is vacuous (they
+                // were filtered from `removed`). A planner change must fail here.
                 for &id in &plan.dpb.removed {
                     assert!(
                         plan.dpb_refs.iter().any(|r| r.id == id),
@@ -957,8 +717,6 @@ mod tests {
                          deferral above stops being justified"
                     );
                 }
-                // Every deferred id is one this plan really removed, and it still
-                // holds the surface the caller is being asked to give back.
                 for &id in &dx.release_after_decode {
                     assert!(
                         plan.dpb.removed.contains(&id),
@@ -993,10 +751,8 @@ mod tests {
              deferral could be deleted without a single assertion noticing"
         );
         assert_eq!(deferred, 268, "one displaced picture per frame here");
-        // The nine-slot ledger is `NUM_REF_SLOTS + 1`, and holding a displaced
-        // picture one frame longer is exactly what that spare is for — the pool is
-        // allocated `SlotMap::capacity()` surfaces (`pf_dxvadec::pool_size`), so a
-        // peak above it would be a submission naming a surface that does not exist.
+        // `NUM_REF_SLOTS + 1`: the spare holds a displaced picture one frame
+        // longer. Peak above `SlotMap::capacity()` would name a missing surface.
         assert!(
             peak <= slots.capacity(),
             "peak {peak} surfaces held exceeds the {} the pool allocates",
@@ -1008,28 +764,13 @@ mod tests {
         );
     }
 
-    /// The whole vector, converted **and packed** — the closest a CPU gate gets to
-    /// the hardware leg, and the test that would have caught the defect this
-    /// module shipped with.
+    /// Whole vector converted and packed: the CPU stand-in for the hardware leg.
     ///
-    /// The load-bearing assertion is the last one: the bytes each
-    /// `DXVA_Tile_AV1` addresses inside the packed buffer must equal that tile's
-    /// payload in the access unit. A record pointing at the whole tile-group OBU
-    /// satisfies every OTHER check here — it is in range, it is inside the buffer,
-    /// its size is consistent — and hands the driver the OBU header, the frame
-    /// header and the tile-group header as entropy-coded tile data. There is no
-    /// way to see that from the picture parameters, and no way to see it from a
-    /// smoke test either: it decodes, and it decodes to noise.
-    ///
-    /// ⚠ That assertion is nonetheless WEAKER than it looks, which is why the
-    /// tile-group ARITHMETIC is checked separately below. `pack_av1` computes a
-    /// record's offset as `base + (tile.start - group.start)` from the very ranges
-    /// this compares against, so the two sides descend from one expression: a walk
-    /// that mistook where a tile begins satisfies it exactly. The independent
-    /// statement is `tile_group_obu()`'s own accounting — every tile's payload plus
-    /// one `TileSizeBytes` field per tile EXCEPT THE LAST fills the group's region
-    /// with nothing over and nothing short — and it is a fact about the bitstream
-    /// rather than about the packer.
+    /// Load-bearing: bytes each `DXVA_Tile_AV1` addresses must equal that tile's
+    /// AU payload. A record covering the whole tile-group OBU passes every other
+    /// check here and hands the driver OBU/frame/tile-group headers as entropy.
+    /// Weaker than it looks — `pack_av1` computes offset from the same ranges —
+    /// so `tile_group_obu()` accounting is checked separately below.
     #[test]
     fn the_whole_vendored_vector_packs_into_a_three_buffer_submission() {
         let mut planner = Av1Planner::new();
@@ -1044,8 +785,8 @@ mod tests {
                 }
                 let dx = convert(packet, &plan, &mut slots);
                 frames += 1;
-                // Poison the mapping so a record can only be "right" by pointing
-                // at bytes this pack actually wrote.
+                // Poison so a record is only "right" by pointing at bytes this
+                // pack actually wrote.
                 dst.fill(0xCC);
                 let packed = pack_av1(packet, &dx.bitstream, &dx.tiles, &mut dst).expect("packs");
 
@@ -1069,8 +810,6 @@ mod tests {
                         "frame {frames}: the bytes a tile record addresses must BE that \
                          tile's payload"
                     );
-                    // …and specifically NOT the tile group's OBU header, which is
-                    // where the payload does not start.
                     assert!(
                         plan.tiles
                             .iter()
@@ -1079,10 +818,9 @@ mod tests {
                     );
                 }
 
-                // `tile_group_obu()`'s accounting, per GROUP — the check the byte
-                // comparison above cannot make (fn docs). `TileSizeBytes` is only
-                // coded when the frame has more than one tile, so a single-tile
-                // group carries no size field at all and the sum is the group.
+                // Per-group accounting the byte comparison cannot make (fn docs).
+                // `TileSizeBytes` is coded only when the frame has more than
+                // one tile.
                 let size_bytes =
                     if plan.header.tile_info.tile_cols * plan.header.tile_info.tile_rows > 1 {
                         plan.header.tile_info.tile_size_bytes as usize
@@ -1120,11 +858,9 @@ mod tests {
                     ],
                     "frame {frames}: AV1 submits three buffers and never a matrix"
                 );
-                // Only the first of these is independent of `descriptors_av1`'s own
-                // arithmetic — the other two would compare `packed.data_size` and
-                // `16 * tiles.len()` with the expressions they were built from. So
-                // they are asserted against the BYTES instead: what the packer wrote,
-                // and the record size measured out of the Windows SDK's `dxva.h`.
+                // Only PicParams size is independent of `descriptors_av1`
+                // arithmetic. The other two are checked against the bytes
+                // written and the SDK record size.
                 assert_eq!(descs[0].data_size, 912, "DXVA_PicParams_AV1, measured");
                 assert_eq!(
                     descs[1].data_size as usize % BITSTREAM_ALIGN,
@@ -1146,12 +882,11 @@ mod tests {
         assert_eq!(frames, 274);
     }
 
-    /// Convert every frame of the vendored vector and check what a driver reads.
+    /// Convert every frame and check what a driver reads.
     ///
-    /// The anti-vacuity assertions matter as much as the checks: a run that never
-    /// saw an inter frame, or never saw the reference store hold a picture the
-    /// frame does not name, would pass every check below while exercising none of
-    /// the code that makes them interesting.
+    /// Anti-vacuity matters as much as the checks: a run that never saw an
+    /// inter frame, or never saw the store hold a picture the frame does not
+    /// name, would pass while exercising none of the interesting code.
     #[test]
     fn the_whole_vendored_vector_converts() {
         let mut planner = Av1Planner::new();
@@ -1166,10 +901,9 @@ mod tests {
                 if plan.dpb.stored.is_none() {
                     continue;
                 }
-                // Would writing the SURFACE into `Index` have been visible at all?
-                // Only where the two numbers differ — so this is counted BEFORE the
-                // conversion, which is when the ledger holds what the conversion
-                // reads (it releases displaced pictures on its way out).
+                // Count before conversion, while the ledger still holds what
+                // the conversion reads (it releases displaced pictures on the
+                // way out). Visible only where surface ≠ slot.
                 for r in plan.refs.iter().flatten() {
                     let surface = slots.slot_of(r.id).expect("a named reference is held");
                     if surface != r.slot {
@@ -1179,18 +913,13 @@ mod tests {
                 let dx = convert(packet, &plan, &mut slots);
                 frames += 1;
 
-                // Tile records must describe TILE PAYLOAD ranges inside the access
-                // unit — the bytes after each tile's `tile_size_minus_1` field,
-                // never the whole tile-group OBU. A record covering the OBU would
-                // hand the driver the OBU header and the frame header as
-                // entropy-coded tile data.
+                // Tile records are payload ranges after `tile_size_minus_1`,
+                // never the whole tile-group OBU.
                 assert_eq!(dx.tiles.len(), dx.bitstream.tiles.len());
                 for (rec, range) in dx.tiles.iter().zip(&dx.bitstream.tiles) {
                     assert_eq!(rec.data_offset as usize, range.start);
                     assert_eq!(rec.data_size as usize, range.end - range.start);
                     assert!(range.end <= packet.len());
-                    // Inside its own tile-group region, which is what the packer
-                    // rebases against.
                     assert!(dx
                         .bitstream
                         .groups
@@ -1198,17 +927,16 @@ mod tests {
                         .any(|g| g.start <= range.start && range.end <= g.end));
                 }
                 for tg in &plan.tiles {
-                    // Every tile record lies strictly INSIDE its OBU, never at its
-                    // first byte: the OBU header alone is one or two bytes.
+                    // Strictly inside its OBU, never at the first byte: the
+                    // OBU header alone is one or two bytes.
                     assert!(dx
                         .tiles
                         .iter()
                         .all(|rec| rec.data_offset as usize != tg.data.start));
                 }
 
-                // The store: every named slot resolves to a real surface, and any
-                // slot with no picture stays UNUSED. `0` is a valid surface, so a
-                // slot left at 0 by accident would point at a live picture.
+                // Named slots resolve to a real surface; empty stays UNUSED.
+                // 0 is a valid surface, so a leftover 0 would point at a live picture.
                 let named = dx
                     .pic_params
                     .ref_frame_map_texture_index
@@ -1223,10 +951,6 @@ mod tests {
 
                 if referenced > 0 {
                     inter += 1;
-                    // Every reference NAME must carry the SLOT the frame header
-                    // named, that slot must hold a surface, that reference's own
-                    // coded size must travel with it, and its global motion must be
-                    // the entry the AV1 syntax codes for THAT name.
                     for (name, r) in plan.refs.iter().enumerate() {
                         let e = dx.pic_params.frame_refs[name];
                         let Some(named_ref) = r else {
@@ -1249,10 +973,8 @@ mod tests {
                             UNUSED_INDEX,
                             "reference name {name} points at an empty slot"
                         );
-                        // The REFERENCE's own size, not this frame's — a distinction
-                        // this vector cannot show (nothing resizes), so it is
-                        // asserted against the planner's per-reference state rather
-                        // than against a difference.
+                        // The reference's own size, not this frame's. This
+                        // vector never resizes, so pin against `RefPic::state`.
                         let (w, h) = (e.width, e.height);
                         assert_eq!(
                             (w, h),
@@ -1265,9 +987,8 @@ mod tests {
                             ref_size_would_differ += 1;
                         }
                         let gm = &plan.header.global_motion_params;
-                        // `PicEntryAv1` is `#[repr(packed)]`, so its fields are
-                        // copied out before being compared — a reference to one
-                        // may be unaligned.
+                        // `PicEntryAv1` is `#[repr(packed)]`; copy fields out
+                        // before compare — a reference may be unaligned.
                         let (wmmat, flags) = (e.wmmat, e.global_motion_flags);
                         assert_eq!(
                             wmmat,
@@ -1283,7 +1004,7 @@ mod tests {
                             }
                             .pack()
                         );
-                        // Would reading by DPB SLOT have given the same answer?
+                        // Count where name-index and slot-index disagree.
                         let slot = usize::from(named_ref.slot);
                         if gm.gm_params[LAST_FRAME + name] != gm.gm_params[slot]
                             || gm.gm_type[LAST_FRAME + name] != gm.gm_type[slot]
@@ -1294,12 +1015,9 @@ mod tests {
                 }
                 assert_eq!(dx.pic_params.curr_pic_texture_index, dx.setup_slot);
 
-                // Both native rungs take AV1's RENDER size as a display crop and
-                // clamp it to the decoded picture, because 5.9.6 puts no upper
-                // bound on `render_width_minus_1` — it is a hint, not a window.
-                // This vector never exercises the clamp, and saying so here is the
-                // point: the Vulkan rung's 250/250 bit-identical parity result
-                // cannot have moved when the clamp was added.
+                // Both native rungs take AV1 render size as a display crop and
+                // clamp it: 5.9.6 puts no upper bound on `render_width_minus_1`.
+                // This vector never exercises the clamp.
                 assert!(
                     plan.picture.render_width <= plan.picture.upscaled_width
                         && plan.picture.render_height <= plan.picture.frame_height,
@@ -1344,30 +1062,12 @@ mod tests {
         );
     }
 
-    /// The CHROMA deblocking levels reach `filter_level_u` / `filter_level_v`, and
+    /// Chroma deblocking reaches `filter_level_u`/`filter_level_v`, and
     /// `log2_restoration_unit_size` is never the parser's silence.
     ///
-    /// Two halves of the same block, both measured on hardware rather than argued.
-    ///
-    /// The levels first. ⚠ The AV1 Vulkan rung's frame-0 parity leg came back `luma
-    /// IDENTICAL, chroma 319/38400 bytes differ` and that signature was reproduced
-    /// EXACTLY — count, `|delta|` histogram and the first six differing bytes with
-    /// their values — by decoding the vector's frame 0 with `loop_filter_level[2]`
-    /// and `[3]` forced to zero in the bitstream. **That divergence turned out NOT
-    /// to be a levels bug** (it was a freed sequence header making the driver treat
-    /// the frame as monochrome — `pf_vkdecode::session_av1`), so do not cite it as
-    /// evidence that a rung got the pair wrong. What it does establish, and what
-    /// keeps this test, is the SIGNATURE: frame 0 codes `[1, 7, 8, 12]`, two luma
-    /// levels and two chroma ones, and dropping only the chroma pair is invisible
-    /// to luma and to every other plane statistic. A rung that lost the pair would
-    /// fail Windows parity in a way nothing else here would notice, and this rung's
-    /// `[2]` and `[3]` reads are four characters from `[0]` and `[1]`.
-    ///
-    /// Then the restoration unit size, which is a units defect the vendored parser
-    /// invites: `LoopRestorationSize` is only computed inside `if ( UsesLr )`
-    /// (5.9.20), so the array is `[0, 0, 0]` on a frame that restores nothing and
-    /// `trailing_zeros` turns that into **16** — 271 of these 274 frames, in a field
-    /// `dxva.h` documents as 6..8. libavcodec sends 8.
+    /// Frame 0 codes levels `[1, 7, 8, 12]`. Dropping only `[2]`/`[3]` is
+    /// invisible to luma. Off restoration leaves the parser at `[0,0,0]`;
+    /// `trailing_zeros` is 16, outside `dxva.h`'s 6..8. libavcodec sends 8.
     #[test]
     fn the_chroma_loop_filter_levels_and_the_restoration_unit_size_reach_the_driver() {
         let mut planner = Av1Planner::new();
@@ -1446,19 +1146,12 @@ mod tests {
         );
     }
 
-    /// The packed CDEF strength bytes carry the CODED secondary strength.
+    /// Packed CDEF strength bytes carry the coded secondary strength.
     ///
-    /// `CdefStrength::pack` gives `secondary` TWO bits, and the vendored parser
-    /// holds the AV1 spec's post-fixup value — 4 where the stream coded 3 (5.9.19
-    /// rewrites the syntax element in place). `& 0x3` then turns the STRONGEST
-    /// secondary filter into no filter at all, silently, on 68 of this vector's 274
-    /// frames including the first. libavcodec's `dxva2_av1.c` assigns CBS's
-    /// unmodified two-bit read into the same bitfield, which is the convention every
-    /// driver was validated against.
-    ///
-    /// Asserted against the packed BYTE rather than the intermediate struct,
-    /// because the truncation is what `pack` does and a test that stopped at the
-    /// struct would not have seen it.
+    /// `CdefStrength::pack` gives `secondary` two bits. The parser holds the
+    /// post-fixup value (4 where the stream coded 3, 5.9.19). `& 0x3` turns
+    /// the strongest filter into none. Assert the packed byte: truncation is
+    /// what `pack` does, and a struct-level check would not see it.
     #[test]
     fn cdef_secondary_strengths_survive_the_two_bit_pack() {
         let mut planner = Av1Planner::new();
@@ -1539,17 +1232,12 @@ mod tests {
             .all(|e| e.index == UNUSED_INDEX));
     }
 
-    /// The tile sizes are COUNTS of superblocks, not the coded minus-one values.
+    /// Tile sizes are superblock COUNTS, not the coded minus-one values.
     ///
-    /// A units defect the parser's field names invite, and the reason it needs its
-    /// own test is that nothing else can see it: every offset, every size and every
-    /// descriptor stays right, the picture decodes, and the driver has simply been
-    /// told each tile is one superblock narrower and shorter than it is.
-    ///
-    /// The number is checked against the FRAME rather than against the field it came
-    /// from: this vector is one tile, so the tile's width in superblocks is the whole
-    /// frame's, `ceil(320 / 64) = 5` columns by `ceil(240 / 64) = 4` rows at 64x64
-    /// superblocks. A conversion that shipped the minus-one value would say 4 by 3.
+    /// Nothing else sees this: offsets, sizes, descriptors stay right, the
+    /// picture decodes, each tile is one SB too small. This vector is one
+    /// tile, so width is the whole frame: `ceil(320/64)=5` by `ceil(240/64)=4`.
+    /// Minus-one would say 4 by 3.
     #[test]
     fn the_tile_sizes_are_superblock_counts_not_the_coded_minus_one() {
         let mut planner = Av1Planner::new();
@@ -1589,10 +1277,8 @@ mod tests {
                     ),
                     "frame {frames}: and that is the coded value plus one"
                 );
-                // Past the frame's tile grid the arrays stay zero — a driver reading
-                // `cols` entries never sees them, and a phantom `1` would be a tile
-                // where the frame has none. (`#[repr(packed)]`: the arrays are
-                // copied out whole before being iterated.)
+                // Past the grid the arrays stay zero. A phantom `1` is a tile
+                // the frame has none of. (`#[repr(packed)]`: copy before iterate.)
                 let (widths, heights) = (tiles.widths, tiles.heights);
                 assert!(widths[1..].iter().all(|w| *w == 0));
                 assert!(heights[1..].iter().all(|h| *h == 0));
@@ -1601,21 +1287,12 @@ mod tests {
         assert_eq!(frames, 274);
     }
 
-    /// The same tile arrays with a SECOND tile in them — the case the vendored vector
-    /// cannot reach and this conversion had therefore never been run against.
+    /// Same tile arrays with a second tile live — the case a one-tile vector
+    /// cannot reach. Writing only index 0 and leaving `1..` zero passes the
+    /// sibling test and drops half the height here.
     ///
-    /// [`the_tile_sizes_are_superblock_counts_not_the_coded_minus_one`] asserts index 0
-    /// is right and `1..` are zero, which is everything a one-tile vector can say. Both
-    /// halves of that are shapes a multi-tile bug would satisfy: a conversion that
-    /// wrote only tile 0 and left the rest zero would pass it on every frame of the
-    /// vector and hand the driver a frame with half its height missing here.
-    ///
-    /// So this pins the row arrays with both entries live, that the second entry is the
-    /// SECOND tile's size rather than a repeat of the first, and that everything past
-    /// the grid is still zero. `tile_rows = 2` with `height_in_sbs_minus_1 = [16, 16]`
-    /// against a 2160-line frame is 17 + 17 = 34 superblocks of 64, i.e. 2176 lines —
-    /// the padded height, which is the arithmetic the one-tile test's `div_ceil` also
-    /// checks but cannot check twice.
+    /// `tile_rows = 2` with `height_in_sbs_minus_1 = [16, 16]` on a 2160-line
+    /// frame is 17+17=34 superblocks of 64 (2176, the padded height).
     #[test]
     fn a_two_tile_frame_fills_both_row_entries_and_leaves_the_rest_zero() {
         let mut planner = Av1Planner::new();
@@ -1654,9 +1331,8 @@ mod tests {
                     (plan.header.frame_width.div_ceil(sb) as u16, 0u16),
                     "frame {frames}: the single tile COLUMN spans the whole width"
                 );
-                // Both row entries, each the coded value plus one — and read
-                // independently, so a conversion that broadcast entry 0 across the
-                // array would still have to get entry 1's own coded value right.
+                // Both rows, each coded-plus-one, read independently so a
+                // broadcast of entry 0 still has to get entry 1's own value.
                 assert_eq!(
                     (heights[0], heights[1]),
                     (
@@ -1673,18 +1349,14 @@ mod tests {
                      short second row is a frame with missing lines, which is precisely \
                      the shape the host once shipped over the wire"
                 );
-                // Past the grid the arrays stay zero: a driver reading `rows` entries
-                // never sees them, and a phantom entry is a tile the frame has not.
+                // Past the grid stays zero: a phantom entry is a tile the
+                // frame has not.
                 assert!(widths[1..].iter().all(|w| *w == 0));
                 assert!(heights[2..].iter().all(|h| *h == 0));
 
-                // TWO tile RECORDS from ONE tile group, with distinct rows and
-                // non-empty spans. `tile_cols * tile_rows` records is libavcodec's own
-                // count, and this stream is the only one here where it exceeds the
-                // number of tile GROUPS — so a conversion that emitted one record per
-                // group (the coarser shape the module docs warn against) is
-                // indistinguishable from a correct one on the vendored vector and
-                // fails here.
+                // Two tile records from one tile group. On the one-tile
+                // vector, one record per group is indistinguishable from one
+                // per tile.
                 assert_eq!(
                     plan.tiles.len(),
                     1,
@@ -1718,18 +1390,14 @@ mod tests {
         assert_eq!(frames, 60, "the low-delay 4K stream is 60 coded frames");
     }
 
-    /// Three fields whose correct value is a SENTINEL or a constant, on every frame
-    /// of the vector — none of which any other assertion here would notice.
+    /// Three fields whose correct value is a sentinel or a constant, on every
+    /// frame — none of which any other assertion here would notice.
     ///
-    /// * `StatusReportFeedbackNumber` **zero**: libavcodec has the assignment
-    ///   commented out for AV1 alone ("breaks decoding on some drivers (tested on
-    ///   NVIDIA 457.09)") and Chromium ships the zero too ("should not be equal to
-    ///   0 ... but it crashes :|"). This rung does not even accept a number.
-    /// * `qm_y`/`qm_u`/`qm_v` **0xFF** where the frame uses no quantiser matrix.
-    ///   The struct has no `using_qmatrix` bit, and the parser leaves the indices at
-    ///   0 — a VALID matrix — so the sentinel is the only thing standing between
-    ///   every frame of this vector and a dequantisation against matrix 0.
-    /// * `reference_frame_update` **1**, which libavcodec writes as a literal.
+    /// * `StatusReportFeedbackNumber` zero: libavcodec comments the AV1
+    ///   assignment out; Chromium ships zero too. This rung takes no number.
+    /// * `qm_y`/`qm_u`/`qm_v` `0xFF` with no matrix: no `using_qmatrix` bit,
+    ///   parser leaves 0 (a valid matrix).
+    /// * `reference_frame_update` 1, which libavcodec writes as a literal.
     #[test]
     fn the_three_fields_whose_right_answer_is_a_constant() {
         let mut planner = Av1Planner::new();
@@ -1792,21 +1460,18 @@ mod tests {
             "no frame of this vector uses a quantiser matrix, so the sentinel is what \
              the driver reads on every one of them — at zero this test proves nothing"
         );
-        // Not an anti-vacuity assertion but a note about what this vector CANNOT
-        // show: `reference_frame_update` only differs from `refresh_frame_flags != 0`
-        // on a frame that refreshes nothing, and this vector has none.
+        // This vector has no no-refresh frame, so `reference_frame_update`
+        // cannot be told from `refresh_frame_flags != 0` by value.
         assert_eq!(without_refresh, 0);
     }
 
-    /// Every picture a temporal unit decodes is still addressable once the unit ends.
+    /// Every picture a temporal unit decodes is still addressable once the
+    /// unit ends.
     ///
-    /// A precondition of the Windows AV1 parity harness rather than of this crate.
-    /// That harness drives the production entry point, which takes a whole temporal
-    /// unit and plans it internally, so it reaches a HIDDEN frame's pixels by asking
-    /// the slot map where that picture went after the unit is done. Sound only if a
-    /// unit never displaces a picture it decoded itself — a fact about this vector,
-    /// not about AV1 — and the harness needs a GPU while this does not, so the check
-    /// lives here where every leg runs it.
+    /// Precondition of the Windows AV1 parity harness: it takes a whole
+    /// temporal unit and finds a hidden frame's pixels via the slot map after
+    /// the unit is done. Sound only if a unit never displaces a picture it
+    /// decoded — a fact about this vector, not about AV1.
     #[test]
     fn no_unit_of_the_vector_displaces_a_picture_it_decoded_itself() {
         let mut planner = Av1Planner::new();
@@ -1844,13 +1509,10 @@ mod tests {
         );
     }
 
-    /// A frame whose tile groups do not add up to its tile GRID is refused.
+    /// A frame whose tile groups do not add up to its tile grid is refused.
     ///
-    /// The failure this stands in for is a dropped tile group: the OBU walk never
-    /// sees it, so no `TruncatedAu` warning is raised and nothing else in the rung
-    /// notices that the submission is short of what `pic_params.tiles` announces.
-    /// Simulated by removing a tile-group plan, which is what such a loss leaves
-    /// behind.
+    /// Stands in for a dropped tile group: the OBU walk never sees it, so no
+    /// `TruncatedAu` warning. Simulated by shrinking the tile-group plan.
     #[test]
     fn a_frame_short_of_its_tile_grid_is_refused_rather_than_submitted() {
         let mut planner = Av1Planner::new();
@@ -1859,11 +1521,9 @@ mod tests {
         let plans = planner.plan_au(first).expect("the first unit plans");
         let mut plan = plans.into_iter().next().expect("a frame");
 
-        // The unmodified frame converts, so the refusal below is about the tiles and
-        // not about the frame.
+        // Untouched frame converts, so the refusal below is about the tiles.
         plan_to_dxva_av1(first, &plan, &mut slots).expect("the untouched frame converts");
 
-        // Now claim a two-tile grid the access unit has one tile for.
         let header = std::rc::Rc::make_mut(&mut plan.header);
         header.tile_info.tile_cols = 2;
         header.tile_info.tile_rows = 1;

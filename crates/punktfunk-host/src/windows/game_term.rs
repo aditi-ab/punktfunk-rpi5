@@ -1,22 +1,14 @@
-//! Asking a game to close on Windows, and killing it if it won't.
+//! Win32 half of [`crate::gamelease`]'s termination ladder: `WM_CLOSE`, then `TerminateProcess`.
 //!
-//! The two halves of [`crate::gamelease`]'s termination ladder that need Win32: post `WM_CLOSE` to the
-//! game's windows, then `TerminateProcess` whatever ignored it. Kept out of `procscan` (read-only by
-//! construction) and out of `gamelease` (platform-neutral orchestration).
+//! Kept out of `procscan` (read-only) and `gamelease` (platform-neutral).
 //!
-//! ### Why the desktop dance
+//! `EnumWindows` sees only the calling thread's desktop. The host is SYSTEM in the interactive
+//! session ([`super::service`]) but not on the user's desktop, so without
+//! `OpenInputDesktop`/`SetThreadDesktop` the polite pass is empty and every game is killed.
+//! A UAC prompt, lock, or Ctrl-Alt-Del swaps that desktop out from under us — same bind
+//! `pf-inject`'s `sendinput.rs` uses for `SendInput`.
 //!
-//! The polite half is the reason this module is not three lines. `EnumWindows` enumerates the windows
-//! of the **calling thread's desktop** — and the host runs as SYSTEM. It is in the right *session*
-//! (the supervisor launches it into the active interactive console session — see [`super::service`]),
-//! but a SYSTEM process does not start on the interactive user's *desktop* within it, so the
-//! enumeration sees none of their windows. Without first binding the thread to the input desktop
-//! the enumeration comes back empty and the ladder silently degrades to killing every game outright,
-//! which is exactly the unsaved-progress outcome the grace window exists to avoid.
-//!
-//! Same `OpenInputDesktop`/`SetThreadDesktop` pattern the input injector uses for `SendInput`
-//! (`pf-inject`'s `sendinput.rs`), for the same reason: a UAC prompt, the lock screen or
-//! Ctrl-Alt-Del swaps the input desktop out from under us.
+//! Pin: [`request_close`], [`kill`]. Evidence: [`crate::gamelease`].
 
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
 use windows::Win32::System::StationsAndDesktops::{
@@ -28,32 +20,25 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE,
 };
 
-/// Exit code reported for a game the host killed. Arbitrary but non-zero, so anything reading it can
-/// tell it apart from a clean quit.
+/// Non-zero so a reader can tell a kill from a clean quit.
 const KILLED_EXIT_CODE: u32 = 1;
 
-/// `GENERIC_ALL` for a desktop open. The `windows` crate models desktop rights as their own type, so
-/// the generic right isn't reachable through it — the same local const the input backends define
-/// (`pf-inject`'s `sendinput.rs` / `pointer_windows.rs`).
+/// `GENERIC_ALL`. The `windows` crate's desktop-rights type does not export generic rights, so
+/// spell it (same constant `pf-inject`'s `sendinput.rs` uses).
 const DESKTOP_GENERIC_ALL: u32 = 0x1000_0000;
 
-/// Binds the calling thread to the desktop currently receiving input, for as long as it is held.
-///
-/// The thread this runs on is dedicated and short-lived (`pf1-gameterm`), so the previous desktop is
-/// not restored — only the handle is released.
+/// The `pf1-gameterm` thread is dedicated and dies after this; previous desktop is not restored,
+/// only the handle is closed.
 struct InputDesktop(HDESK);
 
 impl InputDesktop {
-    /// `None` when the input desktop can't be opened or bound (an unprivileged host, or a secure
-    /// desktop we aren't allowed onto). Callers degrade rather than fail: without it the polite pass
-    /// finds no windows, and the kill pass still works.
+    /// `None` if the input desktop cannot be opened or bound (unprivileged, or a secure desktop).
+    /// Callers skip the polite pass; the kill pass still works.
     fn attach() -> Option<Self> {
-        // SAFETY: FFI calls taking by-value args only (constant desktop flags, a bool, an access
-        // mask). `OpenInputDesktop` yields an owned `HDESK` only on `Ok`; it is then either installed
-        // on this thread and owned by the returned guard (closed exactly once in `Drop`), or closed
-        // here on the failure path. `SetThreadDesktop` rebinds only the calling thread — which owns
-        // this guard — and succeeds only when that thread has no windows or hooks, true of the fresh
-        // termination thread.
+        // SAFETY: FFI by-value args only. `OpenInputDesktop` yields an owned `HDESK` only on `Ok`;
+        // it is installed on this thread and owned by the returned guard (closed once in `Drop`),
+        // or closed here on failure. `SetThreadDesktop` rebinds only the calling thread, which
+        // owns no windows or hooks (fresh termination thread).
         unsafe {
             let h = OpenInputDesktop(
                 DESKTOP_CONTROL_FLAGS(0),
@@ -81,29 +66,20 @@ impl Drop for InputDesktop {
     }
 }
 
-/// What the enumeration callback needs, passed through `LPARAM`.
-///
-/// Owns its pid list rather than borrowing: the value round-trips through a raw pointer, and a
-/// borrowed lifetime there is a subtlety with no upside for one small allocation per termination.
+/// `EnumWindows` `LPARAM`. Owns the pid list: the value round-trips through a raw pointer, and a
+/// borrowed lifetime there has no upside for one small allocation per termination.
 struct CloseCtx {
     pids: Vec<u32>,
     posted: usize,
 }
 
-/// Ask every visible top-level window belonging to `pids` to close, the way clicking its X would —
-/// so a game runs its own shutdown path and gets the chance to save. Returns how many windows were
-/// asked.
-///
-/// Zero is a perfectly ordinary answer: a game may be mid-load with no window yet, or the host may not
-/// have reached the input desktop. The caller's job is to wait and then insist, not to treat this as
-/// success.
+/// The window X, so the game can save. Zero is ordinary (no window yet, or off the input
+/// desktop). The caller waits, then kills; it must not treat zero as success.
 pub fn request_close(pids: &[u32]) -> usize {
     if pids.is_empty() {
         return 0;
     }
-    // Without the input desktop this enumerates session 0 and finds nothing (see the module docs), so
-    // failing to attach means skipping the polite pass rather than doing it uselessly. Held for the
-    // whole enumeration.
+    // Held for the whole enumeration. Failure skips the polite pass (session 0 has no game windows).
     let Some(_desktop) = InputDesktop::attach() else {
         tracing::debug!(
             "could not bind to the input desktop — skipping the polite close and going straight to \
@@ -115,24 +91,19 @@ pub fn request_close(pids: &[u32]) -> usize {
         pids: pids.to_vec(),
         posted: 0,
     };
-    // SAFETY: `EnumWindows` invokes `enum_close` synchronously for each top-level window on this
-    // thread's desktop and returns before this frame exits, so the `&mut ctx` pointer it carries in
-    // the `LPARAM` stays valid for the whole call and is not aliased (nothing else touches `ctx`
-    // while the enumeration runs).
+    // SAFETY: `EnumWindows` calls `enum_close` synchronously and returns before this frame exits,
+    // so the `&mut ctx` in `LPARAM` stays valid and unaliased for the whole call.
     unsafe {
         let _ = EnumWindows(Some(enum_close), LPARAM(&mut ctx as *mut CloseCtx as isize));
     }
     ctx.posted
 }
 
-/// `EnumWindows` callback: post `WM_CLOSE` to each visible window owned by one of the target pids.
-///
-/// Visible top-level windows only — a game's message-only and tool windows would swallow the close, and
-/// posting to them achieves nothing while making the count meaningless.
+/// Visible top-level windows only: message-only and tool windows swallow `WM_CLOSE` and would
+/// inflate the count.
 unsafe extern "system" fn enum_close(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
-    // SAFETY: `lparam` is the `&mut CloseCtx` `request_close` passed in, valid for the whole
-    // enumeration; the callback is invoked synchronously on the same thread, so this is the only live
-    // reference to it.
+    // SAFETY: `lparam` is the `&mut CloseCtx` from `request_close`, valid for the enumeration;
+    // the callback runs synchronously on the same thread, so this is the only live reference.
     let ctx = unsafe { &mut *(lparam.0 as *mut CloseCtx) };
     let mut pid = 0u32;
     // SAFETY: `hwnd` is the window the enumeration handed us; `pid` is a live local we own.
@@ -148,11 +119,8 @@ unsafe extern "system" fn enum_close(hwnd: HWND, lparam: LPARAM) -> windows::cor
     true.into() // keep enumerating — a game can own several windows
 }
 
-/// Kill `pids` outright. Returns how many were terminated.
-///
-/// The caller must have re-verified each pid against its recorded start time immediately before
-/// calling this ([`crate::procscan::Scanner::alive`]) — Windows recycles pids briskly, and this call is
-/// unforgiving about being pointed at the wrong one.
+/// Caller must have re-verified start time ([`crate::procscan::Scanner::alive`]) immediately
+/// before: Windows recycles pids.
 pub fn kill(pids: &[u32]) -> usize {
     let mut killed = 0;
     for &pid in pids {

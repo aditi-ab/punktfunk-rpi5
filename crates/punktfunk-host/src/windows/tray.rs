@@ -1,30 +1,25 @@
-//! Tray lifecycle: the one place that knows how to find, start, stop, check and SUPERVISE the
-//! per-user status tray. Shared by the `tray` CLI subcommand and by [`supervise`], which the host
-//! service runs for its whole lifetime.
+//! Tray lifecycle: find, start, stop, check, and supervise `punktfunk-tray.exe`.
+//! Shared by the `tray` CLI and by [`supervise`], which the host service runs
+//! for its whole lifetime.
 //!
-//! Why this exists at all: `punktfunk-tray.exe` is a per-USER, per-SESSION GUI process with no
-//! recovery path of its own. The HKLM `Run` value only fires at sign-in, and nothing in the product
-//! restarted a tray that died — so anything that killed one (an upgrade's `StopTrays`, a crash) left
-//! the operator without an icon until they signed out and back in. [`supervise`] closes that.
+//! The tray is a per-user, per-session GUI with no recovery of its own. HKLM
+//! `Run` fires at sign-in only; [`supervise`] restarts a tray that dies after.
 //!
-//! The launch has to cross a privilege boundary in one direction but not the other, so [`start`]
-//! tries the session-crossing path first and falls back to a plain spawn:
+//! [`start`] tries the session-crossing path first, then a plain spawn:
 //!
-//! * **From the host service (SYSTEM)** — the tray must land in the active console session under
-//!   the *logged-in user's* token, not SYSTEM's. That is
+//! * **From the host service (SYSTEM)** — land in the active console session
+//!   under the logged-in user's token via
 //!   [`crate::interactive::spawn_in_active_session`] (`WTSQueryUserToken` +
-//!   `CreateProcessAsUserW`), and it needs `SE_TCB`, which only SYSTEM holds.
-//! * **From an interactive shell** — the caller IS the user in the right session already, so
-//!   `WTSQueryUserToken` fails (an administrator does not hold `SE_TCB` either) and a plain spawn
-//!   is both sufficient and correct.
+//!   `CreateProcessAsUserW`). Needs `SE_TCB`, which only SYSTEM holds.
+//! * **From an interactive shell** — the caller is already the user in the
+//!   right session, so `WTSQueryUserToken` fails and a plain spawn is correct.
 //!
-//! Trying the privileged path and falling back on failure discriminates the two without a token
-//! inspection, and without adding any `unsafe` to this crate.
+//! Trying the privileged path first discriminates the two without a token
+//! inspection and without adding `unsafe` to this crate.
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 
-/// The tray's image name, as the installer lays it down next to `punktfunk-host.exe`.
 pub const TRAY_EXE: &str = "punktfunk-tray.exe";
 
 pub fn main(args: &[String]) -> Result<()> {
@@ -64,8 +59,7 @@ pub fn main(args: &[String]) -> Result<()> {
     }
 }
 
-/// `punktfunk-tray.exe` next to this executable, when it is actually installed (the `trayicon`
-/// task is optional, so its absence is a legitimate state, not an error).
+/// `punktfunk-tray.exe` next to this executable. The `trayicon` task is optional, so absence is not an error.
 pub fn tray_exe() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
@@ -73,9 +67,7 @@ pub fn tray_exe() -> Option<PathBuf> {
         .filter(|p| p.exists())
 }
 
-/// Is a tray running in ANY session? Reuses the conflicting-host scan's Toolhelp snapshot rather
-/// than opening a second one. Best-effort: a failed snapshot reads as "not running", so callers
-/// must treat this as a hint — never as proof for a destructive decision.
+/// Any session. Best-effort: a failed snapshot reads as not running — a hint, never proof for a kill.
 pub fn is_running() -> bool {
     let stem = TRAY_EXE.trim_end_matches(".exe");
     crate::detect::running_process_names()
@@ -83,12 +75,10 @@ pub fn is_running() -> bool {
         .any(|n| n == stem)
 }
 
-/// How often [`supervise`] re-checks that a tray is up.
+/// Two misses restart the tray, so this is half the grace window.
 const WATCH_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The installer's `trayicon` task writes this HKLM `Run` value. Its presence is the ONLY honest
-/// "this box wants a status icon" signal: `punktfunk-tray.exe` is installed unconditionally
-/// (it is small), so its mere existence on disk means nothing.
+/// HKLM `Run` `PunktfunkTray` is the only "this box wants an icon" signal. The exe is always on disk.
 fn wanted() -> bool {
     winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
         .open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run")
@@ -96,18 +86,10 @@ fn wanted() -> bool {
         .is_ok()
 }
 
-/// Keep a status tray alive for as long as the host runs. Spawned once from `mgmt::run`.
+/// Keep a status tray alive while the host runs. Spawned once from `mgmt::run`.
 ///
-/// This is the tray's missing supervisor. The HKLM `Run` value fires at sign-in and never again, so
-/// EVERY way a tray dies used to be terminal until the next logon: the installer's `StopTrays`
-/// (which every upgrade runs — console-initiated, winget, or a hand-run setup), an Explorer-level
-/// crash, an operator's `taskkill`. An update-specific remedy only ever covered the update path,
-/// and only when the *previous* binary already knew to record the intent. A tick that just asks
-/// "is one running?" covers all of them and depends on nothing the old version wrote.
-///
-/// The first check is immediate — that is the post-update restore — and later ones need TWO
-/// consecutive misses before acting. That grace tick is what keeps the watchdog from fighting the
-/// tray's own "Exit tray", which stops this service and takes the watchdog down with it a few
+/// First check is immediate. Later ticks need two consecutive misses before
+/// [`ensure`]: one miss is the tray's own Exit, which stops this service a few
 /// seconds later.
 pub fn supervise() {
     std::thread::spawn(|| {
@@ -128,9 +110,7 @@ pub fn supervise() {
     });
 }
 
-/// One supervision beat. Best-effort by design: nobody's stream depends on the icon, and the
-/// ordinary "failure" is simply that nobody has signed in yet — so this stays at `debug`/`info`
-/// rather than handing the operator a warning they cannot act on.
+/// Best-effort: a miss is usually "nobody signed in yet", so this stays at `debug`/`info`.
 fn ensure() {
     match start() {
         Ok((Some(pid), how)) => tracing::info!(pid, how, "status tray started"),
@@ -141,13 +121,11 @@ fn ensure() {
 
 /// Start the tray if it is not already up.
 ///
-/// `Ok(None)` = one was already running (idempotent by design: the tray also guards itself with a
-/// `Local\PunktfunkTray` mutex, so even a lost race merely makes the second instance exit). The
-/// `&'static str` names which mechanism launched it, for an honest CLI message.
+/// `Ok(None)` = already running. The tray also holds `Local\PunktfunkTray`, so a lost race just
+/// exits the second instance. The `&'static str` names the launch path.
 ///
-/// Note for an ELEVATED interactive caller: the fallback spawn inherits this process's token, so
-/// the tray then runs elevated. It works, but UIPI stops a medium-integrity `--quit` from closing
-/// it later. Prefer `tray start` from a normal shell, or let the host service do it.
+/// An elevated interactive spawn inherits this token; UIPI then blocks a medium-integrity `--quit`.
+/// Prefer `tray start` from a normal shell, or let the host service do it.
 pub fn start() -> Result<(Option<u32>, &'static str)> {
     let Some(exe) = tray_exe() else {
         bail!("{TRAY_EXE} is not installed next to this executable");
@@ -161,10 +139,8 @@ pub fn start() -> Result<(Option<u32>, &'static str)> {
         Ok(pid) => return Ok((Some(pid), "into the active console session")),
         Err(e) => e,
     };
-    // Only SYSTEM holds SE_TCB, so reaching here means an ordinary (possibly elevated) user — which
-    // is fine ONLY if we are already sitting in the session the icon has to appear in. Refuse
-    // loudly otherwise: a plain spawn from an ssh/RDP session would put a tray in a session nobody
-    // is looking at, report success, and leave the operator staring at an empty notification area.
+    // Only SYSTEM holds SE_TCB. A fallback spawn is correct only in the console session; from
+    // ssh/RDP it would land in a session nobody is looking at and still report success.
     if let Some((own, console)) = crate::interactive::console_session_mismatch() {
         bail!(
             "cannot place the tray in session {console} from session {own}: {session_err}\n\
@@ -180,21 +156,17 @@ pub fn start() -> Result<(Option<u32>, &'static str)> {
 
 /// Stop every tray instance. Returns whether one was running.
 ///
-/// Note that [`supervise`] will put one back within a minute while this host runs — `tray stop` is
-/// a diagnostic, not a way to turn the icon off. Turning it off for good means clearing the
-/// installer's HKLM `Run` value (see [`wanted`]).
+/// [`supervise`] puts one back within a minute while this host runs — a diagnostic, not an off
+/// switch. Clearing the HKLM `Run` value (see [`wanted`]) is the off switch.
 ///
-/// Graceful first, mirroring the uninstaller's own order (`[UninstallRun]`): `--quit` posts
-/// WM_CLOSE to the tray window, which lets it remove its icon via `NIM_DELETE` instead of leaving a
-/// ghost in the notification area until the shell next sweeps it. `--quit` only reaches the session
-/// it runs in, so a force-kill reaps any instance in another session.
+/// `--quit` posts WM_CLOSE so the tray can `NIM_DELETE` its icon; skip that and the shell keeps a
+/// ghost. `--quit` only reaches this session, so `taskkill` reaps any instance in another.
 pub fn stop() -> bool {
     let was_running = is_running();
     if !was_running {
         return false;
     }
     if let Some(exe) = tray_exe() {
-        // Best-effort and short: if the graceful close does not land we force it below anyway.
         if let Ok(mut child) = std::process::Command::new(&exe).arg("--quit").spawn() {
             let _ = child.wait();
         }

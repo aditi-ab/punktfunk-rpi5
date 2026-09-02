@@ -1,8 +1,10 @@
-//! The in-console PIN pairing screen — the couch counterpart of the desktop PairSheet,
-//! and the piece that makes a Steam Deck self-sufficient (pairing used to need the
-//! Decky plugin or a desktop). The host shows a PIN in its web console; the user types
-//! it here (on-screen keyboard, or Steam's keyboard on Deck), the SPAKE2 ceremony runs
-//! on the binary's service thread, and success pins the host and pops back to Home.
+//! PIN pairing on the controller console — counterpart of the desktop PairSheet.
+//!
+//! Type the PIN the host shows (on-screen tray, or Steam's keyboard on Deck).
+//! SPAKE2 runs on the binary's service thread; success pins the host and the
+//! shell pops Home. A discovered host with an advertised fingerprint also
+//! offers Request access (connect and wait for operator approval). A typed
+//! host with no advert is PIN-only.
 
 use crate::glyphs::{Hint, HintKey};
 use crate::model::{ConsoleCmd, HostRow, PairPhase};
@@ -19,9 +21,6 @@ enum Field {
     Device,
 }
 
-/// The ordered actions a pair screen presents. `RequestAccess` leads only when the host
-/// has an advertised fingerprint to pin (a discovered host); a manually-typed host with
-/// no advert is PIN-only, exactly like the desktop shells.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
     RequestAccess,
@@ -34,16 +33,14 @@ pub(crate) struct PairScreen {
     host_name: String,
     addr: String,
     port: u16,
-    /// The host's advertised certificate fingerprint (lowercase hex); empty = a manual
-    /// entry with no advert → no request-access path.
+    /// Empty = typed host with no advert, so no Request access row.
     fp_hex: String,
     list: MenuList,
     keyboard: Keyboard,
     pin: String,
     device: String,
     editing: Option<Field>,
-    /// The ceremony is in flight (mirrors the model's `PairPhase::Busy` immediately so
-    /// a second A can't double-submit before the service thread picks the command up).
+    /// Local Busy so a second A cannot double-submit before the service thread sees the command.
     busy: bool,
     error: Option<String>,
 }
@@ -65,14 +62,12 @@ impl PairScreen {
         }
     }
 
-    /// Whether the no-PIN "request access" action is offered (host advertises an identity
-    /// to pin). Stable across `busy` so the row list never reshuffles mid-ceremony.
+    /// Stable across `busy` so the row list never reshuffles mid-ceremony.
     fn can_request(&self) -> bool {
         !self.fp_hex.is_empty()
     }
 
-    /// The ordered roles for the current host — the single source both `rows` (render) and
-    /// `menu` (activate dispatch) index, so a cursor never acts on a stale row.
+    /// Shared by `rows` and `activate` so the cursor cannot fire a stale row.
     fn roles(&self) -> Vec<Role> {
         let mut roles = Vec::with_capacity(4);
         if self.can_request() {
@@ -88,7 +83,7 @@ impl PairScreen {
         &self.host_name
     }
 
-    /// The shell routes the model's pairing phase here (success pops shell-side).
+    /// Paired is popped by the shell, not this screen.
     pub(crate) fn apply_phase(&mut self, phase: &PairPhase) {
         match phase {
             PairPhase::Busy => self.busy = true,
@@ -128,7 +123,7 @@ impl PairScreen {
             return false;
         }
         if f == Field::Pin && self.pin.chars().count() >= 8 {
-            return false; // PINs are 4 digits today; leave headroom, refuse novels
+            return false; // 4-digit PINs today; 8 is headroom, not a passphrase
         }
         self.field_mut(f).push(ch);
         true
@@ -201,7 +196,7 @@ impl PairScreen {
         }
 
         if ev == MenuEvent::Back {
-            // Leaving mid-ceremony is fine — success still pins and toasts globally.
+            // Leave is fine mid-ceremony: success still pins and toasts globally.
             fx.pop();
             return None;
         }
@@ -210,8 +205,8 @@ impl PairScreen {
         self.activate(msg, pulse, &roles, ctx, fx)
     }
 
-    /// Mouse/touch. The raised keyboard is modal, exactly as on the add-host screen: it
-    /// takes what lands on it, and a press outside closes it rather than reaching through.
+    /// Raised keyboard is modal: hits on it stay here; a press outside closes it rather
+    /// than reaching the row underneath.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
         if self.editing.is_some() && !ctx.deck {
             if !self.keyboard.covers(p) {
@@ -257,10 +252,7 @@ impl PairScreen {
             ListMsg::Activate => {
                 match roles.get(self.list.cursor) {
                     Some(Role::RequestAccess) if !self.busy => {
-                        // The no-PIN path: connect and park until the operator approves this
-                        // device on the host. The shell shows the approval takeover; on
-                        // success the binary persists the host as paired. Leave the pair
-                        // screen so a canceled or finished session returns to Home.
+                        // Leave so a canceled or finished approval returns to Home, not here.
                         fx.connect = Some(ConnectIntent {
                             addr: self.addr.clone(),
                             port: self.port,
@@ -289,8 +281,7 @@ impl PairScreen {
                         });
                     }
                     _ => {
-                        // Pair with no PIN yet (or a request while busy) — jump into the
-                        // PIN field instead of a dead press.
+                        // No PIN yet, or Request while busy: open the PIN field, not a dead press.
                         if let Some(i) = roles.iter().position(|r| *r == Role::Pin) {
                             self.list.cursor = i;
                         }
@@ -356,7 +347,7 @@ impl PairScreen {
         } else {
             0.0
         };
-        // A status band under the rows: the ceremony spinner or the error line.
+        // Status band (spinner / error); 34 matches the settings detail band.
         let status_h = 34.0 * k;
         let list_rect = Rect::from_ltrb(
             rect.left,
@@ -414,8 +405,7 @@ impl PairScreen {
     }
 
     fn rows(&self) -> Vec<RowSpec> {
-        // The PIN renders spaced out (● would hide typos; a PIN is not a secret worth
-        // masking — the host shows it on screen anyway).
+        // Spaced digits, not ●: the host already shows the PIN, and ● hides typos.
         let pin_display: String = self
             .pin
             .chars()
@@ -435,8 +425,7 @@ impl PairScreen {
                 Role::Pin => {
                     let mut pin = RowSpec::field("PIN", pin_display.clone(), "From the host");
                     pin.caret = self.editing == Some(Field::Pin);
-                    // When a request-access path is offered above, head the PIN group so
-                    // the two ways to pair read as alternatives.
+                    // Only when Request access sits above, so the two paths read as alternatives.
                     if has_request {
                         pin.header = Some("Or pair with a PIN");
                     }
@@ -503,7 +492,7 @@ mod tests {
             t: 0.0,
         };
         let mut s = PairScreen::new(&host(), "living-room-deck");
-        s.device.clear(); // the user deleted the prefill
+        s.device.clear(); // empty field falls back to `ctx.device_name`
         s.editing = Some(Field::Pin);
         s.text_input("1234");
         s.edit_key(crate::input::Key::Return);
@@ -516,14 +505,11 @@ mod tests {
                 if pin == "1234" && device_name == "living-room-deck"
         ));
         assert!(s.busy);
-        // A second A while busy is a no-op (the action row is disabled).
         let mut fx = Outbox::default();
         s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
         assert!(fx.cmds.is_empty());
     }
 
-    /// A host with an advertised fingerprint offers Request Access as the first row; A on
-    /// it raises a request-access connect intent (pinning the advert) and leaves the screen.
     #[test]
     fn request_access_connects_and_leaves() {
         let mut host = host();
@@ -545,7 +531,7 @@ mod tests {
         };
         let mut s = PairScreen::new(&host, "deck");
         assert_eq!(s.roles().len(), 4, "Request Access + PIN + Device + Pair");
-        s.list.cursor = 0; // the Request Access row leads
+        s.list.cursor = 0;
         let mut fx = Outbox::default();
         s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
         let intent = fx.connect.expect("request-access raises a connect intent");
@@ -554,10 +540,9 @@ mod tests {
         assert!(matches!(fx.nav, Some(crate::screens::Nav::Pop)));
     }
 
-    /// A manual host (no advert) is PIN-only — the Request Access row never appears.
     #[test]
     fn no_request_access_without_an_advert() {
-        let s = PairScreen::new(&host(), "deck"); // host() has an empty fp_hex
+        let s = PairScreen::new(&host(), "deck");
         assert!(!s.can_request());
         assert_eq!(s.roles().len(), 3, "PIN + Device + Pair only");
     }

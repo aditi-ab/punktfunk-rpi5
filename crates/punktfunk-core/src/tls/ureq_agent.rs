@@ -1,15 +1,11 @@
-//! A blocking [`ureq::Agent`] that speaks TLS through a caller-supplied
-//! [`rustls::ClientConfig`] — which is the only way to get [`PinVerify`](super::PinVerify) into an
-//! HTTP client, because ureq's own `TlsConfig` exposes roots, a client cert and an
-//! off-switch, but no hook for a custom [`ServerCertVerifier`](rustls::client::danger::ServerCertVerifier).
+//! A blocking [`ureq::Agent`] over a caller-supplied [`rustls::ClientConfig`].
+//! ureq's `TlsConfig` exposes roots, a client cert, and an off-switch, but no
+//! [`ServerCertVerifier`](rustls::client::danger::ServerCertVerifier) hook, so
+//! [`PinVerify`](super::PinVerify) cannot use the default agent.
 //!
-//! Every caller here pins the host's self-signed leaf by fingerprint (the same trust rule as the
-//! QUIC plane), so "just use the default agent" is not an option: the default agent validates
-//! against webpki roots, which a self-signed host cert can never satisfy.
-//!
-//! The connector below is modelled on ureq 3.x's own (crate-private) `RustlsConnector` minus its
-//! `TlsConfig`-driven config-building step. It is transport glue, not crypto: the handshake, the
-//! verifier and the cipher suites all live in the `ClientConfig` the caller hands in.
+//! The default agent validates against webpki roots, which a self-signed host
+//! cert never satisfies. Handshake, verifier, and cipher suites live in the
+//! `ClientConfig` the caller hands in; this module is transport glue.
 
 use std::io::{Read as _, Write as _};
 use std::sync::Arc;
@@ -20,9 +16,8 @@ use ureq::unversioned::transport::{
     Transport, TransportAdapter,
 };
 
-/// Build an agent whose HTTPS connections use `tls` verbatim, with `config` for everything else
-/// (timeouts, redirect policy, buffer sizes) — built by the caller via
-/// [`ureq::Agent::config_builder`], since those knobs differ per call site.
+/// HTTPS via `tls` verbatim. Other knobs (timeouts, redirects, buffers) come
+/// from `config`, built by the caller via [`ureq::Agent::config_builder`].
 pub fn agent(tls: Arc<rustls::ClientConfig>, config: ureq::config::Config) -> ureq::Agent {
     let connector = TcpConnector::default().chain(PinnedTlsConnector { config: tls });
     ureq::Agent::with_parts(config, connector, DefaultResolver::default())
@@ -50,7 +45,6 @@ impl<In: Transport> Connector<In> for PinnedTlsConnector {
             // Unreachable via `agent()` above, which always chains onto a TcpConnector.
             return Err(ureq::Error::Tls("no chained transport to wrap in TLS"));
         };
-        // A plain-HTTP URL, or something that already negotiated TLS, passes straight through.
         if !details.needs_tls() || transport.is_tls() {
             return Ok(Some(Either::A(transport)));
         }

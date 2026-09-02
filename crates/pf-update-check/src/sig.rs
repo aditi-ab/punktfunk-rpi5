@@ -1,12 +1,11 @@
-//! Detached Ed25519 signatures over an exact document (plugin-store index, update manifest).
+//! Detached Ed25519 over exact document bytes (plugin-store index, update manifest).
 //!
-//! Moved here from `punktfunk-host::store::index` when the client grew its own update check:
-//! one implementation, one set of tests, one place to fix if the format ever moves. The host
-//! re-exports it, so its call sites are unchanged.
+//! Key: `ed25519:<base64 of 32 raw bytes>`. Sig: base64 of 64 raw bytes, whitespace-tolerant.
+//! Host re-exports this crate so both products share one verifier.
 
 use anyhow::{bail, Context, Result};
 
-/// An ed25519 public key pinned by a source record, spelled `ed25519:<base64 of the 32 raw bytes>`.
+/// Pinned key, spelled `ed25519:<base64 of the 32 raw bytes>`.
 #[derive(Debug, Clone)]
 pub struct PublicKey(Vec<u8>);
 
@@ -26,11 +25,9 @@ impl PublicKey {
     }
 }
 
-/// Verify a detached ed25519 signature over the **exact** document bytes against any of the
-/// pinned keys (two slots, so a key rotation is "sign with the new one, ship a build that
-/// trusts both, retire the old" rather than a flag day).
+/// Exact bytes against any pinned key. Two slots so rotation is not a flag day.
 ///
-/// `sig_text` is the `.sig` file's contents: base64, whitespace-tolerant.
+/// `sig_text` is the `.sig` file: base64, whitespace-tolerant.
 pub fn verify_signature(bytes: &[u8], sig_text: &str, keys: &[PublicKey]) -> Result<()> {
     use base64::Engine as _;
     if keys.is_empty() {
@@ -53,8 +50,6 @@ pub fn verify_signature(bytes: &[u8], sig_text: &str, keys: &[PublicKey]) -> Res
 pub(crate) mod tests {
     use super::*;
 
-    /// A fresh keypair as `(pinned key string, signer)` — the format contract with the
-    /// CI signers (raw 32-byte key, `ed25519:<base64>`; raw 64-byte signature, base64).
     pub(crate) fn keypair() -> (String, aws_lc_rs::signature::Ed25519KeyPair) {
         use aws_lc_rs::signature::KeyPair as _;
         use base64::Engine as _;
@@ -88,12 +83,10 @@ pub(crate) mod tests {
     fn key_format_is_enforced() {
         assert!(PublicKey::parse("6rmlLg1aQ55cgB6icpC5BEpbMJxwPKdGaDQtDcJ0yLI=").is_err());
         assert!(PublicKey::parse("ed25519:not base64!!").is_err());
-        // Right encoding, wrong length.
         assert!(PublicKey::parse("ed25519:AAAA").is_err());
     }
 
-    /// A signature from a key we do NOT pin must fail even though it is perfectly valid —
-    /// "verifies" and "verifies as us" are the same statement or the pinning is decorative.
+    /// A valid signature from an unpinned key is still a miss; pinning is the check.
     #[test]
     fn other_signer_refused() {
         use base64::Engine as _;

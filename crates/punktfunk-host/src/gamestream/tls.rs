@@ -1,11 +1,12 @@
-//! TLS for the HTTPS nvhttp port (47984) and the management API. Moonlight does **mutual TLS** —
-//! it presents its client cert and expects the server to request one — so a plain server-auth
-//! config makes the post-pairing `pairchallenge` fail. This config requests the client cert and
-//! verifies the client owns its key, but accepts any well-formed cert at the *handshake* (the
-//! pairing ceremony is the real proof of identity). Authorization against the paired allow-list is
-//! then enforced per-request: [`serve_https`] reads the verified peer cert and attaches its
-//! fingerprint ([`PeerCertFingerprint`]) to each request, and the nvhttp/mgmt handlers reject
-//! callers whose fingerprint is not pinned (mirroring Apollo's post-handshake `get_verified_cert`).
+//! TLS for the HTTPS nvhttp port (47984) and the management API.
+//!
+//! Moonlight does mutual TLS: it presents a client cert and expects the
+//! server to request one. A server-auth-only config makes post-pairing
+//! `pairchallenge` fail. This config requests the cert and verifies the
+//! client owns its key, then accepts any well-formed cert at the handshake
+//! — pairing is the identity proof. Authorization is per-request:
+//! [`serve_https`] attaches [`PeerCertFingerprint`]; nvhttp/mgmt handlers
+//! reject unpinned callers (Apollo's post-handshake `get_verified_cert`).
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -18,34 +19,31 @@ use rustls::{DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureSc
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// SHA-256 of the peer's client certificate (hex), injected per-connection into each request's
-/// extensions by [`serve_https`]; `None` when the peer presented no client cert (plain HTTP, or a
-/// browser falling back to a bearer token). Handlers authorize a request whose fingerprint is in
-/// the paired store.
+/// SHA-256 of the peer client cert (hex). `None` on plain HTTP or a certless
+/// browser (bearer token). Handlers authorize against the paired store.
 #[derive(Clone)]
 pub(crate) struct PeerCertFingerprint(pub Option<String>);
 
-/// The TCP source address of an HTTPS request, injected per-connection by [`serve_https`]. Used by
-/// `/launch` to record which paired client owns the session so the unauthenticated RTSP/UDP media
-/// plane can bind to that peer's IP (security-review 2026-06-28 #4).
+/// TCP source of an HTTPS request. `/launch` records which paired client
+/// owns the session so the unauthenticated RTSP/UDP media plane can bind
+/// to that IP.
 #[derive(Clone, Copy)]
 pub(crate) struct PeerAddr(pub SocketAddr);
 
-/// Ceilings for the governed HTTP(S) acceptors (security-review 2026-08-31 M-6): without them a
-/// LAN peer holding sockets open — incomplete TLS handshakes, never-sent request headers, idle
-/// connections — exhausts file descriptors and memory with no authentication at all. Generous
-/// for real deployments: a console browser holds a handful of connections, a paired client a few.
+/// Caps on the HTTP(S) acceptors. Without them a LAN peer holding sockets
+/// (incomplete TLS, idle connections) exhausts fds with no authentication.
+/// 256 / 32 is generous: a console browser holds a handful, a paired client a few.
 const MAX_CONNS: usize = 256;
 const MAX_CONNS_PER_IP: usize = 32;
-/// A LAN handshake completes in milliseconds; a peer still negotiating after this is holding a
-/// slot, not pairing.
+/// A LAN handshake completes in milliseconds; a peer still negotiating after
+/// this is holding a slot, not pairing.
 const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// Bounds reading each request's header block (the slowloris shape). Response streaming — the
-/// mgmt event stream — is unaffected; hyper re-arms this per request on a keep-alive connection.
+/// Bounds reading each request's header block (slowloris). Response streaming
+/// is unaffected; hyper re-arms this per request on a keep-alive connection.
 const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Decrements its IP's live-connection count on drop, so the per-IP ceiling tracks reality on
-/// every exit path (handshake failure, served connection, task cancellation).
+/// Decrements the per-IP live count on drop so every exit path (handshake
+/// failure, served connection, cancellation) releases the ceiling.
 struct IpGuard(
     Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
     std::net::IpAddr,
@@ -63,10 +61,10 @@ impl Drop for IpGuard {
     }
 }
 
-/// HTTPS server that surfaces the verified client cert to handlers. `axum_server` can't expose the
-/// peer cert, so this runs the rustls handshake itself (tokio-rustls), reads the peer certificate,
-/// and serves the axum `Router` over hyper with the peer's fingerprint attached to every request as
-/// a [`PeerCertFingerprint`] extension. Shared by the nvhttp HTTPS listener and the management API.
+/// HTTPS server that surfaces the verified client cert to handlers.
+/// `axum_server` cannot expose the peer cert, so this runs the rustls
+/// handshake (tokio-rustls) and attaches [`PeerCertFingerprint`] on every
+/// request. Shared by the nvhttp HTTPS listener and the management API.
 pub(crate) async fn serve_https(
     bind: SocketAddr,
     app: Router,
@@ -75,8 +73,8 @@ pub(crate) async fn serve_https(
     serve_governed(bind, app, Some(tls)).await
 }
 
-/// The same governed acceptor without TLS — the plain nvhttp listener (47989), which is pre-auth
-/// by protocol design and needs the identical connection ceilings (security-review 2026-08-31 M-6).
+/// Same acceptor without TLS — the plain nvhttp listener (47989). Pre-auth
+/// by protocol; still needs the connection ceilings.
 pub(crate) async fn serve_plain(bind: SocketAddr, app: Router) -> Result<()> {
     serve_governed(bind, app, None).await
 }
@@ -104,9 +102,9 @@ async fn serve_governed(
                 continue;
             }
         };
-        // Refuse (drop the socket) rather than queue when a ceiling is hit: a well-behaved
-        // client retries, and queuing is exactly the unbounded buildup the ceiling exists to
-        // prevent. Both guards travel into the task so every exit path releases them.
+        // Drop rather than queue when a ceiling is hit: a well-behaved client retries,
+        // and queuing is the unbounded buildup the ceiling exists to prevent.
+        // Both guards travel into the task so every exit path releases them.
         let Ok(permit) = conns.clone().try_acquire_owned() else {
             tracing::warn!(%peer, "HTTP(S) connection ceiling reached — dropping new connection");
             continue;
@@ -133,12 +131,11 @@ async fn serve_governed(
                             .await
                         {
                             Ok(Ok(s)) => s,
-                            // A failed or dawdling handshake is routine (port scan, a browser bailing
-                            // on the self-signed cert, a peer that hung up) — not fatal.
+                            // Failed or dawdling handshake is routine (port scan, browser
+                            // bailing on the self-signed cert) — not fatal.
                             _ => return,
                         };
-                    // The verified peer cert (the verifier accepts any well-formed one; handlers
-                    // authorize by fingerprint) → its SHA-256, matched against the paired store.
+                    // Verifier accepts any well-formed cert; handlers authorize by fingerprint.
                     let fp = tls_stream
                         .get_ref()
                         .1
@@ -151,8 +148,6 @@ async fn serve_governed(
                         });
                     serve_conn(tls_stream, app, PeerCertFingerprint(fp), PeerAddr(peer)).await;
                 }
-                // Plain HTTP carries no client cert by construction — handlers see `None` and
-                // treat the peer as unpaired, exactly as before.
                 None => serve_conn(tcp, app, PeerCertFingerprint(None), PeerAddr(peer)).await,
             }
         });
@@ -223,40 +218,26 @@ mod governed_tests {
     }
 }
 
-/// Requests the client cert and **verifies its `CertificateVerify` signature**, but does not
-/// judge the certificate itself. Authorization happens immediately after the handshake, against
-/// the pinned allow-list (`nvhttp::peer_is_paired`).
+/// Requests the client cert and verifies its `CertificateVerify` signature,
+/// but does not judge the certificate. Authorization is after the handshake
+/// against the pinned allow-list (`nvhttp::peer_is_paired`).
 ///
-/// **This is the design, not an unfinished pin.** (Reviewed 2026-08-27; the comment here used to
-/// call pinning "a hardening follow-up", which read as debt.) Three things decide it:
+/// Pinning here is not expressible: the handshake finishes before the
+/// request line, and the protocol fixes the ports, so post-pair routes
+/// cannot use a different listener. `/serverinfo` on 47984 must answer
+/// unpaired peers (`PairStatus=0`) or pairing has no entry point. The
+/// management API shares this verifier and admits certless browsers
+/// (`mandatory: false`) that authenticate by bearer token.
 ///
-/// * **A TLS handshake cannot know the route.** It completes before a single byte of the request
-///   line is parsed, so "pin the post-pair routes, accept-any on the pairing routes" is not
-///   expressible here — it would take a second listener on a second port, and the protocol fixes
-///   the ports.
-/// * **Some HTTPS traffic must come from unpaired peers.** `/serverinfo` over 47984 answers
-///   `PairStatus=0` precisely so a client can discover it needs to pair; refusing the handshake
-///   would remove the entry point to pairing. The management API shares this verifier and goes
-///   further, admitting *certless* browsers (`mandatory: false`) that authenticate by bearer
-///   token instead.
-/// * **Deferring the check costs nothing cryptographically.** The signature verification below is
-///   real — webpki's, or [`accept_legacy_moonlight_cert`]'s equivalent RSA check for the pre-v3
-///   certificates Moonlight presents — so a peer reaching a handler has *proved possession* of the
-///   private key for the certificate it presented. `peer_is_paired` then pins the SHA-256 of that
-///   same certificate before any state-changing work happens, and every route but `/serverinfo`
-///   goes through it. Rejecting an unpinned peer with an HTTP error rather than a TLS alert is a
-///   difference in *when*, not in *what is proven*.
-///
-/// What would genuinely be a hole is accepting the certificate without checking the signature —
-/// then anyone could replay a paired client's certificate, which is public, and pass the
-/// fingerprint gate without its key. That is why [`verify_tls12_signature`] /
-/// [`verify_tls13_signature`] below must keep returning a real verdict, and why the legacy
-/// fallback re-verifies rather than waving the certificate through.
+/// A peer that reaches a handler has proved possession of the presented
+/// key (webpki, or [`accept_legacy_moonlight_cert`] for pre-v3 RSA).
+/// `peer_is_paired` then pins that cert's SHA-256. Skipping the signature
+/// check would let anyone replay a paired client's public certificate.
 #[derive(Debug)]
 struct AcceptAnyClientCert {
     provider: Arc<CryptoProvider>,
-    /// nvhttp/pairing REQUIRES the client cert (mandatory); the mgmt API REQUESTS it but lets a
-    /// certless peer (a browser, falling back to a bearer token) through (optional).
+    /// nvhttp/pairing requires the client cert; the mgmt API requests it but
+    /// lets a certless peer (browser + bearer token) through.
     mandatory: bool,
 }
 
@@ -294,7 +275,7 @@ impl ClientCertVerifier for AcceptAnyClientCert {
             dss,
             &self.provider.signature_verification_algorithms,
         );
-        // The Moonlight-client-cert leniency exists only when the compat planes do (WP19) —
+        // Moonlight-client-cert leniency only when the compat planes are on;
         // native clients present webpki-clean certs and never need it.
         #[cfg(feature = "gamestream")]
         let verdict = verdict.or_else(|e| accept_legacy_moonlight_cert(message, cert, dss, e));
@@ -313,7 +294,7 @@ impl ClientCertVerifier for AcceptAnyClientCert {
             dss,
             &self.provider.signature_verification_algorithms,
         );
-        // The Moonlight-client-cert leniency exists only when the compat planes do (WP19) —
+        // Moonlight-client-cert leniency only when the compat planes are on;
         // native clients present webpki-clean certs and never need it.
         #[cfg(feature = "gamestream")]
         let verdict = verdict.or_else(|e| accept_legacy_moonlight_cert(message, cert, dss, e));
@@ -327,29 +308,21 @@ impl ClientCertVerifier for AcceptAnyClientCert {
     }
 }
 
-/// Fallback client-cert `CertificateVerify` check that tolerates pre-v3 (X.509 v2) certificates,
-/// invoked only when rustls-webpki's strict path has already rejected the cert.
+/// Fallback `CertificateVerify` for pre-v3 (X.509 v2) certificates, used
+/// only after rustls-webpki has already rejected the cert.
 ///
-/// **The compatibility gap.** rustls-webpki (0.103) accepts *only* X.509 v3 certs and returns
-/// `UnsupportedCertVersion` for anything older — aborting the mTLS handshake before it ever looks at
-/// the signature. The moonlight-embedded client family (moonlight-embedded, aurora-tv, …) still mint
-/// self-signed **v2** certs with no `keyUsage` extension, so pairing fails against us while it works
-/// against Sunshine, whose OpenSSL verify callback never inspects the cert version. The decisive
-/// factor is the cert *version*, not the missing `keyUsage` — a v3 cert with no extensions passes
-/// webpki fine.
+/// rustls-webpki 0.103 accepts only X.509 v3 and returns
+/// `UnsupportedCertVersion` before looking at the signature.
+/// moonlight-embedded still mints self-signed v2 certs with no `keyUsage`,
+/// so pairing fails here while Sunshine's OpenSSL callback never inspects
+/// version. The version is the gap; a v3 cert with no extensions passes.
 ///
-/// **Why relaxing it does not weaken security.** The cert's X.509 version and extensions carry no
-/// security weight in GameStream: the client cert is self-signed and later pinned by SHA-256
-/// (`nvhttp::peer_is_paired`), and the PIN pairing ceremony is the real proof of identity. The one
-/// property that *does* matter — and that we still enforce here — is that the peer holds the private
-/// key for the cert it presented (the TLS `CertificateVerify` signature), because the cert itself is
-/// exchanged in the clear over the plain-HTTP pairing port and is not a secret. So we re-run
-/// *exactly that* check with a version-agnostic parser: pull the RSA public key from the lenient
-/// x509-parser and verify the handshake signature ourselves (the same primitive
-/// `pairing::verify256` uses). This is a full cryptographic verification, never a bypass — a bad
-/// signature still fails, and any non-RSA / unsupported scheme falls through to webpki's original
-/// error `webpki_err`. Moonlight/Sunshine client certs are RSA-2048, so this matches Sunshine's
-/// leniency without loosening the pinned trust model.
+/// X.509 version and extensions carry no GameStream security weight: the
+/// cert is self-signed and later pinned by SHA-256 (`nvhttp::peer_is_paired`).
+/// The property that matters is possession of the private key. We re-run
+/// that check with a version-agnostic parser (x509-parser + RSA), the same
+/// primitive `pairing::verify256` uses. A bad signature still fails; any
+/// non-RSA scheme returns `webpki_err`. Not a bypass.
 #[cfg(feature = "gamestream")]
 fn accept_legacy_moonlight_cert(
     message: &[u8],
@@ -368,13 +341,12 @@ fn accept_legacy_moonlight_cert(
         return Err(webpki_err);
     };
     let Ok(key) = RsaPublicKey::from_public_key_der(x509.public_key().raw) else {
-        return Err(webpki_err); // not an RSA cert — leave webpki's verdict in place
+        return Err(webpki_err); // not RSA — keep webpki's error
     };
     let sig = dss.signature();
 
-    // `VerifyingKey`/`Signature` hash `message` internally with the scheme's digest; each arm moves
-    // `key`, but exactly one arm runs. Covers the RSA PKCS#1v1.5 and RSA-PSS schemes a Moonlight
-    // client offers in `CertificateVerify` (SHA-256/384/512).
+    // `VerifyingKey`/`Signature` hash `message` internally; each arm moves
+    // `key`, but exactly one arm runs.
     let ok = match dss.scheme {
         SignatureScheme::RSA_PKCS1_SHA256 => pkcs1v15::Signature::try_from(sig)
             .map(|s| {
@@ -431,15 +403,15 @@ fn accept_legacy_moonlight_cert(
     }
 }
 
-/// Build a mutual-TLS `ServerConfig` presenting the host cert/key. nvhttp/pairing path: the
-/// client cert is **mandatory**.
+/// Mutual-TLS `ServerConfig` with the host cert/key. nvhttp/pairing:
+/// client cert is mandatory.
 pub fn server_config(cert_pem: &str, key_pem: &str) -> Result<Arc<ServerConfig>> {
     build_server_config(cert_pem, key_pem, true)
 }
 
-/// Like [`server_config`] but the client cert is **optional** — a certless peer (a browser using a
-/// bearer token) still completes the handshake. Used by the management API's mTLS auth: a paired
-/// client presents its cert (authorized by fingerprint), everyone else falls back to the token.
+/// Like [`server_config`] but the client cert is optional — a certless
+/// peer (browser + bearer token) still completes the handshake. Mgmt
+/// API: paired clients present a cert; everyone else falls back to the token.
 pub fn server_config_optional_client(cert_pem: &str, key_pem: &str) -> Result<Arc<ServerConfig>> {
     build_server_config(cert_pem, key_pem, false)
 }
@@ -450,8 +422,8 @@ fn build_server_config(
     mandatory: bool,
 ) -> Result<Arc<ServerConfig>> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    // PEM parsing via rustls-pki-types (the same `PemObject` path punktfunk-core/quic.rs uses),
-    // so we don't pull the unmaintained `rustls-pemfile`.
+    // rustls-pki-types `PemObject` (same path as punktfunk-core/quic.rs) so
+    // we don't pull the unmaintained `rustls-pemfile`.
     let certs = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("parse host cert PEM")?;

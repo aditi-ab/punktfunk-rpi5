@@ -1,39 +1,25 @@
-//! PyroWave client decode (design/pyrowave-codec-plan.md §4.5) — the wired-LAN wavelet
-//! codec's decoder, running as plain Vulkan compute on the PRESENTER's own VkDevice (the
-//! whole point: decode + CSC + present on one device, zero interop): the AU is one
-//! self-delimiting pyrowave packet; `push_packet` → ready →
-//! `decode_gpu_buffer` recorded into OUR command buffer, submitted on the shared graphics
-//! queue under the device's [`QueueLock`], fence-waited (sub-ms — Phase-0 measured
-//! 0.067 ms GPU at 1080p on the RTX 5070 Ti).
+//! PyroWave client decode on the presenter's VkDevice: decode + CSC + present on one
+//! device, no interop (design/pyrowave-codec-plan.md). One AU is one self-delimiting
+//! packet: `push_packet` → ready → `decode_gpu_buffer` into our command buffer,
+//! submitted under [`QueueLock`], fence-waited.
 //!
-//! Output: three separate single-component planes (Y full-res; Cb/Cr half-res, or
-//! full-res on a 4:4:4 session) — R8, or R16 UNORM on a 10-bit session — the decode
-//! path requires STORAGE usage and IDENTITY/R swizzles, so the encoder's two-component
-//! RG trick is not allowed here (pyrowave.h validation). The presenter samples them
-//! with its planar CSC variant (colour per the negotiated `ColorInfo` — the wavelet
-//! bitstream carries no VUI). A small ring of plane-sets keeps a decode from overwriting the set
-//! the presenter is still sampling; the synchronous fence bounds decode-side reuse and
-//! the ring depth covers present-side latency (≤ 1–2 frames in this pipeline).
+//! Output is three STORAGE planes (Y full-res; Cb/Cr half-res, or full-res on 4:4:4;
+//! R8, or R16 UNORM at 10-bit). Encoder RG packing is invalid here (`pyrowave.h`).
+//! Colour comes from negotiated `ColorInfo`; the bitstream has no VUI. A plane-set
+//! ring keeps decode from overwriting a set the presenter still samples.
 //!
-//! pyrowave 0.4.0 requires the instance/device create-infos to stay alive on the shared
-//! device — the presenter doesn't pin its originals, so [`Hold`] reconstructs
-//! content-equivalent ones from [`VulkanDecodeDevice`]'s exported extension lists,
-//! feature facts and queue-family shape (pyrowave reads them for extension/feature
-//! detection; pointer identity is not required).
+//! pyrowave 0.4.0 needs instance/device create-infos alive for the shared device.
+//! The presenter does not pin its originals, so [`Hold`] reconstructs content-equivalent
+//! ones from [`VulkanDecodeDevice`]. Pointer identity is not required.
 //!
-//! **Mid-stream resize:** the pyrowave decoder object is fixed-size, but every frame's
-//! bitstream opens with a sequence header carrying its dimensions — [`au_dims`] sniffs
-//! it and [`PyroWaveDecoder::reconfigure`] rebuilds the decoder + plane ring in place
-//! when the host's `Reconfigure` pipeline rebuild lands (the pyrowave *device*, command
-//! pool and pinned create-infos are dimension-independent and survive). Superseded plane
-//! rings are retired, not destroyed — the presenter may still hold their views (see
-//! [`RETIRE_HANDOVERS`]).
+//! The decoder object is fixed-size. [`au_dims`] sniffs each frame's sequence header
+//! and [`PyroWaveDecoder::reconfigure`] rebuilds decoder + plane ring in place; device,
+//! command pool and pinned create-infos survive. Superseded rings are retired, not
+//! destroyed — the presenter may still hold their views (see [`RETIRE_HANDOVERS`]).
 
-// UNSAFE-LINT EXEMPTION (rationale + exit criteria: `unsafe_op_in_unsafe_fn` in the workspace
-// Cargo.toml). This body is `pyrowave-sys` C-API and ash/Vulkan compute calls almost line for line;
-// narrowing it would add one `unsafe {}` plus one SAFETY comment per call that could only restate
-// the signature. Clearing this file means DELETING the markers that carry no caller contract, not
-// wrapping the calls — until then the lint is off HERE and enforced everywhere else.
+// UNSAFE-LINT EXEMPTION: pyrowave-sys C-API + ash compute, line for line. Wrapping
+// each call would add `unsafe {}` + a SAFETY that restates the signature. Clearing
+// this file means deleting markers with no caller contract, not wrapping the calls.
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::video::{ColorDesc, VulkanDecodeDevice};
@@ -45,22 +31,16 @@ use std::ffi::{c_char, c_void, CString};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Plane-set ring depth: decode writes slot N while the presenter may still sample
-/// N-1/N-2 (its own submission raced ahead under the shared queue's FIFO order, so
-/// same-queue execution ordering already serializes writes vs. reads per slot; the ring
-/// keeps LOGICAL reuse far enough behind).
+/// Decode writes slot N while the presenter may still sample N-1/N-2. Same-queue FIFO
+/// already serializes writes vs. reads per slot; 4 covers ≤ 1–2 frames of present latency.
 const RING: usize = 4;
 
-/// A mid-stream resize retires the old plane ring, but its images can't be destroyed
-/// immediately: the pump→presenter frame channel (depth 2, newest-wins) may still hold a
-/// frame referencing them, and the presenter binds a frame's views into its descriptor
-/// set only inside the `present` call that carries it. Once this many NEW-ring frames
-/// have been handed over, every old-ring frame has been displaced from the channel and
-/// any present that picked one up has long finished recording; combined with the
-/// queue-idle taken before destruction (covers submitted GPU work) the retired images
-/// are provably unreachable. The wall-clock floor is a belt for a presenter stalled
-/// mid-`present` (swapchain acquire on an occluded window) while frames keep flowing.
+/// Handovers after a resize before a retired ring's images may be destroyed. The
+/// pump→presenter channel (depth 2, newest-wins) can still hold an old-ring frame, and
+/// the presenter binds views only inside `present`. Eight new-ring frames displace every
+/// old one; `queue_wait_idle` then covers submitted GPU work.
 const RETIRE_HANDOVERS: u32 = 8;
+/// Floor while `present` is stalled on an occluded swapchain acquire and frames still flow.
 const RETIRE_MIN_AGE: Duration = Duration::from_millis(250);
 
 fn pw_check(r: pw::pyrowave_result, what: &str) -> Result<()> {
@@ -71,11 +51,10 @@ fn pw_check(r: pw::pyrowave_result, what: &str) -> Result<()> {
     }
 }
 
-/// Parse an upstream `BitstreamSequenceHeader` (pyrowave_common.hpp) at the start of
-/// `bytes`: 8 bytes, two LE u32s — word 0 = `width_minus_1:14 | height_minus_1:14 |
-/// sequence:3 | extended:1`, word 1 = `total_blocks:24 | code:2 | …`. Returns the frame
-/// dimensions when this really is a START-OF-FRAME sequence header (the `extended` bit
-/// distinguishes it from a regular `BitstreamHeader`, which carries a wavelet block).
+/// Sequence header at the start of `bytes` (pyrowave_common.hpp): 8 bytes, two LE u32s —
+/// word 0 = `width_minus_1:14 | height_minus_1:14 | sequence:3 | extended:1`, word 1 =
+/// `total_blocks:24 | code:2 | …`. The `extended` bit distinguishes a START-OF-FRAME
+/// header from a regular `BitstreamHeader` (a wavelet block).
 fn seq_header_dims(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.len() < 8 {
         return None;
@@ -83,21 +62,18 @@ fn seq_header_dims(bytes: &[u8]) -> Option<(u32, u32)> {
     let w0 = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     let w1 = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
     if w0 >> 31 == 0 {
-        return None; // regular block header, not a sequence header
+        return None;
     }
     if (w1 >> 24) & 0x3 != 0 {
-        return None; // extended, but not BITSTREAM_EXTENDED_CODE_START_OF_FRAME
+        return None; // not START_OF_FRAME
     }
     Some(((w0 & 0x3FFF) + 1, ((w0 >> 14) & 0x3FFF) + 1))
 }
 
-/// The frame dimensions an AU announces, or `None` when they can't be known from this AU
-/// (the sequence header rode a lost shard of a partial). The encoder writes exactly one
-/// sequence header per frame, at byte 0 of the frame's bitstream — so it sits at the
-/// start of an unaligned AU, and at the start of the FIRST window's body in a
-/// chunk-aligned AU (§4.4 framing: 4-byte prefix `used:u16 | kind:u16`; kind PACKED or
-/// FRAG_FIRST both begin with the frame's first packet, and that packet begins with the
-/// sequence header).
+/// Frame dimensions this AU announces, or `None` when the sequence header rode a lost
+/// shard. One header per frame, at bitstream byte 0: start of an unaligned AU, or start
+/// of the first window body in a chunk-aligned AU (4-byte prefix `used:u16 | kind:u16`;
+/// PACKED and FRAG_FIRST both begin with the frame's first packet).
 fn au_dims(au: &[u8], aligned: bool, wire_window: usize) -> Option<(u32, u32)> {
     if !aligned {
         return seq_header_dims(au);
@@ -109,10 +85,10 @@ fn au_dims(au: &[u8], aligned: bool, wire_window: usize) -> Option<(u32, u32)> {
     let used = u16::from_le_bytes([win[0], win[1]]) as usize;
     let kind = u16::from_le_bytes([win[2], win[3]]);
     if used == 0 || 4 + used > win.len() {
-        return None; // first window lost/garbage — the sequence header went with it
+        return None;
     }
-    // WIN_PACKED (0) and WIN_FRAG_FIRST (1) both start at the frame's first packet;
-    // a CONT/LAST fragment here would mean the first window was lost.
+    // PACKED (0) and FRAG_FIRST (1) start at the frame's first packet; CONT/LAST here
+    // means the first window was lost.
     if kind > 1 {
         return None;
     }
@@ -120,7 +96,7 @@ fn au_dims(au: &[u8], aligned: bool, wire_window: usize) -> Option<(u32, u32)> {
 }
 
 /// Content-equivalent reconstruction of the presenter device's create-infos, pinned for
-/// the lifetime of the `pyrowave_device` (heap boxes; moving `Hold` moves only pointers).
+/// the `pyrowave_device` lifetime. Heap boxes: moving `Hold` moves only pointers.
 struct Hold {
     _inst_ext_names: Vec<CString>,
     _inst_ext_ptrs: Vec<*const c_char>,
@@ -169,8 +145,7 @@ impl Hold {
             ci.p_queue_priorities = queue_prio.as_ptr();
         }
 
-        // The feature facts the presenter enabled (VulkanDecodeDevice reports exactly
-        // what device creation turned on — pyrowave keys its paths off these).
+        // Facts the presenter enabled at device create; pyrowave keys its paths off these.
         let mut feat2 = Box::new(vk::PhysicalDeviceFeatures2::default());
         feat2.features.shader_int16 = vkd.f_shader_int16 as u32;
         let mut v11 = Box::new(
@@ -218,8 +193,8 @@ impl Hold {
     }
 }
 
-/// The queue-lock trampolines pyrowave calls around any internal queue use. `userdata`
-/// is a raw pointer to the [`crate::video::QueueLock`] kept alive by the decoder's Arc.
+/// Trampolines pyrowave calls around internal queue use. `userdata` is a raw pointer
+/// to the [`crate::video::QueueLock`] the decoder's Arc keeps alive.
 unsafe extern "C" fn queue_lock_cb(ud: *mut c_void) {
     // SAFETY: `ud` is the QueueLock the decoder's Arc pins; pyrowave only calls this
     // while the decoder (and thus the Arc) lives.
@@ -230,17 +205,15 @@ unsafe extern "C" fn queue_unlock_cb(ud: *mut c_void) {
     unsafe { (*(ud as *const crate::video::QueueLock)).unlock() }
 }
 
-/// One decoded PyroWave frame: three single-component plane images (R8, or R16 on a
-/// 10-bit session) on the presenter's device, GENERAL layout, decode-complete (the
-/// decoder fence-waits before handing it over). `slot` identifies the ring entry; the
-/// images/views live as long as the decoder.
+/// Fence-waited decode output on the presenter's device, GENERAL layout. Views live
+/// as long as the decoder.
 pub struct PyroWavePlanarFrame {
-    /// Raw `VkImageView`s (Y, Cb, Cr) for the presenter's planar CSC sampling.
+    /// Raw `VkImageView`s (Y, Cb, Cr) for planar CSC sampling.
     pub views: [u64; 3],
     pub width: u32,
     pub height: u32,
     pub color: ColorDesc,
-    /// Every PyroWave frame is independently decodable — always a clean re-anchor.
+    /// Independently decodable — always a clean re-anchor.
     pub keyframe: bool,
 }
 
@@ -252,17 +225,15 @@ struct PlaneSet {
     initialized: bool,
 }
 
-/// A plane ring superseded by a mid-stream resize, awaiting safe destruction (see
-/// [`RETIRE_HANDOVERS`] for the lifetime argument).
+/// Plane ring superseded by a mid-stream resize, awaiting destruction
+/// (see [`RETIRE_HANDOVERS`]).
 struct RetiredRing {
     sets: Vec<PlaneSet>,
-    /// Frames handed to the presenter since this ring was retired.
     handed_over: u32,
     retired_at: Instant,
 }
 
-/// One decode-output plane (`fmt` = R8, or R16 on a 10-bit session): storage (decode
-/// writes) + sampled (presenter CSC).
+/// One decode-output plane: STORAGE (decode writes) + SAMPLED (presenter CSC).
 unsafe fn make_plane(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -351,8 +322,8 @@ unsafe fn destroy_sets(device: &ash::Device, sets: &[PlaneSet]) {
     }
 }
 
-/// Build a fresh [`RING`]-deep plane ring at the given dimensions; cleans up the partial
-/// ring on failure (the caller keeps whatever it was using before).
+/// Fresh [`RING`]-deep plane ring. Cleans up a partial ring on failure; the caller
+/// keeps whatever it was using.
 unsafe fn build_ring(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -361,8 +332,7 @@ unsafe fn build_ring(
     chroma444: bool,
     fmt: vk::Format,
 ) -> Result<Vec<PlaneSet>> {
-    // 4:2:0 = half-res chroma; 4:4:4 = full-res. The presenter's planar CSC samples with
-    // normalized UVs, so the chroma plane resolution is transparent to it.
+    // Presenter planar CSC samples with normalized UVs; chroma resolution is transparent.
     let (cw, ch) = if chroma444 {
         (width, height)
     } else {
@@ -411,8 +381,8 @@ unsafe fn build_ring(
 }
 
 pub struct PyroWaveDecoder {
-    // ash wrappers reconstructed over the presenter's raw handles (not owned — the
-    // presenter outlives the decoder; Drop destroys only what this struct created).
+    // ash wrappers over the presenter's raw handles (not owned). Drop destroys only
+    // what this struct created; the presenter outlives the decoder.
     device: ash::Device,
     queue: vk::Queue,
     _hold: Box<Hold>,
@@ -420,7 +390,6 @@ pub struct PyroWaveDecoder {
     pw_dev: pw::pyrowave_device,
     pw_dec: pw::pyrowave_decoder,
     ring: Vec<PlaneSet>,
-    /// Plane rings superseded by mid-stream resizes, pending safe destruction.
     retired: Vec<RetiredRing>,
     next: usize,
     cmd_pool: vk::CommandPool,
@@ -429,18 +398,16 @@ pub struct PyroWaveDecoder {
     mem_props: vk::PhysicalDeviceMemoryProperties,
     width: u32,
     height: u32,
-    /// Session-fixed negotiated chroma ([`Welcome::chroma_format`]): 4:4:4 = full-res
-    /// chroma planes + `Chroma444` pyrowave decoders (the seq-header bit is
-    /// decoder-enforced upstream, so a mismatch fails loudly, never silently).
+    /// Session-fixed ([`Welcome::chroma_format`]). A seq-header mismatch fails upstream,
+    /// never silently.
     chroma444: bool,
-    /// Session colour signalling ([`Welcome::color`]): the wavelet bitstream has no VUI,
-    /// so the negotiated `ColorInfo` is the contract the presenter CSC configures from.
+    /// Negotiated [`Welcome::color`]. The wavelet bitstream has no VUI.
     color: ColorDesc,
-    /// Session-fixed negotiated depth ≥10: the planes are `R16_UNORM` carrying the host's
-    /// P010-style studio codes (the presenter samples them with depth-10 MSB-packed rows).
+    /// Depth ≥10: `R16_UNORM` planes carry P010-style studio codes; the presenter
+    /// samples them as depth-10 MSB-packed rows.
     hdr16: bool,
-    /// The wire shard payload — the parse-window size for chunk-aligned AUs (§4.4): each
-    /// window holds whole self-delimiting codec packets, zero-padded to the window.
+    /// Shard payload: parse-window size for chunk-aligned AUs. Each window holds whole
+    /// self-delimiting packets, zero-padded.
     wire_window: usize,
 }
 
@@ -464,9 +431,8 @@ impl PyroWaveDecoder {
         if !chroma444 && (width % 2 != 0 || height % 2 != 0) {
             bail!("pyrowave 4:2:0 needs even dimensions (got {width}x{height})");
         }
-        // SAFETY: the handles in `vkd` are the presenter's live instance/device (it
-        // outlives the decoder — same contract the FFmpeg Vulkan backend relies on);
-        // `Hold` pins the reconstructed create-infos for the pyrowave device's lifetime.
+        // SAFETY: `vkd` handles are the presenter's live instance/device (it outlives
+        // the decoder). `Hold` pins reconstructed create-infos for the pyrowave device.
         unsafe { Self::new_inner(vkd, width, height, shard_payload, chroma444, color, hdr16) }
     }
 
@@ -515,7 +481,7 @@ impl PyroWaveDecoder {
                 as *const pw::VkDeviceCreateInfo,
             queue_info: &mut queue_info,
             queue_info_count: 1,
-            // The presenter, Skia and every decode lane serialize on this same lock.
+            // Presenter, Skia and every decode lane serialize on this same lock.
             queue_lock_callback: Some(queue_lock_cb),
             queue_unlock_callback: Some(queue_unlock_cb),
             userdata: Arc::as_ptr(&queue_lock) as *mut c_void,
@@ -537,7 +503,7 @@ impl PyroWaveDecoder {
             } else {
                 pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
             },
-            // The fragment-iDWT path is for Mali/Adreno-class mobile GPUs only.
+            // fragment-iDWT is Mali/Adreno only.
             fragment_path: false,
         };
         let mut pw_dec: pw::pyrowave_decoder = std::ptr::null_mut();
@@ -549,14 +515,11 @@ impl PyroWaveDecoder {
             return Err(e);
         }
 
-        // Plane-set ring: 3 single-component planes (R8; R16 on a 10-bit session),
-        // storage (decode writes) + sampled (presenter CSC).
         let mem_props = instance.get_physical_device_memory_properties(
             vk::PhysicalDevice::from_raw(vkd.physical_device as u64),
         );
-        // 16-bit sessions decode into R16_UNORM storage planes; STORAGE_IMAGE support for
-        // R16_UNORM is optional in Vulkan (universal on desktop) — probe it so an exotic
-        // device fails with a clear message instead of a validation error.
+        // R16_UNORM STORAGE_IMAGE is optional in Vulkan. Probe so a miss is a clear
+        // error instead of a validation failure.
         let plane_fmt = if hdr16 {
             let props = instance.get_physical_device_format_properties(
                 vk::PhysicalDevice::from_raw(vkd.physical_device as u64),
@@ -625,13 +588,10 @@ impl PyroWaveDecoder {
         })
     }
 
-    /// Mid-stream resize: rebuild the pyrowave decoder + plane ring at the new
-    /// dimensions in place, keeping the (dimension-independent) pyrowave device, command
-    /// pool, fence and pinned create-infos. Build-new-before-drop-old: a failure leaves
-    /// the current decoder untouched (and propagates — with the stream now at a size we
-    /// can't decode, the session ends with a real error instead of a frozen picture).
-    /// The old ring is RETIRED, not destroyed: the presenter / frame channel may still
-    /// reference its views (see [`RETIRE_HANDOVERS`]).
+    /// Rebuild decoder + plane ring at new dimensions. Device, command pool, fence and
+    /// pinned create-infos are dimension-independent and survive. Build-new-before-drop-old:
+    /// failure leaves the current decoder untouched. The old ring is retired, not
+    /// destroyed (see [`RETIRE_HANDOVERS`]).
     unsafe fn reconfigure(&mut self, width: u32, height: u32) -> Result<()> {
         if !self.chroma444 && (width % 2 != 0 || height % 2 != 0) {
             bail!("pyrowave 4:2:0 needs even dimensions (resize to {width}x{height})");
@@ -640,7 +600,7 @@ impl PyroWaveDecoder {
             device: self.pw_dev,
             width: width as i32,
             height: height as i32,
-            // Chroma is session-fixed (negotiated); a resize never changes it.
+            // Chroma is session-fixed; a resize never changes it.
             chroma: if self.chroma444 {
                 pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_444
             } else {
@@ -671,8 +631,8 @@ impl PyroWaveDecoder {
                 return Err(e).context("plane ring (mid-stream resize)");
             }
         };
-        // Our own decode work is fence-synchronous (never in flight here), so the old
-        // pyrowave decoder can go immediately; only the plane images wait (retired).
+        // Decode is fence-synchronous here, so the old decoder can go now; only the
+        // plane images wait (retired).
         pw::pyrowave_decoder_destroy(self.pw_dec);
         self.pw_dec = new_dec;
         let old = std::mem::replace(&mut self.ring, new_ring);
@@ -692,9 +652,8 @@ impl PyroWaveDecoder {
         Ok(())
     }
 
-    /// Destroy retired rings that are provably unreachable (enough new-ring frames handed
-    /// over + a wall-clock floor — see [`RETIRE_HANDOVERS`]); the queue idle bounds any
-    /// still-submitted presenter sampling of the retiring views.
+    /// Destroy retired rings that have enough new-ring handovers and have aged past
+    /// [`RETIRE_MIN_AGE`]. Queue idle bounds any still-submitted sampling of those views.
     unsafe fn reap_retired(&mut self) {
         let ripe = |r: &RetiredRing| {
             r.handed_over >= RETIRE_HANDOVERS && r.retired_at.elapsed() >= RETIRE_MIN_AGE
@@ -717,10 +676,9 @@ impl PyroWaveDecoder {
         self.retired = kept;
     }
 
-    /// One AU in → one frame out. `aligned` = the AU is shard-window chunked (each
-    /// `wire_window` holds whole self-delimiting packets, zero-padded — walk and strip);
-    /// `complete` = every shard arrived (a partial decodes anyway: missing blocks are
-    /// localized blur for exactly this frame, §4.4).
+    /// One AU in → one frame out. `aligned`: shard-window chunked (each `wire_window`
+    /// holds whole self-delimiting packets, zero-padded). `complete`: every shard arrived;
+    /// a partial still decodes — missing blocks are localized blur for this frame only.
     pub fn decode_frame(
         &mut self,
         au: &[u8],
@@ -728,16 +686,13 @@ impl PyroWaveDecoder {
         complete: bool,
     ) -> Result<Option<PyroWavePlanarFrame>> {
         // SAFETY: single decode thread; all handles owned/pinned by `self`; queue access
-        // serialized under the device-wide QueueLock; the fence bounds GPU completion
-        // before the frame is handed to the presenter.
+        // serialized under QueueLock; the fence bounds GPU completion before handover.
         unsafe { self.decode_inner(au, aligned, complete) }
     }
 
-    /// Consume one framed shard window (§4.4): a 4-byte prefix (u16 used-length + u16
-    /// kind) then either WHOLE self-delimiting codec packets (PACKED) or one fragment of
-    /// an oversized packet (FRAG chain). A lost shard arrives as a zeroed window
-    /// (used = 0) — skipped, and it breaks any fragment chain it interrupts (that
-    /// packet's blocks are unusable without their end; dropping them is the §4.4 blur).
+    /// One framed shard window: 4-byte prefix (`used:u16`, `kind:u16`) then whole packets
+    /// (PACKED) or one fragment of an oversized packet (FRAG chain). A lost shard is a
+    /// zeroed window (`used = 0`) — skip it and break any fragment chain it interrupts.
     unsafe fn push_window(&mut self, win: &[u8], frag: &mut Vec<u8>) -> Result<()> {
         if win.len() < 4 {
             return Ok(());
@@ -801,13 +756,9 @@ impl PyroWaveDecoder {
         aligned: bool,
         complete: bool,
     ) -> Result<Option<PyroWavePlanarFrame>> {
-        // Mid-stream resize: every frame's bitstream opens with a sequence header
-        // carrying its dimensions, so the AU itself announces the host's mode switch —
-        // no control-plane ordering to race (the Reconfigured ack travels on another
-        // stream). Upstream hard-errors on a dimension mismatch, so rebuild FIRST. A
-        // partial that lost its first shard sniffs `None` and decodes at the current
-        // size (correct when the size didn't change; harmlessly dropped below when it
-        // did — the next complete frame carries the header again).
+        // The AU's sequence header announces a host mode switch; rebuild first — a size
+        // mismatch hard-errors upstream. A lost first shard sniffs `None` and decodes at
+        // the current size; the next complete frame carries the header again.
         if let Some(dims) = au_dims(au, aligned, self.wire_window) {
             if dims != (self.width, self.height) {
                 self.reconfigure(dims.0, dims.1)?;
@@ -830,9 +781,8 @@ impl PyroWaveDecoder {
         }
         if let Some(e) = push_err {
             // A partial straddling a resize can carry blocks the (possibly wrong-size)
-            // decoder rejects — that's one lost frame, not a broken session; the next
-            // complete frame re-anchors (all-intra). A COMPLETE frame that fails to
-            // parse is real corruption: propagate.
+            // decoder rejects — one lost frame, not a broken session. A complete frame
+            // that fails to parse is corruption: propagate.
             if complete {
                 return Err(e);
             }
@@ -840,8 +790,8 @@ impl PyroWaveDecoder {
             return Ok(None);
         }
         // A complete AU that isn't ready is a stale/duplicate (sequence rewind) — skip.
-        // A PARTIAL is decoded regardless: missing wavelet blocks reconstruct as zeros,
-        // i.e. localized blur for exactly this one frame (the next is complete again).
+        // A partial still decodes: missing wavelet blocks reconstruct as zeros (blur
+        // for this frame only).
         if complete && !pw::pyrowave_decoder_decode_is_ready(self.pw_dec, false) {
             return Ok(None);
         }
@@ -884,15 +834,9 @@ impl PyroWaveDecoder {
             &vk::DependencyInfo::default().image_memory_barriers(&pre),
         );
 
-        // The declared format/extent MUST equal the ring image's real ones: pyrowave wraps
-        // our VkImage under `image_format` and vkCreateImageView's its storage view with
-        // `view_format` (pyrowave_c.cpp `WrappedViewBuffers::wrap` — its own
-        // `pyrowave_image_get_image_view` helper fills both from the image itself).
-        // Declaring R8 over a 10-bit session's R16_UNORM planes is an invalid view the
-        // driver executes anyway: its addressing covers half the surface, so decoded 8-bit
-        // codes fuse pairwise into 16-bit texels (structured garbage) and the never-written
-        // remainder samples as all-plane zeros (saturated green) — the 2026-07 AMD-client
-        // field report. Same discipline for chroma extents: a 4:4:4 ring is full-res.
+        // Declared format/extent must equal the ring image. pyrowave wraps our VkImage
+        // and creates a storage view from `image_format`/`view_format`; R8 over R16_UNORM
+        // addresses half the surface. Same for chroma extents: a 4:4:4 ring is full-res.
         let fmt = if self.hdr16 {
             pw::VkFormat_VK_FORMAT_R16_UNORM
         } else {
@@ -936,8 +880,8 @@ impl PyroWaveDecoder {
         pw::pyrowave_device_set_command_buffer(self.pw_dev, std::ptr::null_mut());
         pw_check(dec_res, "decode_gpu_buffer")?;
 
-        // Decode's storage writes → the presenter's fragment sampling (layout stays
-        // GENERAL: that is what the planar CSC descriptors use for this path).
+        // Storage writes → presenter fragment sampling. Layout stays GENERAL: that is
+        // what the planar CSC descriptors use.
         let to_read = |img| {
             vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
@@ -970,8 +914,6 @@ impl PyroWaveDecoder {
             .context("pyrowave decode fence")?;
         self.ring[slot].initialized = true;
 
-        // This frame is about to reach the presenter — it advances every retired ring's
-        // displacement count, and ripe rings can now be destroyed.
         for r in &mut self.retired {
             r.handed_over += 1;
         }
@@ -985,9 +927,6 @@ impl PyroWaveDecoder {
             ],
             width: w,
             height: h,
-            // No VUI in the bitstream: the negotiated Welcome `ColorInfo` is the contract
-            // with the host's CSC (BT.709 limited for SDR sessions; BT.2020 PQ once the
-            // HDR leg lands — design/pyrowave-444-hdr.md).
             color: self.color,
             keyframe: true,
         }))
@@ -996,10 +935,9 @@ impl PyroWaveDecoder {
 
 impl Drop for PyroWaveDecoder {
     fn drop(&mut self) {
-        // SAFETY: owned handles created by this struct on the presenter's device; the
-        // fence-synchronous decode means no work of OURS is in flight, and the presenter
-        // may still be sampling the last handed-over slot — idle the device's queue
-        // under the shared lock before destroying the plane images.
+        // SAFETY: owned handles on the presenter's device. Decode is fence-synchronous so
+        // none of our work is in flight; the presenter may still sample the last slot —
+        // idle the shared queue under the lock before destroying plane images.
         unsafe {
             {
                 let _guard = self.queue_lock.guard();
@@ -1013,7 +951,7 @@ impl Drop for PyroWaveDecoder {
             }
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.cmd_pool, None);
-            // `self.device`/instance are the PRESENTER's — never destroyed here.
+            // `self.device`/instance are the presenter's — never destroyed here.
         }
     }
 }
@@ -1022,9 +960,9 @@ impl Drop for PyroWaveDecoder {
 mod tests {
     use super::{au_dims, seq_header_dims};
 
-    /// Little-endian encoding of upstream's `BitstreamSequenceHeader` bitfields (see
-    /// pyrowave_common.hpp): word 0 = width_minus_1:14 | height_minus_1:14 | sequence:3
-    /// | extended:1; word 1 = total_blocks:24 | code:2 | chroma:1 | …
+    /// LE encoding of `BitstreamSequenceHeader` (pyrowave_common.hpp): word 0 =
+    /// width_minus_1:14 | height_minus_1:14 | sequence:3 | extended:1; word 1 =
+    /// total_blocks:24 | code:2 | chroma:1 | …
     fn seq_header(w: u32, h: u32, code: u32) -> [u8; 8] {
         let w0 = (w - 1) & 0x3FFF | ((h - 1) & 0x3FFF) << 14 | 1 << 31;
         let w1 = 0x1234 | code << 24; // arbitrary total_blocks
@@ -1044,7 +982,6 @@ mod tests {
         out
     }
 
-    /// Wrap `body` in one §4.4 framed window of `win` bytes (4-byte prefix + zero pad).
     fn window(body: &[u8], kind: u16, win: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(win);
         out.extend_from_slice(&(body.len() as u16).to_le_bytes());
@@ -1073,9 +1010,9 @@ mod tests {
 
     #[test]
     fn rejects_non_sequence_headers() {
-        assert_eq!(seq_header_dims(&block_header()), None); // extended bit clear
+        assert_eq!(seq_header_dims(&block_header()), None);
         assert_eq!(seq_header_dims(&seq_header(1920, 1080, 1)), None); // not START_OF_FRAME
-        assert_eq!(seq_header_dims(&seq_header(1920, 1080, 0)[..7]), None); // short
+        assert_eq!(seq_header_dims(&seq_header(1920, 1080, 0)[..7]), None);
         assert_eq!(seq_header_dims(&[]), None);
     }
 
@@ -1091,12 +1028,10 @@ mod tests {
         const WIN: usize = 64;
         let mut body = seq_header(1280, 800, 0).to_vec();
         body.extend_from_slice(&block_header());
-        // WIN_PACKED first window, then another window of blocks.
         let mut au = window(&body, 0, WIN);
         au.extend_from_slice(&window(&block_header(), 0, WIN));
         assert_eq!(au_dims(&au, true, WIN), Some((1280, 800)));
-        // An oversized first packet rides a FRAG chain — FRAG_FIRST also starts at the
-        // frame's first byte, so the header is still there.
+        // FRAG_FIRST also starts at the frame's first byte, so the header is still there.
         let frag = window(&body, 1, WIN);
         assert_eq!(au_dims(&frag, true, WIN), Some((1280, 800)));
     }
@@ -1104,14 +1039,13 @@ mod tests {
     #[test]
     fn lost_first_window_means_unknown_dims() {
         const WIN: usize = 64;
-        // A lost shard arrives as a zeroed window (used = 0) — the sequence header is gone.
         let mut au = vec![0u8; WIN];
         au.extend_from_slice(&window(&seq_header(1280, 800, 0), 0, WIN));
         assert_eq!(au_dims(&au, true, WIN), None);
-        // A FRAG_CONT/LAST first window means the same (its FIRST was in a lost prior AU).
+        // FRAG_CONT/LAST as the first window: its FIRST was in a lost prior AU.
         let cont = window(&block_header(), 2, WIN);
         assert_eq!(au_dims(&cont, true, WIN), None);
-        // Garbage used-length never reads out of bounds.
+        // Used-length 0xFFFF must not read past the window.
         let mut garbage = vec![0u8; WIN];
         garbage[0] = 0xFF;
         garbage[1] = 0xFF;

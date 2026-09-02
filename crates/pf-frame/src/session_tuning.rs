@@ -1,17 +1,16 @@
-//! Windows host-process session tuning — parity with Apollo/Sunshine `streaming_will_start`.
+//! Windows host-process session tuning, matching Apollo/Sunshine `streaming_will_start`.
 //!
-//! The default Windows process runs at NORMAL priority and ~15.6 ms timer granularity, and lets the
-//! GPU/display idle. Under a GPU-saturating game that starves our capture/encode/send threads (the
-//! "240→40 fps collapse"), and the coarse timer floors any precise frame pacing. This raises the
-//! process out of the default scheduling class, gives DWM and our hot threads MMCSS priority, drops
-//! the timer to 1 ms, and keeps the (virtual) display awake for the session.
+//! Default Windows process: NORMAL class, ~15.6 ms timer, GPU/display may idle.
+//! A GPU-saturating game then starves capture/encode/send, and the coarse timer
+//! floors frame pacing. This raises the process class, gives DWM and hot threads
+//! MMCSS, drops the timer to 1 ms, and keeps the (virtual) display awake.
 //!
-//! Raw C-ABI FFI (winmm/kernel32/dwmapi/avrt) rather than the `windows` crate so it builds without
-//! pulling new windows-rs features. No-op on non-Windows. Per-thread effects (MMCSS, execution
-//! state) auto-revert at thread exit (= session end); the process-wide bits are refcounted over
-//! the hot threads and revert when the LAST one exits — the host must not keep HIGH priority and
-//! a 1 ms global timer while a local game runs and nobody streams (2026-08-12 field report).
-//! See `design/host-latency-plan.md` Tier 3A.
+//! Raw C-ABI FFI (winmm/kernel32/dwmapi/avrt) so the crate does not pull extra
+//! windows-rs features. No-op off Windows. Per-thread MMCSS and execution-state
+//! revert at thread exit. Process-wide bits are refcounted over hot threads and
+//! revert when the last one exits — a 24/7 host must not keep HIGH class and a
+//! 1 ms global timer after the session ends.
+//! See `design/host-latency-plan.md`.
 
 #[cfg(target_os = "windows")]
 mod imp {
@@ -38,10 +37,9 @@ mod imp {
         fn CloseHandle(hObject: Handle) -> Bool;
     }
 
-    /// `REASON_CONTEXT` (minwinbase.h), simple-string flavour: `Version` (ULONG), `Flags` (DWORD),
-    /// then the union collapses to `SimpleReasonString` (LPWSTR) under
-    /// `POWER_REQUEST_CONTEXT_SIMPLE_STRING` — same size/alignment as the C layout (4+4, 8-aligned
-    /// pointer).
+    /// `REASON_CONTEXT` (minwinbase.h), simple-string flavour.
+    /// Layout: `Version` (ULONG), `Flags` (DWORD), then `SimpleReasonString`
+    /// (LPWSTR) under `POWER_REQUEST_CONTEXT_SIMPLE_STRING` — 4+4, 8-aligned pointer.
     #[repr(C)]
     struct ReasonContext {
         version: u32,
@@ -68,13 +66,12 @@ mod imp {
     const POWER_REQUEST_SYSTEM_REQUIRED: i32 = 1;
     const INVALID_HANDLE_VALUE: isize = -1;
 
-    /// RAII display+system availability request (`PowerRequestDisplayRequired`, visible in
-    /// `powercfg /requests`) — the service-grade "someone is watching this screen" assertion,
-    /// held for a capture session so the console cannot drop into display-off mid-stream. This is
-    /// object-lifetime (unlike the thread-bound `ES_*` flags in [`on_hot_thread`], which the OS
-    /// reverts at thread exit), so a capturer can hold it across whatever threads serve the
-    /// session. PREVENTION only: no power request turns an already-off display back ON — that
-    /// wake needs input, which is the virtual-mouse compose kick's job.
+    /// RAII display+system availability (`PowerRequestDisplayRequired`,
+    /// visible in `powercfg /requests`).
+    ///
+    /// Object-lifetime, unlike the thread-bound `ES_*` flags in [`on_hot_thread`]
+    /// (OS reverts those at thread exit). Prevention only: no power request
+    /// turns an already-off display back on — that wake is the virtual-mouse kick.
     pub struct DisplayWakeRequest(Handle);
 
     // SAFETY: the wrapped power-request HANDLE is a kernel object handle — a plain opaque value
@@ -82,8 +79,7 @@ mod imp {
     unsafe impl Send for DisplayWakeRequest {}
 
     impl DisplayWakeRequest {
-        /// Create + set the request. `None` when the kernel refuses (best-effort — the caller
-        /// streams without the assertion, exactly the pre-existing behavior).
+        /// `None` if the kernel refuses; the session still streams.
         pub fn new() -> Option<DisplayWakeRequest> {
             let reason: Vec<u16> = "punktfunk streaming session\0".encode_utf16().collect();
             let ctx = ReasonContext {
@@ -118,51 +114,36 @@ mod imp {
         }
     }
 
-    /// Live hot (session) threads. A Mutex, not an atomic: the 0↔1 transitions carry the
-    /// apply/revert side effects, and an interleaved fetch_add/fetch_sub pair could otherwise
-    /// finish with a running session untuned (transitions are rare — thread start/exit only).
+    /// Live hot-session threads. Mutex, not atomic: the 0↔1 transitions carry
+    /// apply/revert, and an interleaved fetch_add/fetch_sub can leave a running
+    /// session untuned.
     static HOT_THREADS: Mutex<usize> = Mutex::new(0);
 
-    /// Process-wide tuning, applied when the FIRST hot thread registers. Best-effort: each call
-    /// is independent and a failure is ignored (e.g. a non-elevated host may not get HIGH class).
+    /// Process-wide bits, applied on the first hot thread. Best-effort: a
+    /// non-elevated host may not get HIGH class.
     fn tune_process() {
         // SAFETY: each call is a C-ABI FFI into winmm/kernel32/dwmapi declared with a matching
         // `extern "system"` signature; every argument is a plain integer (no pointers/buffers escape),
         // and `GetCurrentProcess()` returns the current-process pseudo-handle (a constant, always valid,
         // never closed).
         unsafe {
-            // 1 ms timer granularity (default ~15.6 ms) — the floor for precise frame pacing and the
-            // encode|send split's sub-ms sleeps.
+            // 1 ms (default ~15.6 ms) is the floor for frame pacing and sub-ms encode|send sleeps.
             timeBeginPeriod(1);
-            // Run DWM's compositor work at MMCSS priority — helps the compose-rate ceiling hold up
-            // under a saturating game (capture is bounded by how often DWM composes).
+            // Capture is bounded by DWM compose rate; MMCSS keeps that ceiling under a saturating game.
             DwmEnableMMCSS(1);
-            // Lift the whole host above NORMAL so a CPU-saturating game can't deschedule our
-            // control/capture/encode/send threads on the CPU (Apollo does the same).
+            // HIGH class so a CPU-saturating game cannot deschedule capture/encode/send.
             SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
             tracing::info!("windows session tuning applied (timer 1ms, DWM MMCSS, HIGH priority)");
         }
     }
 
-    /// The mirror of [`tune_process`], run when the LAST hot thread exits. Leaving the tuning in
-    /// place used to be the design ("reverts at process exit") — but the host is a 24/7 service,
-    /// so after one stream it competed at HIGH class with a 1 ms global timer against whatever
-    /// the user played locally, forever.
+    /// Mirror of [`tune_process`], run when the last hot thread exits.
     ///
-    /// 🛑 **Nothing in here may log, or touch anything that logs.** This runs from
-    /// [`HotThreadGuard`]'s `Drop`, which is a **TLS destructor** — and by then this thread's
-    /// *other* thread-locals may already be gone, including the ones `tracing_subscriber`'s
-    /// registry keeps (it is `sharded-slab`-backed, and the slab's per-thread registration is a
-    /// `thread_local!` read with `LocalKey::with`). Emitting an event here panicked with "cannot
-    /// access a Thread Local Storage value during or after destruction", and **a panic that
-    /// escapes a TLS destructor is fatal in Rust** — `fatal runtime error: thread local panicked
-    /// on drop, aborting`. So one `info!` line killed the whole host on session teardown and the
-    /// SCM restarted it ~6 s later, which read in the field as a mystery reconnect (on glass,
-    /// .173: four aborts, every one of them a session teardown).
-    ///
-    /// The revert itself is only FFI and stays here, inside the refcount lock, so it remains
-    /// atomic against a session starting concurrently. The counterpart "applied" line in
-    /// [`tune_process`] runs on a live thread and is kept — that one is safe.
+    /// Must not log: this runs from [`HotThreadGuard`]'s `Drop`, a TLS
+    /// destructor. Other thread-locals (including `tracing`'s registry) may
+    /// already be gone; a panic that escapes a TLS destructor aborts the process.
+    /// Revert is FFI only, inside the refcount lock, so it stays atomic against
+    /// a concurrent session start.
     fn untune_process() {
         // SAFETY: same FFI surface as `tune_process` — plain-integer arguments, constant
         // pseudo-handle, no pointers or buffers. Sound in a TLS destructor: no Rust TLS is read.
@@ -173,15 +154,14 @@ mod imp {
         }
     }
 
-    /// One per hot thread, parked in TLS by [`on_hot_thread`]; its Drop runs at thread exit
-    /// (= session teardown), the same lifetime the MMCSS/execution-state effects already ride.
+    /// One per hot thread, parked in TLS by [`on_hot_thread`]. Drop runs at
+    /// thread exit, the same lifetime MMCSS and execution-state already ride.
     struct HotThreadGuard;
 
     impl Drop for HotThreadGuard {
         fn drop(&mut self) {
-            // ⚠ TLS DESTRUCTOR. Everything reached from here must be panic-free and must not log —
-            // see [`untune_process`] for what a single `info!` here cost. A poisoned lock skips the
-            // revert (best-effort, like every call here) rather than panicking.
+            // TLS destructor: panic-free, no logging. A poisoned lock skips the
+            // revert rather than panicking (best-effort, like every call here).
             if let Ok(mut n) = HOT_THREADS.lock() {
                 *n -= 1;
                 if *n == 0 {
@@ -196,13 +176,10 @@ mod imp {
             const { std::cell::OnceCell::new() };
     }
 
-    /// Call at the start of each capture/encode/send (hot stream) thread. Registers the thread in
-    /// the process-tuning refcount (first in applies, last out reverts), registers it with MMCSS
-    /// ("Games"), and asserts the display/system must stay awake for as long as this thread lives.
-    /// The MMCSS handle is intentionally leaked and the execution-state assertion is bound to this
-    /// thread — both are reverted by the OS when the thread exits, and the refcount guard's TLS
-    /// Drop runs there too, so a session that ends tears everything down without explicit
-    /// bookkeeping.
+    /// Register this capture/encode/send thread. First in applies process
+    /// tuning; last out reverts. MMCSS handle is leaked and `ES_*` is bound
+    /// to this thread — the OS reverts both at thread exit, where the TLS
+    /// guard drops too.
     pub fn on_hot_thread() {
         HOT_THREAD.with(|slot| {
             if slot.get().is_none() {
@@ -225,8 +202,6 @@ mod imp {
             SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
             let task: Vec<u16> = "Games\0".encode_utf16().collect();
             let mut idx: u32 = 0;
-            // Leak the handle: these are session/process-lifetime worker threads; the OS reverts the
-            // MMCSS characteristics at thread exit.
             let _ = AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut idx);
         }
     }
@@ -235,7 +210,7 @@ mod imp {
 #[cfg(target_os = "windows")]
 pub use imp::{on_hot_thread, DisplayWakeRequest};
 
-/// No-op on non-Windows (Linux uses `setpriority` nice + CUDA stream priority instead — see
-/// `native::boost_thread_priority` and `zerocopy::cuda`).
+/// No-op on non-Windows (Linux uses `setpriority` nice + CUDA stream priority —
+/// see `native::boost_thread_priority` and `zerocopy::cuda`).
 #[cfg(not(target_os = "windows"))]
 pub fn on_hot_thread() {}

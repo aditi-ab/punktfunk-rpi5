@@ -2,23 +2,20 @@
 //! Do not edit by hand — re-run `bash scripts/gen-launcher-icons.sh` instead.
 //! Per-mark provenance and licensing: assets/launcher-icons/README.md.
 //!
-//! The brand mark a `role: "launcher"` tile draws, resolved from the entry's `icon` token.
-//! Skia parses SVG path data directly, so the masters need no transcription into a drawing
-//! DSL — the path string is the asset.
+//! Brand mark a `role: "launcher"` tile draws, resolved from the entry's
+//! `icon` token.
 
 use skia_safe::{Matrix, Path, Rect};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-/// A parsed mark and the viewport its coordinates are in.
 type Glyph = (Path, f32, f32);
 
-/// Token → parsed mark, with `None` memoizing "no such token / did not parse" so a miss is not
-/// re-attempted every frame. Named because `clippy::type_complexity` rejects it inline, and this
-/// file is generated — an inline type would fail the `-D warnings` gate on every regeneration.
+/// Token → parsed mark. `None` memoizes a miss so a bad token is not re-parsed
+/// every frame. Named: `clippy::type_complexity` rejects the inline form, and
+/// this file is generated — an inline type would fail `-D warnings` on regen.
 type GlyphCache = HashMap<String, Option<Glyph>>;
 
-/// `(token, viewport width, viewport height, path data)` — the masters, verbatim.
 const GLYPHS: &[(&str, f32, f32, &str)] = &[
     ("steam", 496.0, 512.0, "M496 256c0 137-111.2 248-248.4 248-113.8 0-209.6-76.3-239-180.4l95.2 39.3c6.4 32.1 34.9 56.4 68.9 56.4 39.2 0 71.9-32.4 70.2-73.5l84.5-60.2c52.1 1.3 95.8-40.9 95.8-93.5 0-51.6-42-93.5-93.7-93.5s-93.7 42-93.7 93.5v1.2L176.6 279c-15.5-.9-30.7 3.4-43.5 12.1L0 236.1C10.2 108.4 117.1 8 247.6 8 384.8 8 496 119 496 256zM155.7 384.3l-30.5-12.6a52.79 52.79 0 0 0 27.2 25.8c26.9 11.2 57.8-1.6 69-28.4 5.4-13 5.5-27.3.1-40.3-5.4-13-15.5-23.2-28.5-28.6-12.9-5.4-26.7-5.2-38.9-.6l31.5 13c19.8 8.2 29.2 30.9 20.9 50.7-8.3 19.9-31 29.2-50.8 21zm173.8-129.9c-34.4 0-62.4-28-62.4-62.3s28-62.3 62.4-62.3 62.4 28 62.4 62.3-27.9 62.3-62.4 62.3zm.1-15.6c25.9 0 46.9-21 46.9-46.8 0-25.9-21-46.8-46.9-46.8s-46.9 21-46.9 46.8c.1 25.8 21.1 46.8 46.9 46.8z"),
     ("lutris", 24.0, 24.0, "m21.231 18.89.001-.002c-1.293 3.243-5.218 5.232-9.447 5.105C5.3 23.993 0 18.48 0 11.906S5.276.001 11.785.001c1.793 0 3.493.406 5.015 1.13.081-.177.271-.544.451-.557.238-.017.374.137.526.309.154.172.46.429.46.429s1.393-.481 2.955.377c1.563.858 1.783 1.116 2.09 1.716.152.301.195.829.2 1.282a.796.796 0 0 0-.07-.003c-.496 0-.96.455-.96 1.08 0 .263.082.496.215.678l-.01.007a1.505 1.505 0 0 0-.132.01 18.704 18.704 0 0 0-.389-.142 2.53 2.53 0 0 1-.82-.472 1.402 1.402 0 0 0-1.196-2.112c-.383 0-.73.156-.982.41-.472-.271-1.174-.482-2.527-.565l-.407-.011c-2.282.012-3.611.279-5.979 1.301-.603.283-1.206.615-1.785 1.001-.423.3-.639.67-.709 1.137a1.326 1.326 0 0 0 1.23 1.373h.042c1.27.06 2.039 1.99 2.063 2.497.004.05.004.023.003.08-.032.727-.37 1.267-1.088 1.246a1.231 1.231 0 0 1-.976-.494c-.063-.077-.103-.172-.159-.254-.666-1.081-1.732-1.36-2.771-1.523-.438-.068-1.073-.122-1.31.25a8.28 8.28 0 0 0-.577 3.063c-.02 5.036 4.041 9.118 9.026 9.118 2.575 0 5.349-.952 6.993-2.7l-.035.03c-1.772 1.473-4.66 1.941-6.027 1.941-4.302 0-7.818-3.232-7.818-7.578 0-1.276.288-2.396.814-3.36.495.183.947.483 1.28 1.022a.24.24 0 0 0 .013.021c.064.092.111.197.182.284.424.524.881.658 1.342.68h.01c.43.013.768-.12 1.024-.342.347-.3.55-.79.577-1.382v-.014c.002-.085 0-.053-.004-.112-.024-.376-.333-1.318-.906-2.027-.266-.331-.587-.607-.95-.774l.12-.074c.756-.457 2.364-.977 4.592-.638 1.13.173 2.055.419 3.483.879 1.657.534 2.579 1.279 3.854 1.427.15.017.301.018.45.003.41 1.129.634 2.35.634 3.621 0 2.068-.59 3.995-1.611 5.62zm1.947-12.274s-.115.201-.364.322c-.103.05-.282-.075-.45.1-.359.726.516 1.332.923 1.315.408-.017.73-.432.712-.793-.017-.558-.82-.944-.82-.944zm.234-1.432c.255 0 .462.26.462.58 0 .32-.207.58-.462.58-.254 0-.46-.26-.46-.58 0-.32.206-.58.46-.58zm-3.292-.951c.492 0 .89.403.89.9a.895.895 0 0 1-.89.898.895.895 0 0 1-.89-.899c0-.496.399-.899.89-.899z"),
@@ -29,12 +26,8 @@ const GLYPHS: &[(&str, f32, f32, &str)] = &[
     ("xbox", 512.0, 512.0, "M369.9 318.2c44.3 54.3 64.7 98.8 54.4 118.7-7.9 15.1-56.7 44.6-92.6 55.9-29.6 9.3-68.4 13.3-100.4 10.2-38.2-3.7-76.9-17.4-110.1-39-27.9-18.2-34.2-25.7-34.2-40.6 0-29.9 32.9-82.3 89.2-142.1 32-33.9 76.5-73.7 81.4-72.6 9.4 2.1 84.3 75.1 112.3 109.5zM188.6 143.8c-29.7-26.9-58.1-53.9-86.4-63.4-15.2-5.1-16.3-4.8-28.7 8.1-29.2 30.4-53.5 79.7-60.3 122.4-5.4 34.2-6.1 43.8-4.2 60.5 5.6 50.5 17.3 85.4 40.5 120.9 9.5 14.6 12.1 17.3 9.3 9.9-4.2-11-.3-37.5 9.5-64 14.3-39 53.9-112.9 120.3-194.4zm311.6 63.5c-16.9-80-67.5-130.3-74.6-130.3-7.3 0-24.2 6.5-36 13.9-23.3 14.5-41 31.4-64.3 52.8 42.4 53.3 102.2 139.4 122.9 202.3 6.8 20.7 9.7 41.1 7.4 52.3-1.7 8.5-1.7 8.5 1.4 4.6 6.1-7.7 19.9-31.3 25.4-43.5 7.4-16.2 15-40.2 18.6-58.7 4.3-22.5 3.9-70.8-.8-93.4zM141.3 43c47.7-2.5 109.7 34.5 114.3 35.4 .7 .1 10.4-4.2 21.6-9.7 63.9-31.1 94-25.8 107.4-25.2-63.9-39.3-152.7-50-233.9-11.7-23.4 11.1-24 11.9-9.4 11.2z"),
 ];
 
-/// The parsed path for a token plus the viewport it was authored in, or `None` when the token is
-/// absent, unknown, or (defensively) unparseable — the tile then names its launcher instead,
-/// which is exactly how every launcher tile looked before icons existed.
-///
-/// Parsed once per token and cached: `Path::from_svg` on a 3 kB string is not free, and the
-/// library shelf re-renders every frame while the cursor springs.
+/// Cached: `Path::from_svg` on a 3 kB string is not free, and the library
+/// shelf re-renders every frame. `None` is a miss or an unparseable path.
 fn glyph(token: &str) -> Option<Glyph> {
     static CACHE: OnceLock<Mutex<GlyphCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -50,8 +43,7 @@ fn glyph(token: &str) -> Option<Glyph> {
     built
 }
 
-/// The mark for `token`, scaled to fit `dst` and centred in it — aspect ratio preserved, because
-/// the masters' viewports are not all square. `None` when there is no mark to draw.
+/// Aspect preserved: the masters' viewports are not all square.
 pub(crate) fn launcher_mark(token: &str, dst: Rect) -> Option<Path> {
     let (path, vw, vh) = glyph(token)?;
     let scale = (dst.width() / vw).min(dst.height() / vh);
@@ -68,8 +60,6 @@ pub(crate) fn launcher_mark(token: &str, dst: Rect) -> Option<Path> {
 mod tests {
     use super::*;
 
-    /// Every shipped master parses. A mark that silently fails to parse is a tile that silently
-    /// loses its icon, which no other test in this crate would notice.
     #[test]
     fn every_glyph_parses() {
         for (token, ..) in GLYPHS {
@@ -82,8 +72,7 @@ mod tests {
         assert!(launcher_mark("not-a-launcher", Rect::from_wh(64.0, 64.0)).is_none());
     }
 
-    /// The mark is letterboxed into the destination, never stretched past it — the guarantee the
-    /// non-square viewports (playnite is 1024x1024, steam 496x512) depend on.
+    /// Letterboxed, never stretched. Steam's viewport is 496×512, not square.
     #[test]
     fn mark_is_contained_and_centred() {
         let dst = Rect::from_xywh(10.0, 20.0, 80.0, 40.0);

@@ -1,58 +1,46 @@
-//! Pure, deterministic decoder-input fault injection for integrity testing.
+//! Deterministic decoder-input damage for integrity tests.
 //!
-//! [`AuFault::from_spec`] accepts `PUNKTFUNK_AU_FAULT=<mode>[:<period>]`; invalid
-//! or zero-period specifications do not arm it, and the default period is 60.
-//! Every period-th offered AU is selected, counting from the first; inputs shorter
-//! than 16 bytes pass unchanged rather than corrupting parameter-only fragments.
-//! [`FaultMode::Drop`] withholds the AU and normally exposes a later planner gap or
-//! missing reference. `Truncate` keeps the first three quarters and targets driver
-//! decode-status detection. `Flip` XORs one byte at the same point and may remain
-//! valid syntax, so neither planner nor driver is guaranteed to report it.
-//! Lack of `queryResultStatusSupport` therefore means unmeasured, not clean.
-//! Unselected AUs are borrowed unchanged; corrupted AUs allocate owned bytes only
-//! on the selected call. The injector runs after `PUNKTFUNK_AU_DUMP`, so dumps
-//! remain clean wire input and reproduce faults only by reapplying the same spec.
+//! [`AuFault::from_spec`] parses `PUNKTFUNK_AU_FAULT=<mode>[:<period>]`.
+//! Invalid or zero-period specs stay inert. Default period is 60.
+//! Every `period`-th offered AU is selected, counting from the first.
+//! AUs shorter than 16 bytes pass unchanged.
+//!
+//! `Drop` withholds the AU. `Truncate` keeps the first three quarters.
+//! `Flip` XORs one payload byte and may stay valid syntax, so neither planner
+//! nor driver is guaranteed to report it. Missing `queryResultStatusSupport`
+//! is unmeasured, not clean. Unselected AUs are borrowed; owned bytes exist
+//! only on the selected call. Runs after `PUNKTFUNK_AU_DUMP`, so dumps stay
+//! clean wire input. Evidence: `tests/fault_detection.rs`.
 
-/// What to do to a faulted access unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultMode {
-    /// Swallow the AU entirely — the decoder never sees it (network loss).
+    /// Network loss: the decoder never sees the AU.
     Drop,
-    /// Deliver a prefix of the AU: a picture whose slice data stops mid-frame.
+    /// Mid-picture cut, not a refuse-at-byte-0.
     Truncate,
-    /// Deliver the whole AU with one payload byte altered (in-picture corruption
-    /// no parser can see).
+    /// In-picture corruption no parser can see.
     Flip,
 }
 
-/// What the caller must do with the access unit it was about to decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FaultAction {
-    /// Untouched — feed the original bytes. The answer for every AU but one in
-    /// `period`, and for every AU of a session with no fault armed.
     Pass,
-    /// Do not feed this AU at all.
     Drop,
-    /// Feed these bytes instead. Owned because corruption is by definition not a
-    /// borrow of the input; allocated only on the faulted AU, never on the
-    /// streaming path.
+    /// Owned because the damaged bytes are not a borrow of the input.
+    /// Allocated only on the faulted AU.
     Corrupt(Vec<u8>),
 }
 
-/// The default fault period: one AU per second at 60 fps — frequent enough to see
-/// within a few seconds of streaming, rare enough that recovery completes between
-/// faults instead of the stream never leaving its post-loss freeze.
+/// 60 fps → one fault per second. Sparse enough that recovery finishes
+/// between faults instead of freezing the stream.
 pub const DEFAULT_FAULT_PERIOD: u32 = 60;
 
-/// Where in a faulted AU the damage lands, as a fraction of its length. Deep
-/// enough to be past the parameter sets and the first slice header (so `Flip`
-/// really is invisible to the parser and `Truncate` really does cut mid-picture
-/// rather than refusing the AU at byte 0), and expressed as a fraction so it holds
-/// for a 700-byte P-frame and a 4 MB IDR alike.
+/// Three quarters in: past parameter sets and the first slice header, so
+/// `Flip` stays parser-invisible and `Truncate` cuts mid-picture. A fraction
+/// so it scales from a small P-frame to a large IDR.
 const FAULT_POINT_NUMERATOR: usize = 3;
 const FAULT_POINT_DENOMINATOR: usize = 4;
 
-/// The armed injector: a mode, a period, and the count of AUs offered so far.
 #[derive(Debug, Clone, Copy)]
 pub struct AuFault {
     mode: FaultMode,
@@ -61,17 +49,16 @@ pub struct AuFault {
 }
 
 impl AuFault {
-    /// Parse a `PUNKTFUNK_AU_FAULT` spec: `<mode>[:<period>]`. `None` for anything
-    /// unrecognized, which is what keeps the injector inert — a typo must leave a
-    /// user's stream alone rather than half-arm it.
+    /// Parse `PUNKTFUNK_AU_FAULT=<mode>[:<period>]`. `None` leaves the injector
+    /// inert — a typo must not half-arm a live stream.
     pub fn from_spec(spec: &str) -> Option<AuFault> {
         let spec = spec.trim();
         let (mode, period) = match spec.split_once(':') {
             Some((m, p)) => (m.trim(), p.trim().parse::<u32>().ok()?),
             None => (spec, DEFAULT_FAULT_PERIOD),
         };
-        // A zero period would fault EVERY AU including the opening IDR, which
-        // never produces a stream to damage in the first place.
+        // Zero would fault every AU, including the opening IDR, so there is no
+        // stream left to damage.
         if period == 0 {
             return None;
         }
@@ -88,7 +75,6 @@ impl AuFault {
         })
     }
 
-    /// Build one directly (tests and callers that resolve the spec themselves).
     pub fn new(mode: FaultMode, period: u32) -> AuFault {
         AuFault {
             mode,
@@ -105,20 +91,16 @@ impl AuFault {
         self.period
     }
 
-    /// Offer one access unit. Returns what the caller should feed the decoder.
-    ///
-    /// The counter advances on EVERY call, faulted or not, so the cadence is a
-    /// property of the stream rather than of the damage: `period` AUs of clean
-    /// stream, one fault, repeat.
+    /// Counter advances on every call, faulted or not, so cadence is a
+    /// property of the stream, not of the damage.
     pub fn apply(&mut self, au: &[u8]) -> FaultAction {
         self.seen = self.seen.wrapping_add(1);
         if self.seen % self.period != 0 {
             return FaultAction::Pass;
         }
-        // Too short to damage meaningfully — a handful of bytes is a parameter-set
-        // AU or a fragment, and cutting/flipping inside one tests the parser's
-        // error handling rather than the decoder's integrity signals. Pass it and
-        // let the next multiple carry the fault.
+        // Under 16 bytes is a parameter-set AU or a fragment. Damaging it tests
+        // parser bounds, not decoder integrity. Pass and let the next multiple
+        // carry the fault.
         if au.len() < 16 {
             return FaultAction::Pass;
         }
@@ -128,12 +110,9 @@ impl AuFault {
             FaultMode::Truncate => FaultAction::Corrupt(au[..point].to_vec()),
             FaultMode::Flip => {
                 let mut bytes = au.to_vec();
-                // XOR with a single high-ish bit rather than inverting the byte:
-                // it moves the sample values the entropy coder decodes without
-                // being especially likely to manufacture a `00 00 01` start code
-                // out of the surrounding bytes (which would turn a payload
-                // corruption into a framing corruption and quietly change which
-                // detector the mode is testing).
+                // XOR 0x40 rather than invert: moves entropy-coded samples without
+                // being likely to produce a `00 00 01` start code from surrounding bytes
+                // (payload corruption would become a framing test).
                 bytes[point] ^= 0x40;
                 FaultAction::Corrupt(bytes)
             }
@@ -145,9 +124,8 @@ impl AuFault {
 mod tests {
     use super::*;
 
-    /// The knob is a support tool: it has to be exactly as inert as it looks when
-    /// unset or mistyped, because the alternative is a user's stream quietly
-    /// breaking on a typo'd environment variable.
+    /// Unset or mistyped specs must stay inert so a live stream is not
+    /// damaged by a typo'd environment variable.
     #[test]
     fn only_a_well_formed_spec_arms_the_injector() {
         assert_eq!(
@@ -169,9 +147,8 @@ mod tests {
         }
     }
 
-    /// The cadence: `period - 1` clean AUs, then one faulted, forever. The count
-    /// starts at the first AU offered, so a period above 1 never touches the
-    /// session's opening parameter sets and IDR.
+    /// Count starts at the first offered AU, so `period > 1` never faults
+    /// the opening parameter sets or IDR.
     #[test]
     fn every_nth_au_is_faulted_and_the_rest_pass_through_untouched() {
         let au = vec![0xA5u8; 64];
@@ -184,8 +161,7 @@ mod tests {
         assert_eq!(f.apply(&au), FaultAction::Drop);
     }
 
-    /// Truncation delivers a real prefix — the shape a lost tail shard has, not a
-    /// zero-length AU (which is a different, uninteresting failure).
+    /// Prefix, not a zero-length AU (that is a different failure).
     #[test]
     fn truncation_delivers_a_prefix_of_the_original() {
         let au: Vec<u8> = (0..100u8).collect();
@@ -197,9 +173,8 @@ mod tests {
         assert_eq!(short[..], au[..75], "and they are the ORIGINAL bytes");
     }
 
-    /// A flip alters exactly one byte, deep in the payload, deterministically —
-    /// the corruption a parser cannot see. Determinism is what makes a field
-    /// report reproducible from the spec string alone.
+    /// Exactly one deep payload byte, deterministically — parser-invisible
+    /// damage that the spec string alone can replay.
     #[test]
     fn a_flip_changes_exactly_one_deep_payload_byte_and_is_reproducible() {
         let au: Vec<u8> = (0..=255u8).collect();
@@ -224,15 +199,13 @@ mod tests {
         assert_eq!(run(), bytes, "the same spec produces the same damage");
     }
 
-    /// Tiny AUs (a lone parameter-set NALU, a fragment) are passed through: the
-    /// modes are about damaging a PICTURE, and cutting a 6-byte AU only tests the
-    /// parser's own bounds checks.
+    /// Modes damage a picture; cutting a handful of bytes only tests the
+    /// parser's bounds checks.
     #[test]
     fn an_au_too_short_to_damage_meaningfully_is_left_alone() {
         let mut f = AuFault::new(FaultMode::Truncate, 1);
         assert_eq!(f.apply(&[0u8; 8]), FaultAction::Pass);
-        // …and the counter still advanced, so the cadence does not stall waiting
-        // for a big enough AU.
+        // Counter still advanced, so cadence does not stall on a tiny AU.
         assert!(matches!(f.apply(&[0u8; 64]), FaultAction::Corrupt(_)));
     }
 }

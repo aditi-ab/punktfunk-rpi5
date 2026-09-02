@@ -1,61 +1,56 @@
-//! Virtual-display backend contract (plan §W3 — the trait facade carved out of [`super`]).
-//! [`DisplayOwnership`] declares who owns an output's lifecycle, [`VirtualOutput`] is the created
-//! output (PipeWire node + RAII keepalive), and [`VirtualDisplay`] is the per-compositor backend
-//! trait `super::open` returns boxed. The per-backend `impl`s and the factory stay in `super`.
+//! Compositor-backend contract for virtual outputs.
+//!
+//! [`DisplayOwnership`] is who may pool or tear an output down. [`VirtualOutput`] is the created
+//! capture target plus the RAII keepalive that releases the compositor resource. [`VirtualDisplay`]
+//! is the boxed trait `super::open` returns; per-backend `impl`s and the factory stay in `super`.
+//!
+//! Pin a backend by name (`"kwin"`, `"mutter"`, `"wlroots"`, `"gamescope"`). Evidence:
+//! `design/gamemode-and-dedicated-sessions.md`, `design/display-management.md`.
 
 use super::*;
 
-/// Who owns a [`VirtualOutput`]'s lifecycle — the honest declaration that lets the registry
-/// (`design/gamemode-and-dedicated-sessions.md` Part A1) pool **only what it owns** instead of
-/// keeping outputs whose real lifecycle lives elsewhere (the gamescope managed/attach paths, which
-/// are governed by the gamescope module's own session machinery). Extends the CLAUDE.md invariant
-/// "the registry owns display lifecycle" with its converse: what the registry does not own, it must
-/// not pretend to keep.
+/// Who may pool or tear this output down. The registry keep-alives only [`Self::Owned`];
+/// [`Self::External`] and [`Self::SessionManaged`] pass through because their lifecycle lives
+/// elsewhere (gamescope attach / session-plus). See `design/gamemode-and-dedicated-sessions.md`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DisplayOwnership {
-    /// The registry owns the lifecycle: it may pool, linger, pin, and tear this display down (KWin,
-    /// Mutter, wlroots, gamescope **bare spawn**, and the Windows manager-delegated monitor). The
-    /// default — a backend that says nothing is registry-owned.
+    /// Registry may pool, linger, pin, and tear down (KWin, Mutter, wlroots, gamescope bare spawn,
+    /// Windows). Default: a silent backend is owned.
     #[default]
     Owned,
-    /// Someone else's display, merely mirrored: no keep-alive, no topology, no reuse (gamescope
-    /// **attach** to a foreign session). Codifies the design-doc §7 "attach = unmanaged pass-through"
-    /// row.
+    /// Mirrored foreign display: no keep-alive, topology, or reuse (gamescope attach).
     External,
-    /// A box-level session the gamescope module manages (the managed `gamescope-session-plus` /
-    /// SteamOS takeover). Passed through by the registry (its restore lifecycle is the gamescope
-    /// module's until Part A3 hands the registry a real keepalive + restore duty).
+    /// Gamescope-module session (`gamescope-session-plus` / SteamOS). Registry pass-through;
+    /// restore stays in the gamescope module.
     SessionManaged,
 }
 
-/// Per-session isolation identity for an INDEPENDENT bare-spawn gamescope session
-/// (`design/gamescope-multiuser.md`): the private planes a multi-user spawn gets instead of the
-/// host-lifetime shared ones. Carried on the backend instance like [`GamescopeRoute`]
-/// (`VirtualDisplay::set_session_isolation`) and consumed only by gamescope's spawn path, which
-/// writes its `LIBEI_SOCKET` relay to `ei_relay` and routes the nested apps' audio by env
-/// (`PULSE_SINK`/`PULSE_SOURCE`). `id` is STABLE per client (cert-fingerprint prefix), which is
-/// what lets the keep-alive registry hand a kept spawn — whose env is baked in — back to the same
-/// client and never to another (`isolation_key`).
+/// Isolation identity for an independent gamescope bare-spawn (`design/gamescope-multiuser.md`).
+/// Private planes instead of host-lifetime shared ones. Carried on the backend like
+/// [`GamescopeRoute`] (`VirtualDisplay::set_session_isolation`); only the spawn path consumes it.
 ///
-/// Defined on every platform because the host's `SessionContext` carries it beside `compositor`.
+/// `id` is stable per client (cert-fingerprint prefix). A kept spawn's env is baked in, so the
+/// registry may hand it back only to the same `isolation_key`.
+///
+/// Defined on every platform: the host's `SessionContext` carries it beside `compositor`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionIsolation {
-    /// Stable per-client identity (lowercase hex fingerprint prefix, or `anon<seq>`).
+    /// Cert-fingerprint prefix (lowercase hex) or `anon<seq>`.
     pub id: String,
-    /// This session's `LIBEI_SOCKET` relay file (`pf_paths::gamescope_ei_socket_file_for`);
-    /// the session's pinned injector reads it, the spawn wrapper writes it.
+    /// This session's `LIBEI_SOCKET` relay (`pf_paths::gamescope_ei_socket_file_for`);
+    /// the pinned injector reads it, the spawn wrapper writes it.
     pub ei_relay: std::path::PathBuf,
-    /// The session's stream-sink `node.name` for the nested apps' `PULSE_SINK`. `None` when the
-    /// operator forced monitor-mode capture (no per-session sink exists to route to).
+    /// Nested apps' `PULSE_SINK` `node.name`. `None` when the operator forced monitor-mode
+    /// capture (no per-session sink exists).
     pub sink: Option<String>,
-    /// The session's virtual-mic `node.name` for the nested apps' `PULSE_SOURCE`.
+    /// Nested apps' `PULSE_SOURCE` `node.name`.
     pub mic_source: Option<String>,
 }
 
 #[cfg(target_os = "linux")]
 impl SessionIsolation {
-    /// Build the identity, computing the relay path under the session env lock (the producer-side
-    /// `XDG_RUNTIME_DIR` read must not race a concurrent handshake's `apply_session_env`).
+    /// Build the identity, computing the relay path under the session env lock: the producer-side
+    /// `XDG_RUNTIME_DIR` read must not race a concurrent handshake's `apply_session_env`.
     pub fn new(id: String, sink: Option<String>, mic_source: Option<String>) -> SessionIsolation {
         let ei_relay = crate::with_env_lock(|| pf_paths::gamescope_ei_socket_file_for(&id));
         SessionIsolation {
@@ -67,73 +62,51 @@ impl SessionIsolation {
     }
 }
 
-/// A created virtual output: a PipeWire source to capture, plus an owned keepalive whose drop
-/// tears the output down (releases the compositor-side resource).
+/// Capture target plus RAII keepalive; drop releases the compositor resource.
 ///
-/// Allowed dead on non-Linux: the backends that construct it are all `cfg(target_os = "linux")`.
+/// `dead_code` allowed: constructors sit behind per-OS `cfg`, so this type looks unused here.
 #[allow(dead_code)]
 pub struct VirtualOutput {
-    /// PipeWire node id of the output's screencast stream.
     pub node_id: u32,
-    /// Portal/remote PipeWire fd when the node lives on a sandboxed remote (e.g. Mutter's
-    /// RemoteDesktop+ScreenCast). `None` means the node is on the user's default PipeWire daemon
-    /// (KWin `zkde_screencast`), captured by connecting to that daemon directly.
+    /// PipeWire fd of a sandboxed remote node (Mutter RemoteDesktop+ScreenCast). `None` = default
+    /// daemon (KWin `zkde_screencast`); connect there directly.
     #[cfg(target_os = "linux")]
     pub remote_fd: Option<OwnedFd>,
-    /// `(width, height, refresh_hz)` to prefer in the PipeWire format negotiation. KWin and
-    /// gamescope outputs are created at the exact size, so this just confirms it; **Mutter sizes
-    /// its virtual monitor FROM the negotiation**, so here it's what makes the client's mode real.
+    /// `(width, height, refresh_hz)` for PipeWire format negotiation. KWin/gamescope already
+    /// created at this size; Mutter sizes the virtual monitor FROM the negotiation.
     pub preferred_mode: Option<(u32, u32, u32)>,
-    /// Windows capture identity (DXGI adapter LUID + GDI output name) for the pf-vdisplay backend —
-    /// what the host `capture::capture_virtual_output` needs to duplicate the right output.
+    /// DXGI adapter LUID + GDI output name; host `capture::capture_virtual_output` duplicates this.
     #[cfg(target_os = "windows")]
     pub win_capture: Option<pf_frame::dxgi::WinCaptureTarget>,
-    /// Keeps the output — and whatever connection/thread backs it — alive; dropped on teardown.
+    /// Holds the compositor resource (and its connection/thread) until drop.
     pub keepalive: Box<dyn Send>,
-    /// Who owns this display's lifecycle (`design/gamemode-and-dedicated-sessions.md` A1). The
-    /// registry pools/keep-alives only [`DisplayOwnership::Owned`] outputs; `External`/`SessionManaged`
-    /// pass through (the capturer holds the keepalive, teardown on drop). Defaults to `Owned`.
+    /// Registry pools only [`DisplayOwnership::Owned`]; the rest pass through to the capturer.
     pub ownership: DisplayOwnership,
-    /// `Some(gen)` when [`registry::acquire`](crate::registry::acquire) handed this back as a
-    /// **reused** kept display (`design/gamemode-and-dedicated-sessions.md` A2), so the pipeline builder
-    /// can [`registry::mark_failed(gen)`](crate::registry::mark_failed) if the first frame
-    /// fails on it — tearing the corpse down so the retry loop's next acquire creates fresh instead of
-    /// re-wedging on the same dead node. `None` on a fresh create / non-poolable output. Linux-only (the
-    /// keep-alive pool is Linux).
+    /// Generation when [`registry::acquire`](crate::registry::acquire) reused a kept display, so a
+    /// first-frame failure can [`registry::mark_failed`](crate::registry::mark_failed) instead of
+    /// retrying the same dead node. `None` on a fresh create or a non-poolable output.
     #[cfg(target_os = "linux")]
     pub reused_gen: Option<u64>,
-    /// The registry pool generation of this display (fresh AND reused — unlike `reused_gen`), so a
-    /// mid-stream mode-switch rebuild can [`registry::retire`](crate::registry::retire) the
-    /// display it supersedes instead of leaving it to accumulate under a linger/forever keep-alive
-    /// policy (`design/midstream-resolution-resize.md` H4). `None` for non-poolable outputs.
-    /// Linux-only (the keep-alive pool is Linux).
+    /// Pool generation of this display (fresh or reused, unlike `reused_gen`). A mid-stream
+    /// mode-switch [`registry::retire`](crate::registry::retire)s the superseded display so it
+    /// does not linger. `None` for non-poolable outputs. See `design/midstream-resolution-resize.md`.
     #[cfg(target_os = "linux")]
     pub pool_gen: Option<u64>,
-    /// The backend created the output at a SACRIFICIAL mode and the producer will renegotiate the
-    /// live stream to `preferred_mode`'s dims (KWin's screencast only rebuilds its format offer —
-    /// and thus its refresh cap — on a size change while recording; see kwin.rs `create`). The
-    /// capturer must hold frames until that renegotiation lands. Linux-only.
+    /// Created at a sacrificial size so KWin rebuilds its format offer (refresh cap only updates
+    /// on a size change while recording). Capturer holds frames until renegotiation to
+    /// `preferred_mode`. See kwin `create`.
     #[cfg(target_os = "linux")]
     pub expect_exact_dims: bool,
-    /// The compositor's own name for this output (Hyprland's `PF-<pid>-<n>`, sway's `HEADLESS-N`,
-    /// a mirrored head's connector) — the Linux answer to what `win_capture` carries on Windows:
-    /// the identity the host needs to aim **absolute input** at the head it is streaming
-    /// (`pf_inject::set_stream_output`, called from `capture::capture_virtual_output`).
-    ///
-    /// It is the `wl_output.name` of that head, which the protocol guarantees is the same string
-    /// for every client — so the injector can match it on its own Wayland connection. `None` on
-    /// the backends whose absolute mapping does not need it (KWin/Mutter inject through libei,
-    /// which selects by region; gamescope owns its whole seat).
-    ///
-    /// This crate must not depend on pf-inject (see the crate doc), so the name is only CARRIED
-    /// here — the host publishes it.
+    /// Compositor `wl_output.name` (Hyprland `PF-<pid>-<n>`, sway `HEADLESS-N`, mirrored connector)
+    /// so the host can aim absolute input (`pf_inject::set_stream_output`). Protocol-stable across
+    /// clients. `None` when mapping does not need it (KWin/Mutter libei-by-region; gamescope owns
+    /// the seat). Carried only: this crate must not depend on pf-inject.
     #[cfg(target_os = "linux")]
     pub output_name: Option<String>,
 }
 
 impl VirtualOutput {
-    /// A registry-[owned](DisplayOwnership::Owned) output — the common case (KWin/Mutter/wlroots,
-    /// gamescope bare-spawn, Windows). Fills `ownership: Owned`; the caller sets the platform fields.
+    /// Registry-owned output. Caller fills the platform fields (`remote_fd`, `win_capture`, …).
     pub fn owned(
         node_id: u32,
         preferred_mode: Option<(u32, u32, u32)>,
@@ -160,226 +133,141 @@ impl VirtualOutput {
     }
 }
 
-/// Pluggable virtual-output creation, per compositor.
+/// Per-compositor virtual-output backend. [`create`](Self::create) is RAII (drop the keepalive).
+/// Setters are instance-local, not process env, so concurrent sessions cannot stomp.
 pub trait VirtualDisplay: Send {
-    /// Human-readable backend name (e.g. `"kwin"`, `"wlroots"`, `"mutter"`).
+    /// Backend pin name (`"kwin"`, `"wlroots"`, `"mutter"`).
     fn name(&self) -> &'static str;
     /// Create a virtual output of the given mode. Teardown is RAII: drop the returned
     /// [`VirtualOutput`]'s `keepalive`.
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput>;
-    /// Set the per-session command this display should launch into its nested output (the resolved
-    /// app/game). Carried on the backend instance — NOT a process-global env var — so concurrent
-    /// sessions can't stomp each other's launch target. Default: no-op (backends that attach to an
-    /// existing session / don't spawn a nested command ignore it; only gamescope's spawn path uses it).
+    /// Nested launch command. Instance-local, not env: concurrent sessions must not stomp.
+    /// Default no-op; only gamescope spawn uses it.
     fn set_launch_command(&mut self, _cmd: Option<String>) {}
-    /// Set the RESOLVED gamescope sub-mode for this session (from
-    /// [`resolve_gamescope_route`](crate::resolve_gamescope_route)). Carried on the backend instance for the same
-    /// reason as [`set_launch_command`](Self::set_launch_command) — it used to travel through
-    /// `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION`, where the GameStream plane and the mid-session switch
-    /// watcher could overwrite one session's decision before another session's `create` read it.
-    /// Default: no-op (only the gamescope backend has sub-modes).
+    /// Resolved gamescope sub-mode ([`resolve_gamescope_route`](crate::resolve_gamescope_route)).
+    /// Instance-local: env (`PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION`) races concurrent sessions.
+    /// Default no-op.
     fn set_gamescope_route(&mut self, _route: Option<crate::GamescopeRoute>) {}
-    /// Set this session's [`SessionIsolation`] (an independent multi-user gamescope spawn —
-    /// `design/gamescope-multiuser.md`). Carried on the backend instance for the same reason as
-    /// [`set_gamescope_route`](Self::set_gamescope_route). Default: no-op (only gamescope's
-    /// bare-spawn path isolates).
+    /// [`SessionIsolation`] for an independent gamescope spawn (`design/gamescope-multiuser.md`).
+    /// Instance-local. Default no-op; only gamescope bare-spawn isolates.
     fn set_session_isolation(&mut self, _iso: Option<SessionIsolation>) {}
-    /// The isolation identity baked into this backend's NEXT create — part of the registry's
-    /// keep-alive reuse key: a kept spawn carries its session's relay path and audio routing in
-    /// its process env, so it may only ever be handed back to the same identity. `None` = not an
-    /// isolated spawn (matches only other `None` creates).
+    /// Isolation identity baked into the next `create`. Registry reuse key: a kept spawn's env
+    /// (relay, audio) is process-baked, so it may only return to the same identity. `None` matches
+    /// only other `None`.
     fn isolation_key(&self) -> Option<String> {
         None
     }
-    /// Set the connecting client's cert fingerprint so the backend can give that client a STABLE virtual
-    /// monitor identity across reconnects and its saved per-monitor config (notably DPI scaling) is
-    /// reapplied — via the OS (Windows EDID serial), the compositor (KWin per-slot output name), or
-    /// host-side persistence (Mutter, whose virtual monitors can't carry a stable identity). Carried on
-    /// the backend instance; set once before [`create`](Self::create). Default: no-op (wlroots/gamescope
-    /// have no per-client identity). `None` = anonymous/unpaired/GameStream → the backend's auto
-    /// (slot-based/shared) identity.
+    /// Client cert fingerprint for a stable virtual-monitor identity across reconnects (DPI, etc.).
+    /// Windows: EDID serial. KWin: per-slot output name. Mutter: host-side persistence (virtual
+    /// monitors cannot carry identity). `None` = anonymous / GameStream → auto slot. Default no-op.
     fn set_client_identity(&mut self, _fingerprint: Option<[u8; 32]>) {}
-    /// Hand the backend the session's deliberate-quit flag (set when the client closes with the QUIT
-    /// application code — a user "stop", not a network drop) so the last lease's drop can tear the
-    /// display down IMMEDIATELY, skipping the keep-alive linger — the Windows analogue of the Linux
-    /// registry's `Linger::Immediate` path. Carried on the backend instance; set once before
-    /// [`create`](Self::create). Default: no-op — only the Windows pf-vdisplay backend needs it (its
-    /// leases live in the `VirtualDisplayManager`, which the registry's quit plumbing does not reach;
-    /// Linux backends get the flag through `registry::acquire`).
+    /// Deliberate-quit flag (QUIT application code, not a network drop). Last lease drop tears
+    /// down immediately (`Linger::Immediate` on Linux). Default no-op: only Windows pf-vdisplay
+    /// needs it — its leases live in `VirtualDisplayManager`, which `registry::acquire` does not
+    /// reach. Linux gets this through the registry.
     fn set_quit_flag(&mut self, _quit: std::sync::Arc<std::sync::atomic::AtomicBool>) {}
-    /// Hand the backend the CLIENT display's HDR colour volume (`Hello::display_hdr` — primaries /
-    /// white point / luminance range as reported by the client OS), so a freshly created virtual
-    /// output can advertise the client's REAL panel in its EDID (pf-vdisplay codes the luminance
-    /// into the CTA-861.3 HDR static-metadata block) — host apps and the OS then tone-map to the
-    /// panel the stream actually lands on instead of a built-in placeholder volume. Carried on the
-    /// backend instance; set once before [`create`](Self::create). `None` = unknown/SDR client →
-    /// the backend's default EDID. Default: no-op — only the Windows pf-vdisplay backend can mint
-    /// per-monitor EDIDs today (the Linux compositors' virtual outputs take no EDID from us).
+    /// Client panel HDR volume (`Hello::display_hdr`) for the virtual output's EDID (CTA-861.3).
+    /// Host apps then tone-map to the panel the stream lands on. `None` = unknown/SDR → default
+    /// EDID. Default no-op: only Windows pf-vdisplay mints per-monitor EDIDs.
     fn set_client_hdr(&mut self, _hdr: Option<punktfunk_core::quic::HdrMeta>) {}
-    /// Tell the backend THIS SESSION negotiated HDR — a 10-bit BT.2020/PQ stream (`bit_depth >=
-    /// 10`, decided in the punktfunk/1 Welcome before any display exists). Distinct from
-    /// [`set_client_hdr`](Self::set_client_hdr), which describes the *client panel's* colour
-    /// volume for the EDID; this is the stream's own colourimetry, and the backend may have to
-    /// bring the output up differently for it. Carried on the backend instance; set once before
-    /// [`create`](Self::create). Default: no-op — only the Linux gamescope backend uses it, where
-    /// it adds `--hdr-enabled --hdr-debug-force-support` to the spawn so nested games get HDR
-    /// surfaces from the WSI layer and the composite can be captured as 10-bit PQ.
+    /// Stream negotiated HDR (10-bit BT.2020/PQ, `bit_depth >= 10` in Welcome). Distinct from
+    /// [`set_client_hdr`](Self::set_client_hdr) (panel volume for EDID). Default no-op; gamescope
+    /// adds `--hdr-enabled --hdr-debug-force-support` so nested WSI surfaces are HDR and capture
+    /// is 10-bit PQ.
     fn set_hdr(&mut self, _on: bool) {}
-    /// The HDR request currently set (see [`set_hdr`](Self::set_hdr)). The registry includes it in
-    /// the keep-alive REUSE key: a kept display brought up SDR cannot serve an HDR session (it was
-    /// spawned without the HDR flags — the game would see no HDR surfaces while the stream
-    /// negotiated PQ over an SDR composite) nor vice versa.
+    /// Current HDR request. Registry reuse key: an SDR-spawned display cannot serve HDR (no HDR
+    /// WSI surfaces; PQ over an SDR composite) nor vice versa.
     fn hdr(&self) -> bool {
         false
     }
-    /// Ask the backend for an OUT-OF-BAND cursor on the created output (the cursor channel):
-    /// the compositor/OS stops compositing the pointer into captured frames and the capture
-    /// layer surfaces shape/position separately. Carried on the backend instance; set once
-    /// before [`create`](Self::create) (both session paths pass `cursor_forward`). Off = the
-    /// compositor EMBEDS the pointer into frames — zero host-side cursor work, the pre-channel
-    /// path — which is what every session without the negotiated cursor cap gets (Moonlight /
-    /// GameStream / legacy clients / capture-mode starts), mirroring the Windows no-regression
-    /// gate. Implementations: Windows pf-vdisplay (IddCx hardware cursor, driver proto v5);
-    /// KWin (zkde `pointer` metadata vs embedded); Mutter (`cursor-mode` metadata vs embedded);
-    /// wlroots/hyprland (portal `CursorMode`). Default: no-op (gamescope has no cursor either
-    /// way — see the Phase C source).
+    /// Out-of-band cursor channel: compositor stops embedding the pointer; capture surfaces
+    /// shape/position separately. Off = embedded (no host cursor work) — Moonlight / GameStream /
+    /// legacy. Default no-op (gamescope has no cursor either way).
     fn set_hw_cursor(&mut self, _on: bool) {}
-    /// The out-of-band-cursor request currently set (see [`set_hw_cursor`](Self::set_hw_cursor)).
-    /// The registry includes it in the keep-alive REUSE key: a kept embedded-pointer display can
-    /// never serve a cursor-channel session (its stream has no cursor metadata to forward) nor
-    /// vice versa (the pointer would be missing from frames).
+    /// Current out-of-band-cursor request. Registry reuse key: an embedded-pointer display has no
+    /// cursor metadata; a cursor-channel display would miss the pointer in frames.
     fn hw_cursor(&self) -> bool {
         false
     }
-    /// The ScreenCast cursor mode the backend's portal actually NEGOTIATED for the most recent
-    /// [`create`](Self::create) — the answer to [`set_hw_cursor`](Self::set_hw_cursor), which is
-    /// only ever a *request*.
+    /// Portal-negotiated ScreenCast cursor mode of the last [`create`](Self::create) — the answer
+    /// to [`set_hw_cursor`](Self::set_hw_cursor), which is only a request.
     ///
-    /// This is the difference between the two that matters downstream: on the whole wlr family
-    /// (xdph, xdpw) `AvailableCursorModes` is `Hidden|Embedded`, so a session that asked for
-    /// metadata is served **`Embedded`** — the compositor paints the pointer into the frames and
-    /// sends no `SPA_META_Cursor`, ever, wherever the pointer is. A consumer that reads "no cursor
-    /// overlay" as a symptom (the host's park schedule reads it as "the seat pointer has not
-    /// reached the streamed output" — true on Mutter, which suppresses metadata while the pointer
-    /// is off the recorded view) is then acting on noise; see
+    /// wlr (xdph, xdpw) advertises `Hidden|Embedded`, so a metadata request is served `Embedded`:
+    /// the pointer is painted into frames and `SPA_META_Cursor` never arrives. Reading "no overlay"
+    /// as "pointer is off the recorded view" is noise there (true on Mutter). See
     /// [`PortalCursorMode::delivers_metadata`](crate::PortalCursorMode::delivers_metadata).
     ///
-    /// `None` — the default, and what every non-portal backend reports — means "nothing was
-    /// negotiated through the xdg ScreenCast portal here, so this says nothing at all": KWin
-    /// (`zkde_screencast` `pointer` mode), Mutter (`RecordVirtual` `cursor-mode`), gamescope (no
-    /// pointer either way) and Windows (IddCx) all get exactly what they ask for through their own
-    /// protocols, and their consumers must keep behaving as they always did. It is also `None`
-    /// before the first `create`.
-    ///
-    /// Reported by the wlr-family backends (`hyprland`, `wlroots`) and by the monitor
-    /// [`mirror`](crate::open_mirror) when it delegates to one. Those outputs are never registry-
-    /// pooled (`remote_fd.is_some()` — the portal fd cannot be re-opened per attach), so a reused
-    /// kept display can never hand back a *stale* answer here.
+    /// `None` (default, every non-portal backend, and before first `create`) means nothing was
+    /// negotiated through xdg ScreenCast: KWin/Mutter/gamescope/Windows use their own protocols.
+    /// wlr and [`mirror`](crate::open_mirror) report this; they are never pooled (`remote_fd` is
+    /// `Some`), so a reuse cannot return a stale answer.
     fn last_portal_cursor_mode(&self) -> Option<crate::PortalCursorMode> {
         None
     }
-    /// The stable identity slot the backend resolved for the most recent [`create`](Self::create) —
-    /// the per-client id the identity policy assigned (`Some`), or `None` for shared/anonymous. The
-    /// registry reads it right after `create` to key the display's group **arrangement** (manual
-    /// per-slot positions) and to label the mgmt `/display/state` slot. Default `None`: a backend
-    /// with no per-client identity (wlroots/gamescope) always auto-rows. KWin (per-slot output
-    /// naming) and Mutter (host-persisted per-client scale) report a real slot on Linux.
+    /// Identity slot of the last [`create`](Self::create) (`Some` = per-client policy, `None` =
+    /// shared/anonymous). Registry keys group arrangement and `/display/state` on it. Default
+    /// `None` (wlroots/gamescope auto-row). KWin and Mutter report a real slot.
     fn last_identity_slot(&self) -> Option<u32> {
         None
     }
-    /// Place the most-recently-[created](Self::create) output at `(x, y)` in the desktop coordinate
-    /// space (design `display-management.md` §6.2 — layout). The registry, which owns the display
-    /// **group**, computes the position from the whole group (auto-row or the console's manual
-    /// arrangement) and calls this right after `create`. Default no-op: only backends that can position
-    /// an output (KWin) implement it; the registry never calls it for the desktop origin `(0, 0)`, so a
-    /// single-display / first-of-group session issues no positioning at all. Best-effort — a failure
-    /// leaves the compositor's default placement.
+    /// Place the last [`create`](Self::create) at `(x, y)` in desktop space. Registry owns the
+    /// group and calls this after `create` (auto-row or console arrangement). Never called for
+    /// origin `(0, 0)`. Default no-op (only KWin positions). Best-effort: failure keeps compositor
+    /// default. See `design/display-management.md`.
     fn apply_position(&mut self, _x: i32, _y: i32) {}
-    /// Take the topology **restore** action this [`create`](Self::create) prepared — the work that
-    /// un-does an `exclusive`/`primary` topology change (e.g. re-enable the physical outputs KWin
-    /// disabled). The registry lifts it into the display **group** so it runs **once, when the group's
-    /// last display is torn down** (design §6.1 — per-group restore), not when this one session's
-    /// display drops: a sibling `exclusive` session must not have the physical re-enabled under it.
-    /// Called right after `create`; the backend must not also run it itself. Default `None` — a backend
-    /// whose topology auto-reverts (Mutter `APPLY_TEMPORARY`) or that changes nothing has nothing to
-    /// hand off.
+    /// Topology restore this [`create`](Self::create) prepared (re-enable heads an `exclusive` /
+    /// `primary` change disabled). Registry lifts it into the group so it runs once, when the
+    /// last display in the group tears down — a sibling exclusive session must not have physicals
+    /// re-enabled under it. Called after `create`; the backend must not also run it. Default `None`
+    /// (Mutter `APPLY_TEMPORARY` auto-reverts). See `design/display-management.md`.
     fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
         None
     }
-    /// Tell the backend whether this create will be the **first** display in its group — i.e. no
-    /// sibling of the same backend is already live (design §6.1). A backend that *establishes* the
-    /// group's topology (Mutter's sole-monitor `exclusive` `ApplyMonitorsConfig`) applies it only when
-    /// first; a later sibling **extends** into the already-exclusive desktop instead of re-clobbering it
-    /// (a fresh sole-monitor config would disable the first session's virtual output). Set by the
-    /// registry right before [`create`](Self::create). Default no-op: KWin recognises siblings at
-    /// runtime by output name (first-slot-wins + a group-aware disable filter), and single-display
-    /// backends never have a sibling.
+    /// Whether this [`create`](Self::create) is the first display in its group. Mutter exclusive
+    /// `ApplyMonitorsConfig` applies only on first; a later sibling extends, because a fresh
+    /// sole-monitor config would disable the first virtual. Registry sets this before `create`.
+    /// Default no-op: KWin sees siblings by output name.
     fn set_first_in_group(&mut self, _first: bool) {}
-    /// Will a [`create`](Self::create) for the CURRENT request produce a registry-poolable
-    /// ([`DisplayOwnership::Owned`], keep-alive-able) display? The registry consults this **before**
-    /// its keep-alive reuse lookup, so it never hands a kept display of one flavor to a request of
-    /// another — specifically a gamescope managed/attach acquire must not reuse a kept **bare-spawn**
-    /// (they share the backend name `"gamescope"`). Overridden by gamescope, which reads the
-    /// resolved [`GamescopeRoute`](crate::GamescopeRoute) carried on the instance (`self.route`, NOT
-    /// env — the sub-mode stopped travelling through `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION` in Phase
-    /// 2.3): `false` for `Managed` and `Attach`, `true` for `Spawn` **and for no route at all**,
-    /// since `create`'s own `None` arm falls through to the bare spawn — so an instance nobody
-    /// called `set_gamescope_route` on (the operator-pinned `PUNKTFUNK_COMPOSITOR` path) is
-    /// poolable, and takes both the reuse lookup and the `max_displays` ceiling. Also overridden by
-    /// the mirror backend (`false` always). See `design/gamemode-and-dedicated-sessions.md` A1.
+    /// Whether the current request's [`create`](Self::create) yields a poolable
+    /// ([`DisplayOwnership::Owned`]) display. Registry consults this *before* reuse lookup so a
+    /// gamescope managed/attach acquire cannot reuse a kept bare-spawn (same backend name).
+    /// Gamescope: `false` for `Managed`/`Attach`, `true` for `Spawn` and for no route (`create`'s
+    /// `None` arm is bare spawn, including operator-pinned `PUNKTFUNK_COMPOSITOR`). Mirror: always
+    /// `false`. See `design/gamemode-and-dedicated-sessions.md`.
     ///
-    /// The default `true` is a DEFAULT, not a fact: it happens to be right for every backend that
-    /// creates a display it owns, and it is wrong for any backend whose `create` reports something
-    /// other than [`DisplayOwnership::Owned`] — this answer and that one must agree, and nothing
-    /// enforces it. A required method would; making it one costs an impl in each of the five
-    /// per-compositor backends plus Windows.
+    /// Default `true` is a default, not a fact: it must agree with the ownership `create` reports,
+    /// and nothing enforces that.
     fn poolable_now(&self) -> bool {
         true
     }
-    /// The resolved launch command carried on this backend instance (set via
-    /// [`set_launch_command`](Self::set_launch_command)). The registry reads it to key keep-alive reuse
-    /// on `(backend, mode, launch)` (`design/gamemode-and-dedicated-sessions.md` A2) — a kept display
-    /// running game A must never be handed to a session that asked to launch game B. Default `None`
-    /// (backends that never nest a command); only gamescope reports its `cmd`.
+    /// Launch command on this instance ([`set_launch_command`](Self::set_launch_command)). Registry
+    /// reuse key `(backend, mode, launch)`: a kept game A must not serve a session that asked for
+    /// B. Default `None`; only gamescope reports it.
     fn launch_command(&self) -> Option<String> {
         None
     }
-    /// Is the kept display's `node_id` still live, checked **before** the registry REUSES it on a
-    /// reconnect (`design/gamemode-and-dedicated-sessions.md` A2)? A `false` tells the registry to tear
-    /// the dead entry down and create fresh instead of handing back a corpse (which would then fail
-    /// capture and burn a retry). Default `true` (honest optimism — the [`mark_failed`] path is the
-    /// backstop for a display that dies between this check and first frame). Only gamescope overrides
-    /// it (its nested session dies when the game exits, independently of any compositor); KWin/Mutter
-    /// nodes die only with their compositor, which the session-epoch invalidation (A4) already reaps.
-    ///
-    /// [`mark_failed`]: crate::registry::mark_failed
+    /// Is this kept `node_id` still live? Registry checks before reuse; `false` tears it down and
+    /// creates fresh. Default `true` — [`mark_failed`](crate::registry::mark_failed) is the backstop
+    /// if it dies between this check and first frame. Only gamescope overrides (nested session dies
+    /// with the game); KWin/Mutter nodes die with the compositor, already reaped by session-epoch.
     fn kept_display_alive(&mut self, _node_id: u32) -> bool {
         true
     }
 }
 
-/// Stash a freshly-prepared topology restore into a backend instance's pending slot, keeping the
-/// **first** restore that instance ever captured.
+/// Keep the first topology restore this backend instance captured; later `None` (or a subset) must
+/// not overwrite it.
 ///
-/// One backend instance serves EVERY attempt of the host's pipeline retry loop (`native/stream.rs`
-/// opens the display once and lends it to `build_pipeline_with_retry` for up to 8 attempts), so
-/// `create` — and with it the backend's topology step — runs repeatedly against this one slot.
-/// Attempt 1 disables the operator's heads and prepares the restore; attempts 2..n then *correctly*
-/// find nothing left to disable and prepare `None`, because attempt 1 already darkened everything.
+/// One instance serves every attempt of the host pipeline retry loop, so `create` runs against this
+/// slot repeatedly. Attempt 1 disables heads and prepares the restore; attempts 2..n correctly
+/// find nothing left and prepare `None`. Overwriting would drop attempt 1's closure, and Drop
+/// would have nothing to re-enable.
 ///
-/// Assigning that `None` over the held restore is what left an `exclusive` Hyprland desk dark after
-/// a failed build: attempt 1's closure was dropped rather than run, so by the time the failure
-/// unwound and the backend dropped, its backstop had nothing to re-enable and only a hand-run
-/// `hyprctl reload` brought the heads back. Skipping the assignment is the whole fix.
+/// First-wins is also the right *set*: attempt 1 saw every lit head; later attempts see a subset.
 ///
-/// First-wins keeps the *right* list too, not merely a surviving one: attempt 1 looked at the desk
-/// while it was still lit, so its set is every head that was on. Any later attempt can only see a
-/// subset of that.
-///
-/// Backends whose restore the registry drains after each `create` (KWin — pooled, so
-/// [`VirtualDisplay::take_topology_restore`] empties the slot) reach this with `None` held and are
-/// unaffected; it matters for the pass-through backends (Hyprland, wlroots/sway carry a portal fd,
-/// so the registry returns them before the take and the slot is never drained).
+/// Registry-drained backends (KWin, pooled — [`VirtualDisplay::take_topology_restore`] empties the
+/// slot) arrive with `None` held and are unaffected. Pass-through backends (Hyprland, wlroots;
+/// portal fd, never taken) need this.
 pub(crate) fn stash_topology_restore(
     slot: &mut Option<Box<dyn FnOnce() + Send>>,
     prepared: Option<Box<dyn FnOnce() + Send>>,
@@ -402,19 +290,16 @@ mod topology_restore_tests {
         }))
     }
 
-    /// The failure shape this exists for: the retry loop runs `create` eight times against ONE
-    /// backend instance, only the first of which has heads to disable — and the build then fails,
-    /// so the backstop `Drop` is the only thing that will ever run the restore. It must still be
-    /// holding one.
+    /// Retry loop: eight `create`s on one instance; only the first prepared a restore; Drop is
+    /// the only runner. The slot must still hold it.
     #[test]
     fn eight_failed_attempts_do_not_strand_the_restore() {
         let hits = Arc::new(AtomicUsize::new(0));
         let mut slot: Option<Box<dyn FnOnce() + Send>> = None;
 
-        // Attempt 1: the desk was lit, two heads went dark, restore prepared.
+        // Attempt 1: heads were on; restore prepared.
         stash_topology_restore(&mut slot, counting(&hits));
-        // Attempts 2..8: `disable_other_heads` correctly finds nothing enabled but the managed
-        // output, so each prepares `None`. None of them may take attempt 1's restore away.
+        // Attempts 2..8 prepare `None` (nothing left to disable). Must not drop attempt 1.
         for _ in 0..7 {
             stash_topology_restore(&mut slot, None);
         }
@@ -428,8 +313,7 @@ mod topology_restore_tests {
         );
     }
 
-    /// A second prepared restore never displaces the first: attempt 1 saw the full set of lit
-    /// heads, a later one can only have seen a subset.
+    /// A later prepared restore never displaces the first (attempt 1 saw the full lit set).
     #[test]
     fn a_later_restore_never_displaces_the_first() {
         let first = Arc::new(AtomicUsize::new(0));
@@ -448,22 +332,20 @@ mod topology_restore_tests {
         );
     }
 
-    /// An empty slot still accepts one — including after the registry drained it (the KWin path),
-    /// so a pooled backend's later create can hand off a fresh restore as before.
+    /// A drained slot (KWin / registry take) still accepts a later restore.
     #[test]
     fn an_empty_slot_still_accepts_a_restore() {
         let hits = Arc::new(AtomicUsize::new(0));
         let mut slot: Option<Box<dyn FnOnce() + Send>> = None;
 
         stash_topology_restore(&mut slot, counting(&hits));
-        let _drained = slot.take(); // the registry lifted it into the group
+        let _drained = slot.take(); // registry lifted it into the group
         assert!(slot.is_none());
         stash_topology_restore(&mut slot, counting(&hits));
         assert!(slot.is_some(), "a drained slot must be refillable");
     }
 
-    /// Nothing to disable and nothing held stays nothing held — an `extend`-shaped session must not
-    /// grow a restore out of thin air.
+    /// Empty + `None` stays empty: an extend session must not grow a restore.
     #[test]
     fn nothing_prepared_leaves_the_slot_empty() {
         let mut slot: Option<Box<dyn FnOnce() + Send>> = None;
