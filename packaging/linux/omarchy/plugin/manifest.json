@@ -16,6 +16,7 @@
     "displayName": "Punktfunk",
     "description": "One bar icon and one panel: what is streaming, who is asking to pair, and which devices are trusted.",
     "category": "System",
+    "defaultSection": "right",
     "aliases": ["punktfunk", "streaming"],
     "allowMultiple": false
   }

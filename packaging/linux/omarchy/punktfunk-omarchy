@@ -455,6 +455,21 @@ remove_menu() {
 # them there. Installing into /usr/share/omarchy/shell/plugins instead would drop unowned files
 # inside omarchy's own package: the exact "exists in filesystem" abort on its next upgrade.
 plugin_dest() { printf '%s/omarchy/plugins/punktfunk' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+# Outside a session shell the omarchy tools need OMARCHY_PATH (measured on 4.0.1).
+om() { OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}" omarchy "$@"; }
+
+# The shell learns of a new plugin dir from inotify plus an async rescan, so an enable in the
+# same instant as the copy fails with "not known" (0 s fails, 3 s later works). Same wait as
+# omarchy-plugin-add: ask for a rescan, then poll the list for up to two seconds.
+plugin_known() {
+  om shell shell rescanPlugins >/dev/null 2>&1 || true
+  local i
+  for ((i = 0; i < 40; i++)); do
+    grep -q '^punktfunk ' <<<"$(om plugin list 2>/dev/null)" && return 0
+    sleep 0.05
+  done
+  return 1
+}
 tray_override() { printf '%s/autostart/io.unom.Punktfunk.Tray.desktop' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 
 # The widget carries status, pairing and the console, so the tray would be a second punktfunk
@@ -481,9 +496,8 @@ setup_plugin() {
   mkdir -p "$dest"
   install -m0644 -t "$dest" "$HOOKS_SRC"/plugin/manifest.json "$HOOKS_SRC"/plugin/*.qml \
     "$HOOKS_SRC"/plugin/README.md
-  # `omarchy plugin enable` wires it into shell.json and reloads the shell. Outside a session
-  # shell it needs OMARCHY_PATH (measured on 4.0.1); the other omarchy tools here do not.
-  if OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}" omarchy plugin enable punktfunk >/dev/null 2>&1; then
+  # `omarchy plugin enable` wires it into shell.json and reloads the shell.
+  if plugin_known && om plugin enable punktfunk >/dev/null 2>&1; then
     ok "widget installed and enabled — the Punktfunk mark appears in the bar"
     hide_tray
   else
@@ -512,7 +526,7 @@ remove_plugin() {
   local dest; dest="$(plugin_dest)"
   # The manifest check keeps an rm -rf honest: only a directory that is actually our plugin goes.
   [[ -d "$dest" ]] && grep -qs '"id": "punktfunk"' "$dest/manifest.json" || return 0
-  OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}" omarchy plugin disable punktfunk >/dev/null 2>&1 || true
+  om plugin disable punktfunk >/dev/null 2>&1 || true
   rm -rf "$dest"
   ok "bar widget removed"
 }
