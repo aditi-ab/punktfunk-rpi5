@@ -16,11 +16,7 @@ use std::time::{Duration, Instant};
 /// the same contract before the deadline.
 #[test]
 fn a_failing_connect_still_speaks_the_contract() {
-    let binary = match option_env!("CARGO_BIN_EXE_punktfunk-session") {
-        Some(path) => path,
-        None => panic!("Cargo did not provide the punktfunk-session test binary"),
-    };
-    let mut child = Command::new(binary)
+    let mut child = Command::new(env!("CARGO_BIN_EXE_punktfunk-session"))
         .args([
             "--connect",
             "127.0.0.1:1",
