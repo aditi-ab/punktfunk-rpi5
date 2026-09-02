@@ -34,6 +34,13 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 
 ### Added
 
+- **`pf_frame::health` classifies a capture gap by evidence.** A pure state machine over the
+  independent progress clocks (worker heartbeat, driver acquire, ring publish, source frame,
+  encoded AU) names a gap Healthy / Idle / Suspect / Stalled(Worker | Transport | Conversion |
+  Presentation) / Recovering, with the 15 s stall floor the interim watchdog already uses. Cursor
+  or input evidence alone only raises suspicion and asks for a composition canary; presents or a
+  failed canary carry a gap into a recovery verdict. No I/O and no actuator: the recovery
+  coordinator consumes the verdict.
 - **`--host` / `--client` choose what to install.** `--client` installs `punktfunk-client` from
   the family repo, or a user-scope flatpak where the family has none, so a distro with no
   punktfunk repo can run the client.

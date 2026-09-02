@@ -12,6 +12,7 @@
 // Unsafe-proof program: every `unsafe {}` / `unsafe impl` must carry a `// SAFETY:` proof.
 
 pub mod hdr;
+pub mod health;
 pub mod metronome;
 pub mod session_tuning;
 pub mod thread_qos;
