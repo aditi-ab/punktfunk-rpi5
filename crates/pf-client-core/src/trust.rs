@@ -930,11 +930,6 @@ pub struct Settings {
     /// Host render/encode at `mode × render_scale`; presenter downscales. `> 1`
     /// supersamples; `< 1` under-renders; `1.0` = native. Clamped even, codec max.
     pub render_scale: f64,
-    /// Overlay chrome size — the stats HUD and the quick-action ring — as a multiplier on
-    /// top of the window's own display scale. `0.0` = Automatic, resolved from the device
-    /// class by [`punktfunk_core::osd_scale`]. A property of this screen, not of a host, so
-    /// it is a client setting and no profile overrides it. Never sent to the host.
-    pub osd_scale: f64,
     pub gamepad: String,
     /// Forward this device's controllers. Default on.
     ///
@@ -1222,7 +1217,6 @@ impl Default for Settings {
             refresh_hz: 0,
             bitrate_kbps: 0,
             render_scale: 1.0,
-            osd_scale: punktfunk_core::osd_scale::AUTO,
             gamepad: "auto".into(),
             gamepad_forwarding: true,
             forward_pad: String::new(),
@@ -1397,26 +1391,6 @@ mod tests {
         let gone: Settings = load_json_or_default(&dir.join("nope.json"));
         assert_eq!(gone.codec, Settings::default().codec);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A store written before the overlay-size setting loads as Automatic, not as the
-    /// 0.5 floor a bare `0.0` would clamp to.
-    #[test]
-    fn settings_osd_scale_defaults_automatic() {
-        let old = r#"{"width":1280,"height":720,"gamepad":"auto","compositor":"auto"}"#;
-        let s: Settings = serde_json::from_str(old).unwrap();
-        assert_eq!(s.osd_scale, punktfunk_core::osd_scale::AUTO);
-        assert!(punktfunk_core::osd_scale::is_auto(s.osd_scale));
-        assert_eq!(
-            Settings::default().osd_scale,
-            punktfunk_core::osd_scale::AUTO
-        );
-        // A stored manual value survives the round trip the dialog does on every close.
-        let mut manual = s.clone();
-        manual.osd_scale = 1.75;
-        let round: Settings =
-            serde_json::from_str(&serde_json::to_string(&manual).unwrap()).unwrap();
-        assert_eq!(round.osd_scale, 1.75);
     }
 
     /// A pre-touch-mode store loads as `trackpad`; names round-trip through the enum.

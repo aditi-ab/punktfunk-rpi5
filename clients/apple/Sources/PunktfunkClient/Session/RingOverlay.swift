@@ -278,10 +278,11 @@ struct RingOverlay: View {
     let actions: RingActions
     /// Set by the settings editor; nil in-stream.
     var editing: RingEditing? = nil
-    /// Overlay-scale multiplier (`OsdScale`). The ring centres on wherever the twist happened, so
-    /// it scales its own metrics rather than taking a `scaleEffect` about a fixed anchor, which
-    /// would walk an off-centre ring across the screen. 1 in the settings editor, which always
-    /// draws at design size.
+    /// Overlay-scale multiplier (`OsdScale.current`). The radial metrics below are scaled by hand
+    /// because the ring centres on wherever the twist happened, and a `scaleEffect` about a fixed
+    /// anchor would walk an off-centre ring across the screen. The two blocks with metrics of their
+    /// own — the sheet and the chord keycap — take the multiplier as a transform instead. 1 in the
+    /// settings editor, which always draws at design size.
     var scale: CGFloat = 1
 
     private var scaledRadius: CGFloat { ringRadius * scale }
@@ -418,15 +419,19 @@ struct RingOverlay: View {
                     Text(hint)
                         .font(.geist(13 * scale, .medium, relativeTo: .caption))
                         .foregroundStyle(.white.opacity(0.9))
-                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .padding(.horizontal, 14 * scale).padding(.vertical, 8 * scale)
                         .glassBackground(Capsule())
                         .position(x: cx, y: cy + scaledRadius + scaledSlot)
                 }
                 if state.sheet {
                     RingSheet(state: state, rows: sheetRows())
-                        .frame(maxHeight: geo.size.height * 0.6)
+                        // Grows upward off its own edge, so a scaled sheet cannot walk off screen.
+                        // `scaleEffect` leaves the layout box alone, so the cap is divided by the
+                        // multiplier to keep the DRAWN sheet inside its 60 % of the stage.
+                        .scaleEffect(scale, anchor: .bottom)
+                        .frame(maxHeight: geo.size.height * 0.6 / scale)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                        .padding(.bottom, 16)
+                        .padding(.bottom, 16 * scale)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
@@ -615,7 +620,7 @@ struct RingOverlay: View {
                             highlighted: Bool = false, action: @escaping () -> Void) -> some View {
         let face = Group {
             if let keys = s?.keys {
-                ChordKeycap(keys: keys)
+                ChordKeycap(keys: keys).scaleEffect(size / slotSize)
             } else {
                 Image(systemName: s?.icon ?? "circle.dashed")
                     .font(.system(size: size * 0.4, weight: .semibold))
@@ -720,14 +725,6 @@ extension RingOverlay {
             let n = options.count
             a.requestMode(mode.w, mode.h, options[((i + dir) % n + n) % n])
         }
-        // The ring re-renders through ContentView's `@AppStorage`, so a UserDefaults write here
-        // rescales the mounted overlay with the sheet still up.
-        func adjustOsd(_ dir: Int) {
-            let cur = UserDefaults.standard.double(forKey: DefaultsKey.osdScale)
-            UserDefaults.standard.set(OsdScale.step(cur, dir: dir), forKey: DefaultsKey.osdScale)
-        }
-        let osdLabel = OsdScale.label(
-            UserDefaults.standard.double(forKey: DefaultsKey.osdScale), for: OsdScale.deviceClass)
         var rows: [SheetRowSpec] = []
         rows.append(SheetRowSpec(header: "Session", label: "End stream",
                                  value: state.armed == "end_stream" ? againHint : "") { [state] in
@@ -754,7 +751,6 @@ extension RingOverlay {
             if pad.enabled { a.togglePad() }
         })
         rows.append(SheetRowSpec(header: "View", label: "Statistics", value: a.stats().label) { a.cycleStats() })
-        rows.append(SheetRowSpec(label: "Overlay size", value: osdLabel, adjust: adjustOsd) { adjustOsd(1) })
         let mic = spec(.mic, cfg, a)
         rows.append(SheetRowSpec(header: "Audio", label: mic.label, value: mic.enabled ? mic.state : mic.reason,
                                  enabled: mic.enabled) { if mic.enabled { a.toggleMic() } })

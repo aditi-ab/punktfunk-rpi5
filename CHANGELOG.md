@@ -34,25 +34,6 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 
 ### Added
 
-- **The overlay size steps live and from the wheel.** `punktfunk_core::osd_scale::step` owns the
-  rung walk (Kotlin and Swift twins included), the quick-action wheel's More sheet gains an
-  Overlay-size row on every client, the Windows settings page gains the combo, and the presenter
-  applies a step to the running stream instead of the next one. The step rebases on
-  `Settings::load()` before saving, so it cannot clobber a concurrent edit from a desktop
-  settings dialog.
-- **`punktfunk_core::osd_scale` sizes the streaming chrome.** The stats HUD and the quick-action
-  ring take a multiplier on top of each platform's density unit, `AUTO` (`0.0`) resolving from a
-  `DeviceClass` — 1.0 in the hand or at a desk, 1.75 on a TV, where `dp`/`pt` assume a viewing
-  distance that no longer holds. Physical screen size is deliberately not an input: no platform
-  reports a diagonal we can trust. Manual values clamp to 0.5–4.0, the range
-  `PUNKTFUNK_OSD_SCALE` and `render_scale` already use, and the pickers offer 25 %-apart presets
-  with a free percentage beside them. Twins ship as Kotlin's `OsdScale` and `OsdScale.swift`; the
-  presenter's `overlay_scale` now resolves through the shared module. On desktop the value is
-  `trust::Settings::osd_scale` — a client setting beside `render_scale`, absent from
-  `SettingsOverlay` because screen size is a fact about the device, not the host a profile is
-  authored against — surfaced in the GTK dialog and the console home, with
-  `PUNKTFUNK_OSD_SCALE` demoted to an override. A store written before this loads as Automatic.
-  Nothing crosses the wire; the host never sees it.
 - **Capture health on the Status page and in `GET /api/v1/status`.** A native Windows session's
   `session.capture` block carries the live capture-health class (`healthy`, `idle`, `suspect`,
   `stalled` with its class, `recovering`, `rebuilding`, `secure_desktop`), the evidence behind
@@ -179,6 +160,10 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 
 ### Changed
 
+- **The streaming overlay sizes itself for a TV.** The stats HUD and the quick-action ring draw
+  1.75x larger on Android TV and tvOS, where `dp` and `pt` normalise pixel density but not the
+  viewing distance a living-room set adds. Nothing to set — it follows the device — and
+  `PUNKTFUNK_OSD_SCALE` still nudges the desktop overlay exactly as before.
 - **The install commands are generated from `data/platforms.json`.** They were copied beside it
   and kept in step by a CI substring check; the binary embeds the file, so the docs and the
   installer cannot drift. Nothing to do.

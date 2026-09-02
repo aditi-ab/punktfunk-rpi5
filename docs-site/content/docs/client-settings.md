@@ -325,15 +325,6 @@ per-platform shortcut. The Apple app also picks the corner (Top/Bottom × Left/R
 home has the tier picker under **Interface**. Shortcuts and every number:
 [Understanding the stats overlay](/docs/stats).
 
-**Overlay size** — *default: Automatic.* Scales the statistics overlay and the quick-action dial
-together, as a percentage of this screen's normal UI size. Automatic asks the device: 100 % in your
-hands or at a desk, 175 % on a TV, where the normal size is read from across a room rather than at
-arm's length. Presets step 25 % at a time and you can enter any value from 50 % to 400 %. Every
-client has it; on Linux and the console home it is one spin row, where the steppers walk the presets
-and the entry takes an exact figure, and on Windows it is one combo beside the stats HUD row. The
-quick-action wheel's **More** sheet carries the same row mid-stream on every client, and a step
-there resizes the overlay on the running session.
-
 ## Settings that are facts about your device
 
 These describe the machine you're sitting at, stay global, and **cannot be put in a settings
@@ -344,8 +335,6 @@ profile**:
   overrides it ([Configuration](/docs/configuration#client-side-native-clients)). Decoder picker:
   Linux, Windows, console home. GPU picker: Windows, and Linux with more than one adapter. Apple
   and Android have neither.
-- **Overlay size** — how large the chrome draws is a property of this screen, not of the host a
-  profile is authored against.
 - **Speaker** and **Microphone** device pickers — this device's audio endpoints.
 - **Forwarded controller** — which physical pad is in your hands. (The *type* the host creates is a
   preference and can live in a profile, as can **Forward controllers**.)

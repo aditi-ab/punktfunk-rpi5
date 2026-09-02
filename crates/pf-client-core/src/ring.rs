@@ -27,11 +27,6 @@ pub enum RingCommand {
     CycleStats,
     ToggleMic,
     CycleTouchMode,
-    /// Step the overlay-size preference one rung (`dir` ±1). The presenter applies it
-    /// live and persists it; it is the loop's own, not [`super::ring_command`]'s.
-    AdjustOsdScale {
-        dir: i32,
-    },
     /// Platform text input, not a Keyboard key.
     Keyboard,
     RequestMode {
@@ -93,8 +88,6 @@ pub struct RingFacts {
     /// Without this the `touch` model is skipped.
     pub host_accepts_touch: bool,
     pub stats_tier: String,
-    /// Overlay-size label for the sheet row: `Automatic (100%)` or `125%`.
-    pub osd_scale: String,
     pub mic_available: bool,
     pub mic_muted: bool,
     /// Live `(w, h, hz)`. `native_mode` is the Welcome native.

@@ -65,7 +65,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -192,9 +191,6 @@ class RingActions(
     val sendText: (String) -> Unit,
     val stats: () -> StatsVerbosity,
     val cycleStats: () -> Unit,
-    /** The overlay-size preference and its ladder step; the shell persists it. */
-    val osdScale: () -> Double,
-    val adjustOsdScale: (Int) -> Unit,
     val micAvailable: () -> Boolean,
     val micMuted: () -> Boolean,
     val toggleMic: () -> Unit,
@@ -312,8 +308,6 @@ fun RingOverlay(
 ) {
     if (!state.visible) return
     val density = LocalDensity.current
-    // The sheet's Overlay-size row shows the resolved label ("Automatic (175%)" on a TV).
-    val deviceClass = osdDeviceClass(LocalContext.current)
     val radiusPx = with(density) { RING_RADIUS.toPx() }
     val slotPx = with(density) { SLOT_D.toPx() }
     val marginPx = radiusPx + slotPx / 2 + with(density) { 16.dp.toPx() }
@@ -351,7 +345,7 @@ fun RingOverlay(
     }
     var textDialog by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { if (state.nativeMode == null) state.nativeMode = actions.currentMode() }
-    val rows = if (state.sheet) sheetRows(state, cfg, actions, haptics, deviceClass) { textDialog = true } else emptyList()
+    val rows = if (state.sheet) sheetRows(state, cfg, actions, haptics) { textDialog = true } else emptyList()
 
     // The haptic vocabulary: a tap per press, a firm "no" on a dimmed button, a warning when a
     // destructive slot arms, and the confirm on the commit (StreamScreen fires that one).
@@ -694,7 +688,6 @@ private fun sheetRows(
     cfg: OverlayConfig,
     actions: RingActions,
     haptics: ConsoleHaptics,
-    deviceClass: OsdScale.DeviceClass,
     requestText: () -> Unit,
 ): List<SheetRowSpec> {
     val rows = mutableListOf<SheetRowSpec>()
@@ -731,7 +724,6 @@ private fun sheetRows(
     val pad = spec(SlotId.Pad, cfg, actions)
     rows += SheetRowSpec(null, pad.label, if (pad.enabled) pad.state else pad.reason, pad.enabled) { if (pad.enabled) actions.togglePad() }
     rows += SheetRowSpec("View", "Statistics", actions.stats().label) { actions.cycleStats() }
-    rows += SheetRowSpec(null, "Overlay size", OsdScale.label(actions.osdScale(), deviceClass), onAdjust = actions.adjustOsdScale) { actions.adjustOsdScale(1) }
     val mic = spec(SlotId.Mic, cfg, actions)
     rows += SheetRowSpec("Audio", mic.label, if (mic.enabled) mic.state else mic.reason, mic.enabled) { if (mic.enabled) actions.toggleMic() }
     actions.hostActions().forEachIndexed { i, act ->

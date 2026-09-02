@@ -252,9 +252,6 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     var panelHz by remember { mutableStateOf(0f) }
     var statsVerbosity by remember { mutableStateOf(initialSettings.statsVerbosity) }
     val statsOn = statsVerbosity != StatsVerbosity.OFF
-    // Overlay size is a device fact, not a profiled field, so the wheel's step persists through a
-    // fresh store read: the write cannot clash with a profile's overrides.
-    var osdScalePref by remember { mutableStateOf(initialSettings.osdScale) }
     // Touch model is fixed per session (re-keys the gesture handler below if it ever changes).
     // Passthrough needs a host that injects touch; without the bit every contact would vanish, so
     // the session runs the trackpad model instead and `touchHint` below says so, once.
@@ -1088,7 +1085,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         if (statsOn) {
             stats?.let {
                 val placement = Modifier.align(Alignment.TopStart).padding(12.dp)
-                OsdScaled(osdScalePref) {
+                OsdScaled {
                     StatsOverlay(
                         it, statsVerbosity, decoderLabel, codecLabel, session.profileName,
                         panelHz, placement,
@@ -1248,7 +1245,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         }
         // The ring, above the gesture layer so its buttons take the finger first. Composed only
         // while open: a closed overlay costs nothing (tenet 1).
-        OsdScaled(osdScalePref) {
+        OsdScaled {
             RingOverlay(
                 state = ring,
                 cfg = overlayCfg,
@@ -1267,12 +1264,6 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                     sendText = { NativeBridge.nativeSendText(handle, it) },
                     stats = { statsVerbosity },
                     cycleStats = { statsVerbosity = statsVerbosity.next() },
-                    osdScale = { osdScalePref },
-                    adjustOsdScale = { dir ->
-                        osdScalePref = OsdScale.step(osdScalePref, dir)
-                        val store = SettingsStore(context)
-                        store.save(store.load().copy(osdScale = osdScalePref))
-                    },
                     micAvailable = { micRunning },
                     micMuted = { micMuted },
                     toggleMic = { setMicMuted(!micMuted) },

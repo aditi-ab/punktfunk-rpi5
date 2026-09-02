@@ -58,7 +58,6 @@ enum SheetRow {
     Slot(SlotId),
     Resolution,
     Refresh,
-    OsdScale,
 }
 
 /// Editor: a press picks, Y lifts, A drops, a pointer carries. Centre is inert;
@@ -564,7 +563,6 @@ impl Ring {
             SheetRow::Slot(SlotId::TouchMode),
             SheetRow::Slot(SlotId::Keyboard),
             SheetRow::Slot(SlotId::Stats),
-            SheetRow::OsdScale,
             SheetRow::Slot(SlotId::Mic),
         ];
         rows.extend(
@@ -599,7 +597,6 @@ impl Ring {
         match row {
             SheetRow::Resolution => RowSpec::field("Resolution", self.res_label(), ""),
             SheetRow::Refresh => RowSpec::field("Refresh", format!("{} Hz", self.facts.mode.2), ""),
-            SheetRow::OsdScale => RowSpec::field("Overlay size", self.facts.osd_scale.clone(), ""),
             SheetRow::Slot(slot) => {
                 let s = self.spec(slot);
                 let value = if !s.enabled {
@@ -647,10 +644,6 @@ impl Ring {
                     refresh_hz: rhz,
                 });
             }
-            SheetRow::OsdScale => {
-                // The presenter applies and persists; the row's label corrects next frame.
-                self.pending.push_back(RingCommand::AdjustOsdScale { dir });
-            }
             SheetRow::Slot(_) => {}
         }
     }
@@ -664,9 +657,7 @@ impl Ring {
             ListMsg::Adjust(d) => self.adjust(&row, d),
             ListMsg::Activate => match &row {
                 SheetRow::Slot(slot) => self.fire(slot),
-                SheetRow::Resolution | SheetRow::Refresh | SheetRow::OsdScale => {
-                    self.adjust(&row, 1)
-                }
+                SheetRow::Resolution | SheetRow::Refresh => self.adjust(&row, 1),
             },
         }
     }

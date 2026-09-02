@@ -34,7 +34,6 @@ pub mod discovery;
 pub mod error;
 pub mod fec;
 pub mod input;
-pub mod osd_scale;
 pub mod packet;
 pub mod phase;
 #[cfg(feature = "quic")]

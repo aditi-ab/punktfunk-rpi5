@@ -334,10 +334,8 @@ modules:
       # compiles here). Both edits touch only the sandbox copies. (No --locked: the lock no
       # longer matches the reduced graph; --offline still pins every crate to the vendored
       # cargo-sources.json, so the build stays reproducible.)
-      - sed -i -e '\#"clients/windows",#d' -e '\#"crates/punktfunk-setup-win",#d' Cargo.toml
-      - python3 packaging/flatpak/prune-windows-toml.py
-          crates/pf-client-core/Cargo.toml
-          crates/punktfunk-setup-win/Cargo.toml
+      - sed -i '\#"clients/windows",#d' Cargo.toml
+      - python3 packaging/flatpak/prune-windows-toml.py crates/pf-client-core/Cargo.toml
       # One cargo invocation for both binaries: the shell and the Vulkan session binary it
       # execs for --connect/--browse. Building them together keeps skia-bindings' feature
       # unification identical to a workspace build (the pinned skia-binaries archive's

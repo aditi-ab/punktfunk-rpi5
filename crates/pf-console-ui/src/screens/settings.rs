@@ -56,9 +56,6 @@ enum RowId {
     PadType,
     SystemButtons,
     GuideGesture,
-    /// `trust::Settings::osd_scale`. Sizes the stats overlay and the quick-action ring
-    /// together; `AUTO` takes the device class's value.
-    OsdScale,
     /// `trust::Settings::pad_haptics`. Negotiated: needs a capable host and a wired DS5.
     PadHaptics,
     /// `trust::Settings::pad_speaker`. On (`"pad"`) / Off only — stored `"mix"`
@@ -230,7 +227,6 @@ const TABS: [(&str, &[RowId]); 7] = [
             RowId::LibraryView,
             RowId::LibraryCollections,
             RowId::Stats,
-            RowId::OsdScale,
             RowId::Fullscreen,
             RowId::AutoWake,
             RowId::GamepadUi,
@@ -1007,15 +1003,6 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
                 format!("{}×", s.render_scale)
             },
         ),
-        RowId::OsdScale => (
-            None,
-            "Overlay size",
-            if punktfunk_core::osd_scale::is_auto(s.osd_scale) {
-                "Automatic".into()
-            } else {
-                format!("{}%", punktfunk_core::osd_scale::to_percent(s.osd_scale))
-            },
-        ),
         RowId::Bitrate => (
             None,
             "Bitrate",
@@ -1239,10 +1226,6 @@ fn detail(id: RowId, ctx: &Ctx) -> &'static str {
         RowId::RenderScale => {
             "The host renders larger or smaller than the stream mode and this window \
              resamples — above 1× supersamples, below saves bandwidth."
-        }
-        RowId::OsdScale => {
-            "How large the statistics overlay and the quick-action dial draw. Automatic \
-             follows the device — larger on a TV, which is read from across a room."
         }
         RowId::Bitrate if ctx.settings.codec == "pyrowave" => {
             "PyroWave sets its own rate from the stream mode (all-intra) — a fixed bitrate \
@@ -1513,25 +1496,6 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             let cur = RENDER_SCALES.iter().position(|v| *v == s.render_scale);
             step_option(cur, RENDER_SCALES.len(), delta, wrap)
                 .map(|i| s.render_scale = RENDER_SCALES[i])
-        }
-        RowId::OsdScale => {
-            // Index 0 is Automatic; a hand-edited off-ladder value snaps to it.
-            let presets = punktfunk_core::osd_scale::PRESETS;
-            let cur = if punktfunk_core::osd_scale::is_auto(s.osd_scale) {
-                Some(0)
-            } else {
-                presets
-                    .iter()
-                    .position(|v| *v == s.osd_scale)
-                    .map(|i| i + 1)
-            };
-            step_option(cur, presets.len() + 1, delta, wrap).map(|i| {
-                s.osd_scale = if i == 0 {
-                    punktfunk_core::osd_scale::AUTO
-                } else {
-                    presets[i - 1]
-                };
-            })
         }
         RowId::Bitrate => {
             // Inert under PyroWave (host pins the rate; see `row_spec`).
@@ -2585,13 +2549,12 @@ pub(crate) mod tests {
                 seen.push(*id);
             }
         }
-        assert_eq!(seen.len(), 50, "{seen:?}");
+        assert_eq!(seen.len(), 49, "{seen:?}");
         assert!(seen.contains(&RowId::FollowOsTheme));
         assert!(seen.contains(&RowId::Palette));
         assert!(seen.contains(&RowId::ReduceMotion));
         assert!(seen.contains(&RowId::ReduceUiResolution));
         assert!(seen.contains(&RowId::AudioFormat));
-        assert!(seen.contains(&RowId::OsdScale));
         assert!(TABS[PROFILES_TAB].1.is_empty());
         assert_eq!(TABS[PROFILES_TAB].0, "Profiles");
     }

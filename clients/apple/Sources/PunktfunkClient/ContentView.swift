@@ -36,7 +36,6 @@ struct ContentView: View {
     @AppStorage(DefaultsKey.statsVerbosity) private var statsVerbosityRaw
         = StatsVerbosity.current.rawValue
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
-    @AppStorage(DefaultsKey.osdScale) private var osdScale = OsdScale.auto
     /// The tier the overlay actually shows: the live session's (its profile's, then whatever the
     /// ⌃⌥⇧S/three-finger cycle moved it to) while streaming, the persisted global otherwise.
     private var statsVerbosity: StatsVerbosity {
@@ -1179,7 +1178,7 @@ struct ContentView: View {
                             StreamHUDView(
                                 model: model, connection: conn, placement: placement,
                                 verbosity: statsVerbosity)
-                                .osdScaled(osdScale, anchor: placement.unitPoint)
+                                .osdScaled(anchor: placement.unitPoint)
                                 .transition(
                                     .scale(scale: 0.8, anchor: placement.unitPoint)
                                         .combined(with: .opacity))
@@ -1327,7 +1326,7 @@ struct ContentView: View {
                 .overlay {
                     if captureEnabled, ring.visible {
                         RingOverlay(state: ring, cfg: ringConfig, actions: ringActions(conn),
-                                    scale: OsdScale.resolved(osdScale))
+                                    scale: OsdScale.current)
                     }
                 }
                 .onChange(of: ring.committed) { _, open in model.setRingOpen(open) }
@@ -1337,7 +1336,7 @@ struct ContentView: View {
                 .overlay {
                     if captureEnabled, ring.visible {
                         RingOverlay(state: ring, cfg: ringConfig, actions: ringActions(conn),
-                                    scale: OsdScale.resolved(osdScale))
+                                    scale: OsdScale.current)
                     }
                 }
                 .onChange(of: ring.committed) { _, open in
