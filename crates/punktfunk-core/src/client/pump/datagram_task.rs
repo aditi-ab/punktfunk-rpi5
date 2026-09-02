@@ -1,10 +1,9 @@
-//! Datagram demux: host → client audio/rumble (try_send: a lagging embedder drops the
-//! newest packet rather than backing up the QUIC receive path).
+//! Host → client datagram demux. `try_send` drops the newest packet when the embedder
+//! lags, so a slow consumer never backs up the QUIC receive path.
 
 use super::*;
 
-// One parameter per demuxed plane — grouping them into a struct would just move the field
-// list one hop away from the single call site.
+// One parameter per demuxed plane; a struct would only move the field list off the call site.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run(
     conn: quinn::Connection,
@@ -15,18 +14,16 @@ pub(super) async fn run(
     pad_audio_tx: std::sync::mpsc::SyncSender<crate::quic::PadAudioFrame>,
     hdr_meta_tx: std::sync::mpsc::SyncSender<crate::quic::HdrMeta>,
     host_timing_tx: std::sync::mpsc::SyncSender<crate::quic::HostTiming>,
-    // The ABR encode signal's accumulator (see [`EncodeLatAcc`]) — fed HERE, not off
-    // `host_timing_tx`: that channel is the overlay's, lossy and embedder-drained.
+    // ABR encode accumulator ([`EncodeLatAcc`]). Fed here, not from `host_timing_tx`
+    // (that channel is overlay-lossy and embedder-drained).
     encode_lat: Arc<Mutex<super::super::frame_channel::EncodeLatAcc>>,
     cursor_state_tx: std::sync::mpsc::SyncSender<crate::quic::CursorState>,
 ) {
-    // Per-pad reorder gate for v2 rumble envelopes (the seq analog of the host's gamepad-state
-    // gate): a datagram the network reordered must not roll a stopped motor back on. Legacy v1
-    // datagrams carry no seq and bypass it (an old host's own periodic re-send is the only heal).
+    // Per-pad seq gate for v2 rumble: a reorder must not restart a stopped motor.
+    // v1 has no seq and bypasses (the host's periodic re-send is the only heal).
     let mut rumble_last_seq: [Option<u8>; crate::input::MAX_PADS] = [None; crate::input::MAX_PADS];
-    // Redundant-audio-plane rebuild (`0xD2`). Recovery happens HERE rather than in the four
-    // client decoders: the recovered frame is re-inserted into this queue in order, so every
-    // embedder gets a complete stream without knowing the plane exists.
+    // `0xD2` rebuild: recover here and re-insert in order so every embedder sees a
+    // complete stream without knowing the plane exists.
     let mut audio_red = crate::audio::AudioRedRecovery::new();
     while let Ok(d) = conn.read_datagram().await {
         match d.first() {
@@ -43,8 +40,7 @@ pub(super) async fn run(
                 if let Some((seq, pts_ns, opus, prev)) = crate::quic::decode_audio_red_datagram(&d)
                 {
                     if audio_red.recover_before(seq, prev.is_some()) {
-                        // The copy is the frame BEFORE this one, so it carries the previous
-                        // sequence and presentation time — one protocol frame earlier.
+                        // Copy is the previous protocol frame: seq-1, pts minus one FRAME_MS.
                         let _ = audio_tx.try_send(AudioPacket {
                             seq: seq.wrapping_sub(1),
                             pts_ns: pts_ns
@@ -61,18 +57,12 @@ pub(super) async fn run(
             }
             Some(&crate::quic::RUMBLE_MAGIC) => {
                 if let Some(u) = crate::quic::decode_rumble_envelope(&d) {
-                    // A pad index the client cannot represent is dropped outright, before either
-                    // consumer sees it. It used to be waved through: the seq gate was skipped (its
-                    // per-pad cursor has no slot for it) and it was handed to the legacy queue,
-                    // while the policy engine silently discarded it on its own bounds check — so
-                    // "both consumers are fed" below was false for exactly these, and an embedder
-                    // draining the queue could be handed an index it would use to subscript its
-                    // own per-pad array. The host never emits one; this is malformed or hostile.
+                    // Out-of-range pad: drop before either consumer. The seq gate has no
+                    // slot, and an embedder would subscript its own per-pad array.
                     let idx = u.pad as usize;
                     if idx >= crate::input::MAX_PADS {
                         continue;
                     }
-                    // Gate v2 envelopes on their per-pad seq; forward v1 (envelope: None) as-is.
                     let fresh = match u.envelope {
                         Some(env) => {
                             if crate::input::GamepadSnapshot::seq_newer(
@@ -82,24 +72,15 @@ pub(super) async fn run(
                                 rumble_last_seq[idx] = Some(env.seq);
                                 true
                             } else {
-                                false // reordered/duplicate — drop, keep the newer state
+                                false // reorder/duplicate
                             }
                         }
                         None => true,
                     };
                     if fresh {
                         let ttl = u.envelope.map(|e| e.ttl_ms);
-                        // Both consumers are fed; an embedder drains exactly one of them
-                        // (the legacy queue, or the policy engine's command API).
-                        //
-                        // Only the policy engine carries `u.left_trigger`/`u.right_trigger` (the
-                        // v3 impulse-trigger tail). The legacy queue's tuple is the shape two
-                        // frozen C entry points read through fixed out-params
-                        // (`punktfunk_connection_next_rumble`/`_next_rumble2`), so it stays at the
-                        // two handle levels forever: an out-of-tree embedder on those symbols must
-                        // keep behaving exactly as it did. That is the §5 compatibility table's
-                        // "new host, old client" cell, and it is now a per-API property rather
-                        // than a per-client one — the same session can serve both.
+                        // Both consumers: legacy queue is the frozen two-handle C ABI
+                        // (`next_rumble`/`next_rumble2`); only the policy engine gets triggers.
                         let _ = rumble_tx.try_send((u.pad, u.low, u.high, ttl));
                         rumble_feed.wire_update(
                             u.pad,
@@ -122,19 +103,9 @@ pub(super) async fn run(
                     let _ = pad_audio_tx.try_send(f);
                 }
             }
-            // The lossless plane feeds the SAME queue as `0xC9`, deliberately: the header is
-            // identical by design, so seq/pts (and therefore the gap tracker, the de-jitter
-            // policy and A/V sync) mean exactly what they mean on the Opus plane, and only the
-            // payload format differs. Keeping one queue means the whole downstream pipeline —
-            // `AUDIO_QUEUE`, `next_audio`, the in-core decode in `abi.rs` — is unchanged, and the
-            // format that tells a consumer how to read `data` is the session-wide
-            // `Welcome::audio_codec` rather than anything per-packet.
-            //
-            // A session runs one plane or the other for its whole life, so the two arms can never
-            // interleave into that queue. `AudioRedRecovery` is not involved: `0xD2` redundancy is
-            // undefined for this plane and never sent with it (it would double a bitrate that is
-            // already the largest on the connection), so a lost datagram here is concealed by
-            // `pcm::PcmConceal` at the decode site instead of reconstructed here.
+            // Same queue as `0xC9` so seq/pts mean the same; `Welcome::audio_codec` is the
+            // payload format. A session runs one plane for life. No `0xD2` on PCM —
+            // conceal at decode (`pcm::PcmConceal`), do not reconstruct here.
             Some(&crate::quic::AUDIO_PCM_MAGIC) => {
                 if let Some((seq, pts_ns, pcm)) = crate::quic::decode_audio_pcm_datagram(&d) {
                     let _ = audio_tx.try_send(AudioPacket {
@@ -164,7 +135,7 @@ pub(super) async fn run(
                     let _ = cursor_state_tx.try_send(s);
                 }
             }
-            _ => {} // unknown tag — a newer host; ignore
+            _ => {} // newer host; ignore
         }
     }
 }
@@ -173,14 +144,9 @@ pub(super) async fn run(
 mod tests {
     use super::*;
 
-    /// A `0xD3` datagram must land in the SAME queue `0xC9` feeds, with its sequence and
-    /// presentation time intact and its payload byte-for-byte what the host put on the wire.
-    ///
-    /// Driven through the REAL demux loop over a real QUIC connection rather than by calling the
-    /// decoder directly, because the decoder is not what this arm adds: the arm is a tag, a sink
-    /// and an absence (no `AudioRedRecovery`), and only the loop can be wrong about those. The
-    /// endpoint pair is the one `endpoint`'s own MTU measurement uses; a single datagram over
-    /// loopback costs milliseconds.
+    /// A `0xD3` datagram lands in the same queue `0xC9` feeds, seq/pts intact, payload
+    /// unmodified. Driven through the real demux loop: the arm is a tag, a sink, and
+    /// no `AudioRedRecovery`, and only the loop can be wrong about those.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_lossless_datagram_reaches_the_audio_sink() {
         let server = crate::quic::endpoint::server("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -193,8 +159,7 @@ mod tests {
         let client_conn = client.connect(addr, "punktfunk").unwrap().await.unwrap();
         let (_server_ep, host_conn) = accept.await.unwrap();
 
-        // Every plane's sink, so nothing the loop touches is a closed channel — the receivers
-        // must outlive the task or `try_send` would fail for a reason the test does not intend.
+        // Keep every receiver alive: a closed sink would fail `try_send` for the wrong reason.
         let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<AudioPacket>(8);
         let (rumble_tx, _rumble_rx) = std::sync::mpsc::sync_channel::<RumbleUpdate>(8);
         let (hidout_tx, _hidout_rx) = std::sync::mpsc::sync_channel(8);
@@ -219,11 +184,8 @@ mod tests {
             cursor_state_tx,
         ));
 
-        // One frame of 48 kHz/24-bit stereo, sized the way the host is REQUIRED to size it: from
-        // the connection's own `max_datagram_size`, because this plane is never fragmented and an
-        // oversized datagram is not sent at all. Hardcoding 5 ms here fails outright — 1440 B of
-        // payload does not fit before MTU discovery settles, which is exactly the trap §4.2
-        // warns the host about, reproduced by accident on the first attempt at this test.
+        // Size from this connection's `max_datagram_size`: the plane is never fragmented,
+        // and a 5 ms / 1440 B frame does not fit before MTU discovery settles.
         let bits = crate::audio::pcm::BITS_24;
         let max_dg = host_conn
             .max_datagram_size()

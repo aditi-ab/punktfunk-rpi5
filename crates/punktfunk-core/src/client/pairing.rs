@@ -7,14 +7,9 @@ use crate::quic::{endpoint, io};
 use std::time::Duration;
 
 impl NativeClient {
-    /// Run the PIN pairing ceremony against a host: connect (trust-on-first-use — the PIN
-    /// proof is what authenticates the certificates), prove knowledge of the PIN the host
-    /// is displaying, and return the host's now-verified fingerprint for pinning. The host
-    /// persists this client's fingerprint in its paired set.
-    ///
-    /// `identity` is this client's persistent PEM identity (cert, key) — the same one
-    /// later passed to [`NativeClient::connect`]; `pin` is what the user read off the host
-    /// (its log / UI); `name` is the label the host stores.
+    /// Pair over TOFU QUIC: the PIN, not the handshake, authenticates the certs.
+    /// Returns the host fingerprint to pin. Pass the same PEM identity later to
+    /// [`NativeClient::connect`]. The host stores `name` against this client.
     pub fn pair(
         host: &str,
         port: u16,
@@ -38,24 +33,23 @@ impl NativeClient {
             .map_err(|_| PunktfunkError::InvalidArg("host:port"))?;
 
         rt.block_on(async move {
-            // The quinn endpoint must be created inside the runtime (it spawns its driver).
+            // quinn's driver is spawned on the current runtime.
             let (ep, observed) = endpoint::client_pinned_with_identity(None, Some(identity));
             let ep = ep.map_err(|e| PunktfunkError::Io(std::io::Error::other(e.to_string())))?;
 
-            // The SPAKE2 exchange over an already-open bi-stream; never closes the conn (the
-            // caller does, then flushes), so any early exit still lets the host see the close.
+            // Never close here; the caller does, then flushes, so an early
+            // return still lets the host see CONNECTION_CLOSE.
             let exchange = |conn: quinn::Connection, host_fp: [u8; 32]| async move {
                 let (mut send, mut recv) = conn
                     .open_bi()
                     .await
                     .map_err(|e| PunktfunkError::Io(std::io::Error::other(e.to_string())))?;
-                // SPAKE2 as A, binding our fingerprint + the host cert we observed (TOFU).
+                // SPAKE2 as A; bind our fingerprint and the TOFU-observed host cert.
                 let (pake, spake_a) = pake::start(true, &pin, &client_fp, &host_fp);
                 io::write_msg(&mut send, &PairRequest { name, spake_a }.encode()).await?;
                 let challenge = PairChallenge::decode(&io::read_msg(&mut recv).await?)?;
                 let confirms = pake.finish(&challenge.spake_b)?;
-                // The host's confirmation proves it reached the same key (right PIN, same
-                // certs) — only then do we pin it and send our own confirmation.
+                // Host confirm = same key (PIN + certs). Pin only after this.
                 if !pake::verify(&confirms.host, &challenge.confirm) {
                     return Err(PunktfunkError::Crypto); // wrong PIN or MITM
                 }
@@ -83,12 +77,9 @@ impl NativeClient {
                     .map_err(|e| PunktfunkError::Io(std::io::Error::other(e.to_string())))?;
                 let host_fp = observed.lock().unwrap().ok_or(PunktfunkError::Crypto)?;
                 let outcome = match exchange(conn.clone(), host_fp).await {
-                    // A typed application close from the host (pairing not armed / armed for a
-                    // different device / rate-limited / version mismatch) beats the generic
-                    // transport error the aborted exchange produced — it is the actual answer.
-                    // Same close-vs-stream-error race as the connect handshake: give the
-                    // host's CONNECTION_CLOSE a short grace to be processed before deciding
-                    // the error was plain transport trouble.
+                    // Prefer a typed host close (not armed / wrong device / rate-limit)
+                    // over the transport error from the aborted stream. Same race as
+                    // connect: 300 ms for CONNECTION_CLOSE to land.
                     Err(e) => {
                         if conn.close_reason().is_none() {
                             let _ = tokio::time::timeout(
@@ -104,8 +95,7 @@ impl NativeClient {
                     }
                     ok => ok,
                 };
-                // Always tell the host we're done so it never blocks at its read — code 0 on
-                // success, 1 on a refused/aborted ceremony.
+                // Close so the host unblocks its read: 0 = ok, 1 = refused/aborted.
                 let code: u32 = if outcome.is_ok() { 0 } else { 1 };
                 conn.close(code.into(), b"pair done");
                 outcome
@@ -113,8 +103,8 @@ impl NativeClient {
             let outcome = tokio::time::timeout(timeout, ceremony)
                 .await
                 .map_err(|_| PunktfunkError::Timeout)?;
-            // Flush the CONNECTION_CLOSE before the runtime is dropped — otherwise the host
-            // may never see it and would block at its read for the full pairing timeout.
+            // Drain CONNECTION_CLOSE before dropping the runtime; else the host
+            // waits the full pairing timeout. 2 s is enough for a local flush.
             let _ = tokio::time::timeout(Duration::from_secs(2), ep.wait_idle()).await;
             outcome
         })

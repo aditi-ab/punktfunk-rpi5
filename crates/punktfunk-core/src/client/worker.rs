@@ -1,4 +1,9 @@
-//! `WorkerArgs` (the pump's constructor payload) and `reject_from_close`.
+//! Constructor bag the connect path hands the tokio worker, plus typed close-code
+//! classification.
+//!
+//! [`WorkerArgs`] holds Hello fields, event planes, and the live slots the control
+//! task mutates. [`reject_from_close`] maps a QUIC application close onto
+//! [`crate::reject::RejectReason`]; transport and local closes keep the original error.
 
 use super::*;
 use crate::clipboard::{ClipCommand, ClipEventCore};
@@ -19,44 +24,37 @@ pub(crate) struct WorkerArgs {
     pub(crate) bitrate_kbps: u32,
     pub(crate) video_caps: u8,
     pub(crate) audio_channels: u8,
-    /// The sample rate/depth this client is ASKING for ([`crate::quic::Hello::audio_rate_hz`] /
-    /// [`audio_bits`](crate::quic::Hello::audio_bits)) — a request, never a fact. Anything other
-    /// than the legacy 48 kHz/16-bit pair also sets [`crate::quic::CLIENT_CAP_AUDIO_HIRES`] (see
-    /// [`NativeClient::connect_with_audio_format`]); the host resolves both and answers in its
-    /// `Welcome`, which is what the client must actually open its device from.
+    /// Hello request, never the device format. The host answers in `Welcome`; open
+    /// the device from that. Anything other than 48 kHz/16-bit also sets
+    /// [`crate::quic::CLIENT_CAP_AUDIO_HIRES`].
     pub(crate) audio_rate_hz: u32,
     pub(crate) audio_bits: u8,
     pub(crate) video_codecs: u8,
     pub(crate) preferred_codec: u8,
     pub(crate) display_hdr: Option<HdrMeta>,
     pub(crate) client_caps: u8,
-    /// Slice-progressive delivery opt-in ([`crate::session::Session::set_deliver_frame_parts`]):
-    /// only an embedder whose decode path understands [`crate::session::Frame::part`] may set
-    /// it. Ignored on all-intra (PyroWave) sessions — their newest-wins draining needs whole AUs.
+    /// Slice-progressive [`crate::session::Frame::part`] opt-in. Ignored on all-intra
+    /// (PyroWave) sessions — newest-wins draining needs whole AUs.
     pub(crate) frame_parts: bool,
     pub(crate) launch: Option<String>,
-    /// This device's display name, sent in `Hello` (the host's approval list / trust store label).
+    /// Display name in `Hello` — the host's approval-list / trust-store label.
     pub(crate) name: Option<String>,
     pub(crate) pin: Option<[u8; 32]>,
     pub(crate) identity: Option<(String, String)>,
-    /// The embedder's connect budget (the same value `connect` bounds `ready_rx` with): the
-    /// dial loop re-dials a silent host within it, so a host still resuming from Wake-on-LAN
-    /// is caught the moment its network comes back instead of failing on the first attempt.
+    /// Same budget `connect` bounds `ready_rx` with. The dial loop re-dials inside it
+    /// so a host still coming up from Wake-on-LAN is not a first-attempt failure.
     pub(crate) connect_timeout: std::time::Duration,
     pub(crate) frames: Arc<FrameChannel>,
     pub(crate) audio_tx: SyncSender<AudioPacket>,
     pub(crate) rumble_tx: SyncSender<RumbleUpdate>,
-    /// Feed half of the rumble policy engine — its `Drop` (demux task end) marks the engine
-    /// closed, so the command API always observes connection teardown.
+    /// Feed half of the rumble policy engine. Its `Drop` (demux task end) marks the
+    /// engine closed, so the command API always sees teardown.
     pub(crate) rumble_feed: super::rumble::RumbleFeed,
     pub(crate) hidout_tx: SyncSender<HidOutput>,
-    /// Inbound pad-audio frames (`0xD1` — DualSense voice-coil haptics + speaker), drained by
-    /// [`NativeClient::next_pad_audio`].
+    /// Inbound `0xD1` pad-audio frames (voice-coil haptics + speaker).
     pub(crate) pad_audio_tx: SyncSender<PadAudioFrame>,
-    /// Per-pad pad-audio render capabilities (bit0 haptics, bit1 speaker), written by
-    /// [`NativeClient::set_pad_audio_caps`] and OR'd into outgoing
-    /// [`GamepadArrival`](crate::input::InputKind::GamepadArrival) flags (bits 8/9) by the input
-    /// task — toward a `HOST_CAP_PAD_AUDIO` host only.
+    /// Per-pad render caps (bit0 haptics, bit1 speaker). OR'd into GamepadArrival
+    /// flags (bits 8/9) toward a `HOST_CAP_PAD_AUDIO` host only.
     pub(crate) pad_audio_caps: Arc<[AtomicU8; crate::input::MAX_PADS]>,
     pub(crate) hdr_meta_tx: SyncSender<HdrMeta>,
     pub(crate) host_timing_tx: SyncSender<crate::quic::HostTiming>,
@@ -64,63 +62,54 @@ pub(crate) struct WorkerArgs {
     pub(crate) cursor_state_tx: SyncSender<crate::quic::CursorState>,
     pub(crate) input_rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
     pub(crate) mic_rx: tokio::sync::mpsc::Receiver<(u32, u64, Vec<u8>)>,
-    /// Pre-encoded 0xCC datagrams (rich input AND pen batches — see `NativeClient.rich_input_tx`).
+    /// Pre-encoded `0xCC` datagrams — rich input and pen batches share this queue.
     pub(crate) rich_input_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     pub(crate) ctrl_rx: tokio::sync::mpsc::Receiver<CtrlRequest>,
     pub(crate) ctrl_tx: tokio::sync::mpsc::Sender<CtrlRequest>,
-    /// Inbound clipboard event plane feed — the control task pushes ClipState/ClipOffer, the
-    /// clipboard task pushes fetch data; drained by [`NativeClient::next_clip`].
+    /// Clipboard event plane: control task pushes ClipState/ClipOffer, clipboard
+    /// task pushes fetch data.
     pub(crate) clip_event_tx: SyncSender<ClipEventCore>,
-    /// Outbound clipboard fetch/serve/cancel commands from the embedder → [`crate::clipboard::run`].
     pub(crate) clip_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<ClipCommand>,
     pub(crate) ready_tx: std::sync::mpsc::Sender<Result<Negotiated>>,
     pub(crate) shutdown: Arc<AtomicBool>,
-    /// A [`crate::client::PunktfunkEndReason`] as `u8`, classified from the connection's close and
-    /// latched alongside `shutdown` (see [`NativeClient::end_reason`]).
+    /// [`crate::client::PunktfunkEndReason`] as `u8`, latched beside `shutdown`.
     pub(crate) end_reason: Arc<AtomicU8>,
-    /// Deliberate-quit flag (see [`NativeClient::quit`]): the worker closes with the quit code if set.
+    /// When set, the worker closes with the deliberate-quit code rather than a generic end.
     pub(crate) quit: Arc<AtomicBool>,
     pub(crate) mode_slot: Arc<std::sync::Mutex<Mode>>,
     pub(crate) probe: Arc<Mutex<ProbeState>>,
     pub(crate) frames_dropped: Arc<AtomicU64>,
     pub(crate) fec_recovered: Arc<AtomicU64>,
-    /// Mic uplink counters (see [`NativeClient::mic_stats`]): the pump's mic task counts wire
-    /// sends and its own stale-shed drops here; the producer counts queue-full drops.
+    /// Pump mic task counts wire sends and stale-shed drops; the producer counts
+    /// queue-full drops.
     pub(crate) mic_stats: Arc<MicUplinkCounters>,
     pub(crate) hot_tids: Arc<Mutex<Vec<i32>>>,
-    /// The live clock offset (see [`NativeClient::clock_offset`]): the worker seeds it with the
-    /// connect-time estimate; the control task's mid-stream re-syncs update it.
+    /// Seeded with the connect-time estimate; the control task's mid-stream re-syncs
+    /// update it.
     pub(crate) clock_offset: Arc<AtomicI64>,
-    /// Decode-stage latency samples from the embedder (see [`NativeClient::decode_lat`]): the pump
-    /// drains a window mean into the adaptive-bitrate controller's decode signal.
+    /// Embedder decode-stage samples. The pump drains a window mean into the ABR
+    /// decode signal.
     pub(crate) decode_lat: Arc<Mutex<DecodeLatAcc>>,
-    /// The live encoder-target mirror (see [`NativeClient::live_bitrate_kbps`]): the worker seeds
-    /// it from the Welcome; the control task updates it on every `BitrateChanged` ack.
+    /// Encoder-target mirror. Seeded from Welcome; updated on every `BitrateChanged` ack.
     pub(crate) live_bitrate: Arc<AtomicU32>,
-    /// The session's LIVE access grants (see [`NativeClient::access_grants`]): seeded from the
-    /// Welcome advert; every [`crate::quic::AccessUpdate`] moves it (latest wins, per design).
+    /// Live grants. Seeded from the Welcome advert; every `AccessUpdate` overwrites
+    /// (latest wins).
     pub(crate) access_grants: Arc<AtomicU32>,
-    /// The live access deadline as client wall clock, unix seconds; `0` = permanent. Seeded
-    /// from the Welcome's `expires_in_secs`, re-anchored by every `AccessUpdate` — see
-    /// [`NativeClient::access_deadline_unix`].
+    /// Client-wall-clock unix seconds; `0` = permanent. Seeded from Welcome
+    /// `expires_in_secs`, re-anchored by every `AccessUpdate`.
     pub(crate) access_deadline_unix: Arc<AtomicU64>,
-    /// Inbound access updates → the embedder's event plane
-    /// ([`NativeClient::next_access_update`]), pushed by the control task AFTER it folded the
-    /// update into the two live slots above.
+    /// Pushed by the control task only AFTER it has folded the update into the two
+    /// live slots above.
     pub(crate) access_tx: SyncSender<crate::quic::AccessUpdate>,
-    /// The typed close code a MID-SESSION end carried, when it is one of the shared
-    /// [`crate::reject::RejectReason`] vocabulary; `0` = none. Latched by the worker's
-    /// close watch beside `end_reason`, so an access-expiry close (0x69) can render its
-    /// real sentence instead of the generic host-error one — see
-    /// [`NativeClient::end_reject`].
+    /// Typed mid-session close from [`crate::reject::RejectReason`]; `0` = none.
+    /// Latched beside `end_reason` so an access-expiry close is not rendered as a
+    /// generic host error.
     pub(crate) end_reject_code: Arc<AtomicU32>,
 }
 
-/// The worker: QUIC handshake, then the input/datagram/control tasks + the blocking
-/// data-plane pump.
-/// The host's stated rejection, if this connection was closed with a typed application code
-/// (see [`crate::reject`]) — `None` for local errors, bare/legacy closes (including our own
-/// `LocallyClosed`), and transport failures, which keep their original error.
+/// The host's stated rejection, if the connection closed with a typed application code.
+/// `None` for local errors, bare/legacy closes (including our own `LocallyClosed`), and
+/// transport failures — those keep their original error.
 pub(crate) fn reject_from_close(conn: &quinn::Connection) -> Option<crate::reject::RejectReason> {
     match conn.close_reason()? {
         quinn::ConnectionError::ApplicationClosed(ac) => u32::try_from(u64::from(ac.error_code))

@@ -1,7 +1,7 @@
-//! Core acceptance: round-trip access units through the full host→client path
-//! (packetize → FEC → loopback with simulated loss → recover → reassemble) and assert
-//! byte-exact recovery, for both FEC schemes, with and without encryption. Plus
-//! property tests over the FEC layer's loss patterns.
+//! Core acceptance: round-trip access units through host→client
+//! (packetize → FEC → loopback with simulated loss → recover → reassemble)
+//! and assert byte-exact recovery, both FEC schemes, with and without
+//! encryption. Property tests cover FEC loss patterns.
 
 use proptest::prelude::*;
 use punktfunk_core::config::{Config, FecConfig, FecScheme, ProtocolPhase, Role};
@@ -32,8 +32,8 @@ fn config(role: Role, scheme: FecScheme, encrypt: bool, drop_period: u32) -> Con
     }
 }
 
-/// Drive `frames` access units host→client over a lossy loopback and assert each one
-/// comes back byte-identical. Returns the client's final stats.
+/// Drive `frames` host→client over a lossy loopback; each must come back
+/// byte-identical. Returns the client's final stats.
 fn run_stream(
     scheme: FecScheme,
     encrypt: bool,
@@ -102,9 +102,9 @@ fn encrypted_stream_recovers_under_loss() {
     assert_eq!(stats.frames_completed, frames.len() as u64);
 }
 
-/// The negotiated ChaCha20-Poly1305 session cipher through the same lossy full-stream path:
-/// loss/replay behavior is cipher-independent (the replay window keys off the authenticated
-/// seq), so recovery must be byte-identical to the AES run above.
+/// ChaCha20-Poly1305 through the same lossy full-stream path. Loss/replay is
+/// cipher-independent (the replay window keys off the authenticated seq), so
+/// recovery must be byte-identical to the AES run above.
 #[test]
 fn chacha20_encrypted_stream_recovers_under_loss() {
     let frames = sample_frames();
@@ -137,9 +137,9 @@ fn lossless_stream_is_exact() {
     );
 }
 
-/// The client's latency-bound escape hatch: `flush_backlog` must discard every queued datagram
-/// (counting them dropped), reset the reassembler so half-assembled frames from the flushed past
-/// can't linger, and leave the session healthy — the next submitted frame recovers byte-exact.
+/// `flush_backlog` must discard every queued datagram (count them dropped),
+/// reset the reassembler so half-assembled frames cannot linger, and leave
+/// the session healthy — the next submitted frame recovers byte-exact.
 #[test]
 fn flush_backlog_discards_queue_and_recovers() {
     let (host_tp, client_tp) = loopback_pair(0, 0);
@@ -158,7 +158,6 @@ fn flush_backlog_discards_queue_and_recovers() {
     // Read one frame first so the client's recv ring exists and may hold an undelivered tail.
     host.submit_frame(&frames[0], 0, 0).unwrap();
     client.poll_frame().unwrap();
-    // Queue a multi-frame backlog, then flush it: everything pending is discarded.
     for (i, f) in frames.iter().enumerate().skip(1) {
         host.submit_frame(f, i as u64 * 1_000_000, 0).unwrap();
     }
@@ -172,7 +171,6 @@ fn flush_backlog_discards_queue_and_recovers() {
         ),
         "nothing pending after a flush"
     );
-    // The stream resumes cleanly: the next frame (the "recovery keyframe") completes byte-exact.
     let recovery = vec![0xA5u8; 100_000];
     host.submit_frame(&recovery, 99_000_000, 0).unwrap();
     let got = client.poll_frame().expect("post-flush frame completes");
@@ -209,11 +207,7 @@ fn input_round_trips_client_to_host() {
     assert_eq!(got, sent);
 }
 
-// ---- property tests over the FEC layer --------------------------------------
-
 proptest! {
-    /// For random shard counts and an erasure set within the recovery budget, every
-    /// original shard is reconstructed byte-identically — for both backends.
     #[test]
     fn fec_recovers_any_loss_within_budget(
         k in 1usize..40,
@@ -236,7 +230,6 @@ proptest! {
             let mut received: Vec<Option<Vec<u8>>> =
                 data.iter().cloned().map(Some).chain(recovery.into_iter().map(Some)).collect();
 
-            // Erase up to `m` shards chosen by a cheap PRNG over the seed.
             let total = k + m;
             let lose = (seed as usize % (m + 1)).min(m);
             let mut s = seed | 1;

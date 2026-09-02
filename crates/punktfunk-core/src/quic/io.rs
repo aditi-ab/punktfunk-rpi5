@@ -1,14 +1,12 @@
-//! Length-prefixed framing for QUIC control-stream messages: a `u16` length header followed by the
-//! payload, bounded at 64 KiB (control messages are tiny).
-/// Read one framed message (bounded at 64 KiB — control messages are tiny).
-///
-/// **Not cancel-safe**: it frames with two `quinn::RecvStream::read_exact` calls, and quinn
-/// documents `read_exact` as not cancel-safe (the bytes it has already taken out of the stream
-/// live only in the future's own buffer, and nothing puts them back on drop). Dropping a
-/// partially-progressed future therefore destroys the bytes it consumed and misaligns every
-/// subsequent read on that stream. Use it only where the read runs to completion — the sequential
-/// handshake/pairing exchanges. Anything driving a read from a `select!` arm or a
-/// `tokio::time::timeout` must use [`MsgReader`] instead.
+//! Length-prefixed QUIC control frames: `u16` LE length, then payload, capped at 64 KiB.
+//!
+//! [`read_msg`] is not cancel-safe (two `read_exact`s; quinn keeps consumed bytes only
+//! in the future). Handshake/pairing, run-to-completion, only.
+//! [`MsgReader`] stores the partial frame in `buf` so a dropped future resumes.
+//! Tests at the foot pin mid-frame cancel.
+/// Read one framed message. **Not cancel-safe**: two `read_exact`s; drop misaligns
+/// the stream. Sequential handshake/pairing only. Use [`MsgReader`] under `select!`
+/// or `timeout`.
 pub async fn read_msg(recv: &mut quinn::RecvStream) -> std::io::Result<Vec<u8>> {
     let mut len = [0u8; 2];
     recv.read_exact(&mut len)
@@ -22,22 +20,14 @@ pub async fn read_msg(recv: &mut quinn::RecvStream) -> std::io::Result<Vec<u8>> 
     Ok(buf)
 }
 
-/// Cancel-safe framed reader for a long-lived control stream.
-///
-/// Keeps the frame in progress in `buf` rather than inside the read future, so dropping the future
-/// — which both control loops do on every iteration where a sibling `select!` arm wins, and which
-/// [`clock_sync`](super::clock_sync) does on a read timeout — resumes instead of losing bytes.
-/// With the plain [`read_msg`] a control frame that straddles two wakeups (a ~2 KB `ClipOffer`
-/// exceeds one QUIC packet; so does any frame whose second half is lost or reordered) left the
-/// stream permanently misaligned: the next read took two payload bytes as a length, every later
-/// message decoded as garbage and was silently ignored, and a bogus 64 KiB length parked the read
-/// forever — killing mode switches, adaptive bitrate, clock re-sync and clipboard for the rest of
-/// the session with nothing but a `warn!` in the log.
+/// Cancel-safe framed reader: the in-progress frame lives in `buf`, not the future.
+/// Dropping the future (a `select!` sibling or a read timeout) resumes. [`read_msg`]
+/// permanently misaligns a frame that straddles two wakeups.
 pub struct MsgReader {
     recv: quinn::RecvStream,
-    /// The frame in progress, length prefix included.
+    /// In-progress frame, length prefix included.
     buf: Vec<u8>,
-    /// Bytes `buf` must reach: 2 while reading the prefix, then `2 + payload length`.
+    /// Target length: 2 while reading the prefix, then `2 + payload`.
     need: usize,
 }
 
@@ -50,15 +40,14 @@ impl MsgReader {
         }
     }
 
-    /// Read one framed message. Cancel-safe: dropping the future keeps the partial frame, so the
-    /// next call resumes where this one stopped.
+    /// Read one framed message. Cancel-safe: drop keeps the partial frame.
     pub async fn read_msg(&mut self) -> std::io::Result<Vec<u8>> {
         loop {
             while self.buf.len() < self.need {
                 let mut chunk = [0u8; 2048];
                 let want = (self.need - self.buf.len()).min(chunk.len());
-                // `read` IS cancel-safe: it only reports bytes it hands back, and they are
-                // committed to `self.buf` before the next await point.
+                // `read` is cancel-safe: it reports only the bytes it returns, and those
+                // land in `self.buf` before the next await.
                 match self
                     .recv
                     .read(&mut chunk[..want])
@@ -78,7 +67,7 @@ impl MsgReader {
                 self.need = 2 + u16::from_le_bytes([self.buf[0], self.buf[1]]) as usize;
                 if self.need == 2 {
                     self.buf.clear();
-                    return Ok(Vec::new()); // zero-length frame
+                    return Ok(Vec::new());
                 }
             } else {
                 let msg = self.buf.split_off(2);
@@ -90,25 +79,18 @@ impl MsgReader {
     }
 }
 
-/// Write one framed message.
 pub async fn write_msg(send: &mut quinn::SendStream, payload: &[u8]) -> std::io::Result<()> {
     send.write_all(&super::frame(payload))
         .await
         .map_err(std::io::Error::other)
 }
 
-/// The control stream is read from a `select!` arm on both peers, so the read future is dropped
-/// routinely — and quinn documents `read_exact` (what `io::read_msg` uses) as NOT cancel-safe.
-/// [`io::MsgReader`] must survive that: the partial frame lives in the reader, not the future.
+/// [`MsgReader`] must survive a dropped read future (`select!` / timeout).
 #[cfg(test)]
 mod tests {
     use crate::quic::io;
     use crate::quic::test_util::connect_pair;
 
-    /// A frame whose halves land in different wakeups, with the read cancelled in between, must
-    /// still be delivered whole — and the NEXT frame must decode correctly too. Without a
-    /// resumable reader the consumed length prefix is lost, the following read takes two payload
-    /// bytes as a length, and every later control message is garbage for the rest of the session.
     #[tokio::test]
     async fn cancelled_mid_frame_read_resumes_without_desync() {
         let (_server_ep, _client_ep, host_conn, client_conn) = connect_pair().await;
@@ -120,8 +102,7 @@ mod tests {
         let writer = tokio::spawn(async move {
             let (mut send, _recv) = host_conn.open_bi().await.expect("open bi");
             let framed = crate::quic::frame(&f1);
-            // Length prefix + only part of the payload, then a real pause: this is the ClipOffer
-            // -sized frame split across two QUIC packets that made the bug reachable.
+            // Prefix + partial payload, then a pause so the timeout can cancel mid-frame.
             let split = 2 + f1.len() / 3;
             send.write_all(&framed[..split]).await.expect("write head");
             tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -136,7 +117,7 @@ mod tests {
         let (_send, recv) = client_conn.accept_bi().await.expect("accept bi");
         let mut reader = io::MsgReader::new(recv);
 
-        // Cancel mid-frame — exactly what a sibling `select!` arm does.
+        // Cancel before the tail arrives — same drop as a sibling `select!` arm.
         let cancelled =
             tokio::time::timeout(std::time::Duration::from_millis(30), reader.read_msg()).await;
         assert!(
@@ -159,7 +140,7 @@ mod tests {
         let _host_conn = writer.await.unwrap();
     }
 
-    /// A zero-length frame is a legal encoding and must not stall the reader or eat the next one.
+    /// Zero-length is a legal encoding; must not stall the reader or eat the next frame.
     #[tokio::test]
     async fn zero_length_frame_round_trips() {
         let (_server_ep, _client_ep, host_conn, client_conn) = connect_pair().await;
