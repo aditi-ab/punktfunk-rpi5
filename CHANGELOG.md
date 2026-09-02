@@ -211,6 +211,10 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 - **`AVSampleBufferVideoRenderer` is the tvOS 17.4+ default for 4:2:0 streams, removing Metal's
   two-refresh reservation.** Older tvOS,
   4:4:4, PyroWave and Smoothness retain Metal; users need no setting changes.
+- **AMF runtime floor is 1.4.30.** The native AMD encoder rejected anything below 1.4.34, which
+  the Polaris/Vega driver branch (frozen at 1.4.31) never reaches, so RX 400/500 and Vega hosts
+  failed every session. Nothing to do; such a host now encodes on the core path and the newer
+  optional properties degrade individually.
 
 ---
 
