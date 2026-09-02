@@ -8,7 +8,7 @@
 //! Placeholders (`<staging>`, `<temp>`, `<version>`) stay literal in a dry run and come from
 //! `Subst` on a real one. Goldens enter through [`render`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::plan::{join_argv, WinAction, WinPlan};
 use super::sys;
@@ -167,10 +167,32 @@ impl WinExecutor<'_> {
                     self.ui.ok(&format!("would remove {dir}"));
                     return Ok(());
                 }
-                // Best-effort: the uninstaller still lives here; a locked file must not fail teardown.
-                match std::fs::remove_dir_all(dir) {
-                    Ok(()) => self.ui.ok(&format!("removed {dir}")),
-                    Err(e) => self.ui.warn(&format!("could not fully remove {dir}: {e}")),
+                // Best-effort: the uninstaller still lives here; a locked file must not fail
+                // teardown, and must not stop the sweep either (`remove_dir_all` aborts at
+                // the first one — WP3.5's VM smoke left 862 files behind that way).
+                let mut locked = Vec::new();
+                sweep(Path::new(dir), &mut locked);
+                if locked.is_empty() {
+                    self.ui.ok(&format!("removed {dir}"));
+                } else {
+                    let deferred = locked
+                        .iter()
+                        .filter(|p| super::sys::delete_on_reboot(p))
+                        .count();
+                    // The dir itself goes last, after its files — Windows replays the list
+                    // in order at boot.
+                    let dir_deferred = deferred == locked.len()
+                        && super::sys::delete_on_reboot(Path::new(dir));
+                    self.ui.warn(&format!(
+                        "{} in-use file(s) under {dir} ({}) go with the next restart{}",
+                        locked.len(),
+                        locked
+                            .iter()
+                            .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        if dir_deferred { "" } else { " - or remove the folder by hand" }
+                    ));
                 }
                 Ok(())
             }
@@ -632,6 +654,24 @@ fn scripting_task_xml(app_dir: &str) -> String {
     )
 }
 
+/// Remove everything under `dir` that will go, then `dir` itself; what stays (locked, or a
+/// dir that still holds something locked) lands in `locked`.
+fn sweep(dir: &Path, locked: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            sweep(&path, locked);
+            let _ = std::fs::remove_dir(&path);
+        } else if std::fs::remove_file(&path).is_err() {
+            locked.push(path);
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
 fn to_utf16le_bom(text: &str) -> Vec<u8> {
     let mut bytes = vec![0xFF, 0xFE];
     for unit in text.encode_utf16() {
@@ -860,6 +900,19 @@ mod tests {
         })
         .unwrap();
         assert_eq!(net.made_private.borrow().as_slice(), ["Netzwerk 2"]);
+    }
+
+    #[test]
+    fn the_sweep_takes_the_whole_tree_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(app.join("web/static")).unwrap();
+        std::fs::write(app.join("web/static/a.js"), b"1").unwrap();
+        std::fs::write(app.join("host.exe"), b"2").unwrap();
+        let mut locked = Vec::new();
+        sweep(&app, &mut locked);
+        assert!(locked.is_empty());
+        assert!(!app.exists());
     }
 
     #[test]
