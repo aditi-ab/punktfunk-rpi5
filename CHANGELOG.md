@@ -34,6 +34,13 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 
 ### Added
 
+- **`pf_frame::recovery` sequences staged recovery.** A pure coordinator opens one episode per
+  `Stalled` verdict and walks the ladder EncoderReset, RingReset, SwapChainReset,
+  PresentationReset, MonitorCycle, DriverCycle, CaptureFallback from the class's first actuator,
+  running each stage once under a deadline; a stage that applied still has to prove itself with
+  three new source sequences (republishes and cursor regens never count). Four episodes per ten
+  minutes, a doubling cooldown after failed ones (10 s to 5 min), one summary per episode, and
+  `owns_episode` so passive descriptor reactions stand down. Actuators wire in with WP6/WP7/WP14.
 - **IDD-push shared header v3 carries ring health.** The 88-byte header grows a 64-byte tail:
   a health state (`Initializing`/`Active`/`Rebuilding`/`Dead`), driver and host capability
   words negotiated by intersection, assignment and D3D-device epochs, a source sequence that
