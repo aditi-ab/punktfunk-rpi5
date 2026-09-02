@@ -790,6 +790,44 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
         }
     }
 
+    // How large the chrome draws is a property of this device's screen, not of a profile — the
+    // same rule the statistics position follows on the Apple client.
+    DeviceScopeOnly {
+        SettingsGroup("Overlay") {
+            val deviceClass = remember(context) { osdDeviceClass(context) }
+            // Custom is read back from the stored value, never flagged — but "Custom…" picked while a
+            // preset is still stored keeps the field on screen until an edit actually makes it custom.
+            var customScalePicked by remember { mutableStateOf(false) }
+            val isPreset = OsdScale.isAuto(s.osdScale) || OsdScale.PRESETS.any { it == s.osdScale }
+            val showCustomScale = customScalePicked || !isPreset
+            SettingDropdown(
+                label = "Overlay size",
+                options = osdScaleOptions(deviceClass) +
+                    (OSD_SCALE_CUSTOM to
+                        if (isPreset) "Custom…" else "Custom (${OsdScale.toPercent(s.osdScale)}%)"),
+                selected = if (showCustomScale) OSD_SCALE_CUSTOM else s.osdScale,
+                caption = "How large the stats HUD and the quick-action ring draw. Automatic follows " +
+                    "the device — bigger on a TV, which is read from across a room.",
+            ) { scale ->
+                if (scale == OSD_SCALE_CUSTOM) {
+                    // Seed from the effective size so the field opens on what is on screen now,
+                    // rather than on the 0.0 that means Automatic.
+                    customScalePicked = true
+                    update(s.copy(osdScale = OsdScale.resolve(s.osdScale, deviceClass)))
+                } else {
+                    customScalePicked = false
+                    update(s.copy(osdScale = scale))
+                }
+            }
+            if (showCustomScale) {
+                PercentField(
+                    label = "Overlay size (%)",
+                    value = OsdScale.toPercent(OsdScale.resolve(s.osdScale, deviceClass)),
+                ) { pct -> update(s.copy(osdScale = OsdScale.fromPercent(pct))) }
+            }
+        }
+    }
+
     SettingsGroup("Host output", footer = "Display changes apply from the next session.") {
         SettingDropdown(
             label = "Compositor",
@@ -1225,6 +1263,30 @@ internal fun <T> SettingDropdown(
  * clamps H.264's tighter 4096 itself) — while the field keeps the raw text so intermediate states
  * ("15" on the way to "1512") aren't rewritten mid-typing; it snaps to the committed value when
  * focus leaves. */
+@Composable
+private fun PercentField(
+    label: String,
+    value: Int,
+    modifier: Modifier = Modifier,
+    onCommit: (Int) -> Unit,
+) {
+    var text by remember { mutableStateOf(value.toString()) }
+    OutlinedTextField(
+        value = text,
+        onValueChange = { raw ->
+            text = raw.filter { it.isDigit() }.take(3)
+            // Commit only what clamps to itself: typing "1" on the way to "150" would otherwise
+            // commit the floor and fight the keystrokes.
+            val pct = text.toIntOrNull() ?: 0
+            if (pct > 0 && OsdScale.toPercent(OsdScale.fromPercent(pct)) == pct) onCommit(pct)
+        },
+        label = { Text(label) },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        modifier = modifier.onFocusChanged { if (!it.isFocused) text = value.toString() },
+    )
+}
+
 @Composable
 private fun ResolutionField(
     label: String,

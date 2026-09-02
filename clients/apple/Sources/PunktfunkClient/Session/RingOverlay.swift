@@ -271,6 +271,15 @@ struct RingOverlay: View {
     let actions: RingActions
     /// Set by the settings editor; nil in-stream.
     var editing: RingEditing? = nil
+    /// Overlay-scale multiplier (`OsdScale`). The ring centres on wherever the twist happened, so
+    /// it scales its own metrics rather than taking a `scaleEffect` about a fixed anchor, which
+    /// would walk an off-centre ring across the screen. 1 in the settings editor, which always
+    /// draws at design size.
+    var scale: CGFloat = 1
+
+    private var scaledRadius: CGFloat { ringRadius * scale }
+    private var scaledSlot: CGFloat { slotSize * scale }
+    private var scaledCentre: CGFloat { centreSize * scale }
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// The disc under an editing drag and how far it has been carried.
     @State private var drag: (k: Int, offset: CGSize)?
@@ -326,7 +335,7 @@ struct RingOverlay: View {
 
     var body: some View {
         GeometryReader { geo in
-            let margin = ringRadius + slotSize / 2 + 16
+            let margin = scaledRadius + scaledSlot / 2 + 16 * scale
             // Clamped so the whole ring stays on screen; a stage narrower than two margins
             // (the editor's) centres it instead of pinning it to one side.
             let cx = state.centred || geo.size.width < 2 * margin
@@ -360,7 +369,7 @@ struct RingOverlay: View {
                     let rad = deg * .pi / 180
                     let slot = cfg.ring[k]
                     let s = slot.map { spec($0, cfg, actions) }
-                    slotButton(s, size: slotSize, scale: 0.6 + 0.4 * q, alpha: q,
+                    slotButton(s, size: scaledSlot, scale: 0.6 + 0.4 * q, alpha: q,
                                armed: s != nil && state.armed == s?.id,
                                highlighted: state.highlight == k) {
                         if let editing {
@@ -370,7 +379,7 @@ struct RingOverlay: View {
                         }
                     }
                     .offset(drag?.k == k ? drag?.offset ?? .zero : .zero)
-                    .position(x: cx + ringRadius * q * cos(rad), y: cy + ringRadius * q * sin(rad))
+                    .position(x: cx + scaledRadius * q * cos(rad), y: cy + scaledRadius * q * sin(rad))
                     .allowsHitTesting(q > 0)
                     #if os(iOS) || os(macOS)
                     // Editing: one gesture owns the disc, so a drag never also fires the tap.
@@ -384,7 +393,7 @@ struct RingOverlay: View {
                 // dimmed and inert rather than offering a preview nobody asked for.
                 let cq = discQ(6)
                 slotButton(SlotSpec(id: "more", label: "More", icon: "ellipsis"),
-                           size: centreSize, scale: 0.6 + 0.4 * cq,
+                           size: scaledCentre, scale: 0.6 + 0.4 * cq,
                            alpha: cq * (editing == nil ? 1 : 0.45), armed: false,
                            highlighted: state.highlight == 6) {
                     state.touch()
@@ -400,11 +409,11 @@ struct RingOverlay: View {
                 }
                 if let hint = label {
                     Text(hint)
-                        .font(.geist(13, .medium, relativeTo: .caption))
+                        .font(.geist(13 * scale, .medium, relativeTo: .caption))
                         .foregroundStyle(.white.opacity(0.9))
                         .padding(.horizontal, 14).padding(.vertical, 8)
                         .glassBackground(Capsule())
-                        .position(x: cx, y: cy + ringRadius + slotSize)
+                        .position(x: cx, y: cy + scaledRadius + scaledSlot)
                 }
                 if state.sheet {
                     RingSheet(state: state, rows: sheetRows())
@@ -564,9 +573,9 @@ struct RingOverlay: View {
                     return
                 }
                 let rad = (-90 + 60 * CGFloat(k)) * .pi / 180
-                let dx = ringRadius * cos(rad) + v.translation.width
-                let dy = ringRadius * sin(rad) + v.translation.height
-                guard hypot(dx, dy) > ringRadius / 2 else { return }
+                let dx = scaledRadius * cos(rad) + v.translation.width
+                let dy = scaledRadius * sin(rad) + v.translation.height
+                guard hypot(dx, dy) > scaledRadius / 2 else { return }
                 let deg = atan2(dy, dx) * 180 / .pi + 90
                 let target = ((Int((deg / 60).rounded()) % 6) + 6) % 6
                 guard target != k, order == Array(0..<OverlayConfig.ringSlots) else { return }

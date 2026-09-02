@@ -439,7 +439,8 @@ extension SettingsView {
                 }
             }
             // Which corner the overlay sits in is a property of this device's screen, not of a
-            // profile (tier G).
+            // profile (tier G). So is how large it draws — and that one also sizes the ring, so it
+            // stays enabled with the statistics off.
             if !inProfileScope {
                 Picker("Position", selection: $hudPlacement) {
                     ForEach(HUDPlacement.allCases) { placement in
@@ -447,8 +448,64 @@ extension SettingsView {
                     }
                 }
                 .disabled(effective.statsVerbosity == StatsVerbosity.off.rawValue)
+                described(Self.osdScaleDescription, field: "osd_scale") {
+                    Picker("Overlay size", selection: osdScaleTag) {
+                        Text(OsdScale.label(OsdScale.auto, for: OsdScale.deviceClass))
+                            .tag(OsdScale.auto)
+                        ForEach(OsdScale.presets, id: \.self) { scale in
+                            Text(OsdScale.label(scale, for: OsdScale.deviceClass)).tag(scale)
+                        }
+                        Text("Custom").tag(OsdScale.customTag)
+                    }
+                }
+                if showOsdCustom {
+                    HStack(spacing: 12) {
+                        Slider(value: osdScaleSlider, in: OsdScale.range, step: 0.05) {
+                            Text("Overlay size")
+                        }
+                        Text("\(OsdScale.toPercent(OsdScale.resolved(osdScale)))%")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .frame(minWidth: 56, alignment: .trailing)
+                    }
+                }
             }
         }
+    }
+
+    /// Overlay size explained, naming what Automatic resolves to on THIS device — the setting is
+    /// otherwise a number with no reference point.
+    private static var osdScaleDescription: String {
+        "How large the statistics overlay and the quick-action ring draw. Automatic follows the "
+            + "device: \(OsdScale.toPercent(OsdScale.autoScale(for: OsdScale.deviceClass)))% here."
+    }
+
+    /// True when the stored value is off the preset list, or "Custom" was just picked.
+    private var showOsdCustom: Bool {
+        osdScaleCustomPicked
+            || !(OsdScale.isAuto(osdScale) || OsdScale.presets.contains(osdScale))
+    }
+
+    /// Picker binding. Selecting Custom seeds the slider with what is on screen now rather than
+    /// with the 0 that means Automatic.
+    private var osdScaleTag: Binding<Double> {
+        Binding(
+            get: { showOsdCustom ? OsdScale.customTag : osdScale },
+            set: { picked in
+                if picked == OsdScale.customTag {
+                    osdScaleCustomPicked = true
+                    osdScale = OsdScale.resolved(osdScale)
+                } else {
+                    osdScaleCustomPicked = false
+                    osdScale = picked
+                }
+            })
+    }
+
+    /// Slider binding, in multiplier units so the 0.05 step reads as 5 %.
+    private var osdScaleSlider: Binding<Double> {
+        Binding(get: { OsdScale.resolved(osdScale) },
+                set: { osdScale = OsdScale.sanitize($0) })
     }
 
     // MARK: - General: Library

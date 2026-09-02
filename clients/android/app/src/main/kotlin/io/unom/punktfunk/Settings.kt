@@ -110,6 +110,15 @@ data class Settings(
      */
     val statsVerbosity: StatsVerbosity = StatsVerbosity.NORMAL,
     /**
+     * Overlay chrome size — the stats HUD and the quick-action ring — as a multiplier on this
+     * screen's normal UI size (`dp`, so density is already handled). `0.0` = Automatic, which
+     * takes the value for the device class: 1.0 in the hand or at a desk, larger on a TV, where
+     * `dp` assumes a viewing distance that no longer holds. See [OsdScale]; a manual value is
+     * clamped to [OsdScale.MIN_SCALE]..[OsdScale.MAX_SCALE]. Does not touch the stream itself,
+     * which is [renderScale].
+     */
+    val osdScale: Double = OsdScale.AUTO,
+    /**
      * Touch input model — how touchscreen fingers drive the host. [TouchMode.TRACKPAD] (default):
      * the cursor stays put on touch-down and moves by the finger's relative delta (swipe to nudge,
      * lift and re-swipe to walk it across), tap to click where it is. [TouchMode.POINTER]: the
@@ -335,6 +344,7 @@ class SettingsStore(context: Context) {
         hz = prefs.getInt(K_HZ, 0),
         bitrateKbps = prefs.getInt(K_BITRATE, 0),
         renderScale = prefs.getFloat(K_RENDER_SCALE, 1.0f).toDouble(),
+        osdScale = prefs.getFloat(K_OSD_SCALE, 0.0f).toDouble(),
         hdrEnabled = prefs.getBoolean(K_HDR, true),
         compositor = prefs.getInt(K_COMPOSITOR, 0),
         gamepad = prefs.getInt(K_GAMEPAD, 0),
@@ -394,6 +404,7 @@ class SettingsStore(context: Context) {
             .putInt(K_HZ, s.hz)
             .putInt(K_BITRATE, s.bitrateKbps)
             .putFloat(K_RENDER_SCALE, s.renderScale.toFloat())
+            .putFloat(K_OSD_SCALE, s.osdScale.toFloat())
             .putBoolean(K_HDR, s.hdrEnabled)
             .putInt(K_COMPOSITOR, s.compositor)
             .putInt(K_GAMEPAD, s.gamepad)
@@ -435,6 +446,7 @@ class SettingsStore(context: Context) {
         const val K_HZ = "hz"
         const val K_BITRATE = "bitrate_kbps"
         const val K_RENDER_SCALE = "render_scale"
+        const val K_OSD_SCALE = "osd_scale"
         const val K_HDR = "hdr_enabled"
         const val K_COMPOSITOR = "compositor"
         const val K_GAMEPAD = "gamepad"
@@ -717,6 +729,88 @@ object RenderScale {
 
 /** (scale, label) for the render-scale picker. `1.0` = Native. */
 val RENDER_SCALE_OPTIONS = RenderScale.PRESETS.map { it to RenderScale.label(it) }
+
+/**
+ * Overlay chrome scale — the Kotlin twin of `punktfunk-core`'s `osd_scale` module (and the Apple
+ * client's `OsdScale`). A multiplier on top of `dp`, so it means "larger than this screen's normal
+ * UI" rather than a pixel size. [AUTO] defers to the device class. Physical screen inches play no
+ * part: `DisplayMetrics.xdpi` is invented on many TV boxes, so a screen-inch rule would mis-size
+ * the living-room case this exists for. Pure + covered by [OsdScaleTest].
+ */
+object OsdScale {
+    /** Stored value meaning "use the device class default". Also the default. */
+    const val AUTO = 0.0
+
+    /** Below this the stats text stops being legible at any distance. */
+    const val MIN_SCALE = 0.5
+
+    /** The same 4x ceiling the desktop OSD knob and [RenderScale] use; past it the ring
+     * covers the game under it. */
+    const val MAX_SCALE = 4.0
+
+    /** Picker stops, 25% apart. Anything else in range is reachable by typing a percentage. */
+    val PRESETS = listOf(0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
+
+    /** How far the viewer sits, as far as Android can honestly tell us. */
+    enum class DeviceClass { HANDHELD, TABLET, DESKTOP, TV }
+
+    /**
+     * The multiplier a class gets under [AUTO]. Near-field classes stay at 1.0 - `dp` already
+     * normalises density and the overlays are drawn for that distance. A TV sits roughly 3x
+     * further than a desk monitor, but the chrome need not grow 3x: it is read in glances, and the
+     * ring is a stick target rather than dense text. 1.75 clears the 10-foot legibility floor
+     * without walling off the game.
+     */
+    fun autoScale(deviceClass: DeviceClass): Double =
+        if (deviceClass == DeviceClass.TV) 1.75 else 1.0
+
+    /** True when the stored value asks for the class default - [AUTO], or anything unusable. */
+    fun isAuto(pref: Double): Boolean = !pref.isFinite() || pref <= 0.0
+
+    /** Clamp a manual multiplier; [AUTO] and junk stay [AUTO] so storage can't drift to 0.5. */
+    fun sanitize(raw: Double): Double =
+        if (isAuto(raw)) AUTO else raw.coerceIn(MIN_SCALE, MAX_SCALE)
+
+    /** The multiplier to draw with. Always finite and at least [MIN_SCALE]. */
+    fun resolve(pref: Double, deviceClass: DeviceClass): Double =
+        if (isAuto(pref)) autoScale(deviceClass) else pref.coerceIn(MIN_SCALE, MAX_SCALE)
+
+    /** `1.25` -> `125`, the percentage the picker speaks. */
+    fun toPercent(scale: Double): Int = Math.round(sanitize(scale) * 100.0).toInt()
+
+    /**
+     * Parse a typed percentage. Out-of-range input clamps rather than falling back to [AUTO] -
+     * someone typing 500 wants the largest chrome offered, not the default.
+     */
+    fun fromPercent(percent: Int): Double =
+        if (percent == 0) AUTO else (percent / 100.0).coerceIn(MIN_SCALE, MAX_SCALE)
+
+    /** Picker label: "Automatic (175%)" for [AUTO] on [deviceClass], else "125%". */
+    fun label(pref: Double, deviceClass: DeviceClass): String =
+        if (isAuto(pref)) "Automatic (${toPercent(autoScale(deviceClass))}%)" else "${toPercent(pref)}%"
+}
+
+/**
+ * This device's [OsdScale.DeviceClass]. TV comes from the same leanback/ui-mode probe the console
+ * UI uses; the 600.dp shortest-width line is the standard tablet break. `DESKTOP` is unreachable
+ * here and exists only to keep the enum identical across clients.
+ */
+fun osdDeviceClass(context: Context): OsdScale.DeviceClass = when {
+    isTvDevice(context) -> OsdScale.DeviceClass.TV
+    context.resources.configuration.smallestScreenWidthDp >= 600 -> OsdScale.DeviceClass.TABLET
+    else -> OsdScale.DeviceClass.HANDHELD
+}
+
+/**
+ * Dropdown sentinel for "Custom…". Negative, so it can never collide with a real multiplier or
+ * with [OsdScale.AUTO], and it is never stored — picking it seeds the field with the effective size.
+ */
+const val OSD_SCALE_CUSTOM = -1.0
+
+/** (scale, label) for the overlay-scale picker. [OsdScale.AUTO] leads, as every option table does. */
+fun osdScaleOptions(deviceClass: OsdScale.DeviceClass): List<Pair<Double, String>> =
+    listOf(OsdScale.AUTO to OsdScale.label(OsdScale.AUTO, deviceClass)) +
+        OsdScale.PRESETS.map { it to OsdScale.label(it, deviceClass) }
 
 // ---- UI option tables (value, label). The first entry is always the "auto/native" default. ----
 

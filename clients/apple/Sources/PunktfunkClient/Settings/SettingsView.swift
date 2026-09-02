@@ -79,6 +79,24 @@ struct SettingsView: View {
     // the legacy-hudEnabled migration (same pattern as ContentView/StreamCommands).
     @AppStorage(DefaultsKey.statsVerbosity) var statsVerbosityRaw = StatsVerbosity.current.rawValue
     @AppStorage(DefaultsKey.hudPlacement) var hudPlacement = HUDPlacement.topTrailing.rawValue
+    @AppStorage(DefaultsKey.osdScale) var osdScale = OsdScale.auto
+    /// Automatic plus the presets, as `(label, percent-string)` — the shape `TVSelectionRow` takes.
+    /// No custom entry on tvOS: a free number needs a keyboard, and the remote has none.
+    var osdScaleTVOptions: [(String, String)] {
+        [(OsdScale.label(OsdScale.auto, for: OsdScale.deviceClass), "0")]
+            + OsdScale.presets.map {
+                (OsdScale.label($0, for: OsdScale.deviceClass), String(OsdScale.toPercent($0)))
+            }
+    }
+
+    /// `"0"` is Automatic — `toPercent` maps the auto sentinel straight back to it.
+    var osdScaleTVTag: Binding<String> {
+        Binding(get: { String(OsdScale.toPercent(osdScale)) },
+                set: { osdScale = OsdScale.fromPercent(Int($0) ?? 0) })
+    }
+    /// "Custom" chosen while a preset is still stored — keeps the slider on screen until a drag
+    /// actually makes the value custom. Custom itself is read back from the stored value.
+    @State var osdScaleCustomPicked = false
     @ObservedObject var gamepads = GamepadManager.shared
     @AppStorage(DefaultsKey.gamepadUIEnabled) var gamepadUIEnabled = true
     /// When the switch above takes over — read (and shown) only while it is on.
@@ -521,6 +539,10 @@ struct SettingsView: View {
                 TVSelectionRow(
                     title: "Statistics position", options: SettingsOptions.hudPlacements,
                     selection: $hudPlacement)
+                TVSelectionRow(
+                    title: "Overlay size", options: osdScaleTVOptions, selection: osdScaleTVTag)
+                tvCaption("How large the statistics overlay and the quick-action ring draw. "
+                    + "Automatic is larger here than on a phone — a TV is read from across a room.")
                 ForEach(gamepads.controllers) { controller in
                     controllerRow(controller)
                         .padding(.horizontal, 24)

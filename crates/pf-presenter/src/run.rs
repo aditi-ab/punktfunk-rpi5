@@ -581,12 +581,12 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     }
 
     // Operator preference on top of the display DPI. Read once (a preference, not
-    // session state); the DPI part is re-read per frame.
+    // session state); the DPI part is re-read per frame. Unset parses to AUTO, which
+    // `overlay_scale` resolves to this device class's default.
     let osd_scale_pref = std::env::var("PUNKTFUNK_OSD_SCALE")
         .ok()
         .and_then(|s| s.trim().parse::<f32>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .unwrap_or(1.0);
+        .unwrap_or(punktfunk_core::osd_scale::AUTO as f32);
 
     let mut overlay = opts.overlay.take();
     if let Some(o) = overlay.as_mut() {
@@ -2999,23 +2999,23 @@ fn content_to_window(
     (lx as f32, ly as f32)
 }
 
-/// Overlay chrome UI scale: SDL's window display scale times `PUNKTFUNK_OSD_SCALE`.
+/// Overlay chrome UI scale: SDL's window display scale times the OSD preference.
 ///
-/// `SDL_GetWindowDisplayScale` returns `0.0` when it cannot resolve the display; a 0
-/// multiplier would collapse the OSD to an invisible panel. The 4× ceiling keeps a
-/// bogus scale from covering the stream.
+/// The preference is `punktfunk_core::osd_scale`, shared with the mobile clients, so
+/// `PUNKTFUNK_OSD_SCALE` and their pickers mean the same thing and clamp alike. A
+/// desktop is near-field, so its automatic value is 1.0 — the DPI term already carries
+/// this display. `SDL_GetWindowDisplayScale` returns `0.0` when it cannot resolve the
+/// display; a 0 multiplier would collapse the OSD to an invisible panel, and the ceiling
+/// on the product keeps a bogus DPI from covering the stream.
 fn overlay_scale(display_scale: f32, pref: f32) -> f32 {
+    use punktfunk_core::osd_scale;
     let base = if display_scale.is_finite() && display_scale > 0.0 {
         display_scale
     } else {
         1.0
     };
-    let pref = if pref.is_finite() && pref > 0.0 {
-        pref
-    } else {
-        1.0
-    };
-    (base * pref).clamp(0.5, 4.0)
+    let pref = osd_scale::resolve(f64::from(pref), osd_scale::DeviceClass::Desktop) as f32;
+    (base * pref).clamp(osd_scale::MIN_SCALE as f32, osd_scale::MAX_SCALE as f32)
 }
 
 /// The presenter's share of the unified stats window — folded into each printed line.
@@ -3352,7 +3352,7 @@ mod tests {
         assert_eq!(overlay_scale(1.5, 0.0), 1.5);
         assert_eq!(overlay_scale(1.5, f32::NAN), 1.5);
         // Clamped both ways so nothing can hide the OSD or bury the stream under it.
-        assert_eq!(overlay_scale(1.0, 100.0), 4.0);
+        assert_eq!(overlay_scale(1.0, 100.0), punktfunk_core::osd_scale::MAX_SCALE as f32);
         assert_eq!(overlay_scale(1.0, 0.01), 0.5);
     }
 
