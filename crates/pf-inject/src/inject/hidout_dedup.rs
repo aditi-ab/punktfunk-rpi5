@@ -1,60 +1,43 @@
-//! Per-pad dedup for the rich HID-output feedback plane (0xCD), carved out of `dualsense_proto`
-//! (plan §W4 — it is device-agnostic, shared by the DualSense/DS4/Deck managers via
-//! [`crate::uhid_manager`], not DualSense-specific). A game bundles rumble + lightbar +
-//! LEDs + adaptive triggers into one output report, so a merely-rumbling pad re-sends unchanged
-//! rich state every report; this forwards only genuine changes (one-shot pulses always fire).
+//! Per-pad dedup for the 0xCD HID-output plane, shared by DualSense, DS4, and Deck
+//! managers via [`crate::uhid_manager`].
+//!
+//! A game packs rumble, lightbar, LEDs, and adaptive triggers into one report, so
+//! an unchanged rich field is re-sent on every rumble tick. This forwards a field
+//! only when its value changes. `TrackpadHaptic` pulses always fire. `HidRaw` is
+//! never deduped: firmware watchdogs require identical periodic refreshes.
+//!
+//! The plane rides unreliable datagrams. A dropped change is not resent by the
+//! game, so [`HidoutDedup::renewals`] re-emits latched state every [`RENEW_EVERY`].
+//! Tests in this file pin the contract.
 
 use punktfunk_core::quic::HidOutput;
 use std::time::{Duration, Instant};
 
-/// How often the latched rich state is re-emitted even though nothing changed.
+/// Interval for re-emitting latched 0xCD state when the game's value has not changed.
 ///
-/// The 0xCD plane is deduped AND rides unreliable datagrams, which is a bad pairing: a change is
-/// forwarded exactly once, so if that datagram is dropped the game will never produce it again —
-/// it keeps re-sending the same value and the dedup swallows every copy. The pad is then left
-/// holding the PREVIOUS value: the last weapon's trigger effect, the last lightbar colour, for as
-/// long as the game keeps that setting. For a trigger effect that can be the rest of a level.
-///
-/// Slow on purpose. This is a repair mechanism, not a transport — at one second a lost update
-/// costs a noticeable but bounded wrong-feel window, while the steady-state cost is at most four
-/// small datagrams per second per pad, against a rumble plane that already resends at ~120 ms.
+/// Dedup plus unreliable datagrams: a dropped change is never produced again.
+/// 1000 ms bounds the stale window; ≤4 datagrams/pad/s sits under rumble's ~120 ms refresh.
 const RENEW_EVERY: Duration = Duration::from_millis(1000);
 
-/// Per-pad dedup for the DualSense HID-output feedback plane (0xCD). A game's DualSense output report
-/// bundles rumble + lightbar + player-LEDs + adaptive-triggers into one report, so a pad that is
-/// merely *rumbling* re-sends its (unchanged) lightbar / LED / trigger state on every output report.
-/// The managers already dedup rumble; this does the same for the rich [`HidOutput`] feedback so the
-/// 0xCD plane carries only genuine changes. State (`Led` / `PlayerLeds` / `Trigger` / `AudioCtl`)
-/// is deduped by value; a one-shot `TrackpadHaptic` pulse is always forwarded (each pulse must
-/// fire).
+/// Last-forwarded 0xCD values. Value kinds dedup; `TrackpadHaptic` and `HidRaw` always fire.
 #[derive(Clone, Default)]
 pub struct HidoutDedup {
     led: Option<(u8, u8, u8)>,
     player_leds: Option<u8>,
     /// Last-forwarded adaptive-trigger effect per side: `[0]` = L2, `[1]` = R2.
     trigger: [Option<Vec<u8>>; 2],
-    /// Last-forwarded audio-control state (`flags` + the raw volume/routing bytes).
     audio_ctl: Option<(u8, [u8; 6])>,
-    /// Once-per-pad-lifetime field-diagnosis flag: set after the first forwarded `AudioCtl`
-    /// carrying the haptics-select bit was logged (cleared with the rest on (re)plug).
     haptics_select_logged: bool,
-    /// When anything was last put on the wire for this pad. `None` = nothing latched yet, so
-    /// there is nothing to renew. See [`RENEW_EVERY`].
     last_sent: Option<Instant>,
 }
 
 impl HidoutDedup {
-    /// Forget all remembered state — call when a pad is created or unplugged so the first feedback
-    /// after a (re)connect is always forwarded.
+    /// Drop latched values so the first report after a (re)plug is forwarded.
     pub fn clear(&mut self) {
         *self = HidoutDedup::default();
     }
 
-    /// Whether `h` should be forwarded: `true` for a genuine change (remembering the new value) or a
-    /// one-shot pulse; `false` if it repeats the last-forwarded value for its kind.
-    ///
-    /// `now` only stamps the renewal clock ([`Self::renewals`]) — forwarding a change resets it, so
-    /// a plane the game is actively changing never pays for a renewal it does not need.
+    /// `true` to send `h`. A forward stamps `now` so [`Self::renewals`] waits a full window.
     pub fn should_forward(&mut self, h: &HidOutput, now: Instant) -> bool {
         let fwd = self.decide(h);
         if fwd {
@@ -63,14 +46,10 @@ impl HidoutDedup {
         fwd
     }
 
-    /// Re-emit the latched rich state, so one lost datagram cannot strand the pad on the previous
-    /// value. Returns the reports to send (empty until [`RENEW_EVERY`] has passed since anything
-    /// last went out); every one is idempotent, so a client that DID receive the original simply
-    /// re-applies it.
+    /// Re-emit latched state once [`RENEW_EVERY`] has passed. Idempotent on the client.
     ///
-    /// One-shots are deliberately absent: replaying a `TrackpadHaptic` pulse would be a *new*
-    /// pulse, not a repair, and `HidRaw` is already re-sent verbatim by the device's own refresh
-    /// cadence (see the note in [`Self::decide`]).
+    /// One-shots are omitted: replaying `TrackpadHaptic` would be a new pulse. `HidRaw`
+    /// is already refreshed by the device's own cadence.
     pub fn renewals(&mut self, pad: u8, now: Instant) -> Vec<HidOutput> {
         if self
             .last_sent
@@ -127,17 +106,14 @@ impl HidoutDedup {
                     true
                 }
             }
-            // One-shot haptic pulse (Steam voice-coil) — state-less, always fires.
+            // One-shot: latching and replaying would fire a second pulse.
             HidOutput::TrackpadHaptic { .. } => true,
             HidOutput::AudioCtl { pad, flags, raw } => {
                 let v = Some((*flags, *raw));
                 if self.audio_ctl == v {
                     false
                 } else {
-                    // Field-diagnosis signal, once per pad lifetime: a title driving the DS5's
-                    // audio haptics (not plain rumble emulation, whose all-zero audio region
-                    // never reaches here) — the trace that tells "the game does audio haptics"
-                    // apart from "the client just doesn't render them".
+                    // Once per pad: the title selected audio haptics, not rumble emulation.
                     if flags & 0x01 != 0 && !self.haptics_select_logged {
                         self.haptics_select_logged = true;
                         tracing::info!(
@@ -148,10 +124,8 @@ impl HidoutDedup {
                     true
                 }
             }
-            // Raw as-is passthrough reports must NEVER dedup: the physical device's firmware
-            // watchdogs RELY on identical periodic refreshes (Triton rumble re-sent every ~40 ms
-            // against a ~50 ms safety timeout, lizard-off every ~3 s) — dropping a repeat would
-            // silence the motors / re-enable lizard mode on the real controller.
+            // Firmware watchdogs need identical refreshes (~40 ms rumble vs ~50 ms timeout;
+            // lizard-off every ~3 s). Deduping a repeat silences motors or re-enables lizard mode.
             HidOutput::HidRaw { .. } => true,
         }
     }
@@ -161,8 +135,6 @@ impl HidoutDedup {
 mod tests {
     use super::*;
 
-    /// `HidoutDedup` forwards a value once, drops exact repeats, re-forwards a change, tracks the two
-    /// trigger sides independently, never dedups one-shot haptic pulses, and re-arms after `clear`.
     #[test]
     fn hidout_dedup_forwards_only_changes() {
         let t = Instant::now();
@@ -173,29 +145,25 @@ mod tests {
             g: 0,
             b: 0,
         };
-        // First value forwards; an exact repeat is dropped; a change forwards again.
         assert!(d.should_forward(&led(10), t));
         assert!(!d.should_forward(&led(10), t));
         assert!(d.should_forward(&led(20), t));
 
-        // Player LEDs dedup on their own field, independent of the lightbar.
         let pl = |bits| HidOutput::PlayerLeds { pad: 0, bits };
         assert!(d.should_forward(&pl(0b101), t));
         assert!(!d.should_forward(&pl(0b101), t));
-        assert!(!d.should_forward(&led(20), t)); // lightbar still unchanged
+        assert!(!d.should_forward(&led(20), t));
 
-        // The two adaptive triggers (L2=0, R2=1) are tracked separately.
         let trig = |which, byte| HidOutput::Trigger {
             pad: 0,
             which,
             effect: vec![byte, 0, 0],
         };
         assert!(d.should_forward(&trig(0, 1), t));
-        assert!(d.should_forward(&trig(1, 1), t)); // same bytes, other side → still forwards
+        assert!(d.should_forward(&trig(1, 1), t));
         assert!(!d.should_forward(&trig(0, 1), t));
-        assert!(d.should_forward(&trig(0, 2), t)); // L2 effect changed
+        assert!(d.should_forward(&trig(0, 2), t));
 
-        // One-shot haptic pulses are never deduped.
         let haptic = HidOutput::TrackpadHaptic {
             pad: 0,
             side: 0,
@@ -206,15 +174,12 @@ mod tests {
         assert!(d.should_forward(&haptic, t));
         assert!(d.should_forward(&haptic, t));
 
-        // `clear` re-arms every kind.
         d.clear();
         assert!(d.should_forward(&led(20), t));
         assert!(d.should_forward(&pl(0b101), t));
         assert!(d.should_forward(&trig(0, 2), t));
     }
 
-    /// A change is forwarded once and then deduped — so if that one datagram is lost, nothing else
-    /// would ever carry it. The renewal is what repairs that.
     #[test]
     fn latched_state_is_renewed_so_a_lost_datagram_is_not_permanent() {
         let t = Instant::now();
@@ -230,10 +195,8 @@ mod tests {
             "the game re-sends it; the dedup swallows it"
         );
 
-        // Nothing due yet.
         assert!(d.renewals(3, t + Duration::from_millis(999)).is_empty());
 
-        // Past the window: the latched state goes out again, addressed to the right pad.
         let out = d.renewals(3, t + Duration::from_millis(1000));
         assert_eq!(out.len(), 1);
         assert!(matches!(
@@ -241,13 +204,10 @@ mod tests {
             HidOutput::Trigger { pad: 3, which: 1, effect } if effect == &vec![0x02, 0x90, 0xA0]
         ));
 
-        // And it keeps repairing on the same cadence, not just once.
         assert!(d.renewals(3, t + Duration::from_millis(1500)).is_empty());
         assert_eq!(d.renewals(3, t + Duration::from_millis(2000)).len(), 1);
     }
 
-    /// Every latched plane is renewed together, and a plane the game is actively driving does not
-    /// pay for renewals it does not need (a forward resets the clock).
     #[test]
     fn renewal_covers_every_latched_plane_and_an_active_plane_defers_it() {
         let t = Instant::now();
@@ -292,7 +252,6 @@ mod tests {
             "lightbar + player LEDs + both triggers, got {out:?}"
         );
 
-        // A genuine change re-stamps the clock, so the next renewal is a full window away.
         let later = t + Duration::from_millis(1500);
         assert!(d.should_forward(
             &HidOutput::Led {
@@ -309,7 +268,6 @@ mod tests {
             .is_empty());
     }
 
-    /// Nothing latched = nothing to renew; a one-shot pulse must never be replayed as a "repair".
     #[test]
     fn renewal_is_silent_with_nothing_latched_and_never_replays_a_pulse() {
         let t = Instant::now();
@@ -324,13 +282,10 @@ mod tests {
             count: 3,
         };
         assert!(d.should_forward(&pulse, t));
-        // The pulse stamped the clock but latched no state, so the renewal has nothing to repeat.
+        // Pulse stamps the clock but latches nothing; a replay would be a new pulse.
         assert!(d.renewals(0, t + Duration::from_millis(1000)).is_empty());
     }
 
-    /// `AudioCtl` dedups by value like the other state kinds: an identical repeat (every output
-    /// report re-sends the unchanged audio region) is dropped, a flags-only or raw-only change
-    /// forwards again, and `clear` re-arms — including the once-per-pad haptics-select log flag.
     #[test]
     fn audio_ctl_dedups_by_value() {
         let mut d = HidoutDedup::default();
@@ -340,15 +295,11 @@ mod tests {
             flags,
             raw: [vol, 0, 0, 0, 0, 0],
         };
-        // Identical twice → exactly one emission.
         assert!(d.should_forward(&audio(0x17, 0x50), t));
         assert!(!d.should_forward(&audio(0x17, 0x50), t));
-        // Either half changing (flags, or the raw region) forwards again.
         assert!(d.should_forward(&audio(0x16, 0x50), t));
         assert!(d.should_forward(&audio(0x16, 0x60), t));
-        // The other kinds' state is untouched by audio traffic.
         assert!(d.should_forward(&HidOutput::PlayerLeds { pad: 0, bits: 1 }, t));
-        // `clear` (pad re-plug) re-arms the value dedup.
         d.clear();
         assert!(d.should_forward(&audio(0x16, 0x60), t));
     }

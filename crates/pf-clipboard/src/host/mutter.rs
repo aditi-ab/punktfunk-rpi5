@@ -1,18 +1,12 @@
-//! GNOME clipboard backend via Mutter's **direct** `org.gnome.Mutter.RemoteDesktop.Session` D-Bus
-//! API (`design/clipboard-and-file-transfer.md` §4.1).
+//! GNOME clipboard via Mutter `org.gnome.Mutter.RemoteDesktop.Session`
+//! (`design/clipboard-and-file-transfer.md`). Mutter has no wlr/ext
+//! `data-control`, so [`super::wayland`] cannot bind here.
 //!
-//! Mutter implements no wlr/ext `data-control` (a deliberate privacy stance), so [`super::wayland`]
-//! can't bind on GNOME. But Mutter's own RemoteDesktop session — the same interface the input
-//! injector drives directly to dodge the xdg-portal approval dialog (`inject/linux/libei.rs`
-//! `connect_mutter`) — carries the full clipboard surface: `EnableClipboard`, `SetSelection`,
-//! `SelectionRead`/`SelectionWrite`/`SelectionWriteDone`, and the `SelectionOwnerChanged` /
-//! `SelectionTransfer` signals. We open our **own** standalone session for it (it coexists with the
-//! injector's input session; validated on GNOME 50), so this backend is self-contained just like the
-//! data-control one.
-//!
-//! One actor task owns the zbus connection + session and multiplexes the two signals with a command
-//! channel; the fds Mutter hands out are **non-blocking**, so reads/writes flip them to blocking and
-//! run on a blocking thread. Option/signal dict keys are hyphenated: `mime-types`, `session-is-owner`.
+//! Opens a standalone RemoteDesktop session that coexists with the injector's
+//! input session (`inject/linux/libei.rs` `connect_mutter`). One actor owns the
+//! zbus connection for the session's life; Mutter ties the two together.
+//! Selection fds are `O_NONBLOCK`; flip them blocking and `spawn_blocking`.
+//! Dict keys are hyphenated: `mime-types`, `session-is-owner`.
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
@@ -34,15 +28,12 @@ const RD_PATH: &str = "/org/gnome/Mutter/RemoteDesktop";
 const RD_IFACE: &str = "org.gnome.Mutter.RemoteDesktop";
 const SESSION_IFACE: &str = "org.gnome.Mutter.RemoteDesktop.Session";
 
-/// Upper bound on one `SelectionRead` (matches the wire clipboard cap, §7).
+/// 64 MiB; same as the wire clipboard cap.
 const CLIP_READ_CAP: u64 = 64 << 20;
 
-/// Handle to the Mutter clipboard actor, held (inside a [`super::HostClipboard`]) by the session
-/// coordinator.
 pub struct MutterClipboard {
     cmd_tx: mpsc::UnboundedSender<Cmd>,
-    /// Raw MIMEs the current host selection advertises (empty when we own it, or nothing is copied).
-    /// Written by the actor on `SelectionOwnerChanged`; read for `current_wire_mimes` / fetches.
+    /// Empty while we own the selection so a fetch cannot read our own offer back.
     current_raw: Arc<Mutex<Vec<String>>>,
 }
 
@@ -56,9 +47,7 @@ enum Cmd {
 }
 
 impl MutterClipboard {
-    /// Create a standalone Mutter RemoteDesktop session, `Start` + `EnableClipboard` it, and spawn
-    /// the actor. Errors when Mutter isn't running (not GNOME) — the caller falls through to
-    /// `BACKEND_UNAVAILABLE`.
+    /// Errors when Mutter is not running; the caller maps that to `BACKEND_UNAVAILABLE`.
     pub async fn open() -> Result<(MutterClipboard, mpsc::UnboundedReceiver<ClipEvent>)> {
         let conn = zbus::Connection::session()
             .await
@@ -98,17 +87,14 @@ impl MutterClipboard {
         ))
     }
 
-    /// Install a client's offered formats as the host selection (fire-and-forget on the actor).
     pub fn set_offer(&self, wire_mimes: &[String]) {
         let _ = self.cmd_tx.send(Cmd::SetOffer(wire_mimes.to_vec()));
     }
 
-    /// Relinquish the selection we own.
     pub fn clear_offer(&self) {
         let _ = self.cmd_tx.send(Cmd::ClearOffer);
     }
 
-    /// The current host selection's wire MIMEs (empty = nothing / we own it).
     pub fn current_wire_mimes(&self) -> Vec<String> {
         super::offer_wire_mimes(&self.current_raw.lock().unwrap())
             .into_iter()
@@ -116,8 +102,6 @@ impl MutterClipboard {
             .collect()
     }
 
-    /// Read one wire format of the current host selection (a client's fetch). Round-trips the actor
-    /// (SelectionRead + a blocking fd read).
     pub async fn read_current(&self, wire: &str) -> Result<Vec<u8>> {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
@@ -131,8 +115,6 @@ impl MutterClipboard {
     }
 }
 
-/// The actor: owns the connection + session, subscribes to the two clipboard signals, and serves
-/// commands. Exits when the command channel closes (session ending) or a signal stream ends.
 async fn actor(
     conn: zbus::Connection,
     session: zbus::Proxy<'static>,
@@ -162,8 +144,7 @@ async fn actor(
                 let is_owner = dict_bool(&opts, "session-is-owner").unwrap_or(false);
                 let raw = dict_mimes(&opts, "mime-types");
                 if is_owner {
-                    // Our own offer (the client's content) — not host clipboard; don't announce it,
-                    // and clear `current_raw` so a fetch never reads our own source back.
+                    // Our offer, not a host copy. Clear so a fetch cannot read our own source.
                     current_raw.lock().unwrap().clear();
                 } else {
                     *current_raw.lock().unwrap() = raw.clone();
@@ -183,10 +164,7 @@ async fn actor(
                 };
                 match super::wayland_to_wire(&mime) {
                     Some(wire) => {
-                        // A host app pastes our offer: hand the fetch to the coordinator, then serve
-                        // the returned bytes into the SelectionWrite fd off-task. NB Mutter issues
-                        // *two* transfers per read (a size probe + the real read), so the coordinator
-                        // fetches from the client twice per paste — correct, just not deduplicated.
+                        // Mutter issues two transfers per paste (size probe + read). Fetch twice.
                         let (tx, rx) = oneshot::channel();
                         if event_tx
                             .send(ClipEvent::Paste {
@@ -203,12 +181,12 @@ async fn actor(
                             serve_write(&session, serial, bytes).await;
                         });
                     }
-                    // Format we don't sync — fail the transfer cleanly.
+                    // Unknown MIME: complete with empty bytes so Mutter does not hang.
                     None => serve_write(&session, serial, Vec::new()).await,
                 }
             }
             cmd = cmd_rx.recv() => {
-                let Some(cmd) = cmd else { break }; // coordinator gone → session ending
+                let Some(cmd) = cmd else { break };
                 match cmd {
                     Cmd::SetOffer(wire) => {
                         let wl = super::wayland_offers_for(&wire);
@@ -229,12 +207,12 @@ async fn actor(
             }
         }
     }
-    // Keep the connection owned for the actor's whole life (Mutter ties the session to it).
+    // Mutter ties the session to this connection; drop only after the actor exits.
     drop(conn);
     let _ = event_tx.send(ClipEvent::Closed);
 }
 
-/// Offer `wl_mimes` as the host selection; an empty list relinquishes ownership.
+/// Empty `wl_mimes` relinquishes ownership.
 async fn set_selection(session: &zbus::Proxy<'_>, wl_mimes: &[String]) -> Result<()> {
     let mut opts: HashMap<&str, Value> = HashMap::new();
     if !wl_mimes.is_empty() {
@@ -248,8 +226,6 @@ async fn set_selection(session: &zbus::Proxy<'_>, wl_mimes: &[String]) -> Result
     Ok(())
 }
 
-/// Read the current selection's `wire` format: pick a concrete offered MIME, `SelectionRead` it, and
-/// read the (non-blocking) fd to EOF on a blocking thread.
 async fn read_selection(session: &zbus::Proxy<'_>, wire: &str, raw: &[String]) -> Result<Vec<u8>> {
     let mime =
         super::pick_wayland_mime(wire, raw).context("format not offered by the host clipboard")?;
@@ -263,8 +239,7 @@ async fn read_selection(session: &zbus::Proxy<'_>, wire: &str, raw: &[String]) -
         .map_err(|e| anyhow!("SelectionRead join: {e}"))?
 }
 
-/// Serve one `SelectionTransfer`: `SelectionWrite` → write `bytes` → `SelectionWriteDone`. Any write
-/// failure still reports done (success=false) so Mutter completes the transfer.
+/// Always `SelectionWriteDone`, even on write failure, so Mutter completes the transfer.
 async fn serve_write(session: &zbus::Proxy<'_>, serial: u32, bytes: Vec<u8>) {
     let ok = match write_selection(session, serial, bytes).await {
         Ok(()) => true,
@@ -289,7 +264,6 @@ async fn write_selection(session: &zbus::Proxy<'_>, serial: u32, bytes: Vec<u8>)
         .map_err(|e| anyhow!("SelectionWrite join: {e}"))?
 }
 
-/// Read a Mutter clipboard fd to EOF (capped). The fd is `O_NONBLOCK`; flip it to blocking first.
 fn read_fd_to_end(fd: OwnedFd) -> Result<Vec<u8>> {
     set_blocking(&fd)?;
     let file = std::fs::File::from(fd);
@@ -300,7 +274,6 @@ fn read_fd_to_end(fd: OwnedFd) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Write `bytes` into a Mutter clipboard fd and close it (EOF). Flip the `O_NONBLOCK` fd to blocking.
 fn write_fd(fd: OwnedFd, bytes: &[u8]) -> Result<()> {
     set_blocking(&fd)?;
     let mut file = std::fs::File::from(fd);
@@ -308,9 +281,7 @@ fn write_fd(fd: OwnedFd, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Peel any `Value::Value` (variant) wrappers to the concrete value. The `a{sv}` dict values Mutter
-/// sends arrive as variants, so a plain `TryFrom<OwnedValue>` (which matches the concrete type) never
-/// sees through them — this strips the layer first.
+/// Mutter `a{sv}` values are `Value::Value` variants; `TryFrom<OwnedValue>` does not see through them.
 fn peel<'a>(v: &'a Value<'a>) -> &'a Value<'a> {
     let mut cur = v;
     while let Value::Value(inner) = cur {
@@ -319,7 +290,6 @@ fn peel<'a>(v: &'a Value<'a>) -> &'a Value<'a> {
     cur
 }
 
-/// Extract a boolean dict entry (e.g. `session-is-owner`), unwrapping the variant.
 fn dict_bool(opts: &HashMap<String, OwnedValue>, key: &str) -> Option<bool> {
     match peel(opts.get(key)?) {
         Value::Bool(b) => Some(*b),
@@ -327,8 +297,7 @@ fn dict_bool(opts: &HashMap<String, OwnedValue>, key: &str) -> Option<bool> {
     }
 }
 
-/// Extract a string-array dict entry (e.g. `mime-types`), unwrapping the variant. Mutter wraps the
-/// array in a single-field struct (`(as)`, seen on `SelectionOwnerChanged`), so unwrap that too.
+/// `mime-types` arrives as `(as)` on `SelectionOwnerChanged`; unwrap the struct then the variant.
 fn dict_mimes(opts: &HashMap<String, OwnedValue>, key: &str) -> Vec<String> {
     let Some(v) = opts.get(key) else {
         return Vec::new();
@@ -352,7 +321,7 @@ fn dict_mimes(opts: &HashMap<String, OwnedValue>, key: &str) -> Vec<String> {
         .collect()
 }
 
-/// Clear `O_NONBLOCK` on a Mutter clipboard fd so a blocking `spawn_blocking` read/write works.
+/// Mutter clipboard fds are `O_NONBLOCK`; a blocking `spawn_blocking` read/write needs this first.
 fn set_blocking(fd: &OwnedFd) -> Result<()> {
     let raw = fd.as_raw_fd();
     // SAFETY: `raw` is a valid fd owned by `fd` for the duration of these fcntl calls.
@@ -374,21 +343,19 @@ fn set_blocking(fd: &OwnedFd) -> Result<()> {
     Ok(())
 }
 
-/// On-glass tests against a **live GNOME/Mutter** session (`WAYLAND_DISPLAY=wayland-0`). `#[ignore]`d
-/// — run explicitly under GNOME (Mutter has no `wl-clipboard`, so a second Mutter session plays the
-/// "host app"):
+/// Live GNOME/Mutter tests (`WAYLAND_DISPLAY=wayland-0`). Ignored; a second
+/// Mutter session stands in for the host app (Mutter has no `wl-clipboard`).
 ///
 /// ```text
 /// cargo test -p punktfunk-host --bin punktfunk-host -- --ignored --nocapture clipboard::mutter::live
 /// ```
 ///
-/// Skips (does not fail) when Mutter isn't running, so `--ignored` off-GNOME is a clean no-op.
+/// Skips when Mutter is not running, so `--ignored` off-GNOME is a no-op.
 #[cfg(test)]
 mod live {
     use super::*;
     use std::time::Duration;
 
-    /// A second Mutter session standing in for a host clipboard app.
     struct Helper {
         session: zbus::Proxy<'static>,
         _conn: zbus::Connection,
@@ -409,7 +376,6 @@ mod live {
             })
         }
 
-        /// Own the selection offering plain text, serving `payload` on every transfer request.
         async fn offer_text(&self, payload: &'static [u8]) {
             let mut transfer = self
                 .session
@@ -435,7 +401,6 @@ mod live {
             .unwrap();
         }
 
-        /// Paste the current selection's plain text.
         async fn read_text(&self) -> Vec<u8> {
             let fd: zbus::zvariant::OwnedFd = self
                 .session
@@ -488,7 +453,6 @@ mod live {
             };
             let helper = Helper::open().await.expect("helper Mutter session");
 
-            // --- host copy → backend observes Selection + read_current returns the bytes ---
             helper.offer_text(b"gnome-host-copied").await;
             let mimes = next_selection(&mut rx, Duration::from_secs(3))
                 .await
@@ -503,10 +467,9 @@ mod live {
                 .expect("read_current text");
             assert_eq!(got, b"gnome-host-copied");
 
-            // --- backend offers client content → the host app (helper) pastes it ---
             backend.set_offer(&[super::super::WIRE_TEXT.to_string()]);
-            tokio::time::sleep(Duration::from_millis(500)).await; // let SetSelection take effect
-                                                                  // Answer every Paste request the host app (helper) triggers, until the read completes.
+            // Mutter applies SetSelection asynchronously; 500 ms is enough for the helper to see it.
+            tokio::time::sleep(Duration::from_millis(500)).await;
             let paste_side = async {
                 while let Some(ev) = rx.recv().await {
                     if let ClipEvent::Paste { responder, .. } = ev {

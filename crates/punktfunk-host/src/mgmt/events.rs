@@ -1,20 +1,13 @@
-//! `GET /api/v1/events` — the host lifecycle event stream (scripting-and-hooks RFC §5, M1).
+//! `GET /api/v1/events` — host lifecycle events as Server-Sent Events.
 //!
-//! Server-Sent Events over the existing HTTPS serve loop: each event goes out as one SSE frame
-//! with `id:` = the event's `seq`, `event:` = its kind (`stream.started`, …), and `data:` = the
-//! [`crate::events::HostEvent`] JSON. Consumers resume with the standard `Last-Event-ID` header
-//! (or its `?since=` query twin); a consumer that fell off the catch-up ring gets a synthetic
-//! `event: dropped` frame first and should resync via the REST snapshots (`/status`, `/clients`,
-//! …). `?kinds=` filters server-side (exact kinds or `domain.*` prefixes, comma-separated).
+//! One frame per event: `id:` is `seq`, `event:` is the kind, `data:` is
+//! [`crate::events::HostEvent`] JSON. Resume with `Last-Event-ID` or `?since=`.
+//! A cursor that fell off the ring gets `event: dropped` first and must resync
+//! from REST snapshots. `?kinds=` filters server-side (exact names or `domain.*`,
+//! comma-separated).
 //!
-//! Bounds (RFC §9.6): at most [`MAX_EVENT_STREAMS`] concurrent streams (503 beyond — the
-//! consumer retries; SSE clients reconnect by themselves), and a consumer too slow for the
-//! live tail (broadcast lag) is **disconnected**, never buffered unboundedly — its reconnect
-//! resumes from the ring via `Last-Event-ID`.
-//!
-//! Auth: deliberately NOT on the mTLS read-only allowlist (`auth::cert_may_access`) — the
-//! stream is part of the loopback + bearer admin lane in v1 (RFC §5; revisit when paired
-//! clients want an activity feed).
+//! At most [`MAX_EVENT_STREAMS`] concurrent streams (503 beyond). A consumer too
+//! slow for the live tail is disconnected, not buffered; reconnect reads the ring.
 
 use super::shared::*;
 use axum::http::HeaderMap;
@@ -24,19 +17,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-/// Concurrent SSE connection cap. Operators run a handful of consumers (console feed, a couple
-/// of scripts/plugins); 32 is generous headroom while bounding a runaway reconnect loop.
+/// 32: a handful of consumers (console + scripts) plus headroom; bounds a reconnect storm.
 const MAX_EVENT_STREAMS: usize = 32;
 
-/// SSE keep-alive comment interval — detects a dead peer and keeps middleboxes from idling
-/// the connection out between (low-rate) lifecycle events.
+/// 15 s: dead-peer probe and idle-middlebox keep-alive between sparse lifecycle events.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 
 static LIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
 
-/// RAII slot in the connection cap: taken before the stream starts, released when the SSE body
-/// is dropped (client disconnect, slow-consumer cut, server shutdown). `pub(crate)` only for
-/// the [`test_support`] saturation helper's return type.
+/// Connection-cap token. `pub(crate)` so [`test_support`] can return the slots it holds.
 pub(crate) struct StreamSlot;
 
 fn try_acquire_slot() -> Option<StreamSlot> {
@@ -54,7 +43,6 @@ impl Drop for StreamSlot {
     }
 }
 
-/// `?kinds=stream.*,pairing.pending` — exact kind names or `domain.*` prefixes. `None` = all.
 struct KindFilter(Option<Vec<String>>);
 
 impl KindFilter {
@@ -79,16 +67,11 @@ impl KindFilter {
 
 #[derive(Deserialize)]
 pub(crate) struct EventsQuery {
-    /// Resume cursor: stream events with `seq > since`. The `Last-Event-ID` header (what an SSE
-    /// client sends on auto-reconnect) takes precedence when both are present.
     since: Option<u64>,
-    /// Comma-separated kind filter (`stream.*,pairing.pending`).
     kinds: Option<String>,
 }
 
-/// One [`crate::events::HostEvent`] as an SSE frame: `id:` = seq (drives `Last-Event-ID`),
-/// `event:` = kind, `data:` = the full event JSON (kind included — the frame is self-contained
-/// for consumers that read `data` only).
+/// `data:` repeats `kind` so a client that ignores the SSE `event:` field still has it.
 fn sse_event(ev: &crate::events::HostEvent) -> Event {
     Event::default()
         .id(ev.seq.to_string())
@@ -96,10 +79,8 @@ fn sse_event(ev: &crate::events::HostEvent) -> Event {
         .data(serde_json::to_string(ev).unwrap_or_else(|_| "{}".to_string()))
 }
 
-/// Everything the poll loop owns; dropping it (the response body going away) releases the
-/// connection-cap slot and the broadcast receiver.
+/// Dropping the SSE body drops `_slot` and the broadcast receiver (cap + subscription).
 struct StreamState {
-    /// The dropped marker (when applicable) + the filtered catch-up, served before the live tail.
     pending: VecDeque<Event>,
     rx: broadcast::Receiver<crate::events::HostEvent>,
     filter: KindFilter,
@@ -108,14 +89,8 @@ struct StreamState {
 
 /// Stream host lifecycle events (SSE)
 ///
-/// Server-Sent Events stream of the host's lifecycle events: client connect/disconnect, session
-/// and stream start/end, pairing decisions, display create/release, library changes, host
-/// start/stop — both protocol planes. Frames carry `id:` = the event's monotonic `seq`,
-/// `event:` = its kind, and `data:` = the event JSON (schema-versioned, additive-only).
-///
-/// Resume: standard `Last-Event-ID` (or `?since=`) replays from the in-memory ring; a consumer
-/// that fell off the ring receives an `event: dropped` frame first and should resync via the
-/// REST snapshots. Keep-alive comments are sent every 15 s.
+/// `id:` is `seq`, `event:` is kind, `data:` is HostEvent JSON. Resume with `Last-Event-ID`
+/// or `?since=`; `event: dropped` means the ring no longer has that cursor — resync from REST.
 #[utoipa::path(
     get,
     path = "/events",
@@ -139,8 +114,7 @@ pub(crate) async fn stream_events(Query(q): Query<EventsQuery>, headers: HeaderM
             "event-stream connection cap reached — close an existing stream or retry",
         );
     };
-    // The header is what an SSE client re-sends on auto-reconnect, so it is always the newer
-    // cursor when both it and the original URL's `?since=` are present.
+    // SSE auto-reconnect sends `Last-Event-ID`; it wins over the URL's `?since=` when both exist.
     let since = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -152,8 +126,7 @@ pub(crate) async fn stream_events(Query(q): Query<EventsQuery>, headers: HeaderM
 
     let mut pending = VecDeque::new();
     if sub.dropped {
-        // The consumer's cursor precedes the ring: tell it so (the `LogPage.dropped` contract)
-        // — its move is a REST resync, not trust in a complete replay.
+        // Cursor is older than the ring; `dropped` means resync from REST, not a complete replay.
         pending.push_back(
             Event::default()
                 .event("dropped")
@@ -184,9 +157,8 @@ pub(crate) async fn stream_events(Query(q): Query<EventsQuery>, headers: HeaderM
                         return Some((Ok(sse_event(&ev)), st));
                     }
                 }
-                // Lagged = this consumer is too slow for the live tail: cut it loose (bounded
-                // memory, RFC §9.6) — its auto-reconnect resumes from the ring, which flags
-                // `dropped` if it also fell off that. Closed = host shutdown.
+                // Lagged: drop this consumer (no unbounded buffer); reconnect reads the ring.
+                // Closed: host shutdown.
                 Err(broadcast::error::RecvError::Lagged(_))
                 | Err(broadcast::error::RecvError::Closed) => return None,
             }
@@ -199,8 +171,8 @@ pub(crate) async fn stream_events(Query(q): Query<EventsQuery>, headers: HeaderM
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    /// Fill the connection cap and hand the slots to a test ([`Drop`] frees them). The events
-    /// tests serialize on a lock so the full cap can't 503 an unrelated concurrent test.
+    /// Hold every cap slot until dropped. Tests that call this must serialize; otherwise
+    /// unrelated streams 503.
     pub(crate) fn saturate_slots() -> Vec<super::StreamSlot> {
         std::iter::from_fn(super::try_acquire_slot).collect()
     }

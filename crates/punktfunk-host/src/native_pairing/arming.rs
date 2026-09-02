@@ -1,40 +1,32 @@
-//! The on-demand arming PIN window (plan §W5 — carved out of the [`super`] facade). Owns the
-//! [`Armed`] state behind a [`Mutex`]: a short-lived (or CLI-flag, no-expiry) PIN the host mints
-//! and the operator reads from the web console, optionally bound to one device fingerprint (#9).
+//! On-demand PIN window that arms native pairing.
+//!
+//! Owns [`Armed`] behind a [`Mutex`]. A window is a PIN, an optional expiry, an
+//! optional bound fingerprint, and an optional [`super::Access`] grant. CLI
+//! `--allow-pairing` arms with no expiry; the web console arms a timed window.
+//! A bound fingerprint rejects other clients without consuming the PIN.
+//!
+//! Pin this via [`ArmState`]. Pairing ceremony tests live on the [`super`] facade.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// The current arming window. `pin == None` ⇒ disarmed. `expires_at == None` ⇒ armed with no
-/// expiry (the CLI `--allow-pairing` flag); `Some(t)` ⇒ a web-armed window that auto-disarms.
-///
-/// `bound_fp == Some(fp)` ⇒ the window is **bound to one operator-selected device fingerprint**:
-/// only a pairing attempt from that fingerprint may consume it (security-review 2026-06-28 #9). This
-/// closes the window-burn DoS — an unpaired LAN peer cannot consume a window armed for a specific
-/// device, because the QUIC client-auth proves cert possession (it can't forge the bound fingerprint).
-/// `None` ⇒ unbound (the CLI flag / a console "arm open"): any well-formed attempt consumes it (the
-/// legacy behavior, retaining the window-burn DoS — acceptable only on a trusted LAN).
+/// PIN window. `pin == None` is disarmed. `expires_at == None` is CLI
+/// `--allow-pairing` (no auto-disarm). `bound_fp == Some` rejects other
+/// fingerprints without consuming the PIN.
 #[derive(Default)]
 struct Armed {
     pin: Option<String>,
     expires_at: Option<Instant>,
     bound_fp: Option<String>,
-    /// The operator's access choice for whichever device completes this window's ceremony
-    /// (design §5.7 — the arm dialog is an authorized grant path). `None` = no choice made
-    /// (the full/permanent default). Wiped with the rest of the window on disarm/expiry, so
-    /// the ceremony must read it BEFORE consuming the single-use PIN.
+    /// Applied to the device that completes this window. `None` is full/permanent.
+    /// Disarm/expiry wipes it; the ceremony must read this before consuming the PIN.
     access: Option<super::Access>,
 }
 
-/// The result of resolving the armed PIN for a specific client fingerprint
-/// (`NativePairing::pin_for_attempt`).
 pub enum PinAttempt {
-    /// No window is armed (disarmed/expired) — reject; do not run the ceremony.
     Disarmed,
-    /// A window IS armed but **bound to a different fingerprint** — reject WITHOUT consuming it, so
-    /// an unrelated (attacker) fingerprint can't burn the operator's armed window (#9).
+    /// Bound to a different fingerprint. Reject without consuming the PIN.
     BoundToOther,
-    /// Proceed: the PIN to run the ceremony with (the window is unbound, or bound to this fingerprint).
     Pin(String),
 }
 
@@ -43,18 +35,15 @@ fn random_pin() -> String {
     format!("{:04}", rand::rng().random_range(0..10_000u32))
 }
 
-/// A snapshot of the arming window for the management API: `(armed, pin, expires_in_secs)`.
+/// Management-API snapshot: `(armed, pin, expires_in_secs)`.
 pub(super) type ArmSnapshot = (bool, Option<String>, Option<u64>);
 
-/// The arming-PIN window behind a [`Mutex`].
 pub(super) struct ArmState {
     arm: Mutex<Armed>,
 }
 
 impl ArmState {
-    /// A fresh window. If `arm_at_start` (the CLI `--allow-pairing`/`--require-pairing` flags), arm
-    /// immediately with `fixed_pin` (or a fresh random PIN) and **no expiry** — back-compat with the
-    /// headless CLI flow. Otherwise disarmed.
+    /// Disarmed unless `arm_at_start`: then a PIN with no expiry (CLI `--allow-pairing`).
     pub(super) fn new(arm_at_start: bool, fixed_pin: Option<String>) -> ArmState {
         let arm = if arm_at_start {
             Armed {
@@ -71,11 +60,8 @@ impl ArmState {
         }
     }
 
-    /// Arm pairing with a fresh random PIN, valid for `ttl`. If `bound_fp` is `Some`, the window is
-    /// bound to that device fingerprint: only a pairing attempt from it consumes the window, so an
-    /// unrelated (attacker) fingerprint can neither pair nor burn the window (#9). `access` is
-    /// the operator's choice for whichever device completes this window's ceremony (`None` =
-    /// the full/permanent default). Returns the PIN.
+    /// Arm a timed PIN. A bound fingerprint is the only client that can consume it.
+    /// `access` is applied on success (`None` = full/permanent).
     pub(super) fn arm_for(
         &self,
         ttl: Duration,
@@ -92,17 +78,14 @@ impl ArmState {
         pin
     }
 
-    /// The access choice the current window carries (`None` when disarmed/expired or armed
-    /// without one). Read by the ceremony BEFORE it consumes the window — disarm wipes it.
+    /// Window access, or `None` if disarmed/expired. Read before consuming the PIN.
     pub(super) fn armed_access(&self) -> Option<super::Access> {
         let mut arm = self.arm.lock().unwrap();
         Self::expire(&mut arm);
         arm.access
     }
 
-    /// Resolve the PIN for an attempt from `client_fp_hex`, honoring fingerprint binding (#9):
-    /// `Disarmed` if no window is armed; `BoundToOther` if a window is armed but bound to a different
-    /// fingerprint (the caller MUST reject without consuming it); else `Pin` to run the ceremony.
+    /// PIN for this fingerprint, or [`PinAttempt::BoundToOther`] without consuming the window.
     pub(super) fn pin_for_attempt(&self, client_fp_hex: &str) -> PinAttempt {
         let mut arm = self.arm.lock().unwrap();
         Self::expire(&mut arm);
@@ -117,12 +100,11 @@ impl ArmState {
         }
     }
 
-    /// Disarm pairing (no new ceremonies accepted).
     pub(super) fn disarm(&self) {
         *self.arm.lock().unwrap() = Armed::default();
     }
 
-    /// Expire a timed window if its deadline passed (called under the lock before any read).
+    /// Drop a timed window whose deadline passed. Call under the lock before any read.
     fn expire(arm: &mut Armed) {
         if let Some(t) = arm.expires_at {
             if Instant::now() >= t {
@@ -131,15 +113,13 @@ impl ArmState {
         }
     }
 
-    /// The current valid PIN, or `None` if disarmed/expired. The QUIC ceremony reads this
-    /// per-attempt, so a window that lapsed mid-connection no longer pairs.
+    /// Live PIN, or `None` if disarmed/expired. Re-read per attempt so a lapsed window cannot pair.
     pub(super) fn current_pin(&self) -> Option<String> {
         let mut arm = self.arm.lock().unwrap();
         Self::expire(&mut arm);
         arm.pin.clone()
     }
 
-    /// A snapshot for the management API: `(armed, pin, expires_in_secs)`.
     pub(super) fn snapshot(&self) -> ArmSnapshot {
         let mut arm = self.arm.lock().unwrap();
         Self::expire(&mut arm);

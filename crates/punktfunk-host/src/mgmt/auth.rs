@@ -1,11 +1,11 @@
-//! Auth gate for the management API `/api/v1` routes: paired client cert (mTLS, from anywhere)
-//! or a bearer token (loopback peers only). Split out of the `mgmt` facade (plan §W5).
+//! Auth gate for `/api/v1`: a paired client cert (mTLS, from anywhere) or a bearer token
+//! (loopback peers only).
 //!
-//! Three lanes, three authorities:
-//! - **paired streaming cert** (mTLS, LAN) — the read-only [`cert_may_access`] allowlist.
-//! - **plugin token** (bearer, loopback) — the scripting runner's capability-limited credential:
-//!   the admin surface MINUS hook registration and pairing administration
-//!   ([`plugin_may_access`]).
+//! Three lanes:
+//! - **paired streaming cert** — [`cert_may_access`] (status reads plus two writes: log
+//!   upload and host-action invoke).
+//! - **plugin token** (bearer, loopback) — [`plugin_may_access`]: admin minus hooks, pairing
+//!   admin, host logs, store, and update.
 //! - **admin token** (bearer, loopback) — everything.
 
 use super::shared::*;
@@ -17,81 +17,64 @@ use axum::http::Method;
 use axum::middleware::Next;
 use sha2::{Digest, Sha256};
 
-/// **Which credential authorized this request**, attached to the request extensions by
-/// [`require_auth`] on every request it forwards.
+/// Which credential authorized this request. [`require_auth`] stamps it on every forwarded
+/// request; handlers extract `Extension<AuthLane>`. A missing extension is a 500, not a
+/// default — a router that forgot the middleware must fail closed.
 ///
-/// [`plugin_may_access`] answers "may this lane reach this route"; this answers "may this lane set
-/// this *field*". Some payloads carry operator-privileged fields on routes a plugin otherwise has
-/// every business calling — the library reconcile is the case that matters: a provider plugin owns
-/// its entry set, but `prep` and `launch.kind == "command"` are executed verbatim as the host user
-/// (`/bin/sh -c` / `cmd.exe /c`), which is the same primitive the `/hooks` carve-out withholds.
-/// Route-level authorization cannot express that; a handler holding this can (see
-/// [`crate::library::reject_privileged_fields`]).
-///
-/// Extracted by handlers as `Extension<AuthLane>`. A missing extension is a 500, not a default —
-/// a router that forgot the middleware must fail closed, never silently grant admin.
+/// [`plugin_may_access`] answers route reachability; this answers field authority. Some
+/// payloads carry operator-privileged fields (`prep`, `launch.kind == "command"`) on routes
+/// a plugin may otherwise call. See [`crate::library::reject_privileged_fields`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AuthLane {
-    /// The operator's admin bearer token (loopback): everything, including the privileged fields.
+    /// Operator admin bearer (loopback): everything, including privileged fields.
     Admin,
-    /// The scripting runner's scoped bearer token (loopback): [`plugin_may_access`] routes, and
-    /// never the operator-privileged fields inside them.
+    /// Scripting-runner bearer (loopback): [`plugin_may_access`] routes, never privileged fields.
     Plugin,
-    /// A paired streaming client certificate (mTLS, LAN): the read-only [`cert_may_access`] set.
+    /// Paired streaming cert (mTLS): the [`cert_may_access`] set.
     Cert,
-    /// An always-open route (`/health`) or the loopback-only tray summary — no credential at all.
+    /// Open route (`/health`) or loopback-only tray summary — no credential.
     Public,
 }
 
 impl AuthLane {
-    /// Whether this lane may set fields that become command execution as the host user. Only the
-    /// operator's own token may: the console is the surface where the operator types a command, and
-    /// typing it there is the trust decision. Everything else is refused, including a paired cert
-    /// (which cannot reach a write route anyway — belt and braces if the allowlist ever grows).
+    /// Fields that become command execution as the host user. Admin only. Still refused
+    /// on other lanes if a write that carries `prep` / `launch.kind` is later allowlisted.
     pub(crate) fn may_set_privileged_fields(self) -> bool {
         matches!(self, AuthLane::Admin)
     }
 
-    /// Whether this is the operator's own lane — the console, as opposed to a paired client or a
-    /// plugin.
+    /// Operator's own lane (the console), as opposed to a paired client or a plugin.
     ///
-    /// Same arm as [`may_set_privileged_fields`](Self::may_set_privileged_fields) today, and
-    /// deliberately a separate question: that one asks "may this caller cause command execution",
-    /// this one asks "is this caller the person curating the library". A read-only view the operator
-    /// alone should see (their hidden titles) is not a privilege escalation, and collapsing the two
-    /// would leave whichever one changes first silently answering for the other.
+    /// Same arm as [`Self::may_set_privileged_fields`] today, deliberately a separate
+    /// question: command execution vs. "is this the person curating the library". A
+    /// read-only operator-only view (hidden titles) is not a privilege escalation;
+    /// collapsing the two would leave whichever changes first answering for the other.
     pub(crate) fn is_operator(self) -> bool {
         matches!(self, AuthLane::Admin)
     }
 }
 
-/// Auth gate on the `/api/v1` routes: a paired client cert (mTLS, from anywhere) or the bearer token
-/// (from a **loopback** peer only) — required always (the host runs with a token by construction).
-/// `/api/v1/health` stays open for probes; `/api/v1/local/summary` is open to loopback peers only
-/// (the tray icon's status source). The cert path authorizes only the read-only allowlist
-/// ([`cert_may_access`]); the bearer path authorizes the full admin surface and is therefore confined
-/// to loopback so it is never LAN-exposed even when the listener binds all interfaces by default.
+/// Paired client cert (mTLS, from anywhere) or a bearer token from a loopback peer.
+/// `/health` is always open; `/local/summary` is loopback-only (the tray cannot read the
+/// token file). Cert: [`cert_may_access`]. Bearer: full admin, confined to loopback because
+/// the listener binds all interfaces by default.
 pub(crate) async fn require_auth(
     State(st): State<Arc<MgmtState>>,
     req: Request,
     next: Next,
 ) -> Response {
-    /// Stamp the authorizing lane onto the request before it reaches a handler, so a handler can
-    /// refuse operator-privileged FIELDS to a non-operator lane (see [`AuthLane`]).
+    /// Stamp the lane so a handler can refuse privileged fields to a non-operator (see [`AuthLane`]).
     async fn forward(mut req: Request, next: Next, lane: AuthLane) -> Response {
         req.extensions_mut().insert(lane);
         next.run(req).await
     }
 
     if req.uri().path() == "/api/v1/health" {
-        return forward(req, next, AuthLane::Public).await; // liveness probe is always open
+        return forward(req, next, AuthLane::Public).await;
     }
-    // The tray icon's status source: non-sensitive counts/booleans only, unauthenticated but
-    // confined to LOOPBACK peers. The bearer-token file (and cert.pem) are SYSTEM/Administrators-
-    // DACL'd on Windows, so the per-user tray process cannot authenticate — this one narrow
-    // read-only route is deliberately all it needs. Not on the cert allowlist: LAN mTLS clients
-    // already have the richer `/status`. (No PeerAddr ⇒ a unit test → treat as loopback, matching
-    // the bearer path below.)
+    // Tray status: unauthenticated, loopback only. On Windows the token file is
+    // SYSTEM/Administrators-DACL'd, so the per-user tray cannot authenticate. Not on the
+    // cert allowlist — LAN clients already have `/status`. No PeerAddr ⇒ test ⇒ loopback.
     if req.uri().path() == "/api/v1/local/summary" {
         let from_loopback = req
             .extensions()
@@ -106,17 +89,12 @@ pub(crate) async fn require_auth(
             )
         };
     }
-    // A paired native client authenticates by its mTLS certificate — the same identity + trust the
-    // QUIC data plane uses. But "paired to STREAM" is not "paired to ADMINISTER": a streaming cert
-    // authorizes only the safe, read-only status routes, NOT state-changing or pairing-administration
-    // routes (which would let one paired client unpair others, read/arm the pairing PIN, stop
-    // sessions, or edit the library). Everything outside the allowlist requires the operator's bearer
-    // token. The fingerprint is attached by `serve_https` from the verified peer cert.
+    // Fingerprint is attached by `serve_https` from the verified peer cert. Paired-to-stream
+    // is not paired-to-administer: only [`cert_may_access`]; everything else needs the bearer.
     if let Some(PeerCertFingerprint(Some(fp))) = req.extensions().get::<PeerCertFingerprint>() {
-        // `effective`, not `is_paired`: the expiry-blind verb answers "is this device LISTED", which
-        // is the device roster's question, not an admission gate's (see the `native_pairing` module
-        // header's two-verbs contract). Authorizing on the listing would leave a guest whose access
-        // lapsed hours ago holding this lane for as long as the record sits in the store.
+        // `effective`, not `is_paired`. The expiry-blind verb answers "is this device listed"
+        // (the roster). Authorizing on the listing would leave a lapsed guest on this lane
+        // for as long as the record sits in the store.
         if cert_may_access(req.method(), req.uri().path())
             && st
                 .native
@@ -126,13 +104,8 @@ pub(crate) async fn require_auth(
             return forward(req, next, AuthLane::Cert).await;
         }
     }
-    // Otherwise require the bearer token (the web console / admin) — but only from a LOOPBACK peer.
-    // The token authorizes the full admin surface, so confining it to loopback keeps that surface off
-    // the LAN even though the listener now binds all interfaces by default (so paired clients can
-    // browse the library). The web console BFF — the sole token holder — always connects over
-    // loopback, so nothing first-party is affected; a LAN caller must use a paired client cert and is
-    // limited to the read-only allowlist above. (No PeerAddr ⇒ a non-`serve_https` caller, e.g. a unit
-    // test → treat as loopback so handler tests still authenticate by token.)
+    // Full admin surface, so loopback only — the listener binds all interfaces so paired
+    // clients can browse the library. No PeerAddr ⇒ unit test ⇒ treat as loopback.
     let from_loopback = req
         .extensions()
         .get::<PeerAddr>()
@@ -143,8 +116,8 @@ pub(crate) async fn require_auth(
             "the admin API is loopback-only — a LAN client must present a paired client certificate",
         );
     }
-    // `run` always passes a token, so no-token means a misconfigured caller (e.g. a test constructing
-    // `app` directly) — deny.
+    // `run` always passes a token; no-token is a misconfigured caller (a test building `app`
+    // directly) — deny.
     let Some(expected) = st.token.as_deref() else {
         return api_error(StatusCode::UNAUTHORIZED, "authentication required");
     };
@@ -155,11 +128,8 @@ pub(crate) async fn require_auth(
         .and_then(|v| v.strip_prefix("Bearer "));
     match presented {
         Some(token) if token_eq(token, expected) => forward(req, next, AuthLane::Admin).await,
-        // The scripting runner's scoped lane: same loopback confinement as the admin token, but
-        // routes that would let a plugin escalate — registering hooks (arbitrary command
-        // execution as the host user) or administering pairing (admitting/ejecting devices,
-        // reading the PIN) — need the operator's admin token. Checked AFTER the admin token so
-        // equal tokens (operator misconfiguration) degrade to full access, never to a lockout.
+        // Same loopback confinement. Checked AFTER the admin token so equal tokens
+        // (operator misconfiguration) degrade to full access, never to a lockout.
         Some(token)
             if st
                 .plugin_token
@@ -183,64 +153,30 @@ pub(crate) async fn require_auth(
     }
 }
 
-/// The routes the scripting runner's **plugin token** may reach — an explicit **allowlist**, so a
-/// route added later is denied until someone classifies it (`plugin_lane_classifies_every_route` in
-/// `mgmt::tests` fails the build otherwise).
+/// Allowlist of routes the plugin token may reach. A later route is denied until classified
+/// (`plugin_lane_classifies_every_route` in `mgmt::tests` fails the build otherwise).
 ///
-/// This gate used to be a denylist of route prefixes, and that is precisely how the 2026-08-05
-/// review's H-1/H-2 arrived: `/api/v1/library` was never enumerated, so the plugin lane inherited
-/// two copies of the very "arbitrary command execution as the host user" primitive the `/hooks`
-/// carve-out exists to withhold, plus an unconfined file read. Every sibling gate in the system
-/// (`cert_may_access`, the QUIC pairing gate, the console's `isPublicPath`) is deny-by-default;
-/// this one now is too.
+/// Out of the list: hooks (operator commands + webhook secrets), `GET /logs` (those secrets
+/// unredacted), pairing admin, UI-proxy credentials, the plugin store, the update surface.
+/// Library writes are in because a provider reconciles its own entries; `prep` and
+/// `launch.kind == "command"` are refused in the handlers via [`AuthLane`].
 ///
-/// What stays *out* of the list, and why:
-/// - **hooks** — `hooks.json` runs operator commands on lifecycle events; writing it is arbitrary
-///   command execution as the host user, and reading it can expose webhook credentials.
-/// - **the host's log ring** (`GET /logs`) — it serves the host's own tracing at DEBUG and above,
-///   unredacted, which is the *same* webhook credentials (for Slack, Discord, ntfy, Teams, Zapier
-///   and Home Assistant the URL IS the bearer token) plus every command line the hook runner has
-///   spawned. Withholding `/hooks` while handing the ring over left the carve-out above decorative
-///   (2026-08-25 review H-2). A plugin still WRITES its own output — `POST /plugins/logs` below —
-///   which is the direction it actually needs.
-/// - **pairing administration** — arming/approving/denying/unpairing (and PIN visibility) decide
-///   *which devices may stream*; a plugin defect must not be able to admit an attacker's device
-///   or eject the operator's.
-/// - **UI proxy credentials** — a plugin has no business reading another plugin's per-boot UI
-///   secret; only the console proxy (admin token) needs it.
-/// - **the plugin store** — installing a plugin is running new code with operator privileges, and a
-///   plugin that can do that is a persistence/escalation primitive: it could install a helper that
-///   isn't constrained the way it is, or switch the runner's own service state.
-/// - **the update surface** — operator business end to end (`apply` runs an installer / the root
-///   helper).
-///
-/// The library *writes* below are on the list because a provider plugin's whole job is reconciling
-/// its own entries — but the two operator-privileged FIELDS inside those payloads (`prep`, and
-/// `launch.kind == "command"`) are refused to this lane in the handlers, via [`AuthLane`]. Route
-/// reachability and field authority are separate questions and this gate only answers the first.
-///
-/// That field refusal is **not** a command-execution boundary today, and this doc used to read as
-/// though it were: `PUT /plugins/{}` below lets this lane register *any* plugin id together with the
-/// loopback port and per-boot secret the host will dial, and a `launch.kind == "plugin"` entry under
-/// that id makes the host run whatever that listener answers
-/// ([`crate::library::ask_plugin_launch`], 2026-08-25 review H-1). No narrowing here can fix that:
-/// the runner hosts every plugin in ONE process on ONE shared token, so this gate cannot tell which
-/// plugin is calling, and a plugin that proved its id would still be entitled to that primitive.
+/// Route reachability is not launch isolation. `PUT /plugins/{}` lets this lane register any
+/// id with the loopback port the host will dial, and `launch.kind == "plugin"` runs whatever
+/// that listener answers. The runner is one process on one token, so this gate cannot tell
+/// which plugin is calling. See [`crate::library::ask_plugin_launch`].
 pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
-    // (method, path) pairs, `{}` matching exactly one path segment. Grouped as the route table is.
+    // (method, path); `{}` is exactly one segment. Grouped as the route table is.
     const ALLOWED: &[(&Method, &str)] = &[
-        // Host / status reads.
         (&Method::GET, "/api/v1/health"),
         (&Method::GET, "/api/v1/host"),
         (&Method::GET, "/api/v1/status"),
         (&Method::GET, "/api/v1/local/summary"),
         (&Method::GET, "/api/v1/compositors"),
         (&Method::GET, "/api/v1/events"),
-        // The paired-device rosters: read-only. (DELETE is pairing administration — not listed.)
+        // Rosters, read-only. DELETE is pairing admin — not listed.
         (&Method::GET, "/api/v1/clients"),
         (&Method::GET, "/api/v1/native/clients"),
-        // GPU + display control: host configuration a plugin may legitimately steer (a room
-        // automation plugin swaps the layout with the lights); no privilege boundary crossed.
         (&Method::GET, "/api/v1/gpus"),
         (&Method::PUT, "/api/v1/gpus/preference"),
         (&Method::GET, "/api/v1/display/settings"),
@@ -253,14 +189,12 @@ pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
         (&Method::POST, "/api/v1/display/presets"),
         (&Method::PUT, "/api/v1/display/presets/{}"),
         (&Method::DELETE, "/api/v1/display/presets/{}"),
-        // Session control: stopping/steering a session is what a launcher plugin exists to do.
         (&Method::DELETE, "/api/v1/session"),
         (&Method::POST, "/api/v1/session/idr"),
         (&Method::GET, "/api/v1/session/settings"),
         (&Method::PUT, "/api/v1/session/settings"),
         (&Method::POST, "/api/v1/game/end"),
-        // Library: reads, plus the provider reconcile a scanner plugin is built around. The
-        // operator-only FIELDS inside these payloads are refused separately (see `AuthLane`).
+        // Library reads + provider reconcile. Privileged fields refused via `AuthLane`.
         (&Method::GET, "/api/v1/library"),
         (&Method::GET, "/api/v1/library/art/{}/{}"),
         (&Method::GET, "/api/v1/library/scanners"),
@@ -270,11 +204,8 @@ pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
         (&Method::DELETE, "/api/v1/library/custom/{}"),
         (&Method::PUT, "/api/v1/library/provider/{}"),
         (&Method::DELETE, "/api/v1/library/provider/{}"),
-        // Liveness reporting for a provider's OWN titles. No new authority: the host maps the
-        // report through the catalog, so a plugin can only ever speak about entries it published,
-        // and the worst a defective one can do to someone else's session is nothing at all.
+        // Provider liveness for its own titles — mapped through the catalog, no one else's session.
         (&Method::PUT, "/api/v1/library/provider/{}/running"),
-        // Stats / telemetry.
         (&Method::POST, "/api/v1/stats/capture/start"),
         (&Method::POST, "/api/v1/stats/capture/stop"),
         (&Method::GET, "/api/v1/stats/capture/status"),
@@ -282,7 +213,6 @@ pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
         (&Method::GET, "/api/v1/stats/recordings"),
         (&Method::GET, "/api/v1/stats/recordings/{}"),
         (&Method::DELETE, "/api/v1/stats/recordings/{}"),
-        // The plugin's own directory entry + log ingest (its UI lease registration).
         (&Method::GET, "/api/v1/plugins"),
         (&Method::POST, "/api/v1/plugins/logs"),
         (&Method::PUT, "/api/v1/plugins/{}"),
@@ -293,9 +223,8 @@ pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
         .any(|(m, pat)| *m == method && path_matches(pat, path))
 }
 
-/// Match a route pattern against a concrete path, `{}` standing for exactly one segment. Segment-
-/// wise (never a substring/prefix test), so `/api/v1/plugins/{}` cannot swallow
-/// `/api/v1/plugins/x/ui-credential` the way a `starts_with` would.
+/// `{}` is exactly one segment. Never a prefix test: `/api/v1/plugins/{}` must not swallow
+/// `/api/v1/plugins/x/ui-credential` the way `starts_with` would.
 fn path_matches(pattern: &str, path: &str) -> bool {
     let (mut p, mut a) = (pattern.split('/'), path.split('/'));
     loop {
@@ -307,24 +236,16 @@ fn path_matches(pattern: &str, path: &str) -> bool {
     }
 }
 
-/// Which routes a paired *streaming* cert (mTLS, no bearer token) may reach: a small allowlist of
-/// safe, read-only status routes only. Deny-by-default — every state-changing route and every route
-/// that exposes a pairing PIN or the pending-approval queue requires the operator's bearer token, so
-/// a streaming client can't administer the host (unpair others, arm/read the PIN, stop sessions,
-/// edit the library). `/health` is handled separately (always open).
+/// Allowlist a paired streaming cert may reach. Deny-by-default: pairing PIN, pending queue,
+/// and every other mutation need the operator bearer. `/health` is always open, separately.
 pub(crate) fn cert_may_access(method: &Method, path: &str) -> bool {
-    // The FIRST write on this lane: a paired device uploading its own log bundle for the operator
-    // ("send logs to host" — the only way logs escape a Deck in Gaming Mode or a tvOS box).
-    // Deliberately write-only: the device gets an id back and can read NOTHING — not the bundle
-    // list, not even its own upload. Size- and quota-capped in the handler/store.
+    // Write-only: the device gets an id back and can read nothing, not even its own upload.
+    // Size- and quota-capped in the handler/store.
     if method == Method::POST && path == "/api/v1/client-logs" {
         return true;
     }
-    // The lane's SECOND write: invoking a host action (`design/host-actions.md` §5.2) — power
-    // is most useful OUT of session ("sleep the host" from the host tile), which is exactly
-    // this lane. Id-only, empty body, and the handler re-reads `effective(fp, now)` and demands
-    // the `GRANT_POWER` bit per request; the route being reachable grants nothing by itself.
-    // Discovery (`GET /actions`) rides the read list below, per-caller-filtered in the handler.
+    // Id-only invoke. The handler re-reads `effective(fp, now)` and demands `GRANT_POWER`;
+    // the route being reachable grants nothing by itself. `GET /actions` is on the read list.
     if method == Method::POST && path_matches("/api/v1/actions/{}", path) {
         return true;
     }
@@ -335,26 +256,20 @@ pub(crate) fn cert_may_access(method: &Method, path: &str) -> bool {
                 | "/api/v1/compositors"
                 | "/api/v1/status"
                 | "/api/v1/actions"
-                // The paired-client ROSTERS (`/clients`, `/native/clients`) are deliberately NOT on
-                // this lane — they expose every OTHER paired device's name + fingerprint, which one
-                // paired streaming client must not be able to enumerate. Only the bearer/loopback
-                // console needs them, and no first-party client calls them (security-review 2026-07-17).
-                //
-                // The native clients browse the game library with their cert (no bearer token); the
-                // library MUTATIONS (POST/PUT/DELETE /library/custom) stay token-only via the exact
-                // GET-path match above.
+                // Rosters are not on this lane: they name every other paired device. Library
+                // GET is; POST/PUT/DELETE stay token-only via this exact-path match.
                 | "/api/v1/library"
         ) || path.starts_with("/api/v1/library/art/"))
 }
 
-/// Compare SHA-256 digests instead of the strings — constant-time with respect to the
-/// secret without pulling in a ct-eq dependency.
+/// Compare SHA-256 digests, not the strings — constant-time in the secret without a ct-eq
+/// dependency.
 pub(crate) fn token_eq(presented: &str, expected: &str) -> bool {
     Sha256::digest(presented.as_bytes()) == Sha256::digest(expected.as_bytes())
 }
 
-/// Host wall clock, unix seconds — the clock every stored access deadline is expressed in, sampled
-/// at each check (per-client-access design §4), same as `mgmt::native`'s copy.
+/// Host wall clock, unix seconds — the clock every stored access deadline is expressed in.
+/// Sampled at each check, same as `mgmt::native`'s copy.
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -366,10 +281,8 @@ fn unix_now() -> i64 {
 mod tests {
     use super::*;
 
-    /// The log ring is the `/hooks` carve-out's back door: it carries the hook runner's webhook URLs
-    /// (which ARE the bearer credential for Slack/Discord/ntfy/Teams/Zapier/Home Assistant) and the
-    /// command lines it spawned, unredacted, to anyone who can `GET /logs`. A plugin only ever needs
-    /// the other direction — pin both halves so neither drifts back (2026-08-25 review H-2).
+    /// `GET /logs` is the `/hooks` carve-out's back door: webhook URLs (the bearer for those
+    /// sinks) and spawned command lines, unredacted. A plugin only needs the other direction.
     #[test]
     fn the_plugin_lane_writes_logs_but_never_reads_them() {
         assert!(!plugin_may_access(&Method::GET, "/api/v1/logs"));

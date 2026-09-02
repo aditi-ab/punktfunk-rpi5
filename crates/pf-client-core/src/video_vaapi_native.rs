@@ -1,126 +1,22 @@
-//! Native VAAPI decode — M6 of the native-decode program, and the FFmpeg-free
-//! replacement for `video_vaapi`, the libavcodec VAAPI rung M10 deleted.
+//! Native VAAPI decode: `pf-vaadec` plans one `AuPlan`; this module owns the libva
+//! display, config, context, surface pool, submission, and DRM-PRIME export. Output
+//! is [`DecodedImage::NativeDmabuf`]. H.264, H.265, and AV1 Profile 0 in NV12 or P010.
+//! `libva.so.2` and `libva-drm.so.2` are dlopen'd — no build-time libva — and a missing
+//! runtime refuses at [`NativeVaapiDecoder::new`] so the ladder in [`crate::video`]
+//! can fall through.
 //!
-//! `pf-vaadec` turns one pf-bitstream `AuPlan` into the buffers a
-//! `vaRenderPicture` call carries; this module is everything libva-shaped around
-//! that: the display, the config and context, the surface pool, the submission, and
-//! the DRM-PRIME export the presenter imports. Its output is
-//! [`DecodedImage::NativeDmabuf`] — physically identical to what the libavcodec VAAPI
-//! rung delivered, and deliberately a different variant so that while both existed no
-//! log could confuse them (see that variant's docs).
+//! A VAAPI slot is not a surface. [`pf_vaadec::SlotMap::assign`] reuses the lowest
+//! free slot, so binding by slot index would decode into the picture the presenter
+//! still holds. Surfaces outnumber slots by [`pf_vaadec::config::PRESENTER_HEADROOM`];
+//! a surface is free when no picture is bound to it AND no consumer holds it.
+//! [`Session::acquire_target`] returns the decode target and the reference table from
+//! one snapshot so the target cannot be a named reference.
 //!
-//! # libva is dlopen'd, never linked
-//!
-//! Everything here resolves `libva.so.2` and `libva-drm.so.2` at runtime. Three
-//! things follow, and all three are the point:
-//!
-//! * `pf-client-core` gains no build-time libva dependency, so the **pf-lxcheck2
-//!   container compiles and clippies this whole rung** even though it has no
-//!   `libva-dev`. On a program where `cfg(windows)` code could only ever be checked
-//!   on a box, that is the difference between a defect found on a laptop and one
-//!   found on hardware.
-//! * A machine without libva gets a clean refusal at construction — the ladder
-//!   falls through exactly as it does for any other unavailable rung — instead of a
-//!   packaging dependency or a link error.
-//! * Nothing in the shipped packages needs to change to try it.
-//!
-//! # The surface pool, and why it is not the slot map
-//!
-//! VAAPI has no DPB slots: `VAPictureH264::picture_id` is a `VASurfaceID`, and
-//! `vaBeginPicture` takes the target surface itself. The slot ledger
-//! ([`pf_vaadec::SlotMap`], borrowed from the Vulkan rung) is our own indirection
-//! from a stable `PicId` to a small integer, and a slot is emphatically NOT a
-//! surface index.
-//!
-//! It cannot be, because [`pf_vaadec::SlotMap::assign`] hands out the lowest free
-//! slot and a slot freed by this access unit's own removals is free by then —
-//! measured at **225 of the vendored vector's 250 access units** (pf-vaadec's
-//! `the_setup_picture_routinely_inherits_a_just_freed_slot`). A surface bound by
-//! slot index would therefore decode, on nine frames in ten, straight into the
-//! surface holding the picture that was just displayed. Under zero-copy the
-//! presenter is still sampling that surface: it holds the frame until its fence has
-//! been waited, which is exactly what "zero-copy" costs.
-//!
-//! So the pool follows pf-vkdecode's image model. Surfaces outnumber slots by
-//! [`pf_vaadec::config::PRESENTER_HEADROOM`], the decode target is taken from a free
-//! list at activation time and bound to its slot afterwards, and a surface the
-//! presenter holds simply stays off the free list until its release token comes
-//! back. A surface is free when no live picture is bound to it AND no consumer holds
-//! it — two conditions, tracked separately, because they end at different times.
-//!
-//! # One access unit in, one frame out — and the queue that makes that honest
-//!
-//! [`NativeVaapiDecoder::decode`] hands the pump at most one frame, because that is the
-//! pump's contract. An access unit can make SEVERAL pictures displayable at once: an
-//! IDR with `no_output_of_prior_pics_flag` clear drains the whole DPB, and ordinary
-//! reordering bumps a burst whenever the buffer empties. Until 2026-08-07 this rung
-//! showed the last of them and retired the rest unshown, and nothing flushed the DPB at
-//! the end of a stream — measured at 225 of 250 frames on the vendored H.264 vector,
-//! 204 of 250 on H.265 and 45 of 50 on HEVC Main 10, while the D3D11VA and Vulkan rungs
-//! delivered every one.
-//!
-//! The surplus now waits in [`NativeVaapiDecoder::deliverable`] for the access units
-//! that output nothing — on a reordering stream, exactly where the reorder buffer
-//! refills — bounded by [`max_deliverable`], and [`NativeVaapiDecoder::flush`] drains
-//! the tail. It costs the surface pool nothing, because a queued frame INHERITS the
-//! claim the picture had as a DPB reference rather than adding a new one; that
-//! arithmetic is [`max_deliverable`]'s docs and
-//! `the_queue_never_needs_a_surface_the_pool_does_not_have`.
-//!
-//! ⚠ None of it engages on the wire. punktfunk hosts emit zero-reorder low-delay
-//! output, so `outputs` never holds more than one picture, the queue is empty on every
-//! access unit, and the flush finds an empty DPB. That is why the defect survived to be
-//! found by a conformance vector rather than by a session.
-//!
-//! # Why this rung is exempt from the decode-into-a-reference defect
-//!
-//! The D3D11VA and Vulkan rungs both had to grow a `release_after_decode` deferral:
-//! their conversions released the pictures an access unit displaces INSIDE the
-//! conversion, then assigned the decode target a slot, and [`pf_vaadec::SlotMap::assign`]
-//! handed back the slot just vacated — so one surface was named as both the decode
-//! target and one of that submission's own references. On H.264 that fired on **117 of
-//! 120** access units of a punktfunk host's low-delay output.
-//!
-//! `pf-vaadec`'s conversions still release inline and this rung is still exempt, for a
-//! reason that is a property of the interface rather than of any stream: **a slot is
-//! not a surface here.** `plan_to_va` never invents a surface — every reference it can
-//! name is read out of the `surfaces` table it is handed — and the decode target is a
-//! separate parameter the caller takes from OUTSIDE that table. Two things carry that,
-//! and both are load-bearing:
-//!
-//! * [`Session::acquire_target`] returns the target and the table **together, from one
-//!   snapshot**, because they are only safe together. A free surface is by construction
-//!   a surface no slot binds, and the table is exactly what the slots bind, so the
-//!   target cannot be in it. Taking the two at different moments — the table before
-//!   this access unit's removals, where references must resolve, and the free surface
-//!   after them, where the displaced picture's surface has become free — is precisely
-//!   the defect, and `taking_the_free_surface_after_the_removals_would_hand_out_a_
-//!   referenced_surface` shows it happening.
-//! * The conversion's half is pinned across every platform by `pf-vaadec`'s
-//!   `no_submission_names_its_decode_target_as_one_of_its_own_references`, driven over
-//!   the same low-delay stream, with
-//!   `taking_the_decode_target_from_the_slot_table_aliases_on_the_low_delay_stream` as
-//!   the counterfactual that shows the walk can see the defect when it is there.
-//!
-//! It holds for all three codecs and for the same one-line reason: `setup_surface`
-//! reaches the submission at exactly ONE field in each conversion — H.264 and H.265'
-//! `curr_pic.picture_id`, AV1's `current_frame`/`current_display_picture` — and every
-//! reference field is resolved through the `surfaces` table. HEVC is doubly covered:
-//! its per-slice `RefPicList` stores an INDEX into `reference_frames`, so it cannot
-//! name a surface that array does not already hold.
-//!
-//! ⚠ One documented exception, and it is not this defect: `plan_to_va_av1` substitutes
-//! a live surface for a reference slot the planner reports empty, and where the store
-//! resolved NOTHING at all the fallback is the decode target itself (that conversion's
-//! module docs say why, and prefer a resolved reference wherever one exists). It names
-//! the target only when there is no other live surface to name, on a frame that is
-//! already concealed and will not be shown.
-//!
-//! ⚠ And one assumption, stated because it is the only way the argument fails: the pool
-//! holds DISTINCT `VASurfaceID`s. Two pool entries with one id would let a free index
-//! resolve to a bound surface. `vaCreateSurfaces` cannot return duplicates — this rung
-//! also destroys each exactly once, which the same duplication would double-free — so
-//! it is an assumption about libva rather than about this file.
+//! [`NativeVaapiDecoder::decode`] hands the pump at most one frame. Surplus waits in
+//! `deliverable`, bounded by [`max_deliverable`]; [`flush`] drains the tail. Hosts
+//! emit zero-reorder low-delay, so the queue is empty on the wire. Pin with
+//! `PUNKTFUNK_DECODER=native-vaapi`. Evidence: `video::native_evidence` and the
+//! ignored tests in this file.
 
 use std::os::fd::AsRawFd as _;
 use std::os::fd::FromRawFd as _;
@@ -143,22 +39,11 @@ use crate::video::DrmFrameGuard;
 use crate::video::StreamFormat;
 use crate::video_color::ColorDesc;
 
-/// `PUNKTFUNK_DECODER=native-vaapi` — the pin that selects this rung.
-///
-/// ⚠ This rung has decoded nothing on any hardware (`video::native_evidence`). Since M10
-/// deleted libavcodec's VAAPI hwaccel it is the only VAAPI there is, so `auto` reaches it
-/// in the vendor order and the session log says at `warn` that nothing has run it.
-///
-/// The PIN is what makes the missing evidence generatable: it skips the vendor order, so a
-/// lab run can reach this rung on a box where `auto` puts Vulkan first. A rule that gated
-/// the pin too would be a rule no hardware run could ever satisfy.
+/// `PUNKTFUNK_DECODER=native-vaapi`. Skips the vendor order so a box that would
+/// pick Vulkan first can still reach this rung; gating the pin would make the
+/// missing `video::native_evidence` ungeneratable.
 pub(crate) const DECODER_PIN: &str = "native-vaapi";
 
-// ---------------------------------------------------------------------------
-// libva, resolved at runtime
-// ---------------------------------------------------------------------------
-
-/// `VADisplay` — an opaque driver handle.
 type VaDisplay = *mut c_void;
 type VaStatus = c_int;
 type VaSurfaceId = c_uint;
@@ -167,32 +52,25 @@ type VaContextId = c_uint;
 type VaBufferId = c_uint;
 
 const VA_STATUS_SUCCESS: VaStatus = 0;
-/// `VA_INVALID_ID` — also the "no surface" sentinel in a slot table.
+/// Also the "no surface" sentinel in a slot table. 0 is a plausible `VASurfaceID`.
 const VA_INVALID_ID: c_uint = 0xffff_ffff;
-/// `VA_PROGRESSIVE` — the only picture structure this rung's envelope contains.
+/// The only picture structure this rung's envelope contains.
 const VA_PROGRESSIVE: c_uint = 0x0001;
 
-/// `VAGenericValue` — 16 bytes, value at offset 8, align 8 (measured).
+/// `VAGenericValue`: 16 bytes, value at offset 8, align 8 (`pf-vaadec/layout-probe.c`).
 ///
-/// The C type's `value` is a union of `int`/`float`/`void*`/function pointer. Two
-/// consequences are written out here rather than left to a Rust `union` declaration:
-///
-/// * the union holds a pointer, so it is **eight-byte aligned** — which is why the
-///   enum ahead of it is followed by four bytes of padding, and why the whole thing
-///   is 16 bytes and not 12. The compile-time assertion below caught exactly that
-///   mistake in this file;
-/// * a Rust union initialised through its `i32` arm leaves the other four bytes
-///   **uninitialised**, and those are the bytes a driver reading the pointer arm
-///   would see. Naming the remainder and writing zero means everything crossing the
-///   FFI boundary was written by us.
+/// The C `value` is a union that includes a pointer, so it is eight-byte aligned —
+/// four bytes of padding after `kind`, 16 bytes total not 12. A Rust union written
+/// through the `i32` arm leaves the other four bytes uninitialised, and those are
+/// the bytes a driver reading the pointer arm would see. `_rest` is always zero so
+/// every byte crossing the FFI was written here.
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
 struct VaGenericValue {
     kind: c_int,
     _pad: u32,
-    /// The union's integer arm, first in the union — where `VAGenericValue.i` lives.
     i: i32,
-    /// The rest of the union. Always zero.
+    /// Always zero: the unused half of the C union.
     _rest: u32,
 }
 
@@ -204,13 +82,12 @@ struct VaSurfaceAttrib {
     value: VaGenericValue,
 }
 
-/// `VASurfaceAttribPixelFormat` / `VAGenericValueTypeInteger` /
-/// `VA_SURFACE_ATTRIB_SETTABLE` — measured by `pf-vaadec/layout-probe.c`.
+/// Measured by `pf-vaadec/layout-probe.c`.
 const VA_SURFACE_ATTRIB_PIXEL_FORMAT: c_int = 1;
 const VA_GENERIC_VALUE_TYPE_INTEGER: c_int = 1;
 const VA_SURFACE_ATTRIB_SETTABLE: c_uint = 0x0002;
 
-// The layouts these calls pass by value, measured (`pf-vaadec/layout-probe.c`).
+// Layouts passed by value, measured (`pf-vaadec/layout-probe.c`).
 const _: () = {
     assert!(size_of::<VaGenericValue>() == 16);
     assert!(std::mem::offset_of!(VaGenericValue, i) == 8);
@@ -219,9 +96,8 @@ const _: () = {
     assert!(std::mem::offset_of!(VaSurfaceAttrib, value) == 8);
 };
 
-/// The libva entry points this rung calls, resolved from `libva.so.2` and
-/// `libva-drm.so.2` at runtime (the same pattern the host's NVML and CUDA loaders
-/// use — no link-time dependency, absent library = clean refusal).
+/// libva entry points from `libva.so.2` / `libva-drm.so.2`. Absent library is a
+/// clean refusal, not a link error.
 struct Libva {
     _va: libloading::Library,
     _drm: libloading::Library,
@@ -278,8 +154,6 @@ struct Libva {
         unsafe extern "C" fn(VaDisplay, VaContextId, *mut VaBufferId, c_int) -> VaStatus,
     end_picture: unsafe extern "C" fn(VaDisplay, VaContextId) -> VaStatus,
     sync_surface: unsafe extern "C" fn(VaDisplay, VaSurfaceId) -> VaStatus,
-    /// `vaExportSurfaceHandle(dpy, surface_id, mem_type, flags, descriptor)` — five
-    /// parameters, and the descriptor's type is decided by `mem_type`.
     export_surface_handle:
         unsafe extern "C" fn(VaDisplay, VaSurfaceId, c_uint, c_uint, *mut c_void) -> VaStatus,
 }
@@ -296,12 +170,8 @@ impl Libva {
                 .context("libva.so.2 (no VAAPI runtime on this system)")?;
             let drm = libloading::Library::new("libva-drm.so.2")
                 .context("libva-drm.so.2 (no VAAPI DRM backend on this system)")?;
-            // Each symbol is resolved AT the field's own type — `Library::get` is
-            // generic, so the struct's declared signature is what `dlsym`'s pointer
-            // is read as. No `transmute` anywhere: a mistyped entry point is then a
-            // mismatch the reader can see next to the declaration rather than a cast
-            // that accepts anything. Bound with `let` (not inline in the literal) so
-            // each borrow of the `Library` ends before it is moved into the struct.
+            // Resolved at the field's own type — no `transmute`. Bound with `let`
+            // so each `Library` borrow ends before the handle moves into the struct.
             macro_rules! get {
                 ($lib:expr, $name:literal) => {
                     *$lib
@@ -354,8 +224,6 @@ impl Libva {
         }
     }
 
-    /// libva's own text for a status code, so a driver's reason reaches the log
-    /// instead of a bare number.
     fn err(&self, what: &str, status: VaStatus) -> anyhow::Error {
         // SAFETY: `vaErrorStr` is documented total — it returns a pointer into libva's
         // static string table for any input, valid while the library is loaded, which
@@ -384,18 +252,13 @@ impl Libva {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The display
-// ---------------------------------------------------------------------------
-
-/// An initialised `VADisplay` over a DRM render node.
+/// Initialised `VADisplay` over a DRM render node.
 struct Display {
     va: Libva,
     display: VaDisplay,
-    /// The render node. libva does NOT dup the fd it is given, so the display is
-    /// only valid while this is open — it is dropped after `vaTerminate`.
+    /// libva does not dup the fd; the display is valid only while this stays open,
+    /// and it is dropped after `vaTerminate`.
     node: Option<OwnedFd>,
-    /// Which node, for the field report that asks "which GPU decoded?".
     path: String,
     version: (c_int, c_int),
 }
@@ -407,17 +270,9 @@ struct Display {
 unsafe impl Send for Display {}
 
 impl Display {
-    /// Open a render node and initialise libva on it.
-    ///
-    /// `PUNKTFUNK_VAAPI_DEVICE` pins a node explicitly. Otherwise nodes are tried in
-    /// name order and the first that initialises wins — the rule libavcodec's VAAPI
-    /// device creation uses when given no device string, so a box that got hardware
-    /// decode from the libavcodec rung this replaced gets the same GPU here.
-    ///
-    /// ⚠ On a multi-GPU box that is not necessarily the PRESENTER's GPU, and a dmabuf
-    /// exported from one GPU and imported into another either fails outright or
-    /// copies. The libavcodec rung had the same property; the env pin is the
-    /// escape hatch, and the chosen node is logged so a field report can name it.
+    /// `PUNKTFUNK_VAAPI_DEVICE` pins a node; otherwise name order, first that
+    /// initialises wins. That GPU need not be the presenter's — a dmabuf across
+    /// GPUs fails or copies — so the pin is the escape hatch.
     fn open(va: Libva) -> Result<Display> {
         if let Some(pin) = std::env::var_os("PUNKTFUNK_VAAPI_DEVICE") {
             let path = pin.to_string_lossy().into_owned();
@@ -471,9 +326,7 @@ impl Display {
         )
     }
 
-    /// Try ONE node, borrowing the loaded library — so a box with several GPUs
-    /// dlopens libva once rather than once per node, and a failure carries only its
-    /// reason.
+    /// One node, borrowing the already-loaded library.
     fn probe(va: &Libva, path: &str) -> Result<(VaDisplay, OwnedFd, (c_int, c_int))> {
         let node = OwnedFd::from(
             std::fs::OpenOptions::new()
@@ -495,12 +348,9 @@ impl Display {
             let status = (va.initialize)(display, &mut major, &mut minor);
             if status != VA_STATUS_SUCCESS {
                 let e = va.err("vaInitialize", status);
-                // The display is unusable but still allocated; terminate it so the
-                // driver's own state goes with the attempt.
+                // Unusable but still allocated; terminate so the driver state goes too.
                 (va.terminate)(display);
-                // No path in the context: every caller already names the node it
-                // asked about, and on a box where nothing initialises that printed
-                // the node twice on every line.
+                // Callers already name the node; putting it in the error printed it twice.
                 return Err(e);
             }
             Ok((display, node, (major, minor)))
@@ -509,11 +359,8 @@ impl Display {
 }
 
 impl Display {
-    /// Does this device decode that profile?
-    ///
-    /// Asked BEFORE `vaCreateConfig` so an unsupported profile is a clean refusal
-    /// naming the profile, not a driver status code — the ladder falls through
-    /// either way, but only one of them tells a field report why.
+    /// Asked before `vaCreateConfig` so an unsupported profile is a named refusal,
+    /// not a driver status code.
     fn require_entrypoint(&self, profile: c_int) -> Result<()> {
         // SAFETY: `vaMaxNumEntrypoints` returns the array size this display needs;
         // the vector is allocated to exactly that and `count` is a local written
@@ -542,16 +389,10 @@ impl Display {
         Ok(())
     }
 
-    /// `vaCreateBuffer` with the data copied in — libva's documented behaviour for a
-    /// non-null `data` pointer, and what makes the caller's structs free to die
-    /// straight after.
-    ///
-    /// `size` is ONE element's size and `count` is how many follow, because that is
-    /// how `vaCreateBuffer` is declared and the two are not interchangeable. Every
-    /// H.264 and H.265 buffer here passes `count = 1`; **AV1's tile-parameter buffer
-    /// is the one exception** — libavcodec's `vaapi_av1.c` sends a whole tile group's
-    /// records in a single buffer beside that group's one data buffer, and a driver
-    /// reads `num_elements` records out of it.
+    /// libva copies a non-null `data` before returning, so the caller's structs may
+    /// die immediately. `size` is one element and `count` is how many — not
+    /// interchangeable. H.264/H.265 pass `count = 1`; AV1's tile-parameter buffer
+    /// is the exception (one buffer, a whole tile group's records).
     fn create_buffer(
         &self,
         context: VaContextId,
@@ -578,14 +419,8 @@ impl Display {
         Ok(id)
     }
 
-    /// Destroy every buffer of a submission.
-    ///
-    /// ⚠ Not optional and not automatic. `va.h` is explicit — *"The user must call
-    /// vaDestroyBuffer() to destroy a buffer"*, and *"a buffer can be re-used and
-    /// sent to the server by another Begin/Render/End sequence if vaDestroyBuffer()
-    /// is not called"*. The libva 0.x behaviour where `vaEndPicture` consumed them is
-    /// long gone; leaking two-plus buffers per picture at 60 fps exhausts the
-    /// driver's buffer store in minutes.
+    /// `vaEndPicture` does not consume buffers. `va.h` requires `vaDestroyBuffer`;
+    /// leaking two-plus per picture at 60 fps exhausts the driver's store.
     fn destroy_buffers(&self, buffers: &[VaBufferId]) {
         for &b in buffers {
             if b == VA_INVALID_ID {
@@ -608,16 +443,10 @@ impl Drop for Display {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The stream shape a session is built for
-// ---------------------------------------------------------------------------
-
-/// Everything about a stream that sizes or configures a session. Any change rebuilds
-/// the whole thing: the config, the context, the surface pool and the slot map all
-/// derive from it, and a half-rebuilt session hands out surfaces the pool does not
-/// have. (M5's review found the depth/chroma half of this missing on the D3D11 rung —
-/// the Windows host flips an HDR desktop to PQ in-band with a NEW SPS at unchanged
-/// size, so a shape keyed on size alone decodes 10-bit samples into an 8-bit pool.)
+/// Anything that sizes or configures a session. A change rebuilds the whole
+/// thing — a half-rebuilt session hands out surfaces the pool does not have.
+/// Depth and chroma belong here: an in-band SPS can flip 8-bit to 10-bit at
+/// unchanged size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StreamShape {
     coded_width: u32,
@@ -629,7 +458,6 @@ struct StreamShape {
     bit_depth: u8,
 }
 
-/// Which codec, and the planner that plans it.
 enum Planner {
     H264(Box<pf_vaadec::H264Planner>),
     H265(Box<pf_vaadec::H265Planner>),
@@ -646,32 +474,19 @@ impl Planner {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Surface release: the consumer's half of the zero-copy contract
-// ---------------------------------------------------------------------------
-
-/// What a shipped frame hands back when the consumer is done with it.
-///
-/// `generation` is what makes a renegotiation safe: a token from a retired pool
-/// names a surface index that no longer exists, and freeing that index in the NEW
-/// pool would hand a live surface to the decoder as if it were spare.
+/// Token a shipped frame hands back. A retired pool's index must not free a
+/// surface in the new one.
 #[derive(Debug, Clone, Copy)]
 struct VaRelease {
     surface: usize,
     generation: u64,
 }
 
-/// Holds one shipped picture's surface out of the decoder's free list, and owns the
-/// fds exported for it.
-///
-/// The presenter DUPS every fd it imports (`pf-presenter`'s dmabuf import says so in
-/// as many words) and drops the frame — and so this guard — only after the fence for
-/// its sampling submission has been waited. So "guard dropped" means "the GPU is done
-/// reading", which is exactly when the surface may be decoded into again.
+/// Pins one shipped picture's surface until the presenter has waited its fence.
+/// The presenter dups every imported fd; drop means the GPU is done reading.
 pub struct VaFrameGuard {
-    /// The exported PRIME fds, closed by this field's own drop. One per OBJECT, not
-    /// per plane: several planes routinely name one object, and closing a shared fd
-    /// twice would close an unrelated file.
+    /// One `OwnedFd` per OBJECT, not per plane. Planes share objects; closing a
+    /// shared fd twice would close an unrelated file.
     _fds: Vec<OwnedFd>,
     tx: mpsc::Sender<VaRelease>,
     release: VaRelease,
@@ -679,92 +494,51 @@ pub struct VaFrameGuard {
 
 impl Drop for VaFrameGuard {
     fn drop(&mut self) {
-        // A dead channel means the decoder is gone; there is nothing to release to.
         let _ = self.tx.send(self.release);
     }
 }
 
-// ---------------------------------------------------------------------------
-// The session
-// ---------------------------------------------------------------------------
-
-/// The facts that belong to a PICTURE rather than to the access unit that happens to
-/// bump it out of the DPB.
-///
-/// Recorded when the picture decodes, because that is the only moment they are known
-/// to be its own. On a reordering stream the access unit that displays a picture can
-/// be several units later and says something different about all three:
-///
-/// * **`keyframe`** was the whole defect. [`finish`] used to be handed the CURRENT
-///   access unit's `is_idr` and stamp it on whichever picture bumping displaced — so
-///   an IDR bumped out three units after it decoded arrived flagged `false`, and the
-///   later AU that drained the DPB flagged some ordinary trailing picture as a
-///   keyframe. That flag is [`crate::video::DecodedImage::is_keyframe`], the pump's
-///   post-loss re-anchor signal: mislabelled, the pump re-anchors on the wrong frame
-///   and keeps asking for a keyframe it has already been sent.
-/// * **`color`** is read per picture off the ACTIVE SPS/VUI and never latched,
-///   because the Windows host switches an HDR desktop to PQ/BT.2020 in-band with a
-///   new SPS. Stamping the displaying AU's description onto a picture decoded under
-///   the previous one is the same mistake one field along.
-/// * **`display`** is a per-FRAME value on AV1 (5.9.6's render size, which may change
-///   without a key frame), so a queued frame shown two units later would be cropped
-///   to whatever the newest frame asked for.
+/// Facts of the PICTURE, recorded at decode. A later display AU can disagree:
+/// `keyframe` is the pump's re-anchor; `color` is the active SPS/VUI (HDR can
+/// flip in-band); AV1 `display` is per-frame (5.9.6) and must not take the newest
+/// crop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PictureFacts {
-    /// Intra keyframe (IDR / AV1 key frame) — THIS picture's, not its display AU's.
     keyframe: bool,
     color: ColorDesc,
-    /// The DISPLAY region. A recorded fact rather than a read of `s.shape` because
-    /// AV1's is per-frame.
     display: (u32, u32),
 }
 
-/// A decoded picture that still owes an output, and where it lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingPicture {
     id: u64,
-    /// Pool index.
     surface: usize,
     facts: PictureFacts,
 }
 
-/// The live config, context and surface pool for one [`StreamShape`].
 struct Session {
     shape: StreamShape,
     config: VaConfigId,
     context: VaContextId,
-    /// The pool. Indices into this are what everything else here refers to.
     surfaces: Vec<VaSurfaceId>,
-    /// A consumer holds this surface. Cleared when its release token returns.
+    /// Cleared when the release token returns. Also covers a frame waiting in
+    /// [`NativeVaapiDecoder::deliverable`]: the guard returns the surface either way.
     held: Vec<bool>,
-    /// DPB slot → pool index, rebound at ACTIVATION (module docs). `None` for a slot
-    /// holding no picture.
+    /// DPB slot → pool index, rebound at activation. `None` if the slot holds nothing.
     slot_surface: Vec<Option<usize>>,
-    /// Decoded pictures the planner has not output yet. Separate from the slot
-    /// binding because the two end at different times: a non-reference picture
-    /// leaves the DPB immediately but still owes an output.
+    /// Separate from the slot binding: a non-reference picture leaves the DPB
+    /// immediately but still owes an output.
     pending: Vec<PendingPicture>,
     slots: pf_vaadec::SlotMap,
-    /// The surface fourcc the pool was created with (NV12 or P010).
     fourcc: u32,
     /// Bumped on every rebuild; stamped into release tokens.
     generation: u64,
 }
 
 impl Session {
-    /// A surface bound to no live picture, owed no output, and held by no consumer.
-    ///
-    /// All three conditions, because they end at different moments: a picture leaves
-    /// the DPB when the planner removes it, stops being pending when it is output,
-    /// and stops being held when the presenter's fence has been waited — and the
-    /// display is usually the LAST of the three.
-    ///
-    /// ⚠ `held` covers TWO claims since the deliverable queue existed: a frame the
-    /// consumer has, and a frame waiting in [`NativeVaapiDecoder::deliverable`] for a
-    /// later access unit. They are deliberately one flag, because a queued frame has
-    /// already been exported and its guard is what returns the surface either way —
-    /// so a frame dropped by [`trim_deliverable`] frees its surface by exactly the
-    /// same path a presented one does.
+    /// Free when unbound, not pending, and not held. Those three end at different
+    /// times; display is usually last. `held` also covers a queued deliverable —
+    /// [`trim_deliverable`] frees by the same guard-drop path as a presented frame.
     fn free_surface(&self) -> Option<usize> {
         (0..self.surfaces.len()).find(|i| {
             !self.held[*i]
@@ -773,12 +547,8 @@ impl Session {
         })
     }
 
-    /// Re-derive the slot bindings from the ledger: a slot the planner released
-    /// binds nothing.
-    ///
-    /// Done by reading the ledger rather than by tracking `removed` here, so there is
-    /// exactly one source of truth for which slots are live. `plan_to_va` has already
-    /// applied this AU's removals by the time it returns.
+    /// Bindings follow the ledger, not a local `removed` list. `plan_to_va` has
+    /// already applied this AU's removals.
     fn sync_slot_bindings(&mut self) {
         let mut live = vec![false; self.slot_surface.len()];
         for (slot, _) in self.slots.held() {
@@ -793,13 +563,8 @@ impl Session {
         }
     }
 
-    /// Slot → `VASurfaceID`, for the pictures the DPB holds RIGHT NOW.
-    ///
-    /// Built before the conversion, because references resolve against the
-    /// pre-removal state. An unbound slot reads [`VA_INVALID_ID`], never 0 — a zero
-    /// there is a plausible surface id, and the conversion only ever indexes slots
-    /// the ledger says are live, so the sentinel exists to make a bug in that
-    /// argument visible rather than silent.
+    /// Pre-removal DPB: references resolve against this. Unbound slots are
+    /// [`VA_INVALID_ID`], never 0 — 0 is a plausible surface id.
     fn surface_table(&self) -> Vec<VaSurfaceId> {
         self.slot_surface
             .iter()
@@ -807,31 +572,15 @@ impl Session {
             .collect()
     }
 
-    /// The decode target — pool index and `VASurfaceID` — together with the reference
-    /// table the conversion resolves against. `None` when the pool is exhausted.
-    ///
-    /// **The three are returned together because they are only safe together**, and
-    /// that is this rung's whole exemption from the aliasing defect the other two
-    /// backends had to defer their way out of (module docs). A free surface is by
-    /// definition a surface no slot binds; [`Self::surface_table`] is exactly what the
-    /// slots bind; so a target drawn from the same snapshot cannot appear in the table,
-    /// and no reference the conversion resolves through that table can be the surface
-    /// it is about to write.
-    ///
-    /// ⚠ Taking the two at DIFFERENT moments is the defect. References must resolve
-    /// against the store as it stood BEFORE this access unit's removals, so the table
-    /// has to be the pre-removal one; and a free list consulted AFTER those removals
-    /// offers the displaced picture's surface, which the pre-removal table still names.
-    /// `taking_the_free_surface_after_the_removals_would_hand_out_a_referenced_surface`
-    /// is that mismatch, made to happen. Returning a tuple is what stops a future edit
-    /// from reintroducing it by moving one call and not the other.
+    /// Target and reference table from one snapshot: a free surface is unbound, so
+    /// it cannot appear in the table. Split them and the free list after removals
+    /// offers a surface the pre-removal table still names.
     fn acquire_target(&self) -> Option<(usize, VaSurfaceId, Vec<VaSurfaceId>)> {
         let index = self.free_surface()?;
         Some((index, self.surfaces[index], self.surface_table()))
     }
 
-    /// Release every libva object this session owns, in creation-reverse order.
-    /// Called explicitly (a `Drop` here could not reach the display).
+    /// Creation-reverse order. Explicit: a `Drop` here could not reach the display.
     fn destroy(mut self, d: &Display) {
         // SAFETY: every handle was created on this display by `build` and is
         // destroyed exactly once — `destroy` consumes `self`. Surfaces are freed
@@ -847,7 +596,6 @@ impl Session {
         }
     }
 
-    /// Build a config, a surface pool and a context for one stream shape.
     fn build(d: &Display, codec: pf_vaadec::Codec, shape: StreamShape) -> Result<Session> {
         let profile = pf_vaadec::profile_for(codec, shape.chroma_format_idc, shape.bit_depth)
             .map_err(|e| anyhow!("{e}"))?;
@@ -860,10 +608,8 @@ impl Session {
         };
         d.require_entrypoint(profile.value)?;
 
-        // `VAConfigAttribRTFormat` (= 0, measured) is set explicitly rather than left
-        // to the driver's default: on a Main 10 stream the default is the 8-bit
-        // format, and a decoder writing 10-bit samples into an 8-bit surface is the
-        // silent-narrowing failure this program refuses everywhere else.
+        // Named rather than default: on Main 10 the driver default is 8-bit, and
+        // writing 10-bit samples into an 8-bit surface is silent narrowing.
         let mut attrib = VaConfigAttrib {
             kind: VA_CONFIG_ATTRIB_RT_FORMAT,
             value: rt_format,
@@ -882,8 +628,7 @@ impl Session {
             )
         })?;
 
-        // From here every early return must destroy what has been created, so the
-        // fallible tail is written as a closure and unwound once.
+        // Every early return must destroy what was created; one closure, one unwind.
         let built = (|| -> Result<Session> {
             let count = pf_vaadec::surface_count(shape.max_dpb_frames);
             let mut surfaces: Vec<VaSurfaceId> = vec![VA_INVALID_ID; count];
@@ -893,17 +638,14 @@ impl Session {
                 value: VaGenericValue {
                     kind: VA_GENERIC_VALUE_TYPE_INTEGER,
                     _pad: 0,
-                    // The fourcc is an i32 in libva's integer arm; the top bit is
-                    // clear for every fourcc here, so the cast is value-preserving.
+                    // Integer arm is i32; every fourcc here has the top bit clear.
                     i: fourcc as i32,
                     _rest: 0,
                 },
             };
-            // Surfaces are allocated at the CODED size. The conformance window is a
-            // display-time crop, and a pool sized to the display region would be
-            // short by the codec's granule padding — the scar that smears rows.
-            // SAFETY: live display; the surface array and the attribute are locals
-            // that outlive the call and the counts match their lengths.
+            // Coded size: a display-sized pool is short by granule padding and smears rows.
+            // SAFETY: live display; the surface array and the attribute outlive the
+            // call and the counts match their lengths.
             d.va.check("vaCreateSurfaces", unsafe {
                 (d.va.create_surfaces)(
                     d.display,
@@ -980,7 +722,7 @@ impl Session {
     }
 }
 
-/// `VAConfigAttrib` — 8 bytes, `{type, value}` at 0 and 4 (measured).
+/// 8 bytes, `{type, value}` at 0 and 4 (`pf-vaadec/layout-probe.c`).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct VaConfigAttrib {
@@ -988,13 +730,11 @@ struct VaConfigAttrib {
     value: c_uint,
 }
 
-/// `VAConfigAttribRTFormat` — measured, and 0 is a real enumerator here rather than
-/// a "left unset", which is why it is named.
+/// Measured. 0 is a real enumerator, not "left unset".
 const VA_CONFIG_ATTRIB_RT_FORMAT: c_int = 0;
 
-/// `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2` — the export memory type that yields a
-/// [`pf_vaadec::VaDrmPrimeSurfaceDescriptor`]. Measured; the older
-/// `..._DRM_PRIME` (0x2000_0000) hands back a different, smaller structure.
+/// Yields [`pf_vaadec::VaDrmPrimeSurfaceDescriptor`]. The older `DRM_PRIME`
+/// (0x2000_0000) hands back a different, smaller structure.
 const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: c_uint = 0x4000_0000;
 
 const _: () = {
@@ -1002,96 +742,25 @@ const _: () = {
     assert!(std::mem::offset_of!(VaConfigAttrib, value) == 4);
 };
 
-// ---------------------------------------------------------------------------
-// The decoder
-// ---------------------------------------------------------------------------
-
-/// How many display-ready frames this rung holds back for LATER access units before it
-/// starts dropping the oldest (see [`trim_deliverable`]).
-///
-/// **The DPB's own depth, and derived rather than chosen.** The deepest burst one
-/// access unit can bump is the whole DPB plus the picture that caused the bump — an
-/// IDR with `no_output_of_prior_pics_flag` clear draining a full buffer, which is
-/// exactly what the vendored H.264 vector does three times (measured: seven pictures
-/// output by one AU, on a stream whose `max_dpb_frames` is seven). One of them ships
-/// immediately, so the CARRY-OVER a bump can leave is the DPB's depth and no more.
-///
-/// It costs the pool **at most one surface**, and that is a property of THIS rung
-/// rather than a hope. A surface is claimed three separate ways here — a live slot, a
-/// pending output, a `held` frame — and a bumped picture MOVES from the first two to
-/// the third: [`settle`] takes it out of `pending` in the same breath the bump
-/// released its slot, and [`ship`] then marks it `held`. So `|slots ∪ pending| +
-/// |queued|` is conserved across a bump, and between bumps it is flat — every access
-/// unit decodes one picture into the pool and ships one frame out of the queue.
-/// Measured by [`the_queue_never_needs_a_surface_the_pool_does_not_have`] over the
-/// real vectors with no device: the deepest simultaneous claim is **9 of a 16-surface
-/// pool** on H.264 — where the queue's marginal cost is exactly zero, on the vector
-/// with the deepest bursts there are — and 8 of 14 on both HEVC vectors, one more
-/// than the same walk with no queue at all. Six or seven of the eight surfaces
-/// [`pf_vaadec::config::PRESENTER_HEADROOM`] exists for are still there for the
-/// consumer.
-///
-/// ⚠ This is where it diverges from the Vulkan rung's [`crate::video_vk_native`]
-/// `MAX_DELIVERABLE`, which is `HOLD_HEADROOM - PIPELINE_HOLD` = **1** — and the
-/// difference is real, not a disagreement. There a delivered-but-unreleased frame is
-/// counted against `picture_count = required_slots + HOLD_HEADROOM` ON TOP of the
-/// DPB's own residency (`build_frame` marks the picture held the moment the decoder
-/// declares it ready), so its queue and the pipeline share one budget of eight. Here
-/// they do not share: the queue inherits the claim the DPB just gave up. A bound of
-/// one would have left this rung dropping five of every seven-picture drain — 235 of
-/// 250 on the H.264 vector instead of 250, which is most of the defect this fix
-/// exists to end still in place.
-///
-/// It is a bound and not a plain queue for the reason the Vulkan rung gives at
-/// length: "transient" is an assumption about the HOST, and a stream that reliably
-/// made two frames displayable per access unit would grow this by one per AU until
-/// the pool ran out — after which every AU refuses with "surface pool exhausted",
-/// three in a second demote the rung, and nothing in the log would say the cause was
-/// a queue that could never drain.
-///
-/// ⚠ On H.264 and H.265 that shape cannot arise and the bound is pure defence: an
-/// access unit decodes at most ONE picture, so it can only ever output what earlier
-/// units decoded, and the queue sheds one per unit — which is why the vendored
-/// vectors drop nothing at any depth. An AV1 temporal unit may decode several, and
-/// that is where the bound is load-bearing rather than decorative. On the wire none
-/// of it engages: punktfunk hosts emit zero-reorder low-delay output, so `outputs`
-/// never holds more than one picture and the queue is empty on every single access
-/// unit.
+/// Carry-over bound: the DPB's own depth. A bump can leave at most that many
+/// frames behind the one that ships now. The queue inherits the DPB claim
+/// ([`settle`] then [`ship`]), so it costs the pool at most one surface — unlike
+/// Vulkan's `MAX_DELIVERABLE = 1`, where a delivered frame is extra residency.
+/// Unbounded, a two-shown-per-AU stream grows until the pool is exhausted and
+/// demotes the rung. H.264/H.265 decode one picture per AU so the bound is
+/// defence; AV1 temporal units may decode several. Hosts emit zero-reorder, so
+/// the queue is empty on the wire. See `the_queue_never_needs_a_surface_the_pool_does_not_have`.
 fn max_deliverable(s: &Session) -> usize {
     s.shape.max_dpb_frames
 }
 
-/// One `warn` per this many dropped deliverable frames, after the first.
-///
-/// The same rate limit and the same reasoning as the Vulkan rung's: the shape that
-/// drops at all drops on EVERY access unit, and a warn per frame at frame rate buries
-/// the log it exists to explain — while a single line at the start of a session that
-/// then goes quiet reads as a one-off. So: the first drop in full, then a heartbeat
-/// with the running total (~every 5 s at 60 fps).
+/// First drop in full, then a heartbeat (~every 5 s at 60 fps). A drop-every-AU
+/// shape would bury the log at frame rate.
 const DROP_WARN_EVERY: u64 = 300;
 
-/// Trim the deliverable queue to `cap` by dropping from the FRONT, returning the
-/// dropped frames so the caller can count them.
-///
-/// Oldest-first, for the Vulkan rung's reason: by the time a queue this deep exists
-/// the front frame is several access units stale and the consumer one stage on is
-/// itself newest-wins (the pump's `force_send` overwrites an unconsumed frame).
-/// Dropping the NEWEST would keep the stalest picture and present the stream in
-/// ever-lagging order; dropping the oldest keeps display order for everything that
-/// survives and costs the frames that were already too late to matter.
-///
-/// ⚠ Called AFTER this access unit's own frame has been taken off the front, so `cap`
-/// bounds the CARRY-OVER — what is held back for later access units — exactly as
-/// [`max_deliverable`] says. Trimming before the take would make a unit that produced
-/// two outputs drop the FIRST of them and ship the second, which is display order
-/// inverted inside a single access unit.
-///
-/// A dropped frame needs no explicit release: its [`VaFrameGuard`] closes the exported
-/// fds and returns the surface to the free list on drop, which is the same path a
-/// presented frame takes. Returning them rather than dropping them here is what lets
-/// the caller count and log before they go.
-///
-/// Pure over the queue, so the bound is CPU-testable without a device.
+/// Drop oldest first after this AU's own frame is taken off the front, so `cap`
+/// bounds carry-over. Trimming before the take would invert display order inside
+/// one AU. Returned frames drop via [`VaFrameGuard`]; the caller counts first.
 fn trim_deliverable(
     queue: &mut std::collections::VecDeque<DmabufFrame>,
     cap: usize,
@@ -1100,56 +769,34 @@ fn trim_deliverable(
     while queue.len() > cap {
         match queue.pop_front() {
             Some(frame) => dropped.push(frame),
-            // Unreachable: `len() > cap >= 0` means the queue is non-empty. Written as
-            // a break rather than an `expect` so a bound of 0 on an empty queue could
-            // never be a panic in the decode path.
+            // `len() > cap` means non-empty. Break, not `expect`: a bound of 0
+            // on an empty queue must not panic in the decode path.
             None => break,
         }
     }
     dropped
 }
 
-/// The native VAAPI rung.
 pub(crate) struct NativeVaapiDecoder {
     display: Display,
     planner: Planner,
     session: Option<Session>,
-    /// Display-ready frames not yet handed to the pump, oldest first.
-    ///
-    /// [`Self::decode`] is one access unit in, at most one frame out — the pump's
-    /// contract — while one access unit can bump SEVERAL pictures out of the DPB. The
-    /// surplus waits here for the access units that output nothing, which on a
-    /// reordering stream is exactly where the reorder buffer refills. Bounded by
-    /// [`max_deliverable`]; empty on every access unit of a punktfunk stream.
-    ///
-    /// Every frame in here holds a pool surface through its own guard, and survives a
-    /// session renegotiation intact for the same reason a consumer-held frame does:
-    /// the exported PRIME fds hold their own reference on the underlying buffer
-    /// object, so the pixels outlive the `VASurface` (see [`ensure_session`]) and the
-    /// stale-generation release token is counted rather than applied.
+    /// Surplus of a multi-picture bump, oldest first. Bounded by [`max_deliverable`].
+    /// PRIME fds keep pixels alive across a rebuild; stale-generation tokens are
+    /// counted, not applied.
     deliverable: std::collections::VecDeque<DmabufFrame>,
     health: DecodeHealth,
-    /// A concealed AU asks the pump for a re-anchor, through the same one throttle
-    /// every other ask uses. Drained by [`Self::take_recovery_request`].
     recovery_request: bool,
     generation: u64,
     release_tx: mpsc::Sender<VaRelease>,
     release_rx: mpsc::Receiver<VaRelease>,
-    /// Pool-index releases that arrived for a RETIRED generation, so the count of
-    /// what is still outstanding is honest in the log.
+    /// Releases for a retired generation. Counted so the outstanding log stays honest.
     stale_releases: u64,
 }
 
 impl NativeVaapiDecoder {
-    /// Build the rung, refusing anything this device or this crate cannot decode
-    /// BEFORE the ladder commits to it.
-    ///
-    /// The refusal is at construction on purpose, and it is M3 WP-2's lesson: a
-    /// backend that accepts a session and then refuses its first access unit has
-    /// already cost the ladder its fall-through — the refusal arrives as a decode
-    /// error, burns the demotion streak, and lands the session on a rung far below
-    /// the one it would have had. So the negotiated [`StreamFormat`] is probed here,
-    /// where "no" simply means the next rung is tried.
+    /// Probe [`StreamFormat`] here. A first-AU refusal is a decode error, burns the
+    /// demotion streak, and skips the ladder's fall-through.
     pub(crate) fn new(codec: pf_vaadec::Codec, stream: StreamFormat) -> Result<NativeVaapiDecoder> {
         let depth = stream.bit_depth;
         pf_vaadec::profile_for(codec, stream.chroma_format_idc, depth)
@@ -1169,12 +816,8 @@ impl NativeVaapiDecoder {
             session: None,
             deliverable: std::collections::VecDeque::new(),
             health: DecodeHealth {
-                // VAAPI has no per-picture decode-status query — there is no
-                // counterpart to Vulkan's `RESULT_STATUS_ONLY`, exactly as on
-                // D3D11VA. Saying so is what keeps "clean" and "unmeasured"
-                // distinguishable on the stats line: `failed` is structurally 0
-                // here, and `DecodeHealth::note` enforces that rather than trusting
-                // this rung to never pass a verdict it cannot have.
+                // No per-picture status query. `failed` is structurally 0;
+                // `DecodeHealth::note` enforces that.
                 status_queries: false,
                 ..DecodeHealth::default()
             },
@@ -1194,12 +837,10 @@ impl NativeVaapiDecoder {
         self.health
     }
 
-    /// Drain the re-anchor request a concealed AU raised.
     pub(crate) fn take_recovery_request(&mut self) -> bool {
         std::mem::take(&mut self.recovery_request)
     }
 
-    /// Return surfaces the consumer has finished with to the free list.
     fn drain_releases(&mut self) {
         drain_releases_into(
             &self.release_rx,
@@ -1208,72 +849,28 @@ impl NativeVaapiDecoder {
         );
     }
 
-    /// Decode one access unit.
-    ///
-    /// One access unit in, **at most one displayable frame out** — the pump's
-    /// contract. An access unit that bumps SEVERAL pictures out of the DPB delivers
-    /// the first of them and holds the rest in [`Self::deliverable`] for the access
-    /// units that output nothing, which on a reordering stream is exactly where the
-    /// reorder buffer refills. Nothing is discarded for want of a return slot; the
-    /// only frames that go unshown are the ones a queue past [`max_deliverable`]
-    /// drops, and that bound never engages on a punktfunk stream.
-    ///
-    /// ⚠ Until 2026-08-07 this shipped `outputs.last()` and RETIRED the rest without
-    /// ever displaying them, which cost the vendored vectors 25 frames of 250 on
-    /// H.264 and 46 of 250 on H.265. It could not bite punktfunk's own streams —
-    /// zero-reorder low-delay output never bumps two pictures at once — but it is
-    /// exactly the class of defect this program exists to find, and the three
-    /// hardware legs measured it.
-    ///
-    /// `Ok(None)` means "no picture from this AU", and covers four different
-    /// things, deliberately none of them errors:
-    ///
-    /// * the planner output nothing yet and the queue is empty (reordering, or the
-    ///   very first AUs);
-    /// * the picture was CONCEALED — an integrity warning says a reference was
-    ///   substituted, so the output is released unshown, [`DecodeHealth::damaged`]
-    ///   records it and a re-anchor is requested through the pump's one throttle.
-    ///   Not an error, because three errors in a second demote the rung on exactly
-    ///   the lossy links it exists to diagnose — libavcodec concealed the same event
-    ///   silently and kept its job;
-    /// * an HEVC RASL picture skipped after an open-GOP join. `PlanError::RaslSkipped`
-    ///   is the spec's own answer (8.1.3 NOTE) and must NEVER reach the reanchor
-    ///   path — mapping it to an error would make every open-GOP join beg the host
-    ///   for a keyframe it has no reason to send;
-    /// * the whole session was refused before a pool existed.
+    /// One AU in, at most one frame out. Surplus waits in [`Self::deliverable`].
+    /// `Ok(None)` is not an error: buffering, concealment (re-anchor, not demotion),
+    /// HEVC RASL skip (8.1.3 NOTE — must not re-anchor), or no session yet.
     pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<DmabufFrame>> {
         self.drain_releases();
         let result = match self.planner {
             Planner::H264(_) => self.decode_h264(au),
             Planner::H265(_) => self.decode_h265(au),
-            // ⚠ An AV1 "access unit" is a TEMPORAL UNIT and may carry several
-            // frames; this arm is the only one whose planner returns a `Vec`.
+            // AV1's "AU" is a temporal unit and may carry several frames.
             Planner::Av1(_) => self.decode_av1(au),
         };
-        // ONE verdict per access unit, folded here and nowhere else. Damage is
-        // reported by the codec arm rather than counted inside it, so a failure
-        // AFTER a clean plan (a submission, an export) is a refusal and only a
-        // refusal — not a clean AU that also refused, which would reset the run
-        // counter a support engineer reads first.
+        // One verdict, here. Damage is reported by the codec arm; a failure after a
+        // clean plan is a refusal only — not also a clean AU that would reset the run.
         match &result {
             Ok((_, damaged)) => self.health.note(*damaged, false, 0),
             Err(_) => self.health.note(false, true, 0),
         }
-        // A REFUSED access unit puts nothing on screen, and that has to hold for the
-        // frames it had already exported before it failed: the codec arm returns them
-        // in its `Err`-free half only, so an error path drops them here by never
-        // reaching the queue at all.
+        // Codec arms return exported frames only on `Ok`; an error never reaches the queue.
         let (fresh, damaged) = result?;
         if damaged {
-            // Concealment answers `Ok(None)` and does NOT drain the queue — the same
-            // order the Vulkan rung keeps, and it is load-bearing rather than tidy.
-            // `clears_demotion_streak(delivered, concealed)` is `delivered || !concealed`:
-            // shipping a queued frame here would report `delivered` on a concealed AU
-            // and zero the streak, which is exactly the escape hatch that keeps a rung
-            // concealing FOREVER from holding a frozen picture with no way down. The
-            // queued frames are clean pictures from earlier units and lose nothing by
-            // waiting — the pump has just armed a freeze that withholds a non-keyframe
-            // anyway — so they ship on the next clean access unit.
+            // Do not drain the queue. Shipping here reports `delivered` on a concealed
+            // AU and zeros the demotion streak (`delivered || !concealed`).
             debug_assert!(
                 fresh.is_empty(),
                 "finish ships nothing from a damaged access unit"
@@ -1284,20 +881,12 @@ impl NativeVaapiDecoder {
         Ok(self.take_deliverable())
     }
 
-    /// Hand the pump the oldest display-ready frame and bound what stays behind.
-    ///
-    /// This access unit's own frame comes off the FRONT first, because the bound is on
-    /// the CARRY-OVER (see [`trim_deliverable`]): a unit that produced two outputs
-    /// ships the first and holds the second, rather than dropping the first to ship
-    /// the second and inverting display order inside one access unit.
+    /// This AU's frame off the front first so [`trim_deliverable`] bounds carry-over.
     fn take_deliverable(&mut self) -> Option<DmabufFrame> {
         let shipped = self.deliverable.pop_front();
-        // No session means no pool, so there is nothing the queue could legitimately
-        // still be holding; a cap of 0 is the honest reading of "no surfaces exist"
-        // rather than a magic number.
+        // No session means no pool; cap 0 is "no surfaces exist".
         let cap = self.session.as_ref().map_or(0, max_deliverable);
-        // The PRE-trim depth: how far past the bound the queue actually got. Read
-        // after the trim it would be the constant `cap` every single time.
+        // Pre-trim depth: after the trim this would be `cap` every time.
         let queued = self.deliverable.len();
         for frame in trim_deliverable(&mut self.deliverable, cap) {
             self.health.note_dropped();
@@ -1310,42 +899,15 @@ impl NativeVaapiDecoder {
                      dropping the oldest so its surface is not held forever"
                 );
             }
-            // The guard closes the exported fds and returns the surface; nothing else
-            // is owed.
             drop(frame);
         }
         shipped
     }
 
-    /// Drain the DPB: every picture the planner is still buffering becomes
-    /// display-ready, in display order, and every id it held is released.
-    ///
-    /// # What "end of stream" means for this rung
-    ///
-    /// It has no end-of-stream signal and cannot have one: the pump feeds access units
-    /// until the session ends and then drops the decoder, and there is no call after
-    /// the last access unit through which a frame could still reach the screen. So the
-    /// two callers are the two honest ones, and they are the SAME walk rather than a
-    /// production path and an untested teardown path:
-    ///
-    /// * **Teardown** ([`Drop`]), where nothing can be presented and the job is to
-    ///   release — the queue's surfaces AND the DPB's — before the session destroys
-    ///   the pool underneath them.
-    /// * **A caller that KNOWS the stream ended**, which today is the conformance
-    ///   harness. Without this the vendored vectors lose their tail outright — seven
-    ///   pictures of 250 on H.264, one on H.265, two of 50 on Main 10, decoded and
-    ///   buffered for reorder and never asked for — plus whatever the deliverable
-    ///   queue is still carrying, which is why the counts the legs print (7 / 2 / 2)
-    ///   are not the DPB's tail alone.
-    ///
-    /// AV1 has no flush and needs none: it shows at most one frame per temporal unit
-    /// and buffers no output between them (`Av1Planner` has no counterpart to the
-    /// H.26x planners' `flush`), so its tail is empty by construction — which the
-    /// hardware leg's 250 of 250 says out loud.
-    ///
-    /// Best-effort by design. An export that fails at teardown must not panic and has
-    /// nothing to return an error to; it is logged and the picture is dropped, and the
-    /// harness sees it as a frame count that does not add up, which is loud enough.
+    /// Drain the DPB in display order. The pump has no EOS; callers are [`Drop`]
+    /// (release before the pool dies) and the conformance harness. AV1 shows at
+    /// most one frame per temporal unit and has no planner flush. Export failure
+    /// at teardown is logged, not panicked.
     pub(crate) fn flush(&mut self) -> Vec<DmabufFrame> {
         self.drain_releases();
         let mut out: Vec<DmabufFrame> = std::mem::take(&mut self.deliverable).into();
@@ -1359,9 +921,7 @@ impl NativeVaapiDecoder {
         let Some(s) = session.as_mut() else {
             return out;
         };
-        // The two H.26x planners' `flush` return the same SHAPE under two different
-        // types (`h264::DpbUpdate` and `h265::DpbUpdate`), which is why this is two
-        // arms and not one generic call.
+        // Two types (`h264::DpbUpdate` / `h265::DpbUpdate`), same shape.
         let (outputs, removed) = match planner {
             Planner::H264(p) => {
                 let update = p.flush();
@@ -1384,9 +944,7 @@ impl NativeVaapiDecoder {
                 ),
             }
         }
-        // No conversion runs on this path, so this is the only place the planner's
-        // releases can reach the ledger — the same reason `show_existing_av1` applies
-        // them by hand. Without it a resumed stream finds every slot taken.
+        // No conversion here; without this a resumed stream finds every slot taken.
         for id in &removed {
             s.slots.release(*id);
         }
@@ -1428,9 +986,7 @@ impl NativeVaapiDecoder {
         let converted = pf_vaadec::plan_to_va(&plan, au, &mut s.slots, &table, target)
             .map_err(|e| anyhow!("{e}"))?;
 
-        // Recorded HERE, with the picture that is decoding, rather than read again at
-        // display time: on a reordering stream the access unit that displays this
-        // picture is a later one and says something different (see [`PictureFacts`]).
+        // This picture's facts, not the later display AU's ([`PictureFacts`]).
         let facts = PictureFacts {
             keyframe: plan.picture.is_idr,
             color: colour_of(&plan.picture.colour),
@@ -1466,9 +1022,7 @@ impl NativeVaapiDecoder {
         let plan = match &mut self.planner {
             Planner::H265(p) => match p.plan_au(au) {
                 Ok(plan) => plan,
-                // The contract pf-bitstream's h265 module docs record for this
-                // wiring: a skipped RASL picture is an Ok-skip, never an error and
-                // never a re-anchor. See [`Self::decode`].
+                // Spec 8.1.3 NOTE: skipped RASL is Ok, never a re-anchor.
                 Err(pf_vaadec::PlanErrorH265::RaslSkipped { .. }) => {
                     return Ok((Vec::new(), false))
                 }
@@ -1508,8 +1062,6 @@ impl NativeVaapiDecoder {
         let converted = pf_vaadec::plan_to_va_h265(&plan, au, &mut s.slots, &table, target)
             .map_err(|e| anyhow!("{e}"))?;
 
-        // This picture's own facts, not the facts of whichever later access unit
-        // bumps it out (see [`PictureFacts`]).
         let facts = PictureFacts {
             keyframe: plan.picture.is_idr,
             color: colour_of(&plan.picture.colour),
@@ -1517,12 +1069,8 @@ impl NativeVaapiDecoder {
         };
         bind_setup(s, plan.dpb.stored, Some(free), facts);
 
-        // The IQ matrix is submitted ONLY where the sequence codes scaling lists.
-        // Handing the driver an all-zero matrix on a "use the defaults" stream is
-        // not a harmless extra buffer: the driver must apply what it is given, every
-        // residual dequantises to zero, and the picture drifts to flat prediction.
-        // (M5's review caught exactly this on the DXVA rung, where the buffer was
-        // unconditional. The conversion answers `None` here so the rung cannot.)
+        // Only when the sequence codes scaling lists. An all-zero matrix on a
+        // "use the defaults" stream dequantises every residual to zero.
         let iq = converted.iq_matrix.as_ref().map(as_ptr);
         let slices = one_record_each(&converted.slices, &converted.slice_data)?;
         submit(
@@ -1547,50 +1095,12 @@ impl NativeVaapiDecoder {
         Ok((frames, damaged))
     }
 
-    /// One AV1 **temporal unit**: decode every frame in it, present at most one.
-    ///
-    /// This is the whole of what AV1 adds to this rung's contract, and it is the
-    /// SPEC's shape rather than an assumption about punktfunk hosts. A temporal unit
-    /// may carry several frame headers; the vendored 250-packet conformance vector
-    /// decodes **274 frames** and shows 250, so 24 of its units carry a hidden
-    /// picture (an alt-ref later frames predict from) ahead of the one that
-    /// displays. Those hidden frames must be DECODED — they are references — and
-    /// must never reach the presenter, which would show each of them for a frame and
-    /// stutter every time.
-    ///
-    /// AV1 admits at most one shown frame per temporal unit, so "the last shown
-    /// frame wins" cannot silently drop a picture.
-    ///
-    /// # Concealment is per UNIT here, per picture on the other two codecs
-    ///
-    /// A damaged frame is still CONVERTED and still SUBMITTED, exactly as the H.264
-    /// and H.265 arms above do it. Converting is what assigns its ledger slot, and
-    /// skipping that would desynchronise this rung's slot map from the planner's store
-    /// and turn every later reference to it into a hard `Err` — a demotion streak
-    /// earned by one lost packet. Submitting is what puts a decoded picture in the
-    /// surface, which matters because a hidden frame's surface is a REFERENCE for
-    /// later frames and can still be exported by a later `show_existing_frame`; a
-    /// surface the driver never wrote is uninitialised video memory, not a stale
-    /// picture.
-    ///
-    /// What concealment does instead is withhold the DISPLAY: nothing from the unit
-    /// is presented, because a shown frame that predicts from a concealed reference in
-    /// the same unit is not fit to display either, and the unit is the smallest thing
-    /// this rung can honestly drop.
-    ///
-    /// ⚠ Submitting a frame whose references were lost needs one thing from the
-    /// conversion, and `va_dec_av1.h:352` is where it comes from: *"Driver is not
-    /// responsible to validate reference frames' id … If missing frame is identified,
-    /// application may choose to perform error recovery by pointing problematic index
-    /// to an alternative frame buffer."* So `plan_to_va_av1` points every empty
-    /// `ref_frame_map` entry at a live surface and reports which
-    /// (`DecodePlanVaAv1::substituted_refs`); no `VA_INVALID_ID` reaches a driver that
-    /// says it will not check.
-    ///
-    /// The one frame that is NOT submitted is the one with nothing to submit: an
-    /// access unit whose tile groups were lost. That refusal is handled in
-    /// [`Self::frame_av1`] and binds no surface at all, so its picture can be neither
-    /// exported nor predicted from.
+    /// One temporal unit: decode every frame, present at most one. Hidden frames
+    /// are references and must be decoded; they must not reach the presenter.
+    /// Concealment is per unit: still convert and submit (slot map stays in sync;
+    /// a later `show_existing_frame` must not export unwritten memory) but withhold
+    /// display. Lost-ref slots get a live surface (`va_dec_av1.h:352`); lost tile
+    /// groups bind nothing ([`Self::frame_av1`]).
     fn decode_av1(&mut self, au: &[u8]) -> Result<(Vec<DmabufFrame>, bool)> {
         let plans = match &mut self.planner {
             Planner::Av1(p) => p.plan_au(au).map_err(|e| anyhow!("{e}"))?,
@@ -1610,33 +1120,23 @@ impl NativeVaapiDecoder {
             shown.extend(self.frame_av1(au, plan, damaged)?);
         }
         if damaged_unit {
-            // A frame may already have been exported before a LATER frame of the
-            // same unit turned out to be damaged. Dropping it here is safe rather
-            // than merely tolerable: `DmabufFrame`'s guard closes its fds and returns
-            // the surface to the free list, which is exactly what an unshown picture
-            // should do.
+            // A later frame of the same unit may have been the damaged one; the
+            // guard returns already-exported surfaces.
             drop(shown);
             return Ok((Vec::new(), true));
         }
         Ok((shown, false))
     }
 
-    /// One frame of a temporal unit: converted, submitted, and exported only if it is
-    /// the frame the unit displays and the unit is clean.
-    ///
-    /// `damaged` changes two things and neither of them is the submission. It decides
-    /// whether the picture may be SHOWN (through [`finish`]), and it decides how a
-    /// conversion refusal is answered: a lost tile group on an already-damaged plan is
-    /// concealed, the same refusal on a plan that arrived whole is a defect and stays
-    /// an error.
+    /// Convert and submit. `damaged` gates display ([`finish`]) and turns a lost
+    /// tile group on an already-damaged plan into concealment rather than an error.
     fn frame_av1(
         &mut self,
         au: &[u8],
         plan: &pf_vaadec::AuPlanAv1,
         damaged: bool,
     ) -> Result<Vec<DmabufFrame>> {
-        // `show_existing_frame` decodes nothing at all: it re-displays a picture some
-        // earlier hidden frame put in a reference slot.
+        // Re-display a picture an earlier hidden frame left in a reference slot.
         if plan.dpb.stored.is_none() {
             return self.show_existing_av1(plan, damaged);
         }
@@ -1651,23 +1151,9 @@ impl NativeVaapiDecoder {
             shape,
             &mut self.generation,
         )?;
-        // AV1's display region is the RENDER size, not the coded size — and it is a
-        // per-FRAME value, so it cannot live in the session shape the way a
-        // conformance window does. Which is also why it belongs to the PICTURE: a
-        // frame held back in the deliverable queue must still be shown at the region
-        // ITS header asked for, not the newest one's.
-        //
-        // ⚠ CLAMPED to the decoded picture. AV1 5.9.6 puts no upper bound on the
-        // render size — a stream may legally ask to be shown at more than it coded —
-        // and an unclamped crop would hand the presenter a region larger than the
-        // surface. The same clamp is in the Vulkan and D3D11 rungs.
-        //
-        // ⚠ Treated as a CROP, which is what both other native rungs do. libavcodec
-        // instead keeps the frame at `upscaled_width` x `frame_height` and expresses
-        // the render size as a sample aspect RATIO, so on a stream where the two
-        // differ this rung shows less picture than libavcodec would. No
-        // punktfunk host emits such a stream; the choice is here so the three native
-        // rungs answer alike, not because it is settled.
+        // Per-frame render size, clamped to the coded picture: 5.9.6 has no upper
+        // bound, and an unclamped crop would exceed the surface. Crop, not SAR —
+        // same as the other native rungs, unlike libavcodec.
         let facts = PictureFacts {
             keyframe: plan.picture.is_key,
             color: colour_of(&plan.picture.colour),
@@ -1682,21 +1168,10 @@ impl NativeVaapiDecoder {
         let converted = match pf_vaadec::plan_to_va_av1(plan, au, &mut s.slots, &table, target) {
             Ok(converted) => converted,
             Err(e) => {
-                // ⚠ The ledger has already been mutated — the conversion assigns the
-                // setup slot before its tile walk, so that a refusal here does not
-                // desynchronise it from the planner's store — and the caller's half of
-                // that contract is to bind NOTHING (see [`bind_setup`]). Unconditional,
-                // because it is also correct for the refusals that fire before any
-                // mutation: there is no slot to clear and no surface to bind either
-                // way.
+                // Conversion assigns the setup slot before the tile walk; bind
+                // nothing so a refusal cannot leave a wrong surface on that slot.
                 bind_setup(s, plan.dpb.stored, None, facts);
-                // A lost tile group on a plan the planner ALREADY called damaged is
-                // concealment, not a defect: the access unit simply did not carry the
-                // tiles its frame header announced, which is what one dropped packet
-                // looks like. Answering with an error instead would burn the demotion
-                // streak on exactly the lossy links this rung exists to diagnose. The
-                // frame is not submitted (there is nothing to submit), its surface is
-                // bound to nothing, and the unit is dropped by the caller.
+                // Lost tiles on an already-damaged plan: conceal, do not demote.
                 if damaged && e.lost_tiles() {
                     tracing::debug!(
                         error = %e,
@@ -1718,12 +1193,8 @@ impl NativeVaapiDecoder {
             }
         };
 
-        // `bind_setup` asks the LEDGER where the picture landed rather than being
-        // told, which is what makes it right for the AV1 frame that refreshes no
-        // slot: the conversion has already handed that slot back, so nothing binds
-        // the surface and only the pending-output claim keeps it out of the free
-        // list. (`DecodePlanVaAv1::setup_slot` is `None` there; it is not consulted
-        // here for exactly that reason.)
+        // Ask the ledger: a no-refresh AV1 frame has already given the slot back,
+        // so only `pending` keeps the surface off the free list.
         bind_setup(s, plan.dpb.stored, Some(free), facts);
 
         if converted.substituted_refs != 0 {
@@ -1737,8 +1208,7 @@ impl NativeVaapiDecoder {
             slices.push(SlicePair {
                 params: group.tiles.as_ptr().cast::<c_void>(),
                 record_size: size_of::<pf_vaadec::va_av1::VaSliceParameterBufferAV1>(),
-                // ⚠ Several records in ONE buffer — the only place this rung does
-                // that, and what libavcodec's `vaapi_av1.c` does per tile group.
+                // Several records in one buffer; H.264/H.265 always pass 1.
                 records: group.tiles.len(),
                 data: group.data.clone(),
             });
@@ -1748,8 +1218,6 @@ impl NativeVaapiDecoder {
             s,
             target,
             as_ptr(&converted.pic_params),
-            // AV1 transmits no quantisation matrix: its matrices are SELECTED by
-            // index out of tables the decoder already holds.
             None,
             &slices,
             au,
@@ -1765,36 +1233,16 @@ impl NativeVaapiDecoder {
             &self.release_tx,
         )?;
 
-        // A frame that enters no reference slot AND displays nothing is dead the
-        // moment it is decoded, and it is the one picture nothing else ever retires:
-        // the planner cannot report it removed (it was never stored) and cannot
-        // output it, so its pending entry — and therefore its surface — is held for
-        // the session's whole life. Seventeen of them exhaust the pool.
-        //
-        // Legal AV1 syntax that no encoder emits, which is exactly why it is worth a
-        // line: a damaged or truncated header can parse to it, and the symptom would
-        // be a session that dies of "pool exhausted" some minutes later with nothing
-        // pointing back here.
+        // Never stored and never output: nothing else retires it, so drop pending
+        // or the surface is held for the session and the pool exhausts.
         if converted.setup_slot.is_none() && !plan.dpb.outputs.contains(&converted.setup_id) {
             s.pending.retain(|p| p.id != converted.setup_id);
         }
         Ok(frames)
     }
 
-    /// A `show_existing_frame` access unit: export a surface the pool already holds.
-    ///
-    /// No conversion and no submission — the picture was decoded by an earlier frame
-    /// of an earlier temporal unit and is still in [`Session::pending`], because a
-    /// hidden frame is never output when it decodes. [`finish`] resolves the output
-    /// id to its surface exactly as it does for any other picture, so this path needs
-    /// no per-surface facts table: the plan's own `picture` carries the SHOWN frame's
-    /// geometry and type, which the vendored parser restores from the reference
-    /// (`load_reference_frame` copies `ref_upscaled_width` / `ref_frame_height` /
-    /// `ref_render_*` / `ref_frame_type` into the display-only header).
-    ///
-    /// ⚠ **Untested.** The vendored conformance vector uses `show_existing_frame`
-    /// zero times — pf-bitstream's planner test asserts that count stays 0 — so
-    /// nothing in any gate reaches this function.
+    /// Export a surface already in [`Session::pending`]. No conversion. Facts
+    /// were recorded at decode; the vendored vector never hits this path.
     fn show_existing_av1(
         &mut self,
         plan: &pf_vaadec::AuPlanAv1,
@@ -1803,25 +1251,16 @@ impl NativeVaapiDecoder {
         let Self {
             display, session, ..
         } = self;
-        // Nothing has decoded yet: the unit is already concealed (the planner
-        // reported `MissingShowExisting`) and there is no session to look in.
+        // Concealed `MissingShowExisting` before any session existed.
         let Some(s) = session.as_mut() else {
             return Ok(Vec::new());
         };
-        // Showing a KEY frame this way resets the whole reference store (AV1 7.20),
-        // so the plan's removals are real and this rung's ledger has to follow them —
-        // or the map fills up and the next assignment fails. No conversion runs on
-        // this path, so this is the only place they can be applied.
+        // A key `show_existing_frame` resets the store (AV1 7.20). No conversion
+        // runs here, so this is the only place the ledger can follow those removals.
         for &id in &plan.dpb.removed {
             s.slots.release(id);
         }
         s.sync_slot_bindings();
-        // ⚠ No `PictureFacts` are built here, and that is the point of recording them
-        // at decode time: the picture this unit displays was decoded by an EARLIER
-        // hidden frame and already carries its own keyframe flag, colour description
-        // and render region. The display-only header the vendored parser restores
-        // from the reference says the same thing, but taking it from the pending
-        // entry means `show_existing_frame` needs no per-surface facts table at all.
         finish(
             display,
             s,
@@ -1836,12 +1275,7 @@ impl NativeVaapiDecoder {
 
 impl Drop for NativeVaapiDecoder {
     fn drop(&mut self) {
-        // Teardown is the only end of stream this rung can observe (see
-        // [`NativeVaapiDecoder::flush`]). Nothing here can be presented, so the point
-        // is to RELEASE: the deliverable queue's surfaces and the DPB's, before
-        // `Session::destroy` pulls the pool out from under them. Same walk the
-        // conformance harness drives, deliberately — a teardown path nothing exercises
-        // is a teardown path nothing checks.
+        // Only EOS this rung sees: release queue and DPB before the pool dies.
         let tail = self.flush().len();
         if tail > 0 {
             tracing::debug!(
@@ -1850,9 +1284,6 @@ impl Drop for NativeVaapiDecoder {
             );
         }
         if self.stale_releases > 0 {
-            // Not an error — a renegotiated session's frames come home to a pool
-            // that no longer exists — but a count worth seeing, because the only
-            // other thing that produces it is release bookkeeping gone wrong.
             tracing::debug!(
                 count = self.stale_releases,
                 "native VAAPI: releases for retired surface pools"
@@ -1864,18 +1295,7 @@ impl Drop for NativeVaapiDecoder {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Shared decode plumbing (free functions: the two codec arms differ only in the
-// types their conversions produce, and splitting the borrow of `self` here is
-// what lets one implementation serve both)
-// ---------------------------------------------------------------------------
-
-/// Apply the consumer's finished-with tokens to the pool's holds.
-///
-/// A free function rather than a method so the rule can be tested without a
-/// `Display`: it is pure bookkeeping, and the one thing it must get right — refusing
-/// a token from a pool that no longer exists — is precisely what a test can check and
-/// hardware cannot.
+/// Pure bookkeeping so a retired-generation token can be tested without a `Display`.
 fn drain_releases_into(
     rx: &mpsc::Receiver<VaRelease>,
     mut session: Option<&mut Session>,
@@ -1887,9 +1307,7 @@ fn drain_releases_into(
             continue;
         };
         if token.generation != s.generation {
-            // A retired pool's surface. Its whole session is gone, so there is
-            // nothing to free — and freeing that index in the CURRENT pool would hand
-            // a live surface to the decoder as a spare.
+            // Retired pool. Freeing this index in the current pool would spare a live surface.
             *stale += 1;
             continue;
         }
@@ -1900,14 +1318,12 @@ fn drain_releases_into(
     }
 }
 
-/// A live struct as a `(pointer, size)` for `vaCreateBuffer`, which COPIES.
+/// `vaCreateBuffer` copies; the struct may die immediately after.
 fn as_ptr<T>(value: &T) -> (*const c_void, usize) {
     ((value as *const T).cast::<c_void>(), size_of::<T>())
 }
 
-/// H.273 code points straight off the picture's ACTIVE SPS/VUI — per frame, never
-/// latched, because the Windows host switches an HDR desktop to PQ/BT.2020 IN-BAND
-/// with a new SPS while the Welcome still says SDR.
+/// Active SPS/VUI, per frame, never latched: HDR can flip in-band at unchanged size.
 fn colour_of(c: &pf_vaadec::ColourDescription) -> ColorDesc {
     ColorDesc {
         primaries: c.colour_primaries,
@@ -1917,7 +1333,6 @@ fn colour_of(c: &pf_vaadec::ColourDescription) -> ColorDesc {
     }
 }
 
-/// Derive the session shape, refusing what the hand-off cannot express.
 fn shape_of(
     coded_width: u32,
     coded_height: u32,
@@ -1926,12 +1341,8 @@ fn shape_of(
     chroma_format_idc: u8,
     bit_depth: u8,
 ) -> Result<StreamShape> {
-    // A non-zero conformance-window ORIGIN would have to shift every plane's offset,
-    // and nothing downstream carries one: the dmabuf planes are handed over with the
-    // driver's own offsets and the consumer samples from (0,0). Refused rather than
-    // cropped from the wrong corner — the same latent gap M5 flagged on the D3D11
-    // rung, closed here instead of inherited. Our hosts emit origin (0,0); a stream
-    // that does not simply falls through to the next rung.
+    // Nothing downstream carries an origin; planes are sampled from (0,0). Refuse
+    // rather than crop from the wrong corner.
     if crop.x != 0 || crop.y != 0 {
         bail!(
             "conformance window at ({}, {}) — this rung hands the surface over \
@@ -1951,23 +1362,9 @@ fn shape_of(
     })
 }
 
-/// The session shape one AV1 plan implies.
-///
-/// ⚠ The pool is sized from the SEQUENCE header's **maximum** frame size, not this
-/// frame's. AV1 lets every frame pick its own size up to that maximum without a key
-/// frame, and sizing the session from the frame would rebuild the config, the
-/// surface pool and the ledger — dropping every reference — the first time a stream
-/// resized downward. libavcodec does the same (`set_context_with_sequence` calls
-/// `ff_set_dimensions(avctx, seq->max_frame_width_minus_1 + 1, …)`).
-///
-/// The display fields carry the same maximum rather than the render region, for the
-/// same reason: the render size is a per-FRAME value and putting it here would make
-/// every render-size change a renegotiation. What actually reaches the presenter is
-/// [`finish`]'s `display` parameter.
-///
-/// The DPB depth is a constant of the codec — `NUM_REF_FRAMES` — never anything a
-/// sequence header says. There is no conformance window to refuse, so unlike
-/// [`shape_of`] this cannot fail.
+/// Pool from the sequence maximum, not this frame: a mid-GOP resize must not
+/// rebuild and drop every reference. Display fields are that maximum too; the
+/// presenter gets [`finish`]'s per-frame region. DPB depth is `NUM_REF_FRAMES`.
 fn shape_of_av1(plan: &pf_vaadec::AuPlanAv1) -> StreamShape {
     let coded_width = u32::from(plan.sequence.max_frame_width_minus_1) + 1;
     let coded_height = u32::from(plan.sequence.max_frame_height_minus_1) + 1;
@@ -1978,13 +1375,10 @@ fn shape_of_av1(plan: &pf_vaadec::AuPlanAv1) -> StreamShape {
         display_height: coded_height,
         max_dpb_frames: pf_vaadec::AV1_MAX_DPB_FRAMES,
         chroma_format_idc: plan.picture.chroma_format_idc,
-        // AV1 codes ONE bit depth for all three planes, so there is no luma/chroma
-        // pair to reconcile the way H.264 and H.265 need.
         bit_depth: plan.picture.bit_depth,
     }
 }
 
-/// The session for this shape, rebuilt whole if the stream renegotiated.
 fn ensure_session<'a>(
     d: &Display,
     slot: &'a mut Option<Session>,
@@ -2001,50 +1395,22 @@ fn ensure_session<'a>(
             to = ?shape,
             "native VAAPI stream renegotiated — rebuilding the session"
         );
-        // Dropped BEFORE the replacement is built so the old pool's video memory is
-        // released first; a 4K pool is on the order of a hundred megabytes.
-        //
-        // Surfaces the CONSUMER still holds are destroyed here too, and that is
-        // sound: an exported PRIME fd holds its own reference on the underlying
-        // buffer object, and the presenter dup'd every fd it imported. The pixels
-        // outlive the VASurface — which is the whole mechanism zero-copy rests on.
+        // Destroy first so the old pool's memory is released. Consumer-held
+        // surfaces are fine: exported PRIME fds keep the pixels alive.
         old.destroy(d);
     }
-    // A NEW generation, always — this is what makes those outstanding frames safe to
-    // let go of. Their release tokens name surface indices in a pool that no longer
-    // exists, and applying one to the new pool would mark a live surface free and
-    // hand it to the decoder as a spare. The bump is here, at the one place a pool is
-    // ever replaced, rather than at the call sites.
+    // New generation: a stale token must not free an index in the replacement pool.
     *generation += 1;
     let mut built = Session::build(d, codec, shape)?;
     built.generation = *generation;
     Ok(slot.insert(built))
 }
 
-/// Record which surface holds the picture just planned — or that NOTHING does.
-///
-/// The slot bindings are re-derived from the ledger FIRST — the conversion has
-/// already applied this AU's removals, so a slot the planner released binds nothing
-/// — and only then is the setup picture bound, by asking the ledger where it landed.
-/// Asking rather than assuming is what handles the one awkward case: a non-reference
-/// picture with no free frame buffer is stored and evicted inside a single plan, so
-/// it holds NO slot when the conversion returns. Its surface is kept out of the free
-/// list by `pending` instead, until it has been output.
-///
-/// ⚠ `surface` is `None` on the AV1 refusal path, and that call is not optional. The
-/// AV1 conversion assigns the ledger slot BEFORE its tile walk — deliberately, so a
-/// lost tile group does not desynchronise the ledger from the planner's store forever
-/// (`pf_vaadec::plan_to_va_av1`'s docs) — which means a refusal can leave a slot
-/// re-assigned to a picture that never decoded while `slot_surface` still holds the
-/// surface of whatever occupied that slot BEFORE. That is not a missing reference, it
-/// is a WRONG one, and nothing downstream could tell. Binding `None` makes the slot
-/// read back as `VA_INVALID_ID`, which the conversion then substitutes with a live
-/// surface. Nothing is pushed to `pending` either: an undecoded surface must never be
-/// exportable.
-///
-/// `facts` travels with the picture from here (see [`PictureFacts`]) and is read back
-/// by [`settle`] when the picture is finally displayed — which on a reordering stream
-/// is a different access unit saying different things.
+/// Bindings from the ledger first, then the setup picture by `slot_of`. A
+/// store-and-evict in one plan holds no slot; `pending` keeps its surface off the
+/// free list. `surface = None` on AV1 refusal: the conversion already reassigned
+/// the slot, so leaving the previous surface would name a wrong picture. An
+/// undecoded surface is never pushed to `pending`.
 fn bind_setup(s: &mut Session, stored: Option<u64>, surface: Option<usize>, facts: PictureFacts) {
     s.sync_slot_bindings();
     let Some(id) = stored else { return };
@@ -2056,36 +1422,20 @@ fn bind_setup(s: &mut Session, stored: Option<u64>, surface: Option<usize>, fact
     }
 }
 
-/// One slice-parameter (AV1: tile-parameter) buffer and the bitstream region its
-/// records address.
-///
-/// The two travel together because `vaRenderPicture` is what establishes which data
-/// buffer a record's `slice_data_offset` is relative to — it is handed the pair.
+/// Parameter buffer plus the AU-coordinate bitstream its records address.
+/// `vaRenderPicture` is what makes `slice_data_offset` relative to that data.
 struct SlicePair {
-    /// The record array. Borrowed from the caller's converted plan, which outlives
-    /// the `submit` call that reads it.
+    /// Borrowed from the converted plan; must outlive `submit`.
     params: *const c_void,
-    /// ONE record's size. `vaCreateBuffer` takes the element size and the element
-    /// count separately and they are not interchangeable.
+    /// Element size for `vaCreateBuffer`; not interchangeable with `records`.
     record_size: usize,
-    /// How many records this buffer carries: **1** for H.264 and H.265 — one slice,
-    /// one buffer, exactly as libavcodec sends them — and a whole tile group's worth
-    /// for AV1, which is the one codec libavcodec packs several records into a single
-    /// buffer for.
+    /// 1 for H.264/H.265; a whole tile group for AV1.
     records: usize,
-    /// The bitstream those records address, in ACCESS-UNIT coordinates.
     data: std::ops::Range<usize>,
 }
 
-/// The H.264/H.265 shape of the above: one record per buffer, parallel to its data
-/// range.
-///
-/// ⚠ The length check is not ceremony, even though both conversions build the two
-/// vectors in one loop today and cannot produce a mismatch. `zip` would answer a
-/// future divergence by SILENTLY TRUNCATING — a picture submitted with some of its
-/// slices, which decodes to a partial frame rather than to an error, and which no
-/// gate here has hardware to catch. A refusal is the honest answer and costs one
-/// comparison per access unit.
+/// One record per buffer. `zip` would silently truncate a length mismatch into a
+/// partial frame that decodes rather than fails.
 fn one_record_each<T>(records: &[T], data: &[std::ops::Range<usize>]) -> Result<Vec<SlicePair>> {
     if records.len() != data.len() {
         bail!(
@@ -2107,10 +1457,8 @@ fn one_record_each<T>(records: &[T], data: &[std::ops::Range<usize>]) -> Result<
         .collect())
 }
 
-/// One picture's buffers, in the order libavcodec's VAAPI path submits them: the
-/// parameter buffers in one `vaRenderPicture`, then the interleaved
-/// slice-parameter/slice-data pairs in another. Matching the path drivers are
-/// validated against is worth more than any tidier arrangement.
+/// Parameters in one `vaRenderPicture`, then interleaved slice-parameter/data
+/// pairs — the order drivers are validated against.
 fn submit(
     d: &Display,
     s: &Session,
@@ -2122,13 +1470,9 @@ fn submit(
 ) -> Result<()> {
     let mut params: Vec<VaBufferId> = Vec::with_capacity(2);
     let mut slice_buffers: Vec<VaBufferId> = Vec::with_capacity(slices.len() * 2);
-    // A picture that was BEGUN must be ended even if a step in between failed, or
-    // the context stays mid-picture and every later `vaBeginPicture` fails on a
-    // stream that was otherwise recoverable. libavcodec's VAAPI path has the same
-    // `fail_with_picture` label for the same reason.
+    // A begun picture must be ended or later `vaBeginPicture` fails on a recoverable stream.
     let mut begun = false;
-    // Every buffer created below must be destroyed whatever happens next — libva
-    // does not reclaim them at `vaEndPicture` (see `Display::destroy_buffers`).
+    // libva does not reclaim buffers at `vaEndPicture`.
     let result = (|| -> Result<()> {
         params.push(
             d.create_buffer(
@@ -2227,48 +1571,11 @@ fn submit(
     result
 }
 
-/// Claim every picture this access unit displays and retire everything it displaced —
-/// the PURE half of [`finish`], and the half a test can drive without a device.
-///
-/// Returns the claimed pictures **in display order**, each carrying the facts recorded
-/// when it decoded ([`PictureFacts`]). A claimed picture is no longer in `pending`, so
-/// until the caller either ships it (which marks its surface `held`) or drops it, the
-/// only thing keeping its surface off the free list is a DPB slot it may no longer
-/// have — which is why claiming and shipping happen in one breath.
-///
-/// Display order, not decode order. `plan.dpb.outputs` is what the planner says is
-/// ready to be shown and in what order, and the surface for each is looked up by
-/// `PicId` — so a reordering stream presents correctly rather than in the order the
-/// pictures happened to decode. (The native D3D11VA rung does present in decode
-/// order; that is a known finding on a rung that blits its output away, and there
-/// was no reason to inherit it here where the display-order queue costs a lookup.)
-///
-/// ⚠ **Every output, not the last one.** Until 2026-08-07 this took `outputs.last()`
-/// and RETIRED the rest unshown — "newest wins", borrowed from the FFmpeg VAAPI rung's
-/// receive loop, where it is a statement about a live stream that has already fallen
-/// behind rather than about a decoder's own reorder buffer. Applied here it discarded
-/// pictures nobody had yet had the chance to fall behind on: a bump is how a reordering
-/// stream delivers, and an IDR draining a full DPB bumps the whole buffer at once. It
-/// cost the vendored H.264 vector 18 frames at three access units. The caller queues
-/// what it cannot hand over at once ([`NativeVaapiDecoder::deliverable`]); dropping is
-/// that queue's decision to make, at its bound, with a counter and a log line.
-///
-/// The retirement rule is `pf_vkdecode`'s `settle_dpb`, reimplemented here over this
-/// rung's flat pending list rather than reasoned out again, because both halves of it
-/// are easy to get wrong:
-///
-/// * **`removed` retires a pending picture too.** A picture can leave the DPB without
-///   ever being output (`no_output_of_prior_pics` at an IDR is the everyday case), and
-///   a pending list that only shrinks on OUTPUT keeps its surface off the free list
-///   for the rest of the session — a slow, silent walk into pool exhaustion.
-/// * **An output naming no pending picture is a TRACE, not an error.** Ids planned
-///   before this decoder existed, or dropped across a session rebuild, are
-///   display-order gaps.
-///
-/// OUTPUTS FIRST, and they are taken out before anything else runs: a picture is
-/// normally output and removed by the SAME access unit — that is what bumping is — so
-/// retiring `removed` before claiming would discard the very pictures about to be
-/// displayed, on essentially every access unit.
+/// Claim every output in display order, then retire `removed` even if never shown.
+/// Claim before retire: bumping outputs and removes in the same AU. A claimed
+/// picture leaves `pending`, so ship or drop in the same breath or the surface
+/// has only a slot it may no longer hold. A missing pending id is a display-order
+/// gap, not an error.
 fn settle(s: &mut Session, outputs: &[u64], removed: &[u64]) -> Vec<PendingPicture> {
     let mut claimed = Vec::with_capacity(outputs.len());
     for id in outputs {
@@ -2277,20 +1584,13 @@ fn settle(s: &mut Session, outputs: &[u64], removed: &[u64]) -> Vec<PendingPictu
             None => tracing::trace!(id, "output id without a pending picture"),
         }
     }
-    // Whatever left the DPB is retired from the pending list whether or not it was
-    // ever output. Its SURFACE only becomes free if nothing else holds it — a
-    // reference still bound to a slot, or a frame the consumer has, stays put.
     for id in removed {
         s.pending.retain(|p| p.id != *id);
     }
     claimed
 }
 
-/// Export one claimed picture as the dmabuf frame the presenter imports, and take the
-/// consumer's hold on its surface.
-///
-/// Split out of [`finish`] so the flush path ships by exactly the same walk rather than
-/// by a second one written to match.
+/// Export and take the consumer's hold. Flush uses the same walk as [`finish`].
 fn ship(
     d: &Display,
     s: &mut Session,
@@ -2300,14 +1600,10 @@ fn ship(
     let surface_index = picture.surface;
     let surface = s.surfaces[surface_index];
 
-    // OWNED from here. `export` wraps the descriptor's fds the moment the call
-    // succeeds, so every refusal below closes them by dropping rather than by
-    // remembering to — an earlier draft leaked one fd per refused frame.
+    // Fds are owned from the successful export; later refusals close them by drop.
     let (exported, fds) = export(d, surface)?;
     if exported.fourcc != s.fourcc {
-        // The pool was created with an explicit pixel format; a surface exporting a
-        // different one means the driver silently substituted, and the consumer
-        // would import the wrong layout.
+        // Driver silently substituted a different layout than the pool was created with.
         bail!(
             "surface exported fourcc {:#010x}, the pool was created as {:#010x}",
             exported.fourcc,
@@ -2332,9 +1628,7 @@ fn ship(
         })
         .collect();
     Ok(DmabufFrame {
-        // The DISPLAY region THIS picture asked for. The surface is allocated at the
-        // coded size and is taller/wider than the picture; handing over the coded size
-        // would show the codec's granule padding.
+        // Coded size would show granule padding.
         width: picture.facts.display.0,
         height: picture.facts.display.1,
         fourcc: exported.fourcc,
@@ -2353,17 +1647,8 @@ fn ship(
     })
 }
 
-/// Turn this access unit's OUTPUT list into shipped frames, in display order.
-///
-/// [`settle`] does the ledger, [`ship`] does the export; this is the two together plus
-/// the concealment rule that decides whether anything is shown at all.
-///
-/// A refusal part-way through ships nothing: the frames already exported are dropped by
-/// the `?`, and their guards close the fds and hand the surfaces straight back. The
-/// pictures not yet reached are dropped too — [`settle`] already took them out of
-/// `pending`, so nothing claims their surfaces and they return to the free list on the
-/// spot. Which is the rule every rung in this program keeps: nothing from a refused
-/// access unit reaches the screen.
+/// [`settle`] then [`ship`]. A mid-loop `?` drops already-exported frames via their
+/// guards; pictures not yet reached already left `pending` and return to the free list.
 fn finish(
     d: &Display,
     s: &mut Session,
@@ -2374,11 +1659,7 @@ fn finish(
     tx: &mpsc::Sender<VaRelease>,
 ) -> Result<Vec<DmabufFrame>> {
     let claimed = settle(s, outputs, removed);
-    // A concealed picture is not shown: it was decoded from a substitute reference,
-    // so shipping it paints the substitution on screen. Nothing this AU output is
-    // shown, the pump is asked to re-anchor, and the caller records the damage. The
-    // claimed pictures simply drop here — never exported, never held, so their
-    // surfaces are free the moment this returns.
+    // Substitute reference: do not paint it. Re-anchor; surfaces were never held.
     if damaged {
         *recovery_request = true;
         return Ok(Vec::new());
@@ -2390,20 +1671,9 @@ fn finish(
     Ok(frames)
 }
 
-/// Wait for the decode and export the surface as DRM-PRIME dmabufs.
-///
-/// The `vaSyncSurface` is what makes the hand-off safe: VAAPI exposes no fence to
-/// the importer, so the accepted contract on this path — and what libavcodec's own
-/// VAAPI→DRM_PRIME mapping does — is to sync before the fds leave. It is a blocking
-/// wait on the pump thread, which is worth naming: at 60 fps against decodes of a
-/// millisecond or two it is slack, and the alternative is handing the presenter a
-/// surface the GPU has not finished writing.
-///
-/// Returns the flattened surface AND the fds it owns, together — so that from the
-/// instant the export succeeds those fds are RAII-owned and every later refusal
-/// closes them by dropping. `ExportedSurface::planes` still carries the raw fds,
-/// borrowed from these: several planes routinely name one object, and each object's
-/// fd must be closed exactly once.
+/// Sync then export. VAAPI has no fence for the importer; without the wait the
+/// presenter would sample a surface still being written. Fds are owned from success
+/// so later refusals close them. One fd per object, even when planes share it.
 fn export(d: &Display, surface: VaSurfaceId) -> Result<(pf_vaadec::ExportedSurface, Vec<OwnedFd>)> {
     // SAFETY: a live display and a surface from its own pool.
     d.va.check("vaSyncSurface", unsafe {
@@ -2437,11 +1707,8 @@ fn export(d: &Display, surface: VaSurfaceId) -> Result<(pf_vaadec::ExportedSurfa
             Ok((exported, fds))
         }
         Err(e) => {
-            // The export SUCCEEDED, so its fds belong to this process even though the
-            // descriptor cannot be read as a surface. Every writable slot is swept
-            // rather than the first `num_objects` — a refusal for a bogus
-            // `num_objects` is exactly the case where that count cannot be trusted to
-            // bound anything.
+            // Export succeeded: the fds are ours even if flatten failed. Sweep every
+            // slot — a bogus `num_objects` is why that count cannot bound the close.
             for object in &desc.objects {
                 if object.fd >= 0 {
                     // SAFETY: an fd this process owns from the successful export;
@@ -2458,9 +1725,7 @@ fn export(d: &Display, surface: VaSurfaceId) -> Result<(pf_vaadec::ExportedSurfa
 mod tests {
     use super::*;
 
-    /// A session whose libva handles are never used — every field exercised below is
-    /// plain bookkeeping, which is exactly why this rule can be tested at all without
-    /// a GPU. The pool is deliberately small so an exhausted free list is reachable.
+    /// Bookkeeping only; libva handles are never used. Small so exhaustion is reachable.
     fn session(surfaces: usize, slots: usize) -> Session {
         Session {
             shape: StreamShape {
@@ -2484,8 +1749,7 @@ mod tests {
         }
     }
 
-    /// Facts a test does not care about. Everything that DOES care about them builds
-    /// its own, so a shared default can never be what makes an assertion pass.
+    /// Tests that care about facts build their own so this default cannot pass them.
     const PLAIN: PictureFacts = PictureFacts {
         keyframe: false,
         color: ColorDesc {
@@ -2505,8 +1769,6 @@ mod tests {
         }
     }
 
-    /// The whole rule, in one test: a surface is free only when NOTHING claims it,
-    /// and the three claims end at different moments.
     #[test]
     fn a_surface_is_free_only_when_no_slot_no_output_and_no_consumer_claims_it() {
         let mut s = session(4, 3);
@@ -2516,9 +1778,7 @@ mod tests {
             "a fresh pool starts at the front"
         );
 
-        // 0: a live DPB reference. 1: decoded, still owing an output. 2: on screen —
-        // or waiting in the deliverable queue, which is the same claim (see
-        // [`Session::free_surface`]).
+        // Slot, pending, held (including a queued deliverable).
         s.slot_surface[0] = Some(0);
         s.pending.push(pending(7, 1));
         s.held[2] = true;
@@ -2528,7 +1788,6 @@ mod tests {
             "the first three are each claimed a different way"
         );
 
-        // Losing ONE claim is not enough when another still stands.
         s.held[3] = true;
         s.slot_surface[1] = Some(1);
         assert_eq!(
@@ -2537,16 +1796,13 @@ mod tests {
             "an exhausted pool must say so rather than hand out a claimed surface"
         );
 
-        // Surface 1 is both slot-bound and pending: releasing only the output keeps
-        // it out, and only when the slot goes too does it come back.
+        // Slot-bound and pending: clearing only pending is not enough.
         s.pending.clear();
         assert_eq!(s.free_surface(), None);
         s.slot_surface[1] = None;
         assert_eq!(s.free_surface(), Some(1));
     }
 
-    /// The consumer's release is what ends the third claim — and it must be matched
-    /// to the generation that issued it, or a renegotiation hands a live surface out.
     #[test]
     fn a_release_from_a_retired_pool_never_frees_a_surface_in_the_new_one() {
         let mut s = session(4, 3);
@@ -2554,9 +1810,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut stale = 0u64;
 
-        // A token from the pool that was retired before this one. Surface index 2
-        // exists in BOTH pools, which is what makes this dangerous: the index is
-        // valid, and only the generation says it means a different surface.
+        // Index 2 exists in both pools; only generation says it is a different surface.
         tx.send(VaRelease {
             surface: 2,
             generation: 0,
@@ -2569,7 +1823,6 @@ mod tests {
         );
         assert_eq!(stale, 1, "and it must be counted, not silent");
 
-        // The matching generation does free it.
         tx.send(VaRelease {
             surface: 2,
             generation: 1,
@@ -2579,7 +1832,6 @@ mod tests {
         assert!(!s.held[2]);
         assert_eq!(stale, 1);
 
-        // An index the pool does not have is counted, never a panic.
         tx.send(VaRelease {
             surface: 99,
             generation: 1,
@@ -2589,8 +1841,6 @@ mod tests {
         assert_eq!(stale, 2);
     }
 
-    /// The bindings follow the ledger: a slot the planner released binds nothing,
-    /// and the surface it held is only free if nothing else claims it.
     #[test]
     fn syncing_bindings_drops_the_slots_the_ledger_no_longer_holds() {
         let mut s = session(4, 3);
@@ -2605,20 +1855,9 @@ mod tests {
         );
     }
 
-    /// The decode target is never a surface the reference table names — swept over
-    /// every binding state a small pool can be in.
-    ///
-    /// This rung's exemption from the aliasing defect the D3D11VA and Vulkan rungs had
-    /// to defer their way out of (module docs), stated as the one thing it actually
-    /// rests on. `pf-vaadec` proves the conversion can only name surfaces out of the
-    /// table it is handed; this proves the table and the target cannot overlap.
-    ///
-    /// Swept rather than exemplified because the claim is structural — a free surface
-    /// is by definition one no slot binds, and the table is exactly what the slots bind
-    /// — so it should hold in states an ordinary run never reaches, and a sweep is what
-    /// says so. The `held` and `pending` masks are varied too even though they can only
-    /// ever REMOVE candidates from the free list: a future claim that could add one
-    /// back is exactly what this would catch.
+    /// Sweep: a free surface is unbound, so it cannot appear in the table. `held`
+    /// and `pending` only remove candidates; a future claim that added one back
+    /// would fail here.
     #[test]
     fn the_decode_target_can_never_be_a_surface_the_reference_table_names() {
         const SURFACES: usize = 4;
@@ -2632,9 +1871,7 @@ mod tests {
             for b in &choices {
                 for c in &choices {
                     let bound = [*a, *b, *c];
-                    // Two slots binding ONE surface is not a state the pool can reach —
-                    // `bind_setup` only ever binds a surface nothing else claims — and
-                    // asserting about it would be asserting about a defect elsewhere.
+                    // Two slots on one surface is unreachable; skip it.
                     let mut distinct: Vec<usize> = bound.iter().flatten().copied().collect();
                     let claimed = distinct.len();
                     distinct.sort_unstable();
@@ -2677,46 +1914,29 @@ mod tests {
                 }
             }
         }
-        // The sweep has to reach both answers, or it is asserting about one branch.
         assert!(states > 1000, "only {states} states swept");
         assert!(with_a_target > 0 && exhausted > 0);
     }
 
-    /// The order the rung must NOT be written in, and the reason
-    /// [`Session::acquire_target`] hands the target and the table back together.
-    ///
-    /// The exemption above is not a property of the pool alone: it needs the target and
-    /// the table to come from ONE snapshot. Split them and this rung acquires the
-    /// D3D11VA/Vulkan defect exactly — because the table must be the PRE-removal one
-    /// (a reference an access unit names can be a picture the same access unit evicts,
-    /// which on a punktfunk host's own low-delay H.264 is 117 access units in 120),
-    /// while a free list consulted after those removals offers precisely the displaced
-    /// picture's surface.
+    /// Split target and table: the post-removal free list offers a surface the
+    /// pre-removal table still names.
     #[test]
     fn taking_the_free_surface_after_the_removals_would_hand_out_a_referenced_surface() {
         let mut s = session(4, 3);
 
-        // Two decoded reference pictures, each in its own surface, both already
-        // displayed and returned by the presenter — so only the SLOT binding keeps
-        // their surfaces off the free list. That is the steady state of a low-delay
-        // stream, where a picture is output by its own access unit and evicted by the
-        // sliding window several units later.
+        // Displayed and returned; only the slot binding keeps the surfaces off the free list.
         s.slots.assign(11).expect("a free slot");
         bind_setup(&mut s, Some(11), Some(0), PLAIN);
         s.slots.assign(12).expect("a free slot");
         bind_setup(&mut s, Some(12), Some(1), PLAIN);
         s.pending.clear();
 
-        // What the conversion resolves its references through, taken BEFORE this access
-        // unit's removals — which is not a choice, it is where the references are.
         let table = s.surface_table();
         assert!(
             table.contains(&s.surfaces[0]),
             "picture 11's surface must still be a resolvable reference"
         );
 
-        // The order the rung is written in: one snapshot, and the target cannot be in
-        // the table it came with.
         let (_, target, same_table) = s.acquire_target().expect("the pool has spares");
         assert_eq!(
             same_table, table,
@@ -2724,8 +1944,6 @@ mod tests {
         );
         assert!(!table.contains(&target));
 
-        // The defect: the conversion applies the removal, the bindings follow it, and
-        // only THEN is the free list consulted.
         s.slots.release(11);
         s.sync_slot_bindings();
         let late = s.free_surface().expect("the pool has spares");
@@ -2737,30 +1955,18 @@ mod tests {
         );
     }
 
-    /// A picture the conversion REFUSED binds no surface — so nothing can show it and
-    /// nothing can predict from it.
-    ///
-    /// Both halves matter and they fail differently. The AV1 conversion assigns its
-    /// ledger slot before the tile walk, so a refusal leaves a slot re-assigned to a
-    /// picture that never decoded; leaving the slot's PREVIOUS binding in place would
-    /// hand the next frame a real, decoded, WRONG picture, which no later check could
-    /// notice. And a `pending` entry for it would let a later `show_existing_frame`
-    /// claim the surface and ship it — a surface the driver never wrote, which is
-    /// uninitialised video memory rather than a stale frame.
+    /// Refusal must not leave the previous surface on the reassigned slot, nor a
+    /// pending entry that `show_existing_frame` could export as unwritten memory.
     #[test]
     fn a_refused_picture_binds_nothing_and_can_never_be_exported() {
         let mut s = session(4, 3);
 
-        // Picture 11 decoded into surface 0 and took slot 0.
         s.slots.assign(11).expect("a free slot");
         bind_setup(&mut s, Some(11), Some(0), PLAIN);
         assert_eq!(s.slot_surface[0], Some(0));
         assert_eq!(s.surface_table()[0], s.surfaces[0]);
         assert_eq!(s.pending, vec![pending(11, 0)]);
 
-        // Picture 12's access unit lost its tile groups. The conversion released 11,
-        // handed 12 the slot it just gave back — the routine case, not a contrived one
-        // — and then refused.
         s.slots.release(11);
         assert_eq!(s.slots.assign(12).expect("the slot 11 gave back"), 0);
         bind_setup(&mut s, Some(12), None, PLAIN);
@@ -2781,29 +1987,16 @@ mod tests {
              a later show_existing_frame export a surface the driver never wrote"
         );
 
-        // The slot is still LIVE in the ledger, which is the whole point of the
-        // conversion mutating before it refuses: the next frame resolves picture 12
-        // rather than hard-erroring on it.
         assert_eq!(s.slots.slot_of(12), Some(0));
     }
 
-    /// **Every** picture an access unit displays is claimed, in the planner's display
-    /// order — the defect this rung carried until 2026-08-07, with the behaviour it
-    /// replaced written out beside it.
-    ///
-    /// [`settle`] is the pure half of [`finish`] precisely so this can be asserted with
-    /// no libva, no device and no surfaces: it is a walk over a list.
     #[test]
     fn settle_claims_every_output_in_display_order_not_only_the_last() {
         let mut s = session(8, 5);
-        // Four pictures decoded and buffered for reorder, each in its own surface —
-        // the state a reordering stream is in when an IDR drains the buffer.
         for (index, id) in [11u64, 12, 13, 14].iter().enumerate() {
             s.pending.push(pending(*id, index));
         }
-        // Display order 13, 11, 14, 12: deliberately neither decode order nor sorted,
-        // because the planner's list IS the display order and this rung must present
-        // in it rather than re-derive one.
+        // Planner order, neither decode order nor sorted.
         let outputs = [13u64, 11, 14, 12];
         let claimed = settle(&mut s, &outputs, &outputs);
 
@@ -2822,8 +2015,7 @@ mod tests {
             "a claimed picture no longer owes an output"
         );
 
-        // ⚠ The counterfactual. What this used to do, in one line, run against the same
-        // access unit: ship `outputs.last()` and retire the other three unshown.
+        // Counterfactual: last-only would ship 12 and drop the other three.
         let old_rule: Vec<u64> = outputs.last().copied().into_iter().collect();
         assert_eq!(old_rule, vec![12]);
         assert_eq!(
@@ -2834,36 +2026,22 @@ mod tests {
         );
     }
 
-    /// The two retirement rules, which are the reason a pool sized for a stream does
-    /// not walk into exhaustion anyway.
     #[test]
     fn settle_retires_what_left_the_dpb_unshown_and_traces_an_output_it_cannot_place() {
         let mut s = session(4, 3);
         s.pending.push(pending(11, 0));
         s.pending.push(pending(12, 1));
 
-        // Picture 12 leaves the DPB without ever being output — `no_output_of_prior_pics`
-        // at an IDR, the everyday case. A pending list that only shrank on OUTPUT would
-        // hold its surface for the rest of the session.
         let claimed = settle(&mut s, &[11], &[11, 12]);
         assert_eq!(claimed.iter().map(|p| p.id).collect::<Vec<_>>(), vec![11]);
         assert!(s.pending.is_empty(), "12 was retired unshown");
 
-        // An output naming no pending picture is a display-order gap, not an error:
-        // ids planned before this decoder existed, or dropped across a rebuild.
         assert!(settle(&mut s, &[99], &[]).is_empty());
     }
 
-    /// A displayed picture carries **its own** facts, not those of whichever access
-    /// unit happens to bump it out.
-    ///
-    /// All three fields fail differently and all three were wrong: `keyframe` is the
-    /// pump's post-loss re-anchor signal, `color` decides whether PQ content is drawn
-    /// as BT.709, and `display` is AV1's per-frame render region.
     #[test]
     fn a_displayed_picture_carries_its_own_facts_not_its_display_units() {
-        /// What the rung stamped until 2026-08-07: the ACCESS UNIT's flag, whatever
-        /// picture the bump happened to display.
+        /// Stamp the bumping AU's flag on whatever picture it displayed.
         fn old_label(bumping_au_is_idr: bool) -> bool {
             bumping_au_is_idr
         }
@@ -2904,7 +2082,6 @@ mod tests {
         assert_eq!(claimed[0].facts, idr);
         assert_eq!(claimed[1].facts, trail);
 
-        // ⚠ The counterfactual, and it fails BOTH ways round.
         assert_ne!(
             old_label(false),
             claimed[0].facts.keyframe,
@@ -2931,8 +2108,7 @@ mod tests {
         );
     }
 
-    /// A frame with no fds — every field the queue's bound cares about, and nothing
-    /// that needs a device. Its guard is real, so dropping it really does release.
+    /// Guard is real so drop actually releases. No fds; no device.
     fn queued_frame(tx: &mpsc::Sender<VaRelease>, surface: usize) -> DmabufFrame {
         DmabufFrame {
             width: 64,
@@ -2953,12 +2129,7 @@ mod tests {
         }
     }
 
-    /// The queue drops its OLDEST rather than pinning surfaces forever — and a dropped
-    /// frame's surface really does come back.
-    ///
-    /// The second half is what makes this a surface-lifetime test rather than a
-    /// bookkeeping one: every frame the queue holds is a `held` surface, so a bound
-    /// that dropped frames without releasing them would trade one leak for another.
+    /// Dropping without releasing would trade a queue leak for a surface leak.
     #[test]
     fn the_deliverable_queue_drops_its_oldest_and_frees_the_surface_it_held() {
         let (tx, rx) = mpsc::channel();
@@ -2988,7 +2159,6 @@ mod tests {
             "and what survives keeps display order"
         );
 
-        // The surfaces come back only when the dropped frames actually drop.
         let mut stale = 0u64;
         drain_releases_into(&rx, Some(&mut s), &mut stale);
         assert!(
@@ -3005,14 +2175,11 @@ mod tests {
         );
         assert_eq!(stale, 0, "and none of it is a stale-generation token");
 
-        // Idempotent, and a bound of 0 drains rather than loops.
         assert!(trim_deliverable(&mut queue, 3).is_empty());
         assert_eq!(trim_deliverable(&mut queue, 0).len(), 3);
         assert!(trim_deliverable(&mut queue, 0).is_empty());
     }
 
-    /// A conformance window with a non-zero ORIGIN is refused, not cropped from the
-    /// wrong corner: nothing downstream carries an origin.
     #[test]
     fn a_non_zero_crop_origin_is_refused() {
         let ok = shape_of(
@@ -3048,8 +2215,6 @@ mod tests {
         .is_err());
     }
 
-    /// One synthetic AV1 plan: a sequence that permits `max` and a frame that codes
-    /// `frame`, so the two can be told apart.
     fn av1_plan(max: (u16, u16), frame: (u32, u32), render: (u32, u32)) -> pf_vaadec::AuPlanAv1 {
         let sequence = pf_vaadec::ParsedSequenceHeaderAv1 {
             max_frame_width_minus_1: max.0 - 1,
@@ -3060,10 +2225,7 @@ mod tests {
             picture: pf_vaadec::PicturePlanAv1 {
                 frame_type: pf_vaadec::FrameTypeAv1::KeyFrame,
                 is_key: true,
-                // Vacuously true for a key frame: it predicts from nothing. This fixture
-                // exists to exercise the SIZING path (sequence max vs coded vs render), so
-                // the clean bit is incidental here — but it must state the honest value,
-                // because `false` is the answer that withholds a re-anchor.
+                // Key frame: `false` would withhold a re-anchor.
                 references_clean: true,
                 show_frame: true,
                 showable_frame: false,
@@ -3092,14 +2254,6 @@ mod tests {
         }
     }
 
-    /// An AV1 session is sized from the SEQUENCE, never from the frame — and its DPB
-    /// depth is the codec's constant.
-    ///
-    /// Both halves are the difference between a stream that survives a mid-GOP resize
-    /// and one that rebuilds its pool, drops every reference and conceals its way back
-    /// to a keyframe. AV1 permits a frame to code any size up to the sequence maximum
-    /// with no key frame in sight, so a shape derived from the frame changes when
-    /// nothing renegotiated.
     #[test]
     fn an_av1_session_is_sized_from_the_sequence_maximum_not_the_frame() {
         let big = shape_of_av1(&av1_plan((1920, 1080), (1920, 1080), (1920, 1080)));
@@ -3109,25 +2263,17 @@ mod tests {
             "NUM_REF_FRAMES, not a stream property"
         );
 
-        // The same sequence, a frame coded smaller and shown smaller still. Neither
-        // may move the shape, or this is a renegotiation.
         let small = shape_of_av1(&av1_plan((1920, 1080), (1280, 720), (960, 540)));
         assert_eq!(
             small, big,
             "a frame that resized itself must not rebuild the session"
         );
 
-        // A genuinely different sequence does move it.
         let other = shape_of_av1(&av1_plan((1280, 720), (1280, 720), (1280, 720)));
         assert_ne!(other, big);
     }
 
-    /// The render size reaches the presenter CLAMPED to the decoded picture.
-    ///
-    /// AV1 5.9.6 puts no upper bound on the render size, so a stream may legally ask
-    /// to be shown at more than it coded; handing that to the presenter as a crop
-    /// would address rows the surface does not have. This restates the clamp in
-    /// `frame_av1`, which cannot itself be reached without a device.
+    /// Restates the `frame_av1` clamp: 5.9.6 has no upper bound.
     #[test]
     fn an_oversized_render_region_is_clamped_to_the_decoded_picture() {
         let plan = av1_plan((1920, 1080), (1280, 720), (4096, 4096));
@@ -3151,11 +2297,6 @@ mod tests {
         assert_eq!(display, (1920, 1080), "the ordinary crop still crops");
     }
 
-    /// H.264 and H.265 send ONE record per parameter buffer; AV1 is the exception.
-    ///
-    /// `vaCreateBuffer` takes an element size and an element count, and getting the
-    /// pair backwards is a driver reading `size` records of `count` bytes. This pins
-    /// the side every codec but AV1 is on.
     #[test]
     fn a_slice_pair_carries_one_record_unless_av1_says_otherwise() {
         let records = [7u32, 8, 9];
@@ -3168,22 +2309,11 @@ mod tests {
         }
         assert_eq!(pairs[1].data, 4..8);
 
-        // A record without its data range REFUSES. `zip` would drop it silently and
-        // submit a picture missing a slice, which decodes rather than fails.
         assert!(one_record_each(&records, &ranges[..2]).is_err());
         assert!(one_record_each(&records[..1], &ranges).is_err());
     }
 
-    /// A shape this rung cannot decode is refused BEFORE libva is even loaded.
-    ///
-    /// The ordering is the point, not the refusal. M3 WP-2's review caught the
-    /// opposite arrangement on the Vulkan rung: a backend that accepts a session and
-    /// then refuses its first access unit has already cost the ladder its
-    /// fall-through — the refusal arrives as a decode error, burns the demotion
-    /// streak, and lands the session several rungs lower than it would have been.
-    /// Asserting on the MESSAGE is what pins the order: this test passes on a machine
-    /// with libva and on one without, and only stays passing while the profile probe
-    /// comes first.
+    /// Message names the shape, not libva, so the profile probe still comes first.
     #[test]
     fn a_shape_with_no_profile_is_refused_before_libva_is_loaded() {
         let e = NativeVaapiDecoder::new(
@@ -3202,18 +2332,8 @@ mod tests {
         );
     }
 
-    /// On-glass probe: resolve every entry point against the REAL libva on this
-    /// machine, then say what each render node does.
-    ///
-    /// This is the one thing no gate can check. `dlsym` takes a STRING: a mistyped
-    /// entry point compiles, clippies and unit-tests perfectly and fails only on a
-    /// machine with libva — so the 19 names are worth exercising once against a real
-    /// runtime, and this test is how. It is also the honest report of a box's VAAPI
-    /// situation: a node that will not initialise is a legitimate outcome (NVIDIA has
-    /// no usable VAAPI driver), printed rather than failed, because the rung's claim
-    /// is that such a box REFUSES CLEANLY and lets the ladder fall through.
-    ///
-    /// `cargo test -p pf-client-core --lib probe_this_machines_libva -- --ignored --nocapture`
+    /// `dlsym` is a string: a mistyped name compiles. A node that will not
+    /// initialise is printed, not failed.
     #[test]
     #[ignore = "needs a machine with a libva runtime"]
     fn probe_this_machines_libva() {
@@ -3260,9 +2380,6 @@ mod tests {
                         ("H.264 High", pf_vaadec::config::VA_PROFILE_H264_HIGH),
                         ("HEVC Main", pf_vaadec::config::VA_PROFILE_HEVC_MAIN),
                         ("HEVC Main 10", pf_vaadec::config::VA_PROFILE_HEVC_MAIN10),
-                        // AV1 was MISSING from this loop until 2026-08-07, which is part
-                        // of why the rung's evidence row could say "never decoded a frame"
-                        // for so long without anyone noticing what had not been asked.
                         // `profile_for` maps both 8- and 10-bit AV1 4:2:0 onto Profile 0.
                         ("AV1 Profile 0", pf_vaadec::config::VA_PROFILE_AV1_PROFILE0),
                         ("AV1 Profile 1", pf_vaadec::config::VA_PROFILE_AV1_PROFILE1),
@@ -3282,21 +2399,12 @@ mod tests {
         );
     }
 
-    /// The vendored AV1 vector, as IVF: 320x240 Main 4:2:0 8-bit, 250 temporal units
-    /// carrying 274 coded frames (24 units carry two, and those extras are HIDDEN —
-    /// decoded, referenced, never shown), so **250 frames are displayed**. The same
-    /// file `pf-vkdecode`'s Vulkan parity leg and `video_d3d11_native`'s D3D11VA leg
-    /// walk, so a count that disagrees with 250 is this rung's problem, not the
-    /// vector's.
+    /// 250 temporal units, 274 coded, 24 hidden, 250 shown. Same file the other rungs walk.
     pub(super) const AV1_25FPS: &[u8] = include_bytes!(
         "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
     );
 
-    /// One temporal unit per IVF packet: 32 bytes of `DKIF` header, then
-    /// `[u32 size][u64 pts][size bytes]`. Hand-rolled because `pf-client-core` does
-    /// not depend on the vendored parser crate — the same reason and the same walk as
-    /// `video_d3d11_native`'s `split_ivf`, and kept honest by the unit count asserted
-    /// at the top of the test below.
+    /// `[u32 size][u64 pts][size bytes]` after the `DKIF` header. No vendored parser dep.
     pub(super) fn split_ivf(stream: &[u8]) -> Vec<&[u8]> {
         assert_eq!(&stream[0..4], b"DKIF", "the AV1 vector must be an IVF file");
         let header = usize::from(u16::from_le_bytes([stream[6], stream[7]]));
@@ -3316,25 +2424,8 @@ mod tests {
         out
     }
 
-    /// Does this machine's VAAPI actually DECODE AV1 — the question the evidence table
-    /// has answered "no hardware has ever tried" since M6.
-    ///
-    /// A DECODE measurement, not frame-hash parity: it asserts that every temporal unit
-    /// is accepted, that the expected number of frames comes back, and that each one is
-    /// a real exported surface of the right shape. It says nothing about the PIXELS.
-    ///
-    /// That used to be all this rung could claim — it hands out a **DRM-PRIME dmabuf**
-    /// whose memory the driver tiles, so there was no CPU-readable image to hash. The
-    /// `parity` module below adds one, test-only, and
-    /// `parity::av1_every_delivered_frame_hashes_bit_identical_to_libavcodec` is the leg
-    /// that checks the pixels. This one is kept because it is the cheaper question and
-    /// it fails FIRST: a rung that stopped decoding at all should say so without
-    /// waiting for 250 hashes.
-    ///
-    /// Fails loudly rather than skipping when the device has no AV1 entry point: it is
-    /// `#[ignore]`d, so it only runs when someone deliberately points it at a box that
-    /// is supposed to have one, and a silent pass there is the invisible-failure mode
-    /// this whole program exists to end.
+    /// Decode measurement, not pixels. Pixels are the `parity` module. `#[ignore]`
+    /// so a missing entry point fails loudly rather than skips.
     #[test]
     #[ignore = "needs a machine with a libva runtime and an AV1 VLD entry point"]
     fn av1_decodes_the_vendored_vector_on_this_machines_vaapi() {
@@ -3372,10 +2463,6 @@ mod tests {
                 Err(e) => panic!("unit {index}: VAAPI AV1 decode failed: {e:#}"),
             }
         }
-        // AV1 buffers no output between temporal units — it shows at most one frame per
-        // unit and `Av1Planner` has no `flush` to call — so its tail is empty by
-        // construction. Asserted rather than assumed, because the same call on the
-        // H.26x legs hands back seven frames.
         assert!(
             decoder.flush().is_empty(),
             "AV1 strands nothing in the DPB: every temporal unit's shown frame is \
@@ -3395,110 +2482,35 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------
-    // H.264 / H.265 — the two legs that had never decoded a frame anywhere
-    // ---------------------------------------------------------------------
-
-    /// The vendored H.264 vector: **250 access units** of 320x240 High 4:2:0 8-bit,
-    /// TWO slice NALUs per picture (500 slice NALs over 250 AUs, 4 IDRs). The same
-    /// file, at the same relative path, that `pf-vkdecode`'s Vulkan legs and
-    /// `video_d3d11_native`'s D3D11VA leg decode — so a count that disagrees with
-    /// theirs is this rung's problem rather than the vector's.
+    /// 250 AUs, two slices per picture. Same file the other rungs decode.
     pub(super) const H264_25FPS: &[u8] = include_bytes!(
         "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
     );
 
-    /// The vendored H.265 twin: 250 access units, 320x240 Main 8-bit 4:2:0, ONE slice
-    /// per picture, one `IDR_N_LP` then 249 TRAIL pictures.
+    /// 250 AUs, one slice per picture.
     pub(super) const H265_25FPS: &[u8] = include_bytes!(
         "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
     );
 
-    /// HEVC **Main 10**: 50 access units of 320x240 4:2:0 ten-bit, from libx265.
-    ///
-    /// Worth a third leg rather than a variation on the second because ten bits is a
-    /// different VAAPI PROFILE (`VAProfileHEVCMain10`), a different render-target
-    /// format (`VA_RT_FORMAT_YUV420_10`) and a different surface fourcc (**P010**, not
-    /// NV12) — three branches of `Session::build` that no 8-bit leg reaches, on the
-    /// path every HDR session takes. `finish` refuses a surface whose exported fourcc
-    /// is not the one the pool was created with, so this leg is also the only thing
-    /// that would catch a driver quietly handing back NV12 for a ten-bit stream.
+    /// 50 AUs, Main 10: different profile, RT format, and P010. Catches NV12 for 10-bit.
     pub(super) const MAIN10_H265: &[u8] =
         include_bytes!("../../pf-vkdecode/tests/data/test-main10.h265");
 
-    /// Both 8-bit vectors are 250 access units.
     const H26X_AU_COUNT: usize = 250;
-    /// The Main 10 vector is 50.
     const MAIN10_AU_COUNT: usize = 50;
 
-    /// How many frames each vector yields THROUGH THIS RUNG: **every picture it
-    /// displays**, which is what the vectors contain and what the Vulkan and D3D11VA
-    /// legs have always delivered.
-    ///
-    /// Three things have to hold together for these to be the frame counts rather than
-    /// something smaller, and until 2026-08-07 none of them did:
-    ///
-    /// * [`settle`] claims **every** output, not `outputs.last()`. An access unit that
-    ///   bumps several pictures out of the DPB — what an IDR with
-    ///   `no_output_of_prior_pics_flag` clear does, and what ordinary reordering does
-    ///   whenever the buffer drains — used to display the last and retire the rest.
-    /// * [`NativeVaapiDecoder::deliverable`] carries the surplus to the access units
-    ///   that output nothing, since the pump takes one frame per call. On a reordering
-    ///   stream those units are exactly where the reorder buffer refills, which is why
-    ///   the queue drains: the vendored H.264 vector's three seven-picture drains are
-    ///   each followed by precisely six output-less access units.
-    /// * [`NativeVaapiDecoder::flush`] drains the DPB at the end, or the tail the
-    ///   planner is still buffering never comes out at all.
-    ///
-    /// Derived, not recorded, by [`the_planner_already_says_how_many_frames_these_legs_can_deliver`],
-    /// which simulates all three over the real vectors on any CPU with no libva:
-    ///
-    /// | vector | AUs | pictures the planner outputs | stranded in the DPB | delivered |
-    /// |---|---|---|---|---|
-    /// | H.264 | 250 | 243 (25 units output none, 222 one, 3 seven) | 7 | **250** |
-    /// | H.265 | 250 | 249 (46 none, 159 one, 45 two) | 1 | **250** |
-    /// | Main 10 | 50 | 48 (5 none, 42 one, 3 two) | 2 | **50** |
-    ///
-    /// ⚠ The "flushed" count each leg prints is NOT the stranded column: a flush hands
-    /// back the deliverable queue's leftovers as well as the DPB's tail. Measured on
-    /// `.25`, H.264 flushes 7 (nothing left queued), H.265 flushes 2 (one still queued
-    /// plus its one stranded picture) and Main 10 flushes 2. The totals are what these
-    /// constants pin, because the split between the two is a property of where the
-    /// output-less access units happen to fall.
-    ///
-    /// ⚠ What this REPLACED, kept as [`H264_LAST_ONLY`] and asserted as a
-    /// counterfactual rather than described: one frame per access unit and no flush
-    /// delivered 225 / 204 / 45. That defect could not bite punktfunk's own streams —
-    /// hosts emit zero-reorder low-delay output with no B pictures, so `outputs` never
-    /// holds more than one picture and the queue is empty on every access unit — which
-    /// is exactly why it survived until a conformance vector was pointed at the rung.
+    /// Every displayed picture: settle-all + deliverable + flush. Derived by
+    /// [`the_planner_already_says_how_many_frames_these_legs_can_deliver`].
     const H264_DELIVERED: usize = 250;
     const H265_DELIVERED: usize = 250;
     const MAIN10_DELIVERED: usize = 50;
 
-    /// What the rung delivered until 2026-08-07: `outputs.last()` per access unit and
-    /// no end-of-stream flush.
-    ///
-    /// Kept as constants because a counterfactual with no expected value is a
-    /// counterfactual that cannot fail. These are what
-    /// [`the_planner_already_says_how_many_frames_these_legs_can_deliver`] reproduces
-    /// when it runs the simulation with a queue bound of zero and no flush — the two
-    /// halves of the old behaviour — and they are the numbers the three hardware legs
-    /// asserted when they were written.
+    /// Last-only and no flush, so the counterfactual has an expected value.
     const H264_LAST_ONLY: usize = 225;
     const H265_LAST_ONLY: usize = 204;
     const MAIN10_LAST_ONLY: usize = 45;
 
-    /// Byte offsets of every Annex-B NAL header in `stream`, in order.
-    ///
-    /// Emulation prevention guarantees `00 00 01` cannot appear inside a NAL payload,
-    /// so scanning for it finds start codes and nothing else; the header begins on the
-    /// byte after. Hand-rolled for the same reason [`split_ivf`] is — `pf-client-core`
-    /// does not depend on the vendored parser crate — and a VERBATIM port of
-    /// `video_d3d11_native`'s, so the two platform rungs are driven over the same
-    /// access units rather than over two splitters free to disagree. Kept honest by
-    /// the AU counts [`the_annex_b_splitters_still_cut_the_vendored_vectors`] asserts
-    /// on every ordinary Linux test run, which no plausible splitter bug survives.
+    /// Start-code scan. Emulation prevention means `00 00 01` is never payload.
     fn nal_headers(stream: &[u8]) -> Vec<usize> {
         let mut out = Vec::new();
         let mut i = 0usize;
@@ -3513,18 +2525,14 @@ mod tests {
         out
     }
 
-    /// Split `stream` into access units, given a per-NAL `(is_slice, starts_a_picture)`
-    /// rule. A new AU begins at a non-VCL NALU following slices, or at a slice that
-    /// declares itself the first of a picture when the current AU already has slices —
-    /// the same rule pf-bitstream applies, spelled once for both codecs.
+    /// New AU at a non-VCL after slices, or a first-of-picture slice while the AU already has slices.
     fn split_aus(stream: &[u8], classify: impl Fn(&[u8], usize) -> (bool, bool)) -> Vec<&[u8]> {
         let mut aus = Vec::new();
         let mut au_start = 0usize;
         let mut au_has_slice = false;
         for header in nal_headers(stream) {
             let (is_slice, first_in_picture) = classify(stream, header);
-            // The start code owning this header: three bytes, plus the optional
-            // leading zero byte of the four-byte form.
+            // Three-byte start code, plus the optional leading zero of the four-byte form.
             let mut start = header - 3;
             if start > 0 && stream[start - 1] == 0x00 {
                 start -= 1;
@@ -3540,10 +2548,7 @@ mod tests {
         aus
     }
 
-    /// H.264: one-byte NAL header, `nal_unit_type` in the low 5 bits (1 = non-IDR
-    /// slice, 5 = IDR slice), and `first_mb_in_slice == 0` is the top bit of the byte
-    /// after it. Load-bearing rather than decorative on this vector: it codes two
-    /// slices per picture, so without the flag every picture would be split in two.
+    /// `first_mb_in_slice == 0` is load-bearing: this vector codes two slices per picture.
     pub(super) fn split_h264_aus(stream: &[u8]) -> Vec<&[u8]> {
         split_aus(stream, |s, h| {
             let is_slice = matches!(s[h] & 0x1f, 1 | 5);
@@ -3552,11 +2557,7 @@ mod tests {
         })
     }
 
-    /// H.265: TWO-byte NAL header, `nal_unit_type` in bits 1..7 of the first byte and
-    /// "is a slice" the numeric range `< 32`, so `first_slice_segment_in_pic_flag` is
-    /// the top bit of the byte at `+2` where H.264 reads `+1`. Getting either wrong
-    /// silently merges or splits AUs, which surfaces as a frame-count mismatch a long
-    /// way from its cause.
+    /// Two-byte NAL header; first-slice flag is at `+2`, not H.264's `+1`.
     pub(super) fn split_h265_aus(stream: &[u8]) -> Vec<&[u8]> {
         split_aus(stream, |s, h| {
             let is_slice = (s[h] >> 1) & 0x3f < 32;
@@ -3565,19 +2566,7 @@ mod tests {
         })
     }
 
-    /// The splitters cut both vendored vectors into the access units every other rung's
-    /// legs count, and the Main 10 vector really is ten-bit.
-    ///
-    /// NOT `#[ignore]`d, unlike everything below it: the splitters are pure CPU, they
-    /// are a hand-rolled copy of code that lives in two other crates, and a drift in
-    /// them would reach the hardware legs as a frame-count mismatch on a box someone
-    /// had to walk to. Ordinary `cargo test -p pf-client-core --lib` catches it here
-    /// instead.
-    ///
-    /// The ten-bit check is the same guard `video_d3d11_native` carries and for the
-    /// same reason: a regenerated vector that came out 8-bit would turn
-    /// [`hevc_main10_decodes_the_ten_bit_vector_on_this_machines_vaapi`] into a second
-    /// run of the 8-bit path wearing a ten-bit name, and it would pass.
+    /// Not ignored: a regenerated 8-bit "Main 10" vector would pass the ten-bit leg.
     #[test]
     fn the_annex_b_splitters_still_cut_the_vendored_vectors() {
         assert_eq!(
@@ -3608,12 +2597,7 @@ mod tests {
         );
     }
 
-    /// One access unit's whole effect on the DPB, as the planner reports it — enough
-    /// to simulate both the DELIVERY and the SURFACE CLAIMS with no device.
-    ///
-    /// `stored` is a LIST rather than an `Option` because an AV1 access unit is a
-    /// temporal unit and may decode several pictures; H.264 and H.265 fill it with the
-    /// nought or one their planners report.
+    /// AV1 may store several pictures per temporal unit; H.26x store nought or one.
     #[derive(Debug, Default, Clone)]
     struct AuEffect {
         stored: Vec<u64>,
@@ -3621,21 +2605,14 @@ mod tests {
         removed: Vec<u64>,
     }
 
-    /// A whole vector, as this rung's model of it: every access unit's effect, the
-    /// end-of-stream flush's, and the DPB depth the session would be built for — which
-    /// is also the queue bound [`max_deliverable`] derives.
     struct VectorEffects {
         aus: Vec<AuEffect>,
         flush: AuEffect,
-        /// `plan.picture.max_dpb_frames`, read from the stream rather than assumed.
+        /// From the stream; also the [`max_deliverable`] bound.
         max_dpb_frames: usize,
     }
 
-    /// [`VectorEffects`] for an H.264 vector.
-    ///
-    /// Two small walks rather than one generic one because the two planners share no
-    /// trait: `AuPlan` and `AuPlanH265` are different types with the same `dpb` fields,
-    /// which is exactly the shape a macro would obscure for six saved lines.
+    /// Two walks: the planners share no trait.
     fn effects_h264(aus: &[&[u8]]) -> VectorEffects {
         let mut planner = pf_vaadec::H264Planner::new();
         let mut max_dpb_frames = 0usize;
@@ -3665,9 +2642,7 @@ mod tests {
         }
     }
 
-    /// [`effects_h264`] for HEVC. A skipped RASL picture is an access unit with no
-    /// effect at all, which is what the rung does with it too
-    /// ([`NativeVaapiDecoder::decode_h265`]).
+    /// RASL skip is an empty effect, matching [`NativeVaapiDecoder::decode_h265`].
     fn effects_h265(aus: &[&[u8]]) -> VectorEffects {
         let mut planner = pf_vaadec::H265Planner::new();
         let mut max_dpb_frames = 0usize;
@@ -3698,29 +2673,16 @@ mod tests {
         }
     }
 
-    /// What a whole vector does to this rung.
     #[derive(Debug, PartialEq, Eq)]
     struct Delivery {
-        /// Frames the pump receives, flush included.
         delivered: usize,
-        /// Frames decoded correctly and discarded because the queue hit its bound.
         dropped: usize,
-        /// The most surfaces claimed at once, at the moment [`Session::acquire_target`]
-        /// looks for a free one — a live slot, a pending output, a queued frame or the
-        /// frame the consumer was just handed.
+        /// Live slot + pending + queued + consumer-held, at `acquire_target`.
         peak_claim: usize,
     }
 
-    /// Drive one vector through this rung's DELIVERY MODEL — the ledger, the deliverable
-    /// queue, the one-frame-per-access-unit hand-off and the end-of-stream flush — with
-    /// no libva, no device and no surfaces.
-    ///
-    /// A faithful re-walk of [`NativeVaapiDecoder::decode`] in the order it does things,
-    /// because the order is where the defects were: the decode target is taken BEFORE
-    /// this unit's removals settle, outputs are claimed BEFORE `removed` retires them,
-    /// and the trim runs AFTER this unit's own frame has been shipped.
-    ///
-    /// `flush` is `None` for the counterfactual that reproduces the old behaviour.
+    /// Same order as decode: target before removals, claim before retire, trim after ship.
+    /// `flush = None` is last-only with no EOS.
     fn simulate(effects: &[AuEffect], flush: Option<&AuEffect>, cap: usize) -> Delivery {
         let mut live: std::collections::BTreeSet<u64> = Default::default();
         let mut pending: Vec<u64> = Vec::new();
@@ -3728,8 +2690,7 @@ mod tests {
         let (mut delivered, mut dropped, mut peak_claim) = (0usize, 0usize, 0usize);
         let mut consumer = 0usize;
 
-        /// [`settle`] itself, over ids: outputs claimed into the queue in display
-        /// order, THEN whatever left the DPB retired whether it was output or not.
+        /// Claim outputs, then retire `removed` whether shown or not.
         fn settle_ids(
             effect: &AuEffect,
             live: &mut std::collections::BTreeSet<u64>,
@@ -3748,15 +2709,10 @@ mod tests {
         }
 
         for effect in effects {
-            // `acquire_target` runs first and needs one free surface on top of
-            // everything already claimed — plus the frame the consumer was handed last
-            // access unit, which it has not necessarily let go of.
             let claimed =
                 live.len() + pending.iter().filter(|p| !live.contains(p)).count() + queue.len();
             peak_claim = peak_claim.max(claimed + consumer + 1);
 
-            // The conversion applies this unit's removals to the slot ledger, then
-            // `bind_setup` binds the picture it decoded.
             for id in &effect.removed {
                 live.remove(id);
             }
@@ -3766,7 +2722,6 @@ mod tests {
             }
             settle_ids(effect, &mut live, &mut pending, &mut queue);
 
-            // `take_deliverable`: this unit's own frame off the front, then the bound.
             consumer = usize::from(queue.pop_front().is_some());
             delivered += consumer;
             while queue.len() > cap {
@@ -3776,9 +2731,6 @@ mod tests {
         }
 
         if let Some(effect) = flush {
-            // `flush` hands back the queue AND everything the planner was still
-            // buffering, all at once — it is not bounded by the pump's one-per-call
-            // contract, because there is no next call.
             settle_ids(effect, &mut live, &mut pending, &mut queue);
             delivered += queue.len();
             queue.clear();
@@ -3794,15 +2746,6 @@ mod tests {
         }
     }
 
-    /// The three delivered-frame counts the hardware legs assert are what the PLANNER
-    /// implies, not what a hardware run happened to print — **and** the old behaviour
-    /// beside them, so the fix is a difference rather than an assertion.
-    ///
-    /// This is the difference between a number that explains itself and a number
-    /// somebody wrote down: it runs on any Linux box, with no GPU and no libva, and it
-    /// fails the moment a vector is regenerated or the planner's bumping changes —
-    /// which would otherwise show up as three mysterious hardware failures on a machine
-    /// somebody had to walk to.
     #[test]
     fn the_planner_already_says_how_many_frames_these_legs_can_deliver() {
         let vectors = [
@@ -3827,8 +2770,6 @@ mod tests {
         ];
 
         for (label, vector, expected, last_only) in &vectors {
-            // The bound the rung would actually run with, read off the stream rather
-            // than chosen here — `max_deliverable` is `max_dpb_frames`.
             let cap = vector.max_dpb_frames;
             let run = simulate(&vector.aus, Some(&vector.flush), cap);
             assert_eq!(
@@ -3841,10 +2782,6 @@ mod tests {
                 "{label}: and none of them may be dropped for want of queue depth"
             );
 
-            // ⚠ The counterfactual: the two halves of the old behaviour, together. A
-            // queue bound of 0 is "one picture per access unit, the rest retired
-            // unshown"; no flush is "the tail never comes out". That is what the rung
-            // did until 2026-08-07, and it is what these three legs asserted.
             let old = simulate(&vector.aus, None, 0);
             assert_eq!(
                 old.delivered, *last_only,
@@ -3859,25 +2796,10 @@ mod tests {
         }
     }
 
-    /// The deliverable queue never asks the pool for a surface it does not have.
-    ///
-    /// This is [`max_deliverable`]'s surface-lifetime argument run over the real
-    /// vectors rather than asserted. A queued frame INHERITS the claim its picture had
-    /// as a DPB reference — [`settle`] takes it out of `pending` in the same breath the
-    /// bump released its slot — so the queue's marginal cost is **at most one surface**,
-    /// measured at exactly zero on the H.264 vector, whose three seven-picture drains
-    /// are the deepest bursts any of these vectors produce.
-    ///
-    /// The counterfactual is the bound itself: an UNBOUNDED queue on a stream that
-    /// bumps two pictures on every access unit grows by one per unit until the pool
-    /// runs out, which is the failure `max_deliverable` exists to prevent and the one
-    /// no log would explain.
+    /// Queued frames inherit the DPB claim. Unbounded two-shown-per-AU grows until
+    /// the pool is exhausted.
     #[test]
     fn the_queue_never_needs_a_surface_the_pool_does_not_have() {
-        // The peaks are pinned, not merely bounded: a change that quietly claimed two
-        // more surfaces would still fit the pool and would still be a change worth
-        // seeing. `without` is the same walk with no carry-over at all — the rung as it
-        // stood before the queue existed.
         for (label, vector, peak, without) in [
             ("H.264", effects_h264(&split_h264_aus(H264_25FPS)), 9, 9),
             ("H.265", effects_h265(&split_h265_aus(H265_25FPS)), 8, 7),
@@ -3888,9 +2810,6 @@ mod tests {
             let run = simulate(&vector.aus, Some(&vector.flush), dpb);
             let queueless = simulate(&vector.aus, Some(&vector.flush), 0);
 
-            // The claim counted here is the DECODER's: live slots, pictures owing an
-            // output, queued frames, the frame just handed over and the target about to
-            // be taken. Everything the pool holds beyond it is the presenter's.
             assert_eq!(
                 (run.peak_claim, queueless.peak_claim),
                 (peak, without),
@@ -3915,16 +2834,7 @@ mod tests {
             );
         }
 
-        // ⚠ On H.264 and H.265 the queue is SELF-limiting and the bound never has to
-        // engage: an access unit decodes at most one picture, so it can only ever
-        // output what earlier units decoded, and the queue sheds one per unit. That is
-        // why the three vectors above drop nothing at any depth — and it is exactly
-        // why a bound is still needed, because the property is a fact about those
-        // codecs rather than about this rung. An AV1 temporal unit may decode SEVERAL
-        // pictures, and a non-conformant one that showed two per unit would grow the
-        // queue by one per unit until the pool ran out: every access unit after that
-        // refuses with "surface pool exhausted", three in a second demote the rung,
-        // and nothing in the log would name a queue that could never drain.
+        // Two shown per unit: H.26x cannot do this; the bound is for AV1.
         let relentless: Vec<AuEffect> = (0..64u64)
             .map(|i| AuEffect {
                 stored: vec![i * 2, i * 2 + 1],
@@ -3957,8 +2867,6 @@ mod tests {
         );
     }
 
-    /// The first frame a leg got back — enough to say the rung exported a real surface
-    /// of the right shape and pixel format, which is the most it can honestly claim.
     #[derive(Clone, Copy)]
     struct FirstFrame {
         width: u32,
@@ -3968,32 +2876,7 @@ mod tests {
         keyframe: bool,
     }
 
-    /// Drive one Annex-B vector's access units through a freshly built rung and report
-    /// how many frames came back and what the first one was.
-    ///
-    /// Shared by all three H.26x legs so that "the H.265 leg proves the same thing the
-    /// H.264 leg does" is a fact about one function rather than a claim about three
-    /// hand-copied ones — the same reasoning `pf-vkdecode`'s `common` module records
-    /// for binding its three decoders to one driver.
-    ///
-    /// # What these legs prove, and what they do not
-    ///
-    /// A DECODE measurement, not frame-hash parity: every access unit is accepted, the
-    /// expected number of frames comes back, and each one is a real exported surface of
-    /// the right shape and fourcc. Nothing here looks at a PIXEL.
-    ///
-    /// That used to be all this rung could claim, because it hands out a **DRM-PRIME
-    /// dmabuf** whose memory the driver tiles and there was no CPU-readable image to
-    /// hash. The `parity` module below adds one, test-only, and its legs are what check
-    /// the pixels against libavcodec's goldens — the same goldens the Vulkan and
-    /// D3D11VA rungs are held to. These legs stay because they are the cheaper question
-    /// and they fail FIRST: a rung that stopped decoding at all should say so without
-    /// waiting for 250 hashes.
-    ///
-    /// Fails loudly rather than skipping when the device has no entry point for the
-    /// profile: these legs are `#[ignore]`d, so they only run when someone deliberately
-    /// points them at a box that is supposed to have one, and a silent pass there is
-    /// the invisible-failure mode this whole program exists to end.
+    /// Decode measurement, not pixels. Shared so the three H.26x legs cannot diverge.
     fn run_annex_b(
         codec: pf_vaadec::Codec,
         stream: StreamFormat,
@@ -4034,9 +2917,6 @@ mod tests {
                 Err(e) => panic!("{label} AU {index}: VAAPI decode failed: {e:#}"),
             }
         }
-        // The tail: pictures the planner was still buffering for reorder when the
-        // vector ran out. Seven of 250 on H.264, one on H.265, two of 50 on Main 10 —
-        // decoded, never asked for, and lost outright until this rung had a flush.
         let flushed = decoder.flush();
         for (index, frame) in flushed.iter().enumerate() {
             record(frame, &format!("flushed frame {index}"));
@@ -4062,12 +2942,6 @@ mod tests {
         (delivered, first)
     }
 
-    /// Does this machine's VAAPI actually DECODE H.264 — the question the evidence
-    /// table has answered "no hardware has ever tried" since M6.
-    ///
-    /// See [`run_annex_b`] for what this proves and, more importantly, what it does
-    /// not: it is a decode measurement. The pixels are
-    /// `parity::h264_every_frame_hashes_bit_identical_to_libavcodec`'s business.
     #[test]
     #[ignore = "needs a machine with a libva runtime and an H.264 VLD entry point"]
     fn h264_decodes_the_vendored_vector_on_this_machines_vaapi() {
@@ -4093,12 +2967,6 @@ mod tests {
              can_deliver for the same number derived without a device"
         );
 
-        // The first frame delivered IS the IDR, bumped out several access units after
-        // it decoded — so this is the label travelling with the PICTURE rather than
-        // with whatever access unit displaced it. It is `DecodedImage::is_keyframe`,
-        // the pump's post-loss re-anchor signal: mislabelled (as it was until
-        // 2026-08-07) the pump re-anchors on the wrong frame and keeps asking for a
-        // keyframe it has already been sent.
         assert!(
             first.keyframe,
             "the vector opens on an IDR, so the first delivered frame must be flagged \
@@ -4106,12 +2974,7 @@ mod tests {
         );
     }
 
-    /// The same question for H.265, whose leg has never decoded a frame either.
-    ///
-    /// Not a redundant copy of the H.264 leg: HEVC reaches an entirely different
-    /// conversion in `pf-vaadec` (its own picture parameters, its own reference-picture
-    /// set, its own slice header) and a different arm of [`NativeVaapiDecoder::decode`]
-    /// — including the `RaslSkipped` Ok-skip no other codec has.
+    /// Different conversion and the `RaslSkipped` Ok-skip no other codec has.
     #[test]
     #[ignore = "needs a machine with a libva runtime and an HEVC Main VLD entry point"]
     fn h265_decodes_the_vendored_vector_on_this_machines_vaapi() {
@@ -4141,11 +3004,6 @@ mod tests {
         );
     }
 
-    /// And the ten-bit leg, which is the one every HDR session lands on.
-    ///
-    /// The fourcc assertion is the point of running it at all: `Session::build` picks
-    /// P010 from the SPS's bit depth, and a pool that came out NV12 would be a ten-bit
-    /// stream decoded into an 8-bit surface.
     #[test]
     #[ignore = "needs a machine with a libva runtime and an HEVC Main 10 VLD entry point"]
     fn hevc_main10_decodes_the_ten_bit_vector_on_this_machines_vaapi() {
@@ -4180,26 +3038,19 @@ mod tests {
 
 #[cfg(test)]
 mod parity {
-    //! Ignored VAAPI frame-parity tests; run on a host with a real device:
-    //! `cargo test -p pf-client-core --lib video_vaapi_native -- --include-ignored --nocapture`.
-    //! Pin multi-GPU runs with `PUNKTFUNK_VAAPI_DEVICE=/dev/dri/renderD…`.
+    //! Ignored frame-parity tests against libavcodec goldens in `pf-vkdecode/tests/data`.
+    //! Run: `cargo test -p pf-client-core --lib video_vaapi_native -- --include-ignored --nocapture`.
+    //! Pin a GPU with `PUNKTFUNK_VAAPI_DEVICE=/dev/dri/renderD…`.
     //!
-    //! Seven H.264, H.265/Main10, and AV1 vector/low-delay legs hash every delivered
-    //! display frame, including flush output, against the shared libavcodec software
-    //! goldens in `pf-vkdecode/tests/data`; order, drops, crop, and pixels must match.
-    //! The 4K AV1 fixture covers two tiles; hidden AV1 frames are observed only through
-    //! later displayed dependants. Main10 is packed as high-bit-aligned P010.
+    //! Seven H.264 / H.265 / Main10 / AV1 legs hash every delivered frame, flush
+    //! included. Hidden AV1 frames are observed only through later displayed
+    //! dependants. Main10 is high-bit-aligned P010. The 4K AV1 fixture is two tiles.
     //!
-    //! Readback is test-only: [`ImageApi`] and all libva image symbols exist only under
-    //! `#[cfg(test)]`; production [`Libva`] remains DRM-PRIME/dmabuf zero-copy, and
-    //! [`the_readback_entry_points_are_resolved_only_inside_this_module`] enforces this boundary.
-    //! [`Readback`] tries `vaDeriveImage`, then `vaCreateImage` + `vaGetImage`, and fails
-    //! rather than skipping if neither returns the pool fourcc. `PF_VAAPI_READBACK=derive|getimage`
-    //! forces a route; when both work, their first-frame bytes must agree.
-    //! [`pf_vaadec::pack_two_plane`] uses driver offsets/pitches and is CPU-unit-tested.
-    //!
-    //! All seven legs were bit-identical on Radeon 780M/radeonsi (Mesa 26.0.3, VA-API 1.23);
-    //! this is driver-specific evidence, not proof for Intel or other VAAPI implementations.
+    //! Readback is test-only: [`ImageApi`] lives under `#[cfg(test)]`; production
+    //! [`Libva`] stays DRM-PRIME. [`Readback`] tries derive then get-image and fails
+    //! rather than skipping. `PF_VAAPI_READBACK=derive|getimage` pins a route.
+    //! [`the_readback_entry_points_are_resolved_only_inside_this_module`] pins the
+    //! boundary. Evidence is driver-specific, not a proof for every VAAPI.
 
     use sha2::Digest;
 
@@ -4212,12 +3063,6 @@ mod parity {
     use super::tests::MAIN10_H265;
     use super::*;
 
-    // -----------------------------------------------------------------------
-    // The vectors and their goldens — the same files the other two rungs use
-    // -----------------------------------------------------------------------
-
-    /// libavcodec's per-display-frame NV12 hashes for the vendored H.264 vector.
-    /// Read across the crate boundary rather than copied — see the module docs.
     const GOLDENS_H264: &str = include_str!("../../pf-vkdecode/tests/data/test-25fps.nv12.sha256");
     const GOLDENS_H265: &str =
         include_str!("../../pf-vkdecode/tests/data/test-25fps-h265.nv12.sha256");
@@ -4226,69 +3071,39 @@ mod parity {
     const GOLDENS_AV1: &str =
         include_str!("../../pf-vkdecode/tests/data/test-25fps-av1.nv12.sha256");
 
-    /// **Our own host's low-delay H.264** and its goldens — the stream shape a
-    /// conformance vector cannot be, and the one that caught the D3D11VA rung's
-    /// release-ordering defect. 120 pictures of 640x480 IPPP with
-    /// `max_num_reorder_frames = 0` and a DPB exactly as deep as its three references.
-    ///
-    /// This rung is argued EXEMPT from that defect for a reason that is a property of
-    /// the interface rather than of any stream (this file's module docs): a slot is not
-    /// a surface here, and [`Session::acquire_target`] takes the target and the
-    /// reference table from one snapshot. That argument is good; it had never been
-    /// checked in PIXELS on the stream it is about, and "we reasoned it cannot happen"
-    /// is what the other two rungs also believed.
+    /// Host low-delay H.264: `max_num_reorder_frames = 0`. Pixels-check of the
+    /// one-snapshot exemption (module docs).
     const LOWDELAY_H264: &[u8] =
         include_bytes!("../../pf-vkdecode/tests/data/lowdelay-640x480.h264");
     const GOLDENS_LOWDELAY_H264: &str =
         include_str!("../../pf-vkdecode/tests/data/lowdelay-640x480.nv12.sha256");
 
-    /// The HEVC twin of [`LOWDELAY_H264`]: 120 pictures of 640x480 IPPP,
-    /// `sps_max_num_reorder_pics = 0`, 115 of the 120 access units retiring a picture.
+    /// Host low-delay HEVC twin of [`LOWDELAY_H264`].
     const LOWDELAY_H265: &[u8] =
         include_bytes!("../../pf-vkdecode/tests/data/lowdelay-640x480.h265");
     const GOLDENS_LOWDELAY_H265: &str =
         include_str!("../../pf-vkdecode/tests/data/lowdelay-640x480-h265.nv12.sha256");
 
-    /// **Our own host's AV1**, and the only stream this rung decodes with more than ONE
-    /// TILE: at 4K the split encode emits `tile_cols = 1, tile_rows = 2` with both tiles
-    /// in a single Tile Group OBU. 1440p and below measured single-tile, so 4K is the
-    /// only shape that has the property.
-    ///
-    /// ⚠ A file fixture is not the wire path, and on AV1 that distinction has already
-    /// cost a release: "250/250 delivered frames bit-identical" was true for the whole
-    /// period the host was shipping only the first tile of every 4K frame, because the
-    /// truncation lived in packetisation. This leg gives the multi-tile shape pixel
-    /// coverage on the DECODE rung and proves nothing about fragmentation or loss.
+    /// Host 4K AV1, two tiles in one Tile Group OBU. Decode coverage only — not the
+    /// wire path; packetisation once shipped only the first tile while this would pass.
     const LOWDELAY_AV1: &[u8] =
         include_bytes!("../../pf-vkdecode/tests/data/lowdelay-3840x2160.ivf.av1");
     const GOLDENS_LOWDELAY_AV1: &str =
         include_str!("../../pf-vkdecode/tests/data/lowdelay-3840x2160-av1.nv12.sha256");
 
-    /// libavcodec's decode of the AV1 vector's FIRST display frame, as raw NV12 —
-    /// 115200 bytes, and the only golden in this program that is pixels rather than a
-    /// hash.
-    ///
-    /// It buys the one thing a hash cannot: when display frame 0 diverges, this says
-    /// WHERE. Frame 0 of that vector is a key frame with no references at all, so a
-    /// divergence there is readback geometry (pitch, crop, plane offset) or the tile
-    /// records — never reference handling — and [`localise`] separates those by naming
-    /// the plane, the bounding box and the magnitude.
+    /// Frame 0 is intra with no refs: a mismatch is readback geometry or tiles, not refs.
     const AV1_FRAME0_NV12: &[u8] =
         include_bytes!("../../pf-vkdecode/tests/data/test-25fps-av1.frame0.nv12");
 
-    /// The vendored vectors' access-unit / temporal-unit counts.
     const H26X_AU_COUNT: usize = 250;
     const MAIN10_AU_COUNT: usize = 50;
     const AV1_UNIT_COUNT: usize = 250;
-    /// 250 temporal units carrying **274 frames**, of which 250 are shown.
     const AV1_DECODED_COUNT: usize = 274;
     const AV1_SHOWN_COUNT: usize = 250;
     const DISPLAY_AV1: (u32, u32) = (320, 240);
 
-    /// Our host's streams. Three separate constants per AV1 stream, never derived from
-    /// one another: the vendored vector is 250 / 274 / 250 and this one is 60 / 60 / 60,
-    /// and a harness that computed "hidden = 0" from either would stop checking the
-    /// other.
+    /// Not derived from each other: a harness that computed hidden=0 from one stream
+    /// would stop checking the other.
     const LOWDELAY_H264_AU_COUNT: usize = 120;
     const LOWDELAY_H265_AU_COUNT: usize = 120;
     const LOWDELAY_AV1_UNIT_COUNT: usize = 60;
@@ -4296,7 +3111,6 @@ mod parity {
     const LOWDELAY_AV1_SHOWN_COUNT: usize = 60;
     const DISPLAY_LOWDELAY_AV1: (u32, u32) = (3840, 2160);
 
-    /// The golden file's hash lines (comments and blanks skipped).
     fn golden_hashes(file: &'static str) -> Vec<&'static str> {
         file.lines()
             .map(str::trim)
@@ -4314,19 +3128,8 @@ mod parity {
             })
     }
 
-    // -----------------------------------------------------------------------
-    // The readback — libva's image entry points, resolved ONLY here
-    // -----------------------------------------------------------------------
-
-    /// The image half of libva, dlopen'd by the harness itself.
-    ///
-    /// Deliberately NOT fields on the production [`Libva`]: keeping them in a
-    /// `#[cfg(test)]` type is what makes "the readback cannot reach the production
-    /// path" a fact about what is COMPILED rather than a claim about what is called
-    /// (module docs). `dlopen` is reference-counted, so resolving these out of a second
-    /// handle on `libva.so.2` reaches the same mapped library and the same
-    /// per-`VADisplay` driver state as the rung's own handle — the display pointer they
-    /// are handed is the rung's.
+    /// Test-only. A second `dlopen` of `libva.so.2` is a refcount bump on the same
+    /// mapped library; the display pointer is the rung's.
     struct ImageApi {
         _va: libloading::Library,
         derive_image:
@@ -4395,36 +3198,27 @@ mod parity {
         }
     }
 
-    /// Which libva call read the surface.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Route {
         Derive,
         GetImage,
     }
 
-    /// A `vaCreateImage`d image, reused for every frame of a leg.
     struct Staging {
         image: pf_vaadec::VaImage,
         size: (u32, u32),
         fourcc: u32,
     }
 
-    /// GPU→CPU readback of one decoded surface, cropped to the picture and packed
-    /// tightly as NV12/P010 — byte for byte the layout the goldens hash.
     struct Readback {
         api: ImageApi,
-        /// Every `VAImageFormat` this driver offers, from `vaQueryImageFormats`. The
-        /// descriptor `vaCreateImage` is handed is the driver's OWN rather than one
-        /// this file guessed a `bits_per_pixel` for.
+        /// Driver's own formats — not a guessed `bits_per_pixel`.
         formats: Vec<pf_vaadec::VaImageFormat>,
         staging: Option<Staging>,
-        /// `PF_VAAPI_READBACK`, if it pinned a route.
         forced: Option<Route>,
-        /// The route that worked, once one has. Latched so a driver that refuses derive
-        /// pays for that refusal once rather than once per frame.
+        /// Latched so a refused derive is paid once, not per frame.
         route: Option<Route>,
-        /// The image size `vaGetImage` accepted — the picture, or the whole surface on
-        /// a driver that refuses a sub-region.
+        /// Picture, or the whole surface if the driver refuses a sub-region.
         get_size: Option<(u32, u32)>,
         derived: u64,
         fetched: u64,
@@ -4471,7 +3265,6 @@ mod parity {
             }
         }
 
-        /// The fourccs this driver says it can produce, for a refusal that names them.
         fn offered(&self) -> String {
             self.formats
                 .iter()
@@ -4485,8 +3278,6 @@ mod parity {
                 .join(" ")
         }
 
-        /// Map an image, pack the picture out of it, unmap. The only place a raw
-        /// pointer becomes a slice.
         fn read_mapped(
             &self,
             d: &Display,
@@ -4531,17 +3322,8 @@ mod parity {
             packed
         }
 
-        /// What a derived image says about the surface's real layout, for the probe.
-        ///
-        /// Worth printing rather than assuming, and this is not idle: on `.25`'s
-        /// radeonsi the decode surfaces for every fixture here turned out to have NO
-        /// vertical padding — `offsets[1]` is exactly `pitch * height` — so the
-        /// chroma-plane trap that walk exists to avoid is not exercised by ANY hardware
-        /// leg on this driver. That is why `pf-vaadec`'s
-        /// `reading_chroma_at_the_display_height_would_have_been_caught` drives a
-        /// deliberately padded surface on the CPU: it is the only place that geometry is
-        /// checked at all, and a reader who assumed the hardware legs covered it would
-        /// be wrong.
+        /// Some drivers have no vertical padding; the chroma-offset trap is CPU-tested
+        /// in `pf-vaadec`.
         fn describe(&self, d: &Display, surface: VaSurfaceId) -> String {
             let mut image = pf_vaadec::VaImage::zeroed();
             // SAFETY: a live display and a surface from its own pool; `image` is a
@@ -4571,8 +3353,6 @@ mod parity {
             text
         }
 
-        /// `vaDeriveImage` — the surface's own memory, when the driver can address it
-        /// linearly.
         fn read_via_derive(
             &self,
             d: &Display,
@@ -4594,7 +3374,6 @@ mod parity {
             out
         }
 
-        /// Ensure the staging image is `size` in `fourcc`, creating or recreating it.
         fn ensure_staging(
             &mut self,
             d: &Display,
@@ -4650,7 +3429,6 @@ mod parity {
             }
         }
 
-        /// `vaCreateImage` + `vaGetImage` at one image size.
         fn get_into(
             &mut self,
             d: &Display,
@@ -4686,9 +3464,7 @@ mod parity {
             self.read_mapped(d, &image, display, fourcc)
         }
 
-        /// `vaGetImage`, trying the picture-sized region first and the whole surface
-        /// second — a driver that refuses a sub-region still answers, and the crop then
-        /// happens in [`pf_vaadec::pack_two_plane`] instead.
+        /// Picture first, then the whole surface; crop in [`pf_vaadec::pack_two_plane`].
         fn read_via_get_image(
             &mut self,
             d: &Display,
@@ -4744,11 +3520,7 @@ mod parity {
             }
         }
 
-        /// The picture in `surface`, by whichever route this driver supports.
-        ///
-        /// Panics — loudly, with what every route said — when none of them can read it.
-        /// There is deliberately no skip: a leg that could not read a surface must
-        /// fail, not pass quietly (module docs).
+        /// No skip: an unread surface must fail, not pass.
         fn read(
             &mut self,
             d: &Display,
@@ -4758,11 +3530,7 @@ mod parity {
             fourcc: u32,
             what: &str,
         ) -> Vec<u8> {
-            // The surface must be finished before it is read. The production export
-            // does exactly this before the fds leave, and for the same reason: VAAPI
-            // exposes no fence to the consumer.
-            //
-            // SAFETY: a live display and a surface from its own pool.
+            // SAFETY: a live display and a surface from its own pool. VAAPI has no fence.
             let status = unsafe { (d.va.sync_surface)(d.display, surface) };
             if status != VA_STATUS_SUCCESS {
                 panic!("{what}: {:#}", d.va.err("vaSyncSurface", status));
@@ -4800,16 +3568,8 @@ mod parity {
             );
         }
 
-        /// Read one surface through BOTH routes and require them to agree.
-        ///
-        /// The only check that can catch a `vaDeriveImage` which "succeeds" onto tiled
-        /// bytes: the descriptor looks ordinary, the walk reads it happily, and the
-        /// pixels are a permutation of the picture. `vaGetImage` asks the driver to
-        /// detile, so where both answer, agreement is evidence that derive's mapping
-        /// really is linear.
-        ///
-        /// A route that refuses is reported, not failed: that is exactly the case
-        /// [`Self::read`] is written to survive.
+        /// Derive can "succeed" onto tiled bytes. Agreement with get-image is evidence
+        /// the mapping is linear. A refused route is reported, not failed.
         fn cross_check(
             &mut self,
             d: &Display,
@@ -4856,8 +3616,6 @@ mod parity {
             }
         }
 
-        /// One line naming which route answered and how often, so a run says it rather
-        /// than leaving it to be inferred from a passing test.
         fn summary(&self) -> String {
             format!(
                 "readback via {:?} ({} derived, {} vaGetImage)",
@@ -4866,30 +3624,13 @@ mod parity {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Divergence: what a hash mismatch will not tell you
-    // -----------------------------------------------------------------------
-
-    /// Where two same-shaped pictures differ.
-    ///
-    /// "N frames differ" is not a lead; "first divergence at frame 3, one 16x24 luma
-    /// block, chroma clean" is what solved the last two defects in this program. This
-    /// is what turns the former into the latter wherever a reference picture exists —
-    /// [`AV1_FRAME0_NV12`] for AV1 display frame 0, the two readback routes against
-    /// each other, and the harness's own bytes in the counterfactual that proves the
-    /// comparison can fail.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct Divergence {
         luma_samples: usize,
         chroma_samples: usize,
-        /// Inclusive bounding box of the differing LUMA samples, in picture
-        /// coordinates.
         luma_box: Option<(u32, u32, u32, u32)>,
         max_delta: u32,
-        /// Ten-bit only: samples whose low six bits are set. P010 puts the ten
-        /// meaningful bits in the HIGH end of each 16-bit word, so a non-zero count
-        /// here means the driver handed back LSB-aligned samples and the divergence is
-        /// a format misunderstanding rather than a decode fault.
+        /// P010 ten bits are in the high end; non-zero low six bits is a format error.
         low_bits_set: usize,
     }
 
@@ -4927,7 +3668,6 @@ mod parity {
         }
     }
 
-    /// Compare two tightly packed pictures of the same shape.
     fn localise(got: &[u8], want: &[u8], display: (u32, u32), fourcc: u32) -> Divergence {
         let stride = if fourcc == pf_vaadec::VA_FOURCC_P010 {
             2usize
@@ -4976,29 +3716,11 @@ mod parity {
         d
     }
 
-    // -----------------------------------------------------------------------
-    // Decode and display order, from a planner run alongside the decoder's own
-    // -----------------------------------------------------------------------
-
-    /// The decode order and the display order of a stream's pictures, as `PicId`s.
-    ///
-    /// Both come from a planner run ALONGSIDE the rung's own, over the same access
-    /// units: the planner is deterministic, so the ids it hands this walk are the ids
-    /// it hands the rung, and no production code has to grow a test accessor.
-    ///
-    /// The hardware legs do not USE this to find surfaces — they hash what the rung
-    /// delivers, in delivery order (module docs). It is what the CPU guards check the
-    /// golden files and the frame counts against, so a regenerated vector fails on a
-    /// laptop rather than on the one box with a VAAPI driver.
+    /// Planner walk alongside the rung. Hardware legs hash delivery order; CPU
+    /// guards check goldens against this. RASL skip contributes an empty `per_unit`.
     struct Order {
-        /// Every DECODED picture in submission order — one per access unit on
-        /// H.264/H.265, one per FRAME on AV1 where a unit may carry several.
         decode: Vec<u64>,
-        /// The same ids in the planner's output (bumping) order, flush included.
         display: Vec<u64>,
-        /// The ids each ACCESS UNIT decodes, in submission order. An access unit that
-        /// decodes nothing — an HEVC RASL skipped after an open-GOP join — contributes
-        /// an EMPTY entry rather than none, so the index stays the unit's own.
         per_unit: Vec<Vec<u64>>,
     }
 
@@ -5037,12 +3759,6 @@ mod parity {
         order
     }
 
-    /// [`order_h264`] for HEVC, with the one thing H.264 has no counterpart to: a
-    /// **RASL picture skipped after an open-GOP join** decodes nothing.
-    ///
-    /// `PlanErrorH265::RaslSkipped` is the spec's own answer (8.1.3 NOTE) and the rung
-    /// treats it as an Ok-skip, so such an access unit contributes no picture and no
-    /// output.
     fn order_h265(aus: &[&[u8]]) -> Order {
         let mut planner = pf_vaadec::H265Planner::new();
         let mut order = Order::empty();
@@ -5072,13 +3788,7 @@ mod parity {
         order
     }
 
-    /// The AV1 stream's decode and display orders.
-    ///
-    /// Where the H.264/H.265 walks push one decoded picture per access unit, this one
-    /// pushes one per FRAME and a unit may carry several — which is the whole
-    /// difference. `display` is still the planner's own output list; AV1 has no bumping
-    /// process, so a picture is output by the unit that shows it and there is no flush
-    /// to drain at the end.
+    /// One decoded picture per FRAME; a unit may carry several. No planner flush.
     fn order_av1(units: &[&[u8]], render: (u32, u32)) -> Order {
         let mut planner = pf_vaadec::Av1Planner::new();
         let mut order = Order::empty();
@@ -5109,17 +3819,7 @@ mod parity {
         order
     }
 
-    // -----------------------------------------------------------------------
-    // The runs
-    // -----------------------------------------------------------------------
-
-    /// Read back the picture a delivered frame carries, packed as the goldens hash it.
-    ///
-    /// The frame names its own surface — [`VaRelease::surface`], stamped when `finish`
-    /// exported it — so nothing here has to work out which pool entry holds which
-    /// picture. It also carries its own display region and fourcc, recorded when the
-    /// picture DECODED (`PictureFacts`), which is the same pair the presenter is handed;
-    /// reading them from anywhere else would be a second guess that could differ.
+    /// Surface, display region, and fourcc from the delivered frame, not re-derived.
     fn read_frame(
         decoder: &NativeVaapiDecoder,
         readback: &mut Readback,
@@ -5150,9 +3850,7 @@ mod parity {
              refuse that before it ships"
         );
         let display = (frame.width, frame.height);
-        // The first frame of a leg is read through BOTH routes, and they must agree.
-        // Skipped when a route was PINNED: the pin exists precisely for a box where one
-        // of them is wrong, and failing the run because it is wrong would defeat it.
+        // Cross-check unless a route was pinned (the pin is for a box where one is wrong).
         if readback.route.is_none() && readback.forced.is_none() {
             readback.cross_check(&decoder.display, surface, display, coded, fourcc, what);
         }
@@ -5165,14 +3863,6 @@ mod parity {
         bytes
     }
 
-    /// Compare the hash of every DELIVERED frame against the goldens, in order,
-    /// printing the first ten divergences and returning how many there were and where
-    /// the first one is.
-    ///
-    /// A separate function from the run that produces the hashes so it can be driven
-    /// from a CPU test with a deliberately corrupted list —
-    /// [`the_comparison_catches_a_corrupted_frame`] is that counterfactual, and it is
-    /// the answer to "prove this harness can fail".
     fn compare(hashes: &[String], goldens: &[&str], label: &str) -> (usize, Option<usize>) {
         let mut mismatches = 0usize;
         let mut first = None;
@@ -5190,7 +3880,6 @@ mod parity {
         (mismatches, first)
     }
 
-    /// The verdict, spelled the way the last two defects were localised from.
     fn verdict(
         mismatches: usize,
         first: Option<usize>,
@@ -5213,9 +3902,6 @@ mod parity {
         );
     }
 
-    /// Write one frame's raw planes to the temp directory when `PF_VAAPI_DUMP` is set —
-    /// the lever that turned "186 frames differ" into a located defect on the D3D11VA
-    /// rung, by giving `ffmpeg -f rawvideo` something to compare against.
     fn dump(tag: &Option<String>, label: &str, what: &str, bytes: &[u8]) {
         let Some(tag) = tag else { return };
         let path = std::env::temp_dir().join(format!(
@@ -5226,28 +3912,14 @@ mod parity {
         eprintln!("dumped {what} -> {}", path.display());
     }
 
-    /// Everything a run collects, so the two drivers below can share the assertions
-    /// that matter rather than two hand-copied sets.
     struct Delivered {
         hashes: Vec<String>,
-        /// The first delivered frame's keyframe flag — a fact about the DELIVERY path
-        /// that used to be wrong on every reordering stream.
         first_keyframe: bool,
-        /// The first delivered frame's pixels, for the one leg that has libavcodec's.
         first_bytes: Vec<u8>,
-        /// How many frames the deliverable queue had to DROP. Anything but zero is a
-        /// golden that can never be checked.
         dropped: u64,
     }
 
-    /// Drive one stream's access units through a real rung, hashing every frame it
-    /// hands back, then drain the tail.
-    ///
-    /// The tail is not optional and not bookkeeping: `flush` is where the pictures the
-    /// DPB is still buffering for reorder come from — seven of the H.264 vector's 250,
-    /// two of the HEVC vector's, two of Main 10's — and a run that stopped at the last
-    /// access unit would be exactly that many frames short of the goldens, which reads
-    /// like missing pictures rather than like a harness that never asked.
+    /// Hash every delivered frame, then flush: stopping at the last AU misses the DPB tail.
     fn drive(
         decoder: &mut NativeVaapiDecoder,
         readback: &mut Readback,
@@ -5290,8 +3962,6 @@ mod parity {
         }
     }
 
-    /// The assertions every leg makes about what came back, before a single hash is
-    /// compared.
     fn check_delivery(d: &Delivered, goldens: &[&str], label: &str) {
         assert_eq!(
             d.dropped, 0,
@@ -5320,8 +3990,6 @@ mod parity {
         );
     }
 
-    /// Decode `aus` through a real [`NativeVaapiDecoder`] and compare every delivered
-    /// frame against libavcodec's goldens.
     fn parity_run(
         codec: pf_vaadec::Codec,
         stream: StreamFormat,
@@ -5370,19 +4038,7 @@ mod parity {
         );
     }
 
-    /// The AV1 leg of [`parity_run`].
-    ///
-    /// It drives the same production entry point — [`NativeVaapiDecoder::decode`] takes
-    /// a whole temporal unit, exactly as the stream does — so the unit loop,
-    /// `frame_av1`'s slot bookkeeping and the `show` suppression are all under test. Two
-    /// things make it a separate function rather than a parameter:
-    ///
-    /// * a temporal unit is not a picture. 24 of the vendored vector's 250 units carry a
-    ///   HIDDEN frame as well as the shown one, so 274 pictures decode and 250 display,
-    ///   and this leg asserts that gap from the planner rather than assuming it;
-    /// * it has libavcodec's actual PIXELS for display frame 0 ([`AV1_FRAME0_NV12`]),
-    ///   which is the only place in this program a divergence can be localised without
-    ///   a second GPU to compare against.
+    /// Temporal units, not pictures. Frame 0 pixels localise without a second GPU.
     #[allow(clippy::too_many_arguments)]
     fn av1_parity_run(
         units: &[&[u8]],
@@ -5423,8 +4079,6 @@ mod parity {
              harness serves both shapes"
         );
 
-        // The one place in this program where a divergence can be localised without a
-        // second GPU to compare against: libavcodec's own first frame, as pixels.
         if let Some(golden) = frame0_golden {
             if delivered.first_bytes.as_slice() != golden {
                 let diff = localise(
@@ -5460,10 +4114,6 @@ mod parity {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // The legs
-    // -----------------------------------------------------------------------
-
     #[test]
     #[ignore = "needs a machine with a libva runtime and an H.264 VLD entry point"]
     fn h264_every_frame_hashes_bit_identical_to_libavcodec() {
@@ -5480,12 +4130,6 @@ mod parity {
         );
     }
 
-    /// **Our own host's output** rather than a conformance vector — the shape that
-    /// caught the D3D11VA rung's release-ordering defect after the vector had passed
-    /// 250/250 on four GPUs across two milestones.
-    ///
-    /// See [`LOWDELAY_H264`] for why this rung is argued exempt from that defect, and
-    /// why the argument being good is not the same as its having been checked.
     #[test]
     #[ignore = "needs a machine with a libva runtime and an H.264 VLD entry point"]
     fn low_delay_host_h264_every_frame_hashes_bit_identical_to_libavcodec() {
@@ -5534,14 +4178,7 @@ mod parity {
         );
     }
 
-    /// The ten-bit path, which every HDR session lands on.
-    ///
-    /// It exercises geometry the 8-bit legs cannot: **P010 samples are two bytes**, so a
-    /// row is `width * 2`, and HEVC's granule pads a 240-line picture to a 256-line
-    /// surface — the chroma plane therefore starts a long way from where the display
-    /// height would put it. And it is the only leg that can tell a Main 10 session that
-    /// BUILDS from one that decodes correctly: VAAPI has no per-picture decode status
-    /// query, so a stream decoding to garbage logs exactly as cleanly.
+    /// P010 is two bytes per sample; HEVC pads 240 to 256, so chroma is not at display height.
     #[test]
     #[ignore = "needs a machine with a libva runtime and an HEVC Main 10 VLD entry point"]
     fn main10_every_frame_hashes_bit_identical_to_libavcodec() {
@@ -5578,11 +4215,7 @@ mod parity {
         );
     }
 
-    /// **Our own host's AV1, at the only resolution where it emits more than one tile.**
-    /// The leg above runs a vector whose every frame is `tile_cols = tile_rows = 1`, so
-    /// every tile field `plan_to_va_av1` fills is the degenerate case. This stream is
-    /// `tile_rows = 2` on all 60 frames with both tiles in one Tile Group OBU — and it
-    /// is 4K, so the readback moves 12.4 MB per frame.
+    /// Two tiles; the vendored vector is single-tile so `plan_to_va_av1` would stay degenerate.
     #[test]
     #[ignore = "needs a machine with a libva runtime and an AV1 VLD entry point"]
     fn low_delay_host_av1_every_frame_hashes_bit_identical_to_libavcodec() {
@@ -5595,23 +4228,12 @@ mod parity {
             LOWDELAY_AV1_UNIT_COUNT,
             LOWDELAY_AV1_DECODED_COUNT,
             LOWDELAY_AV1_SHOWN_COUNT,
-            // The raw golden is the vendored vector's frame 0, at 320x240. This stream
-            // is 4K, so there is nothing to compare pixels against.
             None,
             "AV1 (low-delay host stream, 4K two-tile)",
         );
     }
 
-    // -----------------------------------------------------------------------
-    // The harness's own evidence: that it reads real pixels and CAN fail
-    // -----------------------------------------------------------------------
-
-    /// Which readback routes this machine's driver supports, on a real decoded surface,
-    /// and what they hand back.
-    ///
-    /// A diagnostic, not a gate — but it FAILS rather than skips if neither route works,
-    /// because a box someone deliberately pointed this at is a box that is supposed to
-    /// be able to answer.
+    /// Fails rather than skips if neither route works.
     #[test]
     #[ignore = "needs a machine with a libva runtime and an H.264 VLD entry point"]
     fn probe_this_machines_readback_routes() {
@@ -5670,19 +4292,7 @@ mod parity {
         readback.destroy_staging(&decoder.display);
     }
 
-    /// **The counterfactual on hardware**: the readback reads real, distinct pixels, and
-    /// the comparison the legs use catches a frame that is wrong by one byte.
-    ///
-    /// Three tests in this program have been found asserting nothing, so the parity legs
-    /// owe a proof that they can fail. This is it, driven through the same [`Readback`],
-    /// the same [`sha256_hex`], the same [`localise`] and the same [`compare`] the legs
-    /// use:
-    ///
-    /// * a readback that returned zeros, or the same surface every time, would make
-    ///   every hash equal — so two different pictures must hash differently;
-    /// * a readback that returned a constant would still have the right LENGTH — so the
-    ///   picture must not be one repeated byte;
-    /// * and one flipped byte must be caught, and LOCALISED to the pixel.
+    /// Distinct pictures hash differently; one flipped luma byte is named.
     #[test]
     #[ignore = "needs a machine with a libva runtime and an H.264 VLD entry point"]
     fn the_readback_reads_real_pixels_and_the_comparison_can_fail() {
@@ -5729,13 +4339,9 @@ mod parity {
             hashes.len()
         );
 
-        // Now the corruption. One luma byte in the LAST frame checked, and the
-        // comparison must name that frame and only that frame.
         let victim = hashes.len() - 1;
         let mut corrupted = frames[victim].clone();
-        // The luma sample at the dead centre of this vector's 320x240 picture, so the
-        // bounding box is a statement about a PIXEL rather than about the first byte of
-        // the buffer or the edge of a plane.
+        // Centre luma of 320x240, so the box names a pixel, not a plane edge.
         let at = 120 * 320 + 160;
         corrupted[at] ^= 0x01;
         let diff = localise(
@@ -5766,21 +4372,7 @@ mod parity {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // CPU guards — NOT `#[ignore]`d, so ordinary CI notices drift
-    // -----------------------------------------------------------------------
-
-    /// The invariant the module docs rest on, asserted mechanically: **the surface
-    /// readback's libva entry points are resolved only inside this test module.**
-    ///
-    /// Not a stylistic preference. A per-frame `vaMapBuffer` on the production video
-    /// path would be exactly the copy zero-copy exists to avoid, and this project has a
-    /// standing rule against it. Reading this file's own source is what turns "we were
-    /// careful" into something a refactor cannot quietly undo: the production [`Libva`]
-    /// must resolve none of these, and this module must resolve all of them.
-    ///
-    /// Doc comments elsewhere in the file name the same calls in prose; the scan looks
-    /// for the QUOTED symbol strings a `dlsym` needs, which prose never contains.
+    /// Quoted `dlsym` strings only; prose elsewhere naming the same calls is ignored.
     #[test]
     fn the_readback_entry_points_are_resolved_only_inside_this_module() {
         const SOURCE: &str = include_str!("video_vaapi_native.rs");
@@ -5814,10 +4406,6 @@ mod parity {
         }
     }
 
-    /// The planners' display orders match the golden sets, on every one of the seven
-    /// streams these legs decode — checked on CPU so a regenerated vector or a change in
-    /// the bumping process fails here rather than as a mysterious hardware failure on a
-    /// machine somebody had to walk to.
     #[test]
     fn every_golden_set_matches_its_planners_display_order() {
         for (label, order, goldens) in [
@@ -5890,8 +4478,6 @@ mod parity {
         }
     }
 
-    /// The counts the AV1 legs assert are what the PLANNER implies, and the two AV1
-    /// streams really are the opposite shapes their constants claim.
     #[test]
     fn the_two_av1_streams_are_the_opposite_shapes_the_legs_claim() {
         let vendored = order_av1(&split_ivf(AV1_25FPS), DISPLAY_AV1);
@@ -5916,11 +4502,6 @@ mod parity {
         );
     }
 
-    /// Both vendored H.26x vectors REORDER, and our own streams do not.
-    ///
-    /// The first half is why the legs need `flush` and why delivery order is a claim
-    /// worth checking at all; the second is why our fixtures represent what punktfunk
-    /// actually streams. Asserted so neither claim can go stale.
     #[test]
     fn the_vendored_vectors_reorder_and_our_own_streams_do_not() {
         for (label, order) in [
@@ -5952,12 +4533,6 @@ mod parity {
         }
     }
 
-    /// **The counterfactual, on CPU**: the comparison every leg's verdict rests on
-    /// catches a wrong frame and names it.
-    ///
-    /// Runs on macOS and in the container with no device, so the falsifiability of the
-    /// parity legs is checked by ordinary CI rather than only on the one box that has a
-    /// VAAPI driver.
     #[test]
     fn the_comparison_catches_a_corrupted_frame() {
         let goldens = ["aa", "bb", "cc"];
@@ -5985,14 +4560,11 @@ mod parity {
         );
     }
 
-    /// [`localise`] separates the plane, the region and the magnitude — the three things
-    /// a hash cannot say and the three that located the last two defects.
     #[test]
     fn a_divergence_names_the_plane_the_box_and_the_magnitude() {
         let (w, h) = (320u32, 240u32);
         let clean = vec![0x40u8; (w * h + w * h / 2) as usize];
 
-        // One luma block, chroma clean — the NVIDIA signature.
         let mut one_block = clean.clone();
         for y in 24..48u32 {
             for x in 16..32u32 {
@@ -6007,7 +4579,6 @@ mod parity {
         assert!(format!("{d}").contains("chroma CLEAN"));
         assert!(format!("{d}").contains("16x24"));
 
-        // Chroma too, and badly — the Intel signature.
         let structural = vec![0xffu8; clean.len()];
         let d = localise(&structural, &clean, (w, h), pf_vaadec::VA_FOURCC_NV12);
         assert_eq!(d.luma_samples, (w * h) as usize);
@@ -6028,21 +4599,12 @@ mod parity {
         );
     }
 
-    /// Ten-bit samples read as LSB-aligned are NAMED as a format problem rather than
-    /// reported as a decode divergence.
-    ///
-    /// The trap the Main 10 golden's header warns about, and the one thing about that
-    /// leg a reader would otherwise have to re-derive from 50 wrong hashes: P010 puts
-    /// the ten bits in the HIGH end of each 16-bit word, so a driver handing back
-    /// `yuv420p10le` produces a buffer of exactly the right LENGTH and entirely the
-    /// wrong content.
+    /// P010 ten bits are high-aligned; LSB-aligned `yuv420p10le` has the right length.
     #[test]
     fn lsb_aligned_ten_bit_samples_are_called_out_as_a_format_problem() {
         let (w, h) = (16u32, 16u32);
         let samples = (w * h + w * h / 2) as usize;
-        // MSB-aligned: 0x0200 is 8 << 6, and its low six bits are clear.
         let msb: Vec<u8> = (0..samples).flat_map(|_| 0x0200u16.to_le_bytes()).collect();
-        // LSB-aligned: the same ten-bit value, 8, unshifted.
         let lsb: Vec<u8> = (0..samples).flat_map(|_| 0x0008u16.to_le_bytes()).collect();
 
         let d = localise(&lsb, &msb, (w, h), pf_vaadec::VA_FOURCC_P010);

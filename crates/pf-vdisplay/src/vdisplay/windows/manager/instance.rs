@@ -1,18 +1,23 @@
-//! The cross-process single-instance guard for pf-vdisplay management (plan §W3, carved out of the
-//! manager). A named mutex makes a SECOND host process fail its vdisplay open loudly instead of firing
-//! `IOCTL_CLEAR_ALL` and razing the live host's monitors mid-stream.
+//! Cross-process single-instance guard for pf-vdisplay management.
+//!
+//! A named mutex in `Global\` makes a second host process fail its vdisplay
+//! open loudly instead of firing `IOCTL_CLEAR_ALL` and razing the live host's
+//! monitors mid-stream. Claimed eagerly on the serve path; held for the
+//! process lifetime (the OS reclaims the name on exit). Failed claims are
+//! not memoized.
+//!
+//! DACL is SYSTEM + Administrators only. Tests pin which owner SIDs count
+//! as a sibling host versus a squat.
 
 use super::*;
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 
-/// The held single-instance mutex (`None` until claimed). Process-global — not per-manager — so the
-/// serve path can claim it EAGERLY at startup, before any session opens the backend: the claim is
-/// first-comer-wins, and a lazily-claiming service could otherwise lose its own machine's driver to
-/// a stray second host started while the service sat idle (observed on-glass). A failed claim is NOT
-/// memoized: once the other instance exits, the next attempt succeeds.
+/// Process-global held mutex (`None` until claimed). Not per-manager: the
+/// serve path claims it at startup, before any session opens the backend.
+/// First-comer wins; a lazy service would otherwise lose the driver to a
+/// stray second host. A failed claim is not memoized.
 static INSTANCE: Mutex<Option<OwnedHandle>> = Mutex::new(None);
 
-/// Claim (or re-verify) the cross-process single-instance guard. Idempotent; retries after failure.
 pub(super) fn claim_instance() -> Result<()> {
     let mut g = INSTANCE.lock().unwrap();
     if g.is_none() {
@@ -21,36 +26,26 @@ pub(super) fn claim_instance() -> Result<()> {
     Ok(())
 }
 
-/// Eager startup claim for the serve/service path (Windows): reserves this process as THE
-/// pf-vdisplay manager before any client connects. Failure is a loud warning, not fatal — sessions
-/// then fail with the same clear in-use error until the other instance exits.
+/// Failure is a warning, not fatal — sessions then fail with the same
+/// in-use error until the other instance exits.
 pub fn claim_instance_eagerly() {
     if let Err(e) = claim_instance() {
         tracing::warn!("pf-vdisplay single-instance claim failed at startup: {e:#}");
     }
 }
 
-/// The cross-process single-instance guard for pf-vdisplay management. A SECOND host process's
-/// first device open used to fire `IOCTL_CLEAR_ALL` and raze the live host's monitors mid-stream —
-/// an admin footgun (run `punktfunk-host serve` while the SCM service streams), masked afterwards
-/// because both processes' pings satisfy the shared driver watchdog. The named mutex makes the
-/// second process fail its vdisplay open LOUDLY instead. Held, never released, for the process
-/// lifetime; the OS reclaims it (and frees the name) when the process exits, however it exits.
+/// Hold the named mutex for the process lifetime. The OS reclaims it (and
+/// frees the name) on any exit. A second process fails its vdisplay open
+/// instead of `IOCTL_CLEAR_ALL` razing the live host's monitors.
 fn acquire_single_instance() -> Result<OwnedHandle> {
     const IN_USE: &str = "another punktfunk-host process is already managing pf-vdisplay on this \
          machine — refusing to touch the driver (a second manager's startup CLEAR_ALL would raze \
          the live host's monitors mid-stream). Stop the other instance (e.g. `punktfunk-host \
          service stop`) first.";
-    // A name in `Global\` is creatable by ANY principal holding SeCreateGlobalPrivilege — which
-    // includes the LocalService account the plugin runner is forced to (plugins.rs). With `None`
-    // security attributes this object took the DACL from the creating token's default, and a
-    // squatter who got there first (creating the name with a DACL that denies SYSTEM) permanently
-    // and silently disabled every virtual-display session: the host lands in the ACCESS_DENIED arm
-    // below and reports a perfectly reasonable "another instance is managing the driver", which
-    // sends the operator hunting a process that does not exist (2026-08-05 review L-16).
-    //
-    // Two changes: create with an EXPLICIT DACL so lesser principals cannot open ours, and check
-    // the OWNER of a name that already exists so a squat is reported as a squat.
+    // `Global\` is creatable by any SeCreateGlobalPrivilege holder (includes LocalService).
+    // Default DACL from the creating token lets a squatter deny SYSTEM and look like
+    // "another instance". Explicit DACL so lesser principals cannot open ours; check
+    // OWNER of an existing name so a squat is reported as a squat.
     let sd = security_descriptor()?;
     let sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -64,18 +59,9 @@ fn acquire_single_instance() -> Result<OwnedHandle> {
     unsafe {
         let h = match CreateMutexW(Some(&sa), false, w!("Global\\punktfunk-vdisplay-manager")) {
             Ok(h) => h,
-            // ACCESS_DENIED has THREE causes here and the handle alone cannot tell them apart, so
-            // name all three rather than assert one. (1) The name exists but its creator's DACL
-            // denies this token the implicit OPEN — the SCM service creates it as SYSTEM, so a
-            // second elevated-admin host lands here instead of in the ALREADY_EXISTS branch
-            // (validated on-glass); that is a live instance. (2) The same shape is exactly what a
-            // SQUAT looks like. (3) `CreateMutexW` also fails ACCESS_DENIED when the caller holds no
-            // SeCreateGlobalPrivilege at all — granted by default to Administrators, SYSTEM and the
-            // SERVICE groups but NOT to an ordinary interactive user, so an un-elevated
-            // `punktfunk-host serve` reaches this arm with no such object existing anywhere. Naming
-            // only (1)+(2) sent that operator hunting a process that does not exist and a
-            // `handle.exe` that finds nothing — the same misdiagnosis family as 2026-08-05 L-16,
-            // which this block exists to remove.
+            // ACCESS_DENIED has three causes the handle cannot tell apart: live SCM
+            // instance whose DACL denies this token OPEN; a squat with the same shape;
+            // or no SeCreateGlobalPrivilege (ordinary interactive user). Name all three.
             Err(e) if e.code().0 == 0x8007_0005u32 as i32 => anyhow::bail!(
                 "{IN_USE}\n\nIf no other punktfunk-host is running, either this process cannot \
                  create a `Global\\` kernel object at all (it needs SeCreateGlobalPrivilege — run \
@@ -93,8 +79,8 @@ fn acquire_single_instance() -> Result<OwnedHandle> {
         let already = GetLastError() == ERROR_ALREADY_EXISTS;
         let owned = OwnedHandle::from_raw_handle(h.0 as _);
         if already {
-            // We opened an existing object — so its DACL let us in, but that says nothing about
-            // who created it. If the owner is not SYSTEM/Administrators it is not one of ours.
+            // DACL let us in, which says nothing about who created it. Owner
+            // outside SYSTEM/Administrators is a squat, not a sibling host.
             if let Some(owner) = object_owner_sid(h) {
                 if !is_privileged_sid(&owner) {
                     anyhow::bail!(
@@ -111,9 +97,8 @@ fn acquire_single_instance() -> Result<OwnedHandle> {
     }
 }
 
-/// `D:P(A;;GA;;;SY)(A;;GA;;;BA)` — a protected DACL (no inheritance) granting Full to SYSTEM and
-/// BUILTIN\Administrators, and to nobody else. Everything that legitimately manages pf-vdisplay is
-/// one of those two; a LocalService plugin runner is neither, so it can no longer open our object.
+/// Protected DACL (`D:P`): Full to SYSTEM and BUILTIN\Administrators only.
+/// A LocalService plugin runner is neither, so it cannot open our object.
 fn security_descriptor() -> Result<LocalSd> {
     use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows::Win32::Security::Authorization::SDDL_REVISION_1;
@@ -132,7 +117,6 @@ fn security_descriptor() -> Result<LocalSd> {
     Ok(LocalSd(psd.0))
 }
 
-/// Owns a `LocalAlloc`'d security descriptor and frees it on drop.
 struct LocalSd(*mut core::ffi::c_void);
 
 impl Drop for LocalSd {
@@ -150,8 +134,8 @@ impl Drop for LocalSd {
     }
 }
 
-/// The owner SID of a kernel object, as an SDDL string. `None` when it cannot be read (the handle
-/// lacks READ_CONTROL) — treated as "unknown", never as "fine".
+/// Owner SID of a kernel object as SDDL. `None` when unreadable (handle
+/// lacks READ_CONTROL) — treated as unknown, never as fine.
 fn object_owner_sid(h: HANDLE) -> Option<String> {
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Authorization::{
@@ -199,26 +183,22 @@ fn object_owner_sid(h: HANDLE) -> Option<String> {
     out
 }
 
-/// SYSTEM, BUILTIN\Administrators, or a member of the Administrators-owned set — the principals a
-/// legitimate pf-vdisplay manager runs as.
+/// SYSTEM, BUILTIN\Administrators, or an NT SERVICE SID (`S-1-5-80-…`).
 ///
-/// Deliberately NARROW, and the narrowness is the security property: this predicate is what decides
-/// whether an existing single-instance name is reported as "another punktfunk-host" (benign, wait it
-/// out) or as a SQUAT (an attack on virtual-display availability). Widening it — `S-1-5-32-` as a
-/// prefix, or any `S-1-5-21-…` domain account — silently reclassifies a non-administrative squatter
-/// as one of ours and restores the exact misdiagnosis the 2026-08-05 L-16 fix removed. LocalService
-/// (`S-1-5-19`) and NetworkService (`S-1-5-20`) are excluded ON PURPOSE: the plugin runner is forced
-/// to LocalService, so a name owned by it is a plugin, not a host.
+/// Narrow on purpose: this decides sibling host vs squat. A `S-1-5-32-`
+/// prefix or any `S-1-5-21-…` domain account reclassifies a non-admin
+/// squatter as one of ours. LocalService (`S-1-5-19`) and NetworkService
+/// (`S-1-5-20`) are excluded: the plugin runner is forced to LocalService,
+/// so a name owned by it is a plugin, not a host.
 fn is_privileged_sid(sid: &str) -> bool {
-    matches!(sid, "S-1-5-18" | "S-1-5-32-544") || sid.starts_with("S-1-5-80-") // service SIDs
+    matches!(sid, "S-1-5-18" | "S-1-5-32-544") || sid.starts_with("S-1-5-80-")
 }
 
 #[cfg(test)]
 mod tests {
     use super::is_privileged_sid;
 
-    /// Pins the classification above — the only pure decision in this module, and the one whose
-    /// widening is silent (nothing fails; a squat merely starts reading as a sibling host).
+    /// Widening is silent: a squat starts reading as a sibling host.
     #[test]
     fn is_privileged_sid_accepts_system_admins_and_service_sids_only() {
         assert!(is_privileged_sid("S-1-5-18"), "SYSTEM");
@@ -233,14 +213,13 @@ mod tests {
             !is_privileged_sid("S-1-5-21-1004336348-1177238915-682003330-1001"),
             "a local/domain user account"
         );
-        // LocalService / NetworkService: the plugin runner's accounts, deliberately NOT ours.
         assert!(!is_privileged_sid("S-1-5-19"), "LocalService");
         assert!(!is_privileged_sid("S-1-5-20"), "NetworkService");
         assert!(
             !is_privileged_sid(""),
             "an unreadable owner is never 'fine'"
         );
-        // Prefix discipline: `S-1-5-80` without the trailing dash is a different SID string, and
+        // `S-1-5-80` without the trailing dash is a different SID string;
         // `S-1-5-8` (Proxy) must not slip in under a loosened prefix.
         assert!(!is_privileged_sid("S-1-5-8"), "Proxy");
         assert!(!is_privileged_sid("S-1-5-800-1"), "not a service SID");

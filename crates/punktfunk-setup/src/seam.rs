@@ -4,20 +4,19 @@
 //! process spawn. Nothing else in the crate may call `std::process::Command::new` — the
 //! crate-local `clippy.toml` denies it, and `SystemRunner` carries the single `#[allow]`.
 //!
-//! They are what make `--demo` on a Mac and the whole test suite honest: swap both for the
-//! fake pair and the engine cannot reach the machine it is running on, by construction rather
-//! than by remembering to check a flag. See `design/installer-v2.md` D3 and §7.
+//! Swap both for the fake pair and the engine cannot reach the host. See
+//! `design/installer-v2.md` D3.
 //!
-//! The `PUNKTFUNK_INSTALL_OS_RELEASE` / `_ETC` env twins the sh installer grew are honoured
-//! here so installer-smoke's fake boxes keep working against the binary unchanged.
+//! `PUNKTFUNK_INSTALL_OS_RELEASE` and `PUNKTFUNK_INSTALL_ETC` override the real
+//! `/etc` paths so installer-smoke's fake boxes keep working against this binary.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Every filesystem root a probe is allowed to read.
+/// Every filesystem root a probe may read.
 ///
-/// `etc_root` is a *prefix*, not the directory itself: the sh script reads
-/// `"$ETC/etc/apt/..."`, so an empty override means the real `/etc`.
+/// `etc_root` is a prefix, not `/etc` itself: the sh script joins `"$ETC/etc/apt/..."`,
+/// so an empty override is the real `/etc`.
 #[derive(Debug, Clone)]
 pub struct BasePaths {
     pub os_release: PathBuf,
@@ -29,7 +28,6 @@ pub struct BasePaths {
 }
 
 impl BasePaths {
-    /// The real box, honouring the two test seams the sh installer already exposed.
     pub fn from_env() -> Self {
         let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/root"), PathBuf::from);
         let config = std::env::var_os("XDG_CONFIG_HOME")
@@ -49,7 +47,6 @@ impl BasePaths {
         }
     }
 
-    /// A tree rooted at `root` — the shape every Facts test builds in a tempdir.
     pub fn rooted(root: &Path) -> Self {
         Self {
             os_release: root.join("etc/os-release"),
@@ -61,12 +58,11 @@ impl BasePaths {
         }
     }
 
-    /// `/etc/<rel>` under the configured root.
     pub fn etc(&self, rel: &str) -> PathBuf {
         self.etc_root.join("etc").join(rel)
     }
 
-    /// The host's env file. Its path is reported verbatim in dry-run output.
+    /// Path is reported verbatim in dry-run output.
     pub fn host_env(&self) -> PathBuf {
         self.config.join("punktfunk/host.env")
     }
@@ -76,10 +72,8 @@ impl BasePaths {
     }
 }
 
-/// The process environment, snapshotted once so probes stay hermetic.
-///
-/// Reading `std::env` directly inside `facts` would make the seat probe untestable: Rust 2024
-/// makes `set_var` unsafe, so a test cannot stage `DISPLAY` around a parallel suite.
+/// Process environment, snapshotted once. Probes must not read `std::env`:
+/// `set_var` is unsafe in Rust 2024, so tests cannot stage `DISPLAY` in a parallel suite.
 #[derive(Debug, Default, Clone)]
 pub struct Env(pub HashMap<String, String>);
 
@@ -88,7 +82,7 @@ impl Env {
         Self(std::env::vars().collect())
     }
 
-    /// Only the values a test actually stages; everything else reads as unset.
+    /// Staged pairs only; any other key reads as unset.
     pub fn of(pairs: &[(&str, &str)]) -> Self {
         Self(
             pairs
@@ -106,17 +100,14 @@ impl Env {
     }
 }
 
-/// How a spawned command gets its stdin.
-///
-/// `Tty` is the package manager's own confirmation prompt reaching the user; without a
-/// terminal it must be `/dev/null` rather than the script's own stdin under `curl | sh`.
+/// Spawn stdin. `Tty` is the package manager's prompt; without a terminal use
+/// `/dev/null`, never the script's own stdin under `curl | sh`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stdin {
     Tty,
     Null,
 }
 
-/// The outcome of a probe spawn. `None` means the binary was not found at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
     pub code: i32,
@@ -130,12 +121,10 @@ impl Output {
     }
 }
 
-/// A snippet that could not start, or exited non-zero. It carries no message on purpose: the
-/// caller owns the failure text, because the sh installer's die line is part of the contract.
+/// Spawn failed. No message: the caller owns the die line, matching the sh installer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunFailed;
 
-/// Every process spawn in the crate goes through here.
 pub trait CommandRunner {
     fn run_shell(&self, cmd: &str, stdin: Stdin) -> Result<(), RunFailed>;
 
@@ -148,10 +137,8 @@ pub trait CommandRunner {
     /// Spawn a probe and capture it. `None` when the program is not on `PATH`.
     fn probe(&self, program: &str, args: &[&str]) -> Option<Output>;
 
-    /// `command -v <program>` — is it on `PATH`?
     fn which(&self, program: &str) -> bool;
 
-    /// First line of `<program> <args…>` stdout, trimmed, when it exited 0.
     fn first_line(&self, program: &str, args: &[&str]) -> Option<String> {
         let out = self.probe(program, args)?;
         if !out.ok() {
@@ -163,10 +150,10 @@ pub trait CommandRunner {
 
 /// The one implementation that touches the machine.
 pub struct SystemRunner {
-    /// Prepended to `PATH` for the root-without-sudo shim (`design/installer-v2.md` §4).
+    /// Prepended to `PATH` for the root-without-sudo shim.
     pub path_prefix: Option<PathBuf>,
-    /// Exported into every spawn. The plan's commands carry a literal `"$USER"`, so it has to
-    /// be set even where the installer was invoked without one.
+    /// Injected into every spawn. Plan commands carry a literal `"$USER"`, so it must
+    /// be set even when the installer was invoked without one.
     pub exports: Vec<(String, String)>,
 }
 
@@ -267,18 +254,15 @@ impl CommandRunner for SystemRunner {
     }
 }
 
-/// A runner that answers from a script and spawns nothing.
-///
-/// Keyed by the whole command line (`"systemctl is-active sunshine.service"`), so a test says
-/// what the box answers and nothing else can leak in: an unscripted probe returns `None`,
-/// which is the same answer as "that binary is not installed".
+/// Scripted answers, no spawn. Keyed by the whole command line
+/// (`"systemctl is-active sunshine.service"`). An unscripted probe returns `None`,
+/// the same as a missing binary.
 #[derive(Debug, Default, Clone)]
 pub struct FakeRunner {
     pub answers: HashMap<String, Output>,
     pub on_path: Vec<String>,
-    /// Every `run_shell` snippet, in order — what the exec tests assert against.
     pub ran: std::cell::RefCell<Vec<String>>,
-    /// Snippets that must fail, matched as a substring.
+    /// Fail `run_shell` when the snippet contains this substring.
     pub fail_matching: Option<String>,
 }
 
@@ -287,7 +271,6 @@ impl FakeRunner {
         Self::default()
     }
 
-    /// Scripted answer for a probe, e.g. `answer("punktfunk-host detect-conflicts", 1, "")`.
     pub fn answer(mut self, line: &str, code: i32, stdout: &str) -> Self {
         self.answers.insert(
             line.to_string(),
@@ -326,8 +309,7 @@ impl CommandRunner for FakeRunner {
         if let Some(out) = self.answers.get(&line) {
             return Some(out.clone());
         }
-        // An unscripted probe of a program that IS on PATH exits non-zero rather than
-        // vanishing: "installed but says no" and "not installed" are different answers.
+        // On PATH but unscripted: exit 1, not `None`. Missing and "says no" are different.
         if self.on_path.iter().any(|p| p == program) {
             return Some(Output {
                 code: 1,
@@ -350,8 +332,7 @@ mod tests {
     #[test]
     fn etc_root_is_a_prefix_not_the_directory() {
         let p = BasePaths::rooted(Path::new("/tmp/box"));
-        // Compared as Paths, not strings: join() writes `\` on Windows and the components
-        // are what the contract is about.
+        // Compare as `Path`s, not strings: `join` writes `\` on Windows.
         assert_eq!(
             p.etc("apt/sources.list.d/punktfunk.list"),
             Path::new("/tmp/box/etc/apt/sources.list.d/punktfunk.list")

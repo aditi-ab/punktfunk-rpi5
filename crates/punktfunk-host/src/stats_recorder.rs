@@ -1,15 +1,12 @@
-//! Shared streaming-stats recorder (`design/stats-capture-plan.md` §1). One
-//! [`StatsRecorder`] handle is created once in the unified host entry
-//! (`gamestream::serve`) alongside [`crate::native_pairing::NativePairing`], and shared with
-//! **both** the management API ([`crate::mgmt`]) and the streaming loops (threaded through
-//! [`crate::native::serve`] → `SessionContext` and into the GameStream encode loop). The
-//! operator arms a capture from the web console, plays a session, stops, and reviews the
-//! captured time-series as graphs; captures are saved to disk and survive a host restart.
+//! Shared streaming-stats recorder (`design/stats-capture-plan.md`). One
+//! [`StatsRecorder`] is created in `gamestream::serve` and shared with
+//! [`crate::mgmt`] and the native / GameStream encode loops.
 //!
-//! Hot-path discipline: [`StatsRecorder::is_armed`] is a cheap `Relaxed` atomic load (re-read
-//! per frame); sample construction happens only at the loops' existing ~2 s / ~1 s aggregation
-//! boundary, never per frame. Memory is bounded ([`MAX_SAMPLES`]); the on-disk write is atomic
-//! (temp + rename); and capture ids are path-traversal-safe.
+//! Captures persist as JSON under the captures dir and survive a host restart.
+//! [`StatsRecorder::is_armed`] is a `Relaxed` load per frame; samples are built
+//! only at the loops' ~2 s / ~1 s aggregation boundary, never per frame.
+//! Memory is bounded ([`MAX_SAMPLES`]). The on-disk write is temp + rename.
+//! Capture ids are charset-gated so `dir.join` cannot leave the captures dir.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -18,12 +15,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use utoipa::ToSchema;
 
-/// Cap on samples kept in one capture: ≈ 3 h at one sample / 2 s. On overflow we stop appending
-/// (keeping the oldest — a saved recording must keep its start), never dropping the front and never
-/// growing unbounded.
+/// ≈ 3 h at one sample / 2 s. Overflow stops appending (oldest kept) so a
+/// recording keeps its start and never grows unbounded.
 const MAX_SAMPLES: usize = 5400;
 
-/// One pipeline stage's latency in an aggregation window (microseconds).
+/// One stage's p50/p99 in an aggregation window (microseconds).
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct StageTiming {
     /// `"capture" | "submit" | "encode" | "packetize" | "send"` (path-dependent).
@@ -32,28 +28,25 @@ pub struct StageTiming {
     pub p99_us: f32,
 }
 
-/// One aggregated sample (~ every 2 s native, ~ every 1 s GameStream).
+/// One aggregated sample (~2 s native, ~1 s GameStream).
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct StatsSample {
     /// Milliseconds since capture start (monotonic; stamped by [`StatsRecorder::push_sample`]).
     pub t_ms: u64,
-    /// Disambiguates concurrent sessions (usually constant).
+    /// Distinguishes concurrent sessions (usually constant for one loop).
     pub session_id: u32,
-    /// Ordered pipeline stages for this path.
     pub stages: Vec<StageTiming>,
-    /// Genuine NEW frames/s from the source.
+    /// Genuine new frames/s from the source (not including repeats).
     pub fps: f32,
-    /// Re-encoded holds/s (source-starvation indicator).
+    /// Re-encoded holds/s — source starvation, not new frames.
     pub repeat_fps: f32,
-    /// Attempted sealed wire bytes/s (Mb/s): full UDP payloads at seal time — video AU bytes
-    /// plus shard framing (header + AEAD) plus FEC parity, and for PyroWave's datagram-aligned
-    /// mode the zero-padded window tails. NOT goodput, and NOT reduced by socket send drops.
+    /// Attempted sealed wire Mb/s at seal time (AU + shard framing + FEC, including
+    /// datagram-aligned zero-pad). Not goodput; socket send drops do not reduce it.
     pub mbps: f32,
-    /// Configured target bitrate.
     pub bitrate_kbps: u32,
-    /// Frames dropped this window (delta).
+    /// Frames dropped this window (delta, not cumulative).
     pub frames_dropped: u32,
-    /// Packets dropped this window (receiver-side / reassembler, where known).
+    /// Packets dropped this window (receiver / reassembler, when known).
     pub packets_dropped: u32,
     /// Host send-buffer overflow / EAGAIN this window (delta).
     pub send_dropped: u32,
@@ -61,12 +54,11 @@ pub struct StatsSample {
     pub fec_recovered: u32,
 }
 
-/// Capture summary — the filename stem plus the negotiated mode/codec/client. Stored at the head
-/// of each on-disk recording and listed standalone (without the sample body) by
-/// [`StatsRecorder::list`].
+/// Filename stem plus negotiated mode/codec/client. On-disk head;
+/// [`StatsRecorder::list`] returns this without the sample body.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct CaptureMeta {
-    /// e.g. `"2026-06-26T20-14-03Z_5120x1440"` — also the filename stem.
+    /// Filename stem, e.g. `2026-06-26T20-14-03Z_5120x1440`.
     pub id: String,
     pub started_unix_ms: u64,
     pub duration_ms: u64,
@@ -77,51 +69,41 @@ pub struct CaptureMeta {
     pub fps: u32,
     /// `"h264" | "hevc" | "av1"`.
     pub codec: String,
-    /// Short label / fingerprint prefix, or `""` if unknown.
+    /// Fingerprint prefix, or `""` if unknown.
     pub client: String,
     pub sample_count: u32,
-    /// The encode backend that ACTUALLY opened for this session — `"nvenc"`, `"vaapi"`,
-    /// `"vulkan"`, `"amf"`, `"qsv"`, `"software"`, … — and the GPU it runs on.
-    ///
-    /// Recorded because the stage split alone can't be read without them. A p50 `submit` of 10 ms
-    /// means "the GPU's CSC+encode throughput is the ceiling" on one backend and something else
-    /// entirely on another, and every fps-shortfall report so far has cost a round-trip asking
-    /// which one it was. Both come from `pf_gpu::active()`, the record the encoder open itself
-    /// writes, so they name the branch that really opened rather than a re-derived guess.
-    ///
-    /// `""` when nothing was streaming at registration (or on a build without the record).
+    /// Backend that actually opened (`"nvenc"`, `"vaapi"`, `"vulkan"`, `"amf"`,
+    /// `"qsv"`, `"software"`, …), from `pf_gpu::active()`. Stage timings are
+    /// unreadable without it. `""` if nothing was streaming at registration.
     #[serde(default)]
     pub encoder_backend: String,
-    /// Human-readable GPU name (`"NVIDIA GeForce RTX 4090"`, `"CPU (openh264)"`), or `""`.
+    /// GPU name from `pf_gpu::active()`, or `""`.
     #[serde(default)]
     pub gpu: String,
 }
 
-/// A full capture: summary + the sample time-series. The wire + on-disk shape.
+/// Wire and on-disk shape: summary plus sample time-series.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct Capture {
     pub meta: CaptureMeta,
     pub samples: Vec<StatsSample>,
 }
 
-/// Snapshot of the in-progress capture for the management API.
+/// In-progress capture, as the management API reports it.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct StatsStatus {
-    /// Capture currently running.
     pub armed: bool,
-    /// Samples in the in-progress capture.
     pub sample_count: u32,
-    /// Unix start time of the in-progress capture (`0` if idle).
+    /// Unix start of the in-progress capture (`0` if idle).
     pub started_unix_ms: u64,
-    /// Host-measured elapsed time of the in-progress capture, in ms (`0` if idle). Computed from the
-    /// host's MONOTONIC clock, so a console can show elapsed time without subtracting `started_unix_ms`
-    /// from its own (possibly skewed) wall clock.
+    /// Host monotonic elapsed ms (`0` if idle). Do not subtract `started_unix_ms`
+    /// from the console's wall clock — that clock may be skewed.
     pub elapsed_ms: u64,
-    /// Path of the in-progress capture (`""` if idle).
+    /// `"native" | "gamestream"`, or `""` if idle.
     pub kind: String,
 }
 
-/// Mode/codec/client seeded on the first [`StatsRecorder::register_session`] of a capture.
+/// Mode/codec/client from the first [`StatsRecorder::register_session`] of a capture.
 #[derive(Clone)]
 struct MetaSeed {
     kind: String,
@@ -134,43 +116,36 @@ struct MetaSeed {
     gpu: String,
 }
 
-/// The in-progress capture (present iff armed).
+/// In-progress capture (present iff armed).
 struct Live {
-    /// Monotonic clock origin for sample `t_ms`.
+    /// Monotonic origin for sample `t_ms`.
     started: Instant,
     started_unix_ms: u64,
     /// Seeded once, on the first session registration.
     meta: Option<MetaSeed>,
     samples: Vec<StatsSample>,
-    /// Set once the sample cap was hit (further samples dropped). Read so it isn't dead.
+    /// Sample cap was hit; further samples are dropped.
     truncated: bool,
 }
 
-/// Shared streaming-stats recorder: an arm/disarm flag (the hot-path gate), the in-progress
-/// capture, and the on-disk capture directory.
 pub struct StatsRecorder {
     dir: PathBuf,
-    /// The hot-path gate — a `Relaxed` load per frame; never blocks the frame thread.
+    /// Hot-path gate: `Relaxed` load per frame; never blocks the frame thread.
     armed: AtomicBool,
-    /// The in-progress capture. Locks recover a poisoned guard (`unwrap_or_else(|e| e.into_inner())`,
-    /// as in `vdisplay::gamescope`) rather than `unwrap()`: a panic somewhere must never make stats
-    /// recording crash an otherwise-healthy stream. The critical sections only push/clone/format, so
-    /// poisoning is near-impossible anyway — this is belt-and-suspenders.
+    /// In-progress capture. Poison recovers (`into_inner`) so a stats panic
+    /// cannot kill a healthy stream.
     live: Mutex<Option<Live>>,
     next_sid: AtomicU32,
 }
 
-/// The default captures directory: `~/.config/punktfunk/captures/` (next to `cert.pem`),
-/// resolved via the same config-dir helper the rest of the host uses.
+/// `~/.config/punktfunk/captures/`, via the same config-dir helper as `cert.pem`.
 pub fn default_dir() -> PathBuf {
     pf_paths::config_dir().join("captures")
 }
 
-/// `id` charset gate, matching `^[A-Za-z0-9._-]+$` — the exact charset `capture_id` emits (which
-/// deliberately uses dashes, not colons, so the stem is a valid Windows filename). We additionally
-/// reject `.`/`..` so a path-component sneaks no parent reference even though the charset would allow
-/// bare dots. The charset already excludes `/` and `\`, so `dir.join("<id>.json")` is always a single
-/// child of `dir`. Defense in depth — the endpoints are bearer-authed.
+/// Charset `^[A-Za-z0-9._-]+$` (what [`capture_id`] emits; dashes not colons
+/// so the stem is a Windows filename). Also reject `.` / `..` — the charset
+/// allows bare dots. `/` and `\` are already excluded, so `dir.join` is one child.
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id != "."
@@ -187,9 +162,8 @@ fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// A human-readable, filesystem-safe capture id from the start time + mode, e.g.
-/// `2026-06-26T20-14-03Z_5120x1440`. Dashes (not colons) in the time so it's a valid Windows
-/// filename; matches [`valid_id`].
+/// Filesystem-safe id from start time + resolution, e.g.
+/// `2026-06-26T20-14-03Z_5120x1440`. Dashes, not colons, so Windows accepts it.
 fn capture_id(unix_ms: u64, width: u32, height: u32) -> String {
     let secs = (unix_ms / 1000) as i64;
     let days = secs.div_euclid(86_400);
@@ -215,7 +189,7 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 impl StatsRecorder {
-    /// Create the recorder, creating `dir` (owner-private, best-effort) if missing.
+    /// Create `dir` owner-private (best-effort) if missing.
     pub fn new(dir: PathBuf) -> Arc<Self> {
         if let Err(e) = pf_paths::create_private_dir(&dir) {
             tracing::warn!(dir = %dir.display(), error = %e, "could not create stats captures dir");
@@ -228,12 +202,12 @@ impl StatsRecorder {
         })
     }
 
-    /// The hot-path gate: cheap `Relaxed` load, called per frame to decide whether to measure.
+    /// Per-frame `Relaxed` load: whether this frame should measure.
     pub fn is_armed(&self) -> bool {
         self.armed.load(Ordering::Relaxed)
     }
 
-    /// Arm a new capture. No-op if already armed (returns the current status).
+    /// Arm a new capture. No-op if already armed (does not wipe; returns status).
     pub fn start(&self) -> StatsStatus {
         let mut guard = self.live.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
@@ -244,16 +218,14 @@ impl StatsRecorder {
                 samples: Vec::new(),
                 truncated: false,
             });
-            // Publish AFTER the live capture exists, so a frame thread that observes `armed` always
-            // finds a capture to push into.
+            // Publish after `live` exists so a frame that sees `armed` can always push.
             self.armed.store(true, Ordering::Relaxed);
         }
         status_of(guard.as_ref())
     }
 
-    /// A streaming loop announces itself when it first records while armed. Seeds the capture's
-    /// `CaptureMeta` (kind/w/h/fps/codec/client) on the FIRST registration; returns a session id
-    /// to stamp on the loop's samples.
+    /// First registration while armed seeds `CaptureMeta`; later ones are ignored.
+    /// Returns a session id to stamp on this loop's samples.
     pub fn register_session(
         &self,
         kind: &'static str,
@@ -264,9 +236,7 @@ impl StatsRecorder {
         client: &str,
     ) -> u32 {
         let sid = self.next_sid.fetch_add(1, Ordering::Relaxed);
-        // The live encode backend + GPU, straight from the record the encoder open wrote. Read
-        // outside the lock (it takes its own) and only on the first registration path's behalf —
-        // this runs once per capture, not per frame.
+        // `pf_gpu::active()` takes its own lock — read it outside `live`, once per capture.
         let (encoder_backend, gpu) = pf_gpu::active()
             .map(|(g, _)| (g.backend.to_string(), g.name))
             .unwrap_or_default();
@@ -288,10 +258,9 @@ impl StatsRecorder {
         sid
     }
 
-    /// Append one aggregated sample (called from the loops' existing ~2 s / ~1 s boundary). The
-    /// `t_ms` is (re)stamped here from the capture's monotonic start, so callers may leave it `0`.
-    /// Bounded at [`MAX_SAMPLES`]: on overflow we stop appending (oldest kept) and flag truncation.
-    /// A no-op when nothing is armed (e.g. a `stop()` raced the frame boundary).
+    /// Append one aggregated sample. Restamps `t_ms` from the monotonic start
+    /// (callers may leave it `0`). Stops appending at [`MAX_SAMPLES`] (oldest kept).
+    /// No-op if unarmed (a `stop()` raced the frame boundary).
     pub fn push_sample(&self, session_id: u32, mut sample: StatsSample) {
         let mut guard = self.live.lock().unwrap_or_else(|e| e.into_inner());
         let Some(live) = guard.as_mut() else { return };
@@ -310,10 +279,9 @@ impl StatsRecorder {
         live.samples.push(sample);
     }
 
-    /// Disarm + finalize: write `<dir>/<id>.json` atomically (temp + rename) and return its meta.
-    /// `Ok(None)` if nothing was recording.
+    /// Disarm, write `<dir>/<id>.json` (temp + rename), return meta. `Ok(None)` if idle.
     pub fn stop(&self) -> std::io::Result<Option<CaptureMeta>> {
-        // Clear the hot-path gate first so frame threads stop building samples immediately.
+        // Clear the gate first so frame threads stop building samples immediately.
         self.armed.store(false, Ordering::Relaxed);
         let Some(live) = self.live.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             return Ok(None);
@@ -324,8 +292,8 @@ impl StatsRecorder {
             samples: live.samples,
         };
         let bytes = serde_json::to_vec(&capture).map_err(std::io::Error::other)?;
-        // Atomic replace: write a sibling temp then rename, so a crash mid-write can't leave a half
-        // file. The id is generated (always `valid_id`), so this only ever names a child of `dir`.
+        // Sibling temp then rename: a crash mid-write cannot leave a half file.
+        // `id` is generated (`valid_id`), so this names a child of `dir`.
         let path = self.dir.join(format!("{}.json", meta.id));
         let tmp = self.dir.join(format!("{}.json.tmp", meta.id));
         std::fs::write(&tmp, &bytes)?;
@@ -333,12 +301,12 @@ impl StatsRecorder {
         Ok(Some(meta))
     }
 
-    /// The in-progress capture status (idle = `armed: false`, zeroed fields).
+    /// In-progress status (idle = `armed: false`, zeroed fields).
     pub fn status(&self) -> StatsStatus {
         status_of(self.live.lock().unwrap_or_else(|e| e.into_inner()).as_ref())
     }
 
-    /// A clone of the in-progress capture for live graphing (`None` when idle).
+    /// Clone of the in-progress capture (`None` when idle).
     pub fn live_snapshot(&self) -> Option<Capture> {
         let guard = self.live.lock().unwrap_or_else(|e| e.into_inner());
         let live = guard.as_ref()?;
@@ -348,9 +316,9 @@ impl StatsRecorder {
         })
     }
 
-    /// All saved recordings, newest first, parsing each file's `meta` head only (not the samples).
+    /// Saved recordings, newest first. Parses each file's `meta` head only.
     pub fn list(&self) -> Vec<CaptureMeta> {
-        /// Parse only the `meta` head — serde skips the (large) `samples` array.
+        /// `meta` only — serde skips the large `samples` array.
         #[derive(Deserialize)]
         struct MetaOnly {
             meta: CaptureMeta,
@@ -374,7 +342,7 @@ impl StatsRecorder {
         out
     }
 
-    /// Load a saved recording by id. Rejects a path-unsafe id (and a missing file) as `NotFound`.
+    /// Load by id. Path-unsafe id and missing file are both `NotFound`.
     pub fn load(&self, id: &str) -> std::io::Result<Capture> {
         let path = self.recording_path(id)?;
         let bytes = std::fs::read(&path)?;
@@ -382,14 +350,13 @@ impl StatsRecorder {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    /// Delete a saved recording by id. Rejects a path-unsafe id (and a missing file) as `NotFound`.
+    /// Delete by id. Path-unsafe id and missing file are both `NotFound`.
     pub fn delete(&self, id: &str) -> std::io::Result<()> {
         let path = self.recording_path(id)?;
         std::fs::remove_file(&path)
     }
 
-    /// Resolve `dir/<id>.json` after validating `id`. A rejected id is `NotFound` (defense in
-    /// depth: never let an attacker-shaped id escape `dir`).
+    /// `dir/<id>.json` after [`valid_id`]. Rejected id is `NotFound` so `join` never leaves `dir`.
     fn recording_path(&self, id: &str) -> std::io::Result<PathBuf> {
         if !valid_id(id) {
             return Err(std::io::Error::new(
@@ -401,7 +368,6 @@ impl StatsRecorder {
     }
 }
 
-/// Build the live `StatsStatus` from the optional in-progress capture.
 fn status_of(live: Option<&Live>) -> StatsStatus {
     match live {
         Some(l) => StatsStatus {
@@ -421,8 +387,8 @@ fn status_of(live: Option<&Live>) -> StatsStatus {
     }
 }
 
-/// Compute the `CaptureMeta` for an in-progress or finalizing capture (id derived from the start
-/// time + negotiated mode; duration from the monotonic start).
+/// `CaptureMeta` for a live or finalizing capture. Id from start + mode;
+/// duration from the monotonic clock.
 fn meta_of(live: &Live) -> CaptureMeta {
     let (kind, width, height, fps, codec, client, encoder_backend, gpu) = match &live.meta {
         Some(m) => (
@@ -458,9 +424,8 @@ mod tests {
     use super::*;
 
     fn temp_dir() -> PathBuf {
-        // A per-call unique dir: a process-wide counter (NOT a timestamp, which collides when tests
-        // run in parallel within the same millisecond — one test's cleanup would then wipe another's
-        // dir mid-run).
+        // Process-wide counter, not a timestamp: parallel tests in the same
+        // millisecond would share a dir and one cleanup would wipe the other.
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!("pf-stats-{}-{}", std::process::id(), n));
@@ -494,7 +459,6 @@ mod tests {
         let rec = StatsRecorder::new(dir.clone());
         assert!(!rec.is_armed());
         assert!(!rec.status().armed);
-        // A push while idle is a no-op (no live capture).
         rec.push_sample(0, sample());
 
         let st = rec.start();
@@ -514,10 +478,8 @@ mod tests {
         assert!(meta.id.ends_with("_5120x1440"), "id was {}", meta.id);
         assert!(!rec.is_armed());
         assert!(rec.live_snapshot().is_none());
-        // Stop with nothing recording → Ok(None).
         assert!(rec.stop().unwrap().is_none());
 
-        // It is listed and loadable.
         let list = rec.list();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, meta.id);
@@ -525,7 +487,6 @@ mod tests {
         assert_eq!(loaded.samples.len(), 2);
         assert_eq!(loaded.meta.codec, "hevc");
 
-        // Delete removes it; a second delete is NotFound.
         rec.delete(&meta.id).unwrap();
         assert!(rec.list().is_empty());
         assert_eq!(
@@ -582,7 +543,6 @@ mod tests {
         rec.start();
         rec.register_session("native", 1920, 1080, 60, "hevc", "");
         rec.push_sample(0, sample());
-        // A second start must NOT wipe the in-progress capture.
         let st = rec.start();
         assert!(st.armed);
         assert_eq!(st.sample_count, 1);

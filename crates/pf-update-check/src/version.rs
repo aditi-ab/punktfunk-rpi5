@@ -1,13 +1,10 @@
-//! Release channels and the "is the manifest newer than me?" comparison.
+//! Channel and "is the manifest newer than this install?"
 //!
-//! The hard part is canary: every packaging channel spells the same CI build differently
-//! (`0.23.0~ci10250.gab12cd34` on deb, `0.23.0-0.ci10250.g…` on rpm, a zero-padded pkgrel on
-//! pacman, `0.23.10250` on Windows/decky). Comparing those strings to each other is
-//! meaningless, so canary compares `(major, minor)` and then the **CI run number**, which is
-//! the one monotonic axis every channel carries. Stable compares the plain triple.
+//! Canary packaging spells one CI build many ways (`~ciN` deb, `-0.ciN` rpm,
+//! `M.m.N` Windows). String compare is meaningless; canary uses `(major, minor)`
+//! then the CI run number. Stable uses the plain triple.
 //!
-//! Everything here is definitive-or-false: an unparseable pair never flags an update. A UI
-//! still shows both version strings — the badge just doesn't light up on guesswork.
+//! Unparseable pairs never flag an update. The UI may still show both strings.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
@@ -29,8 +26,7 @@ pub fn triple(v: &str) -> Option<(u64, u64, u64)> {
     let mut parts = v
         .split(|c: char| !c.is_ascii_digit())
         .filter(|s| !s.is_empty());
-    // Split on any non-digit: "0.23.0~ci10250.gab" → 0,23,0,10250… — take the first three
-    // ONLY if the string actually starts with digits (else it's not a version at all).
+    // Non-digit split yields extra tokens (`~ci10250`). Require a leading digit or it is not a version.
     if !v.starts_with(|c: char| c.is_ascii_digit()) {
         return None;
     }
@@ -41,11 +37,9 @@ pub fn triple(v: &str) -> Option<(u64, u64, u64)> {
     ))
 }
 
-/// The CI run number embedded in a canary version string, wherever the channel's format hid
-/// it: `0.23.0~ci10250.g<sha>` (deb), `0.23.0-0.ci10250.g<sha>` (rpm), `0.23.10250`
-/// (Windows/decky style, run-as-patch). A stable string yields `None`.
+/// CI run hidden in the canary string: `~ciN` / `.ciN` (deb/rpm) or patch ≥ 1000 (Windows).
+/// Stable strings return `None`.
 pub fn canary_run(version: &str) -> Option<u64> {
-    // `ci` immediately followed by digits, anywhere.
     let mut rest = version;
     while let Some(pos) = rest.find("ci") {
         let digits: String = rest[pos + 2..]
@@ -63,8 +57,7 @@ pub fn canary_run(version: &str) -> Option<u64> {
     }
 }
 
-/// Is the manifest's release newer than `current`? See the module docs for why canary
-/// compares run numbers rather than patch fields.
+/// Canary compares run numbers, not patch fields; see module docs.
 pub fn is_newer(
     manifest_version: &str,
     manifest_ci_run: Option<u64>,
@@ -89,8 +82,7 @@ pub fn is_newer(
     }
 }
 
-/// Windows canary installers are versioned `M.m.<run>` where `<run>` is a 4+ digit CI run
-/// number; stable patch numbers stay small. Heuristic, documented in the plan (R10).
+/// Windows canary is `M.m.<run>` with run ≥ 1000; stable patch stays small.
 pub fn windows_channel_of(version: &str) -> Channel {
     match triple(version) {
         Some((_, _, patch)) if patch >= 1000 => Channel::Canary,
@@ -98,7 +90,7 @@ pub fn windows_channel_of(version: &str) -> Channel {
     }
 }
 
-/// `CHANNEL=canary` in a shell-style conf (the sysext updater's own format).
+/// `CHANNEL=` line in the sysext updater's shell-style conf.
 pub fn conf_channel(conf: &str) -> Option<Channel> {
     for line in conf.lines() {
         if let Some(v) = line.trim().strip_prefix("CHANNEL=") {
@@ -128,8 +120,8 @@ mod tests {
     fn canary_runs() {
         assert_eq!(canary_run("0.23.0~ci10250.gab12cd34"), Some(10250));
         assert_eq!(canary_run("0.23.0-0.ci777.g12345678"), Some(777));
-        assert_eq!(canary_run("0.23.10250"), Some(10250)); // run-as-patch (Windows/decky)
-        assert_eq!(canary_run("0.23.0"), None); // stable string
+        assert_eq!(canary_run("0.23.10250"), Some(10250)); // Windows/decky: run-as-patch
+        assert_eq!(canary_run("0.23.0"), None);
         assert_eq!(canary_run("0.23.0-1"), None);
     }
 
@@ -137,14 +129,13 @@ mod tests {
     fn newer_stable() {
         assert!(is_newer("0.23.0", None, "0.22.2", Channel::Stable));
         assert!(!is_newer("0.22.2", None, "0.22.2", Channel::Stable));
-        assert!(!is_newer("0.22.1", None, "0.22.2", Channel::Stable)); // downgrade never flags
+        assert!(!is_newer("0.22.1", None, "0.22.2", Channel::Stable));
         assert!(!is_newer("not-a-version", None, "0.22.2", Channel::Stable));
     }
 
     #[test]
     fn newer_canary_compares_runs_not_patch() {
-        // deb canary current vs Windows-style manifest version, same run ⇒ NOT newer,
-        // even though a naive triple compare says 10250 > 0.
+        // Same CI run, different spelling (Windows vs deb) is not newer; triple compare would say it is.
         assert!(!is_newer(
             "0.23.10250",
             Some(10250),
@@ -157,14 +148,13 @@ mod tests {
             "0.23.0~ci10250.gab12cd34",
             Channel::Canary
         ));
-        // Minor bump wins outright.
         assert!(is_newer(
             "0.24.100",
             Some(100),
             "0.23.0~ci10250.g12",
             Channel::Canary
         ));
-        // No run extractable on either side ⇒ conservative false.
+        // Missing run on either side: never guess.
         assert!(!is_newer("0.23.10250", None, "0.23.0", Channel::Canary));
     }
 

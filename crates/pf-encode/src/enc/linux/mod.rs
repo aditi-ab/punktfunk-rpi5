@@ -1,17 +1,12 @@
-//! NVENC encoder via `ffmpeg-next` (binds the system FFmpeg — `ffmpeg-sys-next` auto-detects the
-//! installed version and emits a per-version cfg, so one source tree spans FFmpeg 7.x/libavcodec 61,
-//! 8.x/62 and 9.x/63; validated live on Ubuntu 26.04 (FFmpeg 8), Bazzite F43 (7.1) and CachyOS
-//! (FFmpeg 9). The `ffmpeg-next` MAJOR is a ceiling, not a target: 8.x refused anything past
-//! libavcodec 62, which is why Arch's FFmpeg 9 needed the crate bump and not just a rebuild.
-//! What a given package links is decided by the BUILDER's FFmpeg, so the soname bound that keeps an
-//! install honest is generated at package time — see packaging/arch/PKGBUILD.
+//! NVENC via `ffmpeg-next` (system FFmpeg; `ffmpeg-sys-next` emits a per-version cfg). One tree
+//! spans FFmpeg 7.x/libavcodec 61 through 9.x/63. The crate MAJOR is a ceiling: 8.x refused
+//! libavcodec 63, so FFmpeg 9 needs a crate bump, not a rebuild. The soname bound is generated
+//! at package time — see packaging/arch/PKGBUILD.
 //!
-//! Input is a packed RGB/BGR CPU frame; `*_nvenc` accepts `rgb0`/`bgr0`/`rgba`/`bgra`
-//! directly and does the RGB→YUV conversion on the GPU, so the host stays off the
-//! colour-conversion path. The portal commonly negotiates packed 24-bit `RGB`, which NVENC
-//! does *not* accept — we expand it to `rgb0` (one padding byte/pixel, no colour math).
-//! The encoder is opened *without* a global header so VPS/SPS/PPS are emitted in-band on
-//! every IDR — the output is both a playable raw Annex-B stream and self-contained AUs.
+//! Packed RGB/BGR CPU input; `*_nvenc` accepts `rgb0`/`bgr0`/`rgba`/`bgra` and does RGB→YUV on
+//! the GPU. Packed 24-bit `RGB` is expanded to `rgb0` (one padding byte, no colour math).
+//! Opened without a global header so VPS/SPS/PPS ride in-band on every IDR — raw Annex-B and
+//! self-contained AUs.
 
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder};
 use anyhow::{anyhow, bail, Context, Result};
@@ -29,9 +24,8 @@ use super::libav::{
 };
 use ffmpeg::ffi; // = ffmpeg_sys_next
 
-/// The swscale *source* pixel format for a captured packed RGB/BGR layout (the real byte order, not
-/// the NVENC-padded `*0` form). Used by the CPU conversion paths: 4:4:4 RGB→YUV444P, and HDR
-/// X2RGB10/X2BGR10→P010. Mirrors the VAAPI CPU-input mapping; YUV inputs can't feed this path.
+/// Captured packed RGB/BGR as swscale source (real byte order, not NVENC-padded `*0`).
+/// CPU CSC only: RGB→YUV444P and X2RGB10/X2BGR10→P010. YUV inputs cannot feed this path.
 fn sws_src_pixel(format: PixelFormat) -> Result<Pixel> {
     Ok(match format {
         PixelFormat::Bgrx => Pixel::BGRZ, // bgr0
@@ -40,8 +34,6 @@ fn sws_src_pixel(format: PixelFormat) -> Result<Pixel> {
         PixelFormat::Rgba => Pixel::RGBA,
         PixelFormat::Rgb => Pixel::RGB24,
         PixelFormat::Bgr => Pixel::BGR24,
-        // The GNOME 50+ HDR capture formats (PQ/BT.2020 packed 2:10:10:10) — the HDR CPU path's
-        // swscale source for the X2RGB10→P010 conversion.
         PixelFormat::X2Rgb10 => Pixel::X2RGB10LE,
         PixelFormat::X2Bgr10 => Pixel::X2BGR10LE,
         PixelFormat::Nv12
@@ -54,9 +46,8 @@ fn sws_src_pixel(format: PixelFormat) -> Result<Pixel> {
     })
 }
 
-/// `AVCUDADeviceContext` (libavutil/hwcontext_cuda.h) — not in the ffmpeg-sys bindings (the
-/// crate doesn't allowlist that header), so mirror its stable 3-pointer layout. We set the
-/// first field to *our* `CUcontext` so NVENC shares the context the EGL importer maps into.
+/// Mirror of libav's `AVCUDADeviceContext` (hwcontext_cuda.h) — ffmpeg-sys does not bind it.
+/// Three-pointer layout; `cuda_ctx` is our importer `CUcontext` so NVENC shares that context.
 #[repr(C)]
 struct AVCUDADeviceContext {
     cuda_ctx: *mut std::ffi::c_void, // CUcontext
@@ -64,11 +55,8 @@ struct AVCUDADeviceContext {
     internal: *mut std::ffi::c_void, // filled by ctx_init
 }
 
-// A hand-written mirror of libav's `AVCUDADeviceContext` (hwcontext_cuda.h) — `ffmpeg-sys-next`
-// does not bind it, so this is the only definition, and `CudaHw::new` WRITES `cuda_ctx` through it.
-// A wrong offset here would not fail to compile or crash; it would scribble over libav's internal
-// pointer. Nothing checked that until this block: the realistic failure is someone adding or
-// reordering a field here, which these assertions turn into a build error.
+// `CudaHw::new` writes `cuda_ctx` through this mirror. A wrong offset compiles and does not
+// crash; it scribbles libav's internal pointer. These asserts fail the build on a field reorder.
 const _: () = {
     use std::mem::{offset_of, size_of};
     assert!(size_of::<AVCUDADeviceContext>() == 3 * size_of::<*mut std::ffi::c_void>());
@@ -77,34 +65,29 @@ const _: () = {
     assert!(offset_of!(AVCUDADeviceContext, internal) == 2 * size_of::<*mut std::ffi::c_void>());
 };
 
-/// CUDA hardware-frame contexts that wrap our shared `CUcontext`, so `hevc_nvenc` reads the
-/// imported device buffer directly. Owns two `AVBufferRef`s, unref'd on drop.
+/// CUDA hwframes wrapping our shared `CUcontext`, so `hevc_nvenc` reads the imported buffer.
+/// Owns two `AVBufferRef`s, unref'd on drop.
 struct CudaHw {
-    // Declared frames-BEFORE-device on purpose: these drop in declaration order, and that
-    // reproduces exactly what the hand-written `Drop` this replaced did (the frames ctx holds its
-    // own reference on the device). Do not reorder these two fields.
+    // frames before device: drop order follows declaration; the frames ctx holds a ref on the
+    // device. Do not reorder.
     frames_ref: AvBuffer,
     device_ref: AvBuffer,
 }
 
 impl CudaHw {
-    /// Build a CUDA hwdevice wrapping `cu_ctx` and a frames pool (`sw_format` = `pixel`).
+    /// CUDA hwdevice wrapping `cu_ctx` plus a frames pool (`sw_format` = `pixel`).
     ///
-    /// The `bail!`s below format raw AVERROR ints eagerly BY DESIGN — do not convert them to
-    /// typed errors: `open_nvenc_probed`'s bitrate ladder steps down on a typed EINVAL
-    /// (`nvenc_open_einval`), and a hwdevice/hwframes EINVAL is a config error no bitrate can
-    /// fix — enrolling it would burn ~10 doomed encoder opens before surfacing the real failure.
+    /// `bail!` formats raw AVERROR ints on purpose: `open_nvenc_probed` treats typed EINVAL as a
+    /// bitrate step. A hwdevice EINVAL is not bitrate-related; typing it burns ~10 doomed opens.
     unsafe fn new(cu_ctx: *mut std::ffi::c_void, sw_format: Pixel, w: u32, h: u32) -> Result<Self> {
         // Each `?`/`bail!` below drops whatever has been built so far — `AvBuffer`'s `Drop` is the
         // single unref path, so the failure branches carry no cleanup of their own.
 
-        // SAFETY: `av_hwdevice_ctx_alloc` returns either null — which `AvBuffer::from_raw` rejects,
-        // so the `?` returns before anything below runs — or a fresh ref whose `data` libav has
-        // already initialized as an `AVHWDeviceContext`. For a CUDA device that context's `hwctx`
-        // is an `AVCUDADeviceContext` (our repr(C) mirror of libav's layout), so writing
-        // `cuda_ctx` is an in-bounds field store on a live allocation, and `cu_ctx` is a valid
-        // `CUcontext` by this fn's contract. `av_hwdevice_ctx_init` then takes the same live ref;
-        // it must see `cuda_ctx` already set, which is why the store precedes it.
+        // SAFETY: `av_hwdevice_ctx_alloc` returns null (`AvBuffer::from_raw` rejects, `?` returns)
+        // or a fresh ref whose `data` is an initialized `AVHWDeviceContext`. For CUDA, `hwctx` is
+        // our `AVCUDADeviceContext` mirror, so writing `cuda_ctx` is in-bounds on a live allocation;
+        // `cu_ctx` is a valid `CUcontext` by this fn's contract. `av_hwdevice_ctx_init` takes the
+        // same live ref and must see `cuda_ctx` already set.
         let device_ref = unsafe {
             let device_ref = AvBuffer::from_raw(ffi::av_hwdevice_ctx_alloc(
                 ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
@@ -112,7 +95,7 @@ impl CudaHw {
             .context("av_hwdevice_ctx_alloc(CUDA) failed")?;
             let dev_ctx = (*device_ref.as_ptr()).data as *mut ffi::AVHWDeviceContext;
             let cu = (*dev_ctx).hwctx as *mut AVCUDADeviceContext;
-            (*cu).cuda_ctx = cu_ctx; // share the importer's context
+            (*cu).cuda_ctx = cu_ctx;
             let r = ffi::av_hwdevice_ctx_init(device_ref.as_ptr());
             if r < 0 {
                 bail!("av_hwdevice_ctx_init failed ({r})");
@@ -120,11 +103,9 @@ impl CudaHw {
             device_ref
         };
 
-        // SAFETY: the same shape one level up — `av_hwframe_ctx_alloc` is handed the live,
-        // now-initialized device ref and returns null (rejected by `from_raw`, so the `?` leaves
-        // before the writes) or a ref whose `data` is a live `AVHWFramesContext`. Every store below
-        // is an in-bounds field write on that allocation, all plain scalars, done before
-        // `av_hwframe_ctx_init` reads them.
+        // SAFETY: `av_hwframe_ctx_alloc` takes the live initialized device ref and returns null
+        // (rejected by `from_raw`) or a ref whose `data` is a live `AVHWFramesContext`. Stores
+        // below are in-bounds scalar writes on that allocation, done before `av_hwframe_ctx_init`.
         let frames_ref = unsafe {
             let frames_ref = AvBuffer::from_raw(ffi::av_hwframe_ctx_alloc(device_ref.as_ptr()))
                 .context("av_hwframe_ctx_alloc failed")?;
@@ -147,12 +128,9 @@ impl CudaHw {
     }
 }
 
-// No `Drop` for `CudaHw`: each `AvBuffer` field unrefs itself, in declaration order (frames, then
-// device — see the field comment). The hand-written unref pair this replaced had to be kept in sync
-// with every failure branch in `new`; now there is exactly one unref path and it cannot be skipped.
+// No `Drop` for `CudaHw`: each `AvBuffer` unrefs itself in declaration order (frames, then device).
 
-/// Map a captured layout to the NVENC input pixel format, and whether a 3→4 byte expand is
-/// needed (packed RGB/BGR have no padding byte; the NVENC `*0` formats do).
+/// NVENC input pixel format, plus whether packed RGB/BGR needs a 3→4 byte expand (`*0` padding).
 fn nvenc_input(format: PixelFormat) -> (Pixel, bool) {
     match format {
         PixelFormat::Bgrx => (Pixel::BGRZ, false), // bgr0
@@ -161,26 +139,19 @@ fn nvenc_input(format: PixelFormat) -> (Pixel, bool) {
         PixelFormat::Rgba => (Pixel::RGBA, false),
         PixelFormat::Rgb => (Pixel::RGBZ, true), // RGB -> rgb0
         PixelFormat::Bgr => (Pixel::BGRZ, true), // BGR -> bgr0
-        // NV12 is native YUV: NVENC encodes it with NO internal RGB→YUV CSC (the Tier 2A win). On
-        // Linux it's produced by the GPU convert on the zero-copy tiled path (`PUNKTFUNK_NV12`); on
-        // Windows by the D3D11 video processor.
+        // Native YUV — no internal RGB→YUV. Linux GPU-convert (`PUNKTFUNK_NV12`) or Windows D3D11 VP.
         PixelFormat::Nv12 => (Pixel::NV12, false),
-        // Planar YUV444 from the zero-copy worker's GPU convert (a 4:4:4 session) — native
-        // full-chroma YUV in, `hevc_nvenc` emits Range-Extensions 4:4:4.
+        // Zero-copy GPU convert — `hevc_nvenc` emits Range-Extensions 4:4:4.
         PixelFormat::Yuv444 => (Pixel::YUV444P, false),
-        // Rgb10a2/Rgb10a2Sdr (the Windows packed-10 outputs) and P010 (the Windows 10-bit
-        // video-processor output) are produced only by the Windows paths; the Linux capturer
-        // never emits them. Map to BGRA so the match is exhaustive — unreachable here.
+        // Windows packed-10 / P010 only; Linux capturer never emits them. BGRA keeps the match exhaustive.
         PixelFormat::Rgb10a2 | PixelFormat::Rgb10a2Sdr | PixelFormat::P010 => (Pixel::BGRA, false),
-        // The Linux HDR capture formats never take the RGB-passthrough input: `open` intercepts
-        // them onto the X2RGB10→P010 swscale path before consulting this mapping (like 4:4:4).
+        // HDR never takes RGB-passthrough: `open` routes X2RGB10→P010 before this mapping.
         PixelFormat::X2Rgb10 | PixelFormat::X2Bgr10 => (Pixel::BGRA, false),
     }
 }
 
-/// The [`NvencEncoder::open`] arguments, kept on the encoder so [`Encoder::reset`] can rebuild it
-/// in place with the session's negotiated parameters — the encode-stall watchdog's recovery lever
-/// (drop the wedged libavcodec encoder, reopen fresh, forfeit the owed AUs, restart at an IDR).
+/// [`NvencEncoder::open`] args, stored so [`Encoder::reset`] can drop a wedged encoder and reopen
+/// with the session's negotiated parameters (forfeit owed AUs, restart at an IDR).
 #[derive(Clone, Copy)]
 struct OpenArgs {
     codec: Codec,
@@ -195,26 +166,21 @@ struct OpenArgs {
 }
 
 pub struct NvencEncoder {
-    // FIELD ORDER IS LOAD-BEARING: the hand-written `Drop` this replaced ran before any field
-    // drop, freeing `sws_csc` ahead of `enc`/`frame`/`cuda` — and this path runs on every
-    // stall-watchdog recovery via `*self = fresh` in `reset`. Declaration order is what
-    // preserves that sequence now (drop order follows declaration; an offset_of assert cannot
-    // pin it — repr(Rust) may lay memory out in any order).
-    /// CPU CSC paths only: swscale context converting the captured packed source into
-    /// [`Self::frame`] — RGB/BGR → planar YUV444P for a 4:4:4 session (`hevc_nvenc` only emits
-    /// 4:4:4 from a YUV444 *input*; RGB-in is always 4:2:0), or X2RGB10/X2BGR10 → P010 (BT.2020
-    /// limited) for an HDR session. `None` on the plain RGB paths AND on the zero-copy paths (the
-    /// worker's GPU convert delivers ready CUDA frames).
+    // Field order is load-bearing: `reset` does `*self = fresh`, so drop follows declaration.
+    // `sws_csc` must free ahead of `enc`/`frame`/`cuda`. `offset_of` cannot pin this — repr(Rust)
+    // may reorder fields in memory.
+    /// CPU CSC only: packed source → [`Self::frame`]. RGB/BGR → YUV444P (`hevc_nvenc` emits 4:4:4
+    /// only from YUV444 *input*; RGB-in is always 4:2:0), or X2RGB10/X2BGR10 → P010. `None` on
+    /// plain RGB and on zero-copy (the worker already delivers CUDA frames).
     sws_csc: Option<AvSwsContext>,
     enc: encoder::video::Encoder,
-    /// Reusable 4-bpp CPU input frame (CPU path only; `None` for the zero-copy/CUDA path).
-    /// Mutating it in place across frames is sound only because the encoder is opened with
-    /// `delay=0`/`bf=0`/`max_b_frames=0` and the caller drains `poll()` after each `submit`,
-    /// so libavcodec holds no reference to the previous frame's buffer when we overwrite it.
+    /// Reusable 4-bpp CPU input (`None` on CUDA). Overwrite is sound only because the encoder
+    /// opens with `delay=0`/`bf=0` and the caller drains `poll()` after each `submit`, so
+    /// libavcodec holds no reference to the previous buffer.
     frame: Option<VideoFrame>,
-    /// Zero-copy path: CUDA hwdevice/hwframes contexts (the encoder takes `AV_PIX_FMT_CUDA`).
+    /// Zero-copy: CUDA hwdevice/hwframes (`AV_PIX_FMT_CUDA`).
     cuda: Option<CudaHw>,
-    /// This session opened as full-chroma 4:4:4 (FREXT) — via either input path.
+    /// Session opened as full-chroma 4:4:4 (FREXT).
     want_444: bool,
     src_format: PixelFormat,
     width: u32,
@@ -222,51 +188,38 @@ pub struct NvencEncoder {
     fps: u32,
     /// Monotonic presentation index, in `1/fps` time-base units.
     frame_idx: i64,
-    /// Force the next submitted frame to be an IDR (set by [`request_keyframe`]).
+    /// Next submit is an IDR ([`request_keyframe`]).
     force_kf: bool,
-    /// Opened in intra-refresh mode (surfaced via [`caps`](Encoder::caps) so the session glue
-    /// rate-limits forced IDRs — the wave heals loss without them).
+    /// Intra-refresh mode — [`caps`](Encoder::caps) so session glue rate-limits forced IDRs.
     intra_refresh: bool,
-    /// Resolved wave length in frames when [`intra_refresh`](Self::intra_refresh), else 0. Cached at
-    /// open so the pump's per-AU `caps()` doesn't re-read `PUNKTFUNK_IR_PERIOD_FRAMES`; the pump marks
-    /// every Nth AU with `USER_FLAG_RECOVERY_POINT` for the client's clean re-anchor.
+    /// Wave length in frames when intra-refresh, else 0. Cached at open so per-AU `caps()` does
+    /// not re-read `PUNKTFUNK_IR_PERIOD_FRAMES`; the pump marks every Nth AU `USER_FLAG_RECOVERY_POINT`.
     intra_refresh_period: u32,
-    /// The open arguments, for the in-place [`reset`](Encoder::reset) rebuild.
     args: OpenArgs,
 }
 
-// `CudaHw` holds raw `AVBufferRef`s and `sws_csc` an owned `SwsContext`; the encoder lives on a single
-// thread. The CPU encoder is already `Send` via ffmpeg-next; assert it for the raw fields too.
-// SAFETY: `NvencEncoder` owns an ffmpeg-next `Encoder`/`VideoFrame` (already `Send`) plus a `CudaHw`
-// holding raw `AVBufferRef`s and an optional raw `SwsContext`, none of which are `Send` by default.
-// The `SwsContext` is a self-contained swscale state object with no thread affinity, touched only
-// through `&mut self` on the one encode thread. The encoder is owned and driven by
-// exactly ONE thread — the per-session encode thread it is moved to — and is only touched through
-// `&mut self` methods, so it is never aliased or accessed concurrently. The wrapped libav contexts
-// (and the shared `CUcontext` the `CudaHw` references) have no thread affinity, so transferring
-// ownership across threads is sound. This asserts `Send` (transfer) only, extending ffmpeg-next's
-// existing `Send` to the raw CUDA fields; `Sync` (shared `&`) is deliberately NOT implemented.
+// SAFETY: `NvencEncoder` owns ffmpeg-next `Encoder`/`VideoFrame` (already `Send`) plus `CudaHw`
+// raw `AVBufferRef`s and an optional raw `SwsContext`, none of which are `Send` by default.
+// `SwsContext` has no thread affinity and is touched only through `&mut self` on the encode
+// thread. The encoder is owned by exactly one thread and only accessed via `&mut self`, so it
+// is never aliased. The libav contexts and the shared `CUcontext` have no thread affinity.
+// `Send` only; `Sync` is deliberately not implemented.
 unsafe impl Send for NvencEncoder {}
 
-/// Latched true once an intra-refresh open failed with the device-capability error (ENOSYS from
-/// `NV_ENC_CAPS_SUPPORT_INTRA_REFRESH`), so later sessions skip the doomed attempt. Never set by
-/// other open failures (a bitrate EINVAL must not permanently disable the feature).
+/// Latched once intra-refresh open fails with ENOSYS (`NV_ENC_CAPS_SUPPORT_INTRA_REFRESH`).
+/// Other open failures must not set this (a bitrate EINVAL must not disable the feature).
 static IR_UNSUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether this open should run the NVENC **intra-refresh** loss-recovery mode
-/// (`PUNKTFUNK_INTRA_REFRESH` truthy, opt-in until on-glass validated): a moving intra band +
-/// recovery-point SEI refreshes the whole picture every [`intra_refresh_period`] frames, so
-/// FEC-unrecoverable loss heals without the 20-40× full-IDR spike (which under loss causes more
-/// loss — the cascade). The session glue then rate-limits client keyframe requests
-/// ([`EncoderCaps::intra_refresh`](super::EncoderCaps)).
+/// Intra-refresh when `PUNKTFUNK_INTRA_REFRESH` is truthy and not latched unsupported.
+/// A moving intra band + recovery-point SEI refreshes the picture every
+/// [`intra_refresh_period`] frames, so unrecoverable loss heals without a 20-40× IDR spike.
 fn intra_refresh_requested() -> bool {
     super::policy::intra_refresh_requested()
         && !IR_UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The intra-refresh wave length in frames ([`super::policy::intra_refresh_period`]) — ffmpeg
-/// derives `intraRefreshPeriod`/`Cnt` from `gop_size` before forcing the real GOP infinite, so
-/// this is what `gop_size` is set to in IR mode.
+/// Intra-refresh wave length in frames. ffmpeg derives `intraRefreshPeriod`/`Cnt` from
+/// `gop_size` before forcing GOP infinite, so IR mode sets `gop_size` to this.
 fn intra_refresh_period(fps: u32) -> i32 {
     super::policy::intra_refresh_period(fps) as i32
 }
@@ -284,11 +237,9 @@ impl NvencEncoder {
         bit_depth: u8,
         chroma: ChromaFormat,
     ) -> Result<Self> {
-        // HDR / 10-bit (GNOME 50+ HDR screencast): a 10-bit session whose capture negotiated a
-        // packed 2:10:10:10 PQ/BT.2020 format (`X2Rgb10`/`X2Bgr10`) encodes HEVC Main10 / 10-bit
-        // AV1 from a P010 input frame we produce by swscale (BT.2020 limited; the PQ transfer
-        // rides through per-channel — BT.2020 NCL Y'CbCr *is* derived from the PQ-encoded R'G'B').
-        // A 10-bit request whose capture stayed SDR (HDR offer downgraded) honestly encodes 8-bit.
+        // 10-bit session with packed 2:10:10:10 PQ/BT.2020 (`X2Rgb10`/`X2Bgr10`) encodes HEVC
+        // Main10 / 10-bit AV1 from a P010 frame (BT.2020 limited; PQ rides through per-channel).
+        // A 10-bit request whose capture stayed SDR encodes 8-bit.
         let want_hdr10 = bit_depth == 10 && format.is_hdr_rgb10() && codec.supports_10bit();
         if bit_depth == 10 && !want_hdr10 {
             tracing::warn!(
@@ -299,39 +250,32 @@ impl NvencEncoder {
             );
         }
         if format.is_hdr_rgb10() && !want_hdr10 {
-            // A 10-bit PQ capture on an 8-bit session would be encoded with a BT.709 VUI and
-            // garbage bit-packing — never silently; the session must renegotiate.
+            // 10-bit PQ on an 8-bit session would get a BT.709 VUI and garbage packing — refuse.
             bail!(
                 "captured 10-bit HDR frames ({format:?}) on an 8-bit/{} session — refusing to \
                  mislabel PQ content",
                 codec.nvenc_name()
             );
         }
-        // Full-chroma 4:4:4 (HEVC Range Extensions). `hevc_nvenc` only emits 4:4:4 from a YUV444
-        // *input* frame — feeding RGB always subsamples to 4:2:0 regardless of profile (verified on
-        // the RTX 5070 Ti). Two ways to produce that input: the zero-copy worker's GPU convert
-        // (planar-YUV444 CUDA frames — `cuda` true), or the CPU path's swscale RGB→YUV444P. Both
-        // feed `profile=rext`; the range follows `PUNKTFUNK_444_FULLRANGE` in both.
+        // HEVC Range Extensions. `hevc_nvenc` emits 4:4:4 only from a YUV444 *input* — RGB always
+        // subsamples to 4:2:0. Input is either the worker's planar-YUV444 CUDA frames or CPU
+        // swscale RGB→YUV444P. Both feed `profile=rext`; range follows `PUNKTFUNK_444_FULLRANGE`.
         let want_444 = chroma.is_444() && codec == Codec::H265;
         if want_444 && want_hdr10 {
-            // The handshake resolves 4:4:4∧10-bit down to 8-bit on Linux, so this can't happen —
-            // fail loudly if it ever does rather than picking one silently.
+            // Handshake resolves 4:4:4∧10-bit down to 8-bit on Linux; fail if it ever reaches here.
             bail!("4:4:4 + 10-bit HDR is not a supported Linux NVENC combination");
         }
         ffmpeg::init().context("ffmpeg init")?;
         if std::env::var_os("PUNKTFUNK_FFMPEG_DEBUG").is_some() {
-            // SAFETY: `av_log_set_level` sets libav's global integer log level; `48` (= AV_LOG_DEBUG)
-            // is a valid level with no pointer args, and libav was just initialized by `ffmpeg::init()`
-            // above — always sound.
+            // SAFETY: `av_log_set_level` writes libav's global integer log level; `48` is
+            // AV_LOG_DEBUG (no pointer args). libav was just initialized by `ffmpeg::init()`.
             unsafe { ffi::av_log_set_level(48) }; // AV_LOG_DEBUG — surface NVENC hw-frame rejects
         }
         let name = codec.nvenc_name();
         let av_codec = encoder::find_by_name(name)
             .ok_or_else(|| anyhow!("{name} not built into libavcodec"))?;
         let (rgb_pixel, rgb_expand) = nvenc_input(format);
-        // 4:4:4 feeds NVENC a planar YUV444P frame we produce by swscale; HDR feeds it a P010
-        // frame likewise; the ordinary path feeds the captured RGB straight in and lets NVENC's
-        // internal CSC subsample to 4:2:0.
+        // 4:4:4 → YUV444P via swscale; HDR → P010; otherwise captured RGB in, NVENC CSC to 4:2:0.
         let (nvenc_pixel, expand) = if want_444 {
             (Pixel::YUV444P, false)
         } else if want_hdr10 {
@@ -346,22 +290,16 @@ impl NvencEncoder {
             .context("alloc video encoder")?;
         video.set_width(width);
         video.set_height(height);
-        video.set_format(nvenc_pixel); // NVENC converts RGB→YUV internally
-                                       // Fixed rate, CBR, no B-frames, ~1-frame VBV — the shared low-latency RC contract.
+        video.set_format(nvenc_pixel); // RGB path: NVENC CSC; 4:4:4/HDR already YUV
         apply_low_latency_rc(&mut video, fps, bitrate_bps);
-        // Infinite GOP — NO periodic IDR. A keyframe at 5120x1440 is ~20-40x a P-frame, so a
-        // periodic IDR is a recurring multi-millisecond encode+packetize+send spike — the ~2s
-        // "freeze". NVENC emits one IDR at stream start, then P-frames only; `forced-idr` (below)
-        // turns a client recovery request (RFI, via `request_keyframe`) into an IDR on demand.
-        // This is the Moonlight/Sunshine low-latency model.
-        // In intra-refresh mode the GOP is still infinite — ffmpeg reads `gop_size` as the refresh
-        // WAVE length (`intraRefreshPeriod`/`Cnt`) and then forces `gopLength` infinite itself, so
-        // a positive `gop_size` here does NOT reintroduce periodic IDRs.
+        // Infinite GOP — no periodic IDR. A 5120x1440 keyframe is ~20-40× a P-frame; a periodic
+        // IDR is a multi-ms encode+send spike. NVENC emits one IDR at start; `forced-idr` turns
+        // `request_keyframe` into an on-demand IDR. In IR mode ffmpeg still reads `gop_size` as
+        // the wave length then forces `gopLength` infinite — a positive value is not a periodic IDR.
         let intra_refresh = intra_refresh_requested();
-        // SAFETY: same `video` builder as above — a non-null, properly-aligned, sole-owned, not-yet-
-        // opened `AVCodecContext`. We write the plain `gop_size` int field (-1 = infinite GOP, or the
-        // intra-refresh wave length) before `open_with`, which ffmpeg-next has no setter for. No
-        // aliasing; synchronous scalar write.
+        // SAFETY: same `video` builder — a non-null, properly-aligned, sole-owned, not-yet-opened
+        // `AVCodecContext`. Write `gop_size` (-1 = infinite GOP, or the IR wave length) before
+        // `open_with`; ffmpeg-next has no setter. No aliasing; synchronous scalar write.
         unsafe {
             (*video.as_mut_ptr()).gop_size = if intra_refresh {
                 intra_refresh_period(fps)
@@ -370,35 +308,14 @@ impl NvencEncoder {
             };
         }
 
-        // Colour signalling, written for EVERY session (colorspace/range/primaries/transfer) —
-        // otherwise the client decoder assumes a default and the picture comes out washed-out /
-        // wrong-contrast. Matches the Windows NV12 path's BT.709 limited-range signalling.
-        //
-        // The packed-RGB 4:2:0 path used to be excluded, on the belief that "NVENC's internal CSC
-        // writes its own VUI". It does not: libavcodec's nvenc wrapper derives
-        // `colourDescriptionPresentFlag` from these very AVCodecContext fields, so leaving them
-        // UNSPECIFIED produced a stream with NO colour description at all. Every punktfunk client
-        // then falls back to BT.709 (`csc_rows`) and looks fine, but vendor TV decoders guess from
-        // RESOLUTION — an LG webOS panel reads a 4K SDR stream as BT.2020 and washes it out.
-        // BT.709 limited is the honest answer for that path too: NVENC's internal RGB→YUV is the
-        // same conversion both direct-SDK backends feed from an ARGB surface
-        // (`nvenc_cuda.rs`/`windows/nvenc.rs`), and `nvenc_core.rs` already stamps 709-limited on
-        // those unconditionally. This only makes the libav sibling consistent with them.
-        //
-        // Reachable whenever the direct-SDK path is not: a CPU/dmabuf (non-CUDA) capture, a build
-        // without `--features nvenc`, or PUNKTFUNK_NVENC_DIRECT=0.
-        //
-        // PUNKTFUNK_444_FULLRANGE=1 (experimental, 4:4:4-only): convert AND signal FULL range —
-        // recovers the ~12% of code space limited-range quantization gives up, for the exact
-        // text/UI chroma 4:4:4 exists for. Every punktfunk client honors the signaled range
-        // (csc_rows / the Apple rows port); ship as default only if the on-glass A/B shows a
-        // visible win. Linux-only: the Windows path's NVENC-internal CSC range is unmeasured.
+        // VUI on every session: libav's nvenc wrapper derives colourDescriptionPresentFlag from
+        // these fields. Unspecified → no colour description; TVs then guess from resolution.
+        // BT.709 limited matches the RGB→YUV both direct-SDK backends stamp. `PUNKTFUNK_444_FULLRANGE=1`
+        // (4:4:4 only) converts and signals full range — Linux-only; Windows CSC range is unmeasured.
         let full_range_444 =
             want_444 && std::env::var("PUNKTFUNK_444_FULLRANGE").is_ok_and(|v| v.trim() == "1");
         if want_hdr10 {
-            // HDR10: BT.2020 primaries + SMPTE-2084 (PQ) transfer, limited range — matches the
-            // swscale BT.2020 CSC below and the Windows paths' signalling. The client decoder
-            // auto-detects PQ from the VUI; static mastering metadata rides out-of-band.
+            // HDR10: BT.2020 + SMPTE-2084 (PQ), limited — matches the swscale CSC. Static metadata is OOB.
             // SAFETY: `raw = video.as_mut_ptr()` is the non-null, properly-aligned, sole-owned,
             // not-yet-opened `AVCodecContext`; we set its four VUI colour enum fields to valid
             // variants before `open_with`. Sole owner → no aliasing; synchronous writes.
@@ -411,9 +328,8 @@ impl NvencEncoder {
             }
         } else {
             // SAFETY: same `video` builder — `raw = video.as_mut_ptr()` is the non-null, properly-
-            // aligned, sole-owned, not-yet-opened `AVCodecContext`. We set its four VUI colour enum
-            // fields to valid `AVColorSpace`/`AVColorRange`/`AVColorPrimaries`/`AVColorTransfer-
-            // Characteristic` variants before `open_with`. Sole owner → no aliasing; synchronous writes.
+            // aligned, sole-owned, not-yet-opened `AVCodecContext`. Four VUI colour enum fields set
+            // to valid variants before `open_with`. Sole owner → no aliasing; synchronous writes.
             unsafe {
                 let raw = video.as_mut_ptr();
                 (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
@@ -427,22 +343,18 @@ impl NvencEncoder {
             }
         }
 
-        // For the zero-copy path, take CUDA surfaces: wrap the shared CUcontext in CUDA
-        // hwdevice/hwframes contexts and set `pix_fmt = CUDA` on the raw encoder context
-        // *before* open (NVENC derives the device from `hw_frames_ctx`).
+        // Zero-copy: wrap the shared CUcontext; set `pix_fmt = CUDA` before open so NVENC takes `hw_frames_ctx`.
         let cuda_hw = if cuda {
             let cu_ctx = pf_zerocopy::cuda::context().context("shared CUDA context")?;
-            // SAFETY: `CudaHw::new` (an `unsafe fn`) requires libav initialized (the `ffmpeg::init()`
-            // above ran) and a valid `CUcontext`; `cu_ctx` is the shared importer context from
-            // `zerocopy::cuda::context()?`, non-null on the `Ok` path. `nvenc_pixel` is a valid `Pixel`
-            // and `width`/`height` are the validated positive dims. It returns a RAII `CudaHw` wrapping
-            // (not owning) `cu_ctx` and owning two `AVBufferRef`s freed on drop.
+            // SAFETY: `CudaHw::new` requires libav initialized (`ffmpeg::init()` above) and a valid
+            // `CUcontext`; `cu_ctx` is the shared importer context, non-null on `Ok`. `nvenc_pixel`
+            // is a valid `Pixel`; `width`/`height` are validated positive dims. Returns a RAII
+            // `CudaHw` wrapping (not owning) `cu_ctx` and owning two `AVBufferRef`s freed on drop.
             let hw = unsafe { CudaHw::new(cu_ctx, nvenc_pixel, width, height)? };
             // SAFETY: `raw = video.as_mut_ptr()` is the non-null, sole-owned, not-yet-opened
-            // `AVCodecContext`. We set `pix_fmt = CUDA` and attach NEW refs (`av_buffer_ref`) of
-            // `hw.device_ref`/`hw.frames_ref` — both non-null (`CudaHw::new` guarantees) and from the
-            // live `hw`, which is moved into `NvencEncoder.cuda` next to `enc` and so outlives the
-            // encoder. The context owns its own refs (freed when the context closes). No aliasing.
+            // `AVCodecContext`. Set `pix_fmt = CUDA` and attach NEW refs (`av_buffer_ref`) of
+            // `hw.device_ref`/`hw.frames_ref` — both non-null (`CudaHw::new`) from live `hw`, moved
+            // into `NvencEncoder.cuda` next to `enc` so it outlives the encoder. No aliasing.
             unsafe {
                 let raw = video.as_mut_ptr();
                 (*raw).pix_fmt = ffi::AVPixelFormat::AV_PIX_FMT_CUDA;
@@ -454,54 +366,36 @@ impl NvencEncoder {
             None
         };
 
-        // Low-latency NVENC tuning (plan §7 / linux-setup doc).
         let mut opts = Dictionary::new();
         opts.set("preset", "p1"); // fastest
         opts.set("tune", "ull"); // ultra-low-latency
         opts.set("rc", "cbr");
         opts.set("bf", "0");
         opts.set("delay", "0");
-        opts.set("forced-idr", "1"); // RFI/request_keyframe → real IDR under the infinite GOP
+        opts.set("forced-idr", "1"); // request_keyframe → real IDR under the infinite GOP
         if intra_refresh {
-            // Moving intra band + recovery-point SEI (period set via gop_size above). Loss now
-            // self-heals within the wave; forced IDRs remain available (rate-limited by the glue).
+            // Moving intra band + recovery-point SEI (period = gop_size). Glue rate-limits forced IDRs.
             opts.set("intra-refresh", "1");
         }
         if want_444 {
-            // HEVC Range Extensions — the profile that carries chroma_format_idc=3. With a YUV444P
-            // input `hevc_nvenc` auto-selects it, but pin it explicitly so the chroma is never silently
-            // dropped on a future libavcodec.
+            // HEVC Range Extensions (`chroma_format_idc=3`). Auto-selected from YUV444P; pin so a
+            // future libavcodec cannot silently drop chroma.
             opts.set("profile", "rext");
         }
         if want_hdr10 && codec == Codec::H265 {
-            // HEVC Main10. `hevc_nvenc` auto-selects it from the P010 input, but pin it explicitly
-            // so the depth is never silently dropped on a future libavcodec. (10-bit AV1 needs no
-            // profile — AV1 Main carries 10-bit, driven by the input format.)
+            // HEVC Main10. Auto-selected from P010; pin so depth cannot silently drop. AV1 Main
+            // already carries 10-bit from the input format.
             opts.set("profile", "main10");
         }
 
-        // Split-frame encode across the GPU's NVENC engines. WP4: the policy is no longer
-        // duplicated here — it comes from the SAME [`resolve_split_mode`] the two direct-SDK
-        // backends use, so the pixel-rate threshold, the codec scoping and the (dropped) 10-bit
-        // short circuit cannot drift between the libav path and the rest. This copy had already
-        // diverged: it hard-coded a 2-way split regardless of engine count and carried no depth
-        // rule at all.
-        //
-        // ⚠ Only the FORCED outcomes are actionable here. libavcodec's `split_encode_mode`
-        // AVOption is its own vocabulary, and our `DISABLE` is the NVENC enum's `15` — passing
-        // that through would be meaningless to it (or fail the open). `DISABLE`/`AUTO` therefore
-        // both mean "leave the option unset", which is exactly today's behaviour: unset = the
-        // driver's own auto.
-        //
-        // ⚠ `engines = 0` = "not probed": the libav path has no caps probe of its own, and
-        // [`max_forced_split_mode`] maps unknown to 2-way, preserving what this site always did.
-        // A 3-NVENC part gets the wider split only on the direct-SDK path.
+        // Split-frame encode. Policy is [`resolve_split_mode`] (same as the direct-SDK backends).
+        // Only FORCED widths are set: libav's `split_encode_mode` is its own vocabulary, and our
+        // `DISABLE` is NVENC enum `15` — passing it through would fail the open. Unset = driver auto.
+        // `engines = 0` = unprobed; [`max_forced_split_mode`] maps unknown to 2-way.
         let pix_rate = width as u64 * height as u64 * fps as u64;
         let split = std::env::var("PUNKTFUNK_SPLIT_ENCODE").ok();
         match split.as_deref() {
-            // The operator arm gains the codec gate the auto arm always had (Phase 8): split
-            // "is not applicable to H264" per nvEncodeAPI.h, and h264_nvenc has no such AVOption
-            // — setting it would fail the open on a leftover dict entry.
+            // Operator override: H.264 has no split AVOption — setting it fails the open.
             Some(mode) if matches!(codec, Codec::H265 | Codec::Av1) => {
                 opts.set("split_encode_mode", mode)
             }
@@ -525,38 +419,19 @@ impl NvencEncoder {
             None => {}
         }
 
-        // libav's OWN failure path can take the whole host down with it. When NVENC init fails,
-        // `ff_nvenc_encode_init` calls `ff_cuda_check`, which hands `av_log` an `err_name`/
-        // `err_string` pair it did not initialize when the CUDA error lookup does not fill them —
-        // and glibc then walks that pointer in `strlen` inside `av_vbprintf`. Measured twice on
-        // home-nobara-1 (fc44, libavcodec 62), identical stack both times:
-        //
-        //     __strlen_evex <- av_vbprintf <- format_line <- av_log_default_callback
-        //       <- ff_cuda_check <- ff_nvenc_encode_init <- avcodec_open2 <- NvencEncoder::open
-        //
-        // once as an outright SIGSEGV mid-session, and once as a thread wedged in that stack so
-        // the service never answered SIGTERM and systemd SIGABRT'd it. Either way one encoder
-        // open failure kills every session on the box.
-        //
-        // We cannot fix the distro's FFmpeg, so deny it the chance to format: these messages are
-        // AV_LOG_ERROR, and `av_log_default_callback` returns on the level check before
-        // `format_line` when the level is AV_LOG_FATAL. The failure is NOT swallowed — it comes
-        // back as `Err(e)` below and is reported with our own context.
-        //
-        // Scoped to the call ALONE, deliberately: the ENOSYS arm below recurses into `Self::open`,
-        // and `QuietLibavLog` takes a non-reentrant global mutex — holding it across the match
-        // would deadlock the retry.
+        // NVENC init failure can take the host down: `ff_cuda_check` hands `av_log` an
+        // uninitialized `err_name`/`err_string` and glibc `strlen`s it. Drop the log level to
+        // AV_LOG_FATAL for this call only — `QuietLibavLog` is a non-reentrant mutex, and the
+        // ENOSYS arm recurses into `Self::open`. The `Err` still surfaces below.
         let opened = {
             let _quiet = QuietLibavLog::new();
             video.open_with(opts)
         };
         let enc = match opened {
             Ok(enc) => enc,
-            // The GPU lacks NV_ENC_CAPS_SUPPORT_INTRA_REFRESH — ffmpeg fails the open with
-            // ENOSYS ("Function not implemented"). Latch it (skip the doomed attempt on later
-            // sessions) and reopen this session without intra-refresh; any other failure — and
-            // any failure when IR wasn't requested — propagates untouched (the bitrate probe
-            // keys on EINVAL, which must not trip the latch).
+            // GPU lacks `NV_ENC_CAPS_SUPPORT_INTRA_REFRESH` (ENOSYS). Latch and reopen without IR.
+            // Other failures, and any failure when IR was not requested, propagate; EINVAL is the
+            // bitrate probe key and must not trip the latch.
             Err(e)
                 if intra_refresh
                     && matches!(
@@ -585,14 +460,8 @@ impl NvencEncoder {
                 );
             }
             Err(e) => {
-                // libav's own message for this failure was suppressed on purpose (see above), so
-                // say so — otherwise the next person debugging an NVENC open wonders why the
-                // journal has our error and none of FFmpeg's. There is no env switch to get it
-                // back (the guard is unconditional, and it outranks PUNKTFUNK_FFMPEG_DEBUG for the
-                // duration of the call): to read libav's text, drop the guard in a local build.
-                // What it costs is one line of the shape
-                //   [hevc_nvenc @ ..] cuInit(0) failed -> CUDA_ERROR_NO_DEVICE: no CUDA-capable ..
-                // and the AVERROR itself still travels in `e`.
+                // libav's message was suppressed (formatter can fault). There is no env switch;
+                // `PUNKTFUNK_FFMPEG_DEBUG` is outranked for this call. The AVERROR still travels in `e`.
                 return Err(e).with_context(|| {
                     format!(
                         "open {name} ({width}x{height}@{fps}, {bitrate_bps} bps) — libav's own \
@@ -610,39 +479,17 @@ impl NvencEncoder {
             );
         }
 
-        // Built HERE, below the fallible encoder open, NOT above it — historically because the
-        // context's only free was `Drop for NvencEncoder`, which needs a CONSTRUCTED `Self` that
-        // does not exist on `open`'s early returns; creating it above them leaked one per failed
-        // attempt, and `open_nvenc_probed`'s EINVAL bitrate ladder calls `open` up to ~10 times.
-        // The owned `AvSwsContext` now frees itself on any exit, but the placement stays: it
-        // documents the dependency on the post-open `nvenc_pixel`, and there is no reason to
-        // build a context an early return would just throw away.
-        // CPU CSC paths: build the packed-RGB → planar swscale (no rescale) into the encoder's
-        // input frame. THREE users: 4:4:4 (RGB→YUV444P, BT.709, range per the flag), HDR
-        // (X2RGB10/X2BGR10→P010, BT.2020 limited — the PQ transfer is per-channel and rides
-        // through the matrix untouched), and the packed 3-bpp expand (RGB24/BGR24→rgb0/bgr0).
-        //
-        // The expand used to be a hand-written per-pixel loop in `submit_cpu`: `w*h` iterations,
-        // each building two bounds-checked sub-slices for a 3-byte copy — a shape LLVM will not
-        // vectorise into the byte shuffle it is, on the COMMON CPU path (the portal and wlroots
-        // both commonly fixate packed 24-bit RGB, and pf-capture offers it first). swscale's
-        // packed-RGB expanders are SIMD, the sibling VAAPI backend already routes RGB24/BGR24
-        // through them, and this file already owned the context lifecycle — so the change is net
-        // subtractive. The three are mutually exclusive by construction: `expand` is only ever
-        // true on the packed-RGB 4:2:0 path (see `nvenc_pixel`/`expand` above), never with
-        // `want_444`, so one context serves whichever applies.
-        //
-        // Skipped on the zero-copy path (`cuda`): the worker's GPU convert already delivers ready
-        // CUDA frames — no CPU pixels exist to scale.
+        // After the fallible open: packed-RGB → encoder input (no rescale). 4:4:4 RGB→YUV444P,
+        // HDR X2RGB10→P010, or 3-bpp expand RGB24/BGR24→rgb0/bgr0 — mutually exclusive (`expand`
+        // only on packed-RGB 4:2:0). Skipped on CUDA: the worker already delivers device frames.
         let sws_csc = if (want_444 || want_hdr10 || expand) && !cuda {
             let src_av = pixel_to_av(sws_src_pixel(format)?);
             let dst_av = pixel_to_av(nvenc_pixel);
-            // SAFETY: `sws_getContext` allocates a swscale context for the given src/dst dims + pixel
-            // formats. Both dims are the encoder's positive `width`/`height` as `c_int`; `src_av` is a
-            // valid `AVPixelFormat` (from the `sws_src_pixel`-validated packed-RGB source), the dst is
-            // YUV444P (4:4:4) or P010LE (HDR). The trailing filter/param pointers are null = "use
-            // defaults" (documented as accepted). No Rust memory is borrowed; ownership of the
-            // returned context passes to the `AvSwsContext` (null rejected by `from_raw`).
+            // SAFETY: `sws_getContext` allocates a swscale context for src/dst dims + pixel formats.
+            // Both dims are the encoder's positive `width`/`height` as `c_int`; `src_av` is a valid
+            // `AVPixelFormat` (from `sws_src_pixel`); dst is YUV444P or P010LE. Trailing filter/param
+            // pointers are null = defaults. No Rust memory borrowed; `AvSwsContext` takes ownership
+            // (null rejected by `from_raw`).
             let sws = unsafe {
                 AvSwsContext::from_raw(ffi::sws_getContext(
                     width as c_int,
@@ -660,18 +507,14 @@ impl NvencEncoder {
             let Some(sws) = sws else {
                 bail!("sws_getContext(RGB→{nvenc_pixel:?}) failed");
             };
-            // Colour math applies to the CSC users ONLY. The expand is a pure byte shuffle —
-            // packed 3-bpp RGB/BGR to the same channels in 4 bytes, `nvenc_pixel` being `rgb0`/
-            // `bgr0` — and NVENC does the RGB→YUV itself downstream. Handing it a matrix + range
-            // here would silently range-convert every packed-RGB session, which is exactly what the
-            // module header promises does not happen ("no colour math").
+            // CSC users only. Expand is a byte shuffle (3-bpp → 4-bpp); a matrix here would
+            // range-convert packed-RGB sessions, which the module header promises does not happen.
             if want_444 || want_hdr10 {
                 // SAFETY: `sws` is the non-null context from the call above (null-checked). The
-                // coefficient tables from `sws_getCoefficients` (ITU-709 for 4:4:4, BT.2020 NCL for
-                // HDR — matching the VUI written above) are process-lifetime libswscale statics,
-                // reused for src+dst matrices; `sws_setColorspaceDetails` only reads them and writes
-                // scalar CSC settings into `sws` (dstRange matches the VUI: 0 = limited, 1 = the
-                // PUNKTFUNK_444_FULLRANGE experiment; HDR is always limited). No Rust memory is passed.
+                // coefficient tables from `sws_getCoefficients` (ITU-709 / BT.2020 NCL, matching the
+                // VUI) are process-lifetime libswscale statics; `sws_setColorspaceDetails` only reads
+                // them and writes scalar CSC into `sws` (dstRange 0 = limited, 1 = full-range 4:4:4).
+                // No Rust memory is passed.
                 unsafe {
                     let cs = ffi::sws_getCoefficients(if want_hdr10 {
                         super::libav::SWS_CS_BT2020
@@ -737,17 +580,13 @@ impl NvencEncoder {
 impl Encoder for NvencEncoder {
     fn caps(&self) -> super::EncoderCaps {
         super::EncoderCaps {
-            // libav NVENC hands the frame straight to the encoder — `frame.cursor` is never read,
-            // so a cursor-as-metadata session loses its pointer on this backend (audit finding).
+            // libav NVENC never reads `frame.cursor` — a cursor-as-metadata session loses its pointer.
             blends_cursor: false,
-            // 4:4:4 iff this session opened FREXT — the CPU swscale path or the zero-copy GPU
-            // convert. RFI/HDR-SEI stay unsupported on libavcodec NVENC (the trait defaults).
+            // FREXT iff this session opened 4:4:4. RFI/HDR-SEI stay at the trait defaults.
             chroma_444: self.want_444,
             intra_refresh: self.intra_refresh,
-            // NVENC intra-refresh is purpose-built GDR loss recovery (moving band + recovery-point
-            // SEI): the wave heals a lost picture within one period, so mark the boundary AUs and let
-            // the client re-anchor on them instead of forcing a full IDR. Tied to `intra_refresh`
-            // (already the `PUNKTFUNK_INTRA_REFRESH` opt-in), unlike AMF/QSV which stay unvalidated.
+            // GDR: mark boundary AUs so the client re-anchors on the wave instead of a full IDR.
+            // Tied to `intra_refresh` (`PUNKTFUNK_INTRA_REFRESH`); AMF/QSV stay unvalidated.
             intra_refresh_recovery: self.intra_refresh,
             intra_refresh_period: self.intra_refresh_period,
             ..super::EncoderCaps::default()
@@ -765,7 +604,6 @@ impl Encoder for NvencEncoder {
         );
         let pts = self.frame_idx;
         self.frame_idx += 1;
-        // Force an IDR when requested (client RFI); otherwise let NVENC pick (GOP/P-frame).
         let idr = self.force_kf;
         self.force_kf = false;
         match &captured.payload {
@@ -781,10 +619,8 @@ impl Encoder for NvencEncoder {
         self.force_kf = true;
     }
 
-    /// Encode-stall recovery: drop the wedged libavcodec encoder and reopen it fresh with the
-    /// session's negotiated parameters (the stored [`OpenArgs`]) — the drop-and-reopen lever the
-    /// QSV/VAAPI paths use, so the encode-stall watchdog can heal a wedged NVENC/driver instead of
-    /// ending the session. Owed AUs are forfeited; the fresh encoder opens on an IDR.
+    /// Drop the wedged libavcodec encoder and reopen with stored [`OpenArgs`]. Owed AUs are
+    /// forfeited; the fresh encoder starts on an IDR.
     fn reset(&mut self) -> bool {
         let a = self.args;
         match Self::open(
@@ -811,8 +647,7 @@ impl Encoder for NvencEncoder {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
-        // Non-blocking single drain: a packet ships, EAGAIN (need another input frame) and EOF
-        // (drained after flush) both mean "nothing this tick".
+        // Non-blocking: a packet ships; EAGAIN and EOF both mean nothing this tick.
         match poll_encoder(&mut self.enc, self.fps)? {
             PollOutcome::Packet(au) => Ok(Some(au)),
             PollOutcome::Again | PollOutcome::Eof => Ok(None),
@@ -844,10 +679,7 @@ impl NvencEncoder {
             bytes.len(),
             src_row * h
         );
-        // swscale the packed RGB straight into the encoder's input frame, then send it. Serves all
-        // three CSC users (see `open`): 4:4:4 → planar YUV444P, HDR → P010, and the packed 3-bpp
-        // expand → `rgb0`/`bgr0`. The remaining branch below is the 4-bpp source, which needs no
-        // conversion at all — just a row copy honouring the destination stride.
+        // Packed RGB → encoder input: 4:4:4, HDR, or 3-bpp expand. The branch below is 4-bpp copy.
         if let Some(sws) = self.sws_csc.as_ref().map(AvSwsContext::as_ptr) {
             let frame = self
                 .frame
@@ -855,14 +687,11 @@ impl NvencEncoder {
                 .context("CPU frame missing (encoder opened in CUDA mode)")?;
             // SAFETY: `format == self.src_format` and `bytes.len() >= src_row * h` (the `ensure!`s
             // above), so `sws_scale` reads `h` rows of `src_row` bytes from `src_data[0] = bytes`
-            // (packed RGB is single-plane; the other src planes are null/0) — all in bounds. `sws` is
-            // the non-null context built in `open`. The dst is `frame`'s underlying `AVFrame`, whose
-            // `data`/`linesize` in-struct arrays were sized by `VideoFrame::new` for the very
-            // `nvenc_pixel` this context was built to output — 3 planes of `width`×`height` for
-            // YUV444P, 2 for P010, 1 packed plane for `rgb0`/`bgr0` — so swscale writes exactly the
-            // planes it allocated, at the strides it reports. All pointers are live locals for this
-            // synchronous call; the encoder runs only on this thread (`unsafe impl Send`), so no
-            // aliasing/race.
+            // (packed RGB is single-plane; other src planes null/0) — all in bounds. `sws` is the
+            // non-null context built in `open`. The dst is `frame`'s `AVFrame`, sized by
+            // `VideoFrame::new` for this `nvenc_pixel` — so swscale writes the planes it allocated,
+            // at the strides it reports. Pointers are live locals; the encoder runs only on this
+            // thread (`unsafe impl Send`), so no aliasing/race.
             unsafe {
                 let dst_av = frame.as_mut_ptr();
                 let src_data: [*const u8; 4] =
@@ -897,8 +726,7 @@ impl NvencEncoder {
         let stride = frame.stride(0); // dst is 4-bpp, aligned
         let dst = frame.data_mut(0);
         {
-            // 4-bpp → 4-bpp, honoring the (possibly larger) dst stride. The 3-bpp expand that used
-            // to live here as a per-pixel loop is now swscale's job (see the branch above).
+            // 4-bpp → 4-bpp, honouring a possibly larger dst stride.
             for y in 0..h {
                 dst[y * stride..y * stride + src_row]
                     .copy_from_slice(&bytes[y * src_row..y * src_row + src_row]);
@@ -914,16 +742,12 @@ impl NvencEncoder {
         Ok(())
     }
 
-    /// Zero-copy path: hand the imported CUDA device buffer to NVENC with no CPU touch.
+    /// Zero-copy: imported CUDA buffer → NVENC with no CPU touch.
     ///
-    /// We take a *pooled* surface from the CUDA hwframes context (`av_hwframe_get_buffer`) and
-    /// device→device-copy our imported buffer into it, rather than wrapping our own pointer in a
-    /// bare frame. Two reasons: (1) NVENC's `nvenc_send_frame` ignores frames whose `buf[0]` is
-    /// null and the generic encode path's `av_frame_ref` needs a refcounted buffer — a bare
-    /// frame is rejected with `EINVAL`; (2) NVENC caches CUDA-resource *registrations* keyed by
-    /// device pointer with a bounded table, so a fresh pointer every frame would thrash/overflow
-    /// it — the pool recycles a small set of pointers. The extra copy is device-local (~8 MB at
-    /// 1080p, sub-millisecond on the GPU) and keeps the host fully off the pixel path.
+    /// Take a pooled surface (`av_hwframe_get_buffer`) and device-copy into it. A bare frame
+    /// is rejected (`buf[0]` null; `av_frame_ref` needs a refcounted buffer). NVENC caches
+    /// CUDA registrations by device pointer with a bounded table — a fresh pointer every
+    /// frame would overflow it; the pool recycles a small set. The copy is device-local.
     fn submit_cuda(&mut self, buf: &pf_zerocopy::DeviceBuffer, pts: i64, idr: bool) -> Result<()> {
         let frames_ref = self
             .cuda
@@ -931,36 +755,28 @@ impl NvencEncoder {
             .context("CUDA hw context missing (encoder opened in CPU mode)")?
             .frames_ref
             .as_ptr();
-        // The device→device copy below uses our shared context directly; make it current on the
-        // encode thread (ffmpeg pushes its own around the pool alloc, so order is fine).
+        // Device→device copy uses our shared context; make it current on this thread (ffmpeg
+        // pushes its own around the pool alloc, so order is fine).
         pf_zerocopy::cuda::make_current().context("CUDA context current (encode thread)")?;
-        // SAFETY: `frames_ref` is the non-null CUDA frames ctx from `self.cuda` (unwrapped via
-        // `.context(..)?` above), and the shared CUDA context was just made current on THIS thread
-        // (`make_current()?`), the precondition for the device-pointer copies below.
-        //  * `f` is an owned `AvFrame` — every exit below (bail, copy error, success) drops it
-        //    exactly once, releasing its ref on the pooled surface. `av_hwframe_get_buffer` fills
-        //    it with a pooled CUDA surface (sets `data[]`/`linesize[]`/`buf[0]`/`hw_frames_ctx`).
-        //  * For NV12 we read `data[0..2]` / `linesize[0..2]` (Y + interleaved UV), else
-        //    `data[0]`/`linesize[0]` — in-struct fields of the live frame, valid for the surface
-        //    dims ffmpeg allocated — and pass them to the cuda copy helpers, which device→device
-        //    copy `buf` (the imported `DeviceBuffer`, owned by the caller and live for this call)
-        //    into the surface.
-        //  * `avcodec_send_frame` takes its own ref of the pooled surface, so the drop afterwards
-        //    is the sole owning free. Single-threaded encoder → no race.
+        // SAFETY: `frames_ref` is the non-null CUDA frames ctx from `self.cuda`; the shared CUDA
+        // context was just made current on this thread (`make_current()?`), the precondition for
+        // the device-pointer copies below.
+        //  * `f` is an owned `AvFrame` — every exit drops it once, releasing its ref on the pooled
+        //    surface. `av_hwframe_get_buffer` fills `data[]`/`linesize[]`/`buf[0]`/`hw_frames_ctx`.
+        //  * NV12 reads `data[0..2]`/`linesize[0..2]`; else `data[0]`/`linesize[0]` — in-struct
+        //    fields of the live frame. `buf` is the imported `DeviceBuffer`, live for this call.
+        //  * `avcodec_send_frame` takes its own ref; the drop afterwards is the owning free.
+        //    Single-threaded encoder → no race.
         unsafe {
             let f = AvFrame::alloc().context("av_frame_alloc failed")?;
-            // Pooled CUDA surface: sets format, width/height, data[0]/linesize[0], buf[0] and
-            // hw_frames_ctx. Reused across frames (the pool recycles), keeping NVENC's
-            // registration cache warm.
+            // Pooled CUDA surface: format, dims, data/linesize, buf[0], hw_frames_ctx. Recycled.
             let r = ffi::av_hwframe_get_buffer(frames_ref, f.as_ptr(), 0);
             if r < 0 {
                 bail!("av_hwframe_get_buffer(CUDA) failed ({r})");
             }
-            // NV12 surfaces are two-plane (Y in data[0], interleaved UV in data[1]); YUV444
-            // surfaces are three-plane (`yuv444p` frames ctx — data[0..3]); the RGB surfaces are
-            // single-plane. Copy the matching layout into NVENC's pooled surface. A 4:4:4 session
-            // whose buffer ISN'T YUV444 (a LINEAR/gamescope capture the worker can't convert)
-            // fails loudly here rather than letting `hevc_nvenc` silently subsample RGB to 4:2:0.
+            // NV12 is two-plane, YUV444 three-plane (`yuv444p` frames ctx), RGB single-plane.
+            // A 4:4:4 session whose buffer is not YUV444 (LINEAR/gamescope, no GPU convert)
+            // fails here rather than letting `hevc_nvenc` silently subsample RGB to 4:2:0.
             let copy_res = if buf.yuv444 {
                 let dsts = core::array::from_fn(|i| {
                     (
@@ -1002,40 +818,30 @@ impl NvencEncoder {
     }
 }
 
-// No `Drop` for `NvencEncoder`: `sws_csc` (`Option<AvSwsContext>`) frees itself, and as field #1
-// it does so ahead of `enc`/`frame`/`cuda` — the same sequence the hand-written `Drop` performed
-// (see the field-order note on the struct).
+// No `Drop` for `NvencEncoder`: `sws_csc` frees itself first (field #1), ahead of `enc`/`frame`/`cuda`.
 
-/// Serialises the save → `AV_LOG_FATAL` → restore window that every capability probe opens around
-/// an encoder open it *expects* to fail.
+/// Serialises the save → `AV_LOG_FATAL` → restore window every capability probe opens around
+/// an encoder open it expects to fail.
 ///
-/// libav's log level is one process-global `int`, and the probes race each other for real: the
-/// NVENC and VAAPI 4:4:4/10-bit probes are reached from `/serverinfo` and from session bring-up.
-/// Two overlapping save/restore pairs interleave as get(INFO) → get(FATAL) → set(INFO) →
-/// set(FATAL), and the process is then pinned at `AV_LOG_FATAL` for good — every later libav
-/// diagnostic silently dropped, which is precisely the logging you want when a stream later fails
-/// to open. The probes run process-once and already cost a real encoder open, so serialising them
-/// costs nothing measurable.
+/// libav's log level is one process-global `int`. NVENC and VAAPI probes race from `/serverinfo`
+/// and session bring-up; interleaved get/set pins the process at `AV_LOG_FATAL` and later
+/// diagnostics vanish. Probes already run process-once.
 static LIBAV_LOG_LEVEL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// RAII quiet-window over libav's global log level: drops it to `AV_LOG_FATAL` on construction and
-/// restores the previous level on drop, holding [`LIBAV_LOG_LEVEL`] for the whole window.
+/// RAII quiet-window: `AV_LOG_FATAL` on construct, restore on drop, holding [`LIBAV_LOG_LEVEL`].
 ///
-/// Callers must have completed `ffmpeg::init()` first. Not re-entrant — no probe may construct a
-/// second guard while holding one (none do; the probe bodies only reach encoder-open helpers).
-/// `pub(crate)` so the VAAPI probes share the one lock: they race the NVENC probes on the same
-/// global.
+/// Callers must have completed `ffmpeg::init()`. Not re-entrant. `pub(crate)` so VAAPI probes
+/// share the lock with NVENC (same global).
 pub(crate) struct QuietLibavLog {
     prev: c_int,
-    // Held for the lifetime of the guard. `Drop for QuietLibavLog` runs before the struct's fields
-    // are dropped, so the restore below still happens under the lock.
+    // Held for the guard's lifetime. `Drop for QuietLibavLog` runs before fields drop, so restore
+    // still happens under the lock.
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl QuietLibavLog {
     pub(crate) fn new() -> Self {
-        // Poison-tolerant: a probe that panicked mid-window already restored the level via `Drop`,
-        // and refusing the lock forever afterwards would be a worse outcome than proceeding.
+        // Poison-tolerant: a panic mid-window already restored via `Drop`; refusing the lock forever is worse.
         let lock = LIBAV_LOG_LEVEL
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1058,17 +864,13 @@ impl Drop for QuietLibavLog {
     }
 }
 
-/// Probe whether this NVIDIA GPU + driver + libavcodec can actually encode HEVC **4:4:4** (Range
-/// Extensions). Opens a tiny real `hevc_nvenc` 4:4:4 session — the exact path [`NvencEncoder::open`]
-/// takes for a live 4:4:4 stream — and reports whether it succeeded. HEVC-only; the result is cached
-/// by the caller ([`crate::can_encode_444`]). A GPU/driver/ffmpeg without RExt 4:4:4 fails
-/// the open here, so the host resolves the session to 4:2:0 before the Welcome (honest downgrade).
+/// Probe HEVC 4:4:4 (Range Extensions) by opening a tiny `hevc_nvenc` session — the same path
+/// [`NvencEncoder::open`] takes. Cached by [`crate::can_encode_444`]. Failure → host downgrades
+/// to 4:2:0 before Welcome.
 ///
-/// ⚠️ Only consulted when libav will really serve the session (`PUNKTFUNK_NVENC_DIRECT=0`, or a
-/// build without `--features nvenc`). A direct-SDK host answers from the driver's caps bit instead
-/// (`nvenc_cuda::probe_support`) — running THIS probe there mixes ffmpeg's NVENC client into a
-/// direct-SDK process, which is the LOG-3 field bug: one successful `hevc_nvenc` FREXT open+close
-/// wedged every later NVENC open process-wide (`NV_ENC_ERR_INVALID_VERSION`) until a host restart.
+/// Only when libav will serve the session (`PUNKTFUNK_NVENC_DIRECT=0` or no `--features nvenc`).
+/// A direct-SDK host must use the driver's caps bit (`nvenc_cuda::probe_support`): one
+/// `hevc_nvenc` FREXT open+close wedges later NVENC opens (`NV_ENC_ERR_INVALID_VERSION`).
 pub fn probe_can_encode_444(codec: Codec) -> bool {
     if codec != Codec::H265 {
         return false;
@@ -1076,8 +878,7 @@ pub fn probe_can_encode_444(codec: Codec) -> bool {
     if ffmpeg::init().is_err() {
         return false;
     }
-    // Quiet ffmpeg's open error on a GPU that lacks 4:4:4 — the probe failing is an expected outcome.
-    // Held until the function returns, so the level is restored after the open either way.
+    // Expected-fail open: hold the quiet window until return so the level restores either way.
     let _quiet = QuietLibavLog::new();
     NvencEncoder::open(
         codec,
@@ -1093,11 +894,8 @@ pub fn probe_can_encode_444(codec: Codec) -> bool {
     .is_ok()
 }
 
-/// Probe whether this NVIDIA GPU + driver + libavcodec can actually encode 10-bit (HEVC Main10 /
-/// 10-bit AV1) from a P010 input — the exact path [`NvencEncoder::open`] takes for a live HDR
-/// stream (a tiny X2RGB10-sourced, P010-input open). The result is cached by the caller
-/// ([`crate::can_encode_10bit`]); a GPU/driver/ffmpeg without the 10-bit encode fails the open
-/// here, so the host resolves the session to 8-bit SDR before the Welcome (honest downgrade).
+/// Probe 10-bit (HEVC Main10 / 10-bit AV1) from P010 — the HDR path in [`NvencEncoder::open`].
+/// Cached by [`crate::can_encode_10bit`]. Failure → host downgrades to 8-bit SDR before Welcome.
 pub fn probe_can_encode_10bit(codec: Codec) -> bool {
     if !codec.supports_10bit() {
         return false;
@@ -1105,8 +903,7 @@ pub fn probe_can_encode_10bit(codec: Codec) -> bool {
     if ffmpeg::init().is_err() {
         return false;
     }
-    // Quiet ffmpeg's open error on a GPU that lacks 10-bit — the probe failing is an expected outcome.
-    // Held until the function returns, so the level is restored after the open either way.
+    // Expected-fail open: hold the quiet window until return so the level restores either way.
     let _quiet = QuietLibavLog::new();
     NvencEncoder::open(
         codec,
@@ -1126,13 +923,10 @@ pub fn probe_can_encode_10bit(codec: Codec) -> bool {
 mod cuda_hw_tests {
     use super::*;
 
-    /// `CudaHw` owns its two `AVBufferRef`s through `AvBuffer`, so *construct and drop* is the
-    /// entire contract: a missed unref leaks, a doubled one aborts inside glibc. Nothing else in
-    /// the suite covers it — the NVENC smoke tests take the CPU path and never build one, and the
-    /// VAAPI twin's tests need AMD/Intel silicon. Looping the cycle is the point: a double-unref
-    /// shows up as an abort, and a leak shows as the allocator growing across iterations.
+    /// `CudaHw` owns two `AVBufferRef`s through `AvBuffer`: construct-and-drop is the contract.
+    /// A missed unref leaks; a doubled one aborts in glibc. Loop so a leak shows as growth.
     ///
-    /// `#[ignore]`d (needs a real CUDA device):
+    /// `#[ignore]` (needs a CUDA device):
     /// `cargo test -p pf-encode cuda_hw_alloc_drop_cycles -- --ignored --nocapture`
     #[test]
     #[ignore = "needs a real CUDA device (run on an NVIDIA host, not the build box)"]
@@ -1142,8 +936,7 @@ mod cuda_hw_tests {
         for i in 0..8 {
             // SAFETY: `CudaHw::new` requires libav initialized (asserted above) and a valid
             // `CUcontext` — `cu_ctx` is the live shared context from `pf_zerocopy`. NV12 at
-            // 640x480 are a valid format and positive dims. The handle drops at the end of each
-            // iteration, which is precisely the unref path under test.
+            // 640x480 are a valid format and positive dims. The handle drops each iteration.
             let hw = unsafe { CudaHw::new(cu_ctx.cast(), Pixel::NV12, 640, 480) }
                 .unwrap_or_else(|e| panic!("CudaHw::new failed on iteration {i}: {e:#}"));
             assert!(!hw.device_ref.as_ptr().is_null(), "device ref went null");
@@ -1157,9 +950,8 @@ mod cuda_hw_tests {
 mod hdr_tests {
     use super::*;
 
-    /// The Linux HDR (GNOME 50 portal) encode path end-to-end on a real NVIDIA GPU: a synthetic
-    /// PQ-ish X2RGB10 CPU frame → swscale BT.2020 → P010 → `hevc_nvenc` Main10, drained to a real
-    /// AU. `#[ignore]`d (needs NVENC):
+    /// HDR encode on a real NVIDIA GPU: synthetic X2RGB10 → swscale BT.2020 → P010 →
+    /// `hevc_nvenc` Main10, drained to an AU.
     /// `cargo test -p pf-encode nvenc_hdr10_smoke -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -1177,7 +969,7 @@ mod hdr_tests {
             ChromaFormat::Yuv420,
         )
         .expect("open hevc_nvenc Main10 (P010 input)");
-        // Packed x:R:G:B 2:10:10:10 gradient (values are treated as PQ-encoded — fine for a smoke).
+        // Packed x:R:G:B 2:10:10:10 gradient (values treated as PQ — enough for a smoke).
         let mut bytes = vec![0u8; (w * h * 4) as usize];
         for y in 0..h {
             for x in 0..w {
@@ -1210,8 +1002,7 @@ mod hdr_tests {
         assert!(!au.data.is_empty(), "empty AU");
         assert!(au.keyframe, "first AU should be the IDR");
         println!("HDR10 smoke: first AU {} bytes (IDR)", au.data.len());
-        // PF_HDR_SMOKE_DUMP=/path.h265: write the Annex-B AU for external inspection —
-        // `ffprobe -show_streams` should report Main 10, bt2020nc/smpte2084/bt2020 colours.
+        // PF_HDR_SMOKE_DUMP=/path.h265 writes the Annex-B AU; ffprobe should show Main 10, bt2020/smpte2084.
         if let Ok(path) = std::env::var("PF_HDR_SMOKE_DUMP") {
             std::fs::write(&path, &au.data).expect("dump AU");
             println!("HDR10 smoke: AU written to {path}");

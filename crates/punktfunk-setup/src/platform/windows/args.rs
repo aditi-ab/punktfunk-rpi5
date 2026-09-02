@@ -1,19 +1,17 @@
-//! The Inno Setup command-line dialect, honoured verbatim and forever (WP1.2).
+//! The Inno Setup command-line dialect.
 //!
-//! Three fielded call sites spawn this installer with these exact flags — the winget manifest,
-//! `punktfunk-host`'s auto-update (`update/windows.rs`), and the rollback path — and every
-//! already-installed box will hand the *new* installer the *old* flags on its first update.
-//! So this parser is a compatibility floor, not a convenience: `design/installer-v2-windows.md`
-//! D5 freezes it.
+//! Winget, `punktfunk-host`'s auto-update (`update/windows.rs`), and rollback spawn this
+//! installer with these flags, and an already-installed box hands the new installer the
+//! old flags on its first update. This parser is a compatibility floor:
+//! `design/installer-v2-windows.md` D5.
 //!
-//! Inno tolerates flags it does not know; a strict exit here would brick a future updater
-//! passing a newer flag to an older cached installer. Unknown `/`-flags are therefore
-//! collected for a warning line, never fatal.
+//! Inno ignores flags it does not know. A strict exit here bricks a future updater
+//! passing a newer flag to an older cached installer, so unknown `/`-flags warn, never fail.
 
 use std::path::PathBuf;
 
-/// How much UI the run may show. `Silent` is Inno's progress-only mode; both silent modes
-/// mean "never ask a question" — with `/SUPPRESSMSGBOXES`, every dialog takes its default.
+/// `Silent` is progress-only. Both silent modes never ask; with `/SUPPRESSMSGBOXES`
+/// every dialog takes its default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Silence {
     Interactive,
@@ -27,31 +25,27 @@ impl Silence {
     }
 }
 
-/// One `/MERGETASKS` / `/TASKS` entry: the task name, and whether it is selected (`!name`
-/// deselects). Names are matched case-insensitively, as Inno does.
+/// `!name` deselects. Names match case-insensitively, as Inno does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskFlag {
     pub name: String,
     pub selected: bool,
 }
 
-/// The parsed Inno dialect. Everything not slash-prefixed passes through untouched in `rest`
-/// so the engine's own `--flags` can ride the same argv.
+/// Non-slash arguments pass through in `rest` so the engine's `--flags` share argv.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InnoArgs {
     pub silence: Silence,
     pub suppress_msgboxes: bool,
     pub log: Option<PathBuf>,
-    /// `/MERGETASKS` entries — merged over the derived defaults.
+    /// Merged over the derived defaults.
     pub merge_tasks: Vec<TaskFlag>,
-    /// `/TASKS` entries — replace the defaults entirely (Inno's semantics).
+    /// Replaces the defaults entirely (Inno's semantics).
     pub tasks: Option<Vec<TaskFlag>>,
-    /// `/DIR=` — honoured on fresh installs only; upgrades follow the ARP location.
+    /// Fresh installs only; upgrades follow the ARP location.
     pub dir: Option<PathBuf>,
-    /// Known no-ops, accepted so the fielded spawns keep working: `/NORESTART`, `/SP-`.
-    /// Unknown `/`-flags land here too — one warning line, never an error.
+    /// Unknown `/`-flags: one warning line, never an error.
     pub unknown: Vec<String>,
-    /// Non-slash arguments, untouched, for the engine's own flag parser.
     pub rest: Vec<String>,
 }
 
@@ -89,7 +83,7 @@ impl InnoArgs {
                     .extend(task_list(&value().unwrap_or_default())),
                 "/TASKS" => out.tasks = Some(task_list(&value().unwrap_or_default())),
                 "/DIR" => out.dir = value().map(PathBuf::from),
-                // Accepted no-ops: we never restart, and /SP- suppresses a prompt we don't show.
+                // No-ops we still accept: this installer never restarts, and we show no `/SP-` prompt.
                 "/NORESTART" | "/SP-" => {}
                 _ => out.unknown.push(arg.clone()),
             }
@@ -98,8 +92,8 @@ impl InnoArgs {
     }
 }
 
-/// `"gamestream,!trayicon"` → entries. Inno also accepts a `*` glob; the fielded manifests
-/// never use it, so a literal `*` lands as a name and warns downstream.
+/// Inno accepts a `*` glob; we never emit one, so a literal `*` is a name and warns
+/// downstream.
 fn task_list(value: &str) -> Vec<TaskFlag> {
     value
         .split(',')
@@ -118,7 +112,7 @@ fn task_list(value: &str) -> Vec<TaskFlag> {
         .collect()
 }
 
-/// Inno accepts `/LOG="C:\a b.log"` — the quotes survive some spawners and not others.
+/// Quotes survive some spawners and not others.
 fn unquote(v: &str) -> String {
     v.strip_prefix('"')
         .and_then(|v| v.strip_suffix('"'))
@@ -134,8 +128,7 @@ mod tests {
         InnoArgs::parse(&args.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
     }
 
-    // The exact spawn from update/windows.rs SILENT_ARGS + /LOG — the contract that must
-    // never break.
+    // The update/windows.rs SILENT_ARGS + /LOG spawn. Do not break it.
     #[test]
     fn the_fielded_updater_spawn_parses_clean() {
         let a = parse(&[
@@ -163,7 +156,6 @@ mod tests {
         assert_eq!(b.silence, Silence::Silent);
     }
 
-    // The troubleshooting docs' exact line, plus a deselect.
     #[test]
     fn mergetasks_parses_selection_and_deselection() {
         let a = parse(&[r#"/MERGETASKS="allowpublicfw,!trayicon""#]);
@@ -189,8 +181,7 @@ mod tests {
         assert!(a.merge_tasks.is_empty());
     }
 
-    // D5's tolerance rule: Inno ignores what it doesn't know, so a future updater flag must
-    // warn, not brick the fielded silent path.
+    // Inno ignores unknown flags; a future updater flag must warn, not fail.
     #[test]
     fn an_unknown_slash_flag_is_collected_never_fatal() {
         let a = parse(&["/VERYSILENT", "/FUTUREFLAG=2", "/NOCANCEL"]);

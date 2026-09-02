@@ -1,13 +1,11 @@
-//! The console shell: the screen stack, the push/pop entrance/exit choreography, the
-//! chrome every screen shares (pinned title, controller chip, hint bar), and the modal
-//! overlays (connecting, waking, toasts). Screens draw CONTENT; the shell makes them
-//! read — and move — as one coherent console.
+//! Console shell: the screen stack, shared chrome, and modal overlays.
 //!
-//! Transitions: a push slides the incoming screen up out of a fade while the outgoing
-//! one recedes; a pop mirrors it. One eased 0→1 progress drives both layers (0.26 s,
-//! ease-out cubic — the WinUI shell's entrance feel), each composited through a
-//! `save_layer_alpha` so a screen fades as a unit, never element by element. The
-//! backdrop crossfades in parallel when the screens disagree (aurora ↔ form).
+//! Screens draw content. This module owns push/pop, the pinned title, controller
+//! chip, hint bar, and connecting/wake/toast takeovers.
+//!
+//! A transition is one sprung 0→1 scalar; both layers composite through
+//! `save_layer_alpha` so a screen fades as a unit. The backdrop crossfades when
+//! the layers disagree (aurora ↔ form). Paint recipes live in `render.rs`.
 
 use crate::anim::{springs, Spring};
 use crate::glyphs::GlyphStyle;
@@ -29,59 +27,45 @@ use std::time::Instant;
 mod overlays;
 mod render;
 
-/// The reduced-motion transition: quick and critically damped, drawn as a pure crossfade
-/// (no slide, no scale — see `render.rs`). Still a transition and not a cut, because the
-/// screen stack needs to stay legible: an instant swap loses the "you went somewhere"
-/// reading that is the only spatial cue a console shell has.
+/// Reduced-motion nav: 0.22 s, critically damped. `render.rs` draws it as a
+/// crossfade (no slide, no scale). Instant swap would drop the only spatial cue.
 const REDUCED_NAV: crate::anim::SpringSpec = crate::anim::SpringSpec {
     response: 0.22,
     damping: 1.0,
 };
-/// The push/pop choreography, in design units. Named rather than inlined at the paint
-/// sites because `console-vectors.json` claims to pin them for all three clients, and a
-/// literal buried in a paint recipe is a literal no test can reach.
+/// Push/pop slide, design units. Named so a test can pin it; a paint-site
+/// literal cannot.
 const NAV_SLIDE_DP: f64 = 36.0;
-/// The incoming screen's starting scale on a push…
+/// Incoming start scale on a push. Just under 1 so the arrival is felt.
 const NAV_ENTER_SCALE: f64 = 0.985;
-/// …and the outgoing/revealed one's, which is the deeper of the two because the screen
-/// being left behind should read as further away than the one arriving.
+/// Outgoing/revealed scale. Deeper than enter: the screen being left reads further away.
 const NAV_EXIT_SCALE: f64 = 0.96;
-/// How visible the revealed screen is at the START of a pop — not 0, because it was
-/// already there behind the screen coming off.
+/// Revealed-screen alpha at the start of a pop. Not 0: it was already behind the leaving screen.
 const NAV_REVEAL_ALPHA: f64 = 0.4;
-/// How far a transition must have travelled before it accepts anything other than Back.
-/// Not a time: with a sprung transition "how far along" and "how long ago" are different
-/// questions, and the one that matters for input is whether the screen under the cursor is
-/// the one the user is aiming at.
+/// Spring position at which non-Back input is accepted. Position, not elapsed time:
+/// the question is whether the screen under the cursor is the one being aimed at.
 const NAV_INPUT_OPENS: f64 = 0.85;
-/// Chrome bands (design units): the pinned title above, hints below.
+/// Chrome bands, design units: pinned title above, hints below.
 const TOP_BAND: f64 = 64.0;
 const BOTTOM_BAND: f64 = 86.0;
 
-/// How far a finger may wander (design units × the frame's `k`) and still be a tap. Past
-/// this the gesture is a drag and the lift acts on nothing. ~12dp is the classic touch
-/// slop; in device pixels it lands near Android's own ViewConfiguration figure.
+/// Max finger wander (design units × `k`) that still counts as a tap. 12 dp is
+/// classic touch slop; in device pixels it matches Android ViewConfiguration.
 const TOUCH_SLOP_DP: f64 = 12.0;
-/// One drag step (design units × `k`): each `DRAG_TICK_DP` of dominant-axis travel emits
-/// one synthetic scroll tick. 56 is the menu list's row pitch (`widgets::ROW_H` + gap), so
-/// a list under the finger moves about as far as the finger does. The on-glass tuning knob.
+/// Dominant-axis travel (design units × `k`) per synthetic scroll tick. 56 is
+/// the menu row pitch (`widgets::ROW_H` + gap), so the list tracks the finger.
 const DRAG_TICK_DP: f64 = 56.0;
 
-/// The active touch gesture, tracked by [`Shell::pointer_input`] (see the `touch` flag on
-/// `PointerInput::Down`). A mouse never enters this machine — its press acts immediately,
-/// which is what a mouse means. A second finger while one gesture is live is ignored
-/// (single-tracked; multi-touch gestures are a non-goal).
+/// Live touch gesture, from [`Shell::pointer_input`] when `touch` is set.
+/// A mouse never enters: its press acts immediately. A second finger is ignored.
 #[derive(Clone, Copy, Debug)]
 enum TouchGesture {
-    /// Finger down, still within slop of the anchor. A lift here is a tap: the Press is
-    /// delivered AT THE ANCHOR — the focused item scrolls toward the centre, so the down
-    /// point is where the user aimed and the lift point is where the content dragged
-    /// their eye; widgets hit-test last frame's rects and already tolerate exactly this
-    /// one-frame skew.
+    /// Finger down, still within slop. A lift is a tap: Press lands at the
+    /// *anchor*, not the lift point — the focused item scrolls toward centre
+    /// and widgets hit-test last frame's rects.
     Armed { x: f64, y: f64 },
-    /// Slop exceeded: a drag, locked to the axis it left the slop on (diagonal jitter
-    /// must not alternate a carousel with a list). `last` is the dominant-axis position
-    /// the previous tick was emitted at.
+    /// Slop exceeded. Axis-locked from the first exit so diagonal jitter cannot
+    /// alternate a carousel with a list. `last` is the last tick's dominant-axis pos.
     Drag {
         x: f64,
         y: f64,
@@ -90,55 +74,45 @@ enum TouchGesture {
     },
 }
 
-/// Which way a transition is choreographed. The paint recipes differ (a push slides the
-/// incoming screen up out of a fade; a pop grows the revealed one back while the leaving
-/// one drops away), so the kind outlives the direction the spring happens to be heading.
+/// Paint recipe for a transition. Distinct from spring direction: a reversed
+/// push still paints as a push.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum NavKind {
     Push,
     Pop,
 }
 
-/// One transition, as a single sprung scalar rather than a timer.
+/// One transition as a sprung scalar, not a timer.
 ///
-/// The scalar is what makes it INTERRUPTIBLE. A Back pressed mid-push retargets this very
-/// spring from 1.0 to 0.0 — same recipe, same velocity, so the screen visibly turns around
-/// and goes back where it came from instead of finishing its arrival and then playing a
-/// separate dismissal. A tween could not do that: its progress is a function of elapsed
-/// time, and reversing it means either a snap or a second animation.
+/// Back mid-push retargets this spring 1.0 → 0.0 with the current velocity.
+/// A tween is elapsed time; reversing it is a snap or a second animation.
 enum Motion {
     None,
     Nav {
         spring: Spring,
-        /// Where the spring is heading: 1.0 = the transition completing, 0.0 = it being
-        /// undone. Only a push is ever retargeted to 0.0 (see [`Shell::nav_back`]).
+        /// 1.0 = completing, 0.0 = undoing. Only a push is retargeted to 0.0
+        /// (see [`Shell::nav_back`]).
         target: f64,
         kind: NavKind,
-        /// The screen leaving the stack, when it is no longer ON the stack to be drawn from.
-        /// A pop always carries one. A plain push never does — its parent stays put and the
-        /// renderer finds it at `n - 2` — but a REPLACE does, because the screen it swapped
-        /// out is gone and `n - 2` is that screen's parent, a level too far.
+        /// Screen no longer on the stack, still needed to paint. A pop always
+        /// carries one. A REPLACE does too: `n - 2` would be the replaced
+        /// screen's parent. A plain push does not — the parent stays at `n - 2`.
         leaving: Option<Box<Screen>>,
     },
 }
 
-/// What a toast is REPORTING, which is the thing the old single style couldn't say: a
-/// pairing that worked and a connect that failed were the same grey pill, so the only way
-/// to tell them apart was to read. Each kind carries a mark and a hairline colour.
+/// Toast severity: mark plus hairline. Error is the one kind that must not
+/// take its colour from the palette.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToastKind {
-    /// Something happened (a session ended, a scan started). The default.
     Info,
-    /// Something the user asked for succeeded.
     Success,
-    /// Something failed. The one kind that does NOT take its colour from the palette — a
-    /// pale field's accent can be a cheerful mint, and a failure must not read as one.
+    /// Failure. Colour is fixed: a pale field's accent can be mint or orange.
     Error,
 }
 
-/// The shape drawn ahead of a toast's text. Three marks, deliberately geometric: the
-/// crate's glyph art is hand-built Skia paths, and a mark that has to survive from 0.75×
-/// to 3× `k` on a TV across the room can't rely on fine detail.
+/// Mark ahead of toast text. Geometric on purpose: glyph art is Skia paths
+/// that must read from 0.75× to 3× `k`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ToastMark {
     Dot,
@@ -147,14 +121,12 @@ pub(crate) enum ToastMark {
 }
 
 impl ToastKind {
-    /// The tint and mark this kind draws with.
     pub(crate) fn look(self) -> (Color4f, ToastMark) {
         match self {
             ToastKind::Info => (crate::theme::fg(0.55), ToastMark::Dot),
             ToastKind::Success => (crate::theme::accent(1.0), ToastMark::Check),
-            // Fixed, not palette-derived, and that is the point: `moss`'s accent is a green
-            // and `ember`'s is an orange — either would report a failure in the colour the
-            // UI uses for "this is fine".
+            // Fixed RGB: `moss` accent is green, `ember` is orange — either
+            // would paint a failure in the "this is fine" colour.
             ToastKind::Error => (Color4f::new(0.93, 0.31, 0.28, 1.0), ToastMark::Bang),
         }
     }
@@ -164,46 +136,38 @@ struct Toast {
     text: String,
     at: f64,
     kind: ToastKind,
-    /// Slide-in seat, 0 → 1 on the tray spring. The same gesture as the keyboard tray
-    /// (something arriving from off-screen and settling), so it takes the same spec.
+    /// Slide-in 0 → 1. Same spring spec as the keyboard tray.
     seat: Spring,
 }
 
 struct Connecting {
     title: String,
     appear: f64,
-    /// A request-access wait (parked on the host until the operator approves) — the
-    /// takeover reads "Waiting for approval" rather than "Connecting".
+    /// Host is parked pending operator approval. Takeover title is
+    /// "Waiting for approval", not "Connecting".
     request_access: bool,
 }
 
-/// What the host hands the shell at construction.
+/// Host-supplied construction options.
 pub struct ConsoleOptions {
-    /// The machine's hostname — the default device name pairing registers.
+    /// Hostname registered as the default pairing device name.
     pub device_name: String,
-    /// Steam Deck: Steam's keyboard types (SDL text input); ours never draws.
+    /// Steam Deck: Steam's keyboard types; this shell never draws one.
     pub deck: bool,
-    /// Whether the host app has another interface to fall back to when the console is
-    /// switched off — an Android phone/tablet's touch shell. Shows the console-off switch
-    /// on the settings screen; false where this console is the only UI there is (the
-    /// desktop session, an Android TV), where offering "off" would strand the user.
+    /// Host has another UI when the console is off (phone/tablet touch shell).
+    /// False on desktop and Android TV — offering "off" would strand the user.
     pub fallback_ui: bool,
-    /// Where settings persist and the profile catalog comes from. `None` = the desktop
-    /// file store (`pf_client_core::trust`), which is what the Vulkan session wants and the
-    /// only store there is on Linux/Windows; every other host must supply one.
+    /// Settings and profile catalog. `None` uses the desktop file store
+    /// (`pf_client_core::trust`); every other host must supply one.
     pub store: Option<Arc<dyn SettingsStore>>,
-    /// Which platform this shell fronts — decides which settings rows exist and which
-    /// platform-native screens the settings list may open.
+    /// Which settings rows exist and which platform-native screens may open.
     pub platform: Platform,
-    /// Skia's GPU resource-cache budget, bytes — where decoded posters and glyph atlases
-    /// live. The desktop's 160 MB ([`DEFAULT_GPU_CACHE_BYTES`]) is sized for
-    /// a Deck; a 1 GB TV box wants a quarter of that (design/android-skia-console-port.md D11).
+    /// Skia GPU resource-cache budget, bytes. Desktop default is
+    /// [`DEFAULT_GPU_CACHE_BYTES`]; a 1 GB TV box wants a quarter of that.
     pub gpu_cache_bytes: usize,
 }
 
 impl ConsoleOptions {
-    /// The Vulkan session's options: file-backed settings, the desktop row set, the
-    /// desktop cache budget.
     pub fn desktop(device_name: String, deck: bool) -> ConsoleOptions {
         ConsoleOptions {
             device_name,
@@ -216,24 +180,11 @@ impl ConsoleOptions {
     }
 }
 
-/// Skia's GPU resource budget — poster art plus a few screen layers.
+/// Skia GPU resource-cache ceiling (not an allocation), bytes.
 ///
-/// A CEILING, not an allocation: Skia grows into it only under demand, and the console's
-/// demand is now small — with the library's posters cached at the size they are drawn
-/// (`screens::library::art_cache_size`) a full grid at Deck scale asks for ~30 MB. What
-/// matters is the HEADROOM. At 64 MB the budget sat under a full grid's working set: a
-/// screenful of full-resolution covers is ~100 MB, so `GrResourceCache` evicted a third of
-/// them on every submit and the next frame re-decoded them from JPEG on the render thread.
-/// That was the grid's slideshow, and a cliff rather than a slope — which is exactly how it
-/// was reported, smooth until the screen filled.
-///
-/// 160 MB clears the working set several times over at every scale a panel up to 1440p
-/// produces, with room for the two render targets and the glyph atlases. The one arrangement
-/// that can still crowd it is a 4K panel (`k` 2.7, 33 MB a render target) fed 1000×1500
-/// SteamGridDB portraits, where full resolution is genuinely what gets drawn — and that is a
-/// desktop GPU by the time it happens.
-///
-/// The desktop's number; a host with less memory (a TV box) passes its own through
+/// 160 MB. 64 MB sat under a full-grid working set (~100 MB of covers), so
+/// `GrResourceCache` evicted a third every submit and the next frame
+/// re-decoded JPEG on the render thread. A TV box passes its own through
 /// [`ConsoleOptions::gpu_cache_bytes`].
 pub const DEFAULT_GPU_CACHE_BYTES: usize = 160 << 20;
 
@@ -245,85 +196,65 @@ pub(crate) struct Shell {
     bus: ConsoleBus,
     actions: VecDeque<OverlayAction>,
     settings: trust::Settings,
-    /// Where `settings` persists (see [`ConsoleOptions::store`]).
     store: Arc<dyn SettingsStore>,
-    /// The platform this shell fronts (see [`ConsoleOptions::platform`]).
     pub(crate) platform: Platform,
     hosts: Vec<HostRow>,
     hosts_gen: u64,
     device_name: String,
     deck: bool,
-    /// See [`ConsoleOptions::fallback_ui`].
     fallback_ui: bool,
     pub(crate) in_stream: bool,
     connecting: Option<Connecting>,
-    /// The last host title a connect was raised for, kept past the connect itself so
-    /// [`Self::session_reconnecting`] can name the host it is re-dialing — that flow
-    /// raises no `Launch` of its own and therefore never passes a title through.
+    /// Host title of the last connect. [`Self::session_reconnecting`] has no
+    /// `Launch` of its own, so nothing else can name the host.
     last_connect_title: Option<String>,
     wake: Option<WakeStatus>,
-    /// True while `wake` is the shell's own optimistic placeholder — raised the instant a
-    /// screen queues `ConsoleCmd::Wake` (see [`Self::apply`]), before the service thread has
-    /// round-tripped its first real `WakeStatus` (~100 ms–1 s). `sync` must not clear the
-    /// placeholder in that window, or navigation would race the wake ungated (the "pressed A,
-    /// cursor drifted to Add Host, then got thrust into the stream" bug).
+    /// `wake` is a local placeholder raised in [`Self::apply`] before the
+    /// first `WakeStatus` (~100 ms–1 s). `sync` must not clear it in that
+    /// window or navigation races the wake ungated.
     wake_optimistic: bool,
     toast: Option<Toast>,
     mesh: RuntimeEffect,
-    /// The `ui_palette` the compiled `mesh` bakes. The settings screen can change the palette
-    /// mid-frame-loop, so [`Self::sync`] recompiles when this falls out of step — the backdrop
-    /// re-colours under the cursor as the row is stepped, which is the whole point of putting
-    /// the picker on a screen the backdrop is behind.
+    /// Palette id baked into `mesh`. [`Self::sync`] recompiles when
+    /// `settings.ui_palette` moves.
     mesh_palette: String,
-    /// Which OS-theme revision the compiled `mesh` bakes, when "Follow system theme" rules —
-    /// `None` while a curated palette draws. The pair with [`mesh_palette`](Self::mesh_palette)
-    /// is what lets `sync` rebuild on exactly two events: the row stepping, and the desk's
-    /// theme actually changing.
+    /// OS-theme revision baked into `mesh` while follow-system is on.
+    /// `None` for a curated palette. Pair with `mesh_palette` so `sync`
+    /// rebuilds only on the row step or a real theme change.
     mesh_os: Option<u64>,
-    /// The palette's ground × 0.4 — the calm lift, precomputed with `mesh`. Chosen so
-    /// `col*0.6 + lift` leaves the ground EXACTLY where it was and pulls the bright pools down
-    /// to it: the form screens lose the launcher's contrast, not its colour.
+    /// Palette ground × 0.4. `col*0.6 + lift` leaves the ground unchanged
+    /// and pulls the bright pools down: form screens lose contrast, not colour.
     mesh_lift: [f32; 3],
-    /// The backdrop's scrim under this palette: rgb = what the vignette and scrims tend
-    /// toward (black on a dark field, white on a pale one), a = how hard. Kept with the ink.
+    /// Backdrop scrim: rgb = vignette target (black on dark, white on pale),
+    /// a = strength. Kept with the ink.
     mesh_scrim: [f32; 4],
-    /// The text/accent/glass the palette calls for, published to the whole crate once per
-    /// frame (see [`crate::theme::set_ink`]).
+    /// Text/accent/glass for this palette, published once per frame
+    /// (see [`crate::theme::set_ink`]).
     ink: crate::theme::Ink,
-    /// 0 = launcher aurora, 1 = the calm form field — chased, so the backdrop settles into
-    /// (or out of) calm alongside the screen transition.
+    /// 0 = launcher aurora, 1 = form field. Chased so the backdrop settles
+    /// with the screen transition.
     bg_mix: f64,
     glyphs: GlyphStyle,
-    /// What drove the console LAST — a pad or keys — noted at the input seams
-    /// ([`Shell::note_input_source`], [`Shell::key`]) and read by the per-frame glyph
-    /// resolution, so the legend speaks the language of the device actually in use.
-    /// `None` until anything drives: the style then follows the connected pad, or the
-    /// platform's key device where there is none.
+    /// Last input device (pad or keys), noted at [`Shell::note_input_source`]
+    /// and [`Shell::key`]. `None` until anything drives: then the connected
+    /// pad, or the platform's key device.
     input_source: Option<crate::console::InputSource>,
     chip: Option<String>,
     pads: Vec<PadInfo>,
-    /// The settled top screen's hint-bar hit boxes, republished every frame by
-    /// [`Shell::render`]. The legend is the console's only on-screen statement of what the
-    /// face buttons do; for a pointer, which has none, it IS the button bar.
+    /// Settled top screen's hint-bar hit boxes, from [`Shell::render`].
+    /// For a pointer, which has no face buttons, this *is* the button bar.
     hint_rects: Vec<(crate::glyphs::HintKey, Rect)>,
-    /// The (left, top) inset the last frame laid out under — pointer coordinates arrive in
-    /// surface pixels and are brought into the same space `hint_rects` and every screen's
-    /// hit boxes were published in.
+    /// (left, top) inset of the last layout. Pointer coords arrive in surface
+    /// pixels; hit boxes were published in this space.
     last_insets: (f32, f32),
-    /// The design-unit scale the last frame rendered at, for the touch tracker's slop and
-    /// tick distances — gesture geometry must grow with the UI it drags.
+    /// Design-unit scale of the last frame. Touch slop and drag ticks grow with it.
     last_k: f64,
-    /// The touch gesture in flight, if any (see [`TouchGesture`]).
     gesture: Option<TouchGesture>,
-    /// Skia's resource-cache budget for the host that renders this shell (see
-    /// [`ConsoleOptions::gpu_cache_bytes`]).
     pub(crate) gpu_cache_bytes: usize,
     t0: Instant,
     last_frame: Option<Instant>,
-    /// Test-only: `(t, step)` — when set, the shell clock reads `t` and every frame advances
-    /// it by `step` instead of wall time, so the screenshot dump renders the SAME pixels on
-    /// any machine at any load (the aurora's phase is the clock; two real-time runs never agree
-    /// past the first scene). Never set outside `shell/tests.rs`.
+    /// Test-only `(t, step)`: clock reads `t` and each frame adds `step`.
+    /// The aurora phase *is* the clock; wall time never agrees across dumps.
     #[cfg(test)]
     pub(crate) fake_clock: Option<(f64, f64)>,
 }
@@ -400,13 +331,13 @@ impl Shell {
         })
     }
 
-    /// The live library model — for a host re-rooting the stack (see [`Self::replace_stack`]).
+    /// Live library model, for a host re-rooting via [`Self::replace_stack`].
     pub(crate) fn library(&self) -> &LibraryShared {
         &self.library
     }
 
-    /// Replace the whole screen stack (a deep link, a "back to that shelf" on return from a
-    /// game). Cuts, no transition: this is a re-entry, not navigation the user watched.
+    /// Replace the stack (deep link, return-to-shelf). Cut, no transition:
+    /// this is re-entry, not navigation the user watched.
     pub(crate) fn replace_stack(&mut self, stack: Vec<Screen>) {
         if stack.is_empty() {
             return;
@@ -419,15 +350,12 @@ impl Shell {
         };
     }
 
-    /// The host-facing pointer vocabulary onto the shell's own: primary press/release,
-    /// secondary-down = Back (its release is dropped, or a right-click would pop two
-    /// screens), wheel = discrete scroll steps, cancel.
+    /// Host pointer events. Secondary-down is Back; its release is dropped
+    /// or a right-click would pop two screens. Wheel is discrete scroll.
     ///
-    /// A TOUCH primary down (`touch: true`) takes the gesture lane instead: the press is
-    /// deferred, and the lift decides whether it was a tap (Press at the anchor) or a drag
-    /// (scroll ticks were already emitted along the way, the lift acts on nothing). A press
-    /// that acted on contact made every swipe across the settings list flip a value — the
-    /// finger has to be allowed to mean "scroll" until it has said otherwise.
+    /// A touch primary down defers the press: lift is a tap (Press at the
+    /// anchor) or a drag (ticks already emitted). A press-on-contact made
+    /// every swipe across a settings list flip a value.
     pub(crate) fn pointer_input(&mut self, input: pf_client_core::console::PointerInput) -> bool {
         use pf_client_core::console::{PointerButton, PointerInput};
         let (x, y, kind) = match input {
@@ -444,7 +372,6 @@ impl Shell {
                 touch,
             } => {
                 if touch {
-                    // A second finger while a gesture is live is ignored — single-tracked.
                     if self.gesture.is_none() {
                         self.gesture = Some(TouchGesture::Armed {
                             x: f64::from(x),
@@ -467,8 +394,6 @@ impl Shell {
                 button: PointerButton::Primary,
             } => match self.gesture.take() {
                 Some(TouchGesture::Armed { x, y }) => {
-                    // A tap: the deferred Press lands now, at the anchor, followed by the
-                    // Release the widgets ignore today (and a fling closes on tomorrow).
                     let consumed = self.pointer(Pointer {
                         x,
                         y,
@@ -481,7 +406,7 @@ impl Shell {
                     });
                     return consumed;
                 }
-                // A drag ends where its last tick left it; the lift itself does nothing.
+                // Drag: lift acts on nothing; ticks already fired.
                 Some(TouchGesture::Drag { .. }) => return true,
                 None => (x, y, PointerKind::Release),
             },
@@ -504,10 +429,9 @@ impl Shell {
         })
     }
 
-    /// Advance the touch gesture by a Move. Within slop nothing happens; past it the
-    /// gesture locks to its dominant axis and every [`DRAG_TICK_DP`]·k of travel becomes
-    /// one synthetic scroll tick at the anchor. Direction reads as "content follows the
-    /// finger": drag down/right = the previous item (a wheel-up), drag up/left = the next.
+    /// Advance a touch Move. Past slop, lock to the dominant axis; every
+    /// [`DRAG_TICK_DP`]·k of travel is one scroll tick at the anchor.
+    /// Down/right = previous (wheel-up); up/left = next.
     fn gesture_move(&mut self, x: f64, y: f64) -> bool {
         let Some(gesture) = self.gesture else {
             return false;
@@ -521,8 +445,7 @@ impl Shell {
                         x: ax,
                         y: ay,
                         horizontal,
-                        // Ticks count from where the slop was left, not from the anchor —
-                        // the slop's travel was spent proving this is a drag.
+                        // Ticks start where slop was left, not at the anchor.
                         last: if horizontal { x } else { y },
                     });
                 }
@@ -558,8 +481,8 @@ impl Shell {
         }
     }
 
-    /// The host reports a session edge. `Connecting` is a no-op — the shell raised the
-    /// Launch itself and is already showing the takeover.
+    /// Host session edge. `Connecting` is a no-op: the shell already showed
+    /// the takeover when it raised Launch.
     pub(crate) fn session_phase(&mut self, phase: pf_client_core::console::SessionPhase) {
         use pf_client_core::console::SessionPhase;
         match phase {
@@ -589,8 +512,6 @@ impl Shell {
         self.actions.pop_front()
     }
 
-    // --- Session lifecycle edges (from the overlay's `session_phase`) --------------------
-
     pub(crate) fn set_connecting(&mut self, title: Option<String>) {
         match title {
             Some(title) => {
@@ -619,14 +540,9 @@ impl Shell {
     pub(crate) fn session_ended(&mut self, reason: Option<&str>) {
         self.connecting = None;
         self.in_stream = false;
-        // Coming back to a shelf means the player just left a game, which is the single moment
-        // the running set is most likely to have changed — and the moment they are standing in
-        // front of the badge that claims to know. Nothing else refreshes it: this screen stack
-        // SURVIVES a stream (which is why the shelf needs no scroll restoration at all), so
-        // without this the Resume badge would still be advertising the title they just quit.
-        //
-        // Only the running set, never the catalog: a re-fetch would reset the phase to Loading
-        // and replace the shelf they are looking at with a spinner over a stream that just ended.
+        // Stack survives a stream, so nothing else refreshes the running set:
+        // without this the Resume badge still names the title they just quit.
+        // Catalog is left alone — a re-fetch would swap the shelf for a spinner.
         if let Some(Screen::Library(lib)) = self.stack.last() {
             self.bus.send(ConsoleCmd::RefreshRunning {
                 addr: lib.host_addr().to_string(),
@@ -639,27 +555,17 @@ impl Shell {
         }
     }
 
-    /// The stream stopped and the client is dialing again on its own (M8's codec
-    /// fallback). Says what changed — the picture is about to come back as a different
-    /// codec and silence would read as a glitch — and raises the connecting modal.
+    /// Client is redialing on its own (codec fallback). Raise the connecting
+    /// modal: nothing sends `Launch` for this retry, so without it the shell
+    /// is not streaming, not connecting, and a live pump is behind the
+    /// console — A would launch a second session. Back → `CancelConnect`.
     ///
-    /// The modal is not cosmetic. Nothing raises a `Launch` for this retry (the run loop
-    /// starts the pump itself), so without it the shell would be in a state no other flow
-    /// produces: not streaming, not connecting, and a live pump behind the console. All
-    /// three gates would open at once — menu events flowing, the console drawn
-    /// full-screen over a frozen picture, and no modal interlock — and pressing A would
-    /// launch a SECOND session on top of the running one. This is also what gives B
-    /// somewhere to go: the modal's Back raises `CancelConnect`, which the run loop
-    /// applies to the retry's pump exactly as it does to a first dial.
-    ///
-    /// `appear = 1.0`: the takeover is already the thing on screen (the retry follows a
-    /// live stream), so fading it in would read as a flash rather than a transition.
+    /// `appear = 1.0`: the retry follows a live stream; fading in is a flash.
     pub(crate) fn session_reconnecting(&mut self, msg: &str) {
         self.in_stream = false;
         self.connecting = Some(Connecting {
-            // The host this session was dialed to. `None` only if the shell never raised
-            // the connect itself (a `--connect` run has no console at all, so it never
-            // reaches here) — name the codec change instead of an empty string.
+            // `None` only if the shell never raised the connect (`--connect`
+            // has no console). Prefer a codec-change name over empty string.
             title: self
                 .last_connect_title
                 .clone()
@@ -683,16 +589,11 @@ impl Shell {
         });
     }
 
-    // --- Model sync (hosts, pairing, wake) — before input and before render --------------
-
     fn sync(&mut self) {
-        // The settings screen writes `ui_palette` and `follow_os_theme` straight into
-        // `self.settings`; recompiling here is what makes the backdrop re-colour live under
-        // the row being stepped — and what makes an `omarchy-theme-set` land mid-session:
-        // the service republishes the theme, the revision moves, this rebuilds. A rejected
-        // compile keeps the field that IS drawing — it never goes black because someone
-        // picked a colour, and the bookkeeping still advances so a broken build warns once
-        // rather than once per frame.
+        // Settings writes palette/follow-OS into `self.settings`; recompile
+        // here so the backdrop re-colours live. A rejected compile keeps the
+        // field that is drawing (never black) and still advances bookkeeping
+        // so a broken build warns once, not once per frame.
         let (os_rev, os) = crate::os_theme::os_theme();
         let want_os = if self.settings.follow_os_theme {
             os
@@ -734,7 +635,6 @@ impl Shell {
             (self.hosts, self.hosts_gen) = self.console.hosts_snapshot();
         }
 
-        // Service-worker notices (e.g. the log-upload result) become plain toasts.
         if let Some(text) = self.console.take_notice() {
             self.show_toast(text);
         }
@@ -769,14 +669,13 @@ impl Shell {
                 self.wake_optimistic = false;
                 self.wake = Some(w);
             }
-            // No service status yet: keep an optimistic placeholder alive — clearing it here
-            // would reopen the ungated window it exists to close.
+            // No service status yet: keep the placeholder. Clearing it here
+            // reopens the ungated window it exists to close.
             None if !self.wake_optimistic => self.wake = None,
             None => {}
         }
         if let Some(w) = &self.wake {
             if w.online {
-                // Awake: stop the wake loop, and connect if that's what A meant.
                 let intent = w.then_connect.then(|| {
                     self.hosts
                         .iter()
@@ -786,8 +685,7 @@ impl Shell {
                             port: h.port,
                             fp_hex: h.fp_hex.clone(),
                             launch: None,
-                            // A wake started from a pinned card carries its profile
-                            // through to the connect (the row's key found it again).
+                            // Pinned-card wake carries the pin's profile.
                             title: match &h.pin {
                                 Some(p) => format!("{} · {}", h.name, p.name),
                                 None => h.name.clone(),
@@ -800,8 +698,8 @@ impl Shell {
                 self.wake = None;
                 if let Some(Some(intent)) = intent {
                     self.start_connect(intent);
-                    // The wake takeover was already full-screen; skip the connect fade-in so the
-                    // Waking → Connecting handoff is seamless (no flash of the home behind).
+                    // Wake takeover was already full-screen; skip the connect
+                    // fade so home does not flash through.
                     if let Some(c) = &mut self.connecting {
                         c.appear = 1.0;
                     }
@@ -812,25 +710,19 @@ impl Shell {
         self.collections_handover();
     }
 
-    /// "Start in collections": a shelf that has just learned it holds more than one collection
-    /// stands aside for the collections screen.
+    /// Swap a library shelf for the collections screen once it holds more
+    /// than one. Lives here: a screen cannot replace itself.
     ///
-    /// It lives here rather than in the screen because a screen cannot replace ITSELF — the
-    /// decision needs the library model and the settings, which the shelf has, but the swap
-    /// needs the stack, which only the shell has. The shelf answers the question and hands
-    /// back a screen; this puts it where the shelf was standing.
-    ///
-    /// Guarded on a settled transition. Mid-flight the stack's top is not yet what the user
-    /// is looking at, and swapping under a push the user has already reversed with B would
-    /// land them on the collections of a host they just backed out of.
+    /// Settled transitions only. Mid-flight the stack top is not what is
+    /// on glass; swapping under a reversed push would land on a host the
+    /// user already backed out of.
     fn collections_handover(&mut self) {
         if !matches!(self.motion, Motion::None) {
             return;
         }
-        // Field borrows rather than clones: this runs every frame for the life of the shelf,
-        // and `Settings` is a struct of owned Strings. `stack` is borrowed mutably while
-        // `library` and `settings` are borrowed shared — disjoint fields, so the shelf can
-        // read both while it is itself being held.
+        // Borrow, don't clone: this is every frame of the shelf's life and
+        // `Settings` owns Strings. `stack` mut vs `library`/`settings` shared
+        // are disjoint, so the shelf can read both while being held.
         let upgraded = match self.stack.last_mut() {
             Some(Screen::Library(shelf)) => {
                 shelf.collections_upgrade(&self.library, &self.settings)
@@ -859,23 +751,14 @@ impl Shell {
         });
     }
 
-    // --- Input ---------------------------------------------------------------------------
-
     pub(crate) fn handle_menu(&mut self, ev: MenuEvent) -> Option<MenuPulse> {
         self.sync();
-        // Modal precedence: the connect card, then the wake card, then the screens.
         if self.connecting.is_some() {
             if ev == MenuEvent::Back {
-                // The takeover comes down HERE, not when the host answers. It used to wait for
-                // the next `session_phase` and show "Canceling…" until one arrived — and one is
-                // not guaranteed to: the dial is a blocking call on the host's side of this
-                // interface, so the wait was the whole connect budget (185 s on a request-access
-                // connect the host parks pending approval), and an embedder that simply drops a
-                // canceled dial never sends a phase at all. Either way the console sat on
-                // "Canceling…" with no input that could reach it — only killing the app cleared
-                // it. Cancel is the USER's decision and needs no confirmation from the wire; the
-                // action below still goes out, and every host already handles a dial that lands
-                // after it (quit-close the connector, route the end back silently).
+                // Drop the takeover here, not on the next `session_phase`.
+                // The dial is blocking on the host; a dropped cancel never
+                // sends a phase. Cancel is local; `CancelConnect` still goes
+                // out and hosts already handle a dial that lands after it.
                 self.connecting = None;
                 self.actions.push_back(OverlayAction::CancelConnect);
                 return Some(MenuPulse::Confirm);
@@ -900,18 +783,9 @@ impl Shell {
                 _ => return None,
             }
         }
-        // A transition no longer walls input off, it only filters it.
-        //
-        // Back is always heard, and is answered by the TRANSITION rather than the screens
-        // (see `nav_back`): mid-push it reverses the push, mid-pop it starts the next one.
-        // That is the whole point of the work — holding B to back out of a deep stack used
-        // to stutter at every level, because each press landed inside the previous
-        // transition and was thrown away.
-        //
-        // Everything else is still dropped until the incoming screen is nearly seated,
-        // which is what keeps a double-tapped A from pushing two screens. The threshold is
-        // on the spring's POSITION, not on elapsed time, so it means "far enough along to
-        // be the thing you are aiming at" whatever the transition's velocity.
+        // Back is always heard by the transition (`nav_back`). Other events
+        // wait until the spring is past `NAV_INPUT_OPENS` so a double-tapped
+        // A cannot push two screens. Threshold is position, not elapsed time.
         if !matches!(self.motion, Motion::None) {
             if ev == MenuEvent::Back {
                 if self.nav_back() {
@@ -945,35 +819,29 @@ impl Shell {
         pulse
     }
 
-    /// Mouse and touch, in device pixels. `true` = consumed.
+    /// Mouse and touch, device pixels. `true` = consumed.
     ///
-    /// The precedence mirrors [`Self::handle_menu`] exactly, and for the same reasons: a
-    /// modal card owns input while it is up, and a screen in motion takes none at all. The
-    /// one addition is the hint bar, which sits above the screens because a pointer has no
-    /// face buttons and the legend is where those actions live.
+    /// Same modal/motion precedence as [`Self::handle_menu`]. The hint bar
+    /// sits above the screens: a pointer has no face buttons.
     pub(crate) fn pointer(&mut self, p: Pointer) -> bool {
         self.sync();
-        // Surface pixels → the safe-area space the last frame laid out in.
+        // Surface pixels → last frame's safe-area space.
         let p = Pointer {
             x: p.x - f64::from(self.last_insets.0),
             y: p.y - f64::from(self.last_insets.1),
             kind: p.kind,
         };
-        // The right button is the pointer's B, everywhere — including on the modal cards,
-        // where Back is the only thing that answers at all.
-        //
-        // With ONE exception: B at the root quits the launcher, and a right-click is far
-        // easier to fire by accident than a thumb on B. Quitting stays an explicit act —
-        // the legend's "Quit" is clickable, and that is the pointer's way out.
+        // Right button is B, including on modal cards. Exception: B at the
+        // root quits, and a right-click is too easy to fire by accident —
+        // quit stays the legend's clickable "Quit".
         if p.kind == PointerKind::Back {
             if self.stack.len() > 1 || self.connecting.is_some() || self.wake.is_some() {
                 self.handle_menu(MenuEvent::Back);
             }
             return true;
         }
-        // A modal swallows the rest: clicking "past" a connect takeover onto the library
-        // behind it would start a second session, which is the same hole the menu path
-        // closes by returning early here.
+        // Clicking through a connect takeover onto the library would start
+        // a second session. Same early return as the menu path.
         if self.connecting.is_some() || self.wake.is_some() {
             return true;
         }
@@ -982,23 +850,17 @@ impl Shell {
         }
         if p.press() {
             if let Some((key, _)) = self.hint_rects.iter().find(|(_, r)| p.hits(*r)) {
-                // A hint is clickable when it names an ACTION. Shoulders and Adjust name a
-                // DIRECTION, and the thing they steer — the tab strip, a row's value — is
-                // already under the pointer's finger; inventing a side for a click here
-                // would just be a worse way to press what it can already press.
+                // Click only hints that name an action. Shoulders/Adjust name
+                // a direction already under the pointer.
                 let ev = match key {
                     crate::glyphs::HintKey::Confirm => Some(MenuEvent::Confirm),
                     crate::glyphs::HintKey::Back => Some(MenuEvent::Back),
                     crate::glyphs::HintKey::Secondary => Some(MenuEvent::Secondary),
                     crate::glyphs::HintKey::Tertiary => Some(MenuEvent::Tertiary),
-                    // ▲ is drawn as a direction and read as one, but it steers nothing: the
-                    // only screen that publishes it is the home carousel, where up is not
-                    // navigation but "open this tile's menu". Without this the context menu —
-                    // and with it the only way to copy a host's link — is pad-only.
+                    // Home carousel: Up is "open this tile's menu", not nav.
+                    // Without this the host-link copy path is pad-only.
                     crate::glyphs::HintKey::Up => Some(MenuEvent::Move(MenuDir::Up)),
-                    // ▼ is the same kind of hint: a direction that steers nothing, because
-                    // the only screen publishing it is the home carousel, where down means
-                    // "open Settings". A finger must be able to press what it advertises.
+                    // Home carousel: Down is "open Settings", not nav.
                     crate::glyphs::HintKey::Down => Some(MenuEvent::Move(MenuDir::Down)),
                     _ => None,
                 };
@@ -1032,18 +894,14 @@ impl Shell {
         consumed
     }
 
-    /// Note what produced the menu events now arriving — the hint legend follows it.
-    /// Called by [`crate::console::Console::menu`] (which is told by its host) and the
-    /// overlay's pad path; the keyboard path notes itself in [`Shell::key`].
+    /// Record what is producing menu events. The hint legend follows it.
     pub(crate) fn note_input_source(&mut self, source: crate::console::InputSource) {
         self.input_source = Some(source);
     }
 
-    /// The keyboard fallback — the console is fully drivable with no pad. Arrows and
-    /// Enter/Esc map onto menu events; Y/X mirror the pad's Secondary/Tertiary
-    /// (suppressed while editing, where letters are text).
-    ///
-    /// `shift` only matters for Tab, whose two directions are one key.
+    /// Keyboard fallback. Arrows and Enter/Esc are menu events; Y/X mirror
+    /// Secondary/Tertiary (suppressed while editing — those keys are text).
+    /// `shift` only affects Tab.
     pub(crate) fn key(&mut self, key: crate::input::Key, shift: bool, repeat: bool) -> bool {
         use crate::input::Key as S;
         self.input_source = Some(crate::console::InputSource::Keys);
@@ -1065,7 +923,7 @@ impl Shell {
                     return true;
                 }
             }
-            // Arrows etc. still drive the OSK grid below.
+            // Editing consumed nothing: arrows still drive the OSK grid.
         }
         let editing = self.stack.last().is_some_and(Screen::editing);
         let ev = match key {
@@ -1077,10 +935,8 @@ impl Shell {
             S::Escape | S::Backspace if !repeat => MenuEvent::Back,
             S::PageUp if !repeat => MenuEvent::JumpBack,
             S::PageDown if !repeat => MenuEvent::JumpForward,
-            // Tab is what a keyboard reaches for to change section, and the settings tabs
-            // were otherwise on PgUp/PgDn alone — a binding the legend only ever spells out
-            // when NO pad is attached, so with a controller plugged in there was nothing to
-            // discover. Shift+Tab goes back, as everywhere else.
+            // Tab = JumpForward even with a pad attached (legend otherwise
+            // only spells PgUp/PgDn when no pad). Shift+Tab = JumpBack.
             S::Tab if !repeat && shift => MenuEvent::JumpBack,
             S::Tab if !repeat => MenuEvent::JumpForward,
             S::Y if !repeat && !editing => MenuEvent::Secondary,
@@ -1097,9 +953,8 @@ impl Shell {
         }
     }
 
-    /// One command straight onto the bus — the in-stream ring's host actions, which have no
-    /// screen and so no `Outbox`. Only the desktop overlay calls it; the Android console's
-    /// ring is the editor alone.
+    /// Push a command with no screen (in-stream ring host actions). Desktop
+    /// overlay only; Android's ring is the editor.
     #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn send_cmd(&self, cmd: ConsoleCmd) {
         self.bus.send(cmd);
@@ -1107,12 +962,9 @@ impl Shell {
 
     fn apply(&mut self, fx: Outbox) {
         for cmd in fx.cmds {
-            // An input-initiated wake must gate input in the SAME call, exactly like
-            // `start_connect` gates via `connecting`: the service's first WakeStatus is
-            // ~100 ms–1 s away, and until it lands the screen would keep navigating —
-            // then the arriving status freezes the UI wherever the cursor drifted, with
-            // the "Waking…" card never shown for a fast wake. Raise it optimistically;
-            // `sync` lets the service's real status supersede this placeholder.
+            // Gate wake in this call, like `connecting`. First WakeStatus is
+            // ~100 ms–1 s away; without a placeholder the cursor keeps moving
+            // and a fast wake never shows "Waking…". `sync` supersedes it.
             if let ConsoleCmd::Wake { key, then_connect } = &cmd {
                 let name = self
                     .hosts
@@ -1146,13 +998,10 @@ impl Shell {
         }
     }
 
-    /// The spring the next push/pop runs on. Read at NAV time rather than per frame so a
-    /// transition can't change feel under itself if the setting is stepped mid-flight.
-    ///
-    /// Reduced motion keeps a spring rather than switching integrators — one code path
-    /// stays one code path — and simply picks a critically damped, quicker one. Combined
-    /// with the flattened geometry in `render.rs` (no slide, no scale) that reads as the
-    /// plain crossfade the setting promises.
+    /// Spring for the next push/pop. Sampled at nav time so a mid-flight
+    /// settings change cannot retune the in-progress transition.
+    /// Reduced motion stays a spring (`REDUCED_NAV`); `render.rs` flattens
+    /// geometry into the crossfade the setting promises.
     fn nav_spec(&self) -> crate::anim::SpringSpec {
         if self.settings.reduce_motion {
             REDUCED_NAV
@@ -1177,18 +1026,10 @@ impl Shell {
                 self.begin_nav(NavKind::Push, None);
             }
             Nav::Replace(screen) => {
-                // Swap under the SAME push choreography: the outgoing screen is dropped
-                // rather than parked, so Back from the incoming one lands where the
-                // replaced screen was reached from.
-                //
-                // It is CARRIED through the transition rather than dropped on the spot,
-                // which is the whole difference between this reading right and reading
-                // wrong. A push paints the screen BENEATH the incoming one as its receding
-                // layer; drop the replaced screen first and that is its parent, so choosing
-                // "Edit…" in a host's menu animated the editor in over HOME — the host list
-                // flashing up for the length of the transition, as if the menu had been
-                // dismissed and something else opened. Handing it over as the leaving layer
-                // means the menu itself recedes, which is what actually happened.
+                // Same push recipe, but the outgoing screen is dropped from
+                // the stack. Carry it as `leaving`: a push paints `n - 2` as
+                // the receding layer, and after pop that would be the parent
+                // (host list flashing under an Edit push).
                 let leaving = self.stack.pop().map(Box::new);
                 self.stack.push(*screen);
                 self.begin_nav(NavKind::Push, leaving);
@@ -1198,14 +1039,15 @@ impl Shell {
                     let leaving = self.stack.pop().expect("len > 1");
                     self.begin_nav(NavKind::Pop, Some(Box::new(leaving)));
                 } else {
-                    // Popping the root quits the console (B at home).
+                    // B at home: pop of the root quits.
                     self.actions.push_back(OverlayAction::Quit);
                 }
             }
         }
     }
 
-    /// How far the transition in flight has travelled, 0 when there is none.
+    /// In-flight spring position. `1.0` when there is no transition, so
+    /// callers that compare against `NAV_INPUT_OPENS` treat idle as seated.
     fn nav_pos(&self) -> f64 {
         match &self.motion {
             Motion::None => 1.0,
@@ -1213,12 +1055,8 @@ impl Shell {
         }
     }
 
-    /// Back, pressed while a transition is still in flight. Returns `true` when the
-    /// transition itself answered it, so the event never reaches the screens.
-    ///
-    /// This is the method the whole work package exists for. Before it, every mid-flight
-    /// press was swallowed, so holding B to back out of a deep stack stuttered at each
-    /// level: press, wait 0.26 s, press again.
+    /// Back during a transition. `true` = the transition consumed it;
+    /// the event must not reach the screens.
     fn nav_back(&mut self) -> bool {
         let Motion::Nav {
             spring,
@@ -1230,25 +1068,18 @@ impl Shell {
             return false;
         };
         match *kind {
-            // Reverse the push ON THE SAME SPRING. Velocity carries, so the entering screen
-            // decelerates, turns, and goes back down — one continuous motion rather than an
-            // arrival followed by a dismissal. `finish_nav` takes it off the stack when the
-            // spring lands on 0.
-            //
-            // Refused at the root, where there is no parent to fall back to and B means
-            // quit: that press belongs to the normal path.
+            // Retarget the same spring. Velocity carries; `finish_nav` pops
+            // the entering screen at 0. Refused at the root: B there is quit.
             NavKind::Push if *target == 1.0 && self.stack.len() > 1 => {
                 *target = 0.0;
                 true
             }
-            // Already reversing — nothing further to say, and letting this through would
-            // pop the parent out from under a screen that is still on its way off.
+            // Already reversing. Letting this through would pop the parent
+            // from under a screen still leaving.
             NavKind::Push if *target == 0.0 => true,
             NavKind::Push => false,
-            // A pop already going the right way: honour the press as "and the next one
-            // too". The current pop's bookkeeping is finished on the spot (the stack is
-            // already correct; only `leaving` is still being carried) and a fresh pop
-            // starts, which is exactly what makes a held B walk out of a stack smoothly.
+            // Held B: finish this pop's bookkeeping (stack is already
+            // correct) and start the next one.
             NavKind::Pop => {
                 let _ = spring;
                 self.motion = Motion::None;
@@ -1258,12 +1089,9 @@ impl Shell {
         }
     }
 
-    /// Advance the transition by `dt`. Returns how far along it is, or `None` once it has
-    /// settled — by which point [`Self::finish_nav`] has already run.
-    ///
-    /// Separate from `render` so it can be driven at a chosen `dt`: the render path takes
-    /// its `dt` from the wall clock, and a test that called it in a tight loop would
-    /// advance the spring by microseconds per frame and never see it move.
+    /// Step the in-flight transition. `None` once settled; [`Self::finish_nav`]
+    /// has then already run. Separate from `render` so tests can pass a `dt`
+    /// wall-clock render would measure in microseconds.
     fn advance_nav(&mut self, dt: f64) -> Option<f64> {
         let spec = self.nav_spec();
         let p = match &mut self.motion {
@@ -1271,8 +1099,8 @@ impl Shell {
             Motion::Nav { spring, target, .. } => {
                 spring.step_spec(*target, spec, dt);
                 spring.settle(*target, 0.001, 0.01);
-                // `settle` snaps both to rest, so this is an exact test rather than an
-                // epsilon one — and it is the only way out of the state.
+                // `settle` snaps to rest, so inequality is exact — and the
+                // only way out of Nav.
                 (spring.pos != *target || spring.vel != 0.0).then_some(spring.pos)
             }
         };
@@ -1282,7 +1110,6 @@ impl Shell {
         p
     }
 
-    /// A settled transition's bookkeeping. Called once the spring has landed on its target.
     fn finish_nav(&mut self) {
         if let Motion::Nav {
             kind,
@@ -1291,33 +1118,24 @@ impl Shell {
             ..
         } = &mut self.motion
         {
-            // A push that was reversed mid-flight never happened: take its screen back off.
-            // Guarded on length because the root must never be popped here — `nav_back`
-            // refuses to reverse there, and this is the belt to that's braces.
+            // Reversed push never happened: pop its screen. Length-guarded
+            // because the root must stay; `nav_back` already refuses there.
             if *kind == NavKind::Push && *target == 0.0 && self.stack.len() > 1 {
                 self.stack.pop();
-                // A reversed REPLACE puts back what it swapped out. The transition showed
-                // that screen receding and then coming home again, so landing anywhere else
-                // would contradict what was on glass — and "undo that navigation" means the
-                // menu you were standing in, not the screen one level further out.
+                // Reversed REPLACE restores what it swapped out. Undo means
+                // the menu that was on glass, not the parent one level out.
                 if let Some(back) = leaving.take() {
                     self.stack.push(*back);
                 }
             }
         }
-        // A completed pop drops the screen it was carrying, exactly as before.
+        // Dropping Nav drops a completed pop's `leaving` screen.
         self.motion = Motion::None;
     }
 
-    /// The living backdrop. `calm` 0 = the launcher's aurora, 1 = the quiet field the form
-    /// screens sit on; the shell chases it, so there is only ever ONE backdrop pass — the
-    /// former aurora-over-static-form crossfade is now a single uniform.
-    /// The clock the backdrop shader runs on. Reduced motion freezes the field at a fixed
-    /// phase rather than removing it: the colour IS the palette the user picked, and a
-    /// still gradient is also the OLED-friendly thing to leave on a screen for an hour.
-    ///
-    /// The CALM mix is deliberately not frozen with it — that tracks which screen is up,
-    /// a state change rather than decoration.
+    /// Backdrop shader clock. Reduced motion freezes the phase; the colour
+    /// is the picked palette and a still gradient is what an OLED can hold.
+    /// Calm mix is not frozen — that tracks which screen is up.
     fn field_clock(&self, t: f64) -> f64 {
         if self.settings.reduce_motion {
             0.0
@@ -1327,11 +1145,9 @@ impl Shell {
     }
 
     fn draw_aurora(&self, canvas: &Canvas, w: f64, h: f64, t: f64, calm: f64) {
-        // Gated at the one place the shader's clock is read, so the takeover's own
-        // `draw_aurora` call inherits it and a third caller can't forget.
+        // One clock read: the takeover's `draw_aurora` inherits it.
         let t = self.field_clock(t);
-        // Laid out to match the SkSL block: u_res (float2), u_tc (float2), u_lift (float4),
-        // u_scrim (float4).
+        // Matches the SkSL block: u_res, u_tc, u_lift, u_scrim (each float2/4).
         let uniforms: [f32; 12] = [
             w as f32,
             h as f32,
@@ -1361,11 +1177,9 @@ impl Shell {
     }
 }
 
-/// Compile the mesh shader for a palette and resolve everything else that palette decides:
-/// the calm lift, the scrim direction, and the ink the whole UI draws with.
-/// `uniform_size` is checked rather than assumed: the byte buffer [`Shell::draw_aurora`]
-/// hands Skia is hand-packed, and a silent layout change would feed the field garbage
-/// instead of failing.
+/// Compile the mesh for a palette and the lift, scrim, and ink it decides.
+/// `uniform_size` is checked: [`Shell::draw_aurora`] hand-packs the buffer
+/// and a silent layout change would feed the field garbage.
 type MeshLook = (RuntimeEffect, [f32; 3], [f32; 4], crate::theme::Ink);
 
 fn build_mesh(palette_id: &str) -> Result<MeshLook> {
@@ -1373,15 +1187,14 @@ fn build_mesh(palette_id: &str) -> Result<MeshLook> {
     compile_mesh(&p.mesh_colors(), crate::theme::Ink::of(p), p.ground)
 }
 
-/// The follow-system field: a QUIET ramp derived from the theme's own colours — shade into
-/// the ground, then a low accent ember in the bright corner — rather than the curated ramps'
-/// big hue arcs. The desk's colour is the point; a loud gradient over it would upstage it.
+/// Follow-system field: a quiet ramp from the theme's own colours, not the
+/// curated hue arcs. The desk colour is the point.
 fn build_mesh_os(t: &crate::os_theme::OsTheme) -> Result<MeshLook> {
     use crate::os_theme::mix;
     let (bg, fg, ac) = (t.background, t.foreground, t.accent);
     let stops: [(f64, f64, f64); 5] = if t.light {
-        // A pale field shades toward its own text colour, not toward black — darkening a
-        // pastel strands the dark ink on it (the scrim comment in `theme::Ink` says why).
+        // Pale field shades toward its text colour, not black: darkening a
+        // pastel strands dark ink on it (see `theme::Ink` scrim).
         [
             mix(bg, fg, 0.10),
             bg,

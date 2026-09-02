@@ -1,4 +1,16 @@
-//! Presenter bring-up: instance → surface → device → swapchain (init-time construction).
+//! Presenter bring-up: instance → surface → device → swapchain over an SDL window.
+//!
+//! [`Presenter::new`] is the only construction path. Device creation and
+//! [`probe_decode`] share [`VIDEO_BASE`], [`VIDEO_CODECS`], and [`video_decode_gate`]
+//! so a probe cannot report a capability the session then refuses.
+//!
+//! Pinning: `PUNKTFUNK_VK_DEVICE=<index>` is raw `vkEnumeratePhysicalDevices` order;
+//! `PUNKTFUNK_VK_ADAPTER=<name>` matches the marketing name, then discrete-first;
+//! `PUNKTFUNK_PRESENT_MODE=` fifo|mailbox|immediate|fifo_relaxed; `PUNKTFUNK_VRR_FIFO=1`
+//! selects the FIFO-first VRR ladder when LATEST_READY is absent; `PUNKTFUNK_HDR10=0`
+//! refuses the HDR10 swapchain.
+//!
+//! Evidence: [`present_mode_chain`], [`pick_device`], [`AdapterDecode::index`].
 
 #[cfg(target_os = "linux")]
 use super::HwCtx;
@@ -13,30 +25,23 @@ use ash::vk;
 use ash::vk::Handle as _;
 use std::ffi::{c_char, CString};
 
-/// The two extensions Vulkan Video decode cannot work without, whatever the codec.
-///
-/// Module scope, not function scope, because [`probe_decode`] answers "can this GPU do
-/// Vulkan Video decode?" and MUST answer it with the same list the device creation path
-/// gates on. A probe that keeps its own copy is a probe that eventually lies — and a
-/// lying capability report is worse than none, because it sends a field reporter looking
-/// in the wrong half of the stack.
+/// Codec-agnostic Vulkan Video decode extensions.
+/// [`probe_decode`] and device creation gate on this same list.
 pub(crate) const VIDEO_BASE: [&std::ffi::CStr; 2] = [
     ash::khr::video_queue::NAME,
     ash::khr::video_decode_queue::NAME,
 ];
 
-/// The per-codec decode extensions, same sharing rule as [`VIDEO_BASE`]. AV1's name is
-/// spelled out because ash 0.38's headers (1.3.281) predate its promotion.
+/// Per-codec decode extensions, same sharing rule as [`VIDEO_BASE`].
+/// AV1 is a string: ash's headers do not name `VK_KHR_video_decode_av1`.
 pub(crate) const VIDEO_CODECS: [&std::ffi::CStr; 3] = [
     ash::khr::video_decode_h264::NAME,
     ash::khr::video_decode_h265::NAME,
     c"VK_KHR_video_decode_av1",
 ];
 
-/// The Vulkan Video decode gate: all five must hold. One function so the device creation
-/// path and [`probe_decode`] cannot drift into disagreeing about what "supported" means —
-/// the failure that produces is a probe reporting a capability the session then refuses,
-/// which reads to everyone as a bug in the decoder rather than in the probe.
+/// All five conjuncts of "this device can host Vulkan Video decode".
+/// Device creation and [`probe_decode`] call this same function.
 pub(crate) fn video_decode_gate(
     api_1_3: bool,
     features_ok: bool,
@@ -47,78 +52,48 @@ pub(crate) fn video_decode_gate(
     api_1_3 && features_ok && has_decode_family && base_exts_present && any_codec_ext
 }
 
-/// What one physical device can do for Vulkan Video decode, without creating a logical
-/// device or a surface — the answer `punktfunk-session --probe-decode` prints.
-///
-/// Exists because "I pinned the Vulkan rung and got D3D11VA instead" was, until this,
-/// only answerable by starting a session and reading a log. Every field question about
-/// hardware decode starts here: WHICH adapter, and does it advertise the codec.
+/// One physical device's Vulkan Video decode capability: no logical device, no
+/// surface. What `punktfunk-session --probe-decode` prints.
 #[derive(Debug, Clone)]
 pub struct AdapterDecode {
-    /// The device's position in the RAW `vkEnumeratePhysicalDevices` order — and
-    /// therefore the value `PUNKTFUNK_VK_DEVICE` takes, because `pick_device` indexes the
-    /// unsorted list (`devices.get(i)`) before any ranking runs.
-    ///
-    /// ⚠ NOT the display position. This list is sorted discrete-first for readability,
-    /// while enumeration order puts the iGPU first on some hybrids — so the two disagree
-    /// on exactly the machines this probe exists to diagnose. Printing the display
-    /// position as if it were the env value would hand a hybrid-laptop reporter the
-    /// number for the other GPU.
+    /// Raw `vkEnumeratePhysicalDevices` index: the value `PUNKTFUNK_VK_DEVICE` takes.
+    /// `pick_device` uses that unsorted index. This report is discrete-first, so the
+    /// display row is not that number — hybrids enumerate the iGPU first.
     pub index: usize,
-    /// Marketing name — also the `PUNKTFUNK_VK_ADAPTER` match key. Not necessarily
-    /// unique: a hybrid can expose the same iGPU twice, and a name match then resolves to
-    /// whichever enumerates first.
+    /// Marketing name, also the `PUNKTFUNK_VK_ADAPTER` match key. Not unique: a hybrid
+    /// can expose the same iGPU twice, and a match takes whoever enumerates first.
     pub name: String,
-    /// Discrete GPUs sort first, exactly as `pick_device` ranks them, so index 0 here is
-    /// the device a default run will pick.
+    /// Discrete-first, matching `pick_device`: row 0 is the default present device.
     pub discrete: bool,
     pub api_1_3: bool,
     pub features_ok: bool,
-    /// The queue family index that advertises `VIDEO_DECODE_KHR`, if any.
     pub decode_family: Option<u32>,
-    /// Raw `VkVideoCodecOperationFlagsKHR` from that family — what the DRIVER says it can
-    /// decode, independent of which extensions are exposed.
+    /// `VkVideoCodecOperationFlagsKHR` from that family. Driver claim, independent of extensions.
     pub codec_ops: u32,
-    /// Required base extensions this device does NOT expose.
     pub base_missing: Vec<String>,
-    /// Per-codec decode extensions it does.
     pub codec_exts: Vec<String>,
     /// [`video_decode_gate`] over the fields above.
     pub usable: bool,
-    /// What the driver answers about video image formats, verbatim — one row per
-    /// (profile, usage) question ([`pf_vkdecode::probe`]).
-    ///
-    /// This is the half of the report that says why a device which passes every gate
-    /// above still cannot host the decoder. The five conjuncts answer "is Vulkan Video
-    /// here at all"; this answers "can the pipeline actually use it", which on at least
-    /// one shipping driver (Intel Arc, Windows) is a different question with a different
-    /// answer. Empty when the gate already failed — there is nothing to ask a device
-    /// with no video queue.
+    /// Video image-format answers from [`pf_vkdecode::probe`], one row per (profile, usage).
+    /// Empty when the gate already failed — no video queue to ask. A miss here is why a
+    /// `usable` device still cannot host the decoder.
     pub formats: Vec<pf_vkdecode::probe::ProfileProbe>,
 }
 
-/// `VK_EXT_present_mode_fifo_latest_ready`, hand-declared: it postdates the Vulkan headers
-/// ash 0.38 is generated from (1.3.281), so there is no binding for it — which is also why
-/// an unenabled driver reports the mode back as the bare number `1000361000`.
+/// `VK_EXT_present_mode_fifo_latest_ready`, hand-declared: ash does not name it.
+/// An unenabled driver reports the mode as the raw number `1000361000`.
 ///
-/// The mode is FIFO's tear-free vblank pacing that presents the **latest ready** image at
-/// each refresh and retires the older ones, instead of draining a queue. That is precisely
-/// what [`super::super::present_pace::PresentGate`] emulates in software, done by the
-/// driver — and it matters most exactly where the gate does: on a surface that offers no
-/// MAILBOX, this restores newest-wins behaviour without the app holding frames back.
+/// FIFO that presents the latest ready image at each refresh and retires the rest.
+/// Listing the mode on the surface is not permission; the device feature is.
 pub(crate) mod fifo_latest_ready {
     use ash::vk;
 
-    /// `VK_EXT_present_mode_fifo_latest_ready` (extension 361).
     pub(super) const NAME: &std::ffi::CStr = c"VK_EXT_present_mode_fifo_latest_ready";
-    /// `VK_PRESENT_MODE_FIFO_LATEST_READY_EXT`.
     pub(crate) const MODE: vk::PresentModeKHR = vk::PresentModeKHR::from_raw(1000361000);
-    /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_EXT`.
     const S_TYPE: vk::StructureType = vk::StructureType::from_raw(1000361000);
 
-    /// `VkPhysicalDevicePresentModeFifoLatestReadyFeaturesEXT`. The mode is usable only
-    /// when this feature is enabled at device creation, so the surface advertising the
-    /// mode is NOT on its own permission to request it.
+    /// `VkPhysicalDevicePresentModeFifoLatestReadyFeaturesEXT`.
+    /// Surface advertising is not permission; enable this at device creation.
     #[repr(C)]
     #[derive(Clone, Copy)]
     pub(super) struct Features {
@@ -139,32 +114,26 @@ pub(crate) mod fifo_latest_ready {
 }
 
 impl Presenter {
-    /// Bring up instance → surface → device → swapchain over an SDL window.
-    /// `instance_extensions` comes from `VideoSubsystem::vulkan_instance_extensions()`.
+    /// Instance → surface → device → swapchain over an SDL window.
+    /// `instance_extensions` is `VideoSubsystem::vulkan_instance_extensions()`.
     pub fn new(
         window: &sdl3::video::Window,
         instance_extensions: &[String],
         pref: PresentPref,
     ) -> Result<Presenter> {
-        // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
-        // builder structs that are locals outliving the call; the handle it returns is owned by
-        // the value being built here.
+        // SAFETY: dlopens libvulkan; no instance exists yet.
         let entry = unsafe { ash::Entry::load() }.context("libvulkan not loadable")?;
 
         let app_name = CString::new("punktfunk-session").unwrap();
-        // 1.3: Vulkan Video decode and PyroWave's compute kernels both need a 1.3
-        // device, and the instance version caps what the device can report (any current
-        // loader accepts 1.3 regardless of device support; device-level gating is below).
-        // `SharedDevice::api_version` republishes this constant to the overlay — keep the
-        // two the same by construction rather than by two spellings of `API_VERSION_1_3`.
+        // 1.3: Video decode and PyroWave both need it. The instance version caps
+        // what the device can report; `SharedDevice::api_version` is this same constant.
         let app_info = vk::ApplicationInfo::default()
             .application_name(&app_name)
             .api_version(super::INSTANCE_API_VERSION);
-        // HDR10 presentation needs the extended colorspaces at the INSTANCE level.
+        // HDR10 needs `VK_EXT_swapchain_colorspace` at instance level, not device.
         let mut instance_extensions: Vec<String> = instance_extensions.to_vec();
         let inst_available =
-            // SAFETY: per the Vulkan contract above - a read-only query on the live
-            // instance/device, filling locals returned by value.
+            // SAFETY: read-only loader query; no instance yet; result by value.
             unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
         let has_colorspace_ext = inst_available
             .iter()
@@ -176,12 +145,10 @@ impl Presenter {
             .iter()
             .map(|e| CString::new(e.as_str()).unwrap())
             .collect();
-        // `c_char`, not `i8`: plain `char` is SIGNED on x86_64 but UNSIGNED on aarch64, so a
-        // hardcoded `*const i8` compiles on the desktop targets and fails to match ash's
-        // `&[*const c_char]` on ARM.
+        // `c_char`, not `i8`: `char` is signed on x86_64 and unsigned on aarch64, so
+        // `*const i8` compiles on the desktop and fails to match ash on ARM.
         let ext_ptrs: Vec<*const c_char> = ext_cstrings.iter().map(|e| e.as_ptr()).collect();
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: CREATE — `app_info` and `ext_ptrs` outlive the call; we own the instance.
         let instance = unsafe {
             entry.create_instance(
                 &vk::InstanceCreateInfo::default()
@@ -193,19 +160,15 @@ impl Presenter {
         .context("vkCreateInstance")?;
         let surface_i = ash::khr::surface::Instance::new(&entry, &instance);
 
-        // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
-        // builder structs that are locals outliving the call; the handle it returns is owned by
-        // the value being built here.
+        // SAFETY: CREATE — `instance` is live; SDL returns a surface we own and later destroy.
         let surface = unsafe { window.vulkan_create_surface(instance.handle()) }
             .map_err(|e| anyhow!("SDL_Vulkan_CreateSurface: {e}"))?;
 
         let (pdev, qfi) = pick_device(&instance, &surface_i, surface)?;
-        // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
-        // filling locals returned by value.
+        // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
         let mem_props = unsafe { instance.get_physical_device_memory_properties(pdev) };
         {
-            // SAFETY: per the Vulkan contract above - a read-only query on the live
-            // instance/device, filling locals returned by value.
+            // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
             let props = unsafe { instance.get_physical_device_properties(pdev) };
             let name = props
                 .device_name_as_c_str()
@@ -214,11 +177,8 @@ impl Presenter {
             tracing::info!(device = %name, queue_family = qfi, "vulkan device");
         }
 
-        // The dmabuf import set is optional: enabled when the device offers all four,
-        // else that path is off (`supports_dmabuf() == false`). Windows has no
-        // dmabuf/DRM-PRIME — the whole import path is compiled out there.
-        // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
-        // filling locals returned by value.
+        // Optional: all four import extensions, else `supports_dmabuf()` is false.
+        // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
         let available = unsafe { instance.enumerate_device_extension_properties(pdev) }?;
         let has = |name: &std::ffi::CStr| {
             available
@@ -237,12 +197,9 @@ impl Presenter {
                  unavailable"
             );
         }
-        // D3D11 shared-texture import (the D3D11VA decode hand-off) — optional exactly
-        // like the dmabuf set; a device without it keeps Vulkan-Video/software decode.
-        // Extensions alone aren't the whole gate: the driver must also report the
-        // multiplanar NV12 image as IMPORTABLE from a D3D11 texture handle
-        // (vkGetPhysicalDeviceImageFormatProperties2 — creating an unsupported external
-        // image is UB, observed as VK_ERROR_DEVICE_LOST at the first submits on NVIDIA).
+        // D3D11 shared-texture import, optional like dmabuf. Extensions are not
+        // enough: the driver must report multiplanar NV12 as IMPORTABLE. Creating
+        // an unsupported external image is UB (`VK_ERROR_DEVICE_LOST` on first submit).
         #[cfg(windows)]
         let (import_bgra8, import_rgb10) = crate::d3d11::import_supported(&instance, pdev);
         #[cfg(windows)]
@@ -256,31 +213,23 @@ impl Presenter {
                  hardware frames unavailable"
             );
         }
-        // The adapter LUID (for the D3D11VA backend to create its decode device on the
-        // SAME adapter). Core 1.1 query; valid on effectively every Windows driver.
+        // Adapter LUID so D3D11VA creates its decode device on the same GPU. Core 1.1.
         let mut id_props = vk::PhysicalDeviceIDProperties::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut id_props);
-        // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
-        // filling locals returned by value.
+        // SAFETY: read-only query; `id_props` / `props2` outlive the call.
         unsafe { instance.get_physical_device_properties2(pdev, &mut props2) };
         let adapter_luid: Option<[u8; 8]> =
             (id_props.device_luid_valid == vk::TRUE).then_some(id_props.device_luid);
-        // Static HDR metadata (ST.2086 mastering + CLL) to the presentation engine.
-        // Compositors key their "this app is HDR" signaling on the client pushing
-        // metadata via vkSetHdrMetadataEXT in addition to picking the HDR10 colorspace
-        // (gamescope's SteamOS HDR badge and per-app tone-map targets among them) —
-        // the colorspace alone leaves the app looking SDR to the shell.
+        // `vkSetHdrMetadataEXT` is what compositors key "this app is HDR" on.
+        // The HDR10 colorspace alone still looks SDR to the shell.
         let has_hdr_metadata = has(ash::ext::hdr_metadata::NAME);
         if has_hdr_metadata {
             dev_exts.push(ash::ext::hdr_metadata::NAME.as_ptr());
         }
 
-        // --- Vulkan Video decode (pf-vkdecode, on THIS device) -----------------------
-        // Probed, never required: a capable stack gets the video extensions, a second
-        // (decode) queue, and the features the decoder needs; anything less means
-        // `vulkan_decode() == None` and the ladder falls through (VAAPI/D3D11VA/software).
-        // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
-        // filling locals returned by value.
+        // Optional: video extensions, decode queue, and decoder features, or
+        // `vulkan_decode()` stays `None`.
+        // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
         let dev_props = unsafe { instance.get_physical_device_properties(pdev) };
         let dev_is_13 = vk::api_version_major(dev_props.api_version) > 1
             || vk::api_version_minor(dev_props.api_version) >= 3;
@@ -289,8 +238,6 @@ impl Presenter {
         let mut have_f11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut have_f12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut have_f13 = vk::PhysicalDeviceVulkan13Features::default();
-        // Present-id/present-wait (on-glass timing, latency plan T0.2): query the feature
-        // structs only when the device lists both extensions.
         let present_wait_exts =
             has(ash::khr::present_id::NAME) && has(ash::khr::present_wait::NAME);
         let mut have_f2 = vk::PhysicalDeviceFeatures2::default()
@@ -300,23 +247,20 @@ impl Presenter {
         if present_wait_exts {
             have_f2 = have_f2.push_next(&mut have_pid).push_next(&mut have_pwait);
         }
-        // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
-        // filling locals returned by value.
+        // SAFETY: read-only query; the pNext chain locals outlive the call.
         unsafe { instance.get_physical_device_features2(pdev, &mut have_f2) };
-        // Copy the one base-features fact out NOW: `have_f2` mutably borrows the chained
-        // structs through its pNext chain, so any later use of it would pin those borrows —
-        // every read of a chained struct below must come after this, have_f2's last use.
+        // Copy shader_int16 out now: `have_f2` mutably borrows the pNext chain, so
+        // later reads of chained structs must come after this last use of `have_f2`.
         let have_shader_int16 = have_f2.features.shader_int16;
-        // FIFO_LATEST_READY: the surface may list the mode even with the extension
-        // disabled, so the device feature is the real gate on using it.
+        // The surface may list FIFO_LATEST_READY with the extension disabled; the
+        // device feature is the gate on requesting it.
         let flr_ok = if has(fifo_latest_ready::NAME) {
             let mut feat = fifo_latest_ready::Features::default();
             let mut probe = vk::PhysicalDeviceFeatures2 {
                 p_next: (&mut feat) as *mut _ as *mut std::ffi::c_void,
                 ..Default::default()
             };
-            // SAFETY: per the Vulkan contract above - a read-only query on the live
-            // instance/device, filling locals returned by value; `feat` outlives the call.
+            // SAFETY: read-only query; `feat` is the pNext target and outlives the call.
             unsafe { instance.get_physical_device_features2(pdev, &mut probe) };
             feat.present_mode_fifo_latest_ready == vk::TRUE
         } else {
@@ -328,10 +272,8 @@ impl Presenter {
         let features_ok = have_f11.sampler_ycbcr_conversion == vk::TRUE
             && have_f12.timeline_semaphore == vk::TRUE
             && have_f13.synchronization2 == vk::TRUE;
-        // PyroWave decode (the wired-LAN wavelet codec, design/pyrowave-codec-plan.md §4.5):
-        // plain Vulkan-1.3 compute on THIS device — no video extensions. Probed alongside so a
-        // capable device gets the features enabled below and advertises the codec; anything
-        // less simply never sets the CODEC_PYROWAVE bit.
+        // PyroWave is Vulkan 1.3 compute on this device — no video extensions.
+        // Probe here so a capable device enables the features and advertises the codec.
         let pyrowave_ok = dev_is_13
             && have_shader_int16 == vk::TRUE
             && have_f12.storage_buffer8_bit_access == vk::TRUE
@@ -340,10 +282,8 @@ impl Presenter {
             && have_f13.compute_full_subgroups == vk::TRUE
             && have_f13.synchronization2 == vk::TRUE;
 
-        // The decode queue family + which codec operations it can run.
         let decode_family: Option<(u32, vk::VideoCodecOperationFlagsKHR)> = {
-            // SAFETY: per the Vulkan contract above - a read-only query on the live
-            // instance/device, filling locals returned by value.
+            // SAFETY: read-only query; length only.
             let n = unsafe { instance.get_physical_device_queue_family_properties2_len(pdev) };
             let mut video: Vec<vk::QueueFamilyVideoPropertiesKHR> =
                 vec![vk::QueueFamilyVideoPropertiesKHR::default(); n];
@@ -351,11 +291,10 @@ impl Presenter {
                 .iter_mut()
                 .map(|v| vk::QueueFamilyProperties2::default().push_next(v))
                 .collect();
-            // SAFETY: per the Vulkan contract above - a read-only query on the live
-            // instance/device, filling locals returned by value.
+            // SAFETY: read-only query; `props` / `video` outlive the call and receive the fill.
             unsafe { instance.get_physical_device_queue_family_properties2(pdev, &mut props) };
-            // `props` mutably borrows `video` (push_next); copy the flags out, then
-            // read the driver-filled video properties directly.
+            // `props` mutably borrows `video` via push_next; copy the flags, drop `props`,
+            // then read the driver-filled video properties.
             let flags: Vec<vk::QueueFlags> = props
                 .iter()
                 .map(|p| p.queue_family_properties.queue_flags)
@@ -384,8 +323,7 @@ impl Presenter {
         if video_ok {
             video_ext_names.extend(VIDEO_BASE);
             video_ext_names.extend(&codec_exts);
-            // Optional decoder niceties, enabled when present (pf-vkdecode probes for
-            // them rather than requiring them).
+            // Optional; pf-vkdecode probes these rather than requiring them.
             for opt in [c"VK_KHR_video_maintenance1", c"VK_KHR_video_maintenance2"] {
                 if has(opt) {
                     video_ext_names.push(opt);
@@ -399,19 +337,8 @@ impl Presenter {
                 "Vulkan Video decode available on this device"
             );
         } else {
-            // ALL FIVE conjuncts, and the evidence behind each. The three this used to
-            // print could every one be true while the answer was still no — a device with
-            // Vulkan 1.3, the features and a decode queue family, but missing a codec
-            // extension, logged `dev_is_13=true features_ok=true decode_family=true` next
-            // to the word "unavailable" and named nothing that could be acted on. A field
-            // reporter cannot then tell "this build never tried" from "the driver said
-            // no", which is the single most expensive ambiguity a fallback can have: it
-            // makes a missing capability and a bug in our gate look identical.
-            //
-            // `queue_codec_ops` matters most on a device that HAS a decode queue: the
-            // driver names the codecs it can decode there, so an empty `codec_exts`
-            // beside a non-empty ops mask means the extensions are what is missing, not
-            // the hardware.
+            // Log every conjunct. Empty `codec_exts` next to non-empty `queue_codec_ops`
+            // means the extensions are missing, not the hardware.
             let base_missing: Vec<&str> = VIDEO_BASE
                 .iter()
                 .filter(|n| !has(n))
@@ -438,8 +365,7 @@ impl Presenter {
             );
         }
 
-        // Present-id/present-wait: enable when fully supported — the presenter then runs
-        // the on-glass PresentTimer; otherwise the display stamp stays submit-time.
+        // Present-wait on: PresentTimer stamps on-glass; otherwise the stamp is submit-time.
         if present_wait_ok {
             dev_exts.push(ash::khr::present_id::NAME.as_ptr());
             dev_exts.push(ash::khr::present_wait::NAME.as_ptr());
@@ -454,8 +380,6 @@ impl Presenter {
         let mut en_pid = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
         let mut en_pwait = vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
 
-        // Enable only the features the video path needs, and only where supported
-        // (harmless when the path is off; reported to the decode lane via device_features).
         let mut en_f11 = vk::PhysicalDeviceVulkan11Features::default()
             .sampler_ycbcr_conversion(have_f11.sampler_ycbcr_conversion == vk::TRUE);
         let mut en_f12 = vk::PhysicalDeviceVulkan12Features::default()
@@ -474,7 +398,7 @@ impl Presenter {
             en_f2 = en_f2.push_next(&mut en_pid).push_next(&mut en_pwait);
         }
         if flr_ok {
-            // Hand-rolled struct, so chain it by hand: splice into the pNext list head.
+            // Hand-rolled struct: splice onto the pNext list head by hand.
             en_flr.p_next = en_f2.p_next;
             en_f2.p_next = (&mut en_flr) as *mut _ as *mut std::ffi::c_void;
         }
@@ -491,8 +415,7 @@ impl Presenter {
                     .queue_priorities(&priorities),
             );
         }
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: CREATE — `queue_info`, `dev_exts`, and `en_f2` outlive the call; we own the device.
         let device = unsafe {
             instance.create_device(
                 pdev,
@@ -516,8 +439,7 @@ impl Presenter {
         );
         let hdr_metadata_d =
             has_hdr_metadata.then(|| ash::ext::hdr_metadata::Device::new(&instance, &device));
-        // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
-        // filling locals returned by value.
+        // SAFETY: `device` is live; queue 0 of `qfi` was requested at create.
         let queue = unsafe { device.get_device_queue(qfi, 0) };
         #[cfg(target_os = "linux")]
         let hw = if hw_capable {
@@ -532,22 +454,14 @@ impl Presenter {
             ext_mem_win32: ash::khr::external_memory_win32::Device::new(&instance, &device),
         });
         let csc = CscPass::new(&device, vk::Format::R8G8B8A8_UNORM)?;
-        // Starts SDR like `csc`; an HDR (PQ) session rebuilds it at the 10-bit
-        // intermediate via `set_hdr_mode`, exactly like the H.26x pass.
-        //
-        // Unconditional since M8. It used to be built only for a device that passed the
-        // pyrowave probe; the SOFTWARE rung now renders through it too, and that rung is
-        // the ladder's last one — gating it on a probe would leave the boxes that failed
-        // the probe with no way to show a software-decoded frame at all.
+        // Starts SDR like `csc`; an HDR session rebuilds it at 10-bit via `set_hdr_mode`.
+        // Always built: the software decode rung renders through it. Gating on the
+        // pyrowave probe would hide software frames.
         let csc_planar = CscPass::new_planar(&device, vk::Format::R8G8B8A8_UNORM)?;
 
-        // The exported handle bundle: this device's Vulkan handles when it can decode,
-        // AND (Windows) the D3D11-interop facts — so it's built whenever EITHER
-        // consumer needs it; `video_decode`/`d3d11_import` tell the decode ladder which
-        // paths are real. The extension LISTS must mirror creation exactly: the pyrowave
-        // decoder replays them verbatim into its pinned create-info reconstruction.
-        // One lock per device for queue external sync (the decode lane + Skia + this
-        // presenter all funnel their queue calls through it — see the `queue_lock` docs).
+        // Export when any consumer needs the handles. Extension lists must match
+        // creation: the pyrowave decoder replays them into its pinned create-info.
+        // One `queue_lock` per device (decode + Skia + presenter; see its docs).
         let queue_lock = std::sync::Arc::new(pf_client_core::video::QueueLock::new());
         #[cfg(windows)]
         let export_worthy = video_ok || win_capable || pyrowave_ok;
@@ -603,14 +517,13 @@ impl Presenter {
                 queue_families: queue_info.iter().map(|q| q.queue_family_index).collect(),
                 pyrowave_decode: pyrowave_ok,
                 video_decode: video_ok,
-                // The phase-lock gate: real on-glass latch stamps exist only when the
-                // present-wait timer runs (see `PresentTimer`).
+                // On-glass latch stamps exist only while PresentTimer (present-wait) runs.
                 present_timing: present_timer.is_some(),
                 #[cfg(windows)]
                 d3d11_import: win_capable,
                 #[cfg(not(windows))]
                 d3d11_import: false,
-                // Filled in below — the HDR10 surface facts arrive with pick_formats.
+                // HDR10 surface facts arrive with `pick_formats` below.
                 d3d11_hdr10: false,
                 adapter_luid,
                 queue_lock: queue_lock.clone(),
@@ -622,9 +535,8 @@ impl Presenter {
         let mut video_export = video_export;
 
         let (format, hdr10_format) = pick_formats(&surface_i, pdev, surface, has_colorspace_ext)?;
-        // The D3D11VA backend may emit its HDR (RGB10 PQ) ring only when this device can
-        // import the 10-bit texture AND the surface offers an HDR10 swapchain to pass it
-        // through to; otherwise a PQ stream keeps the decoder-side tonemap to sRGB.
+        // D3D11VA may emit its RGB10 PQ ring only when this device imports 10-bit and
+        // the surface offers an HDR10 swapchain; otherwise PQ stays decoder-tonemapped.
         #[cfg(windows)]
         if let Some(v) = video_export.as_mut() {
             v.d3d11_hdr10 = win_capable && import_rgb10 && hdr10_format.is_some();
@@ -645,9 +557,7 @@ impl Presenter {
         );
         let overlay_pipe = OverlayPipe::new(&device, format.format)?;
 
-        // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns
-        // and has begun, referencing handles it also owns; nothing is submitted until the
-        // recording is ended.
+        // SAFETY: CREATE — CreateInfo is a local; the pool is owned by the Presenter being built.
         let cmd_pool = unsafe {
             device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
@@ -656,9 +566,7 @@ impl Presenter {
                 None,
             )
         }?;
-        // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns
-        // and has begun, referencing handles it also owns; nothing is submitted until the
-        // recording is ended.
+        // SAFETY: ALLOCATE — the pool is ours and empty; we take the single primary buffer.
         let cmd_buf = unsafe {
             device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -668,12 +576,9 @@ impl Presenter {
             )
         }?[0];
         let acquire_sem =
-            // SAFETY: per the Vulkan contract above - a create/allocate call on the live device,
-            // over builder structs that are locals outliving the call; the handle it returns is
-            // owned by the value being built here.
+            // SAFETY: CREATE — CreateInfo is a local; the handle is stored on the Presenter.
             unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: CREATE — CreateInfo is a local; SIGNALED so the first wait is a no-op.
         let fence = unsafe {
             device.create_fence(
                 &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
@@ -734,27 +639,17 @@ impl Presenter {
 /// Every physical device's Vulkan Video decode capability
 /// (`punktfunk-session --probe-decode`). No surface, no logical device, no session.
 ///
-/// The question this answers is the one every hardware-decode field report starts with:
-/// the rung was pinned and something else ran — did this build never try, or did the
-/// driver refuse? Ordered like [`list_adapters`] (discrete first, `pick_device`'s
-/// tie-break), so the FIRST entry is the device a default run presents on — which is also
-/// the device Vulkan Video decodes on, because the decoder shares the presenter's device
-/// by design. On a hybrid laptop those two facts together are usually the whole answer:
-/// pinning the decoder does not move the presenter, so probing the iGPU's capability
-/// while the dGPU is presenting reports on the wrong GPU. `PUNKTFUNK_VK_DEVICE=<index>`
-/// is the knob that moves it.
+/// Ordered like [`list_adapters`] (discrete first). Row 0 is the default present
+/// (and decode) device. `PUNKTFUNK_VK_DEVICE=<index>` moves both; probing the
+/// iGPU while the dGPU presents reports the wrong GPU.
 pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
-    // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
-    // builder structs that are locals outliving the call; the handle it returns is owned by the
-    // value being built here.
+    // SAFETY: dlopens libvulkan; no instance exists yet.
     let entry = unsafe { ash::Entry::load() }.context("libvulkan not loadable")?;
     let app_name = CString::new("punktfunk-session").unwrap();
     let app_info = vk::ApplicationInfo::default()
         .application_name(&app_name)
         .api_version(super::INSTANCE_API_VERSION);
-    // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
-    // builder structs that are locals outliving the call; the handle it returns is owned by the
-    // value being built here.
+    // SAFETY: CREATE — `app_info` outlives the call; we own the instance.
     let instance = unsafe {
         entry.create_instance(
             &vk::InstanceCreateInfo::default().application_info(&app_info),
@@ -763,15 +658,12 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
     }
     .context("vkCreateInstance")?;
 
-    // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
-    // filling locals returned by value.
+    // SAFETY: read-only query on the live instance; result by value.
     let devices = unsafe { instance.enumerate_physical_devices() }?;
     let mut out: Vec<(u8, AdapterDecode)> = Vec::with_capacity(devices.len());
-    // `enumerate()` BEFORE any filtering or sorting: this index is what
-    // `PUNKTFUNK_VK_DEVICE` selects, so it has to survive both.
+    // `enumerate()` before filtering or sorting: this index is `PUNKTFUNK_VK_DEVICE`.
     for (raw_index, pdev) in devices.into_iter().enumerate() {
-        // SAFETY: per the Vulkan contract above - a read-only query on the live
-        // instance/device, filling locals returned by value.
+        // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
         let props = unsafe { instance.get_physical_device_properties(pdev) };
         let name = props
             .device_name_as_c_str()
@@ -788,7 +680,7 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
         let api_1_3 = vk::api_version_major(props.api_version) > 1
             || vk::api_version_minor(props.api_version) >= 3;
 
-        // The same three features the creation path demands (`features_ok` there).
+        // Same three features the creation path demands (`features_ok` there).
         let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
@@ -796,15 +688,13 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
             .push_next(&mut f11)
             .push_next(&mut f12)
             .push_next(&mut f13);
-        // SAFETY: per the Vulkan contract above - a read-only query on the live
-        // instance/device, filling locals returned by value.
+        // SAFETY: read-only query; the pNext chain locals outlive the call.
         unsafe { instance.get_physical_device_features2(pdev, &mut feats) };
         let features_ok = f11.sampler_ycbcr_conversion == vk::TRUE
             && f12.timeline_semaphore == vk::TRUE
             && f13.synchronization2 == vk::TRUE;
 
-        // SAFETY: per the Vulkan contract above - a read-only query on the live
-        // instance/device, filling locals returned by value.
+        // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
         let ext_props =
             unsafe { instance.enumerate_device_extension_properties(pdev) }.unwrap_or_default();
         let has = |n: &std::ffi::CStr| {
@@ -823,11 +713,9 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
             .map(|n| n.to_string_lossy().into_owned())
             .collect();
 
-        // The decode queue family and the codec operations the DRIVER claims for it —
-        // reported even when the extensions are absent, because "the hardware can, the
-        // driver does not expose it" is a different conversation from "this GPU cannot".
-        // SAFETY: per the Vulkan contract above - a read-only query on the live
-        // instance/device, filling locals returned by value.
+        // Report the family's codec ops even without the extensions: hardware-can vs
+        // driver-does-not-expose is a different answer from "this GPU cannot".
+        // SAFETY: read-only query; length only.
         let n = unsafe { instance.get_physical_device_queue_family_properties2_len(pdev) };
         let mut video: Vec<vk::QueueFamilyVideoPropertiesKHR> =
             vec![vk::QueueFamilyVideoPropertiesKHR::default(); n];
@@ -835,8 +723,7 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
             .iter_mut()
             .map(|v| vk::QueueFamilyProperties2::default().push_next(v))
             .collect();
-        // SAFETY: per the Vulkan contract above - a read-only query on the live
-        // instance/device, filling locals returned by value.
+        // SAFETY: read-only query; `qprops` / `video` outlive the call and receive the fill.
         unsafe { instance.get_physical_device_queue_family_properties2(pdev, &mut qprops) };
         let flags: Vec<vk::QueueFlags> = qprops
             .iter()
@@ -857,12 +744,10 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
             base_missing.is_empty(),
             !codec_exts.is_empty(),
         );
-        // Only where the gate passed: the format queries need `VK_KHR_video_queue`'s
-        // entry points, and asking a device that does not expose them produces a null
-        // dispatch, not an answer.
+        // Format queries need `VK_KHR_video_queue` entry points; asking without them
+        // is a null dispatch, not an answer.
         let formats = if usable {
-            // SAFETY: `instance` is the live instance created above and `pdev` one of
-            // the physical devices it enumerated; the probe only reads.
+            // SAFETY: `instance` is live and `pdev` was enumerated from it; the probe only reads.
             unsafe { pf_vkdecode::probe::probe_video_formats(&entry, &instance, pdev) }
         } else {
             Vec::new()
@@ -885,28 +770,23 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
         ));
     }
     out.sort_by_key(|(rank, _)| *rank);
-    // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and no
-    // logical device was created against this instance, so nothing is in flight on it.
+    // SAFETY: DESTROY — no logical device was created against this instance.
     unsafe { instance.destroy_instance(None) };
     Ok(out.into_iter().map(|(_, a)| a).collect())
 }
 
-/// The physical devices' marketing names — the shells' GPU-picker source
-/// (`punktfunk-session --list-adapters`). No surface and no logical device; discrete
-/// GPUs first (mirroring `pick_device`'s tie-break), duplicates collapsed (the name is
-/// the whole `PUNKTFUNK_VK_ADAPTER` match key, so a second identical card adds nothing).
-/// Same 1.3 instance the presenter creates, so the list matches what streaming sees.
+/// Physical-device marketing names for the shells' GPU picker
+/// (`punktfunk-session --list-adapters`). No surface, no logical device. Discrete
+/// first (same tie-break as `pick_device`); duplicate names collapsed because the
+/// name is the whole `PUNKTFUNK_VK_ADAPTER` key. Same 1.3 instance the presenter creates.
 pub fn list_adapters() -> Result<Vec<String>> {
-    // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
-    // builder structs that are locals outliving the call; the handle it returns is owned by the
-    // value being built here.
+    // SAFETY: dlopens libvulkan; no instance exists yet.
     let entry = unsafe { ash::Entry::load() }.context("libvulkan not loadable")?;
     let app_name = CString::new("punktfunk-session").unwrap();
     let app_info = vk::ApplicationInfo::default()
         .application_name(&app_name)
         .api_version(super::INSTANCE_API_VERSION);
-    // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this type
-    // and live for the call, and every builder struct is a local that outlives it.
+    // SAFETY: CREATE — `app_info` outlives the call; we own the instance.
     let instance = unsafe {
         entry.create_instance(
             &vk::InstanceCreateInfo::default().application_info(&app_info),
@@ -914,13 +794,11 @@ pub fn list_adapters() -> Result<Vec<String>> {
         )
     }
     .context("vkCreateInstance")?;
-    // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
-    // filling locals returned by value.
+    // SAFETY: read-only query on the live instance; result by value.
     let mut ranked: Vec<(u8, String)> = unsafe { instance.enumerate_physical_devices() }?
         .into_iter()
         .map(|d| {
-            // SAFETY: per the Vulkan contract above - a read-only query on the live
-            // instance/device, filling locals returned by value.
+            // SAFETY: read-only query on the live instance; `d` was enumerated from it.
             let props = unsafe { instance.get_physical_device_properties(d) };
             let rank = match props.device_type {
                 vk::PhysicalDeviceType::DISCRETE_GPU => 0u8,
@@ -935,10 +813,7 @@ pub fn list_adapters() -> Result<Vec<String>> {
         })
         .filter(|(_, n)| !n.is_empty())
         .collect();
-    // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and the GPU is
-    // known idle for them (the fence/queue-wait on the path here, or the swapchain being retired),
-    // which is the obligation that makes a destroy sound rather than the handle merely being non-
-    // null.
+    // SAFETY: DESTROY — no logical device was created against this instance.
     unsafe { instance.destroy_instance(None) };
     ranked.sort_by_key(|(r, _)| *r); // stable: enumeration order within each tier
     let mut names: Vec<String> = Vec::new();
@@ -950,15 +825,14 @@ pub fn list_adapters() -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// First physical device with a queue family that does graphics + present here;
-/// `PUNKTFUNK_VK_DEVICE=<index>` overrides on multi-GPU boxes.
+/// First physical device with a graphics+present queue family here.
+/// `PUNKTFUNK_VK_DEVICE=<index>` overrides (raw enumeration order).
 fn pick_device(
     instance: &ash::Instance,
     surface_i: &ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
 ) -> Result<(vk::PhysicalDevice, u32)> {
-    // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
-    // filling locals returned by value.
+    // SAFETY: read-only query on the live instance; result by value.
     let devices = unsafe { instance.enumerate_physical_devices() }?;
     let forced: Option<usize> = std::env::var("PUNKTFUNK_VK_DEVICE")
         .ok()
@@ -967,22 +841,16 @@ fn pick_device(
         Some(i) => devices.get(i).copied().into_iter().collect(),
         None => devices,
     };
-    // Rank the candidates (stable sort; the index override wins outright):
-    // 1. The Settings GPU pick — `PUNKTFUNK_VK_ADAPTER` carries the adapter's marketing
-    //    name (the WinUI shell's picker stores DXGI's, which matches Vulkan's for the
-    //    same GPU): exact match, then substring, plain order when nothing matches
-    //    (eGPU unplugged, stale setting).
-    // 2. Discrete over integrated: enumeration order puts the iGPU FIRST on some
-    //    hybrids (observed: Ryzen iGPU ahead of an RTX dGPU), and the iGPU's video
-    //    engine is the far weaker decoder — first-enumerated was a silent footgun.
+    // Rank when the index override is absent (stable sort):
+    // 1. `PUNKTFUNK_VK_ADAPTER` marketing name: exact, then substring; unmatched keeps order.
+    // 2. Discrete over integrated — enumeration puts the iGPU first on some hybrids.
     if forced.is_none() {
         let want = std::env::var("PUNKTFUNK_VK_ADAPTER")
             .ok()
             .map(|w| w.trim().to_lowercase())
             .filter(|w| !w.is_empty());
         candidates.sort_by_key(|d| {
-            // SAFETY: per the Vulkan contract above - a read-only query on the live
-            // instance/device, filling locals returned by value.
+            // SAFETY: read-only query on the live instance; `d` was enumerated from it.
             let props = unsafe { instance.get_physical_device_properties(*d) };
             let name = props
                 .device_name_as_c_str()
@@ -1003,14 +871,12 @@ fn pick_device(
         });
     }
     for pdev in candidates {
-        // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
-        // filling locals returned by value.
+        // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
         let families = unsafe { instance.get_physical_device_queue_family_properties(pdev) };
         for (i, f) in families.iter().enumerate() {
             let graphics = f.queue_flags.contains(vk::QueueFlags::GRAPHICS);
             let present =
-                // SAFETY: per the Vulkan contract above - a read-only query on the live
-                // instance/device, filling locals returned by value.
+                // SAFETY: read-only query; `pdev` and `surface` are live on this instance.
                 unsafe { surface_i.get_physical_device_surface_support(pdev, i as u32, surface) }
                     .unwrap_or(false);
             if graphics && present {
@@ -1021,28 +887,22 @@ fn pick_device(
     bail!("no Vulkan device with a graphics+present queue family")
 }
 
-/// SDR: prefer BGRA8 UNORM (the near-universal presentable format); RGBA8 second; else
-/// whatever the surface offers first. UNORM (not SRGB) — the decoded RGBA is already
-/// display-referred, the blit must not re-encode it. HDR: a 10-bit UNORM format paired
-/// with the HDR10/ST.2084 colorspace, when the instance ext + surface offer one (KDE/
-/// gamescope with HDR enabled; absent elsewhere → the shader tonemaps instead).
+/// SDR: BGRA8 UNORM, then RGBA8, else the surface's first format. UNORM not SRGB —
+/// decoded RGBA is already display-referred; an SRGB blit would re-encode it.
+/// HDR: a 10-bit UNORM + HDR10/ST.2084 colorspace when the instance ext and surface
+/// offer one; otherwise the shader tonemaps.
 pub(super) fn pick_formats(
     surface_i: &ash::khr::surface::Instance,
     pdev: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
     colorspace_ext: bool,
 ) -> Result<(vk::SurfaceFormatKHR, Option<vk::SurfaceFormatKHR>)> {
-    // `PUNKTFUNK_HDR10=0` (explicit-off grammar) refuses the HDR10/ST.2084 swapchain outright,
-    // pinning PQ streams to the shader tonemap on an SDR surface. Two reasons this exists:
-    // desktop compositors newly offer HDR10 even on SDR desktops (GNOME 48 / Plasma 6 with
-    // Mesa ≥ 25.1 — a lane that otherwise engages silently), and it is the A/B lever that
-    // splits "HDR10 passthrough composes wrong" from "the decoded planes are wrong" in the
-    // field without rebuilding anything.
+    // `PUNKTFUNK_HDR10=0` refuses the HDR10 swapchain; PQ stays shader-tonemapped.
+    // Compositors advertise HDR10 on SDR desktops.
     let colorspace_ext = colorspace_ext
         && !std::env::var("PUNKTFUNK_HDR10")
             .is_ok_and(|v| matches!(v.as_str(), "0" | "false" | "off" | "no"));
-    // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
-    // filling locals returned by value.
+    // SAFETY: read-only query; `pdev` and `surface` are live on this instance.
     let formats = unsafe { surface_i.get_physical_device_surface_formats(pdev, surface) }?;
     let mut sdr = None;
     for want in [vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8A8_UNORM] {
@@ -1075,59 +935,31 @@ pub(super) fn pick_formats(
     Ok((sdr, hdr10))
 }
 
-/// What the user asked the presentation to be, resolved into a swapchain present mode by
-/// [`present_mode_chain`] (design/desktop-presentation-rebuild.md WP3).
+/// User presentation intent, resolved to a swapchain present mode by [`present_mode_chain`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PresentPref {
-    /// Tear-free presentation (the `vsync` setting, default on).
+    /// Tear-free (`vsync` setting, default on).
     pub vsync: bool,
-    /// Let a variable-refresh display follow the stream cadence (`allow_vrr`, default on).
+    /// Variable-refresh follows the stream cadence (`allow_vrr`, default on).
     pub allow_vrr: bool,
-    /// Opt-in for the VRR FIFO-first ladder (`PUNKTFUNK_VRR_FIFO=1`). Off by default on
-    /// measured evidence — see [`present_mode_chain`].
+    /// Opt-in for the VRR FIFO-first ladder (`PUNKTFUNK_VRR_FIFO=1`). Default off.
     pub vrr_fifo_opt_in: bool,
-    /// `VK_EXT_present_mode_fifo_latest_ready` is enabled on the device, so the mode may
-    /// be requested. Resolved during device creation; never set by callers.
+    /// Device enabled `VK_EXT_present_mode_fifo_latest_ready`; the mode may be requested.
+    /// Set during device creation, never by callers.
     pub fifo_latest_ready: bool,
-    /// The session STARTED fullscreen. The mode is chosen once, at swapchain creation, so
-    /// this is the starting state and an F11 mid-session does not re-pick — consistent
-    /// with the shells' "Display changes apply from the next session" footer, and why
-    /// live present-mode switching is an explicit non-goal.
+    /// Session started fullscreen. Mode is chosen once at swapchain creation; F11
+    /// mid-session does not re-pick.
     pub fullscreen: bool,
 }
 
-/// The preference ladder, most to least wanted. The caller takes the first entry the
-/// surface actually offers; FIFO ends every chain because the spec guarantees it.
+/// First offered mode from this ladder; FIFO always last (spec-guaranteed).
 ///
-/// * **V-Sync off** — IMMEDIATE (tears, no wait at all), then FIFO_RELAXED (tears only on
-///   a late frame), then the tear-free modes. Asking for tearing and silently getting
-///   vsync is a lie the stats line now exposes, but the ladder still degrades safely.
-/// * **V-Sync on + VRR allowed + fullscreen + `PUNKTFUNK_VRR_FIFO=1`** — FIFO first. On a
-///   variable-refresh panel with direct scanout the FIFO present IS the flip, so the panel
-///   follows the stream's cadence; MAILBOX would decouple presents from scanout and
-///   re-quantize to the compositor's clock.
-///
-///   **Automatic where a queue-free vblank mode exists, opt-in otherwise.** The history is
-///   worth keeping: this was default-on, then measured on glass (.21, GNOME/Wayland,
-///   NVIDIA, *non*-VRR 60 Hz panel, 2026-08-02) to cost ~27 ms of display stage against
-///   MAILBOX — `28.4 ms (pace 11.8 + latch 16.6)` versus `1.4 ms (0.2 + 1.2)` — because a
-///   plain-FIFO present's on-glass confirmation lands a whole refresh later and the
-///   presenter serialises behind it. It became opt-in on that evidence.
-///
-///   `FIFO_LATEST_READY` removes the cause rather than working around it: the driver
-///   retires stale images, so the vblank-locked path measured **2.6 ms** on the same box —
-///   0.6 ms over MAILBOX instead of 27. So where the device offers it, following the panel
-///   is cheap enough to be the default again; where it does not, the ladder would fall
-///   back to plain FIFO and the regression returns, so it stays behind
-///   `PUNKTFUNK_VRR_FIFO=1` there. The win on a genuine VRR panel is still UNMEASURED —
-///   no VRR display was available — but the cost of trying is now small and bounded.
-/// * **Otherwise** — MAILBOX, then FIFO: the shipped default. MAILBOX never queues more
-///   than the newest frame, so an arrival-paced presenter doesn't block in the present
-///   queue (a measured 11-13 ms standing wait at 60 Hz when the compositor holds images
-///   for a vblank pass, or when arrival cadence drifts against refresh).
-///
-/// AMD's Windows driver offers no MAILBOX (NVIDIA does), so those clients land on FIFO —
-/// expected, not a misconfiguration, and now visible in the `present:` stats line.
+/// V-sync off: IMMEDIATE, FIFO_RELAXED, MAILBOX.
+/// V-sync + VRR + fullscreen with LATEST_READY or `PUNKTFUNK_VRR_FIFO=1`:
+/// vblank-locked family first — MAILBOX would re-quantize to the compositor.
+/// LATEST_READY is newest-wins in the driver; plain FIFO waits a full refresh,
+/// so without LATEST_READY that rung is opt-in.
+/// Otherwise MAILBOX first so an arrival-paced presenter does not block.
 fn present_mode_chain(pref: PresentPref) -> Vec<vk::PresentModeKHR> {
     use vk::PresentModeKHR as M;
     let flr = pref.fifo_latest_ready.then_some(fifo_latest_ready::MODE);
@@ -1135,17 +967,12 @@ fn present_mode_chain(pref: PresentPref) -> Vec<vk::PresentModeKHR> {
         vec![M::IMMEDIATE, M::FIFO_RELAXED, M::MAILBOX]
     } else if pref.allow_vrr && pref.fullscreen && (pref.fifo_latest_ready || pref.vrr_fifo_opt_in)
     {
-        // The VRR ladder wants the vblank-locked family; LATEST_READY is that with the
-        // queue removed, so it outranks plain FIFO here too.
         vec![]
             .into_iter()
             .chain(flr)
             .chain([M::FIFO, M::MAILBOX, M::FIFO_RELAXED, M::IMMEDIATE])
             .collect()
     } else {
-        // MAILBOX first (measured good), then LATEST_READY — which is what gives a
-        // MAILBOX-less surface the same newest-wins behaviour, in the driver instead of
-        // in our glass gate.
         vec![M::MAILBOX]
             .into_iter()
             .chain(flr)
@@ -1155,28 +982,25 @@ fn present_mode_chain(pref: PresentPref) -> Vec<vk::PresentModeKHR> {
     if !pref.vsync {
         chain.extend(flr);
     }
-    // FIFO ends every chain: the spec guarantees it exists, so there is always a landing.
+    // FIFO last: the spec guarantees it, so the chain always lands.
     chain.push(M::FIFO);
     chain
 }
 
-/// `PUNKTFUNK_VRR_FIFO=1` — opt into the FIFO-first ladder for variable-refresh panels.
-/// See [`present_mode_chain`] for the measurement that made this opt-in rather than
-/// default.
+/// `PUNKTFUNK_VRR_FIFO=1` opts into the FIFO-first ladder for variable-refresh panels.
 fn vrr_fifo_opt_in() -> bool {
     std::env::var("PUNKTFUNK_VRR_FIFO").is_ok_and(|v| v != "0")
 }
 
-/// Resolve the present mode: `PUNKTFUNK_PRESENT_MODE` pins one outright (the debug lever,
-/// unchanged), otherwise the first entry of [`present_mode_chain`] the surface offers.
+/// Resolve the present mode. `PUNKTFUNK_PRESENT_MODE` pins one; otherwise the first
+/// entry of [`present_mode_chain`] the surface offers.
 fn pick_present_mode(
     surface_i: &ash::khr::surface::Instance,
     pdev: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
     pref: PresentPref,
 ) -> Result<vk::PresentModeKHR> {
-    // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
-    // filling locals returned by value.
+    // SAFETY: read-only query; `pdev` and `surface` are live on this instance.
     let modes = unsafe { surface_i.get_physical_device_surface_present_modes(pdev, surface) }?;
     let pinned = match std::env::var("PUNKTFUNK_PRESENT_MODE").ok().as_deref() {
         Some("fifo") => Some(vk::PresentModeKHR::FIFO),
@@ -1201,12 +1025,8 @@ fn pick_present_mode(
             "PUNKTFUNK_PRESENT_MODE not offered by this surface — falling back"
         );
     }
-    // What the surface ACTUALLY offers, logged unconditionally. "AMD's Windows driver
-    // has no MAILBOX" is the premise the FIFO glass gate is built on, and it has been
-    // carried in comments rather than measured — present modes are a property of the
-    // (surface, device) pair, so they vary by platform surface, driver version and
-    // fullscreen state, and the only way to settle it is to read it back from real
-    // machines. One line here makes every field log answer the question.
+    // Present modes are a (surface, device, fullscreen) property; log the set so a
+    // fallback is visible as the driver's list, not our choice.
     tracing::info!(
         available = ?modes,
         "surface present modes"
@@ -1217,8 +1037,7 @@ fn pick_present_mode(
         .copied()
         .find(|m| modes.contains(m))
         .unwrap_or(vk::PresentModeKHR::FIFO); // always available per spec
-                                              // The one line that answers "did V-Sync off actually take?" — a request the surface
-                                              // can't serve is a fact about the driver, and it must not look like our choice.
+                                              // A request the surface cannot serve is a driver fact; do not present it as our choice.
     if chosen != chain[0] {
         tracing::info!(
             requested = ?chain[0],
@@ -1236,22 +1055,20 @@ mod tests {
     use super::*;
     use vk::PresentModeKHR as M;
 
-    /// The preference ladders (WP3). Every chain must end at FIFO, which the spec
-    /// guarantees exists — a chain whose entries a surface all refuses would otherwise
-    /// have no landing.
+    /// Preference ladders. Every chain ends at FIFO, which the spec guarantees —
+    /// otherwise a surface that refuses every earlier entry has no landing.
     #[test]
     fn present_mode_chains_rank_by_intent() {
         let pref = |vsync, allow_vrr, fullscreen| PresentPref {
             vsync,
             allow_vrr,
             fullscreen,
-            vrr_fifo_opt_in: true, // the ladder under test; the DEFAULT is off (see below)
+            vrr_fifo_opt_in: true, // the ladder under test; default is off (see below)
             fifo_latest_ready: false,
         };
         let flr = fifo_latest_ready::MODE;
 
-        // V-Sync off asks to tear, hardest first, and outranks the VRR rule (tearing
-        // already gives a VRR-like latch, so the two never fight).
+        // V-sync off: IMMEDIATE first, even when VRR+fullscreen.
         assert_eq!(present_mode_chain(pref(false, true, true))[0], M::IMMEDIATE);
         assert_eq!(
             present_mode_chain(pref(false, false, false))[0],
@@ -1263,11 +1080,9 @@ mod tests {
             "tears only on a late frame — the gentler tearing rung"
         );
 
-        // Tear-free + VRR allowed + fullscreen prefers the vblank-locked family — but
-        // ONLY when opted in.
+        // Tear-free + VRR + fullscreen prefers vblank-locked, but only when opted in.
         assert_eq!(present_mode_chain(pref(true, true, true))[0], M::FIFO);
-        // Without the opt-in the shipped MAILBOX-first default stands: measured on glass
-        // to be ~27 ms of display stage better on a non-VRR panel.
+        // Without the opt-in, MAILBOX-first stands: plain FIFO waits a full refresh.
         assert_eq!(
             present_mode_chain(PresentPref {
                 vsync: true,
@@ -1293,9 +1108,8 @@ mod tests {
              instead of 27 — cheap enough to be automatic"
         );
 
-        // FIFO_LATEST_READY only appears where the device enabled it, and it outranks
-        // plain FIFO everywhere: it is FIFO's vblank pacing WITHOUT the queue, which is
-        // what a MAILBOX-less surface otherwise needs the software glass gate for.
+        // LATEST_READY only where the device enabled it, and it outranks plain FIFO:
+        // FIFO's vblank pacing without the standing queue.
         let with_flr = |vsync, allow_vrr, fullscreen| PresentPref {
             vsync,
             allow_vrr,
@@ -1331,7 +1145,6 @@ mod tests {
             "the VRR ladder takes the queue-free vblank mode first"
         );
 
-        // Every ladder can land: FIFO appears in all of them.
         for p in [
             pref(true, true, true),
             pref(true, true, false),

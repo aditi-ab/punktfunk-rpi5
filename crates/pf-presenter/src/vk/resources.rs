@@ -1,4 +1,4 @@
-//! Video-image / staging-buffer (re)build + retired-frame destruction.
+//! Video-image / staging-buffer rebuild and retired-frame destruction.
 
 use super::gpu::subresource_range;
 use super::{CpuPlanes, Presenter, Retired, Staging, VideoImage};
@@ -13,19 +13,17 @@ impl Retired {
             Retired::Dmabuf(f) => f.destroy(device),
             #[cfg(windows)]
             Retired::D3d11(f) => f.destroy(device),
-            // The image and plane views belong to the DECODER's pools — nothing of ours
-            // to destroy. The drop sends the release token (the caller reaches here only
-            // after the sampling fence, so the token honestly means "GPU reads done").
+            // Image and plane views belong to the decoder's pools — nothing
+            // of ours to destroy. Drop sends the release token; the caller
+            // reaches here only after the sampling fence (GPU reads done).
             Retired::NativeVk(frame) => drop(frame),
         }
     }
 }
 
-/// Staging offset of plane `i` for a picture of this size, plus the total bytes needed.
-///
-/// Each plane starts on a 16-byte boundary so `bufferOffset` satisfies the copy's
-/// "multiple of 4" rule whatever the picture dimensions are — with a 1-byte-per-texel
-/// format an odd width would otherwise land a later plane on an odd offset.
+/// Each plane starts on a 16-byte boundary so `bufferOffset` is a multiple
+/// of 4 at any picture size — a 1-byte-per-texel odd width would otherwise
+/// land a later plane on an odd offset.
 fn plane_staging_offsets(f: &CpuPlanarFrame) -> ([usize; 3], usize) {
     let mut offsets = [0usize; 3];
     let mut at = 0usize;
@@ -38,14 +36,11 @@ fn plane_staging_offsets(f: &CpuPlanarFrame) -> ([usize; 3], usize) {
 }
 
 impl CpuPlanes {
-    /// Destroy every handle this value holds. Null handles are fine — Vulkan defines
-    /// destroy/free on `VK_NULL_HANDLE` as a no-op — which is what lets
-    /// [`Presenter::rebuild_cpu_planes`] unwind a build that failed part-way.
+    /// Null handles are a no-op, so [`Presenter::rebuild_cpu_planes`] can
+    /// unwind a build that failed part-way.
     pub(super) fn destroy(self, device: &ash::Device) {
-        // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and the
-        // GPU is known idle for them (the fence/queue-wait on the path here, or the swapchain
-        // being retired), which is the obligation that makes a destroy sound rather than the
-        // handle merely being non-null.
+        // SAFETY: handles owned by `self`. GPU idle: fence/queue-wait on this
+        // path, or the swapchain already retired.
         unsafe {
             for i in 0..3 {
                 device.destroy_image_view(self.views[i], None);
@@ -57,12 +52,8 @@ impl CpuPlanes {
 }
 
 impl Presenter {
-    /// Copy the frame's three tightly-packed planes into the staging buffer and (re)build
-    /// the plane images + video image on a stream-size change.
-    ///
-    /// Returns the per-plane staging offsets the record step copies from. Nothing here
-    /// touches the queue: a rebuild that fails must fail BEFORE the acquire, the same
-    /// rule the hardware imports follow.
+    /// Touches no queue: a failed rebuild must fail before acquire, same
+    /// rule as the hardware imports.
     pub(super) fn stage_frame(&mut self, f: &CpuPlanarFrame) -> Result<[usize; 3]> {
         if self
             .video
@@ -86,29 +77,24 @@ impl Presenter {
         let s = self.staging.as_ref().unwrap();
         for (i, off) in offsets.iter().enumerate() {
             let plane = f.plane(i);
-            // SAFETY: per the Vulkan contract above - `s.ptr` maps a HOST_VISIBLE allocation of
-            // `s.capacity >= needed` bytes and `plane_staging_offsets` placed `off + plane.len()`
-            // inside `needed`; source and destination are distinct allocations.
+            // SAFETY: `s.ptr` maps a HOST_VISIBLE allocation of
+            // `s.capacity >= needed` bytes; `plane_staging_offsets` placed
+            // `off + plane.len()` inside `needed`; src and dst are distinct.
             unsafe { std::ptr::copy_nonoverlapping(plane.as_ptr(), s.ptr.add(*off), plane.len()) };
         }
         Ok(offsets)
     }
 
-    /// (Re)build the software rung's three R8 plane images for a luma size.
     fn rebuild_cpu_planes(&mut self, width: u32, height: u32) -> Result<()> {
-        // Fence-quiesce: the old images are only ever referenced by OUR command buffers.
+        // Old images are only referenced by our command buffers.
         self.quiesce_own()?;
         if let Some(p) = self.cpu_planes.take() {
             p.destroy(&self.device);
         }
         let (cw, ch) = CpuPlanarFrame::chroma_dims(width, height);
         let dims = [(width, height), (cw, ch), (cw, ch)];
-        // Built INTO the owning value, not into loose arrays: nine fallible steps (three
-        // images, three allocations, three views) used to `?` straight out and leak
-        // everything created before the one that failed — up to ~12 MB per size change at
-        // 4K, on the rung the client reaches because something already went wrong.
-        // `destroy` tolerates the nulls a partial build leaves (Vulkan defines
-        // destroy/free on `VK_NULL_HANDLE` as a no-op), so one call unwinds any prefix.
+        // Build into the owning value, not loose arrays: nine fallible steps,
+        // and `destroy` treats `VK_NULL_HANDLE` as a no-op so a prefix unwinds.
         let mut planes = CpuPlanes {
             images: [vk::Image::null(); 3],
             memory: [vk::DeviceMemory::null(); 3],
@@ -128,12 +114,10 @@ impl Presenter {
         Ok(())
     }
 
-    /// One R8 plane of [`CpuPlanes`], written into `planes` as each handle is created so
-    /// a failure part-way leaves the caller something it can destroy.
+    /// One R8 plane, written into `planes` as each handle is created so a
+    /// failure part-way leaves the caller something it can destroy.
     fn build_cpu_plane(&self, planes: &mut CpuPlanes, i: usize, (w, h): (u32, u32)) -> Result<()> {
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by
-        // this type and live for the call, and every builder struct is a local that outlives
-        // it.
+        // SAFETY: `device` is live; create-info is a local that outlives the call.
         let image = unsafe {
             self.device.create_image(
                 &vk::ImageCreateInfo::default()
@@ -154,15 +138,12 @@ impl Presenter {
             )
         }?;
         planes.images[i] = image;
-        // SAFETY: per the Vulkan contract above - a read-only query on the live device.
+        // SAFETY: `image` was created above and is owned here.
         let reqs = unsafe { self.device.get_image_memory_requirements(image) };
         planes.memory[i] = self.allocate(reqs, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by
-        // this type and live for the call.
+        // SAFETY: `image` and `planes.memory[i]` were created above and are owned here.
         unsafe { self.device.bind_image_memory(image, planes.memory[i], 0) }?;
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by
-        // this type and live for the call, and every builder struct is a local that outlives
-        // it.
+        // SAFETY: `device` is live; `image` is owned here; create-info is a local.
         planes.views[i] = unsafe {
             self.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
@@ -177,12 +158,10 @@ impl Presenter {
     }
 
     pub(super) fn rebuild_video_image(&mut self, width: u32, height: u32) -> Result<()> {
-        // Fence-quiesce: the old image is only ever referenced by OUR command buffers.
+        // Old image is only referenced by our command buffers.
         self.quiesce_own()?;
         if let Some(v) = self.video.take() {
-            // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by
-            // this type and live for the call, and every builder struct is a local that outlives
-            // it.
+            // SAFETY: `quiesce_own` above; GPU idle on this image, view, and framebuffer.
             unsafe {
                 if v.framebuffer != vk::Framebuffer::null() {
                     self.device.destroy_framebuffer(v.framebuffer, None);
@@ -194,9 +173,8 @@ impl Presenter {
                 self.device.free_memory(v.memory, None);
             }
         }
-        // COLOR_ATTACHMENT is the CSC pass's render target; harmless where hw is absent.
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // COLOR_ATTACHMENT is the CSC render target; harmless where hw is absent.
+        // SAFETY: `device` is live; create-info is a local that outlives the call.
         let image = unsafe {
             self.device.create_image(
                 &vk::ImageCreateInfo::default()
@@ -220,17 +198,13 @@ impl Presenter {
                 None,
             )
         }?;
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `image` was created above and is owned here.
         let reqs = unsafe { self.device.get_image_memory_requirements(image) };
         let memory = self.allocate(reqs, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `image` and `memory` were created above and are owned here.
         unsafe { self.device.bind_image_memory(image, memory, 0) }?;
-        // The CSC pass renders into it — view + framebuffer, unconditional (Vulkan-Video
-        // frames need the pass on every device, dmabuf-capable or not).
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // View + framebuffer always: Vulkan Video needs the CSC pass on every device.
+        // SAFETY: `device` is live; create-info is a local that outlives the call.
         let view = unsafe {
             self.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
@@ -242,8 +216,8 @@ impl Presenter {
             )
         }?;
         let attachments = [view];
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `device` is live; `view`/`csc.render_pass` are owned here;
+        // create-info is a local that outlives the call.
         let framebuffer = unsafe {
             self.device.create_framebuffer(
                 &vk::FramebufferCreateInfo::default()
@@ -269,18 +243,14 @@ impl Presenter {
     fn rebuild_staging(&mut self, capacity: usize) -> Result<()> {
         self.quiesce_own()?;
         if let Some(s) = self.staging.take() {
-            // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and
-            // the GPU is known idle for them (the fence/queue-wait on the path here, or the
-            // swapchain being retired), which is the obligation that makes a destroy sound rather
-            // than the handle merely being non-null.
+            // SAFETY: `quiesce_own` above; GPU idle on this buffer. Unmap before free.
             unsafe {
                 self.device.unmap_memory(s.memory);
                 self.device.destroy_buffer(s.buffer, None);
                 self.device.free_memory(s.memory, None);
             }
         }
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `device` is live; create-info is a local that outlives the call.
         let buffer = unsafe {
             self.device.create_buffer(
                 &vk::BufferCreateInfo::default()
@@ -290,18 +260,15 @@ impl Presenter {
                 None,
             )
         }?;
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `buffer` was created above and is owned here.
         let reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
         let memory = self.allocate(
             reqs,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `buffer` and `memory` were created above and are owned here.
         unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }?;
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `memory` is HOST_VISIBLE, bound above, and owned here until unmap.
         let ptr = unsafe {
             self.device
                 .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())

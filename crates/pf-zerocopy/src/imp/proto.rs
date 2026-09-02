@@ -1,21 +1,20 @@
-//! Wire *vocabulary* between the PipeWire capture thread and the isolated zero-copy GPU-import
-//! worker process (`punktfunk-host zerocopy-worker`; design:
-//! `design/zerocopy-worker-isolation.md`) — the message types and this protocol's version, and
-//! nothing else. The transport they ride on ([`super::ipc`]: SEQPACKET framing, `SCM_RIGHTS`,
-//! spawn/reap) is shared with the other workers and is deliberately generic over the body type;
-//! each worker's vocabulary stays its own and versions independently.
+//! Request/reply vocabulary between the PipeWire capture thread and the isolated GPU-import
+//! worker (`punktfunk-host zerocopy-worker`; `design/zerocopy-worker-isolation.md`).
 //!
-//! Bodies are small serde_json blobs (~200 B/frame); pixels never cross the socket (they move
-//! GPU-side via CUDA IPC, see [`super::cuda::ipc_export`]).
+//! Transport is [`super::ipc`] (SEQPACKET + `SCM_RIGHTS`); this module versions the body
+//! independently of other workers. Pixels never ride the socket — they move GPU-side via
+//! CUDA IPC ([`super::cuda::ipc_export`]).
+//!
+//! Pin: `round_trip_both_directions`.
 
 use serde::{Deserialize, Serialize};
 
-/// Bumped on any wire change; the worker echoes it in [`Reply::Ready`] and the host refuses a
-/// mismatch. Host and worker are the same binary (`/proc/self/exe`), so this only ever trips on
-/// exotic deployment mistakes (a stale binary re-exec'd across an upgrade).
+/// Bumped on any wire change. Echoed in [`Reply::Ready`]; the host refuses a mismatch.
+/// Same binary (`/proc/self/exe`) — trips only a stale re-exec.
 pub const PROTO_VERSION: u32 = 1;
 
-/// How a dmabuf should be imported — mirrors the `EglImporter` entry points.
+/// Mirrors the `EglImporter` entry points. Append-only: a worker can outlive a replaced host,
+/// so an unknown variant must fail decode, not remap.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportKind {
     /// Tiled dmabuf → EGL/GL de-tile blit → BGRx CUDA buffer.
@@ -24,26 +23,20 @@ pub enum ImportKind {
     TiledNv12,
     /// LINEAR dmabuf → Vulkan bridge → BGRx CUDA buffer (gamescope's only offer).
     Linear,
-    /// Tiled dmabuf → EGL/GL planar-YUV444 convert → ONE stacked 3-plane CUDA buffer (a 4:4:4
-    /// session). APPENDED last: the worker can outlive a replaced host binary, so the earlier
-    /// variants' wire tags must never shift — an old worker receiving this fails the decode and
-    /// the import-fail machinery handles it like any other worker error.
+    /// Tiled dmabuf → EGL/GL planar-YUV444 convert → one stacked 3-plane CUDA buffer.
     Tiled444,
-    /// LINEAR dmabuf → Vulkan-bridge compute CSC → two-plane NV12 CUDA buffer (latency plan
-    /// T2.5b — the gamescope analogue of [`TiledNv12`](Self::TiledNv12)). Appended last, same
-    /// wire-tag rule as [`Tiled444`](Self::Tiled444).
+    /// LINEAR dmabuf → Vulkan-bridge compute CSC → two-plane NV12 CUDA buffer (gamescope analogue
+    /// of [`TiledNv12`](Self::TiledNv12)).
     LinearNv12,
 }
 
 /// host → worker.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub enum Request {
-    /// The EGL-importable DRM modifiers for `fourcc` (startup, before the stream connects —
-    /// the host advertises these to PipeWire).
+    /// EGL-importable DRM modifiers for `fourcc` (startup; advertised to PipeWire).
     Modifiers { fourcc: u32 },
-    /// Import one frame. `key` identifies the underlying dmabuf across frames (the host uses
-    /// the fd's `st_ino` — unique per dma-buf object); the fd itself rides along as
-    /// `SCM_RIGHTS` only on first sight of `key` (`has_fd`), and the worker keeps its dup.
+    /// `key` is the dmabuf's `st_ino` (stable per object). The fd rides `SCM_RIGHTS` only on
+    /// first sight of `key` (`has_fd`); the worker keeps the dup.
     Import {
         key: u64,
         kind: ImportKind,
@@ -55,54 +48,50 @@ pub enum Request {
         stride: u32,
         has_fd: bool,
     },
-    /// The frame buffer previously delivered as `id` is no longer in use — recycle it into the
-    /// worker's pool. Fire-and-forget (no reply); may be sent from any host thread.
+    /// Recycle buffer `id` into the worker pool. Fire-and-forget; any host thread.
     Release { id: u32 },
-    /// The PipeWire stream renegotiated its format: the buffer pool is gone, so drop all cached
-    /// per-`key` state (stored fds, Vulkan per-fd imports). Fire-and-forget.
+    /// Format renegotiation: drop cached per-`key` fds and Vulkan imports. Fire-and-forget.
     ClearCache,
 }
 
 /// worker → host.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub enum Reply {
-    /// Sent once at startup after EGL + CUDA came up.
+    /// Once, after EGL + CUDA init.
     Ready {
         version: u32,
     },
-    /// Startup failed (no NVIDIA driver, EGL error, …) — the host falls back to the CPU path,
-    /// exactly like an in-process `EglImporter::new()` failure.
+    /// Init failed. Host falls back to CPU, as for in-process `EglImporter::new()`.
     InitErr {
         message: String,
     },
     Modifiers {
         modifiers: Vec<u64>,
     },
-    /// The imported frame is complete (the GPU copy already synced worker-side) in buffer `id`.
-    /// `desc` rides along the first time `id` is ever delivered — the host opens its CUDA IPC
-    /// handles once and caches the mapping for every later frame in the same buffer.
+    /// Import done; GPU copy already synced worker-side. `desc` only the first time `id` is
+    /// delivered — the host opens CUDA IPC handles then and caches the mapping.
     Frame {
         id: u32,
         desc: Option<BufferDesc>,
     },
-    /// The worker has no cached fd for the import's `key` (evicted, or the two sides' caches
-    /// diverged) — the host forgets its "already sent" note and retries once WITH the fd.
+    /// No cached fd for this `key` (evicted or caches diverged). Host forgets "already sent"
+    /// and retries once with the fd.
     NeedFd,
-    /// This import failed but the worker is alive (e.g. `EGL_BAD_MATCH` on one buffer).
+    /// This import failed; the worker is still alive (e.g. `EGL_BAD_MATCH`).
     Err {
         message: String,
     },
 }
 
-/// CUDA IPC identity of one pooled device buffer (sent once per buffer, then referenced by id).
+/// Sent once per pooled buffer; later frames cite it by `Frame.id`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct BufferDesc {
     pub width: u32,
     pub height: u32,
-    /// `cuIpcGetMemHandle` blob for the (Y or BGRx) plane — exactly 64 bytes.
+    /// `cuIpcGetMemHandle` blob (Y or BGRx). Always 64 bytes.
     pub y_handle: Vec<u8>,
     pub y_pitch: usize,
-    /// NV12 only: the interleaved chroma plane's `(handle, pitch)`.
+    /// NV12 only: interleaved chroma `(handle, pitch)`.
     pub uv: Option<(Vec<u8>, usize)>,
 }
 
@@ -112,8 +101,7 @@ mod tests {
     use crate::imp::ipc;
     use std::os::fd::AsFd;
 
-    /// The vocabulary survives the wire in both directions. (The framing itself — fds, EOF,
-    /// timeouts, the descriptor cap — is exercised in [`ipc`]; this only pins the message types.)
+    /// Pins the message types. Framing (fds, EOF, timeouts, descriptor cap) lives in [`ipc`].
     #[test]
     fn round_trip_both_directions() {
         let (a, b) = ipc::socketpair_seqpacket().unwrap();

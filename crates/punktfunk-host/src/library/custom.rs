@@ -1,63 +1,53 @@
-//! User-curated custom store: CRUD (add/update/delete) over the persisted custom entries the web
-//! console manages, and their mapping onto the uniform `GameEntry`. Split out of the `library` facade (plan §W5).
+//! Persisted custom catalog (`library.json`): operator CRUD and provider reconcile onto [`GameEntry`].
+//!
+//! Lives in the hardened host config dir next to hooks.json. Manual CRUD never
+//! touches provider-owned rows; provider reconcile never touches manual ones.
+//! A store claim stamps `<store>:<external_id>` so GameStream app ids and client
+//! art caches stay valid (design D2).
+//!
+//! `prep` and `command` run as the host user; other kinds name a title the host
+//! resolves. Tests pin the id scheme, the v1→v2 load, and the privileged-field allowlist.
 
 use super::*;
 
-/// A user-added title, persisted in the hardened host config dir's `library.json` (see
-/// [`custom_path`]). Same shape the API returns and the web console edits.
+/// One stored row. Same shape the API returns and the console edits.
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct CustomEntry {
-    /// Host-assigned, stable for the life of the entry (the `{id}` in the CRUD path).
+    /// Host-assigned row id; the `{id}` in the CRUD path. Not the surfaced library id.
     pub id: String,
     pub title: String,
     #[serde(default)]
     pub art: Artwork,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<LaunchSpec>,
-    /// Per-title prep/undo steps (RFC §6): each `do` runs before this title launches, each
-    /// `undo` at session end in reverse order (see [`crate::hooks::run_prep`]).
+    /// Each `do` runs before launch; each `undo` at session end in reverse ([`crate::hooks::run_prep`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prep: Vec<crate::hooks::PrepCmd>,
-    /// The external provider owning this entry (RFC §8), set ONLY by the provider reconcile
-    /// API — `None` = a manual entry, which no provider operation ever touches, and which the
-    /// manual CRUD alone may edit (the converse holds too: manual CRUD refuses provider-owned
-    /// entries, so ownership is never ambiguous).
+    /// Set only by provider reconcile. `None` is a manual row: reconcile never touches it, and
+    /// manual CRUD refuses provider-owned rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    /// The provider's own stable key for this title — the reconcile diff key, so the
-    /// host-assigned `id` stays stable across reconciles. Present iff `provider` is.
+    /// Provider's reconcile key. Present iff `provider` is, so the host `id` can stay put.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
-    /// The **store this entry was claimed under** (D2), stamped by a `?store=`-qualified reconcile.
-    /// `None` = an unclaimed provider entry or a manual one, both of which surface as `custom`.
-    ///
-    /// Materialized onto the entry rather than looked up in [`Catalog::claims`] on every read so an
-    /// entry is self-describing: its id and its `store` badge derive from the entry alone, and stay
-    /// correct even while the claim map is being rewritten.
+    /// Store this row was claimed under. `None` surfaces as `custom`. Stamped on the
+    /// row so id and badge stay correct while [`Catalog::claims`] is being rewritten.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store: Option<String>,
-    /// Whether this entry is a game or the launcher itself — see [`GameRole`].
     #[serde(default, skip_serializing_if = "GameRole::is_game")]
     pub role: GameRole,
-    /// Which brand mark a client should draw for this entry — see [`GameEntry::icon`]. A token
-    /// (`steam`, `heroic`), never bytes and never a URL.
+    /// Brand token (`steam`, `heroic`) a client draws. Never bytes, never a URL. See [`GameEntry::icon`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
-    /// How to recognize this title's process once it is running (design §9) — the one thing a
-    /// provider knows that the host cannot work out for itself.
-    ///
-    /// Optional: without it the entry is still tracked by the child the host spawns for it, which
-    /// covers every command that stays in the foreground. It earns its keep for a command that hands
-    /// off and exits — a launcher script, a `flatpak run`, a front-end that starts an emulator — where
-    /// the host would otherwise lose the game the moment the shim returns.
+    /// How to find this title after a command that hands off and exits. Without it the
+    /// host tracks only the child it spawned.
     #[serde(default, skip_serializing_if = "DetectHint::is_empty")]
     pub detect: DetectHint,
-    /// Descriptive metadata (platform, description, …), flattened — see [`GameMeta`].
     #[serde(flatten)]
     pub meta: GameMeta,
 }
 
-/// Request body to create or replace a custom entry (no `id` — the host owns it).
+/// Create/replace body. No `id` — the host assigns it.
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 pub struct CustomInput {
     pub title: String,
@@ -65,65 +55,51 @@ pub struct CustomInput {
     pub art: Artwork,
     #[serde(default)]
     pub launch: Option<LaunchSpec>,
-    /// Per-title prep/undo steps — commands run as the host user; operator-privileged config.
+    /// Run as the host user; operator-privileged. See [`privileged_field`].
     #[serde(default)]
     pub prep: Vec<crate::hooks::PrepCmd>,
-    /// Whether this entry is a game or the launcher itself — see [`GameRole`]. A hand-added launcher
-    /// entry is legal (an operator may want a "Steam" tile without installing the steam plugin).
+    /// A hand-added launcher tile is legal without installing the matching plugin.
     #[serde(default)]
     pub role: GameRole,
-    /// Which brand mark to draw — see [`GameEntry::icon`]. Hand-settable for the same reason `role`
-    /// is: an operator's own "Steam" tile should be able to look like one.
+    /// Brand token. A hand-added "Steam" tile can look like one. See [`GameEntry::icon`].
     #[serde(default)]
     pub icon: Option<String>,
-    /// How to recognize this title's process — see [`CustomEntry::detect`].
     #[serde(default)]
     pub detect: DetectHint,
-    /// Descriptive metadata (platform, description, …), flattened — see [`GameMeta`]. Replaced
-    /// wholesale on update, like `art`: an edit must round-trip every field it wants kept.
+    /// Flattened [`GameMeta`]. Replaced wholesale on update — an edit must send every field it wants kept.
     #[serde(flatten)]
     pub meta: GameMeta,
 }
 
-/// One title in a provider's declarative reconcile payload (RFC §8): [`CustomInput`] plus the
-/// provider's required stable key.
+/// One title in a provider reconcile payload: [`CustomInput`] plus the provider's required stable key.
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 pub struct ProviderEntryInput {
-    /// The provider's stable id for this title (the reconcile diff key).
     pub external_id: String,
     pub title: String,
     #[serde(default)]
     pub art: Artwork,
     #[serde(default)]
     pub launch: Option<LaunchSpec>,
-    /// Per-title prep/undo steps — commands run as the host user; operator-privileged config.
+    /// Run as the host user; operator-privileged. See [`privileged_field`].
     #[serde(default)]
     pub prep: Vec<crate::hooks::PrepCmd>,
-    /// Whether this entry is a game or the launcher itself — see [`GameRole`]. A library plugin
-    /// emits its `launchers(cfg)` entries with `role: "launcher"`.
+    /// Plugins emit `launchers(cfg)` tiles with `role: "launcher"`.
     #[serde(default)]
     pub role: GameRole,
-    /// Which brand mark to draw — see [`GameEntry::icon`]. This is the field a library plugin sets
-    /// on its `launchers(cfg)` tiles, and the whole reason the token exists.
+    /// Brand token a plugin sets on its `launchers(cfg)` tiles. See [`GameEntry::icon`].
     #[serde(default)]
     pub icon: Option<String>,
-    /// How to recognize this title's process — see [`CustomEntry::detect`]. A provider that knows its
-    /// titles' install directories (Playnite does) should send them: it is what lets a game launched
-    /// through the provider's own client still end its session when the player quits.
+    /// Install-dir / process hint. Needed when launch goes through the provider's own client.
     #[serde(default)]
     pub detect: DetectHint,
-    /// Descriptive metadata (platform, description, …), flattened — see [`GameMeta`].
     #[serde(flatten)]
     pub meta: GameMeta,
 }
 
 impl From<CustomEntry> for GameEntry {
     fn from(c: CustomEntry) -> Self {
-        // A custom/provider entry is spawned by the host itself, so its own child process is the
-        // primary lifetime signal; the spec is the fallback for a command that hands off and exits (a
-        // launcher script, a `flatpak run`). An absolute exe in the command line is all that can be
-        // *inferred*; anything sharper has to be stated, which is what `detect` is for (design §9).
-        // The inferred exe wins where both exist — it is derived from the very command being run.
+        // Child process is the primary lifetime; `detect` is the fallback when the command
+        // hands off and exits. An inferred `command` exe wins where both exist.
         let detect = c
             .launch
             .as_ref()
@@ -133,14 +109,13 @@ impl From<CustomEntry> for GameEntry {
             .or_hint(&c.detect);
         GameEntry {
             id: library_id_for(&c),
-            // A claimed entry wears its store's badge; everything else is `custom`. `provider` rides
-            // along either way, so attribution ("synced by the steam plugin") survives the claim.
             store: c.store.clone().unwrap_or_else(|| "custom".into()),
             title: c.title,
             art: c.art,
             role: c.role,
             icon: c.icon,
             launch: c.launch,
+            // Stays set so attribution survives the claim.
             provider: c.provider,
             detect,
             meta: c.meta,
@@ -149,32 +124,25 @@ impl From<CustomEntry> for GameEntry {
 }
 
 fn custom_path() -> PathBuf {
-    // The shared, hardened host config dir (`%ProgramData%\punktfunk` / `~/.config/punktfunk`, with
-    // the `PUNKTFUNK_CONFIG_DIR` override) — NOT a bespoke XDG/HOME resolver with a CWD-relative
-    // fallback. This file drives operator `prep`/`launch` command execution, so it must live where the
-    // rest of the privileged host config does and be DACL/0600-locked against a non-privileged local
-    // user planting one (security-review 2026-07-17). Matches hooks.json / the mgmt token.
+    // Hardened host config dir, not CWD. `prep`/`launch` run as the host user, so this
+    // file sits with hooks.json and is DACL/0600-locked.
     pf_paths::config_dir().join("library.json")
 }
 
-/// The persisted catalog (`library.json` **v2**): the entries plus the store-claim map (D2).
+/// `library.json` v2: entries plus the store-claim map.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Catalog {
     #[serde(default)]
     pub entries: Vec<CustomEntry>,
-    /// `store id → provider id`. One provider per store; a second claimant is refused (409).
-    ///
-    /// The map — not the entries — is the authority for a claim, which is exactly why it survives an
-    /// **empty reconcile**: a store the plugin legitimately owns can have zero installed titles, and
-    /// it must keep owning the store's id space regardless. Releasing is explicit
-    /// (`DELETE /library/provider/{p}`, or the plugin claiming a different store).
+    /// `store id → provider id`. One provider per store; a second claimant is 409.
+    /// The map, not the entries, is the claim authority, so an empty reconcile still owns
+    /// the store's id space.
     #[serde(default)]
     pub claims: BTreeMap<String, String>,
 }
 
-/// What `library.json` may contain on disk. v1 was a bare array of entries; v2 is the [`Catalog`]
-/// object. Untagged, so an existing v1 file loads unchanged — and the host always WRITES v2, so the
-/// first mutation after an upgrade migrates the file in place with no separate migration step.
+/// On-disk `library.json`: v1 is a bare array, v2 is [`Catalog`]. Untagged so v1 still loads;
+/// the host always writes v2, so the first mutation migrates in place.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum LibraryFile {
@@ -182,7 +150,7 @@ enum LibraryFile {
     Legacy(Vec<CustomEntry>),
 }
 
-/// Load the whole catalog (default + non-fatal if the file is absent or malformed).
+/// Absent or malformed file → empty catalog, never an error.
 pub fn load_catalog() -> Catalog {
     match std::fs::read_to_string(custom_path()) {
         Ok(raw) => match serde_json::from_str::<LibraryFile>(&raw) {
@@ -200,26 +168,18 @@ pub fn load_catalog() -> Catalog {
     }
 }
 
-/// Load just the entries — the read path every library surface uses.
 pub fn load_custom() -> Vec<CustomEntry> {
     load_catalog().entries
 }
 
-/// The active store claims (`store → provider`). Read per library scan to suppress the built-in
-/// scanner a plugin has taken over (D2).
+/// Store ids a plugin has claimed, so library scans skip the matching built-in scanner.
 pub fn claimed_stores() -> BTreeMap<String, String> {
     load_catalog().claims
 }
 
-/// The library id a stored entry surfaces as. **The single source of truth for the mapping** —
-/// [`From<CustomEntry> for GameEntry`] and every id→entry lookup go through it, so the id scheme
-/// can't drift between the catalog, the art proxy and the launch resolver.
-///
-/// A **claimed** entry (D2) gets the deterministic `<store>:<external_id>` its built-in scanner used
-/// to produce — `steam:440`, `heroic:legendary:Quail` — so entry ids, GameStream FNV-1a app ids,
-/// client art caches and Moonlight pins all survive the migration to a plugin untouched. That is the
-/// whole point of the claim: extraction must be invisible to everything downstream. An unclaimed
-/// entry keeps the opaque host-assigned `custom:<id>`.
+/// Surfaced library id. Every `GameEntry` mapping and id→entry lookup goes through here.
+/// Claimed: `<store>:<external_id>` (GameStream FNV-1a ids, art caches, Moonlight pins).
+/// Unclaimed: opaque `custom:<id>`.
 pub(crate) fn library_id_for(e: &CustomEntry) -> String {
     match (e.store.as_deref(), e.external_id.as_deref()) {
         (Some(store), Some(external)) => format!("{store}:{external}"),
@@ -227,26 +187,16 @@ pub(crate) fn library_id_for(e: &CustomEntry) -> String {
     }
 }
 
-/// The **source id** an entry is toggled by (WP2.6): its claimed store when it has one, else its
-/// provider id. `None` for a manual entry — the custom store is not a source and can never be
-/// switched off. Since the claimed store id, the provider id and the old scanner id are all the same
-/// string by construction, a user's existing disabled state carries over verbatim.
+/// Toggle key: claimed store, else provider. `None` for a manual row — the custom store is
+/// not a source and cannot be switched off. Store and provider share the string, so a
+/// disabled state carries over.
 pub(crate) fn source_id_for(e: &CustomEntry) -> Option<&str> {
     e.store.as_deref().or(e.provider.as_deref())
 }
 
-/// The stored entry a full **library id** refers to, or `None`. The art proxy resolves *any* id this
-/// way before falling back to the legacy per-store branches (WP1.2), which is what lets a plugin's
-/// entries be served regardless of what their ids look like.
-///
-/// Gated on what the library actually collects ([`super::collect_games`]), so a source the operator
-/// switched OFF resolves to nothing here either. It used to resolve straight out of the catalog,
-/// which let `GET /library/art/<id>/<kind>` — on the paired-cert allowlist — serve covers for
-/// entries `GET /library` had already filtered away (security review 2026-08-25).
-///
-/// The per-entry **hide** is deliberately not applied: the console draws a hidden title's (dimmed)
-/// cover so the operator can bring it back, and this resolver cannot see the caller's lane. Keeping
-/// a hidden title's art off the paired-cert lane is a check for the route, which can.
+/// Gated on [`super::collect_games`]: a source the operator switched off must not serve art
+/// (`GET /library/art` is on the paired-cert allowlist). Per-entry hide is not applied here —
+/// the console draws a dimmed cover, and this resolver cannot see the caller's lane.
 pub fn entry_for_library_id(library_id: &str) -> Option<CustomEntry> {
     let entry = load_custom()
         .into_iter()
@@ -257,9 +207,7 @@ pub fn entry_for_library_id(library_id: &str) -> Option<CustomEntry> {
         .then_some(entry)
 }
 
-/// Serve a stored entry's **local** art file for one [`ArtKind`] — the `library.json` branch of the
-/// art proxy (`GET /library/art/<library id>/<kind>`). `None` if the id names no stored entry, it has
-/// no art of that kind, or that art value isn't a servable local file (e.g. an `http` URL the client
+/// Local art bytes for one [`ArtKind`], or `None` (no row, no field, or an `http` URL the client
 /// fetches itself). Blocking IO — call off the async runtime.
 pub fn library_local_art_bytes(library_id: &str, kind: ArtKind) -> Option<(Vec<u8>, String)> {
     let field = art_field(&entry_for_library_id(library_id)?.art, kind)?;
@@ -268,7 +216,6 @@ pub fn library_local_art_bytes(library_id: &str, kind: ArtKind) -> Option<(Vec<u
         .flatten()
 }
 
-/// One [`Artwork`] field by kind — the tiny mapping the proxy and the box-art ladder share.
 pub(crate) fn art_field(art: &Artwork, kind: ArtKind) -> Option<String> {
     match kind {
         ArtKind::Portrait => art.portrait.clone(),
@@ -278,18 +225,14 @@ pub(crate) fn art_field(art: &Artwork, kind: ArtKind) -> Option<String> {
     }
 }
 
-/// Persist the catalog in the **v2** shape (write-then-rename, restrictive perms). Every mutation
-/// path funnels through here, so a v1 file is upgraded by the first write.
+/// Every mutation path goes through here, so the first write upgrades v1.
 fn save_catalog(catalog: &Catalog) -> Result<()> {
     let dir = pf_paths::config_dir();
-    // Owner-private dir (0700 / SYSTEM+Admins DACL) so a non-privileged local user can't plant a
-    // library.json whose `prep`/`launch` commands the host would later execute — the same trust
-    // boundary hooks.json and the mgmt token already use.
+    // 0700 / SYSTEM+Admins, matching hooks.json: a local user must not plant `prep`/`launch`.
     pf_paths::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
     let json = serde_json::to_string_pretty(catalog)?;
-    // Write-then-rename so a crash mid-write never truncates the catalog; `write_secret_file` gives
-    // the temp file its restrictive perms (0600 / SYSTEM+Admins DACL) before the rename carries them
-    // to the final path.
+    // Crash mid-write must not truncate. `write_secret_file` applies 0600 / SYSTEM+Admins before
+    // the rename carries them to the final path.
     let tmp = custom_path().with_extension("json.tmp");
     pf_paths::write_secret_file(&tmp, json.as_bytes())
         .with_context(|| format!("write {}", tmp.display()))?;
@@ -297,7 +240,7 @@ fn save_catalog(catalog: &Catalog) -> Result<()> {
     Ok(())
 }
 
-/// 12 hex chars from the title + wall-clock nanos — collision-free in practice, no uuid dep.
+/// 12 hex chars from title + wall-clock nanos.
 fn new_id(title: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -306,24 +249,19 @@ fn new_id(title: &str) -> String {
     hex::encode(&Sha256::digest(format!("{title}:{nanos}").as_bytes())[..6])
 }
 
-/// Outcome of a mutation — distinguishes "no such entry" from the two conflict cases the mgmt
-/// layer maps to 409 rather than 404.
+/// Distinguishes "no such entry" from the two 409 cases the mgmt layer must not map to 404.
 pub enum MutateOutcome<T> {
     Done(T),
     NotFound,
-    /// The entry belongs to this provider — mutate it through the provider reconcile API
-    /// (or remove the whole provider set); manual edits would be clobbered at the next sync.
+    /// Belongs to this provider. Manual edits would be clobbered at the next sync.
     ProviderOwned(String),
-    /// The requested store claim is already held by a DIFFERENT provider (D2: one provider per
-    /// store). Refusing is the point — two plugins both emitting `steam:440` would collide on entry
-    /// ids, so the second claimant is told who holds it instead of silently taking over.
+    /// A different provider already holds this store. The second claimant is told who holds it.
     StoreClaimed {
         store: String,
         provider: String,
     },
 }
 
-/// Create a custom (manual) entry, returning it with its assigned id.
 pub fn add_custom(input: CustomInput) -> Result<CustomEntry> {
     let mut catalog = load_catalog();
     let entry = CustomEntry {
@@ -346,8 +284,7 @@ pub fn add_custom(input: CustomInput) -> Result<CustomEntry> {
     Ok(entry)
 }
 
-/// Replace a manual entry's fields (id preserved). Provider-owned entries are refused —
-/// their state belongs to the provider's reconcile (RFC §8 ownership rule).
+/// Replace a manual row (id kept). Provider-owned rows are refused — they belong to reconcile.
 pub fn update_custom(id: &str, input: CustomInput) -> Result<MutateOutcome<CustomEntry>> {
     let mut catalog = load_catalog();
     let Some(slot) = catalog.entries.iter_mut().find(|e| e.id == id) else {
@@ -370,7 +307,7 @@ pub fn update_custom(id: &str, input: CustomInput) -> Result<MutateOutcome<Custo
     Ok(MutateOutcome::Done(updated))
 }
 
-/// Delete a manual entry. Provider-owned entries are refused (see [`update_custom`]).
+/// Delete a manual row. Provider-owned rows are refused (see [`update_custom`]).
 pub fn delete_custom(id: &str) -> Result<MutateOutcome<()>> {
     let mut catalog = load_catalog();
     let Some(entry) = catalog.entries.iter().find(|e| e.id == id) else {
@@ -385,23 +322,9 @@ pub fn delete_custom(id: &str) -> Result<MutateOutcome<()>> {
     Ok(MutateOutcome::Done(()))
 }
 
-// ------------------------------------------------------------------ providers (RFC §8)
-
-/// The **operator-privileged field** in a library payload, if the payload carries one: `prep`, or a
-/// launch kind that is not on [`UNPRIVILEGED_LAUNCH_KINDS`] — the fields whose contents the host
-/// could later execute as the host user.
-///
-/// `prep` is run by [`crate::hooks::run_prep`] through `/bin/sh -c`, and a `command` launch is run
-/// through `/bin/sh -c` (Linux) or `cmd.exe /c` (Windows). Both are documented at their execution
-/// sites as *operator-typed, never client-set* — the custom store's whole trust argument is that a
-/// human typed the command into the admin console. Any lane that is not the operator's own token
-/// must therefore not be able to set them, which is what the 2026-08-05 review's H-1 exploited: the
-/// plugin token reached `POST /library/custom` and `PUT /library/provider/{p}`, which carry two
-/// copies of the very primitive the `/hooks` carve-out exists to withhold.
-///
-/// Returns the field name for the error message, so a plugin author sees exactly what was refused.
-/// Every launch kind on [`UNPRIVILEGED_LAUNCH_KINDS`] stays open to every lane — a provider plugin
-/// can still publish its whole catalogue, it just cannot hand the host a program to run.
+/// `prep` and `command` run through `/bin/sh -c` or `cmd.exe /c` as the host user. Returns the
+/// field name for the error. Kinds on [`UNPRIVILEGED_LAUNCH_KINDS`] stay open so a plugin can
+/// publish a catalogue without handing the host a program to run.
 pub fn privileged_field(
     launch: Option<&LaunchSpec>,
     prep: &[crate::hooks::PrepCmd],
@@ -415,19 +338,12 @@ pub fn privileged_field(
     None
 }
 
-/// The launch kinds any lane may publish: the host owns the whole command line and builds it from a
-/// value it validates per kind (`launch.rs`), so the entry NAMES a title rather than carrying a
-/// program to run. `plugin` is here for a different reason — its command is never stored at all: the
-/// host asks the live plugin for one at launch time ([`crate::library::ask_plugin_launch`]), so the
-/// stored entry on its own executes nothing.
-///
-/// An **allowlist**, deliberately, and the reason [`privileged_field`] reads the way round it does:
-/// a kind added to `launch.rs` and forgotten here is operator-only until someone lists it on
-/// purpose, which is the safe way to be wrong. It used to be a two-entry blocklist, and `gog` — an
-/// exe plus arguments — sat outside it as a standing exec primitive for the plugin lane (security
-/// review 2026-08-25). `gog` is listed now because `launch::gog_spawn` confines its exe to a GOG
-/// install the host enumerates itself; `command` never is, because `cmd.exe /c` / `sh -c` is the
-/// primitive this whole gate exists to withhold.
+/// Launch kinds any lane may publish: the host builds the command from a validated value,
+/// so the entry names a title rather than carrying a program. `plugin` stores no command —
+/// the host asks the live plugin at launch ([`crate::library::ask_plugin_launch`]).
+/// Fail closed: a kind added to `launch.rs` and forgotten here is operator-only.
+/// `gog` is listed because `launch::gog_spawn` confines the exe to a GOG install;
+/// `command` is never listed (`cmd.exe /c` / `sh -c`).
 const UNPRIVILEGED_LAUNCH_KINDS: &[&str] = &[
     "steam_appid",
     "steam_ui",
@@ -442,8 +358,8 @@ const UNPRIVILEGED_LAUNCH_KINDS: &[&str] = &[
     "plugin",
 ];
 
-/// Provider ids are path segments, event sources, and console labels: keep them tame.
-/// `manual` is reserved (it is the no-provider sentinel in `library.changed`).
+/// Path segment / event source / console label. `manual` is reserved (the no-provider sentinel
+/// in `library.changed`).
 pub fn validate_provider_name(provider: &str) -> Result<(), String> {
     if provider == "manual" {
         return Err("provider id `manual` is reserved".into());
@@ -461,10 +377,9 @@ pub fn validate_provider_name(provider: &str) -> Result<(), String> {
     }
 }
 
-/// Store claims become the **prefix of every claimed entry's library id**, so they are far more
-/// constrained than a provider name: no dots (an id is split on the first `:`, and a dotted store
-/// would read as a hostname in logs), and the two host-owned namespaces are off-limits — `custom` is
-/// the unclaimed-entry namespace and `manual` is the no-provider sentinel in `library.changed`.
+/// Prefix of every claimed library id, so tighter than a provider name: no dots (ids split on
+/// the first `:`; a dotted store reads as a hostname in logs). `custom` is the unclaimed
+/// namespace; `manual` is the `library.changed` sentinel.
 pub fn validate_store_claim(store: &str) -> Result<(), String> {
     if store == "custom" || store == "manual" {
         return Err(format!("store id `{store}` is reserved"));
@@ -481,22 +396,9 @@ pub fn validate_store_claim(store: &str) -> Result<(), String> {
     }
 }
 
-/// Drop every `launcher_ui` entry naming a launcher this host cannot actually open, returning the
-/// `(title, value)` pairs removed.
-///
-/// The launch-side counterpart to [`sanitize_art_paths`], and it exists for the same reason: a
-/// plugin reconciles its **whole** entry set at once, so anything that fails the payload costs the
-/// operator every game in it. The Playnite plugin appends one launcher tile beside the games, so a
-/// host that could not resolve `Playnite.FullscreenApp.exe` refused the lot — the operator saw an
-/// empty grid and a `HostRequestError` naming `entries[9]`, with nothing to say the other entries
-/// were fine.
-///
-/// Only the *unresolvable* case is dropped. A value outside the platform's vocabulary is still a
-/// hard 400 in [`validate_provider_payload`]: that one is a bug in the plugin, and silently
-/// swallowing it would leave the author with a tile that never appears and no reason why.
-///
-/// Dropping the whole entry rather than clearing its `launch` is deliberate — a launcher tile with
-/// no launch is a dead tile, which is strictly worse than no tile.
+/// A plugin reconciles its whole set at once, so a 400 on one tile would drop every game.
+/// Vocabulary errors still 400 in [`validate_provider_payload`]. Drop the row, not just
+/// `launch`: a launcher tile with no launch is not shown.
 pub fn sanitize_launcher_entries(inputs: &mut Vec<ProviderEntryInput>) -> Vec<(String, String)> {
     let mut dropped = Vec::new();
     inputs.retain(|e| {
@@ -510,8 +412,8 @@ pub fn sanitize_launcher_entries(inputs: &mut Vec<ProviderEntryInput>) -> Vec<(S
     dropped
 }
 
-/// Validate a reconcile payload: non-empty titles and unique, non-empty external ids (the
-/// diff key — a duplicate would make ownership of the surviving entry ambiguous).
+/// Non-empty titles and unique, non-empty `external_id`s. A duplicate would make ownership of
+/// the surviving row ambiguous.
 pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
     for (i, e) in inputs.iter().enumerate() {
@@ -527,17 +429,15 @@ pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), St
                 e.external_id
             ));
         }
-        // Closed-vocabulary launch kinds are checked on the way IN as well as at launch time, so a
-        // plugin gets a 400 it can act on rather than a tile that silently refuses to start.
+        // Closed-vocabulary kinds are 400 here as well as at launch, so the plugin can act.
         if let Some(launch) = &e.launch {
             if launch.kind == "steam_ui" && !valid_steam_ui(&launch.value) {
                 return Err(format!(
                     "entries[{i}]: `launch.value` for kind `steam_ui` must be `bigpicture` or `desktop`"
                 ));
             }
-            // Only the VOCABULARY is refused here. Whether the launcher is actually installed on
-            // this box is not the payload's fault, and 400ing over it threw away every game in the
-            // reconcile — see `sanitize_launcher_entries`, which drops just the tile instead.
+            // Vocabulary only. "Not installed" is not a payload bug — [`sanitize_launcher_entries`]
+            // drops just that tile instead of 400ing the whole reconcile.
             if launch.kind == "launcher_ui" && !known_launcher_ui(&launch.value) {
                 return Err(format!(
                     "entries[{i}]: `launch.value` for kind `launcher_ui` is not a launcher this \
@@ -545,24 +445,21 @@ pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), St
                     launch.value
                 ));
             }
-            // The value is interpolated into a `playnite://` URI, so it is charset-checked here as
-            // well as at launch time — same reasoning as the two kinds above.
+            // Interpolated into a `playnite://` URI; charset-checked here and at launch.
             if launch.kind == "playnite" && !valid_playnite_id(&launch.value) {
                 return Err(format!(
                     "entries[{i}]: `launch.value` for kind `playnite` must be a Playnite game GUID"
                 ));
             }
-            // `<Identity>!<AppId>`, both straight off `MicrosoftGame.config`. The host completes it
-            // into an AUMID at launch (it can read the publisher hash; the runner cannot), so the
-            // shape is checked here where the author can still act on the error.
+            // `<Identity>!<AppId>` from `MicrosoftGame.config`. The host fills the publisher hash
+            // at launch (the runner cannot), so the shape is checked here.
             if launch.kind == "xbox" && !valid_aumid(&launch.value) {
                 return Err(format!(
                     "entries[{i}]: `launch.value` for kind `xbox` must be `<Identity>!<AppId>`"
                 ));
             }
-            // `plugin`: the value is an opaque key in the OWNING plugin's own namespace, handed back
-            // to it at launch time (see `library::ask_plugin_launch`). The host never parses it, so
-            // the only checks are the ones that keep it loggable and bounded.
+            // Opaque key in the owning plugin's namespace, handed back at launch
+            // ([`crate::library::ask_plugin_launch`]). Host never parses it; keep it loggable.
             if launch.kind == "plugin" && !valid_plugin_entry_key(&launch.value) {
                 return Err(format!(
                     "entries[{i}]: `launch.value` for kind `plugin` must be 1–512 chars with no \
@@ -590,29 +487,26 @@ pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), St
     Ok(())
 }
 
-/// The pure reconcile (unit-tested without the filesystem): replace `provider`'s entry set
-/// with `inputs` inside `entries` — keeping each surviving title's host id stable (keyed on
-/// `external_id`), dropping the provider's orphans, and never touching manual entries or
-/// other providers'. Returns the provider's resulting entries, payload order.
+/// Replace `provider`'s rows with `inputs`. Surviving titles keep their host id (keyed on
+/// `external_id`); orphans drop; manual rows and other providers are untouched. Returns the
+/// provider's resulting rows, payload order. Pure — no filesystem.
 fn reconcile_entries(
     entries: &mut Vec<CustomEntry>,
     provider: &str,
     store: Option<&str>,
     inputs: Vec<ProviderEntryInput>,
 ) -> Vec<CustomEntry> {
-    // The provider's current entries, keyed by its own stable id.
     let mut existing: std::collections::HashMap<String, CustomEntry> = entries
         .iter()
         .filter(|e| e.provider.as_deref() == Some(provider))
         .filter_map(|e| e.external_id.clone().map(|x| (x, e.clone())))
         .collect();
-    // Everything the provider does NOT own survives untouched.
     entries.retain(|e| e.provider.as_deref() != Some(provider));
     let mut result = Vec::with_capacity(inputs.len());
     for input in inputs {
         let id = existing
             .remove(&input.external_id)
-            .map(|prev| prev.id) // same title as last sync → keep its host id
+            .map(|prev| prev.id) // keep the host id from last sync
             .unwrap_or_else(|| new_id(&format!("{provider}:{}", input.external_id)));
         result.push(CustomEntry {
             id,
@@ -622,8 +516,6 @@ fn reconcile_entries(
             prep: input.prep,
             provider: Some(provider.to_string()),
             external_id: Some(input.external_id),
-            // Stamping the claim per entry is what makes the surfaced id deterministic
-            // (`<store>:<external_id>`) — see `library_id_for`.
             store: store.map(str::to_string),
             role: input.role,
             icon: input.icon,
@@ -631,18 +523,15 @@ fn reconcile_entries(
             meta: input.meta,
         });
     }
-    // `existing`'s leftovers are the orphans — deliberately dropped (declarative reconcile).
+    // Leftovers in `existing` are orphans — dropped.
     entries.extend(result.iter().cloned());
     result
 }
 
-/// Atomically replace `provider`'s entry set (RFC §8: `PUT /library/provider/{provider}`), optionally
-/// under a **store claim** (D2: `?store=steam`). The caller validates the name and payload first.
-/// Emits `library.changed` with the provider as the source.
-///
-/// Claiming is idempotent for the holder and refused for anyone else. A provider holds at most one
-/// store, so claiming a new one releases whatever it held before — otherwise an abandoned claim would
-/// go on holding a store id that no plugin is filling any more, locking out the next claimant.
+/// Replace `provider`'s rows (`PUT /library/provider/{provider}`), optionally under a store
+/// claim (`?store=steam`). Caller validates name and payload. Emits `library.changed`.
+/// Claiming is idempotent for the holder and 409 for anyone else. A provider holds at most
+/// one store: claiming a new one releases the old.
 pub fn reconcile_provider(
     provider: &str,
     store: Option<&str>,
@@ -682,12 +571,9 @@ pub fn reconcile_provider(
     Ok(MutateOutcome::Done(result))
 }
 
-/// Remove every entry of `provider` **and release its store claim** (RFC §8:
-/// `DELETE /library/provider/{provider}` — the clean-uninstall path). Returns how many entries were
-/// removed; no event when nothing changed at all.
-///
-/// Releasing here — and only here — is what makes uninstalling a library plugin bring its built-in
-/// scanner straight back, with no restart and nothing to undo by hand.
+/// Releases the store claim as well (`DELETE /library/provider/{provider}`). No event when
+/// nothing changed. This is the only release path, so uninstalling a library plugin restores
+/// the built-in scanner without a restart.
 pub fn delete_provider(provider: &str) -> Result<usize> {
     let mut catalog = load_catalog();
     let before = catalog.entries.len();
@@ -708,27 +594,21 @@ pub fn delete_provider(provider: &str) -> Result<usize> {
     Ok(removed)
 }
 
-/// The prep/undo steps for a library id — any **stored** entry (the in-host scanners have no
-/// per-title config surface; a GameStream `apps.json` entry carries its own `prep` instead).
-///
-/// Resolved through [`entry_for_library_id`] rather than by stripping a `custom:` prefix, so a
-/// claimed entry's prep still runs: after extraction a `steam:440` entry is a stored one, and
-/// per-title prep is exactly the kind of thing an operator sets on a game they play.
+/// Prep/undo for a stored library id. In-host scanners have no per-title config; GameStream
+/// `apps.json` carries its own `prep`. Goes through [`entry_for_library_id`], not a `custom:`
+/// prefix strip, so a claimed `steam:440` still runs operator prep.
 pub fn prep_for(library_id: &str) -> Vec<crate::hooks::PrepCmd> {
     entry_for_library_id(library_id)
         .map(|e| e.prep)
         .unwrap_or_default()
 }
 
-/// Every library mutation announces itself (RFC §4): `source` is `"manual"` for the operator
-/// CRUD, the provider id for a reconcile/uninstall — hooks and the SDK filter on it.
+/// `source` is `"manual"` for operator CRUD, else the provider id. Hooks and the SDK filter on it.
 fn emit_changed(source: &str) {
     crate::events::emit(crate::events::EventKind::LibraryChanged {
         source: source.to_string(),
     });
 }
-
-// `valid_steam_appid` moved to `launch.rs` (WP1.1) — it validates a launch value, not a store entry.
 
 #[cfg(test)]
 mod tests {
@@ -781,9 +661,6 @@ mod tests {
         assert_eq!(g.meta.platform.as_deref(), Some("PS2"));
     }
 
-    /// D2's core promise, and the reason removing the built-in scanners was invisible downstream: a
-    /// **claimed** entry is indistinguishable from what the scanner produced. Same id, same store
-    /// badge — plus the provider attribution the scanner never had.
     #[test]
     fn a_claimed_entry_reproduces_the_scanner_identity() {
         let mut e = manual("host-assigned", "Portal 2");
@@ -800,15 +677,12 @@ mod tests {
             "attribution rides along too"
         );
 
-        // Unclaimed provider entries are untouched by any of this — rom-manager/playnite keep the
-        // opaque host id they have always had.
         let mut u = manual("abc", "Chrono Trigger");
         u.provider = Some("romm".into());
         u.external_id = Some("rom-1".into());
         assert_eq!(library_id_for(&u), "custom:abc");
         assert_eq!(GameEntry::from(u).store, "custom");
 
-        // The source a toggle addresses: the claimed store when there is one, else the provider.
         assert_eq!(source_id_for(&e), Some("steam"));
         let mut r = manual("z", "T");
         r.provider = Some("romm".into());
@@ -820,9 +694,6 @@ mod tests {
         );
     }
 
-    /// A claimed entry keeps its `<store>:<external_id>` id across reconciles no matter what the
-    /// host-assigned id does — which is what keeps GameStream's FNV-1a app ids, client art caches
-    /// and Moonlight pins valid through the migration (the whole point of D2).
     #[test]
     fn claimed_ids_are_deterministic_across_reconciles() {
         let mut entries = Vec::new();
@@ -835,8 +706,7 @@ mod tests {
         let ids: Vec<String> = r1.iter().map(library_id_for).collect();
         assert_eq!(ids, ["steam:440", "steam:620"]);
 
-        // Re-sync with a renamed title and a new entry: the surfaced ids for surviving titles are
-        // byte-identical, and a brand-new title's id is derived, not random.
+        // Survivors keep byte-identical surfaced ids; a new title is derived.
         let r2 = reconcile_entries(
             &mut entries,
             "steam",
@@ -849,19 +719,13 @@ mod tests {
         let ids2: Vec<String> = r2.iter().map(library_id_for).collect();
         assert_eq!(ids2, ["steam:440", "steam:70"]);
 
-        // Dropping the claim on a later reconcile reverts them to opaque custom ids — the entries
-        // are the same rows, so this is exactly the "plugin stopped claiming" degradation.
+        // Dropping the claim reverts to opaque `custom:` ids.
         let r3 = reconcile_entries(&mut entries, "steam", None, vec![input("440", "TF2")]);
         assert!(library_id_for(&r3[0]).starts_with("custom:"));
     }
 
-    /// A plugin's `launchers(cfg)` tile, end to end: `role: "launcher"` survives the reconcile onto
-    /// the stored entry AND onto the `GameEntry` a client renders, keeps the deterministic claimed
-    /// id, and stays out of the wire for ordinary games.
-    ///
-    /// This is the path the lutris and heroic plugins publish through, and nothing exercised it
-    /// before — every earlier test reconciled `GameRole::Game`, which is the serde default, so the
-    /// field could have been dropped anywhere between the payload and the client without a failure.
+    /// `role: "launcher"` must survive payload → stored row → `GameEntry` → wire, and stay off
+    /// ordinary games. Serde default is `Game`, so a dropped field would not fail other tests.
     #[test]
     fn a_launcher_entry_survives_reconcile_onto_the_wire() {
         let mut launcher = input("launcher", "Lutris");
@@ -883,7 +747,6 @@ mod tests {
         assert_eq!(out[0].role, GameRole::Launcher);
         assert_eq!(out[1].role, GameRole::Game, "the game is untouched");
 
-        // Onto the wire: the client sees `role`, and `is_game` keeps it off ordinary entries.
         let tile: GameEntry = out[0].clone().into();
         assert_eq!(tile.role, GameRole::Launcher);
         let v = serde_json::to_value(&tile).unwrap();
@@ -896,10 +759,7 @@ mod tests {
         );
     }
 
-    /// The `icon` token takes the same route as `role`: payload → stored entry → the `GameEntry` a
-    /// client renders → the wire. Same reasoning as the test above — the field is skipped when
-    /// absent, so it could be dropped anywhere along that path and every existing test would still
-    /// pass, while every launcher tile silently lost its mark.
+    /// The field is skipped when absent, so a drop would not fail other tests.
     #[test]
     fn an_icon_token_survives_reconcile_onto_the_wire() {
         let mut launcher = input("launcher", "Lutris");
@@ -931,10 +791,8 @@ mod tests {
         );
     }
 
-    /// A second reconcile that drops the token must clear it, not leave the old one behind. The
-    /// reconcile is declarative — `slot.icon = input.icon` — and this is the test that would fail if
-    /// someone ever made it an `Option`-merging update, which for `art` would be a defensible choice
-    /// and here would strand a mark on a tile whose plugin removed it.
+    /// A later reconcile that omits the token must clear it. Merging `Option` would strand
+    /// a mark the plugin removed.
     #[test]
     fn dropping_the_icon_on_a_later_reconcile_clears_it() {
         let mut first = input("launcher", "Lutris");
@@ -950,9 +808,6 @@ mod tests {
         assert_eq!(out[0].icon, None);
     }
 
-    /// The metadata contract on the wire and on disk: fields serialize FLAT (no `meta` nesting —
-    /// clients and plugins see `platform` beside `title`), absent fields vanish entirely, and a
-    /// pre-metadata `library.json` / payload still parses (all-optional).
     #[test]
     fn meta_is_flat_and_optional_on_the_wire() {
         let mut e = manual("abc123", "Shadow of the Colossus");
@@ -970,12 +825,10 @@ mod tests {
         assert!(v.get("description").is_none(), "absent fields are omitted");
         assert!(v.get("tags").is_none(), "empty lists are omitted");
 
-        // A pre-metadata entry (what an existing library.json holds) still deserializes.
         let old = r#"{"id":"abc","title":"Old"}"#;
         let e: CustomEntry = serde_json::from_str(old).unwrap();
         assert!(e.meta.platform.is_none());
 
-        // And a provider payload can carry the fields flat, next to `title` (RFC §8 shape).
         let payload = r#"{"external_id":"rom-1","title":"OoT","platform":"N64",
                           "region":"NTSC-U","players":1,"tags":["kids"]}"#;
         let p: ProviderEntryInput = serde_json::from_str(payload).unwrap();
@@ -983,18 +836,14 @@ mod tests {
         assert_eq!(p.meta.players, Some(1));
     }
 
-    /// The RFC §8 contract in one walk: add keeps ids stable across re-syncs, updates flow,
-    /// orphans drop, and neither manual entries nor other providers are ever touched.
     #[test]
     fn reconcile_is_declarative_with_stable_ids() {
         let mut entries = vec![manual("man1", "Hand-added")];
-        // Another provider's entry must survive every romm reconcile.
         let mut other = manual("oth1", "Other title");
         other.provider = Some("itch".into());
         other.external_id = Some("x1".into());
         entries.push(other);
 
-        // First sync: two titles appear.
         let r1 = reconcile_entries(
             &mut entries,
             "romm",
@@ -1006,7 +855,7 @@ mod tests {
         let id_a = r1[0].id.clone();
         assert_eq!(entries.len(), 4);
 
-        // Second sync: A renamed, B gone, C new — A's host id must be STABLE.
+        // A's host id stays put across rename, drop, and add.
         let r2 = reconcile_entries(
             &mut entries,
             "romm",
@@ -1024,7 +873,6 @@ mod tests {
             "orphan dropped"
         );
 
-        // Idempotence: an identical re-PUT changes nothing.
         let snapshot: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
         let r3 = reconcile_entries(
             &mut entries,
@@ -1041,7 +889,6 @@ mod tests {
             snapshot
         );
 
-        // The bystanders never moved.
         assert!(entries
             .iter()
             .any(|e| e.id == "man1" && e.provider.is_none()));
@@ -1049,7 +896,7 @@ mod tests {
             .iter()
             .any(|e| e.id == "oth1" && e.provider.as_deref() == Some("itch")));
 
-        // Empty payload = remove everything the provider owns (same as DELETE).
+        // Empty payload = drop everything this provider owns (same as DELETE).
         let r4 = reconcile_entries(&mut entries, "romm", None, Vec::new());
         assert!(r4.is_empty());
         assert_eq!(
@@ -1059,12 +906,9 @@ mod tests {
         );
     }
 
-    /// `library.json` v1 (a bare array) must keep loading, and v2 (the claims object) must round
-    /// trip. This is the only migration in the whole program — get it wrong and an existing host
-    /// silently loses its manual entries on upgrade.
+    /// v1 (bare array) must still load; v2 must round-trip. Wrong migration silently drops manual rows.
     #[test]
     fn v1_and_v2_library_files_both_load() {
-        // v1: exactly what a shipped host has on disk today.
         let v1 = r#"[{"id":"abc","title":"Old Manual"}]"#;
         let c = match serde_json::from_str::<LibraryFile>(v1).unwrap() {
             LibraryFile::Legacy(entries) => Catalog {
@@ -1077,7 +921,6 @@ mod tests {
         assert_eq!(c.entries[0].title, "Old Manual");
         assert!(c.claims.is_empty());
 
-        // v2, including a claim.
         let v2 = r#"{"entries":[{"id":"abc","title":"New"}],"claims":{"steam":"steam"}}"#;
         let c = match serde_json::from_str::<LibraryFile>(v2).unwrap() {
             LibraryFile::V2(c) => c,
@@ -1086,15 +929,14 @@ mod tests {
         assert_eq!(c.entries.len(), 1);
         assert_eq!(c.claims.get("steam").map(String::as_str), Some("steam"));
 
-        // A v2 file with no claims key at all (what the first write after upgrade produces before
-        // anything is claimed) still loads.
+        // v2 with no `claims` key still loads.
         let bare = r#"{"entries":[]}"#;
         assert!(matches!(
             serde_json::from_str::<LibraryFile>(bare).unwrap(),
             LibraryFile::V2(_)
         ));
 
-        // And what we WRITE is v2, so one mutation upgrades the file in place.
+        // Writes are v2, so one mutation upgrades the file in place.
         let written = serde_json::to_string(&Catalog::default()).unwrap();
         assert!(written.contains("\"entries\""));
         assert!(written.contains("\"claims\""));
@@ -1105,18 +947,15 @@ mod tests {
         assert!(validate_store_claim("steam").is_ok());
         assert!(validate_store_claim("epic-games").is_ok());
         assert!(validate_store_claim("xbox_pc").is_ok());
-        // The two host-owned namespaces are off-limits.
         assert!(validate_store_claim("custom").is_err());
         assert!(validate_store_claim("manual").is_err());
         assert!(validate_store_claim("").is_err());
-        assert!(validate_store_claim("Steam").is_err()); // no uppercase
-                                                         // A dot would read as a hostname in a log line and muddies the `store:id` split.
+        assert!(validate_store_claim("Steam").is_err());
+        // A dot would read as a hostname in logs and muddies the `store:id` split.
         assert!(validate_store_claim("my.store").is_err());
         assert!(validate_store_claim(&"s".repeat(33)).is_err());
     }
 
-    /// The closed-vocabulary fields are rejected at the door, so a plugin gets a 400 rather than a
-    /// tile that silently refuses to launch.
     #[test]
     fn payload_validation_covers_the_new_closed_vocabularies() {
         let with_launch = |kind: &str, value: &str| {
@@ -1131,11 +970,10 @@ mod tests {
         assert!(validate_provider_payload(&[with_launch("steam_ui", "desktop")]).is_ok());
         assert!(validate_provider_payload(&[with_launch("steam_ui", "gamepad")]).is_err());
         assert!(validate_provider_payload(&[with_launch("steam_ui", "")]).is_err());
-        // Other kinds are unconstrained here (the host validates them per-kind at launch).
+        // Other kinds are unconstrained here (validated per-kind at launch).
         assert!(validate_provider_payload(&[with_launch("command", "anything")]).is_ok());
 
-        // `launcher_ui` is checked for VOCABULARY only. A launcher that is merely not installed
-        // must pass here and be dropped later — see `an_unopenable_launcher_tile_costs_only_itself`.
+        // `launcher_ui`: unknown names 400 here. Not-installed is dropped later, not 400.
         assert!(validate_provider_payload(&[with_launch("launcher_ui", "nonesuch")]).is_err());
         #[cfg(windows)]
         assert!(validate_provider_payload(&[with_launch("launcher_ui", "playnite")]).is_ok());
@@ -1159,9 +997,6 @@ mod tests {
         );
     }
 
-    /// The field-authority rule behind the 2026-08-05 review's H-1: the fields the host later hands
-    /// to a shell are operator-only. Every host-resolved launch kind stays open, so a provider
-    /// plugin can publish its whole catalogue.
     #[test]
     fn privileged_field_is_command_execution_only() {
         let cmd = LaunchSpec {
@@ -1180,19 +1015,12 @@ mod tests {
         assert_eq!(privileged_field(Some(&cmd), &[]), Some("launch.kind"));
         assert_eq!(privileged_field(None, &prep), Some("prep"));
         assert_eq!(privileged_field(Some(&steam), &prep), Some("prep"));
-        // The ordinary provider catalogue: nothing privileged, so no lane is refused.
         assert_eq!(privileged_field(Some(&steam), &[]), None);
         assert_eq!(privileged_field(None, &[]), None);
     }
 
-    /// The gate is an ALLOWLIST, and this is the test that keeps it one: a launch kind nobody listed
-    /// is operator-privileged, so a kind added to `launch.rs` and forgotten in
-    /// `UNPRIVILEGED_LAUNCH_KINDS` fails closed instead of shipping as an open primitive. `gog` was
-    /// exactly that miss — an exe plus arguments that the two-entry blocklist never named (security
-    /// review 2026-08-25).
-    ///
-    /// The listed set is pinned as well as the rule, so WIDENING it is a deliberate edit to this
-    /// test rather than a line that slips through in someone's diff.
+    /// Unlisted kinds are operator-privileged. The listed set is pinned so widening it is an
+    /// edit to this test.
     #[test]
     fn an_unlisted_launch_kind_is_operator_privileged() {
         let kind = |k: &str| {
@@ -1222,10 +1050,9 @@ mod tests {
         for k in UNPRIVILEGED_LAUNCH_KINDS {
             assert_eq!(kind(k), None, "`{k}` is on the allowlist");
         }
-        // A kind this host has never heard of — a newer host's vocabulary, or a plugin's invention.
         assert_eq!(kind("brand_new_store"), Some("launch.kind"));
         assert_eq!(kind(""), Some("launch.kind"));
-        // Casing is not a way in: the launch resolvers match the exact string.
+        // Resolvers match the exact string; `GOG` is not `gog`.
         assert_eq!(kind("GOG"), Some("launch.kind"));
     }
 
@@ -1248,12 +1075,6 @@ mod tests {
         );
     }
 
-    /// The regression `sanitize_launcher_entries` exists for: a launcher tile this host cannot open
-    /// must cost that tile, not the games reconciled beside it.
-    ///
-    /// Field shape — the Playnite plugin appends exactly one `launcher_ui` tile after its games, so
-    /// `entries[N]` failing validation used to refuse the entire payload and leave the operator with
-    /// an empty grid and a `HostRequestError` that named only the index.
     #[test]
     fn an_unopenable_launcher_tile_costs_only_itself() {
         let mut tile = input("launcher", "Playnite");
@@ -1267,18 +1088,16 @@ mod tests {
         let dropped = sanitize_launcher_entries(&mut inputs);
 
         if resolvable_launcher_ui("playnite") {
-            // A Windows box with Playnite actually installed keeps all three.
+            // Playnite is installed: keep all three.
             assert!(dropped.is_empty());
             assert_eq!(inputs.len(), 3);
         } else {
-            // Everywhere else the tile goes and both games survive — the whole point of the split.
             assert_eq!(dropped.len(), 1);
             assert_eq!(dropped[0].1, "playnite");
             assert_eq!(inputs.len(), 2);
             assert!(inputs.iter().all(|e| e.external_id != "launcher"));
         }
 
-        // A payload of nothing but games is untouched on every OS.
         let mut only_games = vec![input("a", "A"), input("b", "B")];
         assert!(sanitize_launcher_entries(&mut only_games).is_empty());
         assert_eq!(only_games.len(), 2);

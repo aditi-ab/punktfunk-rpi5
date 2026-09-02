@@ -2,45 +2,31 @@
 
 use super::{Host, APP_VERSION, GFE_VERSION, SCM_HEVC, SERVER_CODEC_MODE_SUPPORT};
 
-/// The HEVC luma-pixel ceiling GFE advertises, which Moonlight compares the mode it wants
-/// against. Emitted only when the codec mask actually offers HEVC.
+/// GFE's advertised HEVC luma-pixel ceiling. Moonlight rejects a mode above this.
 const MAX_LUMA_PIXELS_HEVC: u64 = 1_869_449_984;
 
-/// Build the `<root status_code="200">…</root>` serverinfo document. `https` selects the
-/// paired-HTTPS variant (real MAC); `paired` is whether the HTTPS peer presented a client cert
-/// that is in the paired allow-list (drives `PairStatus`). Element names are case-sensitive and
-/// match what moonlight-common-c parses.
+/// Build the `<root status_code="200">…</root>` document. `https` selects the
+/// paired-HTTPS variant (real MAC); `paired` is whether the HTTPS peer's client
+/// cert is on the allow-list (`PairStatus`). Element names are case-sensitive
+/// and match moonlight-common-c.
 ///
-/// `current_game` is the running app id **as this caller may see it** (0 = none): the nvhttp
-/// handler passes the live session's appid only to the session OWNER's pinned cert (GS
-/// competitive program WP3). Moonlight keys real UX on these two fields — `currentgame != 0`
-/// is what makes it show Resume/Quit and route a tap through `/resume` instead of `/launch` —
-/// and both were hard-coded free/0 before, so no stock client ever resumed or quit from its
-/// UI. Owner-only on purpose: a non-owner shown the truth would route same-app taps into the
-/// owner-only `/resume`/`/cancel` and break the reject/join/steal admission it gets via
-/// `/launch` today (and a busy signal over plain HTTP would leak what's running to the LAN).
+/// `current_game` is the running app id **as this caller may see it** (0 = none).
+/// Moonlight keys Resume/Quit on `currentgame != 0` and `_SERVER_BUSY` together;
+/// a non-owner shown the live id would hit owner-only `/resume`/`/cancel`.
 pub fn serverinfo_xml(host: &Host, https: bool, paired: bool, current_game: u32) -> String {
-    // MAC is hidden over plain HTTP (no per-client identity there). Over HTTPS it is the REAL
-    // routed-NIC MAC (WP6.1): Moonlight persists this field for its Wake-on-LAN, so the fake
-    // constant this replaces made every client-side wake a silent no-op against this host.
+    // Plain HTTP has no per-client identity, so the MAC is zeros. HTTPS is the routed-NIC
+    // MAC: Moonlight persists it for Wake-on-LAN.
     let real_mac = if https { host_mac() } else { None };
     let mac = real_mac.as_deref().unwrap_or("00:00:00:00:00:00");
-    // PairStatus reflects the real allow-list: 1 only when the HTTPS peer's client-cert
-    // fingerprint is pinned (the nvhttp handler computes `paired`); 0 otherwise (incl. plain HTTP).
     let pair_status = u8::from(paired);
-    // Moonlight matches the `_SERVER_BUSY` suffix, and pairs it with `currentgame` to decide
-    // the Resume/Quit affordance — the two must move together.
     let state = if current_game != 0 {
         "SUNSHINE_SERVER_BUSY"
     } else {
         "SUNSHINE_SERVER_FREE"
     };
     let codec_mode_support = codec_mode_support();
-    // Follow the mask rather than stating this unconditionally: a host whose probe dropped HEVC
-    // (a software-encoder host does H.264 and nothing else) used to advertise capacity for HEVC in
-    // the same document that said it had no HEVC. Harmless while clients gate on the mask, but two
-    // advertisements that contradict each other stay harmless only by luck. `0` is the
-    // unambiguous "no HEVC capacity" answer in the field's own terms.
+    // Follow the mask: `0` is "no HEVC" in this field's terms. The ceiling beside a
+    // mask without HEVC would contradict the same document.
     let max_luma_hevc = if codec_mode_support & SCM_HEVC != 0 {
         MAX_LUMA_PIXELS_HEVC
     } else {
@@ -72,10 +58,8 @@ pub fn serverinfo_xml(host: &Host, https: bool, paired: bool, current_game: u32)
     )
 }
 
-/// The host's primary wake-capable MAC (`crate::wol::wake_macs`, routed NIC first) — cached on
-/// first SUCCESS only, because `/serverinfo` is polled and NIC enumeration per poll is waste,
-/// while a cold-booted host may have no routable address yet (the #366 boot-race lesson: a
-/// latched failure would advertise zeros forever). `None` until a read succeeds.
+/// Routed-NIC wake MAC (`crate::wol::wake_macs`). Cached on first success only:
+/// a latched miss would advertise zeros after a boot with no address yet.
 fn host_mac() -> Option<String> {
     static MAC: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     let mut cached = MAC.lock().unwrap_or_else(|p| p.into_inner());
@@ -89,17 +73,12 @@ fn host_mac() -> Option<String> {
     cached.clone()
 }
 
-/// The `<ServerCodecModeSupport>` mask to advertise: the SDR baseline ([`base_codec_mode_support`])
-/// plus the 10-bit (HDR) bit of each codec the host can actually deliver HDR with ([`apply_hdr`] /
-/// [`crate::gamestream::host_hdr_capable`]). Without a 10-bit bit Moonlight never offers its HDR
-/// toggle; with one, enabling HDR client-side negotiates that profile and the host streams
-/// BT.2020 PQ.
+/// `<ServerCodecModeSupport>`: SDR baseline ([`base_codec_mode_support`]) plus each
+/// codec's 10-bit bit the host can actually deliver ([`apply_hdr`] /
+/// [`crate::gamestream::host_hdr_capable`]). Moonlight offers its HDR toggle only
+/// when a 10-bit bit is set.
 fn codec_mode_support() -> u32 {
     use crate::encode::Codec;
-    // Per codec, exactly like the SDR baseline is: `can_encode_10bit` answers for the backend this
-    // host will actually open (on AMD/Intel, the union of VAAPI's and Vulkan Video's 10-bit
-    // support), so a box that encodes HEVC Main10 but not 10-bit AV1 — or the reverse — advertises
-    // the truth instead of one bit standing in for both.
     let hdr = crate::gamestream::host_hdr_capable();
     apply_hdr(
         base_codec_mode_support(),
@@ -108,13 +87,7 @@ fn codec_mode_support() -> u32 {
     )
 }
 
-/// Layer each codec's 10-bit (HDR) bit onto `base`, gated on the SDR baseline already advertising
-/// that codec — pure so the HDR-layering is unit-testable without a GPU.
-///
-/// AV1 Main10 used to be omitted unconditionally, on the theory that the GameStream AV1 path was
-/// unconfirmed. But the baseline already offers AV1 **Main8** to every client, so the AV1 path is
-/// either live or it is not — the depth was never the uncertain part. Now that the encoders probe
-/// 10-bit per codec, withholding the bit only cost AV1-preferring clients their HDR.
+/// Pure so tests can pin HDR layering without a GPU.
 fn apply_hdr(base: u32, hevc_10bit: bool, av1_10bit: bool) -> u32 {
     let mut m = base;
     if hevc_10bit && base & super::SCM_HEVC != 0 {
@@ -126,21 +99,12 @@ fn apply_hdr(base: u32, hevc_10bit: bool, av1_10bit: bool) -> u32 {
     m
 }
 
-/// The **SDR baseline** mask. On the VAAPI (AMD/Intel) backend it reflects what the GPU can ACTUALLY
-/// encode (probed — AV1 is narrow, and an old iGPU might lack HEVC), so a Moonlight client never
-/// negotiates a codec the encoder can't open. NVENC and the GPU-less software path keep the
-/// Moonlight-validated static superset. HDR (Main10) is layered on by [`codec_mode_support`].
+/// SDR baseline. Probe when the backend can, so Moonlight never negotiates a
+/// codec the encoder cannot open; fail open to [`SERVER_CODEC_MODE_SUPPORT`].
+/// HDR bits are layered by [`codec_mode_support`].
 fn base_codec_mode_support() -> u32 {
-    // A GPU-less host encodes H.264 and nothing else (openh264), so advertising the superset made
-    // Moonlight negotiate HEVC/AV1 and the session then died at encoder open with "the software
-    // encoder emits H.264 only". `pf_encode::Codec::host_wire_caps` — the native plane's twin of
-    // this function — has gated on exactly this since it was written; this one never did.
-    //
-    // Deliberately a local gate rather than delegating wholesale to `host_wire_caps()`: that would
-    // be the drift-proof shape, but on Windows it re-runs the DXGI adapter enumeration several
-    // times per `/serverinfo` GET (the probe helpers each sample it), and this endpoint is polled.
-    // The software case is a plain config read, so it costs nothing here. (`MaxLumaPixelsHEVC`
-    // in the XML above now follows this mask, so the two can no longer disagree.)
+    // Software encodes H.264 only. A local config read, not `host_wire_caps()`:
+    // that re-runs DXGI enumeration per `/serverinfo` poll.
     if matches!(
         pf_host_config::config().encoder_pref.as_str(),
         "software" | "sw" | "openh264"
@@ -153,20 +117,16 @@ fn base_codec_mode_support() -> u32 {
             return m;
         }
     }
-    // Linux NVIDIA: the driver's own encode-GUID list (`nvenc_codec_support`, one throwaway
-    // direct-SDK session, cached) — the same probe `host_wire_caps` consults, so both planes
-    // stop advertising HEVC/AV1 on a chip without them (the GM107 dead-session field bug).
-    // Fail-open like every arm here: an unanswerable probe → `probed_mask` = None → superset.
+    // Same GUID probe `host_wire_caps` uses (one cached throwaway session). Fail-open:
+    // `probed_mask` is None → the static superset below.
     #[cfg(all(target_os = "linux", feature = "nvenc"))]
     if !crate::encode::linux_zero_copy_is_vaapi() {
         if let Some(m) = probed_mask(crate::encode::nvenc_codec_support()) {
             return m;
         }
     }
-    // Windows: advertise only what the GPU actually encodes (AV1 is narrow, an old iGPU might
-    // lack HEVC, a 1st-gen-Maxwell NVENC is H.264-only). AMF probes natively (no build feature
-    // needed); QSV needs the libavcodec or VPL build, NVENC the `nvenc` build. The GPU-less
-    // software path keeps the static superset.
+    // AMF probes with no extra feature; QSV needs libavcodec or VPL, NVENC the `nvenc`
+    // build. Unprobed → superset, same fail-open as the Linux arms.
     #[cfg(target_os = "windows")]
     if crate::encode::windows_backend_is_probed() {
         if let Some(m) = probed_mask(crate::encode::windows_codec_support()) {
@@ -176,10 +136,9 @@ fn base_codec_mode_support() -> u32 {
     SERVER_CODEC_MODE_SUPPORT
 }
 
-/// Turn a probed [`CodecSupport`](crate::encode::CodecSupport) into a `ServerCodecModeSupport` mask,
-/// or `None` if the probe found nothing — meaning the GPU wasn't usable at probe time (GPU-less CI,
-/// a misconfigured/wrong-vendor host), NOT that it encodes zero codecs; the caller then advertises
-/// the static superset (pre-probe behaviour) rather than claiming nothing.
+/// Map a probe to a `ServerCodecModeSupport` mask. `None` means the GPU was
+/// unusable at probe time, not that it encodes nothing — the caller then
+/// advertises the static superset rather than claiming zero codecs.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn probed_mask(caps: crate::encode::CodecSupport) -> Option<u32> {
     use super::{SCM_AV1_MAIN8, SCM_H264, SCM_HEVC};
@@ -201,9 +160,8 @@ mod tests {
     use super::*;
     use crate::gamestream::{SCM_AV1_MAIN10, SCM_AV1_MAIN8, SCM_H264, SCM_HEVC, SCM_HEVC_MAIN10};
 
-    /// The advertised codec mask: H.264 + HEVC + AV1 Main8 (= 65793), and explicitly *no*
-    /// 10-bit bits — Moonlight gates its HDR mode on those, which we can't deliver (8-bit
-    /// SDR capture). Flag values are moonlight-common-c `Limelight.h`.
+    /// Static SDR superset (moonlight-common-c `Limelight.h`). No 10-bit bits:
+    /// HDR is layered at advertise time, not baked into this constant.
     #[test]
     fn codec_mode_support_mask() {
         assert_eq!(SERVER_CODEC_MODE_SUPPORT, 0x1 | 0x100 | 0x10000);
@@ -219,24 +177,18 @@ mod tests {
         );
     }
 
-    /// The 10-bit bits are layered PER CODEC, and each needs both halves: the host able to encode
-    /// 10-bit for that codec, and the SDR baseline already advertising it. A client gates its HDR
-    /// toggle on these, so an over-claim invites it into a mode the encoder cannot open.
+    /// Each 10-bit bit needs encode capability and the SDR baseline bit. An
+    /// over-claim invites the client into a mode the encoder cannot open.
     #[test]
     fn apply_hdr_adds_each_codecs_10bit_bit_independently() {
         let sdr = SCM_H264 | SCM_HEVC | SCM_AV1_MAIN8;
-        // Both codecs 10-bit-capable → both bits.
         assert_eq!(
             apply_hdr(sdr, true, true),
             sdr | SCM_HEVC_MAIN10 | SCM_AV1_MAIN10
         );
-        // Neither → baseline unchanged (no HDR claim).
         assert_eq!(apply_hdr(sdr, false, false), sdr);
-        // One without the other — the case a single shared flag used to get wrong in both
-        // directions (AV1 Main10 was never advertised at all, and HEVC Main10 stood in for it).
         assert_eq!(apply_hdr(sdr, true, false), sdr | SCM_HEVC_MAIN10);
         assert_eq!(apply_hdr(sdr, false, true), sdr | SCM_AV1_MAIN10);
-        // 10-bit-capable but the codec isn't in the SDR baseline at all → no bit for it.
         assert_eq!(apply_hdr(SCM_H264, true, true), SCM_H264);
         assert_eq!(
             apply_hdr(SCM_H264 | SCM_HEVC, true, true),
@@ -255,9 +207,7 @@ mod tests {
             os_name: "Linux".into(),
         };
         let xml = serverinfo_xml(&host, false, false, 0);
-        // The mask is the GPU-aware value (NVENC/no-GPU → the static 65793; a VAAPI host →
-        // whatever it probes). Assert the XML embeds exactly what `codec_mode_support()` returns,
-        // so the test is deterministic regardless of the build host's GPU.
+        // Pin the XML to `codec_mode_support()`, not a literal: the mask is GPU-probed.
         let mask = codec_mode_support();
         assert!(mask != 0, "must advertise at least one codec");
         assert!(xml.contains(&format!(
@@ -265,9 +215,8 @@ mod tests {
         )));
     }
 
-    /// WP6.1: plain HTTP never reveals a MAC; HTTPS carries the real routed-NIC MAC (or the
-    /// zeros fallback when none is readable — this CI host may have neither), and NEVER the
-    /// old fake `01:02:03:04:05:06` that made every Moonlight Wake-on-LAN a silent no-op.
+    /// Plain HTTP always zeros. HTTPS is the routed-NIC MAC or zeros, never
+    /// `01:02:03:04:05:06` — Moonlight persists `<mac>` for Wake-on-LAN.
     #[test]
     fn mac_is_real_or_hidden_never_fake() {
         let host = Host {
@@ -285,9 +234,7 @@ mod tests {
         assert!(https.contains("<mac>"), "a mac element is always present");
     }
 
-    /// WP3: `currentgame` + `state` move together — a caller shown a running app id gets
-    /// `_SERVER_BUSY` (what Moonlight's Resume/Quit affordance keys on), everyone else keeps
-    /// the free/0 pair the plane always sent.
+    /// Moonlight keys Resume/Quit on `currentgame` and `_SERVER_BUSY` moving together.
     #[test]
     fn serverinfo_busy_state_tracks_current_game() {
         let host = Host {

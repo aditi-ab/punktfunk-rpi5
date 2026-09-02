@@ -1,38 +1,27 @@
-//! D3D11 shared-texture → Vulkan import (Windows): the presenter half of the D3D11VA
-//! decode path (`pf_client_core::video_d3d11`). Each decoded frame arrives as the NT
-//! handle of a shareable single-plane RGB texture — **BGRA8** sRGB normally, **RGB10A2**
-//! PQ for the HDR pass-through flavor (the decoder's VideoProcessor already did
-//! YUV→RGB); we import it as a single-plane VkImage (`VK_KHR_external_memory_win32`,
-//! dedicated allocation) and the presenter blits it straight into its video image — no
-//! CSC pass. Single-plane RGBA is deliberate: importing the earlier multiplanar NV12
-//! hand-off device-lost on NVIDIA however it was consumed (sampling or DMA copy, both
-//! validation-clean — bisected 2026-07-09), while RGBA D3D11↔Vulkan interop is the path
-//! Chromium/ANGLE exercise on every Windows driver.
+//! D3D11 shared-texture → Vulkan import (Windows): presenter half of
+//! D3D11VA (`pf_client_core::video_d3d11`). Each frame is the NT handle of
+//! a shareable single-plane RGB texture — BGRA8 sRGB, or RGB10A2 PQ
+//! (the video processor already did YUV→RGB). Imported as one `VkImage`
+//! (`VK_KHR_external_memory_win32`, dedicated allocation) and blitted into
+//! the video image; no CSC.
 //!
-//! Synchronization is the texture's DXGI **keyed mutex** (`VK_KHR_win32_keyed_mutex`),
-//! key 0 on both sides: the submit chains an acquire(0)/release(0) pair, so the GPU
-//! waits for the decoder's conversion to complete before reading and the decoder's next
-//! `AcquireSync(0)` on that ring slot blocks until our reads are done. Import is
-//! per-frame (same discipline as the dmabuf path — parked in `Retired` until the fence
-//! proves the GPU past it); NT-handle ownership stays with the decoder ring, the import
-//! only references the payload.
+//! Both sides acquire/release the DXGI keyed mutex (`VK_KHR_win32_keyed_mutex`)
+//! on key 0. Import is per-frame (parked in `Retired` until the fence);
+//! the decoder ring still owns the NT handle. A driver reject is a clean
+//! error; the caller demotes.
 
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
 use pf_client_core::video::{ColorDesc, D3d11Frame};
 
-/// The two device extensions this path needs; queried at device creation. Broadly present
-/// on every Windows driver (NVIDIA/AMD/Intel) — a device without them just reports
-/// `supports_d3d11() == false` and the decoder chain skips D3D11VA.
+/// Required at device creation. Missing either, `supports_d3d11()` is false.
 pub const DEVICE_EXTENSIONS: [&std::ffi::CStr; 2] = [
     ash::khr::external_memory_win32::NAME,
     ash::khr::win32_keyed_mutex::NAME,
 ];
 
-/// Can this device import a D3D11 texture of `format` as a blit source? The spec-required
-/// capability probe for the exact image the import path creates — creating an external
-/// image the driver doesn't support is undefined behavior (observed as
-/// `VK_ERROR_DEVICE_LOST` at the first submits with the old NV12 hand-off).
+/// Spec-required probe for the image `import` creates. An unsupported
+/// external image is undefined.
 fn format_importable(
     instance: &ash::Instance,
     pdev: vk::PhysicalDevice,
@@ -48,8 +37,7 @@ fn format_importable(
         .push_next(&mut ext_info);
     let mut ext_props = vk::ExternalImageFormatProperties::default();
     let mut props = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
-    // SAFETY: per the Vulkan contract in lib.rs - a read-only query on the live instance/device,
-    // filling locals returned by value.
+    // SAFETY: `instance` is live; `fmt_info` and `props` are locals that outlive the call.
     unsafe { instance.get_physical_device_image_format_properties2(pdev, &fmt_info, &mut props) }
         .is_ok()
         && ext_props
@@ -58,9 +46,8 @@ fn format_importable(
             .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
 }
 
-/// The two hand-off flavors' import support: `.0` = BGRA8 (the SDR ring — gates the whole
-/// D3D11VA path), `.1` = RGB10A2 (the HDR PQ ring — gates only the pass-through flavor;
-/// without it a PQ stream keeps the decoder-side tonemap to BGRA8).
+/// `(bgra8, rgb10)`: BGRA8 gates D3D11VA; RGB10A2 gates only PQ pass-through.
+/// Without RGB10, a PQ stream tone-maps to BGRA8 on the decoder.
 pub fn import_supported(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> (bool, bool) {
     let bgra8 = format_importable(instance, pdev, vk::Format::B8G8R8A8_UNORM);
     let rgb10 = format_importable(instance, pdev, vk::Format::A2B10G10R10_UNORM_PACK32);
@@ -68,10 +55,8 @@ pub fn import_supported(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> (
     (bgra8, rgb10)
 }
 
-/// One imported frame: the BGRA8 image over the shared texture and its imported
-/// (dedicated) memory — a blit source, nothing more. Parked until the in-flight fence
-/// proves the GPU past the blit, then [`HwFrame::destroy`]ed — the memory is what the
-/// keyed-mutex info on the submit references.
+/// Imported blit source. Park until the in-flight fence signals, then
+/// [`HwFrame::destroy`]. `memory` is what the submit's keyed-mutex info names.
 pub struct HwFrame {
     pub color: ColorDesc,
     pub width: u32,
@@ -81,20 +66,18 @@ pub struct HwFrame {
 }
 
 impl HwFrame {
-    /// The imported image — the acquire barrier + copy source.
     pub fn image(&self) -> vk::Image {
         self.image
     }
 
-    /// The imported memory object — the submit's keyed-mutex acquire/release info needs it.
+    /// The submit's keyed-mutex acquire/release info names this allocation.
     pub fn memory(&self) -> vk::DeviceMemory {
         self.memory
     }
 
     pub fn destroy(self, device: &ash::Device) {
-        // SAFETY: per the Vulkan contract in lib.rs - destroys objects this type owns, on a path
-        // where the GPU is known idle for them; that idleness is the obligation, not the handle
-        // being non-null.
+        // SAFETY: `self` owns `image` and `memory`. Called only after the frame's
+        // fence has signaled, so the GPU is idle on them.
         unsafe {
             device.destroy_image(self.image, None);
             device.free_memory(self.memory, None);
@@ -102,20 +85,17 @@ impl HwFrame {
     }
 }
 
-/// Import one hand-off frame. Fails cleanly (the caller demotes to software after a
-/// streak) on anything the driver rejects: unsupported multiplanar external format,
-/// import refusal, no matching memory type.
+/// Import one hand-off frame. A driver reject is a clean error; the caller demotes.
 pub fn import(
     device: &ash::Device,
     ext_mem_win32: &ash::khr::external_memory_win32::Device,
     frame: &D3d11Frame,
 ) -> Result<HwFrame> {
-    // The demotion test hook — same contract as the dmabuf path's.
+    // Test hook: fault every import so demotion is exercisable without a broken driver.
     if std::env::var_os("PUNKTFUNK_HW_FAULT").is_some_and(|v| v == "import") {
         bail!("injected import failure (PUNKTFUNK_HW_FAULT=import)");
     }
-    // DXGI R10G10B10A2 and Vulkan A2B10G10R10_PACK32 are the same bit layout (R in the
-    // low bits) — the standard interop pairing, same as BGRA8 ↔ B8G8R8A8.
+    // DXGI R10G10B10A2 matches Vulkan A2B10G10R10_PACK32 (R in the low bits).
     let mp_format = if frame.rgb10 {
         vk::Format::A2B10G10R10_UNORM_PACK32
     } else {
@@ -123,13 +103,9 @@ pub fn import(
     };
     let handle_type = vk::ExternalMemoryHandleTypeFlags::D3D11_TEXTURE;
 
-    // One single-plane image over the whole texture, transfer-source only — the blit is
-    // the whole job. Kept maximally "identical" to the D3D11 resource (no view-format
-    // aliasing, no extra usages).
+    // Single-plane, TRANSFER_SRC only: match the D3D11 resource (no view-format aliasing).
     let mut external_info = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
-    // SAFETY: per the Vulkan contract in lib.rs - a create/allocate/import call on the live
-    // device, over builder structs that are locals outliving the call; the handle returned is
-    // owned by the value being built here.
+    // SAFETY: `external_info` is a local that outlives the call; the returned handle is owned here.
     let image = unsafe {
         device.create_image(
             &vk::ImageCreateInfo::default()
@@ -158,32 +134,28 @@ pub fn import(
     })?;
 
     let result = (|| {
-        // The handle's importable memory types, intersected with the image's requirement.
         let handle = frame.handle as vk::HANDLE;
         let mut handle_props = vk::MemoryWin32HandlePropertiesKHR::default();
-        // SAFETY: per the Vulkan contract in lib.rs - a read-only query on the live
-        // instance/device, filling locals returned by value.
+        // SAFETY: `handle` is the decoder ring's live NT handle; `handle_props` is a
+        // local that outlives the call.
         unsafe {
             ext_mem_win32.get_memory_win32_handle_properties(handle_type, handle, &mut handle_props)
         }
         .context("vkGetMemoryWin32HandlePropertiesKHR")?;
-        // SAFETY: per the Vulkan contract in lib.rs - a read-only query on the live
-        // instance/device, filling locals returned by value.
+        // SAFETY: `image` was created above and has not been destroyed.
         let reqs = unsafe { device.get_image_memory_requirements(image) };
         let bits = reqs.memory_type_bits & handle_props.memory_type_bits;
         let type_index = (0..32u32)
             .find(|i| bits & (1 << i) != 0)
             .context("no importable memory type for the D3D11 texture")?;
 
-        // Import does NOT take handle ownership (NT handle rule): the decoder ring keeps
-        // closing its own handle; this allocation references the payload independently.
+        // Import does not take NT-handle ownership; the decoder ring still closes it.
         let mut import_info = vk::ImportMemoryWin32HandleInfoKHR::default()
             .handle_type(handle_type)
             .handle(handle);
         let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
-        // SAFETY: per the Vulkan contract in lib.rs - a create/allocate/import call on the live
-        // device, over builder structs that are locals outliving the call; the handle returned is
-        // owned by the value being built here.
+        // SAFETY: `import_info` and `dedicated` are locals that outlive the call.
+        // `import_info.handle` is the decoder ring's live NT handle, not owned here.
         let memory = unsafe {
             device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
@@ -195,13 +167,9 @@ pub fn import(
             )
         }
         .context("import D3D11 texture memory")?;
-        // SAFETY: per the Vulkan contract in lib.rs - a create/allocate/import call on the live
-        // device, over builder structs that are locals outliving the call; the handle returned is
-        // owned by the value being built here.
+        // SAFETY: `image` and `memory` were created above and are still owned here.
         if let Err(e) = unsafe { device.bind_image_memory(image, memory, 0) } {
-            // SAFETY: per the Vulkan contract in lib.rs - destroys objects this type owns, on a
-            // path where the GPU is known idle for them; that idleness is the obligation, not the
-            // handle being non-null.
+            // SAFETY: `memory` was allocated in this call and never bound, so the GPU is idle on it.
             unsafe { device.free_memory(memory, None) };
             return Err(e).context("bind imported memory");
         }
@@ -210,9 +178,7 @@ pub fn import(
     let memory = match result {
         Ok(m) => m,
         Err(e) => {
-            // SAFETY: per the Vulkan contract in lib.rs - destroys objects this type owns, on a
-            // path where the GPU is known idle for them; that idleness is the obligation, not the
-            // handle being non-null.
+            // SAFETY: `image` was created in this call and never bound, so the GPU is idle on it.
             unsafe { device.destroy_image(image, None) };
             return Err(e);
         }

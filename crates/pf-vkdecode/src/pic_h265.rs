@@ -1,30 +1,18 @@
 //! Per-AU H.265 conversion: one [`AuPlan`] into the `StdVideoDecodeH265*` structs,
-//! slice offsets and DPB slot bindings a `vkCmdDecodeVideoKHR` call is built from —
-//! [`crate::pic`] one codec over (M3's CPU half; the session/recording half is a
-//! later WP).
+//! slice offsets and DPB slot bindings a `vkCmdDecodeVideoKHR` call is built from.
 //!
-//! The codec difference that shapes this module: Vulkan H.265 decode takes NO
-//! per-slice reference lists. The hardware re-derives 8.3.4's lists itself from
-//! the slice bits, keyed by the picture-level RPS index arrays
-//! (`RefPicSetStCurrBefore`/`StCurrAfter`/`LtCurr`) — so the AU-level binding set
-//! here is the union of the plan's three CURRENT reference picture sets
-//! ([`pf_bitstream::h265::RpsPlan`]), not the union of slice lists as in H.264.
-//! The plan's per-slice lists still exist and are used as a cross-check: every
-//! list entry must be a member of the binding set, or the conversion fails closed.
+//! Vulkan H.265 decode takes no per-slice reference lists. Hardware re-derives
+//! 8.3.4 from the slice bits, keyed by `RefPicSetStCurrBefore`/`StCurrAfter`/`LtCurr`
+//! — DPB slot indices, not positions in `pReferenceSlots`. Those two numberings
+//! coincide on a fresh IDR; filling the arrays from `refs` positions is silent
+//! corruption. See [`DecodePlanVkH265::std_pic`].
 //!
-//! Those arrays carry **DPB slot indices**, not positions in the decode op's
-//! reference list — the distinction that
-//! [`DecodePlanVkH265::std_pic`] documents at length, because the two readings
-//! coincide on a freshly anchored stream and diverge a handful of AUs later, which
-//! makes getting it wrong silent corruption rather than an error.
+//! The AU-level binding set is the union of the plan's three current RPS sets
+//! ([`pf_bitstream::h265::RpsPlan`]). Per-slice lists are a closed check: every
+//! entry must be in that set.
 //!
-//! Concealment note: a lost reference is ABSENT from the plan's RPS sets (flagged
-//! upstream via `PlanWarning::MissingReference`), so the Std index arrays compact
-//! past it — later positions shift by one relative to the damaged stream's
-//! intent. That is deliberate: there is no slot to point at, `0xFF` padding keeps
-//! the arrays well-formed, and the session layer has already been told to request
-//! recovery. The alternative (fabricating an entry) is exactly what this crate
-//! never does.
+//! A lost reference is absent from the RPS (`PlanWarning::MissingReference`);
+//! the index arrays compact past it. There is no slot to point at.
 
 use ash::vk::native as hh;
 use pf_bitstream::h265::AuPlan;
@@ -35,17 +23,14 @@ use tracing::trace;
 use crate::slots::SlotError;
 use crate::slots::SlotMap;
 
-/// `STD_VIDEO_DECODE_H265_REF_PIC_SET_LIST_SIZE`: each Std RPS index array holds
-/// eight entries — the hard ceiling on how many CURRENT references one set may
-/// carry through Vulkan (the spec itself allows up to 16 per side; beyond eight
-/// is unexpressible and rejected, see [`PlanToVkH265Error::RpsSetOverflow`]).
+/// `STD_VIDEO_DECODE_H265_REF_PIC_SET_LIST_SIZE`. H.265 allows 16 per side;
+/// Vulkan expresses eight. Beyond that: [`PlanToVkH265Error::RpsSetOverflow`].
 pub const H265_RPS_LIST_SIZE: usize = 8;
 
-/// The Std sentinel for an unused RPS index-array entry.
+/// Std unused-entry sentinel. Real DPB slots are ≤ 17, so never `0xFF`.
 const UNUSED_RPS_ENTRY: u8 = 0xFF;
 
-/// One active reference of the AU: its DPB slot, its Std reference info, and the
-/// planner id it resolves (kept so the backend can map the slot to its image).
+/// One bound reference: DPB slot, Std info, and the planner id the backend keys images by.
 #[derive(Debug, Clone)]
 pub struct VkRefH265 {
     pub slot: u8,
@@ -53,124 +38,93 @@ pub struct VkRefH265 {
     pub id: PicId,
 }
 
-/// Everything CPU-derivable of one AU's decode submission. The GPU half adds the
-/// live objects: bitstream buffer, DPB images, session and command recording.
+/// CPU-derivable half of one AU's decode submission.
 #[derive(Debug, Clone)]
 pub struct DecodePlanVkH265 {
-    /// The picture info. Its `RefPicSetStCurrBefore`/`StCurrAfter`/`LtCurr`
-    /// arrays hold **DPB SLOT INDICES** (`0xFF` = unused) — the same numbers
-    /// `VkVideoReferenceSlotInfoKHR::slotIndex` carries, NOT positions in
+    /// Picture info. `RefPicSetStCurrBefore`/`StCurrAfter`/`LtCurr` hold **DPB
+    /// slot indices** (`0xFF` unused) — the same numbers
+    /// `VkVideoReferenceSlotInfoKHR::slotIndex` carries, not positions in
     /// [`Self::refs`] / `pDecodeInfo->pReferenceSlots`.
     ///
-    /// This is the one place the two readings can be confused, and confusing
-    /// them is silent corruption rather than an error: they COINCIDE for as long
-    /// as the referenced pictures happen to sit in slots `0..refs.len()` in
-    /// `refs` order, which on a fresh IDR they do, so a stream decodes correctly
-    /// for its first few AUs and then quietly references the wrong pictures.
-    /// (On the vendored 25fps H.265 vector that is exactly AUs 0-2 correct and
-    /// AU 3 onwards wrong — its first B picture with two `StCurrAfter` entries
-    /// binds slots 2 and 1 in that order, so `refs` positions 1,2 and slots 2,1
-    /// disagree.)
+    /// The two numberings coincide on a fresh IDR and diverge as soon as a B
+    /// picture binds slots out of `refs` order. Filling the arrays from
+    /// positions is silent corruption.
     ///
-    /// The authority is libavcodec's Vulkan H.265 hwaccel, which every driver is
-    /// validated against: it fills these arrays with the index of the picture in
-    /// its own DPB array and hands that SAME index to `slotIndex`, while packing
-    /// `pReferenceSlots` densely over only the USED entries — so the two arrays
-    /// are provably different numberings there, and the RPS one follows the slot.
-    ///
-    /// The backend must still lay `pReferenceSlots` out in [`Self::refs`] order
-    /// and fail closed on a reference with no bound image — not because the
-    /// indices depend on the order any more, but because a slot these arrays
-    /// name that the decode op never binds is unresolvable for the hardware.
+    /// The backend lays `pReferenceSlots` in [`Self::refs`] order and fails
+    /// closed on a reference with no bound image: a slot these arrays name
+    /// that the decode op never binds is unresolvable.
     pub std_pic: hh::StdVideoDecodeH265PictureInfo,
-    /// Byte offset of each slice segment NALU in the AU as planned, START CODE
-    /// INCLUDED — exactly one entry per slice segment of the AU, in plan order
-    /// (so the recording layer's own rebased array, built by walking the same
-    /// slices, matches this length by construction).
-    /// AU-relative, NOT submission-final: the recording layer must
-    /// pack the SLICE NALUs alone into the bitstream buffer and rebase these
-    /// offsets while doing so — non-VCL NALUs inside the decode range hang VCN
-    /// firmware (the H.264 decoder's slices-only packing exists for exactly
-    /// that `vcn_unified_0` ring timeout; FFmpeg feeds slices-only for the same
-    /// reason). Vulkan's `pSliceSegmentOffsets` then receives the REBASED
-    /// offsets, each pointing at a start code within the packed buffer.
+    /// Byte offset of each slice-segment NALU in the AU as planned, start code
+    /// included. AU-relative, not submission-final: the recording layer packs
+    /// the slice NALUs alone into the bitstream buffer and rebases these
+    /// offsets (non-VCL NALUs inside the decode range hang VCN firmware — see
+    /// the slices-only packing in `decoder.rs`). Vulkan's
+    /// `pSliceSegmentOffsets` then receives the rebased offsets.
     pub slice_offsets: Vec<u32>,
     /// The slot the decoded picture activates (`pSetupReferenceSlot`).
     pub setup_slot: u8,
-    /// Reference info for the setup slot: the picture's own POC, short-term.
-    /// HEVC has no same-AU self-marking (H.264's IDR long_term_reference_flag /
-    /// MMCO 6): C.3.4 marks every stored picture "used for short-term reference",
-    /// and a picture turns long-term only when a LATER picture's RPS lists it in
-    /// `RefPicSetLtCurr` — at which point that AU's [`Self::refs`] entry carries
-    /// the long-term flag.
+    /// Setup-slot reference info: this picture's POC, short-term. HEVC has no
+    /// same-AU self-marking (H.264's IDR `long_term_reference_flag` / MMCO 6);
+    /// C.3.4 stores every picture short-term, and it becomes long-term only when
+    /// a later picture lists it in `RefPicSetLtCurr`.
     pub setup_ref: hh::StdVideoDecodeH265ReferenceInfo,
-    /// The planner id of the decoded picture (`AuPlan.dpb.stored`) — the backend
-    /// keys its image bookkeeping by it.
+    /// Planner id of the decoded picture (`AuPlan.dpb.stored`). The backend keys
+    /// image bookkeeping by it.
     pub setup_id: PicId,
-    /// Whether the decoded picture may be referenced by later pictures (false
-    /// for sub-layer non-reference NALU types, RASL_N/TRAIL_N and friends). When
-    /// `false` the setup slot exists for the decode itself plus any remaining
-    /// DPB residency, and must never be bound as a reference for later AUs.
+    /// Whether later pictures may reference the decoded picture. False for
+    /// sub-layer non-reference NALU types (`RASL_N`/`TRAIL_N` and friends): the
+    /// setup slot then exists for the decode itself plus any remaining DPB
+    /// residency, and must never be bound as a reference for later AUs.
     pub setup_is_reference: bool,
-    /// The unique referenced pictures of this AU — the union of the plan's three
-    /// current RPS sets in set order (StCurrBefore, StCurrAfter, LtCurr), first
-    /// appearance first. Every slot [`Self::std_pic`]'s index arrays name appears
-    /// here exactly once, which is what makes those arrays resolvable against the
-    /// decode op's reference list.
+    /// Unique referenced pictures: union of the three current RPS sets in set
+    /// order (StCurrBefore, StCurrAfter, LtCurr), first appearance first. Every
+    /// slot [`Self::std_pic`]'s index arrays name appears here exactly once.
     pub refs: Vec<VkRefH265>,
 }
 
 /// Conversion failures. Stream damage never lands here — pf-bitstream degrades
-/// it to [`pf_bitstream::h265::PlanWarning`]s upstream; these are caller/session
-/// bugs or envelope limits. (`PlanError::RaslSkipped` also never reaches this
-/// layer: it is an error OF planning, handled as an Ok-skip by the client
-/// wiring, and no plan exists to convert.)
+/// it to [`pf_bitstream::h265::PlanWarning`]s. `PlanError::RaslSkipped` is an
+/// error of planning (Ok-skip upstream); no plan exists to convert.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanToVkH265Error {
-    /// The plan holds no slices; there is nothing to submit.
     NoSlices,
-    /// The plan's `DpbUpdate.stored` is `None`. `plan_au` always stores; only
-    /// `flush()` produces such updates, and those go to [`SlotMap::apply`]
-    /// directly.
+    /// `DpbUpdate.stored` is `None`. `plan_au` always stores; only `flush()`
+    /// produces such updates, and those go to [`SlotMap::apply`] directly.
     NoStoredId,
-    /// An RPS entry's id holds no slot: an earlier plan of this stream never
-    /// went through this [`SlotMap`].
+    /// An RPS entry's id holds no slot: an earlier plan never went through this
+    /// [`SlotMap`].
     UnresolvedReference(PicId),
-    /// A slice reference-list entry names a picture outside the plan's current
-    /// RPS sets. 8.3.4 builds every list FROM those sets, so this is a planner
-    /// contract violation — the picture would be missing from
-    /// `pReferenceSlots` and the hardware could not resolve it.
+    /// A slice list names a picture outside the current RPS sets. 8.3.4 builds
+    /// every list from those sets; the picture would be missing from
+    /// `pReferenceSlots` and hardware could not resolve it.
     ReferenceOutsideRps(PicId),
     Slot(SlotError),
-    /// A slice offset exceeds `u32` (Vulkan submits offsets as `u32`).
+    /// Vulkan submits slice offsets as `u32`.
     OffsetOverflow(usize),
-    /// A current RPS set holds more entries than the Std index arrays' eight
-    /// ([`H265_RPS_LIST_SIZE`]) — expressible in H.265, not in Vulkan; outside
-    /// the program envelope (punktfunk hosts keep well under it).
+    /// A current RPS set holds more than [`H265_RPS_LIST_SIZE`] entries —
+    /// expressible in H.265, not in Vulkan.
     RpsSetOverflow {
         set: &'static str,
         len: usize,
     },
-    /// The first slice's inline `st_ref_pic_set()` predicts from an SPS
-    /// candidate that does not exist — `NumDeltaPocsOfRefRpsIdx` cannot be
-    /// derived, and the hardware would misparse the slice header.
+    /// The first slice's inline `st_ref_pic_set()` predicts from a missing SPS
+    /// candidate — `NumDeltaPocsOfRefRpsIdx` cannot be derived, and hardware
+    /// would misparse the slice header.
     InvalidRefRpsIdx {
         curr_rps_idx: u8,
         delta_idx_minus1: u8,
     },
-    /// The inline `st_ref_pic_set()`'s bit count exceeds `u16` (the Std field
-    /// `NumBitsForSTRefPicSetInSlice`) — a header that large is corrupt.
+    /// Inline `st_ref_pic_set()` bit count exceeds `u16`
+    /// (`NumBitsForSTRefPicSetInSlice`) — a header that large is corrupt.
     StRpsBitsOverflow(u32),
-    /// The predicted-from candidate's `NumDeltaPocs` exceeds `u8` (the Std
-    /// field `NumDeltaPocsOfRefRpsIdx`). Impossible off a real parse (≤ 32);
-    /// a directly-constructed plan gets an error, never a clamped count the
-    /// hardware would misparse the slice header with.
+    /// Predicted-from candidate `NumDeltaPocs` exceeds `u8`. Impossible off a
+    /// real parse (≤ 32); an error rather than a clamp, because a clamped count
+    /// makes hardware misparse the slice header.
     NumDeltaPocsOverflow(u32),
     /// The map was built for a different DPB depth than this plan's
-    /// `max_dpb_frames` — an SPS renegotiation resized the DPB. The session
-    /// must rebuild the video session and its [`SlotMap`]; converting against
-    /// the stale map would hand out slot indices the session's image pool does
-    /// not have (the H.264 module's exact contract).
+    /// `max_dpb_frames` — an SPS renegotiation resized the DPB. Rebuild the
+    /// video session and its [`SlotMap`]; converting against the stale map
+    /// would hand out slot indices the session's image pool does not have.
     CapacityMismatch {
         required: usize,
         capacity: usize,
@@ -248,7 +202,6 @@ impl From<SlotError> for PlanToVkH265Error {
     }
 }
 
-/// One [`RefPic`] as Std reference info.
 fn ref_info(rp: &RefPic) -> hh::StdVideoDecodeH265ReferenceInfo {
     // SAFETY: StdVideoDecodeH265ReferenceInfo is a plain-C bindgen struct of a
     // bitfield word and one integer; all-zero is a valid value for every field.
@@ -261,26 +214,25 @@ fn ref_info(rp: &RefPic) -> hh::StdVideoDecodeH265ReferenceInfo {
     std
 }
 
-/// `NumDeltaPocsOfRefRpsIdx` (the Std picture-info field): when the first
-/// slice's inline `st_ref_pic_set()` uses inter-RPS prediction, the hardware
-/// re-parses those slice bits and needs `NumDeltaPocs[RefRpsIdx]` of the SOURCE
-/// candidate to size the `used_by_curr_pic_flag`/`use_delta_flag` loop (7.4.8);
-/// otherwise 0.
+/// `NumDeltaPocsOfRefRpsIdx`: when the first slice's inline `st_ref_pic_set()`
+/// uses inter-RPS prediction, hardware re-parses those slice bits and needs
+/// `NumDeltaPocs[RefRpsIdx]` of the source candidate to size the
+/// `used_by_curr_pic_flag`/`use_delta_flag` loop (7.4.8); otherwise 0.
 fn num_delta_pocs_of_ref_rps_idx(plan: &AuPlan) -> Result<u8, PlanToVkH265Error> {
     let hdr = &plan
         .slices
         .first()
         .expect("caller validated the plan holds slices")
         .header;
-    // Inline means CurrRpsIdx == num_short_term_ref_pic_sets (8.3.2 NOTE 2);
-    // an SPS-indexed RPS re-parses nothing in the slice header.
+    // Inline means CurrRpsIdx == num_short_term_ref_pic_sets (8.3.2 NOTE 2); an
+    // SPS-indexed RPS re-parses nothing in the slice header.
     let inline = !hdr.short_term_ref_pic_set_sps_flag
         && hdr.curr_rps_idx == plan.sps.num_short_term_ref_pic_sets;
     if !inline || !hdr.short_term_ref_pic_set.inter_ref_pic_set_prediction_flag {
         return Ok(0);
     }
     // RefRpsIdx = stRpsIdx - (delta_idx_minus1 + 1), stRpsIdx = CurrRpsIdx here
-    // (equation 7-59). u16 arithmetic so a hostile delta cannot wrap.
+    // (equation 7-59). u16 so a hostile delta cannot wrap.
     let delta = hdr.short_term_ref_pic_set.delta_idx_minus1;
     let source = u16::from(hdr.curr_rps_idx)
         .checked_sub(u16::from(delta) + 1)
@@ -289,33 +241,23 @@ fn num_delta_pocs_of_ref_rps_idx(plan: &AuPlan) -> Result<u8, PlanToVkH265Error>
             curr_rps_idx: hdr.curr_rps_idx,
             delta_idx_minus1: delta,
         })?;
-    // NumDeltaPocs = num_negative + num_positive <= 32 off any real parse,
-    // comfortably u8 — but a directly-constructed plan could exceed it, and a
-    // silently clamped count would misparse the slice header on hardware:
-    // typed error, like everything else in this file.
+    // Real parses have NumDeltaPocs ≤ 32 (u8). A clamp would misparse the slice
+    // header on hardware, so a constructed plan that exceeds it is an error.
     u8::try_from(source.num_delta_pocs)
         .map_err(|_| PlanToVkH265Error::NumDeltaPocsOverflow(source.num_delta_pocs))
 }
 
 /// Convert one planned AU, driving `slots` through the AU's slot lifecycle.
 ///
-/// Unlike the H.264 [`crate::plan_to_vk`], no `sps_id` parameter: an H.265
-/// [`AuPlan`] carries its activated SPS and PPS, so every id resolves from the
-/// plan itself.
+/// Unlike H.264 [`crate::plan_to_vk`], no `sps_id`: an H.265 [`AuPlan`] carries
+/// its activated SPS and PPS.
 ///
-/// Atomicity contract (identical to the H.264 module): every fallible step runs
-/// before any mutation of `slots`, so an error leaves the map exactly as it was.
-/// In order:
-/// 1. capacity is validated against the plan's `max_dpb_frames` (read-only);
-/// 2. the RPS binding set resolves against the PRE-removal state (read-only) —
-///    a current-set member always survives its own AU (8.3.2's marking keeps it
-///    referenced), but resolving before removals keeps the transaction shape
-///    byte-for-byte the H.264 one and costs nothing;
-/// 3. slice lists are cross-checked and offsets validated (read-only);
-/// 4. `removed` is applied — removals were real regardless of this AU's fate —
-///    and the setup slot is assigned last. A stored-and-evicted picture (its id
-///    in this same plan's `removed`) still gets its slot for the decode itself
-///    and is released right after, exactly the H.264 defensive path.
+/// Atomicity: every fallible step runs before any mutation of `slots`. Capacity,
+/// RPS resolution (pre-removal: a current-set member survives its own AU per
+/// 8.3.2), slice-list check and offsets are read-only. Then `removed` is applied
+/// — those evictions were real regardless of this AU's fate — and the setup slot
+/// is assigned last. A stored-and-evicted picture still gets its slot for the
+/// decode itself and is released right after.
 pub fn plan_to_vk_h265(
     plan: &AuPlan,
     slots: &mut SlotMap,
@@ -323,8 +265,6 @@ pub fn plan_to_vk_h265(
     let first_slice = plan.slices.first().ok_or(PlanToVkH265Error::NoSlices)?;
     let setup_id = plan.dpb.stored.ok_or(PlanToVkH265Error::NoStoredId)?;
 
-    // The map must match THIS plan's DPB depth; a mismatch means an SPS
-    // renegotiation resized the DPB and the session must be rebuilt.
     let required = plan.picture.max_dpb_frames + 1;
     if slots.capacity() != required {
         return Err(PlanToVkH265Error::CapacityMismatch {
@@ -333,10 +273,8 @@ pub fn plan_to_vk_h265(
         });
     }
 
-    // The AU-level binding set: the union of the three current RPS sets, first
-    // appearance first (module docs — Vulkan H.265 keys everything by these,
-    // not by slice lists). Each picture appears once even if a corrupt stream's
-    // concealment resolved two entries to the same stored picture.
+    // Union of the three current RPS sets, first appearance first. A picture
+    // appears once even if concealment resolved two entries to the same id.
     let mut refs: Vec<VkRefH265> = Vec::new();
     let mut index_arrays = [[UNUSED_RPS_ENTRY; H265_RPS_LIST_SIZE]; 3];
     let sets: [(&'static str, &[RefPic]); 3] = [
@@ -354,12 +292,9 @@ pub fn plan_to_vk_h265(
         for (position, rp) in set.iter().enumerate() {
             let entry = match refs.iter().position(|existing| existing.id == rp.id) {
                 Some(index) => {
-                    // A concealment-resolved duplicate across sets (doc above):
-                    // the stored picture binds ONCE, but if ANY occurrence
-                    // marks it long-term the binding must say so — hardware
-                    // treats LT references differently (no MV scaling, POC-LSB
-                    // matching), and an `RefPicSetLtCurr` index into a
-                    // short-term-marked slot is an internally inconsistent DPB.
+                    // Duplicate across sets: bind once. If any occurrence is
+                    // long-term, mark it so — hardware treats LT refs differently
+                    // (no MV scaling, POC-LSB matching).
                     if rp.is_long_term {
                         refs[index].std.flags.set_used_for_long_term_reference(1);
                     }
@@ -377,18 +312,12 @@ pub fn plan_to_vk_h265(
                     slot
                 }
             };
-            // A DPB SLOT index, not a position in `refs` — see the
-            // `DecodePlanVkH265::std_pic` docs. Slots are bounded by the session's
-            // `maxDpbSlots` (<= 17 under this crate's envelope), so no real slot
-            // can collide with the 0xFF sentinel.
+            // DPB slot index, not a `refs` position. Slots ≤ 17, so never 0xFF.
             debug_assert_ne!(entry, UNUSED_RPS_ENTRY, "a real DPB slot is never 0xFF");
             array[position] = entry;
         }
     }
 
-    // Cross-check: 8.3.4 builds every slice list from the current sets, so any
-    // entry outside the binding set is a planner-contract violation the
-    // hardware could not resolve (error-type docs).
     for slice in &plan.slices {
         for rp in slice.ref_list0.iter().chain(&slice.ref_list1) {
             if !refs.iter().any(|existing| existing.id == rp.id) {
@@ -414,8 +343,7 @@ pub fn plan_to_vk_h265(
     std_pic.pps_pic_parameter_set_id = plan.pps.pic_parameter_set_id;
     std_pic.NumDeltaPocsOfRefRpsIdx = num_delta_pocs_of_ref_rps_idx(plan)?;
     std_pic.PicOrderCntVal = pic.pic_order_cnt;
-    // 0 when the RPS came from the SPS by index (PicturePlan field docs) —
-    // exactly Vulkan's convention for this field.
+    // 0 when the RPS came from the SPS by index — Vulkan's convention for this field.
     std_pic.NumBitsForSTRefPicSetInSlice = u16::try_from(pic.short_term_ref_pic_set_size_bits)
         .map_err(|_| PlanToVkH265Error::StRpsBitsOverflow(pic.short_term_ref_pic_set_size_bits))?;
     [
@@ -424,36 +352,28 @@ pub fn plan_to_vk_h265(
         std_pic.RefPicSetLtCurr,
     ] = index_arrays;
 
-    // The setup slot's reference info: the picture's own identity, short-term
-    // (see the DecodePlanVkH265 field docs for why there is no long-term leg
-    // here, unlike H.264).
     // SAFETY: as above — all-zero is a valid StdVideoDecodeH265ReferenceInfo.
     let mut setup_ref: hh::StdVideoDecodeH265ReferenceInfo = unsafe { std::mem::zeroed() };
     setup_ref.PicOrderCntVal = pic.pic_order_cnt;
 
     let mut slice_offsets = Vec::with_capacity(plan.slices.len());
     for slice in &plan.slices {
-        // SlicePlan.data starts at the slice NALU's start code — exactly the
-        // offset Vulkan wants (struct docs).
         slice_offsets.push(
             u32::try_from(slice.data.start)
                 .map_err(|_| PlanToVkH265Error::OffsetOverflow(slice.data.start))?,
         );
     }
 
-    // Mutations LAST, after every fallible step above (fn docs). Removals first
-    // — they were real regardless of this AU's fate — then the setup
-    // assignment, releasing immediately when this very plan already evicted the
-    // stored picture (the H.264 defensive path; the slot must still exist for
-    // the decode itself).
+    // Mutations last. Removals first (they were real regardless of this AU),
+    // then setup; release immediately if this plan already evicted the stored
+    // picture — the slot must still exist for the decode itself.
     let setup_evicted = plan.dpb.removed.contains(&setup_id);
     for &id in &plan.dpb.removed {
         if id == setup_id {
             continue;
         }
         if !slots.release(id) {
-            // Tolerated but never silent: reachable only when the caller
-            // skipped feeding an AU's plan through this map.
+            // Reachable only when the caller skipped an AU's plan through this map.
             trace!(id, "DpbUpdate removed an id this SlotMap never assigned");
         }
     }
@@ -496,8 +416,7 @@ mod tests {
 
     use super::*;
 
-    // The same vendored vectors pf-bitstream's h265 tests plan (its goldens:
-    // 250 AUs / 250 slices for the 25fps clip), included from the same path.
+    // Same vendored vectors pf-bitstream's h265 tests plan, from the same path.
     const TEST_25FPS: &[u8] = include_bytes!(
         "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
     );
@@ -505,11 +424,10 @@ mod tests {
         "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/64x64-I-P-B-P.h265"
     );
 
-    /// Test-only AU splitter, mirroring pf-bitstream's h265 helper (which is
-    /// `#[cfg(test)]`-private there): a new AU starts at a non-VCL NALU
-    /// following slices, or at a slice segment with
-    /// `first_slice_segment_in_pic_flag == 1` (the first bit of the byte after
-    /// the 2-byte NAL header) when the current AU already has slices.
+    /// Test-only AU splitter, mirroring pf-bitstream's private helper: a new AU
+    /// starts at a non-VCL NALU following slices, or at a slice segment with
+    /// `first_slice_segment_in_pic_flag == 1` (first bit of the byte after the
+    /// 2-byte NAL header) when the current AU already has slices.
     fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
         let mut aus = Vec::new();
         let mut cursor = Cursor::new(stream);
@@ -534,35 +452,19 @@ mod tests {
         aus
     }
 
-    /// **Our own host's low-delay HEVC**, vendored beside the goldens the GPU legs
-    /// decode it against (`tests/data/lowdelay-640x480-h265.nv12.sha256` carries the
-    /// `punktfunk-host spike` command and the ffmpeg cross-check). 120 pictures of
-    /// 640x480 IPPP, a five-picture DPB against four marked references and
-    /// `sps_max_num_reorder_pics = 0`, so 115 of its 120 access units retire a picture.
+    /// Host low-delay HEVC: 120 pictures, five-picture DPB, reorder 0 — 115 of
+    /// 120 AUs retire a picture. The stream the GPU legs decode against.
     const LOWDELAY_640X480_H265: &[u8] = include_bytes!("../tests/data/lowdelay-640x480.h265");
 
-    /// This rung is immune to the release-ordering defect for a STRONGER reason than
-    /// the DXVA one, and this pins the difference instead of asserting it in prose.
+    /// This conversion binds `plan.rps` (the current sets), never `dpb_refs`.
+    /// Widening `dpb_refs` to the pre-RPS marked set — the mutation that aliases
+    /// the DXVA rung on 115 of these 120 AUs — must change nothing here.
     ///
-    /// Both HEVC conversions release `removed` inline and let [`SlotMap::assign`] hand
-    /// the freed slot to the decode target. DXVA survives that because `H265Planner`
-    /// snapshots `dpb_refs` AFTER `decode_rps`, so the retired picture is not in the
-    /// marked DPB `RefPicList` is built from — a property of the PLANNER, one call
-    /// away from being untrue, which is why `pf_dxvadec::pic_h265` drives the
-    /// counterfactual through its conversion.
-    ///
-    /// This conversion never reads `dpb_refs` at all. `pReferenceSlots` is spec-defined
-    /// as the slots the decode operation USES, so it binds `plan.rps` — the three
-    /// current sets, which `decode_rps` derives and which therefore cannot name a
-    /// picture that same RPS just dropped. The test proves it the only way that means
-    /// anything: it hands the conversion a `dpb_refs` deliberately widened to the
-    /// PRE-RPS marked set (the mutation that makes the DXVA rung alias on 115 of these
-    /// 120 access units) and asserts nothing changes here.
-    ///
-    /// If this ever fails, someone has made this conversion bind the marked DPB — a
-    /// legitimate thing to want, since a *Foll* long-term anchor invisible to the
-    /// hardware is the RFI failure shape — and it now needs the `release_after_decode`
-    /// deferral the H.264 and AV1 conversions carry.
+    /// A failure means the conversion started binding the marked DPB and now
+    /// needs the `release_after_decode` deferral H.264 and AV1 carry. A *Foll*
+    /// long-term anchor invisible to the hardware is the reason one might want
+    /// that; Vulkan `pReferenceSlots` is the slots this decode uses, so it does
+    /// not.
     #[test]
     fn a_pre_rps_marked_dpb_changes_nothing_here_because_the_current_sets_are_what_bind() {
         let aus = split_into_aus(LOWDELAY_640X480_H265);
@@ -576,9 +478,8 @@ mod tests {
             let plan = planner.plan_au(au).expect("the low-delay stream plans");
             let map = slots.get_or_insert_with(|| SlotMap::new(plan.picture.max_dpb_frames));
 
-            // The marked DPB as this AU's `decode_rps` found it: the previous AU's
-            // snapshot plus the picture it stored. Exactly what `dpb_snapshot()` would
-            // return from above `decode_rps` instead of below it.
+            // Marked DPB as `decode_rps` found it: previous AU's snapshot plus
+            // the picture it stored — `dpb_snapshot()` from above `decode_rps`.
             let mut as_if = plan.clone();
             as_if.dpb_refs = match &prev {
                 None => Vec::new(),
@@ -628,11 +529,9 @@ mod tests {
         let aus = split_into_aus(TEST_25FPS);
         let mut planner = H265Planner::new();
         let mut slots: Option<SlotMap> = None;
-        // PicId -> the slot it was assigned; entries leave only on `removed`.
+        // PicId → slot assigned when that picture was decoded; drop on `removed`.
         let mut held: BTreeMap<PicId, u8> = BTreeMap::new();
         let mut converted = 0usize;
-        // AUs whose `refs` are NOT in slot order — the AUs on which "DPB slot" and
-        // "position in refs" are distinguishable (see the loop body).
         let mut slot_order_differs = 0usize;
 
         for au in &aus {
@@ -641,8 +540,6 @@ mod tests {
             let vk = plan_to_vk_h265(&plan, slots).expect("the clean vector converts");
             converted += 1;
 
-            // Slot stability: every reference resolves to the slot its picture
-            // was assigned when IT was decoded, and no ref shares the setup slot.
             for r in &vk.refs {
                 assert_eq!(
                     held.get(&r.id),
@@ -652,9 +549,8 @@ mod tests {
                 assert_ne!(r.slot, vk.setup_slot, "a reference aliases the setup slot");
             }
 
-            // The Std index arrays resolve exactly the plan's RPS sets, in
-            // order, 0xFF beyond — BY DPB SLOT (struct docs), and every slot they
-            // name is one the decode op will bind, i.e. one of `refs`'.
+            // Index arrays name DPB slots of the plan's RPS sets, 0xFF beyond.
+            // Every named slot must be one of `refs`.
             for (array, set) in [
                 (&vk.std_pic.RefPicSetStCurrBefore, &plan.rps.st_curr_before),
                 (&vk.std_pic.RefPicSetStCurrAfter, &plan.rps.st_curr_after),
@@ -682,11 +578,8 @@ mod tests {
                     }
                 }
             }
-            // …and the vector genuinely DISCRIMINATES the two readings, so this
-            // assertion can never quietly become vacuous: on a freshly anchored
-            // stream "DPB slot" and "position in refs" agree, and a test that only
-            // ever saw agreeing AUs would pass either way. Count the AUs where
-            // they disagree; the total is asserted below.
+            // Count AUs where slot ≠ position in `refs`, so a positional reading
+            // cannot pass this test vacuously (on a fresh IDR they agree).
             if vk
                 .refs
                 .iter()
@@ -696,8 +589,6 @@ mod tests {
                 slot_order_differs += 1;
             }
 
-            // Slice offsets: one per slice, each at a start-code boundary of
-            // the AU, exactly where the plan said the slice begins.
             assert_eq!(vk.slice_offsets.len(), plan.slices.len());
             for (offset, slice) in vk.slice_offsets.iter().zip(&plan.slices) {
                 let offset = *offset as usize;
@@ -728,8 +619,6 @@ mod tests {
                 plan.picture.short_term_ref_pic_set_size_bits as u16
             );
 
-            // Mirror the map's bookkeeping: record the new picture, drop the
-            // removed.
             let stored = plan.dpb.stored.unwrap();
             assert_eq!(vk.setup_id, stored);
             assert_eq!(vk.setup_is_reference, plan.picture.is_reference);
@@ -738,25 +627,19 @@ mod tests {
                 held.remove(id);
             }
 
-            // held() must mirror the plan-driven bookkeeping exactly, every AU.
             let ledger: BTreeMap<PicId, u8> = slots.held().map(|(slot, id)| (id, slot)).collect();
             assert_eq!(ledger, held);
         }
 
         assert_eq!(converted, 250, "the vector's own golden");
-        // The vector's hierarchical-B RPS sets put the references out of slot order
-        // from AU 3 on (its first B picture with two `StCurrAfter` entries binds
-        // slots 2 then 1), so the index-array assertions above are decisive rather
-        // than accidental. 247 of 250: AUs 0-2 agree, which is precisely why the
-        // wrong reading survived to hardware and produced three correct frames
-        // followed by 247 corrupt ones.
+        // Hierarchical-B RPS puts refs out of slot order from AU 3 on (first B
+        // with two StCurrAfter entries binds slots 2 then 1). 247 of 250: AUs
+        // 0-2 agree, which is why a positional reading looks right at start.
         assert_eq!(
             slot_order_differs, 247,
             "the vector must distinguish DPB slots from positions in refs"
         );
 
-        // Teardown: the flush update releases every remaining slot — the
-        // codec-neutral DpbUpdate drives the SAME SlotMap H.264 uses.
         let mut slots = slots.unwrap();
         slots.apply(&planner.flush());
         assert_eq!(slots.active(), 0);
@@ -778,8 +661,8 @@ mod tests {
                 continue;
             }
             b_pictures_seen += 1;
-            // 8.3.2: StCurrBefore entries sit below the picture's POC,
-            // StCurrAfter above — resolved through the index arrays' DPB SLOTS.
+            // 8.3.2: StCurrBefore sits below this POC, StCurrAfter above —
+            // resolved through the index arrays' DPB slots.
             let bound = |slot: u8| {
                 vk.refs
                     .iter()
@@ -796,10 +679,8 @@ mod tests {
         assert!(b_pictures_seen > 0, "the vector must contain B pictures");
     }
 
-    // ------- hand-built plan fixtures (the vendored crate has no H.265
-    // synthesizer; every AuPlan field is public, so edge cases construct the
-    // planner's output shape directly — the contract under test is the plan,
-    // not the bitstream) -------
+    // Hand-built plans: the vendored crate has no H.265 synthesizer. Every
+    // AuPlan field is public; the contract under test is the plan, not the bits.
 
     fn mini_sps() -> Rc<Sps> {
         Rc::new(Sps {
@@ -813,8 +694,7 @@ mod tests {
     }
 
     fn mini_pps(sps: &Rc<Sps>) -> Rc<Pps> {
-        // The vendored Pps derives no Default; only the fields this module
-        // reads (the two ids and the SPS chain) carry meaning here.
+        // Vendored Pps has no Default; only the two ids and the SPS chain matter here.
         Rc::new(Pps {
             pic_parameter_set_id: 0,
             seq_parameter_set_id: 0,
@@ -899,8 +779,7 @@ mod tests {
             max_dpb_frames,
             short_term_ref_pic_set_size_bits: 0,
             recovery_point: None,
-            // These fixtures model a healthy stream; the clean bit is the planner's
-            // observation and nothing in this conversion layer reads it.
+            // Healthy-stream fixture; this conversion never reads the bit.
             references_clean: true,
         }
     }
@@ -914,8 +793,8 @@ mod tests {
         }
     }
 
-    /// A plan storing `stored` with the given RPS sets and one slice whose
-    /// list0 is the concatenation the 8-8 temporal order would produce.
+    /// Plan storing `stored` with the given RPS sets and one slice whose list0
+    /// is the 8.3.4 concatenation of those sets.
     fn mini_plan(
         stored: PicId,
         poc: i32,
@@ -929,9 +808,8 @@ mod tests {
         list0.extend(rps.st_curr_before.iter().copied());
         list0.extend(rps.st_curr_after.iter().copied());
         list0.extend(rps.lt_curr.iter().copied());
-        // The marked DPB is this AU's current sets and nothing more here: the Vulkan
-        // rung binds `pReferenceSlots` from the CURRENT sets (the slots this decode
-        // operation uses), so the snapshot is not an input to anything under test.
+        // Vulkan binds `pReferenceSlots` from the current sets; `dpb_refs` is
+        // not an input to anything under test.
         let dpb_refs = list0.clone();
         AuPlan {
             picture: mini_picture(poc, max_dpb_frames),
@@ -968,8 +846,8 @@ mod tests {
     #[test]
     fn a_long_term_rps_entry_carries_the_flag_and_its_index_lands_in_lt_curr() {
         let mut slots = SlotMap::new(4);
-        // Two pictures already decoded through this map: the anchor (id 10,
-        // poc 0, pinned long-term) and the previous picture (id 11, poc 1).
+        // Anchor (id 10, slot 0) then previous (id 11, slot 1): RPS order is
+        // the reverse of slot order, so a positional reading would swap them.
         slots.assign(10).unwrap();
         slots.assign(11).unwrap();
 
@@ -987,10 +865,9 @@ mod tests {
         let vk = plan_to_vk_h265(&plan, &mut slots).unwrap();
 
         assert_eq!(vk.refs.len(), 2);
-        // The entries are DPB SLOTS: id 11 took slot 1 and id 10 slot 0, while the
-        // RPS set order binds id 11 FIRST — so a positional reading would name slot
-        // 0 for the short-term set and get the long-term anchor instead. That is the
-        // whole M3 field failure in one fixture.
+        // Entries are DPB slots: id 11 took slot 1, id 10 slot 0. RPS order
+        // binds id 11 first — a positional reading names slot 0 for the
+        // short-term set and hits the long-term anchor instead.
         assert_eq!(vk.std_pic.RefPicSetStCurrBefore[0], 1, "id 11's DPB slot");
         assert_eq!(vk.std_pic.RefPicSetLtCurr[0], 0, "id 10's DPB slot");
         let bound = |slot: u8| vk.refs.iter().find(|r| r.slot == slot).expect("bound");
@@ -1002,17 +879,14 @@ mod tests {
         assert_eq!(lt.std.flags.used_for_long_term_reference(), 1);
         assert_eq!(lt.std.PicOrderCntVal, 0);
         assert_eq!(vk.std_pic.RefPicSetStCurrAfter[0], UNUSED_RPS_ENTRY);
-        // The setup picture itself activates short-term (no same-AU
-        // self-marking in HEVC — struct docs).
         assert_eq!(vk.setup_ref.flags.used_for_long_term_reference(), 0);
         assert_eq!(vk.setup_ref.PicOrderCntVal, 2);
     }
 
     #[test]
     fn a_failed_conversion_leaves_the_slot_map_untouched_and_the_session_recovers() {
-        // A right-sized map that never saw the reference's AU, holding one
-        // unrelated slot: the reference must fail loudly, not resolve to a
-        // fabricated slot.
+        // Right-sized map that never saw the reference's AU: fail, do not
+        // fabricate a slot.
         let mut slots = SlotMap::new(4);
         slots.assign(999).unwrap();
 
@@ -1024,7 +898,7 @@ mod tests {
                 st_curr_after: Vec::new(),
                 lt_curr: Vec::new(),
             },
-            vec![3], // a removal that must NOT be applied on the failed path
+            vec![3], // must not apply on the failed path
             4,
         );
         assert_eq!(
@@ -1032,13 +906,11 @@ mod tests {
             PlanToVkH265Error::UnresolvedReference(4)
         );
 
-        // Atomicity: the failed conversion mutated nothing.
         assert_eq!(slots.active(), 1);
         assert_eq!(slots.held().collect::<Vec<_>>(), vec![(0, 999)]);
 
-        // And the session recovers: the next valid plan (an IDR restart whose
-        // `removed` names ids this map never assigned — tolerated by design)
-        // still converts on the same map.
+        // Next valid plan (IDR restart whose `removed` names ids this map never
+        // assigned — tolerated) still converts on the same map.
         let idr = mini_plan(6, 0, RpsPlan::default(), vec![4, 5], 4);
         let vk = plan_to_vk_h265(&idr, &mut slots).unwrap();
         assert_eq!(vk.setup_slot, 1, "the lowest free slot after the held one");
@@ -1047,9 +919,8 @@ mod tests {
 
     #[test]
     fn an_sps_switch_that_resizes_the_dpb_is_a_capacity_mismatch_not_a_guess() {
-        // The map was built for a 6-deep DPB; a renegotiated stream plans with
-        // 16. Refuse, so the session rebuilds session + map instead of handing
-        // out slots the image pool does not have.
+        // Map sized for a 6-deep DPB; a renegotiated stream plans with 16.
+        // Refuse rather than hand out slots the image pool does not have.
         let mut slots = SlotMap::new(6);
         plan_to_vk_h265(
             &mini_plan(0, 0, RpsPlan::default(), Vec::new(), 6),
@@ -1065,7 +936,6 @@ mod tests {
                 capacity: 7
             }
         );
-        // And the mismatch mutated nothing.
         assert_eq!(slots.active(), 1);
     }
 
@@ -1140,8 +1010,8 @@ mod tests {
             Vec::new(),
             4,
         );
-        // Id 2 holds a slot but is in NO current set: it would be missing from
-        // pReferenceSlots, so the hardware could not resolve the list entry.
+        // Id 2 holds a slot but is in no current set: it would be missing from
+        // pReferenceSlots, so hardware could not resolve the list entry.
         plan.slices[0].ref_list0.push(st_ref(2, 1));
         assert_eq!(
             plan_to_vk_h265(&plan, &mut slots).unwrap_err(),
@@ -1151,10 +1021,9 @@ mod tests {
 
     #[test]
     fn a_stored_and_evicted_picture_still_gets_a_slot_for_the_decode_itself() {
-        // The defensive same-plan eviction path (H.264 parity): the stored id
-        // appears in its own plan's `removed` — the slot exists during the
-        // decode and is released right after, so the next picture can reuse it.
-        let mut slots = SlotMap::new(1); // capacity 2
+        // Stored id also in this plan's `removed`: slot exists for the decode
+        // and is released right after, so the next picture can reuse it.
+        let mut slots = SlotMap::new(1); // capacity = max_dpb_frames + 1
         let mut plan = mini_plan(0, 0, RpsPlan::default(), Vec::new(), 1);
         plan.dpb.removed = vec![0];
         let vk = plan_to_vk_h265(&plan, &mut slots).unwrap();
@@ -1168,8 +1037,8 @@ mod tests {
         let mut slots = SlotMap::new(4);
         slots.assign(1).unwrap();
 
-        // The activated SPS carries two candidates; the inline slice RPS
-        // predicts from the second (delta_idx_minus1 = 0 ⇒ RefRpsIdx = 1).
+        // SPS carries two candidates; the inline slice RPS predicts from the
+        // second (`delta_idx_minus1 = 0` ⇒ RefRpsIdx = 1).
         let mut sps = (*mini_sps()).clone();
         sps.num_short_term_ref_pic_sets = 2;
         sps.short_term_ref_pic_set = vec![
@@ -1229,7 +1098,6 @@ mod tests {
         assert_eq!(vk.std_pic.flags.short_term_ref_pic_set_sps_flag(), 0);
         assert_eq!(vk.std_pic.NumBitsForSTRefPicSetInSlice, 23);
 
-        // A prediction pointing past the candidate table cannot be derived.
         let mut broken = plan.clone();
         {
             let header = &mut broken.slices[0].header;
@@ -1268,9 +1136,9 @@ mod tests {
 
     #[test]
     fn a_picture_referenced_by_two_sets_binds_one_slot_listed_once() {
-        // Concealment can resolve an lsb-masked long-term entry and a
-        // short-term entry to the SAME stored picture; Vulkan wants each slot
-        // bound once, with both index arrays pointing at that one entry.
+        // Concealment can resolve an LSB-masked long-term entry and a
+        // short-term entry to the same stored picture; each slot binds once,
+        // with both index arrays pointing at that one entry.
         let mut slots = SlotMap::new(4);
         slots.assign(1).unwrap();
         let plan = mini_plan(
@@ -1290,11 +1158,9 @@ mod tests {
             vk.std_pic.RefPicSetStCurrBefore[0],
             vk.std_pic.RefPicSetLtCurr[0]
         );
-        // The short-term set bound the picture FIRST, but the LtCurr occurrence
-        // must still mark the shared binding long-term: hardware treats LT
-        // references differently (no MV scaling, POC-LSB matching), and an
-        // LtCurr index into a short-term-marked slot is an internally
-        // inconsistent DPB the driver may reject or mispredict from.
+        // StCurrBefore bound first, but the LtCurr occurrence must still mark
+        // the shared binding long-term: hardware treats LT refs differently
+        // (no MV scaling, POC-LSB matching).
         assert_eq!(vk.refs[0].std.flags.used_for_long_term_reference(), 1);
     }
 }

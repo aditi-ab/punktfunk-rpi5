@@ -1,23 +1,18 @@
-//! The NV12→RGBA color-space-conversion pass: coefficient rows from the stream's CICP
-//! signaling (the GL presenter's `yuv_to_rgb`, folded into row form for the shader's
-//! push constants) and the graphics pipeline that renders the two imported planes into
-//! the presenter's video image.
+//! NV12→RGBA color-space conversion: CICP coefficient rows (the GL presenter's
+//! `yuv_to_rgb`, folded for the shader's push constants) and the pipeline that
+//! renders imported planes into the presenter's video image.
 //!
-//! Deliberately NOT `VK_KHR_sampler_ycbcr_conversion`: the ext can't express the PQ path
-//! coming with the HDR phase and its range handling varies by driver — these are the
-//! proven, unit-tested coefficients (plan §5.2).
+//! Not `VK_KHR_sampler_ycbcr_conversion`: the ext cannot express the PQ path,
+//! and range handling varies by driver. Coefficients live in
+//! `pf_client_core::video::csc_rows` (shared with D3D11 and the Apple port).
 
 use anyhow::{Context as _, Result};
 use ash::vk;
 
-// The coefficient math lives in pf-client-core next to `ColorDesc` (one tested
-// implementation shared with the Windows client's D3D11 constant buffer and mirrored by the
-// Apple client's Swift port); re-exported here so presenter callers keep their import path.
 pub use pf_client_core::video::csc_rows;
 
-/// The pass objects (everything except the per-video-size framebuffer, which lives with
-/// the video image). Destroyed explicitly via [`CscPass::destroy`] from the presenter's
-/// `Drop` — no device handle is stored here.
+/// Pass objects except the per-video-size framebuffer (that lives with the video
+/// image). No device handle is stored; [`CscPass::destroy`] runs from the presenter's `Drop`.
 pub struct CscPass {
     pub render_pass: vk::RenderPass,
     pub set_layout: vk::DescriptorSetLayout,
@@ -29,8 +24,8 @@ pub struct CscPass {
 }
 
 impl CscPass {
-    /// `attachment_format` = the video image's format: R8G8B8A8 for SDR, a 10-bit
-    /// format when the pass writes PQ (8 bits would band the PQ curve visibly).
+    /// `attachment_format` is the video image: R8G8B8A8 for SDR, 10-bit for PQ
+    /// (8 bits band the PQ curve).
     pub fn new(device: &ash::Device, attachment_format: vk::Format) -> Result<CscPass> {
         Self::build(
             device,
@@ -40,15 +35,9 @@ impl CscPass {
         )
     }
 
-    /// The planar 3-plane variant (separate Cb/Cr R8 planes). Same push-constant
-    /// contract.
-    ///
-    /// Two producers now: the PyroWave decode output
-    /// (design/pyrowave-codec-plan.md §4.5) and — since M8 — the SOFTWARE rung, whose
-    /// I420 planes the presenter uploads and converts here instead of receiving swscale's
-    /// RGBA. That is why this is no longer feature-gated or probe-gated: the CPU rung is
-    /// the ladder's last one, so it must exist on every device, including the ones that
-    /// failed the pyrowave probe.
+    /// Planar 3-plane variant (separate Cb/Cr R8). Same push-constant contract.
+    /// Not feature- or probe-gated: the CPU I420 rung is the ladder's last step
+    /// and must exist on every device.
     pub fn new_planar(device: &ash::Device, attachment_format: vk::Format) -> Result<CscPass> {
         Self::build(
             device,
@@ -64,9 +53,8 @@ impl CscPass {
         plane_bindings: u32,
         frag_spv: &[u8],
     ) -> Result<CscPass> {
-        // One color attachment: the presenter's video image. Content is fully
-        // overwritten (DONT_CARE load), and the pass ends in TRANSFER_SRC so the
-        // existing letterbox blit consumes it with no extra barrier.
+        // Fully overwritten (DONT_CARE load). Ends TRANSFER_SRC so the letterbox blit
+        // needs no extra barrier.
         let attachment = [vk::AttachmentDescription::default()
             .format(attachment_format)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -80,7 +68,7 @@ impl CscPass {
         let subpass = [vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_ref)];
-        // Conservative scopes, matching the presenter's per-frame barrier granularity.
+        // Conservative scopes; matches the presenter's per-frame barrier granularity.
         let deps = [
             vk::SubpassDependency::default()
                 .src_subpass(vk::SUBPASS_EXTERNAL)
@@ -97,8 +85,7 @@ impl CscPass {
                 .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
         ];
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
         let render_pass = unsafe {
             device.create_render_pass(
                 &vk::RenderPassCreateInfo::default()
@@ -110,8 +97,7 @@ impl CscPass {
         }
         .context("CSC render pass")?;
 
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
         let sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -135,8 +121,7 @@ impl CscPass {
                     .immutable_samplers(&samplers)
             })
             .collect();
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
         let set_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
@@ -147,8 +132,7 @@ impl CscPass {
         let push = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .size(64)]; // three vec4 rows + a params vec4 (mode, tonemap peak)
-                        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-                        // type and live for the call, and every builder struct is a local that outlives it.
+                        // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
         let pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
@@ -161,8 +145,7 @@ impl CscPass {
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(plane_bindings)];
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
         let desc_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -171,8 +154,7 @@ impl CscPass {
                 None,
             )
         }?;
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
         let desc_set = unsafe {
             device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
@@ -186,7 +168,7 @@ impl CscPass {
             render_pass,
             pipeline_layout,
             frag_spv,
-            false, // opaque — the CSC output IS the video
+            false, // opaque: CSC output is the video
         )?;
 
         Ok(CscPass {
@@ -200,9 +182,8 @@ impl CscPass {
         })
     }
 
-    /// Point the descriptor set at this frame's plane views. Only safe while no
-    /// submitted command buffer references the set — the presenter's single in-flight
-    /// fence is waited before every record, which covers it.
+    /// Only while no submitted command buffer references the set — the
+    /// presenter's in-flight fence is waited before every record.
     pub fn bind_planes(&self, device: &ash::Device, luma: vk::ImageView, chroma: vk::ImageView) {
         let infos = [luma, chroma].map(|view| {
             [vk::DescriptorImageInfo::default()
@@ -221,16 +202,14 @@ impl CscPass {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&infos[1]),
         ];
-        // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns
-        // and has begun, referencing handles it also owns; nothing is submitted until the
-        // recording is ended.
+        // SAFETY: no submitted command buffer references this set (in-flight fence
+        // waited before every record); views and sampler outlive the write.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
 
-    /// Planar variant of [`bind_planes`](Self::bind_planes): three single-component
-    /// plane views, in the layout their producer left them in — GENERAL for the pyrowave
-    /// decode, `SHADER_READ_ONLY_OPTIMAL` for the software rung's uploaded planes. Same
-    /// fence-wait safety contract.
+    /// Three single-component plane views in the producer's layout: GENERAL for
+    /// pyrowave decode, `SHADER_READ_ONLY_OPTIMAL` for the software upload. Same
+    /// fence-wait contract as [`bind_planes`](Self::bind_planes).
     pub fn bind_planes_planar(
         &self,
         device: &ash::Device,
@@ -249,17 +228,14 @@ impl CscPass {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&infos[b as usize])
         });
-        // SAFETY: per the Vulkan contract above - recorded into a command buffer this code owns
-        // and has begun, referencing handles it also owns; nothing is submitted until the
-        // recording is ended.
+        // SAFETY: no submitted command buffer references this set (in-flight fence
+        // waited before every record); views and sampler outlive the write.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
 
     pub fn destroy(&self, device: &ash::Device) {
-        // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and the
-        // GPU is known idle for them (the fence/queue-wait on the path here, or the swapchain
-        // being retired), which is the obligation that makes a destroy sound rather than the
-        // handle merely being non-null.
+        // SAFETY: this type owns these objects; the GPU is idle for them
+        // (fence/queue-wait on this path, or the swapchain retired).
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
@@ -271,10 +247,9 @@ impl CscPass {
     }
 }
 
-/// A bufferless fullscreen-triangle pipeline over `fullscreen.vert` + the given
-/// fragment SPIR-V, dynamic viewport/scissor. `blend` = premultiplied-alpha over the
-/// destination (the overlay composite); `false` = opaque write (the CSC pass). Shared
-/// by both passes — the geometry and states are identical.
+/// Bufferless fullscreen triangle (`fullscreen.vert` + `frag_spv`), dynamic
+/// viewport/scissor. `blend` is premultiplied-alpha over the destination
+/// (overlay); `false` is opaque write (CSC).
 pub(crate) fn build_fullscreen_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
@@ -282,29 +257,23 @@ pub(crate) fn build_fullscreen_pipeline(
     frag_spv: &[u8],
     blend: bool,
 ) -> Result<vk::Pipeline> {
-    // Committed SPIR-V (shaders/build.sh) — include_bytes! alignment is unspecified, so
-    // read_spv copies into aligned Vec<u32>s.
+    // include_bytes! alignment is unspecified; read_spv copies into aligned Vec<u32>.
     let vert = ash::util::read_spv(&mut std::io::Cursor::new(
         &include_bytes!("../shaders/fullscreen.vert.spv")[..],
     ))?;
     let frag = ash::util::read_spv(&mut std::io::Cursor::new(frag_spv))?;
-    // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this type
-    // and live for the call, and every builder struct is a local that outlives it.
+    // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
     let vert_mod = unsafe {
         device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&vert), None)
     }?;
-    // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this type
-    // and live for the call, and every builder struct is a local that outlives it.
+    // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
     let frag_mod = unsafe {
         device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&frag), None)
     };
     let frag_mod = match frag_mod {
         Ok(m) => m,
         Err(e) => {
-            // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and
-            // the GPU is known idle for them (the fence/queue-wait on the path here, or the
-            // swapchain being retired), which is the obligation that makes a destroy sound rather
-            // than the handle merely being non-null.
+            // SAFETY: vert_mod is owned here and was never submitted.
             unsafe { device.destroy_shader_module(vert_mod, None) };
             return Err(e).context("fragment shader module");
         }
@@ -324,8 +293,7 @@ pub(crate) fn build_fullscreen_pipeline(
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default(); // bufferless
     let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-    // Dynamic viewport/scissor: the video size changes with the stream mode, the
-    // pipeline must not bake one in.
+    // Video size changes with stream mode; do not bake viewport/scissor into the pipeline.
     let viewport = vk::PipelineViewportStateCreateInfo::default()
         .viewport_count(1)
         .scissor_count(1);
@@ -338,7 +306,7 @@ pub(crate) fn build_fullscreen_pipeline(
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
     let blend_attachment = [if blend {
-        // Premultiplied alpha over the destination (Skia surfaces are premultiplied).
+        // Premultiplied alpha (Skia surfaces are premultiplied).
         vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(vk::ColorComponentFlags::RGBA)
             .blend_enable(true)
@@ -366,16 +334,11 @@ pub(crate) fn build_fullscreen_pipeline(
         .layout(layout)
         .render_pass(render_pass);
     let pipeline =
-        // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
-        // builder structs that are locals outliving the call; the handle it returns is owned by
-        // the value being built here.
+        // SAFETY: live device; builder structs are locals that outlive the call; returned handle is owned here.
         unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) }
             .map_err(|(_, e)| e)
             .context("CSC pipeline");
-    // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and the GPU is
-    // known idle for them (the fence/queue-wait on the path here, or the swapchain being retired),
-    // which is the obligation that makes a destroy sound rather than the handle merely being non-
-    // null.
+    // SAFETY: modules were used only to create the pipeline and were never submitted.
     unsafe {
         device.destroy_shader_module(vert_mod, None);
         device.destroy_shader_module(frag_mod, None);

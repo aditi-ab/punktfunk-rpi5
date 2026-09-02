@@ -1,54 +1,51 @@
-//! Cursor-as-metadata: the `SPA_META_Cursor` parser and the CPU-path composite blits.
+//! Cursor-as-metadata: `SPA_META_Cursor` parse and CPU composite blit.
 //!
-//! Split out of `linux/pipewire.rs` (sweep Phase 5.2). Both halves are producer-driven and
-//! bounds-critical: [`update_cursor_meta`] reads a bitmap at offsets the COMPOSITOR chose (its own
-//! SAFETY proof notes that a missing bound SIGSEGVs inside the PipeWire `.process` callback, where
-//! `catch_unwind` cannot help), and the `composite_cursor*` blits clip a caller-positioned bitmap
-//! into a frame buffer. Separating them from the stream machinery is what makes them testable
+//! [`update_cursor_meta`] reads a compositor-chosen bitmap; a missed bound
+//! SIGSEGVs inside the PipeWire `.process` callback (`catch_unwind` cannot
+//! help). The `composite_cursor*` blits clip that bitmap into a frame.
+//! Isolated from stream machinery so the bounds and blits are testable
 //! without a compositor.
+//!
+//! Tests in this module. SAFETY proofs sit on each unaligned header read
+//! and `from_raw_parts`.
 
 use super::PixelFormat;
 use pipewire as pw;
 use pw::spa;
 use std::sync::Arc;
 
-/// Latest cursor state parsed from `SPA_META_Cursor` (cursor-as-metadata mode). Position is
-/// refreshed every buffer that carries the meta (including Mutter's cursor-only "corrupted"
-/// buffers we otherwise skip for their stale frame); the RGBA bitmap is cached and only
-/// replaced when the compositor sends a fresh one (`bitmap_offset != 0`).
+/// Latest cursor parsed from `SPA_META_Cursor`. Position refreshes on every
+/// buffer that carries the meta (including cursor-only buffers whose frame is
+/// otherwise skipped); the RGBA bitmap is replaced only when `bitmap_offset != 0`.
 #[derive(Default)]
 pub(super) struct CursorState {
-    /// True when the compositor reports a visible pointer (`spa_meta_cursor.id != 0`).
+    /// `spa_meta_cursor.id != 0`.
     visible: bool,
-    /// Top-left where the bitmap is drawn = reported position − hotspot.
+    /// Bitmap top-left = reported position − hotspot.
     x: i32,
     y: i32,
-    /// Cached straight-alpha RGBA pixels (`bw*bh*4`, bytes R,G,B,A). `Arc` so the overlay handed
-    /// to each GPU frame is a refcount bump, not a copy. Empty until the first bitmap arrives.
+    /// Straight-alpha RGBA (`bw*bh*4`). `Arc` so each GPU overlay is a
+    /// refcount bump, not a copy. Empty until the first bitmap arrives.
     rgba: Arc<Vec<u8>>,
     bw: u32,
     bh: u32,
-    /// Bumps whenever the bitmap (`rgba`/`bw`/`bh`) changes — stable across position-only moves,
-    /// so the GPU encoder re-uploads its cursor texture only on change.
+    /// Bitmap identity. Stable across position-only moves so the GPU path
+    /// re-uploads the cursor texture only on change.
     serial: u64,
-    /// The compositor-reported hotspot — carried on the overlay for the cursor-forward
-    /// channel (the blend path uses the pre-adjusted `x`/`y` and never reads it).
+    /// Compositor hotspot, for the cursor-forward channel. The blend path
+    /// uses pre-adjusted `x`/`y` and never reads this.
     hot_x: i32,
     hot_y: i32,
-    /// One-shot breadcrumb latch: this stream saw a `SPA_META_Cursor` region (the Meta param
-    /// negotiated). Per-stream deliberately — a host serves many sessions per process, and a
-    /// process-wide latch made the second session's triage read as "no meta".
+    /// This stream observed a `SPA_META_Cursor` region. Per-stream: a
+    /// process-wide latch made a later session look like "no meta".
     seen_meta: bool,
-    /// This stream's producer rewrites the cursor meta on EVERY buffer, so an `id == 0` meta is
-    /// an authoritative "pointer hidden / off this output" rather than a stale recycled region.
-    /// True for KWin virtual outputs; false for the stale-meta producers (Mutter) — see
-    /// [`note_cursor_id`].
+    /// Producer rewrites cursor meta on every buffer, so `id == 0` is an
+    /// authoritative hide rather than a stale recycled region. True for
+    /// KWin virtual outputs; false for stale-meta producers (Mutter).
     id0_hides: bool,
 }
 
 impl CursorState {
-    /// The per-stream state, declaring which `id == 0` contract the producer follows
-    /// ([`Self::id0_hides`]).
     pub(super) fn new(id0_hides: bool) -> CursorState {
         CursorState {
             id0_hides,
@@ -56,12 +53,9 @@ impl CursorState {
         }
     }
 
-    /// A shareable overlay for the encode/forward paths, or `None` before the first bitmap
-    /// arrived. A HIDDEN pointer still yields `Some` (with `visible: false`): the
-    /// cursor-forward channel needs "known but hidden" — an app grabbed the pointer, the
-    /// client's relative-mode hint (M3) — which is a different fact from "no cursor yet".
-    /// The encode loop strips invisible overlays before any blend path sees the frame.
-    /// Cheap: clones an `Arc` + a few scalars.
+    /// Overlay for encode/forward, or `None` before the first bitmap. Hidden
+    /// still yields `Some` (`visible: false`): known-hidden ≠ no cursor yet.
+    /// The encode loop strips invisible overlays before any blend.
     pub(super) fn overlay(&self) -> Option<pf_frame::CursorOverlay> {
         if self.rgba.is_empty() {
             return None;
@@ -80,9 +74,8 @@ impl CursorState {
     }
 }
 
-/// Extract straight (R,G,B,A) from one 4-byte cursor-bitmap pixel, honoring the bitmap's SPA
-/// video format (portals emit RGBA or BGRA; ARGB/ABGR handled for completeness). Unknown
-/// 4-byte formats are read as RGBA.
+/// Straight (R,G,B,A) from one 4-byte cursor pixel. Portals emit RGBA or
+/// BGRA; ARGB/ABGR are accepted. Unknown 4-byte formats read as RGBA.
 pub(super) fn decode_bitmap_pixel(vfmt: u32, s: &[u8]) -> (u8, u8, u8, u8) {
     match vfmt {
         x if x == spa::sys::SPA_VIDEO_FORMAT_RGBA => (s[0], s[1], s[2], s[3]),
@@ -93,20 +86,15 @@ pub(super) fn decode_bitmap_pixel(vfmt: u32, s: &[u8]) -> (u8, u8, u8, u8) {
     }
 }
 
-/// Apply one parsed `spa_meta_cursor.id` to the visibility state; returns whether the rest of the
-/// meta region (position, bitmap) is worth parsing.
+/// Apply `spa_meta_cursor.id` to visibility. `false` means skip the rest of
+/// the meta (position, bitmap).
 ///
-/// Two producer contracts meet on `id == 0`. **KWin** rewrites the cursor meta on EVERY enqueued
-/// buffer, and writes id 0 whenever `Cursor::isOnOutput` says the pointer is not in this stream —
-/// which covers a globally hidden cursor AND a client null-cursor surface (empty cursor geometry
-/// intersects nothing). There id 0 is the authoritative hide, and honoring it is what lets a game
-/// or Big Picture hide the pointer mid-stream ([`CursorState::id0_hides`], set for KWin virtual
-/// outputs; without it the composited arrow outlived every hide — the 0.22.0 field report).
-/// **Mutter** only rewrites a buffer's meta region when the cursor changed, so recycled buffers
-/// between damage frames carry a stale id-0 meta — treating that as hidden flickered the cursor
-/// off between hovers (on-glass round 5). There the last-known state holds, and a pointer that
-/// really left/hid simply stops producing updates (the M3 hidden hint has no Mutter signal —
-/// Windows has its own CURSOR_SUPPRESSED source).
+/// Two producer contracts on `id == 0`. A rewriting producer (KWin) writes
+/// id 0 on every buffer when the pointer is off this output or hidden —
+/// honour it or the composited arrow outlives every hide. A stale-meta
+/// producer (Mutter) only rewrites the region when the cursor changed;
+/// recycled buffers carry a stale id-0, so last-known state holds. A real
+/// leave/hide simply stops producing updates.
 fn note_cursor_id(cursor: &mut CursorState, id: u32) -> bool {
     if id == 0 {
         if cursor.id0_hides {
@@ -118,27 +106,22 @@ fn note_cursor_id(cursor: &mut CursorState, id: u32) -> bool {
     true
 }
 
-/// Read the newest `SPA_META_Cursor` into `cursor`, tolerating absent or malformed metadata.
-/// This runs before stale-frame filtering so metadata-only pointer moves still update position.
-/// Producer offsets, extents, alignment, and bitmap geometry are validated before every read.
-/// Position-only updates retain the last complete bitmap.
+/// Read the newest `SPA_META_Cursor` into `cursor`. Runs before stale-frame
+/// filtering so metadata-only pointer moves still update position.
+/// Producer offsets and bitmap geometry are bounded before every read.
+/// `bitmap_offset == 0` keeps the last complete bitmap.
 pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sys::spa_buffer) {
-    // SAFETY: `spa_buf` is the live buffer we still hold (dequeued, not yet requeued).
-    // `spa_buffer_find_meta` returns the `spa_meta` (type + byte `size` + `data` pointer) for
-    // `SPA_META_Cursor`, or null. We take `find_meta` rather than `find_meta_data` specifically
-    // to obtain the region's real `size`: the bitmap offset, pixel offset and stride read below
-    // are ALL producer-written, and without a bound against the actual region they drive
-    // out-of-bounds pointer arithmetic and an oversized `slice::from_raw_parts` — an OOB read
-    // that SIGSEGVs inside the PipeWire `.process` callback (a segfault `catch_unwind` cannot
-    // catch). Every offset below is validated against `region_size` with checked arithmetic,
-    // mirroring the fd-length guard the main frame path already applies to xdg-desktop-portal-wlr.
+    // SAFETY: `spa_buf` is the live dequeued buffer (not yet requeued).
+    // `find_meta` (not `find_meta_data`) yields the region's real `size`.
+    // Offsets below are producer-written; unbound they OOB-read, and a
+    // SIGSEGV inside `.process` is uncatchable by `catch_unwind`.
     let meta = unsafe { spa::sys::spa_buffer_find_meta(spa_buf, spa::sys::SPA_META_Cursor) };
     if meta.is_null() {
         return;
     }
-    // One-shot breadcrumb (per stream): the producer DID attach a cursor-meta region (the Meta
-    // param negotiated). Field triage for a cursorless stream starts by grepping for this line
-    // — its absence means the negotiation dropped the meta, not that the pointer never moved.
+    // One-shot per stream: the producer attached a cursor-meta region.
+    // Absence of this log means negotiation dropped the meta, not that
+    // the pointer never moved.
     if !cursor.seen_meta {
         cursor.seen_meta = true;
         tracing::info!("cursor meta: first SPA_META_Cursor region observed on this stream");
@@ -148,8 +131,8 @@ pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sy
     if data.is_null() || region_size < std::mem::size_of::<spa::sys::spa_meta_cursor>() {
         return;
     }
-    // SAFETY: `region_size >= size_of::<spa_meta_cursor>()` checked above, so the full header is
-    // readable. `read_unaligned` avoids assuming the producer aligned this metadata region.
+    // SAFETY: `region_size >= size_of::<spa_meta_cursor>()` above, so the
+    // header is readable. `read_unaligned`: the producer need not align it.
     let cur = unsafe { (data as *const spa::sys::spa_meta_cursor).read_unaligned() };
     let (id, pos_x, pos_y, hot_x, hot_y, bmp_off) = (
         cur.id,
@@ -171,18 +154,16 @@ pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sy
         return;
     }
     let bmp_off = bmp_off as usize;
-    // The `spa_meta_bitmap` header must fit entirely inside the region before we read it —
-    // `bitmap_offset` is producer-controlled and otherwise reads past the metadata.
+    // `bitmap_offset` is producer-controlled; the `spa_meta_bitmap` header
+    // must fit in the region or the next read walks off it.
     match bmp_off.checked_add(std::mem::size_of::<spa::sys::spa_meta_bitmap>()) {
         Some(end) if end <= region_size => {}
         _ => return,
     }
-    // SAFETY: `bmp_off + size_of::<spa_meta_bitmap>() <= region_size` (checked directly above),
-    // so the header is fully in bounds for a read of that many bytes. `read_unaligned` is
-    // REQUIRED, not defensive: `bmp_off` is producer-written and nothing in the SPA contract or
-    // in this function establishes that `data + bmp_off` meets `spa_meta_bitmap`'s alignment —
-    // the previous field reads through an aligned `*const` asserted an invariant the code never
-    // proved. The struct is `Copy` POD, so one unaligned read yields an owned, aligned local.
+    // SAFETY: `bmp_off + size_of::<spa_meta_bitmap>() <= region_size` above,
+    // so the header is in bounds. `read_unaligned` is required: `bmp_off` is
+    // producer-written and neither SPA nor this function proves alignment.
+    // The struct is `Copy` POD; one unaligned read yields an aligned local.
     let bmp = unsafe { (data.add(bmp_off) as *const spa::sys::spa_meta_bitmap).read_unaligned() };
     let (vfmt, bw, bh, stride, pix_off) = (
         bmp.format,
@@ -191,17 +172,13 @@ pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sy
         bmp.stride.max(0) as usize,
         bmp.offset as usize,
     );
-    // Ignore empty or implausibly large bitmaps (the meta-size request covers <= 1024×1024;
-    // real cursors are ≤96px — the cursor channel downscales >120px for the wire anyway).
+    // Empty or >1024 (the meta-size request cap).
     if bw == 0 || bh == 0 || bw > 1024 || bh > 1024 {
         return;
     }
-    // SPA's second "no image data" signal, distinct from the `bitmap_offset == 0` position-only
-    // case above: `spa_meta_bitmap.offset` is the offset of the PIXELS within the bitmap struct,
-    // and 0 means there are none. Without this, `pix_off == 0` made the pixel extent start at the
-    // `spa_meta_bitmap` header itself, so a producer signalling an invisible pointer got its own
-    // header words (format/size/stride/offset) decoded and cached as the cursor bitmap. In bounds,
-    // so not unsound — just garbage pixels blitted into every later frame.
+    // Distinct from `bitmap_offset == 0` (position-only): `spa_meta_bitmap.offset
+    // == 0` means no pixels. Treating 0 as a pixel offset would start the
+    // extent at the bitmap header and cache those words as the cursor.
     if pix_off == 0 {
         return;
     }
@@ -211,9 +188,9 @@ pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sy
     else {
         return;
     };
-    // SAFETY: `bitmap_extent` returned `Some`, which means (see its contract) the whole range
-    // `[bmp_off + pix_off, +len)` lies inside `region_size` and `len` is EXACTLY the extent the
-    // strided loop below reads. `data` is the producer's meta-region base, live for this callback.
+    // SAFETY: `bitmap_extent` returned `Some`: `[bmp_off + pix_off, +len)`
+    // lies inside `region_size` and `len` is exactly what the strided loop
+    // reads. `data` is the producer's meta-region base, live for this callback.
     let src = unsafe { std::slice::from_raw_parts(data.add(extent.start), extent.len()) };
     let mut rgba = vec![0u8; bw as usize * bh as usize * 4];
     for y in 0..bh as usize {
@@ -231,31 +208,24 @@ pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sy
     cursor.bw = bw;
     cursor.bh = bh;
     cursor.serial = cursor.serial.wrapping_add(1);
-    // One-shot sibling of the region breadcrumb above (per stream, via the serial's 0→1 edge):
-    // the first BITMAP — before this line has fired, `overlay()` is `None` and every
-    // blend/forward path is cursorless by construction.
+    // First bitmap (serial 0→1). Until then `overlay()` is `None`.
     if cursor.serial == 1 {
         tracing::info!(w = bw, h = bh, "cursor meta: first cursor bitmap received");
     }
 }
 
-/// The byte range inside the producer's cursor-meta region that a `bh`-row, `row`-wide,
-/// `stride`-strided bitmap at `bmp_off + pix_off` occupies — or `None` when it does not fit, or when
-/// any of the arithmetic overflows.
+/// Byte range of a `bh`-row, `row`-wide, `stride`-strided bitmap at
+/// `bmp_off + pix_off` inside the cursor-meta region, or `None` if it does
+/// not fit or the arithmetic overflows.
 ///
-/// THE bound on `update_cursor_meta`. Every input except `region_size` is producer-written, and
-/// `region_size` is the real byte size of the meta region libspa handed us (which is why the caller
-/// takes `spa_buffer_find_meta` rather than `find_meta_data`). Without this check the offsets drive
-/// out-of-bounds pointer arithmetic and an oversized `slice::from_raw_parts` — an OOB read that
-/// SIGSEGVs inside the PipeWire `.process` callback, where `catch_unwind` cannot help. A stride near
-/// `i32::MAX` is enough to overflow the multiply on its own, so every step is checked.
+/// Every input except `region_size` is producer-written. `region_size` is
+/// the real meta-region size (`find_meta`, not `find_meta_data`). Unchecked
+/// offsets OOB-read; a SIGSEGV in `.process` is uncatchable. A stride near
+/// `i32::MAX` overflows the multiply, so every step is checked.
 ///
-/// `len()` of the returned range is EXACTLY `stride·(bh−1) + row`: the last row contributes only its
-/// `row` visible bytes, not a full stride, so a bitmap that ends flush against the region's end is
-/// accepted rather than rejected by a padding byte that is never read.
-///
-/// Extracted (sweep Phase 6.1) purely so it can be tested — the caller is unreachable without a live
-/// compositor.
+/// Returned `len()` is `stride·(bh−1) + row`: the last row contributes its
+/// visible bytes, not a full stride, so a flush-against-end bitmap is
+/// accepted. Extracted so it can be tested without a live compositor.
 fn bitmap_extent(
     bmp_off: usize,
     pix_off: usize,
@@ -273,9 +243,8 @@ fn bitmap_extent(
     (end <= region_size).then_some(start..end)
 }
 
-/// Destination channel byte offsets (R,G,B) and bytes-per-pixel for a packed-RGB `PixelFormat`,
-/// or `None` for a layout the CPU cursor blit doesn't handle (YUV/10-bit — those never reach
-/// the CPU de-pad path anyway).
+/// Packed-RGB (R,G,B) byte offsets and bytes-per-pixel, or `None` for a
+/// layout the 8-bit CPU blit does not handle (YUV / 10-bit).
 pub(super) fn dst_offsets(fmt: PixelFormat) -> Option<(usize, usize, usize, usize)> {
     Some(match fmt {
         PixelFormat::Bgrx | PixelFormat::Bgra => (2, 1, 0, 4),
@@ -286,11 +255,11 @@ pub(super) fn dst_offsets(fmt: PixelFormat) -> Option<(usize, usize, usize, usiz
     })
 }
 
-/// Alpha-blend the cached cursor bitmap into a packed 10-bit (`X2Rgb10`/`X2Bgr10`) CPU frame:
-/// unpack each u32, blend the 8-bit cursor channels scaled to 10 bits (`v<<2 | v>>6`), repack.
-/// The frame samples are PQ-encoded, so like the 8-bit gamma-space blend this is a display-
-/// referred approximation — fine for a cursor. `r_shift` is the R channel's bit offset (20 for
-/// x:R:G:B, 0 for x:B:G:R); G is always at 10 and B mirrors R.
+/// Alpha-blend the cached cursor into a packed 10-bit (`X2Rgb10`/`X2Bgr10`)
+/// CPU frame: unpack, blend 8-bit channels scaled to 10 (`v<<2 | v>>6`),
+/// repack. Frame samples are PQ; this is a display-referred approximation.
+/// `r_shift` is R's bit offset (20 for x:R:G:B, 0 for x:B:G:R); G is always
+/// at 10 and B mirrors R.
 pub(super) fn composite_cursor_rgb10(
     tight: &mut [u8],
     w: usize,
@@ -298,7 +267,7 @@ pub(super) fn composite_cursor_rgb10(
     r_shift: u32,
     cursor: &CursorState,
 ) {
-    let b_shift = 20 - r_shift; // 0 or 20 — the opposite end from R
+    let b_shift = 20 - r_shift; // 0 or 20 — opposite end from R
     let (bw, bh) = (cursor.bw as i32, cursor.bh as i32);
     for cy in 0..bh {
         let dy = cursor.y + cy;
@@ -315,7 +284,7 @@ pub(super) fn composite_cursor_rgb10(
             if a == 0 {
                 continue;
             }
-            // 8-bit cursor channel → 10-bit (replicate the top bits into the bottom).
+            // 8-bit → 10-bit: replicate the top bits into the bottom.
             let up10 = |v: u8| ((v as u32) << 2) | ((v as u32) >> 6);
             let (sr, sg, sb) = (
                 up10(cursor.rgba[s]),
@@ -334,10 +303,8 @@ pub(super) fn composite_cursor_rgb10(
     }
 }
 
-/// Alpha-blend the cached cursor bitmap into the tightly-packed CPU frame at its latched
-/// position. Cheap: a straight-alpha blit over at most 1024×1024 pixels (the accepted cap; real
-/// cursors are ≤96 px), clipped to the frame —
-/// the whole point of cursor-as-metadata (no forced full-frame composite on the producer).
+/// Alpha-blend the cached cursor into the tightly-packed CPU frame, clipped
+/// to the frame. Bitmap cap is 1024×1024.
 pub(super) fn composite_cursor(
     tight: &mut [u8],
     w: usize,
@@ -348,7 +315,7 @@ pub(super) fn composite_cursor(
     if !cursor.visible || cursor.rgba.is_empty() {
         return;
     }
-    // The packed 10-bit HDR layouts blend via bit unpack/repack, not byte offsets.
+    // Packed 10-bit HDR: unpack/repack, not `dst_offsets`.
     match fmt {
         PixelFormat::X2Rgb10 => return composite_cursor_rgb10(tight, w, h, 20, cursor),
         PixelFormat::X2Bgr10 => return composite_cursor_rgb10(tight, w, h, 0, cursor),
@@ -391,7 +358,6 @@ pub(super) fn composite_cursor(
 mod tests {
     use super::*;
 
-    /// A solid-colour cursor state at `(x, y)`, `w`×`h`, alpha `a`.
     fn cursor(x: i32, y: i32, w: u32, h: u32, rgb: (u8, u8, u8), a: u8) -> CursorState {
         let mut px = Vec::with_capacity((w * h * 4) as usize);
         for _ in 0..w * h {
@@ -412,23 +378,19 @@ mod tests {
         }
     }
 
-    // ---- note_cursor_id: the two producer id-0 contracts --------------------------------------
-
     #[test]
     fn id_zero_hides_only_on_a_rewriting_producer() {
-        // KWin contract (`id0_hides`): id 0 is written fresh on every buffer, so it IS the hide —
-        // a game or Big Picture hiding the pointer must reach the stream.
+        // Rewriting producer (`id0_hides`): id 0 is written fresh on every
+        // buffer, so it is the hide.
         let mut kwin = cursor(10, 10, 8, 8, (255, 255, 255), 255);
         kwin.id0_hides = true;
         assert!(!note_cursor_id(&mut kwin, 0), "id 0 parses no further");
         let o = kwin.overlay().expect("bitmap stays cached across a hide");
         assert!(!o.visible, "KWin id 0 must hide the overlay");
-        // The pointer coming back re-shows the SAME cached bitmap.
         assert!(note_cursor_id(&mut kwin, 1));
         assert!(kwin.overlay().expect("still cached").visible);
 
-        // Mutter contract: recycled buffers carry stale id-0 metas — the last-known state holds
-        // (honoring them flickered the cursor off between hovers, on-glass round 5).
+        // Stale-meta producer: recycled buffers carry id-0; last-known holds.
         let mut mutter = cursor(10, 10, 8, 8, (255, 255, 255), 255);
         assert!(!note_cursor_id(&mut mutter, 0));
         assert!(
@@ -439,27 +401,24 @@ mod tests {
 
     #[test]
     fn id_zero_before_any_bitmap_yields_no_overlay() {
-        // A KWin stream whose pointer was never on the output: hides arrive before any bitmap —
-        // `overlay()` must stay `None` (nothing to blend), not a phantom empty cursor.
+        // Hide before any bitmap: `overlay()` stays `None`, not an empty cursor.
         let mut c = CursorState::new(true);
         assert!(!note_cursor_id(&mut c, 0));
         assert!(c.overlay().is_none());
     }
 
-    // ---- bitmap_extent: the guard whose absence SIGSEGVs uncatchably -------------------------
-
     #[test]
     fn bitmap_extent_accepts_a_bitmap_that_fits() {
         // 4×2 RGBA, tightly packed: 32 bytes at offset 0.
         assert_eq!(bitmap_extent(0, 0, 16, 16, 2, 32), Some(0..32));
-        // …and the same bitmap behind a header + pixel offset.
+        // Same bitmap behind a header + pixel offset.
         assert_eq!(bitmap_extent(24, 8, 16, 16, 2, 64), Some(32..64));
     }
 
     #[test]
     fn bitmap_extent_charges_the_last_row_only_its_visible_bytes() {
-        // stride 32, row 16, 3 rows ⇒ 32*2 + 16 = 80, NOT 96. A bitmap ending flush against the
-        // region must be accepted: the trailing stride padding is never read.
+        // stride 32, row 16, 3 rows ⇒ 32*2 + 16 = 80, not 96. Trailing
+        // stride padding is never read, so a flush-against-end bitmap fits.
         assert_eq!(bitmap_extent(0, 0, 32, 16, 3, 80), Some(0..80));
         assert_eq!(bitmap_extent(0, 0, 32, 16, 3, 79), None, "one byte short");
     }
@@ -467,22 +426,20 @@ mod tests {
     #[test]
     fn bitmap_extent_rejects_anything_past_the_region() {
         assert_eq!(bitmap_extent(0, 0, 16, 16, 2, 31), None);
-        // An offset alone can push it out.
         assert_eq!(bitmap_extent(1, 0, 16, 16, 2, 32), None);
         assert_eq!(bitmap_extent(0, 1, 16, 16, 2, 32), None);
-        // A region of zero accepts nothing.
         assert_eq!(bitmap_extent(0, 0, 16, 16, 1, 0), None);
     }
 
-    /// The producer picks `stride` and both offsets, so each is an overflow vector on its own.
+    /// `stride` and both offsets are producer-picked; each can overflow alone.
     #[test]
     fn bitmap_extent_survives_hostile_arithmetic() {
         // stride × (bh-1) overflows.
         assert_eq!(bitmap_extent(0, 0, usize::MAX, 16, 3, usize::MAX), None);
-        // span + row overflows. Needs ≥2 rows so `stride·(bh−1)` is already at the ceiling: with a
-        // SINGLE row `stride·0 == 0`, and even a `usize::MAX`-wide row is then arithmetically in
-        // range — which is correct rather than a miss, since the caller has already capped `bw` at
-        // 1024 and `row` is therefore ≤ 4096.
+        // span + row overflows. ≥2 rows so `stride·(bh−1)` is already at the
+        // ceiling: one row is `stride·0 == 0`, and `usize::MAX` row is then
+        // in range — correct, because the caller already capped `bw` at 1024
+        // (`row` ≤ 4096).
         assert_eq!(
             bitmap_extent(0, 0, usize::MAX, usize::MAX, 2, usize::MAX),
             None
@@ -494,7 +451,7 @@ mod tests {
             bitmap_extent(usize::MAX - 8, 0, 16, 16, 1, usize::MAX),
             None
         );
-        // A near-i32::MAX stride — the case the SAFETY comment calls out — must not wrap.
+        // Near-`i32::MAX` stride must not wrap.
         assert_eq!(bitmap_extent(0, 0, i32::MAX as usize, 16, 1024, 4096), None);
     }
 
@@ -505,9 +462,6 @@ mod tests {
         assert_eq!(bitmap_extent(0, 0, 8, 16, 2, 4096), None, "stride < row");
     }
 
-    // ---- composite_cursor: clipping, alpha, and every layout --------------------------------
-
-    /// Read pixel `(x, y)`'s (R, G, B) out of a packed frame, honouring the layout's byte order.
     fn px_rgb(buf: &[u8], w: usize, x: usize, y: usize, fmt: PixelFormat) -> (u8, u8, u8) {
         let (ri, gi, bi, bpp) = dst_offsets(fmt).expect("packed layout");
         let i = (y * w + x) * bpp;
@@ -527,10 +481,8 @@ mod tests {
             let bpp = dst_offsets(fmt).unwrap().3;
             let (w, h) = (4usize, 4usize);
             let mut buf = vec![0u8; w * h * bpp];
-            // Opaque pure red at (1, 1).
             composite_cursor(&mut buf, w, h, fmt, &cursor(1, 1, 1, 1, (255, 0, 0), 255));
             assert_eq!(px_rgb(&buf, w, 1, 1, fmt), (255, 0, 0), "{fmt:?}");
-            // Nothing else moved.
             assert_eq!(px_rgb(&buf, w, 0, 0, fmt), (0, 0, 0), "{fmt:?}");
             assert_eq!(px_rgb(&buf, w, 2, 1, fmt), (0, 0, 0), "{fmt:?}");
         }
@@ -573,17 +525,14 @@ mod tests {
     #[test]
     fn transparent_and_hidden_cursors_draw_nothing() {
         let (w, h, fmt) = (2usize, 2usize, PixelFormat::Bgrx);
-        // Alpha 0 — every pixel skipped.
         let mut buf = vec![0u8; w * h * 4];
         composite_cursor(&mut buf, w, h, fmt, &cursor(0, 0, 2, 2, (255, 255, 255), 0));
         assert!(buf.iter().all(|&b| b == 0));
-        // `visible: false` — the whole blit is skipped.
         let mut c = cursor(0, 0, 2, 2, (255, 255, 255), 255);
         c.visible = false;
         let mut buf = vec![0u8; w * h * 4];
         composite_cursor(&mut buf, w, h, fmt, &c);
         assert!(buf.iter().all(|&b| b == 0));
-        // No bitmap yet — likewise.
         let mut c = cursor(0, 0, 2, 2, (255, 255, 255), 255);
         c.rgba = Arc::new(Vec::new());
         let mut buf = vec![0u8; w * h * 4];
@@ -594,13 +543,12 @@ mod tests {
     #[test]
     fn half_alpha_blends_toward_the_destination() {
         let (w, h, fmt) = (1usize, 1usize, PixelFormat::Bgrx);
-        // dst = white, src = black at 50% ⇒ mid grey (integer blend: (0*128 + 255*127)/255 = 127).
+        // dst white, src black at 50% → 127: (0*128 + 255*127)/255.
         let mut buf = vec![255u8; w * h * 4];
         composite_cursor(&mut buf, w, h, fmt, &cursor(0, 0, 1, 1, (0, 0, 0), 128));
         assert_eq!(px_rgb(&buf, w, 0, 0, fmt), (127, 127, 127));
     }
 
-    /// A layout the CPU blit cannot address must be declined, not mis-blitted.
     #[test]
     fn unsupported_layouts_are_declined() {
         assert!(dst_offsets(PixelFormat::Nv12).is_none());
@@ -617,17 +565,15 @@ mod tests {
         assert!(buf.iter().all(|&b| b == 0), "NV12 must not be blitted");
     }
 
-    // ---- composite_cursor_rgb10: the 10-bit unpack/repack round trip -------------------------
-
-    /// Pack an `x:R:G:B` (`X2Rgb10`) pixel — R at bit 20, G at 10, B at 0 — the way a producer does.
+    /// Pack `x:R:G:B` (`X2Rgb10`): R at 20, G at 10, B at 0.
     fn pack_x2rgb10(r: u32, g: u32, b: u32) -> [u8; 4] {
         (0xC000_0000 | (r << 20) | (g << 10) | b).to_le_bytes()
     }
 
     #[test]
     fn the_10bit_path_round_trips_an_untouched_pixel() {
-        // Alpha 0 ⇒ the blend is skipped entirely, so the packed pixel must come back bit-identical
-        // (including the top two bits, which are alpha and must survive the repack).
+        // Alpha 0 skips the blend; the packed pixel (incl. top two alpha
+        // bits) must come back bit-identical.
         for (r, g, b) in [(0, 0, 0), (1023, 1023, 1023), (940, 64, 512), (1, 2, 3)] {
             let src = pack_x2rgb10(r, g, b);
             let mut buf = src.to_vec();
@@ -644,7 +590,7 @@ mod tests {
 
     #[test]
     fn the_10bit_path_writes_the_right_channel_at_the_right_shift() {
-        // Opaque pure red, 8-bit 255 → 10-bit 1023 (the `v<<2 | v>>6` expansion).
+        // Opaque 8-bit 255 → 10-bit 1023 (`v<<2 | v>>6`).
         let mut buf = pack_x2rgb10(0, 0, 0).to_vec();
         composite_cursor(
             &mut buf,
@@ -659,7 +605,7 @@ mod tests {
         assert_eq!(v & 0x3ff, 0, "B");
         assert_eq!(v & 0xc000_0000, 0xc000_0000, "alpha bits preserved");
 
-        // X2Bgr10 puts R at bit 0 and B at 20 — the SAME cursor must land in the other end.
+        // X2Bgr10: R at bit 0, B at 20 — same cursor, other end.
         let mut buf = pack_x2rgb10(0, 0, 0).to_vec();
         composite_cursor(
             &mut buf,
@@ -678,7 +624,6 @@ mod tests {
         let (w, h) = (2usize, 2usize);
         let mut buf: Vec<u8> = (0..w * h).flat_map(|_| pack_x2rgb10(0, 0, 0)).collect();
         let before = buf.clone();
-        // Entirely off-frame.
         composite_cursor(
             &mut buf,
             w,
@@ -701,8 +646,6 @@ mod tests {
         assert_eq!((p1 >> 20) & 0x3ff, 0);
     }
 
-    // ---- decode_bitmap_pixel: the producer's byte order ------------------------------------
-
     #[test]
     fn each_bitmap_format_is_decoded_to_straight_rgba() {
         let s = [1u8, 2, 3, 4];
@@ -722,7 +665,7 @@ mod tests {
             decode_bitmap_pixel(spa::sys::SPA_VIDEO_FORMAT_ABGR, &s),
             (4, 3, 2, 1)
         );
-        // An unknown 4-byte format reads as RGBA rather than being rejected — documented behaviour.
+        // Unknown 4-byte format reads as RGBA, not rejected.
         assert_eq!(decode_bitmap_pixel(0xdead_beef, &s), (1, 2, 3, 4));
     }
 }

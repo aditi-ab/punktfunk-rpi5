@@ -1,5 +1,18 @@
-//! Client side: buffer incoming shards, FEC-recover lost ones, and emit whole access units.
-//! The per-packet [`Reassembler::push`] hot path is kept whole (disjoint field borrows).
+//! Client reassembly: buffer incoming shards, FEC-recover lost ones, emit access units.
+//!
+//! [`Reassembler::push`] is the hot path and is kept as one function (disjoint field
+//! borrows). A malformed header or exhausted in-flight budget drops the packet; it
+//! never aborts the session. Geometry is per-frame: the first packet pins
+//! `shard_bytes`, later packets must match.
+//!
+//! Two index spaces (`video`, `probe`) so a speed-test burst cannot move the video
+//! loss window. Incomplete frames age out after [`LOSS_WINDOW_NS`] of capture time
+//! (or [`HARD_LOSS_WINDOW`] indices). Opt-in paths emit chunk-aligned partials and
+//! slice-progressive prefixes.
+//!
+//! In-flight memory is capped at [`IN_FLIGHT_BUF_FACTOR`] × `max_frame_bytes`.
+//! Pinning: `design/shard-payload-reneg.md`. Late-shard netting:
+//! [`crate::stats::Stats::fec_late_shards`].
 
 use super::*;
 use crate::config::Config;
@@ -10,154 +23,98 @@ use crate::stats::StatsCounters;
 use std::collections::HashMap;
 use zerocopy::FromBytes;
 
-/// How far behind the newest frame's capture pts an INCOMPLETE frame may sit before it is
-/// declared lost (counted in `frames_dropped`, which triggers the client's recovery-keyframe
-/// request). TIME-based, not frame-count-based, so the fuse is the same at every refresh rate: a
-/// fixed index window is refresh-relative (4 frames = 66 ms at 60 fps but only 33 ms at 120 fps —
-/// inside normal Wi-Fi retry/block-ack reorder timescales, where a delayed-not-lost shard can
-/// trail newer frames). Observed live at 120 fps: the too-tight fuse declared merely-late frames
-/// dead every few seconds, and each false loss cost a recovery-IDR burst + an inflated loss report
-/// (FEC churn) — a self-sustaining latency/bitrate oscillation. 120 ms rides safely above radio
-/// retry jitter while still detecting a real loss ~2× faster than the original 16-frame window did
-/// at 60 fps.
+/// Incomplete-frame fuse: capture time behind the newest pts. Time, not index count —
+/// 4 frames is 66 ms at 60 fps and 33 ms at 120 fps, inside Wi-Fi retry/reorder.
+/// 120 ms sits above radio jitter; a real loss still trips ~2× faster than a
+/// 16-frame window at 60 fps. A false trip requests a recovery IDR.
 pub(super) const LOSS_WINDOW_NS: u64 = 120_000_000;
 
-/// Hard cap on how many frame INDICES behind the newest an incomplete frame may sit, whatever its
-/// pts claims — bounds the reassembler's memory against a corrupt/hostile pts (which
-/// [`LOSS_WINDOW_NS`] alone would trust) and against pathologically high frame rates. At 120 fps,
-/// 120 ms ≈ 14 indices, so 64 leaves ample slack up to ~500 fps.
+/// Index cap beside [`LOSS_WINDOW_NS`]. A hostile pts would otherwise grow the
+/// window without bound. 120 ms at 120 fps ≈ 14 indices; 64 covers ~500 fps.
 const HARD_LOSS_WINDOW: u32 = 64;
 
-/// The much tighter fuse for PARTIAL-deliverable frames (chunk-aligned AUs with a consumer
-/// that opted in): once anything newer exists and this much capture time passed, the frame
-/// is delivered as-is — its stragglers can only make it less late, and each frame is
-/// independently decodable, so waiting the full loss window (120 ms) would inject ancient
-/// frames into a live stream. ~2 frame periods at 60 fps rides out normal reorder.
+/// Fuse for opted-in chunk-aligned partials. The full 120 ms would inject
+/// independently-decodable ancient frames into a live stream. 30 ms ≈ 2 periods at 60 fps.
 const PARTIAL_WINDOW_NS: u64 = 30_000_000;
 
-/// How many frames behind the newest the reassembler remembers emitted/abandoned frame indices
-/// (`completed`), so a straggler shard can neither resurrect an abandoned frame nor re-open an
-/// emitted one. Must cover at least [`HARD_LOSS_WINDOW`]: stragglers can trickle in later than the
-/// loss verdict.
+/// How far `completed` remembers emitted/abandoned indices, so a straggler cannot
+/// resurrect them. Must be ≥ [`HARD_LOSS_WINDOW`]: shards can arrive after the verdict.
 const REORDER_WINDOW: u32 = 64;
 
-// ---------------------------------------------------------------------------
-// Client side: reassembly + FEC recovery
-// ---------------------------------------------------------------------------
-
-/// Per-block reassembly state. The block's DATA bytes live in the owning [`FrameBuf::buf`]
-/// (each shard copied once, straight to its final AU offset); this tracks presence and holds
-/// the received recovery shards until the block resolves.
+/// Presence map and held recovery shards. Data bytes live in [`FrameBuf::buf`] at
+/// their final AU offset — this struct never copies them.
 struct BlockState {
-    /// The block's K/M — pinned by the frame geometry derived from `frame_bytes` and validated
-    /// against every packet of the block.
     data_shards: usize,
     recovery_shards: usize,
-    /// The block's base offset in SHARD units — where its data shards land in the frame buffer.
-    /// Uniform (legacy) frames: `block_index × max_data_shards`. Slice-streamed frames
-    /// ([`USER_FLAG_SLICE_STREAM`]): sentinels carry it on the wire (`frame_bytes ÷
-    /// shard_bytes`), the final block derives it from the totals
-    /// (`total_data − final_data_shards`).
+    /// Data-shard origin in the frame buffer. Uniform: `block_index × max_data_shards`.
+    /// Slice-stream: sentinel `frame_bytes / shard_bytes`; final `total_data − K`.
     base_shard: usize,
-    /// Per-data-shard presence: which ranges of the frame buffer hold received bytes (also the
-    /// FEC input map — the codec reads only present slots).
+    /// Present data-shard slots; also the FEC reconstruct input map.
     have_data: Vec<bool>,
     data_received: usize,
-    /// Received recovery shards (pooled shard-sized buffers, reclaimed when the block resolves).
     recovery: Vec<Option<Vec<u8>>>,
     recovery_received: usize,
-    /// Terminal — either reconstructed (its buffer range is fully written) or unrecoverable
-    /// (corrupt shards; the frame can never complete). Later shards for it are ignored.
+    /// Reconstructed or unrecoverable. Later shards for this block are ignored.
     done: bool,
-    /// The block resolved by actually consuming parity (`missing > 0` at reconstruct) — the only
-    /// case where a data shard arriving after `done` was counted into `fec_recovered_shards` and
-    /// must be netted back out as [`fec_late_shards`](crate::stats::Stats::fec_late_shards).
+    /// `true` iff reconstruct consumed parity (`missing > 0`). Only then a late data
+    /// shard was counted in `fec_recovered_shards` and must net into `fec_late_shards`.
     reconstructed: bool,
 }
 
 struct FrameBuf {
-    /// The frame's PINNED shard payload — set by its first-arriving packet (bounds-checked by
-    /// the firewall), matched by every later packet of the frame. Geometry is per-frame so a
-    /// mid-session `shard_payload` change (design/shard-payload-reneg.md) is safe on an
-    /// unordered wire: frames in flight complete under their own pin while new frames arrive
-    /// under the new one, and no cross-geometry splice can land in one buffer.
+    /// Pinned by the first packet; later packets must match. Per-frame so a mid-session
+    /// `shard_payload` change cannot splice two geometries into one buffer.
+    /// See `design/shard-payload-reneg.md`.
     shard_bytes: usize,
-    /// Exact AU size. 0 = unknown: the frame was opened by a streamed-AU SENTINEL packet
-    /// ([`crate::quic::VIDEO_CAP_STREAMED_AU`]) and the final block's real totals haven't
-    /// arrived yet — the frame can't complete before they do (and retro-validate).
+    /// Exact AU size. `0` = opened by a streamed-AU sentinel; cannot complete until
+    /// the final block pins the totals.
     frame_bytes: usize,
-    /// Block count; 0 = unknown (sentinel-opened, totals not yet pinned). A legacy-opened
-    /// frame always has ≥ 1 here, so 0 doubles as the "unpinned streamed" marker.
+    /// `0` = unpinned streamed frame. A legacy-opened frame always has ≥ 1.
     block_count: usize,
     pts_ns: u64,
     user_flags: u32,
-    /// Slice-progressive delivery cursor ([`Reassembler::deliver_parts`]): count of leading
-    /// blocks already handed up as prefix parts...
+    /// Leading blocks already handed up as slice-progressive prefix parts.
     next_part_block: u16,
-    /// ...and their total data shards — the AU shard offset where the next part starts.
+    /// AU shard offset of the next prefix part (`next_part_block`'s start).
     delivered_shards: usize,
-    /// The whole frame's data region — `total_data_shards × shard_bytes` zeroed bytes. Data
-    /// shards are copied to their final offset on arrival; FEC reconstruction writes only the
-    /// missing shards' ranges. On completion this Vec IS [`Frame::data`] (truncated to
-    /// `frame_bytes`) — the old shard→block→AU copy chain and its ~per-packet allocations are
-    /// gone (the 2026-07-14 sweeps pinned the client pump as the ~1.5 Gbps wall, ~85% userspace).
+    /// Whole data region, zeroed. Shards copy to their final offset; FEC writes only
+    /// the holes. On completion this Vec is [`Frame::data`] (truncated to `frame_bytes`).
     buf: Vec<u8>,
     blocks: HashMap<u16, BlockState>,
-    /// Blocks fully reconstructed into `buf`. The frame completes when this reaches
-    /// `block_count` (a failed block never counts — the frame then ages out as dropped).
+    /// Blocks reconstructed into `buf`. A failed block never counts; the frame ages out.
     blocks_ok: usize,
 }
 
-/// Per-session bounds the reassembler enforces on every packet header *before*
-/// allocating, so a hostile or corrupt header cannot drive unbounded memory use. All
-/// derived from the negotiated [`Config`].
+/// Per-session header bounds, applied before any allocation. Derived from [`Config`].
 ///
-/// Shard geometry is PER-FRAME, not per-session (mid-session shard-payload renegotiation,
-/// design/shard-payload-reneg.md W0.1): a frame's first-arriving packet pins the frame's
-/// `shard_bytes` within `[min_shard_bytes, max_shard_bytes]`, later packets must match the
-/// pin, and the per-frame block ceiling derives from the pinned size (a shrunk shard needs
-/// more blocks for the same bytes). The reorder race between an ordered control-stream
-/// geometry change and the unordered video datagrams is thereby killed structurally — every
-/// frame is wholly one geometry, whichever order its packets and the change arrive in.
+/// Geometry is per-frame, not per-session (`design/shard-payload-reneg.md`): the first
+/// packet pins `shard_bytes` in `[min_shard_bytes, max_shard_bytes]`; later packets
+/// must match; the block ceiling derives from the pin (a smaller shard needs more
+/// blocks). Ordered control-stream changes cannot splice unordered datagrams.
 #[derive(Clone, Copy, Debug)]
 pub struct ReassemblerLimits {
-    /// Floor for a frame's pinned shard payload — [`crate::config::MIN_SHARD_PAYLOAD`] in
-    /// production (or the negotiated value when a session legitimately starts below it).
+    /// Floor of the per-frame pin. Production is [`crate::config::MIN_SHARD_PAYLOAD`];
+    /// a hand-configured session may start below it.
     pub min_shard_bytes: usize,
-    /// Ceiling for a frame's pinned shard payload — what this receive path accepts and what
-    /// the client advertises in `Hello::max_shard_payload`
-    /// ([`crate::config::max_shard_payload`]): the transport recv buffers are sized for a
-    /// sealed datagram of exactly this shard size.
+    /// Ceiling of the pin, advertised in `Hello::max_shard_payload`. Recv buffers are
+    /// sized for a sealed datagram of this shard size.
     pub max_shard_bytes: usize,
-    /// Max data shards per block (the negotiated `max_data_per_block`).
     pub max_data_shards: usize,
-    /// Max total shards per block (data + recovery), capped by the FEC scheme ceiling.
     pub max_total_shards: usize,
-    /// Max accepted access-unit size.
     pub max_frame_bytes: usize,
 }
 
 impl ReassemblerLimits {
     pub fn from_config(c: &Config) -> Self {
         let max_data = c.fec.max_data_per_block as usize;
-        // Size the ceiling from the whole range adaptive FEC may reach, NOT from the percentage
-        // negotiated at session start: the sender moves `fec_percent` live (`Packetizer::
-        // set_fec_percent`, clamped to ≤ 90) and the wire is self-describing, so it never
-        // renegotiates. Deriving this from the start value made every packet of a large block
-        // fail the `total > max_total_shards` check once FEC ramped up — the block never
-        // accumulated a shard, the frame aged out, and the resulting loss drove FEC *higher*,
-        // wedging large frames at 100% loss exactly when FEC was meant to rescue the link. A
-        // current sender also clamps its side (`Packetizer::recovery_for`); this keeps an
-        // already-deployed sender that doesn't from wedging a current receiver. Still a hard
-        // pre-allocation bound against hostile headers — just the sender's clamp, not a stale
-        // snapshot of it.
+        // Ceiling from the 90% live FEC range, not the session-start percent. The
+        // sender ramps `fec_percent` without renegotiating; a stale snapshot then
+        // fails `total > max_total_shards` and wedges large frames at 100% loss.
         let max_total =
             (max_data + (max_data * 90).div_ceil(100)).min(c.fec.scheme.max_total_shards());
         ReassemblerLimits {
-            // `.min(c.shard_payload)`: never reject the session's own negotiated value — a
-            // hand-configured session below the production floor still reassembles itself. It
-            // can't be a NEGOTIATED one: `Config::validate` refuses a sub-floor value on the
-            // client, which is the only side that takes it from the peer's `Welcome`.
+            // Never reject the session's own `shard_payload`. Only the client takes
+            // that from `Welcome`, and `Config::validate` already refuses a sub-floor.
             min_shard_bytes: crate::config::MIN_SHARD_PAYLOAD.min(c.shard_payload),
             max_shard_bytes: crate::config::max_shard_payload(),
             max_data_shards: max_data,
@@ -167,63 +124,44 @@ impl ReassemblerLimits {
     }
 }
 
-/// One frame-index space's reassembly state: the in-flight frames, the recently-emitted memory,
-/// and the loss-window anchor. The [`Reassembler`] keeps two — video and speed-test probe filler —
-/// because the two ride **separate index counters** on a [`VIDEO_CAP_PROBE_SEQ`]-aware host
-/// (a probe burst must neither advance the video loss window nor be dropped as "stale" against
-/// it). [`VIDEO_CAP_PROBE_SEQ`]: crate::quic::VIDEO_CAP_PROBE_SEQ
+/// One index space: in-flight frames, recently-emitted memory, loss-window anchor.
+/// [`Reassembler`] keeps two — video and probe — because they use separate counters
+/// ([`VIDEO_CAP_PROBE_SEQ`]): a probe burst must not move the video loss window.
+/// [`VIDEO_CAP_PROBE_SEQ`]: crate::quic::VIDEO_CAP_PROBE_SEQ
 #[derive(Default)]
 struct ReassemblyWindow {
     frames: HashMap<u32, FrameBuf>,
-    /// Recently-terminated frames (emitted OR abandoned by the loss window), so stray/late shards
-    /// can't resurrect them. The value is the frame's parity-restored data shards (frame-wide
-    /// index `block × max_data_shards + shard`, usually empty): each was counted into
-    /// `fec_recovered_shards` at reconstruct, so when one ARRIVES after all — late, not lost —
-    /// it's removed here and counted into `fec_late_shards` for the loss windows to net out
-    /// (reordering alone must not read as packet loss). The removal makes the accounting exact:
-    /// a wire duplicate of a shard that did arrive matches nothing and counts nothing. Pruned to
-    /// the reorder window alongside `frames`.
+    /// Terminated frame indices (emitted or abandoned) so a straggler cannot resurrect
+    /// them. Values are parity-restored shard indexes (`block × max_data_shards + shard`);
+    /// a later arrival nets `fec_recovered_shards` into `fec_late_shards`. Removal keeps
+    /// duplicates from counting twice. Pruned with `frames` to [`REORDER_WINDOW`].
     completed: HashMap<u32, Vec<u32>>,
-    /// The newest frame seen, as `(frame_index, capture pts)` — the loss-window anchor: an
-    /// incomplete frame is declared lost once it sits [`LOSS_WINDOW_NS`] behind this pts (or
-    /// [`HARD_LOSS_WINDOW`] indices, whichever trips first).
+    /// Loss-window anchor `(frame_index, capture pts)`. Incomplete frames die once they
+    /// sit [`LOSS_WINDOW_NS`] behind this pts or [`HARD_LOSS_WINDOW`] indices.
     newest_frame: Option<(u32, u64)>,
 }
 
-/// Frame buffers are allocated whole (zeroed) at a frame's first shard, so bound how much a
-/// window of tiny first-shards can commit: the sum of in-flight `FrameBuf::buf` bytes (both index
-/// spaces) may not exceed `IN_FLIGHT_BUF_FACTOR × max_frame_bytes`. Honest streams hold 1–3
-/// partially-arrived frames of ACTUAL size (≪ max); without this cap, [`HARD_LOSS_WINDOW`]
-/// max-sized declarations from one header-sized packet each could commit gigabytes — an
-/// amplification the old sparse per-shard allocation didn't have.
+/// Cap on in-flight `FrameBuf::buf` bytes (both index spaces): factor × `max_frame_bytes`.
+/// Buffers are allocated whole at the first shard; without this, [`HARD_LOSS_WINDOW`]
+/// max-sized frames opened by one header each could commit gigabytes.
 pub(super) const IN_FLIGHT_BUF_FACTOR: usize = 4;
 
-/// Recovery-shard buffer pool ceiling (shard-sized buffers): enough for several max-recovery
-/// blocks in flight, small enough (~720 KB at a 1408-byte shard) to keep after a loss burst.
-/// Entries size themselves to the largest shard they ever held, so a jumbo session (opt-in,
-/// desktop-LAN — shards up to [`ReassemblerLimits::max_shard_bytes`]) retains proportionally
-/// more; it also needs ~6× fewer buffers per block, so the pool rarely fills there.
+/// Recovery-shard pool cap. Several max-recovery blocks; ~720 KB at a 1408-byte shard.
+/// Jumbo sessions keep larger entries but need ~6× fewer buffers per block.
 const RECOVERY_POOL_MAX: usize = 512;
 
-/// Byte cost a [`BlockState`] commits to the in-flight budget. Both vectors are sized from
-/// attacker-declared header fields (`data_shards`, `recovery_shards`), so a slice-streamed frame
-/// can mint thousands of distinct-index blocks while its `FrameBuf::buf` stays pinned near zero —
-/// they must be metered exactly like the buffer, or the firewall meters only half the allocation
-/// (security-review 2026-08-15 finding 11).
-///
-/// `pub(super)` so the budget tests can locate the refusal boundary from the cost model itself
-/// rather than from a baked-in frame count — [`BlockState`] gaining a field moves that boundary,
-/// and a test that hard-codes it answers such a change with an arithmetic puzzle instead of the
-/// question actually worth asking.
+/// Bytes a [`BlockState`] charges the in-flight budget. Vectors size from header
+/// fields, so a slice-streamed frame can mint thousands of blocks while `buf` stays
+/// near zero — they must meter like the buffer. `pub(super)` so budget tests read
+/// the cost model instead of a baked-in frame count.
 pub(super) fn block_state_bytes(data_shards: usize, recovery_shards: usize) -> usize {
     std::mem::size_of::<BlockState>()
         + data_shards // have_data: Vec<bool>
         + recovery_shards * std::mem::size_of::<Option<Vec<u8>>>() // recovery slot table
 }
 
-/// Everything a frame has committed to the in-flight budget: its zeroed buffer plus every block's
-/// state. Computed at each release site BEFORE any `buf` truncation, so it nets exactly against the
-/// increments made at buffer allocation and block insertion.
+/// Call before any `buf` truncate so release nets the increments made at
+/// allocation and block insert.
 fn frame_cost(f: &FrameBuf) -> usize {
     f.buf.len()
         + f.blocks
@@ -232,10 +170,8 @@ fn frame_cost(f: &FrameBuf) -> usize {
             .sum::<usize>()
 }
 
-/// Move a block's held parity buffers to the pool and credit their payload bytes back to the
-/// in-flight budget — the exact mirror of the charge made when each shard was inserted. Every
-/// take-out of `BlockState::recovery` must route through here, or the budget drifts and the
-/// firewall meters only part of the allocation (security-review 2026-08-31 M-5).
+/// Return held parity buffers to the pool and credit their bytes. Every take-out of
+/// `BlockState::recovery` must go through here or the in-flight budget drifts.
 fn reclaim_parity(
     block: &mut BlockState,
     recovery_pool: &mut Vec<Vec<u8>>,
@@ -251,37 +187,24 @@ fn reclaim_parity(
     }
 }
 
-/// Buffers incoming shards, recovers lost ones via FEC, and emits whole access units.
-/// Client-side only.
 pub struct Reassembler {
     limits: ReassemblerLimits,
-    /// Deliver aged-out incomplete frames whose AUs are [`USER_FLAG_CHUNK_ALIGNED`] instead of
-    /// silently dropping them (client opt-in — the PyroWave decode path): the frame buffer is
-    /// already the right shape (received shards at their final offsets, zeros elsewhere).
-    /// They still count into `frames_dropped` — a partial IS lost data for the loss reports.
+    /// Opt-in: emit aged-out [`USER_FLAG_CHUNK_ALIGNED`] frames instead of dropping
+    /// them. Still counted in `frames_dropped` — a partial is lost data.
     deliver_partial: bool,
-    /// The newest such partial awaiting pickup (newest-wins: partials are a lossy byproduct).
+    /// Newest parked partial (newest-wins; partials are lossy).
     pending_partial: Option<Frame>,
-    /// Deliver each video AU's newly-contiguous PREFIX as [`Frame`]s with
-    /// [`Frame::part`]`= Some` while the rest is still in flight (client opt-in — the
-    /// slice-progressive decode path). Works for any multi-block frame — both streamed shapes
-    /// and legacy uniform frames tile their blocks contiguously (`BlockState::base_shard`).
+    /// Opt-in: emit each newly-contiguous AU prefix as a [`Frame`] with `part = Some`
+    /// while the rest is still in flight. Any multi-block frame tiles via `base_shard`.
     deliver_parts: bool,
-    /// The video stream's window — its aged-out incomplete frames count into `frames_dropped`
-    /// (the client's loss-recovery trigger).
+    /// Video index space. Aged-out frames count as `frames_dropped` (recovery trigger).
     video: ReassemblyWindow,
-    /// Speed-test probe filler ([`FLAG_PROBE`] in `user_flags`). Routed by the flag, so it also
-    /// captures an OLD host's probe frames (which still carry video-space indexes — they complete
-    /// fine here, and keeping them out of the video window means a burst can no longer advance the
-    /// video loss anchor). Aged-out probe frames are NOT `frames_dropped` — probe loss is measured
-    /// bytes-wise by the probe accumulator and must not fire video recovery.
+    /// Probe filler ([`FLAG_PROBE`]), including old hosts that still use video indexes.
+    /// Aged-out probes are not `frames_dropped` — that would fire video recovery.
     probe: ReassemblyWindow,
-    /// Reusable shard-sized buffers for received recovery shards — the only shard bytes that
-    /// still need their own storage (data shards land straight in the frame buffer). Capped at
-    /// [`RECOVERY_POOL_MAX`].
+    /// Pooled recovery-shard buffers. Data shards land in the frame buffer; these do not.
     recovery_pool: Vec<Vec<u8>>,
-    /// Sum of in-flight `FrameBuf::buf` bytes PLUS per-block [`BlockState`] cost across both
-    /// windows (see [`IN_FLIGHT_BUF_FACTOR`] and [`block_state_bytes`]).
+    /// In-flight `buf` bytes plus per-block [`block_state_bytes`], both windows.
     in_flight_bytes: usize,
 }
 
@@ -299,7 +222,6 @@ impl Reassembler {
         }
     }
 
-    /// Opt into partial delivery of chunk-aligned frames (see [`Reassembler::deliver_partial`]).
     pub fn set_deliver_partial(&mut self, on: bool) {
         self.deliver_partial = on;
         if !on {
@@ -307,28 +229,23 @@ impl Reassembler {
         }
     }
 
-    /// Opt into slice-progressive prefix delivery (see [`Reassembler::deliver_parts`]).
     pub fn set_deliver_parts(&mut self, on: bool) {
         self.deliver_parts = on;
     }
 
-    /// Take the newest aged-out partial frame, if one is pending (see `set_deliver_partial`).
     pub fn take_partial(&mut self) -> Option<Frame> {
         self.pending_partial.take()
     }
 
-    /// Ingest one (already-decrypted) packet. Returns the access unit when its last
-    /// block completes, otherwise `None`.
+    /// Ingest one already-decrypted packet. The AU when its last block completes, else `None`.
     pub fn push(
         &mut self,
         pkt: &[u8],
         coder: &dyn ErasureCoder,
         stats: &StatsCounters,
     ) -> Result<Option<Frame>> {
-        // On a lossy datagram link a malformed or non-video packet is dropped, never
-        // fatal: it must not abort `poll_frame`. A FEC reconstruction failure (corrupt or
-        // incompatible shards that passed the header checks) likewise drops the block rather
-        // than killing the whole session — the stream recovers at the next keyframe/RFI.
+        // Malformed or non-video: drop, never fatal — must not abort `poll_frame`.
+        // A reconstruct failure drops the block; the stream recovers at the next keyframe.
         if pkt.len() < HEADER_LEN {
             StatsCounters::add(&stats.packets_dropped, 1);
             return Ok(None);
@@ -341,8 +258,8 @@ impl Reassembler {
             }
         };
 
-        // Disjoint field borrows: the window (`video`/`probe`), the recovery pool, and the
-        // in-flight budget are all touched while a frame entry is mutably borrowed.
+        // Split so the window, pool, and in-flight budget can be touched while a
+        // frame entry is mutably borrowed.
         let Reassembler {
             limits,
             deliver_partial,
@@ -363,12 +280,9 @@ impl Reassembler {
         let block_count = hdr.block_count as usize;
         let frame_bytes = hdr.frame_bytes as usize;
 
-        // Bound every attacker-controllable header field against the negotiated limits
-        // BEFORE allocating anything keyed on it — this is the firewall against a tiny
-        // datagram triggering a huge `vec![None; total]` / `Vec::with_capacity`.
-        // `shard_bytes` is bounds-checked (not equality-checked) because geometry is
-        // per-frame — the frame-pin check below is what rejects a size CHANGE mid-frame;
-        // the even requirement mirrors `Config::validate` (FEC requires even shards).
+        // Bound every attacker-controlled header field before allocating on it.
+        // `shard_bytes` is a range, not equality: geometry is per-frame; the pin
+        // below rejects a mid-frame change. Even size matches `Config::validate`.
         let drop = |stats: &StatsCounters| {
             StatsCounters::add(&stats.packets_dropped, 1);
         };
@@ -387,44 +301,31 @@ impl Reassembler {
             drop(stats);
             return Ok(None);
         }
-        // Streamed-AU sentinel ([`crate::quic::VIDEO_CAP_STREAMED_AU`]): `block_count == 0` — a
-        // value no legacy sender ever emits — marks a NON-FINAL block of an AU whose total size
-        // doesn't exist yet (the host is still encoding its tail). The exact derived-geometry
-        // check below can't run without a total, so a sentinel is bounded by the negotiated
-        // limits instead — and by construction: full-K exactly (the offset formula needs it),
-        // never the last block the limits allow (the real final block must still fit after it),
-        // and no total to lie about. The frame-wide exact check runs retroactively the moment
-        // the final block's real totals arrive (the pinning arm below).
+        // Streamed-AU sentinel: `block_count == 0` (legacy never emits 0) is a
+        // non-final block of an AU whose total is still unknown. Bound by negotiated
+        // limits: full-K, not the last allowed block. Exact geometry waits for the pin.
         let sentinel = block_count == 0;
-        // Slice-streamed frames (the P2 pipeline): variable-size, base-addressed blocks — the
-        // uniform-geometry rules below don't apply to ANY of their blocks (see
-        // [`USER_FLAG_SLICE_STREAM`]). Flagged on every packet because reorder can deliver the
-        // final block first.
+        // Variable-size, base-addressed blocks: uniform rules below do not apply.
+        // Flagged on every packet because reorder can deliver the final block first.
         let slice_stream = hdr.user_flags & crate::packet::USER_FLAG_SLICE_STREAM != 0;
         let block_idx = hdr.block_index as usize;
-        // The most data shards any frame can carry under THIS packet's shard size: the ceiling the
-        // per-frame block caps below derive from, and the clamp on a frame's buffer extent. NOT
-        // what a frame is allocated at — that is only ever the extent its packets have PROVEN
-        // (see `need_shards`), which is what keeps one small datagram from committing the whole
-        // negotiated frame ceiling; the in-flight budget bounds the rest.
+        // Per-packet shard-size ceiling for block caps and buffer extent. Allocation
+        // uses only what this packet proves (`need_shards`); the in-flight budget
+        // bounds the rest — one datagram must not commit `max_frame_bytes`.
         let total_data_max = lim.max_frame_bytes.div_ceil(shard_bytes).max(1);
-        // The per-frame FEC-block ceiling under THIS packet's shard size (geometry is
-        // per-frame: a shrunk shard needs more blocks for the same bytes, so a session-level
-        // cap from the negotiated size would reject legitimate post-shrink frames). Mirrors
-        // the sender's `Packetizer::new` for whatever size it currently packetizes at.
+        // Per-frame FEC-block ceiling at this shard size. A session-level cap from
+        // the negotiated size would reject legitimate post-shrink frames.
         let max_blocks = total_data_max.div_ceil(lim.max_data_shards).max(1);
-        // The slice pipeline's per-frame block ceiling: every non-final slice block carries at
-        // least `min(MIN_STREAM_BLOCK_SHARDS, max_data_per_block)` data shards (the sender's
-        // flush floor, clamped by the block size), so a max-size frame bounds the block count
-        // (+ the final block and one rounding block). Mirrors `Packetizer::slice_block_cap`.
+        // Slice pipeline: every non-final block is at least
+        // `min(MIN_STREAM_BLOCK_SHARDS, max_data_per_block)` data shards, so a
+        // max-size frame bounds the count (+ final + rounding). Matches the sender.
         let slice_block_cap = total_data_max
             / super::packetize::MIN_STREAM_BLOCK_SHARDS.min(lim.max_data_shards.max(1))
             + 2;
         let total_data = frame_bytes.div_ceil(shard_bytes).max(1);
         if sentinel && slice_stream {
-            // Slice-granularity sentinel: `frame_bytes` is the block's BASE byte offset —
-            // shard-aligned by contract, and the block's whole range must fit the negotiated
-            // frame budget (placement re-checks against the live buffer too).
+            // Slice sentinel: `frame_bytes` is the block's base byte offset.
+            // Shard-aligned; the block's range must fit the negotiated frame budget.
             if frame_bytes % shard_bytes != 0
                 || frame_bytes + data_shards * shard_bytes > lim.max_frame_bytes
                 || block_idx + 1 >= slice_block_cap
@@ -449,11 +350,9 @@ impl Reassembler {
                 return Ok(None);
             }
             if slice_stream {
-                // Slice-streamed frames: the earlier blocks are variable-size, so the uniform
-                // derivation below is meaningless — only the FINAL block is ever non-sentinel,
-                // and its geometry must be self-consistent: it IS the last block, its K fits
-                // the negotiated block size, and its shards fit inside the frame (its base
-                // derives as `total_data − data_shards`).
+                // Only the final block is non-sentinel. It must be last, K must fit
+                // the block size, and its shards must sit in the frame
+                // (`base = total_data − data_shards`).
                 if block_idx + 1 != block_count
                     || data_shards > lim.max_data_shards
                     || data_shards > total_data
@@ -462,15 +361,10 @@ impl Reassembler {
                     return Ok(None);
                 }
             } else {
-                // Derived-geometry firewall: every sender (our Packetizer, any version) slices
-                // a frame into consecutive blocks of exactly `max_data_per_block` data shards
-                // with only the LAST block smaller, and stamps the exact `frame_bytes` in every
-                // non-sentinel header. That makes every data shard's final AU offset computable
-                // on arrival —
-                //     offset = (block_index × max_data_per_block + shard_index) × shard_bytes
-                // — which is what lets shards land straight in the frame buffer below. Enforce
-                // the invariant so a header lying about its geometry is dropped instead of
-                // scribbling into another shard's range.
+                // Uniform sender: consecutive full-K blocks, last smaller, exact
+                // `frame_bytes` on every non-sentinel. Offset
+                // `(block × max_data_per_block + shard) × shard_bytes` is then
+                // computable on arrival. A mismatched header is dropped, not placed.
                 let expect_blocks = total_data.div_ceil(lim.max_data_shards).max(1);
                 let expect_data_shards = if block_idx + 1 == expect_blocks {
                     total_data - (expect_blocks - 1) * lim.max_data_shards
@@ -485,19 +379,13 @@ impl Reassembler {
         }
         let body = &pkt[HEADER_LEN..HEADER_LEN + shard_bytes];
 
-        // Route by index space: speed-test probe filler (FLAG_PROBE in user_flags) reassembles in
-        // its own window so its indexes never interact with the video loss window — a probe burst
-        // can neither advance the video anchor nor be dropped as stale against it (and its aged-out
-        // frames never count as `frames_dropped`, which would fire video loss recovery).
+        // Probe filler reassembles in its own window so its indexes never move the
+        // video loss window or count as `frames_dropped`.
         let is_probe = hdr.user_flags & (FLAG_PROBE as u32) != 0;
         if is_probe {
-            // Probe-scoped receive accounting (the speed-test numerator + denominator, see
-            // `Stats::probe_first_arrival_ns`), stamped at the routing decision so video in
-            // flight around the burst contaminates neither the byte count nor the arrival
-            // stamps. Byte unit mirrors `bytes_received` (whole plaintext packet). The first
-            // probe packet since the pump armed the probe claims the first-arrival slot (the
-            // pump zeroes it before the burst can reach the host); every probe packet
-            // refreshes the last-arrival stamp.
+            // Probe receive accounting, stamped at the routing decision so video in
+            // flight around the burst cannot contaminate it. Bytes = whole plaintext
+            // packet. First packet since the pump zeroed the slot claims first-arrival.
             let now_ns = crate::stats::now_monotonic_ns();
             StatsCounters::add(&stats.probe_packets_received, 1);
             StatsCounters::add(&stats.probe_bytes_received, pkt.len() as u64);
@@ -511,11 +399,8 @@ impl Reassembler {
                 .probe_last_arrival_ns
                 .store(now_ns, std::sync::atomic::Ordering::Relaxed);
         } else if hdr.shard_index < hdr.data_shards {
-            // Media accounting (see `Stats::media_bytes_received`): DATA shards only, payload
-            // only. Stamped at the same routing decision as the probe counters and for the same
-            // reason — the adaptive-bitrate utilization gate compares delivered throughput
-            // against an ENCODER target, so parity, headers and probe filler have no business
-            // in the numerator.
+            // DATA payload only. ABR compares delivered throughput to an encoder
+            // target, so parity, headers, and probe filler stay out of the numerator.
             StatsCounters::add(&stats.media_bytes_received, shard_bytes as u64);
         }
         let win = if is_probe { probe } else { video };
@@ -530,16 +415,12 @@ impl Reassembler {
             (*deliver_partial && !is_probe).then_some(pending_partial),
         );
 
-        // Drop shards for frames already terminated (emitted — e.g. the recovery shards of a
-        // frame that completed early via the all-originals-present fast path — or abandoned by
-        // the loss window) and for frames that have fallen out of the loss window entirely.
+        // Terminated (emitted or abandoned): drop. Recovery shards of an early-complete
+        // frame land here; a late original nets `fec_late_shards` below.
         if let Some(reconstructed) = win.completed.get_mut(&hdr.frame_index) {
-            // A data shard the parity reconstruct already restored (and counted into
-            // `fec_recovered_shards`) was late, not lost: count the arrival so the loss windows
-            // net it out (`recovered - late`), or plain reordering reads as packet loss and
-            // spooks adaptive FEC + the bitrate controller. Removing the match keeps it exact —
-            // wire duplicates of delivered shards match nothing, recovery shards are never in
-            // the list. No probe/video split: `fec_recovered_shards` counts both windows.
+            // A data shard parity already restored was late, not lost. Count it so
+            // loss windows net `recovered − late`; reordering must not look like loss.
+            // Remove the match so wire duplicates count nothing. No probe/video split.
             if shard_index < data_shards {
                 let fw = block_idx as u32 * lim.max_data_shards as u32 + shard_index as u32;
                 if let Some(pos) = reconstructed.iter().position(|&s| s == fw) {
@@ -555,48 +436,34 @@ impl Reassembler {
             return Ok(None);
         }
 
-        // How many shards of frame buffer THIS packet proves the frame needs. A sentinel carries
-        // no total, but it does pin its own block's extent — a slice sentinel by its wire base,
-        // a legacy one by its full-K position — and that is what the buffer must cover to place
-        // the shard. The frame grows as later blocks reveal more, and the final (non-sentinel)
-        // block's totals settle it.
-        //
-        // ⚠ NOT `total_data_max` (= the negotiated `max_frame_bytes`, 8-64 MiB): that shape
-        // shipped in 0.23.0 and was survivable only while sentinels were rare — the streamed
-        // path emitted one solely for an AU exceeding a whole FEC block (~281 KB). The slice
-        // wire flushes at `MIN_STREAM_BLOCK_SHARDS`, so EVERY ordinary AU became sentinel-opened
-        // and every one of them committed the full ceiling: a multi-megabyte zeroed allocation
-        // per access unit, and an in-flight budget (`IN_FLIGHT_BUF_FACTOR × max_frame_bytes`)
-        // exhausted after ~3 concurrent frames — beyond which every packet of every further
-        // frame was dropped outright. On a jittery link that is a permanent loss storm.
+        // Extent this packet proves the buffer needs. A sentinel has no total but
+        // pins its own block (slice: wire base; legacy: full-K position). Never
+        // `total_data_max` (8–64 MiB): every slice AU would open at the ceiling and
+        // exhaust the in-flight budget after ~3 concurrent frames.
         let need_shards = if sentinel && slice_stream {
             frame_bytes / shard_bytes + data_shards
         } else if sentinel {
-            // Legacy sentinels are full-K uniform blocks (firewall-enforced), so the block's
-            // index alone gives its end.
+            // Full-K uniform (firewall-enforced); the block index alone gives the end.
             (block_idx + 1).saturating_mul(lim.max_data_shards)
         } else {
             total_data
         }
         .min(total_data_max);
-        // First packet of a frame allocates its (zeroed) buffer, budget-gated; later packets must
-        // agree with its geometry.
         let buf_len = need_shards * shard_bytes;
         let frame = match win.frames.entry(hdr.frame_index) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
                 if *in_flight_bytes + buf_len > IN_FLIGHT_BUF_FACTOR * lim.max_frame_bytes {
-                    // Budget exhausted (several max-size frames all partially in flight) — a
-                    // stream this bites is already deep in loss; dropping the packet is strictly
-                    // milder than what the loss window would do to the frame moments later.
+                    // Several max-size frames already in flight. Dropping this packet
+                    // is milder than the loss window killing the frame moments later.
                     drop(stats);
                     return Ok(None);
                 }
                 *in_flight_bytes += buf_len;
                 e.insert(FrameBuf {
                     shard_bytes,
-                    // A slice-stream sentinel's `frame_bytes` is its block's BASE offset, not a
-                    // frame size — the unpinned marker stays 0 until the final block's totals.
+                    // Slice sentinel `frame_bytes` is the block base, not AU size.
+                    // Stay 0 until the final block pins the totals.
                     frame_bytes: if sentinel { 0 } else { frame_bytes },
                     block_count,
                     pts_ns: hdr.pts_ns,
@@ -609,39 +476,31 @@ impl Reassembler {
                 })
             }
         };
-        // Per-frame geometry pin: the frame's first packet pinned its shard size; a later
-        // packet claiming a different (even in-bounds) size is dropped — otherwise two
-        // geometries would compute different offsets into one buffer (a splice). This is
-        // also what makes a mid-session `shard_payload` change safe against reorder: a
-        // straggler of the old geometry can only ever land in ITS OWN frame's buffer.
+        // First packet pinned shard size; a later in-bounds but different size would
+        // compute different offsets into one buffer. Also keeps a mid-session
+        // `shard_payload` change from landing a straggler in the wrong geometry.
         if frame.shard_bytes != shard_bytes {
             drop(stats);
             return Ok(None);
         }
-        // The slice marker must be frame-consistent: a mixed frame would firewall under one
-        // placement rule and place under the other. The per-packet checks above and the
-        // placement bounds guard below stay memory-safe without this — it's the tighter drop.
+        // Mixed slice/uniform would firewall under one rule and place under the other.
+        // Placement stays memory-safe without this; this is the tighter drop.
         if (frame.user_flags ^ hdr.user_flags) & crate::packet::USER_FLAG_SLICE_STREAM != 0 {
             drop(stats);
             return Ok(None);
         }
         if sentinel {
-            // Sentinel packets carry no totals to cross-check: while the frame is unpinned
-            // (`block_count == 0`) they match by construction, and once the totals are pinned —
-            // whichever packet arrived first, sentinel or final (reorder is normal) — a
-            // sentinel block must still be NON-final under them. Its full-K shape was already
-            // enforced by the firewall, which is exactly what the pinned geometry demands of
-            // every non-final block, and its shard offsets are within the pinned range by
-            // `block_idx + 1 < block_count`.
+            // No totals to cross-check. Unpinned: match by construction. Once pinned
+            // (either order — reorder is normal), a sentinel must still be non-final.
+            // Full-K was already enforced; offsets sit in range by `idx + 1 < count`.
             if frame.block_count != 0 {
                 if block_idx + 1 >= frame.block_count {
                     drop(stats);
                     return Ok(None);
                 }
                 if slice_stream {
-                    // The final block pinned the totals, so it exists in `blocks` (the pinning
-                    // packet created it) — a sentinel arriving after the pin must fit strictly
-                    // below its base or it could scribble over the final block's landed shards.
+                    // The pinning packet created the final block. A later sentinel
+                    // must sit strictly below its base or it overwrites landed shards.
                     let final_k = frame
                         .blocks
                         .get(&((frame.block_count - 1) as u16))
@@ -655,22 +514,15 @@ impl Reassembler {
                 }
             }
         } else if frame.block_count == 0 {
-            // A streamed frame meets its FINAL block's real totals: retro-validate every block
-            // the sentinels created against the exact geometry these totals derive (the same
-            // invariant the firewall enforces per-packet for legacy frames), then PIN them. A
-            // header that lies — totals under which an already-received sentinel block is
-            // out of range or not full-K — kills the WHOLE frame: its landed shards can't be
-            // trusted to be at the offsets this geometry means, so delivering any of it would
-            // hand the decoder spliced bytes.
+            // Final-block totals arrived: retro-validate every sentinel-created block
+            // against the geometry these totals derive, then pin. Totals that put an
+            // already-received block out of range or not full-K drop the whole frame —
+            // landed offsets cannot be trusted, so delivering would splice the decoder.
             let lied = if slice_stream {
-                // Slice frames have no uniform shape to demand — the invariant is positional:
-                // every sentinel block must sit strictly below the final block's base
-                // (`total_data − data_shards`; the firewall already proved the subtraction
-                // safe) and be a non-final index. Sentinel-vs-sentinel overlap is not policed
-                // HERE — placement stays in-bounds by these checks, so a lying base can only
-                // corrupt this frame's own bytes, never memory — but the completion tiling
-                // check below refuses to deliver such a frame (black-band corruption from a
-                // buggy, AEAD-authenticated sender would otherwise ship as `complete`).
+                // No uniform K to demand. Every sentinel must sit strictly below the
+                // final base (`total_data − data_shards`; subtraction is firewall-safe)
+                // and be a non-final index. Sentinel overlap is not policed here —
+                // placement stays in-bounds; the tiling check refuses to deliver gaps.
                 let final_base = total_data - data_shards;
                 frame.blocks.iter().any(|(&bi, b)| {
                     let bi = bi as usize;
@@ -692,10 +544,9 @@ impl Reassembler {
                     .remove(&hdr.frame_index)
                     .expect("frame entry exists");
                 *in_flight_bytes -= frame_cost(&f);
-                // Remember the index (with its late-shard memory, exactly like an aged-out
-                // frame) so stragglers can't resurrect it, reclaim the parity buffers, and
-                // count the loss — the client's recovery request is the right outcome for a
-                // frame that was destroyed by a lying header.
+                // Remember the index (late-shard memory, like an aged-out frame) so
+                // stragglers cannot resurrect it. Count the drop: recovery-keyframe
+                // is the right outcome for a frame destroyed by a bad header.
                 win.completed.insert(
                     hdr.frame_index,
                     reconstructed_shards(&f.blocks, lim.max_data_shards),
@@ -715,12 +566,9 @@ impl Reassembler {
             drop(stats);
             return Ok(None);
         }
-        // Grow to this packet's proven extent. A streamed frame opens at whichever block arrived
-        // first and learns its real size from the final block's totals (or a later, higher
-        // sentinel base) — reorder means either can come first, so the buffer is sized by
-        // whatever the frame has proven so far. Never shrinks: the totals only settle the frame's
-        // END, and completion truncates to `frame_bytes` anyway. The budget is re-checked here
-        // for exactly the reason it is checked at open — growth commits memory too.
+        // Grow to this packet's proven extent. A streamed frame opens on whichever
+        // block arrived first; the buffer never shrinks (completion truncates).
+        // Re-check the budget: growth commits memory too.
         if buf_len > frame.buf.len() {
             let delta = buf_len - frame.buf.len();
             if *in_flight_bytes + delta > IN_FLIGHT_BUF_FACTOR * lim.max_frame_bytes {
@@ -743,14 +591,13 @@ impl Reassembler {
         } = frame;
         let (frame_pts_ns, frame_user_flags) = (*frame_pts_ns, *frame_user_flags);
 
-        // First packet of a block sizes its state; `data_shards` is already pinned by the
-        // derived geometry above, but `recovery_shards` is per-block wire input (adaptive FEC
-        // varies it per frame) — later packets must match the block's first.
+        // First packet sizes the block. `data_shards` is already pinned; `recovery_shards`
+        // varies per frame (adaptive FEC) — later packets must match the first.
         let base_shard = if slice_stream {
             if sentinel {
-                frame_bytes / shard_bytes // the sentinel's wire base (firewall: shard-aligned)
+                frame_bytes / shard_bytes // sentinel wire base (firewall: shard-aligned)
             } else {
-                total_data - data_shards // the final block sits at the end of the frame
+                total_data - data_shards // final block sits at the end of the frame
             }
         } else {
             block_idx * lim.max_data_shards
@@ -758,9 +605,8 @@ impl Reassembler {
         let block = match blocks.entry(hdr.block_index) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
-                // A NEW block's state is sized from the header-declared shard counts, so gate it on
-                // the same in-flight budget as the frame buffer — otherwise a slice-streamed frame
-                // mints unmetered block state per distinct index (security-review 2026-08-15 #11).
+                // Block state is sized from header shard counts — same in-flight budget
+                // as the frame buffer, or a slice-streamed frame mints unmetered state.
                 let cost = block_state_bytes(data_shards, recovery_shards);
                 if *in_flight_bytes + cost > IN_FLIGHT_BUF_FACTOR * lim.max_frame_bytes {
                     drop(stats);
@@ -784,44 +630,39 @@ impl Reassembler {
             drop(stats);
             return Ok(None);
         }
-        // A slice-stream block's base is per-block wire input like `recovery_shards` — later
-        // packets must agree with the block's first, or two packets of "one" block would place
-        // their shards at different frame offsets.
+        // Slice-stream base is per-block wire input, like `recovery_shards`. Two
+        // packets of "one" block must not place shards at different offsets.
         if block.base_shard != base_shard {
             drop(stats);
             return Ok(None);
         }
-        // Defense-in-depth (2026-07 security review): the geometry invariants above guarantee
-        // every packet of a block agrees on K, so this can't fire today — but `have_data`
-        // indexing and the recovery-slot math below assume it, and an explicit check keeps a
-        // future firewall refactor from turning that assumption into an OOB panic.
+        // Geometry above already agrees on K; `have_data` and recovery-slot math
+        // still assume it. An explicit check keeps a later firewall refactor from
+        // turning that into an OOB panic.
         if block.data_shards != data_shards {
             drop(stats);
             return Ok(None);
         }
         if block.done {
-            // A data shard the parity reconstruct already restored (`!have_data`) was late, not
-            // lost — net it out of the `fec_recovered_shards` it was counted into (see the
-            // completed-frame twin above; this arm covers multi-block frames whose other blocks
-            // are still in flight). `have_data == true` = wire duplicate; a failed reconstruct
-            // (`!reconstructed`) never counted its missing shards, so neither do we.
+            // Late original after reconstruct (`!have_data`): net out of
+            // `fec_recovered_shards`. Covers multi-block frames still in flight.
+            // `have_data` = duplicate; a failed reconstruct never counted missing.
             if block.reconstructed
                 && shard_index < block.data_shards
                 && !block.have_data[shard_index]
             {
-                block.have_data[shard_index] = true; // it HAS arrived now — dedups a re-dup
+                block.have_data[shard_index] = true; // arrived — dedup a later re-dup
                 StatsCounters::add(&stats.fec_late_shards, 1);
             }
             return Ok(None);
         }
 
         if shard_index < data_shards {
-            // A data shard lands at its final AU offset — the only copy its bytes ever make
-            // past decrypt.
+            // Lands at its final AU offset — the only copy past decrypt.
             if !block.have_data[shard_index] {
                 let off = (block.base_shard + shard_index) * shard_bytes;
-                // The firewall + pin checks keep every accepted base in range; this guard is
-                // the same future-refactor insurance as the `data_shards` check above.
+                // Firewall + pin keep accepted bases in range; same refactor
+                // insurance as the `data_shards` check above.
                 if off + shard_bytes > buf.len() {
                     drop(stats);
                     return Ok(None);
@@ -833,11 +674,9 @@ impl Reassembler {
         } else {
             let slot = shard_index - data_shards;
             if block.recovery[slot].is_none() {
-                // A parity payload is a heap buffer sized from wire input — meter it against the
-                // same in-flight budget as the frame buffer and block state, or a max-recovery
-                // frame commits far more than the nominal `4 × max_frame_bytes` ceiling
-                // (security-review 2026-08-31 M-5). Refusal is soft: the block just can't
-                // reconstruct and the frame ages out into the ordinary loss path.
+                // Parity is a heap buffer sized from the wire. Meter it or a
+                // max-recovery frame exceeds `4 × max_frame_bytes`. Soft refuse:
+                // the block cannot reconstruct and the frame ages out.
                 if *in_flight_bytes + body.len() > IN_FLIGHT_BUF_FACTOR * lim.max_frame_bytes {
                     drop(stats);
                     return Ok(None);
@@ -851,11 +690,10 @@ impl Reassembler {
             }
         }
 
-        // Reconstruct as soon as we hold enough shards.
         if block.data_received + block.recovery_received >= block.data_shards {
             let missing = block.data_shards - block.data_received;
             let outcome = if missing == 0 {
-                Ok(()) // every original arrived — its bytes are already in place
+                Ok(()) // originals already in place
             } else {
                 let base = block.base_shard * shard_bytes;
                 let region = &mut buf[base..base + block.data_shards * shard_bytes];
@@ -868,34 +706,31 @@ impl Reassembler {
                     .collect();
                 coder.reconstruct_into(block.recovery_shards, &mut slots, &block.have_data, &parity)
             };
-            // The parity buffers are spent either way — reclaim them for the next block.
+            // Parity is spent either way — reclaim for the next block.
             reclaim_parity(block, recovery_pool, in_flight_bytes);
             block.done = true;
             match outcome {
                 Ok(()) => {
-                    // With in-order delivery `missing` is exactly the block's lost shards; under
-                    // reordering the early trigger also "recovers" shards that are merely still
-                    // in flight — their later arrival counts `fec_late_shards` (both arms above)
-                    // so loss estimators can net the two (`window_loss_ppm`).
+                    // In-order, `missing` is true loss. Under reorder the early
+                    // trigger also "recovers" shards still in flight; their arrival
+                    // counts `fec_late_shards` so estimators can net the two.
                     block.reconstructed = missing > 0;
                     StatsCounters::add(&stats.fec_recovered_shards, missing as u64);
                     *blocks_ok += 1;
                 }
                 Err(_) => {
-                    // Corrupt/incompatible shards that slipped past the header checks: discard
-                    // this block (done, but never counted ok — the frame can't complete and ages
-                    // out) and keep the session alive; the client recovers at the next
-                    // keyframe/RFI.
+                    // Corrupt shards that passed the header checks: discard the
+                    // block (never `blocks_ok`) and keep the session. Recover at
+                    // the next keyframe.
                     StatsCounters::add(&stats.packets_dropped, 1);
                     return Ok(None);
                 }
             }
         }
 
-        // Whole frame ready? Judged against the FRAME's pinned block count, not this packet's
-        // header — a streamed frame can complete on a reordered sentinel packet (header says 0)
-        // after the final block already pinned the real totals, and can never complete before
-        // they're pinned (`0` never equals a non-zero `blocks_ok`).
+        // Use the FRAME's pinned block count, not this header. A streamed frame
+        // can complete on a reordered sentinel (`block_count == 0` in the header)
+        // after the final block pinned; it cannot complete before (`0 != blocks_ok`).
         let block_count = *frame_block_count;
         if block_count != 0 && *blocks_ok == block_count {
             let mut done = win.frames.remove(&hdr.frame_index).unwrap();
@@ -903,14 +738,10 @@ impl Reassembler {
                 hdr.frame_index,
                 reconstructed_shards(&done.blocks, lim.max_data_shards),
             );
-            *in_flight_bytes -= frame_cost(&done); // buffer + block state, before the truncate below
-                                                   // Slice-streamed frames: every base was bounds-checked on arrival (in range,
-                                                   // below the final block) but nothing yet proved the blocks TILE the AU. A base
-                                                   // that lies WITHIN bounds leaves a zero gap and an overlap — wrong bytes in a
-                                                   // frame stamped `complete`, which the decoder paints as garbage rectangles and
-                                                   // no loss counter ever moves. Refuse to deliver: the index is already in
-                                                   // `completed` (stragglers can't resurrect it), so just count the loss — the
-                                                   // `frames_dropped` climb is what fires the client's recovery request.
+            *in_flight_bytes -= frame_cost(&done); // before the truncate below
+                                                   // Slice-stream: bases were in range but may not TILE. A gap or overlap
+                                                   // would stamp `complete` with wrong bytes and no loss counter would move.
+                                                   // Refuse: index is already in `completed`, so count the drop.
             if done.user_flags & crate::packet::USER_FLAG_SLICE_STREAM != 0 {
                 let total_data = done.frame_bytes.div_ceil(done.shard_bytes).max(1);
                 let mut next = 0usize;
@@ -929,11 +760,10 @@ impl Reassembler {
                     return Ok(None);
                 }
             }
-            done.buf.truncate(done.frame_bytes); // trim trailing-shard zero padding
-                                                 // Slice-progressive consumers already hold the delivered prefix — the completing
-                                                 // packet hands up only the SUFFIX (with `last`), or the degenerate whole-AU part
-                                                 // when nothing was delivered early. Probe filler stays whole either way — the
-                                                 // speed test accounts AUs, not slices.
+            done.buf.truncate(done.frame_bytes); // drop trailing-shard zero padding
+                                                 // Slice-progressive consumers already hold the prefix — hand up only
+                                                 // the suffix (`last`), or the whole AU if nothing was delivered early.
+                                                 // Probe filler stays whole: the speed test accounts AUs, not slices.
             let (data, part) = if deliver_parts && !is_probe {
                 let lo = (done.delivered_shards * shard_bytes).min(done.frame_bytes);
                 let part = FramePart {
@@ -959,11 +789,10 @@ impl Reassembler {
                 received_ns: 0, // stamped by Session::poll_frame at the session boundary
             }));
         }
-        // Slice-progressive delivery: when this packet completed a block that extends the AU's
-        // contiguous prefix (possibly unlocking blocks that finished out of order behind it),
-        // hand the newly-contiguous bytes up as ONE part. Only successfully-completed blocks
-        // count (`done` alone includes failed reconstructs), and the cursor stops short of the
-        // FINAL block — its zero-padded tail is only trimmed at completion above.
+        // If this packet completed a block that extends the contiguous prefix
+        // (possibly unlocking out-of-order finished blocks), emit ONE part.
+        // Only successful completes count; stop short of the final block — its
+        // zero-padded tail is trimmed only at completion above.
         if deliver_parts && !is_probe {
             let start = *delivered_shards;
             while let Some(b) = blocks.get(&*next_part_block) {
@@ -973,9 +802,8 @@ impl Reassembler {
                 if block_count != 0 && (*next_part_block as usize) + 1 >= block_count {
                     break;
                 }
-                // A prefix is only a prefix if this block starts where the last one ended —
-                // a slice block whose wire base lies within bounds must not extend it (the
-                // frame then dies at the completion tiling check above).
+                // A prefix is only a prefix if this block starts where the last ended.
+                // An in-bounds but non-contiguous base must not extend it.
                 if b.base_shard != *delivered_shards {
                     break;
                 }
@@ -1002,39 +830,31 @@ impl Reassembler {
         Ok(None)
     }
 
-    /// Drop all in-flight state — every partially-assembled frame and the completed/abandoned
-    /// index memory, in both index spaces — as if the session just started. Used by the client's
-    /// backlog flush ([`Session::flush_backlog`](crate::session::Session::flush_backlog)): after
-    /// the socket backlog is discarded wholesale, the partial frames here can never complete
-    /// (their remaining shards were just thrown away) and the window anchors (`newest_frame`)
-    /// point into the discarded past.
+    /// Drop all in-flight state in both index spaces. After
+    /// [`Session::flush_backlog`](crate::session::Session::flush_backlog) the remaining
+    /// shards are gone and `newest_frame` points into the discarded past.
     pub fn reset(&mut self) {
         self.video = ReassemblyWindow::default();
         self.probe = ReassemblyWindow::default();
-        // The dropped frames' buffers (and their parity bufs) go back to the allocator, not the
-        // pool — a flush is the rare path. The budget resets with them.
+        // Dropped buffers return to the allocator, not the pool — flush is rare.
         self.in_flight_bytes = 0;
-        // An aged-out partial parked for delivery is from the discarded past too — without this
-        // it survives `flush_backlog` and gets handed up as the first "frame" after the
-        // jump-to-live, exactly the stale content the flush existed to discard.
+        // A parked partial is from the discarded past too; leaving it would hand it
+        // up as the first frame after jump-to-live.
         self.pending_partial = None;
     }
 
-    /// Test-only: the current in-flight frame-buffer byte commitment (see
-    /// [`IN_FLIGHT_BUF_FACTOR`]). The mixed-geometry budget tests assert it returns to
-    /// exactly zero once every frame has terminated — the 0.23.0 lesson: geometry changes
-    /// breed sizing bugs, and accounting drift here surfaces in the field as a permanent
-    /// loss storm once the budget wedges.
+    /// Test-only in-flight byte commitment. Mixed-geometry tests assert it returns
+    /// to zero once every frame has terminated — drift here wedges the budget.
     #[cfg(test)]
     pub(crate) fn in_flight(&self) -> usize {
         self.in_flight_bytes
     }
 }
 
-/// The data shards of a terminating frame that only exist because parity restored them
+/// Data shards of a terminating frame that exist only because parity restored them
 /// (`reconstructed` blocks' still-absent originals), as frame-wide indexes
-/// (`block × max_data_shards + shard`) for the [`ReassemblyWindow::completed`] late-shard
-/// memory. Empty (no allocation) for the overwhelmingly common clean frame.
+/// (`block × max_data_shards + shard`) for [`ReassemblyWindow::completed`]. Empty
+/// for a clean frame.
 fn reconstructed_shards(blocks: &HashMap<u16, BlockState>, max_data_shards: usize) -> Vec<u32> {
     let mut v = Vec::new();
     for (&bi, b) in blocks {
@@ -1050,10 +870,9 @@ fn reconstructed_shards(blocks: &HashMap<u16, BlockState>, max_data_shards: usiz
 }
 
 impl ReassemblyWindow {
-    /// Track the newest frame, declare incomplete frames that fell out of the loss window
-    /// ([`LOSS_WINDOW_NS`] behind the newest pts, or [`HARD_LOSS_WINDOW`] indices) lost — for the
-    /// video window (`count_drops`) counting them dropped, which is what drives the client's
-    /// recovery-keyframe request — and prune the completed-index memory to [`REORDER_WINDOW`].
+    /// Track the newest frame. Declare incomplete frames outside [`LOSS_WINDOW_NS`]
+    /// or [`HARD_LOSS_WINDOW`] lost (video: `frames_dropped`, which requests a
+    /// recovery keyframe). Prune `completed` to [`REORDER_WINDOW`].
     #[allow(clippy::too_many_arguments)]
     fn advance_window(
         &mut self,
@@ -1068,7 +887,7 @@ impl ReassemblyWindow {
         mut partial_sink: Option<&mut Option<Frame>>,
     ) {
         let (newest, newest_pts) = match self.newest_frame {
-            // `frame_index` is newer iff it's within the forward half of the index space.
+            // Newer iff within the forward half of the index space.
             Some((n, p)) if frame_index.wrapping_sub(n) > u32::MAX / 2 => (n, p),
             _ => (frame_index, pts_ns),
         };
@@ -1078,8 +897,7 @@ impl ReassemblyWindow {
         let completed = &mut self.completed;
         let partial_on = partial_sink.is_some();
         self.frames.retain(|&idx, f| {
-            // Partial-deliverable frames age out on the TIGHT fuse (see PARTIAL_WINDOW_NS);
-            // everything else keeps the full loss window.
+            // Chunk-aligned partials use [`PARTIAL_WINDOW_NS`]; everything else the full window.
             let window_ns = if partial_on && f.user_flags & USER_FLAG_CHUNK_ALIGNED != 0 {
                 PARTIAL_WINDOW_NS
             } else {
@@ -1088,22 +906,16 @@ impl ReassemblyWindow {
             let keep = newest.wrapping_sub(idx) <= HARD_LOSS_WINDOW
                 && newest_pts.saturating_sub(f.pts_ns) <= window_ns;
             if !keep {
-                // Remember the abandoned index so a straggler shard is dropped (below, and in
-                // `push`) instead of resurrecting the frame — which would re-allocate its buffers
-                // and double-count the drop when it aged out again. Blocks that reconstructed
-                // before the frame died still counted `fec_recovered_shards`, so their restored
-                // shards join the late-shard memory exactly like an emitted frame's.
+                // Remember the index so a straggler cannot resurrect the frame
+                // (which would re-allocate and double-count the drop). Restored
+                // shards join late-shard memory exactly like an emitted frame.
                 completed.insert(idx, reconstructed_shards(&f.blocks, max_data_shards));
-                // Release its buffer budget (+ block state) and reclaim its parity bufs for the pool.
                 *in_flight_bytes -= frame_cost(f);
-                // Partial delivery (chunk-aligned AUs only): the buffer is already exactly
-                // what the consumer needs — received shards at their final offsets, zeros
-                // where shards are missing (the codec's block walk skips zero windows).
-                // Newest-wins if several age out in one prune. Still counted dropped below.
+                // Chunk-aligned: the buffer is already the consumer shape (received
+                // at final offsets, zeros in holes). Newest-wins. Still counted dropped.
                 if let Some(sink) = partial_sink.as_deref_mut() {
-                    // `frame_bytes > 0` also excludes an UNPINNED streamed frame (its total is
-                    // still the 0 sentinel value): truncating its max-sized buffer to 0 would
-                    // deliver an empty "partial" — worse than the plain drop it gets instead.
+                    // `frame_bytes > 0` also excludes an unpinned streamed frame
+                    // (total still the 0 sentinel): truncate-to-0 would emit empty.
                     if f.user_flags & USER_FLAG_CHUNK_ALIGNED != 0 && f.frame_bytes > 0 {
                         let mut buf = std::mem::take(&mut f.buf);
                         buf.truncate(f.frame_bytes);
@@ -1137,10 +949,8 @@ impl ReassemblyWindow {
             .retain(|&idx, _| newest.wrapping_sub(idx) <= REORDER_WINDOW);
     }
 
-    /// True if this packet's frame lies outside the loss window (behind the newest frame by more
-    /// than [`LOSS_WINDOW_NS`] of capture time or [`HARD_LOSS_WINDOW`] indices) — its shards
-    /// arrive too late to be useful, and accepting one would only create a frame buffer the next
-    /// [`advance_window`](Self::advance_window) immediately declares lost.
+    /// Frame sits outside the loss window. Accepting a shard would only allocate a
+    /// buffer that the next [`advance_window`](Self::advance_window) immediately drops.
     fn is_stale(&self, frame_index: u32, pts_ns: u64) -> bool {
         match self.newest_frame {
             Some((n, newest_pts)) => {
@@ -1158,9 +968,8 @@ impl ReassemblyWindow {
 mod reset_tests {
     use super::*;
 
-    /// `flush_backlog` discards the past wholesale — an aged-out partial parked for delivery is
-    /// part of that past and must not survive [`Reassembler::reset`] to be handed up as the
-    /// first "frame" after a jump-to-live.
+    /// A parked partial is part of the discarded past and must not survive
+    /// [`Reassembler::reset`] as the first frame after jump-to-live.
     #[test]
     fn reset_drops_a_parked_partial() {
         let mut r = Reassembler::new(ReassemblerLimits {

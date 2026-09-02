@@ -1,5 +1,5 @@
-//! Host-tagged management endpoints: identity + capabilities, liveness, compositor list, live
-//! runtime status, and the loopback tray summary. Split out of the `mgmt` facade (plan §W5).
+//! Host-tagged `/api/v1` routes: identity, liveness, compositor list, live status,
+//! and the loopback tray summary. Split out of the `mgmt` facade.
 
 use super::shared::*;
 use crate::encode::Codec;
@@ -11,7 +11,6 @@ use crate::gamestream::RTSP_PORT;
 use crate::gamestream::VIDEO_PORT;
 use std::sync::atomic::Ordering;
 
-/// Liveness + version probe.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct Health {
     /// Always `"ok"` when the host responds.
@@ -23,16 +22,14 @@ pub(crate) struct Health {
     abi_version: u32,
 }
 
-/// Host identity and advertised capabilities (static for the life of the process, except
-/// `local_ip`).
+/// Host identity and capabilities. Static for the process except `local_ip`.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct HostInfo {
     hostname: String,
-    /// Stable per-host id (persisted across restarts), matched on pairing.
+    /// Persisted host id; pairing matches on this.
     uniqueid: String,
-    /// Best-effort primary LAN IP, read fresh on every request — a host that started before its
-    /// network did (cold boot) reports `127.0.0.1` only until it actually has an address, and a
-    /// host that moves networks reports the new one. Poll it rather than caching it.
+    /// Fresh LAN IP each request — do not cache. Cold-boot and network-move report
+    /// `127.0.0.1` until a real address exists.
     local_ip: String,
     /// `punktfunk-host` crate version.
     version: String,
@@ -42,28 +39,23 @@ pub(crate) struct HostInfo {
     app_version: String,
     /// GFE version advertised to Moonlight clients.
     gfe_version: String,
-    /// OS identity chain, generic → most specific, slash-separated (`windows` | `macos` |
-    /// `linux[/<family>][/<id>]`). A client walks it most-specific-first and shows the first
-    /// token it has an icon for, so an unknown distro still degrades to its family's mark.
+    /// OS chain, generic → specific, slash-separated (`windows` | `macos` |
+    /// `linux[/<family>][/<id>]`). Walk most-specific-first; an unknown distro still matches its family.
     #[schema(example = "linux/fedora/bazzite")]
     os: String,
     /// Human-readable OS name (os-release `PRETTY_NAME`; `"Windows"`/`"macOS"` elsewhere).
     #[schema(example = "Bazzite 42 (Kinoite)")]
     os_name: String,
-    /// Codecs the host can encode (NVENC).
+    /// Codecs this host can encode (`Codec::host_wire_caps`, not the compile-time list).
     codecs: Vec<ApiCodec>,
-    /// Whether the GameStream/Moonlight-compat planes are running (`--gamestream`). `false` on the
-    /// secure default (native punktfunk/1 only) — a console can hide Moonlight-only UI (e.g. the
-    /// Moonlight PIN pairing card, which could never receive a PIN when this is `false`).
+    /// GameStream/Moonlight-compat planes are running (`--gamestream`). `false` is the default (native only).
     gamestream: bool,
     ports: PortMap,
 }
 
-/// Every port a client integration may need (Moonlight derives the stream ports from the
-/// HTTP base; a control pane should not have to).
+/// Ports a client needs. Moonlight derives stream ports from HTTP; a control pane should not.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct PortMap {
-    /// This management API.
     mgmt: u16,
     /// nvhttp plain HTTP (serverinfo, pairing).
     http: u16,
@@ -75,10 +67,7 @@ pub(crate) struct PortMap {
     audio: u16,
 }
 
-/// Video codec identifier. The wire token matches the codec's canonical name used across the
-/// stack (SDP/GameStream advertisement, the stats-capture `CaptureMeta.codec`, and the encoder's
-/// [`Codec::label`]) — notably `H.265` serializes as `"hevc"`, not `"h265"`, so the same codec
-/// reads identically on every console page.
+/// Wire token is the stack's canonical codec name (`Codec::label`). `H265` serializes as `"hevc"`, not `"h265"`.
 #[derive(Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ApiCodec {
@@ -86,7 +75,7 @@ pub(crate) enum ApiCodec {
     #[serde(rename = "hevc")]
     H265,
     Av1,
-    /// PyroWave — the opt-in wired-LAN intra-only wavelet codec.
+    /// Opt-in wired-LAN intra-only wavelet codec.
     PyroWave,
 }
 
@@ -101,70 +90,53 @@ impl From<Codec> for ApiCodec {
     }
 }
 
-/// Live host status (changes as clients launch/end sessions).
+/// Live status; changes as sessions start and end.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct RuntimeStatus {
-    /// True while the video stream thread is running.
     video_streaming: bool,
-    /// True while the audio stream thread is running.
     audio_streaming: bool,
-    /// True while a pairing handshake is parked waiting for the user's PIN
-    /// (submit it via `POST /api/v1/pair/pin`).
+    /// Pairing handshake is waiting for a PIN (`POST /api/v1/pair/pin`).
     pin_pending: bool,
-    /// Number of pinned (paired) GameStream client certificates. Native (punktfunk/1) devices pair
-    /// against a separate store and are counted in `native_paired_clients` — sum the two for
-    /// "how many clients are paired with this host".
+    /// GameStream paired-cert count. Native devices are `native_paired_clients`; sum both for the total.
     paired_clients: u32,
-    /// Number of paired native (punktfunk/1) devices — the default plane, so on a host that has
-    /// never been touched by Moonlight this is the only non-zero one of the pair.
+    /// Native-plane pairings (separate store).
     native_paired_clients: u32,
-    /// Number of live streaming sessions across BOTH planes (GameStream + native punktfunk/1). The
-    /// native server admits concurrent sessions, so this can exceed 1; `session`/`stream` below
-    /// describe a single representative session for the detail card.
+    /// Live sessions on both planes. Native admits concurrent sessions so this can exceed 1;
+    /// `session`/`stream` are one representative.
     active_sessions: u32,
-    /// A representative active session. GameStream's launch (Moonlight `/launch`) when present, else
-    /// the first live native session. `null` when nothing is streaming.
+    /// GameStream launch if present, else the first live native session. `null` when idle.
     session: Option<SessionInfo>,
-    /// The active stream's parameters — RTSP-negotiated for GameStream, or the live native session's
-    /// mode/codec/bitrate. `null` when nothing is streaming.
+    /// Active stream parameters. `null` when idle.
     stream: Option<StreamInfo>,
-    /// Every launched game the host is tracking: one row per live session that launched a title, plus
-    /// any game whose session has ended and which is waiting out its reconnect window before being
-    /// ended (`state: "grace"`). Empty when nothing was launched — a plain desktop stream has no game.
+    /// Launched titles: live sessions plus `state: "grace"` reconnect-window rows. Empty for a desktop-only stream.
     games: Vec<ActiveGame>,
-    /// The audio wiring verdict (Windows hosts; absent on other platforms and before the first
-    /// wiring pass). Present even while idle — the wiring exists for the host's lifetime.
+    /// Windows audio-wiring verdict; absent off-Windows and before the first pass. Present while idle.
     #[serde(skip_serializing_if = "Option::is_none")]
     audio: Option<AudioWiring>,
 }
 
-/// The Windows host's audio wiring verdict — which endpoint carries each role. The names are
-/// the endpoints' friendly names as the Sound settings show them (on current hosts the minted
-/// "Punktfunk" instances of Steam's streaming drivers).
+/// Windows audio wiring: which endpoint carries each role. Names are the Sound-settings friendly names.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct AudioWiring {
-    /// `full` | `audio_only` | `mic_only` | `none` — whether desktop audio and mic passthrough
-    /// each have an endpoint at all.
+    /// `full` | `audio_only` | `mic_only` | `none`.
     #[schema(example = "full")]
     readiness: String,
-    /// Friendly name of the desktop-audio loopback source; absent = desktop audio unavailable.
+    /// Desktop-audio loopback friendly name; absent = unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     loopback: Option<String>,
-    /// Friendly name of the virtual-mic write target; absent = mic passthrough unavailable.
+    /// Virtual-mic write-target friendly name; absent = unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     mic: Option<String>,
-    /// The mic was WITHHELD so game audio could keep the only working sink — mic passthrough
-    /// needs Steam installed (the host mints its own microphone) or a virtual cable.
+    /// Mic withheld so game audio keeps the only working sink.
     mic_withheld: bool,
-    /// The loopback is the known-degraded last resort — desktop audio may be silent until the
-    /// endpoint set changes.
+    /// Loopback is the degraded last resort; desktop audio may be silent until endpoints change.
     last_resort: bool,
     /// Why the chosen loopback endpoint NARROWS the desktop mix (rate/channels), when it does.
     #[serde(skip_serializing_if = "Option::is_none")]
     narrowing: Option<String>,
 }
 
-/// The wiring snapshot mapped for the API — `None` off-Windows or before the first pass.
+/// `None` off-Windows or before the first wiring pass.
 fn audio_wiring() -> Option<AudioWiring> {
     use crate::audio::wiring_plan as wp;
     crate::audio::wiring_snapshot().map(|w| AudioWiring {
@@ -183,28 +155,23 @@ fn audio_wiring() -> Option<AudioWiring> {
     })
 }
 
-/// One launched game, for the console's running-game card.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ActiveGame {
-    /// The session streaming it; `null` for a game waiting out its reconnect window.
+    /// Streaming session; `null` while waiting out the reconnect window.
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<u64>,
     /// Client-supplied device name of the session that launched it; may be empty.
     client: String,
-    /// Store-qualified library id (`steam:570`) — the key the console matches against `GET /library`
-    /// to show box art. Absent for an operator-typed GameStream command.
+    /// Store-qualified library id (`steam:570`); matches `GET /library`. Absent for a typed GameStream command.
     #[serde(skip_serializing_if = "Option::is_none")]
     app_id: Option<String>,
-    /// Display title.
     title: String,
     /// Which store surfaced it (`steam`, `heroic`, `custom`, …), when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     store: Option<String>,
     /// `native` or `gamestream`.
     plane: crate::events::Plane,
-    /// `launching` (launched, not seen running yet), `running`, `exited`, `untracked` (this title
-    /// exposes nothing the host can recognize its process by, so its exit will never be noticed),
-    /// or `grace` (its session is gone and it will be ended when the reconnect window closes).
+    /// `launching` | `running` | `exited` | `untracked` (exit will never be seen) | `grace` (reconnect window).
     #[schema(example = "running")]
     state: String,
     /// Seconds until this game is ended — only present on a `grace` row.
@@ -212,7 +179,6 @@ pub(crate) struct ActiveGame {
     grace_remaining_s: Option<u64>,
 }
 
-/// Client-requested launch parameters (key material is never exposed here).
 #[derive(Serialize, ToSchema)]
 pub(crate) struct SessionInfo {
     width: u32,
@@ -220,7 +186,7 @@ pub(crate) struct SessionInfo {
     fps: u32,
 }
 
-/// RTSP-negotiated stream parameters.
+/// Negotiated stream parameters (RTSP on GameStream; live mode on native).
 #[derive(Serialize, ToSchema)]
 pub(crate) struct StreamInfo {
     width: u32,
@@ -232,68 +198,46 @@ pub(crate) struct StreamInfo {
     /// Client's parity floor per FEC block (`minRequiredFecPackets`).
     min_fec: u8,
     codec: ApiCodec,
-    /// Session bring-up total, hello → first video packet, in ms (native sessions; `null` on the
-    /// GameStream plane or while the session is still bringing up).
+    /// Hello → first video packet, ms. Native only; `null` on GameStream or while still bringing up.
     time_to_first_frame_ms: Option<u32>,
-    /// Most recent mid-stream resize total, reconfigure → pipeline rebuilt, in ms (native sessions;
-    /// `null` when no resize happened / GameStream).
+    /// Last mid-stream resize, reconfigure → rebuilt, ms. Native only; `null` if none / GameStream.
     last_resize_ms: Option<u32>,
 }
 
-/// Non-sensitive host status for the local tray icon: counts and booleans — no PIN values, no
-/// fingerprints. The ONE name exposed is `client_name`, the streaming client's display label
-/// (deliberate loosening for the tray's "client connected" toast: it tells the local user who is
-/// on their machine, which is disclosure in the user's favor — and any local process could
-/// already infer a session exists from the booleans here). Served unauthenticated to LOOPBACK
-/// peers only (see `require_auth`): the bearer-token file is SYSTEM/Administrators-DACL'd on
-/// Windows, so the per-user tray process cannot authenticate — this narrow read-only route is
-/// its status source.
+/// Tray snapshot for loopback: counts, booleans, and `client_name`.
+/// Unauthenticated; `require_auth` admits loopback only (the tray cannot read the bearer file).
 #[derive(Serialize, ToSchema)]
 pub(crate) struct LocalSummary {
     /// Host version (mirrors `/health`).
     version: String,
-    /// True while video is streaming on EITHER plane: the GameStream media pipeline, or a live
-    /// native (punktfunk/1) session — the default plane, invisible in the GameStream flag alone.
+    /// Video streaming on either plane. The GameStream flag alone misses native sessions.
     video_streaming: bool,
     /// True while audio is streaming on either plane (same rule as `video_streaming`).
     audio_streaming: bool,
-    /// The active session: GameStream's launch (Moonlight `/launch`) when present, else the first
-    /// live native session. `null` when nothing is streaming.
+    /// GameStream launch if present, else the first live native session. `null` when idle.
     session: Option<SessionInfo>,
-    /// Display name of the (first) streaming native client — the trust store's name for it, else
-    /// the name the device sent at connect. `null` when idle, for a nameless client, or for a
-    /// GameStream session (that plane carries no device name).
+    /// First native session's display name (trust-store, else connect-time). `null` when idle, nameless, or GameStream.
     #[serde(skip_serializing_if = "Option::is_none")]
     client_name: Option<String>,
-    /// Number of pinned (paired) GameStream client certificates.
+    /// GameStream paired-cert count.
     paired_clients: u32,
-    /// Number of paired native (punktfunk/1) devices.
+    /// Native-plane pairing count.
     native_paired_clients: u32,
-    /// True while a GameStream pairing handshake is parked waiting for the user's PIN.
+    /// GameStream pairing is waiting for a PIN.
     pin_pending: bool,
     /// Native pairing knocks awaiting the operator's approval (count only).
     pending_approvals: u32,
-    /// Virtual displays being KEPT with no live session — lingering (keep-alive window) or pinned
-    /// (`keep_alive: forever`). Non-zero means a display (and, exclusive, your physical monitors) is
-    /// held; the tray surfaces it + a one-click release. Active (in-use) displays are not counted.
+    /// Lingering or pinned virtual displays with no live session. Active (in-use) displays are not counted.
     kept_displays: u32,
-    /// Other Moonlight-compatible hosts (Sunshine/Apollo/…) detected on this machine at startup —
-    /// running one alongside Punktfunk is unsupported. Compact labels (e.g. `Sunshine (running)`);
-    /// the tray/console surface them so the clash is visible before pairing silently fails.
+    /// Other GameStream hosts on this machine, detected at startup. Running one alongside is unsupported.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     conflicts: Vec<String>,
-    /// Launched games the host is tracking, as compact labels (`Hades`, `Hades (closing in 4:12)`).
-    ///
-    /// The countdown form is the one that matters: it means the game's client is gone and the host
-    /// will end the game when the window closes — something a user at the machine should be able to
-    /// see (and stop) without opening the console. Empty when nothing was launched.
+    /// Compact labels (`Hades`, `Hades (closing in 4:12)`). Countdown means the client is gone and the host will end the game when the window closes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     games: Vec<String>,
 }
 
-/// Liveness probe
-///
-/// Always available without authentication.
+/// Liveness probe. Unauthenticated (`require_auth` exempts it).
 #[utoipa::path(
     get,
     path = "/health",
@@ -334,10 +278,7 @@ pub(crate) async fn get_host_info(State(st): State<Arc<MgmtState>>) -> Json<Host
         gfe_version: GFE_VERSION.into(),
         os: h.os_chain.clone(),
         os_name: h.os_name.clone(),
-        // What this host can ACTUALLY encode on its resolved backend — GPU-aware, straight from the
-        // same capability mask that drives GameStream/QUIC negotiation ([`Codec::host_wire_caps`]).
-        // So an iGPU without AV1 encode won't advertise AV1, a software-only host reports H.264 only,
-        // and PyroWave appears only when its opt-in feature is built and the backend can open.
+        // Same mask as GameStream/QUIC negotiation (`Codec::host_wire_caps`), not the compile-time list.
         codecs: {
             let caps = Codec::host_wire_caps();
             use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE};
@@ -365,26 +306,20 @@ pub(crate) async fn get_host_info(State(st): State<Arc<MgmtState>>) -> Json<Host
     })
 }
 
-/// A compositor backend the host can drive a virtual output on, and whether it's usable now.
+/// A compositor backend and whether it is usable now.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct AvailableCompositor {
-    /// Stable identifier (`"kwin"` | `"wlroots"` | `"mutter"` | `"gamescope"`) — pass this to a
-    /// client's `--compositor` flag.
+    /// Stable id (`kwin` | `wlroots` | `mutter` | `gamescope`); pass to `--compositor`.
     id: String,
-    /// Human-readable label for UIs.
     label: String,
-    /// Usable on this host right now: the live session's own compositor, or gamescope wherever
-    /// its binary is installed.
+    /// Usable now: the live session's compositor, or gamescope if its binary is installed.
     available: bool,
     /// True for the backend an `Auto` (unspecified) request resolves to right now.
     default: bool,
 }
 
-/// Available compositor backends
-///
-/// Lists every backend the host knows how to drive, flags which are usable right now, and marks
-/// the one an unspecified (`Auto`) client request resolves to. Clients pass an `id` to their
-/// `--compositor` flag (or `PUNKTFUNK_COMPOSITOR_*` over the C ABI) to request it.
+/// Compositor backends the host can drive, with availability and the `Auto` default.
+/// Clients pass `id` to `--compositor` or `PUNKTFUNK_COMPOSITOR_*`.
 #[utoipa::path(
     get,
     path = "/compositors",
@@ -396,16 +331,12 @@ pub(crate) struct AvailableCompositor {
     )
 )]
 pub(crate) async fn list_compositors() -> Json<Vec<AvailableCompositor>> {
-    // Compositor backends are a Linux concept. On Windows the pf-vdisplay IddCx driver is the sole
-    // virtual-display backend and `vdisplay::open` ignores the compositor argument entirely, so the
-    // list could only ever be five Linux backends flagged unavailable with no default — which reads
-    // as broken detection rather than "not applicable here". Report none and let the console say so.
+    // Empty off Linux: `vdisplay::open` ignores compositor there.
+    // Listing unavailable Linux backends looks like a detection bug.
     #[cfg(not(target_os = "linux"))]
     let list = Vec::new();
     #[cfg(target_os = "linux")]
-    // One `/proc` scan backs BOTH columns (see `vdisplay::available`), so a backend can no longer
-    // be the auto-detect default and "unavailable" on the same row — the contradiction that made
-    // this list look broken on a box plainly running the compositor it called unavailable.
+    // One `/proc` scan for both columns (`vdisplay::available`); default cannot be unavailable.
     let list = {
         let available = crate::vdisplay::available();
         let default = crate::vdisplay::detect().ok();
@@ -434,20 +365,16 @@ pub(crate) async fn list_compositors() -> Json<Vec<AvailableCompositor>> {
     )
 )]
 pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<RuntimeStatus> {
-    // GameStream plane (set by RTSP/nvhttp on the compat path).
     let gs_launch = *st.app.launch.lock().unwrap_or_else(|e| e.into_inner());
-    // The RTSP-negotiated stream slot only exists in GameStream-featured builds (WP19); a
-    // native-only build never has a compat-plane stream to report.
+    // Stream slot is GameStream-featured only; a native-only build has no compat-plane stream.
     #[cfg(feature = "gamestream")]
     let gs_stream = *st.app.stream.lock().unwrap_or_else(|e| e.into_inner());
     let gs_video = st.app.streaming.load(Ordering::SeqCst);
     let gs_audio = st.app.audio_streaming.load(Ordering::SeqCst);
-    // Native punktfunk/1 plane (published by the native video loop; the default plane). See
-    // [`crate::session_status`] for why this lives outside `AppState`.
+    // Native plane, published by the video loop; lives outside `AppState` (see `session_status`).
     let native = crate::session_status::snapshot();
 
-    // Detail card is singular: prefer a live GameStream session, else the first native one.
-    // `active_sessions` conveys the true count when several native clients stream at once.
+    // Detail card is singular: GameStream if live, else the first native session. `active_sessions` is the true count.
     let session = gs_launch
         .map(|l| SessionInfo {
             width: l.width,
@@ -470,7 +397,7 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
         packet_size: c.packet_size as u32,
         min_fec: c.min_fec,
         codec: c.codec.into(),
-        // Transition latencies are traced on the native plane only (latency plan P0.1).
+        // Transition latencies are native-plane only.
         time_to_first_frame_ms: None,
         last_resize_ms: None,
     });
@@ -482,8 +409,7 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
             height: s.height,
             fps: s.fps,
             bitrate_kbps: s.bitrate_kbps,
-            // FEC/packetization are RTSP-negotiated (GameStream only); the native QUIC plane
-            // shards differently, so these are 0 (not applicable) for a native session.
+            // FEC/packetization are RTSP (GameStream); native QUIC shards differently, so 0 = not applicable.
             packet_size: 0,
             min_fec: 0,
             codec: s.codec.into(),
@@ -523,10 +449,7 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
     })
 }
 
-/// Local status summary for the tray icon
-///
-/// Non-sensitive status (counts, booleans, and the streaming client's display name — no PIN
-/// values, no fingerprints). Unauthenticated, but served to loopback peers only.
+/// Loopback tray summary. Unauthenticated; `require_auth` admits loopback only.
 #[utoipa::path(
     get,
     path = "/local/summary",
@@ -540,11 +463,9 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
     )
 )]
 pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<LocalSummary> {
-    // Native punktfunk/1 plane (the DEFAULT plane; GameStream is opt-in) — read ONCE and used for
-    // both the session card and the streaming flags below.
+    // Snapshot once; reused for the session card and the streaming flags below.
     let native = crate::session_status::snapshot();
-    // GameStream launch, else the first live native session — so the tray reflects a native session
-    // too (same GameStream-only blind spot the Dashboard `/status` had; see `session_status`).
+    // GameStream launch, else the first live native session (same order as `/status`).
     let session = st
         .app
         .launch
@@ -569,13 +490,11 @@ pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<
         .unwrap_or((0, 0));
     Json(LocalSummary {
         version: env!("PUNKTFUNK_VERSION").into(),
-        // Either plane counts, like `/status`: reading only the GameStream flags made the tray say
-        // "idle" (and wear the idle icon) through an entire native session.
+        // Either plane, like `/status`; GameStream flags alone miss a native session.
         video_streaming: st.app.streaming.load(Ordering::SeqCst) || !native.is_empty(),
         audio_streaming: st.app.audio_streaming.load(Ordering::SeqCst) || !native.is_empty(),
         session,
-        // The first native session's display name (matches the `session` fallback order — a
-        // GameStream launch carries no device name, so the field stays absent there).
+        // First native session's name. GameStream launches have no device name, so this stays absent there.
         client_name: native.first().and_then(|s| s.client_name.clone()),
         paired_clients: st
             .app
@@ -591,8 +510,7 @@ pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<
             .iter()
             .filter(|d| d.state == "lingering" || d.state == "pinned")
             .count() as u32,
-        // Cached at `serve` startup (empty when nothing was detected / never scanned) — no per-poll
-        // process enumeration.
+        // Startup cache (empty if nothing detected / never scanned); not a per-poll process scan.
         conflicts: crate::detect::summary_labels(crate::detect::snapshot()),
         games: crate::session_status::games()
             .into_iter()
@@ -600,9 +518,7 @@ pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<
                 (Some(left), _) => {
                     format!("{} (closing in {}:{:02})", g.title, left / 60, left % 60)
                 }
-                // Say so here too: the tray is the surface someone at the machine reads, and
-                // "Hades" beside a game the host cannot actually follow reads as a promise it
-                // never made.
+                // Untracked: the host cannot follow this process, so say so rather than a bare title.
                 (None, "untracked") => format!("{} (not tracked)", g.title),
                 (None, _) => g.title,
             })
@@ -610,9 +526,7 @@ pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<
     })
 }
 
-/// Whether the GameStream PIN flow is parked waiting for a PIN — `false` by construction in a
-/// native-only build (WP19), where the pairing machinery does not exist. The API field stays so
-/// the schema (and every console) is identical across build flavors.
+/// GameStream PIN wait. `false` in a native-only build (pairing does not exist); the field stays so the schema matches across flavors.
 #[cfg(feature = "gamestream")]
 fn gs_pin_pending(st: &Arc<MgmtState>) -> bool {
     st.app.pairing.pin.awaiting_pin()

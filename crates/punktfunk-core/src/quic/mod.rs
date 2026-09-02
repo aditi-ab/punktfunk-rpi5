@@ -1,45 +1,29 @@
-//! `punktfunk/1` — the native control plane, gated behind the `quic` feature.
+//! `punktfunk/1` — native control plane, behind the `quic` feature.
 //!
-//! GameStream is punktfunk's compatibility layer; this is the start of its own protocol. A QUIC
-//! connection (quinn, tokio — control plane only, never the per-frame path) carries a
-//! length-prefixed binary handshake on one bidirectional stream:
+//! One QUIC bidirectional stream (quinn, tokio — control only, never the
+//! per-frame path) carries a length-prefixed handshake:
 //!
 //! ```text
 //!   client → host  Hello   { abi_version }
-//!   host → client  Welcome { abi_version, session: full data-plane Config + mode + UDP port }
+//!   host → client  Welcome { abi_version, session: Config + mode + UDP port }
 //!   client → host  Start   { client_udp_port }
 //! ```
 //!
-//! after which both sides bring up a [`crate::session::Session`] over a plain
-//! [`UdpTransport`](crate::transport::udp) (native threads, no async) and the host streams.
-//! The Welcome carries everything the core negotiates — FEC scheme (including GF(2¹⁶)
-//! Leopard, which GameStream can't express), shard sizing, crypto key/salt — so the data
-//! plane is exactly the hardened core `Session`.
-//!
-//! Transport security: the host presents a long-lived self-signed certificate
-//! ([`endpoint::server_with_identity`]) and the client pins its SHA-256 fingerprint
-//! ([`endpoint::client_pinned`]; no pin = trust-on-first-use, with the observed fingerprint
-//! reported back for persisting). The data plane adds AES-GCM on top.
-//! All integers little-endian; every message is `u16 length || payload`.
-//!
-//! Split by concern (networking-audit deferred plan §3 — a pure move): `handshake` the
-//! positional Hello/Welcome/Start codecs, `caps` the capability/codec-negotiation
-//! vocabulary, `access` the per-client grant bits + input-kind classifier,
-//! `control` the typed control + clipboard messages, `pairing` the pairing
-//! message codecs with [`pake`] the SPAKE2 itself, `datagram` the 0xC9–0xD1 plane codecs,
-//! `pen` the stylus batch (0xCC kind 0x05) + host stroke tracker,
-//! [`io`] framed stream IO, `clock` skew estimation + mid-stream re-sync, [`endpoint`] the
-//! quinn constructors, [`clipstream`] the per-transfer clipboard fetch streams. Every item
-//! is re-exported here, so all existing `crate::quic::X` paths compile unchanged; each
-//! module's tests sit at its own foot.
+//! Both sides then open a [`crate::session::Session`] over
+//! [`UdpTransport`](crate::transport::udp) (native threads). Welcome carries
+//! the negotiated data-plane config (FEC, shard size, key/salt). The host
+//! presents a long-lived self-signed cert ([`endpoint::server_with_identity`]);
+//! the client pins its SHA-256 fingerprint ([`endpoint::client_pinned`]; no
+//! pin = TOFU). Data-plane AES-GCM sits on top. Integers little-endian; every
+//! message is `u16 length || payload`. Submodules re-export here as
+//! `crate::quic::X`.
 
-/// Protocol magic + version, first bytes of the positional handshake (Hello/Welcome/Start).
+/// Protocol magic + version; first bytes of Hello/Welcome/Start.
 pub const MAGIC: &[u8; 4] = b"PKF1";
 
-/// Magic for typed post-handshake / pairing control messages. A distinct magic keeps the
-/// typed namespace disjoint from the positional handshake: a `Hello` (whose abi_version
-/// byte sits where a type byte would) can never be misparsed as a control message, and
-/// vice-versa, regardless of field values.
+/// Magic for typed post-handshake / pairing messages. Distinct from [`MAGIC`] so a
+/// `Hello` (abi_version where a type byte would sit) cannot parse as control, and
+/// vice versa.
 pub const CTL_MAGIC: &[u8; 4] = b"PKFc";
 
 mod access;
@@ -51,23 +35,18 @@ mod handshake;
 mod pairing;
 mod pen;
 
-/// quinn endpoint constructors. Host: self-signed identity (fresh, or persisted PEMs via
-/// [`endpoint::server_with_identity`]). Client: fingerprint pinning / TOFU via
-/// [`endpoint::client_pinned`] ([`endpoint::client_insecure`] is the no-pin special case).
+/// quinn endpoint constructors: host identity ([`endpoint::server_with_identity`]),
+/// client pin / TOFU ([`endpoint::client_pinned`]).
 pub mod endpoint;
 
-/// Async framed-message IO over a quinn stream (`u16 LE length || payload`).
 pub mod io;
 
-/// Per-transfer clipboard fetch bi-streams (`PKFs` magic + kind byte, then request/response). The
-/// transport half of the shared clipboard; wire codecs are in [`control`], state lives per side.
+/// Per-transfer clipboard fetch streams (`PKFs` + kind, then request/response).
+/// Transport only; wire codecs in [`control`], state per side.
 pub mod clipstream;
 
-/// SPAKE2 over Ed25519 for the pairing ceremony. The two roles use the asymmetric flow so
-/// the identities are ordered; each side binds **both** certificate fingerprints as the
-/// SPAKE2 identities, so the derived key only matches when client and host agree on the PIN
-/// *and* saw the same two certificates (a MITM, presenting different certs to each leg,
-/// cannot reach a shared key).
+/// SPAKE2 over Ed25519 for pairing. Both certificate fingerprints are the SPAKE2
+/// identities, so a MITM that presents different certs on each leg cannot share a key.
 pub mod pake;
 
 pub use access::*;
@@ -79,9 +58,8 @@ pub use handshake::*;
 pub use pairing::*;
 pub use pen::*;
 
-// Typed rejection close codes + [`RejectReason`] live in `crate::reject` (ungated — the
-// error enum references them even in `quic`-less builds) and are re-exported here so the
-// wire vocabulary stays browsable next to QUIT/APP_EXITED.
+// Close codes + [`RejectReason`] live in `crate::reject` (ungated: the error enum
+// names them even without `quic`) and re-export here next to QUIT/APP_EXITED.
 pub use crate::reject::*;
 
 #[cfg(test)]

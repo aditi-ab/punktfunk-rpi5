@@ -1,15 +1,17 @@
-//! Virtual **Steam Controller 2** over USB/IP (`vhci_hcd`) — the Steam-promotable transport for
-//! the as-is passthrough backend ([`super::steam_controller2`]). The UHID leg was confirmed
-//! on-glass to be invisible to Steam (`Interface: -1`, the same gap the Deck had pre-usbip), so
-//! physical devices captured on 2026-07-15:
+//! Virtual Steam Controller 2 over USB/IP (`vhci_hcd`) — the Steam-promotable
+//! transport for the as-is backend ([`super::steam_controller2`]).
 //!
-//! - direct wired: `28DE:1302`, one Triton HID interface;
-//! - Puck: `28DE:1304`, CDC interfaces 0–1, four identical Triton HID controller slots on
-//!   interfaces 2–5, and the Puck management HID on interface 6.
+//! Steam Input requires a real USB parent (`Interface` ≥ 0). UHID enumerates
+//! `Interface: -1` and is dropped. Wired identity is `28DE:1302` (one HID
+//! interface). Puck is `28DE:1304`: CDC 0–1, HID slots 2–5, management HID 6.
 //!
-//! Report bodies are never translated. The declared client kind selects only the physical USB
-//! topology which owned those bytes. Interrupt-OUT and feature SET_REPORT traffic is captured and
-//! returned to the Android physical-device owner exactly as on the UHID leg.
+//! Report bodies are not translated. Client kind selects only the USB topology
+//! that owned those bytes. Interrupt-OUT and SET_REPORT traffic is returned
+//! to the physical-device owner.
+//!
+//! Pin the topologies with [`tests::device_matches_wired_capture`] and
+//! [`tests::device_matches_puck_capture`]. Attach is
+//! [`super::steam_usbip::attach_device`].
 
 use super::steam_usbip::{attach_device, boxed, UsbipAttachment};
 use super::triton_proto::{
@@ -30,7 +32,7 @@ const TRITON_VENDOR: u16 = 0x28DE;
 const TRITON_WIRED_PRODUCT: u16 = 0x1302;
 const TRITON_PUCK_PRODUCT: u16 = 0x1304;
 
-/// Captured interface-6 Puck management HID descriptor (54 bytes).
+/// Interface 6: Puck management HID. Not a controller slot.
 const PUCK_MANAGEMENT_RDESC: &[u8] = &[
     0x06, 0x00, 0xFF, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x42, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08,
     0x95, 0x35, 0x09, 0x42, 0x81, 0x02, 0x85, 0x79, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95,
@@ -38,12 +40,11 @@ const PUCK_MANAGEMENT_RDESC: &[u8] = &[
     0x3F, 0x09, 0x01, 0xB1, 0x02, 0xC0,
 ];
 
-/// Everything Steam wrote to the device since the last service pass.
+/// Steam writes since the last [`TritonUsbip::service`] drain.
 #[derive(Debug, Default)]
 pub struct TritonUsbFeedback {
-    /// `(low, high)` from the last `0x80` rumble output report.
+    /// `(low, high)` from the last `0x80` output report.
     pub rumble: Option<(u16, u16)>,
-    /// Raw reports to forward, `(kind, bytes)` — kind = `HID_RAW_OUTPUT`/`HID_RAW_FEATURE`.
     pub raw: Vec<(u8, Vec<u8>)>,
 }
 
@@ -62,9 +63,8 @@ impl Default for InputReport {
     }
 }
 
-/// A physical interrupt-IN endpoint queues sparse reports, but replays continuous controller
-/// state when the host polls faster than the controller. Keeping only one latest report loses a
-/// battery/RSSI packet to the following 250 Hz state packet before USB/IP can observe it.
+/// Sparse reports (battery/RSSI/wireless) queue; `0x42`/`0x45`/`0x47` state is newest-wins.
+/// A single latest-report slot loses the sparse packet to the next 250 Hz state URB.
 #[derive(Debug)]
 struct InputReports {
     latest_state: InputReport,
@@ -87,10 +87,8 @@ impl InputReports {
 
     fn write(&mut self, report: InputReport) {
         match report.data[0] {
-            // Continuous controller-state formats. Only the newest sample matters.
             0x42 | 0x45 | 0x47 => self.latest_state = report,
-            // Battery (0x43), RSSI/status (0x44/0x7B), wireless edges (0x46/0x79), and
-            // future sparse report types must each survive until Steam consumes them.
+            // Battery 0x43, RSSI 0x44/0x7B, wireless 0x46/0x79: queue until a poll consumes them.
             _ => {
                 if self.pending.len() >= 32 {
                     self.pending.pop_front();
@@ -105,8 +103,7 @@ impl InputReports {
     }
 }
 
-/// The 9-byte HID class descriptor: bcdHID **1.11**, country 0, one report descriptor — the
-/// captured wired values ([`super::steam_usbip`]'s shared helper bakes the Deck's 1.10/33).
+/// HID class descriptor: bcdHID 1.11, country 0. Do not reuse the Deck helper (1.10 / country 33).
 fn triton_hid_desc() -> Vec<u8> {
     let l = TRITON_RDESC.len() as u16;
     vec![
@@ -133,7 +130,7 @@ fn triton_puck_feature_reply(last_set: &[u8], serial: &str, unit_id: u32, status
             let payload = body.get(2..).unwrap_or_default();
             if payload.starts_with(b"user/wireless_transport") {
                 reply[2] = 1;
-                reply[3] = 2; // active Puck slot 0 maps to transport code 0 XOR 2
+                reply[3] = 2; // slot 0 → transport 0 XOR 2
             } else if status == 0x02 && payload.starts_with(b"esb/bond") {
                 reply[2] = 0x18;
                 write_puck_bond(&mut reply[3..27], serial, unit_id);
@@ -190,25 +187,21 @@ fn write_puck_bond(out: &mut [u8], serial: &str, unit_id: u32) {
     out[8..8 + len].copy_from_slice(&serial[..len]);
 }
 
-/// Interface 0: streams the current report on interrupt-IN, captures Steam's writes.
 #[derive(Debug)]
 struct TritonHandler {
-    /// Latest controller state plus sparse reports awaiting an interrupt-IN poll, shared with
-    /// [`TritonUsbip::write_state`].
+    /// Shared with [`TritonUsbip::write_state`].
     reports: Arc<Mutex<InputReports>>,
     feedback: Option<Arc<Mutex<TritonUsbFeedback>>>,
     serial: String,
     unit_id: u32,
-    /// `None` for wired; Puck slots answer `0xB4` with 2 (connected) or 1 (disconnected).
+    /// `None` wired; Puck `0xB4` is 2 (connected) or 1 (disconnected).
     puck_status: Option<u8>,
-    /// The last feature SET_REPORT (id-first) — the query half of the Valve GET dance.
+    /// Last feature SET_REPORT, id-first. GET echoes this command.
     last_set: Vec<u8>,
-    /// Last GET query command logged (once per distinct cmd, for the tester-facing journal).
     last_get_logged: u8,
 }
 
 impl TritonHandler {
-    /// Queue one raw report for forwarding, newest-wins bounded like the UHID leg.
     fn queue_raw(&self, kind: u8, data: Vec<u8>) {
         if data.is_empty() {
             return;
@@ -240,12 +233,9 @@ impl UsbInterfaceHandler for TritonHandler {
         use punktfunk_core::quic::{HID_RAW_FEATURE, HID_RAW_OUTPUT};
         if ep.is_ep0() {
             Ok(match (setup.request_type, setup.request) {
-                // GET report descriptor (standard, interface recipient).
                 (0x81, 0x06) if (setup.value >> 8) == 0x22 => TRITON_RDESC.to_vec(),
-                // HID GET_REPORT (feature): the answer half of the Valve query dance — echo the
-                // LAST SET's command with a plausible payload (attributes / serial). Answering
-                // with the wrong command type makes Steam drop the pad (confirmed on-glass
-                // 2026-07-15); the dance can't round-trip to the physical pad synchronously.
+                // Feature GET: echo last SET's command. Wrong type → Steam drops the pad.
+                // Cannot round-trip to the physical device on this URB.
                 (0xA1, 0x01) => {
                     let reply = if let Some(status) = self.puck_status {
                         triton_puck_feature_reply(
@@ -266,9 +256,8 @@ impl UsbInterfaceHandler for TritonHandler {
                     }
                     reply.to_vec()
                 }
-                // HID SET_REPORT: report type rides wValue's high byte (2 = OUTPUT, 3 = FEATURE)
-                // and the report id rides its low byte. EP0 OUT data may or may not repeat the id,
-                // so normalize to id-first before returning it to the physical-device owner.
+                // SET_REPORT: type in wValue high (2=OUT, 3=FEATURE), id in low.
+                // EP0 payload may omit the id; normalize to id-first for the physical owner.
                 (0x21, 0x09) => {
                     let report_type = (setup.value >> 8) as u8;
                     let id = (setup.value & 0xFF) as u8;
@@ -301,13 +290,10 @@ impl UsbInterfaceHandler for TritonHandler {
                 _ => vec![],
             })
         } else if let Direction::In = ep.direction() {
-            // Replay continuous state, but consume sparse battery/RSSI/wireless reports exactly
-            // once so a following 250 Hz state packet cannot erase them before Steam polls.
             let r = self.reports.lock().read();
             Ok(r.data[..r.len as usize].to_vec())
         } else {
-            // Interrupt-OUT: Steam's haptic output reports (`SDL_hid_write` — id-first framing
-            // on the wire already). Parse rumble for the universal plane, forward everything raw.
+            // Interrupt-OUT is already id-first (`SDL_hid_write`); EP0 SET_REPORT may not be.
             if !req.is_empty() {
                 if let (Some(r), Some(feedback)) =
                     (parse_triton_rumble(req), self.feedback.as_ref())
@@ -443,8 +429,7 @@ impl UsbInterfaceHandler for PuckManagementHandler {
                 reply[0] = 0x02;
                 let command = self.last_set.get(1).copied().unwrap_or(0);
                 reply[1] = command;
-                // Captured management response: SET 02 B4 00..., GET returns
-                // 02 B4 01 01... (the management interface itself is not a controller slot).
+                // Management HID is not a slot: 0xB4 GET is 02 B4 01 01, never a connected pad.
                 if command == 0xB4 {
                     reply[2] = 1;
                     reply[3] = 1;
@@ -461,8 +446,7 @@ impl UsbInterfaceHandler for PuckManagementHandler {
     }
 }
 
-/// Assemble the simulated wired Steam Controller 2 (see the module docs for the capture it
-/// matches). The handler shares `reports` + `feedback` with the owning [`TritonUsbip`].
+/// Wired `28DE:1302`. `reports` and `feedback` are shared with the owning [`TritonUsbip`].
 fn build_triton_device(
     index: u8,
     reports: &Arc<Mutex<InputReports>>,
@@ -470,36 +454,32 @@ fn build_triton_device(
 ) -> UsbDevice {
     let ep = |addr: u8| UsbEndpoint {
         address: addr,
-        attributes: 0x03,    // interrupt
-        max_packet_size: 64, // wMaxPacketSize 0x0040
-        // bInterval 1 — the real pad's 1 kHz. ⚠ Do NOT "fix" this to 4: bInterval is only the
-        // 2^(n-1) × 125 µs exponent on a HIGH-speed device, and this one negotiates FULL speed
-        // (`dev.speed` below), where the field is a plain frame count in milliseconds. So 1 means
-        // 1 ms = 1 kHz, exactly as intended, and 4 would mean 4 ms = 250 Hz — a 4× cut to the
-        // motion rate a passed-through SC2 delivers. (A 2026-08-07 sweep read this as high-speed
-        // and called it an 8 kHz duplicate storm; it is neither.)
+        attributes: 0x03, // interrupt
+        max_packet_size: 64,
+        // Full-speed bInterval is milliseconds, not the HS 2^(n-1)×125 µs exponent.
+        // 1 = 1 kHz. Do not "fix" to 4: that is 4 ms / 250 Hz on FS.
         interval: 1,
     };
     let mut dev = UsbDevice::new(0);
     dev.vendor_id = TRITON_VENDOR;
     dev.product_id = TRITON_WIRED_PRODUCT;
-    dev.usb_version = Version::from(0x0200u16); // bcdUSB 2.00
-    dev.device_bcd = Version::from(0x0307u16); // bcdDevice 3.07 (the captured firmware)
-    dev.device_class = 0xEF; // Miscellaneous / IAD — as the real pad ships
+    dev.usb_version = Version::from(0x0200u16);
+    dev.device_bcd = Version::from(0x0307u16);
+    dev.device_class = 0xEF; // IAD (miscellaneous)
     dev.device_subclass = 0x02;
     dev.device_protocol = 0x01;
-    dev.speed = UsbSpeed::Full as u32; // negotiated Full Speed (12 Mbps) on the capture
+    dev.speed = UsbSpeed::Full as u32;
     dev.set_manufacturer_name("Valve Software");
     dev.set_product_name("Steam Controller");
     dev.set_serial_number(&triton_serial(index));
-    dev.unset_configuration_name(); // real iConfiguration = 0
+    dev.unset_configuration_name(); // iConfiguration = 0
     dev.configuration_attributes = 0xA0; // bus powered + remote wakeup
     dev.configuration_max_power = 250; // 500 mA in 2 mA units
     dev.with_interface(
         0x03, // HID
         0x00,
         0x00,
-        None, // real iInterface = 0
+        None, // iInterface = 0
         vec![ep(0x81), ep(0x01)],
         boxed(TritonHandler {
             reports: reports.clone(),
@@ -513,8 +493,7 @@ fn build_triton_device(
     )
 }
 
-/// Assemble the captured `28DE:1304` Puck topology. A punktfunk wire pad occupies virtual Puck
-/// slot 0 (interface 2); slots 1–3 remain present but disconnected, matching an unpaired bank.
+/// Puck `28DE:1304`. The forwarded pad is slot 0 (interface 2); slots 1–3 stay disconnected.
 fn build_puck_device(
     index: u8,
     reports: &Arc<Mutex<InputReports>>,
@@ -584,10 +563,8 @@ fn build_puck_device(
         let (slot_reports, slot_feedback, puck_status) = if slot == 0 {
             (reports.clone(), Some(feedback.clone()), 0x02)
         } else {
-            // An unpaired physical slot leaves its interrupt-IN URB pending. The simulator
-            // cannot defer one URB without stalling the shared USB/IP command stream, so
-            // complete it empty instead. Replaying 0x79/0x01 here would announce a disconnect
-            // every 2 ms and keep Steam re-probing every slot.
+            // Unpaired slot: complete interrupt-IN empty. NAK/defer stalls the USB/IP stream.
+            // Do not replay 0x79/0x01 — Steam re-probes the slot every 2 ms.
             (
                 Arc::new(Mutex::new(InputReports::new(InputReport::default()))),
                 None,
@@ -623,8 +600,7 @@ fn build_puck_device(
     )
 }
 
-/// A virtual Steam Controller 2 presented over USB/IP. Dropping it detaches the `vhci_hcd` port
-/// (the device disappears, Steam releases it) and stops the emulation server.
+/// Drop detaches the `vhci_hcd` port and stops the emulation server.
 pub struct TritonUsbip {
     reports: Arc<Mutex<InputReports>>,
     feedback: Arc<Mutex<TritonUsbFeedback>>,
@@ -633,8 +609,8 @@ pub struct TritonUsbip {
 }
 
 impl TritonUsbip {
-    /// Bind a virtual wired SC2 and attach it locally via `vhci_hcd` (root + `vhci_hcd` loaded;
-    /// see [`super::steam_usbip::attach_device`]). `index` varies only the serial.
+    /// Attach a wired SC2 via `vhci_hcd` (root + module; [`super::steam_usbip::attach_device`]).
+    /// `index` varies only the serial.
     pub fn open(index: u8) -> Result<TritonUsbip> {
         let reports = Arc::new(Mutex::new(InputReports::new(neutral_report())));
         let feedback = Arc::new(Mutex::new(TritonUsbFeedback::default()));
@@ -650,8 +626,7 @@ impl TritonUsbip {
         })
     }
 
-    /// Bind the captured seven-interface Puck identity. The forwarded controller occupies Puck
-    /// slot 0; the other three HID interfaces remain visible as disconnected slots.
+    /// Attach the seven-interface Puck. Forwarded pad is slot 0; slots 1–3 stay disconnected.
     pub fn open_puck(index: u8) -> Result<TritonUsbip> {
         let reports = Arc::new(Mutex::new(InputReports::with_pending(
             neutral_report(),
@@ -670,8 +645,7 @@ impl TritonUsbip {
         })
     }
 
-    /// Mirror one report onto the interrupt-IN stream: continuous state replaces the prior sample;
-    /// sparse physical reports retain their native length and queue until Steam consumes them.
+    /// Push one interrupt-IN report. Continuous state newest-wins; sparse reports queue.
     pub fn write_state(&mut self, st: &TritonState) {
         let mut report = InputReport::default();
         if st.raw_len > 0 {
@@ -690,13 +664,12 @@ impl TritonUsbip {
         self.reports.lock().write(report);
     }
 
-    /// Drain everything Steam wrote to the device since the last pass.
     pub fn service(&mut self) -> TritonUsbFeedback {
         std::mem::take(&mut *self.feedback.lock())
     }
 }
 
-/// An idle `0x42` state report — what the wired endpoint streams before the first write.
+/// Idle `0x42` state — what the wired endpoint streams before the first write.
 fn neutral_report() -> InputReport {
     let mut report = InputReport {
         len: TRITON_STATE_LEN as u8,
@@ -708,7 +681,7 @@ fn neutral_report() -> InputReport {
     report
 }
 
-/// The Puck reports its wireless connect edge before the first controller state packet.
+/// Puck wireless-connect edge (`0x79 0x02`), queued before the first state packet.
 fn puck_connect_report() -> InputReport {
     let mut report = InputReport {
         len: 2,
@@ -738,11 +711,9 @@ mod tests {
 
         assert_eq!(reports.read().data[..3], [0x7B, 0xF8, 0x01]);
         assert_eq!(reports.read().data[1], 9);
-        assert_eq!(reports.read().data[1], 9); // continuous state replays
+        assert_eq!(reports.read().data[1], 9); // newest state replays after the sparse packet
     }
 
-    /// The simulated device matches the captured wired identity byte-for-byte where Steam looks:
-    /// VID/PID, device class triplet, bcdDevice, ONE HID interface with the IN+OUT endpoint pair.
     #[test]
     fn device_matches_wired_capture() {
         let reports = Arc::new(Mutex::new(InputReports::new(InputReport::default())));
@@ -770,18 +741,15 @@ mod tests {
             .map(|e| (e.address, e.attributes, e.max_packet_size, e.interval))
             .collect();
         assert_eq!(eps, vec![(0x81, 3, 64, 1), (0x01, 3, 64, 1)]);
-        // bcdHID 1.11 + the served report descriptor's length in the HID class descriptor.
         let hid = triton_hid_desc();
         assert_eq!(&hid[2..4], &[0x11, 0x01]);
         assert_eq!(
             u16::from_le_bytes([hid[7], hid[8]]) as usize,
             TRITON_RDESC.len()
         );
-        assert!(triton_serial(3).starts_with("FVPF")); // the conflict-gate exclusion prefix
+        assert!(triton_serial(3).starts_with("FVPF")); // conflict-gate exclusion prefix
     }
 
-    /// The Puck capture's complete configuration is 235 bytes: CDC IAD + CDC pair + four
-    /// controller HID slots + management HID. Endpoint numbers and intervals are slot-significant.
     #[test]
     fn device_matches_puck_capture() {
         let reports = Arc::new(Mutex::new(InputReports::with_pending(
@@ -924,8 +892,7 @@ mod tests {
         for interface in 3..=5 {
             assert_eq!(slot_status(interface), [0x02, 0xB4, 0x01, 0x01]);
         }
-        // A disconnected slot is quiescent. In particular, it must not replay the
-        // one-shot 0x79/0x01 disconnect edge on every 2 ms interrupt poll.
+        // Disconnected slot: empty interrupt-IN. Never 0x79/0x01 on every 2 ms poll.
         let iface = dev.interfaces[3].clone();
         let interrupt_in = iface.endpoints[0];
         assert!(iface
@@ -937,8 +904,6 @@ mod tests {
             .is_empty());
     }
 
-    /// Steam's interrupt-OUT rumble lands in the feedback (parsed + queued raw); EP0 feature
-    /// writes are normalized to id-first framing whichever way the stack framed them.
     #[test]
     fn out_and_feature_writes_are_captured() {
         use punktfunk_core::quic::{HID_RAW_FEATURE, HID_RAW_OUTPUT};
@@ -971,18 +936,18 @@ mod tests {
         };
         let ep0 = UsbEndpoint {
             address: 0x00,
-            attributes: 0x00, // control
+            attributes: 0x00,
             max_packet_size: 64,
             interval: 0,
         };
-        // Rumble output report: [0x80, type, intensity u16, left u16+gain, right u16+gain].
+        // `[0x80, type, intensity u16, left u16+gain, right u16+gain]`.
         let mut rumble = [0u8; 10];
         rumble[0] = 0x80;
         rumble[4..6].copy_from_slice(&0x2000u16.to_le_bytes());
         rumble[7..9].copy_from_slice(&0x4000u16.to_le_bytes());
         h.handle_urb(&iface_dummy, ep_out, 10, SetupPacket::default(), &rumble)
             .unwrap();
-        // hidraw may issue an OUTPUT report through EP0 instead of the interrupt endpoint.
+        // hidraw may SET_REPORT OUTPUT on EP0 instead of interrupt-OUT.
         let setup = SetupPacket {
             request_type: 0x21,
             request: 0x09,
@@ -992,7 +957,7 @@ mod tests {
         };
         h.handle_urb(&iface_dummy, ep0, 3, setup, &[0x01, 0x01, 0xF7])
             .unwrap();
-        // Feature SET_REPORT with the id NOT in the payload (it rides wValue) → normalized.
+        // Feature SET_REPORT: id rides wValue, not the payload — must still normalize.
         let setup = SetupPacket {
             request_type: 0x21,
             request: 0x09,
@@ -1009,7 +974,7 @@ mod tests {
         assert_eq!(fb.raw[0].1[0], 0x80);
         assert_eq!(fb.raw[1], (HID_RAW_OUTPUT, vec![0x82, 0x01, 0x01, 0xF7]));
         assert_eq!(fb.raw[2].0, HID_RAW_FEATURE);
-        assert_eq!(&fb.raw[2].1[..3], &[0x01, 0x87, 3]); // id-first for the client replay
+        assert_eq!(&fb.raw[2].1[..3], &[0x01, 0x87, 3]); // id-first for client replay
     }
 
     #[derive(Debug)]
@@ -1033,16 +998,14 @@ mod tests {
         }
     }
 
-    /// On-box smoke (root + `vhci_hcd`): attach the virtual wired SC2, confirm the USB device
-    /// enumerates with the Valve identity on a REAL interface number (the whole point vs UHID),
-    /// and that it tears down on drop. `#[ignore]`d in CI.
+    /// Root + `vhci_hcd`: enumerates `28DE:1302` on a real interface, tears down on drop.
     #[test]
     #[ignore = "attaches a real vhci_hcd device; needs root + vhci_hcd"]
     fn usbip_triton_enumerates_and_tears_down() {
         super::super::steam_usbip::ensure_modules();
         let mut pad = TritonUsbip::open(0).expect("open TritonUsbip (root + vhci_hcd?)");
         let mut st = TritonState::neutral();
-        let raw: &[u8] = &[0x42, 1, 0x01, 0, 0, 0]; // A held (truncated report is fine)
+        let raw: &[u8] = &[0x42, 1, 0x01, 0, 0, 0]; // A held; truncated length is accepted
         st.raw[..raw.len()].copy_from_slice(raw);
         st.raw_len = raw.len() as u8;
         let start = std::time::Instant::now();
@@ -1051,8 +1014,6 @@ mod tests {
             let _ = pad.service();
             std::thread::sleep(std::time::Duration::from_millis(8));
         }
-        // A real USB HID device now exists: /sys/bus/hid device named ...:28DE:1302 whose path
-        // resolves through vhci_hcd (NOT /devices/virtual), carrying interface number 0.
         let found = std::fs::read_dir("/sys/bus/hid/devices")
             .expect("/sys/bus/hid/devices")
             .flatten()

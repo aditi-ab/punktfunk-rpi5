@@ -1,42 +1,19 @@
-//! Intel **QSV** (and, retained-but-no-longer-dispatched, AMD **AMF**) hardware encode on Windows
-//! via `ffmpeg-next` — the Windows analogue of the Linux [`super::vaapi`] backend (one libavcodec
-//! backend per vendor, selected by encoder name: `*_qsv` / `*_amf`). Sibling of the direct-SDK
-//! [`super::nvenc`] path behind the shared [`Encoder`] trait.
+//! Intel **QSV** (and, retained for the latency A/B, AMD **AMF**) libavcodec encode on Windows.
+//! Analogue of Linux [`super::vaapi`]; sibling of the direct-SDK [`super::nvenc`] path. Encoder
+//! name selects the vendor (`*_qsv` / `*_amf`). Evidence: `design/native-amf-encoder.md`.
 //!
-//! **Dispatch (design/native-amf-encoder.md Phase 3):** [`super::open_video`] routes AMD to the
-//! direct-SDK [`super::amf`] encoder, not this module — the libavcodec AMF wrapper's ~2-frame
-//! output hold and its silent-wedge failure mode are exactly why the native path exists. So in
-//! production this file serves **QSV only**. The `WinVendor::Amf` machinery is kept (not deleted)
-//! because it is the comparator in the native-vs-libavcodec latency A/B (`amf::tests::
-//! amf_latency_ab_bench`), and excising it would churn the shared, Intel-unvalidated QSV code for
-//! no production benefit. Treat every `WinVendor::Amf` arm below as benchmark-only.
+//! Production dispatch: [`super::open_video`] sends AMD to [`super::amf`], not here — the
+//! libavcodec AMF wrapper holds ~2 frames and can wedge silently. `WinVendor::Amf` remains
+//! because `amf::tests::amf_latency_ab_bench` compares native vs libavcodec; treat those arms
+//! as benchmark-only.
 //!
-//! The capturer hands a `FramePayload::D3d11` texture (NV12/P010 from the D3D11 video processor, or
-//! BGRA/Rgb10a2 as a fallback) on the capturer's own `ID3D11Device`. Two input paths, chosen lazily
-//! from the first frame and the `PUNKTFUNK_ZEROCOPY` knob:
-//!
-//! * **System-memory** ([`SystemInner`]): read the captured D3D11 surface back to a CPU
-//!   NV12/P010 [`AVFrame`] (a same-format `CopyResource` → staging → `Map`, plus a `swscale` step for
-//!   the BGRA fallback) and `avcodec_send_frame` it. AMF/QSV upload it internally. One
-//!   GPU→CPU→GPU round-trip per frame — the robust path, the QSV default, and the automatic
-//!   fallback when the zero-copy setup fails (it is the analogue of the VAAPI "CPU input" fallback).
-//! * **Zero-copy D3D11** ([`ZeroCopyInner`], the AMF default; see [`zerocopy_enabled`]): wrap the
-//!   capturer's `ID3D11Device` as an `AV_HWDEVICE_TYPE_D3D11VA` hwdevice (shared, *not* a second
-//!   device — the capture textures are not shared-handle, so a different device couldn't read them),
-//!   keep an FFmpeg D3D11 frames pool, `CopySubresourceRegion` the captured texture into a pooled
-//!   array slice (a GPU-local copy, like NVENC's CUDA path), then feed AMF `AV_PIX_FMT_D3D11`
-//!   directly, or map the D3D11 frame to a derived QSV surface for QSV. If the hw setup fails to
-//!   open, this falls back to the system-memory path for the session.
-//!
-//! **Status:** AMF on-glass validated 2026-07-06 (Ryzen 7000 iGPU, 1080p120 HDR P010, both input
-//! paths; zero-copy cut `submit_us` p50 2.8 ms → 0.26 ms) — zero-copy is the AMF default. QSV is
-//! still not on-glass validated (no Intel Windows box in the lab), so its zero-copy path stays
-//! opt-in via `PUNKTFUNK_ZEROCOPY=1`.
-//!
-//! Raw FFI: `ffmpeg-next` has no hwcontext wrappers for D3D11VA, so the hwdevice/hwframes calls go
-//! through `ffmpeg::ffi` (= `ffmpeg_sys_next`), exactly as the Linux CUDA/VAAPI paths do. The
-//! `AVD3D11VADeviceContext`/`AVD3D11VAFramesContext` layouts are mirrored (the bindings don't
-//! allowlist `hwcontext_d3d11va.h`), as [`super::linux`] mirrors `AVCUDADeviceContext`.
+//! Input is the capturer's `FramePayload::D3d11` on its `ID3D11Device`. [`SystemInner`] reads
+//! back to CPU NV12/P010 (QSV default; fallback if zero-copy open fails). [`ZeroCopyInner`]
+//! wraps that same device as D3D11VA (capture textures are not shared-handle — a second
+//! device cannot read them), copies GPU-local into an FFmpeg pool, and feeds AMF D3D11 or a
+//! derived QSV surface. QSV zero-copy is opt-in (`PUNKTFUNK_ZEROCOPY=1`); a derive that opens
+//! but maps wrong would corrupt silently. FFI via `ffmpeg::ffi`; D3D11VA layouts are mirrored
+//! because the bindings omit `hwcontext_d3d11va.h`.
 
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder};
 use anyhow::{anyhow, bail, Context, Result};
@@ -62,55 +39,35 @@ use super::libav::{
     apply_low_latency_rc, pixel_to_av, poll_encoder, AvBuffer, AvFrame, AvSwsContext, PollOutcome,
     SWS_CS_BT2020, SWS_CS_ITU709, SWS_POINT,
 };
-use ffmpeg::ffi; // = ffmpeg_sys_next
+use ffmpeg::ffi;
 
-/// `AVD3D11VADeviceContext` (libavutil/hwcontext_d3d11va.h) — mirrored (the ffmpeg-sys bindings
-/// don't allowlist that header). We set `device` to the capturer's `ID3D11Device` so AMF/QSV share
-/// it; `av_hwdevice_ctx_init` fills `device_context`/`video_device`/`video_context`/the default
-/// lock from a non-null `device`.
+/// Mirrored `AVD3D11VADeviceContext` (`hwcontext_d3d11va.h` is not in the ffmpeg-sys allowlist).
+/// Store the capturer's `ID3D11Device` in `device`; `av_hwdevice_ctx_init` fills the rest.
 #[repr(C)]
 struct AVD3D11VADeviceContext {
-    device: *mut c_void,         // ID3D11Device*
-    device_context: *mut c_void, // ID3D11DeviceContext*
-    video_device: *mut c_void,   // ID3D11VideoDevice*
-    video_context: *mut c_void,  // ID3D11VideoContext*
-    lock: *mut c_void,           // void (*)(void*)
-    unlock: *mut c_void,         // void (*)(void*)
+    device: *mut c_void,
+    device_context: *mut c_void,
+    video_device: *mut c_void,
+    video_context: *mut c_void,
+    lock: *mut c_void,
+    unlock: *mut c_void,
     lock_ctx: *mut c_void,
-    // DELIBERATELY TRUNCATED: FFmpeg >=8 appends `UINT BindFlags; UINT MiscFlags;` here, FFmpeg 7.1
-    // does not, and we build against both (Windows links the BtbN n7.1 tree, Linux the distro's 8 or
-    // 9). Mirroring only the common prefix is what makes one definition correct for all three —
-    // libav owns the allocation (av_hwdevice_ctx_alloc sizes it), and we only ever WRITE `device` at
-    // offset 0, so a short mirror can never read or write past what libav allocated. Adding the two
-    // flags to match 8/9 would silently mis-describe the 7.1 build we actually ship on Windows.
-    // The per-pool AVD3D11VAFramesContext.BindFlags below — which we DO set — exists in all three.
+    // Stop at the FFmpeg 7.1 prefix: 8+ appends BindFlags/MiscFlags. libav sizes the alloc;
+    // we only write `device` at offset 0. Matching 8 would mis-describe the Windows 7.1 ship.
 }
 
-/// `AVD3D11VAFramesContext` (libavutil/hwcontext_d3d11va.h) — mirrored. `BindFlags`/`MiscFlags`
-/// customise the texture-array FFmpeg allocates for the pool; `texture` (we leave null) would let us
-/// supply our own array.
+/// Mirrored `AVD3D11VAFramesContext`. Null `texture` lets FFmpeg allocate the pool array;
+/// `bind_flags`/`misc_flags` customise that array. `texture_infos` is FFmpeg-owned — never write.
 #[repr(C)]
 struct AVD3D11VAFramesContext {
-    texture: *mut c_void,       // ID3D11Texture2D*
-    bind_flags: c_uint,         // UINT BindFlags
-    misc_flags: c_uint,         // UINT MiscFlags
-    texture_infos: *mut c_void, // AVD3D11FrameDescriptor* (FFmpeg-owned; we never touch it)
+    texture: *mut c_void,
+    bind_flags: c_uint,
+    misc_flags: c_uint,
+    texture_infos: *mut c_void,
 }
 
-// Hand-written mirrors of libav's `AVD3D11VADeviceContext` / `AVD3D11VAFramesContext`
-// (hwcontext_d3d11va.h) — `ffmpeg-sys-next` binds neither, and we WRITE `device` / `bind_flags`
-// through them, so a wrong offset is silent corruption of libav's context rather than a compile
-// error.
-//
-// ⚠ KNOW WHAT THESE ASSERTIONS DO AND DO NOT BUY YOU. They pin OUR layout, not libav's, so they
-// turn an accidental edit to the structs above into a build failure — but nothing here reads
-// hwcontext_d3d11va.h, so a field libav inserts upstream still sails straight through, and a green
-// build is not evidence. Both layouts were therefore re-checked BY HAND against FFmpeg 7.1, 8.1.2
-// and 9.0 during the 8 -> 9 bump (2026-08-08): `AVD3D11VAFramesContext` is byte-identical in all
-// three, and `AVD3D11VADeviceContext` gained two trailing UINTs in 8 that 7.1 lacks — which is
-// exactly why the struct above stops at the common prefix. Re-check by hand on the next FFmpeg
-// major. (An older note here claimed these were duplicated in pf-client-core's `video_d3d11.rs`;
-// that copy went away with the client's FFmpeg in M10, so this is now the only definition.)
+// These asserts pin OUR layout, not libav's. A field FFmpeg inserts still compiles; re-check
+// `hwcontext_d3d11va.h` on the next FFmpeg major. A wrong offset here is silent corruption.
 const _: () = {
     use std::mem::{offset_of, size_of};
     type P = *mut c_void;
@@ -130,15 +87,10 @@ const _: () = {
     assert!(offset_of!(AVD3D11VAFramesContext, texture_infos) == 2 * size_of::<P>());
 };
 
-/// AMD AMF vs Intel QSV — the two libavcodec vendor backends this module covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WinVendor {
-    /// Benchmark-only, as the module header explains: native AMF replaced the libavcodec AMF path
-    /// in production, and the only remaining CONSTRUCTOR is the `#[cfg(feature = "amf-qsv")]`
-    /// latency A/B in `amf.rs` — the measurement that justifies the native backend existing. That
-    /// is test code, so the *lib* target constructs it nowhere and `dead_code` fires on it (the
-    /// crate root no longer blanket-allows that). Kept deliberately rather than deleted; the arms
-    /// below are what the benchmark drives.
+    /// Benchmark-only: production AMD goes through [`super::amf`]. The lib target never
+    /// constructs this (`dead_code`); `amf::tests::amf_latency_ab_bench` is the remaining caller.
     #[allow(dead_code)]
     Amf,
     Qsv,
@@ -160,49 +112,27 @@ impl WinVendor {
     }
 }
 
-/// Is the zero-copy D3D11 path enabled for this vendor? An explicit `PUNKTFUNK_ZEROCOPY`
-/// (`0|false|off|no` = off, anything else = on) overrides; unset defers to the per-vendor default:
-/// **on for AMF** — on-glass validated 2026-07-06 (Ryzen iGPU, 1080p120 HDR P010: `submit_us` p50
-/// 2.8 ms → 0.26 ms vs readback) — and **off for QSV** until validated on Intel glass (the
-/// open-failure fallback only catches *setup* errors; a derive that opens but maps wrong would
-/// corrupt silently, so it stays opt-in per the probe-never-assume rule).
+/// `PUNKTFUNK_ZEROCOPY` override, else AMF on / QSV off. QSV stays opt-in: open-failure fallback
+/// catches setup errors only; a derive that opens but maps wrong would corrupt silently.
 fn zerocopy_enabled(vendor: WinVendor) -> bool {
     zerocopy_active(pf_host_config::config().zerocopy, vendor)
 }
 
-/// The pure half of [`zerocopy_enabled`]: an operator override wins; unset resolves to the
-/// per-vendor default (AMF on, QSV off — see the validation status above).
+/// Pure half of [`zerocopy_enabled`] (tests). Operator override wins; unset is AMF on, QSV off.
 fn zerocopy_active(override_: Option<bool>, vendor: WinVendor) -> bool {
     override_.unwrap_or(matches!(vendor, WinVendor::Amf))
 }
 
-/// Upper bound on `PUNKTFUNK_FFWIN_POLL_MS`. This knob spins the **encode thread** waiting for an
-/// AU, so a value past one frame period is already self-defeating and a full second is far beyond
-/// anything an operator would set on purpose. The clamp is also what makes the µs conversion
-/// below provably overflow-free.
-///
-/// The reachable hazard is a slipped digit, not the overflow: pre-clamp, `PUNKTFUNK_FFWIN_POLL_MS=
-/// 100000000` was a **27.7-hour** spin with no overflow anywhere near it.
+/// Cap on `PUNKTFUNK_FFWIN_POLL_MS`. The knob spins the encode thread; past one frame period is
+/// already useless. Clamping here is what makes the µs conversion overflow-free.
 const MAX_POLL_SPIN_MS: u64 = 1_000;
 
-/// Bounded post-submit spin for [`FfmpegWinEncoder::poll`], in microseconds (0 = off, the default
-/// and the correct choice on every VCN measured so far).
+/// Post-submit spin for [`FfmpegWinEncoder::poll`], microseconds, latched once per process
+/// (`poll` is per tick). 0 = off.
 ///
-/// Read from the environment **once per process** (WP6.1): `poll` runs once per encode tick, and
-/// this was an unconditional `env::var` + parse on it.
-///
-/// ⚠ The audit proposed `saturating_mul` for the µs conversion. It is still the wrong fix, but for
-/// a reason worth stating precisely, because the obvious one is false: `Duration::from_micros(
-/// u64::MAX)` is only ~1.8e13 seconds, six orders of magnitude below `Duration`'s `u64::MAX`-second
-/// ceiling, so `Instant::now() + Duration::from_micros(u64::MAX)` does **not** overflow and does
-/// **not** panic (measured, both with and without debug assertions). What it does instead is set a
-/// deadline ~584,000 years out, and the loop below only exits on `Packet`/`Eof` — and this
-/// function's own doc explains that a spin here *provably never* produces the owed AU on the
-/// measured hardware. So `saturating_mul` converts a bad value into a **permanently wedged encode
-/// thread**: a hang, not a panic. Clamping the parsed value first removes the bad value entirely.
-///
-/// (For the record on the pre-clamp behaviour: the workspace sets no `overflow-checks` in
-/// `[profile.release]`, so `ms * 1000` wrapped silently in release and panicked only in debug.)
+/// Do not `saturating_mul` the ms→µs step: `Duration::from_micros(u64::MAX)` does not overflow
+/// `Instant` (~584 kyr), and the loop exits only on Packet/Eof, so a saturated bad value wedges
+/// the encode thread. Clamp the parsed ms to [`MAX_POLL_SPIN_MS`] first.
 fn poll_spin_cap_us() -> u64 {
     static CAP_US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *CAP_US.get_or_init(|| {
@@ -210,16 +140,14 @@ fn poll_spin_cap_us() -> u64 {
     })
 }
 
-/// The pure half of [`poll_spin_cap_us`]: parse, clamp to [`MAX_POLL_SPIN_MS`] BEFORE the µs
-/// conversion (the ordering the doc above proves is load-bearing), and default to 0 — no spin,
-/// the libavcodec AMF buffer can't be spun out.
+/// Clamp to [`MAX_POLL_SPIN_MS`] **before** `* 1000`. Default 0: the libavcodec AMF hold cannot
+/// be spun out.
 fn parse_poll_spin_cap_us(raw: Option<&str>) -> u64 {
     raw.and_then(|s| s.trim().parse::<u64>().ok())
         .map(|ms| ms.min(MAX_POLL_SPIN_MS) * 1000)
         .unwrap_or(0)
 }
 
-/// The swscale *source* pixel format for a captured packed-RGB/BGR layout (8-bit BGRA fallback only).
 fn sws_src(format: PixelFormat) -> Result<Pixel> {
     Ok(match format {
         PixelFormat::Bgrx => Pixel::BGRZ,
@@ -228,9 +156,8 @@ fn sws_src(format: PixelFormat) -> Result<Pixel> {
         PixelFormat::Rgba => Pixel::RGBA,
         PixelFormat::Rgb => Pixel::RGB24,
         PixelFormat::Bgr => Pixel::BGR24,
-        // X2Rgb10/X2Bgr10 are the Linux GNOME 50 HDR screencast formats — the Windows HDR path
-        // stays Rgb10a2/P010, so they can't reach this capture-side conversion. Listed explicitly
-        // (not via `_`) so the next PixelFormat addition breaks this match again on purpose.
+        // Exhaustive on purpose: a new PixelFormat must re-break this match. X2Rgb10/X2Bgr10
+        // are Linux HDR screencast layouts and cannot arrive on this Windows capture path.
         PixelFormat::Nv12
         | PixelFormat::P010
         | PixelFormat::Rgb10a2
@@ -243,39 +170,27 @@ fn sws_src(format: PixelFormat) -> Result<Pixel> {
     })
 }
 
-/// Does this captured format imply a 10-bit encode (P010 / Rgb10a2)?
-///
-/// Depth follows the PIXELS, not the negotiated `bit_depth` — see
-/// [`crate::ten_bit_input`] for why, and for the failure this shape used to produce here in
-/// particular: a 10-bit-negotiated session over an 8-bit capture built a P010 encoder whose every
-/// `submit_d3d11` then failed the depth check below, forever, with `reset()` unable to help
-/// because the rebuild re-derived the same wrong answer.
+/// Depth follows the pixels, not negotiated `bit_depth` ([`crate::ten_bit_input`]). A 10-bit
+/// session over 8-bit capture would otherwise open P010 and fail every `submit_d3d11` forever —
+/// `reset()` rebuilds from the same wrong answer.
 fn is_10bit_format(format: PixelFormat) -> bool {
-    // Rgb10a2Sdr joins for honesty, though it can't arrive here: the 10-bit SDR chain is
-    // gated to the direct-NVENC backend at the handshake.
+    // Rgb10a2Sdr cannot arrive: the 10-bit SDR chain is gated to direct-NVENC at handshake.
     matches!(
         format,
         PixelFormat::P010 | PixelFormat::Rgb10a2 | PixelFormat::Rgb10a2Sdr
     )
 }
 
-/// Which lane the system-memory path routes a captured D3D11 format through. Device-free — the
-/// routing DECISION, split from the D3D11 copies so it is testable.
+/// System-path lane for a captured D3D11 format. Device-free so the routing table is testable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReadbackRoute {
-    /// Same-format `CopyResource` + plane-by-plane copy (NV12/P010 from the video processor).
     Yuv,
-    /// BGRA staging + swscale BGRA→NV12 — the 8-bit fallback when the capturer's video
-    /// processor latched off.
     Bgra,
-    /// R10G10B10A2 staging + swscale X2BGR10→P010 — the HDR twin of that fallback.
     Rgb10,
 }
 
-/// Route a captured format, guarding the mid-stream depth change first: the predicate matches
-/// what the encoder was built from (`ten_bit_input`), so the guard can only fire on a GENUINE
-/// depth change under the encoder — never, as it used to, on every frame of a session that
-/// merely negotiated 10-bit over an 8-bit capture (see [`is_10bit_format`]).
+/// Guard fires only on a genuine mid-stream depth change: `ten_bit` is what the encoder was
+/// built from ([`is_10bit_format`]), not the negotiated session depth.
 fn readback_route(format: PixelFormat, ten_bit: bool) -> Result<ReadbackRoute> {
     anyhow::ensure!(
         is_10bit_format(format) == ten_bit,
@@ -292,46 +207,36 @@ fn readback_route(format: PixelFormat, ten_bit: bool) -> Result<ReadbackRoute> {
     })
 }
 
-/// The vendor-specific low-latency option set for [`open_win_encoder`], pure so the latency
-/// contract is pinned by tests. Unknown private options are ignored by `avcodec_open2` (left in
-/// the dict), so vendor/codec-specific keys are safe to set unconditionally.
+/// Per-vendor low-latency dict for [`open_win_encoder`]. Unknown keys are ignored by
+/// `avcodec_open2`, so codec-specific entries are safe to set unconditionally.
 fn vendor_opts(vendor: WinVendor, amf_usage: &str) -> Vec<(&'static str, String)> {
     match vendor {
         WinVendor::Amf => vec![
-            // Field-tuning override (ultralowlatency | lowlatency | lowlatency_high_quality |
-            // transcoding): AMF usage presets bundle driver-side pipeline behavior that varies
-            // by VCN generation/driver — measured on-box rather than assumed.
             ("usage", amf_usage.to_owned()),
             ("rc", "cbr".into()),
-            // Streaming is latency-first: `speed` trims per-frame motion-estimation depth — the
-            // difference between ~encode-time and ~frame-budget on iGPU-class VCN (matches the
-            // low-latency preset choice on the NVENC path).
+            // `speed` trims motion-estimation depth; matches the NVENC low-latency preset.
             ("quality", "speed".into()),
             ("preanalysis", "false".into()),
             ("enforce_hrd", "true".into()),
-            // AMF low-latency submission mode (FFmpeg ≥ 6.1; unknown-option-ignored on older).
-            ("latency", "true".into()),
-            // Never B-frames: h264_amf defaults >0 on RDNA3+ HW that supports them, and each
-            // B-frame is a full frame period of added latency. (HEVC VCN has none; ignored there.)
+            ("latency", "true".into()), // FFmpeg ≥ 6.1; ignored on older
+            // h264_amf defaults B-frames >0 on RDNA3+; each is a full frame period. Ignored on HEVC.
             ("bf", "0".into()),
-            // VPS/SPS/PPS on each IDR (clean mid-stream join) — HEVC/AV1 only; ignored elsewhere.
+            // VPS/SPS/PPS on each IDR — HEVC/AV1 only; ignored elsewhere.
             ("header_insertion_mode", "idr".into()),
         ],
         WinVendor::Qsv => vec![
             ("preset", "veryfast".into()),
-            ("async_depth", "1".into()), // bound in-flight frames — the big QSV latency lever
-            ("low_power", "1".into()),   // VDEnc fixed-function path (lower latency)
-            ("look_ahead", "0".into()),  // (h264_qsv only; ignored on hevc/av1)
-            ("forced_idr", "1".into()),  // a forced key frame becomes a real IDR
+            ("async_depth", "1".into()), // in-flight cap — the QSV latency lever
+            ("low_power", "1".into()),   // VDEnc fixed-function path
+            ("look_ahead", "0".into()),  // h264_qsv only; ignored on hevc/av1
+            ("forced_idr", "1".into()),
             ("scenario", "displayremoting".into()),
         ],
     }
 }
 
-/// Bind flags on the FFmpeg-allocated zero-copy pool. AMF reads it as encoder input
-/// (RENDER_TARGET + SHADER_RESOURCE, matching the video-processor output); QSV maps it as an mfx
-/// surface (DECODER | VIDEO_ENCODER). The `CopySubresourceRegion` into the pool works with any
-/// usable DEFAULT-usage texture regardless.
+/// Zero-copy pool bind flags. AMF: encoder-input (RENDER_TARGET | SHADER_RESOURCE). QSV: mfx
+/// surface (DECODER | VIDEO_ENCODER). The GPU copy into the pool accepts any DEFAULT texture.
 fn pool_bind_flags(vendor: WinVendor) -> u32 {
     match vendor {
         WinVendor::Amf => (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
@@ -339,9 +244,8 @@ fn pool_bind_flags(vendor: WinVendor) -> u32 {
     }
 }
 
-/// Build the FFmpeg encoder context shared by both inner paths: name, mode, low-latency RC,
-/// infinite GOP, the BT.709-limited (SDR) or BT.2020-PQ (HDR) VUI, the given `pix_fmt`, and the
-/// optional hw device/frames contexts (null for the system path). Returns the opened encoder.
+/// Shared encoder open: low-latency RC, infinite GOP, BT.709-limited or BT.2020-PQ VUI.
+/// `device_ref`/`frames_ref` null = system path.
 #[allow(clippy::too_many_arguments)]
 unsafe fn open_win_encoder(
     vendor: WinVendor,
@@ -369,33 +273,28 @@ unsafe fn open_win_encoder(
         .context("alloc video encoder")?;
     video.set_width(width);
     video.set_height(height);
-    // Software view of the input layout (NV12 / P010). For the hw paths `pix_fmt` is overridden to
-    // D3D11/QSV below; libavcodec still uses this as `sw_pix_fmt`.
+    // Software layout (NV12/P010). Hw paths override `pix_fmt` to D3D11/QSV; libav still
+    // stores this as `sw_pix_fmt`.
     video.set_format(Pixel::from(sw_pix_fmt));
-    // Fixed rate, CBR, no B-frames, ~1-frame VBV — the shared low-latency RC contract.
     apply_low_latency_rc(&mut video, fps, bitrate_bps);
-    // SAFETY: `as_mut_ptr` hands back the `AVCodecContext` behind the `video` encoder allocated just
-    // above, which outlives every write here (it is opened and returned below). The gop/colour/
-    // pix_fmt stores are in-bounds scalar field writes on that live context. `device_ref` and
-    // `frames_ref` are valid `AVBufferRef`s by this fn's contract OR null — the system path passes
-    // null for both — and the `is_null` guards keep `av_buffer_ref` off the null case; each call
-    // returns a NEW reference that the codec context adopts and unrefs when freed, so this shares
-    // the caller's buffers rather than taking them over.
+    // SAFETY: `as_mut_ptr` is the `AVCodecContext` behind `video`, which outlives these writes
+    // (opened and returned below). gop/colour/pix_fmt stores are in-bounds scalars.
+    // `device_ref`/`frames_ref` are live `AVBufferRef`s or null (system path); the null
+    // guards keep `av_buffer_ref` off that case. Each call returns a NEW ref the codec
+    // adopts and unrefs — share, do not take over.
     let raw = unsafe { video.as_mut_ptr() };
-    // SAFETY: as above — `raw` is that live `AVCodecContext` and every store below is an in-bounds
-    // field write on it, with the two `av_buffer_ref` calls guarded against null.
+    // SAFETY: `raw` is that live context; stores below are in-bounds; `av_buffer_ref` is
+    // null-guarded.
     unsafe {
-        (*raw).gop_size = i32::MAX; // no periodic IDR (forced-IDR via pict_type=I on RFI)
+        (*raw).gop_size = i32::MAX; // no periodic IDR; RFI forces via pict_type=I
         if ten_bit {
-            // 10-bit HDR: BT.2020 primaries + SMPTE-2084 (PQ) transfer. The client auto-detects PQ from
-            // the HEVC VUI; the static mastering metadata also rides the 0xCE datagram out-of-band.
+            // Client auto-detects PQ from HEVC VUI; mastering metadata rides 0xCE out-of-band.
             (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT2020_NCL;
             (*raw).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
             (*raw).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT2020;
             (*raw).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084;
         } else {
-            // We hand the encoder BT.709 *limited* NV12 (video-processor or swscale CSC), so signal that
-            // VUI — else the client decoder washes the picture out.
+            // Input is BT.709 limited NV12; omit the VUI and the client washes the picture out.
             (*raw).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
             (*raw).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
             (*raw).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
@@ -410,7 +309,6 @@ unsafe fn open_win_encoder(
         }
     }
 
-    // Low-latency tuning — the per-vendor contract lives in `vendor_opts` (pure, test-pinned).
     let mut opts = Dictionary::new();
     let usage = std::env::var("PUNKTFUNK_AMF_USAGE").unwrap_or_else(|_| "ultralowlatency".into());
     for (k, v) in vendor_opts(vendor, &usage) {
@@ -421,45 +319,29 @@ unsafe fn open_win_encoder(
         .with_context(|| format!("open {name} ({width}x{height}@{fps}, {bitrate_bps} bps)"))
 }
 
-/// Probe whether THIS GPU can `vendor`-encode `codec`, by opening a tiny system-input encoder. The
-/// driver/runtime rejects codecs the video engine can't do (AV1 on pre-RDNA3 AMD / pre-Arc Intel,
-/// or HEVC on a very old part). Used to build the GameStream codec advertisement so a client never
-/// negotiates a codec the encoder can't open. Torn down immediately.
-/// Whether the active AMD (AMF) / Intel (QSV) GPU can encode HEVC **4:4:4**. **Deferred in v1 —
-/// always `false`.** AMF/QSV HEVC 4:4:4 encode is narrow (AMD RDNA3+, Intel Arc/Xe2+) and the
-/// libavcodec profile/pixel-format incantation is vendor- and driver-specific — a wrong profile
-/// `avcodec_open2` *silently* falls back to 4:2:0, so a positive probe would need a verify-by-frame,
-/// and there is no AMD/Intel Windows box in the lab to build + validate that against. Returning
-/// `false` keeps the negotiation honest: an AMF/QSV host resolves every session to 4:2:0 before the
-/// Welcome. (Follow-up: implement + validate on an RDNA3+/Arc Windows box.)
+/// Always `false`: a wrong HEVC 4:4:4 profile `avcodec_open2` silently encodes 4:2:0, so a
+/// positive probe would need a verify-by-frame. Negotiation stays 4:2:0.
 pub fn probe_can_encode_444(_vendor: WinVendor, _codec: Codec) -> bool {
     tracing::debug!("AMF/QSV HEVC 4:4:4 encode not implemented — declining (4:2:0)");
     false
 }
 
-/// Gated to the builds that can actually reach it: `lib.rs`'s only caller sits under
-/// `cfg(all(not(feature = "qsv"), feature = "amf-qsv"))`, because with the native VPL backend
-/// compiled in it is `qsv::probe_can_encode` that answers. So in the SHIPPED Windows combo
-/// (`nvenc,amf-qsv,qsv`) this function has no caller at all.
+/// Tiny system-input open of `vendor`/`codec`. Compiled only when native VPL is out
+/// (`not(feature = "qsv")`); the shipped `nvenc,amf-qsv,qsv` combo answers via `qsv::probe_can_encode`.
 #[cfg(not(feature = "qsv"))]
 pub fn probe_can_encode(vendor: WinVendor, codec: Codec) -> bool {
-    // Deliberately NOT pinned to the selected render adapter (unlike `nvenc::probe_can_encode_444`):
-    // the system-input probe passes no hwdevice, and the AMF/QSV runtimes only ever bind their own
-    // vendor's silicon — on a mixed-vendor box the probe lands on the right GPU by construction.
-    // Only a two-same-vendor-GPU box could probe the wrong card (accepted; results are cached per
-    // selected GPU in `windows_codec_support`, so a fix here slots in without churn).
+    // Not pinned to the selected adapter: no hwdevice is passed, and each runtime binds its own
+    // vendor. Mixed-vendor boxes land on the right GPU; two same-vendor GPUs can miss (accepted;
+    // `windows_codec_support` caches per selected GPU).
     if ffmpeg::init().is_err() {
         return false;
     }
-    // SAFETY: `ffmpeg::init()` succeeded above, so libav's global state is initialised.
-    // `av_log_get_level`/`av_log_set_level` are global scalar getters/setters with no pointer args.
-    // `open_win_encoder` (the `unsafe fn`) is called with null `device_ref`/`frames_ref` (the system
-    // path), so it touches no D3D11/hwcontext — it only allocates and opens a self-contained
-    // libavcodec encoder that is dropped at the end of `.is_ok()`. We restore the prior log level and
-    // no raw pointer escapes the block.
+    // SAFETY: `ffmpeg::init()` succeeded. `av_log_get_level`/`av_log_set_level` are scalar
+    // getters/setters. `open_win_encoder` is called with null device/frames (system path), so
+    // it touches no D3D11; the encoder drops at `.is_ok()`. Log level is restored; no raw
+    // pointer escapes.
     unsafe {
-        // A missing AMF/QSV runtime (wrong-vendor host, GPU-less CI) is an expected probe outcome —
-        // quiet ffmpeg's open error for the probe, then restore the level.
+        // Missing runtime is an expected probe miss — mute ffmpeg's open error, then restore.
         let prev = ffi::av_log_get_level();
         ffi::av_log_set_level(ffi::AV_LOG_FATAL);
         let ok = open_win_encoder(
@@ -481,15 +363,9 @@ pub fn probe_can_encode(vendor: WinVendor, codec: Codec) -> bool {
     }
 }
 
-/// The immediate context of an `ID3D11Device` (for `CopyResource`/`CopySubresourceRegion`).
-///
-/// Safe: `&ID3D11Device` is a borrowed, reference-counted COM wrapper, so the borrow itself is the
-/// "live device" guarantee, and the returned context owns its own reference.
 fn immediate_context(device: &ID3D11Device) -> ID3D11DeviceContext {
-    // windows-rs 0.62: the inherent method takes no args and returns the context (the OutRef form is
-    // only on the `_Impl` trait, for implementing the interface). Every D3D11 device has one.
-    // SAFETY: a `?`-free COM call on the live `device` borrow; it takes no pointers and every
-    // D3D11 device has an immediate context, so the `expect` is unreachable in practice.
+    // SAFETY: COM call on the live `device` borrow; no pointers. Every D3D11 device has an
+    // immediate context, so the `expect` is unreachable in practice.
     unsafe {
         device
             .GetImmediateContext()
@@ -497,21 +373,12 @@ fn immediate_context(device: &ID3D11Device) -> ID3D11DeviceContext {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// System-memory path (default): read the captured D3D11 surface back to a CPU NV12/P010 frame.
-// ---------------------------------------------------------------------------------------------
-
 struct SystemInner {
     enc: encoder::video::Encoder,
-    // FIELD ORDER IS LOAD-BEARING: the hand-written `Drop` this replaced freed `sw_frame`
-    // before `sws`, and field-DECLARATION order is what preserves that now (an offset_of assert
-    // cannot pin this — repr(Rust) may reorder memory independently of declaration order, and
-    // drop order follows declaration).
-    /// Reusable software NV12/P010 frame: swscale dst / readback dst, and the `send_frame` src.
+    // Drop order follows declaration. `sw_frame` must drop before `sws`. `repr(Rust)` may
+    // reorder memory, so an offset_of assert cannot pin this — do not reorder these fields.
     sw_frame: AvFrame,
-    /// swscale ctx for the BGRA→NV12 fallback (built lazily; `None` for the YUV-readback path).
     sws: Option<AvSwsContext>,
-    /// CPU-readable staging texture for the D3D11 readback (built lazily on the captured device).
     staging: Option<ID3D11Texture2D>,
     ctx: Option<ID3D11DeviceContext>,
     format: PixelFormat,
@@ -538,10 +405,8 @@ impl SystemInner {
         } else {
             ffi::AVPixelFormat::AV_PIX_FMT_NV12
         };
-        // SAFETY: calls the `unsafe fn open_win_encoder` with null `device_ref`/`frames_ref`, so the
-        // system path is taken (no hw device/frames context is touched); all other args are scalars.
-        // The returned `encoder::video::Encoder` owns its `AVCodecContext` and frees it on drop; no raw
-        // pointer is aliased.
+        // SAFETY: `open_win_encoder` with null device/frames (system path); remaining args are
+        // scalars. The returned encoder owns its `AVCodecContext`; no raw pointer is aliased.
         let enc = unsafe {
             open_win_encoder(
                 vendor,
@@ -558,9 +423,8 @@ impl SystemInner {
             )?
         };
         let sw_frame = AvFrame::alloc().context("av_frame_alloc(sw) failed")?;
-        // SAFETY: writing `format`/`width`/`height` through the owned frame's pointer stays inside
-        // its allocation. `av_frame_get_buffer` allocates the backing planes — on failure the
-        // owned `sw_frame` simply drops (freed once, by the wrapper).
+        // SAFETY: format/width/height writes stay inside the owned frame. `av_frame_get_buffer`
+        // allocates the planes; on failure `sw_frame` drops once via the wrapper.
         unsafe {
             (*sw_frame.as_ptr()).format = sw_av as c_int;
             (*sw_frame.as_ptr()).width = width as c_int;
@@ -588,10 +452,6 @@ impl SystemInner {
         })
     }
 
-    /// Lazily (re)build the staging texture matching `dxgi_fmt` on the captured device.
-    ///
-    /// Safe: `&ID3D11Device` is the live-device guarantee and `dxgi_fmt` is a plain enum; the
-    /// texture it creates is owned by `self`.
     fn ensure_staging(&mut self, device: &ID3D11Device, dxgi_fmt: DXGI_FORMAT) -> Result<()> {
         if self.staging.is_some() {
             return Ok(());
@@ -612,8 +472,8 @@ impl SystemInner {
             MiscFlags: 0,
         };
         let mut t: Option<ID3D11Texture2D> = None;
-        // SAFETY: one `?`-checked `CreateTexture2D` on the live `device` borrow, over a
-        // fully-initialized stack descriptor and a live `Option` out-param.
+        // SAFETY: `CreateTexture2D` on the live `device` borrow; `desc` is fully initialized;
+        // the `Option` out-param is live.
         unsafe {
             device
                 .CreateTexture2D(&desc, None, Some(&mut t))
@@ -624,15 +484,10 @@ impl SystemInner {
         Ok(())
     }
 
-    /// Send the reusable `sw_frame` to the encoder with the given pts / IDR flag.
-    ///
-    /// Safe: both arguments are scalars, and `sw_frame`/`enc` are allocations `self` owns from its
-    /// constructor until `Drop` — no caller supplies or can invalidate them.
     fn send(&mut self, pts: i64, idr: bool) -> Result<()> {
-        // SAFETY: `self.sw_frame` is the `AVFrame` this struct allocated and owns, so the two field
-        // stores are in-bounds writes on a live allocation; `avcodec_send_frame` then takes that
-        // frame and `self.enc`'s own context, both live for the call and neither retained by libav
-        // (it references the frame's buffers itself).
+        // SAFETY: `sw_frame` is this struct's owned `AVFrame`; the two stores are in-bounds.
+        // `avcodec_send_frame` borrows that frame and `enc`'s context for the call; libav refs
+        // the frame's buffers itself and retains neither pointer.
         unsafe {
             (*self.sw_frame.as_ptr()).pts = pts;
             (*self.sw_frame.as_ptr()).pict_type = if idr {
@@ -648,9 +503,8 @@ impl SystemInner {
         Ok(())
     }
 
-    /// D3D11 path: read the captured surface back into `sw_frame`, then send. Dispatches on the
-    /// CURRENT frame's `format` — the capturer's video processor latches off on failure and switches
-    /// NV12→Bgra (SDR) or P010→Rgb10a2 (HDR) mid-session, so a fixed open-time format is wrong.
+    /// Dispatch on this frame's format: the video processor can latch off mid-session
+    /// (NV12→Bgra / P010→Rgb10a2), so the open-time format is not the route.
     fn submit_d3d11(
         &mut self,
         frame: &D3d11Frame,
@@ -665,25 +519,19 @@ impl SystemInner {
         }
     }
 
-    /// Read back a captured NV12/P010 surface plane-by-plane into the software frame.
     fn readback_yuv(&mut self, frame: &D3d11Frame, pts: i64, idr: bool) -> Result<()> {
         let dxgi_fmt = if self.ten_bit {
             DXGI_FORMAT_P010
         } else {
             DXGI_FORMAT_NV12
         };
-        // SAFETY: `ensure_staging` builds a STAGING texture (CPU_ACCESS_READ) matching `dxgi_fmt` on
-        // `frame.device` — the same `ID3D11Device` that owns `frame.texture` — and caches that device's
-        // immediate context in `self.ctx`. `src`/`dst` are that device's textures of identical NV12/P010
-        // format and dimensions, so `CopyResource` on the single-threaded immediate context is valid.
-        // `Map(.., D3D11_MAP_READ)` succeeds on a staging texture and yields `map.pData` valid for the
-        // whole resource; for NV12/P010 the luma plane is `H` rows at `RowPitch` and the chroma plane
-        // follows at byte offset `RowPitch*H` (`H/2` rows), so `total = pitch*(H+⌈H/2⌉)` is exactly the
-        // mapped extent and `from_raw_parts(base, total)` stays in-bounds. Each `copy_nonoverlapping`
-        // reads a bounds-checked `mapped[..]` sub-slice (`row_bytes ≤ pitch`) and writes `row_bytes ≤
-        // linesize` into the `av_frame_get_buffer`-allocated plane at row `y < H`, so every destination
-        // offset is inside the frame's plane allocation; src and dst never alias. `Unmap` pairs `Map`,
-        // then `send` (the `unsafe fn`) hands `sw_frame` to the encoder.
+        // SAFETY: staging is CPU_ACCESS_READ on `frame.device` (same device as `frame.texture`),
+        // matching NV12/P010 size, so `CopyResource` on the immediate context is valid.
+        // `Map(READ)` yields `pData` for the whole resource: Y is `H` rows at `RowPitch`, chroma
+        // starts at `RowPitch*H` (`H/2` rows), so `total = pitch*(H+⌈H/2⌉)` is the mapped extent.
+        // Each copy reads `row_bytes ≤ pitch` from `mapped` and writes `row_bytes ≤ linesize` at
+        // row `y < H` in the `av_frame_get_buffer` planes; src and dst do not alias. `Unmap`
+        // pairs `Map`; `send` then hands `sw_frame` to the encoder.
         unsafe {
             self.ensure_staging(&frame.device, dxgi_fmt)?;
             let staging = self.staging.clone().context("staging texture")?;
@@ -696,9 +544,8 @@ impl SystemInner {
                 .context("Map staging (yuv readback)")?;
             let pitch = map.RowPitch as usize;
             let h = self.height as usize;
-            // NV12/P010 in a mapped staging surface: the Y plane occupies rows [0,H) at `pitch`; the
-            // interleaved chroma plane (H/2 rows) starts at byte offset `pitch * H`. P010 samples are
-            // 16-bit, so a "row" of width pixels is `width*2` bytes (and chroma `width*2` too).
+            // NV12/P010: Y is rows [0,H) at `pitch`; chroma (H/2 rows) starts at `pitch * H`.
+            // P010 samples are 16-bit, so a width-pixel row is `width*2` bytes (chroma too).
             let bytes_per_sample = if self.ten_bit { 2 } else { 1 };
             let row_bytes = self.width as usize * bytes_per_sample;
             let base = map.pData as *const u8;
@@ -722,19 +569,14 @@ impl SystemInner {
         }
     }
 
-    /// Read back a captured BGRA surface, then swscale BGRA→NV12 into the software frame (8-bit).
     fn readback_bgra(&mut self, frame: &D3d11Frame, pts: i64, idr: bool) -> Result<()> {
         if self.ten_bit {
             bail!("ffmpeg_win: BGRA readback is 8-bit only (HDR needs the P010 capture path)");
         }
-        // SAFETY: `ensure_staging` builds a B8G8R8A8 STAGING texture on `frame.device` and caches that
-        // device's immediate context; `src`/`dst` are that device's textures of matching BGRA format,
-        // so `CopyResource` on the single-threaded context is valid. `Map(READ)` on the staging texture
-        // yields `base` valid for `pitch` × `h` rows. `ensure_sws` lazily builds the BGRA→NV12 context;
-        // `sws_scale` reads `h` rows of `pitch` bytes from `base` (in-bounds — the staging surface is
-        // `≥ pitch*h`) into the `sw_frame` planes addressed by its `data`/`linesize` (allocated for
-        // `width`×`height` NV12). `Unmap` pairs `Map`; the cached `sws` is freed once in `Drop`. The
-        // mapped read region never aliases the owned encoder frame.
+        // SAFETY: B8G8R8A8 staging on `frame.device`; `src`/`dst` match, so `CopyResource` is
+        // valid. `Map(READ)` yields `base` for `pitch*h` rows. `sws_scale` reads that extent
+        // into `sw_frame`'s NV12 planes (`width`×`height`). `Unmap` pairs `Map`; `sws` drops
+        // once with `self`. Mapped read never aliases the encoder frame.
         unsafe {
             self.ensure_staging(&frame.device, DXGI_FORMAT_B8G8R8A8_UNORM)?;
             let staging = self.staging.clone().context("staging texture")?;
@@ -772,18 +614,11 @@ impl SystemInner {
         }
     }
 
-    /// Read back a captured Rgb10a2 (BT.2020 PQ, R10G10B10A2) surface and swscale it to P010
-    /// (BT.2020 PQ, limited range) — the HDR path when the capturer's video processor emitted its
-    /// R10 shader output instead of P010. DXGI `R10G10B10A2_UNORM` (R in the low 10 bits, X2 alpha in
-    /// the top 2) == FFmpeg `AV_PIX_FMT_X2BGR10LE`. UNTESTED on glass (no AMD/Intel Windows box).
+    /// DXGI `R10G10B10A2_UNORM` (R in the low 10 bits) == FFmpeg `AV_PIX_FMT_X2BGR10LE`.
     fn readback_rgb10(&mut self, frame: &D3d11Frame, pts: i64, idr: bool) -> Result<()> {
-        // SAFETY: same shape as `readback_yuv`/`readback_bgra` — `ensure_staging` builds an
-        // R10G10B10A2 STAGING texture on `frame.device` and caches its immediate context; `src`/`dst`
-        // are that device's matching-format textures, so `CopyResource` on the single-threaded context
-        // is valid. `Map(READ)` yields `base` valid for `pitch` × `h` rows. `ensure_sws` builds the
-        // X2BGR10LE→P010 (BT.2020) context; `sws_scale` reads `h` rows of `pitch` bytes from `base`
-        // (in-bounds) into the `sw_frame` P010 planes (`data`/`linesize`, allocated `width`×`height`).
-        // `Unmap` pairs `Map`; `sws` is freed once in `Drop`. No aliasing between read and write.
+        // SAFETY: R10G10B10A2 staging on `frame.device`; matching-format `CopyResource` is valid.
+        // `Map(READ)` yields `base` for `pitch*h`. `sws_scale` reads that into `sw_frame`'s P010
+        // planes. `Unmap` pairs `Map`; `sws` drops once with `self`. Read and write do not alias.
         unsafe {
             self.ensure_staging(&frame.device, DXGI_FORMAT_R10G10B10A2_UNORM)?;
             let staging = self.staging.clone().context("staging texture")?;
@@ -797,7 +632,7 @@ impl SystemInner {
             let pitch = map.RowPitch as usize;
             let h = self.height as usize;
             let base = map.pData as *const u8;
-            // RGB(BT.2020 PQ) → YUV(BT.2020 PQ): a matrix-only repack (same PQ transfer), full→limited.
+            // Same PQ transfer; matrix-only RGB(BT.2020) → YUV(BT.2020), full → limited.
             let sws = self.ensure_sws(
                 ffi::AVPixelFormat::AV_PIX_FMT_X2BGR10LE,
                 ffi::AVPixelFormat::AV_PIX_FMT_P010LE,
@@ -822,8 +657,7 @@ impl SystemInner {
         }
     }
 
-    /// CPU path: swscale a packed RGB/BGR CPU buffer to NV12, then send (8-bit only). Used when the
-    /// capturer hands `FramePayload::Cpu` (DDA without the video-processor path).
+    /// `FramePayload::Cpu` is DDA without the video processor (8-bit packed RGB/BGR → NV12).
     fn submit_cpu(&mut self, bytes: &[u8], format: PixelFormat, pts: i64, idr: bool) -> Result<()> {
         anyhow::ensure!(
             format == self.format,
@@ -837,12 +671,9 @@ impl SystemInner {
         let h = self.height as usize;
         let src_row = w * format.bytes_per_pixel();
         anyhow::ensure!(bytes.len() >= src_row * h, "captured buffer too small");
-        // SAFETY: `ensure_sws` lazily builds the (packed RGB/BGR)→NV12 context for this fixed src/dst
-        // format pair. `src_data[0] = bytes.as_ptr()` with `src_stride[0] = src_row`; the `ensure!`
-        // above guarantees `bytes` holds at least `src_row*h` bytes, so `sws_scale` reads `h` rows of
-        // `src_row` bytes in-bounds and writes the `sw_frame` NV12 planes (`data`/`linesize`, allocated
-        // `width`×`height`). `bytes` is borrowed for the call only and never aliases the owned
-        // `sw_frame`. `send` then hands `sw_frame` to the encoder.
+        // SAFETY: `src_data[0]`/`src_stride[0]` cover `src_row*h` bytes (`ensure!` above).
+        // `sws_scale` reads that and writes `sw_frame`'s NV12 planes. `bytes` is borrowed for
+        // the call and does not alias `sw_frame`. `send` then hands `sw_frame` to the encoder.
         unsafe {
             let sws = self.ensure_sws(
                 pixel_to_av(sws_src(format)?),
@@ -867,13 +698,8 @@ impl SystemInner {
         }
     }
 
-    /// Lazily build the swscale context (src → NV12/P010, limited range, the given colorspace). A
-    /// SystemInner uses exactly one src→dst conversion for its lifetime (8-bit RGB→NV12 BT.709, or
-    /// 10-bit RGB10→P010 BT.2020), so caching a single context is sound.
-    ///
-    /// Safe: every argument is a plain libav enum/int, and the context it caches belongs to `self`
-    /// (an owned `AvSwsContext`, freed by its own drop). Returns the borrowed pointer for the
-    /// caller's `sws_scale` — borrowed only, `self.sws` stays the owner.
+    /// One src→dst conversion per `SystemInner` (RGB→NV12 BT.709 or RGB10→P010 BT.2020), so a
+    /// single cached context is sound. Returns a borrow; `self.sws` stays the owner.
     fn ensure_sws(
         &mut self,
         src_av: ffi::AVPixelFormat,
@@ -883,11 +709,9 @@ impl SystemInner {
         if let Some(sws) = &self.sws {
             return Ok(sws.as_ptr());
         }
-        // SAFETY: `sws_getContext` takes only scalars plus the documented "no filters, no params"
-        // null trio, and returns an owned context or null — `from_raw` rejects the null, so
-        // `sws_setColorspaceDetails` only ever sees a live one, and ownership passes to the
-        // `AvSwsContext`. `sws_getCoefficients` returns a pointer into libav's own static tables,
-        // valid for the process, and the call only reads it.
+        // SAFETY: `sws_getContext` takes scalars plus a documented null-filter trio and returns
+        // an owned context or null. `from_raw` rejects null, so `sws_setColorspaceDetails` sees
+        // a live one. `sws_getCoefficients` points into libav's static tables for the process.
         let sws = unsafe {
             let raw = ffi::sws_getContext(
                 self.width as c_int,
@@ -904,8 +728,7 @@ impl SystemInner {
             let Some(owned) = AvSwsContext::from_raw(raw) else {
                 bail!("sws_getContext(RGB→YUV) failed");
             };
-            // Source full-range RGB → destination limited-range YUV (matches the limited-range VUI
-            // we signal). For RGB input the src coefficient table is unused; pass dst for both.
+            // Full-range RGB → limited YUV (matches the VUI). RGB ignores the src table; pass dst twice.
             let coeff = ffi::sws_getCoefficients(cs);
             ffi::sws_setColorspaceDetails(owned.as_ptr(), coeff, 1, coeff, 0, 0, 1 << 16, 1 << 16);
             owned
@@ -914,29 +737,17 @@ impl SystemInner {
     }
 }
 
-// No `Drop` for `SystemInner`: `sw_frame` (`AvFrame`) and `sws` (`Option<AvSwsContext>`) free
-// themselves, in field-declaration order — the same sw_frame-then-sws sequence the hand-written
-// `Drop` performed, pinned by the offset_of assert at the struct.
-
-// ---------------------------------------------------------------------------------------------
-// Zero-copy D3D11 path (the AMF default; QSV opt-in — see `zerocopy_enabled`): share the capture
-// device, pool D3D11 frames, copy the captured texture into a pooled slice, feed AMF directly /
-// map to QSV. Falls back to the system path if the hw setup fails to open.
-// ---------------------------------------------------------------------------------------------
+// No `Drop`: `sw_frame` then `sws` drop in declaration order. Do not reorder those fields.
 
 struct D3d11Hw {
-    // Declared frames-BEFORE-device on purpose: these drop in declaration order, reproducing what
-    // the hand-written `Drop` this replaced did (the frames ctx holds its own ref on the device).
-    // Do not reorder these two fields.
+    // Frames before device: the frames ctx holds its own ref on the device. Do not reorder.
     frames_ref: AvBuffer,
     device_ref: AvBuffer,
 }
 
 impl D3d11Hw {
-    /// Wrap the capturer's `ID3D11Device` as a D3D11VA hwdevice and build an NV12/P010 frames pool.
-    /// Safe: like [`super::super::linux::VaapiHw::new`] and unlike its CUDA counterpart, this is
-    /// handed no raw pointer — `&ID3D11Device` is a borrowed, reference-counted COM wrapper and the
-    /// rest are scalars — so there is no caller contract; the `unsafe` below is the libav/D3D11 FFI.
+    /// Wrap the capturer's `ID3D11Device` as a D3D11VA hwdevice + NV12/P010 frames pool.
+    /// No raw pointer from the caller; the `unsafe` below is the libav/D3D11 FFI.
     fn new(
         device: &ID3D11Device,
         sw_format: ffi::AVPixelFormat,
@@ -945,11 +756,8 @@ impl D3d11Hw {
         h: u32,
         pool: c_int,
     ) -> Result<Self> {
-        // Owned from the moment it exists: each `bail!` below drops what was built so far, so none
-        // of the failure branches carry cleanup of their own.
-        // SAFETY: `av_hwdevice_ctx_alloc` returns null — rejected by `AvBuffer::from_raw`, so the
-        // `?` leaves before anything below runs — or a ref whose `data` libav has already
-        // initialized as an `AVHWDeviceContext`; for a D3D11VA device that context's `hwctx` is an
+        // SAFETY: `av_hwdevice_ctx_alloc` returns null (rejected by `from_raw`, so `?` leaves)
+        // or a ref whose `data` is an `AVHWDeviceContext`. For D3D11VA, `hwctx` is an
         // `AVD3D11VADeviceContext`, so `d11` addresses a live, correctly-typed struct.
         let (device_ref, d11) = unsafe {
             let device_ref = AvBuffer::from_raw(ffi::av_hwdevice_ctx_alloc(
@@ -961,53 +769,32 @@ impl D3d11Hw {
             (device_ref, d11)
         };
 
-        // Turn on D3D11 multithread protection before libav sees the device.
-        //
-        // libav does this itself in `d3d11va_device_create` — but only there. We take the OTHER
-        // path (`d3d11va_device_init`, because we supply the capturer's device), which does not,
-        // and the omission bites twice:
-        //
-        //  * QSV. `av_hwdevice_ctx_create_derived(QSV <- D3D11VA)` ends in
-        //    `MFXVideoCORE_SetHandle`, and MFX rejects a device that is not multithread-protected
-        //    with `MFX_ERR_UNDEFINED_BEHAVIOR (-16)` — logged only as "Error setting child device
-        //    handle", which names neither the cause nor the cure. Measured on Intel UHD 750 /
-        //    FFmpeg 7.1.5+libvpl: identical device, protection off -> derive fails; protection on
-        //    -> derive succeeds. `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` makes no difference either way.
-        //
-        //  * AMF, which is the DEFAULT path and was already shipping. We deliberately leave
-        //    `lock`/`unlock` null so libav installs its `d3d11va_default_lock`, and that lock is
-        //    `ID3D11Multithread::Enter`/`Leave` — which are documented no-ops while protection is
-        //    off. So the lock libav installs to serialise our capture thread against its encode
-        //    thread has been doing nothing at all. It only starts working from here.
-        //
-        // Idempotent, and safe to apply to a device the capturer owns: it only enables the
-        // device's internal critical section (`was` is the previous state, reported once at debug).
+        // `d3d11va_device_init` (we supply the capturer device) does not SetMultithreadProtected;
+        // `d3d11va_device_create` does. Without it QSV derive fails MFX SetHandle, and AMF's
+        // default lock is Enter/Leave — a no-op until protection is on. Idempotent on a device
+        // the capturer owns.
         match device.cast::<ID3D11Multithread>() {
             Ok(mt) => {
-                // SAFETY: a COM call on the live `ID3D11Multithread` just obtained by a checked
-                // `cast` of the borrowed device; it takes a BOOL and returns the previous state.
+                // SAFETY: COM call on the live `ID3D11Multithread` from a checked `cast`; BOOL in,
+                // previous state out.
                 let was = unsafe { mt.SetMultithreadProtected(true) };
                 tracing::debug!(
                     previously_protected = was.as_bool(),
                     "D3D11 multithread protection enabled for the libav hwdevice"
                 );
             }
-            // Pre-11.1 runtimes have no ID3D11Multithread. Nothing to enable, so carry on and let
-            // the QSV derive fail with its own message rather than failing capture here.
+            // Pre-11.1 has no ID3D11Multithread. Let QSV derive fail later rather than fail capture.
             Err(e) => tracing::warn!(
                 error = %e,
                 "no ID3D11Multithread on this device — QSV zero-copy will not derive"
             ),
         }
 
-        // Share the capture device. FFmpeg's d3d11va teardown Releases `device`, so hand it an owned
-        // reference (clone = AddRef, forget = don't Release ours). init() fills
-        // device_context / video_device / video_context / the default lock from a non-null device.
+        // FFmpeg Releases `device` at teardown: clone = AddRef, forget = keep ours.
         std::mem::forget(device.clone());
-        // SAFETY: `d11` is the live `AVD3D11VADeviceContext` from above, so storing the device
-        // pointer is an in-bounds field write; the `forget(clone())` on the line above is what
-        // makes that pointer an OWNED reference, matching the Release libav does at teardown.
-        // `av_hwdevice_ctx_init` then reads that field, which is why the store precedes it.
+        // SAFETY: `d11` is the live context; storing the device pointer is in-bounds.
+        // `forget(clone())` makes that pointer an owned ref matching libav's teardown Release.
+        // `av_hwdevice_ctx_init` reads the field, so the store precedes it.
         let r = unsafe {
             (*d11).device = device.as_raw();
             ffi::av_hwdevice_ctx_init(device_ref.as_ptr())
@@ -1016,11 +803,9 @@ impl D3d11Hw {
             bail!("av_hwdevice_ctx_init(D3D11VA) failed ({r})");
         }
 
-        // SAFETY: same shape one level up — `av_hwframe_ctx_alloc` takes the live, now-initialized
-        // device ref and returns null (rejected by `from_raw`, so the `?` leaves before the writes)
-        // or a ref whose `data` is a live `AVHWFramesContext` whose `hwctx` is an
-        // `AVD3D11VAFramesContext`. Every store is an in-bounds field write on those, all done
-        // before `av_hwframe_ctx_init` reads them.
+        // SAFETY: `av_hwframe_ctx_alloc` takes the live device ref and returns null (rejected
+        // by `from_raw`) or a ref whose `data` is an `AVHWFramesContext` whose `hwctx` is
+        // `AVD3D11VAFramesContext`. Stores are in-bounds and precede `av_hwframe_ctx_init`.
         let frames_ref = unsafe {
             let frames_ref = AvBuffer::from_raw(ffi::av_hwframe_ctx_alloc(device_ref.as_ptr()))
                 .context("av_hwframe_ctx_alloc(D3D11VA) failed")?;
@@ -1045,35 +830,23 @@ impl D3d11Hw {
     }
 }
 
-// No `Drop` for `D3d11Hw`: each `AvBuffer` field unrefs itself, in declaration order (frames, then
-// device — see the field comment). The hand-written unref pair this replaced had to be kept in sync
-// with every failure branch in `new`; now there is one unref path per ref and none can skip it.
+// No `Drop`: each `AvBuffer` unrefs in declaration order (frames, then device).
 
 struct ZeroCopyInner {
     vendor: WinVendor,
-    /// QSV only: the QSV device + frames ctx derived from the D3D11VA ones (the encoder's real
-    /// input). `None` for AMF, which takes the D3D11 frames directly — the nullable raw pointers
-    /// these replaced said the same thing, but only in a comment.
-    ///
-    /// FIELD ORDER IS LOAD-BEARING: frames before device, and BOTH before `enc`/`hw`. Fields drop
-    /// in declaration order, and that sequence reproduces the hand-written `Drop` this replaced,
-    /// which ran ahead of every field and so released the derived QSV pair before the encoder and
-    /// the D3D11 refs. Everything holds its own reference, so refcounting makes any order sound;
-    /// the ordering is pinned so a reorder cannot quietly change what ships.
+    /// QSV only (`None` for AMF). Frames before device, both before `enc`/`hw`: drop order
+    /// releases the derived pair first. Refcounting makes any order sound; the pin is so a
+    /// reorder cannot quietly change what ships.
     qsv_frames: Option<AvBuffer>,
-    /// Unlike `qsv_frames` (which the send path reads to tag each mapped frame), this one is held
-    /// purely as an owner: the frames ctx and the encoder each took their own ref, so nothing reads
-    /// it again — it exists so the QSV device outlives both and is unref'd exactly once. Same
-    /// reasoning as the decoders' `hw_device`: removing the field would free the device early, and
-    /// an underscore name would hide what it holds.
+    /// Owner only: send reads `qsv_frames`, not this. Removing it frees the QSV device while
+    /// the frames ctx and encoder still hold refs. Same shape as the decoders' `hw_device`.
     #[allow(dead_code)]
     qsv_device: Option<AvBuffer>,
     enc: encoder::video::Encoder,
     hw: D3d11Hw,
     ctx: ID3D11DeviceContext,
-    /// The pool's fixed sw_format (NV12 8-bit / P010 10-bit). A captured frame whose format differs
-    /// (the capturer's video-processor fell back to Bgra/Rgb10a2) cannot be CopySubresourceRegion'd
-    /// into this pool (format-group mismatch → UB), so the caller drops to the system path instead.
+    /// Pool sw_format (NV12/P010). A VP fallback to Bgra/Rgb10a2 cannot `CopySubresourceRegion`
+    /// into this pool (format-group mismatch → UB); the caller drops to the system path.
     pool_format: PixelFormat,
 }
 
@@ -1103,30 +876,19 @@ impl ZeroCopyInner {
         };
         let bind_flags = pool_bind_flags(vendor);
         const POOL: c_int = 8;
-        // SAFETY: `D3d11Hw::new` wraps the capturer's `device` as a D3D11VA hwdevice (handing FFmpeg
-        // an owned AddRef of it, balanced by FFmpeg's teardown Release) and returns an owned
-        // frames_ref/device_ref pair. For QSV, `av_hwdevice_ctx_create_derived` /
-        // `av_hwframe_ctx_create_derived` fill their null-initialised out-params only on success
-        // (`r >= 0` checked) and each result is taken into an `AvBuffer` immediately. From there
-        // every handle in this function is owned by a local, so each early `bail!`/`?` releases
-        // exactly what exists at that point, in reverse order — there is no cleanup code on any
-        // failure branch to keep in step. `open_win_encoder` takes its OWN refs of the dev/frames
-        // pointers it is handed, so lending them via `as_ptr()` transfers nothing; on success the
-        // owners move into `ZeroCopyInner` and are released by its field drops. Every `AVBufferRef`
-        // is still unref'd exactly once on every path — the difference is that it is now the type
-        // system enforcing it rather than a comment.
+        // SAFETY: `D3d11Hw::new` AddRefs the capturer device (FFmpeg Releases at teardown) and
+        // returns owned frames/device refs. QSV `create_derived` fills its out-param only on
+        // `r >= 0`; each result is taken into `AvBuffer` immediately. Locals own every handle,
+        // so `bail!`/`?` unref what exists. `open_win_encoder` takes its own refs of the
+        // pointers it is handed, so `as_ptr()` transfers nothing; success moves owners into
+        // `ZeroCopyInner`. Each `AVBufferRef` is unref'd exactly once on every path.
         unsafe {
             let hw = D3d11Hw::new(device, sw_av, bind_flags, width, height, POOL)?;
-            // Own the derived QSV pair (or nothing, on AMF). Keeping ownership here and deriving the
-            // encoder's pointers from it below is the whole point: the tuple this replaced handed
-            // the SAME two pointers out twice — once as the encoder's dev/frames args and once as
-            // the pair moved into `Self` — which is fine for raw pointers and would be two owners
-            // for `AvBuffer`.
+            // Own the derived pair here and lend pointers to the encoder. Handing the same
+            // `AvBuffer` out twice would be two owners.
             let (qsv_frames, qsv_device) = match vendor {
                 WinVendor::Amf => (None, None),
                 WinVendor::Qsv => {
-                    // Derive a QSV device that SHARES the D3D11 device, and a QSV frames ctx derived
-                    // from the D3D11 frames pool (auto-mapped 1:1). The encoder takes AV_PIX_FMT_QSV.
                     let mut qsv_device: *mut ffi::AVBufferRef = ptr::null_mut();
                     let r = ffi::av_hwdevice_ctx_create_derived(
                         &mut qsv_device,
@@ -1148,8 +910,6 @@ impl ZeroCopyInner {
                         ffi::AV_HWFRAME_MAP_DIRECT as c_int,
                     );
                     if r < 0 {
-                        // `qsv_device` drops here — the hand-written unref this replaced was the
-                        // single easiest line in the function to forget.
                         bail!("derive QSV frames from D3D11VA: {}", ffmpeg::Error::from(r));
                     }
                     let qsv_frames = AvBuffer::from_raw(qsv_frames)
@@ -1157,8 +917,7 @@ impl ZeroCopyInner {
                     (Some(qsv_frames), Some(qsv_device))
                 }
             };
-            // BORROWED views for the encoder — `open_win_encoder` takes its own refs of whatever it
-            // is handed, so ownership stays with `qsv_*`/`hw` either way.
+            // Borrowed views: `open_win_encoder` takes its own refs; ownership stays here.
             let (pix_fmt, dev_ref, frames_ref) = match (&qsv_device, &qsv_frames) {
                 (Some(d), Some(f)) => (ffi::AVPixelFormat::AV_PIX_FMT_QSV, d.as_ptr(), f.as_ptr()),
                 _ => (
@@ -1167,8 +926,6 @@ impl ZeroCopyInner {
                     hw.frames_ref.as_ptr(),
                 ),
             };
-            // `?` is enough now: on failure `qsv_frames`/`qsv_device` and `hw` all drop on the way
-            // out, which is what the hand-written null-checked unref pair here used to do.
             let enc = open_win_encoder(
                 vendor,
                 codec,
@@ -1201,22 +958,14 @@ impl ZeroCopyInner {
     }
 
     fn submit(&mut self, frame: &D3d11Frame, pts: i64, idr: bool) -> Result<()> {
-        // SAFETY: `d3d`/`qsv` are owned `AvFrame`s, so EVERY exit — including the three `?` exits
-        // between the pool pull and the send, which as hand-placed frees previously leaked the
-        // frame plus one of the POOL-sized hwframe surfaces per failure (eight failures wedged
-        // the encoder permanently) — unrefs the pooled surface back to the pool. `(*d3d).data[0]`
-        // is the pool's texture-array and `data[1]` the array index; `from_raw_borrowed` borrows
-        // that `ID3D11Texture2D` WITHOUT taking ownership (no Release — the frame owns it) and is
-        // null-checked. `src` (the captured texture) and `dst` (the pooled slice) live on the
-        // SAME D3D11 device wrapped by `self.hw`, and the caller guarantees `captured.format ==
-        // pool_format` before calling, so `CopySubresourceRegion(dst, dst_index, .., src, 0, ..)`
-        // on the single-threaded immediate context `self.ctx` is a valid same-format GPU copy.
-        // For QSV the mapped `qsv` frame's `hw_frames_ctx` takes an `av_buffer_ref` of
-        // `self.qsv_frames`; its drop at the end of the arm releases that ref at the same point
-        // the hand-written free did. `avcodec_send_frame` only internally refs the input frame,
-        // so the drops are the sole owning frees — no leak, no double-free, no use-after-free.
+        // SAFETY: `d3d`/`qsv` are owned `AvFrame`s, so every exit — including `?` between pool
+        // pull and send — unrefs the pooled surface. `data[0]` is the pool texture-array,
+        // `data[1]` the index; `from_raw_borrowed` borrows without Release (the frame owns it)
+        // and is null-checked. `src` and `dst` are on `self.hw`'s device; the caller has
+        // `captured.format == pool_format`, so `CopySubresourceRegion` is a same-format GPU
+        // copy. QSV's mapped frame `av_buffer_ref`s `qsv_frames` and drops that ref with the
+        // arm. `avcodec_send_frame` only internally refs the input; the drops are the owners.
         unsafe {
-            // Pull a pooled D3D11 surface; its data[0] is the pool's texture-ARRAY, data[1] the slice.
             let d3d = AvFrame::alloc().context("av_frame_alloc(d3d11) failed")?;
             let r = ffi::av_hwframe_get_buffer(self.hw.frames_ref.as_ptr(), d3d.as_ptr(), 0);
             if r < 0 {
@@ -1226,8 +975,6 @@ impl ZeroCopyInner {
             let dst_index = (*d3d.as_ptr()).data[1] as usize as u32;
             let dst_tex = ID3D11Texture2D::from_raw_borrowed(&dst_ptr)
                 .ok_or_else(|| anyhow!("pooled D3D11 frame has null texture"))?;
-            // GPU-local copy of the captured slice into the pooled array slice (like NVENC's CUDA
-            // device→device copy). Subresource = arrayIndex (MipLevels=1).
             let src: ID3D11Resource = frame.texture.cast().context("texture -> resource")?;
             let dst: ID3D11Resource = dst_tex.cast().context("pooled texture -> resource")?;
             self.ctx
@@ -1243,18 +990,14 @@ impl ZeroCopyInner {
             let send = match self.vendor {
                 WinVendor::Amf => ffi::avcodec_send_frame(self.enc.as_mut_ptr(), d3d.as_ptr()),
                 WinVendor::Qsv => {
-                    // Map the D3D11 frame to a QSV surface (1:1, no copy), then send the mapped frame.
                     let qsv = AvFrame::alloc().context("av_frame_alloc(qsv) failed")?;
-                    // Always `Some` on this arm — `open` fills the pair for `WinVendor::Qsv` and
-                    // leaves it `None` only for AMF — but say so with a bail rather than an unwrap,
-                    // matching the null check above it. The `Option` is what the raw pointer's
-                    // "null means AMF" convention was already encoding.
+                    // `open` fills this for QSV and leaves `None` only for AMF. Bail, don't unwrap.
                     let Some(qsv_frames) = self.qsv_frames.as_ref() else {
                         bail!("QSV send path without a derived QSV frames context");
                     };
                     (*qsv.as_ptr()).format = ffi::AVPixelFormat::AV_PIX_FMT_QSV as c_int;
                     (*qsv.as_ptr()).hw_frames_ctx = ffi::av_buffer_ref(qsv_frames.as_ptr());
-                    // The map flags are a bindgen enum (no BitOr) — cast each to int before OR-ing.
+                    // Bindgen enum has no BitOr — cast each flag to int before OR-ing.
                     let r = ffi::av_hwframe_map(
                         qsv.as_ptr(),
                         d3d.as_ptr(),
@@ -1266,8 +1009,6 @@ impl ZeroCopyInner {
                     (*qsv.as_ptr()).pts = pts;
                     (*qsv.as_ptr()).pict_type = (*d3d.as_ptr()).pict_type;
                     ffi::avcodec_send_frame(self.enc.as_mut_ptr(), qsv.as_ptr())
-                    // `qsv` drops here — releasing the mapped frame and its frames-ctx ref at the
-                    // same point the hand-written `av_frame_free(&mut qsv)` did.
                 }
             };
             if send < 0 {
@@ -1276,18 +1017,13 @@ impl ZeroCopyInner {
                     self.vendor.label()
                 );
             }
-            // `d3d` drops here (and on every early exit above), returning the pooled surface.
         }
         Ok(())
     }
 }
 
-// No `Drop` for `ZeroCopyInner`: the two `Option<AvBuffer>`s unref themselves when present and do
-// nothing when `None` (AMF), which is what the hand-written null checks amounted to. Field order
-// (see the struct) keeps the release sequence identical: QSV frames, QSV device, then the encoder's
-// AddRef'd copies via `enc`, then the D3D11 pair via `hw`.
-
-// ---------------------------------------------------------------------------------------------
+// No `Drop`: `Option<AvBuffer>` unrefs when `Some` (QSV) and no-ops when `None` (AMF). Field
+// order: QSV frames, QSV device, `enc`, then `hw`.
 
 enum Inner {
     System(SystemInner),
@@ -1303,26 +1039,19 @@ pub struct FfmpegWinEncoder {
     fps: u32,
     bitrate_bps: u64,
     bit_depth: u8,
-    /// Built lazily from the first frame (system readback vs zero-copy D3D11).
     inner: Option<Inner>,
-    /// Raw `ID3D11Device` pointer the live inner is bound to — re-init on change (the capturer
-    /// recreates its device across secure-desktop / HDR / resize transitions, like NVENC tracks).
+    /// Raw `ID3D11Device` the inner is bound to. Re-init when the capturer recreates the device
+    /// (secure-desktop / HDR / resize).
     bound_device: isize,
     frame_idx: i64,
     force_kf: bool,
-    /// Frames sent to libavcodec whose AUs haven't been received yet. `poll` blocks (bounded)
-    /// while this is non-zero — see the poll-contract note on [`Encoder::poll`] below.
+    /// Submitted frames whose AUs have not arrived. `poll` may spin while this is non-zero.
     in_flight: usize,
 }
 
-// Raw FFI pointers + COM objects; the encoder lives on a single thread (same contract as NVENC/VAAPI).
-// SAFETY: `FfmpegWinEncoder` owns raw libav pointers (`AVFrame`/`SwsContext`/`AVBufferRef`) and
-// windows-rs COM handles (`ID3D11Device`/`ID3D11DeviceContext`/textures) that are not auto-`Send`. The
-// session creates the encoder, drives `submit`/`poll`/`flush`, and drops it all on one dedicated encode
-// thread; it is never shared by reference across threads, and the D3D11 immediate context is only ever
-// touched from that thread. The only cross-thread action is the initial move to the encode thread,
-// after which every interior pointer/COM ref is used single-threaded — the same contract the
-// NVENC/VAAPI encoders rely on. No interior state is accessed concurrently.
+// SAFETY: owns raw libav pointers and COM handles that are not auto-`Send`. The session
+// creates, drives, and drops the encoder on one encode thread; the D3D11 immediate context
+// is touched only there. The only cross-thread action is the initial move onto that thread.
 unsafe impl Send for FfmpegWinEncoder {}
 
 impl FfmpegWinEncoder {
@@ -1339,21 +1068,15 @@ impl FfmpegWinEncoder {
         bit_depth: u8,
         chroma: ChromaFormat,
     ) -> Result<Self> {
-        // AMF/QSV 4:4:4 is deferred (see `probe_can_encode_444`): no validated AMD/Intel Windows
-        // hardware in the lab, and the AMF/QSV HEVC 4:4:4 profile/format incantations are vendor- and
-        // driver-specific (a wrong profile silently encodes 4:2:0). The probe returns false so the host
-        // never negotiates 4:4:4 for an AMF/QSV session; if a request slips through, fall back to 4:2:0.
+        // `probe_can_encode_444` is always false; a slipped 4:4:4 request still encodes 4:2:0.
         if chroma.is_444() {
             tracing::warn!("AMF/QSV 4:4:4 encode not implemented — encoding 4:2:0");
         }
         ffmpeg::init().context("ffmpeg init")?;
         if std::env::var_os("PUNKTFUNK_FFMPEG_DEBUG").is_some() {
-            // SAFETY: `ffmpeg::init()` ran on the line above, so libav is initialised; `av_log_set_level`
-            // is a global scalar setter with no pointer arguments.
+            // SAFETY: `ffmpeg::init()` succeeded; `av_log_set_level` is a scalar setter.
             unsafe { ffi::av_log_set_level(48) };
         }
-        // Make sure the encoder name exists in this libavcodec build up front (clear error vs a
-        // first-frame failure).
         let name = vendor.encoder_name(codec);
         if encoder::find_by_name(name).is_none() {
             bail!(
@@ -1378,9 +1101,7 @@ impl FfmpegWinEncoder {
         })
     }
 
-    /// Build (or rebuild) the inner for a D3D11 frame, picking zero-copy or system. Zero-copy
-    /// failures fall back to the system path so a session is never lost to the untested hw path. The
-    /// device is re-bound on change (the capturer recreates it across secure-desktop / HDR / resize).
+    /// Rebuild on device change. Zero-copy open failure falls back to system so the session lives.
     fn ensure_inner_d3d11(&mut self, device: &ID3D11Device) -> Result<()> {
         let dev_raw = device.as_raw() as isize;
         if self.inner.is_some() && self.bound_device == dev_raw {
@@ -1448,10 +1169,8 @@ impl Encoder for FfmpegWinEncoder {
         let submitted = match &captured.payload {
             FramePayload::D3d11(f) => {
                 self.ensure_inner_d3d11(&f.device)?;
-                // If zero-copy is active but the capturer fell back to a format the NV12/P010 pool
-                // can't accept (no video processor → Bgra/Rgb10a2), a CopySubresourceRegion into the
-                // pool would be a format-group mismatch (UB / device removal). Drop to the system
-                // readback path, which handles every captured format.
+                // VP fallback to Bgra/Rgb10a2 cannot copy into the NV12/P010 pool (format-group
+                // mismatch → UB). System readback handles every captured format.
                 let pool_mismatch = matches!(
                     &self.inner,
                     Some(Inner::ZeroCopy(zc)) if captured.format != zc.pool_format
@@ -1471,7 +1190,6 @@ impl Encoder for FfmpegWinEncoder {
                 }
             }
             FramePayload::Cpu(bytes) => {
-                // DDA-without-video-processor hands CPU BGRA; build a system inner and swscale it.
                 if self.inner.is_none() {
                     self.inner = Some(Inner::System(self.open_system()?));
                 }
@@ -1496,10 +1214,8 @@ impl Encoder for FfmpegWinEncoder {
         self.force_kf = true;
     }
 
-    /// Encode-stall recovery: drop the wedged libavcodec encoder (its `Drop` releases the AMF/QSV
-    /// runtime state) and let the next `submit` rebuild it lazily on the current device, exactly
-    /// like first-frame bring-up. The owed AUs are forfeited (`in_flight` zeroed) and the rebuilt
-    /// encoder's first frame is forced IDR so the client resyncs immediately.
+    /// Drop the wedged encoder (runtime state goes with `Drop`). Next `submit` rebuilds; owed AUs
+    /// are forfeited and the first rebuilt frame is IDR so the client resyncs.
     fn reset(&mut self) -> bool {
         self.inner = None;
         self.bound_device = 0;
@@ -1508,18 +1224,9 @@ impl Encoder for FfmpegWinEncoder {
         true
     }
 
-    /// Poll for the next finished AU (single non-blocking `receive_packet`).
-    ///
-    /// libavcodec's `hevc_amf`/`av1_amf` wrapper holds ~2 frames before releasing the oldest
-    /// (it needs frame N+2 submitted to flush N), so the encode→retrieve latency floors at
-    /// **~2 frame periods** — measured dead-stable at 36 ms p50 for 720p60 on the Ryzen 7000
-    /// iGPU across depth 1/2, every `usage` preset, and any spin (a spin between submits provably
-    /// never produces the owed AU — verified with a 150 ms cap pegging at exactly 150 ms). So the
-    /// buffer is inherent to the libavcodec path, NOT host scheduling: the real fix is a direct
-    /// AMF SDK encoder (the AMF analogue of `encode/windows/nvenc.rs`, whose delay=0 gives NVENC
-    /// its ~1–2 ms) — tracked as the next AMD latency lever. `PUNKTFUNK_FFWIN_POLL_MS` keeps a
-    /// bounded spin available for a future VCN/driver where the AU can land mid-spin (0 = off,
-    /// the default and correct choice on measured hardware).
+    /// Non-blocking `receive_packet`. libavcodec AMF holds ~2 frames (N+2 must be submitted to
+    /// flush N); a spin between submits never produces the owed AU. `PUNKTFUNK_FFWIN_POLL_MS`
+    /// is the bounded spin for a driver that can land mid-spin (0 = off, the default).
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
         let fps = self.fps;
         let enc = match &mut self.inner {
@@ -1537,7 +1244,7 @@ impl Encoder for FfmpegWinEncoder {
                     return Ok(Some(au));
                 }
                 PollOutcome::Eof => {
-                    self.in_flight = 0; // flushed: nothing further is owed
+                    self.in_flight = 0; // flushed; nothing further is owed
                     return Ok(None);
                 }
                 PollOutcome::Again => match deadline {
@@ -1564,30 +1271,21 @@ impl Encoder for FfmpegWinEncoder {
 mod tests {
     use super::*;
 
-    /// Pick the Intel adapter, or any hardware D3D11 adapter, for the probes below.
-    ///
-    /// Not `EnumAdapters1(0)`: a punktfunk host box also enumerates our own virtual-display adapter,
-    /// and "Microsoft Basic Render Driver" (vendor 0x1414) is the software rasterizer, which has no
-    /// video engine at all.
-    ///
-    /// Safe: `prefer_vendor` is a plain id and every DXGI object is created here and owned by the
-    /// returned device; the old `# Safety` section described the body, not a caller obligation.
+    /// Prefer `prefer_vendor`, else any hardware adapter. Not `EnumAdapters1(0)`: that can be
+    /// our virtual display, and vendor 0x1414 is the WARP rasterizer (no video engine).
     #[cfg(test)]
     fn test_hw_device(prefer_vendor: u32) -> Option<ID3D11Device> {
         use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
-        // SAFETY: DXGI factory/adapter enumeration over owned locals — the factory is created here,
-        // each adapter it yields owns its own COM reference, and every call is `.ok()`-checked
-        // before use. `GetDesc1` fills a fully-initialized stack descriptor.
+        // SAFETY: factory created here; each adapter owns its COM ref; every call is `.ok()`-
+        // checked. `GetDesc1` fills a stack descriptor.
         let (factory, mut preferred, mut fallback): (IDXGIFactory1, _, _) =
             (unsafe { CreateDXGIFactory1() }.ok()?, None, None);
         for i in 0.. {
-            // SAFETY: a COM call on the live `factory` created above; it takes an index and
-            // yields an owned adapter, and the `Ok` binding is what proves one came back.
+            // SAFETY: COM call on the live factory; `Ok` means an owned adapter came back.
             let Ok(adapter) = (unsafe { factory.EnumAdapters1(i) }) else {
-                break; // DXGI_ERROR_NOT_FOUND — end of the list
+                break; // DXGI_ERROR_NOT_FOUND
             };
-            // SAFETY: a COM call on the adapter just enumerated, filling a fully-initialized
-            // stack descriptor it returns by value.
+            // SAFETY: COM call on that adapter; descriptor returned by value.
             let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
                 continue;
             };
@@ -1602,32 +1300,19 @@ mod tests {
             }
         }
         let adapter = preferred.or(fallback)?;
-        // SAFETY: `make_device` requires a live `IDXGIAdapter1`; `adapter` is one of the adapters
-        // enumerated above, still owned here and borrowed only for this synchronous call.
+        // SAFETY: `adapter` is an owned enumerated `IDXGIAdapter1`, borrowed only for this call.
         unsafe { pf_frame::dxgi::make_device(&adapter) }
             .ok()
             .map(|(d, _c)| d)
     }
 
-    /// Construct/drop `D3d11Hw` repeatedly on real silicon — the D3D11VA half of the RAII change,
-    /// and the half that IS reachable on any GPU.
-    ///
-    /// `D3d11Hw` owns a hwdevice + frames-pool pair through `AvBuffer`, and it is shared by both
-    /// Windows zero-copy vendors, so this covers the AMF path's ownership too without needing AMD
-    /// hardware. Looping is the point, as with `cuda_hw_alloc_drop_cycles`: a double-unref aborts in
-    /// the CRT, a missed one leaks a device and a pool of eight surfaces per iteration.
-    ///
-    /// `#[ignore]`d (needs a real D3D11 GPU):
-    /// `cargo test -p pf-encode --features amf-qsv d3d11hw_alloc_drop_cycles -- --ignored --nocapture`
+    /// Loop construct/drop of `D3d11Hw`: a double-unref aborts in the CRT; a miss leaks a device
+    /// and an 8-surface pool per iteration. Shared by both zero-copy vendors.
     #[test]
     #[ignore = "needs a real D3D11 GPU (run on a GPU host, not the build box)"]
     fn d3d11hw_alloc_drop_cycles() {
         let device = test_hw_device(0x8086).expect("a hardware D3D11 adapter");
         for i in 0..8 {
-            // `D3d11Hw::new` is safe now; it still needs libav initialised, which the ffmpeg-next
-            // crate does statically on first use here. NV12 at 640x480 with an 8-surface pool are
-            // valid pool parameters. The handle drops at the end of each iteration — that release
-            // is what is under test.
             let hw = D3d11Hw::new(
                 &device,
                 ffi::AVPixelFormat::AV_PIX_FMT_NV12,
@@ -1643,29 +1328,10 @@ mod tests {
         eprintln!("8 D3d11Hw alloc/drop cycles completed without abort");
     }
 
-    /// Construct/drop `ZeroCopyInner` on the QSV path, repeatedly, on real Intel silicon.
-    ///
-    /// This is the one path in the crate where ownership was genuinely ambiguous: `open` builds a
-    /// `D3d11Hw` (D3D11VA device + frames pair) and then DERIVES a QSV device + frames ctx from it,
-    /// and the tuple it used to return handed those two derived pointers out **twice** — once as
-    /// the encoder's `dev_ref`/`frames_ref`, once as the pair moved into `Self`. Harmless while they
-    /// were raw pointers; two owners once they are `AvBuffer`. Looping construct/drop is what tells
-    /// the difference apart: a double-unref aborts inside the CRT, a missed one leaks an Intel
-    /// device per session.
-    ///
-    /// Nothing else reaches it. `zerocopy_enabled` defaults QSV **off**, so the normal encode path
-    /// never builds one on Intel, and the native VPL backend (`enc/windows/qsv.rs`) supersedes this
-    /// whole file unless `PUNKTFUNK_QSV_FFMPEG=1`. Calling `open` directly sidesteps both gates so
-    /// the ownership itself is what gets exercised.
-    ///
-    /// This test is also the regression guard for the D3D11 multithread-protection fix in
-    /// `D3d11Hw::new`. Without it the QSV derive dies in `MFXVideoCORE_SetHandle` with
-    /// `MFX_ERR_UNDEFINED_BEHAVIOR (-16)`, surfacing only as libav's "Error setting child device
-    /// handle" — a message that names neither the cause nor the cure. If this starts failing that
-    /// way again, look there first.
-    ///
-    /// `#[ignore]`d (needs a real Intel QSV device):
-    /// `cargo test -p pf-encode --features amf-qsv zerocopy_qsv_alloc_drop_cycles -- --ignored --nocapture`
+    /// Loop QSV `ZeroCopyInner` construct/drop. `open` derives a QSV pair from D3D11VA; a
+    /// double-owner would abort in the CRT, a miss leaks a device per session. Sidesteps
+    /// `zerocopy_enabled` (QSV default off) and native VPL. Also the regression for
+    /// `SetMultithreadProtected` in `D3d11Hw::new` — without it derive fails MFX SetHandle.
     #[test]
     #[ignore = "needs a real Intel QSV device (run on an Intel host, not the build box)"]
     fn zerocopy_qsv_alloc_drop_cycles() {
@@ -1683,17 +1349,13 @@ mod tests {
                 &device,
             )
             .unwrap_or_else(|e| panic!("ZeroCopyInner::open(QSV) failed on iteration {i}: {e:#}"));
-            // The QSV arm must have derived BOTH halves — an `Option` that came back `None` here
-            // would mean the AMF branch was taken and the derived-pair ownership never ran.
+            // `None` here means the AMF arm ran and the derived-pair ownership never executed.
             assert!(zc.qsv_frames.is_some(), "QSV path derived no frames ctx");
             assert!(zc.qsv_device.is_some(), "QSV path derived no device");
         }
         eprintln!("8 ZeroCopyInner(QSV) alloc/drop cycles completed without abort");
     }
 
-    /// Zero-copy default matrix: the operator override wins in both directions; unset resolves
-    /// AMF on (on-glass validated) and QSV off (opt-in until validated on Intel glass — the
-    /// probe-never-assume rule).
     #[test]
     fn zerocopy_default_is_per_vendor_and_override_wins() {
         assert!(zerocopy_active(None, WinVendor::Amf));
@@ -1704,9 +1366,7 @@ mod tests {
         }
     }
 
-    /// `PUNKTFUNK_FFWIN_POLL_MS` grammar: default 0 (no spin), verbatim ms → µs inside the clamp,
-    /// and the clamp applies BEFORE the µs conversion — the slipped-digit value that used to be a
-    /// 27.7-hour spin resolves to the 1 s cap, not a wedged encode thread.
+    /// Clamp before `* 1000`: a slipped-digit ms value must hit [`MAX_POLL_SPIN_MS`], not a hang.
     #[test]
     fn poll_spin_cap_clamps_before_the_us_conversion() {
         assert_eq!(parse_poll_spin_cap_us(None), 0);
@@ -1725,9 +1385,6 @@ mod tests {
         assert_eq!(parse_poll_spin_cap_us(Some("-1")), 0);
     }
 
-    /// The swscale source map: packed RGB/BGR converts; every YUV/10-bit layout is refused (the
-    /// swscale lane is the 8-bit BGRA fallback, not a general converter — the Linux HDR formats
-    /// are listed explicitly so a `PixelFormat` addition re-breaks the match on purpose).
     #[test]
     fn sws_src_accepts_packed_rgb_only() {
         assert_eq!(sws_src(PixelFormat::Bgrx).unwrap(), Pixel::BGRZ);
@@ -1748,9 +1405,6 @@ mod tests {
         }
     }
 
-    /// The readback routing table, and its depth guard: NV12/P010 take the plane copy, the
-    /// video-processor fallbacks take their swscale lanes, a depth CHANGE under the encoder is
-    /// refused (in both directions), and depth-consistent routing never trips the guard.
     #[test]
     fn readback_routing_and_depth_guard() {
         assert_eq!(
@@ -1773,17 +1427,13 @@ mod tests {
             readback_route(PixelFormat::Rgb10a2, true).unwrap(),
             ReadbackRoute::Rgb10
         );
-        // Mid-stream depth changes — the genuine error the guard exists for.
         assert!(readback_route(PixelFormat::P010, false).is_err());
         assert!(readback_route(PixelFormat::Rgb10a2, false).is_err());
         assert!(readback_route(PixelFormat::Nv12, true).is_err());
         assert!(readback_route(PixelFormat::Bgra, true).is_err());
-        // A format neither lane can read back.
         assert!(readback_route(PixelFormat::Yuv444, false).is_err());
     }
 
-    /// The 10-bit predicate follows the PIXELS (P010/Rgb10a2), not the negotiated depth — see
-    /// `ten_bit_input` for the forever-failing-session shape the reverse produced here.
     #[test]
     fn ten_bit_follows_the_pixels() {
         assert!(is_10bit_format(PixelFormat::P010));
@@ -1793,9 +1443,6 @@ mod tests {
         assert!(!is_10bit_format(PixelFormat::Bgrx));
     }
 
-    /// The QSV low-latency contract, pinned: these five knobs are the difference between
-    /// display-remoting latency and transcode behavior — a silent regression here changes every
-    /// Intel Windows session.
     #[test]
     fn qsv_opts_pin_the_latency_contract() {
         let opts = vendor_opts(WinVendor::Qsv, "ignored");
@@ -1813,9 +1460,6 @@ mod tests {
         assert_eq!(get("usage"), None, "AMF-only knob must not leak into QSV");
     }
 
-    /// The AMF (benchmark-comparator) contract: usage passes through, B-frames are pinned OFF
-    /// (each one is a full frame period of latency on RDNA3+), and the low-latency submission
-    /// mode + IDR header insertion are requested.
     #[test]
     fn amf_opts_pin_no_bframes_and_the_usage_passthrough() {
         let opts = vendor_opts(WinVendor::Amf, "lowlatency");
@@ -1834,9 +1478,6 @@ mod tests {
         assert_eq!(get("enforce_hrd"), Some("true"));
     }
 
-    /// The zero-copy pool's bind flags per vendor — AMF's encoder-input shape vs QSV's mfx
-    /// surface shape (a wrong flag set fails `av_hwframe_ctx_init`, or worse, opens and maps
-    /// wrong).
     #[test]
     fn pool_bind_flags_per_vendor() {
         assert_eq!(
@@ -1849,8 +1490,6 @@ mod tests {
         );
     }
 
-    /// The libavcodec encoder-name dispatch (name-selected — the codec id would pick the
-    /// software encoder).
     #[test]
     fn encoder_names_dispatch_by_vendor() {
         assert_eq!(WinVendor::Qsv.encoder_name(Codec::H264), "h264_qsv");
@@ -1859,11 +1498,8 @@ mod tests {
         assert_eq!(WinVendor::Amf.encoder_name(Codec::H265), "hevc_amf");
     }
 
-    /// Probe smoke: resolve the QSV probe on this machine without crashing — `false` on a box
-    /// without the Intel runtime is a valid outcome; the value is printed, not asserted. Only
-    /// compiled in the `amf-qsv`-without-`qsv` combo (the shipped combo answers via native VPL).
-    /// Run on the Windows CI runner:
-    ///   cargo test -p pf-encode --no-default-features --features amf-qsv -- --ignored ffmpeg_win
+    /// `false` without the Intel runtime is valid; print, don't assert. Compiled only when
+    /// native VPL is out (`not(feature = "qsv")`).
     #[cfg(not(feature = "qsv"))]
     #[test]
     #[ignore = "needs a real FFmpeg runtime probe (run on the Windows CI runner, not a dev box)"]

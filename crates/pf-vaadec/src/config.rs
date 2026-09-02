@@ -1,34 +1,27 @@
-//! Decoder-creation decisions: which `VAProfile` a stream needs, which render-target
-//! format its surfaces must carry, and how many of them to allocate.
+//! Which `VAProfile`, render-target format, and surface count a stream needs.
 //!
-//! The same job `pf-dxvadec`'s `config` module does for DXVA, and split out for the same
-//! reason: these are pure functions of the stream's shape, so they belong where the
-//! ordinary gates run them rather than inside `cfg(target_os = "linux")` FFI that
-//! only a box can compile.
+//! Pure functions of stream shape, split out like `pf-dxvadec::config` so ordinary
+//! gates run them — not `cfg(target_os = "linux")` FFI that only a box compiles.
 //!
-//! Constant values are the libva 2.23.0 enumerators.
+//! Constants are libva 2.23.0 enumerators.
 
-/// `VAEntrypointVLD` — full bitstream decode, the only entry point this rung uses.
+/// `VAEntrypointVLD`. Full bitstream decode; the only entry point this rung uses.
 pub const VA_ENTRYPOINT_VLD: u32 = 1;
 
-/// `VAProfile` enumerators (`va.h`).
 pub const VA_PROFILE_H264_MAIN: i32 = 6;
 pub const VA_PROFILE_H264_HIGH: i32 = 7;
 pub const VA_PROFILE_H264_CONSTRAINED_BASELINE: i32 = 13;
 pub const VA_PROFILE_HEVC_MAIN: i32 = 17;
 pub const VA_PROFILE_HEVC_MAIN10: i32 = 18;
-/// Measured, not counted from the top of the enum: `VAProfileAV1Profile0` is **32**
-/// and `VAProfileAV1Profile1` is 33, with ten VP9/HEVC enumerators in between.
+/// Not a count from the top of the enum: ten VP9/HEVC values sit between HEVC and AV1.
 pub const VA_PROFILE_AV1_PROFILE0: i32 = 32;
 pub const VA_PROFILE_AV1_PROFILE1: i32 = 33;
 
-/// `VA_RT_FORMAT_*` — the surface render-target format.
 pub const VA_RT_FORMAT_YUV420: u32 = 0x0000_0001;
 pub const VA_RT_FORMAT_YUV444: u32 = 0x0000_0004;
 pub const VA_RT_FORMAT_YUV420_10: u32 = 0x0000_0100;
 
-/// Which codec a session decodes. Mirrors `pf-dxvadec`'s `Codec` rather than
-/// re-exporting it: this crate must not depend on the Windows-facing one.
+/// Mirrors `pf-dxvadec::Codec` locally; this crate must not depend on the Windows one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
     H264,
@@ -36,17 +29,15 @@ pub enum Codec {
     Av1,
 }
 
-/// A profile choice, with the name the logs print.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VaProfile {
     pub value: i32,
     pub name: &'static str,
 }
 
-/// Why a stream cannot be decoded by this rung at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigError {
-    /// A (chroma, depth) pair with no profile — 4:4:4, or a depth outside 8/10.
+    /// No profile for this (chroma, depth) — 4:4:4, or a depth outside 8/10.
     UnsupportedShape { chroma_format_idc: u8, depth: u8 },
 }
 
@@ -66,27 +57,14 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// The profile a stream of this shape decodes under.
+/// H.264 8-bit 4:2:0 is always High, not the SPS `profile_idc`. Main would
+/// fail mid-stream on 8×8 transforms; High is a superset. Narrower values
+/// exist for the capability probe (what the device offers).
 ///
-/// H.264 resolves to **High** for every 8-bit 4:2:0 stream rather than reading the
-/// SPS's `profile_idc`. That is deliberate and is what VAAPI clients do: High is a
-/// superset of Main and Constrained Baseline for the tools our hosts emit, every
-/// driver advertising H.264 decode advertises High, and picking Main for a stream
-/// that turns out to use 8x8 transforms is a mid-stream failure where picking High
-/// is not. The narrower enumerators are exported for the capability probe, which
-/// reports what the DEVICE offers.
-///
-/// 4:4:4 is refused rather than mapped: `VAProfileH264High444` exists in the header
-/// but no driver in this fleet advertises it, and the Vulkan rung is where this
-/// program's 4:4:4 support actually lives.
-///
-/// **AV1 Profile 0 covers 8 AND 10 bits under one enumerator**, so the pair differs
-/// only in the render-target format — which is the one thing that must not be shared,
-/// since it is what the surface pool is allocated with. Profile 1 (4:4:4) and
-/// Profile 2 (4:2:2 / 12-bit) are refused: `va_dec_av1.h` opens by saying *"This AV1
-/// decoding API supports 8-bit/10bit 420 format only"*, so this is the API's
-/// envelope and not merely ours. Monochrome reaches here as `chroma_format_idc` 0
-/// and lands in the same refusal rather than being mistaken for 4:2:0.
+/// 4:4:4 is refused: the header has High444, drivers here do not, Vulkan does.
+/// AV1 Profile 0 is 8 and 10 bit under one enumerator — `rt_format` must differ
+/// or the surface pool is wrong. Profile 1/2 and monochrome (`chroma_format_idc` 0)
+/// are refused: `va_dec_av1.h` is 8/10-bit 4:2:0 only.
 pub fn profile_for(
     codec: Codec,
     chroma_format_idc: u8,
@@ -120,7 +98,6 @@ pub fn profile_for(
     }
 }
 
-/// The surface render-target format for a stream shape.
 pub fn rt_format(chroma_format_idc: u8, depth: u8) -> Result<u32, ConfigError> {
     match (chroma_format_idc, depth) {
         (1, 8) => Ok(VA_RT_FORMAT_YUV420),
@@ -133,44 +110,19 @@ pub fn rt_format(chroma_format_idc: u8, depth: u8) -> Result<u32, ConfigError> {
     }
 }
 
-/// Headroom over the DPB for pictures the CONSUMER still holds.
-///
-/// A surface handed to the presenter is not free to decode into — that is what
-/// zero-copy costs — and a pool sized exactly to the DPB stalls the decoder behind
-/// the display.
-///
-/// **8, matching `pf_vkdecode::images::HOLD_HEADROOM`, and for its measurement**:
-/// the real client pipeline holds roughly four to seven frames at steady state (two
-/// bounded(2) channels, the frame store's 1..=3 preroll, the in-flight present and
-/// the retired-frame slot), so eight leaves a frame of slack and a consumer holding
-/// more than that has earned an honest "pool exhausted" rather than a silent stall.
-/// The number was 4 when this module was written against no consumer; the native
-/// Vulkan rung had already measured the pipeline by then, and 4 would have run the
-/// pool dry on an ordinary stream.
-///
-/// (The FFmpeg VAAPI rung asks libavcodec for `extra_hw_frames = 4` and survives on
-/// it, but its pool is not this pool: `av_hwframe_get_buffer` BLOCKS until a surface
-/// frees, so its headroom buys latency where ours buys correctness.)
+/// Zero-copy: a presented surface cannot be decoded into. Size the pool to DPB
+/// and the decoder stalls behind display. 8 matches `pf_vkdecode::images::HOLD_HEADROOM`.
+/// Do not copy FFmpeg's `extra_hw_frames = 4`: `av_hwframe_get_buffer` blocks;
+/// this pool does not.
 pub const PRESENTER_HEADROOM: usize = 8;
 
-/// How many decode surfaces a session allocates: the DPB, plus the picture being
-/// decoded, plus [`PRESENTER_HEADROOM`].
-///
-/// VAAPI reports no driver minimum to honour (DXVA's
-/// `ConfigMinRenderTargetBuffCount` has no counterpart), so this is the whole rule.
-///
-/// AV1 passes [`AV1_MAX_DPB_FRAMES`] here — the codec's constant, not a stream
-/// property.
+/// VAAPI has no driver minimum. AV1 passes [`AV1_MAX_DPB_FRAMES`] (codec constant, not a sequence header).
 pub fn surface_count(max_dpb_frames: usize) -> usize {
     max_dpb_frames + 1 + PRESENTER_HEADROOM
 }
 
-/// AV1's DPB depth: `NUM_REF_FRAMES`, and a constant of the codec rather than
-/// anything a sequence header says.
-///
-/// The slot ledger adds the picture being decoded, so an AV1 session's ledger holds
-/// nine — libavcodec's own `num_surfaces = 1 + 8` for this codec, before the
-/// presenter headroom this rung adds on top.
+/// AV1 DPB depth (`NUM_REF_FRAMES`). Codec constant, not a sequence-header field.
+/// Ledger is this plus the picture being decoded (libavcodec `num_surfaces = 1 + 8`).
 pub const AV1_MAX_DPB_FRAMES: usize = 8;
 
 #[cfg(test)]
@@ -195,8 +147,7 @@ mod tests {
         );
     }
 
-    /// AV1 Profile 0 is one enumerator for two depths, and the depth still has to
-    /// reach the surface pool through `rt_format` rather than through the profile.
+    /// Profile 0 is one enumerator for 8 and 10 bit; depth reaches the pool via `rt_format`.
     #[test]
     fn av1_profile0_covers_both_depths_and_the_format_is_what_differs() {
         assert_eq!(
@@ -218,17 +169,12 @@ mod tests {
 
     #[test]
     fn shapes_outside_the_envelope_are_refused_not_guessed() {
-        // 10-bit H.264 (High10) and 4:4:4 both have header enumerators; neither is
-        // in this rung's envelope, and silently narrowing to an 8-bit profile is the
-        // class of bug that decodes to garbage instead of failing.
+        // High10 and 4:4:4 exist in the header; mapping them to 8-bit High decodes garbage.
         assert!(profile_for(Codec::H264, 1, 10).is_err());
         assert!(profile_for(Codec::H264, 3, 8).is_err());
         assert!(profile_for(Codec::H265, 3, 10).is_err());
         assert!(rt_format(1, 12).is_err());
-        // AV1 Profile 1 (4:4:4) and Profile 2 (4:2:2 / 12-bit) have no rung here —
-        // `va_dec_av1.h` says the API itself is 8/10-bit 4:2:0 only — and
-        // monochrome, which the AV1 planner reports as chroma_format_idc 0, is
-        // refused rather than treated as 4:2:0's neighbour.
+        // AV1 API is 8/10-bit 4:2:0 only. chroma_format_idc 0 is monochrome, not 4:2:0.
         assert!(profile_for(Codec::Av1, 3, 8).is_err());
         assert!(profile_for(Codec::Av1, 3, 10).is_err());
         assert!(profile_for(Codec::Av1, 1, 12).is_err());
@@ -236,8 +182,7 @@ mod tests {
         assert!(profile_for(Codec::Av1, 2, 8).is_err());
     }
 
-    /// AV1's pool is sized from the codec's constant, and the ledger it implies is
-    /// the nine slots [`crate::pic_av1::plan_to_va_av1`] insists on.
+    /// Pool from the codec constant; ledger is nine slots, as [`crate::pic_av1::plan_to_va_av1`].
     #[test]
     fn the_av1_pool_is_the_codecs_eight_slots_plus_the_current_picture() {
         assert_eq!(AV1_MAX_DPB_FRAMES, pf_bitstream::av1::NUM_REF_SLOTS);
@@ -259,10 +204,7 @@ mod tests {
         assert_eq!(surface_count(16), 16 + 1 + PRESENTER_HEADROOM);
     }
 
-    /// The headroom must cover what the client pipeline actually holds, which the
-    /// native Vulkan rung measured before this crate existed. Pinning it to that
-    /// crate's constant means a future re-measurement moves both rungs together
-    /// instead of leaving this one quietly short.
+    /// Pin to `pf_vkdecode` so a re-measurement moves both rungs; this pool must not go short.
     #[test]
     fn the_headroom_matches_the_pipeline_depth_the_vulkan_rung_measured() {
         assert_eq!(

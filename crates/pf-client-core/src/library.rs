@@ -1,13 +1,12 @@
-//! Game-library client for the host's management REST API (the Apple `LibraryClient`
-//! ported): `GET https://<host>:<mgmt>/api/v1/library` plus the per-title art proxy.
-//! Authentication is **mTLS** — this client presents its persistent identity (the same
-//! cert the host paired over QUIC) and the host authorizes paired certificates for the
-//! read-only library routes, no bearer token. The host's self-signed certificate is
-//! verified by its pinned SHA-256 fingerprint (`KnownHost::fp_hex`), not a CA chain.
+//! Game-library client for the host management REST API:
+//! `GET https://<host>:<mgmt>/api/v1/library` plus the per-title art proxy.
 //!
-//! The MODEL half (`GameEntry`, `Artwork`, `RunningGame`, `LibraryError`, `base_url`) is
-//! portable — the Skia console renders it on Android too, where the Kotlin client does the
-//! fetching; the ureq/rustls half below is desktop-gated item by item.
+//! Auth is mTLS: the client presents the persistent identity paired over QUIC;
+//! paired certs may read the library routes (no bearer token). The host cert is
+//! checked against the pinned SHA-256 fingerprint (`KnownHost::fp_hex`), not a CA.
+//!
+//! Types (`GameEntry`, `Artwork`, `RunningGame`, `LibraryError`, `base_url`) are
+//! portable. The ureq/rustls fetch path is desktop-gated (`linux` / `windows`).
 
 use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "linux", windows))]
@@ -17,19 +16,17 @@ use std::sync::{Arc, Mutex};
 #[cfg(any(target_os = "linux", windows))]
 use std::time::Duration;
 
-/// The management API's default port — matches `mgmt::DEFAULT_PORT` on the host. A
-/// discovered host may override it via its mDNS `mgmt` TXT (`DiscoveredHost::mgmt_port`);
-/// saved-but-not-advertising hosts fall back here (Apple parity).
+/// Matches host `mgmt::DEFAULT_PORT`. Discovered hosts override via mDNS `mgmt`
+/// TXT (`DiscoveredHost::mgmt_port`); a saved host that is not advertising falls
+/// back here.
 pub const DEFAULT_MGMT_PORT: u16 = 47990;
 
-/// Cover-art URLs, mirroring the host's `library::Artwork`: absolute CDN URLs for custom
-/// entries, host-relative proxy paths (`/api/v1/library/art/...`) for Steam titles. The
-/// wire shape also carries a `logo` (a transparent title logo) — not a poster kind, so
-/// serde just skips it here.
+/// Cover URLs as the host sends them: CDN for custom entries, host-relative
+/// `/api/v1/library/art/...` for Steam. Wire also has `logo`; it is not a poster
+/// kind, so it is not a field here.
 ///
-/// `Serialize` as well as `Deserialize` so a catalog can be written back out verbatim by
-/// [`crate::library_cache`]; `skip_serializing_if` keeps a cached file the same shape the host
-/// sent, rather than a wall of `null`s.
+/// `Serialize` so [`crate::library_cache`] can write a catalog back verbatim.
+/// `skip_serializing_if` keeps omitted host fields omitted, not `null`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Artwork {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -41,9 +38,6 @@ pub struct Artwork {
 }
 
 impl Artwork {
-    /// Poster candidates in the Apple client's fallback order — portrait (the 600×900
-    /// capsule) → header (near-universal) → hero — with host-relative paths resolved
-    /// against `base` so the loader only ever sees absolute URLs.
     pub fn poster_candidates(&self, base: &str) -> Vec<String> {
         [&self.portrait, &self.header, &self.hero]
             .into_iter()
@@ -58,67 +52,44 @@ impl Artwork {
             .collect()
     }
 
-    /// Whether this entry has no poster art at all — the condition a launcher's brand mark stands
-    /// in for. Separate from `poster_candidates` so a caller asking the question doesn't have to
-    /// invent a `base` it has no use for.
+    /// Separate from `poster_candidates` so the caller need not invent a `base`.
     pub fn is_empty(&self) -> bool {
         self.portrait.is_none() && self.header.is_none() && self.hero.is_none()
     }
 }
 
-/// One title in the host's unified library. `id` is store-qualified (`steam:<appid>`,
-/// `custom:<id>`) and is also the launch handle the Hello carries when a session is
-/// started from the library. The host's `launch` spec field is deliberately not
-/// deserialized — launching goes by id, the host resolves the spec itself.
-///
-/// `Serialize` for [`crate::library_cache`]'s benefit — see [`Artwork`]. The `launch` spec the
-/// host also sends stays undecoded, so a cached catalog loses nothing a client was using.
+/// One title. `id` is store-qualified (`steam:<appid>`, `custom:<id>`) and is the
+/// launch handle Hello carries. Host `launch` spec is not a field: launch is by
+/// id. `Serialize` for [`crate::library_cache`] — see [`Artwork`].
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GameEntry {
     pub id: String,
-    /// Which store surfaced it (`"steam"`, `"custom"`, future `"heroic"`/`"gog"`/…) —
-    /// drives the poster's store badge.
+    /// Store badge on the poster (`"steam"`, `"custom"`, …).
     pub store: String,
     pub title: String,
     #[serde(default)]
     pub art: Artwork,
-    /// The system the title runs on (`"PC"`, `"PS2"`, …) — free-form display string from the
-    /// host's flattened `GameMeta`; the rest of the metadata is not decoded until a UI needs it.
+    /// Free-form display string from the host's flattened `GameMeta`. Other
+    /// metadata stays undecoded until a UI needs it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
-    /// `"game"` (the default, and what an older host omits) or `"launcher"` — an entry that opens
-    /// the launcher itself (Steam Big Picture, Heroic) rather than a title. A UI may group these
-    /// separately; one that doesn't renders them as ordinary tiles, which is the intended
-    /// degradation (design D4). Kept a plain string: the host owns the vocabulary, and an unknown
-    /// future value must never fail the whole library decode.
+    /// `"game"` (default; older hosts omit) or `"launcher"`. A plain string: the
+    /// host owns the vocabulary; an unknown value must not fail the catalog decode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    /// Which brand mark to draw for this entry — `"steam"`, `"heroic"`, `"playnite"` — or `None`
-    /// when the host sent none (every older host, and every ordinary title).
-    ///
-    /// A **token**, not art: the shell resolves it against the marks it ships
-    /// (`assets/launcher-icons`) and falls back to naming the launcher for one it doesn't have, so
-    /// a plugin can name a mark this client has never heard of without breaking the tile. The host
-    /// guarantees the slug shape (`[a-z][a-z0-9-]{0,31}`), which is what makes it safe to
-    /// interpolate into a resource name or an asset lookup — but see [`GameEntry::icon_token`],
-    /// which re-checks rather than trusting it.
+    /// Brand-mark slug (`"steam"`, `"heroic"`, `"playnite"`), not image bytes.
+    /// Resolve through [`GameEntry::icon_token`] — never interpolate `icon` raw.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
 }
 
 impl GameEntry {
-    /// Whether this entry opens a launcher rather than a game.
     pub fn is_launcher(&self) -> bool {
         self.role.as_deref() == Some("launcher")
     }
 
-    /// The brand-icon token, re-validated here rather than taken on trust.
-    ///
-    /// The host validates the shape on the way in, so this can only fire for a host that is older
-    /// than that check, compromised, or simply not ours. Every caller interpolates the result into
-    /// a resource name (`pf-launcher-{t}-symbolic`), an asset-catalog lookup or a file path, and
-    /// "the peer promised" is not the standard those deserve — a client re-checks what it is about
-    /// to concatenate. Cheap enough to do at the call site.
+    /// Re-check before interpolating into a resource name or path. Callers
+    /// concatenate this into `pf-launcher-{t}-symbolic` and asset lookups.
     pub fn icon_token(&self) -> Option<&str> {
         let t = self.icon.as_deref()?;
         let ok = !t.is_empty()
@@ -130,12 +101,12 @@ impl GameEntry {
     }
 }
 
-/// Errors surfaced to the UI so it can guide setup (the common case is "not paired yet").
+/// Classified so the UI can tell "not paired" from "wrong pin" from "down".
 #[derive(Debug)]
 pub enum LibraryError {
-    /// The host rejected our certificate — this device isn't on its paired list.
+    /// Host rejected the client cert — this device is not on the paired list.
     NotPaired,
-    /// The host's certificate didn't hash to the pinned fingerprint (impostor/rotated cert).
+    /// Host cert did not hash to the pinned fingerprint (impostor or rotated).
     PinMismatch,
     Http(u16),
     Unreachable(String),
@@ -165,7 +136,6 @@ impl std::fmt::Display for LibraryError {
     }
 }
 
-/// `https://addr:port`, IPv6 literals bracketed.
 pub fn base_url(addr: &str, mgmt_port: u16) -> String {
     if addr.contains(':') {
         format!("https://[{addr}]:{mgmt_port}")
@@ -174,9 +144,8 @@ pub fn base_url(addr: &str, mgmt_port: u16) -> String {
     }
 }
 
-/// An HTTPS agent presenting `identity` via TLS client auth and verifying the server by
-/// `pin` (`None` = accept any cert, the TOFU special case — same semantics as the QUIC
-/// connect). Reused across a whole grid's worth of poster loads.
+/// mTLS agent: client cert from `identity`, server checked by `pin`.
+/// `pin = None` is TOFU (accept any cert), same as the QUIC connect.
 #[cfg(any(target_os = "linux", windows))]
 pub fn agent(
     identity: &(String, String),
@@ -185,8 +154,8 @@ pub fn agent(
     use rustls::pki_types::pem::PemObject;
     let bad =
         |what: &str, e: &dyn std::fmt::Display| LibraryError::Unreachable(format!("{what}: {e}"));
-    // The aws-lc-rs provider, explicitly — the same one core's QUIC endpoints install, so the
-    // process never mixes rustls crypto providers.
+    // Same aws-lc-rs provider the QUIC endpoints install — mixing rustls
+    // providers panics.
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -200,8 +169,8 @@ pub fn agent(
     let cfg = builder
         .with_client_auth_cert(vec![cert], key)
         .map_err(|e| bad("client auth", &e))?;
-    // ureq's own `TlsConfig` has no hook for a custom verifier, so the agent is built around this
-    // `ClientConfig` verbatim (punktfunk-core owns that glue — see `tls::ureq_agent`).
+    // ureq's `TlsConfig` has no custom-verifier hook; wrap this `ClientConfig`
+    // via `tls::ureq_agent`.
     Ok(punktfunk_core::tls::ureq_agent::agent(
         Arc::new(cfg),
         ureq::Agent::config_builder()
@@ -211,8 +180,8 @@ pub fn agent(
     ))
 }
 
-/// Fetch the host's unified library. Errors are pre-classified for the UI (401/403 →
-/// [`LibraryError::NotPaired`], a pin-verifier rejection → [`LibraryError::PinMismatch`]).
+/// `GET /api/v1/library`. 401/403 → [`LibraryError::NotPaired`]; pin failure →
+/// [`LibraryError::PinMismatch`].
 #[cfg(any(target_os = "linux", windows))]
 pub fn fetch_games(
     addr: &str,
@@ -232,43 +201,33 @@ pub fn fetch_games(
     serde_json::from_str(&body).map_err(|e| LibraryError::Unreachable(format!("bad JSON: {e}")))
 }
 
-/// One game the host currently has launched, from `GET /api/v1/status`.
-///
-/// A deliberately partial mirror of the host's `ActiveGame`: only the fields a client can act on.
-/// The web console's view of this payload carries more (which session, which plane, the grace
-/// countdown), and none of that is a player's business from a library shelf.
+/// One title currently launched, from `GET /api/v1/status`. Partial
+/// `ActiveGame`: session/plane/grace stay undecoded so a shelf does not
+/// break when the operator payload grows.
 #[derive(Clone, Debug, Deserialize)]
 pub struct RunningGame {
-    /// Store-qualified library id (`steam:570`) — the key that lines this up with a
-    /// [`GameEntry`]. Absent for an operator-typed GameStream command, which has no catalog
-    /// entry behind it.
+    /// Store-qualified id (`steam:570`); join key onto [`GameEntry`].
+    /// Absent for an operator-typed GameStream command (no catalog row).
     #[serde(default)]
     pub app_id: Option<String>,
     #[serde(default)]
     pub title: String,
-    /// `launching` | `running` | `exited` | `untracked` | `grace`. A plain String on purpose:
-    /// the host owns the vocabulary and adds to it (`untracked` arrived in 0.30), so an unknown
-    /// value must never fail the decode of the whole list.
+    /// `launching` | `running` | `exited` | `untracked` | `grace`. A String so an
+    /// unknown host value cannot fail the whole list decode.
     #[serde(default)]
     pub state: String,
 }
 
 impl RunningGame {
-    /// Is this title *up on the host right now* — i.e. would picking it take the player back
-    /// into it rather than start it?
-    ///
-    /// `untracked` counts: the host cannot follow that process, but it did launch it and has no
-    /// evidence it stopped. `grace` counts too — its session is gone but the game is still
-    /// running, which is precisely the case where getting back in promptly matters most. Only a
-    /// confirmed `exited` does not.
+    /// True unless `state == "exited"`. `untracked` (host cannot follow the
+    /// process) and `grace` (session gone, process still up) both count as up.
     pub fn is_up(&self) -> bool {
         self.state != "exited"
     }
 }
 
-/// Just the slice of `/status` a client reads. Everything else on that payload is the operator
-/// console's business, and decoding only what we use keeps an unrelated schema change on the
-/// host from breaking a library screen.
+/// `/status` slice the shelf needs. Other operator fields stay undecoded so a
+/// schema change there cannot break the library screen.
 #[cfg(any(target_os = "linux", windows))]
 #[derive(Deserialize)]
 struct HostStatus {
@@ -276,16 +235,9 @@ struct HostStatus {
     games: Vec<RunningGame>,
 }
 
-/// What the host currently has running, from `GET /api/v1/status`.
-///
-/// Same lane, same identity, no new host work: `/status` is already on the paired-certificate
-/// allowlist (the host's `mgmt::auth::cert_may_access`) alongside `/library`, and has carried a
-/// `games[]` array since the session⇄game lifetime work. Clients simply never read it — so a
-/// player had no way to see, from the device they browse on, that something was already up.
-///
-/// **Best-effort by contract**: an older host, an unreachable one, or a shape we don't recognize
-/// yields an empty list rather than an error. Nothing here is worth failing a library screen
-/// over — the worst case is a Resume badge that doesn't appear.
+/// `GET /api/v1/status` `games[]`. Best-effort: older host, unreachable, or
+/// unknown shape → empty list, never an error. A missing Resume badge is
+/// cheaper than failing the library screen.
 #[cfg(any(target_os = "linux", windows))]
 pub fn fetch_running(
     addr: &str,
@@ -308,22 +260,20 @@ pub fn fetch_running(
         .unwrap_or_default()
 }
 
-/// Poster-art byte fetch cap — largest Steam hero assets run a few MB; anything bigger is
-/// not an image we want to hand to the texture decoder.
+/// 16 MiB. Steam heroes are a few MB; larger is not an image for the decoder.
 #[cfg(any(target_os = "linux", windows))]
 const ART_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Fetch one cover-art image. URLs on the host itself (under `base`) go through the
-/// pinned mTLS agent (the host's art proxy requires the paired cert); any other origin —
-/// a public CDN URL on a custom entry — uses ureq's default agent with normal webpki
-/// trust and no client cert (Apple's `LibraryTLSDelegate` does the same split).
+/// Host-origin URLs (`base` prefix) use the pinned mTLS agent; the art proxy
+/// requires the paired cert. Any other origin (custom-entry CDN) uses ureq's
+/// default agent: webpki trust, no client cert.
 #[cfg(any(target_os = "linux", windows))]
 pub fn fetch_art(pinned: &ureq::Agent, base: &str, url: &str) -> Result<Vec<u8>, LibraryError> {
     let mut resp = if url.starts_with(base) {
         pinned.get(url).call()
     } else {
-        // ureq's default agent builds its own rustls config from the process-default provider.
-        // Installed here rather than trusting the binary, since several link this crate.
+        // Default ureq agent uses the process rustls provider. Install it here;
+        // several binaries link this crate and may not have done so.
         punktfunk_core::tls::install_default_provider();
         ureq::get(url)
             .config()
@@ -332,8 +282,7 @@ pub fn fetch_art(pinned: &ureq::Agent, base: &str, url: &str) -> Result<Vec<u8>,
             .call()
     }
     .map_err(classify)?;
-    // `limit` replaces the old `take()` — ureq 3 caps body reads itself, and its default cap is
-    // lower than the largest legitimate hero asset.
+    // ureq 3's default body cap is below a legitimate Steam hero; raise it.
     resp.body_mut()
         .with_config()
         .limit(ART_MAX_BYTES)
@@ -341,16 +290,13 @@ pub fn fetch_art(pinned: &ureq::Agent, base: &str, url: &str) -> Result<Vec<u8>,
         .map_err(|e| LibraryError::Unreachable(format!("read image: {e}")))
 }
 
-/// Concurrent poster fetches — a handful is plenty for a LAN art proxy without turning a
-/// big library into a connection burst.
+/// Three workers: enough for a LAN art proxy without a connection burst.
 #[cfg(any(target_os = "linux", windows))]
 const ART_WORKERS: usize = 3;
 
-/// Fetch poster bytes for `jobs` (entry id → candidate URLs, walked in order until one
-/// loads) on a small worker pool; results stream on the returned channel as they land.
-/// Dropping the receiver (the consuming page popped) winds the workers down. Shared by
-/// the touch grid and the gamepad launcher — the consumer does its own texture decode on
-/// the main loop.
+/// Walk each job's candidate URLs until one loads; results arrive on the
+/// returned channel. Drop the receiver to stop the workers (page popped).
+/// Consumer decodes textures on the main loop.
 #[cfg(any(target_os = "linux", windows))]
 pub fn spawn_art_fetch(
     base: String,
@@ -377,13 +323,13 @@ pub fn spawn_art_fetch(
                     for url in &candidates {
                         match fetch_art(&agent, &base, url) {
                             Ok(bytes) => {
-                                // Receiver gone (page popped) — stop fetching.
+                                // Receiver dropped (page popped) — stop fetching.
                                 if tx.send_blocking((id, bytes)).is_err() {
                                     return;
                                 }
                                 break;
                             }
-                            // 404 on a guessed CDN path is routine — try the next kind.
+                            // Miss (often 404 on a guessed CDN path) — try the next URL.
                             Err(e) => tracing::debug!(%id, url, error = %e, "poster miss"),
                         }
                     }
@@ -399,9 +345,8 @@ pub(crate) fn classify(e: ureq::Error) -> LibraryError {
     match e {
         ureq::Error::StatusCode(401 | 403) => LibraryError::NotPaired,
         ureq::Error::StatusCode(code) => LibraryError::Http(code),
-        // Exactly the rejection `PinVerify` raises on a fingerprint mismatch. ureq 3 carries the
-        // typed `rustls::Error`, so this is a real match instead of the substring sniff the 2.x
-        // `Transport(t)` string forced — which would also have fired on unrelated cert errors.
+        // `PinVerify`'s fingerprint-mismatch error. Match this variant only —
+        // a broader cert-error arm would also fire on unrelated TLS failures.
         ureq::Error::Rustls(rustls::Error::InvalidCertificate(
             rustls::CertificateError::ApplicationVerificationFailure,
         )) => LibraryError::PinMismatch,
@@ -415,7 +360,6 @@ mod tests {
 
     #[test]
     fn poster_candidates_order_and_resolution() {
-        // Fallback order is portrait → header → hero, host-relative paths resolved.
         let art = Artwork {
             portrait: Some("/api/v1/library/art/steam:570/portrait".into()),
             hero: Some("https://cdn.example/hero.jpg".into()),
@@ -436,7 +380,7 @@ mod tests {
 
     #[test]
     fn game_entry_decodes_the_wire_shape() {
-        // The exact shape mgmt.rs serializes (optional art fields omitted, launch ignored).
+        // Wire shape from mgmt: optional art omitted, `launch` present but ignored.
         let json = r#"[
             {"id":"steam:570","store":"steam","title":"Dota 2","platform":"PC",
              "art":{"portrait":"/api/v1/library/art/steam:570/portrait"},
@@ -456,8 +400,7 @@ mod tests {
 
     #[test]
     fn running_games_decode_and_untracked_counts_as_up() {
-        // The `/status` slice a client reads, in the shape `mgmt::host` serializes: `app_id` and
-        // `store` omitted on an operator-typed GameStream command, extra fields present.
+        // Host `/status` shape: extra operator fields present; typed command omits `app_id`.
         let json = r#"{"games":[
             {"app_id":"steam:570","title":"Dota 2","state":"running","plane":"native",
              "client":"iPad","session_id":7},
@@ -470,8 +413,6 @@ mod tests {
         ],"video_streaming":false}"#;
         let status: HostStatus = serde_json::from_str(json).expect("the /status slice decodes");
         assert_eq!(status.games.len(), 5);
-        // `untracked` means the host cannot FOLLOW the process, not that the game is gone — the
-        // whole point of the state, and the one a Resume badge must not misread.
         assert!(status.games[1].is_up(), "untracked is up");
         assert!(
             status.games[2].is_up(),
@@ -486,9 +427,6 @@ mod tests {
 
     #[test]
     fn an_unknown_state_from_a_newer_host_still_decodes_and_reads_as_up() {
-        // The host owns this vocabulary and adds to it. A value we've never seen must degrade to
-        // "something is up" rather than failing the decode of the whole list — the badge being
-        // slightly optimistic is nothing next to losing every other game's state.
         let one: RunningGame =
             serde_json::from_str(r#"{"app_id":"steam:1","title":"T","state":"hibernating"}"#)
                 .expect("an unknown state is not a decode failure");
@@ -497,9 +435,7 @@ mod tests {
 
     #[test]
     fn a_catalog_round_trips_through_the_cache_encoding() {
-        // `library_cache` writes `GameEntry` back out verbatim, so the Serialize half has to
-        // preserve everything the Deserialize half read — including the fields an older host
-        // omits, which must stay omitted rather than becoming nulls a re-read misparses.
+        // Omitted host fields must stay omitted on the way back, not become `null`.
         let json = r#"[{"id":"steam:570","store":"steam","title":"Dota 2","platform":"PC",
              "art":{"portrait":"/api/v1/library/art/steam:570/portrait"},"role":"launcher",
              "icon":"steam"},

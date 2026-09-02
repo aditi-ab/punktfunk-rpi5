@@ -1,51 +1,22 @@
-//! The D3D11 side of the DXVA rung (Windows): the decode DEVICE and the shareable
-//! hand-off ring the decoded surfaces are converted into. Auto's first choice on
-//! Intel/unknown vendors — Intel's Windows driver DOES advertise Vulkan Video (Arc drivers
-//! since 2023 — don't trust the capability gate to keep Intel off it), but Vulkan decode
-//! on it was field-broken (B580, 2026-07: strobing + ~7 ms decodes) where this path
-//! streams clean; on NVIDIA/AMD it is the fallback rung below Vulkan Video, in `auto` and
-//! via mid-session demotion.
+//! D3D11 decode device and shareable hand-off ring for the Windows DXVA rung.
+//! [`crate::video_d3d11_native`] fills the decode surfaces; this module converts
+//! each slice through `ID3D11VideoProcessor` into RGBA textures the presenter
+//! imports (`pf-presenter/src/d3d11.rs`, `VK_KHR_external_memory_win32`).
 //!
-//! **What decodes into these surfaces is [`crate::video_d3d11_native`]** (M5: pf-dxvadec
-//! plans driven into `ID3D11VideoDecoder`). This module held libavcodec's D3D11VA hwaccel
-//! as well until M10 excised FFmpeg from the client; what is left is the half both rungs
-//! always shared, and it is the field-proven half.
+//! Auto's first choice on Intel — the driver advertises Vulkan Video, but that
+//! decode path is not the shipping one. NVIDIA/AMD fall back here below Vulkan
+//! Video, including mid-session demotion.
 //!
-//! Ported from the retired in-process WinUI presenter's decoder (`clients/windows/src/video.rs`)
-//! with one structural change: that presenter sampled D3D11 textures directly, while ours draws
-//! with Vulkan. Bridging rules, all learned the hard way there:
+//! Decode surfaces carry no share flags. Ring slots are single-plane RGBA
+//! (`SHARED_NTHANDLE | SHARED_KEYEDMUTEX`): a multiplanar NV12 import TDRs on
+//! NVIDIA. Both sides acquire the keyed mutex with **key 0**; a dropped frame
+//! is never acquired, which a ping-pong key would deadlock on. The device is
+//! created on the presenter's adapter (Vulkan LUID) so shares stay on one GPU.
 //!
-//! * The decode POOL is not built here. libavcodec's rung let libavcodec derive it
-//!   (`get_format` set no frames context) after a hand-built pool validated on NVIDIA was
-//!   rejected by Intel at the first `SubmitDecoderBuffers` — and Intel is the GPU this
-//!   backend exists for; the native rung declares its own pool in `video_d3d11_native`,
-//!   against pf-dxvadec's pinned bind flags. Either way the decode surfaces carry no share
-//!   flags, so they can't be imported into Vulkan directly — hence the ring below.
-//! * Each decoded slice goes through the fixed-function **`ID3D11VideoProcessor`**
-//!   (`VideoProcessorBlt`, NV12/P010 → BGRA8 — the conversion every Windows video player
-//!   exercises on every vendor) into a small ring of **shareable RGBA textures** created with
-//!   `SHARED_NTHANDLE | SHARED_KEYEDMUTEX`. Single-plane RGBA is deliberate: the presenter's
-//!   Vulkan import of a *multiplanar* NV12 D3D11 texture device-losts on NVIDIA no matter how
-//!   it's consumed (plane-view sampling, DMA copy — all validation-clean, all TDR; bisected
-//!   2026-07-09), while RGBA D3D11↔Vulkan interop is the path Chromium/ANGLE ship everywhere.
-//!   The presenter imports a ring slot's NT handle per frame (`pf-presenter/src/d3d11.rs`,
-//!   `VK_KHR_external_memory_win32`) and blits it straight into its video image — the frames
-//!   arrive as ready sRGB, no CSC pass.
-//! * Cross-API exclusion + write→read visibility ride the slot's keyed mutex
-//!   (`VK_KHR_win32_keyed_mutex`); both sides take and release it with **key 0**: a frame the
-//!   presenter drops (arrival-paced, newest wins) is simply never acquired, which a
-//!   key-ping-pong protocol would deadlock on.
-//! * An HDR (PQ/BT.2020) stream passes through when the presenter can take it (RGB10A2
-//!   import + an HDR10 swapchain — [`crate::video::VulkanDecodeDevice::d3d11_hdr10`]): the
-//!   video processor converts YCbCr G2084 → RGB G2084 into an RGB10A2 ring, colorspace
-//!   only, no tone mapping. On an SDR-only path it tone-maps to sRGB instead (input
-//!   `G2084_P2020`, output sRGB) — correct picture, no HDR presentation.
-//!
-//! The decode device is created on the **presenter's adapter** (matched by the Vulkan device's
-//! LUID) so the shared textures never cross GPUs on a multi-adapter box.
-//!
-//! Device creation ([`create_device`]) and the video-processor ring ([`HandoffRing`]) are
-//! `pub(crate)` because `video_d3d11_native` is their only consumer.
+//! PQ streams pass through as RGB10A2 when the presenter has an HDR10 swapchain
+//! ([`crate::video::VulkanDecodeDevice::d3d11_hdr10`]); otherwise the processor
+//! tone-maps to sRGB. [`create_device`] and [`HandoffRing`] are `pub(crate)`
+//! for [`crate::video_d3d11_native`].
 
 use crate::video::ColorDesc;
 use anyhow::{anyhow, Context as _, Result};
@@ -77,57 +48,39 @@ use windows::Win32::dxgi::{
 use windows::Win32::windef::RECT;
 use windows::Win32::winnt::HANDLE;
 
-/// Ring of shareable hand-off textures. Bounds how many decoded-but-unpresented frames can
-/// exist without a slot being rewritten under an in-flight older frame: the pump's decoded
-/// channel holds 2 and the presenter drains to newest with one frame in flight, so 3 are ever
-/// outstanding — 6 leaves margin without meaningful VRAM cost.
+/// Six slots: the pump holds 2 decoded frames and the presenter has one in flight, so 3 are
+/// outstanding. Double that leaves margin without meaningful VRAM cost.
 const RING_SLOTS: usize = 6;
 
-/// Keyed-mutex acquire budget (ms) on the DECODE side. The presenter holds a slot only for one
-/// submit's GPU lifetime; multiple seconds means the render thread died — surface an error
-/// (which demotes to software) instead of wedging the decode loop.
+/// Decode-side keyed-mutex acquire budget, milliseconds. The presenter holds a slot for one
+/// submit; a multi-second wait means the render thread died — error (and demote) rather than
+/// wedge the decode loop.
 const ACQUIRE_TIMEOUT_MS: u32 = 2000;
 
-/// One decoded frame, parked in a ring slot the presenter imports by NT handle. Plain POD —
-/// the ring (and its handles) belong to the decoder and outlive every in-flight frame; the
-/// presenter must NOT close the handle. Cross-API exclusion + visibility ride the slot's
-/// keyed mutex (key 0 on both sides), not this struct.
+/// One decoded frame in a ring slot the presenter imports by NT handle. The ring owns the
+/// handle for its lifetime; the presenter must not close it. Exclusion and visibility ride
+/// the slot's keyed mutex (key 0), not this struct.
 pub struct D3d11Frame {
     pub width: u32,
     pub height: u32,
-    /// What the ring slot actually CONTAINS after the video processor's conversion:
-    /// sRGB BT.709 full-range RGB normally (a PQ stream was tone-mapped), or PQ BT.2020
-    /// full-range RGB when the HDR pass-through ring is active (`rgb10`) — the presenter
-    /// keys its SDR/HDR handling off this.
+    /// Colour after the video processor: sRGB BT.709 full-range, or PQ BT.2020 full-range
+    /// when the HDR pass-through ring is active (`rgb10`). The presenter keys SDR/HDR off this.
     pub color: ColorDesc,
-    /// The ring slot's texture format: `false` = BGRA8, `true` = RGB10A2 (the HDR PQ
-    /// pass-through flavor) — the presenter's Vulkan import must match it exactly.
+    /// Slot format: `false` = BGRA8, `true` = RGB10A2. The presenter's Vulkan import must match.
     pub rgb10: bool,
-    /// Intra keyframe (IDR/I) — the pump's post-loss re-anchor signal. See
-    /// [`crate::video::DecodedImage::is_keyframe`].
+    /// Intra (IDR/I) — the pump's post-loss re-anchor. See [`crate::video::DecodedImage::is_keyframe`].
     pub keyframe: bool,
-    /// The ring slot's NT shared handle (`IDXGIResource1::CreateSharedHandle`), stable for the
-    /// ring's lifetime. Raw `isize` so the frame crosses the pump→presenter channel.
+    /// Slot NT handle (`CreateSharedHandle`), stable for the ring's lifetime. Raw `isize` so
+    /// the frame can cross the pump→presenter channel.
     pub handle: isize,
-    /// Ring generation — bumped when the ring is rebuilt (stream size change), so a
-    /// presenter-side import cache could never alias a stale handle. Informational today
-    /// (the presenter imports per frame).
+    /// Bumped when the ring is rebuilt (size or flavour change) so an import cache cannot
+    /// alias a stale handle.
     pub generation: u32,
 }
 
-// ⚠ This struct carried a `native: bool` until M10, because TWO rungs filled the ring —
-// libavcodec's D3D11VA hwaccel and `video_d3d11_native` — and both delivered
-// `DecodedImage::D3d11`, so the `stats:` decode-path tag read `d3d11va` for either and no
-// soak log could tell them apart (fixed in `1573a987`). With the libavcodec rung deleted
-// there is one filler, the tag is unconditionally `native-d3d11va`, and a permanently-true
-// flag would be a claim nothing can falsify. If a second rung ever shares this ring again,
-// the flag has to come back WITH it — the lesson is that the tag must name the rung that
-// actually wrote the pixels, not the family it belongs to.
-
-/// Create the decode device on the presenter's adapter. `luid` is the Vulkan device's
-/// `VkPhysicalDeviceIDProperties::deviceLUID` (little-endian LowPart‖HighPart) — matching it
-/// keeps the shared textures on one GPU. `None`/no match falls back to the first hardware
-/// adapter (single-GPU boxes; a WARP-only box fails out to software decode).
+/// Decode device on the presenter's adapter. `luid` is the Vulkan `deviceLUID`
+/// (little-endian LowPart‖HighPart); a match keeps shares on one GPU. `None` or no match
+/// uses the first hardware adapter. A WARP-only box fails out.
 pub(crate) fn create_device(luid: Option<[u8; 8]>) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     // SAFETY: DXGI factory creation takes no pointer and returns an owned factory or an error,
     // checked by `?`.
@@ -148,7 +101,7 @@ pub(crate) fn create_device(luid: Option<[u8; 8]>) -> Result<(ID3D11Device, ID3D
             continue;
         }
         if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE as u32 != 0 {
-            continue; // WARP can't hardware-decode; software decode covers that box anyway
+            continue; // WARP cannot hardware-decode
         }
         if fallback.is_none() {
             fallback = Some(adapter.clone());
@@ -192,39 +145,27 @@ pub(crate) fn create_device(luid: Option<[u8; 8]>) -> Result<(ID3D11Device, ID3D
     .context("D3D11CreateDevice")?;
     let device = device.ok_or_else(|| anyhow!("D3D11CreateDevice returned no device"))?;
     let context = context.ok_or_else(|| anyhow!("D3D11CreateDevice returned no context"))?;
-    // The decode video context and our copy (immediate context) run on the decode thread,
-    // and D3D11's own driver threads touch the device too — the same protection the legacy
-    // shared device enabled, and the same one libavcodec's hwdevice init used to install
-    // for us. Explicit keeps the invariant obvious now that nothing else sets it.
+    // Decode and driver threads both touch this device; without multithread protection
+    // those concurrent COM calls race.
     if let Ok(mt) = device.cast::<ID3D11Multithread>() {
-        // Returns the PREVIOUS protection state — nothing to act on.
         // SAFETY: a COM call on the live `ID3D11Multithread` from a checked `cast`; it takes a
-        // BOOL and returns the previous state.
+        // BOOL and returns the previous protection state, which we ignore.
         let _ = unsafe { mt.SetMultithreadProtected(true) };
     }
     Ok((device, context))
 }
 
-/// Can this adapter's video processor actually CONVERT a PQ decode surface to sRGB — the
-/// tonemap [`HandoffRing::present`] relies on for a PQ stream whenever the presenter has no
-/// HDR10 swapchain to pass it through ([`crate::video::VulkanDecodeDevice::d3d11_hdr10`]
-/// false)?
+/// Whether this adapter's video processor can convert a PQ decode surface to sRGB —
+/// the tonemap [`HandoffRing::present`] uses when the presenter has no HDR10 swapchain
+/// ([`crate::video::VulkanDecodeDevice::d3d11_hdr10`] false).
 ///
-/// Asked because setting the colorspaces is not a negotiation: `VideoProcessorSetStream/
-/// OutputColorSpace1` accept anything, and `VideoProcessorBlt` succeeds either way — a
-/// driver that cannot do the conversion renders garbage instead of failing. The host
-/// records the sibling failure on NVIDIA in `pf-capture`'s `VideoConverter` docs (RGB→P010
-/// "renders green"); field report 2026-08-26 is this direction on the client: an Arc A370M
-/// went green on every HDR session while AV1 8-bit SDR at the same 2880x1620@120 streamed
-/// clean.
-///
-/// One throwaway device + enumerator on the presenter's adapter, asked the exact pair the
-/// SDR ring sets: P010 `YCBCR_STUDIO_G2084_LEFT_P2020` in, BGRA8 `RGB_FULL_G22_NONE_P709`
-/// out. Only the driver's definitive "no" answers `false`; an API failure answers `true`
-/// (today's behaviour) — a box whose D3D11 is broken enough to fail the probe fails
-/// D3D11VA construction too, and PQ then presents through a rung whose tonemap is our own
-/// shader. Cost is a few ms, paid once per connect and only on the path that needs the
-/// answer (`crate::video::hdr_presentable` short-circuits it away everywhere else).
+/// Setting the colorspaces is not a negotiation: `VideoProcessorSetStream/OutputColorSpace1`
+/// accept anything and `VideoProcessorBlt` succeeds either way. A driver that cannot
+/// convert renders garbage. Probe the SDR-ring pair: P010 `YCBCR_STUDIO_G2084_LEFT_P2020`
+/// in, BGRA8 `RGB_FULL_G22_NONE_P709` out. Only a definitive "no" answers `false`; an
+/// API failure answers `true` — a box whose D3D11 fails the probe fails D3D11VA
+/// construction too. Paid once per connect; [`crate::video::hdr_presentable`] skips it
+/// elsewhere.
 pub(crate) fn pq_tonemap_supported(luid: Option<[u8; 8]>) -> bool {
     fn probe(luid: Option<[u8; 8]>) -> Result<bool> {
         let (device, _context) = create_device(luid)?;
@@ -285,14 +226,12 @@ pub(crate) fn pq_tonemap_supported(luid: Option<[u8; 8]>) -> bool {
     }
 }
 
-/// One shareable ring slot: the NV12/P010 texture, its keyed mutex, and the NT handle the
-/// presenter imports. Handle closed on drop (the presenter never owns it).
+/// Shareable RGBA slot. The NT handle is closed on drop; the presenter never owns it.
 struct Slot {
-    /// The shared texture itself — everything below views into it; kept for its lifetime.
+    /// Shared texture the views below point at; kept so they stay valid.
     _tex: ID3D11Texture2D,
     mutex: IDXGIKeyedMutex,
     handle: HANDLE,
-    /// The video processor's render target over the texture — `VideoProcessorBlt`'s target.
     out_view: ID3D11VideoProcessorOutputView,
 }
 
@@ -306,8 +245,8 @@ impl Drop for Slot {
     }
 }
 
-/// The hand-off ring + the video processor that fills it (both sized to the stream, so a
-/// mid-stream `Reconfigure` rebuilds the whole bundle). See the module docs.
+/// Video processor plus shareable slots, both sized to the stream. A mid-stream
+/// `Reconfigure` rebuilds the whole bundle.
 struct SharedRing {
     slots: Vec<Slot>,
     vp: ID3D11VideoProcessor,
@@ -316,8 +255,7 @@ struct SharedRing {
     height: u32,
     next: usize,
     generation: u32,
-    /// HDR flavor: RGB10A2 slots the processor fills with PQ BT.2020 RGB (colorspace
-    /// conversion only — both sides G2084, no tone mapping). `false` = BGRA8 sRGB.
+    /// `true` = RGB10A2 PQ BT.2020 (colorspace only, both sides G2084). `false` = BGRA8 sRGB.
     pq_out: bool,
 }
 
@@ -330,8 +268,7 @@ impl SharedRing {
         generation: u32,
         pq_out: bool,
     ) -> Result<SharedRing> {
-        // The video processor: NV12/P010 in, BGRA8 out, 1:1 (no scaling — the Vulkan side
-        // scales at composite time like every other path). Frame rates are advisory.
+        // 1:1, no scaling — Vulkan scales at composite. Frame rates are advisory.
         let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
             InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
             InputFrameRate: DXGI_RATIONAL {
@@ -361,10 +298,8 @@ impl SharedRing {
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            // Single-plane RGB: the ONLY hand-off family whose Vulkan import is a
-            // universally exercised driver path (see the module docs — NV12 import TDRs
-            // on NVIDIA despite being advertised). RGB10A2 for the HDR pass-through
-            // flavor (gated on the presenter's probe), BGRA8 otherwise.
+            // Single-plane RGB: NV12 D3D11→Vulkan import TDRs on NVIDIA. RGB10A2 for
+            // HDR pass-through, BGRA8 otherwise.
             Format: if pq_out {
                 DXGI_FORMAT_R10G10B10A2_UNORM
             } else {
@@ -375,7 +310,6 @@ impl SharedRing {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            // RENDER_TARGET: the video processor's output view renders into it.
             BindFlags: (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET) as u32,
             CPUAccessFlags: 0,
             MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)
@@ -451,58 +385,41 @@ impl SharedRing {
     }
 }
 
-/// One decoded picture, as [`HandoffRing::present`] needs to see it.
-///
-/// A struct rather than seven positional parameters because six of them are integers and
-/// booleans: a caller that swaps `width` and `height`, or `array_slice` and a dimension,
-/// compiles clean and renders a wrong picture. Named fields make each of those a build error.
+/// One decoded picture for [`HandoffRing::present`]. Named fields so a swapped
+/// `width`/`height` or `array_slice` is a build error, not a wrong picture.
 pub(crate) struct HandoffSource<'a> {
-    /// The decode pool's texture ARRAY — the pool `video_d3d11_native` created.
+    /// Decode-pool texture array from `video_d3d11_native`.
     pub texture: &'a ID3D11Texture2D,
-    /// The picture's slice within that array — the decoder's DPB slot, which IS the DXVA
-    /// surface index.
+    /// Slice in that array: the decoder's DPB slot, which is the DXVA surface index.
     pub array_slice: u32,
-    /// The FRAME size. The surface is taller (DXVA alignment), which is exactly what the
-    /// stream source rect excludes — see the blit below.
+    /// Frame size, not the DXVA-aligned surface. The blit source rect uses this so
+    /// padding rows stay out of the picture.
     pub width: u32,
     pub height: u32,
-    /// The picture's colour signalling, per frame and never latched (the host flips PQ
-    /// in-band with a new SPS).
+    /// Per-frame colour signalling; never latched — the host flips PQ in-band with a new SPS.
     pub color: ColorDesc,
-    /// Intra keyframe (IDR/I) — the pump's post-loss re-anchor signal.
+    /// Intra (IDR/I) — the pump's post-loss re-anchor.
     pub keyframe: bool,
-    /// Which decoder produced it, for the one-time layout log a field report leans on.
+    /// Decoder name for [`log_layout_once`]; the key includes it so a demotion logs the new rung.
     pub decoder: &'a str,
 }
 
-/// The shipping hand-off: the video processor, its ring of shareable RGBA textures, and the
-/// D3D11 objects they live on. Everything from "here is a decoded NV12/P010 surface" to "here
-/// is a [`D3d11Frame`] the presenter can import".
-///
-/// Extracted verbatim from `D3d11vaDecoder`, the libavcodec D3D11VA rung that owned this ring
-/// until M10 deleted it, so the M5 native rung ([`crate::video_d3d11_native`]) filled the
-/// identical ring rather than growing a second copy of it: this is the half with the field
-/// history (the NVIDIA NV12-import TDR, the Intel green bar, the keyed-mutex protocol), and two
-/// copies of it would have been two chances to lose that history. Nothing about the hand-off
-/// changed in the extraction; only its owner did, and today that owner is the sole one.
+/// Video processor, shareable RGBA ring, and the D3D11 objects they live on.
+/// Turns a decoded NV12/P010 surface into a [`D3d11Frame`] the presenter can import.
 pub(crate) struct HandoffRing {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    /// Creates the per-ring video processor + views.
     video_device: ID3D11VideoDevice,
-    /// Runs the per-frame `VideoProcessorBlt`; the `1` interface for the DXGI colour-space
-    /// setters (Win10 1703+, universally present — init fails to software without it).
+    /// `1` for the DXGI colour-space setters (Win10 1703+). Init fails to software without it.
     video_context1: ID3D11VideoContext1,
     ring: Option<SharedRing>,
-    /// The presenter can import RGB10A2 AND offers an HDR10 swapchain
-    /// ([`crate::video::VulkanDecodeDevice::d3d11_hdr10`]) — PQ streams get the HDR
-    /// pass-through ring; without it they keep the tonemap-to-sRGB ring.
+    /// Presenter can import RGB10A2 and has an HDR10 swapchain
+    /// ([`crate::video::VulkanDecodeDevice::d3d11_hdr10`]). PQ then uses the pass-through ring.
     hdr10_out: bool,
 }
 
 impl HandoffRing {
-    /// Take the interfaces the hand-off needs off a decode device, up front — their absence
-    /// must route the session to another rung NOW, not burn the opening IDR.
+    /// Bind the video interfaces now. Missing them must fail the rung before the opening IDR.
     pub(crate) fn new(
         device: ID3D11Device,
         context: ID3D11DeviceContext,
@@ -524,17 +441,14 @@ impl HandoffRing {
         })
     }
 
-    /// The video device, for a caller that also needs it (the native rung enumerates decode
-    /// profiles and creates its decoder through the same interface).
+    /// Same `ID3D11VideoDevice` the native rung enumerates decode profiles on.
     pub(crate) fn video_device(&self) -> &ID3D11VideoDevice {
         &self.video_device
     }
 
-    /// Convert one decoded surface into the next ring slot (`VideoProcessorBlt`, NV12/P010 →
-    /// BGRA8/RGB10A2) under its keyed mutex and describe the hand-off. The mutex acquire also
-    /// back-pressures against the presenter still reading this slot (only possible if the
-    /// stream runs `RING_SLOTS` ahead of present).
-    ///
+    /// Blit one decoded surface into the next ring slot under its keyed mutex.
+    /// The acquire also back-pressures if the presenter is still reading this slot
+    /// (only possible `RING_SLOTS` frames ahead of present).
     pub(crate) fn present(&mut self, source: HandoffSource<'_>) -> Result<D3d11Frame> {
         let HandoffSource {
             texture: src,
@@ -549,10 +463,9 @@ impl HandoffRing {
         let video_device = self.video_device.clone();
         let video_context1 = self.video_context1.clone();
         let context = self.context.clone();
-        // (Re)build the ring + video processor on first use, a stream size change, or a
-        // flavor change (the host flips PQ in-band; SDR↔HDR swaps the slot format, so
-        // it rebuilds like a resize — bit DEPTH alone still never rebuilds: an SDR
-        // 10-bit stream and an 8-bit one share the same output flavor).
+        // Rebuild on first use, size change, or SDR↔HDR flavour change (PQ flips in-band
+        // and swaps the slot format). Bit depth alone does not: SDR 10-bit and 8-bit
+        // share the same output flavour.
         let pq_out = self.hdr10_out && color.is_pq();
         let rebuild = self
             .ring
@@ -580,7 +493,7 @@ impl HandoffRing {
         // this method's contract. Out-params are local `Option`s checked before use; the
         // `ManuallyDrop` refs the stream struct carries are balanced explicitly below.
         unsafe {
-            // Input view over THIS slice of the decode array (cheap per-frame object).
+            // Per-frame view over this DPB slice.
             let mut iv_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
                 FourCC: 0, // surface format speaks for itself
                 ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
@@ -595,12 +508,9 @@ impl HandoffRing {
                 .context("CreateVideoProcessorInputView")?;
             let in_view = in_view.expect("input view created");
 
-            // Colour spaces per frame (the host flips PQ in-band): YCbCr in, sRGB out — a PQ
-            // stream is tone-mapped to SDR by the processor (module docs). CICP → DXGI enums.
-            // BT.601 (5/6) matters in practice: a Linux host's RGB-input NVENC paths signal
-            // BT470BG limited (NVENC's fixed internal RGB→YUV is BT.601 — ffmpeg force-writes
-            // that VUI), and mapping it to P709 here was a constant hue error on those streams.
-            // DXGI has no full-range G2084 YCbCr enum, so PQ is studio regardless of range.
+            // Per-frame CICP → DXGI (host flips PQ in-band). Matrix 5/6 is BT.601; mapping
+            // it to P709 is a hue error (NVENC's RGB→YUV is BT.601). DXGI has no full-range
+            // G2084 YCbCr enum, so PQ is studio regardless of range.
             let in_cs = match (color.transfer, color.matrix, color.full_range) {
                 (16, _, _) => DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
                 (_, 9 | 10, false) => DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020,
@@ -610,14 +520,10 @@ impl HandoffRing {
                 (_, _, true) => DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709,
                 _ => DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
             };
-            // The DECODE surface is DXVA-aligned (height rounded up to the profile's
-            // macroblock/tile alignment — 128 for HEVC/AV1), so it is TALLER than the
-            // frame: a 2400-line stream decodes into a 2432-line texture. Without an
-            // explicit source rect the processor blits the WHOLE surface — the padding
-            // rows (uninitialized NV12: Y=0,U=V=0, which converts to vivid green) land at
-            // the bottom of the output and the picture is squashed to fit. Clamp the
-            // source to the real frame; the dest stays the whole (frame-sized) slot.
-            // Live-hit on Intel 3840x2400 as a ~32 px green bar (2026-07-19).
+            // DXVA-aligned surfaces are taller than the frame (HEVC/AV1 round to 128).
+            // Without a source rect the processor blits the padding too: uninit NV12
+            // (Y=0,U=V=0) converts to green at the bottom and the picture is squashed.
+            // Clamp to the real frame; dest stays the (frame-sized) slot.
             video_context1.VideoProcessorSetStreamSourceRect(
                 &ring.vp,
                 0,
@@ -632,9 +538,8 @@ impl HandoffRing {
             video_context1.VideoProcessorSetStreamColorSpace1(&ring.vp, 0, in_cs);
             video_context1.VideoProcessorSetOutputColorSpace1(
                 &ring.vp,
-                // HDR ring: PQ in, PQ out — a pure colorspace conversion (YCbCr→RGB),
-                // no tone mapping; the presenter passes the values through to its HDR10
-                // swapchain. SDR ring: sRGB out (a PQ stream is tone-mapped here).
+                // HDR ring: PQ in, PQ out (YCbCr→RGB, no tone map). SDR ring: sRGB out
+                // (PQ is tone-mapped here).
                 if ring.pq_out {
                     DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
                 } else {
@@ -669,8 +574,8 @@ impl HandoffRing {
             let release = slot.mutex.ReleaseSync(0);
             blt.ok().context("VideoProcessorBlt")?;
             release.ok().context("keyed-mutex release")?;
-            // Get the conversion moving now — the presenter's GPU-side acquire waits on its
-            // completion, and an unflushed deferred batch would add a driver-decided delay.
+            // Flush now: the presenter's GPU acquire waits on this blit; an unflushed
+            // deferred batch adds a driver-decided delay.
             context.Flush();
 
             let mut src_desc = D3D11_TEXTURE2D_DESC::default();
@@ -687,9 +592,7 @@ impl HandoffRing {
             Ok(D3d11Frame {
                 width,
                 height,
-                // What the slot now CONTAINS. HDR ring: PQ BT.2020 full-range RGB (the
-                // presenter reads is_pq() and flips its HDR10 swapchain). SDR ring: sRGB
-                // BT.709 full-range RGB (PQ was tone-mapped above).
+                // Slot contents after the blit, not the source signalling.
                 color: if ring.pq_out {
                     ColorDesc {
                         primaries: 9,
@@ -714,18 +617,12 @@ impl HandoffRing {
     }
 }
 
-/// One-time dump of the first decoded surface's layout — the forensics for a new GPU/driver.
-/// `tex_*` is the DXVA-aligned decode surface (>= the frame); the gap is the padding the
-/// stream source rect excludes.
+/// One-time layout log of a decoded surface. `tex_*` is the DXVA-aligned pool
+/// (>= the frame); the gap is the padding the source rect excludes.
 ///
-/// Keyed by DECODER × LAYOUT rather than latched once per process. Decoder, because two
-/// rungs shared this hand-off until M10 and a process-wide latch left whichever rung a
-/// session demoted onto undocumented in exactly the report that needs it. Layout
-/// (frame + pool dims + PQ), because a mid-stream `Reconfigure` or in-band SDR↔PQ flip
-/// rebuilds the decode pool at a new shape, and a latch keyed on the decoder alone left
-/// the frame-vs-padding relationship — the very thing a green-bar/smear report hinges
-/// on — logged only for the shape the session STARTED at. `slice` stays out of the key:
-/// it varies per frame and would turn one line per shape into one per DPB slot.
+/// Keyed by decoder × (frame, pool, PQ) so a demotion or mid-stream `Reconfigure`
+/// logs the new shape. `slice` stays out of the key: it varies per frame and
+/// would log once per DPB slot.
 fn log_layout_once(
     width: u32,
     height: u32,
@@ -740,8 +637,7 @@ fn log_layout_once(
     type LayoutKey = (String, u32, u32, u32, u32, bool);
     static SEEN: OnceLock<Mutex<HashSet<LayoutKey>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    // A poisoned lock costs a log line, never a frame: a panic while holding it can only have
-    // happened inside the set, and the worst outcome of ignoring it is a repeated line.
+    // Poison costs a log line, never a frame: ignore it and the worst case is a repeat.
     let first = match seen.lock() {
         Ok(mut seen) => seen.insert((decoder.to_owned(), width, height, tex_w, tex_h, pq)),
         Err(_) => false,
@@ -760,16 +656,12 @@ fn log_layout_once(
     }
 }
 
-/// This desktop's HDR colour volume (`IDXGIOutput6::GetDesc1`) → the Hello's
-/// `display_hdr`, so the host's virtual-display EDID matches THIS panel instead of its
-/// generic defaults (host apps then tone-map to the real glass). `pos` picks the output
-/// containing that desktop point — the `--window-pos` monitor, where the stream window
-/// will open; no `pos` or no match falls back to the output holding the desktop origin
-/// (the primary). Returns `None` when that output's advanced color is off (an SDR
-/// colorspace): claiming an HDR volume for a desktop that won't present HDR would steer
-/// host tone mapping wrong, and the host's EDID defaults are the honest answer there.
-/// (`PUNKTFUNK_CLIENT_PEAK_NITS` still overrides whatever this reports — see
-/// `punktfunk_core::client::display_hdr_env_override`.)
+/// This desktop's HDR volume (`IDXGIOutput6::GetDesc1`) for Hello `display_hdr`, so
+/// the host EDID matches this panel. `pos` selects the output containing that point
+/// (`--window-pos`); no `pos` or no match uses the output at the desktop origin.
+/// `None` when advanced color is off — claiming HDR for an SDR desktop would steer
+/// host tone-mapping wrong. `PUNKTFUNK_CLIENT_PEAK_NITS` still overrides; see
+/// `punktfunk_core::client::display_hdr_env_override`.
 pub fn display_hdr_volume(pos: Option<(i32, i32)>) -> Option<punktfunk_core::quic::HdrMeta> {
     use windows::Win32::dxgi::{IDXGIOutput6, DXGI_OUTPUT_DESC1};
     // SAFETY: plain DXGI factory creation — no arguments to get wrong; the returned

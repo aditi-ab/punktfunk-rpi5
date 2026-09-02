@@ -1,12 +1,9 @@
-//! The pipeline spike (plan §8): capture → NVENC encode → playable file, with the
-//! encoded access units also fed through a `punktfunk_core` host→client `Session` over an
-//! in-process loopback to prove the core's FEC + packetize + reassemble path on real
-//! encoder output.
+//! One-thread capture → encode → playable file. Optional in-process
+//! `punktfunk_core` host→client loopback of each AU (FEC, packetize, reassemble).
 //!
-//! This is the spike runner, not the production host path: it drives the stages on one thread (the
-//! per-stage-thread pipeline with bounded channels is [`crate::pipeline`]). Source is
-//! either a synthetic BGRx test pattern (no capture session needed) or the live xdg
-//! ScreenCast portal monitor.
+//! Not the production host path; that is [`crate::pipeline`]. Sources are a
+//! synthetic BGRx pattern, a Windows synthetic NV12 GPU texture, the xdg
+//! ScreenCast portal, or a compositor virtual output.
 
 use crate::capture::{self, Capturer, SyntheticCapturer};
 use crate::encode::{self, Codec, EncodedFrame, Encoder};
@@ -20,44 +17,33 @@ use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
-    /// Deterministic moving BGRx test pattern — no capture session required.
+    /// Moving BGRx test pattern. No capture session.
     Synthetic,
-    /// Deterministic moving NV12 texture on the GPU (Windows only) — no capture session required.
-    /// Feeds the native AMF / D3D11 zero-copy encoders, which demand an NV12 GPU texture the CPU
-    /// `Synthetic` source can't give them. Used to validate GPU-encoder behaviour (e.g. AMF
-    /// intra-refresh) headlessly.
+    /// Windows-only moving NV12 GPU texture. AMF / D3D11 zero-copy encoders need
+    /// this; the CPU `Synthetic` source cannot feed them.
     SyntheticNv12,
     /// Live monitor via the xdg ScreenCast portal + PipeWire.
     Portal,
-    /// KWin virtual output created at `width`x`height` (zkde_screencast). Lets us validate
-    /// capture (and zero-copy) at an arbitrary client resolution against a headless KWin.
+    /// Compositor virtual output at `width`×`height` (zkde_screencast / equivalent).
     KwinVirtual,
 }
 
 #[derive(Clone, Debug)]
 pub struct Options {
     pub source: Source,
-    /// Synthetic-only; the portal source uses the PipeWire-negotiated size.
+    /// Synthetic / virtual-output size. Portal uses the PipeWire-negotiated size.
     pub width: u32,
     pub height: u32,
     pub fps: u32,
     pub seconds: u32,
     pub codec: Codec,
     pub bitrate_bps: u64,
-    /// Raw Annex-B elementary-stream sink (`.h265`/`.h264`/`.ivf-less .obu`); playable.
+    /// Annex-B elementary-stream path (`.h265`/`.h264`/`.obu`).
     pub out: PathBuf,
-    /// Also round-trip every AU through a `punktfunk_core` host→client loopback and verify.
     pub loopback: bool,
-    /// PyroWave datagram-aligned packetization at this shard payload
-    /// ([`Encoder::set_wire_chunking`], plan §4.4) — what a real session passes from its
-    /// negotiated `shard_payload`. `None` = the dense one-packet-per-AU shape.
-    ///
-    /// This is also the switch that makes the STREAMED-AU wire reachable from the spike: with
-    /// it set and `PUNKTFUNK_PYROWAVE_STREAMED_AU=1` armed, the encoder's `poll_chunk` hands the
-    /// AU out in window-aligned pieces and the loopback seals them through
-    /// `begin_streamed_frame_at`/`seal_streamed_chunk`/`seal_streamed_finish` — the same path a
-    /// `VIDEO_CAP_STREAMED_AU` client drives. Without it there is no way to exercise PW6 end to
-    /// end outside a real client session.
+    /// Shard payload for [`Encoder::set_wire_chunking`]. `None` is one packet per AU.
+    /// Set this and `PUNKTFUNK_PYROWAVE_STREAMED_AU=1` to drain via `poll_chunk` and
+    /// the streamed-AU loopback; without both, that path cannot run here.
     pub wire_chunk: Option<usize>,
 }
 
@@ -98,15 +84,13 @@ pub fn run(opts: Options) -> Result<()> {
             }
         }
         Source::Portal => {
-            // PUNKTFUNK_SPIKE_HDR=1: run the GNOME 50+ HDR offer (10-bit PQ dmabufs) — the dev
-            // validation lever for the Linux HDR capture path without a full GameStream client.
+            // `PUNKTFUNK_SPIKE_HDR=1` asks the portal for 10-bit PQ dmabufs (GNOME HDR offer).
             let want_hdr = std::env::var("PUNKTFUNK_SPIKE_HDR").as_deref() == Ok("1");
             tracing::info!(
                 want_hdr,
                 "spike source: xdg ScreenCast portal (live monitor)"
             );
-            // Embedded cursor: the spike passes `cursor_blend = false` to its encoder open, so
-            // a metadata pointer would be composited by nothing.
+            // Encoder open passes `cursor_blend = false`, so a metadata pointer would composite nowhere.
             capture::open_portal_monitor(want_hdr, false).context("open portal capturer")?
         }
         Source::KwinVirtual => {
@@ -125,15 +109,10 @@ pub fn run(opts: Options) -> Result<()> {
                     refresh_hz: opts.fps,
                 })
                 .context("create virtual output")?;
-            // `resolve` is the shared GameStream/spike constructor and hard-codes `pyrowave: false`
-            // (GameStream never negotiates it). The spike DOES know its codec, and on Linux that
-            // flag is what puts the capture on the raw-dmabuf passthrough
-            // (`ZeroCopyPolicy::pyrowave_session`, set from the same comparison in
-            // `session_plan::output_format`). Left false, `--codec pyrowave` encoded PyroWave off a
-            // capture negotiated for somebody else, and the only way to exercise the real path was
-            // the host-global `PUNKTFUNK_ENCODER=pyrowave` lever — which ALSO flips
-            // `backend_is_vaapi`, so it cannot reproduce a per-session PyroWave negotiation on an
-            // auto/NVENC host at all. That is precisely the configuration PW2 exists for.
+            // `OutputFormat::resolve` hard-codes `pyrowave: false` (GameStream never
+            // negotiates it). On Linux that flag is raw-dmabuf passthrough; overwrite
+            // from the spike codec so `--codec pyrowave` does not encode off a
+            // non-PyroWave capture.
             let mut want =
                 capture::OutputFormat::resolve(false, crate::encode::resolved_backend_is_gpu());
             want.pyrowave = opts.codec == Codec::PyroWave;
@@ -147,12 +126,9 @@ pub fn run(opts: Options) -> Result<()> {
         }
     };
 
-    // Activate the capturer so the portal/PipeWire process callback actually delivers frames
-    // (it gates the per-frame de-pad on `active`; idle by default so reconnects are cheap).
+    // Portal/PipeWire delivers frames only while `active`; idle by default so reconnects are cheap.
     capturer.set_active(true);
 
-    // The first frame establishes the authoritative dimensions (the portal's negotiated
-    // size, or the synthetic size) used to configure the encoder.
     let first = capturer.next_frame().context("capture first frame")?;
     let (w, h) = (first.width, first.height);
     tracing::info!(
@@ -171,15 +147,14 @@ pub fn run(opts: Options) -> Result<()> {
         opts.fps,
         opts.bitrate_bps,
         first.is_cuda(),
-        8,                            // spike synthetic harness: 8-bit
-        encode::ChromaFormat::Yuv420, // ...and 4:2:0
-        false,                        // synthetic frames carry no cursor
-        4,                            // no client decoder — keep the backend's multi-slice default
+        8, // 8-bit; spike has no HDR client
+        encode::ChromaFormat::Yuv420,
+        false, // no cursor to blend
+        4,     // no client decoder; keep the backend multi-slice default
     )
     .context("open encoder")?;
 
-    // Datagram-aligned packetization (§4.4) — and, with the PW6 knob armed, the gate that makes
-    // `supports_chunked_poll()` true so the drain below takes the streamed-AU path.
+    // Also the gate for `supports_chunked_poll()` (needs `PUNKTFUNK_PYROWAVE_STREAMED_AU=1`).
     if let Some(c) = opts.wire_chunk {
         encoder.set_wire_chunking(c);
         tracing::info!(
@@ -229,7 +204,7 @@ pub fn run(opts: Options) -> Result<()> {
         out = %opts.out.display(),
         elapsed_s = format!("{elapsed:.2}"),
         encode_fps = format!("{:.1}", stats.encoded as f64 / elapsed.max(1e-9)),
-        // 0 = the whole-AU drain; > encoded = the streamed drain actually cut AUs into pieces.
+        // 0 = whole-AU drain; > encoded = streamed drain cut AUs into pieces.
         chunks = stats.chunks,
         chunks_per_au = format!(
             "{:.1}",
@@ -258,8 +233,7 @@ struct Stats {
     encoded: u64,
     keyframes: u64,
     bytes_out: u64,
-    /// Streamed-AU drain only: total chunks polled across all AUs (1 per AU means the cut never
-    /// engaged — the knob is off or the AU fits one chunk).
+    /// Streamed-AU drain only. 1 per AU means the cut never engaged.
     chunks: u64,
 }
 
@@ -269,9 +243,7 @@ fn drain_encoder(
     mut lb: Option<&mut Loopback>,
     stats: &mut Stats,
 ) -> Result<()> {
-    // Streamed-AU drain (PW6): the encoder hands the finished AU out in shard-aligned pieces and
-    // the loopback seals each piece as it arrives, exactly as the native host's send thread does.
-    // Re-queried per drain, never cached — the trait's contract.
+    // Re-query `supports_chunked_poll` each drain; the trait does not promise a stable answer.
     if encoder.supports_chunked_poll() {
         return drain_encoder_chunked(encoder, sink, lb, stats);
     }
@@ -289,11 +261,8 @@ fn drain_encoder(
     Ok(())
 }
 
-/// The streamed-AU drain. Each chunk is sealed into the open wire frame the moment it is polled;
-/// the concatenation is kept only so the completed AU can still be written to the file sink and
-/// byte-compared against what the client reassembled — which is the point of the leg: it proves
-/// the chunks the encoder cut, sealed through the sentinel-block wire, reassemble to EXACTLY the
-/// AU `poll()` would have produced.
+/// Seal each chunk as it is polled. Concatenate only for the file sink and the
+/// loopback byte-compare against what `poll()` would have produced.
 fn drain_encoder_chunked(
     encoder: &mut dyn Encoder,
     sink: &mut impl Write,
@@ -332,9 +301,8 @@ fn drain_encoder_chunked(
     Ok(())
 }
 
-/// A host↔client `punktfunk_core` pair over a lossless in-process loopback. Each encoded AU is
-/// FEC-protected, packetized, sent, then reassembled on the client and byte-compared to the
-/// original — exercising the core on real encoder output (the spike "feed into a Session" goal).
+/// In-process host↔client `punktfunk_core` pair. Each AU is FEC-protected,
+/// packetized, sent, reassembled, and byte-compared to the original.
 struct Loopback {
     host: Session,
     client: Session,
@@ -342,13 +310,11 @@ struct Loopback {
     recovered: u64,
     mismatches: u64,
     bytes: u64,
-    /// The streamed AU currently open (PW6). `Some` strictly between `streamed_begin` and
-    /// `streamed_finish`, mirroring the native send thread's `StreamedOpen`.
+    /// Open streamed AU. `Some` only between `streamed_begin` and `streamed_finish`.
     open: Option<punktfunk_core::packet::StreamedAu>,
-    /// Wire frame index for the streamed path. `submit_frame` uses the packetizer's internal
-    /// counter and `begin_streamed_frame_at` takes an explicit one; a session must use ONE
-    /// numbering style, and the spike never mixes them (`supports_chunked_poll()` is constant
-    /// for a PyroWave session, so every AU takes the same route).
+    /// Explicit wire-frame index for the streamed path. `submit_frame` uses the
+    /// packetizer's counter; `begin_streamed_frame_at` takes this. A session
+    /// must use one style.
     next_index: u32,
 }
 
@@ -371,9 +337,7 @@ impl Loopback {
         })
     }
 
-    /// Open a streamed AU on the wire (PW6). The client side needs no opt-in: a streamed frame
-    /// completes exactly like a whole one and is handed up as a single `Frame` — which is the
-    /// finding this leg exists to demonstrate rather than assert.
+    /// Client needs no opt-in; a streamed frame surfaces as one `Frame`, same as a whole AU.
     fn streamed_begin(&mut self, pts_ns: u64, keyframe: bool) -> Result<()> {
         if self.open.is_some() {
             return Err(anyhow!(
@@ -394,8 +358,7 @@ impl Loopback {
         Ok(())
     }
 
-    /// Seal + send one encoder chunk. The returned batch is often EMPTY (the sealer buffers
-    /// until a whole FEC block accumulates) — that is the normal case, not an error.
+    /// Seal + send one encoder chunk. An empty batch is normal: the sealer waits for a full FEC block.
     fn streamed_chunk(&mut self, data: &[u8]) -> Result<()> {
         let au = self
             .open
@@ -408,7 +371,7 @@ impl Loopback {
         self.send(wires)
     }
 
-    /// Close the AU (final block carries the real totals) and verify what the client got.
+    /// Final block carries the real totals. Then verify the client reassembly.
     fn streamed_finish(&mut self, expect: &[u8]) -> Result<()> {
         let au = self
             .open
@@ -437,7 +400,6 @@ impl Loopback {
         Ok(())
     }
 
-    /// Drain whatever the client can now reassemble and byte-compare it to `expect`.
     fn verify(&mut self, expect: &[u8]) -> Result<()> {
         loop {
             match self.client.poll_frame() {
@@ -472,7 +434,7 @@ impl Loopback {
         self.submitted += 1;
         self.bytes += au.data.len() as u64;
 
-        // Lossless + in-order loopback: each submit yields exactly the AU just sent.
+        // Lossless in-order loopback: each submit yields exactly the AU just sent.
         loop {
             match self.client.poll_frame() {
                 Ok(frame) => {

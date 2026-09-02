@@ -1,8 +1,10 @@
-//! The Windows transcript's bookends: what was detected, what was chosen, what to do next.
+//! Windows transcript bookends: detected, chosen, what to do next.
 //!
-//! Sibling of `report.rs`, same `Reporter` vocabulary, Windows words. The outro carries the
-//! D11 and D12 footnotes — the moved console port and the unreachable-host warning are the
-//! two facts a user must leave the installer knowing.
+//! Sibling of `report.rs`: same `Reporter` vocabulary, Windows words. The outro
+//! is the two facts a user must leave knowing — the moved management port when a
+//! competitor is live, and the unreachable-host warning when the network is Public.
+//!
+//! Goldens pin the strings. Design: `design/installer-v2-windows.md`.
 
 use super::choices::{NetworkAnswer, WinChoices};
 use super::plan::Artifact;

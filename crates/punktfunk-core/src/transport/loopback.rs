@@ -7,7 +7,6 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// One direction of the link.
 struct Channel {
     queue: Mutex<VecDeque<Vec<u8>>>,
     /// Drop one of every `drop_period` packets (0 = lossless).
@@ -27,14 +26,13 @@ impl Channel {
     }
 }
 
-/// Sends on `tx`, receives on `rx`. Created in cross-wired pairs by [`loopback_pair`].
+/// Cross-wired pair half, created by [`loopback_pair`].
 pub struct LoopbackTransport {
     tx: Arc<Channel>,
     rx: Arc<Channel>,
 }
 
 impl LoopbackTransport {
-    /// Number of packets this transport's send side has deliberately dropped.
     pub fn dropped(&self) -> u64 {
         self.tx.dropped.load(Ordering::Relaxed)
     }
@@ -60,10 +58,8 @@ impl Transport for LoopbackTransport {
     fn send(&self, packet: &[u8]) -> std::io::Result<bool> {
         let n = self.tx.sent.fetch_add(1, Ordering::Relaxed);
         if self.tx.drop_period != 0 && (n % self.tx.drop_period as u64) == 0 {
-            // Deterministically drop in flight (the 1st of each `drop_period` group). This models
-            // NETWORK loss (the packet left the sender, then vanished), not a local send-buffer
-            // drop — so it still reports `Ok(true)`: the host sent it; the recv/FEC side handles
-            // the loss. (`Ok(false)` is reserved for a real WouldBlock send-buffer overflow.)
+            // Network loss: the packet left the sender, then vanished. Report `Ok(true)`
+            // so recv/FEC handle it. `Ok(false)` is reserved for WouldBlock send-buffer overflow.
             self.tx.dropped.fetch_add(1, Ordering::Relaxed);
             return Ok(true);
         }

@@ -1,37 +1,16 @@
-//! MTU resilience for the video data plane (the "connects fine, black screen forever" field
-//! shape).
+//! MTU clamp and jumbo grow for the video data plane.
 //!
-//! Video datagrams are sealed at a per-session `shard_payload` sized for a clean 1500-byte MTU
-//! (1472-byte UDP payloads). A host whose route to the client runs through a smaller-MTU hop —
-//! a VPN/overlay adapter (Tailscale/WARP/ZeroTier default to 1280) claiming the LAN route, or a
-//! lowered NIC MTU — delivers every SMALL flow (QUIC control, hole punch, input, audio) while
-//! 100 % of video datagrams die by fragmentation or local `WSAEMSGSIZE`: the client sits on a
-//! black screen reporting `loss_ppm=0` (it can't see gaps in packets it never saw any of) and
-//! the host streams into the void with every gauge green. Neither side observes the failure
-//! directly — but the control connection CAN: its MTU discovery probes up to exactly the sealed
-//! video-datagram size ([`video_datagram_udp_ceiling`], set in `quic/endpoint.rs`), so its
-//! settled MTU is a verdict on the path.
+//! Video datagrams are sealed at a per-session `shard_payload` sized for a
+//! 1500-byte MTU. A smaller hop still carries QUIC control while every video
+//! datagram dies to fragmentation or `WSAEMSGSIZE`; the client reports
+//! `loss_ppm=0`. Control discovery probes up to
+//! [`video_datagram_udp_ceiling`], so a settled MTU below that is the path
+//! verdict.
 //!
-//! Three legs, none of which changes a session on a healthy path:
-//! - **`PUNKTFUNK_WIRE_MTU=<bytes>`** — operator override; the shard payload is derived from
-//!   the given on-wire IP MTU. Wire-compatible with every deployed client:
-//!   `Welcome::shard_payload` is already negotiated per session (the v4/v6 split ships two
-//!   values today) and clients follow the negotiated value.
-//! - **Watch** — a per-session task samples the control connection's discovered MTU once the
-//!   search has had time to finish. A connection still alive that settled BELOW the ceiling is
-//!   proof the path can't carry full-size video: log an actionable WARN and record the measured
-//!   budget for the peer.
-//! - **Heal** — the next handshake from that peer clamps `shard_payload` to the recorded
-//!   budget, so a reconnect fixes the stream. A later session that reaches the ceiling erases
-//!   the record (the learn/heal loop is self-correcting in both directions).
-//! - **Grow** (PW7a) — the mirror image, for the jumbo half: a connection whose discovery
-//!   settles at the sealed JUMBO size has proven the path carries ~8.9 KB video datagrams, and
-//!   the next session on that same path *starts* there instead of at the 1500-byte default.
-//!   PyroWave sessions cannot be re-keyed mid-stream (the client's parse window is the
-//!   `Welcome` value, read once over the C ABI), so the session-start value is the ONLY way
-//!   they ever reach jumbo — and it is exactly where ~6× fewer datagrams per frame is worth
-//!   the most. See [`jumbo_session_start`] for why a remembered verdict alone is never
-//!   allowed to seal one byte above the default.
+//! Pin with `PUNKTFUNK_WIRE_MTU=<bytes>`. Watch records a below-ceiling
+//! settle; the next handshake clamps. Jumbo grow starts the next session at
+//! the sealed jumbo size only after a live re-proof — PyroWave cannot re-key
+//! mid-stream. Evidence: [`jumbo_session_start`].
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -42,91 +21,68 @@ use punktfunk_core::config::{
     shard_payload_for_udp_budget, shard_payload_for_wire_mtu, video_datagram_udp_ceiling,
 };
 
-/// Everything the MID-SESSION renegotiation driver needs (design/shard-payload-reneg.md
-/// Phase 2) — `None` at [`spawn_watch`] makes the watcher observe-and-learn only (leg-1
-/// behavior). Constructed ONLY when the client's `Hello::max_shard_payload` advertised
-/// per-frame geometry AND the session's wire is not chunk-aligned: a PyroWave client parses
-/// chunk-aligned AUs in windows of the `Welcome` value pinned at session start (Apple
-/// `Stage2Pipeline` / `pf-client-core` video.rs read it once over the C ABI), so re-keying
-/// such a session mid-stream would corrupt its parse — those sessions keep the leg-1
-/// next-session clamp instead.
+/// Mid-session re-key driver. `None` at [`spawn_watch`] is observe-and-learn
+/// only. Built only when the client advertised per-frame geometry and the
+/// wire is not chunk-aligned — PyroWave pins `Welcome` once over the C ABI,
+/// so a mid-stream re-key would corrupt its parse.
 pub(super) struct ShardReneg {
-    /// The client's advertised receive ceiling (bytes of shard; > 0 by construction).
+    /// Client receive ceiling in shard bytes; > 0 by construction.
     pub client_ceiling: u16,
-    /// → control task (the control stream's sole writer): send `ShardPayloadChanged{n}`.
+    /// Sole writer of the control stream: `ShardPayloadChanged{n}`.
     pub change_tx: tokio::sync::mpsc::UnboundedSender<u16>,
-    /// ← control task: the client's `ShardPayloadAck`s (the grow gate).
+    /// Client `ShardPayloadAck`s — the grow does not apply until one matches.
     pub ack_rx: tokio::sync::mpsc::UnboundedReceiver<u16>,
-    /// → data plane: apply [`Session::set_shard_payload`] between AUs
-    /// (drained next to `bitrate_rx` in the encode loop).
+    /// Encode loop: [`Session::set_shard_payload`] between AUs, next to `bitrate_rx`.
     pub apply_tx: std::sync::mpsc::Sender<usize>,
 }
 
-/// Measured UDP-payload budget per peer IP, learned from live control connections whose MTU
-/// discovery settled below the video-datagram ceiling. In-memory only: a host restart
-/// re-learns in one session, and entries self-correct (a later ceiling-hit erases, a lower
-/// re-measure overwrites).
+/// Per-peer UDP-payload budget from a live below-ceiling settle. In-memory:
+/// a restart re-learns in one session; a later ceiling-hit erases.
 fn learned() -> &'static Mutex<HashMap<IpAddr, u16>> {
     static LEARNED: OnceLock<Mutex<HashMap<IpAddr, u16>>> = OnceLock::new();
     LEARNED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Identity of a PATH, not of a peer — the key the jumbo verdict is filed under.
+/// Jumbo-verdict key: a path, not a peer.
 ///
-/// The clamp above is keyed by peer IP alone, and that is safe *because being wrong is benign*:
-/// a stale clamp only makes video datagrams smaller than they had to be. A stale GROW is the
-/// opposite — one oversized datagram on a 1500-byte path is silently dropped, which is the
-/// "connects fine, black screen forever" shape this whole module exists to kill. So the grow
-/// keys strictly: a verdict earned over the host's 10 GbE NIC does not apply to the same peer
-/// IP reached over the host's Wi-Fi or a VPN adapter, because those are different routes with
-/// different MTUs.
+/// The clamp is keyed by peer IP; a stale clamp only shrinks datagrams. A
+/// stale grow is the opposite — one oversized datagram is silently dropped.
+/// A verdict earned on one host NIC must not apply to the same peer over
+/// another route.
 ///
-/// `local` is `Connection::local_ip()` (the address the connection was actually received on);
-/// `None` where the platform can't report it, which degrades this key to the clamp's — safely,
-/// because the live re-proof in [`jumbo_session_start`] is what actually protects the grow.
+/// `local` is `Connection::local_ip()`; `None` when the platform cannot
+/// report it. That degrades to the clamp's key — the live re-proof in
+/// [`jumbo_session_start`] is what actually authorises a grow.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct PathKey {
     local: Option<IpAddr>,
     peer: IpAddr,
 }
 
-/// A path that a completed MTU-discovery search proved carries jumbo video datagrams.
+/// A completed MTU-discovery search that reached the sealed jumbo size.
 #[derive(Clone, Copy, Debug)]
 struct JumboVerdict {
-    /// The settled UDP-payload budget the proof measured.
     udp_budget: u16,
-    /// The operator's jumbo target when the proof was taken. A changed `PUNKTFUNK_JUMBO` /
-    /// `PUNKTFUNK_WIRE_MTU` invalidates it rather than being silently reinterpreted.
+    /// Operator jumbo target at proof time. A later `PUNKTFUNK_JUMBO` /
+    /// `PUNKTFUNK_WIRE_MTU` change invalidates rather than reinterpreting.
     target_wire_mtu: usize,
-    /// When it was taken ([`JUMBO_VERDICT_TTL`]).
+    /// Instant of the proof; see [`JUMBO_VERDICT_TTL`].
     at: std::time::Instant,
 }
 
-/// How long a jumbo verdict may be redeemed for. Contrary evidence erases it long before this
-/// (any settle below the sealed target, on any later session over the same path — the same
-/// self-correction the clamp has), so the TTL is not the safety mechanism; it is a bound on how
-/// stale an *unrefreshed* memory can get, for the case where the path changes while no session
-/// is running.
+/// Bound on an unrefreshed verdict (path changed with no session running).
+/// Contrary evidence erases long before this; the TTL is not the safety gate.
 const JUMBO_VERDICT_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
-/// How long the `Welcome` may wait for THIS connection's MTU discovery to re-prove a jumbo
-/// path.
-///
-/// The wait is structural, not laziness: every connection restarts discovery from ~1200 bytes,
-/// so the live proof the grow requires does not exist yet when the `Welcome` is built — and the
-/// binary search up to sealed-jumbo needs an ACKED probe per step, each of which a peer may sit
-/// on for its ack delay. Without a wait the gate would never pass and the feature would be dead.
-///
-/// It is honestly on the bring-up critical path (`handshake.rs` sends the `Welcome` and only
-/// THEN kicks the display prep), so it is bounded, returns the instant the proof lands, and is
-/// entered ONLY for a path a previous session already proved jumbo — i.e. an opted-in operator
-/// on a jumbo LAN, never anyone else. The worst case (the full wait, no proof) is the moved
-/// laptop, and it is self-limiting: that session's watcher erases the verdict, so the next
-/// connect doesn't wait at all.
+/// Cap on waiting for this connection's MTU discovery to re-prove jumbo
+/// before `Welcome`. Discovery restarts from ~1200 bytes and needs an
+/// acked probe per binary-search step; without a wait the grow never
+/// fires. Entered only for a path a previous session already proved.
+/// A miss is self-limiting: the watcher erases the verdict.
 const JUMBO_PROOF_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
 const JUMBO_PROOF_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// Proven-jumbo paths. Same lifetime rules as [`learned`] — in-memory, re-earned in one session
+/// Proven-jumbo paths. Same lifetime as [`learned`]: in-memory, re-earned
 /// after a host restart.
 fn jumbo_verdicts() -> &'static Mutex<HashMap<PathKey, JumboVerdict>> {
     static JUMBO: OnceLock<Mutex<HashMap<PathKey, JumboVerdict>>> = OnceLock::new();
@@ -140,30 +96,26 @@ fn path_key(conn: &quinn::Connection) -> PathKey {
     }
 }
 
-/// Everything the session-start jumbo decision reads. Every field but `proven_udp_budget` is
-/// observed on THIS connection during THIS handshake — which is the point (see
-/// [`jumbo_session_start`]).
+/// Inputs to the session-start jumbo decision. Every field but
+/// `proven_udp_budget` is observed on this connection during this handshake.
 #[derive(Clone, Copy, Debug)]
 struct JumboStart {
-    /// The host operator's opt-in ([`jumbo_wire_mtu`]) — `None` = no jumbo, ever.
+    /// Operator jumbo opt-in ([`jumbo_wire_mtu`]); `None` = never jumbo.
     target_wire_mtu: Option<usize>,
-    /// `Hello::max_shard_payload`: the client's own receive ceiling (0 = legacy client, which
-    /// never gets a geometry it didn't ask for).
+    /// `Hello::max_shard_payload`. 0 = legacy client: never a geometry it
+    /// did not advertise.
     client_ceiling: u16,
-    /// `conn.stats().path.current_mtu` right now: the largest UDP payload quinn has had ACKED
-    /// on this connection.
+    /// Largest UDP payload quinn has had acked on this connection.
     live_udp_mtu: u16,
-    /// What a previous session over this same [`PathKey`] settled at, if any.
+    /// Prior session over this [`PathKey`], if any.
     proven_udp_budget: Option<u16>,
-    /// The constrained-path clamp [`learned`] for this peer, if any. Contradictory evidence
-    /// (this peer black-screened on a small MTU recently) vetoes the grow — the two memories
-    /// are keyed differently and the safe one wins.
+    /// [`learned`] clamp for this peer. Contradictory evidence vetoes the
+    /// grow — the two memories are keyed differently and the safe one wins.
     clamped_udp_budget: Option<u16>,
 }
 
-/// The jumbo shard payload a session to `peer` could use, or `None` when there is nothing to
-/// gain (no opt-in, a legacy/low client ceiling, or a target that isn't bigger than the family
-/// default). Shared by the decision, the wait, and the watcher so all three agree on the number.
+/// Jumbo shard for `peer`, or `None` when there is nothing to gain. Shared
+/// by the decision, the wait, and the watcher so all three use one number.
 fn jumbo_target(
     target_wire_mtu: Option<usize>,
     client_ceiling: u16,
@@ -175,22 +127,10 @@ fn jumbo_target(
     (t > mtu1500_shard_payload_for(peer)).then_some(t)
 }
 
-/// The session-START jumbo decision: `Some(shard_payload)` only when every gate below holds.
-///
-/// **Why a remembered verdict is never enough.** A laptop that proved jumbo on the wired LAN
-/// and comes back on Wi-Fi, a switch that lost its jumbo config, a client IP recycled by DHCP —
-/// all of them present a path that cannot carry an 8.9 KB datagram, and a PyroWave session
-/// sealed at that size cannot be re-keyed mid-stream, so it would black-screen for its whole
-/// life. The memory therefore only decides whether it is worth WAITING for a proof; what
-/// actually authorises the grow is `live_udp_mtu` — a datagram of exactly that size, acked by
-/// this client, on this connection, seconds ago. That is why this is as safe as the clamp
-/// despite the failure modes being opposite: a wrong memory cannot produce a jumbo `Welcome`,
-/// only a live measurement can.
-///
-/// The gates, in order: the host operator opted in; the client advertised enough receive
-/// headroom; the target beats the family default (nothing to gain otherwise); no constrained-path
-/// clamp contradicts it; a prior session over this exact path settled at or above the sealed
-/// target; and this connection has re-proven it live.
+/// Session-start jumbo shard, or `None`. A remembered verdict only decides
+/// whether to wait; `live_udp_mtu` is the authorisation — an acked datagram
+/// of that size on this connection. PyroWave cannot re-key mid-stream, so a
+/// stale memory must never seal a jumbo `Welcome`.
 fn jumbo_session_start(i: JumboStart, peer: IpAddr) -> Option<usize> {
     let target = jumbo_target(i.target_wire_mtu, i.client_ceiling, peer)?;
     let sealed = sealed_datagram_bytes(target);
@@ -208,13 +148,9 @@ fn jumbo_session_start(i: JumboStart, peer: IpAddr) -> Option<usize> {
     Some(target)
 }
 
-/// The shard payload for a new session on `conn`: a proven-jumbo grow, else the
-/// `PUNKTFUNK_WIRE_MTU` override, else the peer's learned path budget, else the family default
-/// (today's exact behavior). Logs whenever the result differs from the default.
-///
-/// `client_ceiling` is the client's `Hello::max_shard_payload`. Async only for the bounded
-/// [`JUMBO_PROOF_WAIT`], which is entered *only* on a path a previous session already proved
-/// jumbo — every other session resolves without awaiting anything.
+/// Shard payload for a new session on `conn`. Async only for the bounded
+/// [`JUMBO_PROOF_WAIT`], entered only on a path a previous session already
+/// proved jumbo.
 pub(super) async fn negotiated_shard_payload(
     conn: &quinn::Connection,
     client_ceiling: u16,
@@ -240,9 +176,6 @@ pub(super) async fn negotiated_shard_payload(
         proven_udp_budget,
         clamped_udp_budget: learned_budget,
     };
-    // A proven path is worth waiting a moment for: MTU discovery starts when the handshake
-    // completes and needs an acked probe per binary-search step, so at `Welcome` time it may
-    // simply not have got there yet. Bounded, and only on paths that already proved it once.
     let awaited_proof = proven_udp_budget
         .and_then(|_| jumbo_target(target_wire_mtu, client_ceiling, peer))
         .map(|t| sealed_datagram_bytes(t) as u16);
@@ -268,8 +201,8 @@ pub(super) async fn negotiated_shard_payload(
     resolve(env, learned_budget, jumbo, peer)
 }
 
-/// The peer's jumbo verdict if it is still redeemable: same operator target, inside the TTL.
-/// A verdict that fails either test is dropped on the spot rather than left to rot.
+/// Redeemable jumbo verdict: same operator target, inside the TTL. A miss
+/// is dropped here rather than left stale.
 fn fresh_verdict(key: PathKey, target_wire_mtu: Option<usize>) -> Option<u16> {
     let target = target_wire_mtu?;
     let mut map = jumbo_verdicts().lock().unwrap();
@@ -281,8 +214,8 @@ fn fresh_verdict(key: PathKey, target_wire_mtu: Option<usize>) -> Option<u16> {
     Some(v.udp_budget)
 }
 
-/// Pure resolution (proven jumbo > env override > learned budget > family default) — the tested
-/// core of [`negotiated_shard_payload`].
+/// Proven jumbo, else env override, else learned budget, else family default.
+/// Tested core of [`negotiated_shard_payload`].
 fn resolve(
     env_wire_mtu: Option<usize>,
     learned_udp_budget: Option<u16>,
@@ -290,9 +223,9 @@ fn resolve(
     peer: IpAddr,
 ) -> usize {
     let default = mtu1500_shard_payload_for(peer);
-    // First, because the two are mutually exclusive by construction: `jumbo_wire_mtu()` only
-    // fires above 1500, and the env branch below CLAMPS to the family default, so a
-    // `PUNKTFUNK_WIRE_MTU=9000` operator would otherwise get 1408 and never a jumbo start.
+    // Jumbo first: `jumbo_wire_mtu()` is only above 1500, and the env branch
+    // below clamps to the family default, so `PUNKTFUNK_WIRE_MTU=9000` would
+    // otherwise start at 1408.
     if let Some(p) = jumbo_session_start(jumbo, peer) {
         tracing::info!(
             peer = %peer,
@@ -335,16 +268,11 @@ fn resolve(
     default
 }
 
-/// Sample the control connection's discovered MTU after the search has settled and turn it
-/// into a verdict — and, with a [`ShardReneg`] driver, act on it MID-SESSION
-/// (design/shard-payload-reneg.md Phase 2): a below-ceiling verdict shrinks the live wire at
-/// the ~3–10 s mark (session 1 heals instead of staying black), and a settled-at-jumbo
-/// verdict grows it, ack-gated, when the operator opted in. The same settled-at-jumbo reading
-/// also writes this path's next-session verdict (PW7a) — `client_ceiling` is the client's
-/// `Hello::max_shard_payload`, which decides what "jumbo" is worth proving for this peer.
-/// Spawned once per negotiated session; without a grow the task ends after the final sample
-/// (bounded ~10 s lifetime, holding only a cheap `Connection` handle) — after a grow, or on a
-/// session that STARTED jumbo, it stays as the revert guard until the connection closes.
+/// After discovery settles, record a path verdict. With a [`ShardReneg`]
+/// driver, shrink or (ack-gated) grow the live wire. A settled-at-jumbo
+/// reading also files the next-session verdict. Without a grow the task
+/// ends after the last sample (~10 s, a `Connection` handle); after a grow
+/// or a jumbo start it stays as the revert guard until the connection closes.
 pub(super) fn spawn_watch(
     conn: quinn::Connection,
     session_shard_payload: usize,
@@ -354,19 +282,15 @@ pub(super) fn spawn_watch(
     tokio::spawn(async move {
         let peer = conn.remote_address().ip();
         let ceiling = video_datagram_udp_ceiling() as u16;
-        // The sealed size a JUMBO proof has to reach on this path (PW7a) — `None` unless the
-        // operator opted in AND this client advertised the headroom. Read once: the verdict
-        // records the target it was proven under, and the two must be the same number.
+        // Sealed jumbo size for this path, or `None` without opt-in and
+        // client headroom. Read once: the verdict stores that same target.
         let target_wire_mtu = jumbo_wire_mtu();
         let jumbo_proof =
             jumbo_target(target_wire_mtu, client_ceiling, peer).map(sealed_datagram_bytes);
-        // Discovery finishes in a handful of RTTs on a LAN (well under the first sample) but
-        // needs a loss timeout per failed probe on a constrained path — the second sample
-        // covers that with margin. Max, because discovery only ever raises `current_mtu`
-        // (the post-grow revert guard below re-reads it live, where blackhole detection CAN
-        // lower it again). Stop early only once nothing more is expected: with a jumbo opt-in
-        // the search keeps climbing past the 1500-byte ceiling, and stopping there would throw
-        // away the very measurement the proof needs.
+        // Two samples: LAN is a handful of RTTs; a constrained path needs a
+        // loss timeout per failed probe. `max`, because discovery only raises
+        // `current_mtu` here. Goal is jumbo-or-ceiling so a jumbo search is
+        // not cut off at 1500.
         let goal = jumbo_proof
             .unwrap_or(ceiling as usize)
             .max(ceiling as usize) as u16;
@@ -378,15 +302,11 @@ pub(super) fn spawn_watch(
                 break;
             }
         }
-        // The wire this session is CURRENTLY sealed at — moves on a mid-session shrink/grow.
         let mut current = session_shard_payload;
         let mut reneg = reneg;
-        // PW7a bookkeeping, before anything else can return: this is where a jumbo path earns
-        // its next-session verdict — and, far more importantly, where it LOSES it. Recording
-        // needs a live connection that reached the sealed target; anything else (a lower
-        // settle, a connection that died before the window closed, i.e. exactly what a client
-        // staring at a black screen does) erases, so the next session falls back to the
-        // 1500-byte default and has to prove itself again from scratch.
+        // File or erase the next-session jumbo verdict before any return.
+        // Record only a live connection that reached the sealed target;
+        // anything else (lower settle, died mid-window) drops it.
         if let Some(need) = jumbo_proof {
             let key = path_key(&conn);
             if settled as usize >= need && conn.close_reason().is_none() {
@@ -407,18 +327,14 @@ pub(super) fn spawn_watch(
             }
         }
         if settled >= ceiling {
-            // The path carries full-size video datagrams — erase any stale learned clamp so
-            // the next session returns to the default wire.
             if learned().lock().unwrap().remove(&peer).is_some() {
                 tracing::info!(peer = %peer,
                     "wire MTU: path re-measured at full size — learned clamp cleared");
             }
-            // …but "full size" is the 1500-byte ceiling, and this session may have STARTED
-            // above it (a PW7a jumbo start whose path changed since the proof, or a client
-            // that roamed onto a 1500-MTU link). Then every video datagram is dying right now.
-            // The verdict is already erased above; heal the live wire if this session can be
-            // re-keyed at all — a PyroWave client cannot (its parse window is the `Welcome`
-            // value), so for those the WARN plus a corrected next session is all there is.
+            // `ceiling` is the 1500-byte video size. A jumbo start on a path
+            // that no longer carries it is dropping every video datagram.
+            // Verdict is already erased; re-key if this session can — PyroWave
+            // cannot (`Welcome` parse window), so those wait for next connect.
             if sealed_datagram_bytes(current) > settled as usize {
                 tracing::warn!(
                     peer = %peer,
@@ -442,16 +358,15 @@ pub(super) fn spawn_watch(
                 }
             }
         } else {
-            // A closed connection stops discovering, so a session that ended before the final
-            // sample proves nothing (a healthy high-RTT path could still be mid-search): learn
-            // only from a connection that stayed alive through the whole window.
+            // A closed connection stops discovering. Learn only from one that
+            // stayed alive through the whole window — a high-RTT path can
+            // still be mid-search here.
             if conn.close_reason().is_some() {
                 return;
             }
             learned().lock().unwrap().insert(peer, settled);
             if sealed_datagram_bytes(current) <= settled as usize {
-                // This session was already clamped small enough — the path is still constrained
-                // (keep the record fresh) but video fits, so no alarm.
+                // Path still constrained; this session already fits, so no WARN.
                 tracing::info!(peer = %peer, discovered_udp_mtu = settled,
                     "wire MTU: constrained path re-measured; this session's video is sized to fit");
             } else {
@@ -468,10 +383,9 @@ pub(super) fn spawn_watch(
                      measured budget is recorded: the NEXT session from this client sizes video to \
                      fit automatically. To pin it for all sessions set PUNKTFUNK_WIRE_MTU."
                 );
-                // Phase 2 down-leg: heal THIS session at the verdict mark. Shrink is sent
-                // and applied immediately — per-frame pinning on the client makes ordering
-                // irrelevant and smaller always fits; the ack is telemetry. The learned
-                // record above still makes session 2 START right.
+                // Shrink this session now: smaller always fits, so ordering
+                // does not matter and the ack is telemetry. The learned
+                // record still starts session 2 at the right size.
                 if let Some(r) = reneg.as_ref() {
                     let target = shard_payload_for_udp_budget(settled as usize, peer);
                     if target < current
@@ -490,13 +404,10 @@ pub(super) fn spawn_watch(
                 }
             }
         }
-        // PW7a revert guard for a session that STARTED jumbo and has no re-key channel (the
-        // PyroWave case, and the only reason the session-start grow exists). Nothing can save
-        // this session if the path stops fitting mid-stream — but the NEXT one must not repeat
-        // it, so keep sampling and drop the verdict the moment quinn's blackhole detection or
-        // a re-search says the path shrank. Cheap: one `Connection` handle, one sample per 5 s.
-        // Only for a session that is currently FITTING — one that already failed the check
-        // above has been warned about and had its verdict erased there.
+        // Revert guard for a jumbo start with no re-key channel (PyroWave).
+        // This session cannot recover; drop the verdict the moment quinn's
+        // blackhole detection says the path shrank. One sample per 5 s, and
+        // only while the session is still fitting.
         if current > mtu1500_shard_payload_for(peer)
             && reneg.is_none()
             && sealed_datagram_bytes(current) <= settled as usize
@@ -519,11 +430,9 @@ pub(super) fn spawn_watch(
                 }
             }
         }
-        // Phase 2 up-leg: jumbo grow — operator opt-in (PUNKTFUNK_JUMBO / PUNKTFUNK_WIRE_MTU
-        // > 1500, which also raised the endpoint's probe ceiling so `settled` can even reach
-        // here), client-advertised headroom, and a settled-at-jumbo proof. The grow is
-        // ACK-GATED: not one sealed datagram above the old size leaves before the client's
-        // ack, even though its buffers are statically sized — the rule must not erode.
+        // Jumbo grow: operator opt-in, client headroom, settled-at-jumbo
+        // proof. Ack-gated — no sealed datagram above the old size leaves
+        // before the client's ack, even though its buffers are static.
         let (Some(mtu), Some(r)) = (target_wire_mtu, reneg.as_mut()) else {
             return;
         };
@@ -561,9 +470,9 @@ pub(super) fn spawn_watch(
             "wire MTU: jumbo grow acked and applied — packets-per-frame cut ~6×"
         );
         current = target;
-        // Revert guard: a mis-proven jumbo hop must self-correct instead of blackholing.
-        // quinn's PMTU blackhole detection lowers `current_mtu` when the big packets start
-        // vanishing; sample it and shrink back through the same path the down-leg uses.
+        // Revert: quinn's PMTU blackhole detection lowers `current_mtu`
+        // when the big packets vanish. Sample and shrink via the same
+        // path the down-leg uses.
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             if conn.close_reason().is_some() {
@@ -591,7 +500,6 @@ mod tests {
 
     const V4: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2));
     const V6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-    /// No jumbo anywhere — what every session that isn't on an opted-in jumbo LAN passes.
     const NO_JUMBO: JumboStart = JumboStart {
         target_wire_mtu: None,
         client_ceiling: 0,
@@ -599,7 +507,6 @@ mod tests {
         proven_udp_budget: None,
         clamped_udp_budget: None,
     };
-    /// A 9000-MTU LAN, a modern client, a path proven last session and re-proven live now.
     fn proven_jumbo() -> JumboStart {
         JumboStart {
             target_wire_mtu: Some(9000),
@@ -630,7 +537,7 @@ mod tests {
 
     #[test]
     fn learned_budget_clamps() {
-        // A WARP-shaped path: 1280-byte UDP budget → 1280 − 64 = 1216.
+        // 1280-byte UDP budget − 64 header/crypto = 1216.
         assert_eq!(resolve(None, Some(1280), NO_JUMBO, V4), 1216);
     }
 
@@ -658,7 +565,7 @@ mod tests {
         );
     }
 
-    /// The happy path, both families: 9000 − 28 (IPv4) − 64 = 8908, and 9000 − 48 − 64 = 8888.
+    /// 9000 − 28 (IPv4) − 64 = 8908; 9000 − 48 − 64 = 8888.
     #[test]
     fn proven_and_reproven_path_starts_jumbo() {
         assert_eq!(jumbo_session_start(proven_jumbo(), V4), Some(8908));
@@ -666,31 +573,27 @@ mod tests {
         v6.live_udp_mtu = 8952;
         v6.proven_udp_budget = Some(8952);
         assert_eq!(jumbo_session_start(v6, V6), Some(8888));
-        // …and it is what `resolve` returns, ahead of the env branch that would clamp a
-        // >1500 `PUNKTFUNK_WIRE_MTU` back down to the family default.
+        // `resolve` must pick jumbo ahead of the env branch, which would
+        // clamp a >1500 `PUNKTFUNK_WIRE_MTU` to the family default.
         assert_eq!(resolve(Some(9000), None, proven_jumbo(), V4), 8908);
     }
 
-    /// THE guard: the laptop that proved jumbo on the wired LAN and came back on a 1500-MTU
-    /// link. The memory still says jumbo; the live connection says otherwise; the live one
-    /// wins, every time. This is what makes the grow as safe as the clamp.
     #[test]
     fn a_remembered_verdict_never_grows_without_a_live_reproof() {
         let mut moved = proven_jumbo();
-        moved.live_udp_mtu = 1472; // a clean 1500-MTU path, freshly measured
+        moved.live_udp_mtu = 1472;
         assert_eq!(jumbo_session_start(moved, V4), None);
         assert_eq!(
             resolve(None, None, moved, V4),
             mtu1500_shard_payload_for(V4)
         );
-        // Not even one byte of headroom short of the sealed target is enough.
+        // 8971 is one byte short of the sealed jumbo target.
         let mut nearly = proven_jumbo();
         nearly.live_udp_mtu = 8971;
         assert_eq!(jumbo_session_start(nearly, V4), None);
     }
 
-    /// …and the mirror: a live-proven path with no prior verdict still starts at the default.
-    /// Both halves are required, so a single fluke on either side cannot seal a jumbo wire.
+    /// Both halves required: a fluke on either side must not seal jumbo.
     #[test]
     fn a_live_proof_alone_does_not_grow() {
         let mut first_ever = proven_jumbo();
@@ -701,14 +604,13 @@ mod tests {
         assert_eq!(jumbo_session_start(weak_memory, V4), None);
     }
 
-    /// The two memories are keyed differently (clamp: peer; verdict: route), so they can
-    /// disagree. When they do, the one that keeps datagrams small wins.
+    /// Clamp is keyed by peer, verdict by route. On disagreement, small wins.
     #[test]
     fn a_constrained_path_clamp_vetoes_the_grow() {
         let mut contradicted = proven_jumbo();
         contradicted.clamped_udp_budget = Some(1280);
         assert_eq!(jumbo_session_start(contradicted, V4), None);
-        // A clamp that is itself at or above the sealed target isn't contrary evidence.
+        // A clamp at or above the sealed target is not contrary evidence.
         let mut roomy = proven_jumbo();
         roomy.clamped_udp_budget = Some(8972);
         assert_eq!(jumbo_session_start(roomy, V4), Some(8908));
@@ -721,9 +623,8 @@ mod tests {
         assert_eq!(jumbo_session_start(no_optin, V4), None);
     }
 
-    /// A legacy client (no `Hello::max_shard_payload`) is never handed a geometry it did not
-    /// advertise, and a client whose ceiling lands under the family default is left alone
-    /// rather than being "grown" to something smaller.
+    /// Legacy (`Hello::max_shard_payload` = 0) never gets a geometry it did
+    /// not advertise. A ceiling under the family default is not a grow.
     #[test]
     fn the_client_ceiling_is_binding() {
         let mut legacy = proven_jumbo();
@@ -732,15 +633,14 @@ mod tests {
         let mut small = proven_jumbo();
         small.client_ceiling = 1408;
         assert_eq!(jumbo_session_start(small, V4), None);
-        // A ceiling between the default and the path target caps the grow — and the proof
-        // then only has to cover the SMALLER sealed size.
+        // A mid-range ceiling caps the grow; the proof covers that smaller seal.
         let mut capped = proven_jumbo();
         capped.client_ceiling = 4000;
         assert_eq!(jumbo_session_start(capped, V4), Some(4000));
     }
 
-    /// Every shard payload the grow can produce is even (Leopard FEC splits shards in halves)
-    /// and fits the receive ceiling every client sizes its buffers from.
+    /// Grown shards stay even (Leopard FEC splits in halves) and inside the
+    /// receive ceiling clients size buffers from.
     #[test]
     fn grown_shards_stay_even_and_inside_the_receive_ceiling() {
         for mtu in [2000usize, 4000, 4001, 9000, 9216, 64000] {
@@ -757,13 +657,11 @@ mod tests {
                 );
             }
         }
-        // Below the family default there is nothing to grow to.
         assert_eq!(jumbo_target(Some(1500), u16::MAX, V4), None);
         assert_eq!(jumbo_target(None, u16::MAX, V4), None);
     }
 
-    /// A path is a (local interface, peer) pair, not a peer: the same client reached over the
-    /// host's other NIC is a different route with a different MTU.
+    /// Same peer over two host NICs is two routes, so two keys.
     #[test]
     fn the_verdict_key_separates_routes_to_the_same_peer() {
         let over_10g = PathKey {

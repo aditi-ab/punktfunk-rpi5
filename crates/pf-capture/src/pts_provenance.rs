@@ -1,46 +1,35 @@
-//! Where the wire's presentation timestamp actually comes from
-//! (design/host-source-stutter-fixes.md, WP-A3 and WP-B3).
+//! Wire `pts_ns` for Linux capture: compositor header vs delivery stamp.
 //!
-//! Every Linux capture publish stamps `pts_ns` with `SystemTime::now()` inside OUR PipeWire
-//! process callback — the instant the buffer was DELIVERED to us, not the instant the compositor
-//! produced it. On a host whose screencast delivery is jittery, that difference IS the jitter, and
-//! it is baked into the timestamps the client eventually plays back from. (The 2026-08-15 Skynet
-//! log: 41 phase-lock disengage cycles in 24 minutes, arrival offsets up to a full 120 Hz period,
-//! on a session whose transport was provably clean.) The compositor's own `spa_meta_header.pts` is
-//! stamped upstream of that delivery, so it *might* be clean — but "might" is the entire question,
-//! and the client-side cure (source-timestamp playout) faithfully REPRODUCES whatever jitter the
-//! timestamps carry rather than absorbing it. So: measure both clocks in the same window, against
-//! each other, before trusting either.
+//! PipeWire stamps `spa_meta_header.pts` in the graph's `CLOCK_MONOTONIC` domain.
+//! The wire and the client's plausibility gate speak realtime-since-epoch.
+//! A delivery stamp is `SystemTime::now` in the process callback — arrival, not
+//! production — so delivery jitter is in the timestamps the client plays back.
 //!
-//! Time is passed IN rather than read here, which keeps this pure and lets its tests run on every
-//! platform — the same reason `capture_policy` in the host crate is split out.
+//! [`wire_pts`] rebases a header stamp into realtime and falls back to delivery
+//! when the header is missing or further than `PLAUSIBLE_NS` from the delivery
+//! instant. [`PtsProvenance`] compares both clocks' interval MADs over a window
+//! so an irregular compositor is not mistaken for a clean header.
+//!
+//! Time is passed in; this module never reads a clock. Tests pin the rebase,
+//! the fallback, and the MAD comparison.
 
-/// Frames sampled per reporting window. ~34 s at 120 Hz, so a 30 s window is covered without the
-/// callback ever reallocating: the vectors are built once at their cap and only ever pushed into
-/// while short of it. Allocation on the PipeWire loop thread is what this avoids.
+/// 4096 ≈ 34 s at 120 Hz, covering a 30 s report window. Sized once so the
+/// PipeWire loop thread never reallocates.
 const MAX_SAMPLES: usize = 4096;
 
-/// A rebased compositor stamp further than this from the delivery instant is not a timestamp for
-/// this frame: the wrong clock domain, a stale header, or a producer that never fills it in. Fall
-/// back to the delivery stamp for that frame, and count it — silently trusting a garbage stamp
-/// would put the whole stream's timing on a fiction (risk R3).
+/// 50 ms ≈ 6 frames at 120 Hz. A rebased header further than this is the wrong
+/// clock domain or a stale/empty header; fall back rather than stamp the stream
+/// from it.
 const PLAUSIBLE_NS: i64 = 50_000_000;
 
-/// One frame's stamp, and which clock produced it.
 pub(crate) struct WirePts {
     pub(crate) pts_ns: u64,
-    /// False when this frame fell back to the delivery stamp — the honest per-frame answer, and
-    /// the number that says whether B3 is actually doing anything on this host.
     pub(crate) from_header: bool,
 }
 
-/// The wire stamp for one frame.
-///
-/// `hdr_pts_ns` is the compositor's `spa_meta_header.pts`, which PipeWire defines in the graph's
-/// clock domain (`CLOCK_MONOTONIC`); `delivery_ns` is realtime-since-epoch, which is the domain
-/// the wire and the client's plausibility gate both speak. `rt_minus_mono_ns` carries one into the
-/// other. A missing or implausible header stamp yields the delivery stamp — today's behaviour —
-/// so a producer that fills in no header is unaffected.
+/// Rebase `hdr_pts_ns` (`spa_meta_header.pts`, graph `CLOCK_MONOTONIC`) into
+/// realtime-since-epoch via `rt_minus_mono_ns`. Missing or implausible headers
+/// yield `delivery_ns` so a producer that never fills the header is unchanged.
 pub(crate) fn wire_pts(
     hdr_pts_ns: Option<i64>,
     delivery_ns: u64,
@@ -50,7 +39,7 @@ pub(crate) fn wire_pts(
         pts_ns: delivery_ns,
         from_header: false,
     };
-    // Producers that have no timestamp write 0 (or leave it negative); neither is a stamp.
+    // Producers write 0 (or leave it negative) when they have no stamp.
     let Some(hdr) = hdr_pts_ns.filter(|&p| p > 0) else {
         return fallback;
     };
@@ -64,44 +53,31 @@ pub(crate) fn wire_pts(
     }
 }
 
-/// One reporting window of "which clock is cleaner", plus the domain sanity check.
 #[derive(Default)]
 pub(crate) struct PtsProvenance {
     frames: u64,
     with_hdr: u64,
-    /// Intervals between consecutive stamps, ns — one series per clock. THE pair the whole WP
-    /// exists to compare: if the compositor's is materially tighter than ours, its stamp is worth
-    /// adopting; if both are equally ragged, the compositor is composing irregularly and no
-    /// choice of stamp can fix it (risk R7).
+    /// If the header MAD is not tighter than delivery, no stamp swap helps.
     hdr_intervals: Vec<i64>,
     delivery_intervals: Vec<i64>,
-    /// `hdr − delivery` per frame. Expected to be huge and roughly CONSTANT (two clock origins);
-    /// its variance is the signal, and a wildly varying one means the header is not a per-frame
-    /// stamp at all.
+    /// `hdr − delivery` per frame. Huge and roughly constant (two clock origins);
+    /// variance means the header is not a per-frame stamp.
     offsets: Vec<i64>,
     prev_hdr: Option<i64>,
     prev_delivery: Option<u64>,
-    /// Frames that asked for the header stamp and were refused by the plausibility gate.
     pub(crate) implausible: u64,
 }
 
-/// A window's worth, in the units a log line wants.
 pub(crate) struct PtsReport {
     pub(crate) frames: u64,
     pub(crate) with_hdr: u64,
-    /// Intervals the deviations were computed from. A MAD over eight samples and one over three
-    /// thousand deserve different amounts of belief, and the log line should not hide which it is.
+    /// A MAD over eight samples and one over thousands deserve different belief.
     pub(crate) samples: u64,
-    /// Median interval between deliveries — the empirical period. Derived rather than taken from
-    /// the negotiated refresh on purpose: a median is immune both to a wrong nominal and to the
-    /// occasional skipped tick, and a skipped tick is exactly what a fixed nominal would
+    /// Empirical period. A skipped tick is what a negotiated refresh would
     /// mis-score as jitter.
     pub(crate) period_us: i64,
-    /// Median absolute deviation of each clock's intervals about ITS OWN median — "how ragged is
-    /// this clock's cadence", and nothing else. Judging both against one shared centre sounds
-    /// tidier and is worse: it folds the period-estimation error, and any genuine rate difference
-    /// between two clock sources, into a number that is supposed to be about jitter. A perfectly
-    /// regular producer would then report several µs of dispersion it does not have.
+    /// Own-median MAD, µs. A shared centre folds period-estimation error and any
+    /// genuine rate difference into "jitter".
     pub(crate) hdr_mad_us: i64,
     pub(crate) delivery_mad_us: i64,
     pub(crate) offset_p50_ms: i64,
@@ -118,9 +94,8 @@ impl PtsProvenance {
         }
     }
 
-    /// Fold one frame in. `hdr_pts_ns` is `None` when the buffer carried no usable header, which
-    /// also breaks the header interval chain — an interval spanning a frame we could not stamp
-    /// would read as one clean long gap rather than the missing measurement it is.
+    /// A missing header clears the header interval chain so a gap is not scored
+    /// as one clean long interval.
     pub(crate) fn observe(&mut self, hdr_pts_ns: Option<i64>, delivery_ns: u64) {
         self.frames += 1;
         if let Some(prev) = self.prev_delivery {
@@ -143,7 +118,6 @@ impl PtsProvenance {
         self.prev_hdr = Some(hdr);
     }
 
-    /// The window's answer, or `None` if too little arrived to say anything.
     pub(crate) fn report(&mut self) -> Option<PtsReport> {
         if self.delivery_intervals.len() < 8 {
             return None;
@@ -160,8 +134,8 @@ impl PtsProvenance {
         })
     }
 
-    /// Start a fresh window. The previous stamps survive so the first interval of the new window
-    /// is a real measurement rather than a hole.
+    /// Previous stamps stay so the first interval of the new window is a real
+    /// measurement rather than a hole.
     pub(crate) fn reset_window(&mut self) {
         self.frames = 0;
         self.with_hdr = 0;
@@ -178,8 +152,8 @@ fn push_capped(v: &mut Vec<i64>, x: i64) {
     }
 }
 
-/// Median, in place. Empty reports 0 so a log line stays parseable (the caller has already
-/// declined to report on a window this thin).
+/// Empty is 0 so a log line stays parseable; the caller has already declined
+/// a window this thin.
 fn median(v: &mut [i64]) -> i64 {
     if v.is_empty() {
         return 0;
@@ -188,8 +162,8 @@ fn median(v: &mut [i64]) -> i64 {
     v[v.len() / 2]
 }
 
-/// Median absolute deviation about the series' own median — robust to the occasional skipped
-/// tick, which a mean would let dominate and a fixed nominal would mis-score as jitter.
+/// MAD about the series' own median. A mean lets a skipped tick dominate; a
+/// fixed nominal mis-scores it as jitter.
 fn mad(v: &mut [i64]) -> i64 {
     if v.is_empty() {
         return 0;
@@ -205,8 +179,8 @@ fn mad(v: &mut [i64]) -> i64 {
 mod tests {
     use super::*;
 
-    /// A monotonic clock a few days into an uptime, against a realtime clock in 2026 — the domain
-    /// gap the rebase exists to close, and the shape the plausibility gate must not mistake for a
+    /// ~3.5 days of monotonic uptime vs a unix-epoch realtime origin — the domain
+    /// gap the rebase closes. The plausibility gate must not treat that gap as a
     /// bad stamp.
     const MONO_BASE: i64 = 300_000 * 1_000_000_000;
     const RT_BASE: u64 = 1_786_000_000 * 1_000_000_000;
@@ -214,7 +188,6 @@ mod tests {
 
     #[test]
     fn a_rebased_compositor_stamp_is_used_and_a_stale_one_is_not() {
-        // In domain and on time: adopted.
         let w = wire_pts(
             Some(MONO_BASE + 1_000_000),
             RT_BASE + 1_200_000,
@@ -227,19 +200,14 @@ mod tests {
             "the compositor's own instant"
         );
 
-        // Half a second stale — a header nobody refreshed. Fall back rather than put the stream's
-        // timing on a fiction.
         let w = wire_pts(Some(MONO_BASE - 500_000_000), RT_BASE, RT_MINUS_MONO);
         assert!(!w.from_header);
         assert_eq!(w.pts_ns, RT_BASE);
 
-        // Never stamped at all (0), and the no-header case: today's behaviour, unchanged.
         assert!(!wire_pts(Some(0), RT_BASE, RT_MINUS_MONO).from_header);
         assert_eq!(wire_pts(None, RT_BASE, RT_MINUS_MONO).pts_ns, RT_BASE);
     }
 
-    /// The wrong clock domain is the failure mode risk R3 names, and it must be *loud in the
-    /// numbers and silent in the stream*: every frame falls back, nothing is corrupted.
     #[test]
     fn a_raw_monotonic_stamp_never_reaches_the_wire() {
         let w = wire_pts(Some(MONO_BASE), RT_BASE, 0); // rebase forgotten
@@ -249,10 +217,8 @@ mod tests {
 
     const PERIOD: i64 = 8_333_333; // 120 Hz
 
-    /// Deterministic LCG in ±spread around zero (no OS randomness in tests). Zero-mean noise, not
-    /// a short repeating cycle: a cycle's interval series has only a handful of distinct values
-    /// and its median lands on one of the jitter peaks rather than on the period — which is a
-    /// property of that harness, not of the statistic.
+    /// Deterministic LCG in ±spread around zero. A short repeating cycle makes
+    /// the interval median land on a jitter peak instead of the period.
     struct Lcg(u64);
     impl Lcg {
         fn noise(&mut self, spread_ns: i64) -> i64 {
@@ -264,15 +230,12 @@ mod tests {
         }
     }
 
-    /// The measurement the branch decision rests on: a compositor stamping a clean 120 Hz grid
-    /// whose buffers reach us raggedly must show a materially tighter MAD than our delivery
-    /// stamps. This is the field shape — arrival offsets wandering up to a full period.
     #[test]
     fn a_clean_producer_behind_a_jittery_delivery_is_visible() {
         let mut p = PtsProvenance::new();
         let mut rng = Lcg(7);
         for i in 0..600i64 {
-            let hdr = MONO_BASE + i * PERIOD; // the producer's own stamp is exact
+            let hdr = MONO_BASE + i * PERIOD;
             let delivery = (RT_BASE as i64 + i * PERIOD + rng.noise(3_000_000)) as u64;
             p.observe(Some(hdr), delivery);
         }
@@ -290,9 +253,6 @@ mod tests {
             "delivery jitter of milliseconds must show as milliseconds, got {} us",
             r.delivery_mad_us
         );
-        // The domain check: a roughly CONSTANT offset is what "two clock origins" looks like — a
-        // varying one would mean the header is not a per-frame stamp at all. (The tolerance is
-        // the delivery jitter itself, which the offset carries by construction.)
         let origins_ms = (MONO_BASE - RT_BASE as i64) / 1_000_000;
         assert!(
             (r.offset_p50_ms - origins_ms).abs() <= 5,
@@ -301,16 +261,11 @@ mod tests {
         );
     }
 
-    /// Risk R7 asserted: if the compositor composes irregularly rather than merely delivering
-    /// late, both clocks are equally ragged and the numbers say so — no stamp swap can help, and
-    /// the report must not flatter the header into looking like a cure.
     #[test]
     fn an_irregular_producer_is_not_flattered() {
         let mut p = PtsProvenance::new();
         let mut rng = Lcg(11);
         for i in 0..600i64 {
-            // One wobble, carried faithfully by both clocks: the compositor really did compose
-            // at that instant, and really did deliver it straight away.
             let wobble = rng.noise(3_000_000);
             p.observe(
                 Some(MONO_BASE + i * PERIOD + wobble),
@@ -329,8 +284,6 @@ mod tests {
         );
     }
 
-    /// A producer that fills in no header at all still gets its delivery clock measured, and the
-    /// header series must not invent intervals across the frames it could not stamp.
     #[test]
     fn a_producer_without_headers_still_reports_its_delivery_clock() {
         let mut p = PtsProvenance::new();
@@ -343,10 +296,6 @@ mod tests {
         assert!((r.period_us - 8_333).abs() <= 1);
     }
 
-    /// A new window starts clean but NOT blind: the previous stamps survive the reset, so the
-    /// first interval after a report is a real measurement rather than a hole. Getting this wrong
-    /// silently drops one frame's interval every 30 s — invisible, and exactly the kind of slow
-    /// bias that makes two clocks look more alike than they are.
     #[test]
     fn a_reset_window_keeps_measuring_across_the_boundary() {
         let mut p = PtsProvenance::new();
@@ -379,7 +328,6 @@ mod tests {
         assert_eq!(second.hdr_mad_us, 0, "the exact producer is still exact");
     }
 
-    /// A window too thin to mean anything says nothing rather than reporting noise as a verdict.
     #[test]
     fn a_thin_window_reports_nothing() {
         let mut p = PtsProvenance::new();

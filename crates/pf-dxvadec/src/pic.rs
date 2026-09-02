@@ -1,68 +1,23 @@
 //! Per-AU H.264 conversion: one [`AuPlan`] into the `DXVA_PicParams_H264`,
-//! `DXVA_Qmatrix_H264` and slice-control records an
-//! `ID3D11VideoContext::SubmitDecoderBuffers` call is built from —
+//! `DXVA_Qmatrix_H264` and slice-control records
+//! `ID3D11VideoContext::SubmitDecoderBuffers` is built from —
 //! [`pf_vkdecode::pic`]'s job, one hardware API over.
 //!
-//! # Surfaces ARE slots
+//! Surfaces are slots. A `DXVA_PicEntry_H264` carries the uncompressed surface
+//! index, so DPB slot and decode-texture `ArraySlice` are the same number and
+//! this module drives the Vulkan rung's [`SlotMap`] unchanged.
 //!
-//! Vulkan's picture pool is deliberately decoupled from its DPB slots (a
-//! re-activated slot binds a fresh image). DXVA has no such indirection: a
-//! `DXVA_PicEntry_H264` carries the **uncompressed surface index**, so the DPB
-//! slot index and the decode texture array's `ArraySlice` are the same number by
-//! construction. That is why this module can drive the very same
-//! [`SlotMap`](pf_vkdecode::SlotMap) the Vulkan rung uses without adapting it: the
-//! ledger's contract — a picture keeps its slot for exactly as long as
-//! pf-bitstream's DPB holds the picture — is precisely DXVA's surface lifetime
-//! too.
+//! `RefFrameList` is the marked DPB ([`AuPlan::dpb_refs`]), not the AU's
+//! reference set — DXVA asks for every picture currently used for reference;
+//! Vulkan's `pReferenceSlots` is only the slots THIS decode uses. AU
+//! references first, then the rest; a DPB deeper than 16 can only lose a
+//! picture no slice names. The snapshot is the authority for marking, POC
+//! pair and `FrameNumList` key (concealment can relabel a long-term
+//! substitute as short-term in the slice lists).
 //!
-//! # `RefFrameList` is the MARKED DPB, not the AU's reference set
-//!
-//! The DXVA specification asks for every picture currently marked "used for
-//! reference" to appear in `RefFrameList`, and `UsedForReferenceFlags` is a
-//! statement about the DPB rather than about this access unit. libavcodec's DXVA
-//! path fills it by walking its whole DPB — `short_ref` then `long_ref` — never
-//! the derived lists.
-//!
-//! An earlier revision of this module put the union of the AU's own derived
-//! reference lists there, on the strength of the native Vulkan rung binding the
-//! same set bit-exact. That argument does not transfer, because the two APIs
-//! define the field differently: Vulkan's `pReferenceSlots` is spec-defined as the
-//! slots THIS decode operation uses, so a subset is right there. Where the
-//! difference bites is not list derivation — the omitted pictures are the tail of
-//! the sorted initial list, so 8.2.4.2/8.2.4.3 reproduce the same final list
-//! either way, which is exactly why a smoke test cannot see it — but the
-//! long-term/RFI class: a long-term reference held across pictures that name none
-//! of them would vanish from `RefFrameList` for those AUs and reappear later, and
-//! a driver keeping internal per-reference state is entitled to read the absence
-//! as "no longer a reference", discard it, and decode the recovery against
-//! whatever the surface then holds.
-//!
-//! So the array is built from [`pf_bitstream::h264::AuPlan::dpb_refs`], the marked
-//! DPB pf-bitstream captures at begin-picture time, with the AU's own references
-//! FIRST and the rest of the marked DPB appended. The order is this module's
-//! choice, not the spec's — DXVA imposes none (a driver resolves an entry by its
-//! `FrameNumList`/`FieldOrderCntList` pair) and libavcodec emits a different one,
-//! so a byte-diff against libavcodec must compare this array as a SET. What the
-//! ordering buys: a DPB deeper than the sixteen-entry array can only ever lose a
-//! picture no slice of this AU names.
-//!
-//! The snapshot is also the AUTHORITY for each entry's marking, POC pair and
-//! `FrameNumList` key, in preference to the slice lists' copy of them. That
-//! matters under concealment: pf-bitstream substitutes a lost reference in place
-//! and relabels the substitute short-term with its own `frame_num`, so a picture
-//! the DPB holds long-term can appear short-term in a list. Feeding a driver an
-//! `AssociatedFlag` of 0 with a `LongTermFrameIdx` in the `FrameNum` slot (or the
-//! reverse) is how `LongTermPicNum` matching resolves to the wrong surface.
-//!
-//! # Progressive envelope
-//!
-//! pf-bitstream rejects interlaced streams before a plan exists, so
-//! `field_pic_flag`, `MbaffFrameFlag`, `CurrPic.AssociatedFlag` and the
-//! bottom-field halves of `UsedForReferenceFlags` are written for a frame and
-//! nothing else. The top/bottom PicOrderCnt PAIRS are still real pairs — a
-//! progressive frame's bottom count differs from its top whenever the PPS carries
-//! `bottom_field_pic_order_in_frame_present_flag` — and ride through from
-//! pf-bitstream verbatim.
+//! Progressive envelope: pf-bitstream rejects interlaced streams, so field
+//! flags are written for a frame. Top/bottom PicOrderCnt pairs still ride
+//! through; they differ when the PPS codes `bottom_field_pic_order_in_frame_present_flag`.
 
 use std::ops::Range;
 
@@ -79,21 +34,18 @@ use crate::dxva::PicParamsH264;
 use crate::dxva::QmatrixH264;
 use crate::dxva::SliceH264Short;
 
-/// `RefFrameList`'s length — the H.264 DXVA reference-frame ceiling, and the
-/// spec's own maximum reference count.
+/// DXVA `RefFrameList` length, and H.264's own reference ceiling.
 const REF_FRAME_LIST_LEN: usize = 16;
 
-/// One entry of `RefFrameList`: a picture the DPB holds marked for reference,
-/// resolved to its surface index. Kept alongside the packed picture parameters for
-/// the backend's logging and for tests that assert the mapping rather than the
-/// bytes.
+/// One `RefFrameList` entry: a marked DPB picture resolved to its surface.
+/// Kept beside the packed params so tests can assert the mapping, not the bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DxvaRef {
-    /// The DPB slot, which is the decode texture array's `ArraySlice`.
+    /// DPB slot = decode texture `ArraySlice`.
     pub slot: u8,
     pub id: PicId,
     pub is_long_term: bool,
-    /// The stored picture's 8.2.1 field order counts — `FieldOrderCntList[i]`.
+    /// 8.2.1 field order counts — `FieldOrderCntList[i]`.
     pub top_field_order_cnt: i32,
     pub bottom_field_order_cnt: i32,
     /// `FrameNumList[i]`: `frame_num` for a short-term reference,
@@ -114,141 +66,80 @@ impl DxvaRef {
     }
 }
 
-/// Everything CPU-derivable of one AU's DXVA submission. The Windows layer adds
-/// the live objects: the decoder, the mapped buffers and the output view.
+/// CPU-derivable half of one AU's DXVA submission. The Windows layer adds the
+/// decoder, mapped buffers and output view.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodePlanDxva {
     pub pic_params: PicParamsH264,
     pub qmatrix: QmatrixH264,
-    /// Byte ranges of the AU's slice NALUs, start code included, in plan order —
-    /// exactly what [`crate::pack::pack`] takes.
+    /// Slice NALU byte ranges, start code included — what [`crate::pack::pack`] takes.
     pub slice_ranges: Vec<Range<usize>>,
-    /// The surface the decoded picture is written into
-    /// (`CreateVideoDecoderOutputView` over this array slice, and
-    /// `DecoderBeginFrame`'s target).
+    /// Decode target surface (`CreateVideoDecoderOutputView` / `DecoderBeginFrame`).
     pub setup_slot: u8,
-    /// The planner id of the decoded picture (`AuPlan.dpb.stored`).
+    /// Planner id of the decoded picture (`AuPlan.dpb.stored`).
     pub setup_id: PicId,
-    /// Whether later AUs may reference the decoded picture. When `false` the
-    /// surface exists for the decode itself plus any remaining DPB residency,
-    /// and may already have been released by this very AU's `removed`.
+    /// Whether later AUs may reference this picture. When `false` the surface
+    /// exists for this decode plus remaining DPB residency, and this AU's
+    /// `removed` may already have released it.
     pub setup_is_reference: bool,
-    /// Surfaces this access unit's own end-of-picture bookkeeping retires while the
-    /// submission still NAMES them. Release them once the decode op is issued —
-    /// never inside the conversion, and never dropped.
+    /// Pictures this AU's end-of-picture bookkeeping retires while the
+    /// submission still names them. Release once the decode op is issued —
+    /// never inside the conversion.
     ///
-    /// # Why the conversion cannot release them
+    /// [`SlotMap::assign`] takes the lowest free slot. Release here and the
+    /// setup assignment reuses the surface, so `CurrPic` and a `RefFrameList`
+    /// entry alias. [`AuPlan::dpb_refs`] is snapshotted in `begin_picture`,
+    /// before 8.2.5 marking and C.4.5.3 bump, so a sliding-window unmark plus
+    /// bump can land the same picture in both `dpb_refs` and `dpb.removed`.
     ///
-    /// [`SlotMap::assign`] takes the LOWEST FREE slot. Release a picture here and the
-    /// setup assignment two lines later hands its surface straight back, so the
-    /// submission says `CurrPic = N` and `RefFrameList[k] = N` in one breath: the
-    /// picture decodes into a surface it predicts from. That is the AV1 defect of
-    /// 2026-08-07 ([`crate::pic_av1::DecodePlanDxvaAv1::release_after_decode`]) on this
-    /// codec, and on H.264 it is not exotic at all.
-    ///
-    /// [`AuPlan::dpb_refs`] — which `RefFrameList` is built from — is snapshotted in
-    /// `H264Planner::begin_picture`, BEFORE `finish_picture` runs 8.2.5's marking and
-    /// C.4.5.3's bump. So a picture the sliding window unmarks and the bump then evicts
-    /// lands in both `dpb_refs` and `dpb.removed` for the same AU. It needs the two to
-    /// coincide, which needs the evicted picture to be already OUTPUT — and that is
-    /// precisely low-delay H.264: `max_num_reorder_frames = 0`, a picture output the
-    /// moment it decodes.
-    ///
-    /// **Measured 2026-08-07, and it is the ordinary case, not a corner.** Every stream
-    /// a punktfunk host emits does it on 297 of 300 access units — 720p, 1080p and
-    /// 2160p alike, on both this rung and [`pf_vkdecode::pic::DecodePlanVk`]'s. NVENC
-    /// writes `max_num_ref_frames = 3` AND `max_dec_frame_buffering = 3`: the DPB is
-    /// exactly as deep as the reference count, so the window unmarks the oldest
-    /// reference in the very AU whose bump evicts it. The aliased picture is
-    /// `ref_idx 2` of a three-entry `num_ref_idx_l0_active` list — addressable by any
-    /// macroblock, not a spare the hardware could ignore.
-    ///
-    /// `test-25fps.h264` measures ZERO and that is why this survived to here: it is
-    /// level 1.3 with no VUI `bitstream_restriction`, so its DPB is the level-derived 7
-    /// against 2 reference frames, and it REORDERS, which keeps an unmarked picture
-    /// alive past the AU that unmarked it. `data/lowdelay-640x480.h264` is vendored to
-    /// close exactly that gap.
-    ///
-    /// # Why the caller can release them safely
-    ///
-    /// The surfaces must outlive the CONVERSION, not the decode. One AU is planned,
-    /// converted and submitted before the next is planned, so once the decode op is
-    /// issued nothing can be assigned them before the next conversion — the same
-    /// argument the AV1 rung's deferral rests on.
-    ///
-    /// # Deferring the whole `removed` list rather than a filtered part
-    ///
-    /// Some removals are pictures no `RefFrameList` entry names (a non-reference
-    /// picture bumped long after it was unmarked), and those could be released here.
-    /// They are not, for three reasons: `refs` is built from the SLICE LISTS as well as
-    /// the snapshot, so a filter on `dpb_refs` would still miss a concealment
-    /// substitute the lists name; deferring costs nothing, because
-    /// [`SlotMap::new`]'s spare slot means `assign` always has a free slot while every
-    /// removal is still held (the DPB never exceeds `max_dpb_frames`, and the map holds
-    /// `max_dpb_frames + 1`); and one unconditional rule is a thing a reader can check.
+    /// The surfaces must outlive the conversion, not the decode: one AU is
+    /// planned, converted and submitted before the next. The whole `removed`
+    /// list is deferred — `refs` is also built from the slice lists (a
+    /// `dpb_refs` filter would miss a concealment substitute), and
+    /// [`SlotMap::new`]'s spare slot always leaves `assign` a free slot.
     pub release_after_decode: Vec<PicId>,
-    /// The marked DPB, resolved to surfaces — the AU's own references first, then
-    /// every other marked picture (module docs). Laid out in exactly this order in
-    /// `pic_params.RefFrameList`.
+    /// Marked DPB, resolved to surfaces — AU references first, then the rest
+    /// (module docs). Same order as `pic_params.RefFrameList`.
     pub refs: Vec<DxvaRef>,
-    /// `MbWidth * MbHeight` of the coded picture: what libavcodec writes into the
-    /// `NumMBsInBuffer` of the BITSTREAM and SLICE_CONTROL buffer descriptors on
-    /// the H.264 path (`commit_bitstream_and_slice_buffer`, both slice formats).
-    ///
-    /// The picture parameters already carry the same two numbers, so this is a
-    /// convenience rather than new information — but the Windows layer sees only
-    /// the packed bytes, and a descriptor field libavcodec fills is not a field to
-    /// leave at zero on the strength of its being redundant. A driver that
-    /// validates the descriptor rejects at the first `SubmitDecoderBuffers`, which
-    /// is precisely the failure this backend's "reproduce libavcodec exactly"
-    /// method exists to avoid.
+    /// `MbWidth * MbHeight`. The picture parameters already carry both numbers,
+    /// but the Windows layer sees only packed bytes and a driver that validates
+    /// the descriptor rejects `NumMBsInBuffer == 0` at `SubmitDecoderBuffers`.
     pub mb_count: u32,
 }
 
-/// Conversion failures. Stream DAMAGE never lands here — pf-bitstream degrades it
-/// to [`pf_bitstream::h264::PlanWarning`]s upstream; these are caller bugs, or
-/// features outside what this backend submits.
+/// Conversion failures. Stream damage never lands here — pf-bitstream
+/// degrades it to [`pf_bitstream::h264::PlanWarning`]s upstream; these are
+/// caller bugs or features this backend does not submit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanToDxvaError {
-    /// The plan holds no slices; there is nothing to submit.
     NoSlices,
-    /// The plan's `DpbUpdate.stored` is `None`. `plan_au` always stores; only
-    /// `flush()` produces such updates, and those go to
-    /// [`SlotMap::apply`](pf_vkdecode::SlotMap::apply) directly.
+    /// `DpbUpdate.stored` is `None`. `plan_au` always stores; only `flush()`
+    /// produces this, and those updates go to [`SlotMap::apply`] directly.
     NoStoredId,
-    /// A reference list entry's id holds no slot: an earlier plan of this stream
-    /// never went through this [`SlotMap`].
+    /// A reference id holds no slot — an earlier plan never went through this map.
     UnresolvedReference(PicId),
     Slot(SlotError),
-    /// The map was built for a different DPB depth than this plan's
-    /// `max_dpb_frames` — an SPS renegotiation resized the DPB. The session must
-    /// rebuild the decoder, its surface pool and its [`SlotMap`]; converting
-    /// against the stale map would hand out surface indices the pool does not
-    /// have.
+    /// Map DPB depth differs from this plan's `max_dpb_frames` — SPS
+    /// renegotiation. Rebuild decoder, surface pool and [`SlotMap`]; converting
+    /// against the stale map would hand out surface indices the pool lacks.
     CapacityMismatch {
         required: usize,
         capacity: usize,
     },
-    /// The AU references more distinct pictures than `RefFrameList` holds.
-    /// Unreachable from a spec-conformant stream (16 is the H.264 ceiling too),
-    /// and an error rather than a truncation because a dropped reference decodes
-    /// to a wrong picture instead of a missing one.
+    /// More distinct references than `RefFrameList` holds. Unreachable from a
+    /// spec-conformant stream (16 is H.264's ceiling too). An error, not a
+    /// truncation: a dropped reference decodes to a wrong picture.
     TooManyReferences(usize),
-    /// Flexible macroblock ordering. `SliceGroupMap` would have to carry a
-    /// derived map this backend does not build; punktfunk hosts never emit FMO,
-    /// and libavcodec's own DXVA path does not implement it either. Refusing
-    /// hands the session to the FFmpeg rung with a clean stream.
+    /// FMO (`num_slice_groups_minus1 != 0`). This backend does not build
+    /// `SliceGroupMap`; refusing hands the session to the FFmpeg rung.
     SliceGroups {
         count: u32,
     },
-    /// `separate_colour_plane_flag` (4:4:4 with independently coded planes).
-    /// pf-bitstream's envelope gate refuses it upstream; checked again here
-    /// because the picture-parameters layout for it is a different shape
-    /// entirely.
+    /// `separate_colour_plane_flag`. Refused upstream; checked again because
+    /// the picture-parameters layout for it is a different shape.
     SeparateColourPlanes,
-    /// A picture dimension in macroblocks exceeds the `USHORT` the picture
-    /// parameters carry — 65536 macroblocks a side, i.e. a megapixel-scale
-    /// impossibility off a real SPS.
+    /// A picture dimension exceeds the `USHORT` the picture parameters carry
+    /// (65536 macroblocks a side).
     DimensionOverflow {
         width_mbs: u32,
         height_mbs: u32,
@@ -310,22 +201,14 @@ impl From<SlotError> for PlanToDxvaError {
 
 /// Convert one planned AU, driving `slots` through the AU's slot lifecycle.
 ///
-/// `status_id` becomes `StatusReportFeedbackNumber` — a per-picture tag the
-/// driver echoes in its status reports. libavcodec makes it a monotonic counter
-/// starting at 1; the caller does the same, because 0 is the value a driver reads
-/// out of a buffer nobody wrote.
+/// `status_id` becomes `StatusReportFeedbackNumber`. libavcodec starts at 1;
+/// 0 is the value a driver reads out of a buffer nobody wrote.
 ///
-/// Atomicity contract, identical to [`pf_vkdecode::plan_to_vk`]'s: every fallible
-/// step runs before any mutation of `slots`, so an error leaves the map exactly
-/// as it was. In order:
-/// 1. envelope and capacity are validated (read-only);
-/// 2. references resolve against the PRE-removal state (read-only) — this AU's
-///    own end-of-picture marking can evict a picture its slices legitimately
-///    reference;
-/// 3. the setup slot is assigned last, and `removed` is NOT applied at all: it
-///    leaves as [`DecodePlanDxva::release_after_decode`] for the caller to apply
-///    once the decode op is issued. Applying it here would give the assignment
-///    back a surface this submission still names — see that field's docs.
+/// Atomicity matches [`pf_vkdecode::plan_to_vk`]: every fallible step runs
+/// before any mutation of `slots`. Envelope and capacity first (read-only);
+/// references resolve against the pre-removal state (this AU's marking can
+/// evict a picture its slices still name); setup is assigned last, and
+/// `removed` leaves as [`DecodePlanDxva::release_after_decode`].
 pub fn plan_to_dxva(
     plan: &AuPlan,
     slots: &mut SlotMap,
@@ -346,8 +229,6 @@ pub fn plan_to_dxva(
         return Err(PlanToDxvaError::SeparateColourPlanes);
     }
 
-    // The map must match THIS plan's DPB depth; a mismatch means an SPS
-    // renegotiation resized the DPB and the decoder must be rebuilt.
     let required = pic.max_dpb_frames + 1;
     if slots.capacity() != required {
         return Err(PlanToDxvaError::CapacityMismatch {
@@ -356,11 +237,9 @@ pub fn plan_to_dxva(
         });
     }
 
-    // Picture dimensions in macroblocks. Height is expressed in FRAME
-    // macroblocks (the DXVA spec is explicit that it is not a field count), so
-    // the map-units count doubles for a non-frame-only SPS — unreachable inside
-    // pf-bitstream's progressive envelope, written out anyway so the expression
-    // says what the spec says rather than what our envelope happens to allow.
+    // Height is FRAME macroblocks, not a field count. The map-units count
+    // doubles for a non-frame-only SPS — unreachable under the progressive
+    // envelope, written so the expression matches the spec.
     let width_mbs = u32::from(sps.pic_width_in_mbs_minus1) + 1;
     let height_mbs = (u32::from(sps.pic_height_in_map_units_minus1) + 1)
         * (2 - u32::from(sps.frame_mbs_only_flag));
@@ -374,22 +253,17 @@ pub fn plan_to_dxva(
         });
     };
 
-    // `RefFrameList`: the marked DPB (module docs), the AU's own references first
-    // so a DPB deeper than the array can only lose a picture no slice names.
-    // Per-slice list ORDER (the `ref_idx` mapping) is not expressed here at all —
-    // it lives in the slice headers the hardware parses.
+    // Marked DPB, AU references first (module docs). Per-slice `ref_idx` order
+    // lives in the slice headers the hardware parses, not here.
     let mut refs: Vec<DxvaRef> = Vec::new();
     for slice in &plan.slices {
         for rp in slice.ref_list0.iter().chain(&slice.ref_list1) {
             if refs.iter().any(|existing| existing.id == rp.id) {
                 continue;
             }
-            // The snapshot is the authority for the marking and the pair-key: a
-            // list entry may be a concealment substitute relabelled short-term
-            // (module docs). A list naming a picture the DPB does not hold marked
-            // is a planner-contract violation rather than stream damage; it cannot
-            // happen off 8.2.4 (every initial list is built FROM the marked DPB),
-            // and the entry's own copy is the honest fallback if it ever does.
+            // Snapshot is the authority for marking and pair-key (module docs).
+            // A list naming an unmarked picture is a planner-contract violation;
+            // the entry's own copy is the fallback if it ever happens.
             let marked = plan.dpb_refs.iter().find(|d| d.id == rp.id);
             if marked.is_none() {
                 trace!(
@@ -403,18 +277,12 @@ pub fn plan_to_dxva(
             refs.push(DxvaRef::new(slot, marked.unwrap_or(rp)));
         }
     }
-    // The AU's own set is what the array MUST hold; 16 is the H.264 ceiling too,
-    // so exceeding it means the plan is malformed. An error rather than a
-    // truncation, because a dropped reference decodes to a wrong picture instead
-    // of a missing one.
     if refs.len() > REF_FRAME_LIST_LEN {
         return Err(PlanToDxvaError::TooManyReferences(refs.len()));
     }
-    // Then the rest of the marked DPB, in the planner's DPB order. Overflow past
-    // the array is dropped rather than refused: these are pictures this AU does
-    // not reference, so the decode is unaffected and refusing would cost the
-    // whole picture. A slot the map never saw is skipped for the same reason —
-    // the AU's own references have already been resolved strictly above.
+    // Rest of the marked DPB. Overflow is dropped, not refused: these pictures
+    // are not referenced, so a missing tail does not change the decode. An
+    // unseen slot is skipped for the same reason — AU refs already resolved.
     for rp in &plan.dpb_refs {
         if refs.len() == REF_FRAME_LIST_LEN {
             trace!(
@@ -438,31 +306,26 @@ pub fn plan_to_dxva(
     pp.num_ref_frames = sps.max_num_ref_frames;
     pp.bit_depth_luma_minus8 = pic.bit_depth_luma_minus8;
     pp.bit_depth_chroma_minus8 = pic.bit_depth_chroma_minus8;
-    // Reserved, and not actually free: libavcodec writes 3 here for every
-    // standard profile (0 only for the legacy Intel ClearVideo GUID and for the
-    // old ATI zigzag workaround, neither of which this backend uses), and the
-    // Microsoft reference decoder does the same. Left at 3 rather than 0 so we
-    // are byte-identical to the path every Windows player exercises.
+    // Reserved, not free: libavcodec and the Microsoft reference decoder write
+    // 3 for every standard profile. 0 is the Intel ClearVideo / ATI zigzag
+    // workaround, which this backend does not use.
     pp.Reserved16Bits = 3;
     pp.StatusReportFeedbackNumber = status_id;
     pp.CurrFieldOrderCnt = [pic.top_field_order_cnt, pic.bottom_field_order_cnt];
     pp.pic_init_qs_minus26 = pps.pic_init_qs_minus26;
     pp.chroma_qp_index_offset = pps.chroma_qp_index_offset;
     pp.second_chroma_qp_index_offset = pps.second_chroma_qp_index_offset;
-    // "The fields after ContinuationFlag are present." Always, here: this
-    // backend never submits the truncated form.
+    // Fields after ContinuationFlag are present. Always: we never truncate.
     pp.ContinuationFlag = 1;
     pp.pic_init_qp_minus26 = pps.pic_init_qp_minus26;
-    // The PPS defaults, NOT a slice's override: the picture parameters describe
-    // the parameter set, and each slice header carries its own
+    // PPS defaults, not a slice override. Each slice header carries its own
     // `num_ref_idx_active_override_flag` for the hardware to apply.
     pp.num_ref_idx_l0_active_minus1 = pps.num_ref_idx_l0_default_active_minus1;
     pp.num_ref_idx_l1_active_minus1 = pps.num_ref_idx_l1_default_active_minus1;
     pp.frame_num = pic.frame_num;
     pp.log2_max_frame_num_minus4 = sps.log2_max_frame_num_minus4;
     pp.pic_order_cnt_type = sps.pic_order_cnt_type;
-    // Each POC type reads exactly one of these; the other stays 0 rather than
-    // carrying a value the SPS never coded for this type.
+    // Each POC type reads exactly one of these; the other stays 0.
     if sps.pic_order_cnt_type == 0 {
         pp.log2_max_pic_order_cnt_lsb_minus4 = sps.log2_max_pic_order_cnt_lsb_minus4;
     } else if sps.pic_order_cnt_type == 1 {
@@ -471,8 +334,7 @@ pub fn plan_to_dxva(
     pp.direct_8x8_inference_flag = u8::from(sps.direct_8x8_inference_flag);
     pp.entropy_coding_mode_flag = u8::from(pps.entropy_coding_mode_flag);
     pp.pic_order_present_flag = u8::from(pps.bottom_field_pic_order_in_frame_present_flag);
-    // num_slice_groups_minus1 / slice_group_map_type / slice_group_change_rate_minus1
-    // / SliceGroupMap all stay 0: FMO was refused above.
+    // FMO fields stay 0: slice groups were refused above.
     pp.deblocking_filter_control_present_flag =
         u8::from(pps.deblocking_filter_control_present_flag);
     pp.redundant_pic_cnt_present_flag = u8::from(pps.redundant_pic_cnt_present_flag);
@@ -489,69 +351,44 @@ pub fn plan_to_dxva(
         weighted_bipred_idc: pps.weighted_bipred_idc,
         frame_mbs_only_flag: sps.frame_mbs_only_flag,
         transform_8x8_mode_flag: pps.transform_8x8_mode_flag,
-        // The DXVA spec defines MinLumaBipredSize8x8Flag as level_idc >= 31,
-        // which is the level at which 8x8 is the smallest bi-predicted luma
-        // block; libavcodec writes the identical comparison.
+        // DXVA: MinLumaBipredSize8x8Flag is `level_idc >= 31` (8x8 is then
+        // the smallest bi-predicted luma block). libavcodec writes the same.
         min_luma_bipred_size_8x8: pic.level_idc as u8 >= 31,
         intra_pic_flag: is_intra,
     }
     .pack();
 
-    // The reference arrays: entry i describes RefFrameList[i]. Unused entries are
-    // 0xFF with zeroed counts, which is the padding both the spec and every
-    // shipping decoder use.
+    // Unused entries are 0xFF with zeroed counts — spec and shipping-decoder padding.
     pp.RefFrameList = [PicEntry::UNUSED; REF_FRAME_LIST_LEN];
     for (i, r) in refs.iter().enumerate() {
         pp.RefFrameList[i] = PicEntry::new(r.slot, r.is_long_term);
-        // Both field counts of a progressive frame; a real pair whenever the PPS
-        // carried bottom_field_pic_order_in_frame_present_flag. TOP first — the
-        // one ordering in this file no vector of ours can catch, because a
-        // progressive stream without that flag has the two counts equal.
+        // Both field counts of a progressive frame. TOP first — a swapped pair
+        // is invisible when the PPS does not code a distinct bottom count.
         pp.FieldOrderCntList[i] = [r.top_field_order_cnt, r.bottom_field_order_cnt];
-        // frame_num for short-term references, LongTermFrameIdx for long-term
-        // ones — the pair-key DXVA identifies references by, exactly as
-        // pf-bitstream's DPB snapshot hands it over.
         pp.FrameNumList[i] = r.frame_num_or_lt_idx;
-        // Two bits per entry: top field at 2i, bottom at 2i+1. A progressive
-        // frame reference is marked for both. `i < 16` bounds the shift.
+        // Two bits per entry: top at 2i, bottom at 2i+1. A progressive frame
+        // is marked for both. `i < 16` bounds the shift.
         pp.UsedForReferenceFlags |= 0b11 << (2 * i);
     }
-    // NonExistingFrameFlags stays 0: pf-bitstream substitutes for a lost
-    // reference and warns; it never hands over a "non-existing frame" placeholder
-    // for the hardware to invent a picture from.
+    // NonExistingFrameFlags stays 0: pf-bitstream substitutes a lost reference
+    // and warns; it never hands over a placeholder for the hardware to invent.
 
-    // The quantization matrices, in the coded (zig-zag) order both the parser
-    // stores and DXVA wants — see `QmatrixH264`'s docs. The PPS's lists are
-    // authoritative: the parser has already applied Table 7-2's fallback rules,
-    // so a PPS that codes no matrix already carries the SPS's (or the flat
-    // default).
+    // Coded (zig-zag) order, both the parser and DXVA. PPS lists are
+    // authoritative: Table 7-2 fallbacks already applied (SPS or flat default).
     let mut qm = QmatrixH264::zeroed();
     qm.bScalingLists4x4 = pps.scaling_lists_4x4;
-    // Only Intra-Y and Inter-Y travel: DXVA has two 8x8 slots because 8x8 chroma
-    // lists exist only in 4:4:4, which is refused above. The vendored parser
-    // stores the 4:2:0 pair at indices 0 and 1 (its loop runs `for i in
-    // 0..num_8x8` with num_8x8 = 2) — NOT at 0 and 3 the way libavcodec's own
-    // scaling_matrix8 is indexed.
+    // Only Intra-Y and Inter-Y: DXVA has two 8x8 slots because 8x8 chroma
+    // lists exist only in 4:4:4, refused above. Parser stores the 4:2:0 pair
+    // at 0 and 1, not 0 and 3 (libavcodec's `scaling_matrix8` indexing).
     qm.bScalingLists8x8[0] = pps.scaling_lists_8x8[0];
     qm.bScalingLists8x8[1] = pps.scaling_lists_8x8[1];
 
     let slice_ranges: Vec<Range<usize>> = plan.slices.iter().map(|s| s.data.clone()).collect();
 
-    // Mutations LAST, after every fallible step above (fn docs).
-    //
-    // The removals are NOT applied here — they are handed back as
-    // `release_after_decode` for the caller to apply once the decode op is issued,
-    // because releasing them now would return their surfaces to the setup
-    // assignment below and alias `CurrPic` with a `RefFrameList` entry. The field's
-    // docs carry the measurement; this is the ordinary case on every stream a
-    // punktfunk host emits.
-    //
-    // The AU's own picture can itself appear in `removed`: a non-reference
-    // picture with no free frame buffer bypasses the DPB and is stored-and-
-    // evicted within one plan. Its surface must still exist for the decode
-    // itself, so it is assigned here and released right after — the one removal
-    // that cannot be deferred, since deferring it would hand the caller the
-    // surface being decoded into.
+    // Mutations last (fn docs). Removals are not applied here.
+    // The AU's own picture can appear in `removed`: a non-reference with no
+    // free frame buffer is stored-and-evicted in one plan. Assign it, then
+    // release immediately — deferring would hand the caller the decode target.
     let setup_evicted = plan.dpb.removed.contains(&setup_id);
     let release_after_decode: Vec<PicId> = plan
         .dpb
@@ -564,15 +401,11 @@ pub fn plan_to_dxva(
     if setup_evicted {
         slots.release(setup_id);
     }
-    // Written after the assignment for the obvious reason that the surface index
-    // is not known until then; AssociatedFlag is the bottom-field flag, 0 by the
-    // progressive envelope.
+    // AssociatedFlag is the bottom-field flag; 0 under the progressive envelope.
     pp.CurrPic = PicEntry::new(setup_slot, false);
 
-    // `first_slice` is read for nothing but this debug aid today — the DXVA
-    // picture parameters name no PPS id (unlike Vulkan's Std picture info,
-    // which does), because the parameter set travels IN the picture parameters
-    // rather than being referenced by id.
+    // DXVA picture parameters name no PPS id: the parameter set travels in
+    // the picture parameters. `first_slice` is only this cross-check.
     debug_assert_eq!(
         first_slice.header.pic_parameter_set_id, pps.pic_parameter_set_id,
         "the plan's activated PPS must be the first slice's"
@@ -591,18 +424,16 @@ pub fn plan_to_dxva(
     })
 }
 
-/// The slice-control records for a packed AU.
-///
-/// Split from [`plan_to_dxva`] because the byte locations only exist after the
-/// bitstream buffer is mapped and packed — the conversion is per-plan, this is
-/// per-submission.
+/// Slice-control records for a packed AU. Split from [`plan_to_dxva`]
+/// because the byte locations exist only after the bitstream buffer is
+/// mapped and packed — conversion is per-plan, this is per-submission.
 pub fn slice_control(records: &[crate::pack::SliceRecord]) -> Vec<SliceH264Short> {
     records
         .iter()
         .map(|r| SliceH264Short {
             BSNALunitDataLocation: r.location,
             SliceBytesInBuffer: r.bytes,
-            // 0 — a whole slice in one buffer; this backend never chops.
+            // Whole slice in one buffer; this backend never chops.
             wBadSliceChopping: 0,
         })
         .collect()
@@ -627,27 +458,19 @@ mod tests {
 
     use super::*;
 
-    /// The same vendored vector pf-bitstream and pf-vkdecode plan (goldens: 250
-    /// AUs, 500 slices), included from the same path rather than copied.
+    /// Shared vendored vector (same path as pf-bitstream / pf-vkdecode goldens).
     const TEST_25FPS: &[u8] = include_bytes!(
         "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
     );
 
-    /// **Our own host's output**, and the only stream in this repository that reaches
-    /// the shape `release_after_decode` exists for: low-delay IPPP, 120 pictures,
-    /// `max_num_reorder_frames = 0`, and a DPB exactly as deep as its reference count.
-    ///
-    /// Vendored beside the goldens the GPU legs decode it against (that file's header
-    /// carries the `punktfunk-host spike` command and the ffmpeg cross-check), because
-    /// three crates need it: this one for the CPU proof, `pf-vkdecode`'s `gpu_parity`
-    /// and `pf-client-core`'s `video_d3d11_native::parity` for the hardware one.
+    /// Host-emitted low-delay IPPP: `max_num_reorder_frames = 0` and a DPB
+    /// as deep as its reference count — the shape `release_after_decode`
+    /// exists for. Shared with `pf-vkdecode` and `pf-client-core` GPU legs.
     const LOWDELAY_640X480: &[u8] =
         include_bytes!("../../pf-vkdecode/tests/data/lowdelay-640x480.h264");
 
-    /// Test-only AU splitter, the same shape pf-vkdecode's `pic` tests use
-    /// (which in turn mirrors pf-bitstream's `#[cfg(test)]`-private helper): a
-    /// new AU starts at a non-slice NALU following a slice, or at a slice whose
-    /// `first_mb_in_slice` is 0 following a slice.
+    /// Test-only AU splitter. A new AU starts at a non-slice NALU following
+    /// a slice, or at a slice whose `first_mb_in_slice` is 0 following a slice.
     fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
         use cros_codecs::codec::h264::parser::NaluType;
         let mut aus = Vec::new();
@@ -673,20 +496,16 @@ mod tests {
         aus
     }
 
-    /// Plan the vendored stream and convert every AU, returning the plans paired
-    /// with their conversions.
     fn convert_stream() -> Vec<(AuPlan, DecodePlanDxva)> {
         convert(TEST_25FPS)
     }
 
-    /// The same over [`LOWDELAY_640X480`].
     fn convert_low_delay() -> Vec<(AuPlan, DecodePlanDxva)> {
         convert(LOWDELAY_640X480)
     }
 
-    /// Plan and convert a whole stream the way a caller does — including applying
-    /// `release_after_decode` once the (notional) decode op is issued, which is what
-    /// keeps the ledger from filling up over 120 access units.
+    /// Plan and convert a stream the way a caller does: apply
+    /// `release_after_decode` once the (notional) decode op is issued.
     fn convert(stream: &[u8]) -> Vec<(AuPlan, DecodePlanDxva)> {
         let mut planner = H264Planner::new();
         let mut slots: Option<SlotMap> = None;
@@ -708,10 +527,8 @@ mod tests {
         out
     }
 
-    /// A 64x64 Main-profile SPS/PPS pair, for the one shape no vendored vector
-    /// carries: long-term reference marking. Authored with the vendored builders
-    /// and synthesizer, exactly as pf-bitstream's own MMCO tests do — slice headers
-    /// written by hand below because upstream has no slice-header synthesizer.
+    /// Authored 64x64 Main SPS/PPS for long-term marking (no vendored vector
+    /// carries MMCO). Slice headers are written by hand: no synthesizer exists.
     fn authored_sps_pps() -> (Rc<Sps>, Rc<Pps>) {
         let sps = SpsBuilder::new()
             .seq_parameter_set_id(0)
@@ -756,9 +573,8 @@ mod tests {
         buf
     }
 
-    /// One P slice NALU. `mmco_ops` = `None` for sliding-window marking, `Some`
-    /// for adaptive marking with `(operation, single-argument)` pairs — the writer
-    /// appends the terminating op 0.
+    /// One P slice NALU. `mmco_ops = None` is sliding-window; `Some` is
+    /// adaptive `(operation, arg)` pairs. The writer appends terminating op 0.
     fn write_p_slice(
         frame_num: u32,
         poc_lsb: u32,
@@ -800,9 +616,7 @@ mod tests {
         buf
     }
 
-    /// The unique pictures the AU's own slice lists name, in first-appearance
-    /// order — what `RefFrameList` used to hold, and what it must now merely start
-    /// with.
+    /// Unique pictures the AU's own slice lists name, in first-appearance order.
     fn au_reference_ids(plan: &AuPlan) -> Vec<PicId> {
         let mut ids = Vec::new();
         for slice in &plan.slices {
@@ -821,8 +635,7 @@ mod tests {
         let mut wider_than_the_au = 0usize;
         for (plan, dxva) in &converted {
             let au = au_reference_ids(plan);
-            // The AU's own references lead, in their own order: truncation at the
-            // array's sixteen can then only ever drop a picture no slice names.
+            // AU references lead: truncation at 16 can only drop a picture no slice names.
             assert_eq!(
                 dxva.refs
                     .iter()
@@ -831,8 +644,6 @@ mod tests {
                     .collect::<Vec<_>>(),
                 au
             );
-            // And the whole marked DPB is there — every picture the planner reports
-            // marked, none missing, none invented.
             let mut listed: Vec<PicId> = dxva.refs.iter().map(|r| r.id).collect();
             let mut marked: Vec<PicId> = plan.dpb_refs.iter().map(|r| r.id).collect();
             listed.sort_unstable();
@@ -842,8 +653,7 @@ mod tests {
                 wider_than_the_au += 1;
             }
         }
-        // This vector is not a degenerate case for the change: the DPB holds a
-        // reference the AU's own lists do not reach on nearly half its pictures.
+        // Not a degenerate vector: many AUs name a proper subset of the marked DPB.
         assert!(
             wider_than_the_au >= 100,
             "only {wider_than_the_au} of {} AUs exercised the difference",
@@ -853,17 +663,16 @@ mod tests {
 
     #[test]
     fn a_long_term_reference_no_slice_names_still_reaches_the_reference_list() {
-        // The RFI shape, end to end: an anchor pinned long-term that the current
-        // picture's (truncated) reference list never names. Built here rather than
-        // taken from a vector because no vendored vector carries an MMCO 6.
+        // Long-term anchor that the current (truncated) list never names.
+        // Authored: no vendored vector carries MMCO 6.
         let (sps, pps) = authored_sps_pps();
         let mut au0 = Vec::new();
         Synthesizer::<'_, Sps, _>::synthesize(3, &sps, &mut au0, true).unwrap();
         Synthesizer::<'_, Pps, _>::synthesize(3, &pps, &mut au0, true).unwrap();
         au0.extend(write_idr_slice());
-        // AU1 pins itself long-term (MMCO 4 admits index 0, MMCO 6 assigns it).
+        // MMCO 4 admits index 0; MMCO 6 assigns it (pin long-term).
         let au1 = write_p_slice(1, 2, 1, 1, Some(&[(4, 1), (6, 0)]));
-        // AU2 activates ONE reference, which 8.2.4.2.1 makes the short-term IDR.
+        // One active reference: 8.2.4.2.1 makes that the short-term IDR.
         let au2 = write_p_slice(2, 4, 1, 1, None);
 
         let mut planner = H264Planner::new();
@@ -882,8 +691,7 @@ mod tests {
         let lt_id = plans[1].dpb.stored.unwrap();
         assert_eq!(au_reference_ids(&plans[2]), vec![idr_id]);
 
-        // Both pictures are in RefFrameList: the one AU2 names, and the long-term
-        // anchor it does not. A driver told the anchor is gone may discard it.
+        // AU2's named ref plus the unnamed long-term. Absence may be a retirement.
         let dxva = &converted[2];
         assert_eq!(
             dxva.refs
@@ -892,7 +700,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(idr_id, false, 0), (lt_id, true, 0)]
         );
-        // …with the marking and pair-key the DPB holds, not the slice list's.
         assert!(
             dxva.pic_params.RefFrameList[1].associated(),
             "AssociatedFlag"
@@ -904,11 +711,8 @@ mod tests {
 
     #[test]
     fn an_unequal_field_order_count_pair_rides_through_top_first() {
-        // Every vector this crate has is progressive with
-        // bottom_field_pic_order_in_frame_present_flag clear, so TopFieldOrderCnt
-        // == BottomFieldOrderCnt everywhere and a swapped pair is invisible across
-        // all 250 AUs. The pair is real whenever a PPS does carry that flag, so
-        // this drives one through the conversion with the two counts distinct.
+        // Vendored vectors have equal top/bottom counts, so a swapped pair is
+        // invisible. Drive one AU with distinct counts.
         let mut planner = H264Planner::new();
         let aus = split_into_aus(TEST_25FPS);
         let first = planner.plan_au(aus[0]).expect("plan 0");
@@ -943,17 +747,14 @@ mod tests {
 
     #[test]
     fn the_macroblock_count_is_the_coded_picture_in_macroblocks() {
-        // libavcodec writes this into `NumMBsInBuffer` on the H.264 bitstream and
-        // slice-control descriptors (`commit_bitstream_and_slice_buffer`:
-        // `h->mb_width * h->mb_height`). The vendored vector is 320x240 — 20x15
-        // macroblocks.
+        // libavcodec's `NumMBsInBuffer` is `mb_width * mb_height`. This vector
+        // is 320x240 → 20×15 macroblocks.
         for (plan, dxva) in convert_stream() {
             let width = u32::from(plan.sps.pic_width_in_mbs_minus1) + 1;
             let height = (u32::from(plan.sps.pic_height_in_map_units_minus1) + 1)
                 * (2 - u32::from(plan.sps.frame_mbs_only_flag));
             assert_eq!(dxva.mb_count, width * height);
             assert_eq!(dxva.mb_count, 20 * 15);
-            // The same two numbers the picture parameters carry, minus one each.
             assert_eq!(
                 u32::from(dxva.pic_params.wFrameWidthInMbsMinus1 + 1)
                     * u32::from(dxva.pic_params.wFrameHeightInMbsMinus1 + 1),
@@ -965,41 +766,22 @@ mod tests {
     #[test]
     fn the_whole_vendored_stream_converts_without_a_single_refusal() {
         let converted = convert_stream();
-        // pf-bitstream's own golden for this vector is 250 planned AUs; the
-        // conversion must not lose any of them.
+        // pf-bitstream's golden for this vector is 250 planned AUs.
         assert_eq!(converted.len(), 250);
     }
 
-    /// The hazard the vendored vector CANNOT see, on a stream that can.
+    /// `removed ∩ dpb_refs` is the aliasing precondition: a picture this AU
+    /// retires while `RefFrameList` still names it. Release it inside the
+    /// conversion and [`SlotMap::assign`] hands its surface to `CurrPic`.
     ///
-    /// `removed ∩ dpb_refs` is the aliasing precondition: a picture this AU's own
-    /// end-of-picture bookkeeping retires while `RefFrameList` still names it. Release
-    /// it inside the conversion and [`SlotMap::assign`] hands its surface straight back
-    /// to `CurrPic`, so the picture decodes into one it predicts from.
+    /// `test-25fps.h264` is blind: level 1.3 with no VUI restriction (DPB 7
+    /// vs 2 refs) and it reorders, so an unmarked picture stays for output.
+    /// `lowdelay-640x480.h264` is host output with DPB depth equal to the
+    /// reference count and `max_num_reorder_frames = 0`, so the window unmarks
+    /// the oldest reference in the AU whose bump evicts it.
     ///
-    /// On `test-25fps.h264` the intersection is **zero**, and for two independent
-    /// reasons that both happen to be properties of that vector rather than of H.264:
-    /// it is level 1.3 with no VUI `bitstream_restriction`, so `dpb_limit` falls back to
-    /// A.3.1's level ceiling and gives a 7-frame DPB against `max_num_ref_frames = 2`
-    /// (the sliding window unmarks two AUs before the bump can evict); and it REORDERS,
-    /// which keeps an unmarked picture alive for output past the AU that unmarked it.
-    /// That zero is what let the eager release survive two milestones.
-    ///
-    /// On `lowdelay-640x480.h264` — OUR host's output, vendored for exactly this — it is
-    /// **117 of 120 access units**, measured the same way at 720p, 1080p and 2160p. The
-    /// difference is the encoder, not the resolution: NVENC writes
-    /// `max_num_ref_frames = 3` AND `max_dec_frame_buffering = 3`, a DPB exactly as deep
-    /// as the reference count, so 8.2.5's window unmarks the oldest reference in the very
-    /// AU whose C.4.5.3 bump evicts it — and `max_num_reorder_frames = 0` means it has
-    /// already been output, which is what makes it evictable at all.
-    ///
-    /// So this is not a tripwire any more: it pins BOTH numbers, and the second one is
-    /// what makes `release_after_decode` a fixed defect rather than a precaution.
-    ///
-    /// HEVC needs no such test: `H265Planner` snapshots `dpb_refs` AFTER `decode_rps`
-    /// has updated the DPB, so an RPS-dropped picture is structurally never in the
-    /// snapshot `RefPicList` is built from — and a low-delay HEVC stream from the same
-    /// host measures 0 of 300, which is the argument confirmed rather than assumed.
+    /// HEVC needs no such test: `H265Planner` snapshots `dpb_refs` after
+    /// `decode_rps`, so an RPS-dropped picture is never in the snapshot.
     #[test]
     fn the_low_delay_stream_removes_pictures_its_own_reference_list_names_and_the_vector_never_does(
     ) {
@@ -1049,13 +831,9 @@ mod tests {
         );
     }
 
-    /// The fix itself: no submission names its decode surface as a reference.
-    ///
-    /// [`the_setup_surface_is_the_current_picture_entry_and_is_never_also_a_reference_entry`]
-    /// asserts this over the vendored vector, where it held even before
-    /// `release_after_decode` existed. This is the same invariant over the stream that
-    /// BREAKS it — 117 of 120 access units before the deferral, every one of them
-    /// decoding into a surface it predicts from.
+    /// No submission names its decode surface as a reference — the same
+    /// invariant as the vendored-vector test, on the stream that would alias
+    /// without `release_after_decode`.
     #[test]
     fn the_low_delay_stream_never_aliases_its_decode_surface_with_a_reference() {
         let converted = convert_low_delay();
@@ -1081,13 +859,9 @@ mod tests {
         );
     }
 
-    /// The deferral costs no slot the map does not have.
-    ///
-    /// Holding every removal through the setup assignment is only free because
-    /// [`SlotMap::new`] allocates `max_dpb_frames + 1` and the DPB never exceeds
-    /// `max_dpb_frames` — so a free slot always exists even with the whole `removed`
-    /// list still held. Measured rather than argued: the deepest the ledger ever gets
-    /// on the stream that defers on 117 of 120 access units.
+    /// Holding every removal through setup is free because [`SlotMap::new`]
+    /// allocates `max_dpb_frames + 1` and the DPB never exceeds
+    /// `max_dpb_frames`.
     #[test]
     fn deferring_every_removal_still_fits_the_ledger() {
         let mut planner = H264Planner::new();
@@ -1103,9 +877,7 @@ mod tests {
                 *map = SlotMap::new(plan.picture.max_dpb_frames);
             }
             let dxva = plan_to_dxva(&plan, map, i as u32 + 1).expect("conversion");
-            // The peak is measured BEFORE the deferred releases are applied: that is
-            // the moment the map is fullest, and the moment `assign` had to find a
-            // free slot in.
+            // Peak before deferred releases: the moment `assign` had to find a slot.
             peak = peak.max(map.held().count());
             capacity = map.capacity();
             for &id in &dxva.release_after_decode {
@@ -1128,8 +900,7 @@ mod tests {
                 !dxva.pic_params.CurrPic.associated(),
                 "progressive: CurrPic's AssociatedFlag is the bottom-field flag"
             );
-            // The picture being decoded must not appear in its own reference
-            // list — that would be a surface read and written in one operation.
+            // A reference that aliases the target is a surface read and written in one op.
             for r in &dxva.refs {
                 assert_ne!(r.slot, dxva.setup_slot, "a reference aliases the target");
             }
@@ -1140,8 +911,7 @@ mod tests {
     fn reference_entries_carry_their_pictures_frame_num_poc_pair_and_used_flags() {
         for (plan, dxva) in convert_stream() {
             for (i, r) in dxva.refs.iter().enumerate() {
-                // The planner's DPB snapshot is the authority for every one of
-                // these — not the slice lists' copy.
+                // DPB snapshot is the authority, not the slice lists' copy.
                 let rp = plan
                     .dpb_refs
                     .iter()
@@ -1155,14 +925,13 @@ mod tests {
                     dxva.pic_params.FieldOrderCntList[i],
                     [rp.top_field_order_cnt, rp.bottom_field_order_cnt]
                 );
-                // A progressive reference is used for BOTH fields.
+                // A progressive reference is used for both fields.
                 assert_eq!(
                     dxva.pic_params.UsedForReferenceFlags >> (2 * i) & 0b11,
                     0b11
                 );
             }
-            // Everything past the marked DPB is the 0xFF sentinel with a cleared
-            // use flag — never a stale surface index.
+            // Past the marked DPB: 0xFF sentinel, never a stale surface index.
             for i in dxva.refs.len()..REF_FRAME_LIST_LEN {
                 assert_eq!(dxva.pic_params.RefFrameList[i], PicEntry::UNUSED);
                 assert_eq!(dxva.pic_params.FrameNumList[i], 0);
@@ -1180,8 +949,7 @@ mod tests {
         let (_, first) = &converted[0];
         assert_ne!(first.pic_params.wBitFields & (1 << 15), 0, "IDR is intra");
         assert!(first.refs.is_empty(), "an IDR references nothing");
-        // The vector is IPPP…, so the second picture is inter and references the
-        // first.
+        // Vector is IPPP: the second picture is inter and references the first.
         let (_, second) = &converted[1];
         assert_eq!(second.pic_params.wBitFields & (1 << 15), 0);
         assert_eq!(second.refs.len(), 1);
@@ -1222,11 +990,10 @@ mod tests {
             pp.num_ref_idx_l0_active_minus1,
             plan.pps.num_ref_idx_l0_default_active_minus1
         );
-        // The invariants a driver reads before anything else.
         assert_eq!(pp.ContinuationFlag, 1);
         assert_eq!(pp.Reserved16Bits, 3);
         assert_eq!(pp.StatusReportFeedbackNumber, 1);
-        // FMO is refused, so its whole descriptor block stays zero.
+        // FMO is refused, so its descriptor block stays zero.
         assert_eq!(pp.num_slice_groups_minus1, 0);
         assert_eq!(pp.slice_group_map_type, 0);
         assert_eq!(pp.slice_group_change_rate_minus1, 0);
@@ -1260,8 +1027,7 @@ mod tests {
 
     #[test]
     fn poc_type_specific_fields_are_written_only_for_the_type_that_codes_them() {
-        // The vendored stream is POC type 0, so the type-1 field must be clear
-        // even though the SPS has a (default) value for it.
+        // POC type 0: the type-1 field must stay 0 even if the SPS has a default.
         let converted = convert_stream();
         let (plan, dxva) = &converted[0];
         assert_eq!(plan.sps.pic_order_cnt_type, 0);
@@ -1277,7 +1043,7 @@ mod tests {
         let mut planner = H264Planner::new();
         let au = split_into_aus(TEST_25FPS).into_iter().next().unwrap();
         let plan = planner.plan_au(au).expect("plan");
-        // A map sized for a different DPB depth: an SPS renegotiation.
+        // Map sized for a different DPB depth (SPS renegotiation).
         let mut slots = SlotMap::new(plan.picture.max_dpb_frames + 1);
         let before = slots.active();
         assert_eq!(
@@ -1292,8 +1058,7 @@ mod tests {
 
     #[test]
     fn a_reference_the_map_never_saw_is_refused_and_leaves_the_map_untouched() {
-        // Plan two AUs but feed only the second through the map: its reference
-        // resolves to nothing.
+        // Plan two AUs; feed only the second through the map so its ref is missing.
         let aus = split_into_aus(TEST_25FPS);
         let mut planner = H264Planner::new();
         let first = planner.plan_au(aus[0]).expect("plan 0");
@@ -1323,35 +1088,27 @@ mod tests {
         ];
         let control = slice_control(&records);
         assert_eq!(control.len(), 2);
-        // Read by VALUE, in braces: `DXVA_Slice_H264_Short` is `#[repr(C, packed)]`
-        // (ten bytes, see `dxva.rs`'s alignment section), so a reference to one of
-        // its `u32` members would be unaligned and is a compile error — `assert_eq!`
-        // takes references to its operands.
+        // Read by value, in braces: `DXVA_Slice_H264_Short` is packed (ten
+        // bytes); a reference to a `u32` member is unaligned and will not compile.
         assert_eq!({ control[0].BSNALunitDataLocation }, 0);
         assert_eq!({ control[0].SliceBytesInBuffer }, 40);
         assert_eq!({ control[1].BSNALunitDataLocation }, 40);
         assert_eq!({ control[1].SliceBytesInBuffer }, 216);
         assert!(control.iter().all(|c| { c.wBadSliceChopping } == 0));
-        // …and the records reach the driver ten bytes apart, which is the fact the
-        // whole submission depends on: the second record's location is at byte 10,
-        // not 12.
+        // Records are ten bytes apart: the second location is at byte 10, not 12.
         let bytes = crate::dxva::slice_bytes(&control);
         assert_eq!(bytes.len(), 20);
         assert_eq!(&bytes[10..14], &40u32.to_le_bytes());
     }
 
-    /// The whole-stream churn check: no two live pictures may share a surface index,
-    /// which for DXVA is the difference between a decode and a corrupted reference.
+    /// No two live pictures share a surface index.
     ///
-    /// Run over BOTH streams, because they stress opposite halves of the ledger: the
-    /// vendored vector has a DPB (7) far deeper than its reference count (2) and so
-    /// never has to reuse a surface promptly, while the low-delay stream's DPB is
-    /// exactly its reference count and cycles all four slots every four pictures.
+    /// Both streams: the vendored vector's DPB is far deeper than its
+    /// reference count, so it rarely reuses a surface; the low-delay stream
+    /// cycles all four slots every four pictures.
     ///
-    /// The loop applies `release_after_decode` because the CALLER does; a loop that
-    /// drops it holds a surface per access unit and dies of `SlotError::Full` — which
-    /// is what this test did the moment the deferral landed, and is the cheapest
-    /// possible demonstration that the deferral is real rather than decorative.
+    /// The loop applies `release_after_decode` because the caller does. A
+    /// loop that skips it holds a surface per AU and dies of `SlotError::Full`.
     #[test]
     fn a_slot_is_reused_only_after_its_picture_leaves_the_dpb() {
         for (label, stream) in [("vendored", TEST_25FPS), ("low-delay", LOWDELAY_640X480)] {
@@ -1365,9 +1122,7 @@ mod tests {
                 let map = slots.get_or_insert_with(|| SlotMap::new(plan.picture.max_dpb_frames));
                 let removed = plan.dpb.removed.clone();
                 let dxva = plan_to_dxva(&plan, map, i as u32 + 1).expect("conversion");
-                // The check runs BEFORE the deferred releases: the aliasing this
-                // guards against is a property of the SUBMISSION, and at submission
-                // time every removed picture is still live by construction.
+                // Before deferred releases: at submission every removed picture is still live.
                 assert!(
                     live.iter().all(|&(_, slot)| slot != dxva.setup_slot),
                     "{label} AU {i} decodes into a surface a live picture still holds"

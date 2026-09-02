@@ -1,19 +1,18 @@
-//! Machine power executors for the `power.*` host actions (`design/host-actions.md` §6):
-//! sleep / reboot / shutdown, plus the per-verb availability probe the discovery route reports.
+//! Blocking sleep / reboot / shutdown for `power.*` (`design/host-actions.md`),
+//! plus the per-verb probe the discovery route reports.
 //!
-//! Linux drives logind over zbus — the SAME privileged path the already-shipped polkit rule
-//! (`packaging/linux/49-punktfunk-power.rules`) authorizes for members of group `punktfunk`,
-//! and deliberately WITHOUT `-ignore-inhibit`/`-multiple-sessions`: a foreign block inhibitor
-//! or a second local user makes logind refuse, and that refusal is surfaced honestly as a
-//! `409 blocked` instead of being steamrolled. Windows uses the interactive user token's own
-//! `SeShutdownPrivilege` (`InitiateSystemShutdownExW` / `SetSuspendState`). macOS has no
-//! executor yet (the mgmt route answers `501`).
+//! Linux drives logind over zbus, authorized for group `punktfunk` by
+//! `packaging/linux/49-punktfunk-power.rules`. Calls omit `-ignore-inhibit`
+//! and `-multiple-sessions`: a foreign inhibitor or a second local user makes
+//! logind refuse, and that is a `409 blocked`.
+//! Windows uses the interactive token's `SeShutdownPrivilege`. Other platforms
+//! have no executor; the mgmt route answers `501`.
 //!
-//! Both [`probe`] and [`act`] BLOCK (a D-Bus round trip / a Win32 call) — call them via
-//! `spawn_blocking` from async contexts. The zbus threading dance mirrors
-//! [`crate::sleep_inhibit::acquire`]: zbus's blocking API cannot run on a tokio worker.
+//! [`probe`] and [`act`] block on a D-Bus round trip or a Win32 call. Call them
+//! from `spawn_blocking`. The dedicated thread matches
+//! [`crate::sleep_inhibit::acquire`]: zbus's blocking API cannot run on a tokio
+//! worker.
 
-/// The three built-in machine-power verbs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PowerVerb {
     Sleep,
@@ -21,9 +20,8 @@ pub enum PowerVerb {
     Shutdown,
 }
 
-/// One verb's platform answer: can this host do it right now, and if not, why (the honest
-/// `unavailable_reason` the discovery route reports — the `SessionSettingsState::enforced`
-/// pattern: say "unavailable, because X" instead of offering a dead switch).
+/// Discovery publishes `reason` as `unavailable_reason` when `available` is
+/// false, so the client does not offer an action that would fail.
 pub struct Availability {
     pub available: bool,
     pub reason: Option<String>,
@@ -45,17 +43,13 @@ impl Availability {
     }
 }
 
-/// Whether this platform has power executors at all — `false` answers the invoke route with
-/// `501 unsupported` (macOS host, until that leg exists).
+/// The invoke route answers `501` when this is false.
 pub fn supported() -> bool {
     cfg!(any(target_os = "linux", target_os = "windows"))
 }
 
-// ---------------------------------------------------------------------------- Linux (logind)
-
-/// One logind `Manager` call on a dedicated plain thread (see the module header for why), the
-/// reply deserialized as `T`. Errors come back as the D-Bus error text — which IS the honest
-/// reason ("Interactive authentication required", "Operation inhibited by …").
+/// One logind `Manager` call on a dedicated thread (zbus blocking cannot run on a
+/// tokio worker). The D-Bus error text is the reason the caller surfaces.
 #[cfg(target_os = "linux")]
 fn logind_call<T, A>(method: &'static str, args: A) -> Result<T, String>
 where
@@ -89,10 +83,8 @@ where
     .map_err(|_| "logind call thread panicked".to_string())?
 }
 
-/// Ask logind whether the verb can run: `CanSuspend`/`CanReboot`/`CanPowerOff` answer `"yes"`,
-/// `"no"`, `"na"` (hardware can't) or `"challenge"` (polkit would need interactive auth —
-/// typically the host user is not in group `punktfunk`, or a second local user is logged in).
-/// Only `"yes"` is available; everything else carries its reason.
+/// Only logind `"yes"` is available. `"challenge"` means polkit would prompt
+/// (host user not in group `punktfunk`, or a second local session).
 #[cfg(target_os = "linux")]
 pub fn probe(verb: PowerVerb) -> Availability {
     let method = match verb {
@@ -112,11 +104,9 @@ pub fn probe(verb: PowerVerb) -> Availability {
     }
 }
 
-/// Run the verb: `Suspend`/`Reboot`/`PowerOff` with `interactive = false` — a polkit challenge
-/// fails instead of prompting (there is nobody at a dialog on a streaming host). The caller has
-/// already ended every session and released our own sleep inhibitor
-/// ([`crate::sleep_inhibit::release_now`]) — a still-standing foreign inhibitor makes logind
-/// refuse, and the error text says whose it is.
+/// `interactive = false`: a polkit challenge fails instead of prompting. The
+/// caller must already have released our inhibitor; a foreign one still standing
+/// makes logind refuse, and the error names the inhibitor.
 #[cfg(target_os = "linux")]
 pub fn act(verb: PowerVerb) -> Result<(), String> {
     let method = match verb {
@@ -127,16 +117,13 @@ pub fn act(verb: PowerVerb) -> Result<(), String> {
     logind_call::<(), (bool,)>(method, (false,))
 }
 
-// ------------------------------------------------------------------------------------ Windows
-
-/// Windows: reboot/shutdown are available whenever the interactive user token holds
-/// `SeShutdownPrivilege` (it does by default — [`act`] enables and uses it); sleep asks the
-/// power manager whether suspend is supported at all.
+/// Reboot/shutdown skip a capability check: the interactive token holds
+/// `SeShutdownPrivilege` by default, and [`act`] enables it.
 #[cfg(target_os = "windows")]
 pub fn probe(verb: PowerVerb) -> Availability {
     match verb {
         PowerVerb::Sleep => {
-            // SAFETY: no arguments, no aliasing — a pure capability query.
+            // SAFETY: no arguments, no aliasing — a capability query.
             if unsafe { windows::Win32::System::Power::IsPwrSuspendAllowed() } {
                 Availability::yes()
             } else {
@@ -147,8 +134,8 @@ pub fn probe(verb: PowerVerb) -> Availability {
     }
 }
 
-/// Enable this process's `SeShutdownPrivilege` (present-but-disabled by default on an
-/// interactive user token), then run the verb. The reason string lands in the system event log.
+/// `SeShutdownPrivilege` is present but disabled on an interactive token.
+/// The reason string is what the system event log records.
 #[cfg(target_os = "windows")]
 pub fn act(verb: PowerVerb) -> Result<(), String> {
     use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
@@ -163,8 +150,7 @@ pub fn act(verb: PowerVerb) -> Result<(), String> {
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-    // SAFETY: standard privilege-enable sequence on our own process token; the token handle is
-    // closed on every path.
+    // SAFETY: privilege-enable on our own process token; CloseHandle on every path.
     unsafe {
         let mut token = HANDLE::default();
         OpenProcessToken(
@@ -191,7 +177,8 @@ pub fn act(verb: PowerVerb) -> Result<(), String> {
 
     match verb {
         PowerVerb::Sleep => {
-            // SAFETY: plain suspend request — no hibernate, honor other apps' wake locks.
+            // SAFETY: SetSuspendState(hibernate, force, disable_wake) all false:
+            // suspend, honor other apps' wake locks, do not force.
             if unsafe { SetSuspendState(false, false, false) } {
                 Ok(())
             } else {
@@ -205,13 +192,13 @@ pub fn act(verb: PowerVerb) -> Result<(), String> {
             let reason = windows::core::HSTRING::from(
                 "Requested from a Punktfunk client (host power action)",
             );
-            // SAFETY: local machine (None), owned wide strings live across the call.
+            // SAFETY: local machine (None); `reason` lives across the call.
             unsafe {
                 InitiateSystemShutdownExW(
                     None,
                     &reason,
-                    0,    // no countdown dialog — sessions were already ended cleanly
-                    true, // force apps closed; nobody is at the console to answer prompts
+                    0,    // no countdown; sessions were already ended
+                    true, // force-close apps; nobody is at the console
                     verb == PowerVerb::Reboot,
                     SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER | SHTDN_REASON_FLAG_PLANNED,
                 )
@@ -220,8 +207,6 @@ pub fn act(verb: PowerVerb) -> Result<(), String> {
         }
     }
 }
-
-// -------------------------------------------------------------------------- other platforms
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn probe(_verb: PowerVerb) -> Availability {
@@ -233,14 +218,8 @@ pub fn act(_verb: PowerVerb) -> Result<(), String> {
     Err("not supported on this host platform".into())
 }
 
-// ------------------------------------------------------------------- the session close signal
-
-/// The host-wide "a power action is ending every session" signal. Each paired session's
-/// access-lifecycle task subscribes ([`closing_rx`]) and closes its connection with the typed
-/// `RejectReason::HostPower` code when it fires — so the client renders "the host is going to
-/// sleep" instead of a bare transport error. One-way: nothing un-fires it (sleep resumes with
-/// no live sessions either way), but the flag resets after a completed sleep so the woken host
-/// types future closes correctly.
+/// Host-wide power-close flag. One-shot per action; [`set_closing`] resets it
+/// after sleep so the woken host types later closes as ordinary.
 static POWER_CLOSING: std::sync::OnceLock<tokio::sync::watch::Sender<bool>> =
     std::sync::OnceLock::new();
 
@@ -248,12 +227,12 @@ fn power_closing() -> &'static tokio::sync::watch::Sender<bool> {
     POWER_CLOSING.get_or_init(|| tokio::sync::watch::channel(false).0)
 }
 
-/// Subscribe to the power-close signal (one receiver per session lifecycle task).
+/// One receiver per session lifecycle task; a true flag closes with
+/// `RejectReason::HostPower`.
 pub fn closing_rx() -> tokio::sync::watch::Receiver<bool> {
     power_closing().subscribe()
 }
 
-/// Fire (or reset) the power-close signal.
 pub fn set_closing(closing: bool) {
     let _ = power_closing().send(closing);
 }

@@ -1,63 +1,52 @@
-//! Plane-neutral live-session status for the management `/status` (web-console Dashboard) view.
+//! Live native-session status for management `GET /status`.
 //!
-//! The GameStream media pipeline records its session in `AppState.{launch, stream, streaming}`
-//! (consumed by RTSP/media), but the native punktfunk/1 plane never touches `AppState` — by design
-//! it is handed only the shared stats recorder ([`crate::native::serve`]). So a native session,
-//! which is the DEFAULT plane (GameStream is opt-in, `--gamestream`), was invisible on the Dashboard:
-//! `GET /status` reported `video_streaming: false` and no session/stream card while a client was
-//! actively streaming (the Stats page worked because it shares the recorder — hence the confusing
-//! "stats move but the dashboard says idle").
+//! GameStream records its session in `AppState.{launch, stream, streaming}`.
+//! The native plane never writes those fields — it is handed only the shared
+//! stats recorder ([`crate::native::serve`]). This registry is the surface
+//! the native video loop ([`crate::native::virtual_stream`]) publishes to,
+//! keyed per session so concurrent sessions (up to `max_sessions`) each get
+//! an entry.
 //!
-//! This module is the small shared surface the native video loop ([`crate::native::virtual_stream`])
-//! publishes a live snapshot to, keyed per session so CONCURRENT native sessions each get an entry
-//! (the native server admits up to `max_sessions`, unbounded by default). The loop registers on
-//! stream start and the returned [`LiveSessionGuard`] removes the entry on ANY scope exit (return,
-//! `?`, panic — RAII). `/status` reads [`snapshot`]/[`count`]; the Dashboard's session-control
-//! buttons reach a native session through [`stop_all`] (stop) and [`force_idr_all`] (request IDR),
-//! so surfacing the session doesn't leave those buttons dead.
+//! [`register`] on stream start; [`LiveSessionGuard`] removes the entry on
+//! any scope exit. `/status` reads [`snapshot`]/[`count`]. Dashboard stop
+//! and IDR reach a native session through [`stop_all`] and [`force_idr_all`].
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::encode::Codec;
 
-/// A single live native session. Holds the SAME live Arc handles the video loop already maintains,
-/// so a mid-stream mode switch / adaptive-bitrate change is reflected on the Dashboard with no
-/// second update path — plus the flags the mgmt API flips to control the session.
+/// One live native session. The Arcs are the video loop's own handles, so a
+/// mid-stream mode/bitrate change shows on `/status` with no second write.
 struct LiveSession {
     id: u64,
-    /// Packed `w:16|h:16|hz:16` ([`crate::native::pack_mode`]); updated on a mode switch.
+    /// Packed `w:16|h:16|hz:16` ([`crate::native::pack_mode`]); live on a mode switch.
     mode: Arc<AtomicU64>,
-    /// Live encoder target (kbps); updated on an adaptive-bitrate change.
+    /// Encoder target, kbps. Same Arc the ABR path writes.
     bitrate_kbps: Arc<AtomicU32>,
     codec: Codec,
-    /// The session's teardown flag ([`stop_all`] → mgmt `DELETE /session`).
+    /// Teardown flag ([`stop_all`]).
     stop: Arc<AtomicBool>,
-    /// The session's *deliberate*-stop flag ([`stop_all_quit`]). Distinct from `stop`: it marks the
-    /// teardown as intended rather than a drop, which is what skips the display's keep-alive linger
-    /// and what the end-game-on-session-end policy keys off.
+    /// Deliberate-stop flag ([`stop_all_quit`]). Distinct from `stop`: intended
+    /// teardown skips display keep-alive linger and trips end-game-on-session-end.
     quit: Arc<AtomicBool>,
-    /// One-shot force-keyframe flag ([`force_idr_all`] → mgmt `POST /session/idr`); the encode loop
-    /// drains it alongside a client's decode-recovery keyframe request.
+    /// One-shot force-keyframe ([`force_idr_all`]). The encode loop drains it
+    /// alongside a client decode-recovery request.
     force_idr: Arc<AtomicBool>,
-    /// Short client label (cert-fingerprint prefix / peer IP) — carried on the lifecycle events.
+    /// Client label: 12-hex cert-fingerprint prefix, or peer IP if anonymous.
     client: String,
-    /// The client's display name (trust-store name, else its sanitized Hello name) — what the
-    /// local summary's connect toast shows. `None` for a nameless knock (old client / Android).
+    /// Display name (trust-store, else sanitized Hello). `None` if nameless.
     client_name: Option<String>,
-    /// Whether the session negotiated HDR — carried on the lifecycle events.
     hdr: bool,
-    /// Completed bring-up total (hello → first packet), ms; 0 until the first packet left. Written
-    /// once by the session's [`crate::bringup::Trace`] (latency plan P0.1).
+    /// Bring-up total (hello → first packet), ms. 0 until the first packet left.
     ttff_ms: Arc<AtomicU32>,
-    /// Most recent completed mid-stream resize (reconfigure → pipeline rebuilt), ms; 0 = none yet.
+    /// Last mid-stream resize (reconfigure → rebuilt), ms. 0 = none yet.
     last_resize_ms: Arc<AtomicU32>,
-    /// The launched game's lease, when this session launched a title — so `/status` can report what
-    /// is actually running and the console can show it (design/session-game-lifetime.md §8a).
+    /// Launched title's lease, if any — what [`games`] reports for this session.
     game: Option<Arc<crate::gamelease::LeaseShared>>,
 }
 
-/// A resolved read of one live session, for the `/status` view.
+/// Resolved read of one live session for `/status`.
 #[derive(Clone)]
 pub struct SessionSnapshot {
     pub width: u32,
@@ -65,12 +54,11 @@ pub struct SessionSnapshot {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub codec: Codec,
-    /// The client's display name (trust-store name, else its sanitized Hello name); `None` for a
-    /// nameless client.
+    /// Display name (trust-store, else sanitized Hello). `None` if nameless.
     pub client_name: Option<String>,
-    /// Bring-up total (hello → first packet), ms; 0 while still bringing up (latency plan P0.1).
+    /// Bring-up total (hello → first packet), ms. 0 while still bringing up.
     pub time_to_first_frame_ms: u32,
-    /// Most recent mid-stream resize total, ms; 0 = no resize this session.
+    /// Last mid-stream resize total, ms. 0 = no resize this session.
     pub last_resize_ms: u32,
 }
 
@@ -84,7 +72,7 @@ fn next_id() -> u64 {
     ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Resolves one session's [`crate::events::SessionRef`] (mode read live) for the lifecycle events.
+/// [`crate::events::SessionRef`] for this session; mode is read live.
 fn session_ref(s: &LiveSession) -> crate::events::SessionRef {
     let (width, height, fps) = crate::native::unpack_mode(s.mode.load(Ordering::Relaxed));
     crate::events::SessionRef {
@@ -95,37 +83,35 @@ fn session_ref(s: &LiveSession) -> crate::events::SessionRef {
     }
 }
 
-/// What [`register`] needs to publish a session. A named struct rather than a positional argument
-/// list: half of these are same-typed `Arc<Atomic…>` handles, so a transposed pair would compile
-/// cleanly and quietly report the wrong number on the Dashboard.
+/// Inputs for [`register`]. Named fields: half are same-typed `Arc<Atomic…>`
+/// handles, so a transposed pair would compile and report the wrong figure.
 pub struct Registration {
-    /// Packed `w:16|h:16|hz:16` ([`crate::native::pack_mode`]); updated on a mode switch.
+    /// Packed `w:16|h:16|hz:16` ([`crate::native::pack_mode`]); live on a mode switch.
     pub mode: Arc<AtomicU64>,
-    /// Live encoder target (kbps); updated on an adaptive-bitrate change.
+    /// Encoder target, kbps. Same Arc the ABR path writes.
     pub bitrate_kbps: Arc<AtomicU32>,
     pub codec: Codec,
     /// Teardown flag ([`stop_all`]).
     pub stop: Arc<AtomicBool>,
-    /// Deliberate-stop flag ([`stop_all_quit`]).
+    /// Deliberate-stop flag ([`stop_all_quit`]). Distinct from `stop`.
     pub quit: Arc<AtomicBool>,
-    /// One-shot force-keyframe flag ([`force_idr_all`]).
+    /// One-shot force-keyframe ([`force_idr_all`]).
     pub force_idr: Arc<AtomicBool>,
-    /// Short client label (cert-fingerprint prefix / peer IP).
+    /// Client label: 12-hex cert-fingerprint prefix, or peer IP if anonymous.
     pub client: String,
-    /// The client's display name, when it has one (trust-store name, else sanitized Hello name).
+    /// Display name (trust-store, else sanitized Hello). `None` if nameless.
     pub client_name: Option<String>,
     pub hdr: bool,
-    /// Bring-up total slot (hello → first packet), ms.
+    /// Bring-up total slot (hello → first packet), ms. 0 until first packet.
     pub ttff_ms: Arc<AtomicU32>,
-    /// Most recent mid-stream resize total, ms.
+    /// Last mid-stream resize total, ms. 0 = none yet.
     pub last_resize_ms: Arc<AtomicU32>,
-    /// The launched game's lease, when this session launched a title.
+    /// Launched title's lease, if this session launched one.
     pub game: Option<Arc<crate::gamelease::LeaseShared>>,
 }
 
-/// Registers a live native session; the returned guard removes it on drop (session end).
-/// Emits the `session.started` lifecycle event; the guard's drop emits `session.ended` — RAII,
-/// so every exit path (return, `?`, panic-unwind) pairs them.
+/// Publish a live native session. The guard removes it on drop and pairs
+/// `session.started` with `session.ended` on every exit path, including panic.
 pub fn register(reg: Registration) -> LiveSessionGuard {
     let Registration {
         mode,
@@ -167,11 +153,11 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
     }
 }
 
-/// Removes its session from the registry when dropped (any scope exit of the native video loop).
+/// Drops the registry entry for this session (any video-loop scope exit).
 pub struct LiveSessionGuard {
     id: u64,
-    /// While any native session lives, the box must not auto-suspend under a passive viewer
-    /// ([`crate::sleep_inhibit`]) — refcounted, released with the guard.
+    /// Sleep inhibit for the session lifetime: a passive viewer must not let
+    /// the box auto-suspend ([`crate::sleep_inhibit`]).
     _sleep: crate::sleep_inhibit::StreamHold,
 }
 
@@ -180,7 +166,7 @@ impl Drop for LiveSessionGuard {
         let mut reg = registry().lock().unwrap();
         if let Some(pos) = reg.iter().position(|s| s.id == self.id) {
             let session = reg.remove(pos);
-            drop(reg); // emit outside the registry lock — the bus takes its own
+            drop(reg); // emit outside the registry lock; the bus takes its own
             crate::events::emit(crate::events::EventKind::SessionEnded {
                 session: session_ref(&session),
             });
@@ -188,12 +174,11 @@ impl Drop for LiveSessionGuard {
     }
 }
 
-/// The number of live native sessions.
 pub fn count() -> usize {
     registry().lock().unwrap().len()
 }
 
-/// A resolved snapshot of every live native session (mode/bitrate read live), newest last.
+/// Snapshot of every live native session; mode/bitrate read live. Newest last.
 pub fn snapshot() -> Vec<SessionSnapshot> {
     registry()
         .lock()
@@ -215,9 +200,9 @@ pub fn snapshot() -> Vec<SessionSnapshot> {
         .collect()
 }
 
-/// One launched game, as `/status` reports it.
+/// One launched game as `/status` reports it.
 pub struct GameSnapshot {
-    /// The session streaming it, or `None` for a game whose session is gone and which is waiting out
+    /// Streaming session, or `None` if the session is gone and the game is in
     /// its reconnect window.
     pub session_id: Option<u64>,
     pub client: String,
@@ -225,32 +210,32 @@ pub struct GameSnapshot {
     pub title: String,
     pub store: Option<String>,
     pub plane: crate::events::Plane,
-    /// `launching` / `running` / `exited` / `untracked`, or `grace` for a game on its reconnect
-    /// window.
+    /// `launching` / `running` / `exited` / `untracked`, or `grace` on the
+    /// reconnect window.
     pub state: &'static str,
-    /// Seconds left before the game is ended, for a `grace` row.
+    /// Seconds left before the game is ended. Set only on a `grace` row.
     pub grace_remaining_s: Option<u64>,
 }
 
-/// The compat plane's launched game, while it has one.
+/// Compat plane's launched game, while it has one.
 ///
-/// GameStream sessions are not in the live-session registry above — that registry holds the native
-/// loop's own `Arc` handles (mode, bitrate, the stop/quit flags), none of which the compat plane has.
-/// It is single-session by construction (one `AppState.launch`), so one slot is the whole story, and
-/// this is what keeps a Moonlight client's game visible on the Dashboard alongside a native one.
+/// GameStream is not in the native registry: that holds the loop's `Arc`
+/// handles, which the compat plane does not have. One `AppState.launch`
+/// means one slot; this is what keeps a Moonlight game on `/status`
+/// alongside a native session.
 fn gs_game() -> &'static Mutex<Option<Arc<crate::gamelease::LeaseShared>>> {
     static SLOT: OnceLock<Mutex<Option<Arc<crate::gamelease::LeaseShared>>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
-/// Publish the compat plane's game for the status surface; the returned guard retracts it when the
-/// stream loop exits by any path (the plane's counterpart to [`LiveSessionGuard`]).
+/// Publish the compat plane's game. The guard retracts it on any stream-loop
+/// exit ([`LiveSessionGuard`]'s counterpart).
 pub fn publish_gamestream_game(shared: Arc<crate::gamelease::LeaseShared>) -> GamestreamGameGuard {
     *gs_game().lock().unwrap_or_else(|e| e.into_inner()) = Some(shared);
     GamestreamGameGuard
 }
 
-/// Clears the compat plane's published game on drop.
+/// Retracts the compat plane's published game on drop.
 pub struct GamestreamGameGuard;
 
 impl Drop for GamestreamGameGuard {
@@ -259,12 +244,11 @@ impl Drop for GamestreamGameGuard {
     }
 }
 
-/// Every launched game the host currently knows about: the live sessions' games first, then the
-/// compat plane's, then any game whose session has ended and which is waiting out its reconnect
-/// window before being ended.
+/// Every launched game the host currently knows: live sessions first, then
+/// the compat plane, then games waiting out a reconnect window.
 ///
-/// The sources are deliberately separate — a grace-pending game has no session to attribute it
-/// to, and hiding it would make "the host is about to close my game" invisible in the UI.
+/// Sources stay separate — a grace-pending game has no session to hang
+/// off, and omitting it would hide "the host is about to close this game".
 pub fn games() -> Vec<GameSnapshot> {
     let mut out: Vec<GameSnapshot> = registry()
         .lock()
@@ -290,8 +274,8 @@ pub fn games() -> Vec<GameSnapshot> {
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|g| GameSnapshot {
-                // The compat plane has no session id to attribute it to; the console tells it from a
-                // grace row by the state, which is never `grace` while a session is streaming it.
+                // Compat plane has no session id. State is never `grace` while
+                // streaming, so the console tells this from a grace row by state.
                 session_id: None,
                 client: g.client.clone(),
                 app_id: g.game.id.clone(),
@@ -319,31 +303,21 @@ pub fn games() -> Vec<GameSnapshot> {
     out
 }
 
-/// Signals every live native session to tear down. Best-effort: the video + send loops observe the
-/// flag and exit, ending the stream; the guard then clears the entry.
-///
-/// This is the *drop*-flavored stop — the session ends, but nothing treats it as intended. Prefer
-/// [`stop_all_quit`] for an operator action.
+/// Tear down every live native session. Best-effort: loops observe the
+/// flag and exit; the guard then clears the entry. Not intended teardown —
+/// prefer [`stop_all_quit`] for an operator action.
 pub fn stop_all() {
     for s in registry().lock().unwrap().iter() {
         s.stop.store(true, Ordering::SeqCst);
     }
 }
 
-/// Signals every live native session to tear down **deliberately** (mgmt `DELETE /session`, the
-/// console's and a plugin's Stop).
+/// Tear down live native sessions for `fp_hex` (lowercase hex cert SHA-256)
+/// deliberately — unpair must not leave a mid-stream client streaming.
 ///
-/// An operator pressing Stop is a decision, and the host now says so: `quit` before `stop` makes the
-/// teardown look exactly like a client's own Stop, so the display skips its keep-alive linger and the
-/// end-game-on-session-end policy sees an intent rather than a network drop. (Before this, a
-/// management stop was indistinguishable from a client vanishing, which left the display lingering
-/// for a session nobody was coming back to.)
-/// Signals the live native sessions belonging to `fp_hex` (lowercase hex cert SHA-256) to tear
-/// down **deliberately** — the unpair path's revocation reaching a mid-stream client, which must
-/// not keep streaming just because it was already connected when its pairing was removed.
-/// Matching is by the registry's client label, which for every pairable client is the
-/// fingerprint's 12-hex-char prefix (an anonymous/TOFU session carries an IP label and never
-/// matches — it has no pairing to revoke). Returns how many sessions were signalled.
+/// Match is the registry client label: the fingerprint's 12-hex prefix.
+/// An anonymous/TOFU session carries an IP label and never matches.
+/// Returns how many sessions were signalled.
 pub fn stop_by_fingerprint(fp_hex: &str) -> usize {
     let mut n = 0;
     for s in registry().lock().unwrap().iter() {
@@ -356,11 +330,11 @@ pub fn stop_by_fingerprint(fp_hex: &str) -> usize {
     n
 }
 
-/// Whether any live native session belongs to a client OTHER than `fp_hex` — the host-power
-/// busy policy (`design/host-actions.md` §5.5): a granted guest must not pull the host out from
-/// under someone else's live stream. Label matching as in [`stop_by_fingerprint`] (the
-/// 12-hex-char fingerprint prefix); an anonymous, IP-labelled session always counts as another
-/// client — it is certainly not the invoking paired device.
+/// Whether any live native session belongs to a client other than `fp_hex`.
+///
+/// Busy check for host-power: a granted guest must not power off the host
+/// while someone else is streaming. Label match as in [`stop_by_fingerprint`].
+/// An anonymous IP-labelled session always counts as another client.
 pub fn other_client_live(fp_hex: &str) -> bool {
     registry()
         .lock()
@@ -369,6 +343,10 @@ pub fn other_client_live(fp_hex: &str) -> bool {
         .any(|s| !(s.client.len() == 12 && fp_hex.starts_with(s.client.as_str())))
 }
 
+/// Tear down every live native session deliberately (mgmt `DELETE /session`).
+///
+/// Sets `quit` before `stop` so teardown matches a client's own Stop: the
+/// display skips keep-alive linger and end-game-on-session-end sees intent.
 pub fn stop_all_quit() {
     for s in registry().lock().unwrap().iter() {
         s.quit.store(true, Ordering::SeqCst);
@@ -376,8 +354,8 @@ pub fn stop_all_quit() {
     }
 }
 
-/// Requests a forced keyframe on every live native session (mgmt `POST /session/idr`). The encode
-/// loop drains the flag exactly like a client decode-recovery request.
+/// Force a keyframe on every live native session (`POST /session/idr`).
+/// The encode loop drains the flag like a client decode-recovery request.
 pub fn force_idr_all() {
     for s in registry().lock().unwrap().iter() {
         s.force_idr.store(true, Ordering::Relaxed);
@@ -408,9 +386,8 @@ mod tests {
         (guard, stop, quit)
     }
 
-    /// Unpair must revoke a LIVE session — matched by the client label (the fingerprint's
-    /// 12-hex-char prefix), deliberately (quit + stop), and precisely: another client's session
-    /// and an anonymous (IP-labelled) session stay untouched.
+    /// Unpair revokes a live session by the 12-hex fingerprint prefix
+    /// (`quit` + `stop`). Other clients and IP-labelled sessions stay up.
     #[test]
     fn stop_by_fingerprint_revokes_exactly_the_unpaired_client() {
         let fp = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
@@ -424,10 +401,8 @@ mod tests {
         assert!(!stop3.load(Ordering::SeqCst));
     }
 
-    /// A Moonlight client's game has no live-session entry to hang off, so without the compat-plane
-    /// slot it would be missing from `/status` entirely — the Dashboard would show a stream with no
-    /// game while one was plainly running. Publishing must also be strictly scoped to the stream: the
-    /// row has to vanish with the guard, or a finished session leaves a ghost game on the console.
+    /// A Moonlight game has no live-session entry, so it is only on `/status`
+    /// while [`publish_gamestream_game`]'s guard is alive.
     #[test]
     fn a_gamestream_game_is_visible_only_while_its_stream_runs() {
         let id = "steam:1701";
@@ -446,7 +421,7 @@ mod tests {
                 },
                 client: "192.0.2.7".into(),
                 plane: crate::events::Plane::Gamestream,
-                // No signals: an inert lease, so no watcher thread races this test's assertions.
+                // No signals: inert lease, so no watcher thread races the assertions.
                 spec: crate::library::DetectSpec::default(),
                 nested: false,
                 launcher: false,
@@ -469,8 +444,8 @@ mod tests {
             assert_eq!(row.plane, crate::events::Plane::Gamestream);
             assert_eq!(row.client, "192.0.2.7");
             assert_eq!(row.title, "Test Title");
-            // Never `grace` while the stream is up — that state is what the console keys its
-            // countdown and "End now" off.
+            // Not `grace` while the stream is up: the console keys
+            // countdown / End now off that state.
             assert_ne!(row.state, "grace");
         }
         assert!(mine().is_none(), "the row goes with the stream");

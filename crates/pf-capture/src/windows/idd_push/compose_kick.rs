@@ -1,11 +1,15 @@
-//! The LAST-RESORT DWM compose kick — synthetic pointer input that dirties a specific virtual
+//! Last-resort DWM compose kick: synthetic pointer input that dirties one virtual
 //! display so DWM presents it.
 //!
-//! Split out of `idd_push.rs` in sweep Phase 5.4. It is self-contained (one function plus a
-//! process-global throttle) and it is the one piece of the capture path that reaches for synthetic
-//! INPUT, which is worth keeping visibly separate from the frame machinery: it is unreliable by
-//! nature, user-visible in the sibling-display case, and only ever a fallback for the driver's own
-//! `FrameStash` republish.
+//! Primary first-frame path is the driver's `FrameStash` (`frame_transport.rs`). This
+//! remains for pre-stash drivers and an empty-stash cold start. Synthetic input is
+//! blocked on the secure desktop, defeated by a fullscreen `ClipCursor`, and
+//! user-visible on a sibling display — which is why it is a fallback.
+//!
+//! A cursor move dirties only the display the pointer is on, so the kick is per-target.
+//! HID-first: when [`crate::HID_COMPOSE_KICK`] is registered, the report is real win32k
+//! input (any session/desktop, wakes a powered-off display). `SendInput` is the remaining
+//! path.
 
 use super::*;
 
@@ -46,9 +50,8 @@ pub(super) fn kick_dwm_compose(ccd: pf_win_display::win_display::CcdTargetKey) {
         }
         *last = Some(now);
     }
-    // Where is the cursor, and where does the target display live in desktop space?
     let mut pos = POINT::default();
-    // SAFETY: plain FFI; `pos` is a valid out-param for this synchronous call.
+    // SAFETY: `pos` is a valid out-param for this call.
     let have_pos = unsafe { GetCursorPos(&mut pos) }.is_ok();
     let rect = pf_win_display::win_display::source_desktop_rect(ccd);
     // HID-first (see the doc comment): the registered virtual-mouse kick works from any
@@ -66,20 +69,15 @@ pub(super) fn kick_dwm_compose(ccd: pf_win_display::win_display::CcdTargetKey) {
     if let (true, Some((x, y, w, h))) = (have_pos, rect) {
         let inside = pos.x >= x && pos.x < x + w.max(1) && pos.y >= y && pos.y < y + h.max(1);
         if !inside {
-            // The cursor is on a sibling display — a wiggle there dirties the WRONG display. Jump
-            // to the target's center, DWELL one composition interval, then restore. The dwell is
-            // load-bearing (proven on-glass, Stage W3): DWM computes dirty state from the CURRENT
-            // cursor position at the next vsync tick, so a sub-tick jump-and-return is invisible
-            // and the target never composes — 35 ms covers a 30 Hz tick with margin. The cursor
-            // visibly leaves the sibling display for those ~2 frames; kicks only fire during THIS
-            // display's session-open / recovery windows (throttled), so the blip is rare and brief.
-            // SAFETY: plain FFI; coordinates are plain ints, and the second call restores the
-            // observed original position.
+            // Sibling: a wiggle there dirties the wrong display. Jump to the target center,
+            // dwell one vsync, restore. DWM samples dirty state at the next tick, so a
+            // sub-tick jump-and-return is invisible. 35 ms covers a 30 Hz tick with margin.
+            // SAFETY: coordinates are ints; the second call restores the observed position.
             unsafe {
                 let _ = SetCursorPos(x + w / 2, y + h / 2);
             }
             std::thread::sleep(Duration::from_millis(35));
-            // SAFETY: as above.
+            // SAFETY: restores the position observed above.
             unsafe {
                 let _ = SetCursorPos(pos.x, pos.y);
             }
@@ -99,8 +97,7 @@ pub(super) fn kick_dwm_compose(ccd: pf_win_display::win_display::CcdTargetKey) {
             },
         },
     };
-    // SAFETY: plain FFI; the input slice is valid, fully-initialized local data for this synchronous
-    // call, and `cbsize` is the true element size.
+    // SAFETY: the slice is a fully-initialized local; `cbSize` is `size_of::<INPUT>()`.
     unsafe {
         let _ = SendInput(&[mk(1), mk(-1)], std::mem::size_of::<INPUT>() as i32);
     }

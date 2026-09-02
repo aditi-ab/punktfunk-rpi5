@@ -1,79 +1,53 @@
-//! The shared media-pipeline vocabulary (plan §W6): the frame + pixel-format types that capture
-//! (producer) and encode (consumer) both speak, extracted into a leaf crate so `pf-capture` and
-//! `pf-encode` depend on the vocabulary WITHOUT depending on each other. The GPU payloads pull
-//! their heavy backends in from below: `FramePayload::Cuda` owns a [`pf_zerocopy::DeviceBuffer`],
-//! `FramePayload::D3d11` a [`dxgi::D3d11Frame`].
+//! Capture↔encode frame vocabulary.
 //!
-//! Alongside the vocabulary live the small pure helpers that ride the same capture-encode seam:
-//! [`hdr`] (HDR static metadata / in-band SEI), [`metronome`] (the metronomic-stall detector),
-//! [`thread_qos`] (per-thread scheduling QoS), [`session_tuning`] (Windows process session
-//! tuning), and — on Windows — [`dxgi`] (the capture identity + D3D11 device creation).
-
-// Unsafe-proof program: every `unsafe {}` / `unsafe impl` must carry a `// SAFETY:` proof.
+//! [`PixelFormat`], [`CapturedFrame`], and [`FramePayload`] are the types both sides
+//! speak. Leaf crate so `pf-capture` and `pf-encode` share them without depending on
+//! each other. GPU payloads own the backends below: `FramePayload::Cuda` is a
+//! [`pf_zerocopy::DeviceBuffer`], `FramePayload::D3d11` a [`dxgi::D3d11Frame`].
+//!
+//! Same seam: [`hdr`] (HDR10 static metadata / SEI), [`metronome`] (periodic-stall
+//! detector), [`thread_qos`], [`session_tuning`], and on Windows [`dxgi`] (capture
+//! identity + D3D11 device).
 
 pub mod hdr;
+pub mod health;
 pub mod metronome;
 pub mod session_tuning;
 pub mod thread_qos;
 
-// The Windows DXGI capture identity + shared D3D11 device creation (plan §W6). Consumed by the
-// capture IDD-push path, the encode D3D11 backends, and pf-vdisplay's `WinCaptureTarget`.
 #[cfg(target_os = "windows")]
 pub mod dxgi;
 
-/// Packed pixel layout of a [`CapturedFrame`]. The ScreenCast portal negotiates the
-/// format; on wlroots it is commonly packed `RGB` (3 bytes/pixel). The encoder maps these
-/// to an NVENC-accepted input format (`rgb0`/`bgr0`/`rgba`/`bgra`), expanding 3→4 bytes
-/// where needed — no host-side colour conversion.
+/// Capture negotiates this; the encoder maps to an NVENC input (`rgb0`/`bgr0`/`rgba`/`bgra`)
+/// and expands 3→4 bytes when needed. No host-side colour conversion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
-    /// `[B,G,R,x]`, 4 bpp.
     Bgrx,
-    /// `[R,G,B,x]`, 4 bpp.
     Rgbx,
-    /// `[B,G,R,A]`, 4 bpp.
     Bgra,
-    /// `[R,G,B,A]`, 4 bpp.
     Rgba,
-    /// `[R,G,B]`, 3 bpp.
     Rgb,
-    /// `[B,G,R]`, 3 bpp.
     Bgr,
-    /// 10-bit RGB packed as `R10G10B10A2` (DXGI `R10G10B10A2_UNORM`), 4 bpp. The HDR capture path
-    /// produces this: scRGB FP16 desktop pixels are converted to BT.2020 PQ and written here, then
-    /// handed to NVENC as `ABGR10` for an HEVC Main10 / HDR10 encode.
+    /// Packed `R10G10B10A2` (DXGI `R10G10B10A2_UNORM`), 4 bpp. HDR capture writes BT.2020 PQ
+    /// here; NVENC ingests it as `ABGR10` for HEVC Main10 / HDR10.
     Rgb10a2,
-    /// [`Rgb10a2`](Self::Rgb10a2)'s **SDR** twin: the same `R10G10B10A2` memory, but the values
-    /// are the plain sRGB desktop pixels expanded 8→10 bit — NOT PQ/BT.2020. The Windows 10-bit
-    /// SDR capture path produces this so NVENC encodes Main10 (finer coding precision = less
-    /// encode banding) under the ordinary BT.709 SDR VUI. A separate variant on purpose: the
-    /// encoder derives its colour signalling from the pixels that arrive, and one format
-    /// carrying two transfers would put PQ labels on SDR frames.
+    /// Same `R10G10B10A2` memory as [`Rgb10a2`](Self::Rgb10a2), but sRGB expanded 8→10 — not PQ.
+    /// Separate so the encoder's colour signalling cannot stamp PQ VUI on SDR frames (BT.709).
     Rgb10a2Sdr,
-    /// `NV12` (DXGI `NV12`): 8-bit BT.709 limited-range YUV 4:2:0. Produced by the D3D11 **video
-    /// processor** (video engine, not the 3D engine) so the per-frame colour conversion doesn't fight a
-    /// GPU-saturating game; handed to NVENC as `NV12` (it encodes YUV natively — no internal RGB→YUV).
+    /// 8-bit BT.709 limited YUV 4:2:0 (DXGI `NV12`). D3D11 video-processor output so CSC
+    /// does not contend with the 3D engine; NVENC ingests `NV12` natively (no RGB→YUV).
     Nv12,
-    /// `P010` (DXGI `P010`): 10-bit BT.2020 PQ limited-range YUV 4:2:0. HDR analogue of [`Nv12`]:
-    /// video-processor output for HEVC Main10 / HDR10, handed to NVENC as `YUV420_10BIT`.
+    /// 10-bit BT.2020 PQ limited YUV 4:2:0 (DXGI `P010`). HDR analogue of [`Nv12`]; NVENC `YUV420_10BIT`.
     P010,
-    /// Planar 8-bit YUV **4:4:4** (BT.709; range per `PUNKTFUNK_444_FULLRANGE`). Produced by the
-    /// Linux zero-copy worker's GPU convert for a 4:4:4 session ([`FramePayload::Cuda`] with
-    /// `DeviceBuffer::yuv444` — three full-res planes stacked in one allocation); NVENC encodes
-    /// it natively under the Range-Extensions profile. Never a CPU payload.
+    /// Planar 8-bit YUV 4:4:4 (BT.709; range via `PUNKTFUNK_444_FULLRANGE`). GPU-only
+    /// ([`FramePayload::Cuda`] / `DeviceBuffer::yuv444`); never a CPU payload. NVENC Range-Extensions.
     Yuv444,
-    /// 10-bit RGB packed `x:R:G:B 2:10:10:10` little-endian (SPA `xRGB_210LE`, DRM `XRGB2101010` /
-    /// `XR30`, ffmpeg `x2rgb10le`, NVENC `ARGB10`) — as an LE u32: B in bits 0-9, G 10-19, R 20-29.
-    /// The Linux GNOME 50+ HDR screencast source format: Mutter advertises it (with BT.2020
-    /// primaries + SMPTE ST.2084 PQ transfer) for a monitor in HDR mode, so the samples are
-    /// PQ-encoded BT.2020 RGB. Linux-only; the Windows HDR path stays `Rgb10a2`/`P010`.
+    /// Packed `x:R:G:B 2:10:10:10` LE (SPA `xRGB_210LE`, DRM `XR30`, NVENC `ARGB10`).
+    /// As a u32: B 0-9, G 10-19, R 20-29. Linux HDR screencast: PQ BT.2020. Not used on Windows.
     X2Rgb10,
-    /// 10-bit RGB packed `x:B:G:R 2:10:10:10` little-endian (SPA `xBGR_210LE`, DRM `XBGR2101010` /
-    /// `XB30`, ffmpeg `x2bgr10le`, NVENC `ABGR10`) — as an LE u32: R in bits 0-9, G 10-19, B 20-29;
-    /// the same memory layout as the Windows [`Rgb10a2`](Self::Rgb10a2) (DXGI `R10G10B10A2`). The
-    /// second GNOME 50+ HDR screencast format (same PQ/BT.2020 colorimetry as
-    /// [`X2Rgb10`](Self::X2Rgb10)); kept separate from `Rgb10a2` so the Linux and Windows HDR
-    /// paths stay independently greppable.
+    /// Packed `x:B:G:R 2:10:10:10` LE (SPA `xBGR_210LE`, DRM `XB30`, NVENC `ABGR10`).
+    /// As a u32: R 0-9, G 10-19, B 20-29 — same memory as Windows [`Rgb10a2`](Self::Rgb10a2).
+    /// Do not fold into `Rgb10a2`: Linux vs Windows HDR stay distinct.
     X2Bgr10,
 }
 
@@ -81,28 +55,26 @@ impl PixelFormat {
     pub fn bytes_per_pixel(self) -> usize {
         match self {
             PixelFormat::Rgb | PixelFormat::Bgr => 3,
-            // Three full-res 1-byte planes (GPU-resident only; no CPU payload carries this).
+            // Three full-res 1-byte planes; GPU-only (no CPU payload).
             PixelFormat::Yuv444 => 3,
             _ => 4,
         }
     }
 
-    /// True for the packed 10-bit RGB layouts a Linux HDR (BT.2020 PQ) capture negotiates —
-    /// the formats that make a session's encode bit depth 10 (HEVC Main10 / 10-bit AV1).
+    /// Linux HDR (BT.2020 PQ) packed RGB. Not Windows `Rgb10a2`.
     pub fn is_hdr_rgb10(self) -> bool {
         matches!(self, PixelFormat::X2Rgb10 | PixelFormat::X2Bgr10)
     }
 }
 
-/// DRM FourCC for a packed 32-bit format name (little-endian, e.g. `b"XR24"`).
+/// DRM FourCC from a 4-byte name, little-endian (`b"XR24"`).
 #[cfg(target_os = "linux")]
 const fn drm_fourcc_code(c: &[u8; 4]) -> u32 {
     (c[0] as u32) | ((c[1] as u32) << 8) | ((c[2] as u32) << 16) | ((c[3] as u32) << 24)
 }
 
-/// Map a SPA/our [`PixelFormat`] to the DRM FourCC EGL expects for import. SPA byte order `BGRx`
-/// ⇒ DRM `XRGB8888` (memory B,G,R,X), etc. Lives with the frame vocabulary (not in
-/// `pf-zerocopy`) because it consumes [`PixelFormat`], which sits above that crate.
+/// SPA/our [`PixelFormat`] → DRM FourCC for EGL import. SPA `BGRx` is DRM `XRGB8888`
+/// (memory B,G,R,X).
 #[cfg(target_os = "linux")]
 pub fn drm_fourcc(format: PixelFormat) -> Option<u32> {
     use PixelFormat::*;
@@ -111,125 +83,90 @@ pub fn drm_fourcc(format: PixelFormat) -> Option<u32> {
         Bgra => drm_fourcc_code(b"AR24"), // DRM_FORMAT_ARGB8888
         Rgbx => drm_fourcc_code(b"XB24"), // DRM_FORMAT_XBGR8888
         Rgba => drm_fourcc_code(b"AB24"), // DRM_FORMAT_ABGR8888
-        // Linux native NV12 capture (gamescope PipeWire): one LINEAR dmabuf with contiguous Y then
-        // interleaved UV, exposed under DRM_FORMAT_NV12.
+        // One LINEAR dmabuf, Y then interleaved UV (`DRM_FORMAT_NV12`).
         Nv12 => drm_fourcc_code(b"NV12"),
-        // The GNOME 50+ HDR screencast formats (packed 2:10:10:10, PQ/BT.2020).
         X2Rgb10 => drm_fourcc_code(b"XR30"), // DRM_FORMAT_XRGB2101010
         X2Bgr10 => drm_fourcc_code(b"XB30"), // DRM_FORMAT_XBGR2101010
-        // 24-bit packed RGB/BGR have no straightforward dmabuf import here; use the CPU path.
-        // Rgb10a2/Rgb10a2Sdr/P010 are Windows formats; Yuv444 is OUR convert output, never a
+        // 24-bit packed RGB/BGR have no dmabuf import here; use the CPU path.
+        // Rgb10a2/Rgb10a2Sdr/P010 are Windows formats; Yuv444 is convert output, never a
         // capture source.
         Rgb | Bgr | Rgb10a2 | Rgb10a2Sdr | P010 | Yuv444 => return None,
     })
 }
 
-/// What a Windows capturer should produce, resolved **once** per session and passed **into**
-/// `capture_virtual_output` (Goal-1 stage 5, plan §2.3/§5). Passing the format in is what lets a
-/// capturer stop re-deriving the encode backend itself — it kills the
-/// `capture/dxgi.rs → encode::windows_resolved_backend()` back-reference (the highest-severity coupling:
-/// capture and encode could otherwise disagree on whether frames are GPU-resident). Neutral type; the
-/// Linux portal capturer ignores it (it negotiates its own format with PipeWire).
+/// What a Windows capturer produces, resolved once per session and passed into
+/// `capture_virtual_output`. Capture must not re-derive the encode backend from this —
+/// a mismatch would put CPU frames on a GPU encoder. Linux portal capture ignores it
+/// (PipeWire negotiates its own format).
 #[derive(Clone, Copy, Debug)]
 pub struct OutputFormat {
-    /// Produce GPU-resident D3D11 frames (zero-copy for a GPU encoder — NVENC/AMF/QSV) rather than CPU
-    /// staging. `false` **only** for the GPU-less software encoder.
+    /// GPU-resident D3D11 (zero-copy for NVENC/AMF/QSV). `false` only for the software encoder.
     pub gpu: bool,
-    /// HDR: the capturer converts to 10-bit (IDD-push FP16 → `P010`, or `Rgb10a2` for a 4:4:4 source).
-    /// `false` = 8-bit SDR.
+    /// 10-bit HDR: IDD-push FP16 → `P010` (or `Rgb10a2` for 4:4:4). `false` = 8-bit SDR.
     pub hdr: bool,
-    /// 10-bit **SDR** session (`bit_depth == 10` negotiated, HDR not): on Windows the IDD-push
-    /// capturer expands the BGRA slot 8→10 bit into the packed [`PixelFormat::Rgb10a2Sdr`]
-    /// output so NVENC encodes Main10 under the BT.709 SDR VUI — finer coding precision without
-    /// touching the display's colour state (advanced colour stays off). Mutually exclusive with
-    /// `hdr` (the handshake resolves 10-bit HDR onto the `hdr` path). Ignored on Linux — no
-    /// SDR-10 capture chain exists there yet, and the handshake never negotiates it.
+    /// 10-bit SDR (`bit_depth == 10`, HDR off). Windows IDD-push expands BGRA 8→10 into
+    /// [`PixelFormat::Rgb10a2Sdr`] so NVENC encodes Main10 under BT.709 VUI. Mutually
+    /// exclusive with `hdr`. Ignored on Linux (no SDR-10 chain; handshake never offers it).
     pub ten_bit_sdr: bool,
-    /// Full-chroma 4:4:4 session: the capturer must keep full chroma. On Windows the IDD-push
-    /// capturer hands the **BGRA** slot through (skipping the subsampling BGRA→NV12
-    /// VideoConverter) so NVENC ingests full-chroma RGB and CSCs to 4:4:4 itself — measured
-    /// on-glass (RTX 5070 Ti): ARGB + `chromaFormatIDC=3` yields TRUE 4:4:4 and the conversion
-    /// follows the configured VUI matrix (BT.709 limited since the VUI is always written). On
-    /// Linux it forces the CPU RGB path the encoder swscales to `YUV444P`. `false` on every
-    /// 4:2:0 session.
+    /// Full-chroma 4:4:4: capturer must not subsample. Windows IDD-push passes BGRA through
+    /// (skip BGRA→NV12) so NVENC CSCs to 4:4:4 under the VUI matrix. Linux forces CPU RGB
+    /// that the encoder swscales to `YUV444P`. `false` on every 4:2:0 session.
     pub chroma_444: bool,
-    /// A PyroWave (wavelet) session on Windows: the IDD-push capturer must make its NV12 out-ring
-    /// **shareable** (`SHARED | SHARED_NTHANDLE`) and signal a **shared fence** after each convert,
-    /// so the pyrowave encoder can zero-copy-import the texture into its own Vulkan device
-    /// (design/pyrowave-windows-host-zerocopy.md). Also forces the NV12 4:2:0 SDR convert branch
-    /// (never BGRA-passthrough / P010). `false` on every non-PyroWave session and on Linux (the
-    /// wavelet encoder ingests dmabufs / CPU RGB there, not a D3D11 texture).
+    /// Windows wavelet session: IDD-push NV12 out-ring must be `SHARED | SHARED_NTHANDLE`
+    /// with a shared fence after each convert (`design/pyrowave-windows-host-zerocopy.md`).
+    /// Forces NV12 4:2:0 SDR (never BGRA-passthrough / P010). `false` off Windows / non-wavelet.
     pub pyrowave: bool,
-    /// THIS session's encoder can ingest a producer-native NV12 capture (Linux raw Vulkan Video
-    /// backend on an H265/AV1 session — see `pf_encode::linux_native_nv12_ok`). The Linux capture
-    /// negotiation only offers gamescope the NV12 pod when this is set: libav VAAPI (the H264
-    /// codec's backend, and the fallback family) would misread the two-plane buffer as packed
-    /// RGB. Always `false` on Windows (the IDD-push capturer owns its own formats).
+    /// This session's encoder can ingest producer-native NV12 (Linux Vulkan Video on
+    /// H265/AV1; `pf_encode::linux_native_nv12_ok`). Capture offers gamescope the NV12 pod
+    /// only when set: libav VAAPI (H264 and the fallback) would read the two-plane buffer
+    /// as packed RGB. Always `false` on Windows.
     pub nv12_native: bool,
-    /// The session negotiated the cursor-forward channel (remote-desktop-sweep M2c): on Windows
-    /// the IDD-push capturer creates + delivers the driver's hardware-cursor section, so DWM
-    /// stops compositing the pointer into the frames and the capturer surfaces it via
-    /// `Capturer::cursor()` instead. Ignored on Linux (the portal's `SPA_META_Cursor` already
-    /// separates the pointer; the session plan's `cursor_blend` gate handles the rest).
+    /// Cursor-forward channel: Windows IDD-push delivers the driver's hardware-cursor
+    /// section so DWM stops compositing the pointer; capturer surfaces it via
+    /// `Capturer::cursor()`. Ignored on Linux (`SPA_META_Cursor` already separates it).
     pub hw_cursor: bool,
 }
 
 impl OutputFormat {
-    /// Resolve the output format for an entry point that doesn't build a full [`SessionPlan`]
-    /// (`crate::session_plan`) — the GameStream + spike paths. `gpu` is the encoder's GPU-residency,
-    /// resolved by the caller via `pf_encode::resolved_backend_is_gpu` and passed **in** (capture
-    /// never re-derives the backend — the one-way capture→encode edge, plan §2.4 / §W4); `hdr` as given.
-    /// The native punktfunk/1 path uses `SessionPlan::output_format()` instead (it already resolved the
-    /// encoder), so neither path makes a capturer re-derive it.
+    /// GameStream + spike paths that do not build a [`SessionPlan`]. `gpu` is the encoder's
+    /// residency (`pf_encode::resolved_backend_is_gpu`); capture never re-derives it.
+    /// Native punktfunk/1 uses `SessionPlan::output_format()` instead.
     pub fn resolve(hdr: bool, gpu: bool) -> Self {
         OutputFormat {
             gpu,
             hdr,
-            // 10-bit SDR is punktfunk/1-native only (Moonlight's HDR checkbox is the whole
-            // depth story on the GameStream plane).
+            // GameStream/spike: no 10-bit SDR, 4:4:4, PyroWave, or cursor-forward (native-only).
             ten_bit_sdr: false,
-            // The GameStream + spike paths are always 4:2:0 (4:4:4 is punktfunk/1-native only).
             chroma_444: false,
-            // GameStream never negotiates PyroWave (native punktfunk/1 only).
             pyrowave: false,
-            // GameStream/spike sessions never negotiate the cursor channel.
             hw_cursor: false,
-            // Conservative: the GameStream + spike paths don't resolve the codec here, and a
-            // Moonlight client may negotiate H264 (whose VAAPI backend can't ingest NV12) — so
-            // they never prefer the producer-native NV12 pod. The punktfunk/1 plane opts in via
-            // `SessionPlan::output_format()`, which knows the codec.
+            // Codec unresolved here; Moonlight may pick H264 (VAAPI cannot ingest NV12).
             nv12_native: false,
         }
     }
 }
 
-/// A mouse-cursor overlay to composite onto a frame at encode time (cursor-as-metadata). Rides on
-/// [`CapturedFrame::cursor`] for the GPU zero-copy payloads (Cuda/Dmabuf), whose pixels never touch
-/// the CPU — the encoder blends this small bitmap into its owned surface (Vulkan CSC image / CUDA
-/// devbuf / VA surface). The CPU de-pad path composites the cursor inline instead, so it leaves
-/// this `None`. `rgba` is `Arc` so attaching the (unchanged) bitmap to every frame is a refcount
-/// bump, not a copy; `serial` bumps only when the bitmap image changes, so the encoder re-uploads
-/// its small GPU texture on change and just moves a push-constant otherwise.
+/// Encode-time cursor bitmap for GPU payloads (Cuda/Dmabuf) whose pixels never hit the CPU.
+/// CPU de-pad composites inline and leaves this `None`. `rgba` is `Arc` so every frame is a
+/// refcount bump; `serial` changes only with the image so the encoder re-uploads on change
+/// and otherwise moves a push-constant.
 #[derive(Clone)]
 pub struct CursorOverlay {
-    /// Top-left in frame pixels where the bitmap is drawn (already = reported position − hotspot).
+    /// Top-left in frame pixels (already = reported position − hotspot).
     pub x: i32,
     pub y: i32,
     pub w: u32,
     pub h: u32,
-    /// Straight-alpha RGBA pixels, `w*h*4` (bytes R,G,B,A).
+    /// Straight-alpha RGBA, `w*h*4`.
     pub rgba: std::sync::Arc<Vec<u8>>,
-    /// Bumps whenever `rgba`/`w`/`h` change; stable across position-only moves.
+    /// Bumps when `rgba`/`w`/`h` change; stable across position-only moves.
     pub serial: u64,
-    /// Hotspot (the pixel that IS the pointer position) within `w`×`h`. The blend paths ignore
-    /// it (`x`/`y` are already hotspot-adjusted); the cursor-forward channel ships it to the
-    /// client so a locally-drawn OS cursor points with the right pixel.
+    /// Hotspot within `w`×`h`. Blend paths ignore it (`x`/`y` are already adjusted); the
+    /// cursor-forward channel ships it so a locally-drawn OS cursor points at the right pixel.
     pub hot_x: u32,
     pub hot_y: u32,
-    /// Compositor-reported pointer visibility. `false` = an app on the host grabbed/hid the
-    /// pointer — the cursor-forward channel turns that into the client's relative-mode hint
-    /// (remote-desktop-sweep M3). The encode loop STRIPS invisible overlays before the frame
-    /// reaches any blend path, so encoders may keep treating `Some` as "draw it".
+    /// Compositor pointer visibility. `false` = host app hid the pointer. The encode loop
+    /// strips invisible overlays before any blend, so encoders may treat `Some` as "draw it".
     pub visible: bool,
 }
 
@@ -311,81 +248,64 @@ pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,
     pub pts_ns: u64,
-    /// Pixel layout of the payload.
     pub format: PixelFormat,
     pub payload: FramePayload,
-    /// Cursor overlay to blend at encode time (GPU zero-copy payloads only); `None` when there's no
-    /// visible cursor or the pixels were already composited on the CPU de-pad path. See
-    /// [`CursorOverlay`].
+    /// Encode-time overlay for GPU payloads; `None` when already composited on the CPU de-pad path.
     pub cursor: Option<CursorOverlay>,
     /// Where these pixels came from ([`FrameOrigin`]) and the source progress clocks.
     pub provenance: Provenance,
 }
 
-/// Keeps the producer's buffer behind a zero-copy frame OUT of the producer's pool.
+/// Keeps a producer's buffer behind a zero-copy frame out of the producer's pool.
 ///
-/// The fd on a [`DmabufFrame`] only keeps the buffer object from being *freed*; nothing stops the
-/// compositor from *re-rendering into it* once the capture layer hands the buffer back — which it
-/// used to do at `.process` return, before the encoder had even imported the dmabuf (the
-/// gamescope-at-120fps torn-frame race). This handle is the fix: the PipeWire capture attaches one
-/// to every raw-passthrough frame (pool depth permitting) and defers the requeue until the LAST
-/// clone drops. A consumer that reads the dmabuf asynchronously (the Vulkan encoder's ring) clones
-/// it into whatever tracks the read (its ring slot) and drops it when the GPU is provably done
-/// (the slot's fence), so content stability covers exactly the read window. Consumers that finish
-/// their read while the frame is alive need to do nothing — the frame's own clone is enough.
+/// A dmabuf fd stops the BO from being freed, not from being re-rendered into. Capture
+/// attaches this to every raw-passthrough frame (pool depth permitting) and requeues
+/// only when the last clone drops. An async reader (Vulkan encoder ring) clones it into
+/// the slot and drops it on the slot fence so stability covers the read window. A
+/// consumer that finishes while the frame is alive needs no extra clone.
 ///
-/// Opaque on purpose: the concrete guard lives in the capture crate; everyone else only clones and
-/// drops.
+/// Opaque: the guard lives in capture; everyone else only clones and drops.
 #[cfg(target_os = "linux")]
 pub type FrameHold = std::sync::Arc<dyn std::any::Any + Send + Sync>;
 
-/// A captured frame still living in a DMA-BUF. Packed RGB uses one plane. Native Linux NV12
-/// (gamescope PipeWire) travels in ONE fd: Y starts at `offset`, and the interleaved UV plane
-/// lives at `plane1`'s offset/stride when the producer reported them — else at the contiguous
-/// fallback `offset + stride * frame_height` with the shared `stride`.
+/// A captured frame still in a DMA-BUF. Packed RGB is one plane. Native Linux NV12
+/// travels in one fd: Y at `offset`, interleaved UV at `plane1` when the producer
+/// reported it, else at `offset + stride * frame_height` with the shared `stride`.
 ///
-/// Owns a *dup* of the PipeWire buffer's fd, so the frame can travel to the encode thread and be
-/// imported there without the compositor's buffer being closed underneath it. Content stability
-/// across the read window comes from [`hold`](Self::hold) when present (the producer does not get
-/// the buffer back until the hold drops); a `None` hold falls back to the old contract — the
-/// compositor's pool depth outrunning the import+encode window.
+/// Owns a *dup* of the PipeWire fd so encode can import after capture returns. Content
+/// stability across the read window is [`hold`](Self::hold); `None` falls back to pool
+/// depth outrunning import+encode.
 #[cfg(target_os = "linux")]
 pub struct DmabufFrame {
     pub fd: std::os::fd::OwnedFd,
     /// DRM FourCC (`XR24` for BGRx, `NV12` for native 4:2:0).
     pub fourcc: u32,
-    /// DRM format modifier the compositor allocated (0 = LINEAR).
+    /// DRM format modifier (0 = LINEAR).
     pub modifier: u64,
-    /// Second-plane `(offset, stride)` within the SAME fd, when the producer reported one (the
-    /// PipeWire buffer's plane-1 chunk — NV12's interleaved UV). `None` falls back to the
-    /// contiguous-plane contract above. Always `None` for single-plane packed RGB.
+    /// Second-plane `(offset, stride)` in the same fd (NV12 UV). `None` = contiguous
+    /// fallback above. Always `None` for packed RGB.
     pub plane1: Option<(u32, u32)>,
     pub offset: u32,
     pub stride: u32,
-    /// Deferred-requeue hold on the producer's buffer (see [`FrameHold`]); `None` when the
-    /// capture could not spare a buffer from the pool (shallow pool, or `PUNKTFUNK_ZEROCOPY_HOLD=0`).
+    /// Deferred-requeue hold; `None` when the pool could not spare a buffer (`PUNKTFUNK_ZEROCOPY_HOLD=0`).
     pub hold: Option<FrameHold>,
 }
 
-/// Where a captured frame's pixels live.
 pub enum FramePayload {
     /// Tightly-packed CPU pixels in `format`, `width*height*bytes_per_pixel` (no row padding).
     Cpu(Vec<u8>),
-    /// A pitched GPU buffer (BGRA-order, on the shared CUDA context) — the NVIDIA zero-copy path.
-    /// The dmabuf has already been imported + copied into this owned device buffer.
+    /// Pitched BGRA on the shared CUDA context. Dmabuf already imported into this owned buffer.
     #[cfg(target_os = "linux")]
     Cuda(pf_zerocopy::DeviceBuffer),
-    /// A raw DMA-BUF: packed RGB for the existing GPU CSC paths, or native NV12 from a producer
-    /// such as gamescope. The encoder imports it without a host copy.
+    /// Raw DMA-BUF: packed RGB for GPU CSC, or producer-native NV12. Encoder imports without a host copy.
     #[cfg(target_os = "linux")]
     Dmabuf(DmabufFrame),
-    /// A GPU-resident D3D11 texture (Windows zero-copy path for NVENC). Owns the copied frame.
+    /// GPU-resident D3D11 texture (Windows NVENC zero-copy). Owns the copied frame.
     #[cfg(target_os = "windows")]
     D3d11(dxgi::D3d11Frame),
 }
 
 impl CapturedFrame {
-    /// True if the frame's pixels are a GPU/CUDA buffer (the NVIDIA zero-copy path).
     pub fn is_cuda(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -397,7 +317,6 @@ impl CapturedFrame {
         }
     }
 
-    /// True if the frame is a raw dmabuf (the VAAPI zero-copy path).
     pub fn is_dmabuf(&self) -> bool {
         #[cfg(target_os = "linux")]
         {

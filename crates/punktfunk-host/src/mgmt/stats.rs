@@ -1,5 +1,7 @@
-//! Stats/logs-tagged management endpoints: performance-capture control + time-series and the
-//! in-memory log stream. Split out of the `mgmt` facade (plan §W5).
+//! Stats- and logs-tagged management HTTP handlers.
+//!
+//! Capture arm/disarm, live samples, saved recordings. `GET /logs` is a cursor
+//! poll of the in-memory ring (DEBUG and above, independent of `RUST_LOG`).
 
 use super::shared::*;
 use crate::log_capture::LogPage;
@@ -7,11 +9,10 @@ use crate::stats_recorder::Capture;
 use crate::stats_recorder::CaptureMeta;
 use crate::stats_recorder::StatsStatus;
 
-/// Start a stats capture
+/// Arm a capture. Idempotent if one is already running.
 ///
-/// Arms a new performance-stats capture. Idempotent: if a capture is already running this returns
-/// the current status unchanged. While armed, the streaming loops emit aggregated samples (~ every
-/// 1–2 s) into the in-progress capture, readable live via `GET /stats/capture/live`.
+/// Streaming loops emit aggregated samples every 1–2 s into the in-progress
+/// capture (`GET /stats/capture/live`).
 #[utoipa::path(
     post,
     path = "/stats/capture/start",
@@ -31,10 +32,7 @@ pub(crate) async fn stats_capture_start(State(st): State<Arc<MgmtState>>) -> Jso
     Json(status)
 }
 
-/// Stop the stats capture
-///
-/// Disarms the in-progress capture and writes it to disk atomically, returning its summary. If
-/// nothing was recording, returns `204 No Content`.
+/// Disarm and write the capture to disk atomically.
 #[utoipa::path(
     post,
     path = "/stats/capture/stop",
@@ -61,10 +59,6 @@ pub(crate) async fn stats_capture_stop(State(st): State<Arc<MgmtState>>) -> Resp
     }
 }
 
-/// Stats capture status
-///
-/// Whether a capture is armed, its sample count, and start time. Poll this (e.g. every 2 s) to
-/// drive the capture-control UI.
 #[utoipa::path(
     get,
     path = "/stats/capture/status",
@@ -79,10 +73,6 @@ pub(crate) async fn stats_capture_status(State(st): State<Arc<MgmtState>>) -> Js
     Json(st.stats.status())
 }
 
-/// Live in-progress capture
-///
-/// The full sample time-series of the capture currently recording, for live graphing. `404` when
-/// nothing is armed.
 #[utoipa::path(
     get,
     path = "/stats/capture/live",
@@ -101,9 +91,7 @@ pub(crate) async fn stats_capture_live(State(st): State<Arc<MgmtState>>) -> Resp
     }
 }
 
-/// List saved recordings
-///
-/// Every saved capture's summary (the `meta` head only — not the sample body), newest first.
+/// Saved capture summaries (`meta` only, no sample body), newest first.
 #[utoipa::path(
     get,
     path = "/stats/recordings",
@@ -120,9 +108,6 @@ pub(crate) async fn stats_recordings_list(
     Json(st.stats.list())
 }
 
-/// Get a saved recording
-///
-/// The full capture (meta + samples) for `id`, for graphing or download.
 #[utoipa::path(
     get,
     path = "/stats/recordings/{id}",
@@ -152,9 +137,6 @@ pub(crate) async fn stats_recording_get(
     }
 }
 
-/// Delete a saved recording
-///
-/// Removes the recording `id` from disk. `404` if there is no such recording.
 #[utoipa::path(
     delete,
     path = "/stats/recordings/{id}",
@@ -187,20 +169,17 @@ pub(crate) async fn stats_recording_delete(
     }
 }
 
-/// Query for `GET /logs` — a cursor poll.
+/// Cursor poll for `GET /logs`.
 #[derive(Deserialize)]
 pub(crate) struct LogsQuery {
     after: Option<u64>,
     limit: Option<u32>,
 }
 
-/// Host logs
+/// In-memory ring at DEBUG and above, independent of `RUST_LOG`.
 ///
-/// The host's recent log entries — an in-memory ring of the newest few thousand, captured at
-/// DEBUG and above regardless of `RUST_LOG`. Follow live by polling with `after` set to the last
-/// response's `next` cursor; a `dropped: true` means entries were evicted between polls (the ring
-/// wrapped). Bearer-only: logs can reference client identities and host paths, so this is part of
-/// the loopback-only admin surface, never the LAN-readable mTLS one.
+/// Poll with `after` = last `next`. `dropped: true` means the ring wrapped
+/// between polls and entries were evicted.
 #[utoipa::path(
     get,
     path = "/logs",

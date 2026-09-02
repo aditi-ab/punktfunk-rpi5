@@ -1,11 +1,11 @@
-//! Shared control-plane plumbing for the management submodules: the [`ApiError`] envelope
-//! every non-2xx response wears, [`api_error`], the [`ApiJson`] extractor that keeps axum's own
-//! rejections in that envelope, and a small re-export prelude of the axum/serde/utoipa vocabulary
-//! the handler modules share. Split out of the `mgmt` facade (plan §W5).
+//! Shared management-API plumbing: [`ApiError`] envelope, [`api_error`], [`ApiJson`].
+//!
+//! Every non-2xx body is [`ApiError`]. [`ApiJson`] rewraps axum JSON rejections
+//! so that contract holds. Handler modules `use super::shared::*` for the
+//! axum/serde/utoipa prelude.
 
 use axum::extract::Request;
 
-// Re-export prelude: the vocabulary every handler submodule pulls in via `use super::shared::*`.
 pub(crate) use super::MgmtState;
 pub(crate) use axum::extract::{Path, Query, State};
 pub(crate) use axum::http::StatusCode;
@@ -15,20 +15,18 @@ pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use std::sync::Arc;
 pub(crate) use utoipa::ToSchema;
 
-/// Error envelope for every non-2xx response.
+/// Envelope for every non-2xx body.
 #[derive(Serialize, Deserialize, ToSchema)]
 pub(crate) struct ApiError {
     error: String,
 }
 
-/// What a bulk unpair removed. Shared by the two collection DELETEs (`/clients` and
-/// `/native/clients`) so the console sees one schema across both pairing planes.
+/// Bulk-unpair result, shared by `/clients` and `/native/clients`.
 ///
-/// A count rather than 204: "unpair everything" is idempotent, so an empty store is a success, and
-/// the operator still wants to be told whether that meant three devices or none.
+/// A count, not 204: unpair-everything is idempotent, and the operator still
+/// needs to know whether that was three devices or none.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct UnpairAllResult {
-    /// Clients removed from the trust store — 0 when nothing was paired.
     #[schema(example = 3)]
     pub(crate) unpaired: u32,
 }
@@ -43,8 +41,7 @@ pub(crate) fn api_error(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
-/// `axum::Json` whose rejections (bad JSON → 400/422, wrong content-type → 415) are
-/// rewrapped in the [`ApiError`] envelope, keeping "every non-2xx body is `ApiError`" true.
+/// `axum::Json` that rewraps rejections (400/422/415) in [`ApiError`].
 pub(crate) struct ApiJson<T>(pub(crate) T);
 
 impl<S, T> axum::extract::FromRequest<S> for ApiJson<T>

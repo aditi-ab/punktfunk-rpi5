@@ -1,34 +1,18 @@
-//! H.265 parameter-set conversion: the vendored parser's [`Vps`]/[`Sps`]/[`Pps`]
-//! into the `StdVideoH265*ParameterSet` structs a Vulkan Video session-parameters
-//! object is created from — [`crate::params`] one codec over (M3's CPU half).
+//! H.265 parameter-set conversion: vendored [`Vps`]/[`Sps`]/[`Pps`] into the
+//! `StdVideoH265*ParameterSet` structs a Vulkan Video session-parameters object
+//! is created from. Std structs embed raw pointers, so conversion returns owning
+//! wrappers with the aliasing/lifetime contract of [`crate::OwnedStdSps`].
 //!
-//! The Std structs embed raw pointers (`pProfileTierLevel`, `pDecPicBufMgr`,
-//! `pScalingLists`, `pShortTermRefPicSet`, `pLongTermRefPicsSps`, ...), so
-//! conversion returns OWNING wrappers — the exact aliasing/lifetime contract of
-//! [`crate::OwnedStdSps`], restated on [`OwnedStdH265Sps`].
+//! A DECODE session consumes neither VUI nor HRD/timing.
+//! `vui_parameters_present_flag` stays 0 and `pSequenceParameterSetVui` stays
+//! null; colour rides [`pf_bitstream::h265::PicturePlan::colour`].
+//! `vps_timing_info_present_flag` stays 0 and `pHrdParameters` stays null.
 //!
-//! Deliberate skips, mirroring the H.264 module's VUI decision (a DECODE session
-//! consumes neither of these — they shape display and rate conformance, not
-//! reconstruction):
-//!
-//! - VUI: `vui_parameters_present_flag` stays 0 and `pSequenceParameterSetVui`
-//!   stays null. Colour rides [`pf_bitstream::h265::PicturePlan::colour`] into the
-//!   presenter, per picture, exactly as H.264 does it.
-//! - HRD/timing: `vps_timing_info_present_flag` stays 0 and `pHrdParameters`
-//!   stays null. HRD is buffer-conformance machinery; no decode operation reads it.
-//!
-//! Short-term RPS candidates are re-encoded in RESOLVED form: the vendored parser
-//! has already run the 7.4.8 inter-RPS prediction (equations 7-59..7-66) and
-//! stores every SPS candidate as absolute `DeltaPocS0`/`DeltaPocS1` arrays, so
-//! each set is declared non-predicted with those derived values encoded back into
-//! `delta_poc_sX_minus1` syntax. Equivalent by construction — 7-65/7-66 IS the
-//! definition of a set's content, and both the direct and the predicted syntax
-//! derive the same arrays — and it is the same "the parser already resolved it"
-//! idiom the H.264 module applies to scaling lists. A slice-inline RPS that
-//! predicts from an SPS candidate still derives identically in hardware: the
-//! derivation consumes only the source set's DeltaPoc arrays and counts, all
-//! preserved here (`NumDeltaPocsOfRefRpsIdx` rides the picture info, see
-//! [`crate::pic_h265`]).
+//! Short-term RPS candidates are re-encoded in resolved form: the parser has
+//! already run 7.4.8 inter-RPS prediction, so each set is declared non-predicted
+//! with derived `DeltaPocS0`/`DeltaPocS1` written back as `delta_poc_sX_minus1`.
+//! Slice-inline prediction still derives from those arrays
+//! (`NumDeltaPocsOfRefRpsIdx` rides picture info; see [`crate::pic_h265`]).
 
 use ash::vk::native as hh;
 pub use cros_codecs::codec::h265::parser::Pps;
@@ -39,55 +23,52 @@ pub use cros_codecs::codec::h265::parser::Sps;
 pub use cros_codecs::codec::h265::parser::Vps;
 use pf_bitstream::h265::Level;
 
-/// A parameter set that cannot be represented as a StdVideo struct, or that sits
-/// outside the punktfunk H.265 decode envelope (4:2:0 and 4:4:4 at 8 or 10 bits,
-/// from encoders we control). Hitting one is a stream-integrity failure, not a
-/// feature gap — reject-with-error rather than submit a half-truth to a driver.
+/// Unrepresentable as a StdVideo struct, or outside the decode envelope
+/// (4:2:0 and 4:4:4 at 8 or 10 bits). Stream-integrity failure: reject,
+/// never submit a half-truth to a driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H265ParamsError {
-    /// `general_profile_idc` has no `StdVideoH265ProfileIdc` code point. Vulkan
-    /// defines Main (1), Main 10 (2), Main Still Picture (3) and Format Range
-    /// Extensions (4); High Throughput/SCC/scalable profiles land here.
+    /// `general_profile_idc` has no `StdVideoH265ProfileIdc` code point.
+    /// Vulkan names 1-4 (Main, Main 10, Main Still Picture, Format Range
+    /// Extensions); High Throughput/SCC/scalable land here.
     UnmappableProfileIdc(u8),
-    /// `chroma_format_idc` past 3 — not legal H.265 to begin with.
+    /// `chroma_format_idc` past 3 — not legal H.265.
     InvalidChromaFormatIdc(u8),
-    /// 4:2:2 or monochrome: legal H.265, but no punktfunk host emits it and the
-    /// client has no output-format plumbing for it — outside the envelope.
+    /// 4:2:2 or monochrome: legal H.265, outside the envelope (no host
+    /// emits it; no output-format plumbing).
     UnsupportedChromaFormat(u8),
-    /// 4:4:4 with `separate_colour_plane_flag`: ChromaArrayType 0 in disguise
-    /// (three monochrome-coded planes) — no output-format plumbing, and most
-    /// decode hardware refuses it.
+    /// 4:4:4 with `separate_colour_plane_flag`: ChromaArrayType 0 (three
+    /// monochrome-coded planes). No output format; most hardware refuses it.
     SeparateColourPlanes,
-    /// Bit depth beyond 8/10, or luma and chroma depths that disagree: no
-    /// punktfunk output format (NV12/P010 and their 4:4:4 counterparts) can carry
-    /// it — outside the envelope.
+    /// Bit depth beyond 8/10, or luma and chroma depths that disagree. No
+    /// output format (NV12/P010 and 4:4:4 counterparts) can carry it.
     UnsupportedBitDepth { luma_minus8: u8, chroma_minus8: u8 },
-    /// SCC palette predictor initializers: `pPredictorPaletteEntries` is the one
-    /// Std pointer this conversion does not populate (punktfunk hosts emit no SCC
-    /// coding), and a present-flag over a null pointer would be a half-truth.
+    /// SCC palette predictor initializers: this conversion does not populate
+    /// `pPredictorPaletteEntries`. A present-flag over a null pointer is a
+    /// half-truth.
     PalettePredictorInitializers,
     /// `num_short_term_ref_pic_sets` past the spec's 64 (7.4.3.2.1).
     TooManyShortTermRpsSets(u8),
-    /// The SPS declares more short-term RPS candidates than the parser resolved —
-    /// a corrupt table this conversion refuses to pad.
+    /// The SPS declares more short-term RPS candidates than the parser
+    /// resolved. Refuse to pad a corrupt table.
     MissingShortTermRps { index: usize },
-    /// An RPS candidate holds more entries on one side than the Std struct's
-    /// 16-element arrays (7.4.8 bounds both sides by the DPB size, itself <= 16).
+    /// More entries on one side than the Std struct's 16-element arrays
+    /// (7.4.8 bounds both sides by DPB size, itself <= 16).
     RpsEntryOverflow {
         set: usize,
         negative: u8,
         positive: u8,
     },
-    /// An RPS candidate's derived `DeltaPocS0`/`DeltaPocS1` array is not strictly
-    /// monotonic (or a step exceeds the 7.4.8 bound of 2^15), so it cannot be
-    /// re-encoded as `delta_poc_sX_minus1` syntax. Unreachable off the vendored
-    /// parser; guards directly-constructed inputs.
+    /// Derived `DeltaPocS0`/`DeltaPocS1` is not strictly monotonic, or a
+    /// step exceeds 7.4.8's 2^15 bound, so it cannot re-encode as
+    /// `delta_poc_sX_minus1`. Unreachable off the vendored parser; guards
+    /// constructed inputs.
     NonMonotonicRps { set: usize },
     /// `num_long_term_ref_pics_sps` past the spec's 32 (7.4.3.2.1).
     TooManyLongTermSpsPics(u8),
-    /// A syntax value overflows the (narrower) Std field that carries it — e.g. a
-    /// tile column width past `u16`. The parser bounds everything it reads, so
-    /// this guards hostile or directly-constructed inputs.
+    /// A syntax value overflows the narrower Std field (e.g. a tile column
+    /// width past `u16`). The parser bounds reads; this guards constructed
+    /// inputs.
     FieldOverflow { field: &'static str, value: i64 },
 }
 
@@ -170,9 +151,9 @@ impl std::fmt::Display for H265ParamsError {
 
 impl std::error::Error for H265ParamsError {}
 
-/// Checked narrowing into a Std field: the parser bounds everything it reads, so
-/// an overflow here means hostile or directly-constructed input — fail closed,
-/// never truncate (a truncated tile width would decode as garbage, silently).
+/// Narrow into a Std field. The parser bounds reads, so overflow here is
+/// hostile or constructed input — fail closed; a truncated tile width
+/// would decode as garbage.
 fn narrow<S, D>(field: &'static str, value: S) -> Result<D, H265ParamsError>
 where
     D: TryFrom<S>,
@@ -184,32 +165,30 @@ where
     })
 }
 
-/// The converted VPS plus the heap allocations its embedded pointers target.
-/// Ownership contract as [`crate::OwnedStdSps`]: boxed backing, movable wrapper,
-/// no mutation, deliberately not `Clone` (re-convert instead).
+/// Converted VPS plus the heap allocations its embedded pointers target.
+/// Same ownership as [`crate::OwnedStdSps`]: boxed backing, movable wrapper,
+/// no mutation, not `Clone` (re-convert instead).
 #[derive(Debug)]
 pub struct OwnedStdH265Vps {
-    /// Boxed so [`Self::std`]'s ADDRESS — what `pStdVPSs` points at — survives every
-    /// move of the wrapper ([`crate::OwnedStdSps`]).
+    /// Boxed so [`Self::std`]'s address — what `pStdVPSs` points at — survives
+    /// every move of the wrapper.
     std: Box<hh::StdVideoH265VideoParameterSet>,
     _ptl_backing: Box<hh::StdVideoH265ProfileTierLevel>,
     _dpb_backing: Box<hh::StdVideoH265DecPicBufMgr>,
 }
 
 impl OwnedStdH265Vps {
-    /// The Std struct, valid for as long as `self` lives (do not let a `Copy` of
-    /// it outlive the wrapper — see [`crate::OwnedStdSps`]).
+    /// The Std struct, valid for as long as `self` lives. Do not let a `Copy`
+    /// of it outlive the wrapper — see [`crate::OwnedStdSps`].
     pub fn std(&self) -> &hh::StdVideoH265VideoParameterSet {
         &self.std
     }
 
-    /// Lower the profile/tier/level block's `general_level_idc` to `max` when the
-    /// stream declares a higher one. The declared level is a CLAIM, and encoders
-    /// over-claim in the wild (AMF stamps 6.2 — the codec maximum — on streams that
-    /// need 5.2); handing the driver a level above its `maxLevelIdc` is invalid
-    /// usage, while the stream's real demands are enforced by the session's coded
-    /// extent and DPB depth. The "no mutation" ownership contract is about blocks a
-    /// LIVE parameters object points at; this runs before the set is handed over.
+    /// Lower `general_level_idc` to `max` when the stream over-claims. A
+    /// level above the driver's `maxLevelIdc` is invalid usage; real demand
+    /// is the session's coded extent and DPB depth. Runs before handover —
+    /// the no-mutation contract covers blocks a live parameters object
+    /// already points at.
     pub(crate) fn clamp_level(&mut self, max: hh::StdVideoH265LevelIdc) {
         if self._ptl_backing.general_level_idc > max {
             self._ptl_backing.general_level_idc = max;
@@ -217,17 +196,14 @@ impl OwnedStdH265Vps {
     }
 }
 
-/// The converted SPS plus the heap allocations its embedded pointers target.
-///
-/// Same ownership contract as [`crate::OwnedStdSps`], with five potential
-/// pointers: the profile/tier/level and DPB-manager blocks are always present,
-/// scaling lists / short-term RPS candidates / long-term SPS candidates only when
-/// the stream carries them. `pSequenceParameterSetVui` and
-/// `pPredictorPaletteEntries` are null by design (module docs; palette data is
-/// rejected, not dropped).
+/// Converted SPS plus the heap allocations its embedded pointers target.
+/// Same ownership as [`crate::OwnedStdSps`]. PTL and DPB-manager blocks are
+/// always present; scaling lists / short-term RPS / long-term SPS candidates
+/// only when the stream carries them. `pSequenceParameterSetVui` and
+/// `pPredictorPaletteEntries` stay null (palette data is rejected).
 #[derive(Debug)]
 pub struct OwnedStdH265Sps {
-    /// Boxed for [`OwnedStdH265Vps`]'s reason: `pStdSPSs` is this field's address.
+    /// Boxed so `pStdSPSs` is this field's address across wrapper moves.
     std: Box<hh::StdVideoH265SequenceParameterSet>,
     _ptl_backing: Box<hh::StdVideoH265ProfileTierLevel>,
     _dpb_backing: Box<hh::StdVideoH265DecPicBufMgr>,
@@ -243,8 +219,7 @@ impl OwnedStdH265Sps {
         &self.std
     }
 
-    /// Lower `general_level_idc` to the device ceiling — [`OwnedStdH265Vps::clamp_level`]
-    /// carries the argument.
+    /// Same clamp as [`OwnedStdH265Vps::clamp_level`].
     pub(crate) fn clamp_level(&mut self, max: hh::StdVideoH265LevelIdc) {
         if self._ptl_backing.general_level_idc > max {
             self._ptl_backing.general_level_idc = max;
@@ -252,11 +227,11 @@ impl OwnedStdH265Sps {
     }
 }
 
-/// The converted PPS plus the scaling-list allocation its `pScalingLists`
-/// targets. Same ownership contract as [`crate::OwnedStdSps`].
+/// Converted PPS plus the scaling-list allocation `pScalingLists` targets.
+/// Same ownership as [`crate::OwnedStdSps`].
 #[derive(Debug)]
 pub struct OwnedStdH265Pps {
-    /// Boxed for [`OwnedStdH265Vps`]'s reason: `pStdPPSs` is this field's address.
+    /// Boxed so `pStdPPSs` is this field's address across wrapper moves.
     std: Box<hh::StdVideoH265PictureParameterSet>,
     _scaling_backing: Option<Box<hh::StdVideoH265ScalingLists>>,
 }
@@ -268,8 +243,8 @@ impl OwnedStdH265Pps {
     }
 }
 
-/// H.265 `general_level_idc` (value-coded: 30 x the level number, Table A.8) to
-/// Vulkan's index-coded `StdVideoH265LevelIdc`. The Std code points ascend with
+/// H.265 `general_level_idc` (value-coded: 30 x the level number, Table A.8)
+/// to Vulkan's index-coded `StdVideoH265LevelIdc`. Code points ascend with
 /// the level, so a driver's `maxLevelIdc` gate compares them numerically.
 pub(crate) const fn level_to_std(level: Level) -> hh::StdVideoH265LevelIdc {
     match level {
@@ -289,13 +264,10 @@ pub(crate) const fn level_to_std(level: Level) -> hh::StdVideoH265LevelIdc {
     }
 }
 
-/// `general_profile_idc` to `StdVideoH265ProfileIdc` — the code points equal the
-/// profile_idc values they name, so recognised ones pass through.
-///
-/// (Visible to the crate because the GPU half's profile key
-/// [`crate::caps_h265::H265ProfileKey`] must be built from the PICTURE's profile
-/// idc before any parameter-set conversion runs — the caps query needs it — and
-/// both must agree on the mapping.)
+/// `general_profile_idc` to `StdVideoH265ProfileIdc`. Recognised code points
+/// equal the `profile_idc` values they name, so they pass through. Shared
+/// with [`crate::caps_h265::H265ProfileKey`]: the caps query builds the
+/// profile key from the picture's idc before conversion, and both must agree.
 pub(crate) fn profile_to_std(idc: u8) -> Result<hh::StdVideoH265ProfileIdc, H265ParamsError> {
     match u32::from(idc) {
         p @ 1..=4 => Ok(p),
@@ -303,7 +275,7 @@ pub(crate) fn profile_to_std(idc: u8) -> Result<hh::StdVideoH265ProfileIdc, H265
     }
 }
 
-/// profile_tier_level() to the Std block (always pointer-backed in VPS and SPS).
+/// `profile_tier_level()` to the Std block (always pointer-backed in VPS and SPS).
 fn ptl_to_std(ptl: &ProfileTierLevel) -> Result<hh::StdVideoH265ProfileTierLevel, H265ParamsError> {
     // SAFETY: StdVideoH265ProfileTierLevel is a plain-C bindgen struct of a
     // bitfield word and two enum ints; all-zero is a valid value for every field.
@@ -323,17 +295,14 @@ fn ptl_to_std(ptl: &ProfileTierLevel) -> Result<hh::StdVideoH265ProfileTierLevel
     Ok(std)
 }
 
-/// Pack the parser's scaling lists into the Std layout.
+/// Pack the parser's scaling lists into the Std layout. The parser has
+/// already run 7.4.5 (explicit coefficients, matrix-id prediction, Table
+/// 7-5/7-6 defaults), so the arrays are fully resolved.
 ///
-/// The vendored parser has already run 7.4.5 in full — explicit coefficients,
-/// matrix-id prediction (equation 7-42) and the Table 7-5/7-6 defaults — so the
-/// arrays hold the fully RESOLVED lists (the H.264 module's idiom). Layout notes:
-///
-/// - 32x32 (sizeId 3) has exactly TWO lists, at parser matrix ids 0 (intra) and
-///   3 (inter) — 7.4.5's loop steps matrixId by 3 there. The Std array holds them
-///   compacted at indices 0 and 1.
-/// - The Std DC fields carry the VALUE (`scaling_list_dc_coef_minus8 + 8`,
-///   1..255), not the minus8 syntax element.
+/// 32x32 (sizeId 3) has two lists, at parser matrix ids 0 (intra) and 3
+/// (inter) — 7.4.5 steps matrixId by 3 there. The Std array holds them at
+/// indices 0 and 1. Std DC fields carry the value
+/// (`scaling_list_dc_coef_minus8 + 8`, 1..255), not the minus8 syntax.
 fn scaling_lists_to_std(
     lists: &ScalingLists,
 ) -> Result<hh::StdVideoH265ScalingLists, H265ParamsError> {
@@ -359,12 +328,10 @@ fn scaling_lists_to_std(
     Ok(std)
 }
 
-/// One resolved SPS short-term RPS candidate re-encoded as a non-predicted Std
-/// set (module docs: the parser flattened 7.4.8's prediction, so the prediction
-/// flags stay 0 and the derived `DeltaPocSX` arrays encode back into
-/// `delta_poc_sX_minus1` syntax — `DeltaPocS0` is strictly decreasing negative,
-/// `DeltaPocS1` strictly increasing positive, so both step differences are the
-/// positive minus1+1 values).
+/// One resolved SPS short-term RPS candidate as a non-predicted Std set.
+/// The parser flattened 7.4.8 prediction, so flags stay 0 and `DeltaPocSX`
+/// re-encodes as `delta_poc_sX_minus1` (`DeltaPocS0` strictly decreasing
+/// negative, `DeltaPocS1` strictly increasing positive).
 fn st_rps_to_std(
     index: usize,
     set: &ShortTermRefPicSet,
@@ -386,8 +353,7 @@ fn st_rps_to_std(
     std.num_negative_pics = set.num_negative_pics;
     std.num_positive_pics = set.num_positive_pics;
 
-    // 7.4.8: the syntax steps are ue(v)-bounded at 2^15 - 1, so a legal step is
-    // 1..=2^15; anything else cannot be re-encoded (fn docs).
+    // 7.4.8: ue(v) steps are bounded at 2^15 - 1, so a legal step is 1..=32768.
     let mut prev: i64 = 0;
     for i in 0..negative {
         let cur = i64::from(set.delta_poc_s0[i]);
@@ -417,9 +383,8 @@ fn st_rps_to_std(
     Ok(std)
 }
 
-/// The envelope + representability gate every conversion path shares: profile,
-/// chroma format and bit depth (struct docs on the error type for the WHY of
-/// each). Runs before any allocation so a rejection is cheap and total.
+/// Shared envelope gate: profile, chroma format, bit depth. Runs before
+/// any allocation so a rejection is cheap and total.
 fn check_envelope(sps: &Sps) -> Result<(), H265ParamsError> {
     profile_to_std(sps.profile_tier_level.general_profile_idc)?;
     if sps.chroma_format_idc > 3 {
@@ -432,11 +397,8 @@ fn check_envelope(sps: &Sps) -> Result<(), H265ParamsError> {
             sps.chroma_format_idc,
         ));
     }
-    // 4:4:4 with separate colour planes is ChromaArrayType 0 in disguise — three
-    // monochrome-coded planes. No punktfunk output format can carry it and most
-    // decode hardware refuses it; letting it through would fail later at the
-    // driver (or worse, map planes wrongly) — the silent class this envelope
-    // exists to catch.
+    // ChromaArrayType 0: three monochrome-coded planes. Letting it through
+    // would fail at the driver or map planes wrongly.
     if sps.chroma_format_idc == 3 && sps.separate_colour_plane_flag {
         return Err(H265ParamsError::SeparateColourPlanes);
     }
@@ -457,9 +419,8 @@ fn check_envelope(sps: &Sps) -> Result<(), H265ParamsError> {
     Ok(())
 }
 
-/// Convert one VPS into the Std struct (owning wrapper). HRD/timing is skipped by
-/// design (module docs); the DPB manager and profile/tier/level blocks ride
-/// behind owned pointers.
+/// Convert one VPS. HRD/timing is skipped (module docs); DPB manager and
+/// profile/tier/level ride behind owned pointers.
 pub fn vps_to_std_h265(vps: &Vps) -> Result<OwnedStdH265Vps, H265ParamsError> {
     let ptl_backing = Box::new(ptl_to_std(&vps.profile_tier_level)?);
 
@@ -468,8 +429,7 @@ pub fn vps_to_std_h265(vps: &Vps) -> Result<OwnedStdH265Vps, H265ParamsError> {
     let mut dpb: hh::StdVideoH265DecPicBufMgr = unsafe { std::mem::zeroed() };
     dpb.max_latency_increase_plus1 = vps.max_latency_increase_plus1;
     for i in 0..7 {
-        // The VPS arrays are u32 in the parser; the spec bounds both syntax
-        // elements well inside u8 (MaxDpbSize <= 16), so an overflow is corrupt.
+        // Parser arrays are u32; spec bounds both inside u8 (MaxDpbSize <= 16).
         dpb.max_dec_pic_buffering_minus1[i] = narrow(
             "vps_max_dec_pic_buffering_minus1",
             vps.max_dec_pic_buffering_minus1[i],
@@ -489,10 +449,8 @@ pub fn vps_to_std_h265(vps: &Vps) -> Result<OwnedStdH265Vps, H265ParamsError> {
         .set_vps_sub_layer_ordering_info_present_flag(u32::from(
             vps.sub_layer_ordering_info_present_flag,
         ));
-    // vps_timing_info_present_flag and vps_poc_proportional_to_timing_flag stay
-    // 0 with their fields: the HRD/timing skip (module docs) must be
-    // self-consistent — a present-flag over a null pHrdParameters would be the
-    // exact half-truth this module exists to avoid.
+    // Timing flags stay 0 with their fields: a present-flag over a null
+    // `pHrdParameters` would be a half-truth.
     std.vps_video_parameter_set_id = vps.video_parameter_set_id;
     std.vps_max_sub_layers_minus1 = vps.max_sub_layers_minus1;
     std.pDecPicBufMgr = &*dpb_backing;
@@ -505,15 +463,12 @@ pub fn vps_to_std_h265(vps: &Vps) -> Result<OwnedStdH265Vps, H265ParamsError> {
     })
 }
 
-/// A minimal Std VPS synthesized from the SPS that references it, for streams
-/// whose VPS NALU was lost upstream (the parser attaches the VPS to the SPS only
-/// when it saw one — `sps.vps` is `None` otherwise). Every stream is REQUIRED to
-/// carry a VPS (7.4.2.1), and Vulkan requires the parameters object to hold the
-/// VPS the SPS names, so the session layer needs SOMETHING to add; this fallback
-/// carries exactly the facts the SPS restates (ids, sub-layer count,
-/// profile/tier/level, DPB sizing) — which is also everything a decode session
-/// could consult, since the VPS's own additions (timing, layer sets) are all in
-/// the deliberate-skip category (module docs).
+/// Minimal Std VPS from the SPS that names it, for streams whose VPS NALU
+/// was lost (`sps.vps` is `None` unless the parser saw one). Every stream
+/// must carry a VPS (7.4.2.1) and Vulkan requires the parameters object to
+/// hold the VPS the SPS names. The fallback restates the facts the SPS
+/// already carries (ids, sub-layer count, PTL, DPB sizing) — the VPS's own
+/// additions (timing, layer sets) are in the skip category.
 pub fn fallback_vps_from_sps(sps: &Sps) -> Result<OwnedStdH265Vps, H265ParamsError> {
     let ptl_backing = Box::new(ptl_to_std(&sps.profile_tier_level)?);
     let dpb_backing = Box::new(sps_dec_pic_buf_mgr(sps));
@@ -538,8 +493,8 @@ pub fn fallback_vps_from_sps(sps: &Sps) -> Result<OwnedStdH265Vps, H265ParamsErr
     })
 }
 
-/// The SPS's sub-layer ordering arrays as the Std DPB-manager block. Infallible:
-/// the parser's SPS arrays are already `u8` where the Std block wants `u8`.
+/// SPS sub-layer ordering as the Std DPB-manager block. Infallible: the
+/// parser's SPS arrays are already `u8`.
 fn sps_dec_pic_buf_mgr(sps: &Sps) -> hh::StdVideoH265DecPicBufMgr {
     // SAFETY: plain-C bindgen struct of integer arrays; all-zero is valid.
     let mut dpb: hh::StdVideoH265DecPicBufMgr = unsafe { std::mem::zeroed() };
@@ -551,9 +506,8 @@ fn sps_dec_pic_buf_mgr(sps: &Sps) -> hh::StdVideoH265DecPicBufMgr {
     dpb
 }
 
-/// Convert one SPS into the Std struct (owning wrapper), mapping every field the
-/// H.265 decode profile consumes. VUI is skipped by design; SCC palette data is
-/// rejected, never dropped (module docs).
+/// Convert one SPS. VUI is skipped; SCC palette data is rejected, never
+/// dropped (module docs).
 pub fn sps_to_std_h265(sps: &Sps) -> Result<OwnedStdH265Sps, H265ParamsError> {
     check_envelope(sps)?;
     if sps.num_short_term_ref_pic_sets > 64 {
@@ -575,9 +529,8 @@ pub fn sps_to_std_h265(sps: &Sps) -> Result<OwnedStdH265Sps, H265ParamsError> {
         .then(|| scaling_lists_to_std(&sps.scaling_list).map(Box::new))
         .transpose()?;
 
-    // The COUNT field and the pointer derive from the one condition (the H.264
-    // module's stale-count rule): a declared candidate count only ever rides
-    // over a real array of exactly that many converted sets.
+    // Count and pointer share one condition: a declared candidate count only
+    // ever rides a real array of exactly that many converted sets.
     let st_rps_backing = (sps.num_short_term_ref_pic_sets > 0)
         .then(
             || -> Result<Box<[hh::StdVideoH265ShortTermRefPicSet]>, H265ParamsError> {
@@ -595,14 +548,10 @@ pub fn sps_to_std_h265(sps: &Sps) -> Result<OwnedStdH265Sps, H265ParamsError> {
         )
         .transpose()?;
 
-    // Backed whenever the FLAG is set, even with zero SPS candidates: the header
-    // annotates `pLongTermRefPicsSps` "must be a valid pointer if
-    // long_term_ref_pics_present_flag is set", and FFmpeg's vulkan_hevc passes it
-    // unconditionally — a set flag over a null pointer is untested territory in
-    // every driver. `flag=1, num=0` is not a corner case here: it is exactly the
-    // punktfunk LTR/RFI-recovery stream shape (slice-signalled long-term pics,
-    // no SPS candidates — pf-bitstream's own LTR synthesizer emits it), so the
-    // all-zero struct (the correct content for num=0) must be present.
+    // Backed whenever the flag is set, even at num=0: the header requires a
+    // valid `pLongTermRefPicsSps` if `long_term_ref_pics_present_flag` is set.
+    // `flag=1, num=0` is the LTR/RFI-recovery shape (slice-signalled LTR, no
+    // SPS candidates); the all-zero struct is the correct content for num=0.
     let lt_backing = sps.long_term_ref_pics_present_flag.then(|| {
         // SAFETY: plain-C bindgen struct of a mask and an integer array;
         // all-zero is valid.
@@ -619,7 +568,7 @@ pub fn sps_to_std_h265(sps: &Sps) -> Result<OwnedStdH265Sps, H265ParamsError> {
     // SAFETY: StdVideoH265SequenceParameterSet is a plain-C bindgen struct of a
     // bitfield word, integers and const pointers; all-zero is valid for every
     // field (null pointers) and is the "everything absent" baseline the field
-    // writes below build on. Same idiom as the H.264 module.
+    // writes below build on.
     let mut std: hh::StdVideoH265SequenceParameterSet = unsafe { std::mem::zeroed() };
 
     std.flags
@@ -634,9 +583,8 @@ pub fn sps_to_std_h265(sps: &Sps) -> Result<OwnedStdH265Sps, H265ParamsError> {
         ));
     std.flags
         .set_scaling_list_enabled_flag(u32::from(sps.scaling_list_enabled_flag));
-    // When enabled-but-absent, the driver applies the Table 7-5/7-6 defaults
-    // itself (7.4.5's inference) — declaring data we did not convert would be
-    // wrong in exactly the way the null-pointer/flag pairing rules forbid.
+    // Enabled-but-absent: the driver applies Table 7-5/7-6 itself (7.4.5).
+    // Declaring data we did not convert would pair a flag with a null pointer.
     std.flags
         .set_sps_scaling_list_data_present_flag(u32::from(sps.scaling_list_data_present_flag));
     std.flags
@@ -655,8 +603,7 @@ pub fn sps_to_std_h265(sps: &Sps) -> Result<OwnedStdH265Sps, H265ParamsError> {
     std.flags.set_strong_intra_smoothing_enabled_flag(u32::from(
         sps.strong_intra_smoothing_enabled_flag,
     ));
-    // vui_parameters_present_flag stays 0: decode sessions consume no VUI
-    // (module docs); colour rides the PicturePlan.
+    // `vui_parameters_present_flag` stays 0; colour rides the PicturePlan.
     std.flags
         .set_sps_extension_present_flag(u32::from(sps.extension_present_flag));
     std.flags
@@ -690,22 +637,20 @@ pub fn sps_to_std_h265(sps: &Sps) -> Result<OwnedStdH265Sps, H265ParamsError> {
     let scc = &sps.scc_extension;
     std.flags
         .set_sps_scc_extension_flag(u32::from(sps.scc_extension_flag));
-    // Faithful even though the planner's envelope gate rejects SCC
-    // self-referencing before a plan exists — conversion is not envelope-coupled
-    // beyond its own representability (the H.264 frame_mbs_only precedent).
+    // Copy the flag even though the planner rejects SCC self-reference:
+    // conversion is not envelope-coupled beyond representability.
     std.flags
         .set_sps_curr_pic_ref_enabled_flag(u32::from(scc.curr_pic_ref_enabled_flag));
     std.flags
         .set_palette_mode_enabled_flag(u32::from(scc.palette_mode_enabled_flag));
-    // sps_palette_predictor_initializers_present_flag stays 0: check_envelope
-    // rejected any SPS that sets it, so flag and (null) pPredictorPaletteEntries
-    // can never disagree.
+    // Flag stays 0: `check_envelope` rejected any SPS that set it, so the flag
+    // and the null `pPredictorPaletteEntries` cannot disagree.
     std.flags
         .set_intra_boundary_filtering_disabled_flag(u32::from(
             scc.intra_boundary_filtering_disabled_flag,
         ));
 
-    // Chroma format code points equal the chroma_format_idc values (0..3).
+    // Chroma format code points equal the `chroma_format_idc` values (0..3).
     std.chroma_format_idc = u32::from(sps.chroma_format_idc);
     std.pic_width_in_luma_samples = u32::from(sps.pic_width_in_luma_samples);
     std.pic_height_in_luma_samples = u32::from(sps.pic_height_in_luma_samples);
@@ -750,8 +695,7 @@ pub fn sps_to_std_h265(sps: &Sps) -> Result<OwnedStdH265Sps, H265ParamsError> {
     if let Some(backing) = &lt_backing {
         std.pLongTermRefPicsSps = &**backing;
     }
-    // pSequenceParameterSetVui and pPredictorPaletteEntries stay null (module
-    // docs / check_envelope).
+    // `pSequenceParameterSetVui` and `pPredictorPaletteEntries` stay null.
 
     Ok(OwnedStdH265Sps {
         std: Box::new(std),
@@ -763,9 +707,8 @@ pub fn sps_to_std_h265(sps: &Sps) -> Result<OwnedStdH265Sps, H265ParamsError> {
     })
 }
 
-/// Convert one PPS into the Std struct (owning wrapper), mapping every field the
-/// H.265 decode profile consumes. SCC palette data is rejected, never dropped;
-/// every narrower Std field is checked, never truncated.
+/// Convert one PPS. SCC palette data is rejected, never dropped; every
+/// narrower Std field is checked, never truncated.
 pub fn pps_to_std_h265(pps: &Pps) -> Result<OwnedStdH265Pps, H265ParamsError> {
     if pps
         .scc_extension
@@ -862,7 +805,7 @@ pub fn pps_to_std_h265(pps: &Pps) -> Result<OwnedStdH265Pps, H265ParamsError> {
         .set_pps_slice_act_qp_offsets_present_flag(u32::from(
             scc.slice_act_qp_offsets_present_flag,
         ));
-    // pps_palette_predictor_initializers_present_flag stays 0 (rejected above).
+    // `pps_palette_predictor_initializers_present_flag` stays 0 (rejected above).
     std.flags
         .set_monochrome_palette_flag(u32::from(scc.monochrome_palette_flag));
     std.flags
@@ -870,7 +813,7 @@ pub fn pps_to_std_h265(pps: &Pps) -> Result<OwnedStdH265Pps, H265ParamsError> {
 
     std.pps_pic_parameter_set_id = pps.pic_parameter_set_id;
     std.pps_seq_parameter_set_id = pps.seq_parameter_set_id;
-    // The VPS id the Std PPS names is the one its OWN SPS references — the
+    // The VPS id the Std PPS names is the one its own SPS references — the
     // parser resolved that chain at parse time.
     std.sps_video_parameter_set_id = pps.sps.video_parameter_set_id;
     std.num_extra_slice_header_bits = pps.num_extra_slice_header_bits;
@@ -925,7 +868,7 @@ pub fn pps_to_std_h265(pps: &Pps) -> Result<OwnedStdH265Pps, H265ParamsError> {
     if let Some(backing) = &scaling_backing {
         std.pScalingLists = &**backing;
     }
-    // pPredictorPaletteEntries stays null (rejected above).
+    // `pPredictorPaletteEntries` stays null (rejected above).
 
     Ok(OwnedStdH265Pps {
         std: Box::new(std),
@@ -943,10 +886,8 @@ mod tests {
 
     use super::*;
 
-    /// An SPS exercising every mapped field with distinct values. Flags carry a
-    /// deliberate mixed pattern asserted bit-for-bit below;
-    /// `vui_parameters_present_flag` is true at the SOURCE precisely because the
-    /// conversion must NOT copy it (the VUI skip).
+    /// `vui_parameters_present_flag` is true at the source because the
+    /// conversion must not copy it.
     fn full_sps() -> Sps {
         Sps {
             video_parameter_set_id: 2,
@@ -1016,9 +957,8 @@ mod tests {
         }
     }
 
-    /// A PPS over `sps` exercising every mapped field with distinct values —
-    /// the vendored `Pps` derives no `Default`, so the literal is spelled out
-    /// once here (the h264 `full_pps` idiom).
+    /// PPS fixture over `sps`. `Pps` has no `Default`, so the literal is
+    /// spelled out once.
     fn full_pps(sps: Sps) -> Pps {
         Pps {
             pic_parameter_set_id: 3,
@@ -1097,7 +1037,6 @@ mod tests {
         let owned = sps_to_std_h265(&sps).unwrap();
         let std = owned.std();
 
-        // The fixture's mixed pattern, bit for bit.
         assert_eq!(std.flags.sps_temporal_id_nesting_flag(), 1);
         assert_eq!(std.flags.separate_colour_plane_flag(), 0);
         assert_eq!(std.flags.conformance_window_flag(), 1);
@@ -1118,7 +1057,6 @@ mod tests {
         );
         assert_eq!(std.flags.sps_extension_present_flag(), 1);
         assert_eq!(std.flags.sps_range_extension_flag(), 1);
-        // The range-extension flags, alternating T/F per the fixture.
         assert_eq!(std.flags.transform_skip_rotation_enabled_flag(), 1);
         assert_eq!(std.flags.transform_skip_context_enabled_flag(), 0);
         assert_eq!(std.flags.implicit_rdpcm_enabled_flag(), 1);
@@ -1169,7 +1107,6 @@ mod tests {
         assert_eq!(std.conf_win_top_offset, 3);
         assert_eq!(std.conf_win_bottom_offset, 4);
 
-        // The always-present pointer-backed blocks.
         assert!(!std.pProfileTierLevel.is_null());
         // SAFETY: pProfileTierLevel targets `owned`'s boxed backing, alive here.
         let ptl = unsafe { &*std.pProfileTierLevel };
@@ -1193,7 +1130,6 @@ mod tests {
         assert_eq!(&dpb.max_num_reorder_pics[..2], &[1, 2]);
         assert_eq!(&dpb.max_latency_increase_plus1[..2], &[7, 8]);
 
-        // The absent-by-content and absent-by-design pointers.
         assert!(
             std.pScalingLists.is_null(),
             "enabled but data-absent: driver defaults"
@@ -1226,7 +1162,7 @@ mod tests {
         ] {
             assert_eq!(profile_to_std(idc).unwrap(), expect);
         }
-        // High Throughput (5) and SCC (9) exist on the wire but not in Vulkan.
+        // 5 (High Throughput) and 9 (SCC) exist on the wire but not in Vulkan.
         for idc in [0u8, 5, 9, 11] {
             assert_eq!(
                 profile_to_std(idc).unwrap_err(),
@@ -1234,7 +1170,6 @@ mod tests {
             );
         }
 
-        // Every Table A.8 level maps to its ascending index-coded point.
         let pairs = [
             (
                 Level::L1,
@@ -1301,9 +1236,8 @@ mod tests {
 
     #[test]
     fn the_owned_backings_survive_moving_the_wrapper() {
-        // Box the wrapper AFTER conversion: a move relocating the wrapper itself
-        // must not invalidate its pointers, because the backing is heap-pinned
-        // (the h264 POC-offset test, one codec over).
+        // Box after conversion: relocating the wrapper must not invalidate its
+        // pointers — the backing is heap-pinned.
         let owned = Box::new(sps_to_std_h265(&full_sps()).unwrap());
         let std = owned.std();
         // SAFETY: both pointers target `owned`'s boxed backings, alive in scope.
@@ -1317,39 +1251,25 @@ mod tests {
 
     /// Scribble over the stack the conversion's frames just used.
     ///
-    /// The discriminator in the move tests is READING a block back, and pointer
-    /// equality cannot stand in for it: the Std struct carries its pointers by
-    /// VALUE, so a stale one is copied along with the struct and still compares
-    /// equal. An inlined backing therefore shows up only as wrong CONTENT — and
-    /// only if the dead slot has actually been reused by then. This makes that
-    /// certain instead of lucky: after it runs, a pointer into a dead local reads
-    /// back `0xA5`s rather than, by chance, its old contents.
+    /// Move tests must READ a block back: the Std struct copies pointer
+    /// values, so a stale one still compares equal. An inlined backing shows
+    /// up only as wrong content, and only after the dead slot is reused.
+    /// After this runs, a pointer into a dead local reads `0xA5`.
     #[inline(never)]
     fn clobber_the_dead_stack() {
         let mut scratch = [0xA5u8; 16 * 1024];
         std::hint::black_box(&mut scratch);
     }
 
-    /// All three wrappers may be MOVED — into the session's stored parameters, out
-    /// of a `Result`, into a `Vec` that later reallocates — without disturbing the
-    /// addresses a driver has already been given.
-    ///
-    /// Not a Rust triviality worth skipping: it is the whole reason
-    /// [`crate::session_h265`] can fix its use-after-free by STORING these values
-    /// alongside the parameters object rather than by boxing or pinning them. It
-    /// holds because every backing is `Box`ed; an "optimisation" that inlined any
-    /// one of them as a field would keep every other test in this crate green, keep
-    /// compiling, and hand the driver a pointer into a moved-from stack slot. The
-    /// H.265 and Main 10 parity legs would catch it on hardware — this catches it in
-    /// ordinary CI. H.265 has the most surface of the three codecs: seven pointers
-    /// across the SPS alone, and this exercises every one a stream can populate.
-    /// (`params_av1::moving_the_wrapper_leaves_the_driver_s_pointers_put` and
-    /// `params::`'s are the same test one codec over.)
+    /// All three wrappers may be moved — into stored parameters, out of a
+    /// `Result`, into a reallocating `Vec` — without disturbing addresses a
+    /// driver has already been given. Every backing is `Box`ed; inlining any
+    /// one as a field would keep other tests green and hand the driver a
+    /// pointer into a moved-from stack slot. This exercises every pointer a
+    /// stream can populate.
     #[test]
     fn moving_the_wrapper_leaves_the_driver_s_pointers_put() {
-        // An SPS carrying every embedded pointer it can: profile/tier/level and
-        // DPB manager (always), plus scaling lists, short-term RPS candidates and
-        // long-term SPS candidates.
+        // SPS with every embeddable pointer populated.
         let mut sps = full_sps();
         sps.scaling_list_data_present_flag = true;
         sps.scaling_list.scaling_list_4x4 = std::array::from_fn(|i| [10 + i as u8; 16]);
@@ -1365,7 +1285,6 @@ mod tests {
         sps.num_long_term_ref_pics_sps = 1;
         sps.lt_ref_pic_poc_lsb_sps[0] = 11;
         sps.used_by_curr_pic_lt_sps_flag[0] = true;
-        // A PPS carrying its one, and a VPS carrying its two.
         let mut pps = full_pps(sps.clone());
         pps.scaling_list_data_present_flag = true;
         pps.scaling_list.scaling_list_4x4 = std::array::from_fn(|i| [60 + i as u8; 16]);
@@ -1373,8 +1292,7 @@ mod tests {
             video_parameter_set_id: 2,
             max_sub_layers_minus1: 1,
             profile_tier_level: full_sps().profile_tier_level,
-            // Distinct from the SPS's [5, 6, …] so a read-back names which block
-            // it came from rather than merely that some block was readable.
+            // Distinct from the SPS's [5, 6, …] so a read-back names which block.
             max_dec_pic_buffering_minus1: [3, 4, 0, 0, 0, 0, 0],
             ..Default::default()
         };
@@ -1407,10 +1325,8 @@ mod tests {
             assert!(!ptr.is_null(), "{what} is attached by this fixture");
         }
 
-        // Every move the session's stored parameters put them through: out of the
-        // conversion, into a `Vec`, through a reallocation of that `Vec` as later
-        // Adds push more sets in, and along with the whole `StoredParamsH265` value
-        // as it is installed by `mem::replace`.
+        // Session stored-parameters moves: into a `Vec`, through a reallocation
+        // as later Adds push more sets, then as a whole value.
         let stored_vps = vec![owned_vps];
         let stored_sps = vec![owned_sps];
         let mut stored_pps = vec![owned_pps];
@@ -1444,15 +1360,9 @@ mod tests {
         );
         assert_eq!(stored_pps[0].std().pScalingLists, pps_lists);
 
-        // The assertions that actually bite. Pointer equality above cannot fail —
-        // the Std struct carries the value, so a stale pointer is copied along with
-        // it — but an inlined backing leaves those pointers addressing dead locals
-        // in the conversions' returned frames, which this has just overwritten.
         clobber_the_dead_stack();
-        // They still address live blocks holding the fixture's own values, not
-        // stale copies.
-        // Every one of the eight, so no single backing can be inlined without this
-        // failing — an earlier draft read only six and let exactly that through.
+        // Pointer equality cannot fail (Std copies the value). Read every
+        // backing so an inlined field addresses 0xA5, not fixture data.
         // SAFETY: `stored_*` are alive here and own every one of these blocks.
         let (vps_ptl, vps_dpb) = unsafe { (&*vps_ptrs.0, &*vps_ptrs.1) };
         // SAFETY: as above.
@@ -1500,9 +1410,8 @@ mod tests {
     fn sps_scaling_lists_convert_verbatim_including_the_32x32_pair_and_dc_values() {
         let mut sps = full_sps();
         sps.scaling_list_data_present_flag = true;
-        // Distinct fill bytes per list; the 32x32 lists live at PARSER matrix
-        // ids 0 and 3 (7.4.5 steps matrixId by 3 at sizeId 3) and must land at
-        // Std indices 0 and 1.
+        // Distinct fill bytes per list. 32x32 lists live at parser matrix ids 0
+        // and 3 (7.4.5 steps matrixId by 3 at sizeId 3) and must land at Std 0, 1.
         sps.scaling_list.scaling_list_4x4 = std::array::from_fn(|i| [10 + i as u8; 16]);
         sps.scaling_list.scaling_list_8x8 = std::array::from_fn(|i| [20 + i as u8; 64]);
         sps.scaling_list.scaling_list_16x16 = std::array::from_fn(|i| [30 + i as u8; 64]);
@@ -1533,7 +1442,7 @@ mod tests {
             lists.ScalingList32x32[1], [43; 64],
             "inter = parser index 3"
         );
-        // The Std DC fields carry the +8 VALUE, not the minus8 syntax element.
+        // Std DC fields carry the +8 value, not the minus8 syntax element.
         assert_eq!(lists.ScalingListDCCoef16x16, [1, 8, 16, 108, 208, 255]);
         assert_eq!(lists.ScalingListDCCoef32x32, [50, 107]);
     }
@@ -1542,8 +1451,7 @@ mod tests {
     fn short_term_rps_candidates_reencode_to_the_std_syntax_exactly() {
         let mut sps = full_sps();
         sps.num_short_term_ref_pic_sets = 2;
-        // Candidate 0: DeltaPocS0 = [-1, -3] (steps 1, 2), DeltaPocS1 = [2]
-        // (step 2), with mixed used_by flags.
+        // Candidate 0: DeltaPocS0 = [-1, -3] (steps 1, 2), DeltaPocS1 = [2] (step 2).
         let mut set0 = ShortTermRefPicSet {
             num_negative_pics: 2,
             num_positive_pics: 1,
@@ -1555,9 +1463,8 @@ mod tests {
         set0.used_by_curr_pic_s0[1] = false;
         set0.delta_poc_s1[0] = 2;
         set0.used_by_curr_pic_s1[0] = true;
-        // Candidate 1: as the parser leaves a PREDICTED set — resolved arrays
-        // with the prediction syntax still recorded. The conversion must emit
-        // the resolved non-predicted form, ignoring the prediction fields.
+        // Candidate 1 as the parser leaves a predicted set: resolved arrays with
+        // prediction syntax still recorded. Conversion must emit non-predicted form.
         let mut set1 = ShortTermRefPicSet {
             inter_ref_pic_set_prediction_flag: true,
             delta_idx_minus1: 0,
@@ -1620,11 +1527,10 @@ mod tests {
         assert_eq!(&lt.lt_ref_pic_poc_lsb_sps[..3], &[11, 22, 33]);
     }
 
-    /// `flag=1, num=0` is not a corner case: it is the punktfunk LTR/RFI
-    /// recovery stream shape (slice-signalled long-term pics, zero SPS
-    /// candidates — pf-bitstream's LTR synthesizer emits exactly this). The
-    /// header requires a valid `pLongTermRefPicsSps` whenever the flag is set;
-    /// a set flag over a null pointer is untested territory in every driver.
+    /// `flag=1, num=0` is the LTR/RFI-recovery shape (slice-signalled
+    /// long-term pics, zero SPS candidates). The header requires a valid
+    /// `pLongTermRefPicsSps` whenever the flag is set; a set flag over a
+    /// null pointer is untested in every driver.
     #[test]
     fn long_term_flag_without_sps_candidates_still_backs_the_pointer() {
         let mut sps = full_sps();
@@ -1644,20 +1550,18 @@ mod tests {
 
     #[test]
     fn envelope_rejections_fail_closed_instead_of_approximating() {
-        // 4:2:2 — legal H.265, outside the punktfunk envelope.
         let mut sps = full_sps();
         sps.chroma_format_idc = 2;
         assert_eq!(
             sps_to_std_h265(&sps).unwrap_err(),
             H265ParamsError::UnsupportedChromaFormat(2)
         );
-        // Monochrome likewise.
         sps.chroma_format_idc = 0;
         assert_eq!(
             sps_to_std_h265(&sps).unwrap_err(),
             H265ParamsError::UnsupportedChromaFormat(0)
         );
-        // 4:4:4 with separate colour planes = ChromaArrayType 0 in disguise.
+        // ChromaArrayType 0: three monochrome-coded planes.
         sps.chroma_format_idc = 3;
         sps.separate_colour_plane_flag = true;
         assert_eq!(
@@ -1665,14 +1569,12 @@ mod tests {
             H265ParamsError::SeparateColourPlanes
         );
         sps.separate_colour_plane_flag = false;
-        // Past 3 is not legal H.265 at all.
         sps.chroma_format_idc = 4;
         assert_eq!(
             sps_to_std_h265(&sps).unwrap_err(),
             H265ParamsError::InvalidChromaFormatIdc(4)
         );
 
-        // 12-bit and mismatched depths: no punktfunk output format carries them.
         let mut sps = full_sps();
         sps.bit_depth_luma_minus8 = 4;
         sps.bit_depth_chroma_minus8 = 4;
@@ -1690,7 +1592,7 @@ mod tests {
             H265ParamsError::UnsupportedBitDepth { .. }
         ));
 
-        // 4:4:4 at 8 and 10 bits IS in the envelope (RExt profile).
+        // 4:4:4 at 8 and 10 bits is in the envelope (RExt profile).
         let mut sps = full_sps();
         sps.profile_tier_level.general_profile_idc = 4;
         sps.chroma_format_idc = 3;
@@ -1702,7 +1604,6 @@ mod tests {
             hh::StdVideoH265ChromaFormatIdc_STD_VIDEO_H265_CHROMA_FORMAT_IDC_444
         );
 
-        // An unmappable profile.
         let mut sps = full_sps();
         sps.profile_tier_level.general_profile_idc = 9; // SCC
         assert_eq!(
@@ -1710,8 +1611,7 @@ mod tests {
             H265ParamsError::UnmappableProfileIdc(9)
         );
 
-        // SCC palette predictor initializers: the one pointer we refuse to fake,
-        // on both parameter sets.
+        // Palette predictor initializers: the one pointer this conversion refuses to fake.
         let mut sps = full_sps();
         sps.scc_extension
             .palette_predictor_initializers_present_flag = true;
@@ -1730,7 +1630,6 @@ mod tests {
 
     #[test]
     fn oversized_or_corrupt_rps_tables_are_rejected_not_padded() {
-        // More candidates than the spec's 64.
         let mut sps = full_sps();
         sps.num_short_term_ref_pic_sets = 65;
         assert_eq!(
@@ -1738,7 +1637,6 @@ mod tests {
             H265ParamsError::TooManyShortTermRpsSets(65)
         );
 
-        // A declared count the parser never resolved.
         let mut sps = full_sps();
         sps.num_short_term_ref_pic_sets = 1;
         sps.short_term_ref_pic_set = Vec::new();
@@ -1747,7 +1645,6 @@ mod tests {
             H265ParamsError::MissingShortTermRps { index: 0 }
         );
 
-        // A set with more entries on one side than the Std arrays hold.
         let mut sps = full_sps();
         sps.num_short_term_ref_pic_sets = 1;
         sps.short_term_ref_pic_set = vec![ShortTermRefPicSet {
@@ -1759,7 +1656,6 @@ mod tests {
             H265ParamsError::RpsEntryOverflow { set: 0, .. }
         ));
 
-        // A non-monotonic DeltaPoc array cannot re-encode as minus1 syntax.
         let mut sps = full_sps();
         sps.num_short_term_ref_pic_sets = 1;
         let mut set = ShortTermRefPicSet {
@@ -1774,7 +1670,6 @@ mod tests {
             H265ParamsError::NonMonotonicRps { set: 0 }
         );
 
-        // Too many long-term SPS candidates.
         let mut sps = full_sps();
         sps.long_term_ref_pics_present_flag = true;
         sps.num_long_term_ref_pics_sps = 33;
@@ -1790,7 +1685,6 @@ mod tests {
         let owned = pps_to_std_h265(&pps).unwrap();
         let std = owned.std();
 
-        // The fixture's mixed pattern, bit for bit.
         assert_eq!(std.flags.dependent_slice_segments_enabled_flag(), 1);
         assert_eq!(std.flags.output_flag_present_flag(), 0);
         assert_eq!(std.flags.sign_data_hiding_enabled_flag(), 1);
@@ -1903,7 +1797,7 @@ mod tests {
             max_dec_pic_buffering_minus1: [5, 6, 0, 0, 0, 0, 0],
             max_num_reorder_pics: [1, 2, 0, 0, 0, 0, 0],
             max_latency_increase_plus1: [7, 8, 0, 0, 0, 0, 0],
-            // Timing present at the SOURCE: the skip must not copy it.
+            // Timing present at the source: the skip must not copy it.
             timing_info_present_flag: true,
             num_units_in_tick: 1000,
             time_scale: 60_000,
@@ -1932,7 +1826,7 @@ mod tests {
         assert_eq!(&dpb.max_dec_pic_buffering_minus1[..2], &[5, 6]);
         assert_eq!(&dpb.max_latency_increase_plus1[..2], &[7, 8]);
 
-        // A VPS whose DPB sizing overflows the Std u8 fields is corrupt.
+        // Parser field is u32; Std is u8. 300 overflows.
         let mut hostile = vps;
         hostile.max_dec_pic_buffering_minus1[0] = 300;
         assert!(matches!(
@@ -1969,7 +1863,6 @@ mod tests {
         use cros_codecs::codec::h265::parser::NaluType;
         use cros_codecs::codec::h265::parser::Parser;
 
-        // The same vendored vector pf-bitstream's h265 tests plan, same path.
         const TEST_25FPS: &[u8] = include_bytes!(
             "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
         );
@@ -1988,7 +1881,6 @@ mod tests {
                     let sps = parser.parse_sps(&nalu).expect("the vector's SPS parses");
                     let owned = sps_to_std_h265(sps).expect("the vector's SPS converts");
                     let std = owned.std();
-                    // The vector's own goldens: 320x240 8-bit 4:2:0 Main.
                     assert_eq!(std.pic_width_in_luma_samples, 320, "the vector is 320x240");
                     assert_eq!(std.pic_height_in_luma_samples, 240);
                     assert_eq!(std.bit_depth_luma_minus8, 0);
@@ -2022,9 +1914,8 @@ mod tests {
         );
     }
 
-    /// The over-declared-level clamp (the AMF 6.2-on-everything field case):
-    /// lowering writes the ceiling into the PTL backing the driver will read;
-    /// a ceiling at or above the declared level changes nothing.
+    /// Lowering writes the ceiling into the PTL backing the driver will read.
+    /// A ceiling at or above the declared level changes nothing.
     #[test]
     fn clamp_level_lowers_the_ptl_and_only_lowers() {
         let sps = full_sps();
@@ -2034,13 +1925,12 @@ mod tests {
         // SAFETY: pProfileTierLevel targets `owned`'s boxed backing.
         let level = unsafe { (*owned.std().pProfileTierLevel).general_level_idc };
         assert_eq!(level, declared);
-        // A ceiling above the declared level is a no-op.
         owned.clamp_level(hh::StdVideoH265LevelIdc_STD_VIDEO_H265_LEVEL_IDC_6_2);
         // SAFETY: as above.
         let level = unsafe { (*owned.std().pProfileTierLevel).general_level_idc };
         assert_eq!(level, declared);
-        // A ceiling below it is written through — and the pointer still targets
-        // the wrapper's own backing (the clamp mutates in place, never re-points).
+        // Ceiling below: written through. The pointer still targets the
+        // wrapper's own backing — the clamp mutates in place, never re-points.
         let ceiling = hh::StdVideoH265LevelIdc_STD_VIDEO_H265_LEVEL_IDC_3_1;
         assert!(ceiling < declared, "fixture declares above 3.1");
         owned.clamp_level(ceiling);

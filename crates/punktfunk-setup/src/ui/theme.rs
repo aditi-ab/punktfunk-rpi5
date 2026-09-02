@@ -1,21 +1,21 @@
-//! Brand colour and the capability ladder every other UI module asks before drawing.
+//! Brand colour and the capability ladder other UI modules ask before drawing.
 //!
-//! One terminal violet (`#8678f5`, pf-console-ui's dark-appearance brand value — terminals are
-//! mostly dark and it stays readable on light) with the lens highlight `#d2c9fb` as its
-//! gradient end. Below truecolor the palette degrades to the 256-colour cube, and below that
-//! to no colour at all rather than to approximate brand paint.
+//! One terminal violet (`#8678f5`, pf-console-ui dark-appearance brand; readable
+//! on light too) with lens highlight `#d2c9fb` as the gradient end. Below
+//! truecolor the palette degrades to the 256-colour cube, then to no colour
+//! rather than approximate brand paint.
 //!
-//! `Caps` is a value, not a probe: it is passed in, so the intro and the theme render the same
-//! way in a test, in `--demo` and on a real terminal. `design/installer-v2.md` D7.
+//! `Caps` is a value, not a probe: callers pass it in so intro and theme
+//! render the same in a test, `--demo`, and a real terminal.
+//!
+//! Evidence: `design/installer-v2.md` D7.
 
 use serde::{Deserialize, Serialize};
 
-/// The brand violet.
 pub const BRAND: Rgb = Rgb(0x86, 0x78, 0xf5);
-/// The lens highlight — the gradient end of the wordmark, and the mark's own overlap.
+/// Wordmark gradient end and the mark's overlap.
 pub const LENS: Rgb = Rgb(0xd2, 0xc9, 0xfb);
-/// D7 names this index for the brand violet specifically; it is duller than the nearest cube
-/// entry would be, and is the recorded choice.
+/// Duller than the nearest cube entry; the recorded brand-violet index.
 pub const BRAND_256: u8 = 99;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,7 +29,7 @@ impl Rgb {
     }
 }
 
-/// What the attached terminal can actually do. Ordered — comparisons below rely on it.
+/// Ordered: comparisons below rely on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Colors {
     None,
@@ -46,8 +46,6 @@ pub struct Caps {
 }
 
 impl Caps {
-    /// Read the environment the way the terminal ecosystem expects: `NO_COLOR` wins over
-    /// everything, `TERM=dumb` means no escapes at all, `COLORTERM` promises truecolor.
     pub fn detect(env: &crate::seam::Env, tty: bool, width: u16) -> Caps {
         let term = env.get("TERM").unwrap_or("");
         let colors = if env.get("NO_COLOR").is_some() || term == "dumb" || !tty {
@@ -74,7 +72,7 @@ impl Caps {
         }
     }
 
-    /// Return the layer to its terminal default without disturbing the other one.
+    /// Restore this layer's default without touching the other.
     pub fn clear(self, layer: Layer) -> String {
         if self.colors < Colors::Ansi256 {
             return String::new();
