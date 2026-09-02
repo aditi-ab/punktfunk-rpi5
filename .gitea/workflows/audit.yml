@@ -94,11 +94,11 @@ jobs:
           # separate locks and were silently never scanned — the drivers one despite already being
           # in this job's `paths:` filter, so edits to it triggered a run that then ignored it.
           # Each needs its own `--file`. `pf-vkhdr-layer` had no lockfile at all until 2026-08-13.
-          cargo audit
-          cargo audit --file packaging/windows/drivers/Cargo.lock
-          cargo audit --file packaging/windows/pf-vkhdr-layer/Cargo.lock
-          cargo audit --file tools/win-input-matrix/Cargo.lock
-          cargo audit --file tools/hid-descriptor-dump/Cargo.lock
+          cargo audit --deny unsound
+          cargo audit --deny unsound --file packaging/windows/drivers/Cargo.lock
+          cargo audit --deny unsound --file packaging/windows/pf-vkhdr-layer/Cargo.lock
+          cargo audit --deny unsound --file tools/win-input-matrix/Cargo.lock
+          cargo audit --deny unsound --file tools/hid-descriptor-dump/Cargo.lock
 
   bun-audit:
     strategy:
