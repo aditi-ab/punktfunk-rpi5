@@ -34,6 +34,26 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
 
 ### Added
 
+- **IDD-push shared header v3 carries ring health.** The 88-byte header grows a 64-byte tail:
+  a health state (`Initializing`/`Active`/`Rebuilding`/`Dead`), driver and host capability
+  words negotiated by intersection, assignment and D3D-device epochs, a source sequence that
+  advances only on new desktop frames, the last publish QPC, published/dropped totals and a
+  terminal error. `SetFrameChannelRequest` spends its padding word on `header_bytes`; the driver
+  touches the tail only when the version AND the declared size both allow it, so any v2/v3
+  pairing keeps working on the 88-byte prefix.
+- **The pf-vdisplay monitor owns its ring endpoint.** A frame-channel delivery becomes a
+  monitor-scoped `RingEndpoint` (header mapping, retained sealed handles, generation, publish and
+  source sequences); every swap-chain assignment opens its own device-bound textures on it and
+  drops them on exit, so no D3D object crosses a device epoch. The D3D device pool is a bounded
+  per-adapter map with per-device epochs and a removal flag every worker honours. The first-frame
+  stash no longer survives a swap-chain reassignment; the next compose refills it.
+- **`pf_frame::health` classifies a capture gap by evidence.** A pure state machine over the
+  independent progress clocks (worker heartbeat, driver acquire, ring publish, source frame,
+  encoded AU) names a gap Healthy / Idle / Suspect / Stalled(Worker | Transport | Conversion |
+  Presentation) / Recovering, with the 15 s stall floor the interim watchdog already uses. Cursor
+  or input evidence alone only raises suspicion and asks for a composition canary; presents or a
+  failed canary carry a gap into a recovery verdict. No I/O and no actuator: the recovery
+  coordinator consumes the verdict.
 - **`--host` / `--client` choose what to install.** `--client` installs `punktfunk-client` from
   the family repo, or a user-scope flatpak where the family has none, so a distro with no
   punktfunk repo can run the client.

@@ -1,22 +1,15 @@
-//! Detector for METRONOMIC event cycles — evenly-spaced disturbances repeating every few seconds.
+//! Evenly-spaced disturbance detector for the capture/encode seam.
 //!
-//! The "periodic double-jolt" symptom class field reports keep describing is a host/display-side
-//! disturbance on a stable multi-second period (display-topology churn, display-poller software,
-//! virtual-display present timing). Random network loss is bursty and irregular; a stable period is
-//! a machine, and saying so in the host log turns a "nothing in the logs :/" report into a
-//! self-diagnosis. Two feeds today: served client-recovery IDRs (`native`) and IDD-push capture
+//! Random network loss is bursty. A stable multi-second period is a machine
+//! (display-topology churn, a display poller, virtual-display present timing).
+//! Callers log the mean period so a host-side cycle is named in the log.
+//!
+//! Two feeds: served client-recovery IDRs (`native`) and IDD-push capture
 //! stalls (`capture::windows::idd_push`).
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// Pure evenly-spaced-events detector (unit-tested below).
-///
-/// Events within [`Self::COALESCE`] count as ONE (a double-jolt's paired disturbances — e.g. the
-/// cooldown re-issue of a lost keyframe ~0.7 s after the first — are one user-visible cycle). When
-/// the gaps between the last [`Self::STREAK`] events are all within ±[`Self::TOLERANCE`] of their
-/// mean, [`Self::note`] returns the mean period for the caller to warn with, then stays quiet for
-/// [`Self::REWARN`] while the cycle persists.
 #[derive(Default)]
 pub struct Metronome {
     events: VecDeque<Instant>,
@@ -24,13 +17,13 @@ pub struct Metronome {
 }
 
 impl Metronome {
-    /// Events closer together than this are the same user-visible disturbance.
+    /// 1500 ms covers an IDR-cooldown re-issue (~0.7 s) without eating a multi-second cycle.
     const COALESCE: Duration = Duration::from_millis(1500);
-    /// Consecutive evenly-spaced events before the cycle counts as metronomic.
+    /// Four events (three gaps) reject irregular bursts.
     const STREAK: usize = 4;
-    /// "Evenly spaced" = every gap within this fraction of the mean gap.
+    /// ±20 % of the mean gap: clock jitter, not a new period.
     const TOLERANCE: f64 = 0.2;
-    /// Once warned, re-warn at most this often while the cycle persists.
+    /// 30 s so a persisting cycle does not flood the log.
     const REWARN: Duration = Duration::from_secs(30);
 
     pub fn new() -> Self {
@@ -40,8 +33,6 @@ impl Metronome {
         }
     }
 
-    /// Record a disturbance at `now`; `Some(mean period)` exactly when the metronomic-cycle
-    /// warning should fire.
     pub fn note(&mut self, now: Instant) -> Option<Duration> {
         if self
             .events
@@ -86,8 +77,6 @@ impl Metronome {
 mod tests {
     use super::*;
 
-    /// Feed a [`Metronome`] a schedule of event offsets (ms from a common origin) and return
-    /// what each `note` produced.
     fn cadence_run(offsets_ms: &[u64]) -> Vec<Option<Duration>> {
         let base = Instant::now();
         let mut c = Metronome::new();
@@ -99,7 +88,6 @@ mod tests {
 
     #[test]
     fn cadence_detects_metronomic_events() {
-        // Four events ~4 s apart (±5%) → the fourth trips the detector at ~4 s.
         let out = cadence_run(&[0, 4_000, 8_100, 11_950]);
         assert_eq!(out[..3], [None, None, None]);
         let period = out[3].expect("metronomic series must be detected");
@@ -111,15 +99,7 @@ mod tests {
 
     #[test]
     fn cadence_coalesces_double_jolt_pairs() {
-        // The field signature: a jolt pair (second event ~0.7 s after the first, e.g. the IDR
-        // cooldown re-issue) every ~4 s. Each pair is ONE event; detection still lands on the
-        // ~4 s cycle.
-        let out = cadence_run(&[
-            0, 700, // pair 1
-            4_000, 4_700, // pair 2
-            8_000, 8_650,  // pair 3
-            12_000, // pair 4 (first event trips it)
-        ]);
+        let out = cadence_run(&[0, 700, 4_000, 4_700, 8_000, 8_650, 12_000]);
         assert!(out[..6].iter().all(Option::is_none));
         let period = out[6].expect("coalesced pairs must still read as a 4 s cycle");
         assert!(
@@ -130,7 +110,6 @@ mod tests {
 
     #[test]
     fn cadence_ignores_irregular_bursts() {
-        // Genuine Wi-Fi-style loss: irregular gaps → never flagged.
         assert!(cadence_run(&[0, 2_000, 9_000, 12_500, 21_000])
             .iter()
             .all(Option::is_none));
@@ -138,8 +117,7 @@ mod tests {
 
     #[test]
     fn cadence_rewarns_at_most_every_30s() {
-        // A persisting 4 s cycle: warn on the 4th event (t=12 s), then stay quiet until ≥30 s
-        // past the warn — the t=44 s event (index 11) is the first at or beyond t=42 s.
+        // 4 s cycle: first warn at event 4 (t=12 s); next at t≥42 s is event 12 (index 11).
         let offsets: Vec<u64> = (0..12).map(|i| i * 4_000).collect();
         let out = cadence_run(&offsets);
         let warned: Vec<usize> = out

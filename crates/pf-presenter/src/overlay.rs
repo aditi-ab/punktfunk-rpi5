@@ -1,18 +1,20 @@
-//! The presenter↔console-UI contract (punktfunk-planning
-//! `linux-client-rearchitecture.md` §6.1): the presenter exposes its device and
-//! composites at most ONE sampled RGBA quad per frame; the overlay implementation
-//! (pf-console-ui, Skia) fills offscreen images on its own damage-driven schedule. No
-//! Skia type crosses this line — everything here is ash — and a `frame()` returning
-//! `None` costs the hot path nothing (the quad isn't even recorded).
+//! Presenter↔console-UI overlay contract: shared Vulkan handles, per-frame
+//! scene facts, and the `Overlay` trait the run loop drives.
+//!
+//! The presenter composites at most one sampled premultiplied RGBA quad per
+//! frame. The overlay (pf-console-ui, Skia) fills offscreen images on its own
+//! damage-driven schedule. No Skia type crosses this crate. `frame()` returning
+//! `None` records no quad.
+//!
+//! Pin: `Option<Box<dyn Overlay>>` from the session binary; `None` is the
+//! Skia-free build. Evidence: punktfunk-planning `linux-client-rearchitecture.md`.
 
 use ash::vk;
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
 use punktfunk_core::config::GamepadPref;
 
-/// The presenter's device, shared with the overlay so its renderer (Skia's
-/// `DirectContext`) creates resources on the same VkDevice/queue. Handles stay valid for
-/// the presenter's lifetime — the overlay must be dropped before it (the run loop owns
-/// both and drops the overlay first).
+/// Presenter's Vulkan handles. Overlay allocations use this device and queue.
+/// Valid for the presenter's lifetime; the run loop drops the overlay first.
 pub struct SharedDevice {
     pub entry: ash::Entry,
     pub instance: ash::Instance,
@@ -20,74 +22,47 @@ pub struct SharedDevice {
     pub device: ash::Device,
     pub queue: vk::Queue,
     pub queue_family_index: u32,
-    /// External-sync lock for `queue` — the decode lane submits to the same queue
-    /// from the pump thread, so every overlay flush/submit must hold it. The presenter,
-    /// this overlay and the native decode lane all serialize on this one lock; take it
-    /// with [`pf_client_core::video::QueueLock::guard`], whose RAII form is what every
-    /// Rust caller wants.
+    /// Decode submits to `queue` from the pump thread. Overlay flush/submit
+    /// holds this via [`pf_client_core::video::QueueLock::guard`].
     pub queue_lock: std::sync::Arc<pf_client_core::video::QueueLock>,
-    /// The Vulkan version an overlay renderer may size its function table to — the lower of
-    /// [`crate::vk::INSTANCE_API_VERSION`] (what `VkApplicationInfo::apiVersion` declared for
-    /// `instance`) and what the loader provides.
-    ///
-    /// **Cap yourself here; do not ask the loader yourself.** Entry points above this version
-    /// were never promised to us — `vkGetDeviceProcAddr` returns null for them — so a renderer
-    /// that probes `vkEnumerateInstanceVersion` instead (a current Mesa answers 1.4 where we
-    /// asked for 1.3) validates a function table it can never fill and refuses to start. That
-    /// is exactly how the Skia console UI died in 0.28.0; see the note in `pf-console-ui`'s
-    /// `SkiaOverlay::init`.
+    /// Overlay function-table cap: min of [`crate::vk::INSTANCE_API_VERSION`]
+    /// and the loader. Do not probe `vkEnumerateInstanceVersion` — extra
+    /// `vkGetDeviceProcAddr` entry points above that are null.
     pub api_version: u32,
 }
 
-/// What the overlay may draw this frame — composed by the run loop from session state.
-/// Milestone 1 (OSD/HUD) is text-shaped; the console library replaces this with a
-/// richer scene enum when it moves in.
+/// Per-frame overlay scene. The run loop fills this from session state.
 pub struct FrameCtx<'a> {
-    /// Swapchain size in pixels — the overlay renders 1:1.
+    /// Swapchain size in pixels. Overlay renders 1:1.
     pub width: u32,
     pub height: u32,
-    /// UI scale for the stream chrome: the window's display scale (DPI × the display's content
-    /// scale — `1.0` at 96 dpi / 100 %), times the `PUNKTFUNK_OSD_SCALE` preference. Because the
-    /// overlay renders in *physical* pixels, a fixed-pixel OSD shrinks as panel density rises —
-    /// unreadable at 14 px on a 4K laptop at 200 %. Every chrome metric is multiplied by this.
-    /// Sanitized and clamped by the run loop (`overlay_scale`), so it is always finite and > 0.
+    /// Window display scale (`1.0` at 96 dpi / 100 %) × `PUNKTFUNK_OSD_SCALE`.
+    /// Overlay chrome is physical pixels; multiply every metric by this. The
+    /// run loop (`overlay_scale`) clamps it finite and > 0.
     pub scale: f32,
-    /// Multi-line stats OSD (top-left panel); `None` = hidden.
     pub stats: Option<&'a str>,
-    /// The capture hint (bottom-center pill, "click to capture…"); `None` = hidden.
     pub hint: Option<&'a str>,
-    /// The access chip (per-client access §7 "say what this session is"): a small standing
-    /// pill — "Controller only · ends in 1 h 58 m" — drawn at every stats tier, `None` for
-    /// a full-control permanent session (today's default look, and every old host).
+    /// Access chip. `None` for a full-control permanent session.
     pub access: Option<&'a str>,
-    /// A transient access toast ("Access is now Controller only", "Access ends in 5 m") —
-    /// takes the hint pill's slot with priority while up. The run loop owns its timing.
+    /// Transient access toast. Occupies the hint slot while up; the run loop owns timing.
     pub notice: Option<&'a str>,
-    /// The user muted their microphone mid-stream (Ctrl+Alt+Shift+V). Draws a persistent
-    /// badge, deliberately independent of the stats tier: a muted mic is a fact about what
-    /// the host is hearing, and "did my mute take?" must be answerable with the overlay off.
-    /// False whenever this session has no mic uplink at all — the badge never invents one.
+    /// Mic muted mid-stream. Independent of the stats tier so the badge still
+    /// shows with chrome off. False when the session has no mic uplink.
     pub mic_muted: bool,
-    /// A mid-stream Match-window resize is in flight (design/midstream-resolution-resize.md,
-    /// client UX): draw a full-screen scrim + spinner so the host's 0.3–2 s virtual-display
-    /// and encoder rebuild reads as an intentional pause rather than the stream stretching to
-    /// the changed window. Cleared the instant the sharp new-resolution frame is on glass.
+    /// Mid-stream Match-window resize in flight (`design/midstream-resolution-resize.md`).
+    /// Draw a full-screen scrim and spinner until the new-resolution frame arrives.
     pub resizing: bool,
-    /// The active gamepad's name (the console library's controller chip).
     pub pad: Option<&'a str>,
-    /// The active pad's resolved kind — drives the console UI's button glyphs
-    /// (PlayStation shapes for DualSense/DualShock, ABXY letters otherwise).
+    /// Resolved pad kind for button glyphs (PlayStation shapes vs ABXY).
     pub pad_pref: Option<GamepadPref>,
-    /// Every connected pad (the console settings' "Use controller" row).
     pub pads: &'a [pf_client_core::gamepad::PadInfo],
-    /// The quick-action ring's session facts (design/touch-client-overlay.md §3.1): what each
-    /// slot shows and whether it is available. `None` outside a stream.
+    /// Quick-action ring facts (`design/touch-client-overlay.md`). `None` outside a stream.
     pub ring: Option<&'a RingFacts>,
 }
 
-/// One overlay image ready to composite: RGBA, PREMULTIPLIED alpha, already in
-/// `SHADER_READ_ONLY_OPTIMAL`, sized `width`×`height` (normally the `FrameCtx` size; a
-/// stale size during a resize just stretches for a frame).
+/// Overlay image ready to composite: RGBA, premultiplied, already in
+/// `SHADER_READ_ONLY_OPTIMAL`. A stale `width`×`height` during resize
+/// stretches for one frame.
 pub struct OverlayFrame {
     pub image: vk::Image,
     pub view: vk::ImageView,
@@ -95,74 +70,60 @@ pub struct OverlayFrame {
     pub height: u32,
 }
 
-// `OverlayAction`, `PointerButton`, `PointerInput` and `SessionPhase` are plain data shared
-// by the console shell on every platform it runs on (the Vulkan session here, the Android
-// client's GL host), so they live in the portable `pf_client_core::console` module. Re-exported
-// under their old paths — `run.rs` and the session's console service spell them
-// `pf_presenter::overlay::…`.
+// Shared with the Android GL host; lives in `pf_client_core::console`
+// (pf-console-ui sits above this crate). Re-exported so `run.rs` and the
+// console keep the `pf_presenter::overlay::…` path.
 pub use pf_client_core::console::{OverlayAction, PointerButton, PointerInput, SessionPhase};
 pub use pf_client_core::ring::{RingCommand, RingFacts, RingInput};
 
-/// The console-UI side. Object-safe; the session binary passes
-/// `Option<Box<dyn Overlay>>` (None = the Skia-free power-user build).
+/// Console-UI side. The session binary passes `Option<Box<dyn Overlay>>`;
+/// `None` is the Skia-free build.
 pub trait Overlay {
-    /// One-time setup on the presenter's device.
     fn init(&mut self, shared: &SharedDevice) -> anyhow::Result<()>;
 
-    /// Input routing, before capture sees the event. `true` = consumed (the library or
-    /// a menu is up) — the event must not reach capture/forwarding.
+    /// Before capture. `true` consumes the event; do not forward.
     fn handle_event(&mut self, event: &sdl3::event::Event) -> bool;
 
-    /// Gamepad menu-mode navigation (browse mode; the run loop drains the service's
-    /// menu channel). Returns a haptic pulse to play on the menu pad, if any.
+    /// Browse-mode gamepad menu nav. The run loop drains the service channel.
     fn handle_menu(&mut self, _event: MenuEvent) -> Option<MenuPulse> {
         None
     }
 
-    /// Mouse/touch input, in swapchain pixels, before capture sees it. `true` = consumed
-    /// (the console is up and something under the pointer took it) — the event must not
-    /// reach capture/forwarding.
-    ///
-    /// Separate from [`Self::handle_event`] because the window→pixel conversion belongs to
-    /// the run loop, which is the side that holds the window: the overlay renders in
-    /// pixels and would otherwise have to re-derive the display scale it never sees.
+    /// Pointer in swapchain pixels, before capture. `true` consumes; do not
+    /// forward. Separate from [`Self::handle_event`]: window→pixel belongs to
+    /// the run loop (it holds the window); the overlay never sees display scale.
     fn handle_pointer(&mut self, _input: PointerInput) -> bool {
         false
     }
 
-    /// Drain one pending action raised by handled input. Called once per loop
-    /// iteration; return `None` when idle.
+    /// Drain one action raised by handled input. Once per loop iteration.
     fn take_action(&mut self) -> Option<OverlayAction> {
         None
     }
 
-    /// A session lifecycle edge (browse mode scene driving).
+    /// Browse-mode session lifecycle. OSD/HUD ignore this.
     fn session_phase(&mut self, _phase: SessionPhase) {}
 
-    /// True while a text field is being edited — the run loop starts/stops SDL text
-    /// input to match (IME + `Event::TextInput` delivery on desktop; under gamescope
-    /// this is also what lets Steam's on-screen keyboard type into the app).
+    /// A text field is being edited. The run loop starts and stops SDL text
+    /// input (IME / `Event::TextInput`) from this.
     fn text_input_active(&self) -> bool {
         false
     }
 
-    /// Once per presenter iteration. Damage-driven: re-render (flush + transition to
-    /// SHADER_READ_ONLY) only when the content or size changed, else return the previous
-    /// image. `None` = nothing to composite. The returned image must stay untouched
-    /// until `frame()` runs again (the presenter runs one frame in flight and the
-    /// implementation keeps a ring of two, so alternating satisfies this).
+    /// Once per presenter iteration. Re-render (flush + `SHADER_READ_ONLY`) only
+    /// on content or size change. The returned image stays untouched until the
+    /// next `frame()` — one frame in flight; a ring of two is enough.
     fn frame(&mut self, ctx: &FrameCtx) -> anyhow::Result<Option<OverlayFrame>>;
 
-    /// The quick-action ring's inputs: the two-finger twist, or the key that opens it.
     fn ring_input(&mut self, _input: RingInput) {}
 
-    /// The ring is up: pointer and key events belong to it, and touch fingers stop feeding
-    /// the gesture engine (the ring's buttons take them).
+    /// Ring is up: pointer and keys belong to it; touch fingers stop feeding
+    /// the gesture engine.
     fn ring_open(&self) -> bool {
         false
     }
 
-    /// Drain one command the ring raised. Called each iteration while streaming.
+    /// Drain one ring command. Each iteration while streaming.
     fn take_ring_command(&mut self) -> Option<RingCommand> {
         None
     }

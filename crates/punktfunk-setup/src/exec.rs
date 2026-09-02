@@ -1,12 +1,12 @@
 //! Stage four: run a `Plan`. Echo, sudo shim, no-confirm rewrites, TTY stdin, per-step results.
 //!
-//! `--dry-run` walks the same code and returns before the spawn, so what dry-run prints is
-//! what a real run executes — there is no second rendering path to drift.
+//! `--dry-run` walks the same code and returns before the spawn, so what dry-run prints
+//! is what a real run executes. There is no second rendering path to drift.
 //!
-//! Four `StepAction`s resolve here rather than in `plan`, because each needs something the
-//! previous step created: apt's madison pins want the rewritten repo, pacman's availability
-//! split wants the `-Sy`, and the unit enable wants the user manager linger may have just made.
-//! `design/installer-v2.md` §4 explains why each is a trap and not an optimisation.
+//! Four `StepAction`s resolve here rather than in `plan`, because each needs something
+//! the previous step created: apt madison pins need the rewritten repo, pacman's
+//! availability split needs the `-Sy`, and the unit enable needs the user manager
+//! linger may have just made. See `design/installer-v2.md`.
 
 use crate::choices::Choices;
 use crate::facts::{Channel, Facts, DOCS};
@@ -53,16 +53,14 @@ pub struct Opts {
     pub tty: bool,
 }
 
-/// What the run left behind, for the report to footnote.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Outcome {
     pub relogin: bool,
     pub started: bool,
-    /// The Omarchy hand-off succeeded, so the generic wiring deliberately did not run.
+    /// Omarchy hand-off ran, so skip the generic wiring.
     pub ended_early: bool,
 }
 
-/// A step failed. The message is the sh installer's, pointing at the per-distro page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failed(pub String);
 
@@ -80,8 +78,7 @@ impl Executor<'_> {
         facts: &Facts,
         choices: &Choices,
     ) -> Result<Outcome, Failed> {
-        // A client-only run enables no services, so the verify pass must not go looking for a
-        // host that was never installed here.
+        // Client-only enables no services; verify must not look for a host never installed.
         let mut outcome = Outcome {
             started: choices.start && choices.components.host,
             ..Outcome::default()
@@ -90,8 +87,7 @@ impl Executor<'_> {
             self.ui.say(&phase.title);
             for step in &phase.steps {
                 let ran = self.step(&step.action, facts, choices, &mut outcome)?;
-                // A hand-off that was skipped for a missing binary has done nothing, so the
-                // generic wiring it would have replaced still has to run.
+                // A skipped hand-off did nothing, so the generic wiring it would replace still runs.
                 if step.ends_run && ran && !self.opts.dry {
                     outcome.ended_early = true;
                     return Ok(outcome);
@@ -101,7 +97,7 @@ impl Executor<'_> {
         Ok(outcome)
     }
 
-    /// `Ok(true)` when the step actually did something — a skipped conditional step is `false`.
+    /// `Ok(true)` when the step did something. A skipped conditional step is `false`.
     fn step(
         &self,
         action: &StepAction,
@@ -111,7 +107,7 @@ impl Executor<'_> {
     ) -> Result<bool, Failed> {
         match action {
             StepAction::Run(cmd) => {
-                // A group change only applies after a re-login, and the outro has to say so.
+                // Group changes apply only after re-login; the outro must say so.
                 if cmd.contains("usermod -aG") || cmd.contains("add-user-to-input-group") {
                     outcome.relogin = true;
                 }
@@ -270,8 +266,7 @@ impl Executor<'_> {
     /// Replace or append one `KEY=VALUE` line in host.env, creating it on first use.
     fn set_env(&self, key: &str, value: &str) {
         let path = self.paths.host_env();
-        // These are Linux box paths, and the goldens must be byte-identical on every OS the
-        // suite runs on — a Windows test host's PathBuf::join writes `\` into the transcript.
+        // Linux box paths; goldens must match on every OS. PathBuf::join writes `\` on Windows.
         let shown = path.display().to_string().replace('\\', "/");
         if self.opts.dry {
             self.ui.ok(&format!("would set {key}={value} in {shown}"));
@@ -296,9 +291,8 @@ impl Executor<'_> {
         }
     }
 
-    /// apt will not walk back to a lower candidate on its own, so name the exact version. After
-    /// the repo rewrite the target channel is the only punktfunk source, so madison's first row
-    /// is that channel's newest.
+    /// apt will not walk back to a lower candidate, so name the exact version. After the repo
+    /// rewrite the target channel is the only punktfunk source, so madison's first row is it.
     fn apt_switch(&self, pkgs: &[String], facts: &Facts, choices: &Choices) -> Result<(), Failed> {
         let mut pins = String::new();
         for pkg in pkgs {
@@ -306,8 +300,8 @@ impl Executor<'_> {
                 pins.push_str(&format!(" {pkg}=<version>"));
                 continue;
             }
-            // A package the target channel does not carry keeps what it has; naming it with no
-            // version would drag it to the highest version from ANY source.
+            // A package the target channel does not carry keeps what it has. Naming it with no
+            // version would drag it to the highest version from any source.
             if let Some(version) = self
                 .run
                 .first_line("apt-cache", &["madison", pkg])
@@ -325,9 +319,8 @@ impl Executor<'_> {
         self.shell(&format!("sudo apt install --allow-downgrades{pins}"), facts)
     }
 
-    /// A package the target channel does not carry can neither be named (the transaction aborts)
-    /// nor kept (its files collide with the channel's own), so a switch lands the box on exactly
-    /// what the target offers and removes what it does not, saying so.
+    /// A package the target does not carry cannot be named (the transaction aborts) or kept
+    /// (files collide), so a switch installs exactly what the target offers and removes the rest.
     fn pacman_switch(&self, pkgs: &[String], facts: &Facts) -> Result<(), Failed> {
         let mut want = String::new();
         let mut drop = String::new();
@@ -347,16 +340,16 @@ impl Executor<'_> {
                 drop.push_str(&format!(" {pkg}"));
             }
         }
-        // -Rdd, not -R: the very next -S replaces whatever depended on the leaving package, and
-        // a dependency check against the outgoing set would refuse the removal that makes room.
+        // -Rdd, not -R: the next -S replaces whatever depended on the leaving package. A
+        // dependency check against the outgoing set would refuse the removal that makes room.
         if !drop.is_empty() {
             self.shell(&format!("sudo pacman -Rdd{drop}"), facts)?;
         }
         self.shell(&format!("sudo pacman -S{want}"), facts)
     }
 
-    /// A container has no logind: enable-linger fails there and would mean nothing anyway.
-    /// `--dry-run` still prints the command, because it reports what a real box would do.
+    /// A container has no logind: enable-linger fails and would mean nothing. `--dry-run`
+    /// still prints the command — it reports what a real box would do.
     fn linger(&self, facts: &Facts) -> Result<bool, Failed> {
         if self.opts.dry || facts.systemd_pid1 {
             return self
@@ -369,8 +362,8 @@ impl Executor<'_> {
         Ok(false)
     }
 
-    /// Probed here, not in `plan`: on a seatless box the linger step above is what created the
-    /// user manager, so asking earlier prints the enable command and stops for nothing.
+    /// Probed here, not in `plan`: linger may have just created the user manager. Asking
+    /// earlier prints the enable command and stops for nothing.
     fn start_units(
         &self,
         units: &[String],
@@ -425,8 +418,7 @@ mod tests {
         );
     }
 
-    // -Syu is a prefix of neither the -S rule's pattern nor the reverse, but only because the
-    // -Syu rule is tested first. Swapping them would emit `-Syu --noconfirm --noconfirm`.
+    // -Syu is not a prefix of -S; the -Syu rule is first. Reverse them and `-Syu` gets `--noconfirm` twice.
     #[test]
     fn syu_is_rewritten_once_not_twice() {
         let once = noninteractive("sudo pacman -Syu punktfunk-host");

@@ -1,137 +1,55 @@
-//! The libva decode buffer layouts for AV1, hand-declared — the third sibling of
-//! [`crate::va`] and [`crate::va_h265`], measured the same way and pinned the same
-//! way.
+//! The libva decode buffer layouts for AV1, hand-declared.
 //!
-//! Sizes and offsets come from the committed `layout-probe.c` run against libva
-//! **2.23.0** headers (`va_dec_av1.h`, x86_64-linux-gnu):
-//! `VASegmentationStructAV1` **156**, `VAFilmGrainStructAV1` **176**,
-//! `VAWarpedMotionParamsAV1` **56**, `VADecPictureParameterBufferAV1` **1160**
-//! (align **8**), `VASliceParameterBufferAV1` **40**. Every bit position below was
-//! read back off a real header one field at a time, not counted by eye — which
-//! matters more here than for the other two codecs, because **three of AV1's six
-//! bit-field unions are NARROWER than a word**: `loop_filter_info_fields` is a
-//! `uint8_t`, `qmatrix_fields` and `loop_restoration_fields` are `uint16_t`. A
-//! `u32` packer over any of them would write straight through the neighbouring
-//! field, and on the two `uint16_t` ones that neighbour is padding on one side and
-//! `mode_control_fields` / `wm[0]` on the other.
+//! Same contract as [`crate::va`] and [`crate::va_h265`]: no libva binding, so
+//! these `#[repr(C)]` PODs are what a driver reads. Sizes, offsets, and bit
+//! positions come from `layout-probe.c` against libva 2.23.0 (`va_dec_av1.h`,
+//! x86_64-linux-gnu) and are compile-time assertions. Re-run the probe if the
+//! headers move.
 //!
-//! # AV1's reference plumbing is a FIFTH convention
+//! Three unions are narrower than a word: `loop_filter_info_fields` is `u8`,
+//! `qmatrix_fields` and `loop_restoration_fields` are `u16`. A `u32` packer
+//! overwrites the neighbour (`mode_control_fields` / `wm[0]`).
 //!
-//! This program has now written down five spellings of "which pictures does this
-//! frame use", and they are not interchangeable:
-//!
-//! * **Vulkan H.265** — DPB *slot* indices in `RefPicSetStCurr*`;
-//! * **DXVA H.265** — positions into `RefPicList[]` in identically named arrays;
-//! * **VAAPI H.265** — membership *flags* ORed onto each DPB entry, with per-slice
-//!   lists indexing `ReferenceFrames`;
-//! * **DXVA AV1** — `frame_refs[7]` by reference NAME, each entry carrying a
-//!   reference SLOT that indexes `RefFrameMapTextureIndex[8]`, plus that
-//!   reference's own size and own global motion;
-//! * **VAAPI AV1** — [`VaDecPictureParameterBufferAV1::ref_frame_map`] is indexed
-//!   by AV1 reference **SLOT** (0..8) and holds a **`VASurfaceID`** — an actual
-//!   surface handle, not an index into anything — while
-//!   [`VaDecPictureParameterBufferAV1::ref_frame_idx`] is indexed by reference
-//!   **NAME** and holds *"a list of indices into `ref_frame_map[8]`"*, i.e. the
-//!   slot. Global motion is a **picture-level** array
-//!   ([`VaDecPictureParameterBufferAV1::wm`], seven entries, `wm[0]` = `LAST_FRAME`)
-//!   and NOT part of a reference entry, and **there is no per-reference size
-//!   anywhere in this structure at all**.
-//!
-//! Both halves of that last sentence are measured rather than assumed:
-//! `grep -c ref_frame_width /usr/include/va/va_dec_av1.h` is **0** on libva 2.23.0,
-//! so a VAAPI driver takes each reference's dimensions from the SURFACE it was
-//! decoded into. (`pf_bitstream::av1::RefState::upscaled_width`'s doc comment says
-//! VA-API has `ref_frame_width`/`ref_frame_height`; it does not, and the field is
-//! still load-bearing for DXVA, which does.) The two statements that DO reach a
-//! VAAPI driver — the slot table and the name table — come from `va_dec_av1.h`'s
-//! own comments and from libavcodec's `vaapi_av1.c`:
-//!
-//! ```text
-//! pic_param.ref_frame_map[i] = <VASurfaceID of ref_tab[i]>        for i in 0..8
-//! pic_param.ref_frame_idx[i] = frame_header->ref_frame_idx[i]     for i in 0..7
-//! pic_param.wm[i - 1]        = <global motion of reference name i>
-//!                                                for i in LAST_FRAME..=ALTREF_FRAME
-//! ```
-//!
-//! # Where libva's AV1 buffers differ from every other codec here
-//!
-//! * **The "slice" parameter buffer is a TILE parameter buffer.** The header says so
-//!   in as many words: *"It uses the name VASliceParameterBufferAV1 to be consistent
-//!   with other codec, but actually means VATileParameterBufferAV1."* One record per
-//!   TILE, not per tile group.
-//! * **Several records share one data buffer.** libavcodec's `vaapi_av1.c` calls
-//!   `ff_vaapi_decode_make_slice_buffer` once per tile-group OBU with `nb_params =
-//!   tg_end - tg_start + 1`, so one `VASliceParameterBufferType` buffer carries
-//!   `nb_params` ELEMENTS beside one `VASliceDataBufferType` buffer holding the whole
-//!   group's `tile_data` region, and each record's `slice_data_offset` is relative to
-//!   THAT buffer. H.264 and H.265 send one record per buffer, so this is the only
-//!   place `vaCreateBuffer`'s `num_elements` is not 1.
-//! * **There is no IQ matrix buffer.** AV1's quantiser matrices are SELECTED by
-//!   index out of tables the decoder already holds
-//!   ([`QmatrixFieldsAV1`]), so a submission is picture parameters plus tile
-//!   pairs and nothing else.
+//! `ref_frame_map` is slot-indexed `VASurfaceID`s; `ref_frame_idx` and `wm` are
+//! name-indexed (`wm[0]` = LAST_FRAME). Drivers take each reference's size from
+//! its surface — libva has no `ref_frame_width`. One slice-parameter record per
+//! TILE; N records share one data buffer (`vaCreateBuffer` `num_elements` ≠ 1).
+//! No IQ matrix buffer: matrices are selected by [`QmatrixFieldsAV1`].
 
-/// `VASliceParameterBufferAV1::anchor_frame_idx` on an ordinary frame.
-///
-/// `anchor_frame_idx` selects a reference for LARGE-SCALE TILE decoding, which no
-/// punktfunk stream and no conformance vector here uses; libavcodec leaves the whole
-/// record zero-initialised and never writes the field.
+/// Ordinary-frame `anchor_frame_idx`. Large-scale tile only; unused here.
 pub const ANCHOR_FRAME_UNUSED: u8 = 0;
 
-/// `PRIMARY_REF_NONE` (AV1 spec 6.8.2): `primary_ref_frame` meaning "this frame
-/// loads no propagated state".
+/// AV1 6.8.2: `primary_ref_frame` loads no propagated state.
 pub const PRIMARY_REF_NONE: u8 = 7;
 
-/// `SUPERRES_NUM` (AV1 spec): the `superres_scale_denominator` that means "no
-/// upscaling". libva documents the field as 8 when `use_superres` is 0 and 9..=16
-/// when it is 1 — so a frame without superres does NOT send 0 here.
+/// AV1 `SUPERRES_NUM`. libva wants 8 when `use_superres` is 0, never 0.
 pub const SUPERRES_NUM: u8 = 8;
 
-/// `VAAV1TransformationType` (measured: 0, 1, 2, 3). The same numbering AV1 5.9.24
-/// gives `GmType`, and the same the vendored parser's `WarpModelType` uses — so the
-/// conversion casts rather than remaps, and this table is here to make that
-/// checkable.
+/// `VAAV1TransformationType`. Same numbering as AV1 5.9.24 `GmType` and the
+/// parser's `WarpModelType`, so the conversion casts.
 pub const VA_AV1_TRANSFORMATION_IDENTITY: u32 = 0;
 pub const VA_AV1_TRANSFORMATION_TRANSLATION: u32 = 1;
 pub const VA_AV1_TRANSFORMATION_ROTZOOM: u32 = 2;
 pub const VA_AV1_TRANSFORMATION_AFFINE: u32 = 3;
 
-/// `ref_frame_map[8]` — AV1's `NUM_REF_FRAMES`.
 pub const REF_FRAME_MAP_LEN: usize = 8;
 
-/// `ref_frame_idx[7]` / `wm[7]` — AV1's `REFS_PER_FRAME`.
 pub const REFS_PER_FRAME: usize = 7;
 
-/// `ref_deltas[8]` — AV1's `TOTAL_REFS_PER_FRAME`.
 pub const TOTAL_REFS_PER_FRAME: usize = 8;
 
-/// `cdef_y_strengths[8]` / `cdef_uv_strengths[8]` — as many as `cdef_bits` can
-/// select (`1 << 3`).
+/// `1 << 3` — as many strengths as `cdef_bits` can select.
 pub const CDEF_MAX: usize = 8;
 
-/// `width_in_sbs_minus_1[63]` / `height_in_sbs_minus_1[63]`.
-///
-/// ⚠ **63, not 64**, and the header explains why: *"Though the maximum number of
-/// tiles is 64, since ones of the last tile are computed from ones of the other
-/// tiles and frame_width/height, they are not necessarily specified."* libavcodec's
-/// `vaapi_av1.c` nonetheless loops `for (i = 0; i < frame_header->tile_cols; i++)`,
-/// which writes index 63 — one past the end — on a 64-column frame. The conversion
-/// clamps instead; see [`crate::pic_av1`].
+/// Last-tile size is derived from the others and the frame size, so the
+/// header omits index 63. libavcodec still writes it on a 64-column frame;
+/// the conversion clamps — see [`crate::pic_av1`].
 pub const TILE_SBS_LEN: usize = 63;
 
-/// `wm[7]`'s index for a reference NAME.
-///
-/// libavcodec writes `pic_param.wm[i - 1]` for `i = LAST_FRAME..=ALTREF_FRAME`, so
-/// `wm[0]` is `LAST_FRAME` and `wm[6]` is `ALTREF_FRAME` — the same indexing
-/// `pf_bitstream::av1::AuPlan::refs` uses, and one step off the parser's own
-/// `gm_params[]`, which is indexed by the spec's reference index (`INTRA_FRAME` = 0).
+/// `wm[i]` is reference name `i + LAST_FRAME`. Parser `gm_params[]` is
+/// indexed from `INTRA_FRAME` = 0, one step off.
 pub const LAST_FRAME: usize = 1;
 
-// ---------------------------------------------------------------------------
-// The bit-field unions, unpacked
-// ---------------------------------------------------------------------------
-
-/// `VADecPictureParameterBufferAV1::seq_info_fields` (32 bits).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SeqInfoFieldsAV1 {
     pub still_picture: bool,
@@ -148,15 +66,7 @@ pub struct SeqInfoFieldsAV1 {
     pub color_range: bool,
     pub subsampling_x: bool,
     pub subsampling_y: bool,
-    /// `va_deprecated` in the header, and still part of the layout — a field that is
-    /// deprecated is not a field that moved.
-    ///
-    /// ⚠ **ONE bit**, where AV1's `chroma_sample_position` is a two-bit enumerator
-    /// (UNKNOWN 0, VERTICAL 1, COLOCATED 2). [`Self::pack`] masks, which is exactly
-    /// what libavcodec's assignment into the C bit-field does — so COLOCATED reaches a
-    /// driver as UNKNOWN through both paths. Not a defect this rung can fix: there is
-    /// no second bit to put it in, and the field is deprecated precisely because
-    /// drivers do not read it.
+    /// One bit; AV1's enumerator is two. `pack` masks, so COLOCATED arrives as UNKNOWN.
     pub chroma_sample_position: u8,
     pub film_grain_params_present: bool,
 }
@@ -182,11 +92,9 @@ impl SeqInfoFieldsAV1 {
     }
 }
 
-/// `VADecPictureParameterBufferAV1::pic_info_fields` (32 bits).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PicInfoFieldsAV1 {
-    /// 0 KEY, 1 INTER, 2 INTRA_ONLY, 3 SWITCH — the AV1 spec's own numbering, which
-    /// is the vendored parser's `FrameType` discriminant too.
+    /// 0 KEY, 1 INTER, 2 INTRA_ONLY, 3 SWITCH — AV1's numbering.
     pub frame_type: u8,
     pub show_frame: bool,
     pub showable_frame: bool,
@@ -202,7 +110,7 @@ pub struct PicInfoFieldsAV1 {
     pub disable_frame_end_update_cdf: bool,
     pub uniform_tile_spacing_flag: bool,
     pub allow_warped_motion: bool,
-    /// Large-scale tile decoding — outside this rung's envelope, always false.
+    /// Large-scale tile; always false here.
     pub large_scale_tile: bool,
 }
 
@@ -227,7 +135,7 @@ impl PicInfoFieldsAV1 {
     }
 }
 
-/// `VADecPictureParameterBufferAV1::loop_filter_info_fields` — **8 bits**, not 32.
+/// `loop_filter_info_fields` — 8 bits. A `u32` packer overwrites the neighbour.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LoopFilterInfoFieldsAV1 {
     pub sharpness_level: u8,
@@ -243,12 +151,8 @@ impl LoopFilterInfoFieldsAV1 {
     }
 }
 
-/// `VADecPictureParameterBufferAV1::qmatrix_fields` — **16 bits**, not 32.
-///
-/// Unlike DXVA, libva carries `using_qmatrix` itself, so the three indices need no
-/// `0xFF` sentinel: they are simply ignored when the flag is clear. (`DXVA_PicParams_AV1`
-/// has no such flag, which is why `pf_dxvadec::pic_av1` has to send 0xFF and why
-/// leaving the parser's 0 there dequantised against matrix 0 on every frame.)
+/// `qmatrix_fields` — 16 bits. libva has `using_qmatrix`, so the indices need
+/// no `0xFF` sentinel; DXVA has no flag and must send 0xFF instead of 0.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QmatrixFieldsAV1 {
     pub using_qmatrix: bool,
@@ -266,7 +170,6 @@ impl QmatrixFieldsAV1 {
     }
 }
 
-/// `VADecPictureParameterBufferAV1::mode_control_fields` (32 bits).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ModeControlFieldsAV1 {
     pub delta_q_present_flag: bool,
@@ -295,18 +198,9 @@ impl ModeControlFieldsAV1 {
     }
 }
 
-/// `VADecPictureParameterBufferAV1::loop_restoration_fields` — **16 bits**, not 32.
-///
-/// The three `*frame_restoration_type` fields take the SPEC's `FrameRestorationType`
-/// (`RESTORE_NONE` 0, `RESTORE_WIENER` 1, `RESTORE_SGRPROJ` 2, `RESTORE_SWITCHABLE`
-/// 3), not the coded two-bit `lr_type`. libavcodec sends
-/// `remap_lr_type[frame_header->lr_type[i]]` with
-/// `remap_lr_type = {NONE, SWITCHABLE, WIENER, SGRPROJ}` — i.e. it applies AV1
-/// 5.9.20's `Remap_Lr_Type` mapping — and the vendored parser has already applied it
-/// (`LoopRestorationParams::frame_restoration_type` is documented "Same as
-/// FrameRestorationType in the specification"), so the conversion casts the parser's
-/// enum and remaps nothing. Sending the coded value instead swaps WIENER and
-/// SWITCHABLE on every frame that restores.
+/// `loop_restoration_fields` — 16 bits. Values are spec `FrameRestorationType`
+/// (NONE 0, WIENER 1, SGRPROJ 2, SWITCHABLE 3), not coded `lr_type`. The parser
+/// already remaps; sending the coded value swaps WIENER and SWITCHABLE.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LoopRestorationFieldsAV1 {
     pub yframe_restoration_type: u8,
@@ -326,7 +220,6 @@ impl LoopRestorationFieldsAV1 {
     }
 }
 
-/// `VASegmentationStructAV1::segment_info_fields` (32 bits).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SegmentInfoFieldsAV1 {
     pub enabled: bool,
@@ -344,7 +237,6 @@ impl SegmentInfoFieldsAV1 {
     }
 }
 
-/// `VAFilmGrainStructAV1::film_grain_info_fields` (32 bits).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FilmGrainInfoFieldsAV1 {
     pub apply_grain: bool,
@@ -370,23 +262,13 @@ impl FilmGrainInfoFieldsAV1 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The structures
-// ---------------------------------------------------------------------------
-
-/// `VASegmentationStructAV1`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VaSegmentationStructAV1 {
     pub segment_info_fields: u32,
-    /// `FeatureData[segment][feature]` **after** AV1 5.9.14's `Clip3` — libva says
-    /// so ("equivalent to variable FeatureData\[\]\[\] in spec, which is after
-    /// clip3() operation"), and the vendored parser clips as it reads
-    /// (`parse_segmentation_params` calls `helpers::clip3` with the spec's
-    /// `FEATURE_MAX`), so no clipping happens in the conversion.
+    /// After AV1 5.9.14 `Clip3`. The parser already clips; conversion does not.
     pub feature_data: [[i16; 8]; 8],
-    /// Bit `feature` set where `feature_enabled[segment][feature]` is. Indexed by
-    /// SEGMENT; the bit position is the feature id.
+    /// Bit `feature` set where that feature is enabled. Indexed by segment.
     pub feature_mask: [u8; 8],
     pub va_reserved: [u32; 4],
 }
@@ -402,12 +284,8 @@ impl VaSegmentationStructAV1 {
     }
 }
 
-/// `VAFilmGrainStructAV1`.
-///
-/// ⚠ The `ar_coeffs_*` are **signed** here (`int8_t`), where the bitstream — and the
-/// vendored parser, and `DXVA_FilmGrain_AV1` — carry the `+128` biased form.
-/// libavcodec writes `film_grain->ar_coeffs_y_plus_128[i] - 128`. Copying the biased
-/// bytes across unchanged is a silent 128-offset on every autoregressive coefficient.
+/// `VAFilmGrainStructAV1`. `ar_coeffs_*` are signed; bitstream and DXVA carry
+/// `+128`. Copying the biased bytes is a silent 128-offset.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VaFilmGrainStructAV1 {
@@ -462,20 +340,14 @@ impl VaFilmGrainStructAV1 {
     }
 }
 
-/// `VAWarpedMotionParamsAV1` — one reference NAME's global motion.
+/// `VAWarpedMotionParamsAV1` — global motion for one reference name.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VaWarpedMotionParamsAV1 {
-    /// `VAAV1TransformationType`. Declared `u32` because a C enum whose enumerators
-    /// are all non-negative is `unsigned int` on this ABI; either signedness is four
-    /// bytes and every value written here is 0..=3, so the choice is a naming one.
     pub wmtype: u32,
-    /// `gm_params[ref][0..6]`. ⚠ Only the first SIX are meaningful: AV1 5.9.24 codes
-    /// six warp parameters and libavcodec copies `for (j = 0; j < 6; j++)`, leaving
-    /// `wmmat[6]`/`wmmat[7]` zero.
+    /// `gm_params[ref][0..6]`. Only six values are coded; `wmmat[6]`/`[7]` stay 0.
     pub wmmat: [i32; 8],
-    /// The INVERSE of the parser's `warp_valid` (`setup_shear`'s verdict): libva's
-    /// field says the affine set is unusable.
+    /// Inverse of the parser's `warp_valid`: set when the affine set is unusable.
     pub invalid: u8,
     pub va_reserved: [u32; 4],
 }
@@ -491,70 +363,46 @@ impl VaWarpedMotionParamsAV1 {
     }
 }
 
-/// `VADecPictureParameterBufferAV1`.
-///
-/// ⚠ **Eight-byte aligned, 1160 bytes**, and the reason is
-/// [`Self::anchor_frames_list`]: a pointer member drags the whole structure's
-/// alignment up and inserts seven bytes of padding after `anchor_frames_num` that
-/// nothing in the field list suggests. Measured, not counted.
+/// `VADecPictureParameterBufferAV1` — 1160 bytes, align 8. The pointer
+/// [`Self::anchor_frames_list`] inserts seven bytes of padding after
+/// `anchor_frames_num`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VaDecPictureParameterBufferAV1 {
-    /// `seq_profile`: 0, 1 or 2.
     pub profile: u8,
-    /// ⚠ The parser types this `i32` and leaves it **-1** when `enable_order_hint`
-    /// is 0. Narrowed to a `u8` that would be 255 — a 256-bit order hint — so the
-    /// conversion sends 0 there instead.
+    /// Parser `i32` is -1 when `enable_order_hint` is 0; a `u8` would become 255.
     pub order_hint_bits_minus_1: u8,
-    /// 0 = 8-bit, 1 = 10-bit, 2 = 12-bit. An INDEX, not a depth.
+    /// 0 = 8-bit, 1 = 10-bit, 2 = 12-bit. An index, not a depth.
     pub bit_depth_idx: u8,
     pub matrix_coefficients: u8,
     pub seq_info_fields: u32,
-    /// The decode target's `VASurfaceID`.
     pub current_frame: u32,
-    /// The surface the film-grained picture is written to. libva: *"Valid only when
-    /// apply_grain equals 1."* This rung refuses `apply_grain` (see
-    /// [`crate::pic_av1`]), so it always equals [`Self::current_frame`].
+    /// Film-grain output surface. Valid only when `apply_grain` is 1; this rung
+    /// refuses that, so it always equals [`Self::current_frame`].
     pub current_display_picture: u32,
     /// Large-scale tile only; always 0 here.
     pub anchor_frames_num: u8,
-    /// Large-scale tile only; always null here. Declared as a real pointer so the
-    /// layout follows the target ABI rather than a hard-coded width — which also
-    /// means the offsets pinned below are the LP64 ones, as everywhere else in this
-    /// crate.
+    /// Large-scale tile only; always null. A real pointer so layout follows LP64.
     pub anchor_frames_list: *mut u32,
-    /// ⚠ The **upscaled** (post-superres) width minus one — libva: *"Picture
-    /// original resolution. If SuperRes is enabled, this is the upscaled
-    /// resolution."* libavcodec sends the coded `frame_width_minus_1` syntax
-    /// element, which is that same quantity: AV1 5.9.8 reads it into
-    /// `UpscaledWidth` and only then divides down into `FrameWidth`.
+    /// Upscaled (post-superres) width minus one. AV1 5.9.8 reads this into
+    /// `UpscaledWidth` before dividing down to `FrameWidth`.
     pub frame_width_minus1: u16,
     pub frame_height_minus1: u16,
     /// Large-scale tile only.
     pub output_frame_width_in_tiles_minus_1: u16,
     pub output_frame_height_in_tiles_minus_1: u16,
-    /// Indexed by AV1 reference **SLOT**, holding a **`VASurfaceID`** (module docs).
-    /// `VA_INVALID_ID` for a slot holding nothing — which is the DEFAULT this
-    /// structure zeroes to, not what a submission carries: `pic_av1` substitutes a live
-    /// surface for every empty entry before the buffer reaches a driver, because
-    /// `va_dec_av1.h:352` says the driver will not check the ids and prescribes exactly
-    /// that recovery.
+    /// Slot → `VASurfaceID`. Empty slots must not stay 0: `pic_av1` substitutes
+    /// a live surface because the driver does not validate ids.
     pub ref_frame_map: [u32; REF_FRAME_MAP_LEN],
-    /// Indexed by reference **NAME**, holding an index into [`Self::ref_frame_map`]
-    /// — i.e. an AV1 slot (module docs).
+    /// Name → slot into [`Self::ref_frame_map`].
     pub ref_frame_idx: [u8; REFS_PER_FRAME],
-    /// Index into [`Self::ref_frame_idx`], or [`PRIMARY_REF_NONE`].
     pub primary_ref_frame: u8,
-    /// ⚠ A `u8`, where AV1 allows up to 8 order-hint bits — so the full range fits,
-    /// but only just.
     pub order_hint: u8,
     pub seg_info: VaSegmentationStructAV1,
     pub film_grain_info: VaFilmGrainStructAV1,
     pub tile_cols: u8,
     pub tile_rows: u8,
-    /// Each tile's width in superblocks MINUS ONE — the coded syntax element, not a
-    /// count. (DXVA's `tiles.widths[]` is the count, `+1`; the two APIs disagree and
-    /// both are documented.)
+    /// Superblock width minus one, the coded syntax. DXVA `tiles.widths[]` is the count.
     pub width_in_sbs_minus_1: [u16; TILE_SBS_LEN],
     pub height_in_sbs_minus_1: [u16; TILE_SBS_LEN],
     /// Large-scale tile only.
@@ -563,13 +411,11 @@ pub struct VaDecPictureParameterBufferAV1 {
     pub pic_info_fields: u32,
     pub superres_scale_denominator: u8,
     pub interp_filter: u8,
-    /// `loop_filter_level[0..2]` — the two LUMA levels.
+    /// Spec `loop_filter_level[0]` and `[1]`; `[2]`/`[3]` are the u/v fields below.
     pub filter_level: [u8; 2],
-    /// `loop_filter_level[2]`.
     pub filter_level_u: u8,
-    /// `loop_filter_level[3]`.
     pub filter_level_v: u8,
-    /// An **8-bit** union ([`LoopFilterInfoFieldsAV1`]).
+    /// Packed [`LoopFilterInfoFieldsAV1`] — 8 bits, not 32.
     pub loop_filter_info_fields: u8,
     pub ref_deltas: [i8; TOTAL_REFS_PER_FRAME],
     pub mode_deltas: [i8; 2],
@@ -579,28 +425,25 @@ pub struct VaDecPictureParameterBufferAV1 {
     pub u_ac_delta_q: i8,
     pub v_dc_delta_q: i8,
     pub v_ac_delta_q: i8,
-    /// A **16-bit** union ([`QmatrixFieldsAV1`]).
+    /// Packed [`QmatrixFieldsAV1`] — 16 bits, not 32.
     pub qmatrix_fields: u16,
     pub mode_control_fields: u32,
     pub cdef_damping_minus_3: u8,
     pub cdef_bits: u8,
-    /// `(primary << 2) | (secondary & 3)`, per the header's own formula. The
-    /// secondary strength must be the CODED two-bit value — see
-    /// [`pf_bitstream::av1::coded_cdef_sec_strength`].
+    /// `(primary << 2) | (secondary & 3)`. Secondary is the coded two-bit value
+    /// — see [`pf_bitstream::av1::coded_cdef_sec_strength`].
     pub cdef_y_strengths: [u8; CDEF_MAX],
     pub cdef_uv_strengths: [u8; CDEF_MAX],
-    /// A **16-bit** union ([`LoopRestorationFieldsAV1`]).
+    /// Packed [`LoopRestorationFieldsAV1`] — 16 bits, not 32.
     pub loop_restoration_fields: u16,
-    /// Global motion by reference NAME: `wm[0]` is `LAST_FRAME` (module docs).
+    /// Name-indexed global motion: `wm[0]` is LAST_FRAME.
     pub wm: [VaWarpedMotionParamsAV1; REFS_PER_FRAME],
-    /// `va_reserved[VA_PADDING_MEDIUM]` — eight, where the other two codecs' picture
-    /// buffers use `VA_PADDING_MEDIUM` and `VA_PADDING_LOW` respectively.
+    /// `VA_PADDING_MEDIUM` — eight words on this buffer.
     pub va_reserved: [u32; 8],
 }
 
 impl VaDecPictureParameterBufferAV1 {
-    /// An all-zero buffer with the sentinels a driver must not read as real values:
-    /// every reference slot empty, and no anchor-frame list.
+    /// All-zero except sentinels: empty slots are `VA_INVALID_SURFACE`, no anchors.
     pub const fn zeroed() -> Self {
         VaDecPictureParameterBufferAV1 {
             profile: 0,
@@ -656,21 +499,18 @@ impl VaDecPictureParameterBufferAV1 {
     }
 }
 
-/// `VASliceParameterBufferAV1` — **one per TILE**, not per tile group (module docs).
+/// `VASliceParameterBufferAV1` — one record per TILE, not per tile group.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VaSliceParameterBufferAV1 {
-    /// This tile's byte count.
     pub slice_data_size: u32,
-    /// This tile's offset **inside the accompanying `VASliceDataBufferType` buffer**
-    /// — which holds the whole tile group's `tile_data` region, not just this tile.
+    /// Offset inside the accompanying `VASliceDataBufferType` (the whole group's
+    /// `tile_data`), not this tile alone.
     pub slice_data_offset: u32,
     pub slice_data_flag: u32,
     pub tile_row: u16,
     pub tile_column: u16,
-    /// `va_deprecated` in the header — and libavcodec fills both anyway, so this
-    /// rung does too. A deprecated field a driver may still read is not a field to
-    /// leave at whatever `zeroed()` chose.
+    /// Deprecated in the header; drivers may still read it, so it is filled.
     pub tg_start: u16,
     pub tg_end: u16,
     pub anchor_frame_idx: u8,
@@ -695,9 +535,7 @@ impl VaSliceParameterBufferAV1 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Layout proofs — the probe's output, pinned (libva 2.23.0, x86_64-linux-gnu).
-// ---------------------------------------------------------------------------
+// Layout proofs — `layout-probe.c` against libva 2.23.0, x86_64-linux-gnu.
 
 const _: () = {
     use std::mem::align_of;
@@ -739,9 +577,7 @@ const _: () = {
     assert!(offset_of!(VaWarpedMotionParamsAV1, invalid) == 36);
     assert!(offset_of!(VaWarpedMotionParamsAV1, va_reserved) == 40);
 
-    // The pointer member is what makes this one align 8 rather than 4, and it is
-    // asserted for its own sake: the padding it creates at offsets 17..24 is the
-    // kind a hand-written declaration silently omits.
+    // Pointer member: align 8, not 4, and seven bytes of padding at 17..24.
     assert!(size_of::<VaDecPictureParameterBufferAV1>() == 1160);
     assert!(align_of::<VaDecPictureParameterBufferAV1>() == 8);
     assert!(offset_of!(VaDecPictureParameterBufferAV1, profile) == 0);
@@ -821,8 +657,6 @@ const _: () = {
 mod tests {
     use super::*;
 
-    /// The probe's own single-field vectors, restated. Each of these is a number a
-    /// real `gcc` printed after setting exactly one bit-field.
     #[test]
     fn av1_bit_fields_pack_where_the_probe_measured() {
         assert_eq!(
@@ -987,15 +821,10 @@ mod tests {
         );
     }
 
-    /// Every field alone must light only its own bits, and nothing may reach the
-    /// reserved tail. Two probe vectors per word would not catch a shift typo that
-    /// overlapped two neighbours — and on the three NARROW unions, a field that
-    /// overflowed its declared width would be invisible in a `u32` comparison, which
-    /// is why each of those is checked against its own type's mask.
+    /// Each field lights only its own bits. Narrow unions are checked against
+    /// their own width; a `u32` mask would hide an overflow.
     #[test]
     fn every_av1_field_owns_a_distinct_bit_range() {
-        // A free function rather than a closure so `seen` can be reset between the
-        // unions without the closure's borrow outliving it.
         fn check(seen: &mut u32, bits: u32, mask: u32) {
             assert_ne!(bits, 0, "a field packed to nothing");
             assert_eq!(*seen & bits, 0, "two fields share a bit: {bits:#010x}");
@@ -1121,7 +950,6 @@ mod tests {
         }
         assert_eq!(seen, 0x0000_000f);
 
-        // The three NARROW unions, checked in their own widths.
         let mut seen8 = 0u8;
         for bits in [
             LoopFilterInfoFieldsAV1 {
@@ -1213,12 +1041,8 @@ mod tests {
         );
     }
 
-    /// The sentinels a zeroed picture buffer must NOT leave as plausible values.
-    ///
-    /// `ref_frame_map` is the one that matters: a zero there is a perfectly valid
-    /// `VASurfaceID`, and `va_dec_av1.h` says outright that the *"Driver is not
-    /// responsible to validate reference frames' id"* — so an unfilled slot has to
-    /// carry `VA_INVALID_ID` or the driver predicts from surface 0.
+    /// A zeroed `ref_frame_map` slot is a valid `VASurfaceID`. Empty slots must
+    /// carry `VA_INVALID_SURFACE` — the driver does not validate ids.
     #[test]
     fn a_zeroed_picture_buffer_carries_the_sentinels_not_zeros() {
         let p = VaDecPictureParameterBufferAV1::zeroed();
@@ -1238,18 +1062,8 @@ mod tests {
         assert_eq!(t.slice_data_flag, crate::va::VA_SLICE_DATA_FLAG_ALL);
     }
 
-    /// Every enumerator [`crate::pic_av1`] CASTS rather than remaps, pinned against
-    /// libva's own documented numbering.
-    ///
-    /// Four families reach a driver as a bare `as u8` / `as u32` of a vendored-parser
-    /// enum. Each cast is only correct because the parser's discriminants happen to be
-    /// the spec's, and "happen to be" is what a test is for: a vendored-parser bump
-    /// that renumbered any of them would decode to something plausible rather than
-    /// failing.
-    ///
-    /// The right-hand sides are transcribed from `va_dec_av1.h` and from libavcodec's
-    /// `av1.h`, not from the parser — comparing the parser against itself would pass
-    /// forever.
+    /// Parser discriminants this rung casts, pinned to `va_dec_av1.h` numbering.
+    /// A parser bump that renumbered any of them would decode plausibly.
     #[test]
     fn every_enumerator_this_rung_casts_matches_the_numbering_libva_documents() {
         use cros_codecs::codec::av1::parser::FrameRestorationType;
@@ -1258,7 +1072,6 @@ mod tests {
         use cros_codecs::codec::av1::parser::TxMode;
         use cros_codecs::codec::av1::parser::WarpModelType;
 
-        // `VAAV1TransformationType` (measured off the header).
         assert_eq!(
             WarpModelType::Identity as u32,
             VA_AV1_TRANSFORMATION_IDENTITY
@@ -1270,33 +1083,22 @@ mod tests {
         assert_eq!(WarpModelType::RotZoom as u32, VA_AV1_TRANSFORMATION_ROTZOOM);
         assert_eq!(WarpModelType::Affine as u32, VA_AV1_TRANSFORMATION_AFFINE);
 
-        // `pic_info_fields.frame_type`, which the header documents inline:
-        // "0: KEY_FRAME; 1: INTER_FRAME; 2: INTRA_ONLY_FRAME; 3: SWITCH_FRAME".
         assert_eq!(FrameType::KeyFrame as u8, 0);
         assert_eq!(FrameType::InterFrame as u8, 1);
         assert_eq!(FrameType::IntraOnlyFrame as u8, 2);
         assert_eq!(FrameType::SwitchFrame as u8, 3);
 
-        // `mode_control_fields.tx_mode` — "read_tx_mode, value range [0..2]", i.e.
-        // ONLY_4X4 / TX_MODE_LARGEST / TX_MODE_SELECT.
         assert_eq!(TxMode::Only4x4 as u8, 0);
         assert_eq!(TxMode::Largest as u8, 1);
         assert_eq!(TxMode::Select as u8, 2);
 
-        // `interp_filter` — "value range [0..4]", AV1 6.8.9's
-        // EIGHTTAP / EIGHTTAP_SMOOTH / EIGHTTAP_SHARP / BILINEAR / SWITCHABLE.
         assert_eq!(InterpolationFilter::EightTap as u8, 0);
         assert_eq!(InterpolationFilter::EightTapSmooth as u8, 1);
         assert_eq!(InterpolationFilter::EightTapSharp as u8, 2);
         assert_eq!(InterpolationFilter::Bilinear as u8, 3);
         assert_eq!(InterpolationFilter::Switchable as u8, 4);
 
-        // `loop_restoration_fields.*frame_restoration_type` — libavcodec's
-        // `AV1_RESTORE_NONE/WIENER/SGRPROJ/SWITCHABLE` = 0/1/2/3, which is what its
-        // `remap_lr_type[] = {NONE, SWITCHABLE, WIENER, SGRPROJ}` PRODUCES from the
-        // coded two-bit `lr_type`. The vendored parser applies the same
-        // `REMAP_LR_TYPE` as it reads, so [`crate::pic_av1`] casts and remaps
-        // nothing; if these four numbers moved, it would have to.
+        // Spec `FrameRestorationType`, not coded `lr_type`. Parser already remaps.
         assert_eq!(FrameRestorationType::None as u8, 0);
         assert_eq!(FrameRestorationType::Wiener as u8, 1);
         assert_eq!(FrameRestorationType::Sgrproj as u8, 2);

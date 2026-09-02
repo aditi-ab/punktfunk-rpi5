@@ -1,52 +1,43 @@
-//! `PUNKTFUNK_PERF` stage-timing telemetry for the two hot paths: where the client pump
-//! and the host send thread actually spend their time, accumulated per report window and
-//! drained via [`Session::take_pump_perf`](super::Session::take_pump_perf) /
+//! `PUNKTFUNK_PERF` stage timings for the client pump and host send thread.
+//! Accumulated per report window; drain with
+//! [`Session::take_pump_perf`](super::Session::take_pump_perf) /
 //! [`Session::take_seal_perf`](super::Session::take_seal_perf).
 
 use crate::fec::ErasureCoder;
 
-/// Accumulated client receive-path stage timings since the last [`Session::take_pump_perf`](super::Session::take_pump_perf).
-/// Answers "where does the pump core go" at line rate: kernel drain (`recv_ns`) vs AES-GCM
-/// (`decrypt_ns`) vs reassembly+FEC (`reasm_ns`, the `Reassembler::push` round-trip including
-/// shard copies and block reconstruction). 2026-07-14 sweep context: the pump pegs one core at
-/// ~1.5 Gbps wire, ~85% of it userspace — this split is what Phase 2.1 (pooled reassembly) is
-/// validated against.
+/// Client receive-path stage timings since the last
+/// [`Session::take_pump_perf`](super::Session::take_pump_perf).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PumpPerf {
-    /// ns inside `recv_batch` (recvmmsg / recvmsg_x), i.e. syscall + kernel copy.
+    /// `recv_batch` (recvmmsg / recvmsg_x): syscall + kernel copy.
     pub recv_ns: u64,
-    /// ns inside `open_in_place` across all datagrams (AES-128-GCM + replay-window upkeep).
+    /// `open_in_place` (AES-128-GCM + replay-window upkeep).
     pub decrypt_ns: u64,
-    /// ns inside `Reassembler::push` (header parse, shard copy, FEC reconstruct, AU assembly).
+    /// `Reassembler::push` (parse, shard copy, FEC reconstruct, AU assembly).
     pub reasm_ns: u64,
-    /// recv_batch calls (batches) and datagrams processed over the accumulation window.
+    /// `recv_batch` calls and datagrams in the window.
     pub batches: u64,
     pub packets: u64,
 }
 
-/// Accumulated host send-path stage timings since the last [`Session::take_seal_perf`](super::Session::take_seal_perf) (plan
-/// Phase 0.4, host half). Answers "where does the send thread go" at rate: FEC parity
-/// generation (`fec_ns`, inside [`ErasureCoder::encode_into`]) vs AES-GCM (`seal_ns`,
-/// per-packet `seal_in_place`) vs the socket handoff (`sock_ns` — `send_gso`/`sendmmsg`
-/// syscalls; the internal submit paths time it here, the paced video path folds its chunk
-/// sends in via [`Session::note_sock_ns`](super::Session::note_sock_ns)). The Phase 1.5 gate reads off this split: build
-/// two-lane seal only if `seal_ns` exceeds ~15% of the send thread at 2 Gbps.
+/// Host send-path stage timings since the last
+/// [`Session::take_seal_perf`](super::Session::take_seal_perf). Paced video folds
+/// its chunk sends into `sock_ns` via
+/// [`Session::note_sock_ns`](super::Session::note_sock_ns).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SealPerf {
-    /// ns inside `ErasureCoder::encode_into` (parity generation).
+    /// [`ErasureCoder::encode_into`] (parity).
     pub fec_ns: u64,
-    /// ns inside `seal_in_place` across all wire packets (AES-128-GCM).
+    /// `seal_in_place` (AES-128-GCM) across all wire packets.
     pub seal_ns: u64,
-    /// ns inside `send_sealed` (socket syscalls), where the session can see it.
+    /// `send_sealed` socket syscalls, plus paced chunks via `note_sock_ns`.
     pub sock_ns: u64,
-    /// Frames sealed and wire packets sealed over the accumulation window.
     pub frames: u64,
     pub packets: u64,
 }
 
-/// [`ErasureCoder`] shim accumulating the time spent in `encode_into` (the send-path FEC
-/// stage) — only constructed when `PUNKTFUNK_PERF` armed the session's [`SealPerf`]. The
-/// counter is atomic purely to satisfy the trait's `Sync` bound; it lives on one thread.
+/// Times `encode_into` into [`SealPerf`] when `PUNKTFUNK_PERF` is armed. `ns` is
+/// atomic only to satisfy [`ErasureCoder`]'s `Sync` bound; it lives on one thread.
 pub(super) struct TimedCoder<'a> {
     pub(super) inner: &'a dyn ErasureCoder,
     pub(super) ns: &'a std::sync::atomic::AtomicU64,

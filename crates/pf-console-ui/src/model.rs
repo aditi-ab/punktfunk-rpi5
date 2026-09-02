@@ -1,107 +1,87 @@
-//! The console's shared binary↔overlay state and command bus — the widened sibling of
-//! [`crate::library::LibraryShared`]. The session binary's service threads (discovery,
-//! probing, pairing, waking, persistence) WRITE snapshots in; the shell reads them per
-//! frame by generation stamp. The overlay never blocks: anything that touches the
-//! network or disk rides a [`ConsoleCmd`] to the binary instead.
+//! Shared console snapshot and command bus, sibling of [`crate::library::LibraryShared`].
+//! Service threads (discovery, probing, pairing, waking, persistence) write snapshots;
+//! the shell reads them per frame by generation stamp. Anything that touches the
+//! network or disk rides a [`ConsoleCmd`] — the overlay never blocks.
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-/// A settings profile as the console shows it (design client-settings-profiles.md §5.2a):
-/// the resolved name and accent of a catalog entry, keyed by its stable id. The service
-/// thread resolves these against the catalog; the shell never opens the profiles file.
+/// Resolved catalog entry. The service thread opens the profiles file; the shell never
+/// does.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProfileChip {
     pub id: String,
     pub name: String,
-    /// `#RRGGBB`, the catalog's optional tint for pinned cards.
+    /// `#RRGGBB`.
     pub accent: Option<String>,
 }
 
-/// One row on the console home carousel — a saved host, a discovered-but-unsaved one,
-/// a pinned profile card, or (client-side) the trailing Add Host tile. Fully resolved by
-/// the service thread; the shell renders it verbatim.
+/// Home carousel row, fully resolved by the service thread. The shell renders it
+/// verbatim.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HostRow {
-    /// Stable identity across refreshes: the pinned fingerprint when known, else
-    /// `addr:port` — keeps the cursor on "the same host" as snapshots churn.
+    /// Fingerprint when pinned, else `addr:port` — cursor identity across snapshot churn.
     pub key: String,
     pub name: String,
     pub addr: String,
     pub port: u16,
-    /// Pinned certificate fingerprint (lowercase hex); empty = not pinned.
+    /// Lowercase hex fingerprint; empty = not pinned.
     pub fp_hex: String,
     pub paired: bool,
-    /// In the known-hosts store (vs. discovered-only).
+    /// In the known-hosts store, not merely discovered.
     pub saved: bool,
-    /// Advertising on mDNS or proven reachable by the probe sweep.
+    /// mDNS advert or last probe succeeded.
     pub online: bool,
-    /// The management API's port (mDNS TXT or store), for the library fetch.
+    /// Management API port (mDNS TXT or store).
     pub mgmt_port: u16,
-    /// Offline + a stored MAC → activating wakes first ("Wake & Connect").
+    /// Offline with a stored MAC: Wake & Connect is offered.
     pub can_wake: bool,
-    /// Share this device's clipboard with THIS host while streaming
-    /// (`KnownHost::clipboard_sync`) — surfaced so the host menu can show and flip it.
-    /// `serde(default)`: a producer predating the field still parses (as not-shared).
+    /// Per-host clipboard share while streaming (`KnownHost::clipboard_sync`).
     #[serde(default)]
     pub clipboard_sync: bool,
-    /// Last successful connect (UNIX seconds) — the most-recent accent.
+    /// Last successful connect, UNIX seconds.
     pub last_used: Option<u64>,
-    /// The host's OS-identity chain (live advert preferred, else the stored one), for a
-    /// future tile OS glyph. Empty = unknown (older host). Plumbed now; drawing is a
-    /// follow-up — the Skia glyph set doesn't exist yet.
+    /// OS-identity chain: live advert preferred, else stored. Empty = unknown.
     pub os: String,
-    /// What this host lets THIS device do to it beyond streaming — sleep, restart, shut down
-    /// (`design/host-actions.md` §7), as the host itself reported them. Empty for an
-    /// unreachable host, an older one with no such route, and any device whose access does not
-    /// carry the Host-power grant: the host is the only judge of that, and a row it would
-    /// refuse is not offered. `serde(default)` so a producer predating the field still parses.
+    /// Host-reported extras (`design/host-actions.md`): sleep, restart, shut down.
+    /// Empty when the host is unreachable or the route does not exist.
     #[serde(default)]
     pub actions: Vec<HostAction>,
-    /// `Some` = this row is a pinned profile card (§5.2a): a shortcut tile rendered right
-    /// after its host's primary tile, sharing its live state, that connects with THIS
-    /// profile. `None` = the host's primary tile.
+    /// Pinned-profile shortcut after the host's primary tile, sharing its live state.
+    /// `None` = this row is the primary tile.
     pub pin: Option<ProfileChip>,
-    /// The primary tile's default-profile chip: the profile bound as this host's default
-    /// (`KnownHost::profile_id`), resolved, so the tile can say what a plain A-press uses.
-    /// Always `None` on pinned rows — there the profile IS `pin`.
+    /// Default profile (`KnownHost::profile_id`). Always `None` on a pinned row — that
+    /// profile is `pin`.
     pub bound_profile: Option<ProfileChip>,
 }
 
-/// One action a host offers this device, resolved by the service thread from the host's own
-/// `GET /api/v1/actions` (`design/host-actions.md` §3.2) — v1: sleep, restart, shut down.
-///
-/// Presentational on purpose: the label is already the one this client would use for a known
-/// id and the host's own title for an id this client has never heard of, so a later host can
-/// add an action and this console renders it with no release. The shell never decides WHETHER
-/// an action may run — the host answered that before the row existed, and answers it again on
-/// invoke.
+/// One host-offered action, resolved from `GET /api/v1/actions`
+/// (`design/host-actions.md`). `label` is already chosen: this client's wording for a
+/// known id, else the host's title, so a new host action renders without a console
+/// release.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HostAction {
-    /// Stable action id, the invoke argument (`power.sleep`).
+    /// Invoke argument (`power.sleep`).
     pub id: String,
-    /// Row label, already resolved (local wording for a known id, else the host's title).
     pub label: String,
-    /// Confirm twice — the action loses state (restart, shut down).
+    /// Confirm twice: the action drops host state (restart, shut down).
     pub danger: bool,
-    /// The host can run it right now. `false` still shows the row, disabled, because
-    /// "unavailable, because X" is more use than a row that quietly vanished.
+    /// Host can run it now. `false` still shows the row, disabled — do not hide it.
     pub available: bool,
-    /// Why it can't run, when it can't. Empty otherwise.
     #[serde(default)]
     pub unavailable_reason: String,
 }
 
-/// The pairing ceremony's observable state (one at a time — the ceremony is modal).
+/// Pairing ceremony state. One at a time: the ceremony is modal.
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub enum PairPhase {
     #[default]
     Idle,
-    /// The SPAKE2 exchange is running (up to ~90 s on a mistyped-then-fixed PIN).
+    /// SPAKE2 in flight; can run ~90 s if the PIN is retried.
     Busy,
     Failed(String),
-    /// Paired and persisted; `key` addresses the host's refreshed row.
+    /// Paired and persisted. `key` is the host's refreshed row.
     Paired {
         key: String,
     },
@@ -113,12 +93,12 @@ pub enum PairPhase {
 pub struct WakeStatus {
     pub key: String,
     pub name: String,
-    /// Seconds since the wake started (the card's counter).
+    /// Seconds since the wake started.
     pub seconds: u32,
     pub timed_out: bool,
-    /// The host answered a probe — the shell launches if the wake wanted a connect.
+    /// Probe answered. The shell launches if `then_connect`.
     pub online: bool,
-    /// Connect once awake (A on an offline host) vs. a bare wake.
+    /// Connect once awake, versus a bare wake.
     pub then_connect: bool,
 }
 
@@ -128,14 +108,12 @@ struct ConsoleState {
     hosts_gen: u64,
     pair: PairPhase,
     wake: Option<WakeStatus>,
-    /// A one-shot toast from a service worker (e.g. the log-upload result). The shell
-    /// takes it on its next sync; unlike [`PairPhase`] there is no modal state to track,
-    /// so a plain take-once string is the whole protocol.
+    /// One-shot toast. The shell `take`s it on the next sync — unlike [`PairPhase`]
+    /// there is no modal state, so a take-once string is the whole protocol.
     notice: Option<String>,
 }
 
-/// The shared handle. Service threads write; the shell polls per frame (cheap locks,
-/// no rendering data inside).
+/// Service threads write; the shell polls per frame. Cheap locks; no GPU data.
 #[derive(Clone, Default)]
 pub struct ConsoleShared(Arc<Mutex<ConsoleState>>);
 
@@ -173,8 +151,7 @@ impl ConsoleShared {
         self.0.lock().unwrap().wake.clone()
     }
 
-    /// Post a one-shot toast from a service worker. A newer notice replaces an unshown
-    /// older one — the shell polls per frame, so in practice nothing is ever dropped.
+    /// One-shot toast. A newer notice replaces an unshown older one.
     pub fn set_notice(&self, text: String) {
         self.0.lock().unwrap().notice = Some(text);
     }
@@ -184,141 +161,128 @@ impl ConsoleShared {
     }
 }
 
-/// Work the shell asks the binary to do. Everything here blocks (network/disk), so it
-/// runs on the binary's service thread, never on the render path.
+/// Overlay→binary work. Every variant blocks on network or disk; never on the
+/// render path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConsoleCmd {
-    /// (Re)fetch a host's game library into the shared library model.
     FetchLibrary {
         addr: String,
         mgmt: u16,
         fp_hex: String,
     },
-    /// Re-read only WHICH titles the host has up (`GET /api/v1/status`), leaving the catalog
-    /// on screen untouched — raised when a stream ends onto a shelf, the one moment the
-    /// running set is most likely to have changed under it.
-    ///
-    /// Its own command rather than a `FetchLibrary`: that one sets the phase to `Loading`,
-    /// which would replace the shelf the player just came back to with a spinner.
+    /// Re-read running titles (`GET /api/v1/status`) without touching the catalog.
+    /// Not [`Self::FetchLibrary`]: that sets `Loading` and would replace the shelf
+    /// with a spinner.
     RefreshRunning {
         addr: String,
         mgmt: u16,
         fp_hex: String,
     },
-    /// Run the SPAKE2 PIN ceremony; on success persist the pin and refresh hosts.
+    /// SPAKE2 PIN ceremony; on success persist the pin and refresh hosts.
     Pair {
         addr: String,
         port: u16,
         pin: String,
         device_name: String,
     },
-    /// Upload the client's recent log ring to this PAIRED host's management API — the
-    /// "send logs to host" escape hatch for platforms whose own logs are unreachable
-    /// (Deck Gaming Mode, tvOS). Same transport + trust as `FetchLibrary`; the result
-    /// comes back as a shared-model notice toast.
+    /// Upload the log ring to this paired host's management API. Same transport as
+    /// [`Self::FetchLibrary`]; the result is a notice toast. For platforms whose own
+    /// logs are unreachable.
     SendLogs {
         addr: String,
         mgmt: u16,
         fp_hex: String,
         host_name: String,
     },
-    /// Save a manually entered host (unpaired) and refresh the rows.
+    /// Save a manually entered host, unpaired, and refresh the rows.
     SaveHost {
         name: String,
         addr: String,
         port: u16,
     },
-    /// Rename / re-address a saved host (the host menu's "Edit…"). `key` addresses the
-    /// row; the fingerprint, pins and MACs already stored against it are kept — this edits
-    /// a host, it doesn't replace one.
+    /// Rename or re-address a saved host. Fingerprint, pins, and MACs stay — this
+    /// edits the row, it does not replace it.
     UpdateHost {
         key: String,
         name: String,
         addr: String,
         port: u16,
     },
-    /// Drop a saved host (the host menu's "Forget"). The next connect to that address
-    /// starts from scratch: no pin, no pairing, no pinned cards.
-    ForgetHost { key: String },
-    /// Start the wake-and-wait loop for this saved host.
-    Wake { key: String, then_connect: bool },
-    /// Stop the wake loop (B on the wake card) and clear its status.
+    /// Drop a saved host. The next connect to that address has no pin, pairing, or
+    /// pinned cards.
+    ForgetHost {
+        key: String,
+    },
+    Wake {
+        key: String,
+        then_connect: bool,
+    },
+    /// Stop the wake loop and clear its status.
     CancelWake,
-    /// Sweep reachability now (the home screen refreshes its presence pips).
     Probe,
-    /// Pin (or unpin) a profile as an extra connect card on a saved host
-    /// (`KnownHost::pinned_profiles`, design §5.2a). `key` is the HOST row's key
-    /// (fingerprint or `addr:port`); presentation only — never touches the host's
-    /// default binding or the profile itself. Idempotent: re-pinning a pinned profile
-    /// (or unpinning an absent one) is a no-op.
+    /// Pin or unpin a profile card on a saved host (`KnownHost::pinned_profiles`).
+    /// `key` is the host row. Presentation only: does not touch the default binding
+    /// or the profile. Idempotent.
     SetPin {
         key: String,
         profile_id: String,
         pin: bool,
     },
-    /// Bind (or clear) a saved host's DEFAULT profile — `KnownHost::profile_id`, the one a
-    /// plain A-press on the primary tile connects with (the port design's WP5 leftover;
-    /// [`ConsoleCmd::SetPin`] is presentation, this is the binding). `key` is the HOST
-    /// row's key; `None` clears the binding. Idempotent like `SetPin`: re-binding the
-    /// bound profile is a no-op.
+    /// Bind or clear a saved host's default profile (`KnownHost::profile_id`).
+    /// [`Self::SetPin`] is presentation; this is the binding. `None` clears.
+    /// Idempotent.
     BindProfile {
         key: String,
         profile_id: Option<String>,
     },
-    /// Share (or stop sharing) this device's clipboard with a saved host while streaming —
-    /// `KnownHost::clipboard_sync`, the host menu's toggle. Per-host, never global:
-    /// handing a host your clipboard is a trust decision about that host.
-    SetClipboard { key: String, on: bool },
-    /// Open a screen the PLATFORM owns over the console (design android-skia-console-port.md
-    /// D7) — Android's connected-controllers view, the open-source licences. `id` is a
-    /// [`crate::platform::PlatformScreen::id`]. The host draws it, holds the console's input
-    /// while it is up, and the console never learns what it looked like. The desktop raises
-    /// none — its settings list has no such rows.
-    OpenPlatformScreen { id: String },
-    /// Something only the PLATFORM can do to a controller, raised by the controllers screen:
-    /// Android's USB / Bluetooth grant dialogs, a rumble pulse on the real `InputDevice`, the
-    /// DualSense pad-audio self test. `action` is a
-    /// [`crate::screens::controllers::PadAction::id`]; `pad_key` addresses one of
-    /// [`crate::screens::Ctx::pads`] and is empty for the actions that are about a device the
-    /// pad list cannot name (an SC2 in lizard mode is no input device at all).
-    ///
-    /// ONE parameterised command rather than one per button: the host's answer to every one
-    /// of them is the same shape — do the platform thing, report back as a notice — and a
-    /// command per grant would make adding the next pad a change in three crates.
-    PadAction { action: String, pad_key: String },
-    /// Invoke one of the host's own actions — sleep / restart / shut down it
-    /// (`design/host-actions.md`). Same lane and trust as [`ConsoleCmd::SendLogs`]; the host
-    /// re-checks this device's Host-power grant on arrival, so the row having existed grants
-    /// nothing. Parameterised by `action_id` for the same reason [`ConsoleCmd::PadAction`] is:
-    /// the host is free to grow the list, and a command per verb would make that a change in
-    /// three crates. The outcome arrives as a notice toast.
+    /// Per-host clipboard share while streaming (`KnownHost::clipboard_sync`).
+    /// Never global.
+    SetClipboard {
+        key: String,
+        on: bool,
+    },
+    /// Open a platform-owned overlay (`design/android-skia-console-port.md`).
+    /// `id` is [`crate::platform::PlatformScreen::id`]. The host draws it and holds
+    /// input; the console never sees the pixels. Desktop raises none.
+    OpenPlatformScreen {
+        id: String,
+    },
+    /// Platform-only pad work. `action` is [`crate::screens::controllers::PadAction::id`];
+    /// `pad_key` indexes [`crate::screens::Ctx::pads`] and is empty when the pad list
+    /// cannot name the device. One command, not one per button: the host's answer is
+    /// always "do it, report as a notice", and a command per grant would span three crates.
+    PadAction {
+        action: String,
+        pad_key: String,
+    },
+    /// Invoke a host action (`design/host-actions.md`). Same lane as [`Self::SendLogs`].
+    /// Parameterised by `action_id` like [`Self::PadAction`]: a command per verb would
+    /// span three crates. Outcome is a notice toast.
     HostAction {
         addr: String,
         mgmt: u16,
         fp_hex: String,
         host_name: String,
-        /// The action's stable id (`power.sleep`).
+        /// Stable id (`power.sleep`).
         action_id: String,
-        /// Its resolved label, for the toast — so the service thread need not re-derive
-        /// wording the screen has already settled.
+        /// Resolved label for the toast — the service thread must not re-derive wording
+        /// the screen already settled.
         label: String,
     },
 }
 
-/// The overlay→binary command queue. A plain deque under the same locking discipline as
-/// the shared models — the service thread drains it on a short cadence (it's never
-/// latency-critical: every command's effect arrives via a model snapshot anyway).
+/// Overlay→binary command queue. Same locking as the shared models. Drain cadence
+/// is not latency-critical: every effect arrives via a model snapshot.
 #[derive(Clone, Default)]
 pub struct ConsoleBus(Arc<Mutex<VecDeque<ConsoleCmd>>>);
 
 impl ConsoleBus {
-    /// Queue a command. Normally the shell's side; the binary may also seed one (the
-    /// direct-entry library fetch) — same lane, same handler.
+    /// Queue a command. The binary may seed one too (direct-entry library fetch) —
+    /// same lane, same handler.
     pub fn send(&self, cmd: ConsoleCmd) {
         self.0.lock().unwrap().push_back(cmd);
     }
 
-    /// Binary side: drain everything queued since the last call.
     pub fn drain(&self) -> Vec<ConsoleCmd> {
         self.0.lock().unwrap().drain(..).collect()
     }

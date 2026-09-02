@@ -1,17 +1,15 @@
-//! In-memory capture of the host's own log stream for the web console.
+//! In-memory tail of the host's own log stream for the web console.
 //!
-//! A `tracing` layer tees every event at DEBUG and above — independent of the `RUST_LOG` filter
-//! that gates stderr/file output — into a bounded in-process ring, and the management API serves
-//! it as `GET /api/v1/logs` (see `mgmt.rs`). That gives an operator the host's recent logs from
-//! the web console without shell access to the box, which is where gamepad-driver / capture /
-//! encoder failures otherwise go to die ("it just doesn't work" bug reports).
+//! A `tracing` layer tees every event at DEBUG and above — independent of
+//! `RUST_LOG` — into a bounded ring. `GET /api/v1/logs` (see `mgmt.rs`) serves
+//! it so an operator can read recent host logs without shell access.
 //!
-//! The ring keeps the *newest* [`CAPACITY`] entries (a log tail — unlike the stats recorder,
-//! which keeps the head of a capture). Readers poll with an `after` sequence cursor.
+//! Newest [`CAPACITY`] entries; readers poll with an `after` sequence cursor.
+//! Unlike the stats recorder, this is a tail, not a head.
 //!
-//! `log`-crate events (arriving via the tracing-log bridge) are normalized to their real module
-//! path, and known-chatty third-party targets ([`NOISY_DEBUG_TARGETS`]) are demoted to
-//! INFO-and-up so ambient LAN noise can't evict the tail the ring exists to preserve.
+//! `log`-crate events (via the tracing-log bridge) are normalized to their
+//! real module path. [`NOISY_DEBUG_TARGETS`] drop DEBUG/TRACE so LAN chatter
+//! cannot evict the diagnostics the ring exists to keep.
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -26,32 +24,27 @@ const MAX_MSG: usize = 2048;
 /// Hard cap on entries returned per poll (the client immediately re-polls to drain a backlog).
 pub const MAX_PAGE: usize = 1000;
 
-/// One captured log event.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct LogEntry {
     /// Monotonic sequence number (1-based) — pass the last one back as the `after` cursor.
     pub seq: u64,
-    /// Unix timestamp in milliseconds.
     pub ts_ms: u64,
     /// `ERROR` | `WARN` | `INFO` | `DEBUG` | `TRACE`.
     pub level: String,
-    /// The emitting module path (tracing target).
     pub target: String,
-    /// The formatted message, structured fields appended as `key=value`.
+    /// Formatted message; structured fields appended as `key=value`.
     pub msg: String,
 }
 
-/// One poll's worth of log entries.
 #[derive(Serialize, Deserialize, ToSchema, Debug)]
 pub struct LogPage {
     pub entries: Vec<LogEntry>,
-    /// Cursor for the next poll (the last returned seq, or the request's `after` when empty).
+    /// Last returned seq, or the request's `after` when the page is empty.
     pub next: u64,
-    /// True when entries between `after` and the first returned one were already evicted.
+    /// Entries between `after` and the first returned one were already evicted.
     pub dropped: bool,
 }
 
-/// The process-wide log ring (see [`ring`]).
 pub struct LogRing {
     inner: Mutex<Inner>,
 }
@@ -80,19 +73,10 @@ impl LogRing {
         self.push_entry(level.to_string(), target.to_string(), msg, ts_ms);
     }
 
-    /// Ingest a line that was produced in **another process** — the plugin/script runner, via
-    /// `POST /plugins/logs` (see `mgmt::plugins::ingest_plugin_logs`).
-    ///
-    /// Plugins are not host child processes: the runner is a separate bun process that `import()`s
-    /// each plugin in-process, so a plugin's output never passes through this process's `tracing`
-    /// and [`RingLayer`] can't see it. Without this door the console's log page shows nothing about
-    /// the plugins at all, and on Windows nothing else does either — the runner task writes no log
-    /// file, so a failing plugin was diagnosable only by stopping the task and re-running it by
-    /// hand (field report 2026-08-03, the VirtualHere plugin).
-    ///
-    /// The caller's `ts_ms` is kept — the line was stamped when it happened, and re-stamping it on
-    /// arrival would collapse a whole batch onto the moment it was flushed. `seq` stays ours: it is
-    /// the cursor for a single ring with several producers, so only the ring can mint it.
+    /// Ingest a line produced outside this process (`POST /plugins/logs`).
+    /// Plugin runners are separate processes, so [`RingLayer`] never sees them.
+    /// Keep the caller's `ts_ms` (a flushed batch must not collapse onto arrival).
+    /// `seq` stays the ring's: one cursor, several producers.
     pub fn push_remote(&self, level: &str, target: &str, msg: &str, ts_ms: u64) {
         self.push_entry(
             normalize_level(level).to_string(),
@@ -118,7 +102,6 @@ impl LogRing {
         });
     }
 
-    /// Entries with `seq > after`, oldest first, capped at `limit` (≤ [`MAX_PAGE`]).
     pub fn since(&self, after: u64, limit: usize) -> LogPage {
         let limit = limit.clamp(1, MAX_PAGE);
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -144,17 +127,15 @@ impl LogRing {
     }
 }
 
-/// The process-wide ring — a `OnceLock` singleton so the tracing layer (installed in `main()`
-/// before any host state exists) and the mgmt handler share it without threading an `Arc`.
+/// Process-wide ring. `OnceLock` so the tracing layer (installed in `main`
+/// before host state exists) and the mgmt handler share it without an `Arc`.
 pub fn ring() -> &'static LogRing {
     static RING: OnceLock<LogRing> = OnceLock::new();
     RING.get_or_init(LogRing::new)
 }
 
-/// Coerce an externally-supplied level to the five the console's filter ranks. Anything else —
-/// a plugin inventing `NOTICE`, a truncated line, empty — becomes `INFO` rather than being
-/// rejected: an unfamiliar level is not a reason to drop the operator's diagnostics on the floor,
-/// and an unranked string would sort as `0` in the console's `RANK` map and hide under every filter.
+/// Coerce an external level to the five the console filter ranks.
+/// Unknown / empty becomes `INFO`: an unranked string sorts as `0` and hides.
 fn normalize_level(level: &str) -> &'static str {
     match level.trim().to_ascii_uppercase().as_str() {
         "ERROR" | "FATAL" | "SEVERE" => "ERROR",
@@ -165,7 +146,6 @@ fn normalize_level(level: &str) -> &'static str {
     }
 }
 
-/// Cap a message at [`MAX_MSG`], cutting on a char boundary and marking the elision.
 fn truncate_msg(mut msg: String) -> String {
     if msg.len() > MAX_MSG {
         let mut end = MAX_MSG;
@@ -178,12 +158,9 @@ fn truncate_msg(mut msg: String) -> String {
     msg
 }
 
-/// Targets whose DEBUG/TRACE output is steady-state chatter, not diagnostics — left in, they evict
-/// the entire ring tail: `mdns_sd` DEBUG-logs every multicast packet it can't parse (one chatty
-/// AirPlay/HomePod device on the LAN floods thousands of entries per hour), and `wasapi` DEBUG-logs
-/// the default audio device once a second (the device-watchdog poll). The ring keeps their
-/// INFO-and-up; the file/stderr filter caps them separately (see `main`'s EnvFilter directives).
-/// Prefix-matched on module path boundaries.
+/// DEBUG/TRACE from these modules is steady chatter and would evict the tail.
+/// The ring keeps their INFO-and-up; the file/stderr EnvFilter caps them
+/// separately. Prefix-matched on module-path boundaries.
 const NOISY_DEBUG_TARGETS: &[&str] = &["mdns_sd", "wasapi"];
 
 fn is_noisy_debug(target: &str) -> bool {
@@ -194,14 +171,11 @@ fn is_noisy_debug(target: &str) -> bool {
     })
 }
 
-/// Init the `log`→`tracing` bridge and install `subscriber` as the global default. Replaces
-/// `SubscriberInitExt::init()` (which auto-inits the bridge with no crate filtering) so we can
-/// **drop the `wasapi` crate's records at the bridge**: it polls the default audio device ~1×/s
-/// and `log::debug!`s it, and those bridged events carry the bridge shim target at *filter* time,
-/// so a downstream level/target filter on the file layer can't catch them (the ring can, in
-/// `on_event`, via `normalized_metadata` — but the fmt layer filters pre-event). `ignore_crate`
-/// stops them at the source, before they ever become tracing events, so neither sink sees them.
-/// The bridge max-level stays DEBUG so every *other* `log`-crate dependency still reaches the ring.
+/// Init the `log`→`tracing` bridge and install `subscriber` as the global
+/// default. Replaces `SubscriberInitExt::init()` so `wasapi` can be dropped
+/// at the bridge: those records carry the shim target at filter time, so a
+/// file-layer target filter cannot catch them. Bridge max-level stays DEBUG
+/// so every other `log` crate still reaches the ring.
 pub fn install_global<S>(subscriber: S)
 where
     S: tracing::Subscriber + Send + Sync + 'static,
@@ -213,9 +187,8 @@ where
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
-/// The tee: a `tracing_subscriber` layer pushing every event into [`ring`]. Install with a
-/// per-layer `LevelFilter::DEBUG` so the ring sees DEBUG even when `RUST_LOG` keeps stderr at
-/// `info` (remote debugging must not require a restart with a different env).
+/// Tee every event into [`ring`]. Install with per-layer `LevelFilter::DEBUG`
+/// so the ring sees DEBUG even when `RUST_LOG` keeps stderr at `info`.
 pub struct RingLayer;
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingLayer {
@@ -224,9 +197,8 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingLayer {
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        // Events from `log`-crate dependencies arrive through the tracing-log bridge under the
-        // shim target "log"; normalize back to the record's real module path so the console's
-        // target column and the noise gate below see `mdns_sd::…`.
+        // `log`-crate events arrive under the bridge shim target `"log"`;
+        // normalize to the real module path so the noise gate sees `mdns_sd::…`.
         use tracing_log::NormalizeEvent;
         let normalized = event.normalized_metadata();
         let meta = normalized.as_ref().unwrap_or_else(|| event.metadata());
@@ -239,8 +211,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingLayer {
     }
 }
 
-/// Formats an event's fields like the default fmt layer: the `message` field first, every other
-/// field appended as ` key=value`.
+/// Default-fmt shape: `message` first, every other field as ` key=value`.
 #[derive(Default)]
 struct FieldFmt {
     msg: String,
@@ -253,8 +224,7 @@ impl tracing::field::Visit for FieldFmt {
         if field.name() == "message" {
             let _ = write!(self.msg, "{value:?}");
         } else if !field.name().starts_with("log.") {
-            // `log.target`/`log.file`/… are tracing-log bridge bookkeeping (already surfaced via
-            // the normalized target), same suppression as the stderr fmt layer.
+            // `log.*` is tracing-log bookkeeping; already on the normalized target.
             let _ = write!(self.fields, " {}={:?}", field.name(), value);
         }
     }
@@ -295,18 +265,15 @@ mod tests {
         let ring = LogRing::new();
         push_n(&ring, 10);
 
-        // Full backfill from 0.
         let page = ring.since(0, 100);
         assert_eq!(page.entries.len(), 10);
         assert_eq!(page.next, 10);
         assert!(!page.dropped);
 
-        // Incremental: nothing new.
         let page = ring.since(10, 100);
         assert!(page.entries.is_empty());
         assert_eq!(page.next, 10);
 
-        // Incremental: partial.
         let page = ring.since(4, 3);
         assert_eq!(
             page.entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
@@ -320,7 +287,7 @@ mod tests {
     fn eviction_reports_dropped() {
         let ring = LogRing::new();
         push_n(&ring, CAPACITY + 50);
-        // Seqs 1..=50 were evicted; a cursor inside the gap must flag it.
+        // Cursor inside the evicted gap must set `dropped`.
         let page = ring.since(10, 5);
         assert!(page.dropped);
         assert_eq!(page.entries.first().map(|e| e.seq), Some(51));
@@ -374,8 +341,8 @@ mod tests {
     fn log_bridge_events_normalize_target_and_noisy_debug_is_dropped() {
         use tracing_subscriber::layer::SubscriberExt;
 
-        // Route `log` records into tracing (what SubscriberInitExt::init does in main). Global,
-        // so tolerate a prior install; max_level explicit so debug! records reach the bridge.
+        // Global `LogTracer`; tolerate a prior install. Explicit max_level so
+        // `debug!` records reach the bridge.
         let _ = tracing_log::LogTracer::init();
         log::set_max_level(log::LevelFilter::Trace);
 
@@ -398,10 +365,8 @@ mod tests {
             .iter()
             .find(|e| e.msg.contains("a real mdns problem"))
             .expect("noisy-target WARN kept");
-        // Normalized off the bridge's "log" shim, and the log.* bookkeeping fields are hidden.
         assert_eq!(warn.target, "mdns_sd::service_daemon");
         assert!(!warn.msg.contains("log.target"), "msg: {}", warn.msg);
-        // Prefix match respects module-path boundaries.
         assert!(page.entries.iter().any(|e| e.target == "mdns_sdx"));
     }
 
@@ -420,7 +385,6 @@ mod tests {
         assert_eq!(remote.level, "WARN");
         assert_eq!(remote.target, "plugin:virtualhere");
         assert_eq!(remote.msg, "remote");
-        // Stamped when it happened, not when the batch arrived.
         assert_eq!(remote.ts_ms, 1_700_000_000_123);
     }
 

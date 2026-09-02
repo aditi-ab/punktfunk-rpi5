@@ -1,13 +1,14 @@
-//! The isolated zero-copy GPU-import worker (`punktfunk-host zerocopy-worker`; design:
-//! `design/zerocopy-worker-isolation.md`). It owns the fragile driver stack — the headless
-//! EGLDisplay + GL context, the CUDA context, and the Vulkan bridge — so that a driver fault on a
-//! producer-invalidated dmabuf (the `cuGraphicsMapResources` SIGSEGV the F44 Game→Desktop switch
-//! reproduced) kills THIS process, not the streaming host. The host observes the dead socket,
-//! fails the frame cleanly, and its existing capture-loss rebuild takes over.
+//! Isolated GPU-import worker (`punktfunk-host zerocopy-worker`).
 //!
-//! One worker serves one capture (spawned per `pipewire_thread`). It exits on socket EOF — which
-//! only happens after the capturer AND every in-flight frame on the host side are gone, so pooled
-//! device memory is never freed under a frame the host still reads.
+//! Owns the headless EGLDisplay + GL context, the CUDA context, and the Vulkan bridge so a
+//! driver fault on a producer-invalidated dmabuf kills this process, not the streaming host.
+//! The host sees the dead socket, fails the frame, and the capture-loss rebuild takes over.
+//!
+//! One worker per capture (spawned per `pipewire_thread`). Exits on socket EOF, which the host
+//! sends only after the capturer and every in-flight frame are gone, so pooled device memory
+//! is never freed under a live mapping.
+//!
+//! Design: `design/zerocopy-worker-isolation.md`.
 
 use super::cuda::{self, CUdeviceptr, DeviceBuffer};
 use super::egl::{DmabufPlane, EglImporter};
@@ -18,16 +19,13 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
-/// Cap on cached per-key dmabuf fds. PipeWire buffer pools are ≤ ~16 buffers; the cap only
-/// matters if a misbehaving producer churns buffers without a renegotiation.
+/// PipeWire pools are ≤ ~16; 64 only applies if a producer churns fds without renegotiating.
 const FD_CACHE_CAP: usize = 64;
 
-/// Entry point for the hidden `zerocopy-worker` subcommand. `args` are the subcommand's own
-/// arguments (`--fd N`, default 3 — the socket end the spawning host `dup2`'d in).
+/// Hidden `zerocopy-worker` subcommand. `--fd N` (default 3) is the socket the host `dup2`'d in.
 pub fn run_from_args(args: &[String]) -> Result<()> {
-    // The host execs this worker through its pinned exe fd (`ipc::self_exe`), so the kernel
-    // derives our comm from the exec path's basename — a meaningless fd number. Rename so
-    // `top`/`pkill` see the worker.
+    // Host execs via pinned exe fd (`ipc::self_exe`); kernel comm is that path's basename (an
+    // fd number). Rename so `top`/`pkill` see the worker.
     // SAFETY: `PR_SET_NAME` copies at most 16 bytes from the given pointer; the C-string literal
     // is valid, NUL-terminated, and short enough. No pointer is retained past the call.
     unsafe {
@@ -41,11 +39,9 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
         .transpose()
         .context("parse --fd")?
         .unwrap_or(3);
-    // Refuse to adopt anything that cannot be the spawning host's socket: a negative fd is
-    // outright UB inside `OwnedFd` (its niche), and 0–2 would make this worker close one of its
-    // own stdio streams on exit. Then confirm the number actually holds an open socket — the
-    // subcommand is hidden but runnable by hand, and adopting an arbitrary inherited fd would
-    // close it behind its real owner.
+    // Negative fd is UB in `OwnedFd`'s niche; 0–2 would close stdio on drop. `fstat` then
+    // confirms an open socket: this hidden subcommand is runnable by hand, and adopting an
+    // inherited fd would close it behind its real owner.
     anyhow::ensure!(fd >= 3, "--fd must be >= 3 (got {fd})");
     // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value, so
     // `mem::zeroed()` is a sound initializer; `fstat` writes into the live, correctly-sized
@@ -63,13 +59,11 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
     run(sock)
 }
 
-/// Bring up the GPU stack, report readiness, and serve until the host goes away.
 fn run(sock: OwnedFd) -> Result<()> {
     let importer = match EglImporter::new() {
         Ok(i) => i,
         Err(e) => {
-            // Init failure is an ANSWER, not a crash: the host falls back to the CPU path,
-            // exactly like an in-process `EglImporter::new()` failure.
+            // Init failure is an answer, not a crash: the host falls back to the CPU path.
             let _ = ipc::send(
                 sock.as_fd(),
                 &Reply::InitErr {
@@ -93,18 +87,15 @@ fn run(sock: OwnedFd) -> Result<()> {
     serve(&sock, &mut backend)
 }
 
-/// What [`serve`] needs from an import implementation — split out so the dispatch loop is
-/// unit-testable without a GPU.
+/// Import surface for [`serve`]. Split out so the dispatch loop is unit-testable without a GPU.
 pub(crate) trait ImportBackend {
     fn modifiers(&mut self, fourcc: u32) -> Vec<u64>;
-    /// Answers with [`Reply::Frame`] (buffer id + [`BufferDesc`] iff first delivery of that id),
-    /// [`Reply::NeedFd`] (this side lacks the key's fd — host resends it once), or [`Reply::Err`].
+    /// Desc only on first delivery of that id. [`Reply::NeedFd`]: host resends the fd once.
     fn import(&mut self, req: &ImportReq, fd: Option<OwnedFd>) -> Reply;
     fn release(&mut self, id: u32);
     fn clear_cache(&mut self);
 }
 
-/// The [`Request::Import`] fields, destructured for [`ImportBackend::import`].
 pub(crate) struct ImportReq {
     pub key: u64,
     pub kind: ImportKind,
@@ -117,8 +108,7 @@ pub(crate) struct ImportReq {
     pub has_fd: bool,
 }
 
-/// The request loop. Returns `Ok(())` on host EOF (normal end-of-life); any other socket error
-/// propagates (the process exits — the host treats it like a death, which it is).
+/// `Ok(())` on host EOF (normal end); any other socket error kills the process.
 pub(crate) fn serve(sock: &OwnedFd, backend: &mut dyn ImportBackend) -> Result<()> {
     let mut buf = Vec::new();
     loop {
@@ -169,7 +159,7 @@ pub(crate) fn serve(sock: &OwnedFd, backend: &mut dyn ImportBackend) -> Result<(
     }
 }
 
-/// Send a reply; `Ok(true)` means the host is gone (EPIPE) and the loop should end quietly.
+/// `Ok(true)`: host is gone (EPIPE); the loop should end quietly.
 fn send_or_eof(sock: &OwnedFd, reply: &Reply) -> Result<bool> {
     match ipc::send(sock.as_fd(), reply, None) {
         Ok(()) => Ok(false),
@@ -178,27 +168,19 @@ fn send_or_eof(sock: &OwnedFd, reply: &Reply) -> Result<bool> {
     }
 }
 
-/// The real backend: the in-process [`EglImporter`] plus the cross-process bookkeeping —
-/// per-key dmabuf fds, in-flight frames (held until `Release`), and stable buffer ids.
 struct EglBackend {
     importer: EglImporter,
-    /// The dmabuf fd for each host key (`st_ino`), kept because the tiled path re-imports the fd
-    /// every frame (`eglCreateImage`) and the LINEAR path caches per fd inside the Vulkan bridge.
+    /// Dmabuf fd per host key (`st_ino`). Tiled re-imports every frame (`eglCreateImage`); LINEAR
+    /// caches per fd inside the Vulkan bridge.
     fds: HashMap<u64, OwnedFd>,
-    /// Insertion order of `fds` keys for the LRU cap.
     fd_lru: VecDeque<u64>,
-    /// Frames delivered to the host and not yet released — holding the `DeviceBuffer` is what
-    /// keeps its device memory alive (pool `Arc`s) while the host encodes from it.
+    /// The `DeviceBuffer` keeps pool `Arc`s alive while the host encodes.
     inflight: HashMap<u32, DeviceBuffer>,
-    /// Buffer id per device allocation. Valid only within one pool generation: pools never free
-    /// allocations while alive, so a device VA can't repeat until a size change replaces the pool
-    /// — at which point [`Self::note_dims`] clears this map, as does `ClearCache` (the host
-    /// retires its IPC mappings on that boundary). Ids themselves are never reused; `next_id`
-    /// only counts up.
+    /// Valid for one pool generation: a VA cannot repeat until a size change replaces the pool
+    /// (`note_dims` / `ClearCache` clear this). Ids never reuse; `next_id` only counts up.
     ids: HashMap<CUdeviceptr, u32>,
     next_id: u32,
-    /// The (kind, width, height) of the last import — a change means the importer replaced its
-    /// pool, invalidating the VA→id map (see [`Self::ids`]).
+    /// A change means the importer replaced its pool, so the VA→id map is invalid (see [`Self::ids`]).
     last_shape: Option<(ImportKind, u32, u32)>,
 }
 
@@ -215,8 +197,7 @@ impl EglBackend {
         }
     }
 
-    /// Store (or replace) the cached fd for `key`, evicting beyond the cap. A replaced or
-    /// evicted fd is first forgotten by the Vulkan bridge so its per-fd import can't go stale.
+    /// Forget a replaced or evicted fd in the Vulkan bridge first so its per-fd import cannot go stale.
     fn store_fd(&mut self, key: u64, fd: OwnedFd) {
         if let Some(old) = self.fds.insert(key, fd) {
             self.importer.forget_linear_fd(old.as_raw_fd());
@@ -233,8 +214,6 @@ impl EglBackend {
         }
     }
 
-    /// Clear the VA→id map when the importer is about to replace its per-size pool (see
-    /// [`Self::ids`]).
     fn note_dims(&mut self, kind: ImportKind, width: u32, height: u32) {
         if self.last_shape != Some((kind, width, height)) {
             self.last_shape = Some((kind, width, height));
@@ -257,8 +236,7 @@ impl ImportBackend for EglBackend {
             };
         }
         let Some(raw) = self.fds.get(&req.key).map(|f| f.as_raw_fd()) else {
-            // We no longer hold this buffer's fd (LRU eviction / cache desync) — ask the host to
-            // resend it rather than failing the frame.
+            // LRU eviction / cache desync: ask the host to resend the fd rather than fail the frame.
             return Reply::NeedFd;
         };
         match self.import_inner(req, raw) {
@@ -281,18 +259,15 @@ impl ImportBackend for EglBackend {
         }
         self.fd_lru.clear();
         self.importer.clear_linear_cache();
-        // ClearCache is the generation boundary the HOST retires its CUDA IPC mappings on: it
-        // closes every mapping the renegotiated-away generation opened (keeping only ones still
-        // under an in-flight frame, until they release). Forget the VA→id map so anything
-        // delivered after this point gets a fresh id WITH its descriptor — re-delivering an old
-        // id would reference a mapping the host just closed. Ids never repeat (`next_id` only
-        // counts up), so fresh ids can't collide with the host's graveyard.
+        // Host retires CUDA IPC mappings here (except those still under an in-flight frame).
+        // Forget VA→id so the next delivery gets a fresh id WITH its descriptor; reusing an
+        // old id would name a mapping the host just closed. `next_id` only counts up, so
+        // fresh ids cannot collide with retired ones.
         self.ids.clear();
     }
 }
 
 impl EglBackend {
-    /// The fallible core of [`ImportBackend::import`], once the fd for `req.key` is resolved.
     fn import_inner(&mut self, req: &ImportReq, raw: i32) -> Result<(u32, Option<BufferDesc>)> {
         let plane = DmabufPlane {
             fd: raw,
@@ -324,7 +299,6 @@ impl EglBackend {
                 .importer
                 .import_linear_nv12(&plane, req.width, req.height)?,
         };
-        // Assign / look up the buffer's id and export its CUDA IPC identity on first delivery.
         cuda::make_current()?;
         let (id, desc) = match self.ids.get(&buf.ptr) {
             Some(&id) => (id, None),
@@ -352,8 +326,8 @@ impl EglBackend {
             }
         };
         if self.inflight.insert(id, buf).is_some() {
-            // A pool never hands out a buffer that hasn't been recycled, so a duplicate id means
-            // corrupted bookkeeping — fail the import rather than alias two frames.
+            // A pool never hands out a buffer that has not been recycled; a duplicate id would
+            // alias two frames.
             bail!("buffer id {id} already in flight");
         }
         Ok((id, desc))
@@ -365,9 +339,9 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
-    /// Identity (`st_ino`) of an open fd — what SCM_RIGHTS preserves across the socket while
-    /// re-numbering the descriptor. Lets the dispatch test assert the fd that ARRIVED is the one
-    /// the host sent, not merely that the JSON body claimed one.
+    /// `st_ino` of an open fd. SCM_RIGHTS preserves identity while re-numbering the descriptor;
+    /// the dispatch test asserts the arrived fd is the one the host sent, not just that JSON
+    /// claimed one.
     fn fd_ino(fd: impl AsRawFd) -> u64 {
         // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value, so
         // `mem::zeroed()` is a sound initializer. `fd` is a live descriptor owned by the caller;
@@ -380,7 +354,6 @@ mod tests {
         }
     }
 
-    /// Records calls; import behavior is scripted per key.
     struct MockBackend {
         calls: mpsc::Sender<String>,
         next: u32,
@@ -469,7 +442,6 @@ mod tests {
             }
         );
 
-        // First import delivers the desc; the second (same mock id sequence continues) doesn't.
         ipc::send(host.as_fd(), &import_req(1, false), None).unwrap();
         let (reply, _) = ipc::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
         match reply {
@@ -483,21 +455,19 @@ mod tests {
         let (reply, _) = ipc::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
         assert_eq!(reply, Reply::Frame { id: 1, desc: None });
 
-        // The descriptor itself must cross the socket: an import WITH an fd rides SCM_RIGHTS and
-        // the backend receives a live descriptor with the sender's identity — `serve` dropping the
-        // received fd (e.g. `backend.import(&req, None)`) would only be caught here.
+        // SCM_RIGHTS must deliver a live fd with the sender's identity. `serve` dropping it
+        // (`backend.import(&req, None)`) is only caught here.
         let (pr, _pw) = std::io::pipe().unwrap();
         let sent_ino = fd_ino(pr.as_fd().as_raw_fd());
         ipc::send(host.as_fd(), &import_req(3, true), Some(pr.as_fd())).unwrap();
         let (reply, _) = ipc::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
         assert_eq!(reply, Reply::Frame { id: 2, desc: None });
 
-        // A missing worker-side fd is a NeedFd reply (host resends), not a failure.
         ipc::send(host.as_fd(), &import_req(0xfeed, false), None).unwrap();
         let (reply, _) = ipc::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
         assert_eq!(reply, Reply::NeedFd);
 
-        // A failed import is an Err reply, not a dead worker.
+        // Failed import is an Err reply, not a dead worker.
         ipc::send(host.as_fd(), &import_req(0xbad, false), None).unwrap();
         let (reply, _) = ipc::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
         match reply {
@@ -505,11 +475,9 @@ mod tests {
             other => panic!("unexpected reply {other:?}"),
         }
 
-        // Fire-and-forget ops reach the backend without replies.
         ipc::send(host.as_fd(), &Request::Release { id: 0 }, None).unwrap();
         ipc::send(host.as_fd(), &Request::ClearCache, None).unwrap();
 
-        // Closing the host end terminates serve() cleanly.
         drop(host);
         join.join().unwrap().unwrap();
 

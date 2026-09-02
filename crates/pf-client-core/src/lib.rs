@@ -1,23 +1,15 @@
-//! Shared, UI-agnostic client plumbing, extracted verbatim from the GTK client
-//! (design: punktfunk-planning `linux-client-rearchitecture.md`, Phase 0) so the desktop
-//! shells and the Vulkan session binary build on one implementation — on Linux AND
-//! Windows (the session binary runs on both; macOS stays `wol`-only, clients/apple is
-//! the client there).
+//! UI-agnostic client plumbing for the desktop shells and the Vulkan session binary
+//! (Linux and Windows). macOS stays `wol`-only; `clients/apple` is the client there.
 //!
-//! Nothing here may depend on a UI toolkit: the presenter contract is `session`'s
-//! channels (`SessionHandle`) and `video`'s `DecodedImage` (RGBA bytes, dmabuf fds +
-//! plane layout, or a decoded VkImage) — how frames reach the screen is the consumer's
-//! business.
+//! Nothing here may depend on a UI toolkit. Frames reach the screen through `session`'s
+//! `SessionHandle` channels and `video`'s `DecodedImage` (RGBA, dmabuf fds, or a decoded
+//! VkImage).
 //!
-//! Audio is the one per-OS module swap: `audio.rs` (PipeWire) on Linux,
-//! `audio_wasapi.rs` (WASAPI) on Windows — same public surface, picked here by `#[path]`
-//! so `crate::audio` is the only name the session pump ever sees. `keymap` (evdev-keyed)
-//! stays Linux: the session path uses pf-presenter's SDL-scancode table instead.
+//! Audio is the one per-OS swap: `audio.rs` (PipeWire) vs `audio_wasapi.rs` (WASAPI),
+//! selected by `#[path]` so the session pump only names `crate::audio`. `keymap` stays
+//! Linux; the session path uses pf-presenter's SDL-scancode table.
 
-// Unsafe-proof program: every `unsafe {}` / `unsafe impl` in this crate carries a `// SAFETY:`
-// proof of why it is sound. This crate held ~91 unsafe items with NO enforcement while every
-// other subsystem crate denied it — the decoders' `unsafe impl Send`s had a one-line aside
-// instead of an argument precisely because nothing required one.
+// Every `unsafe` block and `unsafe impl` in this crate carries a `// SAFETY:` proof.
 
 #[cfg(any(target_os = "linux", windows))]
 mod au_dump;
@@ -26,114 +18,80 @@ pub mod audio;
 #[cfg(windows)]
 #[path = "audio_wasapi.rs"]
 pub mod audio;
-// The playback vitals both twins publish from their device callback and the decode thread logs
-// — atomics only, because the PipeWire callback runs on the graph's realtime loop.
+// Playback counters both audio backends publish. Atomics only: the PipeWire callback is the graph's realtime loop.
 #[cfg(any(target_os = "linux", windows))]
 pub mod audio_vitals;
-// Best-effort priority for the threads that FEED the device callbacks (decode leg, pad-audio
-// renderer, the WASAPI loops): rtkit / the Realtime portal on Linux, MMCSS on Windows.
+// Priority for threads that feed the device callbacks (decode, pad-audio, WASAPI). rtkit / Realtime portal on Linux, MMCSS on Windows.
 #[cfg(any(target_os = "linux", windows))]
 pub mod audio_rt;
 #[cfg(any(target_os = "linux", windows))]
 pub mod discovery;
 #[cfg(any(target_os = "linux", windows))]
 pub mod gamepad;
-// The menu-event vocabulary + synthesizer and the pad descriptors, portable: `gamepad`
-// (the SDL3 service) re-exports them on the desktop; the Android client feeds the same
-// synthesizer from Kotlin-captured pad samples (design/android-skia-console-port.md D4).
+// Menu-event synthesizer and pad descriptors. Desktop `gamepad` re-exports them; Android feeds the same synthesizer from Kotlin samples (`design/android-skia-console-port.md`).
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod menu_nav;
-// The audio-format vocabulary (`session` re-exports it) and the decoder-preference
-// migration (`video` re-exports it): two settings-screen inputs the console needs on
-// every platform, split out so the platform-bound modules can stay platform-bound.
+// Audio-format vocabulary (`session` re-exports) and decoder-preference migration (`video` re-exports). Split out so the platform-bound modules stay platform-bound.
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod audio_format;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod decoder_pref;
-// The console shell's platform-facing data types (actions it raises, pointer input,
-// session phases) — shared by the Vulkan session's overlay and the Android GL host.
+// Console actions, pointer input, and session phases. Shared by the Vulkan overlay and the Android GL host.
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod console;
 #[cfg(target_os = "linux")]
 pub mod keymap;
-// The library MODEL (`GameEntry`, `Artwork`, the running set) is portable — the Skia console
-// renders it on Android too; the ureq fetches inside the module stay desktop-gated.
+// Library model (`GameEntry`, `Artwork`, running set) is portable; the ureq fetches stay desktop-gated.
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod library;
 // Per-host catalog cache, so a library screen has titles to show while a sleeping host boots.
 #[cfg(any(target_os = "linux", windows))]
 pub mod library_cache;
-// Host actions — sleep/restart/shut down the host (design/host-actions.md §7). Android-enabled
-// for the MODEL half (the row type + labelling rules the console screens read); the ureq calls
-// inside stay desktop-gated, exactly like `library`, since Android dials the same routes through
-// its own mTLS OkHttp client.
+// Host power actions (`design/host-actions.md`). Android gets the row type and labels; ureq stays desktop-gated (Android uses OkHttp).
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod host_actions;
-// Android-enabled for the RING half (note/render — std only): the client's "Send logs to
-// host" needs the ring on every platform. The `send_to_host` uploader inside stays
-// desktop-gated with the rest of the ureq fetches; Android posts the rendered bundle
-// through its own mTLS OkHttp client (`SkiaConsole.sendLogs`).
+// Log ring (note/render, std only) on every platform. `send_to_host` stays desktop-gated; Android posts via OkHttp (`SkiaConsole.sendLogs`).
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod logring;
-// The `punktfunk://` grammar (design/client-deep-links.md §2): one parser/emitter for the
-// shells, the session and the CLI, held to the Swift/Kotlin ports by a shared vector file.
+// `punktfunk://` grammar (`design/client-deep-links.md`). One parser/emitter, held to the Swift/Kotlin ports by a shared vector file.
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod deeplink;
-// The brain layer (design/client-architecture-split.md §3): what a connect is, the wake
-// state machine every front-end drives, and the session spawn + stdout contract.
+// Connect, the wake state machine, and the session spawn + stdout contract (`design/client-architecture-split.md`).
 #[cfg(any(target_os = "linux", windows))]
 pub mod orchestrate;
-// The session's effective access, client-side (design/per-client-access.md §7): the
-// snapshot type over the shared grant vocabulary, the derived preset label, the overlay
-// chip's text and the AccessUpdate toast wording. Pure presentation logic — the
-// Apple/Android ports mirror its rules rather than link it. Gated with the session
-// modules only because macOS has no punktfunk-core dependency to name the grants with.
+// Session grant snapshot, overlay chip, and AccessUpdate toast (`design/per-client-access.md`).
+// Presentation only; Apple/Android mirror the rules. Gated with session: macOS has no punktfunk-core to name the grants.
 #[cfg(any(target_os = "linux", windows))]
 pub mod access;
-// The host's OS-identity chain (mDNS `os=` TXT): sanitize + icon-walk order. Pure string
-// logic, built everywhere (the Apple/Android ports mirror it rather than link it).
+// Host OS-identity from mDNS `os=` TXT: sanitize + icon-walk order. Apple/Android mirror it rather than link it.
 pub mod os;
-// "Are we really under gamescope?" — our flatpak exports the env var the naive test reads, so
-// every Gaming-Mode decision goes through here. Built everywhere: the answer is just "no" off
-// Linux, which keeps the callers free of cfgs.
+// Real gamescope compositor check. Built everywhere so callers stay cfg-free; off Linux the answer is no.
 pub mod gamescope;
-// "A system overlay owns the controller" for gamescope Gaming Mode — the signal behind the
-// gamepad input mask, which SDL's own focus gate structurally cannot provide there.
+// Gamescope overlay-owns-controller signal. SDL's focus gate cannot provide it in Gaming Mode; this drives the gamepad input mask.
 #[cfg(target_os = "linux")]
 pub mod overlay_focus;
-// The desktop's Omarchy theme (a state-dir file read + palette maths): the GTK shell's
-// recolour and the session console's follow-system palette both build from it.
+// Omarchy theme (state-dir file + palette). GTK recolour and the session follow-system palette both build from it.
 #[cfg(target_os = "linux")]
 pub mod omarchy;
-// Punktfunk's rows in the Omarchy menu (Super+Space) — opt-in, synced from the known-hosts
-// store by every binary that mutates it.
+// Opt-in Omarchy menu rows (Super+Space), synced from the known-hosts store by every binary that mutates it.
 #[cfg(target_os = "linux")]
 pub mod omarchy_menu;
-// The UI icon set (Lucide path data), shared by the Skia console and the GTK shell so one
-// mark cannot differ between them: pure data, every platform.
+// Lucide path data shared by Skia and GTK so a mark cannot differ between them.
 pub mod lucide;
-// The in-stream quick-action ring's setting (one JSON blob): pure data, every platform.
 pub mod overlay_actions;
-// The ring's portable contract (inputs, commands, session facts): pure data, every platform.
 pub mod ring;
-// Client settings profiles: the override catalog + the one connect-time resolver
-// (design/client-settings-profiles.md §4). Sits beside `trust`, which owns the host records
-// the bindings live on.
-// Pad audio (the 0xD1 plane): DualSense voice-coil haptics + speaker rendered on the wired
-// physical pad's own 4-ch audio device — correlation, the per-session renderer worker, and
-// the tier-A pad registry the gamepad worker feeds it through.
+// DualSense voice-coil + speaker on the pad's 4-ch device (0xD1 plane): correlation, per-session renderer, tier-A registry the gamepad worker feeds.
 #[cfg(any(target_os = "linux", windows))]
 pub mod pad_audio;
+// Override catalog + connect-time resolver (`design/client-settings-profiles.md`). Bindings live on `trust`'s host records.
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod profiles;
 #[cfg(any(target_os = "linux", windows))]
 pub mod session;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod trust;
-// "Is a newer client available, and can this box install it?" — the client half of the
-// signed-manifest update check the host already runs (design: host-update-from-web-console.md).
-// Linux only: the Windows client ships inside the host installer and the Mac one through
-// clients/apple, so neither has a package to reason about here.
+// Client half of the signed-manifest update check (`design/host-update-from-web-console.md`).
+// Linux only: Windows ships inside the host installer, macOS through `clients/apple`.
 #[cfg(target_os = "linux")]
 pub mod update;
 #[cfg(any(target_os = "linux", windows))]
@@ -142,44 +100,24 @@ pub mod video;
 mod video_color;
 #[cfg(any(target_os = "linux", windows))]
 mod video_software;
-// Native VAAPI decode (M6 of the native-decode program): pf-vaadec's plans driven
-// straight into libva, dlopen'd at runtime, exporting DRM-PRIME dmabufs the presenter
-// imports. Since M10 it is the ONLY VAAPI rung there is — the libavcodec one it
-// replaced is deleted — so `auto` reaches it wherever the vendor order puts VAAPI
-// first; `PUNKTFUNK_DECODER=native-vaapi` reaches it by pin regardless. See `video`'s
-// evidence table for what hardware has actually run it.
+// Native VAAPI: pf-vaadec plans into dlopen'd libva, DRM-PRIME dmabufs for the presenter.
+// Only VAAPI rung; `auto` reaches it when vendor order puts VAAPI first, or pin `PUNKTFUNK_DECODER=native-vaapi`. Evidence: `video`.
 #[cfg(target_os = "linux")]
 pub mod video_vaapi_native;
-// Native Vulkan Video decode (WP-C of the native-decode program, HEVC added by M3
-// WP-2, AV1 by M7): pf-vkdecode's H.264/H.265/AV1 decoders on the presenter's shared
-// device — auto's TOP rung on both desktop OSes since M9, for all three codecs (each
-// leg has hardware parity against libavcodec; see `video`'s evidence table), also
-// pinnable via `PUNKTFUNK_DECODER=native-vulkan`.
+// Native Vulkan Video (H.264/H.265/AV1) on the presenter's device. Auto's top rung on both desktop OSes; pin `PUNKTFUNK_DECODER=native-vulkan`. Evidence: `video`.
 #[cfg(any(target_os = "linux", windows))]
 mod video_vk_native;
-// The OS-clipboard bridge for the shared clipboard (design/clipboard-and-file-transfer.md §5).
-// Built everywhere the session client is; the platform seam inside is Windows-real,
-// stub elsewhere.
+// OS clipboard bridge (`design/clipboard-and-file-transfer.md`). Session clients; Windows-real, stub elsewhere.
 #[cfg(any(target_os = "linux", windows))]
 pub mod clipboard;
-// PyroWave decode — Linux + Windows (plan §4.5; the Apple Metal port is its own phase).
-// Windows joined once its client moved to the SAME spawned Vulkan session presenter as
-// Linux's: the decoder is plain Vulkan compute on the presenter's device (no fds, no
-// dmabuf, no D3D11 interop), so the old "Windows present-path decision" that gated it
-// resolved itself — the present path is now literally the same code.
-// D3D11 decode-device plumbing: the shareable-texture hand-off ring, the decode-device
-// creation and `display_hdr_volume`. Field-proven, FFmpeg-free code that
-// `video_d3d11_native` (and `clients/session`) build on; the libavcodec DECODER that used
-// to live alongside it went with M10's excision.
+// D3D11 decode-device: shareable-texture hand-off ring, device creation, `display_hdr_volume`. `video_d3d11_native` and `clients/session` build on it.
 #[cfg(windows)]
 pub mod video_d3d11;
-// Native D3D11VA (M5): `ID3D11VideoDecoder` driven from pf-bitstream plans, filling the
-// hand-off ring `video_d3d11` owns. Since M10 it is the only DXVA rung there is. In `auto`
-// for all three codecs, each of which now has hardware evidence — H.264/H.265 since M5, AV1
-// since 2026-08-07 — see `video`'s evidence table; `PUNKTFUNK_DECODER=native-d3d11va`
-// reaches every leg by pin.
+// Native D3D11VA: `ID3D11VideoDecoder` from pf-bitstream plans into `video_d3d11`'s hand-off ring.
+// Only DXVA rung; in `auto` for H.264/H.265/AV1. Pin `PUNKTFUNK_DECODER=native-d3d11va`. Evidence: `video`.
 #[cfg(windows)]
 pub mod video_d3d11_native;
+// PyroWave: Vulkan compute on the presenter's device (no fds, no dmabuf, no D3D11 interop). Linux + Windows; Apple Metal is a separate port.
 #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
 pub mod video_pyrowave;
 

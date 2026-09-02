@@ -1,33 +1,27 @@
-//! VAAPI dmabuf → Vulkan import: per-plane `VkImage`s (R8/GR88 for NV12 and full-chroma
-//! NV24, R16/GR1616 for 10-bit P010) with the
-//! surface's explicit DRM format modifier — the same layer-wise import the EGL presenter
-//! (`video_gl.rs`) proved on this hardware, minus the toolkit. Same-Mesa export/import
-//! is the contract; anything a driver rejects surfaces as a clean error and the caller
-//! demotes the decoder to software (never a black screen).
+//! VAAPI dmabuf → Vulkan import of per-plane `VkImage`s with the surface's
+//! explicit DRM format modifier.
+//!
+//! Formats: R8/R8G8 for NV12 and full-chroma NV24; R16/R16G16 for P010.
+//! Same-Mesa export/import is the contract. A driver rejection is a clean
+//! error; the caller demotes to software decode. EGL sibling: `video_gl.rs`.
 
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
 use pf_client_core::video::{DmabufFrame, DrmFrameGuard};
 use std::os::fd::{AsRawFd as _, BorrowedFd, IntoRawFd as _};
 
-/// `fourcc('N','V','1','2')` — 8-bit 4:2:0 VAAPI output.
+/// fourcc('N','V','1','2').
 const DRM_FORMAT_NV12: u32 = 0x3231_564e;
-/// `fourcc('P','0','1','0')` — 10-bit 4:2:0, 10 bits MSB-aligned in 16 (the HDR path).
+/// fourcc('P','0','1','0'). 10 bits MSB-aligned in 16.
 const DRM_FORMAT_P010: u32 = 0x3031_3050;
-/// `fourcc('N','V','2','4')` — 8-bit 4:4:4 semi-planar (full-size interleaved chroma
-/// plane): the 2-plane full-chroma export a VAAPI HEVC RExt decode can hand over. Same
-/// R8 + R8G8 views as NV12; the CSC shader keys chroma siting off the plane widths, so
-/// the full-size plane needs nothing else. (Intel's iHD prefers PACKED 4:4:4 exports —
-/// AYUV/Y410 — which are single-plane and would need their own CSC arm; those still
-/// demote to software decode. 10-bit 4:4:4 has no settled dmabuf fourcc at all.)
+/// fourcc('N','V','2','4'). CSC keys chroma siting off plane widths, so the
+/// full-size chroma plane needs no extra shader. Packed AYUV/Y410 is
+/// single-plane and still demotes.
 const DRM_FORMAT_NV24: u32 = 0x3432_564e;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
-/// `DRM_FORMAT_MOD_LINEAR` — the fallback when the export carried no explicit modifier.
+/// Fallback when the export carried no explicit modifier.
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
-/// The four device extensions the import path needs; queried at device creation. All
-/// Mesa drivers (RADV/ANV/radeonsi boxes) expose the set — NVIDIA proprietary has no
-/// usable VAAPI anyway, so the software path owns that vendor by design.
 pub const DEVICE_EXTENSIONS: [&std::ffi::CStr; 4] = [
     ash::ext::external_memory_dma_buf::NAME,
     ash::khr::external_memory_fd::NAME,
@@ -35,16 +29,15 @@ pub const DEVICE_EXTENSIONS: [&std::ffi::CStr; 4] = [
     ash::ext::queue_family_foreign::NAME,
 ];
 
-/// One imported frame: both plane images + their memory, and the decoder surface guard.
-/// GPU reads outlive the submit — the presenter parks this until the frame's fence has
-/// signaled, then calls [`HwFrame::destroy`] (which finally drops the guard).
+/// Imported frame. GPU reads outlive submit: park until the fence signals,
+/// then [`HwFrame::destroy`] (drops the decoder surface guard).
 pub struct HwFrame {
     pub luma_view: vk::ImageView,
     pub chroma_view: vk::ImageView,
     pub color: pf_client_core::video::ColorDesc,
     pub width: u32,
     pub height: u32,
-    /// 10-bit MSB-packed (P010) — the CSC picks its depth-exact rows off this.
+    /// Fourcc. CSC picks its P010 vs 8-bit rows off this.
     fourcc: u32,
     images: [vk::Image; 2],
     memories: [vk::DeviceMemory; 2],
@@ -53,12 +46,11 @@ pub struct HwFrame {
 }
 
 impl HwFrame {
-    /// 10-bit MSB-packed layout (P010)?
     pub fn is_p010(&self) -> bool {
         self.fourcc == DRM_FORMAT_P010
     }
 
-    /// The raw plane images — the presenter's foreign-acquire barriers need them.
+    /// Plane images for the presenter's foreign-acquire barriers.
     pub fn luma_image(&self) -> vk::Image {
         self.images[0]
     }
@@ -68,8 +60,8 @@ impl HwFrame {
     }
 
     pub fn destroy(self, device: &ash::Device) {
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: views, images, and memories are owned by `self`. Called only
+        // after the frame's fence has signaled, so the GPU is idle on them.
         unsafe {
             for v in self.views {
                 device.destroy_image_view(v, None);
@@ -81,21 +73,18 @@ impl HwFrame {
                 device.free_memory(m, None);
             }
         }
-        // _guard (the mapped AVFrame / VAAPI surface) drops here — after every GPU read.
+        // `_guard` drops after the GPU reads: the VAAPI surface stays mapped until here.
     }
 }
 
-/// Import one frame's two planes. Fails cleanly (caller demotes) on anything the driver
-/// rejects: unknown fourcc, unsupported modifier, import refusal.
+/// Import both planes. Driver rejection is a clean error; the caller demotes.
 pub fn import(
     device: &ash::Device,
     ext_mem_fd: &ash::khr::external_memory_fd::Device,
     frame: DmabufFrame,
 ) -> Result<HwFrame> {
-    // The demotion test hook (plan §8, Phase 2 acceptance): fault every import so the
-    // failure-streak → force_software → software-decode recovery is exercisable on any
-    // box, no broken driver required. Read per hw frame — demotion silences it within
-    // three frames, so the env lookup never runs hot.
+    // Test hook: fault every import so demotion is exercisable without a broken
+    // driver. Per-frame lookup is fine — demotion silences it within three frames.
     if std::env::var_os("PUNKTFUNK_HW_FAULT").is_some_and(|v| v == "import") {
         bail!("injected import failure (PUNKTFUNK_HW_FAULT=import)");
     }
@@ -108,8 +97,7 @@ pub fn import(
     if frame.planes.len() < 2 {
         bail!("2-plane YCbCr needs 2 planes (got {})", frame.planes.len());
     }
-    // EGL could leave an INVALID modifier to the driver's implied choice; explicit-
-    // modifier images can't — LINEAR is the only honest guess (debug-visible if wrong).
+    // Explicit-modifier images cannot take INVALID; LINEAR is the only honest guess.
     let modifier = if frame.modifier == DRM_FORMAT_MOD_INVALID {
         tracing::trace!("dmabuf carried no explicit modifier — importing as LINEAR");
         DRM_FORMAT_MOD_LINEAR
@@ -131,7 +119,6 @@ pub fn import(
         modifier,
     )
     .context("luma plane")?;
-    // 4:2:0 subsamples the chroma plane both ways; 4:4:4 (NV24) keeps it full-size.
     let (cw, ch) = if chroma_full_res {
         (frame.width, frame.height)
     } else {
@@ -144,10 +131,8 @@ pub fn import(
     {
         Ok(r) => r,
         Err(e) => {
-            // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and
-            // the GPU is known idle for them (the fence/queue-wait on the path here, or the
-            // swapchain being retired), which is the obligation that makes a destroy sound rather
-            // than the handle merely being non-null.
+            // SAFETY: `luma_img` / `luma_mem` were created in this call and never
+            // submitted, so the GPU is idle on them.
             unsafe {
                 device.destroy_image(luma_img, None);
                 device.free_memory(luma_mem, None);
@@ -157,9 +142,8 @@ pub fn import(
     };
 
     let view = |image, format| {
-        // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
-        // builder structs that are locals outliving the call; the handle it returns is owned by
-        // the value being built here.
+        // SAFETY: `image` is owned by this function; the create-info locals
+        // outlive the call.
         unsafe {
             device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
@@ -177,10 +161,8 @@ pub fn import(
         }
         .context("plane image view")
     };
-    // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and the GPU is
-    // known idle for them (the fence/queue-wait on the path here, or the swapchain being retired),
-    // which is the obligation that makes a destroy sound rather than the handle merely being non-
-    // null.
+    // SAFETY: luma/chroma image and memory were created in this call and never
+    // submitted, so the GPU is idle on them.
     let destroy_images = |views: &[vk::ImageView]| unsafe {
         for v in views {
             device.destroy_image_view(*v, None);
@@ -219,10 +201,8 @@ pub fn import(
     })
 }
 
-/// One single-plane image over a dmabuf plane: explicit-modifier tiling with the plane's
-/// (offset, pitch), external-memory dmabuf handle type, dedicated import of a dup'd fd
-/// (Vulkan takes ownership of the fd it's given; the frame guard keeps owning the
-/// original).
+/// One plane as an explicit-modifier image. Vulkan takes the fd it is given,
+/// so this dups; the frame guard keeps the original.
 #[allow(clippy::too_many_arguments)]
 fn plane_image(
     device: &ash::Device,
@@ -237,7 +217,7 @@ fn plane_image(
 ) -> Result<(vk::Image, vk::DeviceMemory)> {
     let plane_layouts = [vk::SubresourceLayout {
         offset: u64::from(offset),
-        size: 0, // must be 0 for imports (the driver derives it)
+        size: 0, // 0 on import: the driver derives size.
         row_pitch: u64::from(stride),
         array_pitch: 0,
         depth_pitch: 0,
@@ -247,8 +227,8 @@ fn plane_image(
         .plane_layouts(&plane_layouts);
     let mut external_info = vk::ExternalMemoryImageCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this type
-    // and live for the call, and every builder struct is a local that outlives it.
+    // SAFETY: create-info and pNext locals (`modifier_info`, `external_info`)
+    // outlive the call.
     let image = unsafe {
         device.create_image(
             &vk::ImageCreateInfo::default()
@@ -275,11 +255,9 @@ fn plane_image(
     })?;
 
     let result = (|| {
-        // The fd's importable memory types, intersected with the image's requirement.
         let mut fd_props = vk::MemoryFdPropertiesKHR::default();
-        // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
-        // builder structs that are locals outliving the call; the handle it returns is owned by
-        // the value being built here.
+        // SAFETY: `fd` is a live plane fd of the caller's `DmabufFrame`;
+        // `fd_props` is a local outliving the call.
         unsafe {
             ext_mem_fd.get_memory_fd_properties(
                 vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
@@ -288,8 +266,7 @@ fn plane_image(
             )
         }
         .context("vkGetMemoryFdPropertiesKHR")?;
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `image` was created above and has not been destroyed.
         let reqs = unsafe { device.get_image_memory_requirements(image) };
         let bits = reqs.memory_type_bits & fd_props.memory_type_bits;
         let type_index = (0..32u32)
@@ -297,9 +274,9 @@ fn plane_image(
             .context("no importable memory type for dmabuf")?;
 
         // Vulkan owns the fd it imports — dup so the decoder guard keeps the original.
-        // SAFETY: `fd` is open for the whole borrow — it is a plane fd of the caller's
-        // `DmabufFrame`, whose `DrmFrameGuard` (the thing that closes those fds) lives until
-        // `import` hands it to the `HwFrame`. The borrow ends at `try_clone_to_owned`, which dups.
+        // SAFETY: `fd` is a plane fd of the caller's `DmabufFrame`. `DrmFrameGuard`
+        // keeps those fds open until `import` moves it onto `HwFrame`. The borrow
+        // ends at `try_clone_to_owned`.
         let owned = unsafe { BorrowedFd::borrow_raw(fd) }
             .try_clone_to_owned()
             .context("dup dmabuf fd")?;
@@ -307,8 +284,8 @@ fn plane_image(
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
             .fd(owned.as_raw_fd());
         let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `import_info` and `dedicated` are locals that outlive the call.
+        // `import_info.fd` is `owned`'s dup, still open.
         let memory = unsafe {
             device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
@@ -320,16 +297,13 @@ fn plane_image(
             )
         }
         .context("import dmabuf memory")?;
-        // Vulkan takes the fd only on a SUCCESSFUL import, so release `owned` here and let it close
-        // the dup on every failure path above (`?` drops it) instead of leaking one fd per frame.
+        // Vulkan takes the fd only on a successful import. `into_raw_fd` here;
+        // `?` above still closes the dup.
         let _ = owned.into_raw_fd();
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `image` and `memory` were created above and are still owned here.
         if let Err(e) = unsafe { device.bind_image_memory(image, memory, 0) } {
-            // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and
-            // the GPU is known idle for them (the fence/queue-wait on the path here, or the
-            // swapchain being retired), which is the obligation that makes a destroy sound rather
-            // than the handle merely being non-null.
+            // SAFETY: `memory` was allocated in this call and never bound, so
+            // the GPU is idle on it.
             unsafe { device.free_memory(memory, None) };
             return Err(e).context("bind imported memory");
         }
@@ -339,10 +313,8 @@ fn plane_image(
     match result {
         Ok(memory) => Ok((image, memory)),
         Err(e) => {
-            // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and
-            // the GPU is known idle for them (the fence/queue-wait on the path here, or the
-            // swapchain being retired), which is the obligation that makes a destroy sound rather
-            // than the handle merely being non-null.
+            // SAFETY: `image` was created in this call and never bound, so the
+            // GPU is idle on it.
             unsafe { device.destroy_image(image, None) };
             Err(e)
         }

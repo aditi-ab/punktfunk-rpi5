@@ -1,23 +1,16 @@
-//! The **plugin store**: discovering and installing plugins from signed catalogs
-//! (design `plugin-store.md`).
+//! Plugin store: discover and install plugins from signed catalogs
+//! (`design/plugin-store.md`).
 //!
-//! Installing a plugin means running somebody's code with operator privileges, so the store is
-//! built around one idea: *the index is the verification gate*. A catalog entry pins one exact
-//! version and that version's tarball hash, and nothing here can express "track the latest
-//! release". Upstream can publish whatever they like; this host will keep offering the reviewed
-//! version until a newly reviewed entry lands in a signed index.
+//! Installing a plugin runs that code with operator privileges. The signed
+//! index is the verification gate: each entry pins one version and its tarball
+//! hash. Nothing here tracks "latest".
 //!
-//! That yields three tiers, which the whole surface is organized around:
+//! Three tiers: **verified** (built-in `unom` index, badged), **external**
+//! (operator-added index, attributed, no badge), **unverified** (raw spec in
+//! the console danger dialog — install only, never listed).
 //!
-//! | tier | where it came from | surfaced? |
-//! |------|--------------------|-----------|
-//! | **verified**   | the built-in `unom` source's index — unom reviewed this exact tarball | yes, with a badge |
-//! | **external**   | an operator-added source's index — pinned and integrity-checked, curated by somebody else | yes, attributed, no badge |
-//! | **unverified** | a raw package spec typed into the console's danger dialog | never listed; install only |
-//!
-//! This module is the domain half (catalog state, installed-package facts, trust decisions); the
-//! HTTP surface lives in [`crate::mgmt::store`]. Everything here is **blocking** — callers on the
-//! async side hand it to `spawn_blocking`.
+//! Domain half (catalog state, installed-package facts, trust). HTTP lives in
+//! [`crate::mgmt::store`]. Blocking; async callers use `spawn_blocking`.
 
 pub(crate) mod catalog;
 pub(crate) mod index;
@@ -31,40 +24,24 @@ use sources::Source;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
-/// How long a fetched catalog is considered fresh. Catalogs change when somebody reviews a
-/// release — hours, not seconds — and a streaming host should not be chatting to the internet on a
-/// timer for a page nobody has open.
+/// Six hours. Catalogs move when a review lands, not on a poll. Do not fetch
+/// while nobody has the store page open.
 const CATALOG_TTL_SECS: u64 = 6 * 60 * 60;
 
-/// Where plugin packages live: `<config_dir>/plugins` (the same dir the SDK and runner use).
+/// Same directory the SDK and runner use.
 pub(crate) fn plugins_dir() -> PathBuf {
     pf_paths::config_dir().join("plugins")
 }
 
-// ---------------------------------------------------------------- installed packages
-
-/// A plugin package present in the plugins dir.
 #[derive(Debug, Clone)]
 pub(crate) struct InstalledPkg {
     pub pkg: String,
     pub version: Option<String>,
 }
 
-/// The packages the operator actually asked for: the `dependencies` of the plugins dir's own
-/// `package.json`, which `bun add` maintains. `None` only when there is no readable `package.json`
-/// at all.
-///
-/// This is what separates a plugin from a plugin's *library*. `@punktfunk/plugin-kit` is the
-/// framework every kit-built plugin depends on — it matches the `plugin-*` naming convention
-/// exactly, lands in `node_modules` as a transitive dependency, and is emphatically not something
-/// the operator installed or can meaningfully uninstall. The convention alone cannot tell the two
-/// apart; the top-level dependency list can.
-///
-/// A `package.json` with **no** `dependencies` key returns an empty list, not `None`: `bun remove`
-/// drops the key entirely when the last plugin goes, and orphaned transitive packages can outlive
-/// it in `node_modules`. Falling back to the naming convention there resurrects a plugin's library
-/// as an installed plugin the moment you uninstall the last real one (seen on-glass). If bun is
-/// managing this tree at all, its answer is the answer — including when the answer is "nothing".
+/// Top-level `dependencies` of the plugins dir's `package.json`. `None` only
+/// when the file is unreadable. A missing `dependencies` key is `[]`: `bun
+/// remove` drops it, and a convention fallback would resurrect `plugin-kit`.
 fn top_level_deps(dir: &Path) -> Option<Vec<String>> {
     let bytes = std::fs::read(dir.join("package.json")).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
@@ -74,18 +51,10 @@ fn top_level_deps(dir: &Path) -> Option<Vec<String>> {
     })
 }
 
-/// Enumerate installed plugin packages under `<dir>/node_modules`.
-///
-/// Mirrors the runner's own discovery so the store never claims something is installed that the
-/// runner wouldn't supervise: the unscoped `punktfunk-plugin-*` convention, and **any** scope's
-/// `plugin-*` (`@punktfunk/plugin-rom-manager`, `@retro-hub/plugin-x`). Scoped-any is what makes a
-/// third-party catalog entry work at all — a scoped name is required for the registry mapping
-/// (D8), so discovery must not be limited to the first-party scope.
-///
-/// Then narrowed to [`top_level_deps`] when a dependency list exists, so a plugin's *dependencies*
-/// (notably `@punktfunk/plugin-kit`) aren't reported as installed plugins. A tree with no readable
-/// `package.json` — hand-assembled, or an older layout — falls back to the convention alone rather
-/// than reporting nothing.
+/// Same conventions as the runner: unscoped `punktfunk-plugin-*`, and any
+/// scope's `plugin-*`. When [`top_level_deps`] exists, only those names —
+/// otherwise a plugin's library (`@punktfunk/plugin-kit`) looks installed.
+/// No readable `package.json` falls back to the convention.
 pub(crate) fn installed_packages(dir: &Path) -> Vec<InstalledPkg> {
     let modules = dir.join("node_modules");
     let top_level = top_level_deps(dir);
@@ -96,7 +65,7 @@ pub(crate) fn installed_packages(dir: &Path) -> Vec<InstalledPkg> {
         v.get("version")?.as_str().map(str::to_string)
     };
     let Ok(entries) = std::fs::read_dir(&modules) else {
-        return out; // nothing installed yet
+        return out;
     };
     let mut names: Vec<String> = entries
         .filter_map(|e| e.ok())
@@ -137,13 +106,9 @@ pub(crate) fn installed_packages(dir: &Path) -> Vec<InstalledPkg> {
     out
 }
 
-/// A registry URL that is safe to write into a hand-formatted TOML string, and plausible as a
-/// registry: absolute https, bounded, and built only from characters that appear in a real URL.
-///
-/// Deliberately a strict allowlist rather than "reject quotes and newlines" — the failure this
-/// guards is TOML injection, and a denylist of the delimiters someone remembers is how the original
-/// `starts_with("https://")` check came to be the only guard at all. No quote, no whitespace, no
-/// control character, no backslash can pass, so `"{scope}" = "{url}"` cannot be closed early.
+/// Hand-formatted into TOML as `"{scope}" = "{url}"`. Do not switch to a
+/// denylist of quotes and newlines. No quote, whitespace, control, or
+/// backslash can pass.
 fn valid_registry_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
@@ -180,28 +145,13 @@ fn valid_registry_url(url: &str) -> bool {
         })
 }
 
-/// Point a package scope at its registry in the plugins dir's `bunfig.toml`.
-///
-/// The runner CLI can do this too (`--registry @scope=URL`), but the store must **not** depend on
-/// that: `runner_command()` resolves whatever scripting package is installed on the box, which can
-/// predate the host binary (the packaged runner and the host ship separately). An older runner
-/// treats an unknown flag's *value* as a package name and the install dies with
-/// "unrecognised dependency format" — found on-glass. Writing the mapping here keeps a
-/// catalog-driven install working against every runner that has ever shipped.
-///
-/// Idempotent and non-destructive, matching `sdk/src/plugins.ts::ensureBunfig`: a scope already
-/// mapped to this URL is left alone, one mapped elsewhere is rewritten, unrelated content survives.
+/// Written here, not via `runner --registry`: `runner_command()` may resolve
+/// an older scripting package that treats the flag value as a package name.
+/// Idempotent; unrelated content survives. Matches `sdk/src/plugins.ts::ensureBunfig`.
 pub(crate) fn ensure_bunfig_scope(dir: &Path, scope: &str, url: &str) -> Result<()> {
-    // Both halves are hand-formatted into TOML below (`"{scope}" = "{url}"`), so both must be
-    // proven unable to close the quote.
-    //
-    // The scope always was. The URL was not: its only guard was `starts_with("https://")`, and
-    // `Entry::registry` — unlike `title`/`description`/`author`/`version` — never goes through
-    // `sanitize`, so everything after the prefix arrived verbatim. A catalog entry whose registry
-    // read `https://ok/"\n[install]\nregistry = "https://evil/` injected a top-level `[install]`
-    // table into the file that tells `bun` where to fetch EVERY package from — and it persists
-    // after the source is deleted, because nothing rewrites this file (2026-08-05 review M-7).
-    // Sources may be unsigned, so "it came from a verified index" was not a guarantee either.
+    // Both halves are interpolated into `"{scope}" = "{url}"`. `Entry::registry`
+    // never goes through `sanitize`; a URL that closes the quote injects a
+    // top-level `[install]` table that bun keeps after the source is deleted.
     if !index::valid_scoped_pkg(&format!("{scope}/x")) || !valid_registry_url(url) {
         bail!("refusing to map scope `{scope}` to `{url}`");
     }
@@ -215,7 +165,7 @@ pub(crate) fn ensure_bunfig_scope(dir: &Path, scope: &str, url: &str) -> Result<
         t.starts_with(&format!("\"{scope}\"")) || t.starts_with(&format!("{scope} "))
     };
     if existing.lines().any(|l| l.trim() == wanted) {
-        return Ok(()); // already correct
+        return Ok(());
     }
     let updated = if existing.lines().any(is_mapping_for_scope) {
         existing
@@ -250,24 +200,10 @@ pub(crate) fn ensure_bunfig_scope(dir: &Path, scope: &str, url: &str) -> Result<
     Ok(())
 }
 
-/// Anchor bun's install root at the plugins dir by giving it a `package.json`.
-///
-/// **This is load-bearing.** `bun add` does not install into its working directory — it walks *up*
-/// to the nearest ancestor `package.json` and installs into THAT tree. A fresh plugins dir has no
-/// `package.json`, so any stray one above it (a `~/package.json` from someone's one-off `bun add`
-/// or `npm init`) silently captures the install: bun reports success and **exits 0**, the packages
-/// land in the ancestor's `node_modules`, and the plugins dir gets nothing. Reproduced on-glass
-/// 2026-07-31 (Nobara 44, host + runner 0.22.3): the runner exits 0 in ~100 ms and the install then
-/// fails the presence check with the unhelpful "not present after install" — a user report that
-/// looked like a broken store and was a stray `~/package.json` all along.
-///
-/// The host writes this itself rather than leaving it to the runner, for the same reason as
-/// [`ensure_bunfig_scope`]: the installed scripting package can be older than this binary.
-///
-/// Only seeds a tree that has no `node_modules` yet. A dir with packages but no `package.json` is
-/// hand-assembled or an older layout, and [`installed_packages`] deliberately falls back to the
-/// naming convention there — dropping an empty `dependencies` on it would make every plugin already
-/// installed vanish from the store.
+/// Seed a `package.json` so `bun add` installs here. It walks up to the
+/// nearest ancestor and still exits 0 if a stray file captures the tree.
+/// Skip when `package.json` or `node_modules` exists: empty `dependencies`
+/// would hide plugins [`installed_packages`] already sees.
 pub(crate) fn ensure_plugin_root(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join("package.json");
@@ -282,9 +218,7 @@ pub(crate) fn ensure_plugin_root(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The nearest `package.json` **above** `dir`, if any — the thing that would capture a `bun add`
-/// run inside `dir` (see [`ensure_plugin_root`]). Used to turn a silent mis-install into an error
-/// the operator can act on.
+/// Nearest `package.json` **above** `dir` — the tree that would capture `bun add`.
 pub(crate) fn capturing_ancestor(dir: &Path) -> Option<PathBuf> {
     dir.ancestors()
         .skip(1)
@@ -292,8 +226,7 @@ pub(crate) fn capturing_ancestor(dir: &Path) -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
-/// Is `pkg` a name the runner would supervise? Guards the uninstall route so a stray
-/// `POST /store/uninstall {"pkg": "effect"}` can't rip a shared dependency out of the tree.
+/// Uninstall must not take a shared dependency.
 pub(crate) fn valid_installed_pkg(pkg: &str) -> Result<()> {
     let plausible = pkg.starts_with("punktfunk-plugin-")
         || (index::valid_scoped_pkg(pkg)
@@ -306,9 +239,7 @@ pub(crate) fn valid_installed_pkg(pkg: &str) -> Result<()> {
     Ok(())
 }
 
-/// The plugin id a package registers under (`@punktfunk/plugin-rom-manager` → `rom-manager`), used
-/// to line an installed package up with the live lease registry. Best-effort: the authoritative id
-/// for a catalogued plugin is its index entry.
+/// Best-effort; a catalogued plugin's authoritative id is its index entry.
 pub(crate) fn plugin_id_for_pkg(pkg: &str) -> Option<String> {
     let last = pkg.rsplit('/').next()?;
     let id = last
@@ -317,18 +248,15 @@ pub(crate) fn plugin_id_for_pkg(pkg: &str) -> Option<String> {
     index::valid_plugin_id(id).then(|| id.to_string())
 }
 
-// ---------------------------------------------------------------- catalog state
-
-/// What we hold for one source: the last good index plus why it might be stale.
 #[derive(Clone)]
 pub(crate) struct SourceState {
     pub source: Source,
     pub index: Option<Index>,
     /// Unix seconds of the fetch that produced [`Self::index`].
     pub fetched_at: Option<u64>,
-    /// True when the last refresh attempt failed and we're serving an older copy.
+    /// Last refresh failed; this is an older copy.
     pub stale: bool,
-    /// Why the last attempt failed, for the console to show against the source.
+    /// Last failure, shown against the source in the console.
     pub error: Option<String>,
     pub etag: Option<String>,
 }
@@ -358,8 +286,7 @@ fn state() -> &'static RwLock<Vec<SourceState>> {
     STATE.get_or_init(|| RwLock::new(Vec::new()))
 }
 
-/// Reconcile the in-memory state list with the configured sources (added/removed/edited), seeding
-/// anything new from the on-disk cache so a cold host has a browsable store before its first fetch.
+/// New source names seed from the on-disk cache so a cold host can browse.
 fn sync_sources() {
     let configured = sources::load();
     let dir = catalog::cache_dir();
@@ -367,8 +294,8 @@ fn sync_sources() {
     st.retain(|s| configured.iter().any(|c| c.name == s.source.name));
     for c in configured {
         match st.iter_mut().find(|s| s.source.name == c.name) {
-            // The URL or key may have been edited under a name we already hold — drop what we
-            // cached for the old definition rather than attributing it to the new one.
+            // URL or key changed under this name — drop the old index rather than
+            // attributing it to the new definition.
             Some(existing) => {
                 if existing.source.url != c.url || existing.source.public_key != c.public_key {
                     *existing = SourceState::empty(c);
@@ -382,7 +309,7 @@ fn sync_sources() {
                     fresh.index = Some(index);
                     fresh.fetched_at = Some(meta.fetched_at);
                     fresh.etag = meta.etag;
-                    fresh.stale = true; // from disk — unverified freshness until a fetch says otherwise
+                    fresh.stale = true; // disk cache: freshness unverified until a fetch
                 }
                 st.push(fresh);
             }
@@ -390,10 +317,8 @@ fn sync_sources() {
     }
 }
 
-/// Every source's catalog, refreshing those past their TTL (or all of them when `force`).
-///
-/// **Blocking** — network I/O. The freshness decision is ours (our fetch clock), never the
-/// document's self-reported `generated` field.
+/// **Blocking**. Refreshes past-TTL sources (or all when `force`). Freshness
+/// is our fetch clock, never the document's `generated`.
 pub(crate) fn catalogs(force: bool) -> Vec<SourceState> {
     sync_sources();
     let dir = catalog::cache_dir();
@@ -415,7 +340,7 @@ pub(crate) fn catalogs(force: bool) -> Vec<SourceState> {
         let now = catalog::unix_now();
         let mut st = state().write().unwrap_or_else(|e| e.into_inner());
         let Some(slot) = st.iter_mut().find(|s| s.source.name == source.name) else {
-            continue; // removed while we were fetching
+            continue; // source removed during the fetch
         };
         match outcome {
             catalog::Fetched::Fresh { index, etag } => {
@@ -442,7 +367,7 @@ pub(crate) fn catalogs(force: bool) -> Vec<SourceState> {
                 slot.error = None;
             }
             catalog::Fetched::Failed(why) => {
-                // Fail soft: keep the last good shelf, say plainly that it's stale.
+                // Keep the last good index; mark it stale.
                 tracing::warn!(source = %source.name, "plugin catalog refresh failed: {why}");
                 slot.stale = true;
                 slot.error = Some(why);
@@ -457,8 +382,7 @@ pub(crate) fn catalogs(force: bool) -> Vec<SourceState> {
         .collect()
 }
 
-/// The catalogs we already hold, without touching the network. For paths that must not block on a
-/// remote host (an install resolving its own entry, an advisory lookup).
+/// No network. For install resolve and advisory lookup.
 pub(crate) fn cached_catalogs() -> Vec<SourceState> {
     sync_sources();
     state()
@@ -469,8 +393,7 @@ pub(crate) fn cached_catalogs() -> Vec<SourceState> {
         .collect()
 }
 
-/// Find a catalog entry by `(source, id)`, plus whether that source is the built-in one — which is
-/// the single place "verified" is decided (D6).
+/// The bool is whether the source is built-in (`verified`).
 pub(crate) fn find_entry(source_name: &str, id: &str) -> Option<(Entry, bool)> {
     cached_catalogs().into_iter().find_map(|s| {
         if s.source.name != source_name {
@@ -481,9 +404,7 @@ pub(crate) fn find_entry(source_name: &str, id: &str) -> Option<(Entry, bool)> {
     })
 }
 
-/// The first advisory covering `pkg@version`, across every source we hold. Revocations are
-/// deliberately not scoped to the source a plugin came from: a package known-bad anywhere is
-/// known-bad here.
+/// Revocations are not scoped to the source the plugin came from.
 pub(crate) fn advisory_for(pkg: &str, version: Option<&str>) -> Option<Advisory> {
     let version = version?;
     cached_catalogs().into_iter().find_map(|s| {
@@ -494,7 +415,7 @@ pub(crate) fn advisory_for(pkg: &str, version: Option<&str>) -> Option<Advisory>
     })
 }
 
-/// Forget a removed source's cached shelf, so re-adding the name later can't serve stale rows.
+/// Drop a removed source's cached index so re-adding the name cannot serve stale rows.
 pub(crate) fn drop_source_cache(name: &str) {
     catalog::drop_cache(&catalog::cache_dir(), name);
     let mut st = state().write().unwrap_or_else(|e| e.into_inner());
@@ -519,11 +440,10 @@ mod tests {
     fn scans_both_conventions_and_any_scope() {
         let dir = tempfile::tempdir().unwrap();
         touch_pkg(dir.path(), "@punktfunk/plugin-rom-manager", "0.3.0");
-        // A third-party scoped plugin MUST be found: catalog entries are required to be scoped
-        // (D8), so limiting discovery to @punktfunk would make every external source unusable.
+        // Any scope's `plugin-*` must be found; catalog entries are required to
+        // be scoped, so limiting discovery to `@punktfunk` would hide externals.
         touch_pkg(dir.path(), "@retro-hub/plugin-x", "1.0.0");
         touch_pkg(dir.path(), "punktfunk-plugin-legacy", "0.1.0");
-        // Not plugins: a plain dependency and a scoped non-plugin.
         touch_pkg(dir.path(), "effect", "4.0.0");
         touch_pkg(dir.path(), "@punktfunk/host", "0.1.2");
 
@@ -554,17 +474,11 @@ mod tests {
         assert!(installed_packages(dir.path()).is_empty());
     }
 
-    /// A plugin's LIBRARY is not an installed plugin.
-    ///
-    /// Regression from a live install: `@punktfunk/plugin-kit` is the framework every kit-built
-    /// plugin depends on. It matches the `plugin-*` convention exactly and lands in `node_modules`
-    /// transitively, so a convention-only scan reported the framework as an installed plugin the
-    /// operator could uninstall. The plugins dir's own `dependencies` is the authority.
     #[test]
     fn transitive_plugin_named_dependencies_are_not_installed_plugins() {
         let dir = tempfile::tempdir().unwrap();
         touch_pkg(dir.path(), "@punktfunk/plugin-rom-manager", "0.3.1");
-        touch_pkg(dir.path(), "@punktfunk/plugin-kit", "0.1.3"); // a dependency of the above
+        touch_pkg(dir.path(), "@punktfunk/plugin-kit", "0.1.3");
         touch_pkg(dir.path(), "@punktfunk/host", "0.1.2");
         std::fs::write(
             dir.path().join("package.json"),
@@ -582,17 +496,11 @@ mod tests {
 
     #[test]
     fn a_tree_with_no_package_json_falls_back_to_the_convention() {
-        // Hand-assembled or older layouts must still be discovered, not silently reported empty.
         let dir = tempfile::tempdir().unwrap();
         touch_pkg(dir.path(), "punktfunk-plugin-legacy", "0.1.0");
         assert_eq!(installed_packages(dir.path()).len(), 1);
     }
 
-    /// A fresh plugins dir must own its install root, or `bun add` installs somewhere else.
-    ///
-    /// Field bug 2026-07-31: with no `package.json` here, bun walked up to the operator's stray
-    /// `~/package.json`, installed the plugin into `~/node_modules`, and exited 0 — the store then
-    /// failed the presence check on an empty dir.
     #[test]
     fn a_fresh_dir_is_seeded_as_its_own_install_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -600,7 +508,6 @@ mod tests {
         ensure_plugin_root(&root).unwrap();
         let seeded = std::fs::read_to_string(root.join("package.json")).unwrap();
         assert!(seeded.contains("punktfunk-plugins"), "{seeded}");
-        // Seeding must not make the dir look like it has installs, nor lose the ones it gets.
         assert!(installed_packages(&root).is_empty());
     }
 
@@ -617,10 +524,8 @@ mod tests {
         );
     }
 
-    /// The one tree we must NOT seed: packages present, no `package.json`. `installed_packages`
-    /// falls back to the naming convention there, and a seeded empty `dependencies` would report
-    /// every plugin the operator already runs as uninstalled (see
-    /// `an_emptied_dependency_list_means_nothing_is_installed`).
+    /// Packages present, no `package.json`: [`installed_packages`] uses the
+    /// naming convention, and a seeded empty `dependencies` would hide them.
     #[test]
     fn seeding_skips_a_tree_that_already_has_packages() {
         let dir = tempfile::tempdir().unwrap();
@@ -641,12 +546,12 @@ mod tests {
             Some(dir.path().join("package.json"))
         );
 
-        // The nearest one wins — that is the tree bun would pick.
+        // Nearest ancestor is the tree bun would pick.
         let nearer = dir.path().join("config/package.json");
         std::fs::write(&nearer, "{}").unwrap();
         assert_eq!(capturing_ancestor(&plugins), Some(nearer));
 
-        // The dir's OWN manifest is not a capture — it is the anchor that prevents one.
+        // The dir's own manifest is the anchor, not a capture.
         std::fs::write(plugins.join("package.json"), "{}").unwrap();
         assert_ne!(
             capturing_ancestor(&plugins),
@@ -654,17 +559,10 @@ mod tests {
         );
     }
 
-    /// Uninstalling the last plugin must not resurrect its library as an installed plugin.
-    ///
-    /// `bun remove` drops the `dependencies` key entirely once it empties, while orphaned
-    /// transitive packages can linger in `node_modules`. Treating "package.json exists but has no
-    /// dependencies" as "no authority, fall back to the naming convention" made
-    /// `@punktfunk/plugin-kit` pop back into the installed list right after the operator removed
-    /// the only real plugin — seen on-glass.
     #[test]
     fn an_emptied_dependency_list_means_nothing_is_installed() {
         let dir = tempfile::tempdir().unwrap();
-        touch_pkg(dir.path(), "@punktfunk/plugin-kit", "0.1.3"); // orphan left behind
+        touch_pkg(dir.path(), "@punktfunk/plugin-kit", "0.1.3"); // leftover transitive
         std::fs::write(dir.path().join("package.json"), r#"{"name":"plugins"}"#).unwrap();
         assert!(installed_packages(dir.path()).is_empty());
 
@@ -681,7 +579,6 @@ mod tests {
         assert!(valid_installed_pkg("@punktfunk/plugin-rom-manager").is_ok());
         assert!(valid_installed_pkg("@retro-hub/plugin-x").is_ok());
         assert!(valid_installed_pkg("punktfunk-plugin-legacy").is_ok());
-        // A shared dependency is not removable through the store.
         assert!(valid_installed_pkg("effect").is_err());
         assert!(valid_installed_pkg("@punktfunk/host").is_err());
         assert!(valid_installed_pkg("../../etc").is_err());
@@ -697,11 +594,9 @@ mod tests {
         assert!(read().contains("[install.scopes]"));
         assert!(read().contains("\"@retro-hub\" = \"https://retro.example/npm/\""));
 
-        // Idempotent — no duplicate line.
         ensure_bunfig_scope(dir.path(), "@retro-hub", "https://retro.example/npm/").unwrap();
         assert_eq!(read().matches("@retro-hub").count(), 1);
 
-        // A second scope joins the same table.
         ensure_bunfig_scope(
             dir.path(),
             "@punktfunk",
@@ -711,7 +606,6 @@ mod tests {
         assert!(read().contains("@punktfunk"));
         assert!(read().contains("@retro-hub"));
 
-        // A changed registry rewrites in place rather than duplicating.
         ensure_bunfig_scope(dir.path(), "@retro-hub", "https://new.example/npm/").unwrap();
         assert_eq!(read().matches("@retro-hub").count(), 1);
         assert!(read().contains("https://new.example/npm/"));
@@ -722,19 +616,15 @@ mod tests {
     #[test]
     fn bunfig_scope_mapping_refuses_junk() {
         let dir = tempfile::tempdir().unwrap();
-        // Only https, only a well-formed scope — both already guaranteed by index validation, held
-        // here as the second line of defence for the one place we format TOML by hand.
+        // Second check at the one place we format TOML by hand.
         assert!(ensure_bunfig_scope(dir.path(), "@x", "http://insecure/").is_err());
         assert!(ensure_bunfig_scope(dir.path(), "no-at-sign", "https://e/").is_err());
         assert!(ensure_bunfig_scope(dir.path(), "@bad\"quote", "https://e/").is_err());
         assert!(!dir.path().join("bunfig.toml").exists());
     }
 
-    /// TOML injection through the registry URL (2026-08-05 review M-7). `Entry::registry` never
-    /// goes through `sanitize`, and the old guard was a bare `starts_with("https://")` — so
-    /// everything after the prefix reached a hand-formatted `"{scope}" = "{url}"` verbatim. The
-    /// payload that mattered injects a top-level `[install]` table, redirecting every subsequent
-    /// package resolution, and survives deletion of the source that introduced it.
+    /// `Entry::registry` is not sanitized. A URL that closes `"{url}"` injects
+    /// a top-level `[install]` table that outlives the source.
     #[test]
     fn bunfig_registry_url_cannot_inject_a_toml_table() {
         let dir = tempfile::tempdir().unwrap();
@@ -745,7 +635,6 @@ mod tests {
         );
         assert!(!dir.path().join("bunfig.toml").exists());
 
-        // The individual characters that make it possible, each on its own.
         for bad in [
             "https://e/\"quote",
             "https://e/\nnewline",
@@ -760,7 +649,6 @@ mod tests {
                 "must refuse registry URL {bad:?}"
             );
         }
-        // Real registry URLs — including ports, query strings and percent-escapes — still pass.
         for good in [
             "https://git.unom.io/api/packages/unom/npm/",
             "https://registry.example.com:8443/npm/",
@@ -773,12 +661,8 @@ mod tests {
         }
     }
 
-    /// The name-shape guard is necessary but NOT sufficient — see `mgmt::store::uninstall_plugin`.
-    ///
-    /// `@punktfunk/plugin-kit` is a plugin's *framework*, and it satisfies every syntactic rule
-    /// here. Windows on-glass accepted an uninstall of it. The real gate is membership in
-    /// [`installed_packages`], which excludes transitive dependencies; this test pins the fact that
-    /// the shape check alone lets it through, so nobody "simplifies" the handler back.
+    /// [`valid_installed_pkg`] accepts `@punktfunk/plugin-kit`. Uninstall must
+    /// also require membership in [`installed_packages`].
     #[test]
     fn name_shape_alone_does_not_protect_a_plugins_framework() {
         assert!(

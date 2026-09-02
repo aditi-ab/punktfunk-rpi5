@@ -1,16 +1,15 @@
-//! Decoder-input capture behind `PUNKTFUNK_DUMP_VIDEO` (fixture corpus for the
-//! native-decode program, design/client-native-decode.md M0).
+//! Decoder-input capture behind `PUNKTFUNK_DUMP_VIDEO`.
 //!
-//! Writes every AU exactly as the pump hands it to [`crate::video::Decoder::decode_frame`]:
-//! the data file is the raw concatenation (a valid Annex-B / OBU stream for clean
-//! captures), and the sidecar `.idx` keeps what a byte stream cannot carry — the exact
-//! AU boundaries plus the wire `flags`/`complete` bits — one `offset len flags complete`
-//! line per AU, so parser fixtures never have to re-derive framing from start codes.
+//! Writes each AU as [`crate::video::Decoder::decode_frame`] received it.
+//! The data file is the raw concatenation (a valid Annex-B / OBU stream for
+//! clean captures). The sidecar `.idx` holds what a byte stream cannot:
+//! `offset len flags complete` per AU, so fixtures do not re-parse start codes.
 //!
-//! Capture is best-effort by design: any I/O error logs once and disables the dump for
-//! the rest of the session; the streaming path is never failed on its account. The
-//! final buffered tail flushes on drop (session end), errors swallowed — a truncated
-//! last AU in a debug capture is acceptable, a stream torn down over one is not.
+//! I/O errors log once and disable the dump; the streaming path never fails
+//! because of this. Drop flushes the tail and swallows errors — a truncated
+//! last AU in a debug capture is fine; tearing the stream down is not.
+//!
+//! Evidence: `design/client-native-decode.md`.
 
 use std::io::BufWriter;
 use std::io::Write;
@@ -22,7 +21,7 @@ pub(crate) struct AuDump {
     offset: u64,
 }
 
-/// Wire-codec byte → fixture file extension (also the corpus naming convention).
+/// Wire codec byte → fixture extension (corpus file names).
 fn codec_ext(codec: u8) -> &'static str {
     match codec {
         punktfunk_core::quic::CODEC_H264 => "h264",
@@ -34,9 +33,8 @@ fn codec_ext(codec: u8) -> &'static str {
 }
 
 impl AuDump {
-    /// Read `PUNKTFUNK_DUMP_VIDEO`; `None` (the overwhelmingly common case) means the
-    /// variable is unset or the capture files could not be created — both already logged
-    /// where they matter.
+    /// `PUNKTFUNK_DUMP_VIDEO` directory. `None` if unset or the files could not
+    /// be created; both cases are already logged.
     pub(crate) fn from_env(codec: u8) -> Option<AuDump> {
         let dir = std::env::var_os("PUNKTFUNK_DUMP_VIDEO")?;
         let stamp = std::time::SystemTime::now()
@@ -79,7 +77,7 @@ impl AuDump {
         }
     }
 
-    /// Append one AU. Returns `false` once the dump should be dropped (error logged).
+    /// Append one AU. `false` means log-and-disable: the caller must drop the dump.
     pub(crate) fn write(&mut self, au: &[u8], flags: u32, complete: bool) -> bool {
         let r = self.data.write_all(au).and_then(|()| {
             writeln!(

@@ -1,15 +1,13 @@
-//! H.264 decode capability query + derivation, plus the codec-agnostic pieces the
-//! H.265 sibling ([`crate::caps_h265`]) reuses: the picture-format vocabulary, the
-//! coincide/distinct/layered arrangement decision, and the profile chain every
-//! Vulkan object of a session is created against.
+//! H.264 decode capability query and derivation, plus the codec-agnostic pieces
+//! [`crate::caps_h265`] reuses: picture-format vocabulary, coincide/distinct/layered
+//! arrangement, and the profile chain every Vulkan object of a session is created
+//! against.
 //!
-//! Split on purpose: [`query_h264_caps`] is the one THIN function that talks to the
-//! driver (`vkGetPhysicalDeviceVideoCapabilitiesKHR` + the three video-format-property
-//! enumerations) and only COPIES facts into [`RawH264Caps`]; [`derive_caps`] turns
-//! those facts into the [`DecodeCaps`] the session/image/ring modules consume and is
-//! a pure function over a hand-buildable struct — every mode/format decision is
-//! unit-tested without a GPU (the RADV-vs-NVIDIA coincide/distinct split is exactly
-//! the driver variance the risk register names).
+//! [`query_h264_caps`] is the only function that talks to the driver
+//! (`vkGetPhysicalDeviceVideoCapabilitiesKHR` and the three video-format enumerations)
+//! and copies facts into [`RawH264Caps`]. [`derive_caps`] is pure over that
+//! hand-buildable struct into [`DecodeCaps`]. Mode and format decisions are
+//! unit-tested without a GPU.
 
 use ash::vk;
 use ash::vk::native as hh;
@@ -20,38 +18,29 @@ use crate::caps_h265::H265ProfileChain;
 use crate::caps_h265::H265ProfileKey;
 use crate::device::DecodeDevice;
 
-/// The 8-bit 4:2:0 semi-planar format every punktfunk H.264 session decodes to,
-/// and the H.265 Main one ([`crate::caps_h265::output_format_for`] picks per SPS).
+/// 8-bit 4:2:0 semi-planar. Every H.264 session here, and H.265 Main via
+/// [`crate::caps_h265::output_format_for`].
 pub const NV12: vk::Format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
-/// 10-bit 4:2:0 (P010's Vulkan spelling): H.265 Main 10's picture format.
+/// 10-bit 4:2:0 (P010). H.265 Main 10's picture format.
 pub const P010: vk::Format = vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
-/// 8-bit 4:4:4 two-plane: H.265 RExt 4:4:4 8-bit, where the device advertises it.
+/// 8-bit 4:4:4 two-plane. H.265 RExt 4:4:4 8-bit, when the device advertises it.
 pub const YUV444_8: vk::Format = vk::Format::G8_B8R8_2PLANE_444_UNORM;
-/// 10-bit 4:4:4 two-plane: H.265 RExt 4:4:4 10-bit, where the device advertises it.
+/// 10-bit 4:4:4 two-plane. H.265 RExt 4:4:4 10-bit, when the device advertises it.
 pub const YUV444_10: vk::Format = vk::Format::G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16;
 
-/// EVERY picture format a pf-vkdecode session can deliver — this crate's whole
-/// output vocabulary, in one place.
-///
-/// It exists so a CONSUMER's per-format table (the presenter's CSC bit-depth and
-/// MSB-packing map) can be pinned against the PRODUCER rather than against a
-/// hand-copied list of its own: a fifth format added here (12-bit RExt, say) breaks
-/// the consumer's test instead of silently rendering through that consumer's
-/// fallback. [`plane_formats`] and [`crate::caps_h265::output_format_for`] are both
-/// tested to agree with it, so the vocabulary can only grow in one edit.
+/// Every picture format a session can deliver. Consumers pin per-format tables
+/// against this list rather than a hand copy: a fifth format here (12-bit RExt)
+/// must fail the consumer's test instead of falling through. [`plane_formats`]
+/// and [`crate::caps_h265::output_format_for`] are tested to agree with it.
 pub const OUTPUT_FORMATS: [vk::Format; 4] = [NV12, P010, YUV444_8, YUV444_10];
 
-/// The `R*`/`R*G*` per-plane view formats the presenter's sampler path needs for
-/// one picture format, or `None` for a format this crate has no plane mapping for.
+/// Per-plane `R*`/`R*G*` view formats the presenter samples, or `None` if this
+/// crate has no mapping. Views exist only under `MUTABLE_FORMAT` and must match
+/// spec table 49.1: 8-bit two-plane → `R8`/`R8G8`, 10-bit `3PACK16` → `R10X6`/
+/// `R10X6G10X6`. An `R8` view on a 10-bit plane silently reads half of each sample.
 ///
-/// Per-plane views exist only under `MUTABLE_FORMAT` and must be format-compatible
-/// with the plane they alias (spec: "Compatible formats of planes of multi-planar
-/// formats", table 49.1): the 8-bit two-plane families take `R8`/`R8G8`, the
-/// 10-bit `3PACK16` families take `R10X6`/`R10X6G10X6` — sampling a 10-bit plane
-/// through an `R8` view would silently read half the bits of every sample, which
-/// is exactly the class of silent-wrongness this crate refuses to ship.
-/// (Comparisons rather than a `match`: `vk::Format` is a newtype over `i32` whose
-/// field is private to ash, so its constants are not structural-match patterns.)
+/// Comparisons, not `match`: `vk::Format` is an ash newtype over `i32` whose
+/// field is private, so the constants are not structural patterns.
 pub fn plane_formats(format: vk::Format) -> Option<[vk::Format; 2]> {
     if format == NV12 || format == YUV444_8 {
         Some([vk::Format::R8_UNORM, vk::Format::R8G8_UNORM])
@@ -65,58 +54,47 @@ pub fn plane_formats(format: vk::Format) -> Option<[vk::Format; 2]> {
     }
 }
 
-/// The usage the pools actually create with, per role — the format queries ask the
-/// driver about EXACTLY these combinations (a query for less would validate an
-/// image nobody creates):
-///
-/// distinct-mode DPB images: reference-only, never sampled.
+/// Distinct-mode DPB: reference-only. Format queries use this exact usage;
+/// a weaker query would validate an image the pool never creates.
 pub const DPB_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR;
-/// Distinct-mode output images: decode destination + presenter sampling.
+/// Distinct-mode output: decode destination plus presenter sampling.
 pub const OUTPUT_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
     vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR.as_raw() | vk::ImageUsageFlags::SAMPLED.as_raw(),
 );
-/// Coincide-mode images: DPB + decode destination + presenter sampling in one.
+/// Coincide-mode: DPB + decode destination + presenter sampling on one image.
 pub const COINCIDE_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
     vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR.as_raw()
         | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR.as_raw()
         | vk::ImageUsageFlags::SAMPLED.as_raw(),
 );
 
-/// One `VkVideoFormatPropertiesKHR` entry as this crate consumes it: the format
-/// plus the driver's advertised usage/create-flag envelope for it — creation must
-/// stay INSIDE that envelope (finding of the adversarial round: the flags used to
-/// be assumed, not honoured).
+/// One `VkVideoFormatPropertiesKHR` entry as this crate consumes it. Creation
+/// must stay inside the advertised usage and create-flag envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoFormat {
     pub format: vk::Format,
-    /// `imageUsageFlags` the driver supports for this format under the queried
-    /// profile (a superset of the query's usage on a conformant driver).
+    /// Driver `imageUsageFlags` under the queried profile (a superset of the query
+    /// usage on a conformant driver).
     pub image_usage: vk::ImageUsageFlags,
-    /// `imageCreateFlags` the driver allows — per-plane views require
-    /// `MUTABLE_FORMAT` to appear here.
+    /// Driver `imageCreateFlags`. Per-plane views need `MUTABLE_FORMAT` here.
     ///
-    /// ⚠ This field is also the ONLY gate on `VK_IMAGE_CREATE_EXTENDED_USAGE_BIT`,
-    /// which is the spec's one escape hatch from `image_usage`: `supportedVideoFormat`
-    /// (VUID-VkImageCreateInfo-pNext-06811) admits a usage bit outside `image_usage`
-    /// only when `VkImageCreateInfo::flags` includes `EXTENDED_USAGE`, and admits that
-    /// flag only when it is "also set in `VkVideoFormatPropertiesKHR::imageCreateFlags`"
-    /// (or is `VIDEO_PROFILE_INDEPENDENT`, which needs `VK_KHR_video_maintenance1`).
-    /// So an EMPTY value here closes the escape hatch as well as the door — measured on
-    /// Intel Arc, where it is empty for every profile ([`crate::probe`] docs).
+    /// This is also the only gate on `VK_IMAGE_CREATE_EXTENDED_USAGE_BIT`, the spec
+    /// escape from `image_usage`. VUID-VkImageCreateInfo-pNext-06811 admits a usage
+    /// bit outside `image_usage` only when create flags include `EXTENDED_USAGE`,
+    /// and admits that flag only when it is also in this field (or is
+    /// `VIDEO_PROFILE_INDEPENDENT`, which needs `VK_KHR_video_maintenance1`).
+    /// Empty here closes that hatch as well as `MUTABLE_FORMAT`.
     pub image_create_flags: vk::ImageCreateFlags,
-    /// `imageType` — the image type this format may be created with. Part of the
-    /// `supportedVideoFormat` match (VUID-06811 compares it for EQUALITY), so it is
-    /// recorded rather than assumed; every fleet driver reports `TYPE_2D`, which is
-    /// what [`crate::images`] creates.
+    /// `imageType`. VUID-06811 compares it for equality, so it is recorded rather
+    /// than assumed. [`crate::images`] creates `TYPE_2D`.
     pub image_type: vk::ImageType,
-    /// `imageTiling` — likewise compared for equality by VUID-06811; every fleet
-    /// driver reports `OPTIMAL`.
+    /// `imageTiling`. Likewise equality-compared by VUID-06811; pools create `OPTIMAL`.
     pub image_tiling: vk::ImageTiling,
 }
 
 impl Default for VideoFormat {
-    /// The shape the pools create with (`TYPE_2D` + `OPTIMAL`), so a fixture that
-    /// names only the interesting fields still describes a creatable image.
+    /// `TYPE_2D` + `OPTIMAL`, matching the pools, so a fixture that names only the
+    /// interesting fields still describes a creatable image.
     fn default() -> Self {
         Self {
             format: vk::Format::UNDEFINED,
@@ -130,18 +108,15 @@ impl Default for VideoFormat {
 
 /// Everything the thin query copies out of the driver, hand-buildable for tests.
 ///
-/// The three format lists correspond to the three REAL usage combinations the
-/// pools create with ([`DPB_USAGE`], [`OUTPUT_USAGE`], [`COINCIDE_USAGE`] — the
-/// presenter-facing ones include `SAMPLED`), in the exact shape the driver was
-/// asked: a usage the implementation does not support yields an EMPTY list (the
-/// thin query maps `VK_ERROR_FORMAT_NOT_SUPPORTED` /
-/// `VK_ERROR_IMAGE_USAGE_NOT_SUPPORTED` for that usage to empty rather than
-/// failing the whole probe).
+/// The three format lists match the three usages the pools create with
+/// ([`DPB_USAGE`], [`OUTPUT_USAGE`], [`COINCIDE_USAGE`]). A usage the driver
+/// rejects yields an empty list: the query maps `VK_ERROR_FORMAT_NOT_SUPPORTED`
+/// and `VK_ERROR_IMAGE_USAGE_NOT_SUPPORTED` for that usage to empty rather than
+/// failing the whole probe.
 #[derive(Debug, Clone, Default)]
 pub struct RawH264Caps {
-    /// `VkVideoCapabilitiesKHR::flags`.
     pub capability_flags: vk::VideoCapabilityFlagsKHR,
-    /// `VkVideoDecodeCapabilitiesKHR::flags` (the coincide/distinct advertisement).
+    /// Coincide/distinct advertisement (`VkVideoDecodeCapabilitiesKHR::flags`).
     pub decode_flags: vk::VideoDecodeCapabilityFlagsKHR,
     pub min_bitstream_buffer_offset_alignment: u64,
     pub min_bitstream_buffer_size_alignment: u64,
@@ -150,54 +125,43 @@ pub struct RawH264Caps {
     pub max_coded_extent: vk::Extent2D,
     pub max_dpb_slots: u32,
     pub max_active_reference_pictures: u32,
-    /// `VkVideoDecodeH264CapabilitiesKHR::maxLevelIdc` (index-coded Std level).
+    /// Index-coded Std level (`VkVideoDecodeH264CapabilitiesKHR::maxLevelIdc`).
     pub max_level_idc: hh::StdVideoH264LevelIdc,
-    /// `VkVideoCapabilitiesKHR::stdHeaderVersion` — session creation echoes it back.
+    /// Session creation echoes `VkVideoCapabilitiesKHR::stdHeaderVersion` back.
     pub std_header_version: vk::ExtensionProperties,
-    /// Formats usable for DISTINCT-mode DPB images (queried with [`DPB_USAGE`]).
+    /// Distinct-mode DPB formats (queried with [`DPB_USAGE`]).
     pub dpb_formats: Vec<VideoFormat>,
-    /// Formats usable for DISTINCT-mode outputs (queried with [`OUTPUT_USAGE`]).
+    /// Distinct-mode output formats (queried with [`OUTPUT_USAGE`]).
     pub output_formats: Vec<VideoFormat>,
-    /// Formats usable when DPB and output COINCIDE ([`COINCIDE_USAGE`]).
+    /// Coincide-mode formats (queried with [`COINCIDE_USAGE`]).
     pub coincide_formats: Vec<VideoFormat>,
 }
 
-/// A device's decode level ceiling, tagged with the codec whose Std code space it
-/// is stated in.
+/// A device's decode level ceiling, tagged with the codec whose Std code space
+/// it is stated in.
 ///
 /// `StdVideoH264LevelIdc`, `StdVideoH265LevelIdc` and `StdVideoAV1Level` are all
-/// `c_uint` aliases, so nothing stops one being assigned where another belongs —
-/// the compiler is silent and the numbers even look plausible (H.264 level 4.1 and
-/// H.265 level 4.1 are different code points; AV1 5.1 is 13 where H.265 5.1 is 12).
-/// This is the confusion `DecodeProfile` was introduced to make unrepresentable for
-/// profiles; the level ceiling gets the same treatment, so a caps derivation has to
-/// SAY which codec's query it copied.
-///
-/// The gate itself stays a numeric comparison against [`Self::code_point`]: within
-/// ONE codec the Std code points ascend with the level, which is exactly what makes
-/// "stream level > device ceiling ⇒ refuse" sound. Across codecs the comparison is
-/// meaningless, which is why the value carries its codec.
+/// `c_uint` aliases. Assigning one where another belongs compiles, and the
+/// numbers look plausible (H.264 4.1 ≠ H.265 4.1; AV1 5.1 is 13, H.265 5.1 is 12).
+/// The gate is a numeric compare against [`Self::code_point`] and is only sound
+/// within one codec, which is why the value carries its tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaxLevelIdc {
-    /// `VkVideoDecodeH264CapabilitiesKHR::maxLevelIdc`.
     H264(hh::StdVideoH264LevelIdc),
-    /// `VkVideoDecodeH265CapabilitiesKHR::maxLevelIdc`.
     H265(hh::StdVideoH265LevelIdc),
-    /// `VkVideoDecodeAV1CapabilitiesKHR::maxLevel`. Unlike the other two this code
-    /// space is the BITSTREAM's own: `StdVideoAV1Level` is index-coded exactly like
-    /// AV1's `seq_level_idx` (2.0 = 0, 2.1 = 1, … 7.3 = 23).
+    /// `VkVideoDecodeAV1CapabilitiesKHR::maxLevel`. Unlike H.264/H.265 this is the
+    /// bitstream's own index (`seq_level_idx`: 2.0 = 0 … 7.3 = 23).
     ///
-    /// ⚠ Only over 0…23. `seq_level_idx` is 5 bits, and 31 is Annex A's "maximum
-    /// parameters" sentinel — no level constraint — which outranks even a device
-    /// reporting the enum's top value. The AV1 gate therefore treats a stream above
-    /// this ceiling as advisory instead of refusing it (`VkAv1Decoder::ensure_state`).
+    /// Valid only over 0…23. `seq_level_idx` is 5 bits; 31 is Annex A's "maximum
+    /// parameters" sentinel and outranks even a device at the enum's top. The AV1
+    /// gate therefore treats a stream above this ceiling as advisory
+    /// (`VkAv1Decoder::ensure_state`).
     Av1(hh::StdVideoAV1Level),
 }
 
 impl MaxLevelIdc {
-    /// The raw Std code point, for the decoders' level gate and its error text.
-    /// Compare it only against a code point of the SAME codec (the variant says
-    /// which) — the tag is the whole point of the type.
+    /// Raw Std code point for the level gate. Compare only against the same codec
+    /// (the variant says which).
     pub fn code_point(self) -> u32 {
         match self {
             MaxLevelIdc::H264(level) | MaxLevelIdc::H265(level) | MaxLevelIdc::Av1(level) => level,
@@ -215,22 +179,19 @@ impl std::fmt::Display for MaxLevelIdc {
     }
 }
 
-/// The derived facts the rest of the crate keys off. One value per session profile;
-/// rebuilt only when the stream renegotiates to a different profile.
+/// Session-shaping facts for one profile. Rebuilt only when the stream
+/// renegotiates to a different profile.
 #[derive(Debug, Clone)]
 pub struct DecodeCaps {
-    /// Chosen DPB/output arrangement: `true` = the decode output IS the DPB image
-    /// (RADV's shape), `false` = separate DPB array + output images (NVIDIA's).
-    /// When a driver advertises both, coincide wins — half the images, and the
-    /// mode field data trusts most on the fleet's AMD boxes.
+    /// `true`: decode output is the DPB image. `false`: separate DPB array and
+    /// output images. When the driver advertises both, coincide wins (half the images).
     pub coincide: bool,
-    /// `true` when the driver does NOT advertise `SEPARATE_REFERENCE_IMAGES`: every
-    /// DPB slot must then be a layer of ONE image array. When separate references
-    /// are allowed this stays `false` and each slot gets its own image (simpler
-    /// lifetime story; nothing downstream requires the layered arrangement).
+    /// `true` when the driver does not advertise `SEPARATE_REFERENCE_IMAGES`: every
+    /// DPB slot is then a layer of one image array. Otherwise each slot is its own
+    /// image (nothing downstream requires the layered arrangement).
     pub layered_dpb: bool,
-    /// Bitstream buffer alignments, normalized to at least 1 so ring math never
-    /// divides by the zero an uninitialized fixture would carry.
+    /// Bitstream buffer alignments, floored at 1 so ring math never divides by
+    /// a zero an uninitialized fixture would carry.
     pub min_bitstream_offset_alignment: u64,
     pub min_bitstream_size_alignment: u64,
     pub picture_access_granularity: vk::Extent2D,
@@ -238,23 +199,20 @@ pub struct DecodeCaps {
     pub max_coded_extent: vk::Extent2D,
     pub max_dpb_slots: u32,
     pub max_active_references: u32,
-    /// The device's `maxLevelIdc` for this session's codec, codec-TAGGED.
     pub max_level_idc: MaxLevelIdc,
-    /// DPB image format (== `output_format` in coincide mode).
+    /// DPB image format (`== output_format` in coincide mode).
     pub dpb_format: vk::Format,
-    /// Decode-output image format.
     pub output_format: vk::Format,
-    /// The per-plane view formats of [`Self::output_format`] ([`plane_formats`]) —
-    /// resolved at derivation so the pool never has to re-derive (or guess) them.
+    /// Per-plane views of [`Self::output_format`], resolved here so the pool never
+    /// re-derives (or guesses) them.
     pub plane_view_formats: [vk::Format; 2],
     pub std_header_version: vk::ExtensionProperties,
 }
 
 impl DecodeCaps {
-    /// `coded` rounded up to the device's `pictureAccessGranularity` — the extent
-    /// pool IMAGES are created at (the per-picture `codedExtent` stays the stream's
-    /// coded size; only the backing store rounds up). A zero granularity axis (an
-    /// uninitialized fixture) degrades to 1.
+    /// `coded` rounded up to `pictureAccessGranularity` — the extent pool images
+    /// are created at. Per-picture `codedExtent` stays the stream size. A zero
+    /// granularity axis (uninitialized fixture) degrades to 1.
     pub fn aligned_extent(&self, coded: vk::Extent2D) -> vk::Extent2D {
         let round = |value: u32, granularity: u32| -> u32 {
             let granularity = granularity.max(1);
@@ -267,50 +225,40 @@ impl DecodeCaps {
     }
 }
 
-/// Raw caps that do not add up to a usable decoder. All of these are device gaps
-/// the caller demotes on (the ladder's next rung), not stream conditions.
+/// Raw caps that do not add up to a usable decoder. Device gaps the caller
+/// demotes on, not stream conditions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapsError {
-    /// The driver advertises neither COINCIDE nor DISTINCT — no way to arrange a
-    /// DPB at all (a broken driver; the spec requires at least one).
+    /// Neither COINCIDE nor DISTINCT advertised — no DPB arrangement (spec
+    /// requires at least one; a broken driver).
     NoDecodeMode,
     /// The mode's format list does not contain the picture format the stream
-    /// needs. `mode` names which list, `wanted` the format: [`NV12`] for H.264
-    /// and H.265 Main, [`P010`] for Main 10, the 4:4:4 pair for RExt streams —
-    /// the Main-10-on-an-8-bit-only-device and 4:4:4-on-a-4:2:0-only-device
-    /// refusals both land here, BEFORE any session exists.
+    /// needs. `wanted` is [`NV12`] for H.264/H.265 Main, [`P010`] for Main 10,
+    /// the 4:4:4 pair for RExt. Refused before any session exists.
     NoFormat {
         mode: &'static str,
         wanted: vk::Format,
     },
-    /// The picture format the stream needs has no per-plane view mapping in this
-    /// crate ([`plane_formats`]) — unreachable for the four formats the envelope
-    /// admits; a guard against a future format arriving without its plane views.
+    /// No per-plane mapping in [`plane_formats`]. Unreachable for the four
+    /// envelope formats; guards a future format arriving without its views.
     NoPlaneMapping { format: vk::Format },
-    /// The driver's entry for the wanted format in `mode` does not advertise every
-    /// usage bit the pool would create with (`missing` names the gap) — creating
-    /// anyway would be a silent VUID violation.
+    /// The wanted format's entry in `mode` is missing a usage bit the pool would
+    /// create with. Creating anyway would be a silent VUID violation.
     UsageUnsupported {
         mode: &'static str,
-        /// The picture format whose entry fell short — NOT always NV12 (a Main 10
-        /// stream is refused about P010), which is what this used to say regardless.
+        /// Picture format whose entry fell short — not always NV12 (Main 10 is P010).
         format: vk::Format,
         missing: vk::ImageUsageFlags,
     },
-    /// The presenter-facing entry for `mode` does not allow `MUTABLE_FORMAT`, so
-    /// the per-plane views the presenter samples through ([`plane_formats`])
-    /// cannot exist on this device.
+    /// Presenter-facing entry for `mode` does not allow `MUTABLE_FORMAT`, so the
+    /// per-plane views [`plane_formats`] cannot exist on this device.
     NoMutableFormat {
         mode: &'static str,
         format: vk::Format,
     },
-    /// The driver forces COINCIDE mode AND a layered DPB (one image array, no
-    /// `SEPARATE_REFERENCE_IMAGES`): the picture-pool model — a re-activated slot
-    /// binding a fresh free image, so delivered pictures are never decode targets
-    /// — cannot exist when every slot is a fixed layer of one array. No fleet
-    /// device has this shape (NVIDIA = distinct, RADV = separate reference
-    /// images); a device that does demotes to the next decoder rung rather than
-    /// getting a degraded copy path built for it.
+    /// COINCIDE plus a layered DPB (no `SEPARATE_REFERENCE_IMAGES`). The picture
+    /// pool rebinds a fresh image per activation, which a fixed layer of one array
+    /// cannot do. Demote rather than build a copy path.
     CoincideLayeredDpb,
 }
 
@@ -341,14 +289,8 @@ impl std::fmt::Display for CapsError {
                     f,
                     "the {mode} {format:?} entry does not advertise usage {missing:?}"
                 )?;
-                // Name the CONSEQUENCE for the one missing bit that is not a passing
-                // driver quirk. Without `SAMPLED` nothing in a shader can read the
-                // decoded picture, so the zero-copy path this rung exists for cannot be
-                // built here at all — a fact worth stating in the log line rather than
-                // leaving a field reporter to work out from a flag name. Measured on
-                // Intel Arc (Windows 101.8861), where the whole advertised envelope is
-                // TRANSFER_SRC|DECODE_DST|DECODE_DPB with no image create flags:
-                // `punktfunk-session --probe-decode` prints the driver's own answer.
+                // Without `SAMPLED` no shader can read the picture, so this rung
+                // cannot exist here. `--probe-decode` prints the driver's envelope.
                 if missing.contains(vk::ImageUsageFlags::SAMPLED) {
                     write!(
                         f,
@@ -377,10 +319,9 @@ impl std::fmt::Display for CapsError {
 
 impl std::error::Error for CapsError {}
 
-/// Derive the session-shaping facts from one raw H.264 query. Pure — the whole
-/// coincide/distinct/layered decision table lives in `derive_arrangement` (shared
-/// with the H.265 side) and in the tests below. H.264 in this program is 8-bit
-/// 4:2:0, so the wanted picture format is always [`NV12`].
+/// Derive session-shaping facts from one raw H.264 query. Pure; arrangement
+/// lives in `derive_arrangement`. H.264 here is 8-bit 4:2:0, so `wanted` is
+/// always [`NV12`].
 pub fn derive_caps(raw: &RawH264Caps) -> Result<DecodeCaps, CapsError> {
     let arrangement = derive_arrangement(
         raw.capability_flags,
@@ -403,8 +344,8 @@ pub fn derive_caps(raw: &RawH264Caps) -> Result<DecodeCaps, CapsError> {
     ))
 }
 
-/// The codec-agnostic half of derivation: which DPB arrangement this device can
-/// host, and which format lists satisfy the picture format `wanted`.
+/// Codec-agnostic half of derivation: DPB arrangement and which format lists
+/// satisfy picture format `wanted`.
 pub(crate) struct Arrangement {
     coincide: bool,
     layered_dpb: bool,
@@ -414,11 +355,9 @@ pub(crate) struct Arrangement {
 }
 
 impl Arrangement {
-    /// Fold in the codec-specific numbers the raw query carried. (One function
-    /// rather than a shared raw-caps struct: the two raw structs differ only in
-    /// which codec's `maxLevelIdc` they copied, and pinning that difference in the
-    /// TYPE is worth more than saving these arguments — hence [`MaxLevelIdc`],
-    /// which each codec's derivation has to name its own variant of.)
+    /// Fold in the codec-specific numbers the raw query carried. The two raw
+    /// structs differ only in which codec's `maxLevelIdc` they copied; pinning
+    /// that in the type is [`MaxLevelIdc`], which each derivation must name.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn into_caps(
         self,
@@ -452,9 +391,8 @@ impl Arrangement {
 }
 
 /// Decide the DPB arrangement and validate `wanted` against the format lists of
-/// the roles that arrangement creates images in. Pure; shared by both codecs — the
-/// only codec-dependent input is `wanted`, which the H.265 side derives from the
-/// SPS's chroma format and bit depth ([`crate::caps_h265::output_format_for`]).
+/// the roles that arrangement creates. Shared by both codecs; H.265 derives
+/// `wanted` from SPS chroma and bit depth ([`crate::caps_h265::output_format_for`]).
 pub(crate) fn derive_arrangement(
     capability_flags: vk::VideoCapabilityFlagsKHR,
     decode_flags: vk::VideoDecodeCapabilityFlagsKHR,
@@ -473,15 +411,13 @@ pub(crate) fn derive_arrangement(
 
     let layered_dpb =
         !capability_flags.contains(vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES);
-    // Coincide preferred when both are offered (struct docs). Each picked entry is
-    // validated against the EXACT usage/create-flags its pool will use: presenter-
-    // facing images (coincide pool, distinct outputs) additionally need
-    // MUTABLE_FORMAT for their per-plane views; the distinct DPB needs neither
-    // sampling nor plane views.
+    // Coincide preferred when both are offered (struct docs). Presenter-facing
+    // images need the pool's exact usage plus MUTABLE_FORMAT; distinct DPB
+    // needs neither sampling nor plane views.
     let (dpb_format, output_format) = if coincide {
         if layered_dpb {
-            // The picture-pool model needs per-slot images (a slot re-binds a
-            // fresh image at activation); one fixed layer per slot cannot do that.
+            // Picture-pool model needs per-slot images (a slot rebinds a fresh
+            // image at activation); one fixed layer per slot cannot.
             return Err(CapsError::CoincideLayeredDpb);
         }
         let mode = "coincide (DPB|DST|SAMPLED)";
@@ -523,7 +459,7 @@ fn pick_format(
         .ok_or(CapsError::NoFormat { mode, wanted })
 }
 
-/// The pool's creation usage must sit inside the driver's advertised envelope.
+/// Pool creation usage must sit inside the driver's advertised envelope.
 fn require_usage(
     entry: &VideoFormat,
     usage: vk::ImageUsageFlags,
@@ -533,9 +469,8 @@ fn require_usage(
     if missing.is_empty() {
         Ok(())
     } else {
-        // The entry's OWN format, not the caller's `wanted`: they are equal here (the
-        // entry was picked by format), and taking it from the driver's record keeps the
-        // message describing what the driver actually said.
+        // The entry's own format, not the caller's `wanted`: they match here,
+        // and the driver's record is what the message should name.
         Err(CapsError::UsageUnsupported {
             mode,
             format: entry.format,
@@ -558,32 +493,25 @@ fn require_mutable(entry: &VideoFormat, mode: &'static str) -> Result<(), CapsEr
     }
 }
 
-/// A complete H.264 decode profile chain in one movable value, mirroring the
-/// encoder's `RgbProfileStack`: profile identity in Vulkan is BY VALUE, so every
-/// consumer (caps query, session create, image/buffer create, query pool create)
-/// rebuilds a structurally identical chain rather than sharing pointers.
+/// One movable H.264 decode profile chain. Vulkan profile identity is by value,
+/// so every consumer rebuilds a structurally identical chain rather than sharing
+/// pointers.
 ///
-/// [`Self::wire`] links `profile.p_next` to this struct's OWN `h264` field; the
-/// value must not move between `wire()` and the last use of the returned reference
-/// — **or of any raw pointer taken from it**, which is the half that does not come
-/// for free. `wire` borrows `self` for the reference's life, so wherever the
-/// reference is passed on AS a reference the borrow checker does pin the chain: a
-/// `profiles(std::slice::from_ref(profile))` builder carries the borrow in its own
-/// lifetime parameter, and so does handing `profile` straight to an entry point.
-/// Where a `*const` is taken instead, the borrow ENDS at that line and nothing but
-/// inspection keeps the chain still — [`crate::decoder`]'s query pool must do
-/// exactly that (`push_next` there would clobber the profile's own `p_next`), so it
-/// holds the reference across the call in a helper's SIGNATURE
-/// (`OpRing::create_status_query_pool`) rather than relying on this sentence.
+/// [`Self::wire`] links `profile.p_next` to this struct's own `h264` field.
+/// Do not move the value between `wire()` and the last use of the returned
+/// reference — or of any raw pointer taken from it. `wire` borrows `self` for
+/// the reference's life, so passing the reference on keeps the chain pinned.
+/// Taking a `*const` ends the borrow at that line: [`crate::decoder`]'s query
+/// pool must do that (`push_next` would clobber the profile's own `p_next`), so
+/// it holds the reference across the call in `OpRing::create_status_query_pool`.
 pub(crate) struct H264ProfileChain {
     h264: vk::VideoDecodeH264ProfileInfoKHR<'static>,
     profile: vk::VideoProfileInfoKHR<'static>,
 }
 
 impl H264ProfileChain {
-    /// Build the (unwired) chain for one SPS profile. `std_profile_idc` is the
-    /// value WP-A's conversion validated (66/77/100/244 pass-through); H.264 here
-    /// is 8-bit 4:2:0 progressive by the program envelope.
+    /// Unwired chain for one SPS profile. `std_profile_idc` is the converted
+    /// idc (66/77/100/244 pass-through). H.264 here is 8-bit 4:2:0 progressive.
     pub(crate) fn new(std_profile_idc: hh::StdVideoH264ProfileIdc) -> Self {
         Self {
             h264: vk::VideoDecodeH264ProfileInfoKHR::default()
@@ -597,39 +525,34 @@ impl H264ProfileChain {
         }
     }
 
-    /// Wire the internal `p_next` chain and hand out the profile root. Do not move
-    /// `self` while the returned reference (or any pointer taken from it) lives.
+    /// Wire the internal `p_next` chain and hand out the profile root. Do not
+    /// move `self` while the returned reference (or any pointer from it) lives.
     pub(crate) fn wire(&mut self) -> &vk::VideoProfileInfoKHR<'static> {
         self.profile.p_next = (&self.h264 as *const vk::VideoDecodeH264ProfileInfoKHR<'_>).cast();
         &self.profile
     }
 }
 
-/// Which codec profile a session — and therefore every image, buffer and query
-/// pool created for it — is built against. A plain `Copy` descriptor rather than a
-/// chain, because profile identity in Vulkan is BY VALUE: each consumer rebuilds
-/// its own structurally identical chain from this, and nothing shares pointers.
+/// Codec profile a session — and every image, buffer and query pool created
+/// for it — is built against. A `Copy` descriptor, not a chain: Vulkan profile
+/// identity is by value, so each consumer rebuilds its own chain from this.
 ///
-/// It is also the reason this type exists at all: `StdVideoH264ProfileIdc`,
-/// `StdVideoH265ProfileIdc` and `StdVideoAV1Profile` are ALL `c_uint`, so a bare
-/// idc parameter would let one codec's profile silently build another's chain —
-/// the images and the session would then disagree about the profile and the driver
-/// would reject (or worse, accept) at submit time. The enum makes that mistake
-/// unrepresentable.
+/// `StdVideoH264ProfileIdc`, `StdVideoH265ProfileIdc` and `StdVideoAV1Profile`
+/// are all `c_uint`; a bare idc would let one codec's profile build another's
+/// chain. The enum makes that unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecodeProfile {
     H264(hh::StdVideoH264ProfileIdc),
     H265(H265ProfileKey),
-    /// AV1's key additionally carries `filmGrainSupport`, which is part of the
-    /// profile — so an image pool built for a grain stream is a different pool
-    /// from one built for a grain-less one, by construction
-    /// ([`crate::caps_av1`] module docs).
+    /// AV1's key also carries `filmGrainSupport`, which is part of the profile,
+    /// so a grain pool is a different pool from a grain-less one
+    /// ([`crate::caps_av1`]).
     Av1(Av1ProfileKey),
 }
 
 impl DecodeProfile {
-    /// A fresh, UNWIRED chain for this profile. Call [`ProfileChain::wire`] on the
-    /// returned value and keep it immobile for as long as the wired pointers live.
+    /// Fresh unwired chain. Call [`ProfileChain::wire`] and keep it immobile
+    /// while the wired pointers live.
     pub(crate) fn chain(self) -> ProfileChain {
         match self {
             DecodeProfile::H264(idc) => ProfileChain::H264(H264ProfileChain::new(idc)),
@@ -639,8 +562,8 @@ impl DecodeProfile {
     }
 }
 
-/// One codec's profile chain, type-erased for the shared creation paths (images,
-/// bitstream ring, query pool). Same immobility contract as the three variants.
+/// One codec's profile chain, type-erased for shared creation paths. Same
+/// immobility contract as the three variants.
 pub(crate) enum ProfileChain {
     H264(H264ProfileChain),
     H265(H265ProfileChain),
@@ -648,8 +571,8 @@ pub(crate) enum ProfileChain {
 }
 
 impl ProfileChain {
-    /// Wire the chain and hand out the profile root. Do not move `self` while the
-    /// returned reference (or any pointer taken from it) lives.
+    /// Wire the chain and hand out the profile root. Do not move `self` while
+    /// the returned reference (or any pointer from it) lives.
     pub(crate) fn wire(&mut self) -> &vk::VideoProfileInfoKHR<'static> {
         match self {
             ProfileChain::H264(chain) => chain.wire(),
@@ -659,14 +582,14 @@ impl ProfileChain {
     }
 }
 
-/// The one function that asks the driver: video capabilities (with the decode +
-/// H.264 capability structs chained) plus the three format-property enumerations.
-/// Copies facts out and returns; derivation happens in [`derive_caps`].
+/// Asks the driver for video capabilities (decode + H.264 structs chained) and
+/// the three format-property enumerations. Copies facts out; derivation is
+/// [`derive_caps`].
 ///
 /// # Safety
 ///
-/// `dev` wraps live handles per the [`crate::DeviceHandles`] contract (this calls
-/// instance-level functions against its physical device).
+/// `dev` wraps live handles per [`crate::DeviceHandles`] (instance-level
+/// functions against its physical device).
 pub(crate) unsafe fn query_h264_caps(
     dev: &DecodeDevice,
     std_profile_idc: hh::StdVideoH264ProfileIdc,
@@ -676,9 +599,9 @@ pub(crate) unsafe fn query_h264_caps(
 
     let mut h264_caps = vk::VideoDecodeH264CapabilitiesKHR::default();
     let mut decode_caps = vk::VideoDecodeCapabilitiesKHR::default();
-    // ⚠ ORDER IS LOAD-BEARING — see the measured Intel Arc swap in
-    // [`crate::caps_h265::query_h265_caps`]. `push_next` prepends, so pushing the codec
-    // struct FIRST leaves VkVideoDecodeCapabilitiesKHR directly after the base struct.
+    // `push_next` prepends. Push the codec struct first so
+    // VkVideoDecodeCapabilitiesKHR sits directly after the base. Swapping
+    // them is a silent wrong-chain (see [`crate::caps_h265::query_h265_caps`]).
     let mut caps = vk::VideoCapabilitiesKHR::default()
         .push_next(&mut h264_caps)
         .push_next(&mut decode_caps);
@@ -695,7 +618,7 @@ pub(crate) unsafe fn query_h264_caps(
     if r != vk::Result::SUCCESS {
         return Err(r);
     }
-    // Copy everything out before the chained &mut borrows end (encoder precedent).
+    // Copy out before the chained &mut borrows end.
     let capability_flags = caps.flags;
     let min_bitstream_buffer_offset_alignment = caps.min_bitstream_buffer_offset_alignment;
     let min_bitstream_buffer_size_alignment = caps.min_bitstream_buffer_size_alignment;
@@ -708,8 +631,8 @@ pub(crate) unsafe fn query_h264_caps(
     let decode_flags = decode_caps.flags;
     let max_level_idc = h264_caps.max_level_idc;
 
-    // The three queries carry the REAL creation usages (SAMPLED included for the
-    // presenter-facing roles) so the answers validate the images the pools build.
+    // Query the real creation usages (SAMPLED included for presenter-facing
+    // roles) so the answers validate the images the pools build.
     let profile = DecodeProfile::H264(std_profile_idc);
     // SAFETY: same liveness as above; the helper wires its own chain (this and
     // the two calls below).
@@ -737,9 +660,8 @@ pub(crate) unsafe fn query_h264_caps(
     })
 }
 
-/// Enumerate the video format properties for one usage combination. A usage the
-/// implementation rejects outright maps to an EMPTY list (that is the driver saying
-/// "not this arrangement", which [`derive_caps`] then routes around).
+/// Video format properties for one usage. A usage the implementation rejects
+/// maps to an empty list ("not this arrangement"); [`derive_caps`] routes around.
 ///
 /// # Safety
 ///
@@ -761,13 +683,11 @@ pub(crate) unsafe fn query_formats(
     }
 }
 
-/// [`query_formats`] against a bare physical device — no `VkDevice` in sight.
+/// [`query_formats`] against a bare physical device — no `VkDevice`.
 ///
-/// Split out so [`crate::probe`] enumerates through the SAME code the session's caps
-/// query runs, rather than a second copy that would drift (the probe's whole value is
-/// that its answer is the one derivation will see). `vkGetPhysicalDeviceVideoFormat-
-/// PropertiesKHR` is an instance-level command over a physical device, so nothing here
-/// ever needed the logical device the old signature demanded.
+/// [`crate::probe`] enumerates through this same path so its answer is the one
+/// derivation will see. `vkGetPhysicalDeviceVideoFormatPropertiesKHR` is an
+/// instance-level command over a physical device.
 ///
 /// # Safety
 ///
@@ -796,8 +716,7 @@ pub(crate) unsafe fn query_formats_on(
     let r = unsafe { fp(physical_device, &info, &mut count, std::ptr::null_mut()) };
     match r {
         vk::Result::SUCCESS => {}
-        // "This usage/profile combination has no formats" — an arrangement gap,
-        // not a failure (derive_caps decides whether a usable mode remains).
+        // This usage/profile has no formats: an arrangement gap, not a failure.
         vk::Result::ERROR_FORMAT_NOT_SUPPORTED
         | vk::Result::ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR => return Ok(Vec::new()),
         err => return Err(err),
@@ -825,7 +744,6 @@ pub(crate) unsafe fn query_formats_on(
 mod tests {
     use super::*;
 
-    /// A format entry advertising `usage` plus the mutable-format allowance.
     fn entry(format: vk::Format, usage: vk::ImageUsageFlags) -> VideoFormat {
         VideoFormat {
             format,
@@ -837,8 +755,6 @@ mod tests {
         }
     }
 
-    /// A raw-caps fixture in RADV's shape: coincide advertised, separate reference
-    /// images allowed, sane alignments.
     fn radv_like() -> RawH264Caps {
         RawH264Caps {
             capability_flags: vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES,
@@ -867,10 +783,8 @@ mod tests {
         }
     }
 
-    /// NVIDIA's shape: distinct only, NO separate reference images (layered DPB
-    /// array), and only the distinct-mode format lists populated. The DPB entry
-    /// deliberately advertises NEITHER sampling nor mutable formats — reference
-    /// arrays need neither, and requiring them there would fail real devices.
+    /// Distinct only, no separate reference images (layered DPB). DPB entry has
+    /// neither sampling nor mutable format — requiring them would fail real devices.
     fn nvidia_like() -> RawH264Caps {
         RawH264Caps {
             capability_flags: vk::VideoCapabilityFlagsKHR::empty(),
@@ -887,11 +801,8 @@ mod tests {
         }
     }
 
-    /// [`OUTPUT_FORMATS`] is the vocabulary a CONSUMER pins its own per-format
-    /// table against, so it has to be the whole of what this crate can deliver —
-    /// no more (a format listed here but unmappable would fail a pool build) and
-    /// no less (a format produced but unlisted is exactly the silent
-    /// wrong-colour-math case the listing exists to stop).
+    /// [`OUTPUT_FORMATS`] is what a consumer pins against: listed-but-unmappable
+    /// fails a pool build; produced-but-unlisted is silent wrong colour math.
     #[test]
     fn the_output_format_vocabulary_is_the_whole_of_what_this_crate_delivers() {
         for format in OUTPUT_FORMATS {
@@ -900,8 +811,7 @@ mod tests {
                 "{format:?} is advertised as an output but has no plane views"
             );
         }
-        // Every (chroma, depth) pair the H.265 envelope admits resolves INTO the
-        // vocabulary — the one producer that picks a format from stream facts.
+        // Every (chroma, depth) pair the H.265 envelope admits must land here.
         for chroma in 0u8..=4 {
             for depth in 0u8..=4 {
                 if let Some(f) = crate::caps_h265::output_format_for(chroma, depth) {
@@ -913,7 +823,6 @@ mod tests {
                 }
             }
         }
-        // H.264 is the 8-bit 4:2:0 envelope — its one format is in there too.
         assert!(OUTPUT_FORMATS.contains(&NV12));
     }
 
@@ -976,7 +885,7 @@ mod tests {
             }
         );
 
-        // Distinct mode reports which HALF is missing NV12.
+        // Distinct mode names which half is missing NV12.
         let mut raw = nvidia_like();
         raw.output_formats = vec![];
         assert_eq!(
@@ -990,8 +899,7 @@ mod tests {
 
     #[test]
     fn an_advertised_usage_missing_a_creation_bit_is_an_error_naming_the_gap() {
-        // A coincide entry that supports decode but NOT sampling: the presenter
-        // cannot read it, so derivation must refuse rather than create anyway.
+        // Coincide entry with decode but not sampling: presenter cannot read it.
         let mut raw = radv_like();
         raw.coincide_formats = vec![entry(
             NV12,
@@ -1005,9 +913,6 @@ mod tests {
                 missing: vk::ImageUsageFlags::SAMPLED
             }
         );
-        // The missing bit is SAMPLED, so the message says what that COSTS — a field
-        // report carrying this line should not need a second round trip to learn that
-        // the device cannot host the rung at all.
         assert!(
             derive_caps(&raw)
                 .unwrap_err()
@@ -1017,7 +922,6 @@ mod tests {
             derive_caps(&raw).unwrap_err()
         );
 
-        // Same on the distinct output half.
         let mut raw = nvidia_like();
         raw.output_formats = vec![entry(NV12, vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR)];
         assert_eq!(
@@ -1029,9 +933,7 @@ mod tests {
             }
         );
 
-        // A 10-bit stream is refused about P010, not about NV12 — the message used to
-        // say "NV12" whatever the stream was, which sends a reader looking at the wrong
-        // format's support.
+        // A 10-bit stream is refused about P010, not NV12.
         let mut raw = radv_like();
         raw.coincide_formats = vec![entry(
             P010,
@@ -1075,8 +977,7 @@ mod tests {
             }
         );
 
-        // The distinct DPB entry needs NO mutable-format allowance (nvidia_like's
-        // DPB entry has empty create flags and derives fine).
+        // Distinct DPB needs no MUTABLE_FORMAT (nvidia_like has empty create flags).
         assert!(derive_caps(&nvidia_like()).is_ok());
     }
 
@@ -1088,15 +989,14 @@ mod tests {
             height: 16,
         };
         let caps = derive_caps(&raw).unwrap();
-        // 1920x1080: width already aligned, height rounds to 1088 — the exact
-        // padded shape the old smeared-rows class came from, now explicit.
+        // 1920×1080: width already aligned; height rounds to 1088.
         let aligned = caps.aligned_extent(vk::Extent2D {
             width: 1920,
             height: 1080,
         });
         assert_eq!((aligned.width, aligned.height), (1920, 1088));
 
-        // Granularity 1 is the identity; a zero axis degrades to 1, not a panic.
+        // Granularity 1 is identity; a zero axis degrades to 1, not a panic.
         let mut raw = radv_like();
         raw.picture_access_granularity = vk::Extent2D {
             width: 0,
@@ -1112,9 +1012,6 @@ mod tests {
 
     #[test]
     fn coincide_with_a_layered_dpb_is_unsupported_not_worked_around() {
-        // A driver forcing coincide AND a single layered DPB array: the pool
-        // model (fresh image per activation) cannot exist there, and no fleet
-        // device has this shape — refuse so the ladder demotes.
         let mut raw = radv_like();
         raw.capability_flags = vk::VideoCapabilityFlagsKHR::empty();
         assert_eq!(
@@ -1135,9 +1032,8 @@ mod tests {
 
     #[test]
     fn plane_view_formats_follow_the_picture_format_bit_depth() {
-        // The 8-bit families sample through R8/R8G8; the 10-bit 3PACK16 families
-        // MUST use the R10X6 pair — an R8 view over a 10-bit plane reads half of
-        // every sample and produces a plausible-looking wrong picture.
+        // 8-bit families sample through R8/R8G8; 10-bit 3PACK16 must use R10X6.
+        // An R8 view over a 10-bit plane reads half of every sample.
         assert_eq!(
             plane_formats(NV12),
             Some([vk::Format::R8_UNORM, vk::Format::R8G8_UNORM])
@@ -1154,7 +1050,7 @@ mod tests {
         // Anything else has no mapping — derivation refuses rather than guesses.
         assert_eq!(plane_formats(vk::Format::R8G8B8A8_UNORM), None);
 
-        // And the derived caps carry the resolved pair, so pools never re-derive.
+        // Derived caps carry the resolved pair, so pools never re-derive.
         let caps = derive_caps(&radv_like()).unwrap();
         assert_eq!(
             caps.plane_view_formats,

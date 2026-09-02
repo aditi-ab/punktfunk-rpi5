@@ -18,8 +18,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use spa::param::video::{VideoFormat, VideoInfoRaw};
 use spa::pod::Pod;
 
-/// Map a negotiated SPA video format to a layout the encoder can consume. Returns
-/// `None` for formats we don't handle (the frame is then skipped).
 fn map_format(f: VideoFormat) -> Option<PixelFormat> {
     Some(match f {
         VideoFormat::BGRx => PixelFormat::Bgrx,
@@ -29,8 +27,7 @@ fn map_format(f: VideoFormat) -> Option<PixelFormat> {
         VideoFormat::RGB => PixelFormat::Rgb,
         VideoFormat::BGR => PixelFormat::Bgr,
         VideoFormat::NV12 => PixelFormat::Nv12,
-        // The GNOME 50+ HDR screencast formats (packed 2:10:10:10; only ever negotiated by
-        // the `want_hdr` offer, whose MANDATORY colorimetry props pin them to PQ/BT.2020).
+        // Packed 2:10:10:10; only the `want_hdr` offer negotiates these (MANDATORY PQ/BT.2020).
         VideoFormat::xRGB_210LE => PixelFormat::X2Rgb10,
         VideoFormat::xBGR_210LE => PixelFormat::X2Bgr10,
         _ => return None,
@@ -39,91 +36,57 @@ fn map_format(f: VideoFormat) -> Option<PixelFormat> {
 
 struct UserData {
     info: VideoInfoRaw,
-    /// Negotiated layout (`None` until param_changed, or if unsupported).
+    /// `None` until `param_changed`, or if the SPA format is unsupported.
     format: Option<PixelFormat>,
-    /// Negotiated DRM format modifier (for dmabuf import); 0 = LINEAR.
+    /// DRM modifier for dmabuf import; 0 = LINEAR.
     modifier: u64,
-    /// The one-deep frame mailbox (see [`super::FrameSlot`]) + its wakeup sender. Written
-    /// through [`UserData::publish`], never directly.
+    /// One-deep mailbox; write only through [`UserData::publish`].
     slot: super::FrameSlot,
     wake: SyncSender<()>,
-    /// Everything this thread publishes to the capturer — see [`super::CaptureSignals`], which also
-    /// documents each flag's contract (it used to be restated here, and drifted).
     signals: super::CaptureSignals,
-    /// Consecutive tiled-import failures (reset on success); see [`IMPORT_FAIL_POISON`].
+    /// Consecutive tiled-import failures; reset on success. See [`IMPORT_FAIL_POISON`].
     import_fail_streak: u32,
-    /// Present when zero-copy is enabled on NVIDIA: imports a dmabuf → CUDA device buffer,
-    /// normally via the isolated worker process (`pf_zerocopy::Importer::Remote`).
+    /// NVIDIA zero-copy: dmabuf → CUDA, usually via the isolated worker (`Importer::Remote`).
     importer: Option<pf_zerocopy::Importer>,
-    /// VAAPI zero-copy: hand the raw dmabuf to the encoder (which imports + GPU-CSCs it) instead
-    /// of a CUDA import. Set when zero-copy is on, the EGL→CUDA importer is unavailable, and the
-    /// encoder backend is VAAPI (AMD/Intel).
+    /// Raw dmabuf to the encoder instead of a CUDA import (VAAPI).
     vaapi_passthrough: bool,
-    /// `PUNKTFUNK_NV12`: on the tiled EGL/GL zero-copy path, convert to NV12 on the GPU and feed
-    /// NVENC native YUV (Tier 2A). Off ⇒ the BGRx path is unchanged.
+    /// `PUNKTFUNK_NV12`: tiled EGL/GL path converts to NV12 for native NVENC YUV. Off leaves BGRx.
     nv12: bool,
-    /// 4:4:4 session: on the tiled EGL/GL zero-copy path, convert to planar YUV444 on the GPU
-    /// (`ImportKind::Tiled444`) and feed NVENC native full-chroma YUV — takes precedence over
-    /// `nv12` (a 4:4:4 session must never subsample).
+    /// Tiled EGL/GL path converts to planar YUV444. Wins over `nv12` — 4:4:4 must not subsample.
     yuv444: bool,
-    /// The LINEAR (gamescope) NV12 compute CSC failed once — RGB for the rest of the stream
-    /// (T2.5b's per-stream fallback latch; cleared by the next stream's fresh `Ud`).
+    /// LINEAR NV12 compute CSC failed once: RGB for the rest of this stream. Cleared by the next `Ud`.
     linear_nv12_failed: bool,
-    /// Rate-limit counter for the latest-frame-only diagnostic log (see `.process`).
+    /// Rate-limit counter for the latest-frame-only diagnostic (see `.process`).
     dbg_log_n: u64,
-    /// WP-A3/B3 — which clock the wire's `pts_ns` comes from, and how clean each one is. See
-    /// [`crate::pts_provenance`]: the delivery stamp this loop used to take unconditionally is
-    /// downstream of the compositor's delivery jitter, so it bakes that jitter into the
-    /// timestamps the client plays back from.
+    /// Which clock feeds wire `pts_ns`. Delivery stamps sit downstream of compositor jitter.
     pts: crate::pts_provenance::PtsProvenance,
-    /// When the provenance window opened.
     pts_reported: std::time::Instant,
-    /// `CLOCK_REALTIME − CLOCK_MONOTONIC`, ns — what carries the compositor's monotonic stamp
-    /// into the wire's realtime domain. Re-sampled each reporting window; the two clocks drift
-    /// by µs over 30 s, so this is not a per-frame cost.
+    /// `CLOCK_REALTIME − CLOCK_MONOTONIC`, ns. Re-sampled each 30 s window; clocks drift by µs.
     rt_minus_mono_ns: i64,
     /// `PUNKTFUNK_CAPTURE_HDR_PTS=0` puts the wire back on the delivery stamp unconditionally.
     hdr_pts_enabled: bool,
-    /// PW4 step 1: the producer-fence wait distribution, measured on this (the PipeWire loop)
-    /// thread. Per-session, like the fall-through tally.
+    /// Producer-fence wait, measured on this loop thread (a block here delays the next recycle).
     fence_wait: FenceWaitStats,
-    /// PW5 step 1: the negotiated buffer-pool depth, counted from `add_buffer`/`remove_buffer`.
-    /// See [`PoolCensus`] — this is the number that decides whether a deeper encode pipeline is
-    /// safe, and until now nobody had it.
+    /// Negotiated pool depth from `add_buffer`/`remove_buffer`. Budget for a deeper encode pipeline.
     pool: PoolCensus,
-    /// Raw-passthrough frames that silently fell through to the CPU de-pad path, by reason — see
-    /// [`PassthroughFallbacks`]. Per-session: a fresh `UserData` is built per pipeline, so a
-    /// compositor that starts serving dmabufs again after a rebuild gets a fresh log budget.
+    /// Raw-passthrough frames that fell through to CPU, by reason. Fresh `UserData` per pipeline.
     passthrough_fallbacks: PassthroughFallbacks,
-    /// Cursor-as-metadata state, composited into the CPU de-pad path (see `consume_frame`).
     cursor: CursorState,
-    /// `Some((w, h))` while the producer's negotiated size is a sacrificial birth mode and a
-    /// renegotiation to these dims is guaranteed (KWin virtual outputs — kwin.rs `create`):
-    /// `.process` skips whole buffers until the negotiated size matches, then clears this
-    /// (self-disarming — later legitimate resizes are unaffected). `None` = no gating.
+    /// Sacrificial birth-mode size (kwin.rs `create`). `.process` skips until it matches, then clears.
     expect_dims: Option<(u32, u32)>,
-    /// Buffers skipped by the `expect_dims` gate (rate-limits its log).
+    /// Buffers skipped by `expect_dims` (rate-limits its log).
     gate_skips: u64,
-    /// When the gate first held a buffer — after [`GATE_DEADLINE`] with no renegotiation the
-    /// gate disarms and accepts what the producer serves (degraded dims beat a session wedged
-    /// into the first-frame-timeout retry loop; the promised renegotiation normally lands
-    /// within a frame or two).
+    /// When the gate first held a buffer. After [`GATE_DEADLINE`] it disarms: degraded dims beat a retry loop.
     gate_since: Option<std::time::Instant>,
-    /// Deferred requeue of raw-passthrough buffers (see [`DeferredRequeue`]): the encode thread
-    /// reads the dmabuf long after `.process` returns, so the buffer must not rejoin the
-    /// producer's pool until the frame's [`BufferHold`] drops.
+    /// Encode reads the dmabuf after `.process` returns; do not rejoin the pool until [`BufferHold`] drops.
     defer: std::sync::Arc<DeferredRequeue>,
 }
 
 impl UserData {
-    /// Hand `frame` to the consumer as THE latest, OVERWRITING any frame it has not taken yet
-    /// (drop-oldest — see [`super::FrameSlot`]), then poke the wakeup edge.
+    /// Latest-wins into [`super::FrameSlot`], then a wakeup edge.
     ///
-    /// Never blocks the PipeWire loop, which is the hard constraint here: this runs inside
-    /// `.process`, so blocking would stall the compositor's stream. Both operations are
-    /// best-effort — a full wakeup channel means an edge is already pending (nothing lost, the
-    /// slot is the truth), and a poisoned mutex is unreachable in practice (the only critical
-    /// sections are a `take` and this store).
+    /// Must not block: this runs inside `.process` and would stall the compositor. A full
+    /// wakeup channel already has a pending edge; the slot is the truth.
     fn publish(&self, frame: CapturedFrame) {
         if let Ok(mut slot) = self.slot.lock() {
             *slot = Some(frame);
@@ -131,10 +94,9 @@ impl UserData {
         let _ = self.wake.try_send(());
     }
 
-    /// Withhold the raw-passthrough buffer from the producer's pool until the returned hold
-    /// drops — the deferred requeue that closes the rewrite-while-the-encoder-reads race.
-    /// `None` (pool too shallow, or `PUNKTFUNK_ZEROCOPY_HOLD=0`) falls back to the immediate
-    /// `.process`-epilogue requeue, i.e. the old racy contract; said once per session.
+    /// Withhold this buffer from the producer until the returned hold drops.
+    /// `None` (pool too shallow, or `PUNKTFUNK_ZEROCOPY_HOLD=0`) requeues at `.process` return —
+    /// the producer may then rewrite the dmabuf while encode still reads it.
     fn try_defer(&mut self, pw_buf: *mut pw::sys::pw_buffer) -> Option<pf_frame::FrameHold> {
         if !zerocopy_hold_enabled() {
             return None;
@@ -172,106 +134,65 @@ impl UserData {
     }
 }
 
-/// Everything the zero-copy negotiation decision depends on, gathered at ONE point in time.
-/// Split out from [`pipewire_thread`]'s prologue so the decision is a pure function of these
-/// facts — testable, and consumable by both the thread and `spawn_pipewire` (see
-/// [`NegotiationPlan`]).
+/// Facts the zero-copy decision needs, sampled at one instant so the decision is a pure
+/// function — shared by the PipeWire thread and `spawn_pipewire` (see [`NegotiationPlan`]).
 #[derive(Debug, Clone, Copy)]
 pub(super) struct NegotiationInputs {
-    /// `allow_zerocopy && pf_zerocopy::enabled()`.
     pub zerocopy: bool,
-    /// `PUNKTFUNK_FORCE_SHM` — the race-free download path.
+    /// `PUNKTFUNK_FORCE_SHM` — race-free download path.
     pub force_shm: bool,
-    /// This session offers the 10-bit PQ/BT.2020 formats.
     pub want_hdr: bool,
-    /// This session negotiated full-chroma 4:4:4.
     pub want_444: bool,
-    /// [`ZeroCopyPolicy::backend_is_vaapi`].
     pub backend_is_vaapi: bool,
-    /// [`ZeroCopyPolicy::pyrowave_session`].
     pub pyrowave_session: bool,
-    /// [`ZeroCopyPolicy::native_nv12_session`].
     pub native_nv12_session: bool,
-    /// `pf_zerocopy::raw_dmabuf_import_disabled()` — the scoped raw-passthrough latch.
+    /// Scoped raw-passthrough latch.
     pub raw_dmabuf_import_disabled: bool,
-    /// `pf_zerocopy::gpu_import_disabled()` — repeated import-worker deaths.
+    /// Repeated import-worker deaths.
     pub gpu_import_disabled: bool,
-    /// `pf_zerocopy::gpu_dmabuf_negotiation_disabled()` — a previous EGL→CUDA dmabuf-only offer
-    /// timed out (the compositor accepts none of the importer's modifiers).
+    /// Previous EGL→CUDA dmabuf-only offer timed out (compositor accepts none of the modifiers).
     pub gpu_dmabuf_negotiation_failed: bool,
-    /// `PUNKTFUNK_PIPEWIRE_NV12` (default ON) — allow the producer-side NV12 preference.
     pub native_nv12_env_on: bool,
-    /// [`ZeroCopyPolicy::hdr_cuda_ok`] — the resolved encoder can ingest a packed 10-bit PQ CUDA
-    /// payload. Only the direct-SDK NVENC backend can.
+    /// Encoder can ingest packed 10-bit PQ CUDA. Only direct-SDK NVENC can.
     pub hdr_cuda_ok: bool,
 }
 
-/// The resolved zero-copy negotiation decision — **one resolver, consumed by the PipeWire thread
-/// AND by `spawn_pipewire`.**
-///
-/// `spawn_pipewire` used to hand-mirror `vaapi_passthrough` so the capturer's
-/// negotiation-timeout branch could tell which offer had failed, and the copy drifted: it omitted
-/// `raw_dmabuf_import_disabled`, so after that latch fired the mirror still said "raw
-/// passthrough" while the thread had already fallen back — and the timeout branch then latched a
-/// downgrade for an offer it had not made. Deriving both consumers from this struct is what makes
-/// that class of drift unrepresentable rather than merely fixed (same shape as WP7.6's single
-/// Linux encode-backend resolver).
+/// Zero-copy negotiation, resolved once and consumed by the PipeWire thread and `spawn_pipewire`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct NegotiationPlan {
-    /// Build the EGL→CUDA importer for this capture.
     pub build_importer: bool,
-    /// Hand raw dmabufs straight to the encoder instead of importing to CUDA.
     pub vaapi_passthrough: bool,
-    /// Offer gamescope's producer-side NV12 pod ahead of packed RGB.
     pub prefer_native_nv12: bool,
-    /// Carried through so [`want_dmabuf`](Self::want_dmabuf) needs no second copy of it.
+    /// Carried so [`want_dmabuf`](Self::want_dmabuf) needs no second copy.
     pub force_shm: bool,
-    /// Diagnostic: this capture WOULD have taken the raw passthrough, but its scoped latch is
-    /// set (the encoder repeatedly failed to import, or a previous negotiation timed out).
+    /// Would have taken raw passthrough, but its latch is set.
     pub raw_dmabuf_latched: bool,
-    /// Diagnostic: this capture WOULD have built the EGL→CUDA importer, but a latch fired —
-    /// repeated import-worker deaths, or a previous dmabuf-offer negotiation timeout.
+    /// Would have built the EGL→CUDA importer, but a latch fired.
     pub gpu_import_latched: bool,
 }
 
 /// Resolve the negotiation plan. **Pure** — every environment read is already in `i`.
 ///
-/// The four invariants this encodes were previously prose-only comments spread across the
-/// prologue; `negotiation_plan_invariants` in the tests below pins each one:
-///   1. HDR never takes the TILED EGL de-tile blit (it renders into an 8-bit `GL_RGBA8` texture
-///      → silent depth loss). It may still build the importer, because the HDR pod family
-///      advertises LINEAR only ([`build_hdr_dmabuf_format`]) — so an HDR dmabuf necessarily
-///      takes the Vulkan-bridge / CUDA-external-memory arm, which is byte-exact for any 4 Bpp
-///      packed format. The per-frame gate in `.process` enforces the tiled half.
-///   2. 4:4:4 never prefers producer NV12 (a 4:4:4 session must not be subsampled).
-///   3. Producer-native NV12 only on a `native_nv12_session` under an active raw passthrough
-///      (libav VAAPI would misread the two-plane buffer; the CUDA importer expects packed RGB).
-///   4. The raw passthrough is off whenever its own latch has fired.
+/// Invariants (pinned by `negotiation_plan_invariants`):
+/// 1. HDR never takes the tiled EGL de-tile blit (8-bit `GL_RGBA8`). It may still build the
+///    importer: HDR pods advertise LINEAR only ([`build_hdr_dmabuf_format`]), so the frame
+///    takes the Vulkan-bridge arm. The per-frame gate in `.process` enforces the tiled half.
+/// 2. 4:4:4 never prefers producer NV12 (must not subsample).
+/// 3. Producer-native NV12 only on a `native_nv12_session` under active raw passthrough
+///    (libav VAAPI misreads two-plane; the CUDA importer expects packed RGB).
+/// 4. Raw passthrough is off once its latch has fired.
 pub(super) fn negotiation_plan(i: NegotiationInputs) -> NegotiationPlan {
-    // The frames' consumer imports raw dmabufs itself: the VAAPI backend (libva import + GPU
-    // CSC) or a PyroWave session (the wavelet encoder's own Vulkan device, any vendor).
+    // Consumer imports raw dmabufs: VAAPI (libva + GPU CSC) or PyroWave (its Vulkan device).
     let raw_passthrough = i.backend_is_vaapi || i.pyrowave_session;
-    // Building the EGL→CUDA importer would waste a CUDA probe under a raw passthrough — or
-    // worse, succeed and produce CUDA payloads only NVENC can consume. `gpu_import_disabled` is
-    // the repeated-worker-death latch (a wedged GPU stack must not crash-loop);
-    // `gpu_dmabuf_negotiation_failed` is the offer's own timeout latch (a compositor that accepts
-    // none of the importer's modifiers refuses them identically on every retry, so the next
-    // session negotiates the CPU path instead of re-paying the 10 s timeout).
-    //
-    // HDR is NOT excluded outright (invariant 1): its pods are LINEAR-only, so it lands on the
-    // Vulkan-bridge arm, never the 8-bit de-tile blit. But it is excluded where the encoder cannot
-    // take a packed 10-bit CUDA payload — the libav fallback's HDR route swscales into a P010
-    // hardware frame, so it must keep getting CPU frames. Without that term a
-    // `PUNKTFUNK_NVENC_DIRECT=0` host would stream garbage.
+    // Skip under raw passthrough (payloads only NVENC consumes) and both GPU latches
+    // (worker-death crash-loop; compositor that rejects our modifiers would re-pay 10 s).
+    // HDR is allowed: pods are LINEAR-only, so it never hits the 8-bit de-tile blit. Exclude
+    // HDR when the encoder cannot take packed 10-bit CUDA (`PUNKTFUNK_NVENC_DIRECT=0` is garbage).
     let build_importer = i.zerocopy
         && !raw_passthrough
         && !i.gpu_import_disabled
         && !i.gpu_dmabuf_negotiation_failed
         && (!i.want_hdr || i.hdr_cuda_ok);
-    // Note there is no `importer.is_none()` term, unlike the expression this replaces: it was
-    // redundant (`build_importer` already excludes `raw_passthrough`, so the importer is
-    // necessarily absent here) and it is what made the decision look impure — the reason
-    // `spawn_pipewire` "had to" mirror it by hand.
     let vaapi_passthrough =
         i.zerocopy && !i.force_shm && raw_passthrough && !i.raw_dmabuf_import_disabled;
     let prefer_native_nv12 = i.native_nv12_env_on
@@ -290,8 +211,7 @@ pub(super) fn negotiation_plan(i: NegotiationInputs) -> NegotiationPlan {
             && !i.force_shm
             && raw_passthrough
             && i.raw_dmabuf_import_disabled,
-        // Every `build_importer` term EXCEPT the two latches, and then either latch — i.e. exactly
-        // "this capture would have built the importer, but a latch stopped it".
+        // Every `build_importer` term except the two latches, then either latch.
         gpu_import_latched: i.zerocopy
             && !raw_passthrough
             && (!i.want_hdr || i.hdr_cuda_ok)
@@ -300,30 +220,23 @@ pub(super) fn negotiation_plan(i: NegotiationInputs) -> NegotiationPlan {
 }
 
 impl NegotiationPlan {
-    /// Whether to request dmabuf buffers. Not part of the plan proper: it depends on whether the
-    /// importer actually CONSTRUCTED (`have_importer` — a GPU/driver fact) and on the modifier
-    /// list that construction yielded.
+    /// Request dmabufs only if the importer actually constructed and returned modifiers.
     pub(super) fn want_dmabuf(&self, have_importer: bool, modifiers: &[u64]) -> bool {
         (have_importer || self.vaapi_passthrough) && !modifiers.is_empty() && !self.force_shm
     }
 }
 
-/// Which capture arm a negotiated pipeline actually resolved to.
+/// Which capture arm a negotiated pipeline resolved to.
 ///
-/// The 2026-08-08 PyroWave triage had to reconstruct this from four files, because no single line
-/// ever states it: the arm is the product of a policy, a latch, an importer that may or may not
-/// have constructed, and a modifier list. A degraded host and a healthy one logged the same
-/// thing. [`resolved_capture_arm`] plus the one INFO line at pipeline build is the whole fix.
+/// Product of a policy, a latch, whether the importer constructed, and the modifier list.
+/// [`resolved_capture_arm`] plus the INFO line at pipeline build is the one place this is stated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CaptureArm {
-    /// Raw dmabufs handed straight to the encoder, which imports them itself — libva (VAAPI) or
-    /// the PyroWave encoder's own Vulkan device. No host pixel touch.
+    /// Raw dmabufs to the encoder (libva or PyroWave Vulkan). No host pixel touch.
     DmabufPassthrough,
-    /// dmabufs imported to CUDA device buffers by the EGL→CUDA worker, for NVENC. No host pixel
-    /// touch either, but a different failure surface (the worker, the modifier negotiation).
+    /// dmabufs imported to CUDA by the EGL→CUDA worker, for NVENC.
     CudaImport,
-    /// CPU frames: an mmap de-pad of every frame, then whatever CSC + upload the encoder needs.
-    /// The slow path — always a downgrade when the consumer could have taken a dmabuf.
+    /// CPU mmap de-pad. A downgrade when the consumer could have taken a dmabuf.
     Cpu,
 }
 
@@ -337,47 +250,39 @@ impl CaptureArm {
     }
 }
 
-/// Resolve the arm this pipeline ended up on. **Pure** — `have_importer` and `want_dmabuf` are the
-/// two runtime facts `negotiation_plan` cannot know (whether the importer constructed, and what
-/// modifier list that yielded); everything else is already in the plan.
+/// Resolve the arm this pipeline ended up on. **Pure.**
+///
+/// `have_importer` and `want_dmabuf` are the two runtime facts `negotiation_plan` cannot know.
 pub(super) fn resolved_capture_arm(
     plan: &NegotiationPlan,
     have_importer: bool,
     want_dmabuf: bool,
 ) -> CaptureArm {
     if !want_dmabuf {
-        // No dmabuf offer at all: SHM/CPU frames, whatever the plan wanted.
         CaptureArm::Cpu
     } else if plan.vaapi_passthrough {
         CaptureArm::DmabufPassthrough
     } else if have_importer {
         CaptureArm::CudaImport
     } else {
-        // Unreachable via `want_dmabuf` (it requires `have_importer || vaapi_passthrough`), but
-        // stated rather than `unreachable!()`: a logging helper must never be the thing that
-        // panics a capture thread.
+        // `want_dmabuf` requires `have_importer || vaapi_passthrough`. Fallback so a logging
+        // helper can never panic the capture thread.
         CaptureArm::Cpu
     }
 }
 
-/// Who consumes the captured frames — the fact that decides whether a CPU arm is a *downgrade*
-/// worth warning about, and what to call it in the log.
+/// Who consumes captured frames — whether a CPU arm is a downgrade, and what to call it.
 ///
-/// Derived from the resolved [`ZeroCopyPolicy`](crate::ZeroCopyPolicy), **not** from the encoder
-/// pref: `pyrowave_session` is per-session (the negotiated codec), so a PyroWave session on an
-/// otherwise-NVENC host reads as PyroWave here. Naming the pref instead is exactly how a PyroWave
-/// session's CPU downgrade came to be reported as an NVENC one — or, on an NVIDIA host, not
-/// reported at all.
+/// From the resolved [`ZeroCopyPolicy`](crate::ZeroCopyPolicy), not the encoder pref:
+/// `pyrowave_session` is per-session, so a PyroWave session on an NVENC host is PyroWave here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConsumerKind {
-    /// This session encodes PyroWave: the wavelet encoder's own Vulkan device imports dmabufs on
-    /// any vendor, so a CPU arm costs it the passthrough it was designed around.
+    /// Wavelet encoder's Vulkan device imports dmabufs on any vendor; CPU costs the passthrough.
     PyroWave,
-    /// The VAAPI backend (AMD/Intel): libva imports the dmabuf and CSCs on the GPU.
+    /// libva imports the dmabuf and CSCs on the GPU.
     Vaapi,
-    /// NVENC, fed by the EGL→CUDA importer.
     Nvenc,
-    /// The software encoder — CPU frames are its native input, so a CPU arm is no downgrade.
+    /// Software encoder — CPU frames are native input, so a CPU arm is not a downgrade.
     Software,
 }
 
@@ -391,18 +296,15 @@ impl ConsumerKind {
         }
     }
 
-    /// Whether landing on [`CaptureArm::Cpu`] is a performance downgrade for this consumer (i.e.
-    /// worth a `warn!`). True for every GPU consumer; false for the software encoder, which wants
-    /// CPU frames anyway.
+    /// True for every GPU consumer; false for software, which wants CPU frames.
     pub(super) fn cpu_is_downgrade(self) -> bool {
         !matches!(self, ConsumerKind::Software)
     }
 }
 
 /// Classify the frames' consumer. **Pure.** `pyrowave_session` wins over `backend_is_vaapi`
-/// because it is the per-session truth and the pref is host-global (a PyroWave session also flips
-/// `backend_is_vaapi` on, via `linux_zero_copy_is_vaapi`'s `Pyrowave` arm — so testing vaapi first
-/// would swallow every PyroWave session).
+/// because it is per-session and the pref is host-global (a PyroWave session also sets
+/// `backend_is_vaapi` via `linux_zero_copy_is_vaapi`'s `Pyrowave` arm).
 pub(super) fn consumer_kind(
     pyrowave_session: bool,
     backend_is_vaapi: bool,
@@ -419,23 +321,19 @@ pub(super) fn consumer_kind(
     }
 }
 
-/// Why a frame on the raw-dmabuf passthrough could not be handed to the encoder and fell through
-/// to the CPU de-pad path instead.
+/// Why a raw-dmabuf passthrough frame fell through to the CPU de-pad path.
 ///
-/// Each variant is a *different* diagnosis with a different fix, and all four were silent: the
-/// passthrough block simply fell out of its `if` and the frame took the slow path, so a session
-/// that had negotiated zero-copy could pay CPU costs on every frame while logging a healthy
-/// "advertising DMA-BUF modifiers" line at open.
+/// Each variant is a different diagnosis. Without this, the `if` fell out silently and a
+/// zero-copy session could pay CPU on every frame while logging a healthy open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PassthroughFallback {
-    /// No format negotiated yet — transient, and expected around a renegotiation.
+    /// No format yet — transient around renegotiation.
     NoFormat,
-    /// The producer delivered an SHM/MemFd buffer for this frame, not a dmabuf.
+    /// Producer delivered SHM/MemFd, not a dmabuf.
     NotDmabuf,
-    /// The negotiated pixel format has no DRM fourcc, so it cannot be described to the encoder.
+    /// Negotiated format has no DRM fourcc, so the encoder cannot describe it.
     NoFourcc,
-    /// `F_DUPFD_CLOEXEC` failed — the fd could not be duplicated to outlive the buffer recycle
-    /// (an fd-limit symptom, not a graphics one).
+    /// `F_DUPFD_CLOEXEC` failed (fd-limit, not graphics).
     DupFailed,
 }
 
@@ -458,15 +356,11 @@ impl PassthroughFallback {
         }
     }
 
-    /// What actually happens to the frame. Three of the four reasons downgrade it to the CPU
-    /// de-pad path; `NoFormat` does not — the CPU path needs `ud.format` too and returns without
-    /// de-padding, so that frame is DROPPED. Worth the distinction: "slower" and "gone" are
-    /// different faults, and a diagnostic that conflates them is the thing PW2 exists to remove.
+    /// Three reasons downgrade to CPU; `NoFormat` drops the frame (CPU path needs `ud.format` too).
     pub(super) fn falls_back_to_cpu(self) -> bool {
         !matches!(self, PassthroughFallback::NoFormat)
     }
 
-    /// What to do about it — the half a log line is useless without.
     pub(super) fn hint(self) -> &'static str {
         match self {
             PassthroughFallback::NoFormat => {
@@ -485,36 +379,23 @@ impl PassthroughFallback {
     }
 }
 
-/// Upper bounds (µs) of the fence-wait histogram's buckets; the last bucket is everything above.
+/// Upper bounds (µs) of the fence-wait histogram; last bucket is overflow.
 ///
-/// Deliberately coarse and log-ish. The question this instrument exists to answer is not "what is
-/// the wait, to the microsecond" but "**is the tail ~0, or is it milliseconds?**" — the first
-/// answer retires PW4 as a comment correction, the second justifies moving the wait off the
-/// PipeWire loop thread. Bucket edges are placed so those two worlds cannot be confused: anything
-/// at or below 100 µs is noise, anything past 1 ms is a real stall on a 60 Hz budget of 16.6 ms.
+/// ≤100 µs is noise; >1 ms is a stall on a 60 Hz 16.6 ms budget. Coarse on purpose: the
+/// question is whether the tail is ~0 or milliseconds.
 const FENCE_WAIT_BUCKETS_US: [u64; 6] = [100, 500, 1_000, 2_000, 5_000, 10_000];
 
-/// PW4 step 1: the distribution of the producer's implicit-fence wait, measured **on the PipeWire
-/// loop thread**, which is exactly where it is expensive — that thread is the compositor's
-/// consumer, so time spent blocked here delays buffer recycling for the NEXT frame.
+/// Producer implicit-fence wait, measured on the PipeWire loop thread.
 ///
-/// PW4 is pre-registered to be **abandoned on evidence**: if the p99 sits in the first bucket the
-/// wait is already ~free and the package becomes a comment correction. Shipping the instrument
-/// before the change is the whole point — the alternative is moving load-bearing synchronisation
-/// off a thread on a hunch.
-///
-/// One caveat the reader needs: measure this AFTER the priority levers land. The win case for
-/// moving the wait is a loaded GPU, which is the same scenario PW1 targets, so a measurement taken
-/// before PW1 would hand PW4 credit for PW1's problem.
+/// That thread is the compositor's consumer, so a block here delays recycling for the next
+/// frame. A `NoFence` majority means the wait is structurally free, not merely short.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct FenceWaitStats {
     samples: u64,
     total_us: u64,
     max_us: u64,
-    /// One more than the bucket bounds: the overflow bucket.
+    /// Overflow bucket: one past the last bound.
     buckets: [u64; FENCE_WAIT_BUCKETS_US.len() + 1],
-    /// Outcome split — a `NoFence` majority means the wait is structurally free on this producer
-    /// (nothing to wait for), which is a different finding from "the wait is short".
     signaled: u64,
     no_fence: u64,
     timed_out: u64,
@@ -522,8 +403,6 @@ pub(super) struct FenceWaitStats {
 }
 
 impl FenceWaitStats {
-    /// Record one wait. `bucket_of` is inlined here rather than exposed: the histogram is only
-    /// ever read through [`summary`](Self::summary).
     pub(super) fn record(&mut self, us: u64) {
         self.samples += 1;
         self.total_us += us;
@@ -535,14 +414,13 @@ impl FenceWaitStats {
         self.buckets[idx] += 1;
     }
 
-    /// The bucket the `q`-quantile falls in, as its upper bound in µs — `None` for the overflow
-    /// bucket (i.e. "worse than the last edge"). Counting up to the quantile rather than
-    /// interpolating keeps this honest about what a histogram can actually say.
+    /// Bucket upper bound for the `q`-quantile, µs; inner `None` is overflow.
+    /// Counts up to the quantile rather than interpolating.
     pub(super) fn quantile_bucket_us(&self, q: f64) -> Option<Option<u64>> {
         if self.samples == 0 {
             return None;
         }
-        // The index of the sample at `q`, 0-based, so q=1.0 picks the last sample.
+        // 0-based index of the sample at `q`; q=1.0 is the last sample.
         let target = ((self.samples as f64) * q).ceil().max(1.0) as u64;
         let mut seen = 0u64;
         for (i, &count) in self.buckets.iter().enumerate() {
@@ -558,36 +436,24 @@ impl FenceWaitStats {
         self.total_us.checked_div(self.samples).unwrap_or(0)
     }
 
-    /// Whether enough has been seen for the p99 to mean anything. 100 frames is under two seconds
-    /// at 60 fps and is the point where one outlier stops dominating the answer.
+    /// 100 frames ≈ 1.7 s at 60 fps — past the point one outlier dominates p99.
     pub(super) fn is_meaningful(&self) -> bool {
         self.samples >= 100
     }
 }
 
-/// PW5 stage 1: how many buffers the producer actually allocated for this stream.
+/// How many buffers the producer allocated for this stream.
 ///
-/// **Nothing in this codebase had ever counted them.** The zero-copy path used to hand the SPA
-/// buffer straight back to the producer at `.process` return, leaving pool depth as the only
-/// thing keeping capture untorn. The deferred requeue ([`DeferredRequeue`]) now withholds
-/// published buffers until the consumer is done, but the depth still matters twice over: it is
-/// the budget `HoldBook::try_hold` spends (a pool of ≤ [`HOLD_POOL_RESERVE`] cannot defer at
-/// all and runs the old race), and for un-deferred frames it remains the race window.
-///
-/// `live` is maintained by the `add_buffer`/`remove_buffer` stream callbacks, which PipeWire fires
-/// on the loop thread as the pool is allocated (and again, remove-then-add, on a renegotiation that
-/// replaces it). There is no "pool complete" event, so the count is published from `.process`: by
-/// the time the first buffer is dequeued the allocation has finished.
+/// `live` comes from `add_buffer`/`remove_buffer` on the loop thread. There is no "pool
+/// complete" event, so the count is published from `.process` (first dequeue ⇒ allocation
+/// finished). Depth is the budget [`HoldBook::try_hold`] spends; a pool of ≤ [`HOLD_POOL_RESERVE`]
+/// cannot defer and the producer may rewrite a buffer mid-encode.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct PoolCensus {
-    /// Buffers currently in the pool (adds minus removes).
     live: u32,
-    /// Deepest `live` seen this session — the number a depth decision must key on, since a
-    /// renegotiation can transiently shrink the pool to zero.
+    /// Deepest `live` this session. A depth decision must not follow a renegotiation down to zero.
     high_water: u32,
-    /// The `live` value already logged, so a stable pool logs exactly one line per distinct depth
-    /// (a renegotiation that changes the depth is worth a second line; 240 frames a second of the
-    /// same number is not).
+    /// Last logged `live`, so a stable pool logs once per distinct depth.
     logged: Option<u32>,
 }
 
@@ -601,8 +467,7 @@ impl PoolCensus {
         self.live = self.live.saturating_sub(1);
     }
 
-    /// Called from `.process`, once per buffer. Returns `Some(live)` the first time each distinct
-    /// depth is seen — the caller logs then and only then.
+    /// `Some(live)` the first time each distinct depth is seen.
     fn note_frame(&mut self) -> Option<u32> {
         (self.logged != Some(self.live)).then(|| {
             self.logged = Some(self.live);
@@ -611,13 +476,10 @@ impl PoolCensus {
     }
 }
 
-/// Per-session tally of raw-passthrough frames that fell through to the CPU path, with a one-line
-/// budget per distinct reason.
+/// Per-session tally of raw-passthrough fall-throughs, one log line per distinct reason.
 ///
-/// Rate-limiting is what makes this shippable: `.process` runs per frame, so an unconditional log
-/// would flood at the capture rate. Per *reason* rather than per session, because the four reasons
-/// diagnose different faults and a transient `NoFormat` at open must not spend the budget a
-/// persistent `NotDmabuf` needs.
+/// `.process` runs per frame; per-reason so a transient `NoFormat` at open does not spend
+/// the budget a persistent `NotDmabuf` needs.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct PassthroughFallbacks {
     frames: u64,
@@ -625,9 +487,7 @@ pub(super) struct PassthroughFallbacks {
 }
 
 impl PassthroughFallbacks {
-    /// Record one fall-through. Returns `Some(frames_so_far)` the FIRST time each distinct reason
-    /// is seen this session — the caller logs then and only then, so at most four lines per
-    /// session regardless of frame rate.
+    /// `Some(frames_so_far)` the first time this reason is seen this session.
     pub(super) fn note(&mut self, reason: PassthroughFallback) -> Option<u64> {
         self.frames += 1;
         let bit = reason.bit();
@@ -638,48 +498,37 @@ impl PassthroughFallbacks {
     }
 }
 
-/// Consecutive tiled-import failures (worker alive, e.g. a per-buffer `EGL_BAD_MATCH`) before
-/// the stream is poisoned for rebuild. A tiled import failure must NEVER fall through to the
-/// CPU mmap path — de-padding tiled bytes as linear produces a scrambled image — so after a
-/// short streak of dropped frames the capturer fails loudly and the session renegotiates.
+/// Tiled-import failures (worker alive) before the stream is poisoned for rebuild.
+/// Never fall through to CPU mmap: de-padding tiled bytes as linear is a scrambled image.
 const IMPORT_FAIL_POISON: u32 = 3;
 
-/// Buffers the deferred requeue always leaves in the producer's pool. One for the frame the
-/// producer is rendering right now, one in transit — withholding past that would make the
-/// producer skip frames whenever our holds are at their worst (host frame + up to two encoder
-/// ring slots), which is a pacing hiccup, not corruption, but there is no reason to court it.
+/// Buffers left in the producer's pool: one it is rendering, one in transit.
+/// Withholding past that skips frames when holds peak (host frame + up to two encoder slots).
 const HOLD_POOL_RESERVE: u32 = 2;
 
-/// `PUNKTFUNK_ZEROCOPY_HOLD=0` restores the immediate `.process`-return requeue (the racy
-/// pre-hold behavior) — a field bisect lever, not a tuning knob. `env_on` grammar like every
-/// other capture knob (a bare `== "0"` compare is the trap `PUNKTFUNK_FORCE_SHM` already fell in).
+/// `PUNKTFUNK_ZEROCOPY_HOLD=0` restores immediate requeue (racy). Use `env_on`; a bare
+/// `== "0"` is the trap `PUNKTFUNK_FORCE_SHM` already hit.
 fn zerocopy_hold_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| pf_host_config::env_on("PUNKTFUNK_ZEROCOPY_HOLD").unwrap_or(true))
 }
 
-/// Pure bookkeeping for the deferred requeue: which buffers are currently withheld from the
-/// producer, each under a per-hold generation so a pointer-value reuse across a pool
-/// renegotiation can never satisfy a stale hold's release (see `complete`).
+/// Which buffers are withheld, each under a per-hold generation.
 ///
-/// Threading contract (what makes the single-requeue invariant hold with no atomics): entries are
-/// INSERTED (`try_hold`) and REMOVED (`complete` via the requeue channel's callback, `purge` via
-/// `remove_buffer`) only on the PipeWire loop thread; a dropping [`BufferHold`] on any other
-/// thread only *sends* the release message. So between a hold's creation and the loop servicing
-/// its release, `contains` is stable — which is exactly what the `.process` epilogue relies on to
-/// decide "requeue now" vs "the hold owns the requeue".
+/// A pointer-value reuse across pool renegotiation must not satisfy a stale hold (`complete`).
+/// Insert/remove run only on the loop thread; a dropping [`BufferHold`] only sends. Between
+/// hold creation and the loop servicing release, `contains` is stable — what `.process` uses
+/// to choose "requeue now" vs "the hold owns the requeue".
 #[derive(Default)]
 struct HoldBook {
-    /// Withheld buffers: `*mut pw_buffer` as usize → the generation of the hold that owns it.
+    /// `*mut pw_buffer` as usize → generation that owns it.
     out: std::collections::HashMap<usize, u64>,
     /// Last issued hold generation (monotonic per stream).
     last_gen: u64,
 }
 
 impl HoldBook {
-    /// Withhold `buf` if the pool can spare it: at most `pool_live - HOLD_POOL_RESERVE` buffers
-    /// out at once. Returns the generation to release with, or `None` (pool too shallow / buffer
-    /// somehow already out — the caller falls back to the immediate requeue).
+    /// Withhold `buf` if the pool can spare it (`pool_live - HOLD_POOL_RESERVE` out at once).
     fn try_hold(&mut self, buf: usize, pool_live: u32) -> Option<u64> {
         let cap = pool_live.saturating_sub(HOLD_POOL_RESERVE) as usize;
         if self.out.len() >= cap || self.out.contains_key(&buf) {
@@ -690,10 +539,8 @@ impl HoldBook {
         Some(self.last_gen)
     }
 
-    /// A hold released: take `buf` out of the book iff this generation still owns it. `true` ⇒
-    /// the caller must requeue the buffer; `false` ⇒ the entry was purged (pool renegotiated —
-    /// the pointer may even be a NEW buffer under a reused address) and the buffer must NOT be
-    /// touched.
+    /// Release `buf` iff this generation still owns it. `true` ⇒ caller must requeue;
+    /// `false` ⇒ purged (pool renegotiated — pointer may be a new buffer) so do not touch it.
     fn complete(&mut self, buf: usize, generation: u64) -> bool {
         match self.out.get(&buf) {
             Some(&g) if g == generation => {
@@ -704,8 +551,7 @@ impl HoldBook {
         }
     }
 
-    /// `remove_buffer`: the buffer is being freed under us (renegotiation/teardown) — forget it.
-    /// Its hold's later release finds the generation gone and becomes a no-op.
+    /// `remove_buffer`: the buffer is being freed under us. Later release of its hold is a no-op.
     fn purge(&mut self, buf: usize) {
         self.out.remove(&buf);
     }
@@ -715,21 +561,17 @@ impl HoldBook {
     }
 }
 
-/// Shared between the loop thread ([`HoldBook`] ops) and the [`BufferHold`] guards riding
-/// published frames to the encode thread.
+/// Shared by the loop thread ([`HoldBook`] ops) and [`BufferHold`] guards on the encode thread.
 struct DeferredRequeue {
     book: std::sync::Mutex<HoldBook>,
-    /// Wakes the loop to requeue `(buffer, generation)`. Send failure = the loop (and with it
-    /// the stream and every buffer) is gone — nothing to release.
+    /// Wakes the loop to requeue `(buffer, generation)`. Send failure = the loop is gone.
     tx: pw::channel::Sender<(usize, u64)>,
-    /// One-per-session lines: the first successful defer, and the shallow-pool fallback.
     logged_active: std::sync::atomic::AtomicBool,
     logged_shallow: std::sync::atomic::AtomicBool,
 }
 
-/// The concrete [`pf_frame::FrameHold`]: releases its buffer back to the producer when the last
-/// clone drops. Send-only from the dropping thread — the actual `pw_stream_queue_buffer` runs in
-/// the requeue channel's loop-thread callback.
+/// Releases its buffer to the producer when the last clone drops. Send-only from the dropping
+/// thread; `pw_stream_queue_buffer` runs in the requeue channel's loop-thread callback.
 struct BufferHold {
     defer: std::sync::Arc<DeferredRequeue>,
     buf: usize,
@@ -742,8 +584,7 @@ impl Drop for BufferHold {
     }
 }
 
-/// Log a frame-drop reason once per process (the process callback runs per frame; a stuck
-/// pipeline must say why without flooding).
+/// Log a frame-drop reason once per process (`.process` runs per frame).
 fn warn_once(msg: &'static str) {
     use std::sync::Mutex;
     static SEEN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
@@ -754,8 +595,8 @@ fn warn_once(msg: &'static str) {
     }
 }
 
-/// A read-only mmap of a dmabuf fd, unmapped on drop. Used when MAP_BUFFERS didn't map the
-/// buffer (producers don't always flag dmabufs mappable, e.g. gamescope's Vulkan exports).
+/// Read-only mmap of a dmabuf fd, unmapped on drop. Used when MAP_BUFFERS left the buffer unmapped
+/// (producers do not always flag dmabufs mappable — gamescope Vulkan exports).
 struct DmabufMap {
     ptr: *mut std::ffi::c_void,
     len: usize,
@@ -800,25 +641,14 @@ fn supported_data_plane_count(count: u32) -> Option<usize> {
     (1..=2).contains(&count).then_some(count as usize)
 }
 
-/// De-pad / import a single PipeWire buffer and push it to the encoder. Called from the
-/// `.process` callback with the NEWEST drained buffer (latest-frame-only). `datas` is sourced
-/// via the same transparent cast libspa's `Buffer::datas_mut` performs, so the safe `Data`
-/// accessors (`.type_()`, `.chunk()`, `.data()`, `.fd()`, `.as_raw()`) keep working.
-///
-/// `pw_buf` is the buffer's `pw_buffer` handle (`spa_buf`'s owner), used only as the identity a
-/// raw-passthrough publish withholds via [`UserData::try_defer`] — never dereferenced here.
-/// How often the wire-pts provenance line is emitted (WP-A3). Matches the audio plane's stats
-/// cadence so a field log reads as one timeline.
+/// How often the wire-pts provenance line is emitted. Matches the audio plane's stats cadence.
 const PTS_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `CLOCK_REALTIME − CLOCK_MONOTONIC`, ns.
 ///
-/// PipeWire stamps `spa_meta_header.pts` in the graph's clock domain (`CLOCK_MONOTONIC`); the wire
-/// — and the client's plausibility gate — speak realtime-since-epoch. Sampling the pair back to
-/// back is what carries one into the other, and the residual is the few hundred nanoseconds
-/// between the two reads against a 50 ms plausibility window. A failed read reports 0, which puts
-/// every rebased stamp outside that window and falls the whole stream back to delivery stamps —
-/// the safe direction.
+/// PipeWire stamps `spa_meta_header.pts` in `CLOCK_MONOTONIC`; the wire speaks realtime-since-epoch.
+/// A failed read reports 0, which puts every rebased stamp outside the 50 ms plausibility window
+/// and falls the stream back to delivery stamps — the safe direction.
 fn realtime_minus_monotonic_ns() -> i64 {
     let rt = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -859,18 +689,22 @@ fn packed_frame_geometry(
     Some((row, stride, needed, tight))
 }
 
+/// De-pad / import one PipeWire buffer and push it to the encoder.
+///
+/// Called from `.process` with the newest drained buffer. `datas` uses the same transparent
+/// cast as libspa's `Buffer::datas_mut`, so the safe `Data` accessors keep working. `pw_buf`
+/// is identity for [`UserData::try_defer`] only — never dereferenced here.
 fn consume_frame(
     ud: &mut UserData,
     spa_buf: *mut spa::sys::spa_buffer,
     pw_buf: *mut pw::sys::pw_buffer,
     hdr_pts_ns: Option<i64>,
 ) {
-    // No active stream: release the buffer without the (expensive at 5K) de-pad.
+    // Inactive: skip the de-pad (expensive at 5K).
     if !ud.signals.active.load(Ordering::Relaxed) {
         return;
     }
-    // Poisoned (GPU import lost): the capturer is already surfacing an error to the encode
-    // loop; skip per-frame work until the rebuild tears this stream down.
+    // GPU import lost: skip per-frame work until the rebuild tears this stream down.
     if ud.signals.broken.load(Ordering::Relaxed) {
         return;
     }
@@ -894,19 +728,15 @@ fn consume_frame(
         return; // format not negotiated yet
     }
 
-    // ONE stamp for this frame, whichever of the three paths below publishes it (WP-B3). Each
-    // used to take its own `SystemTime::now()` at the moment it happened to reach the publish, so
-    // a CPU de-pad's milliseconds landed INSIDE the timestamp and the three paths could drift
-    // apart without anything saying so. Sampled here, before any of that work, the stamp
-    // describes the frame's arrival rather than our handling of it.
+    // One stamp for every publish path, taken before de-pad/import. Sampling at publish put
+    // CPU work inside the timestamp and let the three paths drift apart.
     let delivery_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let hdr_pts_ns = hdr_pts_ns.filter(|&p| p > 0);
-    // Measured on EVERY capture, whether or not the compositor's stamp is the one we ship: the
-    // question "which clock is cleaner on this host" is what decides that, and a diagnostic that
-    // only runs once you already trust the answer cannot inform it.
+    // Observe even if we ship the delivery stamp: which clock is cleaner on this host is the
+    // question; a diagnostic that runs only after you trust the answer cannot inform it.
     ud.pts.observe(hdr_pts_ns, delivery_ns);
     let stamp = crate::pts_provenance::wire_pts(
         ud.hdr_pts_enabled.then_some(hdr_pts_ns).flatten(),
@@ -924,9 +754,8 @@ fn consume_frame(
                 with_hdr = r.with_hdr,
                 samples = r.samples,
                 period_us = r.period_us,
-                // THE pair this whole work package exists to compare. Materially tighter on the
-                // left ⇒ the compositor's stamp is worth shipping; equally ragged ⇒ the producer
-                // composes irregularly and no choice of stamp can fix it.
+                // Tighter hdr_mad than delivery_mad ⇒ compositor stamp is worth shipping;
+                // equally ragged ⇒ the producer composes irregularly and no stamp fixes it.
                 hdr_mad_us = r.hdr_mad_us,
                 delivery_mad_us = r.delivery_mad_us,
                 offset_p50_ms = r.offset_p50_ms,
@@ -937,33 +766,14 @@ fn consume_frame(
         }
         ud.pts.reset_window();
         ud.pts_reported = std::time::Instant::now();
-        // The two clocks drift by µs over a window; re-pairing them here keeps the rebase honest
-        // over a multi-hour session without costing anything per frame.
+        // Clocks drift by µs over a window; re-pair here so a multi-hour session stays honest.
         ud.rt_minus_mono_ns = realtime_minus_monotonic_ns();
     }
 
-    // Implicit-fence wait: Mutter renders into the dmabuf and hands it over at
-    // GPU-submit time; with no producer explicit sync (Mutter+NVIDIA can't) we snapshot
-    // the buffer's implicit fence and wait the producer's render before sampling —
-    // closing the stale/old-frame race on NVIDIA. No-op for shm buffers or drivers that
-    // attach no fence. Covers both the GPU import and the CPU mmap read below.
-    //
-    // MEASURED 2026-08-08 (Wave-2 PW4, which proposed moving this off the loop thread and was
-    // pre-registered to be abandoned if the wait was already free — it is):
-    //   gamescope + NVIDIA (RTX 5070 Ti)   outcome=NoFence
-    //   Mutter    + NVIDIA (RTX 5070 Ti)   outcome=NoFence
-    //   gamescope + RADV   (Deck VANGOGH)  300 samples, ALL NoFence, mean 23us, max 48us,
-    //                                      p50 and p99 both in the <=100us bucket
-    //   KWin      + RADV   (Deck desktop)  no implicit fence either
-    // That is EVERY compositor × vendor combination this fleet has, and not one of them attaches an
-    // implicit fence — so this is one ioctl and a return, not a block: there is nothing to wait on,
-    // and moving it to the consumer side buys nothing. The 100 ms budget stays as a guard for a
-    // producer that DOES fence, which is a real thing even if nothing here does it. The histogram
-    // below is how to re-check if that ever changes: run with PUNKTFUNK_PERF=1 and read the p99
-    // bucket.
+    // Mutter hands the dmabuf at GPU-submit; without producer explicit sync (Mutter+NVIDIA)
+    // wait the implicit fence before sampling, or the CPU/GPU path reads a stale frame.
+    // No-op when the driver attaches no fence. 100 ms is a guard for a producer that does fence.
     if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
-        // PW4 step 1: time the wait. Two `Instant::now()` per frame on a path that is already
-        // making a syscall — and this is the measurement that decides whether PW4 ships at all.
         let t0 = std::time::Instant::now();
         let waited = pf_zerocopy::dmabuf_fence::wait_read_ready(datas[0].fd(), 100);
         ud.fence_wait.record(t0.elapsed().as_micros() as u64);
@@ -998,8 +808,7 @@ fn consume_frame(
                 }
             }
         }
-        // One line per ~5 s at 60 fps, under PUNKTFUNK_PERF only — the same gate and cadence the
-        // encode backends use for their submit splits, so a perf run reads as one instrument.
+        // One line per ~5 s at 60 fps, under PUNKTFUNK_PERF only — same gate as encode submit splits.
         if pf_host_config::config().perf
             && ud.fence_wait.is_meaningful()
             && ud.fence_wait.samples % 300 == 0
@@ -1028,13 +837,9 @@ fn consume_frame(
         }
     }
 
-    // Raw DMA-BUF passthrough: packed RGB is imported for GPU CSC; producer-native NV12 can
-    // be consumed by the Vulkan Video encoder without another color conversion.
-    //
-    // The block below either publishes a dmabuf and RETURNS, or breaks with the reason it could
-    // not — so every non-success exit is named and counted instead of silently falling out of
-    // three nested `if`s into the CPU path, which is how a session that had negotiated zero-copy
-    // could pay a full CPU pixel touch per frame while logging nothing but a healthy open.
+    // Raw DMA-BUF passthrough: packed RGB for GPU CSC, or producer NV12 without another convert.
+    // Publishes and returns, or breaks with a named reason. Silent fall-through CPU-touches
+    // every frame on a session that had negotiated zero-copy.
     if ud.vaapi_passthrough {
         let reason = 'passthrough: {
             let Some(fmt) = ud.format else {
@@ -1049,13 +854,9 @@ fn consume_frame(
             let chunk = datas[0].chunk();
             let offset = chunk.offset();
             let stride = chunk.stride().max(0) as u32;
-            // Native NV12 usually arrives as a two-plane SPA buffer over ONE buffer
-            // object; plane 1's chunk carries the REAL UV offset/stride (compositors
-            // may align the Y plane before UV). Pass it through instead of assuming
-            // contiguity. Each spa_data holds its own (dup'd) fd, so BO identity is
-            // by inode, not fd number; a genuinely two-BO frame cannot travel through
-            // the single-fd import — drop it with a diagnosis instead of streaming
-            // garbage chroma.
+            // NV12 is usually two SPA planes on one BO; plane 1's chunk has the real UV
+            // offset/stride. BO identity is inode, not fd number. A two-BO frame cannot
+            // travel the single-fd import — drop it rather than stream garbage chroma.
             let plane1 = if fmt == PixelFormat::Nv12 && datas.len() >= 2 && datas[1].fd() > 0 {
                 // SAFETY: zeroed `libc::stat` is a valid POD initializer; both fds are
                 // owned by the live PipeWire buffer for this callback, and `fstat`
@@ -1073,8 +874,7 @@ fn consume_frame(
                         "NV12 planes live in different buffer objects — frames \
                                  dropped (single-fd import only)",
                     );
-                    // Not a fall-through: this frame is DROPPED, not downgraded (de-padding it as
-                    // linear would stream scrambled chroma), so it is not counted below.
+                    // Dropped, not downgraded: de-padding as linear would scramble chroma.
                     return;
                 }
                 let c1 = datas[1].chunk();
@@ -1082,12 +882,9 @@ fn consume_frame(
             } else {
                 None
             };
-            // dup the fd so it survives the SPA buffer recycle — the encode thread
-            // imports it. Content stability across the read window comes from the deferred
-            // requeue below (`try_defer` — the producer does not get this buffer back until
-            // the frame's hold drops); with no hold (shallow pool / PUNKTFUNK_ZEROCOPY_HOLD=0)
-            // it falls back to the compositor's pool depth outrunning the encode, the old
-            // racy contract.
+            // Dup so the fd outlives SPA recycle. Content stability is `try_defer`; without a
+            // hold (shallow pool / PUNKTFUNK_ZEROCOPY_HOLD=0) the pool depth must outrun encode.
+
             // SAFETY: `datas[0].fd()` is the dmabuf fd owned by the live PipeWire buffer (valid
             // for this callback). `fcntl(fd, F_DUPFD_CLOEXEC, 0)` reads only the integer fd,
             // touches no Rust memory, and returns a fresh independent CLOEXEC duplicate (or -1).
@@ -1116,8 +913,8 @@ fn consume_frame(
                     plane1,
                     hold,
                 }),
-                // Cursor-as-metadata is blended only by RGB→NV12 backends. Gamescope
-                // embeds its pointer in the produced pixels, so native NV12 has none.
+                // RGB→NV12 backends blend cursor-as-metadata. Gamescope burns the pointer in;
+                // native NV12 has none.
                 cursor: ud.cursor.overlay(),
             });
             static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -1137,9 +934,8 @@ fn consume_frame(
             }
             return;
         };
-        // The passthrough declined this frame. Say so ONCE per distinct reason (`.process` runs
-        // per frame — see `PassthroughFallbacks`), carrying the running count so a persistent
-        // downgrade is distinguishable from a one-frame hiccup at renegotiation.
+        // Once per distinct reason (`.process` is per-frame). The running count separates a
+        // persistent downgrade from a one-frame hiccup at renegotiation.
         if let Some(frames) = ud.passthrough_fallbacks.note(reason) {
             tracing::warn!(
                 frames,
@@ -1157,16 +953,12 @@ fn consume_frame(
         }
     }
 
-    // Zero-copy path: if the buffer is a dmabuf and we have an importer, import it
-    // into a CUDA device buffer (no CPU touch) and deliver that. Otherwise fall
-    // through to the shm de-pad copy below.
+    // dmabuf + importer → CUDA, no CPU touch. Else fall through to the shm de-pad copy.
     let mut gpu_import_broken = false;
     if let (Some(importer), Some(fmt)) = (ud.importer.as_mut(), ud.format) {
-        // Invariant 1's teeth: a 10-bit PQ frame may take the LINEAR (Vulkan-bridge → CUDA
-        // external memory) arm, which moves 4 Bpp words verbatim, but must NEVER take the TILED
-        // EGL de-tile blit — that renders into an 8-bit `GL_RGBA8` texture and would crush the
-        // depth silently. The HDR pods advertise LINEAR only, so a tiled modifier here means the
-        // producer ignored the offer; drop to the CPU path rather than trust it.
+        // 10-bit PQ may take LINEAR (Vulkan-bridge, 4 Bpp verbatim) but never the tiled EGL
+        // de-tile blit (`GL_RGBA8`, silent depth loss). A tiled modifier here means the
+        // producer ignored the LINEAR-only HDR offer — drop to CPU rather than trust it.
         let hdr_tiled = fmt.is_hdr_rgb10() && ud.modifier != 0;
         if hdr_tiled {
             warn_once(
@@ -1181,24 +973,14 @@ fn consume_frame(
                 offset: datas[0].chunk().offset(),
                 stride: datas[0].chunk().stride().max(0) as u32,
             };
-            // Tiled modifier → EGL/GL de-tile import; LINEAR (0/unset, e.g.
-            // gamescope) → direct CUDA external-memory import (NVIDIA EGL can't
-            // sample LINEAR).
+            // Tiled → EGL/GL de-tile; LINEAR (gamescope) → CUDA external-memory (NVIDIA EGL
+            // cannot sample LINEAR).
             let modifier = (ud.modifier != 0).then_some(ud.modifier);
             if let Some(fourcc) = pf_frame::drm_fourcc(fmt) {
-                // GPU converts: a 4:4:4 session gets the planar-YUV444 convert on the tiled
-                // EGL/GL path (full chroma, takes precedence over NV12 — 4:4:4 must never
-                // subsample), otherwise `PUNKTFUNK_NV12` gets NV12 — tiled via the EGL/GL
-                // blit, LINEAR/gamescope via the Vulkan bridge's compute CSC (latency plan
-                // T2.5b) — so NVENC encodes native YUV and skips its internal RGB→YUV CSC on
-                // the contended SM. A 4:4:4 session on LINEAR frames has no convert and
-                // stays RGB, falling to the encoder's clear-error path (`want_444` with an
-                // RGB CUDA payload) rather than silently subsampling. A LINEAR NV12 convert
-                // failure latches RGB for the stream (mid-frame fallback, no drop).
-                // A 10-bit frame takes NEITHER convert: both the GL and the Vulkan compute CSCs
-                // write 8-bit planes, and NVENC ingests the packed 10-bit RGB natively
-                // (`ARGB10`/`ABGR10`) with its own BT.2020 CSC. So HDR stays packed RGB all the
-                // way to the encoder — no depth loss, no extra pass.
+                // 4:4:4 planar YUV444 on tiled EGL (never subsample; wins over NV12). Else
+                // `PUNKTFUNK_NV12` → NV12 (tiled blit or LINEAR compute CSC). HDR stays packed
+                // RGB: both CSCs write 8-bit planes, and NVENC ingests ARGB10/ABGR10 natively.
+                // LINEAR NV12 failure latches RGB for the stream (no drop).
                 let ten_bit = fmt.is_hdr_rgb10();
                 let yuv444 = ud.yuv444 && modifier.is_some() && !ten_bit;
                 let mut nv12 = ud.nv12 && !ud.yuv444 && !ten_bit;
@@ -1255,8 +1037,7 @@ fn consume_frame(
                                 fmt
                             },
                             payload: FramePayload::Cuda(devbuf),
-                            // Cursor-as-metadata: blended by the CUDA encoder into its owned
-                            // device surface. (RGB LINEAR-import case; YUV sessions blend planes.)
+                            // CUDA encoder blends cursor-as-metadata into its owned device surface.
                             cursor: ud.cursor.overlay(),
                         });
                         return;
@@ -1267,11 +1048,9 @@ fn consume_frame(
                             pf_zerocopy::note_gpu_import_death();
                         }
                         if modifier.is_some() {
-                            // Tiled buffer: the CPU fallback below would mmap TILED bytes
-                            // and de-pad them as linear — a scrambled image, worse than no
-                            // frame. Drop the frame instead; on a dead worker (it absorbed a
-                            // driver fault) or a short failure streak, poison the stream so
-                            // the session's capture-loss rebuild renegotiates cleanly.
+                            // Tiled: CPU mmap would de-pad tiled bytes as linear — scrambled.
+                            // Drop the frame; on a dead worker or a short streak, poison so
+                            // capture-loss rebuild renegotiates.
                             ud.import_fail_streak += 1;
                             if dead || ud.import_fail_streak >= IMPORT_FAIL_POISON {
                                 tracing::error!(error = %format!("{e:#}"), dead,
@@ -1284,8 +1063,7 @@ fn consume_frame(
                             }
                             return;
                         }
-                        // LINEAR dmabuf: CPU-mappable, so disable the importer and fall
-                        // through to the CPU mmap path — degraded, not dead.
+                        // LINEAR dmabuf is CPU-mappable: disable the importer and fall through.
                         tracing::warn!(error = %format!("{e:#}"),
                             "LINEAR dmabuf GPU import failed — falling back to the CPU copy path");
                         gpu_import_broken = true;
@@ -1301,17 +1079,13 @@ fn consume_frame(
     }
 
     let d = &mut datas[0];
-    // CPU path may also receive LINEAR dmabufs (gamescope offers only those once its
-    // modifier-bearing format pod wins); capture the fd before `data()` borrows `d`.
+    // LINEAR dmabufs also land here (gamescope). Capture the fd before `data()` borrows `d`.
     let data_type = d.type_();
-    // fd-backed buffer (MemFd SHM, or DmaBuf)? Capture the fd before `data()` borrows `d`.
     let raw_fd = d.fd();
-    // `mapoffset` is where THIS spa_data's region begins inside the fd — non-zero for a pooled
-    // producer that carves every buffer out of one shared fd. PipeWire's own MAP_BUFFERS slice
-    // already starts there, but our self-mmap below maps the fd from 0, so that path must add it
-    // (see `region_off`). Reading it without it made the self-mmap path index the WRONG buffer,
-    // and the `needed > avail` guard could not catch that: `avail` came from the whole-fd
-    // mapping, so it was large enough for any single buffer's span.
+    // `mapoffset` is this spa_data's start in the fd — non-zero when one fd is pooled.
+    // PipeWire's MAP_BUFFERS slice already starts there; our self-mmap maps from 0, so
+    // add it (`region_off`). Skip it and we index the wrong buffer; `needed > avail` cannot
+    // catch that because `avail` is the whole-fd mapping.
     let map_off = d.as_raw().mapoffset as usize;
     let (size, chunk_off, stride) = {
         let c = d.chunk();
@@ -1322,13 +1096,10 @@ fn consume_frame(
         )
     };
     let Some(fmt) = ud.format else { return }; // unsupported/not negotiated
-                                               // The de-pad below assumes ONE packed plane of `bytes_per_pixel` bytes. `bytes_per_pixel`'s
-                                               // catch-all answers 4 for NV12, so a producer-native NV12 buffer (stride ≈ w, two planes)
-                                               // computed `row = 4w` and always tripped the `stride < row` guard below — blaming the
-                                               // PRODUCER's stride for a host limitation. NV12 cannot be de-padded on this path at all
-                                               // (the second plane is not even in `datas[0]`'s span), so say so honestly. It only arrives
-                                               // here if a native-NV12 negotiation happens without the zero-copy passthrough that is
-                                               // supposed to consume it, which is a host bug, not a producer one.
+                                               // This de-pad assumes one packed plane. `bytes_per_pixel` reports 4 for NV12, so a
+                                               // native NV12 buffer (`stride ≈ w`, two planes) always trips `stride < row` and blames
+                                               // the producer. The second plane is not in `datas[0]`; arriving here is a host bug
+                                               // (NV12 offer without the raw-dmabuf passthrough that consumes it).
     if matches!(fmt, PixelFormat::Nv12) {
         warn_once(
             "negotiated producer-native NV12 but this capture fell back to the CPU de-pad path, \
@@ -1344,13 +1115,9 @@ fn consume_frame(
     };
     // dmabuf chunks commonly report size 0; fall back to the computed span.
     let size = if size == 0 { needed } else { size };
-    // For fd-backed buffers (MemFd SHM, DmaBuf) mmap the fd OURSELVES, sized to the fd's real
-    // length (fstat), rather than trusting PipeWire's MAP_BUFFERS slice: xdg-desktop-portal-wlr
-    // hands MemFd buffers whose reported `data.maxsize` exceeds the bytes actually mapped into
-    // our process, so reading to maxsize segfaults (it also covers the original case — MAP_BUFFERS
-    // not mapping Vulkan dmabufs, e.g. gamescope). The `needed > avail` guard below then drops
-    // cleanly if the real buffer is genuinely too small. MemPtr buffers (no fd) are same-process —
-    // trust `d.data()`.
+    // mmap the fd ourselves at fstat length. xdg-desktop-portal-wlr MemFd reports
+    // `data.maxsize` past the mapped bytes — reading to maxsize segfaults. Also covers
+    // MAP_BUFFERS skipping Vulkan dmabufs. MemPtr (no fd) is same-process: trust `d.data()`.
     let fd_len = if raw_fd > 0 {
         // SAFETY: `libc::stat` is a C plain-old-data struct for which all-zero is a valid value, so
         // `mem::zeroed()` is a sound initializer. `raw_fd` is the buffer's fd (`> 0` checked here) and
@@ -1366,16 +1133,9 @@ fn consume_frame(
         None
     };
     let _mapping; // keeps a manual mmap alive for the copy below
-                  // Prefer our own fstat-sized mmap of the fd; fall back to PipeWire's MAP_BUFFERS slice
-                  // (and finally drop) so an fd PipeWire could map but we can't never silently over-reads.
-                  //
-                  // `fd_len` is REQUIRED, not preferred: it used to fall back to
-                  // `offset + needed`, i.e. a length invented from producer-controlled geometry.
-                  // That defeated the whole point of the fstat (the "buffer smaller than the
-                  // frame span" guard compares against exactly the number the producer just
-                  // supplied) and could map — and then read — past the end of the object, which
-                  // is a SIGBUS, not an `Err`. Without a real length we decline to self-map and
-                  // let PipeWire's own slice serve, which is bounded by construction.
+                  // Prefer our fstat-sized mmap; else PipeWire's MAP_BUFFERS slice. `fd_len` is required:
+                  // falling back to `offset + needed` maps a producer-invented length and can SIGBUS past
+                  // the object. Without a real length, decline to self-map.
     let self_mapped: Option<&[u8]> = if raw_fd > 0 {
         match fd_len.and_then(|map_len| DmabufMap::new(raw_fd as i32, map_len)) {
             Some(m) => {
@@ -1395,8 +1155,7 @@ fn consume_frame(
     } else {
         None
     };
-    // Which base `chunk.offset` is relative to differs by path: our self-mmap starts at fd
-    // offset 0, so this spa_data's region begins at `mapoffset`; PipeWire's MAP_BUFFERS slice
+    // Self-mmap starts at fd offset 0, so this spa_data begins at `mapoffset`; MAP_BUFFERS
     // already begins there. Checked add — both halves are producer-controlled.
     let (buf, region_off): (&[u8], usize) = if let Some(b) = self_mapped {
         match map_off.checked_add(chunk_off) {
@@ -1418,8 +1177,7 @@ fn consume_frame(
     }
     let avail = buf.len() - region_off;
     {
-        // One-time geometry dump — makes a new compositor/GPU's buffer layout visible in the
-        // logs (the kind of mismatch that crashed xdpw MemFd capture before the self-mmap fix).
+        // First-frame geometry — a compositor/GPU layout mismatch is otherwise silent here.
         use std::sync::atomic::{AtomicBool, Ordering};
         static ONCE: AtomicBool = AtomicBool::new(true);
         if ONCE.swap(false, Ordering::Relaxed) {
@@ -1435,14 +1193,12 @@ fn consume_frame(
         return;
     }
     let region = &buf[region_off..region_off + size.min(avail)];
-    // De-pad into a tightly-packed buffer (chunk stride may exceed w*bpp).
     let mut tight = vec![0u8; tight_len];
     for y in 0..h {
         tight[y * row..y * row + row].copy_from_slice(&region[y * stride..y * stride + row]);
     }
-    // Cursor-as-metadata: blit the latched pointer into the frame (no-op when hidden or when
-    // the layout isn't packed RGB). This is the CPU path's counterpart to the producer's
-    // hardware cursor plane, which stays out of the captured buffer.
+    // Blit the latched pointer (no-op when hidden or not packed RGB). The producer's hardware
+    // cursor plane stays out of the captured buffer.
     composite_cursor(&mut tight, w, h, fmt, &ud.cursor);
     let frame = CapturedFrame {
         provenance: Default::default(),
@@ -1451,10 +1207,9 @@ fn consume_frame(
         pts_ns,
         format: fmt,
         payload: FramePayload::Cpu(tight),
-        // Already composited inline into `tight` above — nothing for the encoder to blend.
+        // Already composited into `tight` — nothing for the encoder to blend.
         cursor: None,
     };
-    // Overwrite whatever the consumer has not taken yet — never block the pipewire loop.
     ud.publish(frame);
 }
 
@@ -1462,25 +1217,17 @@ fn consume_frame(
 pub fn pipewire_thread(
     fd: Option<OwnedFd>,
     node_id: u32,
-    // The frame mailbox + its wakeup sender (see `super::FrameSlot`): publishing OVERWRITES,
-    // so a stalled consumer costs the intermediate frames, never the freshest one.
+    // One-deep mailbox: publish overwrites, so a stalled consumer loses intermediates, never the latest.
     slot: super::FrameSlot,
     wake: SyncSender<()>,
-    // Every flag/slot this thread PUBLISHES, in one struct (see `super::CaptureSignals`). It used to
-    // be seven separate parameters here, seven `Arc` clones at the call site, and the same seven
-    // fields restated on `UserData`.
     signals: super::CaptureSignals,
-    // THE zero-copy negotiation decision, resolved once by `spawn_pipewire` (which consumes the
-    // same struct for the capturer's timeout diagnosis) — never re-derived here.
+    // Zero-copy decision, resolved once by `spawn_pipewire` — never re-derived here.
     plan: NegotiationPlan,
-    // The session's capture options (see `super::CaptureOpts`) — `want_444`/`want_hdr` pick the pod
-    // family, `expect_exact_dims` arms the sacrificial-mode gate. `allow_zerocopy` is already folded
-    // into `plan`.
+    // `want_444`/`want_hdr` pick the pod family; `expect_exact_dims` arms the birth-mode gate.
     opts: super::CaptureOpts,
     preferred: Option<(u32, u32, u32)>,
     quit_rx: pw::channel::Receiver<()>,
-    // Encode-backend facts resolved by the facade (never re-derived here) — the one-way
-    // capture→encode edge (plan §W6).
+    // Encode-backend facts from the facade — never re-derived here.
     policy: ZeroCopyPolicy,
 ) -> Result<()> {
     let super::CaptureOpts {
@@ -1493,17 +1240,15 @@ pub fn pipewire_thread(
     crate::pwinit::ensure_init();
 
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw MainLoop")?;
-    // A quit signal (capturer `Drop`) lands here on the loop thread and stops `run()` so the
-    // thread unwinds instead of blocking to process exit. Hold the attachment for the loop's
-    // life; the cloned loop handle is the one the callback quits.
+    // Capturer `Drop` lands here on the loop thread and stops `run()` so the thread unwinds
+    // instead of blocking to process exit. Hold the attachment for the loop's life.
     let quit_loop = mainloop.clone();
     let _quit_attach = quit_rx.attach(mainloop.loop_(), move |()| {
         tracing::debug!("pipewire: quit signal received — stopping capture loop");
         quit_loop.quit();
     });
     let context = pw::context::ContextRc::new(&mainloop, None).context("pw Context")?;
-    // A portal source hands us an fd to a (sandboxed) PipeWire remote; the KWin
-    // virtual-output source has no fd — its node lives on the user's default daemon.
+    // Portal source: fd to a sandboxed PipeWire remote. KWin virtual-output: no fd, default daemon.
     let core = match fd {
         Some(fd) => context
             .connect_fd_rc(fd, None)
@@ -1513,19 +1258,13 @@ pub fn pipewire_thread(
             .context("pw connect (default daemon)")?,
     };
 
-    // The negotiation decision arrives pre-resolved in `plan` (see `negotiation_plan`): what to
-    // build, which offer to make, and whether to prefer producer NV12. Nothing here re-derives
-    // any of it — that duplication is what F1/L3 was.
     let backend_is_vaapi = policy.backend_is_vaapi;
     let force_shm = plan.force_shm;
     let vaapi_passthrough = plan.vaapi_passthrough;
     let prefer_native_nv12 = plan.prefer_native_nv12;
-    // Build the GPU importer — normally the ISOLATED worker process
-    // (design/zerocopy-worker-isolation.md), so a driver fault on a dying compositor's dmabuf
-    // kills the worker, not this host. If construction fails, log and fall back to the CPU path
-    // (we simply won't request dmabuf below); `plan.build_importer` already encodes WHEN to try
-    // at all (not under a raw passthrough, not once repeated worker deaths latched the import
-    // off — see `negotiation_plan`).
+    // Isolated worker (design/zerocopy-worker-isolation.md): a driver fault kills the worker,
+    // not this host. Construction failure → CPU path (no dmabuf request). `plan.build_importer`
+    // already encodes when to try.
     if plan.gpu_import_latched {
         tracing::warn!(
             "zero-copy GPU import disabled for this host process (repeated import-worker deaths, \
@@ -1549,29 +1288,19 @@ pub fn pipewire_thread(
              RGB CSC; PUNKTFUNK_PIPEWIRE_NV12=0 restores the packed-RGB negotiation)"
         );
     }
-    // Modifiers our import stack handles, enumerated PER FOURCC. `XR24` (BGRx) and `AR24` (BGRA)
-    // are asked separately on purpose: EGL/libva answer per format, and nothing entitles us to
-    // assume a driver that imports one imports the other. Keeping them apart is also what makes
-    // the BGRA pod below correct on AMD and Intel rather than an NVIDIA-shaped guess — each list
-    // is whatever THIS GPU's stack actually said.
-    //
-    // To each list we add LINEAR (0) — NVIDIA's EGL won't list it, but LINEAR dmabufs (gamescope's
-    // only offer) import via CUDA external memory instead. For the VAAPI passthrough path there is
-    // no importer at all, so the lists start empty and LINEAR is all we advertise: radeonsi/iHD
-    // import it and any compositor can allocate it.
+    // Per-fourcc: EGL/libva answer per format; XR24 (BGRx) and AR24 (BGRA) are asked
+    // separately. Append LINEAR (0): NVIDIA EGL will not list it, but gamescope LINEAR
+    // dmabufs import via CUDA external memory. VAAPI passthrough has no importer, so
+    // LINEAR is all we advertise — radeonsi/iHD import it and any compositor can allocate it.
     let mut modifiers = Vec::new();
     let mut modifiers_bgra = Vec::new();
     if let Some(i) = importer.as_mut() {
         modifiers = i.supported_modifiers(pf_frame::drm_fourcc(PixelFormat::Bgrx).unwrap());
         modifiers_bgra = i.supported_modifiers(pf_frame::drm_fourcc(PixelFormat::Bgra).unwrap());
     }
-    // PyroWave passthrough: the encoder imports through Vulkan, not libva — extend the
-    // advertisement with every modifier its device samples from, so compositors that
-    // never allocate LINEAR (Mutter+NVIDIA) still negotiate zero-copy dmabufs. The modifiers
-    // were resolved by the facade (`ZeroCopyPolicy::pyrowave_modifiers`) — non-empty only when
-    // the host's `pyrowave` feature is on AND the session (or the global encoder pref) is
-    // PyroWave — so capture never calls back into `encode` and needs no feature gate of its
-    // own (the emptiness check gates it).
+    // PyroWave imports through Vulkan, not libva. Extra modifiers come from the facade
+    // (`ZeroCopyPolicy::pyrowave_modifiers`) so capture never calls `encode`. Empty unless
+    // the `pyrowave` feature is on and this session (or the global pref) is PyroWave.
     let extend_pyrowave = vaapi_passthrough && !policy.pyrowave_modifiers.is_empty();
     for list in [&mut modifiers, &mut modifiers_bgra] {
         if (importer.is_some() || vaapi_passthrough) && !list.contains(&0) {
@@ -1591,21 +1320,15 @@ pub fn pipewire_thread(
             "zero-copy: advertising the PyroWave device's Vulkan-importable dmabuf modifiers"
         );
     }
-    // The one runtime-dependent half of the decision (see `NegotiationPlan::want_dmabuf`): it
-    // needs the modifier list the importer's construction actually yielded.
     let want_dmabuf = plan.want_dmabuf(importer.is_some(), &modifiers);
-    // Record whether THIS capture really advertises the EGL→CUDA dmabuf-only offer, for the
-    // capturer's negotiation-timeout diagnosis (its latch must fire only for an offer that was
-    // actually made — `plan.build_importer` alone can't know the importer constructed).
+    // Latch must fire only for an offer actually made — `plan.build_importer` cannot know
+    // the importer constructed.
     signals.gpu_dmabuf_offer.store(
         want_dmabuf && !vaapi_passthrough && !want_hdr,
         Ordering::Relaxed,
     );
-    // The ONE line that says which arm this session actually got, and who consumes it. Everything
-    // below explains a particular arm; nothing below states the answer. Reconstructing it from the
-    // detail lines cost the 2026-08-08 PyroWave triage four files, and on the one arm that matters
-    // most — a PyroWave session downgraded to CPU on an NVIDIA host — there was no detail line to
-    // reconstruct it from at all (see the final `else if` of this chain).
+    // One line for the resolved arm and its consumer. Detail lines below explain an arm;
+    // they do not state which one this session took.
     let consumer = consumer_kind(
         policy.pyrowave_session,
         backend_is_vaapi,
@@ -1616,11 +1339,8 @@ pub fn pipewire_thread(
         capture_arm = arm.as_str(),
         consumer = consumer.as_str(),
         modifier_count = modifiers.len(),
-        // PW3(c): the latch state belongs on the same line as the arm. A `cpu` arm has two very
-        // different explanations — "this host was never going to do dmabuf" and "something failed
-        // earlier and we are still living with the verdict" — and only the second is a bug worth
-        // chasing. Reading it here also means the retry/clear behaviour is observable rather than
-        // inferred.
+        // Latch state belongs on the same line as the arm: `cpu` is either "never dmabuf"
+        // or "a prior failure we are still living with" — only the second is a bug.
         raw_dmabuf_latch = pf_zerocopy::raw_dmabuf_latch_state(),
         "capture pipeline resolved: {} → {}",
         arm.as_str(),
@@ -1639,10 +1359,8 @@ pub fn pipewire_thread(
     } else if !want_dmabuf && (plan.build_importer || plan.vaapi_passthrough) {
         tracing::warn!("zero-copy: no importable dmabuf modifiers — using CPU path");
     } else if vaapi_passthrough {
-        // The raw-passthrough advertisement. Covers the PyroWave case too: its extra
-        // Vulkan-importable modifiers were appended (and logged) just above, so this arm must
-        // NOT be gated on `pyrowave_modifiers.is_empty()` — that gate is what dropped a fully
-        // zero-copy PyroWave session through to the CPU-path warning below (L11).
+        // Covers PyroWave: its extra Vulkan modifiers were appended above. Do not gate this
+        // on `pyrowave_modifiers.is_empty()` — that dropped a zero-copy PyroWave session to CPU.
         tracing::info!(
             native_nv12_preferred = prefer_native_nv12,
             modifier_count = modifiers.len(),
@@ -1654,26 +1372,17 @@ pub fn pipewire_thread(
         tracing::info!(
             bgrx_count = modifiers.len(),
             bgra_count = modifiers_bgra.len(),
-            // `sample` is TRUNCATED to 6, and LINEAR is pushed last — so reading the sample as the
-            // whole list makes a perfectly good offer look tiled-only. That misreading cost a full
-            // debugging session on 2026-08-14, hence stating the one bit that was actually wanted.
+            // Sample is truncated to 6, LINEAR pushed last — reading the sample as the whole
+            // list makes a good offer look tiled-only.
             linear_offered = modifiers.contains(&0),
             sample = ?&modifiers[..modifiers.len().min(6)],
             "zero-copy: advertising EGL-importable dmabuf modifiers (BGRx + BGRA pods)"
         );
     } else if consumer.cpu_is_downgrade() {
-        // Reached only when no dmabuf is advertised at all (every arm above rules out a
-        // zero-copy path), so this genuinely IS the CPU capture path: the consumer then pays
-        // full-frame CPU touches (mmap de-pad + whatever CSC/upload it needs) —
-        // make the silent fallback visible.
-        // The `raw_dmabuf_latched` arm above catches the latched downgrade, so by here zero-copy
-        // is off at the source: the env var, or the session's own output format.
-        //
-        // The gate used to be `backend_is_vaapi && backend_is_gpu`, which is why a PyroWave
-        // session's CPU downgrade was invisible on an NVIDIA/auto host: `backend_is_vaapi` reads
-        // the host-global encoder pref, so a per-session PyroWave negotiation there is `false` and
-        // fell out of the chain logging NOTHING. `consumer_kind` asks the per-session question
-        // instead, and excludes only the software encoder (which wants CPU frames).
+        // No dmabuf advertised: this is the CPU path. `raw_dmabuf_latched` already caught a
+        // latched downgrade. Warn for every GPU consumer; software wants CPU frames.
+        // `consumer_kind` is per-session so a PyroWave session on an NVIDIA host still warns
+        // (the host-global encoder pref would have called it NVENC and logged nothing).
         tracing::warn!(
             consumer = consumer.as_str(),
             "{} encode with the CPU capture path (per-frame de-pad + CSC + upload) — \
@@ -1683,10 +1392,9 @@ pub fn pipewire_thread(
             if std::env::var_os("PUNKTFUNK_ZEROCOPY").is_some() {
                 "PUNKTFUNK_ZEROCOPY is set falsy"
             } else if want_hdr && !policy.hdr_cuda_ok {
-                // Reachable and NOT the output format's doing: `build_importer` drops an HDR
-                // capture whose encoder cannot take a packed 10-bit CUDA payload (libav's HDR
-                // route swscales into a P010 hardware frame). Naming the output format here
-                // would send the reader hunting the wrong knob.
+                // `build_importer` drops HDR when the encoder cannot take packed 10-bit CUDA
+                // (libav swscales into P010). Naming the output format would send the reader
+                // to the wrong knob.
                 "this HDR session's encoder cannot ingest a 10-bit CUDA payload, so the capture \
                  stays on CPU frames"
             } else {
@@ -1706,10 +1414,8 @@ pub fn pipewire_thread(
         );
     }
 
-    // Deferred requeue (the rewrite-while-encoding fix): holds riding published frames release
-    // their buffers through this channel from whatever thread drops them last; the receiver —
-    // attached to the loop below, after the stream exists — is the single place a withheld
-    // buffer rejoins the producer's pool.
+    // Holds on published frames release through this channel from whichever thread drops last;
+    // the receiver (attached after the stream exists) is the only place a withheld buffer rejoins.
     let (requeue_tx, requeue_rx) = pw::channel::channel::<(usize, u64)>();
     let defer = std::sync::Arc::new(DeferredRequeue {
         book: std::sync::Mutex::new(HoldBook::default()),
@@ -1757,10 +1463,9 @@ pub fn pipewire_thread(
             *pw::keys::MEDIA_TYPE     => "Video",
             *pw::keys::MEDIA_CATEGORY => "Capture",
             *pw::keys::MEDIA_ROLE     => "Screen",
-            // Never let the session manager re-target this stream to a different node when
-            // its target goes away: an orphaned stream auto-linked to a fresh Video/Source
-            // wedges that node — and a stuck link head-blocks the PipeWire daemon's shared
-            // work queue, stalling ALL new link negotiation system-wide.
+            // Do not let the session manager re-target this stream: an orphaned auto-link to
+            // a fresh Video/Source wedges that node and head-blocks the daemon work queue,
+            // stalling all new link negotiation system-wide.
             "node.dont-reconnect"     => "true",
         },
     )
@@ -1770,11 +1475,9 @@ pub fn pipewire_thread(
         .add_local_listener_with_user_data(data)
         .state_changed(|_stream, ud, old, new| {
             tracing::info!(?old, ?new, "pipewire stream state");
-            // Track whether the node is actively producing. A live source sits in `Streaming`
-            // (a static desktop just sends no buffers); anything else — `Paused`/`Unconnected`/
-            // `Error` — means the source went away (compositor died, virtual output removed on a
-            // Gaming↔Desktop switch). `try_latest` turns a sustained non-Streaming state into a
-            // capture-loss so the encode loop rebuilds instead of freezing on the last frame.
+            // `Streaming` with no buffers is a static desktop. Anything else means the source
+            // went away; `try_latest` turns a sustained non-Streaming state into capture-loss
+            // so the encode loop rebuilds instead of freezing on the last frame.
             ud.signals.streaming.store(
                 matches!(new, pw::stream::StreamState::Streaming),
                 Ordering::Relaxed,
@@ -1795,11 +1498,9 @@ pub fn pipewire_thread(
             {
                 return;
             }
-            // Parse ONCE — `parse` takes `&mut self` — and report a failure instead of swallowing it.
-            // On `Err`, `negotiated` stays false and `format`/`modifier`/`frame_size` keep their
-            // previous values, so the capture dies on the generic "the compositor offered no format
-            // this consumer accepts" timeout — sending the operator hunting a format mismatch when
-            // the real fault was a malformed Format pod we DID accept.
+            // Parse once (`parse` takes `&mut self`) and report failure. On `Err`, `negotiated`
+            // stays false so the timeout looks like "no accepted format" — a malformed pod we
+            // accepted, not a format mismatch.
             let parsed = ud.info.parse(param);
             if let Err(e) = &parsed {
                 tracing::error!(
@@ -1810,25 +1511,21 @@ pub fn pipewire_thread(
             }
             if parsed.is_ok() {
                 ud.signals.negotiated.store(true, Ordering::Relaxed);
-                // A (re)negotiation replaces the buffer pool: every cached per-buffer import
-                // (stored fds in the worker, the Vulkan bridge's per-fd sources) keys on
-                // buffers that no longer exist — and a recycled fd number/inode must never
-                // resolve to a stale import. No-op on the first negotiation (empty caches).
+                // Renegotiation replaces the pool: cached per-buffer imports key on buffers
+                // that no longer exist, and a recycled fd/inode must not resolve to a stale import.
                 if let Some(imp) = ud.importer.as_mut() {
                     imp.clear_cache();
                 }
                 let sz = ud.info.size();
-                // Publish the negotiated size for the gamescope cursor source's root→frame
-                // scaling (`xfixes_cursor::scale_to_frame`); a renegotiation updates it.
+                // Gamescope cursor source scales root→frame (`xfixes_cursor::scale_to_frame`).
                 ud.signals.frame_size.store(
                     (u64::from(sz.width) << 32) | u64::from(sz.height),
                     Ordering::Relaxed,
                 );
                 ud.format = map_format(ud.info.format());
                 ud.modifier = ud.info.modifier();
-                // HDR: the 10-bit PQ formats are only ever offered with MANDATORY BT.2020/PQ
-                // colorimetry props, so a 10-bit negotiation IS an HDR negotiation — but log
-                // what the producer actually fixated for diagnosis.
+                // 10-bit PQ is only offered with MANDATORY BT.2020/PQ, so a 10-bit negotiation
+                // is HDR — still log the producer's fixated transfer/primaries.
                 let hdr = ud.format.is_some_and(|f| f.is_hdr_rgb10());
                 ud.signals.hdr_negotiated.store(hdr, Ordering::Relaxed);
                 tracing::info!(
@@ -1850,12 +1547,9 @@ pub fn pipewire_thread(
                 }
             }
         })
-        // PW5 stage 1 — the pool census. PipeWire fires these on the loop thread as it allocates
-        // (and, on a renegotiation, frees then re-allocates) the stream's buffers. The census only
-        // counts; `remove_buffer` additionally purges the buffer from the deferred-requeue book —
-        // the buffer is being freed under any hold still riding a frame, so that hold's later
-        // release must become a no-op (the generation check in `HoldBook::complete` also covers
-        // the freed address being reused by a new pool's buffer).
+        // Pool census. `remove_buffer` also purges the deferred-requeue book: the buffer is
+        // being freed under any hold, so that hold's later release must be a no-op (generation
+        // in `HoldBook::complete` also covers the address being reused by a new pool).
         .add_buffer(|_stream, ud, _buf| ud.pool.add())
         .remove_buffer(|_stream, ud, buf| {
             ud.pool.remove();
@@ -1864,13 +1558,10 @@ pub fn pipewire_thread(
             }
         })
         .process(|stream, ud| {
-            // Latest-frame-only (OBS pattern): Mutter delivers buffers in bursts and recycles its
-            // pool; an older queued buffer carries a STALE frame. Drain all queued buffers, requeue
-            // the older ones, keep only the newest. This dequeue/requeue runs OUTSIDE the
-            // `catch_unwind` below — they are non-panicking C FFI pointer ops, and `newest` is
-            // requeued exactly once AFTER the panic-containing region. Previously the whole thing was
-            // inside the catch, so a caught panic (in `update_cursor_meta`/`consume_frame`) stranded
-            // `newest` forever, permanently shrinking the stream's fixed pool until capture wedged.
+            // Latest-frame-only: Mutter bursts, older queued buffers are stale. Drain, requeue
+            // older, keep newest. Dequeue/requeue stay outside `catch_unwind` — a panic inside
+            // would strand `newest` and shrink the fixed pool until capture wedged.
+
             // SAFETY: `stream` is the live stream PipeWire passes into this `.process` callback on the
             // loop thread; `dequeue_raw_buffer` returns a stream-owned `*mut pw_buffer` or null
             // (null-checked), single-threaded so no concurrent access.
@@ -1891,15 +1582,9 @@ pub fn pipewire_thread(
                 newest = next;
                 drained += 1;
             }
-            // PW5 stage 1: publish the depth the producer actually negotiated, once per distinct
-            // value. MEASURED, not requested: `build_dmabuf_buffers` asks for a range and the
-            // producer picks — this line is the only place the picked number is visible.
-            //
-            // Why it matters beyond curiosity: the depth is the budget the deferred requeue
-            // (`HoldBook::try_hold`) spends withholding published buffers from the producer
-            // while the encoder reads them. A pool of ≤ HOLD_POOL_RESERVE cannot defer at all —
-            // those sessions run the old contract, where a requeued buffer may be rewritten
-            // mid-encode and only pool depth keeps frames untorn.
+            // Producer's actual pool depth, once per distinct value. `build_dmabuf_buffers`
+            // asks for a range; the producer picks. Depth is the deferred-requeue budget:
+            // ≤ HOLD_POOL_RESERVE cannot defer, and a requeued buffer may be rewritten mid-encode.
             if let Some(depth) = ud.pool.note_frame() {
                 tracing::info!(
                     pool_depth = depth,
@@ -1910,16 +1595,12 @@ pub fn pipewire_thread(
                      window for any frame published without a hold"
                 );
             }
-            // Sacrificial-mode gate (kwin.rs `create`): until the producer renegotiates to the
-            // expected dims, every buffer — frame AND cursor meta, whose positions are in the
-            // doomed mode's space — belongs to the birth mode; consuming one would build the
-            // pipeline at the wrong size. Self-disarms on the first matching negotiation, or
-            // after `GATE_DEADLINE` without one — degraded dims beat wedging the session into
-            // the first-frame-timeout retry loop when the promised renegotiation never comes.
+            // Sacrificial birth mode (kwin.rs `create`): frame and cursor meta are in the doomed
+            // size until renegotiation. Self-disarms on match, or after `GATE_DEADLINE` — degraded
+            // dims beat a first-frame-timeout retry loop if the promised renegotiation never comes.
             if let Some((ew, eh)) = ud.expect_dims {
-                /// The renegotiation normally lands within a frame or two of recording; well
-                /// past that, the producer is not going to deliver it (the on-glass case: the
-                /// real mode never actually applied) — stop starving the pipeline.
+                /// Renegotiation normally lands within a frame or two; past this, stop starving
+                /// the pipeline (the real mode never applied).
                 const GATE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
                 let sz = ud.info.size();
                 if sz.width == ew && sz.height == eh {
@@ -1964,35 +1645,29 @@ pub fn pipewire_thread(
                     return;
                 }
             }
-            // PipeWire dispatches from a C trampoline with no catch_unwind; a panic crossing that FFI
-            // boundary would abort the whole host. Contain the inspect/consume work — the only Rust
-            // code here that can panic — and requeue `newest` unconditionally after it.
+            // PipeWire dispatches from a C trampoline with no catch_unwind; a panic across that
+            // FFI aborts the host. Contain inspect/consume — the only Rust here that can panic.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // SAFETY: `newest` is the non-null buffer we still own (dequeued, not requeued);
                 // `.buffer` is a `*mut spa_buffer` field libpipewire populated. This is a single field
                 // load through a valid pointer — no mutation or aliasing.
                 let spa_buf = unsafe { (*newest).buffer };
 
-                // Refresh cursor-as-metadata BEFORE the stale-frame skip below: Mutter delivers
-                // pointer-only movements as metadata-only "corrupted" buffers we drop for their
-                // frame, but their cursor meta is fresh and must still move our overlay.
+                // Cursor meta before the stale-frame skip: Mutter pointer-only moves arrive as
+                // metadata-only CORRUPTED buffers we drop for pixels, but the cursor is fresh.
                 update_cursor_meta(&mut ud.cursor, spa_buf);
-                // Publish the LIVE overlay (frames or not) so the encode loop's forwarder
-                // tracks pointer-only motion on a static desktop — the frame-attached overlay
-                // alone stales between damage frames. ONLY when we actually have one: a
-                // gamescope node carries no `SPA_META_Cursor`, so `overlay()` is always `None`
-                // here, and writing that would clobber — at frame rate — the `Some` the
-                // attached XFixes source publishes into this SAME slot, strobing the
-                // composited pointer on/off. Portal cursors are `None` only before the first
-                // bitmap (nothing to drop), and a HIDDEN pointer is still `Some(visible:false)`.
+                // Publish the live overlay so pointer-only motion on a static desktop still
+                // moves. Skip when `overlay()` is `None`: gamescope has no `SPA_META_Cursor`,
+                // and writing `None` at frame rate would clobber the XFixes `Some` in this
+                // same slot (pointer strobes). Hidden is still `Some(visible:false)`.
                 if let Some(overlay) = ud.cursor.overlay() {
                     if let Ok(mut slot) = ud.signals.cursor_live.lock() {
                         *slot = Some(overlay);
                     }
                 }
 
-                // Inspect the newest buffer's header + first chunk for the diagnostic and the
-                // CORRUPTED skip. SPA_META_Header is optional — `hdr` may be null.
+                // Header + first chunk for the CORRUPTED skip. SPA_META_Header is optional.
+
                 // SAFETY: `spa_buf` is the `*mut spa_buffer` of the buffer we still hold.
                 // `spa_buffer_find_meta_data` scans that buffer's metadata array for a `SPA_META_Header`
                 // of at least `size_of::<spa_meta_header>()` bytes and returns a pointer into the held
@@ -2015,10 +1690,8 @@ pub fn pipewire_thread(
                     // while the buffer is still held.
                     unsafe { (*hdr).flags }
                 };
-                // The compositor's OWN stamp for this frame (WP-A3/B3), stamped upstream of the
-                // delivery jitter our `SystemTime::now()` cannot see past. Located here because
-                // the header already is; whether it is worth shipping is what the provenance
-                // line measures.
+                // Compositor stamp, upstream of delivery jitter `SystemTime::now()` cannot see.
+                // Whether it is worth shipping is what the provenance line measures.
                 let hdr_pts = if hdr.is_null() {
                     None
                 } else {
@@ -2027,9 +1700,9 @@ pub fn pipewire_thread(
                     // the buffer is still held.
                     Some(unsafe { (*hdr).pts })
                 };
-                // First data chunk's size + flags (used for the diagnostic + CORRUPTED check)
-                // and its data type (a dmabuf legitimately reports chunk size 0, so the size-0
-                // stale skip only applies to mappable SHM buffers).
+                // Size + flags for the CORRUPTED skip. dmabuf legitimately reports chunk size
+                // 0, so the size-0 stale skip is SHM-only.
+
                 // SAFETY: every dereference is guarded in order before any field read — `spa_buf`
                 // non-null, `n_datas > 0`, the `datas` (`*mut spa_data`) array non-null, and the first
                 // element's `chunk` (`*mut spa_chunk`) non-null. `d0` is that first `spa_data` and `c`
@@ -2054,14 +1727,9 @@ pub fn pipewire_thread(
                 let corrupted = (hdr_flags & spa::sys::SPA_META_HEADER_FLAG_CORRUPTED) != 0
                     || (chunk_flags & spa::sys::SPA_CHUNK_FLAG_CORRUPTED as i32) != 0;
 
-                // THE GNOME FLASH FIX: skip Mutter's CORRUPTED / size-0 cursor-update buffers.
-                // When the pointer moves (e.g. dragging a window) Mutter sends metadata-only
-                // buffers flagged CORRUPTED (chunk size 0) that still reference a RECYCLED old
-                // frame; consuming them encodes "the window at its old position" — the flash.
-                // Confirmed live on worker-3 (chunk_flags=CORRUPTED, size 0) for both the zero-copy
-                // and SHM paths. The size-0 half is SHM-only (a real dmabuf legitimately reports
-                // chunk size 0). `drained` is the latest-frame-only depth — a cheap extra defense
-                // against bursty delivery, though here Mutter sends one buffer per callback.
+                // Skip Mutter CORRUPTED / size-0 cursor-update buffers. Pointer motion sends
+                // metadata-only buffers flagged CORRUPTED (chunk size 0) that still reference
+                // a recycled old frame — encoding that is the flash. Size-0 skip is SHM-only.
                 if corrupted || (chunk_size == 0 && !is_dmabuf) {
                     ud.dbg_log_n += 1;
                     if ud.dbg_log_n.is_power_of_two() {
@@ -2071,21 +1739,15 @@ pub fn pipewire_thread(
                             "capture: skipped a stale CORRUPTED/cursor buffer (GNOME)"
                         );
                     }
-                    // Skip this stale/cursor buffer — `newest` is requeued unconditionally below.
                     return;
                 }
 
                 consume_frame(ud, spa_buf, newest, hdr_pts);
             }));
-            // Hand `newest` back to the stream exactly once, on EVERY path — normal, corrupted-skip,
-            // or a caught panic in the closure above — UNLESS a raw-passthrough publish withheld it
-            // (`try_defer` put it in the hold book): then the requeue duty belongs to the frame's
-            // `BufferHold`, and requeueing here too would hand the producer the same buffer twice.
-            // The book is stable across this check: only this thread removes entries (the requeue
-            // channel's callback / `remove_buffer`), and neither can run inside `.process` — a
-            // consumer racing the frame to its drop merely queues the release message. A panic
-            // AFTER the publish leaves the hold live on the published frame, so skipping the
-            // immediate requeue remains correct on that path too.
+            // Requeue `newest` exactly once on every path unless `try_defer` withheld it —
+            // then `BufferHold` owns the requeue; doing both hands the producer the buffer
+            // twice. The book is stable here: only this thread removes entries, and neither
+            // callback runs inside `.process`. A panic after publish still leaves the hold live.
             let withheld = ud
                 .defer
                 .book
@@ -2100,9 +1762,7 @@ pub fn pipewire_thread(
                 unsafe { stream.queue_raw_buffer(newest) };
             }
             if outcome.is_err() {
-                // In the per-frame `.process` callback: a deterministic panic (e.g. a bad
-                // format) would fire this every frame, so power-of-two throttle it — enough to
-                // surface the fault without evicting the whole log ring.
+                // `.process` is per-frame; a deterministic panic would flood. Power-of-two throttle.
                 static PANICS: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(0);
                 let n = PANICS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2114,11 +1774,9 @@ pub fn pipewire_thread(
         .register()
         .context("register stream listener")?;
 
-    // The deferred-requeue service. A `BufferHold` dropping on any thread only *sends*
-    // `(buffer, generation)`; this callback — on the loop thread, like every other stream op —
-    // is where a withheld buffer actually rejoins the producer's pool. `HoldBook::complete`
-    // makes a release for a renegotiated-away buffer (or a freed address reused by a new
-    // pool's buffer) a no-op, so a stale hold can never queue somebody else's buffer.
+    // A `BufferHold` dropping on any thread only sends; this loop-thread callback is where a
+    // withheld buffer rejoins. `HoldBook::complete` no-ops a renegotiated-away (or reused)
+    // address, so a stale hold can never queue somebody else's buffer.
     let defer_cb = defer.clone();
     let stream_ptr = stream.as_raw_ptr() as usize;
     let _requeue_attach = requeue_rx.attach(mainloop.loop_(), move |(buf, generation)| {
@@ -2142,14 +1800,12 @@ pub fn pipewire_thread(
         }
     });
 
-    // Debug knob: offer a single fixed format (PUNKTFUNK_PW_FIXED_POD="WxH") to bisect
-    // negotiation failures against a producer's exact EnumFormat (e.g. gamescope).
+    // `PUNKTFUNK_PW_FIXED_POD="WxH"`: one fixed format, to bisect against a producer's EnumFormat.
     let fixed_pod: Option<(u32, u32)> = std::env::var("PUNKTFUNK_PW_FIXED_POD")
         .ok()
         .and_then(|v| v.split_once('x').map(|(w, h)| (w.parse(), h.parse())))
         .and_then(|(w, h)| Some((w.ok()?, h.ok()?)));
 
-    // Request raw video in any encoder-mappable layout, any size/framerate.
     let obj = if let Some((fw, fh)) = fixed_pod {
         tracing::info!(
             fw,
@@ -2192,36 +1848,20 @@ pub fn pipewire_thread(
         build_default_format_obj(preferred)
     };
 
-    // gamescope trap — the Steam overlay's presence in the stream is decided HERE by omission:
-    // gamescope's `paint_pipewire()` composites the overlay (Shift+Tab / Quick Access Menu) into
-    // the node it hands us ONLY when the consumer-negotiated `gamescope_focus_appid` is 0 — the
-    // default, and the "mirror the focused window + overlay" branch (gamescope ≥ 3.16.23; see
-    // `MIN_GAMESCOPE_OVERLAY`). None of the EnumFormat pods below advertise the
-    // `SPA_FORMAT_VIDEO_gamescope_focus_appid` property, so gamescope reads 0 and paints the
-    // overlay for us for free. DO NOT add a non-zero focus-appid (e.g. to "isolate the game" in a
-    // dedicated session) — that flips gamescope into the Remote-Play branch that deliberately
-    // drops the overlay (and all host chrome) back out of the capture. The cursor, external
-    // overlay (MangoHUD), and notifications are excluded from the node on EVERY gamescope
-    // version and are composited host-side instead (see `xfixes_cursor.rs`).
-    //
-    // When zero-copy is on, offer ONLY a BGRx dmabuf format with our EGL-importable modifiers
-    // (offering shm too makes the compositor pick shm). The modifier list goes out as a plain
-    // MANDATORY `ChoiceEnum::Enum` and the producer fixates one of the alternatives directly —
-    // this is NOT the two-step DONT_FIXATE handshake (libspa 0.9's `ChoiceFlags` cannot express
-    // `SPA_POD_PROP_FLAG_DONT_FIXATE`, and `param_changed` only READS the fixated format, it
-    // re-emits nothing). Worth revisiting if a multi-modifier offer is ever seen to fail
-    // negotiation on a compositor that needs the allocator round-trip. Otherwise offer the
-    // multi-format shm pod and let MAP_BUFFERS map it. An HDR session replaces ALL of this with the two 10-bit
-    // PQ pods (LINEAR dmabuf, MANDATORY colorimetry — see `build_hdr_dmabuf_format`): offering
-    // SDR alongside would make the producer pick its earlier-listed SDR format, and the
-    // negotiation-timeout path latches the process-wide SDR downgrade if nothing matches.
+    // gamescope paints the Steam overlay into this node only when negotiated
+    // `gamescope_focus_appid` is 0 (the default). Do not advertise a non-zero focus-appid —
+    // that is the Remote-Play branch, which drops the overlay.
+
+    // Zero-copy: offer only BGRx dmabuf with our EGL-importable modifiers (offering shm
+    // makes the compositor pick shm). Modifiers go out as MANDATORY `ChoiceEnum::Enum`;
+    // this is not the two-step DONT_FIXATE handshake (`ChoiceFlags` cannot express it).
     let format_pods: Vec<Vec<u8>> = if want_hdr {
         tracing::info!(
             "HDR capture: offering xBGR_210LE/xRGB_210LE LINEAR dmabufs with MANDATORY \
              BT.2020 + SMPTE-2084 (PQ) colorimetry (GNOME 50+ monitor stream)"
         );
-        // ⚠ Order is the whole fix — see the NVIDIA note on `HDR_FORMAT_ORDER`. The first
-        // compatible consumer pod wins, so this is what a gamescope session actually lands on.
+        // Offering SDR alongside lets the producer pick it, and a timeout latches SDR downgrade.
+        // Order is the fix — see the NVIDIA note on `HDR_FORMAT_ORDER`. First compatible pod wins.
         HDR_FORMAT_ORDER
             .iter()
             .map(|fmt| build_hdr_dmabuf_format(*fmt, preferred))
@@ -2229,8 +1869,8 @@ pub fn pipewire_thread(
     } else if want_dmabuf {
         let mut pods = Vec::with_capacity(if prefer_native_nv12 { 3 } else { 2 });
         if prefer_native_nv12 {
-            // First compatible consumer pod wins. Gamescope advertises NV12 and BGRx; pinning
-            // BT.709 limited here selects its RGB→NV12 shader with our bitstream colorimetry.
+            // First compatible consumer pod wins. Pinning BT.709 limited selects gamescope's
+            // RGB→NV12 shader with our bitstream colorimetry.
             pods.push(build_dmabuf_format(VideoFormat::NV12, &[0], preferred)?);
         }
         if !modifiers.is_empty() {
@@ -2240,19 +1880,10 @@ pub fn pipewire_thread(
                 preferred,
             )?);
         }
-        // xdph (Hyprland/sway) offers ONLY **BGRA** on its dmabuf EnumFormat — it lists BGRA *and*
-        // BGRx on the SHM pod, so a BGRx-only dmabuf offer intersects with nothing and PipeWire
-        // fails the link outright:
-        //     pw.link: negotiating -> error no more input formats (-22)
-        // Measured 2026-08-14 on Hyprland 0.55.4 + xdph 1.3.12: the 12 tiled modifiers matched on
-        // both sides perfectly — only the fourcc never did, which is why the failure reads like a
-        // GPU/modifier problem and is not one.
-        //
-        // BGRA and BGRx are the same 32-bit layout; the alpha byte is ignored the whole way to the
-        // encoder (`vk_util` maps both to `B8G8R8A8_UNORM`, VAAPI both to `Pixel::BGRA`), and the
-        // dmabuf import is driven by the NEGOTIATED format's fourcc, so an AR24 frame imports as
-        // AR24. Listed AFTER BGRx so a producer offering both still lands on the pre-existing path
-        // — first compatible consumer pod wins, so this is purely additive.
+        // xdph (Hyprland/sway) lists only BGRA on its dmabuf EnumFormat (BGRA+BGRx on SHM).
+        // A BGRx-only dmabuf offer intersects nothing and the link fails as if modifiers
+        // mismatched. Same 32-bit layout; listed after BGRx so a producer offering both
+        // still takes the existing path (first compatible consumer pod wins).
         if !modifiers_bgra.is_empty() {
             pods.push(build_dmabuf_format(
                 VideoFormat::BGRA,
@@ -2265,22 +1896,20 @@ pub fn pipewire_thread(
         vec![serialize_pod(obj)?]
     };
     let buffers_values = if want_hdr || want_dmabuf {
-        // Dmabuf-only. For HDR this is load-bearing beyond zero-copy: Mutter's SHM record
-        // path paints 8-bit ARGB32 regardless of the negotiated format, so a MemFd buffer
-        // under a 10-bit format would carry mislabeled bytes.
+        // Dmabuf-only. HDR: Mutter's SHM path paints 8-bit ARGB32 regardless of format, so a
+        // MemFd buffer under a 10-bit format would carry mislabeled bytes.
         Some(build_dmabuf_buffers()?)
     } else if force_shm {
-        // True SHM: exclude DmaBuf so Mutter MUST download (glReadPixels orders against render).
+        // Exclude DmaBuf so Mutter must download (glReadPixels orders against render).
         Some(build_shm_only_buffers()?)
     } else {
         // CPU path still accepts mappable dmabufs (gamescope offers only those once its
-        // modifier-bearing format pod wins the intersection).
+        // modifier-bearing format pod wins).
         Some(build_mappable_buffers()?)
     };
 
-    // Ask for cursor-as-metadata on every path (harmless if the producer can't supply it): the
-    // pointer rides as SPA_META_Cursor rather than being burned into the frame, so the
-    // compositor keeps its cheap hardware cursor plane (see `choose_cursor_mode`).
+    // Cursor-as-metadata on every path (harmless if the producer cannot supply it): the pointer
+    // rides as SPA_META_Cursor so the compositor keeps its hardware cursor plane.
     let cursor_meta = build_cursor_meta_param()?;
     let mut byte_slices: Vec<&[u8]> = Vec::new();
     for pod in &format_pods {
@@ -2304,9 +1933,8 @@ pub fn pipewire_thread(
         )
         .context("pw stream connect")?;
 
-    // Blocks this thread, pumping frame callbacks until the capturer's `Drop` fires the quit
-    // channel attached above (`_quit_attach` → `quit_loop.quit()`), at which point `run()`
-    // returns and the thread unwinds — releasing the importer / CUDA context deterministically.
+    // Blocks until capturer `Drop` fires the quit channel; `run()` returns and the thread
+    // unwinds, releasing the importer / CUDA context.
     mainloop.run();
     Ok(())
 }
@@ -2365,13 +1993,11 @@ mod tests {
         );
     }
 
-    /// The four invariants that were prose-only comments in `pipewire_thread`'s prologue.
+    /// Pins the four invariants documented on [`negotiation_plan`].
     #[test]
     fn negotiation_plan_invariants() {
-        // 1. HDR builds the importer on the NVENC path — its pods are LINEAR-only, so the frames
-        //    take the Vulkan-bridge/CUDA arm (byte-exact for 4 Bpp), never the 8-bit de-tile
-        //    blit. (The tiled half of the invariant is enforced per frame in `.process`, which
-        //    sees the negotiated modifier this plan cannot.)
+        // HDR on NVENC builds the importer: pods are LINEAR-only, so frames take the
+        // Vulkan-bridge arm, never the 8-bit de-tile blit. Tiled half is enforced in `.process`.
         for want_444 in [false, true] {
             let p = negotiation_plan(NegotiationInputs {
                 want_hdr: true,
@@ -2388,9 +2014,8 @@ mod tests {
             })
             .build_importer
         );
-        // …and never when the resolved encoder can't take a packed 10-bit CUDA payload (libav
-        // NVENC: its HDR route swscales into a P010 hardware frame). SDR is unaffected — the term
-        // is HDR-only, so a libav host keeps its 8-bit zero-copy.
+        // Never when the encoder cannot take packed 10-bit CUDA (libav HDR swscales to P010).
+        // SDR is unaffected — the term is HDR-only.
         assert!(
             !negotiation_plan(NegotiationInputs {
                 want_hdr: true,
@@ -2424,9 +2049,8 @@ mod tests {
             .prefer_native_nv12
         );
 
-        // 3. Producer-native NV12 needs a `native_nv12_session` AND an active raw passthrough:
-        //    libav VAAPI would misread the two-plane buffer, and the CUDA importer expects
-        //    packed RGB.
+        // Producer-native NV12 needs a `native_nv12_session` and an active raw passthrough:
+        // libav VAAPI misreads two-plane; the CUDA importer expects packed RGB.
         assert!(negotiation_plan(vaapi_native_nv12()).prefer_native_nv12);
         assert!(
             !negotiation_plan(NegotiationInputs {
@@ -2453,8 +2077,7 @@ mod tests {
             .prefer_native_nv12
         );
 
-        // 4. The pyrowave-modifier extension (and the passthrough generally) is off whenever
-        //    the raw-dmabuf latch has fired.
+        // Passthrough (and the pyrowave-modifier extension) is off once the raw-dmabuf latch fires.
         let p = negotiation_plan(NegotiationInputs {
             raw_dmabuf_import_disabled: true,
             ..vaapi_native_nv12()
@@ -2464,11 +2087,8 @@ mod tests {
         assert!(p.raw_dmabuf_latched, "…and the operator gets told why");
     }
 
-    /// The drift F1 was about: `spawn_pipewire` derived `vaapi_passthrough` by hand and its copy
-    /// omitted the raw-dmabuf latch, so after that latch fired the capturer believed it had made
-    /// the passthrough offer while the thread had already fallen back — and a timeout then
-    /// latched a downgrade for an offer nobody made. With one resolver the two cannot disagree,
-    /// so this pins the property that made the mirror wrong: the latch MUST move the decision.
+    /// The latch must move `vaapi_passthrough`. One resolver is shared by the thread and
+    /// `spawn_pipewire`; a timeout must not latch a downgrade for an offer nobody made.
     #[test]
     fn the_raw_dmabuf_latch_moves_the_passthrough_decision() {
         for pyrowave in [false, true] {
@@ -2488,10 +2108,8 @@ mod tests {
         }
     }
 
-    /// The EGL→CUDA offer's own negotiation-timeout latch gates `build_importer` — the twin of
-    /// the raw passthrough's latch, so a compositor that accepts none of the importer's modifiers
-    /// stops being asked (previously it re-ran the same 10 s timeout on every session, forever).
-    /// The raw passthrough is untouched by it.
+    /// EGL→CUDA negotiation-timeout latch gates `build_importer` only, so a compositor that
+    /// accepts none of the importer's modifiers is not re-asked (10 s) every session.
     #[test]
     fn gpu_dmabuf_negotiation_latch_gates_only_the_importer() {
         let p = negotiation_plan(NegotiationInputs {
@@ -2511,9 +2129,8 @@ mod tests {
         assert!(!p.gpu_import_latched, "no importer was ever wanted here");
     }
 
-    /// A PyroWave session on an NVIDIA box takes the raw passthrough (the wavelet encoder's own
-    /// Vulkan device imports dmabufs on any vendor) and therefore must NOT also build the
-    /// EGL→CUDA importer — whose payloads only NVENC can consume.
+    /// PyroWave takes raw passthrough (its Vulkan device imports on any vendor) and must not
+    /// also build the EGL→CUDA importer — those payloads only NVENC can consume.
     #[test]
     fn a_pyrowave_session_passes_through_without_a_cuda_importer() {
         let p = negotiation_plan(NegotiationInputs {
@@ -2534,8 +2151,8 @@ mod tests {
         });
         assert!(!p.vaapi_passthrough);
         assert!(!p.want_dmabuf(true, &[0, 1, 2]));
-        // …and an SHM-forced NVENC session may still build the importer (it just won't be fed
-        // dmabufs), which is why `want_dmabuf` — not `build_importer` — is the gate.
+        // SHM-forced NVENC may still build the importer (it will not be fed dmabufs), so
+        // `want_dmabuf` — not `build_importer` — is the gate.
         let p = negotiation_plan(NegotiationInputs {
             force_shm: true,
             ..nvenc()
@@ -2560,7 +2177,6 @@ mod tests {
         assert!(p.want_dmabuf(false, &[0]));
     }
 
-    /// The GPU-import death latch stops the importer being rebuilt, and says so.
     #[test]
     fn the_gpu_import_death_latch_skips_the_importer() {
         let p = negotiation_plan(NegotiationInputs {
@@ -2569,8 +2185,7 @@ mod tests {
         });
         assert!(!p.build_importer);
         assert!(p.gpu_import_latched);
-        // Reported for an HDR capture too — HDR takes the same importer (LINEAR/Vulkan-bridge
-        // arm), so the latch really did cost it zero-copy.
+        // HDR takes the same importer (LINEAR/Vulkan-bridge), so the latch costs it zero-copy.
         assert!(
             negotiation_plan(NegotiationInputs {
                 gpu_import_disabled: true,
@@ -2579,8 +2194,7 @@ mod tests {
             })
             .gpu_import_latched
         );
-        // It is NOT reported for a capture that would never have built one anyway (a raw
-        // passthrough) — that would misdirect the operator.
+        // Not reported for a raw passthrough that would never have built an importer.
         assert!(
             !negotiation_plan(NegotiationInputs {
                 gpu_import_disabled: true,
@@ -2590,7 +2204,6 @@ mod tests {
         );
     }
 
-    /// Zero-copy off ⇒ nothing at all: no importer, no passthrough, no NV12 preference.
     #[test]
     fn zerocopy_off_disables_every_branch() {
         for i in [
@@ -2611,28 +2224,23 @@ mod tests {
         }
     }
 
-    // ---- PW2: capture-arm observability (pure halves) -------------------------------------
-    //
-    // Env-var reads race under a shared test process, so these assert against the pure functions
-    // the logging sites call — the same rule `negotiation_plan_invariants` follows.
+    // Env-var reads race under a shared test process, so these assert against the pure
+    // functions the logging sites call.
 
     use super::{
         consumer_kind, resolved_capture_arm, CaptureArm, ConsumerKind, FenceWaitStats,
         PassthroughFallback, PassthroughFallbacks, PoolCensus, FENCE_WAIT_BUCKETS_US,
     };
 
-    /// A PyroWave session is PyroWave even though it also flips `backend_is_vaapi` on (the
-    /// `linux_zero_copy_is_vaapi` `Pyrowave` arm). Getting this precedence backwards is the exact
-    /// shape of the bug PW2 fixes: the session gets reported as somebody else's backend.
+    /// PyroWave wins even when it also flips `backend_is_vaapi` on (`linux_zero_copy_is_vaapi`
+    /// `Pyrowave` arm). The other order reports the session as somebody else's backend.
     #[test]
     fn pyrowave_outranks_the_host_global_backend_pref() {
         assert_eq!(consumer_kind(true, true, true), ConsumerKind::PyroWave);
-        // ...and on an NVIDIA/auto host, where `backend_is_vaapi` is false, it is still PyroWave —
-        // the case that previously logged nothing at all.
+        // NVIDIA/auto host (`backend_is_vaapi` false) is still PyroWave — that case logged nothing.
         assert_eq!(consumer_kind(true, false, true), ConsumerKind::PyroWave);
     }
 
-    /// The non-PyroWave consumers, and the one that must NOT warn on a CPU arm.
     #[test]
     fn consumer_kinds_and_which_ones_a_cpu_arm_degrades() {
         assert_eq!(consumer_kind(false, true, true), ConsumerKind::Vaapi);
@@ -2649,7 +2257,6 @@ mod tests {
     /// resolver can produce, so the headline line can never claim an arm the session did not take.
     #[test]
     fn resolved_arm_matches_the_plan_that_produced_it() {
-        // PyroWave/VAAPI raw passthrough.
         let p = negotiation_plan(NegotiationInputs {
             pyrowave_session: true,
             ..nvenc()
@@ -2659,7 +2266,6 @@ mod tests {
             resolved_capture_arm(&p, false, p.want_dmabuf(false, &[0])),
             CaptureArm::DmabufPassthrough
         );
-        // NVENC via the EGL→CUDA importer.
         let p = negotiation_plan(nvenc());
         assert!(p.build_importer);
         assert_eq!(
@@ -2697,21 +2303,16 @@ mod tests {
     #[test]
     fn fallback_log_budget_is_one_line_per_reason() {
         let mut f = PassthroughFallbacks::default();
-        // First of a reason logs, and reports the running total (not a per-reason count).
         assert_eq!(f.note(PassthroughFallback::NotDmabuf), Some(1));
-        // Repeats of the SAME reason never log again, but are still counted.
         for _ in 0..1_000 {
             assert_eq!(f.note(PassthroughFallback::NotDmabuf), None);
         }
-        // A DIFFERENT reason is a different diagnosis and gets its own line, carrying the
-        // now-large total — which is what distinguishes a persistent downgrade from a hiccup.
+        // A different reason is a different diagnosis and gets its own line, carrying the
+        // running total — which distinguishes a persistent downgrade from a hiccup.
         assert_eq!(f.note(PassthroughFallback::DupFailed), Some(1002));
         assert_eq!(f.note(PassthroughFallback::DupFailed), None);
-        // All four reasons fit the budget independently; the tally counts every frame.
         assert_eq!(f.note(PassthroughFallback::NoFormat), Some(1004));
         assert_eq!(f.note(PassthroughFallback::NoFourcc), Some(1005));
-        // Budget spent: every reason has logged once, so nothing logs again however long the
-        // session runs.
         for r in [
             PassthroughFallback::NoFormat,
             PassthroughFallback::NotDmabuf,
@@ -2741,22 +2342,17 @@ mod tests {
             assert!(!r.as_str().is_empty());
             assert!(!r.hint().is_empty());
         }
-        // Only `NoFormat` drops the frame; the other three downgrade it. The log line picks its
-        // consequence clause off this, so an inverted answer would print the opposite of the truth.
+        // Only `NoFormat` drops the frame; the other three downgrade it.
         assert!(!PassthroughFallback::NoFormat.falls_back_to_cpu());
         assert!(PassthroughFallback::NotDmabuf.falls_back_to_cpu());
         assert!(PassthroughFallback::NoFourcc.falls_back_to_cpu());
         assert!(PassthroughFallback::DupFailed.falls_back_to_cpu());
     }
 
-    // ---- PW4 step 1: the fence-wait histogram ------------------------------------------------
-    //
-    // This instrument decides whether PW4 ships, so its arithmetic has to be right: a p99 that
-    // reads one bucket low would retire a package that was worth doing, and one that reads high
-    // would justify moving load-bearing synchronisation off a thread for nothing.
+    // A p99 one bucket low would call the wait free; one bucket high would justify moving
+    // load-bearing sync off the loop thread for nothing.
 
-    /// An empty histogram must say "no answer", not "zero" — those are different claims, and the
-    /// second one would look like a decisive p99 ≈ 0 result.
+    /// An empty histogram must say "no answer", not "zero" — the second looks like p99 ≈ 0.
     #[test]
     fn an_empty_histogram_has_no_quantile() {
         let s = FenceWaitStats::default();
@@ -2765,8 +2361,7 @@ mod tests {
         assert!(!s.is_meaningful(), "it must not be trusted yet either");
     }
 
-    /// The all-fast case — the one that RETIRES PW4. Every sample in the first bucket must put the
-    /// p99 there too.
+    /// Every sample in the first bucket must put p99 there too.
     #[test]
     fn an_all_fast_distribution_puts_p99_in_the_first_bucket() {
         let mut s = FenceWaitStats::default();
@@ -2784,9 +2379,7 @@ mod tests {
         assert_eq!(s.mean_us(), 3);
     }
 
-    /// The case PW4 exists for: a fast median with a heavy tail. The p50 must stay low AND the p99
-    /// must find the tail — a histogram that smeared them together could not tell the two worlds
-    /// apart, which is the entire decision.
+    /// Fast median, heavy tail: p50 stays low and p99 finds the tail. A smear cannot tell them apart.
     #[test]
     fn a_heavy_tail_moves_p99_without_moving_p50() {
         let mut s = FenceWaitStats::default();
@@ -2833,8 +2426,7 @@ mod tests {
         }
     }
 
-    /// PW5 stage 1: a stable pool logs ONE line, not one per frame. `.process` runs at the capture
-    /// rate — an unconditional log here would be 240 lines a second of the same number.
+    /// A stable pool logs one line, not one per frame. `.process` runs at capture rate.
     #[test]
     fn a_stable_pool_is_logged_once() {
         let mut p = PoolCensus::default();
@@ -2922,17 +2514,16 @@ mod tests {
         assert!(!b.contains(0x1000));
     }
 
-    /// The renegotiation hazard the generation exists for: the pool is replaced (`remove_buffer`
-    /// purges), a NEW buffer lands on the SAME address and is withheld, and only then does the
-    /// OLD hold's release arrive. Matching by pointer alone would requeue the new tenant while
-    /// its own hold is still out — the mid-encode rewrite race, reintroduced by the fix itself.
+    /// Pool replaced (`remove_buffer` purges), a new buffer lands on the same address, then the
+    /// old hold's release arrives. Matching by pointer alone would requeue the new tenant while
+    /// its own hold is still out.
     #[test]
     fn hold_book_generation_outlives_an_address_reuse() {
         let mut b = HoldBook::default();
         let old = b.try_hold(0x1000, 8).unwrap();
-        b.purge(0x1000); // remove_buffer: pool renegotiated away under the hold
+        b.purge(0x1000); // `remove_buffer`: pool renegotiated away under the hold
         assert!(!b.complete(0x1000, old), "purged hold releases nothing");
-        let new = b.try_hold(0x1000, 8).unwrap(); // new pool's buffer, same address
+        let new = b.try_hold(0x1000, 8).unwrap(); // new pool, same address
         assert!(
             !b.complete(0x1000, old),
             "the OLD hold cannot release the NEW tenant"

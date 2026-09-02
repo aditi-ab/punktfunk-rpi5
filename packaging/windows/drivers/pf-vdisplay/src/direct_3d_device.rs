@@ -12,7 +12,7 @@
 //! `D3D11_CREATE_DEVICE_SINGLETHREADED` (that was sound only pre-pooling, device-per-processor), and
 //! the immediate context is `SetMultithreadProtected` (it has no internal locking of its own).
 
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::{
@@ -61,9 +61,37 @@ pub struct Direct3DDevice {
     /// init: an immediate context has no internal locking, and two concurrent monitors' workers would
     /// otherwise race it (undefined behavior inside the UMD).
     pub device_context: ID3D11DeviceContext,
+    /// This device object's epoch (immunity plan D2): minted from [`DEVICE_EPOCH`] at `init`, so a
+    /// TDR recreate on the SAME LUID is a different epoch and LUID equality is never mistaken for
+    /// D3D-object compatibility. Reported to the host in the v3 header.
+    epoch: u32,
+    /// Set once ANY worker observed this device removed (`GetDeviceRemovedReason` failed). Every
+    /// worker on the entry stops using it and [`pooled_device`] recreates instead of handing it out.
+    removed: AtomicBool,
 }
 
 impl Direct3DDevice {
+    /// See the `epoch` field.
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    /// Whether a worker has flagged this device removed ([`Self::mark_removed`]).
+    pub fn is_removed(&self) -> bool {
+        self.removed.load(Ordering::Acquire)
+    }
+
+    /// Flag the device removed for every holder + the pool (one observation is enough — a removed
+    /// device never comes back).
+    pub fn mark_removed(&self) {
+        if !self.removed.swap(true, Ordering::AcqRel) {
+            dbglog!(
+                "[pf-vd] D3D device epoch {} marked REMOVED — workers stop, pool recreates",
+                self.epoch
+            );
+        }
+    }
+
     pub fn init(adapter_luid: LUID) -> Result<Self, Direct3DError> {
         // SAFETY: a plain DXGI factory-creation call; `?` returns the error on failure.
         let dxgi_factory =
@@ -116,13 +144,16 @@ impl Direct3DDevice {
         }
 
         let live = LIVE_DEVICES.fetch_add(1, Ordering::Relaxed) + 1;
-        dbglog!("[pf-vd] Direct3DDevice::init OK — live D3D devices = {live}");
+        let epoch = DEVICE_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
+        dbglog!("[pf-vd] Direct3DDevice::init OK — epoch {epoch}, live D3D devices = {live}");
 
         Ok(Self {
             _dxgi_factory: dxgi_factory,
             _adapter: adapter,
             device,
             device_context,
+            epoch,
+            removed: AtomicBool::new(false),
         })
     }
 }
@@ -134,37 +165,52 @@ impl Drop for Direct3DDevice {
     }
 }
 
-/// ONE shared D3D render device, reused across every swap-chain assignment (keyed by render LUID).
+/// ONE shared D3D render device PER RENDER LUID, reused across every swap-chain assignment.
 /// Creating a fresh `Direct3DDevice` per assign — and the swap-chain flap fires several assigns per
 /// session — spawned a new NVIDIA UMD worker-thread set each time that was NEVER reclaimed on release
 /// (proven on the RTX box: ~70 `nvwgf2umx` threads + ~50 MB VRAM leaked per reconnect, permanently,
-/// even though our `Direct3DDevice` refcount dropped to 0). Pooling one device keeps a single, stable
-/// thread set: the processors borrow an `Arc`, so the device outlives them and is never re-created.
-static DEVICE_POOL: Mutex<Option<(i64, Arc<Direct3DDevice>)>> = Mutex::new(None);
+/// even though our `Direct3DDevice` refcount dropped to 0). Pooling keeps a single, stable thread
+/// set per adapter: the processors borrow an `Arc`, so the device outlives them and is never
+/// re-created. A bounded MAP, not one slot (immunity plan WP5): on a hybrid iGPU+dGPU box two
+/// live monitors on different adapters must not evict each other's entry every assignment.
+static DEVICE_POOL: Mutex<Vec<(i64, Arc<Direct3DDevice>)>> = Mutex::new(Vec::new());
 
-/// Get-or-create the pooled D3D device for `luid`. Re-creates only if the render adapter changes
-/// (e.g. a GPU hot-swap), which drops the old `Arc` once its last processor releases it.
+/// How many adapters the pool keeps devices for — beyond this the oldest entry goes.
+const DEVICE_POOL_CAP: usize = 4;
+
+/// Minted on EVERY successful `Direct3DDevice::init` (see `Direct3DDevice::epoch`).
+static DEVICE_EPOCH: AtomicU32 = AtomicU32::new(0);
+
+/// Get-or-create the pooled D3D device for `luid`. Re-creates when the entry is gone, was flagged
+/// removed by a worker, or reports removal at checkout; the old `Arc` drops once its last
+/// processor releases it.
 pub fn pooled_device(luid: LUID) -> Option<Arc<Direct3DDevice>> {
     let key = (i64::from(luid.HighPart) << 32) | i64::from(luid.LowPart);
     let mut pool = DEVICE_POOL.lock().ok()?;
-    if let Some((k, dev)) = pool.as_ref()
-        && *k == key
-    {
+    if let Some(pos) = pool.iter().position(|(k, _)| *k == key) {
+        let dev = &pool[pos].1;
         // A TDR / driver reset REMOVES the pooled device permanently; handing it out again gives
         // every future swap-chain a dead device (SetDevice fail-loop → black virtual display until
-        // device teardown). Detect and fall through to a fresh create instead.
+        // device teardown). A worker may already have flagged it; otherwise ask the device.
         // SAFETY: plain status query on the live pooled device.
-        match unsafe { dev.device.GetDeviceRemovedReason() } {
-            Ok(()) => return Some(dev.clone()),
-            Err(e) => {
-                dbglog!("[pf-vd] pooled D3D device was REMOVED ({e:?}) — recreating on {key:#x}");
-            }
+        let alive = !dev.is_removed() && unsafe { dev.device.GetDeviceRemovedReason() }.is_ok();
+        if alive {
+            return Some(dev.clone());
         }
+        dev.mark_removed();
+        dbglog!(
+            "[pf-vd] pooled D3D device epoch {} was REMOVED — recreating on {key:#x}",
+            dev.epoch()
+        );
+        pool.remove(pos);
     }
     match Direct3DDevice::init(luid) {
         Ok(d) => {
             let a = Arc::new(d);
-            *pool = Some((key, a.clone()));
+            if pool.len() >= DEVICE_POOL_CAP {
+                pool.remove(0);
+            }
+            pool.push((key, a.clone()));
             Some(a)
         }
         Err(e) => {

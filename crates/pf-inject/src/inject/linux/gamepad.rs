@@ -1,19 +1,16 @@
-//! Virtual gamepads via `/dev/uinput`, cloning the kernel `xpad` identity ("Microsoft X-Box
-//! 360 pad", `045e:028e`) so SDL/Steam/Proton match their built-in mapping with zero
-//! configuration — exactly what Sunshine emulates. One [`VirtualPad`] per attached client
-//! controller, managed by [`GamepadManager`] from decoded
+//! Virtual gamepads via `/dev/uinput`, cloning the kernel `xpad` identity so SDL/Steam/Proton
+//! match their built-in mapping with no extra config. One [`VirtualPad`] per attached client
+//! controller; [`GamepadManager`] applies decoded
 //! [`GamepadFrame`](punktfunk_core::input::GamepadFrame)s.
 //!
-//! Rumble flows the *other* way on the same fd: games upload force-feedback effects
-//! (`EV_UINPUT`/`UI_FF_UPLOAD` → `UI_BEGIN/END_FF_UPLOAD` ioctls) and trigger them with
-//! `EV_FF` writes; [`GamepadManager::pump_rumble`] services that protocol non-blockingly
-//! (the control thread calls it every tick) and reports mixed `(low, high)` motor levels for
-//! the host to send to the client. Note: a game's `EVIOCSFF` ioctl BLOCKS until we answer
-//! `UI_END_FF_UPLOAD`, so the pump must run regularly.
+//! Rumble is the reverse path on the same fd: the game uploads FF effects
+//! (`EV_UINPUT`/`UI_FF_UPLOAD` → `UI_BEGIN/END_FF_UPLOAD`) and plays them with `EV_FF`.
+//! [`GamepadManager::pump_rumble`] must run every tick — a game's `EVIOCSFF` BLOCKS until
+//! we answer `UI_END_FF_UPLOAD`. Mixdown is `(low, high)` for the host to send back.
 //!
-//! All ioctl numbers/struct layouts below were verified against this generation's
-//! `<linux/uinput.h>` on x86_64. `/dev/uinput` needs a udev rule + `input` group membership
-//! (see `scripts/60-punktfunk.rules`); creation fails with a clear error otherwise.
+//! Ioctl numbers and struct layouts match `<linux/uinput.h>` on x86_64 (see the `size_of`
+//! asserts). `/dev/uinput` needs the udev rule and `input` group
+//! (`scripts/60-punktfunk.rules`).
 
 use crate::pad_slots::PadSlots;
 use anyhow::{bail, Result};
@@ -35,7 +32,6 @@ const UI_END_FF_UPLOAD: libc::c_ulong = 0x4068_55c9;
 const UI_BEGIN_FF_ERASE: libc::c_ulong = 0xc00c_55ca;
 const UI_END_FF_ERASE: libc::c_ulong = 0x400c_55cb;
 
-// Event types/codes.
 const EV_SYN: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
 const EV_ABS: u16 = 0x03;
@@ -58,7 +54,7 @@ const ABS_HAT0Y: u16 = 0x11;
 
 const BTN_SOUTH: u16 = 0x130; // A
 const BTN_EAST: u16 = 0x131; // B
-const BTN_NORTH: u16 = 0x133; // X (kernel calls it BTN_NORTH/BTN_X)
+const BTN_NORTH: u16 = 0x133; // X
 const BTN_WEST: u16 = 0x134; // Y
 const BTN_TL: u16 = 0x136;
 const BTN_TR: u16 = 0x137;
@@ -67,15 +63,13 @@ const BTN_START: u16 = 0x13b;
 const BTN_MODE: u16 = 0x13c;
 const BTN_THUMBL: u16 = 0x13d;
 const BTN_THUMBR: u16 = 0x13e;
-// Xbox-Elite paddle codes (the xpad convention SDL / Steam Input recognize). A client's back grips —
-// and the GameStream `buttonFlags2` paddle bits, which were silently dropped before — land here, so
-// the virtual X-Box pad exposes paddles like an Elite controller. PADDLE1/2/3/4 = R4/L4/R5/L5.
+// xpad Elite paddles (SDL/Steam Input). PADDLE1/2/3/4 = R4/L4/R5/L5.
 const BTN_TRIGGER_HAPPY5: u16 = 0x2c4;
 const BTN_TRIGGER_HAPPY6: u16 = 0x2c5;
 const BTN_TRIGGER_HAPPY7: u16 = 0x2c6;
 const BTN_TRIGGER_HAPPY8: u16 = 0x2c7;
 
-/// `(GameStream button bit, evdev key code)` — D-pad is emitted as HAT axes instead.
+/// `(GameStream button bit, evdev key code)`. D-pad is HAT axes, not keys.
 const BUTTON_MAP: [(u32, u16); 15] = [
     (gamepad::BTN_A, BTN_SOUTH),
     (gamepad::BTN_B, BTN_EAST),
@@ -94,24 +88,21 @@ const BUTTON_MAP: [(u32, u16); 15] = [
     (gamepad::BTN_PADDLE4, BTN_TRIGGER_HAPPY8),
 ];
 
-/// The USB identity a virtual uinput pad presents. SDL/Steam/Proton key their built-in mapping off
-/// `bustype/vendor/product/version` (+ name), and games pick button glyphs from it. The button/axis
-/// layout this backend emits is the same XInput one regardless — only the identity differs between an
-/// X-Box 360 pad and an X-Box One/Series pad (which is why "Xbox One" buys glyphs, not new capability;
-/// impulse-trigger rumble is unreachable through evdev FF either way).
+/// USB identity the virtual pad presents. SDL/Steam/Proton key the mapping off
+/// `bustype/vendor/product/version` (+ name); games pick glyphs from it. Axis/button
+/// layout is XInput either way — One/Series only changes glyphs. Impulse-trigger rumble
+/// is not in evdev `FF_RUMBLE`.
 #[derive(Clone, Copy)]
 pub struct PadIdentity {
     vendor: u16,
     product: u16,
     version: u16,
     name: &'static [u8],
-    /// Short label for the creation log line.
     log: &'static str,
 }
 
 impl PadIdentity {
-    /// "Microsoft X-Box 360 pad" (`045e:028e`) — the universal default; matches the kernel `xpad`
-    /// table verbatim so SDL/Steam map it with zero config.
+    /// Kernel `xpad` table entry `045e:028e`. SDL/Steam map it with no extra config.
     pub const fn xbox360() -> PadIdentity {
         PadIdentity {
             vendor: 0x045e,
@@ -122,8 +113,7 @@ impl PadIdentity {
         }
     }
 
-    /// "Microsoft X-Box One S pad" (`045e:02ea`) — an `xpad`-table entry, so games show One/Series
-    /// glyphs. XInput-identical to the 360 pad otherwise.
+    /// Kernel `xpad` table entry `045e:02ea`. One/Series glyphs; XInput-identical otherwise.
     pub const fn xbox_one() -> PadIdentity {
         PadIdentity {
             vendor: 0x045e,
@@ -216,7 +206,7 @@ struct UinputFfErase {
     effect_id: u32,
 }
 
-// Layouts verified by compiling a probe against this generation's <linux/uinput.h> (x86_64).
+// x86_64 `<linux/uinput.h>` layouts.
 const _: () = {
     assert!(std::mem::size_of::<UinputSetup>() == 92);
     assert!(std::mem::size_of::<UinputAbsSetup>() == 28);
@@ -227,11 +217,9 @@ const _: () = {
 };
 
 fn ioctl_int(fd: i32, req: libc::c_ulong, arg: libc::c_int, what: &str) -> Result<()> {
-    // SAFETY: every caller passes one of UI_SET_EVBIT/KEYBIT/FFBIT/UI_DEV_CREATE/UI_DEV_DESTROY as
-    // `req` — all integer-argument ioctls whose third arg the kernel takes BY VALUE, so nothing is
-    // dereferenced through `arg` and no memory must outlive the call. The only precondition is `fd`
-    // being a valid open descriptor; callers pass the live `/dev/uinput` fd, and even a stale fd
-    // would merely return -1/EBADF (reported below), never UB.
+    // SAFETY: callers pass UI_SET_EVBIT/KEYBIT/FFBIT/UI_DEV_CREATE/UI_DEV_DESTROY — integer
+    // ioctls whose third arg the kernel takes BY VALUE, so nothing is dereferenced through
+    // `arg`. `fd` is the live `/dev/uinput` fd; a stale fd returns EBADF, not UB.
     if unsafe { libc::ioctl(fd, req, arg) } < 0 {
         bail!("{what}: {}", std::io::Error::last_os_error());
     }
@@ -239,49 +227,39 @@ fn ioctl_int(fd: i32, req: libc::c_ulong, arg: libc::c_int, what: &str) -> Resul
 }
 
 fn ioctl_ptr<T>(fd: i32, req: libc::c_ulong, arg: *mut T, what: &str) -> Result<()> {
-    // SAFETY: `fd` is the caller's live `/dev/uinput` fd. Every call site passes `&mut x` for a live,
-    // uniquely-borrowed `#[repr(C)]` `x: T` whose size matches the struct the request number encodes
-    // (UI_DEV_SETUP=0x405c_5503 → 0x5c=92=size_of::<UinputSetup>(); UI_ABS_SETUP → 0x1c=28; the FF
-    // upload/erase ioctls → 0x68/0x0c — all pinned by the `size_of` asserts above). The kernel copies
-    // exactly that many bytes in/out through `arg`; the `&mut` keeps the pointee alive and unaliased
-    // for the whole synchronous call.
+    // SAFETY: `fd` is the caller's live `/dev/uinput` fd. Call sites pass `&mut x` for a
+    // uniquely-borrowed `#[repr(C)]` `T` whose size matches the request (`UI_DEV_SETUP`
+    // 0x405c_5503 → 0x5c=92; `UI_ABS_SETUP` → 0x1c=28; FF upload/erase → 0x68/0x0c — pinned
+    // by the `size_of` asserts). The kernel copies that many bytes; the `&mut` lives for
+    // the whole synchronous call.
     if unsafe { libc::ioctl(fd, req, arg) } < 0 {
         bail!("{what}: {}", std::io::Error::last_os_error());
     }
     Ok(())
 }
 
-/// The window a played effect occupies: `replay.delay` of silence, then `replay.length` of rumble.
+/// Played-effect window: `replay.delay` of silence, then `replay.length` of rumble.
 #[derive(Clone, Copy)]
 struct Playback {
-    /// When the effect starts contributing — `play + replay.delay`. Until then it is armed but
-    /// silent, which is the whole point of the delay.
+    /// `play + replay.delay`. Armed but silent until then.
     starts: Instant,
     /// When it stops, or `None` for replay length 0 (until explicitly stopped).
     ends: Option<Instant>,
 }
 
-/// One FF effect a game uploaded: rumble magnitudes + playback state.
 struct Effect {
     strong: u16,
     weak: u16,
-    /// `Some(window)` while playing.
     playing: Option<Playback>,
     replay_ms: u16,
-    /// `replay.delay` — how long after the play command the effect stays silent. Decoded from the
-    /// upload since forever and, until now, never acted on: the effect started immediately and
-    /// ended `replay.length` later, so anything scheduling a delayed effect (DirectInput under
-    /// Wine does this routinely) fired early AND finished early by the same amount.
+    /// Silence after play. `replay.length` runs from the end of this delay, so the delay
+    /// shifts the window instead of eating into it.
     delay_ms: u16,
 }
 
 impl Effect {
-    /// The window a play command at `at` opens: silent for `replay.delay`, then `replay.length` of
-    /// rumble (or until stopped, when the length is 0).
-    ///
-    /// `replay.length` is measured from the END of the delay, not from the play command, so the
-    /// delay shifts the whole window instead of eating into it. Split out from the `EV_FF` handler
-    /// purely so this is testable — the handler itself needs a live uinput fd.
+    /// Silent for `replay.delay`, then `replay.length` of rumble (length 0 = until stopped).
+    /// Length is measured from the end of the delay, not from the play command.
     fn window(&self, at: Instant) -> Playback {
         let starts = at + Duration::from_millis(self.delay_ms as u64);
         Playback {
@@ -292,19 +270,16 @@ impl Effect {
     }
 }
 
-/// The force-feedback half of a virtual pad — the game-side effect table plus the mixdown policy
-/// (finite-replay expiry + the abandoned-INFINITE-effect force-off), split from [`VirtualPad`] so
-/// the policy is pure and unit-testable without a live uinput fd.
+/// Game-side FF table and mixdown (finite-replay expiry + abandoned infinite force-off).
+/// Split from [`VirtualPad`] so the policy is testable without a uinput fd.
 struct FfState {
     effects: HashMap<i16, Effect>,
     gain: u32,
     /// Last `(low, high)` reported, to dedup.
     last_mix: (u16, u16),
-    /// When a game last touched the FF plane (upload / erase / play / stop / gain). An
-    /// infinite-replay effect still playing past the shared idle window against this is a residual
-    /// the game abandoned (kernel auto-erase only covers a game whose fd CLOSED) — finite effects
-    /// are untouched: their declared replay deadline is the contract, exactly as a real pad honors
-    /// it. SDL-class writers re-play held rumble every ~2 s, refreshing this clock.
+    /// Last upload/erase/play/stop/gain. An infinite-replay effect still playing past the
+    /// idle window against this was abandoned — kernel auto-erase only runs on fd close.
+    /// Finite effects keep their declared deadline. SDL re-plays held rumble every ~2 s.
     last_activity: Instant,
 }
 
@@ -318,36 +293,27 @@ impl FfState {
         }
     }
 
-    /// The game touched the FF plane — refresh the abandoned-effect clock.
     fn note_activity(&mut self) {
         self.last_activity = Instant::now();
     }
 
-    /// Mix: sum playing effects (expiring finished ones, force-stopping abandoned infinite ones),
-    /// scale by gain. Returns the new `(low, high)` only when it changed since the last call.
+    /// `Some` only when mixed `(low, high)` changed since last call.
     fn mix(&mut self, now: Instant, idle: Option<Duration>) -> Option<(u16, u16)> {
         let quiet_since = |t: Instant| idle.is_some_and(|d| now.duration_since(t) >= d);
         let plane_stale = quiet_since(self.last_activity);
         let (mut strong, mut weak) = (0u32, 0u32);
         for e in self.effects.values_mut() {
             let Some(p) = e.playing else { continue };
-            // Still inside `replay.delay`: armed, silent, and NOT a candidate for expiry or the
+            // Still inside `replay.delay`: armed, silent, not a candidate for expiry or the
             // abandoned-effect force-off — it has not had its turn yet.
             if now < p.starts {
                 continue;
             }
             match p.ends {
                 Some(d) if now >= d => e.playing = None,
-                // An infinite-replay effect the game stopped driving (no FF traffic for the whole
-                // idle window) — the alive-but-abandoned case the kernel's close-time auto-erase
-                // cannot see. Stop it once; a later EV_FF play re-arms it (and refreshes the
-                // clock). Mirrors the XUSB/UHID abandoned-rumble force-off.
-                //
-                // "Abandoned" needs the effect to have been AUDIBLE for the window too, not just
-                // the plane quiet: the play command is itself the last activity, so an effect with
-                // a `replay.delay` longer than the window would otherwise be force-stopped the
-                // instant it finally started — silent the whole time it waited, then killed on its
-                // first contributing tick.
+                // Infinite-replay, no FF traffic for `idle`. Kernel auto-erase only runs on
+                // fd close. Require audible-for-`idle` too: play is last_activity, so a delay
+                // longer than idle would die on its first contributing tick.
                 None if plane_stale && quiet_since(p.starts) => {
                     tracing::info!(
                         strong = e.strong,
@@ -372,7 +338,6 @@ impl FfState {
     }
 }
 
-/// One virtual X-Box-360 pad backed by a uinput device.
 pub struct VirtualPad {
     fd: OwnedFd,
     ff: FfState,
@@ -381,9 +346,9 @@ pub struct VirtualPad {
 impl VirtualPad {
     pub fn create(index: usize, identity: PadIdentity) -> Result<VirtualPad> {
         use std::os::fd::FromRawFd;
-        // SAFETY: `c"/dev/uinput"` is a 'static NUL-terminated C string literal; `as_ptr()` yields a
-        // valid pointer the kernel only reads as a filesystem path. `open` returns a fresh fd (or -1)
-        // and retains nothing; no Rust memory is aliased or handed to the kernel beyond that 'static path.
+        // SAFETY: `c"/dev/uinput"` is a 'static NUL-terminated C string; `as_ptr()` is a
+        // valid path the kernel only reads. `open` returns a fresh fd (or -1) and retains
+        // nothing; no Rust memory is handed over except that 'static path.
         let raw = unsafe {
             libc::open(
                 c"/dev/uinput".as_ptr(),
@@ -397,9 +362,8 @@ impl VirtualPad {
                 std::io::Error::last_os_error()
             );
         }
-        // SAFETY: `raw >= 0` here (the `< 0` branch above already bailed), so it is a freshly-opened fd
-        // from `libc::open` that is not stored or owned anywhere else. Transferring it to `OwnedFd` makes
-        // this the unique owner, which will `close` it exactly once on drop (no double-close, no leak).
+        // SAFETY: `raw >= 0` (the `< 0` branch already bailed). The fd is freshly opened
+        // and not stored elsewhere. `OwnedFd` becomes the unique owner and closes it once.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
 
         ioctl_int(raw, UI_SET_EVBIT, EV_KEY as i32, "UI_SET_EVBIT(EV_KEY)")?;
@@ -451,7 +415,6 @@ impl VirtualPad {
             ioctl_ptr(raw, UI_ABS_SETUP, &mut a, "UI_ABS_SETUP")?;
         }
 
-        // The xpad identity: SDL keys its built-in mapping off bustype/vendor/product/version.
         let mut setup = UinputSetup {
             id: InputId {
                 bustype: 0x0003, // BUS_USB
@@ -489,11 +452,9 @@ impl VirtualPad {
             value,
         };
         // Best-effort: a full kernel queue drops the event; the next frame re-syncs state.
-        // SAFETY: `self.fd` is the live uinput `OwnedFd` (borrowed via `as_raw_fd`, so it stays open for
-        // the call). `write` READS exactly `size_of::<InputEventRaw>()` bytes from the live local `ev` —
-        // a `#[repr(C)]` struct of all-integer fields with no padding (timeval=16 + u16 + u16 + i32 = 24,
-        // the size asserted above), so every byte is initialized — and retains nothing past return, so
-        // `ev` outlives the synchronous call and the read-only access cannot race or alias.
+        // SAFETY: `self.fd` is the live uinput `OwnedFd` (borrowed via `as_raw_fd`).
+        // `write` READS `size_of::<InputEventRaw>()` initialized bytes from local `ev`
+        // (`#[repr(C)]` all-integer, no padding, size 24) and retains nothing past return.
         let _ = unsafe {
             libc::write(
                 self.fd.as_raw_fd(),
@@ -503,14 +464,10 @@ impl VirtualPad {
         };
     }
 
-    /// Apply one decoded frame: button state, axes, D-pad hat, one SYN_REPORT.
     pub fn apply(&mut self, f: &GamepadFrame) {
-        // Re-assert every mapped button's absolute state each frame — exactly like the axes below —
-        // instead of only writing XOR-changed edges. `emit` is best-effort (a full kernel queue drops
-        // the write), so an edge-only scheme would strand a dropped press/release until that button
-        // next toggles; re-asserting re-syncs it on the following frame. Restating an unchanged key is
-        // free downstream: the kernel input core discards an EV_KEY whose value already matches the
-        // device's current state (no duplicate event reaches consumers, and BTN_* keys don't autorepeat).
+        // Absolute state every frame, not XOR edges: `emit` is best-effort, so a dropped
+        // edge would stick until that button toggles again. Kernel input drops an EV_KEY
+        // that already matches device state (BTN_* does not autorepeat).
         for (bit, key) in BUTTON_MAP {
             self.emit(EV_KEY, key, ((f.buttons & bit) != 0) as i32);
         }
@@ -531,41 +488,36 @@ impl VirtualPad {
         self.emit(EV_SYN, SYN_REPORT, 0);
     }
 
-    /// Service the FF protocol on this pad's fd (non-blocking). Returns the new mixed
-    /// `(low, high)` motor levels if they changed since last call.
+    /// Non-blocking FF protocol on this pad's fd. `Some` when mixed `(low, high)` changed.
     fn pump_ff(&mut self) -> Option<(u16, u16)> {
         let raw = self.fd.as_raw_fd();
         let mut buf = [0u8; std::mem::size_of::<InputEventRaw>()];
         loop {
-            // SAFETY: `raw` is the live raw fd of `self.fd` (the non-blocking uinput device). `buf` is a
-            // live local `[u8; size_of::<InputEventRaw>()]`; `buf.as_mut_ptr()` is a valid writable pointer
-            // to its `buf.len()` bytes. `read` writes AT MOST `buf.len()` bytes (in bounds), the buffer
-            // outlives this synchronous call, and `buf` is borrowed uniquely here (no alias/race).
+            // SAFETY: `raw` is the live non-blocking uinput fd. `buf` is a local
+            // `[u8; size_of::<InputEventRaw>()]`; `read` writes at most `buf.len()` bytes.
+            // The buffer outlives this synchronous call and is borrowed uniquely.
             let n = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n != buf.len() as isize {
                 break; // EAGAIN / short read — queue drained
             }
-            // SAFETY: `buf` is exactly `size_of::<InputEventRaw>()` bytes and fully written by the
-            // `read` above. `read_unaligned` (not `read`) because the `[u8]` buffer is 1-aligned but
-            // `InputEventRaw` needs 8 (it holds a `timeval`) — a plain `ptr::read` would be UB.
+            // SAFETY: `buf` is exactly `size_of::<InputEventRaw>()` bytes and fully written by
+            // the `read` above. `read_unaligned` because `[u8]` is 1-aligned and `InputEventRaw`
+            // needs 8 (`timeval`); a plain `ptr::read` would be UB.
             let ev: InputEventRaw =
                 unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const InputEventRaw) };
             match (ev.type_, ev.code) {
                 (EV_UINPUT, UI_FF_UPLOAD) => {
                     self.ff.note_activity();
-                    // SAFETY: `UinputFfUpload` is `#[repr(C)]` over integers (`u32`, `i32`) and two
-                    // `FfEffect`s (integers + `[u8; 32]`); all-zero is a valid bit pattern for every field
-                    // (no bool/NonZero/enum/reference niche), so `zeroed` yields a fully-initialized valid
-                    // value — `request_id` is then set below and the rest filled by UI_BEGIN_FF_UPLOAD.
+                    // SAFETY: `UinputFfUpload` is `#[repr(C)]` over integers and two `FfEffect`s
+                    // (integers + `[u8; 32]`); all-zero is valid for every field (no
+                    // bool/NonZero/enum/reference niche). `request_id` is set below; the ioctl
+                    // fills the rest.
                     let mut up: UinputFfUpload = unsafe { std::mem::zeroed() };
                     up.request_id = ev.value as u32;
                     if ioctl_ptr(raw, UI_BEGIN_FF_UPLOAD, &mut up, "UI_BEGIN_FF_UPLOAD").is_ok() {
                         let e = up.effect;
-                        // No `id == -1` fallback: ff-core's `input_ff_upload` picks a free slot and
-                        // writes it into the effect BEFORE handing the request to uinput, so what
-                        // arrives here is always an assigned id. The fallback that used to allocate
-                        // one from a local counter could therefore never run, and a local counter is
-                        // the wrong answer anyway — the kernel owns that id space.
+                        // ff-core assigns a slot before uinput sees the request. A local
+                        // counter would fight the kernel's id space.
                         debug_assert!(e.id >= 0, "uinput handed us an unassigned FF effect id");
                         if e.type_ == FF_RUMBLE {
                             let strong = u16::from_ne_bytes([e.u[0], e.u[1]]);
@@ -589,9 +541,8 @@ impl VirtualPad {
                 }
                 (EV_UINPUT, UI_FF_ERASE) => {
                     self.ff.note_activity();
-                    // SAFETY: `UinputFfErase` is `#[repr(C)]` over three integer fields (`u32`, `i32`,
-                    // `u32`); all-zero is a valid bit pattern for each, so `zeroed` produces a fully-valid
-                    // initialized value — `request_id` is set below and `effect_id` filled by the ioctl.
+                    // SAFETY: `UinputFfErase` is `#[repr(C)]` over three integer fields; all-zero
+                    // is valid for each. `request_id` is set below; the ioctl fills `effect_id`.
                     let mut er: UinputFfErase = unsafe { std::mem::zeroed() };
                     er.request_id = ev.value as u32;
                     if ioctl_ptr(raw, UI_BEGIN_FF_ERASE, &mut er, "UI_BEGIN_FF_ERASE").is_ok() {
@@ -621,20 +572,17 @@ impl VirtualPad {
 
 impl Drop for VirtualPad {
     fn drop(&mut self) {
-        // SAFETY: `self.fd` is still the live owned uinput fd here (the `OwnedFd` field is closed only
-        // AFTER this `drop` body returns), borrowed by `as_raw_fd`. UI_DEV_DESTROY takes its argument
-        // (0) BY VALUE, so nothing is dereferenced or aliased; the ioctl just tears down the device.
+        // SAFETY: `self.fd` is still live here (`OwnedFd` closes only after this `drop`
+        // returns). UI_DEV_DESTROY takes 0 BY VALUE, so nothing is dereferenced.
         let _ = unsafe { libc::ioctl(self.fd.as_raw_fd(), UI_DEV_DESTROY, 0) };
     }
 }
 
-/// All virtual pads of a session, driven from decoded controller events. Stateless per frame
-/// (uinput/evdev holds last-known state kernel-side), so it rides [`PadSlots`] directly — no state
-/// vec, heartbeat, or rich plane like the UHID managers.
+/// Evdev holds last-known state kernel-side, so this rides [`PadSlots`] with no extra
+/// vec or heartbeat.
 pub struct GamepadManager {
     slots: PadSlots<VirtualPad>,
-    /// The USB identity every pad in this session presents (X-Box 360 by default, One/Series when
-    /// the client asked for `XboxOne`). All pads in a session share one identity.
+    /// Shared by every pad in the session.
     identity: PadIdentity,
 }
 
@@ -645,12 +593,10 @@ impl Default for GamepadManager {
 }
 
 impl GamepadManager {
-    /// A manager that creates X-Box 360 pads (the universal default).
     pub fn new() -> GamepadManager {
         GamepadManager::with_identity(PadIdentity::xbox360())
     }
 
-    /// A manager whose pads present `identity` (see [`PadIdentity::xbox_one`]).
     pub fn with_identity(identity: PadIdentity) -> GamepadManager {
         GamepadManager {
             slots: PadSlots::new(identity.log, "gamepad", ""),
@@ -658,7 +604,6 @@ impl GamepadManager {
         }
     }
 
-    /// Handle one decoded controller event (create/destroy by mask, then apply state).
     pub fn handle(&mut self, ev: &punktfunk_core::input::GamepadEvent) {
         use punktfunk_core::input::GamepadEvent;
         match ev {
@@ -671,8 +616,8 @@ impl GamepadManager {
                 if idx >= MAX_PADS {
                     return;
                 }
-                // Unplugs: drop any allocated pad whose mask bit cleared (no per-index sibling
-                // state to reset — the pads mix rumble internally).
+                // Drop any allocated pad whose mask bit cleared. No per-index sibling
+                // state to reset — the pads mix rumble internally.
                 self.slots.sweep(f.active_mask);
                 if f.active_mask & (1 << idx) == 0 {
                     return; // this event WAS the unplug
@@ -692,18 +637,13 @@ impl GamepadManager {
             .ensure(idx, |i| VirtualPad::create(i as usize, identity));
     }
 
-    /// Service every pad's FF protocol; `send(index, low, high, left_trigger, right_trigger)` is
-    /// invoked for each pad whose mixed rumble level changed. Call frequently (games block in
-    /// `EVIOCSFF` until answered).
-    ///
-    /// The two trigger levels are always zero here and always will be: evdev's `FF_RUMBLE` effect
-    /// is `{ u16 strong_magnitude, u16 weak_magnitude }` and has no third field, so impulse-trigger
-    /// rumble is unreachable through this backend no matter what the client can render.
+    /// Service every pad's FF protocol. `send(index, low, high, left_trigger, right_trigger)`
+    /// runs when mixed rumble changed. Call every tick: games block in `EVIOCSFF` until answered.
+    /// Trigger levels are always 0: `FF_RUMBLE` is `{strong, weak}` with no third field.
     pub fn pump_rumble(&mut self, mut send: impl FnMut(u16, u16, u16, u16, u16)) {
-        // Finish any unplug whose removal frame only armed the grace — the producer sends that
-        // frame once, so without this the uinput node would outlive the controller. The swept
-        // mask is discarded because this manager keeps no per-index sibling state (the pads mix
-        // rumble internally); if that ever changes, consume it like the other two backends do.
+        // Reap an unplug whose removal frame only armed the grace — that frame is sent once,
+        // so without this the uinput node outlives the controller. The swept mask is unused:
+        // this manager has no per-index sibling state.
         self.slots.reap();
         for (i, pad) in self.slots.iter_mut() {
             if let Some((low, high)) = pad.pump_ff() {
@@ -718,7 +658,6 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// The FF-capable evdev node whose input-device name contains `name`.
     fn find_ff_node(name: &str) -> Option<String> {
         let s = std::fs::read_to_string("/proc/bus/input/devices").unwrap_or_default();
         let mut cur = String::new();
@@ -744,11 +683,9 @@ mod tests {
         node
     }
 
-    /// Upload + play an FF_RUMBLE like SDL's evdev haptic backend. Returns the OPEN fd (closing
-    /// it erases the process's effects, stopping the rumble) with the kernel-assigned id.
-    /// NOTE: EVIOCSFF BLOCKS until the uinput owner answers UI_FF_UPLOAD — the caller must be a
-    /// separate thread from the one running [`VirtualPad::pump_ff`], exactly like a real game vs
-    /// the host input loop.
+    /// Upload + play an `FF_RUMBLE`. Returns the OPEN fd (close erases the process's effects)
+    /// and the kernel-assigned id. `EVIOCSFF` BLOCKS until the uinput owner answers
+    /// `UI_FF_UPLOAD` — the caller must not be the thread running [`VirtualPad::pump_ff`].
     fn evdev_rumble(node: &str, strong: u16, weak: u16) -> std::io::Result<(std::fs::File, i16)> {
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new()
@@ -763,8 +700,8 @@ mod tests {
         eff[18..20].copy_from_slice(&weak.to_ne_bytes());
         // EVIOCSFF = _IOW('E', 0x80, struct ff_effect)
         let req: libc::c_ulong = (1 << 30) | (48 << 16) | (0x45 << 8) | 0x80;
-        // SAFETY: EVIOCSFF reads/writes the 48-byte ff_effect behind the valid fd `f`; `eff` is
-        // exactly sizeof(struct ff_effect) and outlives the synchronous call.
+        // SAFETY: EVIOCSFF reads/writes the 48-byte `ff_effect` behind `f`; `eff` is
+        // exactly `sizeof(struct ff_effect)` and outlives the synchronous call.
         let rc = unsafe { libc::ioctl(f.as_raw_fd(), req, eff.as_mut_ptr()) };
         if rc < 0 {
             return Err(std::io::Error::last_os_error());
@@ -778,10 +715,6 @@ mod tests {
         Ok((f, id))
     }
 
-    /// On-box proof of the uinput FF back-channel, playing the GAME's role: an evdev FF_RUMBLE
-    /// upload+play against the virtual X-Box 360 pad must surface through `pump_ff` (the
-    /// EV_UINPUT UI_FF_UPLOAD protocol) — the path every `auto`-kind session's rumble rides on
-    /// Linux — and erasing the effect (fd close) must surface the stop.
     #[test]
     #[ignore = "creates a real /dev/uinput device; needs the input group"]
     fn ff_upload_reaches_pump_and_stops_on_erase() {
@@ -841,7 +774,6 @@ mod ff_state_tests {
         })
     }
 
-    /// Playing from `at`, no delay, for `len`.
     fn playing_for(at: Instant, len: Duration) -> Option<Playback> {
         Some(Playback {
             starts: at,
@@ -855,15 +787,14 @@ mod ff_state_tests {
         let mut ff = ff_with(Effect {
             strong: 0x8000,
             weak: 0,
-            // Playing since before the window: "abandoned" means audible AND unattended, so an
-            // effect that only just started is not a candidate however stale the plane is.
+            // Playing since before the window: abandoned means audible AND unattended.
             playing: playing(now - Duration::from_millis(2600)),
             replay_ms: 0,
             delay_ms: 0,
         });
         assert_eq!(ff.mix(now, IDLE), Some((scaled(0x8000), 0)));
-        assert_eq!(ff.mix(now, IDLE), None); // unchanged level dedups, still playing
-                                             // The game goes silent on the FF plane past the idle window: cut, exactly once.
+        assert_eq!(ff.mix(now, IDLE), None); // unchanged level; still playing
+                                             // FF plane quiet past the idle window: cut, exactly once.
         ff.last_activity = now - Duration::from_millis(2600);
         assert_eq!(ff.mix(now, IDLE), Some((0, 0)));
         assert_eq!(ff.mix(now, IDLE), None); // already off — no repeat
@@ -879,11 +810,10 @@ mod ff_state_tests {
             replay_ms: 10_000,
             delay_ms: 0,
         });
-        // FF plane long stale, but the effect declared a finite replay — the declared duration is
-        // the contract (a real pad honors it too), so it keeps playing…
+        // FF plane long stale, but a finite replay is the contract — keep playing.
         ff.last_activity = now - Duration::from_secs(60);
         assert_eq!(ff.mix(now, IDLE), Some((scaled(0x4000), 0)));
-        // …and expires at its own deadline.
+        // Expires at its own deadline, not the idle window.
         assert_eq!(ff.mix(now + Duration::from_secs(11), IDLE), Some((0, 0)));
     }
 
@@ -900,15 +830,11 @@ mod ff_state_tests {
         assert_eq!(ff.mix(now, IDLE), Some((scaled(0x8000), 0)));
         ff.last_activity = now - Duration::from_millis(3000);
         assert_eq!(ff.mix(now, IDLE), Some((0, 0)));
-        // The game plays the effect again — an FF event refreshes the clock and re-arms playback.
         ff.last_activity = now;
         ff.effects.get_mut(&0).unwrap().playing = playing(now);
         assert_eq!(ff.mix(now, IDLE), Some((scaled(0x8000), 0)));
     }
 
-    /// `replay.delay` shifts the whole window: silent until it elapses, then the FULL
-    /// `replay.length`. Before this the delay was decoded and dropped, so a delayed effect both
-    /// started early and finished early — DirectInput under Wine schedules these routinely.
     #[test]
     fn replay_delay_holds_the_effect_off_then_gives_it_its_full_length() {
         let now = Instant::now();
@@ -931,18 +857,18 @@ mod ff_state_tests {
             ff.mix(now + Duration::from_millis(501), IDLE),
             Some((scaled(0x8000), 0))
         );
-        // Still playing at 1400 ms — it gets its full second FROM the delay, not from the play.
+        // Still playing at 1400 ms — full second FROM the delay, not from play.
         assert_eq!(ff.mix(now + Duration::from_millis(1400), IDLE), None);
-        // And ends at delay + length, not at length.
+        // Ends at delay + length, not at length.
         assert_eq!(
             ff.mix(now + Duration::from_millis(1600), IDLE),
             Some((0, 0))
         );
     }
 
-    /// The window a play opens, straight from the uploaded fields — this is the half that reads
-    /// `replay.delay` at all. Pinned separately because the `EV_FF` handler that calls it needs a
-    /// live uinput fd, so a test driving `mix` alone would pass with the delay ignored entirely.
+    /// Playback window from the uploaded fields. Separate from `mix` because the `EV_FF`
+    /// handler that calls [`Effect::window`] needs a live uinput fd; a mix-only test would
+    /// pass with the delay ignored.
     #[test]
     fn window_offsets_the_whole_playback_by_replay_delay() {
         let at = Instant::now();
@@ -966,7 +892,6 @@ mod ff_state_tests {
             "length runs from the END of the delay, so the effect keeps its full second"
         );
 
-        // No delay: starts immediately, unchanged from before.
         let plain = Effect {
             strong: 0,
             weak: 0,
@@ -991,8 +916,8 @@ mod ff_state_tests {
         assert_eq!(w.ends, None);
     }
 
-    /// A delayed effect must not be force-stopped as "abandoned" while it is still waiting: it has
-    /// not had its turn, and the idle window is shorter than a delay can legitimately be.
+    /// A delayed effect is not "abandoned" while it is still waiting: it has not had its
+    /// turn, and the idle window can be shorter than a legitimate delay.
     #[test]
     fn a_waiting_effect_is_not_cut_by_the_idle_watchdog() {
         let now = Instant::now();
@@ -1005,8 +930,8 @@ mod ff_state_tests {
             delay_ms: 5000,
         });
         ff.last_activity = now - Duration::from_secs(60); // long stale
-        assert_eq!(ff.mix(now, IDLE), None); // silent, but NOT cut
-                                             // It still plays when its delay elapses.
+        assert_eq!(ff.mix(now, IDLE), None); // silent, but not cut
+                                             // Plays once the delay elapses.
         assert_eq!(
             ff.mix(now + Duration::from_millis(5001), IDLE),
             Some((scaled(0x8000), 0))

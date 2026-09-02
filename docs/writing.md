@@ -139,6 +139,34 @@ Older sections are not counted.
 A comment is the non-local reason: the trap, the lifetime, the unit on a magic number.
 Names and types are the what. If the next five lines already say it, delete the comment.
 
+### Voice
+
+Present tense. The file as it is, for someone who has the code and not the git log.
+
+Cover the next five lines with your hand. If the comment is only interesting as
+history — how v2 scared us, a soak, a review ticket, a “this used to” — it belongs
+on the PR or in `docs/adr/`. Keep the rule that is still true.
+
+A comment is not a poem. No cadence, no punchline, no plot. Name the invariant
+and stop.
+
+A constant’s comment is why the number, not the incident that produced it.
+A version comment is the live handshake, not a biography of every bump.
+
+Bad (archaeology): `A v2 host never stamps the field, so a v3 driver would refuse
+every attach — lockstep by the handshake, as ever. On-glass 2026-07-23…`
+Good (the live rule): `A host that leaves this field zero fails the bind.`
+
+Bad (field report): `Field 2026-08-28, iPad Pro / iOS 27 over Tailscale: …`
+Good: `250 ms ≈ 30 refreshes at 120 Hz. A miss freezes the picture.`
+Good (commit body / PR): the iPad, the log lines, the reconnect.
+
+`// SAFETY:` is a proof, not how the bug was found. Dates, SKUs, and soak minutes
+go stale; prefer a name (`stash_topology_restore_first_wins`) over a twelve-line
+comment.
+
+CI length caps are a backstop, not the style. A four-line war story is still wrong.
+
 ### Caps
 
 - `//` : at most four lines (CI fails at six).
@@ -156,15 +184,8 @@ lines are a SAFETY/lifetime trap.
 Do not sweep the file. Do not open a comments-only PR.
 
 1. Restates the next five lines → delete.
-2. Field report (date, device, OS, log line) → delete. That is the commit body or the PR.
-3. Lab nickname (`ponytail:`), second copy of the commit body → delete.
-4. Lifetime / weak-ref / generation-vs-session / why this number → keep, one to three lines.
-
-A constant’s comment is why the number, not the incident that produced it.
-
-Bad (in the file): `Field 2026-08-28, iPad Pro / iOS 27 over Tailscale: …`
-Good (in the file): `250 ms ≈ 30 refreshes at 120 Hz. A miss freezes the picture.`
-Good (in the commit body): the iPad, the log lines, the reconnect.
+2. Archaeology, field report, lab nickname (`ponytail:`), second copy of the commit body → delete.
+3. Lifetime / weak-ref / generation-vs-session / why this number → keep, one to three lines.
 
 ### Module rustdoc
 
@@ -181,9 +202,6 @@ Keep proofs exact:
 // never freed here.
 ```
 
-Dates, SKUs, soak durations, and “this used to” go stale. Prefer a name:
-`stash_topology_restore_first_wins` over a twelve-line comment.
-
 ---
 
 ## 4. Checklist (every PR)
@@ -195,6 +213,7 @@ Dates, SKUs, soak durations, and “this used to” go stale. Prefer a name:
 - [ ] User-facing fact updated in `docs/releases/` or the docs-site page that owns it
 - [ ] Embedder-facing fact is a bullet in CHANGELOG.md, not a new chapter
 - [ ] New comments state an invariant or a trap, not a recap of the diff
+- [ ] Comments are present-tense live rules, not archaeology or a poem
 - [ ] Module rustdoc still fits on one screen (CI fails a touched `//!` / `///` at 24 lines)
 - [ ] Touched `//` blocks are at most four lines (CI fails at six), except SAFETY proofs
 - [ ] No new comment that is the only enforcement of a trust boundary

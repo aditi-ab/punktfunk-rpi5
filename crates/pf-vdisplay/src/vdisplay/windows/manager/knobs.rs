@@ -1,13 +1,10 @@
-//! Runtime display-management knobs read from the console policy (with legacy env-var fallbacks),
-//! carved out of the manager (plan §W3): the linger window, the keep-alive-forever pin, and the
-//! per-monitor topology action. Pure readers of [`crate::policy`] + env — no manager state.
+//! Runtime display-management knobs: linger window, keep-alive-forever pin,
+//! and per-monitor topology action. Readers of [`crate::policy`] plus legacy
+//! env fallbacks — no manager state.
 
-/// The historical Windows linger window, and the fallback for every rung that cannot answer.
+/// 10 s: historical default, and the fallback when a rung cannot answer.
 const DEFAULT_LINGER_MS: u64 = 10_000;
 
-/// Linger window before a session-less monitor is torn down. The console display-management policy
-/// wins when configured (`keep_alive`); otherwise the legacy `PUNKTFUNK_MONITOR_LINGER_MS` env knob,
-/// else the 10 s default.
 pub(super) fn linger_ms() -> u64 {
     resolve_linger_ms(
         crate::policy::prefs()
@@ -19,32 +16,26 @@ pub(super) fn linger_ms() -> u64 {
     )
 }
 
-/// The precedence itself, lifted out of the readers so it is pinnable without a settings file, an
-/// environment or a manager (this module's decisions are the ONLY ones on the Windows lifecycle path
-/// that need neither a driver nor a desktop, and they had no tests at all).
-///
-/// `configured` is the console policy's resolved [`Linger`](crate::policy::Linger) (`None` = the
-/// host was never configured), `env_ms` the parsed legacy knob. The configured policy outranks the
-/// env knob entirely — an operator who set the console must not have it silently overridden by a
-/// leftover variable.
+/// Console policy outranks the env knob: an operator who set the console
+/// must not have it silently overridden by a leftover
+/// `PUNKTFUNK_MONITOR_LINGER_MS`.
 fn resolve_linger_ms(configured: Option<crate::policy::Linger>, env_ms: Option<u64>) -> u64 {
     use crate::policy::Linger;
     match configured {
         Some(Linger::Immediate) => 0,
         Some(Linger::For(d)) => d.as_millis() as u64,
-        // `forever` is handled BEFORE this by `keep_alive_forever()` in `release` (→ `Pinned`), so
-        // this arm is only reached defensively (e.g. a caller that resolves ms without the pin
-        // check) — fall back to the default rather than a huge linger.
+        // `forever` is handled by `keep_alive_forever()` in `release` (→ `Pinned`).
+        // Reached only if a caller skipped the pin check — fall back to the
+        // default, not a huge linger.
         Some(Linger::Forever) => DEFAULT_LINGER_MS,
-        // Unconfigured: the legacy env knob, else the historical default. An unparseable value
-        // arrives here as `None` (the caller's `parse().ok()`), i.e. it reads as unset.
+        // Unconfigured: env knob, else the default. Unparseable arrives as `None`
+        // (`parse().ok()`), i.e. unset, not zero.
         None => env_ms.unwrap_or(DEFAULT_LINGER_MS),
     }
 }
 
-/// Whether the configured console policy's `keep_alive` resolves to **forever** (`Pinned`) — the
-/// gaming-rig preset. `release` uses this to keep the last-released monitor indefinitely instead of
-/// lingering. Unconfigured hosts are never forever (default is a short linger).
+/// Whether configured `keep_alive` is forever (`Pinned`). `release` keeps
+/// the last-released monitor indefinitely. Unconfigured hosts are never forever.
 pub(super) fn keep_alive_forever() -> bool {
     use crate::policy::{prefs, Linger};
     prefs()
@@ -53,9 +44,9 @@ pub(super) fn keep_alive_forever() -> bool {
         .unwrap_or(false)
 }
 
-/// Cadence of the exclusive-topology re-assert watchdog (`PUNKTFUNK_EXCLUSIVE_REASSERT_MS`,
-/// default 2000, `0` disables — the pre-watchdog behavior). Why it exists: a verified isolate is
-/// not durable — see `VirtualDisplayManager::ensure_exclusive_watch` in the parent module.
+/// Exclusive-topology re-assert cadence. Default 2000 ms; `0` disables.
+/// A verified isolate is not durable — see
+/// `VirtualDisplayManager::ensure_exclusive_watch`.
 pub(super) fn exclusive_reassert_ms() -> u64 {
     std::env::var("PUNKTFUNK_EXCLUSIVE_REASSERT_MS")
         .ok()
@@ -63,11 +54,9 @@ pub(super) fn exclusive_reassert_ms() -> u64 {
         .unwrap_or(2_000)
 }
 
-/// The effective display topology for a freshly-created monitor (never `Auto`): the console policy's
-/// [`effective_topology`](crate::effective_topology) when configured, else the legacy
-/// `PUNKTFUNK_NO_ISOLATE` env knob (`Extend`) / `Exclusive` (today's default). `Extend` leaves the IDD
-/// extended; `Primary` makes it primary while keeping the physical(s) active; `Exclusive` disables the
-/// physical(s) so the IDD is the sole composited desktop.
+/// Topology for a freshly-created monitor (never `Auto`): console
+/// [`effective_topology`](crate::effective_topology) when configured, else
+/// `PUNKTFUNK_NO_ISOLATE` → `Extend`, otherwise `Exclusive`.
 pub(super) fn topology_action() -> crate::policy::Topology {
     let configured = crate::policy::prefs()
         .configured_effective()
@@ -75,10 +64,8 @@ pub(super) fn topology_action() -> crate::policy::Topology {
     resolve_topology_action(configured, std::env::var("PUNKTFUNK_NO_ISOLATE").is_ok())
 }
 
-/// The precedence for [`topology_action`], lifted out for the same reason as [`resolve_linger_ms`].
-/// `configured` is [`crate::effective_topology`]'s answer when the console configured anything at
-/// all (that fn is the rung responsible for never returning `Auto`); `no_isolate_env` is the legacy
-/// `PUNKTFUNK_NO_ISOLATE` opt-out, which an unconfigured host still honors.
+/// Unconfigured host: `PUNKTFUNK_NO_ISOLATE` → `Extend`, else `Exclusive`.
+/// A configured answer is passed through; the env knob does not override it.
 fn resolve_topology_action(
     configured: Option<crate::policy::Topology>,
     no_isolate_env: bool,
@@ -97,8 +84,6 @@ mod tests {
     use crate::policy::{Linger, Topology};
     use std::time::Duration;
 
-    /// The console policy is the top rung: a host that configured `keep_alive` must not have it
-    /// silently overridden by a leftover `PUNKTFUNK_MONITOR_LINGER_MS`.
     #[test]
     fn configured_policy_beats_the_legacy_env_knob() {
         assert_eq!(
@@ -108,9 +93,8 @@ mod tests {
         assert_eq!(resolve_linger_ms(Some(Linger::Immediate), Some(60_000)), 0);
     }
 
-    /// Unconfigured hosts keep the historical behavior: the env knob, else the 10 s default. An
-    /// unparseable value reaches this fn as `None` (the reader's `parse().ok()`), so it reads as
-    /// unset rather than as zero — a `linger_ms = 0` would tear the monitor down on every
+    /// Unparseable env reaches here as `None` (`parse().ok()`), so it reads as
+    /// unset, not zero. `linger_ms = 0` would tear the monitor down on every
     /// disconnect.
     #[test]
     fn an_unconfigured_host_honours_the_env_knob_then_the_default() {
@@ -118,9 +102,9 @@ mod tests {
         assert_eq!(resolve_linger_ms(None, None), DEFAULT_LINGER_MS);
     }
 
-    /// `Forever` is the `Pinned` lifecycle, resolved by `keep_alive_forever()` before any ms are
-    /// asked for; reaching this fn with it means a caller skipped the pin check, and the answer is
-    /// the default window — NOT an effectively infinite linger that would keep the physical panels
+    /// `Forever` is the `Pinned` lifecycle, resolved by `keep_alive_forever()`
+    /// before any ms are asked. Reaching here skipped the pin check; the answer
+    /// is the default window, not an infinite linger that keeps physical panels
     /// dark with nothing to release them.
     #[test]
     fn forever_resolves_to_the_default_not_a_huge_linger() {
@@ -130,15 +114,13 @@ mod tests {
         );
     }
 
-    /// The unconfigured rungs are `Exclusive` by default, `Extend` under the legacy opt-out — and
-    /// neither is `Auto`, which the manager's `match` would treat as plain extend without ever
-    /// saying so.
+    /// Unconfigured rungs are `Exclusive` by default, `Extend` under the legacy
+    /// opt-out — never `Auto`, which the manager's `match` would treat as extend
+    /// without saying so.
     #[test]
     fn the_unconfigured_topology_rungs_never_yield_auto() {
         assert_eq!(resolve_topology_action(None, false), Topology::Exclusive);
         assert_eq!(resolve_topology_action(None, true), Topology::Extend);
-        // A configured host's answer is whatever `effective_topology()` resolved — passed through
-        // verbatim, env knob or not.
         assert_eq!(
             resolve_topology_action(Some(Topology::Primary), true),
             Topology::Primary

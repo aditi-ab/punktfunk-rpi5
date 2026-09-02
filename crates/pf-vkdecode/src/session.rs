@@ -1,45 +1,18 @@
-//! `VkVideoSessionKHR` + `VkVideoSessionParametersKHR` lifecycle.
+//! `VkVideoSessionKHR` + `VkVideoSessionParametersKHR` lifecycle for H.264.
 //!
-//! The session is created from the STREAM's facts (the SPS's coded extent and DPB
-//! depth), its memory requirements bound exactly like the encoder does, and its
-//! parameters object holds WP-A's converted `StdVideoH264*ParameterSet`s. Parameter
-//! versioning follows Vulkan's rules precisely:
+//! The session is created from the stream's coded extent and DPB depth. New
+//! (sps-id / pps-id) pairs are Added with `updateSequenceCount` = previous + 1;
+//! an existing id whose content changed, or a capacity overflow, Recreates the
+//! parameters object (Vulkan cannot replace a stored set). A DPB or extent
+//! resize Recreates the whole session.
 //!
-//! - a NEW (sps-id / pps-id) is ADDED via `vkUpdateVideoSessionParametersKHR` with
-//!   `updateSequenceCount` = previous + 1 (the spec's exact-increment rule);
-//! - an EXISTING id whose content changed cannot be updated in place — the object
-//!   is RECREATED (Vulkan forbids replacing a stored parameter set), as is an
-//!   object whose capacity would overflow;
-//! - a stream renegotiation that resizes the DPB or the coded extent recreates the
-//!   whole session — `plan_to_vk`'s `CapacityMismatch` is the trigger the decoder
-//!   sees for the DPB half, the extent comparison covers the other.
+//! A driver may retain `pStdSPSs` / `pStdPPSs` and the embedded Std pointers
+//! (`pOffsetForRefFrame`, `pScalingLists`) past create/update. [`StoredParams`]
+//! holds the object and those backings in one value; Drop and Recreate destroy
+//! the object first. Create-info plumbing stays function-local.
 //!
-//! ⚠⚠⚠ **The Std sets' heap blocks must outlive the parameters OBJECT, not just the
-//! call that hands them over.** Vulkan reads as though parameter data were captured
-//! by `vkCreateVideoSessionParametersKHR`, and all three codecs in this crate
-//! assumed it. NVIDIA 610.57.04 does not: for AV1 it was measured keeping
-//! `StdVideoAV1SequenceHeader::pColorConfig` and dereferencing it when a decode is
-//! RECORDED, which decoded every frame against recycled heap ([`crate::session_av1`]
-//! carries the measurement). H.264's Std sets embed the same kind of pointer —
-//! `pOffsetForRefFrame` and `pScalingLists` on the SPS, `pScalingLists` on the PPS —
-//! so [`StoredParams`] holds the object and its backings in ONE value with one
-//! lifetime, and both the recreate path and `Drop` destroy the object before that
-//! value is released.
-//!
-//! **Both LEVELS of pointer are covered, not just the one the measurement caught.**
-//! Fixing the inner pointers left the OUTER ones — `pStdSPSs`/`pStdPPSs`, and AV1's
-//! `pStdSequenceHeader` — still addressing function locals, and a driver retaining
-//! those instead would reproduce the same bug with the same silent signature. So the
-//! Std structs are boxed inside their wrappers ([`crate::OwnedStdSps`]) and the
-//! contiguous arrays are FIELDS of `StoredParams`: no address the driver is given
-//! is a temporary's. The line is drawn at Std DATA — `VkVideoSessionParametersCreateInfoKHR`
-//! and its `pNext`/`pParametersAddInfo` plumbing stay function-local, because those
-//! are ordinary create-info structures every `vkCreate*` in Vulkan reads during the
-//! call; it is the `pStd*` members whose retention the spec's wording left ambiguous
-//! and this fleet was measured exercising.
-//!
-//! [`ParamsLedger`] is the pure half of that decision table (unit-tested);
-//! [`VideoSession`] is the thin Vulkan half.
+//! [`ParamsLedger`] is the pure decision table; [`VideoSession`] is the Vulkan
+//! half. Pin: tests in this file; the AV1 retention case is [`crate::session_av1`].
 
 use std::rc::Rc;
 
@@ -62,27 +35,22 @@ use crate::params::ParamsError;
 use crate::params_av1::ParamsAv1Error;
 use crate::params_h265::H265ParamsError;
 
-/// Parameter-object capacity. Punktfunk hosts emit one SPS + one PPS per stream;
-/// the headroom absorbs id churn across renegotiations without recreation, and an
-/// overflow beyond it recreates rather than fails.
+/// Headroom for id churn. Hosts emit one SPS + one PPS; overflow Recreates.
 pub(crate) const MAX_STD_SPS: usize = 4;
 pub(crate) const MAX_STD_PPS: usize = 8;
 
-/// What the ledger decided for one (SPS, PPS) activation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParamsAction {
-    /// Both sets are already stored with identical content — nothing to do.
+    /// Identical content already stored.
     Current,
-    /// At least one set is new; one update call (seq += 1) adds what is missing.
+    /// New id; one update (seq += 1) may add both sets.
     Add { add_sps: bool, add_pps: bool },
-    /// A stored id changed content, or capacity would overflow: recreate the
-    /// parameters object (Vulkan cannot replace or evict a stored set).
+    /// Content changed under a stored id, or capacity would overflow.
     Recreate,
 }
 
-/// Pure bookkeeping for the parameters object: which sets it holds (by id AND
-/// content — the parser re-parses in-band parameter sets every keyframe, so
-/// pointer identity means nothing) and the update sequence counter.
+/// Sets the parameters object holds, keyed by id AND content. In-band sets
+/// re-parse every keyframe, so pointer identity is not identity.
 #[derive(Debug, Default)]
 pub(crate) struct ParamsLedger {
     sps: Vec<(u8, Rc<Sps>)>,
@@ -91,8 +59,7 @@ pub(crate) struct ParamsLedger {
 }
 
 impl ParamsLedger {
-    /// Decide the action for activating (`sps`, `pps`). Pure — mutate via
-    /// [`Self::commit`].
+    /// Decide without mutating. Apply via [`Self::commit`].
     pub(crate) fn plan(&self, sps: &Rc<Sps>, pps: &Rc<Pps>) -> ParamsAction {
         let sps_key = sps.seq_parameter_set_id;
         let pps_key = (pps.seq_parameter_set_id, pps.pic_parameter_set_id);
@@ -121,10 +88,8 @@ impl ParamsLedger {
         ParamsAction::Add { add_sps, add_pps }
     }
 
-    /// Apply a decided action. `Add` bumps the sequence count by EXACTLY one (the
-    /// Vulkan update rule — one call may carry both sets); `Recreate` resets the
-    /// ledger to just the current pair with a fresh object's zero counter (any
-    /// other id the stream still references simply re-Adds on next activation).
+    /// `Add` bumps the sequence by exactly one (one Vulkan call, even if both
+    /// sets). `Recreate` keeps only this pair and resets the counter to 0.
     pub(crate) fn commit(&mut self, action: ParamsAction, sps: &Rc<Sps>, pps: &Rc<Pps>) {
         match action {
             ParamsAction::Current => {}
@@ -153,39 +118,32 @@ impl ParamsLedger {
         }
     }
 
-    /// The sequence count the NEXT `vkUpdateVideoSessionParametersKHR` must carry.
     pub(crate) fn next_update_seq(&self) -> u32 {
         self.update_seq + 1
     }
 }
 
-/// The session's create-time shape; a plan disagreeing with it forces a rebuild.
+/// Create-time shape. A plan that disagrees rebuilds the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionConfig {
     pub max_coded_extent: vk::Extent2D,
     pub max_dpb_slots: u32,
     pub max_active_references: u32,
-    /// The Std profile the session was created against (a profile change is a
-    /// renegotiation too).
+    /// Profile change is a renegotiation.
     pub std_profile_idc: hh::StdVideoH264ProfileIdc,
-    /// The device's `maxLevelIdc` for this profile (Std code point). Every SPS
-    /// handed to the parameters object has its declared level clamped to this —
-    /// see `SessionConfigH265::max_level_idc` for the whole argument.
+    /// Device `maxLevelIdc` for this profile. Every SPS is clamped to this.
     pub max_level_idc: hh::StdVideoH264LevelIdc,
 }
 
-/// Session creation/parameter failures the decoder maps into its error type.
 #[derive(Debug)]
 pub(crate) enum SessionError {
     Vk(vk::Result),
     Params(ParamsError),
-    /// An H.265 parameter set has no Std representation (the H.265 session's
-    /// counterpart of [`SessionError::Params`]).
+    /// H.265 Std conversion (this error type is shared across codecs).
     ParamsH265(H265ParamsError),
-    /// An AV1 sequence header has no Std representation (the AV1 session's
-    /// counterpart of [`SessionError::Params`]).
+    /// AV1 Std conversion (this error type is shared across codecs).
     ParamsAv1(ParamsAv1Error),
-    /// Session memory binding found no matching memory type (never a fallback).
+    /// No matching memory type. Never a fallback.
     NoMemoryType {
         type_bits: u32,
         flags: vk::MemoryPropertyFlags,
@@ -227,40 +185,30 @@ impl From<AllocError> for SessionError {
     }
 }
 
-/// A [`bind_session_memory`] failure and whatever allocations the CALLER must now
-/// take over.
+/// [`bind_session_memory`] failure plus allocations the caller must adopt.
 ///
-/// The distinction is a lifetime rule, not bookkeeping taste. Vulkan defines no
-/// partial-bind rollback: once `vkBindVideoSessionMemoryKHR` has been called, some
-/// bind indices may have taken, and memory bound into a live session may NOT be
-/// freed while that session exists. So:
-///
-/// - an ALLOCATE failure happens before any bind — nothing is attached to the
-///   session, the function frees everything itself, and `allocations` is empty;
-/// - a BIND failure hands the allocations back UNFREED, because the caller's
-///   session object must be destroyed FIRST. The caller parks them where its own
-///   `Drop` frees them after the destroy (that is exactly [`VideoSession`]'s and
-///   [`crate::session_h265::VideoSessionH265`]'s field order).
+/// Vulkan has no partial-bind rollback. After `vkBindVideoSessionMemoryKHR`,
+/// bound memory must not be freed while the session lives. Allocate-stage
+/// failure frees here (`allocations` empty). Bind-stage failure returns them
+/// unfreed so the caller destroys the session first ([`VideoSession`] field
+/// order).
 pub(crate) struct BindFailure {
-    /// Allocations that may be bound into the session — free them only AFTER the
-    /// session is destroyed. Empty when the failure preceded any bind.
+    /// May be bound into the session — free only AFTER it is destroyed. Empty
+    /// if the failure preceded any bind.
     pub(crate) allocations: Vec<vk::DeviceMemory>,
     pub(crate) error: SessionError,
 }
 
-/// Query and bind one video session's memory requirements (the encoder's exact
-/// shape), returning the allocations the session now owns. Codec-agnostic —
-/// `VkVideoSessionKHR` memory binding says nothing about H.264 vs H.265 — so both
-/// session types call this, and the NVIDIA placement rationale below lives once.
+/// Query and bind one video session's memory. Codec-agnostic; H.264 and H.265
+/// sessions both call this.
 ///
-/// Failure hands back a [`BindFailure`] whose `allocations` the caller must adopt
-/// (see its docs for the destroy-before-free rule); an allocate-stage failure
-/// frees eagerly and hands back none.
+/// Bind-stage failure: adopt [`BindFailure::allocations`] and destroy the
+/// session before freeing. Allocate-stage failure already freed; empty vec.
 ///
 /// # Safety
 ///
-/// `dev` wraps live handles ([`crate::DeviceHandles`] contract) and `session` is a
-/// live, not-yet-memory-bound session created on it.
+/// `dev` wraps live handles ([`crate::DeviceHandles`] contract) and `session`
+/// is a live, not-yet-memory-bound session created on it.
 pub(crate) unsafe fn bind_session_memory(
     dev: &DecodeDevice,
     session: vk::VideoSessionKHR,
@@ -281,24 +229,18 @@ pub(crate) unsafe fn bind_session_memory(
     let props = dev.memory_properties();
     let mut allocated: Vec<vk::DeviceMemory> = Vec::with_capacity(reqs.len());
     let mut binds = Vec::with_capacity(reqs.len());
-    // Free everything allocated so far — for the ALLOCATE-stage exits only, which
-    // are reached before `vkBindVideoSessionMemoryKHR` is ever called. The
-    // BIND-stage exit must NOT come through here (BindFailure docs).
+    // Allocate-stage only: bind has not run, so none of these is session-bound.
     let unwind = |device: &ash::Device, allocated: &[vk::DeviceMemory]| {
         for &memory in allocated {
-            // SAFETY: allocations made in this function on this live device, none
-            // of which the bind call has been reached for — so none can be bound
-            // into any session, and freeing them here cannot outlive-order a
-            // session destroy.
+            // SAFETY: allocated here on this live device; bind has not run, so
+            // none is session-bound.
             unsafe { device.free_memory(memory, None) };
         }
     };
     for rq in &reqs {
         let mr = rq.memory_requirements;
-        // DEVICE_LOCAL preferred, any type from `memoryTypeBits` accepted:
-        // NVIDIA (610.88) constrains some session bindings to host-visible-only
-        // types, and the driver knows where its own session state belongs. NEVER
-        // a hard DEVICE_LOCAL requirement — that shape is unsatisfiable there.
+        // Prefer DEVICE_LOCAL; accept any type from `memoryTypeBits`. Some
+        // drivers expose session bindings as host-visible-only.
         let type_index = match find_memory_type_preferring(
             &props,
             mr.memory_type_bits,
@@ -346,9 +288,8 @@ pub(crate) unsafe fn bind_session_memory(
         )
     };
     if r != vk::Result::SUCCESS {
-        // NOT freed here: a partial bind may have attached some of these to
-        // `session`, and Vulkan has no rollback for that. They go back to the
-        // caller, whose session object destroys BEFORE freeing them.
+        // Not freed: a partial bind may have attached some of these. Caller
+        // destroys the session first.
         return Err(BindFailure {
             allocations: allocated,
             error: SessionError::Vk(r),
@@ -357,56 +298,30 @@ pub(crate) unsafe fn bind_session_memory(
     Ok(allocated)
 }
 
-/// A live parameters object **and every Std parameter set it was given**, in one
-/// field — because the two may not drift apart.
+/// Parameters object and every Std set it was given, as one value.
 ///
-/// The wrapper is not decoration and not defensive: a driver in this fleet keeps
-/// the embedded pointers out of a Std set and dereferences them long after the call
-/// that handed them over returned (module docs), so releasing the backing early
-/// hands it freed memory. One value rather than two fields makes "an object whose
-/// backing is gone" unrepresentable, which is the only shape of this bug — and the
-/// shape a `let owned = …;` local silently had.
-///
-/// What is pinned, precisely: the wrappers' BOXED blocks, which is what the driver
-/// was measured retaining. The contiguous array of outer `StdVideoH264*` structs
-/// each call receives is a short-lived temporary, and the driver copies THAT before
-/// returning — which is what the AV1 fix itself rests on, its Std header being moved
-/// into storage after the create call on a rung that is now 250/250 bit-exact. So
-/// moving these wrappers, or reallocating the `Vec`s holding them, disturbs nothing
-/// the driver kept; `params::moving_the_wrapper_leaves_the_driver_s_pointers_put`
-/// pins the half that matters.
+/// A driver may retain embedded Std pointers past create/update. One value
+/// makes "object whose backing is gone" unrepresentable. `std_sps` / `std_pps`
+/// are the outer `pStdSPSs` / `pStdPPSs` arrays, assembled at their final
+/// address. Moving a wrapper does not move the boxed blocks the driver kept.
 struct StoredParams {
     object: vk::VideoSessionParametersKHR,
-    /// One entry per set the OBJECT stores, held for the object's whole life.
-    /// Never read by this crate after the create/update call; the DRIVER reads the
-    /// blocks they own.
+    /// One entry per set the object stores. The driver reads the boxed blocks.
     sps: Vec<OwnedStdSps>,
     pps: Vec<OwnedStdPps>,
-    /// The contiguous Std ARRAYS the create call was handed as `pStdSPSs`/`pStdPPSs`
-    /// — the OUTER pointers, held for the object's life for the reason the wrappers
-    /// are. They were function-local `Vec`s, dropped the moment
-    /// [`VideoSession::create_parameters_object`] returned; nothing but the spec's
-    /// wording said a driver may not keep them, and that wording is what the AV1
-    /// measurement already disproved for the pointers one level in. Built by
-    /// [`Self::assemble`] at their final address, so the pointer the driver is given
-    /// never moves at all.
+    /// Outer `pStdSPSs` / `pStdPPSs` arrays, held for the object's life.
+    /// Assembled at their final address so the pointer handed over never moves.
     std_sps: Vec<hh::StdVideoH264SequenceParameterSet>,
     std_pps: Vec<hh::StdVideoH264PictureParameterSet>,
 }
 
 impl StoredParams {
-    /// The wrappers plus the contiguous Std arrays the create call reads its
-    /// `pStdSPSs`/`pStdPPSs` out of, with a NULL object the caller fills in once
-    /// `vkCreateVideoSessionParametersKHR` has succeeded.
-    ///
-    /// Assembling BEFORE the call is the point: the arrays are copies of the
-    /// wrappers' Std structs, and building them here puts them at the address they
-    /// will keep for the object's whole life rather than in a temporary the call
-    /// outlives.
+    /// Wrappers plus the contiguous Std arrays the create call reads.
+    /// Built before the call so the arrays sit at the address they keep.
+    /// Object handle is NULL until create succeeds.
     fn assemble(sps: Vec<OwnedStdSps>, pps: Vec<OwnedStdPps>) -> Self {
-        // COPIES of each wrapper's Std struct (it is `Copy`); the embedded pointers
-        // they carry still address the wrappers' own boxed blocks, which is why
-        // both halves have to be kept.
+        // Copies of each wrapper's Std struct (`Copy`); embedded pointers
+        // still address the wrappers' boxed blocks — both halves stay.
         let std_sps = sps.iter().map(|o| *o.std()).collect();
         let std_pps = pps.iter().map(|o| *o.std()).collect();
         Self {
@@ -418,24 +333,18 @@ impl StoredParams {
         }
     }
 
-    /// The placeholder a half-built session holds. `vkDestroyVideoSessionParametersKHR`
-    /// ignores a NULL handle, so a [`VideoSession::create`] that fails before the
-    /// object exists still drops cleanly.
+    /// Placeholder for a half-built session. Destroy ignores a NULL handle.
     fn none() -> Self {
         Self::assemble(Vec::new(), Vec::new())
     }
 
-    /// Take over sets an `Add` just handed to the live object — they belong to the
-    /// OBJECT now, so their blocks live as long as it does rather than as long as
-    /// the update call. Only ever reached after that call SUCCEEDED: a failed
-    /// update stored nothing, and its wrappers are dropped instead.
+    /// Take sets an `Add` just stored. Only after that update succeeded.
     fn adopt(&mut self, sps: Option<OwnedStdSps>, pps: Option<OwnedStdPps>) {
         self.sps.extend(sps);
         self.pps.extend(pps);
     }
 }
 
-/// The Vulkan half: session + bound memory + parameters object.
 pub(crate) struct VideoSession {
     device: ash::Device,
     video_queue: ash::khr::video_queue::Device,
@@ -444,17 +353,14 @@ pub(crate) struct VideoSession {
     parameters: StoredParams,
     ledger: ParamsLedger,
     pub(crate) config: SessionConfig,
-    /// The session has never run a coding scope: the first one records a
-    /// `VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR` control before anything else (the
-    /// spec's initialization requirement; same shape as the encoder's first-frame
-    /// RESET install).
+    /// First coding scope records `VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR`
+    /// (spec initialization). Re-arm if that recording never reaches the queue.
     needs_reset: ResetArm,
 }
 
 impl VideoSession {
-    /// Create the session + an EMPTY parameters object (sets arrive via
-    /// [`Self::ensure_parameters`], which the decoder calls before the first
-    /// decode).
+    /// Session plus an empty parameters object. Sets arrive via
+    /// [`Self::ensure_parameters`].
     ///
     /// # Safety
     ///
@@ -501,12 +407,11 @@ impl VideoSession {
             config,
             needs_reset: ResetArm::armed(),
         };
-        // SAFETY: fn contract; on error `built` drops and unwinds the session +
-        // whatever memory was bound.
+        // SAFETY: fn contract; on error `built` drops the session and any
+        // bound memory.
         unsafe {
-            // A bind failure hands its allocations BACK: parking them in `built`
-            // is what makes the early return destroy the session before freeing
-            // them (BindFailure docs — Vulkan defines no partial-bind rollback).
+            // Bind failure: park allocations on `built` so Drop destroys the
+            // session before freeing them.
             match bind_session_memory(dev, session) {
                 Ok(memory) => built.memory = memory,
                 Err(failure) => {
@@ -519,13 +424,8 @@ impl VideoSession {
         Ok(built)
     }
 
-    /// Create a parameters object holding exactly `sps`/`pps` (either may be
-    /// empty), **fused with the wrappers whose heap blocks it points at**.
-    ///
-    /// Taking the wrappers BY VALUE rather than as Std slices is the point: there is
-    /// no way to reach `vkCreateVideoSessionParametersKHR` from here without the
-    /// resulting object taking ownership of everything it will go on dereferencing
-    /// (module docs, [`StoredParams`]).
+    /// Parameters object holding exactly `sps` / `pps` (either may be empty),
+    /// fused with the wrappers those Std pointers address.
     ///
     /// # Safety
     ///
@@ -535,9 +435,8 @@ impl VideoSession {
         sps: Vec<OwnedStdSps>,
         pps: Vec<OwnedStdPps>,
     ) -> Result<StoredParams, SessionError> {
-        // Assembled FIRST so the arrays `pStdSPSs`/`pStdPPSs` will point at are
-        // already where they will stay: `stored` is returned by value, and moving a
-        // `Vec` moves its handle, not the block the driver was given.
+        // Assemble first so `pStdSPSs` / `pStdPPSs` address `stored`'s arrays.
+        // Moving the `Vec` moves the handle, not the block the driver was given.
         let mut stored = StoredParams::assemble(sps, pps);
         let add = vk::VideoDecodeH264SessionParametersAddInfoKHR::default()
             .std_sp_ss(&stored.std_sps)
@@ -550,10 +449,8 @@ impl VideoSession {
             .video_session(self.session)
             .push_next(&mut h264);
         let mut object = vk::VideoSessionParametersKHR::null();
-        // SAFETY: fn contract; `ci` roots locals outliving the call, and everything
-        // the driver may retain past it — the Std arrays AND the blocks their
-        // embedded pointers address — is owned by `stored`, which is returned
-        // rather than dropped here.
+        // SAFETY: fn contract; `ci` roots locals outliving the call. Std arrays
+        // and the boxed blocks their embedded pointers address live in `stored`.
         let r = unsafe {
             (self.video_queue.fp().create_video_session_parameters_khr)(
                 self.device.handle(),
@@ -569,25 +466,22 @@ impl VideoSession {
         Ok(stored)
     }
 
-    /// The ledger's verdict for activating (`sps`, `pps`), without mutating
-    /// anything — the decoder consults this BEFORE [`Self::ensure_parameters`] so
-    /// a [`ParamsAction::Recreate`] can be preceded by a full in-flight drain
-    /// (the destroy inside the recreate must never race a submitted decode).
+    /// Ledger verdict without mutating. Consult before
+    /// [`Self::ensure_parameters`] so a Recreate can drain in-flight work
+    /// first — destroy must not race a submitted decode.
     pub(crate) fn parameters_action(&self, sps: &Rc<Sps>, pps: &Rc<Pps>) -> ParamsAction {
         self.ledger.plan(sps, pps)
     }
 
-    /// Make the parameters object hold this AU's activated (SPS, PPS), converting
-    /// through WP-A and Adding/Recreating per the ledger's decision.
+    /// Make the parameters object hold this AU's activated (SPS, PPS).
     ///
     /// # Safety
     ///
-    /// Live device; when [`Self::parameters_action`] says `Recreate`, the caller
-    /// has ALREADY drained every in-flight decode (waited each output slot's
-    /// newest submitted timeline value) — the old object is destroyed here, and a
-    /// still-executing decode reading it would be use-after-free at the driver
-    /// level. The decoder enforces exactly that ordering in `decode_inner`;
-    /// `Current`/`Add` touch no object a submitted decode can be reading.
+    /// Live device. On Recreate the caller has drained every in-flight decode
+    /// (waited each output slot's newest submitted timeline). The old object
+    /// is destroyed here; a still-executing decode reading it is
+    /// use-after-free. `Current` / `Add` do not destroy an object a submitted
+    /// decode can read.
     pub(crate) unsafe fn ensure_parameters(
         &mut self,
         sps: &Rc<Sps>,
@@ -637,9 +531,8 @@ impl VideoSession {
                 if r != vk::Result::SUCCESS {
                     return Err(SessionError::Vk(r));
                 }
-                // ⚠ The added sets now belong to the OBJECT, so their heap blocks
-                // must too: an Add whose wrappers died at the end of this arm would
-                // be the AV1 use-after-free with an update call in front of it.
+                // Added sets belong to the object; adopt so the blocks outlive
+                // this arm.
                 self.parameters.adopt(owned_sps, owned_pps);
                 self.ledger.commit(action, sps, pps);
                 Ok(())
@@ -658,9 +551,7 @@ impl VideoSession {
                 // live as long as it does rather than merely across the call.
                 let fresh =
                     unsafe { self.create_parameters_object(vec![owned_sps], vec![owned_pps])? };
-                // The old object goes FIRST and its backings with it — installing
-                // `fresh` through a local keeps the destroy ahead of the free,
-                // which is the order a driver still holding the old pointers needs.
+                // Destroy the old object before its backings drop.
                 let old = std::mem::replace(&mut self.parameters, fresh);
                 // SAFETY: the fn-level contract — the caller drained every
                 // in-flight decode before a Recreate reached here (checked via
@@ -673,9 +564,7 @@ impl VideoSession {
                         std::ptr::null(),
                     );
                 }
-                // Explicit, because the ORDER is the whole point: every Std block
-                // `old` owns is released only now, after the object that pointed at
-                // them is gone.
+                // Std blocks `old` owns are released only after that destroy.
                 drop(old);
                 self.ledger.commit(action, sps, pps);
                 Ok(())
@@ -691,24 +580,20 @@ impl VideoSession {
         self.parameters.object
     }
 
-    /// Whether the next coding scope must record the initialization RESET —
-    /// `true` exactly once per session, PROVIDED the command buffer that recorded
-    /// it actually reaches the queue: a recording/submit failure after this
-    /// returned `true` must call [`Self::re_arm_reset`], or the session would run
-    /// its whole life uninitialized.
+    /// Whether the next coding scope must record the initialization RESET.
+    /// True once per session. If that recording never reaches the queue, call
+    /// [`Self::re_arm_reset`].
     pub(crate) fn take_needs_reset(&mut self) -> bool {
         self.needs_reset.take()
     }
 
-    /// Undo a consumed [`Self::take_needs_reset`] whose RESET never reached the
-    /// queue (end/submit failed after recording it).
+    /// Undo a consumed [`Self::take_needs_reset`] whose RESET never queued.
     pub(crate) fn re_arm_reset(&mut self) {
         self.needs_reset.re_arm();
     }
 }
 
-/// The one-shot session-RESET arm, its own type so the take/re-arm cycle is
-/// testable without a live session object.
+/// One-shot session-RESET arm, testable without a live session.
 #[derive(Debug)]
 pub(crate) struct ResetArm(bool);
 
@@ -728,16 +613,11 @@ impl ResetArm {
 
 impl Drop for VideoSession {
     fn drop(&mut self) {
-        // SAFETY: all handles are this session's own on the (contract-live) device;
-        // the owning decoder drains GPU work before dropping state. The destroy
-        // entry points ignore NULL handles, covering half-built sessions. The
-        // ORDER is load-bearing, not stylistic: memory bound into a session may
-        // not be freed while the session lives, so the session is destroyed first
-        // — which is also why a failed bind hands its allocations back here
-        // instead of freeing them itself ([`BindFailure`]). The Std backings are
-        // freed after both, by the `parameters` field's own drop, which Rust runs
-        // AFTER this body — the same reason `ensure_parameters` destroys before it
-        // replaces.
+        // SAFETY: this session's handles on a live device; the decoder drains
+        // GPU work first. Destroy ignores NULL (half-built sessions). Bound
+        // memory must not be freed while the session lives, so destroy the
+        // session first — a failed bind parks allocations here ([`BindFailure`]).
+        // Std backings drop with `parameters` after this body.
         unsafe {
             (self.video_queue.fp().destroy_video_session_parameters_khr)(
                 self.device.handle(),
@@ -782,13 +662,9 @@ mod tests {
         (sps, pps)
     }
 
-    /// An `Add` hands NEW Std sets to an EXISTING parameters object, so their heap
-    /// blocks must live as long as that OBJECT — not as long as the update call
-    /// that carried them. [`StoredParams::adopt`] is where the transfer happens,
-    /// and this pins that it genuinely takes ownership: `ensure_parameters` drops
-    /// its local wrappers the instant this returns, and a driver holding
-    /// `pScalingLists` would be reading freed heap from the next frame on
-    /// ([`crate::session_av1`] for the measurement that made this real).
+    /// An `Add` transfers the Std blocks to the live object.
+    /// [`StoredParams::adopt`] is the transfer; update-call locals drop when
+    /// `ensure_parameters` returns.
     #[test]
     fn an_added_set_keeps_its_blocks_alive_past_the_update_call() {
         let sps = SpsBuilder::new()
@@ -799,7 +675,7 @@ mod tests {
             .direct_8x8_inference_flag(true)
             .max_num_ref_frames(4)
             .resolution(64, 64)
-            // The one SPS pointer a builder can attach.
+            // Non-null inner pointer for the read-back below.
             .seq_scaling_matrix_present_flag(true)
             .build();
         let owned = sps_to_std(&sps).expect("converts");
@@ -823,22 +699,14 @@ mod tests {
         assert_eq!(read_back, [0; 16], "the fixture's lists, read back live");
     }
 
-    /// …and it keeps the ADDRESS too, not merely the blocks.
-    ///
-    /// The Add path hands `vkUpdateVideoSessionParametersKHR` a
-    /// `std::slice::from_ref(o.std())` — a one-element array that IS the wrapper's
-    /// own Std struct — and then moves the wrapper into [`StoredParams`]. The test
-    /// above covers a driver retaining `pScalingLists` (an INNER pointer); this
-    /// covers one retaining `pStdSPSs`/`pStdPPSs`, which the same wording in the
-    /// spec permits just as much. Boxing the Std struct inside the wrapper is what
-    /// makes the two addresses equal; un-boxing it would leave every other test in
-    /// this crate green and hand the driver a moved-from stack slot.
+    /// Add hands `from_ref(o.std())` then moves the wrapper into
+    /// [`StoredParams`]. Boxing keeps that address; unboxing would hand the
+    /// driver a moved-from slot.
     #[test]
     fn an_added_set_keeps_the_address_the_update_call_was_given() {
         let (sps, pps) = authored(0, 0, 26);
         let owned_sps = sps_to_std(&sps).expect("converts");
         let owned_pps = pps_to_std(&pps).expect("converts");
-        // Exactly what `ensure_parameters` puts in `pStdSPSs`/`pStdPPSs`.
         let handed_sps = std::ptr::from_ref(owned_sps.std());
         let handed_pps = std::ptr::from_ref(owned_pps.std());
 
@@ -868,16 +736,8 @@ mod tests {
         );
     }
 
-    /// The create path's OUTER pointers: `pStdSPSs`/`pStdPPSs` address contiguous
-    /// COPIES of the wrappers' Std structs, and those arrays must outlive the
-    /// create call the same way the wrappers do.
-    ///
-    /// [`StoredParams::assemble`] builds them at their final address — inside the
-    /// value the parameters object is returned in — so the pointer the driver is
-    /// given never moves at all. Before this, they were function-local `Vec`s that
-    /// were dropped the instant `create_parameters_object` returned: a driver
-    /// retaining the array (rather than the embedded pointer this fleet was
-    /// measured retaining) would have been reading freed heap from the first frame.
+    /// Create-path outer pointers: [`StoredParams::assemble`] builds the
+    /// contiguous Std arrays at the address they keep after the value moves.
     #[test]
     fn the_std_arrays_the_create_call_is_given_are_the_ones_the_object_keeps() {
         let sps = SpsBuilder::new()
@@ -888,8 +748,8 @@ mod tests {
             .direct_8x8_inference_flag(true)
             .max_num_ref_frames(4)
             .resolution(64, 64)
-            // So the copied Std struct carries a NON-null embedded pointer and the
-            // "still addresses the wrapper's live block" assertion below can bite.
+            // Non-null embedded pointer so the copy-still-addresses-wrapper
+            // assertion below can fail.
             .seq_scaling_matrix_present_flag(true)
             .build();
         let pps = PpsBuilder::new(Rc::clone(&sps))
@@ -900,7 +760,6 @@ mod tests {
         let owned_pps = pps_to_std(&pps).expect("converts");
 
         let stored = StoredParams::assemble(vec![owned_sps], vec![owned_pps]);
-        // Exactly what `create_parameters_object` puts in `pStdSPSs`/`pStdPPSs`.
         let (handed_sps, handed_pps) = (stored.std_sps.as_ptr(), stored.std_pps.as_ptr());
         // The move `create_parameters_object` ends with: `Ok(stored)`.
         let stored = std::hint::black_box(stored);
@@ -910,7 +769,6 @@ mod tests {
             (handed_sps, handed_pps),
             "the arrays handed to Vulkan must be the ones the object keeps"
         );
-        // And their COPIES still address the wrappers' own live blocks.
         let lists = stored.std_sps[0].pScalingLists;
         assert!(!lists.is_null(), "the fixture attaches scaling lists");
         assert_eq!(lists, stored.sps[0].std().pScalingLists);
@@ -927,7 +785,7 @@ mod tests {
     #[test]
     fn a_reactivated_identical_pair_is_current_even_across_reparses() {
         let (sps_a, pps_a) = authored(0, 0, 26);
-        // The parser re-parses in-band sets each keyframe: same content, NEW Rcs.
+        // Parser re-parses in-band sets each keyframe: same content, new Rcs.
         let (sps_b, pps_b) = authored(0, 0, 26);
         assert!(!Rc::ptr_eq(&sps_a, &sps_b));
 
@@ -972,8 +830,7 @@ mod tests {
         ledger.commit(a, &sps, &pps);
         assert_eq!(ledger.next_update_seq(), 2, "one Add happened");
 
-        // Same ids, different content (qp changed): Vulkan cannot replace a
-        // stored set, so this must recreate.
+        // Same ids, different content: Vulkan cannot replace a stored set.
         let (sps2, pps2) = authored(0, 0, 30);
         let action = ledger.plan(&sps2, &pps2);
         assert_eq!(action, ParamsAction::Recreate);
@@ -983,14 +840,12 @@ mod tests {
             1,
             "a fresh object restarts its counter"
         );
-        // And the pair is now Current under the new content.
         assert_eq!(ledger.plan(&sps2, &pps2), ParamsAction::Current);
     }
 
     #[test]
     fn capacity_overflow_recreates_with_just_the_current_pair() {
         let mut ledger = ParamsLedger::default();
-        // Fill the PPS capacity under one SPS.
         let (sps, first) = authored(0, 0, 26);
         let a = ledger.plan(&sps, &first);
         ledger.commit(a, &sps, &first);
@@ -1005,7 +860,7 @@ mod tests {
         }
         assert_eq!(ledger.next_update_seq() - 1, MAX_STD_PPS as u32);
 
-        // One past capacity: recreate; afterwards the evicted first PPS re-Adds.
+        // One past capacity: Recreate; the evicted first PPS re-Adds later.
         let overflow = PpsBuilder::new(Rc::clone(&sps))
             .pic_parameter_set_id(MAX_STD_PPS as u8)
             .pic_init_qp(26)
@@ -1032,8 +887,8 @@ mod tests {
             "consumed — the next scope must NOT reset again"
         );
 
-        // The recorded RESET never reached the queue (end/submit failed): the
-        // re-arm makes the next successful recording carry it instead.
+        // Recorded RESET never reached the queue: re-arm so the next
+        // successful recording carries it.
         arm.re_arm();
         assert!(arm.take());
         assert!(!arm.take());
@@ -1044,7 +899,7 @@ mod tests {
         let (sps, pps) = authored(0, 0, 26);
         let mut ledger = ParamsLedger::default();
         assert_eq!(ledger.next_update_seq(), 1);
-        // One call carries BOTH sets: the counter moves by exactly one.
+        // One call carries both sets: the counter moves by exactly one.
         let a = ledger.plan(&sps, &pps);
         assert_eq!(
             a,

@@ -1,64 +1,39 @@
-//! Which ScreenCast cursor mode to ASK the portal for — negotiated against what the backend
-//! advertises, rather than asserted.
+//! ScreenCast cursor mode against `AvailableCursorModes`.
 //!
-//! The portal spec is unforgiving here: `SelectSources` with a cursor mode that is absent from
-//! `AvailableCursorModes` does not quietly degrade — **xdg-desktop-portal itself rejects the call**
-//! (`"Unavailable cursor mode %x"`, an `INVALID_ARGUMENT` from the FRONTEND, which validates the
-//! request against the backend's advertised bitfield before the backend ever sees it). Both
-//! wlr-family backends used to hardcode `Metadata` whenever the session had negotiated the cursor
-//! channel, so every cursor-forward session died at `select_sources` — `unavailable cursor mode 4`
-//! (4 being `Metadata`'s bit) and a client left on a black screen behind "pipeline build failed".
-//! Field report 2026-08-14.
+//! `SelectSources` with a bit the portal did not advertise is
+//! `INVALID_ARGUMENT` from xdg-desktop-portal, not the backend. The request is
+//! always a subset of the advertised bits.
 //!
-//! ⚠️ This is NOT a stale-portal problem, and not Hyprland-specific. MEASURED on .21 2026-08-14 on
-//! fully current packages — Hyprland **0.56.2**, xdg-desktop-portal-hyprland **1.4.1**,
-//! xdg-desktop-portal **1.22.1** — with a live session and xdph attached (`[screencopy] init
-//! successful`): `AvailableCursorModes` reads **3** (`Hidden|Embedded`) on both the backend impl
-//! interface and the frontend. **Metadata is simply not offered by xdph today.** xdpw is the same
-//! story from the other end: its `screencast.c` refuses `METADATA` outright. So the hardcode broke
-//! every cursor-forward session on the entire wlr family, on current software — not only on old
-//! installs. (xdph 1.4.1 would itself fall back — its binary carries
-//! `"[screencopy] unsupported cursor_mode {}, fallback to {}"` — but it never gets the chance,
-//! because the frontend fails the call first.)
+//! Want is `Metadata` when the session has a cursor channel (`set_hw_cursor`),
+//! else `Embedded`. `PUNKTFUNK_PORTAL_CURSOR_MODE` pins a preference; the
+//! ladder still runs, so a pin cannot request an unadvertised mode.
 //!
-//! `pf-capture`'s own portal path has always negotiated (`portal::choose_cursor_mode`) — this is
-//! that ladder, restated in the crate that owns the virtual-display backends. pf-vdisplay must not
-//! depend on pf-capture (see this crate's Cargo.toml: "never on capture/inject or the
-//! orchestrator"), so the two copies are deliberate; keep the ladders in step.
+//! `pf-capture` keeps the same ladder (`portal::choose_cursor_mode`). This crate
+//! must not depend on capture; keep the two copies in step.
 //!
-//! Declared unconditionally although only the Linux backends call it: the ladder is pure integer
-//! work, and its tests are the whole point of the module — this is a decision that leaves no trace
-//! anyone can check without a compositor in front of them — so they run on every platform's CI
-//! rather than on the one leg that compiles `mod hyprland`.
+//! Compiled on every platform so the tests run in CI without a compositor.
 
-/// A ScreenCast cursor mode, valued as the portal's own wire bits — which is what a backend prints
-/// when it rejects one, so `Metadata`'s `4` is literally the number in the field report.
+/// Portal wire bits. Re-exported as [`crate::PortalCursorMode`].
 ///
-/// Public because the NEGOTIATED mode is a per-session fact the consumer needs: the host's stream
-/// loop reads it back off the backend ([`VirtualDisplay::last_portal_cursor_mode`]) to know whether
-/// `SPA_META_Cursor` can ever arrive on this output. Re-exported as
-/// [`crate::PortalCursorMode`](crate::PortalCursorMode).
+/// The host reads [`VirtualDisplay::last_portal_cursor_mode`] to know whether
+/// `SPA_META_Cursor` can arrive.
 ///
 /// [`VirtualDisplay::last_portal_cursor_mode`]: crate::VirtualDisplay::last_portal_cursor_mode
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// No pointer in the cast at all.
     Hidden = 1,
-    /// The compositor paints the pointer into the frames it hands us.
+    /// Pointer burnt into the frames; no `SPA_META_Cursor`.
     Embedded = 2,
-    /// The pointer rides `SPA_META_Cursor` metadata beside the frames: the compositor keeps its
-    /// cheap hardware cursor plane, and the consumer either composites the shape itself or
-    /// forwards it to a client that draws its own.
+    /// `SPA_META_Cursor` beside the frames; the compositor keeps its hardware plane.
     Metadata = 4,
 }
 
 impl Mode {
-    /// The portal's bit for this mode.
     pub(crate) const fn bit(self) -> u32 {
         self as u32
     }
 
-    /// The spelling used in logs and in `PUNKTFUNK_PORTAL_CURSOR_MODE`.
+    /// Spelling for logs and `PUNKTFUNK_PORTAL_CURSOR_MODE`.
     pub const fn name(self) -> &'static str {
         match self {
             Mode::Hidden => "hidden",
@@ -67,54 +42,34 @@ impl Mode {
         }
     }
 
-    /// Can `SPA_META_Cursor` EVER arrive under this mode? Only under [`Metadata`](Mode::Metadata) —
-    /// and this is the whole point of surfacing the negotiated mode.
-    ///
-    /// Under `Embedded` the compositor paints the pointer into the frames and sends no cursor
-    /// metadata **regardless of where the pointer is**, so on such a session the absence of a cursor
-    /// overlay carries NO information: not about the pointer's position, not about whether the
-    /// capture is healthy. Consumers that treat "no overlay" as a symptom (the host's seat-pointer
-    /// park schedule, which reads it as "the pointer has not reached the streamed output" — true on
-    /// Mutter, which suppresses metadata while the pointer is off the recorded view) must ask this
-    /// first. Under `Hidden` there is no pointer at all, so the same holds.
+    /// Under `Embedded` a missing overlay is not "pointer off the recorded view".
     pub const fn delivers_metadata(self) -> bool {
         matches!(self, Mode::Metadata)
     }
 
-    /// What to ask for instead, best first, when this mode is not advertised.
     const fn fallbacks(self) -> [Mode; 2] {
         match self {
-            // The session wanted out-of-band shapes and cannot have them. `Embedded` still puts a
-            // pointer on the client's screen (the compositor's, burnt in) — and because no
-            // `SPA_META_Cursor` then arrives, the host feeds the cursor channel nothing and a
-            // cursor-forward client draws nothing of its own, so this is one pointer, not two.
-            // `Hidden` is last: it streams a desktop nobody can point at.
+            // Embedded still shows a pointer (burnt in). Hidden last: no pointer,
+            // and no `SPA_META_Cursor` for a cursor-forward client to draw.
             Mode::Metadata => [Mode::Embedded, Mode::Hidden],
-            // Embedded wanted but not offered. Metadata still beats Hidden: the CPU capture path
-            // composites `SPA_META_Cursor` inline, so part of the matrix keeps a pointer.
+            // CPU capture composites `SPA_META_Cursor` inline, so Metadata still shows a pointer.
             Mode::Embedded => [Mode::Metadata, Mode::Hidden],
-            // A deliberate request for no pointer that the backend will not honour. Either
-            // remaining mode shows one; prefer the cheap burnt-in pointer over metadata nothing on
-            // this path is set up to draw.
+            // Either remaining mode shows a pointer. Prefer Embedded: this path is
+            // not set up to draw `SPA_META_Cursor`.
             Mode::Hidden => [Mode::Embedded, Mode::Metadata],
         }
     }
 }
 
-/// The outcome of the ladder: what to request, and what the session actually wanted if those
-/// differ (the caller logs the gap — a silently downgraded cursor is how this class of bug hides).
+/// Requested mode, plus the original want when that is a downgrade (the caller logs the gap).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Choice {
-    /// The mode to put in `SelectSources`. Advertised, unless the backend advertised nothing.
+    /// `SelectSources` mode. In `advertised`, unless the backend advertised nothing we know.
     pub(crate) mode: Mode,
-    /// Set only when `mode` is a downgrade: the mode the session asked for and could not have.
     pub(crate) wanted: Option<Mode>,
 }
 
-/// Pick the cursor mode to request, given the backend's `AvailableCursorModes` bitfield.
-///
-/// Never returns a mode outside `advertised` unless `advertised` names none we know — see the tail
-/// comment, which is the one case with no right answer.
+/// Unknown bits fall to `Hidden` and set `wanted`.
 pub(crate) fn pick(advertised: u32, want: Mode) -> Choice {
     if advertised & want.bit() != 0 {
         return Choice {
@@ -130,30 +85,25 @@ pub(crate) fn pick(advertised: u32, want: Mode) -> Choice {
             };
         }
     }
-    // The backend advertised no mode this build knows — 0, or only bits from a spec revision newer
-    // than us. Every request is then a coin flip against a session-closing rejection; `Hidden` is
-    // both the most universally implemented and the only one that cannot end up drawing two
-    // pointers. The caller warns: whatever this backend is doing, we are guessing.
+    // Advertised nothing this build knows (0, or bits from a newer spec). Hidden
+    // draws no pointer. The caller warns.
     Choice {
         mode: Mode::Hidden,
         wanted: Some(want),
     }
 }
 
-/// A parsed `PUNKTFUNK_PORTAL_CURSOR_MODE`.
+/// Parsed `PUNKTFUNK_PORTAL_CURSOR_MODE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Pin {
-    /// Unset or `auto` — the session's own negotiation decides.
+    /// Unset or `auto`. The session's own negotiation decides.
     Auto,
-    /// Prefer this mode instead of what the session negotiated. Still runs the ladder, so a pin
-    /// can never re-create the session-killing request this module exists to prevent.
+    /// Prefer this mode. The ladder still runs; a pin cannot request an unadvertised mode.
     Mode(Mode),
-    /// Set to something we do not recognise. Treated as `Auto`, but the caller says so out loud —
-    /// a typo'd escape hatch that silently does nothing is worse than no escape hatch.
+    /// Unknown spelling. Treated as `Auto`; the caller logs it rather than swallowing a typo.
     Unrecognised,
 }
 
-/// Parse the `PUNKTFUNK_PORTAL_CURSOR_MODE` value.
 pub(crate) fn parse_pin(raw: &str) -> Pin {
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "auto" => Pin::Auto,
@@ -164,11 +114,9 @@ pub(crate) fn parse_pin(raw: &str) -> Pin {
     }
 }
 
-/// The mode this session wants before the backend gets a say: `Metadata` when the cursor channel
-/// was negotiated (`set_hw_cursor` — the client draws the pointer, so the compositor must not burn
-/// it in), `Embedded` otherwise. `PUNKTFUNK_PORTAL_CURSOR_MODE` overrides both.
-///
-/// `backend` names the portal implementation for the log line only (`xdph`, `xdpw`).
+/// `Metadata` when the cursor channel was negotiated (`set_hw_cursor`: the client
+/// draws, so the compositor must not burn the pointer in), else `Embedded`.
+/// `PUNKTFUNK_PORTAL_CURSOR_MODE` overrides both. `backend` is the log line only.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn want(hw_cursor: bool, backend: &str) -> Mode {
     let negotiated = if hw_cursor {
@@ -216,14 +164,8 @@ impl Mode {
     }
 }
 
-/// Ask the portal what it supports, run the ladder, and hand back the mode to put in
-/// `SelectSources`. Infallible by construction: a backend we cannot interrogate gets `Embedded`,
-/// the mode that predates the property and that every implementation has always had.
-///
-/// Returns OUR [`Mode`], not ashpd's — the caller converts with [`Mode::to_ashpd`] for the request
-/// and carries the value out of the portal thread, because what was negotiated (as opposed to
-/// asked for) governs how the session's cursor behaves for its whole life. See
-/// [`Mode::delivers_metadata`].
+/// Returns our [`Mode`], not ashpd's: the caller converts with [`Mode::to_ashpd`]
+/// and carries the value out of the portal thread for the session lifetime.
 #[cfg(target_os = "linux")]
 pub(crate) async fn negotiate(
     proxy: &ashpd::desktop::screencast::Screencast,
@@ -234,9 +176,7 @@ pub(crate) async fn negotiate(
     let advertised = match proxy.available_cursor_modes().await {
         Ok(avail) => avail.bits(),
         Err(e) => {
-            // `AvailableCursorModes` is a versioned property (ScreenCast v2); a portal too old to
-            // publish it is also too old to have metadata, and `Embedded` is what this backend
-            // requested for its whole life before the cursor channel existed.
+            // ScreenCast v2 property. A portal that cannot publish it is too old for Metadata.
             tracing::warn!(
                 backend,
                 error = %e,
@@ -253,8 +193,6 @@ pub(crate) async fn negotiate(
             mode = choice.mode.name(),
             "ScreenCast: cursor mode negotiated"
         ),
-        // The downgrade path — and the one that used to be a dead session. Loud, because a stream
-        // whose pointer quietly changed hands is exactly what nobody thinks to check.
         Some(wanted) => tracing::warn!(
             backend,
             advertised = format_args!("{advertised:#05b}"),
@@ -271,8 +209,7 @@ pub(crate) async fn negotiate(
 mod tests {
     use super::*;
 
-    /// The portal's wire values. These are ABI — a backend rejecting our request prints the
-    /// number, and `4` is the one in the field report that started this module.
+    /// Portal wire bits. A rejecting backend prints this number.
     #[test]
     fn mode_bits_are_the_portal_wire_values() {
         assert_eq!(Mode::Hidden.bit(), 1);
@@ -280,9 +217,8 @@ mod tests {
         assert_eq!(Mode::Metadata.bit(), 4);
     }
 
-    /// Our `Mode` is a restatement of ashpd's `CursorMode`, whose bits enumflags2 assigns from
-    /// declaration order — so a reordering upstream would silently repoint every mode. Pin it
-    /// where ashpd is actually compiled.
+    /// ashpd `CursorMode` bits follow enumflags2 declaration order; a reorder
+    /// silently repoints every mode. Pin them where ashpd is compiled.
     #[cfg(target_os = "linux")]
     #[test]
     fn mode_bits_match_ashpd() {
@@ -299,36 +235,26 @@ mod tests {
         assert_eq!(BitFlags::from_flag(CursorMode::Metadata).bits(), 4);
     }
 
-    /// THE REGRESSION, with the real number: `3` is what xdph actually advertises — measured on
-    /// .21 2026-08-14 against a live Hyprland 0.56.2 + xdph 1.4.1, both current. A cursor-forward
-    /// session wants metadata; asking for it made xdg-desktop-portal fail the call, and the client
-    /// got a black screen behind "pipeline build failed" / "unavailable cursor mode 4".
+    /// xdph advertises `3` (`Hidden|Embedded`). Metadata (`4`) is
+    /// `INVALID_ARGUMENT` from xdg-desktop-portal, not the backend.
     #[test]
     fn metadata_wanted_but_unadvertised_downgrades_to_embedded() {
-        // Exactly the bitfield the portal reported on glass.
         assert_eq!(Mode::Hidden.bit() | Mode::Embedded.bit(), 3);
         let c = pick(3, Mode::Metadata);
         assert_eq!(c.mode, Mode::Embedded);
         assert_eq!(c.wanted, Some(Mode::Metadata));
     }
 
-    /// The consumer-facing half of the same incident: xdph negotiates `3` down to `Embedded`, and
-    /// under Embedded no `SPA_META_Cursor` ever arrives — so a host that reads "no cursor overlay"
-    /// as "the pointer has not reached the streamed output" (true on Mutter, which suppresses
-    /// metadata off-view) re-centres the user's pointer forever. Field report 2026-08-14: the seat
-    /// pointer warped to centre once a second for the full park cap on a working Hyprland stream.
+    /// Under Embedded no `SPA_META_Cursor` arrives. A missing overlay is not "pointer off view".
     #[test]
     fn only_metadata_can_deliver_a_cursor_overlay() {
         assert!(Mode::Metadata.delivers_metadata());
         assert!(!Mode::Embedded.delivers_metadata());
         assert!(!Mode::Hidden.delivers_metadata());
-        // The negotiated mode is what governs, not the wanted one: this is the exact ladder result
-        // on xdph/xdpw, and it says "no overlay is ever coming" even though metadata was requested.
+        // The negotiated mode governs, not the wanted one.
         assert!(!pick(3, Mode::Metadata).mode.delivers_metadata());
     }
 
-    /// The same portal, a session with no cursor channel: already asking for what exists, so the
-    /// fix must not perturb it.
     #[test]
     fn embedded_wanted_and_advertised_is_untouched() {
         let c = pick(Mode::Hidden.bit() | Mode::Embedded.bit(), Mode::Embedded);
@@ -336,8 +262,6 @@ mod tests {
         assert_eq!(c.wanted, None);
     }
 
-    /// A portal that does support metadata (KWin, Mutter, xdph ≥ #366) still gets it — the point
-    /// is to stop asserting, not to stop using it.
     #[test]
     fn metadata_is_used_where_advertised() {
         let all = Mode::Hidden.bit() | Mode::Embedded.bit() | Mode::Metadata.bit();
@@ -346,8 +270,7 @@ mod tests {
         assert_eq!(c.wanted, None);
     }
 
-    /// Embedded wanted, only metadata offered: the CPU capture path composites it, so a pointer
-    /// survives. (Mirrors `pf-capture`'s ladder.)
+    /// CPU capture composites `SPA_META_Cursor`, so Metadata still shows a pointer.
     #[test]
     fn embedded_unadvertised_falls_to_metadata_not_hidden() {
         let c = pick(Mode::Hidden.bit() | Mode::Metadata.bit(), Mode::Embedded);
@@ -355,7 +278,7 @@ mod tests {
         assert_eq!(c.wanted, Some(Mode::Embedded));
     }
 
-    /// A backend offering only `Hidden`: a cursorless stream beats a closed session.
+    /// Hidden-only backend: requesting Metadata would close the session.
     #[test]
     fn hidden_only_backend_yields_hidden() {
         let c = pick(Mode::Hidden.bit(), Mode::Metadata);
@@ -363,8 +286,7 @@ mod tests {
         assert_eq!(c.wanted, Some(Mode::Metadata));
     }
 
-    /// Advertises nothing we know — no right answer, but it must still be a legal enum and flagged
-    /// as a downgrade so the warn fires.
+    /// Unknown bits: still a legal `Mode`, flagged as a downgrade so the caller warns.
     #[test]
     fn unknown_advertisement_guesses_hidden_and_reports_a_downgrade() {
         for advertised in [0, 0b1000_0000] {
@@ -374,8 +296,6 @@ mod tests {
         }
     }
 
-    /// Whatever the ladder returns must be a mode the backend named — the invariant the old
-    /// hardcode broke. Exhaustive over every advertisement × every want.
     #[test]
     fn never_requests_an_unadvertised_mode() {
         let modes = [Mode::Hidden, Mode::Embedded, Mode::Metadata];
@@ -388,7 +308,6 @@ mod tests {
                     c.mode.name(),
                     want.name()
                 );
-                // A downgrade is reported exactly when one happened.
                 assert_eq!(c.wanted.is_some(), c.mode != want);
             }
         }
@@ -407,8 +326,7 @@ mod tests {
         assert_eq!(parse_pin("yes"), Pin::Unrecognised);
     }
 
-    /// The hatch pins a PREFERENCE, not the request: pinning metadata at a portal without it must
-    /// still come out embedded rather than re-closing the session.
+    /// A pin is a preference: unadvertised Metadata still becomes Embedded.
     #[test]
     fn a_pin_still_runs_the_ladder() {
         let c = pick(Mode::Hidden.bit() | Mode::Embedded.bit(), Mode::Metadata);

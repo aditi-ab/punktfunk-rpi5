@@ -1,23 +1,24 @@
-//! Cursor-forward channel, host side (design/remote-desktop-sweep.md M2).
+//! Host cursor-forward channel (`design/remote-desktop-sweep.md`).
 //!
-//! When the session negotiated the cursor channel (client `CLIENT_CAP_CURSOR` met our
-//! `HOST_CAP_CURSOR`), the encoder stops blending the pointer into the video
-//! (`SessionPlan::cursor_blend = false`) and the encode loop forwards it out-of-band instead:
-//! the SHAPE (bitmap + hotspot, rare) rides the reliable control stream via the control-task
-//! bridge, per-tick STATE (position/visibility, 14 B) rides a lossy `0xD0` datagram — resent
-//! every iteration so loss self-heals with no refresh timer.
+//! Armed when `CLIENT_CAP_CURSOR` met `HOST_CAP_CURSOR`. The encoder then
+//! stops blending (`SessionPlan::cursor_blend = false`) and this loop forwards
+//! the pointer out-of-band: `CursorShape` (bitmap + hotspot) on serial change
+//! via the control-task bridge (reliable); `CursorState` (hotspot position /
+//! visibility, 14 B) as a `0xD0` datagram every encode tick (lossy, latest-wins;
+//! no refresh timer).
+//!
+//! Pin: `shape_from_overlay` tests. Flag contract is on [`CursorForwarder::tick`].
 
 use punktfunk_core::quic::{
     encode_cursor_state_datagram, CursorShape, CursorState, CURSOR_RELATIVE_HINT,
     CURSOR_SHAPE_MAX_SIDE, CURSOR_VISIBLE,
 };
 
-/// Per-session forward state, owned by the encode loop (the thread that binds frames).
+/// Owned by the encode loop — the thread that binds frames.
 pub(super) struct CursorForwarder {
-    /// Serial of the last shape handed to the control-task bridge (`None` = none yet).
     sent_serial: Option<u64>,
-    /// Last visible pointer position (hotspot point, frame px) — held across hidden spans so
-    /// a hide still states WHERE the pointer was (the M3 reappear position).
+    /// Hotspot in frame px. Survives hide so a hidden tick still names
+    /// the last visible point.
     last_pos: (i32, i32),
 }
 
@@ -29,12 +30,10 @@ impl CursorForwarder {
         }
     }
 
-    /// Called once per encode-loop iteration with the bound frame's overlay (also on repeat
-    /// iterations — the state datagram is the plane's loss heal, so it goes out every tick).
-    /// Flag mapping (M3): a visible overlay states VISIBLE; a hidden-but-known overlay
-    /// (an app grabbed/hid the pointer) states RELATIVE_HINT — the client should flip to
-    /// captured relative; `None` (no bitmap has EVER arrived) states neither — never hint
-    /// off a cold start, only off an observed hide.
+    /// Send `0xD0` every encode tick (lossy, latest-wins; no refresh timer).
+    /// Visible → `CURSOR_VISIBLE`; hidden-but-known (app grabbed the pointer)
+    /// → `CURSOR_RELATIVE_HINT`; `None` (no overlay ever) → 0. Do not hint
+    /// off a cold start — only off an observed hide.
     pub(super) fn tick(
         &mut self,
         cursor: Option<&pf_frame::CursorOverlay>,
@@ -45,7 +44,7 @@ impl CursorForwarder {
             Some(ov) if ov.visible => {
                 if self.sent_serial != Some(ov.serial) {
                     if let Some(shape) = shape_from_overlay(ov) {
-                        // Bridge full ⇒ control task gone ⇒ session is tearing down anyway.
+                        // Unbounded send fail ⇒ receiver dropped; session is tearing down.
                         let _ = shape_tx.send(shape);
                         self.sent_serial = Some(ov.serial);
                     }
@@ -66,10 +65,9 @@ impl CursorForwarder {
     }
 }
 
-/// Build the wire shape from a capture overlay, integer-downscaling (nearest-neighbor) anything
-/// over [`CURSOR_SHAPE_MAX_SIDE`] so the message always fits the u16-length control frame.
-/// Real cursors are far under the cap — the scale path is a correctness backstop for XL
-/// accessibility cursors, not a quality path. `None` on a malformed overlay (short buffer).
+/// Nearest-neighbor integer downscale when a side exceeds [`CURSOR_SHAPE_MAX_SIDE`].
+/// Control frames are u16-length; this is a backstop for oversized accessibility
+/// cursors, not a quality path.
 fn shape_from_overlay(ov: &pf_frame::CursorOverlay) -> Option<CursorShape> {
     let px = (ov.w as usize).checked_mul(ov.h as usize)?.checked_mul(4)?;
     if ov.w == 0 || ov.h == 0 || ov.rgba.len() < px {
@@ -125,19 +123,17 @@ mod tests {
         let s = shape_from_overlay(&overlay(32, 32, (4, 5))).unwrap();
         assert_eq!((s.w, s.h, s.hot_x, s.hot_y, s.serial), (32, 32, 4, 5, 3));
         assert_eq!(s.rgba.len(), 32 * 32 * 4);
-        // Encodes within the u16 control-frame cap.
         assert!(s.encode().len() <= u16::MAX as usize);
     }
 
     #[test]
     fn oversize_shape_downscales_with_hotspot() {
-        // 256² → f = ceil(256/120) = 3 → 86² (256.div_ceil(3)), hotspot scales with it.
+        // 256 > 120 → f = ceil(256/120) = 3; hotspot scales with the same f.
         let s = shape_from_overlay(&overlay(256, 256, (255, 0))).unwrap();
         assert!(s.w <= CURSOR_SHAPE_MAX_SIDE && s.h <= CURSOR_SHAPE_MAX_SIDE);
         assert_eq!(s.rgba.len(), s.w as usize * s.h as usize * 4);
         assert!(s.hot_x < s.w && s.hot_y < s.h);
         assert!(s.encode().len() <= u16::MAX as usize);
-        // The scaled message must decode (dims within the cap).
         assert_eq!(CursorShape::decode(&s.encode()).unwrap(), s);
     }
 

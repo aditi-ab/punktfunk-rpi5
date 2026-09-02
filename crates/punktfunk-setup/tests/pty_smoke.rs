@@ -1,13 +1,12 @@
-//! The TUI in a real pseudo-terminal, end to end.
+//! The TUI in a real pseudo-terminal.
 //!
-//! The frame goldens in `tui_frames` prove what the renderer *builds*; this proves the binary
-//! survives an actual terminal — raw mode, cursor control, key decoding, the intro repaint —
-//! which is the "TUI panics on a real terminal" class no in-process test can reach.
+//! `tui_frames` pins what the renderer builds. This drives the binary under a
+//! pty — raw mode, cursor control, key decoding, the intro repaint — which no
+//! in-process test can reach.
 //!
-//! It drives `--demo`, so nothing it runs can touch the machine: demo mode hands the plan a
-//! runner that cannot spawn. Runs on the Linux and macOS lanes; unix-only, because the TUI
-//! through a real pty is a unix contract — ConPTY re-encodes the stream and the reads hang.
-//! The Windows face is the WinUI wizard; its silent path gets its own smoke (WP2.4).
+//! Always `--demo`: the plan gets a runner that cannot spawn. Unix only.
+//! ConPTY re-encodes the stream and the reads hang. Windows uses the WinUI
+//! wizard; the silent path is a separate smoke.
 #![cfg(unix)]
 
 use std::io::{Read, Write};
@@ -15,10 +14,9 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
-/// Long enough for the intro animation plus ~12 simulated steps on a loaded CI box.
+/// 45 s: intro animation plus ~12 steps on a loaded CI box.
 const DEADLINE: Duration = Duration::from_secs(45);
 
-/// Run the binary under a pty, send `keys`, and return everything it drew.
 fn run(args: &[&str], keys: &[u8], until: &str) -> String {
     run_with_home(args, keys, until, None)
 }
@@ -36,8 +34,7 @@ fn run_with_home(args: &[&str], keys: &[u8], until: &str, home: Option<&str>) ->
     for arg in args {
         cmd.arg(arg);
     }
-    // A real terminal that claims truecolor, so the mark and the rail are exercised rather
-    // than degraded away.
+    // A terminal that claims truecolor, so the mark and the rail are not degraded away.
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env_remove("NO_COLOR");
@@ -64,7 +61,7 @@ fn run_with_home(args: &[&str], keys: &[u8], until: &str, home: Option<&str>) ->
         }
     });
 
-    // The settings screen has to be on the glass before a keystroke means anything.
+    // The settings screen must be drawn before a keystroke means anything.
     let start = Instant::now();
     while start.elapsed() < DEADLINE {
         if collected.lock().unwrap().contains("Install now") {
@@ -87,7 +84,7 @@ fn run_with_home(args: &[&str], keys: &[u8], until: &str, home: Option<&str>) ->
     text
 }
 
-/// Strip the escape sequences so an assertion reads the text, not the paint.
+/// Strip CSI so an assertion reads the text, not the paint.
 fn plain(raw: &str) -> String {
     let mut out = String::new();
     let mut chars = raw.chars();
@@ -96,7 +93,7 @@ fn plain(raw: &str) -> String {
             out.push(c);
             continue;
         }
-        // CSI and the handful of two-character sequences the renderer emits.
+        // CSI, plus the two-character sequences the renderer emits.
         match chars.next() {
             Some('[') => {
                 for c in chars.by_ref() {
@@ -135,7 +132,6 @@ fn the_demo_walks_from_the_settings_screen_to_the_outro() {
     );
 }
 
-/// The failure state has to render as a failure, not as a silent stop.
 #[test]
 fn a_failed_step_renders_the_failure_and_points_at_the_docs() {
     let text = plain(&run(
@@ -157,9 +153,8 @@ fn a_failed_step_renders_the_failure_and_points_at_the_docs() {
     );
 }
 
-/// D9's promise, as a regression test: `--demo` once wrote a real `~/.config/punktfunk/host.env`
-/// because `SetEnv` edits the file directly instead of spawning, so the fake runner never saw
-/// it. The preset below is the one that sets two of them.
+/// `SetEnv` writes `host.env` with `std::fs`, not a spawn, so the fake runner never sees it.
+/// `fedora-sunshine` is the preset that sets two of those keys.
 #[test]
 fn the_demo_writes_nothing_into_the_users_home() {
     let home = tempfile::tempdir().expect("tempdir");
@@ -181,7 +176,6 @@ fn the_demo_writes_nothing_into_the_users_home() {
     );
 }
 
-/// q leaves without running anything, and says so.
 #[test]
 fn quitting_the_settings_screen_changes_nothing() {
     let text = plain(&run(&["--demo", "arch-fresh"], b"q", "Nothing was changed"));

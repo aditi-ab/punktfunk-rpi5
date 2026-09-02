@@ -1,80 +1,60 @@
-//! Pure display-**arrangement** engine (design: `design/display-management.md` §6.2). Given a
-//! group's members (in acquire order) and the `layout` policy, compute each member's top-left
-//! origin in the desktop coordinate space. No I/O, no OS types — the registry (for the
-//! `/display/state` readout) and the per-backend position apply both consume it, so the auto-row /
-//! manual math is defined and tested in exactly one place (the `pick_gamescope_mode` / `wiring_plan`
-//! discipline).
+//! Pure display-arrangement: members in acquire order plus a [`Layout`] policy
+//! become each member's top-left origin. No I/O, no OS types. The registry
+//! readout and the per-backend position apply both consume this, so the math
+//! lives in one place. Design: `design/display-management.md`.
 //!
-//! * **auto-row** — left-to-right in acquire order, top-aligned: member *i* sits at
-//!   `x = Σ widths[0..i]`, `y = 0`. This is what compositors mostly do by default, made
-//!   deterministic.
-//! * **manual** — per-identity-slot offsets from [`Layout::positions`] (console-arranged): a member
-//!   whose stable identity slot has a stored position sits there; a member with no pin (no stored
-//!   position, or a shared/anonymous identity that has no slot) is **packed clear of the pins** —
-//!   rowed left-to-right starting past the rightmost pinned edge — so a half-arranged group neither
-//!   collapses everything onto the origin nor drops an unpinned display exactly on top of a pinned
-//!   one. The pins themselves are reproduced verbatim: where two of them overlap, that is the
-//!   operator's own arrangement and not ours to second-guess.
+//! Auto-row is left-to-right, top-aligned: member *i* at `x = Σ widths[0..i]`,
+//! `y = 0`. Manual sits a member on its identity-slot pin, or packs it
+//! left-to-right past the rightmost pinned edge. Overlapping pins are copied
+//! verbatim.
 //!
-//! Members carry no height, so "clear of the pins" is decided on the x axis alone and every pin
-//! counts regardless of its `y` — a vertically-stacked arrangement therefore packs further right than
-//! it strictly needs to. That is the conservative direction: a gap is a cosmetic waste of desktop
-//! coordinate space, an overlap is two desktops fighting over the same pixels.
+//! Members have no height, so clearance is x-only and every pin counts
+//! regardless of `y`. A vertical stack therefore packs further right than it
+//! needs to: a gap wastes coordinate space; an overlap maps two desktops onto
+//! the same pixels.
 //!
-//! Group membership + acquire order live in the registry ([`super::registry`]); this file only turns
-//! that ordered member list into positions.
+//! Group membership lives in [`super::registry`].
 
 use super::policy::{Layout, LayoutMode};
 
-/// One display in a group, as the arranger sees it (given in acquire order).
+/// One group member, in acquire order.
 #[derive(Clone, Copy, Debug)]
 pub struct Member {
-    /// Stable per-client identity slot — the manual-layout key. `None` for a shared/anonymous
-    /// identity (no per-client slot), which can't carry a manual pin and therefore always auto-rows.
+    /// Manual-layout key. `None` cannot carry a pin, so it always auto-rows.
     pub identity_slot: Option<u32>,
-    /// The member's width **in the same coordinate space the resulting [`Placement`] is expressed
-    /// in**, for row `x` accumulation. Clamped at 0 (a bogus negative never shifts a sibling left).
+    /// Width in the same coordinate space as the resulting [`Placement`].
+    /// Clamped at 0 so a negative never shifts a sibling left.
     ///
-    /// ⚠ Every fill site currently uses the requested *mode* width, i.e. pixels. On Windows
-    /// that is also the desktop space (CCD geometry is pixels), so the two agree; on KWin the
-    /// placement is handed to `config.position()`, which is the compositor's **logical** space — the
-    /// two coincide only at scale 1.0, and a per-output scale is exactly what the identity machinery
-    /// exists to make KDE reapply. A 150 %-scaled 2560-wide output occupies 1707 logical px, so
-    /// auto-rowing past it by 2560 leaves an 853-px dead band. Fixing that means dividing by the
-    /// output's applied scale at the KWin fill site (`kwin_output_mgmt` already reads `scale` into
-    /// its device state); this type stays unit-agnostic, and the contract is that whoever fills it
-    /// speaks the consumer's space.
+    /// Fill sites pass mode pixels. That matches Windows CCD; KWin
+    /// `config.position()` is logical, so a scaled output is too wide unless
+    /// the fill site divides by applied scale. This type stays unit-agnostic.
     pub width: i32,
 }
 
-/// A member's resolved desktop-space top-left origin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Placement {
     pub x: i32,
     pub y: i32,
 }
 
-/// The auto-row origin of member `i`: the summed width of every prior member, top-aligned.
-/// `saturating_add` because the widths are client-supplied through the requested mode — an absurd
-/// one must produce an absurd coordinate, not a debug-build panic inside the state readout.
+/// Prefix-sum of prior widths, top-aligned. Saturating: a client-supplied
+/// absurd width must not panic the state readout.
 fn auto_row_x(members: &[Member], i: usize) -> i32 {
     members[..i]
         .iter()
         .fold(0i32, |x, m| x.saturating_add(m.width.max(0)))
 }
 
-/// The manual pin for `m`, if its identity slot carries one. The lookup is an exact string match on
-/// the canonical decimal slot id — `DisplayPolicy::sanitized` re-keys the table to that form on
-/// write, so a `"01"` typed into a hand-edited settings file still resolves here.
+/// Pin for `m` if its slot is in [`Layout::positions`]. Lookup is the canonical
+/// decimal slot string — `DisplayPolicy::sanitized` re-keys `"01"` on write.
 fn pin_of(m: &Member, layout: &Layout) -> Option<Placement> {
     m.identity_slot
         .and_then(|slot| layout.positions.get(&slot.to_string()))
         .map(|p| Placement { x: p.x, y: p.y })
 }
 
-/// Arrange `members` (in acquire order) per `layout`, returning one [`Placement`] per member in the
-/// same order. Pure — the single source of truth for auto-row / manual placement, shared by the
-/// state readout and (KWin) the per-backend position apply.
+/// One [`Placement`] per member, same order. Shared by the state readout and
+/// (KWin) the per-backend position apply.
 pub fn arrange(members: &[Member], layout: &Layout) -> Vec<Placement> {
     match layout.mode {
         LayoutMode::AutoRow => (0..members.len())
@@ -87,34 +67,18 @@ pub fn arrange(members: &[Member], layout: &Layout) -> Vec<Placement> {
     }
 }
 
-/// Manual placement: pins verbatim, everything else rowed out past them.
+/// Pins verbatim; unpinned members row out past the rightmost pinned edge.
 ///
-/// The unpinned fallback used to be the unconditional auto-row prefix sum — computed as if the pins
-/// did not exist — so an unpinned display could land exactly on top of a pinned sibling with nothing
-/// downstream noticing (the arrangement is only ever *reported* and *applied*, never validated). One
-/// number in this crate's own fixture separated the tested case from that collision. Rowing the
-/// unpinned members from the rightmost pinned edge instead makes the overlap unrepresentable within
-/// one call, and keeps three of the fallback's properties: deterministic, acquire-ordered, and
-/// identical to plain auto-row when nothing is pinned.
-///
-/// ⚠ **The fourth property is gone, knowingly: incremental stability.** The prefix sum could not
-/// move member `i` when member `i+1` joined; this cursor is seeded from the pins of *all* members,
-/// so an already-placed unpinned member's computed `x` shifts the moment a pinned sibling arrives
-/// later in acquire order. Nothing re-applies it — `registry::position_for_new` takes only the
-/// `.last()` placement and the registry moves the newly-acquired display alone — so in that ordering
-/// `GET /display/state` reports a position the desktop never received (the pre-existing shape of
-/// this: an auto-row teardown already shifts every survivor's reported `x` with no re-apply; the
-/// packing widens the class to joins under `Manual`). It is not fixable here: the honest fix is for
-/// the registry to re-apply the WHOLE group's arrangement on any membership change under
-/// `LayoutMode::Manual`, the way `windows/manager.rs`'s `arrange_slots` already does, at which point
-/// this function is right in every ordering. Seeding the cursor from preceding pins only would buy
-/// incremental stability back by reintroducing the collision this exists to prevent — the wrong
-/// trade, since the common ordering (the pin exists, an unpinned client joins) does reach the apply
-/// path and is placed correctly.
+/// The cursor is seeded from every pin, so an already-placed unpinned `x`
+/// shifts when a pinned sibling arrives later in acquire order. Nothing here
+/// re-applies: `registry::position_for_new` takes only `.last()` and moves the
+/// new display. The registry must re-apply the whole group on a Manual
+/// membership change (`windows/manager.rs` `arrange_slots` already does).
+/// Seeding from preceding pins only restores incremental stability by
+/// bringing the overlap back — the wrong trade.
 fn arrange_manual(members: &[Member], layout: &Layout) -> Vec<Placement> {
     let pins: Vec<Option<Placement>> = members.iter().map(|m| pin_of(m, layout)).collect();
-    // Start the unpinned row at the desktop origin, or past the rightmost pinned edge when there is
-    // one. `max(0)` on the width keeps a bogus negative from pulling the cursor back over a pin.
+    // `max(0)` so a negative width cannot pull the cursor back over a pin.
     let mut cursor = pins
         .iter()
         .zip(members)
@@ -160,7 +124,7 @@ mod tests {
     #[test]
     fn auto_row_accumulates_widths_top_aligned() {
         let members = [m(Some(1), 2560), m(Some(2), 1920), m(None, 1280)];
-        let out = arrange(&members, &Layout::default()); // default = AutoRow
+        let out = arrange(&members, &Layout::default());
         assert_eq!(
             out,
             vec![
@@ -174,7 +138,7 @@ mod tests {
     #[test]
     fn manual_honors_pins_by_identity_slot() {
         let members = [m(Some(1), 2560), m(Some(7), 1920)];
-        // Client 7 arranged to the LEFT of client 1 (crossing order reversed vs auto-row).
+        // Crossing order: 7 is left of 1, the reverse of auto-row.
         let layout = manual(&[("1", 1920, 0), ("7", 0, 0)]);
         let out = arrange(&members, &layout);
         assert_eq!(out[0], Placement { x: 1920, y: 0 });
@@ -184,13 +148,11 @@ mod tests {
     #[test]
     fn manual_unpinned_and_slotless_pack_clear_of_the_pins() {
         let members = [m(Some(1), 2560), m(Some(9), 1920), m(None, 1280)];
-        // Only slot 1 is pinned; slot 9 has no stored pin; the third has no slot at all.
         let layout = manual(&[("1", 100, 50)]);
         let out = arrange(&members, &layout);
         assert_eq!(out[0], Placement { x: 100, y: 50 }, "pinned");
-        // The pin occupies [100, 2660); the unpinned members row out from its right edge in acquire
-        // order, NOT from the pin-blind prefix sum (which would have put the first one at 2560 —
-        // inside the pin).
+        // Pin occupies [100, 2660). Pin-blind prefix-sum would put slot 9 at
+        // 2560, inside the pin.
         assert_eq!(
             out[1],
             Placement { x: 2660, y: 0 },
@@ -201,8 +163,6 @@ mod tests {
 
     #[test]
     fn manual_with_no_pins_at_all_is_plain_auto_row() {
-        // The fallback must not drift from auto-row when the manual table happens to be empty (the
-        // state a group is in the instant `manual` is selected and nothing has been arranged yet).
         let members = [m(Some(1), 2560), m(Some(2), 1920), m(None, 1280)];
         let out = arrange(&members, &manual(&[]));
         assert_eq!(out, arrange(&members, &Layout::default()));
@@ -210,8 +170,7 @@ mod tests {
 
     #[test]
     fn a_manual_pin_that_would_collide_with_an_auto_row_sibling_is_packed_clear() {
-        // The exact geometry §13 11.8 names: a pin sitting where the pin-blind auto-row would have
-        // put the unpinned sibling. Two displays on one origin = two desktops on the same pixels.
+        // Pin sits where pin-blind auto-row would place the sibling.
         let members = [m(Some(1), 2560), m(Some(9), 1920)];
         let layout = manual(&[("1", 2560, 0)]);
         let out = arrange(&members, &layout);
@@ -229,8 +188,8 @@ mod tests {
 
     #[test]
     fn a_pin_left_of_the_origin_still_leaves_the_unpinned_row_at_zero() {
-        // A negative pin is legal (KWin's global space extends left of 0). Its right edge is what
-        // matters: at -3000+2560 = -440 it constrains nothing, so the row still starts at the origin.
+        // KWin global space extends left of 0. Right edge -3000+2560 = -440 is
+        // still left of origin, so the unpinned row stays at 0.
         let members = [m(Some(1), 2560), m(Some(9), 1920)];
         let out = arrange(&members, &manual(&[("1", -3000, 0)]));
         assert_eq!(out[0], Placement { x: -3000, y: 0 });
@@ -239,8 +198,6 @@ mod tests {
 
     #[test]
     fn absurd_widths_saturate_instead_of_panicking() {
-        // Widths originate in the client-requested mode; a hostile or corrupt one must produce an
-        // absurd coordinate, not an overflow panic inside the `/display/state` readout.
         let members = [m(Some(1), i32::MAX), m(Some(2), i32::MAX), m(None, 4096)];
         let out = arrange(&members, &Layout::default());
         assert_eq!(out[2], Placement { x: i32::MAX, y: 0 });
@@ -248,15 +205,12 @@ mod tests {
         assert_eq!(out[2], Placement { x: i32::MAX, y: 0 });
     }
 
-    /// Property (deterministic seeded walk): across arbitrary member widths, slot assignments and pin
-    /// tables, **no unpinned member may share desktop space with any sibling**. Overlap between two
-    /// *pins* is excluded from the invariant — that is the operator's own arrangement, faithfully
-    /// reproduced. Members carry no height, so "share space" is decided on the x interval alone,
-    /// which is the strictest reading available here.
+    /// No unpinned member may share an x-interval with any sibling. Overlap
+    /// between two pins is excluded — that is the operator's arrangement.
+    /// No height, so "share space" is x-only.
     #[test]
     fn no_unpinned_member_overlaps_a_sibling_under_any_layout() {
-        // Tiny deterministic LCG (Numerical Recipes) — reproducible, no dependency. Same shape as
-        // `lifecycle`'s property walk.
+        // Numerical Recipes LCG — reproducible, no crate.
         let mut rng: u64 = 0x0bad_f00d_dead_beef;
         let mut next = || {
             rng = rng
@@ -269,8 +223,7 @@ mod tests {
             let count = (next() % 6) as usize;
             let members: Vec<Member> = (0..count)
                 .map(|_| {
-                    // A slot only sometimes, and from a small pool so collisions with the pin table
-                    // are frequent; widths include 0 and the odd negative.
+                    // Small slot pool so pin-table collisions are frequent.
                     let slot = match next() % 4 {
                         0 => None,
                         _ => Some(next() % 6 + 1),
@@ -312,7 +265,7 @@ mod tests {
                         };
                         let (ai, bi) = span(i);
                         let (aj, bj) = span(j);
-                        // Empty spans (a zero/negative width) can't collide with anything.
+                        // Zero/negative width is an empty span; it cannot overlap.
                         if ai >= bi || aj >= bj {
                             continue;
                         }

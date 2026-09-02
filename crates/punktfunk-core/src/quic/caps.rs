@@ -1,289 +1,177 @@
-//! Client/host video capability bits, codec + chroma negotiation, and colour signalling.
+//! Handshake capability bits, codec pick, chroma idc, and CICP colour on Hello/Welcome.
+//!
+//! Each `*_CAP_*` constant is one bit of [`Hello::video_caps`], [`Hello::client_caps`],
+//! [`Welcome::host_caps`], or [`Welcome::host_caps2`]. Zero (or a missing trailing byte)
+//! is an older peer. Most features are capable-and-agreed: the client asks, the host
+//! answers, and only then does the wire shape change.
+//!
+//! [`resolve_codec`] intersects advertised codecs with what the host can emit; PyroWave
+//! is opt-in via [`Hello::preferred_codec`], not the default ladder. [`ColorInfo`] is the
+//! static CICP; ST.2086 mastering metadata rides the HDR meta datagram instead.
+//!
+//! `VIDEO_CAP_MULTI_SLICE` is the last `video_caps` bit; `HOST_CAP_AUDIO_HIRES` is the
+//! last `host_caps` bit — further host caps already use `host_caps2`. Evidence: `design/`.
 
-/// [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) stream. Alone — without
-/// [`VIDEO_CAP_HDR`] — it is the **10-bit SDR** ask (0.32, the client's "10-bit SDR" setting):
-/// the host encodes the SDR desktop at Main10 precision under a BT.709 SDR VUI, and neither
-/// display's colour state is touched. Every pre-0.32 client sets the two bits together.
+/// [`Hello::video_caps`]: client can decode Main10. Without [`VIDEO_CAP_HDR`] this is
+/// 10-bit SDR — Main10 under a BT.709 SDR VUI; neither display's colour state is touched.
 pub const VIDEO_CAP_10BIT: u8 = 0x01;
-/// [`Hello::video_caps`] bit: the client can present BT.2020 PQ HDR10 (implies 10-bit — set
-/// together with [`VIDEO_CAP_10BIT`]).
+/// [`Hello::video_caps`]: client can present BT.2020 PQ HDR10. Implies 10-bit; set with
+/// [`VIDEO_CAP_10BIT`].
 pub const VIDEO_CAP_HDR: u8 = 0x02;
-/// [`Hello::video_caps`] bit: the client can decode a full-chroma **4:4:4** HEVC stream (HEVC
-/// Range Extensions / Rec.ITU-T H.265 `chroma_format_idc = 3`) AND its user turned 4:4:4 on (a
-/// client-side setting, default OFF — the per-session policy switch). The host emits 4:4:4 ONLY
-/// when this bit is set, the host allows it (`PUNKTFUNK_444`, default on), the codec is HEVC,
-/// **and** the GPU/driver actually supports a 4:4:4 encode (probed) — otherwise the session stays
-/// 4:2:0 and [`Welcome::chroma_format`] reflects the real resolved value. Independent of
-/// 10-bit/HDR (4:4:4 is a chroma decision, bit depth is a depth decision; the two may combine
-/// where the hardware allows).
+/// [`Hello::video_caps`]: client can decode HEVC 4:4:4 and asked for it. The host emits
+/// 4:4:4 only when this bit is set, HEVC won, the operator allows it, and the GPU can
+/// encode 4:4:4; otherwise the session stays 4:2:0 and [`Welcome::chroma_format`] is the
+/// real value. Independent of 10-bit / HDR.
 pub const VIDEO_CAP_444: u8 = 0x04;
-/// [`Hello::video_caps`] bit: the client consumes per-AU host-timing datagrams
-/// ([`HOST_TIMING_MAGIC`], 0xCF) — the host's capture→send duration per frame, letting the client
-/// split its `host+network` latency stage into `host` and `network`
-/// (design/stats-unification.md Phase 2). The host emits 0xCF ONLY when this bit is set (an older
-/// host ignores it and simply never sends any); a client that doesn't set it keeps the combined
-/// stage. Purely observability — never changes what the host encodes.
+/// [`Hello::video_caps`]: client consumes per-AU host-timing datagrams (`HOST_TIMING_MAGIC`,
+/// 0xCF). The host emits them only when this bit is set. Observability only.
 pub const VIDEO_CAP_HOST_TIMING: u8 = 0x08;
-/// [`Hello::video_caps`] bit: the client's reassembler keeps **speed-test probe filler in its own
-/// frame-index space** (a second reassembly window keyed on the [`crate::packet::FLAG_PROBE`]
-/// user-flag), so probe bursts no longer consume video `frame_index`es. Without this, a mid-session
-/// speed test burns thousands of video indexes that are invisible to every client-side gap detector
-/// (probe frames are filtered before the pump sees them) — the first real AU afterwards reads as a
-/// phantom multi-thousand-frame loss (spurious freeze + a nonsense RFI). It also lets the host's
-/// encode loop own the video numbering outright (the wire-index contract
-/// [`crate::packet::Packetizer::packetize_each`] documents), which reference-frame invalidation
-/// depends on. The host runs mid-session probe bursts ONLY against clients that set this bit — an
-/// older client gets a declined (zeroed) [`ProbeResult`] instead of a measurement its single-window
-/// reassembler would silently drop as stale.
+/// [`Hello::video_caps`]: the reassembler keeps speed-test probe filler in its own
+/// frame-index space ([`crate::packet::FLAG_PROBE`]). Without this, a mid-session probe
+/// burns video indexes the pump never sees, so the next real AU looks like a multi-thousand
+/// frame loss. The host probes only clients that set this bit; others get a zeroed
+/// [`ProbeResult`].
 pub const VIDEO_CAP_PROBE_SEQ: u8 = 0x10;
-/// [`Hello::video_caps`] bit: the client's reassembler accepts **streamed access units**
-/// (design/nvenc-subframe-slice-output.md Phase 2): the host may ship an AU's early FEC blocks
-/// before the AU's total size exists — while the tail of the frame is still encoding — so the
-/// AU's last packet leaves the host sooner (latency plan §7 LN1). Non-final blocks ride
-/// SENTINEL headers (`block_count == 0` — a value no legacy sender emits — with
-/// `frame_bytes == 0` and exactly `max_data_per_block` data shards, so the shard-offset
-/// formula needs no total); the FINAL block's headers carry the real
-/// `frame_bytes`/`block_count` (+ `FLAG_EOF`), which retro-validate the whole frame's geometry
-/// — a mismatch drops the frame wholesale. The host streams ONLY to clients advertising this
-/// bit; every other client gets today's whole-AU path (chunks concatenated before sealing), so
-/// the fallback is zero-risk.
+/// [`Hello::video_caps`]: the reassembler accepts streamed access units. Non-final blocks
+/// use SENTINEL headers (`block_count == 0`, `frame_bytes == 0`, exactly
+/// `max_data_per_block` data shards); the FINAL block carries real `frame_bytes` /
+/// `block_count` and `FLAG_EOF`. A geometry mismatch drops the frame. Hosts stream only
+/// to clients that set this bit; others get a whole-AU seal.
 pub const VIDEO_CAP_STREAMED_AU: u8 = 0x20;
-/// [`Hello::video_caps`] bit: the client can open **ChaCha20-Poly1305**-sealed session datagrams
-/// AND requests them — set by clients without hardware AES (the soft-AES armv7 targets, e.g.
-/// webOS TVs), where GCM's software AES + GHASH caps decrypt at ~100 Mbps while ChaCha's ARX
-/// construction runs 4–7× faster in portable code (design/chacha20-session-cipher.md).
-/// Support-plus-request in one bit mirrors [`VIDEO_CAP_444`]'s "capable AND turned on"
-/// precedent. The host grants it only when its `PUNKTFUNK_CHACHA20` kill-switch (default on)
-/// allows, answering with [`Welcome::cipher`] `= 1` + the 32-byte [`Welcome::key_chacha`];
-/// toward every other client the Welcome stays byte-identical AES-128-GCM. Purely a
-/// performance choice — both AEADs are full-strength, and Hello/Welcome ride the pinned-TLS
-/// control channel, so there is no downgrade surface.
+/// [`Hello::video_caps`]: client can open ChaCha20-Poly1305 session datagrams and wants
+/// them (software-AES targets). The host grants only when `PUNKTFUNK_CHACHA20` allows,
+/// answering [`Welcome::cipher`] `= 1` plus [`Welcome::key_chacha`]. Other clients keep
+/// the AES-128-GCM Welcome byte-identical.
 pub const VIDEO_CAP_CHACHA20: u8 = 0x40;
-/// [`Hello::video_caps`] bit: the client's decoder accepts **multi-slice access units** — H.264/
-/// HEVC frames carrying several slice NALs (latency plan §7 LN1: the encoder splits frames so
-/// sub-frame readback can ship early slices while the tail encodes). Decoder-level, so the
-/// EMBEDDER sets it from what its decode stack actually handles: every desktop decode stack
-/// (Vulkan Video, D3D11VA, VAAPI, openh264/rav1d) is fine, but mobile/TV MediaCodec is per-SoC
-/// — Amlogic HEVC decoders (Chromecast with Google TV, Fire TV) wedge the whole DEVICE on
-/// multi-slice frames (the 0.17.0 field regression: the 4-slice Linux default froze streams on
-/// first frame and watchdog-rebooted the CCwGTV), which is exactly why Moonlight requests 1
-/// slice per frame for every hardware decoder. The host defaults to >1 slice ONLY toward a
-/// client that sets this bit (`PUNKTFUNK_NVENC_SLICES` stays the explicit operator override in
-/// both directions); every other client gets single-slice frames — the pre-0.17 wire shape.
-/// NOTE: this takes the video_caps byte's last free bit — the next video cap needs a second
-/// byte (ABI bump).
+/// [`Hello::video_caps`]: the decoder accepts multi-slice AUs. The embedder sets this from
+/// the decode stack — some mobile/TV SoCs wedge on multi-slice HEVC — not from a host
+/// default. The host uses >1 slice only toward this bit (`PUNKTFUNK_NVENC_SLICES` still
+/// overrides). Last free `video_caps` bit; the next cap needs a second byte (ABI bump).
 pub const VIDEO_CAP_MULTI_SLICE: u8 = 0x80;
 
-/// [`Welcome::host_caps`] bit: the host applies [`InputKind::GamepadState`]
-/// (crate::input::InputKind::GamepadState) snapshot events — full per-pad state with a reorder
-/// sequence number. A capable client then sends gamepad state as snapshots (idempotent on the
-/// lossy datagram plane, periodically refreshed) instead of the fragile per-transition
-/// button/axis events; toward a host that doesn't set the bit it keeps the legacy events.
+/// [`Welcome::host_caps`]: host applies
+/// [`InputKind::GamepadState`](crate::input::InputKind::GamepadState) snapshots. A capable
+/// client then sends full per-pad state (idempotent on the lossy datagram plane) instead
+/// of per-transition button/axis events.
 pub const HOST_CAP_GAMEPAD_STATE: u8 = 0x01;
 
-/// [`Welcome::host_caps`] bit: the host has a shared-clipboard service (a working OS backend)
-/// **and** its operator policy does not hard-disable it, so the client may offer the clipboard
-/// toggle. Absent (an older host, or `PUNKTFUNK_CLIPBOARD` off) ⇒ the client greys the toggle
-/// out. Purely additive: nothing clipboard-related happens until a [`ClipControl`]`{ enabled:
-/// true }` crosses (see `design/clipboard-and-file-transfer.md` §3.1). Packs into the existing
-/// trailing `host_caps` byte — no wire-layout change.
+/// [`Welcome::host_caps`]: host has a clipboard backend and the operator did not disable
+/// it, so the client may offer the toggle. Nothing clipboard-related happens until a
+/// [`ClipControl`] `{ enabled: true }` crosses (`design/clipboard-and-file-transfer.md`).
 pub const HOST_CAP_CLIPBOARD: u8 = 0x02;
 
-/// [`Welcome::host_caps`] bit: the host's active inject backend can type **committed text**
-/// ([`InputKind::TextInput`](crate::input::InputKind::TextInput) — one Unicode scalar per event):
-/// Windows (`KEYEVENTF_UNICODE`) and Linux wlroots (dynamic Unicode keymap on a dedicated virtual
-/// keyboard); the KWin/libei/gamescope backends can only press layout keycodes, so those sessions
-/// don't set it. A capable client routes its IME's committed text (autocorrect, gesture typing,
-/// non-Latin scripts, emoji) through `TextInput` instead of lossy VK synthesis; absent the bit it
-/// keeps the VK fallback. Packs into the existing trailing `host_caps` byte — no wire-layout
-/// change; an older host ignores the unknown input tag anyway (input is lossy by design).
+/// [`Welcome::host_caps`]: the inject backend can type committed Unicode
+/// ([`InputKind::TextInput`](crate::input::InputKind::TextInput)). Windows and wlroots
+/// can; KWin / libei / gamescope only press layout keycodes and leave this clear. Absent
+/// the bit, the client keeps VK synthesis.
 pub const HOST_CAP_TEXT_INPUT: u8 = 0x04;
 
-/// [`Hello::client_caps`] bit: the client renders the host cursor LOCALLY
-/// (design/remote-desktop-sweep.md M2). It consumes [`CursorShape`](super::control::CursorShape)
-/// control messages (RGBA bitmap + hotspot, cached by serial) and per-frame
-/// [`CursorState`](super::datagram::CursorState) `0xD0` datagrams (position/visibility), and
-/// draws the pointer itself — so the host must STOP compositing the cursor into the video
-/// (`SessionPlan.cursor_blend = false`) or the user sees it twice. Active only when the host
-/// answers with [`HOST_CAP_CURSOR`] (capable-and-agreed, the 444/clipboard precedent); toward
-/// an older or incapable host nothing changes.
+/// [`Hello::client_caps`]: the client draws the host cursor locally from
+/// [`CursorShape`](super::control::CursorShape) and
+/// [`CursorState`](super::datagram::CursorState) `0xD0`. When the host answers
+/// [`HOST_CAP_CURSOR`], it must stop blending the cursor into the video
+/// (`SessionPlan.cursor_blend = false`) or the user sees it twice.
 pub const CLIENT_CAP_CURSOR: u8 = 0x01;
 
-/// `Hello.client_caps` bit: this client runs a vsync-aware presenter and will send
-/// [`PhaseReport`](super::control::PhaseReport)s (~1 Hz) so the host can phase-lock its
-/// capture/send tick to the client's display latch (design/phase-locked-capture.md). Without
-/// the bit the host never arms the phase controller; toward an older host the reports are
-/// simply ignored — no behavior change in either direction.
+/// [`Hello::client_caps`]: the presenter is vsync-aware and will send
+/// [`PhaseReport`](super::control::PhaseReport)s so the host can phase-lock capture
+/// (`design/phase-locked-capture.md`). Without the bit the host never arms the controller.
 pub const CLIENT_CAP_PHASE_LOCK: u8 = 0x02;
 
-/// `Hello.client_caps` bit: this client can decode the redundant desktop-audio plane
-/// ([`AUDIO_RED_MAGIC`](super::datagram::AUDIO_RED_MAGIC), `0xD2`), where every datagram also
-/// carries a copy of the previous frame so a single lost packet is reconstructed instead of
-/// papered over with packet-loss concealment.
-///
-/// Active only when the host answers with [`HOST_CAP_AUDIO_RED`] (capable-and-agreed, the
-/// cursor/clipboard precedent). Toward an older host, or a host that declines because the link is
-/// clean, the client keeps receiving the plain `0xC9` plane — so a client may always set this bit.
-/// `0x04` — `0x01`/`0x02` are cursor / phase-lock.
+/// [`Hello::client_caps`]: the client can decode the redundant desktop-audio plane
+/// ([`AUDIO_RED_MAGIC`](super::datagram::AUDIO_RED_MAGIC), `0xD2`). Active only when the
+/// host answers [`HOST_CAP_AUDIO_RED`]. A client may always set this bit: a host that
+/// declines keeps the plain `0xC9` plane.
 pub const CLIENT_CAP_AUDIO_RED: u8 = 0x04;
-/// [`Hello::client_caps`] bit: the client understands the pad-audio plane
-/// ([`PAD_AUDIO_MAGIC`](super::datagram::PAD_AUDIO_MAGIC), `0xD1`) — per-gamepad DualSense
-/// voice-coil haptics + speaker Opus frames, plus the [`HidOutput::AudioCtl`]
-/// (super::datagram::HidOutput) routing/volume events. Active only when the host answers with
-/// [`HOST_CAP_PAD_AUDIO`] AND the pad's arrival declared a renderer for the kind
-/// ([`crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/`_SPEAKER`) — the capable-and-agreed
-/// precedent, per pad; toward an older or incapable host nothing changes. `0x08` — `0x01` is [`CLIENT_CAP_CURSOR`],
-/// `0x02` is [`CLIENT_CAP_PHASE_LOCK`], `0x04` is [`CLIENT_CAP_AUDIO_RED`].
+/// [`Hello::client_caps`]: the client understands the pad-audio plane
+/// ([`PAD_AUDIO_MAGIC`](super::datagram::PAD_AUDIO_MAGIC), `0xD1`) and
+/// [`HidOutput::AudioCtl`](super::datagram::HidOutput). Active only when the host answers
+/// [`HOST_CAP_PAD_AUDIO`] and the pad's arrival declared a renderer
+/// ([`crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`] / `_SPEAKER`).
 pub const CLIENT_CAP_PAD_AUDIO: u8 = 0x08;
 
-/// [`Welcome::host_caps`] bit: the host CAN forward the cursor out-of-band (it captures cursor
-/// metadata separately from the frame — the Linux portal `SPA_META_Cursor` path; NOT gamescope,
-/// whose capture carries no cursor, and NOT Windows yet, where DWM composites into the IDD
-/// frame). Set only when the client asked via [`CLIENT_CAP_CURSOR`]; when both bits agree the
-/// host stops blending and ships [`CursorShape`](super::control::CursorShape) +
-/// [`CursorState`](super::datagram::CursorState) instead. `0x08` — `0x04` is
-/// [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
+/// [`Welcome::host_caps`]: the host can forward the cursor out-of-band (Linux portal
+/// `SPA_META_Cursor`). Not gamescope (capture has no cursor) and not Windows (DWM
+/// composites into the IDD frame). Set only when the client asked via [`CLIENT_CAP_CURSOR`].
 pub const HOST_CAP_CURSOR: u8 = 0x08;
 
-/// [`Welcome::host_caps`] bit: the host injects full-fidelity stylus input — it routes
-/// [`PenBatch`](super::pen::PenBatch) `0xCC/0x05` datagrams (pressure, tilt, azimuth, barrel
-/// roll, hover, eraser, barrel buttons) through the [`PenTracker`](super::pen::PenTracker)
-/// into a virtual tablet device (design/pen-tablet-input.md). A capable client (Apple Pencil,
-/// Android stylus) then splits pen contacts out of its finger/touch path and sends pen
-/// batches; absent the bit it keeps folding the pen into touch/pointer like today, and
-/// [`NativeClient::send_pen`](crate::client::NativeClient::send_pen) refuses to send. The
-/// wire ships ahead of the backend (P0): no host sets this bit until the P1 injector lands —
-/// which is exactly why the gate exists. `0x10` — `0x08` is [`HOST_CAP_CURSOR`], `0x04` is
-/// [`HOST_CAP_TEXT_INPUT`], `0x01`/`0x02` are gamepad-state / clipboard.
+/// [`Welcome::host_caps`]: the host injects [`PenBatch`](super::pen::PenBatch) `0xCC/0x05`
+/// into a virtual tablet (`design/pen-tablet-input.md`). Absent the bit, the client folds
+/// pen into touch and [`NativeClient::send_pen`](crate::client::NativeClient::send_pen)
+/// refuses.
 pub const HOST_CAP_PEN: u8 = 0x10;
 
-/// [`Welcome::host_caps`] bit: the host is sending the REDUNDANT desktop-audio plane
-/// ([`AUDIO_RED_MAGIC`](super::datagram::AUDIO_RED_MAGIC), `0xD2`) instead of plain `0xC9` — each
-/// datagram carries its own frame plus a copy of the previous one.
-///
-/// Set only when the client asked via [`CLIENT_CAP_AUDIO_RED`]. It is a statement about the WIRE,
-/// not a negotiation the client can decline: with the bit set the client must decode `0xD2`, and
-/// without it `0xC9`. The host may also drop back to `0xC9` mid-session (the redundancy is
-/// loss-gated — a clean LAN shouldn't pay for it), which is why clients decode BOTH tags
-/// unconditionally and treat this bit as "expect redundancy", not "only redundancy".
-/// `0x20` — `0x10` is [`HOST_CAP_PEN`], `0x08` is [`HOST_CAP_CURSOR`].
+/// [`Welcome::host_caps`]: the wire is the redundant desktop-audio plane
+/// ([`AUDIO_RED_MAGIC`](super::datagram::AUDIO_RED_MAGIC), `0xD2`), not plain `0xC9`. Set
+/// only when the client asked. The host may drop back to `0xC9` mid-session (loss-gated),
+/// so clients decode both tags and treat this bit as "expect redundancy", not "only
+/// redundancy".
 pub const HOST_CAP_AUDIO_RED: u8 = 0x20;
-/// [`Welcome::host_caps`] bit: the host can capture pad audio — its virtual DualSense exposes
-/// the pad's audio endpoints (voice-coil haptics + speaker), so a game's per-pad audio can be
-/// captured and shipped on the [`PAD_AUDIO_MAGIC`](super::datagram::PAD_AUDIO_MAGIC) plane.
-/// Set only when the client asked via [`CLIENT_CAP_PAD_AUDIO`]; when both bits agree, a
-/// capable client marks its pads' render capabilities on their arrivals
-/// ([`crate::input::ARRIVAL_FLAG_PAD_AUDIO_HAPTICS`]/`_SPEAKER`) and the host emits `0xD1`
-/// toward exactly those pads. `0x40` — `0x20` is [`HOST_CAP_AUDIO_RED`], `0x10` is
-/// [`HOST_CAP_PEN`], `0x08` is [`HOST_CAP_CURSOR`], `0x04` is [`HOST_CAP_TEXT_INPUT`],
-/// `0x01`/`0x02` are gamepad-state / clipboard.
+/// [`Welcome::host_caps`]: the host can capture pad audio onto
+/// [`PAD_AUDIO_MAGIC`](super::datagram::PAD_AUDIO_MAGIC) `0xD1`. Set only when the client
+/// asked via [`CLIENT_CAP_PAD_AUDIO`]. When both bits agree, the host emits `0xD1` toward
+/// pads whose arrivals declared a renderer.
 pub const HOST_CAP_PAD_AUDIO: u8 = 0x40;
 
-/// [`Hello::client_caps`] bit: the client can play the LOSSLESS audio plane
-/// ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`) at the rate and depth it asked
-/// for in [`Hello::audio_rate_hz`](super::handshake::Hello::audio_rate_hz) /
-/// [`audio_bits`](super::handshake::Hello::audio_bits).
-///
-/// **Capable AND the user turned it on** — the [`VIDEO_CAP_444`] precedent, not a bare capability.
-/// This plane costs 1.5–4.6 Mbps against Opus's 256 kbps and is taken off the top of the link
-/// (audio rides datagrams outside the ABR loop, so ABR can neither see it nor reclaim it), so it
-/// must be asked for on both ends. A client that cannot open an output at the format it is
-/// requesting must not set this bit.
-///
-/// `0x10` — `0x08` is [`CLIENT_CAP_PAD_AUDIO`], `0x04` is [`CLIENT_CAP_AUDIO_RED`], `0x02` is
-/// [`CLIENT_CAP_PHASE_LOCK`], `0x01` is [`CLIENT_CAP_CURSOR`].
+/// [`Hello::client_caps`]: the client can play the lossless audio plane
+/// ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`) at the rate/depth it
+/// asked in Hello, **and** the user turned it on. This plane costs 1.5–4.6 Mbps against
+/// Opus's 256 kbps and sits outside the ABR loop, so both ends must ask. A client that
+/// cannot open that output format must not set this bit.
 pub const CLIENT_CAP_AUDIO_HIRES: u8 = 0x10;
 
-/// [`Hello::client_caps`] bit: this session asks the host to leave the host's OWN audio devices
-/// alone — capture whatever the operator's default playback device already is, instead of
-/// re-routing the desktop mix onto a silent (or preferred) endpoint. A loopback/monitor tap
-/// doesn't silence the device it taps, so the host keeps playing (the headphones plugged into
-/// the host PC stay live) and the client hears the same audio — Moonlight's "Mute host PC
-/// speakers" box, unchecked, as a per-session client choice.
-///
-/// The user's-setting precedent ([`CLIENT_CAP_AUDIO_HIRES`]), and REQUEST-only — no `HOST_CAP`
-/// echo: an older host ignores the bit and re-routes as it always did, which degrades to
-/// "audio still works, host went quiet", not a broken session. Per-session best-effort on the
-/// host: with several concurrent sessions the wiring is host-global, so any live session that
-/// asked wins for all of them until it ends. Composes with the host-wide
-/// `PUNKTFUNK_AUDIO_OUTPUT_MODE=follow_default`, which is this behaviour for every session.
-/// `0x20` — `0x10` is [`CLIENT_CAP_AUDIO_HIRES`]; `0x40`/`0x80` remain free.
+/// [`Hello::client_caps`]: leave the host's own playback devices alone — tap the current
+/// default instead of re-routing the mix onto a silent endpoint. Request-only: no
+/// `HOST_CAP` echo; an older host ignores it and still re-routes. Concurrent sessions share
+/// host-global wiring, so any live session that asked wins until it ends.
 pub const CLIENT_CAP_KEEP_HOST_AUDIO: u8 = 0x20;
 
-/// [`Welcome::host_caps`] bit: the host resolved the session onto the lossless audio plane
-/// ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`). Like [`HOST_CAP_AUDIO_RED`]
-/// this is a statement about the WIRE rather than an offer: with the bit set the client decodes
-/// `0xD3` and MUST open its device from the resolved
+/// [`Welcome::host_caps`]: the session is on the lossless audio plane
+/// ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`). A wire statement, not
+/// an offer: the client must open from
 /// [`Welcome::audio_rate_hz`](super::handshake::Welcome::audio_rate_hz) /
 /// [`audio_bits`](super::handshake::Welcome::audio_bits) /
-/// [`audio_frame_us`](super::handshake::Welcome::audio_frame_us), never from what it asked for.
-///
-/// Unlike `0xD2`, the host does NOT drop back mid-session: the client's device is open at a fixed
-/// format, so a change would mean a re-open. The plane is resolved once, at handshake, by the
-/// five-condition gate in `design/hi-res-audio.md` §8.4, and every decline resolves to Opus
-/// 48 kHz with a logged reason.
-///
-/// ⚠ `0x80` is the **LAST free `host_caps` bit**. The next host capability needs a second byte
-/// and an ABI bump — the same wall [`VIDEO_CAP_MULTI_SLICE`] already hit on `video_caps`.
-/// `0x40` is [`HOST_CAP_PAD_AUDIO`], `0x20` is [`HOST_CAP_AUDIO_RED`], `0x10` is
-/// [`HOST_CAP_PEN`], `0x08` is [`HOST_CAP_CURSOR`], `0x04` is [`HOST_CAP_TEXT_INPUT`],
-/// `0x01`/`0x02` are gamepad-state / clipboard.
+/// [`audio_frame_us`](super::handshake::Welcome::audio_frame_us), never from what it asked.
+/// Unlike `0xD2`, the host does not drop back mid-session (the device is open at a fixed
+/// format). Last free `host_caps` bit; the next cap needs a second byte (already
+/// [`Welcome::host_caps2`]).
 pub const HOST_CAP_AUDIO_HIRES: u8 = 0x80;
 
-/// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2) bit — the second capability byte
-/// the `0x80` wall above predicted, delivered as a trailing Welcome field (absent → `0`, the
-/// same append discipline as every field since `compositor`; no ABI bump needed).
-///
-/// The host marks its idle-keepalive re-encodes with
-/// [`USER_FLAG_REPEAT`](crate::packet::USER_FLAG_REPEAT), so the client's ABR can tell an
-/// idle window from an active one (ABR overhaul RFC §4.1). The bit is what makes the flag's
-/// ABSENCE meaningful: against a host that advertises it, an unflagged AU is genuinely new
-/// content; against an older host the client must treat activity as unknown and keep the
-/// legacy window arithmetic.
+/// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): idle-keepalive re-encodes
+/// carry [`USER_FLAG_REPEAT`](crate::packet::USER_FLAG_REPEAT). Against a host that
+/// advertises this, an unflagged AU is new content; against an older host the client must
+/// treat activity as unknown.
 pub const HOST_CAP2_REPEAT_MARK: u8 = 0x01;
 
-/// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2) bit: the host's live injector puts
-/// wire touch contacts (`TouchDown` / `TouchMove` / `TouchUp`) on its desktop. Linux sets it on
-/// the libei, gamescope-EIS and KWin backends; the wlroots virtual-pointer backend has no touch
-/// protocol and drops every contact, and Windows below build 1809 cannot create a `PT_TOUCH`
-/// device. A client whose touch model is passthrough falls back to its trackpad model without the
-/// bit and says so — otherwise every contact vanishes with no error anywhere
-/// (design/touch-client-overlay.md §5.4). `0x02` — `0x01` is [`HOST_CAP2_REPEAT_MARK`].
+/// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the injector puts wire touch
+/// contacts on the desktop. Linux libei / gamescope-EIS / KWin set it; wlroots
+/// virtual-pointer has no touch protocol, and Windows below build 1809 cannot create
+/// `PT_TOUCH`. Without the bit a passthrough client falls back to trackpad — otherwise
+/// contacts vanish with no error (`design/touch-client-overlay.md`).
 pub const HOST_CAP2_TOUCH: u8 = 0x02;
 
-/// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
-/// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
-/// advertise this.
+/// [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
+/// that wants to stream from a GPU-less host must advertise this.
 pub const CODEC_H264: u8 = 0x01;
-/// [`Hello::video_codecs`] bit: the client can decode H.265 / HEVC — the default every existing
-/// build produces and decodes (a peer that omits [`Hello::video_codecs`] is treated as HEVC-only).
+/// [`Hello::video_codecs`]: H.265 / HEVC. A peer that omits [`Hello::video_codecs`] is
+/// treated as HEVC-only.
 pub const CODEC_HEVC: u8 = 0x02;
-/// [`Hello::video_codecs`] bit: the client can decode AV1.
 pub const CODEC_AV1: u8 = 0x04;
-/// [`Hello::video_codecs`] bit: the client can decode **PyroWave** — the opt-in wired-LAN
-/// intra-only wavelet codec (design/pyrowave-codec-plan.md; 100–400 Mbps class, 8-bit SDR,
-/// every frame independently decodable). Deliberately **absent from [`resolve_codec`]'s
-/// precedence ladder**: it is selected only when the client also names it
-/// [`Hello::preferred_codec`] (or the host operator forces the advertisement mask) — a codec
-/// that needs a wired-LAN bitrate must never win a negotiation just because both ends support
-/// it. The bit means "PyroWave bitstream as of the punktfunk-vendored pin"
-/// (`crates/pyrowave-sys/vendor/pyrowave/PUNKTFUNK-VENDOR.txt`): upstream has no bitstream
-/// version field, so a vendored bump that changes the bitstream bumps the punktfunk protocol
-/// version instead (plan §4.2).
+/// [`Hello::video_codecs`]: PyroWave (opt-in wired-LAN intra-only wavelet,
+/// `design/pyrowave-codec-plan.md`). Deliberately absent from [`resolve_codec`]'s ladder:
+/// selected only when the client also names it [`Hello::preferred_codec`] (or the operator
+/// forces the mask). The bit means the bitstream of the vendored pin
+/// (`crates/pyrowave-sys/vendor/pyrowave/PUNKTFUNK-VENDOR.txt`); upstream has no version
+/// field, so a bitstream-changing vendor bump bumps the punktfunk protocol instead.
 pub const CODEC_PYROWAVE: u8 = 0x08;
 
-/// Resolve which single codec the host will emit, from the client's advertised [`Hello::video_codecs`]
-/// bitfield (`0` = an older client, treated as HEVC-only) intersected with what the host's chosen
-/// encoder can produce (`host_capable`, also a bitfield). `preferred` is the client's soft preference
-/// ([`Hello::preferred_codec`], `0` = none): when it's in the shared set it wins; otherwise the tie is
-/// broken by **HEVC > AV1 > H.264** (HEVC is the established, best-tested path; H.264 is the
-/// compatibility / software floor). [`CODEC_PYROWAVE`] is intentionally NOT in that ladder — it can
-/// only be returned via the `preferred` path (plan §3: opt-in, pinned, honest). Returns the
-/// single-bit codec value, or `None` when client and host share nothing the ladder may pick — the
-/// caller then refuses the session with a clear error rather than emitting a stream the client
-/// can't decode.
+/// Pick the one codec the host will emit: client's [`Hello::video_codecs`] (`0` = older
+/// client, HEVC-only) intersected with `host_capable`. `preferred` (`0` = none) wins when
+/// it is in the shared set; else HEVC > AV1 > H.264. [`CODEC_PYROWAVE`] is not on that
+/// ladder — only the preferred path can return it. `None` when nothing the ladder may pick
+/// is shared; the caller refuses the session rather than emit an undecodable stream.
 pub fn resolve_codec(client_codecs: u8, host_capable: u8, preferred: u8) -> Option<u8> {
-    // An older client (no codec byte) decodes HEVC — the only codec every pre-negotiation build sent.
+    // `0` is a missing codec byte: every pre-negotiation build decoded HEVC.
     let client = if client_codecs == 0 {
         CODEC_HEVC
     } else {
@@ -293,34 +181,27 @@ pub fn resolve_codec(client_codecs: u8, host_capable: u8, preferred: u8) -> Opti
     if shared == 0 {
         return None;
     }
-    // Honor the client's preference when the host can also emit it; else fall back to precedence.
-    // `preferred` is a single-bit field by contract but arrives as a raw wire byte — isolate ONE
-    // bit of the intersection instead of echoing the request, so a non-conformant multi-bit
-    // value can never escape as a codec id (downstream `from_wire` folds unknown values to HEVC,
-    // which may not even be in the shared set).
+    // `preferred` is a single-bit field by contract but a raw wire byte. Keep the lowest
+    // set bit of the intersection so a multi-bit value cannot escape as a codec id
+    // (`from_wire` would fold unknowns to HEVC, which may not even be shared).
     if preferred != 0 && shared & preferred != 0 {
         let want = shared & preferred;
         return Some(want & want.wrapping_neg());
     }
-    // Precedence: HEVC > AV1 > H.264.
     [CODEC_HEVC, CODEC_AV1, CODEC_H264]
         .into_iter()
         .find(|&c| shared & c != 0)
 }
 
-/// HEVC `chroma_format_idc` for 4:2:0 — what every pre-4:4:4 build produced and the back-compat
-/// default when a peer omits [`Welcome::chroma_format`].
+/// HEVC `chroma_format_idc` 4:2:0. Default when a peer omits [`Welcome::chroma_format`].
 pub const CHROMA_IDC_420: u8 = 1;
-/// HEVC `chroma_format_idc` for full-chroma 4:4:4 (Range Extensions).
+/// HEVC `chroma_format_idc` 4:4:4 (Range Extensions).
 pub const CHROMA_IDC_444: u8 = 3;
 
-/// Per-session colour signalling (CICP / ITU-T H.273 code points) the host resolved for the
-/// encoded video, carried on [`Welcome`]. A client configures its decoder/presenter from these
-/// instead of inferring them from the bitstream VUI. An older host omits the bytes on the wire →
-/// [`ColorInfo::SDR_BT709`] (the 8-bit BT.709 limited stream every pre-HDR build produced).
-///
-/// The *static* HDR mastering metadata (ST.2086 + content light level) is larger and can change
-/// mid-stream, so it rides the [`HDR_META_MAGIC`] datagram rather than this fixed struct.
+/// Per-session CICP (ITU-T H.273) the host resolved, on [`Welcome`]. Configure the
+/// decoder/presenter from these; do not infer from bitstream VUI. An older host omits the
+/// bytes → [`ColorInfo::SDR_BT709`]. ST.2086 + CLL can change mid-stream, so they ride
+/// [`HDR_META_MAGIC`] rather than this fixed struct.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColorInfo {
     /// CICP colour primaries: 1 = BT.709, 9 = BT.2020.
@@ -334,24 +215,16 @@ pub struct ColorInfo {
 }
 
 impl ColorInfo {
-    /// CICP colour-primaries code point: BT.709.
     pub const CP_BT709: u8 = 1;
-    /// CICP colour-primaries code point: BT.2020.
     pub const CP_BT2020: u8 = 9;
-    /// CICP transfer code point: BT.709.
     pub const TRC_BT709: u8 = 1;
-    /// CICP transfer code point: PQ (SMPTE ST.2084).
     pub const TRC_PQ: u8 = 16;
-    /// CICP transfer code point: HLG (ARIB STD-B67 / BT.2100).
     pub const TRC_HLG: u8 = 18;
-    /// CICP matrix code point: BT.709.
     pub const MC_BT709: u8 = 1;
-    /// CICP matrix code point: BT.2020 non-constant-luminance. (Never emit 10 / constant-luminance —
-    /// no client decodes it.)
+    /// CICP matrix 9: BT.2020 NCL. Never emit 10 (constant-luminance) — no client decodes it.
     pub const MC_BT2020_NCL: u8 = 9;
 
-    /// 8-bit BT.709 limited-range SDR — what every pre-HDR build produced, and the back-compat
-    /// default when a peer omits the colour bytes.
+    /// Default when a peer omits the colour bytes.
     pub const SDR_BT709: ColorInfo = ColorInfo {
         primaries: Self::CP_BT709,
         transfer: Self::TRC_BT709,
@@ -359,7 +232,6 @@ impl ColorInfo {
         full_range: 0,
     };
 
-    /// BT.2020 PQ (HDR10), limited range — what the Windows host's HEVC VUI emits.
     pub const HDR10_BT2020_PQ: ColorInfo = ColorInfo {
         primaries: Self::CP_BT2020,
         transfer: Self::TRC_PQ,
@@ -367,8 +239,7 @@ impl ColorInfo {
         full_range: 0,
     };
 
-    /// True when the transfer is an HDR curve (PQ or HLG): the stream needs HDR present, and
-    /// (for PQ) a [`HdrMeta`] datagram carries the mastering metadata.
+    /// PQ also needs a [`HdrMeta`] datagram; HLG does not.
     pub fn is_hdr(&self) -> bool {
         self.transfer == Self::TRC_PQ || self.transfer == Self::TRC_HLG
     }
@@ -389,7 +260,6 @@ mod tests {
 
     #[test]
     fn host_cap_clipboard_bit_is_distinct_and_survives_welcome() {
-        // The new cap packs into the existing trailing host_caps byte with no layout change.
         assert_ne!(HOST_CAP_CLIPBOARD, HOST_CAP_GAMEPAD_STATE);
         let mut w = Welcome {
             abi_version: 1,
@@ -435,7 +305,6 @@ mod tests {
             got.host_caps & HOST_CAP_GAMEPAD_STATE,
             HOST_CAP_GAMEPAD_STATE
         );
-        // Clipboard-off host: the bit is clear, gamepad bit still set.
         w.host_caps = HOST_CAP_GAMEPAD_STATE;
         assert_eq!(
             Welcome::decode(&w.encode()).unwrap().host_caps & HOST_CAP_CLIPBOARD,
@@ -445,8 +314,6 @@ mod tests {
 
     #[test]
     fn pad_audio_cap_bits_are_distinct() {
-        // The new pad-audio bits pack into the existing caps bytes without colliding with any
-        // taken bit (a collision would silently negotiate an unrelated feature).
         assert_eq!(
             CLIENT_CAP_PAD_AUDIO & (CLIENT_CAP_CURSOR | CLIENT_CAP_PHASE_LOCK),
             0
@@ -460,7 +327,6 @@ mod tests {
                     | HOST_CAP_PEN),
             0
         );
-        // Single-bit values (a multi-bit cap would OR neighbours in).
         assert_eq!(CLIENT_CAP_PAD_AUDIO.count_ones(), 1);
         assert_eq!(HOST_CAP_PAD_AUDIO.count_ones(), 1);
     }
@@ -481,14 +347,13 @@ mod tests {
 
     #[test]
     fn resolve_codec_canonicalizes_a_multi_bit_preference() {
-        // A non-conformant peer may stuff its capability MASK into `preferred` — the result
-        // must still be a single bit of the shared set, never the raw multi-bit echo (which
-        // folds to HEVC downstream and can select a codec the client can't decode).
+        // A peer may stuff its capability mask into `preferred`. The result must still be
+        // one bit of the shared set; echoing the mask folds to HEVC and can pick a codec
+        // the client cannot decode.
         assert_eq!(
             resolve_codec(CODEC_H264, CODEC_H264 | CODEC_AV1, CODEC_H264 | CODEC_AV1),
             Some(CODEC_H264)
         );
-        // Several shared preferred bits: still exactly one bit, and one of the preferred ones.
         let got = resolve_codec(
             CODEC_H264 | CODEC_HEVC | CODEC_AV1,
             CODEC_H264 | CODEC_HEVC | CODEC_AV1,

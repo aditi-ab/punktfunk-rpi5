@@ -1,24 +1,11 @@
-//! The brain layer: what a connect *is*, and the one implementation of how it runs
-//! (design/client-architecture-split.md §3).
+//! Connect plans and the orchestrator that runs them
+//! (`design/client-architecture-split.md`).
 //!
-//! Wake-then-connect exists three times today — GTK's `WakeConnect`/`wake_fallback`, the
-//! WinUI shell's `wake_and_connect`, Apple's `HostWaker` (whose comment in the Windows copy
-//! literally says "mirrors the Apple HostWaker") — and the deep-link and profile work would
-//! have made it five. This module is where that collapses: a [`ConnectPlan`] is built from a
-//! card click, a CLI verb or a URL (one constructor each, one type out), and the orchestrator
-//! runs it. Front-ends render; they don't decide.
+//! A [`ConnectPlan`] is built from a card click, a CLI verb, or a URL. Front-ends
+//! render; they do not decide when to prompt, how long to wait for a sleeping host,
+//! or what counts as a refusal. [`UiDelegate`] is the presentation surface.
 //!
-//! The split that keeps this honest is [`UiDelegate`]: prompts, progress and error surfaces
-//! stay in the front-end, because a GTK dialog, a WinUI page, a Skia console screen and a
-//! terminal prompt genuinely are different things — but *when* to prompt, *how long* to wait
-//! for a sleeping box and *what counts as a refusal* are decided here, once.
-//!
-//! Wake timings are Apple's `HostWaker` verbatim, because it is the implementation that got
-//! them right: a magic packet is fire-and-forget and a cold box takes 20–60 s to POST, boot
-//! and re-advertise — far longer than any dial will sit — so the packet is re-sent every 6 s
-//! (a single one gets missed, and some NICs only wake on a fresh packet after dropping into a
-//! deeper sleep state), presence is polled once a second, and the whole wait is bounded at
-//! 90 s, after which it PARKS for retry rather than erroring out from under the user.
+//! Wake cadence lives on [`WAKE_TIMEOUT_SECS`] / [`WAKE_RESEND_SECS`].
 
 use crate::deeplink::{DeepLink, HostResolution, Route};
 use crate::profiles::{ProfilesFile, Resolution, StreamProfile};
@@ -27,22 +14,19 @@ use serde::{Deserialize, Serialize};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-/// The host a plan dials, flattened out of whichever record or reference produced it.
+/// Dial target as values. A plan-holder has no [`KnownHost`] in hand.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HostTarget {
     pub name: String,
     pub addr: String,
     pub port: u16,
-    /// The pinned fingerprint. `None` = no pin, which the session binary refuses by design —
-    /// a plan without one may only exist after the front-end's trust ceremony.
+    /// `None` = no pin. The session refuses that; only a completed trust ceremony may produce one.
     pub fp_hex: Option<String>,
     pub mac: Vec<String>,
     pub id: Option<String>,
-    /// The host's management-API port (saved store or live advert) — where the library is
-    /// served, distinct from `port` (the native QUIC plane). Carried on the target for the same
-    /// reason as `mac`: a front-end holding a plan has no `KnownHost` in hand, and resolving to
-    /// [`crate::library::DEFAULT_MGMT_PORT`] there is what made a moved mgmt port work on the
-    /// LAN but not over a VPN. `None` = unknown, fall back to the constant.
+    /// Management-API port (library), distinct from `port` (QUIC). Carried like `mac`:
+    /// a plan-holder has no [`KnownHost`]. `None` = unknown, fall back to
+    /// [`crate::library::DEFAULT_MGMT_PORT`].
     pub mgmt_port: Option<u16>,
 }
 
@@ -60,44 +44,35 @@ impl From<&KnownHost> for HostTarget {
     }
 }
 
-/// A resolved intent: everything needed to start one session, with every policy question
-/// already answered. Built once, then executed — front-ends don't re-decide any of it.
+/// One session, every policy question already answered. Front-ends do not re-decide.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectPlan {
     pub host: HostTarget,
-    /// Library id for the host to launch on arrival.
     pub launch: Option<String>,
-    /// The settings profile this connect resolved with (display + the stats overlay).
     pub profile: Option<StreamProfile>,
-    /// The one-off profile reference to hand the session, if this connect overrides the host's
-    /// binding: `Some(id)` for "Connect with ▸ X", `Some("")` to force the defaults, `None` to
-    /// let the session resolve the host's own binding (the two paths call the same resolver,
-    /// so they cannot disagree).
+    /// One-off override handed to the session: `Some(id)` picks that profile,
+    /// `Some("")` forces the defaults, `None` lets the session resolve the host binding.
+    /// Both paths use the same resolver, so they cannot disagree.
     pub profile_override: Option<String>,
-    /// Effective settings — global defaults with the profile overlaid. What the front-end
-    /// reads for anything it needs to know up front (fullscreen, match-window…).
     pub settings: Settings,
-    /// Send a magic packet up front and fall back to wake-and-wait if the dial fails. Off for
-    /// hosts with no MAC, and when the user turned auto-wake off (VPN hosts look offline when
-    /// they aren't, and the wake+wait only adds delay).
+    /// Magic packet first; wake-and-wait if the dial fails. Off with no MAC, and when
+    /// auto-wake is off — VPN hosts look offline when they aren't.
     pub wake: bool,
-    /// Handshake budget override — the request-access flow passes ~185 s because the host
-    /// PARKS the connection until an operator approves.
+    /// Handshake budget override. Request-access passes ~185 s: the host PARKS until
+    /// an operator approves.
     pub connect_timeout_secs: Option<u64>,
-    /// The pin came from an advert rather than the store: persist it once the session reports
-    /// ready (ready proves the host really holds that identity).
+    /// Pin came from an advert, not the store. Persist only after `ready` — that proves
+    /// the host holds this identity.
     pub tofu: bool,
-    /// Share this machine's clipboard with this host — a trust decision about the HOST, so it
-    /// lives on the record rather than in a profile, and the spawner resolves it once here
-    /// instead of the renderer looking it up again.
+    /// Per-host trust decision, not a profile setting. Resolved here so the renderer
+    /// does not look it up again.
     pub clipboard: bool,
 }
 
 impl ConnectPlan {
-    /// The plain card-click plan: this host, its binding (or a one-off profile), its wake
-    /// policy. `one_off_profile` is the "Connect with ▸" pick — `Some("")` forces the global
-    /// defaults on a bound host, `None` honors the binding. Loads the stores; the pure form is
-    /// [`ConnectPlan::resolve`], which a front-end that already holds them should use.
+    /// Card-click plan. `one_off_profile`: `Some("")` forces the global defaults on a
+    /// bound host; `None` honors the binding. Loads stores; use [`ConnectPlan::resolve`]
+    /// when the caller already holds them.
     pub fn for_host(
         host: &KnownHost,
         launch: Option<&str>,
@@ -117,26 +92,18 @@ impl ConnectPlan {
         }
     }
 
-    /// The plan for a host a front-end carries in its OWN request type rather than as a stored
-    /// [`KnownHost`] (the GTK shell's `ConnectRequest`, a resolved link target). Settings,
-    /// profile and the clipboard decision are resolved here, through the same helpers
-    /// [`ConnectPlan::for_host`] uses; the caller then sets only what is genuinely its own
-    /// (`wake` when it runs its own wake fallback, `tofu`, `connect_timeout_secs`).
-    ///
-    /// It exists because hand-building the struct is a trap. [`spawn_session`] writes
-    /// `settings` into the child's `--resolved-spec`, and a session running from a spec reads
-    /// NO stores — so a `..Settings::default()` in a front-end does not fall back to the
-    /// user's settings, it silently streams at every default: the host's fallback bitrate, the
-    /// native resolution, `auto` codec, stereo audio. That shipped on the GTK shell (fixed
-    /// 2026-07-31) and presented as "my bitrate is stuck at 20 Mbps".
+    /// Plan for a host the front-end already holds as values, not a stored [`KnownHost`].
+    /// Resolves settings, profile, and clipboard through the same helpers as
+    /// [`ConnectPlan::for_host`]. Hand-building the struct is a trap: [`spawn_session`]
+    /// writes `settings` into `--resolved-spec`, and a spec-mode session reads no stores,
+    /// so `..Settings::default()` silently streams at every default.
     pub fn for_target(
         host: HostTarget,
         launch: Option<String>,
         one_off_profile: Option<String>,
     ) -> ConnectPlan {
         let known = KnownHosts::load();
-        // No record yet — a first connect straight off an advert. A default record says
-        // exactly the right thing: no profile binding, no clipboard opt-in.
+        // First connect off an advert: no record. Default = no binding, no clipboard.
         let fallback = KnownHost::default();
         let stored = known
             .find_by_addr(&host.addr, host.port)
@@ -148,22 +115,16 @@ impl ConnectPlan {
             &ProfilesFile::load(),
             &Settings::load(),
         );
-        // The CALLER's target wins over the stored record's: its fingerprint can be one the
-        // host just advertised and we haven't persisted (trust on first use), and its name/MAC
-        // come from the same discovery snapshot the card was drawn from — so `wake` has to be
-        // re-decided against that MAC rather than the record's.
+        // Caller's target wins: its fingerprint may be TOFU (not yet stored), and `wake`
+        // must follow this MAC, not the record's.
         plan.wake = plan.settings.auto_wake && !host.mac.is_empty();
         plan.host = host;
         plan
     }
 
-    /// The same plan, built from stores the caller already has — no disk, no clock, no
-    /// environment. This is the form the URL router uses: a front-end loads the three stores
-    /// once per event and every decision below is a pure function of them.
-    ///
-    /// Profile precedence is the design's, unchanged: the one-off pick, else the host's
-    /// binding, else nothing; `Some("")` forces the defaults; anything dangling resolves as
-    /// no profile rather than an error.
+    /// Same plan from stores the caller already holds — no disk, no clock, no
+    /// environment. One-off pick, else host binding, else nothing; `Some("")` forces
+    /// the defaults; a dangling reference is no profile, not an error.
     pub fn resolve(
         host: &KnownHost,
         launch: Option<&str>,
@@ -197,8 +158,7 @@ impl ConnectPlan {
         }
     }
 
-    /// This plan as a [`ResolvedSpec`] — what a first-party spawner hands the session so it
-    /// performs no store reads of its own.
+    /// Spec for a first-party spawner so the session performs no store reads.
     pub fn spec(&self, clipboard: bool) -> ResolvedSpec {
         ResolvedSpec {
             settings: self.settings.clone(),
@@ -207,8 +167,7 @@ impl ConnectPlan {
         }
     }
 
-    /// The session binary's argv for this plan — the one place the flags are assembled, so a
-    /// shell, the CLI and a URL launch cannot spawn subtly different sessions.
+    /// Session argv for this plan. Assembled once so shells cannot spawn different sessions.
     pub fn session_args(&self) -> Vec<String> {
         let mut args = vec![
             "--connect".into(),
@@ -222,8 +181,8 @@ impl ConnectPlan {
             args.push("--launch".into());
             args.push(launch.clone());
         }
-        // Only a one-off rides the flag: without it the session resolves the host's own
-        // binding through the same helper this plan used.
+        // Only a one-off rides the flag. Without it the session resolves the host binding
+        // through the same helper this plan used.
         if let Some(profile) = &self.profile_override {
             args.push("--profile".into());
             args.push(profile.clone());
@@ -235,70 +194,55 @@ impl ConnectPlan {
         if self.settings.fullscreen_on_stream {
             args.push("--fullscreen".into());
         }
-        // Deliberately NO `--window-pos` here. The Windows shell appends its own (its
-        // window's desktop coordinates place the session on the same monitor), but on
-        // Wayland neither GTK can read global window coordinates nor can SDL apply
-        // them — the compositor owns placement — so from the GTK/CLI spawners the flag
-        // would be a silent no-op everywhere it matters. X11 could carry it, but a
-        // Linux-only special case that most Linux sessions ignore isn't worth the drift.
+        // No `--window-pos`: Wayland compositors own placement, so the flag is a silent
+        // no-op from GTK/CLI. Windows appends its own. An X11-only special case is drift.
         args
     }
 }
 
-/// What a URL turned into. Everything a front-end must not decide for itself lives in this
-/// enum: an unknown host is a *prompt*, never a connect, and a route this build doesn't do is
-/// a notice, never a silent no-op.
+/// What a URL turned into. Unknown host = prompt, never connect; unimplemented
+/// route = notice, never a silent no-op.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlanOutcome {
     Connect(Box<ConnectPlan>),
-    /// The same plan, for a link that named the host by something GUESSABLE — its display name,
-    /// its address, or the `host=` recovery parameter — rather than by its stable record id.
-    /// `x-scheme-handler/punktfunk` means any web page can emit such a link, so the front-end
-    /// asks first and then runs it exactly as [`PlanOutcome::Connect`]. NOT
-    /// [`PlanOutcome::ConfirmUnknown`]: this host is saved and pinned, and routing it through
-    /// the pairing ceremony would drop the pin it already has.
+    /// Same plan, but the link named the host by a guessable label, address, or `host=`.
+    /// `x-scheme-handler/punktfunk` lets any page emit that, so the front-end asks first.
+    /// Not [`PlanOutcome::ConfirmUnknown`]: this host is saved and pinned; pairing would
+    /// drop the pin.
     ConfirmConnect(Box<ConnectPlan>),
-    /// The link resolved to no local record. The front-end shows the confirmation sheet with
-    /// exactly this, and the normal pairing/TOFU flow proceeds under the user's eyes (§3.1).
+    /// No local record. Front-end shows the confirmation sheet; pairing/TOFU proceeds
+    /// under the user.
     ConfirmUnknown(Box<UnknownHost>),
-    /// A route the grammar defines but this front-end hasn't implemented yet.
     Unsupported(Route),
 }
 
-/// The confirmation sheet's contents for a link to a host we don't know.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnknownHost {
     pub addr: String,
     pub port: u16,
-    /// The label the link claimed — shown as *claimed*, never trusted.
+    /// Label the link claimed. Shown as claimed, never trusted.
     pub name: Option<String>,
-    /// The fingerprint the link expects; pre-fills the sheet's pin so the first connect is
-    /// verified rather than blind trust-on-first-use.
+    /// Fingerprint the link expects. Pre-fills the sheet so the first connect is
+    /// verified, not blind TOFU.
     pub fp: Option<String>,
     pub launch: Option<String>,
     pub profile: Option<String>,
 }
 
-/// Why a link can't become a plan. Each of these is a *notice*, never a degraded connect:
-/// predictability over best-effort — a shortcut that silently streams with the wrong settings
-/// or to the wrong box is worse than one that explains itself (design/client-deep-links.md §8).
+/// Why a link cannot become a plan. Each is a notice, never a degraded connect
+/// (`design/client-deep-links.md`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanError {
-    /// The host name matched more than one saved host.
     AmbiguousHost(String),
-    /// Nothing local matched and the link carries no address to fall back on.
     UnresolvableHost(String),
-    /// The link's `fp` contradicts the pin we hold — the link is stale or lying.
-    PinConflict {
-        host: String,
-    },
+    PinConflict { host: String },
     UnknownProfile(String),
     AmbiguousProfile(String),
 }
 
 impl PlanError {
-    /// The notice text. Every one of these names the reference that failed, because "it didn't
-    /// work" on a shortcut double-click is unactionable.
+    /// Notice text. Names the reference that failed — "it didn't work" on a
+    /// shortcut is unactionable.
     pub fn message(&self) -> String {
         match self {
             PlanError::AmbiguousHost(r) => {
@@ -321,15 +265,13 @@ impl PlanError {
     }
 }
 
-/// Build a plan from a `punktfunk://` link against this device's stores — the shared half of
-/// every platform's URL router (§4). The security rules of §3 live here, not in the shells:
-/// no pairing, no silent trust, no dial on a GUESSABLE reference (only the stable record id
-/// yields [`PlanOutcome::Connect`]; a name or an address yields
-/// [`PlanOutcome::ConfirmConnect`]), references resolved or refused.
+/// Plan from a `punktfunk://` link against this device's stores. Shared URL-router
+/// half (`design/client-architecture-split.md`): no pairing, no silent trust, no
+/// dial on a guessable reference — only the stable record id yields
+/// [`PlanOutcome::Connect`]; a name or address yields [`PlanOutcome::ConfirmConnect`].
 ///
-/// Preempting a live session is the one rule that stays with the caller: only the front-end
-/// knows whether a session is running, and the answer ("focus it" / "end that one first")
-/// is UI, not policy.
+/// Preempting a live session stays with the caller: only the front-end knows
+/// whether a session is running, and "focus it" / "end that one first" is UI.
 pub fn plan_from_link(
     link: &DeepLink,
     known: &KnownHosts,
@@ -339,8 +281,8 @@ pub fn plan_from_link(
     if link.route != Route::Connect {
         return Ok(PlanOutcome::Unsupported(link.route));
     }
-    // The profile is resolved BEFORE anything is dialled: a link that can't honor its profile
-    // must say so instead of streaming with the wrong settings.
+    // Profile first: a link that cannot honor its profile must refuse rather than
+    // stream with the wrong settings.
     if let Some(reference) = &link.profile {
         match catalog.resolve(reference) {
             (Some(_), _) => {}
@@ -351,8 +293,6 @@ pub fn plan_from_link(
         }
     }
     let resolution = crate::deeplink::resolve_host(link, known);
-    // A guessable reference (name / address / `host=`) reaches the same plan, but the front-end
-    // must put a person in front of it — see `PlanOutcome::ConfirmConnect`.
     let confirm = matches!(resolution, HostResolution::Confirm(_));
     match resolution {
         HostResolution::Known(i) | HostResolution::Confirm(i) => {
@@ -362,8 +302,6 @@ pub fn plan_from_link(
                     host: host.name.clone(),
                 });
             }
-            // A link with no `profile=` honors the host's binding, exactly like a card
-            // click — the URL adds nothing there, so it changes nothing.
             let mut plan = ConnectPlan::resolve(
                 host,
                 link.launch.as_deref(),
@@ -371,9 +309,8 @@ pub fn plan_from_link(
                 catalog,
                 base,
             );
-            // A record we know but never pinned (added by address, never paired) is not a
-            // silent connect either: the session refuses without a pin, and the front-end
-            // should run its trust flow. Hand it back as the confirmation case.
+            // Known but never pinned: the session refuses without a pin. Hand back as
+            // ConfirmUnknown so the front-end runs its trust flow.
             if plan.host.fp_hex.is_none() {
                 return Ok(PlanOutcome::ConfirmUnknown(Box::new(UnknownHost {
                     addr: plan.host.addr,
@@ -385,8 +322,8 @@ pub fn plan_from_link(
                 })));
             }
             if plan.host.name.is_empty() {
-                // An address-only record has no label; the link's claimed one is fine for a
-                // window title (it names nothing that is trusted).
+                // Address-only record has no label. The link's claimed name is fine for
+                // a window title; it names nothing that is trusted.
                 plan.host.name = link.name.clone().unwrap_or_else(|| plan.host.addr.clone());
             }
             Ok(if confirm {
@@ -413,19 +350,15 @@ pub fn plan_from_link(
     }
 }
 
-// ---------------------------------------------------------------------------------------
-// Wake-and-wait — the reference state machine, ported from Apple's `HostWaker`.
-// ---------------------------------------------------------------------------------------
-
-/// How long to wait for a woken host to come back. Generous on purpose: a cold boot plus
-/// service start is routinely a minute-plus.
+/// Bound on the wake wait. A cold boot plus service start is routinely a minute-plus.
 pub const WAKE_TIMEOUT_SECS: u64 = 90;
-/// How often to re-send the magic packet while waiting.
+/// Magic-packet re-send while waiting. A single packet is missed, and some NICs
+/// only wake on a fresh packet after dropping into a deeper sleep.
 pub const WAKE_RESEND_SECS: u64 = 6;
 
-/// The wake-and-wait loop as a pure step function, so every front-end drives it from its own
-/// loop (relm4 messages, a WinUI thread, the console's service tick, a CLI's sleep) and they
-/// all still agree on the timings — and so the behavior is testable without waiting 90 s.
+/// Wake-and-wait as a one-second step so every front-end drives its own loop
+/// and still agrees on the timings — and so the behavior is testable without
+/// waiting 90 s.
 #[derive(Clone, Debug)]
 pub struct WakeWait {
     elapsed_secs: u64,
@@ -433,23 +366,19 @@ pub struct WakeWait {
     resend_secs: u64,
 }
 
-/// What the caller should do for this one-second step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WakeTick {
-    /// Send (or re-send) the magic packet now.
     pub send_packet: bool,
-    /// Seconds waited so far — the "Waking… 12s" line.
     pub seconds: u64,
-    /// `None` = keep waiting (sleep a second, then tick again).
+    /// `None` = keep waiting (sleep one second, tick again).
     pub outcome: Option<WakeOutcome>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WakeOutcome {
-    /// The host answered — proceed with the connect.
     Online,
-    /// The budget ran out. The UI PARKS here (Try again / Cancel); it does not error out
-    /// from under the user, because "it didn't wake in 90 s" is often "give it 10 more".
+    /// Budget ran out. The UI PARKS (Try again / Cancel); it does not error out —
+    /// "didn't wake in 90 s" is often "give it 10 more".
     TimedOut,
 }
 
@@ -464,17 +393,14 @@ impl Default for WakeWait {
 }
 
 impl WakeWait {
-    /// A wait with the shipped timings.
     pub fn new() -> WakeWait {
         WakeWait::default()
     }
 
-    /// One second of the wait. `online` is this tick's presence reading (an mDNS advert, a
-    /// reachability probe — whichever the front-end has; both are "did it answer").
-    ///
-    /// Order matters and matches the reference: the packet goes out *before* the presence
-    /// check, so an already-awake host costs one wasted packet rather than a lost second, and
-    /// the timeout is checked after it — a host that appears on the last tick still wins.
+    /// One second of the wait. `online` is this tick's presence reading (mDNS or
+    /// a reachability probe). Packet before presence so an already-awake host
+    /// costs one wasted packet, not a lost second; timeout after, so a host that
+    /// appears on the last tick still wins.
     pub fn tick(&mut self, online: bool) -> WakeTick {
         let send_packet = self.elapsed_secs % self.resend_secs == 0;
         let seconds = self.elapsed_secs;
@@ -493,8 +419,7 @@ impl WakeWait {
         }
     }
 
-    /// Restart the same wait — "Try again" after a timeout replays it exactly (the reference's
-    /// captured `replay` closure, minus the closure).
+    /// Replay the same wait. "Try again" after a timeout.
     pub fn restart(&mut self) {
         self.elapsed_secs = 0;
     }
@@ -504,70 +429,53 @@ impl WakeWait {
     }
 }
 
-/// The front-end's obligations. Everything here is presentation; nothing here decides policy.
+/// Front-end presentation. Nothing here decides policy.
 pub trait UiDelegate {
-    /// A link or a card points at a host we don't know (or never pinned). Return true to
-    /// proceed into the trust flow. A non-interactive front-end returns false — refusing is
-    /// always safe, and the CLI reports it as "needs interaction" rather than pairing blind.
+    /// Unknown or never-pinned host. Return true to enter the trust flow. A
+    /// non-interactive front-end returns false — refusing is always safe.
     fn confirm_unknown_host(&mut self, host: &UnknownHost) -> bool;
-    /// Render "Waking <host>… 12s" / the timed-out park state.
     fn wake_progress(&mut self, host: &HostTarget, tick: WakeTick);
-    /// The session ended, one way or another.
     fn report(&mut self, outcome: &ConnectOutcome);
 }
 
-/// How a connect finished — the typed outcome every front-end maps onto its own surface.
+/// How a connect finished. Front-ends map this onto their own surface.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectOutcome {
-    /// The stream ran and ended cleanly; `Some` carries the host's stated reason.
+    /// Stream ended cleanly. `Some` is the host's stated reason.
     Ended(Option<String>),
-    /// The dial failed (and, where applicable, the wake wait did too).
     ConnectFailed(String),
-    /// Trust rejected: no pin, or the pin no longer matches. Never retried silently.
+    /// No pin, or the pin no longer matches. Never retried silently.
     TrustRejected(String),
-    /// The session binary itself failed to start or died abnormally.
     RendererFailed(String),
-    /// The user cancelled.
     Cancelled,
 }
 
-// ---------------------------------------------------------------------------------------
-// Session spawn + the stdout contract.
-// ---------------------------------------------------------------------------------------
-
-/// Everything a session needs, resolved by the caller — the spec `--resolved-spec` carries
-/// (design/client-architecture-split.md §5).
+/// Everything a session needs, resolved by the caller — what `--resolved-spec`
+/// carries (`design/client-architecture-split.md`).
 ///
-/// The session binary is a renderer: given this, it performs ZERO store reads. Its old habit of
-/// re-deriving state (loading `Settings`, looking up the host's `clipboard_sync`, resolving the
-/// profile) meant policy was being evaluated inside the thing that draws pixels, and that the
-/// spawner and the child could disagree about a file either of them might have written since.
-///
-/// The compat path — a hand-run `punktfunk-session --connect` with no spec — still resolves for
-/// itself, but through the *same* helper (`effective_settings`), so the two modes cannot drift.
+/// The session is a renderer: given this, it performs no store reads. A hand-run
+/// `punktfunk-session --connect` with no spec still resolves through the same
+/// helper (`effective_settings`), so the two modes cannot drift.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedSpec {
-    /// Effective settings: the global defaults with the chosen profile already applied.
     pub settings: Settings,
-    /// Whether this host may share the clipboard — a per-host trust decision, resolved by the
-    /// spawner rather than re-looked-up here.
+    /// Per-host trust decision, resolved by the spawner — not re-looked-up here.
     pub clipboard: bool,
-    /// The profile's name, for the stats overlay. `None` = the global defaults.
+    /// Profile name for the stats overlay. `None` = the global defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
 }
 
 impl ResolvedSpec {
-    /// Write the spec somewhere the child can read it, returning the path. Temp files rather
-    /// than a pipe because the session already takes a file path elsewhere and a crashed
-    /// spawner leaves something inspectable.
+    /// Write the spec somewhere the child can read, returning the path. A file, not
+    /// a pipe: the session already takes a path, and a crashed spawner leaves
+    /// something inspectable.
     ///
-    /// The name is a CSPRNG token, creation is `create_new` + 0600, and on Linux the file lives
-    /// in `$XDG_RUNTIME_DIR` (per-user 0700) rather than shared `/tmp`: the old predictable
-    /// `punktfunk-spec-<pid>-<n>` name let another local user pre-create the path as a symlink
-    /// or swap the spec before the child read it (security-review 2026-08-31 M-3). The token
-    /// also keys concurrent launches apart — a collision fails the exclusive create instead of
-    /// overwriting, and the caller already falls back to letting the child resolve for itself.
+    /// CSPRNG name, `create_new` + 0600. On Linux this is `$XDG_RUNTIME_DIR`
+    /// (per-user 0700), not shared `/tmp` — a predictable `punktfunk-spec-<pid>-<n>`
+    /// name lets another local user pre-create the path as a symlink or swap the
+    /// spec before the child reads it. A collision fails the exclusive create;
+    /// the caller already falls back to letting the child resolve for itself.
     pub fn write_temp(&self) -> std::io::Result<std::path::PathBuf> {
         let json = serde_json::to_vec_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -576,7 +484,7 @@ impl ResolvedSpec {
             .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        // Windows %TEMP% and the macOS $TMPDIR are already per-user private directories.
+        // Windows %TEMP% and macOS $TMPDIR are already per-user private directories.
         #[cfg(not(target_os = "linux"))]
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
@@ -592,7 +500,6 @@ impl ResolvedSpec {
         Ok(path)
     }
 
-    /// Read a spec written by the spawner.
     pub fn read(path: &std::path::Path) -> std::io::Result<ResolvedSpec> {
         let text = std::fs::read_to_string(path)?;
         serde_json::from_str(&text)
@@ -600,9 +507,9 @@ impl ResolvedSpec {
     }
 }
 
-/// One event from the session child's stdout contract (`{"ready":true}`, `{"error":…}`,
-/// `{"ended":…}`, then EOF and an exit code). Parsed in one place so a shell, the console and
-/// the CLI cannot disagree about what "ready" or "trust rejected" means.
+/// One event from the session child's stdout contract (`{"ready":true}`,
+/// `{"error":…}`, `{"ended":…}`, then EOF and an exit code). Parsed once so
+/// shells cannot disagree about what "ready" or "trust rejected" means.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionEvent {
     /// First frame presented — the stream is up.
@@ -612,9 +519,9 @@ pub enum SessionEvent {
         trust_rejected: bool,
     },
     Ended(String),
-    /// The session window's logical size settled at this, under the match-window policy. The
-    /// SPAWNER persists it (design §5): a renderer that load-modify-saves the shared settings
-    /// file was one of its five concurrent writers, for a value only the parent needs.
+    /// Session window logical size under match-window. The SPAWNER persists it:
+    /// a renderer that load-modify-saves settings was a concurrent writer for a
+    /// value only the parent needs.
     Window {
         w: u32,
         h: u32,
@@ -623,8 +530,7 @@ pub enum SessionEvent {
     Exited(i32),
 }
 
-/// Parse one stdout line of the session contract; `None` for anything else (`stats:` lines,
-/// stray output).
+/// Parse one stdout line of the session contract. `None` for `stats:` and stray output.
 pub fn parse_session_line(line: &str) -> Option<SessionEvent> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     if v.get("ready").and_then(|r| r.as_bool()) == Some(true) {
@@ -648,8 +554,9 @@ pub fn parse_session_line(line: &str) -> Option<SessionEvent> {
     None
 }
 
-/// Persist a window size the session reported. The spawner's job now, not the renderer's — and
-/// it writes only on a real change, so a session that never resizes never touches the file.
+/// Persist a window size the session reported. The spawner's job, not the
+/// renderer's — and only on a real change, so a session that never resizes
+/// never touches the file.
 pub fn persist_window_size(w: u32, h: u32) {
     let mut s = Settings::load();
     if (s.last_window_w, s.last_window_h) != (w, h) {
@@ -659,8 +566,8 @@ pub fn persist_window_size(w: u32, h: u32) {
     }
 }
 
-/// The session binary: installed next to this executable, else `$PATH` (a dev run out of
-/// `target/…` lands on the sibling).
+/// Session binary: installed next to this executable, else `$PATH` (a dev run
+/// out of `target/…` lands on the sibling).
 pub fn session_binary() -> std::path::PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         let sibling = exe.with_file_name(SESSION_BIN);
@@ -676,8 +583,8 @@ const SESSION_BIN: &str = "punktfunk-session.exe";
 #[cfg(not(windows))]
 const SESSION_BIN: &str = "punktfunk-session";
 
-/// Kills the spawned session child — the Cancel button of a parked request-access connect,
-/// and the CLI's Ctrl-C path. Safe any time; a child that already exited is a no-op.
+/// Kills the spawned session child. Safe any time; a child that already exited
+/// is a no-op.
 #[derive(Clone, Debug, Default)]
 pub struct CancelHandle(Arc<Mutex<Option<Child>>>);
 
@@ -689,12 +596,10 @@ impl CancelHandle {
     }
 }
 
-/// Spawn the session for this plan and supervise its stdout contract on a reader thread,
-/// handing each event to `on_event` (which every front-end maps onto its own messages). The
-/// final [`SessionEvent::Exited`] always arrives, so a caller can release its busy flag in
-/// exactly one place.
-/// `cancel` lets a front-end hold the abort handle BEFORE the child exists (a request-access
-/// dialog arms its Cancel button first, then spawns); pass `None` to get a fresh one back.
+/// Spawn the session for this plan and supervise its stdout on a reader thread,
+/// handing each event to `on_event`. [`SessionEvent::Exited`] always arrives.
+/// `cancel` lets a front-end hold the abort handle before the child exists
+/// (request-access arms Cancel first, then spawns); `None` returns a fresh one.
 pub fn spawn_session(
     plan: &ConnectPlan,
     cancel: Option<CancelHandle>,
@@ -702,10 +607,9 @@ pub fn spawn_session(
 ) -> Result<CancelHandle, String> {
     let mut cmd = Command::new(session_binary());
     let mut args = plan.session_args();
-    // Spec mode: hand the child the settings we already resolved, so it reads no stores and
-    // cannot disagree with us about a file either of us might write (design §5). A spec we
-    // fail to write is not fatal — the child's compat path resolves the same values through
-    // the same helper, which is exactly why that path was kept.
+    // Spec mode: the child reads no stores and cannot disagree about a file either
+    // of us might write. A failed write is not fatal — the child's compat path
+    // resolves the same values through the same helper.
     let spec_path = match plan.spec(plan.clipboard).write_temp() {
         Ok(path) => {
             args.push("--resolved-spec".into());
@@ -720,11 +624,8 @@ pub fn spawn_session(
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        // Piped through the ring forwarder, not inherited: a dev terminal still gets the
-        // session's logs interleaved with the front-end's (the forwarder writes them straight
-        // back to our stderr), and the shell's "Send logs to host" bundle now carries the
-        // session's whole receive/decode/present trail — without it, the one surface a
-        // GUI-only user can export held everything EXCEPT the stream it was exported about.
+        // Piped through the ring forwarder, not inherited: a GUI-only log export
+        // otherwise holds everything except the stream it was exported about.
         .stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
@@ -750,20 +651,17 @@ pub fn spawn_session(
             for line in std::io::BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 if let Some(ev) = parse_session_line(&line) {
-                    // The window size is the spawner's to persist — the renderer only reports
-                    // it. Front-ends still see the event; they just don't have to act on it.
                     if let SessionEvent::Window { w, h } = ev {
                         persist_window_size(w, h);
                     }
                     on_event(ev);
                 }
             }
-            // The spec has done its job the moment the child has read it; a leftover temp file
-            // in %TEMP% is litter, and one per launch adds up.
+            // The child has read the spec by EOF. Leftover temps accumulate.
             if let Some(path) = &spec_path {
                 let _ = std::fs::remove_file(path);
             }
-            // EOF — reap (a cancel-killed child lands here too; -1 = died on a signal).
+            // Reap. A cancel-killed child lands here too; -1 = died on a signal.
             let code = reader_slot
                 .0
                 .lock()
@@ -779,11 +677,10 @@ pub fn spawn_session(
     Ok(slot)
 }
 
-/// Become the session process (`--exec`): the CLI's gamescope-wrapper mode, where the launched
-/// process identity must be the streaming one — a supervising parent would break focus and
-/// lifecycle under gamescope. Never returns on success. Windows has no `exec`, so there this
-/// runs the child to completion and exits with its code, which is the same contract minus the
-/// pid.
+/// Become the session process (`--exec`): gamescope-wrapper needs the streaming
+/// identity — a supervising parent would break focus and lifecycle. Never
+/// returns on success. Windows has no `exec`, so this runs the child to
+/// completion and exits with its code.
 pub fn exec_session(plan: &ConnectPlan) -> std::io::Error {
     let mut cmd = Command::new(session_binary());
     cmd.args(plan.session_args());
@@ -819,32 +716,28 @@ mod tests {
         }
     }
 
-    /// The wait is Apple's `HostWaker` second for second: a packet at 0 and every 6 s after,
-    /// a presence check each second, 90 s of budget, and a park (not an error) at the end.
+    /// Packet at 0 and every 6 s, presence each second, 90 s of budget, park (not
+    /// an error) at the end.
     #[test]
     fn wake_wait_matches_the_reference_cadence() {
         let mut w = WakeWait::new();
-        // t=0: packet goes out before the first presence check.
         let t = w.tick(false);
         assert!(t.send_packet);
         assert_eq!(t.seconds, 0);
         assert_eq!(t.outcome, None);
-        // t=1..5 wait quietly, t=6 re-sends.
         for s in 1..6 {
             let t = w.tick(false);
             assert!(!t.send_packet, "no packet at {s}s");
             assert_eq!(t.seconds, s);
         }
-        assert!(w.tick(false).send_packet); // t=6
+        assert!(w.tick(false).send_packet);
         assert_eq!(w.seconds(), 7);
 
-        // A host that answers ends the wait immediately, whatever second it is.
         let mut w = WakeWait::new();
         w.tick(false);
         let t = w.tick(true);
         assert_eq!(t.outcome, Some(WakeOutcome::Online));
 
-        // The budget: still waiting at 90 s of elapsed time, timed out on the tick after.
         let mut w = WakeWait::new();
         for _ in 0..WAKE_TIMEOUT_SECS {
             assert_eq!(w.tick(false).outcome, None);
@@ -852,19 +745,16 @@ mod tests {
         assert_eq!(w.seconds(), WAKE_TIMEOUT_SECS);
         let t = w.tick(false);
         assert_eq!(t.outcome, Some(WakeOutcome::TimedOut));
-        // A timed-out wait doesn't advance — it parks, and stays parked until asked again.
+        // Parked, not advanced. A host that appears while parked still wins.
         assert_eq!(w.tick(false).outcome, Some(WakeOutcome::TimedOut));
-        // …and a host that comes back while parked still wins ("Try again" isn't required).
         assert_eq!(w.tick(true).outcome, Some(WakeOutcome::Online));
-        // Retry replays the identical wait.
         w.restart();
         assert_eq!(w.seconds(), 0);
         assert!(w.tick(false).send_packet);
     }
 
-    /// The argv every door spawns through. A one-off profile rides the flag; a host BINDING
-    /// deliberately doesn't — the session resolves it with the same helper, so passing it
-    /// would be a second source of truth.
+    /// One-off profile rides the flag; a host binding does not — the session
+    /// resolves it with the same helper, so passing it would be a second source of truth.
     #[test]
     fn session_args_are_assembled_in_one_place() {
         let h = host(
@@ -907,17 +797,16 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--connect-timeout", "185"]));
         assert!(args.contains(&"--fullscreen".to_string()));
 
-        // "Connect with ▸ Default settings" on a bound host is an EMPTY override, which is
-        // not the same as no override — it has to survive as a flag.
+        // "Connect with ▸ Default settings" on a bound host is an empty override, not
+        // the same as no override — it has to survive as a flag.
         plan.profile_override = Some(String::new());
         let args = plan.session_args();
         let i = args.iter().position(|a| a == "--profile").unwrap();
         assert_eq!(args[i + 1], "");
     }
 
-    /// The §3 security rules, in the layer that owns them: an unknown host is a prompt, a
-    /// contradicted pin is a refusal, an unhonorable profile is a refusal, and an ambiguous
-    /// reference is never guessed at.
+    /// Unknown host is a prompt, a contradicted pin is a refusal, an unhonorable
+    /// profile is a refusal, and an ambiguous reference is never guessed at.
     #[test]
     fn link_plans_refuse_rather_than_degrade() {
         let fp = "a".repeat(64);
@@ -949,7 +838,6 @@ mod tests {
         let plan =
             |url: &str| plan_from_link(&deeplink::parse(url).unwrap(), &known, &catalog, &base);
 
-        // A known, pinned host named by its (unguessable) record id: a plain connect.
         let out = plan("punktfunk://connect/11111111-2222-4333-8444-555555555555").unwrap();
         match out {
             PlanOutcome::Connect(p) => {
@@ -960,10 +848,8 @@ mod tests {
             other => panic!("expected a connect, got {other:?}"),
         }
 
-        // The SAME host named by its label — which any web page could guess, and
-        // `x-scheme-handler/punktfunk` lets one hand us: the same plan, but the shell must ask
-        // first. Deliberately not `ConfirmUnknown`: that would re-run the pairing ceremony on a
-        // host that is already pinned.
+        // Same host named by its label: any page can guess that, so the shell must ask.
+        // Not ConfirmUnknown — that would re-run pairing on an already-pinned host.
         match plan("punktfunk://connect/Desk").unwrap() {
             PlanOutcome::ConfirmConnect(p) => {
                 assert_eq!(p.host.addr, "192.168.1.50");
@@ -971,20 +857,17 @@ mod tests {
             }
             other => panic!("expected a confirm-connect, got {other:?}"),
         }
-        // …and by its address, launch id and all.
         match plan("punktfunk://connect/192.168.1.50?launch=steam:570").unwrap() {
             PlanOutcome::ConfirmConnect(p) => assert_eq!(p.launch.as_deref(), Some("steam:570")),
             other => panic!("expected a confirm-connect, got {other:?}"),
         }
 
-        // A lying/stale fingerprint never connects, and says which host it was about.
         assert_eq!(
             plan(&format!("punktfunk://connect/Desk?fp={}", "b".repeat(64))),
             Err(PlanError::PinConflict {
                 host: "Desk".into()
             })
         );
-        // Ambiguity is reported, never resolved by picking the first.
         assert_eq!(
             plan("punktfunk://connect/Couch"),
             Err(PlanError::AmbiguousHost("Couch".into()))
@@ -995,13 +878,12 @@ mod tests {
                 "00000000-0000-4000-8000-000000000000".into()
             ))
         );
-        // A profile the catalog can't honor refuses BEFORE anything is dialled.
         assert_eq!(
             plan("punktfunk://connect/Desk?profile=NoSuchProfile"),
             Err(PlanError::UnknownProfile("NoSuchProfile".into()))
         );
-        // An unknown address is a confirmation sheet, never an auto-connect — and it carries
-        // the claimed name and the expected pin so the first connect is verified, not TOFU.
+        // Unknown address: confirmation sheet, never auto-connect. Carries the claimed
+        // name and expected pin so the first connect is verified, not TOFU.
         match plan(&format!(
             "punktfunk://connect/10.0.0.9:7000?name=Studio&fp={fp}"
         ))
@@ -1020,7 +902,7 @@ mod tests {
             ),
             other => panic!("expected a confirmation, got {other:?}"),
         }
-        // A saved host we never pinned is the same case: known ≠ trusted.
+        // Saved but never pinned: known ≠ trusted.
         match plan("punktfunk://connect/192.168.1.60").unwrap() {
             PlanOutcome::ConfirmUnknown(u) => {
                 assert_eq!(u.addr, "192.168.1.60");
@@ -1028,15 +910,13 @@ mod tests {
             }
             other => panic!("expected a confirmation, got {other:?}"),
         }
-        // Routes that parse but aren't implemented here are a notice, not a silent drop.
         assert!(matches!(
             plan("punktfunk://wake/Desk").unwrap(),
             PlanOutcome::Unsupported(Route::Wake)
         ));
     }
 
-    /// The spec is the whole of what a session needs, and it round-trips — a field lost here
-    /// is a setting the stream silently doesn't get.
+    /// Spec round-trips. A field lost here is a setting the stream silently doesn't get.
     #[test]
     fn resolved_spec_round_trips() {
         let spec = ResolvedSpec {
@@ -1057,7 +937,7 @@ mod tests {
         let json = serde_json::to_string(&spec).unwrap();
         assert_eq!(serde_json::from_str::<ResolvedSpec>(&json).unwrap(), spec);
 
-        // A spec without a profile is the defaults, and the key is simply absent.
+        // No profile: the key is absent, not null.
         let plain = ResolvedSpec {
             profile: None,
             ..spec.clone()
@@ -1067,8 +947,8 @@ mod tests {
         assert_eq!(serde_json::from_str::<ResolvedSpec>(&json).unwrap(), plain);
     }
 
-    /// A plan's spec carries the settings the plan resolved — including the profile's name for
-    /// the overlay, and the host's clipboard decision the renderer no longer looks up.
+    /// Plan spec carries the resolved settings, the overlay name, and the host's
+    /// clipboard decision — the renderer must not re-derive them.
     #[test]
     fn plan_spec_carries_what_the_session_may_not_re_derive() {
         let h = KnownHost {
@@ -1098,7 +978,6 @@ mod tests {
         assert!(spec.clipboard, "the host's decision, resolved once");
     }
 
-    /// The stdout contract, parsed once for every front-end.
     #[test]
     fn session_contract_lines() {
         assert_eq!(
@@ -1123,15 +1002,13 @@ mod tests {
             parse_session_line(r#"{"ended":"Host ended the session"}"#),
             Some(SessionEvent::Ended("Host ended the session".into()))
         );
-        // The window report the spawner persists on the session's behalf.
         assert_eq!(
             parse_session_line(r#"{"window":{"w":1600,"h":900}}"#),
             Some(SessionEvent::Window { w: 1600, h: 900 })
         );
-        // A half-formed window line is not an event — persisting half a size would be worse
-        // than ignoring it.
+        // Half a window line is not an event — persisting half a size is worse than
+        // ignoring it.
         assert_eq!(parse_session_line(r#"{"window":{"w":1600}}"#), None);
-        // Stats lines and stray output are never events.
         assert_eq!(parse_session_line("stats: 1280×800@60 · 60 fps"), None);
         assert_eq!(parse_session_line(""), None);
         assert_eq!(parse_session_line(r#"{"other":1}"#), None);

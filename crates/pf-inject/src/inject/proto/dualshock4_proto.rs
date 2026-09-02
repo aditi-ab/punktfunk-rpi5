@@ -1,63 +1,42 @@
-//! Transport-independent DualShock 4 HID contract — the pure report codec shared by the Windows
-//! UMDF-driver backend ([`super::dualshock4_windows`]) and the Linux UHID backend
-//! ([`super::dualshock4`]).
+//! Transport-independent DualShock 4 HID report codec — shared by the Linux UHID backend
+//! ([`super::dualshock4`]) and the Windows UMDF backend ([`super::dualshock4_windows`]).
 //!
-//! The PS4 sibling of [`super::dualsense_proto`]: the pure report codec and the fixed feature
-//! blobs, with no transport. The DS4 reuses the DualSense [`DsState`] controller model + its
-//! `GameStream`/XInput mapper ([`DsState::from_gamepad`]) — only the report *byte layout*, the
-//! touchpad resolution, and the feedback report differ. The Linux backend writes report `0x01` to
-//! `/dev/uhid` and reads `0x05` via `UHID_OUTPUT`; the Windows backend pushes `0x01` to the UMDF
-//! driver and pulls `0x05` back over its shared-memory channel — both build/parse the exact same
-//! bytes here.
-//!
-//! Field offsets are the canonical real-DS4-USB layout the kernel `struct
-//! dualshock4_input_report_usb` / `_output_report_common` parse.
+//! PS4 sibling of [`super::dualsense_proto`]: same [`DsState`] model and
+//! [`DsState::from_gamepad`] mapper; only the report byte layout, touchpad resolution, and
+//! output report (`0x05`) differ. Offsets match kernel `struct dualshock4_input_report_usb` /
+//! `_output_report_common`. Pin via `tests` here and `crates/pf-inject/tests/motion_contract.rs`.
 
 use super::dualsense_proto::{DsState, Touch};
 
-/// DualShock 4 v2 USB identity (Sony Interactive Entertainment / CUH-ZCT2).
 pub const DS4_VENDOR: u16 = 0x054C;
 pub const DS4_PRODUCT: u16 = 0x09CC;
-/// USB input report `0x01` is 64 bytes total (report id + 63-byte body).
+/// USB input report `0x01`: report id + 63-byte body.
 pub const DS4_INPUT_REPORT_LEN: usize = 64;
-/// The DualShock 4 touchpad resolution the kernel advertises (ABS_MT 0..1919 / 0..941). Narrower
-/// than the DualSense's 1920×1080.
+/// Kernel ABS_MT range is 0..=1919 / 0..=941 — one less than DualSense's 1920×1080.
 pub const DS4_TOUCH_W: u16 = 1920;
 pub const DS4_TOUCH_H: u16 = 942;
 
-// Feature reports the host stack GET_REPORTs during DS4 init, the PS4 counterpart of
-// `dualsense_proto`'s DS_FEATURE_* blobs. PAIRING (0x12) is MANDATORY — without a valid reply
-// `dualshock4_create()` aborts and creates NO input devices; the kernel reads the 6-byte device MAC
-// from bytes 1..7. CALIBRATION (0x02) and FIRMWARE (0xa3) are non-fatal (the kernel warns and falls
-// back to identity IMU calibration), but we answer them so motion scales correctly. Each array's
-// first byte is the report id (the kernel hard-checks it).
+// GET_REPORT blobs at DS4 init. PAIRING (`0x12`) is mandatory: without a valid reply
+// `dualshock4_create()` creates no input devices. Byte 0 is the report id (kernel hard-check);
+// bytes 1..7 are the device MAC.
 #[rustfmt::skip]
-pub const DS4_FEATURE_PAIRING: &[u8] = &[ // report 0x12 (MAC at bytes 1..7, LE → DE:AD:BE:EF:00:01)
+pub const DS4_FEATURE_PAIRING: &[u8] = &[ // 0x12; MAC at 1..7, LSB first → DE:AD:BE:EF:00:01
     0x12, 0x01, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, 0x08, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
-/// IMU calibration (report `0x02`) — the numbers that decide what a *degree per second* means to
-/// every consumer of this pad.
+/// IMU calibration (report `0x02`). Consumers (`hid-playstation`, SDL `SDL_hidapi_ps4`) derive
+/// scale from this blob: gyro = `(|pitch+| + |pitch-|)/(speed+ + speed-)` LSB per °/s, accel =
+/// `(acc+ - acc-)/2` LSB per g. Must match
+/// [`MOTION_GYRO_LSB_PER_DEG_S`](punktfunk_core::input::gamepad::MOTION_GYRO_LSB_PER_DEG_S).
+/// Same DualSense numbers, same units — both pads consume the same wire sample.
 ///
-/// A consumer (kernel `hid-playstation`, SDL's `SDL_hidapi_ps4`) derives its scale from this blob,
-/// it does not assume one: gyro resolution = `(|pitch_plus| + |pitch_minus|) / (speed_plus +
-/// speed_minus)` LSB per °/s, accel resolution = `(acc_plus - acc_minus) / 2` LSB per g. So the
-/// blob is where the wire contract
-/// ([`MOTION_GYRO_LSB_PER_DEG_S`](punktfunk_core::input::gamepad::MOTION_GYRO_LSB_PER_DEG_S)) is
-/// *declared* on this backend, and it must state exactly what the wire delivers. These values are
-/// the DualSense blob's, which is the same statement in the same units — deliberately, since both
-/// pads consume the identical wire sample.
+/// Per-axis order is interleaved (`pitch±`, `yaw±`, `roll±`) — USB layout. Bluetooth groups
+/// all three plusses first. The virtual pad is `BUS_USB`; do not regroup.
 ///
-/// ⚠ The per-axis order is INTERLEAVED (`pitch±`, `yaw±`, `roll±`), which is the **USB** layout;
-/// Bluetooth groups all three plusses first. Our virtual pad declares `BUS_USB`, so interleaved is
-/// correct — do not "fix" it to grouped.
-///
-/// The Windows UMDF driver serves its own copy of this blob
-/// (`packaging/windows/drivers/pf-gamepad/src/lib.rs`) because it lives in a separate WDK
-/// workspace and cannot depend on this crate; the `motion_contract` test derives the units from
-/// *that* file's source too, so the two can't drift.
+/// The Windows UMDF copy lives in `packaging/windows/drivers/pf-gamepad/src/lib.rs` (separate
+/// WDK workspace). `motion_contract` derives units from both so they cannot drift.
 #[rustfmt::skip]
-pub const DS4_FEATURE_CALIBRATION: &[u8] = &[ // report 0x02 (IMU calibration; all signed le16 words)
+pub const DS4_FEATURE_CALIBRATION: &[u8] = &[ // 0x02; signed le16 words
     0x02,
     0x00, 0x00, // gyro_pitch_bias  = 0
     0x00, 0x00, // gyro_yaw_bias    = 0
@@ -79,7 +58,7 @@ pub const DS4_FEATURE_CALIBRATION: &[u8] = &[ // report 0x02 (IMU calibration; a
     0x00, 0x00, // trailing pad (descriptor declares 36 data bytes)
 ];
 #[rustfmt::skip]
-pub const DS4_FEATURE_FIRMWARE: &[u8] = &[ // report 0xa3 (build date string + hw/fw versions; cosmetic)
+pub const DS4_FEATURE_FIRMWARE: &[u8] = &[ // 0xa3 firmware/build; non-fatal
     0xA3, 0x41, 0x75, 0x67, 0x20, 0x20, 0x33, 0x20, 0x32, 0x30, 0x31, 0x33, // "Aug  3 2013"
     0x00, 0x00, 0x00, 0x00, 0x00,
     0x30, 0x37, 0x3A, 0x30, 0x31, 0x3A, 0x31, 0x32, // "07:01:12"
@@ -90,10 +69,8 @@ pub const DS4_FEATURE_FIRMWARE: &[u8] = &[ // report 0xa3 (build date string + h
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // trailing pad (buf[43..49]) → 49 bytes total
 ];
 
-/// The pairing reply (report `0x12`) for wire pad `pad`: [`DS4_FEATURE_PAIRING`] with the MAC's low
-/// octet offset by the pad index — same per-pad-serial contract as the DualSense's
-/// [`ds_pairing_reply`](super::dualsense_proto::ds_pairing_reply): the kernel adopts the MAC as the
-/// HID uniq, and SDL/Steam dedup controllers by that serial.
+/// Pairing reply `0x12` for wire pad `pad`: [`DS4_FEATURE_PAIRING`] with MAC low octet += `pad`.
+/// The kernel adopts the MAC as HID uniq; SDL/Steam dedup by that serial — identical MACs merge.
 pub fn ds4_pairing_reply(pad: u8) -> [u8; 16] {
     let mut r = [0u8; 16];
     r.copy_from_slice(DS4_FEATURE_PAIRING);
@@ -101,8 +78,7 @@ pub fn ds4_pairing_reply(pad: u8) -> [u8; 16] {
     r
 }
 
-/// Pack one touchpad contact into the DS4's 4-byte point (same bit layout as the DualSense's:
-/// byte0 bit7 = NOT-active, bits0-6 = id; 12-bit X then 12-bit Y).
+/// One contact as the DS4 4-byte point: byte0 bit7 = NOT-active, bits0-6 = id; 12-bit X then Y.
 fn pack_touch(dst: &mut [u8], t: &Touch) {
     dst[0] = (t.id & 0x7F) | if t.active { 0 } else { 0x80 };
     // Never emit the extent itself — the kernel advertises 0..=W-1 / 0..=H-1.
@@ -112,70 +88,60 @@ fn pack_touch(dst: &mut [u8], t: &Touch) {
     dst[3] = ((y >> 4) & 0xFF) as u8;
 }
 
-/// Serialize a full DS4 input report `0x01` (pure — unit-testable without a transport). Field offsets
-/// per the kernel's `struct dualshock4_input_report_usb` { report_id; common; num_touch; touch[3];
-/// rsvd[3] } where `common` = { x,y,rx,ry; buttons[3]; z,rz; sensor_ts le16; temp; gyro[3] le16;
-/// accel[3] le16; rsvd[5]; status[2]; rsvd }. The report id is byte 0, so a `common` field at struct
-/// offset N sits at report byte N+1.
+/// Pack input report `0x01`. Offsets match kernel `struct dualshock4_input_report_usb`;
+/// a `common` field at struct offset N sits at report byte N+1 (byte 0 is the report id).
+/// Unwritten bytes (temp, reserved, extra touch frames) stay as the caller left them.
 pub fn serialize_state(r: &mut [u8; DS4_INPUT_REPORT_LEN], st: &DsState, counter: u8, ts: u16) {
-    r[0] = 0x01; // report id
+    r[0] = 0x01;
     r[1] = st.lx;
     r[2] = st.ly;
     r[3] = st.rx;
     r[4] = st.ry;
-    r[5] = (st.dpad & 0x0F) | (st.buttons[0] & 0xF0); // dpad hat (low) + face buttons (high)
-    r[6] = st.buttons[1]; // L1/R1, L2/R2 digital, Share/Options, L3/R3
-    r[7] = (st.buttons2_with_click() & 0x03) | ((counter & 0x3F) << 2); // PS + touchpad-click (incl. rich pad clicks) + report counter
-    r[8] = st.l2; // L2 analog (z)
-    r[9] = st.r2; // R2 analog (rz)
+    r[5] = (st.dpad & 0x0F) | (st.buttons[0] & 0xF0); // dpad hat (low nibble) + face (high)
+    r[6] = st.buttons[1];
+    r[7] = (st.buttons2_with_click() & 0x03) | ((counter & 0x3F) << 2); // PS + pad-click + report counter
+    r[8] = st.l2;
+    r[9] = st.r2;
     r[10..12].copy_from_slice(&ts.to_le_bytes()); // sensor_timestamp (struct off 9)
-                                                  // r[12] temperature stays 0
     for (i, v) in st.gyro.iter().enumerate() {
-        r[13 + i * 2..15 + i * 2].copy_from_slice(&v.to_le_bytes()); // gyro at struct off 12
+        r[13 + i * 2..15 + i * 2].copy_from_slice(&v.to_le_bytes()); // gyro (struct off 12)
     }
     for (i, v) in st.accel.iter().enumerate() {
-        r[19 + i * 2..21 + i * 2].copy_from_slice(&v.to_le_bytes()); // accel at struct off 18
+        r[19 + i * 2..21 + i * 2].copy_from_slice(&v.to_le_bytes()); // accel (struct off 18)
     }
-    // r[25..30] reserved2.
-    // status[0] (struct off 29 → r[30]): bit4 = cable/wired, low nibble = battery capacity. Report
-    // wired + full (0x1B) so SteamOS / the kernel never warn "low battery" on a virtual pad.
+    // status[0] (struct off 29 → r[30]): bit4 cable, low nibble battery. Wired + full
+    // (0x1B) so the kernel never warns "low battery" on a virtual pad.
     r[30] = 0x10 | 0x0B;
-    // r[31] status[1] = 0 (no headphone/mic), r[32] reserved3 = 0.
-    r[33] = 1; // num_touch_reports: one frame carrying the two contacts (a real DS4 always sends one)
-    r[34] = ts as u8; // touch_reports[0].timestamp
-    pack_touch(&mut r[35..39], &st.touch[0]); // touch point 0
-    pack_touch(&mut r[39..43], &st.touch[1]); // touch point 1
-                                              // remaining touch frames (r[43..61]) + reserved (r[61..64]) stay zero
+    r[33] = 1; // one touch frame; a real DS4 always sends one
+    r[34] = ts as u8;
+    pack_touch(&mut r[35..39], &st.touch[0]);
+    pack_touch(&mut r[39..43], &st.touch[1]);
 }
 
-/// What one feedback pass extracted from the device's HID output reports. Rumble rides the universal
-/// 0xCA plane; the lightbar rides the HID-output 0xCD plane as a `Led` event (DS4 has no player LEDs
-/// or adaptive triggers, so those never appear).
+/// One HID-output pass: rumble on the 0xCA plane, lightbar as a `Led` on 0xCD.
+/// DS4 has no player LEDs or adaptive triggers.
 #[derive(Default)]
 pub struct Ds4Feedback {
-    /// `(low, high)` motor levels (0..=0xFF00), if a report carried them.
+    /// `(low, high)` motor levels, 0..=0xFF00, if a report carried them.
     pub rumble: Option<(u16, u16)>,
     /// Lightbar RGB, if the report carried it (deduped by the manager).
     pub led: Option<(u8, u8, u8)>,
-    /// The driver's output-report ring overflowed this poll — pending reports were DISCARDED and
-    /// feedback state is unknown; the [`UhidManager`](crate::uhid_manager) must resync (silence +
-    /// re-armed dedups). Set by the backend's section drain, never by the parser.
+    /// Output-report ring overflowed this poll: pending reports discarded, feedback unknown.
+    /// [`UhidManager`](crate::uhid_manager) must resync. Set by the backend drain, never the parser.
     pub resync: bool,
 }
 
-/// Parse a DualShock 4 USB output report (`0x05`) into a [`Ds4Feedback`]. Layout per the kernel
-/// `struct dualshock4_output_report_common`: valid_flag0 (bit0 motor, bit1 LED, bit2 blink) at [1],
-/// valid_flag1 [2], reserved [3], motor_right (weak/small) [4], motor_left (strong/large) [5],
-/// lightbar R/G/B [6..9], blink on/off [9..11]. Gated on the valid-flags so a rumble-only write
-/// doesn't masquerade as a lightbar change.
+/// Parse USB output report `0x05`. Gated on `valid_flag0`: bit0 motor, bit1 LED. Motor right
+/// (weak) is at [4], left (strong) at [5] — inverted vs (low, high). A rumble-only write must
+/// not look like a lightbar change.
 pub fn parse_ds4_output(data: &[u8], fb: &mut Ds4Feedback) {
     if data.first() != Some(&0x05) || data.len() < 11 {
-        return; // not the USB output report (BT 0x11 is shifted) / too short
+        return; // not USB 0x05 (BT 0x11 is shifted) / too short
     }
     let flag0 = data[1];
     if flag0 & 0x01 != 0 {
-        // motor_left (strong/large/low-freq) at [5], motor_right (weak/small/high-freq) at [4];
-        // scale 0..255 → 0..0xFF00, same (low, high) convention as the other backends.
+        // motor_left (strong/low) at [5], motor_right (weak/high) at [4];
+        // scale 0..255 → 0..0xFF00, same (low, high) as the other backends.
         let low = (data[5] as u16) << 8;
         let high = (data[4] as u16) << 8;
         fb.rumble = Some((low, high));
@@ -189,17 +155,17 @@ pub fn parse_ds4_output(data: &[u8], fb: &mut Ds4Feedback) {
 mod tests {
     use super::*;
 
-    /// Report 0x01 places sticks/buttons/triggers/motion/touch at the kernel's DS4 offsets.
+    /// L2 analog is byte 8, not DualSense's 5. Offsets otherwise match kernel DS4 USB.
     #[test]
     fn serialize_offsets() {
         use punktfunk_core::input::gamepad as gs;
         let mut st = DsState::from_gamepad(
             gs::BTN_A | gs::BTN_DPAD_UP | gs::BTN_LB,
-            16384, // lx (right)
+            16384, // lx right of centre
             0,
             0,
-            -32768, // ry (down) — inverted to 0xFF
-            200,    // L2
+            -32768, // ry down — Y inverted to 0xFF
+            200,
             0,
         );
         st.gyro = [0x0102, 0x0304, 0x0506];
@@ -212,30 +178,27 @@ mod tests {
         };
         let mut r = [0u8; DS4_INPUT_REPORT_LEN];
         serialize_state(&mut r, &st, 0, 0);
-        assert_eq!(r[0], 0x01); // report id
-        assert_eq!(r[8], 200); // L2 analog at byte 8 (not the DualSense's byte 5)
-        assert_eq!(r[5] & 0x0F, 0); // dpad hat = N (up)
-        assert_eq!(r[5] & 0x20, 0x20); // Cross (A) face bit
-        assert_eq!(r[6] & 0x01, 0x01); // L1
-                                       // gyro le16 at 13..19, accel le16 at 19..25.
+        assert_eq!(r[0], 0x01);
+        assert_eq!(r[8], 200); // L2 analog at byte 8 (not DualSense's 5)
+        assert_eq!(r[5] & 0x0F, 0); // dpad hat 0 = N
+        assert_eq!(r[5] & 0x20, 0x20); // Cross (A)
+        assert_eq!(r[6] & 0x01, 0x01);
         assert_eq!(&r[13..19], &[0x02, 0x01, 0x04, 0x03, 0x06, 0x05]);
         assert_eq!(&r[19..25], &[0x12, 0x11, 0x14, 0x13, 0x16, 0x15]);
-        assert_eq!(r[33], 1); // one touch frame
+        assert_eq!(r[33], 1);
         assert_eq!(r[35] & 0x80, 0); // contact 0 active (bit7 clear)
-        assert_eq!(r[35] & 0x7F, 0); // contact id 0
-        assert_eq!(r[30] & 0x10, 0x10); // cable/wired bit set
+        assert_eq!(r[35] & 0x7F, 0);
+        assert_eq!(r[30] & 0x10, 0x10);
 
-        // A rich-plane pad click (`touch_click`, no BTN_TOUCHPAD in the frame) rides the
-        // touchpad-click bit at byte 7 bit 1 via `buttons2_with_click` — the Linux backend used to
-        // serialize raw `buttons[2]` here and drop it.
-        assert_eq!(r[7] & 0x02, 0); // no click yet
+        // Rich-plane `touch_click` (no BTN_TOUCHPAD in the frame) still sets byte 7 bit 1 via
+        // `buttons2_with_click`.
+        assert_eq!(r[7] & 0x02, 0);
         st.touch_click[0] = true;
         serialize_state(&mut r, &st, 0, 0);
         assert_eq!(r[7] & 0x02, 0x02);
     }
 
-    /// A DS4 USB output report (`0x05`) with motor + LED flags parses into rumble (0xCA) and a
-    /// lightbar `Led` (0xCD); a rumble-only report (no LED flag) leaves the lightbar untouched.
+    /// Flag-gated parse: MOTOR|LED fills rumble + lightbar; MOTOR-only leaves `led` untouched.
     #[test]
     fn parse_output_rumble_and_lightbar() {
         let mut report = [0u8; 32];
@@ -243,9 +206,9 @@ mod tests {
         report[1] = 0x01 | 0x02; // MOTOR | LED
         report[4] = 0x40; // motor_right (weak/high)
         report[5] = 0x80; // motor_left (strong/low)
-        report[6] = 0x11; // R
-        report[7] = 0x22; // G
-        report[8] = 0x33; // B
+        report[6] = 0x11;
+        report[7] = 0x22;
+        report[8] = 0x33;
         let mut fb = Ds4Feedback::default();
         parse_ds4_output(&report, &mut fb);
         assert_eq!(fb.rumble, Some((0x8000, 0x4000))); // (low=strong, high=weak)
@@ -258,11 +221,10 @@ mod tests {
         let mut fb2 = Ds4Feedback::default();
         parse_ds4_output(&motor_only, &mut fb2);
         assert!(fb2.rumble.is_some());
-        assert_eq!(fb2.led, None); // lightbar not asserted → no spurious change
+        assert_eq!(fb2.led, None);
 
-        // LED-only write: rumble not asserted → stays `None` (this is what `rumble_drove` keys
-        // on — an LED stream must not read as rumble activity), and an explicit flagged zero
-        // parses as `Some((0, 0))`, never as absence.
+        // LED-only: rumble stays `None` (`rumble_drove` keys on it — an LED stream must not
+        // look like rumble). A MOTOR-flagged zero is `Some((0, 0))`, never absence.
         let mut led_only = [0u8; 32];
         led_only[0] = 0x05;
         led_only[1] = 0x02; // LED only

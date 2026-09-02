@@ -1,82 +1,55 @@
-//! The stylus plane: full-fidelity pen input on the 0xCC rich-input datagram
-//! (design/pen-tablet-input.md).
+//! Stylus batches on the 0xCC rich-input datagram (`RICH_PEN` = 0x05).
 //!
-//! A pen datagram is a batch of **state-full samples**: every sample carries the *complete*
-//! pen state — in-range/touching/buttons/tool plus all axes — never an edge ("down"/"up")
-//! event. The host diffs each sample against its own tracked state ([`PenTracker`]) and
-//! synthesizes the transitions, so a lost datagram self-heals on the next sample: a dropped
-//! "first contact" batch becomes a tip-down when the next in-contact sample arrives, and a
-//! dropped lift heals on the next hover/out-of-range sample (with the
-//! [`PEN_TOUCH_TIMEOUT_MS`] failsafe for a client that dies mid-stroke). That is what makes
-//! the lossy datagram plane sound for a 240 Hz stylus without any reliable-delivery
-//! machinery — the same idempotent-snapshot argument as [`GamepadSnapshot`]
-//! (crate::input::GamepadSnapshot) and [`RichInput::HidReport`](super::RichInput).
+//! Every sample is a complete snapshot (range, contact, buttons, tool, axes),
+//! never an edge. [`PenTracker`] diffs against last state so a lost datagram
+//! heals on the next sample; [`PEN_TOUCH_TIMEOUT_MS`] covers a client that dies
+//! mid-stroke. Stale batches drop whole ([`pen_seq_newer`]) — a rewind would
+//! jump the stroke.
 //!
-//! Batches are ordered by a wrapping `u16` sequence number and dropped **whole** when stale
-//! ([`pen_seq_newer`]) — applying a stale state-full sample would rewind the stroke.
-//!
-//! Clients send this only after the host advertised [`HOST_CAP_PEN`](super::HOST_CAP_PEN);
-//! a pre-pen host drops the unknown 0xCC kind by the plane's documented forward-compat rule.
+//! Send only after the host advertised [`HOST_CAP_PEN`](super::HOST_CAP_PEN).
+//! Wire and injection: `design/pen-tablet-input.md`.
 
 use super::datagram::{RICH_INPUT_MAGIC, RICH_PEN};
 
-/// [`PenSample::state`] bit: the pen is in the hover range of the surface. Implied by
-/// [`PEN_TOUCHING`] (decode normalizes, so a client that only sets TOUCHING still produces a
-/// coherent contact).
+/// Implied by [`PEN_TOUCHING`]; [`PenTracker`] ORs it so a client that only sets TOUCHING still looks in-range.
 pub const PEN_IN_RANGE: u8 = 0x01;
-/// [`PenSample::state`] bit: the tip is in contact with the surface.
 pub const PEN_TOUCHING: u8 = 0x02;
-/// [`PenSample::state`] bit: the primary barrel button (or the client's squeeze mapping) is held.
+/// Primary barrel, or the client's squeeze mapping.
 pub const PEN_BARREL1: u8 = 0x04;
-/// [`PenSample::state`] bit: the secondary barrel button (or the client's double-tap mapping)
-/// is held.
+/// Secondary barrel, or the client's double-tap mapping.
 pub const PEN_BARREL2: u8 = 0x08;
-/// [`PenSample::state`] bit, RESERVED: a predicted (not yet observed) sample. Never sent v1;
-/// receivers MUST ignore samples carrying it until a capability negotiates otherwise
-/// (design/pen-tablet-input.md §8).
+/// Reserved: predicted sample. Never sent v1; [`PenTracker::apply`] skips it until a capability says otherwise.
 pub const PEN_PREDICTED: u8 = 0x80;
 
-/// The button subset of [`PenSample::state`].
 const PEN_BUTTONS_MASK: u8 = PEN_BARREL1 | PEN_BARREL2;
 
-/// [`PenSample::tilt_deg`] sentinel: the client has no tilt sensor / no reading.
 pub const PEN_TILT_UNKNOWN: u8 = 0xFF;
-/// [`PenSample::azimuth_deg`] / [`PenSample::roll_deg`] sentinel: no reading.
 pub const PEN_ANGLE_UNKNOWN: u16 = 0xFFFF;
-/// [`PenSample::distance`] sentinel: no hover-distance reading.
 pub const PEN_DISTANCE_UNKNOWN: u16 = 0xFFFF;
 
-/// Most samples one [`PenBatch`] can carry. Sized for coalesced capture at video-frame cadence
-/// (240 Hz pen ÷ 30 fps = 8); a client producing more splits into consecutive batches.
+/// Coalesced capture at video-frame cadence: 240 Hz ÷ 30 fps = 8. More samples split across batches.
 pub const PEN_BATCH_MAX: usize = 8;
 
-/// Wire length of one encoded [`PenSample`].
 pub const PEN_SAMPLE_WIRE_LEN: usize = 21;
 
 /// `[0xCC][0x05][flags][count][u16 seq LE]` — bytes before the first sample.
 const PEN_HEADER_LEN: usize = 6;
 
-/// Host-side failsafe (design/pen-tablet-input.md §2): a tracker still in range after this
-/// many ms without a sample force-releases ([`PenTracker::force_release`]) — a client that
-/// died mid-stroke must not leave the host's virtual pen inked-down forever. This makes the
-/// **client heartbeat a wire contract**: capture APIs only fire on change, so a stationary
-/// pen is naturally silent — senders MUST repeat the last sample at least every ~100 ms while
-/// the pen is in range or touching (it re-decodes as pure Motion, harmless), keeping a live
-/// stationary stroke two heartbeats clear of the deadline.
+/// Force-release if still in range after this many ms with no sample (dead client).
+/// Capture only fires on change, so senders repeat the last sample every ~100 ms while
+/// in range — two heartbeats clear of this deadline. Repeats re-decode as Motion.
 pub const PEN_TOUCH_TIMEOUT_MS: u32 = 200;
 
-/// Which end of the stylus (or which mapped mode) a sample describes. A tool *switch* while in
-/// range is a physical re-entry — [`PenTracker`] emits a full release + re-proximity, matching
-/// how a real tablet treats each tool as its own proximity session.
+/// A tool switch while in range is a physical re-entry:
+/// [`PenTracker`] emits a full release + re-proximity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PenTool {
     #[default]
     Pen = 0,
     Eraser = 1,
-    /// An unrecognized wire value (a future tool from a newer client) — injectors treat it as
-    /// [`PenTool::Pen`]. Inside a proximity session it inherits the session's tool instead of
-    /// forcing a spurious re-entry.
+    /// Unrecognized wire value. Injectors treat it as [`PenTool::Pen`]. Inside a
+    /// proximity session it inherits the session tool instead of forcing re-entry.
     Unknown = 0xFF,
 }
 
@@ -90,38 +63,24 @@ impl PenTool {
     }
 }
 
-/// One complete stylus state at one instant. All axes ride every sample (state-full — see the
-/// module doc); unknown axes carry their sentinel, never 0.
-///
-/// `x`/`y` are normalized `0.0..=1.0` in **video-frame space** — the client maps its letterbox
-/// / viewport before sending (exactly as its wire touches already do), so the host scales
-/// straight to the streamed output. f32 keeps sub-pixel precision at any resolution.
+/// Unknown axes use their sentinel, never 0.
+/// `x`/`y` are `0.0..=1.0` in video-frame space (client maps letterbox before send);
+/// f32 keeps sub-pixel precision at any resolution.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PenSample {
-    /// Bitfield of `PEN_*` state bits ([`PEN_IN_RANGE`] … [`PEN_PREDICTED`]).
     pub state: u8,
-    /// Active tool. Meaningful while in range; [`PenTool::Unknown`] inherits (see [`PenTool`]).
     pub tool: PenTool,
-    /// Normalized `0.0..=1.0` across the video frame (decode clamps; see [`PenBatch::decode`]).
     pub x: f32,
-    /// Normalized `0.0..=1.0` across the video frame.
     pub y: f32,
-    /// Tip force, `0..=65535` full scale, `0` while hovering. Injectors rescale (Windows pens
-    /// are 0..1024, uinput declares its own range) — full u16 keeps every source's precision.
+    /// `0` while hovering. Injectors rescale (Windows pens are 0..1024); full u16 keeps source precision.
     pub pressure: u16,
-    /// Hover distance, `0..=65534` normalized (0 = touching the hover floor), or
-    /// [`PEN_DISTANCE_UNKNOWN`].
+    /// `0` = hover floor. `0xFFFF` is unknown, so the live range is `0..=65534`.
     pub distance: u16,
-    /// Tilt from the surface normal, degrees `0..=90`, or [`PEN_TILT_UNKNOWN`]. Polar form —
-    /// what Apple capture and the GameStream wire both produce; injectors needing tiltX/tiltY
-    /// convert (design/pen-tablet-input.md §2).
+    /// Polar form (what capture produces). Injectors that need tiltX/tiltY convert.
     pub tilt_deg: u8,
-    /// Tilt azimuth, degrees `0..=359` clockwise from north, or [`PEN_ANGLE_UNKNOWN`].
     pub azimuth_deg: u16,
-    /// Barrel roll (Apple Pencil Pro `rollAngle`), degrees `0..=359`, or [`PEN_ANGLE_UNKNOWN`].
     pub roll_deg: u16,
-    /// µs since the previous sample in the same batch (`0` for the first) — preserves the
-    /// coalesced capture spacing for injectors/consumers that pace.
+    /// `0` for the first sample in a batch. Preserves coalesced capture spacing for paced injectors.
     pub dt_us: u16,
 }
 
@@ -156,10 +115,8 @@ impl PenSample {
         out.extend_from_slice(&self.dt_us.to_le_bytes());
     }
 
-    /// Decode one sample from exactly [`PEN_SAMPLE_WIRE_LEN`] bytes (caller bounds-checks).
-    /// `None` on a non-finite coordinate — an attacker-forged NaN/∞ must never reach an
-    /// injector's pixel scaling. Finite out-of-range coordinates clamp to `0.0..=1.0` (a
-    /// stroke drifting a hair past the letterbox edge is real input, not corruption).
+    /// `None` on a non-finite coordinate — NaN/∞ must never reach pixel scaling.
+    /// Finite out-of-range values clamp to `0.0..=1.0` (a stroke past the letterbox is real).
     fn decode(b: &[u8]) -> Option<PenSample> {
         let f32at = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
         let u16at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
@@ -182,10 +139,9 @@ impl PenSample {
     }
 }
 
-/// One pen datagram: `[0xCC][0x05][flags][count][u16 seq LE]` + `count` ×
-/// [`PEN_SAMPLE_WIRE_LEN`]-byte samples, oldest first. `flags` is reserved (sent 0, ignored on
-/// decode — semantic changes take a new 0xCC kind, never a flag reinterpretation). `seq` is the
-/// sender's wrapping batch counter, the reorder gate ([`pen_seq_newer`]).
+/// `[0xCC][0x05][flags][count][u16 seq LE]` + `count` × [`PEN_SAMPLE_WIRE_LEN`] samples, oldest first.
+/// `flags` is reserved (sent 0, ignored) — a semantic change takes a new 0xCC kind.
+/// `seq` is the wrapping reorder gate ([`pen_seq_newer`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PenBatch {
     pub seq: u16,
@@ -194,8 +150,6 @@ pub struct PenBatch {
 }
 
 impl PenBatch {
-    /// Build a batch from up to [`PEN_BATCH_MAX`] samples (a longer slice truncates — senders
-    /// with more coalesced samples split into consecutive batches so nothing is lost).
     pub fn new(seq: u16, samples: &[PenSample]) -> PenBatch {
         let count = samples.len().min(PEN_BATCH_MAX);
         let mut buf = [PenSample::default(); PEN_BATCH_MAX];
@@ -207,7 +161,6 @@ impl PenBatch {
         }
     }
 
-    /// The batch's samples, oldest first.
     pub fn samples(&self) -> &[PenSample] {
         &self.samples[..self.count as usize]
     }
@@ -223,11 +176,8 @@ impl PenBatch {
         out
     }
 
-    /// Parse a pen datagram. `None` on bad tag/kind, an empty batch, or a forged coordinate
-    /// (see [`PenSample::decode`]). Every read is bounded: `count` clamps to the declared
-    /// value, the fixed maximum, AND what the buffer actually holds — a torn datagram yields
-    /// the complete samples that arrived, never an over-read (the
-    /// [`RichInput::HidReport`](super::RichInput) truncation contract).
+    /// `count` clamps to declared, [`PEN_BATCH_MAX`], and what the buffer holds —
+    /// a torn datagram yields complete samples only, never an over-read.
     pub fn decode(b: &[u8]) -> Option<PenBatch> {
         if b.len() < PEN_HEADER_LEN || b[0] != RICH_INPUT_MAGIC || b[1] != RICH_PEN {
             return None;
@@ -251,11 +201,8 @@ impl PenBatch {
     }
 }
 
-/// The batch reorder gate: is `new` strictly newer than `last` on the wrapping u16 circle?
-/// `None` (nothing applied yet) always passes. The u16 analog of
-/// [`GamepadSnapshot::seq_newer`](crate::input::GamepadSnapshot::seq_newer): newer ⇔ the
-/// forward distance is `1..=0x7FFF`, so reordered stale batches drop and a wrap (65535 → 0)
-/// still counts as newer.
+/// Wrapping u16 analog of [`GamepadSnapshot::seq_newer`](crate::input::GamepadSnapshot::seq_newer):
+/// newer ⇔ forward distance `1..=0x7FFF`. `None` (nothing applied yet) always passes.
 pub fn pen_seq_newer(new: u16, last: Option<u16>) -> bool {
     match last {
         None => true,
@@ -263,31 +210,30 @@ pub fn pen_seq_newer(new: u16, last: Option<u16>) -> bool {
     }
 }
 
-/// One synthesized stroke transition, in the order [`PenTracker`] emits them for a sample:
-/// `ProximityIn?` → `Motion` → `TipDown?` → `ButtonsChanged?` → `TipUp?` → `ProximityOut?`.
-/// `Motion` precedes `TipDown` so the contact lands where the sample says; a release
-/// ([`PenTracker::force_release`] or an out-of-range sample) orders
+/// Emission order for one sample: `ProximityIn?` → `Motion` → `TipDown?` →
+/// `ButtonsChanged?` → `TipUp?` → `ProximityOut?`.
+/// Motion before TipDown so contact lands at this sample; a release orders
 /// `ButtonsChanged?` → `TipUp?` → `ProximityOut` so nothing is left held.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PenTransition {
-    /// The pen entered hover range. Injectors map [`PenTool::Unknown`] to a plain pen.
-    ProximityIn { tool: PenTool },
-    /// Position + all axes moved to this sample's values (emitted for every in-range sample).
-    Motion { sample: PenSample },
-    /// The tip made contact.
+    ProximityIn {
+        tool: PenTool,
+    },
+    Motion {
+        sample: PenSample,
+    },
     TipDown,
-    /// Barrel buttons changed: `pressed` / `released` are disjoint `PEN_BARREL*` subsets.
-    ButtonsChanged { pressed: u8, released: u8 },
-    /// The tip lifted.
+    /// `pressed` / `released` are disjoint `PEN_BARREL*` subsets.
+    ButtonsChanged {
+        pressed: u8,
+        released: u8,
+    },
     TipUp,
-    /// The pen left hover range.
     ProximityOut,
 }
 
-/// The host-side stroke state machine (one per session): diffs state-full [`PenSample`]s
-/// against tracked state and appends the synthesized [`PenTransition`]s. Pure and clock-free —
-/// the owner arms its own [`PEN_TOUCH_TIMEOUT_MS`] timer over [`PenTracker::is_active`] and
-/// calls [`PenTracker::force_release`] when it fires (and on session teardown).
+/// Clock-free: the owner arms [`PEN_TOUCH_TIMEOUT_MS`] over [`PenTracker::is_active`]
+/// and calls [`PenTracker::force_release`] on fire and on session teardown.
 #[derive(Debug, Default)]
 pub struct PenTracker {
     last_seq: Option<u16>,
@@ -298,9 +244,6 @@ pub struct PenTracker {
 }
 
 impl PenTracker {
-    /// Apply one decoded batch, appending transitions to `out` (callers reuse the buffer). A
-    /// stale batch ([`pen_seq_newer`]) is dropped whole with no transitions. Samples carrying
-    /// the reserved [`PEN_PREDICTED`] bit are skipped (never injected — module doc).
     pub fn apply(&mut self, batch: &PenBatch, out: &mut Vec<PenTransition>) {
         if !pen_seq_newer(batch.seq, self.last_seq) {
             return;
@@ -314,14 +257,12 @@ impl PenTracker {
         }
     }
 
-    /// The tracker holds live state a dead client could leave stuck (in range, or mid-stroke).
+    /// A dead client could leave in-range / mid-stroke stuck.
     pub fn is_active(&self) -> bool {
         self.in_range || self.touching
     }
 
-    /// Release everything held (buttons → tip → proximity) — the [`PEN_TOUCH_TIMEOUT_MS`]
-    /// failsafe and session teardown. Keeps the seq gate armed so a late stale datagram from
-    /// the dead stroke cannot re-apply after the release.
+    /// Leaves the seq gate armed so a late stale datagram from the dead stroke cannot re-apply.
     pub fn force_release(&mut self, out: &mut Vec<PenTransition>) {
         if self.buttons != 0 {
             out.push(PenTransition::ButtonsChanged {
@@ -342,15 +283,13 @@ impl PenTracker {
 
     fn apply_sample(&mut self, s: &PenSample, out: &mut Vec<PenTransition>) {
         let touching = s.state & PEN_TOUCHING != 0;
-        // Touching implies in-range (a contact IS a proximity) — normalize here once so every
-        // consumer sees coherent states.
+        // Touching implies in-range. Normalize once so every consumer sees coherent state.
         let in_range = touching || s.state & PEN_IN_RANGE != 0;
         if !in_range {
             self.force_release(out);
             return;
         }
-        // Unknown inherits the session's tool (a newer client's future tool must not thrash
-        // proximity); outside a session it grounds to the default.
+        // Unknown inherits the session tool; outside a session it grounds to default.
         let tool = match s.tool {
             PenTool::Unknown if self.in_range => self.tool,
             t => t,
@@ -429,14 +368,10 @@ mod tests {
         assert_eq!(back.seq, 7);
         assert_eq!(back.samples(), &samples);
 
-        // A torn datagram yields exactly the complete samples that arrived — never an
-        // over-read, never a partial sample.
         let torn = PenBatch::decode(&d[..6 + 2 * PEN_SAMPLE_WIRE_LEN + 5]).unwrap();
         assert_eq!(torn.samples(), &samples[..2]);
-        // Header-only / empty batches and short buffers are rejected whole.
         assert!(PenBatch::decode(&d[..PEN_HEADER_LEN]).is_none());
         assert!(PenBatch::decode(&PenBatch::new(0, &[]).encode()).is_none());
-        // Wrong tag / wrong kind are None before any read.
         let mut bad = d.clone();
         bad[0] = 0xC8;
         assert!(PenBatch::decode(&bad).is_none());
@@ -447,28 +382,23 @@ mod tests {
 
     #[test]
     fn pen_batch_oversize_truncates_and_flags_reserved() {
-        // 10 samples truncate to PEN_BATCH_MAX on construction (senders split instead).
         let many: Vec<PenSample> = (0..10).map(|i| hover(i as f32 / 10.0, 0.5)).collect();
         let b = PenBatch::new(1, &many);
         assert_eq!(b.samples().len(), PEN_BATCH_MAX);
-        // A declared count larger than the payload clamps to what arrived.
         let mut d = b.encode();
         d[3] = 200;
         assert_eq!(PenBatch::decode(&d).unwrap().samples().len(), PEN_BATCH_MAX);
-        // A nonzero reserved flags byte still parses (receivers MUST ignore).
         d[2] = 0xAA;
         assert!(PenBatch::decode(&d).is_some());
     }
 
     #[test]
     fn pen_batch_rejects_forged_floats_and_clamps_stragglers() {
-        // NaN / ∞ coordinates kill the whole batch — nothing legitimate produces them.
         for forged in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let mut s = touch(0.5, 0.5, 1);
             s.x = forged;
             assert!(PenBatch::decode(&PenBatch::new(0, &[s]).encode()).is_none());
         }
-        // A finite coordinate a hair outside the letterbox clamps instead (real input).
         let mut s = hover(0.5, 0.5);
         s.x = -0.01;
         s.y = 1.25;
@@ -478,8 +408,6 @@ mod tests {
 
     #[test]
     fn pen_plane_is_disjoint_from_rich_input() {
-        // A pen datagram shares the 0xCC tag but is NOT a RichInput: a pre-pen host takes the
-        // documented unknown-kind drop, and the pen decoder rejects every RichInput kind.
         let d = PenBatch::new(3, &[touch(0.5, 0.5, 100)]).encode();
         assert!(RichInput::decode(&d).is_none());
         let rich = RichInput::Touchpad {
@@ -500,10 +428,9 @@ mod tests {
         assert!(!pen_seq_newer(5, Some(5)));
         assert!(!pen_seq_newer(4, Some(5)));
         assert!(pen_seq_newer(2, Some(0xFFFE))); // wrap
-        assert!(!pen_seq_newer(0xFFFE, Some(2))); // stale across the wrap
+        assert!(!pen_seq_newer(0xFFFE, Some(2)));
     }
 
-    /// Drives a tracker and returns the transitions of one batch.
     fn run(t: &mut PenTracker, seq: u16, samples: &[PenSample]) -> Vec<PenTransition> {
         let mut out = Vec::new();
         t.apply(&PenBatch::new(seq, samples), &mut out);
@@ -513,7 +440,6 @@ mod tests {
     #[test]
     fn tracker_full_stroke_lifecycle() {
         let mut t = PenTracker::default();
-        // Hover in → ProximityIn + Motion.
         let h = hover(0.2, 0.2);
         assert_eq!(
             run(&mut t, 0, &[h]),
@@ -522,20 +448,17 @@ mod tests {
                 PenTransition::Motion { sample: h },
             ]
         );
-        // Contact: Motion precedes TipDown so ink lands at the sample's position.
         let c = touch(0.21, 0.2, 30000);
         assert_eq!(
             run(&mut t, 1, &[c]),
             vec![PenTransition::Motion { sample: c }, PenTransition::TipDown]
         );
         assert!(t.is_active());
-        // Drag: motion only.
         let m = touch(0.3, 0.25, 45000);
         assert_eq!(
             run(&mut t, 2, &[m]),
             vec![PenTransition::Motion { sample: m }]
         );
-        // Lift back to hover, then leave range: buttons(none) → TipUp, then ProximityOut.
         let l = hover(0.3, 0.25);
         assert_eq!(
             run(&mut t, 3, &[l]),
@@ -549,8 +472,6 @@ mod tests {
     #[test]
     fn tracker_self_heals_lost_transitions() {
         let mut t = PenTracker::default();
-        // The hover batch AND the tip-down batch were lost: the first surviving mid-stroke
-        // sample synthesizes the whole entry.
         let m = touch(0.5, 0.5, 20000);
         assert_eq!(
             run(&mut t, 10, &[m]),
@@ -560,7 +481,6 @@ mod tests {
                 PenTransition::TipDown,
             ]
         );
-        // The lift batch was lost; the next out-of-range sample heals it fully.
         assert_eq!(
             run(&mut t, 11, &[PenSample::default()]),
             vec![PenTransition::TipUp, PenTransition::ProximityOut]
@@ -572,7 +492,6 @@ mod tests {
         let mut t = PenTracker::default();
         let c = touch(0.5, 0.5, 100);
         assert!(!run(&mut t, 5, &[c]).is_empty());
-        // A reordered older batch (a hover from before the contact) must not rewind the stroke.
         assert!(run(&mut t, 4, &[hover(0.4, 0.4)]).is_empty());
         assert!(t.is_active());
     }
@@ -582,7 +501,6 @@ mod tests {
         let mut t = PenTracker::default();
         let mut held = touch(0.5, 0.5, 100);
         held.state |= PEN_BARREL1;
-        // Buttons apply after TipDown on entry…
         assert_eq!(
             run(&mut t, 0, &[held]),
             vec![
@@ -595,7 +513,6 @@ mod tests {
                 },
             ]
         );
-        // …swap BARREL1 → BARREL2 in one sample: one delta, both directions.
         let mut swapped = held;
         swapped.state = (swapped.state & !PEN_BARREL1) | PEN_BARREL2;
         assert_eq!(
@@ -608,8 +525,6 @@ mod tests {
                 },
             ]
         );
-        // Tool switch to eraser mid-contact = full release + re-entry as the eraser, with the
-        // held button released first so nothing sticks across tools.
         let mut erase = touch(0.5, 0.5, 200);
         erase.tool = PenTool::Eraser;
         assert_eq!(
@@ -628,7 +543,6 @@ mod tests {
                 PenTransition::TipDown,
             ]
         );
-        // Unknown tool inside the session inherits (no re-entry thrash from a newer client).
         let mut unk = touch(0.51, 0.5, 210);
         unk.tool = PenTool::Unknown;
         assert_eq!(
@@ -643,7 +557,6 @@ mod tests {
         let mut held = touch(0.5, 0.5, 100);
         held.state |= PEN_BARREL2;
         run(&mut t, 100, &[held]);
-        // The 200 ms failsafe / teardown: buttons → tip → proximity, all released.
         let mut out = Vec::new();
         t.force_release(&mut out);
         assert_eq!(
@@ -658,14 +571,11 @@ mod tests {
             ]
         );
         assert!(!t.is_active());
-        // Idempotent.
         let mut out = Vec::new();
         t.force_release(&mut out);
         assert!(out.is_empty());
-        // The seq gate survives the release: a late datagram from the dead stroke is stale.
         assert!(run(&mut t, 99, &[held]).is_empty());
         assert!(!t.is_active());
-        // But the stroke after it proceeds normally.
         assert!(!run(&mut t, 101, &[held]).is_empty());
         assert!(t.is_active());
     }
@@ -675,8 +585,6 @@ mod tests {
         let mut t = PenTracker::default();
         let mut p = touch(0.5, 0.5, 100);
         p.state |= PEN_PREDICTED;
-        // A v1 host must never inject a predicted sample — and skipping must not corrupt
-        // tracking for the real samples around it.
         let real = touch(0.6, 0.5, 120);
         let out = run(&mut t, 0, &[p, real]);
         assert_eq!(

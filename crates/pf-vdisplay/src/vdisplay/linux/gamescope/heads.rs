@@ -1,35 +1,22 @@
-//! The physical head a gamescope session drives — the enumeration half of per-monitor capture.
+//! The physical head a gamescope DRM session drives.
 //!
-//! gamescope was originally written off here as "nested, therefore no physical heads of its own"
-//! (`design/per-monitor-portal-capture.md` §2). That is true of a gamescope running *inside*
-//! another compositor, and of the headless ones this crate spawns itself — but it is false for the
-//! deployment most people actually stream from: a Bazzite/SteamOS **Game Mode session is the DRM
-//! master**, driving the TV directly. On such a box the head exists, the operator can see it, and
-//! refusing to list it meant the console's picker was permanently empty on exactly the hardware the
-//! feature was asked for.
+//! Nested and headless gamescopes have no connector of their own. A session that is the DRM
+//! master does: this module finds that connector from `/proc/<pid>/cmdline` (backend flag and
+//! `--prefer-output`) and `/sys/class/drm` (plug status + EDID). gamescope has no protocol that
+//! reports the output it lights; [`gamescope_control`] only sets things.
 //!
-//! So this module answers a narrow question — *is this gamescope on the DRM backend, and which
-//! connector is it lighting?* — from two sources that need no cooperation from gamescope:
+//! Only the driven head is listed. Mirror capture attaches to gamescope's composited PipeWire
+//! node (`vdisplay::mirror`), so an undriven connector cannot be streamed. The pin id is the
+//! connector name (`HDMI-A-1`), the same string `PUNKTFUNK_CAPTURE_MONITOR` names.
 //!
-//! * `/proc/<pid>/cmdline`, for the backend flag and `--prefer-output` (gamescope has no protocol
-//!   that reports its own output; the [`gamescope_control`] extension only sets things), and
-//! * `/sys/class/drm`, for which connectors are actually plugged in, plus each one's EDID.
-//!
-//! **Only the head gamescope drives is listed.** Mirroring here is an attach to gamescope's own
-//! composited PipeWire node (see [`super::heads`]'s caller in `vdisplay::mirror`), so a connector
-//! gamescope is *not* driving could never be streamed — offering it in a picker would be offering
-//! something that cannot work.
+//! Empty, never an error, when there is no DRM session or nothing is plugged in — same contract
+//! as [`crate::monitors::list`]. See `design/per-monitor-portal-capture.md`.
 
 use crate::monitors::{describe, PhysicalMonitor};
 use std::path::Path;
 
-/// The head this box's gamescope session is driving, or empty when it drives none.
-///
-/// Empty — never an error — for the three "no physical head" shapes, which are ordinary states and
-/// not failures to reach anything: no gamescope running, a gamescope on a non-DRM backend
-/// (`--backend headless`, or nested in a parent compositor), and a DRM gamescope with nothing
-/// plugged in. That matches [`crate::monitors::list`]'s contract, where `Ok(vec![])` means "asked,
-/// and there are none".
+/// The DRM-driven head, or empty. Empty is not an error: no gamescope, a nested/headless
+/// backend, or nothing plugged in. Same contract as [`crate::monitors::list`].
 pub(crate) fn list_monitors() -> anyhow::Result<Vec<PhysicalMonitor>> {
     Ok(heads_under(
         Path::new("/sys/class/drm"),
@@ -37,21 +24,13 @@ pub(crate) fn list_monitors() -> anyhow::Result<Vec<PhysicalMonitor>> {
     ))
 }
 
-/// [`list_monitors`] against an arbitrary sysfs root and a supplied argv set — the unit-testable
-/// core.
+/// [`list_monitors`] against a sysfs root and argv set.
 ///
-/// The head's size comes from the `-W`/`-H` of the argv selected HERE, which OUTRANKS the EDID's
-/// preferred timing because it is the size the capture node actually produces. It used to arrive as
-/// a parameter filled by a scan over ALL gamescopes on the box — including the nested child this
-/// function had just deliberately rejected, and any headless one the crate spawned itself. On a
-/// Deck driving eDP-1 at 1280x800 with a game nested at `-W 1920 -H 1080`, the panel was listed as
-/// 1920x1080, and `mirror::create` publishes that row verbatim as the `preferred_mode` the stream
-/// negotiates against — a mode the composited node never produces, and one `check_mirrorable` waves
-/// through because it only rejects `0x0`.
+/// Size is `-W`/`-H` on the argv selected here — what the capture node produces — not the EDID
+/// preferred timing, and not another gamescope on the box (a nested child, or a headless one
+/// this crate spawned).
 fn heads_under(base: &Path, argvs: &[Vec<String>]) -> Vec<PhysicalMonitor> {
-    // A gamescope that isn't on DRM has no head of its own. Any DRM-backed one qualifies the box:
-    // a Deck streaming from Game Mode often has a second, nested gamescope running the game inside
-    // the session one, and that child must not disqualify its parent.
+    // First DRM-backed argv, not first argv: a nested child must not mask its parent.
     let Some(argv) = argvs.iter().find(|a| drives_drm(a)) else {
         return Vec::new();
     };
@@ -71,11 +50,8 @@ fn heads_under(base: &Path, argvs: &[Vec<String>]) -> Vec<PhysicalMonitor> {
                 .as_ref()
                 .map(|e| (e.make.clone(), e.model.clone()))
                 .unwrap_or_default();
-            // Size: what the capture node produces (`-W`/`-H`) beats the panel's preferred timing,
-            // since that is what the client will actually decode. Refresh only ever comes from the
-            // EDID — gamescope's `-r`/`--nested-refresh` is the rate it composites the NESTED game
-            // at, not the rate the connector runs, and reading it as the latter would tell the
-            // pacer to cap a 120 Hz TV at whatever the session happened to be launched with.
+            // Size: `-W`/`-H` (capture node). Refresh: EDID only — `-r` is the nested
+            // composite rate, not the connector; using it caps a 120 Hz panel at launch rate.
             let (w, h) = output_size
                 .or_else(|| edid.as_ref().map(|e| (e.width, e.height)))
                 .or_else(|| preferred_sysfs_mode(base, &c.dir))
@@ -86,32 +62,29 @@ fn heads_under(base: &Path, argvs: &[Vec<String>]) -> Vec<PhysicalMonitor> {
                 width: w,
                 height: h,
                 refresh_mhz: edid.as_ref().map(|e| e.refresh_mhz).unwrap_or(0),
-                // gamescope composites ONE output; there is no global space to be offset in, so
-                // the origin is the origin. (`monitors`' identity key degenerates here, which is
-                // sound precisely because there is never more than one head to tell apart.)
+                // No compositor global space — gamescope composites one node.
+                // `monitors`' origin identity-key degenerates; every row is (0, 0).
                 x: 0,
                 y: 0,
                 scale: 1.0,
                 primary: true,
                 enabled: c.enabled,
-                // Never ours: a gamescope WE created is headless, and `drives_drm` excluded it.
+                // Headless gamescopes this crate spawns never reach here (`drives_drm`).
                 managed: false,
             }
         })
         .collect()
 }
 
-/// One connected DRM connector, as sysfs presents it.
 struct Connector {
-    /// Directory name — `card1-HDMI-A-1`.
+    /// Sysfs directory — `card1-HDMI-A-1`.
     dir: String,
-    /// Connector name with the `cardN-` prefix stripped — `HDMI-A-1`, the id an operator pins.
+    /// Connector with `cardN-` stripped — `HDMI-A-1`, the pin id.
     connector: String,
     enabled: bool,
 }
 
-/// Every plugged-in connector under `base`, sorted by name so the list is stable across calls
-/// (`read_dir` order is not).
+/// Plugged-in connectors, sorted by name (`read_dir` order is not stable).
 fn connected_connectors(base: &Path) -> Vec<Connector> {
     let Ok(entries) = std::fs::read_dir(base) else {
         return Vec::new();
@@ -120,8 +93,7 @@ fn connected_connectors(base: &Path) -> Vec<Connector> {
         .flatten()
         .filter_map(|e| {
             let dir = e.file_name().to_str()?.to_string();
-            // `cardN-<connector>`; the render/device nodes (`card1`, `renderD128`) have no dash and
-            // no status file, and a connector name itself contains dashes (`HDMI-A-1`).
+            // `cardN-<connector>`. `card1`/`renderD128` have no dash; the connector name does.
             let (card, connector) = dir.split_once('-')?;
             if !card.starts_with("card") || !card[4..].bytes().all(|b| b.is_ascii_digit()) {
                 return None;
@@ -144,16 +116,12 @@ fn connected_connectors(base: &Path) -> Vec<Connector> {
     out
 }
 
-/// Which of `connected` is gamescope lighting?
+/// Connector gamescope is lighting.
 ///
-/// `--prefer-output` is gamescope's own answer and is taken when it names something plugged in —
-/// it is a comma-separated preference list (`*,eDP-1` on a Deck), so `*` ("whatever you find") is
-/// skipped rather than matched. Failing that, a single connected head is unambiguous.
-///
-/// When neither settles it, every connected head is returned. That is deliberately NOT a guess:
-/// mirroring attaches to gamescope's composited node, so the *stream* is correct whichever row the
-/// operator picks — only the label could be off, and showing the plausible labels beats showing an
-/// empty picker on a box that demonstrably has a screen.
+/// `--prefer-output` is a comma-separated preference list; `*` means "any" and is skipped, not
+/// matched. One connected head is unambiguous. Otherwise every connected head is returned —
+/// not a guess: the stream is the composited node either way, so a wrong label still streams
+/// the right pixels.
 fn resolve_driven(connected: &[Connector], prefer: Option<&str>) -> Vec<Connector> {
     let clone = |c: &Connector| Connector {
         dir: c.dir.clone(),
@@ -184,12 +152,10 @@ fn resolve_driven(connected: &[Connector], prefer: Option<&str>) -> Vec<Connecto
     connected.iter().map(clone).collect()
 }
 
-/// Is this gamescope on the DRM backend — i.e. does it own a physical connector?
+/// DRM backend — owns a physical connector.
 ///
-/// gamescope picks DRM when no `--backend` says otherwise, so ABSENCE of the flag is the common
-/// yes (a Bazzite session's argv carries `--prefer-output` and no backend at all). `headless` is
-/// what this crate spawns and what its own SteamOS takeover writes; `wayland`/`sdl`/`x11` are
-/// nested. `-b` is the short form.
+/// No `--backend` means DRM (gamescope's default). `headless` is what this crate spawns;
+/// `wayland`/`sdl`/`x11` are nested. `-b` is the short form.
 fn drives_drm(argv: &[String]) -> bool {
     match backend_flag(argv) {
         Some(b) => b.eq_ignore_ascii_case("drm"),
@@ -205,8 +171,7 @@ fn prefer_output(argv: &[String]) -> Option<&str> {
     flag_value(argv, &["--prefer-output", "-O"])
 }
 
-/// The value following the first of `names` present in `argv`, in both `--flag value` and
-/// `--flag=value` spellings.
+/// Value of the first matching flag, in `--flag value` and `--flag=value` form.
 fn flag_value<'a>(argv: &'a [String], names: &[&str]) -> Option<&'a str> {
     argv.iter().enumerate().find_map(|(i, a)| {
         if let Some((k, v)) = a.split_once('=') {
@@ -221,8 +186,7 @@ fn flag_value<'a>(argv: &'a [String], names: &[&str]) -> Option<&'a str> {
     })
 }
 
-/// The connector's preferred mode from sysfs (`modes`, most-preferred first, `WIDTHxHEIGHT`).
-/// Last-resort size when there is neither a `-W`/`-H` nor a readable EDID.
+/// Sysfs `modes` first line (`WIDTHxHEIGHT`) — last-resort size after `-W`/`-H` and EDID.
 fn preferred_sysfs_mode(base: &Path, dir: &str) -> Option<(u32, u32)> {
     let modes = std::fs::read_to_string(base.join(dir).join("modes")).ok()?;
     let first = modes.lines().next()?.trim();
@@ -230,7 +194,6 @@ fn preferred_sysfs_mode(base: &Path, dir: &str) -> Option<(u32, u32)> {
     Some((w.parse().ok()?, h.trim().parse().ok()?))
 }
 
-/// The fields a picker needs out of an EDID base block.
 struct Edid {
     make: String,
     model: String,
@@ -239,19 +202,16 @@ struct Edid {
     refresh_mhz: u32,
 }
 
-/// Parse an EDID 1.x base block: the manufacturer id, the monitor-name descriptor, and the
-/// preferred detailed timing.
+/// Manufacturer id, monitor-name descriptor, preferred detailed timing.
 ///
-/// Only the first 128-byte block is read. Extension blocks (CTA-861) can carry *more* modes, but
-/// never a better answer to "what is this panel called and what is its preferred timing", which is
-/// all a picker row needs.
+/// First 128-byte block only. CTA-861 extensions add modes, not a better name or preferred
+/// timing — all a picker row needs.
 fn parse_edid(bytes: &[u8]) -> Option<Edid> {
     if bytes.len() < 128 || bytes[..8] != [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00] {
         return None;
     }
-    // Manufacturer: three 5-bit letters packed big-endian, 1 = 'A' (bit 15 reserved). This is the
-    // PnP id (`SAM`, `LGD`) rather than a marketing name — the same thing sway and KWin report,
-    // and `describe` pairs it with the model string.
+    // Three 5-bit letters packed BE, 1 = 'A' (bit 15 reserved). PnP id, not a marketing
+    // name; `describe` pairs it with the model string.
     let m = u16::from_be_bytes([bytes[8], bytes[9]]);
     let letter = |shift: u16| -> Option<char> {
         let v = ((m >> shift) & 0x1F) as u8;
@@ -259,13 +219,13 @@ fn parse_edid(bytes: &[u8]) -> Option<Edid> {
     };
     let make: String = match (letter(10), letter(5), letter(0)) {
         (Some(a), Some(b), Some(c)) => [a, b, c].iter().collect(),
-        // A zeroed/garbage id is not worth showing; `describe` falls back to the connector.
+        // Zeroed/garbage id: leave empty so `describe` falls back to the connector.
         _ => String::new(),
     };
     let mut model = String::new();
     let mut timing: Option<(u32, u32, u32)> = None;
-    // Four 18-byte descriptors. The FIRST is the preferred timing by definition; the others may be
-    // timings too, or tagged text blocks (a zero pixel clock is the tag marker).
+    // Four 18-byte descriptors. First timing is preferred; pixel clock 0 marks a tagged
+    // text block, not a mode.
     for off in [54usize, 72, 90, 108] {
         let d = &bytes[off..off + 18];
         let pixel_clock = u16::from_le_bytes([d[0], d[1]]);
@@ -281,7 +241,7 @@ fn parse_edid(bytes: &[u8]) -> Option<Edid> {
         if timing.is_some() {
             continue;
         }
-        // Split-nibble encoding: the high 4 bits of the upper byte extend hactive, the low 4 hblank
+        // Split-nibble: high 4 of the upper byte extend hactive, low 4 hblank
         // (likewise vactive/vblank).
         let hactive = d[2] as u32 | ((d[4] as u32 & 0xF0) << 4);
         let hblank = d[3] as u32 | ((d[4] as u32 & 0x0F) << 8);
@@ -291,8 +251,8 @@ fn parse_edid(bytes: &[u8]) -> Option<Edid> {
         if hactive == 0 || vactive == 0 || htotal == 0 || vtotal == 0 {
             continue;
         }
-        // Pixel clock is in 10 kHz units; ×10_000 gives Hz, and the extra ×1000 gives mHz — done
-        // in u64 so a 4K timing's htotal×vtotal cannot overflow the intermediate.
+        // Pixel clock is 10 kHz units; ×10_000_000 → mHz. u64 so a 4K htotal×vtotal
+        // cannot overflow the intermediate.
         let refresh_mhz =
             ((pixel_clock as u64 * 10_000_000) / (htotal as u64 * vtotal as u64)) as u32;
         timing = Some((hactive, vactive, refresh_mhz));
@@ -315,8 +275,7 @@ mod tests {
         s.split_whitespace().map(String::from).collect()
     }
 
-    /// A sysfs tree with the device/render nodes a real `/sys/class/drm` also holds, so the
-    /// connector filter is exercised against the noise it has to survive.
+    /// Fake `/sys/class/drm` including `card1`/`renderD128`, so the filter sees real noise.
     fn sysfs(name: &str, connectors: &[(&str, &str, &str)]) -> std::path::PathBuf {
         let base = std::env::temp_dir().join(format!("pf-gs-heads-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -332,8 +291,6 @@ mod tests {
         base
     }
 
-    /// The bug this module exists to fix: a Bazzite Game Mode session (no `--backend`, so DRM)
-    /// driving a TV must report that TV, where the old code returned an empty list unconditionally.
     #[test]
     fn a_drm_backed_session_reports_the_head_it_drives() {
         let base = sysfs(
@@ -353,9 +310,6 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    /// The original premise, which stays true and must keep returning empty: a gamescope we spawned
-    /// headless (or one nested in a parent compositor) owns no connector, even on a box whose TV is
-    /// plugged in. This is the state a punktfunk takeover leaves the box in mid-stream.
     #[test]
     fn a_headless_or_nested_session_reports_nothing() {
         let base = sysfs(
@@ -373,13 +327,10 @@ mod tests {
                 "expected no heads for {a:?}"
             );
         }
-        // No gamescope at all is the same answer, not an error.
         assert!(heads_under(&base, &[]).is_empty());
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    /// A Deck in Game Mode runs a SECOND gamescope nested inside the session one for the game. The
-    /// nested child must not mask the parent's connector.
     #[test]
     fn a_nested_child_does_not_disqualify_its_drm_parent() {
         let base = sysfs("nested", &[("card1-eDP-1", "connected\n", "enabled\n")]);
@@ -392,15 +343,11 @@ mod tests {
         );
         assert_eq!(heads.len(), 1);
         assert_eq!(heads[0].connector, "eDP-1");
-        // …and the size comes from the DRM PARENT, not from the nested child listed first. Reading
-        // it off any-gamescope-on-the-box is what published a 1280x800 panel as the mirror's
-        // preferred mode on a box where the game happened to be nested at a different size.
+        // Size from the DRM parent, not the nested child listed first.
         assert_eq!((heads[0].width, heads[0].height), (2560, 1440));
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    /// `*` means "whatever you find" and must not be matched against a connector name; the next
-    /// entry in the preference list is the real answer.
     #[test]
     fn prefer_output_skips_the_wildcard_and_picks_the_named_head() {
         let base = sysfs(
@@ -416,8 +363,6 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    /// Two heads and nothing to choose between them: list both rather than guess or show nothing —
-    /// the mirror attaches to the composited node, so any row streams the right pixels.
     #[test]
     fn an_undecidable_multi_head_box_lists_every_connected_head() {
         let base = sysfs(
@@ -439,7 +384,6 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    /// A DRM gamescope with nothing plugged in is a headless box — empty, not an error.
     #[test]
     fn a_drm_session_with_nothing_plugged_in_reports_nothing() {
         let base = sysfs(
@@ -450,8 +394,6 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    /// gamescope's own output size is what the capture node produces, so it outranks the panel's
-    /// preferred timing — a supersampled session must not advertise the TV's native size.
     #[test]
     fn the_capture_size_outranks_the_panels_preferred_timing() {
         let base = sysfs("size", &[("card1-HDMI-A-1", "connected\n", "enabled\n")]);
@@ -463,7 +405,7 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    /// A synthetic EDID: 1920x1080 @ 60 Hz preferred timing, make `ACM`, name "TEST PANEL".
+    /// 1920×1080 @ 60 Hz, make `ACM`, name "TEST PANEL".
     fn edid_1080p60() -> Vec<u8> {
         let mut e = vec![0u8; 128];
         e[..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
@@ -472,13 +414,13 @@ mod tests {
         e[8..10].copy_from_slice(&id.to_be_bytes());
         // Preferred detailed timing: 148.5 MHz = 14850 (10 kHz units); 1920+280 x 1080+45.
         e[54..56].copy_from_slice(&14850u16.to_le_bytes());
-        e[56] = 1920u32 as u8; // hactive low
-        e[57] = 280u32 as u8; // hblank low
+        e[56] = 1920u32 as u8;
+        e[57] = 280u32 as u8;
         e[58] = ((1920 >> 4) as u8 & 0xF0) | ((280 >> 8) as u8 & 0x0F);
-        e[59] = (1080 & 0xFF) as u8; // vactive low
-        e[60] = 45; // vblank low
+        e[59] = (1080 & 0xFF) as u8;
+        e[60] = 45;
         e[61] = ((1080 >> 4) as u8 & 0xF0) | ((45 >> 8) as u8 & 0x0F);
-        // Second descriptor: monitor name.
+        // Monitor-name descriptor (tag 0xFC).
         e[72..74].copy_from_slice(&0u16.to_le_bytes());
         e[75] = 0xFC;
         let name = b"TEST PANEL\x0a";
@@ -497,16 +439,12 @@ mod tests {
         assert_eq!(describe(&e.make, &e.model, "HDMI-A-1"), "ACM TEST PANEL");
     }
 
-    /// Garbage must not become a picker row that lies; the caller falls back to the connector name.
     #[test]
     fn a_bad_edid_is_rejected_rather_than_half_parsed() {
         assert!(parse_edid(&[0u8; 128]).is_none(), "no magic header");
         assert!(parse_edid(&[0u8; 12]).is_none(), "too short");
     }
 
-    /// The refresh a mirrored TV runs at comes from the EDID — reading gamescope's
-    /// `--nested-refresh` as the connector's rate would let a session launched at 60 cap a 120 Hz
-    /// panel for the whole stream.
     #[test]
     fn refresh_comes_from_the_panel_not_from_the_nested_rate() {
         let base = sysfs("refresh", &[("card1-HDMI-A-1", "connected\n", "enabled\n")]);
@@ -534,7 +472,6 @@ mod tests {
         assert_eq!(prefer_output(&argv("gamescope -O DP-2")), Some("DP-2"));
     }
 
-    /// Sysfs `modes` is the last resort when a panel has no readable EDID (some TVs over a KVM).
     #[test]
     fn sysfs_modes_is_the_last_resort_size() {
         let base = sysfs("modes", &[("card1-HDMI-A-1", "connected\n", "enabled\n")]);

@@ -1,40 +1,29 @@
-//! Shared discovery-address selection: which A record to dial when an mDNS advert resolves to
-//! several.
+//! Which A record to dial when an mDNS advert resolves to several.
 //!
-//! The resolved set is a UNION of answers from every responder on every interface. The host's
-//! own advert registers exactly one address (its routed primary — see the host crate's
-//! `discovery.rs`), but the host OS's built-in mDNS responder also answers A queries for the
-//! same `<host>.local.` label per interface, with that interface's address — so a host running
-//! an overlay network (ZeroTier, Tailscale, …) whose multicast reaches this client contributes
-//! its overlay address to the set. Field case: a client dialed the host's ZeroTier address
-//! while both machines shared a LAN, because the pick was `HashSet::iter().next()` — arbitrary,
-//! and re-rolled on every re-announce.
+//! The resolved set is a union of answers from every responder on every
+//! interface. The host advert registers one address (its routed primary;
+//! host crate `discovery.rs`), but the OS mDNS responder also answers
+//! `<host>.local.` per interface. Overlay networks add their addresses
+//! to the same set.
 //!
-//! [`rank_host_addr`] is the pure policy (testable); [`pick_host_addr`] applies it with this
-//! machine's live context.
+//! [`rank_host_addr`] is the pure policy; [`pick_host_addr`] applies it
+//! with this machine's live context.
 
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 
-/// Common leading bits of two addresses — the "how on-link is this" proxy the ranking runs on.
-/// No netmasks: a longer shared prefix with one of our own addresses is monotonically "more
-/// likely on this segment", which is all a RANKING needs.
+/// Shared leading bits — the ranking's on-link proxy. No netmasks: a longer
+/// prefix with one of our addresses is "more on this segment".
 fn prefix_bits(a: Ipv4Addr, b: Ipv4Addr) -> u32 {
     (u32::from(a) ^ u32::from(b)).leading_zeros()
 }
 
-/// The address to dial, chosen deterministically. Score, best wins, in order:
+/// Address to dial, chosen deterministically. Best score wins:
 ///
-/// 1. longest common prefix with ANY of this machine's unicast addresses — an address on one of
-///    our own subnets beats one we would have to route. This alone settles the overlay case in
-///    both directions: on a shared LAN the host's LAN address out-prefixes its overlay address,
-///    and a client that can ONLY reach the host through the overlay has no LAN interface for
-///    the host's LAN address to match, so the overlay address wins instead;
-/// 2. the address the host itself declared (mDNS TXT `addr`, its routed primary) — settles a
-///    multi-NIC host's tie without ever overriding reachability, because a declared address we
-///    cannot see on-link already lost rung 1;
-/// 3. longest common prefix with OUR routed (default-route) source address — a host that
-///    predates the `addr` TXT still resolves the common ties here;
-/// 4. the numerically lowest address — pure determinism, so a re-announce cannot flap the pick.
+/// 1. longest common prefix with any of this machine's unicast addresses
+///    (on-link beats routed; overlay wins only when we have no LAN match);
+/// 2. the address the host declared (mDNS TXT `addr`);
+/// 3. longest common prefix with our default-route source;
+/// 4. numerically lowest — so a re-announce cannot flap the pick.
 pub fn rank_host_addr(
     candidates: &[Ipv4Addr],
     host_declared: Option<Ipv4Addr>,
@@ -55,9 +44,9 @@ pub fn rank_host_addr(
     })
 }
 
-/// [`rank_host_addr`] with this machine's live context: every non-loopback unicast IPv4, plus
-/// the source address the OS routes toward the internet. Gathered per call — discovery events
-/// are rare, and interfaces change (VPN up/down) between them.
+/// [`rank_host_addr`] with live context: non-loopback unicast IPv4 plus the
+/// OS default-route source. Gathered per call — interfaces change between
+/// discovery events.
 pub fn pick_host_addr(
     candidates: &[Ipv4Addr],
     host_declared: Option<Ipv4Addr>,
@@ -83,8 +72,8 @@ fn local_ipv4s() -> Vec<Ipv4Addr> {
         .unwrap_or_default()
 }
 
-/// Same trick as the host's `primary_local_ip`: a UDP `connect()` performs the route lookup
-/// without sending a packet, and `local_addr` is the source address the OS chose.
+/// UDP `connect` does a route lookup without sending; `local_addr` is the
+/// source the OS chose. Same as the host's `primary_local_ip`.
 fn routed_local_ipv4() -> Option<Ipv4Addr> {
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect("8.8.8.8:80").ok()?;
@@ -103,9 +92,7 @@ mod tests {
         s.parse().unwrap()
     }
 
-    // The 2026-08-28 field case: host advertises from its LAN address, the OS responder adds
-    // the ZeroTier address over the overlay's multicast, and both machines are on both
-    // networks. The LAN address must win — with or without the host's TXT declaration.
+    // Shared LAN + overlay: LAN must win, with or without the host's TXT declaration.
     #[test]
     fn shared_lan_beats_shared_overlay() {
         let candidates = [ip("192.168.196.206"), ip("192.168.1.170")];
@@ -118,9 +105,7 @@ mod tests {
         }
     }
 
-    // A client that can ONLY reach the host through the overlay (different site): the host's
-    // declared LAN address is not on any of our subnets, so it must NOT win — the overlay
-    // address is the reachable one.
+    // Overlay-only client: declared LAN is off-link, so it must not beat the overlay address.
     #[test]
     fn overlay_only_client_ignores_the_declared_lan_address() {
         let candidates = [ip("192.168.1.170"), ip("192.168.196.206")];
@@ -136,9 +121,7 @@ mod tests {
         );
     }
 
-    // A multi-NIC host (Ethernet + Wi-Fi on the same LAN) ties on every reachability rung;
-    // its own declaration settles which of ITS addresses we dial. Without the declaration
-    // (older host) the pick is still deterministic.
+    // Same-LAN multi-NIC tie: host declaration wins; without it, lowest address.
     #[test]
     fn declared_addr_settles_a_multi_nic_tie() {
         let candidates = [ip("192.168.1.170"), ip("192.168.1.171")];

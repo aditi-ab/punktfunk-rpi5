@@ -1,15 +1,13 @@
-//! Windows facts: the read-only probe of a Windows box (WP1.1).
+//! Windows host facts: the read-only probe later stages may read.
 //!
-//! Same charter as `facts.rs`, different machine: everything later stages may know about a
-//! Windows host, as one serde'd struct so `--facts` and `--demo` stay honest. Registry reads
-//! go through `reg.exe` via `CommandRunner` — value names and `REG_*` type tokens are
-//! locale-invariant, unlike anything PowerShell prints — and the two questions no process can
-//! answer (NLA network categories, a port already bound) sit behind `NetProbe`, whose system
-//! impl is the only `cfg(windows)` code here. Everything else compiles and tests on any OS,
-//! which is what puts the Windows plans in the Linux and macOS lanes.
+//! Same charter as `facts.rs`: one serde'd struct so `--facts` and `--demo`
+//! round-trip the same fields. Registry reads go through `reg.exe` via
+//! `CommandRunner` — value names and `REG_*` type tokens are locale-invariant,
+//! unlike PowerShell. NLA categories and a bound-port check sit behind
+//! `NetProbe`; the system impl is the only `cfg(windows)` code here. Everything
+//! else compiles and tests on any OS.
 //!
-//! Design of record: `design/installer-v2-windows.md` §3 (facts), D11 (coexistence), D12
-//! (network step) in the planning repo.
+//! Design: `design/installer-v2-windows.md` (facts, coexistence, network step).
 
 pub mod args;
 pub mod choices;
@@ -27,12 +25,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::seam::{BasePaths, CommandRunner, Env};
 
-/// The host installer's ARP key. The `_is1` suffix is Inno's, kept forever: winget's
-/// `ProductCode` and every fielded install track this exact key name.
+/// Host ARP key. The `_is1` suffix is Inno's; winget's `ProductCode` matches this name.
 pub const HOST_ARP_KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{7C9E6A52-1F4B-4E8D-A3C7-2B5D8F1E0A93}_is1";
 
-/// GameStream hosts that own the ports punktfunk would want. Service names, verbatim from the
-/// shipped installer's probe list.
+/// GameStream host services that occupy the same ports.
 pub const COMPETING_SERVICES: [&str; 5] = [
     "SunshineService",
     "ApolloService",
@@ -41,7 +37,7 @@ pub const COMPETING_SERVICES: [&str; 5] = [
     "LuminalShineService",
 ];
 
-/// The management API's default port — and Sunshine's web UI port, which is why D11 exists.
+/// Management API default port. Also Sunshine's web UI port.
 pub const MGMT_PORT: u16 = 47990;
 
 /// The uninstaller's file name: docs-site promises `{app}\unins000.exe` (D6), so the pack
@@ -73,8 +69,7 @@ pub fn launched_as_uninstaller(exe: &std::path::Path) -> bool {
 /// Where D11 moves the management API when a competitor owns [`MGMT_PORT`].
 pub const MGMT_PORT_MOVED: u16 = 47991;
 
-/// An NLA network category. `Domain` is immutable through the API; the D12 step never offers
-/// to change it.
+/// NLA network category. `Domain` cannot be changed through the API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NetCategory {
@@ -83,30 +78,30 @@ pub enum NetCategory {
     Domain,
 }
 
-/// One connected network, as NLA sees it.
+/// One connected NLA network.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetProfile {
     pub name: String,
     pub category: NetCategory,
 }
 
-/// The two probes that have no process to shell: NLA categories and a bound port.
+/// NLA categories and a bound-port check — neither has a process to shell.
 ///
-/// The system impl answers from COM and a bind attempt; tests and `--demo` inject the box
-/// they want, the same bargain as `CommandRunner`.
+/// The system impl uses COM and a bind attempt. Tests and `--demo` inject a fake,
+/// same as `CommandRunner`.
 pub trait NetProbe {
     fn networks(&self) -> Vec<NetProfile>;
     fn port_in_use(&self, port: u16) -> bool;
-    /// D12's consented fix. Per-network; `false` = the API refused (e.g. a domain network).
+    /// Set one network to Private. `false` if the API refused (a domain network).
     fn make_private(&self, network: &str) -> bool;
 }
 
-/// A `NetProbe` that answers from data and touches nothing.
+/// In-memory `NetProbe`. Touches nothing.
 #[derive(Debug, Default)]
 pub struct FakeNet {
     pub networks: Vec<NetProfile>,
     pub ports_in_use: Vec<u16>,
-    /// Every network a test run asked to flip — what the D12 tests assert against.
+    /// Networks `make_private` was asked to flip.
     pub made_private: std::cell::RefCell<Vec<String>>,
 }
 
@@ -125,8 +120,7 @@ impl NetProbe for FakeNet {
     }
 }
 
-/// A scheduled task's pre-install state — captured so upgrade stop/restore can put back
-/// exactly what was there, including on an aborted run.
+/// Pre-install scheduled-task state, so upgrade stop/restore can put it back after abort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskState {
@@ -135,34 +129,33 @@ pub enum TaskState {
     Disabled,
 }
 
-/// What the ARP key says about an existing install.
+/// ARP record of an existing install.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WinInstall {
     pub version: Option<String>,
-    /// `InstallLocation` — an upgrade follows it instead of the default dir.
+    /// `InstallLocation`. An upgrade follows this instead of the default dir.
     pub location: Option<String>,
 }
 
-/// Everything the Windows plan is allowed to know about this machine.
+/// Everything later Windows stages may know about this machine.
 ///
-/// On Windows, `BasePaths.config` is `%ProgramData%` — `host_env()` then lands on
-/// `%ProgramData%\punktfunk\host.env`, the file the service reads.
+/// On Windows, `BasePaths.config` is `%ProgramData%`, so `host_env()` is
+/// `%ProgramData%\punktfunk\host.env` — the file the service reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WinFacts {
     pub os_build: u32,
-    /// `x64` / `arm64`, lowercased raw value for anything else.
+    /// `x64` or `arm64`; any other value is lowercased as-is.
     pub arch: String,
-    /// `None` = no ARP key = a fresh install.
+    /// `None` when there is no ARP key (fresh install).
     pub installed: Option<WinInstall>,
     pub host_env_present: bool,
-    /// Skips the password page and the password step — the web install already happened.
+    /// Web install already wrote a password; skip the password page and step.
     pub web_password_present: bool,
-    /// An operator set `PUNKTFUNK_MGMT_BIND` themselves; D11 must never rewrite it.
+    /// Operator already set `PUNKTFUNK_MGMT_BIND`; coexistence must not rewrite it.
     pub mgmt_bind_set: bool,
-    /// Competing GameStream host services with `Start ≤ 2`. Disabled/manual don't count.
+    /// Competing GameStream services with `Start ≤ 2` (boot/system/auto). Disabled/manual do not count.
     pub competing_hosts: Vec<String>,
-    /// Something already answers on [`MGMT_PORT`] — catches a competitor running without a
-    /// service entry.
+    /// Something already answers on [`MGMT_PORT`] — a competitor with no service entry.
     pub mgmt_port_in_use: bool,
     pub networks: Vec<NetProfile>,
     pub steam_audio_drivers: bool,
@@ -219,13 +212,11 @@ impl WinFacts {
         }
     }
 
-    /// D11: a competitor is live — by service or by the port answering — and the operator has
-    /// not already moved the management API themselves.
     pub fn needs_coexistence(&self) -> bool {
         (!self.competing_hosts.is_empty() || self.mgmt_port_in_use) && !self.mgmt_bind_set
     }
 
-    /// D12: the networks whose Public category makes the default firewall rules inert.
+    /// Networks whose Public category leaves the default firewall rules inert.
     pub fn public_networks(&self) -> Vec<&NetProfile> {
         self.networks
             .iter()
@@ -234,7 +225,7 @@ impl WinFacts {
     }
 }
 
-/// `PROCESSOR_ARCHITECTURE` in the artifact vocabulary the packers already use.
+/// Map `PROCESSOR_ARCHITECTURE` onto the packers' `x64` / `arm64` names.
 fn arch(env: &Env) -> String {
     match env.get("PROCESSOR_ARCHITECTURE") {
         Some("AMD64") => "x64".into(),
@@ -254,8 +245,7 @@ fn arp_install(run: &dyn CommandRunner) -> Option<WinInstall> {
     })
 }
 
-/// `Start ≤ 2` (boot/system/auto) only: a *disabled* Sunshine aborting a winget install was a
-/// fielded bug, and the narrowing that fixed it ports verbatim.
+/// `Start ≤ 2` (boot/system/auto) only. Disabled (`4`) and manual (`3`) are not a conflict.
 fn competing_hosts(run: &dyn CommandRunner) -> Vec<String> {
     COMPETING_SERVICES
         .iter()
@@ -280,14 +270,12 @@ fn mgmt_bind_set(host_env: &str) -> bool {
     })
 }
 
-/// The Steam streaming-audio drivers the host's mic capture rides on — their absence is a
-/// warn-and-point, exactly as the shipped installer words it.
+/// Steam streaming-audio drivers the host mic capture needs. Absence is a warning, not a fail.
 fn steam_audio_drivers(env: &Env) -> bool {
     let base = env
         .get("CommonProgramFiles(x86)")
         .unwrap_or(r"C:\Program Files (x86)\Common Files");
-    // Joined component-wise so the probe (and its test tree) also works on the unix lanes,
-    // where a literal backslash is not a separator.
+    // Join component-wise: a literal backslash is not a separator on the unix test lanes.
     ["x64", "arm64", "x86"].iter().any(|a| {
         [
             "Steam",
@@ -302,8 +290,8 @@ fn steam_audio_drivers(env: &Env) -> bool {
     })
 }
 
-/// `schtasks /XML` is the locale-invariant surface — the human table localizes its headers,
-/// the task XML never does. A missing `<Enabled>` element means enabled (the schema default).
+/// `schtasks /XML` is locale-invariant; the human table is not. A missing
+/// `<Enabled>` element means enabled (schema default).
 fn task_state(run: &dyn CommandRunner, name: &str) -> TaskState {
     match run.probe("schtasks", &["/Query", "/TN", name, "/XML"]) {
         Some(out) if out.ok() => {
@@ -330,8 +318,8 @@ fn reg_value(run: &dyn CommandRunner, key: &str, value: &str) -> Option<String> 
     parse_reg_value(&out.stdout, value)
 }
 
-/// One value line of `reg query` output: `    <name>    REG_<type>    <data>`. The data is
-/// everything after the type token, so a `REG_SZ` path with spaces survives.
+/// One `reg query` value line: `<name> REG_<type> <data>`. Data is everything after the
+/// type token, so a `REG_SZ` path with spaces survives.
 pub(crate) fn parse_reg_value(text: &str, name: &str) -> Option<String> {
     for line in text.lines() {
         let mut words = line.split_whitespace();
@@ -357,7 +345,7 @@ fn hex_u32(data: &str) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok()
 }
 
-/// The real box: NLA over COM, and a plain bind attempt for the port question.
+/// Live `NetProbe`: NLA over COM, port check by bind.
 #[cfg(windows)]
 pub struct SystemNet;
 
@@ -367,8 +355,7 @@ impl NetProbe for SystemNet {
         nlm_networks().unwrap_or_default()
     }
 
-    /// A listener that cannot bind means someone answers there — the same 0.0.0.0 bind both
-    /// hosts take, so a false positive needs another server on the box, which IS the conflict.
+    /// Bind `0.0.0.0` — the same address both hosts take. A failure means a listener is there.
     fn port_in_use(&self, port: u16) -> bool {
         std::net::TcpListener::bind(("0.0.0.0", port)).is_err()
     }
@@ -378,7 +365,7 @@ impl NetProbe for SystemNet {
     }
 }
 
-/// One COM pass over the connected networks; `visit` returns `true` to stop early.
+/// One COM pass over connected networks. `visit` returns `true` to stop early.
 #[cfg(windows)]
 fn nlm_visit(
     mut visit: impl FnMut(&::windows::Win32::Networking::NetworkListManager::INetwork, &str) -> bool,
@@ -390,8 +377,8 @@ fn nlm_visit(
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
     };
 
-    // SAFETY: plain COM lifecycle — init tolerating an already-initialized thread, walk the
-    // enumerator through `windows`' smart pointers, uninit only when this call did the init.
+    // SAFETY: COM init (ok if the thread is already initialized); walk the enumerator
+    // through `windows` smart pointers; CoUninitialize only if this call did the init.
     unsafe {
         let inited = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
         let result = (|| -> ::windows::core::Result<()> {
@@ -424,9 +411,8 @@ fn nlm_networks() -> Option<Vec<NetProfile>> {
         NLM_NETWORK_CATEGORY_DOMAIN_AUTHENTICATED, NLM_NETWORK_CATEGORY_PRIVATE,
     };
     let mut out = Vec::new();
-    // SAFETY: `GetCategory` is a plain out-value call on an interface `nlm_visit` owns.
     nlm_visit(|network, name| {
-        // SAFETY: a plain out-value call on an interface `nlm_visit` owns for this frame.
+        // SAFETY: `GetCategory` is a plain out-value call on an interface `nlm_visit` owns for this frame.
         let category = match unsafe { network.GetCategory() } {
             Ok(NLM_NETWORK_CATEGORY_PRIVATE) => NetCategory::Private,
             Ok(NLM_NETWORK_CATEGORY_DOMAIN_AUTHENTICATED) => NetCategory::Domain,
@@ -441,15 +427,13 @@ fn nlm_networks() -> Option<Vec<NetProfile>> {
     Some(out)
 }
 
-/// D12's consented fix: find the network by name and set its NLA category to Private.
 #[cfg(windows)]
 fn nlm_make_private(wanted: &str) -> Option<bool> {
     use ::windows::Win32::Networking::NetworkListManager::NLM_NETWORK_CATEGORY_PRIVATE;
     let mut done = false;
-    // SAFETY: `SetCategory` is a plain in-value call on an interface `nlm_visit` owns.
     nlm_visit(|network, name| {
         if name == wanted {
-            // SAFETY: a plain in-value call on an interface `nlm_visit` owns for this frame.
+            // SAFETY: `SetCategory` is a plain in-value call on an interface `nlm_visit` owns for this frame.
             done = unsafe { network.SetCategory(NLM_NETWORK_CATEGORY_PRIVATE) }.is_ok();
             return true;
         }
@@ -463,7 +447,6 @@ mod tests {
     use super::*;
     use crate::seam::FakeRunner;
 
-    /// A realistic `reg query` transcript for one value.
     fn reg_out(key: &str, name: &str, ty: &str, data: &str) -> String {
         format!("\r\n{key}\r\n    {name}    {ty}    {data}\r\n\r\n")
     }
@@ -548,8 +531,6 @@ mod tests {
         assert_eq!(installed.location.unwrap(), r"C:\Program Files\punktfunk\");
     }
 
-    // The winget narrowing, verbatim: Start=4 (disabled) and Start=3 (manual) are not a
-    // conflict; only boot/system/auto are.
     #[test]
     fn a_disabled_competitor_is_not_a_conflict() {
         let (mut run, env, net, tmp) = fresh_box();
@@ -581,8 +562,6 @@ mod tests {
         assert!(facts.needs_coexistence());
     }
 
-    // D11's guard: an operator who moved the port themselves already coexists — rewriting
-    // their value would be the bug.
     #[test]
     fn an_operator_mgmt_bind_disarms_coexistence() {
         let (mut run, env, _, tmp) = fresh_box();
@@ -674,8 +653,7 @@ mod tests {
         )])));
     }
 
-    // --facts and --demo hand WinFacts through JSON; a field that doesn't round-trip is a
-    // field the demo lies about.
+    // `--facts` and `--demo` serialize WinFacts; a field that does not round-trip is dropped.
     #[test]
     fn win_facts_round_trip_through_serde() {
         let (mut run, env, _, tmp) = fresh_box();

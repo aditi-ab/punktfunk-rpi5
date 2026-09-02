@@ -1,43 +1,35 @@
-//! The `punktfunk://` URL grammar — one parser/emitter for Linux, Windows, the session and
-//! the CLI (design/client-deep-links.md §2). Swift (`PunktfunkShared/DeepLink.swift`) and
-//! Kotlin keep their own ports; all three are held together by the shared vector file
-//! `clients/shared/deeplink-vectors.json`, which this module's tests consume verbatim.
+//! The `punktfunk://` URL grammar: one parser/emitter for every native client
+//! (`design/client-deep-links.md`). Swift (`PunktfunkShared/DeepLink.swift`) and
+//! Kotlin keep their own ports; all three consume
+//! `clients/shared/deeplink-vectors.json`.
 //!
 //! ```text
 //! punktfunk://connect/<host-ref>[?fp=<64-hex>][&host=<addr[:port]>][&launch=<id>]
 //!                               [&profile=<ref>][&name=<label>]
 //! ```
 //!
-//! The invariant the grammar exists to keep: **a URL may only ever do what a click on an
-//! existing card could do, minus trust decisions.** So it carries *references* to things that
-//! already exist on this device — a host record, a settings profile, a library id — and never
-//! values: no resolution, no bitrate, no codec. A web page must not be able to shape a
-//! session beyond picking among the user's own configurations. `pair` is deliberately not a
-//! route and never will be; pairing stays an interactive ceremony.
-//!
-//! `pf://` parses as an alias so a hand-typed or legacy link still works, but nothing ever
-//! *emits* or registers it (§2: claiming a two-letter scheme on MSIX/Apple is unconditional
-//! squatting, and a link that resolves on one platform only is a trap).
+//! A URL may only do what a click on an existing card could do, minus trust
+//! decisions: references (host record, settings profile, library id), never
+//! values (resolution, bitrate, codec). `pair` is not a route; pairing stays
+//! interactive. `pf://` parses as an alias so a typed or legacy link still
+//! works, but nothing emits or registers it — claiming a two-letter scheme on
+//! MSIX/Apple is squatting, and a link that resolves on one platform only is a trap.
 
 use crate::trust::{KnownHost, KnownHosts};
 
-/// Hostile-input caps (§8). The total is generous for a real link and small enough that a
-/// pasted megabyte never reaches the decoder.
+/// Hostile-input caps. Generous for a real link; a pasted megabyte never reaches the decoder.
 pub const MAX_URL_LEN: usize = 2048;
 pub const MAX_HOST_REF_LEN: usize = 128;
 pub const MAX_LAUNCH_LEN: usize = 128;
 pub const MAX_PROFILE_LEN: usize = 64;
 pub const MAX_NAME_LEN: usize = 64;
 
-/// The default native port, as everywhere else in the clients.
+/// Native control port; same default as every other client.
 pub const DEFAULT_PORT: u16 = 9777;
 
-/// What the URL asks for. `Wake`/`Browse` are reserved in the grammar and parse today; a
-/// front-end that hasn't implemented them refuses with a notice rather than silently
-/// connecting — the grammar is the contract, per-platform support is not.
+/// Reserved routes parse so an unimplemented front-end can refuse instead of silently connecting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Route {
-    /// The default, and the only route an emitter builds today.
     #[default]
     Connect,
     Wake,
@@ -54,55 +46,46 @@ impl Route {
     }
 }
 
-/// A parsed, validated link. Every field is already length- and charset-checked, so a
-/// consumer never has to re-validate hostile input; what it still has to do is *resolve*
-/// (§3): the references may name things that don't exist here.
+/// Parsed and length/charset-checked. The consumer still has to resolve: references may not exist here.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct DeepLink {
     pub route: Route,
-    /// The host reference as written: a stable record id, a host name, or `addr[:port]`.
+    /// Host record id, display name, or `addr[:port]`.
     pub host_ref: String,
-    /// Expected host certificate fingerprint, lowercase hex (64 chars).
+    /// Expected host cert pin; lowercase hex, 64 chars.
     pub fp: Option<String>,
-    /// Recovery address for a stable id that no longer resolves (store wiped, reinstall).
+    /// Dial this when the stable id no longer resolves (wiped store).
     pub host: Option<(String, u16)>,
-    /// A store-qualified library id (`steam:570`) for the host to launch on arrival.
+    /// Store-qualified library id (`steam:570`).
     pub launch: Option<String>,
-    /// A settings-profile reference (id, or a unique name) — one-off, never rebinding.
+    /// Profile id or unique name; one-off, never rebinding.
     pub profile: Option<String>,
-    /// Display label for the unknown-host confirmation sheet (external emitters).
+    /// Label for the unknown-host confirmation sheet (external emitters).
     pub name: Option<String>,
 }
 
-/// Why a URL was rejected. The `code` strings are the cross-language contract (the vector
-/// file names them) — Swift and Kotlin report the same code for the same input, which is what
-/// keeps three parsers from drifting into three different security postures.
+/// Rejection codes shared with the Swift/Kotlin ports via `clients/shared/deeplink-vectors.json`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParseError {
-    /// Not a `punktfunk://` (or `pf://`) URL at all — the caller should ignore it, not warn.
+    /// Not `punktfunk://` / `pf://` — ignore, do not warn.
     NotOurScheme,
     TooLong,
-    /// A route this grammar doesn't define.
     UnknownRoute(String),
-    /// `punktfunk://pair/…` — pairing is an interactive ceremony, never a link (§2).
+    /// Pairing is interactive; never a link.
     PairRefused,
     MissingHostRef,
-    /// A `%` escape that isn't two hex digits, or a decode that isn't UTF-8.
+    /// `%` not followed by two hex digits, or the decode is not UTF-8.
     BadEscape,
-    /// A control character survived decoding — no legitimate field contains one.
+    /// A control character survived decoding; no legitimate field contains one.
     ControlChar,
-    /// A parameter past its cap; carries the parameter name.
     ParamTooLong(&'static str),
-    /// `fp=` that isn't 64 hex characters.
     BadFingerprint,
-    /// `host=` that isn't `addr[:port]` with a parsable port.
     BadHostParam,
-    /// `launch=` outside the printable, shell-safe id charset the host and Decky agree on.
+    /// Outside the printable, shell-safe charset the host and Decky agree on.
     BadLaunchId,
 }
 
 impl ParseError {
-    /// The stable code shared with the Swift/Kotlin ports and the vector file.
     pub fn code(&self) -> &'static str {
         match self {
             ParseError::NotOurScheme => "not-our-scheme",
@@ -119,9 +102,7 @@ impl ParseError {
         }
     }
 
-    /// A sentence for the notice a refusing front-end shows. Deliberately names the failing
-    /// reference: "a shortcut that can't honor its profile says so instead of streaming with
-    /// the wrong settings" (§10.6) applies to every refusal here.
+    /// Names the failing reference so a shortcut never streams with the wrong settings.
     pub fn message(&self) -> String {
         match self {
             ParseError::NotOurScheme => "That isn't a Punktfunk link.".into(),
@@ -142,9 +123,7 @@ impl ParseError {
     }
 }
 
-/// Parse a `punktfunk://` (or `pf://`) URL. Everything hostile is rejected here, once, for
-/// every front-end: over-long input, malformed escapes, control characters, out-of-charset
-/// launch ids and fingerprints that aren't fingerprints.
+/// Hostile input is rejected here once for every front-end; `pf://` is an alias.
 pub fn parse(url: &str) -> Result<DeepLink, ParseError> {
     if url.len() > MAX_URL_LEN {
         return Err(ParseError::TooLong);
@@ -153,8 +132,7 @@ pub fn parse(url: &str) -> Result<DeepLink, ParseError> {
     if !scheme.eq_ignore_ascii_case("punktfunk") && !scheme.eq_ignore_ascii_case("pf") {
         return Err(ParseError::NotOurScheme);
     }
-    // A fragment is never part of this grammar; drop it rather than folding it into the last
-    // parameter (where it would smuggle unvalidated text past the caps).
+    // Fragments are not in the grammar; drop `#…` so it cannot smuggle text past the caps.
     let rest = rest.split('#').next().unwrap_or("");
     let (path, query) = match rest.split_once('?') {
         Some((p, q)) => (p, q),
@@ -164,10 +142,8 @@ pub fn parse(url: &str) -> Result<DeepLink, ParseError> {
     let path = path.trim_end_matches('/');
     let (route_word, host_ref_raw) = match path.split_once('/') {
         Some((r, h)) => (r, h),
-        // A single segment: Apple's shipped links are always `connect/<uuid>`, but a bare
-        // reference is unambiguous as long as it isn't one of the route words — those stay
-        // routes (with a missing reference), so `punktfunk://pair` refuses instead of hunting
-        // for a host called "pair".
+        // Bare path is a host-ref unless it is a route word: `punktfunk://pair` must refuse,
+        // not hunt for a host named "pair".
         None if is_route_word(path) => (path, ""),
         None => ("connect", path),
     };
@@ -197,11 +173,10 @@ pub fn parse(url: &str) -> Result<DeepLink, ParseError> {
         let key = decode(key)?.to_ascii_lowercase();
         let value = decode(value)?;
         if value.is_empty() {
-            continue; // `?launch=` with nothing after it is "not given", not an error.
+            continue; // Empty `?launch=` is absent, not an error.
         }
-        // First occurrence wins, and unknown keys are ignored: a newer emitter's parameter
-        // must not turn an otherwise valid link into a refusal, and appending a second `fp=`
-        // must not be able to override the first.
+        // First occurrence wins; unknown keys are ignored. A second `fp=` must not override,
+        // and a newer emitter's extra parameter must not refuse an otherwise valid link.
         match key.as_str() {
             "fp" if link.fp.is_none() => {
                 let fp = value.to_ascii_lowercase();
@@ -241,9 +216,8 @@ pub fn parse(url: &str) -> Result<DeepLink, ParseError> {
 }
 
 impl DeepLink {
-    /// The canonical URL for this link — always `punktfunk://`, never the `pf://` alias.
-    /// Self-emitted links carry the stable id AND `host`+`fp`, so a shortcut written today
-    /// still resolves after a reinstall wipes the store (§2, §5).
+    /// Always `punktfunk://`, never the `pf://` alias. Self-emitted links carry the stable
+    /// id and `host`+`fp` so a wiped store still resolves.
     pub fn to_url(&self) -> String {
         let mut s = format!(
             "punktfunk://{}/{}",
@@ -265,7 +239,7 @@ impl DeepLink {
             let host = if *port == DEFAULT_PORT {
                 addr.clone()
             } else if addr.contains(':') {
-                format!("[{addr}]:{port}") // literal IPv6 needs its brackets back
+                format!("[{addr}]:{port}") // IPv6 literals need brackets in `host=`
             } else {
                 format!("{addr}:{port}")
             };
@@ -283,9 +257,8 @@ impl DeepLink {
         s
     }
 
-    /// The self-emitted form for a saved host: id first (address-independent), with the
-    /// address and pin alongside so the link degrades to a confirmation sheet instead of a
-    /// dead click when the record is gone.
+    /// Id first (address-independent). Address and pin so a missing record degrades
+    /// to a confirmation sheet, not an unresolvable click.
     pub fn for_host(host: &KnownHost, launch: Option<&str>, profile: Option<&str>) -> DeepLink {
         DeepLink {
             route: Route::Connect,
@@ -301,8 +274,7 @@ impl DeepLink {
         }
     }
 
-    /// True when this link's `fp` contradicts what we have pinned for that host — the link is
-    /// stale or lying, and the only safe answer is a hard refusal (§3.1).
+    /// `fp` contradicts the pinned host cert; the only safe answer is a hard refusal.
     pub fn pin_conflict(&self, host: &KnownHost) -> bool {
         match (&self.fp, host.fp_hex.is_empty()) {
             (Some(fp), false) => !fp.eq_ignore_ascii_case(&host.fp_hex),
@@ -311,44 +283,32 @@ impl DeepLink {
     }
 }
 
-/// What the local host store made of a link's references.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostResolution {
-    /// Index into `KnownHosts::hosts` — a record we already trust, named by its stable
-    /// (unguessable) id: the one-click contract (subject to [`DeepLink::pin_conflict`]).
+    /// Named by the unguessable record id (one-click, subject to [`DeepLink::pin_conflict`]).
     Known(usize),
-    /// The same index, for a record named by something GUESSABLE — its display name, its
-    /// address, or the `host=` recovery parameter. A link may not act on a guess, so the
-    /// front-end confirms first; past that it is the [`HostResolution::Known`] path exactly.
+    /// Guessable display name, address, or `host=`. Confirm first; then [`HostResolution::Known`].
     Confirm(usize),
-    /// No record, but the link says where to dial: the confirmation sheet's input, from which
-    /// the normal pairing/TOFU flow proceeds under the user's eyes. Never an auto-connect.
+    /// No record, but an address to dial. Confirmation sheet, then pairing/TOFU. Never auto-connect.
     Unknown {
         addr: String,
         port: u16,
         name: Option<String>,
         fp: Option<String>,
     },
-    /// The name matched more than one saved host — refuse with a notice, never guess (§8).
+    /// Name matched more than one saved host; refuse, never guess.
     Ambiguous,
-    /// A reference that resolves to nothing and carries no address to fall back on.
     Unresolvable,
 }
 
-/// Resolve a link's host reference against the local store, in the documented order: stable
-/// record id → unique case-insensitive name → `addr[:port]` literal, then the `host=` recovery
-/// path — a self-emitted shortcut that outlived the record it was written from still lands on
-/// the right box.
+/// Resolve in order: stable record id → unique case-insensitive name → `addr[:port]`
+/// literal → `host=` recovery.
 ///
-/// Only the record id is UNGUESSABLE, so only the record id resolves to
-/// [`HostResolution::Known`], the silent one-click contract. A display name is an mDNS instance
-/// name or a user label ("Gaming PC") and an address is a LAN address: the `.desktop` files
-/// register `x-scheme-handler/punktfunk`, so any web page can hand this resolver a guess, and a
-/// guess must not be able to start a stream (or launch a title). Those resolve to
-/// [`HostResolution::Confirm`] — the same host, behind the user's OK.
+/// Only the record id is unguessable, so only it is [`HostResolution::Known`].
+/// `.desktop` files register `x-scheme-handler/punktfunk`, so any web page can
+/// hand this a guessable name or LAN address; those are [`HostResolution::Confirm`].
 ///
-/// Returns an index rather than a borrow so callers can keep mutating the store (rekey,
-/// touch-last-used) without fighting the borrow checker.
+/// Returns an index, not a borrow, so callers can rekey / touch-last-used.
 pub fn resolve_host(link: &DeepLink, known: &KnownHosts) -> HostResolution {
     if let Some(i) = known
         .hosts
@@ -369,10 +329,8 @@ pub fn resolve_host(link: &DeepLink, known: &KnownHosts) -> HostResolution {
         0 => {}
         _ => return HostResolution::Ambiguous,
     }
-    // `addr[:port]` literal, then the `host=` recovery parameter — both matched the way every
-    // other per-host lookup in the client matches (addr + port). The literal is only
-    // considered when the reference could BE an address: a stale record id must fall through
-    // to `host=` (or to a refusal), never be offered as a box to dial.
+    // Literal `addr[:port]`, then `host=`, matched as addr+port. A stale record id must
+    // fall through to `host=` (or refusal), never be offered as a box to dial.
     let literal = looks_like_address(&link.host_ref)
         .then(|| parse_addr_port(&link.host_ref))
         .flatten();
@@ -392,11 +350,7 @@ pub fn resolve_host(link: &DeepLink, known: &KnownHosts) -> HostResolution {
     }
 }
 
-/// Could this reference be a network address (an IP literal or a host name) rather than a
-/// record id or a display name? Only then may an unmatched reference become "an unknown host
-/// at this address" for the confirmation sheet. A stable id that no longer resolves is NOT an
-/// address: offering to dial a UUID as a hostname would turn a wiped store into a confusing
-/// dead end instead of the `host=`-driven recovery §2 specifies.
+/// A stale record id is not an address: offering to dial a UUID would skip `host=` recovery.
 fn looks_like_address(s: &str) -> bool {
     let uuid_shaped = s.len() == 36
         && s.char_indices().all(|(i, c)| match i {
@@ -409,8 +363,7 @@ fn looks_like_address(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'))
 }
 
-/// The reserved first path segments — everything the grammar routes on, plus `pair`, which is
-/// reserved precisely so it can be refused rather than mistaken for a host name.
+/// Grammar routes plus `pair`, reserved so it is refused rather than taken as a host name.
 fn is_route_word(s: &str) -> bool {
     matches!(
         s.to_ascii_lowercase().as_str(),
@@ -418,9 +371,7 @@ fn is_route_word(s: &str) -> bool {
     )
 }
 
-/// `addr`, `addr:port`, `[v6]`, `[v6]:port` — `None` when the port isn't a number. A bare
-/// IPv6 literal (`::1`) keeps its colons and takes the default port; anything else splits at
-/// the last colon, like every other host-parsing site in the clients.
+/// A bare IPv6 (`::1`) keeps its colons and takes the default port; anything else splits at the last colon.
 fn parse_addr_port(s: &str) -> Option<(String, u16)> {
     if s.is_empty() {
         return None;
@@ -436,7 +387,7 @@ fn parse_addr_port(s: &str) -> Option<(String, u16)> {
         };
     }
     match s.rsplit_once(':') {
-        // `::1` and friends: the head still has a colon, so this isn't a port separator.
+        // Head still has a colon (`::1`): not a port separator.
         Some((head, _)) if head.contains(':') => Some((s.to_string(), DEFAULT_PORT)),
         Some((addr, port)) if !addr.is_empty() => Some((addr.to_string(), port.parse().ok()?)),
         Some(_) => None,
@@ -444,10 +395,8 @@ fn parse_addr_port(s: &str) -> Option<(String, u16)> {
     }
 }
 
-/// The launch-id charset the whole product already agrees on: printable, non-space ASCII with
-/// no shell metacharacters (Decky rides ids through Steam launch options as an env token, so
-/// a quote or a backtick genuinely breaks something downstream). Validation only — the id is
-/// opaque and the host matches it verbatim against its own library.
+/// Printable non-space ASCII without shell metacharacters. Decky puts the id in a
+/// Steam launch-option env token; a quote or backtick breaks downstream. Opaque to us.
 fn is_safe_launch_id(id: &str) -> bool {
     !id.is_empty()
         && id
@@ -455,9 +404,8 @@ fn is_safe_launch_id(id: &str) -> bool {
             .all(|b| (0x21..=0x7e).contains(&b) && !br#""'\$`"#.contains(&b))
 }
 
-/// Strict percent-decoding: `%` must be followed by exactly two hex digits, the result must be
-/// UTF-8, and no control character may survive. Lenient decoders are how `%00`, a stray `\n`
-/// or a half-escape end up inside a filename or a log line.
+/// `%` plus two hex digits, UTF-8, no surviving control. A lenient decoder lets
+/// `%00` or a stray `\n` into a filename or log.
 fn decode(s: &str) -> Result<String, ParseError> {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -484,8 +432,8 @@ fn decode(s: &str) -> Result<String, ParseError> {
     Ok(text)
 }
 
-/// Percent-encode for emission: unreserved characters plus `:` (legal in a query value and
-/// left alone by Apple's `URLComponents`, so the three emitters agree on `steam:570`).
+/// Unreserved plus `:`, which is legal in a query and left alone by Apple's `URLComponents`
+/// so the three emitters agree on `steam:570`.
 fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -516,8 +464,7 @@ mod tests {
         }
     }
 
-    /// Every case in the cross-language vector file, which the Swift and Kotlin ports consume
-    /// too — this is what keeps three parsers from drifting into three security postures.
+    /// Cross-language vector file; Swift and Kotlin consume it too.
     #[test]
     fn shared_vectors() {
         let raw = include_str!("../../../clients/shared/deeplink-vectors.json");
@@ -568,8 +515,7 @@ mod tests {
         }
     }
 
-    /// A `Result` from the parser is not enough on its own: the codes are the shared
-    /// vocabulary, so they must be exactly what the vector file (and the ports) name.
+    /// Codes, not just `Err`, are the shared vocabulary with the vector file and the ports.
     #[test]
     fn refusals_are_specific() {
         assert_eq!(parse("https://example.com/"), Err(ParseError::NotOurScheme));
@@ -596,11 +542,6 @@ mod tests {
         );
     }
 
-    /// The one-click contract in resolution form: an id beats a name beats an address, an
-    /// ambiguous name refuses, and a link whose record is gone still lands on the
-    /// confirmation sheet via `host=`+`fp=` instead of dying. Only the id — the one reference
-    /// nothing can guess — dials on its own; a name or an address finds the same host behind a
-    /// confirmation.
     #[test]
     fn host_resolution_order_and_recovery() {
         let fp = "a".repeat(64);
@@ -632,8 +573,6 @@ mod tests {
             r("punktfunk://connect/11111111-2222-4333-8444-555555555555"),
             HostResolution::Known(0)
         );
-        // A display name ("Gaming PC") and a LAN address are guesses any web page can make —
-        // the same host, but only behind a confirmation. See the test below.
         assert_eq!(r("punktfunk://connect/desk"), HostResolution::Confirm(0));
         assert_eq!(r("punktfunk://connect/couch"), HostResolution::Ambiguous);
         assert_eq!(
@@ -644,14 +583,10 @@ mod tests {
             r("punktfunk://connect/192.168.1.50:9777"),
             HostResolution::Confirm(0)
         );
-        // A stale id with the recovery parameters: the address finds the record anyway — and,
-        // being an address, behind the confirmation exactly as this function's doc always said.
         assert_eq!(
             r("punktfunk://connect/00000000-0000-4000-8000-000000000000?host=192.168.1.50"),
             HostResolution::Confirm(0)
         );
-        // Nothing local matches: the sheet gets the address, the claimed name and the pin —
-        // which is what makes the first connect verified rather than blind TOFU.
         assert_eq!(
             r(&format!(
                 "punktfunk://connect/10.0.0.9:7000?name=Studio&fp={fp}"
@@ -663,8 +598,6 @@ mod tests {
                 fp: Some(fp.clone()),
             }
         );
-        // An unmatched reference that could be an address (an mDNS/DNS name, a new IP) is
-        // offered as an unknown host — the sheet, never an auto-connect.
         assert_eq!(
             r("punktfunk://connect/nas.local"),
             HostResolution::Unknown {
@@ -674,31 +607,25 @@ mod tests {
                 fp: None,
             }
         );
-        // But a stale record id is not a hostname: without `host=` there is nothing to dial,
-        // and dialing "11111111-…" would be a confusing dead end rather than a recovery.
+        // Stale record id is not a hostname; without `host=` there is nothing to dial.
         assert_eq!(
             r("punktfunk://connect/00000000-0000-4000-8000-000000000000"),
             HostResolution::Unresolvable
         );
-        // Neither is a display name that can't be an address.
         assert_eq!(
             r("punktfunk://connect/Basement%20PC"),
             HostResolution::Unresolvable
         );
 
-        // A pin that contradicts the stored one is the link lying — the caller hard-refuses.
         let link = parse(&format!("punktfunk://connect/desk?fp={}", "b".repeat(64))).unwrap();
         assert!(link.pin_conflict(&known.hosts[0]));
         assert!(!parse(&format!("punktfunk://connect/desk?fp={fp}"))
             .unwrap()
             .pin_conflict(&known.hosts[0]));
-        // No pin stored (an address-only record) → nothing to contradict; the trust flow runs.
+        // Empty stored pin: nothing to contradict.
         assert!(!link.pin_conflict(&known.hosts[1]));
     }
 
-    /// The record id is a UUID nothing can guess; a display name and a LAN address are guesses
-    /// any web page can make — and `x-scheme-handler/punktfunk` hands web pages this resolver.
-    /// So the id, and only the id, is the silent one-click dial.
     #[test]
     fn only_the_record_id_dials_without_asking() {
         let fp = "a".repeat(64);
@@ -721,17 +648,14 @@ mod tests {
             "punktfunk://connect/DESK",
             "punktfunk://connect/192.168.1.50",
             "punktfunk://connect/192.168.1.50:9777",
-            // A launch id doesn't buy a name any authority it didn't have.
+            // Extra params do not upgrade a guess to one-click.
             "punktfunk://connect/desk?launch=steam:570",
-            // …and neither does the `host=` recovery path.
             "punktfunk://connect/00000000-0000-4000-8000-000000000000?host=192.168.1.50",
         ] {
             assert_eq!(r(guess), HostResolution::Confirm(0), "{guess}");
         }
     }
 
-    /// Self-emitted links round-trip and carry all three references, so they survive both a
-    /// re-addressed host and a wiped store.
     #[test]
     fn self_emitted_links_round_trip() {
         let fp = "c".repeat(64);
@@ -752,7 +676,7 @@ mod tests {
         );
         assert_eq!(parse(&url).unwrap(), link);
 
-        // A record with no id yet (pre-migration store) still emits something resolvable.
+        // Pre-migration record with no id still emits a resolvable `addr:port`.
         let mut plain = h.clone();
         plain.id = None;
         assert_eq!(
@@ -760,7 +684,6 @@ mod tests {
             "192.168.1.50:7777"
         );
 
-        // Names with spaces and non-ASCII survive the round trip.
         let link = DeepLink {
             host_ref: "Wohnzimmer PC".into(),
             name: Some("Büro · Mac".into()),
@@ -772,7 +695,6 @@ mod tests {
         assert_eq!(parse(&link.to_url()).unwrap(), link);
     }
 
-    /// `addr[:port]` parsing, including the bracketed IPv6 forms a link can carry.
     #[test]
     fn addr_port_forms() {
         assert_eq!(
@@ -789,7 +711,7 @@ mod tests {
         assert_eq!(parse_addr_port("host:notaport"), None);
         assert_eq!(parse_addr_port("[::1]junk"), None);
         assert_eq!(parse_addr_port(""), None);
-        // An emitted IPv6 host parameter comes back bracketed so it parses again.
+        // Emitted IPv6 `host=` is bracketed so parse accepts it again.
         let link = DeepLink {
             host_ref: "x".into(),
             host: Some(("::1".into(), 1234)),

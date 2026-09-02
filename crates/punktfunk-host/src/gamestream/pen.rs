@@ -1,20 +1,17 @@
-//! Translate Moonlight's edge-based `SS_PEN` / `SS_TOUCH` events (design/pen-tablet-input.md
-//! §4) into punktfunk's state-full pen model and wire-touch events.
+//! Translate Moonlight `SS_PEN` / `SS_TOUCH` into punktfunk [`PenSample`]s and wire-touch events.
 //!
-//! Pen: each packet becomes one complete [`PenSample`] (packet fields merged over the last
-//! known state, since e.g. `BUTTON_ONLY` carries no position by spec), fed through the same
-//! [`PenTracker`] → [`VirtualPen`] chain the native plane uses — so Moonlight iOS with an
-//! Apple Pencil exercises the exact injection path our own clients will.
+//! Pen: each packet merges over last state into one sample (`BUTTON_ONLY` has no
+//! position by spec), then the same [`PenTracker`] → [`VirtualPen`] chain as the
+//! native plane.
 //!
-//! No stroke timeout here, deliberately: the native plane's 200 ms failsafe exists because
-//! datagrams are lossy and clients heartbeat; Moonlight's control stream is ordered/reliable
-//! ENet and its clients do NOT heartbeat a stationary pen — a timeout would lift a held
-//! stroke. Lost-client cleanup is the ENet disconnect (the control loop re-news this
-//! translator, and destroying the uinput device releases everything kernel-side).
+//! No stroke timeout. Native's 200 ms failsafe exists because datagrams are lossy
+//! and clients heartbeat. Moonlight's ENet control stream is ordered and reliable,
+//! and clients do not heartbeat a stationary pen — a timeout would lift a held
+//! stroke. Lost-client cleanup is the ENet disconnect: the control loop rebuilds
+//! this translator, and destroying the uinput device releases kernel-side state.
 //!
-//! Touch: forwarded as the ordinary wire touch kinds (`TouchDown/Move/Up`, normalized onto a
-//! synthetic 65535² surface) through the injector service — pressure/area are dropped v1
-//! (the wire touch has no field for them; `RICH_TOUCH` is the design's §8 upgrade).
+//! Touch: `TouchDown` / `Move` / `Up` on a synthetic 65535² surface. Pressure and
+//! area have no wire field. Spec: `design/pen-tablet-input.md`.
 
 use super::input::{SsPen, SsPointer, SsTouch};
 use punktfunk_core::input::{InputEvent, InputKind};
@@ -39,36 +36,26 @@ const LI_PEN_BUTTON_SECONDARY: u8 = 0x02;
 const LI_ROT_UNKNOWN: u16 = 0xFFFF;
 const LI_TILT_UNKNOWN: u8 = 0xFF;
 
-/// Synthetic reference extent for forwarded touches: coordinates arrive normalized, so map
-/// them onto a full-range surface and let the injector rescale to its output (the
-/// `MouseMoveAbs`/touch `flags = (w << 16) | h` contract).
+/// Normalized touches map onto this full-range surface; injector rescales via `flags = (w << 16) | h`.
 const TOUCH_SURFACE: u32 = 65535;
 
-/// Most concurrently-tracked touch pointers (for `CANCEL_ALL` replay). A flood of distinct
-/// ids can't grow memory — untracked ids still forward down/up verbatim, they just miss a
-/// later `CANCEL_ALL` (which a real client never has more than ~10 contacts for anyway).
+/// Cap of tracked ids for `CANCEL_ALL` replay. Extra ids still forward down/up; they miss cancel-all.
 const MAX_TOUCH_IDS: usize = 32;
 
-/// Per-GameStream-session pen + touch translator. Owned by the control loop next to the
-/// gamepad manager; re-created on client disconnect (the dropped [`VirtualPen`] destroys the
-/// uinput device, which releases any held tool/tip kernel-side).
+/// Per-session pen and touch translator. Recreated on disconnect; Drop of [`VirtualPen`] releases uinput.
 pub struct GsPointer {
     tracker: PenTracker,
     dev: Option<crate::inject::pen::VirtualPen>,
     create_failed: bool,
     seq: u16,
     out: Vec<PenTransition>,
-    /// Last complete pen state — the merge base for packets that omit fields
-    /// (`BUTTON_ONLY` ignores x/y/pressure/tilt/rotation by spec).
+    /// Merge base for packets that omit fields (`BUTTON_ONLY` has no x/y/pressure/tilt/rotation).
     last: PenSample,
-    /// This client sends hover events, so an `UP` means "back to hover" rather than "gone" —
-    /// clients without hover support get proximity-out on lift instead of a pen parked
-    /// forever at the last point.
+    /// This client sent hover, so `UP` is back-to-hover. Without hover, lift must leave range.
     saw_hover: bool,
-    /// Active forwarded touch ids, for `CANCEL_ALL` replay as per-id ups.
+    /// Tracked ids so `CANCEL_ALL` can replay per-id ups.
     touch_ids: Vec<u32>,
-    /// Whether this session's first SS_TOUCH was logged (the one observable breadcrumb an
-    /// on-glass "touch does nothing" report needs — every later stage logs its own failure).
+    /// One-shot: first SS_TOUCH is the breadcrumb if later stages stay silent.
     touch_seen: bool,
 }
 
@@ -87,8 +74,6 @@ impl GsPointer {
         }
     }
 
-    /// Apply one decoded pointer packet. Touch events forward through `sink` (the injector
-    /// channel); pen events drive this session's virtual tablet.
     pub fn apply(&mut self, p: &SsPointer, sink: impl FnMut(InputEvent)) {
         match p {
             SsPointer::Pen(pen) => self.apply_pen(pen),
@@ -122,8 +107,7 @@ impl GsPointer {
         }
     }
 
-    /// Merge one edge-based packet over the last known state into a complete sample.
-    /// `None` = nothing to apply (a `BUTTON_ONLY` before any positioned event).
+    /// Merge one edge packet over last state. `None` if `BUTTON_ONLY` arrives before any position.
     fn pen_sample(&mut self, p: &SsPen) -> Option<PenSample> {
         let buttons = (if p.buttons & LI_PEN_BUTTON_PRIMARY != 0 {
             PEN_BARREL1
@@ -139,7 +123,6 @@ impl GsPointer {
             LI_TOOL_TYPE_ERASER => PenTool::Eraser,
             _ => PenTool::Unknown,
         };
-        // BUTTON_ONLY ignores x/y/pressure/rotation/tilt by spec — reuse the last state.
         if p.event_type == LI_TOUCH_EVENT_BUTTON_ONLY {
             if !self.tracker.is_active() {
                 return None;
@@ -171,8 +154,7 @@ impl GsPointer {
         match p.event_type {
             LI_TOUCH_EVENT_DOWN | LI_TOUCH_EVENT_MOVE => {
                 s.state |= PEN_IN_RANGE | PEN_TOUCHING;
-                // pressureOrDistance is pressure (0..1) in contact — and 0.0 means UNKNOWN
-                // there, which must still ink: binary-stylus clients get full pressure.
+                // 0.0 in contact is UNKNOWN, not zero — binary-stylus clients must still ink.
                 s.pressure = if p.pressure_or_distance <= 0.0 {
                     u16::MAX
                 } else {
@@ -187,9 +169,7 @@ impl GsPointer {
                 s.distance = (p.pressure_or_distance.clamp(0.0, 1.0) * 65534.0) as u16;
             }
             LI_TOUCH_EVENT_UP => {
-                // A hover-capable client keeps proximity after lift (its HOVER/HOVER_LEAVE
-                // events own the exit); one that never hovers would otherwise park the pen
-                // in proximity forever, so lift = leave for those.
+                // Hover clients keep proximity (HOVER_LEAVE exits); others would park the pen forever.
                 if self.saw_hover {
                     s.state |= PEN_IN_RANGE;
                 }
@@ -235,8 +215,7 @@ impl GsPointer {
                     sink(ev(InputKind::TouchUp, id, 0.0, 0.0));
                 }
             }
-            // Touch hover has no wire representation (and BUTTON_ONLY is pen-only in
-            // practice) — nothing to forward.
+            // Touch hover has no wire kind; BUTTON_ONLY is pen-only. Nothing to forward.
             _ => {}
         }
     }
@@ -269,12 +248,10 @@ mod tests {
         assert_eq!(s.pressure, 32767);
         assert_eq!((s.tilt_deg, s.azimuth_deg), (40, 270));
         assert_eq!(s.roll_deg, PEN_ANGLE_UNKNOWN);
-        // Unknown contact pressure (0.0) must still ink — binary-stylus full scale.
         let s = g
             .pen_sample(&pen(LI_TOUCH_EVENT_MOVE, 0.3, 0.5, 0.0))
             .unwrap();
         assert_eq!(s.pressure, u16::MAX);
-        // No hover ever seen: UP = fully out of range (no parked proximity).
         let s = g
             .pen_sample(&pen(LI_TOUCH_EVENT_UP, 0.3, 0.5, 0.0))
             .unwrap();
@@ -293,7 +270,6 @@ mod tests {
             .pen_sample(&pen(LI_TOUCH_EVENT_UP, 0.2, 0.2, 0.0))
             .unwrap();
         assert_eq!(s.state, PEN_IN_RANGE);
-        // HOVER_LEAVE exits.
         let s = g
             .pen_sample(&pen(LI_TOUCH_EVENT_HOVER_LEAVE, 0.2, 0.2, 0.0))
             .unwrap();
@@ -303,12 +279,9 @@ mod tests {
     #[test]
     fn button_only_merges_over_last_state() {
         let mut g = GsPointer::new();
-        // BUTTON_ONLY before any positioned event: nothing to merge over.
         let mut b = pen(LI_TOUCH_EVENT_BUTTON_ONLY, 0.0, 0.0, 0.0);
         b.buttons = LI_PEN_BUTTON_PRIMARY;
         assert!(g.pen_sample(&b).is_none());
-        // After a DOWN is applied (through the real tracker path minus the device), the
-        // button packet reuses the held position/pressure.
         g.apply_pen(&pen(LI_TOUCH_EVENT_DOWN, 0.4, 0.6, 0.8));
         let s = g.pen_sample(&b).unwrap();
         assert_eq!(s.state & (PEN_BARREL1 | PEN_BARREL2), PEN_BARREL1);
@@ -325,7 +298,6 @@ mod tests {
         assert_eq!(g.pen_sample(&p).unwrap().tool, PenTool::Eraser);
         p.tool = 0x7F;
         assert_eq!(g.pen_sample(&p).unwrap().tool, PenTool::Unknown);
-        // Unknown sentinel angles pass through as our sentinels.
         p.rotation = LI_ROT_UNKNOWN;
         p.tilt = LI_TILT_UNKNOWN;
         let s = g.pen_sample(&p).unwrap();
@@ -355,7 +327,6 @@ mod tests {
         assert_eq!(got[0].flags, (65535 << 16) | 65535);
         assert_eq!(got[2].kind, InputKind::TouchMove);
         assert_eq!(got[2].x, 49151);
-        // CANCEL_ALL lifts every tracked contact.
         got.clear();
         g.apply_touch(&t(LI_TOUCH_EVENT_CANCEL_ALL, 0, 0.0), |e| got.push(e));
         assert_eq!(got.len(), 2);
@@ -363,7 +334,6 @@ mod tests {
         let mut ids: Vec<u32> = got.iter().map(|e| e.code).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![7, 9]);
-        // And the set is empty now — a second CANCEL_ALL is a no-op.
         got.clear();
         g.apply_touch(&t(LI_TOUCH_EVENT_CANCEL_ALL, 0, 0.0), |e| got.push(e));
         assert!(got.is_empty());

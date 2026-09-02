@@ -1,8 +1,13 @@
-//! Linux tray: a StatusNotifierItem (ksni/zbus) fed by the status poller. The host runs as the
-//! systemd **user** unit `punktfunk-host.service`, so start/stop/restart are plain
-//! `systemctl --user` calls — no polkit, no elevation. KDE (the project's primary Linux desktop)
-//! renders SNI natively; GNOME needs the AppIndicator extension (without it the icon is invisible
-//! — `--autostart` exits silently rather than erroring at every login).
+//! Linux StatusNotifierItem tray (`ksni`/`zbus`), fed by the status poller.
+//!
+//! The host is the systemd **user** unit `punktfunk-host.service`. Start/stop/restart
+//! are `systemctl --user` — no polkit. KDE renders SNI natively; GNOME needs the
+//! AppIndicator extension or the icon is missing. `--autostart` then exits silently
+//! instead of failing every login.
+//!
+//! One instance per session (`flock` on `$XDG_RUNTIME_DIR/punktfunk-tray.lock`).
+//! Status model and poller: `status.rs`. Service-vs-machine restart wording:
+//! `design/host-actions.md`.
 
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,16 +15,13 @@ use std::sync::{Arc, OnceLock};
 
 use crate::status::{self, Poller, TrayStatus};
 
-/// The tray's D-Bus/menu model. `status` + `web_console` are the mutable state; the poller
-/// rewrites them via `Handle::update`, which re-emits the SNI properties (icon, tooltip, menu).
+/// Poller writes `status` / `web_console` through `Handle::update`, which re-emits SNI props.
 struct HostTray {
     status: TrayStatus,
     web_port: u16,
-    /// The console answered the poller's live loopback probe — labels the (always present) "Open
-    /// web console" entry; it never hides it.
+    /// Loopback probe of the console. Labels the always-present "Open web console" row; never hides it.
     web_console: bool,
-    /// Filled right after `spawn` (the poller needs the tray handle first) — lets menu actions
-    /// force an immediate re-poll instead of waiting out the cadence.
+    /// Set after `spawn` (the poller needs the tray handle first) so menu actions can `poke`.
     poller: Arc<OnceLock<Poller>>,
 }
 
@@ -33,8 +35,7 @@ impl HostTray {
         }
     }
 
-    /// Open the web console at `path` ("" = dashboard). Deep links land the operator on the page
-    /// the menu entry promised — the pairing queue, the virtual displays.
+    /// Empty `path` is the dashboard.
     fn open_console(&self, path: &str) {
         let url = format!("https://127.0.0.1:{}/{path}", self.web_port);
         let _ = std::process::Command::new("xdg-open").arg(url).spawn();
@@ -58,8 +59,7 @@ impl ksni::Tray for HostTray {
         }
     }
 
-    /// Hicolor theme names (installed by the packages); `icon_pixmap` below is the fallback so a
-    /// `cargo run` from the repo shows an icon too.
+    /// `icon_pixmap` is the `cargo run` fallback when packaged hicolor names are missing.
     fn icon_name(&self) -> String {
         match &self.status {
             TrayStatus::Running(_) if self.status.is_streaming() => {
@@ -109,9 +109,7 @@ impl ksni::Tray for HostTray {
             }
             .into(),
             MenuItem::Separator,
-            // Always present — it is the reason most people open this menu. When the loopback
-            // probe says the console isn't answering, the label says so rather than the entry
-            // disappearing (a menu missing its main action reads as a broken tray).
+            // Always shown; a dead console changes the label, never hides the row.
             StandardItem {
                 label: if self.web_console {
                     "Open web console".to_string()
@@ -155,9 +153,8 @@ impl ksni::Tray for HostTray {
             }
             .into(),
             StandardItem {
-                // "Restart Punktfunk", not "Restart host": this restarts the SERVICE, and the
-                // clients' host-power menus use "Restart host" for the MACHINE
-                // (design/host-actions.md §7) — one phrase must not mean two verbs.
+                // Service restart. Clients' host-power "Restart host" reboots the MACHINE
+                // (`design/host-actions.md`); one phrase must not mean both.
                 label: "Restart Punktfunk".into(),
                 visible: running || matches!(self.status, TrayStatus::Error(_)),
                 activate: Box::new(|t: &mut Self| t.systemctl("restart")),
@@ -174,16 +171,14 @@ impl ksni::Tray for HostTray {
         ]
     }
 
-    /// Keep waiting when the watcher drops (plasmashell restart, GNOME shell reload) — the item
-    /// re-registers when it returns. Only `--autostart` runs get here with SNI truly absent, and
-    /// lingering invisibly is the documented trade-off (see `assume_sni_available` below).
+    /// Stay registered across a watcher drop (plasmashell restart, GNOME reload).
+    /// `--autostart` waits when SNI was never there (`assume_sni_available` below).
     fn watcher_offline(&self, _reason: ksni::OfflineReason) -> bool {
         true
     }
 }
 
-/// A flat antialiased status dot — the pixmap fallback when the hicolor icons aren't installed
-/// (dev runs from `target/`). ARGB32, network byte order (per the SNI spec).
+/// ARGB32 pixmap fallback (network byte order, SNI spec) when hicolor icons are missing.
 fn dot_icon(size: i32, (r, g, b): (u8, u8, u8)) -> ksni::Icon {
     let mut data = Vec::with_capacity((size * size * 4) as usize);
     let center = (size as f32 - 1.0) / 2.0;
@@ -203,8 +198,7 @@ fn dot_icon(size: i32, (r, g, b): (u8, u8, u8)) -> ksni::Icon {
     }
 }
 
-/// Does this user's box run (or intend to run) a punktfunk host? Gates `--autostart` so the
-/// packaged autostart entry doesn't put an icon in every desktop user's tray.
+/// `--autostart` skip: the packaged autostart file is installed for every desktop user.
 fn host_present() -> bool {
     if status::punktfunk_config_dir().is_some_and(|d| d.exists()) {
         return true;
@@ -215,7 +209,7 @@ fn host_present() -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// One tray per session: `flock` on a runtime-dir lockfile (held for the process lifetime).
+/// One tray per session. The `flock` is held for the process lifetime.
 fn acquire_instance_lock() -> Option<std::fs::File> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
@@ -238,7 +232,7 @@ pub fn run(args: crate::Args) -> anyhow::Result<()> {
         return Ok(());
     }
     if args.autostart && !host_present() {
-        return Ok(()); // not a host box — stay out of this user's tray
+        return Ok(());
     }
     let Some(_lock) = acquire_instance_lock() else {
         return Ok(()); // another instance already runs in this session
@@ -246,14 +240,13 @@ pub fn run(args: crate::Args) -> anyhow::Result<()> {
 
     let poller_slot = Arc::new(OnceLock::new());
     let tray = HostTray {
-        status: TrayStatus::Stopped, // placeholder; the poller fires within its first cycle
+        status: TrayStatus::Stopped, // placeholder until the first poll
         web_port: args.web_port,
-        web_console: false, // live-probed by the poller within its first cycle
+        web_console: false, // live-probed on the first poll
         poller: poller_slot.clone(),
     };
-    // Autostart races the desktop (the watcher may register after us) → be lenient and wait for
-    // it. A manual launch should fail loudly instead (e.g. GNOME without the AppIndicator
-    // extension) so the user learns why there is no icon.
+    // Autostart races the desktop watcher: wait. A manual launch fails loudly so a
+    // missing AppIndicator extension is visible.
     use ksni::blocking::TrayMethods;
     let handle = match tray.assume_sni_available(args.autostart).spawn() {
         Ok(h) => h,
@@ -279,13 +272,13 @@ pub fn run(args: crate::Args) -> anyhow::Result<()> {
                 t.web_console = console_up;
             });
             if updated.is_none() {
-                dead_flag.store(true, Ordering::SeqCst); // tray service shut down
+                dead_flag.store(true, Ordering::SeqCst);
             }
         }),
     );
     let _ = poller_slot.set(poller);
 
-    // The SNI service runs on its own thread; park here until it dies (shell logout etc.).
+    // The SNI service runs on its own thread; park until it dies.
     while !dead.load(Ordering::SeqCst) && !handle.is_closed() {
         std::thread::sleep(std::time::Duration::from_secs(2));
     }

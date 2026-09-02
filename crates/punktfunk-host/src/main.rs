@@ -1,56 +1,47 @@
-//! `punktfunk-host` — the Linux streaming host (plan §2, §6, §7).
+//! Streaming host: virtual display, capture, encode, then FEC + packetize + pace
+//! + send via `punktfunk_core`. Input returns through the inject backends.
 //!
-//! Creates a client-sized virtual display, captures it via PipeWire, encodes with
-//! VAAPI/NVENC, and hands encoded access units to `punktfunk_core` for FEC + packetization +
-//! pacing + send. Input flows back via libei/uinput. The platform backends are
-//! `#[cfg(target_os = "linux")]`; the crate compiles everywhere so the workspace builds
-//! on non-Linux dev machines — it just can't run the pipeline there.
+//! `serve` is the secure default (native punktfunk/1 + management API).
+//! `--gamestream` is opt-in, trusted-LAN only. `punktfunk1-host` is the native
+//! plane alone. `spike` writes encoded AUs to a file and loopbacks them through
+//! `punktfunk_core`.
 //!
-//! Subcommands: `serve` runs the native punktfunk/1 host + management REST API by default, and —
-//! with `--gamestream` — the GameStream/Moonlight-compat planes too (opt-in, trusted-LAN only);
-//! `punktfunk1-host` runs the native punktfunk/1 host standalone; `spike` is a capture→encode→file
-//! pipeline dev tool that also round-trips the encoded AUs through a `punktfunk_core` loopback.
+//! Platform backends are `#[cfg]`; the crate still compiles on every workspace
+//! OS. Pin: `design/`. Evidence: this crate's tests and `docs/adr/`.
 
-// Scaffold: trait methods and config paths are defined ahead of their backends.
+// Dead methods/paths exist before their backends land.
 #![allow(dead_code)]
-// Unsafe-proof program (both lints now enforced by the workspace `[workspace.lints]` tables):
-// every `unsafe {}` / `unsafe impl` carries a `// SAFETY:` proof, and `unsafe fn` bodies need
-// explicit blocks. Keep the `unsafe fn` marker only where a caller can actually violate
-// something — a raw pointer or a borrowed `HANDLE` parameter, as in `service::spawn_host`.
+// Keep `unsafe fn` only where a caller can violate a contract (raw pointer / borrowed HANDLE).
+// Workspace lints already require `// SAFETY:` on every `unsafe` block.
 
 mod audio;
 mod bringup;
 mod capture;
 mod detect;
 mod devtest;
-/// Host health verdicts as one structured channel (design/web-console-diagnostics.md).
+/// Structured health verdicts — design/web-console-diagnostics.md.
 #[forbid(unsafe_code)]
 mod diagnostics;
-// Network-facing on the secure default host (see the forbid block at `mod mgmt` below).
+// Network-facing; same `forbid` as `mod mgmt`.
 #[forbid(unsafe_code)]
 mod discovery;
 #[forbid(unsafe_code)]
 mod wol;
-// Goal-1 stage 6: top-level platform-only modules live under `src/linux/` and `src/windows/`; `#[path]`
-// keeps the `crate::*` module names flat (every existing path is unchanged).
+// `#[path]` keeps `crate::*` names flat while files live under `src/linux/` / `src/windows/`.
 #[cfg(target_os = "windows")]
 #[path = "windows/crash.rs"]
 mod crash;
 #[cfg(target_os = "linux")]
 #[path = "linux/drm_sync.rs"]
 mod drm_sync;
-// The video encode backends live in the `pf-encode` leaf crate (plan §W6); this shim keeps every
-// existing `crate::encode::*` path valid (the host is the sole consumer, via the negotiator + the
-// GameStream/native/mgmt planes). Feature flags (nvenc/amf-qsv/vulkan-encode/pyrowave) forward to
-// pf-encode from this crate's `[features]`.
+// Shim: encode backends live in `pf-encode`; keep `crate::encode::*` for this crate's callers.
 mod encode {
     pub(crate) use pf_encode::*;
 }
 mod events;
-// The lifetime of a launched game: whether it is running, when it exits (which can end the session),
-// and how to end it (which a session ending can ask for) — design/session-game-lifetime.md.
+// Session⇄game lifetime — design/session-game-lifetime.md.
 mod gamelease;
-// The Win32 half of ending a game: WM_CLOSE onto the interactive desktop, then TerminateProcess.
+// WM_CLOSE on the interactive desktop, then TerminateProcess.
 #[cfg(target_os = "windows")]
 #[path = "windows/game_term.rs"]
 mod game_term;
@@ -59,43 +50,31 @@ mod gamestream;
 #[path = "linux/gpuclocks.rs"]
 mod gpuclocks;
 mod hooks;
-// Network-facing on the secure default host (see the forbid block at `mod mgmt` below). Test
-// builds carve out like `native`: the identity tests scope `PUNKTFUNK_CONFIG_DIR` by mutating
-// the process env, which edition 2024 makes an unsafe call; shipped code keeps the forbid.
+// Network-facing; same `forbid` as `mod mgmt`. Tests mutate process env (`set_var` is unsafe in 2024).
 #[cfg_attr(not(test), forbid(unsafe_code))]
 mod identity;
-// The input-injection backends live in the `pf-inject` subsystem crate (plan §W6); this shim keeps
-// every existing `crate::inject::*` path valid (the native/gamestream input planes + devtest consume
-// the trait, factory, and per-device backends through it).
+// Shim: inject backends live in `pf-inject`; keep `crate::inject::*` for this crate's callers.
 mod inject {
     pub(crate) use pf_inject::*;
 }
+mod client_logs;
 #[cfg(target_os = "windows")]
 #[path = "windows/install.rs"]
 mod install;
 #[cfg(target_os = "windows")]
 #[path = "windows/interactive.rs"]
 mod interactive;
-// What this host launched, for whom, and when — so a client that re-dials and re-sends its
-// `Hello::launch` verbatim neither gets a second copy of its game nor loses sight of the one it has
-// (design/session-game-lifetime.md).
-mod client_logs;
+// Re-`Hello::launch` must not start a second copy — design/session-game-lifetime.md.
 mod launchreg;
 mod library;
 mod log_capture;
-// The native punktfunk/1 plane and the management API — everything a SECURE-DEFAULT host
-// exposes — are safe Rust by compiler-enforced invariant (rust-safety programme): `forbid`
-// here means a future edit cannot quietly introduce unsafe into a network-facing module.
-// (`native` carves out its `#[cfg(test)]` C-ABI roundtrip tests, which exercise the CLIENT
-// side of punktfunk-core against this host in-process and are unsafe by nature; `mgmt` and
-// `identity` carve out test builds too — their tests scope `PUNKTFUNK_CONFIG_DIR` by mutating
-// the process env, an unsafe call since edition 2024.)
+// Network-facing secure-default surface. `not(test)` because tests mutate process env
+// (`set_var` is unsafe in 2024) and `native` has in-process C-ABI roundtrips.
 #[cfg_attr(not(test), forbid(unsafe_code))]
 mod mgmt;
 #[forbid(unsafe_code)]
 mod mgmt_token;
-// `ctl` is a CLIENT of everything above — it holds the operator token and the certificate pin, so
-// it gets the same `forbid` as the surfaces it talks to.
+// Loopback client of the surfaces above; same `forbid` (holds the operator token and cert pin).
 #[forbid(unsafe_code)]
 mod ctl;
 #[cfg_attr(not(test), forbid(unsafe_code))]
@@ -106,49 +85,38 @@ mod osinfo;
 mod pipeline;
 mod plugins;
 mod power;
-// Finding a launched game's processes from its store's detect signals — the read side of the
-// session⇄game lifetime binding (design/session-game-lifetime.md §4). Per-OS matchers inside; on a
-// platform with neither (macOS, which has no launch path either) the module is an empty shell.
+// Process-table half of session⇄game binding — design/session-game-lifetime.md. Empty on macOS.
 mod procscan;
-// The live half of the same binding: what a provider PLUGIN reports about its titles' liveness,
-// where `procscan` can only look at the process table.
+// Plugin-reported liveness; `procscan` only sees the process table.
 mod runstate;
 mod send_pacing;
 #[cfg(target_os = "windows")]
 #[path = "windows/service.rs"]
 mod service;
 mod session_plan;
-// Operator policy for the session⇄game lifetime binding (`session-settings.json`).
+// Operator policy for session⇄game binding (`session-settings.json`).
 mod session_settings;
 mod session_status;
 mod sleep_inhibit;
 mod spike;
 mod stats_recorder;
-// Start/stop/status for the per-user tray — the recovery path it has never had of its own.
+// Per-user tray start/stop/status — the only recovery path after a crash or upgrade.
 #[cfg(target_os = "windows")]
 #[path = "windows/tray.rs"]
 mod tray;
-// The plugin store: signed catalogs, tiered trust, and install/uninstall jobs that run through the
-// same runner CLI the `plugins` subcommand uses (design/plugin-store.md).
+// Signed catalogs and install jobs via the `plugins` runner — design/plugin-store.md.
 mod store;
 mod stream_marker;
 mod update;
-// The two startup crash-recovery legs (below), both in the `pf-win-display` leaf crate (plan §W6):
-// `monitor_devnode::startup_recover()` re-enables PnP monitor devnodes disabled by a prior run, and
-// `isolate_journal::startup_recover()` re-lights displays a prior run deactivated for an EXCLUSIVE
-// session and never restored.
 #[cfg(target_os = "windows")]
 use pf_win_display::monitor_devnode;
 #[cfg(target_os = "windows")]
 use pf_win_display::win_display::isolate_journal;
-// Virtual-display orchestration lives in the `pf-vdisplay` subsystem crate (plan §W6); this shim
-// keeps every existing `crate::vdisplay::*` path valid (serve/mgmt/native/capture consume the trait,
-// registry, and manager through it). The DDC panel control + the KWin zkde protocol moved with it.
+// Shim: virtual-display lives in `pf-vdisplay`; keep `crate::vdisplay::*` for this crate's callers.
 mod vdisplay {
     pub(crate) use pf_vdisplay::*;
 }
-// The zero-copy GPU plumbing lives in the `pf-zerocopy` leaf crate (plan §W6); this shim keeps
-// every existing `crate::zerocopy::*` path valid for the host's remaining callers (session_plan).
+// Shim: GPU import lives in `pf-zerocopy`; keep `crate::zerocopy::*` for `session_plan`.
 #[cfg(target_os = "linux")]
 mod zerocopy {
     pub(crate) use pf_zerocopy::*;
@@ -160,12 +128,11 @@ use spike::{Options, Source};
 use std::path::PathBuf;
 
 fn main() {
-    // Before anything can reach an HTTPS call (the cover-art warmer, webhooks, the plugin-store
-    // catalog, the update downloader all build default `ureq` agents).
+    // Before any `ureq` agent (cover-art, webhooks, catalog, updates).
     punktfunk_core::tls::install_default_provider();
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
-    // `service run` is launched by the SCM with no console — log to a file instead of stderr.
+    // SCM `service run` has no console; log to a file, not stderr.
     #[cfg(target_os = "windows")]
     let service_run = {
         let a: Vec<String> = std::env::args().skip(1).take(2).collect();
@@ -179,9 +146,8 @@ fn main() {
         #[cfg(target_os = "windows")]
         service::init_file_logging(filter);
     } else {
-        // Logs go to stderr so stdout stays machine-readable (`punktfunk-host openapi > spec.json`).
-        // A second layer tees DEBUG-and-up into the in-memory ring served by GET /api/v1/logs —
-        // deliberately not gated by RUST_LOG, so console-side debugging never needs a restart.
+        // stderr so stdout stays machine-readable (`openapi > spec.json`). The ring tees DEBUG+
+        // ungated by RUST_LOG so the console Logs tab works without a restart.
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::Layer;
         log_capture::install_global(
@@ -198,28 +164,13 @@ fn main() {
         );
     }
 
-    // Tee every panic into the log ring BEFORE the default hook: a panicking thread otherwise
-    // prints only to stderr — absent from the web console's Logs tab (the ring) and gone entirely
-    // when stderr is detached — so a field report reads "host died, zero errors in the logs".
-    // The default hook still runs afterwards for the usual stderr message/abort behavior.
-    //
-    // 🛑 **The tee goes straight to the ring, NOT through `tracing`.** A panic hook that emits a
-    // tracing event is a trap: `tracing_subscriber`'s registry is `sharded-slab`-backed and reads a
-    // `thread_local!` with `LocalKey::with`, so emitting from a thread whose TLS is being torn down
-    // panics — *inside the hook*. Rust treats a panic raised while the hook is running as
-    // `MustAbort::PanicInHook` and then deliberately does not format the message ("perhaps that is
-    // causing the panic"), so the log gets `panicked at <loc>:` followed by a BLANK line and
-    // `thread panicked while processing panic. aborting.` — the cause erased at exactly the moment
-    // it mattered. That is precisely what hid the 2026-08-18 teardown abort on .173 (four aborts,
-    // zero diagnosis) until it was reproduced standalone.
-    //
-    // Everything below is TLS-free and cannot panic: `LogRing` is a `OnceLock` + `Mutex`, and
-    // `thread::current().name()` / `Backtrace::force_capture()` were both verified safe during TLS
-    // destruction. This does not make a TLS-destructor panic survivable — Rust aborts on those
-    // regardless — but it does mean the message that names the cause always lands.
+    // Push panics into the ring before the default hook (stderr is gone when detached).
+    // Do not emit via `tracing`: the registry uses TLS, so a destructor-path panic re-enters
+    // the hook (`MustAbort::PanicInHook`) and the cause is erased. `LogRing` is OnceLock+Mutex;
+    // `thread::current().name()` and `Backtrace::force_capture()` are TLS-teardown safe.
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Manual payload downcast (`payload_as_str` needs Rust 1.91; workspace MSRV is 1.82).
+        // `payload_as_str` needs Rust 1.91; MSRV is 1.82.
         let payload = info
             .payload()
             .downcast_ref::<&str>()
@@ -247,8 +198,7 @@ fn main() {
         );
         default_panic(info);
     }));
-    // Native crashes (an access violation inside a GPU runtime/driver DLL) are logged by a
-    // last-resort SEH filter for the same reason — they otherwise kill the host with no trace.
+    // SEH last-resort: a GPU-runtime AV otherwise kills the process with no ring entry.
     #[cfg(target_os = "windows")]
     crash::install();
 
@@ -258,29 +208,17 @@ fn main() {
     }
 }
 
-/// A lightweight management/CLI subcommand — package/service/driver ops, spec/library dumps — as
-/// opposed to a streaming/capture command. These never touch DXGI or run the host, so they skip the
-/// startup banner and (on Windows) the GPU-preference hook, whose DPI-awareness probe otherwise
-/// prints an alarming `SetProcessDpiAwarenessContext … "access denied"` WARN on a plain
-/// `plugins add`. `service run` is the SCM-launched host itself, so it is explicitly NOT lightweight
-/// (it must keep the hook — the hybrid-GPU ACCESS_LOST fix depends on it).
-/// Resolve the effective monitor pin (env, else the stored policy) and aim absolute input at that
-/// head — then report it. Called at startup (an operator sets the pin in a `host.env` and then has
-/// no session to watch, so this is where a typo has to surface) and again whenever the console
-/// writes the policy, so a picker change re-aims input without a host restart.
+/// Aim absolute input at the pinned capture monitor (env, else stored policy).
 ///
-/// The anchor lives HERE rather than in the mirror backend for two reasons: pf-vdisplay must not
-/// depend on pf-inject (its crate doc), and the anchor is a host-level pin anyway — the injector is
-/// host-lifetime and shared by every concurrent session, so there is nothing per-session to track
-/// (`design/per-monitor-portal-capture.md` §7.2).
+/// Called at startup and whenever the console writes the pin so a picker change
+/// re-aims without a host restart. Lives here, not in the mirror backend:
+/// `pf-vdisplay` must not depend on `pf-inject`, and the injector is host-lifetime
+/// (shared by every session) — design/per-monitor-portal-capture.md.
 #[cfg(target_os = "linux")]
 pub(crate) fn refresh_capture_monitor_anchor(context: &str) {
     let Some(want) = pf_vdisplay::capture_monitor() else {
-        // No pin (or the console just cleared one): stop aiming input at a monitor we are no
-        // longer mirroring, or a later virtual-display session inherits a stale anchor.
-        // Setting a pin says so in the log; clearing one is the same size of change to what the
-        // host streams, so say that too — but only when there WAS one, or every unpinned host
-        // logs this line at startup for no reason.
+        // Drop a stale anchor so a later virtual-display session does not inherit it.
+        // Log a clear only when an anchor was set; unpinned hosts must stay quiet at startup.
         if pf_inject::absolute_anchor().is_some() {
             tracing::info!(
                 context,
@@ -294,9 +232,7 @@ pub(crate) fn refresh_capture_monitor_anchor(context: &str) {
     match pf_vdisplay::detect().and_then(pf_vdisplay::monitors::list) {
         Ok(ms) => match pf_vdisplay::monitors::resolve(&ms, &want) {
             Ok(m) => {
-                // Match the libei region by the head's ORIGIN: two monitors can share a size — and
-                // a mirrored head's region is not the client's size at all — so size matching would
-                // put the pointer on the wrong screen.
+                // Match libei by origin: two heads can share a size; a mirror is not client-sized.
                 pf_inject::set_absolute_anchor(Some(pf_inject::AbsoluteAnchor {
                     origin: Some((m.x, m.y)),
                     mapping_id: None,
@@ -311,8 +247,7 @@ pub(crate) fn refresh_capture_monitor_anchor(context: &str) {
                      absolute input is anchored to it"
                 );
             }
-            // Left unanchored on purpose: a pin that resolves to nothing must not aim input at a
-            // guess. The session's own `create` fails with the same reason.
+            // Do not guess an anchor; `create` fails with the same unresolved pin.
             Err(e) => {
                 pf_inject::set_absolute_anchor(None);
                 tracing::warn!(
@@ -335,20 +270,20 @@ pub(crate) fn refresh_capture_monitor_anchor(context: &str) {
     }
 }
 
+// Package/service/driver CLI: skip the banner and the Windows GPU-pref hook (its DPI
+// probe WARNs `access denied` on `plugins add`). `service run` is the SCM host, not CLI.
 fn is_management_cli(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
         Some("plugins")
         | Some("driver")
         | Some("web")
         | Some("tray")
-        // A loopback API client. None of the host-startup work applies, and `watch` is a
-        // long-lived process — the GPU clock profile and the DXGI hook must not follow it.
+        // Loopback API client; `watch` is long-lived — do not take GPU clocks or the DXGI hook.
         | Some("ctl")
         | Some("openapi")
         | Some("library")
         | Some("detect-conflicts")
-        // Reads the compositor's output list and exits — none of the host-startup work applies,
-        // and it must not re-run the pin's own startup report while printing that same list.
+        // Prints the same list `refresh_capture_monitor_anchor` would log; skip host startup.
         | Some("list-monitors")
         | Some("-h")
         | Some("--help")
@@ -362,7 +297,6 @@ fn is_management_cli(args: &[String]) -> bool {
 fn real_main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // `--version` prints the build-stamped version (build.rs) to stdout and exits — no logging.
     if matches!(
         args.first().map(String::as_str),
         Some("--version") | Some("-V") | Some("version")
@@ -371,7 +305,6 @@ fn real_main() -> Result<()> {
         return Ok(());
     }
 
-    // Lightweight CLI commands (e.g. `plugins add`) get none of the host-startup noise below.
     let management_cli = is_management_cli(&args);
 
     if !management_cli {
@@ -387,8 +320,7 @@ fn real_main() -> Result<()> {
         refresh_capture_monitor_anchor("startup");
     }
 
-    // Wire pf-vdisplay's display-lifecycle events into the SSE event bus (the subsystem crate emits a
-    // neutral DisplayEvent; the orchestrator owns the bus type — plan §W6). Set once, ignore re-set.
+    // Once: pf-vdisplay emits a crate-neutral `DisplayEvent`; this crate owns the SSE bus type.
     let _ = pf_vdisplay::DISPLAY_EVENT_SINK.set(Box::new(|ev| match ev {
         pf_vdisplay::DisplayEvent::Created {
             backend,
@@ -404,22 +336,15 @@ fn real_main() -> Result<()> {
         }
     }));
 
-    // Install the win32u GPU-preference hook (same technique as Apollo, reimplemented — no GPL source
-    // copied) BEFORE anything touches DXGI (the virtual-display
-    // render-adapter selection creates a DXGI factory during virtual-display setup, well before
-    // capture). On a hybrid-GPU box this stops DXGI from reparenting the virtual output off the
-    // capture GPU — the ACCESS_LOST churn fix. Idempotent (Once); harmless on non-hybrid boxes.
-    // Skipped for lightweight CLI commands (`plugins`, `openapi`, …): they never touch DXGI, and the
-    // hook's DPI-awareness probe prints a misleading "access denied" WARN that looks like a failure.
+    // Before DXGI: virtual-display setup creates a factory. Hybrid-GPU boxes otherwise reparent
+    // the virtual output off the capture GPU (ACCESS_LOST). Idempotent Once.
     #[cfg(target_os = "windows")]
     if !management_cli {
         crate::capture::dxgi::install_gpu_pref_hook();
     }
 
-    // NVIDIA clock hygiene (Linux, host subcommands only): install the P2-cap driver profile. The
-    // vendor clock *pin* (PUNKTFUNK_PIN_CLOCKS) is no longer held for the host lifetime — it is
-    // armed per live client via `gpuclocks::session_pin()` on both streaming planes, so idle clocks
-    // are left alone while nobody is connected. No-op off NVIDIA / on the tool subcommands.
+    // P2-cap driver profile only. Clock pin is per live client (`gpuclocks::session_pin`), not
+    // host-lifetime, so idle clocks stay down. No-op off NVIDIA.
     #[cfg(target_os = "linux")]
     if matches!(
         args.first().map(String::as_str),
@@ -429,37 +354,25 @@ fn real_main() -> Result<()> {
     }
 
     match args.first().map(String::as_str) {
-        // The host: the native punktfunk/1 plane + management API by default (secure), and — with
-        // --gamestream — the GameStream/Moonlight-compat planes too (opt-in; #5/#9 trusted-LAN caveat).
         Some("serve") => {
             let (mgmt_opts, native, gamestream) = parse_serve(&args[1..])?;
-            // Claim the pf-vdisplay single-instance guard EAGERLY, before any client connects: the
-            // claim is first-comer-wins, and a lazily-claiming service could lose its own machine's
-            // driver to a stray second host started while the service sat idle.
+            // First-comer-wins: claim before any client, or an idle service loses the driver to a stray host.
             #[cfg(target_os = "windows")]
             vdisplay::manager::claim_instance_eagerly();
-            // Crash recovery for the experimental `pnp_disable_monitors` axis: re-enable any
-            // monitor devnodes a previous host disabled for an Exclusive session and never
-            // restored (crash/kill/power loss) — before any new session touches the topology.
+            // Re-enable PnP monitors a prior Exclusive session disabled and never restored.
+            // Must run before any new session touches the topology.
             #[cfg(target_os = "windows")]
             monitor_devnode::startup_recover();
-            // The same recovery for the experimental `edid_lock` axis: unpin AMD connector
-            // emulation a previous host locked and never unlocked — pinned emulation outlives
-            // the process (and can outlive a reboot), so this is the only thing standing between
-            // a crash and a permanently-emulated connector.
+            // Unpin AMD connector emulation a prior host locked. The pin outlives the process
+            // (and can outlive a reboot).
             #[cfg(target_os = "windows")]
             pf_win_display::adl_emul::startup_recover();
-            // The same recovery for the DEFAULT Exclusive path: a previous host that died holding a
-            // CCD isolate left the operator's panels deactivated with nothing to put them back (the
-            // restore snapshot was process memory). Runs AFTER the devnode leg so re-enabled
-            // monitors are present again and the EXTEND preset can actually light them.
+            // Re-light Exclusive CCD-isolate panels. After the devnode leg so re-enabled
+            // monitors exist for the EXTEND preset (the snapshot was process memory).
             #[cfg(target_os = "windows")]
             isolate_journal::startup_recover();
             gamestream::serve(mgmt_opts, native, gamestream)
         }
-        // Report other Moonlight-compatible hosts (Sunshine/Apollo/…) installed or running on this
-        // machine — side-by-side use is unsupported. Exit 1 if any are found (so the installers and
-        // support scripts can gate on it), 0 if clean. The host also runs this at `serve` startup.
         Some("detect-conflicts") => {
             let found = detect::scan();
             if found.is_empty() {
@@ -467,81 +380,45 @@ fn real_main() -> Result<()> {
                 return Ok(());
             }
             print!("{}", detect::render_report(&found));
-            // Exit 1 ONLY for a host that runs or will start on its own. The installers and support
-            // scripts gate on this code, and a dormant leftover used to abort them — a `winget
-            // install` failed in the field on a box whose Sunshine was merely present (see the
-            // module docs + `punktfunk-host.iss`). Dormant findings print, then exit 0.
+            // Exit 1 only for a host that runs or will auto-start. Dormant leftovers print, then 0
+            // (installers gate on this; see `detect` docs and `punktfunk-host.iss`).
             if detect::any_active(&found) {
                 std::process::exit(1);
             }
             Ok(())
         }
-        // The operator control surface: `ctl status`, `ctl approve 3`, `ctl watch`, … A loopback
-        // client of this same binary's management API, so a shell plugin or a script can drive
-        // pairing and sessions without a browser (design/omarchy-integration.md D13). See ctl.rs.
         Some("ctl") => ctl::main(&args[1..]),
-        // Install and run host plugins: `plugins add playnite`, `plugins enable`, … Package ops are
-        // forwarded to the bun runner; enable/disable/status drive the systemd unit (Linux) or the
-        // PunktfunkScripting scheduled task (Windows). See plugins.rs.
         Some("plugins") => plugins::main(&args[1..]),
-        // Print the management API's OpenAPI document (for client codegen).
         Some("openapi") => {
             print!("{}", mgmt::openapi_json());
             Ok(())
         }
-        // Dump the resolved game library (installed stores + custom entries) as JSON — the same
-        // payload `GET /api/v1/library` serves. A diagnostic for "does the host see my games?".
+        // Same JSON as `GET /api/v1/library`.
         Some("library") => {
             println!("{}", serde_json::to_string_pretty(&library::all_games())?);
             Ok(())
         }
-        // Standalone input-injection smoke test (no client needed): open the session's input
-        // backend and inject a scripted mouse/keyboard pattern. Watch a focused app / `wev`.
         Some("input-test") => devtest::input_test(),
-        // Standalone stylus smoke test (no client needed): create the "Punktfunk Pen" virtual
-        // tablet and draw a pressure-ramped stroke through the real tracker→uinput chain.
-        // Watch in Krita/GIMP (pressure brush) or `libinput debug-events`.
         #[cfg(target_os = "linux")]
         Some("pen-test") => devtest::pen_test(),
-        // Zero-copy FFI/GPU probe: init the EGL importer + CUDA context (no capture needed).
         #[cfg(target_os = "linux")]
         Some("zerocopy-probe") => zerocopy::probe(),
-        // Hidden: the isolated GPU-import worker the capture path spawns from a pinned fd to its
-        // own executable image (design/zerocopy-worker-isolation.md) — never run by hand; --fd
-        // names the inherited socketpair end.
+        // Hidden: capture spawns this from a pinned fd of its own image — design/zerocopy-worker-isolation.md.
         #[cfg(target_os = "linux")]
         Some("zerocopy-worker") => zerocopy::worker::run_from_args(&args[1..]),
-        // Hidden: the splash client every bare gamescope spawn backgrounds beside its nested app,
-        // so a fresh headless gamescope composites (and its PipeWire node delivers frames) from
-        // the first second — never run by hand; it needs a gamescope session's DISPLAY.
+        // Hidden: backgrounds beside a nested gamescope app so a fresh headless instance composites
+        // from the first second. Needs that session's DISPLAY.
         #[cfg(target_os = "linux")]
         Some("gamescope-splash") => vdisplay::gamescope_splash_client(),
-        // NV12 colour self-test (no display/capture needed): convert a known RGBA pattern to NV12
-        // on the GPU and compare against a BT.709 limited-range reference. Validates the Tier 2A
-        // `PUNKTFUNK_NV12` convert is colour-correct. Prints PASS/FAIL + max Y/U/V error.
         #[cfg(target_os = "linux")]
         Some("nv12-selftest") => zerocopy::nv12_selftest(),
-        // HDR P010 colour self-test (Windows; no display/capture needed): upload a known scRGB FP16
-        // pattern, run the `HdrP010Converter` shader → P010 on the GPU, read the Y/UV planes back, and
-        // compare against an f64 BT.2020-PQ limited-range reference. Validates the
-        // `PUNKTFUNK_HDR_SHADER_P010` colour math without green-screening a live HDR stream. Prints
-        // PASS/FAIL + max Y/Cb/Cr error.
         #[cfg(target_os = "windows")]
         Some("hdr-p010-selftest") => {
-            // Optional args: a `WxH` size (default 64x64 — pass the real capture size: heights
-            // like 1080 are NOT 16-aligned and exercise a different driver path) and a GPU
-            // vendor (`intel`|`nvidia`|`amd` — dual-GPU boxes otherwise test the default
-            // adapter, which may not be the one that encodes).
+            // `WxH` (default 64×64) and vendor. 1080 is not 16-aligned — a different driver path.
+            // Dual-GPU boxes otherwise test the default adapter, not the encoder.
             let mut size = (64u32, 64u32);
             let mut vendor = None;
-            // `args` starts AT the subcommand (main builds it with `env::args().skip(1)`), so the
-            // optional arguments begin at index 1 — cf. `args.get(1)` in the `service` arm. This
-            // read `skip(2)` and so silently swallowed the first optional argument: the documented
-            // `hdr-p010-selftest 1920x1080 nvidia` picked up the vendor but ran at the 64x64
-            // DEFAULT, and a size-only invocation parsed nothing at all and still printed PASS.
-            // The size is the whole point of the flag — 1080 is not 16-aligned and takes a
-            // different driver path — so the self-test was passing on the one geometry that
-            // exercises the least.
+            // `args` starts at the subcommand (`skip(1)`), so optionals begin at index 1.
             for a in args.iter().skip(1) {
                 match a.as_str() {
                     "intel" => vendor = Some(0x8086),
@@ -562,12 +439,6 @@ fn real_main() -> Result<()> {
             }
             crate::capture::dxgi::hdr_p010_selftest_at(size.0, size.1, vendor)
         }
-        // Linux HDR readiness probe: prints, for BOTH Linux HDR sources, whether they can deliver
-        // 10-bit PQ right now — the monitor mirror (is a monitor in BT.2100 colour mode?) and the
-        // gamescope virtual output (is the resolved gamescope our `pipewire-hdr` build, and is the
-        // knob on?) — plus whether the NVENC/VAAPI backend probes Main10 for HEVC/AV1 and the
-        // GameStream capability they combine into. The "why isn't my stream HDR?" diagnostic (no
-        // display/session needed for the encoder half).
         #[cfg(target_os = "linux")]
         Some("hdr-probe") => {
             let monitor_hdr = pf_capture::gnome_hdr_monitor_active();
@@ -579,12 +450,8 @@ fn real_main() -> Result<()> {
             println!("monitor in BT.2100 (HDR) colour mode: {monitor_hdr}");
             println!("gamescope offers 10-bit PQ capture:   {gs_binary_hdr}");
             println!("PUNKTFUNK_GAMESCOPE_HDR:              {gs_knob}");
-            // The other half of what the patched gamescope buys, and the one with no on-glass
-            // symptom of its own: when it is true the compositor paints the pointer into the
-            // capture node and the host stops blending — which is what lets the session take the
-            // zero-CSC encode source. When it is false the pointer is still streamed, just at the
-            // cost of a full-frame pass. Printed because "cursor composited by" is otherwise
-            // invisible until you compare two streams side by side.
+            // In-node cursor lets the session take the zero-CSC encode source; otherwise a
+            // full-frame blend. Invisible until you compare two streams, so print it here.
             println!(
                 "gamescope paints the cursor in-node:  {}",
                 pf_vdisplay::gamescope_composites_cursor()
@@ -602,18 +469,14 @@ fn real_main() -> Result<()> {
             );
             Ok(())
         }
-        // Compositor readiness probe: exit 0 iff the (detected or PUNKTFUNK_COMPOSITOR-forced)
-        // compositor is up and able to create a virtual output *now*. A session-bringup
-        // script polls this to gate on real readiness instead of a blind `sleep`.
+        // Exit 0 iff a virtual output can be created now — bringup scripts poll this instead of `sleep`.
         Some("probe-compositor") => {
             let compositor = vdisplay::detect()?;
             vdisplay::probe(compositor).with_context(|| format!("{compositor:?} not ready"))?;
             println!("{compositor:?} ready");
             Ok(())
         }
-        // List the host's physical monitors — the connector names `PUNKTFUNK_CAPTURE_MONITOR`
-        // takes. An operator configuring an unattended host has to learn those names from
-        // somewhere, and "curl the management API before the host is configured" is not it.
+        // Connector names `PUNKTFUNK_CAPTURE_MONITOR` takes — available before the mgmt API is up.
         #[cfg(target_os = "linux")]
         Some("list-monitors") => {
             let compositor = vdisplay::detect()?;
@@ -659,53 +522,31 @@ fn real_main() -> Result<()> {
             }
             Ok(())
         }
-        // Mirror a pinned physical monitor and pull frames from it — the per-monitor capture
-        // on-glass gate, with no client involved.
         #[cfg(target_os = "linux")]
         Some("mirror-test") => devtest::mirror_test(&args),
-        // Aim absolute input at a named monitor and report which libei region it landed in — the
-        // on-glass gate for the input-region ladder, with no client involved.
         #[cfg(target_os = "linux")]
         Some("anchor-test") => devtest::anchor_test(&args),
-        // Create a virtual DualSense via UHID and exercise it (validation, no streaming session).
         #[cfg(target_os = "linux")]
         Some("dualsense-test") => devtest::dualsense_test(&args),
-        // Mint one pad-audio PipeWire sink and capture from it — the Linux 0xD1 source gate.
         #[cfg(target_os = "linux")]
         Some("pad-sink-test") => devtest::pad_sink_test(&args),
-        // Attach the usbip DualSense (real USB device + its own UAC sound card) and capture off its
-        // isochronous endpoint — the gate for the ContainerId / real-ALSA-card path.
         #[cfg(target_os = "linux")]
         Some("pad-usbip-test") => devtest::pad_usbip_test(&args),
-        // Create a virtual Switch Pro Controller via UHID and exercise it (validation, no session).
         #[cfg(target_os = "linux")]
         Some("switchpro-test") => devtest::switchpro_test(&args),
-        // Windows N4 SPIKE: hold a software-devnode HID Steam Deck and watch Steam Input promote it.
         #[cfg(target_os = "windows")]
         Some("deck-windows-spike") => devtest::deck_windows_spike(&args),
-        // Windows: hold the pf-mouse virtual HID pointer and sweep the real cursor via HID reports
-        // (validates the resident-mouse cursor-presence fix on-glass). `--seconds N`.
         #[cfg(target_os = "windows")]
         Some("vmouse-spike") => devtest::vmouse_spike(&args),
-        // Windows: ask a throwaway pf_mouse devnode for its channel proof and report which HID
-        // transport hidclass forwarded — the pad channel's v3 delivery gate, verified on glass.
         #[cfg(target_os = "windows")]
         Some("channel-proof-probe") => devtest::channel_proof_probe(&args),
-        // Windows: create a virtual DualSense (or --ds4/--edge/--deck/--xbox) via the UMDF driver and
-        // hold it, driving the real *WindowsManager end to end. `--index N`, `--seconds N`.
         #[cfg(target_os = "windows")]
         Some("dualsense-windows-test") => devtest::dualsense_windows_test(&args),
-        // Windows: pad-audio endpoint provisioning (`ensure`/`status`) + the pnputil removal
-        // escape hatch (`remove`). `--index N` selects the pad slot (default 0).
         #[cfg(target_os = "windows")]
         Some("pad-endpoint") => devtest::pad_endpoint(&args),
-        // Windows: audio-substrate spikes (design/windows-audio-endpoints-and-vbcable.md §3) —
-        // mint Steam-driver instances and measure render→capture / loopback end to end.
         #[cfg(target_os = "windows")]
         Some("audio-probe") => devtest::audio_probe(&args),
-        // Capture→encode→file pipeline spike (dev tool).
         Some("spike") => spike::run(parse_spike(&args[1..])?),
-        // Native punktfunk/1 host (QUIC control plane + UDP data plane).
         Some("punktfunk1-host") => {
             let get = |flag: &str| {
                 args.iter()
@@ -717,9 +558,7 @@ fn real_main() -> Result<()> {
                 Some("virtual") => native::Punktfunk1Source::Virtual,
                 _ => native::Punktfunk1Source::Synthetic,
             };
-            // Fixed pairing PIN for test harnesses/CI (deterministic ceremony instead of scraping
-            // the logged random PIN). An empty value would arm SPAKE2 with an empty password —
-            // refuse it loudly, mirroring the --mgmt-token guard.
+            // Empty would arm SPAKE2 with an empty password (same trap as `--mgmt-token`).
             let pairing_pin = match get("--pairing-pin") {
                 Some(p) if p.trim().is_empty() => bail!("--pairing-pin must not be empty"),
                 p => p.map(str::to_string),
@@ -735,24 +574,17 @@ fn real_main() -> Result<()> {
                 max_concurrent: get("--max-concurrent")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(native::DEFAULT_MAX_CONCURRENT),
-                // Secure by default: REQUIRE PIN pairing (reject unpaired clients) unless
-                // --allow-tofu opts into trust-on-first-use — the host then accepts unpaired
-                // clients and advertises pair=optional. Pairing is always armed so a PIN is
-                // available (logged at startup); `--require-pairing`/`--allow-pairing` are now
-                // the default and accepted as no-ops for back-compat.
+                // Pairing required unless `--allow-tofu`. `--require-pairing`/`--allow-pairing` are no-ops.
                 require_pairing: !args.iter().any(|a| a == "--allow-tofu"),
                 allow_pairing: true,
                 pairing_pin,
                 paired_store: None,
-                // Fixed data-plane port: bind it and stream direct (no hole-punch), removing the
-                // ~2.5 s punch-timeout on a firewalled host. Default (absent) = a random port +
-                // hole-punch. Also honors PUNKTFUNK_DATA_PORT.
+                // Fixed port: direct send, no ~2.5 s punch-timeout on a firewalled host. Absent = random + punch.
                 data_port: get("--data-port")
                     .map(str::to_string)
                     .or_else(|| std::env::var("PUNKTFUNK_DATA_PORT").ok())
                     .and_then(|s| s.parse().ok()),
-                // Disconnect-detection latency (QUIC control-connection idle timeout): --idle-timeout-ms
-                // overrides PUNKTFUNK_IDLE_TIMEOUT_MS; absent = the core default (8s).
+                // QUIC idle timeout; flag overrides env; absent = core default (8 s).
                 idle_timeout: get("--idle-timeout-ms")
                     .and_then(|s| s.trim().parse::<u64>().ok())
                     .filter(|&ms| ms > 0)
@@ -761,56 +593,41 @@ fn real_main() -> Result<()> {
                 mdns: !args.iter().any(|a| a == "--no-mdns") && discovery::mdns_enabled(),
             })
         }
-        // Windows service control: install/uninstall/start/stop/status + the SCM `run` entry point.
-        // Replaces the ad-hoc launch chain — `service install` registers an auto-start SYSTEM service
-        // that launches the host into the active interactive session.
         #[cfg(target_os = "windows")]
         Some("service") => service::main(&args[1..]),
-        // Install-time work the Windows installer delegates to the exe instead of locale-parsed
-        // PowerShell *files* (the ANSI-codepage parse-break root fix; see windows/install.rs).
+        // Installer work in-process: locale-parsed PowerShell files break on ANSI codepages.
         #[cfg(target_os = "windows")]
         Some("driver") => install::driver_main(&args[1..]),
         #[cfg(target_os = "windows")]
         Some("web") => install::web_main(&args[1..]),
-        // The tray's only recovery path: it is a per-user GUI process whose HKLM Run value fires
-        // solely at sign-in, so anything that kills one (an upgrade, a crash) otherwise left the
-        // operator iconless until the next logon.
+        // HKLM Run fires only at sign-in; this is how an upgrade/crash gets the icon back.
         #[cfg(target_os = "windows")]
         Some("tray") => tray::main(&args[1..]),
         Some("-h") | Some("--help") | Some("help") | None => {
             print_usage();
             Ok(())
         }
-        // Unknown subcommand → usage. (No implicit default; a bare `punktfunk-host` with no
-        // args hits the None arm above and prints help.)
+        // No implicit `serve`; bare invocation is `None` above and prints help.
         Some(other) => bail!("unknown command '{other}' (try --help)"),
     }
 }
 
-/// `serve` options. The **native punktfunk/1 plane + management API are the secure default and always
-/// run**; `--gamestream` additionally enables the GameStream/Moonlight-compat planes (opt-in — they
-/// carry the inherent on-path #5/#9 weaknesses, so only on a trusted LAN). Returns the mgmt options,
-/// the native host config, and whether GameStream is enabled. Native pairing is **required by default**
-/// (an open host any LAN device can stream from is insecure); `--open` turns it off.
+/// Native plane + management API always run. `--gamestream` is trusted-LAN only.
+/// Pairing is required unless `--open`. Returns `(mgmt, native, gamestream)`.
 fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, bool)> {
     let mut opts = mgmt::Options::default();
-    let mut native_port: u16 = 9777; // the native plane always runs now
+    let mut native_port: u16 = 9777;
 
-    // Fixed data-plane UDP port: `Some(p)` binds p and streams direct (no hole-punch, no ~2.5 s
-    // punch-timeout on a firewalled host); `None` (default) = a random port + hole-punch. Env
-    // default, `--data-port` overrides.
+    // Env default; `--data-port` overrides. `Some` = direct bind; `None` = random + hole-punch (~2.5 s).
     let mut data_port: Option<u16> = std::env::var("PUNKTFUNK_DATA_PORT")
         .ok()
         .and_then(|s| s.parse().ok());
     let mut open = false;
     let mut gamestream = false;
     let mut no_mdns = false;
-    // Did the operator pin the mgmt bind themselves? If not, we LAN-expose the read surface below so
-    // paired clients can browse the game library out of the box (the bearer admin surface stays
-    // loopback-gated in `mgmt::require_auth` regardless of the bind).
+    // If unset, bind wide below so paired clients can browse. Admin stays loopback in `require_auth`.
     let mut mgmt_bind_explicit = false;
-    // Same question for the native port: an explicit `--native-port` out-ranks
-    // `PUNKTFUNK_NATIVE_PORT` from host.env, resolved after the loop.
+    // Explicit `--native-port` outranks `PUNKTFUNK_NATIVE_PORT` after the loop.
     let mut native_port_explicit = false;
     let mut i = 0;
     while i < args.len() {
@@ -830,16 +647,13 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
             }
             "--mgmt-token" => {
                 let token = next()?;
-                // An empty token would satisfy the non-loopback "token required" guard
-                // while authenticating nobody (or, worse, everybody) — refuse it loudly
-                // rather than letting `--mgmt-token "$UNSET_VAR"` ship a dead credential.
+                // Empty satisfies "token required" while authenticating nobody (`"$UNSET_VAR"`).
                 if token.trim().is_empty() {
                     bail!("--mgmt-token must not be empty");
                 }
                 opts.token = Some(token);
             }
-            // The native plane is now the DEFAULT (always runs in `serve`); `--native` is kept as an
-            // accepted no-op for back-compat / explicitness.
+            // No-op: the native plane always runs.
             "--native" => {}
             "--native-port" => {
                 native_port = next()?
@@ -854,14 +668,9 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
                         .map_err(|_| anyhow::anyhow!("bad --data-port (want a port number)"))?,
                 )
             }
-            // Opt into the GameStream/Moonlight-compat planes (off by default — they carry the
-            // inherent on-path #5/#9 weaknesses; only for a trusted LAN).
             "--gamestream" | "--moonlight" => gamestream = true,
-            // Disable mandatory native pairing — any device can connect (trusted single-user
-            // setups only). The default REQUIRES pairing.
             "--open" => open = true,
-            // Skip the mDNS adverts (native + GameStream) — multicast-dead environments
-            // (bridged Docker, CI netns); clients connect via a manually-added host.
+            // Bridged Docker / CI netns: multicast never arrives.
             "--no-mdns" => no_mdns = true,
             "-h" | "--help" => {
                 print_usage();
@@ -871,36 +680,18 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
         }
         i += 1;
     }
-    // The mgmt API is HTTPS + token-authenticated ALWAYS (even on loopback). Resolve the token:
-    // the --mgmt-token flag (above) wins, else PUNKTFUNK_MGMT_TOKEN env, else the persisted
-    // ~/.config/punktfunk/mgmt-token, else a freshly generated + persisted one — so a bare `serve`
-    // Just Works with auth on, no operator step, and the bundled web console reads the same file.
+    // Flag, else env, else persisted `mgmt-token`, else generate. HTTPS+token even on loopback.
     if opts.token.is_none() {
         opts.token = Some(crate::mgmt_token::load_or_generate()?);
     }
-    // The scripting runner's scoped credential: minted + persisted (plugin-token) alongside the
-    // admin token so a plugin's zero-config `connect()` picks it up — it authorizes the plugin
-    // surface but not hook registration or pairing administration (mgmt::auth::plugin_may_access).
-    //
-    // Only when a runner is actually installed. It used to be minted unconditionally on every
-    // `serve`, so a host with no plugins — the common case — still persisted a second
-    // admin-adjacent credential to disk and kept a second authentication lane live for a
-    // subsystem it does not run (2026-08-05 review L-21). Installing the runner later mints it on
-    // the next start, and an existing plugin-token file is picked up unchanged, so nothing about
-    // the plugin flow changes for a host that has one.
+    // Mint only if the runner is installed — otherwise a second admin-adjacent credential sits
+    // on disk for a subsystem that is not running. Scope: `plugin_may_access`, not pairing/hooks.
     if crate::plugins::runtime_status().installed {
         opts.plugin_token = Some(crate::mgmt_token::load_or_generate_plugin()?);
     }
-    // Default the mgmt listener to ALL interfaces (not just loopback) so a paired native client can
-    // fetch the game library over mTLS with no operator step — the whole point of "browse works by
-    // default". This only LAN-exposes the read-only cert allowlist; the bearer-token admin surface
-    // is confined to loopback peers in `mgmt::require_auth`, so binding wide adds no admin exposure.
-    // An operator who pinned `--mgmt-bind` (e.g. `127.0.0.1:47990` to restore loopback-only) keeps it.
-    //
-    // Same two-source shape as `--gamestream` / `PUNKTFUNK_GAMESTREAM` below, and for the same
-    // reason: the packaged units ship a fixed ExecStart, so `host.env` is the only route a package
-    // user has to move this that an upgrade won't overwrite. CLI wins — it is the more explicit of
-    // the two and the one a support instruction reaches for.
+    // Default all-interfaces so paired clients browse over mTLS. Admin stays loopback in
+    // `require_auth`. Packaged units ship a fixed ExecStart — `host.env` is the upgrade-safe pin;
+    // CLI wins as the more explicit of the two.
     if !mgmt_bind_explicit {
         opts.bind = match pf_host_config::config().mgmt_bind.as_deref() {
             Some(s) => s
@@ -909,9 +700,8 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
             None => std::net::SocketAddr::from(([0, 0, 0, 0], mgmt::DEFAULT_PORT)),
         };
     }
-    // Same two-source resolution as the mgmt bind above. A bad value is FATAL rather than ignored:
-    // silently serving on 9777 while host.env says otherwise is the failure that reads as "I moved
-    // the port and the client still can't reach me".
+    // A bad value is fatal — serving 9777 while host.env says otherwise reads as
+    // "I moved the port and the client still cannot reach me".
     if !native_port_explicit {
         if let Some(s) = pf_host_config::config().native_port.as_deref() {
             native_port = s
@@ -919,23 +709,18 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
                 .map_err(|_| anyhow::anyhow!("bad PUNKTFUNK_NATIVE_PORT '{s}' (want a port)"))?;
         }
     }
-    // Publish the resolved port for the console, right here rather than inside `serve`: the
-    // console's unit gates on `mgmt-token` (persisted a few lines above), so writing the endpoint
-    // in the same function keeps the two files effectively simultaneous. A console that still wins
-    // that race falls back to 47990 and its `Restart=always` retry picks the file up.
+    // Same function as the token persist so the console unit sees both. A race falls back to
+    // 47990; `Restart=always` retries.
     mgmt::publish_endpoint(opts.bind);
     let native = native::NativeServe {
         port: native_port,
         require_pairing: !open,
-        // Advertise the mgmt port over mDNS so clients learn where to browse the library (rather than
-        // assuming the default). `opts.bind.port()` is the real port even if the operator moved it.
+        // Real bound port, not the default, so mDNS clients follow a moved mgmt port.
         mgmt_port: opts.bind.port(),
         data_port,
         mdns: !no_mdns && discovery::mdns_enabled(),
     };
-    // The Moonlight-compat planes are opt-in from EITHER source: the `--gamestream` CLI flag or
-    // `PUNKTFUNK_GAMESTREAM` in host.env — the packaged systemd units ship a fixed native-only
-    // ExecStart, so the env knob is how a package user opts in without editing the unit.
+    // CLI or `PUNKTFUNK_GAMESTREAM`. Packaged units ship native-only ExecStart; env is the pin.
     let gamestream = gamestream || pf_host_config::config().gamestream;
     Ok((opts, native, gamestream))
 }
@@ -997,11 +782,7 @@ fn parse_spike(args: &[String]) -> Result<Options> {
                     "h264" => Codec::H264,
                     "h265" | "hevc" => Codec::H265,
                     "av1" => Codec::Av1,
-                    // The spike is the only way to drive a PyroWave capture→encode pass without
-                    // a client, which is what the Linux-host PyroWave work measures against.
-                    // Needs the `pyrowave` feature (default-on) and pairs with
-                    // `PUNKTFUNK_ENCODER=pyrowave`, which is what puts the CAPTURE side on the
-                    // raw-dmabuf passthrough.
+                    // Needs `pyrowave` and `PUNKTFUNK_ENCODER=pyrowave` (raw-dmabuf passthrough).
                     "pyrowave" => Codec::PyroWave,
                     other => bail!("unknown --codec '{other}' (h264|h265|av1|pyrowave)"),
                 }
@@ -1037,7 +818,7 @@ fn parse_spike(args: &[String]) -> Result<Options> {
             Codec::H264 => "h264",
             Codec::H265 => "h265",
             Codec::Av1 => "obu",
-            // Raw concatenated PyroWave packets — a lab dump, not an FFmpeg-playable stream.
+            // Concatenated packets; not an FFmpeg-playable stream.
             Codec::PyroWave => "pyrowave",
         };
         PathBuf::from(format!("/tmp/punktfunk-spike.{ext}"))

@@ -1,9 +1,11 @@
-//! The Windows core suite: every WinFacts preset renders its WinPlan to dry-run text, pinned
-//! under `tests/golden/win-*.txt`. Regenerate with `UPDATE_GOLDEN=1 cargo test`. Runs on
-//! every OS — that is the whole point of the plans being pure data.
+//! Windows plan goldens: every `WinFacts` preset renders its `WinPlan` to
+//! dry-run text under `tests/golden/win-*.txt`.
 //!
-//! Below the goldens, one named test per `design/installer-v2-windows.md` §5 trap. Those
-//! assert on the command list and step order, so they keep meaning when wording moves.
+//! Regenerate with `UPDATE_GOLDEN=1 cargo test -p punktfunk-setup`. Runs on
+//! every OS — the plans are pure data.
+//!
+//! Named tests below assert on the command list and step order so they keep
+//! meaning when wording moves. Traps live in `design/installer-v2-windows.md`.
 
 use std::path::Path;
 
@@ -16,8 +18,6 @@ use punktfunk_setup::platform::windows::{
 };
 use punktfunk_setup::seam::Env;
 use punktfunk_setup::ui::Plain;
-
-// ------------------------------------------------------------------------------- presets
 
 fn fresh() -> WinFacts {
     WinFacts {
@@ -77,8 +77,6 @@ fn public_network() -> WinFacts {
     }
 }
 
-// -------------------------------------------------------------------------- the mechanism
-
 fn render(facts: &WinFacts, choices: &WinChoices, artifact: Artifact, uninstall: bool) -> String {
     let (ui, buf) = Plain::capture();
     report::detected(&ui, facts, artifact);
@@ -113,8 +111,6 @@ fn golden(name: &str, actual: &str) {
 fn host_plan(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
     plan::build(facts, choices, Artifact::Host, false)
 }
-
-// --------------------------------------------------------------------------------- goldens
 
 #[test]
 fn golden_win11_fresh() {
@@ -222,8 +218,7 @@ fn an_upgrade_over_inno_retires_its_uninstaller_between_files_and_arp() {
 
 // ------------------------------------------------------------------- named traps (§5, D11, D12)
 
-// D11: coexistence is a SetEnv the host was built for, never an abort — and the value is
-// exactly the one shipped Linux behaviour writes.
+// Coexistence is a SetEnv, never an abort. The value is the Linux one.
 #[test]
 fn a_sunshine_box_coexists_by_moving_the_management_port() {
     let facts = sunshine();
@@ -235,7 +230,6 @@ fn a_sunshine_box_coexists_by_moving_the_management_port() {
     )));
 }
 
-// The D11 guard: an operator's own value is never rewritten.
 #[test]
 fn an_operator_mgmt_bind_is_never_rewritten() {
     let facts = WinFacts {
@@ -248,7 +242,7 @@ fn an_operator_mgmt_bind_is_never_rewritten() {
         .any(|s| matches!(s, WinAction::SetEnv { key, .. } if key == "PUNKTFUNK_MGMT_BIND")));
 }
 
-// Silent installs never touch a network profile: the Skip default renders a warning only.
+// Silent installs never touch a network profile. Skip is a warning only.
 #[test]
 fn silent_with_a_public_network_warns_but_never_touches_the_profile() {
     let facts = public_network();
@@ -261,7 +255,6 @@ fn silent_with_a_public_network_warns_but_never_touches_the_profile() {
         .any(|s| matches!(s, WinAction::Note(Level::Warn, text) if text.contains("Public"))));
 }
 
-// Fresh-only params, ported as data: a fresh install pins both; an upgrade passes neither.
 #[test]
 fn service_install_params_are_fresh_only_by_default() {
     let fresh_cmds = host_plan(&fresh(), &WinChoices::derive(&fresh())).commands();
@@ -281,8 +274,7 @@ fn service_install_params_are_fresh_only_by_default() {
     assert!(!install.contains("--allow-public-network"));
 }
 
-// ...but an explicit ask reaches the plan even on an upgrade — the Reconfigure fix for the
-// fielded Public-network boxes.
+// Omitting the flags on upgrade is not a no-op when the operator asked.
 #[test]
 fn an_explicit_public_fw_task_reaches_an_upgrade_plan() {
     let facts = upgrade();
@@ -294,8 +286,7 @@ fn an_explicit_public_fw_task_reaches_an_upgrade_plan() {
     assert!(install.contains("--allow-public-network=on"));
 }
 
-// §5: the uninstall order is load-bearing — service first (it supervises the tray), then the
-// tray, then all three driver legs unconditionally.
+// Service first — it supervises the tray — then tray, then all three driver legs.
 #[test]
 fn uninstall_order_is_service_tray_then_all_three_driver_legs() {
     let facts = upgrade();
@@ -311,8 +302,7 @@ fn uninstall_order_is_service_tray_then_all_three_driver_legs() {
     assert!(pos("driver uninstall --gamepad") < pos("driver uninstall --audio"));
 }
 
-// §5: stop/restore honesty — the restore step carries the pre-install task states, so an
-// upgrade puts back exactly what was there (here: web stays disabled, scripting enabled).
+// Restore carries the pre-install task states, so an upgrade puts back what was there.
 #[test]
 fn restore_carries_the_pre_install_task_states() {
     let facts = upgrade();
@@ -324,7 +314,6 @@ fn restore_carries_the_pre_install_task_states() {
             scripting_enabled: Some(true),
         }
     )));
-    // And a fresh install has nothing to stop or restore.
     let fresh_plan = host_plan(&fresh(), &WinChoices::derive(&fresh()));
     assert!(!fresh_plan.steps().any(|s| matches!(
         s,
@@ -332,8 +321,7 @@ fn restore_carries_the_pre_install_task_states() {
     )));
 }
 
-// §5: turning a row off on an upgrade removes what the box has — better than Inno's
-// unchecked-box-changes-nothing, and the registry line proves it.
+// Unchecking a row on upgrade deletes it. Inno's unchecked box is a no-op; do not copy that.
 #[test]
 fn deselecting_tray_on_an_upgrade_deletes_the_run_key() {
     let facts = upgrade();
@@ -345,7 +333,6 @@ fn deselecting_tray_on_an_upgrade_deletes_the_run_key() {
         .any(|c| c.starts_with("reg delete") && c.contains("PunktfunkTray")));
 }
 
-// The web password travels via a temp file on fresh installs only.
 #[test]
 fn web_password_file_is_fresh_only() {
     let plan = host_plan(&fresh(), &WinChoices::derive(&fresh()));

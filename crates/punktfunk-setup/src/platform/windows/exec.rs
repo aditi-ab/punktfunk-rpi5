@@ -1,15 +1,12 @@
-//! Stage four, Windows: run a `WinPlan` (WP1.4). One walk — echo always, mutate only when
-//! not dry — so what dry-run prints is what a real run executes, the Linux executor's rule.
+//! Windows `WinPlan` executor. One walk: echo always, mutate only when not dry.
 //!
-//! Two kinds of legs. Everything expressible as a spawn goes through `CommandRunner` and is
-//! FakeRunner-testable on any OS: `reg.exe` for the surgical PATH and the ARP entry, netstat
-//! for the port sweep (PID column + port match — the localized STATE word is never parsed),
-//! `schtasks` for tasks and the de-elevated tray launch. Only what no process can do — SCM
-//! stop/wait, `.lnk` writing, the env-change broadcast, the Appx presence check — lives in
-//! `sys.rs` behind `cfg(windows)` with honest error stubs elsewhere.
+//! Spawnable work goes through `CommandRunner` (FakeRunner-testable on any OS): `reg.exe` for
+//! PATH and ARP, `netstat` for the port sweep (PID + port; never the localized STATE),
+//! `schtasks` for tasks and the de-elevated tray. SCM stop/wait, `.lnk` writing, the env-change
+//! broadcast, and Appx presence live in `sys.rs` (`cfg(windows)`; error stubs elsewhere).
 //!
-//! Placeholders (`<staging>`, `<temp>`, `<version>`) render verbatim in a dry run and are
-//! substituted from `Subst` on a real one.
+//! Placeholders (`<staging>`, `<temp>`, `<version>`) stay literal in a dry run and come from
+//! `Subst` on a real one. Goldens enter through [`render`].
 
 use std::path::Path;
 
@@ -21,18 +18,15 @@ use crate::plan::Level;
 use crate::seam::{BasePaths, CommandRunner};
 use crate::ui::Reporter;
 
-/// What a real run substitutes for the plan's placeholders.
 #[derive(Debug, Clone, Default)]
 pub struct Subst {
     pub version: String,
-    /// The admin-only extraction dir the driver payloads were staged into.
+    /// Admin-only dir the driver payloads were staged into.
     pub staging: String,
-    /// A scratch dir with the same ACLs (the password file, generated task XML).
+    /// Same ACLs as staging; password file and generated task XML.
     pub temp: String,
 }
 
-/// Where the artifact's files come from. The real overlay reader lands with WP3.1; tests and
-/// `--demo` inject one that deploys nothing.
 pub trait PayloadSource {
     fn deploy(&self, dest: &Path) -> Result<(), String>;
 }
@@ -57,8 +51,7 @@ pub struct WinExecutor<'a> {
     pub paths: &'a BasePaths,
     pub ui: &'a dyn Reporter,
     pub dry: bool,
-    /// Inno-silent run: never a window, and the tray launch is skipped (the `.iss` rule —
-    /// the new host's supervision puts one back).
+    /// Silent install: no window; skip tray launch — the host's supervision starts one.
     pub silent: bool,
     /// The web password when the wizard edited it; `None` = generate at the step.
     pub web_password: Option<String>,
@@ -106,9 +99,8 @@ impl WinExecutor<'_> {
             .replace("<version>", &self.subst.version)
     }
 
-    /// Echo the (substituted) argv, then spawn it. `lenient` tolerates a non-zero exit and a
-    /// binary that is not even there — absence is the goal state for those steps (quitting a
-    /// tray that was already removed must not fail the uninstall).
+    /// `lenient`: non-zero exit and a missing binary both succeed. Absence is the goal — a
+    /// tray already gone must not fail uninstall.
     fn spawn(&self, argv: &[String], lenient: bool) -> Result<(), Failed> {
         let argv: Vec<String> = argv.iter().map(|a| self.sub(a)).collect();
         self.ui.plus(&join_argv(&argv));
@@ -133,8 +125,7 @@ impl WinExecutor<'_> {
         }
     }
 
-    /// A spawn whose echo the step's own line already covered — one logical step, several
-    /// helper spawns, and echoing all of them would drown the transcript.
+    /// Helper spawn; the step already echoed this line.
     fn spawn_quiet(&self, argv: &[&str], lenient: bool) -> Result<(), Failed> {
         let owned: Vec<String> = argv.iter().map(|a| self.sub(a)).collect();
         if self.dry {
@@ -192,8 +183,7 @@ impl WinExecutor<'_> {
                     self.ui.ok(&format!("would remove {dir}"));
                     return Ok(());
                 }
-                // Best-effort: the uninstaller itself lives here until WP3.x's copy-to-temp
-                // dance, and a locked file must not fail the teardown that already ran.
+                // Best-effort: the uninstaller still lives here; a locked file must not fail teardown.
                 match std::fs::remove_dir_all(dir) {
                     Ok(()) => self.ui.ok(&format!("removed {dir}")),
                     Err(e) => self.ui.warn(&format!("could not fully remove {dir}: {e}")),
@@ -299,7 +289,7 @@ impl WinExecutor<'_> {
         Ok(())
     }
 
-    /// The surgical PATH edit, entirely through `reg.exe`: read, rebuild, write EXPAND_SZ.
+    /// PATH via `reg.exe` so FakeRunner pins the write; type is REG_EXPAND_SZ.
     fn path_edit(&self, machine: bool, dir: &str, add: bool) -> Result<(), Failed> {
         let scope = if machine { "machine" } else { "user" };
         if self.dry {
@@ -489,8 +479,8 @@ impl WinExecutor<'_> {
         Ok(())
     }
 
-    /// De-elevated launch via a `/IT` scheduled task without `/RL` — a limited, interactive
-    /// token out of an elevated process, with no COM and no PowerShell (the S1 trick).
+    /// De-elevate via `/IT` without `/RL`: limited interactive token from an elevated process.
+    /// No COM, no PowerShell.
     fn launch_tray(&self, exe: &str) -> Result<(), Failed> {
         if self.dry {
             self.ui.ok(&format!(
@@ -529,7 +519,6 @@ impl WinExecutor<'_> {
             self.ui.ok("Windows App Runtime already installed");
             return Ok(());
         }
-        // Best-effort, exactly as shipped: every failure warns and points at the download.
         let url =
             format!("https://aka.ms/windowsappsdk/2.2/latest/windowsappruntimeinstall-{arch}.exe");
         let file = format!("{}\\windowsappruntimeinstall.exe", self.subst.temp);
@@ -574,7 +563,6 @@ impl WinExecutor<'_> {
     }
 }
 
-/// Replace or append one `KEY=VALUE` line — the same shape the Linux executor applies.
 fn upsert_env(existing: &str, key: &str, value: &str) -> String {
     let prefix = format!("{key}=");
     let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
@@ -587,7 +575,7 @@ fn upsert_env(existing: &str, key: &str, value: &str) -> String {
     body
 }
 
-/// `None` = the dir is already an entry (case-insensitive, slash-insensitive) — nothing to do.
+/// `None` = already an entry (case-insensitive, slash-insensitive).
 fn path_with(current: &str, dir: &str) -> Option<String> {
     let want = dir.trim_end_matches('\\');
     if current
@@ -616,8 +604,8 @@ fn path_without(current: &str, dir: &str) -> Option<String> {
     Some(kept.join(";"))
 }
 
-/// The PID column of `netstat -ano` rows whose local address ends in one of `ports`. The
-/// state column is localized (ABHÖREN on a German box) and deliberately never read.
+/// PID column of `netstat -ano` rows whose local address ends in `ports`. STATE is localized;
+/// never read it.
 fn pids_listening_on(netstat: &str, ports: &[u16]) -> Vec<String> {
     let suffixes: Vec<String> = ports.iter().map(|p| format!(":{p}")).collect();
     let mut pids: Vec<String> = vec![];
@@ -637,8 +625,8 @@ fn pids_listening_on(netstat: &str, ports: &[u16]) -> Vec<String> {
     pids
 }
 
-/// The `.iss` registration as XML: boot trigger, LocalService, restart 999×/1 min, battery
-/// tolerant — `schtasks` flags cannot express the restart backoff.
+/// XML because `schtasks` flags cannot express restart backoff. Boot, LocalService, 999×/1 min,
+/// battery-tolerant.
 fn scripting_task_xml(app_dir: &str) -> String {
     let cmd = format!("{app_dir}\\scripting\\scripting-run.cmd");
     format!(
@@ -729,9 +717,8 @@ mod tests {
     #[test]
     fn path_edit_is_containment_checked_and_entry_exact() {
         assert_eq!(path_with(r"C:\a;C:\b", r"C:\c").unwrap(), r"C:\a;C:\b;C:\c");
-        // Case-insensitive, trailing-slash-insensitive: never a duplicate.
         assert!(path_with(r"C:\a;c:\PF\", r"C:\pf").is_none());
-        // Entry-by-entry removal — a substring of another entry survives.
+        // Entry-by-entry: a substring of another entry survives.
         assert_eq!(
             path_without(r"C:\pf;C:\pf-tools;C:\b", r"C:\pf").unwrap(),
             r"C:\pf-tools;C:\b"
@@ -739,8 +726,6 @@ mod tests {
         assert!(path_without(r"C:\a", r"C:\nope").is_none());
     }
 
-    // The .iss identified the console's survivors by port + PID, never the localized state
-    // word — a German box says ABHÖREN where an English one says LISTENING.
     #[test]
     fn netstat_parse_matches_ports_and_ignores_the_state_word() {
         let out = "\r\nAktive Verbindungen\r\n\r\n  Proto  Lokale Adresse  Remoteadresse  Status  PID\r\n  TCP    0.0.0.0:47992   0.0.0.0:0      ABH\u{00d6}REN  4711\r\n  TCP    127.0.0.1:9000  0.0.0.0:0      ABH\u{00d6}REN  1234\r\n  TCP    [::]:47992      [::]:0         ABH\u{00d6}REN  4711\r\n";
@@ -780,11 +765,11 @@ mod tests {
         let (net, payload) = (FakeNet::default(), FakePayload::default());
         let paths = BasePaths::rooted(Path::new("/box"));
         let exec = executor(&run, &net, &payload, &paths, &ui);
-        // An unscripted probe of an on-PATH program exits 1: fine leniently, fatal otherwise.
+        // Unscripted on-PATH probe exits 1: ok lenient, fatal otherwise.
         let argv = ["taskkill", "/F", "/IM", "x.exe"].map(str::to_string);
         assert!(exec.spawn(&argv, true).is_ok());
         assert!(exec.spawn(&argv, false).is_err());
-        // A missing binary is fine leniently (absence is the goal state), fatal otherwise.
+        // Missing binary: ok lenient (absence is the goal), fatal otherwise.
         let missing = ["no-such-tool"].map(str::to_string);
         assert!(exec.spawn(&missing, true).is_ok());
         assert!(exec.spawn(&missing, false).is_err());
@@ -831,8 +816,7 @@ mod tests {
             r"C:\app",
         )
         .unwrap();
-        // And without a scripted reg, the first write fails — proof the writes go through
-        // the runner seam, not around it.
+        // Unscripted `reg` fails: writes go through the runner, not around it.
         let bare = FakeRunner::new();
         let exec = executor(&bare, &net, &payload, &paths, &ui);
         assert!(exec
@@ -871,8 +855,7 @@ mod tests {
         let (net, payload) = (FakeNet::default(), FakePayload::default());
         let paths = BasePaths::rooted(Path::new("/box"));
         let exec = executor(&run, &net, &payload, &paths, &ui);
-        // Lenient legs tolerate absent targets; the PATH read sees an empty value; the file
-        // removal warns on a nonexistent dir — the honest degradations, none a failure.
+        // Lenient legs, empty PATH, missing dir: warn, never fail.
         exec.execute(&plan).unwrap();
         assert!(
             run.ran.borrow().is_empty(),

@@ -1,12 +1,10 @@
-//! The in-stream quick-action ring's portable contract (design/touch-client-overlay.md §2–3):
-//! what the presenter feeds it, what it asks back, and the session facts its slots draw from.
-//! Plain data — the Skia console renders it on desktop; the Android GL host may share it.
+//! In-stream quick-action ring: input the presenter feeds, commands it asks
+//! back, facts the slots draw from, and the 100 % geometry every editor uses.
+//! Pin: `design/touch-client-overlay.md`.
 
-/// What the presenter feeds the ring: the two-finger twist, or a key.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RingInput {
-    /// The twist is turning: `progress` 0…1 drives the unwind, `clockwise` is the hand's
-    /// direction, `x`/`y` (window pixels) the centroid the ring is centred on.
+    /// `progress` 0…1; `x`/`y` are window pixels of the twist centroid.
     Turn {
         progress: f32,
         clockwise: bool,
@@ -21,8 +19,7 @@ pub enum RingInput {
     Toggle { x: f32, y: f32 },
 }
 
-/// What the ring asks the session to do; the presenter drains these once per iteration.
-/// Host actions do not appear here — the console's own command bus carries them.
+/// Drained by the presenter once per iteration. Host actions ride the console bus, not this enum.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RingCommand {
     EndStream,
@@ -30,7 +27,7 @@ pub enum RingCommand {
     CycleStats,
     ToggleMic,
     CycleTouchMode,
-    /// Toggle the platform's text input (Steam's on-screen keyboard under gamescope).
+    /// Platform text input, not a Keyboard key.
     Keyboard,
     RequestMode {
         width: u32,
@@ -41,20 +38,17 @@ pub enum RingCommand {
     Shortcut(Vec<String>),
 }
 
-/// The ring's geometry at 100 % scale, in the client's design units (px on Skia, dp/pt on the
-/// phones). Every desktop drawing of the ring — the Skia console in-stream and its editor,
-/// the GTK shell's editor, the Windows client's editor — reads these, so the three cannot
-/// drift apart (design tenet 8).
+/// 100 % scale, client design units (px on Skia, dp/pt on phones). Shared so editors cannot drift.
 pub const RING_RADIUS: f32 = 120.0;
 pub const SLOT_DIAMETER: f32 = 56.0;
 pub const CENTRE_DIAMETER: f32 = 64.0;
 
-/// Slot `k` sits at 12, 2, 4… o'clock: its angle in degrees with 0 at 3 o'clock, clockwise.
+/// Degrees; 0 at 3 o'clock, clockwise. Slot 0 is 12 o'clock.
 pub fn slot_angle_deg(k: usize) -> f32 {
     -90.0 + 60.0 * k as f32
 }
 
-/// Slot `k`'s centre relative to the ring's centre, `radius` out, y down.
+/// Offset from ring centre; y down.
 pub fn slot_offset(k: usize, radius: f32) -> (f32, f32) {
     let (s, c) = slot_angle_deg(k).to_radians().sin_cos();
     (radius * c, radius * s)
@@ -64,7 +58,6 @@ pub fn slot_offset(k: usize, radius: f32) -> (f32, f32) {
 mod geometry_tests {
     use super::*;
 
-    /// Slot 0 is straight up, slot 3 straight down, and the six sit 60° apart on the circle.
     #[test]
     fn slots_sit_at_twelve_two_four_six_eight_and_ten() {
         let (x0, y0) = slot_offset(0, 100.0);
@@ -85,24 +78,22 @@ mod geometry_tests {
     }
 }
 
-/// The session facts the ring's slots show and gate on, composed by the presenter per frame.
+/// Per-frame session facts the slots show and gate on.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RingFacts {
-    /// The resolved profile's `overlay_actions` blob (empty = the platform default ring).
+    /// Empty means the platform default ring.
     pub overlay_actions: String,
-    /// The live touch model's stored name (`trackpad` / `pointer` / `touch`).
+    /// Touch-model name: `trackpad` / `pointer` / `touch`.
     pub touch_mode: String,
-    /// Whether the host injects touch contacts — the `touch` model is skipped without it.
+    /// Without this the `touch` model is skipped.
     pub host_accepts_touch: bool,
-    /// The stats tier's label.
     pub stats_tier: String,
     pub mic_available: bool,
     pub mic_muted: bool,
-    /// The live mode, and the mode the Welcome carried (the Resolution row's "Native").
+    /// Live `(w, h, hz)`. `native_mode` is the Welcome native.
     pub mode: (u32, u32, u32),
     pub native_mode: (u32, u32, u32),
-    /// The host, for its pre-fetched actions: address, management port, pinned
-    /// fingerprint (hex) and display name.
+    /// Host identity for pre-fetched actions; `fp_hex` is the pinned fingerprint.
     pub addr: String,
     pub mgmt_port: u16,
     pub fp_hex: String,

@@ -6,33 +6,33 @@
 //! frame-ready event + ring of keyed-mutex textures with no names, duplicates the handles INTO this
 //! WUDFHost process (`DuplicateHandle` — SYSTEM can, we can't reciprocate, which is why the host is the
 //! broker), and delivers the handle VALUES over `IOCTL_SET_FRAME_CHANNEL` ([`crate::control`] stashes
-//! them per monitor as a [`FrameChannel`]). The swap-chain worker picks the stash up and attaches with
-//! [`FramePublisher::from_channel`]. Only the two endpoint processes ever hold a handle to any frame
-//! object — see `design/idd-push-security.md`.
+//! them per monitor as a [`FrameChannel`]). The swap-chain worker turns the delivery into the
+//! monitor-owned [`RingEndpoint`] (mapping + retained handles, outlives any one worker) and opens its
+//! own device-bound [`FramePublisher`] on it ([`FramePublisher::open`]). Only the two endpoint
+//! processes ever hold a handle to any frame object — see `design/idd-push-security.md`.
 //!
-//! The driver writes its actual render-adapter LUID + a status code back into the host-created header
-//! (our only driver-visibility channel: UMDF hides OutputDebugString in ETW and the token can't write
-//! files), then copies each acquired swap-chain surface into the next ring slot and signals the host.
-//!
-//! Host counterpart: `crates/punktfunk-host/src/capture/windows/idd_push.rs`. The shared `SharedHeader`
-//! layout, the [`FrameToken`] packing, the `MAGIC`/`RING_LEN`, the `DRV_STATUS_*` codes and the
-//! channel-delivery struct are NOT hand-duplicated here: both sides `use pf_driver_proto::{control,
-//! frame}`, which OWNS the contract (with `const` size asserts so any drift is a compile error).
+//! The driver writes its render-adapter LUID + a status code back into the host-created header (our
+//! only driver-visibility channel), then copies each acquired swap-chain surface into the next ring
+//! slot and signals the host. Host counterpart: `crates/pf-capture/src/windows/idd_push.rs`. The
+//! `SharedHeader` layout, [`FrameToken`] packing, `MAGIC`/`RING_LEN`, `DRV_STATUS_*` codes and the
+//! channel-delivery struct all come from `pf_driver_proto`, which OWNS the contract (with `const`
+//! size asserts so any drift is a compile error).
 //!
 //! This module also owns the [`FrameStash`] — the driver-retained copy of the most recent composed
 //! frame that the swap-chain worker republishes into every freshly-attached ring, so a session
-//! opening onto an IDLE desktop gets its first frame immediately instead of waiting for something
-//! to dirty the display (the first-frame guarantee; see the type docs). Purely driver-internal
-//! behavior — no proto change: the host just sees a normal `seq = 1` publish right after attach.
+//! opening onto an IDLE desktop gets its first frame immediately (see the type docs).
 
+use std::mem::offset_of;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use pf_driver_proto::control::SetFrameChannelRequest;
 use pf_driver_proto::frame::{
-    AttachReject, DRV_STATUS_BIND_FAIL, DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED,
-    DRV_STATUS_TEX_FAIL, FrameToken, RING_LEN, SharedHeader, VERSION_TELEMETRY, check_attach,
-    pack_opened_detail,
+    AttachReject, CAP_RING_HEALTH_V3, CAP_SOURCE_SEQUENCE_QPC, DRV_STATUS_BIND_FAIL,
+    DRV_STATUS_NO_DEVICE1, DRV_STATUS_OPENED, DRV_STATUS_TEX_FAIL, ERR_DOMAIN_TRANSPORT,
+    FrameToken, HealthState, RING_LEN, SharedHeader, VERSION_TELEMETRY, check_attach,
+    pack_opened_detail, v3_readable,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D11::{
@@ -52,6 +52,20 @@ use windows::core::Interface;
 /// SUCCESS-severity (positive), so the windows-rs `Result` wrapper can never surface it (`.ok()` maps
 /// every non-negative HRESULT to `Ok(())`) — the publish loop reads the raw vtable HRESULT instead.
 const WAIT_TIMEOUT_HRESULT: i32 = 0x0000_0102;
+/// The capability bits this driver advertises (`frame::CAP_*`). Fence ring, endpoint survival and
+/// the swap-chain reset actuator arrive with WP7/WP5/WP13 and stay unadvertised until then.
+const DRIVER_CAPABILITIES: u32 = CAP_RING_HEALTH_V3 | CAP_SOURCE_SEQUENCE_QPC;
+
+/// The current QPC tick (0 if the counter is unavailable — it cannot be on any OS we load on).
+fn qpc_now() -> u64 {
+    let mut qpc = 0i64;
+    // SAFETY: plain FFI; `qpc` is a valid local out-param.
+    match unsafe { QueryPerformanceCounter(&mut qpc) } {
+        Ok(()) => qpc as u64,
+        Err(_) => 0,
+    }
+}
+
 /// `WAIT_ABANDONED` as an HRESULT — the host died while holding the slot's keyed mutex. Also
 /// SUCCESS-severity, and ownership DID transfer to the caller.
 const WAIT_ABANDONED_HRESULT: i32 = 0x0000_0080;
@@ -65,6 +79,8 @@ pub struct FrameChannel {
     /// The ring generation these textures belong to (checked against the header at attach).
     generation: u32,
     ring_len: u32,
+    /// Section size the host declared (v3; 0 from a pre-v3 host) — half of the v3-tail gate.
+    header_bytes: u32,
     header: u64,
     event: u64,
     textures: [u64; RING_LEN as usize],
@@ -87,6 +103,7 @@ impl FrameChannel {
         Some(Self {
             generation: req.generation,
             ring_len: req.ring_len,
+            header_bytes: req.header_bytes,
             header: req.header_handle,
             event: req.event_handle,
             textures: req.texture_handles,
@@ -129,6 +146,267 @@ impl Drop for FrameChannel {
 // NB: `FrameChannel` is plain integers, so it is auto-`Send` — it crosses from the control-plane
 // dispatch thread (stash) to the swap-chain worker (attach) with `MONITOR_MODES` serializing the
 // hand-off; no manual impl needed (handle values are process-global tokens, not thread-affine).
+
+/// The MONITOR-owned half of an attached ring (immunity plan D4 / WP5): the mapped header, the
+/// frame-ready event, the RETAINED shared-texture NT handles, the ring's identity (generation,
+/// v3 gate) and the sequences that must outlive any one worker. Every swap-chain assignment opens
+/// its own device-bound [`FramePublisher`] on it; worker exit drops those COM objects, and nothing
+/// device-bound ever crosses to the next assignment. Held as an `Arc` by the monitor entry and by
+/// the live publisher — the last holder unmaps and closes.
+pub struct RingEndpoint {
+    map: HANDLE,
+    header: *mut SharedHeader,
+    event: HANDLE,
+    /// Retained (NOT closed after open, unlike the pre-WP5 attach): each assignment re-opens them
+    /// on its own device. Closed by `Drop`.
+    textures: [u64; RING_LEN as usize],
+    ring_len: u32,
+    /// The ring generation this endpoint attached to — see [`Self::is_stale`].
+    generation: u32,
+    /// The host built the telemetry-capable (v2, 88-byte) layout — gates the v2 tail writes.
+    telemetry: bool,
+    /// The v3 ring-health tail may be touched (`frame::v3_readable` over version AND declared size).
+    v3: bool,
+    /// Publish-token sequence, monotonic per ring generation across worker re-opens.
+    seq: AtomicU64,
+    /// Publishes that landed / frames dropped, mirrored into the v3 tail (monotonic per ring).
+    published_total: AtomicU64,
+    dropped_total: AtomicU64,
+    /// The MONITOR's source sequence (D2: monotonic across ring rebuilds) — shared with the entry.
+    source_seq: Arc<AtomicU64>,
+}
+
+// SAFETY: the raw header pointer is a mapped section alive until `Drop`; every cross-thread access
+// to it goes through atomics (or plain status writes serialized by "one worker per monitor").
+unsafe impl Send for RingEndpoint {}
+// SAFETY: as above — shared references only reach atomic views of the mapping.
+unsafe impl Sync for RingEndpoint {}
+
+impl RingEndpoint {
+    /// Map + validate a delivered [`FrameChannel`], consuming it. Device-independent: no D3D here.
+    /// On ANY failure every handle is closed (the partially-built endpoint's `Drop`, or the
+    /// channel's) and the host re-delivers on its next recreate — failure is terminal for THIS
+    /// delivery. `target_id` is the OWNING monitor's OS target id: the mapped ring must name it
+    /// (proto v3 binding validation), so a cross-delivered ring can never carry this monitor's
+    /// frames into another client's stream.
+    pub fn from_channel(
+        mut channel: FrameChannel,
+        target_id: u32,
+        source_seq: Arc<AtomicU64>,
+    ) -> windows::core::Result<Self> {
+        // 1. Map the header from the duplicated section handle (ours from here on).
+        let map = FrameChannel::take(&mut channel.header);
+        // SAFETY: `map` is the live section handle the host duplicated into this process; a byte
+        // count of 0 maps the WHOLE section — always exactly what the host built, whatever version
+        // (the `telemetry`/`v3` gates keep our writes inside it). Read/write only: the host
+        // duplicates the handle with `SECTION_MAP_READ | SECTION_MAP_WRITE`, so a wider request
+        // would fail. The null `view.Value` is checked below.
+        let view = unsafe { MapViewOfFile(map, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0) };
+        if view.Value.is_null() {
+            let err = windows::core::Error::from_win32();
+            // SAFETY: `map` is the taken section handle, closed once here on the error path (the
+            // rest of `channel` closes via its Drop).
+            unsafe {
+                let _ = CloseHandle(map);
+            }
+            return Err(err);
+        }
+        let header = view.Value.cast::<SharedHeader>();
+        // From here `me`'s Drop owns cleanup on every early return.
+        let mut me = Self {
+            map,
+            header,
+            event: FrameChannel::take(&mut channel.event),
+            textures: core::mem::take(&mut channel.textures),
+            ring_len: channel.ring_len,
+            generation: 0,
+            telemetry: false,
+            v3: false,
+            seq: AtomicU64::new(0),
+            published_total: AtomicU64::new(0),
+            dropped_total: AtomicU64::new(0),
+            source_seq,
+        };
+
+        // 2. Validate (`check_attach`, unit-tested in pf-driver-proto — staleness first, binding
+        //    second): the channel's generation must match the header's CURRENT one (else a fresh
+        //    delivery is coming), and the ring must NAME THIS MONITOR (a cross-wire fails CLOSED).
+        // SAFETY: `header` is the mapped host header; `magic`/`generation` are read Acquire to pair
+        // with the host's Release publishes; `target_id`/`version` are plain in-bounds reads.
+        let (magic, header_gen, header_target, header_version) = unsafe {
+            (
+                (*(core::ptr::addr_of!((*header).magic) as *const AtomicU32))
+                    .load(Ordering::Acquire),
+                (*(core::ptr::addr_of!((*header).generation) as *const AtomicU32))
+                    .load(Ordering::Acquire),
+                (*header).target_id,
+                (*header).version,
+            )
+        };
+        match check_attach(
+            magic,
+            header_gen,
+            header_target,
+            channel.generation,
+            target_id,
+        ) {
+            Ok(()) => {}
+            Err(AttachReject::Stale) => {
+                dbglog!(
+                    "[pf-vd] frame-push(driver): dropping channel delivery (channel gen {} vs header gen {header_gen}) — superseded",
+                    channel.generation
+                );
+                // E_BOUNDS — stand-in for "stale delivery"; the caller only drops the attempt.
+                return Err(windows::core::HRESULT(0x8000_000Bu32 as i32).into());
+            }
+            Err(AttachReject::BindMismatch) => {
+                dbglog!(
+                    "[pf-vd] frame-push(driver): REFUSING attach — ring names target {header_target}, this monitor is {target_id} (host stash cross-wire?)"
+                );
+                // Report the refusal through the header so the host's wait_for_attach fails the
+                // open LOUDLY (DRV_STATUS_BIND_FAIL) instead of timing out mute; the detail carries
+                // the target id the ring claims.
+                // SAFETY: `header` is the live mapped view; in-bounds scalar writes.
+                unsafe {
+                    (*header).driver_status_detail = header_target;
+                    (*header).driver_status = DRV_STATUS_BIND_FAIL;
+                }
+                // E_INVALIDARG — the delivery itself is wrong; the caller only drops the attempt.
+                return Err(windows::core::HRESULT(0x8007_0057u32 as i32).into());
+            }
+        }
+        let v3 = v3_readable(header_version, channel.header_bytes);
+        dbglog!(
+            "[pf-vd] frame-push(driver): ring endpoint mapped for gen {header_gen} ({} slots, target {target_id}, v3_tail={v3})",
+            me.ring_len
+        );
+        me.generation = header_gen;
+        me.telemetry = header_version >= VERSION_TELEMETRY;
+        me.v3 = v3;
+        // v3: advertise what this driver can do. The state word follows from `stamp_epochs`
+        // (Release, after the epochs) on each worker open.
+        me.v3_store_u32(offset_of!(SharedHeader, capabilities), DRIVER_CAPABILITIES);
+        Ok(me)
+    }
+
+    /// The ring generation this endpoint attached to.
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// True once the host has recreated the ring (bumped the header generation) — e.g. the display's
+    /// HDR mode flipped, so the ring format changed (FP16 ⇄ BGRA) and a fresh channel delivery is
+    /// coming. The worker drops its publisher on this so it re-attaches to the new ring.
+    pub fn is_stale(&self) -> bool {
+        // SAFETY: `self.header` stays mapped for the endpoint's lifetime; `generation` lives within
+        // it and is read atomically (Acquire) to pair with the host's Release bump on a recreate.
+        let cur = unsafe {
+            (*(core::ptr::addr_of!((*self.header).generation) as *const AtomicU32))
+                .load(Ordering::Acquire)
+        };
+        cur != self.generation
+    }
+
+    /// Store one v3 tail `u32` at byte offset `off` (Relaxed; the state word carries the Release) —
+    /// a no-op unless the v3 gate passed, so a v2 section is never touched past byte 88.
+    fn v3_store_u32(&self, off: usize, v: u32) {
+        if !self.v3 {
+            return;
+        }
+        // SAFETY: the v3 gate proves the host built and declared the 152-byte layout; `off` is an
+        // `offset_of!` of a naturally-aligned u32 inside it (the `latest_cell` pattern).
+        unsafe {
+            (*self.header.cast::<u8>().add(off).cast::<AtomicU32>()).store(v, Ordering::Relaxed)
+        }
+    }
+
+    /// Store one v3 tail `u64` — same contract as [`Self::v3_store_u32`].
+    fn v3_store_u64(&self, off: usize, v: u64) {
+        if !self.v3 {
+            return;
+        }
+        // SAFETY: as `v3_store_u32`, for a naturally-aligned u64 field.
+        unsafe {
+            (*self.header.cast::<u8>().add(off).cast::<AtomicU64>()).store(v, Ordering::Relaxed)
+        }
+    }
+
+    /// Publish a [`HealthState`] LAST, with Release, so a host that Acquire-loads it sees every
+    /// epoch/sequence/error field written before it (the v3 snapshot contract).
+    fn v3_set_state(&self, state: HealthState) {
+        if !self.v3 {
+            return;
+        }
+        // SAFETY: as `v3_store_u32`; Release is the ordering the contract names.
+        unsafe {
+            (*self
+                .header
+                .cast::<u8>()
+                .add(offset_of!(SharedHeader, health_state))
+                .cast::<AtomicU32>())
+            .store(state as u32, Ordering::Release);
+        }
+    }
+
+    /// Stamp the epochs the opening worker runs under and mark the ring ACTIVE — `assignment`
+    /// changes per swap-chain assignment, `device` per D3D device object (`Direct3DDevice::epoch`).
+    fn stamp_epochs(&self, assignment: u32, device: u32) {
+        self.v3_store_u32(offset_of!(SharedHeader, assignment_epoch), assignment);
+        self.v3_store_u32(offset_of!(SharedHeader, device_epoch), device);
+        self.v3_set_state(HealthState::Active);
+    }
+
+    /// The worker is retiring its publisher (generation superseded / worker exit) and a fresh open
+    /// is expected — tell the host so a quiet ring reads as REBUILDING, not stalled.
+    pub fn mark_rebuilding(&self) {
+        self.v3_set_state(HealthState::Rebuilding);
+    }
+
+    /// The generation is poisoned: record the cause, then DEAD (Release, last).
+    fn mark_dead(&self, domain: u32, code: i32) {
+        self.v3_store_u32(offset_of!(SharedHeader, terminal_error_domain), domain);
+        self.v3_store_u32(offset_of!(SharedHeader, terminal_error_code), code as u32);
+        self.v3_set_state(HealthState::Dead);
+    }
+
+    /// One more frame dropped (busy / mismatch / fatal) — the v3 counter the host deltas.
+    fn note_drop(&self) {
+        let n = self
+            .dropped_total
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        self.v3_store_u64(offset_of!(SharedHeader, dropped_total), n);
+    }
+
+    #[inline]
+    fn latest_cell(&self) -> &AtomicU64 {
+        // SAFETY: `self.header` stays mapped for the endpoint's lifetime (unmapped only in Drop);
+        // the `latest` field lives within it and is naturally aligned, so this view is valid.
+        unsafe { &*(core::ptr::addr_of!((*self.header).latest) as *const AtomicU64) }
+    }
+}
+
+impl Drop for RingEndpoint {
+    fn drop(&mut self) {
+        // Every publisher (opened textures + keyed mutexes) is gone — they hold an `Arc` to us.
+        // Unmap the header, then close the event, section and every retained texture handle:
+        // nothing of the channel outlives the endpoint (`design/idd-push-security.md`).
+        // SAFETY: drop runs once; `self.header` is the live mapped view and every non-zero handle
+        // is one this endpoint owns — each unmapped/closed exactly once here.
+        unsafe {
+            let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.header.cast(),
+            });
+            let _ = CloseHandle(self.event);
+            let _ = CloseHandle(self.map);
+            for v in self.textures.iter_mut() {
+                if *v != 0 {
+                    let _ = CloseHandle(FrameChannel::take(v));
+                }
+            }
+        }
+    }
+}
 
 struct Slot {
     tex: ID3D11Texture2D,
@@ -276,25 +554,19 @@ pub enum PublishOutcome {
     Fatal,
 }
 
-/// Publishes acquired swap-chain surfaces into the HOST-created ring. Owned by the swap-chain processor
-/// thread; attached lazily once the host's channel delivery lands in the monitor stash.
+/// The WORKER-owned half of an attached ring: the slot textures + keyed mutexes opened on THIS
+/// worker's device, publishing into the monitor's [`RingEndpoint`]. Created per swap-chain
+/// assignment by [`Self::open`] and dropped with the worker — no COM object from one device epoch
+/// is reachable from another (immunity plan D4 acceptance).
 pub struct FramePublisher {
+    ep: Arc<RingEndpoint>,
     context: ID3D11DeviceContext,
-    map: HANDLE,
-    header: *mut SharedHeader,
-    event: HANDLE,
     slots: Vec<Slot>,
     next: u32,
-    seq: u64,
     /// The host-created ring textures' DXGI format (from the shared header). A swap-chain surface whose
     /// format differs (e.g. an FP16 HDR frame vs a BGRA ring) is dropped in `publish` — `CopyResource`
     /// needs matching formats.
     ring_format: u32,
-    /// The ring generation this publisher attached to. The host BUMPS the header generation when it
-    /// recreates the ring at a new format mid-session (the display's HDR mode flipped) — [`Self::is_stale`]
-    /// detects that so `run_core` re-attaches to the new ring (whose channel the host re-delivers)
-    /// instead of dropping every frame.
-    generation: u32,
     /// Set when a surface is dropped for a descriptor mismatch (a game mode-set the display), cleared on a
     /// matched publish — throttles the drop log to once per mismatch episode (game-capture bug GB1).
     mismatch_logged: bool,
@@ -304,210 +576,71 @@ pub struct FramePublisher {
     /// "DWM never composed" from "every compose mismatched the ring".
     offered: u32,
     mismatch_drops: u32,
-    /// Whether the HOST created a telemetry-capable (v2, 88-byte) header — stamped `version >=
-    /// VERSION_TELEMETRY` at attach. Gates every write to the telemetry tail: a v1 host's header
-    /// is 64 bytes, and the tail fields would land past the layout it reads.
-    telemetry: bool,
     /// Full-width wrapping sibling of `offered` (which packs to 15 saturating bits) — mirrored
     /// into `SharedHeader::offered_total` so the host can delta it across a stall window.
     offered_total: u64,
     /// The slot of the most recent successful publish + when it happened — what [`Self::harvest_into`]
     /// reads when this publisher is superseded. `None` until the first publish.
     last_published: Option<(u32, Instant)>,
-    /// The render adapter (LUID) this publisher's device + opened ring textures live on. A worker
-    /// re-adopts a publisher preserved across a swap-chain unassign→reassign flap ONLY when the
-    /// freshly-assigned swap-chain renders on this SAME adapter (else the opened textures would be
-    /// cross-device); see [`Self::render_adapter`] + `swap_chain_processor::run_core`.
-    render_luid_low: u32,
-    render_luid_high: i32,
 }
 
 // SAFETY: created and used only on the swap-chain processor thread.
 unsafe impl Send for FramePublisher {}
 
 impl FramePublisher {
-    /// Attach to the host ring from a delivered [`FrameChannel`]. Consumes the channel: on ANY failure
-    /// every handle is closed (taken ones explicitly, the rest by the channel's `Drop`) and the host
-    /// re-delivers on the next recreate — there is nothing to poll, so failure is terminal for THIS
-    /// delivery (the host's `wait_for_attach` sees the status code and fails the session open). All
-    /// early-return paths clean up explicitly (raw-handle style, no RAII — matches the rest of this
-    /// driver). `target_id` is the OWNING monitor's OS target id: the mapped ring must name it
-    /// (proto v3 binding validation — see step 3), so a cross-delivered ring can never carry this
-    /// monitor's frames into another client's stream.
-    pub fn from_channel(
-        mut channel: FrameChannel,
-        target_id: u32,
+    /// Open the endpoint's ring textures on THIS worker's device and mark the ring ACTIVE under
+    /// `assignment_epoch` / `device_epoch`. Fails (status reported through the header) when the
+    /// device lacks `ID3D11Device1` or a texture will not open here — most likely a render-adapter
+    /// mismatch (the host made the textures on a different GPU than the swap-chain renders on).
+    /// The endpoint survives a failed open; the caller decides whether to keep it.
+    pub fn open(
+        ep: Arc<RingEndpoint>,
         render_luid_low: u32,
         render_luid_high: i32,
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
+        assignment_epoch: u32,
+        device_epoch: u32,
     ) -> windows::core::Result<Self> {
-        let ring_len = channel.ring_len;
-
-        // 1. Map the header from the duplicated section handle (ours from here on).
-        let map = FrameChannel::take(&mut channel.header);
-        // SAFETY: `map` is the live section handle the host duplicated into this process; a byte
-        // count of 0 maps the WHOLE section — a v1 host created a 64-byte (pre-telemetry) header,
-        // so requesting size_of::<SharedHeader>() (the v2 88 bytes) could exceed what that host
-        // declared, while 0 always fits and always covers the layout the host actually built (the
-        // `telemetry` version gate keeps our writes inside it). The null `view.Value` is checked below.
-        let view = unsafe {
-            // Read/write only — the host now duplicates the header handle with least access
-            // (`SECTION_MAP_READ | SECTION_MAP_WRITE`), so `FILE_MAP_ALL_ACCESS` would exceed the
-            // granted rights and fail. We read the layout + write status/publish-token fields; RW covers it.
-            MapViewOfFile(map, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0)
-        };
-        if view.Value.is_null() {
-            let err = windows::core::Error::from_win32();
-            // SAFETY: `map` is the taken section handle, closed once here on the error path (the rest of
-            // `channel` closes via its Drop).
-            unsafe {
-                let _ = CloseHandle(map);
-            }
-            return Err(err);
-        }
-        let header = view.Value.cast::<SharedHeader>();
-
-        // 2. Report our render adapter to the host immediately (lets it detect a mismatch).
-        // SAFETY: `header` points to the mapped, non-null host header (>= size_of::<SharedHeader>()
-        // bytes); these scalar writes are within it.
+        let header = ep.header;
+        // Report our render adapter to the host first (lets it detect a mismatch).
+        // SAFETY: `header` is the endpoint's live mapped header; scalar in-bounds writes.
         unsafe {
             (*header).driver_render_luid_low = render_luid_low;
             (*header).driver_render_luid_high = render_luid_high;
         }
-
-        // 3. The host stamps magic==MAGIC BEFORE delivering the channel, this channel's generation
-        //    must match the header's CURRENT generation (a mismatch means the host recreated the ring
-        //    again before we attached — a fresh delivery is on its way; drop this stale one), and —
-        //    proto v3, `design/idd-push-security.md` invariant #10 — the mapped ring must NAME THIS
-        //    MONITOR: the host stamps `target_id` before the magic, so with parallel displays a
-        //    host-side stash cross-wire fails CLOSED here instead of publishing this monitor's frames
-        //    into another client's ring. The shared `check_attach` (unit-tested in pf-driver-proto)
-        //    owns the precedence: staleness first, binding second.
-        // SAFETY: `header` is the mapped host header; `magic`/`generation` live within it and are read
-        // atomically (Acquire) to pair with the host's Release publishes; `target_id`/`version` are
-        // plain in-bounds u32 reads, stamped before the magic the Acquire load ordered us behind.
-        let (magic, header_gen, header_target, header_version) = unsafe {
-            (
-                (*(core::ptr::addr_of!((*header).magic) as *const AtomicU32))
-                    .load(Ordering::Acquire),
-                (*(core::ptr::addr_of!((*header).generation) as *const AtomicU32))
-                    .load(Ordering::Acquire),
-                (*header).target_id,
-                (*header).version,
-            )
-        };
-        match check_attach(
-            magic,
-            header_gen,
-            header_target,
-            channel.generation,
-            target_id,
-        ) {
-            Ok(()) => {}
-            Err(AttachReject::Stale) => {
-                dbglog!(
-                    "[pf-vd] frame-push(driver): dropping channel delivery (channel gen {} vs header gen {header_gen}) — superseded",
-                    channel.generation
-                );
-                // SAFETY: `header`/`map` are the live mapped view + taken handle; unmapped + closed once
-                // on this path.
-                unsafe {
-                    let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                        Value: header.cast(),
-                    });
-                    let _ = CloseHandle(map);
-                }
-                // E_BOUNDS — stand-in for "stale delivery"; the caller only drops the attempt.
-                return Err(windows::core::HRESULT(0x8000_000Bu32 as i32).into());
-            }
-            Err(AttachReject::BindMismatch) => {
-                dbglog!(
-                    "[pf-vd] frame-push(driver): REFUSING attach — ring names target {header_target}, this monitor is {target_id} (host stash cross-wire?)"
-                );
-                // Report the refusal through the header so the host's wait_for_attach fails the open
-                // LOUDLY (DRV_STATUS_BIND_FAIL) instead of timing out mute; the detail carries the
-                // target id the ring claims.
-                // SAFETY: `header`/`map` are the live mapped view + taken handle; the status writes are
-                // in-bounds scalar writes, then both are released exactly once on this path.
-                unsafe {
-                    (*header).driver_status_detail = header_target;
-                    (*header).driver_status = DRV_STATUS_BIND_FAIL;
-                    let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                        Value: header.cast(),
-                    });
-                    let _ = CloseHandle(map);
-                }
-                // E_INVALIDARG — the delivery itself is wrong; the caller only drops the attempt.
-                return Err(windows::core::HRESULT(0x8007_0057u32 as i32).into());
-            }
-        }
-
-        // 4. The frame-ready event (duplicated with the host handle's full access, so SetEvent works).
-        let event = FrameChannel::take(&mut channel.event);
-
-        // 5. Open device1 + the ring textures from their duplicated shared handles (same render adapter
-        //    required). Each NT handle is closed right after the open — the COM object holds its own
-        //    reference, and the HOST keeps the resource alive with its own handle.
         let device1: ID3D11Device1 = match device.cast() {
             Ok(d) => d,
             Err(e) => {
-                // SAFETY: `header` is the mapped host header (status write within it); `event`/`map` are
-                // the taken live handles, all released once on this error path.
-                unsafe {
-                    (*header).driver_status = DRV_STATUS_NO_DEVICE1;
-                    let _ = CloseHandle(event);
-                    let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                        Value: header.cast(),
-                    });
-                    let _ = CloseHandle(map);
-                }
+                // SAFETY: as above — a status write within the mapped header.
+                unsafe { (*header).driver_status = DRV_STATUS_NO_DEVICE1 };
                 return Err(e);
             }
         };
-        let mut slots = Vec::new();
-        // Take each texture handle one at a time (NOT the whole array up front), so an error return
-        // mid-loop still lets `channel`'s Drop close every not-yet-taken handle.
-        for value in channel.textures.iter_mut().take(ring_len as usize) {
-            let tex_handle = FrameChannel::take(value);
-            // SAFETY: `device1` is a live ID3D11Device1; `tex_handle` is the duplicated shared NT handle
-            // for this ring texture.
+        let mut slots = Vec::with_capacity(ep.ring_len as usize);
+        // The NT handles stay RETAINED on the endpoint (closed only by its Drop): the next
+        // assignment opens them again on its own device.
+        for &tex_handle in ep.textures.iter().take(ep.ring_len as usize) {
+            let h = HANDLE(tex_handle as usize as *mut core::ffi::c_void);
+            // SAFETY: `device1` is a live ID3D11Device1; `h` is the duplicated shared NT handle for
+            // this ring texture, alive for the endpoint's lifetime.
             let opened: windows::core::Result<ID3D11Texture2D> =
-                unsafe { device1.OpenSharedResource1(tex_handle) };
-            // SAFETY: `tex_handle` is ours (taken above) and no longer needed whether the open succeeded
-            // (the COM object holds the resource) or failed — close it exactly once here.
-            unsafe {
-                let _ = CloseHandle(tex_handle);
-            }
-            let failed = match opened {
-                Ok(tex) => match tex.cast::<IDXGIKeyedMutex>() {
-                    Ok(mutex) => {
-                        slots.push(Slot { tex, mutex });
-                        None
+                unsafe { device1.OpenSharedResource1(h) };
+            match opened.and_then(|tex| {
+                tex.cast::<IDXGIKeyedMutex>()
+                    .map(|mutex| Slot { tex, mutex })
+            }) {
+                Ok(slot) => slots.push(slot),
+                Err(e) => {
+                    // SAFETY: status writes within the mapped header (the opened slots drop with `slots`).
+                    unsafe {
+                        (*header).driver_status = DRV_STATUS_TEX_FAIL;
+                        (*header).driver_status_detail = e.code().0 as u32;
                     }
-                    Err(e) => Some(e),
-                },
-                // Most likely a render-adapter mismatch (the host made the textures on a different GPU
-                // than the swap-chain renders on). Tell the host so it can report it.
-                Err(e) => Some(e),
-            };
-            if let Some(e) = failed {
-                // SAFETY: `header` is the mapped host header (status writes within it); `event`/`map`
-                // are the taken live handles, all released once on this error path (the not-yet-taken
-                // texture handles close via `channel`'s Drop).
-                unsafe {
-                    (*header).driver_status = DRV_STATUS_TEX_FAIL;
-                    (*header).driver_status_detail = e.code().0 as u32;
-                    let _ = CloseHandle(event);
-                    let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                        Value: header.cast(),
-                    });
-                    let _ = CloseHandle(map);
+                    return Err(e);
                 }
-                return Err(e);
             }
         }
-
         // Stamp the LIVE diagnostic word BEFORE the status flip, so a host that reads OPENED can
         // trust the detail field is ours (zero counters = "attached, nothing offered yet" — the
         // host's wait-for-attach uses this to tell a never-composed display from a pre-detail
@@ -517,29 +650,37 @@ impl FramePublisher {
             (*header).driver_status_detail = pack_opened_detail(0, 0);
             (*header).driver_status = DRV_STATUS_OPENED;
         }
+        // v3 epochs go in BEFORE the first publish, so the host never reads an ACTIVE ring without
+        // knowing which device/assignment its frames come from.
+        ep.stamp_epochs(assignment_epoch, device_epoch);
         dbglog!(
-            "[pf-vd] frame-push(driver): attached to host ring gen {header_gen} ({ring_len} slots, sealed channel)"
+            "[pf-vd] frame-push(driver): opened ring gen {} on device epoch {device_epoch} (assignment {assignment_epoch}, {} slots)",
+            ep.generation,
+            slots.len()
         );
         Ok(Self {
-            context: context.clone(),
-            map,
-            header,
-            event,
-            slots,
-            next: 0,
-            seq: 0,
             // SAFETY: `header` is the mapped host header; `dxgi_format` lives within it.
             ring_format: unsafe { (*header).dxgi_format },
-            generation: header_gen,
+            ep,
+            context: context.clone(),
+            slots,
+            next: 0,
             mismatch_logged: false,
             offered: 0,
             mismatch_drops: 0,
-            telemetry: header_version >= VERSION_TELEMETRY,
             offered_total: 0,
             last_published: None,
-            render_luid_low,
-            render_luid_high,
         })
+    }
+
+    /// The endpoint this publisher writes into.
+    pub fn endpoint(&self) -> &Arc<RingEndpoint> {
+        &self.ep
+    }
+
+    /// See [`RingEndpoint::is_stale`].
+    pub fn is_stale(&self) -> bool {
+        self.ep.is_stale()
     }
 
     /// v2 telemetry tail, drain side (stall attribution): stamp the heartbeat on EVERY drain-loop
@@ -549,23 +690,23 @@ impl FramePublisher {
     /// stale). Gated on the host's stamped header version (see the `telemetry` field docs);
     /// best-effort Relaxed stores, the `driver_status` visibility contract.
     pub fn note_drain(&self, acquired: bool) {
-        if !self.telemetry {
+        if !self.ep.telemetry {
             return;
         }
-        let mut qpc = 0i64;
-        // SAFETY: plain FFI; `qpc` is a valid local out-param. QPC cannot fail on any OS we load on.
-        if unsafe { QueryPerformanceCounter(&mut qpc) }.is_err() {
+        let qpc = qpc_now();
+        if qpc == 0 {
             return;
         }
-        // SAFETY: `self.header` stays mapped for the publisher's lifetime and the version gate above
+        let header = self.ep.header;
+        // SAFETY: the header stays mapped for the endpoint's lifetime and the version gate above
         // proves the host built the v2 (88-byte) layout; both fields are naturally-aligned u64s
         // within it, valid for `AtomicU64` views (the same pattern as `latest_cell`).
         unsafe {
-            (*(core::ptr::addr_of!((*self.header).drain_heartbeat_qpc) as *const AtomicU64))
-                .store(qpc as u64, Ordering::Relaxed);
+            (*(core::ptr::addr_of!((*header).drain_heartbeat_qpc) as *const AtomicU64))
+                .store(qpc, Ordering::Relaxed);
             if acquired {
-                (*(core::ptr::addr_of!((*self.header).last_acquire_qpc) as *const AtomicU64))
-                    .store(qpc as u64, Ordering::Relaxed);
+                (*(core::ptr::addr_of!((*header).last_acquire_qpc) as *const AtomicU64))
+                    .store(qpc, Ordering::Relaxed);
             }
         }
     }
@@ -576,47 +717,20 @@ impl FramePublisher {
     /// across a stall window (the packed 15-bit counter saturates, so it can't be delta'd).
     #[inline]
     fn write_opened_detail(&self) {
-        // SAFETY: `self.header` stays mapped for the publisher's lifetime (unmapped only in Drop);
-        // `driver_status_detail` is a plain in-bounds u32 field — a best-effort diagnostic write.
+        let header = self.ep.header;
+        // SAFETY: the header stays mapped for the endpoint's lifetime; `driver_status_detail` is a
+        // plain in-bounds u32 field — a best-effort diagnostic write.
         unsafe {
-            (*self.header).driver_status_detail =
-                pack_opened_detail(self.offered, self.mismatch_drops);
+            (*header).driver_status_detail = pack_opened_detail(self.offered, self.mismatch_drops);
         }
-        if self.telemetry {
+        if self.ep.telemetry {
             // SAFETY: the version gate proves the host built the v2 (88-byte) layout;
             // `offered_total` is a naturally-aligned u64 within it (the `latest_cell` pattern).
             unsafe {
-                (*(core::ptr::addr_of!((*self.header).offered_total) as *const AtomicU64))
+                (*(core::ptr::addr_of!((*header).offered_total) as *const AtomicU64))
                     .store(self.offered_total, Ordering::Relaxed);
             }
         }
-    }
-
-    #[inline]
-    fn latest_cell(&self) -> &AtomicU64 {
-        // SAFETY: `self.header` stays mapped for the publisher's lifetime (unmapped only in Drop); the
-        // `latest` field lives within it and is naturally aligned, so this AtomicU64 reference is valid.
-        unsafe { &*(core::ptr::addr_of!((*self.header).latest) as *const AtomicU64) }
-    }
-
-    /// True once the host has recreated the ring (bumped the header generation) — e.g. the display's HDR
-    /// mode flipped, so the ring format changed (FP16 ⇄ BGRA) and a fresh channel delivery is coming.
-    /// `run_core` drops the publisher on this so it re-attaches to the new ring.
-    pub fn is_stale(&self) -> bool {
-        // SAFETY: `self.header` stays mapped for the publisher's lifetime; `generation` lives within it and
-        // is read atomically (Acquire) to pair with the host's Release bump on a mid-session ring recreate.
-        let cur = unsafe {
-            (*(core::ptr::addr_of!((*self.header).generation) as *const AtomicU32))
-                .load(Ordering::Acquire)
-        };
-        cur != self.generation
-    }
-
-    /// The render adapter (LUID) this publisher's device + opened ring textures live on. The swap-chain
-    /// worker re-adopts a publisher preserved across an unassign→reassign flap only when the freshly-
-    /// assigned swap-chain renders on this same adapter (see the field docs + `run_core`).
-    pub fn render_adapter(&self) -> (u32, i32) {
-        (self.render_luid_low, self.render_luid_high)
     }
 
     /// Copy the most recently PUBLISHED frame out of the ring into `stash` — called just before this
@@ -686,8 +800,8 @@ impl FramePublisher {
         // A fullscreen game can mode-set the display, changing the surface's format/size before the host
         // recreates the ring to match (game-capture bug GB1) — drop a mismatched frame (else garbage) and
         // report the ACTUAL descriptor once per episode so a repro shows exactly what changed.
-        // SAFETY: `self.header` stays mapped for the publisher's lifetime; width/height are plain u32 fields.
-        let (rw, rh) = unsafe { ((*self.header).width, (*self.header).height) };
+        // SAFETY: the header stays mapped for the endpoint's lifetime; width/height are plain u32 fields.
+        let (rw, rh) = unsafe { ((*self.ep.header).width, (*self.ep.header).height) };
         // Live diagnostics: count every surface offered (and, below, every mismatch drop) into the
         // header's detail word — what lets the host's first-frame timeout tell "DWM never composed"
         // from "every compose mismatched the ring". Written once per call, after the outcome is known.
@@ -708,6 +822,7 @@ impl FramePublisher {
                     self.ring_format
                 );
             }
+            self.ep.note_drop();
             return PublishOutcome::DescMismatch;
         }
         self.mismatch_logged = false;
@@ -739,6 +854,9 @@ impl FramePublisher {
                     dbglog!(
                         "[pf-vd] frame-push FATAL: slot {slot} keyed mutex ABANDONED (host died holding it) — poisoning this ring generation"
                     );
+                    self.ep.note_drop();
+                    self.ep
+                        .mark_dead(ERR_DOMAIN_TRANSPORT, WAIT_ABANDONED_HRESULT);
                     return PublishOutcome::HostAbandoned;
                 }
                 // Acquired cleanly.
@@ -760,33 +878,52 @@ impl FramePublisher {
                             "[pf-vd] frame-push FATAL: slot {slot} ReleaseSync failed rc={:#x} — NOT publishing `latest`; poisoning this ring generation",
                             e.code().0
                         );
+                        self.ep.note_drop();
+                        self.ep.mark_dead(ERR_DOMAIN_TRANSPORT, e.code().0);
                         return PublishOutcome::Fatal;
                     }
-                    self.seq = self.seq.wrapping_add(1);
+                    let ep = &*self.ep;
+                    let seq = ep.seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                     // `latest` = (generation << 40) | (seq << 8) | slot, packed by the proto's `FrameToken`
                     // (single source of truth — the host unpacks with the same type). Stamping the generation
                     // lets the host REJECT a publish from a stale ring (an old-generation publisher racing the
                     // host's mid-session ring recreate) so it never consumes an unwritten new-ring slot.
                     let latest = FrameToken {
-                        generation: self.generation,
-                        seq: self.seq as u32,
+                        generation: ep.generation,
+                        seq: seq as u32,
                         slot: slot as u8,
                     }
                     .pack();
                     // Provenance stamp BEFORE the Release publish of `latest`: a host that reads
                     // it after loading the token sees this frame's stamp or a newer one —
                     // monotonic either way, and best-effort like the telemetry tail.
-                    // SAFETY: `self.header` stays mapped for the publisher's lifetime; `qpc_pts`
-                    // is an 8-aligned u64 within it (the `latest_cell` pattern).
+                    // SAFETY: the header stays mapped for the endpoint's lifetime; `qpc_pts` is an
+                    // 8-aligned u64 within it (the `latest_cell` pattern).
                     unsafe {
-                        (*(core::ptr::addr_of!((*self.header).qpc_pts) as *const AtomicU64))
+                        (*(core::ptr::addr_of!((*ep.header).qpc_pts) as *const AtomicU64))
                             .store(display_qpc, Ordering::Relaxed);
                     }
-                    self.latest_cell().store(latest, Ordering::Release);
-                    // SAFETY: `self.event` is the live host-created frame-ready event, duplicated into
+                    ep.latest_cell().store(latest, Ordering::Release);
+                    // v3 tail: a NEW source frame (the OS stamped a present time) advances the
+                    // MONITOR's source sequence; a stash republish (qpc 0) does not. Counters +
+                    // publish QPC are best-effort Relaxed like the telemetry tail.
+                    if display_qpc != 0 {
+                        let n = ep
+                            .source_seq
+                            .fetch_add(1, Ordering::Relaxed)
+                            .wrapping_add(1);
+                        ep.v3_store_u64(offset_of!(SharedHeader, source_sequence), n);
+                    }
+                    let n = ep
+                        .published_total
+                        .fetch_add(1, Ordering::Relaxed)
+                        .wrapping_add(1);
+                    ep.v3_store_u64(offset_of!(SharedHeader, published_total), n);
+                    ep.v3_store_u64(offset_of!(SharedHeader, last_publish_qpc), qpc_now());
+                    // SAFETY: `ep.event` is the live host-created frame-ready event, duplicated into
                     // this process with the creator's access; signalling it wakes the host consumer.
                     unsafe {
-                        let _ = SetEvent(self.event);
+                        let _ = SetEvent(ep.event);
                     }
                     self.next = (slot + 1) % ring_len;
                     self.last_published = Some((slot, Instant::now()));
@@ -809,32 +946,22 @@ impl FramePublisher {
                         "[pf-vd] frame-push FATAL: slot {slot} AcquireSync rc={:#x} (device-removed reason {removed:#x}) — poisoning this ring generation",
                         hr.0
                     );
+                    self.ep.note_drop();
+                    self.ep.mark_dead(
+                        if removed != 0 {
+                            pf_driver_proto::frame::ERR_DOMAIN_DEVICE
+                        } else {
+                            ERR_DOMAIN_TRANSPORT
+                        },
+                        if removed != 0 { removed } else { hr.0 },
+                    );
                     return PublishOutcome::Fatal;
                 }
             }
         }
         // All slots busy — the designed backpressure (never block the swap-chain thread). Distinct
         // from the fatal outcomes: the host is alive and behind, retrying next compose is correct.
+        self.ep.note_drop();
         PublishOutcome::AllSlotsBusy
-    }
-}
-
-impl Drop for FramePublisher {
-    fn drop(&mut self) {
-        // Slots FIRST (release the shared textures + keyed mutexes), THEN unmap the header, THEN the
-        // handles — nothing of the channel outlives the publisher (teardown invariant,
-        // `design/idd-push-security.md`).
-        self.slots.clear();
-        // SAFETY: drop runs once; `self.header` (if non-null) is the live mapped view and `self.event`/
-        // `self.map` are the live handles this publisher owns — each unmapped/closed exactly once here.
-        unsafe {
-            if !self.header.is_null() {
-                let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: self.header.cast(),
-                });
-            }
-            let _ = CloseHandle(self.event);
-            let _ = CloseHandle(self.map);
-        }
     }
 }

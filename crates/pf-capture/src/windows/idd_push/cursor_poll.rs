@@ -1,24 +1,19 @@
-//! GDI cursor poller — the Windows cursor-SHAPE source for the cursor-forward channel
-//! (design/remote-desktop-sweep.md §8, the M2c redesign).
+//! GDI cursor poller: the Windows cursor-SHAPE source for the cursor-forward
+//! channel. Off-thread `GetCursorInfo` + `HCURSOR` rasterise, published as
+//! [`pf_frame::CursorOverlay`].
 //!
-//! Why not the IddCx hardware-cursor query (the v5 `CursorShm` path, now the fallback): it is
-//! alpha-only BY DESIGN — `IDDCX_CURSOR_SHAPE_TYPE` has no monochrome value, the OS pre-converts
-//! monochrome to masked-color (IDDCX_CURSOR_CAPS docs), and masked-color delivery is dead code on
-//! modern builds (proven on-glass at every `ColorXorCursorSupport` level; no public evidence of a
-//! MASKED_COLOR delivery anywhere). The driver keeps its hardware cursor declared at XOR FULL
-//! purely so DWM EXCLUDES every cursor type from the IDD frame.
+//! IddCx hardware-cursor query (`CursorShm`) is alpha-only: `IDDCX_CURSOR_SHAPE_TYPE`
+//! has no monochrome, the OS pre-converts mono to masked-color, and MASKED_COLOR
+//! delivery is dead on modern builds. The driver still declares XOR FULL so DWM
+//! excludes every cursor type from the IDD frame; this poller is the shape that
+//! then gets forwarded or host-composited. DXGI `GetFramePointerShape` is not
+//! used: `PointerPosition.Visible` goes stale under injected input, and it burns
+//! one of four duplication slots.
 //!
-//! Why not DXGI Desktop Duplication `GetFramePointerShape`: its `PointerPosition.Visible` goes
-//! stale when the cursor moves only via injected input on current Win11 (Sunshine #5293 — exactly
-//! a Punktfunk session's topology), it burns one of the session's four duplication slots, and its
-//! per-output metadata on IDD monitors has conflicting field reports. The GDI path below is the
-//! metadata-forwarding-remote-desktop pattern (RustDesk, WebRTC/Chrome Remote Desktop, OBS): the
-//! cursor is per-session global state in win32k, readable cross-process, and `CURSOR_SHOWING` is
-//! the logical visibility — immune to all of the above.
-//!
-//! Works because the capture host runs as SYSTEM *inside the interactive session* on
-//! `winsta0\default` (the service supervisor retargets the token — `windows/service.rs`
-//! `spawn_host`), so the poller thread sees the session's cursor directly; no helper process.
+//! The host runs as SYSTEM inside the interactive session on `winsta0\default`
+//! (`windows/service.rs` `spawn_host`), so this thread reads the session cursor
+//! directly. Pin via the overlay snapshot and `secure_desktop`. Invert/mask
+//! contracts are tested below; design in `design/remote-desktop-sweep.md`.
 
 use super::*;
 use windows::Win32::Graphics::Gdi::{
@@ -36,13 +31,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CopyIcon, DestroyIcon, GetCursorInfo, GetIconInfo, CURSORINFO, HICON, ICONINFO,
 };
 
-/// `CURSORINFO.flags` bits (WindowsAndMessaging): the pointer is logically shown /
-/// touch-or-pen-suppressed. Named locally so the visibility rule below reads as the docs do.
 const CURSOR_SHOWING: u32 = 0x1;
 const CURSOR_SUPPRESSED: u32 = 0x2;
 
-/// A converted shape: the cache the per-tick overlay is assembled from. `rgba` is `Arc` so the
-/// slot publish (and every downstream frame attach) is a refcount bump.
+/// `rgba` is `Arc` so slot publish and every downstream attach is a refcount bump.
 struct Shape {
     rgba: std::sync::Arc<Vec<u8>>,
     w: u32,
@@ -52,47 +44,33 @@ struct Shape {
     serial: u64,
 }
 
-/// Off-thread GDI cursor poller. Samples `GetCursorInfo` every [`Self::INTERVAL`] (4 ms, ~250 Hz —
-/// see that constant for why 16 ms was the bug), rasterises the `HCURSOR` when its handle value
-/// changes and when [`Self::EXTENT_PROBE`] catches a resize under a STABLE handle, and publishes a
-/// ready [`pf_frame::CursorOverlay`] snapshot; the
-/// capture thread's per-tick cost is one uncontended mutex read + an `Arc` clone
-/// (same split as [`DescriptorPoller`], and for the same reason: user32/gdi32 calls have no place
-/// on the capture/encode thread).
+/// Off-thread GDI cursor poller. User32/gdi32 stay off the capture/encode thread;
+/// the capture tick is one uncontended mutex read plus an `Arc` clone.
 pub(super) struct CursorPoller {
     slot: Arc<Mutex<Option<pf_frame::CursorOverlay>>>,
     stop: Arc<AtomicBool>,
-    /// The input desktop is a SECURE desktop (Winlogon — UAC consent / lock / logon). Classified
-    /// on every reattach; the capturer polls it to stand the IddCx hardware-cursor declare down
-    /// while the secure desktop needs the software-cursor path to render (see
-    /// `IddPushCapturer::poll_secure_desktop`).
+    /// Input desktop is Winlogon (UAC/lock/logon). The capturer uses this to stand
+    /// the IddCx hardware-cursor declare down (`IddPushCapturer::poll_secure_desktop`).
     secure: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl CursorPoller {
-    /// ~250 Hz: the polled position is ALSO the composite-blend position (capture model), so
-    /// it must out-pace the fastest session — at 16 ms a 240 fps stream re-used a stale
-    /// position for ~4 consecutive frames and the composited pointer visibly stuttered
-    /// against the video. A tick is one `GetCursorInfo` syscall (rasterisation only on shape
-    /// change), so 250 Hz is still negligible CPU.
+    /// 4 ms ≈ 250 Hz. The polled position is also the composite-blend position, so
+    /// it must out-pace a 240 fps session; 16 ms reused a stale spot for ~4 frames.
     const INTERVAL: Duration = Duration::from_millis(4);
-    /// Unconditional input-desktop reattach cadence — catches secure-desktop (UAC/lock) switches
-    /// without a failure signal (`GetCursorInfo` on a stale desktop *succeeds* with stale data).
-    /// 250 ms, not the original 2 s: the reattach now also feeds [`Self::secure_desktop`], which
-    /// gates when the secure desktop becomes VISIBLE in the stream (the hardware-cursor
-    /// stand-down) — a 2 s freeze at every UAC prompt is user-visible, ~4 `OpenInputDesktop`
-    /// syscalls/s are not.
+    /// Unconditional input-desktop reattach. `GetCursorInfo` on a stale desktop
+    /// *succeeds* with stale data, so there is no failure signal. 250 ms, not 2 s:
+    /// this also feeds [`Self::secure_desktop`], and a 2 s freeze at UAC is visible.
     const REATTACH: Duration = Duration::from_millis(250);
-    /// Cadence of the same-handle extent re-probe (see the [`run`] loop). Display-scale changes are
-    /// human/OS-timescale events and the probe reads dimensions only — no pixel copy — so 4 Hz is
-    /// both ample and negligible, and a ≤250 ms lag on the pointer's size is imperceptible.
+    /// Same-handle extent re-probe. Scale changes are human-timescale; the probe
+    /// reads dimensions only, so 4 Hz is ample and a ≤250 ms size lag is invisible.
     const EXTENT_PROBE: Duration = Duration::from_millis(250);
 
-    /// Spawn the poller for the virtual display `target_id`. `rect` SEEDS the target's desktop rect
-    /// (`source_desktop_rect` order: x, y, w, h) — cursor positions are desktop-global; the
-    /// overlay wants frame-relative, and a pointer outside the rect reports `visible: false`
-    /// (per-output semantics, matching the driver shm path and the Linux portal).
+    /// Spawn for virtual display `target_id`. `rect` seeds the desktop rect
+    /// (`source_desktop_rect` order: x, y, w, h). Positions are desktop-global;
+    /// the overlay is frame-relative, and a pointer outside the rect is
+    /// `visible: false` (per-output, matching shm and the Linux portal).
     ///
     /// A SEED, not the value: the poll thread re-queries the rect on its [`Self::REATTACH`] cadence.
     /// It used to be captured once here and used forever for BOTH the desktop→frame offset and the
@@ -124,18 +102,17 @@ impl CursorPoller {
         }
     }
 
-    /// The latest overlay snapshot (`None` until the first successful shape rasterisation).
+    /// Latest overlay; `None` until the first successful rasterise.
     pub(super) fn read(&self) -> Option<pf_frame::CursorOverlay> {
         self.slot.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    /// Whether the input desktop is currently a SECURE desktop (UAC consent / Winlogon lock or
-    /// logon). Latched by the poll thread on its reattach cadence (≤ [`Self::REATTACH`] stale).
+    /// Secure-desktop latch; at most [`Self::REATTACH`] stale.
     pub(super) fn secure_desktop(&self) -> bool {
         self.secure.load(Ordering::Relaxed)
     }
 
-    /// Whether the worker thread is (still) alive — `false` degrades the capturer to the shm read.
+    /// Worker still running; `false` degrades the capturer to the shm read.
     pub(super) fn alive(&self) -> bool {
         self.thread.as_ref().is_some_and(|t| !t.is_finished())
     }
@@ -150,7 +127,6 @@ impl Drop for CursorPoller {
     }
 }
 
-/// The poll loop. Owns the thread's input-desktop binding and the shape cache.
 fn run(
     ccd: pf_win_display::win_display::CcdTargetKey,
     mut rect: (i32, i32, i32, i32),
@@ -158,10 +134,10 @@ fn run(
     stop: &AtomicBool,
     secure: &AtomicBool,
 ) {
-    // Physical-pixel coordinates on this thread regardless of the process's DPI awareness:
-    // `rect` comes from CCD (always physical), and a DPI-virtualized `GetCursorInfo` position
-    // would land in the wrong frame pixel on any scaled display. Thread-scoped, so the rest of
-    // the host is untouched.
+    // Physical pixels on this thread: `rect` is CCD (always physical). A
+    // DPI-virtualized `GetCursorInfo` would miss the frame pixel on a scaled display.
+    // Thread-scoped; the rest of the host is untouched.
+
     // SAFETY: takes and returns only a by-value context handle; affects this thread only.
     let _ = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 
@@ -209,8 +185,8 @@ fn run(
         // SAFETY: `ci` is a live, correctly-sized out-param for this synchronous call; no pointer
         // escapes it.
         if unsafe { GetCursorInfo(&mut ci) }.is_err() {
-            // Desktop went away under us (secure-desktop switch mid-call) — rebind and retry
-            // next tick; the slot keeps its last snapshot meanwhile.
+            // Desktop gone (secure-desktop switch mid-call) — rebind next tick;
+            // the slot keeps its last snapshot.
             publish_secure(secure, desktop.reattach());
             last_attach = Instant::now();
             continue;
@@ -219,23 +195,14 @@ fn run(
         let flags = ci.flags.0;
         let showing = flags & CURSOR_SHOWING != 0 && flags & CURSOR_SUPPRESSED == 0;
 
-        // Rasterise on handle change only (position-only ticks are a header update). Hidden
-        // cursors keep the cached shape — the forwarder's hidden-but-known contract needs the
-        // bitmap to have been seen. v1: animated cursors publish their first frame (the OBS
-        // behavior); frame cycling via DrawIconEx istep is a known follow-up.
+        // Rasterise on handle change only. Hidden cursors keep the cached shape
+        // (hidden-but-known needs a seen bitmap). Animated cursors publish frame 0.
         let handle = ci.hCursor.0 as isize;
 
-        // …but the handle alone CANNOT see a re-render. Windows rebuilds the system cursors at a
-        // new size whenever the scale under the pointer changes — crossing to a differently-scaled
-        // monitor, or a monitor's own scale settling after a mode change (a fresh virtual display
-        // is created at the RECOMMENDED scale and gets the client's saved `PerMonitorSettings`
-        // override a beat later) — while the SHARED handle stays put for the session's life (the
-        // arrow is 0x10003 throughout). Keyed on the handle alone the cache latched whatever size
-        // the pointer happened to have when the poller started and never let go: a session that
-        // sampled inside that pre-settle window forwarded — and composited — a 96 px pointer over
-        // a 100 % desktop until it ended, which is exactly the "cursor is 3× too big while
-        // everything else is fine" report. Re-read the bitmap's EXTENT on a slow cadence
-        // (dimensions only, no pixel copy) and drop the cache when it moved.
+        // Handle identity cannot see a re-render. Windows rebuilds system cursors
+        // when the scale under the pointer changes, but the shared handle stays
+        // put for the session (arrow is 0x10003 throughout). Re-read extent
+        // (dimensions only) and drop the cache when it moved.
         if showing && handle != 0 && handle == cached_handle {
             if last_extent.elapsed() >= CursorPoller::EXTENT_PROBE {
                 last_extent = Instant::now();
@@ -303,13 +270,9 @@ fn run(
                 serial: s.serial,
                 hot_x: s.hot_x,
                 hot_y: s.hot_y,
-                // `handle != 0` is part of "visible", not just of "worth rasterising": `SetCursor(NULL)`
-                // — how a game or a video player hides the pointer for its own window — leaves
-                // `CURSOR_SHOWING` set with a NULL `hCursor`. Judging on the flags alone published
-                // `visible: true` carrying the last shape we rasterised, so the composite path blended a
-                // ghost arrow into a game that had hidden its cursor, and the forward path told the
-                // client to draw one too. Every rasterise gate below already tests this; the published
-                // verdict has to agree with them.
+                // `handle != 0` is part of visible, not just of rasterise:
+                // `SetCursor(NULL)` (game/video hide) leaves `CURSOR_SHOWING` set
+                // with a NULL `hCursor`. Flags alone would publish the last shape.
                 visible: showing && in_rect && handle != 0,
             }
         });
@@ -317,24 +280,22 @@ fn run(
     }
 }
 
-/// Store a reattach's secure-desktop verdict (`None` = classification unavailable — keep the
-/// previous state rather than flapping the capturer's hardware-cursor stand-down).
+/// `None` = classification unavailable: keep the previous state rather than
+/// flapping the capturer's hardware-cursor stand-down.
 fn publish_secure(secure: &AtomicBool, verdict: Option<bool>) {
     if let Some(s) = verdict {
         secure.store(s, Ordering::Relaxed);
     }
 }
 
-/// The thread's owned input-desktop handle — the [`SendInputInjector`] reattach model
-/// (`pf-inject` sendinput.rs): keep the current binding, swap on demand, close exactly once.
+/// Owned input-desktop handle: keep the current binding, swap on demand, close
+/// exactly once (same reattach model as [`SendInputInjector`] in `pf-inject`).
 #[derive(Default)]
 struct DesktopBinding(Option<HDESK>);
 
 impl DesktopBinding {
-    /// Rebind to the CURRENT input desktop. Returns whether that desktop is a SECURE one
-    /// (`UOI_NAME` != "Default": "Winlogon" during UAC consent / lock / logon) — `None` when the
-    /// input desktop could not be opened, in which case the binding (and the caller's secure
-    /// state) stays put.
+    /// Rebind to the current input desktop. `Some(secure)` from `UOI_NAME` !=
+    /// "Default"; `None` if the desktop could not be opened (binding stays put).
     fn reattach(&mut self) -> Option<bool> {
         const GENERIC_ALL: u32 = 0x1000_0000;
         // SAFETY: `OpenInputDesktop`/`SetThreadDesktop`/`CloseDesktop` take only by-value args.
@@ -365,10 +326,10 @@ impl DesktopBinding {
     }
 }
 
-/// `UOI_NAME` of `h` != "Default" — i.e. the input desktop is Winlogon (UAC consent / lock /
-/// logon) or a screen-saver desktop, both of which need the OS's software-cursor render path.
-/// Unnameable desktops read as NOT secure: the only in-contract failure is a too-small buffer,
-/// and misreading secure-as-normal merely keeps today's behavior for a beat.
+/// `UOI_NAME` != "Default" (Winlogon UAC/lock/logon, or a screen-saver) — both
+/// need the OS software-cursor path. Unnameable desktops read as not secure:
+/// the only in-contract failure is a too-small buffer, and misreading
+/// secure-as-normal keeps today's behaviour for a beat.
 fn desktop_is_secure(h: HDESK) -> bool {
     let mut name = [0u16; 64]; // "Default"/"Winlogon"/"Screen-saver" all fit with room to spare
     let mut needed = 0u32;
@@ -400,11 +361,12 @@ impl Drop for DesktopBinding {
     }
 }
 
-/// Rasterise `hcursor` to straight-alpha RGBA: `(rgba, w, h, hot_x, hot_y)`. `None` on any
-/// failure (caller keeps the previous shape).
+/// Rasterise `hcursor` to straight-alpha RGBA. `None` on any failure (caller
+/// keeps the previous shape).
 fn rasterize(hcursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR) -> RasterOut {
-    // CopyIcon first: the owning process can destroy its HCURSOR between GetCursorInfo and the
-    // reads below; the copy is ours (the OBS/WebRTC guard).
+    // CopyIcon first: the owner can destroy its HCURSOR between GetCursorInfo
+    // and the reads below; the copy is ours.
+
     // SAFETY: `HICON(hcursor.0)` reinterprets the cursor handle as an icon handle (cursors ARE
     // icons in user32); CopyIcon yields an owned HICON we destroy below.
     let Ok(icon) = (unsafe { CopyIcon(HICON(hcursor.0)) }) else {
@@ -431,12 +393,12 @@ fn rasterize(hcursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR) -> Raste
 
 type RasterOut = Option<(Vec<u8>, u32, u32, u32, u32)>;
 
-/// The CURRENT bitmap extent of `hcursor` — exactly the `(w, h)` [`convert`] would derive, without
-/// the pixel read. Feeds the poll loop's staleness check (a re-render keeps the handle, see there).
-/// `None` on any failure, which the caller reads as "no verdict" and keeps its cached shape.
+/// Bitmap extent of `hcursor` — the `(w, h)` [`convert`] would derive, no pixel
+/// read. A re-render keeps the handle; `None` is "no verdict" (keep the cache).
 fn cursor_extent(hcursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR) -> Option<(u32, u32)> {
-    // CopyIcon first, for the reason `rasterize` does it: the owning process can destroy its
-    // HCURSOR between GetCursorInfo and the reads below; the copy is ours.
+    // CopyIcon first, same reason as `rasterize`: the owner can destroy the
+    // HCURSOR between GetCursorInfo and the reads below.
+
     // SAFETY: `HICON(hcursor.0)` reinterprets the cursor handle as an icon handle (cursors ARE
     // icons in user32); CopyIcon yields an owned HICON destroyed below.
     let icon = unsafe { CopyIcon(HICON(hcursor.0)) }.ok()?;
@@ -464,8 +426,8 @@ fn cursor_extent(hcursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR) -> O
     extent
 }
 
-/// A GDI bitmap's dimensions, under [`read_bitmap_32`]'s sanity caps so the two agree on what a
-/// plausible cursor is — a bitmap `rasterize` would reject must not read here as a size CHANGE.
+/// Dimensions under [`read_bitmap_32`]'s caps so the two agree: a bitmap
+/// `rasterize` would reject must not read here as a size change.
 fn bitmap_extent(hbm: HBITMAP) -> Option<(u32, u32)> {
     let mut bm = BITMAP::default();
     // SAFETY: `bm` is a live out-param sized exactly as passed; GetObjectW only writes into it.
@@ -482,18 +444,17 @@ fn bitmap_extent(hbm: HBITMAP) -> Option<(u32, u32)> {
     Some((bm.bmWidth as u32, bm.bmHeight as u32))
 }
 
-/// Convert the ICONINFO bitmaps to straight RGBA. Two families:
-/// - color (`hbmColor` set): 32bpp BGRA; if the alpha channel is entirely empty (old-style
-///   masked-color cursors, including Windows 11's coloured I-beam) the AND mask is NOT just
-///   transparency — it is the same four-state table as monochrome, with the colour bitmap
-///   standing in for the XOR plane. Treating AND=1 as "always transparent" drops invert
-///   pixels, and the text I-beam is almost entirely invert, so the client would install a
-///   fully-transparent pointer over every text field.
-/// - monochrome (`hbmColor` null): `hbmMask` is DOUBLE height — AND plane over XOR plane, the
-///   WebRTC truth table: (0,0) black, (0,1) white, (1,0) transparent, (1,1) invert. Invert
-///   pixels — unrepresentable in straight alpha — become opaque black with a white outline
-///   grown into adjacent transparency (the WebRTC approximation; keeps the I-beam legible on
-///   any background, which the old translucent-gray stand-in did not).
+/// Convert ICONINFO bitmaps to straight RGBA. Two families:
+///
+/// - color (`hbmColor` set): 32bpp BGRA. If alpha is entirely empty (old-style
+///   masked-color, including Win11's coloured I-beam) the AND mask is the same
+///   four-state table as monochrome, with the colour bitmap as XOR. Treating
+///   AND=1 as "always transparent" drops invert pixels; the I-beam is almost
+///   entirely invert.
+/// - monochrome (`hbmColor` null): `hbmMask` is double height — AND over XOR.
+///   (0,0) black, (0,1) white, (1,0) transparent, (1,1) invert. Invert is
+///   unrepresentable in straight alpha, so it becomes opaque black with a white
+///   outline grown into adjacent transparency (keeps the I-beam legible).
 fn convert(ii: &ICONINFO) -> Option<(Vec<u8>, u32, u32)> {
     // SAFETY: GetDC(None) yields the screen DC, released below on every path; it is only used
     // as the GetDIBits reference DC.
@@ -504,7 +465,6 @@ fn convert(ii: &ICONINFO) -> Option<(Vec<u8>, u32, u32)> {
             let (w, h) = (color.w as u32, color.h as u32);
             let mut rgba = bgra_to_rgba(&color.bgra);
             if alpha_is_empty(&rgba) {
-                // Alpha-less color cursor: AND + colour-as-XOR, including invert.
                 let mask = read_bitmap_32(dc, ii.hbmMask)?;
                 if mask.w != color.w || mask.h < color.h {
                     return None;
@@ -548,8 +508,7 @@ struct RawBitmap {
     bgra: Vec<u8>,
 }
 
-/// Read any GDI bitmap as 32bpp top-down via `GetDIBits` (which performs the 1bpp→32bpp
-/// expansion for the mask planes).
+/// 32bpp top-down via `GetDIBits` (1bpp→32bpp expansion for the mask planes).
 fn read_bitmap_32(dc: HDC, hbm: HBITMAP) -> Option<RawBitmap> {
     let mut bm = BITMAP::default();
     // SAFETY: `bm` is a live out-param sized exactly as passed; GetObjectW only writes into it.
@@ -602,20 +561,15 @@ fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Whether a 32bpp RGBA buffer's alpha channel is entirely zero — the "old-style cursor with no
-/// alpha" test, whose transparency (and invert) live in the AND mask instead
-/// ([`masked_color_to_rgba`]).
+/// Alpha channel entirely zero: old-style cursor whose transparency (and invert)
+/// live in the AND mask ([`masked_color_to_rgba`]).
 fn alpha_is_empty(rgba: &[u8]) -> bool {
     rgba.chunks_exact(4).all(|p| p[3] == 0)
 }
 
-/// Take alpha from an expanded AND mask: mask WHITE (AND bit 1) means transparent, black opaque.
-/// `mask_bgra` is the 32bpp expansion `GetDIBits` produces from the 1bpp mask, so any non-zero
-/// channel byte is "set".
-///
-/// Test-only: the simple AND-as-alpha helper (no invert). [`convert`] uses
-/// [`masked_color_to_rgba`] instead — AND=1 plus a non-zero colour pixel is invert, not
-/// transparent, and that is the I-beam.
+/// Test-only AND-as-alpha (no invert). `mask_bgra` is GetDIBits' 32bpp expansion
+/// of the 1bpp mask, so any non-zero channel is "set"; white = transparent.
+/// [`convert`] uses [`masked_color_to_rgba`]: AND=1 plus colour is invert (I-beam).
 #[cfg(test)]
 fn apply_and_mask_alpha(rgba: &mut [u8], mask_bgra: &[u8]) {
     for (px, m) in rgba.chunks_exact_mut(4).zip(mask_bgra.chunks_exact(4)) {
@@ -623,12 +577,10 @@ fn apply_and_mask_alpha(rgba: &mut [u8], mask_bgra: &[u8]) {
     }
 }
 
-/// Alpha-less colour cursor: the AND mask plus the colour bitmap as XOR, same four states as
-/// [`mono_planes_to_rgba`]. A non-zero RGB with AND=1 is invert — which treating AND=1 as
-/// "always transparent" would have dropped, vanishing the I-beam.
-///
-/// `(false, true)` keeps the colour (a painted glyph), unlike the monochrome table which can
-/// only emit white.
+/// Alpha-less colour cursor: AND plus colour-as-XOR, same four states as
+/// [`mono_planes_to_rgba`]. Non-zero RGB with AND=1 is invert — treating AND=1
+/// as always-transparent drops the I-beam. `(false, true)` keeps the colour
+/// (a painted glyph); the monochrome table can only emit white.
 fn masked_color_to_rgba(color_rgba: &[u8], mask_bgra: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut rgba = vec![0u8; w * h * 4];
     let mut invert = vec![false; w * h];
@@ -640,7 +592,7 @@ fn masked_color_to_rgba(color_rgba: &[u8], mask_bgra: &[u8], w: usize, h: usize)
         match (and, xor) {
             (false, false) => px.copy_from_slice(&[0, 0, 0, 0xFF]),
             (false, true) => px.copy_from_slice(&[c[0], c[1], c[2], 0xFF]),
-            (true, false) => {} // transparent (already zeroed)
+            (true, false) => {}
             (true, true) => {
                 px.copy_from_slice(&[0, 0, 0, 0xFF]);
                 invert[i] = true;
@@ -651,10 +603,10 @@ fn masked_color_to_rgba(color_rgba: &[u8], mask_bgra: &[u8], w: usize, h: usize)
     rgba
 }
 
-/// The monochrome-cursor truth table, plus the white outline that makes an INVERT region legible.
+/// Monochrome-cursor truth table, plus the white outline that makes invert legible.
 ///
-/// A monochrome `HCURSOR` has no colour bitmap: `hbmMask` is DOUBLE height — the AND plane over the
-/// XOR plane — and the pair encodes four states (the WebRTC/Chromium table):
+/// A monochrome `HCURSOR` has no colour bitmap: `hbmMask` is double height — AND
+/// over XOR — and the pair encodes four states:
 ///
 /// | AND | XOR | meaning     | straight-alpha result                    |
 /// |-----|-----|-------------|------------------------------------------|
@@ -663,13 +615,10 @@ fn masked_color_to_rgba(color_rgba: &[u8], mask_bgra: &[u8], w: usize, h: usize)
 /// | 1   | 0   | transparent | fully transparent                        |
 /// | 1   | 1   | INVERT dst  | opaque black + a grown white outline     |
 ///
-/// INVERT is unrepresentable in straight alpha (it is a per-pixel XOR against whatever is behind
-/// it), so it becomes opaque black and every TRANSPARENT 8-neighbour of an invert pixel is turned
-/// opaque white. That outline is what keeps the text I-beam — which is almost entirely invert
-/// pixels — legible over dark content; the earlier translucent-grey stand-in did not.
-///
-/// Extracted from `convert`'s GDI plumbing (sweep Phase 6.6) so the table is testable: the caller
-/// needs a live `HCURSOR` and a screen DC, this needs two byte slices.
+/// Invert is unrepresentable in straight alpha (per-pixel XOR of the destination),
+/// so it becomes opaque black and every transparent 8-neighbour of an invert
+/// pixel is turned opaque white. That outline keeps a text I-beam — almost
+/// entirely invert — legible over dark content.
 fn mono_planes_to_rgba(and_plane: &[u8], xor_plane: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut rgba = vec![0u8; w * h * 4];
     let mut invert = vec![false; w * h];
@@ -679,7 +628,7 @@ fn mono_planes_to_rgba(and_plane: &[u8], xor_plane: &[u8], w: usize, h: usize) -
         match (a, x) {
             (false, false) => px.copy_from_slice(&[0, 0, 0, 0xFF]),
             (false, true) => px.copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]),
-            (true, false) => {} // transparent (already zeroed)
+            (true, false) => {}
             (true, true) => {
                 px.copy_from_slice(&[0, 0, 0, 0xFF]);
                 invert[i] = true;
@@ -690,8 +639,8 @@ fn mono_planes_to_rgba(and_plane: &[u8], xor_plane: &[u8], w: usize, h: usize) -
     rgba
 }
 
-/// Turn every TRANSPARENT 8-neighbour of an invert pixel opaque white. Invert itself stays
-/// opaque black. Shared by the monochrome and masked-color converters.
+/// Transparent 8-neighbours of an invert pixel become opaque white. Invert
+/// itself stays opaque black. Shared by the monochrome and masked-color paths.
 fn grow_invert_outline(rgba: &mut [u8], invert: &[bool], w: usize, h: usize) {
     for y in 0..h as i32 {
         for x in 0..w as i32 {
@@ -716,8 +665,7 @@ fn grow_invert_outline(rgba: &mut [u8], invert: &[bool], w: usize, h: usize) {
 mod tests {
     use super::*;
 
-    /// Expand a 1-bit-per-pixel plane (as `GetDIBits` does) into the 32bpp form the converters read:
-    /// any non-zero channel byte means "bit set".
+    /// 1bpp plane → 32bpp as `GetDIBits` does: any non-zero channel means "bit set".
     fn plane(bits: &[u8]) -> Vec<u8> {
         bits.iter()
             .flat_map(|&b| {
@@ -735,7 +683,6 @@ mod tests {
     const OPAQUE_WHITE: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
     const TRANSPARENT: [u8; 4] = [0, 0, 0, 0];
 
-    /// All four AND/XOR states, in one 4×1 row — the table `mono_planes_to_rgba` documents.
     #[test]
     fn the_monochrome_truth_table_is_exact() {
         //          (0,0) black  (0,1) white  (1,0) transparent  (1,1) invert
@@ -754,7 +701,6 @@ mod tests {
         assert_eq!(px(&out, 3), OPAQUE_BLACK, "AND=1 XOR=1 ⇒ black + outline");
     }
 
-    /// Transparency survives when there is no invert pixel next to it.
     #[test]
     fn transparent_pixels_stay_transparent_without_an_invert_neighbour() {
         let and = plane(&[1, 1, 1, 1]);
@@ -765,8 +711,6 @@ mod tests {
         }
     }
 
-    /// The outline grows into all eight neighbours, and only into TRANSPARENT ones — it must not
-    /// repaint a black or white shape pixel.
     #[test]
     fn the_invert_outline_covers_eight_neighbours_and_overwrites_nothing() {
         // 3×3, invert at the centre, everything else transparent.
@@ -793,7 +737,6 @@ mod tests {
         }
     }
 
-    /// The outline must clip at the bitmap edges rather than wrap to the opposite side.
     #[test]
     fn the_outline_clips_at_the_edges() {
         // 2×2 with the invert at (0, 0): only (1,0), (0,1) and (1,1) can be outlined.
@@ -809,8 +752,6 @@ mod tests {
         }
     }
 
-    // ---- the alpha-less colour path ---------------------------------------------------------
-
     #[test]
     fn an_empty_alpha_channel_is_detected() {
         assert!(alpha_is_empty(&[1, 2, 3, 0, 4, 5, 6, 0]));
@@ -818,22 +759,17 @@ mod tests {
         assert!(alpha_is_empty(&[]), "no pixels ⇒ vacuously empty");
     }
 
-    /// Mask WHITE (AND bit 1) = transparent, black = opaque — and the colour bytes are untouched.
     #[test]
     fn the_and_mask_supplies_alpha_for_an_alpha_less_cursor() {
-        let mut rgba = vec![
-            10, 20, 30, 0, // pixel 0
-            40, 50, 60, 0, // pixel 1
-        ];
+        let mut rgba = vec![10, 20, 30, 0, 40, 50, 60, 0];
         let mask = plane(&[1, 0]); // pixel 0 masked out, pixel 1 kept
         apply_and_mask_alpha(&mut rgba, &mask);
         assert_eq!(px(&rgba, 0), [10, 20, 30, 0], "masked ⇒ transparent");
         assert_eq!(px(&rgba, 1), [40, 50, 60, 0xFF], "unmasked ⇒ opaque");
     }
 
-    /// A mask with FEWER pixels than the colour bitmap must not panic — `zip` stops at the shorter
-    /// side, leaving the tail at whatever alpha it had (the caller has already required
-    /// `mask.h >= color.h`, so this is the belt).
+    /// A short mask must not panic: `zip` stops at the shorter side. The caller
+    /// already requires `mask.h >= color.h`; this is the belt.
     #[test]
     fn a_short_mask_does_not_panic() {
         let mut rgba = vec![1, 2, 3, 0, 4, 5, 6, 0, 7, 8, 9, 0];
@@ -842,20 +778,13 @@ mod tests {
         assert_eq!(px(&rgba, 1), [4, 5, 6, 0]);
     }
 
-    // ---- masked-color (colour bitmap as XOR) ------------------------------------------------
-
-    /// The four-state table, with colour standing in for XOR. Pixel 3 is the I-beam case:
-    /// AND=1 and a non-zero colour pixel is invert, not transparent — `apply_and_mask_alpha`
-    /// would have dropped it, which is how the text cursor vanished on a Windows host.
+    /// Colour standing in for XOR. Pixel 3 is the I-beam case: AND=1 and a
+    /// non-zero colour pixel is invert, not transparent — `apply_and_mask_alpha`
+    /// would have dropped it.
     #[test]
     fn a_masked_color_invert_pixel_is_not_transparent() {
         //          (0,0) black  (0,1) red    (1,0) transparent  (1,1) invert
-        let color = vec![
-            0, 0, 0, 0, //
-            0xCC, 0, 0, 0, //
-            0, 0, 0, 0, //
-            0xFF, 0xFF, 0xFF, 0, //
-        ];
+        let color = vec![0, 0, 0, 0, 0xCC, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0];
         let mask = plane(&[0, 0, 1, 1]);
         let out = masked_color_to_rgba(&color, &mask, 4, 1);
         assert_eq!(px(&out, 0), OPAQUE_BLACK, "AND=0 colour=0 ⇒ black");
@@ -878,7 +807,6 @@ mod tests {
         );
     }
 
-    /// AND=1 and a zero colour pixel stays transparent when nothing invert-neighbours it.
     #[test]
     fn a_masked_color_transparent_pixel_stays_transparent() {
         let color = vec![0u8; 16];

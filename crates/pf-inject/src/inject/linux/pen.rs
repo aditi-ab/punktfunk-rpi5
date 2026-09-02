@@ -1,23 +1,17 @@
-//! Virtual tablet ("Punktfunk Pen"): a uinput stylus device carrying the pen plane's full
-//! fidelity — pressure, tilt, barrel roll, hover distance, eraser, barrel buttons
-//! (design/pen-tablet-input.md §5).
+//! Virtual tablet ("Punktfunk Pen"): a uinput stylus with pressure, tilt, barrel
+//! roll, hover distance, eraser, and barrel buttons.
 //!
-//! Deliberately a **uinput device, not a compositor-protocol citizen**: no virtual-tablet
-//! protocol exists in EI, the RemoteDesktop portal, KWin `fake_input`, or wlroots — while
-//! every compositor consumes evdev tablets via libinput and forwards them to apps over
-//! `zwp_tablet_v2` with nothing to configure. udev's `input_id` builtin classifies the device
-//! from its capabilities (`BTN_TOOL_PEN` + `ABS_X/Y` ⇒ `ID_INPUT_TABLET`), so Krita/GIMP/
-//! Xournal++ see a real pen. Output mapping is the compositor's own tablet-mapping default
-//! (single output ⇒ correct; multi-monitor pinning is the documented follow-up, which is why
-//! the device carries a stable, distinctive identity to key rules on).
+//! Compositors have no virtual-tablet protocol; they consume evdev tablets via
+//! libinput and forward `zwp_tablet_v2`. udev's `input_id` builtin classifies
+//! `BTN_TOOL_PEN` + `ABS_X/Y` as `ID_INPUT_TABLET`. A stable vendor:product lets
+//! compositor mapping rules pin this device.
 //!
-//! The consumer feeds it [`PenTransition`]s straight from the core's
-//! [`PenTracker`](punktfunk_core::quic::PenTracker); this file only translates transitions to
-//! evdev events and groups them into SYN frames so proximity-enter carries its position in the
-//! same frame (libinput would otherwise report an entry at a stale point).
+//! [`PenTracker`](punktfunk_core::quic::PenTracker) feeds [`PenTransition`]s.
+//! This file maps them to evdev and groups SYN frames so proximity-enter
+//! carries its position in the same frame — libinput otherwise reports a stale
+//! point. ioctl numbers and layouts match `gamepad.rs`.
 //!
-//! ioctl numbers/struct layouts mirror `gamepad.rs` (verified against the same kernel
-//! generation); each backend file stays self-contained by convention.
+//! Evidence: `design/pen-tablet-input.md`.
 
 use anyhow::{bail, Result};
 use punktfunk_core::quic::{PenSample, PenTool, PenTransition, PEN_BARREL1, PEN_BARREL2};
@@ -32,15 +26,13 @@ const UI_SET_EVBIT: libc::c_ulong = 0x4004_5564;
 const UI_SET_KEYBIT: libc::c_ulong = 0x4004_5565;
 const UI_SET_PROPBIT: libc::c_ulong = 0x4004_556e;
 
-// input-event-codes.h subset.
 const EV_SYN: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
 const EV_ABS: u16 = 0x03;
 const SYN_REPORT: u16 = 0;
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
-/// Barrel roll rides ABS_Z (the Wacom Art-Pen rotation convention); libinput normalizes the
-/// declared min..max onto its 0..360° rotation axis.
+/// Barrel roll on ABS_Z (Wacom Art-Pen). libinput maps min..max onto 0..360°.
 const ABS_Z: u16 = 0x02;
 const ABS_PRESSURE: u16 = 0x18;
 const ABS_DISTANCE: u16 = 0x19;
@@ -51,9 +43,7 @@ const BTN_TOOL_RUBBER: u16 = 0x141;
 const BTN_TOUCH: u16 = 0x14a;
 const BTN_STYLUS: u16 = 0x14b;
 const BTN_STYLUS2: u16 = 0x14c;
-/// The pen writes on the display it is mapped to (a "screen tablet"), not a desk pad —
-/// libinput then maps the full ABS range onto the output rect, exactly the wire's normalized
-/// coordinate contract.
+/// Screen tablet: libinput maps the full ABS range onto the output rect.
 const INPUT_PROP_DIRECT: libc::c_int = 0x01;
 
 /// Full-scale wire pressure (u16) → the declared 0..4095 axis.
@@ -123,9 +113,8 @@ fn ioctl_ptr<T>(fd: i32, req: libc::c_ulong, arg: *mut T, what: &str) -> Result<
     Ok(())
 }
 
-/// The active tool's evdev key, one in proximity at a time (Wacom semantics — the core's
-/// [`PenTracker`](punktfunk_core::quic::PenTracker) already re-enters proximity on a tool
-/// switch, so this only tracks which key to release on `ProximityOut`).
+/// Evdev key for the in-proximity tool. The tracker re-enters on a tool switch,
+/// so this only names the key to release on `ProximityOut`.
 fn tool_key(tool: PenTool) -> u16 {
     match tool {
         PenTool::Eraser => BTN_TOOL_RUBBER,
@@ -134,16 +123,13 @@ fn tool_key(tool: PenTool) -> u16 {
     }
 }
 
-/// One per-session virtual tablet. Created lazily on the first pen batch (a session that never
-/// draws never creates a device), destroyed with the session (Drop → `UI_DEV_DESTROY`).
+/// Per-session uinput tablet.
 pub struct VirtualPen {
     fd: OwnedFd,
-    /// The tool key currently held in proximity (release target for `ProximityOut`).
+    /// In-proximity `BTN_TOOL_*`; the `ProximityOut` release target.
     tool: u16,
-    /// Whether the current SYN frame already carries a Motion — the frame-split trigger for
-    /// consecutive samples in one batch.
+    /// Current SYN frame already has a Motion; a second Motion starts a new frame.
     frame_has_motion: bool,
-    /// Whether the current SYN frame has any unflushed events.
     frame_dirty: bool,
 }
 
@@ -187,17 +173,15 @@ impl VirtualPen {
             "UI_SET_PROPBIT(DIRECT)",
         )?;
 
-        // Position spans the full u16 range; `resolution` (units/mm) only feeds libinput's mm
-        // math (nothing pen-relevant), but tablets without one trip its missing-resolution
-        // fixup — 100 declares a plausible ~655 mm drawing surface.
+        // 0..65535, resolution 100 units/mm (~655 mm). Zero resolution trips libinput's
+        // missing-resolution fixup; the mm figure is unused for pen mapping.
         let pos = AbsInfo {
             minimum: 0,
             maximum: 65535,
             resolution: 100,
             ..Default::default()
         };
-        // Tilt in degrees from vertical, per evdev convention; resolution = units/radian (57
-        // ⇔ 1 unit = 1°, what the Wacom driver declares).
+        // Degrees from vertical. resolution 57 units/radian ⇒ 1 unit = 1° (Wacom).
         let tilt = AbsInfo {
             minimum: -90,
             maximum: 90,
@@ -226,7 +210,7 @@ impl VirtualPen {
             (ABS_TILT_X, tilt),
             (ABS_TILT_Y, tilt),
             (
-                // Barrel roll: libinput maps the declared range linearly onto 0..360°.
+                // 0..359: libinput maps the declared range linearly onto 0..360°.
                 ABS_Z,
                 AbsInfo {
                     minimum: 0,
@@ -243,9 +227,7 @@ impl VirtualPen {
             ioctl_ptr(raw, UI_ABS_SETUP, &mut a, "UI_ABS_SETUP")?;
         }
 
-        // A stable, distinctive identity (pid.codes open-source VID) so compositor
-        // tablet-mapping rules — GNOME's per-`vendor:product` gsettings path, sway
-        // `map_to_output` — can target exactly this device.
+        // pid.codes VID + "PF" PID so compositor tablet-mapping can target this device.
         let mut setup = UinputSetup {
             id: InputId {
                 bustype: 0x0006, // BUS_VIRTUAL
@@ -289,8 +271,7 @@ impl VirtualPen {
                 std::mem::size_of::<InputEventRaw>(),
             )
         };
-        // Best-effort like the gamepad path: a full kernel queue drops the event; pen samples
-        // are state-full, so the next frame re-syncs axes (and the tracker re-syncs state).
+        // Best-effort: a full kernel queue drops the event; the next sample re-syncs axes.
         // SAFETY: `self.fd` stays open for the synchronous call; `write` only reads
         // `bytes.len()` bytes from the still-live local and retains nothing.
         let _ = unsafe {
@@ -317,8 +298,7 @@ impl VirtualPen {
         if s.distance != punktfunk_core::quic::PEN_DISTANCE_UNKNOWN {
             self.emit(EV_ABS, ABS_DISTANCE, (s.distance >> DISTANCE_SHIFT) as i32);
         }
-        // Polar → tiltX/tiltY needs both angles; azimuth clockwise from north, so east (90°)
-        // tilts +X and south (180°, toward the user) tilts +Y — the evdev/W3C signs.
+        // Polar → tiltX/tiltY. Azimuth clockwise from north: east (90°) is +X, south (180°) is +Y.
         if s.tilt_deg != punktfunk_core::quic::PEN_TILT_UNKNOWN
             && s.azimuth_deg != punktfunk_core::quic::PEN_ANGLE_UNKNOWN
         {
@@ -334,13 +314,10 @@ impl VirtualPen {
         self.frame_has_motion = true;
     }
 
-    /// Apply one decoded batch's transitions (the core tracker's output, in its documented
-    /// order), grouping them into SYN frames: a frame closes before a `ProximityIn` (an entry
-    /// is a new instant — and must carry its own position, not inherit the stale frame) and
-    /// before a second `Motion` (consecutive samples are consecutive instants), plus a final
-    /// close. So `[ProxIn, Motion, TipDown]` lands as ONE frame — libinput reports the entry
-    /// already at the right point with contact — while a drag batch's `[Motion, Motion]`
-    /// stays two.
+    /// Apply one batch of tracker transitions as SYN frames. Close a frame before
+    /// `ProximityIn` (entry must carry its own position) and before a second
+    /// `Motion` (consecutive samples are consecutive instants), then close at the
+    /// end. `[ProxIn, Motion, TipDown]` is one frame; `[Motion, Motion]` is two.
     pub fn apply_batch(&mut self, transitions: &[PenTransition]) {
         for t in transitions {
             match t {

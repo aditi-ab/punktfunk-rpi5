@@ -1,22 +1,16 @@
-//! On-disk cache for a host's library CATALOG — the list of titles, not their art.
+//! On-disk cache of a host's library catalog (titles, not cover art).
 //!
-//! Cover art has been cached per client for a while; the catalog behind it never was. Every visit
-//! to a library refetched `GET /api/v1/library` and showed nothing until that call returned. A host
-//! that is asleep, or simply not reachable yet, therefore had an EMPTY library — which is the
-//! opposite of what a player wants from the screen they use to decide what to play, and it makes
-//! waking a host on library entry pointless: there would be nothing to look at while it boots.
+//! One JSON file per host under the platform cache dir. Every byte is re-derivable
+//! from the host, so the OS may evict it. No size budget: a catalog is a few hundred KB.
+//! Shared by every client that fetches through [`crate::library`].
 //!
-//! So the catalog is cached per host and rendered immediately, marked stale, and reconciled when the
-//! host answers. The Rust half of the Apple client's `LibraryCache` (PR #276), shared by every
-//! client that fetches through [`crate::library`].
+//! The key is the pinned certificate fingerprint, not `addr:port`. A host that
+//! moves DHCP lease is the same library; keying on address would miss exactly
+//! when a cold-booted box needs the last-seen list.
 //!
-//! Cache directory, not config: every byte is re-derivable from the host, so the system is welcome
-//! to evict it. Unlike art, a catalog is small (a few hundred KB for a big library), so there is no
-//! size budget here — one file per host, replaced wholesale.
-//!
-//! The key is the host's **pinned certificate fingerprint**, not its address: a host that moves to a
-//! new DHCP lease is the same host with the same library, and keying on `addr:port` would silently
-//! lose the cache exactly when a cold-booted box needs it most.
+//! Load is best-effort and silent: a schema mismatch or a missing file is a miss,
+//! not an error. The UI renders the snapshot immediately and reconciles when the
+//! host answers.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -25,28 +19,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::library::GameEntry;
 
-/// A host's library as last seen, with when that was.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CachedLibrary {
     pub games: Vec<GameEntry>,
-    /// Unix seconds. A plain integer rather than a `SystemTime` so the file stays readable and a
-    /// clock that moved backwards yields a silly age rather than a decode failure.
+    /// Unix seconds. `u64` so a clock that stepped backwards yields a silly age, not a decode failure.
     pub fetched_at: u64,
 }
 
 impl CachedLibrary {
-    /// How old this snapshot is. A UI uses it to word the staleness note, never to decide whether
-    /// to show the catalog: a year-old library is still a far better answer than an empty one, and
-    /// the live fetch is always in flight behind it anyway. `None` when the stamp is in the future
-    /// (a clock that has since been corrected), which is not a reason to hide the titles.
+    /// `None` if the stamp is in the future. The UI words a staleness note from
+    /// this; a year-old list still beats empty.
     pub fn age(&self) -> Option<Duration> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
         now.checked_sub(self.fetched_at).map(Duration::from_secs)
     }
 }
 
-/// `~/.cache/punktfunk/library` (`%LOCALAPPDATA%\punktfunk\cache\library` on Windows), honouring
-/// `XDG_CACHE_HOME` where the platform defines it.
 fn cache_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -73,13 +61,9 @@ fn cache_dir() -> Option<PathBuf> {
     }
 }
 
-/// The file this host's catalog lives in, or `None` for a key that isn't a fingerprint.
-///
-/// `fp_hex` reaches a path component, so it is re-validated rather than trusted: it must be exactly
-/// the 64 lowercase hex characters of a SHA-256 digest. That leaves no way for a `..` or a
-/// separator to appear in a filename, and it costs one scan of a short string. A host with no pin
-/// (TOFU, never paired) has no key and simply runs without a cache — which is correct anyway,
-/// since an unpinned host is not an identity we should be remembering a game list against.
+/// Re-validated because `fp_hex` becomes a path component (64 lowercase hex).
+/// An unpinned host has no key and runs uncached — we do not remember a game
+/// list against TOFU.
 fn path_for(fp_hex: &str) -> Option<PathBuf> {
     let ok = fp_hex.len() == 64
         && fp_hex
@@ -89,21 +73,16 @@ fn path_for(fp_hex: &str) -> Option<PathBuf> {
         .flatten()
 }
 
-/// This host's last-known catalog, or `None` if there is no usable one.
-///
-/// A catalog written by an older build whose `GameEntry` had different fields decodes to nothing
-/// rather than failing: a miss costs one fetch, which is what would have happened anyway. Never
-/// surfaced as an error.
+/// Decode failure (older `GameEntry` shape) is a miss, never an error:
+/// one extra fetch, same as no cache.
 pub fn load(fp_hex: &str) -> Option<CachedLibrary> {
     let raw = std::fs::read_to_string(path_for(fp_hex)?).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
-/// Remember this host's catalog. Best-effort: a cache that can't write is a slower client, not a
-/// broken one, so every failure here is swallowed.
+/// Best-effort write. A cache that cannot write is a slower client, not a broken one.
 pub fn store(fp_hex: &str, games: &[GameEntry]) {
-    // An empty catalog is not worth remembering: it is indistinguishable from "never fetched" when
-    // read back, and caching it would pin a blank library over a host that has titles.
+    // Empty is indistinguishable from a miss; caching it would pin a blank list over titles.
     if games.is_empty() {
         return;
     }
@@ -122,8 +101,7 @@ pub fn store(fp_hex: &str, games: &[GameEntry]) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    // Write-then-rename: a client killed mid-write (a Deck going to sleep, a TV pulling power)
-    // must not leave a half-file that the next launch reads as a corrupt catalog.
+    // Rename over write: a kill mid-write must not leave a half-file the next launch reads.
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, &json).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
@@ -132,8 +110,7 @@ pub fn store(fp_hex: &str, games: &[GameEntry]) {
     }
 }
 
-/// Drop a host's catalog — part of forgetting the host, so a removed host leaves no list of what
-/// somebody plays behind on disk.
+/// Part of forgetting the host: the title list must leave disk with it.
 pub fn forget(fp_hex: &str) {
     if let Some(path) = path_for(fp_hex) {
         let _ = std::fs::remove_file(path);
@@ -146,8 +123,6 @@ mod tests {
 
     #[test]
     fn only_a_real_fingerprint_becomes_a_path() {
-        // The whole point of the check: nothing user- or host-supplied can escape the directory
-        // or name a file outside it.
         assert!(path_for("../../etc/passwd").is_none());
         assert!(path_for("").is_none());
         assert!(path_for(&"a".repeat(63)).is_none(), "too short");
@@ -156,7 +131,6 @@ mod tests {
             "uppercase is not our hex"
         );
         assert!(path_for(&"g".repeat(64)).is_none(), "not hex at all");
-        // A real digest does, provided the platform gives us a cache directory at all.
         if cache_dir().is_some() {
             let p = path_for(&"0123456789abcdef".repeat(4)).expect("64 lowercase hex is a key");
             assert!(p.to_string_lossy().ends_with(".json"));

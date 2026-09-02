@@ -1,18 +1,16 @@
-//! Virtual Steam Deck via the USB **gadget** subsystem (`raw_gadget` + `dummy_hcd`) — the only
-//! virtual-Deck transport Steam Input recognizes.
+//! Virtual Steam Deck over the USB gadget subsystem (`raw_gadget` + `dummy_hcd`).
 //!
-//! The UHID [`super::steam_controller::SteamDeckPad`] binds the kernel `hid-steam` driver, but Steam's
-//! own controller driver filters the Deck's controller to USB **interface 2**, and a UHID device has no
-//! USB interface number (`Interface: -1`), so Steam enumerates it but never promotes it. This backend
-//! instead presents a *real* 3-interface USB Deck (mouse = interface 0, keyboard = 1, **controller =
-//! 2**) on a `dummy_hcd` loopback UDC, driven from userspace via `/dev/raw-gadget` so we can answer
-//! every control transfer (including the HID feature reports `f_hid` can't). Proven on a real Deck:
-//! hid-steam binds it, Steam reserves an XInput slot and emits an X-Box pad. Descriptors are captured
-//! verbatim from a physical Deck; see `packaging/linux/steam-deck-gadget/` for the original PoC + the
-//! USB-stack gotchas. **SteamOS-host only** (needs `dummy_hcd` + `raw_gadget`, which SteamOS ships).
+//! Steam Input promotes a Deck only on USB interface 2. UHID has no interface
+//! number (`Interface: -1`), so it enumerates but never promotes. This backend
+//! presents a 3-interface Deck (mouse 0, keyboard 1, controller 2) on a
+//! `dummy_hcd` loopback UDC and answers every control transfer from userspace
+//! via `/dev/raw-gadget`, including HID feature reports `f_hid` cannot.
+//! Descriptors are captured from a physical Deck; see
+//! `packaging/linux/steam-deck-gadget/` for the PoC and USB-stack traps.
 //!
-//! The transport here is self-contained (libc + std); the report bytes it streams are produced by
-//! [`super::steam_proto`] in the wrapping backend.
+//! SteamOS-host only: needs `dummy_hcd` + `raw_gadget`. Report bytes come from
+//! [`super::steam_proto`]. The Secure-Boot-clean alternative is
+//! [`super::steam_usbip`].
 
 use anyhow::{bail, Context, Result};
 use std::mem::size_of;
@@ -21,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-// ---- raw_gadget UAPI (mirrors linux/usb/raw_gadget.h; inlined like the C PoC) ----
+// linux/usb/raw_gadget.h, inlined; this crate has no kernel headers.
 const UDC_NAME_MAX: usize = 128;
 
 #[repr(C)]
@@ -31,14 +29,12 @@ struct UsbRawInit {
     speed: u8,
 }
 
-// usb_raw_event { u32 type; u32 length; u8 data[]; } — we read it into a fixed buffer.
-const EVENT_HDR: usize = 8; // type + length
-const EVENT_BUF: usize = EVENT_HDR + 64; // setup packet (8) fits easily
+const EVENT_HDR: usize = 8; // usb_raw_event: type + length; data[] follows
+const EVENT_BUF: usize = EVENT_HDR + 64; // 64 holds the 8-byte setup packet
 
-// usb_raw_ep_io { u16 ep; u16 flags; u32 length; u8 data[]; }
-const EPIO_HDR: usize = 8;
+const EPIO_HDR: usize = 8; // usb_raw_ep_io: ep, flags, length; data[] follows
 
-// usb_endpoint_descriptor is 9 bytes in the kernel (audio bRefresh/bSynchAddress); EP_ENABLE wants it.
+// Kernel EP_ENABLE wants the 9-byte audio form (bRefresh/bSynchAddress), not USB's 7-byte EP desc.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 struct UsbEndpointDescriptor {
@@ -59,7 +55,7 @@ const IOCTL_INIT: libc::c_ulong = ioc(1, 0, size_of::<UsbRawInit>());
 const IOCTL_RUN: libc::c_ulong = ioc(0, 1, 0);
 const IOCTL_EVENT_FETCH: libc::c_ulong = ioc(2, 2, EVENT_HDR); // size is the header; kernel copies more
 const IOCTL_EP0_WRITE: libc::c_ulong = ioc(1, 3, EPIO_HDR);
-const IOCTL_EP0_READ: libc::c_ulong = ioc(2 | 1, 4, EPIO_HDR); // _IOWR
+const IOCTL_EP0_READ: libc::c_ulong = ioc(2 | 1, 4, EPIO_HDR); // _IOWR: kernel writes the payload into our buffer
 const IOCTL_EP_ENABLE: libc::c_ulong = ioc(1, 5, size_of::<UsbEndpointDescriptor>());
 const IOCTL_EP_WRITE: libc::c_ulong = ioc(1, 7, EPIO_HDR);
 const IOCTL_CONFIGURE: libc::c_ulong = ioc(0, 9, 0);
@@ -70,30 +66,22 @@ const USB_RAW_EVENT_CONNECT: u32 = 1;
 const USB_RAW_EVENT_CONTROL: u32 = 2;
 const USB_SPEED_HIGH: u8 = 3;
 
-// Captured-from-hardware Deck descriptors + the `0x83`/`0xAE` feature contract live in the shared
-// [`super::steam_proto`] module (single source of truth, also used by the usbip transport).
 use super::steam_proto::{
     deck_serial, deck_unit_id, feature_reply, neutral_deck_report, RDESC_DECK_CTRL as RDESC_CTRL,
     RDESC_DECK_KBD as RDESC_KBD, RDESC_DECK_MOUSE as RDESC_MOUSE,
 };
 
+// USB device descriptor: Valve 28DE:1205, bcdUSB 2.00, bcdDevice 3.00.
 const DEV_DESC: [u8; 18] = [
-    18, 1, 0x00, 0x02, // bLength, DEVICE, bcdUSB 2.00
-    0, 0, 0, 64, // class/sub/proto, bMaxPacketSize0
-    0xDE, 0x28, 0x05, 0x12, // idVendor 28DE, idProduct 1205
-    0x00, 0x03, // bcdDevice 3.00
-    1, 2, 3, 1, // iManufacturer, iProduct, iSerial, bNumConfigurations
+    18, 1, 0x00, 0x02, 0, 0, 0, 64, 0xDE, 0x28, 0x05, 0x12, 0x00, 0x03, 1, 2, 3, 1,
 ];
 
 const HID_DT: u8 = 0x21;
 const HID_RPT_DT: u8 = 0x22;
 
-/// Assemble the 84-byte config descriptor: config + 3×(interface + HID + 7-byte endpoint).
 fn build_config() -> Vec<u8> {
     let mut c = Vec::with_capacity(84);
-    // config descriptor (wTotalLength patched after)
     c.extend_from_slice(&[9, 2, 84, 0, 3, 1, 0, 0x80, 250]);
-    // helper closures
     let iface = |n: u8, sub: u8, proto: u8| [9u8, 4, n, 0, 1, 3, sub, proto, 0];
     let hid = |rlen: u16, country: u8| {
         [
@@ -109,15 +97,14 @@ fn build_config() -> Vec<u8> {
         ]
     };
     let ep = |addr: u8, mps: u16| [7u8, 5, addr, 0x03, (mps & 0xff) as u8, (mps >> 8) as u8, 4];
-    // interface 0: mouse, EP 0x81
+    // 3-interface Deck: mouse 0x81, boot kbd 0x82, controller 0x83.
+    // Steam Input filters on iface 2. Country 33 matches a physical Deck.
     c.extend_from_slice(&iface(0, 0, 2));
     c.extend_from_slice(&hid(RDESC_MOUSE.len() as u16, 0));
     c.extend_from_slice(&ep(0x81, 8));
-    // interface 1: keyboard (boot), EP 0x82
     c.extend_from_slice(&iface(1, 1, 1));
     c.extend_from_slice(&hid(RDESC_KBD.len() as u16, 0));
     c.extend_from_slice(&ep(0x82, 8));
-    // interface 2: controller, EP 0x83, bCountryCode 33
     c.extend_from_slice(&iface(2, 0, 0));
     c.extend_from_slice(&hid(RDESC_CTRL.len() as u16, 33));
     c.extend_from_slice(&ep(0x83, 64));
@@ -127,7 +114,7 @@ fn build_config() -> Vec<u8> {
 
 fn string_desc(idx: u8, serial: &str) -> Vec<u8> {
     if idx == 0 {
-        return vec![4, 3, 0x09, 0x04]; // LANGID en-US
+        return vec![4, 3, 0x09, 0x04]; // LANGID 0x0409 en-US
     }
     let s: &str = match idx {
         1 => "Valve Software",
@@ -143,11 +130,10 @@ fn string_desc(idx: u8, serial: &str) -> Vec<u8> {
     v
 }
 
-// ---- ioctl wrappers (the only unsafe surface for the raw_gadget UAPI; documented once) ----
 fn ioctl_ptr<T>(fd: RawFd, req: libc::c_ulong, arg: *const T) -> i32 {
-    // SAFETY: `fd` is our open /dev/raw-gadget descriptor; `arg` points to a correctly-sized,
-    // initialized argument for `req` (a raw_gadget UAPI struct or an owned usb_raw_ep_io buffer)
-    // that lives for the duration of the call. `ioctl` is variadic, so passing a thin pointer is ABI-correct.
+    // SAFETY: `fd` is the open `/dev/raw-gadget`; `arg` is a live, correctly-sized
+    // initialized UAPI struct or `usb_raw_ep_io` buffer for `req`. `ioctl` is
+    // variadic; a thin pointer is the ABI.
     unsafe { libc::ioctl(fd, req as _, arg) as i32 }
 }
 fn ioctl_mut<T>(fd: RawFd, req: libc::c_ulong, arg: *mut T) -> i32 {
@@ -159,15 +145,14 @@ fn ioctl_val(fd: RawFd, req: libc::c_ulong, val: libc::c_ulong) -> i32 {
     unsafe { libc::ioctl(fd, req as _, val) as i32 }
 }
 fn ioctl_none(fd: RawFd, req: libc::c_ulong) -> i32 {
-    // SAFETY: `req` (RUN / CONFIGURE / EP0_STALL) takes no argument, but raw_gadget rejects a non-zero
-    // `value` with EINVAL — pass an explicit 0 (an omitted vararg would be an indeterminate register).
+    // SAFETY: `req` (RUN / CONFIGURE / EP0_STALL) takes no argument. raw_gadget EINVAL on a
+    // non-zero `value`; an omitted vararg is an indeterminate register — pass 0.
     unsafe { libc::ioctl(fd, req as _, 0) as i32 }
 }
 
-// ---- low-level ep0 helpers (operate on the shared fd) ----
 fn ep0_write(fd: RawFd, data: &[u8]) -> i32 {
     let mut buf = vec![0u8; EPIO_HDR + data.len()];
-    buf[0..2].copy_from_slice(&0u16.to_ne_bytes()); // ep 0
+    buf[0..2].copy_from_slice(&0u16.to_ne_bytes());
     buf[4..8].copy_from_slice(&(data.len() as u32).to_ne_bytes());
     buf[EPIO_HDR..].copy_from_slice(data);
     ioctl_ptr(fd, IOCTL_EP0_WRITE, buf.as_ptr())
@@ -179,7 +164,7 @@ fn ep0_read(fd: RawFd, len: usize) -> (i32, Vec<u8>) {
     let n = if r > 0 { r as usize } else { 0 };
     (r, buf[EPIO_HDR..EPIO_HDR + n.min(len.max(1))].to_vec())
 }
-/// Complete a no-data OUT control (status stage is an IN, handled by a zero-length read).
+/// Status stage of a no-data OUT is an IN; a zero-length `EP0_READ` completes it.
 fn ep0_ack(fd: RawFd) {
     ep0_read(fd, 0);
 }
@@ -187,7 +172,7 @@ fn ep0_stall(fd: RawFd) {
     ioctl_none(fd, IOCTL_EP0_STALL);
 }
 
-/// Owns the `/dev/raw-gadget` fd; closing it tears the device down.
+/// Unique owner of `/dev/raw-gadget`; close tears the gadget down.
 struct GadgetFd(RawFd);
 impl Drop for GadgetFd {
     fn drop(&mut self) {
@@ -196,29 +181,25 @@ impl Drop for GadgetFd {
     }
 }
 
-/// The signal used to break a worker thread out of a blocking raw_gadget ioctl at teardown.
-/// `EVENT_FETCH`/`EP_WRITE` are `wait_event_interruptible` in the kernel with no timeout and no
-/// `O_NONBLOCK` honouring, and closing the fd cannot wake a thread already inside the ioctl (the
-/// in-flight syscall holds a reference to the struct file). A signal is the only reliable lever:
-/// delivered with a no-op, non-`SA_RESTART` handler it forces the ioctl to return `EINTR`, after
-/// which the loop's top-of-iteration `running` check exits. `SIGUSR1` is unused elsewhere in this
-/// process; the handler is a no-op, so a stray `SIGUSR1` becomes harmless rather than fatal.
+/// Wakes a worker blocked in `EVENT_FETCH`/`EP_WRITE` at teardown.
+///
+/// Those ioctls are `wait_event_interruptible` with no timeout and no `O_NONBLOCK`.
+/// Close cannot wake: the in-flight syscall holds a `struct file` ref. A no-op
+/// non-`SA_RESTART` `SIGUSR1` returns `EINTR`; the loop then sees `running`.
+/// `SIGUSR1` is unused in this process, so a stray delivery is harmless.
 const WAKE_SIGNAL: libc::c_int = libc::SIGUSR1;
 
-/// Install the no-op `WAKE_SIGNAL` handler exactly once. Crucially `sa_flags = 0` (no `SA_RESTART`)
-/// so a delivered signal makes the interruptible ioctl return `EINTR` instead of auto-restarting.
+/// No-op `WAKE_SIGNAL` handler, `sa_flags = 0` (no `SA_RESTART`) so the ioctl returns `EINTR`.
 fn install_wake_handler() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         extern "C" fn noop(_: libc::c_int) {}
-        // SAFETY: installing a well-formed `sigaction` with an empty mask and a valid no-op handler
-        // for a single signal; touches only this process's disposition for `WAKE_SIGNAL`.
+        // SAFETY: well-formed `sigaction`, empty mask, valid no-op handler.
+        // Touches only this process's `WAKE_SIGNAL` disposition.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            // Via `*const ()`: casting a function item straight to an integer is what
-            // `clippy::function_casts_as_integer` rejects, and the pointer hop is the documented
-            // way to spell it. `sa_sigaction` is a `usize`-typed handler slot, so the value is
-            // unchanged.
+            // `sa_sigaction` is a `usize` slot. Function-item → integer trips
+            // `clippy::function_casts_as_integer`; hop via `*const ()`.
             sa.sa_sigaction = noop as *const () as usize;
             libc::sigemptyset(&mut sa.sa_mask);
             sa.sa_flags = 0;
@@ -227,16 +208,14 @@ fn install_wake_handler() {
     });
 }
 
-/// Lets `Drop` wake a specific worker thread parked in a blocking ioctl. `tid` is the thread's
-/// `pthread_self()` (0 until it starts); `done` is set right before the thread returns, so `Drop`
-/// stops signalling a thread that has already exited.
+/// `Drop` signals a worker parked in a blocking ioctl.
+/// `tid` is `pthread_self()` (0 until start); `done` is set just before return.
 struct Waker {
     tid: Arc<AtomicU64>,
     done: Arc<AtomicBool>,
 }
 
-/// A virtual Steam Deck presented over the USB gadget subsystem. Dropping it stops the threads and
-/// closes the gadget (the kernel tears down the device).
+/// Drop stops the workers and closes the fd; the kernel then tears the device down.
 pub struct SteamDeckGadget {
     report: Arc<Mutex<[u8; 64]>>,
     feedback: Arc<Mutex<super::steam_proto::SteamFeedback>>,
@@ -248,8 +227,8 @@ pub struct SteamDeckGadget {
 }
 
 impl SteamDeckGadget {
-    /// Bind a virtual Deck on a fresh `dummy_hcd` UDC. `index` only varies the serial. Requires
-    /// `dummy_hcd` + `raw_gadget` loaded and write access to `/dev/raw-gadget` (root on SteamOS).
+    /// Bind a Deck on `dummy_udc.0`. `index` only changes the serial.
+    /// Needs `dummy_hcd` + `raw_gadget` and write access to `/dev/raw-gadget`.
     pub fn open(index: u8) -> Result<SteamDeckGadget> {
         // SAFETY: opening a constant NUL-terminated device path with O_RDWR; returns a fd or -1.
         let fd = unsafe { libc::open(c"/dev/raw-gadget".as_ptr(), libc::O_RDWR) };
@@ -262,7 +241,6 @@ impl SteamDeckGadget {
         let fd = Arc::new(GadgetFd(fd));
         let raw = fd.0;
 
-        // INIT against the dummy UDC, then RUN.
         // SAFETY: `UsbRawInit` is a plain-old-data struct (byte arrays + u8); all-zero is a valid value.
         let mut init: UsbRawInit = unsafe { std::mem::zeroed() };
         copy_cstr(&mut init.driver_name, "dummy_udc");
@@ -276,15 +254,14 @@ impl SteamDeckGadget {
         }
 
         let serial = deck_serial(index);
-        let unit_id = deck_unit_id(index); // "PF" + index — a synthetic per-instance device id
+        let unit_id = deck_unit_id(index);
         let report = Arc::new(Mutex::new(neutral_deck_report()));
         let feedback = Arc::new(Mutex::new(Default::default()));
         let running = Arc::new(AtomicBool::new(true));
         let ctrl_ep = Arc::new(std::sync::atomic::AtomicI32::new(-1));
         let configured = Arc::new(AtomicBool::new(false));
 
-        // The teardown wake path (see `WAKE_SIGNAL`) needs the handler installed before any thread
-        // can park in a blocking ioctl.
+        // Handler must exist before a worker can park in a blocking ioctl.
         install_wake_handler();
         let ctrl_waker = Waker {
             tid: Arc::new(AtomicU64::new(0)),
@@ -295,7 +272,6 @@ impl SteamDeckGadget {
             done: Arc::new(AtomicBool::new(false)),
         };
 
-        // Control thread: enumerate + answer every control transfer.
         let control = {
             let fd = fd.clone();
             let running = running.clone();
@@ -314,7 +290,6 @@ impl SteamDeckGadget {
                 })
                 .context("spawn gadget control thread")?
         };
-        // Stream thread: push the current report on the controller interrupt-IN endpoint.
         let stream = {
             let fd = fd.clone();
             let running = running.clone();
@@ -345,7 +320,6 @@ impl SteamDeckGadget {
         })
     }
 
-    /// Serialize `st` into the 64-byte Deck state report streamed to the kernel.
     pub fn write_state(&mut self, st: &super::steam_proto::SteamState) {
         self.seq = self.seq.wrapping_add(1);
         let mut r = [0u8; 64];
@@ -355,7 +329,7 @@ impl SteamDeckGadget {
         }
     }
 
-    /// Drain any feedback (rumble) the kernel/Steam wrote to the device.
+    /// Take rumble (and other) feedback the host wrote since the last call.
     pub fn service(&mut self) -> super::steam_proto::SteamFeedback {
         self.feedback
             .lock()
@@ -367,12 +341,8 @@ impl SteamDeckGadget {
 impl Drop for SteamDeckGadget {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        // The control thread spends steady state parked in a blocking `EVENT_FETCH` ioctl that only
-        // tests `running` at the top of its loop, so clearing the flag is not enough — it must be
-        // signalled out of the syscall (see `WAKE_SIGNAL`). Without this the join below can hang the
-        // caller (the session input thread, via `PadSlots::sweep`) indefinitely. Retry until each
-        // thread reports done, to cover the race where the signal lands just before the thread
-        // re-enters the ioctl; bounded (~1 s) so a genuinely stuck thread can't wedge teardown either.
+        // `EVENT_FETCH` only sees `running` between ioctls; signal it out (see `WAKE_SIGNAL`).
+        // Retry: the signal can land just before re-entry. 200 × 5 ms ≈ 1 s caps a stuck join.
         for _ in 0..200 {
             let mut all_done = true;
             for w in &self.wakers {
@@ -382,9 +352,8 @@ impl Drop for SteamDeckGadget {
                 all_done = false;
                 let tid = w.tid.load(Ordering::SeqCst);
                 if tid != 0 {
-                    // SAFETY: the thread is joinable and not yet joined (join runs after this loop),
-                    // so `tid` names a live pthread; `pthread_kill` on a finished-but-unjoined thread
-                    // is defined (returns ESRCH), never UB.
+                    // SAFETY: join runs after this loop, so `tid` is a live or finished-but-unjoined
+                    // pthread. `pthread_kill` on the latter returns ESRCH; it is not UB.
                     unsafe { libc::pthread_kill(tid as libc::pthread_t, WAKE_SIGNAL) };
                 }
             }
@@ -418,12 +387,10 @@ fn control_loop(
     let mut last_set: Vec<u8> = Vec::new();
     let mut evbuf = [0u8; EVENT_BUF];
     while running.load(Ordering::SeqCst) {
-        // EVENT_FETCH: type(4) length(4) data[].
-        evbuf[4..8].copy_from_slice(&(8u32).to_ne_bytes()); // request setup-sized payload
+        evbuf[4..8].copy_from_slice(&(8u32).to_ne_bytes()); // setup packet is 8 bytes
         let r = ioctl_mut(raw, IOCTL_EVENT_FETCH, evbuf.as_mut_ptr());
         if r < 0 {
             if running.load(Ordering::SeqCst) {
-                // transient; brief backoff
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             continue;
@@ -481,7 +448,7 @@ fn handle_control(
     let type_class = ctrl.bm_request_type & 0x60;
     let wl = ctrl.w_length as usize;
     if type_class == 0x00 {
-        // standard
+        // USB standard
         match ctrl.b_request {
             0x06 => {
                 // GET_DESCRIPTOR
@@ -496,10 +463,7 @@ fn handle_control(
                         1 => RDESC_KBD.to_vec(),
                         _ => RDESC_CTRL.to_vec(),
                     },
-                    HID_DT => {
-                        // re-emit the interface's HID descriptor from the config blob (best effort)
-                        hid_desc_for(cfg, idx)
-                    }
+                    HID_DT => hid_desc_for(cfg, idx),
                     _ => {
                         ep0_stall(raw);
                         return;
@@ -527,13 +491,13 @@ fn handle_control(
         // HID class
         match ctrl.b_request {
             0x01 => {
-                // GET_REPORT — serve the Deck feature reply for the last requested command.
+                // GET_REPORT — feature reply for the last SET_REPORT
                 let resp = feature_reply(last_set, serial, unit_id);
                 let n = resp.len().min(wl);
                 ep0_write(raw, &resp[..n]);
             }
             0x09 => {
-                // SET_REPORT — read the host's data; remember it + extract feedback.
+                // SET_REPORT
                 let (r, data) = ep0_read(raw, wl);
                 if r > 0 {
                     *last_set = data.clone();
@@ -561,8 +525,8 @@ fn handle_control(
 }
 
 fn hid_desc_for(cfg: &[u8], idx: u8) -> Vec<u8> {
-    // The HID descriptors live right after each interface descriptor in the config blob.
-    // Offsets: cfg(9) | i0(9) h0(9) e0(7) | i1(9) h1(9) e1(7) | i2(9) h2(9) e2(7)
+    // HID desc sits after each iface in the config blob.
+    // Layout: cfg(9) | 3×(iface 9 + HID 9 + EP 7).
     let off = match idx {
         0 => 9 + 9,
         1 => 9 + 25 + 9,
@@ -611,26 +575,23 @@ fn stream_loop(
             buf[0..2].copy_from_slice(&(ep as u16).to_ne_bytes());
             buf[4..8].copy_from_slice(&(64u32).to_ne_bytes());
             buf[EPIO_HDR..].copy_from_slice(&r);
-            // Blocks until the host polls the interrupt-IN endpoint; that's fine on its own thread.
+            // EP_WRITE blocks until the host polls interrupt-IN; this loop has its own thread.
             ioctl_ptr(raw, IOCTL_EP_WRITE, buf.as_ptr());
         }
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
 }
 
-/// Best-effort load of the gadget modules (SteamOS ships `dummy_hcd` + `raw_gadget`). Failures are
-/// ignored — the caller falls back to UHID if `/dev/raw-gadget` is then still unusable.
+/// Ignore `modprobe` failure; the caller falls back if `/dev/raw-gadget` is still missing.
 pub fn ensure_modules() {
     for m in ["dummy_hcd", "raw_gadget"] {
         let _ = std::process::Command::new("modprobe").arg(m).status();
     }
 }
 
-/// Whether to prefer the USB-gadget Deck over the UHID `SteamDeckPad` — the only transport Steam Input
-/// promotes (validated glass-to-glass on a Deck). Defaults **on for SteamOS** hosts (which ship the
-/// gadget modules + run Steam Input); off elsewhere, where the universal UHID path stays the default.
-/// `PUNKTFUNK_STEAM_GADGET=1`/`0` forces it on/off. A Deck-as-host with a *physical* Deck never reaches
-/// here: `resolve_gamepad`'s conflict gate degrades `SteamDeck` → DualSense before the manager is built.
+/// Default on for SteamOS (ships the modules and runs Steam Input); off elsewhere.
+/// `PUNKTFUNK_STEAM_GADGET=1`/`0` forces it. A host that *is* a Deck never reaches
+/// here: `resolve_gamepad` degrades `SteamDeck` → DualSense before the manager is built.
 pub fn gadget_preferred() -> bool {
     if let Ok(v) = std::env::var("PUNKTFUNK_STEAM_GADGET") {
         return v == "1" || v.eq_ignore_ascii_case("true");
@@ -638,7 +599,6 @@ pub fn gadget_preferred() -> bool {
     is_steamos()
 }
 
-/// True on SteamOS-class hosts (`/etc/os-release` `ID=steamos`, or `ID_LIKE` naming it).
 fn is_steamos() -> bool {
     std::fs::read_to_string("/etc/os-release")
         .map(|s| {

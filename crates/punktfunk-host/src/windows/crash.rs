@@ -1,14 +1,12 @@
-//! Last-resort crash visibility (Windows): an unhandled-SEH filter that logs a native crash —
-//! an access violation inside a driver/runtime DLL (amfrt64, the GPU user-mode driver, d3d11,
-//! IddCx plumbing) — through `tracing` before the process dies.
+//! Unhandled-SEH filter: one `tracing` ERROR, then default handling.
 //!
-//! Motivated by the "host went Offline with zero errors in the logs" class of field report: a
-//! native crash kills the process (dropping the mDNS advert → every client tile flips Offline)
-//! while the log ring's last entry is a healthy INFO line, so the report arrives with no evidence
-//! at all. One ERROR line naming the exception code and the faulting module turns that into a
-//! diagnosis. The Rust-panic analogue (a panic hook that tees into `tracing`) lives in `main()`.
-
-// Every `unsafe` block in this file carries a `// SAFETY:` proof (unsafe-proof program).
+//! Native crashes leave no Rust panic and no log line. This filter names the exception code,
+//! fault address, and containing module before the process dies. The panic analogue lives in
+//! `main()`.
+//!
+//! Call [`install`] once, after logging init — earlier logs into the void. The filter allocates;
+//! heap corruption can fault again, and the OS then terminates as it would have. Always returns
+//! `EXCEPTION_CONTINUE_SEARCH` so WER, a debugger, or the service supervisor still run.
 
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::Diagnostics::Debug::{
@@ -19,26 +17,21 @@ use windows::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
 };
 
-/// Install the process-wide unhandled-exception filter. Call once at startup, after logging init
-/// (the filter reports through `tracing`, so installing it earlier would log into the void).
+/// After logging init: the filter reports through `tracing`.
 pub fn install() {
-    // SAFETY: registers a process-wide top-level exception filter; `on_unhandled` is a plain
-    // `extern "system"` fn with the LPTOP_LEVEL_EXCEPTION_FILTER signature and static lifetime.
-    // The returned previous filter is deliberately dropped — we are the first/only installer.
+    // SAFETY: `on_unhandled` is `extern "system"`, matches LPTOP_LEVEL_EXCEPTION_FILTER, and
+    // has static lifetime. The previous filter is dropped: this crate is the only installer.
     unsafe {
         SetUnhandledExceptionFilter(Some(on_unhandled));
     }
 }
 
-/// STATUS_ACCESS_VIOLATION — the overwhelmingly common native-crash code; its first two
-/// `ExceptionInformation` slots carry the access kind (0 read / 1 write / 8 execute) and the
-/// target address, which we surface because they distinguish a wild pointer from a guard page.
+/// Slots 0-1 are access kind (0 read / 1 write / 8 execute) and the fault address; those
+/// distinguish a wild pointer from a guard page.
 const STATUS_ACCESS_VIOLATION: i32 = 0xC0000005u32 as i32;
 
-/// The filter itself. Best-effort by design: it formats and logs, which allocates — if the crash
-/// is heap corruption this can fault again, in which case the OS terminates us exactly as it was
-/// about to anyway. Returns `EXCEPTION_CONTINUE_SEARCH` so default handling (WER / a debugger /
-/// the service supervisor seeing the exit) still runs.
+/// Best-effort: formats and logs, so heap corruption can fault again. Returns
+/// `EXCEPTION_CONTINUE_SEARCH` so WER / a debugger / the supervisor still run.
 unsafe extern "system" fn on_unhandled(info: *const EXCEPTION_POINTERS) -> i32 {
     let mut code: i32 = 0;
     let mut addr: usize = 0;
@@ -74,16 +67,14 @@ unsafe extern "system" fn on_unhandled(info: *const EXCEPTION_POINTERS) -> i32 {
     EXCEPTION_CONTINUE_SEARCH
 }
 
-/// Resolve the module (DLL/EXE) containing `addr` — the smoking gun that separates "our bug" from
-/// "the GPU runtime crashed under us" (amfrt64.dll, atiumd64.dll, nvwgf2umx.dll, d3d11.dll, …).
+/// So the log names the faulting DLL rather than a raw address.
 fn module_at(addr: usize) -> Option<String> {
     if addr == 0 {
         return None;
     }
     let mut hmod = HMODULE::default();
-    // SAFETY: FROM_ADDRESS reinterprets the "module name" parameter as an address inside the
-    // module — `addr as *const u16` is exactly that; UNCHANGED_REFCOUNT means no AddRef, so the
-    // returned HMODULE needs no FreeLibrary. `&mut hmod` is a live out-pointer for the call.
+    // SAFETY: FROM_ADDRESS treats the "module name" argument as an address inside the module
+    // (`addr as *const u16`). UNCHANGED_REFCOUNT skips AddRef, so this HMODULE is not Freed.
     unsafe {
         GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -93,8 +84,8 @@ fn module_at(addr: usize) -> Option<String> {
         .ok()?;
     }
     let mut buf = [0u16; 512];
-    // SAFETY: `hmod` is the module handle resolved above; `buf` is a live, writable slice for the
-    // duration of the call. Returns the number of UTF-16 units written (0 on failure).
+    // SAFETY: `hmod` is the handle from GetModuleHandleExW above; `buf` is a live writable
+    // slice for the call.
     let n = unsafe { GetModuleFileNameW(Some(hmod), &mut buf) } as usize;
     (n > 0).then(|| String::from_utf16_lossy(&buf[..n.min(buf.len())]))
 }

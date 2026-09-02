@@ -20,24 +20,19 @@ use crate::stats::{Stats, StatsCounters};
 use crate::transport::Transport;
 use zerocopy::IntoBytes;
 
-/// Slice-progressive delivery metadata ([`Session::set_deliver_frame_parts`]): this [`Frame`]
-/// carries one contiguous piece of an access unit, handed up while the rest is still on the
-/// wire so a `PARTIAL_FRAME`-capable decoder can start ahead of the last packet.
+/// One contiguous piece of an access unit under [`Session::set_deliver_frame_parts`].
+/// Handed up while the rest is still on the wire so a `PARTIAL_FRAME` decoder can start
+/// ahead of the last packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FramePart {
-    /// Byte offset of `data` within the whole AU. The reassembler emits parts in order with
-    /// no gaps — but the pre-decode hand-off may drop entries under memory pressure or a
-    /// jump-to-live clear, so a consumer must still verify `offset` equals its open AU's next
-    /// expected byte and treat a mismatch as the AU lost (abandon + flush the decoder's
-    /// partial input, then discard until the next `first`). The same discard applies to a
-    /// non-`first` part arriving with no AU open.
+    /// Byte offset of `data` in the AU. The reassembler emits parts in order, but a
+    /// memory-pressure or jump-to-live drop can skip entries: treat a mismatch (or a
+    /// non-`first` part with no AU open) as the AU lost — flush the decoder, wait for `first`.
     pub offset: u32,
-    /// The AU's first part. A `first` part for a NEW `frame_index` while an earlier AU is
-    /// still open means that AU died mid-flight (aged out or was cleared) — abandon it and
-    /// flush the decoder's partial input; no explicit abort part is ever sent.
+    /// First part of this AU. A `first` for a new `frame_index` while an AU is still open
+    /// means that AU died (aged out or cleared) — flush the decoder; no abort part is sent.
     pub first: bool,
-    /// The AU's final part — the whole AU has now been delivered ([`Frame::complete`] is set
-    /// on exactly this part) and the input may be submitted to the decoder as finished.
+    /// Final part: the whole AU is in ([`Frame::complete`] is set on this part only).
     pub last: bool,
 }
 
@@ -47,41 +42,34 @@ pub struct Frame {
     pub frame_index: u32,
     pub pts_ns: u64,
     pub flags: u32,
-    /// `false` = a partial delivery: the frame aged out of the loss window with shards
-    /// missing, and the session opted into receiving it anyway
-    /// ([`Session::set_deliver_partial_frames`]). Only chunk-aligned AUs
-    /// ([`crate::packet::USER_FLAG_CHUNK_ALIGNED`]) are ever delivered partial; missing
-    /// shard ranges are zero-filled at their exact offsets.
+    /// `false` when the frame aged out of the loss window with shards missing and the
+    /// session opted in ([`Session::set_deliver_partial_frames`]). Only chunk-aligned AUs
+    /// ([`crate::packet::USER_FLAG_CHUNK_ALIGNED`]); missing ranges are zero-filled in place.
     pub complete: bool,
-    /// `Some` = slice-progressive delivery is on and this is ONE PIECE of an AU (see
-    /// [`FramePart`]); `data` holds only the part's bytes. `None` = a whole AU (or an
-    /// aged-out chunk-aligned partial — `complete` distinguishes).
+    /// `Some` = one piece of an AU under slice-progressive delivery ([`FramePart`]); `data`
+    /// is only that piece. `None` = a whole AU, or an aged-out chunk-aligned partial
+    /// (`complete` distinguishes).
     pub part: Option<FramePart>,
-    /// Wall-clock instant (ns since the Unix epoch, CLOCK_REALTIME basis — the same clock the
-    /// skew handshake compares and the host stamps `pts_ns` with) at which this AU finished
-    /// reassembly, stamped by [`Session::poll_frame`] as the frame leaves the session. Embedders
-    /// that previously stamped receipt themselves at the hand-off pull should use this instead:
-    /// the pull stamp additionally contains the pre-decode queue wait, silently folding any
-    /// client-side standing backlog into the apparent NETWORK latency. The reassembler itself
-    /// leaves this 0 (it owns no clock — the stamp is the session boundary's job).
+    /// Unix-epoch ns (CLOCK_REALTIME, same basis as `pts_ns` and the skew handshake) when
+    /// this AU finished reassembly. Stamped by [`Session::poll_frame`]; the reassembler
+    /// leaves 0 (it has no clock). Do not stamp at the pre-decode pull — that folds queue
+    /// wait into apparent network latency.
     pub received_ns: u64,
 }
 
-/// One end of a stream. Constructed for a single [`Role`]; calling the other role's
-/// methods returns [`PunktfunkError::InvalidArg`].
+/// One end of a stream. Built for a single [`Role`]; the other role's methods return
+/// [`PunktfunkError::InvalidArg`].
 ///
-/// Anti-replay: the receive path runs each opened datagram's AEAD-authenticated sequence through a
-/// sliding-window filter ([`ReplayWindow`]), so a captured, validly-sealed datagram can't be replayed
-/// by an on-path attacker — closing the input-replay gap that previously rested solely on the
-/// LAN/VPN transport assumption (plan §1). Genuine reordering within the window is still accepted;
-/// video additionally benefits from the reassembler's per-frame dedup.
+/// Receive-side anti-replay: each opened datagram's AEAD-authenticated sequence is
+/// filtered by [`ReplayWindow`]. Reordering inside the window is accepted; a captured
+/// sealed datagram is not. Video also dedups per-frame in the reassembler.
 pub struct Session {
     config: Config,
     coder: Box<dyn ErasureCoder>,
-    /// `Arc` so the second seal lane (Phase 1.5) can share the cipher; uncontended otherwise.
+    /// `Arc` so the second seal lane can share the cipher; uncontended otherwise.
     crypto: Option<std::sync::Arc<SessionCrypto>>,
-    /// Anti-replay window over the peer's authenticated sequence (receive side). `Some` exactly when
-    /// `crypto` is — the plaintext probe path carries no sequence to filter on.
+    /// Receive-side anti-replay over the peer's authenticated sequence. `Some` exactly when
+    /// `crypto` is — the plaintext probe path has no sequence to filter on.
     replay: Option<ReplayWindow>,
     transport: Box<dyn Transport>,
     packetizer: Packetizer,
@@ -89,38 +77,35 @@ pub struct Session {
     stats: StatsCounters,
     /// Monotonic wire sequence, also the AES-GCM nonce counter.
     next_seq: u64,
-    /// Client recv ring (reused across [`poll_frame`](Self::poll_frame)): `recvmmsg` drains a batch
-    /// of datagrams into `recv_scratch` in one syscall, and poll_frame consumes them one at a time
-    /// across calls (`recv_idx`..`recv_count`), refilling when drained. Allocated lazily on the
-    /// first client poll so host sessions don't carry it. No per-packet recv alloc at line rate.
+    /// Client recv ring, reused across [`poll_frame`](Self::poll_frame). Filled by one
+    /// `recvmmsg`, consumed across calls (`recv_idx`..`recv_count`). Allocated on first
+    /// client poll so host sessions do not carry it.
     recv_scratch: Vec<Vec<u8>>,
     recv_lens: Vec<usize>,
     recv_count: usize,
     recv_idx: usize,
-    /// Host send pool: reused wire buffers (`seal_frame` seals in place into these, the caller sends
-    /// then returns them via [`reclaim_wires`](Self::reclaim_wires)). After warmup each buffer keeps
-    /// its capacity, so the per-packet ciphertext + wire `Vec` allocations vanish from the hot path.
+    /// Host send pool. `seal_frame` seals in place here; the caller sends then returns the
+    /// buffers via [`reclaim_wires`](Self::reclaim_wires). After warmup each keeps its capacity.
     wire_pool: Vec<Vec<u8>>,
-    /// Receive-path stage timing (`PUNKTFUNK_PERF`), read+reset via [`take_pump_perf`]
-    /// (Self::take_pump_perf). `None` when disabled — the hot path then pays one branch per stage.
+    /// Receive-path stage timing (`PUNKTFUNK_PERF`); [`take_pump_perf`](Self::take_pump_perf)
+    /// reads and resets. `None` when off — the hot path then pays one branch per stage.
     perf: Option<PumpPerf>,
-    /// Send-path stage timing (`PUNKTFUNK_PERF`), read+reset via [`take_seal_perf`]
-    /// (Self::take_seal_perf). Same arming + branch-cost contract as `perf`.
+    /// Send-path stage timing (`PUNKTFUNK_PERF`); [`take_seal_perf`](Self::take_seal_perf)
+    /// reads and resets. Same arming and branch-cost contract as `perf`.
     seal_perf: Option<SealPerf>,
-    /// The second seal lane (plan Phase 1.5), lazily spawned by the first frame that crosses
-    /// [`TWO_LANE_MIN_PACKETS`]. Host sessions only (client sessions never seal frames).
+    /// Second seal lane, spawned by the first frame that crosses [`TWO_LANE_MIN_PACKETS`].
+    /// Host only — client sessions never seal frames.
     seal_lane: Option<SealLane>,
     /// Two-lane sealing enabled (default). `PUNKTFUNK_SEAL_LANES=1` forces single-lane.
     seal_two_lane: bool,
-    /// Reused header-Vec for the lane hand-off (the worker's half round-trips through this,
-    /// so steady-state two-lane frames move `n/2` Vec headers with zero allocation).
+    /// Reused Vecs for the lane hand-off. The worker's half round-trips here, so
+    /// steady-state two-lane frames move `n/2` headers with no allocation.
     lane_scratch: Vec<Vec<u8>>,
 }
 
-/// Stamp [`Frame::received_ns`] as the frame crosses the session boundary in
-/// [`Session::poll_frame`] — completed frames return the moment their last shard lands, so
-/// stamping at return IS stamping at reassembly completion (µs apart). CLOCK_REALTIME to match
-/// `pts_ns` / the skew handshake (deliberately not monotonic — cross-machine latency math).
+/// Stamp [`Frame::received_ns`] as the frame leaves [`Session::poll_frame`]. Completed
+/// frames return as the last shard lands, so this is reassembly completion. CLOCK_REALTIME
+/// to match `pts_ns` and the skew handshake — not monotonic; the math is cross-machine.
 fn stamp_received(mut f: Frame) -> Frame {
     f.received_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -139,10 +124,9 @@ use perf::TimedCoder;
 use replay::{seq_of, ReplayWindow};
 use seal::{seal_wire_slice, SealJob, SealLane, TWO_LANE_MIN_PACKETS};
 
-/// Datagrams drained per `recvmmsg` syscall on the client (the reused ring's size). 128 keeps
-/// the syscall rate ≤ ~3.4k/s even at the ~430k pkt/s the post-2026-07-14 receive path delivers
-/// (~4.8 Gbps wire), and gives the kernel buffer a deeper drain per pump iteration; the buffers
-/// cost `RECV_BATCH × RECV_BUF` (~256 KB, client sessions only).
+/// Datagrams per client `recvmmsg` (the reused ring). 128 keeps the syscall rate
+/// ≤ ~3.4k/s at ~430k pkt/s (~4.8 Gbps) and drains the kernel buffer deeper per pump;
+/// cost is `RECV_BATCH × RECV_BUF` (~256 KB, client sessions only).
 const RECV_BATCH: usize = 128;
 
 impl Session {
@@ -152,8 +136,6 @@ impl Session {
         let crypto = config.encrypt.then(|| {
             std::sync::Arc::new(SessionCrypto::new(&config.key, config.salt, config.role))
         });
-        // A receive-side replay window exists exactly when the datagrams are sealed (they carry the
-        // authenticated sequence the window keys on). Both roles receive from their peer.
         let replay = config.encrypt.then(ReplayWindow::new);
         let packetizer = Packetizer::new(&config);
         let reassembler = Reassembler::new(ReassemblerLimits::from_config(&config));
@@ -171,7 +153,7 @@ impl Session {
             recv_count: 0,
             recv_idx: 0,
             wire_pool: Vec::new(),
-            // Same opt-in the host's stage logs use; read once — set it before connecting.
+            // Read once at construct; set `PUNKTFUNK_PERF` before connecting.
             perf: std::env::var("PUNKTFUNK_PERF")
                 .is_ok_and(|v| v != "0")
                 .then(PumpPerf::default),
@@ -179,8 +161,8 @@ impl Session {
                 .is_ok_and(|v| v != "0")
                 .then(SealPerf::default),
             seal_lane: None,
-            // Two-lane sealing of large frames is the default; =1 forces single-lane (the
-            // escape hatch — behavior is byte-identical, this only changes who seals).
+            // Default two-lane; `PUNKTFUNK_SEAL_LANES=1` is single-lane. Byte-identical;
+            // only who seals changes.
             seal_two_lane: std::env::var("PUNKTFUNK_SEAL_LANES")
                 .map(|v| v != "1")
                 .unwrap_or(true),
@@ -189,21 +171,21 @@ impl Session {
         })
     }
 
-    /// Drain the receive-path stage timings accumulated since the last call (window semantics —
-    /// the pump reads this once per report interval). `None` when `PUNKTFUNK_PERF` is off.
+    /// Drain receive-path stage timings since the last call (window semantics: the pump
+    /// reads once per report interval). `None` when `PUNKTFUNK_PERF` is off.
     pub fn take_pump_perf(&mut self) -> Option<PumpPerf> {
         self.perf.as_mut().map(std::mem::take)
     }
 
-    /// Drain the send-path stage timings accumulated since the last call (window semantics —
-    /// the host send loop reads this once per perf window). `None` when `PUNKTFUNK_PERF` is off.
+    /// Drain send-path stage timings since the last call (window semantics: the host send
+    /// loop reads once per perf window). `None` when `PUNKTFUNK_PERF` is off.
     pub fn take_seal_perf(&mut self) -> Option<SealPerf> {
         self.seal_perf.as_mut().map(std::mem::take)
     }
 
-    /// Fold externally-timed socket time into [`SealPerf::sock_ns`] — the paced video path
-    /// times its own `send_sealed` chunk calls (they happen behind a `&self` borrow inside the
-    /// pacing closure, where the session can't self-time). No-op when perf is off.
+    /// Fold externally-timed socket time into [`SealPerf::sock_ns`]. The paced video path
+    /// times its own `send_sealed` chunks behind a `&self` borrow the session cannot
+    /// self-time. No-op when perf is off.
     pub fn note_sock_ns(&mut self, ns: u64) {
         if let Some(p) = self.seal_perf.as_mut() {
             p.sock_ns += ns;
@@ -218,40 +200,35 @@ impl Session {
         self.stats.snapshot()
     }
 
-    /// Re-arm the probe-scoped arrival stamps (see [`Stats::probe_first_arrival_ns`]): zero
-    /// them so the NEXT burst's first packet claims the first-arrival slot. Called by the
-    /// client pump when it arms a probe, strictly before the burst can have reached the host
-    /// (the `ProbeRequest` is still queued locally) — so the reset cannot race a probe packet.
-    /// The cumulative probe byte/packet counters are left alone: per-burst deltas come from
-    /// base snapshots, the same pattern the total counters use.
+    /// Zero probe-scoped arrival stamps ([`Stats::probe_first_arrival_ns`]) so the next
+    /// burst's first packet claims the slot. Call before the burst can hit the host
+    /// (`ProbeRequest` still queued locally) or the reset races a probe packet. Cumulative
+    /// probe counters stay: per-burst deltas come from base snapshots.
     pub fn reset_probe_arrivals(&self) {
         let l = std::sync::atomic::Ordering::Relaxed;
         self.stats.probe_first_arrival_ns.store(0, l);
         self.stats.probe_last_arrival_ns.store(0, l);
     }
 
-    /// Wrap a packet for the wire: when encrypting, prepend the 8-byte big-endian
-    /// sequence (the receiver derives the GCM nonce from it) then the ciphertext.
-    /// Seal one plaintext packet into the reused `wire` buffer in place (no allocation): the wire is
-    /// `seq(8) || ciphertext || tag` with crypto on, or just the packet with crypto off (probe).
-    /// Byte-identical to the previous `seal` + concat path; `clear()` keeps the buffer's capacity.
+    /// Seal one plaintext packet into reused `wire` in place. Layout is
+    /// `seq(8) || ciphertext || tag` with crypto on, or the packet with crypto off.
+    /// `clear()` keeps the buffer's capacity; the receiver derives the GCM nonce from `seq`.
     fn seal_into(&mut self, packet: &[u8], wire: &mut Vec<u8>) -> Result<()> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         wire.clear();
         match &self.crypto {
             Some(c) => {
-                wire.extend_from_slice(&seq.to_be_bytes()); // [0..8] plaintext seq prefix
-                wire.extend_from_slice(packet); // [8..8+n] plaintext to encrypt
-                wire.resize(wire.len() + crate::crypto::TAG_LEN, 0); // tag scratch
-                c.seal_in_place(seq, &mut wire[8..])?; // encrypt [8..] in place, tag written at the end
+                wire.extend_from_slice(&seq.to_be_bytes());
+                wire.extend_from_slice(packet);
+                wire.resize(wire.len() + crate::crypto::TAG_LEN, 0); // tag scratch for seal_in_place
+                c.seal_in_place(seq, &mut wire[8..])?;
             }
             None => wire.extend_from_slice(packet),
         }
         Ok(())
     }
 
-    /// Unwrap a wire datagram back into a plaintext packet.
     fn open_from_wire(&self, wire: &[u8]) -> Result<Vec<u8>> {
         match &self.crypto {
             Some(c) => {
@@ -265,9 +242,8 @@ impl Session {
         }
     }
 
-    /// Feed an opened datagram's authenticated sequence to the anti-replay window: `true` = fresh
-    /// (accept), `false` = a replay or older than the window (drop). Returns `true` when the session
-    /// isn't encrypting (no window, and no sequence on the wire to key on).
+    /// Anti-replay: `true` = fresh, `false` = replay or older than the window. Returns `true`
+    /// when the session is not encrypting (no window, no sequence on the wire).
     fn accept_seq(&mut self, seq: u64) -> bool {
         match self.replay.as_mut() {
             Some(w) => w.accept(seq),
@@ -277,12 +253,10 @@ impl Session {
 
     // -- Host path --------------------------------------------------------
 
-    /// Host: FEC-protect, packetize, and seal one encoded access unit into wire packets WITHOUT
-    /// sending them. Counts the frame + its packets/bytes as submitted; the caller transmits the
-    /// returned packets via [`send_sealed`](Self::send_sealed) — in one call, or in chunks paced
-    /// over the frame interval so a real NIC doesn't drop the whole frame as a line-rate burst (the
-    /// 1 Gbps+ freeze fix). The nonce counter advances per packet, in order, so seal once and send
-    /// the result intact. (Holding the `Vec<Vec<u8>>` also keeps the buffers alive for the batch.)
+    /// Host: FEC-protect, packetize, and seal one access unit without sending. Counts the
+    /// frame as submitted; transmit via [`send_sealed`](Self::send_sealed), whole or paced
+    /// so the NIC does not drop a line-rate burst. Nonce advances per packet in order —
+    /// seal once, send intact. Holding the `Vec`s keeps the buffers alive for the batch.
     pub fn seal_frame(
         &mut self,
         data: &[u8],
@@ -292,11 +266,10 @@ impl Session {
         self.seal_frame_inner(data, pts_ns, user_flags, None)
     }
 
-    /// [`seal_frame`](Self::seal_frame) with the caller's **explicit** `frame_index` instead of the
-    /// packetizer's internal counter. The punktfunk/1 encode loop owns the video numbering (one
-    /// session-lifetime counter, stamped per AU) so the encoder's reference-frame-invalidation
-    /// bookkeeping stays 1:1 with the wire across encoder rebuilds/resets — see
-    /// [`Packetizer::packetize_each`]. A session must use ONE numbering style per index space.
+    /// [`seal_frame`](Self::seal_frame) with the caller's `frame_index` instead of the
+    /// packetizer counter. The encode loop owns video numbering so encoder invalidation
+    /// stays 1:1 with the wire across rebuilds ([`Packetizer::packetize_each`]). One
+    /// numbering style per index space.
     pub fn seal_frame_at(
         &mut self,
         data: &[u8],
@@ -319,13 +292,11 @@ impl Session {
         })
     }
 
-    /// Host: open a **streamed** access unit ([`crate::quic::VIDEO_CAP_STREAMED_AU`] — only
-    /// toward a client that advertised it; anyone else must get the whole-AU
-    /// [`seal_frame_at`](Self::seal_frame_at) path). The AU's bytes are fed in with
-    /// [`seal_streamed_chunk`](Self::seal_streamed_chunk) as the encoder produces them and
-    /// closed with [`seal_streamed_finish`](Self::seal_streamed_finish); the three calls'
-    /// returned wire batches are ONE frame, and the nonce order is emission order across the
-    /// calls — send each batch as it is returned, before sealing the next.
+    /// Host: open a streamed AU ([`crate::quic::VIDEO_CAP_STREAMED_AU`]) — only toward a
+    /// client that advertised it; anyone else uses [`seal_frame_at`](Self::seal_frame_at).
+    /// Feed with [`seal_streamed_chunk`](Self::seal_streamed_chunk), close with
+    /// [`seal_streamed_finish`](Self::seal_streamed_finish). The three batches are one
+    /// frame; nonce order is emission order — send each batch before sealing the next.
     pub fn begin_streamed_frame_at(
         &mut self,
         pts_ns: u64,
@@ -342,11 +313,9 @@ impl Session {
             .begin_streamed(pts_ns, user_flags, Some(frame_index)))
     }
 
-    /// Feed one encoder chunk into a streamed AU, sealing slice-granularity blocks under
-    /// sentinel headers (see [`begin_streamed_frame_at`](Self::begin_streamed_frame_at)).
-    /// `slice_end` marks an encoder slice boundary — the flush points of the P2 slice pipeline
-    /// (with it false the legacy full-FEC-block granularity applies). The returned batch is
-    /// often EMPTY (the chunk is buffered until enough accumulates) — that's normal.
+    /// Feed one encoder chunk into a streamed AU ([`begin_streamed_frame_at`](Self::begin_streamed_frame_at)).
+    /// `slice_end` flushes at an encoder slice; false keeps full-FEC-block granularity.
+    /// An empty return is normal — the chunk is buffered until a block fills.
     pub fn seal_streamed_chunk(
         &mut self,
         au: &mut StreamedAu,
@@ -358,17 +327,16 @@ impl Session {
         })
     }
 
-    /// Close a streamed AU: seal the final block with the real totals (+ `FLAG_EOF`), which
-    /// retro-validate the frame at the receiver. Counts the frame as submitted.
+    /// Close a streamed AU: seal the last block with the real totals and `FLAG_EOF`,
+    /// which retro-validates the frame at the receiver. Counts the frame as submitted.
     pub fn seal_streamed_finish(&mut self, au: StreamedAu) -> Result<Vec<Vec<u8>>> {
         self.seal_run(true, |p, coder, emit| p.finish_streamed(au, coder, emit))
     }
 
-    /// The shared packetize → pooled-wire → seal machinery behind [`seal_frame`](Self::seal_frame)
-    /// and the streamed sealers: `run` drives the packetizer against an emit sink that writes
-    /// each packet's plaintext at its final wire offset; the seal pass (two-lane for large runs)
-    /// then encrypts in place. `count_frame` gates the per-frame stats — a streamed AU counts
-    /// once, at its finish call.
+    /// Packetize → pooled-wire → seal for [`seal_frame`](Self::seal_frame) and the streamed
+    /// sealers. `run` writes each packet's plaintext at its final wire offset; the seal
+    /// pass then encrypts in place. `count_frame` is per-AU — a streamed AU counts once,
+    /// at finish.
     fn seal_run(
         &mut self,
         count_frame: bool,
@@ -383,13 +351,8 @@ impl Session {
                 "seal_frame called on a client session",
             ));
         }
-        // Packetize straight into the pooled wire buffers (reused across frames via
-        // `reclaim_wires`) and seal each in place: the plaintext `header ++ shard` is written
-        // once, at its final wire offset — no intermediate per-packet Vec at all. Byte-identical
-        // to the wrapper (`packetize` + seal) path: same plaintext, same emission order, and the
-        // nonce counter advances per emitted packet exactly as before (pinned by the
-        // wire-equivalence tests below). Destructure into disjoint field borrows first — the
-        // emit closure needs `crypto`/`next_seq`/the pool while `packetizer` is `&mut`.
+        // Disjoint field borrows: emit needs `crypto` / `next_seq` / the pool while
+        // `packetizer` is `&mut`. Plaintext lands at the final wire offset (no per-packet Vec).
         let perf_armed = self.seal_perf.is_some();
         let fec_ns = std::sync::atomic::AtomicU64::new(0);
         let mut seal_ns = 0u64;
@@ -404,7 +367,7 @@ impl Session {
             lane_scratch,
             ..
         } = self;
-        // Stage timing (SealPerf): the coder shim times FEC, the seal phase times itself.
+        // TimedCoder shims FEC into SealPerf; the seal phase times itself.
         let timed_coder;
         let coder_ref: &dyn ErasureCoder = if perf_armed {
             timed_coder = TimedCoder {
@@ -417,10 +380,9 @@ impl Session {
         };
         let mut wires = std::mem::take(wire_pool);
         let mut used = 0usize;
-        // Phase 1 — packetize: write each packet's plaintext at its final wire offset
-        // (`seq(8) ‖ header(40) ‖ shard ‖ tag scratch(16)` with crypto on; `header ‖ shard`
-        // off). The nonce counter advances per packet in emission order exactly as before;
-        // sealing itself is a separate pass so it can split across lanes.
+        // Packetize: plaintext at the final wire offset (`seq(8) ‖ header(40) ‖ shard ‖
+        // tag(16)` with crypto; `header ‖ shard` off). Nonce advances in emission order;
+        // sealing is a later pass so it can split across lanes.
         let seq_base = *next_seq;
         let encrypting = crypto.is_some();
         let result = {
@@ -449,22 +411,19 @@ impl Session {
             run(packetizer, coder_ref, &mut emit)
         };
         result?;
-        // A smaller frame uses fewer buffers than the pool holds: drop the unused tail, same
-        // as the previous `resize_with(packets.len(), ..)` did. (Before the seal phase, so a
-        // two-lane split hands the worker exactly the frame's back half.)
+        // Drop unused pool tail before sealing so a two-lane split hands the worker
+        // exactly the frame's back half.
         wires.truncate(used);
-        // Phase 2 — seal. Large frames split across two lanes (plan Phase 1.5): the worker
-        // seals the back half under nonces `seq_base + i` while this thread seals the front —
-        // byte-identical output to the sequential pass (pinned by the wire-equivalence test).
+        // Seal. Large frames split: the worker seals the back half under `seq_base + i`
+        // while this thread seals the front — byte-identical to a sequential pass.
         if let Some(c) = crypto {
             if two_lane && used >= TWO_LANE_MIN_PACKETS && seal_lane.is_none() {
-                *seal_lane = SealLane::spawn(c.clone()); // stays None if spawn fails → single-lane
+                *seal_lane = SealLane::spawn(c.clone()); // None if spawn fails → single-lane
             }
             let mut split_done = false;
             if two_lane && used >= TWO_LANE_MIN_PACKETS {
-                // Take the lane for the frame: a healthy round-trip puts it back; either
-                // failure arm drops the corpse so the next large frame respawns a fresh one
-                // instead of retrying a dead channel forever.
+                // Take the lane for this frame. A healthy round-trip puts it back; either
+                // failure arm drops the corpse so the next large frame respawns, not a dead channel.
                 if let Some(lane) = seal_lane.take() {
                     let half = used / 2;
                     let mut tail = std::mem::take(lane_scratch);
@@ -478,7 +437,7 @@ impl Session {
                     };
                     match lane.to_worker.send(job) {
                         Ok(()) => {
-                            // Seal the front half while the worker runs; collect BOTH results
+                            // Seal the front while the worker runs; collect both results
                             // before erroring so the lane is always drained and reusable.
                             let t0 = perf_armed.then(std::time::Instant::now);
                             let front = seal_wire_slice(c, &mut wires, seq_base);
@@ -496,19 +455,16 @@ impl Session {
                                     split_done = true;
                                 }
                                 Err(_) => {
-                                    // The worker died holding the back half — the frame is
-                                    // unrecoverable (its packets are gone), but the error now
-                                    // SURFACES instead of `Ok` with half an access unit.
+                                    // Worker died holding the back half: those packets are
+                                    // gone. Surface the error — do not return `Ok` with half an AU.
                                     front?;
                                     return Err(PunktfunkError::Unsupported("seal lane died"));
                                 }
                             }
                         }
                         Err(std::sync::mpsc::SendError(job)) => {
-                            // The worker is gone but the channel hands the job back: reclaim
-                            // the back half so the single-lane pass below seals the WHOLE
-                            // frame — previously this fall-through sealed and returned only
-                            // the front half, silently, as `Ok`.
+                            // Worker gone but the channel returned the job: reclaim the back
+                            // half so the single-lane pass below seals the whole frame.
                             wires.extend(job.bufs);
                         }
                     }
@@ -537,16 +493,14 @@ impl Session {
         Ok(wires)
     }
 
-    /// Return the wire buffers from [`seal_frame`](Self::seal_frame) to the reuse pool once the caller
-    /// has finished sending them, so the next frame reseals in place with no allocation. Optional —
-    /// dropping the buffers instead just forfeits the reuse (correctness is unaffected).
+    /// Return [`seal_frame`](Self::seal_frame) buffers to the reuse pool after send.
+    /// Optional: dropping them only forfeits reuse.
     pub fn reclaim_wires(&mut self, wires: Vec<Vec<u8>>) {
         self.wire_pool = wires;
     }
 
-    /// Host: transmit one chunk of already-[`seal_frame`](Self::seal_frame)ed packets in a single
-    /// batched `sendmmsg`, returning how many the kernel accepted. The rest (`packets.len() - n`)
-    /// are counted as send-buffer drops. Call once for the whole frame, or per paced chunk.
+    /// Host: send one chunk of already-sealed packets in one `sendmmsg`. Returns how many
+    /// the kernel accepted; the rest are send-buffer drops. Whole frame, or per paced chunk.
     pub fn send_sealed(&self, packets: &[&[u8]]) -> Result<usize> {
         // GSO when enabled (UdpTransport/Linux), else sendmmsg — same short-count drop contract.
         let sent = self.transport.send_gso(packets)?;
@@ -559,15 +513,14 @@ impl Session {
         Ok(sent)
     }
 
-    /// Host: FEC-protect, packetize, seal, and send one encoded access unit (the whole frame in one
-    /// batched send). Convenience composition of [`seal_frame`](Self::seal_frame) +
-    /// [`send_sealed`](Self::send_sealed) for callers that don't pace (synthetic source, probe).
+    /// Host: seal and send one access unit in one batched send. [`seal_frame`](Self::seal_frame)
+    /// plus [`send_sealed`](Self::send_sealed) for callers that do not pace (synthetic, probe).
     pub fn submit_frame(&mut self, data: &[u8], pts_ns: u64, user_flags: u32) -> Result<()> {
         let wires = self.seal_frame(data, pts_ns, user_flags)?;
         let refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
         let t0 = self.seal_perf.is_some().then(std::time::Instant::now);
         let r = self.send_sealed(&refs);
-        drop(refs); // release the borrow of `wires` before returning the buffers to the pool
+        drop(refs); // release `wires` before reclaim_wires
         if let Some(t0) = t0 {
             self.note_sock_ns(t0.elapsed().as_nanos() as u64);
         }
@@ -575,12 +528,10 @@ impl Session {
         r.map(|_| ())
     }
 
-    /// Host: seal + send one **speed-test probe filler** access unit in the probe index space
-    /// (its own frame counter + the [`crate::packet::FLAG_PROBE`] user-flag) so a burst never
-    /// consumes video `frame_index`es — the client reassembles probe frames in a separate window
-    /// and its gap detectors never see them. Only call this against a client that advertised
-    /// [`crate::quic::VIDEO_CAP_PROBE_SEQ`]; an older client's single-window reassembler would
-    /// drop probe-space indexes as stale against the video stream.
+    /// Host: seal and send one probe filler in the probe index space
+    /// ([`crate::packet::FLAG_PROBE`]) so a burst never consumes video `frame_index`es.
+    /// Only against a client that advertised [`crate::quic::VIDEO_CAP_PROBE_SEQ`]; an
+    /// older single-window reassembler would drop probe indexes as stale video.
     pub fn submit_probe_frame(&mut self, data: &[u8], pts_ns: u64) -> Result<()> {
         let idx = self.packetizer.alloc_probe_index();
         let wires =
@@ -596,30 +547,23 @@ impl Session {
         r.map(|_| ())
     }
 
-    /// Host: live-adjust the FEC recovery percentage (adaptive FEC). Affects the next
-    /// [`submit_frame`](Self::submit_frame)/[`seal_frame`](Self::seal_frame); the receiver needs no
-    /// notification (each packet's header carries its block's data/recovery shard counts).
+    /// Host: live-adjust FEC recovery percent. Affects the next sealed AU; the receiver
+    /// needs no notification (each header carries that block's data/recovery counts).
     pub fn set_fec_percent(&mut self, pct: u8) {
         self.packetizer.set_fec_percent(pct);
     }
 
-    /// Host: live-swap the wire shard payload between AUs (mid-session shard renegotiation,
-    /// design/shard-payload-reneg.md). Affects the next sealed AU; call only between AUs
-    /// (never with a `StreamedAu` in flight — see [`Packetizer::set_shard_payload`]). The new
-    /// value must satisfy the exact bounds `Config::validate` imposed on the negotiated one
-    /// (even, > 0, fits a datagram, block count fits the wire) — validated here against a
-    /// probe of the session config. The PROTOCOL side is the caller's contract: a current
-    /// client reassembles any in-bounds size per-frame, but a shrink may be sent immediately
-    /// while a grow must be client-acked and never exceed the client's advertised
-    /// `Hello::max_shard_payload` ceiling.
+    /// Host: live-swap shard payload between AUs (`design/shard-payload-reneg.md`). Never
+    /// with a `StreamedAu` in flight ([`Packetizer::set_shard_payload`]). Bounds match
+    /// `Config::validate`. Shrink may go immediately; grow must be client-acked and must
+    /// not exceed `Hello::max_shard_payload`.
     pub fn set_shard_payload(&mut self, shard_payload: usize) -> Result<()> {
         if self.config.role != Role::Host {
             return Err(PunktfunkError::InvalidArg(
                 "set_shard_payload called on a client session",
             ));
         }
-        // Full `Config::validate` parity, zero drift: probe a copy (its key/salt copies are
-        // zeroized on drop) rather than re-spelling the shard clauses here.
+        // Probe a copy so `Config::validate` cannot drift; its key/salt copies zeroize on drop.
         let mut probe = self.config.clone();
         probe.shard_payload = shard_payload;
         probe.validate()?;
@@ -628,12 +572,10 @@ impl Session {
         Ok(())
     }
 
-    /// The current FEC recovery percentage (host side).
     pub fn fec_percent(&self) -> u8 {
         self.packetizer.fec_percent()
     }
 
-    /// Host: drain one pending input event from the client, if any.
     pub fn poll_input(&mut self) -> Result<Option<InputEvent>> {
         if self.config.role != Role::Host {
             return Err(PunktfunkError::InvalidArg(
@@ -643,11 +585,10 @@ impl Session {
         while let Some(wire) = self.transport.recv()? {
             let pkt = match self.open_from_wire(&wire) {
                 Ok(p) => p,
-                Err(_) => continue, // drop undecryptable noise
+                Err(_) => continue,
             };
-            // Anti-replay: a captured input datagram replayed by an on-path attacker opens cleanly
-            // (its sequence + tag are still valid) — the window is what rejects the second copy.
-            // `len >= 8` is guaranteed because the sealed-path open above succeeded.
+            // A captured input datagram opens cleanly (seq + tag still valid); the window
+            // rejects the second copy. `len >= 8` holds because sealed open succeeded.
             if self.replay.is_some() && !self.accept_seq(seq_of(&wire)) {
                 StatsCounters::add(&self.stats.packets_dropped, 1);
                 continue;
@@ -656,68 +597,58 @@ impl Session {
             if let Some(ev) = InputEvent::decode(&pkt) {
                 return Ok(Some(ev));
             }
-            // Not an input datagram (e.g. stray video) — ignore and keep draining.
+            // Stray video (or anything else) — ignore and keep draining.
         }
         Ok(None)
     }
 
     // -- Client path ------------------------------------------------------
 
-    /// Client: drain the transport until a whole access unit is recovered, or no more
-    /// packets are pending ([`PunktfunkError::NoFrame`]).
     /// Client opt-in: deliver aged-out incomplete chunk-aligned frames as
-    /// [`Frame`]`{ complete: false }` instead of only dropping them (the PyroWave
-    /// datagram-aligned mode, plan §4.4 — a lost datagram costs a few blocks of blur,
-    /// not the frame). No effect on other codecs' AUs (they never carry the flag).
+    /// [`Frame`]`{ complete: false }` instead of dropping them. A lost datagram costs a
+    /// few blocks of blur, not the frame. No effect on AUs that do not carry the flag.
     pub fn set_deliver_partial_frames(&mut self, on: bool) {
         self.reassembler.set_deliver_partial(on);
     }
 
     /// Client opt-in: deliver each AU's newly-contiguous prefix as [`Frame`]s with
-    /// [`Frame::part`]` = Some` while the rest is still on the wire, instead of one whole-AU
-    /// delivery (the slice-progressive decode path — [`crate::packet::USER_FLAG_SLICE_STREAM`]).
-    /// With it on, EVERY video frame delivery carries `part: Some` (a frame with no early
-    /// parts arrives as the degenerate `{offset: 0, first, last}` whole).
+    /// [`Frame::part`]` = Some` while the rest is still on the wire
+    /// ([`crate::packet::USER_FLAG_SLICE_STREAM`]). Every video delivery then carries
+    /// `part: Some`; a frame with no early parts is the degenerate `{offset: 0, first, last}`.
     ///
-    /// **Do not combine with an all-intra (PyroWave) stream**, and the reason is sharper than
-    /// "newest-wins draining assumes whole AUs" (2026-08-08, PW6): the drain
-    /// (`client::frame_channel::FrameChannel::pop`) counts QUEUE ENTRIES and takes one entry to be
-    /// one AU. With parts on, a single AU pushes K entries, so `len > 1` stops meaning "the consumer
-    /// is behind" — the drain fires mid-AU, returns the newest entry (a SUFFIX) and clears that
-    /// same AU's prefixes. For PyroWave that is unrecoverable rather than lossy: the sequence
-    /// header lives in window 0 of every AU, so every frame would arrive headerless. Making the
-    /// two composable means teaching the drain to skip whole superseded AUs (never to split one)
-    /// — see the PW6 section of `design/linux-host-performance-wave2-pyrowave.md`.
+    /// Do not combine with an all-intra (PyroWave) stream: `FrameChannel::pop` counts
+    /// queue entries as whole AUs, so parts make one AU K entries and `len > 1` drains
+    /// mid-AU (newest suffix, prefixes dropped). PyroWave's sequence header lives in
+    /// window 0 of every AU — every frame would arrive headerless.
     ///
-    /// Note this is a DIFFERENT axis from the host's streamed-AU wire
-    /// ([`crate::quic::VIDEO_CAP_STREAMED_AU`]): a streamed AU still completes as ONE `Frame`
-    /// here, so it is unaffected by any of the above.
+    /// Distinct from streamed-AU wire ([`crate::quic::VIDEO_CAP_STREAMED_AU`]): a streamed
+    /// AU still completes as one `Frame` here.
     pub fn set_deliver_frame_parts(&mut self, on: bool) {
         self.reassembler.set_deliver_parts(on);
     }
 
-    /// The session's negotiated wire shard payload size (bytes of AU per datagram) —
-    /// the window size for chunk-aligned AUs (`USER_FLAG_CHUNK_ALIGNED`).
+    /// Negotiated wire shard payload (bytes of AU per datagram) — the window size for
+    /// chunk-aligned AUs (`USER_FLAG_CHUNK_ALIGNED`).
     pub fn shard_payload(&self) -> usize {
         self.config.shard_payload
     }
 
+    /// Client: drain the transport until a whole access unit is recovered, or no more
+    /// packets are pending ([`PunktfunkError::NoFrame`]).
     pub fn poll_frame(&mut self) -> Result<Frame> {
         if self.config.role != Role::Client {
             return Err(PunktfunkError::InvalidArg(
                 "poll_frame called on a host session",
             ));
         }
-        // Lazily allocate the recv ring on first client poll (host sessions never get here).
         if self.recv_scratch.is_empty() {
-            // Each buffer holds a max datagram + 1 (an oversized read fills it → reassembler rejects).
+            // Max datagram + 1: an oversized read fills the buffer and we drop it below.
             self.recv_scratch = (0..RECV_BATCH)
                 .map(|_| vec![0u8; MAX_DATAGRAM_BYTES + 1])
                 .collect();
             self.recv_lens = vec![0usize; RECV_BATCH];
         }
         loop {
-            // Refill the ring with one `recvmmsg` batch when the current one is drained.
             if self.recv_idx >= self.recv_count {
                 let t0 = self.perf.is_some().then(std::time::Instant::now);
                 self.recv_count = self
@@ -729,8 +660,7 @@ impl Session {
                 }
                 self.recv_idx = 0;
                 if self.recv_count == 0 {
-                    // Nothing new on the wire — hand over an aged-out partial if one is
-                    // waiting (it can only get staler).
+                    // Idle wire: hand over an aged-out partial if one is waiting (it only gets staler).
                     if let Some(p) = self.reassembler.take_partial() {
                         return Ok(stamp_received(p));
                     }
@@ -740,19 +670,15 @@ impl Session {
             let i = self.recv_idx;
             self.recv_idx += 1;
             let len = self.recv_lens[i];
-            // An oversized datagram fills the whole buffer (recvmmsg truncates + caps msg_len at the
-            // buffer size) — drop it rather than hand up a truncated, corrupt packet, mirroring the
-            // scalar `recv`'s `n >= RECV_BUF` check.
+            // recvmmsg truncates and caps `msg_len` at the buffer size: drop rather than
+            // hand up a truncated packet (same contract as scalar `recv`'s `n >= RECV_BUF`).
             if len > MAX_DATAGRAM_BYTES {
                 continue;
             }
-            // Open in place inside the ring buffer — no per-datagram allocation at line rate
-            // (~125k pkt/s at 1 Gbps; the recv ring killed the recv alloc, this kills the decrypt
-            // one). The plaintext lands at [8..8+n] of the sealed wire (behind the seq prefix); an
-            // unencrypted (probe) datagram IS the packet. Field-precise borrows keep the slice into
-            // `recv_scratch` alive across the replay/reassembler calls below.
-            // Perf note: the two `continue`s below (short / undecryptable noise) skip the decrypt
-            // accounting — they are the exception path, not line-rate traffic.
+            // Open in place in the ring: plaintext at [8..8+n] behind the seq prefix; a
+            // probe datagram is the packet. Field-precise borrows keep the `recv_scratch`
+            // slice alive across replay/reassembly. Short / undecryptable `continue`s skip
+            // decrypt accounting (exception path, not line rate).
             let t_dec = self.perf.is_some().then(std::time::Instant::now);
             let (pkt_range, seq) = match &self.crypto {
                 Some(c) => {
@@ -763,7 +689,7 @@ impl Session {
                     let seq = u64::from_be_bytes(self.recv_scratch[i][..8].try_into().unwrap());
                     match c.open_in_place(seq, &mut self.recv_scratch[i][8..len]) {
                         Ok(n) => (8..8 + n, Some(seq)),
-                        Err(_) => continue, // undecryptable noise — drop, keep draining
+                        Err(_) => continue,
                     }
                 }
                 None => (0..len, None),
@@ -771,9 +697,8 @@ impl Session {
             if let (Some(p), Some(t)) = (self.perf.as_mut(), t_dec) {
                 p.decrypt_ns += t.elapsed().as_nanos() as u64;
             }
-            // Anti-replay (same rationale as poll_input): reject a datagram whose authenticated
-            // sequence was already seen. Video also dedups per-frame downstream, but filtering here
-            // is uniform and cheap.
+            // Reject a datagram whose authenticated sequence was already seen. Video also
+            // dedups per-frame downstream; filtering here is uniform and cheap.
             if let (Some(w), Some(seq)) = (self.replay.as_mut(), seq) {
                 if !w.accept(seq) {
                     StatsCounters::add(&self.stats.packets_dropped, 1);
@@ -783,53 +708,43 @@ impl Session {
             let pkt = &self.recv_scratch[i][pkt_range];
             StatsCounters::add(&self.stats.packets_received, 1);
             StatsCounters::add(&self.stats.bytes_received, pkt.len() as u64);
-            // The reassembler validates the packet via its parsed header (`magic`),
-            // ignoring anything that isn't a well-formed video packet.
             let t_push = self.perf.is_some().then(std::time::Instant::now);
             let pushed = self
                 .reassembler
                 .push(pkt, self.coder.as_ref(), &self.stats)?;
             if let (Some(p), Some(t)) = (self.perf.as_mut(), t_push) {
                 p.reasm_ns += t.elapsed().as_nanos() as u64;
-                // Counts datagrams that reached the reassembler (replay-rejected ones don't).
+                // Datagrams that reached the reassembler (replay-rejected ones do not).
                 p.packets += 1;
             }
             if let Some(frame) = pushed {
-                // A prefix part is not a completed frame — only the delivery that closes the
-                // AU counts, or parts would multiply the completion rate.
+                // Prefix parts are not completions: only the delivery that closes the AU,
+                // or parts would multiply the completion rate.
                 if frame.complete {
                     StatsCounters::add(&self.stats.frames_completed, 1);
                 }
                 return Ok(stamp_received(frame));
             }
-            // A push that completed nothing may still have aged a partial out — deliver it
-            // ahead of further draining (its successors are already arriving).
+            // A no-complete push may still have aged a partial out; deliver it before
+            // draining further (its successors are already arriving).
             if let Some(p) = self.reassembler.take_partial() {
                 return Ok(stamp_received(p));
             }
         }
     }
 
-    /// Client: discard the ENTIRE pending receive backlog — the current recv ring plus everything
-    /// queued in the kernel socket buffer — and reset the reassembler. Returns how many datagrams
-    /// were thrown away (counted into `packets_dropped`).
-    ///
-    /// This is the latency-bound escape hatch: the receive path has no other way to skip ahead.
-    /// Packets arrive strictly in order, so once a standing queue forms (the pump transiently
-    /// slower than the wire, a Wi-Fi stall, power-save delivery clumping), the client plays that
-    /// far behind FOREVER — it consumes at exactly the arrival rate, so the backlog never shrinks
-    /// (observed live: a stream stuck 6–7 s behind, socket buffers full end to end). Discarding
-    /// is memcpy-speed (no decrypt/reassembly/allocation), so this empties even a 32 MB buffer in
-    /// milliseconds; the caller then requests a keyframe and the stream resumes live. The iteration
-    /// cap (1024 batches ≈ 131k datagrams ≈ 190 MB at the 128-deep ring) only guards against a
-    /// line-rate sender outpacing the discard loop indefinitely.
+    /// Client: discard the pending receive backlog (current recv ring plus the kernel
+    /// socket buffer) and reset the reassembler. Returns datagrams thrown away
+    /// (`packets_dropped`). The receive path has no other skip-ahead: packets arrive in
+    /// order, and consume-at-arrival-rate never shrinks a standing queue. 1024 batches
+    /// (≈131k datagrams at the 128-deep ring) only cap a line-rate sender outrunning the loop.
     pub fn flush_backlog(&mut self) -> Result<u64> {
         if self.config.role != Role::Client {
             return Err(PunktfunkError::InvalidArg(
                 "flush_backlog called on a host session",
             ));
         }
-        // The undelivered tail of the current ring is backlog too.
+        // Undelivered tail of the current ring is backlog too.
         let mut flushed = self.recv_count.saturating_sub(self.recv_idx) as u64;
         self.recv_count = 0;
         self.recv_idx = 0;
@@ -849,7 +764,6 @@ impl Session {
         Ok(flushed)
     }
 
-    /// Client: serialize and send one input event to the host.
     pub fn send_input(&mut self, event: &InputEvent) -> Result<()> {
         if self.config.role != Role::Client {
             return Err(PunktfunkError::InvalidArg(
@@ -857,7 +771,7 @@ impl Session {
             ));
         }
         let pkt = event.encode();
-        let mut wire = Vec::new(); // input is rare + per-event; no pool needed
+        let mut wire = Vec::new(); // rare + per-event; no pool
         self.seal_into(&pkt, &mut wire)?;
         StatsCounters::add(&self.stats.packets_sent, 1);
         StatsCounters::add(&self.stats.bytes_sent, wire.len() as u64);
@@ -901,9 +815,8 @@ mod wire_equivalence_tests {
         Session::new(cfg, Box::new(h)).unwrap()
     }
 
-    /// The reference wire path: build owned packets via the `packetize` wrapper, then seal
-    /// each into its own buffer — the pre-zero-copy implementation of `seal_frame`, spelled
-    /// out with the session's own private pieces so the two paths share nothing but state.
+    /// Reference wire path: `packetize` wrapper then per-packet `seal_into`. Shares
+    /// session state with `seal_frame` and nothing else, so the equality pin is real.
     fn seal_via_wrapper(sess: &mut Session, frame: &[u8], pts_ns: u64, flags: u32) -> Vec<Vec<u8>> {
         let packets = sess
             .packetizer
@@ -918,10 +831,9 @@ mod wire_equivalence_tests {
         wires
     }
 
-    /// `seal_frame`'s packetize-straight-into-the-wire-pool path must produce byte-identical
-    /// sealed output to the wrapper path (same plaintext = header ++ shard, same nonce
-    /// sequence) — for multi-block frames, partial tail shards, exact-multiple frames, the
-    /// empty frame, fec 0%/50%, both schemes, crypto on and off (plan §1.4).
+    /// `seal_frame`'s pooled-wire path must be byte-identical to the wrapper path
+    /// (same plaintext, same nonce sequence) across schemes, FEC percents, crypto on/off,
+    /// and the frame shapes below.
     #[test]
     fn zero_copy_seal_matches_wrapper_path() {
         for scheme in [FecScheme::Gf8, FecScheme::Gf16] {
@@ -930,7 +842,7 @@ mod wire_equivalence_tests {
                     let mut opt = host_session(host_cfg(scheme, fec_percent, encrypt));
                     let mut refr = host_session(host_cfg(scheme, fec_percent, encrypt));
 
-                    // shard_payload 64 × max_data_per_block 8: >512 bytes spans FEC blocks.
+                    // shard_payload 64 × max_data_per_block 8: >512 B spans FEC blocks.
                     let frames: Vec<Vec<u8>> = vec![
                         pattern(3000),  // multi-block + partial tail shard
                         pattern(1024),  // exact multiple (2 full blocks)
@@ -946,13 +858,12 @@ mod wire_equivalence_tests {
                             got, want,
                             "wire mismatch: scheme={scheme:?} fec={fec_percent}% encrypt={encrypt} frame#{i}"
                         );
-                        // Return the buffers so later frames exercise the pooled-reuse path
-                        // (including a bigger frame after a smaller one and vice versa).
+                        // Return buffers so later frames exercise pooled reuse (bigger after
+                        // smaller and vice versa).
                         opt.reclaim_wires(got);
                     }
-                    // The 20000-byte frame (~469 wire packets at shard 64) crosses
-                    // TWO_LANE_MIN_PACKETS: the equality above must have held THROUGH the
-                    // two-lane split, not via a silent single-lane fallback.
+                    // 20000 bytes (~469 packets at shard 64) crosses TWO_LANE_MIN_PACKETS:
+                    // equality above must have held through the two-lane split, not a fallback.
                     if encrypt {
                         assert!(
                             opt.seal_lane.is_some(),
@@ -968,15 +879,14 @@ mod wire_equivalence_tests {
         (0..len).map(|i| (i * 31 + 7) as u8).collect()
     }
 
-    /// A dead seal lane (worker gone, channels dangling) must degrade to a single-lane seal of
-    /// the WHOLE frame — the old fall-through sealed and returned only the front half as `Ok` —
-    /// and the corpse must be dropped so the next large frame respawns a fresh lane.
+    /// A dead seal lane must fall back to a single-lane seal of the whole frame, and the
+    /// corpse must be dropped so the next large frame respawns a fresh lane.
     #[test]
     fn dead_seal_lane_falls_back_to_single_lane_whole_frame() {
         let mut opt = host_session(host_cfg(FecScheme::Gf16, 20, true));
         let mut refr = host_session(host_cfg(FecScheme::Gf16, 20, true));
-        // A lane whose worker has already exited: both far ends dropped, so `send` fails
-        // immediately and hands the job (with the frame's back half) back.
+        // Worker already gone: both far ends dropped, so `send` fails immediately and
+        // hands the job (back half of the frame) back.
         let (to_worker, jobs) = std::sync::mpsc::sync_channel::<SealJob>(1);
         let (done_tx, from_worker) = std::sync::mpsc::sync_channel::<SealJob>(1);
         drop(jobs);
@@ -993,7 +903,6 @@ mod wire_equivalence_tests {
             opt.seal_lane.is_none(),
             "the dead lane must be dropped, not retried forever"
         );
-        // The next large frame respawns a fresh, working lane.
         opt.reclaim_wires(got);
         let got2 = opt.seal_frame(&frame, 8, 1).unwrap();
         let want2 = seal_via_wrapper(&mut refr, &frame, 8, 1);
@@ -1004,10 +913,9 @@ mod wire_equivalence_tests {
         );
     }
 
-    /// Partial delivery (plan §4.4): a chunk-aligned frame that loses shards past FEC's
-    /// reach is DELIVERED once it ages out — `complete: false`, received shards at their
-    /// exact offsets, missing ranges zero-filled — instead of silently dropping. Plain
-    /// AUs (no flag) keep the drop behavior even with the opt-in enabled.
+    /// A chunk-aligned frame that loses shards past FEC is delivered once it ages out
+    /// (`complete: false`, survivors at exact offsets, holes zero-filled). Unflagged AUs
+    /// still drop, even with the opt-in on.
     #[test]
     fn partial_delivery_of_chunk_aligned_frames() {
         use crate::packet::USER_FLAG_CHUNK_ALIGNED;
@@ -1026,18 +934,16 @@ mod wire_equivalence_tests {
             salt: [0u8; 4],
             loopback_drop_period: 0,
         };
-        // Drop exactly one datagram (the 3rd) out of the first frame's shards.
         let (h, c) = crate::transport::loopback_pair(3, 1);
         let mut host = Session::new(mk(Role::Host), Box::new(h)).unwrap();
         let mut client = Session::new(mk(Role::Client), Box::new(c)).unwrap();
         client.set_deliver_partial_frames(true);
 
-        // 8 shards of chunk-aligned payload.
         let frame = pattern(8 * 1024);
         host.submit_frame(&frame, 1_000, USER_FLAG_CHUNK_ALIGNED)
             .unwrap();
-        // The incomplete frame ages out on the HARD index window — push enough newer
-        // (complete) frames past it. Collect everything the client emits.
+        // Age the incomplete frame off the hard index window: push enough newer complete
+        // frames past it, and collect everything the client emits.
         let mut got_partial = None;
         let mut completes = 0;
         for i in 0..80u64 {
@@ -1057,7 +963,6 @@ mod wire_equivalence_tests {
         assert_eq!(p.pts_ns, 1_000);
         assert_eq!(p.data.len(), frame.len());
         assert!(p.flags & USER_FLAG_CHUNK_ALIGNED != 0);
-        // Exactly one 1024-byte shard is zeroed; every other offset matches the original.
         let mut zero_windows = 0;
         for w in 0..8 {
             let win = &p.data[w * 1024..(w + 1) * 1024];
@@ -1068,15 +973,14 @@ mod wire_equivalence_tests {
             }
         }
         // loopback_pair(3, _) drops every 3rd datagram, so several of the 8 shards are
-        // gone — the exact count depends on phase; what matters is that SOME are zeroed
-        // and every survivor is intact.
+        // gone — the exact count depends on phase; some zeroed, every survivor intact.
         assert!(
             (1..8).contains(&zero_windows),
             "dropped shards zero-filled (got {zero_windows})"
         );
         assert!(completes > 40, "surviving filler frames flow normally");
 
-        // Control: WITHOUT the flag the same loss is a plain drop, opt-in or not.
+        // Control: without the chunk-aligned flag the same loss is a drop, opt-in or not.
         let (h2, c2) = crate::transport::loopback_pair(3, 1);
         let mut host2 = Session::new(mk(Role::Host), Box::new(h2)).unwrap();
         let mut client2 = Session::new(mk(Role::Client), Box::new(c2)).unwrap();
@@ -1099,17 +1003,11 @@ mod wire_equivalence_tests {
         );
     }
 
-    /// The low-MTU PyroWave guarantee (design/shard-payload-reneg.md): mid-session
-    /// renegotiation is gated OFF for chunk-aligned sessions, so a constrained path serves
-    /// them through the leg-1 SESSION-START clamp instead — the learned budget (or
-    /// `PUNKTFUNK_WIRE_MTU`) sizes `Welcome::shard_payload`, and everything chunk-aligned
-    /// derives from that ONE number fixed at the handshake: the host packetizes at it, the
-    /// client's parse window reads it back ([`Session::shard_payload`] → the C-ABI
-    /// `punktfunk_connection_shard_payload` every embedder walks windows with), and partial
-    /// delivery zero-fills exact windows of it. Pin that consistency at the clamp shapes a
-    /// constrained path actually produces: the WARP/Tailscale budget (1216) and the floor
-    /// (512) — chunk-aligned frames deliver, lose whole windows (never splice), and the
-    /// window arithmetic matches the session value end to end.
+    /// Chunk-aligned sessions do not renegotiate mid-session (`design/shard-payload-reneg.md`):
+    /// `Welcome::shard_payload` is fixed at handshake, host packetizes at it, the client
+    /// parse window is [`Session::shard_payload`], and partial delivery zero-fills exact
+    /// windows of it. Pin 1216 (typical VPN MTU budget) and 512 (floor): frames deliver,
+    /// loss is whole windows, window math matches the session value.
     #[test]
     fn chunk_aligned_sessions_work_at_clamped_shard_sizes() {
         use crate::packet::USER_FLAG_CHUNK_ALIGNED;
@@ -1133,7 +1031,7 @@ mod wire_equivalence_tests {
             let mut host = Session::new(mk(Role::Host), Box::new(h)).unwrap();
             let mut client = Session::new(mk(Role::Client), Box::new(c)).unwrap();
             client.set_deliver_partial_frames(true);
-            // The window every embedder parses with IS the clamped session value.
+            // Parse window every embedder walks is the clamped session value.
             assert_eq!(client.shard_payload(), shard);
             assert_eq!(host.shard_payload(), shard);
 
@@ -1156,8 +1054,8 @@ mod wire_equivalence_tests {
             }
             let p = got_partial.expect("the lossy frame must be delivered partial");
             assert_eq!(p.data.len(), frame.len(), "shard {shard}");
-            // Loss lands on exact `shard`-sized window boundaries: zeroed windows for the
-            // dropped datagrams, byte-identical survivors — nothing spliced across windows.
+            // Loss lands on exact `shard`-sized windows: zeroed for dropped datagrams,
+            // byte-identical survivors — nothing spliced across windows.
             let mut zero_windows = 0;
             for w in 0..8 {
                 let win = &p.data[w * shard..(w + 1) * shard];
@@ -1182,11 +1080,9 @@ mod wire_equivalence_tests {
         }
     }
 
-    /// Mid-session shard renegotiation end to end over the SEALED loopback wire
-    /// (design/shard-payload-reneg.md): one host session re-keys its packetizer between AUs
-    /// — shrink, jumbo grow, revert — through one continuous crypto/replay stream, and one
-    /// client session must DELIVER every frame byte-identically (the vacuous-green lesson:
-    /// assert delivered frames, never the absence of errors).
+    /// Mid-session shard swap over the sealed loopback (`design/shard-payload-reneg.md`):
+    /// shrink, jumbo grow, revert through one crypto/replay stream. Assert delivered
+    /// frames byte-identical — never the mere absence of errors.
     #[test]
     fn mid_session_shard_swap_delivers_frames_over_the_sealed_wire() {
         let mk = |role: Role| {
@@ -1201,10 +1097,10 @@ mod wire_equivalence_tests {
         let mut client = Session::new(mk(Role::Client), Box::new(ct)).unwrap();
 
         let phases: [(usize, &[usize]); 4] = [
-            (1408, &[3000, 3 * 1408]), // the negotiated default (incl. exact multiple)
-            (512, &[2000, 5 * 512 + 17]), // shrink — the mid-session VPN heal
-            (8908, &[100_000]),        // grow — jumbo on a 9000-MTU LAN
-            (1216, &[2 * 1216 + 9]),   // revert — a mis-proven jumbo hop self-corrects
+            (1408, &[3000, 3 * 1408]),    // negotiated default (incl. exact multiple)
+            (512, &[2000, 5 * 512 + 17]), // shrink
+            (8908, &[100_000]),           // grow to jumbo (9000-MTU)
+            (1216, &[2 * 1216 + 9]),      // revert
         ];
         let mut pts = 0u64;
         let mut delivered = 0usize;
@@ -1227,8 +1123,7 @@ mod wire_equivalence_tests {
             }
         }
         assert_eq!(delivered, 6, "every submitted frame must be delivered");
-        // The setter is host-side machinery: a client session must refuse it, and an
-        // invalid size (odd / oversized) must be rejected without touching the live config.
+        // Host-only setter: a client must refuse it, and an invalid size must not stick.
         assert!(client.set_shard_payload(1408).is_err());
         assert!(
             host.set_shard_payload(1407).is_err(),

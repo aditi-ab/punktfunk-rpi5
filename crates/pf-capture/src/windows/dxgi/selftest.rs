@@ -1,20 +1,21 @@
-//! The P010 colour SELF-TEST and its helpers — the `hdr-p010-selftest` subcommand's whole
-//! implementation, plus the f64 reference math it compares against and the f16 encoder it uploads
-//! with.
+//! GPU colour check for [`HdrP010Converter`]: the `hdr-p010-selftest` subcommand,
+//! the f64 analogue of its HLSL, and the f16 encoder that uploads the pattern.
 //!
-//! Split out of `windows/dxgi.rs` in sweep Phase 5.5: it was ~560 of that file's 1,374 lines and
-//! none of it runs in a session. What remains in the parent is the production path (the win32u hook,
-//! the shader sources, the three converters); this is the validation path.
+//! Does not run in a session. Pin with `punktfunk-host hdr-p010-selftest WxH [vendor]`
+//! at a session size (1080 is not 16-aligned — encoder align16 pool seam). `vendor`
+//! is a PCI id (`0x8086` Intel / `0x10de` NVIDIA / `0x1002` AMD); a PASS is only
+//! for that GPU.
 //!
-//! `hdr_p010_selftest_at` and `hdr_p010_convert_bars_on_luid` are re-exported by the parent, so
-//! every existing `crate::capture::dxgi::…` / `pf_capture::dxgi::…` path keeps resolving.
+//! [`hdr_p010_selftest_at`] and [`hdr_p010_convert_bars_on_luid`] are re-exported
+//! by the parent so `crate::capture::dxgi::…` / `pf_capture::dxgi::…` keep resolving.
+//! Evidence: `f16_tests`, ignored `hdr_p010_selftest_intel_1080_live`,
+//! `docs-site/content/docs/hdr.md`.
 
 use super::*;
 
-/// f64 reference for the P010 colour math — the EXACT analogue of the HLSL in [`HDR_P010_COMMON`].
-/// Input is one scRGB pixel (linear, Rec.709 primaries, 1.0 = 80 nits, may be >1 for HDR). Output is
-/// the 10-bit studio-range (Y, Cb, Cr) codes the shader should produce for a flat (constant) block.
-/// Used by [`hdr_p010_selftest`].
+/// f64 analogue of the HLSL in [`HDR_P010_COMMON`].
+/// One scRGB pixel in (linear Rec.709, 1.0 = 80 nits, HDR may exceed 1.0);
+/// out is 10-bit studio-range (Y, Cb, Cr) for a flat block.
 #[cfg(target_os = "windows")]
 fn p010_reference(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
     fn pq_oetf(l: f64) -> f64 {
@@ -52,13 +53,11 @@ fn p010_reference(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
     (yc, cbc, crc)
 }
 
-/// Test support (used by pf-encode's live e2e): the 8 sRGB colour bars (white/yellow/cyan/green/
-/// magenta/red/blue/black, sRGB 1.0 = scRGB 1.0 = 80 nits) as a w×h FP16 scRGB texture on the
-/// adapter with `luid`, converted through the REAL [`HdrP010Converter`] into a P010 texture with
-/// **`BIND_RENDER_TARGET` only, `MiscFlags` 0 — the exact bind profile of the IDD out-ring** (the
-/// CPU-upload encoder tests can't use that profile, so only this path exercises "RTV-written P010
-/// → encoder ingest copy"). Returns `(device, p010)`; expected decoded codes per bar are the
-/// bars_pq2020 fixture's: (490,512,512) (478,423,518) (464,525,473) (450,432,476) (350,584,585)
+/// Colour-bar P010 on `luid` with the IDD out-ring bind profile:
+/// `BIND_RENDER_TARGET` only, `MiscFlags` 0. CPU-upload encoder tests cannot
+/// use that profile; this is the RTV-written P010 → encoder ingest path.
+/// Eight sRGB bars (1.0 = 80 nits). Expected 10-bit codes:
+/// (490,512,512) (478,423,518) (464,525,473) (450,432,476) (350,584,585)
 /// (325,448,598) (226,650,535) (64,512,512).
 #[cfg(target_os = "windows")]
 #[doc(hidden)]
@@ -73,8 +72,7 @@ pub fn hdr_p010_convert_bars_on_luid(
     if w == 0 || h == 0 || w % 2 != 0 || h % 2 != 0 {
         bail!("bars pattern needs even non-zero dimensions, got {w}x{h}");
     }
-    // sRGB primaries at full/zero channels: sRGB EOTF(1.0)=1.0, (0)=0 → the scRGB pattern is
-    // pure 0/1 floats and the PQ/BT.2020 reference codes above are exact.
+    // EOTF(1)=1 and EOTF(0)=0, so 0/1 scRGB bars match the PQ/BT.2020 codes exactly.
     const BARS: [(f32, f32, f32); 8] = [
         (1.0, 1.0, 1.0),
         (1.0, 1.0, 0.0),
@@ -183,18 +181,12 @@ pub fn hdr_p010_convert_bars_on_luid(
     }
 }
 
-/// Colour self-test for [`HdrP010Converter`] (the `hdr-p010-selftest` subcommand): create a hardware
-/// D3D11 device, upload a known scRGB FP16 pattern, run the P010 shader passes, read the Y (plane 0)
-/// and UV (plane 1) planes back from a staging copy, and compare against the [`p010_reference`] f64
-/// math. The ONLY validation we have without green-screening a live HDR stream. PASS if max abs error
-/// Y ≤ 4 codes, U/V ≤ 5 codes (rounding + chroma averaging). Prints a per-colour table + PASS/FAIL.
+/// Colour self-test for [`HdrP010Converter`] (`hdr-p010-selftest`).
+/// PASS if max |err| vs [`p010_reference`] is Y ≤ 4, U/V ≤ 5 (rounding + chroma averaging).
 ///
-/// `w`/`h` must be even and non-zero. Run it at the FIELD capture size, not a toy one: sessions run
-/// at resolutions whose height is not 16-aligned (1080 → the encoder's align16 pool seam) and a
-/// driver may treat the planar RTVs differently at real sizes. `vendor` pins the adapter by PCI
-/// vendor id (`0x8086` Intel / `0x10de` NVIDIA / `0x1002` AMD) — it matters on dual-GPU boxes where
-/// the default adapter is not the one the session encodes on. The chosen adapter is always printed,
-/// because a PASS only means anything for the GPU it actually ran on.
+/// `w`/`h` must be even and non-zero. Run at a session size: 1080 is not
+/// 16-aligned (encoder align16 pool seam) and a driver may treat planar RTVs
+/// differently at real sizes. `vendor` is a PCI id; a PASS is only for that GPU.
 #[cfg(target_os = "windows")]
 pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
     use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
@@ -203,13 +195,11 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
     if w == 0 || h == 0 || w % 2 != 0 || h % 2 != 0 {
         bail!("hdr-p010-selftest needs even non-zero dimensions, got {w}x{h}");
     }
-    // A grid of 16x16 flat scRGB blocks (each 2x2 chroma footprint uniform → exact chroma
-    // comparison) covering pure R/G/B/white/black/gray at plausible HDR nit levels, plus a couple
-    // of bright (>1.0 scRGB) colours, then the rest is a gradient (compared on Y only).
+    // 16×16 flats: each 2×2 chroma footprint is uniform, so Cb/Cr can match exactly.
     #[allow(non_snake_case)]
     let (W, H) = (w, h);
     const BLK: u32 = 16;
-    // (name, r, g, b) scRGB linear (1.0 = 80 nits). Mix of SDR-ish and HDR (>1.0) values.
+    // scRGB linear; 1.0 = 80 nits.
     let named: [(&str, f32, f32, f32); 8] = [
         ("red1.0", 1.0, 0.0, 0.0),
         ("green0.5", 0.0, 0.5, 0.0),
@@ -221,14 +211,14 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
         ("amber2.0", 2.0, 1.0, 0.0),
     ];
 
-    let grid_cols = W / BLK; // 4
+    let grid_cols = W / BLK;
     let pixel_rgb = |x: u32, y: u32| -> (f32, f32, f32, bool) {
         let idx = ((y / BLK) * grid_cols + (x / BLK)) as usize;
         if idx < named.len() {
             let (_, r, g, b) = named[idx];
             (r, g, b, true)
         } else {
-            // Gradient (distinct per pixel; Y-only compare), within HDR scRGB range.
+            // Per-pixel gradient (Y-only compare — chroma would average neighbours).
             let r = (x as f32 / W as f32) * 3.0;
             let g = (y as f32 / H as f32) * 3.0;
             let b = ((x + y) as f32 / (W + H) as f32) * 3.0;
@@ -236,7 +226,6 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
         }
     };
 
-    // Build the scRGB FP16 (R16G16B16A16_FLOAT) source as f16 bits.
     let mut fp16 = vec![0u16; (W * H * 4) as usize];
     let mut flat = vec![false; (W * H) as usize];
     for y in 0..H {
@@ -251,18 +240,11 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
         }
     }
 
-    // SAFETY: this self-test creates its own D3D11 device + immediate context (`D3D11CreateDevice`,
-    // both checked non-null) and uses ONLY that device for the rest of the block: every
-    // `CreateTexture2D`/`CreateShaderResourceView`/`HdrP010Converter::{new,convert}`/`CopyResource`/
-    // `Map` is invoked on that device or its context, so all resources share one device and run on this
-    // single thread. The source texture's `D3D11_SUBRESOURCE_DATA` points at `fp16`, a live
-    // `Vec<u16>` of `W*H*4` samples with `SysMemPitch = W*8`, matching the W×H R16G16B16A16 texture;
-    // `fp16` outlives the synchronous `CreateTexture2D` that reads it. The mapped-pointer reads are
-    // proven individually at the `read_u16` closure below.
+    // SAFETY: this block's D3D11 device + immediate context (both non-null) own
+    // every Create/convert/Copy/Map below; one device, this thread. `fp16` is
+    // W×H R16G16B16A16 with SysMemPitch = W*8 and outlives the synchronous
+    // CreateTexture2D. Mapped reads are proven at `read_u16`.
     unsafe {
-        // Device on the requested vendor's adapter (dual-GPU boxes encode on a specific one), else
-        // the default hardware GPU. Always says which adapter ran — a PASS is only meaningful for
-        // the GPU it actually tested.
         let adapter: Option<IDXGIAdapter> = match vendor {
             None => None,
             Some(want) => {
@@ -318,7 +300,6 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
             );
         }
 
-        // Source FP16 texture (initialized) + SRV.
         let src_desc = D3D11_TEXTURE2D_DESC {
             Width: W,
             Height: H,
@@ -349,7 +330,6 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
             .context("CreateShaderResourceView(fp16 src)")?;
         let src_srv = src_srv.context("null src srv")?;
 
-        // P010 destination texture (render-target bindable).
         let p010_desc = D3D11_TEXTURE2D_DESC {
             Width: W,
             Height: H,
@@ -375,7 +355,6 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
         let uv_rtv = HdrP010Converter::plane_rtv(&device, &p010, DXGI_FORMAT_R16G16_UNORM)?;
         conv.convert(&context, &src_srv, &y_rtv, &uv_rtv, W, H)?;
 
-        // Staging copy of the whole P010 texture (both planes), MAP_READ.
         let stage_desc = D3D11_TEXTURE2D_DESC {
             Width: W,
             Height: H,
@@ -402,15 +381,11 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
         context
             .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut map))
             .context("Map(P010 staging)")?;
-        let row_pitch = map.RowPitch as usize; // bytes per luma row (in 16-bit samples: /2)
+        let row_pitch = map.RowPitch as usize; // bytes per luma row
         let base = map.pData as *const u8;
-        // DIAGNOSTIC (the uncertain layout spot — verify on the box if chroma is wrong): the mapped
-        // P010 plane offsets. Plane 0 (luma): H rows of W u16. Plane 1 (chroma): H/2 rows of W/2
-        // *interleaved* (Cb,Cr) u16 pairs. P010 packs plane 1 after plane 0 at the SAME row pitch; the
-        // chroma plane begins at byte offset RowPitch * (luma height). For a STAGING texture that
-        // height is the created H (no inter-plane alignment). DepthPitch (total mapped size) lets us
-        // sanity-check: it should be ~ RowPitch * H * 3/2. If chroma reads garbage on the box, print
-        // these and adjust `chroma_base` (e.g. an aligned luma height).
+        // P010: plane 1 starts at RowPitch * luma height (same pitch, no extra
+        // alignment on a STAGING texture). DepthPitch is the whole surface;
+        // drivers omit the chroma offset, so RowPitch*H is the portable read.
         tracing::info!(
             row_pitch,
             depth_pitch = map.DepthPitch,
@@ -418,11 +393,6 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
             expected_total = row_pitch * H as usize * 3 / 2,
             "hdr-p010-selftest: mapped P010 layout (verify chroma plane offset here if chroma is wrong)"
         );
-        // Plane 0 (luma): H rows of W u16. Plane 1 (chroma): H/2 rows of W/2 *interleaved* (Cb,Cr)
-        // u16 pairs, i.e. W u16 per chroma row. P010 packs plane 1 immediately after plane 0 at the
-        // SAME row pitch; per spec the chroma plane begins at an allocation offset of
-        // RowPitch * Height (luma rows). We read it from there. (DepthPitch is the full surface size;
-        // not all drivers report the chroma offset, so RowPitch*Height is the portable choice.)
         let read_u16 = |byte_off: usize| -> u16 {
             // SAFETY: `base` is the mapped staging pointer; all offsets are within the P010 surface
             // (luma H*RowPitch + chroma (H/2)*RowPitch ≤ DepthPitch). Already in the fn's unsafe scope.
@@ -439,7 +409,7 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
         }
         let cw = W / 2;
         let ch = H / 2;
-        let chroma_base = row_pitch * H as usize; // plane 1 offset
+        let chroma_base = row_pitch * H as usize;
         let mut cb_codes = vec![0u16; (cw * ch) as usize];
         let mut cr_codes = vec![0u16; (cw * ch) as usize];
         for cy in 0..ch {
@@ -452,7 +422,6 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
         }
         context.Unmap(&staging, 0);
 
-        // Compare Y over every pixel.
         let mut max_y_err = 0.0f64;
         for y in 0..H {
             for x in 0..W {
@@ -462,7 +431,7 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
                 max_y_err = max_y_err.max((got - ry).abs());
             }
         }
-        // Compare Cb/Cr over flat blocks only (uniform 2x2 footprint → exact reference).
+        // Cb/Cr only on flat 2×2 footprints; a mixed block has no single reference.
         let mut max_u_err = 0.0f64;
         let mut max_v_err = 0.0f64;
         for cy in 0..ch {
@@ -482,7 +451,6 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
             }
         }
 
-        // Per-colour table.
         println!("HDR P010 self-test ({W}x{H}, BT.2020 PQ, 10-bit limited range)");
         println!(
             "  {:<10} {:>14} {:>14} {:>14}",
@@ -517,8 +485,7 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
     }
 }
 
-/// Minimal f32 → IEEE-754 half (f16) bit pattern, for uploading the FP16 scRGB self-test pattern. Not
-/// on any hot path; handles normals, subnormals, and the 1.0/0.0 constants we feed. (round-to-nearest)
+/// IEEE-754 binary16 bits for the FP16 upload. Round-to-nearest; normals and subnormals.
 #[cfg(target_os = "windows")]
 fn f32_to_f16(v: f32) -> u16 {
     let bits = v.to_bits();
@@ -526,14 +493,12 @@ fn f32_to_f16(v: f32) -> u16 {
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     let mant = bits & 0x007f_ffff;
     if exp <= 0 {
-        // Subnormal / zero in half precision.
         if exp < -10 {
             return sign; // too small → ±0
         }
         let mant = mant | 0x0080_0000; // implicit 1
         let shift = (14 - exp) as u32;
         let half_mant = (mant >> shift) as u16;
-        // Round to nearest.
         let round = ((mant >> (shift - 1)) & 1) as u16;
         sign | (half_mant + round)
     } else if exp >= 0x1f {
@@ -542,14 +507,8 @@ fn f32_to_f16(v: f32) -> u16 {
         let half_exp = (exp as u16) << 10;
         let half_mant = (mant >> 13) as u16;
         let round = ((mant >> 12) & 1) as u16;
-        // ADD, never OR. `half_mant + round` can carry out of the 10-bit mantissa (all ones, then
-        // rounded up), and that carry must INCREMENT the exponent — which is exactly what an
-        // IEEE-754 round-to-nearest overflow means. `sign | half_exp | (…)` instead ORed it into bit
-        // 10, so for every ODD biased exponent (bit 10 already set) the carry vanished and the
-        // result came back a factor of ~2 low: `f32_to_f16(1.9998779) → 0x3C00 = 1.0`,
-        // `0.49996948 → 0.25`. Only values one ULP below a power of two are affected — which is
-        // precisely what a gradient test pattern is full of, so this made `hdr-p010-selftest` FAIL a
-        // correct shader. The subnormal branch above was already additive.
+        // Add, never OR: a mantissa carry must increment the exponent. OR into
+        // bit 10 drops the carry on odd biased exponents (bit 10 already set).
         sign | (half_exp + half_mant + round)
     }
 }
@@ -558,28 +517,22 @@ fn f32_to_f16(v: f32) -> u16 {
 mod f16_tests {
     use super::f32_to_f16;
 
-    /// Round-trip through the reference conversion the rest of the test uses as an oracle.
+    /// Inverse of [`f32_to_f16`] for the round-trip oracle.
     fn f16_to_f32(h: u16) -> f32 {
         let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
         let exp = ((h >> 10) & 0x1f) as i32;
         let mant = (h & 0x3ff) as f32;
         match exp {
-            0 => sign * mant * 2f32.powi(-24), // subnormal
-            31 => sign * f32::INFINITY,        // our encoder never emits NaN
+            0 => sign * mant * 2f32.powi(-24),
+            31 => sign * f32::INFINITY, // encoder never emits NaN
             e => sign * (1.0 + mant / 1024.0) * 2f32.powi(e - 15),
         }
     }
 
-    /// W7: the rounding carry out of the mantissa must INCREMENT the exponent. The composition used
-    /// `sign | half_exp | (half_mant + round)`, which swallowed that carry for every odd biased
-    /// exponent — a silent factor-of-2 error on exactly the values a gradient test pattern is full
-    /// of, which made `hdr-p010-selftest` fail a correct shader.
     #[test]
     fn a_rounding_carry_increments_the_exponent() {
-        // The plan's canonical case: biased exponent 127 (2^0) with a mantissa that rounds up out
-        // of 10 bits ⇒ 2.0 = 0x4000, NOT 1.0 = 0x3C00.
+        // Biased exp 127 (2^0), mantissa rounds up out of 10 bits → 2.0 = 0x4000, not 1.0.
         assert_eq!(f32_to_f16(f32::from_bits((127 << 23) | 0x7FF000)), 0x4000);
-        // The two measured regressions, by value.
         assert_eq!(
             f32_to_f16(1.9998779),
             0x4000,
@@ -590,8 +543,7 @@ mod f16_tests {
             0x3800,
             "0.49996948 must not read as 0.25"
         );
-        // …and an EVEN biased exponent, where the bug happened to be invisible (bit 10 clear), so
-        // the fix must not change it.
+        // Even biased exponent (bit 10 clear): carry is visible either way; must stay 4.0.
         assert_eq!(f32_to_f16(f32::from_bits((128 << 23) | 0x7FF000)), 0x4400); // → 4.0
     }
 
@@ -606,8 +558,6 @@ mod f16_tests {
         assert_eq!(f32_to_f16(4.0), 0x4400);
     }
 
-    /// Every HDR scRGB value the self-test patterns use must survive the round trip to within one
-    /// f16 ULP — the property the P010 comparison actually depends on.
     #[test]
     fn hdr_scrgb_values_round_trip_within_one_ulp() {
         for &v in &[
@@ -615,7 +565,7 @@ mod f16_tests {
             3.999, 0.001,
         ] {
             let back = f16_to_f32(f32_to_f16(v));
-            // One ULP at this magnitude: f16 carries 11 significand bits.
+            // f16 has 11 significand bits: one ULP is |v|/1024 (subnormal floor 2^-24).
             let ulp = (v.abs() / 1024.0).max(2f32.powi(-24));
             assert!(
                 (back - v).abs() <= ulp,
@@ -636,10 +586,9 @@ mod f16_tests {
 
 #[cfg(test)]
 mod hdr_selftests {
-    /// LIVE (needs the GPU): [`super::hdr_p010_selftest_at`] at the field capture size — 1080 is
-    /// NOT 16-aligned, and the planar-RTV write path is driver-specific per vendor. Pinned to the
-    /// Intel adapter (`0x8086`), so it runs on the Intel validation boxes and errors out cleanly
-    /// ("no adapter") elsewhere. `cargo test -p pf-capture -- --ignored hdr_p010 --nocapture`.
+    /// GPU self-test at 1920×1080 (height not 16-aligned). Pinned to Intel
+    /// `0x8086`; missing adapter fails cleanly. Run with
+    /// `cargo test -p pf-capture -- --ignored hdr_p010 --nocapture`.
     #[test]
     #[ignore]
     fn hdr_p010_selftest_intel_1080_live() {

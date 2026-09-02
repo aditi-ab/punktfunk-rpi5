@@ -1,11 +1,10 @@
-//! Skia on the presenter's device: `DirectContext` over the shared handles, a ring of
-//! two offscreen render-target surfaces (the presenter runs one frame in flight and may
-//! still be sampling the previous image while we render the next), damage-driven
-//! redraws (content/size change only — an unchanged OSD costs zero GPU work per frame).
+//! Skia overlay on the presenter's device: `DirectContext` over the shared
+//! Vulkan handles, a two-slot offscreen ring (one frame in flight; the
+//! presenter may still sample the previous image), and damage-driven redraws.
 //!
-//! Two personas over one `Overlay`: the CONSOLE (the full shell — home, library,
-//! settings, pairing — always dirty, the aurora animates) and the stream chrome (stats
-//! OSD, capture hint, the auto-fading start banner).
+//! Two personas on one `Overlay`: the console shell (home, library, settings,
+//! pairing — always dirty; the aurora animates) and stream chrome (stats OSD,
+//! capture hint, auto-fading start banner).
 
 use crate::console::{Console, ConsoleEntry, ConsoleHandles};
 use crate::shell::{ConsoleOptions, Shell};
@@ -23,12 +22,11 @@ use skia_safe::gpu::{self, DirectContext, SurfaceOrigin};
 use skia_safe::{Canvas, Color4f, Font, FontMgr, Point, RRect, Rect, Surface};
 use std::time::Instant;
 
-/// How long the start-of-stream banner lingers (fading through the tail).
+/// Long enough to read the leave/stats chords; the last `BANNER_FADE_S` fade out.
 const BANNER_S: f64 = 6.0;
 const BANNER_FADE_S: f64 = 0.6;
 
-/// One offscreen target: the Skia surface + the raw Vulkan handles the presenter
-/// samples. The image is Skia-owned (freed with the surface); the view is ours.
+/// Offscreen target. Skia owns the image (freed with the surface); we own the view.
 struct Slot {
     surface: Surface,
     image: avk::Image,
@@ -37,78 +35,60 @@ struct Slot {
     height: u32,
 }
 
-/// What the current ring slot has drawn — re-render only when this changes.
+/// Damage key for the current ring slot — re-render only when this changes.
 #[derive(PartialEq, Clone, Default)]
 struct Drawn {
     width: u32,
     height: u32,
     stats: Option<String>,
     hint: Option<String>,
-    /// The access chip's text ("Controller only · ends in 1 h 58 m"). Its countdown moves
-    /// once a minute, which is exactly one damage redraw a minute — a steady chip costs
-    /// nothing per frame.
+    /// Chip text. Countdown ticks once a minute, so a still chip is free per frame.
     access: Option<String>,
-    /// The transient access toast (holds the hint pill's slot while up).
+    /// Access toast; occupies the hint pill's slot while up.
     notice: Option<String>,
-    /// The mic-mute badge is up. Part of the damage key like everything else here — the badge
-    /// is static once drawn, so a muted stream still re-renders nothing per frame.
     mic_muted: bool,
-    /// The UI scale this was drawn at, in percent — part of the damage key so dragging the window
-    /// to a differently-scaled monitor re-renders the chrome at the new size instead of keeping
-    /// the stale one (the text is identical, so nothing else here would notice).
+    /// UI scale in percent. Text is identical across monitors, so scale must live in the key.
     scale_pct: u16,
-    /// The start banner's alpha, quantized — a fade step is a redraw, steady is not.
+    /// Banner alpha, quantized: a fade step redraws, a steady alpha does not.
     banner_step: u8,
-    /// The resize scrim's spinner phase, quantized — a nonzero, ever-changing step while a
-    /// mid-stream resize is in flight forces the per-frame redraw the spinner needs; `0`
-    /// when no resize is showing (so a still stream stays damage-free).
+    /// Resize spinner phase, quantized. Nonzero while in flight (forces per-frame redraw); `0` idle.
     resize_step: u16,
-    /// The quick-action ring's drawing state folded into one number (`0` = closed); its
-    /// opening animation changes it every frame, a settled ring changes nothing.
+    /// Ring draw state (`0` = closed). Opening animates every frame; settled is free.
     ring: u64,
 }
 
-/// The stream chrome's base metrics, in pixels at 100 % scale (96 dpi). Everything here is
-/// multiplied by `FrameCtx::scale` before it is drawn: the overlay composites into the swapchain
-/// 1:1 in PHYSICAL pixels, so on a 4K panel at 200 % an unscaled 14 px OSD renders at half its
-/// intended physical size — legible on a 1080p monitor, a squint on a HiDPI laptop.
+/// Chrome metrics in px at 100 % (96 dpi). Multiply by `FrameCtx::scale`: the overlay
+/// is 1:1 in physical pixels, so an unscaled 14 px OSD is half-size on a 200 % panel.
 mod base {
-    /// The monospace OSD/hint/label size. Also the size the shared `Font` is built at, so the
-    /// scale factor below is exactly the multiplier applied to it.
+    /// OSD/hint size, and the size the shared `Font` is built at — scale is a multiplier on this.
     pub const FONT_PX: f32 = 14.0;
-    /// Top-left inset of the stats panel.
     pub const OSD_MARGIN: f32 = 12.0;
-    /// Stats-panel inner padding and corner radius.
     pub const OSD_PAD_X: f32 = 10.0;
     pub const OSD_PAD_Y: f32 = 8.0;
     pub const OSD_RADIUS: f32 = 8.0;
-    /// Hint/banner pill padding and its gap from the bottom edge.
     pub const PILL_PAD_X: f32 = 14.0;
     pub const PILL_PAD_Y: f32 = 8.0;
     pub const PILL_BOTTOM: f32 = 24.0;
 }
 
 pub struct SkiaOverlay {
-    /// Set by `init`; `None` until then (and after an init failure the run loop drops
-    /// the whole overlay, so mid-session these are always `Some`).
+    /// Set in `init`. After a failed init the run loop drops us, so mid-session this is `Some`.
     gpu: Option<Gpu>,
     slots: [Option<Slot>; 2],
-    /// Which slot the LAST returned frame lives in — the next render takes the other.
+    /// Slot of the last returned frame; the next render takes the other.
     current: usize,
     drawn: Drawn,
-    /// The stats OSD's monospace face (system-resolved; the console uses Geist).
+    /// Stats OSD face (system monospace; the console uses Geist).
     font: Option<Font>,
     fonts: Option<Fonts>,
-    /// The console shell (`--browse`) — `None` for a plain `--connect` session.
+    /// `--browse` shell. `None` for a plain `--connect` session.
     shell: Option<Shell>,
-    /// When the current stream started presenting — drives the start banner.
+    /// Stream start; drives the start banner.
     streaming_since: Option<Instant>,
-    /// The banner's words (set per stream from the active-pad state).
     banner_text: Option<String>,
-    /// When the current mid-stream resize scrim began showing — drives its spinner phase.
-    /// `None` = no resize in flight (`FrameCtx::resizing` was false last frame).
+    /// Resize-scrim start; spinner phase. `None` = `FrameCtx::resizing` was false last frame.
     resizing_since: Option<Instant>,
-    /// The in-stream quick-action ring (design/touch-client-overlay.md §2).
+    /// In-stream quick-action ring (`design/touch-client-overlay.md`).
     ring: crate::ring::Ring,
     ring_drawn_at: Option<Instant>,
 }
@@ -117,12 +97,11 @@ struct Gpu {
     device: ash::Device,
     queue_family_index: u32,
     context: DirectContext,
-    /// The device's shared queue lock (see `SharedDevice::queue_lock`): Skia submits
-    /// on the presenter's graphics queue, which FFmpeg's decode prep also uses from
-    /// the pump thread — every `flush*`/`submit` below holds this.
+    /// Shared queue lock (`SharedDevice::queue_lock`). Skia submits on the presenter's
+    /// graphics queue, which FFmpeg's decode prep also uses from the pump thread —
+    /// every `flush*`/`submit` below holds this.
     queue_lock: std::sync::Arc<pf_client_core::video::QueueLock>,
-    // Keep the loader library + instance dispatch alive as long as the DirectContext
-    // (its baked fn pointers live inside libvulkan).
+    // Loader + instance dispatch must outlive DirectContext (fn pointers live in libvulkan).
     _entry: ash::Entry,
     _instance: ash::Instance,
 }
@@ -146,8 +125,8 @@ impl SkiaOverlay {
         }
     }
 
-    /// The `--browse` overlay: the full console shell between streams, stream chrome
-    /// during them. Returns the binary's handles (models + command bus).
+    /// `--browse` overlay: full shell between streams, stream chrome during them.
+    /// Returns the binary's handles (models + command bus).
     pub fn console(
         opts: ConsoleOptions,
         entry: ConsoleEntry,
@@ -167,9 +146,8 @@ impl SkiaOverlay {
 }
 
 impl Drop for SkiaOverlay {
-    /// The run loop quiesces the queue before dropping us; releasing the views + Skia
-    /// surfaces (which free their VkImages) is then safe. Field order drops the slots
-    /// before the DirectContext.
+    /// The run loop quiesces the queue before drop. Views + Skia surfaces (which
+    /// free their VkImages) can then go. Field order drops slots before DirectContext.
     fn drop(&mut self) {
         if let Some(gpu) = &mut self.gpu {
             for slot in self.slots.iter_mut().flat_map(Option::take) {
@@ -187,10 +165,8 @@ impl Drop for SkiaOverlay {
 
 impl Overlay for SkiaOverlay {
     fn init(&mut self, shared: &SharedDevice) -> Result<()> {
-        // Skia resolves its Vulkan entry points through us: instance-scoped names via
-        // the loader, device-scoped via the device — the exact same dispatch ash uses.
-        // Resolution completes inside `make_vulkan` (the DirectContext bakes its fn
-        // table); the closure and its clones end with `init`.
+        // Skia resolves Vulkan entry points through us (same ash dispatch). The
+        // DirectContext bakes the table in `make_vulkan`; this closure dies with `init`.
         let entry = shared.entry.clone();
         let instance = shared.instance.clone();
         let get_proc = move |of: skvk::GetProcOf| -> *const std::ffi::c_void {
@@ -222,21 +198,10 @@ impl Overlay for SkiaOverlay {
                 shared.queue_family_index as usize,
             ),
             &get_proc,
-            // 🛑 MUST be the presenter's declared version, never `None`.
-            //
-            // `None` leaves Skia's `fMaxAPIVersion` at its `0` sentinel, which makes Skia fall
-            // back to `vkEnumerateInstanceVersion()` — the LOADER's ceiling, not ours. Those are
-            // not the same number: the presenter asks for 1.3, while a current Mesa loader answers
-            // 1.4 (1.4.321 on SteamOS 3.7). Skia then validates a 1.4 function table against an
-            // instance that only ever promised 1.3, `vkGetDeviceProcAddr` returns null for the
-            // entry points above 1.3, validation fails, and `make_vulkan` hands back `None` — so
-            // the console UI refuses to start and `--browse` dies with it.
-            //
-            // ⚠ The `0` sentinel was harmless at skia-safe 0.87 (that Skia knew nothing of 1.4, so
-            // clamping to the loader was a no-op) and the 0.99 migration preserved it as
-            // "byte-for-byte what `BackendContext::new` did" — true of the VALUE, false of the
-            // BEHAVIOUR. It shipped in 0.28.0 and took the Deck's launcher out. 0.99's own doc for
-            // this parameter says it should match `VkApplicationInfo::apiVersion`; this is that.
+            // Must be the presenter's declared version, never `None`.
+            // `None` leaves Skia's `fMaxAPIVersion` at 0, so Skia calls
+            // `vkEnumerateInstanceVersion()` (the loader's ceiling, not ours)
+            // and validates a newer table against a 1.3 instance.
             Some(skvk::Version::from(shared.api_version)),
         );
         // SAFETY: the instance/physical-device/device handles come from `shared`, which owns them
@@ -275,9 +240,8 @@ impl Overlay for SkiaOverlay {
     }
 
     fn handle_event(&mut self, event: &sdl3::event::Event) -> bool {
-        // Keyboard + text into the console while it's on screen — never for
-        // chord-modified keys (those stay the run loop's), never during a stream — except
-        // into the quick-action ring while it is up.
+        // Console keys/text only while visible. Chord-modified keys stay the
+        // run loop's. During a stream, only the open ring consumes keys.
         if !self.console_visible() {
             if let sdl3::event::Event::KeyDown {
                 scancode: Some(sc),
@@ -331,8 +295,7 @@ impl Overlay for SkiaOverlay {
         }
         if self.console_visible() {
             self.shell.as_mut().and_then(|s| {
-                // The presenter's menu_rx carries pad events only (its keyboard goes
-                // through `key`), so this seam IS the pad source note.
+                // menu_rx is pad-only (keyboard goes through `key`); this is the pad source.
                 s.note_input_source(crate::console::InputSource::Pad);
                 s.handle_menu(event)
             })
@@ -397,7 +360,7 @@ impl Overlay for SkiaOverlay {
 
     fn session_phase(&mut self, phase: SessionPhase) {
         let Some(shell) = &mut self.shell else { return };
-        // The start banner's clock is the overlay's own; everything else is the shell's.
+        // Banner clock is the overlay's; everything else is the shell's.
         match &phase {
             SessionPhase::Streaming => self.streaming_since = Some(Instant::now()),
             SessionPhase::Ended(_) | SessionPhase::Reconnecting(_) => self.streaming_since = None,
@@ -407,8 +370,7 @@ impl Overlay for SkiaOverlay {
     }
 
     fn frame(&mut self, ctx: &FrameCtx) -> Result<Option<OverlayFrame>> {
-        // The console: full-screen, opaque, and always dirty (the aurora animates
-        // every frame — the GPU port's whole point).
+        // Full-screen, opaque, always dirty — the aurora animates every frame.
         if self.console_visible() {
             let next = 1 - self.current;
             self.ensure_slot(next, ctx.width, ctx.height)?;
@@ -455,19 +417,17 @@ impl Overlay for SkiaOverlay {
             }));
         }
 
-        // --- Stream chrome: stats OSD + capture hint + start banner + resize scrim -----
         let banner_alpha = self.banner_alpha(ctx);
         let banner_step = (banner_alpha * 32.0).round() as u8;
         let resize_phase = self.resize_phase(ctx);
-        // 120 steps/s: every ~16 ms frame lands on a fresh step, so the spinner keeps
-        // spinning through the damage gate; `+ 1` keeps an active resize's step nonzero
-        // even on its first frame (phase 0) so the guard below doesn't skip it.
+        // 120 steps/s: a ~16 ms frame hits a new step, so the spinner passes
+        // the damage gate. `+ 1` keeps phase 0 nonzero so the first frame draws.
         let resize_step = resize_phase.map_or(0, |p| (p * 120.0) as u16 + 1);
         if let Some(facts) = ctx.ring {
             self.ring.set_facts(facts);
         }
         self.ring.tick();
-        // The ring's host actions ride the console's own bus, like the power rows do.
+        // Host actions ride the console command bus (same as the power rows).
         for cmd in self.ring.take_cmds() {
             if let Some(shell) = &self.shell {
                 shell.send_cmd(cmd);
@@ -486,8 +446,8 @@ impl Overlay for SkiaOverlay {
             self.drawn = Drawn::default(); // forget content so re-show re-renders
             return Ok(None);
         }
-        // 1 % granularity: fine enough that no real display scale is rounded into another, coarse
-        // enough that float noise on the same monitor can't churn the damage gate every frame.
+        // 1 %: fine enough that no real display scale rounds into another, coarse
+        // enough that float noise on the same monitor cannot churn the damage gate.
         let scale = ctx.scale.clamp(0.5, 4.0);
         let want = Drawn {
             width: ctx.width,
@@ -503,7 +463,6 @@ impl Overlay for SkiaOverlay {
             ring: ring_key,
         };
         if want == self.drawn {
-            // Unchanged — hand the presenter the already-rendered image.
             return Ok(self.slots[self.current].as_ref().map(|s| OverlayFrame {
                 image: s.image,
                 view: s.view,
@@ -512,8 +471,7 @@ impl Overlay for SkiaOverlay {
             }));
         }
 
-        // Render into the OTHER slot — the presenter may still be sampling the current
-        // one (one frame in flight; the ring of two is exactly deep enough).
+        // Other slot: the presenter may still be sampling this one (one frame in flight).
         let next = 1 - self.current;
         self.ensure_slot(next, ctx.width, ctx.height)?;
         let gpu = self.gpu.as_mut().expect("init ran");
@@ -521,38 +479,31 @@ impl Overlay for SkiaOverlay {
 
         let canvas = slot.surface.canvas();
         canvas.clear(Color4f::new(0.0, 0.0, 0.0, 0.0));
-        // Each drawer re-derives the face at its own (fit-clamped) size rather than the canvas
-        // being transformed: Skia hints and rasterizes glyphs at the requested size, so this
-        // stays crisp where a magnified 14 px bitmap would be mush. Only on a damage redraw —
-        // a steady stream re-renders nothing at all.
+        // Size the face per drawer, don't scale the canvas: Skia hints at the
+        // requested size. A magnified 14 px bitmap is mush.
         let font = self.font.as_ref().expect("init ran");
-        // The resize scrim sits UNDER the OSD/hint so those stay legible over it.
+        // Scrim under OSD/hint so those stay legible.
         if let Some(phase) = resize_phase {
             draw_resize_scrim(canvas, font, ctx.width, ctx.height, phase, scale);
         }
         if let Some(stats) = &want.stats {
             draw_osd_panel(canvas, font, stats, ctx.width, scale);
         }
-        // Top-RIGHT, so it never collides with the stats panel or the bottom pill: the badge
-        // has to stay readable at every stats tier, including Off.
+        // Top-right: never collides with the stats panel or the bottom pill, even at stats Off.
         if want.mic_muted {
             draw_mic_muted_badge(canvas, font, ctx.width, scale);
         }
-        // The access chip shares the top-right corner (same tier-independence argument as
-        // the badge — "what may this session do" must survive the stats overlay being
-        // Off), stacking under the badge when both are up.
+        // Same corner as the badge (must survive stats Off); stacks under it when both are up.
         if let Some(access) = &want.access {
             draw_access_chip(canvas, font, access, ctx.width, want.mic_muted, scale);
         }
-        // The access toast outranks the capture hint for its few seconds — an "Access
-        // ends in 1 m" must not lose the slot to "click to capture".
+        // Access toast outranks the capture hint for its few seconds.
         if let Some(notice) = &want.notice {
             draw_hint_pill(canvas, font, notice, ctx.width, ctx.height, 1.0, scale);
         } else if let Some(hint) = &want.hint {
             draw_hint_pill(canvas, font, hint, ctx.width, ctx.height, 1.0, scale);
         } else if banner_step > 0 {
-            // The start banner: the leave/stats shortcuts, fading out on its own —
-            // discoverable without the stats overlay, gone before it annoys.
+            // Leave/stats shortcuts, fading so they are discoverable without the OSD.
             if let Some(text) = &self.banner_text {
                 draw_hint_pill(
                     canvas,
@@ -566,9 +517,7 @@ impl Overlay for SkiaOverlay {
             }
         }
 
-        // The ring sits over everything else: it owns the glass while it is up. It needs the
-        // console's fonts, which a plain `--connect` session never loads — the ring is a
-        // console-shell feature.
+        // Ring on top. Needs console fonts, which `--connect` never loads.
         if ring_key != 0 {
             let dt = ring_dt(&mut self.ring_drawn_at);
             if let Some(fonts) = self.fonts.as_ref() {
@@ -577,9 +526,8 @@ impl Overlay for SkiaOverlay {
             }
         }
 
-        // Flush on the shared queue, ending in SHADER_READ_ONLY on our family — the
-        // layout the presenter's composite samples (its own barrier covers visibility).
-        // Lock: queue external sync vs FFmpeg's pump-thread submits (same queue).
+        // Flush on the shared queue, ending SHADER_READ_ONLY on our family
+        // (the layout the composite samples). Lock: vs FFmpeg's pump submits.
         {
             let _q = gpu.queue_lock.guard();
             gpu.context.flush_surface_with_texture_state(
@@ -605,8 +553,7 @@ impl Overlay for SkiaOverlay {
     }
 }
 
-/// Seconds since the ring last drew — its spring's clock. Capped so a paused loop does not
-/// snap the animation.
+/// Seconds since the ring last drew (spring clock). Cap so a paused loop does not snap.
 fn ring_dt(drawn_at: &mut Option<Instant>) -> f64 {
     let now = Instant::now();
     let dt = drawn_at
@@ -617,8 +564,8 @@ fn ring_dt(drawn_at: &mut Option<Instant>) -> f64 {
 }
 
 impl SkiaOverlay {
-    /// The start banner's current alpha (1 → 0 across the fade tail), refreshing its
-    /// words while fully visible so a pad hot-plug updates the leave hint.
+    /// Banner alpha 1→0 across the fade tail. Refresh the words while visible
+    /// so a pad hot-plug updates the leave hint.
     fn banner_alpha(&mut self, ctx: &FrameCtx) -> f64 {
         let Some(since) = self.streaming_since else {
             self.banner_text = None;
@@ -639,10 +586,9 @@ impl SkiaOverlay {
         ((BANNER_S - age) / BANNER_FADE_S).min(1.0)
     }
 
-    /// The mid-stream-resize spinner's phase (elapsed seconds since the scrim came up), or
-    /// `None` when no resize is in flight. Latches the start on the first `resizing` frame
-    /// and clears it the moment the run loop drops the flag (the target frame landed or the
-    /// switch timed out), so the next resize starts its spinner from zero.
+    /// Spinner phase (seconds since the scrim came up), or `None` if idle.
+    /// Latch on the first `resizing` frame; clear when the flag drops so the
+    /// next resize starts at zero.
     fn resize_phase(&mut self, ctx: &FrameCtx) -> Option<f64> {
         if !ctx.resizing {
             self.resizing_since = None;
@@ -656,7 +602,6 @@ impl SkiaOverlay {
         )
     }
 
-    /// Make `slots[i]` a render target of exactly `width`×`height` (rebuilt on resize).
     fn ensure_slot(&mut self, i: usize, width: u32, height: u32) -> Result<()> {
         if self.slots[i]
             .as_ref()
@@ -666,11 +611,9 @@ impl SkiaOverlay {
         }
         let gpu = self.gpu.as_mut().expect("init ran");
         if let Some(old) = self.slots[i].take() {
-            // Any in-flight sampling of THIS slot ended two presents ago (the ring
-            // alternates and the presenter waits its fence before each record).
-            // SAFETY: the view belongs to the slot being replaced, and per the comment above any
-            // in-flight sampling of THIS slot ended two presents ago — the ring alternates and the
-            // presenter waits its fence before each record — so the GPU is done with it.
+            // SAFETY: the view belongs to the slot being replaced. Sampling of this
+            // slot ended two presents ago (ring alternates; presenter waits its fence
+            // before each record), so the GPU is done with it.
             unsafe { gpu.device.destroy_image_view(old.view, None) };
         }
         let info =
@@ -725,10 +668,7 @@ impl SkiaOverlay {
     }
 }
 
-/// The chrome face at `scale`. `with_size` only fails on a nonsensical size (the caller clamps),
-/// in which case the unscaled face is still better than no text.
-/// SDL scancode → the console's own [`Key`](crate::input::Key). `None` = a key the console
-/// has no use for, which the run loop keeps for itself.
+/// SDL scancode → [`Key`](crate::input::Key). `None` = unused; the run loop keeps it.
 fn key_of(sc: sdl3::keyboard::Scancode) -> Option<crate::input::Key> {
     use crate::input::Key as K;
     use sdl3::keyboard::Scancode as S;
@@ -750,16 +690,16 @@ fn key_of(sc: sdl3::keyboard::Scancode) -> Option<crate::input::Key> {
     })
 }
 
+/// Chrome face at `scale`. `with_size` fails only on a nonsensical size (caller clamps);
+/// the unscaled face is still better than no text.
 fn chrome_font(font: &Font, scale: f32) -> Font {
     font.with_size(base::FONT_PX * scale)
         .unwrap_or_else(|| font.clone())
 }
 
-/// Shrink `scale` until a box of `width_at_scale` (which must be linear in the scale — every
-/// chrome metric is) fits in `budget`. Scaling text up by the display's DPI is only an
-/// improvement while the result still fits the window: the capture hint is a ~150-character line
-/// that already spans most of a 1280 px window at 100 %, so at 200 % it would run off both edges
-/// and lose its ends. Fitting keeps it whole, just smaller than the nominal scale.
+/// Shrink `scale` until `width_at_scale` (linear in scale) fits `budget`. DPI-up
+/// is only an improvement while the result still fits: the capture hint is ~150
+/// chars and already fills a 1280 px window at 100 %.
 fn fit_scale(scale: f32, width_at_scale: f32, budget: f32) -> f32 {
     if width_at_scale > budget && width_at_scale > 0.0 {
         (scale * budget / width_at_scale).max(0.1)
@@ -768,13 +708,10 @@ fn fit_scale(scale: f32, width_at_scale: f32, budget: f32) -> f32 {
     }
 }
 
-/// The stats OSD: a translucent rounded panel in the top-left, one text line per `\n` (the GTK
-/// OSD's look, minus the toolkit), sized for the display's UI `scale`.
+/// Stats OSD: translucent rounded panel, top-left, one line per `\n`, at UI `scale`.
 fn draw_osd_panel(canvas: &Canvas, base_font: &Font, text: &str, width: u32, scale: f32) {
     let lines: Vec<&str> = text.lines().collect();
-    // Panel width is linear in the scale, so measuring once at the requested scale is enough to
-    // solve for the scale that keeps the Detailed tier's long lines inside the window instead of
-    // running them past the right edge on a HiDPI display.
+    // Width is linear in scale; measure once, then fit so Detailed-tier lines stay in-window.
     let width_at = |s: f32| {
         let font = chrome_font(base_font, s);
         let widest = lines
@@ -816,18 +753,12 @@ fn draw_osd_panel(canvas: &Canvas, base_font: &Font, text: &str, width: u32, sca
     }
 }
 
-/// The mic-mute badge: a dot in the error colour plus the words, on the same translucent pill
-/// as the rest of the chrome, pinned to the TOP-RIGHT corner.
-///
-/// It is drawn from `FrameCtx::mic_muted` alone — not from the stats text — because it must
-/// survive the stats overlay being Off, which is where most people leave it. Words, not a
-/// glyph: the chrome font is a system monospace resolved at runtime and cannot be relied on to
-/// carry a crossed-out microphone. Persistent by design (no fade): a fading indicator answers
-/// "did the chord register?" but not "am I muted right now?", and the second question is the
-/// one that matters ten minutes later.
+/// Mic-mute badge (error-colour dot + words), top-right. From `mic_muted`, not
+/// the stats text, so it survives stats Off. Words: the runtime monospace may
+/// not ship a mute glyph. Persistent so mute state stays visible.
 fn draw_mic_muted_badge(canvas: &Canvas, base_font: &Font, width: u32, scale: f32) {
     const LABEL: &str = "Microphone muted";
-    // Short line — it fits any window the stream runs in, so it takes the display scale as-is.
+    // Short; it fits any stream window, so take the display scale as-is.
     let font = &chrome_font(base_font, scale);
     let (_, metrics) = font.metrics();
     let line_h = metrics.descent - metrics.ascent;
@@ -859,15 +790,10 @@ fn draw_mic_muted_badge(canvas: &Canvas, base_font: &Font, width: u32, scale: f3
     );
 }
 
-/// The access chip (per-client access §7 "say what this session is"): the session's
-/// derived preset label and its countdown — "Controller only · ends in 1 h 58 m" — on the
-/// same translucent pill as the rest of the chrome, pinned to the TOP-RIGHT corner and
-/// stacked under the mic badge when both are up.
-///
-/// Standing by design, like the badge and unlike the toasts: "why does my keyboard do
-/// nothing" and "when does my access end" must be answerable ten minutes in, at every
-/// stats tier including Off. Never drawn for a full-control permanent session — the run
-/// loop passes `None` and today's default look stays untouched.
+/// Access chip: preset label + countdown, top-right, stacked under the mic
+/// badge when both are up. Standing, like the badge: must stay readable at
+/// every stats tier including Off. Omitted for a full-control permanent session
+/// (`None` from the run loop).
 fn draw_access_chip(
     canvas: &Canvas,
     base_font: &Font,
@@ -876,7 +802,6 @@ fn draw_access_chip(
     below_badge: bool,
     scale: f32,
 ) {
-    // Short line (label + countdown) — fits any window the stream runs in.
     let font = &chrome_font(base_font, scale);
     let (_, metrics) = font.metrics();
     let line_h = metrics.descent - metrics.ascent;
@@ -885,8 +810,8 @@ fn draw_access_chip(
     let w = text_w + 2.0 * pad_x;
     let h = line_h + 2.0 * pad_y;
     let margin = base::OSD_MARGIN * scale;
-    // One row down when the mic badge holds the corner (its height is the same formula,
-    // sans dot — the dot fits inside the shared line height).
+    // One row down when the mic badge holds the corner (same height formula; the
+    // dot fits inside the shared line height).
     let y = margin + if below_badge { h + 8.0 * scale } else { 0.0 };
     let x = width as f32 - w - margin;
     canvas.draw_rrect(
@@ -901,12 +826,9 @@ fn draw_access_chip(
     );
 }
 
-/// The mid-stream-resize cover: a full-screen dark scrim, the shared rotating spinner, and
-/// a "Resizing…" label centered over it — so the host's 0.3–2 s virtual-display + encoder
-/// rebuild reads as a deliberate pause rather than the stream stretching to the changed
-/// window. This is the presenter's analog of the Apple client's blur overlay: the overlay
-/// composites its own RGBA quad and cannot sample the video to blur it, so an opaque scrim
-/// hides the stretched in-between frame instead (same intent, one draw).
+/// Mid-stream resize cover: full-screen scrim + spinner + "Resizing…". The overlay
+/// cannot sample the video to blur it, so an opaque scrim hides the stretched
+/// in-between frame instead.
 fn draw_resize_scrim(
     canvas: &Canvas,
     base_font: &Font,
@@ -915,14 +837,12 @@ fn draw_resize_scrim(
     phase: f64,
     scale: f32,
 ) {
-    // Short, centered label — it always fits, so it just takes the display scale as-is.
     let font = &chrome_font(base_font, scale);
     let (wf, hf) = (width as f32, height as f32);
     canvas.draw_rect(
         Rect::from_wh(wf, hf),
         &fill(Color4f::new(0.0, 0.0, 0.0, 0.55)),
     );
-    // Spinner slightly above center; the label sits below it.
     let (cx, cy) = (f64::from(width) / 2.0, f64::from(height) / 2.0);
     let r = (f64::from(width.min(height)) * 0.045).clamp(16.0, 44.0);
     crate::theme::spinner(canvas, cx, cy - r, r, phase);
@@ -937,8 +857,8 @@ fn draw_resize_scrim(
     );
 }
 
-/// The capture hint / start banner: a centered pill near the bottom edge. `scale` = the display's
-/// UI scale (the text size already rides in `font`).
+/// Capture hint / start banner: centered pill near the bottom. `scale` is the
+/// display UI scale (size already rides in `font`).
 fn draw_hint_pill(
     canvas: &Canvas,
     base_font: &Font,
@@ -948,9 +868,8 @@ fn draw_hint_pill(
     alpha: f32,
     scale: f32,
 ) {
-    // The capture hint is one long line that already fills most of a 1280 px window at 100 %;
-    // scaled by a 2× display it would overrun both edges, so fit it to the window (a 4 % gutter
-    // keeps it off the very edge).
+    // Capture hint already fills most of a 1280 px window at 100 %; fit to the
+    // window (4 % gutter) so 2× scale does not overrun both edges.
     let pill_w =
         |s: f32| chrome_font(base_font, s).measure_str(text, None).0 + 2.0 * base::PILL_PAD_X * s;
     let scale = fit_scale(scale, pill_w(scale), width as f32 * 0.96);

@@ -1,13 +1,13 @@
-//! `ext-data-control-v1` clipboard backend (`design/clipboard-and-file-transfer.md` §4.1).
+//! `ext-data-control-v1` clipboard backend (`design/clipboard-and-file-transfer.md`).
 //!
-//! A dedicated thread owns the `wayland-client` [`EventQueue`] and runs a poll loop that dispatches
-//! selection + paste events, emitting them over a channel. Everything else — installing a lazy
-//! source (a client's offer) and `receive()`-ing the host selection (a client's fetch) — is issued
-//! from the session thread on the shared, `Send + Sync` proxy handles; only *dispatch* is
-//! single-threaded (per the wayland-client contract). Templated on `inject/linux/wlr.rs`.
+//! A dedicated thread owns the `wayland-client` [`EventQueue`] and dispatches
+//! selection + paste events onto a channel. Installing a lazy source and
+//! `receive()`-ing the host selection happen on the session thread via shared
+//! `Send + Sync` proxies; only dispatch is single-threaded (wayland-client
+//! contract).
 //!
-//! The `zwlr-data-control-unstable-v1` fallback for older wlroots/KWin is a mechanical parallel of
-//! this file (the protocols are 1:1) — a follow-up.
+//! `open` binds the session's `WAYLAND_DISPLAY` (env already applied by
+//! `vdisplay::apply_session_env`). Missing protocol is `BackendUnavailable`.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -29,29 +29,24 @@ use wayland_protocols::ext::data_control::v1::client::{
 
 use super::{ClipEvent, PasteResponder};
 
-/// Upper bound on bytes read from one `receive()` transfer (matches the wire clipboard cap, §7) so a
-/// hostile host app can't stream unboundedly into our buffer.
+/// 64 MiB, matching the wire clipboard cap. `read_to_end` would otherwise grow with the pipe.
 const CLIP_READ_CAP: u64 = 64 << 20;
 
-/// The current host selection, shared between the dispatch thread (writer) and the session thread
-/// (reader, for `receive()`).
+/// Dispatch thread writes; session thread reads for `receive()`.
 struct CurrentSelection {
     offer: ExtDataControlOfferV1,
-    /// Raw Wayland MIMEs the offer advertises (what `receive()` accepts).
     mimes: Vec<String>,
 }
 
-/// Dispatch-thread state. Also collects the manager + seat during the bind roundtrip.
+/// Bind roundtrip fills `mgr` + `seat` before the loop starts.
 struct State {
     mgr: Option<ExtDataControlManagerV1>,
     seat: Option<WlSeat>,
-    /// Offers accumulating their MIME list before the `selection` event promotes one.
+    /// MIME lists land here; `selection` promotes one.
     pending: HashMap<ObjectId, Vec<String>>,
     current: Arc<Mutex<Option<CurrentSelection>>>,
-    /// Pending count of our own `set_selection`s whose `selection` echo must be dropped rather than
-    /// announced back to the client (loop prevention, §3.4). Bumped by the session before each set;
-    /// each of our sets produces exactly one echo on wlroots/KWin, so one decrement per echo pairs
-    /// them up — a counter (not a bool) keeps rapid back-to-back offers from leaking a self-echo.
+    /// Own `set_selection` echoes still to drop. Session bumps; dispatch is the only decrementer.
+    /// A counter, not a bool: back-to-back offers would leak a self-echo through a flag.
     suppress_echoes: Arc<AtomicU32>,
     tx: tokio::sync::mpsc::UnboundedSender<ClipEvent>,
 }
@@ -119,14 +114,11 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for State {
     ) {
         use ext_data_control_device_v1::Event;
         match event {
-            // A new offer is being introduced; its `offer` events follow before `selection`.
             Event::DataOffer { id } => {
                 state.pending.insert(id.id(), Vec::new());
             }
-            // The active selection changed. `Some` = a new clipboard; `None` = cleared.
             Event::Selection { id } => {
-                // Consume one pending self-echo if any (atomic vs. the session thread's bumps; the
-                // dispatch thread is the only decrementer). `Ok` = there was one → suppress.
+                // `Ok` = a pending self-echo; drop it. Dispatch is the only decrementer.
                 let suppressed = state
                     .suppress_echoes
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| c.checked_sub(1))
@@ -135,8 +127,6 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for State {
                     Some(offer) => {
                         let mimes = state.pending.remove(&offer.id()).unwrap_or_default();
                         if suppressed {
-                            // Our own source's echo — don't store it as the host clipboard and
-                            // don't announce it back to the client.
                             return;
                         }
                         let wire = super::offer_wire_mimes(&mimes)
@@ -157,7 +147,7 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for State {
             Event::Finished => {
                 let _ = state.tx.send(ClipEvent::Closed);
             }
-            // Primary selection is out of scope for the shared clipboard.
+            // Primary selection is out of scope.
             _ => {}
         }
     }
@@ -195,7 +185,6 @@ impl Dispatch<ExtDataControlSourceV1, ()> for State {
     ) {
         use ext_data_control_source_v1::Event;
         match event {
-            // A host app pasted our (the client's) offered data.
             Event::Send { mime_type, fd } => match super::wayland_to_wire(&mime_type) {
                 Some(wire) => {
                     let _ = state.tx.send(ClipEvent::Paste {
@@ -203,17 +192,15 @@ impl Dispatch<ExtDataControlSourceV1, ()> for State {
                         responder: PasteResponder::Fd(fd),
                     });
                 }
-                // We can't satisfy this format — closing the fd yields an empty paste.
+                // Unknown MIME: closing the fd is an empty paste, not a hang.
                 None => drop(fd),
             },
-            // Our source was superseded (a host app or another client set a new selection).
             Event::Cancelled => {}
             _ => {}
         }
     }
 }
 
-/// The host clipboard backend handle used by the session thread.
 pub struct ClipboardBackend {
     conn: Connection,
     mgr: ExtDataControlManagerV1,
@@ -227,10 +214,8 @@ pub struct ClipboardBackend {
 }
 
 impl ClipboardBackend {
-    /// Connect to the active session's Wayland display (env already applied by
-    /// `vdisplay::apply_session_env`), bind `ext_data_control`, and start the dispatch thread.
-    /// Returns the handle plus the event stream. Errors if the compositor lacks the protocol
-    /// (caller reports `BackendUnavailable`).
+    /// Session env must already be applied (`vdisplay::apply_session_env`).
+    /// Missing protocol: caller reports `BackendUnavailable`.
     pub fn open() -> Result<(
         ClipboardBackend,
         tokio::sync::mpsc::UnboundedReceiver<ClipEvent>,
@@ -265,8 +250,7 @@ impl ClipboardBackend {
             .clone()
             .context("compositor advertised no wl_seat")?;
         let device = mgr.get_data_device(&seat, &qh, ());
-        // Second roundtrip: the compositor sends the initial selection for the freshly-bound device
-        // (the current host clipboard), which the session announces to the client.
+        // Device bind delivers the current selection; the session announces it.
         queue
             .roundtrip(&mut state)
             .context("Wayland get_data_device roundtrip")?;
@@ -297,8 +281,7 @@ impl ClipboardBackend {
         ))
     }
 
-    /// Install a lazy source advertising a client's offered formats (wire MIMEs) as the host
-    /// selection. A later host-app paste fires a [`ClipEvent::Paste`]. Replaces any previous offer.
+    /// Bytes stay with the client until a host paste emits [`ClipEvent::Paste`].
     pub fn set_offer(&self, wire_mimes: &[String]) -> Result<()> {
         let wl_mimes = super::wayland_offers_for(wire_mimes);
         if wl_mimes.is_empty() {
@@ -308,7 +291,6 @@ impl ClipboardBackend {
         for m in &wl_mimes {
             src.offer(m.clone());
         }
-        // Suppress the selection echo our own set triggers (loop prevention).
         self.suppress_echoes.fetch_add(1, Ordering::SeqCst);
         self.device.set_selection(Some(&src));
         self.conn.flush().context("flush set_selection")?;
@@ -320,7 +302,6 @@ impl ClipboardBackend {
         Ok(())
     }
 
-    /// Drop the host selection we own (client disabled sync / offered nothing).
     pub fn clear_offer(&self) -> Result<()> {
         let mut slot = self.active_source.lock().unwrap();
         if let Some(old) = slot.take() {
@@ -332,8 +313,6 @@ impl ClipboardBackend {
         Ok(())
     }
 
-    /// The current host selection's wire MIMEs (what a client offer announcement would carry), or
-    /// empty if the clipboard is empty. Used to answer an immediate query.
     pub fn current_wire_mimes(&self) -> Vec<String> {
         match self.current.lock().unwrap().as_ref() {
             Some(sel) => super::offer_wire_mimes(&sel.mimes)
@@ -344,9 +323,7 @@ impl ClipboardBackend {
         }
     }
 
-    /// Read one format (`wire_mime`) of the current host selection into a byte vector — a client's
-    /// lazy fetch. BLOCKS on the pipe until the source app finishes, so call from a blocking
-    /// context (e.g. `spawn_blocking`). Errors if there is no selection or the format isn't offered.
+    /// Blocks on the pipe until the source finishes; call from `spawn_blocking`.
     pub fn read_current(&self, wire_mime: &str) -> Result<Vec<u8>> {
         let (offer, wl_mime) = {
             let cur = self.current.lock().unwrap();
@@ -358,11 +335,10 @@ impl ClipboardBackend {
         let (read_fd, write_fd) = make_pipe()?;
         offer.receive(wl_mime, write_fd.as_fd());
         self.conn.flush().context("flush receive")?;
-        // Close our write end so the pipe reaches EOF once the source app closes its dup.
+        // Drop our write end so the pipe EOFs when the source closes its dup.
         drop(write_fd);
         let mut buf = Vec::new();
-        // `read_fd` is a fresh, uniquely-owned pipe read end; `File` takes sole ownership and closes
-        // it on drop.
+        // Unique pipe read end; `File` owns it and closes on drop.
         let file = std::fs::File::from(read_fd);
         file.take(CLIP_READ_CAP)
             .read_to_end(&mut buf)
@@ -380,8 +356,7 @@ impl Drop for ClipboardBackend {
     }
 }
 
-/// The dispatch thread: poll the Wayland socket with a short timeout so `stop` is honored promptly,
-/// dispatching selection/paste events into `state`.
+/// Poll the Wayland socket (200 ms) so `stop` is seen promptly.
 fn dispatch_loop(
     conn: Connection,
     mut queue: wayland_client::EventQueue<State>,
@@ -396,7 +371,7 @@ fn dispatch_loop(
             break;
         }
         let Some(guard) = conn.prepare_read() else {
-            // Events are already queued; loop to dispatch them.
+            // `prepare_read` lost the race; dispatch the already-queued events.
             continue;
         };
         let raw_fd = guard.connection_fd().as_raw_fd();
@@ -431,7 +406,6 @@ fn dispatch_loop(
     let _ = state.tx.send(ClipEvent::Closed);
 }
 
-/// Create a `pipe2(O_CLOEXEC)`, returning `(read_end, write_end)` as owned fds.
 fn make_pipe() -> Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe2` fully initializes the 2-element `fds` on success (returns 0); on failure (-1)
@@ -447,16 +421,14 @@ fn make_pipe() -> Result<(OwnedFd, OwnedFd)> {
     Ok((read_fd, write_fd))
 }
 
-/// On-glass tests against a **live** `data-control` compositor (Hyprland / Sway / KWin). `#[ignore]`d
-/// — run explicitly under such a session with `wl-clipboard` present:
+/// Ignored live tests. Needs `wl-clipboard` and a `data-control` compositor.
 ///
 /// ```text
 /// WAYLAND_DISPLAY=wayland-1 cargo test -p punktfunk-host --bin punktfunk-host \
 ///     -- --ignored --nocapture clipboard::wayland::live
 /// ```
 ///
-/// Each test skips (does not fail) when `open()` finds no backend — so `--ignored` on GNOME (no
-/// data-control) or a headless CI runner is a clean no-op instead of a false failure.
+/// `open()` missing a backend skips; `--ignored` on a headless runner is a no-op.
 #[cfg(test)]
 mod live {
     use super::*;
@@ -464,7 +436,7 @@ mod live {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    /// Poll the event channel (sync `try_recv`, no runtime) until `pred` matches or `timeout`.
+    /// Sync `try_recv` until `pred` or `timeout`. No tokio runtime on this thread.
     fn wait_event(
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<ClipEvent>,
         timeout: Duration,
@@ -486,7 +458,7 @@ mod live {
         }
     }
 
-    /// Set the compositor selection from a "host app" (`wl-copy`, which forks a server that holds it).
+    /// `wl-copy` forks a server that holds the selection; the child we wait on is the parent.
     fn wl_copy(bytes: &[u8], mime: &str) {
         let mut child = Command::new("wl-copy")
             .arg("--type")
@@ -521,8 +493,6 @@ mod live {
         }
     }
 
-    /// Host copy → we observe a `Selection` and can `read_current` the exact bytes back — both text
-    /// and PNG (§3.5 format normalization end to end).
     #[test]
     #[ignore = "needs a live data-control compositor (WAYLAND_DISPLAY)"]
     fn live_host_copy_is_readable() {
@@ -530,7 +500,6 @@ mod live {
             return;
         };
 
-        // Text.
         wl_copy(b"hello-from-host-app", "text/plain;charset=utf-8");
         let ev = wait_event(&mut rx, Duration::from_secs(3), |e| {
             matches!(e, ClipEvent::Selection { mimes } if mimes.iter().any(|m| m == super::super::WIRE_TEXT))
@@ -542,7 +511,7 @@ mod live {
             b"hello-from-host-app"
         );
 
-        // PNG (arbitrary bytes tagged image/png — data-control is format-agnostic).
+        // Tagged `image/png`; the bytes need not be a valid PNG.
         let png = b"\x89PNG\r\n\x1a\n-fake-but-tagged-image/png";
         wl_copy(png, "image/png");
         wait_event(&mut rx, Duration::from_secs(3), |e| {
@@ -552,8 +521,6 @@ mod live {
         assert_eq!(backend.read_current(super::super::WIRE_PNG).unwrap(), png);
     }
 
-    /// We install a client's offer as the host selection; a host app (`wl-paste`) pasting it fires a
-    /// `Paste` event that we fulfill with bytes, and the host app receives exactly those bytes.
     #[test]
     #[ignore = "needs a live data-control compositor (WAYLAND_DISPLAY)"]
     fn live_set_offer_is_pasteable() {
@@ -565,7 +532,6 @@ mod live {
             .set_offer(&[super::super::WIRE_TEXT.to_string()])
             .expect("install offer");
 
-        // A host app pastes our offered selection.
         let child = Command::new("wl-paste")
             .arg("-n")
             .stdout(Stdio::piped())

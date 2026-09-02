@@ -1,33 +1,30 @@
-//! `/api/v1/update/*` — the host update-check surface (design
-//! `host-update-from-web-console.md` §4.2, phase U0).
+//! `/api/v1/update/*` — host update-check and apply.
 //!
-//! Admin lane ONLY: denied to the plugin token (`auth::plugin_may_access`) and absent from
-//! the paired-cert allowlist — an update trigger is operator business. U0 exposes `status` +
-//! `check`; the `apply` route arrives with the first apply leg (U1) so the API never
-//! advertises a capability no code backs.
+//! Admin lane only: denied to the plugin token (`auth::plugin_may_access`) and
+//! absent from the paired-cert allowlist. An update trigger is operator business.
+//!
+//! Pin the wire types at [`UpdateStatus`]. Evidence:
+//! `design/host-update-from-web-console.md`.
 
 use super::shared::*;
 use crate::update::{self, detect};
 
-/// One channel's manifest facts, as much as the console renders.
 #[derive(Serialize, Deserialize, ToSchema)]
 pub(crate) struct UpdateManifestInfo {
-    /// The released version this manifest announces.
     pub version: String,
-    /// Publish serial (unix seconds) — monotonic per channel.
+    /// Unix seconds; monotonic per channel.
     pub serial: u64,
-    /// RFC-3339 publish time (display only).
+    /// RFC-3339; display only, never compared.
     pub published_at: String,
-    /// Release-notes link (pinned to our forge by the manifest validator).
+    /// Forge-pinned by the manifest validator.
     pub notes_url: String,
-    /// The last verified manifest is suspiciously old (>45 days) — the freeze/stale hint.
+    /// Last verified manifest older than 45 days.
     pub stale: bool,
 }
 
-/// A running apply job (or a spawned installer that hasn't resolved yet).
+/// In-process apply, or a leftover installer that has not resolved yet.
 #[derive(Serialize, Deserialize, ToSchema)]
 pub(crate) struct UpdateJobInfo {
-    /// The version being installed.
     pub target_version: String,
     /// `downloading` | `verifying` | `applying` | `restarting`.
     pub stage: String,
@@ -37,66 +34,56 @@ pub(crate) struct UpdateJobInfo {
     pub started_unix: u64,
 }
 
-/// Durable outcome of the most recent apply attempt (survives the host's own restart).
+/// Last apply outcome. Survives the host's own restart.
 #[derive(Serialize, Deserialize, ToSchema)]
 pub(crate) struct UpdateResultInfo {
     pub ok: bool,
     pub from: String,
     pub to: String,
     pub finished_unix: u64,
-    /// The stage that failed; absent on success.
+    /// Failed stage; absent on success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// The installer's own log file on this host, for diagnosis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_path: Option<String>,
-    /// Applied but activates on the next reboot (rpm-ostree).
+    /// Applied; activates on the next reboot (rpm-ostree).
     #[serde(default)]
     pub staged: bool,
 }
 
-/// The full update-check state for this host.
 #[derive(Serialize, Deserialize, ToSchema)]
 pub(crate) struct UpdateStatus {
-    /// How this host was installed: `windows-installer` | `sysext` | `rpm-ostree` | `apt` |
-    /// `dnf` | `pacman` | `steamos-source` | `nix` | `source`.
+    /// `windows-installer` | `sysext` | `rpm-ostree` | `apt` | `dnf` | `pacman` |
+    /// `steamos-source` | `nix` | `source`.
     pub install_kind: String,
-    /// Release channel this install follows: `stable` | `canary`.
+    /// `stable` | `canary`.
     pub channel: String,
-    /// The running host version.
     pub current_version: String,
-    /// What the console may offer for this install: `notify` (show the command) — later
-    /// phases add `full` (one-click apply) and `staged` (apply + reboot to finish).
+    /// `notify` (show the command) | `full` (one-click) | `staged` (apply + reboot).
     pub apply: String,
-    /// The copy-pastable update command for this install kind.
+    /// Copy-paste update command for this install kind.
     pub channel_hint: String,
-    /// Update checks are disabled on this host (`PUNKTFUNK_UPDATE_CHECK=0`).
+    /// `PUNKTFUNK_UPDATE_CHECK=0`.
     pub check_disabled: bool,
-    /// A newer release than `current_version` exists for this channel (definitive
-    /// comparisons only — an unparseable version pair never flags).
+    /// Newer than `current_version` on this channel. Unparseable pairs never flag.
     pub available: bool,
-    /// The last verified manifest, if any check has succeeded.
     pub manifest: Option<UpdateManifestInfo>,
-    /// When the last successful check happened (unix seconds).
+    /// Last successful check (unix seconds).
     pub last_checked_unix: Option<u64>,
-    /// Why the last check failed, verbatim, if it did.
+    /// Last check failure, verbatim.
     pub last_error: Option<String>,
-    /// The check reached the feed and found this channel has **no release published yet** —
-    /// an expected state (a channel nobody has announced to answers with a 404), not a
-    /// failure. Mutually exclusive with `last_error`, so a UI can say "nothing published yet"
-    /// instead of painting an empty feed as a broken host. Never set once a manifest has been
-    /// seen for this channel: a feed that loses a document it used to serve stays an error.
+    /// Feed 404 for this channel: nothing published yet, not a check failure.
+    /// Mutually exclusive with `last_error`. Never set once a manifest has been
+    /// seen — a feed that then 404s is an error.
     pub not_published: bool,
-    /// This install could one-click apply, but the operator hasn't opted in yet — the
-    /// command to run (Linux: join the `punktfunk-update` group).
+    /// One-click apply is possible but not opted in — command to run
+    /// (Linux: join `punktfunk-update`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opt_in_hint: Option<String>,
-    /// The apply in flight, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<UpdateJobInfo>,
-    /// Outcome of the most recent apply attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_result: Option<UpdateResultInfo>,
 }
@@ -110,8 +97,8 @@ fn status_from(snap: update::Snapshot) -> UpdateStatus {
         .as_ref()
         .map(|c| detect::is_newer(&c.manifest.version, c.manifest.ci_run, current, channel))
         .unwrap_or(false);
-    // A spawned installer that hasn't resolved shows as a `restarting` job even though the
-    // in-process job died with the previous host (the console poller needs continuity here).
+    // Leftover installer intent still shows as `restarting` so the console
+    // poller does not see a gap after the previous host died.
     let job = snap
         .job
         .as_ref()
@@ -164,11 +151,10 @@ fn status_from(snap: update::Snapshot) -> UpdateStatus {
     }
 }
 
-/// Update-check status
+/// Cached update-check state.
 ///
-/// How this host was installed, which channel it follows, whether a newer release is known,
-/// and how to update. Reading this may kick a background refresh when the cached check is
-/// older than 6 h; the response never blocks on the network.
+/// A cache older than 6 h may kick a background refresh. The response never
+/// blocks on the network.
 #[utoipa::path(
     get,
     path = "/update/status",
@@ -183,10 +169,10 @@ pub(crate) async fn get_update_status() -> Json<UpdateStatus> {
     Json(status_from(update::snapshot_and_maybe_refresh()))
 }
 
-/// Check for updates now
+/// Force a manifest fetch and verification.
 ///
-/// Forces a manifest fetch + verification and returns the refreshed state. Rate-limited to
-/// one forced check per 30 s.
+/// One forced check per 30 s. `last_error` is a failed check; `not_published`
+/// is an empty channel, not a failure.
 #[utoipa::path(
     post,
     path = "/update/check",
@@ -215,18 +201,15 @@ pub(crate) async fn force_update_check() -> Response {
 
 #[derive(Default, Deserialize, ToSchema)]
 pub(crate) struct ApplyRequest {
-    /// Proceed even while a streaming session is live (the stream will drop when the host
-    /// restarts — the console warns before sending this).
+    /// Apply even with a live stream (the stream drops when the host restarts).
     #[serde(default)]
     pub force: bool,
 }
 
-/// Apply the available update
+/// Start one-click apply for install kinds that support it.
 ///
-/// Starts the one-click apply for install kinds that support it (Windows installer). The
-/// request carries no version or URL — the host installs exactly what its verified manifest
-/// announced. Progress is polled via `GET /update/status` (`job`); the host restarts as part
-/// of the apply, and the outcome lands in `last_result` after it comes back.
+/// No version or URL in the body — the host installs the verified manifest.
+/// Poll `GET /update/status` (`job`); after restart, the outcome is `last_result`.
 #[utoipa::path(
     post,
     path = "/update/apply",
@@ -241,11 +224,10 @@ pub(crate) struct ApplyRequest {
 )]
 pub(crate) async fn apply_update(
     State(st): State<Arc<MgmtState>>,
-    // The body is required (send `{}` for defaults) — axum has no optional-body extractor and
-    // the console always posts JSON here anyway.
+    // Axum has no optional-body extractor; send `{}` for defaults.
     ApiJson(req): ApiJson<ApplyRequest>,
 ) -> Response {
-    // Same session-liveness composition as `get_status`: either plane counts.
+    // Either streaming plane counts as an active session (`get_status` same).
     let session_active = st.app.streaming.load(std::sync::atomic::Ordering::SeqCst)
         || !crate::session_status::snapshot().is_empty();
 

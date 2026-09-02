@@ -1,13 +1,13 @@
 //! Fire-and-forget operator commands and webhooks for host lifecycle events.
 //!
-//! `hooks.json` is operator-privileged and managed through `/api/v1/hooks`. Commands receive
-//! event JSON and `PF_EVENT_*` variables; Windows services run them in the interactive user
-//! session. Webhooks use verified TLS, do not follow redirects or attach Punktfunk credentials,
+//! `hooks.json` is operator-privileged (`/api/v1/hooks`). Commands get event JSON and
+//! `PF_EVENT_*` env; Windows services run them in the interactive user session.
+//! Webhooks use verified TLS, do not follow redirects or attach host credentials,
 //! and may carry an HMAC signature.
 //!
-//! Debouncing, timeouts, process-group termination, and [`MAX_CONCURRENT_HOOKS`] bound work.
-//! Script paths must pass ownership and writability checks. Logs use sanitized labels rather
-//! than raw command lines or webhook URLs, which may contain credentials.
+//! Debounce, timeout, process-group kill, and [`MAX_CONCURRENT_HOOKS`] bound work.
+//! Absolute script paths must pass ownership/writability checks. Logs use sanitized
+//! labels — command lines and webhook URLs may contain credentials.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -17,70 +17,60 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use utoipa::ToSchema;
 
-/// Concurrent hook executions in flight (exec + webhook combined). Excess firings are dropped
-/// with a warning — hooks are best-effort observers, and unbounded queueing is the failure
-/// mode this cap exists to prevent.
+/// In-flight exec + webhook cap. Excess firings drop — hooks are observers, not a queue.
 const MAX_CONCURRENT_HOOKS: usize = 8;
 
-/// Default and ceiling for the exec timeout.
 const DEFAULT_TIMEOUT_S: u32 = 30;
 const MAX_TIMEOUT_S: u32 = 600;
 
-/// Outbound webhook timeout (connect + response).
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn default_timeout_s() -> u32 {
     DEFAULT_TIMEOUT_S
 }
 
-/// The operator's hook configuration — the `hooks.json` document and the `/api/v1/hooks` body.
+/// Operator hook config: `hooks.json` and the `/api/v1/hooks` body.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug, Default)]
 pub struct HooksConfig {
     #[serde(default)]
     pub hooks: Vec<HookEntry>,
 }
 
-/// One hook: fire `run` and/or `webhook` when an event matching `on` (+ `filter`) occurs.
+/// One hook: `run` and/or `webhook` when `on` (+ `filter`) matches.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct HookEntry {
-    /// Which events fire this hook: an exact kind (`stream.started`) or a `domain.*` prefix
-    /// (`pairing.*`) — the same vocabulary as the SSE `?kinds=` filter.
+    /// Exact kind (`stream.started`) or `domain.*` prefix; same vocabulary as SSE `?kinds=`.
     pub on: String,
-    /// Exact-match constraints on the event's fields; every present field must match.
+    /// Exact-match constraints; every present field must match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<HookFilter>,
-    /// Shell command to execute (detached, event JSON on stdin + `PF_EVENT_*` env).
+    /// Detached shell command: event JSON on stdin, `PF_EVENT_*` env.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
-    /// URL to POST the event JSON to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook: Option<String>,
     /// Exec timeout in seconds (1–600, default 30); the process group is killed on expiry.
     #[serde(default = "default_timeout_s")]
     pub timeout_s: u32,
-    /// Minimum interval between firings of this hook, in milliseconds. 0 = fire every time.
+    /// Minimum interval between firings, in milliseconds. 0 = fire every time.
     #[serde(default)]
     pub debounce_ms: u64,
-    /// File holding the webhook HMAC secret (`X-Punktfunk-Signature: sha256=<hex>`). The file
-    /// should be operator-owned and private; a world-readable secret is warned about.
+    /// HMAC secret file (`X-Punktfunk-Signature: sha256=<hex>`). Warns if world-readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>)]
     pub hmac_secret_file: Option<PathBuf>,
 }
 
-/// Exact-match filters against an event's identity fields (RFC open-question 3: exact match
-/// only — anything richer is what the SDK is for). Absent fields don't constrain; a filter
-/// field set on an event kind that doesn't carry it (e.g. `client` on `host.started`) never
-/// matches.
+/// Exact-match filters on event identity fields. Absent fields do not constrain;
+/// a field set on a kind that does not carry it (e.g. `client` on `host.started`) never matches.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug, Default)]
 pub struct HookFilter {
-    /// Client/device name (for `session.*`: the short client label the Dashboard shows).
+    /// Client/device name (`session.*`: the Dashboard's short client label).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<String>,
     /// Certificate fingerprint (hex, case-insensitive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
-    /// Protocol plane (`native` / `gamestream`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plane: Option<crate::events::Plane>,
     /// Launched app id/title (`stream.*` events).
@@ -116,8 +106,7 @@ impl HookFilter {
 }
 
 impl HooksConfig {
-    /// Validate for the mgmt PUT: structural errors are rejected (the config would silently do
-    /// nothing or something surprising); unknown kinds are accepted (additive event catalog).
+    /// Structural errors fail the PUT; unknown kinds are accepted (additive catalog).
     pub fn validate(&self) -> Result<(), String> {
         for (i, h) in self.hooks.iter().enumerate() {
             let at = |msg: &str| format!("hooks[{i}]: {msg}");
@@ -138,8 +127,7 @@ impl HooksConfig {
                         "`webhook` must not target a loopback/link-local/metadata host",
                     ));
                 }
-                // A signed webhook over plaintext http:// sends the HMAC'd event body in the clear.
-                // Warn rather than reject (an internal-only `http://` receiver may be intentional).
+                // Warn, don't reject: an internal-only http:// receiver may be intentional.
                 if h.hmac_secret_file.is_some() && url.starts_with("http://") {
                     tracing::warn!(
                         url = %webhook_origin(url),
@@ -161,11 +149,9 @@ impl HooksConfig {
     }
 }
 
-/// The documented `hmac_secret_file` hygiene check (see [`HookEntry::hmac_secret_file`]): the
-/// secret should be operator-owned and private. Returns the complaint to warn about, `None` when
-/// the file is fine (or absent — an unreadable secret is [`post_webhook`]'s fail-closed case, not
-/// this one's). A warning, not a refusal: the operator asked for signing, and refusing here would
-/// silently drop it.
+/// Hygiene warning for [`HookEntry::hmac_secret_file`]. `None` if the file is fine or
+/// absent — unreadability is [`post_webhook`]'s fail-closed case. Warn, do not refuse:
+/// refusing here would silently drop a signing the operator asked for.
 #[cfg(unix)]
 fn secret_file_complaint(path: &std::path::Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
@@ -182,7 +168,7 @@ fn secret_file_complaint(path: &std::path::Path) -> Option<String> {
         .then(|| format!("group/world-accessible (mode {:o})", meta.mode() & 0o7777))
 }
 
-/// Windows: the SYSTEM/Admins-DACL'd config dir is the boundary (as for [`exec_path_check`]).
+/// Windows: the SYSTEM/Admins-DACL'd config dir is the boundary (same as [`exec_path_check`]).
 #[cfg(not(unix))]
 fn secret_file_complaint(_path: &std::path::Path) -> Option<String> {
     None
@@ -190,15 +176,9 @@ fn secret_file_complaint(_path: &std::path::Path) -> Option<String> {
 
 // ------------------------------------------------------------------------- store
 
-/// The persisted hooks store — the [`crate::vdisplay::policy::DisplayPolicyStore`] recipe:
-/// private dir, temp-write + atomic rename, in-memory value changes only if the write succeeds.
-///
-/// A hand-edited `hooks.json` is honored WITHOUT a restart (the documented contract): [`get`]
-/// re-stats the file and reloads when its identity (mtime + length) moved. The stat rides the
-/// per-event dispatch, so the check costs one `metadata()` call per event, and a full re-read
-/// happens only when the file actually changed.
-///
-/// [`get`]: HooksStore::get
+/// Persisted `hooks.json` (same recipe as [`crate::vdisplay::policy::DisplayPolicyStore`]):
+/// private dir, temp-write + atomic rename; memory updates only after the write succeeds.
+/// [`get`] re-stats mtime+length so a hand edit applies without a restart.
 pub struct HooksStore {
     path: PathBuf,
     cur: Mutex<StoreState>,
@@ -206,14 +186,12 @@ pub struct HooksStore {
 
 struct StoreState {
     cfg: Option<HooksConfig>,
-    /// Identity of the file revision `cfg` was parsed from (mtime + length); `None` = the file
-    /// did not exist. `get` compares against a fresh stat to detect hand edits.
+    /// mtime + length of the revision `cfg` was parsed from. `None` = the file did not exist.
     file_id: Option<(std::time::SystemTime, u64)>,
 }
 
 impl HooksStore {
-    /// Load from `path`. Missing file ⇒ no hooks; corrupt file ⇒ no hooks with a warning
-    /// (never fail host startup over a settings file).
+    /// Missing or corrupt file ⇒ no hooks (warn on corrupt); never fail host startup.
     pub fn load_from(path: PathBuf) -> Self {
         let (cfg, file_id) = Self::read_disk(&path);
         HooksStore {
@@ -222,15 +200,13 @@ impl HooksStore {
         }
     }
 
-    /// The file's on-disk identity, `None` when it does not exist (or cannot be stat'd —
-    /// indistinguishable on purpose: both mean "no usable hooks file").
+    /// On-disk identity. `None` if missing or unstatable — both mean no usable file.
     fn file_identity(path: &PathBuf) -> Option<(std::time::SystemTime, u64)> {
         let meta = std::fs::metadata(path).ok()?;
         Some((meta.modified().ok()?, meta.len()))
     }
 
-    /// Read + validate the file. Same lenient contract as startup: missing ⇒ no hooks;
-    /// invalid/unreadable ⇒ no hooks with a warning naming the problem.
+    /// Same lenient contract as [`Self::load_from`]: missing or invalid ⇒ no hooks.
     fn read_disk(path: &PathBuf) -> (Option<HooksConfig>, Option<(std::time::SystemTime, u64)>) {
         let file_id = Self::file_identity(path);
         let cfg = match std::fs::read(path) {
@@ -255,9 +231,8 @@ impl HooksStore {
         (cfg, file_id)
     }
 
-    /// The stored configuration (empty when unconfigured) — the mgmt GET and the dispatcher.
-    /// Re-reads `hooks.json` first if it changed on disk since last load, so hand edits apply
-    /// on the next event, no restart ("changes apply immediately" — docs/automation.md).
+    /// Empty when unconfigured. Reloads `hooks.json` if identity moved — hand edits apply
+    /// on the next event (`docs/automation.md`).
     pub fn get(&self) -> HooksConfig {
         let mut st = self.cur.lock().unwrap();
         let now_id = Self::file_identity(&self.path);
@@ -271,8 +246,7 @@ impl HooksStore {
         st.cfg.clone().unwrap_or_default()
     }
 
-    /// Persist + adopt a new configuration (caller validates first). The in-memory value
-    /// changes only if the disk write succeeds.
+    /// Persist then adopt (caller validates first). Memory updates only if the write succeeds.
     pub fn set(&self, cfg: HooksConfig) -> Result<()> {
         if let Some(dir) = self.path.parent() {
             pf_paths::create_private_dir(dir)?;
@@ -287,8 +261,7 @@ impl HooksStore {
     }
 }
 
-/// The process-wide hooks store (`<config_dir>/hooks.json`), loaded on first access and
-/// re-loaded whenever the file changes on disk (see [`HooksStore::get`]).
+/// Process-wide store (`<config_dir>/hooks.json`); reloads on disk change ([`HooksStore::get`]).
 pub fn store() -> &'static HooksStore {
     static STORE: OnceLock<HooksStore> = OnceLock::new();
     STORE.get_or_init(|| HooksStore::load_from(pf_paths::config_dir().join("hooks.json")))
@@ -296,10 +269,8 @@ pub fn store() -> &'static HooksStore {
 
 // ------------------------------------------------------------------------- runner
 
-/// The hook runner: a host-lifetime task consuming the live event tail and dispatching
-/// matching hooks. Spawned by `serve()` before `host.started` is emitted, so hooks can
-/// observe the full host lifetime. Lag (more events than the runner drained) skips the
-/// missed events with a warning — fire-and-forget, never a queue that grows unboundedly.
+/// Host-lifetime task: live event tail → matching hooks. Spawned by `serve()` before
+/// `host.started`. Lag skips missed events — fire-and-forget, never an unbounded queue.
 pub async fn runner() {
     let mut rx = crate::events::bus().subscribe_live();
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HOOKS));
@@ -318,8 +289,7 @@ pub async fn runner() {
     }
 }
 
-/// Stable identity for a hook entry across config reloads (the debounce key): the hash of its
-/// serialized form — an unchanged entry keeps its debounce window across a PUT.
+/// Debounce key: hash of the serialized entry, so an unchanged hook keeps its window across a PUT.
 fn entry_key(h: &HookEntry) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -367,8 +337,7 @@ fn dispatch(
             fire_webhook(url.to_string(), h.hmac_secret_file.clone(), ev, sem);
         }
     }
-    // The two env-var mirrors (`PUNKTFUNK_ON_CONNECT_CMD` / `PUNKTFUNK_ON_DISCONNECT_CMD`) —
-    // the zero-config siblings of `PUNKTFUNK_RECOVER_SESSION_CMD` for the simplest cases.
+    // Env-var mirrors of `PUNKTFUNK_ON_CONNECT_CMD` / `PUNKTFUNK_ON_DISCONNECT_CMD`.
     let mirror = match kind {
         "client.connected" => pf_host_config::config().on_connect_cmd.clone(),
         "client.disconnected" => pf_host_config::config().on_disconnect_cmd.clone(),
@@ -381,10 +350,8 @@ fn dispatch(
 
 // ------------------------------------------------------------------------- exec action
 
-/// Short, stable id for one hook action (`#1a2b3c4d`) — all a log line keeps of the part that can
-/// carry a secret. The same id on every line about one firing, a different one for two hooks that
-/// share a program or a webhook host, so an operator can still tell which fired. Process-lifetime
-/// stable, like [`entry_key`]'s hash.
+/// Process-lifetime `#xxxxxxxx` of the secret-bearing part of a log line. Same id on every
+/// line of one firing; different ids for two hooks that share a program or host.
 fn short_id(s: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -392,12 +359,9 @@ fn short_id(s: &str) -> String {
     format!("#{:08x}", hasher.finish() as u32)
 }
 
-/// What the `cmd` field of a log line carries about an operator command: the program's file name
-/// plus its [`short_id`]. The arguments are dropped — a hook command line carries API tokens
-/// (`curl -H "Authorization: …"`) as readily as a webhook URL does, and these lines land in the
-/// tracing ring `GET /api/v1/logs` serves verbatim (security review 2026-08-24). A refusal still
-/// names the offending *path*, through the [`exec_path_check`] error — that is what the operator
-/// needs in order to fix it.
+/// Log `cmd`: program file name + [`short_id`]. Arguments are dropped — they carry tokens
+/// and `GET /api/v1/logs` serves the tracing ring verbatim. Refusals still name the path
+/// via [`exec_path_check`].
 fn cmd_label(cmd: &str) -> String {
     let prog = cmd
         .split_whitespace()
@@ -428,18 +392,16 @@ fn fire_exec(
     let kind = ev.kind.name();
     let timeout = Duration::from_secs(u64::from(timeout_s));
     tracing::info!(cmd = %label, kind, "hook: running command");
-    // Detached execution + off-thread reap (the `try_recover_session` recipe): the streaming
-    // planes never wait on operator code. The permit rides along and frees on thread exit.
+    // Off-thread: streaming planes never wait on operator code. Permit frees on thread exit.
     std::thread::spawn(move || {
         run_hook_process(&cmd, &json, &env, timeout);
         drop(permit);
     });
 }
 
-/// The event flattened to `PF_EVENT_*` env vars: scalar leaves of the event JSON, path-joined
-/// with `_` and uppercased (`client.name` → `PF_EVENT_CLIENT_NAME`), plus `PF_EVENT_JSON` with
-/// the whole document. Values are control-char-stripped so a hostile device name can't smuggle
-/// newlines into a naive shell consumer.
+/// Event as `PF_EVENT_*` env: scalar JSON leaves, path joined with `_` and uppercased
+/// (`client.name` → `PF_EVENT_CLIENT_NAME`), plus `PF_EVENT_JSON`. Control chars stripped
+/// so a device name cannot smuggle newlines into a shell consumer.
 fn flatten_env(ev: &crate::events::HostEvent) -> Vec<(String, String)> {
     fn walk(prefix: &str, v: &serde_json::Value, out: &mut Vec<(String, String)>) {
         match v {
@@ -476,23 +438,10 @@ fn flatten_env(ev: &crate::events::HostEvent) -> Vec<(String, String)> {
     out
 }
 
-/// The sshd/sudoers rule (RFC §9.1): refuse to run a command that references a script/binary which
-/// is group/world-writable, or owned by neither the host user nor root — a world-writable hook
-/// script is privilege-escalation bait. The same rule covers every directory above the script: a
-/// writable parent is the same bait one level up, since whoever may rename an entry in it chooses
-/// what runs. A bare command name (`systemctl`, `curl`) is left to PATH.
-///
-/// **This is a hygiene rule, not an authorization gate**, and the distinction matters: it
-/// constrains *who owns the file being run*, never *what the command does*. `curl … | sh` and
-/// `python3 -c '…'` are unconstrained by construction, and `/bin/sh -c '<anything>'` passes because
-/// `/bin/sh` is root-owned. Whoever may WRITE a hook already has command execution as the host
-/// user — which is why writing them is admin-only. A pass here does not mean "this command is
-/// safe", and nothing should be granted on the strength of it.
-///
-/// It checks EVERY absolute-path token, not just the first (2026-08-05 review L-12). Looking only
-/// at `cmd.split_whitespace().next()` meant `bash /opt/x/hook.sh`, `sh -c /tmp/x` and any quoted
-/// path skipped the check entirely — so the interpreter was vetted and the script it ran was not,
-/// which is backwards: the script is the part an attacker can plant.
+/// Refuse a referenced script/binary that is group/world-writable or owned by neither the
+/// host user nor root; walk every parent (a writable parent can swap the file). Bare names
+/// are left to PATH. Every absolute-path token is checked, not just argv0 — otherwise
+/// `bash /tmp/x` vets the interpreter and skips the script.
 #[cfg(unix)]
 fn exec_path_check(cmd: &str) -> Result<(), String> {
     let tokens = shell_tokens(cmd);
@@ -507,11 +456,8 @@ fn exec_path_check(cmd: &str) -> Result<(), String> {
         }
         let path = std::path::Path::new(token);
         if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
-            continue; // not an existing file — the shell will report it
+            continue; // not an existing file — the shell reports it
         }
-        // The script, then every directory up to `/`: an unchecked writable parent lets the
-        // attacker swap a perfectly-owned script out from under us, which is why sshd walks the
-        // whole chain rather than stat'ing the file alone.
         for node in path.ancestors() {
             let Ok(meta) = std::fs::metadata(node) else {
                 continue;
@@ -522,9 +468,8 @@ fn exec_path_check(cmd: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The ownership/mode rule [`exec_path_check`] applies to the script and to each directory above
-/// it. A world-writable *directory* with the sticky bit set (`/tmp`) passes: there only an entry's
-/// own owner can replace it, so the swap this rule exists to block is already impossible.
+/// Ownership/mode rule for the script and each parent. A sticky world-writable directory
+/// (`/tmp`) passes: only the entry's owner can replace it, so the swap is already blocked.
 #[cfg(unix)]
 fn path_node_check(
     path: &std::path::Path,
@@ -551,11 +496,8 @@ fn path_node_check(
     Ok(())
 }
 
-/// Split a command line into tokens the way `/bin/sh` would *for the purpose of finding paths*:
-/// whitespace separates, but a quoted or backslash-escaped run stays one token. Plain
-/// `split_whitespace` turned `"/opt/my hooks/run.sh"` into two nonexistent tokens, so the check
-/// above silently passed the case it most needs to catch — a script the shell really does run, at
-/// a path with a space in it (security review 2026-08-24).
+/// Tokenize like `/bin/sh` for path finding: whitespace splits; quoted or backslash-escaped
+/// runs stay one token. `split_whitespace` would miss `"/opt/my hooks/run.sh"`.
 #[cfg(unix)]
 fn shell_tokens(cmd: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -584,14 +526,9 @@ fn shell_tokens(cmd: &str) -> Vec<String> {
     out
 }
 
-/// Whether this process is running as `NT AUTHORITY\SYSTEM` (S-1-5-18) — i.e. as the SCM service
-/// rather than as the operator's own console process.
-///
-/// Used to decide whether the in-process hook fallback is acceptable: as the operator it is the
-/// privilege they already have, as SYSTEM it is an elevation the hook contract forbids
-/// (2026-08-05 review L-13). Fails CLOSED — an unreadable token is treated as SYSTEM, because the
-/// consequence of guessing wrong in that direction is a skipped hook, and in the other direction
-/// it is a SYSTEM command.
+/// True if this process is `NT AUTHORITY\SYSTEM` (S-1-5-18), i.e. the SCM service.
+/// Fail closed: an unreadable token is treated as SYSTEM — a skipped hook beats a
+/// SYSTEM command. The in-process fallback is only acceptable as the operator.
 #[cfg(windows)]
 fn running_as_system() -> bool {
     use windows::Win32::Foundation::HANDLE;
@@ -606,14 +543,9 @@ fn running_as_system() -> bool {
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
         return true; // fail closed
     }
-    // TOKEN_USER is align-8; a bare `[u8; 256]` is align-1, and forming `&TOKEN_USER` out of it
-    // below would be UB by the language rule whenever the stack slot happens to land misaligned.
-    // (Shipped codegen happens to 8-align it today — that is luck, not a guarantee.) The wrapper
-    // keeps the buffer at 256 BYTES: redeclaring as `[u64; 32]` would silently turn the length
-    // argument below into 32 — `len()` counts elements — and a console operator's 44-byte
-    // TOKEN_USER+SID would then fail with ERROR_INSUFFICIENT_BUFFER, misclassifying every
-    // hand-run host as SYSTEM (it fits exactly for SYSTEM's own 16-byte S-1-5-18, so a
-    // SYSTEM-side test would not catch it).
+    // TOKEN_USER is align-8; `[u8; 256]` is align-1 — a `&TOKEN_USER` into it is UB if
+    // the slot is misaligned. Keep 256 BYTES: `[u64; 32]` would pass `len()`=32 to
+    // GetTokenInformation and misclassify a 44-byte console TOKEN_USER as SYSTEM.
     #[repr(align(8))]
     struct TokenUserBuf([u8; 256]);
     let mut buf = TokenUserBuf([0u8; 256]);
@@ -655,11 +587,9 @@ fn running_as_system() -> bool {
     // this comparison.
     unsafe {
         let tu = &*(buf.0.as_ptr() as *const TOKEN_USER);
-        // windows-rs maps EqualSid's BOOL(0) to Err BOTH for "SIDs differ" and for a genuine
-        // failure, telling them apart only via GetLastError — so clear it first (a stale value
-        // from an earlier call would otherwise read as failure) and split three ways. `.is_ok()`
-        // here previously meant an EqualSid ERROR yielded "not SYSTEM" — the fail-OPEN
-        // direction, contradicting the contract in the doc comment above.
+        // EqualSid maps BOOL(0) and a genuine failure both to Err; tell them apart via
+        // GetLastError. Clear it first — a stale value would read as failure. Treating
+        // EqualSid Err as "not SYSTEM" is fail-open.
         windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0));
         match EqualSid(tu.User.Sid, PSID(system.as_mut_ptr().cast())) {
             Ok(()) => true,                      // equal: we are SYSTEM
@@ -671,15 +601,13 @@ fn running_as_system() -> bool {
 
 #[cfg(not(unix))]
 fn exec_path_check(_cmd: &str) -> Result<(), String> {
-    // Windows: hooks.json lives in the SYSTEM/Admins-DACL'd config dir and the command runs in
-    // the interactive user session (never SYSTEM) — the config itself is the trust boundary.
-    // A per-script ACL check is a hardening follow-up.
+    // Windows: the command runs in the interactive session, never SYSTEM; hooks.json sits
+    // in the SYSTEM/Admins-DACL'd config dir. No per-script ACL walk here.
     Ok(())
 }
 
-/// Run one hook command to completion (or timeout), blocking the reaper thread it runs on.
-/// Returns whether the command ran to completion successfully (exit 0) — the prep machinery
-/// gates each step's `undo` on it.
+/// Run one hook command to completion or timeout, blocking the reaper thread.
+/// Returns exit-0 success; prep gates each step's `undo` on that.
 #[cfg(unix)]
 fn run_hook_process(
     cmd: &str,
@@ -696,7 +624,7 @@ fn run_hook_process(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        // Its own process group, so the timeout can kill the whole tree the shell spawned.
+        // Own process group so timeout can kill the whole tree the shell spawned.
         .process_group(0);
     c.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     let mut child = match c.spawn() {
@@ -708,7 +636,7 @@ fn run_hook_process(
     };
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(event_json.as_bytes());
-        // stdin drops (closes) here — a hook that never reads it is unaffected.
+        // stdin drops here; a hook that never reads it is unaffected.
     }
     let deadline = Instant::now() + timeout;
     loop {
@@ -744,11 +672,10 @@ fn run_hook_process(
     }
 }
 
-/// Windows: on a SYSTEM host the command must run in the interactive user session
-/// ([`crate::interactive::spawn_in_active_session`], never SYSTEM) — that path can't carry
-/// per-process env or stdin, so the event JSON is written to a private temp file whose path is
-/// appended as the command's last argument. A console-mode host (dev) falls back to a plain
-/// spawn with the full Unix-style context (env + stdin).
+/// Windows: SYSTEM hosts spawn in the interactive session (never SYSTEM) via
+/// [`crate::interactive::spawn_in_active_session`]. That path has no env/stdin, so
+/// event JSON is a private temp file appended as the last argument. A console host
+/// falls back to in-process spawn with Unix-style env + stdin.
 #[cfg(windows)]
 fn run_hook_process(
     cmd: &str,
@@ -774,27 +701,16 @@ fn run_hook_process(
     match crate::interactive::spawn_in_active_session(&cmdline, None) {
         Ok(pid) => {
             tracing::debug!(cmd = %label, pid, "hook command launched in the interactive session");
-            // No child handle on this path — wait out the timeout, then clean the temp file.
+            // No child handle — wait out the timeout, then remove the temp file.
             std::thread::sleep(timeout);
             let _ = std::fs::remove_file(&json_path);
-            // Detached in the user session: completion/exit status is unobservable here —
-            // report "ran" (prep `undo`s stay armed).
+            // Detached in the user session: exit status is unobservable.
+            // Report ran so prep `undo`s stay armed.
             true
         }
         Err(e) if running_as_system() => {
-            // NO in-process fallback when we are SYSTEM.
-            //
-            // `spawn_in_active_session` fails whenever there is no interactive user — pre-login, at
-            // boot, on a logged-off box — and the fallback below then ran the operator's command
-            // line through `cmd.exe /C` IN THIS PROCESS. As the SCM service that process is
-            // LocalSystem, so a hook the module contract promises runs "in the interactive session,
-            // never SYSTEM" quietly became a SYSTEM command, at the exact moments nobody is watching
-            // the screen, with no ownership check on the script (`exec_path_check` is a no-op on
-            // Windows) — 2026-08-05 review L-13.
-            //
-            // Refusing is the honest behaviour: the contract says these run as the user, and if
-            // there is no user there is nothing to run them as. A hook that must run without a
-            // logged-in user belongs in a service, not here.
+            // No in-process fallback as SYSTEM. spawn_in_active_session fails with no
+            // interactive user; cmd.exe /C here would be LocalSystem. Skip: no user, nothing to run as.
             tracing::warn!(
                 cmd = %label,
                 error = %format!("{e:#}"),
@@ -805,9 +721,7 @@ fn run_hook_process(
             false
         }
         Err(e) => {
-            // Not SYSTEM (a hand-run `punktfunk-host serve` in the operator's own console): running
-            // in-process is the same privilege the operator already has, which is the whole trust
-            // model for hooks.
+            // Console host: in-process is the operator's own privilege, not an elevation.
             tracing::debug!(error = %format!("{e:#}"),
                 "interactive-session spawn unavailable — running hook in-console");
             let mut ok = false;
@@ -872,13 +786,9 @@ fn fire_webhook(
     });
 }
 
-/// True if `url`'s host is a clearly-illegitimate webhook target — loopback, link-local (which
-/// includes the `169.254.169.254` cloud-metadata endpoint), the unspecified address, or `localhost`
-/// — so a tampered/misguided hooks.json can't make the privileged host POST event data to its own
-/// services or a metadata endpoint (direct-SSRF guard; security-review 2026-07-17). Deliberately does
-/// NOT block RFC-1918 / ULA / `.local` — a webhook to another box on the operator's own LAN is a
-/// legitimate self-hosting config. A best-effort textual + IP-literal check (no DNS resolution, so
-/// not a full anti-rebinding defense; the operator-gated config already limits the threat).
+/// True if the host is loopback, link-local (incl. `169.254.169.254`), unspecified, or
+/// `localhost`. Does not block RFC-1918 / ULA / `.local` — LAN webhooks are valid.
+/// Textual + IP-literal only; no DNS, so not an anti-rebinding defense.
 fn webhook_host_is_internal(url: &str) -> bool {
     let hostport = webhook_authority(url);
     let host = if let Some(rest) = hostport.strip_prefix('[') {
@@ -915,10 +825,8 @@ fn webhook_authority(url: &str) -> &str {
         .unwrap_or(authority)
 }
 
-/// What the `url` field of a log line carries about a webhook: `scheme://host[:port]` plus the
-/// URL's [`short_id`]. The path, query and any userinfo are dropped — for Slack, Discord, ntfy,
-/// Teams, Zapier and Home Assistant the token IS a path segment, and these lines land in the
-/// tracing ring `GET /api/v1/logs` serves verbatim (security review 2026-08-24).
+/// Log `url`: `scheme://host[:port]` + [`short_id`]. Path, query, and userinfo dropped —
+/// the token is often a path segment, and `GET /api/v1/logs` serves the ring verbatim.
 fn webhook_origin(url: &str) -> String {
     let scheme = url
         .split_once("://")
@@ -929,8 +837,7 @@ fn webhook_origin(url: &str) -> String {
 
 fn post_webhook(url: &str, json: &str, secret_file: Option<&std::path::Path>) {
     let origin = webhook_origin(url);
-    // TLS is verified (ureq's default rustls roots); redirects are never followed, so a
-    // compromised receiver can't bounce the POST cross-origin (RFC §9.5).
+    // Verified TLS (ureq rustls roots). max_redirects(0): a compromised receiver cannot bounce the POST.
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .max_redirects(0)
         .timeout_global(Some(WEBHOOK_TIMEOUT))
@@ -940,7 +847,6 @@ fn post_webhook(url: &str, json: &str, secret_file: Option<&std::path::Path>) {
     if let Some(path) = secret_file {
         match std::fs::read(path) {
             Ok(secret) => {
-                // `new_from_slice` moved from `Mac` to `KeyInit` in the digest 0.11 wave.
                 use hmac::{Hmac, KeyInit, Mac};
                 let mut mac = match Hmac::<sha2::Sha256>::new_from_slice(&secret) {
                     Ok(m) => m,
@@ -954,8 +860,7 @@ fn post_webhook(url: &str, json: &str, secret_file: Option<&std::path::Path>) {
                 req = req.header("X-Punktfunk-Signature", &format!("sha256={sig}"));
             }
             Err(e) => {
-                // A configured-but-unreadable secret means the operator WANTS signing —
-                // failing open (unsigned POST) would defeat the receiver's authentication.
+                // Configured but unreadable: the operator wants signing. Do not POST unsigned.
                 tracing::error!(path = %path.display(), error = %e,
                     "webhook HMAC secret unreadable — NOT posting unsigned");
                 return;
@@ -975,27 +880,20 @@ fn post_webhook(url: &str, json: &str, secret_file: Option<&std::path::Path>) {
 
 // ------------------------------------------------------------------------- per-app prep/undo
 
-/// One per-app preparation step (RFC §6 — deliberate Sunshine `prep-cmd` parity): `do` runs
-/// **synchronously before the app launches** (an HDR toggle or a MangoHud env change must land
-/// first), `undo` runs at session end — reverse order across steps, best-effort, on every exit
-/// path including a crash-unwind (RAII via [`PrepGuard`]).
+/// Per-app prep (Sunshine `prep-cmd` parity): `do` runs synchronously before launch;
+/// `undo` runs at session end, reverse order, best-effort, including panic-unwind ([`PrepGuard`]).
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq)]
 pub struct PrepCmd {
-    /// Command run before launch. Same execution recipe and ownership checks as hook `run`
-    /// commands (event-less: stdin is empty JSON, env carries the `PF_APP_*` context).
+    /// Command run before launch. Same recipe and ownership checks as hook `run`; stdin is `{}`.
     #[serde(rename = "do")]
     pub run: String,
-    /// Command run after the session ends. Skipped when its `do` failed (it never took effect).
+    /// After session end. Skipped when its `do` failed (it never took effect).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo: Option<String>,
 }
 
-/// The negotiated stream mode as env for prep `do`/`undo` commands — the same `PF_STREAM_*`
-/// vocabulary as the [`crate::stream_marker`] file (and the same rule: keys only ever get
-/// added), so a script written against either sees one spelling. Exists because prep commands
-/// are how operators do per-mode setup (an RTSS/driver FPS cap wants the refresh rate), and
-/// until now their whole environment was the app identity — every mode value had to be
-/// hard-coded per device. One definition, used by BOTH serving planes, so they can't drift.
+/// Negotiated stream mode as `PF_STREAM_*` env for prep `do`/`undo` — same spelling as
+/// [`crate::stream_marker`] (keys only ever added). Shared by both serving planes.
 pub fn prep_mode_env(width: u32, height: u32, refresh_hz: u32, hdr: bool) -> [(String, String); 4] {
     [
         ("PF_STREAM_WIDTH".to_string(), width.to_string()),
@@ -1005,20 +903,17 @@ pub fn prep_mode_env(width: u32, height: u32, refresh_hz: u32, hdr: bool) -> [(S
     ]
 }
 
-/// Holds the armed `undo` commands for one session's prep steps; dropping it (session end,
-/// error return, panic-unwind) runs them in reverse order on a detached thread — teardown
-/// never blocks on operator code.
+/// Armed `undo`s for one session's prep. Drop (end, error, panic-unwind) runs them in
+/// reverse on a detached thread — teardown never blocks on operator code.
 #[must_use = "dropping the guard immediately runs the undo commands"]
 pub struct PrepGuard {
     undo: Vec<String>,
     env: Vec<(String, String)>,
 }
 
-/// Run a title's prep steps **synchronously, in order** (the caller is a launch path — this is
-/// the one deliberate exception to fire-and-forget, because prep exists to happen *before* the
-/// game). Each step gets the default hook timeout and the same ownership gate as hook
-/// commands; a failed/refused `do` logs and continues (best-effort), and its `undo` stays
-/// disarmed. Returns the guard that runs the armed `undo`s at drop.
+/// Run prep steps synchronously, in order — the exception to fire-and-forget, because
+/// prep must land before launch. Failed/refused `do` logs and continues; its `undo`
+/// stays disarmed. Returns the guard that runs armed `undo`s at drop.
 pub fn run_prep(cmds: &[PrepCmd], env: &[(String, String)]) -> PrepGuard {
     let timeout = Duration::from_secs(u64::from(DEFAULT_TIMEOUT_S));
     let mut undo = Vec::new();
@@ -1055,9 +950,8 @@ impl Drop for PrepGuard {
         let undo = std::mem::take(&mut self.undo);
         let env = std::mem::take(&mut self.env);
         let timeout = Duration::from_secs(u64::from(DEFAULT_TIMEOUT_S));
-        // Detached: the drop site may be an async task or a panic-unwind — session teardown
-        // must not block on operator commands. Order (reverse of `do`) is preserved because
-        // the one thread runs them sequentially.
+        // Detached: drop may be async or a panic-unwind; teardown must not block.
+        // One thread keeps reverse-of-`do` order.
         std::thread::spawn(move || {
             for cmd in undo.iter().rev() {
                 let label = cmd_label(cmd);
@@ -1159,12 +1053,10 @@ mod tests {
         store.set(cfg).unwrap();
         assert_eq!(store.get().hooks.len(), 1);
 
-        // A fresh load sees the persisted value.
         let reload = HooksStore::load_from(path.clone());
         assert_eq!(reload.get().hooks.len(), 1);
         assert_eq!(reload.get().hooks[0].on, "pairing.pending");
 
-        // Corruption never breaks startup — it just disables hooks loudly.
         std::fs::write(&path, b"{ not json").unwrap();
         let corrupt = HooksStore::load_from(path.clone());
         assert!(corrupt.get().hooks.is_empty());
@@ -1183,8 +1075,6 @@ mod tests {
         let store = HooksStore::load_from(path.clone());
         assert!(store.get().hooks.is_empty());
 
-        // The documented flow: the operator writes hooks.json by hand and the SAME running
-        // store honors it on the next event — no restart, no PUT.
         std::fs::write(
             &path,
             br#"{"hooks":[{"on":"stream.started","run":"true"}]}"#,
@@ -1193,8 +1083,7 @@ mod tests {
         assert_eq!(store.get().hooks.len(), 1, "hand edit applies on next read");
         assert_eq!(store.get().hooks[0].on, "stream.started");
 
-        // A second edit applies too (length differs, so same-second mtime granularity can't
-        // mask it).
+        // Length differs so same-second mtime granularity cannot mask the second edit.
         std::fs::write(
             &path,
             br#"{"hooks":[{"on":"stream.started","run":"true"},{"on":"client.*","run":"true"}]}"#,
@@ -1202,7 +1091,6 @@ mod tests {
         .unwrap();
         assert_eq!(store.get().hooks.len(), 2, "second hand edit applies too");
 
-        // Deleting the file removes the hooks.
         std::fs::remove_file(&path).unwrap();
         assert!(store.get().hooks.is_empty(), "deleted file = no hooks");
     }
@@ -1230,7 +1118,7 @@ mod tests {
         };
         assert!(!f.matches(&ev.kind));
 
-        // stream.* events carry no fingerprint — a fingerprint filter can't match them.
+        // stream.* events carry no fingerprint — a fingerprint filter cannot match them.
         let f = HookFilter {
             fingerprint: Some("ab12".into()),
             ..Default::default()
@@ -1270,7 +1158,7 @@ mod tests {
         assert_eq!(get("PF_EVENT_STREAM_PLANE"), Some("native"));
         assert!(get("PF_EVENT_JSON").unwrap().contains("\"seq\":7"));
 
-        // A hostile client name can't smuggle control chars into env consumers.
+        // Control chars in a client name must not reach env consumers.
         let mut evil = sample_event();
         if let EventKind::StreamStarted { stream } = &mut evil.kind {
             stream.client = "evil\nname\r\t".into();
@@ -1286,8 +1174,7 @@ mod tests {
 
     #[test]
     fn prep_mode_env_speaks_the_marker_vocabulary() {
-        // The names are the stream-marker file's — a script written against either sees one
-        // spelling — and HDR is 1/0 like the marker, not true/false like PF_EVENT_*.
+        // Same names as the stream-marker file. HDR is 1/0 like the marker, not PF_EVENT_* true/false.
         let env = prep_mode_env(2560, 1440, 120, true);
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("PF_STREAM_WIDTH"), Some("2560"));
@@ -1300,7 +1187,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exec_runs_with_stdin_and_env_and_timeout_kills() {
-        // A hook that proves stdin + env delivery by writing both to a file.
         let out = std::env::temp_dir().join(format!(
             "pf-hook-exec-{}-{:p}.txt",
             std::process::id(),
@@ -1324,7 +1210,7 @@ mod tests {
         assert!(text.contains("\"seq\":7"), "stdin delivered: {text}");
         let _ = std::fs::remove_file(&out);
 
-        // Timeout: a sleeping hook is killed (process group) well before its sleep ends.
+        // Timeout must kill the process group, not wait out `sleep 30`.
         let started = Instant::now();
         run_hook_process("sleep 30", &json, &env, Duration::from_secs(1));
         assert!(
@@ -1333,8 +1219,6 @@ mod tests {
         );
     }
 
-    /// Prep semantics end to end: `do`s run in order before the guard exists, armed `undo`s run
-    /// in REVERSE order at drop, and a failed `do` disarms its own `undo` only.
     #[cfg(unix)]
     #[test]
     fn prep_runs_do_in_order_and_undo_in_reverse() {
@@ -1351,7 +1235,7 @@ mod tests {
         let cmds = vec![
             step("do-a", Some("undo-a")),
             step("do-b", Some("undo-b")),
-            // A failing `do` must not arm its undo.
+            // `false` must not arm its undo.
             PrepCmd {
                 run: "false".into(),
                 undo: Some(format!("echo undo-never >> {}", out.display())),
@@ -1386,7 +1270,7 @@ mod tests {
 
     #[test]
     fn prep_cmd_wire_shape() {
-        // The RFC's `{ "do": …, "undo": … }` spelling is the wire contract.
+        // Wire spelling is `{ "do": …, "undo": … }`.
         let c: PrepCmd = serde_json::from_str(r#"{"do":"a","undo":"b"}"#).unwrap();
         assert_eq!(c.run, "a");
         assert_eq!(c.undo.as_deref(), Some("b"));
@@ -1420,9 +1304,6 @@ mod tests {
         assert!(exec_path_check("/nonexistent/definitely-not-here").is_ok());
     }
 
-    /// The two holes the check used to have: a path with a space in it (whitespace splitting made
-    /// the check a no-op for exactly the paths the shell still runs), and a writable directory
-    /// above an otherwise-fine script.
     #[cfg(unix)]
     #[test]
     fn ownership_check_sees_quoted_paths_and_writable_parents() {
@@ -1456,7 +1337,7 @@ mod tests {
             "backslash-escaped spaces too"
         );
 
-        // A writable parent defeats a perfectly-owned script — the attacker replaces the file.
+        // A writable parent can replace a well-owned script.
         std::fs::set_permissions(&script, mode(0o700)).unwrap();
         std::fs::set_permissions(&dir, mode(0o777)).unwrap();
         let err = exec_path_check(&quoted).expect_err("world-writable parent must be refused");
@@ -1467,7 +1348,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The `hmac_secret_file` warning the field doc promises.
     #[cfg(unix)]
     #[test]
     fn secret_file_permissions_are_complained_about() {
@@ -1490,9 +1370,7 @@ mod tests {
         assert!(secret_file_complaint(&path).is_none());
     }
 
-    /// `GET /api/v1/logs` serves the tracing ring verbatim, so no log line may carry a webhook URL's
-    /// path (the bearer credential for Slack/Discord/ntfy) or a command's arguments — while still
-    /// saying which hook fired.
+    /// `GET /api/v1/logs` serves the tracing ring verbatim: drop URL path and command args.
     #[test]
     fn log_labels_drop_the_credential_and_stay_identifiable() {
         let slack = "https://hooks.slack.com/services/T0000/B0000/XXXXsecretXXXX";
@@ -1515,7 +1393,6 @@ mod tests {
             assert!(!creds.contains(secret), "{secret} leaked: {creds}");
         }
 
-        // Command lines: the program's file name survives, its arguments don't.
         let cmd = "/usr/local/bin/notify.sh --token=SEKRIT-zz 'Living Room'";
         let label = cmd_label(cmd);
         assert!(

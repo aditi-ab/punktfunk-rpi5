@@ -1,27 +1,16 @@
-//! DDC/CI monitor panel power control — the EXPERIMENTAL `ddc_power_off` display-policy axis.
+//! DDC/CI panel power for the experimental `ddc_power_off` axis (Windows).
 //!
-//! DDC/CI is the VESA command channel to the monitor itself: an I²C bus inside the video cable
-//! (dedicated pins on VGA/DVI/HDMI, tunneled over the AUX channel on DisplayPort) whose MCCS
-//! "VCP codes" expose the monitor's OSD knobs to software. VCP 0xD6 is the power mode; we command
-//! `0x04` (DPMS off — panel + backlight dark, firmware still listening) and never `0x05`
-//! (power-button off — many monitors kill their DDC controller in that state and need a physical
-//! button press to come back).
+//! VESA MCCS VCP 0xD6 over the video-cable I²C / DP-AUX bus. We command `0x04` (DPMS off —
+//! panel and backlight dark, firmware still listening) so a cooperating monitor stops
+//! no-signal auto-scan. Never `0x05` (power-button off): many monitors kill their DDC
+//! controller and need a physical button to come back.
 //!
-//! Why: the "periodic double-jolt while the virtual display is the SOLE active display" stutter
-//! class (Apollo #179/#358/#368/#563/#776 and our own field report). When an `Exclusive` isolate
-//! deactivates the physical monitor, its link drops and the monitor falls into its no-signal flow:
-//! standby with periodic auto-input-scan / link probing that the GPU driver services with
-//! display-subsystem stalls at a seconds-scale cadence. A panel commanded off over DDC/CI believes
-//! it has an owner and (on cooperating firmware) stops probing. This is deliberately shipped as an
-//! experiment: whether it helps discriminates *who initiates* the churn — monitor firmware (DDC-off
-//! fixes it) vs. the driver servicing a dark head regardless (only a driven link fixes it, i.e.
-//! topology `primary`/`extend`).
-//!
-//! Everything here is best-effort and warn-and-continue: monitors without DDC/CI support (or with
-//! it disabled in the OSD), docks/KVMs that don't pass the channel through, and laptop-internal
-//! panels (ACPI backlight, no DDC) all simply probe as unsupported and are skipped. Each DDC
-//! transaction can block for tens of ms — callers run at session acquire/teardown, never on the
-//! frame path.
+//! Best-effort, warn-and-continue. Monitors without DDC, OSD-disabled DDC, docks/KVMs
+//! that drop the channel, and laptop-internal panels (ACPI backlight) probe as
+//! unsupported and are skipped. Each transaction can block for tens of ms — callers
+//! run at session acquire/teardown, never on the frame path. `HMONITOR` is live only
+//! while the display is on the desktop, so off runs before an Exclusive CCD isolate
+//! and on after the restore.
 
 use windows::Win32::Devices::Display::{
     DestroyPhysicalMonitors, GetNumberOfPhysicalMonitorsFromHMONITOR,
@@ -33,22 +22,17 @@ use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
 };
 
-/// MCCS VCP code 0xD6 — display power mode.
 const VCP_POWER_MODE: u8 = 0xD6;
-/// VCP 0xD6 value: on.
 const POWER_ON: u32 = 0x01;
-/// VCP 0xD6 value: DPMS off (dark panel, DDC controller stays responsive). Deliberately NOT 0x05.
+/// 0x04 DPMS off (DDC stays up). Not 0x05: power-button off, many panels need a physical press after it.
 const POWER_OFF: u32 = 0x04;
 
-/// One active display: its HMONITOR and GDI device name (`\\.\DISPLAYn`).
 struct ActiveMonitor {
     hmon: HMONITOR,
     device: String,
 }
 
-/// Enumerate the active displays (HMONITOR + GDI name). HMONITORs are only valid while a display
-/// is part of the desktop — which is exactly why the off-command must run BEFORE a CCD isolate
-/// and the on-command AFTER the restore.
+/// `HMONITOR` is live only while the display is on the desktop — off before isolate, on after restore.
 fn active_monitors() -> Vec<ActiveMonitor> {
     unsafe extern "system" fn collect(
         hmon: HMONITOR,
@@ -61,14 +45,10 @@ fn active_monitors() -> Vec<ActiveMonitor> {
         let out = unsafe { &mut *(data.0 as *mut Vec<ActiveMonitor>) };
         let mut info = MONITORINFOEXW::default();
         info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-        // The pointer is derived from the WHOLE `MONITORINFOEXW`, not from its `monitorInfo` field.
-        // `cbSize` promises the OS 104 bytes, but `&mut info.monitorInfo` is a pointer to the
-        // 40-byte `MONITORINFO` prefix: everything the OS writes past byte 40 — which is `szDevice`,
-        // the only field this function reads — is then out of bounds for that pointer's provenance.
-        // A compiler is entitled to assume those bytes were untouched and fold the zeroed
-        // initializer into the reads below, i.e. hand back an EMPTY device name. That name is what
-        // `panel_off_except`'s exclusion compares against, so an empty one would darken the very
-        // panel it is meant to spare.
+        // Pass the whole `MONITORINFOEXW`, not `&mut info.monitorInfo`. `cbSize` is 104 bytes;
+        // `&mut info.monitorInfo` only covers the 40-byte prefix, so `szDevice` is out of
+        // provenance and the compiler may keep the zeroed name. An empty name matches no
+        // exclusion and `panel_off_except` would darken the spared panel.
         let p = (&raw mut info).cast::<windows::Win32::Graphics::Gdi::MONITORINFO>();
         // SAFETY: `hmon` is the live monitor handle the enumeration just handed us. `p` carries the
         // provenance of the full `MONITORINFOEXW`, so the OS may write all `cbSize` bytes it was
@@ -84,7 +64,7 @@ fn active_monitors() -> Vec<ActiveMonitor> {
                 device: String::from_utf16_lossy(&info.szDevice[..len]),
             });
         }
-        true.into() // keep enumerating
+        true.into() // FALSE stops the walk
     }
 
     let mut out: Vec<ActiveMonitor> = Vec::new();
@@ -101,8 +81,7 @@ fn active_monitors() -> Vec<ActiveMonitor> {
     out
 }
 
-/// Apply `value` to VCP 0xD6 on every physical monitor behind `hmon` that answers a 0xD6 probe.
-/// Returns how many panels acknowledged the set. `device` is for the log lines only.
+/// `device` is log-only.
 fn set_power(hmon: HMONITOR, device: &str, value: u32) -> u32 {
     let mut n = 0u32;
     // SAFETY: `hmon` is a live monitor handle from the enumeration; `n` is a valid out-param.
@@ -116,8 +95,7 @@ fn set_power(hmon: HMONITOR, device: &str, value: u32) -> u32 {
     }
     let mut acked = 0u32;
     for p in &phys {
-        // PHYSICAL_MONITOR is `packed(1)` (dxva2 header pragma) — copy the fields OUT by value
-        // before touching them; a reference into a packed field is rejected (E0793, UB).
+        // `PHYSICAL_MONITOR` is packed(1). Copy fields by value; a ref into a packed field is UB.
         let handle = p.hPhysicalMonitor;
         let desc_raw = p.szPhysicalMonitorDescription;
         let len = desc_raw
@@ -125,9 +103,7 @@ fn set_power(hmon: HMONITOR, device: &str, value: u32) -> u32 {
             .position(|&c| c == 0)
             .unwrap_or(desc_raw.len());
         let desc = String::from_utf16_lossy(&desc_raw[..len]);
-        // Probe first: a monitor without DDC/CI (or with it disabled in the OSD, or behind a
-        // dock/KVM that drops the channel) fails here and is skipped — never blind-write to a
-        // bus we can't read.
+        // Probe first. A silent bus (no DDC, OSD-off, dock drop) fails here — never write unread.
         let (mut current, mut max) = (0u32, 0u32);
         // SAFETY: `handle` is the live physical-monitor handle (valid until
         // DestroyPhysicalMonitors below); the value pointers are valid locals ('None' for the
@@ -178,9 +154,7 @@ fn set_power(hmon: HMONITOR, device: &str, value: u32) -> u32 {
     acked
 }
 
-/// Command every physical panel EXCEPT `exclude_gdi` (the virtual display) off via DDC/CI
-/// (VCP 0xD6 → DPMS off). Call while the physical displays are still ACTIVE — i.e. immediately
-/// before the `Exclusive` CCD isolate. Returns how many panels acknowledged.
+/// Call while the physical displays are still on the desktop, immediately before Exclusive isolate.
 pub fn panel_off_except(exclude_gdi: &str) -> u32 {
     let mut acked = 0;
     for m in active_monitors() {
@@ -190,10 +164,8 @@ pub fn panel_off_except(exclude_gdi: &str) -> u32 {
         acked += set_power(m.hmon, &m.device, POWER_OFF);
     }
     if acked == 0 {
-        // INFO, not debug: the user opted into this axis, so "it did nothing" is an answer they
-        // asked for. The common case is a laptop — internal eDP/LVDS panels have NO DDC/CI at
-        // all (their brightness/power runs over the driver's own channel), so `ddc_power_off`
-        // is structurally a no-op for them (reporter feedback 2026-07-27).
+        // INFO: the user opted into this axis, so a no-op is an answer. Laptop eDP/LVDS
+        // has no DDC; brightness runs on the driver's own channel.
         tracing::info!(
             "DDC/CI: no panel accepted the DPMS-off command — the ddc_power_off axis did \
              nothing on this display set (internal eDP/LVDS panels expose no DDC/CI; external \
@@ -203,9 +175,7 @@ pub fn panel_off_except(exclude_gdi: &str) -> u32 {
     acked
 }
 
-/// Best-effort wake: command ON to every physical panel that answers. Call AFTER the CCD restore
-/// has re-activated the physical paths — the returning signal alone wakes DPMS-off panels on most
-/// firmware; this is the belt-and-braces for the rest.
+/// Call after CCD restore. Returning signal wakes most firmware; this covers the rest.
 pub fn panel_on_all() -> u32 {
     let mut acked = 0;
     for m in active_monitors() {

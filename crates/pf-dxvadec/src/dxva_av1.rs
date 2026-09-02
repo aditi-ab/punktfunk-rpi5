@@ -1,83 +1,43 @@
-//! The DXVA **AV1** buffer layouts, hand-declared — M7's Windows half.
+//! The DXVA AV1 buffer layouts, hand-declared.
 //!
-//! Same contract and the same hazards as [`crate::dxva`]: windows-rs generates
-//! nothing from `dxva.h`, nothing here is type-checked against Windows, and a field
-//! at the wrong offset is a driver reading a reference index where a quantiser
-//! should be.
+//! Same contract as [`crate::dxva`]: windows-rs generates nothing from `dxva.h`,
+//! and a field at the wrong offset is a driver reading a reference index where a
+//! quantiser should be. Sizes, offsets, and bit positions come from
+//! `layout-probe-av1.c` against the Windows SDK `dxva.h` and are compile-time
+//! assertions. Re-run the probe if the SDK moves.
 //!
-//! # This one was MEASURED against Microsoft's own header
+//! `DXVA_PicParams_AV1` is 912 bytes, alignment 1. `dxva.h` packs these to a
+//! byte boundary, so the structs carry `#[repr(C, packed)]`.
 //!
-//! The H.264 and HEVC layouts were checked against libavcodec's DXVA byte capture —
-//! a mirror, and the best available at the time. AV1 does better: `DXVA_PicParams_AV1`
-//! ships in the **Windows SDK's own `dxva.h`** (`10.0.26100.0` and `10.0.28000.0` on
-//! the .173 box), which is the declaration the DRIVER was compiled against. So every
-//! size, every offset and every bit position below came out of
-//! `layout-probe-av1.c` compiled with MSVC against that header, and each is pinned as
-//! a compile-time assertion. Re-run the probe (its own header carries the one-liner)
-//! if the SDK ever moves.
+//! Two layout traps versus Vulkan's Std blocks:
 //!
-//! Measured: `DXVA_PicParams_AV1` is **912 bytes, alignment 1** — `dxva.h` packs
-//! every one of these to a byte boundary, which is why the structs below carry
-//! `#[repr(C, packed)]` and not a plain `#[repr(C)]`.
-//!
-//! # Two things AV1 puts somewhere unexpected
-//!
-//! **Global motion is per REFERENCE, inside the picture entry.** `DXVA_PicEntry_AV1`
-//! is 36 bytes and carries `wmmat[6]` plus the warp type for that reference — where
-//! Vulkan hangs one `StdVideoAV1GlobalMotion` block off the picture info. Same data,
-//! a different owner, and a conversion that assumed the Vulkan shape would leave
-//! every warped reference at identity.
-//!
-//! **CDEF strengths are packed two-to-a-byte.** `y_strengths[i]` and
-//! `uv_strengths[i]` are single bytes holding `primary` in the low six bits and
-//! `secondary` in the top two — not the separate arrays the AV1 syntax (and Vulkan's
-//! Std block) use.
+//! - **Global motion lives on the reference entry.** `DXVA_PicEntry_AV1` is 36
+//!   bytes and carries `wmmat[6]` plus warp type. Vulkan hangs one
+//!   `StdVideoAV1GlobalMotion` off the picture info; a conversion that assumed
+//!   that shape leaves every warped reference at identity.
+//! - **CDEF strengths are packed two-to-a-byte.** `y_strengths[i]` /
+//!   `uv_strengths[i]` hold `primary` in the low six bits and `secondary` in
+//!   the top two — not the separate arrays the AV1 syntax uses.
 
-/// `DXVA_PicEntry_AV1` — 36 bytes, and it carries global motion (module docs).
-///
-/// ```c
-/// typedef struct _DXVA_PicEntry_AV1 {
-///     UINT width;
-///     UINT height;
-///     INT wmmat[6];              // global motion parameters
-///     union { struct { UCHAR wminvalid:1; UCHAR wmtype:2; UCHAR Reserved:5; };
-///             UCHAR GlobalMotionFlags; };
-///     UCHAR Index;
-///     UINT16 Reserved16Bits;
-/// } DXVA_PicEntry_AV1;
-/// ```
+/// `DXVA_PicEntry_AV1` — 36 bytes; global motion lives here, not on the picture.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PicEntryAv1 {
-    /// The REFERENCE's own `UpscaledWidth` — not the current frame's. AV1 lets
-    /// every frame pick its own size, and this pair is what lets the driver scale
-    /// motion out of a differently-sized reference (libavcodec:
-    /// `pp->frame_refs[i].width = ref_frame->width`).
+    /// This reference's `UpscaledWidth`, not the current frame's. AV1 lets each
+    /// frame pick its own size; the driver scales motion from this pair.
     pub width: u32,
-    /// The reference's own `FrameHeight`, on the same terms as [`Self::width`].
+    /// This reference's `FrameHeight`, same terms as [`Self::width`].
     pub height: u32,
     pub wmmat: [i32; 6],
     pub global_motion_flags: u8,
-    /// ⚠⚠ The AV1 reference **SLOT** — `ref_frame_idx[i]`, 0..8 — or
-    /// [`UNUSED_INDEX`] where this reference is not present. **Not a surface
-    /// index.**
-    ///
-    /// This is a subscript INTO [`PicParamsAv1::ref_frame_map_texture_index`],
-    /// which is the array that names surfaces; the driver dereferences one through
-    /// the other. libavcodec writes `pp->frame_refs[i].Index = ref_frame ? ref_idx
-    /// : 0xFF` with `ref_idx = frame_header->ref_frame_idx[i]`, and Chromium's
-    /// `d3d11_av1_accelerator.cc` writes the same thing.
-    ///
-    /// Putting a surface index here is not a refusal: on a stream where reference
-    /// `i` happens to live in the slot whose number equals its surface it decodes
-    /// correctly, and everywhere else it predicts from whichever picture the
-    /// reference store holds at the surface's number.
+    /// AV1 reference **slot** (`ref_frame_idx[i]`, 0..8), or [`UNUSED_INDEX`].
+    /// Not a surface index: this subscripts [`PicParamsAv1::ref_frame_map_texture_index`].
+    /// A surface index here only happens to work when slot number equals surface number.
     pub index: u8,
     pub reserved16: u16,
 }
 
-/// What `DXVA_PicEntry_AV1::Index` (and `RefFrameMapTextureIndex`) carry for a
-/// reference that is not present. `0xFF` is DXVA's universal "no surface".
+/// `0xFF` — DXVA's "no surface", for a missing reference.
 pub const UNUSED_INDEX: u8 = 0xFF;
 
 impl PicEntryAv1 {
@@ -93,11 +53,10 @@ impl PicEntryAv1 {
     }
 }
 
-/// `GlobalMotionFlags`'s members, packed by [`GlobalMotionFlags::pack`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GlobalMotionFlags {
     pub wminvalid: bool,
-    /// `wmtype`: 0 identity, 1 translation, 2 rotzoom, 3 affine. Two bits.
+    /// 0 identity, 1 translation, 2 rotzoom, 3 affine. Two bits.
     pub wmtype: u8,
 }
 
@@ -107,8 +66,6 @@ impl GlobalMotionFlags {
     }
 }
 
-/// The tile block inside [`PicParamsAv1`]. Declared as its own type so the
-/// 64-entry arrays are named once.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TilesAv1 {
@@ -131,7 +88,6 @@ impl TilesAv1 {
     }
 }
 
-/// The loop-filter block.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoopFilterAv1 {
@@ -166,7 +122,6 @@ impl LoopFilterAv1 {
     }
 }
 
-/// `loop_filter.ControlFlags`' members.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoopFilterFlagsAv1 {
     pub mode_ref_delta_enabled: bool,
@@ -184,7 +139,6 @@ impl LoopFilterFlagsAv1 {
     }
 }
 
-/// The quantisation block.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QuantizationAv1 {
@@ -219,7 +173,6 @@ impl QuantizationAv1 {
     }
 }
 
-/// `quantization.ControlFlags`' members.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct QuantizationFlagsAv1 {
     pub delta_q_present: bool,
@@ -233,8 +186,7 @@ impl QuantizationFlagsAv1 {
     }
 }
 
-/// The CDEF block. ⚠ Its strengths are packed two fields to a byte — see
-/// [`CdefStrength`] and the module docs.
+/// Strengths are packed two fields to a byte — see [`CdefStrength`].
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CdefAv1 {
@@ -253,7 +205,7 @@ impl CdefAv1 {
     }
 }
 
-/// `cdef.ControlFlags`' members: `damping` in bits 0-1, `bits` in 2-3.
+/// `damping` in bits 0-1, `bits` in 2-3.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CdefFlagsAv1 {
     /// `cdef_damping_minus_3`, two bits.
@@ -268,8 +220,7 @@ impl CdefFlagsAv1 {
     }
 }
 
-/// One packed CDEF strength byte: `primary` in the low SIX bits, `secondary` in
-/// the top two.
+/// Packed CDEF strength: `primary` in the low six bits, `secondary` in the top two.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CdefStrength {
     pub primary: u8,
@@ -282,7 +233,6 @@ impl CdefStrength {
     }
 }
 
-/// The segmentation block.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentationAv1 {
@@ -304,7 +254,6 @@ impl SegmentationAv1 {
     }
 }
 
-/// `segmentation.ControlFlags`' members.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SegmentationFlagsAv1 {
     pub enabled: bool,
@@ -322,9 +271,8 @@ impl SegmentationFlagsAv1 {
     }
 }
 
-/// One segment's feature mask. The bit ORDER is the AV1 `SEG_LVL_*` order, which
-/// is also the order the parser's `feature_enabled[segment]` is indexed by — so a
-/// conversion can shift by feature index directly.
+/// Bit order is AV1 `SEG_LVL_*`, matching `feature_enabled[segment]`, so a
+/// conversion can shift by feature index.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SegmentFeatureMask {
     pub alt_q: bool,
@@ -350,8 +298,8 @@ impl SegmentFeatureMask {
     }
 }
 
-/// The film-grain block. ⚠ Its scaling points are `[value, scaling]` PAIRS, where
-/// AV1's syntax and Vulkan's Std block keep two parallel arrays.
+/// Scaling points are `[value, scaling]` pairs; AV1 syntax and Vulkan keep two
+/// parallel arrays.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FilmGrainAv1 {
@@ -400,8 +348,7 @@ impl FilmGrainAv1 {
     }
 }
 
-/// `film_grain.ControlFlags`' members — a SIXTEEN-bit word, unlike every other
-/// control word here.
+/// Packed into a 16-bit word; every other control word here is 8 bits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FilmGrainFlagsAv1 {
     pub apply_grain: bool,
@@ -433,7 +380,7 @@ impl FilmGrainFlagsAv1 {
     }
 }
 
-/// `DXVA_PicParams_AV1` — 912 bytes, packed (module docs).
+/// `DXVA_PicParams_AV1` — 912 bytes, packed.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PicParamsAv1 {
@@ -446,19 +393,16 @@ pub struct PicParamsAv1 {
     pub bitdepth: u8,
     pub seq_profile: u8,
     pub tiles: TilesAv1,
-    /// `CodingParamToolFlags` — see [`CodingFlagsAv1`].
+    /// Packed [`CodingFlagsAv1`].
     pub coding: u32,
-    /// `FormatAndPictureInfoFlags` — see [`FormatFlagsAv1`].
+    /// Packed [`FormatFlagsAv1`].
     pub format: u8,
     pub primary_ref_frame: u8,
     pub order_hint: u8,
     pub order_hint_bits: u8,
-    /// The seven reference NAMES (`LAST`..`ALTREF`), each with its own global
-    /// motion (module docs).
+    /// The seven reference names (`LAST`..`ALTREF`); each carries its own global motion.
     pub frame_refs: [PicEntryAv1; 7],
-    /// The eight reference SLOTS, as surface indices — DXVA's statement about the
-    /// whole reference store, the counterpart of `RefFrameList` on the other
-    /// codecs. [`UNUSED_INDEX`] for an empty slot.
+    /// The eight reference slots as surface indices. [`UNUSED_INDEX`] for empty.
     pub ref_frame_map_texture_index: [u8; 8],
     pub loop_filter: LoopFilterAv1,
     pub quantization: QuantizationAv1,
@@ -501,7 +445,7 @@ impl PicParamsAv1 {
     }
 }
 
-/// `CodingParamToolFlags`' members, in declaration order.
+/// Packed into [`PicParamsAv1::coding`], LSB first in declaration order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CodingFlagsAv1 {
     pub use_128x128_superblock: bool,
@@ -564,7 +508,6 @@ impl CodingFlagsAv1 {
     }
 }
 
-/// `FormatAndPictureInfoFlags`' members.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FormatFlagsAv1 {
     /// Two bits: 0 KEY, 1 INTER, 2 INTRA_ONLY, 3 SWITCH.
@@ -587,19 +530,9 @@ impl FormatFlagsAv1 {
     }
 }
 
-/// `DXVA_Tile_AV1` — one tile's location in the bitstream buffer. 16 bytes.
-///
-/// ONE RECORD PER TILE, not per tile GROUP. `row` and `column` are the tile's
-/// position in the frame's tile grid, which only a per-tile record can carry, and
-/// libavcodec's `dxva2_av1.c` sizes its array `frame_header->tile_cols *
-/// frame_header->tile_rows` and fills it `for (tile_num = h->tg_start; tile_num <=
-/// h->tg_end; tile_num++)`. A frame whose four tiles arrive in one tile group is
-/// four of these, not one.
-///
-/// [`Self::data_offset`] and [`Self::data_size`] address that tile's raw payload
-/// inside the bitstream buffer: the bytes AFTER its `tile_size_minus_1` field, and
-/// not one byte more. See [`mod@crate::pack_av1`] for what the buffer holds around
-/// them.
+/// `DXVA_Tile_AV1` — 16 bytes. One record per TILE, not per tile group.
+/// [`Self::data_offset`] / [`Self::data_size`] cover the payload after
+/// `tile_size_minus_1`. See [`mod@crate::pack_av1`].
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TileAv1 {
@@ -612,21 +545,13 @@ pub struct TileAv1 {
     pub reserved8: u8,
 }
 
-// The byte-view permission ([`crate::dxva::as_bytes`] / [`crate::dxva::slice_bytes`]),
-// for the two structures a submission actually copies into a driver mapping. The
-// sealed trait's argument is even simpler here than for the H.264/HEVC buffers:
-// `#[repr(C, packed)]` leaves NO padding at all, so "every byte is initialized" is
-// a property of the layout rather than of how carefully `zeroed()` was written.
-//
-// The nested blocks (`TilesAv1`, `LoopFilterAv1`, …) deliberately do NOT implement
-// it: they are never submitted on their own, only as members of
-// [`PicParamsAv1`].
+// `#[repr(C, packed)]` has no padding, so every byte is initialized. Nested
+// blocks (`TilesAv1`, …) do not implement this: they are never submitted
+// alone, only as members of [`PicParamsAv1`].
 impl crate::dxva::DxvaBuffer for PicParamsAv1 {}
 impl crate::dxva::DxvaBuffer for TileAv1 {}
 
-// Every number below was printed by `layout-probe-av1.c`, compiled with MSVC
-// against the Windows SDK's own `dxva.h` (10.0.26100.0) on .173. Not transcribed
-// from a specification, and not copied from libavcodec.
+// Sizes and offsets from `layout-probe-av1.c` against the SDK `dxva.h`.
 const _: () = {
     use std::mem::offset_of;
     use std::mem::size_of;
@@ -660,8 +585,7 @@ const _: () = {
     assert!(offset_of!(PicParamsAv1, reserved32) == 904);
     assert!(offset_of!(PicParamsAv1, status_report_feedback_number) == 908);
 
-    // Nested offsets, measured through the outer struct so a wrong INTERNAL
-    // layout cannot hide behind a right outer one.
+    // Nested offsets: a wrong internal layout cannot hide behind a correct outer size.
     assert!(offset_of!(TilesAv1, widths) == 4);
     assert!(offset_of!(TilesAv1, heights) == 132);
     assert!(offset_of!(LoopFilterAv1, filter_level_u) == 2);
@@ -709,11 +633,8 @@ const _: () = {
 mod tests {
     use super::*;
 
-    /// Every packed word, checked against the value MSVC produced for the same
-    /// single-field assignment. These are the probe's own printed numbers — the
-    /// point being that C bit-field order is ABI-defined, so the only honest way
-    /// to know where `tx_mode` lands is to have asked the compiler that the
-    /// driver agrees with.
+    /// Packed words against MSVC's single-field assignments. C bit-field order is
+    /// ABI-defined; `tx_mode`'s position is whatever that compiler put it at.
     #[test]
     fn packed_words_match_what_msvc_measured() {
         assert_eq!(
@@ -822,9 +743,8 @@ mod tests {
         );
     }
 
-    /// A zeroed picture-parameters block must name NO references. `0` is a valid
-    /// surface index, so a memset-style default would quietly point every unused
-    /// reference at surface 0 — which decodes, and decodes wrong.
+    /// A zeroed block must name no references. `0` is a valid surface index, so a
+    /// memset-style default would point every unused reference at surface 0.
     #[test]
     fn a_zeroed_block_names_no_reference() {
         let p = PicParamsAv1::zeroed();
