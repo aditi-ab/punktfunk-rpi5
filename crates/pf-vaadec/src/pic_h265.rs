@@ -1,26 +1,19 @@
-//! One HEVC [`AuPlanH265`] into libva's buffers — the H.265 twin of [`crate::pic`],
-//! with the same transaction discipline and the same refusal-over-narrowing posture.
+//! One HEVC [`AuPlanH265`] into libva picture, IQ, and slice buffers. Twin of
+//! [`crate::pic`]: validate and resolve against the pre-removal DPB, then mutate.
 //!
-//! # What differs from the H.264 conversion, and why each one bites
+//! HEVC differs from that H.264 conversion in five ways that mis-wire a driver:
 //!
-//! * **`ReferenceFrames` is 15 entries, not 16.**
-//! * **The reference sets are FLAGS, not arrays.** `RefPicSetStCurrBefore/After/LtCurr`
-//!   do not exist here: membership is ORed into each DPB entry's own `flags` as
-//!   `VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE` / `_AFTER` / `_LT_CURR`. Vulkan wants slot
-//!   indices in identically named arrays and DXVA wants list positions in them — this
-//!   is the third convention, and confusing the first two is what made HEVC
-//!   unplayable on every driver.
-//! * **The per-slice lists are INDICES into `ReferenceFrames`**, not pictures and not
-//!   surfaces, with `0xff` for an unused entry. So the DPB array must be built first
-//!   and every list entry resolved through it — a picture a slice names that is not in
-//!   the marked DPB is a refusal here rather than something to paper over.
-//! * **The offset is in BYTES.** `slice_data()` is byte-aligned by `byte_alignment()`,
-//!   so `header_bit_size / 8` is exact — asserted, not assumed, because a rounded
-//!   offset would decode garbage from the first inter picture.
-//! * **The IQ matrix is optional** and gated on `scaling_list_enabled_flag`, exactly
-//!   as the DXVA rung gates its `qmatrix`. Submitting one built from an all-zero
-//!   parser default is the defect review round 13 caught on the DXVA side: a driver
-//!   MUST apply what it is handed, so every residual would dequantise to zero.
+//! * `ReferenceFrames` is 15 entries, not 16.
+//! * RPS membership is flags ORed onto each DPB entry
+//!   (`VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE` / `_AFTER` / `_LT_CURR`). There are no
+//!   `RefPicSet*` arrays: Vulkan wants slot indices there, DXVA wants list
+//!   positions. Either convention here submits an empty RPS.
+//! * Per-slice lists are indices into `ReferenceFrames` (`0xff` unused). Build the
+//!   DPB array first; a named picture missing from it is a refusal.
+//! * `slice_data_byte_offset` is bytes. `header_bit_size / 8` is exact — never
+//!   round; `slice_data()` is already byte-aligned.
+//! * The IQ matrix is submitted only when `scaling_list_enabled_flag` is set. A
+//!   table of parser zeros would dequantise every residual to zero.
 
 use std::ops::Range;
 
@@ -49,8 +42,7 @@ use crate::SlotMap;
 #[derive(Debug, Clone)]
 pub struct DecodePlanVaH265 {
     pub pic_params: VaPictureParameterBufferHEVC,
-    /// `None` unless the sequence enables scaling lists — the buffer is then not
-    /// submitted at all (module docs).
+    /// `None` when scaling lists are off — then no IQ buffer is submitted.
     pub iq_matrix: Option<VaIqMatrixBufferHEVC>,
     pub slices: Vec<VaSliceParameterBufferHEVC>,
     /// Each slice's data range, start code excluded. Parallel to [`Self::slices`].
@@ -68,9 +60,8 @@ pub enum PlanToVaH265Error {
         required: usize,
         capacity: usize,
     },
-    /// A slice list, or an RPS set, named a picture the marked DPB does not hold —
-    /// and HEVC's lists are indices INTO that array, so there is nothing to fall
-    /// back to.
+    /// A slice list or RPS set named a picture the marked DPB does not hold.
+    /// HEVC lists are indices into that array: there is no fallback.
     UnresolvedReference(PicId),
     /// More marked references than `ReferenceFrames[15]` can express.
     TooManyReferences(usize),
@@ -85,9 +76,8 @@ pub enum PlanToVaH265Error {
     SliceRange {
         slice: usize,
     },
-    /// `header_bit_size` is not a whole number of bytes. `slice_data()` is
-    /// byte-aligned, so this means the parser and this conversion disagree about
-    /// where the header ended — never something to round.
+    /// `header_bit_size` is not a whole number of bytes. Never round: a rounded
+    /// `slice_data_byte_offset` would skip into the payload.
     UnalignedSliceHeader {
         slice: usize,
         bits: u32,
@@ -143,10 +133,9 @@ impl std::fmt::Display for PlanToVaH265Error {
 
 impl std::error::Error for PlanToVaH265Error {}
 
-/// Convert one planned HEVC access unit. See [`crate::pic::plan_to_va`] for the
-/// parameter contract — `au`, `surfaces` and `setup_surface` mean the same things,
-/// including the reason the decode target is bound by the caller rather than read
-/// out of a slot-indexed table.
+/// Convert one planned HEVC access unit. `au`, `surfaces`, and `setup_surface`
+/// match [`crate::pic::plan_to_va`]: the caller binds the decode target, because
+/// reading it from a slot-indexed table would reuse a surface still on screen.
 pub fn plan_to_va_h265(
     plan: &AuPlanH265,
     au: &[u8],
@@ -172,8 +161,8 @@ pub fn plan_to_va_h265(
             capacity: slots.capacity(),
         });
     }
-    // See the H.264 twin: a pre-check, so the caller's post-call bind of
-    // `setup_surface` to the returned slot is always in range.
+    // Pre-check so the caller's post-return bind of `setup_surface` to the
+    // returned slot cannot land past `surfaces`.
     if surfaces.len() < slots.capacity() {
         return Err(PlanToVaH265Error::SurfaceOutOfRange {
             slot: (slots.capacity() - 1) as u8,
@@ -184,11 +173,8 @@ pub fn plan_to_va_h265(
         return Err(PlanToVaH265Error::TooManyReferences(plan.dpb_refs.len()));
     }
 
-    // --- the DPB array, and the index every slice list will speak in ---------
-    //
-    // Built FIRST because the per-slice lists are indices into it. `dpb_refs` is
-    // the marked DPB — a superset of the three current sets, since RefPicSet*Foll
-    // pictures stay marked for later access units.
+    // Built first: per-slice lists are indices into this array. `dpb_refs` is
+    // the marked DPB, including RefPicSet*Foll pictures later AUs still need.
     let mut reference_frames = [VaPictureHEVC::invalid(); REFERENCE_FRAMES_LEN_H265];
     let mut index_of: Vec<(PicId, u8)> = Vec::with_capacity(plan.dpb_refs.len());
     for (slot_out, rp) in reference_frames.iter_mut().zip(&plan.dpb_refs) {
@@ -215,8 +201,8 @@ pub fn plan_to_va_h265(
         index_of.push((rp.id, index_of.len() as u8));
     }
 
-    // Membership flags, ORed onto the entries the three current sets name. This is
-    // VAAPI's whole expression of the RPS — there is no array to fill.
+    // VAAPI has no RefPicSet* arrays: OR membership onto the DPB entries the
+    // three current sets name.
     for (set, flag) in [
         (&plan.rps.st_curr_before, VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE),
         (&plan.rps.st_curr_after, VA_PICTURE_HEVC_RPS_ST_CURR_AFTER),
@@ -239,8 +225,6 @@ pub fn plan_to_va_h265(
             .map(|(_, i)| *i)
             .ok_or(PlanToVaH265Error::UnresolvedReference(id))
     };
-
-    // --- per-slice records ---------------------------------------------------
 
     let mut slices = Vec::with_capacity(plan.slices.len());
     let mut slice_data = Vec::with_capacity(plan.slices.len());
@@ -311,10 +295,9 @@ pub fn plan_to_va_h265(
             }
         }
 
-        // 7.3.6.1: an explicit weight table is only coded for a P slice when the PPS
-        // enables weighted P prediction, or a B slice when it enables weighted
-        // bi-prediction. Copying it anywhere else hands the driver parser defaults as
-        // though the stream had coded them.
+        // 7.3.6.1: a weight table is coded only for P+weighted_pred or
+        // B+weighted_bipred. Copying it elsewhere hands the driver parser defaults
+        // as if the stream had coded them.
         let weighted = (pps.weighted_pred_flag && hdr.type_ == SliceTypeH265::P)
             || (pps.weighted_bipred_flag && hdr.type_ == SliceTypeH265::B);
         if weighted {
@@ -328,9 +311,8 @@ pub fn plan_to_va_h265(
             rec.luma_offset_l1 = pwt.luma_offset_l1;
             rec.delta_chroma_weight_l1 = pwt.delta_chroma_weight_l1;
 
-            // libva takes the DERIVED ChromaOffsetLX; the parser stores the coded
-            // delta. Clamped into a legal shift because a malformed denominator must
-            // not panic a decode thread.
+            // libva wants derived ChromaOffsetLX; the parser stores the coded
+            // delta. Clamp the shift so a malformed denominator cannot panic.
             let denom = (i32::from(pwt.luma_log2_weight_denom)
                 + i32::from(pwt.delta_chroma_log2_weight_denom))
             .clamp(0, 7);
@@ -356,7 +338,7 @@ pub fn plan_to_va_h265(
         slices.push(rec);
     }
 
-    // --- mutations, after every fallible step --------------------------------
+    // Slot mutations only after every fallible step has passed.
 
     let setup_evicted = plan.dpb.removed.contains(&setup_id);
     for &id in &plan.dpb.removed {
@@ -398,9 +380,8 @@ pub fn plan_to_va_h265(
             pps_loop_filter_across_slices_enabled_flag: pps.loop_filter_across_slices_enabled_flag,
             loop_filter_across_tiles_enabled_flag: pps.loop_filter_across_tiles_enabled_flag,
             pcm_loop_filter_disabled_flag: sps.pcm_loop_filter_disabled_flag,
-            // Both are DERIVED hints a decoder may optimise on. libavcodec's VAAPI
-            // backend leaves them 0 for every stream, and a wrong "no reordering"
-            // claim is a correctness bug rather than a slow path — so 0 it is.
+            // Derived hints. A false "no reordering" is a correctness bug, not a
+            // slow path, so leave both 0.
             no_pic_reordering_flag: false,
             no_bi_pred_flag: false,
         }
@@ -444,8 +425,7 @@ pub fn plan_to_va_h265(
                 .slice_segment_header_extension_present_flag,
             rap_pic_flag: pic.is_irap,
             idr_pic_flag: pic.is_idr,
-            // An IRAP picture is intra by definition; nothing in our envelope codes
-            // an intra-only non-IRAP picture.
+            // IRAP ⇒ intra; the envelope does not code an intra-only non-IRAP.
             intra_pic_flag: pic.is_irap,
         }
         .pack(),
@@ -461,9 +441,8 @@ pub fn plan_to_va_h265(
         va_reserved: [0; 8],
     };
 
-    // The DXVA rung's rule, for the same reason: PPS lists win unless only the SPS
-    // carried them. Gated on scaling_list_enabled_flag so a stream that codes none
-    // gets no buffer at all rather than a table of parser defaults.
+    // PPS lists win unless only the SPS carried them. No buffer at all when
+    // scaling lists are off — a table of parser zeros would dequantise to zero.
     let iq_matrix = sps.scaling_list_enabled_flag.then(|| {
         let sl = if sps.scaling_list_data_present_flag && !pps.scaling_list_data_present_flag {
             &sps.scaling_list
@@ -499,10 +478,8 @@ pub fn plan_to_va_h265(
 
 /// `ChromaOffsetLX` per equation 7-56.
 ///
-/// libva takes the derived value; the vendored parser stores the coded
-/// `delta_chroma_offset_lX`, so the derivation happens here rather than being
-/// mistaken for a straight copy — which would put a delta where a driver expects an
-/// offset and tint every weighted-predicted block.
+/// libva wants the derived offset; the parser stores coded
+/// `delta_chroma_offset_lX`. A straight copy would tint every weighted block.
 fn chroma_offsets(
     delta_weight: &[[i8; 2]; 15],
     delta_offset: &[[i16; 2]; 15],
@@ -519,15 +496,12 @@ fn chroma_offsets(
     })
 }
 
-/// `column_width_minus1` is `u32` in the parser and `u16` in libva; a value past
-/// 65535 columns is impossible for any real picture, so saturating is honest here
-/// and a wrap would not be.
+/// Parser `u32` → libva `u16`. Saturate: a wrap would invent a tiny last tile;
+/// 65535 columns is not a real picture.
 ///
-/// Takes a slice, not a fixed-size array: libva's 19/21 are a frozen ABI (see the
-/// `offset_of!` asserts in `va_h265`), while the parser's arrays carry one extra
-/// slot for the running remainder it stores at `[num_tile_*_minus1]`. Copying the
-/// first 19/21 is what libva wants anyway — it derives the last tile itself — and
-/// a slice means growing the parser side again cannot break this pair.
+/// Slice, not `[u32; N]`: libva's 19/21 are frozen ABI (`offset_of!` in `va_h265`);
+/// the parser stores one extra remainder at `[num_tile_*_minus1]`. Copy the first
+/// 19/21 — libva derives the last tile — so a longer parser array cannot break this.
 fn narrow_19(src: &[u32]) -> [u16; 19] {
     std::array::from_fn(|i| u16::try_from(src.get(i).copied().unwrap_or(0)).unwrap_or(u16::MAX))
 }
@@ -542,7 +516,6 @@ mod tests {
     use crate::va_h265::REF_PIC_LIST_UNUSED;
     use crate::va_h265::VA_PICTURE_HEVC_INVALID;
 
-    /// `SURFACE_BASE + access-unit index` — see the H.264 twin's constant.
     const SURFACE_BASE: u32 = 0xa000;
 
     const TEST_25FPS_H265: &[u8] = include_bytes!(
@@ -550,9 +523,9 @@ mod tests {
     );
     const TEST_MAIN10_H265: &[u8] = include_bytes!("../../pf-vkdecode/tests/data/test-main10.h265");
 
-    /// HEVC access-unit splitter — two-byte NAL header, so
-    /// `first_slice_segment_in_pic_flag` is the top bit at `+2` where H.264 reads
-    /// `+1`, and "is a slice" is the range `< 32` rather than an enum pair.
+    /// Split HEVC Annex-B into access units. The NAL header is two bytes, so
+    /// `first_slice_segment_in_pic_flag` is the top bit at `+2` (H.264 reads `+1`)
+    /// and a slice is nal_unit_type `< 32`.
     fn split_aus(stream: &[u8]) -> Vec<&[u8]> {
         let mut aus = Vec::new();
         let (mut au_start, mut au_has_slice) = (0usize, false);
@@ -588,8 +561,8 @@ mod tests {
         assert_eq!(aus.len(), expect_aus, "{label}: access-unit count");
 
         let mut planner = H265Planner::new();
-        // The caller's binding model — see the H.264 twin: one never-reused surface
-        // id per picture, bound to its slot after the conversion returns.
+        // One never-reused surface id per picture, bound to its slot after
+        // conversion returns — the caller's model, same as the H.264 twin.
         let mut surfaces: Vec<u32> = Vec::new();
         let mut slots: Option<SlotMap> = None;
         let mut saw_rps_flags = false;
@@ -617,9 +590,8 @@ mod tests {
                 );
                 assert!(rec.slice_data_byte_offset > 0);
                 assert!((rec.slice_data_byte_offset as usize) < range.end - range.start);
-                // Every used list entry must index a VALID DPB array slot — HEVC's
-                // lists are indices, so a stale 0xff or an out-of-range index is a
-                // silently wrong reference rather than a refusal.
+                // Used list entries are indices into ReferenceFrames. A stale 0xff
+                // or an out-of-range index is a silent wrong reference, not a refusal.
                 for list in &rec.ref_pic_list {
                     for &idx in list.iter().filter(|&&i| i != REF_PIC_LIST_UNUSED) {
                         saw_list_entries = true;
@@ -678,8 +650,8 @@ mod tests {
         walk(TEST_25FPS_H265, 250, "8-bit");
     }
 
-    /// The Main 10 vector too — the pic-params carry depth, and a conversion that
-    /// only ever saw 8-bit would not notice a depth field wired to a constant.
+    /// Main 10 as well: pic-params carry bit depth, and an 8-bit-only walk would
+    /// not notice a depth field wired to a constant.
     #[test]
     fn the_main10_vector_converts() {
         walk(TEST_MAIN10_H265, 50, "Main 10");

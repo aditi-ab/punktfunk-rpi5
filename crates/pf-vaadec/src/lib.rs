@@ -1,88 +1,26 @@
-//! Native VAAPI decode for the Linux clients — M6 (H.264/HEVC) and M7 (AV1) of the
-//! native-decode program, and the VAAPI counterpart of [`pf_vkdecode`] and
-//! `pf-dxvadec`.
+//! Native VAAPI H.264/HEVC/AV1 decode for the Linux clients, counterpart of
+//! [`pf_vkdecode`] and `pf-dxvadec`.
 //!
-//! Like `pf-dxvadec`, this crate is the **CPU-testable half**: everything between
-//! pf-bitstream's per-AU plan and the buffers a `vaRenderPicture` call delivers. It
-//! links no libva, names no `VA*` handle type, and compiles on macOS and in the Linux
-//! container — which is the point. The VAAPI rung itself is
-//! `cfg(target_os = "linux")` code that only a box can build, so anything left inside
-//! that boundary is verified by a remote `cargo check` and nothing more.
+//! CPU-testable half: everything between a [`pf_bitstream`] access-unit plan and
+//! the buffers `vaRenderPicture` delivers. It links no libva, names no `VA*`
+//! handle type, and compiles on macOS. The `cfg(target_os = "linux")` rung lives
+//! in `pf-client-core`; this crate holds layouts, conversion, and export walk.
 //!
-//! - [`va`] / [`va_h265`] / [`va_av1`]: the libva decode buffer layouts,
-//!   **hand-declared**, with every size and offset measured off the real headers and
-//!   pinned as compile-time assertions.
-//! - [`config`]: profile, render-target format and surface-count decisions.
-//! - [`pic`] / [`pic_h265`] / [`pic_av1`]: one `AuPlan` into picture parameters, IQ
-//!   matrices and slice records (AV1: tile records, and no IQ matrix at all).
+//! [`va`] / [`va_h265`] / [`va_av1`] hand-declare the libva decode buffers;
+//! sizes and offsets are measured by `layout-probe.c` and pinned as compile-time
+//! assertions. [`config`] picks profile, render-target format, and surface count.
+//! [`pic`] / [`pic_h265`] / [`pic_av1`] fill picture parameters, matrices, and
+//! slice or tile records. [`drm`] is the one structure the DRIVER writes: the
+//! PRIME export descriptor and the plane walk a dmabuf import consumes.
 //!
-//! # Status
-//!
-//! **All three codecs converted, and the rung is wired.** `pf-client-core`'s
-//! `video_vaapi_native` dlopens libva and drives these buffers; this crate holds
-//! everything decidable without a device — including [`drm`], the export
-//! descriptor the driver writes back and the plane walk that reads it.
-//!
-//! **Every conversion in this crate has now been checked in PIXELS.** On 2026-08-08,
-//! on `.25` (Radeon 780M, RDNA3, radeonsi, Mesa 26.0.3, VA-API 1.23),
-//! `pf-client-core`'s `video_vaapi_native::parity` decoded seven streams through the
-//! rung and hashed every delivered frame against libavcodec's software decode — the
-//! same golden files the Vulkan and D3D11VA rungs are held to — and all seven came
-//! back bit-identical: 250 + 120 H.264, 250 + 120 H.265, 50 HEVC Main 10 (P010), and
-//! 250 + 60 AV1. That was possible at all because [`va::pack_two_plane`] and the
-//! `VAImage` pair below give a TEST-ONLY readback of a decoded surface; nothing on the
-//! production path maps one, and that module's docs say how it is kept that way.
-//!
-//! ⚠ ONE vendor. AMD/radeonsi only — Intel's iHD driver has neither run these legs nor
-//! been asked to.
-//!
-//! Five things this crate settled that a reader would otherwise have to re-derive:
-//!
-//! * **`slice_data_bit_offset` costs no new parsing.** VAAPI is the only one of the
-//!   three backends that wants a bit position — DXVA takes a byte offset, Vulkan
-//!   takes none — and the vendored parser already records exactly it as
-//!   `SliceHeader::header_bit_size`, because cros-codecs' own production backend is
-//!   VAAPI. Its definition matches field for field: computed as
-//!   `(nalu.size - emulation_prevention_bytes) * 8 - bits_left`, it counts from and
-//!   including the NAL header byte with emulation-prevention bytes removed, which is
-//!   what `VASliceParameterBufferH264` documents.
-//! * **The slice data buffer starts at the NAL header byte**, so the start code is
-//!   skipped — `SlicePlan::data` is start-code-inclusive, and the prefix is three
-//!   OR four bytes (the real host emits four on 100% of access units), so it is
-//!   measured per slice rather than assumed.
-//! * **`VAPictureParameterBufferH264::reference_frames` is the MARKED DPB**, not the
-//!   access unit's own lists — the same statement DXVA's `RefFrameList` makes, so it
-//!   is filled from pf-bitstream's per-AU `dpb_refs` snapshot. Vulkan's
-//!   `pReferenceSlots` is the opposite and takes the AU's own set; all three
-//!   conventions now have a written home.
-//! * **Unlike DXVA's short-format slice control, VAAPI wants the per-slice reference
-//!   lists themselves** (`RefPicList0`/`RefPicList1`, 32 entries each, in 8.2.4.2
-//!   order) and the prediction weight tables. One wrinkle handled in [`pic`]: the
-//!   vendored `PredWeightTable` stores `luma_offset_l0` as `[i8; 32]` but
-//!   `luma_offset_l1` as `[i16; 32]`, an upstream inconsistency, while libva wants
-//!   `i16` for both.
-//! * **AV1's reference plumbing is a FIFTH convention**, and libva's AV1 buffers
-//!   break three of this rung's other habits: the "slice" parameter buffer is a TILE
-//!   parameter buffer, several of its records share ONE data buffer (the only place
-//!   `vaCreateBuffer`'s `num_elements` is not 1), and there is no IQ matrix buffer at
-//!   all. [`va_av1`] states the convention and what it was established from;
-//!   [`pic_av1`] is where it is applied.
-//!
-//! # Why the slot ledger is borrowed
-//!
-//! [`SlotMap`] comes from [`pf_vkdecode`] for the reason `pf-dxvadec`'s docs give at
-//! length: it is not a Vulkan object but a ledger from
-//! [`pf_bitstream::h264::PicId`] to hardware DPB slot indices, and it is as
-//! API-agnostic as it is codec-agnostic. VAAPI's own indirection is one step longer —
-//! a slot indexes the caller's surface table, because `VAPictureH264::picture_id` is
-//! a `VASurfaceID` rather than an index — so the conversion will take that table as
-//! a parameter and stay pure.
+//! [`SlotMap`] is re-exported from [`pf_vkdecode`]. VAAPI's extra hop is that
+//! `VAPictureH264::picture_id` is a `VASurfaceID`, not a slot index, so conversion
+//! takes the caller's surface table and stays pure. Evidence: `layout-probe.c`
+//! and the compile-time assertions in [`va`], [`va_h265`], [`va_av1`], and [`drm`].
 
-// The header above states the crate's whole design constraint: it is the CPU-testable half, it
-// links no libva, and it compiles on macOS — "which is the point". That constraint is exactly
-// what `forbid(unsafe_code)` encodes. The crate is full of hand-declared libva `repr(C)` mirrors,
-// and the moment one of them gets dereferenced through a raw pointer here, the crate has quietly
-// become the other half and stops being testable off a Linux box with a GPU.
+// `forbid(unsafe_code)` is the CPU-testable contract: no libva, no raw deref of
+// the hand-declared `repr(C)` mirrors. A pointer walk here would make this the
+// GPU half, untestable off a Linux box.
 #![forbid(unsafe_code)]
 
 pub mod config;
@@ -94,13 +32,12 @@ pub mod va;
 pub mod va_av1;
 pub mod va_h265;
 
-/// The DPB slot ledger — borrowed, not redefined (crate docs).
+/// DPB slot ledger, re-exported from [`pf_vkdecode`] (crate docs).
 pub use pf_vkdecode::SlotError;
 pub use pf_vkdecode::SlotMap;
 
-/// The AV1 planner and its plan. ⚠ Its `plan_au` returns a **`Vec`**: an AV1 access
-/// unit is a TEMPORAL UNIT and may carry several frames, of which at most one
-/// displays.
+/// AV1 planner. ⚠ `plan_au` returns a **`Vec`**: an AV1 access unit is a temporal
+/// unit and may carry several frames, of which at most one displays.
 pub use pf_bitstream::av1::AuPlan as AuPlanAv1;
 pub use pf_bitstream::av1::Av1Planner;
 pub use pf_bitstream::av1::DpbUpdate as DpbUpdateAv1;
@@ -112,9 +49,8 @@ pub use pf_bitstream::av1::PicturePlan as PicturePlanAv1;
 pub use pf_bitstream::av1::PlanError as PlanErrorAv1;
 pub use pf_bitstream::av1::PlanWarning as PlanWarningAv1;
 pub use pf_bitstream::av1::NUM_REF_SLOTS;
-/// The planners and plans this crate converts, re-exported so the Linux layer names
-/// every type it touches through `pf_vaadec` — the same courtesy `pf-dxvadec` does
-/// for the Windows layer.
+/// H.264/H.265 planners, re-exported so the Linux layer names them through
+/// `pf_vaadec` and does not grow a pf-bitstream dependency of its own.
 pub use pf_bitstream::h264::AuPlan;
 pub use pf_bitstream::h264::ColourDescription;
 pub use pf_bitstream::h264::DisplayCrop;
@@ -125,8 +61,8 @@ pub use pf_bitstream::h265::AuPlan as AuPlanH265;
 pub use pf_bitstream::h265::H265Planner;
 pub use pf_bitstream::h265::PlanError as PlanErrorH265;
 pub use pf_bitstream::h265::PlanWarning as PlanWarningH265;
-/// Which warnings mean the PICTURE is damaged — pf-vkdecode's one list, so all three
-/// native rungs conceal on exactly the same predicate.
+/// Integrity warnings: pf-vkdecode's list, so all three native rungs conceal on
+/// the same predicate.
 pub use pf_vkdecode::is_integrity_warning;
 pub use pf_vkdecode::is_integrity_warning_av1;
 pub use pf_vkdecode::is_integrity_warning_h265;
@@ -166,15 +102,9 @@ pub use va::VaPictureH264;
 pub use va::VaPictureParameterBufferH264;
 pub use va::VaSliceParameterBufferH264;
 
-// The CPU-readable view of a decoded surface, and the pure walk that packs one into
-// the layout this program's goldens hash.
-//
-// ⚠ TEST-ONLY. Nothing on the production video path maps a surface — the rung exports
-// a DRM-PRIME dmabuf and the presenter samples it, which is the zero-copy contract —
-// so the only caller is `pf-client-core`'s `video_vaapi_native::parity`, which exists
-// solely under `#[cfg(test)]`. These are declared here so that harness needs no
-// `libva-dev` and so its geometry can be checked with no device at all (`va`'s module
-// docs say why at length).
+// ⚠ TEST-ONLY surface readback. Production exports a PRIME dmabuf; the only
+// caller is `video_vaapi_native::parity` under `#[cfg(test)]`. Declared here
+// so the harness needs no `libva-dev` (`va` module docs).
 pub use va::pack_two_plane;
 pub use va::packed_len;
 pub use va::ImageReadError;
