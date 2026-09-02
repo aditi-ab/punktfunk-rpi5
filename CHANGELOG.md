@@ -41,8 +41,12 @@ The guided Linux installer is now a binary. Wire and C ABI unchanged.
   reports a diagonal we can trust. Manual values clamp to 0.5–4.0, the range
   `PUNKTFUNK_OSD_SCALE` and `render_scale` already use, and the pickers offer 25 %-apart presets
   with a free percentage beside them. Twins ship as Kotlin's `OsdScale` and `OsdScale.swift`; the
-  presenter's `overlay_scale` now resolves through the shared module, so its env knob and the
-  mobile pickers clamp alike. Nothing crosses the wire — the host never sees it.
+  presenter's `overlay_scale` now resolves through the shared module. On desktop the value is
+  `trust::Settings::osd_scale` — a client setting beside `render_scale`, absent from
+  `SettingsOverlay` because screen size is a fact about the device, not the host a profile is
+  authored against — surfaced in the GTK dialog and the console home, with
+  `PUNKTFUNK_OSD_SCALE` demoted to an override. A store written before this loads as Automatic.
+  Nothing crosses the wire; the host never sees it.
 - **IDD-push shared header v3 carries ring health.** The 88-byte header grows a 64-byte tail:
   a health state (`Initializing`/`Active`/`Rebuilding`/`Dead`), driver and host capability
   words negotiated by intersection, assignment and D3D-device epochs, a source sequence that

@@ -89,6 +89,9 @@ pub struct SessionOpts {
     pub render_scale: f64,
     /// Codec per-axis ceiling for the render-scale clamp (4096 for H.264, else 8192).
     pub render_scale_max_dim: u32,
+    /// Overlay chrome multiplier from client settings ([`punktfunk_core::osd_scale`]).
+    /// `AUTO` resolves from the device class; `PUNKTFUNK_OSD_SCALE` overrides it.
+    pub osd_scale: f64,
 }
 
 pub enum Outcome {
@@ -580,13 +583,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         println!("{{\"ready\":true}}");
     }
 
-    // Operator preference on top of the display DPI. Read once (a preference, not
-    // session state); the DPI part is re-read per frame. Unset parses to AUTO, which
-    // `overlay_scale` resolves to this device class's default.
+    // The client's overlay-size setting, on top of the display DPI. Read once (a
+    // preference, not session state); the DPI part is re-read per frame. The env var is
+    // the override; AUTO from either resolves to this device class's default.
     let osd_scale_pref = std::env::var("PUNKTFUNK_OSD_SCALE")
         .ok()
         .and_then(|s| s.trim().parse::<f32>().ok())
-        .unwrap_or(punktfunk_core::osd_scale::AUTO as f32);
+        .unwrap_or(opts.osd_scale as f32);
 
     let mut overlay = opts.overlay.take();
     if let Some(o) = overlay.as_mut() {

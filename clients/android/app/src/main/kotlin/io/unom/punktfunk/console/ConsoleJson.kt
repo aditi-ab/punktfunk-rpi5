@@ -317,6 +317,7 @@ internal object ConsoleJson {
         j.put("refresh_hz", s.hz)
         j.put("bitrate_kbps", s.bitrateKbps)
         j.put("render_scale", s.renderScale)
+        j.put("osd_scale", s.osdScale)
         j.put("gamepad", GAMEPAD_NAMES.getOrElse(s.gamepad) { "auto" })
         j.put("gamepad_forwarding", s.gamepadForwarding)
         j.put("system_buttons", s.systemButtons)
@@ -373,6 +374,7 @@ internal object ConsoleJson {
             hz = j.optInt("refresh_hz", s.hz),
             bitrateKbps = j.optInt("bitrate_kbps", s.bitrateKbps),
             renderScale = j.optDouble("render_scale", s.renderScale),
+            osdScale = j.optDouble("osd_scale", s.osdScale),
             gamepad = GAMEPAD_NAMES.indexOf(str("gamepad", "")).takeIf { it >= 0 } ?: s.gamepad,
             gamepadForwarding = j.optBoolean("gamepad_forwarding", s.gamepadForwarding),
             systemButtons = str("system_buttons", s.systemButtons),

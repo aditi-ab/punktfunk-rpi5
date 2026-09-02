@@ -196,6 +196,7 @@ pub fn run(target: Option<&str>) -> u8 {
         window_pos: window_pos(),
         // Seeds the loop only — every launch carries its own freshly resolved tier.
         stats_verbosity: stats_tier(&settings_at_start),
+        osd_scale: settings_at_start.osd_scale,
         touch_mode: settings_at_start.touch_mode(),
         mouse_mode: settings_at_start.mouse_mode(),
         invert_scroll: settings_at_start.invert_scroll,

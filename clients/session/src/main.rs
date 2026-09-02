@@ -1063,6 +1063,7 @@ mod session_main {
             fullscreen,
             window_pos: window_pos(),
             stats_verbosity: stats_tier(&settings),
+            osd_scale: settings.osd_scale,
             touch_mode: settings.touch_mode(),
             mouse_mode: settings.mouse_mode(),
             invert_scroll: settings.invert_scroll,
