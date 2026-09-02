@@ -1,20 +1,13 @@
-//! The motion **unit contract**, pinned across every side that has an opinion about it.
+//! Motion unit contract: every backend's calibration or rescale lands on the wire constants.
 //!
-//! Gyro aim integrates angular velocity over time, so a scale error is not a cosmetic wrongness —
-//! it is every rotation being the wrong size, forever. The wire carries raw `i16` LSBs in the
-//! DualSense convention ([`MOTION_GYRO_LSB_PER_DEG_S`] / [`MOTION_ACCEL_LSB_PER_G`]), and each host
-//! backend re-states that convention in its own dialect: the Sony pads *declare* it in a fixed
-//! calibration feature report the consumer reads its scale out of, the Steam Deck and Switch Pro
-//! backends *rescale* into their driver's native resolution.
+//! Gyro aim integrates angular velocity, so a scale error is every rotation the wrong
+//! size. The wire carries DualSense `i16` LSBs ([`MOTION_GYRO_LSB_PER_DEG_S`] /
+//! [`MOTION_ACCEL_LSB_PER_G`]). Sony pads *declare* that scale in a USB calibration
+//! feature report; Steam Deck and Switch Pro *rescale* into their driver's native
+//! resolution.
 //!
-//! Nothing used to check that those re-statements agreed with the wire. They didn't: the DualShock
-//! 4 blob declared 0.5 LSB/°·s and 8192 LSB/g against a wire delivering 20 and 10000, so every DS4
-//! session read gyro 40× too fast and accel 1.22× hot — in two byte-identical copies, one of them
-//! in a driver that lives in a different cargo workspace. This file is the gate that would have
-//! caught it: it applies the *consumer's* arithmetic to each backend's declaration and asserts the
-//! result lands back on the wire constants.
-//!
-//! Adding a motion-capable backend means adding it here.
+//! This file applies the consumer's arithmetic to each declaration and asserts the
+//! result is the wire constant. A new motion-capable backend belongs here.
 
 #![cfg(any(target_os = "linux", target_os = "windows"))]
 
@@ -34,21 +27,18 @@ use punktfunk_core::input::gamepad::{
 };
 use punktfunk_core::quic::RichInput;
 
-/// The Sony IMU-calibration feature report, whose layout is the same for the DualSense (report
-/// `0x05`) and the USB DualShock 4 (report `0x02`): report id, three signed bias words, six
-/// **interleaved** per-axis `plus`/`minus` words, two gyro `speed` words, then six accel
-/// `plus`/`minus` words, all little-endian `i16`.
+/// Sony IMU-calibration feature report (DualSense `0x05`, USB DualShock 4 `0x02`):
+/// report id, three signed bias words, six **interleaved** per-axis `plus`/`minus`
+/// words, two gyro `speed` words, six accel `plus`/`minus` words, all LE `i16`.
 ///
-/// ⚠ Interleaved is the **USB** order. A Bluetooth DualShock 4 groups the three plusses before the
-/// three minuses, and consumers switch layout on the transport; our virtual pads declare `BUS_USB`,
-/// so interleaved is correct here — this was checked and is not a latent bug.
+/// Interleaved is USB order. Bluetooth DualShock 4 groups pluses then minuses;
+/// consumers switch on transport. Virtual pads declare `BUS_USB`.
 #[derive(Debug, PartialEq, Eq)]
 struct SonyImuCalibration {
     gyro_bias: [i16; 3],
     gyro_plus: [i16; 3],
     gyro_minus: [i16; 3],
-    /// `speed_plus`, `speed_minus` — the reference rotation rate the plus/minus span was measured
-    /// at. Consumers only ever use the sum.
+    /// `speed_plus` + `speed_minus`: reference rate the plus/minus span was measured at.
     gyro_speed: [i16; 2],
     accel_plus: [i16; 3],
     accel_minus: [i16; 3],
@@ -73,16 +63,12 @@ impl SonyImuCalibration {
         }
     }
 
-    /// LSB per °/s that the **kernel** derives for axis `i`: `hid-playstation` sets
+    /// LSB/°·s the kernel derives for axis `i`. `hid-playstation` sets
     /// `sens_numer = (speed_plus + speed_minus) * GYRO_RES_PER_DEG_S` and
     /// `sens_denom = |plus - bias| + |minus - bias|`, then reports
-    /// `raw * sens_numer / sens_denom` in units of 1/`GYRO_RES_PER_DEG_S` °/s — so the
-    /// `GYRO_RES_PER_DEG_S` cancels and the resolution the pad *advertises* is `denom / speed_2x`,
-    /// independent of the driver's internal fixed-point scale.
-    ///
-    /// Returned as an integer because a fractional answer is itself a defect: no consumer can
-    /// round-trip a resolution it cannot express, and the assert below is where the pre-2026-08
-    /// DS4 blob (32/64 = 0.5) fails.
+    /// `raw * sens_numer / sens_denom` in 1/`GYRO_RES_PER_DEG_S` °/s.
+    /// `GYRO_RES_PER_DEG_S` cancels; advertised resolution is `denom / speed_2x`.
+    /// Integer because a fraction cannot round-trip.
     fn kernel_gyro_lsb_per_deg_s(&self, i: usize, who: &str) -> i64 {
         let speed_2x = self.gyro_speed[0] as i64 + self.gyro_speed[1] as i64;
         assert!(
@@ -99,17 +85,15 @@ impl SonyImuCalibration {
         denom / speed_2x
     }
 
-    /// The same number as SDL derives it (`SDL_hidapi_ps4` / `SDL_hidapi_ps5`: `plus - minus` over
-    /// the speed sum, ignoring the bias). It agrees with the kernel's form only for a symmetric,
-    /// zero-bias blob — and both consumers read the same virtual pad, so a blob they disagree
-    /// about is a bug no matter which one is "right".
+    /// SDL's form (`SDL_hidapi_ps4` / `SDL_hidapi_ps5`): `plus - minus` over the
+    /// speed sum, ignoring bias. Agrees with the kernel only for a symmetric
+    /// zero-bias blob — both consumers read the same pad, so disagreement is a bug.
     fn sdl_gyro_lsb_per_deg_s(&self, i: usize) -> f64 {
         (self.gyro_plus[i] as f64 - self.gyro_minus[i] as f64)
             / (self.gyro_speed[0] as f64 + self.gyro_speed[1] as f64)
     }
 
-    /// LSB per g for axis `i`: consumers take `range_2g = plus - minus` as the span of **2 g**, so
-    /// one g is half of it.
+    /// LSB/g for axis `i`: consumers take `plus - minus` as 2 g, so 1 g is half.
     fn accel_lsb_per_g(&self, i: usize, who: &str) -> i64 {
         let range_2g = self.accel_plus[i] as i64 - self.accel_minus[i] as i64;
         assert_eq!(
@@ -120,16 +104,14 @@ impl SonyImuCalibration {
         range_2g / 2
     }
 
-    /// The raw value a consumer treats as zero g (`plus - range_2g / 2`). Our pads pass the wire
-    /// through unscaled, and the wire's zero is 0, so this must be 0 — a non-zero bias would show
-    /// up as a constant phantom acceleration.
+    /// Raw value a consumer treats as zero g (`plus - range_2g / 2`). Wire zero is 0;
+    /// a non-zero bias is a constant phantom acceleration.
     fn accel_zero_point(&self, i: usize) -> i64 {
         let range_2g = self.accel_plus[i] as i64 - self.accel_minus[i] as i64;
         self.accel_plus[i] as i64 - range_2g / 2
     }
 }
 
-/// Every Sony-dialect backend declares exactly the wire's units, to both of its consumers.
 #[test]
 fn sony_calibration_blobs_declare_the_wire_units() {
     let wire_gyro = MOTION_GYRO_LSB_PER_DEG_S as i64;
@@ -165,30 +147,27 @@ fn sony_calibration_blobs_declare_the_wire_units() {
     }
 }
 
-/// The two rescaling backends land a wire sample on their driver's native resolution.
 #[test]
 fn rescaling_backends_convert_the_wire_into_their_native_units() {
-    // One reference sample: 100 °/s and exactly 1 g, expressed on the wire.
+    // 100 °/s and 1 g on the wire.
     let wire_gyro = (100 * MOTION_GYRO_LSB_PER_DEG_S) as i16;
     let wire_accel = MOTION_ACCEL_LSB_PER_G as i16;
 
-    // Steam Deck: `hid-steam` fixes STEAM_DECK_GYRO_RES_PER_DPS = 16 and ACCEL_RES_PER_G = 16384.
+    // hid-steam: STEAM_DECK_GYRO_RES_PER_DPS = 16, ACCEL_RES_PER_G = 16384.
     let (gyro, accel) = motion_wire_to_deck([wire_gyro; 3], [wire_accel; 3]);
     assert_eq!(gyro, [100 * 16; 3], "Deck gyro: 100 °/s at 16 LSB/°·s");
     assert_eq!(accel, [16384; 3], "Deck accel: 1 g at 16384 LSB/g");
 
-    // Switch Pro: `hid-nintendo` fixes JC_IMU_GYRO_RES_PER_DPS = 14.247 and ACCEL_RES_PER_G = 4096,
-    // and consumes our report 1:1 because the factory-calibration blob we serve is the driver's own
-    // identity default. 100 °/s × 14.247 = 1424.7, truncated.
+    // hid-nintendo: JC_IMU_GYRO_RES_PER_DPS = 14.247, ACCEL_RES_PER_G = 4096.
+    // Identity factory-calibration blob, so report is 1:1. 100 °/s × 14.247 = 1424.7, truncated.
     let mut st = SwitchState::neutral();
     st.apply_motion([wire_gyro; 3], [wire_accel; 3]);
     assert_eq!(st.gyro, [1424; 3], "Switch gyro: 100 °/s at 14.247 LSB/°·s");
     assert_eq!(st.accel, [4096; 3], "Switch accel: 1 g at 4096 LSB/g");
 }
 
-/// The DualSense / DualShock 4 backends hand the wire sample to the report codec **unscaled** —
-/// which is only correct because their calibration blobs declare the wire's own units above. If
-/// someone ever adds a rescale here, the blobs have to move with it (or vice versa).
+/// Sony backends pass the wire sample unscaled. Correct only because the blobs above
+/// declare the wire's units; a rescale here must move the blobs with it.
 #[test]
 fn sony_backends_pass_the_wire_sample_through_unscaled() {
     let gyro = [(100 * MOTION_GYRO_LSB_PER_DEG_S) as i16, -640, 7];
@@ -199,7 +178,6 @@ fn sony_backends_pass_the_wire_sample_through_unscaled() {
         accel,
     };
 
-    // Both Sony backends share `DsState::apply_rich`, differing only in touchpad extent.
     for (who, w, h) in [
         ("DualSense", DS_TOUCH_W, DS_TOUCH_H),
         ("DualShock 4", DS4_TOUCH_W, DS4_TOUCH_H),
@@ -211,14 +189,12 @@ fn sony_backends_pass_the_wire_sample_through_unscaled() {
     }
 }
 
-/// The client→report path end to end, in the units that matter: a wire Motion sample must reach
-/// the HID report's motion fields as those exact little-endian values. The proto tests already pin
-/// the OFFSETS; nothing pinned that the VALUE arrives unscaled — which is the half the calibration
-/// blobs above are a promise about.
+/// Proto tests pin the HID offsets; this pins the VALUE arriving unscaled — the
+/// other half of the calibration-blob promise.
 #[test]
 fn a_wire_motion_sample_reaches_the_report_bytes_unchanged() {
-    let g = (100 * MOTION_GYRO_LSB_PER_DEG_S) as i16; // 100 °/s  = 2000 = 0x07D0
-    let a = MOTION_ACCEL_LSB_PER_G as i16; // 1 g      = 10000 = 0x2710
+    let g = (100 * MOTION_GYRO_LSB_PER_DEG_S) as i16; // 100 °/s = 2000 = 0x07D0
+    let a = MOTION_ACCEL_LSB_PER_G as i16; // 1 g = 10000 = 0x2710
     let motion = RichInput::Motion {
         pad: 0,
         gyro: [g, -g, 0],
@@ -244,9 +220,8 @@ fn a_wire_motion_sample_reaches_the_report_bytes_unchanged() {
     assert_eq!(&r[19..25], &accel_le, "DualShock 4 report accel");
 }
 
-/// The idle-motion watchdog's semantics, which only make sense in these units: angular velocity
-/// goes to zero when the feed stops, acceleration does not — a still controller still measures
-/// gravity, and blanking it would read as free-fall.
+/// Idle watchdog: gyro → 0 when the feed stops; accel does not — a still pad
+/// still measures gravity, and blanking it reads as free-fall.
 #[test]
 fn neutralizing_motion_keeps_gravity() {
     let mut st = DsState::neutral();
@@ -266,19 +241,11 @@ fn neutralizing_motion_keeps_gravity() {
     assert_eq!(deck.accel, [0, 0, 16384], "Deck gravity must survive too");
 }
 
-/// A virtual pad that has received no motion must read as STILL, not as falling.
-///
-/// `[0, 0, 0]` is not "no information": zero proper acceleration is free fall, a claim about the
-/// physical world that is never true of a controller on a desk. Anything deriving orientation from
-/// the accelerometer gets a confident wrong answer rather than a boring right one — and the pads
-/// this affects most are the ones with no gyro at all, which sit on that neutral for the whole
-/// session.
-///
-/// Each backend is checked in ITS OWN units, because the value differs per backend and hard-coding
-/// "1 g" three times is how the two halves of a unit contract drift apart.
+/// Neutral must read as still, not free-fall. `[0, 0, 0]` is zero proper
+/// acceleration (falling). Each backend is checked in its own units.
 #[test]
 fn every_backend_neutral_reads_as_a_still_pad_not_a_falling_one() {
-    // The wire's own answer, measured from a real DualSense on 2026-08-07: axis 1 is UP.
+    // Wire convention: axis 1 is up.
     assert_eq!(MOTION_NEUTRAL_ACCEL, [0, MOTION_ACCEL_LSB_PER_G as i16, 0]);
 
     let ds = DsState::neutral();
@@ -288,9 +255,8 @@ fn every_backend_neutral_reads_as_a_still_pad_not_a_falling_one() {
     );
     assert_eq!(ds.gyro, [0; 3], "and it must not be turning");
 
-    // The Deck rescales, so its neutral is the wire's put through the same conversion a real
-    // sample takes — asserted against the resolution `hid-steam` actually fixes (16384 LSB/g),
-    // so a change to either side has to face this line.
+    // Deck neutral is the wire's, through the same rescale a live sample takes.
+    // 16384 LSB/g is hid-steam's ACCEL_RES_PER_G.
     let deck = SteamState::neutral();
     assert_eq!(
         deck.accel,
@@ -300,9 +266,8 @@ fn every_backend_neutral_reads_as_a_still_pad_not_a_falling_one() {
     assert_eq!(deck.accel, [0, 16384, 0]);
     assert_eq!(deck.gyro, [0; 3]);
 
-    // The Switch Pro already did this correctly and is deliberately NOT touched: it is a different
-    // device (hid-nintendo), its up axis is its own, and nobody has measured its frame. Pinned so
-    // that a well-meaning sweep does not "make it consistent" with the DualSense on no evidence.
+    // Switch Pro is a different device (hid-nintendo); its up axis is its own.
+    // Do not align it to DualSense unmeasured.
     let sw = SwitchState::neutral();
     assert_eq!(
         sw.accel,
@@ -310,7 +275,6 @@ fn every_backend_neutral_reads_as_a_still_pad_not_a_falling_one() {
         "switch_proto's neutral is its own device's; do not align it to the DualSense unmeasured"
     );
 
-    // The property that actually matters, stated once per backend: none of them is in free fall.
     for (what, accel) in [
         ("dualsense", ds.accel),
         ("deck", deck.accel),
@@ -326,17 +290,13 @@ fn every_backend_neutral_reads_as_a_still_pad_not_a_falling_one() {
     }
 }
 
-// ---- the Windows UMDF driver's copies ----
-
-/// `packaging/windows/drivers/pf-gamepad` is a separate WDK cargo workspace: it cannot depend on
-/// pf-inject, so it carries its own copies of the calibration blobs. That is exactly the shape the
-/// DS4 bug shipped in — one wrong table living in two files, where fixing one reads as fixing it.
-/// Rather than trust a "keep in sync" comment, derive the units from the driver's own source.
+/// Separate WDK workspace, cannot depend on pf-inject. Parse units from the
+/// driver's own source rather than trust a keep-in-sync comment.
 const DRIVER_SRC: &str = include_str!("../../../packaging/windows/drivers/pf-gamepad/src/lib.rs");
 
-/// Pull the bytes out of a `static NAME: [u8; N] = [ … ];` (or `const NAME: &[u8] = &[ … ];`)
-/// literal in Rust source. Deliberately dumb: the arrays it reads are `#[rustfmt::skip]` tables of
-/// `0x..` bytes, and a scan that breaks fails this test loudly rather than passing vacuously.
+/// Bytes of a `static NAME: [u8; N] = [ … ];` (or `const NAME: &[u8] = &[ … ];`)
+/// in source. The tables are `#[rustfmt::skip]` `0x..` bytes; a broken scan
+/// must fail loudly rather than pass vacuously.
 fn extract_byte_array(src: &str, name: &str) -> Vec<u8> {
     let decl = src
         .find(&format!("{name}:"))
@@ -355,7 +315,7 @@ fn extract_byte_array(src: &str, name: &str) -> Vec<u8> {
         + open;
     let bytes: Vec<u8> = src[open + 1..close]
         .lines()
-        .map(|l| l.split("//").next().unwrap_or("")) // drop trailing comments
+        .map(|l| l.split("//").next().unwrap_or(""))
         .flat_map(|l| l.split(','))
         .map(str::trim)
         .filter(|t| !t.is_empty())
@@ -372,9 +332,8 @@ fn extract_byte_array(src: &str, name: &str) -> Vec<u8> {
     bytes
 }
 
-/// The driver's blobs declare the same calibration as pf-inject's, field for field, and therefore
-/// the same units. Trailing padding may differ (the two transports declare different feature
-/// lengths), so this compares the parsed fields rather than raw bytes.
+/// Driver blobs match pf-inject field-for-field. Trailing padding may differ
+/// (feature lengths differ by transport), so compare parsed fields, not bytes.
 #[test]
 fn windows_driver_blobs_match_the_canonical_ones() {
     let wire_gyro = MOTION_GYRO_LSB_PER_DEG_S as i64;

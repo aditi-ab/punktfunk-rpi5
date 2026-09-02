@@ -1,25 +1,17 @@
-//! Plugin **store** API: browse catalogs, install/uninstall, manage sources and the runner
-//! (design `plugin-store.md` §4.2). The domain logic lives in [`crate::store`]; this is its HTTP
-//! surface.
+//! HTTP surface for the plugin **store**: catalogs, install/uninstall, sources, runner
+//! (design `plugin-store.md`). Domain logic is [`crate::store`].
 //!
-//! Auth: **admin bearer + loopback**, like every mutation — and explicitly *denied to the plugin
-//! token* ([`super::auth::plugin_may_access`]). A plugin that can install plugins is a persistence
-//! and escalation primitive: it could install a helper that isn't constrained the way it is. That
-//! deny is a carve-out in the exclusion-based allowlist, so it is spelled out there and pinned by a
-//! test.
+//! Auth is admin bearer + loopback, same as other mutations, and **denied to the plugin
+//! token** ([`super::auth::plugin_may_access`]). The deny is an exclusion-list carve-out;
+//! a test there pins it. A plugin that can install plugins can persist a helper outside
+//! its own constraints.
 //!
-//! (A console *session* can already reach arbitrary command execution via `PUT /hooks`, so the
-//! store adds convenience for a session holder rather than a new privilege class. It is still worth
-//! keeping the plugin lane away from it — the lanes exist precisely so a plugin defect isn't an
-//! operator compromise.)
-//!
-//! Everything here does blocking work — filesystem scans, network fetches, process spawns — so
-//! handlers hop to `spawn_blocking` rather than stalling the runtime.
+//! Handlers hop to `spawn_blocking`: catalog scans, fetches, and package-manager spawns
+//! would stall the runtime.
 
 use super::shared::*;
 use crate::store::{self, index, jobs, manifest, sources};
 
-/// Run blocking store work off the async runtime, mapping a joined-thread panic to a 500.
 async fn blocking<T, F>(f: F) -> Result<T, Response>
 where
     F: FnOnce() -> T + Send + 'static,
@@ -36,7 +28,7 @@ where
 
 // ---------------------------------------------------------------- wire shapes
 
-/// Facts about this host, so the console can grey out rows it can't install.
+/// The console greys out rows this host cannot install.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct HostFacts {
     pub version: String,
@@ -44,24 +36,19 @@ pub(crate) struct HostFacts {
     pub platform: String,
 }
 
-/// A configured catalog source and how its last refresh went.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct SourceView {
     pub name: String,
     pub url: String,
-    /// The built-in `unom` source: not editable, not removable, and the only source whose entries
-    /// may carry the "verified" tier.
+    /// Built-in `unom`: not editable, not removable; only its entries may be `verified`.
     pub builtin: bool,
-    /// Whether we check a signature on this source's index. An unsigned source still works; the
-    /// console marks it.
+    /// Unsigned sources still serve; the console flags them.
     pub signed: bool,
-    /// The catalog we're serving is older than the last refresh attempt (offline, or the last
-    /// fetch failed) — entries still install, because the pin travelled with the entry.
+    /// Last refresh missed; entries still install — the pin travelled with the entry.
     pub stale: bool,
-    /// Unix seconds of the data we hold, when we hold any.
+    /// Unix seconds of the cached index, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fetched_at: Option<u64>,
-    /// Why the last refresh failed, if it did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub entry_count: u32,
@@ -69,7 +56,6 @@ pub(crate) struct SourceView {
     pub public_key: Option<String>,
 }
 
-/// One row on the shelf.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct CatalogEntry {
     pub id: String,
@@ -85,10 +71,9 @@ pub(crate) struct CatalogEntry {
     pub license: Option<String>,
     /// The one installable version this entry pins.
     pub version: String,
-    /// Which source listed it.
     pub source: String,
-    /// `verified` (built-in source) or `external` (an operator-added source). Never `unverified`:
-    /// unverified installs come from a raw spec and are never listed (D7).
+    /// `verified` (built-in) or `external` (operator-added). Never `unverified`: those come from a
+    /// raw spec and are not listed.
     pub tier: String,
     /// When unom reviewed this exact tarball (built-in source only).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,24 +81,19 @@ pub(crate) struct CatalogEntry {
     pub platforms: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_host: Option<String>,
-    /// Can this host install it?
     pub compatible: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incompatible_reason: Option<String>,
-    /// The version installed right now, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub installed_version: Option<String>,
-    /// Installed, but at a different version than the catalog pins.
     pub update_available: bool,
-    /// A revocation covering the catalogued version — do not offer this without shouting.
+    /// Revocation of the catalogued version; listed, never offered quietly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked: Option<String>,
-    /// What kind of plugin this is — the console filters Browse by these, and the Game sources
-    /// surface's "Add a source" rail shows exactly the `library` ones (design D5/D6).
+    /// Browse filters; the Game-sources add-rail is exactly the `library` entries.
     pub categories: Vec<String>,
-    /// Whether the launcher this plugin scans looks **installed on this host** (design D8), from the
-    /// index's own existence probes. `null` = the entry declares no probes for this platform, which
-    /// the console renders as "unknown" rather than "not installed".
+    /// Host-side existence probe for the launcher this plugin scans. `null` = no probe for this
+    /// platform (unknown, not "not installed").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detected: Option<bool>,
 }
@@ -123,58 +103,51 @@ pub(crate) struct CatalogResponse {
     pub host: HostFacts,
     pub sources: Vec<SourceView>,
     pub plugins: Vec<CatalogEntry>,
-    /// True while a package operation is in flight — the console disables install buttons.
     pub busy: bool,
 }
 
-/// An installed plugin package, joined with its provenance and whether it's actually running.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct InstalledView {
     pub pkg: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// `verified` / `external` / `unverified` / `cli` — remembered from install time, so an
-    /// unverified plugin stays visibly unverified long after the dialog is forgotten.
+    /// Install-time tier; unverified stays unverified after the dialog is gone.
     pub tier: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// The catalog entry this maps to, when it is on a shelf we know.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_id: Option<String>,
-    /// The plugin id it registers under — the key into `GET /plugins`.
+    /// Key for `GET /plugins`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub installed_at: Option<String>,
-    /// Is it registered in the live lease registry right now?
     pub running: bool,
-    /// The catalog's version, when it's newer than what's installed.
+    /// Catalog version when newer than installed (a version string, not a bool).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update_available: Option<String>,
-    /// A revocation covering the *installed* version. Reported, never auto-removed: silently
-    /// deleting running code is its own hazard, so the operator decides.
+    /// Revocation of the installed version. Reported, never auto-removed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked: Option<String>,
 }
 
-/// `POST /store/install` — either a catalogued entry, or a raw spec the operator owns.
+/// Catalog `{source, id}` or a raw `spec` the operator owns.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct InstallRequest {
-    /// Catalog source name (with [`Self::id`]).
+    /// With [`Self::id`]: catalogued install.
     #[serde(default)]
     pub source: Option<String>,
-    /// Catalog entry id (with [`Self::source`]).
+    /// With [`Self::source`]: catalogued install.
     #[serde(default)]
     pub id: Option<String>,
-    /// A raw package spec (`@scope/name`, `@scope/name@1.2.3`, an https tarball or git+https URL).
-    /// Nothing reviewed it and nothing pins it.
+    /// Raw spec (`@scope/name`, `@scope/name@1.2.3`, https tarball or git+https). Nothing reviewed
+    /// it and nothing pins it.
     #[serde(default)]
     pub spec: Option<String>,
-    /// Required with [`Self::spec`]: the operator's explicit acknowledgement that this installs
-    /// unreviewed code with operator privileges. The console collects it behind a typed
-    /// confirmation; the API refuses without it so no other caller can skip the decision.
+    /// Required with [`Self::spec`]. Without it the API refuses; a caller cannot skip the
+    /// unverified decision.
     #[serde(default)]
     pub accept_unverified: bool,
 }
@@ -184,7 +157,6 @@ pub(crate) struct UninstallRequest {
     pub pkg: String,
 }
 
-/// 202 body: where to watch the work.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct JobRef {
     pub job: String,
@@ -200,7 +172,6 @@ pub(crate) struct SourceInput {
 
 #[derive(Serialize, ToSchema)]
 pub(crate) struct RuntimeView {
-    /// Is the runner payload/unit present at all?
     pub installed: bool,
     pub enabled: bool,
     pub running: bool,
@@ -232,8 +203,7 @@ fn runtime_view() -> RuntimeView {
     }
 }
 
-/// Build the merged catalog view: every source's shelf, annotated with what this host has and can
-/// run. `force` refreshes past the TTL.
+/// Merged catalog, annotated with this host's install state. `force` refreshes past the TTL.
 fn build_catalog(force: bool) -> CatalogResponse {
     let states = store::catalogs(force);
     let installed = store::installed_packages(&store::plugins_dir());
@@ -272,8 +242,7 @@ fn build_catalog(force: bool) -> CatalogResponse {
                 license: e.license.clone(),
                 version: e.version.clone(),
                 source: st.source.name.clone(),
-                // The badge is the built-in source's alone: a third-party curator can pin and
-                // publish, but cannot confer unom's review (D6).
+                // Verified is the built-in source only; a third-party curator cannot confer unom's review.
                 tier: if verified { "verified" } else { "external" }.to_string(),
                 reviewed_at: verified
                     .then(|| e.verification.as_ref().map(|v| v.reviewed_at.clone()))
@@ -290,8 +259,7 @@ fn build_catalog(force: bool) -> CatalogResponse {
             });
         }
     }
-    // Stable, useful order: alphabetical by title, then by source so duplicates across shelves
-    // don't jitter between polls.
+    // Title then source, so duplicates across sources don't jitter between polls.
     plugins.sort_by(|a, b| {
         a.title
             .to_lowercase()
@@ -317,8 +285,7 @@ fn build_installed(live: &[String]) -> Vec<InstalledView> {
         .into_iter()
         .map(|p| {
             let rec = records.get(&p.pkg);
-            // The catalog row for this package, if any shelf carries it — the source of "an update
-            // is available" and of a friendly title for CLI-installed packages.
+            // Catalog row, if any source still lists it: update version and a title for CLI installs.
             let entry = catalogs.iter().find_map(|s| {
                 s.index
                     .as_ref()?
@@ -332,7 +299,7 @@ fn build_installed(live: &[String]) -> Vec<InstalledView> {
                 .map(|(e, _)| e.id.clone())
                 .or_else(|| store::plugin_id_for_pkg(&p.pkg));
             InstalledView {
-                // Absence of a manifest record is meaningful: the CLI put it there (§4.5).
+                // No manifest record means the CLI put it there (`cli` tier).
                 tier: rec
                     .map(|r| r.tier)
                     .unwrap_or(manifest::Tier::Cli)
@@ -367,10 +334,9 @@ fn build_installed(live: &[String]) -> Vec<InstalledView> {
 
 /// Browse the plugin catalog
 ///
-/// The merged shelf across every configured source, annotated with what this host already has and
-/// what it can run. Sources past their freshness window are refreshed first; a source that can't be
-/// reached keeps serving its last good copy, marked `stale` (a LAN-only host still has a working
-/// store — an entry's pin travelled with the entry).
+/// Merged view across sources, annotated with what this host has and can run. A source past its
+/// freshness window is refreshed first; a miss keeps the last copy marked `stale` — the pin
+/// travelled with the entry.
 #[utoipa::path(
     get,
     path = "/store/catalog",
@@ -391,7 +357,7 @@ pub(crate) async fn get_catalog() -> Response {
 
 /// Refresh every catalog now
 ///
-/// Bypasses the freshness window and re-fetches all sources, then returns the merged catalog.
+/// Bypasses the freshness window, re-fetches all sources, returns the merged catalog.
 #[utoipa::path(
     post,
     path = "/store/refresh",
@@ -415,9 +381,8 @@ pub(crate) async fn refresh_catalog() -> Response {
 
 /// List installed plugins
 ///
-/// What's actually in the plugins directory, joined with how it got there (the provenance manifest)
-/// and whether it is registered right now. A package with no provenance record was installed with
-/// the CLI and reports `tier: "cli"` — absence is the answer, not a gap.
+/// Plugins-dir packages, with provenance and live registration. No provenance record means CLI
+/// install (`tier: "cli"`); absence is the answer, not a gap.
 #[utoipa::path(
     get,
     path = "/store/installed",
@@ -430,8 +395,7 @@ pub(crate) async fn refresh_catalog() -> Response {
     )
 )]
 pub(crate) async fn list_installed() -> Response {
-    // The live set comes from the in-memory lease registry — cheap, and it must be read on this
-    // thread rather than inside the blocking closure to keep the borrow simple.
+    // Lease registry is in-memory; read it here, not inside `spawn_blocking`.
     let live: Vec<String> = super::plugins::live_plugin_ids();
     match blocking(move || build_installed(&live)).await {
         Ok(v) => Json(v).into_response(),
@@ -441,13 +405,11 @@ pub(crate) async fn list_installed() -> Response {
 
 /// Install a plugin
 ///
-/// Either `{source, id}` — a catalogued entry, installed at its pinned version after its integrity
-/// is re-checked against the registry — or `{spec, accept_unverified: true}`, which installs an
-/// unreviewed package the operator takes responsibility for. Returns `202` with a job id; watch it
-/// at `GET /store/jobs/{id}`.
+/// `{source, id}` installs the catalog pin after re-checking integrity, or `{spec,
+/// accept_unverified: true}` installs unreviewed code the operator owns. `202` + job id; watch at
+/// `GET /store/jobs/{id}`.
 ///
-/// One package operation runs at a time (`409` otherwise): `bun` operations share a lockfile and a
-/// `node_modules` tree.
+/// One package operation at a time (`409` otherwise): `bun` shares a lockfile and `node_modules`.
 #[utoipa::path(
     post,
     path = "/store/install",
@@ -523,9 +485,8 @@ pub(crate) async fn install_plugin(ApiJson(req): ApiJson<InstallRequest>) -> Res
 
 /// Uninstall a plugin
 ///
-/// Removes the package and forgets its provenance, then restarts the runner. Only names the runner
-/// would actually supervise are accepted, so this can't be used to rip a shared dependency out of
-/// the tree.
+/// Drops the package and its provenance, then restarts the runner. Only names the runner would
+/// supervise: a shared dependency cannot be ripped out of the tree.
 #[utoipa::path(
     post,
     path = "/store/uninstall",
@@ -544,12 +505,8 @@ pub(crate) async fn uninstall_plugin(ApiJson(req): ApiJson<UninstallRequest>) ->
     if let Err(e) = store::valid_installed_pkg(&req.pkg) {
         return api_error(StatusCode::BAD_REQUEST, &format!("{e:#}"));
     }
-    // The name shape is not enough. `@punktfunk/plugin-kit` — the framework every kit-built plugin
-    // *depends on* — matches `@scope/plugin-*` exactly, so a syntactic guard waves it through and
-    // the store offers to uninstall a library out from under the plugins using it (accepted on
-    // Windows on-glass before this check existed). Only a package the operator actually installed
-    // may be removed, which is precisely what `installed_packages` reports: the plugins dir's
-    // top-level dependencies, transitive ones excluded.
+    // `@scope/plugin-*` also matches `@punktfunk/plugin-kit`, a library plugins depend on.
+    // Only a top-level install (`installed_packages`) may be removed.
     let pkg = req.pkg.clone();
     let known = match blocking(move || {
         store::installed_packages(&store::plugins_dir())
@@ -651,9 +608,8 @@ pub(crate) async fn list_sources() -> Response {
 
 /// Add or update a catalog source
 ///
-/// Adding a source is a trust decision: its entries become installable on this host. They are
-/// attributed to it in the console and never carry the "verified" badge, which belongs to the
-/// built-in source alone.
+/// Its entries become installable and attributed to it. They never carry `verified`; that badge is
+/// the built-in source alone.
 #[utoipa::path(
     put,
     path = "/store/sources/{name}",
@@ -680,7 +636,7 @@ pub(crate) async fn put_source(
     let saved = blocking(move || {
         let r = sources::put(source);
         if r.is_ok() {
-            // A redefined source must not keep serving what the old definition cached.
+            // A redefined source must not keep serving the old cache.
             store::drop_source_cache(&name);
         }
         r
@@ -736,9 +692,8 @@ pub(crate) async fn delete_source(Path(name): Path<String>) -> Response {
 
 /// Plugin runner state
 ///
-/// Installed plugins only run while the runner is on, and the runner discovers units at startup —
-/// so this is both the "is anything running" answer and the explanation for a freshly installed
-/// plugin that hasn't appeared yet.
+/// Plugins run only while the runner is on. The runner discovers units at startup, so a freshly
+/// installed plugin may not have appeared yet.
 #[utoipa::path(
     get,
     path = "/store/runtime",

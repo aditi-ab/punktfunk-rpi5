@@ -1,29 +1,25 @@
 //! The Linux matcher: `/proc`.
 //!
-//! Contract, rules, and the shared vocabulary live in [`super`]; this module is only the reading of
-//! `/proc` — and the parsing that gets wrong more often than it looks (`stat`'s `comm` field can
-//! contain spaces *and* parentheses, so fields must be counted from the last `)`).
+//! Contract and rules live in [`super`]. This module only reads `/proc`. `stat`'s `comm` can
+//! contain spaces and parentheses, so fields are counted from the last `)`.
 
 use super::{ProcRef, START_SLACK_SECS};
 use crate::library::DetectSpec;
 use std::path::{Path, PathBuf};
 
-/// Largest `cmdline`/`environ` blob we will read from a single process. Both are bounded by `ARG_MAX`
-/// in practice; the cap exists so a pathological process can't make the host allocate without bound
-/// during a once-a-second scan.
+/// Cap on one `cmdline`/`environ` read. `ARG_MAX` is the practical bound; without this a scan can
+/// allocate without bound.
 const MAX_PROC_BLOB: u64 = 512 * 1024;
 
-/// A `/proc` reader. Parameterized on its root, uid filter, and clock rate so the matching logic can
-/// be unit-tested against a fixture tree instead of the live system.
+/// `/proc` reader. Root, uid, and clock are parameters so tests can feed a fixture tree.
 pub struct Scanner {
     root: PathBuf,
-    /// Only consider processes owned by this uid. `None` (tests only) considers all.
+    /// Own-uid filter. `None` is tests-only and considers every process.
     uid: Option<u32>,
     ticks_per_sec: f64,
 }
 
 impl Scanner {
-    /// The live system: `/proc`, this host process's own uid, the kernel's clock rate.
     pub fn system() -> Self {
         // SAFETY: a parameterless POSIX call that always succeeds and touches no memory.
         let uid = unsafe { libc::getuid() };
@@ -33,32 +29,26 @@ impl Scanner {
         Self {
             root: PathBuf::from("/proc"),
             uid: Some(uid),
-            // A non-positive sysconf answer would poison every start-time comparison; fall back to
-            // the universal Linux value rather than divide by nonsense.
+            // Non-positive sysconf would poison every start-time comparison; 100 is the usual Linux CLK_TCK.
             ticks_per_sec: if ticks > 0 { ticks as f64 } else { 100.0 },
         }
     }
 
-    /// Seconds since boot — the Linux process-start timeline (see [`super::launch_stamp`]). `None`
-    /// when `/proc/uptime` can't be read, which disables start-time filtering rather than rejecting
-    /// every candidate.
+    /// Seconds since boot on the process-start timeline ([`super::launch_stamp`]). `None` if
+    /// `/proc/uptime` is unreadable — that disables the start-time filter, it does not reject everyone.
     pub fn now_stamp(&self) -> Option<f64> {
         let text = std::fs::read_to_string(self.root.join("uptime")).ok()?;
         text.split_whitespace().next()?.parse().ok()
     }
 
-    /// Every process matching any of `spec`'s signals, restricted to those that started at or after
-    /// `min_start` (seconds since boot; `None` disables the filter).
-    ///
-    /// The signals are a union: a Steam appid, an env marker, an exact executable, or an install
-    /// directory each independently qualify a process. That is deliberate — the store with the
-    /// sharpest signal wins, but a store that only knows its install directory is still covered.
+    /// Processes matching any of `spec`'s signals, started at or after `min_start` (seconds since
+    /// boot; `None` disables that filter). Signals are a union: appid, env marker, exact exe, or
+    /// install dir each independently qualify.
     pub fn find(&self, spec: &DetectSpec, min_start: Option<f64>) -> Vec<ProcRef> {
         if spec.is_empty() {
             return Vec::new();
         }
-        // Resolve symlinks in the install dir once per scan: a game reached through a symlinked
-        // library folder would otherwise never prefix-match its own canonical image path.
+        // Canonicalize once: a game reached through a symlink would miss its own image path.
         let dir = spec
             .install_dir
             .as_deref()
@@ -76,7 +66,7 @@ impl Scanner {
         for e in entries.flatten() {
             let name = e.file_name();
             let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
-                continue; // not a pid dir
+                continue;
             };
             let dir_path = e.path();
             if let Some(uid) = self.uid {
@@ -91,7 +81,7 @@ impl Scanner {
                 }
             }
             let Some(start_ticks) = self.start_ticks(&dir_path) else {
-                continue; // vanished mid-scan, or an unparseable stat
+                continue;
             };
             if let Some(min) = min_start {
                 let started = start_ticks as f64 / self.ticks_per_sec;
@@ -115,27 +105,23 @@ impl Scanner {
         out
     }
 
-    /// Pin a pid the host itself just spawned to *this* process, by reading its start time.
+    /// Pin a pid the host just spawned to *this* process by reading its start time.
     ///
-    /// The one legitimate way into rule 2 from a bare pid: it is safe here, and only here, because
-    /// the caller spawned the process and is resolving it immediately, so there is no window in
-    /// which the number could have been recycled. Everything downstream then re-verifies the pair
-    /// through [`Self::alive`] like any other adopted process.
+    /// The only safe entry into rule 2 from a bare pid: the caller spawned it and resolves it
+    /// immediately, so the number cannot have been recycled. Downstream re-checks via [`Self::alive`].
     pub fn resolve(&self, pid: u32) -> Option<ProcRef> {
         let start = self.start_ticks(&self.root.join(pid.to_string()))?;
         Some(ProcRef { pid, start })
     }
 
-    /// This process's `comm` — its short name, as `ps` shows it. Diagnostics only (see
-    /// [`super::names`]); `?` for a process that has already gone, which is routine.
+    /// Diagnostics only ([`super::names`]). Gone processes yield `?`.
     pub fn name_of(&self, p: ProcRef) -> String {
         std::fs::read_to_string(self.root.join(p.pid.to_string()).join("comm"))
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "?".into())
     }
 
-    /// Which of `procs` are still the same live processes — pid present **and** start time unchanged,
-    /// so a recycled pid is never reported alive (rule 2).
+    /// Pid present and start time unchanged, so a recycled pid is never alive (rule 2).
     pub fn alive(&self, procs: &[ProcRef]) -> Vec<ProcRef> {
         procs
             .iter()
@@ -144,7 +130,6 @@ impl Scanner {
             .collect()
     }
 
-    /// Does this process match any of the spec's signals?
     fn matches(
         &self,
         dir_path: &Path,
@@ -153,8 +138,6 @@ impl Scanner {
         exe: Option<&Path>,
         install_dir: Option<&Path>,
     ) -> bool {
-        // The process's own image, resolved through /proc/<pid>/exe. Absent for a kernel thread or a
-        // process whose binary was replaced.
         let image = std::fs::read_link(dir_path.join("exe")).ok();
         if let Some(want) = exe {
             if image.as_deref() == Some(want) {
@@ -166,9 +149,7 @@ impl Scanner {
                 return true;
             }
         }
-        // A bare executable name, the operator-supplied fallback. Case-insensitive because it is typed
-        // by hand and the cost of a case mismatch (the game is never recognized) far outweighs the
-        // cost of a case collision (two differently-cased binaries, both started since this launch).
+        // Operator-typed fallback. Case-insensitive: missing the game costs more than a rare case collision.
         if let Some(want) = spec.process_name.as_deref() {
             let named = image
                 .as_deref()
@@ -180,24 +161,13 @@ impl Scanner {
             }
         }
 
-        // The command line covers what the image can't: a Proton/Wine title's image is the *runtime*
-        // (`…/proton`, `wine64-preloader`), and the game only appears as an argument; Steam's launch
-        // reaper is likewise identified by its argv, not its binary.
+        // Image path misses Proton/Wine titles (image is the runtime) and Steam's launch reaper (argv only).
         let cmdline = read_capped(&dir_path.join("cmdline"));
         if let Some(cmdline) = cmdline.as_deref() {
             if let Some(tok) = steam_tok {
-                // Both tokens together, exact-matched, so `AppId=57` never satisfies appid 570 and
-                // Steam's own (non-reaper) helper steps aren't mistaken for the game.
-                //
-                // …with one exception, because the reaper is *not* only the game's: Steam wraps its
-                // shader pre-caching for a title in the same `SteamLaunch AppId=<appid>` reaper it
-                // wraps the game in, so that job satisfies this recipe exactly while the game has
-                // not started yet. Adopting it points the lease at a tree that exits when the
-                // compile finishes, which reads as the game exiting — on Linux that dropped a
-                // Rocket League stream 10 s into a launch, mid-"Processing Vulkan shaders", and the
-                // player had to launch a second time to get a session that stayed up (field report
-                // 2026-08-22). The payload names itself: `fossilize_replay` is Steam's replayer and
-                // is never a game.
+                // Both tokens, exact: `AppId=57` must not satisfy 570. Skip `fossilize_replay` —
+                // Steam wraps shader pre-caching in the same `SteamLaunch AppId=` reaper, and adopting
+                // it treats the compile's exit as the game exiting.
                 let mut launch = false;
                 let mut appid = false;
                 let mut shader = false;
@@ -215,9 +185,8 @@ impl Scanner {
                 }
             }
             if let Some(dir) = install_dir {
-                // Require a path separator after the directory, so an install dir of `/games/x` is
-                // not satisfied by an unrelated `/games/xyz/…` argument. (The image-path check above
-                // needs no such care — `Path::starts_with` already compares whole components.)
+                // Path separator after the directory so `/games/x` is not satisfied by `/games/xyz/…`.
+                // (`Path::starts_with` on the image already compares whole components.)
                 let needle = dir.as_os_str().as_encoded_bytes();
                 let under_dir = |arg: &[u8]| {
                     arg.strip_prefix(needle)
@@ -235,9 +204,7 @@ impl Scanner {
             }
         }
 
-        // Env markers last: reading another process's environment is the most invasive of these
-        // reads, so it only happens for a spec that actually asked for one. The contents are matched
-        // and discarded — never logged.
+        // Last: reading another process's environment is the most invasive of these. Matched and discarded — never logged.
         if let Some(marker) = &spec.env_marker {
             if let Some(env) = read_capped(&dir_path.join("environ")) {
                 let want: Vec<u8> = match &marker.value {
@@ -245,9 +212,7 @@ impl Scanner {
                     None => format!("{}=", marker.key).into_bytes(),
                 };
                 let hit = env.split(|&b| b == 0).any(|kv| match marker.value {
-                    // An exact `KEY=VALUE` entry.
                     Some(_) => kv == want.as_slice(),
-                    // Presence of the key with any value.
                     None => kv.starts_with(want.as_slice()),
                 });
                 if hit {
@@ -258,9 +223,9 @@ impl Scanner {
         false
     }
 
-    /// `/proc/<pid>/stat` field 22 (`starttime`). The `comm` field is parenthesized and may itself
-    /// contain spaces and parentheses, so fields are counted from the **last** `)`: the token right
-    /// after it is field 3 (`state`), which puts `starttime` at index 19 of the remainder.
+    /// `/proc/<pid>/stat` field 22 (`starttime`). `comm` is parenthesized and may contain spaces
+    /// and parentheses, so fields are counted from the last `)`: the next token is field 3 (`state`),
+    /// which puts `starttime` at index 19 of the remainder.
     fn start_ticks(&self, dir_path: &Path) -> Option<u64> {
         let stat = std::fs::read_to_string(dir_path.join("stat")).ok()?;
         let tail = &stat[stat.rfind(')')? + 1..];
@@ -268,8 +233,7 @@ impl Scanner {
     }
 }
 
-/// The last `/`-separated component of an argv entry — the program's own name, when the entry is a
-/// path to one. Bytes rather than `str` because an argv entry is not required to be UTF-8.
+/// Bytes: an argv entry is not required to be UTF-8.
 fn program_name(arg: &[u8]) -> &[u8] {
     match arg.iter().rposition(|&b| b == b'/') {
         Some(i) => &arg[i + 1..],
@@ -277,8 +241,6 @@ fn program_name(arg: &[u8]) -> &[u8] {
     }
 }
 
-/// Read a `/proc` blob with a hard size cap (see [`MAX_PROC_BLOB`]). `None` when the process vanished
-/// or the file is unreadable — both routine during a scan.
 fn read_capped(path: &Path) -> Option<Vec<u8>> {
     use std::io::Read;
     let file = std::fs::File::open(path).ok()?;
@@ -292,8 +254,6 @@ mod tests {
     use super::*;
     use crate::library::DetectSpec;
 
-    /// Build a fake `/proc` tree. Each process gets a `stat` (with a deliberately nasty `comm`), and
-    /// optionally a `cmdline`, an `environ`, and an `exe` symlink.
     struct FakeProc {
         pid: u32,
         start: u64,
@@ -335,13 +295,11 @@ mod tests {
         for p in procs {
             let dir = td.path().join(p.pid.to_string());
             std::fs::create_dir_all(&dir).unwrap();
-            // `stat` is `pid (comm) state ppid … starttime …`, with starttime as field 22. Counting
-            // from the last ')', index 0 is `state` (field 3), so starttime lands at index 19. The
-            // comm is hostile on purpose — a space and a close-paren inside the parens, which is
-            // exactly what naive field-splitting gets wrong.
+            // `starttime` is field 22: after the last `)`, index 0 is `state` (field 3), so it lands at 19.
+            // Comm is hostile on purpose (`evil ) name`) — naive splitting on spaces would get this wrong.
             let mut tail = vec!["0".to_string(); 20];
-            tail[0] = "S".to_string(); // field 3
-            tail[19] = p.start.to_string(); // field 22
+            tail[0] = "S".to_string();
+            tail[19] = p.start.to_string();
             std::fs::write(
                 dir.join("stat"),
                 format!("{} (evil ) name) {}\n", p.pid, tail.join(" ")),
@@ -373,7 +331,7 @@ mod tests {
     fn scanner(root: &Path) -> Scanner {
         Scanner {
             root: root.to_path_buf(),
-            uid: None, // the fixture's owner is the test user; don't couple the test to it
+            uid: None, // fixture owner is the test user; do not couple the test to it
             ticks_per_sec: 100.0,
         }
     }
@@ -401,21 +359,16 @@ mod tests {
             ],
         );
         let s = scanner(td.path());
-        // Exact exe → only that process.
         assert_eq!(
             pids(s.find(&DetectSpec::exe("/games/hades/Hades"), None)),
             vec![10]
         );
-        // Install dir → every process running out of the game's tree, but nothing outside it.
         assert_eq!(
             pids(s.find(&DetectSpec::dir("/games/hades"), None)),
             vec![10, 11]
         );
     }
 
-    /// The operator-supplied fallback ([`DetectSpec::process_name`]): the image's own file name and
-    /// nothing else — never a directory that happens to be called the same, and never a process whose
-    /// path merely contains the name.
     #[test]
     fn matches_a_bare_process_name_against_the_image_name_only() {
         let td = fake_proc_root(
@@ -431,15 +384,11 @@ mod tests {
             process_name: Some("retroarch".into()),
             ..Default::default()
         };
-        // Case-insensitive (the name is typed by hand), but a whole-name match: neither the
-        // longer-named helper nor the script living in a `retroarch/` directory qualifies.
         assert_eq!(pids(s.find(&spec, None)), vec![20]);
     }
 
     #[test]
     fn install_dir_does_not_match_a_sibling_with_the_same_prefix() {
-        // `/games/x` must not adopt a process running out of `/games/xyz` — a real hazard when one
-        // library folder's name is a prefix of another's.
         let td = fake_proc_root(
             1000.0,
             &[
@@ -449,7 +398,6 @@ mod tests {
         );
         let s = scanner(td.path());
         assert!(s.find(&DetectSpec::dir("/games/x"), None).is_empty());
-        // The genuine directory still matches, by image path and by argument.
         assert_eq!(
             pids(s.find(&DetectSpec::dir("/games/xyz"), None)),
             vec![90, 91]
@@ -458,7 +406,7 @@ mod tests {
 
     #[test]
     fn matches_proton_style_game_only_in_the_cmdline() {
-        // The image is the Proton runtime; the game appears only as an argument.
+        // Image is the Proton runtime; the game appears only as an argument.
         let td = fake_proc_root(
             1000.0,
             &[FakeProc::new(20, 50_000)
@@ -484,7 +432,6 @@ mod tests {
                     "--",
                     "dota",
                 ]),
-                // A different appid that shares a prefix must NOT match (AppId=57 vs 570).
                 FakeProc::new(31, 50_000).cmdline(&[
                     "reaper",
                     "SteamLaunch",
@@ -492,7 +439,6 @@ mod tests {
                     "--",
                     "other",
                 ]),
-                // `SteamLaunch` without the appid, and the appid without `SteamLaunch`, are both no.
                 FakeProc::new(32, 50_000).cmdline(&["reaper", "SteamLaunch", "--", "shader"]),
                 FakeProc::new(33, 50_000).cmdline(&["something", "AppId=570"]),
             ],
@@ -502,18 +448,11 @@ mod tests {
         assert_eq!(pids(s.find(&DetectSpec::steam(57), None)), vec![31]);
     }
 
-    /// The 2026-08-22 field report: Steam's **shader pre-caching** runs under the game's own
-    /// `SteamLaunch AppId=` reaper, so it satisfies the appid recipe while the game has not started.
-    ///
-    /// Adopting it is what dropped a Rocket League stream 10 s into a launch — the lease called that
-    /// tree the game, and its exit (the compile finishing) the game exiting. The reaper's payload is
-    /// the whole tell, and it is only ever Steam's replayer.
     #[test]
     fn steam_shader_pre_caching_is_not_the_game() {
         let td = fake_proc_root(
             1000.0,
             &[
-                // The shader job for this very appid — the game is still being brought up.
                 FakeProc::new(35, 50_000).cmdline(&[
                     "/home/p/.steam/ubuntu12_32/reaper",
                     "SteamLaunch",
@@ -522,7 +461,6 @@ mod tests {
                     "/home/p/.steam/steamapps/common/SteamLinuxRuntime/fossilize_replay",
                     "/home/p/.steam/steamapps/shadercache/252950/fozpipelinesv6/steamapprun_pipeline_cache.foz",
                 ]),
-                // The game itself, same appid, same reaper. This one IS the game.
                 FakeProc::new(36, 50_000).cmdline(&[
                     "/home/p/.steam/ubuntu12_32/reaper",
                     "SteamLaunch",
@@ -551,15 +489,13 @@ mod tests {
         let s = scanner(td.path());
         let exact = DetectSpec::default().with_env("HEROIC_APP_NAME", Some("Quail".to_string()));
         assert_eq!(pids(s.find(&exact, None)), vec![40]);
-        // Presence-only matches any value, but still nothing that lacks the key.
         let any = DetectSpec::default().with_env("HEROIC_APP_NAME", None);
         assert_eq!(pids(s.find(&any, None)), vec![40, 41]);
     }
 
     #[test]
     fn never_adopts_a_process_that_predates_the_launch() {
-        // Uptime 1000 s; the launch happened at t=900. pid 50 started at t=500 (a copy the player
-        // already had open), pid 51 at t=950 (ours).
+        // ticks/sec is 100: pid 50 started at t=500 (already open), pid 51 at t=950; launch is t=900.
         let td = fake_proc_root(
             1000.0,
             &[
@@ -570,20 +506,19 @@ mod tests {
         let s = scanner(td.path());
         let spec = DetectSpec::dir("/games/hades");
         assert_eq!(pids(s.find(&spec, Some(900.0))), vec![51]);
-        // Without the filter both are visible — proving the filter is what excluded it.
         assert_eq!(pids(s.find(&spec, None)), vec![50, 51]);
     }
 
     #[test]
     fn start_slack_tolerates_tick_granularity() {
-        // Started a hair (0.5 s) BEFORE the recorded launch instant: still ours.
+        // 89_950 ticks / 100 = 899.5 s — 0.5 s before launch 900, inside START_SLACK_SECS.
         let td = fake_proc_root(1000.0, &[FakeProc::new(60, 89_950).exe("/games/x/run")]);
         let s = scanner(td.path());
         assert_eq!(
             pids(s.find(&DetectSpec::dir("/games/x"), Some(900.0))),
             vec![60]
         );
-        // A full minute early is not.
+        // Launch 960 vs start 899.5 — a minute early is outside slack.
         assert!(s.find(&DetectSpec::dir("/games/x"), Some(960.0)).is_empty());
     }
 
@@ -608,23 +543,14 @@ mod tests {
         assert!(s.alive(&[gone]).is_empty());
     }
 
-    /// Everything above runs against a fixture tree, which proves the parsing but not that the
-    /// parsing describes this kernel. This one scans the **real** `/proc` for a process it just
-    /// started — the only version of this test that would notice `/proc/<pid>/stat` field ordering,
-    /// the uid check, or the uptime clock being wrong on a real box.
+    /// Live `/proc`: spawn a process and find it. Fixture tests cannot catch a wrong `stat` field
+    /// order, uid filter, or uptime clock on this kernel.
     #[test]
     fn finds_a_real_process_it_just_started() {
-        // A real game's *binary* lives under its install dir, which is what makes the install-dir
-        // recipe work. So the stand-in must too: copy a long-running binary into the directory and run
-        // it from there. (A wrapper script that `exec`s something outside the directory would leave no
-        // trace of the directory in either the image path or the command line — worth knowing, and the
-        // reason a copied binary is the honest fixture here.)
-        //
-        // It has to keep the name `sleep`. Modern coreutils (uutils on Ubuntu 25.10+, busybox
-        // elsewhere) is a MULTI-CALL binary that dispatches on `argv[0]`: copied to any other name it
-        // prints "unknown program" and exits instantly, leaving nothing in `/proc` to find — which
-        // looks exactly like the matcher being broken. That cost a CI red, green on a distro with a
-        // standalone `sleep` and failing on one without.
+        // Copy a long-running binary *into* the install dir and run it from there: a wrapper that
+        // `exec`s something outside leaves no install-dir trace in image or argv.
+        // Keep the name `sleep`. Multi-call coreutils dispatches on `argv[0]`; any other name exits
+        // immediately and the matcher looks broken.
         let td = tempfile::tempdir().expect("tempdir");
         let game = td.path().join("sleep");
         std::fs::copy("/bin/sleep", &game).expect("copy a stand-in game binary");
@@ -635,7 +561,7 @@ mod tests {
             .arg("20")
             .spawn()
             .expect("spawn the fake game");
-        // Give it a moment to be visible in /proc.
+        // 300 ms: the child must be visible in /proc before the scan.
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         let found = s.find(&DetectSpec::dir(td.path()), Some(before));
@@ -645,22 +571,18 @@ mod tests {
             child.id(),
             td.path().display()
         );
-        // The same process is still alive when re-verified by (pid, start time).
         assert!(!s.alive(&found).is_empty());
-        // The exact-exe recipe finds it too, on the same live process.
         assert!(s
             .find(&DetectSpec::exe(&game), Some(before))
             .iter()
             .any(|p| p.pid == child.id()));
 
-        // A launch reference AFTER this process started must exclude it — the rule that keeps a
-        // pre-existing copy of a game from being adopted, checked against a real start time.
+        // Stamp 60 s after now: this process started before it, so rule 1 must exclude it.
         let after = s.now_stamp().unwrap() + 60.0;
         assert!(s.find(&DetectSpec::dir(td.path()), Some(after)).is_empty());
 
         let _ = child.kill();
         let _ = child.wait();
-        // Once it is gone and reaped, neither the scan nor the liveness re-check sees it.
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(s.find(&DetectSpec::dir(td.path()), Some(before)).is_empty());
         assert!(s.alive(&found).is_empty());
@@ -671,7 +593,6 @@ mod tests {
         let td = fake_proc_root(4321.5, &[FakeProc::new(80, 1234)]);
         let s = scanner(td.path());
         assert_eq!(s.now_stamp(), Some(4321.5));
-        // The comm field contains a space and a ')' — start time must still parse.
         assert_eq!(s.start_ticks(&td.path().join("80")), Some(1234));
     }
 }

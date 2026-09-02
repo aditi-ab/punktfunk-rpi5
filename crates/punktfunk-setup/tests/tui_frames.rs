@@ -1,11 +1,11 @@
-//! The TUI driven by injected key events, with the frames pinned as goldens.
+//! Injected-key TUI frames, pinned as goldens.
 //!
-//! This is what S1 bought by hand-rolling the widget: the screen a user would be looking at is
-//! a value a test can assert on, so the PTY smoke only has to prove the real terminal agrees
-//! rather than being the only place the rendering is exercised at all.
+//! The screen a user would see is a value a test can assert on. The PTY smoke
+//! only has to prove a real terminal agrees.
 //!
-//! Rendered with `Colors::None` so the goldens are readable text — the escape sequences have
-//! their own tests in `ui::theme`.
+//! Rendered with `Colors::None` so the goldens are readable text. Escape
+//! sequences have their own tests in `ui::theme`. Goldens live under
+//! `tests/golden/tui-*.txt`; regenerate with `UPDATE_GOLDEN=1`.
 
 use punktfunk_setup::choices::{Choices, Pins};
 use punktfunk_setup::demo;
@@ -24,14 +24,12 @@ fn caps() -> Caps {
     }
 }
 
-/// Drive the settings screen with a key script; return the last frame and how it ended.
 fn drive(preset: &str, keys: &[Key]) -> (String, Step, Screen) {
     let (frame, step, screen, _) = drive_all(preset, keys);
     (frame, step, screen)
 }
 
-/// As `drive`, plus every frame that was written — a frame the loop later cleared (a row
-/// editor backed out of) is only visible here.
+/// Every frame written, including ones the loop later cleared (a backed-out row editor).
 fn drive_all(preset: &str, keys: &[Key]) -> (String, Step, Screen, Vec<String>) {
     let facts = demo::preset(preset).expect("preset");
     let choices = Choices::derive(&facts, &Pins::default());
@@ -102,7 +100,6 @@ fn an_installed_box_shows_the_manage_screen() {
     assert!(frame.contains("Apply these changes"));
 }
 
-/// Enter on a row opens its editor; an exhausted script then backs out of both.
 #[test]
 fn the_cursor_lands_on_the_row_it_was_moved_to() {
     let (frame, step, screen) = drive("arch-fresh", &[Key::Down, Key::Down]);
@@ -111,11 +108,10 @@ fn the_cursor_lands_on_the_row_it_was_moved_to() {
     assert_eq!(step, Step::Cancel);
 }
 
-/// Editing a row opens the radio list, then folds the answer back into the plan.
 #[test]
 fn editing_moonlight_compat_adds_the_firewall_step() {
-    // Down×4 lands on Moonlight compat; Enter opens the editor, Up picks "yes", Enter accepts.
-    // The cursor stays on the row it just edited, so walk back up to the action and install.
+    // Down×4: Moonlight compat. Enter opens, Up picks yes, Enter accepts.
+    // Cursor stays on that row; walk back up to the action and install.
     let keys = [
         Key::Down,
         Key::Down,
@@ -147,7 +143,7 @@ fn editing_moonlight_compat_adds_the_firewall_step() {
     );
 }
 
-/// The editor carries the sh prompt's why-text, so accepting a default never hides the grant.
+/// The editor must name the grant; accepting a default must not hide it.
 #[test]
 fn the_row_editor_frame_names_the_grant() {
     let keys = [Key::Down, Key::Down, Key::Down, Key::Enter];
@@ -164,8 +160,8 @@ fn the_row_editor_frame_names_the_grant() {
     );
 }
 
-/// The mark is part of the settings frame, so picking Client greys the host circle under the
-/// cursor instead of leaving a banner that disagrees with the row below it.
+/// The mark is in the settings frame. Picking Client greys the host circle;
+/// a separate banner would disagree with the row below it.
 #[test]
 fn the_mark_mutes_the_half_that_is_not_being_installed() {
     let colour = Caps {
@@ -202,8 +198,8 @@ fn the_mark_mutes_the_half_that_is_not_being_installed() {
     assert_ne!(client_only, both);
     assert_ne!(host_only, client_only);
 
-    // The mark paints backgrounds; the same colour appears as a foreground in the TUI's
-    // highlight, so the escape has to be the background one to mean the lens.
+    // The mark paints backgrounds. The same colour is a highlight foreground
+    // elsewhere, so only `\x1b[48;2` means the lens.
     let mark_of = |frame: &str| {
         frame
             .lines()
@@ -222,7 +218,6 @@ fn the_mark_mutes_the_half_that_is_not_being_installed() {
     );
 }
 
-/// Visible columns, ignoring the escape sequences.
 fn columns(line: &str) -> usize {
     let mut cols = 0;
     let mut chars = line.chars();
@@ -240,8 +235,8 @@ fn columns(line: &str) -> usize {
     cols
 }
 
-/// A line wider than the terminal wraps, and a wrapped line makes `clear_last_lines` rewind
-/// fewer rows than the frame drew — so every keystroke leaves another stripe behind.
+/// A wrapped line makes `clear_last_lines` rewind fewer rows than the frame
+/// drew, so every keystroke would leave a stripe behind.
 #[test]
 fn no_frame_line_is_wider_than_the_terminal() {
     for width in [30u16, 40, 60, 80, 120] {
@@ -269,8 +264,7 @@ fn no_frame_line_is_wider_than_the_terminal() {
     }
 }
 
-/// Editing a row used to leave a collapsed answer line behind, so opening the same editor
-/// twice pushed the screen down twice. The row already shows the answer.
+/// The row already shows the answer. A second edit must not add a line.
 #[test]
 fn repeated_edits_do_not_pile_up_lines() {
     let once = drive(

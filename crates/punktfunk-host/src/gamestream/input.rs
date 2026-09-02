@@ -1,20 +1,17 @@
-//! Decode the GameStream input wire format (carried AES-GCM-encrypted on the ENet control
-//! stream — see [`super::control`]) into platform-agnostic
-//! [`punktfunk_core::input::InputEvent`]s for injection.
+//! Decode GameStream input on the AES-GCM control stream ([`super::control`]) into
+//! [`punktfunk_core::input::InputEvent`]s.
 //!
-//! A decrypted control message is `[u16 type LE][u16 length LE][NV_INPUT packet]`. We only
-//! handle the input type (`0x0206`); the packet is an 8-byte `NV_INPUT_HEADER` (`size` BE,
-//! `magic` LE) followed by a magic-specific body. Multi-byte body fields are big-endian
-//! (network order) except `magic` and the keyboard `keyCode` (little-endian). Struct layouts
-//! mirror moonlight-common-c `Input.h`; the magic dispatch matches Sunshine `input.cpp`
-//! (Gen5+, where scroll is `0x0A` and controllers are `0x0C`, so there's no ambiguity).
+//! Plaintext is `[u16 type LE][u16 length LE][NV_INPUT]`. Only type `0x0206` is input.
+//! `NV_INPUT_HEADER` is `size` BE + `magic` LE; body fields are big-endian except `magic`
+//! and keyboard `keyCode` (LE). Layouts match moonlight-common-c `Input.h`; magics match
+//! Sunshine `input.cpp` Gen5+ (`scroll = 0x0A`, `controller = 0x0C`).
 
 use punktfunk_core::input::{InputEvent, InputKind};
 
-/// Inner control-message type for input (moonlight `packetTypesGen7[IDX_INPUT_DATA]`).
+/// moonlight `packetTypesGen7[IDX_INPUT_DATA]`.
 const INPUT_DATA_TYPE: u16 = 0x0206;
 
-// NV_INPUT_HEADER.magic values (Input.h), with the Gen5+ variants where they differ.
+// Input.h magics. REL and scroll have Gen5+ replacements; both REL values are accepted.
 const MAGIC_KEY_DOWN: u32 = 0x03;
 const MAGIC_KEY_UP: u32 = 0x04;
 const MAGIC_MOUSE_ABS: u32 = 0x05;
@@ -28,21 +25,19 @@ const MAGIC_HSCROLL: u32 = 0x5500_0001;
 const MAGIC_SS_TOUCH: u32 = 0x5500_0002;
 const MAGIC_SS_PEN: u32 = 0x5500_0003;
 
-/// `code` value marking a [`InputKind::MouseScroll`] as horizontal (vs `0` = vertical).
+/// `InputKind::MouseScroll` `code`: `1` = horizontal, `0` = vertical.
 pub const SCROLL_HORIZONTAL: u32 = 1;
 
-/// Decode one decrypted control plaintext into zero or more input events. Non-input control
-/// messages (keepalives, QoS) and unhandled input kinds (gamepad/pen/touch) yield nothing.
+/// Keepalives, QoS, gamepad, pen, and touch yield nothing (sibling decoders).
 pub fn decode(plaintext: &[u8]) -> Vec<InputEvent> {
     if plaintext.len() < 4 || u16::from_le_bytes([plaintext[0], plaintext[1]]) != INPUT_DATA_TYPE {
         return Vec::new();
     }
     let p = &plaintext[4..];
-    // UTF-8 text (Moonlight's client-side keyboard commit) expands to one `TextInput` event per
-    // Unicode scalar — the only magic yielding more than one event, so it's handled before the
-    // single-event dispatch. Injected the same way as the native plane's IME text.
+    // UTF-8 expands to one `TextInput` per scalar — the only multi-event magic, so it
+    // runs before the single-event dispatch.
     if p.len() >= 8 && u32::from_le_bytes([p[4], p[5], p[6], p[7]]) == MAGIC_UTF8 {
-        // NV_INPUT_HEADER.size (BE, excludes itself) counts magic + body.
+        // `size` is BE and excludes itself; it counts magic + body.
         let size = u32::from_be_bytes([p[0], p[1], p[2], p[3]]) as usize;
         let body_len = size.saturating_sub(4).min(p.len() - 8);
         return match std::str::from_utf8(&p[8..8 + body_len]) {
@@ -61,7 +56,6 @@ fn decode_input_packet(p: &[u8]) -> Option<InputEvent> {
     if p.len() < 8 {
         return None;
     }
-    // NV_INPUT_HEADER: size (BE u32, excludes itself) + magic (LE u32). Body follows.
     let magic = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
     let b = &p[8..];
     let be16 = |o: usize| -> Option<i16> { Some(i16::from_be_bytes([*b.get(o)?, *b.get(o + 1)?])) };
@@ -71,8 +65,8 @@ fn decode_input_packet(p: &[u8]) -> Option<InputEvent> {
             ev(InputKind::MouseMove, 0, be16(0)? as i32, be16(2)? as i32, 0)
         }
         MAGIC_MOUSE_ABS => {
-            // short x, y, unused, width, height (all BE). Carry the client's reference extent
-            // (width<<16 | height) in `flags` so the injector can scale to its output.
+            // x, y, unused, width, height (BE). Client extent `width<<16 | height` in `flags`
+            // so the injector can scale.
             let (x, y) = (be16(0)? as i32, be16(2)? as i32);
             let flags = ((be16(6)? as u16 as u32) << 16) | (be16(8)? as u16 as u32);
             ev(InputKind::MouseMoveAbs, 0, x, y, flags)
@@ -88,11 +82,9 @@ fn decode_input_packet(p: &[u8]) -> Option<InputEvent> {
             0,
         ),
         MAGIC_KEY_DOWN | MAGIC_KEY_UP => {
-            // char flags, short keyCode (LE), char modifiers, short zero2. The client stuffs a
-            // 0x80 high byte on key-down; Sunshine masks to the low-byte VK (`& 0xFF`).
-            // Moonlight VKs are LAYOUT-SEMANTIC (the client's layout already resolved them) —
-            // tag them so the Windows injector maps them under the receiving app's layout
-            // instead of the fixed US-positional table the first-party clients use.
+            // keyCode is LE; Sunshine masks the 0x80 key-down high byte (`& 0xFF`). Moonlight
+            // VKs are layout-semantic — tag them so Windows maps under the receiving layout,
+            // not the US-positional table first-party clients use.
             let key_code = (u16::from_le_bytes([*b.get(1)?, *b.get(2)?]) & 0x00FF) as u32;
             let modifiers = *b.get(3)? as u32;
             let kind = if magic == MAGIC_KEY_DOWN {
@@ -108,19 +100,14 @@ fn decode_input_packet(p: &[u8]) -> Option<InputEvent> {
                 modifiers | crate::inject::KEY_FLAG_SEMANTIC_VK,
             )
         }
-        // Not a pointer/keyboard magic. Gamepad, pen and touch are decoded by the SIBLING
-        // decoders (`gamepad::decode`, `pen`/`SS_PEN`/`SS_TOUCH` in the control dispatch), not
-        // here; anything genuinely unknown falls through to the control loop's drop.
-        // (UTF-8 text is handled in `decode`.)
+        // Gamepad/pen/touch: sibling decoders. Unknown magics drop in the control loop.
         _ => return None,
     })
 }
 
-/// One decoded `SS_PEN_PACKET` body (moonlight-common-c `Input.h`; all fields little-endian,
-/// coordinates/pressure as normalized floats). Semantics — `pressure_or_distance` is pressure
-/// (0..1, 0 = unknown) for contact events and hover distance (1 = farthest) for hover;
-/// `rotation` is the tilt azimuth (0..360, `0xFFFF` unknown); `tilt` is degrees from the
-/// surface normal (0..90, `0xFF` unknown) — are interpreted in [`super::pen`].
+/// Sunshine `SS_PEN_PACKET` (`Input.h`, LE, normalized floats). Unknowns: pressure `0`,
+/// rotation `0xFFFF`, tilt `0xFF`. Contact vs hover for `pressure_or_distance` is in
+/// [`super::pen`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SsPen {
     pub event_type: u8,
@@ -133,8 +120,7 @@ pub struct SsPen {
     pub tilt: u8,
 }
 
-/// One decoded `SS_TOUCH_PACKET` body (same conventions as [`SsPen`]; contact-area fields are
-/// not carried — the wire touch kinds have nowhere to put them yet).
+/// Sunshine `SS_TOUCH_PACKET`. Contact area is on the wire but has no native field; dropped.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SsTouch {
     pub event_type: u8,
@@ -145,17 +131,15 @@ pub struct SsTouch {
     pub pressure_or_distance: f32,
 }
 
-/// A Sunshine-extension pointer event (sent only after we advertise
-/// `SS_FF_PEN_TOUCH_EVENTS` — see [`super::rtsp`]).
+/// Sunshine pointer event, sent only after `SS_FF_PEN_TOUCH_EVENTS` ([`super::rtsp`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SsPointer {
     Pen(SsPen),
     Touch(SsTouch),
 }
 
-/// Whether this control plaintext carries a pointer magic ([`decode_pointer`]'s domain) —
-/// lets the caller tell "malformed pointer packet" (worth a warn) apart from "some other
-/// message" when `decode_pointer` returns `None`.
+/// True when the plaintext is a pointer magic, so a `decode_pointer` `None` is malformed
+/// rather than some other message.
 pub fn is_pointer_magic(plaintext: &[u8]) -> bool {
     plaintext.len() >= 12
         && u16::from_le_bytes([plaintext[0], plaintext[1]]) == INPUT_DATA_TYPE
@@ -165,10 +149,7 @@ pub fn is_pointer_magic(plaintext: &[u8]) -> bool {
         )
 }
 
-/// Decode a control plaintext into a pen/touch pointer event, or `None` for every other
-/// message (the caller then falls through to [`decode`]). Bounds- and sanity-checked like the
-/// rest of the plane: short bodies and non-finite floats (a forged NaN must never reach the
-/// injectors' scaling) drop the packet whole.
+/// Pen/touch event, or `None` for every other message (caller falls through to [`decode`]).
 pub fn decode_pointer(plaintext: &[u8]) -> Option<SsPointer> {
     if plaintext.len() < 12 || u16::from_le_bytes([plaintext[0], plaintext[1]]) != INPUT_DATA_TYPE {
         return None;
@@ -176,22 +157,18 @@ pub fn decode_pointer(plaintext: &[u8]) -> Option<SsPointer> {
     let p = &plaintext[4..];
     let magic = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
     let b = &p[8..];
-    // Coordinates must be finite (they feed the injectors' scaling); a forged NaN drops the
-    // packet whole.
+    // Finite only: a forged NaN would poison injector scaling.
     let f32at = |o: usize| -> Option<f32> {
         let v = f32::from_le_bytes([*b.get(o)?, *b.get(o + 1)?, *b.get(o + 2)?, *b.get(o + 3)?]);
         v.is_finite().then_some(v)
     };
-    // pressureOrDistance is different: real clients ship NaN there to mean "unknown" (iPad
-    // fingers have no force sensor — observed live from VoidLink, which NaN'd every touch and
-    // a strict gate silently killed the whole plane). The spec's own unknown value is 0.0, so
-    // non-finite sanitizes to that instead of poisoning the packet.
+    // Clients send NaN for "unknown"; the spec unknown is 0.0. Do not drop the packet.
     let f32_pressure = |o: usize| -> Option<f32> {
         let v = f32::from_le_bytes([*b.get(o)?, *b.get(o + 1)?, *b.get(o + 2)?, *b.get(o + 3)?]);
         Some(if v.is_finite() { v } else { 0.0 })
     };
     match magic {
-        // eventType, zero[1], rotation u16, pointerId u32, x, y, pressureOrDistance, areas.
+        // Pad byte at 1 and contact areas after pressure; neither is stored.
         MAGIC_SS_TOUCH => Some(SsPointer::Touch(SsTouch {
             event_type: *b.first()?,
             rotation: u16::from_le_bytes([*b.get(2)?, *b.get(3)?]),
@@ -200,8 +177,7 @@ pub fn decode_pointer(plaintext: &[u8]) -> Option<SsPointer> {
             y: f32at(12)?,
             pressure_or_distance: f32_pressure(16)?,
         })),
-        // eventType, toolType, penButtons, zero[1], x, y, pressureOrDistance, rotation u16,
-        // tilt, zero2[1], areas.
+        // Pad bytes at 3 and 19, then contact areas; none are stored.
         MAGIC_SS_PEN => Some(SsPointer::Pen(SsPen {
             event_type: *b.first()?,
             tool: *b.get(1)?,
@@ -231,10 +207,9 @@ fn ev(kind: InputKind, code: u32, x: i32, y: i32, flags: u32) -> InputEvent {
 mod tests {
     use super::*;
 
-    /// Build a control plaintext: inner header + NV_INPUT_HEADER + body.
     fn wrap(magic: u32, body: &[u8]) -> Vec<u8> {
         let mut inp = Vec::new();
-        inp.extend_from_slice(&((4 + body.len()) as u32).to_be_bytes()); // size (excl. itself)
+        inp.extend_from_slice(&((4 + body.len()) as u32).to_be_bytes()); // size excludes itself
         inp.extend_from_slice(&magic.to_le_bytes());
         inp.extend_from_slice(body);
         let mut pt = Vec::new();
@@ -246,7 +221,6 @@ mod tests {
 
     #[test]
     fn decodes_relative_mouse() {
-        // deltaX = -1 (ffff BE), deltaY = +2 (0002 BE) — matches a real captured packet.
         let pt = wrap(MAGIC_MOUSE_REL_GEN5, &[0xff, 0xff, 0x00, 0x02]);
         let ev = decode(&pt);
         assert_eq!(ev.len(), 1);
@@ -256,8 +230,6 @@ mod tests {
 
     #[test]
     fn decodes_key_down_masking_high_byte() {
-        // keyCode 0x80A4 (LE a4 80) → VK 0xA4 (VK_LMENU); modifiers 0x04 (Alt). GameStream keys
-        // are additionally tagged layout-semantic (Moonlight resolved the VK under its layout).
         let pt = wrap(MAGIC_KEY_DOWN, &[0x00, 0xa4, 0x80, 0x04, 0x00, 0x00]);
         let ev = decode(&pt);
         assert_eq!(ev.len(), 1);
@@ -268,7 +240,6 @@ mod tests {
 
     #[test]
     fn decodes_utf8_text_per_scalar() {
-        // "aß😀" — ASCII, Latin-1, and an astral scalar; one TextInput event per scalar.
         let pt = wrap(MAGIC_UTF8, "aß😀".as_bytes());
         let ev = decode(&pt);
         assert_eq!(ev.len(), 3);
@@ -276,15 +247,14 @@ mod tests {
         assert_eq!(ev[0].code, 'a' as u32);
         assert_eq!(ev[1].code, 'ß' as u32);
         assert_eq!(ev[2].code, 0x1F600);
-        // Truncated / invalid UTF-8 decodes to nothing rather than mojibake.
+        // Invalid UTF-8 decodes to empty, not mojibake.
         let bad = wrap(MAGIC_UTF8, &[0xff, 0xfe]);
         assert!(decode(&bad).is_empty());
     }
 
     #[test]
     fn decodes_ss_pen_and_touch_golden_bytes() {
-        // SS_PEN body per Input.h: DOWN, pen tool, primary button, x=0.5 y=0.25,
-        // pressure=0.75, rotation=180, tilt=45, then contact areas (present but ignored).
+        // Contact-area floats are on the wire and ignored.
         let mut body = vec![0x01, 0x01, 0x01, 0x00];
         for f in [0.5f32, 0.25, 0.75] {
             body.extend_from_slice(&f.to_le_bytes());
@@ -308,10 +278,9 @@ mod tests {
                 tilt: 45,
             }))
         );
-        // A pen packet is invisible to the classic decoder (no misparse as mouse/key).
+        // Classic decoder must not misparse a pen packet as mouse/key.
         assert!(decode(&pt).is_empty());
 
-        // SS_TOUCH body: MOVE, rotation unknown, pointerId 42, x=1.0 y=0.0, pressure 1.0.
         let mut body = vec![0x03, 0x00];
         body.extend_from_slice(&0xFFFFu16.to_le_bytes());
         body.extend_from_slice(&42u32.to_le_bytes());
@@ -331,22 +300,17 @@ mod tests {
             }))
         );
 
-        // Truncated bodies and forged NaN coordinates drop the packet whole.
         assert_eq!(decode_pointer(&pt[..pt.len() - 18]), None);
         let mut nan = body.clone();
         nan[8..12].copy_from_slice(&f32::NAN.to_le_bytes());
         assert_eq!(decode_pointer(&wrap(0x5500_0002, &nan)), None);
-        // …but a NaN pressureOrDistance sanitizes to 0.0 ("unknown") instead of killing the
-        // packet — a REAL client convention, observed live: VoidLink NaN's the pressure of
-        // every iPad finger touch (no force sensor), and the strict gate silently disabled
-        // the whole touch plane.
+        // NaN pressureOrDistance → 0.0 (unknown). Dropping the packet would kill real clients.
         let mut nan_pod = body.clone();
         nan_pod[16..20].copy_from_slice(&f32::NAN.to_le_bytes());
         match decode_pointer(&wrap(0x5500_0002, &nan_pod)) {
             Some(SsPointer::Touch(t)) => assert_eq!(t.pressure_or_distance, 0.0),
             other => panic!("NaN pressure must decode with pod=0.0, got {other:?}"),
         }
-        // Non-pointer magics fall through to the classic decoder.
         assert_eq!(
             decode_pointer(&wrap(MAGIC_MOUSE_REL_GEN5, &[0, 0, 0, 0])),
             None
@@ -355,7 +319,7 @@ mod tests {
 
     #[test]
     fn ignores_non_input_type() {
-        let mut pt = vec![0x00, 0x02]; // type 0x0200 (keepalive)
+        let mut pt = vec![0x00, 0x02]; // keepalive type 0x0200
         pt.extend_from_slice(&[0x08, 0x00, 0x04, 0, 0, 0, 0, 0, 0, 0]);
         assert!(decode(&pt).is_empty());
     }

@@ -1,8 +1,6 @@
-//! GL plumbing for the EGL zero-copy blit (plan §W4, carved out of the EGL facade): the GL enum
-//! constants, the `#[link]`'d libGL / libgbm entry points, the fullscreen-triangle shader sources
-//! (BGRA swizzle + the NV12 / YUV444 BT.709 convert passes), and the shader/program compile
-//! helpers. The de-tiling blit passes and the EGLDisplay importer that drive this all live in
-//! [`super`].
+//! GL FFI and shaders for [`super`]'s EGL zero-copy blit: `libGL`/`libgbm` entry points,
+//! fullscreen-triangle sources (BGRA swizzle, NV12 / YUV444 BT.709 convert), and compile
+//! helpers. The importer and de-tiling passes live in [`super`].
 
 #![allow(non_upper_case_globals)]
 
@@ -15,11 +13,10 @@ pub(crate) const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
 pub(crate) const GL_LINEAR: c_int = 0x2601;
 pub(crate) const GL_NEAREST: c_int = 0x2600;
 pub(crate) const GL_RGBA8: u32 = 0x8058;
-// Single/dual-channel 8-bit formats for the NV12 convert targets: R8 luma (full-res),
-// RG8 interleaved chroma (half-res). The `_RED`/`_RG` enums are the matching client formats.
+// NV12 convert targets: R8 luma (full-res), RG8 interleaved chroma (half-res).
 pub(crate) const GL_R8: u32 = 0x8229;
 pub(crate) const GL_RG8: u32 = 0x822B;
-// Client pixel format/type for texture uploads (self-test only): RGBA bytes.
+// Client format/type for self-test texture uploads only.
 pub(crate) const GL_RGBA: u32 = 0x1908;
 pub(crate) const GL_UNSIGNED_BYTE: u32 = 0x1401;
 pub(crate) const GL_FRAMEBUFFER: u32 = 0x8D40;
@@ -32,7 +29,7 @@ pub(crate) const GL_FRAGMENT_SHADER: u32 = 0x8B30;
 pub(crate) const GL_COMPILE_STATUS: u32 = 0x8B81;
 pub(crate) const GL_LINK_STATUS: u32 = 0x8B82;
 
-// libglvnd's libGL dispatches these to the NVIDIA driver based on the current EGL/GL context.
+// libglvnd `libGL` dispatches these through the current EGL/GL context.
 #[link(name = "GL")]
 unsafe extern "C" {
     pub(crate) fn glGenTextures(n: c_int, textures: *mut u32);
@@ -102,30 +99,22 @@ unsafe extern "C" {
     pub(crate) fn gbm_device_destroy(device: *mut c_void);
 }
 
-/// `glEGLImageTargetTexture2DOES(target, EGLImage)` — loaded via `eglGetProcAddress`.
+/// `glEGLImageTargetTexture2DOES` — `eglGetProcAddress`, not `#[link]`.
 pub(crate) type EglImageTargetFn = unsafe extern "system" fn(u32, *mut c_void);
 
-// Fullscreen-triangle blit: sample the dmabuf EGLImage texture and write it (swizzled to BGRA,
-// to match the BGRx the encoder expects) into a normal GL_RGBA8 texture that CUDA *can* register.
+// `.bgra` matches the encoder's BGRx; dest is linear `GL_RGBA8` so CUDA can register it.
 pub(crate) const VERT_SRC: &[u8] = b"#version 330 core\nout vec2 v_tex;\nvoid main(){vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));v_tex=p;gl_Position=vec4(p*2.0-1.0,0.0,1.0);}\n";
 pub(crate) const FRAG_SRC: &[u8] = b"#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){o_color=texture(image,v_tex).bgra;}\n";
 
-// NV12 BT.709 LIMITED-range convert from full-range RGB in [0,1]. Two passes share `VERT_SRC` and
-// the same source texture (the de-tiled dmabuf):
-//   Y pass  → GL_R8 luma, full-res:   Y = (16 + 219·(0.2126R+0.7152G+0.0722B))/255
-//   UV pass → GL_RG8 chroma, half-res (GL_LINEAR averages the 2×2 footprint):
-//     U = (128 + 224·(-0.1146R-0.3854G+0.5000B))/255  → R channel
-//     V = (128 + 224·( 0.5000R-0.4542G-0.0458B))/255  → G channel
-// RG8's (R=U, G=V) byte order matches NV12's interleaved [U,V]. All outputs clamped to [0,1].
-// Matches the Windows VideoConverter (BT.709, limited/studio range) so the two hosts look identical.
+// NV12 BT.709 studio (16+219 / 128±112) from RGB in [0,1]. UV is half-res: `GL_LINEAR`
+// averages the 2×2; RG8 (R=U, G=V) is NV12's interleaved chroma. Same matrix as the
+// Windows VideoConverter so both hosts match.
 pub(crate) const FRAG_Y_SRC: &[u8] = b"#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){vec3 c=texture(image,v_tex).rgb;float Y=(16.0+219.0*(0.2126*c.r+0.7152*c.g+0.0722*c.b))/255.0;o_color=vec4(clamp(Y,0.0,1.0),0.0,0.0,1.0);}\n";
 pub(crate) const FRAG_UV_SRC: &[u8] = b"#version 330 core\nuniform sampler2D image;\nin vec2 v_tex;\nout vec4 o_color;\nvoid main(){vec3 c=texture(image,v_tex).rgb;float U=(128.0+224.0*(-0.1146*c.r-0.3854*c.g+0.5000*c.b))/255.0;float V=(128.0+224.0*(0.5000*c.r-0.4542*c.g-0.0458*c.b))/255.0;o_color=vec4(clamp(U,0.0,1.0),clamp(V,0.0,1.0),0.0,1.0);}\n";
 
-/// The three planar-YUV444 convert shaders (full-res `R8` target each) — the [`Yuv444Blit`]
-/// analogue of `FRAG_Y_SRC`/`FRAG_UV_SRC` with NO subsampling (4:4:4 keeps every chroma sample).
-/// Same BT.709 coefficients; `full_range` flips the quantization from studio (16+219 / 128±112)
-/// to the full 0..255 swing — the encoder flips the VUI (`PUNKTFUNK_444_FULLRANGE`, read by both
-/// processes from the same inherited environment) in lockstep, so pixels and signaling agree.
+/// Planar YUV444 (three full-res `R8` shaders). Same BT.709 matrix as NV12; `full_range`
+/// switches studio (16+219 / 128±112) to 0..255. The encoder reads `PUNKTFUNK_444_FULLRANGE`
+/// from the same inherited env and flips VUI in lockstep — pixels and signaling must agree.
 pub(crate) fn yuv444_frag_sources(full_range: bool) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let (y_scale, y_off, c_scale) = if full_range {
         ("255.0", "0.0", "255.0")
@@ -146,9 +135,8 @@ pub(crate) fn yuv444_frag_sources(full_range: bool) -> (Vec<u8>, Vec<u8>, Vec<u8
 }
 
 pub(crate) unsafe fn compile_shader(kind: u32, src: &[u8]) -> Result<u32> {
-    // SAFETY: caller contract: the GL context is current on this thread. `src` is a live slice; its
-    // pointer/length locals outlive the synchronous `glShaderSource`; the shader name is deleted on
-    // the compile-failure path.
+    // SAFETY: the GL context is current on this thread. `src` is a live slice; `ptr`/`len`
+    // outlive the synchronous `glShaderSource`. The shader name is deleted on compile failure.
     unsafe {
         let sh = glCreateShader(kind);
         ensure!(sh != 0, "glCreateShader failed");
@@ -166,14 +154,11 @@ pub(crate) unsafe fn compile_shader(kind: u32, src: &[u8]) -> Result<u32> {
     }
 }
 
-/// Compile+link the fullscreen-triangle program with fragment source `frag` and bind its `image`
-/// sampler to texture unit 0.
 pub(crate) unsafe fn compile_program_with(frag: &[u8]) -> Result<u32> {
-    // SAFETY: caller contract: the GL context is current on this thread. All names are created here
-    // and deleted on every failure path; `c"image"` is a valid NUL-terminated literal.
+    // SAFETY: the GL context is current on this thread. Every GL name created here is deleted
+    // on failure; `c"image"` is a NUL-terminated literal.
     unsafe {
-        // Callers retry per frame, so every error path below must delete what it created — a leak
-        // here is unbounded, not one-shot.
+        // Callers retry per frame; a leak here is unbounded.
         let vs = compile_shader(GL_VERTEX_SHADER, VERT_SRC)?;
         let fs = match compile_shader(GL_FRAGMENT_SHADER, frag) {
             Ok(fs) => fs,
@@ -202,7 +187,7 @@ pub(crate) unsafe fn compile_program_with(frag: &[u8]) -> Result<u32> {
         glUseProgram(prog);
         let loc = glGetUniformLocation(prog, c"image".as_ptr());
         if loc >= 0 {
-            glUniform1i(loc, 0); // sampler -> texture unit 0
+            glUniform1i(loc, 0);
         }
         glUseProgram(0);
         Ok(prog)
@@ -210,7 +195,6 @@ pub(crate) unsafe fn compile_program_with(frag: &[u8]) -> Result<u32> {
 }
 
 pub(crate) unsafe fn compile_program() -> Result<u32> {
-    // SAFETY: caller contract: the GL context is current on this thread (forwarded to
-    // `compile_program_with`).
+    // SAFETY: the GL context is current on this thread (forwarded to `compile_program_with`).
     unsafe { compile_program_with(FRAG_SRC) }
 }

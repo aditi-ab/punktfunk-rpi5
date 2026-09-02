@@ -1,4 +1,4 @@
-//! The console shell's modal overlays (connecting / waking / toast / full-screen takeover).
+//! Modal overlays: connecting, waking, toast, full-screen takeover.
 
 use crate::anim::{approach, springs};
 use crate::glyphs::{hint_bar, Hint, HintKey};
@@ -7,7 +7,7 @@ use skia_safe::{gradient, Canvas, Color4f, PathBuilder, Point, Rect, TileMode};
 
 use super::{Shell, ToastMark, BOTTOM_BAND};
 
-/// The toast's leading mark, centred on `(cx, cy)` in a ~13 dp box.
+/// Kind mark in a 13 dp box.
 fn draw_toast_mark(canvas: &Canvas, mark: ToastMark, cx: f64, cy: f64, k: f64, ink: Color4f) {
     let mut p = fill(ink);
     match mark {
@@ -27,8 +27,7 @@ fn draw_toast_mark(canvas: &Canvas, mark: ToastMark, cx: f64, cy: f64, k: f64, i
             canvas.draw_path(&path.detach(), &p);
         }
         ToastMark::Bang => {
-            // A stem and a dot rather than a glyph: at 0.75× k an "!" from the text font
-            // would be two pixels of stem and disappear.
+            // Stem + dot, not a text "!": at 0.75× k a font bang is two pixels and vanishes.
             let r = 5.4 * k;
             let w = 2.0 * k;
             canvas.draw_rrect(
@@ -61,10 +60,8 @@ impl Shell {
         t: f64,
         fonts: &Fonts,
     ) {
-        // Resolve the connect/wake takeover — the two phases of reaching a host — into one
-        // full-screen shape (spinner, title, one detail line, its own hints). Connecting flows
-        // straight out of a wake (see `sync`) so they share the same backdrop and never blink
-        // between them. Mirrors the Android client's unified `ConnectOverlay`.
+        // Connect and wake share one full-screen shape. A connect can follow a wake
+        // (`sync`) so they share the backdrop and never blink between them.
         let takeover: Option<(f64, bool, String, String, Vec<Hint>)> =
             if let Some(c) = &mut self.connecting {
                 c.appear = approach(c.appear, 1.0, dt, 0.07);
@@ -89,7 +86,7 @@ impl Shell {
                     ))
                 }
             } else if let Some(wk) = &self.wake {
-                // Service-driven, so it appears settled (no fade-in).
+                // Service-driven: already settled, no fade-in.
                 if wk.timed_out {
                     Some((
                         1.0,
@@ -107,8 +104,7 @@ impl Shell {
                         true,
                         format!("Waking {}…", wk.name),
                         format!("Waiting for it to come online · {} s", wk.seconds),
-                        // A wake-only wait (no dial after) offers "Stop Waiting"; a wake-&-connect
-                        // is a plain "Cancel".
+                        // Wake-only offers "Stop Waiting"; wake-then-connect is "Cancel".
                         vec![Hint::new(
                             HintKey::Back,
                             if wk.then_connect {
@@ -128,7 +124,6 @@ impl Shell {
             );
         }
 
-        // The toast: a transient pill above the hint bar; springs in, fades out.
         if self.toast.as_ref().is_some_and(|toast| t - toast.at > 4.0) {
             self.toast = None;
         }
@@ -140,8 +135,7 @@ impl Shell {
                 toast.seat.step_spec(1.0, springs::INDICATOR, dt);
                 toast.seat.settle(1.0, 0.001, 0.01);
             }
-            // The seat drives the SLIDE; the fade is deliberately still linear-in-time,
-            // because a dismissal is a deadline (4 s) and not a gesture.
+            // Seat springs the slide. Fade stays linear: dismissal is a 4 s deadline, not a gesture.
             let slide = toast.seat.pos.clamp(0.0, 1.0);
             let fade = if age > 3.4 {
                 (1.0 - (age - 3.4) / 0.6).max(0.0)
@@ -153,27 +147,16 @@ impl Shell {
             let size = 13.0 * k;
             let tw = f64::from(fonts.measure(&toast.text, W::Medium, size));
             let (pad_x, bh) = (16.0 * k, 34.0 * k);
-            // Leading run: the kind mark, air, then the text. The mark carries the kind by
-            // itself — a hairline in the same tint used to stand beside it, saying the same
-            // thing twice and reading as a rendering seam rather than as meaning. Its pad is
-            // shy of `pad_x` because nothing drawn in the 13 dp box fills it, and an equal pad
-            // leaves the pill visibly left-heavy in air.
+            // Kind mark, then text. Pad is 13 dp (shy of `pad_x`) because the 13 dp mark
+            // never fills its box; equal pad leaves the pill left-heavy.
             let (mark_pad, mark_w, gap) = (13.0 * k, 13.0 * k, 9.0 * k);
             let lead = mark_pad + mark_w + gap;
             let bw = lead + tw + pad_x;
             let bx = (w - bw) / 2.0;
             let by = h - BOTTOM_BAND * k - bh - 8.0 * k + (1.0 - slide) * 12.0 * k;
             let rect = Rect::from_xywh(bx as f32, by as f32, bw as f32, bh as f32);
-            // BOUNDED to the pill. Unbounded, `save_layer` allocates an offscreen the size of
-            // the whole SURFACE and composites it back — on a 4K TV that is a 33 MB render
-            // target raised and torn down every frame, for four seconds, to fade a 34 dp pill
-            // (and on a box whose whole Skia budget is 64 MB, it evicts real work to do it).
-            //
-            // Everything drawn inside is inside `rect`: the pill fill, `theme::panel`'s
-            // hairline ON that rect, the kind mark centred in it, and text that ends a `pad_x`
-            // short of its right edge. There is no blur to reach further, so the outset is
-            // slack for the stroke rather than a computed reach — `screens::home` needs 36 k
-            // for the same layer only because it wraps a σ = 10 k halo.
+            // Bound the fade layer to the pill. Unbounded `save_layer` is a full-surface
+            // offscreen every frame. 12 k outset is stroke slack (no blur to reach further).
             let bounds = rect.with_outset((12.0 * k as f32, 12.0 * k as f32));
             canvas.save_layer_alpha_f(Some(bounds), alpha);
             canvas.draw_rrect(
@@ -189,7 +172,6 @@ impl Shell {
                 k as f32,
             );
             let cy = by + bh / 2.0;
-            // Tinted by kind, so a toast is readable from a couch without reading the words.
             draw_toast_mark(canvas, mark, bx + mark_pad + mark_w / 2.0, cy, k, tint);
             fonts.draw(
                 canvas,
@@ -203,12 +185,9 @@ impl Shell {
             canvas.restore();
         }
     }
-    /// A full-screen connect/wake takeover: a fresh aurora over everything (so the carousel and
-    /// chrome fall away), a centered spinner (or none, when a wake has timed out), a title, one
-    /// detail line, and its own bottom hint row. `appear` fades the whole thing in over the home;
-    /// a wake that hands off to a connect passes 1.0 so the two never blink between them. The
-    /// console counterpart of the Android/Apple `ConnectOverlay` — one full-screen shape, not a
-    /// centered modal card.
+    /// Full-screen connect/wake takeover: aurora, optional spinner, title, one
+    /// detail line, own hint row. `appear` = 1.0 when a wake hands off to a connect
+    /// so the two never blink. Not a centered card.
     #[allow(clippy::too_many_arguments)]
     fn draw_takeover(
         &self,
@@ -226,11 +205,9 @@ impl Shell {
     ) {
         let cx = w / 2.0;
         canvas.save_layer_alpha_f(None, appear as f32);
-        // Opaque aurora — the same living backdrop the home wears, so the takeover reads as the
-        // console taking over rather than a card popping up.
+        // Opaque aurora — the home field, so this reads as the console taking over.
         self.draw_aurora(canvas, w, h, t, 0.0);
-        // A soft pool of shade under the centre seats the text against a bright field —
-        // dark on a dark palette, light on a pale one, so it always separates.
+        // Shade pool under the centre so title/body separate from a bright aurora.
         let mut vignette = crate::theme::shaded();
         let shades = [crate::theme::shade(0.5), crate::theme::shade(0.0)];
         vignette.set_shader(gradient::shaders::radial_gradient(
@@ -246,7 +223,6 @@ impl Shell {
         ));
         canvas.draw_rect(Rect::from_wh(w as f32, h as f32), &vignette);
 
-        // Centre the spinner + title + detail as a group around the middle of the screen.
         let title_y = h / 2.0 + if spinner { 14.0 * k } else { 0.0 };
         if spinner {
             crate::theme::spinner(canvas, cx, title_y - 52.0 * k, 22.0 * k, t);
@@ -274,7 +250,6 @@ impl Shell {
             );
         }
         if !hints.is_empty() {
-            // Centered near the bottom, where every console screen's legend sits.
             let probe = hint_bar(canvas, fonts, hints, self.glyphs, -10_000.0, -10_000.0, k);
             hint_bar(
                 canvas,

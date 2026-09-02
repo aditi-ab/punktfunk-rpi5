@@ -1,10 +1,12 @@
-//! A shortcut's editor on the console (design/touch-client-overlay.md §3.3, the pad form), in
-//! the console's own grammar: a list of rows — the name, the key, the four modifiers, Save
-//! and Remove — under the disc as the ring will draw it. The name is typed on the keyboard
-//! tray (Steam's on a Deck); the key is picked on a key tray that rises the same way, shaped
-//! like a keyboard and drawn like the keyboard tray — every name `key_vk` knows, laid out the
-//! way a keyboard lays them out. A new shortcut takes the first empty ring slot, as on the
-//! phones. Writes go through the same load-then-save the settings screen uses.
+//! One ring shortcut on the console: name, key, four modifiers, Save, Remove.
+//!
+//! The disc preview is the same keycap the in-stream ring draws. The name is
+//! typed on the keyboard tray (Steam's on a Deck); the key is picked on a
+//! keyboard-shaped tray of every name `key_vk` knows. A new shortcut takes the
+//! first empty ring slot. Writes go through the same load-then-save the
+//! settings screen uses, so another writer's edits are never reverted.
+//!
+//! Pad form: design/touch-client-overlay.md.
 
 use crate::anim::{approach, Spring, TRAY_C, TRAY_K};
 use crate::glyphs::{Hint, HintKey};
@@ -21,8 +23,6 @@ use super::ring_editor::ring_platform;
 
 const MODIFIERS: [&str; 4] = ["ctrl", "alt", "shift", "win"];
 
-/// The key grid, row by row, the way a keyboard lays them out — every name `key_vk` knows
-/// that is not a modifier.
 const GRID: [&[&str]; 6] = [
     &[
         "escape", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
@@ -60,15 +60,12 @@ const GRID: [&[&str]; 6] = [
     ],
 ];
 
-/// The rows, top to bottom: the name, the key, one per modifier, Save, and Remove for an
-/// existing shortcut.
 const ROW_NAME: usize = 0;
 const ROW_KEY: usize = 1;
 const ROW_MODS: usize = 2;
 const ROW_SAVE: usize = ROW_MODS + MODIFIERS.len();
 const ROW_REMOVE: usize = ROW_SAVE + 1;
 
-/// One shortcut being edited: `id` is `None` for a new one.
 pub(crate) struct Draft {
     pub id: Option<String>,
     pub label: String,
@@ -77,7 +74,6 @@ pub(crate) struct Draft {
 }
 
 impl Draft {
-    /// A draft of `sc`, or an empty one for a new shortcut.
     fn of(sc: Option<&Shortcut>) -> Draft {
         let Some(sc) = sc else {
             return Draft {
@@ -106,7 +102,7 @@ impl Draft {
         }
     }
 
-    /// The chord in send order: the modifiers marked on, then the key.
+    /// Host send order: marked modifiers, then the key.
     fn keys(&self) -> Vec<String> {
         let mut v: Vec<String> = MODIFIERS
             .iter()
@@ -118,7 +114,6 @@ impl Draft {
         v
     }
 
-    /// How many rows the list shows: Remove only for a shortcut that exists.
     fn row_count(&self) -> usize {
         if self.id.is_some() {
             ROW_REMOVE + 1
@@ -128,8 +123,6 @@ impl Draft {
     }
 }
 
-/// The rows as the list draws them this frame. `typing`: the name row carries the caret;
-/// `picking`: the key row does (it is what the key tray edits).
 fn rows(d: &Draft, typing: bool, picking: bool) -> Vec<RowSpec> {
     let mut v = Vec::with_capacity(ROW_REMOVE + 1);
     let mut name = RowSpec::field("Name", d.label.clone(), "Optional — e.g. Task Manager");
@@ -167,19 +160,16 @@ fn rows(d: &Draft, typing: bool, picking: bool) -> Vec<RowSpec> {
     v
 }
 
-/// The draft into the blob: the shared upsert (over its own entry, or appended into the first
-/// empty slot). Pure, so a test can drive it without the shared settings file.
+/// Pure upsert so tests can drive the blob without the process-wide settings file.
 fn apply_draft(cfg: &mut OverlayConfig, d: &Draft) {
     cfg.upsert_shortcut(d.id.as_deref(), &d.label, d.keys());
 }
 
-/// Drop a shortcut and empty the slot that pointed at it.
 fn remove_shortcut(cfg: &mut OverlayConfig, id: &str) {
     cfg.remove_shortcut(id);
 }
 
-/// The key in `row` whose centre is nearest `x`, so Up and Down keep the column a keyboard
-/// would (the rows are staggered).
+/// Nearest key centre to `x` — Up/Down keep a keyboard column on staggered rows.
 fn nearest_col(row: &[Rect], x: f32) -> usize {
     row.iter()
         .enumerate()
@@ -191,27 +181,20 @@ fn nearest_col(row: &[Rect], x: f32) -> usize {
         .map_or(0, |(i, _)| i)
 }
 
-/// What the key tray consumed an event into.
 #[derive(Debug, PartialEq, Eq)]
 enum TrayMsg {
     None,
-    /// A on a key (or a press on it).
     Pick(&'static str),
-    /// B: the tray goes down, the key stays what it was.
     Close,
 }
 
-/// The key picker: a keyboard-shaped tray of every key the wire knows, risen from the bottom
-/// like the keyboard tray and drawn its way — flat keys, the focused one filled with the
-/// accent, the chosen one washed with it.
 struct KeyTray {
     row: usize,
     col: usize,
-    /// Tray slide-in (0 hidden → 1 seated), the keyboard tray's spring.
+    /// 0 hidden → 1 seated; shares the keyboard tray's spring.
     tray: Spring,
     flash: f64,
-    /// Each key's rect as last drawn, by grid position — the tray slides, so hit-testing
-    /// and the column walk read the drawn geometry.
+    /// Last drawn key rects — hit-testing and the column walk follow the sliding tray.
     keys: Vec<Vec<Rect>>,
 }
 
@@ -219,7 +202,7 @@ impl KeyTray {
     const KEY_H: f64 = 38.0;
     const GAP: f64 = 6.0;
     const PAD: f64 = 14.0;
-    /// A letter key's width; a word key is as wide as its word.
+    /// Letter-key width in design units; word keys grow to the legend.
     const UNIT: f64 = 34.0;
 
     fn new() -> KeyTray {
@@ -235,7 +218,7 @@ impl KeyTray {
         }
     }
 
-    /// Open on `key` if the grid has it, else on Esc.
+    /// Focus `key` if it is on the grid; otherwise Esc at (0, 0).
     fn seat_on(&mut self, key: Option<&str>) {
         let at = key.and_then(|name| {
             GRID.iter()
@@ -245,14 +228,12 @@ impl KeyTray {
         (self.row, self.col) = at.unwrap_or((0, 0));
     }
 
-    /// The tray's design height (pre-`k`), for layout above it.
     fn tray_height() -> f64 {
         let rows = GRID.len() as f64;
         rows * Self::KEY_H + (rows - 1.0) * Self::GAP + 2.0 * Self::PAD
     }
 
-    /// Advance the tray spring toward shown/hidden. Returns the seat 0..1 — exactly 0 while
-    /// hidden, so the caller can skip rendering.
+    /// Step the tray spring. Returns 0 while hidden so the caller can skip drawing.
     fn seat(&mut self, shown: bool, dt: f64) -> f64 {
         let target = if shown { 1.0 } else { 0.0 };
         self.tray.step(target, TRAY_K, TRAY_C, dt);
@@ -265,8 +246,7 @@ impl KeyTray {
         self.keys.iter().flatten().any(|r| p.hits(*r))
     }
 
-    /// A press on a key picks it and moves the cursor there; between keys it is swallowed —
-    /// the tray is modal.
+    /// A press on a key picks it. Misses are swallowed — the tray is modal.
     fn pointer(&mut self, p: Pointer) -> (TrayMsg, Option<MenuPulse>) {
         if !p.press() {
             return (TrayMsg::None, None);
@@ -284,9 +264,6 @@ impl KeyTray {
         (TrayMsg::Pick(GRID[r][c]), Some(MenuPulse::Confirm))
     }
 
-    /// The stick on the grid: Left and Right walk a row, Up and Down keep the column a
-    /// keyboard would (the rows are staggered — the nearest centre in the next row). A
-    /// picks, B closes.
     fn menu(&mut self, ev: MenuEvent) -> (TrayMsg, Option<MenuPulse>) {
         match ev {
             MenuEvent::Move(dir) => {
@@ -316,8 +293,6 @@ impl KeyTray {
         }
     }
 
-    /// Render the tray with its bottom edge at `bottom`, horizontally centred, slid by
-    /// `seat` (0..1). `chosen` is the draft's key, washed with the accent.
     #[allow(clippy::too_many_arguments)]
     fn render(
         &mut self,
@@ -362,7 +337,6 @@ impl KeyTray {
                 let face = if focused {
                     let mut b = accent(1.0);
                     if self.flash > 0.02 {
-                        // A just-picked key flashes brighter, then eases back.
                         let f = self.flash as f32;
                         b = Color4f::new(
                             b.r + (1.0 - b.r) * 0.5 * f,
@@ -382,8 +356,7 @@ impl KeyTray {
                 if is_chosen && !focused {
                     canvas.draw_rrect(rr, &stroke(accent(0.9), kf));
                 }
-                // The focused key is filled with the accent, so its legend needs ink that
-                // reads on THAT, not on the field.
+                // Accent fill: legend ink is `on_accent`, not field `fg`.
                 let ink = if focused { on_accent() } else { fg(1.0) };
                 let tw = f64::from(fonts.measure(&legends[c], W::Medium, size));
                 fonts.draw(
@@ -404,7 +377,7 @@ impl KeyTray {
 pub(crate) struct ShortcutEditorScreen {
     draft: Draft,
     list: MenuList,
-    /// The name's tray, on a screen without Steam's keyboard.
+    /// Own tray; a Deck uses Steam's keyboard instead.
     keyboard: Keyboard,
     keys: KeyTray,
     editing_name: bool,
@@ -415,7 +388,6 @@ impl ShortcutEditorScreen {
     pub(crate) fn new(_ctx: &Ctx, existing: Option<&Shortcut>) -> ShortcutEditorScreen {
         let draft = Draft::of(existing);
         let mut list = MenuList::new();
-        // A new shortcut opens on the key — the one thing it needs.
         list.jump_to(if draft.key.is_none() {
             ROW_KEY
         } else {
@@ -515,8 +487,6 @@ impl ShortcutEditorScreen {
         }
     }
 
-    /// A on a row: the name opens the keyboard, the key opens the key tray, a modifier
-    /// toggles, Save and Remove do what they say.
     fn activate(&mut self, row: usize, ctx: &mut Ctx, fx: &mut Outbox) -> Option<MenuPulse> {
         match row {
             ROW_NAME => self.editing_name = true,
@@ -528,8 +498,7 @@ impl ShortcutEditorScreen {
         Some(MenuPulse::Confirm)
     }
 
-    /// ◀ ▶ on a modifier row: Left is Off, Right is On — the settings rows' grammar. A
-    /// refused step (already there) recoils.
+    /// Modifier rows: Left Off, Right On — same grammar as settings. Already-there recoils.
     fn adjust(&mut self, row: usize, delta: i32) -> Option<MenuPulse> {
         if !(ROW_MODS..ROW_SAVE).contains(&row) {
             return Some(MenuPulse::Boundary);
@@ -598,7 +567,6 @@ impl ShortcutEditorScreen {
             return self.take_pick(msg).or(pulse);
         }
         if ev == MenuEvent::Back {
-            // Unsaved: the editor peels back to the ring.
             fx.pop();
             return None;
         }
@@ -717,8 +685,6 @@ impl ShortcutEditorScreen {
             ROW_MAX_W * 0.9 * k,
         );
 
-        // The disc as the ring will draw it, its legend beside it — over the rows, on the
-        // rows' own left edge.
         let top = rect.top + 40.0 * kf;
         let r = 30.0 * kf;
         let chip = chord_chip(&self.draft.keys());
@@ -749,8 +715,7 @@ impl ShortcutEditorScreen {
             fg(0.5),
         );
 
-        // The rows, above whichever tray is up (the list shrinks and scrolls the edited
-        // row into view, as the add-host screen does).
+        // Shrink the list by whichever tray is seated so the edited row stays in view.
         let seat_kb = self.keyboard.seat(self.editing_name && !ctx.deck, dt);
         let seat_keys = self.keys.seat(self.picking_key, dt);
         let tray_h = (Keyboard::tray_height() + 12.0) * k * seat_kb
@@ -800,11 +765,8 @@ mod tests {
     use super::*;
     use pf_client_core::overlay_actions::{RingPlatform, SlotId};
 
-    /// A new shortcut: Ctrl and Shift marked on, Esc chosen on the grid — applied, it is in
-    /// the blob with its keys in send order and sits in the first empty slot; reopened, the
-    /// draft reads it back; removed, that slot empties again. The blob is applied directly
-    /// rather than through `save`: the store is one real file shared by every test in the
-    /// process, and a round trip through it races the settings tests.
+    /// Apply the blob directly. The settings store is one process-wide file; a round
+    /// trip through `save` races the settings tests.
     #[test]
     fn a_new_shortcut_lands_in_the_blob_and_the_first_empty_slot() {
         let blob = r#"{"v":2,"ring":["end_stream",null,null,null,null,null]}"#;
@@ -829,9 +791,6 @@ mod tests {
         assert_eq!(cfg.ring[1], None);
     }
 
-    /// The rows follow the draft: a new shortcut has no Remove and cannot be added until it
-    /// has a key; the modifiers are stepped rows reading Off/On; the key row shows the
-    /// legend, and carries the caret while the key tray is up.
     #[test]
     fn the_rows_follow_the_draft() {
         let mut d = Draft::of(None);
@@ -861,8 +820,6 @@ mod tests {
         assert_eq!(d.row_count(), ROW_REMOVE + 1);
     }
 
-    /// The key tray opens on the draft's key, walks its rows like a keyboard, picks on A
-    /// and closes on B.
     #[test]
     fn the_key_tray_walks_like_a_keyboard() {
         let mut t = KeyTray::new();
@@ -870,7 +827,7 @@ mod tests {
         assert_eq!((t.row, t.col), (3, 1));
         assert_eq!(t.menu(MenuEvent::Move(MenuDir::Right)).0, TrayMsg::None);
         assert_eq!(t.menu(MenuEvent::Confirm).0, TrayMsg::Pick("s"));
-        // Undrawn, every rect is empty, so the column walk lands on the first key.
+        // Undrawn rects are empty, so Up lands on column 0.
         assert_eq!(t.menu(MenuEvent::Move(MenuDir::Up)).0, TrayMsg::None);
         assert_eq!((t.row, t.col), (2, 0));
         t.seat_on(Some("not a key"));
@@ -882,7 +839,6 @@ mod tests {
         assert_eq!(t.menu(MenuEvent::Back).0, TrayMsg::Close);
     }
 
-    /// Every key on the grid is one `key_vk` knows, none is a modifier, and none repeats.
     #[test]
     fn the_grid_holds_every_key_once_and_no_modifier() {
         use pf_client_core::overlay_actions::key_vk;
@@ -898,7 +854,6 @@ mod tests {
         assert_eq!(seen.len(), 66);
     }
 
-    /// Up and Down keep the column a keyboard would: the nearest centre in the next row.
     #[test]
     fn the_grid_cursor_keeps_its_column_across_staggered_rows() {
         let row: Vec<Rect> = (0..5)

@@ -1,22 +1,13 @@
-//! Host-side shared-clipboard backend.
+//! Host clipboard backends (`design/clipboard-and-file-transfer.md`).
 //!
-//! The wire protocol and the client half live in `punktfunk-core`
-//! (`punktfunk_core::quic` + `punktfunk_core::clipboard`); this module drives the **host's** real
-//! session clipboard so it can offer what a host app copied and paste what the remote client
-//! offered (`design/clipboard-and-file-transfer.md` §4).
+//! Wire protocol and client half live in `punktfunk-core`. This module owns the
+//! host selection: offer what a host app copied, paste what the remote offered.
+//! [`HostClipboard::open`] picks one backend; [`session`] stays agnostic.
 //!
-//! Concrete backends, selected at session start ([`HostClipboard::open`]) and presented as one
-//! [`HostClipboard`] to the [`session`] coordinator:
-//! * [`wayland`] (Linux) — `ext-data-control-v1` (KWin, wlroots / Sway, Hyprland). Preferred when present.
-//! * [`mutter`] (Linux) — GNOME. Mutter implements **no** wlr/ext data-control, but its *direct*
-//!   `org.gnome.Mutter.RemoteDesktop.Session` D-Bus API carries the same clipboard operations (the
-//!   xdg `org.freedesktop.portal.Clipboard` would need an interactive grant a headless host can't
-//!   answer — so we skip it and talk to Mutter directly, as the input injector already does).
-//! * [`windows`] — the Win32 clipboard: a hidden message-only window watches `WM_CLIPBOARDUPDATE`
-//!   and serves client content via OLE delayed rendering (`WM_RENDERFORMAT`).
-//!
-//! The `zwlr-data-control-unstable-v1` fallback (older wlroots/KWin) is a follow-up. The module
-//! compiles on Linux and Windows; the [`session`] coordinator is backend-agnostic.
+//! Linux prefers [`wayland`] (`ext-data-control-v1`). GNOME has no data-control;
+//! [`mutter`] uses `org.gnome.Mutter.RemoteDesktop.Session` directly — the xdg
+//! portal needs an interactive grant a headless host cannot answer.
+//! [`windows`] watches `WM_CLIPBOARDUPDATE` and serves via `WM_RENDERFORMAT`.
 
 #[cfg(target_os = "linux")]
 mod mutter;
@@ -24,9 +15,8 @@ mod mutter;
 mod wayland;
 #[cfg(target_os = "windows")]
 mod windows;
-/// Pure Win32-clipboard ↔ wire byte conversions (CF_HTML offset math, UTF-16 text, RTF NUL
-/// trimming). Free of any Win32 dependency, so it compiles — and its unit tests run — on any host
-/// (`cfg(test)`); the Windows backend is the only production consumer.
+/// Win32 clipboard ↔ wire bytes (CF_HTML offsets, UTF-16, RTF NULs). No Win32
+/// crate, so tests run on every host; [`windows`] is the only production caller.
 #[cfg(any(target_os = "windows", test))]
 mod winfmt;
 
@@ -38,44 +28,33 @@ use std::io::Write as _;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
-/// A clipboard event surfaced by a host backend to the [`session`] coordinator. Both the
-/// data-control and Mutter backends emit this identical shape.
 pub enum ClipEvent {
-    /// The host selection changed (a host app copied). `mimes` are the **wire** MIMEs offered (empty
-    /// = the clipboard was cleared). The coordinator forwards these as a `ClipOffer` to the client;
-    /// bytes cross only if the client later fetches.
+    /// Empty `mimes` means cleared; bytes wait for a client fetch.
     Selection { mimes: Vec<String> },
-    /// A host app is pasting content the client offered. The coordinator fetches the wire-`mime`
-    /// bytes from the client and hands them to `responder`.
+    /// Host app pasting the client's offer; coordinator fetches then `responder`.
     Paste {
         mime: String,
         responder: PasteResponder,
     },
-    /// The backend ended (compositor / session gone).
     Closed,
 }
 
-/// How a backend receives the bytes answering a [`ClipEvent::Paste`]. The two host clipboard
-/// mechanisms complete a paste differently, so the coordinator stays agnostic by handing bytes to
-/// whichever responder the backend attached.
+/// Bytes sink for a [`ClipEvent::Paste`]. The coordinator never picks the
+/// mechanism (pipe, oneshot, or blocking mpsc).
 pub enum PasteResponder {
-    /// data-control: the compositor handed us the destination pipe on the `send` event — write the
-    /// bytes and close it (EOF completes the paste).
+    /// Compositor `send` pipe; write bytes and close (EOF finishes the paste).
     #[cfg(target_os = "linux")]
     Fd(OwnedFd),
-    /// Mutter: hand the bytes back to the backend actor, which owns the `SelectionWrite` fd and the
-    /// trailing `SelectionWriteDone` call that Mutter's transfer requires.
+    /// Mutter actor owns the `SelectionWrite` fd and the required `SelectionWriteDone`.
     #[cfg(target_os = "linux")]
     Channel(tokio::sync::oneshot::Sender<Vec<u8>>),
-    /// Windows: hand the bytes to the `WM_RENDERFORMAT` handler blocking the clipboard message-loop
-    /// thread, which then `SetClipboardData`s them for the pasting app (`std::sync::mpsc`, since that
-    /// thread waits synchronously — see [`windows`]).
+    /// `WM_RENDERFORMAT` handler blocks the message-loop thread; `std::sync::mpsc`.
     #[cfg(target_os = "windows")]
     Sync(std::sync::mpsc::Sender<Vec<u8>>),
 }
 
 impl PasteResponder {
-    /// Deliver the fetched bytes (empty on a failed fetch → an empty paste, never a hang).
+    /// Empty `bytes` (failed fetch) is an empty paste, never a hang.
     pub async fn respond(self, bytes: Vec<u8>) {
         match self {
             #[cfg(target_os = "linux")]
@@ -94,8 +73,7 @@ impl PasteResponder {
     }
 }
 
-/// Write `bytes` into a paste pipe `fd` and close it (EOF signals the reader). Blocking — run off the
-/// reactor for large payloads.
+/// Blocking; call off the reactor. Close is EOF, which completes the paste.
 #[cfg(target_os = "linux")]
 fn fulfill_paste(fd: OwnedFd, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::File::from(fd);
@@ -103,10 +81,6 @@ fn fulfill_paste(fd: OwnedFd, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The active host clipboard backend, chosen per session: `ext-data-control`
-/// (KWin/wlroots/Hyprland/Sway) or Mutter's direct RemoteDesktop clipboard (GNOME) on Linux, or the
-/// Win32 clipboard on Windows. Presented as one type so the [`session`] coordinator is
-/// backend-agnostic.
 pub enum HostClipboard {
     #[cfg(target_os = "linux")]
     DataControl(wayland::ClipboardBackend),
@@ -117,17 +91,14 @@ pub enum HostClipboard {
 }
 
 impl HostClipboard {
-    /// Open whichever backend this session supports. Linux tries data-control first
-    /// (KWin/wlroots/Hyprland/Sway) then Mutter's direct clipboard (GNOME); Windows opens the Win32
-    /// clipboard. Errors when none is available (gamescope, no live compositor) — the caller then
-    /// reports `BACKEND_UNAVAILABLE`.
+    /// No compositor (gamescope) → error; caller reports `BACKEND_UNAVAILABLE`.
     pub async fn open() -> anyhow::Result<(
         HostClipboard,
         tokio::sync::mpsc::UnboundedReceiver<ClipEvent>,
     )> {
         #[cfg(target_os = "linux")]
         {
-            // data-control's bind does blocking Wayland roundtrips — keep them off the reactor.
+            // Bind does blocking Wayland roundtrips; keep them off the reactor.
             let dc = tokio::task::spawn_blocking(wayland::ClipboardBackend::open)
                 .await
                 .map_err(|e| anyhow::anyhow!("data-control open join: {e}"))?;
@@ -150,7 +121,7 @@ impl HostClipboard {
         }
     }
 
-    /// The current host selection's wire MIMEs (empty = nothing to offer).
+    /// Empty means nothing to offer.
     pub fn current_wire_mimes(&self) -> Vec<String> {
         match self {
             #[cfg(target_os = "linux")]
@@ -162,7 +133,6 @@ impl HostClipboard {
         }
     }
 
-    /// Install a client's offered formats as the host selection.
     pub fn set_offer(&self, wire_mimes: &[String]) -> anyhow::Result<()> {
         match self {
             #[cfg(target_os = "linux")]
@@ -180,7 +150,6 @@ impl HostClipboard {
         }
     }
 
-    /// Drop the host selection we own.
     pub fn clear_offer(&self) -> anyhow::Result<()> {
         match self {
             #[cfg(target_os = "linux")]
@@ -198,9 +167,8 @@ impl HostClipboard {
         }
     }
 
-    /// Read one wire format of the current host selection (a client's fetch). Async: data-control
-    /// blocks on a pipe (offloaded), Mutter round-trips D-Bus + reads a pipe, Windows reads the
-    /// clipboard on a blocking thread.
+    /// Data-control blocks on a pipe (offloaded); Mutter round-trips D-Bus;
+    /// Windows reads on a blocking thread.
     pub async fn read_current(self: &Arc<Self>, wire_mime: &str) -> anyhow::Result<Vec<u8>> {
         match &**self {
             #[cfg(target_os = "linux")]
@@ -222,33 +190,21 @@ impl HostClipboard {
     }
 }
 
-// ---- Format normalization (design/clipboard-and-file-transfer.md §3.5) ------------------------
-//
-// One portable vocabulary crosses the wire; each end maps to platform types at fetch time. Phase 1
-// covers text / RTF / HTML / PNG (files are Phase 2). The wire MIMEs match the core's table.
-
-/// Wire MIME for UTF-8 plain text.
 pub const WIRE_TEXT: &str = "text/plain;charset=utf-8";
-/// Wire MIME for HTML.
 pub const WIRE_HTML: &str = "text/html";
-/// Wire MIME for rich text.
 pub const WIRE_RTF: &str = "text/rtf";
-/// Wire MIME for a PNG image.
 pub const WIRE_PNG: &str = "image/png";
-/// Wire MIME for a JPEG image — passed through VERBATIM when the source clipboard carries one
-/// (no PNG transcode: a lossy original re-encoded lossless is pure bloat). [`WIRE_PNG`] remains
-/// the universal fallback every peer must accept; JPEG/GIF are richer options beside it.
+/// JPEG from the source clipboard, verbatim. Do not transcode to PNG: a
+/// lossy original re-encoded lossless is pure bloat. PNG is the fallback.
 pub const WIRE_JPEG: &str = "image/jpeg";
-/// Wire MIME for a GIF image — verbatim pass-through preserves animation end to end.
+/// GIF verbatim; transcoding would drop animation.
 pub const WIRE_GIF: &str = "image/gif";
 
-/// Map a Wayland selection MIME to its canonical wire MIME, or `None` to drop it (internal targets
-/// like `TARGETS`/`TIMESTAMP`/`SAVE_TARGETS`, and formats we don't sync in Phase 1). Aliases
-/// collapse onto one canonical wire name so the offered list dedups cleanly.
+/// Canonical wire MIME, or `None` for compositor internals (`TARGETS`,
+/// `TIMESTAMP`, `SAVE_TARGETS`). Aliases collapse so the offer list dedups.
 #[cfg(target_os = "linux")]
 pub fn wayland_to_wire(wl: &str) -> Option<&'static str> {
-    // Strip any parameter noise for the plain-text aliases (some apps send `text/plain;charset=...`
-    // with odd charsets, or bare `text/plain`).
+    // Some apps send `text/plain;charset=...` with odd charsets, or bare `text/plain`.
     let base = wl.split(';').next().unwrap_or(wl).trim();
     match wl {
         "text/html" => Some(WIRE_HTML),
@@ -263,8 +219,6 @@ pub fn wayland_to_wire(wl: &str) -> Option<&'static str> {
     }
 }
 
-/// The Wayland MIME candidates to request, in preference order, when a client fetches `wire` from
-/// the host clipboard. The first one present in the current offer is used.
 #[cfg(target_os = "linux")]
 pub fn wayland_candidates(wire: &str) -> &'static [&'static str] {
     match wire {
@@ -284,8 +238,6 @@ pub fn wayland_candidates(wire: &str) -> &'static [&'static str] {
     }
 }
 
-/// Pick the Wayland MIME to `receive()` for a wire fetch: the first [`wayland_candidates`] entry the
-/// current selection actually advertises.
 #[cfg(target_os = "linux")]
 pub fn pick_wayland_mime(wire: &str, available: &[String]) -> Option<String> {
     wayland_candidates(wire)
@@ -294,8 +246,6 @@ pub fn pick_wayland_mime(wire: &str, available: &[String]) -> Option<String> {
         .map(|c| c.to_string())
 }
 
-/// Normalize a raw Wayland offer's MIME list into the deduplicated wire MIME list announced to the
-/// client (drops internal targets; collapses aliases; preserves a stable order).
 #[cfg(target_os = "linux")]
 pub fn offer_wire_mimes(raw: &[String]) -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
@@ -309,11 +259,8 @@ pub fn offer_wire_mimes(raw: &[String]) -> Vec<&'static str> {
     out
 }
 
-/// Whether a non-canonical, client-supplied MIME is safe to hand to Wayland as a string argument.
-///
-/// Deliberately strict: printable ASCII only (so no NUL and no other control byte can reach the
-/// `CString` in the generated encoder), bounded length, and it must actually look like a MIME type.
-/// A real `type/subtype[;params]` passes; nothing that could crash or confuse the compositor does.
+/// Client MIME safe to pass as a Wayland string. Printable ASCII, ≤255,
+/// `type/subtype`. The generated encoder `unwrap()`s a `CString`; a NUL panics.
 #[cfg(target_os = "linux")]
 fn valid_passthrough_mime(m: &str) -> bool {
     let Some((ty, rest)) = m.split_once('/') else {
@@ -322,14 +269,12 @@ fn valid_passthrough_mime(m: &str) -> bool {
     !ty.is_empty()
         && !rest.is_empty()
         && m.len() <= 255
-        // 0x21..=0x7E: printable ASCII without space. Excludes NUL, every other control byte, and
-        // any non-ASCII byte.
+        // Printable ASCII without space: no NUL, no other control, no non-ASCII.
         && m.bytes().all(|b| (0x21..=0x7E).contains(&b))
 }
 
-/// The Wayland MIMEs to advertise when installing a source for a client's offer. Each wire MIME
-/// expands to its canonical Wayland name(s); a rich-text-only offer also advertises `text/plain`
-/// so plain-text targets always paste (§3.5 synthesis — destination-side, one direction only).
+/// A rich-only offer also advertises `text/plain` so plain-text targets can paste
+/// (destination-side, one way).
 #[cfg(target_os = "linux")]
 pub fn wayland_offers_for(wire_mimes: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -360,20 +305,16 @@ pub fn wayland_offers_for(wire_mimes: &[String]) -> Vec<String> {
             WIRE_PNG => push("image/png"),
             WIRE_JPEG => push("image/jpeg"),
             WIRE_GIF => push("image/gif"),
-            // A MIME we don't canonicalize is passed through verbatim — so it is the one value on
-            // this path the CLIENT fully controls, and it ends up as a Wayland string argument.
-            // The wayland-scanner-generated request encoder builds a `CString` and `unwrap()`s it,
-            // so a single interior NUL turns one control message into a host clipboard panic
-            // (2026-08-05 review L-8). `String::from_utf8_lossy` on the wire preserves `\0`, so
-            // nothing upstream removes it. Validate here, at the boundary where the value stops
-            // being ours and becomes libwayland's.
+            // Uncanonicalized MIME is a client-controlled Wayland string. The generated
+            // encoder `unwrap()`s a `CString`; an interior NUL panics. Wire UTF-8 lossy
+            // keeps `\0`. Validate here, at the libwayland boundary.
             other if valid_passthrough_mime(other) => push(other),
             other => {
                 tracing::debug!(mime = %other.escape_debug(), "clipboard: dropping a malformed client MIME");
             }
         }
     }
-    // Synthesis: rich text without plain text → also advertise plain (the source derives it lazily).
+    // Rich without plain: advertise plain; the source derives it lazily.
     if has_rich && !has_plain {
         push("text/plain;charset=utf-8");
         push("text/plain");
@@ -395,10 +336,8 @@ mod tests {
         assert_eq!(wayland_to_wire("text/html"), Some(WIRE_HTML));
         assert_eq!(wayland_to_wire("application/rtf"), Some(WIRE_RTF));
         assert_eq!(wayland_to_wire("image/png"), Some(WIRE_PNG));
-        // Original image formats now map to their own wire kinds (verbatim pass-through).
         assert_eq!(wayland_to_wire("image/jpeg"), Some(WIRE_JPEG));
         assert_eq!(wayland_to_wire("image/gif"), Some(WIRE_GIF));
-        // Internal targets and unsupported formats are dropped.
         assert_eq!(wayland_to_wire("TARGETS"), None);
         assert_eq!(wayland_to_wire("TIMESTAMP"), None);
         assert_eq!(wayland_to_wire("image/webp"), None);
@@ -413,24 +352,18 @@ mod tests {
             "text/plain".to_string(),
             "text/html".to_string(),
         ];
-        // text aliases collapse to one WIRE_TEXT; TARGETS dropped; html kept.
         assert_eq!(offer_wire_mimes(&raw), vec![WIRE_TEXT, WIRE_HTML]);
     }
 
-    /// One control message must not be able to panic the host clipboard coordinator
-    /// (2026-08-05 review L-8). The passthrough branch is the only place a client string becomes a
-    /// Wayland argument, and the generated encoder `unwrap()`s a `CString` built from it.
     #[test]
     fn passthrough_mimes_cannot_carry_a_nul_or_control_byte() {
-        // The crash payload: an interior NUL survives `String::from_utf8_lossy` on the wire.
+        // Interior NUL survives `String::from_utf8_lossy` on the wire.
         assert!(!valid_passthrough_mime("image/webp\0"));
         assert!(!valid_passthrough_mime("\0"));
         assert!(!valid_passthrough_mime("image/\0webp"));
-        // Other control bytes and whitespace are refused for the same reason.
         assert!(!valid_passthrough_mime("image/web\np"));
         assert!(!valid_passthrough_mime("image/web p"));
         assert!(!valid_passthrough_mime("image/web\tp"));
-        // Shapes that are not a MIME type at all.
         assert!(!valid_passthrough_mime(""));
         assert!(!valid_passthrough_mime("noslash"));
         assert!(!valid_passthrough_mime("/nosubtype"));
@@ -439,12 +372,10 @@ mod tests {
             "image/{}",
             "x".repeat(300)
         )));
-        // Legitimate uncanonicalized MIMEs still pass through.
         assert!(valid_passthrough_mime("image/webp"));
         assert!(valid_passthrough_mime("application/x-custom+json"));
         assert!(valid_passthrough_mime("text/plain;charset=utf-8"));
 
-        // End to end: the offer list is built without the malformed entry, and does not panic.
         let offers = wayland_offers_for(&["image/webp\0".to_string(), WIRE_PNG.to_string()]);
         assert_eq!(offers, vec!["image/png".to_string()]);
     }
@@ -452,7 +383,7 @@ mod tests {
     #[test]
     fn pick_wayland_mime_prefers_canonical() {
         let avail = vec!["text/plain".to_string(), "UTF8_STRING".to_string()];
-        // Canonical charset form isn't present, so it falls to the next candidate.
+        // Charset form missing; next candidate (`text/plain`) wins.
         assert_eq!(
             pick_wayland_mime(WIRE_TEXT, &avail),
             Some("text/plain".to_string())
@@ -476,7 +407,6 @@ mod tests {
             offers.iter().any(|m| m == "text/plain;charset=utf-8"),
             "rich-only offer must synthesize plain text: {offers:?}"
         );
-        // Plain already present → no duplicate synthesis, and text aliases included.
         let offers2 = wayland_offers_for(&[WIRE_TEXT.to_string()]);
         assert!(offers2.iter().any(|m| m == "UTF8_STRING"));
         assert_eq!(offers2.iter().filter(|m| *m == "text/plain").count(), 1);

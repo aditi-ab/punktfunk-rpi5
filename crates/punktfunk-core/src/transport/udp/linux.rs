@@ -1,6 +1,5 @@
-//! Linux/Android batched UDP send/recv: `sendmmsg`/`recvmmsg` + Linux UDP GSO.
-//! The platform bodies of [`super::UdpTransport`]'s `send_batch`/`send_gso`/`recv_batch`
-//! overrides live here (called by the cfg-gated delegators in the parent `impl Transport`).
+//! Linux/Android batched UDP: `sendmmsg`/`recvmmsg` plus Linux UDP GSO.
+//! Platform bodies of [`super::UdpTransport`]'s `send_batch`/`send_gso`/`recv_batch`.
 
 // Crate-wide deny(unsafe_code) carve-out (lib.rs): platform syscall-batching glue —
 // `sendmmsg`/`recvmmsg`/GSO move caller-owned buffers; nothing here interprets network bytes.
@@ -37,11 +36,8 @@ use android_mmsg::{mmsghdr, recvmmsg, sendmmsg};
 #[cfg(target_os = "linux")]
 use libc::{mmsghdr, recvmmsg, sendmmsg};
 
-/// Build one `mmsghdr` per `iovec` (each a single-buffer message) for `sendmmsg`/`recvmmsg`. Shared
-/// by `send_batch` + `recv_batch` so the raw-pointer scaffolding lives in exactly one place.
-///
-/// SAFETY (caller's): each returned header holds a raw pointer into `iovs`; the caller MUST keep
-/// `iovs` alive and unmoved for as long as the headers are passed to the syscall.
+/// Each returned header holds a raw pointer into `iovs`. The caller must keep
+/// `iovs` alive and unmoved while those headers are passed to the syscall.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn mmsghdrs(iovs: &mut [libc::iovec]) -> Vec<mmsghdr> {
     iovs.iter_mut()
@@ -56,17 +52,14 @@ fn mmsghdrs(iovs: &mut [libc::iovec]) -> Vec<mmsghdr> {
         .collect()
 }
 
-/// UDP GSO enable state (process-wide). **Opt-in** (`PUNKTFUNK_GSO=1`) — and deliberately so,
-/// measured three times on 2026-07-14: GSO cuts send-thread CPU ~30% at 1250 Mbps, but its
-/// line-rate super-buffer trains cost real delivered throughput on a constrained fabric (the
-/// 2.5GbE-hop pair: peak 2452 → 1909 Mbps, and 0.4% loss at a rate sendmmsg carries clean).
-/// The third A/B ran WITH pace-aware chunk scaling landed (plan Phase 1.2/1.3 in
-/// `design/throughput-beyond-1gbps.md`) and reproduced the regression bit-for-bit — the trains
-/// lose on the hop's queue in the transport path itself (per-AU super-buffers, no video pacer
-/// involved), so the default stays opt-in on fabric evidence, not on pacing readiness. Revisit
-/// with a bare-metal Linux host on a clean 10G path. NOTE the gate is value-aware:
-/// `PUNKTFUNK_GSO=0` explicitly disables (it used to key on env *presence*, so `=0` ENABLED
-/// it here while disabling Windows USO).
+/// Process-wide UDP GSO latch. Opt-in (`PUNKTFUNK_GSO=1`).
+///
+/// Super-buffer trains cut send CPU but lose delivered rate on constrained hops
+/// (queue drop in the transport path, not the video pacer). Default stays off;
+/// evidence: `design/throughput-beyond-1gbps.md`.
+///
+/// The gate is value-aware: `PUNKTFUNK_GSO=0` disables. Do not key on env
+/// presence — `=0` would enable here while Windows USO treats `=0` as off.
 #[cfg(target_os = "linux")]
 mod gso {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -77,15 +70,14 @@ mod gso {
             1 => true,
             2 => false,
             _ => {
-                // Opt-in: on only when PUNKTFUNK_GSO is set to something other than "0".
                 let on = std::env::var("PUNKTFUNK_GSO").is_ok_and(|v| v != "0");
                 STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
                 on
             }
         }
     }
-    /// Latch GSO off for the process after a GSO syscall error (unsupported kernel/path).
-    /// Warns once — a mid-session downshift to sendmmsg should be visible, not silent.
+    /// Latch GSO off after an unsupported-path syscall error. Warn once so a
+    /// mid-session downshift to `sendmmsg` is visible.
     pub fn disable() {
         if STATE.swap(2, Ordering::Relaxed) != 2 {
             tracing::warn!("Linux UDP GSO unsupported on this path — falling back to sendmmsg");
@@ -93,12 +85,11 @@ mod gso {
     }
 }
 
-/// True if the send error means UDP GSO isn't usable on this kernel/NIC/path (vs a transient/real
-/// failure) — so we latch GSO off and fall back to `sendmmsg` rather than tear the stream down.
-/// `EMSGSIZE` is the important one in practice: a NIC/egress path whose effective MTU is below our
-/// segment size rejects the whole GSO super-buffer at send time (the kernel validates each segment
-/// against the device MTU, which plain `sendmmsg` does not) — observed live as a code-90
-/// "Message too long" that instantly killed the stream. Treat it as "no GSO here" and fall back.
+/// Errors that mean GSO is unusable on this kernel/NIC/path — latch off and
+/// fall back to `sendmmsg` instead of tearing the stream down.
+///
+/// `EMSGSIZE`: the kernel checks each GSO segment against the device MTU;
+/// `sendmmsg` does not. Treat it as "no GSO here".
 #[cfg(target_os = "linux")]
 fn gso_unsupported(e: &std::io::Error) -> bool {
     matches!(
@@ -111,18 +102,17 @@ fn gso_unsupported(e: &std::io::Error) -> bool {
     )
 }
 
-/// One `sendmsg` carrying a `UDP_SEGMENT` control message: the kernel splits `buf` (a back-to-back
-/// concatenation of equal-size datagrams, only the final one allowed shorter) into `gso_size`-byte
-/// UDP datagrams to the connected peer — one large GSO skb instead of N. `EAGAIN` (full send buffer)
-/// surfaces as a `WouldBlock` error; the caller treats it as a lossy drop.
+/// One `sendmsg` with `UDP_SEGMENT`: kernel splits `buf` into `gso_size`-byte
+/// datagrams (last segment may be shorter). `EAGAIN` is `WouldBlock`; the
+/// caller treats it as a lossy drop.
 #[cfg(target_os = "linux")]
 fn send_one_gso(fd: libc::c_int, buf: &[u8], gso_size: u16) -> std::io::Result<()> {
     let mut iov = libc::iovec {
         iov_base: buf.as_ptr() as *mut libc::c_void,
         iov_len: buf.len(),
     };
-    // Aligned control buffer for one cmsg(UDP_SEGMENT = u16). 64 B > CMSG_SPACE(2); the union forces
-    // cmsghdr alignment (CMSG_FIRSTHDR requires it).
+    // 64 B > CMSG_SPACE(2) for one `UDP_SEGMENT` u16. The union forces `cmsghdr`
+    // alignment; `CMSG_FIRSTHDR` requires it.
     #[repr(C)]
     union CmsgBuf {
         _align: libc::cmsghdr,
@@ -136,8 +126,7 @@ fn send_one_gso(fd: libc::c_int, buf: &[u8], gso_size: u16) -> std::io::Result<(
     msg.msg_iovlen = 1;
     // SAFETY: `control` and `iov` are locals that outlive the call. `msg_controllen` is set to
     // `CMSG_SPACE(size_of::<u16>())`, which the 64-byte `CmsgBuf` covers, so the kernel cannot write
-    // past it; `CMSG_FIRSTHDR`/`CMSG_DATA` are the documented accessors for that buffer and the
-    // header they return is checked for null before it is written through.
+    // past it; `CMSG_FIRSTHDR`/`CMSG_DATA` are the documented accessors for that buffer.
     let rc = unsafe {
         msg.msg_control = control.bytes.as_mut_ptr() as *mut libc::c_void;
         msg.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as _;
@@ -165,7 +154,7 @@ pub(super) fn send_batch(t: &UdpTransport, packets: &[&[u8]]) -> std::io::Result
     let fd = t.socket.as_raw_fd();
     let mut total_sent = 0usize;
     for chunk in packets.chunks(CHUNK) {
-        // `hdrs` borrow `iovs` by raw pointer; both stay alive through the `sendmmsg` call.
+        // `hdrs` hold raw pointers into `iovs`; both must outlive `sendmmsg`.
         let mut iovs: Vec<libc::iovec> = chunk
             .iter()
             .map(|p| libc::iovec {
@@ -180,9 +169,8 @@ pub(super) fn send_batch(t: &UdpTransport, packets: &[&[u8]]) -> std::io::Result
         let n = unsafe { sendmmsg(fd, hdrs.as_mut_ptr(), hdrs.len() as libc::c_uint, 0) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
-            // Nothing fit in the send buffer (or a stale ICMP from a connected-socket blip) —
-            // drop this + the remaining chunks (counted by the caller). Only a genuine error
-            // tears the session down; transient conditions are lossy drops (see is_transient_io).
+            // Send buffer full or stale ICMP on a connected socket: drop this chunk
+            // and the rest. Only a non-transient error tears the session down.
             if is_transient_io(&err) {
                 break;
             }
@@ -190,7 +178,7 @@ pub(super) fn send_batch(t: &UdpTransport, packets: &[&[u8]]) -> std::io::Result
         }
         total_sent += n as usize;
         if (n as usize) < chunk.len() {
-            break; // buffer filled mid-chunk — drop the remainder
+            break; // partial sendmmsg: drop the remainder (lossy)
         }
     }
     Ok(total_sent)
@@ -205,20 +193,17 @@ pub(super) fn send_gso(t: &UdpTransport, packets: &[&[u8]]) -> std::io::Result<u
     if !gso::active() {
         return send_batch(t, packets);
     }
-    // GSO needs every segment but the last to be exactly `seg` bytes. Our wire packets are all
-    // identical size (shards zero-padded to shard_payload), but guard and fall back if not.
+    // GSO: every segment but the last must be exactly `seg` bytes. Guard and
+    // fall back if the batch is not uniform (last may be shorter, never longer).
     let seg = packets[0].len();
     let last = packets.len() - 1;
     if seg == 0 || packets[..last].iter().any(|p| p.len() != seg) || packets[last].len() > seg {
         return send_batch(t, packets);
     }
     let fd = t.socket.as_raw_fd();
-    // A GSO super-buffer is capped at 64 segments AND, in bytes, by the kernel's UDP payload
-    // ceiling. 65535 is the IP-datagram cap — the payload is that minus the IP + UDP headers
-    // the cork accounts for (IPv4: 65507, IPv6: 65487). Use the tighter v6 figure: it costs at
-    // most one segment per train, while a super-buffer over the ceiling is bounced with
-    // EMSGSIZE — which gso_unsupported() reads as "no GSO on this path" and latches GSO off
-    // process-wide, silently forfeiting the multi-Gbps lever over a local arithmetic slip.
+    // 64-segment kernel cap, and 65535 - 40 - 8 (IPv6+UDP; tighter than IPv4
+    // 65507). Oversize is EMSGSIZE, which `gso_unsupported` latches GSO off
+    // process-wide.
     const GSO_MAX_PAYLOAD: usize = 65535 - 40 - 8;
     let max_seg = (GSO_MAX_PAYLOAD / seg).clamp(1, 64);
     let mut scratch: Vec<u8> = Vec::with_capacity(seg * max_seg);
@@ -230,10 +215,8 @@ pub(super) fn send_gso(t: &UdpTransport, packets: &[&[u8]]) -> std::io::Result<u
         }
         match send_one_gso(fd, &scratch, seg as u16) {
             Ok(()) => sent += chunk.len(),
-            // Send buffer momentarily full, or a stale ICMP from a connected-socket blip — drop
-            // the rest (counted by the caller), never block, never tear down (see is_transient_io).
+            // Send buffer full or stale ICMP: drop the rest, never block.
             Err(e) if is_transient_io(&e) => break,
-            // GSO unsupported on this kernel/path — latch off and finish via sendmmsg.
             Err(e) if gso_unsupported(&e) => {
                 gso::disable();
                 return Ok(sent + send_batch(t, &packets[sent..])?);
@@ -256,7 +239,7 @@ pub(super) fn recv_batch(
     if n_bufs == 0 {
         return Ok(0);
     }
-    // `hdrs` borrow `iovs` (one per buffer) by raw pointer; both live through the recvmmsg call.
+    // `hdrs` hold raw pointers into `iovs`; both must outlive `recvmmsg`.
     let mut iovs: Vec<libc::iovec> = out[..n_bufs]
         .iter_mut()
         .map(|b| libc::iovec {
@@ -266,7 +249,7 @@ pub(super) fn recv_batch(
         .collect();
     let mut hdrs = mmsghdrs(&mut iovs);
     // SAFETY: `fd` is the live socket, and `hdrs` is a local slice of `mmsghdr` whose length is
-    // passed alongside it; each header points at an `iov` backed by a buffer in `bufs`, which
+    // passed alongside it; each header points at an `iov` backed by a buffer in `out`, which
     // outlives the call, so the kernel writes only inside those buffers.
     let n = unsafe {
         recvmmsg(
@@ -294,9 +277,8 @@ pub(super) fn recv_batch(
 mod tests {
     use super::*;
 
-    /// `send_one_gso` must split one buffer into N separate UDP datagrams of `gso_size` bytes each
-    /// (the kernel UDP GSO segmentation) — the multi-Gbps send lever. Loopback supports GSO; if the
-    /// CI kernel doesn't, skip rather than fail.
+    /// Kernel UDP GSO must emit N datagrams of `gso_size`. Loopback usually
+    /// supports it; skip if this kernel does not.
     #[cfg(target_os = "linux")]
     #[test]
     fn gso_segments_into_separate_datagrams() {
@@ -321,7 +303,6 @@ mod tests {
             }
             panic!("gso sendmsg failed: {e}");
         }
-        // Each segment arrives as its own datagram, full size, content intact.
         let mut rbuf = vec![0u8; 4096];
         for i in 0..segs {
             let n = rx.recv(&mut rbuf).expect("recv GSO segment");

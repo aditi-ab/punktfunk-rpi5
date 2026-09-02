@@ -1,13 +1,13 @@
-//! Client identity, the known-hosts (pinned fingerprint) store, and app settings.
+//! Client identity, known-hosts (pinned fingerprints), and app settings.
 //!
-//! The identity shares `~/.config/punktfunk/client-{cert,key}.pem` (Linux; on Windows
-//! `%APPDATA%\punktfunk`, the WinUI shell's directory) with `punktfunk-probe` so a box
-//! pairs once whichever client it uses. On Windows the session binary reads the SAME
-//! stores the WinUI shell writes — pairing there makes the session connect silently,
-//! mirroring the GTK-shell arrangement on Linux. The WinUI shell re-exports THIS module
-//! (`clients/windows/src/trust.rs`), so both processes share one `Settings` shape; the
-//! shell stays the settings file's only writer (the session only reads). Pre-unification
-//! shell files (≤ 0.8.4: `show_hud`, `engine`) still load — see the migration test below.
+//! Identity PEMs live in `~/.config/punktfunk/` (Linux) or `%APPDATA%\punktfunk`
+//! (Windows) and are shared with `punktfunk-probe` so a box pairs once. On Windows
+//! the WinUI shell re-exports this module (`clients/windows/src/trust.rs`) and is
+//! the settings file's only writer; the session binary reads the same stores.
+//!
+//! Pin a host via [`persist_host`]. Settings resolve through [`effective_settings`].
+//! Evidence: the migration and known-hosts tests below;
+//! `design/client-settings-profiles.md`.
 
 use crate::profiles::{ProfilesFile, Resolution, StreamProfile};
 use anyhow::{anyhow, Context, Result};
@@ -17,12 +17,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Read a client JSON file or return its default value.
+/// Load a client JSON file, or `T::default()`.
 ///
-/// A leading UTF-8 BOM is accepted because common PowerShell editing commands add one.
-/// Missing files are normal and silent; other read or parse failures warn before falling back
-/// so malformed settings do not look like unexplained resets. Configuration errors never
-/// prevent streaming from starting.
+/// A leading UTF-8 BOM is stripped — PowerShell `Set-Content -Encoding UTF8` writes
+/// one, and serde refuses it. Missing files are silent; other failures warn then
+/// fall back so a parse error is not an unexplained reset. A bad file never
+/// blocks a stream.
 pub(crate) fn load_json_or_default<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
@@ -64,25 +64,21 @@ pub fn config_dir() -> Result<PathBuf> {
     }
 }
 
-/// This client's persistent identity, generated on first use — presented on every connect
-/// so hosts can recognize it once paired.
+/// Persistent mTLS identity, generated once and presented on every connect.
 pub fn load_or_create_identity() -> Result<(String, String)> {
     let dir = config_dir()?;
     let (cp, kp) = (dir.join("client-cert.pem"), dir.join("client-key.pem"));
     if let (Ok(c), Ok(k)) = (std::fs::read_to_string(&cp), std::fs::read_to_string(&kp)) {
-        // An older build wrote the key with a plain `fs::write`, which honors the umask and
-        // typically lands 0644 — world-readable. Re-lock an existing store on load so upgrades
-        // get fixed, not just fresh installs. Best-effort (a read-only store keeps what it has).
+        // Older builds wrote the key via `fs::write` (umask → 0644). Re-lock on load so
+        // upgrades get 0600, not just fresh installs. Best-effort: a read-only store stays.
         #[cfg(unix)]
         lock_identity_perms(&dir, &kp);
         return Ok((c, k));
     }
     let (c, k) = endpoint::generate_identity().map_err(|e| anyhow!("generate identity: {e}"))?;
     std::fs::create_dir_all(&dir)?;
-    // The private key authorizes this client for full remote control of a paired host, so it must
-    // never be world-readable: lock the dir to the owner (0700) and create the key 0600 from the
-    // start (`fs::write` alone honors the umask → typically 0644). The certificate is public. On
-    // non-Unix the %APPDATA% profile ACL already scopes the dir to the user, so std perms suffice.
+    // Dir 0700, key 0600 from create (`fs::write` honors umask → 0644). The cert is public.
+    // Non-Unix: %APPDATA% ACLs already scope the dir; std perms suffice.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -94,9 +90,8 @@ pub fn load_or_create_identity() -> Result<(String, String)> {
     Ok((c, k))
 }
 
-/// Write the client's mTLS private key owner-only. On Unix the file is created with mode 0600 from
-/// the outset — an `fs::write` + later `chmod` would briefly expose it at the umask default. On
-/// other platforms std's default perms plus the %APPDATA% profile ACL scope it to the user.
+/// Write the mTLS private key. Unix: create 0600 — `fs::write` then chmod would briefly
+/// expose it at the umask default. Elsewhere: std perms + %APPDATA% ACL.
 fn write_private_key(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
@@ -115,9 +110,8 @@ fn write_private_key(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort re-lock of an already-present identity (dir 0700, key 0600) — for stores written by
-/// an older build that left the key world-readable. Errors are ignored: the worst case is the
-/// pre-existing perms, which this never loosens.
+/// Best-effort dir 0700 / key 0600 on an existing store. Errors ignored: this never
+/// loosens perms, so a failure leaves what was already there.
 #[cfg(unix)]
 fn lock_identity_perms(dir: &std::path::Path, key: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -125,47 +119,28 @@ fn lock_identity_perms(dir: &std::path::Path, key: &std::path::Path) {
     let _ = std::fs::set_permissions(key, std::fs::Permissions::from_mode(0o600));
 }
 
-/// A sibling temp path unique to this process. The stores below have five whole-file writers
-/// (WinUI shell, session, console UI, CLI, Decky) and a single shared `.json.tmp` lets two of
-/// them interleave: on Windows the second `fs::write` hits a sharing violation, and worse, one
-/// process can rename the OTHER's half-written bytes over the target. The pid keeps each
-/// writer on its own scratch file; the rename below removes it, so a leftover only survives a
-/// hard kill.
+/// Sibling temp unique to this pid. A shared `.json.tmp` lets two writers interleave:
+/// Windows sharing-violation, or one process renaming the other's half-written bytes.
+/// Leftover only after a hard kill; the rename below removes it on success.
 fn temp_sibling(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".tmp-{}", std::process::id()));
     path.with_file_name(name)
 }
 
-/// Write a config file the safe way: a sibling temp file, then a rename over the target. A
-/// plain `fs::write` truncates first, so a crash, a full disk or a power cut between truncate
-/// and the last byte leaves an empty/half file — and these stores are what a client needs to
-/// find its hosts at all. Rename is atomic within a directory on both Unix and Windows
-/// (`MoveFileEx` with replace), so a reader ever sees the old file or the new one, never a
-/// torn one. Same discipline as the host's `session_settings.rs`.
+/// Temp sibling then rename over the target. A plain `fs::write` truncates first, so a
+/// crash or full disk leaves a torn store — and these files are how a client finds hosts.
+/// Rename is atomic within a directory on Unix and Windows (`MoveFileEx` replace).
 ///
-/// **But the rename is not always available, and losing the write is far worse than a torn
-/// one.** The Windows client ships as an MSIX package, so every path here is rewritten by the
-/// container's AppData virtualization before it reaches the filesystem — and when the package
-/// is installed to a secondary drive (Settings ▸ Storage ▸ "New apps will save to: D:"),
-/// Windows stores that redirected AppData on the *package's* volume, under
-/// `D:\WpSystem\<SID>\AppData\`. The literal path we name still says `C:\Users\…`, so a rename
-/// can end up straddling two volumes, and `std::fs::rename` is `MoveFileExW` with
-/// `MOVEFILE_REPLACE_EXISTING` and *not* `MOVEFILE_COPY_ALLOWED` — a cross-volume move fails
-/// outright with `ERROR_NOT_SAME_DEVICE`. Creating and writing files works fine, which is why
-/// such an install starts, streams and pairs happily while every setting and profile silently
-/// evaporates (field report 2026-08-05: "it's in read-only mode").
+/// Rename is not always available. MSIX AppData virtualization can put the redirected
+/// store on the package volume while the path still names `C:\Users\…`; `std::fs::rename`
+/// is `MoveFileExW` without `MOVEFILE_COPY_ALLOWED`, so a cross-volume move fails with
+/// `ERROR_NOT_SAME_DEVICE`. Creating files still works, which is why an install streams
+/// while every setting evaporates.
 ///
-/// So a failed rename falls back to writing the target in place. That is exactly what the
-/// identity files already do a few lines up — and those demonstrably work on the affected
-/// installs — so the fallback is a path we know resolves. It gives up crash-atomicity for that
-/// one write and nothing else: the temp+rename stays the normal route everywhere it works.
-///
-/// Writes and reads of one literal path cannot disagree under that redirection — Microsoft
-/// documents a single private-location-first resolution order for both, so whichever layer a
-/// write lands in is the layer the next read finds. The fallback still verifies by reading
-/// back: a silent write is the exact bug being fixed here, and this path only runs on an
-/// install that has already proven it does something unusual.
+/// A failed rename writes the target in place (same path the identity files already use)
+/// and reads the bytes back — `Ok(())` alone was the silent-loss failure mode. The
+/// temp+rename stays the normal route everywhere it works.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = temp_sibling(path);
     let atomic = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
@@ -173,7 +148,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         store_health::clear();
         return Ok(());
     };
-    // Don't leave the temp behind to confuse the next writer (or a backup tool).
+    // Drop the temp so the next writer (or a backup tool) does not see it.
     let _ = std::fs::remove_file(&tmp);
     match std::fs::write(path, bytes) {
         Ok(()) => {
@@ -182,11 +157,8 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
                 error = %e,
                 "atomic replace unavailable in this install; wrote the config in place instead",
             );
-            // Read it straight back. This whole bug was a write that reported success and
-            // vanished, so the fallback does not get to claim success on the strength of an
-            // `Ok(())` alone — on the one layered filesystem we know we run on, that is the
-            // failure mode to be paranoid about. Only on the degraded path, so the normal
-            // route pays nothing.
+            // Read back: a write that returned `Ok(())` and vanished is the failure mode.
+            // Only on the degraded path, so the atomic route pays nothing.
             match std::fs::read(path) {
                 Ok(back) if back == bytes => {
                     store_health::clear();
@@ -205,9 +177,8 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
                 }
             }
         }
-        // Both routes are gone: the store really is unwritable. Report the direct write's
-        // error — it describes the actual permission/space problem, where the rename's may
-        // only say the two paths landed on different volumes.
+        // Both routes failed. Report the in-place error (permission/space); the rename's
+        // may only say the paths landed on different volumes.
         Err(direct) => {
             store_health::record(path, &direct);
             Err(direct)
@@ -215,14 +186,10 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
-/// Whether the config store is accepting writes, so a front-end can *say so* when it is not.
+/// Last persist failure, if any, so a front-end can say the store is unwritable.
 ///
-/// Every persistence call site in this crate is deliberately fire-and-forget — a failed
-/// settings write must never take a stream down — which historically meant a client whose
-/// store was unwritable looked completely normal: toggles moved, profiles appeared, and
-/// nothing survived a restart. The field report that produced this module had no log file to
-/// send either, so there was no signal anywhere. Recording the last failure centrally lets the
-/// UI surface it without unpicking ~15 `let _ = …save()` call sites.
+/// Every save in this crate is fire-and-forget — a failed write must not take a stream
+/// down — so an unwritable store otherwise looks healthy. One latch instead of ~15 call sites.
 pub mod store_health {
     use std::path::Path;
     use std::sync::Mutex;
@@ -243,11 +210,7 @@ pub mod store_health {
         }
     }
 
-    /// The most recent failure to persist a config file, if the last attempt failed.
-    ///
-    /// Tracks the last *attempt*, not a per-file verdict: a store that cannot be written fails
-    /// every file, so this latches for as long as the problem lasts and goes quiet the moment
-    /// any write gets through.
+    /// Last persist failure. One latch for the whole store: any successful write clears it.
     pub fn last_error() -> Option<String> {
         LAST_ERROR.lock().ok().and_then(|s| s.clone())
     }
@@ -268,75 +231,54 @@ pub fn parse_hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// One trusted host: its pinned certificate fingerprint plus how we got there (TOFU or a
-/// PIN ceremony) and where we last reached it.
+/// One trusted host: pinned cert fingerprint, how trust was granted, last-reached address.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KnownHost {
     pub name: String,
     pub addr: String,
     pub port: u16,
-    /// SHA-256 of the host certificate, lowercase hex — the pin for every later connect.
+    /// SHA-256 of the host certificate, lowercase hex — the pin for later connects.
     pub fp_hex: String,
     /// True if trust came from the SPAKE2 PIN ceremony (vs. trust-on-first-use).
     pub paired: bool,
-    /// Unix seconds of the last successful connect — the hosts page marks the
-    /// most-recent card with the accent bar. `default` so pre-existing stores load.
+    /// Unix seconds of the last successful connect. `default` so older stores load.
     #[serde(default)]
     pub last_used: Option<u64>,
-    /// Wake-on-LAN MAC(s) (`aa:bb:cc:dd:ee:ff`) learned from the host's mDNS `mac` TXT while it
-    /// was online, so we can wake it once it sleeps and stops advertising. `default` so
-    /// pre-existing stores load; empty until first learned.
+    /// Wake-on-LAN MACs (`aa:bb:cc:dd:ee:ff`) learned from mDNS `mac` TXT while online,
+    /// so we can wake a host that has stopped advertising. `default`; empty until learned.
     #[serde(default)]
     pub mac: Vec<String>,
-    /// The host's OS-identity chain (`windows` | `macos` | `linux[/<family>][/<id>]`) learned
-    /// from its mDNS `os` TXT while online, so the card's OS icon survives the host going to
-    /// sleep. `default` (and elided when empty) so pre-existing stores load unchanged.
+    /// OS-identity chain (`windows` | `macos` | `linux[/<family>][/<id>]`) from mDNS `os`
+    /// TXT, so the card icon survives sleep. `default`; elided when empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub os: String,
-    /// The host's management-API port (mDNS `mgmt` TXT), where the game library is served —
-    /// distinct from `port`, which is the native QUIC plane. Learned from the advert while the
-    /// host is online and persisted here for the same reason as `mac` and `os`: so it survives the
-    /// advert going away.
-    ///
-    /// That is not a cosmetic loss like a missing OS icon. A host that moved its mgmt port off
-    /// 47990 — the supported fix for sharing a machine with a Sunshine fork, whose web UI owns
-    /// that port — was reachable only for as long as mDNS was: on a VPN, a routed subnet, or a
-    /// multicast-dead network the library silently went blank, because the port the client had
-    /// already been told was never written down. `None` = never learned, resolve via
-    /// [`KnownHost::effective_mgmt_port`]. Optional + `default` so pre-existing stores load
-    /// (the Apple client's `StoredHost.mgmtPort` is the same field for the same reason).
+    /// Management-API port (mDNS `mgmt` TXT), distinct from `port` (native QUIC). Persisted
+    /// so a host that moved off 47990 stays reachable once the advert is gone. `None` =
+    /// never learned; resolve via [`KnownHost::effective_mgmt_port`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mgmt_port: Option<u16>,
-    /// Share this machine's clipboard with THIS host (design/clipboard-and-file-transfer.md
-    /// §5.3 — the Apple client's `StoredHost.clipboardSync`). Per-host, not global: handing a
-    /// host your clipboard is a trust decision about that host. Default off; the host must
-    /// also advertise `HOST_CAP_CLIPBOARD` and have its own policy enabled.
+    /// Share this machine's clipboard with this host (design/clipboard-and-file-transfer.md).
+    /// Per-host, not global. Default off; the host must also advertise `HOST_CAP_CLIPBOARD`.
     #[serde(default)]
     pub clipboard_sync: bool,
-    /// This host's default settings profile (design/client-settings-profiles.md §4.1) — the
-    /// one a plain click uses. `None`, or an id whose profile was deleted, means the global
-    /// defaults, i.e. exactly today's behavior; a dangling binding never errors and never
-    /// blocks a connect.
+    /// Default settings profile for a plain click (design/client-settings-profiles.md).
+    /// `None` or a deleted id → global defaults; a dangling binding never blocks a connect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
-    /// Profiles pinned as extra cards for this host (design §5.2a); order = card order.
-    /// Presentation only — NOT the default (that's `profile_id`) — and duplicates/dangling
-    /// ids are dropped when the list is resolved against the catalog.
+    /// Extra profile cards for this host; order = card order. Presentation only — not
+    /// the default (`profile_id`). Duplicates and dangling ids are dropped at resolve.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_profiles: Vec<String>,
-    /// Stable record identity (design §4.5): minted lazily for records that predate it, never
-    /// changed afterwards, so a deep link or a future cross-reference has something to point
-    /// at that survives a rename or a new DHCP lease. **No lookup in this crate is keyed by
-    /// it** — `fp_hex`/`addr:port` stay the lookup keys; this is groundwork.
+    /// Stable record id, minted lazily, never rewritten. Survives rename and DHCP.
+    /// No lookup here is keyed by it — `fp_hex` / `addr:port` stay the keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 }
 
 impl Default for KnownHost {
-    /// A blank record with a fresh stable id — the base every construction site builds on
-    /// (`KnownHost { name, addr, port, ..Default::default() }`), so adding a field here can't
-    /// silently produce records that lack it. That is not hypothetical: `clipboard_sync`
-    /// survives today only because [`KnownHosts::upsert`] happens to skip it.
+    /// Blank record with a fresh stable id — construction sites use
+    /// `KnownHost { name, addr, port, ..Default::default() }`, so a new field here cannot
+    /// silently omit it.
     fn default() -> KnownHost {
         KnownHost {
             name: String::new(),
@@ -357,20 +299,14 @@ impl Default for KnownHost {
 }
 
 impl KnownHost {
-    /// Where this host's management API actually is: the port learned from its advert, else the
-    /// compiled-in 47990. The twin of the Apple client's `StoredHost.effectiveMgmtPort`.
-    ///
-    /// Every library/art call resolves through this rather than reaching for
-    /// [`crate::library::DEFAULT_MGMT_PORT`] directly — that constant is the FALLBACK, not the
-    /// answer, and call sites that treated it as the answer are why a moved port only worked while
-    /// mDNS was up.
+    /// Learned mgmt port, else compiled-in 47990. Library/art calls must use this, not
+    /// [`crate::library::DEFAULT_MGMT_PORT`] — that constant is the fallback, not the answer.
     pub fn effective_mgmt_port(&self) -> u16 {
         self.mgmt_port.unwrap_or(crate::library::DEFAULT_MGMT_PORT)
     }
 
-    /// This host's pinned profiles that still exist, in card order, without duplicates — what
-    /// a grid renders. Dangling pins (the profile was deleted) simply disappear, per design
-    /// §5.2a: a pin is presentation state, never a reason to show an error.
+    /// Pins that still exist, in card order, no duplicates. Dangling ids disappear —
+    /// a pin is presentation state, never an error.
     pub fn resolved_pins<'a>(&self, catalog: &'a ProfilesFile) -> Vec<&'a StreamProfile> {
         let mut out: Vec<&StreamProfile> = Vec::new();
         for id in &self.pinned_profiles {
@@ -395,11 +331,9 @@ impl KnownHosts {
         Ok(config_dir()?.join("client-known-hosts.json"))
     }
 
-    /// The store, with any pre-[`KnownHost::id`] records given one. The mint is written back
-    /// best-effort right here rather than "on the next save" so the id a caller sees is the
-    /// id that is on disk — an identity that changed every load would be worse than none.
-    /// A read-only config dir just keeps re-minting in memory, which harms nothing: no lookup
-    /// is keyed by the id yet (design §4.5).
+    /// The store, minting ids on records that lack one. Written back here, not "on the
+    /// next save", so the id a caller sees is the one on disk. A read-only dir re-mints
+    /// in memory; no lookup is keyed by id yet.
     pub fn load() -> KnownHosts {
         let mut k = Self::read();
         if k.mint_missing_ids() {
@@ -408,23 +342,18 @@ impl KnownHosts {
         k
     }
 
-    /// The store exactly as it is on disk — no mint, and so no write.
+    /// The store as on disk — no mint, so no write.
     ///
-    /// For a consumer that only needs to LOOK at the records (annotating a discovery result
-    /// against them, say) and never dials one by id. [`KnownHosts::load`]'s mint is a write, and
-    /// two processes started together against a pre-mint store will each mint a *different* id
-    /// for the same record and race to save it — after which whichever one already handed its
-    /// ids to a caller has handed out references that no longer resolve. A read that stays a
-    /// read cannot take part in that.
+    /// [`KnownHosts::load`]'s mint is a write: two processes against a pre-mint store each
+    /// mint a different id and race to save. A read-only consumer cannot take part in that.
     pub fn read() -> KnownHosts {
         Self::path()
             .map(|p| load_json_or_default(&p))
             .unwrap_or_default()
     }
 
-    /// Give every record still missing one a stable id; returns true if anything changed
-    /// (i.e. whether this needs persisting). Idempotent — a store that has been through it
-    /// once is left byte-identical.
+    /// Mint a stable id on every record that lacks one. `true` = needs persisting.
+    /// Idempotent: a store that has been through it once is byte-identical.
     pub fn mint_missing_ids(&mut self) -> bool {
         let mut minted = false;
         for h in &mut self.hosts {
@@ -441,10 +370,8 @@ impl KnownHosts {
         std::fs::create_dir_all(p.parent().unwrap())?;
         // Temp+rename: losing this file to a torn write costs the user every pairing.
         write_atomic(&p, serde_json::to_string_pretty(self)?.as_bytes())?;
-        // The Omarchy menu mirrors this store (one connect row per host), and save() is the
-        // one door every mutation walks through — GTK pairing, the couch console, the CLI —
-        // so this is the whole of "the menu never goes stale". A no-op unless the operator
-        // opted in (`--omarchy-menu on`), which a scoped test HOME never has.
+        // Omarchy menu mirrors this store; save() is the one door every mutation walks.
+        // No-op unless `--omarchy-menu on` — a scoped test HOME never has that.
         #[cfg(target_os = "linux")]
         crate::omarchy_menu::sync_if_enabled();
         Ok(())
@@ -454,21 +381,12 @@ impl KnownHosts {
         self.hosts.iter().find(|h| h.fp_hex == fp_hex)
     }
 
-    /// The record an address-keyed lookup resolves to, by index (so callers that go on to
-    /// mutate the store don't fight the borrow checker).
+    /// Index of the record an `addr:port` lookup resolves to (so mutators avoid a second
+    /// borrow).
     ///
-    /// One address cannot host two live identities at once, but the store can still hold more
-    /// than one record claiming `addr:port`: an fp-less placeholder waiting for its first
-    /// ceremony, or — before [`KnownHosts::upsert_trusted`] existed — a re-keyed host whose new
-    /// record was appended beside the dead one. Resolving that positionally is what turned a
-    /// host reinstall into a permanent lockout: the dead pin, written first, won every later
-    /// connect, including right after a successful re-pair.
-    ///
-    /// So the rule is "the newest trust decision wins": a real fingerprint beats a placeholder,
-    /// and among real ones the LAST record — records are only ever appended by an explicit
-    /// trust decision, so the last one is the most recent thing the user actually authorised.
-    /// That is a lookup order, never an authorisation: whichever record this picks, the pin it
-    /// yields still has to match the certificate the host presents, or the connect fails closed.
+    /// A real fingerprint beats a placeholder; among real ones the last record wins —
+    /// records are only appended by a trust decision. Lookup order, not authorisation:
+    /// the pin still has to match the cert the host presents.
     pub fn index_by_addr(&self, addr: &str, port: u16) -> Option<usize> {
         let mut best: Option<usize> = None;
         for (i, h) in self.hosts.iter().enumerate() {
@@ -490,8 +408,6 @@ impl KnownHosts {
         self.index_by_addr(addr, port).map(|i| &self.hosts[i])
     }
 
-    /// Forget the entry with this fingerprint. Returns true if one was removed (the user
-    /// will have to pair/trust again to reconnect).
     pub fn remove_by_fp(&mut self, fp_hex: &str) -> bool {
         let before = self.hosts.len();
         self.hosts.retain(|h| h.fp_hex != fp_hex);
@@ -510,27 +426,20 @@ impl KnownHosts {
             if entry.last_used.is_some() {
                 h.last_used = entry.last_used;
             }
-            // Likewise a trust-decision upsert (which carries no MAC) must not wipe learned MACs.
+            // A trust-decision upsert carries no MAC — do not wipe learned ones.
             if !entry.mac.is_empty() {
                 h.mac = entry.mac;
             }
-            // Same rule for the learned OS chain: only an upsert that carries one moves it.
+            // Same for the OS chain: only a carrier moves it.
             if !entry.os.is_empty() {
                 h.os = entry.os;
             }
-            // And for the learned mgmt port. Stated explicitly rather than left to the
-            // does-not-mention-it rule below: this one is load-bearing (a host that moved off
-            // 47990 is unreachable for the library without it), so a reconnect upsert that
-            // carries `None` must visibly not clear what a discovery taught us.
+            // Same for mgmt port: `None` on reconnect must not clear a learned 47991.
             if entry.mgmt_port.is_some() {
                 h.mgmt_port = entry.mgmt_port;
             }
-            // Everything below is state the user set ON this record, which a refresh (a
-            // reconnect, a re-pair, a rediscovery) never carries and therefore must never
-            // clear: the per-host clipboard decision — which survives today only because this
-            // function happens not to mention it — plus the profile binding, its pinned
-            // cards, and the stable id. Only an upsert that actually carries a value moves
-            // one of them.
+            // User-set fields a refresh never carries: clipboard, profile, pins, id.
+            // Only an upsert that actually carries a value moves one of them.
             if entry.clipboard_sync {
                 h.clipboard_sync = true;
             }
@@ -548,33 +457,22 @@ impl KnownHosts {
         }
     }
 
-    /// [`upsert`](Self::upsert) for an **authorised trust decision** — a PIN ceremony, a
-    /// delegated approval, a TOFU accept, a headless pair — which additionally retires every
-    /// other record claiming the same `addr:port`.
+    /// [`upsert`](Self::upsert) for an authorised trust decision (PIN, TOFU accept,
+    /// delegated, headless pair). Also retires every other record claiming the same
+    /// `addr:port`.
     ///
-    /// `upsert` alone keys on the fingerprint, deliberately: that is how a host which moved
-    /// address keeps its record and the fields the user set on it. The cost was that a host
-    /// which changed IDENTITY — a reinstall, a wiped `ProgramData`, a re-key — matched nothing
-    /// and got a SECOND record appended for the address it already had, and every later
-    /// connect then pinned the dead fingerprint from the older one. No way out from the UI,
-    /// and re-pairing didn't help: the ceremony succeeded and appended yet another record.
+    /// `upsert` keys on fingerprint so a moved address keeps its record. A re-keyed
+    /// host would otherwise sit beside the dead pin, and later connects would pick
+    /// the older one. Box fields (MAC, OS, profile, pins, last_used) ride onto the
+    /// survivor. Not carried: `paired`, `clipboard_sync` (cert decisions), and the
+    /// stable id (a deep link must not silently retarget).
     ///
-    /// A record retired here carries what describes the BOX rather than the identity onto the
-    /// record that survives — its MAC, its OS chain, the profile bound to it, its pinned cards,
-    /// when it was last used — so a reinstall doesn't quietly cost the user their setup.
-    /// Deliberately NOT carried: `paired` and `clipboard_sync`, which are decisions about one
-    /// specific certificate and have to be made again for a new one, and the stable record id
-    /// (a deep link written from the retired record falls through to the `host=` recovery the
-    /// link grammar already specifies, rather than silently pointing at a new identity).
-    ///
-    /// **Only trust decisions may call this.** Everything that merely LEARNS something about a
-    /// host — a rediscovery, the wake path's address re-key — stays on plain `upsert`: those
-    /// are driven by unauthenticated mDNS, and letting an advert delete a saved host by
-    /// claiming its address would trade this bug for a much worse one.
+    /// Discovery and wake re-key stay on plain `upsert` — an unauthenticated advert
+    /// must not delete a saved host by claiming its address.
     pub fn upsert_trusted(&mut self, entry: KnownHost) {
         let (addr, port, fp_hex) = (entry.addr.clone(), entry.port, entry.fp_hex.clone());
         self.upsert(entry);
-        // Nothing to supersede *with*: an fp-less record is a placeholder, not an identity.
+        // Nothing to supersede with: an fp-less record is a placeholder, not an identity.
         if fp_hex.is_empty() {
             return;
         }
@@ -616,17 +514,11 @@ impl KnownHosts {
     }
 }
 
-/// Load-upsert-save in one step — the pin every trust decision (TOFU accept, PIN
-/// ceremony, delegated approval, headless pairing) ends in.
+/// Load-upsert-save: the pin every trust decision (TOFU, PIN, delegated, headless) ends in.
 pub fn persist_host(name: &str, addr: &str, port: u16, fp_hex: &str, paired: bool) {
     let mut known = KnownHosts::load();
-    // `..Default::default()` deliberately: this builds a record from a trust decision only,
-    // so every user-set field (clipboard, profile binding, pins) must arrive as "not carried"
-    // — `upsert` then leaves an existing host's own settings alone. A hand-written literal
-    // here is how those fields would get silently reset on the next re-pair.
-    //
-    // `upsert_trusted`, not `upsert`: this IS the authorised decision, so it is also the point
-    // at which a host that re-keyed retires its own dead record for this address.
+    // `..Default::default()` so user-set fields arrive uncarried; a literal would
+    // reset them on re-pair. `upsert_trusted`: this is the authorised decision.
     known.upsert_trusted(KnownHost {
         name: name.to_string(),
         addr: addr.to_string(),
@@ -638,18 +530,14 @@ pub fn persist_host(name: &str, addr: &str, port: u16, fp_hex: &str, paired: boo
     let _ = known.save();
 }
 
-/// This machine's name — the label a host files this client under in its paired-devices list.
-/// Now owned by punktfunk-core (`client::device_name`) so the connect path and the C ABI share
-/// the same default; re-exported here for the existing pairing-path callers.
+/// Label a host files this client under. Re-export of `punktfunk_core::client::device_name`.
 pub fn device_name() -> String {
     punktfunk_core::client::device_name()
 }
 
-/// Drop an fp-less placeholder entry for `addr:port`. A host added by address before any
-/// ceremony (`--add-host` with no `--fp`) is stored keyed by address with an empty fingerprint;
-/// once pairing yields the real one, [`persist_host`] writes a second, fp-keyed entry — so the
-/// placeholder has to go or the host list shows the same box twice. No-op (and no disk write)
-/// when there is none, which is the usual case.
+/// Drop the fp-less placeholder for `addr:port`. `--add-host` with no `--fp` stores one;
+/// [`persist_host`] then writes the real pin, so the placeholder would show twice.
+/// No-op, and no disk write, when there is none.
 pub fn forget_placeholder(addr: &str, port: u16) {
     let mut known = KnownHosts::load();
     let before = known.hosts.len();
@@ -661,10 +549,8 @@ pub fn forget_placeholder(addr: &str, port: u16) {
     }
 }
 
-/// The record an advert's lesson should land on: the fingerprint match if there is one, else
-/// whatever the address resolves to. Fingerprint FIRST — a single pass that took "either" would
-/// hand a stale record at the same address the data the live host advertised, purely because it
-/// came earlier in the file.
+/// Record an advert should land on: fingerprint match if any, else the address. Fingerprint
+/// first — "either" would teach a stale namesake that merely sat earlier in the file.
 fn learn_target<'a>(
     known: &'a mut KnownHosts,
     fp_hex: &str,
@@ -678,12 +564,8 @@ fn learn_target<'a>(
     known.hosts.get_mut(i)
 }
 
-/// Copy everything an advert can teach onto a saved record — wake MAC(s), OS-identity chain,
-/// management port — and report whether anything actually moved, so the caller writes only when
-/// there is something to write. Pure (no disk, no clock), which is what makes it testable.
-///
-/// A field the advert does not carry is left alone, never cleared: an older host simply omits the
-/// TXT, and forgetting a MAC already learned would cost the user their wake.
+/// Copy MAC / OS / mgmt port from an advert onto a saved record; `true` if anything moved.
+/// Pure (no disk). An omitted field is left alone — forgetting a learned MAC costs wake.
 fn apply_advert(h: &mut KnownHost, mac: &[String], os: &str, mgmt_port: Option<u16>) -> bool {
     let mut changed = false;
     if !mac.is_empty() && h.mac != mac {
@@ -702,23 +584,12 @@ fn apply_advert(h: &mut KnownHost, mac: &[String], os: &str, mgmt_port: Option<u
     changed
 }
 
-/// Write down everything a live advert teaches the saved record it matched — wake MAC(s), OS
-/// chain, management port — matched by fingerprint or address. No-op, and no disk write, when
-/// the record already says all three, so a surface can call this on every discovery tick.
+/// Persist MAC / OS / mgmt port from a live advert onto the matched record. No-op, and
+/// no disk write, when nothing changed — call it on every discovery tick.
 ///
-/// ONE call rather than three. Each field used to be learned by its own function, which meant
-/// every front-end had to remember all three, and only the two desktop hosts pages ever did:
-/// the console home and the headless CLI learned the management port alone. On a Steam Deck,
-/// whose Gaming Mode runs nothing but those two, that left every saved host with no MAC forever
-/// — and every wake gate in the codebase reads `!mac.is_empty()` against this record, so
-/// Wake-on-LAN there could not fire at all, with no error to show for it (#322).
-///
-/// [`KnownHosts::read`], not [`KnownHosts::load`]: `punktfunk discover` calls this, and that verb
-/// is deliberately not an id-minter (see [`KnownHosts::read`] for the race that avoids). Learning
-/// a MAC is no reason to become one.
-///
-/// Takes the three learned fields rather than a `DiscoveredHost` because there are two of those
-/// — core's and the WinUI shell's verbatim port — and this has to serve both.
+/// [`KnownHosts::read`], not [`KnownHosts::load`]: `punktfunk discover` is not an
+/// id-minter (see the race on [`KnownHosts::read`]). Takes three fields rather than a
+/// `DiscoveredHost` because core and the WinUI shell each have their own type.
 pub fn learn_from_advert(
     fp_hex: &str,
     addr: &str,
@@ -736,10 +607,9 @@ pub fn learn_from_advert(
     }
 }
 
-/// Re-key a saved host's address/port after it rediscovered on a new DHCP lease (matched by
-/// fingerprint). No-op — and no disk write — when unchanged. Called from the wake-and-wait flow when
-/// a woken host reappears on a different IP than the stored one, so this and future connects dial the
-/// live address instead of the stale one.
+/// Rewrite a saved host's address/port after a new DHCP lease, matched by fingerprint.
+/// No-op, and no disk write, when unchanged. Wake-and-wait uses this so later connects
+/// dial the live address.
 pub fn rekey_addr(fp_hex: &str, addr: &str, port: u16) {
     if fp_hex.is_empty() {
         return;
@@ -756,8 +626,7 @@ pub fn rekey_addr(fp_hex: &str, addr: &str, port: u16) {
     let _ = known.save();
 }
 
-/// Stamp "now" as this host's last successful connect (drives the hosts page's
-/// most-recent accent). No-op when the fingerprint isn't stored.
+/// Stamp now as this host's last successful connect. No-op if the fingerprint is not stored.
 pub fn touch_last_used(fp_hex: &str) {
     let mut known = KnownHosts::load();
     if let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp_hex) {
@@ -769,13 +638,10 @@ pub fn touch_last_used(fp_hex: &str) {
     }
 }
 
-/// Save a host's management-API port learned from the **session's own `Welcome`**, keyed by
-/// fingerprint alone — the identity a just-connected client is certain of.
+/// Persist mgmt port from the session `Welcome`, keyed by fingerprint.
 ///
-/// This is the mDNS-free path, and the one that matters most: [`learn_from_advert`] can only fire
-/// where an advert is visible, whereas this fires on any successful connect, including a host
-/// added by IP on a network where discovery has never worked. No-op — and no disk write — when
-/// the fingerprint isn't stored or the value is unchanged, so it is safe on every connect.
+/// mDNS-free: [`learn_from_advert`] needs a visible advert; this fires on any successful
+/// connect, including a host added by IP. No-op, and no disk write, when unchanged.
 pub fn learn_mgmt_port_by_fp(fp_hex: &str, mgmt_port: u16) {
     if fp_hex.is_empty() || mgmt_port == 0 {
         return;
@@ -791,9 +657,8 @@ pub fn learn_mgmt_port_by_fp(fp_hex: &str, mgmt_port: u16) {
     let _ = known.save();
 }
 
-/// Run the SPAKE2 PIN ceremony against a host. `device_name` is the label the HOST
-/// stores this client under (its paired-devices list); the 90 s budget covers a
-/// human-typed PIN. Returns the host's now-verified certificate fingerprint to pin.
+/// SPAKE2 PIN ceremony. `device_name` is the label the host stores; 90 s covers a
+/// human-typed PIN. Returns the verified host certificate fingerprint.
 pub fn pair_with_host(
     addr: &str,
     port: u16,
@@ -811,11 +676,8 @@ pub fn pair_with_host(
     )
 }
 
-/// User-facing sentence for a failed connect / request-access, keyed on the actual cause —
-/// shared by every desktop/console surface so "the host declined this device" never renders
-/// as "connection timed out". Reason-specific text for a typed host rejection
-/// ([`punktfunk_core::reject::RejectReason`]); the caller keeps its own wording for
-/// non-rejection errors.
+/// User-facing sentence for a typed host rejection, shared by every desktop/console
+/// surface so "declined" never renders as "timed out". The caller words other errors.
 pub fn connect_reject_message(reason: punktfunk_core::reject::RejectReason) -> String {
     use punktfunk_core::reject::RejectReason as R;
     match reason {
@@ -869,9 +731,8 @@ pub fn connect_reject_message(reason: punktfunk_core::reject::RejectReason) -> S
     }
 }
 
-/// User-facing sentence for a failed PIN pairing ceremony ([`pair_with_host`]) — distinguishes
-/// a wrong PIN (the SPAKE2 proof failed) from an unreachable host and from the host's typed
-/// rejections, so a dead network path or a disarmed host is never reported as a bad PIN.
+/// User-facing sentence for a failed [`pair_with_host`]. Crypto is a wrong PIN; do not
+/// report a dead path or a disarmed host as one.
 pub fn pair_error_message(err: &punktfunk_core::PunktfunkError) -> String {
     use punktfunk_core::PunktfunkError as E;
     match err {
@@ -887,11 +748,8 @@ pub fn pair_error_message(err: &punktfunk_core::PunktfunkError) -> String {
     }
 }
 
-/// Probe several hosts for reachability in parallel — one thread each, so the wall-clock cost is
-/// ~one `timeout`, not the sum. Each element of the returned vec corresponds by index to
-/// `targets`. Wraps the single-host [`NativeClient::probe`] (a bounded, trust-agnostic,
-/// mDNS-independent QUIC handshake); used by the hosts page's presence pips and the headless
-/// `--list-hosts --probe`.
+/// Probe several hosts in parallel — wall-clock is ~one `timeout`, not the sum. Result
+/// index matches `targets`. Wraps [`NativeClient::probe`].
 pub fn probe_reachable_many(
     targets: Vec<(String, u16)>,
     timeout: std::time::Duration,
@@ -906,9 +764,8 @@ pub fn probe_reachable_many(
         .collect()
 }
 
-/// How much the on-stream statistics overlay shows — the Android client's tiers, shared
-/// across every client (design/stats-unification.md): each tier is a strict superset of
-/// the previous. Ctrl+Alt+Shift+S cycles Off → Compact → Normal → Detailed live.
+/// On-stream stats overlay tier (design/stats-unification.md). Each tier is a strict
+/// superset of the previous. Ctrl+Alt+Shift+S cycles Off → Compact → Normal → Detailed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StatsVerbosity {
@@ -922,7 +779,6 @@ pub enum StatsVerbosity {
 }
 
 impl StatsVerbosity {
-    /// Cycle order (also the settings pickers' option order).
     pub const ALL: [StatsVerbosity; 4] = [
         StatsVerbosity::Off,
         StatsVerbosity::Compact,
@@ -930,7 +786,6 @@ impl StatsVerbosity {
         StatsVerbosity::Detailed,
     ];
 
-    /// The next tier in the live cycle, wrapping back to Off.
     pub fn next(self) -> StatsVerbosity {
         match self {
             StatsVerbosity::Off => StatsVerbosity::Compact,
@@ -950,27 +805,23 @@ impl StatsVerbosity {
     }
 }
 
-/// How a touchscreen's fingers drive the host — the cross-client touch-input model (Android
-/// `TouchMode`, Apple `TouchInputMode`). Stored stringly in [`Settings::touch_mode`] so the
-/// file stays readable; parsed with [`TouchMode::from_name`].
+/// How a touchscreen drives the host (Android `TouchMode`, Apple `TouchInputMode`).
+/// Stored stringly in [`Settings::touch_mode`]; parsed with [`TouchMode::from_name`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TouchMode {
-    /// Relative cursor like a laptop touchpad: the cursor stays put on touch-down and moves
-    /// by the finger's delta (with mild acceleration), tap to click. The default — a cursor
-    /// is the universally workable model on a screen the host isn't sized for.
+    /// Relative cursor (touchpad): stays put on down, moves by delta, tap to click.
+    /// Default — a cursor works on a screen the host is not sized for.
     Trackpad,
     /// Direct pointing: the cursor jumps to the finger and follows it (absolute).
     Pointer,
-    /// Real multi-touch passthrough: every finger is a host touchscreen contact, no gesture
-    /// interpretation — only helps hosts/apps that actually understand touch.
+    /// Multi-touch passthrough: each finger is a host contact, no gesture interpretation.
     Touch,
 }
 
 impl TouchMode {
-    /// Cycle/picker order (also the settings pickers' option order).
     pub const ALL: [TouchMode; 3] = [TouchMode::Trackpad, TouchMode::Pointer, TouchMode::Touch];
 
-    /// Parse the persisted name, defaulting to `Trackpad` for unset/unknown values.
+    /// Persisted name; unknown / unset → `Trackpad`.
     pub fn from_name(s: &str) -> TouchMode {
         match s {
             "pointer" => TouchMode::Pointer,
@@ -979,7 +830,6 @@ impl TouchMode {
         }
     }
 
-    /// The persisted name (the inverse of [`from_name`](Self::from_name)).
     pub fn as_name(self) -> &'static str {
         match self {
             TouchMode::Trackpad => "trackpad",
@@ -997,25 +847,21 @@ impl TouchMode {
     }
 }
 
-/// How a physical mouse drives the host — the desktop-sweep mouse model
-/// (design/remote-desktop-sweep.md M1). Stored stringly in [`Settings::mouse_mode`] so the
-/// file stays readable; parsed with [`MouseMode::from_name`].
+/// How a physical mouse drives the host (design/remote-desktop-sweep.md). Stored
+/// stringly in [`Settings::mouse_mode`]; parsed with [`MouseMode::from_name`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MouseMode {
-    /// Pointer lock (relative deltas, hidden cursor) — the game model, and the default:
-    /// the only cursor you see is the host's.
+    /// Pointer lock (relative deltas, hidden cursor). Default: the only cursor is the host's.
     Capture,
-    /// Absolute pointer, uncaptured: the cursor enters and leaves the stream freely and
-    /// motion goes on the wire as absolute positions through the letterbox. The remote
-    /// desktop model. Requires a host injector with absolute support (not gamescope).
+    /// Uncaptured absolute pointer through the letterbox. Needs an injector with
+    /// absolute support (not gamescope).
     Desktop,
 }
 
 impl MouseMode {
-    /// Cycle/picker order (also the settings pickers' option order).
     pub const ALL: [MouseMode; 2] = [MouseMode::Capture, MouseMode::Desktop];
 
-    /// Parse the persisted name, defaulting to `Capture` for unset/unknown values.
+    /// Persisted name; unknown / unset → `Capture`.
     pub fn from_name(s: &str) -> MouseMode {
         match s {
             "desktop" => MouseMode::Desktop,
@@ -1023,7 +869,6 @@ impl MouseMode {
         }
     }
 
-    /// The persisted name (the inverse of [`from_name`](Self::from_name)).
     pub fn as_name(self) -> &'static str {
         match self {
             MouseMode::Capture => "capture",
@@ -1039,26 +884,20 @@ impl MouseMode {
     }
 }
 
-/// Presentation intent — what the presenter optimizes for
-/// (design/desktop-presentation-rebuild.md; the Apple/Android clients' shared
-/// `present_priority`/`smooth_buffer` pair). Stored stringly in
+/// Presentation intent (design/desktop-presentation-rebuild.md). Stored as
 /// [`Settings::present_priority`] + [`Settings::smooth_buffer`]; resolved with
-/// [`PresentPriority::resolve`], whose rules match the Android reference
-/// (`decode/presenter.rs`): anything but an explicit `"smooth"` is latency, and a
-/// smooth buffer outside 1..=3 (including 0 = Automatic) becomes 2.
+/// [`PresentPriority::resolve`]: anything but `"smooth"` is latency; a buffer
+/// outside 1..=3 (including 0 = Automatic) becomes 2.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PresentPriority {
-    /// Every frame presents the moment the display can take it; a network hiccup is an
-    /// occasional repeated or skipped frame. The default.
+    /// Present the moment the display can take it. Default.
     Latency,
-    /// A small frame buffer (1–3 frames) evens out network/decode jitter, at the
-    /// buffer's worth of added display latency.
+    /// Buffer 1–3 frames of jitter, at that many frames of added display latency.
     Smooth { buffer: u8 },
 }
 
 impl PresentPriority {
-    /// The shared cross-client resolution rule — pure, so every embedder agrees on what
-    /// a foreign profile's values mean.
+    /// Shared resolution rule — pure, so every embedder agrees on a foreign profile.
     pub fn resolve(name: &str, buffer: u8) -> PresentPriority {
         if name == "smooth" {
             PresentPriority::Smooth {
@@ -1078,336 +917,194 @@ impl PresentPriority {
     }
 }
 
-/// App settings, persisted as JSON. Stringly-typed gamepad/compositor prefs so the file
-/// stays readable; parsed with `*Pref::from_name` at connect time.
+/// App settings, persisted as JSON. Stringly-typed prefs so the file stays readable.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Stream mode; `0` = the native size/refresh of the monitor the window is on,
-    /// resolved at connect time.
+    /// Stream mode; `0` = native size/refresh of the window's monitor, resolved at connect.
     pub width: u32,
     pub height: u32,
     pub refresh_hz: u32,
     /// Requested encoder bitrate (kbps); 0 = host default.
     pub bitrate_kbps: u32,
-    /// Render-resolution multiplier: the client asks the host to render/encode at
-    /// `resolved mode × render_scale` and the presenter downscales the larger decoded frame to the
-    /// window (`> 1` supersamples for sharpness, at more bandwidth AND decode; `< 1` renders under
-    /// native for a lighter host/link). `1.0` = Native (the prior behaviour). Applied at connect
-    /// (and each match-window resize) via [`punktfunk_core::render_scale`], clamped even + to the
-    /// codec's max dimension. Missing in a pre-existing store → the `Default` (1.0) via the
-    /// container `#[serde(default)]`.
+    /// Host render/encode at `mode × render_scale`; presenter downscales. `> 1`
+    /// supersamples; `< 1` under-renders; `1.0` = native. Clamped even, codec max.
     pub render_scale: f64,
     pub gamepad: String,
-    /// Forward this device's controllers to the host at all. Default ON — that was the
-    /// unconditional behaviour before this became a setting.
+    /// Forward this device's controllers. Default on.
     ///
-    /// Off is for the couch whose controller reaches the host by some *other* route: a USB
-    /// passthrough tool (VirtualHere and friends), or a pad simply plugged into the host
-    /// itself. Leaving forwarding on there gives the host two controllers for one pair of
-    /// hands, and games read both.
-    ///
-    /// It is deliberately stronger than "send no input": with it off the client never
-    /// *opens* the controller, and opening is what grabs the hardware (SDL's HIDAPI drivers
-    /// take the hidraw node) — a held device is one a passthrough tool cannot bind. Menu
-    /// navigation in the launcher still opens the active pad, and the session releases it;
-    /// see [`crate::gamepad::GamepadService::set_forwarding`].
+    /// Off: the client never opens the pad (SDL HIDAPI takes hidraw). Needed when a
+    /// USB passthrough or a pad plugged into the host already owns it — otherwise the
+    /// host sees two controllers. See [`crate::gamepad::GamepadService::set_forwarding`].
     #[serde(default = "default_true")]
     pub gamepad_forwarding: bool,
-    /// Stable identity (`vid:pid:name`, see `PadInfo::key`) of the physical controller
-    /// forwarded as pad 0; empty = automatic (most recently connected). Applied to the
-    /// gamepad service at startup so the choice survives restarts.
+    /// `vid:pid:name` (`PadInfo::key`) forwarded as pad 0; empty = most recently connected.
     pub forward_pad: String,
-    /// What a controller's SYSTEM buttons — guide (Xbox/PS/Steam) and the Deck's QAM `…` —
-    /// do while streaming: `"auto"` (default), `"forward"` (raw presses go to the host,
-    /// the pre-setting behaviour), or `"local"` (they stay with this device; the host's
-    /// are reached via the hold-Select gesture instead). Auto resolves per platform in
-    /// [`Settings::system_buttons_forward`]: forward everywhere EXCEPT under Gaming Mode,
-    /// where the local Steam UI always reacts to the same physical press — forwarding
-    /// there opens BOTH overlays, the local one on top of the stream.
+    /// Guide / QAM while streaming: `"auto"` (default), `"forward"`, or `"local"`.
+    /// Auto forwards everywhere except Gaming Mode, where the local Steam UI also
+    /// reacts — forwarding there opens both overlays. Resolved in
+    /// [`Settings::system_buttons_forward`].
     #[serde(default = "default_auto")]
     pub system_buttons: String,
-    /// The hold-Select guide gesture: holding Select/Back alone ≥ ~350 ms sends the HOST
-    /// the guide button (down for as long as it's held, so a long hold is the host's
-    /// long-press — the QAM on a Gaming-Mode host). `"auto"` (default) / `"on"` / `"off"`,
-    /// resolved in [`Settings::guide_gesture_enabled`]: auto = on only where the raw
-    /// guide press can't reach the host cleanly (Gaming Mode; iOS/tvOS resolve their own
-    /// auto in the Apple client). While armed, a Select TAP is delivered on release —
-    /// costing it up to the hold threshold in latency — and a Select held as part of a
-    /// combo (any other button already down) passes through untouched.
+    /// Hold-Select ≥ ~350 ms sends the host the guide button (down for the hold).
+    /// `"auto"` / `"on"` / `"off"`; auto = on only where raw guide cannot reach the
+    /// host cleanly (Gaming Mode). A Select tap is delayed up to the threshold.
     #[serde(default = "default_auto")]
     pub guide_gesture: String,
-    /// Which host compositor backend to request (advisory; the host falls back to
-    /// auto-detect when unavailable).
+    /// Host compositor backend to request (advisory; the host falls back if unavailable).
     pub compositor: String,
-    /// How a touchscreen's fingers drive the host (Deck/tablet): a [`TouchMode`] name —
-    /// `"trackpad"` (default), `"pointer"`, or `"touch"`. Read at connect via
-    /// [`Settings::touch_mode`]; irrelevant on a mouse-only client. `default` so pre-existing
-    /// stores load as trackpad.
+    /// [`TouchMode`] name: `"trackpad"` (default), `"pointer"`, or `"touch"`.
+    /// `default` so older stores load as trackpad.
     #[serde(default = "default_touch_mode")]
     pub touch_mode: String,
-    /// How a physical mouse drives the host: a [`MouseMode`] name — `"capture"` (default,
-    /// pointer lock + relative) or `"desktop"` (uncaptured absolute pointer). Read at
-    /// connect via [`Settings::mouse_mode`]. `default` so pre-existing stores load as
-    /// capture — today's behavior.
+    /// [`MouseMode`] name: `"capture"` (default) or `"desktop"`. `default` so older
+    /// stores load as capture.
     #[serde(default = "default_mouse_mode")]
     pub mouse_mode: String,
-    /// Send system chords (Alt+Tab, Super / the Windows key) to the host while input is
-    /// captured; off leaves them with the local shell. Read at connect into the presenter's
-    /// session opts, which turns it into an SDL keyboard grab (a low-level hook on Windows,
-    /// shortcuts-inhibit or `XGrabKeyboard` on Linux). Applies in BOTH mouse models — the
-    /// `desktop` model's unlocked pointer clicking another window is its way back.
+    /// Send system chords (Alt+Tab, Super) to the host while input is captured.
+    /// Off leaves them with the local shell. Applies in both mouse models.
     pub inhibit_shortcuts: bool,
-    /// Stream the default microphone to the host's virtual mic source.
     pub mic_enabled: bool,
-    /// Run the mic uplink through the platform's echo cancellation (the Apple/Android clients'
-    /// "Echo cancellation" toggle, same `echo_cancel` key). On Linux that means preferring an
-    /// echo-cancelled PipeWire source; on Windows, asking WASAPI for the Communications stream
-    /// category so the endpoint's own canceller engages. Default ON — without it, a laptop
-    /// speaker playing the host's audio is heard by this device's mic and sent straight back.
-    /// Only meaningful while `mic_enabled`. `PUNKTFUNK_NO_AEC=1` overrides it off (see
-    /// `audio::aec_enabled`). `default` so pre-existing stores load with it on.
+    /// Platform echo cancellation (PipeWire echo-cancelled source; WASAPI Communications
+    /// category). Default on — without it a laptop speaker looping host audio is heard
+    /// by the mic. `PUNKTFUNK_NO_AEC=1` overrides off. Only while `mic_enabled`.
     #[serde(default = "default_true")]
     pub echo_cancel: bool,
-    /// Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
-    /// can capture; the resolved count drives the decoder + playback layout.
+    /// Requested channels: 2 (stereo), 6 (5.1), 8 (7.1). Host clamps; decoder follows.
     pub audio_channels: u8,
-    /// Requested audio format — the cross-client `audio_format` key, whose stored values are shared
-    /// verbatim with the Apple and Android clients (`crate::audio_format::AUDIO_FORMATS`):
-    /// [`crate::audio_format::AUDIO_FORMAT_OPUS`] (the default, and byte for byte the session every
-    /// build before the lossless plane ran), `..._LOSSLESS_48` or `..._LOSSLESS_96`.
+    /// Cross-client `audio_format`: Opus (default), lossless 48, or lossless 96
+    /// (`crate::audio_format::AUDIO_FORMATS`).
     ///
-    /// Off by default and deliberately: lossless takes 2.3–4.6 Mbps off the top of the link,
-    /// OUTSIDE the ABR loop that manages the video budget, against the ~256 kbps Opus it replaces —
-    /// so a user has to pick it. Since 2026-08-17 this setting is the ONLY opt-in: the host's half
-    /// (`PUNKTFUNK_AUDIO_HIRES`) defaults ON and is an opt-OUT (`=0`), so this choice is enough on
-    /// any host that has not deliberately turned the plane off. A REQUEST, never a fact: the host
-    /// runs a five-condition gate and may answer
-    /// Opus anyway, and this client downgrades it further if the output device will not open the
-    /// rate. What actually happened is the OSD's `audio lossless …` line, and the log's
-    /// "negotiated audio format".
-    ///
-    /// Stereo-only: a lossless surround frame does not fit one QUIC datagram at the default MTU
-    /// and the host declines it (`design/hi-res-audio.md` §4.2). Both desktop settings UIs take
-    /// the picker away under 5.1/7.1 — GTK greys the row (its per-row profile Reset lives on the
-    /// row, and an insensitive row is the idiom its mic-dependent rows already use), the WinUI
-    /// shell drops it from the rendered card (its idiom for a row that does not apply). The
-    /// session filters the pair AGAIN whatever either UI did, because the two fields are
-    /// independent profile overrides and can disagree — and the env override answers to no UI.
-    ///
-    /// A `String`, not an enum, for the same reason [`codec`](Self::codec) is: it is read out of a
-    /// file a newer client may have written, and an unrecognized value resolves to Opus rather than
-    /// ending a session over a dropdown. `default` so pre-existing stores load on the Opus plane.
+    /// Off by default: lossless takes 2.3–4.6 Mbps outside the ABR video budget, vs
+    /// ~256 kbps Opus. A request, never a fact — the host may still answer Opus.
+    /// Stereo-only: a lossless surround frame does not fit one QUIC datagram
+    /// (`design/hi-res-audio.md`). A `String` so an unrecognized value resolves to
+    /// Opus rather than ending a session.
     #[serde(default = "default_audio_format")]
     pub audio_format: String,
-    /// Ask the host to leave its own audio devices alone for this session
-    /// (`CLIENT_CAP_KEEP_HOST_AUDIO`): the host captures whatever its default playback device
-    /// already is, so audio keeps playing there — the headphones plugged into the host PC stay
-    /// live — as well as here. Off (the default), the host parks playback on a silent endpoint
-    /// and the host goes quiet while streaming. Best-effort: an older host ignores the ask and
-    /// re-routes as it always did. `default` so pre-existing stores load with today's behavior.
+    /// Ask the host to leave its own audio devices alone (`CLIENT_CAP_KEEP_HOST_AUDIO`).
+    /// Off (default): the host parks playback on a silent endpoint. Best-effort; older
+    /// hosts ignore it.
     #[serde(default)]
     pub keep_host_audio: bool,
-    /// Preferred video codec: `"auto"` (host decides), `"hevc"`, `"h264"`, or `"av1"`. A soft
-    /// preference — the host honors it when it can emit it, else falls back to the best shared codec.
+    /// Preferred video codec: `"auto"` (host decides), `"hevc"`, `"h264"`, or `"av1"`.
+    /// Soft preference — the host honors it when it can, else falls back.
     #[serde(default = "default_codec")]
     pub codec: String,
-    /// Video decoder preference: `"auto"` (vendor-ordered native ladder — pf-vkdecode over
-    /// Vulkan Video, then the platform's own rung, then software; see `video::Decoder::new`
-    /// for the per-vendor order), `"native-vulkan"`, `"native-vaapi"`, `"native-d3d11va"`,
-    /// or `"software"`.
+    /// Decoder preference: `"auto"` (vendor-ordered native ladder), `"native-vulkan"`,
+    /// `"native-vaapi"`, `"native-d3d11va"`, or `"software"`.
     ///
-    /// ⚠ A STORED value is not a validated one — this is a plain `String` read out of a
-    /// user's settings file, and the pre-M10 spellings `"vulkan"`/`"vaapi"`/`"d3d11va"`
-    /// (which every desktop Settings UI offered) named libavcodec's rungs, deleted at
-    /// M10. `video::migrate_decoder_pref` maps each onto the native rung for the same
-    /// hardware family, at `warn`, so an upgrade does not end a session over a dropdown
-    /// the user picked long ago. Nothing rewrites the STORE — the value is migrated on
-    /// every read, so downgrading to an older client still works.
-    /// The `PUNKTFUNK_DECODER` env var overrides this (see `video::Decoder::new`).
+    /// A stored value is not validated. Pre-native spellings `"vulkan"`/`"vaapi"`/`"d3d11va"`
+    /// map in `video::migrate_decoder_pref` at warn; the store is not rewritten, so a
+    /// downgrade still works. `PUNKTFUNK_DECODER` overrides (see `video::Decoder::new`).
     pub decoder: String,
-    /// Decode/present GPU (multi-GPU boxes): the adapter's marketing name, as the WinUI
-    /// shell's GPU picker stores it; empty = automatic. The session maps it onto the
-    /// presenter's device pick (`PUNKTFUNK_VK_ADAPTER`). `default` so pre-existing
-    /// stores (and the Linux shells, which have no picker yet) load.
+    /// Decode/present GPU marketing name; empty = automatic. Maps to `PUNKTFUNK_VK_ADAPTER`.
     #[serde(default)]
     pub adapter: String,
-    /// Ask the host for full-chroma **4:4:4** video (`quic::VIDEO_CAP_444`). Default off: it
-    /// costs bandwidth and encode headroom, and only lands when everything lines up — HEVC,
-    /// the host's own policy, and a GPU that can actually encode 4:4:4. It is what makes small
-    /// text and thin UI lines crisp on a remote desktop, which is why this is a per-profile
-    /// choice rather than a global one (a "Work" profile wants it; "Game" usually doesn't).
+    /// Ask for 4:4:4 (`quic::VIDEO_CAP_444`). Default off: bandwidth and encode
+    /// headroom; per-profile because a desktop wants it and a game usually does not.
     #[serde(default)]
     pub enable_444: bool,
-    /// Advertise 10-bit + HDR10 so the host upgrades HDR content to a Main10/PQ stream.
-    /// The presenter handles the display side dynamically either way (HDR10 swapchain
-    /// where offered, tonemap where not) — off means "never send me HDR".
-    /// `default = true`: the Linux stores never carried this and always advertised.
+    /// Advertise 10-bit + HDR10. Off means never send HDR. Default true: Linux stores
+    /// never carried this and always advertised.
     #[serde(default = "default_true")]
     pub hdr_enabled: bool,
-    /// Advertise 10-bit WITHOUT HDR (`VIDEO_CAP_10BIT` alone): the host encodes the SDR
-    /// desktop at Main10 precision — less encode banding on gradients, the display's colour
-    /// state untouched at both ends. Subsumed by `hdr_enabled`; the host additionally gates
-    /// (today: a Windows host on direct NVENC, HEVC), so elsewhere the session stays 8-bit.
-    /// `default` so pre-existing stores load with today's behavior.
+    /// Advertise 10-bit without HDR (`VIDEO_CAP_10BIT`): SDR desktop at Main10.
+    /// Subsumed by `hdr_enabled`. `default` so older stores load off.
     #[serde(default)]
     pub ten_bit_sdr: bool,
-    /// Presentation intent: `"latency"` (default) or `"smooth"` — the Apple/Android
-    /// clients' shared `present_priority` profile key, resolved with
-    /// [`PresentPriority::resolve`] (via [`Settings::present_priority`]). Anything
-    /// unknown reads as latency, so a newer client's future value degrades safely.
+    /// `"latency"` (default) or `"smooth"`. Unknown reads as latency so a future
+    /// value degrades safely.
     #[serde(default = "default_present_priority")]
     pub present_priority: String,
-    /// Smoothness buffer size in frames: `0` = Automatic (resolves to 2), else 1–3.
-    /// Only meaningful under `present_priority = "smooth"` (the shared `smooth_buffer`
-    /// key). Each buffered frame absorbs about one refresh of jitter and adds one
-    /// refresh of display latency.
+    /// Smoothness buffer in frames: `0` = Automatic (resolves to 2), else 1–3.
+    /// Only under `present_priority = "smooth"`. One frame ≈ one refresh of jitter
+    /// and one refresh of display latency.
     #[serde(default)]
     pub smooth_buffer: u8,
-    /// Tear-free presentation (default ON = today's behavior: MAILBOX, FIFO fallback).
-    /// Off asks for a tearing present mode (IMMEDIATE) for the lowest possible latch
-    /// latency — best-effort: platforms/drivers without tearing silently stay tear-free
-    /// and the active mode is visible in the detailed stats. The shared `vsync` profile
-    /// key; the desktop default differs from macOS's (`false` there) deliberately —
-    /// sync-off means something different on each platform, the key is the contract.
+    /// Tear-free presentation (default on = MAILBOX, FIFO fallback). Off asks
+    /// IMMEDIATE. Shared `vsync` key; macOS defaults false — sync-off means
+    /// something different per platform.
     #[serde(default = "default_true")]
     pub vsync: bool,
-    /// Let a variable-refresh display follow the stream cadence: prefers the present
-    /// mode that drives VRR panels directly when fullscreen. Inert on fixed-refresh
-    /// displays (detection is measured from on-glass timestamps, not queried). The
-    /// shared `allow_vrr` profile key. Default ON, like the Apple client.
+    /// Let a VRR display follow the stream cadence when fullscreen. Inert on
+    /// fixed-refresh (measured from on-glass timestamps). Default on.
     #[serde(default = "default_true")]
     pub allow_vrr: bool,
-    /// Legacy on/off for the stats overlay — superseded by `stats_verbosity` but kept
-    /// written in sync (`set_stats_verbosity`) so pre-tier binaries reading the same
-    /// file keep working. `alias`: the pre-unification WinUI shell (≤ 0.8.4) persisted
-    /// this as `show_hud`.
+    /// Legacy on/off for the stats overlay — kept in sync with `stats_verbosity`
+    /// so pre-tier binaries reading the same file keep working. `alias`: older
+    /// WinUI shells persisted this as `show_hud`.
     #[serde(alias = "show_hud")]
     pub show_stats: bool,
     /// Stats overlay tier. `None` = a pre-tier store; resolve through
     /// [`Settings::stats_verbosity`], which falls back to `show_stats`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats_verbosity: Option<StatsVerbosity>,
-    /// Enter fullscreen when a stream starts (F11 / the controller chord / the top-edge
-    /// header reveal exit it). Gaming-Mode launches (`--fullscreen`) fullscreen regardless.
+    /// Enter fullscreen when a stream starts. `--fullscreen` (Gaming Mode) ignores this.
     pub fullscreen_on_stream: bool,
-    /// Which colour family the gamepad UI's living backdrop drifts through — the shared
-    /// `ui_palette` key (`"violet"` = the brand default, then `oled`/`nebula`/`abyss`/
-    /// `ember`/`moss`/`graphite`, then the six pale fields; see `pf-console-ui`'s palette
-    /// table, and the Apple/Android clients' twins). Presentation only: nothing about a
-    /// stream depends on it, which is why it is a device preference and never part of a
-    /// settings profile. An unknown name reads as the default rather than erroring — a
-    /// newer client may have shipped a palette this binary doesn't know.
+    /// Gamepad-UI backdrop palette (`"violet"` default). Presentation only — never
+    /// part of a settings profile. Unknown name → default (a newer client may have
+    /// shipped one this binary does not know).
     #[serde(default = "default_ui_palette")]
     pub ui_palette: String,
-    /// Follow the desktop's own theme where the platform exposes one — today that is
-    /// Omarchy on Linux: the GTK shell recolours from it and the console builds its field
-    /// and ink from it, live across a theme switch. While it is on, [`ui_palette`]
-    /// (Self::ui_palette) stays stored but does not draw. Presentation only, a device
-    /// preference like the palette. The row is shown only where a theme exists; everywhere
-    /// else the value is inert, which is why defaulting ON is safe — following the desk IS
-    /// the integration, and the switch is the way out.
+    /// Follow the desktop theme where the platform exposes one (Omarchy on Linux).
+    /// While on, [`ui_palette`](Self::ui_palette) stays stored but does not draw.
+    /// Default on: following the desk is the integration; the switch is the way out.
     #[serde(default = "default_true")]
     pub follow_os_theme: bool,
-    /// Suppress the gamepad UI's decorative motion: the living backdrop freezes, screen
-    /// transitions become a plain fade, entrances stop staggering, and refused moves keep
-    /// their haptic but drop the recoil travel. Presentation only, exactly like
-    /// [`ui_palette`](Self::ui_palette) — a device preference, never part of a settings
-    /// profile.
-    ///
-    /// A console setting rather than a mirror of an OS one, because there is no
-    /// system "reduce motion" SDL can read portably across Linux and Windows. It also
-    /// doubles as the OLED-friendly mode: a frozen backdrop is a static image.
-    /// `default` so pre-existing stores load with the full motion they have today.
+    /// Freeze decorative motion. Presentation only, like [`ui_palette`](Self::ui_palette).
+    /// No portable OS "reduce motion" via SDL; also the OLED-friendly mode.
     #[serde(default)]
     pub reduce_motion: bool,
-    /// How the console's game library orders titles within a group: `""`/unknown (the
-    /// host's own order — today's shelf, byte for byte), `"title"`, `"platform"` or
-    /// `"store"`. See `pf-console-ui`'s `collate` module, which is the portable spec the
-    /// Apple and Android ports implement.
-    ///
-    /// Presentation only, like [`ui_palette`](Self::ui_palette), so it is a device
-    /// preference and never part of a settings profile. Parsed leniently — an unrecognized
-    /// value is a newer client's key, and the right answer to one is the default shelf.
+    /// Library order within a group: `""`/unknown = host order, `"title"`,
+    /// `"platform"`, or `"store"`. Presentation only; unknown → default shelf.
     #[serde(default)]
     pub library_sort: String,
-    /// How the console's game library is arranged: `"shelf"` (the coverflow — the default,
-    /// and unknown values read as it) or `"grid"`. Presentation only, same rules as
-    /// [`library_sort`](Self::library_sort).
+    /// Library arrangement: `"shelf"` (default, and unknown values) or `"grid"`.
     #[serde(default)]
     pub library_view: String,
-    /// Open a host's library on its COLLECTIONS — platforms and stores as tiles — instead of
-    /// the whole shelf. Presentation only, same rules as [`library_sort`](Self::library_sort).
-    ///
-    /// Ignored by a library with fewer than two collections (see `pf-console-ui`'s
-    /// `collate::worth_browsing`): a screen that opens onto a single tile is a press the user
-    /// pays for nothing, so that library opens on its shelf whatever this says. Default off,
-    /// like every key in this family — an existing install must not have the screen its
-    /// deep links land on changed under it.
+    /// Open a host's library on collections instead of the whole shelf.
+    /// Ignored when fewer than two collections (`collate::worth_browsing`).
+    /// Default off so an existing install's deep-link landing screen does not move.
     #[serde(default)]
     pub library_collections: bool,
-    /// Send Wake-on-LAN before connecting to a saved host and wait for it to boot (the
-    /// Apple client's "Auto-wake on connect"). Default ON — that was the unconditional
-    /// behavior before this became a setting. Off is for hosts reached over a VPN, where
-    /// an offline-looking host is really just unreachable by broadcast and the wake +
-    /// wait only adds a delay.
+    /// Wake-on-LAN before connecting and wait for boot. Default on. Off for VPN
+    /// hosts, where broadcast never reaches and the wait only adds delay.
     #[serde(default = "default_true")]
     pub auto_wake: bool,
-    /// Reverse the wheel/trackpad scroll direction sent to the host (the Apple client's
-    /// "Invert scroll direction"). Default off = the host scrolls the way this machine does.
+    /// Reverse wheel/trackpad scroll sent to the host. Default off = host matches this machine.
     #[serde(default)]
     pub invert_scroll: bool,
-    /// The in-stream quick-action ring: one JSON blob parsed by
-    /// [`crate::overlay_actions::OverlayConfig::parse`] (six slots, shortcuts, the virtual
-    /// pad's preset). Empty = the platform default ring. One opaque field, not a dozen
-    /// booleans: every cross-client setting costs about six hand edits per client.
+    /// In-stream quick-action ring JSON ([`crate::overlay_actions::OverlayConfig::parse`]).
+    /// Empty = platform default. One opaque field: each cross-client setting is ~six edits.
     #[serde(default)]
     pub overlay_actions: String,
-    /// Playback endpoint for stream audio — on Linux the PipeWire `node.name` the
-    /// playback stream targets (`target.object`); on Windows the WASAPI `IMMDevice`
-    /// endpoint id; empty = the OS default (the Apple client's Speaker picker). The
-    /// session maps it onto `PUNKTFUNK_AUDIO_SINK`. A picked endpoint that's gone
-    /// falls back to the default on both OSes.
+    /// Playback endpoint (PipeWire `node.name` / WASAPI `IMMDevice` id); empty = OS default.
+    /// Maps to `PUNKTFUNK_AUDIO_SINK`. A gone pick falls back to default.
     #[serde(default)]
     pub speaker_device: String,
-    /// Capture endpoint for the mic uplink (same semantics as `speaker_device`;
-    /// `PUNKTFUNK_AUDIO_SOURCE`).
+    /// Capture endpoint; same semantics as `speaker_device` (`PUNKTFUNK_AUDIO_SOURCE`).
     #[serde(default)]
     pub mic_device: String,
-    /// Render the host's per-pad DualSense voice-coil haptics stream (the 0xD1 plane, kind 0)
-    /// on a WIRED physical DualSense's own audio device (tier A — Bluetooth pads expose no
-    /// audio device). Gates the `CLIENT_CAP_PAD_AUDIO` advertisement and the per-pad arrival
-    /// capability bit; wire rumble is suppressed for a pad whose haptics stream is live (the
-    /// stream carries the feedback — see `gamepad.rs`, the SDL disable-bit trap). Default ON:
-    /// the capable-and-agreed negotiation means it changes nothing without a capable host AND
-    /// a wired DS5. `default` so pre-existing stores load with it on.
+    /// DualSense voice-coil haptics (0xD1 kind 0) on a wired pad's audio device.
+    /// Gates `CLIENT_CAP_PAD_AUDIO`; wire rumble is suppressed while the stream is
+    /// live (see `gamepad.rs`). Default on: no-op without a capable host and a wired DS5.
     #[serde(default = "default_true")]
     pub pad_haptics: bool,
-    /// Where the DualSense built-in-speaker stream (0xD1 kind 1) is rendered: `"pad"` (default
-    /// — the physical pad's own speaker), `"mix"` (fold it into the main stream audio — a
-    /// declared TODO that renders as `"off"` today; see `pad_audio::speaker_active`), or
-    /// `"off"`. `default` so pre-existing stores load as `"pad"`.
+    /// DualSense speaker stream (0xD1 kind 1): `"pad"` (default), `"mix"` (renders
+    /// as `"off"` today; see `pad_audio::speaker_active`), or `"off"`.
     #[serde(default = "default_pad_speaker")]
     pub pad_speaker: String,
-    /// Match-window resolution policy (design/midstream-resolution-resize.md D1): the
-    /// stream mode follows the session window — the connect asks for the window's pixel
-    /// size and a mid-session resize renegotiates the host's virtual display + encoder
-    /// (`Reconfigure`), so windowed sessions stream native-resolution pixels instead of
-    /// scaling. Overrides `width`/`height` while on; on fullscreen it degenerates to the
-    /// display's native mode. Default off (Auto-native stays the shipped default until
-    /// the per-backend validation matrix is green).
+    /// Stream mode follows the session window (design/midstream-resolution-resize.md).
+    /// Overrides `width`/`height` while on; fullscreen degenerates to the display's
+    /// native mode. Default off until per-backend validation is green.
     pub match_window: bool,
-    /// The session window's last logical size under `match_window`: the next launch
-    /// opens its window at this size, so the first connect's mode already matches what
-    /// the user will be looking at. `0` = never stored → the 1280×720 default.
+    /// Last logical window size under `match_window`, so the next launch's first
+    /// connect already matches. `0` = never stored → 1280×720.
     pub last_window_w: u32,
     pub last_window_h: u32,
-    /// Settings keys this build doesn't model (a newer client's field), carried through a
-    /// load→save round-trip untouched — [`crate::profiles::SettingsOverlay`]'s `extra`
-    /// pattern extended to the globals. Without it, every whole-file writer of this store
-    /// (two shells, the console settings screen, the session's resize callback, Decky)
-    /// running as an OLDER binary silently drops what a newer one persisted. Empty on
-    /// every existing store, and an empty map serializes to nothing, so files don't churn.
+    /// Keys this build does not model, carried through load→save so an older writer
+    /// does not drop a newer client's fields. Empty map serializes to nothing.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
@@ -1416,9 +1113,8 @@ fn default_codec() -> String {
     "auto".into()
 }
 
-/// The Opus plane — every session before the lossless one existed, and the one a store written by
-/// an older client must load as. Named from `session` so the default and the menu's first row can
-/// never be two different strings.
+/// Opus plane — the one an older client's store must load as. Named from `session`
+/// so the default and the menu's first row cannot be two different strings.
 fn default_audio_format() -> String {
     crate::audio_format::AUDIO_FORMAT_OPUS.into()
 }
@@ -1452,8 +1148,7 @@ fn default_pad_speaker() -> String {
 }
 
 impl Settings {
-    /// The stats-overlay tier, resolving pre-tier stores: an old `show_stats = false`
-    /// reads as Off, everything else as Normal (≈ what the pre-tier overlay showed).
+    /// Overlay tier, resolving pre-tier stores: `show_stats = false` → Off, else Normal.
     pub fn stats_verbosity(&self) -> StatsVerbosity {
         self.stats_verbosity.unwrap_or(if self.show_stats {
             StatsVerbosity::Normal
@@ -1462,14 +1157,12 @@ impl Settings {
         })
     }
 
-    /// Set the tier, keeping the legacy `show_stats` bool coherent for pre-tier
-    /// binaries that read the same settings file.
+    /// Set the tier, keeping the legacy `show_stats` bool coherent for pre-tier readers.
     pub fn set_stats_verbosity(&mut self, v: StatsVerbosity) {
         self.stats_verbosity = Some(v);
         self.show_stats = v != StatsVerbosity::Off;
     }
 
-    /// The touch-input model for this session (parsed from the stored name).
     pub fn touch_mode(&self) -> TouchMode {
         TouchMode::from_name(&self.touch_mode)
     }
@@ -1478,16 +1171,12 @@ impl Settings {
         MouseMode::from_name(&self.mouse_mode)
     }
 
-    /// The presentation intent for this session (the resolved
-    /// `present_priority` × `smooth_buffer` pair).
     pub fn present_priority(&self) -> PresentPriority {
         PresentPriority::resolve(&self.present_priority, self.smooth_buffer)
     }
 
-    /// Whether raw system-button presses (guide + QAM) are forwarded to the host.
-    /// `game_mode` = this client runs as the embedded Gaming-Mode stream (gamescope),
-    /// where the local Steam UI reacts to the same physical buttons no matter what we
-    /// do — auto keeps them local there and forwards everywhere else.
+    /// Whether raw system-button presses (guide + QAM) go to the host.
+    /// `game_mode`: auto keeps them local under gamescope (Steam UI reacts too).
     pub fn system_buttons_forward(&self, game_mode: bool) -> bool {
         match self.system_buttons.as_str() {
             "forward" => true,
@@ -1496,9 +1185,8 @@ impl Settings {
         }
     }
 
-    /// Whether the hold-Select guide gesture is armed ([`Settings::guide_gesture`]).
-    /// Auto = on only under Gaming Mode, where it is the sole controller route to the
-    /// host's guide once raw presses stay local.
+    /// Whether the hold-Select guide gesture is armed.
+    /// Auto = on only under Gaming Mode, the sole controller route once raw presses stay local.
     pub fn guide_gesture_enabled(&self, game_mode: bool) -> bool {
         match self.guide_gesture.as_str() {
             "on" => true,
@@ -1513,9 +1201,8 @@ impl Settings {
             "h264" | "avc" => punktfunk_core::quic::CODEC_H264,
             "hevc" | "h265" => punktfunk_core::quic::CODEC_HEVC,
             "av1" => punktfunk_core::quic::CODEC_AV1,
-            // The wired-LAN wavelet codec: preference-only by design (resolve_codec never
-            // auto-picks it), and harmless on a build/device that doesn't advertise the
-            // bit — the ladder falls back to HEVC.
+            // Wired-LAN wavelet: preference-only (`resolve_codec` never auto-picks it).
+            // Harmless if the bit is not advertised — the ladder falls back to HEVC.
             "pyrowave" => punktfunk_core::quic::CODEC_PYROWAVE,
             _ => 0,
         }
@@ -1580,10 +1267,8 @@ impl Default for Settings {
 
 impl Settings {
     fn path() -> Result<PathBuf> {
-        // The shell's settings file on each OS: the GTK shell's on Linux, the WinUI
-        // shell's on Windows. The desktop shells AND the session binary's console
-        // settings screen write it (load-modify-save per change — Gaming Mode has no
-        // other editor); a plain `--connect` stream only ever reads.
+        // GTK settings file on Linux, WinUI on Windows. Desktop shells and the session
+        // console write it; a plain `--connect` stream only reads.
         #[cfg(windows)]
         return Ok(config_dir()?.join("client-windows-settings.json"));
         #[cfg(not(windows))]
@@ -1596,9 +1281,8 @@ impl Settings {
             .unwrap_or_default()
     }
 
-    /// Fire-and-forget by design (a failed settings write must never take a stream down),
-    /// but temp+rename: this file has five whole-file writers, and a torn one loads as
-    /// `Default` — i.e. silently resets every setting the user has.
+    /// Fire-and-forget (a failed write must never take a stream down), but temp+rename:
+    /// five whole-file writers, and a torn file loads as `Default` — silent reset.
     pub fn save(&self) {
         let Ok(p) = Self::path() else { return };
         let _ = std::fs::create_dir_all(p.parent().unwrap());
@@ -1608,24 +1292,17 @@ impl Settings {
     }
 }
 
-/// The one settings resolver every front-end and the session binary go through
-/// (design/client-settings-profiles.md §4.4/§4.6): global defaults, with the profile this
-/// connect uses overlaid.
+/// Settings resolver every front-end and the session go through
+/// (design/client-settings-profiles.md):
 ///
 /// ```text
 /// effective = overlay(profile).apply(global)
 /// profile   = one-off override  ??  host binding  ??  none
 /// ```
 ///
-/// `one_off` is the "Connect with ▸ X" / `--profile` / `profile=` pick, by id or unique name;
-/// `Some("")` forces the global defaults on a bound host. It never rebinds anything — the
-/// host's default is changed only by an explicit act in the UI.
-///
-/// Nothing here fails: an unknown one-off falls back to the *defaults* (not to the host's
-/// binding — a connect that was explicitly asked for "Work" must not silently run "Game"),
-/// and a dangling binding resolves as none, exactly today's behavior. The host is looked up
-/// by `addr:port`, the same match the per-host clipboard decision has always used —
-/// consistency with the shipped precedent beats purity here (§4.6).
+/// `one_off` is Connect-with / `--profile` / `profile=`; `Some("")` forces globals
+/// on a bound host and never rebinds. Unknown one-off → defaults (not the host
+/// binding). Lookup is `addr:port`, same as the per-host clipboard decision.
 pub fn effective_settings(
     addr: &str,
     port: u16,
@@ -1644,15 +1321,15 @@ pub fn effective_settings(
     }
 }
 
-/// The profile half of [`effective_settings`], split out so the precedence rules are testable
-/// without touching the config directory: one-off pick ?? host binding ?? none.
+/// Profile half of [`effective_settings`], split so the precedence rules are testable
+/// without touching the config directory: one-off ?? host binding ?? none.
 fn resolve_profile(
     catalog: &ProfilesFile,
     bound: Option<&str>,
     one_off: Option<&str>,
 ) -> Option<StreamProfile> {
     match one_off {
-        // `--profile ""` — "Connect with ▸ Default settings" on a bound host.
+        // `--profile ""` forces defaults on a bound host.
         Some("") => None,
         Some(reference) => match catalog.resolve(reference) {
             (Some(p), _) => Some(p.clone()),
@@ -1665,8 +1342,7 @@ fn resolve_profile(
                 None
             }
         },
-        // A binding is an id, never a name: it was written by a picker, and resolving it by
-        // name would let renaming another profile hijack it. Dangling → the defaults.
+        // Binding is an id, never a name — a rename must not hijack it. Dangling → defaults.
         None => bound.and_then(|id| catalog.find_by_id(id).cloned()),
     }
 }
@@ -1675,23 +1351,13 @@ fn resolve_profile(
 mod tests {
     use super::*;
 
-    /// A 64-hex fingerprint of one repeated digit — readable in an assertion, and distinct
-    /// per letter, which is all the known-hosts tests need one to be.
+    /// 64-hex fingerprint of one repeated digit — readable and distinct per letter.
     fn fp(c: char) -> String {
         std::iter::repeat_n(c, 64).collect()
     }
 
-    /// **A byte order mark must not silently erase every setting in the file.**
-    ///
-    /// PowerShell's `Set-Content -Encoding UTF8` writes one, so this is what a settings
-    /// file edited from a Windows shell actually looks like on disk. `serde_json` refuses
-    /// `EF BB BF` at byte 0, and the loader used to swallow that refusal and return
-    /// `Default` — which on 2026-08-07 cost an hour: a `codec: "av1"` edit was ignored and
-    /// the client negotiated HEVC, with the correct file open on screen. Nothing was
-    /// logged, because there was nothing in the code to log it.
-    ///
-    /// Asserts the three cases together, because the middle one is the whole point: a BOM
-    /// must LOAD, not merely fail loudly.
+    /// A UTF-8 BOM must load, not fall back to `Default`. serde refuses `EF BB BF`
+    /// at byte 0; PowerShell `Set-Content -Encoding UTF8` writes one.
     #[test]
     fn a_bom_does_not_turn_a_settings_file_into_defaults() {
         let dir = std::env::temp_dir().join(format!(
@@ -1710,16 +1376,14 @@ mod tests {
         assert_eq!(s.codec, "av1");
         assert_eq!(s.bitrate_kbps, 42000);
 
-        // The same bytes with a UTF-8 BOM in front must load identically.
+        // Same bytes with a UTF-8 BOM must load identically.
         let bom = dir.join("bom.json");
         std::fs::write(&bom, format!("\u{feff}{body}")).unwrap();
         let s: Settings = load_json_or_default(&bom);
         assert_eq!(s.codec, "av1", "a BOM must not discard the settings file");
         assert_eq!(s.bitrate_kbps, 42000);
 
-        // Genuinely broken JSON still falls back to defaults (never an error — nothing
-        // about streaming may hinge on this file), and a missing file is not a failure
-        // at all, it is first run.
+        // Broken JSON falls back to defaults; a missing file is first run, not a failure.
         let broken = dir.join("broken.json");
         std::fs::write(&broken, r#"{"codec":"av1",}"#).unwrap();
         let d: Settings = load_json_or_default(&broken);
@@ -1729,15 +1393,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A settings file predating the touch-input model loads as `trackpad` (the shipped
-    /// default), and the name round-trips through the enum both ways.
+    /// A pre-touch-mode store loads as `trackpad`; names round-trip through the enum.
     #[test]
     fn settings_touch_mode_defaults_trackpad() {
         let old = r#"{"width":1280,"height":720,"gamepad":"auto","compositor":"auto"}"#;
         let s: Settings = serde_json::from_str(old).unwrap();
         assert_eq!(s.touch_mode, "trackpad");
         assert_eq!(s.touch_mode(), TouchMode::Trackpad);
-        // Explicit values parse; an unknown name falls back to trackpad.
+        // Unknown name falls back to trackpad.
         assert_eq!(TouchMode::from_name("pointer"), TouchMode::Pointer);
         assert_eq!(TouchMode::from_name("touch"), TouchMode::Touch);
         assert_eq!(TouchMode::from_name("bogus"), TouchMode::Trackpad);
@@ -1746,10 +1409,8 @@ mod tests {
         }
     }
 
-    /// A settings file predating the presentation cluster loads with the shipped
-    /// defaults (latency intent, Automatic buffer, tear-free, VRR allowed), and the
-    /// resolution rules match the Apple/Android reference: anything but an explicit
-    /// `"smooth"` is latency, and a smooth buffer outside 1..=3 becomes 2.
+    /// A pre-presentation store loads latency / Automatic / tear-free / VRR.
+    /// Anything but `"smooth"` is latency; a buffer outside 1..=3 becomes 2.
     #[test]
     fn settings_presentation_defaults_and_resolution() {
         let old = r#"{"width":1280,"height":720,"gamepad":"auto","compositor":"auto"}"#;
@@ -1783,7 +1444,7 @@ mod tests {
         assert_eq!(PresentPriority::Smooth { buffer: 3 }.fifo_capacity(), 3);
     }
 
-    /// A pre-`forward_pad` settings file (≤ 0.5.0) loads with the pin on automatic.
+    /// A pre-`forward_pad` store loads with the pin on automatic.
     #[test]
     fn settings_forward_pad_defaults_empty() {
         let old = r#"{"width":1280,"height":720,"refresh_hz":60,"bitrate_kbps":0,
@@ -1794,11 +1455,8 @@ mod tests {
         assert_eq!(round.forward_pad, "");
     }
 
-    /// A pre-unification WinUI shell settings file (≤ 0.8.4, when the shell had its own
-    /// `Settings` struct) still loads: `show_hud` migrates onto `show_stats` via the serde
-    /// alias, the dropped `engine` knob is ignored, fields that file never carried
-    /// (forward_pad, fullscreen_on_stream, …) default, and the D3D11VA-era
-    /// `decoder: "hardware"` survives as-is (video::Decoder::new reads it as auto).
+    /// Older WinUI shell files still load: `show_hud` aliases onto `show_stats`,
+    /// dropped `engine` is ignored, missing fields default.
     #[test]
     fn settings_reads_winui_shell_shape() {
         let shell = r#"{
@@ -1820,20 +1478,15 @@ mod tests {
         assert_eq!(pw.preferred_codec(), punktfunk_core::quic::CODEC_PYROWAVE);
         assert_eq!(s.adapter, "NVIDIA GeForce RTX 4080");
         assert!(s.hdr_enabled);
-        // The old shell's `show_hud` lands on `show_stats` (the user's preference survives).
         assert!(!s.show_stats);
-        // Fields the old file doesn't carry take this struct's defaults.
         assert_eq!(s.forward_pad, "");
         assert!(s.fullscreen_on_stream);
-        // Echo cancellation post-dates every stored file: it must load ON, or an upgrade
-        // would silently turn a user's echo protection off.
+        // Echo cancellation post-dates every stored file: it must load on.
         assert!(s.echo_cancel);
     }
 
-    /// A key this build doesn't model (a newer client's setting) survives a load→save
-    /// round trip instead of being dropped by the next whole-file write — the same
-    /// contract `SettingsOverlay.extra` gives profiles. And when there are no unknown
-    /// keys, the flatten map adds nothing, so existing files don't churn.
+    /// Unknown keys survive load→save. An empty flatten map adds nothing, so files
+    /// without extras do not churn.
     #[test]
     fn settings_unknown_keys_survive_round_trip() {
         let newer = r#"{"width":1920,"height":1080,"frob_mode":"fancy","frob_level":3}"#;
@@ -1846,18 +1499,14 @@ mod tests {
         let out = serde_json::to_string(&s).unwrap();
         assert!(out.contains(r#""frob_mode":"fancy""#), "{out}");
         assert!(out.contains(r#""frob_level":3"#), "{out}");
-        // No unknown keys → no artifact of the passthrough field in the file.
+        // No unknown keys → no artifact of the passthrough field.
         let plain = serde_json::to_string(&Settings::default()).unwrap();
         assert!(!plain.contains("extra"), "{plain}");
         assert!(!plain.contains("frob"), "{plain}");
     }
 
-    /// The same contract seen from the other side: a key this build RETIRED. `library_enabled`
-    /// gated "Browse library…" in the GTK and WinUI shells and defaulted off, so dropping the
-    /// field is what finally shows the library to everyone who never found the toggle. The
-    /// stored `false` must not fail the load — that would lock a user out of their whole
-    /// settings file over a setting that no longer exists — and it must survive the next
-    /// whole-file write, so a downgrade still reads the value it wrote.
+    /// A retired key (`library_enabled`) must not fail the load, and must survive the
+    /// next whole-file write so a downgrade still reads it.
     #[test]
     fn settings_retired_library_key_loads_and_survives() {
         let stored = r#"{"width":1920,"height":1080,"library_enabled":false}"#;
@@ -1871,9 +1520,7 @@ mod tests {
         assert!(out.contains(r#""library_enabled":false"#), "{out}");
     }
 
-    /// Stats-tier resolution: a pre-tier store falls back to `show_stats` (off → Off,
-    /// on/absent → Normal), an explicit tier wins, and setting a tier keeps the legacy
-    /// bool in sync so pre-tier binaries reading the same file agree on off vs on.
+    /// Pre-tier store falls back to `show_stats`; setting a tier keeps the legacy bool in sync.
     #[test]
     fn stats_verbosity_migrates_and_round_trips() {
         let mut s: Settings = serde_json::from_str("{}").unwrap();
@@ -1889,12 +1536,11 @@ mod tests {
         s.set_stats_verbosity(StatsVerbosity::Detailed);
         let round: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(round.stats_verbosity(), StatsVerbosity::Detailed);
-        // The tier serializes lowercase — the file stays human-readable.
+        // Lowercase so the file stays readable.
         assert!(serde_json::to_string(&s).unwrap().contains("\"detailed\""));
     }
 
-    /// The WinUI shell's known-hosts shape (no `last_used` field) loads losslessly — same
-    /// filename, same directory, so on Windows the two clients genuinely share the store.
+    /// WinUI known-hosts shape (no `last_used`) loads; same path so the two clients share it.
     #[test]
     fn known_hosts_reads_winui_shell_shape() {
         let shell = r#"{"hosts":[{
@@ -1908,14 +1554,12 @@ mod tests {
         assert_eq!(h.last_used, None);
         assert_eq!(h.mac, vec!["aa:bb:cc:dd:ee:ff".to_string()]);
         assert!(parse_hex32(&h.fp_hex).is_some());
-        // A store predating the `os` field loads with it empty, and serializes back without
-        // the key (an older client reading the same file sees exactly what it wrote).
+        // Pre-`os` store loads empty and serializes without the key.
         assert_eq!(h.os, "");
         assert!(!serde_json::to_string(&k).unwrap().contains("\"os\""));
     }
 
-    /// The learned OS chain round-trips, and an absent key stays absent — the same
-    /// back-compat contract as every late `KnownHost` field.
+    /// Learned OS chain round-trips; an absent key stays absent.
     #[test]
     fn known_hosts_os_chain_round_trips() {
         let k = KnownHosts {
@@ -1932,10 +1576,8 @@ mod tests {
         assert_eq!(back.hosts[0].os, "linux/fedora/bazzite");
     }
 
-    /// A pre-profiles known-hosts file loads unchanged — no binding, no pins — and its
-    /// records serialize back without the new keys, so an older client reading the same file
-    /// sees exactly what it wrote. The id is minted only when `load()` runs (the migration
-    /// step), not by deserialization.
+    /// A pre-profiles store loads with no binding/pins and serializes without the new
+    /// keys. Id is minted by `load()`, not by deserialization.
     #[test]
     fn known_hosts_migration_is_a_no_op_on_a_pre_profiles_store() {
         let old = r#"{"hosts":[{
@@ -1954,23 +1596,19 @@ mod tests {
         assert!(!text.contains("pinned_profiles"));
         assert!(!text.contains("\"id\""));
 
-        // Minting is idempotent: the second pass reports nothing to persist and leaves the
-        // id it handed out alone.
+        // Second pass reports nothing to persist and leaves the minted id alone.
         assert!(k.mint_missing_ids());
         let minted = k.hosts[0].id.clone().unwrap();
         assert_eq!(minted.len(), 36);
         assert!(!k.mint_missing_ids());
         assert_eq!(k.hosts[0].id.as_deref(), Some(minted.as_str()));
-        // An empty-string id (a hand-edited store) counts as missing, not as an identity.
+        // Empty-string id counts as missing, not as an identity.
         k.hosts[0].id = Some(String::new());
         assert!(k.mint_missing_ids());
         assert_ne!(k.hosts[0].id.as_deref(), Some(""));
     }
 
-    /// `upsert` refreshes what a reconnect actually knows and preserves what the user set:
-    /// the profile binding, the pinned cards, the clipboard decision and the stable id all
-    /// survive a trust-decision upsert that carries none of them (the bug `clipboard_sync`
-    /// only ever avoided by accident).
+    /// `upsert` preserves user-set fields a trust-decision payload does not carry.
     #[test]
     fn upsert_preserves_user_set_host_state() {
         let fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1984,8 +1622,7 @@ mod tests {
                 last_used: Some(1000),
                 mac: vec!["aa:bb:cc:dd:ee:ff".into()],
                 os: "linux/fedora/bazzite".into(),
-                // Deliberately NOT 47990: a host that moved its mgmt port is the case this field
-                // exists for, so the default would make the assertions below pass vacuously.
+                // Not 47990: the default would make the keep-on-upsert assertions pass vacuously.
                 mgmt_port: Some(47991),
                 clipboard_sync: true,
                 profile_id: Some("aaaaaaaaaaaa".into()),
@@ -1996,10 +1633,10 @@ mod tests {
         // What `persist_host` builds: a trust decision, nothing else.
         k.upsert(KnownHost {
             name: "Desk".into(),
-            addr: "192.168.1.51".into(), // new lease
+            addr: "192.168.1.51".into(),
             port: 9777,
             fp_hex: fp.into(),
-            paired: false, // must not demote
+            paired: false,
             ..Default::default()
         });
         let h = &k.hosts[0];
@@ -2008,10 +1645,8 @@ mod tests {
         assert!(h.paired);
         assert_eq!(h.last_used, Some(1000));
         assert_eq!(h.mac, vec!["aa:bb:cc:dd:ee:ff".to_string()]);
-        // The learned OS chain rides the same rule as `mac`: a carrier-less upsert keeps it.
         assert_eq!(h.os, "linux/fedora/bazzite");
-        // And the learned mgmt port. If a reconnect could reset this to None the host would fall
-        // back to 47990 and its library would 404 — the exact regression this rule prevents.
+        // Reconnect must not reset mgmt port to None — the library would 404 on 47990.
         assert_eq!(h.mgmt_port, Some(47991));
         assert!(h.clipboard_sync);
         assert_eq!(h.profile_id.as_deref(), Some("aaaaaaaaaaaa"));
@@ -2021,7 +1656,7 @@ mod tests {
             Some("11111111-2222-4333-8444-555555555555")
         );
 
-        // A carried value does move the binding (that is how the UI rebinds through upsert).
+        // A carried value does move the binding (UI rebind path).
         k.upsert(KnownHost {
             fp_hex: fp.into(),
             profile_id: Some("cccccccccccc".into()),
@@ -2032,14 +1667,11 @@ mod tests {
         assert_eq!(k.hosts[0].pinned_profiles, vec!["dddddddddddd".to_string()]);
     }
 
-    /// The mgmt port a host advertises has to OUTLIVE the advert: a store written before the field
-    /// existed must load, resolve to 47990, and then take and keep a learned value. Without the
-    /// middle rung a host moved off 47990 (to share a box with a Sunshine fork, whose web UI owns
-    /// that port) served its library on the LAN and nowhere else — over a VPN or a routed subnet
-    /// there is no advert to read and the client silently went back to a dead port.
+    /// A store written before `mgmt_port` loads, resolves to 47990, then takes and
+    /// keeps a learned value — the port must outlive the advert.
     #[test]
     fn mgmt_port_survives_a_store_that_predates_it_and_then_persists() {
-        // A store written before the field existed: no `mgmt_port` key at all.
+        // Store written before the field existed: no `mgmt_port` key.
         let old = r#"{"hosts":[{
             "name": "Gaming PC", "addr": "192.168.1.50", "port": 9777,
             "fp_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -2052,17 +1684,16 @@ mod tests {
             crate::library::DEFAULT_MGMT_PORT,
             "unknown resolves to the compiled-in default, i.e. today's behaviour"
         );
-        // Unset stays out of the serialized form, so an untouched store is byte-stable.
+        // Unset stays out of the serialized form so an untouched store is byte-stable.
         assert!(!serde_json::to_string(&k).unwrap().contains("mgmt_port"));
 
-        // Learning one (what a discovery tick does) takes effect and round-trips.
+        // A learned port takes effect and round-trips.
         k.hosts[0].mgmt_port = Some(47991);
         assert_eq!(k.hosts[0].effective_mgmt_port(), 47991);
         let round: KnownHosts = serde_json::from_str(&serde_json::to_string(&k).unwrap()).unwrap();
         assert_eq!(round.hosts[0].mgmt_port, Some(47991));
 
-        // A re-key carries it onto the surviving record — otherwise a host that regenerated its
-        // identity would silently drop back to 47990.
+        // Re-key must carry the port onto the survivor, else it drops back to 47990.
         let fresh = fp('a');
         let mut k2 = k;
         k2.upsert_trusted(KnownHost {
@@ -2077,10 +1708,8 @@ mod tests {
         assert_eq!(kept.mgmt_port, Some(47991), "re-key must not lose the port");
     }
 
-    /// A host that regenerated its identity (reinstall, wiped ProgramData, re-key) ends up with
-    /// ONE record for its address — the live one. This is the `.173` lockout: `upsert` keys on
-    /// the fingerprint, so the re-paired host used to be appended beside the dead record, and
-    /// every later connect pinned the dead one — forever, re-pairing included.
+    /// A re-keyed host ends up with one record for its address — the live pin.
+    /// `upsert` keys on fingerprint, so a second record would leave the dead pin winning.
     #[test]
     fn upsert_trusted_supersedes_a_rekeyed_host() {
         let (dead, live) = (fp('c'), fp('a'));
@@ -2101,7 +1730,7 @@ mod tests {
                 id: Some("11111111-2222-4333-8444-555555555555".into()),
             }],
         };
-        // The re-pair: same box, same address, a certificate the client has never seen.
+        // Same box, same address, a certificate the client has never seen.
         k.upsert_trusted(KnownHost {
             name: "127.0.0.1".into(),
             addr: "127.0.0.1".into(),
@@ -2113,20 +1742,15 @@ mod tests {
         assert_eq!(k.hosts.len(), 1);
         let h = &k.hosts[0];
         assert_eq!(h.fp_hex, live);
-        // …and the address now resolves to the live pin, which is the whole bug.
         assert_eq!(k.find_by_addr("127.0.0.1", 9777).unwrap().fp_hex, live);
         assert!(k.find_by_fp(&dead).is_none());
-        // What describes the BOX rides along, so a reinstall doesn't cost the user their setup.
+        // Box fields ride along; cert decisions (`clipboard_sync`, record id) do not.
         assert_eq!(h.mac, vec!["aa:bb:cc:dd:ee:ff".to_string()]);
         assert_eq!(h.os, "windows");
-        // The mgmt port describes the BOX, not the retired certificate: a reinstall must not send
-        // the library back to 47990 on a host that serves it somewhere else.
         assert_eq!(h.mgmt_port, Some(47991));
         assert_eq!(h.profile_id.as_deref(), Some("aaaaaaaaaaaa"));
         assert_eq!(h.pinned_profiles, vec!["bbbbbbbbbbbb".to_string()]);
         assert_eq!(h.last_used, Some(1000));
-        // What described the dead IDENTITY does not: the clipboard grant is a decision about
-        // one certificate, and the retired record's stable id must not follow a new one.
         assert!(!h.clipboard_sync);
         assert_ne!(
             h.id.as_deref(),
@@ -2134,10 +1758,7 @@ mod tests {
         );
     }
 
-    /// The case fingerprint-keying exists for still works through the trusted path: a host that
-    /// only MOVED keeps its one record, its `paired` bit and everything the user set on it —
-    /// including the clipboard grant and the stable id, which a same-identity re-pair must not
-    /// disturb (that would be the fix trading one silent reset for another).
+    /// A host that only moved address keeps its one record, `paired`, clipboard, and id.
     #[test]
     fn upsert_trusted_keeps_a_host_that_only_moved_address() {
         let same = fp('a');
@@ -2159,7 +1780,7 @@ mod tests {
             addr: "192.168.1.51".into(),
             port: 9777,
             fp_hex: same.clone(),
-            paired: false, // must not demote
+            paired: false,
             ..Default::default()
         });
         assert_eq!(k.hosts.len(), 1);
@@ -2174,10 +1795,7 @@ mod tests {
         );
     }
 
-    /// Superseding is scoped to the address the decision was made for, and only ever runs off
-    /// one: a trust decision for `.51` leaves a different host saved at `.50` alone, and an
-    /// fp-less save (a manual entry, `--add-host` without `--fp`) retires nothing at all — it
-    /// carries no identity to supersede anything WITH.
+    /// Superseding is scoped to the decision's `addr:port`. An fp-less save retires nothing.
     #[test]
     fn upsert_trusted_leaves_other_addresses_and_placeholders_alone() {
         let mut k = KnownHosts {
@@ -2190,7 +1808,7 @@ mod tests {
                     paired: true,
                     ..Default::default()
                 },
-                // Same address, DIFFERENT port: a distinct endpoint, not a duplicate.
+                // Same address, different port: a distinct endpoint, not a duplicate.
                 KnownHost {
                     name: "Second host".into(),
                     addr: "192.168.1.51".into(),
@@ -2219,8 +1837,7 @@ mod tests {
             fp('d')
         );
 
-        // An fp-less save alongside a real record: nothing is retired, and the address still
-        // resolves to the record that HAS a pin.
+        // Fp-less save alongside a real record: nothing retired; address still hits the pin.
         k.upsert_trusted(KnownHost {
             name: "Typed by hand".into(),
             addr: "192.168.1.50".into(),
@@ -2234,11 +1851,8 @@ mod tests {
         );
     }
 
-    /// A store that ALREADY holds the duplicate (every client shipped so far can have written
-    /// one) connects again on the next connect, before any re-pair: an address resolves to the
-    /// newest trust decision for it, not to whichever record happens to sit first in the file.
-    /// Nothing is deleted at load — which record is live isn't knowable there, and guessing
-    /// wrong would throw away the good one; the retirement waits for the next trust decision.
+    /// A duplicated store resolves to the newest trust decision, not the first record.
+    /// Load does not delete; retirement waits for the next trust decision.
     #[test]
     fn a_duplicated_store_resolves_to_the_newest_record() {
         let (dead, live) = (fp('c'), fp('a'));
@@ -2250,7 +1864,7 @@ mod tests {
                     port: 9777,
                     fp_hex: dead.clone(),
                     paired: true,
-                    last_used: Some(9999), // the stale record is the one that HAS connected
+                    last_used: Some(9999),
                     ..Default::default()
                 },
                 KnownHost {
@@ -2264,7 +1878,6 @@ mod tests {
             ],
         };
         assert_eq!(k.find_by_addr("127.0.0.1", 9777).unwrap().fp_hex, live);
-        // Loading is non-destructive: both records are still there to be looked up by pin.
         assert!(k.find_by_fp(&dead).is_some());
         // A placeholder appended later never displaces a real pin.
         k.hosts.push(KnownHost {
@@ -2273,7 +1886,6 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(k.find_by_addr("127.0.0.1", 9777).unwrap().fp_hex, live);
-        // …and the next trust decision cleans the store up.
         k.upsert_trusted(KnownHost {
             name: "127.0.0.1".into(),
             addr: "127.0.0.1".into(),
@@ -2286,8 +1898,7 @@ mod tests {
         assert_eq!(k.hosts[0].fp_hex, live);
     }
 
-    /// An advert's learned MAC/OS lands on the record it identified, not on a stale namesake
-    /// at the same address that merely came first in the file.
+    /// An advert lands on the fingerprint match, not a stale namesake earlier in the file.
     #[test]
     fn learn_target_prefers_the_fingerprint_match() {
         let (dead, live) = (fp('c'), fp('a'));
@@ -2310,17 +1921,16 @@ mod tests {
         learn_target(&mut k, &live, "127.0.0.1", 9777).unwrap().os = "windows".into();
         assert_eq!(k.find_by_fp(&live).unwrap().os, "windows");
         assert_eq!(k.find_by_fp(&dead).unwrap().os, "");
-        // No fingerprint to go on (an advert that carries none) → the address's own answer.
+        // No fingerprint → the address's own answer.
         learn_target(&mut k, "", "127.0.0.1", 9777).unwrap().os = "linux".into();
         assert_eq!(k.find_by_fp(&live).unwrap().os, "linux");
         assert_eq!(k.find_by_fp(&dead).unwrap().os, "");
-        // An advert for a host this store has never seen writes nothing.
+        // Unknown host: write nothing.
         assert!(learn_target(&mut k, &fp('e'), "10.0.0.9", 9777).is_none());
     }
 
-    /// What an advert carries lands on the record; what it omits is left alone; and a repeat of
-    /// the same advert reports no change — which is what lets every surface call this on every
-    /// discovery tick without churning the store.
+    /// An advert writes what it carries, leaves omitted fields, and reports no change
+    /// on a repeat — so every discovery tick can call it.
     #[test]
     fn apply_advert_learns_what_it_carries_and_keeps_what_it_omits() {
         let mut h = KnownHost::default();
@@ -2329,24 +1939,20 @@ mod tests {
         assert_eq!(h.mac, mac);
         assert_eq!(h.os, "linux/arch");
         assert_eq!(h.mgmt_port, Some(47991));
-        // The same advert a tick later: nothing moved, so there is nothing to persist.
         assert!(!apply_advert(&mut h, &mac, "linux/arch", Some(47991)));
-        // An older host advertises none of the three. Clearing a learned MAC here is exactly what
-        // would cost the user their wake, so an absent field must never overwrite a known one.
+        // Absent fields must not overwrite a known MAC — that would cost wake.
         assert!(!apply_advert(&mut h, &[], "", None));
         assert_eq!(h.mac, mac);
         assert_eq!(h.os, "linux/arch");
         assert_eq!(h.mgmt_port, Some(47991));
-        // 0 is how "not advertised" reaches us from a consumer that has no Option — not a port.
+        // 0 is "not advertised" from a caller with no Option — not a port.
         assert!(!apply_advert(&mut h, &[], "", Some(0)));
         assert_eq!(h.mgmt_port, Some(47991));
-        // A host that genuinely moved: the new value wins.
         assert!(apply_advert(&mut h, &[], "", Some(47992)));
         assert_eq!(h.mgmt_port, Some(47992));
     }
 
-    /// Pins render in card order, deduplicated, with deleted profiles simply gone — a pin is
-    /// presentation state, so a dangling one is never an error surface.
+    /// Pins render in card order, deduplicated; dangling ids disappear, never error.
     #[test]
     fn resolved_pins_drop_duplicates_and_dangling_ids() {
         use crate::profiles::{ProfilesFile, StreamProfile};
@@ -2383,10 +1989,8 @@ mod tests {
         assert!(KnownHost::default().resolved_pins(&catalog).is_empty());
     }
 
-    /// The connect-time precedence: a one-off pick beats the host's binding, `""` forces the
-    /// defaults, a dangling binding resolves as none, and a one-off that can't be honored
-    /// falls back to the DEFAULTS rather than to the host's own profile — "connect with Work"
-    /// must never quietly run "Game".
+    /// One-off beats binding; `""` forces defaults; unknown one-off falls back to
+    /// defaults, not the host's profile.
     #[test]
     fn profile_resolution_precedence() {
         use crate::profiles::{ProfilesFile, StreamProfile};
@@ -2412,14 +2016,11 @@ mod tests {
         };
         let name_of = |p: Option<StreamProfile>| p.map(|p| p.name);
 
-        // No binding, no pick: today's behavior.
         assert_eq!(resolve_profile(&catalog, None, None), None);
-        // The binding drives a plain connect…
         assert_eq!(
             name_of(resolve_profile(&catalog, Some("aaaaaaaaaaaa"), None)),
             Some("Game".into())
         );
-        // …a one-off overrides it, by id or by unique name…
         assert_eq!(
             name_of(resolve_profile(
                 &catalog,
@@ -2432,14 +2033,11 @@ mod tests {
             name_of(resolve_profile(&catalog, None, Some("GAME"))),
             Some("Game".into())
         );
-        // …and `""` forces the defaults on a bound host.
         assert_eq!(
             resolve_profile(&catalog, Some("aaaaaaaaaaaa"), Some("")),
             None
         );
-        // A deleted binding is not an error, it is "no profile".
         assert_eq!(resolve_profile(&catalog, Some("deleted00000"), None), None);
-        // Unknown and ambiguous one-offs fall back to the defaults, NOT to the binding.
         assert_eq!(
             resolve_profile(&catalog, Some("aaaaaaaaaaaa"), Some("nope")),
             None
@@ -2448,12 +2046,11 @@ mod tests {
             resolve_profile(&catalog, Some("aaaaaaaaaaaa"), Some("work")),
             None
         );
-        // A binding resolves by id only — a profile NAMED like the bound id doesn't hijack it.
+        // Binding is by id only — a profile named like the bound id must not hijack it.
         assert_eq!(resolve_profile(&catalog, Some("Game"), None), None);
     }
 
-    /// The atomic write replaces the target in one step and leaves no temp behind — the
-    /// discipline all three client stores now share.
+    /// Atomic write replaces the target in one step and leaves no temp behind.
     #[test]
     fn write_atomic_replaces_and_cleans_up() {
         let _guard = store_health_lock();
@@ -2471,7 +2068,7 @@ mod tests {
         write_atomic(&p, b"{\"a\":2}").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"a\":2}");
         assert!(!temp_sibling(&p).exists());
-        // Nothing else in the directory either — the scratch file is gone, not renamed aside.
+        // Scratch file is gone, not renamed aside.
         let left: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.file_name()))
@@ -2480,16 +2077,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `store_health` is process-global, so the two tests that read it must not run at the same
-    /// time — one's successful write clears the other's recorded failure. Nothing else in the
-    /// crate's tests reaches `write_atomic`, so this lock is the whole serialization needed.
+    /// `store_health` is process-global: one test's successful write would clear
+    /// another's recorded failure. Nothing else in this crate's tests hits `write_atomic`.
     fn store_health_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Two processes saving at once must not share one scratch file — the pid keeps them apart.
-    /// (Same-process, so this only proves the name varies with the pid, not the interleaving.)
+    /// Two writers must not share one scratch file. Same-process: proves the name
+    /// varies with pid, not the interleaving.
     #[test]
     fn temp_sibling_is_per_process_and_a_sibling() {
         let p = Path::new("/tmp/pf/client-windows-settings.json");
@@ -2499,15 +2095,12 @@ mod tests {
             t.file_name().unwrap().to_str().unwrap(),
             format!("client-windows-settings.json.tmp-{}", std::process::id())
         );
-        // Must not collide with the store itself, nor look like one to `load()`.
+        // Must not collide with the store, nor look like one to `load()`.
         assert_ne!(t, p.to_path_buf());
     }
 
-    /// **The fix itself.** When the temp+rename route is unavailable, the bytes must still
-    /// reach the target — that is the difference between the field's "read-only mode" and a
-    /// working client. Simulated by parking a DIRECTORY on the (deterministic) temp sibling
-    /// path so the temp leg cannot be written; the field's install fails one step later, at
-    /// the rename, but both funnel into the same fallback, which is what this pins.
+    /// When temp+rename is unavailable, bytes must still reach the target. Simulated
+    /// by parking a directory on the temp sibling so the atomic leg cannot complete.
     #[test]
     fn the_atomic_route_failing_falls_back_to_an_in_place_write() {
         let _guard = store_health_lock();
@@ -2523,22 +2116,18 @@ mod tests {
         let p = dir.join("store.json");
         std::fs::write(&p, b"{\"old\":true}").unwrap();
 
-        // Block the scratch path, so the atomic route cannot complete.
         std::fs::create_dir_all(temp_sibling(&p)).unwrap();
         assert!(temp_sibling(&p).is_dir());
 
-        // The write must still report success AND actually be readable back — a silent
-        // `Ok(())` that lost the bytes is the bug, not the fix.
+        // Success must be readable back — `Ok(())` that lost the bytes is the failure mode.
         write_atomic(&p, b"{\"new\":true}").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{\"new\":true}");
-        // Degraded, but not broken: nothing to warn the user about.
         assert_eq!(store_health::last_error(), None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The other end: when the in-place fallback ALSO fails, the error must surface rather
-    /// than be swallowed, because at that point nothing the user does on the page will stick.
+    /// When the in-place fallback also fails, the error must surface, not be swallowed.
     #[test]
     fn a_failed_rename_still_persists_the_write() {
         let _guard = store_health_lock();
@@ -2552,13 +2141,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Sanity: the healthy path reports a healthy store.
         let ok = dir.join("store.json");
         write_atomic(&ok, b"{}").unwrap();
         assert_eq!(store_health::last_error(), None);
 
-        // Now the unwritable case: a directory in the target's place defeats BOTH the rename
-        // and the in-place write, so the error must surface instead of being swallowed.
+        // Directory in the target's place defeats both rename and in-place write.
         let blocked = dir.join("blocked.json");
         std::fs::create_dir_all(&blocked).unwrap();
         std::fs::write(blocked.join("occupant"), b"x").unwrap();
@@ -2568,10 +2155,9 @@ mod tests {
             reported.contains("blocked.json"),
             "the report names the store: {reported}"
         );
-        // No scratch file left behind by the failed attempt.
         assert!(!temp_sibling(&blocked).exists());
 
-        // And a later success clears it, so the UI stops warning once the store recovers.
+        // A later success clears the latch.
         write_atomic(&ok, b"{\"a\":2}").unwrap();
         assert_eq!(store_health::last_error(), None);
         assert_eq!(std::fs::read_to_string(&ok).unwrap(), "{\"a\":2}");

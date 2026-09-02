@@ -1,9 +1,9 @@
-//! "Pin “Work”" — choose which saved hosts show a profile as an extra connect card
-//! (design/client-settings-profiles.md §5.2a), reached from the settings screen's
-//! Profiles section. One toggle row per saved host; a toggle rides
-//! [`ConsoleCmd::SetPin`] to the binary, which persists `KnownHost::pinned_profiles`
-//! and refreshes the rows — the row's shown state follows the model, so what the list
-//! says is always what the store holds (and what Decky's host list will render).
+//! Pin a profile onto saved hosts as extra connect cards
+//! (`KnownHost::pinned_profiles`). Reached from the settings Profiles section.
+//!
+//! A toggle emits [`ConsoleCmd::SetPin`]; pinned/off is read back from the
+//! host rows, never stored here. Binding is the sibling (`bind_profile.rs`):
+//! that changes what the primary tile does; this adds a card.
 
 use crate::glyphs::{Hint, HintKey};
 use crate::model::ConsoleCmd;
@@ -20,8 +20,7 @@ pub(crate) struct PinHostsScreen {
     list: MenuList,
 }
 
-/// The toggle rows' domain: every SAVED host, primary tiles only (a pinned card is the
-/// OUTPUT of this screen, not a row in it), in the model's carousel order.
+/// Saved hosts, primary tiles only: a pinned card is this screen's output, not a row.
 fn host_indices(ctx: &Ctx) -> Vec<usize> {
     ctx.hosts
         .iter()
@@ -44,9 +43,8 @@ impl PinHostsScreen {
         &self.profile_name
     }
 
-    /// Is this profile currently pinned on the host at `ctx.hosts[host_idx]`? Read from
-    /// the model — the pinned card's row IS the state, so the toggle can never disagree
-    /// with what the carousel shows.
+    /// Read from the model — the pinned card's row is the state, so the toggle cannot
+    /// disagree with the carousel.
     fn pinned(&self, ctx: &Ctx, host_idx: usize) -> bool {
         let host = &ctx.hosts[host_idx];
         ctx.hosts.iter().any(|r| {
@@ -81,7 +79,7 @@ impl PinHostsScreen {
         true
     }
 
-    /// One list message against the focused host's pin — shared by both input paths.
+    /// Shared by pad and pointer. Left unpins, right pins, A flips; already-in-state is a thud.
     fn toggle(
         &mut self,
         msg: ListMsg,
@@ -93,8 +91,6 @@ impl PinHostsScreen {
         let Some(&host_idx) = indices.get(self.list.cursor) else {
             return pulse;
         };
-        // Toggle semantics shared with the settings rows: left = unpin, right = pin,
-        // A flips; asking for the state it's already in is a boundary thud.
         let target = match msg {
             ListMsg::Adjust(delta) => delta > 0,
             ListMsg::Activate => !self.pinned(ctx, host_idx),
@@ -145,7 +141,7 @@ impl PinHostsScreen {
             );
             return;
         }
-        // The explainer band under the list, like the settings screen's detail text.
+        // Detail band under the list; 34 matches the settings screen.
         let detail_h = 34.0 * k;
         let list_rect = Rect::from_ltrb(
             rect.left,
@@ -250,7 +246,7 @@ mod tests {
             }]
         );
 
-        // Left on an unpinned host = already off = boundary, no command.
+        // Left on an unpinned host is already off: boundary, no command.
         let mut fx = Outbox::default();
         let pulse = s.menu(
             MenuEvent::Move(pf_client_core::menu_nav::MenuDir::Left),
@@ -266,7 +262,7 @@ mod tests {
         let mut settings = Settings::default();
         let pads = Vec::new();
         let library = crate::library::LibraryShared::default();
-        // Host "aa" already carries a pinned card for p1; its primary row toggles OFF.
+        // Primary "aa" plus a pinned-card row for p1: Confirm on the primary unpins.
         let hosts = [host("aa", true, None), host("aa\0p1", true, Some("p1"))];
         let mut ctx = Ctx {
             hosts: &hosts,
@@ -281,7 +277,6 @@ mod tests {
             t: 0.0,
         };
         let mut s = PinHostsScreen::new("p1".into(), "Work".into());
-        // Only the primary row is a toggle row.
         assert_eq!(host_indices(&ctx).len(), 1);
         let mut fx = Outbox::default();
         s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);

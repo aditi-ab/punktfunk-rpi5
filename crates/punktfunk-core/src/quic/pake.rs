@@ -1,18 +1,24 @@
-//! SPAKE2 password-authenticated key exchange for pairing: derive a shared key from the PIN and
-//! confirm it against both certificate fingerprints.
+//! SPAKE2 for pairing: shared key from the PIN, confirmed against both certificate
+//! fingerprints.
+//!
+//! Identities are the two fingerprints, so the derived key matches only when both
+//! sides share the PIN *and* the same two certs. A wrong PIN does not fail
+//! [`PairingPake::finish`] — it yields a different key, and the confirmation MACs
+//! simply disagree. Tests at the foot pin matching PIN+certs, a wrong PIN, and a
+//! MITM with split host certs.
 use crate::error::{PunktfunkError, Result};
 use hmac::{Hmac, KeyInit, Mac};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 
-/// In-progress SPAKE2 state plus the identity transcript for key confirmation.
+/// In-progress SPAKE2 plus the fingerprint transcript for key confirmation.
 pub struct PairingPake {
     state: Spake2<Ed25519Group>,
     transcript: Vec<u8>,
 }
 
-/// Start the exchange. `client_fp`/`host_fp` are the two certificate fingerprints (the
-/// client passes what it observed via TOFU; the host passes its own + the client's
-/// presented cert). Returns the state and this side's outbound SPAKE2 message.
+/// Start the exchange. `is_client` selects SPAKE2 role A vs B (identities are
+/// ordered). Fingerprints are the identities (client: observed TOFU; host: own
+/// + client's presented cert).
 pub fn start(
     is_client: bool,
     pin: &str,
@@ -33,10 +39,9 @@ pub fn start(
     (PairingPake { state, transcript }, msg)
 }
 
-/// Key confirmation MAC for one direction (`label` distinguishes host vs client), keyed
-/// by the SPAKE2 shared key and bound to the fingerprint transcript.
+/// One-direction key-confirmation MAC (`label` is host vs client), keyed by the
+/// SPAKE2 shared key and bound to the fingerprint transcript.
 fn confirm(key: &[u8], label: &[u8], transcript: &[u8]) -> [u8; 32] {
-    // `new_from_slice` moved from `Mac` to `KeyInit` in the digest 0.11 / crypto-common 0.2 wave.
     let mut mac =
         <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key).expect("hmac takes any key length");
     mac.update(label);
@@ -44,8 +49,7 @@ fn confirm(key: &[u8], label: &[u8], transcript: &[u8]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-/// `Hmac` verification is constant-time via `ct_eq` in the underlying crate; we compare
-/// our recomputed tag the same way.
+/// Constant-time 32-byte compare. Do not replace with `==`.
 fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     a.iter()
         .zip(b.iter())
@@ -53,7 +57,6 @@ fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
         == 0
 }
 
-/// Confirmation tags both sides expect, given the agreed SPAKE2 key.
 pub struct Confirmations {
     /// MAC the host sends (client verifies).
     pub host: [u8; 32],
@@ -62,9 +65,9 @@ pub struct Confirmations {
 }
 
 impl PairingPake {
-    /// Finish SPAKE2 with the peer's message → the pair of confirmation tags. `Err` if
-    /// the peer's message is malformed (a wrong PIN does NOT error here — it yields a
-    /// *different* key, so the confirmation MACs simply won't match).
+    /// Finish SPAKE2 with the peer's message → both confirmation tags. `Err` only
+    /// if the peer message is malformed. A wrong PIN yields a *different* key;
+    /// the MACs simply will not match.
     pub fn finish(self, peer_msg: &[u8]) -> Result<Confirmations> {
         let key = self
             .state
@@ -77,7 +80,7 @@ impl PairingPake {
     }
 }
 
-/// Constant-time tag comparison for the confirmation step.
+/// Constant-time confirmation-tag compare.
 pub fn verify(expected: &[u8; 32], got: &[u8; 32]) -> bool {
     ct_eq(expected, got)
 }
@@ -91,21 +94,19 @@ mod tests {
         let cfp = [0x11u8; 32];
         let hfp = [0x22u8; 32];
 
-        // Right PIN, same fingerprint views on both sides → both confirmations agree.
         let (ca, ma) = pake::start(true, "4321", &cfp, &hfp);
         let (cb, mb) = pake::start(false, "4321", &cfp, &hfp);
         let a = ca.finish(&mb).unwrap();
         let b = cb.finish(&ma).unwrap();
         assert!(pake::verify(&a.host, &b.host) && pake::verify(&a.client, &b.client));
 
-        // Wrong PIN → different keys → confirmations DON'T match (one online guess wasted).
         let (ca, ma) = pake::start(true, "0000", &cfp, &hfp);
         let (cb, mb) = pake::start(false, "4321", &cfp, &hfp);
         let a = ca.finish(&mb).unwrap();
         let b = cb.finish(&ma).unwrap();
         assert!(!pake::verify(&a.client, &b.client));
 
-        // MITM: the two legs saw different host certs → no agreement even with the right PIN.
+        // Split host certs: right PIN still must not agree.
         let attacker_hfp = [0x33u8; 32];
         let (ca, ma) = pake::start(true, "4321", &cfp, &attacker_hfp);
         let (cb, mb) = pake::start(false, "4321", &cfp, &hfp);

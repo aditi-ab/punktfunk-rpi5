@@ -1,16 +1,15 @@
-//! The terminal seam: keys in, frames out, nothing else.
+//! Terminal seam: keys in, frames out.
 //!
-//! S1's verdict (2026-08-31) sent the whole TUI here rather than to cliclack. Its `Select`
-//! cannot mark an item unselectable, so the §2 screen's rules and action row are not
-//! expressible; it renders every prompt to stderr, which would split the transcript the
-//! command echo depends on; and its prompt loop is private and refuses a non-tty, so nothing
-//! it draws could be tested in-process. The settings list was a custom widget either way.
+//! The TUI draws here, not through cliclack: `Select` cannot mark an item
+//! unselectable, prompts go to stderr (which would split the command-echo
+//! transcript), and the prompt loop is private and refuses a non-tty so
+//! nothing it draws can be tested in-process.
 //!
-//! Keys are read from `/dev/tty`, not stdin — under `curl | sh` stdin is the script itself,
-//! which is the same trap the sh installer opens `/dev/tty` to dodge.
+//! Keys come from `/dev/tty`, not stdin. Under `curl | sh` stdin is the
+//! script — the same trap the sh installer opens `/dev/tty` to dodge.
 //!
-//! `ScriptedTerm` is what makes the rendering testable: it answers a queued key list and
-//! keeps the frame the user would be looking at, so a golden can assert on it.
+//! `ScriptedTerm` answers a queued key list and keeps the on-screen frame
+//! so goldens can assert on it.
 
 use std::collections::VecDeque;
 #[cfg(unix)]
@@ -35,8 +34,7 @@ pub enum Key {
 pub trait Terminal {
     fn write(&mut self, text: &str);
     fn read_key(&mut self) -> Key;
-    /// Rewind `n` rendered lines so the next frame overwrites them. No alternate screen —
-    /// the transcript scrolls, and scrollback stays the audit log.
+    /// No alternate screen: the transcript scrolls and scrollback is the audit log.
     fn clear_last_lines(&mut self, n: usize);
     fn width(&self) -> u16;
     fn hide_cursor(&mut self) {}
@@ -48,8 +46,8 @@ pub struct ConsoleTerm {
 }
 
 impl ConsoleTerm {
-    /// `None` when there is no controlling terminal — in a container or under a service
-    /// `/dev/tty` exists but opens ENXIO, so testing `-r`/`-w` would lie.
+    /// `None` with no controlling terminal. In a container or under a service
+    /// `/dev/tty` exists but opens ENXIO, so probing `-r`/`-w` is not enough.
     #[cfg(unix)]
     pub fn open() -> Option<ConsoleTerm> {
         let read = File::options()
@@ -62,8 +60,8 @@ impl ConsoleTerm {
         term.is_term().then_some(ConsoleTerm { term })
     }
 
-    /// Windows has no `/dev/tty` and no `curl | sh` stdin to route around — the process
-    /// console is the terminal. The WinUI wizard is the real face; this is the silent path.
+    /// Windows has no `/dev/tty` and no `curl | sh` stdin to route around; the
+    /// process console is the terminal.
     #[cfg(not(unix))]
     pub fn open() -> Option<ConsoleTerm> {
         let term = Term::stdout();
@@ -109,12 +107,11 @@ impl Terminal for ConsoleTerm {
     }
 }
 
-/// A terminal that answers from a script and draws into a string.
 pub struct ScriptedTerm {
     pub keys: VecDeque<Key>,
     pub out: String,
     pub width: u16,
-    /// Every frame written, in order — for asserting on what the user saw, not just the last.
+    /// Every frame in order, so a golden can assert on more than the last.
     pub frames: Vec<String>,
 }
 
@@ -128,7 +125,6 @@ impl ScriptedTerm {
         }
     }
 
-    /// What the user would be looking at once the run ends.
     pub fn screen(&self) -> &str {
         &self.out
     }

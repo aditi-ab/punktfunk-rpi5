@@ -1,20 +1,13 @@
-//! Windows 11 fit-and-finish for the tray's Win32 UI.
+//! Dark mode, DPI-scaled glyphs, and themed popup menus for the Windows tray.
 //!
-//! Three gaps make a stock Win32 tray read as "Windows 10 app" on Windows 11, and this module
-//! closes them without pulling a UI framework into a ~2 MB always-resident helper (there is no
-//! WinUI/App-SDK tray API — even fully modern apps register the icon via `Shell_NotifyIconW`;
-//! only the popup differs):
+//! Win32 popup menus have no documented dark-mode opt-in. This module calls the
+//! undocumented uxtheme ordinals `SetPreferredAppMode` (135) and `FlushMenuThemes`
+//! (136), stable since Windows 10 1809. A missing ordinal leaves the classic light menu.
 //!
-//! * **Dark mode.** Popup menus never got a documented dark-mode opt-in; every app that ships
-//!   one (Explorer, PowerToys, Notepad++) calls the same undocumented uxtheme ordinals —
-//!   `SetPreferredAppMode` (135) and `FlushMenuThemes` (136), stable since Windows 10 1809.
-//!   Every call here degrades to the classic light menu when an ordinal is missing.
-//! * **Glyphs.** Menu items get "Segoe Fluent Icons" glyphs ("Segoe MDL2 Assets" on Windows 10 —
-//!   the codepoints are shared), rendered into premultiplied ARGB bitmaps that the themed menu
-//!   composites correctly in both light and dark. Rounded corners come free — Windows 11 rounds
-//!   every popup menu.
-//! * **DPI.** Sizing helpers for the PerMonitorV2 manifest build.rs embeds — an unmanifested exe
-//!   is DPI-virtualized and its menu GDI-stretched (visibly blurry on any scaled display).
+//! Glyphs come from Segoe Fluent Icons (Segoe MDL2 Assets on Windows 10; same
+//! codepoints), drawn into premultiplied ARGB bitmaps so the themed menu composites
+//! in both light and dark. Sizing helpers assume the PerMonitorV2 manifest
+//! `build.rs` embeds — without it, Windows virtualizes DPI and GDI-stretches the menu.
 
 use std::sync::OnceLock;
 
@@ -35,19 +28,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetMenuItemInfoW, HMENU, MENUITEMINFOW, MIIM_BITMAP,
 };
 
-// Glyph codepoints, identical in Segoe Fluent Icons and Segoe MDL2 Assets.
-pub const GLYPH_GLOBE: u16 = 0xE774; // Globe — open web console
-pub const GLYPH_APPROVE: u16 = 0xE73E; // CheckMark — approve pairing
-pub const GLYPH_DISPLAY: u16 = 0xE7F4; // TVMonitor — kept displays
-pub const GLYPH_SHIELD: u16 = 0xE7EF; // Admin — marks the UAC-elevated service actions
-pub const GLYPH_FOLDER: u16 = 0xE8B7; // Folder — open logs
-pub const GLYPH_POWER: u16 = 0xE7E8; // PowerButton — exit tray
+// Same codepoints in Segoe Fluent Icons and Segoe MDL2 Assets.
+pub const GLYPH_GLOBE: u16 = 0xE774;
+pub const GLYPH_APPROVE: u16 = 0xE73E;
+pub const GLYPH_DISPLAY: u16 = 0xE7F4;
+pub const GLYPH_SHIELD: u16 = 0xE7EF;
+pub const GLYPH_FOLDER: u16 = 0xE8B7;
+pub const GLYPH_POWER: u16 = 0xE7E8;
 
 type FnSetPreferredAppMode = unsafe extern "system" fn(mode: i32) -> i32;
 type FnVoid = unsafe extern "system" fn();
 
-/// The undocumented uxtheme dark-mode entry points, resolved once by ordinal. Any of them may be
-/// absent (pre-1809, or a future Windows that removes them) — each caller checks.
+/// Undocumented uxtheme ordinals. Any may be absent (pre-1809); each caller checks.
 struct UxTheme {
     set_preferred_app_mode: Option<FnSetPreferredAppMode>,
     refresh_immersive_colors: Option<FnVoid>,
@@ -63,10 +55,9 @@ fn uxtheme() -> &'static UxTheme {
             refresh_immersive_colors: None,
             flush_menu_themes: None,
         };
-        // SAFETY: system32-only load of a Windows-supplied DLL, then ordinal lookups that return
-        // None when absent. The transmutes assert the known signatures of ordinals 135/104/136
-        // (unchanged since 1809; on 1809 ordinal 135 is `AllowDarkModeForApp(bool)`, for which
-        // the later `SetPreferredAppMode(1)` call means the same "allow dark").
+        // SAFETY: system32-only load of a Windows-supplied DLL; ordinals 135/104/136
+        // return None when absent. Transmutes match those signatures. On 1809, 135 is
+        // AllowDarkModeForApp(bool); SetPreferredAppMode(1) is the same "allow dark".
         unsafe {
             let Ok(lib) = LoadLibraryExW(w!("uxtheme.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32)
             else {
@@ -82,8 +73,7 @@ fn uxtheme() -> &'static UxTheme {
     })
 }
 
-/// Opt this process's menus into the system app theme ("allow dark", not "force dark" — the user
-/// setting decides). Call once before the first menu.
+/// Allow (do not force) dark menus. Call once before the first menu.
 pub fn init_dark_mode() {
     let ux = uxtheme();
     if let Some(set) = ux.set_preferred_app_mode {
@@ -96,8 +86,7 @@ pub fn init_dark_mode() {
     }
 }
 
-/// The system theme flipped while we're running — re-read the immersive colors and drop the
-/// cached menu theme so the next popup renders in the new mode.
+/// Flush the cached menu theme so the next popup follows the new system colors.
 pub fn on_color_scheme_changed() {
     let ux = uxtheme();
     if let Some(refresh) = ux.refresh_immersive_colors {
@@ -110,7 +99,7 @@ pub fn on_color_scheme_changed() {
     }
 }
 
-/// Is this WM_SETTINGCHANGE the "ImmersiveColorSet" broadcast (light/dark toggled)?
+/// `lparam` is the ImmersiveColorSet WM_SETTINGCHANGE broadcast.
 pub fn is_color_scheme_change(lparam: LPARAM) -> bool {
     const NAME: &[u16] = &[
         b'I' as u16,
@@ -147,8 +136,7 @@ pub fn is_color_scheme_change(lparam: LPARAM) -> bool {
     }
 }
 
-/// Apps dark theme active? (`AppsUseLightTheme` = 0). Menus under "allow dark" follow this same
-/// value, so glyph colors chosen from it always match the menu background.
+/// `AppsUseLightTheme` = 0. Glyph colors follow this so they match the menu.
 pub fn apps_use_dark() -> bool {
     let mut data: u32 = 1;
     let mut size = std::mem::size_of::<u32>() as u32;
@@ -168,17 +156,15 @@ pub fn apps_use_dark() -> bool {
     r.is_ok() && data == 0
 }
 
-/// The window's monitor DPI (96 fallback for an invalid handle).
 pub fn window_dpi(hwnd: HWND) -> u32 {
     // SAFETY: valid on any window handle; returns 0 only for an invalid one.
     match unsafe { GetDpiForWindow(hwnd) } {
-        0 => 96,
+        0 => 96, // Windows default DPI
         d => d,
     }
 }
 
-/// Per-popup glyph bitmaps: rendered at the menu's DPI in the current theme's text color,
-/// attached via `hbmpItem`, and deleted on drop — `DestroyMenu` does not free item bitmaps.
+/// Per-popup `hbmpItem` bitmaps. `DestroyMenu` does not free them; Drop does.
 pub struct MenuGlyphs {
     size: i32,
     color: u32, // 0x00RRGGBB
@@ -191,7 +177,7 @@ impl MenuGlyphs {
         let dpi = window_dpi(hwnd) as i32;
         MenuGlyphs {
             size: (16 * dpi + 48) / 96,
-            // Match the themed menu's text: near-white on dark, near-black on light.
+            // Themed menu text: near-white on dark, near-black on light.
             color: if apps_use_dark() {
                 0x00EBEBEB
             } else {
@@ -202,8 +188,7 @@ impl MenuGlyphs {
         }
     }
 
-    /// Render `glyph` and attach it to menu item `id`. Silently a no-op when the icon font is
-    /// missing or GDI fails — the menu is fully usable without bitmaps.
+    /// No-op if the icon font is missing or GDI fails. The menu is usable without bitmaps.
     pub fn set(&mut self, menu: HMENU, id: usize, glyph: u16) {
         let Some(face) = self.face else { return };
         let Some(bmp) = glyph_bitmap(face, glyph, self.size, self.color) else {
@@ -239,15 +224,13 @@ impl Drop for MenuGlyphs {
     }
 }
 
-/// The installed system icon font: Fluent (Windows 11) → MDL2 (Windows 10) → None (skip glyphs).
 fn resolve_icon_font() -> Option<PCWSTR> {
     [w!("Segoe Fluent Icons"), w!("Segoe MDL2 Assets")]
         .into_iter()
         .find(|f| font_exists(*f))
 }
 
-/// GDI never fails font creation — it substitutes. Detect a missing face by asking the DC what
-/// it actually selected.
+/// GDI never fails font creation — it substitutes. Compare the selected face.
 fn font_exists(face: PCWSTR) -> bool {
     // SAFETY: local DC/font pair created and freed here; GetTextFaceW writes a bounded,
     // nul-terminated name into buf.
@@ -274,8 +257,7 @@ fn create_font(face: PCWSTR, height: i32) -> HFONT {
         lfHeight: -height, // negative = character height; MDL2/Fluent glyphs fill the em square
         lfWeight: 400,
         lfCharSet: DEFAULT_CHARSET,
-        // Grayscale AA, not ClearType — the alpha pass below reads coverage from one channel and
-        // subpixel rendering would leave color fringes.
+        // Grayscale AA, not ClearType: the alpha pass reads one channel; subpixel leaves fringes.
         lfQuality: ANTIALIASED_QUALITY,
         ..Default::default()
     };
@@ -288,12 +270,11 @@ fn create_font(face: PCWSTR, height: i32) -> HFONT {
     }
 }
 
-/// Render one glyph, white-on-black, into a 32-bit top-down DIB, then convert coverage to a
-/// premultiplied-alpha bitmap in `color` — the format themed menus composite without artifacts.
+/// White-on-black coverage → premultiplied ARGB in `color`. Themed menus need this format.
 fn glyph_bitmap(face: PCWSTR, glyph: u16, size: i32, color: u32) -> Option<HBITMAP> {
-    // SAFETY: standard GDI render-to-memory-DIB. Every handle created here is released here (the
-    // returned bitmap by MenuGlyphs::drop), GdiFlush completes pending GDI writes before the bits
-    // are read, and the pixel loop stays inside the size*size allocation CreateDIBSection made.
+    // SAFETY: every handle created here is released here (the returned bitmap by
+    // MenuGlyphs::drop). GdiFlush completes pending writes before the bits are read.
+    // The pixel loop stays inside the size*size allocation CreateDIBSection made.
     unsafe {
         let dc = CreateCompatibleDC(None);
         if dc.is_invalid() {

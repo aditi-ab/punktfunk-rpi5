@@ -1,11 +1,10 @@
-//! Session configuration and protocol/FEC parameters.
+//! Session configuration: role, protocol phase, FEC, shard/MTU knobs, and `Config`.
 
 use crate::crypto::SessionKey;
 use crate::error::{PunktfunkError, Result};
 use crate::packet::{CRYPTO_OVERHEAD, HEADER_LEN, MAX_DATAGRAM_BYTES};
 use zeroize::Zeroize;
 
-/// Which side of the stream this session drives.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -13,8 +12,8 @@ pub enum Role {
     Client = 1,
 }
 
-/// Negotiated protocol generation. P1 is GameStream-compatible (GF(2⁸)); P2 is the
-/// `punktfunk/1` extension (GF(2¹⁶), multi-block framing, optional QUIC control).
+/// Negotiated generation. P1 is GameStream-compatible GF(2⁸); P2 is `punktfunk/1`
+/// (GF(2¹⁶), multi-block framing, optional QUIC control).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolPhase {
@@ -22,13 +21,13 @@ pub enum ProtocolPhase {
     P2Punktfunk = 2,
 }
 
-/// Erasure-coding field. Mirrors the on-wire `fec_scheme` tag.
+/// On-wire `fec_scheme` tag.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FecScheme {
-    /// GF(2⁸) classic RS — Moonlight/GameStream compatible, ≤ 255 shards/block.
+    /// Classic RS, GameStream-compatible; 255 shards/block.
     Gf8 = 0,
-    /// GF(2¹⁶) Leopard-RS — SIMD, O(n log n), up to 65535 shards/block.
+    /// Leopard-RS; 65535 shards/block.
     Gf16 = 1,
 }
 
@@ -41,7 +40,6 @@ impl FecScheme {
         }
     }
 
-    /// Hard per-block total-shard ceiling for the field (data + recovery).
     pub fn max_total_shards(self) -> usize {
         match self {
             FecScheme::Gf8 => 255,
@@ -50,7 +48,7 @@ impl FecScheme {
     }
 }
 
-/// A client-sized display mode the host should produce on the virtual output.
+/// Size the host should produce on the virtual output.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mode {
@@ -59,31 +57,21 @@ pub struct Mode {
     pub refresh_hz: u32,
 }
 
-/// Which compositor backend a client would like the host to drive for its virtual output.
-///
-/// Sent in [`Hello`](crate::quic::Hello) as a *preference* and echoed back — resolved to the
-/// backend actually chosen — in [`Welcome`](crate::quic::Welcome). `Auto` (the default) lets the
-/// host decide (auto-detect from the running desktop). A concrete preference is honored only if
-/// that backend is available on the host right now; otherwise the host falls back to auto-detect
-/// and reports the real choice in `Welcome`. The wire form is a single byte (`0 = Auto`,
-/// `1..=4` concrete), appended to `Hello`/`Welcome` — older peers simply omit/ignore it.
+/// Client compositor preference on [`Hello`](crate::quic::Hello); [`Welcome`](crate::quic::Welcome)
+/// echoes the backend actually chosen. A concrete value is used only if that backend is
+/// available now; otherwise the host auto-detects. Older peers omit the byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CompositorPref {
-    /// Let the host pick (auto-detect from the running desktop / its configured default).
     #[default]
     Auto,
-    /// KWin / KDE Plasma.
     Kwin,
-    /// wlroots (Sway / Hyprland).
     Wlroots,
-    /// Mutter / GNOME.
     Mutter,
-    /// gamescope (spawned nested — available wherever the binary is installed).
+    /// Nested process; available wherever the binary is installed.
     Gamescope,
 }
 
 impl CompositorPref {
-    /// Wire byte. `0 = Auto`, `1 = Kwin`, `2 = Wlroots`, `3 = Mutter`, `4 = Gamescope`.
     pub fn to_u8(self) -> u8 {
         match self {
             CompositorPref::Auto => 0,
@@ -94,8 +82,7 @@ impl CompositorPref {
         }
     }
 
-    /// Inverse of [`to_u8`](Self::to_u8). An unknown byte decodes to `Auto` — forward-compatible:
-    /// a future concrete value a peer doesn't recognize degrades to "let the host decide".
+    /// Unknown bytes decode to `Auto` so a future concrete value still lets the host decide.
     pub fn from_u8(v: u8) -> Self {
         match v {
             1 => CompositorPref::Kwin,
@@ -106,8 +93,7 @@ impl CompositorPref {
         }
     }
 
-    /// Parse a CLI/config name (case-insensitive, with the usual desktop aliases). `None` for an
-    /// unrecognized name, so callers can error rather than silently defaulting to `Auto`.
+    /// CLI/config name. `None` on unknown so callers can error instead of silently becoming `Auto`.
     pub fn from_name(s: &str) -> Option<Self> {
         Some(match s.trim().to_ascii_lowercase().as_str() {
             "auto" | "detect" | "default" => CompositorPref::Auto,
@@ -119,7 +105,6 @@ impl CompositorPref {
         })
     }
 
-    /// Canonical lowercase identifier (`"auto"`, `"kwin"`, `"wlroots"`, `"mutter"`, `"gamescope"`).
     pub fn as_str(self) -> &'static str {
         match self {
             CompositorPref::Auto => "auto",
@@ -131,103 +116,64 @@ impl CompositorPref {
     }
 }
 
-/// Which virtual gamepad the host should create for a client's pads.
-///
-/// Sent in [`Hello`](crate::quic::Hello) as a *preference* and echoed back — resolved to the
-/// backend actually chosen — in [`Welcome`](crate::quic::Welcome). `Auto` (the default) lets the
-/// host decide (its `PUNKTFUNK_GAMEPAD` env var, else X-Box 360). A concrete preference is
-/// honored only if that backend is available on the host (DualSense / DualShock 4 need Linux UHID);
-/// otherwise the host falls back and reports the real choice in `Welcome`. The wire form is a single
-/// byte (`0 = Auto`, `1 = Xbox360`, `2 = DualSense`, `3 = XboxOne`, `4 = DualShock4`,
-/// `5 = SteamController`, `6 = SteamDeck`, `7 = DualSenseEdge`, `8 = SwitchPro`,
-/// `9 = SteamController2`, `10 = SteamController2Puck`, `11 = XboxElite`), appended to
-/// `Hello`/`Welcome` — older peers simply omit/ignore it (an unknown byte degrades to `Auto`).
+/// Client gamepad preference on [`Hello`](crate::quic::Hello); [`Welcome`](crate::quic::Welcome)
+/// echoes the backend actually chosen. `Auto` uses `PUNKTFUNK_GAMEPAD` else Xbox 360. UHID
+/// backends (DualSense family, Switch Pro, Steam pads) fold if the host cannot build them.
+/// Older peers omit the byte; unknown bytes decode to `Auto`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum GamepadPref {
-    /// Let the host pick (its `PUNKTFUNK_GAMEPAD` env var, else X-Box 360).
+    /// `PUNKTFUNK_GAMEPAD`, else Xbox 360.
     #[default]
     Auto,
-    /// uinput X-Box 360 pad (the universal default — every game speaks XInput).
+    /// Universal default: every game speaks XInput.
     Xbox360,
-    /// UHID DualSense (kernel `hid-playstation`) — adaptive triggers, lightbar, touchpad, motion.
+    /// Linux UHID DualSense (`hid-playstation`).
     DualSense,
-    /// X-Box One / Series pad. On Linux, the X-Box 360 uinput backend with the One/Series USB
-    /// identity (VID/PID/name), so games show One/Series glyphs — XInput-identical otherwise. On
-    /// Windows it is a distinct HID identity (`045E:02FD`, Bluetooth Xbox One S) through the UMDF
-    /// minidriver; it used to fold to `Xbox360` there, because the only Windows Xbox backend was
-    /// the XUSB companion, which presents one fixed 360 identity and cannot vary it.
+    /// Linux: Xbox 360 uinput with One/Series VID/PID/name (XInput-identical).
+    /// Windows: distinct HID `045E:02FD` through the UMDF minidriver.
     XboxOne,
-    /// UHID DualShock 4 (kernel `hid-playstation`, ≥ 6.2) — lightbar, touchpad, motion, rumble. Like
-    /// `DualSense` minus adaptive triggers / player LEDs / mute. Needs Linux UHID on the host.
+    /// Linux UHID DualShock 4 (`hid-playstation`, kernel ≥ 6.2).
     DualShock4,
-    /// UHID classic Steam Controller (Valve `28DE:1102`, kernel `hid-steam`) — one stick + dual
-    /// trackpads + two grip paddles. The wire right stick drives the right pad; a left-pad contact
-    /// shadows the stick (hardware multiplex). Needs Linux UHID.
+    /// Linux UHID classic Steam Controller (`28DE:1102`, `hid-steam`).
+    /// Wire right stick drives the right pad; left-pad contact shadows the stick.
     SteamController,
-    /// Steam Deck controller (Valve `28DE:1205`) — full Deck gamepad incl. the four back grips
-    /// (L4/L5/R4/R5), both trackpads, and the IMU; re-grabbed by Steam Input with native glyphs
-    /// when Steam runs on the host. Linux (kernel `hid-steam` via UHID/usbip/gadget) or Windows
-    /// (UMDF minidriver, Steam-Input-promoted).
+    /// Steam Deck (`28DE:1205`): Linux `hid-steam` via UHID/usbip/gadget, or Windows UMDF.
+    /// Steam Input re-grabs it with native glyphs when Steam is on the host.
     SteamDeck,
-    /// DualSense Edge (Sony `054C:0DF2`, kernel `hid-playstation` ≥ 6.3 / Windows UMDF) — the
-    /// DualSense plus two back buttons + two Fn buttons, so a client's back paddles (Deck grips,
-    /// Elite P1–P4) land on a native slot instead of the fold/drop policy.
+    /// DualSense Edge (`054C:0DF2`, `hid-playstation` ≥ 6.3 / Windows UMDF).
+    /// Back paddles land on native slots instead of the fold/drop policy.
     DualSenseEdge,
-    /// Nintendo Switch Pro Controller (Nintendo `057E:2009`, kernel `hid-nintendo` ≥ 5.16) —
-    /// correct Nintendo glyphs + positional layout, gyro/accel, HD rumble back. Needs Linux UHID.
+    /// Linux UHID Switch Pro (`057E:2009`, `hid-nintendo` ≥ 5.16).
     SwitchPro,
-    /// New Steam Controller (2026, Valve "Ibex"/SDL "Triton", wired `28DE:1302`) passed through
-    /// AS-IS: the host presents a virtual SC2 with the real identity and mirrors the client's raw
-    /// Triton input reports ([`RichInput::HidReport`](crate::quic::RichInput)); Steam on the host
-    /// drives it over hidraw exactly like the physical pad (its feature/output writes — lizard
-    /// mode, IMU enable, rumble/haptics — come back raw on the HID-output plane and land on the
-    /// real controller). No kernel driver binds the PID (mainline `hid-steam` stops at the Deck),
-    /// so Steam Input is the consumer. Needs Linux UHID.
+    /// Wired Steam Controller 2 (`28DE:1302`). Host presents that identity and
+    /// mirrors client [`RichInput::HidReport`](crate::quic::RichInput); Steam on
+    /// the host consumes hidraw (`hid-steam` stops at the Deck). Linux UHID.
     SteamController2,
-    /// Steam Controller Puck dongle (`28DE:1304`) carrying a captured SC2. The host presents the
-    /// native seven-interface Puck topology (CDC pair, four controller slots, management HID)
-    /// rather than relabelling its reports as a wired `1302`.
+    /// Puck dongle (`28DE:1304`) carrying a captured SC2. Host presents the
+    /// native seven-interface Puck topology, not a relabelled wired `1302`.
     SteamController2Puck,
-    /// Xbox Elite Wireless Controller Series 2 (Microsoft `045E:0B22`, Bluetooth) — a Windows-only
-    /// HID identity through the UMDF minidriver, so glyphs and the Device Manager name read Elite.
-    ///
-    /// ⚠️ **Glyphs and identity only, today.** The four paddles (`BTN_PADDLE1..4`) still fold or
-    /// drop exactly as on the other Xbox classes; the Elite is merely the first Xbox identity that
-    /// *could* carry them natively. Wiring them up is blocked on a measurement, not on effort —
-    /// once Windows promotes the pad, `xinputhid` claims its HID collection exclusively, so extra
-    /// buttons declared in the report descriptor may reach no consumer at all
-    /// (`design/xbox-pad-windows-handoff.md` §3.6). Do not advertise paddle support off this
-    /// variant until that is measured; `DualSenseEdge` stays the only virtual pad with native
-    /// back-button slots.
-    ///
-    /// Folds to `Xbox360` everywhere but Windows: there is no Linux uinput Elite identity
-    /// (`PadIdentity` has 360 and One S only).
+    /// Windows-only Elite Series 2 HID (`045E:0B22` Bluetooth, UMDF). Paddles
+    /// still fold or drop: after Windows promotes the pad, `xinputhid` claims
+    /// the HID collection, so extra buttons may reach no consumer
+    /// (`design/xbox-pad-windows-handoff.md`). Off Windows this folds to
+    /// `Xbox360` (`PadIdentity` has 360 and One S only).
     XboxElite,
 }
 
 impl GamepadPref {
-    /// Whether this backend has a motion plane at all — i.e. whether a `RichInput::Motion` sample
-    /// sent to a host running it can reach the game, or is decoded and dropped.
+    /// Whether `RichInput::Motion` on this backend can reach the game.
     ///
-    /// The X-Box classes have no gyro in their HID contract, so a client whose local pad HAS one
-    /// is streaming ~250 Hz of datagrams into a void: the host parses each and discards it, and
-    /// the player sees a controller whose gyro silently does nothing.
+    /// Answers one backend. For a particular pad use [`pad_motion_reaches`]: the
+    /// host builds each virtual device from that pad's `GamepadArrival`, so
+    /// [`Welcome::gamepad`](crate::quic::Welcome::gamepad) is not this pad's
+    /// answer unless it declared the session default.
     ///
-    /// This answers for ONE backend. To ask it of a particular pad, go through
-    /// [`pad_motion_reaches`] — the session's [`Welcome::gamepad`](crate::quic::Welcome::gamepad)
-    /// echo is not that pad's answer, because the host builds each virtual device from the pad's
-    /// own `GamepadArrival` and falls back to the session default only for a pad that never
-    /// declared one.
-    ///
-    /// `Auto` answers `true` on purpose. It means "unknown": either a host too old to echo the
-    /// field, or one that hasn't resolved yet. Suppressing motion on unknown would silently break
-    /// gyro against every old host that did resolve to a DualSense, which is a worse failure than
-    /// sending datagrams nobody reads.
-    ///
-    /// Exhaustive by design — a new backend has to state its answer here rather than inherit one.
+    /// `Auto` is `true` on purpose: unknown (old host, or not yet resolved).
+    /// Suppressing on unknown would kill gyro against old DualSense hosts.
+    /// Exhaustive so a new backend must pick an answer.
     pub const fn has_motion(self) -> bool {
         match self {
-            GamepadPref::Auto => true, // unknown; assume it can, see above
+            GamepadPref::Auto => true,
             // No Xbox pad has a gyro in its HID contract — Elite Series 2 included.
             GamepadPref::Xbox360 | GamepadPref::XboxOne | GamepadPref::XboxElite => false,
             GamepadPref::DualSense
@@ -241,9 +187,6 @@ impl GamepadPref {
         }
     }
 
-    /// Wire byte. `0 = Auto`, `1 = Xbox360`, `2 = DualSense`, `3 = XboxOne`, `4 = DualShock4`,
-    /// `5 = SteamController`, `6 = SteamDeck`, `7 = DualSenseEdge`, `8 = SwitchPro`,
-    /// `9 = SteamController2`, `10 = SteamController2Puck`, `11 = XboxElite`.
     pub const fn to_u8(self) -> u8 {
         match self {
             GamepadPref::Auto => 0,
@@ -261,8 +204,7 @@ impl GamepadPref {
         }
     }
 
-    /// Inverse of [`to_u8`](Self::to_u8). An unknown byte decodes to `Auto` — forward-compatible:
-    /// a future concrete value a peer doesn't recognize degrades to "let the host decide".
+    /// Unknown bytes decode to `Auto` so a future concrete value still lets the host decide.
     pub fn from_u8(v: u8) -> Self {
         match v {
             1 => GamepadPref::Xbox360,
@@ -280,8 +222,7 @@ impl GamepadPref {
         }
     }
 
-    /// Parse a CLI/config name (case-insensitive, with the usual aliases). `None` for an
-    /// unrecognized name, so callers can error rather than silently defaulting to `Auto`.
+    /// CLI/config name. `None` on unknown so callers can error instead of silently becoming `Auto`.
     pub fn from_name(s: &str) -> Option<Self> {
         Some(match s.trim().to_ascii_lowercase().as_str() {
             "auto" | "default" => GamepadPref::Auto,
@@ -290,7 +231,7 @@ impl GamepadPref {
             "xboxone" | "xbox-one" | "xone" | "xbox1" | "series" | "xboxseries" => {
                 GamepadPref::XboxOne
             }
-            // "elite" is unambiguous here — the DualSense Edge answers to "edge", never "elite".
+            // DualSense Edge answers to "edge", never "elite".
             "xboxelite" | "xbox-elite" | "elite" | "xboxelite2" | "elite2" => {
                 GamepadPref::XboxElite
             }
@@ -311,9 +252,6 @@ impl GamepadPref {
         })
     }
 
-    /// Canonical lowercase identifier (`"auto"`, `"xbox360"`, `"dualsense"`, `"xboxone"`,
-    /// `"dualshock4"`, `"steamcontroller"`, `"steamdeck"`, `"dualsenseedge"`, `"switchpro"`,
-    /// `"steamcontroller2"`, `"steamcontroller2puck"`, `"xboxelite"`).
     pub fn as_str(self) -> &'static str {
         match self {
             GamepadPref::Auto => "auto",
@@ -332,38 +270,27 @@ impl GamepadPref {
     }
 }
 
-/// Whether motion sent for ONE pad can reach the game: `declared` is the kind that pad announced
-/// in its [`InputKind::GamepadArrival`](crate::input::InputKind::GamepadArrival), `asked` is the
-/// session default the Hello carried, and `resolved` is the host's
-/// [`Welcome::gamepad`](crate::quic::Welcome::gamepad) echo.
+/// Whether motion for one pad can reach the game.
 ///
-/// Three facts make this a per-pad question rather than a session one:
+/// `declared` is the pad's [`InputKind::GamepadArrival`](crate::input::InputKind::GamepadArrival),
+/// `asked` is the Hello session default, `resolved` is
+/// [`Welcome::gamepad`](crate::quic::Welcome::gamepad).
 ///
-/// 1. The host builds each virtual device from that pad's arrival — `Pads::set_kind` — and uses
-///    the session default only for a pad that never declares. So the echo is simply not this
-///    pad's answer when the two differ.
-/// 2. The host FOLDS what it cannot build (`resolve_gamepad`/`resolve_pad_kind` share one
-///    `pick_gamepad`): a Switch Pro on a Windows host, or any UHID backend on a host whose
-///    `/dev/uhid` is unusable, lands on X-Box 360 with the motion plane gone. Nothing local can
-///    predict that.
-/// 3. But the echo IS one observed sample of that fold — for the kind the Hello asked about. When
-///    a pad declared exactly that kind, the host ran the same fold on the same input, so the echo
-///    is authoritative for it.
+/// The host builds each virtual device from that pad's arrival and uses the
+/// session default only when the pad never declared. It also folds backends it
+/// cannot build (Switch Pro on Windows, any UHID host without `/dev/uhid`) to
+/// Xbox 360, dropping the motion plane — nothing local can predict that. The
+/// echo is one sample of that fold for the Hello kind, so it is authoritative
+/// when `declared == asked`.
 ///
-/// Hence: trust the echo for a pad that declared what we asked for, and otherwise fall back to
-/// what the declaration alone can tell us. That keeps both motivating cases: a generic pad under
-/// `Auto` (declares X-Box 360, no motion plane, suppressed) and an explicit Switch Pro folded to
-/// X-Box 360 by a Windows host (declared == asked, so the echo catches it).
-///
-/// The residual gap is a pad whose declared kind differs from the session's AND gets folded — we
-/// keep sending, and the host keeps dropping. That is the direction to be wrong in: the failure
-/// is wasted datagrams, where guessing the other way would silently kill a working gyro.
+/// Otherwise trust the declaration. Wrong the other way would silently kill a
+/// working gyro; wasted datagrams are the cheaper miss.
 pub const fn pad_motion_reaches(
     declared: GamepadPref,
     asked: GamepadPref,
     resolved: GamepadPref,
 ) -> bool {
-    // `==` on a fieldless enum, spelled as a match because PartialEq::eq is not const.
+    // PartialEq::eq is not const; u8 compare is.
     if declared.to_u8() == asked.to_u8() {
         resolved.has_motion()
     } else {
@@ -371,66 +298,49 @@ pub const fn pad_motion_reaches(
     }
 }
 
-/// Per-block FEC parameters. Recovery count is derived from `fec_percent` exactly as
-/// GameStream does: `m = ceil(k * fec_percent / 100)`.
+/// Per-block FEC. Recovery is GameStream's `m = ceil(k * fec_percent / 100)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FecConfig {
     pub scheme: FecScheme,
-    /// Recovery overhead as a percentage of data shards (0 disables FEC).
+    /// Percent of data shards. 0 disables FEC.
     pub fec_percent: u8,
-    /// Maximum data shards per FEC block; larger frames split into multiple blocks.
-    /// GF(2⁸) is bounded at 255 total shards, so keep this ≤ ~200 for `Gf8`.
+    /// Data shards per block; larger frames split. GF(2⁸) is 255 total, so ≤ ~200 for `Gf8`.
     pub max_data_per_block: u16,
 }
 
 impl FecConfig {
-    /// Recovery (parity) shard count for a block of `data_shards` shards.
     pub fn recovery_for(&self, data_shards: usize) -> usize {
         if self.fec_percent == 0 || data_shards == 0 {
             return 0;
         }
-        // ceil(k * pct / 100)
         (data_shards * self.fec_percent as usize).div_ceil(100)
     }
 }
 
-/// Largest shard payload that still fits a datagram once header + crypto overhead are
-/// added. Bounds `shard_payload` so packets never exceed [`MAX_DATAGRAM_BYTES`].
+/// Header + crypto still fit in [`MAX_DATAGRAM_BYTES`].
 pub const fn max_shard_payload() -> usize {
     MAX_DATAGRAM_BYTES - HEADER_LEN - CRYPTO_OVERHEAD
 }
 
-/// Largest **even** shard payload whose sealed wire datagram still fits an unfragmented IPv4/UDP
-/// packet on a standard 1500-byte MTU: `1500 − 20 (IPv4) − 8 (UDP) − HEADER_LEN − CRYPTO_OVERHEAD`
-/// = 1408. Hosts should default `shard_payload` to this: one byte more and the kernel silently
-/// splits EVERY video datagram into two IP fragments (a full frame plus a runt) — either fragment
-/// lost = the datagram lost, roughly doubling per-datagram loss on Wi-Fi and eating straight into
-/// FEC's recovery margin, plus per-pair kernel reassembly and runt airtime at line rate. (Exactly
-/// what the previous hardcoded 1452 did: its MTU math forgot the punktfunk header + crypto ride
-/// inside the UDP payload and counted the IP+UDP headers as 8 bytes instead of 28.)
+/// Largest even shard payload whose sealed IPv4/UDP datagram fits a 1500-byte MTU:
+/// `1500 − 20 − 8 − HEADER_LEN − CRYPTO_OVERHEAD` = 1408. One byte more and the kernel
+/// IP-fragments every video datagram; either fragment lost drops the datagram.
 pub const fn mtu1500_shard_payload() -> usize {
     let p = 1500 - 20 - 8 - HEADER_LEN - CRYPTO_OVERHEAD;
     p - p % 2 // FEC requires even shards
 }
 
-/// The IPv6 sibling of [`mtu1500_shard_payload`]: largest **even** shard payload whose sealed wire
-/// datagram fits an unfragmented IPv6/UDP packet on a standard 1500-byte MTU:
-/// `1500 − 40 (IPv6) − 8 (UDP) − HEADER_LEN − CRYPTO_OVERHEAD` = 1388. The 20 extra header bytes
-/// matter MORE here than on v4: IPv6 routers never fragment — an oversized datagram gets an ICMPv6
-/// Packet-Too-Big at best and a silent blackhole at worst — so streaming the v4 size (1408) to a
-/// v6 client wouldn't degrade the way v4 fragmentation did (the b5c30df saga), it would drop every
-/// video datagram on any 1500-MTU hop.
+/// IPv6 sibling of [`mtu1500_shard_payload`]: `1500 − 40 − 8 − HEADER_LEN −
+/// CRYPTO_OVERHEAD` = 1388. IPv6 routers never fragment; an oversized datagram is
+/// ICMPv6 Packet-Too-Big or a silent blackhole, not a degrade.
 pub const fn mtu1500_shard_payload_v6() -> usize {
     let p = 1500 - 40 - 8 - HEADER_LEN - CRYPTO_OVERHEAD;
     p - p % 2 // FEC requires even shards
 }
 
-/// The MTU-safe shard payload for a session streaming to `peer` (the QUIC remote — the data plane
-/// dials the same address family): v6 sizing for a genuine IPv6 remote, v4 sizing otherwise —
-/// including IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`, what a dual-stack `[::]` socket reports
-/// for a v4 client), which ride IPv4 on the wire. Hosts pass this through
-/// `Welcome::shard_payload`, so per-family sizing needs no wire change and old clients simply
-/// follow the negotiated value.
+/// MTU-safe shard payload for `peer`. Genuine IPv6 uses the v6 size; IPv4 and
+/// IPv4-mapped IPv6 (`::ffff:…`, dual-stack `[::]` reporting a v4 client) use v4 —
+/// those ride IPv4 on the wire. Hosts send this as `Welcome::shard_payload`.
 pub fn mtu1500_shard_payload_for(peer: core::net::IpAddr) -> usize {
     match peer {
         core::net::IpAddr::V4(_) => mtu1500_shard_payload(),
@@ -439,40 +349,33 @@ pub fn mtu1500_shard_payload_for(peer: core::net::IpAddr) -> usize {
     }
 }
 
-/// Floor for a negotiated `shard_payload` (even, well under every real path). A path whose UDP
-/// budget lands below this can't carry the QUIC control plane either (QUIC's own minimum is a
-/// 1200-byte UDP payload), so shrinking video shards further buys nothing — the clamp helpers
-/// bottom out here instead of producing degenerate confetti-sized shards.
+/// Floor for a negotiated `shard_payload`. Below this the path cannot carry QUIC
+/// either (QUIC's minimum UDP payload is 1200), so shrinking further buys nothing.
+/// 512 is even and well under every real path.
 pub const MIN_SHARD_PAYLOAD: usize = 512;
 
-/// The sealed wire size of a video datagram carrying `shard_payload` bytes of shard — what
-/// actually leaves the socket as UDP payload (punktfunk header + shard + crypto overhead).
 pub const fn sealed_datagram_bytes(shard_payload: usize) -> usize {
     HEADER_LEN + shard_payload + CRYPTO_OVERHEAD
 }
 
-/// The UDP-payload size a path must carry for full-size IPv4 video datagrams: the sealed size
-/// of the [`mtu1500_shard_payload`] default (= 1472, the exact 1500-MTU IPv4 ceiling). Doubles
-/// as the QUIC MTU-discovery probe ceiling (`quic/endpoint.rs`): with the ceiling set to
-/// exactly this value, a control connection whose discovery settles AT the ceiling has proven
-/// the path carries full-size video datagrams, and one that settles BELOW it has proven the
-/// path cannot — a discrimination quinn's stock 1452 ceiling can't make in either direction.
+/// Sealed size of the [`mtu1500_shard_payload`] default (= 1472, the 1500-MTU IPv4
+/// UDP ceiling). Also the QUIC MTU-discovery probe ceiling: settled-at means the
+/// path carries full-size video; settled-below means it cannot. quinn's stock 1452
+/// ceiling cannot make that discrimination.
 pub const fn video_datagram_udp_ceiling() -> usize {
     sealed_datagram_bytes(mtu1500_shard_payload())
 }
 
-/// Largest even shard payload whose sealed datagram fits in `udp_budget` bytes of UDP payload
-/// (the quantity QUIC MTU discovery measures — [`video_datagram_udp_ceiling`] is its probe
-/// ceiling). Clamped to the peer's family default ([`mtu1500_shard_payload_for`]) so a generous
-/// budget never grows packets past today's wire, and floored at [`MIN_SHARD_PAYLOAD`].
+/// Largest even shard payload that fits `udp_budget` (what QUIC MTU discovery
+/// measures). Clamped to [`mtu1500_shard_payload_for`] so a generous budget never
+/// grows past the family 1500 default; floored at [`MIN_SHARD_PAYLOAD`].
 pub fn shard_payload_for_udp_budget(udp_budget: usize, peer: core::net::IpAddr) -> usize {
     let p = udp_budget.saturating_sub(HEADER_LEN + CRYPTO_OVERHEAD);
     let p = p - p % 2; // FEC requires even shards
     p.clamp(MIN_SHARD_PAYLOAD, mtu1500_shard_payload_for(peer))
 }
 
-/// The family's IP+UDP header bytes between an on-wire IP MTU and its UDP payload budget —
-/// 28 for IPv4 (and IPv4-mapped), 48 for IPv6.
+/// IP+UDP headers between on-wire MTU and UDP payload: 20+8 IPv4 (and mapped), 40+8 IPv6.
 fn ip_udp_overhead(peer: core::net::IpAddr) -> usize {
     match peer {
         core::net::IpAddr::V4(_) => 28,
@@ -481,20 +384,17 @@ fn ip_udp_overhead(peer: core::net::IpAddr) -> usize {
     }
 }
 
-/// [`shard_payload_for_udp_budget`] for an operator-supplied ON-WIRE IP MTU (the number
-/// `netsh interface ipv4 show subinterfaces` / `ip link` shows): subtracts the family's IP+UDP
-/// headers first — 28 for IPv4 (and IPv4-mapped), 48 for IPv6.
+/// [`shard_payload_for_udp_budget`] for an operator on-wire IP MTU (`ip link` / `netsh`):
+/// subtract family IP+UDP headers first.
 pub fn shard_payload_for_wire_mtu(wire_mtu: usize, peer: core::net::IpAddr) -> usize {
     shard_payload_for_udp_budget(wire_mtu.saturating_sub(ip_udp_overhead(peer)), peer)
 }
 
-/// The operator's jumbo-frames opt-in (design/shard-payload-reneg.md Phase 2): the target
-/// on-wire IP MTU, or `None` = no opt-in (nothing above the 1500-default wire is ever probed
-/// or grown to). One knob, one code path: a `PUNKTFUNK_WIRE_MTU` above the standard 1500
-/// derives the target from the operator's number; `PUNKTFUNK_JUMBO=1` is the fixed 9000
-/// profile for operators who don't want to think in MTUs. Raising the wire above 1500 is
-/// only ever an ACK-GATED mid-session grow toward a client that advertised
-/// [`max_shard_payload`] headroom — sessions still START at the family default.
+/// Operator jumbo opt-in (`design/shard-payload-reneg.md`): target on-wire IP MTU,
+/// or `None` = never probe or grow above the 1500 default. `PUNKTFUNK_WIRE_MTU`
+/// above 1500 is that number; `PUNKTFUNK_JUMBO=1` is the 9000 profile. Sessions
+/// still start at the family default; growth is ACK-gated toward a client that
+/// advertised [`max_shard_payload`] headroom.
 pub fn jumbo_wire_mtu() -> Option<usize> {
     if let Ok(v) = std::env::var("PUNKTFUNK_WIRE_MTU") {
         if let Ok(mtu) = v.trim().parse::<usize>() {
@@ -509,10 +409,8 @@ pub fn jumbo_wire_mtu() -> Option<usize> {
     }
 }
 
-/// The jumbo sibling of [`shard_payload_for_wire_mtu`]: the largest even shard payload whose
-/// sealed datagram fits `wire_mtu`, clamped to the RECEIVE ceiling ([`max_shard_payload`])
-/// instead of the family 1500-default — the up-leg's grow target. Still floored at
-/// [`MIN_SHARD_PAYLOAD`].
+/// Jumbo sibling of [`shard_payload_for_wire_mtu`]: clamped to [`max_shard_payload`]
+/// (receive ceiling), not the family 1500 default.
 pub fn jumbo_shard_payload_for(wire_mtu: usize, peer: core::net::IpAddr) -> usize {
     let p = wire_mtu
         .saturating_sub(ip_udp_overhead(peer))
@@ -521,31 +419,25 @@ pub fn jumbo_shard_payload_for(wire_mtu: usize, peer: core::net::IpAddr) -> usiz
     p.clamp(MIN_SHARD_PAYLOAD, max_shard_payload())
 }
 
-/// Everything needed to construct a [`Session`](crate::session::Session).
-///
-/// `Debug` is implemented by hand to redact `key`/`salt`, and `key`/`salt` are zeroized
-/// on drop, so secrets neither leak into logs nor linger in freed memory.
+/// Inputs to construct a [`Session`](crate::session::Session).
+/// `Debug` redacts `key`/`salt`; both are zeroized on drop.
 #[derive(Clone)]
 pub struct Config {
     pub role: Role,
     pub phase: ProtocolPhase,
     pub fec: FecConfig,
-    /// Shard payload bytes per packet. Must be even and ≤ [`max_shard_payload`].
+    /// Even, and ≤ [`max_shard_payload`].
     pub shard_payload: usize,
-    /// Largest encoded access unit the reassembler will accept (bounds memory against
-    /// hostile/​corrupt headers; see [`Session`](crate::session::Session)).
+    /// Reassembler cap; bounds memory against hostile/corrupt headers.
     pub max_frame_bytes: usize,
     pub encrypt: bool,
-    /// The negotiated session AEAD + its key, established during pairing/handshake —
-    /// AES-128-GCM for every peer by default, ChaCha20-Poly1305 when the client negotiated it
-    /// (soft-AES armv7 targets; see [`SessionKey`]). MUST be unique per session when
-    /// `encrypt` is set (see the nonce-uniqueness contract in [`crate::crypto`]).
+    /// Session AEAD. AES-128-GCM by default; ChaCha20-Poly1305 when the client
+    /// negotiated it (soft-AES armv7). Unique per session when `encrypt` is set
+    /// ([`crate::crypto`] nonce-uniqueness).
     pub key: SessionKey,
-    /// Per-session nonce salt, established alongside `key` during pairing. MUST be
-    /// unique per (key, session).
+    /// Unique per (key, session).
     pub salt: [u8; 4],
-    /// Test hook: when non-zero, the loopback transport deterministically drops one of
-    /// every `loopback_drop_period` packets it sends. 0 = lossless.
+    /// Test hook: drop one of every N loopback packets. 0 = lossless.
     pub loopback_drop_period: u32,
 }
 
@@ -565,7 +457,7 @@ impl std::fmt::Debug for Config {
             .field("shard_payload", &self.shard_payload)
             .field("max_frame_bytes", &self.max_frame_bytes)
             .field("encrypt", &self.encrypt)
-            // SessionKey's own Debug redacts the material but keeps the cipher choice visible.
+            // SessionKey Debug redacts material but keeps the cipher visible.
             .field("key", &self.key)
             .field("salt", &"<redacted>")
             .field("loopback_drop_period", &self.loopback_drop_period)
@@ -574,8 +466,7 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
-    /// Validate every invariant the hot path and the reassembler rely on. Rejecting here
-    /// is what keeps the receive-side parser's allocations bounded.
+    /// Keeps receive-side allocations bounded.
     pub fn validate(&self) -> Result<()> {
         if self.shard_payload == 0 || self.shard_payload % 2 != 0 {
             return Err(PunktfunkError::InvalidArg(
@@ -587,13 +478,9 @@ impl Config {
                 "shard_payload too large to fit a datagram (header + crypto overhead)",
             ));
         }
-        // The floor the clamp helpers already bottom out at, enforced for the CLIENT: its value
-        // comes off the wire from the peer (`Welcome::shard_payload`) and sets the reassembler's
-        // per-frame shard floor ([`ReassemblerLimits::min_shard_bytes`]), so without this a
-        // hostile Welcome drops that floor to two bytes and we accept confetti-sized shards for
-        // the whole session. A host's value is always locally derived (every `shard_payload_for_*`
-        // helper clamps here, and a client's ACK only ever confirms a size the host proposed), so
-        // a hand-configured host below the floor stays legal.
+        // Client only: Welcome.shard_payload sets the reassembler floor. A hostile
+        // 2-byte Welcome would otherwise be accepted for the whole session. Hosts
+        // derive locally (helpers already clamp); a hand-set host below the floor stays legal.
         if self.role == Role::Client && self.shard_payload < MIN_SHARD_PAYLOAD {
             return Err(PunktfunkError::InvalidArg(
                 "negotiated shard_payload below MIN_SHARD_PAYLOAD",
@@ -602,8 +489,7 @@ impl Config {
         if self.fec.max_data_per_block == 0 {
             return Err(PunktfunkError::InvalidArg("max_data_per_block must be > 0"));
         }
-        // The per-block total (data + recovery) must fit both the field ceiling and the
-        // u16 wire fields.
+        // Per-block total must fit the field ceiling and the u16 wire fields.
         let k = self.fec.max_data_per_block as usize;
         let total = k + self.fec.recovery_for(k);
         if total > self.fec.scheme.max_total_shards() {
@@ -614,7 +500,7 @@ impl Config {
         if self.max_frame_bytes == 0 {
             return Err(PunktfunkError::InvalidArg("max_frame_bytes must be > 0"));
         }
-        // The frame must not need more FEC blocks than the u16 block-count field allows.
+        // Block count is a u16 on the wire.
         let total_data = self.max_frame_bytes.div_ceil(self.shard_payload).max(1);
         let max_blocks = total_data.div_ceil(k).max(1);
         if max_blocks > u16::MAX as usize {
@@ -630,9 +516,9 @@ impl Config {
         Ok(())
     }
 
-    /// Sensible P1 defaults: GF(2⁸), 15% FEC, ~1 KiB shards, no encryption, 64 MiB frame
-    /// cap. When enabling encryption, replace `key`/`salt` with per-session values from
-    /// pairing — the all-zero defaults are rejected by [`validate`](Self::validate).
+    /// P1 defaults: GF(2⁸), 15% FEC, 1024-byte shards, no encryption, 64 MiB frame cap.
+    /// All-zero `key`/`salt` are rejected by [`validate`](Self::validate) once encryption
+    /// is on — replace them from pairing.
     pub fn p1_defaults(role: Role) -> Self {
         Config {
             role,
@@ -659,21 +545,19 @@ mod tests {
     #[test]
     fn rejects_encrypt_with_zero_key() {
         let mut c = Config::p1_defaults(Role::Host);
-        c.encrypt = true; // key is still all-zero
+        c.encrypt = true;
         assert!(c.validate().is_err());
         c.key = SessionKey::Aes128Gcm([1u8; 16]);
         assert!(c.validate().is_ok());
-        // The rejection follows whichever cipher variant is active.
+        // Same rejection for ChaCha20-Poly1305.
         c.key = SessionKey::ChaCha20Poly1305([0u8; 32]);
         assert!(c.validate().is_err());
         c.key = SessionKey::ChaCha20Poly1305([1u8; 32]);
         assert!(c.validate().is_ok());
     }
 
-    /// The client's `shard_payload` is whatever the host's `Welcome` says, and the reassembler
-    /// takes its per-frame shard floor from it — so a sub-floor negotiated value must be refused
-    /// outright instead of quietly lowering that floor (a 2-byte shard is not a path this
-    /// protocol runs on: it can't carry the QUIC control plane either).
+    /// Client `shard_payload` comes from Welcome and is the reassembler floor;
+    /// a sub-floor value must fail rather than lower that floor.
     #[test]
     fn rejects_negotiated_shard_payload_below_the_floor() {
         let mut c = Config::p1_defaults(Role::Client);
@@ -683,7 +567,6 @@ mod tests {
         assert!(c.validate().is_err());
         c.shard_payload = MIN_SHARD_PAYLOAD;
         assert!(c.validate().is_ok());
-        // The reassembler's floor can no longer be dragged below the production one by a peer.
         assert_eq!(
             crate::packet::ReassemblerLimits::from_config(&c).min_shard_bytes,
             MIN_SHARD_PAYLOAD
@@ -693,13 +576,11 @@ mod tests {
     #[test]
     fn rejects_oversized_shard_payload() {
         let mut c = Config::p1_defaults(Role::Host);
-        c.shard_payload = max_shard_payload() + 2; // still even, but won't fit a datagram
+        c.shard_payload = max_shard_payload() + 2; // even, but won't fit a datagram
         assert!(c.validate().is_err());
     }
 
-    /// Pin the 1500-MTU wire math: the sealed datagram (header + shard + crypto) at the MTU-safe
-    /// shard payload must be ≤ 1472 (1500 − IPv4 20 − UDP 8), and one shard-step (+2) above must
-    /// not — the regression that shipped as 1452 and IP-fragmented every video datagram.
+    /// Pin 1500-MTU IPv4 math: sealed datagram ≤ 1472 (`1500 − 20 − 8`); +2 must not.
     #[test]
     fn mtu1500_shard_payload_never_fragments() {
         let p = mtu1500_shard_payload();
@@ -710,9 +591,8 @@ mod tests {
         assert!(HEADER_LEN + (p + 2) + CRYPTO_OVERHEAD > 1472, "not maximal");
     }
 
-    /// Pin the IPv6 wire math the same way: the sealed datagram must fit 1452 (1500 − IPv6 40 −
-    /// UDP 8 — v6 routers don't fragment, so overshooting blackholes rather than degrades) and one
-    /// shard-step above must not.
+    /// Pin IPv6 math: sealed datagram ≤ 1452 (`1500 − 40 − 8`); +2 must not.
+    /// v6 routers do not fragment, so overshoot blackholes.
     #[test]
     fn mtu1500_shard_payload_v6_never_blackholes() {
         let p = mtu1500_shard_payload_v6();
@@ -726,8 +606,7 @@ mod tests {
         assert!(HEADER_LEN + (p + 2) + CRYPTO_OVERHEAD > 1452, "not maximal");
     }
 
-    /// The video-datagram ceiling IS the exact v4 sealed size — the QUIC MTU-discovery probe
-    /// ceiling (endpoint.rs) relies on this equality for its settled-at-vs-below verdict.
+    /// The ceiling equals the exact v4 sealed size; QUIC MTU discovery uses that equality.
     #[test]
     fn video_datagram_ceiling_is_the_sealed_default() {
         assert_eq!(
@@ -737,26 +616,24 @@ mod tests {
         assert_eq!(video_datagram_udp_ceiling(), 1472);
     }
 
-    /// Budget-derived sizing: even, sealed-fits-the-budget, clamped to the family default
-    /// above and [`MIN_SHARD_PAYLOAD`] below.
+    /// Even, fits the budget, clamped to the family default and [`MIN_SHARD_PAYLOAD`].
     #[test]
     fn shard_payload_for_udp_budget_math() {
         use core::net::IpAddr;
         let v4: IpAddr = "192.168.1.50".parse().unwrap();
         let v6: IpAddr = "fd00::50".parse().unwrap();
-        // The full ceiling reproduces the default exactly.
         assert_eq!(
             shard_payload_for_udp_budget(video_datagram_udp_ceiling(), v4),
             mtu1500_shard_payload()
         );
-        // A WARP/Tailscale-shaped 1280 budget: sealed result must fit the budget, stay even.
+        // 1280-byte tunnel MTU: sealed result must fit, stay even.
         let p = shard_payload_for_udp_budget(1280, v4);
         assert_eq!(p % 2, 0);
         assert!(sealed_datagram_bytes(p) <= 1280);
         assert!(sealed_datagram_bytes(p + 2) > 1280, "not maximal");
         // Odd budgets round down to even shards.
         assert_eq!(shard_payload_for_udp_budget(1281, v4) % 2, 0);
-        // A generous budget never grows past the family default (either family).
+        // Generous budget must not grow past the family default.
         assert_eq!(
             shard_payload_for_udp_budget(9000, v4),
             mtu1500_shard_payload()
@@ -765,12 +642,10 @@ mod tests {
             shard_payload_for_udp_budget(9000, v6),
             mtu1500_shard_payload_v6()
         );
-        // Degenerate budgets bottom out at the floor instead of confetti.
         assert_eq!(shard_payload_for_udp_budget(100, v4), MIN_SHARD_PAYLOAD);
     }
 
-    /// Operator-facing wire-MTU sizing subtracts the right IP+UDP header per family, and 1500
-    /// reproduces today's defaults exactly.
+    /// Subtracts the right IP+UDP header per family; 1500 reproduces the defaults.
     #[test]
     fn shard_payload_for_wire_mtu_math() {
         use core::net::IpAddr;
@@ -794,22 +669,18 @@ mod tests {
         assert_eq!(shard_payload_for_wire_mtu(1280, v6), 1168);
     }
 
-    /// Jumbo grow-target sizing (the up-leg, design/shard-payload-reneg.md): even, sealed
-    /// fits the wire, clamped to the RECEIVE ceiling instead of the family 1500-default —
-    /// and the standard 9000 profile lands on the exact documented value.
+    /// Jumbo grow-target: even, sealed fits the wire, clamped to [`max_shard_payload`].
     #[test]
     fn jumbo_shard_payload_math() {
         use core::net::IpAddr;
         let v4: IpAddr = "192.168.1.50".parse().unwrap();
         let v6: IpAddr = "fd00::50".parse().unwrap();
-        // 9000 − 28 (IPv4+UDP) − 64 (header+crypto) = 8908 even; sealed 8972 ≤ the 9216
-        // datagram ceiling. The v6 sibling: 9000 − 48 − 64 = 8888.
+        // 9000 − 28 − 64 = 8908 (v4); 9000 − 48 − 64 = 8888 (v6).
         assert_eq!(jumbo_shard_payload_for(9000, v4), 8908);
         assert_eq!(sealed_datagram_bytes(8908), 8972);
         assert!(sealed_datagram_bytes(8908) <= MAX_DATAGRAM_BYTES);
         assert_eq!(jumbo_shard_payload_for(9000, v6), 8888);
-        // An operator MTU larger than the receive path clamps to the ceiling, smaller ones
-        // track the wire, and degenerate ones floor at MIN_SHARD_PAYLOAD.
+        // Oversize clamps to the receive ceiling; degenerate floors.
         assert_eq!(jumbo_shard_payload_for(64_000, v4), max_shard_payload());
         let p = jumbo_shard_payload_for(4000, v4);
         assert_eq!(p % 2, 0);
@@ -817,8 +688,7 @@ mod tests {
         assert_eq!(jumbo_shard_payload_for(100, v4), MIN_SHARD_PAYLOAD);
     }
 
-    /// Family selection: genuine v6 remotes get the v6 size; v4 — including the IPv4-mapped v6
-    /// form a dual-stack `[::]` socket reports for a v4 client — keeps the v4 size.
+    /// Genuine v6 gets the v6 size; v4 and IPv4-mapped v6 (`[::]` reporting a v4 client) keep v4.
     #[test]
     fn shard_payload_follows_peer_family() {
         use core::net::IpAddr;
@@ -834,20 +704,19 @@ mod tests {
     fn rejects_block_exceeding_scheme_ceiling() {
         let mut c = Config::p1_defaults(Role::Host); // Gf8, ceiling 255
         c.fec.max_data_per_block = 250;
-        c.fec.fec_percent = 15; // 250 + ceil(250*15/100)=288 > 255
+        c.fec.fec_percent = 15; // 250 + ceil(250*15/100) = 288 > 255
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn gamepad_pref_steam_roundtrip() {
         use GamepadPref::*;
-        // Wire-byte round-trip for the Steam additions; an unknown byte still degrades to Auto.
+        // Unknown byte still degrades to Auto.
         for (p, b) in [(SteamController, 5u8), (SteamDeck, 6)] {
             assert_eq!(p.to_u8(), b);
             assert_eq!(GamepadPref::from_u8(b), p);
         }
         assert_eq!(GamepadPref::from_u8(99), Auto);
-        // Name parsing + canonical-name round-trip.
         assert_eq!(GamepadPref::from_name("steamdeck"), Some(SteamDeck));
         assert_eq!(GamepadPref::from_name("deck"), Some(SteamDeck));
         assert_eq!(
@@ -873,21 +742,17 @@ mod tests {
             assert_eq!(CompositorPref::from_u8(p.to_u8()), p);
             assert_eq!(CompositorPref::from_name(p.as_str()), Some(p));
         }
-        // Aliases + unknowns.
         assert_eq!(CompositorPref::from_name("KDE"), Some(CompositorPref::Kwin));
         assert_eq!(
             CompositorPref::from_name("sway"),
             Some(CompositorPref::Wlroots)
         );
         assert_eq!(CompositorPref::from_name("nope"), None);
-        // Unknown wire byte degrades to Auto (forward-compatible).
+        // Unknown wire byte degrades to Auto.
         assert_eq!(CompositorPref::from_u8(200), CompositorPref::Auto);
     }
 
-    /// Which backends a client may stream motion to. Pinned as a table because the answer decides
-    /// whether a player's gyro works at all, and getting it wrong in either direction is silent:
-    /// a false negative kills working motion, a false positive keeps ~250 Hz of datagrams flowing
-    /// into a host that drops every one.
+    /// False negative kills working gyro; false positive streams ~250 Hz into a void.
     #[test]
     fn only_the_xbox_classes_lack_a_motion_plane() {
         for p in [
@@ -913,47 +778,36 @@ mod tests {
         ] {
             assert!(p.has_motion(), "{} should carry motion", p.as_str());
         }
-        // Unknown must not suppress: an old host that omitted the echo may well have resolved a
-        // DualSense, and silently killing its gyro is worse than sending into a void.
+        // Unknown must not suppress: an old host may have resolved DualSense.
         assert!(GamepadPref::Auto.has_motion());
     }
 
-    /// The per-pad question, case by case. Each row is a session a player can actually sit down
-    /// to; the comment says which of the three inputs decides it.
+    /// Per-pad, not per-session: which of declared / asked / resolved decides each row.
     #[test]
     fn motion_reach_is_answered_per_pad_not_per_session() {
         use GamepadPref::*;
-        // The case this predicate exists for, and the one a session-level check gets WRONG:
-        // "Automatic" with mixed pads. The Hello carries the active pad's kind (an X-Box pad), so
-        // the echo says X-Box 360 — but pad 1 declared a DualSense and the host built it one, with
-        // a motion plane. Reading the echo here kills a gyro that works.
+        // Mixed pads under Auto: Hello/echo is Xbox, but this pad declared DualSense.
+        // A session-level check would kill a gyro that works.
         assert!(pad_motion_reaches(DualSense, Xbox360, Xbox360));
-        // Its mirror: the pad that DID declare the X-Box kind still has nowhere to put motion.
+        // The pad that declared Xbox still has no motion plane.
         assert!(!pad_motion_reaches(Xbox360, Xbox360, Xbox360));
 
-        // A generic pad (8BitDo &c.) under Automatic — the sweep's motivating case. Detection
-        // lands on X-Box 360, the pad declares it, and its gyro has no plane to reach.
+        // Generic pad under Auto: detection lands on Xbox 360, no motion plane.
         assert!(!pad_motion_reaches(Xbox360, Xbox360, Xbox360));
 
-        // An explicit Switch Pro against a WINDOWS host, which folds it to X-Box 360. Declared ==
-        // asked, so the echo is this pad's answer and catches a fold nothing local could predict.
+        // Switch Pro on Windows folds to Xbox 360. declared == asked, so the echo catches it.
         assert!(!pad_motion_reaches(SwitchPro, SwitchPro, Xbox360));
-        // The same declaration against a Linux host that builds it: unchanged, motion reaches.
         assert!(pad_motion_reaches(SwitchPro, SwitchPro, SwitchPro));
 
-        // A DualSense wish on a host with no usable /dev/uhid degrades the same way.
+        // DualSense on a host with no usable /dev/uhid folds the same way.
         assert!(!pad_motion_reaches(DualSense, DualSense, Xbox360));
 
-        // Nobody connected at dial time, so the Hello asked `Auto` and the host resolved it from
-        // its own env. A pad that shows up later declares its own kind and is judged on that —
-        // whichever way the session went.
+        // Hello asked Auto; a later pad is judged on its own declaration.
         assert!(pad_motion_reaches(DualSense, Auto, Xbox360));
         assert!(!pad_motion_reaches(Xbox360, Auto, DualSense));
 
-        // An old host that echoes nothing leaves `Auto`, which must not suppress: it may well have
-        // resolved a DualSense, and silently killing gyro is the worse of the two failures.
+        // Old host echoes Auto; must not suppress (it may have resolved DualSense).
         assert!(pad_motion_reaches(DualSense, DualSense, Auto));
-        // Even then the declaration still speaks when it is the thing without a plane.
         assert!(!pad_motion_reaches(Xbox360, DualSense, Auto));
     }
 
@@ -976,8 +830,7 @@ mod tests {
             assert_eq!(GamepadPref::from_u8(p.to_u8()), p);
             assert_eq!(GamepadPref::from_name(p.as_str()), Some(p));
         }
-        // Every wire byte 0..=11 is assigned, distinct, and pinned (forward-compat with peers
-        // that only know a prefix of the range).
+        // Bytes 0..=11 are assigned and pinned; older peers may know only a prefix.
         for (v, p) in [
             (0, GamepadPref::Auto),
             (1, GamepadPref::Xbox360),
@@ -995,9 +848,8 @@ mod tests {
             assert_eq!(p.to_u8(), v);
             assert_eq!(GamepadPref::from_u8(v), p);
         }
-        // The next unassigned byte degrades to Auto today; assigning it later must update this.
+        // Next unassigned byte degrades to Auto; assigning it later must update this.
         assert_eq!(GamepadPref::from_u8(12), GamepadPref::Auto);
-        // Aliases + unknowns.
         assert_eq!(GamepadPref::from_name("PS5"), Some(GamepadPref::DualSense));
         assert_eq!(GamepadPref::from_name("x360"), Some(GamepadPref::Xbox360));
         assert_eq!(GamepadPref::from_name("ps4"), Some(GamepadPref::DualShock4));
@@ -1027,8 +879,7 @@ mod tests {
             Some(GamepadPref::XboxOne)
         );
         assert_eq!(GamepadPref::from_name("series"), Some(GamepadPref::XboxOne));
-        // The Elite's aliases, and the one that could plausibly have been stolen: "edge" is the
-        // DualSense Edge and must stay so — the two are different pads on different vendors.
+        // "edge" is DualSense Edge, never Elite.
         assert_eq!(
             GamepadPref::from_name("Elite"),
             Some(GamepadPref::XboxElite)
@@ -1046,7 +897,7 @@ mod tests {
             Some(GamepadPref::DualSenseEdge)
         );
         assert_eq!(GamepadPref::from_name("nope"), None);
-        // Unknown wire byte degrades to Auto (forward-compatible).
+        // Unknown wire byte degrades to Auto.
         assert_eq!(GamepadPref::from_u8(200), GamepadPref::Auto);
     }
 }

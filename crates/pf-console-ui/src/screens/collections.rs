@@ -1,21 +1,18 @@
-//! The library's collections: one tile per group, and the sort that orders them all.
+//! One tile per library group, and the sort that orders them.
 //!
-//! This is the drill-in the whole of Part C exists for — group by platform, walk the
-//! platforms, pick PS3, see its games. It deliberately borrows the home carousel's tile
-//! language rather than inventing a third one: a collection is a place you go, exactly like
-//! a host is, and the console should have one idea of what "a place you go" looks like.
+//! Owns no model. [`crate::collate`] groups the library snapshot; opening a tile
+//! pushes a `LibraryScreen` with a filter rather than a filtered copy, so the art
+//! pump, fetch, and shared model never learn this screen exists. Tile metrics match
+//! the home carousel pixel-for-pixel.
 //!
-//! It owns no model. The groups come from [`crate::collate`] over the library screen's own
-//! snapshot, and opening one pushes a `LibraryScreen` with a FILTER rather than a filtered
-//! copy of the library — so the art pump, the fetch flow and the shared model never learn
-//! that collections exist.
+//! Two entry paths, one flag ([`CollectionsScreen::root`]). From a shelf's Y the
+//! shelf stays underneath. As the host's library ("Start in collections",
+//! `LibraryScreen::collections_upgrade`) nothing is underneath, so this screen
+//! pumps the model's poster queue and Y opens the unfiltered list.
 //!
-//! It is reached two ways, and the difference is one flag ([`CollectionsScreen::root`]).
-//! From a shelf's Y there is a shelf underneath it, holding the covers and waiting for the
-//! B. Opened as the host's library — the "Start in collections" setting, where the shelf
-//! hands over the moment it knows there is more than one collection
-//! (`LibraryScreen::collections_upgrade`) — there is nothing underneath, so this screen
-//! feeds itself from the model's poster queue and offers Y as the way to the whole library.
+//! Pin: `as_the_librarys_root_it_takes_only_the_covers_it_fans`,
+//! `a_drill_in_from_a_shelf_leaves_the_queue_alone`,
+//! `the_way_to_all_titles_exists_only_where_there_is_no_shelf`.
 
 use crate::anim::{entrances, Entrance, EntranceAt, Spring};
 use crate::collate::{collate, GroupBy, GroupKey, SortKey};
@@ -33,72 +30,51 @@ use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Color4f, Image, Matrix, Point, RRect, Rect, TileMode};
 use std::collections::HashMap;
 
-// Home's tile metrics, to the pixel. The module doc claims a collection is "a place you go,
-// exactly like a host is" — that claim is only checkable if the two tiles are the SAME tile,
-// so these are not "close to" home.rs:20-23, they are it.
+// Same numbers as home.rs — a collection tile is a host tile.
 const TILE_W: f64 = 340.0;
 const TILE_H: f64 = 224.0;
 const TILE_GAP: f64 = 30.0;
 const TILE_CORNER: f64 = 26.0;
-/// How many poster covers the deck goes deep. Three is enough to say "this is a shelf of
-/// covers" and few enough that they stay recognisable at tile size.
+/// Deck depth. Three reads as a shelf; more and the back cards vanish at tile size.
 const FAN: usize = 3;
 
-// The box the deck is laid out in, from the tile's padded top-left. Reserved whether or not
-// a single cover decoded, so the top-right caption keeps a clear corner and the title below
-// keeps a clear rail — `the_deck_stays_clear_of_the_tiles_own_text` holds it to both.
+// Reserved even with no covers, so the caption corner and the title rail stay clear.
 const FAN_W: f64 = 120.0;
 const FAN_H: f64 = 130.0;
-// The FRONT cover; the other two are this one, smaller. 2:3, the same as the shelf's posters
-// and the grid's cells, so a cover here is the shape of the cover it opens.
+// Front cover; the rest are this rect, smaller. 2:3, matching the shelf posters it opens.
 const COVER_H: f64 = 118.0;
 const COVER_W: f64 = COVER_H * 2.0 / 3.0;
 const COVER_CORNER: f64 = 11.0;
-// How the deck splays: each card further back is smaller, higher, further right and turned a
-// few degrees more. Four cues rather than one because any single one is ambiguous at couch
-// distance — a smaller card could be a smaller cover, a lifted one a taller cover — but
-// smaller AND lifted AND turned is unmistakably "behind".
+// Back cards: smaller, higher, further right, and turned. One cue alone is a smaller cover.
 const FAN_SCALE_STEP: f64 = 0.07;
 const FAN_DX: f64 = 18.0;
 const FAN_DY: f64 = -7.0;
 const FAN_ROT_DEG: f64 = 6.0;
-// The contact shadow under each card: a HARD round-rect, grown on every side and dropped
-// down-right, never a blur. A blurred shadow per cover would be three `MaskFilter`s per tile
-// and fifteen across a live strip, where the whole crate has three blur call sites; at
-// 1280x800 from a sofa a 3 px hard band and a 3 px soft one are the same mark.
+// Hard round-rect, not a blur: three `MaskFilter`s per tile, fifteen on a live strip.
 const PLATE_OUTSET: f64 = 3.0;
 const PLATE_DX: f64 = 1.5;
 const PLATE_DY: f64 = 2.0;
 const PLATE_ALPHA: f32 = 0.38;
 
 pub(crate) struct CollectionsScreen {
-    /// Everything needed to build the filtered library this screen pushes into. Copied at
-    /// construction from the shelf that opened it, so a collection inherits its host AND
-    /// its pinned profile — a drill-in off a pinned card's shelf must still launch the way
-    /// that card does.
+    /// Host and pinned profile from the shelf that opened this. A drill-in off a
+    /// pinned card must still launch the way that card does.
     host: HostRow,
     cursor: i32,
     anim: Spring,
     bump: Spring,
     sort: SortKey,
     sort_tabs: TabStrip,
-    /// Group labels/keys/counts as of the last sync, and the poster ids that fan on each.
     groups: Vec<GroupTile>,
     generation: u64,
-    /// Decoded posters, borrowed by id from whatever the library screen already fetched —
-    /// this screen never asks for art of its own. A group whose covers have not arrived
-    /// yet simply fans nothing and shows its monogram, which is also what a platform of
-    /// art-less ROM entries looks like permanently.
+    /// Posters borrowed by id from the library screen. This screen never fetches art;
+    /// a group with none yet (or ever — art-less ROMs) fans a monogram.
     art: HashMap<String, Image>,
-    /// The scale `art` was decoded for — the last frame's `k`, published by `render` before
-    /// it syncs, exactly as the shelf publishes its own.
+    /// Decode scale: last frame's `k`, published by `render` before `sync`.
     art_k: f64,
-    /// This screen stands where the library's SHELF would have stood: it was opened as the
-    /// host's library ("Start in collections"), not from a shelf's Y. Two things follow, and
-    /// both are wrong the other way round — it feeds itself from the model's poster queue
-    /// (there is no shelf beneath it to do that), and it offers the way to the whole library
-    /// (there is no shelf beneath it to go back to).
-    root: bool,
+    /// Opened as the host's library, not from a shelf's Y. Pumps the poster queue
+    /// itself and offers Y as the way to the whole library — there is no shelf beneath.
+    root: bool;
     geom: Vec<Rect>,
     entrance: Option<Entrance>,
     entrance_armed: bool,
@@ -108,23 +84,17 @@ struct GroupTile {
     key: GroupKey,
     label: String,
     count: usize,
-    /// Up to [`FAN`] titles whose covers fan across the tile.
     fan: Vec<FanCard>,
 }
 
-/// One card in a tile's deck — what it takes to DRAW that title's cover without holding the
-/// title.
+/// Id plus launcher icon — enough to draw the cover without holding the title.
 ///
-/// The id alone was not enough, and a launcher group is where that showed: a launcher has no
-/// poster, its cover IS its brand mark, and the mark is drawn from `icon` rather than looked
-/// up in the art map. Fanning ids only, the deck found no image for any of them and drew a
-/// rank of empty ghosts — reported from a Deck as the Launchers collection showing covers
-/// with no logos in them.
+/// A launcher has no poster; its cover is a brand mark from `icon`. Ids alone
+/// fan empty ghosts for every launcher group.
 struct FanCard {
     id: String,
-    /// The launcher's icon key (`steam`, `playnite`, …), empty for an ordinary game. Carried
-    /// rather than resolved at collate time because the mark is a PATH built to fit the rect
-    /// it is drawn into, and the tile's card rect is not known here.
+    /// Launcher icon key (`steam`, …); empty for a game. A path built to the card
+    /// rect, which is not known at collate time.
     icon: String,
 }
 
@@ -140,8 +110,7 @@ impl CollectionsScreen {
             groups: Vec::new(),
             generation: u64::MAX,
             art: HashMap::new(),
-            // Seated at the design scale; the first frame publishes the real one, and it
-            // does so before the first `sync` can decode anything against it.
+            // Design scale until the first frame publishes the real `k` before `sync`.
             art_k: 1.0,
             root: false,
             geom: Vec::new(),
@@ -154,9 +123,8 @@ impl CollectionsScreen {
         self.host.name.clone()
     }
 
-    /// Re-derive the tiles when the library moved under us (a rescan, a late fetch) or the
-    /// sort changed. Cheap enough to do on a generation bump: collation is one pass and
-    /// the tiles hold labels and ids, not games.
+    /// Rebuild tiles on a library generation bump or a sort change. Collation is
+    /// one pass; tiles hold labels and ids, not games.
     fn sync(&mut self, library: &LibraryShared) {
         if library.generation() != self.generation {
             let snap = library.snapshot();
@@ -182,20 +150,17 @@ impl CollectionsScreen {
                 .collect();
             self.cursor = self.cursor.clamp(0, (self.groups.len() as i32 - 1).max(0));
         }
-        // Outside the generation guard: the list settles in one bump and the art streams in
-        // for seconds afterwards.
+        // Art arrives after the list settles; the generation guard would miss it.
         if self.root {
             self.pump_art(library);
         }
     }
 
-    /// Decode the covers this screen FANS, and only those.
+    /// Decode only the covers this screen fans, and only as the library's root.
     ///
-    /// Only as the library's root, and even then only by name. The shelf drains the model's
-    /// queue wholesale because it eventually draws everything in it; this screen draws three
-    /// covers per group. The bytes are pushed once per fetch and never re-sent, so a
-    /// wholesale drain here would take four hundred posters, keep a dozen, and leave the
-    /// shelf a tile opens with monograms for the rest of the session.
+    /// The shelf drains the model's queue wholesale. Bytes are pushed once per fetch
+    /// and never re-sent: a wholesale drain here would keep a dozen posters and leave
+    /// the next shelf with monograms for the rest of the session.
     fn pump_art(&mut self, library: &LibraryShared) {
         let want: std::collections::HashSet<String> = self
             .groups
@@ -217,16 +182,12 @@ impl CollectionsScreen {
         }
     }
 
-    /// Stand in for the shelf this screen was opened INSTEAD of — see [`Self::root`].
     pub(crate) fn own_library(&mut self) {
         self.root = true;
     }
 
-    /// Adopt whatever posters the library screen has already decoded. Reading the shared
-    /// model's art queue would be wrong on the drill-in path — that queue is drained by the
-    /// shelf this screen is standing on — so this takes a snapshot handed down at
-    /// construction time instead. As the library's own root there is no shelf to read it
-    /// from either, and [`Self::pump_art`] takes over from here.
+    /// Take posters the library screen already decoded. The model's queue is drained
+    /// by the shelf this drill-in sits on; as root, [`Self::pump_art`] takes over.
     pub(crate) fn adopt_art(&mut self, art: HashMap<String, Image>) {
         self.art = art;
     }
@@ -247,16 +208,15 @@ impl CollectionsScreen {
         }
     }
 
-    /// Step the sort and persist it. The shelf reads `library_sort` every frame, so the
-    /// collection tiles AND the shelf waiting behind this screen both re-order at once —
-    /// which is the point of putting the pills here rather than in a dialog.
+    /// Step the sort and persist it. The shelf reads `library_sort` every frame, so
+    /// the tiles here and the shelf behind re-order together.
     fn step_sort(&mut self, delta: i32, ctx: &mut Ctx) -> Option<MenuPulse> {
         let all = SortKey::ALL;
         let at = all.iter().position(|s| *s == self.sort).unwrap_or(0);
         let next = (at as i32 + delta).rem_euclid(all.len() as i32) as usize;
         self.sort = all[next];
         super::library::store_sort(self.sort, ctx);
-        // Force a re-collate: the sort changed, not the library.
+        // Sort changed, not the library — force a re-collate.
         self.generation = u64::MAX;
         Some(MenuPulse::Move)
     }
@@ -275,27 +235,19 @@ impl CollectionsScreen {
             MenuEvent::JumpForward => self.step_sort(1, ctx),
             MenuEvent::Confirm => {
                 let g = self.groups.get(self.cursor.max(0) as usize)?;
-                // The CURRENT epoch: a drill-in raises no fetch of its own — it filters the
-                // list already in the model — so the titles it shows are this epoch's by
-                // definition. (`set_filter` marks it drilled, which refuses a second
-                // collections hand-over regardless; this just keeps the epoch honest rather
-                // than leaning on that.)
+                // This epoch: a drill-in fetches nothing, it filters the list already
+                // in the model. `set_filter` also refuses a second collections hand-over.
                 let mut shelf =
                     super::library::LibraryScreen::new(&self.host, ctx.library.fetch_epoch());
                 shelf.set_filter(g.key.clone(), g.label.clone());
-                // Hand the decoded posters DOWN as well. These are the very covers this
-                // screen just fanned on the tile the user pressed; without this the drill-in
-                // waits out the art deadline and then shows monograms forever, because the
-                // shared queue that fed them was drained by the shelf above.
+                // Covers this tile just fanned. Without them the drill-in waits out
+                // the art deadline and shows monograms: the shared queue was drained above.
                 shelf.adopt_art(self.art.clone());
                 fx.push(Screen::Library(shelf));
                 Some(MenuPulse::Confirm)
             }
-            // Y is the way to the whole library — and it exists only when this screen IS the
-            // library, because then there is no shelf underneath and one alphabetical list
-            // of everything would otherwise be reachable only by turning the setting off.
-            // Opened from a shelf's own Y, that shelf is one B away and this would be a
-            // second, deeper copy of it.
+            // Whole-library only as root: nothing is underneath. From a shelf's Y
+            // that shelf is one Back away; this would push a second copy of it.
             MenuEvent::Secondary if self.root => {
                 let mut shelf =
                     super::library::LibraryScreen::new(&self.host, ctx.library.fetch_epoch());
@@ -330,8 +282,7 @@ impl CollectionsScreen {
                     return true;
                 }
                 match p.pick(&self.geom).filter(|i| *i < self.groups.len()) {
-                    // The carousel's rule: a press brings a tile to the centre, and a press
-                    // on the CENTRED tile opens it.
+                    // Press centres a tile; press the centred tile to open it.
                     Some(i) if i == self.cursor as usize => {
                         self.menu(MenuEvent::Confirm, ctx, fx);
                         true
@@ -349,8 +300,7 @@ impl CollectionsScreen {
 
     pub(crate) fn hints(&self, _ctx: &Ctx) -> Vec<Hint> {
         let mut hints = vec![Hint::new(HintKey::Confirm, "Open")];
-        // Offered on exactly the condition the press answers to, so the legend never
-        // advertises a button that would do nothing.
+        // Same condition the press answers, so the legend never advertises a no-op.
         if self.root {
             hints.push(Hint::new(HintKey::Secondary, "All titles"));
         }
@@ -368,8 +318,7 @@ impl CollectionsScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
-        // Published before the sync that reads it: a poster is cached against the scale it
-        // will be drawn at, and a decode is not something this can redo.
+        // Cached against the scale it will be drawn at; a decode cannot be redone.
         self.art_k = k;
         self.sync(ctx.library);
         let labels: Vec<&str> = SortKey::ALL.iter().map(|s| s.label()).collect();
@@ -378,9 +327,8 @@ impl CollectionsScreen {
             .position(|s| *s == self.sort)
             .unwrap_or(0);
         let strip = Rect::from_xywh(rect.left, rect.top, rect.width(), (TAB_STRIP_H * k) as f32);
-        // Captioned, the way the library's own bar captions the identical row: four pills
-        // reading "Default · A–Z · Platform · Store" are a sort only once something says so,
-        // and this screen and the shelf behind it are showing the SAME key.
+        // Same caption as the library bar: four unlabeled pills are not a sort, and
+        // this screen and the shelf behind share the key.
         let cap_x = f64::from(strip.left) + EDGE_INSET * k;
         let pills = cap_x + super::library::strip_caption(canvas, fonts, "SORT", strip, cap_x, k);
         self.sort_tabs.render(
@@ -455,14 +403,9 @@ impl CollectionsScreen {
             canvas.scale((scale as f32, scale as f32));
             canvas.translate((-cxx as f32, -cyy as f32));
             let recede = 1.0 - f;
-            // Raised only when it does something, and bounded to the tile when it does.
-            // Unbounded, `save_layer` allocates a SCREEN-SIZED offscreen — five of them a
-            // frame here, one of which was pure ceremony: the focused settled tile is at
-            // alpha 1.0 with no recede, so its layer composited a full screen to arrive
-            // back where it started. The deck below draws a dozen round-rects per tile and
-            // every one of them would have been a draw into that offscreen. Same guard the
-            // coverflow already uses (screens/library.rs:1119); the outset covers
-            // `focus_halo`'s 4 + 3·10 reach and `drop_shadow`'s +10 drop.
+            // Layer only when alpha or recede does work, and bound it to the tile.
+            // Unbounded, `save_layer` allocates a screen-sized offscreen per tile.
+            // Outset covers `focus_halo` (4 + 3·10) and `drop_shadow`'s +10 drop.
             let layered = alpha < 0.999 || recede > 0.001;
             let bounds = tile.with_outset(((36.0 * k) as f32, (36.0 * k) as f32));
             if layered {
@@ -492,9 +435,9 @@ impl CollectionsScreen {
             }
             self.draw_tile(canvas, fonts, i, tile, k);
             if layered {
-                canvas.restore(); // layer
+                canvas.restore();
             }
-            canvas.restore(); // transform
+            canvas.restore();
         }
 
         if self.groups.is_empty() {
@@ -526,15 +469,8 @@ impl CollectionsScreen {
         let pad = 20.0 * k;
         let (l, t) = (f64::from(rect.left) + pad, f64::from(rect.top) + pad);
 
-        // The deck. It sits in the top-left corner at a FIXED size, and the text below it
-        // runs the tile's full inner width — the same composition as a host tile, and the
-        // end of a two-column split that let the covers decide where the title started. A
-        // group whose posters had decoded got 76 px of title and clipped "PlayStation 3" to
-        // "Play…", while the group beside it that had none got twice that, so the strip's
-        // text rail was ragged and moved as art streamed in.
-        //
-        // Scaled by the TILE rather than by `k` alone so that a squeezed tile takes the
-        // deck down with it instead of letting it run into the title.
+        // Fixed-size deck, top-left; title runs the full inner width. Scale by the
+        // tile, not `k` alone, or a squeezed tile lets the deck hit the title.
         let fk = (f64::from(rect.height()) / TILE_H).min(k);
         let front = Rect::from_xywh(
             l as f32,
@@ -547,10 +483,8 @@ impl CollectionsScreen {
             (COVER_CORNER * fk) as f32,
             (COVER_CORNER * fk) as f32,
         );
-        // What each slot actually draws. A launcher has no poster and never will — its cover
-        // is its brand mark — so it is a face in its own right rather than a slot still
-        // waiting for art. Compacted like the posters: a gap in the middle would read as a
-        // rendering fault.
+        // A launcher's cover is its brand mark, not a missing poster. Compact gaps:
+        // a hole in the middle reads as a draw fault.
         let have: Vec<Face<'_>> = g
             .fan
             .iter()
@@ -560,17 +494,13 @@ impl CollectionsScreen {
                 None => None,
             })
             .collect();
-        // Never deeper than the group has titles: a one-game platform must not pretend to
-        // be a stack of three. `have` compacts (a missing poster in the middle would read
-        // as a rendering bug), so covers fill from the front and ghosts trail behind.
+        // Never deeper than the group has titles. `have` is compact, so covers fill
+        // from the front and ghosts trail.
         let slots = FAN.min(g.count.max(1));
-        // Never thinner than a device pixel, the same floor `panel_highlight` keeps: a
-        // hairline that is the whole separation between two covers cannot be allowed to
-        // fade to a grey smear on a 720p panel.
+        // Device-pixel floor, same as `panel_highlight`: a sub-pixel hairline smears.
         let hair = fk.max(1.0) as f32;
-        // BACK TO FRONT, so `fan[0]` — the sort-first game, the one that represents the
-        // group — lands on top and nearest the title. Ascending order buried it at the back
-        // and put the sort's LAST pick in the hero position.
+        // Back to front so `fan[0]` (sort-first, the group's face) lands on top.
+        // Ascending order buried it and put the sort's last pick in front.
         for n in (0..slots).rev() {
             canvas.save();
             canvas.concat(&fan_matrix(front, n, fk));
@@ -581,33 +511,25 @@ impl CollectionsScreen {
                         Face::Poster(img) => draw_cover(canvas, img, front, rr),
                         Face::Launcher(icon) => draw_launcher_face(canvas, icon, front, rr),
                     }
-                    // Back cards move TOWARD THE GROUND — `shade` is black on a dark
-                    // palette and white on a pale one, the same rule `recede_matrix`
-                    // follows. A colour filter would read better still and costs a
-                    // save_layer per cover, which is the one thing this deck must not do.
+                    // Recede toward the ground (`shade` tracks the palette). A colour
+                    // filter would cost a `save_layer` per cover — the deck must not.
                     if n > 0 {
                         canvas.draw_rrect(rr, &fill(crate::theme::shade(0.14 * n as f32)));
                     }
-                    // The plate under the card and an ink hairline on top of it: a lit edge
-                    // over a shadow on a dark palette, a drawn line over one on a pale
-                    // palette, and an edge either way. Nothing drew a boundary at all
-                    // before, so dark art overlapping dark art merged into one black blob.
-                    // Back cards get the stronger rim; they need the separation more.
+                    // Plate under, ink hairline on top: an edge on both palettes.
+                    // Stronger rim on back cards; they need the separation more.
                     canvas.draw_rrect(
                         rr.with_inset((hair / 2.0, hair / 2.0)),
                         &stroke(fg(if n == 0 { 0.18 } else { 0.28 }), hair),
                     );
                 }
-                // Slot zero with nothing decoded is the monogram — a platform of art-less
-                // ROM entries looks like this permanently, so it has to be a finished thing
-                // rather than a gap.
+                // Front slot with no art: finished monogram, not a gap. Art-less ROMs stay this.
                 None if n == 0 => {
                     plate(canvas, rr, fk);
                     draw_monogram(canvas, fonts, &g.label, front, rr, hair);
                 }
-                // A ghost: the silhouette of a card that has not arrived. No plate — an
-                // empty slot casts no shadow — but the deck keeps its depth, so a tile does
-                // not change shape as its posters stream in.
+                // Empty silhouette, no plate (nothing to cast a shadow). Keeps deck depth
+                // so the tile does not change shape as posters arrive.
                 None => {
                     canvas.draw_rrect(rr, &fill(crate::theme::shade(0.10)));
                     canvas.draw_rrect(
@@ -619,9 +541,7 @@ impl CollectionsScreen {
             canvas.restore();
         }
 
-        // Title and count on the bottom rail at full inner width, exactly where the host
-        // tile puts its name and address (home.rs:523-532). 300 px at 1280x800, identical
-        // on every tile in the strip whatever decoded.
+        // Bottom rail, full inner width — same place the host tile puts name and address.
         let max_w = f64::from(rect.width()) - 2.0 * pad;
         let sub_base = f64::from(rect.bottom) - pad;
         let count = if g.count == 1 {
@@ -649,22 +569,20 @@ impl CollectionsScreen {
             fg(1.0),
             max_w,
         );
-        // What KIND of collection this is, so "Steam" as a platform bucket and "Steam" as
-        // a store read as the same thing they are. Top-right, where the host tile keeps its
-        // status cluster — the corner the deck deliberately leaves clear.
+        // Platform vs store, so two "Steam" buckets stay distinct. Top-right, the
+        // corner the deck leaves clear.
         let kind = match &g.key {
             GroupKey::Launchers => "LAUNCHERS",
             GroupKey::Platform(_) => "PLATFORM",
             GroupKey::Store(_) => "STORE",
         };
-        // `draw_tracked` adds tracking after EVERY character including the last, so the ink
-        // ends one gap short of the pen — hence `n - 1` when hanging it off the right edge.
+        // `draw_tracked` tracks after every character including the last, so the ink
+        // ends one gap short of the pen — `n - 1` when hanging off the right edge.
         let track = 1.4 * k;
         let kind_w = f64::from(fonts.measure(kind, W::SemiBold, 11.0 * k))
             + track * (kind.chars().count().saturating_sub(1)) as f64;
-        // …and never left of the corner the deck reserves: the tile narrows with the window
-        // (`tile_w` is capped at 80 % of the field), and on a narrow one a right-aligned
-        // caption would otherwise walk back into the covers.
+        // Never left of the deck's reserved corner: a narrow tile would otherwise
+        // walk the caption back into the covers.
         let kind_x = (f64::from(rect.right) - pad - kind_w).max(l + (FAN_W + 10.0) * fk);
         fonts.draw_tracked(
             canvas,
@@ -679,11 +597,10 @@ impl CollectionsScreen {
     }
 }
 
-/// Where card `n` of the deck sits, as a transform on the FRONT card's rect.
+/// Transform that places card `n` relative to the front card's rect.
 ///
-/// A pure function rather than four `canvas` calls inline so the geometry can be asserted
-/// without a GPU: the one thing that can go wrong here is the deck growing past the box it
-/// reserves and colliding with the title under it.
+/// Pure so the geometry can be asserted without a GPU. The trap is the deck
+/// growing past the box it reserves and hitting the title under it.
 fn fan_matrix(front: Rect, n: usize, k: f64) -> Matrix {
     let n = n as f64;
     let s = (1.0 - FAN_SCALE_STEP * n) as f32;
@@ -694,13 +611,10 @@ fn fan_matrix(front: Rect, n: usize, k: f64) -> Matrix {
     m
 }
 
-/// The contact shadow under one card — the depth cue that survives any cover art, because
-/// it is not made of cover art.
+/// Contact shadow under one card. Drawn, not sampled from the cover.
 fn plate(canvas: &Canvas, rr: RRect, k: f64) {
-    // Black under a card is WEIGHT on a dark field and DIRT on a pale one, where it is the
-    // heaviest mark on the screen. `theme::drop_shadow` scales itself back at the pale pole
-    // for exactly that reason; a shadow that ignored the palette would put a grey-brown
-    // smear between every pair of covers on `dawn` and `bloom`.
+    // Black is weight on a dark field and dirt on a pale one. `theme::drop_shadow`
+    // scales back at the pale pole; ignoring that smears every pair of covers.
     let alpha = if crate::theme::ink().scrim.r > 0.5 {
         PLATE_ALPHA * 0.40
     } else {
@@ -713,26 +627,19 @@ fn plate(canvas: &Canvas, rr: RRect, k: f64) {
     );
 }
 
-/// One cover, centre-cropped to the card's 2:3 and drawn as a single shader-filled
-/// round-rect.
-///
 /// What one slot of the deck draws.
 enum Face<'a> {
-    /// A decoded poster, adopted from the shelf that opened this screen.
+    /// Decoded poster, adopted from the shelf that opened this screen.
     Poster(&'a Image),
-    /// A launcher's brand mark, drawn from its icon key. Not a missing poster — a launcher
-    /// entry has no cover art and never will, so this is its finished appearance.
+    /// Brand mark from the icon key. Not a missing poster — a launcher has no cover art.
     Launcher(&'a str),
 }
 
-/// A launcher's card: the brand face the library's own placeholder uses, with its mark
-/// centred on it. Kept in step with `screens::library::draw_poster_placeholder` on purpose —
-/// the same launcher appears as a card in the shelf and as a cover in this deck, and two
-/// recipes would have it two colours.
+/// Launcher card: the library placeholder's brand face, mark centred. Same recipe
+/// as `screens::library::draw_poster_placeholder` so one launcher is not two colours.
 fn draw_launcher_face(canvas: &Canvas, icon: &str, front: Rect, rr: RRect) {
     canvas.draw_rrect(rr, &fill(crate::theme::card_face(0.38)));
-    // ~44 % of the card, letterboxed by `launcher_mark` itself, so a non-square master keeps
-    // its proportions rather than stretching to the 2:3.
+    // ~44 % of the card; `launcher_mark` letterboxes, so a non-square master is not stretched to 2:3.
     let side = front.width().min(front.height()) * 0.44;
     let box_ = Rect::from_xywh(
         front.left + (front.width() - side) / 2.0,
@@ -745,12 +652,11 @@ fn draw_launcher_face(canvas: &Canvas, icon: &str, front: Rect, rr: RRect) {
     }
 }
 
-/// Not `clip_rrect` + `draw_image_rect`, which is what this replaced: it is a save, a clip
-/// and a draw where this is one draw, and — the load-bearing part — a rotated round-rect
-/// FILL stays on Skia's analytic path, where a rotated round-rect CLIP is no longer
-/// device-axis-aligned and falls back to a clip mask. At three covers across five live
-/// tiles that is fifteen mask allocations a frame, which would have made the deck's turn
-/// unaffordable. If this ever goes back to a clip, `FAN_ROT_DEG` must go to zero with it.
+/// Centre-crop to the card's 2:3 and fill the round-rect with one shader.
+///
+/// Not `clip_rrect` + `draw_image_rect`: a rotated round-rect clip is no longer
+/// axis-aligned and falls back to a clip mask (three covers × five tiles = fifteen
+/// masks a frame). If this goes back to a clip, `FAN_ROT_DEG` must go to zero with it.
 fn draw_cover(canvas: &Canvas, img: &Image, front: Rect, rr: RRect) {
     let (iw, ih) = (img.width() as f32, img.height() as f32);
     let aspect = front.width() / front.height();
@@ -771,29 +677,24 @@ fn draw_cover(canvas: &Canvas, img: &Image, front: Rect, rr: RRect) {
     ) else {
         return;
     };
-    // OPAQUE by construction — Skia modulates a shader by the paint's alpha, so a
-    // transparent placeholder here would draw literally nothing (theme.rs:52-64).
+    // Opaque: Skia modulates a shader by the paint's alpha, so a transparent
+    // placeholder here draws nothing.
     let mut p = crate::theme::shaded();
     p.set_shader(shader);
     canvas.draw_rrect(rr, &p);
 }
 
-/// The front card when the group has no art at all: its initials on an accent-tinted face.
+/// Front card when the group has no art: initials on an accent-tinted face.
 fn draw_monogram(canvas: &Canvas, fonts: &Fonts, label: &str, front: Rect, rr: RRect, hair: f32) {
-    // The face FOLLOWS THE PALETTE. It used to be a fixed near-black (0.118, 0.118, 0.145)
-    // carrying an `fg()` glyph, and on the six pale palettes `fg()` is itself a near-black
-    // tinted toward the ground — on `mint` the two composited to 1.03:1, so the monogram was
-    // not dim there, it was absent, and had been on every pale palette since they shipped.
-    // An accent tint moves with the field and the ink moves the opposite way, so the pair
-    // separates at both poles by construction rather than by luck.
+    // Accent-tinted face, not a fixed near-black: `fg()` is itself near-black on
+    // pale palettes, so a dark face and a dark glyph vanish into each other.
     canvas.draw_rrect(rr, &fill(accent(0.20)));
     canvas.draw_rrect(
         rr.with_inset((hair / 2.0, hair / 2.0)),
         &stroke(accent(0.5), hair),
     );
     let mono = initials(label);
-    // Off the CARD, not off `k`: the deck's cards are smaller than a shelf poster and a
-    // monogram scaled for one would not fit the other.
+    // Sized off the card, not `k`: deck cards are smaller than a shelf poster.
     let size = f64::from(front.height()) * 0.30;
     let font = fonts.font(W::Bold, size);
     let tw = font.measure_str(&mono, None).0;
@@ -833,8 +734,8 @@ mod tests {
         }
     }
 
-    /// Two platforms of four titles each — more per group than the deck's [`FAN`] three, so
-    /// some covers belong to no tile and the queue has something to be left with.
+    /// Two platforms of four titles — more per group than [`FAN`], so the queue
+    /// keeps covers no tile draws.
     fn two_platforms() -> LibraryShared {
         let library = LibraryShared::default();
         library.set_games(
@@ -867,22 +768,20 @@ mod tests {
         library
     }
 
-    /// As the library's root this screen feeds itself — and takes ONLY the covers it fans.
+    /// As the library's root this screen feeds itself — and takes only the covers it fans.
     ///
-    /// The poster bytes are pushed once per fetch and never re-sent, so every one taken by a
-    /// screen that cannot draw it is a monogram on the shelf a tile opens. A wholesale drain
-    /// here would look right on this screen and gut the next one.
+    /// Poster bytes are pushed once per fetch and never re-sent. A wholesale drain
+    /// would look right here and leave the next shelf with monograms.
     #[test]
     fn as_the_librarys_root_it_takes_only_the_covers_it_fans() {
         let library = two_platforms();
         let mut s = CollectionsScreen::new(&host(), SortKey::HostOrder);
         s.own_library();
-        // Bounded per frame, like the shelf's own pump: several frames to take six covers.
+        // Bounded per frame, like the shelf's pump: several frames to take six covers.
         for _ in 0..8 {
             s.sync(&library);
         }
-        // Only the poster-backed slots: a launcher's card is drawn from its icon and must
-        // never be fetched, which is the other half of what this test is holding.
+        // Poster-backed slots only: a launcher's card is drawn from its icon, never fetched.
         let mut fanned: Vec<String> = s
             .groups
             .iter()
@@ -911,8 +810,8 @@ mod tests {
         );
     }
 
-    /// Opened from a shelf's Y, that shelf is still under this screen and still expects the
-    /// queue it has been draining all along. Touching it here would starve it.
+    /// From a shelf's Y that shelf is still underneath and still draining the queue.
+    /// Touching it here would starve it.
     #[test]
     fn a_drill_in_from_a_shelf_leaves_the_queue_alone() {
         let library = two_platforms();
@@ -928,9 +827,8 @@ mod tests {
         );
     }
 
-    /// The way to the whole library exists exactly where the whole library is otherwise
-    /// unreachable — as the root, with no shelf beneath. Opened from a shelf's Y it would be
-    /// a second, deeper copy of the screen one B away.
+    /// Y opens the whole library only as root, where that list is otherwise unreachable.
+    /// From a shelf's Y it would be a second copy of the screen one Back away.
     #[test]
     fn the_way_to_all_titles_exists_only_where_there_is_no_shelf() {
         let library = two_platforms();
@@ -969,13 +867,12 @@ mod tests {
         assert!(root.hints(&ctx).iter().any(|h| h.key == HintKey::Secondary));
     }
 
-    /// The tile at `k`, laid out the way [`CollectionsScreen::render`] lays it out.
+    /// Tile at `k`, matching [`CollectionsScreen::render`].
     fn tile(k: f64) -> Rect {
         Rect::from_xywh(100.0, 60.0, (TILE_W * k) as f32, (TILE_H * k) as f32)
     }
 
-    /// The front card of the deck on that tile — [`CollectionsScreen::draw_tile`]'s own
-    /// arithmetic, and the only thing the deck's geometry is a function of.
+    /// Front card of the deck — [`CollectionsScreen::draw_tile`]'s arithmetic.
     fn front_card(rect: Rect, k: f64) -> Rect {
         let pad = 20.0 * k;
         Rect::from_xywh(
@@ -986,7 +883,6 @@ mod tests {
         )
     }
 
-    /// The deck's whole footprint, every slot, however many decoded.
     fn deck_bounds(rect: Rect, k: f64) -> Rect {
         let front = front_card(rect, k);
         let mut b = Rect::new_empty();
@@ -996,10 +892,8 @@ mod tests {
         b
     }
 
-    /// The deck turns and lifts, so its footprint is NOT the front card's — the property
-    /// that matters is that however far it splays it stays inside the box it reserves and
-    /// off the title underneath. Getting this wrong is a collision no screenshot of one
-    /// palette would catch and every long group label would.
+    /// The deck turns and lifts, so its footprint is not the front card. However far
+    /// it splays it must stay inside the reserved box and off the title underneath.
     #[test]
     fn the_deck_stays_clear_of_the_tiles_own_text() {
         for k in [0.75, 1.0, 1.5, 2.0, 3.0] {
@@ -1017,8 +911,7 @@ mod tests {
                 f64::from(deck.bottom) <= t + FAN_H * k + slack,
                 "k={k}: {deck:?}"
             );
-            // Bold 23 sits on `sub_base - 22`; no face's ascent exceeds its em size, so a
-            // full em above the baseline is a bound on where the title's ink can start.
+            // Bold 23 sits on `sub_base - 22`; a full em above the baseline bounds the title's ink.
             let title_top = f64::from(rect.bottom) - pad - 22.0 * k - 23.0 * k;
             assert!(
                 f64::from(deck.bottom) < title_top,
@@ -1028,16 +921,11 @@ mod tests {
         }
     }
 
-    /// A launcher's slot is a FACE, not a slot still waiting for a poster.
+    /// A launcher's slot is a face, not a poster still on its way.
     ///
-    /// Reported from a Deck: the Launchers collection fanned covers "which don't actually
-    /// contain their logos" — blank cards. A launcher entry carries no poster and never will;
-    /// its cover is a brand mark drawn from its icon key. The deck only ever looked in the art
-    /// map, found nothing for any of them, and drew the ghost that means "not arrived yet".
-    ///
-    /// Asserted on what the tile CARRIES rather than on pixels: the defect was the fan losing
-    /// the icon on its way out of collation, and a rendered frame cannot tell a mark that was
-    /// never asked for from one that failed to draw.
+    /// A launcher has no poster; its cover is a brand mark from the icon key.
+    /// Asserted on what the tile carries: a rendered frame cannot tell a mark
+    /// that was never asked for from one that failed to draw.
     #[test]
     fn a_launcher_fans_its_mark_and_is_never_fetched() {
         let library = LibraryShared::default();
@@ -1080,23 +968,19 @@ mod tests {
                 .is_some(),
             "and the icon it carries must actually resolve to a mark"
         );
-        // …and it is never queued for a fetch: a launcher has no poster to wait for, so
-        // asking for one would be a request that can only ever fail.
+        // Never fetched: a launcher has no poster, so the request can only fail.
         assert!(
             !s.art.contains_key("steam"),
             "a launcher's cover is drawn, not fetched"
         );
     }
 
-    /// Every card further back must be smaller, higher AND further right. One cue alone is
-    /// ambiguous at couch distance — a smaller card could be a smaller cover — so the test
-    /// is that all three agree, and that none of them ever reverses.
+    /// Every back card is smaller, higher, and further right. One cue alone is a
+    /// smaller cover.
     ///
-    /// Measured on the card's OWN top edge, not on `map_rect`'s bounding box. The deck turns
-    /// each card a few degrees, and a rotated rectangle's axis-aligned bounds are WIDER than
-    /// the rectangle: at slot 1 the card shrinks 78.7 → 73.2 while its bounds grow to 84.2. A
-    /// test written against the bounds therefore reads a shrinking deck as a growing one, and
-    /// says "did not shrink" about geometry that is doing exactly what it should.
+    /// Measured on the card's own top edge, not `map_rect`'s bounds. Rotation
+    /// makes the axis-aligned box *wider* than the card, so a shrinking deck
+    /// reads as a growing one against the bounds.
     #[test]
     fn the_deck_recedes_in_every_cue_at_once() {
         let front = front_card(tile(1.0), 1.0);
@@ -1116,8 +1000,7 @@ mod tests {
         for n in 1..FAN {
             let (w, bounds) = edge(n);
             assert!(w < prev_w, "slot {n} did not shrink: {w} vs {prev_w}");
-            // The centre survives the rotation (it is the pivot), so the bounding box is a
-            // fair witness for these two.
+            // The centre is the pivot, so the bounding box is a fair witness for lift/right.
             assert!(
                 bounds.center_y() < prev_box.center_y(),
                 "slot {n} did not lift"
@@ -1136,7 +1019,7 @@ mod tests {
         Color4f::new(m(src.r, dst.r), m(src.g, dst.g), m(src.b, dst.b), 1.0)
     }
 
-    /// WCAG's own arithmetic: sRGB to linear, then Rec. 709 relative luminance.
+    /// WCAG contrast: sRGB to linear, then Rec. 709 relative luminance.
     fn contrast(a: Color4f, b: Color4f) -> f32 {
         let lin = |c: f32| {
             if c <= 0.04045 {
@@ -1150,24 +1033,18 @@ mod tests {
         (x.max(y) + 0.05) / (x.min(y) + 0.05)
     }
 
-    /// A group with no decoded art shows its initials, and that had to be readable on ALL
-    /// THIRTEEN palettes rather than on the one anybody screenshots.
+    /// Initials of a group with no art must read on every palette, not just the dark one.
     ///
-    /// The face used to be a hardcoded near-black under an `fg()` glyph. On the six pale
-    /// palettes `fg()` is ITSELF a near-black tinted toward the ground, so the two landed on
-    /// top of each other: `mint` measured 1.03:1 — not a dim monogram, an absent one — and
-    /// it had been that way since the pale palettes shipped. Only an assertion that fails
-    /// before and passes after is worth writing, and this is that assertion.
+    /// A hardcoded near-black face under `fg()` vanishes on pale palettes, where
+    /// `fg()` is itself near-black.
     #[test]
     fn the_monogram_reads_on_every_palette() {
         for p in &crate::library::PALETTES {
             crate::theme::set_ink(crate::theme::Ink::of(p));
             let ground = Color4f::new(p.ground.0 as f32, p.ground.1 as f32, p.ground.2 as f32, 1.0);
-            // The stack the badge actually sits in: the tile's accent tint over the field,
-            // then the badge's own face, then the glyph. The glass between the first two is
-            // left out deliberately — it is white frost on a pale field and near-black on a
-            // dark one, so it pushes the backdrop AWAY from the ink at both poles. Omitting
-            // it is the harder case (measured: it costs every palette some margin).
+            // Tile accent over the field, then the badge face, then the glyph. Glass
+            // between the first two is omitted: it pushes the backdrop away from the
+            // ink at both poles, so this is the harder case.
             let panel = over(accent(0.16), ground);
             let face = over(accent(0.20), panel);
             let glyph = over(fg(0.85), face);

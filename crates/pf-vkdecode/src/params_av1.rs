@@ -1,40 +1,31 @@
-//! AV1 session parameters: the sequence header, converted to `StdVideoAV1SequenceHeader`.
+//! AV1 session parameters: one sequence header as `StdVideoAV1SequenceHeader`.
 //!
-//! AV1's parameter surface is far smaller than H.264's or H.265's — there is no PPS
-//! and no VPS, and `VkVideoDecodeAV1SessionParametersCreateInfoKHR` carries exactly
-//! ONE sequence header. Everything else a frame needs (tiles, quantisation,
-//! segmentation, loop filter, CDEF, loop restoration, global motion, film grain)
-//! rides on the PICTURE info, which is why [`crate::pic_av1`] is the large half of
-//! this codec and this module is the small one.
+//! `VkVideoDecodeAV1SessionParametersCreateInfoKHR` carries exactly that header —
+//! no PPS, no VPS. Per-frame state (tiles, loop filter, CDEF, film grain, …)
+//! is [`crate::pic_av1`].
 //!
-//! Ownership contract as [`crate::OwnedStdSps`]: boxed backing for the two embedded
+//! Ownership as [`crate::OwnedStdSps`]: boxed backing for the two embedded
 //! pointers, movable wrapper, no mutation, deliberately not `Clone`.
 
 use ash::vk::native as hh;
 use cros_codecs::codec::av1::parser::SequenceHeaderObu;
 
-/// `StdVideoAV1Profile` values (`vk_video/vulkan_video_codec_av1std.h`).
 pub const STD_PROFILE_MAIN: hh::StdVideoAV1Profile = 0;
 pub const STD_PROFILE_HIGH: hh::StdVideoAV1Profile = 1;
 pub const STD_PROFILE_PROFESSIONAL: hh::StdVideoAV1Profile = 2;
 
 /// Why a sequence header cannot be expressed to Vulkan.
 ///
-/// The last two variants are the ENVELOPE gate rather than the conversion's:
-/// [`crate::caps_av1::Av1ProfileKey::from_stream`] builds the Vulkan profile from
-/// the same sequence header and has to refuse the sampling/depth combinations this
-/// crate has no picture format for. They live here, with the other sequence-header
-/// refusals, for the reason `H265ParamsError` carries its own pair — one error type
-/// per codec's parameter surface, so a caller matches on one enum.
+/// [`UnsupportedChromaFormat`] and [`UnsupportedBitDepth`] are envelope gates:
+/// [`crate::caps_av1::Av1ProfileKey::from_stream`] refuses sampling/depth this
+/// crate has no picture format for. They sit with the conversion refusals so a
+/// caller matches one enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamsAv1Error {
-    /// A profile outside the Std enumeration.
     UnsupportedProfile(u8),
-    /// A field wider than the Std struct's type for it.
     FieldOverflow { field: &'static str, value: u32 },
-    /// The sequence's sampling, in H.264's `chroma_format_idc` vocabulary (the
-    /// planner's translation): 0 = monochrome, 2 = 4:2:2, 4 = the 4:4:0 shape no
-    /// AV1 profile has. None of them has a picture format in this crate.
+    /// Sampling as H.264 `chroma_format_idc`: 0 = monochrome, 2 = 4:2:2, 4 = 4:4:0
+    /// (no AV1 profile). None has a picture format here.
     UnsupportedChromaFormat(u8),
     /// 12-bit — legal in AV1 Professional, with no output format here.
     UnsupportedBitDepth(u8),
@@ -61,29 +52,25 @@ impl std::fmt::Display for ParamsAv1Error {
 
 impl std::error::Error for ParamsAv1Error {}
 
-/// The converted sequence header plus the heap allocations its pointers target.
+/// Converted sequence header plus the heap blocks its pointers target.
 ///
-/// ⚠⚠ **This must outlive the `VkVideoSessionParametersKHR` it is handed to, not
-/// merely the create call.** A driver in this fleet keeps `pColorConfig` and reads
-/// it at every decode; `session_av1::StoredParamsAv1` is where that is enforced and
-/// where the measurement lives. Boxed backing (rather than inline arrays) is what
-/// makes storing the wrapper enough — moving it does not move the blocks, which
-/// `moving_the_wrapper_leaves_the_driver_s_pointers_put` pins.
+/// Must outlive the `VkVideoSessionParametersKHR` it is handed to, not merely
+/// the create call: a driver retains `pColorConfig` and reads it at every
+/// decode. [`crate::session_av1::StoredParamsAv1`] enforces that.
+/// Boxed backing means moving the wrapper does not move the blocks —
+/// `moving_the_wrapper_leaves_the_driver_s_pointers_put` pins it.
 ///
-/// ⚠⚠ The Std struct ITSELF is boxed for the same reason, one level out:
-/// `pStdSequenceHeader` is [`Self::std`]'s address, and `ensure_parameters` hands
-/// it to the create call BEFORE moving the wrapper into the stored parameters.
-/// Inline, that address would be a moved-from stack slot the instant the function
-/// returned — the original bug's exact shape, differing only in WHICH pointer a
-/// driver chose to retain (`session_av1`'s
-/// `the_sequence_header_address_the_create_call_is_given_survives_being_stored`).
+/// The Std struct itself is boxed for the same reason one level out:
+/// `pStdSequenceHeader` is [`Self::std`]'s address, and `ensure_parameters`
+/// hands it to create before moving the wrapper into stored parameters.
+/// Inline, that address would be a moved-from stack slot.
+/// Evidence: `session_av1::the_sequence_header_address_the_create_call_is_given_survives_being_stored`.
 #[derive(Debug)]
 pub struct OwnedStdAv1SequenceHeader {
     std: Box<hh::StdVideoAV1SequenceHeader>,
     _color_backing: Box<hh::StdVideoAV1ColorConfig>,
-    /// `pTimingInfo` is null unless the stream carries timing info: a decoder needs
-    /// none of it, and a zeroed block behind a non-null pointer would claim a frame
-    /// rate the stream never stated.
+    /// `pTimingInfo` is null unless the stream carries timing. A zeroed block
+    /// behind a non-null pointer would claim a frame rate the stream never stated.
     _timing_backing: Option<Box<hh::StdVideoAV1TimingInfo>>,
 }
 
@@ -94,7 +81,6 @@ impl OwnedStdAv1SequenceHeader {
     }
 }
 
-/// Convert one parsed sequence header.
 pub fn sequence_to_std(
     seq: &SequenceHeaderObu,
 ) -> Result<OwnedStdAv1SequenceHeader, ParamsAv1Error> {
@@ -231,17 +217,11 @@ pub fn sequence_to_std(
 mod tests {
     use super::*;
 
-    /// The wrapper may be MOVED — into the session's stored parameters, out of a
-    /// `Result`, into a struct literal — without disturbing the addresses a driver
-    /// has already been given.
+    /// Moving the wrapper must not change the addresses a driver already holds.
     ///
-    /// Not a Rust triviality worth skipping: it is the whole reason
-    /// [`crate::session_av1`] can fix its use-after-free by storing this value
-    /// rather than by boxing it or pinning it. It holds because the two blocks are
-    /// `Box`ed; an "optimisation" that inlined either one as a field would keep
-    /// every other test in this crate green, keep compiling, and hand the driver a
-    /// pointer into a moved-from stack slot. The AV1 parity leg would catch it on
-    /// hardware — this catches it in ordinary CI.
+    /// The colour and timing blocks are `Box`ed so a move relocates the handles,
+    /// not the heap. Inlining either field would compile, keep other tests green,
+    /// and hand the driver a pointer into a moved-from slot.
     #[test]
     fn moving_the_wrapper_leaves_the_driver_s_pointers_put() {
         let seq = SequenceHeaderObu {
@@ -255,7 +235,6 @@ mod tests {
         assert!(!colour.is_null(), "pColorConfig is always attached");
         assert!(!timing.is_null(), "this header states timing info");
 
-        // Every move a session parameters object's creation puts it through.
         let moved = owned;
         let boxed = Box::new(moved);
         let stored = (*boxed, 0u8);
@@ -263,7 +242,6 @@ mod tests {
 
         assert_eq!(owned.std().pColorConfig, colour);
         assert_eq!(owned.std().pTimingInfo, timing);
-        // And they still address the wrapper's own live blocks, not stale copies.
         // SAFETY: `owned` is alive here and owns both blocks.
         let subsampling = unsafe { ((*colour).subsampling_x, (*colour).subsampling_y) };
         assert_eq!(
@@ -273,15 +251,8 @@ mod tests {
         );
     }
 
-    /// A stream without timing info gets a NULL `pTimingInfo`, and that is a
-    /// deliberate statement rather than an omission.
-    ///
-    /// Measured on NVIDIA 610.57.04: with the backing held for the parameters
-    /// object's life, all 250 frames of the vendored vector are bit-identical to
-    /// libavcodec with this pointer NULL. libavcodec always attaches a zeroed block
-    /// instead; both work. Attaching one here would claim a frame rate the stream
-    /// never stated, so the null stays — but if a future driver refuses it, this is
-    /// the line to change and the sentence to delete.
+    /// A stream without timing info gets a null `pTimingInfo`. A zeroed block
+    /// would claim a frame rate the stream never stated.
     #[test]
     fn a_stream_without_timing_info_sends_no_timing_block() {
         let seq = SequenceHeaderObu {

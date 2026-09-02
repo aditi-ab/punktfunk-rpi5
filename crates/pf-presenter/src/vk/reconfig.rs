@@ -1,4 +1,4 @@
-//! Swapchain recreate / resize / HDR reconfiguration.
+//! Swapchain recreate, resize, and SDR↔HDR10 flip.
 
 use super::setup::pick_formats;
 use super::{OverlayPipe, Presenter};
@@ -6,16 +6,9 @@ use crate::csc::CscPass;
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk;
 
-/// Extra guidance appended to a swapchain-creation failure when SDL is on the KMSDRM backend —
-/// i.e. a compositor-less kiosk/embedded run, where the bare Vulkan error is close to useless.
-///
-/// Measured on an NVIDIA proprietary + KMSDRM box: SDL opens the card, Vulkan enumerates the GPU
-/// *and* the display (`VK_KHR_display` reports the connected HDMI connector), then
-/// `vkCreateSwapchainKHR` returns ERROR_INITIALIZATION_FAILED — as root, with `nvidia_drm.modeset`
-/// on, on a card no compositor was using. So it is neither permissions nor DRM master: NVIDIA's
-/// direct-to-display path wants the display leased (`vkAcquireDrmDisplayEXT`) and SDL's KMSDRM
-/// surface path does not do that for it. Empty on every other backend, where the message would be
-/// noise.
+/// NVIDIA proprietary still fails `vkCreateSwapchainKHR` after a successful
+/// enumerate — it wants `vkAcquireDrmDisplayEXT`, which SDL's KMSDRM surface
+/// does not. Empty on other backends.
 fn kmsdrm_swapchain_hint() -> String {
     let kmsdrm = std::env::var("SDL_VIDEODRIVER").is_ok_and(|v| v.eq_ignore_ascii_case("kmsdrm"));
     if !kmsdrm {
@@ -32,30 +25,19 @@ fn kmsdrm_swapchain_hint() -> String {
 }
 
 impl Presenter {
-    /// (Re)build the swapchain for the window's current pixel size. Also the resize path.
     pub fn recreate_swapchain(&mut self, window: &sdl3::video::Window) -> Result<()> {
         self.quiesce_own()?;
-        // Drain the queue before touching presentation objects: after this, every prior
-        // present's semaphore-wait operation has completed, so the OLD swapchain and its
-        // render semaphores are safe to destroy immediately below. (The previous scheme
-        // parked them and destroyed after one fence cycle — but the fence proves only
-        // OUR submit, not the presentation engine's semaphore consumption:
-        // VUID-vkDestroySemaphore-05149 / VUID-vkDestroySwapchainKHR-01282 on every
-        // recreate, and destroy-in-use is exactly the kind of misuse that turns into an
-        // intermittent VK_ERROR_DEVICE_LOST.) Safe against the pump's decode submits —
-        // both sides hold the shared queue lock — and cheap: a recreate already stalls
-        // the stream for a frame, and only happens on resize/HDR-flip/OUT_OF_DATE.
+        // Presentation-engine semaphore waits finish here. A fence wait proves
+        // only OUR submit (VUID-vkDestroySemaphore-05149 /
+        // VUID-vkDestroySwapchainKHR-01282). Decode submits share `queue_lock`.
         {
             let _q = self.queue_lock.guard();
-            // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by
-            // this type and live for the call, and every builder struct is a local that outlives
-            // it.
+            // SAFETY: `queue` is owned here; `queue_lock` is held so no concurrent submit.
             unsafe { self.device.queue_wait_idle(self.queue) }
                 .context("vkQueueWaitIdle (swapchain recreate)")?;
         }
 
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `pdev` and `surface` are live handles owned by this presenter.
         let caps = unsafe {
             self.surface_i
                 .get_physical_device_surface_capabilities(self.pdev, self.surface)
@@ -70,8 +52,8 @@ impl Presenter {
             }
         };
         if extent.width == 0 || extent.height == 0 {
-            // Minimized — keep the old swapchain; presents will report OUT_OF_DATE and
-            // land back here once the window has a size again.
+            // Minimized: keep the old swapchain. Presents return OUT_OF_DATE
+            // and land back here once the window has a size.
             return Ok(());
         }
         let mut min_images = caps.min_image_count + 1;
@@ -79,20 +61,15 @@ impl Presenter {
             min_images = min_images.min(caps.max_image_count);
         }
 
-        // The present-wait waiter is the last thing still holding the live swapchain, and
-        // `vkCreateSwapchainKHR` externally-synchronises `oldSwapchain` — so the drain
-        // belongs BEFORE the create, not merely before the destroy. It used to sit after
-        // the create, which left a waiter parked inside `vkWaitForPresentKHR(old)` while
-        // the driver retired that same swapchain underneath it. The window that opens is
-        // widest exactly where the field reports land: a mode change orphans its last
-        // present, so that wait runs the full 250 ms cap instead of completing at the
-        // next vblank. Bounded by that same cap, and normally instant.
+        // Drain before create: `oldSwapchain` is externally synchronised, so
+        // the driver may retire it under a parked `vkWaitForPresentKHR`.
+        // Bounded by the waiter's 250 ms cap.
         if let Some(t) = &self.present_timer {
             t.drain();
         }
-        // An unclaimed last present belonged to the dying swapchain — drop the claim.
-        // (`note_presented` is the only producer and shares this thread, so nothing can
-        // hand the waiter a new job between the drain above and the destroy below.)
+        // Last present belonged to the dying swapchain. `note_presented` is
+        // the only producer and shares this thread, so nothing enqueues
+        // between this drain and the destroy below.
         self.last_presented = None;
         let old = self.swapchain;
         let info = vk::SwapchainCreateInfoKHR::default()
@@ -102,8 +79,8 @@ impl Presenter {
             .image_color_space(self.format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            // TRANSFER_DST is the whole phase-1 pipeline (clear + blit); COLOR_ATTACHMENT
-            // keeps the phase-2 render pass from forcing a swapchain rebuild contract change.
+            // TRANSFER_DST is clear + blit; COLOR_ATTACHMENT keeps the overlay
+            // pass from forcing a swapchain-rebuild contract change.
             .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
@@ -111,12 +88,7 @@ impl Presenter {
             .present_mode(self.present_mode)
             .clipped(true)
             .old_swapchain(old);
-        // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
-        // builder structs that are locals outliving the call; the handle it returns is owned by
-        // the value being built here.
-        // The parameters ride the failure text: a swapchain refusal is otherwise a bare
-        // driver code, and the first question every field report raises — which size,
-        // which format, which present mode — cost nothing to answer here.
+        // SAFETY: `device`/`surface` are live; `info` is a local that outlives the call.
         let swapchain = unsafe { self.swap_d.create_swapchain(&info, None) }.map_err(|e| {
             anyhow!(
                 "vkCreateSwapchainKHR: {e} ({}x{}, {:?} / {:?}, {:?}, {min_images} images){}",
@@ -128,13 +100,12 @@ impl Presenter {
                 kmsdrm_swapchain_hint()
             )
         })?;
-        // The old swapchain and everything tied to its images dies NOW: the fence
-        // quiesce covered our own command buffers, the queue drain covered the
-        // presentation engine's semaphore waits, and the present-wait drain above
-        // released the last referent — nothing can still reference them.
+        // Quiesce covered our cmd bufs, queue drain the presentation-engine
+        // semaphore waits, present-timer drain the last waiter — nothing
+        // still names these objects.
         let (overlay_views, overlay_framebuffers) = self.overlay_pipe.take_targets();
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: quiesce, `queue_wait_idle`, and present-timer drain above;
+        // GPU idle on these views, framebuffers, semaphores, and `old`.
         unsafe {
             for fb in overlay_framebuffers {
                 self.device.destroy_framebuffer(fb, None);
@@ -150,8 +121,7 @@ impl Presenter {
             }
         }
         self.swapchain = swapchain;
-        // SAFETY: per the Vulkan contract above - a read-only query on the live instance/device,
-        // filling locals returned by value.
+        // SAFETY: `swapchain` was created above and is owned here.
         self.images = unsafe { self.swap_d.get_swapchain_images(swapchain) }?;
         self.extent = extent;
         self.overlay_pipe.rebuild_targets(
@@ -162,9 +132,7 @@ impl Presenter {
         )?;
 
         for _ in 0..self.images.len() {
-            // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by
-            // this type and live for the call, and every builder struct is a local that outlives
-            // it.
+            // SAFETY: `device` is live; create-info is a local that outlives the call.
             self.render_sems.push(unsafe {
                 self.device
                     .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
@@ -176,42 +144,34 @@ impl Presenter {
             images = self.images.len(),
             "swapchain (re)created"
         );
-        // HDR metadata is per-swapchain state: a rebuilt HDR10 swapchain needs it pushed
-        // again (this also covers set_hdr_mode's entry into HDR10, which lands here).
+        // HDR metadata is per-swapchain: a rebuilt HDR10 swapchain needs it
+        // pushed again (`set_hdr_mode` into HDR10 also lands here).
         if self.hdr_active {
             self.apply_hdr_metadata();
         }
         Ok(())
     }
 
-    /// Whether the swapchain is actually in HDR10/PQ mode — as opposed to a PQ stream
-    /// being tone-mapped onto an SDR surface. This, not the stream's own signaling, is
-    /// what user-facing "HDR" indicators should report.
+    /// Swapchain is HDR10/PQ, not a PQ stream tone-mapped onto SDR.
+    /// User-facing "HDR" indicators should report this, not stream signalling.
     pub fn hdr_active(&self) -> bool {
         self.hdr_active
     }
 
-    /// Drop back to the SDR swapchain. A no-op unless HDR10 is actually live, so it is
-    /// cheap to call on every idle iteration (the flip itself rebuilds the CSC pass, the
-    /// video image, the overlay pipe and the swapchain).
+    /// Drop back to the SDR swapchain. No-op unless HDR10 is live.
     ///
-    /// The console/gamepad UI is SDR content, and it is composited into whatever swapchain
-    /// the last STREAM left behind. [`Presenter::present`] only re-evaluates the mode when a
-    /// frame carries colour signalling, and a UI-only present is `FrameInput::Redraw`, which
-    /// carries none — so once a PQ session ended, the UI kept being written into the HDR10
-    /// swapchain and its sRGB mid-tones were emitted as PQ code points, i.e. near-peak nits.
-    /// That is the "gamepad UI is blown out after disconnecting from an HDR host" report:
-    /// the UI looks right until the first HDR session, and wrong forever after.
+    /// Console UI is SDR and composites into whatever swapchain the last
+    /// stream left. [`Presenter::present`] only flips on a frame with colour
+    /// signalling; a UI-only present is `FrameInput::Redraw` (none). After a
+    /// PQ session the UI would otherwise write into the HDR10 swapchain and
+    /// sRGB mid-tones would emit as PQ code points.
     pub fn leave_hdr(&mut self, window: &sdl3::video::Window) -> Result<()> {
         if !self.hdr_active {
             return Ok(());
         }
-        // Minimized is not just "pointless work": `recreate_swapchain` deliberately keeps
-        // the old swapchain at a zero extent, but `set_hdr_mode` would already have rebuilt
-        // the CSC and overlay pipes against the SDR format — leaving them mismatched against
-        // the live HDR10 swapchain images. [`Presenter::present`] carries the same guard,
-        // which is why the flip could never reach this state before; the mode change just
-        // waits for the window to have a size again.
+        // Do not flip while minimized: `recreate_swapchain` keeps the old
+        // swapchain at zero extent, but `set_hdr_mode` would already have
+        // rebuilt CSC/overlay against SDR, mismatched to live HDR10 images.
         if self.extent.width == 0 || self.extent.height == 0 {
             return Ok(());
         }
@@ -219,9 +179,7 @@ impl Presenter {
         self.set_hdr_mode(window, false)
     }
 
-    /// Record the host's ST.2086 mastering + content-light metadata (the 0xCE plane),
-    /// pushing it to the swapchain immediately when HDR10 mode is live. Cheap and
-    /// idempotent per distinct value — callers just drain the plane into it.
+    /// Host ST.2086 + content-light from the 0xCE plane.
     pub fn set_hdr_metadata(&mut self, meta: punktfunk_core::quic::HdrMeta) {
         if self.hdr_meta == Some(meta) {
             return;
@@ -232,17 +190,16 @@ impl Presenter {
         }
     }
 
-    /// Push the current metadata (the host's, or a generic HDR10 baseline until 0xCE
-    /// arrives) to the presentation engine via `vkSetHdrMetadataEXT`. Compositors gate
-    /// their HDR-app signaling on this — picking the HDR10 colorspace alone leaves
-    /// gamescope treating the app as SDR (no SteamOS HDR badge, no per-app tone-map
-    /// target). No-op where the driver lacks the extension.
+    /// `vkSetHdrMetadataEXT` with the host 0xCE values, or a generic HDR10
+    /// baseline until that plane arrives. Compositors gate HDR-app signalling
+    /// on this call — HDR10 colorspace alone leaves gamescope treating the
+    /// app as SDR. No-op without the extension.
     fn apply_hdr_metadata(&self) {
         let Some(ext) = &self.hdr_metadata_d else {
             return;
         };
-        // Same generic baseline as the Windows presenter: BT.2020 primaries + D65
-        // white, 1000-nit mastering display, MaxCLL 1000 / MaxFALL 400.
+        // Same generic baseline as the Windows presenter: BT.2020 + D65,
+        // 1000-nit mastering, MaxCLL 1000 / MaxFALL 400.
         let m = self.hdr_meta.unwrap_or(punktfunk_core::quic::HdrMeta {
             display_primaries: [[8500, 39850], [6550, 2300], [35400, 14600]],
             white_point: [15635, 16450],
@@ -251,9 +208,9 @@ impl Presenter {
             max_cll: 1000,
             max_fall: 400,
         });
-        // Protocol fields are HDR10 SEI fixed-point (chromaticity 1/50000, luminance
-        // 0.0001 cd/m², primaries in ST.2086 G,B,R order); Vulkan wants floats in
-        // 0..1 chromaticity and whole nits, primaries named R/G/B.
+        // HDR10 SEI fixed-point: chromaticity 1/50000, luminance 0.0001
+        // cd/m², primaries in ST.2086 G,B,R order. Vulkan wants 0..1 xy,
+        // whole nits, primaries named R/G/B.
         let xy = |p: [u16; 2]| vk::XYColorEXT {
             x: p[0] as f32 / 50_000.0,
             y: p[1] as f32 / 50_000.0,
@@ -268,21 +225,16 @@ impl Presenter {
             .min_luminance(m.min_display_mastering_luminance as f32 / 10_000.0)
             .max_content_light_level(m.max_cll as f32)
             .max_frame_average_light_level(m.max_fall as f32);
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `swapchain` is live and owned here; `md` is a local.
         unsafe { ext.set_hdr_metadata(&[self.swapchain], &[md]) };
         tracing::debug!(from_host = self.hdr_meta.is_some(), "HDR metadata pushed");
     }
-    /// Flip the presenter between SDR and HDR10 output (stream SDR↔PQ, in-band). A
-    /// fence quiesce, then everything format-bound is rebuilt: the CSC pass + video
-    /// image (10-bit intermediate — PQ in 8 bits bands visibly), the overlay pipe, and
-    /// the swapchain (old one parked per the deferred-destroy rules).
+    /// SDR↔HDR10 flip. Video intermediate is 10-bit: PQ in 8 bits bands.
     pub(super) fn set_hdr_mode(&mut self, window: &sdl3::video::Window, on: bool) -> Result<()> {
         let target = if on {
             self.hdr10_format.expect("caller checked availability")
         } else {
-            // Recompute the SDR pick? It never changed — the sdr format is immutable.
-            // (self.format currently holds the HDR pairing.)
+            // `self.format` currently holds the HDR pairing; the SDR pick never changed.
             pick_formats(&self.surface_i, self.pdev, self.surface, false)?.0
         };
         tracing::info!(hdr = on, format = ?target, "switching presentation mode");
@@ -292,18 +244,13 @@ impl Presenter {
         } else {
             vk::Format::R8G8B8A8_UNORM
         };
-        self.csc.destroy(&self.device); // fence-safe: only our cmd bufs reference it
+        self.csc.destroy(&self.device); // `quiesce_own` above; only our cmd bufs reference it
         self.csc = CscPass::new(&self.device, self.video_format)?;
-        // The planar pass (PyroWave + the software rung) renders to the same intermediate
-        // — rebuild it at the new format too (an HDR session needs the 10-bit
-        // intermediate exactly like the H.26x path; 8-bit PQ bands visibly).
+        // Planar CSC (PyroWave + software) writes the same intermediate; rebuild it too.
         self.csc_planar.destroy(&self.device);
         self.csc_planar = CscPass::new_planar(&self.device, self.video_format)?;
         if let Some(v) = self.video.take() {
-            // SAFETY: per the Vulkan contract above - this destroys objects this type owns, and
-            // the GPU is known idle for them (the fence/queue-wait on the path here, or the
-            // swapchain being retired), which is the obligation that makes a destroy sound rather
-            // than the handle merely being non-null.
+            // SAFETY: `quiesce_own` above; GPU idle on this video image.
             unsafe {
                 self.device.destroy_framebuffer(v.framebuffer, None);
                 self.device.destroy_image_view(v.view, None);
@@ -311,17 +258,15 @@ impl Presenter {
                 self.device.free_memory(v.memory, None);
             }
         }
-        // New overlay pipe against the new swapchain format. The old one's targets
-        // (views/framebuffers over the current swapchain's images) are only ever
-        // referenced by our own command buffers — the fence quiesce above makes them
-        // safe to destroy right here; the swapchain itself rides the recreate below.
+        // New overlay pipe for the new format. Old views/framebuffers are
+        // only in our cmd bufs — fence quiesce makes destroy safe here;
+        // the swapchain rides `recreate_swapchain` below.
         let mut old_pipe = std::mem::replace(
             &mut self.overlay_pipe,
             OverlayPipe::new(&self.device, target.format)?,
         );
         let (overlay_views, overlay_framebuffers) = old_pipe.take_targets();
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: fence quiesce above; these views/framebuffers are only in our cmd bufs.
         unsafe {
             for fb in overlay_framebuffers {
                 self.device.destroy_framebuffer(fb, None);

@@ -1,28 +1,19 @@
-//! The desktop's Omarchy theme, for every surface this client draws.
+//! The desktop's Omarchy theme, as four colours this client draws from.
 //!
-//! Omarchy keeps the active theme at `~/.local/state/omarchy/current/theme/`, and two files
-//! there can tell us its colours:
+//! Omarchy stores the active theme at `~/.local/state/omarchy/current/theme/`.
+//! Two files there carry colours:
 //!
-//! - `punktfunk.json` — our own template, rendered by Omarchy on each `omarchy-theme-set` when
-//!   `punktfunk-omarchy setup` (host package) registered it. Exact, but host-side opt-in.
-//! - `colors.toml` — the theme's native semantic palette, present on EVERY Omarchy box. This is
-//!   what makes a client-only install follow the theme with zero setup.
+//! - `punktfunk.json` — our template, rendered on `omarchy-theme-set` after
+//!   `punktfunk-omarchy setup`. Exact, host-side opt-in.
+//! - `colors.toml` — the theme's native palette, present on every Omarchy box.
 //!
-//! Deliberately a FILE read and not an integration: there is no Omarchy API to call, and a box
-//! that is not Omarchy simply has no directory — every failure here is "no theme", never an
-//! error. The web console reads the same rendered template (`web/server/util/omarchyTheme.ts`);
-//! the JSON rules here are that file's, ported.
-//!
-//! Consumers: the GTK shell (`clients/linux/src/omarchy.rs` turns this into libadwaita
-//! `@define-color`s) and the console shell (`pf-console-ui` builds its field and ink from it).
-//! The colour type and maths are platform-neutral so a later "follow OS" on another platform
-//! can feed the same shape; only the file reading is Linux.
+//! File read, not an API: a non-Omarchy box has no directory, so every miss
+//! is "no theme", never an error. JSON rules match
+//! `web/server/util/omarchyTheme.ts`. GTK (`clients/linux/src/omarchy.rs`)
+//! and the console (`pf-console-ui`) consume the same `OsTheme`.
 
-/// An sRGB colour, components 0..1.
-///
-/// Parsed into numbers rather than passed around as strings for two reasons: every derived
-/// surface is a mix of two of them, and a value that survived [`parse_hex`] cannot smuggle
-/// syntax into a stylesheet.
+/// sRGB 0..1. Numbers, not strings: mixes need arithmetic, and a value that
+/// survived [`parse_hex`] cannot smuggle stylesheet syntax.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Rgb(pub f64, pub f64, pub f64);
 
@@ -32,8 +23,7 @@ impl Rgb {
         format!("#{:02x}{:02x}{:02x}", c(self.0), c(self.1), c(self.2))
     }
 
-    /// Straight sRGB lerp — `t` is how far toward `other`. At the few-percent mixes the
-    /// consumers use, oklab would be indistinguishable, and this needs no colour library.
+    /// At the few-percent mixes consumers use, oklab is indistinguishable.
     pub fn mix(self, other: Rgb, t: f64) -> Rgb {
         let m = |a: f64, b: f64| a + (b - a) * t;
         Rgb(m(self.0, other.0), m(self.1, other.1), m(self.2, other.2))
@@ -58,12 +48,10 @@ pub fn contrast(a: Rgb, b: Rgb) -> f64 {
     (x.max(y) + 0.05) / (x.min(y) + 0.05)
 }
 
-/// `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`. Alpha is parsed and dropped — every colour here
-/// names a solid surface.
+/// `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`. Alpha is dropped: surfaces are solid.
 ///
-/// Hex only, deliberately. The theme files carry hex in practice, the consumers need the
-/// numbers anyway, and **an unrendered template still holds its literal `{{ accent }}`** —
-/// which is not a colour, and this is what refuses it.
+/// Hex only. An unrendered template still holds literal `{{ accent }}`; this
+/// refuses it.
 pub fn parse_hex(s: &str) -> Option<Rgb> {
     let h = s.trim().strip_prefix('#')?;
     if !h.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -76,16 +64,14 @@ pub fn parse_hex(s: &str) -> Option<Rgb> {
     };
     let chan = |i: usize| -> Option<f64> {
         let raw = u8::from_str_radix(h.get(i * w..i * w + w)?, 16).ok()?;
-        // A single nibble is the byte repeated: `f` is `ff`, not `f0`.
+        // One nibble repeats: `f` is `ff`, not `f0`.
         Some(f64::from(raw) * if w == 1 { 17.0 } else { 1.0 } / 255.0)
     };
     Some(Rgb(chan(0)?, chan(1)?, chan(2)?))
 }
 
-/// The theme's accent, nudged toward the foreground until it reads as **text** on the theme's
-/// background. 3:1 is WCAG's floor for large text and non-text, which is what an accent is
-/// used for — labels, outlines, a focus dot. ⚠ Not every theme can reach it (an accent already
-/// equal to the foreground has nowhere to move), so this returns the best it managed.
+/// Accent mixed toward `fg` until contrast with `bg` is ≥ 3:1 (WCAG large-text
+/// floor). An accent already equal to `fg` has nowhere to go; returns the best mix.
 pub fn readable(accent: Rgb, bg: Rgb, fg: Rgb) -> Rgb {
     let mut c = accent;
     for _ in 0..10 {
@@ -97,7 +83,6 @@ pub fn readable(accent: Rgb, bg: Rgb, fg: Rgb) -> Rgb {
     c
 }
 
-/// Ink drawn ON the accent (a filled button, a selected pill): whichever pole reads better.
 pub fn on_accent(accent: Rgb) -> Rgb {
     let (black, white) = (Rgb(0.0, 0.0, 0.0), Rgb(1.0, 1.0, 1.0));
     if contrast(accent, white) >= contrast(accent, black) {
@@ -107,7 +92,6 @@ pub fn on_accent(accent: Rgb) -> Rgb {
     }
 }
 
-/// The desktop's theme, in the four values every consumer acts on.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct OsTheme {
     pub dark: bool,
@@ -116,11 +100,8 @@ pub struct OsTheme {
     pub accent: Rgb,
 }
 
-/// Parse our rendered template (`punktfunk.json`).
-///
-/// All three colours are required together: the template renders them as a set, so a file
-/// missing one is a file we do not understand, and half a palette reads worse than none. An
-/// unparsable `mode` is treated as `dark`, matching the web console.
+/// All three colours are required: half a palette is worse than none.
+/// Unparsable `mode` is `dark`, matching the console.
 pub fn parse_punktfunk_json(raw: &str) -> Option<OsTheme> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     let colour = |k: &str| {
@@ -136,9 +117,8 @@ pub fn parse_punktfunk_json(raw: &str) -> Option<OsTheme> {
     })
 }
 
-/// Parse the theme's native `colors.toml` — flat `key = "value"` lines, nothing nested, so a
-/// line scan is the whole parser and no toml dependency enters the graph. Only the four
-/// semantic keys are read; the ANSI ramp is the terminal's business.
+/// Flat `key = "value"` lines — no toml crate, nothing nested. Only the four
+/// semantic keys; the ANSI ramp is the terminal's.
 pub fn parse_colors_toml(raw: &str) -> Option<OsTheme> {
     let value = |key: &str| {
         raw.lines().find_map(|l| {
@@ -158,8 +138,7 @@ pub fn parse_colors_toml(raw: &str) -> Option<OsTheme> {
     })
 }
 
-/// Omarchy's own state directory. `XDG_STATE_HOME` first, because that is what the spec says
-/// and what a non-default setup uses; `~/.local/state` is the default it falls back to.
+/// `XDG_STATE_HOME` first (the spec, and non-default setups); else `~/.local/state`.
 fn omarchy_state_dir() -> Option<std::path::PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(std::path::PathBuf::from)
@@ -170,22 +149,17 @@ fn omarchy_state_dir() -> Option<std::path::PathBuf> {
     Some(state.join("omarchy"))
 }
 
-/// Is this box Omarchy at all? The state directory exists on every Omarchy box — Omarchy
-/// itself writes indicators and rendered templates under it — and on no other. This is what
-/// gates "show the Follow-system row" and what keeps every other Linux box at one `stat`.
+/// True iff Omarchy's state directory exists — one `stat`, and the Follow-system row's gate.
 pub fn present() -> bool {
     omarchy_state_dir().is_some_and(|d| d.is_dir())
 }
 
-/// The active theme, or `None` when this box has none — which is every box that is not
-/// Omarchy. Our rendered template wins when the operator registered it (it is the same values,
-/// rendered by Omarchy itself); the theme's own `colors.toml` covers the client-only box that
-/// never ran the host's setup. Read per call, not cached: `omarchy-theme-set` swaps the
-/// `current` symlink whenever the user changes theme.
+/// Active theme, or `None` on a non-Omarchy box. `punktfunk.json` wins when
+/// registered; `colors.toml` covers a client-only install. Uncached:
+/// `omarchy-theme-set` retargets the `current` symlink.
 pub fn current() -> Option<OsTheme> {
     let theme = omarchy_state_dir()?.join("current/theme");
-    // A half-written file during a theme switch parses as nothing; the fallback then reads
-    // the other file or reports "no theme" for a tick, both of which are correct.
+    // A half-written switch parses as nothing; the other file, or a tick of "no theme", is fine.
     std::fs::read_to_string(theme.join("punktfunk.json"))
         .ok()
         .and_then(|raw| parse_punktfunk_json(&raw))
@@ -208,8 +182,7 @@ mod tests {
 
     #[test]
     fn an_unrendered_template_is_not_a_theme() {
-        // The failure this catches for real: the template copied into place without Omarchy
-        // ever rendering it. `{{ accent }}` is a string, and JSON-valid.
+        // `{{ accent }}` is JSON-valid; parse_hex is what refuses it.
         assert!(
             parse_punktfunk_json(&rendered("dark", "#1a1b26", "#c0caf5", "{{ accent }}")).is_none()
         );
@@ -251,8 +224,7 @@ mod tests {
 
     #[test]
     fn colors_toml_reads_the_semantic_keys_and_nothing_else() {
-        // Verbatim shape from a real box (2026-08-31): flat keys, quoted hex, and sibling
-        // keys that PREFIX the ones we want (`dark_background`, `bright_foreground`).
+        // Sibling keys PREFIX the ones we want (`dark_background`, `bright_foreground`).
         let raw = r##"
 mode = "dark"
 
@@ -279,7 +251,6 @@ bright_foreground = "#ffddcc"
 
     #[test]
     fn a_washed_out_accent_is_lifted_until_it_reads_as_text() {
-        // Everforest Light's shape: a pale accent on a pale background.
         let (bg, fg, accent) = (
             parse_hex("#fdf6e3").unwrap(),
             parse_hex("#5c6a72").unwrap(),

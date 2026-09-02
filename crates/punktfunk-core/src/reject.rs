@@ -1,97 +1,65 @@
-//! Why a host turns a connection away: typed QUIC application close codes + the
-//! [`RejectReason`] vocabulary shared by host and every client. Lives OUTSIDE the `quic`
-//! feature gate because [`PunktfunkError::Rejected`](crate::error::PunktfunkError::Rejected)
+//! Typed QUIC application close codes and the [`RejectReason`] vocabulary a
+//! host uses to turn a connection away. Lives outside the `quic` feature
+//! because [`PunktfunkError::Rejected`](crate::error::PunktfunkError::Rejected)
 //! carries it in every build; `crate::quic` re-exports it.
 
-/// QUIC application error code the host closes with on a `mode_conflict = reject` admission
-/// refusal, carrying the human-readable busy reason (live mode + client label). A distinct code
-/// lets a client tell "host busy" apart from a transport failure. Shared so clients can render it.
+/// `mode_conflict = reject` admission close. Distinct from a transport
+/// failure so a client can render "host busy". Reason bytes carry live mode
+/// + client label.
 pub const REJECT_BUSY_CLOSE_CODE: u32 = 0x42;
 
-/// QUIC application close codes the host sends on **pairing-gate rejections**, so a client can
-/// tell the user WHY it was turned away instead of collapsing every close into a generic
-/// "not accepted" (the failure mode behind more than one support thread: a PIN attempt against a
-/// disarmed host, an operator denial, and a dead network path all looked identical). Grouped in
-/// their own 0x60 block, disjoint from [`REJECT_BUSY_CLOSE_CODE`] (0x42) and the deliberate-end
-/// codes (0x51/0x52). Purely additive: an older client treats them as a bare close (exactly the
-/// pre-code behavior), an older host never sends them. Decode with [`RejectReason::from_close_code`].
+/// Pairing-gate close. Occupies 0x60.., disjoint from
+/// [`REJECT_BUSY_CLOSE_CODE`] (0x42) and the deliberate-end codes (0x51/0x52).
+/// Decode with [`RejectReason::from_close_code`].
 pub const PAIR_NOT_ARMED_CLOSE_CODE: u32 = 0x60;
-/// Pairing window armed, but bound to a DIFFERENT device fingerprint (the attempt does not
-/// consume the window). See [`PAIR_NOT_ARMED_CLOSE_CODE`] for the block's contract.
+/// Armed window is bound to a different fingerprint; the attempt does not
+/// consume it.
 pub const PAIR_BOUND_OTHER_CLOSE_CODE: u32 = 0x61;
-/// PIN attempt inside the host's global pairing cooldown — retry shortly.
+/// Inside the host's global pairing cooldown.
 pub const PAIR_RATE_LIMITED_CLOSE_CODE: u32 = 0x62;
-/// Unpaired client presented no certificate: nothing to approve, and the SPAKE2 ceremony needs an
-/// identity to bind — the PIN flow with a client identity is the way in.
+/// No client certificate: SPAKE2 has nothing to bind.
 pub const PAIR_NO_IDENTITY_CLOSE_CODE: u32 = 0x63;
-/// The operator explicitly denied this pairing request in the host console.
 pub const PAIR_DENIED_CLOSE_CODE: u32 = 0x64;
-/// Nobody decided on the parked pairing request before the host's approval wait elapsed.
 pub const PAIR_APPROVAL_TIMEOUT_CLOSE_CODE: u32 = 0x65;
-/// This parked knock was superseded by a newer connection from the same device — only the
-/// newest is admitted on approval.
+/// Only the newest knock from this device is admitted.
 pub const PAIR_SUPERSEDED_CLOSE_CODE: u32 = 0x66;
-/// The client's wire (protocol) version does not match the host's — one side needs updating.
 pub const WIRE_VERSION_CLOSE_CODE: u32 = 0x67;
-/// The host admitted the connection but could not stand the stream session up (compositor /
-/// capture / encoder setup failed host-side). The close reason bytes carry the specific error
-/// text for logs/diagnostics; clients render a stable "host-side failure" sentence. Before this
-/// code, a setup failure reached the client as a bare dropped connection ("control stream
-/// finished mid-frame") — indistinguishable from transport trouble.
+/// Admitted, then compositor / capture / encoder setup failed. Reason bytes
+/// carry the host error; clients render a stable "host-side failure" sentence.
 pub const SETUP_FAILED_CLOSE_CODE: u32 = 0x68;
-/// This device's temporary access ran out (per-client access, `design/per-client-access.md` §4)
-/// — sent when the deadline fires mid-session, and by "Expire now" in the console. Only the
-/// expiring device's sessions close with it; a reconnect lands in the console's pending list
-/// for a one-click re-grant.
+/// Per-client access deadline, or console "Expire now". Only this device's
+/// sessions close; a reconnect parks in the pending list.
+/// `design/per-client-access.md`.
 pub const ACCESS_EXPIRED_CLOSE_CODE: u32 = 0x69;
-/// The `Hello.launch` request named a game this device's grants don't cover (no `LAUNCH` bit).
-/// Refused AT the handshake — a crisp typed reason beats silently dropping the user onto a
-/// bare desktop they didn't ask for. Connecting *without* a launch request still works.
+/// `Hello.launch` named a game this device's grants lack the `LAUNCH` bit
+/// for. Refused at handshake; connecting without a launch request still works.
 pub const LAUNCH_NOT_PERMITTED_CLOSE_CODE: u32 = 0x6A;
-/// A host power action (`power.sleep`/`reboot`/`shutdown`, `design/host-actions.md`) is ending
-/// every session: the host is going to sleep or shutting down, deliberately — not a crash, not
-/// the network. Old clients render the generic close; acceptable degrade.
+/// Host power action (`power.sleep` / `reboot` / `shutdown`) is ending every
+/// session. `design/host-actions.md`.
 pub const HOST_POWER_CLOSE_CODE: u32 = 0x6B;
 
-/// Why a host turned a connection away, decoded from the QUIC application close code — the
-/// client-side view of [`PAIR_NOT_ARMED_CLOSE_CODE`]..[`WIRE_VERSION_CLOSE_CODE`] plus
-/// [`REJECT_BUSY_CLOSE_CODE`]. Surfaces as
-/// [`PunktfunkError::Rejected`](crate::error::PunktfunkError::Rejected) so every client can show
-/// the real reason ("pairing not armed", "denied in the console") instead of a generic failure.
+/// Client-side view of the host's QUIC application close code. Surfaces as
+/// [`PunktfunkError::Rejected`](crate::error::PunktfunkError::Rejected).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
-    /// No pairing window is armed on the host (arm it in the console).
     PairingNotArmed,
-    /// The armed window is bound to a different device fingerprint.
     PairingBoundToOtherDevice,
-    /// Inside the host's pairing cooldown — retry shortly.
     PairingRateLimited,
-    /// The client presented no certificate identity to approve/bind.
     IdentityRequired,
-    /// The operator denied the request in the console.
     Denied,
-    /// The parked request expired with no operator decision.
     ApprovalTimeout,
-    /// A newer knock from the same device replaced this one.
     Superseded,
-    /// Client/host wire versions differ.
     WireVersionMismatch,
-    /// The host refused admission because a conflicting session is live.
     Busy,
-    /// The host admitted the connection but failed to start the stream session (host-side
-    /// setup error — the host log has the specific cause).
     SetupFailed,
-    /// This device's temporary access to the host has expired (per-client access).
     AccessExpired,
-    /// This device's grants don't include launching games (the `LAUNCH` bit is clear).
     LaunchNotPermitted,
-    /// The host is going to sleep or shutting down (a host power action ended the session).
     HostPower,
 }
 
 impl RejectReason {
-    /// Decode a QUIC application close code into a reason; `None` for codes outside the
-    /// shared vocabulary (a bare/legacy close stays a plain transport error).
+    /// `None` for codes outside this vocabulary — a bare/legacy close stays a
+    /// transport error.
     pub fn from_close_code(code: u32) -> Option<Self> {
         Some(match code {
             PAIR_NOT_ARMED_CLOSE_CODE => Self::PairingNotArmed,
@@ -111,7 +79,7 @@ impl RejectReason {
         })
     }
 
-    /// The close code this reason travels as (inverse of [`Self::from_close_code`]).
+    /// Inverse of [`Self::from_close_code`].
     pub fn close_code(self) -> u32 {
         match self {
             Self::PairingNotArmed => PAIR_NOT_ARMED_CLOSE_CODE,
@@ -130,8 +98,8 @@ impl RejectReason {
         }
     }
 
-    /// Stable machine token (kebab-case) for FFI layers that pass the reason as a string
-    /// (e.g. the Android JNI bridge). Do not reword existing tokens — clients match on them.
+    /// Stable kebab-case token for FFI (Android JNI). Do not reword — clients
+    /// match on these.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::PairingNotArmed => "not-armed",
@@ -210,10 +178,8 @@ mod tests {
 
     #[test]
     fn foreign_codes_stay_untyped() {
-        // Bare closes, the client's own pair-done codes, and the deliberate-end codes must
-        // never read as a host rejection. (0x69/0x6A/0x6B left this list when they became the
-        // access-expired / launch-not-permitted / host-power codes; 0x6C is the block's next
-        // free id.)
+        // Bare closes, pair-done, and 0x51/0x52 (deliberate-end) must never
+        // decode as a rejection. 0x6C is the next free id in the 0x60 block.
         for code in [0u32, 1, 0x41, 0x51, 0x52, 0x5f, 0x6C, 0x70, u32::MAX] {
             assert_eq!(RejectReason::from_close_code(code), None);
         }

@@ -1,9 +1,10 @@
-//! Host side of the v5 hardware-cursor channel (remote-desktop-sweep M2c): the capturer creates
-//! an unnamed [`CursorShm`] section, delivers it to the pf-vdisplay driver (which declares an
-//! IddCx hardware cursor — DWM then EXCLUDES the pointer from the frames we consume), and reads
-//! the driver's seqlock publishes here at encode-tick pace, converting them into the same
-//! [`pf_frame::CursorOverlay`] the Linux portal path produces — everything downstream (the
-//! cursor forwarder, the wire, the client renderer) is shared.
+//! Host side of the hardware-cursor channel.
+//!
+//! The capturer creates an unnamed [`CursorShm`] section, delivers it to pf-vdisplay
+//! (IddCx hardware cursor — DWM then excludes the pointer from consumed frames), and
+//! seqlock-reads the driver's publishes at encode-tick pace into the same
+//! [`pf_frame::CursorOverlay`] the Linux portal path produces. Downstream (forwarder,
+//! wire, client renderer) is shared.
 
 use super::*;
 use pf_driver_proto::cursor::{
@@ -12,16 +13,16 @@ use pf_driver_proto::cursor::{
 };
 use std::sync::atomic::AtomicU32;
 
-/// The host end of one monitor's cursor channel: the section (we created it — the mapping stays
-/// valid for the capturer's life) plus the reader's conversion cache.
+/// Host end of one monitor's cursor channel. The mapping stays valid for the capturer's
+/// life.
 pub(super) struct CursorShared {
     section: MappedSection,
-    /// The monitor's desktop origin — IddCx reports positions in DESKTOP coordinates; the
-    /// overlay wants frame-relative. Fetched at attach (the virtual monitor's placement is
-    /// stable for the session; a topology change recreates the pipeline anyway).
+    /// Monitor desktop origin. IddCx reports desktop coordinates; the overlay wants
+    /// frame-relative. Placement is stable for the session; a topology change recreates
+    /// the pipeline.
     origin: (i32, i32),
-    /// Conversion cache: the last `shape_id` whose pixels were converted, and the result.
-    /// Position-only updates (the common case) reuse it — a refcount bump, no pixel work.
+    /// Last `shape_id` whose pixels were converted. Position-only updates (the common
+    /// case) reuse it — a refcount bump, no pixel work.
     cached_id: u32,
     cached: Option<ConvertedShape>,
 }
@@ -65,7 +66,7 @@ impl CursorShared {
             }
             let shm = view.Value.cast::<CursorShm>();
             std::ptr::write_bytes(view.Value.cast::<u8>(), 0, CURSOR_SHM_SIZE);
-            // Magic LAST-ish (the driver validates it at adopt; seq 0 = even = consistent).
+            // Magic last: the driver validates it at adopt. Seq 0 is even = consistent.
             std::sync::atomic::fence(Ordering::Release);
             (*shm).magic = CURSOR_MAGIC;
             MappedSection { handle: map, view }
@@ -81,40 +82,37 @@ impl CursorShared {
         })
     }
 
-    /// The section handle for the broker's duplication into the WUDFHost.
     pub(super) fn section_handle(&self) -> HANDLE {
         HANDLE(self.section.handle.as_raw_handle())
     }
 
-    /// Seqlock-read the driver's latest publish → a frame-relative [`pf_frame::CursorOverlay`].
-    /// `None` until the first publish lands (or while the pointer has never been seen). A hidden
-    /// pointer returns `Some` with `visible: false` — the forwarder turns that into the client's
-    /// relative-mode hint, exactly like the Linux path.
+    /// Seqlock-read the latest publish as a frame-relative [`pf_frame::CursorOverlay`].
+    /// `None` until the first publish. Hidden pointer → `Some` with `visible: false` — the
+    /// forwarder turns that into the client's relative-mode hint, as on Linux.
     pub(super) fn read(&mut self) -> Option<pf_frame::CursorOverlay> {
         let shm = self.section.ptr::<CursorShm>();
-        // SAFETY: the view spans CURSOR_SHM_SIZE for self's lifetime; seq is 4-aligned in the
-        // fixed layout (offset 4).
+        // SAFETY: the view spans `CURSOR_SHM_SIZE` for `self`'s lifetime; `seq` is
+        // 4-aligned at offset 4 in the fixed layout.
         let seq = unsafe { &*std::ptr::addr_of!((*shm).seq).cast::<AtomicU32>() };
         for _ in 0..64 {
             let s1 = seq.load(Ordering::Acquire);
             if s1 == 0 {
-                return None; // no publish yet
+                return None; // seq 0: no publish yet (even, but not a valid snapshot)
             }
             if s1 & 1 != 0 {
                 std::hint::spin_loop();
-                continue; // writer mid-update
+                continue; // odd seq: writer mid-update
             }
-            // SAFETY: header reads within the mapped view; consistency is validated by the
-            // seq re-check below (a torn read is discarded and retried).
+            // SAFETY: header is inside the mapped view; a torn read is discarded by the
+            // seq re-check below.
             let hdr = unsafe { std::ptr::read_volatile(shm) };
-            // Shape pixels: convert only when the OS minted a new shape id.
             if hdr.visible != 0 && hdr.shape_id != self.cached_id {
                 let rows = hdr.height.min(CURSOR_SHAPE_MAX) as usize;
                 let width = hdr.width.min(CURSOR_SHAPE_MAX) as usize;
                 let pitch = (hdr.pitch as usize).min(CURSOR_SHAPE_BYTES / rows.max(1));
                 let mut raw = vec![0u8; rows * pitch];
-                // SAFETY: the shape region spans CURSOR_SHAPE_BYTES from CURSOR_SHAPE_OFFSET
-                // inside the mapped view; `rows * pitch` is clamped to it above.
+                // SAFETY: the shape region is `CURSOR_SHAPE_BYTES` from `CURSOR_SHAPE_OFFSET`
+                // in the mapped view; `rows * pitch` is clamped to it above.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         self.section.ptr::<u8>().add(CURSOR_SHAPE_OFFSET),
@@ -122,7 +120,7 @@ impl CursorShared {
                         rows * pitch,
                     );
                 }
-                // Discard the copy if the writer raced us mid-shape (seq moved) — retry.
+                // Writer raced mid-shape (seq moved) — retry without caching.
                 if seq.load(Ordering::Acquire) != s1 {
                     continue;
                 }
@@ -144,14 +142,13 @@ impl CursorShared {
                 visible: hdr.visible != 0,
             });
         }
-        None // persistent tearing (writer wedged mid-seq) — skip this tick
+        None // writer wedged mid-seq; skip this tick
     }
 }
 
-/// Convert the OS's 32-bpp pitch-strided shape rows into the overlay's packed straight RGBA.
-/// ALPHA cursors are BGRA with straight per-pixel alpha (swap R↔B). MASKED_COLOR approximates:
-/// alpha 0x00 = opaque color pixel; 0xFF = an XOR pixel we cannot honor client-side — rendered
-/// as a translucent mid-gray so inversion cursors stay visible instead of vanishing.
+/// Pack 32-bpp pitch-strided rows into straight RGBA. ALPHA is BGRA (swap R↔B).
+/// MASKED_COLOR: `alpha == 0` is opaque color; `0xFF` is XOR, which we cannot honor
+/// client-side — mid-gray so inversion cursors stay visible instead of vanishing.
 fn convert_shape(
     hdr: &CursorShm,
     raw: &[u8],

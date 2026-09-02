@@ -1,24 +1,12 @@
-//! VAAPI encoder via `ffmpeg-next` — AMD (Mesa `radeonsi`) and Intel (`iHD`/`i965`) over one
-//! libavcodec backend (`h264_vaapi`/`hevc_vaapi`/`av1_vaapi`). The kernel driver differs per
-//! vendor; the libva userspace API is identical, so a single encoder covers both. This is the
-//! sibling of [`super::linux`] (NVENC/CUDA) behind the shared [`Encoder`] trait — selected in
-//! [`super::open_video`] (NVIDIA → NVENC, AMD/Intel → here).
+//! VAAPI encoder (`h264_vaapi` / `hevc_vaapi` / `av1_vaapi`) for AMD Mesa and Intel iHD/i965.
+//! Sibling of [`super::linux`] (NVENC) behind [`Encoder`]; [`super::open_video`] picks NVIDIA →
+//! NVENC, AMD/Intel → here. Kernel drivers differ; libva is the same, so one encoder covers both.
 //!
-//! Two input paths, chosen lazily from the FIRST frame's payload (so `open_video`'s signature
-//! is unchanged and the encoder self-configures for whatever the capturer produces):
-//! * **CPU upload** ([`CpuInner`]): the portal hands packed RGB/BGR CPU frames; we swscale to
-//!   BT.709-limited NV12 and `av_hwframe_transfer_data` it into a pooled VA surface. Works on any
-//!   VAAPI GPU with no capture changes (the capturer falls back to CPU frames on non-NVIDIA).
-//! * **Zero-copy dmabuf** ([`DmabufInner`], `PUNKTFUNK_ZEROCOPY=1`): the capturer hands a packed-RGB
-//!   dmabuf. We wrap it as an `AV_PIX_FMT_DRM_PRIME` frame and push it through a tiny filter graph
-//!   `buffer(drm_prime) → hwmap=derive_device=vaapi → scale_vaapi=format=nv12 → buffersink`, so
-//!   the import AND the RGB→NV12 colour conversion run on the GPU's video engine — no host CSC, no
-//!   upload. The encoder takes the NV12 surfaces straight from the filter sink.
-//!
-//! Raw FFI: `ffmpeg-next` has no hwcontext/filter wrappers for what we need, so the
-//! hwdevice/hwframes/buffersrc/buffersink calls go through `ffmpeg::ffi` (= `ffmpeg_sys_next`),
-//! as the CUDA encode path and the clients' decode paths already do. The encoder is opened
-//! *without* a global header, so VPS/SPS/PPS are in-band on every IDR.
+//! First-frame payload picks the path: packed RGB/BGR CPU ([`CpuInner`]) swscales to BT.709
+//! NV12 (or BT.2020 P010) and uploads; `PUNKTFUNK_ZEROCOPY=1` dmabufs ([`DmabufInner`]) go
+//! `buffer(drm_prime) → hwmap → scale_vaapi → buffersink` on the GPU. Pins:
+//! `PUNKTFUNK_VAAPI_LOW_POWER`, `PUNKTFUNK_VAAPI_ASYNC_DEPTH`, `PUNKTFUNK_RENDER_NODE`. Opened
+//! without a global header so VPS/SPS/PPS ride every IDR. FFI via `ffmpeg::ffi`.
 
 use super::{Codec, EncodedFrame, Encoder};
 use anyhow::{anyhow, bail, Context, Result};
@@ -37,17 +25,15 @@ use super::libav::{
     apply_low_latency_rc, pixel_to_av, poll_encoder, AvBuffer, AvFilterGraph, AvFrame,
     AvSwsContext, PollOutcome, SWS_CS_ITU709, SWS_POINT,
 };
-use ffmpeg::ffi; // = ffmpeg_sys_next
+use ffmpeg::ffi;
 
-/// The render node a VAAPI/DRM device should open, from [`pf_gpu::linux_render_node`]: a
-/// matched web-console GPU preference pins it, else `PUNKTFUNK_RENDER_NODE`, else the single-GPU
-/// default.
+/// Render node libva opens: web-console GPU pin, else `PUNKTFUNK_RENDER_NODE`, else the
+/// single-GPU default ([`pf_gpu::linux_render_node`]).
 fn render_node() -> CString {
     let p = pf_gpu::linux_render_node().to_string_lossy().into_owned();
     CString::new(p).unwrap_or_else(|_| CString::new("/dev/dri/renderD128").unwrap())
 }
 
-/// The swscale *source* pixel format for a captured CPU layout (packed RGB/BGR only).
 fn vaapi_sws_src(format: PixelFormat) -> Result<Pixel> {
     Ok(match format {
         PixelFormat::Bgrx => Pixel::BGRZ, // bgr0
@@ -56,8 +42,6 @@ fn vaapi_sws_src(format: PixelFormat) -> Result<Pixel> {
         PixelFormat::Rgba => Pixel::RGBA,
         PixelFormat::Rgb => Pixel::RGB24,
         PixelFormat::Bgr => Pixel::BGR24,
-        // The GNOME 50+ HDR capture formats (PQ/BT.2020 packed 2:10:10:10) — the HDR CPU path's
-        // swscale source for the X2RGB10→P010 conversion.
         PixelFormat::X2Rgb10 => Pixel::X2RGB10LE,
         PixelFormat::X2Bgr10 => Pixel::X2BGR10LE,
         PixelFormat::Nv12
@@ -70,51 +54,34 @@ fn vaapi_sws_src(format: PixelFormat) -> Result<Pixel> {
     })
 }
 
-/// Which VAAPI entrypoint mode opened successfully: 1 = default (full-feature `EncSlice`),
-/// 2 = low-power (`EncSliceLP`/VDEnc). Modern Intel (Gen12+/Arc) removed the full-feature encode
-/// entrypoints, so the default open fails there and only `low_power=1` works; AMD (radeonsi) is the
-/// reverse. Caching the resolved mode lets later sessions/probes skip the known-failing attempt
-/// (and its libav error spew).
+/// Latched VAAPI entrypoint: `1` = full-feature `EncSlice`, `2` = low-power `EncSliceLP`/VDEnc.
+/// Intel Gen12+/Arc only expose VDEnc; AMD radeonsi is the reverse. Caching skips the
+/// known-failing open (and its libav spew).
 ///
-/// Keyed on **(render node, codec, bit depth)**, and every part of that key is load-bearing:
-///
-/// * The render node, because the entrypoint is a property of the DEVICE libva opens — and
-///   `render_node()` follows the web-console GPU preference. This used to be a process-global array
-///   keyed by codec alone, which made it a session-killer rather than a staleness bug: once a mode
-///   is latched the open tries exactly ONE mode and the `[false, true]` fallback is gone. Latch
-///   low-power on an Intel Arc, switch the preference to an AMD dGPU, and every VAAPI open there
-///   passes `low_power=1` — which radeonsi rejects — with no full-feature retry, for the process
-///   lifetime: the probe reports all-false AND the session's own encoder open fails.
-///   Keyed on the node rather than `pf_gpu::selection_key()` on purpose — the node is literally what
-///   `render_node()` hands libva, so key and device cannot describe different GPUs.
-/// * The bit depth, because Main10 and 8-bit can resolve to different entrypoints on the same
-///   device; one shared slot let an 8-bit answer pin the 10-bit open (HDR under-advertisement).
+/// Key is **(render node, codec, bit depth)** — all load-bearing. The node is what
+/// `render_node()` hands libva (not `pf_gpu::selection_key()`); a codec-only latch would pin
+/// Intel `low_power=1` onto a later AMD open with no retry. Depth is separate because Main10
+/// and 8-bit can resolve to different entrypoints on one device.
 static LP_MODE: OnceLock<Mutex<HashMap<LpKey, u8>>> = OnceLock::new();
 
-/// (render-node path, codec label, 10-bit) — see [`LP_MODE`].
 type LpKey = (String, &'static str, bool);
 
-/// The [`LP_MODE`] key for this device/codec/depth. `render_node()` is re-read rather than cached
-/// so a GPU-preference change is picked up on the next open.
+/// Re-reads `render_node()` so a GPU-preference change is picked up on the next open.
 fn lp_key(codec: Codec, ten_bit: bool) -> LpKey {
     lp_key_for(&render_node().to_string_lossy(), codec, ten_bit)
 }
 
-/// [`lp_key`] with the render node explicit (device-free for the unit tests). Every part of the
-/// key is load-bearing — see [`LP_MODE`] for the two field-motivated bugs (node: cross-GPU
-/// session-killer; depth: HDR under-advertisement).
+/// [`lp_key`] with the node explicit (tests).
 fn lp_key_for(node: &str, codec: Codec, ten_bit: bool) -> LpKey {
     (node.to_owned(), codec.label(), ten_bit)
 }
 
-/// `PUNKTFUNK_VAAPI_LOW_POWER` pins the entrypoint mode (`1` = low-power only, `0` = full-feature
-/// only); unset → try full-feature first, fall back to low-power.
+/// `PUNKTFUNK_VAAPI_LOW_POWER`: `1` = low-power only, `0` = full-feature only; unset = ladder.
 fn low_power_override() -> Option<bool> {
     parse_low_power(&std::env::var("PUNKTFUNK_VAAPI_LOW_POWER").ok()?)
 }
 
-/// [`low_power_override`]'s value grammar (device-free for the unit tests). Anything outside the
-/// two literal sets means "no pin" — the `[full-feature, low-power]` ladder runs.
+/// Anything outside the two literal sets is no pin — the ladder runs.
 fn parse_low_power(raw: &str) -> Option<bool> {
     match raw.trim() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -123,11 +90,8 @@ fn parse_low_power(raw: &str) -> Option<bool> {
     }
 }
 
-/// The entrypoint modes to attempt, in order (`false` = full-feature `EncSlice`, `true` =
-/// low-power VDEnc): an operator pin tries exactly that one; a cached resolution ([`LP_MODE`]:
-/// 1 = full-feature, 2 = low-power) skips the known-failing attempt; anything else runs the full
-/// ladder — full-feature first so AMD's first-try open stays byte-for-byte unchanged. Never
-/// empty: [`open_vaapi_encoder`] relies on at least one attempt running.
+/// Modes to try (`false` = EncSlice, `true` = VDEnc). A pin or a [`LP_MODE`] hit is one
+/// attempt; otherwise full-feature first, then low-power. Never empty.
 fn entrypoint_ladder(pin: Option<bool>, cached: u8) -> &'static [bool] {
     match pin {
         Some(true) => &[true],
@@ -140,8 +104,6 @@ fn entrypoint_ladder(pin: Option<bool>, cached: u8) -> &'static [bool] {
     }
 }
 
-/// The [`LP_MODE`] value a successful open latches (1 = full-feature, 2 = low-power). Paired with
-/// [`entrypoint_ladder`], which maps it back to the single-mode retry list.
 fn latched_mode(low_power: bool) -> u8 {
     if low_power {
         2
@@ -150,7 +112,6 @@ fn latched_mode(low_power: bool) -> u8 {
     }
 }
 
-/// The VUI colour metadata the encoder signals for the session's depth.
 struct Vui {
     colorspace: ffi::AVColorSpace,
     range: ffi::AVColorRange,
@@ -158,12 +119,8 @@ struct Vui {
     trc: ffi::AVColorTransferCharacteristic,
 }
 
-/// 10-bit HDR: BT.2020 primaries + SMPTE-2084 (PQ) transfer, limited range — matches the P010 the
-/// CSC produces (swscale BT.2020 on the CPU path; `scale_vaapi` pinned to bt2020nc on the zero-copy
-/// path); the client decoder auto-detects PQ from the VUI. SDR: we hand the encoder BT.709
-/// *limited* NV12 (swscale CSC on the CPU path; `scale_vaapi` pinned to
-/// `out_color_matrix=bt709:out_range=limited` on the zero-copy path, with the full-range RGB input
-/// tagged), so signal that VUI — else the client decoder washes the picture out.
+/// VUI for the session depth. 10-bit: BT.2020 + PQ limited, matching the P010 CSC. SDR: BT.709
+/// limited — an unspecified VUI lets the decoder treat full-range and wash out.
 fn vui_for(ten_bit: bool) -> Vui {
     if ten_bit {
         Vui {
@@ -182,28 +139,20 @@ fn vui_for(ten_bit: bool) -> Vui {
     }
 }
 
-/// The explicit `profile` option for this codec/depth, or `None` to let the encoder derive it.
-/// HEVC Main10 is pinned explicitly so the depth is never silently dropped (`hevc_vaapi` would
-/// derive it from the P010 surfaces, but a derivation can regress quietly); 10-bit AV1 is
-/// input-driven — no profile knob — and every 8-bit open keeps the encoder default.
+/// Pin HEVC Main10 so depth cannot drop silently; 10-bit AV1 has no profile knob.
 fn explicit_profile(codec: Codec, ten_bit: bool) -> Option<&'static str> {
     (ten_bit && codec == Codec::H265).then_some("main10")
 }
 
-/// `PUNKTFUNK_VAAPI_ASYNC_DEPTH` grammar: 1..=8 accepted verbatim; unset, junk, and out-of-range
-/// values all resolve to depth 1 — the lowest-latency structure (see the `async_depth` note at the
-/// call site for why 1 is the default and what depth ≥ 2 trades).
+/// `PUNKTFUNK_VAAPI_ASYNC_DEPTH`: 1..=8 verbatim; anything else is 1 (lowest latency).
 fn async_depth(raw: Option<&str>) -> u32 {
     raw.and_then(|s| s.parse::<u32>().ok())
         .filter(|d| (1..=8).contains(d))
         .unwrap_or(1)
 }
 
-/// The `scale_vaapi` filter args for the session's depth. The VPP's output colour is pinned to
-/// exactly what the encoder's VUI signals ([`vui_for`]) — without the explicit options the
-/// conversion matrix is whatever the driver defaults to for an unspecified output (Mesa: BT.601),
-/// a hue shift against the signaled VUI. (The PQ transfer is per-channel and rides through the
-/// matrix untouched.)
+/// `scale_vaapi` output colour, pinned to [`vui_for`]. Unspecified output is Mesa BT.601 — a
+/// hue shift against the signaled VUI. PQ is per-channel and rides the matrix untouched.
 fn scale_vaapi_args(ten_bit: bool) -> &'static CStr {
     if ten_bit {
         c"format=p010:out_color_matrix=bt2020nc:out_range=limited"
@@ -212,21 +161,17 @@ fn scale_vaapi_args(ten_bit: bool) -> &'static CStr {
     }
 }
 
-/// What a (captured format, negotiated bit depth) pair resolves to at open. 10-bit rides on the
-/// captured PIXELS, not the negotiated depth — see [`crate::ten_bit_input`] for the failure the
-/// reverse shape produces.
+/// Open-time depth vs captured pixels. 10-bit rides on the pixels, not the negotiated depth —
+/// see [`crate::ten_bit_input`] for the reverse-shape failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DepthResolution {
-    /// PQ-graded 10-bit frames on a non-10-bit session: refuse the open, so PQ content is never
-    /// mislabeled BT.709.
+    /// PQ frames on a non-10-bit session: refuse rather than mislabel BT.709.
     RefuseMislabeledPq,
-    /// 10-bit negotiated but the capture stayed SDR: honestly encode 8-bit (with a warning).
+    /// 10-bit negotiated, capture stayed SDR: encode 8-bit (with a warning).
     SdrDowngrade,
-    /// Format and negotiated depth agree.
     Agreed,
 }
 
-/// See [`DepthResolution`].
 fn resolve_depth(format: PixelFormat, bit_depth: u8) -> DepthResolution {
     if format.is_hdr_rgb10() && bit_depth != 10 {
         DepthResolution::RefuseMislabeledPq
@@ -237,19 +182,14 @@ fn resolve_depth(format: PixelFormat, bit_depth: u8) -> DepthResolution {
     }
 }
 
-/// Whether a codec is even eligible for the 10-bit probe: PyroWave answers 10-bit support on its
-/// own path (no VAAPI involved), and a codec without a 10-bit profile can never pass.
+/// HEVC/AV1 only. PyroWave answers 10-bit on its own path; skip the VAAPI device open.
 fn ten_bit_probe_eligible(codec: Codec) -> bool {
     codec.supports_10bit() && codec != Codec::PyroWave
 }
 
-/// Open the VAAPI encoder, resolving the entrypoint mode: try the full-feature entrypoint first
-/// and, if the driver rejects it, retry with `low_power=1` — modern Intel (Gen12+/Arc) exposes
-/// ONLY the low-power VDEnc entrypoint (ffmpeg's `vaapi_encode` defaults `low_power=0` and errors
-/// "no usable encoding entrypoint" there; LP additionally needs the HuC firmware, loaded by
-/// default on those kernels). AMD keeps its first-try full-feature open byte-for-byte unchanged.
-/// The resolved mode is cached per codec; `PUNKTFUNK_VAAPI_LOW_POWER` pins it.
-/// Safety contract is [`open_vaapi_encoder_mode`]'s (borrowed `device_ref`/`frames_ref`).
+/// Open the encoder, trying full-feature then `low_power=1`. Intel Gen12+/Arc is VDEnc-only;
+/// AMD's first-try EncSlice stays unchanged. Mode caches per [`LP_MODE`]; env pins it.
+/// Safety: borrowed `device_ref`/`frames_ref` — see [`open_vaapi_encoder_mode`].
 #[allow(clippy::too_many_arguments)]
 unsafe fn open_vaapi_encoder(
     codec: Codec,
@@ -270,9 +210,8 @@ unsafe fn open_vaapi_encoder(
     let modes: &[bool] = entrypoint_ladder(low_power_override(), cached);
     let mut first_err = None;
     for &lp in modes {
-        // SAFETY: `device_ref`/`frames_ref` are forwarded unchanged from this fn's own contract —
-        // valid `AVBufferRef`s — and the callee only `av_buffer_ref`s them, so retrying another
-        // entrypoint below reuses the same still-owned buffers rather than consuming them.
+        // SAFETY: `device_ref`/`frames_ref` are this fn's borrowed `AVBufferRef`s. The callee
+        // only `av_buffer_ref`s them, so a retry reuses the still-owned buffers.
         let attempt = unsafe {
             open_vaapi_encoder_mode(
                 codec,
@@ -309,15 +248,12 @@ unsafe fn open_vaapi_encoder(
             }
         }
     }
-    // `modes` is never empty, so at least one attempt ran and recorded its error. The first
-    // (full-feature) error is the informative one — "no VA display" etc.
+    // `modes` is never empty ([`entrypoint_ladder`]); the first error is the informative one.
     Err(first_err.unwrap())
 }
 
-/// Build the FFmpeg encoder context (shared by both inner paths): name, mode, low-latency RC,
-/// infinite GOP, the VUI (BT.709 limited SDR, or BT.2020 PQ limited for `ten_bit` HDR),
-/// `pix_fmt=VAAPI`, and the given hw device + frames contexts. Returns the opened encoder.
-/// `device_ref`/`frames_ref` are borrowed (ref'd into the context).
+/// Shared encoder context for both inner paths. `device_ref`/`frames_ref` are borrowed
+/// (`av_buffer_ref`'d into the context), not consumed.
 #[allow(clippy::too_many_arguments)]
 unsafe fn open_vaapi_encoder_mode(
     codec: Codec,
@@ -340,16 +276,12 @@ unsafe fn open_vaapi_encoder_mode(
         .context("alloc video encoder")?;
     video.set_width(width);
     video.set_height(height);
-    // sw view (pix_fmt overridden to VAAPI below): NV12, or P010 for the 10-bit HDR session.
     video.set_format(if ten_bit { Pixel::P010LE } else { Pixel::NV12 });
-    // Fixed rate, CBR, no B-frames, ~1-frame VBV — the shared low-latency RC contract.
     apply_low_latency_rc(&mut video, fps, bitrate_bps);
-    // SAFETY: `as_mut_ptr` hands back the `AVCodecContext` behind the `video` encoder allocated
-    // just above, which outlives every write here (it is moved into the return value). The
-    // colour/gop/pix_fmt stores are in-bounds scalar field writes on that live context. The two
-    // `av_buffer_ref` calls take `device_ref`/`frames_ref`, valid `AVBufferRef`s by this fn's
-    // contract, and each returns a NEW reference that the codec context adopts and unrefs when it
-    // is freed — so this shares the caller's buffers rather than taking them over.
+    // SAFETY: `as_mut_ptr` is the `AVCodecContext` behind `video`, which outlives these writes
+    // (moved into the return). Colour/gop/pix_fmt stores are in-bounds scalars. Each
+    // `av_buffer_ref` returns a NEW ref the context unrefs on free — the caller's buffers stay
+    // owned by the caller.
     unsafe {
         let raw = video.as_mut_ptr();
         (*raw).gop_size = i32::MAX; // no periodic IDR (forced-IDR via pict_type=I on RFI)
@@ -367,14 +299,10 @@ unsafe fn open_vaapi_encoder_mode(
     if let Some(profile) = explicit_profile(codec, ten_bit) {
         opts.set("profile", profile);
     }
-    // async_depth=1: `send_frame` blocks until THIS frame's ASIC encode completes — the lowest
-    // latency structure libavcodec's vaapi_encode offers. Measured on the 780M at 1440p60: depth 1
-    // = 8.3 ms end-to-end p50 vs depth 2 = 18 ms, because with depth ≥ 2 frame N's packet only
-    // materializes once frame N+1 is queued (a structural +1-frame delay no poll can beat). The
-    // knob exists for pixel rates beyond the ASIC's serial budget (e.g. 1440p120+ on an iGPU),
-    // where depth 2 restores throughput at that one-frame cost. NOTE: the per-frame block tracks
-    // GPU CLOCKS — a paced 60 fps trickle lets the VCN downclock (~8 ms/frame vs ~4.4 ms hot);
-    // see `gpuclocks` for the session clock pin that removes the ramp tax.
+    // async_depth=1: `send_frame` blocks until this frame's encode completes. Depth ≥ 2 only
+    // emits packet N once N+1 is queued — a structural +1-frame delay no poll beats. Raise it
+    // when the ASIC cannot serialise the pixel rate (the env knob). The block tracks GPU
+    // clocks; a paced 60 fps trickle downclocks VCN — see `gpuclocks`.
     let depth = async_depth(std::env::var("PUNKTFUNK_VAAPI_ASYNC_DEPTH").ok().as_deref());
     opts.set("async_depth", &depth.to_string());
     if low_power {
@@ -385,26 +313,19 @@ unsafe fn open_vaapi_encoder_mode(
     })
 }
 
-/// Probe whether THIS GPU can VAAPI-encode `codec`, by opening a tiny encoder: the driver rejects
-/// codecs its video engine can't do (e.g. AV1 on pre-RDNA3 AMD / pre-Arc Intel). Used to build the
-/// GameStream codec advertisement so a client never negotiates a codec the GPU can't encode. The
-/// device + encoder are torn down immediately (RAII).
+/// Tiny open/close: the driver rejects codecs the video engine cannot do. Feeds GameStream
+/// advertisement so a client never negotiates an unencodable codec.
 pub fn probe_can_encode(codec: Codec) -> bool {
     if ffmpeg::init().is_err() {
         return false;
     }
-    // A missing VA device (non-VAAPI host, GPU-less CI) is an expected probe outcome — quiet
-    // ffmpeg's "No VA display found" error for the probe. Held until the function returns, so the
-    // level is restored after the open either way. Shares one lock with the NVENC probes, which
-    // race this one on the same libav global (see [`crate::linux::QuietLibavLog`]).
+    // Missing VA device is an expected probe outcome. Held for the whole fn so the log
+    // level restores either way. Shares the lock with the NVENC probes ([`crate::linux::QuietLibavLog`]).
     let _quiet = crate::linux::QuietLibavLog::new();
-    // SAFETY: `ffmpeg::init()` returned Ok above, so libav is initialized. `VaapiHw::new` (an
-    // `unsafe fn`) builds a VAAPI device + NV12 frames pool from the literal NV12/640x480/pool=2
-    // args and hands back a RAII handle that unrefs both `AVBufferRef`s on drop.
-    // `open_vaapi_encoder` (an `unsafe fn`) borrows `hw.device_ref`/`hw.frames_ref` — the two
-    // non-null refs `VaapiHw::new` just created — and `av_buffer_ref`s them into the encoder; `hw`
-    // is a live local for the whole match arm, so the borrows outlive the synchronous call, and
-    // both `hw` and the probe encoder are dropped (RAII) when the arm ends.
+    // SAFETY: `ffmpeg::init()` returned Ok. `VaapiHw::new` builds a VAAPI device + NV12 pool
+    // (640×480, pool=2) and unrefs both on drop. `open_vaapi_encoder` borrows the two non-null
+    // refs; `hw` is a live local for the match arm, so the borrows outlive the call. Both drop
+    // when the arm ends.
     unsafe {
         match VaapiHw::new(ffi::AVPixelFormat::AV_PIX_FMT_NV12, 640, 480, 2) {
             Ok(hw) => open_vaapi_encoder(
@@ -423,11 +344,7 @@ pub fn probe_can_encode(codec: Codec) -> bool {
     }
 }
 
-/// Probe whether the active VAAPI GPU can encode **10-bit** (HEVC Main10 / 10-bit AV1) from P010
-/// surfaces — the exact shape a live HDR session opens (P010 pool + Main10 profile + PQ VUI). The
-/// driver rejects what the video engine can't do; the result is cached by the caller
-/// ([`crate::can_encode_10bit`]), so a non-Main10 GPU resolves every session to 8-bit SDR before
-/// the Welcome (honest downgrade).
+/// Tiny P010 + Main10 + PQ VUI open — the live HDR shape. Cached by [`crate::can_encode_10bit`].
 pub fn probe_can_encode_10bit(codec: Codec) -> bool {
     if !ten_bit_probe_eligible(codec) {
         return false;
@@ -435,15 +352,10 @@ pub fn probe_can_encode_10bit(codec: Codec) -> bool {
     if ffmpeg::init().is_err() {
         return false;
     }
-    // A missing VA device / no Main10 entrypoint is an expected probe outcome — quiet ffmpeg's
-    // error for the probe. Held until the function returns, so the level is restored after the open
-    // either way, and shared with the other probes (see [`crate::linux::QuietLibavLog`]).
+    // Missing VA / no Main10 is expected. Same quiet-log contract as [`probe_can_encode`].
     let _quiet = crate::linux::QuietLibavLog::new();
-    // SAFETY: `ffmpeg::init()` returned Ok above, so libav is initialized. `VaapiHw::new` (an
-    // `unsafe fn`) builds a VAAPI device + P010 frames pool from the literal args and hands back a
-    // RAII handle; `open_vaapi_encoder` (an `unsafe fn`) borrows `hw.device_ref`/`hw.frames_ref` —
-    // the two non-null refs `VaapiHw::new` just created, live locals for the whole match arm — and
-    // `av_buffer_ref`s them into the probe encoder. Both `hw` and the encoder drop (RAII) at arm end.
+    // SAFETY: `ffmpeg::init()` returned Ok. `VaapiHw::new` builds a P010 pool; `open_vaapi_encoder`
+    // borrows the two non-null refs for the match arm. Both drop at arm end.
     unsafe {
         match VaapiHw::new(ffi::AVPixelFormat::AV_PIX_FMT_P010LE, 640, 480, 2) {
             Ok(hw) => open_vaapi_encoder(
@@ -462,35 +374,23 @@ pub fn probe_can_encode_10bit(codec: Codec) -> bool {
     }
 }
 
-/// Whether the active VAAPI GPU can encode HEVC **4:4:4** (Range Extensions). **Deferred in v1 —
-/// always `false`.** VAAPI HEVC 4:4:4 encode is narrow and vendor-specific (the lab's AMD Phoenix1 /
-/// RDNA3 exposes only `VAProfileHEVCMain`/`Main10` `EncSlice`, no `Main444`), and there is no
-/// validated hardware to build + verify the 4:4:4 surface/profile path against. Returning `false`
-/// keeps the negotiation honest: a VAAPI host resolves every session to 4:2:0 before the Welcome, so
-/// the client never builds a 4:4:4 decoder it would only get 4:2:0 frames for. (Follow-up: implement
-/// and validate on an Intel Arc / RDNA4-class box that advertises a HEVC 4:4:4 encode entrypoint.)
+/// Always `false`. No validated HEVC 4:4:4 encode entrypoint, so a VAAPI host advertises 4:2:0
+/// and the client never builds a 4:4:4 decoder for 4:2:0 frames.
 pub fn probe_can_encode_444(_codec: Codec) -> bool {
     tracing::info!("VAAPI HEVC 4:4:4 encode is not implemented yet — declining (encoding 4:2:0)");
     false
 }
 
-// ---------------------------------------------------------------------------------------------
-// CPU upload path (Phase 1): swscale RGB→NV12 → upload into a pooled VA surface → encode.
-// ---------------------------------------------------------------------------------------------
-
-/// VAAPI device + NV12 frames pool (the encoder's input surfaces for the CPU path).
 struct VaapiHw {
-    // Declared frames-BEFORE-device on purpose: these drop in declaration order, which reproduces
-    // exactly what the hand-written `Drop` this replaced did (the frames ctx holds its own
-    // reference on the device). Do not reorder these two fields.
+    // frames-BEFORE-device: drop order matches the frames ctx holding a ref on the device.
+    // Do not reorder.
     frames_ref: AvBuffer,
     device_ref: AvBuffer,
 }
 
 impl VaapiHw {
-    /// Safe: unlike its CUDA twin ([`super::CudaHw::new`], which is handed a `CUcontext` the caller
-    /// must vouch for) this takes only scalars and opens the device itself, so there is no caller
-    /// contract — the `unsafe` below is the libav FFI, not an obligation.
+    /// Opens the device from scalars — no caller `CUcontext` contract, unlike [`super::CudaHw::new`].
+    /// The `unsafe` below is libav FFI, not an obligation on the caller.
     fn new(sw_format: ffi::AVPixelFormat, w: u32, h: u32, pool: c_int) -> Result<Self> {
         let mut device_ref: *mut ffi::AVBufferRef = ptr::null_mut();
         let node = render_node();
@@ -509,16 +409,13 @@ impl VaapiHw {
         if r < 0 {
             bail!("no VAAPI device ({:?}): {}", node, ffmpeg::Error::from(r));
         }
-        // `av_hwdevice_ctx_create` wrote an owned ref into `device_ref`; take ownership of it here so
-        // every `bail!` below drops it (and the frames ref, once built) without cleanup of its own.
+        // Take ownership now so every later `bail!` drops the device (and frames, once built).
         // SAFETY: `r >= 0`, so `device_ref` is that owned reference and this is its only owner.
         let device_ref = unsafe { AvBuffer::from_raw(device_ref) }
             .context("av_hwdevice_ctx_create(VAAPI) gave no device")?;
-        // SAFETY: the same shape as `CudaHw::new` — `av_hwframe_ctx_alloc` is handed the live device
-        // ref and returns null (rejected by `from_raw`, so the `?` leaves before the writes below)
-        // or a ref whose `data` libav has already initialized as an `AVHWFramesContext`. Every store
-        // is then an in-bounds scalar write on that live allocation, done before
-        // `av_hwframe_ctx_init` reads them.
+        // SAFETY: `av_hwframe_ctx_alloc` is handed the live device ref and returns null (rejected
+        // by `from_raw`, so `?` leaves before the writes) or a ref whose `data` is already an
+        // `AVHWFramesContext`. Stores are in-bounds scalars, done before `av_hwframe_ctx_init`.
         let frames_ref = unsafe {
             let frames_ref = AvBuffer::from_raw(ffi::av_hwframe_ctx_alloc(device_ref.as_ptr()))
                 .context("av_hwframe_ctx_alloc(VAAPI) failed")?;
@@ -541,18 +438,13 @@ impl VaapiHw {
     }
 }
 
-// No `Drop` for `VaapiHw`: each `AvBuffer` field unrefs itself, in declaration order (frames, then
-// device — see the field comment). The hand-written unref pair this replaced had to stay in sync
-// with every failure branch in `new`; now there is one unref path and it cannot be skipped.
+// No `Drop`: each `AvBuffer` unrefs itself, frames then device (see field comment).
 
 struct CpuInner {
     enc: encoder::video::Encoder,
     hw: VaapiHw,
-    // FIELD ORDER IS LOAD-BEARING: the hand-written `Drop` this replaced freed `nv12` BEFORE
-    // `sws` — the reverse of the old declaration order — and field-DECLARATION order is what
-    // preserves that now (drop order follows declaration; an offset_of assert cannot pin it,
-    // repr(Rust) may lay memory out in any order).
-    /// Reusable software NV12/P010 staging frame (swscale dst → upload src).
+    // nv12 before sws: drop order is declaration order (`repr(Rust)` layout is not). Do not
+    // reorder — `offset_of` cannot pin this.
     nv12: AvFrame,
     sws: AvSwsContext,
     src_format: PixelFormat,
@@ -570,8 +462,6 @@ impl CpuInner {
         bitrate_bps: u64,
     ) -> Result<Self> {
         let src_pixel = vaapi_sws_src(format)?;
-        // A 10-bit HDR capture (X2RGB10/X2BGR10, PQ/BT.2020) uploads P010 and encodes Main10; the
-        // 8-bit paths keep NV12/BT.709 byte-for-byte unchanged.
         let ten_bit = format.is_hdr_rgb10();
         let staging_av = if ten_bit {
             ffi::AVPixelFormat::AV_PIX_FMT_P010LE
@@ -579,16 +469,10 @@ impl CpuInner {
             ffi::AVPixelFormat::AV_PIX_FMT_NV12
         };
         const POOL: c_int = 16;
-        // `VaapiHw::new` is safe now; it returns a RAII `VaapiHw` that unrefs its two `AVBufferRef`s
-        // on drop. (libav is initialized on every path here — `VaapiEncoder::open` → `ensure_inner`
-        // → `CpuInner::open`, and `open` ran `ffmpeg::init()` — which the call relies on but cannot
-        // itself be broken by a caller, so it is a note rather than a contract.)
         let hw = VaapiHw::new(staging_av, width, height, POOL)?;
-        // SAFETY: `open_vaapi_encoder` (an `unsafe fn`) borrows `hw.device_ref`/`hw.frames_ref` — both
-        // non-null (`VaapiHw::new` guarantees it) and from the `hw` just built above, which is a live
-        // local that outlives this synchronous call. The fn `av_buffer_ref`s them into the encoder, so
-        // the encoder holds its own references; `hw` is also moved into the returned `CpuInner` next to
-        // `enc`, keeping the device/frames alive for the encoder's whole lifetime.
+        // SAFETY: `open_vaapi_encoder` borrows `hw.device_ref`/`hw.frames_ref` — both non-null
+        // (`VaapiHw::new`) and live for this call. It `av_buffer_ref`s them into the encoder;
+        // `hw` is then moved into `CpuInner` next to `enc`, so the device outlives the encoder.
         let enc = unsafe {
             open_vaapi_encoder(
                 codec,
@@ -601,16 +485,11 @@ impl CpuInner {
                 ten_bit,
             )?
         };
-        // swscale RGB→NV12 (BT.709 limited) or X2RGB10→P010 (BT.2020 limited, HDR) — matches the
-        // VUI; no rescale.
         let src_av = pixel_to_av(src_pixel);
-        // SAFETY: `sws_getContext` allocates a swscale context for the given src/dst dimensions and
-        // pixel formats. All four dims are the encoder's positive `width`/`height` cast to `c_int`;
-        // `src_av` is a valid `AVPixelFormat` (from `pixel_to_av` of the `vaapi_sws_src`-validated
-        // `src_pixel`), the dst is NV12/P010. The three trailing pointers (srcFilter, dstFilter,
-        // param) are explicitly null = "use defaults", which the API documents as accepted. No Rust
-        // memory is borrowed — only by-value ints/enums — and ownership of the returned context
-        // passes to the `AvSwsContext` (null rejected by `from_raw`).
+        // SAFETY: `sws_getContext` for the encoder's positive `width`/`height`. `src_av` is a
+        // valid `AVPixelFormat` (`vaapi_sws_src` then `pixel_to_av`); dst is NV12/P010. Trailing
+        // srcFilter/dstFilter/param are null = documented defaults. No Rust memory is borrowed;
+        // ownership of the returned context passes to `AvSwsContext` (null rejected by `from_raw`).
         let sws = unsafe {
             AvSwsContext::from_raw(ffi::sws_getContext(
                 width as c_int,
@@ -631,12 +510,9 @@ impl CpuInner {
                 if ten_bit { "P010" } else { "NV12" }
             );
         };
-        // SAFETY: `sws` is the live owned context from above. The coefficient table from
-        // `sws_getCoefficients` (ITU-709, or BT.2020 NCL for the HDR path — matching the VUI) is a
-        // libswscale static const valid for the whole process, reused here for both the inverse
-        // (src) and forward (dst) matrices. `sws_setColorspaceDetails` only reads those tables and
-        // writes scalar CSC settings into `sws`; the table pointer outlives the synchronous call and
-        // no Rust memory is passed.
+        // SAFETY: `sws` is the owned context from above. `sws_getCoefficients` returns a
+        // process-lifetime static table (ITU-709 or BT.2020 NCL, matching the VUI), reused for
+        // both inverse and forward matrices. `sws_setColorspaceDetails` only reads it.
         unsafe {
             let cs = ffi::sws_getCoefficients(if ten_bit {
                 super::libav::SWS_CS_BT2020
@@ -646,11 +522,8 @@ impl CpuInner {
             ffi::sws_setColorspaceDetails(sws.as_ptr(), cs, 1, cs, 0, 0, 1 << 16, 1 << 16);
         }
         let nv12 = AvFrame::alloc().context("av_frame_alloc(staging) failed")?;
-        // SAFETY: writing the plain `format`/`width`/`height` fields through the owned frame's
-        // pointer stays inside its allocation (sole owner, not yet shared).
-        // `av_frame_get_buffer` allocates backing storage for those dims/format; on failure the
-        // owned `nv12` (and the `sws` above it) simply drop — the hand-written unwind this
-        // replaced had to free both by hand on every branch.
+        // SAFETY: `format`/`width`/`height` writes stay inside the owned frame. `av_frame_get_buffer`
+        // allocates backing; on failure `nv12` and `sws` drop.
         unsafe {
             (*nv12.as_ptr()).format = staging_av as c_int;
             (*nv12.as_ptr()).width = width as c_int;
@@ -685,18 +558,11 @@ impl CpuInner {
         let h = self.height as usize;
         let src_row = w * self.src_format.bytes_per_pixel();
         anyhow::ensure!(bytes.len() >= src_row * h, "captured buffer too small");
-        // SAFETY: The `ensure!`s above guarantee `format == self.src_format` and
-        // `bytes.len() >= src_row * h`. `sws_scale` reads `h` rows of `src_row` bytes from
-        // `src_data[0] = bytes.as_ptr()` (the other planes null/0 — packed RGB is single-plane), all
-        // in bounds; `bytes`, `src_data`, `src_stride` are live locals for this synchronous call.
-        // `self.sws` is the owned context built in `open`; it writes into `self.nv12` (an owned
-        // frame whose `data`/`linesize` in-struct arrays were sized by `av_frame_get_buffer`).
-        // `hwf` is an owned `AvFrame` — every exit below drops it exactly once, releasing its ref
-        // on the pooled VAAPI surface. `av_hwframe_get_buffer` pulls that surface from the live
-        // non-null `self.hw.frames_ref`; `av_hwframe_transfer_data` uploads the staged NV12 into
-        // it. `avcodec_send_frame` takes its own ref, so the drop afterwards is the sole owning
-        // free. The encoder runs only on this thread (see `unsafe impl Send`), so no
-        // aliasing/data race.
+        // SAFETY: the `ensure!`s cover format and `bytes.len() >= src_row * h`. `sws_scale` reads
+        // `h` packed-RGB rows from `bytes`; `self.sws` writes `self.nv12` (buffer-sized in `open`).
+        // `hwf` is owned — every exit drops it once. `av_hwframe_get_buffer` pulls from live
+        // `self.hw.frames_ref`; `av_hwframe_transfer_data` uploads; `avcodec_send_frame` takes its
+        // own ref. Encoder is this thread only (`unsafe impl Send`).
         unsafe {
             let src_data: [*const u8; 4] = [bytes.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
             let src_stride: [c_int; 4] = [src_row as c_int, 0, 0, 0];
@@ -734,38 +600,22 @@ impl CpuInner {
     }
 }
 
-// No `Drop` for `CpuInner`: `nv12` (`AvFrame`) and `sws` (`AvSwsContext`) free themselves, in
-// field-declaration order — the same nv12-then-sws sequence the hand-written `Drop` performed
-// (see the field-order note on the struct). The encoder holds its own `av_buffer_ref`'d
-// device/frames copies, so their order against `enc`/`hw` is irrelevant to soundness.
-
-// ---------------------------------------------------------------------------------------------
-// Zero-copy dmabuf path: DRM-PRIME → hwmap(vaapi) → scale_vaapi(nv12) filter graph → encode.
-// ---------------------------------------------------------------------------------------------
+// No `Drop`: `nv12` then `sws` free themselves (see field order). The encoder holds its own
+// `av_buffer_ref`'d copies, so `enc`/`hw` order is not a soundness issue.
 
 struct DmabufInner {
-    // FIELD ORDER IS LOAD-BEARING. These drop in declaration order, and this order reproduces
-    // exactly what the hand-written `Drop` this replaced did: graph, then frames, then the derived
-    // VAAPI device, then DRM — and `enc` last of all, since the old `Drop` ran before any field and
-    // so freed all four ahead of ffmpeg-next dropping the encoder. Every one of these holds its own
-    // reference, so refcounting makes any order sound; the point is that a field reorder must not
-    // silently change what ships. Do not move `enc`, and do not reorder the four below it.
-    /// The filter graph. Owner-only: `src`/`sink` below are borrowed filter contexts the graph owns,
-    /// and everything per-frame goes through those, so nothing reads this field again — it exists so
-    /// the graph outlives them and is freed exactly once. (`dead_code` answered here rather than by
-    /// removing the field, which would free the graph while `src`/`sink` still point into it.)
+    // Drop order is declaration order: graph, frames, derived VAAPI, DRM, then `enc` last.
+    // Each holds its own ref so any order is sound; do not silently change what ships.
+    /// Owner-only: `src`/`sink` are borrowed ctxs the graph owns. Removing the field would
+    /// free the graph while they still point into it.
     #[allow(dead_code)]
     graph: AvFilterGraph,
-    /// DRM-PRIME frames context for the imported dmabufs (buffersrc input). Read per frame by
-    /// `submit`, which tags each imported `AVFrame` with a new ref of it.
+    /// DRM-PRIME frames ctx; `submit` tags each imported `AVFrame` with a new ref of it.
     drm_frames: AvBuffer,
-    /// VAAPI device driving `hwmap`/`scale_vaapi`/the encoder. Owner-only: the two filters and the
-    /// encoder each took their own ref at open, so nothing reads it again — it keeps the device
-    /// alive behind them.
+    /// Owner-only: hwmap, scale_vaapi, and the encoder each took their own ref at open.
     #[allow(dead_code)]
     vaapi_device: AvBuffer,
-    /// DRM device the source dmabuf frames reference (the buffersrc's `hw_frames_ctx` device).
-    /// Owner-only for the same reason: `drm_frames` holds its own ref on it.
+    /// Owner-only: `drm_frames` holds its own ref on this DRM device.
     #[allow(dead_code)]
     drm_device: AvBuffer,
     src: *mut ffi::AVFilterContext,
@@ -773,13 +623,9 @@ struct DmabufInner {
     width: u32,
     height: u32,
     fourcc: u32,
-    /// Frames submitted — drives the sampled `PUNKTFUNK_PERF` breakdown of the synchronous
-    /// submit (import+push vs CSC pull vs encoder send), the stage that dominates AMD/Intel
-    /// host latency (7.9 ms p50 at 1440p on the 780M).
+    /// Submit count for the sampled `PUNKTFUNK_PERF` split (one line per ~2 s at 60 fps).
     frames: u64,
-    /// Declared LAST on purpose — see the field-order note at the top of this struct. The encoder
-    /// holds its own device ref and must drop after the graph and the three buffers, which is what
-    /// the hand-written `Drop` used to guarantee by running ahead of every field.
+    /// Last so it drops after the graph and the three buffers.
     enc: encoder::video::Encoder,
 }
 
@@ -794,8 +640,6 @@ impl DmabufInner {
     ) -> Result<Self> {
         let drm_fourcc = pf_frame::drm_fourcc(format)
             .ok_or_else(|| anyhow!("no DRM fourcc for {format:?} (VAAPI zero-copy)"))?;
-        // A 10-bit HDR capture (X2RGB10/X2BGR10 dmabufs, PQ/BT.2020) maps + CSCs to P010 and
-        // encodes Main10; the 8-bit paths keep the NV12/BT.709 graph byte-for-byte unchanged.
         let ten_bit = format.is_hdr_rgb10();
         let sw_format = match format {
             PixelFormat::X2Rgb10 => ffi::AVPixelFormat::AV_PIX_FMT_X2RGB10LE,
@@ -804,34 +648,20 @@ impl DmabufInner {
             _ => ffi::AVPixelFormat::AV_PIX_FMT_BGR0,
         };
         let node = render_node();
-        // SAFETY: libav is initialized (`VaapiEncoder::open` ran `ffmpeg::init()` before
-        // `ensure_inner` → `DmabufInner::open`). Every raw pointer dereferenced below is either freshly
-        // allocated by the immediately-preceding ffmpeg call and null-checked, or an in-struct field of
-        // such an object:
-        //  * `node` is a `CString` (from `render_node`) live for the whole block; its `.as_ptr()` is a
-        //    NUL-terminated path read only during `av_hwdevice_ctx_create`.
-        //  * `av_hwdevice_ctx_create(&mut drm_device, DRM, …)` / `…_create_derived(&mut vaapi_device,
-        //    VAAPI, drm_device, …)`: on `r < 0` the out-param stays null and we bail (the derive path
-        //    unrefs `drm_device` first); on success each is a non-null owned `AVBufferRef`.
-        //  * `av_hwframe_ctx_alloc(drm_device)` → `drm_frames` (null-checked); `(*drm_frames).data` is
-        //    its `AVHWFramesContext` payload, written before `av_hwframe_ctx_init`.
-        //  * `avfilter_graph_alloc` → `graph` (null-checked); `avfilter_get_by_name` returns a static
-        //    const `AVFilter` (process-lifetime) or null; `avfilter_graph_alloc_filter` allocates each
-        //    filter ctx inside `graph`; the four are null-checked together. `inst`/arg strings are
-        //    'static C literals.
-        //  * `(*hwmap/scale).hw_device_ctx = av_buffer_ref(vaapi_device)` attaches a NEW ref owned by
-        //    the filter (freed by `avfilter_graph_free`); our `vaapi_device` ref is untouched.
-        //  * `av_buffersink_get_hw_frames_ctx(sink)` → `nv12_ctx` is a borrowed ref owned by the sink,
-        //    valid while `graph` lives (and `graph` is moved into the returned `DmabufInner`).
-        //  * `open_vaapi_encoder` borrows `vaapi_device` (our live owned ref) and `nv12_ctx` (sink's
-        //    live ref) and `av_buffer_ref`s both into the encoder.
-        // Every early-error path unref's the allocated buffers and frees the graph in the right order
-        // before bailing; on success the four `AVBufferRef`s + `graph` + `src`/`sink` are moved into
-        // `DmabufInner` and freed in its `Drop`. (Two non-UB leaks noted below: `av_buffersrc_*` and
-        // the final `?`.)
+        // SAFETY: libav is initialized (`VaapiEncoder::open` ran `ffmpeg::init()`). Every raw
+        // pointer below is a just-allocated, null-checked ffmpeg object or an in-struct field of one:
+        //  * `node` is a live `CString`; `.as_ptr()` is read only during `av_hwdevice_ctx_create`.
+        //  * device creates: `r < 0` leaves the out-param null and we bail; success is one owned ref.
+        //  * `av_hwframe_ctx_alloc` → `drm_frames` (null-checked); `data` is the `AVHWFramesContext`,
+        //    written before `av_hwframe_ctx_init`.
+        //  * `avfilter_graph_alloc` / `avfilter_get_by_name` (static or null) /
+        //    `avfilter_graph_alloc_filter` inside `graph`; the four ctxs are null-checked together.
+        //  * `av_buffer_ref(vaapi_device)` on hwmap/scale is a NEW ref the graph frees; ours is untouched.
+        //  * `av_buffersink_get_hw_frames_ctx` is borrowed from the sink, valid while `graph` lives.
+        //  * `open_vaapi_encoder` borrows `vaapi_device` and `nv12_ctx` and `av_buffer_ref`s both.
+        // Early `bail!` drops whatever `AvBuffer`/`AvFilterGraph` have been built. On success they
+        // move into `DmabufInner`.
         unsafe {
-            // DRM device (source dmabuf frames) + a VAAPI device derived from it (same GPU) for
-            // hwmap/scale_vaapi/the encoder.
             let mut drm_device: *mut ffi::AVBufferRef = ptr::null_mut();
             let r = ffi::av_hwdevice_ctx_create(
                 &mut drm_device,
@@ -847,8 +677,7 @@ impl DmabufInner {
                     ffmpeg::Error::from(r)
                 );
             }
-            // Own each handle the moment it exists: from here every `bail!` drops whatever has been
-            // built so far, in reverse order, so not one failure branch below carries cleanup code.
+            // Own each handle as it exists: later `bail!` drops whatever has been built so far.
             let drm_device = AvBuffer::from_raw(drm_device)
                 .context("av_hwdevice_ctx_create(DRM) gave no device")?;
             let mut vaapi_device: *mut ffi::AVBufferRef = ptr::null_mut();
@@ -864,7 +693,6 @@ impl DmabufInner {
             let vaapi_device = AvBuffer::from_raw(vaapi_device)
                 .context("av_hwdevice_ctx_create_derived(VAAPI) gave no device")?;
 
-            // DRM-PRIME frames context for the imported dmabufs.
             let drm_frames = AvBuffer::from_raw(ffi::av_hwframe_ctx_alloc(drm_device.as_ptr()))
                 .context("av_hwframe_ctx_alloc(DRM) failed")?;
             let fc = (*drm_frames.as_ptr()).data as *mut ffi::AVHWFramesContext;
@@ -876,8 +704,6 @@ impl DmabufInner {
                 bail!("av_hwframe_ctx_init(DRM) failed");
             }
 
-            // Filter graph: buffer(drm_prime) → hwmap=derive_device=vaapi:mode=read →
-            // scale_vaapi=format=nv12 → buffersink.
             let graph = AvFilterGraph::alloc().context("avfilter_graph_alloc failed")?;
 
             let mk = |name: &CStr, inst: &CStr| -> *mut ffi::AVFilterContext {
@@ -894,31 +720,26 @@ impl DmabufInner {
             if src.is_null() || hwmap.is_null() || scale.is_null() || sink.is_null() {
                 bail!("a VAAPI filter (buffer/hwmap/scale_vaapi/buffersink) is missing");
             }
-            // hwmap maps the DRM-PRIME input onto THIS vaapi device; scale_vaapi runs the CSC on
-            // it. Giving both our device (rather than `hwmap=derive_device`) keeps every surface —
-            // and the sink's output frames ctx the encoder adopts — on one VADisplay.
+            // Bind both filters to this VAAPI device rather than `hwmap=derive_device`, so every
+            // surface — and the sink frames ctx the encoder adopts — stays on one VADisplay.
             (*hwmap).hw_device_ctx = ffi::av_buffer_ref(vaapi_device.as_ptr());
             (*scale).hw_device_ctx = ffi::av_buffer_ref(vaapi_device.as_ptr());
 
-            // buffersrc params: DRM-PRIME frames, the drm_frames ctx.
             let par = ffi::av_buffersrc_parameters_alloc();
             (*par).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as c_int;
             (*par).width = width as c_int;
             (*par).height = height as c_int;
-            // Declare the link's colour up front (full-range RGB — the compositor's desktop) so
-            // the per-frame tags in `submit` match the negotiated link instead of reading as a
-            // mid-stream property change.
+            // Full-range RGB (compositor desktop) so per-frame tags in `submit` match the
+            // negotiated link instead of reading as a mid-stream property change.
             (*par).color_space = ffi::AVColorSpace::AVCOL_SPC_RGB;
             (*par).color_range = ffi::AVColorRange::AVCOL_RANGE_JPEG;
             (*par).time_base = ffi::AVRational {
                 num: 1,
                 den: fps as c_int,
             };
-            // Assign `drm_frames` BORROWED (no extra ref): `av_buffersrc_parameters_set` takes its
-            // own ref of `par->hw_frames_ctx` (via av_buffer_replace), and `av_free(par)` frees only
-            // the struct, not the ref. Our single owned `drm_frames` ref is retained, lives in
-            // `DmabufInner`, and is unref'd in `Drop`. Wrapping it in `av_buffer_ref` here would leak
-            // that extra ref every session (the persistent listener would accumulate them).
+            // Borrowed (no extra ref): `av_buffersrc_parameters_set` takes its own ref of
+            // `par->hw_frames_ctx`; `av_free(par)` frees only the struct. An extra `av_buffer_ref`
+            // here leaks one ref per session.
             (*par).hw_frames_ctx = drm_frames.as_ptr();
             let r = ffi::av_buffersrc_parameters_set(src, par);
             ffi::av_free(par as *mut _);
@@ -949,16 +770,10 @@ impl DmabufInner {
                 bail!("avfilter_graph_config failed ({r})");
             }
 
-            // The encoder takes NV12 surfaces from the sink's output frames context.
             let nv12_ctx = ffi::av_buffersink_get_hw_frames_ctx(sink);
             if nv12_ctx.is_null() {
                 bail!("filter sink has no VAAPI frames context");
             }
-            // On encoder-open failure, free the graph + our owned buffer refs before bailing (matching
-            // every error path above) so a failed session doesn't leak them. `nv12_ctx` is borrowed
-            // from the sink (owned by `graph`), so `avfilter_graph_free` reclaims it — don't unref it
-            // separately. On success the encoder takes its own ref of `vaapi_device`, and `drm_frames`/
-            // `vaapi_device`/`drm_device`/`graph` move into `DmabufInner` (freed in `Drop`).
             let enc = match open_vaapi_encoder(
                 codec,
                 width,
@@ -1003,50 +818,29 @@ impl DmabufInner {
             dmabuf.fourcc,
             self.fourcc
         );
-        // Sampled breakdown of this synchronous submit under PUNKTFUNK_PERF: push = descriptor
-        // build + buffersrc (the per-frame DRM→VA import happens inside hwmap on the pull path),
-        // pull = buffersink (VPP CSC + any sync), send = avcodec_send_frame. One line per ~2 s.
+        // `PUNKTFUNK_PERF`: one sampled line per ~2 s (`frames % 120`). Push = desc+buffersrc,
+        // pull = hwmap import + VPP CSC, send = `avcodec_send_frame`.
         let sample = pf_host_config::config().perf && self.frames % 120 == 0;
         self.frames += 1;
         let t0 = std::time::Instant::now();
         let t_push: std::time::Duration;
         let t_pull: std::time::Duration;
-        // SAFETY: The `ensure!` above checked `dmabuf.fourcc == self.fourcc`.
-        //  * `std::mem::zeroed::<AVDRMFrameDescriptor>()` is sound: it is a `#[repr(C)]` POD of ints and
-        //    nested int-struct arrays (no `NonNull`/refs), for which all-zero is a valid bit pattern;
-        //    `Box` puts it on the heap with a unique owner.
-        //  * `dmabuf.fd.as_raw_fd()` is the fd of the caller's `&DmabufFrame`, which owns it for the
-        //    whole synchronous `submit`; we describe one object/layer/plane from its
-        //    fourcc/modifier/offset/stride and its `lseek`-queried size. `libc::lseek` on that live
-        //    fd only reads the description's size and returns it (or -1); it touches no Rust memory.
-        //  * `drm`/`nv12` are owned `AvFrame`s — every exit drops each exactly once (the
-        //    hand-placed frees this replaced were branch-clean, but only by inspection). We set
-        //    `drm`'s scalar fields and `hw_frames_ctx = av_buffer_ref(self.drm_frames)` (new ref
-        //    of the live owned ctx).
-        //  * `data[0] = Box::into_raw(desc)` transfers the box into the frame; `buf[0] =
-        //    av_buffer_create(.., free_desc, ..)` registers a destructor that reclaims it exactly once
-        //    when the buffer's refcount hits zero — matched alloc/free, no leak/double-free.
-        //  * `av_buffersrc_add_frame_flags(self.src, drm, KEEP_REF)` pushes a ref into the live
-        //    buffersrc; KEEP_REF keeps our own `drm` ref, dropped explicitly right after the push
-        //    (the same point the hand-written free sat, kept so the descriptor's release timing
-        //    across the pull does not change). We pull the converted surface with
-        //    `av_buffersink_get_frame(self.sink, nv12)` BEFORE returning, so the dmabuf (owned by
-        //    the caller) is read while still valid. `nv12` is sent into the live owned `self.enc`
-        //    (takes its own ref) and dropped. Single-threaded encoder → no race.
+        // SAFETY: `dmabuf.fourcc == self.fourcc` (ensure above).
+        //  * `zeroed::<AVDRMFrameDescriptor>()` is a `#[repr(C)]` POD of ints; all-zero is valid.
+        //  * `dmabuf.fd` is owned by the caller's `&DmabufFrame` for this call; `lseek` only reads size.
+        //  * `drm`/`nv12` are owned `AvFrame`s — every exit drops each once.
+        //  * `data[0] = Box::into_raw(desc)` + `av_buffer_create(..., free_desc)` reclaims it once.
+        //  * `av_buffersrc_add_frame_flags(..., KEEP_REF)` keeps our `drm` ref, dropped after the
+        //    push. We pull from `self.sink` before return so the caller's dmabuf is still valid.
+        //    `avcodec_send_frame` takes its own ref. Single-threaded encoder → no race.
         unsafe {
-            // Build a DRM-PRIME AVFrame describing the dmabuf (one object/fd, one layer/plane).
             let mut desc: Box<ffi::AVDRMFrameDescriptor> = Box::new(std::mem::zeroed());
             desc.nb_objects = 1;
             desc.objects[0].fd = dmabuf.fd.as_raw_fd();
-            // The object's REAL size, not 0. libav does not query it for us — both of its import
-            // paths hand this value straight to libva, as `prime_desc.objects[i].size` on the
-            // PRIME_2 path and `buffer_desc.data_size` on the legacy fallback — so a 0 told every
-            // VA driver the backing object was empty and left it to work the real size out itself.
-            // The drivers this has run on (radeonsi, modern Intel iHD) do; a Gen9 Intel host
-            // answered `vaCreateSurfaces` with VA_STATUS_ERROR_ALLOCATION_FAILED on every single
-            // frame. `lseek(SEEK_END)` is the standard dma-buf size query — the same one the
-            // Vulkan bridge already uses on these fds (`pf_zerocopy::imp::vulkan`). If a kernel
-            // refuses it, keep the old 0 rather than drop a frame we could still have encoded.
+            // Real object size, not 0. Both libav import paths pass this to libva as
+            // `prime_desc.objects[i].size` / `buffer_desc.data_size`; 0 means "empty backing"
+            // and `vaCreateSurfaces` fails on drivers that do not guess. `lseek(SEEK_END)` is
+            // the dma-buf size query (`pf_zerocopy::imp::vulkan`). A refused lseek keeps 0.
             let obj_size = libc::lseek(dmabuf.fd.as_raw_fd(), 0, libc::SEEK_END);
             desc.objects[0].size = if obj_size > 0 { obj_size as _ } else { 0 };
             desc.objects[0].format_modifier = dmabuf.modifier;
@@ -1061,22 +855,18 @@ impl DmabufInner {
             (*drm.as_ptr()).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as c_int;
             (*drm.as_ptr()).width = self.width as c_int;
             (*drm.as_ptr()).height = self.height as c_int;
-            // The dmabuf is the compositor's rendered desktop: full-range RGB. Tag the frame so
-            // the VPP's colour negotiation sees the real input instead of "unspecified" (an
-            // untagged input lets the driver pick its own default for the RGB→NV12 conversion —
-            // Mesa's is BT.601, contradicting the BT.709-limited VUI the encoder signals).
+            // Full-range RGB desktop. Untagged input lets Mesa pick BT.601, against the
+            // BT.709-limited VUI the encoder signals.
             (*drm.as_ptr()).color_range = ffi::AVColorRange::AVCOL_RANGE_JPEG;
             (*drm.as_ptr()).colorspace = ffi::AVColorSpace::AVCOL_SPC_RGB;
             (*drm.as_ptr()).hw_frames_ctx = ffi::av_buffer_ref(self.drm_frames.as_ptr());
             (*drm.as_ptr()).data[0] = Box::into_raw(desc) as *mut u8;
-            // Own the descriptor so it frees with the frame (the fd is owned by the DmabufFrame,
-            // which outlives this call — the graph reads the surface before submit returns).
+            // Descriptor frees with the frame. The fd stays with `DmabufFrame`, which outlives
+            // this call — the graph reads the surface before submit returns.
             extern "C" fn free_desc(_opaque: *mut std::ffi::c_void, data: *mut u8) {
-                // SAFETY: `data` is exactly the pointer produced by `Box::into_raw(desc)` and passed as
-                // `av_buffer_create`'s first arg, which libav hands back verbatim to this callback. It
-                // is a valid, uniquely-owned `Box<AVDRMFrameDescriptor>` raw pointer; libav invokes the
-                // callback exactly once (when the last buffer ref drops), so `from_raw` + `drop`
-                // reclaims it exactly once — no double-free. `_opaque` is unused (we passed null).
+                // SAFETY: `data` is the `Box::into_raw(desc)` pointer passed to `av_buffer_create`,
+                // handed back verbatim. Libav invokes this once when the last buffer ref drops, so
+                // `from_raw` reclaims it once. `_opaque` is unused (we passed null).
                 unsafe { drop(Box::from_raw(data as *mut ffi::AVDRMFrameDescriptor)) };
             }
             (*drm.as_ptr()).buf[0] = ffi::av_buffer_create(
@@ -1087,21 +877,15 @@ impl DmabufInner {
                 0,
             );
 
-            // Push through hwmap → scale_vaapi; pull the NV12 surface back out.
             let r = ffi::av_buffersrc_add_frame_flags(
                 self.src,
                 drm.as_ptr(),
                 ffi::AV_BUFFERSRC_FLAG_KEEP_REF as c_int,
             );
-            drop(drm); // release our ref where the hand-written free sat (see the SAFETY note)
-                       // These two stages ARE the import: the push hands libav our DRM-PRIME descriptor, and
-                       // the pull is where `hwmap` actually maps it into a VA surface (and `scale_vaapi` runs
-                       // the CSC). A failure here means this driver would not take this compositor's dmabuf —
-                       // which no encoder rebuild can fix — so tell the process-wide latch, and capture
-                       // negotiates CPU frames from the next session on. `avcodec_send_frame` below is
-                       // deliberately NOT counted: that one is the encoder stalling, which the in-place
-                       // rebuild above us exists to recover, and disabling zero-copy over it would be a
-                       // permanent penalty for a transient fault.
+            drop(drm); // KEEP_REF: drop our ref after the push so descriptor timing is unchanged.
+            // Import is this push + the pull below. Failure means this driver will not take
+            // this dmabuf — latch it; capture falls back to CPU next session. Do not count
+            // `avcodec_send_frame`: that stall is what the in-place rebuild recovers.
             if r < 0 {
                 let e = format!("av_buffersrc_add_frame failed ({r})");
                 pf_zerocopy::note_raw_dmabuf_import_failure(&e);
@@ -1142,13 +926,7 @@ impl DmabufInner {
     }
 }
 
-// No `Drop` for `DmabufInner`: `AvFilterGraph`/`AvBuffer` each free themselves, in field-declaration
-// order — graph, frames, derived VAAPI device, DRM device, then `enc` — which is exactly the order
-// the hand-written `Drop` this replaced used. That `Drop` had to be kept in step with eight separate
-// failure branches in `open`, each repeating the same four-line unwind; there is now one release
-// path per handle and no branch can skip it.
-
-// ---------------------------------------------------------------------------------------------
+// No `Drop`: field order is graph, frames, derived VAAPI, DRM, then `enc`.
 
 enum Inner {
     Cpu(CpuInner),
@@ -1162,24 +940,19 @@ pub struct VaapiEncoder {
     height: u32,
     fps: u32,
     bitrate_bps: u64,
-    /// Built lazily from the first frame's payload (CPU upload vs zero-copy dmabuf).
+    /// First-frame payload picks CPU upload vs zero-copy dmabuf.
     inner: Option<Inner>,
     frame_idx: i64,
     force_kf: bool,
-    /// Frames sent to the encoder but not yet returned as packets. Gates [`poll`](Encoder::poll)'s
-    /// bounded wait: with `async_depth > 1` a submitted frame's AU lands ~ASIC-time later, so poll
-    /// briefly waits for it (same-tick delivery) — but only when something is actually in flight.
+    /// Submitted frames not yet returned as packets. [`poll`](Encoder::poll) waits only when
+    /// `async_depth > 1` and something is actually in flight.
     in_flight: u32,
 }
 
-// Raw FFI pointers; the encoder lives on a single thread (same contract as `NvencEncoder`).
-// SAFETY: `VaapiEncoder`'s `Inner` holds raw FFI pointers (`SwsContext`, `AVFrame`, `AVBufferRef`,
-// `AVFilterContext`, `AVCodecContext`) that are not `Send` by default. The encoder is owned and
-// driven by exactly ONE thread — the host's per-session encode thread it is moved (transferred) to —
-// and is only ever touched through `&mut self` methods, so it is never aliased or accessed
-// concurrently from two threads. None of the underlying libav/libswscale objects have thread
-// affinity (they are not thread-local), so transferring ownership across threads is sound. This
-// asserts `Send` (transfer) only; `Sync` (shared `&`) is deliberately NOT implemented.
+// SAFETY: `Inner` holds raw FFI pointers that are not `Send` by default. The encoder is owned
+// by one thread (the session encode thread it is moved to) and only touched via `&mut self`,
+// so never aliased. The libav objects have no thread affinity. `Send` only; `Sync` is
+// deliberately not implemented.
 unsafe impl Send for VaapiEncoder {}
 
 impl VaapiEncoder {
@@ -1194,8 +967,6 @@ impl VaapiEncoder {
         bit_depth: u8,
         chroma: super::ChromaFormat,
     ) -> Result<Self> {
-        // 10-bit rides on the captured format: an HDR capture (X2RGB10/X2BGR10) opens the P010 /
-        // Main10 / PQ-VUI variant of whichever inner path the first frame selects.
         match resolve_depth(format, bit_depth) {
             DepthResolution::RefuseMislabeledPq => bail!(
                 "captured 10-bit HDR frames ({format:?}) on an {bit_depth}-bit VAAPI session — \
@@ -1208,21 +979,17 @@ impl VaapiEncoder {
             ),
             DepthResolution::Agreed => {}
         }
-        // VAAPI 4:4:4 is deferred (see `probe_can_encode_444`): no validated AMD/Intel hardware in the
-        // lab exposes a HEVC 4:4:4 encode entrypoint, and the probe returns false so the host never
-        // negotiates 4:4:4 for a VAAPI session. If a request slips through, fall back to 4:2:0 rather
-        // than emit an unverified stream — the host signalled 4:2:0 in the Welcome anyway.
+        // 4:4:4 is unimplemented ([`probe_can_encode_444`] is false). If a request slips
+        // through, encode 4:2:0 — the Welcome already advertised 4:2:0.
         if chroma.is_444() {
             tracing::warn!("VAAPI 4:4:4 encode not implemented — encoding 4:2:0");
         }
         ffmpeg::init().context("ffmpeg init")?;
         if std::env::var_os("PUNKTFUNK_FFMPEG_DEBUG").is_some() {
-            // SAFETY: `av_log_set_level` sets libav's global integer log level; `48` (= AV_LOG_DEBUG)
-            // is a valid level and there are no pointer args. libav was just initialized by the
-            // `ffmpeg::init()` above, so the call is always sound.
+            // SAFETY: `av_log_set_level` is a global integer; `48` = `AV_LOG_DEBUG`. No pointer
+            // args. libav was just initialized by `ffmpeg::init()` above.
             unsafe { ffi::av_log_set_level(48) };
         }
-        // Validate the codec/format up front so a bad request fails at open, not on the first frame.
         let _ = vaapi_sws_src(format)?;
         Ok(VaapiEncoder {
             codec,
@@ -1301,12 +1068,9 @@ impl Encoder for VaapiEncoder {
         self.force_kf = true;
     }
 
-    /// Encode-stall recovery: drop the wedged libavcodec encoder (its `Drop` releases the VA
-    /// surfaces/filter graph/devices) and let the next `submit` rebuild it lazily from the first
-    /// frame's payload, exactly like first-frame bring-up — the same drop-and-reopen lever the
-    /// Windows QSV path has. The owed AUs are forfeited (`in_flight` zeroed) and the rebuilt
-    /// encoder's first frame is forced IDR so the client resyncs immediately. Without this the
-    /// encode-stall watchdog had no lever on Linux AMD/Intel and a wedged driver ended the session.
+    /// Drop the wedged encoder; the next `submit` rebuilds it from the first frame. Zero
+    /// `in_flight` (owed AUs are gone) and force IDR so the client resyncs. Without this the
+    /// encode-stall watchdog had no Linux AMD/Intel lever.
     fn reset(&mut self) -> bool {
         self.inner = None;
         self.in_flight = 0;
@@ -1315,11 +1079,8 @@ impl Encoder for VaapiEncoder {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
-        // With `async_depth > 1`, `submit` no longer waits for the ASIC — the AU for the frame we
-        // just sent lands ~one hardware-encode-time later. Wait for it (bounded) so it still ships
-        // this tick: the same blocking-retrieve model as NVENC's lock_bitstream, at the ASIC's
-        // real per-frame latency instead of send_frame's synchronous ~2× wait. The budget is 3/4
-        // of a frame interval (capped 12 ms); on expiry return None — the AU rides the next poll.
+        // `async_depth > 1`: the AU lands ~one ASIC-time later. Wait up to 3/4 of a frame
+        // interval (capped 12 ms) so it still ships this tick; on expiry it rides the next poll.
         let enc = match &mut self.inner {
             Some(Inner::Cpu(c)) => &mut c.enc,
             Some(Inner::Dmabuf(d)) => &mut d.enc,
@@ -1334,12 +1095,9 @@ impl Encoder for VaapiEncoder {
                     self.in_flight = self.in_flight.saturating_sub(1);
                     return Ok(Some(au));
                 }
-                // No AU yet (EAGAIN) or drained (EOF) both fall through to the budget check,
-                // exactly as the previous `Option::None` did.
                 PollOutcome::Again | PollOutcome::Eof => {}
             }
-            // Nothing ready: only wait when a frame is actually in flight (a drained/EOF'd
-            // encoder must not spin the budget), and give the ASIC ~250 µs between checks.
+            // Wait only while a frame is in flight; ~250 µs between ASIC checks.
             if self.in_flight == 0 || std::time::Instant::now() >= deadline {
                 return Ok(None);
             }
@@ -1361,25 +1119,11 @@ impl Encoder for VaapiEncoder {
 mod tests {
     use super::*;
 
-    /// Construct/drop `DmabufInner` repeatedly on real VAAPI silicon.
+    /// Construct/drop `DmabufInner` on real VAAPI silicon. `open` owns four objects; looping
+    /// is what distinguishes a double-free (glibc abort) from a missed unref (leak per iter).
+    /// The CPU smoke test never builds this graph.
     ///
-    /// This is the heaviest ownership change in the crate and the one with no other coverage.
-    /// `open` builds four owned objects — a DRM device, a VAAPI device derived from it, a DRM-PRIME
-    /// frames context, and a filter graph — and each of its eight failure branches used to unwind
-    /// them by hand, the same four-line block copied eight times (once inside a macro) plus a ninth
-    /// copy in `Drop`. All of that is now `AvBuffer`/`AvFilterGraph` field drops in declaration
-    /// order, so *construct and drop* is the entire contract. Looping is what separates the
-    /// outcomes: a double-free trips glibc, a missed one leaks a VAAPI device, a DRM device and a
-    /// whole filter graph per iteration.
-    ///
-    /// `vaapi_cpu_encode_smoke` does NOT cover this — it drives the swscale/CPU-upload path, which
-    /// uses `VaapiHw` and never builds a graph.
-    ///
-    /// `#[ignore]`d (needs a real VAAPI device):
     /// `cargo test -p pf-encode dmabuf_inner_alloc_drop_cycles -- --ignored --nocapture`
-    /// ⚠️ Inside a distrobox on an immutable host, also set
-    /// `LIBVA_DRIVERS_PATH=/run/host/usr/lib64/dri` — the container's own mesa is typically older
-    /// than the host kernel's amdgpu and fails every encoder open with a bare ENOSYS.
     #[test]
     #[ignore = "needs a real VAAPI device (run on an AMD/Intel host, not the build box)"]
     fn dmabuf_inner_alloc_drop_cycles() {
@@ -1397,27 +1141,20 @@ mod tests {
         eprintln!("8 DmabufInner alloc/drop cycles completed without abort");
     }
 
-    /// The operator pin tries exactly one mode; a cached resolution ([`LP_MODE`]) tries only the
-    /// mode that worked; anything else runs the full ladder, full-feature FIRST — AMD's first-try
-    /// open must stay byte-for-byte unchanged.
     #[test]
     fn entrypoint_ladder_orders_and_pins() {
         assert_eq!(entrypoint_ladder(None, 0), &[false, true]);
         assert_eq!(entrypoint_ladder(None, 1), &[false]);
         assert_eq!(entrypoint_ladder(None, 2), &[true]);
-        // A corrupt/unknown cache value degrades to the full ladder, never to a wrong pin.
+        // Unknown cache → full ladder, never a wrong pin.
         assert_eq!(entrypoint_ladder(None, 77), &[false, true]);
-        // The pin beats the cache in BOTH directions — what makes PUNKTFUNK_VAAPI_LOW_POWER a
-        // real escape hatch from a stale latch.
+        // Pin beats cache in both directions — the env escape from a stale latch.
         for cached in [0u8, 1, 2, 77] {
             assert_eq!(entrypoint_ladder(Some(true), cached), &[true]);
             assert_eq!(entrypoint_ladder(Some(false), cached), &[false]);
         }
     }
 
-    /// The latch round-trip: what a successful open stores makes the NEXT open attempt exactly
-    /// the mode that worked (the "skip the known-failing attempt and its libav error spew"
-    /// contract — and, per [`LP_MODE`], the shape that must never cross devices or depths).
     #[test]
     fn latch_round_trip_pins_the_resolved_mode() {
         for lp in [false, true] {
@@ -1425,9 +1162,6 @@ mod tests {
         }
     }
 
-    /// `PUNKTFUNK_VAAPI_LOW_POWER` grammar: the two lowercase literal sets pin; anything else —
-    /// including uppercase — means "no pin" (the ladder runs). Case-sensitivity is pinned as
-    /// shipped behavior.
     #[test]
     fn low_power_grammar() {
         for s in ["1", "true", "yes", "on", " on ", "yes\n"] {
@@ -1441,10 +1175,6 @@ mod tests {
         }
     }
 
-    /// Every part of the LP_MODE key is load-bearing (see the [`LP_MODE`] field comments): the
-    /// node (a GPU-preference switch must re-resolve — the old codec-only key was a
-    /// session-killer), the codec, and the depth (an 8-bit answer must never pin the 10-bit open —
-    /// the HDR under-advertisement).
     #[test]
     fn lp_key_separates_node_codec_and_depth() {
         let base = lp_key_for("/dev/dri/renderD128", Codec::H265, false);
@@ -1453,8 +1183,6 @@ mod tests {
         assert_ne!(base, lp_key_for("/dev/dri/renderD128", Codec::H265, true));
     }
 
-    /// `PUNKTFUNK_VAAPI_ASYNC_DEPTH` grammar: 1..=8 verbatim; unset, junk, zero, and past-the-cap
-    /// all resolve to the lowest-latency depth 1.
     #[test]
     fn async_depth_grammar() {
         assert_eq!(async_depth(None), 1);
@@ -1467,9 +1195,6 @@ mod tests {
         assert_eq!(async_depth(Some("fast")), 1);
     }
 
-    /// The swscale source map: packed RGB/BGR and the GNOME 50+ HDR 2:10:10:10 layouts convert;
-    /// planar/video formats are refused (the CPU path is a packed-RGB fallback, not a general
-    /// converter).
     #[test]
     fn sws_src_accepts_packed_rgb_only() {
         assert_eq!(vaapi_sws_src(PixelFormat::Bgrx).unwrap(), Pixel::BGRZ);
@@ -1496,9 +1221,8 @@ mod tests {
         }
     }
 
-    /// VUI ↔ CSC agreement: the signaled VUI and the zero-copy VPP's pinned output colour must
-    /// name the SAME matrix/range per depth — a mismatch is exactly the Mesa-BT.601 hue shift the
-    /// pin exists to prevent.
+    /// Signaled VUI and `scale_vaapi` output must name the same matrix/range, or Mesa BT.601
+    /// shifts hue against the VUI.
     #[test]
     fn vui_and_scale_args_agree_per_depth() {
         let sdr = vui_for(false);
@@ -1547,9 +1271,6 @@ mod tests {
         }
     }
 
-    /// The honest-downgrade table at open: PQ pixels demand a 10-bit session (refused otherwise —
-    /// PQ content must never be mislabeled BT.709); a 10-bit session over SDR pixels downgrades
-    /// honestly to 8-bit; agreement passes both ways.
     #[test]
     fn depth_resolution_table() {
         use DepthResolution::*;
@@ -1561,8 +1282,6 @@ mod tests {
         assert_eq!(resolve_depth(PixelFormat::X2Bgr10, 10), Agreed);
     }
 
-    /// Main10 is pinned explicitly for 10-bit HEVC ONLY: 10-bit AV1 is input-driven (no profile
-    /// knob), and every 8-bit open keeps the encoder's default profile.
     #[test]
     fn explicit_profile_is_hevc_main10_only() {
         assert_eq!(explicit_profile(Codec::H265, true), Some("main10"));
@@ -1573,9 +1292,6 @@ mod tests {
         assert_eq!(explicit_profile(Codec::H264, false), None);
     }
 
-    /// The 10-bit probe gate: HEVC and AV1 are probe-eligible; H.264 (no 10-bit path here) and
-    /// PyroWave (answers 10-bit on its own path, no VAAPI involved) are refused before any device
-    /// is touched — this is what keeps the probe safe on GPU-less CI.
     #[test]
     fn ten_bit_probe_gate() {
         assert!(ten_bit_probe_eligible(Codec::H265));
@@ -1584,11 +1300,6 @@ mod tests {
         assert!(!ten_bit_probe_eligible(Codec::PyroWave));
     }
 
-    /// Probe smoke on real silicon: H.264 VAAPI encode opens on every supported AMD/Intel GPU;
-    /// the narrower codecs are printed, not asserted (device-dependent). Build anywhere, run on a
-    /// VAAPI host:
-    ///   cargo test -p pf-encode --no-run
-    ///   <host> target/debug/deps/pf_encode-<hash> --ignored --nocapture vaapi_probe_smoke
     #[test]
     #[ignore = "needs a real VAAPI device (run on an AMD/Intel host, not the build box)"]
     fn vaapi_probe_smoke() {
@@ -1605,9 +1316,6 @@ mod tests {
         }
     }
 
-    /// CPU-path encode round-trip on real silicon: open → BGRX frames → poll AUs → the first AU
-    /// is the IDR. Exercises the swscale CSC, the VA surface upload, and the entrypoint ladder
-    /// end-to-end (same recipe as [`vaapi_probe_smoke`]).
     #[test]
     #[ignore = "needs a real VAAPI device (run on an AMD/Intel host, not the build box)"]
     fn vaapi_cpu_encode_smoke() {

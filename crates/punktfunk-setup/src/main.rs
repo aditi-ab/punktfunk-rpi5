@@ -1,11 +1,12 @@
 //! The CLI: flags, env twins, the TTY probe, and the mode dispatch.
 //!
-//! D5 is the contract this file keeps — same flags, same env twins, same exit codes
-//! (0 done · 1 unsupported system or a step failed · 2 bad usage) as `scripts/install.sh`,
-//! plus `--host`/`--client` and the demo flags that are outside it.
+//! Same flags, same env twins, same exit codes as `scripts/install.sh` (0 done, 1
+//! unsupported system or a step failed, 2 bad usage), plus `--host`/`--client` and
+//! the demo flags that are outside it.
 //!
-//! No TTY behaves exactly like `--yes`, and the terminal is probed by *opening* `/dev/tty`:
-//! in a container or under a service the node exists but opens ENXIO, so `-r`/`-w` lie.
+//! No TTY behaves exactly like `--yes`. Probe by opening `/dev/tty`: in a container
+//! or under a service the node exists but open returns ENXIO, so `-r`/`-w` still
+//! succeed.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -23,10 +24,10 @@ use punktfunk_setup::ui::theme::Caps;
 use punktfunk_setup::ui::tui::Tui;
 use punktfunk_setup::ui::{Plain, Reporter};
 
-/// Long enough that a demo step reads as work happening, short enough to sit through.
+/// 140 ms: long enough that a demo step reads as work, short enough to sit through.
 const DEMO_LATENCY_MS: u64 = 140;
 
-/// The mark needs a width to decide whether it fits; 80 is the safe assumption when the
+/// The mark needs a width to decide whether it fits. 80 is the safe assumption when the
 /// terminal will not say.
 fn terminal_width() -> u16 {
     ConsoleTerm::open().map_or(80, |t| t.width())
@@ -65,7 +66,7 @@ PUNKTFUNK_INSTALL_CHANNEL, PUNKTFUNK_INSTALL_GAMESTREAM, PUNKTFUNK_INSTALL_CLIPB
 PUNKTFUNK_INSTALL_PUNKTFUNK_GROUP, PUNKTFUNK_INSTALL_LINGER, PUNKTFUNK_INSTALL_CONSOLE_CERT,
 PUNKTFUNK_INSTALL_OMARCHY_SETUP, PUNKTFUNK_INSTALL_MGMT_PORT (1/0 for the flags)."#;
 
-/// 2 is "bad usage", matching the sh installer's contract.
+/// 2 is bad usage, matching the sh installer's contract.
 const BAD_USAGE: u8 = 2;
 
 struct Cli {
@@ -83,8 +84,7 @@ fn env_flag(env: &Env, key: &str) -> Option<bool> {
 }
 
 fn parse(args: Vec<String>, env: &Env) -> Result<Cli, (u8, String)> {
-    // Env is the default; a flag on the command line overwrites it, exactly as the sh script
-    // reads its variables first and lets the arg loop assign over them.
+    // Env first, then flags overwrite — the same order as the sh installer.
     let mut cli = Cli {
         pins: Pins {
             channel: env
@@ -192,7 +192,6 @@ fn main() -> ExitCode {
         }
     };
 
-    // Probe the terminal by opening it: no terminal behaves like --yes.
     let tty = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -215,7 +214,7 @@ fn main() -> ExitCode {
         .unwrap_or_default();
     runner.exports.push(("USER".to_string(), user));
 
-    // A demo box is canned, so none of the preflight applies — and nothing may be probed.
+    // A demo box is canned: skip preflight, and nothing may be probed.
     let facts = if let Some(name) = &demo {
         match punktfunk_setup::demo::preset(name) {
             Some(facts) => facts,
@@ -243,8 +242,8 @@ fn main() -> ExitCode {
         }
     };
 
-    // The TUI is the interactive surface only. No terminal or --yes stays on today's output,
-    // byte for byte, which is what CI containers and scripts already depend on.
+    // The TUI is the interactive surface only. No terminal or `--yes` stays on the plain
+    // output, byte for byte — CI containers and scripts depend on it.
     let interactive = tty && !yes;
     let mut console = if interactive {
         ConsoleTerm::open()
@@ -273,8 +272,7 @@ fn main() -> ExitCode {
         report::detected(ui, &facts);
     }
 
-    // The floors sit after the uninstall dispatch on purpose: a box below them must still be
-    // able to clean itself up.
+    // Floors sit after the uninstall dispatch: a box below them must still be able to clean up.
     if choices.action != Action::Uninstall
         && let Some(floor) = &facts.floor
     {
@@ -307,7 +305,7 @@ fn main() -> ExitCode {
             Step::Run(action) => choices.action = action,
             Step::Idle | Step::Edit(_) => unreachable!("the settings loop only ends on a choice"),
         }
-        // Every edit the user made lives on the screen, not in the pins.
+        // Edits live on the screen, not in the pins.
         let action = choices.action;
         choices = screen.choices;
         choices.action = action;
@@ -315,9 +313,9 @@ fn main() -> ExitCode {
         report::choices_summary(ui, &choices);
     }
 
-    // A distro with no punktfunk repo stops a HOST install and nothing else: a client install
-    // there takes the flatpak line instead of dying (§5). Checked after the screen, because
-    // switching Components to client-only is exactly how a user gets past it.
+    // A distro with no punktfunk repo stops a host install only: a client install takes the
+    // flatpak line. Checked after the screen, because switching to client-only is how a
+    // user gets past it.
     if choices.action != Action::Uninstall
         && choices.components.host
         && let Some(msg) = &facts.host_punt
@@ -388,8 +386,8 @@ fn preflight(env: &Env, paths: &BasePaths, runner: &mut SystemRunner) -> Result<
     if !runner.which("curl") {
         return Err("curl is required (install it with your package manager first)".into());
     }
-    // Running as root without sudo (a minimal Debian container): a shim so the verbatim
-    // `sudo …` lines from platforms.json still work.
+    // Root without sudo (a minimal Debian container): a shim so the verbatim `sudo …`
+    // lines from platforms.json still work.
     if root && !runner.which("sudo") {
         let dir = std::env::temp_dir().join(format!("punktfunk-setup-{}", std::process::id()));
         if std::fs::create_dir_all(&dir).is_ok()
@@ -431,8 +429,8 @@ fn load_facts(
     Facts::probe(paths, runner, env).map_err(|punt| punt.message())
 }
 
-/// The sh installer's `ask`, with the default behind Enter. Without a terminal the default
-/// stands — which is why a version-floor confirm defaulting to *no* aborts under `--yes`.
+/// Default behind Enter. Without a terminal the default stands, so a version-floor confirm
+/// that defaults to no aborts under `--yes`.
 fn ask(interactive: bool, question: &str) -> bool {
     if !interactive {
         return false;
@@ -547,7 +545,7 @@ mod tests {
         assert_eq!(cli.pins.mgmt_port, Some(48000));
     }
 
-    // The smoke needs to decline the Omarchy hand-off; today's sh question has no env twin.
+    // Smoke needs a way to decline the Omarchy hand-off without a TTY.
     #[test]
     fn the_omarchy_hand_off_has_a_flag_and_an_env_twin() {
         let flag = parse(args(&["--no-omarchy-setup"]), &Env::default()).unwrap();

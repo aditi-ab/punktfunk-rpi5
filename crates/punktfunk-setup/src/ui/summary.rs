@@ -1,16 +1,17 @@
-//! The settings-list screen, as pure state. No terminal, no cliclack, no I/O.
+//! Settings-list state: rows, cursor, and key transitions. No terminal, no I/O.
 //!
-//! §2 of `design/installer-v2.md`: every resolved choice visible at once, Enter installs,
-//! ↑↓ + Enter edits one row. Keeping the row model and the transitions here — rather than
-//! inside the prompt library — is what lets the whole screen be driven by injected key events
-//! in a test, and is why swapping cliclack for a hand-rolled widget stays a rendering change.
+//! Every resolved choice is visible at once. Enter on Go installs; ↑↓ + Enter
+//! edits one row. The row model lives here so tests inject keys; swapping the
+//! renderer stays a rendering change.
 //!
-//! Re-resolution is free by construction: the screen owns `Choices`, and the plan is rebuilt
-//! from `(Facts, Choices)` whenever it is asked for. Toggling Moonlight compat therefore adds
-//! the gamestream firewall line with no cache to invalidate.
+//! The screen owns `Choices`. `plan()` rebuilds from `(Facts, Choices)` on
+//! each call, so a Moonlight-compat toggle adds the gamestream firewall line
+//! with no cache to invalidate.
 //!
-//! The row descriptions carry the sh installer's prompt texts verbatim — the usbip-attach
-//! grant, "each client still opts in" — so accepting a default never hides what it grants.
+//! Row `why` texts match the sh installer verbatim so a default still names
+//! the usbip-attach grant and that each client opts in.
+//!
+//! Pin `lines()`. Evidence: `design/installer-v2.md`.
 
 use crate::choices::{Action, Choices};
 use crate::facts::{Channel, Facts};
@@ -30,10 +31,10 @@ pub enum Field {
     OmarchyTheme,
 }
 
-/// A line the cursor can land on. The separators in the mockup are drawn, never selected.
+/// Separators in the mockup are drawn, never selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Item {
-    /// The default action, at the top so Enter on arrival installs.
+    /// First so Enter on arrival installs.
     Go,
     Row(Field),
     Uninstall,
@@ -45,11 +46,11 @@ pub enum Key {
     Down,
     Enter,
     Cancel,
-    /// A key the screen has no meaning for. It must not move the cursor.
+    /// Must not move the cursor.
     Ignored,
 }
 
-/// What the caller should do after a key. `Edit` is where the renderer opens its own prompt.
+/// `Edit` is where the renderer opens its own prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     Idle,
@@ -103,7 +104,7 @@ impl Screen {
         }
     }
 
-    /// True when the box already has the host — the screen re-titles and gains Uninstall.
+    /// Installed host: retitle and offer Uninstall.
     pub fn manage_mode(&self) -> bool {
         self.facts.fully_installed()
     }
@@ -137,7 +138,6 @@ impl Screen {
         self.items[self.cursor]
     }
 
-    /// Movement wraps, the way every clack select does.
     pub fn key(&mut self, key: Key) -> Step {
         match key {
             Key::Up => {
@@ -158,7 +158,6 @@ impl Screen {
         }
     }
 
-    /// Apply an edit the renderer collected, then re-derive everything that depends on it.
     pub fn set_bool(&mut self, field: Field, on: bool) {
         match field {
             Field::Group => self.choices.punktfunk_group = on,
@@ -191,7 +190,7 @@ impl Screen {
         self.cursor = self.cursor.min(self.items.len() - 1);
     }
 
-    /// Why-texts follow the value, so a row that is off never explains a grant it is not making.
+    /// An off row must not explain a grant it is not making.
     fn rederive(&mut self) {
         if !self.choices.punktfunk_group {
             self.choices.group_why = None;
@@ -259,7 +258,7 @@ impl Screen {
         }
     }
 
-    /// The prompt text the editor for this row shows — the sh installer's, verbatim.
+    /// Editor prompt: the sh installer's text, verbatim.
     pub fn why(field: Field) -> &'static str {
         match field {
             Field::Components => "The host streams this box. The client watches another one.",
@@ -275,7 +274,7 @@ impl Screen {
         }
     }
 
-    /// The screen as text — what the goldens pin and what plain mode would show.
+    /// Golden and plain-mode text of the screen.
     pub fn lines(&self) -> Vec<String> {
         let mut out = vec![self.title()];
         let rule = "─".repeat(63);
@@ -394,7 +393,6 @@ mod tests {
         assert_eq!(s.key(Key::Cancel), Step::Cancel);
     }
 
-    /// The re-resolution the design calls out by name.
     #[test]
     fn turning_moonlight_compat_on_adds_the_gamestream_firewall_line() {
         let mut s = screen();
@@ -431,7 +429,6 @@ mod tests {
         assert!(s.choices.group_why.is_none());
     }
 
-    /// A row that is on must never stop naming what it grants.
     #[test]
     fn the_group_row_always_states_the_usbip_grant() {
         let s = screen();
@@ -455,7 +452,6 @@ mod tests {
         );
     }
 
-    /// Client-only asks almost nothing — no groups, gamestream, linger or firewall rows.
     #[test]
     fn a_client_only_screen_drops_every_host_row() {
         let f = facts("debian", Family::Apt);

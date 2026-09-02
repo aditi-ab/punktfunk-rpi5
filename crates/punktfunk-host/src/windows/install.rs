@@ -1,23 +1,19 @@
-//! `punktfunk-host driver install|uninstall` / `web setup` - the install-time work the Windows
-//! installer's Inno `[Run]`/`[UninstallRun]` sections delegate to the host EXE instead of
-//! locale-parsed PowerShell *files*.
+//! Install-time `driver install|uninstall` and `web setup` that Inno `[Run]`/`[UninstallRun]`
+//! delegates to this EXE instead of BOM-less `.ps1` files.
 //!
-//! Why: Windows PowerShell 5.1 reads a BOM-less `.ps1` *file* in the machine's ANSI codepage, so on a
-//! non-English locale a stray non-ASCII byte mis-decodes and the script aborts "unterminated string" -
-//! exactly how the pf-vdisplay driver install silently failed on a German box. A compiled subcommand has
-//! no such surface: the external tools it drives (`certutil`/`pnputil`/`nefconc`/`schtasks`/`netsh`/
-//! `icacls`) are fixed string literals, not a file parsed in some codepage. (The installer's *inline*
-//! `-Command` PowerShell in the `.iss` is unaffected - that's a command-line string, not a file read -
-//! so it stays.) Sits next to `service install` (`service.rs`), the established Rust-owns-install pattern.
+//! PowerShell 5.1 reads a `.ps1` *file* in the machine ANSI codepage; a non-ASCII byte on a
+//! non-English locale aborts as "unterminated string". A compiled subcommand has no such
+//! surface: `certutil`/`pnputil`/`nefconc`/`schtasks`/`netsh`/`icacls` are string literals.
+//! Inline `-Command` PowerShell in the `.iss` is a command-line string, not a file, so it stays.
+//! Same pattern as `service install` in `service.rs`.
 //!
-//! Everything here is BEST-EFFORT: a hiccup warns but returns `Ok` - a non-zero exit would abort the
-//! whole installer, and a missing driver only degrades the host to a physical display.
+//! Best-effort: a hiccup warns but returns `Ok`. A non-zero exit aborts the installer; a
+//! missing driver only degrades the host to a physical display.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-// ── arg + command helpers ──────────────────────────────────────────────────────────────────────
 fn flag_val(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|a| a == name)
@@ -27,7 +23,6 @@ fn flag_val(args: &[String], name: &str) -> Option<String> {
 fn flag_present(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
-/// Run a command, discard output, return whether it succeeded.
 fn run_quiet(cmd: &str, args: &[&str]) -> bool {
     Command::new(cmd)
         .args(args)
@@ -37,7 +32,6 @@ fn run_quiet(cmd: &str, args: &[&str]) -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
-/// Run a command, capture stdout (lossy UTF-8); empty on failure.
 fn run_capture(cmd: &str, args: &[&str]) -> String {
     Command::new(cmd)
         .args(args)
@@ -46,7 +40,6 @@ fn run_capture(cmd: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-// ── `driver install [--gamepad] --dir <stage>` / `driver uninstall [--gamepad|--audio]` ────────
 pub fn driver_main(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("install") => driver_install(&args[1..]),
@@ -61,15 +54,7 @@ pub fn driver_main(args: &[String]) -> Result<()> {
 fn driver_install(args: &[String]) -> Result<()> {
     let dir =
         PathBuf::from(flag_val(args, "--dir").context("driver install: --dir <stage> required")?);
-    // Everything below this line runs with the caller's privileges — which, on the installer path,
-    // are SYSTEM/Administrator — and it does three things with the CONTENTS of `dir`: trusts a
-    // `.cer` into the machine `Root` store, runs `nefconc.exe` from it, and stages an `.inf` into
-    // the driver store. So the directory is not merely an input, it is code and trust; a stage a
-    // non-admin can write is a local privilege escalation, whoever passed the flag.
-    //
-    // This is the check the 2026-07-05 audit recorded as FIXED (F-8) and which was never actually
-    // in the tree — re-found by the 2026-08-05 review as H-5, and the payload half of H-4's
-    // plant-then-elevate chain (`PUNKTFUNK_HOST_CMD=driver install --dir C:\Users\attacker\stage`).
+    // `--dir` is code and trust (Root cert, nefconc, INF). A stage a non-admin can write is LPE.
     ensure_admin_only_source(&dir).with_context(|| {
         format!(
             "refusing to install drivers from {} — the staging directory must be writable only by \
@@ -84,24 +69,18 @@ fn driver_install(args: &[String]) -> Result<()> {
         ("pf-vdisplay", install_pf_vdisplay(&dir))
     };
     if let Err(e) = res {
-        // Never abort the installer on a driver failure (matches the old best-effort PS scripts).
         eprintln!("warning: {what} driver install: {e:#} (the host degrades without it)");
     }
     Ok(())
 }
 
-/// Refuse a driver staging directory that anyone but SYSTEM/Administrators can write.
+/// Refuse a staging directory anyone but SYSTEM/Administrators/TrustedInstaller can write.
 ///
-/// Two conditions, both necessary:
-/// - the directory is **owned** by SYSTEM, Administrators, or TrustedInstaller — an owner always
-///   retains `WRITE_DAC`, so a non-admin owner can put their own access back no matter what the
-///   DACL currently says;
-/// - no **allow** ACE grants a write-shaped right to any trustee outside that same set. `CREATOR
-///   OWNER` counts as outside: on a directory a non-admin pre-created under `C:\ProgramData`, it is
-///   precisely what keeps handing them control of everything inside.
+/// Both: the owner is in that set (an owner always retains `WRITE_DAC` and can restore their
+/// own ACE), and no allow ACE grants a write-shaped right to anyone else. `CREATOR OWNER` is
+/// outside — a non-admin who created the dir under `%ProgramData%` keeps control through it.
 ///
-/// Reads the security descriptor directly rather than parsing `icacls` output, which prints
-/// *localized account names* — the same class of locale trap this whole module exists to avoid.
+/// Reads the security descriptor; `icacls` output uses localized account names.
 #[cfg(windows)]
 fn ensure_admin_only_source(dir: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -114,10 +93,8 @@ fn ensure_admin_only_source(dir: &Path) -> Result<()> {
     };
 
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
-    /// Rights that let a trustee change what we are about to trust and execute: write/append data,
-    /// write attributes/EA, delete (incl. child delete), and the two that let them rewrite the
-    /// security descriptor itself. `GENERIC_WRITE`/`GENERIC_ALL` map onto these once mapped, and
-    /// both generic bits are checked explicitly in case an ACE stores them unmapped.
+    /// Rights that replace what we are about to trust and execute. GENERIC_ALL/WRITE are checked
+    /// unmapped in case an ACE stores them without mapping.
     const WRITE_MASK: u32 = 0x0000_0002 // FILE_WRITE_DATA / FILE_ADD_FILE
         | 0x0000_0004 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
         | 0x0000_0010 // FILE_WRITE_EA
@@ -195,7 +172,7 @@ fn ensure_admin_only_source(dir: &Path) -> Result<()> {
             // SAFETY: an allow ACE is an ACCESS_ALLOWED_ACE, whose SidStart begins the trustee SID.
             let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
             if allowed.Mask & WRITE_MASK == 0 {
-                continue; // read-only for this trustee — harmless
+                continue; // no write-shaped right
             }
             let sid = PSID(std::ptr::addr_of!(allowed.SidStart) as *mut core::ffi::c_void);
             if !is_privileged(sid) {
@@ -216,8 +193,7 @@ fn ensure_admin_only_source(dir: &Path) -> Result<()> {
     verdict
 }
 
-/// The SIDs allowed to own or write a driver staging directory: `SYSTEM`, `BUILTIN\Administrators`,
-/// and `TrustedInstaller` (which owns much of `%ProgramFiles%`, a perfectly good stage).
+/// SYSTEM, `BUILTIN\Administrators`, and TrustedInstaller (owns `%ProgramFiles%`).
 #[cfg(windows)]
 fn privileged_sids() -> Result<Vec<Vec<u8>>> {
     use windows::core::PCWSTR;
@@ -250,14 +226,9 @@ fn privileged_sids() -> Result<Vec<Vec<u8>>> {
     .collect()
 }
 
-/// Owner check for a SINGLE secret file: `Some(true)` if owned by SYSTEM / Administrators /
-/// TrustedInstaller, `Some(false)` if owned by any other (non-privileged) account, `None` if the
-/// owner could not be determined. Used to distrust a `host.env` / `web-password` a non-admin
-/// pre-created under `%ProgramData%` before a privileged install ran — the file's bytes would
-/// otherwise be adopted verbatim into the SYSTEM service's environment / the console password
-/// (security-review 2026-08-15 findings 3c and 4). Reads the security descriptor directly, like
-/// [`ensure_admin_only_source`], to stay locale-independent. Must be consulted BEFORE any
-/// `create_private_dir` re-owns the file to Administrators and erases the signal.
+/// `Some(true)` SYSTEM/Administrators/TrustedInstaller, `Some(false)` any other owner, `None`
+/// if the owner cannot be read. Call before `create_private_dir` re-owns the file and erases
+/// the signal. Distrusts a `host.env` / `web-password` a non-admin planted under `%ProgramData%`.
 #[cfg(windows)]
 pub(crate) fn is_admin_owned(path: &Path) -> Option<bool> {
     use std::os::windows::ffi::OsStrExt;
@@ -309,28 +280,17 @@ pub(crate) fn is_admin_owned(path: &Path) -> Option<bool> {
     verdict
 }
 
-/// The subject CN both driver-signing certs carry (`build-pf-vdisplay.ps1` /
-/// `build-gamepad-drivers.ps1`). certutil matches a CertId against the subject, so this is how we
-/// find our own certs again without parsing any localized output — see `purge_driver_certs`.
+/// Subject CN both signing certs carry. `certutil` matches CertId on subject, not a localized name.
 const DRIVER_CERT_CN: &str = "punktfunk-driver";
 
-/// Remove every `CN=punktfunk-driver` cert this product ever added, from machine `Root` and
-/// `TrustedPublisher`.
+/// Delete every `CN=punktfunk-driver` cert from machine `Root` and `TrustedPublisher`.
 ///
-/// Two reasons this has to exist. Uninstall used to leave the certs behind forever, so removing
-/// punktfunk left a trusted root CA on the machine — trust we asked for and then never gave back.
-/// And before the signing cert was stabilised, every BUILD minted a fresh throwaway cert, so each
-/// upgrade added two more roots under the same name; a box that has been upgraded a dozen times is
-/// carrying two dozen of them. Purging by subject rather than by thumbprint is what lets one
-/// install clean up the whole historical pile.
+/// Match on subject, not thumbprint, so one run collects every historical cert under this CN.
+/// Deleting the root does not unload an installed driver: PnP validates the signature when the
+/// package is staged, not on every load. Safe to run before re-adding the current cert.
 ///
-/// Deleting the root does NOT unload an already-installed driver: PnP validates the signature when
-/// the package is staged into the driver store, not on every load. So a purge is safe to run before
-/// re-adding the current cert.
-///
-/// Best-effort and silent, like everything else here. `certutil -delstore` deletes one match per
-/// call and fails once nothing matches, so loop until it stops succeeding — bounded, because a
-/// pathological store must not turn an uninstall into an infinite loop.
+/// `certutil -delstore` deletes one match per call and fails when none remain. Bound the loop
+/// so a pathological store cannot hang uninstall.
 fn purge_driver_certs() {
     for store in ["Root", "TrustedPublisher"] {
         let mut removed = 0;
@@ -343,8 +303,7 @@ fn purge_driver_certs() {
     }
 }
 
-/// Trust the bundled self-signed driver cert: machine `Root` (so the chain validates) + `TrustedPublisher`
-/// (so PnP installs without a prompt).
+/// Machine `Root` (chain validates) and `TrustedPublisher` (PnP installs without a prompt).
 fn trust_cert(dir: &Path) {
     match first_with_ext(dir, "cer") {
         Some(cer) => {
@@ -368,16 +327,12 @@ fn install_pf_vdisplay(dir: &Path) -> Result<()> {
     if !inf.exists() {
         bail!("no pf_vdisplay.inf in {}", dir.display());
     }
-    // Sweep the old certs before adding the current one. Deliberately only on THIS path and not in
-    // `install_gamepad`: the installer runs pf-vdisplay first and gamepad second, so one purge here
-    // clears the pile and both trust_cert calls then add on top. Purging in both would have the
-    // gamepad leg delete the cert the vdisplay leg just installed whenever the two bundles carry
-    // different certs — which is exactly what a canary build's per-build fallback certs are.
+    // Purge here only, not in `install_gamepad`. The installer runs vdisplay then gamepad; a
+    // second purge would delete the cert the vdisplay leg just added when the two bundles differ.
     purge_driver_certs();
     trust_cert(dir);
-    // Create the ROOT device node only if absent (a blind re-create spawns a phantom duplicate, and the
-    // host binds interface index 0). ALWAYS nefconc (a clean ROOT\DISPLAY node), NEVER devgen (which makes
-    // persistent SWD\DEVGEN software devices that survive reboot + registry deletion).
+    // Create the ROOT node only if absent: a re-create is a phantom duplicate, and the host binds
+    // index 0. nefconc (ROOT\DISPLAY), never devgen (SWD\DEVGEN nodes survive reboot + registry delete).
     if pf_vdisplay_present() {
         println!("pf-vdisplay device node already present - leaving it.");
     } else if let Some(nef) = first_named(dir, "nefconc.exe") {
@@ -405,7 +360,6 @@ fn install_pf_vdisplay(dir: &Path) -> Result<()> {
             dir.display()
         );
     }
-    // Stage + bind the driver (idempotent; re-staging the same .inf is harmless).
     if run_quiet(
         "pnputil",
         &["/add-driver", &inf.to_string_lossy(), "/install"],
@@ -428,17 +382,11 @@ fn install_gamepad(dir: &Path) -> Result<()> {
         bail!("no driver .inf in {}", dir.display());
     }
     trust_cert(dir);
-    // Retire the PRE-RENAME package first. `pf-dualsense` became `pf-gamepad` (one driver always
-    // served four identities, so the old name read as if the other three lived elsewhere) and the
-    // HARDWARE IDS deliberately did not move — they are the binding contract with every devnode the
-    // host creates and with every installed system. That means an upgraded box would otherwise hold
-    // TWO store packages claiming `pf_dualsense`/`pf_dualshock4`/…, and PnP would be free to bind
-    // the stale one. Matched on `pf_dualsense.dll`, a string only the OLD package's INF contains —
-    // the new INF still mentions the hardware ids, so matching on those would delete what we are
-    // about to install.
+    // Hardware IDs did not move when `pf-dualsense` became `pf-gamepad`. Match the old INF on
+    // `pf_dualsense.dll` — matching those IDs would also delete the package we are about to add.
     delete_store_drivers(&["pf_dualsense.dll"]);
-    // Add each package to the store - no /install, no device node: the host SwDeviceCreate's the
-    // per-session devnode when a client forwards a pad, so PnP binds the store driver on demand.
+    // No `/install`, no device node: the host SwDeviceCreate's the per-session devnode when a
+    // client forwards a pad, so PnP binds the store driver on demand.
     for inf in &infs {
         if run_quiet("pnputil", &["/add-driver", &inf.to_string_lossy()]) {
             println!("pnputil /add-driver {} ok", file_name(inf));
@@ -446,18 +394,12 @@ fn install_gamepad(dir: &Path) -> Result<()> {
             eprintln!("warning: pnputil /add-driver {} failed", inf.display());
         }
     }
-    // Sweep pad devnodes, INCLUDING phantoms a host crash / service stop left behind: a re-created
-    // SwDevice with a known instance id REVIVES the existing devnode with its previously-bound
-    // driver — it never re-ranks against the store — so after an upgrade the old driver keeps
-    // serving (or, across the v1→v2 sealed-channel fence, fails closed and the pad plays dead).
-    // Proven in the field on the RTX box: a v1 phantom pinned the old package through a v2
-    // install. The devnodes are per-session objects the host recreates on demand, so removing
-    // them at driver-install time is always safe; the next pad binds the fresh package.
+    // Phantoms too: SwDeviceCreate with a known instance id revives the bound driver and never
+    // re-ranks the store. Per-session objects; the next pad binds the fresh package.
     remove_pad_devnodes();
     Ok(())
 }
 
-/// `pnputil /remove-device` every punktfunk virtual-pad devnode (live or phantom).
 fn remove_pad_devnodes() {
     for id in pad_instance_ids() {
         if run_quiet("pnputil", &["/remove-device", &id]) {
@@ -468,22 +410,9 @@ fn remove_pad_devnodes() {
     }
 }
 
-// ── `driver uninstall [--gamepad|--audio]` ──────────────────────────────────────────────────────
-// The uninstaller's cleanup counterpart (Inno [UninstallRun]) — the field report was that our
-// virtual devices survived an uninstall. Removes the pf-vdisplay device node(s) + driver package,
-// or (--gamepad) the pf-gamepad/pf-xusb driver packages (their devnodes are per-session
-// SwDeviceCreate'd and are already gone once the service stopped), or (--audio) the audio devnodes
-// the HOST mints at runtime — the same complaint one layer up, since those are created by the
-// running host rather than by any driver payload the installer laid down. Locale-safe by
-// construction: we never parse pnputil's localized LABELS — devices are matched on the
-// un-localized VALUE side (instance IDs / device IDs / registry markers), and driver packages are
-// found by scanning %WINDIR%\INF\oem*.inf CONTENT for our driver names, then passed to pnputil by
-// file name.
-
 fn driver_uninstall(args: &[String]) -> Result<()> {
-    // The audio leg touches no driver package and no certificate — it removes devnodes the host
-    // minted on Valve's drivers — so it returns before the cert purge below rather than making
-    // that purge run a third time per uninstall.
+    // Audio removes host-minted devnodes on Valve's drivers; return before the cert purge so a
+    // `--audio` uninstall does not run that purge a third time.
     if flag_present(args, "--audio") {
         return uninstall_audio_devices();
     }
@@ -494,25 +423,18 @@ fn driver_uninstall(args: &[String]) -> Result<()> {
         ("pf-vdisplay", uninstall_pf_vdisplay())
     };
     if let Err(e) = res {
-        // Same best-effort contract as install: never abort the (un)installer over a driver.
         eprintln!("warning: {what} driver uninstall: {e:#}");
     }
-    // Give back the trust we asked for. Here in the dispatcher rather than in the two uninstall
-    // bodies so it runs exactly once per invocation, and idempotently when the installer calls both
-    // legs back to back. Uninstalling punktfunk must not leave a trusted root CA behind — and this
-    // also collects the historical pile from the era when every build signed with a new cert.
+    // Once per invocation, here rather than in each uninstall body: the uninstaller calls both
+    // legs back to back, and a leftover trusted root CA must not survive.
     purge_driver_certs();
     Ok(())
 }
 
-/// Remove the "Punktfunk Speakers"/"Punktfunk Microphone" endpoints and the per-pad DualSense
-/// speaker endpoints the running host minted — the audio half of the surviving-virtual-device
-/// complaint. Must run AFTER `service uninstall`: a live host re-mints them on its next wiring
-/// pass, which would make this sweep look like it did nothing.
+/// Host-minted "Punktfunk Speakers"/"Punktfunk Microphone" and per-pad DualSense speaker
+/// endpoints. Run after `service uninstall`: a live host re-mints them on the next wiring pass.
 ///
-/// Never removes Steam's streaming-audio DRIVERS. Ours are extra devnodes riding on drivers that
-/// belong to Steam and that the user's own Remote Play still needs; the sweep is marker-matched
-/// (see `audio::devnode_cleanup`) precisely so it can tell the two apart.
+/// Does not remove Steam's streaming-audio drivers. Marker-matched in `audio::devnode_cleanup`.
 fn uninstall_audio_devices() -> Result<()> {
     match crate::audio::devnode_cleanup::purge() {
         Ok(r) if r.devnodes == 0 && r.devnode_failures == 0 => {
@@ -531,15 +453,13 @@ fn uninstall_audio_devices() -> Result<()> {
                 );
             }
         }
-        // Best-effort like every other leg: an enumeration that fails must not fail the uninstall.
         Err(e) => eprintln!("warning: audio device cleanup: {e:#}"),
     }
     Ok(())
 }
 
 fn uninstall_pf_vdisplay() -> Result<()> {
-    // 1. Remove the ROOT device node(s) the installer created via nefconc (leaving them would keep
-    //    a ghost "punktfunk virtual display" in Device Manager forever — the exact complaint).
+    // ROOT nodes first; leaving them is a ghost "punktfunk virtual display" in Device Manager.
     for id in pf_vdisplay_instance_ids() {
         if run_quiet("pnputil", &["/remove-device", &id]) {
             println!("removed device node {id}");
@@ -547,14 +467,12 @@ fn uninstall_pf_vdisplay() -> Result<()> {
             eprintln!("warning: pnputil /remove-device {id} failed");
         }
     }
-    // 2. Delete the driver package from the driver store.
     delete_store_drivers(&["pf_vdisplay"]);
     Ok(())
 }
 
 fn uninstall_gamepad() -> Result<()> {
-    // Devnodes first (incl. phantoms — the same ghost-device complaint the vdisplay uninstall
-    // fixed), then the store packages.
+    // Devnodes (incl. phantoms) before store packages.
     remove_pad_devnodes();
     delete_store_drivers(&[
         "pf_gamepad",
@@ -566,10 +484,9 @@ fn uninstall_gamepad() -> Result<()> {
     Ok(())
 }
 
-/// Instance IDs of enumerated punktfunk virtual-display devices. Parses `pnputil /enum-devices`
-/// per-device blocks (blank-line separated); a block is ours if it mentions the pf_vdisplay
-/// hardware id / description, and its instance ID is the first line's VALUE (never the localized
-/// label) — pnputil prints "Instance ID:" (or its translation) first in every block.
+/// Instance IDs of enumerated pf-vdisplay devices. Blank-line blocks from `pnputil /enum-devices`;
+/// ours if the block mentions the hardware id / description. The instance ID is the first line's
+/// VALUE (never the localized "Instance ID:" label — pnputil prints that first in every block).
 fn pf_vdisplay_instance_ids() -> Vec<String> {
     let out = run_capture("pnputil", &["/enum-devices", "/class", "Display"]);
     let mut ids = Vec::new();
@@ -585,7 +502,7 @@ fn pf_vdisplay_instance_ids() -> Vec<String> {
             continue;
         };
         let id = value.trim();
-        // Sanity: an instance ID is a backslashed path with no spaces (e.g. ROOT\DISPLAY\0000).
+        // Instance IDs are backslashed paths with no spaces (`ROOT\DISPLAY\0000`).
         if !id.is_empty() && id.contains('\\') && !id.contains(' ') {
             ids.push(id.to_string());
         }
@@ -593,10 +510,8 @@ fn pf_vdisplay_instance_ids() -> Vec<String> {
     ids
 }
 
-/// Instance IDs of punktfunk virtual-pad devnodes (`SWD\PUNKTFUNK\…`), INCLUDING phantoms left by
-/// a host crash / service stop (`pnputil /enum-devices` lists disconnected devnodes too). Same
-/// un-localized VALUE-side parsing as [`pf_vdisplay_instance_ids`]; matched on the instance-id
-/// prefix itself — the pads span two device classes (HIDClass + System), so no `/class` filter.
+/// Pad instance IDs (`SWD\PUNKTFUNK\…`), including phantoms (`/enum-devices` lists disconnected
+/// nodes). Same VALUE-side parse as [`pf_vdisplay_instance_ids`]. No `/class`: HIDClass + System.
 fn pad_instance_ids() -> Vec<String> {
     let out = run_capture("pnputil", &["/enum-devices"]);
     let mut ids = Vec::new();
@@ -615,10 +530,8 @@ fn pad_instance_ids() -> Vec<String> {
     ids
 }
 
-/// Delete every driver-store package (`%WINDIR%\INF\oem*.inf`) whose INF text mentions one of
-/// `needles` — our driver names are unique enough that a content match identifies the package
-/// without parsing `pnputil /enum-drivers`' localized output. `/uninstall /force` also unbinds it
-/// from any remaining devnodes.
+/// Delete each `%WINDIR%\INF\oem*.inf` whose text mentions a needle — content match, not
+/// `pnputil /enum-drivers` (localized). `/uninstall /force` also unbinds remaining devnodes.
 fn delete_store_drivers(needles: &[&str]) {
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
     let inf_dir = Path::new(&windir).join("INF");
@@ -646,7 +559,7 @@ fn delete_store_drivers(needles: &[&str]) {
     }
 }
 
-/// INF files in %WINDIR%\INF are ANSI or UTF-16LE(+BOM); decode either so content matching works.
+/// `%WINDIR%\INF` is ANSI or UTF-16LE(+BOM); decode either so the needle match works.
 fn read_inf_text(path: &Path) -> String {
     let bytes = std::fs::read(path).unwrap_or_default();
     if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
@@ -660,11 +573,9 @@ fn read_inf_text(path: &Path) -> String {
     }
 }
 
-/// Is a punktfunk virtual-display device already enumerated AND connected? `/connected` is
-/// load-bearing: without it a PHANTOM (disconnected) devnode left by an earlier uninstall satisfies
-/// this check, the install skips creating a live ROOT node, and every session then fails "driver not
-/// installed" (the host enumerates present devices only). Matches the device ID / description, which
-/// are NOT localized, so the substring check is locale-safe.
+/// Enumerated AND connected. Without `/connected` a phantom from an earlier uninstall satisfies
+/// this, install skips the live ROOT node, and the host (present devices only) reports no driver.
+/// Match device ID / description, not a localized label.
 fn pf_vdisplay_present() -> bool {
     let lo = run_capture(
         "pnputil",
@@ -674,7 +585,7 @@ fn pf_vdisplay_present() -> bool {
     lo.contains("pf_vdisplay") || lo.contains("punktfunk virtual display")
 }
 
-/// Read `Class` + `ClassGuid` from an INF so the node matches the shipped driver; falls back to Display.
+/// INF `Class` + `ClassGuid` so the node matches the shipped driver; fallback is Display.
 fn inf_class(inf: &Path) -> (String, String) {
     let text = std::fs::read_to_string(inf).unwrap_or_default();
     let (mut class, mut guid) = (None, None);
@@ -704,18 +615,11 @@ fn inf_class(inf: &Path) -> (String, String) {
     )
 }
 
-// ── `web setup --app-dir <app> [--password-file <file>]` ────────────────────────────────────────
-//
-// Provisioning ONLY. The console is a supervised child of the PunktfunkHost service (see
-// `service.rs`'s "web console child" section; design: punktfunk-planning
-// design/windows-web-console-lifecycle.md): the service spawns bun itself, gated on the files the
-// console needs, so this subcommand no longer registers a scheduled task, waits for the host's
-// cert, or starts anything. What remains is what genuinely belongs to install time: the login
-// password (the wizard's --password-file only exists here), the firewall rule, and deleting the
-// legacy `PunktfunkWeb` scheduled task a pre-supervision install left behind — a live legacy task
-// would race the service's own console child for :47992.
+// Install-time provisioning only: login password, firewall, and delete of the legacy
+// `PunktfunkWeb` scheduled task (a live one races the service's console child for :47992).
+// The service supervises bun; see `service.rs` and design/windows-web-console-lifecycle.md.
 
-/// The RETIRED scheduled task's name — referenced only to migrate old installs off it.
+/// Retired scheduled-task name; referenced only to delete it from older installs.
 const WEB_TASK: &str = "PunktfunkWeb";
 
 pub fn web_main(args: &[String]) -> Result<()> {
@@ -730,23 +634,16 @@ fn web_setup(args: &[String]) -> Result<()> {
         PathBuf::from(flag_val(args, "--app-dir").context("web setup: --app-dir <app> required")?);
     let pw_file = flag_val(args, "--password-file");
     let data_dir = pf_paths::config_dir();
-    // `create_private_dir`, not `create_dir_all`: this runs at install time, before anything else
-    // touches the config dir, and the very next line writes the console login password into it. A
-    // plain `create_dir_all` leaves the inherited `%ProgramData%` ACL, under which BUILTIN\Users may
-    // create files — so the one call that most needs the hardened directory was the one creating it
-    // unhardened (2026-08-05 review H-4).
+    // `create_private_dir`, not `create_dir_all`: the next line writes the console password, and
+    // `create_dir_all` would inherit `%ProgramData%` (BUILTIN\Users can create files).
     pf_paths::create_private_dir(&data_dir).ok();
 
-    // 1. login password
     set_web_password(&data_dir.join("web-password"), pw_file.as_deref());
-    // 2. migration: end + delete the legacy scheduled task (idempotent; harmless when absent).
-    //    On the migrating upgrade the installer's StopBunRuntimes DISABLED the task before the file
-    //    copy, so it cannot respawn between the new service's start and this delete.
+    // End + delete the legacy task (idempotent if absent). The installer disables it before the
+    // file copy so it cannot respawn between service start and this delete.
     run_quiet("schtasks", &["/end", "/tn", WEB_TASK]);
     run_quiet("schtasks", &["/delete", "/tn", WEB_TASK, "/f"]);
-    // 3. payload sanity. Purely informational — the supervisor logs and keeps waiting on its own —
-    //    but install time is when a human is watching, and a WithWeb installer whose payload is
-    //    missing has shipped before (the 0.22.1/0.22.2 CI cache bug).
+    // Informational: the supervisor waits on its own; install time is when a human is watching.
     let server = app_dir
         .join("web")
         .join(".output")
@@ -758,25 +655,10 @@ fn web_setup(args: &[String]) -> Result<()> {
             server.display()
         );
     }
-    // 4. firewall: inbound TCP 47992 (console) and 47993 (plugin UIs). The console serves HTTPS
-    //    (HTTP/1.1 over TLS) with the host's identity cert. (No UDP/HTTP-3: browsers won't use QUIC
-    //    against a self-signed/no-SAN cert.) Scoped to the same profiles as the streaming ports —
-    //    Domain + Private by default, Public only with `--allow-public-network`. Delete any prior
-    //    rule first so an upgrade re-scopes it instead of stacking a second (possibly all-profiles)
-    //    rule behind the new one.
-    //
-    //    47993 is a SEPARATE ORIGIN, not a second copy of the console: plugin UIs are served there
-    //    precisely so a plugin cannot act as the logged-in operator on the console's origin
-    //    (security-review 2026-08-05 H-3). Same host, same certificate, different port — which is
-    //    what makes it a different origin to the browser while staying same-site for the session
-    //    cookie. Without this rule, plugin interfaces simply do not load from another device.
-    //    Both rules are scoped to the bundled bun binary that actually listens on them, not left
-    //    open to any program: a port-only `dir=in action=allow` rule admits whatever binds the port
-    //    first, needs no elevation to do so, and suppresses the Windows prompt that would otherwise
-    //    be the only way in (see `service::fw_add_rule_args`). The console child is
-    //    `<app>/bun/bun.exe` — the same path `service.rs`'s supervisor spawns — so the rule follows
-    //    it. If that binary isn't there, fall back to the port-only rule rather than leaving the
-    //    console unreachable, and say which happened.
+    // TCP 47992 (console) and 47993 (plugin UIs — separate origin so a plugin cannot act as the
+    // operator). Delete any prior rule first so an upgrade re-scopes instead of stacking. Bind
+    // to `<app>/bun/bun.exe`; a port-only allow admits whoever binds first. No UDP: browsers
+    // will not QUIC a self-signed/no-SAN cert. Missing bun.exe falls back to port-only.
     let fw_profile =
         crate::service::firewall_profile_arg(crate::service::allow_public_network(args)?);
     let bun = app_dir.join("bun").join("bun.exe");
@@ -812,25 +694,18 @@ fn web_setup(args: &[String]) -> Result<()> {
             eprintln!("warning: could not add the firewall rule for TCP {port}");
         }
     }
-    // No start step: the PunktfunkHost service supervises the console and starts it the moment the
-    // host has written the files it needs (mgmt token + identity cert/key) — there is nothing an
-    // install-time one-shot start could add except a new way to fail.
     println!(
         "web console set up (https://<host-ip>:47992; supervised by the PunktfunkHost service)"
     );
     Ok(())
 }
 
-/// Source: a non-empty `--password-file` (fresh install) > keep existing (upgrade) > random fallback.
-/// Writes `PUNKTFUNK_UI_PASSWORD=<pw>\n` (LF, no BOM) + ACLs it to Administrators + SYSTEM only.
+/// Non-empty `--password-file` (fresh) > keep existing (upgrade) > random. Writes
+/// `PUNKTFUNK_UI_PASSWORD=<pw>\n` (LF, no BOM) and ACLs it to Administrators + SYSTEM only.
 fn set_web_password(pw_path: &Path, pw_file: Option<&str>) {
-    // A password file that exists but is owned by a NON-admin was planted by an unprivileged user
-    // before this privileged install (`%ProgramData%` CREATOR OWNER). The installer's
-    // `FreshWebInstall := not FileExists` check then mistakes it for an upgrade, skips the password
-    // page, and adopts the attacker's console password. Distrust it: rename aside and rotate to a
-    // fresh random below (`!planted` forces the random branch even if the rename failed). A password
-    // file from a prior privileged install is Administrators-owned and is kept. security-review
-    // 2026-08-15 finding 4.
+    // Non-admin owner means planted under `%ProgramData%` CREATOR OWNER before this install.
+    // `FileExists` would treat it as an upgrade and keep the attacker's password. Rename aside;
+    // `!planted` still rotates if the rename failed. An Administrators-owned file is kept.
     let planted = pw_path.exists() && is_admin_owned(pw_path) == Some(false);
     if planted {
         let mut aside = pw_path.to_path_buf().into_os_string();
@@ -855,14 +730,13 @@ fn set_web_password(pw_path: &Path, pw_file: Option<&str>) {
             }
         });
     if let Some(pw) = password {
-        // Create the file EMPTY first, lock its DACL, THEN write the secret — so the cleartext
-        // password is never present at the inherited (Users-readable) %ProgramData% ACL, even for
-        // the brief window before icacls runs (security-review 2026-06-28 #8).
+        // Empty file, lock DACL, then write: the secret must not sit on the inherited
+        // `%ProgramData%` (Users-readable) ACL even for the window before icacls.
         if std::fs::write(pw_path, b"").is_err() {
             eprintln!("warning: could not create {}", pw_path.display());
             return;
         }
-        // Lock down: drop inheritance, grant only Administrators (S-1-5-32-544) + SYSTEM (S-1-5-18).
+        // Drop inheritance; Administrators (S-1-5-32-544) + SYSTEM (S-1-5-18) only.
         let p = pw_path.to_string_lossy();
         run_quiet(
             "icacls",
@@ -874,14 +748,14 @@ fn set_web_password(pw_path: &Path, pw_file: Option<&str>) {
                 "*S-1-5-18:F",
             ],
         );
-        // Now write the secret into the already-locked file (truncate keeps the explicit DACL).
+        // Truncate keeps the explicit DACL; write the secret into the already-locked file.
         if std::fs::write(pw_path, format!("PUNKTFUNK_UI_PASSWORD={pw}\n")).is_err() {
             eprintln!("warning: could not write {}", pw_path.display());
         }
     }
 }
 
-/// 20-char URL/shell-safe password (no `/ + =`), like web-init.sh / the old web-setup.ps1.
+/// 20 chars, URL/shell-safe (no `/ + =`).
 fn random_password() -> String {
     use base64::Engine;
     use rand::RngCore;

@@ -1,37 +1,38 @@
-//! Capture-stall detection (plan §W4, carved out of the IDD-push capturer): flags multi-hundred-ms
-//! holes in DWM frame delivery that open while the desktop was actively composing.
+//! Capture-stall detection for IDD-push: holes in DWM frame delivery while
+//! the desktop was composing.
+//!
+//! [`StallWatch`] gates on recent active flow, classifies each hole from
+//! driver telemetry + probes + ETW, and feeds a metronome so periodic stalls
+//! self-diagnose. Damage-idle holes (still cursor on a dwm-only desktop) are
+//! real delivery gaps but are excluded from the beat.
+//!
+//! Evidence: `design/` disturbance-immunity verdict matrix. Tests sit with
+//! the capturer's stall suite.
 
 use super::*;
 
-/// A detected capture stall: a multi-hundred-ms hole in DWM's frame delivery that opened while the
-/// desktop was actively composing right beforehand (see [`StallWatch`]).
+/// A hole in DWM delivery that opened after recent active compose ([`StallWatch`]).
 ///
-/// The metronome is NOT fed here — [`StallWatch::report`] feeds it after classification, so a
-/// damage-idle hole (cursor stationary on a dwm-only desktop: an input/hand pause, not a display
-/// stall — the 2026-08-27 NVIDIA-laptop field case was ~30 of these misread as a 1.87 s display
-/// metronome) never contributes to the beat that the METRONOMIC warns blame on display hardware.
+/// The metronome is not fed here. [`StallWatch::report`] feeds it after
+/// classification so a damage-idle hole never advances the display-hardware beat.
 pub(super) struct Stall {
-    /// How long the hole lasted (last fresh frame → the frame that ended it).
     pub(super) gap: Duration,
 }
 
-/// One degraded stretch, summarized at recovery ([`StallWatch::take_recovery`]). Per-hole stall
-/// lines gate on prior ACTIVE flow, so inside a sustained ~2 fps phase only the first hole is
-/// reported and the log goes quiet exactly while the user suffers — this summary is the stretch's
-/// one visible line.
+/// One degraded stretch, closed by [`StallWatch::take_recovery`].
+///
+/// Per-hole stall lines gate on prior active flow, so a sustained slow phase
+/// logs only the first hole; this summary is the stretch's remaining line.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Recovery {
-    /// First hole's start → last hole's end.
     pub(super) degraded: Duration,
-    /// Stall-sized (≥ [`StallWatch::STALL_MIN`]) holes inside the stretch.
+    /// Stall-sized holes (≥ [`StallWatch::STALL_MIN`]).
     pub(super) holes: u32,
-    /// Their summed length.
     pub(super) hole_time: Duration,
-    /// The longest single hole.
     pub(super) worst: Duration,
 }
 
-/// [`StallWatch`]'s in-flight degraded stretch (see [`Recovery`]).
+/// Open degraded stretch; closed into [`Recovery`].
 struct Episode {
     started: Instant,
     last_hole_end: Instant,
@@ -40,60 +41,46 @@ struct Episode {
     worst: Duration,
 }
 
-/// Driver-telemetry evidence for one stall window (the v2 header tail — see
-/// `pf_driver_proto::frame::SharedHeader`), sampled by the capturer between the last pre-gap
+/// Driver telemetry for one stall window (v2 header tail:
+/// `pf_driver_proto::frame::SharedHeader`), sampled between the last pre-gap
 /// frame and the frame that ended the stall.
 pub(super) struct StallEvidence {
-    /// Surfaces the driver OFFERED to the ring publisher during the window (delta of
-    /// `offered_total`); `None` = pre-telemetry driver (it never wrote the tail).
+    /// Delta of `offered_total` in the window. `None` = pre-telemetry driver (no tail).
     pub(super) offered_delta: Option<u64>,
-    /// The STALEST the driver's drain heartbeat ever read while the host starved (max of
-    /// now − heartbeat over the window), in milliseconds.
+    /// Max `now − heartbeat` over the window, in milliseconds.
     pub(super) max_heartbeat_age_ms: u64,
-    /// What the micro-probe engine saw across the window (Phase A.2); `None` when the engine
-    /// isn't running.
     pub(super) probes: Option<ProbeWindow>,
-    /// The DxgKrnl DDI activity inside the window (Phase A.3 ETW summary); `None` when the
-    /// session is unavailable (non-admin dev run).
+    /// DxgKrnl DDI summary for the window. `None` when the ETW session is unavailable.
     pub(super) etw: Option<String>,
-    /// The structured present-vs-queue counts for the window ([`EtwWatch::window_report`]) —
-    /// the compose-silence discriminator: presents flowing while the queue starves = the OS
-    /// display path dropped composed frames; both silent = the content stopped presenting.
-    /// `None` when the ETW session is unavailable.
+    /// Present-vs-queue counts ([`EtwWatch::window_report`]). Presents flowing
+    /// while the queue starves = OS dropped composed frames; both silent =
+    /// content stopped. `None` when the ETW session is unavailable.
     pub(super) etw_counts: Option<super::dxgkrnl_etw::EtwWindowCounts>,
-    /// How far the OS cursor moved (px, |dx|+|dy| summed over samples) DURING the hole — the
-    /// damage witness. On the composited-cursor desktop the pointer is the damage source, so
-    /// `Some(0)` says the content had nothing to compose (input/hand pause: damage-idle) while
-    /// `Some(n>0)` says damage existed and DWM composed none of it — a positive display-stack
-    /// conviction. `None` = never sampled (`GetCursorPos` failing / pre-witness build); the
-    /// classifier then behaves as before this field existed. The stall-ending frame's own
-    /// cursor move is deliberately NOT counted (see the capturer's fold-on-next-call sampler).
+    /// Cursor travel during the hole (px, |dx|+|dy|). `Some(0)` = nothing to
+    /// compose (damage-idle); `Some(n>0)` = damage existed and DWM composed
+    /// none of it. `None` = never sampled. The stall-ending frame's own move
+    /// is not counted (capturer fold-on-next-call sampler).
     pub(super) cursor_moved_px: Option<u32>,
 }
 
-/// The micro-probes' window read (Phase A.2, built by `probes::ProbeEngine::window`): per-leg
-/// maxima across one stall window. Every field is `None` when that probe is absent (no adapter
-/// device, no active output, thread failed to spawn) — absence is stated, never guessed.
+/// Per-leg maxima from `probes::ProbeEngine::window` across one stall.
+/// Every field is `None` when that probe is absent; absence is never guessed.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct ProbeWindow {
-    /// Worst engine-liveness fence round-trip (µs) across all hardware adapters.
     pub(super) fence_max_us: Option<u64>,
-    /// Longest span (µs) with no `DwmGetCompositionTimingInfo` `cRefresh` advance.
+    /// Longest span with no `DwmGetCompositionTimingInfo` `cRefresh` advance (µs).
     pub(super) dwm_tick_frozen_us: Option<u64>,
-    /// Longest span (µs) with no `cFrame` (composed-frame counter) advance. ADVISORY ONLY —
-    /// never classification evidence: on Win11 `DWM_TIMING_INFO.cFrame` is refresh-synthesized
-    /// and advances without real composes (proven on-glass 2026-07-30 against a kernel trace
-    /// where DWM verifiably presented nothing for 1.6 s while cFrame ticked). The line keeps
-    /// reporting it for older builds' sake; [`classify`] ignores it.
+    /// Longest span with no `cFrame` advance (µs). Advisory only: on Win11
+    /// `DWM_TIMING_INFO.cFrame` is refresh-synthesized and ticks without
+    /// composes. [`classify`] ignores it.
     pub(super) dwm_frame_frozen_us: Option<u64>,
-    /// Worst watchdogged `DwmFlush` latency (µs).
     pub(super) dwm_flush_max_us: Option<u64>,
-    /// Worst `D3DKMTGetScanLine` CALL latency (µs) — Level-Zero, so blocking convicts the KMD.
+    /// Worst `D3DKMTGetScanLine` call latency (µs). Blocking here convicts the KMD.
     pub(super) scanline_max_us: Option<u64>,
-    /// Whether the scanline probe had a PHYSICAL head to ask (exclusive topology leaves only our
-    /// IDD active — latency still counts, scanline values don't).
+    /// Physical head present. Exclusive topology leaves only our IDD; latency
+    /// still counts, scanline values do not.
     pub(super) scanline_physical: bool,
-    /// Worst high-res sleeper overshoot (µs) — the DPC-storm / CPU-starvation discriminator.
+    /// Worst high-res sleeper overshoot (µs). DPC-storm / CPU-starvation discriminator.
     pub(super) cpu_max_overshoot_us: Option<u64>,
 }
 
@@ -122,45 +109,32 @@ impl std::fmt::Display for ProbeWindow {
     }
 }
 
-/// The named disturbance class a stall's combined evidence supports — the [`attribute`] verdict
-/// (driver telemetry, Phase A.1) refined by the micro-probe window (Phase A.2). This is the
-/// per-stall output of the program's verdict matrix (design doc §4.4).
+/// Class a stall's combined evidence supports: [`attribute`]'s driver verdict
+/// refined by the probe window. Verdict matrix: `design/` (disturbance immunity).
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(super) enum StallClass {
-    /// The drain worker starved — ours (CPU/MMCSS/dead WUDFHost).
+    /// Drain worker starved (CPU / MMCSS / dead WUDFHost).
     OursWorker,
-    /// Frames were composed and offered but never became consumable — ours (ring/publish/consume).
+    /// Composed and offered, never consumable (ring / publish / consume).
     OursDelivery,
-    /// Engine-liveness fences stalled with the hole: the ADAPTER froze (Level-Two/Three DDI
-    /// servicing — link train, power transition, mux). Class 1.
+    /// Engine-liveness fences stalled with the hole: the adapter froze
+    /// (link train, power transition, mux).
     AdapterFreeze,
-    /// Engines alive but DWM's own tick froze: the compositor is blocked on something (DDC/child
-    /// I/O vendor lock, win32k display-config queue). Class 2.
+    /// Engines alive, DWM tick frozen (DDC / vendor lock / win32k display-config queue).
     CompositorBlocked,
-    /// Engines alive, DWM's clock ticking, driver drained E_PENDING, and the ETW present witness
-    /// saw (essentially) NO swapchain presents from ANY process across the hole: the content
-    /// stopped presenting — no damage, DWM correctly composed nothing. A ONE-OFF here is benign
-    /// (a game hitch, a loading screen, a menu). But this class is also what a frozen *presenter*
-    /// looks like (disturbance-immunity Flavor 3: the display stack — win32k CCD lock, UMD
-    /// serialization against display events, vblank-wait limiters — stops the content's present
-    /// loop), and every probe we run sits at the host's elevated GPU priority, so normal-band
-    /// starvation reads healthy. REPEATED holes under active load do NOT exonerate the display
-    /// path — the repeated-stall / metronomic WARNs carry that triage.
+    /// No swapchain presents from any process across the hole. A one-off is
+    /// a hitch; a frozen presenter looks the same. Probes run at the host's
+    /// elevated GPU priority, so normal-band starvation reads healthy.
+    /// Repeated holes under load do not exonerate the display path.
     ContentSilence,
-    /// Engines alive, DWM ticking, driver drained E_PENDING — and the ETW present witness saw
-    /// presents FLOWING through the hole while the virtual display's kernel queue
-    /// (`BltQueueAddEntry`) starved: composed frames existed and the OS display path dropped
-    /// them before our swap-chain. The real display-path bug class — never yet observed in the
-    /// field; a report with this label (counts attached) is the specimen we want.
+    /// Presents flowed through the hole while the virtual display's kernel queue
+    /// (`BltQueueAddEntry`) starved: OS dropped composed frames before our swap-chain.
     FrameGeneration,
-    /// A CONTENT-SILENCE hole whose damage witness says there was nothing to compose: the
-    /// pre-hole flow was dwm.exe-only (cursor/UI damage, no game presenting) AND the cursor sat
-    /// still through the hole. That is an input/hand pause — client-radio holes, Wi-Fi
-    /// power-save/scan cycles, or simply a resting hand — not a display disturbance. Excluded
-    /// from the metronome and both repeated-stall warns; the 2026-08-27 NVIDIA-laptop field
-    /// case was 30/30 of these blamed on the dark laptop panel.
+    /// Content-silence with dwm.exe-only flow and a still cursor: nothing was dirty.
+    /// An input/hand pause, not a display stall. Excluded from the metronome and
+    /// both repeated-stall warns.
     DamageIdle,
-    /// Not enough evidence to name a class (pre-telemetry driver and/or probes absent).
+    /// Pre-telemetry driver and/or probes absent.
     Unattributed,
 }
 
@@ -189,13 +163,11 @@ impl std::fmt::Display for StallClass {
     }
 }
 
-/// The vdisplay driver's GPU-priority lever (default REALTIME; opt-out `PFVD_NO_RT_GPU`) as
-/// configured in THIS process's environment (the WUDFHost driver process resolves the same
-/// variable, so this read mirrors what the driver decided — modulo a machine env edited after
-/// either process started, which a restart heals). A 2026-08-12 RX 9070 XT A/B once blamed the
-/// REALTIME raise for the metronomic stall signature; confirmed cases with the raise off later
-/// showed lowering priority masks that class at most. The posture still rides every
-/// stall-triage line so the A/B state is always visible.
+/// Driver GPU-priority lever (`PFVD_NO_RT_GPU` opt-out; default REALTIME).
+/// Reads this process's env; WUDFHost resolves the same variable. An env
+/// edited after either process started is stale until restart. Rides every
+/// stall-triage line so an A/B is interpretable; lowering priority masks
+/// this class at most.
 pub(super) fn rt_gpu_driver_posture() -> &'static str {
     if std::env::var_os("PFVD_NO_RT_GPU").is_some() {
         "off (PFVD_NO_RT_GPU)"
@@ -204,8 +176,6 @@ pub(super) fn rt_gpu_driver_posture() -> &'static str {
     }
 }
 
-/// The host's own GPU scheduling-priority policy (`PUNKTFUNK_GPU_PRIORITY_CLASS`) as prose —
-/// [`rt_gpu_driver_posture`]'s twin for the host-process REALTIME lever.
 pub(super) fn rt_gpu_host_posture() -> &'static str {
     match std::env::var("PUNKTFUNK_GPU_PRIORITY_CLASS")
         .ok()
@@ -218,23 +188,19 @@ pub(super) fn rt_gpu_host_posture() -> &'static str {
     }
 }
 
-/// How many window presents acquit the content: ≥8 presents across the hole mirrors
-/// [`attribute`]'s offered-frames bar and [`StallWatch::RECENT`]'s sustained-flow definition —
-/// a caret blink or a stall-ending frame stays under it, a game presenting through the hole
-/// clears it by an order of magnitude.
+/// Presents across the hole that acquit the content. Matches [`attribute`]'s
+/// offered-frames bar and [`StallWatch::RECENT`]: a caret blink or stall-ending
+/// frame stays under 8; a game presenting through the hole clears it.
 const PRESENTS_ACQUIT_CONTENT: u32 = 8;
 
-/// The verdict matrix: fold the driver-telemetry verdict, the probe window and the ETW
-/// present-vs-queue counts into a class. Pure — unit-tested beside the [`StallWatch`] tests.
-/// A leg is "stalled for the hole" when its worst reading covers at least half the gap (the
-/// same proportional bar as [`attribute`]).
+/// Fold driver verdict, probe window, and ETW present-vs-queue counts into a
+/// class. A leg covers the hole when its worst reading is ≥ half the gap
+/// (same bar as [`attribute`]).
 ///
-/// Compose-silence is split by the ETW witnesses ONLY (`DWM_TIMING_INFO.cFrame` is
-/// refresh-synthesized on Win11 and convicts nothing — see [`ProbeWindow::dwm_frame_frozen_us`]):
-/// presents flowing while the hole ran = the OS display path dropped them (FRAME-GENERATION,
-/// positively convicted); no presents anywhere = the content stopped (CONTENT-SILENCE). With no
-/// working witness the class stays UNATTRIBUTED — the pre-2026-07-30 default of blaming the
-/// frame-generation path mislabeled benign content pauses and is retired.
+/// Compose-silence splits on ETW only (`DWM_TIMING_INFO.cFrame` is
+/// refresh-synthesized — [`ProbeWindow::dwm_frame_frozen_us`]): presents
+/// flowing = FRAME-GENERATION; none = CONTENT-SILENCE. No witness stays
+/// UNATTRIBUTED.
 pub(super) fn classify(
     gap: Duration,
     verdict: &StallVerdict,
@@ -258,30 +224,25 @@ pub(super) fn classify(
     if covers(p.dwm_tick_frozen_us) || covers(p.dwm_flush_max_us) {
         return StallClass::CompositorBlocked;
     }
-    // Engines alive and DWM ticking: only the driver's own E_PENDING testimony can pin the
-    // silence on the present path — without it (pre-telemetry driver) the delivery leg is
-    // equally possible, so stay honest.
+    // Only the driver's E_PENDING pins silence on the present path. Without
+    // it (pre-telemetry) the delivery leg is equally possible.
     if matches!(verdict, StallVerdict::ComposeSilence) {
         match etw_counts {
             Some(c) if c.present_history => {
                 if c.presents >= PRESENTS_ACQUIT_CONTENT {
                     StallClass::FrameGeneration
                 } else if c.flow_dwm_only && cursor_moved_px == Some(0) {
-                    // The damage witness closes the CONTENT-SILENCE ambiguity from BOTH sides:
-                    // dwm-only flow means the damage source was the cursor, and a cursor that
-                    // sat still through the hole means DWM had nothing to compose — the hole is
-                    // an input/hand pause, not a display stall. (A cursor that MOVED through a
-                    // present-free hole stays CONTENT-SILENCE and, repeated, is the display
-                    // stack freezing the presenter — the warns say so.) Both conditions are
-                    // required: a game session (flow not dwm-only) is never demoted, and a
-                    // missing witness (`None`) keeps the pre-witness behavior.
+                    // dwm-only + still cursor: nothing to compose (input pause).
+                    // A moved cursor stays CONTENT-SILENCE. Both required: a
+                    // game is never demoted; a missing witness (`None`) is not
+                    // treated as still.
                     StallClass::DamageIdle
                 } else {
                     StallClass::ContentSilence
                 }
             }
-            // No working present witness (session refused / DXGI enable failed / renumbered
-            // events): the silence cannot be attributed to either side.
+            // No present witness (session refused / DXGI enable failed /
+            // renumbered events): silence cannot be pinned to either side.
             _ => StallClass::Unattributed,
         }
     } else {
@@ -289,21 +250,16 @@ pub(super) fn classify(
     }
 }
 
-/// The attribution a stall's evidence supports — the Branch-1/Branch-2 fork of the
-/// vdisplay-disturbance-immunity program, computed per stall instead of argued per field report.
+/// Attribution from driver telemetry alone, before the probe/ETW matrix.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum StallVerdict {
-    /// Pre-telemetry driver: no verdict, the log says only what the host observed.
+    /// Pre-telemetry driver: host observation only.
     NoTelemetry,
-    /// The drain worker's heartbeat went silent for a large share of the hole — the swap-chain
-    /// thread starved (CPU/MMCSS) or the WUDFHost died. Ours, host/driver side.
+    /// Drain heartbeat silent for a large share of the hole (CPU/MMCSS or dead WUDFHost).
     WorkerStalled,
-    /// The worker drained E_PENDING throughout: DWM composed NOTHING for the hole. The
-    /// disturbance is below capture (adapter servicing / DDC lock / present clock) — the
-    /// micro-probe + ETW phases discriminate further.
+    /// Worker drained E_PENDING: DWM composed nothing. Below capture; probes + ETW split it.
     ComposeSilence,
-    /// DWM composed frames all through the hole and the driver offered them, but none became a
-    /// consumable ring slot — OUR publish/ring/consume leg lost them. Fully killable.
+    /// Frames composed and offered, none consumable — our publish/ring/consume leg.
     DeliveryLeg,
 }
 
@@ -318,14 +274,11 @@ impl std::fmt::Display for StallVerdict {
     }
 }
 
-/// Turn one stall window's evidence into a [`StallVerdict`]. Pure — unit-tested beside the
-/// [`StallWatch`] tests.
+/// Fold one stall window into a [`StallVerdict`].
 ///
-/// Thresholds: a heartbeat that was ever `max(gap/2, 250 ms)` stale convicts the worker (its
-/// scheduled cadence is ≤16 ms, so 250 ms of silence is real starvation, and gap/2 scales the bar
-/// for long holes); `offered_delta ≥ 8` acquits DWM (8 composed frames during the "hole" mirrors
-/// [`StallWatch::RECENT`]'s definition of sustained flow — the stall-ending frame plus a resume
-/// burst stay well under it).
+/// Heartbeat ever `max(gap/2, 250 ms)` stale convicts the worker (cadence is
+/// ≤16 ms, so 250 ms is starvation; gap/2 scales long holes). `offered_delta
+/// ≥ 8` acquits DWM — same sustained-flow bar as [`StallWatch::RECENT`].
 pub(super) fn attribute(gap: Duration, evidence: &StallEvidence) -> StallVerdict {
     let Some(offered) = evidence.offered_delta else {
         return StallVerdict::NoTelemetry;
@@ -340,71 +293,55 @@ pub(super) fn attribute(gap: Duration, evidence: &StallEvidence) -> StallVerdict
     }
 }
 
-/// Capture-stall watch — the "sole virtual display" stutter diagnostic (field reports: Exclusive
-/// topology = periodic double-jolt, Extend = smooth, i.e. the disturbance lives in the display/present
-/// path BELOW capture and only while no physical output is active).
+/// Capture-stall watch. A hole counts only when [`Self::RECENT`] pre-gap
+/// frames all fit in [`Self::ACTIVE_SPAN`] — an idle desktop goes quiet
+/// with no damage.
 ///
-/// On a damage-driven capture an idle desktop legitimately goes quiet (no damage → no frames), so a
-/// gap only counts as a stall when the [`Self::RECENT`] frames before it all arrived within
-/// [`Self::ACTIVE_SPAN`] — sustained ≥ ~20 fps flow (a game or video), not a blinking caret or a
-/// mouse twitch. Each stall feeds a [`pf_frame::metronome::Metronome`], so periodic stalls self-diagnose
-/// in the log WITHOUT needing any client keyframe request — discriminating "DWM stopped composing"
-/// from encode/network causes that the recovery-cadence detector covers. Pure logic — unit-tested
-/// below; the caller does the logging.
+/// Reported stalls feed a [`pf_frame::metronome::Metronome`] after
+/// classification so periodic DWM holes self-diagnose. Encode/network
+/// causes stay with the recovery-cadence detector. The caller logs.
 pub(super) struct StallWatch {
-    /// The last [`Self::RECENT`] fresh-frame instants (pre-gap history for the activity gate).
+    /// Last [`Self::RECENT`] fresh-frame instants — activity-gate history.
     recent: std::collections::VecDeque<Instant>,
     cadence: pf_frame::metronome::Metronome,
-    /// Stalls seen this session, and how many had a coinciding OS display event — the discriminator
-    /// [`Self::report`] uses. They were capturer fields that nothing outside the report touched.
+    /// Session stall count and how many carried a coinciding OS display event.
     seen: u32,
     with_os_events: u32,
-    /// Running per-verdict tally (worker-stalled / compose-silence / delivery-leg / no-telemetry),
-    /// in [`StallVerdict`] order — the metronomic WARN prints it, so one pasted line attributes the
-    /// whole session's beat, not just the stall that tripped the metronome.
+    /// Per-verdict counts in [`StallVerdict`] order. The metronomic WARN prints
+    /// the session, not just the stall that tripped the beat.
     verdicts: [u32; 4],
-    /// Running per-class tally ([`StallClass`] order: ours-worker, ours-delivery, adapter-freeze,
-    /// compositor-blocked, content-silence, frame-generation, damage-idle, unattributed) — the
-    /// verdict matrix's session summary.
+    /// Per-class counts in [`StallClass`] declaration order.
     classes: [u32; 8],
-    /// The degraded stretch currently being accumulated, opened by a reported stall and fed by
-    /// every stall-sized hole until sustained flow returns.
+    /// Open stretch; every stall-sized hole feeds it until sustained flow returns.
     episode: Option<Episode>,
-    /// A closed episode's summary, parked for the caller ([`Self::take_recovery`]).
     pending_recovery: Option<Recovery>,
-    /// Instants of REPORTED stalls inside the last [`Self::RATE_WINDOW`] — the repeated-stall
-    /// (non-metronomic) WARN's evidence. The metronome needs a stable period; the 2026-08-26
-    /// 7700 XT field case showed 6 stall-sized holes in 8 s with none, and its log carried zero
-    /// triage guidance as a result.
+    /// Reported-stall instants in [`Self::RATE_WINDOW`]. The metronome needs a
+    /// stable period; this arm covers aperiodic bursts.
     rate_window: std::collections::VecDeque<Instant>,
-    /// When the repeated-stall WARN last fired (spacing: [`Self::RATE_REWARN`]).
+    /// Last rate-arm WARN; spacing is [`Self::RATE_REWARN`].
     last_rate_warn: Option<Instant>,
 }
 
 impl StallWatch {
-    /// Frames of pre-gap history that must be tight for flow to count as active. Stalls are thus
-    /// naturally spaced ≥ RECENT frame times apart — no extra log rate limit needed.
+    /// Pre-gap frames that must be tight for active flow. Stalls are then spaced
+    /// ≥ this many frame times — no extra log rate limit.
     const RECENT: usize = 8;
-    /// The RECENT pre-gap frames must all fit in this span (8 frames spanning 400 ms is 7 intervals,
-    /// so the real bar is ≈ ≥ 17.5 fps flow —
-    /// loose enough for a 30 fps-capped game, tight enough to reject idle-desktop damage).
+    /// Span the RECENT pre-gap frames must fit. 8 frames in 400 ms is 7 intervals
+    /// ≈ 17.5 fps: a 30 fps-capped game passes; idle-desktop damage does not.
     const ACTIVE_SPAN: Duration = Duration::from_millis(400);
-    /// The smallest hole that counts as a stall (~9 missed frames at 60 Hz) — well below the
-    /// reported 300–700 ms freezes, above encode/present jitter.
+    /// Smallest stall hole. ~9 missed frames at 60 Hz; above encode/present jitter.
     const STALL_MIN: Duration = Duration::from_millis(150);
-    /// A hole this long is a content STOP, not a degraded stretch — an open episode is closed
-    /// (and summarized) before it, so a quit-to-idle pause never folds into the tally.
+    /// Hole that is a content stop, not a stretch. Closes an open episode first so
+    /// a quit-to-idle pause never folds into the tally.
     const EPISODE_BREAK: Duration = Duration::from_secs(10);
-    /// Episodes with fewer holes than this dissolve silently — the single stall's own report
-    /// line already covers them.
+    /// Below this, the episode dissolves; the single stall's report already covers it.
     const EPISODE_MIN_HOLES: u32 = 2;
-    /// Rolling window for the repeated-stall (non-metronomic) WARN.
+    /// Window for the aperiodic repeated-stall WARN.
     const RATE_WINDOW: Duration = Duration::from_secs(60);
-    /// Reported stalls inside [`Self::RATE_WINDOW`] that make the session WARN-worthy — well
-    /// above the ~1-per-minute a busy desktop legitimately produces, well under a degraded
-    /// session's dozens.
+    /// Stalls in [`Self::RATE_WINDOW`] that trip the rate WARN. Above a busy
+    /// desktop's ~1/min; under a degraded session's dozens.
     const RATE_MIN_STALLS: usize = 3;
-    /// Re-WARN spacing for the rate arm (the metronomic arms pace themselves via the metronome).
+    /// Rate-arm re-WARN spacing. Metronomic arms pace via the metronome.
     const RATE_REWARN: Duration = Duration::from_secs(300);
 
     pub(super) fn new() -> Self {
@@ -422,9 +359,9 @@ impl StallWatch {
         }
     }
 
-    /// Feed one REPORTED stall at `now` into the rate window; `Some(count)` exactly when the
-    /// repeated-stall WARN is due (≥ [`Self::RATE_MIN_STALLS`] inside [`Self::RATE_WINDOW`],
-    /// spaced by [`Self::RATE_REWARN`]). Pure — unit-tested beside the verdict tests.
+    /// Record a reported stall at `now`. `Some(count)` when the rate WARN is due
+    /// (≥ [`Self::RATE_MIN_STALLS`] in [`Self::RATE_WINDOW`], [`Self::RATE_REWARN`]
+    /// spacing).
     pub(super) fn note_for_rate_warn(&mut self, now: Instant) -> Option<usize> {
         self.rate_window.push_back(now);
         while let Some(front) = self.rate_window.front() {
@@ -447,7 +384,8 @@ impl StallWatch {
         Some(self.rate_window.len())
     }
 
-    /// The session's per-verdict tally as one log token ([`StallVerdict`] order).
+    /// Per-verdict log token. Array is [`StallVerdict`] order; the string prints
+    /// worker, compose-silence, delivery-leg, no-telemetry.
     fn verdict_tally(&self) -> String {
         format!(
             "worker-stalled {}, compose-silence {}, delivery-leg {}, no-telemetry {}",
@@ -455,7 +393,7 @@ impl StallWatch {
         )
     }
 
-    /// The session's per-class tally as one log token ([`StallClass`] order).
+    /// Per-class log token in [`StallClass`] order.
     fn class_tally(&self) -> String {
         format!(
             "ours-worker {}, ours-delivery {}, adapter-freeze {}, compositor-blocked {}, \
@@ -471,15 +409,15 @@ impl StallWatch {
         )
     }
 
-    /// Forget the flow history (a ring recreate's gap is self-inflicted, not a DWM stall — without
-    /// the reset the first post-recreate frame would read as one). An open episode is closed and
-    /// summarized: its holes predate the recreate and are real evidence.
+    /// Drop flow history. A ring-recreate gap is self-inflicted; without this the
+    /// first post-recreate frame reads as a stall. Open episodes still close —
+    /// those holes predate the recreate.
     pub(super) fn reset(&mut self) {
         self.recent.clear();
         self.close_episode();
     }
 
-    /// Close an open episode into [`Self::pending_recovery`] (kept only past the noise bar).
+    /// Close the open episode into [`Self::pending_recovery`] if past the noise bar.
     fn close_episode(&mut self) {
         if let Some(ep) = self.episode.take() {
             if ep.holes >= Self::EPISODE_MIN_HOLES {
@@ -493,14 +431,13 @@ impl StallWatch {
         }
     }
 
-    /// A closed degraded stretch's summary, if one is waiting — the caller logs it. Check after
-    /// every [`Self::note_fresh`]/[`Self::reset`]: closure rides frames that are NOT stalls (the
-    /// first sustained-flow frame after recovery).
+    /// Take a closed stretch if one is waiting. Call after every
+    /// [`Self::note_fresh`] / [`Self::reset`]: closure rides a non-stall frame.
     pub(super) fn take_recovery(&mut self) -> Option<Recovery> {
         self.pending_recovery.take()
     }
 
-    /// Record a fresh driver frame at `now`; `Some` exactly when it ended a stall.
+    /// Record a fresh driver frame at `now`. `Some` iff it ended a stall.
     pub(super) fn note_fresh(&mut self, now: Instant) -> Option<Stall> {
         let was_active = self.recent.len() == Self::RECENT
             && self
@@ -515,15 +452,14 @@ impl StallWatch {
         }
         let gap = gap?;
         if gap >= Self::EPISODE_BREAK {
-            // The content plainly STOPPED (quit to desktop, long idle) — summarize what came
-            // before rather than folding a legitimate pause into the degraded tally.
+            // Content stopped (quit / long idle). Summarize the stretch; do not
+            // fold a legitimate pause into the tally.
             self.close_episode();
         }
         if gap >= Self::STALL_MIN {
             match &mut self.episode {
-                // Inside a degraded stretch every stall-sized hole accumulates — the activity
-                // gate below keeps per-hole reports quiet here (the pre-gap window spans the
-                // slow frames), which is exactly why the episode summary exists.
+                // Accumulate every stall-sized hole. The activity gate below
+                // quiets per-hole reports (pre-gap spans the slow frames).
                 Some(ep) => {
                     ep.holes += 1;
                     ep.hole_time += gap;
@@ -542,42 +478,35 @@ impl StallWatch {
                 None => {}
             }
         } else if was_active {
-            // Sustained flow is back ([`Self::RECENT`] tight frames) — the stretch is over.
+            // [`Self::RECENT`] tight frames: the stretch is over.
             self.close_episode();
         }
         if !was_active || gap < Self::STALL_MIN {
             return None;
         }
-        // The metronome is fed in [`Self::report`], AFTER classification — a damage-idle hole
-        // must never advance the beat the METRONOMIC warns blame on display hardware.
+        // Metronome is fed in [`Self::report`] after classification. A
+        // damage-idle hole must not advance the display-hardware beat.
         Some(Stall { gap })
     }
 
-    /// Feed one classified stall into the metronome — `Some(mean period)` when it completes a
-    /// metronomic cycle. Damage-idle stalls are NOT fed: an input/hand pause repeating on the
-    /// user's cadence must not fabricate the display-disturbance beat (the 2026-08-27 field
-    /// case fitted a "1.87 s display metronome" to what were pauses in the client's input).
-    /// Split from [`Self::report`] so the metronome integration stays unit-testable.
+    /// Feed a classified stall into the metronome. `Some(mean period)` on a
+    /// completed cycle. Damage-idle is not fed: an input pause on the user's
+    /// cadence must not fabricate a display-disturbance beat.
     pub(super) fn cycle(&mut self, now: Instant, damage_idle: bool) -> Option<Duration> {
         if damage_idle {
             return None;
         }
         self.cadence.note(now)
     }
-    /// Log a detected stall, correlate it against OS display events, and — once the cadence turns
-    /// metronomic — name the class of disturbance and its cures.
+    /// Log a stall, correlate OS display events, and name the class once the
+    /// cadence is metronomic.
     ///
-    /// Lives here rather than in `try_consume` (sweep Phase 5.4): it is ~65 lines of log prose plus
-    /// a running tally, all of it about stalls and none of it about consuming a frame, in a function
-    /// that runs per frame. `now` is the instant of the frame that ENDED the stall — the same one
-    /// passed to [`Self::note_fresh`] — which is what bounds the event-correlation window.
-    /// `evidence` is the capturer's driver-telemetry sample for the window; its [`attribute`]
-    /// verdict rides every stall line, so a field log names which leg lost the frames instead of
-    /// leaving it to hypothesis.
+    /// `now` is the frame that ended the stall (same instant as [`Self::note_fresh`])
+    /// and bounds the event-correlation window. `evidence` is the capturer's
+    /// sample for that window; [`attribute`] rides every stall line.
     pub(super) fn report(&mut self, stall: &Stall, now: Instant, evidence: &StallEvidence) {
-        // OS display events inside the gap (plus a lead-in margin: the event that CAUSED the
-        // hole lands just before DWM stops delivering) — the attribution that turns "DWM
-        // stopped composing" into "…because Windows re-enumerated SAMSUNG on HDMI".
+        // Gap plus 300 ms lead-in: the causing OS event lands just before
+        // DWM stops delivering.
         let window = stall.gap + Duration::from_millis(300);
         let events = now
             .checked_sub(window)
@@ -611,15 +540,13 @@ impl StallWatch {
             StallClass::DamageIdle => 6,
             StallClass::Unattributed => 7,
         }] += 1;
-        // Damage-idle holes are real delivery holes (the episode/recovery summaries still count
-        // them) but they are NOT display-disturbance evidence: they must not advance the
-        // metronome, trip either repeated-stall warn, or put a connected-inactive display on
-        // trial. The per-stall line below still carries their full evidence.
+        // Damage-idle is still a delivery hole (episode/recovery count it) but
+        // not display-disturbance evidence: skip metronome, rate WARN, and
+        // connected-inactive trial. The per-stall line still carries evidence.
         let damage_idle = class == StallClass::DamageIdle;
         let metronomic = self.cycle(now, damage_idle);
-        // debug (not warn): a single hole also happens when content legitimately pauses;
-        // the reportable signal is the metronomic cycle below. Mounjay-class triage runs
-        // at debug level, and the web-console debug ring captures these.
+        // debug, not warn: a single hole is a legitimate content pause. The
+        // reportable signal is the metronomic cycle below.
         tracing::debug!(
             gap_ms = stall.gap.as_millis() as u64,
             os_display_events = %pf_win_display::display_events::summarize(&events),
@@ -627,14 +554,12 @@ impl StallWatch {
             class = %class,
             probes = evidence.probes.as_ref().map(tracing::field::display),
             etw = evidence.etw.as_deref().unwrap_or("unavailable"),
-            // The discriminator's numeric read (also embedded in `etw` as prose): swapchain
-            // presents from ANY process vs frames entering the virtual display's kernel queue,
-            // inside the gap window. presents≥bar with adds≈0 = FRAME-GENERATION conviction.
+            // Presents from any process vs virtual-display kernel-queue adds.
+            // presents≥bar with adds≈0 = FRAME-GENERATION.
             etw_presents = evidence.etw_counts.map(|c| c.presents),
             etw_queue_adds = evidence.etw_counts.map(|c| c.queue_adds),
-            // The damage witness: 0 on a dwm-only desktop = the hole had nothing to compose
-            // (input/hand pause); >0 with no presents = damage existed and the display stack
-            // composed none of it — a positive conviction the old CONTENT-SILENCE could not make.
+            // 0 on a dwm-only desktop = nothing to compose. >0 with no
+            // presents = damage existed and DWM composed none of it.
             cursor_moved_px_during_gap = evidence.cursor_moved_px,
             flow_dwm_only = evidence.etw_counts.map(|c| c.flow_dwm_only),
             offered_during_gap = evidence.offered_delta,
@@ -642,12 +567,9 @@ impl StallWatch {
             "IDD-push capture stall — the desktop was composing at speed, then the ring \
              delivered no frame for the gap; the class names the leg that lost them"
         );
-        // The repeated-stall arm: the metronome needs a stable period, but a session losing
-        // frames to 150+ ms holes every few seconds without one (the 2026-08-26 7700 XT case)
-        // deserves the same triage payload — otherwise the log's only guidance is per-stall
-        // DEBUG lines nobody is told to read. Skipped when THIS stall completed a metronomic
-        // cycle (the arms below carry strictly richer prose) and for damage-idle holes (an
-        // input/hand pause repeated 30 times is still not a display problem).
+        // Aperiodic 150+ ms holes still need the triage payload. Skip when
+        // this stall completed a metronomic cycle (richer arms below) or is
+        // damage-idle.
         if metronomic.is_none() && !damage_idle {
             if let Some(stalls_in_window) = self.note_for_rate_warn(now) {
                 let suspects = pf_win_display::display_events::connected_inactive_physicals();
@@ -683,12 +605,10 @@ impl StallWatch {
                 suspects.join(", ")
             };
             let correlated = format!("{}/{}", self.with_os_events, self.seen);
-            // The session's attribution in one token: which leg the evidence convicted, per stall.
             let verdict_tally = self.verdict_tally();
             let class_tally = self.class_tally();
-            // Half-or-more of the stalls carrying a coinciding OS event = the reaction
-            // cascade is OS-visible; otherwise the disturbance never surfaces above the
-            // driver. Different classes, different cures — say which one this box has.
+            // ≥ half the stalls with a coinciding OS event: the cascade is
+            // OS-visible. Otherwise it never surfaces above the driver.
             if self.with_os_events * 2 >= self.seen {
                 tracing::warn!(
                     period_s = format!("{:.2}", period.as_secs_f64()),
@@ -707,9 +627,8 @@ impl StallWatch {
                      suspects)"
                 );
             } else {
-                // The two REALTIME GPU-priority levers (default-on; see the posture helpers'
-                // docs) — a log carrying this warning must say whether either lever is
-                // engaged so a priority A/B is interpretable.
+                // Both REALTIME GPU-priority levers (default on). The line
+                // must say whether either is engaged so an A/B is interpretable.
                 let rt_gpu_driver = rt_gpu_driver_posture();
                 let rt_gpu_host = rt_gpu_host_posture();
                 tracing::warn!(

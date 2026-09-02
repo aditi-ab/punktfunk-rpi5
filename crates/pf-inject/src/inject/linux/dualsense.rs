@@ -1,16 +1,13 @@
-//! Virtual Sony DualSense via UHID — the rich-controller path (roadmap §5).
+//! Virtual DualSense / DualSense Edge via `/dev/uhid`.
 //!
-//! Unlike the uinput X-Box-360 pad ([`super::gamepad`]), which only carries buttons + axes + a
-//! rumble back-channel, a UHID device presents a *real* DualSense HID interface to the kernel:
-//! `hid-playstation` binds it (matched by VID `054C`/PID `0CE6`) and exposes the full controller
-//! — gamepad, motion sensors, touchpad, lightbar + player LEDs, and adaptive triggers — to games.
-//! The host writes HID **input** reports (report `0x01`, our controller state) and reads HID
-//! **output** reports (report `0x02`, a game's rumble/LED/trigger feedback) back, which it
-//! forwards to the client as [`punktfunk_core::quic::HidOutput`].
+//! `hid-playstation` binds VID `054C` / PID `0CE6` (Edge: `0DF2`) and exposes the full HID
+//! surface: gamepad, motion, touchpad, lightbar, player LEDs, adaptive triggers. This module
+//! writes input report `0x01` and reads output report `0x02` (rumble / LED / trigger feedback)
+//! as [`punktfunk_core::quic::HidOutput`].
 //!
-//! The transport-independent contract (report descriptor, feature blobs, [`DsState`], the `0x01`
-//! serializer and `0x02` parser) lives in [`super::dualsense_proto`], shared with the Windows
-//! UMDF-driver backend; this module is just the `/dev/uhid` plumbing around it.
+//! Descriptor, feature blobs, [`DsState`], `0x01` serializer and `0x02` parser live in
+//! [`super::dualsense_proto`] (shared with the Windows UMDF backend). The uinput X-Box-360
+//! pad is [`super::gamepad`].
 
 use super::dualsense_proto::{
     ds_pairing_reply, edge_paddle_bits, parse_ds_output, serialize_state, DsFeedback, DsState,
@@ -31,17 +28,12 @@ use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::time::Instant;
 
-/// The UHID identity a [`DualSensePad`] is created with — the plain DualSense or the Edge (same
-/// driver, same report codec; the Edge differs by PID + descriptor and carries the four extra
-/// `buttons[2]` bits). Mirrors the uinput pad's `PadIdentity` shape.
+/// CREATE2 identity: DualSense vs Edge. Same codec; Edge is PID, descriptor, and `buttons[2]`.
 pub struct DsUhidIdentity {
     product: u32,
     rdesc: &'static [u8],
-    /// Device name prefix ("Punktfunk <name> <index>").
     name: &'static str,
-    /// Path token for the phys string ("punktfunk/<phys>/<index>").
     phys: &'static str,
-    /// Short slug for the uniq string ("punktfunk-<slug>-<index>").
     slug: &'static str,
 }
 
@@ -67,9 +59,7 @@ impl DsUhidIdentity {
     }
 }
 
-/// A virtual DualSense / DualSense Edge backed by `/dev/uhid` (hand-rolled codec — no bindgen,
-/// mirroring the uinput pad's style). Dropping it destroys the device (the kernel tears down the
-/// bound `hid-playstation` interface).
+/// Virtual DualSense on `/dev/uhid`. Drop sends `UHID_DESTROY` and unbinds `hid-playstation`.
 pub struct DualSensePad {
     fd: File,
     seq: u8,
@@ -77,8 +67,7 @@ pub struct DualSensePad {
 }
 
 impl DualSensePad {
-    /// Create the UHID pad for wire index `index` under `id`'s identity (`index` is used only to
-    /// make the device name/uniq unique).
+    /// `index` is only for unique name/uniq; identity is `id`.
     pub fn open(index: u8, id: &DsUhidIdentity) -> Result<DualSensePad> {
         let fd = OpenOptions::new()
             .read(true)
@@ -98,28 +87,25 @@ impl DualSensePad {
         Ok(ds)
     }
 
-    /// Send UHID_CREATE2 under `id`'s identity. The uniq written here is cosmetic:
-    /// `hid-playstation` replaces it with the MAC from the pairing feature report (see
-    /// [`ds_pairing_reply`]) as soon as it binds.
+    /// CREATE2. The uniq is cosmetic: `hid-playstation` replaces it with the pairing-report MAC ([`ds_pairing_reply`]).
     fn send_create2(&mut self, index: u8, id: &DsUhidIdentity) -> Result<()> {
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_CREATE2.to_ne_bytes());
-        // union (uhid_create2_req) starts at byte 4.
-        put_cstr(&mut ev, 4, 128, &format!("Punktfunk {} {index}", id.name)); // name[128]
-        put_cstr(&mut ev, 132, 64, &format!("punktfunk/{}/{index}", id.phys)); // phys[64]
-        put_cstr(&mut ev, 196, 64, &format!("punktfunk-{}-{index}", id.slug)); // uniq[64]
-        ev[260..262].copy_from_slice(&(id.rdesc.len() as u16).to_ne_bytes()); // rd_size
-        ev[262..264].copy_from_slice(&BUS_USB.to_ne_bytes()); // bus
+        // uhid_create2_req at 4: name[128] phys[64] uniq[64] rd_size bus vid pid version country rd_data.
+        put_cstr(&mut ev, 4, 128, &format!("Punktfunk {} {index}", id.name));
+        put_cstr(&mut ev, 132, 64, &format!("punktfunk/{}/{index}", id.phys));
+        put_cstr(&mut ev, 196, 64, &format!("punktfunk-{}-{index}", id.slug));
+        ev[260..262].copy_from_slice(&(id.rdesc.len() as u16).to_ne_bytes());
+        ev[262..264].copy_from_slice(&BUS_USB.to_ne_bytes());
         ev[264..268].copy_from_slice(&DS_VENDOR.to_ne_bytes());
         ev[268..272].copy_from_slice(&id.product.to_ne_bytes());
-        ev[272..276].copy_from_slice(&0x0100u32.to_ne_bytes()); // version
-        ev[276..280].copy_from_slice(&0u32.to_ne_bytes()); // country
-        ev[280..280 + id.rdesc.len()].copy_from_slice(id.rdesc); // rd_data
+        ev[272..276].copy_from_slice(&0x0100u32.to_ne_bytes());
+        ev[276..280].copy_from_slice(&0u32.to_ne_bytes());
+        ev[280..280 + id.rdesc.len()].copy_from_slice(id.rdesc);
         self.fd.write_all(&ev).context("write UHID_CREATE2")?;
         Ok(())
     }
 
-    /// Serialize `st` into report `0x01` and write it to the kernel (UHID_INPUT2).
     pub fn write_state(&mut self, st: &DsState) -> Result<()> {
         self.seq = self.seq.wrapping_add(1);
         let ts = self.clock.ds_ticks(Instant::now());
@@ -128,17 +114,14 @@ impl DualSensePad {
 
         let mut ev = [0u8; UHID_EVENT_SIZE];
         ev[0..4].copy_from_slice(&UHID_INPUT2.to_ne_bytes());
-        ev[4..6].copy_from_slice(&(r.len() as u16).to_ne_bytes()); // input2.size
-        ev[6..6 + r.len()].copy_from_slice(&r); // input2.data
+        // uhid_input2_req: size u16 at 4, data at 6.
+        ev[4..6].copy_from_slice(&(r.len() as u16).to_ne_bytes());
+        ev[6..6 + r.len()].copy_from_slice(&r);
         self.fd.write_all(&ev).context("write UHID_INPUT2")?;
         Ok(())
     }
 
-    /// Service the device, non-blocking: answer the kernel's feature-report GET_REPORTs (calibration
-    /// / pairing / firmware — required during `hid-playstation` init, or no input devices appear)
-    /// and parse any HID OUTPUT reports (rumble / lightbar / player LEDs / adaptive triggers) into
-    /// a [`DsFeedback`] for pad `pad`. Call frequently — especially right after [`open`] so the
-    /// init handshake completes. The fd is `O_NONBLOCK`, so once drained `read` returns `WouldBlock`.
+    /// Drain UHID events. GET_REPORT (0x05/0x09/0x20) must be answered or `hid-playstation` never binds; call often right after [`open`].
     pub fn service(&mut self, pad: u8) -> DsFeedback {
         let mut fb = DsFeedback::default();
         let mut ev = [0u8; UHID_EVENT_SIZE];
@@ -156,8 +139,7 @@ impl DualSensePad {
                 UHID_GET_REPORT => {
                     // uhid_get_report_req: id u32 [4..8], rnum u8 [8].
                     let id = u32::from_ne_bytes([ev[4], ev[5], ev[6], ev[7]]);
-                    // Per-pad MAC: hid-playstation adopts it as the HID uniq, and SDL/Steam
-                    // dedup controllers by that serial (see `ds_pairing_reply`).
+                    // Per-pad MAC becomes HID uniq; SDL/Steam dedup on it (`ds_pairing_reply`).
                     let pairing = ds_pairing_reply(pad);
                     let data: &[u8] = match ev[8] {
                         0x05 => DS_FEATURE_CALIBRATION,
@@ -168,13 +150,11 @@ impl DualSensePad {
                     let _ = self.reply_get_report(id, data);
                 }
                 UHID_SET_REPORT => {
-                    // Ack (err=0) so a SET_REPORT writer doesn't block on the kernel's 5 s
-                    // timeout. Nothing to parse: every known DualSense writer sends its feedback
-                    // as OUTPUT reports (handled above), never SET_REPORT.
+                    // Ack SET_REPORT (err=0): kernel waits 5 s otherwise. DualSense feedback is OUTPUT, not SET_REPORT.
                     let id = u32::from_ne_bytes([ev[4], ev[5], ev[6], ev[7]]);
                     let _ = self.reply_set_report(id);
                 }
-                _ => {} // Start/Stop/Open/Close — ignore
+                _ => {}
             }
         }
         fb
@@ -185,7 +165,7 @@ impl DualSensePad {
         ev[0..4].copy_from_slice(&UHID_GET_REPORT_REPLY.to_ne_bytes());
         // uhid_get_report_reply_req: id u32 [4..8], err u16 [8..10], size u16 [10..12], data [12..].
         ev[4..8].copy_from_slice(&id.to_ne_bytes());
-        let err: u16 = if data.is_empty() { 5 } else { 0 }; // EIO if we don't know the report
+        let err: u16 = if data.is_empty() { 5 } else { 0 }; // EIO if unknown report
         ev[8..10].copy_from_slice(&err.to_ne_bytes());
         ev[10..12].copy_from_slice(&(data.len() as u16).to_ne_bytes());
         ev[12..12 + data.len()].copy_from_slice(data);
@@ -200,7 +180,7 @@ impl DualSensePad {
         ev[0..4].copy_from_slice(&UHID_SET_REPORT_REPLY.to_ne_bytes());
         // uhid_set_report_reply_req: id u32 [4..8], err u16 [8..10].
         ev[4..8].copy_from_slice(&id.to_ne_bytes());
-        ev[8..10].copy_from_slice(&0u16.to_ne_bytes()); // err 0 (ack)
+        ev[8..10].copy_from_slice(&0u16.to_ne_bytes());
         self.fd
             .write_all(&ev)
             .context("write UHID_SET_REPORT_REPLY")?;
@@ -216,24 +196,17 @@ impl Drop for DualSensePad {
     }
 }
 
-/// How a virtual DualSense is presented to the kernel.
+/// Kernel presentation: usbip (`usb_device` parent) or UHID fallback.
 ///
-/// [`Usbip`](DsTransport::Usbip) is a *real* USB device (see [`crate::dualsense_usbip`]) and is the
-/// only rung that can satisfy wine's ContainerId derivation or GE-Proton's raw-ALSA leg, because
-/// both walk sysfs for a `usb_device` parent that a UHID pad simply does not have.
-/// [`Uhid`](DsTransport::Uhid) is the long-validated universal fallback: the pad works, games see
-/// it, but its speaker cannot be paired to it by a libScePad-style title.
+/// Wine ContainerId and GE-Proton raw-ALSA walk sysfs for a `usb_device` parent UHID does not have.
+/// UHID has no speaker pairing for libScePad-style titles. See [`crate::dualsense_usbip`].
 pub enum DsTransport {
     Usbip(crate::dualsense_usbip::DualSenseUsbip),
     Uhid(DualSensePad),
 }
 
-/// Open the best DualSense transport available: **usbip/`vhci_hcd` → UHID**, degrading on failure
-/// so a host without `vhci_hcd` (or without the `punktfunk` group's write on its sysfs `attach`)
-/// still gets a working pad.
-///
-/// The usbip rung is opt-in while it awaits on-glass verification — see
-/// [`crate::dualsense_usbip::usbip_preferred`].
+/// Try usbip (`vhci_hcd` + `punktfunk` write on sysfs `attach`); else UHID.
+/// Opt-in: [`crate::dualsense_usbip::usbip_preferred`].
 fn open_transport(idx: u8) -> Result<DsTransport> {
     if crate::dualsense_usbip::usbip_preferred() {
         match crate::dualsense_usbip::DualSenseUsbip::open(idx) {
@@ -251,13 +224,9 @@ fn open_transport(idx: u8) -> Result<DsTransport> {
     Ok(DsTransport::Uhid(p))
 }
 
-/// The DualSense-specific half of the shared stateful manager (see [`PadProto`]): transport
-/// open ([`open_transport`]), the [`DsState`] mappers, and the kernel-handshake service pass.
-/// Everything lifecycle-shaped (slot table, unplug sweep, heartbeat, feedback dedup) lives in
-/// [`UhidManager`].
+/// DualSense [`PadProto`]: transport + [`DsState`] + handshake. Slot table / heartbeat live in [`UhidManager`].
 pub struct DsLinuxProto {
-    /// Fallback policy for the Steam back grips a client may send (the DualSense has no back-button
-    /// HID slot). `PUNKTFUNK_STEAM_REMAP=paddles=…`; default drop.
+    /// Steam back-grip fold. DualSense has no HID slot; `PUNKTFUNK_STEAM_REMAP=paddles=…`, default drop.
     remap: crate::steam_remap::RemapConfig,
 }
 
@@ -284,11 +253,8 @@ impl PadProto for DsLinuxProto {
         DsState::neutral()
     }
 
-    /// Merge buttons/sticks/triggers from the frame, preserving touch + motion + pad clicks (those
-    /// come on the rich-input plane and must survive a button-only frame).
+    /// Button/stick/trigger frame. Keep prev touch/motion/click — they arrive on the rich plane.
     fn merge_frame(&self, prev: &DsState, f: &punktfunk_core::input::GamepadFrame) -> DsState {
-        // Steam back grips have no DualSense slot — fold them onto standard buttons per the
-        // configured policy (default drop) so they aren't silently lost.
         let buttons = crate::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
         let mut s = DsState::from_gamepad(
             buttons,
@@ -306,8 +272,7 @@ impl PadProto for DsLinuxProto {
         s
     }
 
-    /// The shared DualSense-family mapping (dualsense_proto::DsState::apply_rich): Steam dual pads
-    /// split the one touchpad left/right, pad clicks ride touch_click.
+    /// Steam dual pads split the one touchpad left/right; clicks ride `touch_click`.
     fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
         st.apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
     }
@@ -329,13 +294,10 @@ impl PadProto for DsLinuxProto {
         }
     }
 
-    /// Answer the kernel's init handshake (it blocks `hid-playstation` init until its GET_REPORTs
-    /// are answered — call frequently) and parse a game's feedback: motor rumble on the universal
-    /// 0xCA plane, the rich lightbar/player-LED/trigger events on the 0xCD plane.
+    /// Handshake + feedback: rumble on 0xCA, lightbar/LEDs/triggers on 0xCD.
     fn service(&self, pad: &mut DsTransport, idx: u8) -> PadFeedback {
         let fb = match pad {
-            // The usbip pad answers EP0 on the server thread, so `service` only drains what the
-            // handlers already collected — `idx` is baked into the handler at build time.
+            // usbip answers EP0 on the server thread; `idx` is baked into the handler.
             DsTransport::Usbip(u) => u.service(),
             DsTransport::Uhid(p) => p.service(idx),
         };
@@ -343,37 +305,24 @@ impl PadProto for DsLinuxProto {
             // No trigger motors on this protocol — see `PadFeedback::rumble`.
             rumble: fb.rumble.map(|(low, high)| (low, high, 0, 0)),
             hidout: fb.hidout,
-            // Rumble-plane liveness (arms the shared abandoned-rumble force-off). evdev-FF games
-            // going through hid-playstation get their stops surfaced reliably, but Steam Input
-            // drives this pad over hidraw DIRECTLY — the same abandonment semantics as a Windows
-            // game, so the same watchdog applies. SDL-class writers re-assert a held level every
-            // ~2 s (inside the idle window), and a writer that goes silent on a latched level is
-            // cut exactly as real firmware decay would cut it on a physical pad.
+            // Arms abandoned-rumble force-off. hidraw (Steam Input) never surfaces a stop;
+            // SDL re-asserts ~2 s, inside the idle window.
             rumble_drove: Some(fb.rumble.is_some()),
             resync: false,
         }
     }
 }
 
-/// All virtual DualSense pads of a session — the rich-controller analog of
-/// [`GamepadManager`](super::gamepad::GamepadManager), selected with `PUNKTFUNK_GAMEPAD=dualsense`.
+/// Session DualSense pads (`PUNKTFUNK_GAMEPAD=dualsense`). Analog of [`GamepadManager`](super::gamepad::GamepadManager).
 ///
-/// Unlike the uinput pad, a DualSense carries touchpad + motion, which arrive on a *separate*
-/// rich-input plane (`apply_rich`) from the button/stick frames (`handle`); the shared
-/// [`UhidManager`] keeps each pad's full [`DsState`], re-emits the merged report whenever either
-/// source changes, and heartbeats it through input silence (a real DualSense streams report `0x01`
-/// continuously — `hid-playstation`/Proton/SDL treat a multi-second gap as an unplug).
+/// Touch/motion arrive on `apply_rich`, buttons on `handle`. [`UhidManager`] merges and heartbeats
+/// report `0x01` — `hid-playstation`/Proton/SDL treat a multi-second gap as unplug.
 pub type DualSenseManager = UhidManager<DsLinuxProto>;
 
-/// The DualSense **Edge** half of the shared stateful manager: the plain-DualSense transport and
-/// report codec under the Edge USB identity (`054C:0DF2` + the Edge descriptor), with the four
-/// wire back-grip bits mapped onto the Edge's native `buttons[2]` slots instead of the
-/// fold/drop policy — the whole point of this backend (a client's Deck grips / Elite paddles
-/// stop vanishing). No remap config: every paddle has a native home.
+/// DualSense Edge [`PadProto`]: PID `0DF2`, paddles on native `buttons[2]` (no fold).
 ///
-/// Kernel note: `hid-playstation` binds the Edge PID since 6.1 (forced vibration-v2 output), but
-/// only kernels ≥ 7.2 surface the Fn/back bits as evdev keys (`BTN_TRIGGER_HAPPY1..4`); SDL /
-/// Steam Input read the report off hidraw and see them on any kernel.
+/// `hid-playstation` binds Edge since 6.1 (vibration-v2). Fn/back as evdev (`BTN_TRIGGER_HAPPY1..4`)
+/// needs ≥ 7.2; hidraw (SDL / Steam Input) sees them on any kernel.
 #[derive(Default)]
 pub struct DsEdgeLinuxProto;
 
@@ -397,9 +346,7 @@ impl PadProto for DsEdgeLinuxProto {
         DsState::neutral()
     }
 
-    /// Merge buttons/sticks/triggers from the frame, preserving the rich-plane fields — like the
-    /// plain DualSense, EXCEPT the wire paddles are not folded away: they land on the Edge's own
-    /// `buttons[2]` bits (rebuilt from every button frame, so no extra persistence).
+    /// Same merge as DualSense, but paddles land on `buttons[2]` (rebuilt every frame, no persistence).
     fn merge_frame(&self, prev: &DsState, f: &punktfunk_core::input::GamepadFrame) -> DsState {
         let mut s = DsState::from_gamepad(
             f.buttons,
@@ -418,8 +365,7 @@ impl PadProto for DsEdgeLinuxProto {
         s
     }
 
-    /// The shared DualSense-family mapping (dualsense_proto::DsState::apply_rich): Steam dual pads
-    /// split the one touchpad left/right, pad clicks ride touch_click.
+    /// Steam dual pads split the one touchpad left/right; clicks ride `touch_click`.
     fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
         st.apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
     }
@@ -436,30 +382,22 @@ impl PadProto for DsEdgeLinuxProto {
         let _ = pad.write_state(st);
     }
 
-    /// Same kernel handshake + feedback parse as the plain DualSense — the Edge's GET_REPORT set
-    /// (calibration 0x05 / pairing 0x09 / firmware 0x20) and output report 0x02 are identical
-    /// (the Edge's rumble arrives via the vibration-v2 valid_flag2 bit, which
-    /// [`parse_ds_output`] already handles).
+    /// Same handshake as DualSense. Edge rumble is vibration-v2 `valid_flag2` ([`parse_ds_output`]).
     fn service(&self, pad: &mut DualSensePad, idx: u8) -> PadFeedback {
         let fb = pad.service(idx);
         PadFeedback {
             // No trigger motors on this protocol — see `PadFeedback::rumble`.
             rumble: fb.rumble.map(|(low, high)| (low, high, 0, 0)),
             hidout: fb.hidout,
-            // Rumble-plane liveness (arms the shared abandoned-rumble force-off). evdev-FF games
-            // going through hid-playstation get their stops surfaced reliably, but Steam Input
-            // drives this pad over hidraw DIRECTLY — the same abandonment semantics as a Windows
-            // game, so the same watchdog applies. SDL-class writers re-assert a held level every
-            // ~2 s (inside the idle window), and a writer that goes silent on a latched level is
-            // cut exactly as real firmware decay would cut it on a physical pad.
+            // Arms abandoned-rumble force-off. hidraw (Steam Input) never surfaces a stop;
+            // SDL re-asserts ~2 s, inside the idle window.
             rumble_drove: Some(fb.rumble.is_some()),
             resync: false,
         }
     }
 }
 
-/// All virtual DualSense Edge pads of a session — `PUNKTFUNK_GAMEPAD=edge`, or the per-pad kind a
-/// client declares for a paddle-bearing physical controller.
+/// Session Edge pads: `PUNKTFUNK_GAMEPAD=edge`, or a client's paddle-bearing pad kind.
 pub type DualSenseEdgeManager = UhidManager<DsEdgeLinuxProto>;
 
 #[cfg(test)]
@@ -469,7 +407,6 @@ mod tests {
     use std::os::unix::io::AsRawFd;
     use std::time::{Duration, Instant};
 
-    /// evdev nodes whose input-device name contains `name`: (full name, /dev/input/eventN).
     fn find_nodes(name: &str) -> Vec<(String, String)> {
         let s = std::fs::read_to_string("/proc/bus/input/devices").unwrap_or_default();
         let mut out = Vec::new();
@@ -488,14 +425,13 @@ mod tests {
         out
     }
 
-    /// Whether the evdev at `node` advertises EV_FF (0x15) — the rumble-capable gamepad node
-    /// (the touchpad / motion / headset siblings don't).
+    /// Touchpad / motion / headset siblings do not advertise EV_FF.
     fn has_ff(node: &str) -> bool {
         let Ok(f) = std::fs::OpenOptions::new().read(true).open(node) else {
             return false;
         };
         let mut bits = [0u8; 8];
-        // EVIOCGBIT(0, 8): the device's event-type bitmap.
+        // EVIOCGBIT(0, 8) event-type bitmap.
         let req: libc::c_ulong = (2 << 30) | (8 << 16) | (0x45 << 8) | 0x20;
         // SAFETY: EVIOCGBIT(0) copies at most 8 bytes (EV_MAX/8 < 8) into the live `bits` buffer
         // behind the valid evdev fd `f`; the kernel never writes past the ioctl's size argument.
@@ -503,9 +439,7 @@ mod tests {
         rc >= 0 && (bits[0x15 / 8] >> (0x15 % 8)) & 1 == 1
     }
 
-    /// Upload an FF_RUMBLE effect on `node` and play it, exactly like SDL's evdev haptic backend.
-    /// Returns the OPEN fd with the id — closing the fd erases the process's effects (stopping
-    /// the rumble), so the caller must hold it while asserting.
+    /// Play FF_RUMBLE on `node` (SDL evdev haptic). Hold the fd: close erases the effect and stops rumble.
     fn evdev_rumble(node: &str, strong: u16, weak: u16) -> std::io::Result<(std::fs::File, i16)> {
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new()
@@ -561,8 +495,7 @@ mod tests {
         out
     }
 
-    /// Service `pad` for `ms`, accumulating every captured feedback pass (all rumble levels in
-    /// order + all rich events) while keeping the input heartbeat going.
+    /// Drain feedback for `ms` while heartbeating `st` (silence looks like unplug).
     fn collect(pad: &mut DualSensePad, st: &DsState, ms: u64) -> (Vec<(u16, u16)>, Vec<HidOutput>) {
         let start = Instant::now();
         let (mut levels, mut hidout) = (Vec::new(), Vec::<HidOutput>::new());
@@ -576,20 +509,15 @@ mod tests {
         (levels, hidout)
     }
 
-    /// On-box proof of the full Linux feedback surface, playing the GAME's role against a real
-    /// kernel: chain A drives rumble through evdev force feedback (`hid-playstation`'s ff-memless
-    /// → UHID_OUTPUT — what SDL/Steam fall back to without hidraw); chain B writes a raw DS5
-    /// output report to the pad's hidraw node (SDL/Steam's real path, and the ONLY way adaptive
-    /// triggers can arrive) and expects rumble + lightbar + player LEDs + both trigger blocks
-    /// back verbatim. Also pins the per-pad pairing MAC: two pads must present distinct uniqs or
-    /// SDL/Steam dedup them into one controller.
+    /// Kernel feedback: evdev FF (ff-memless → UHID_OUTPUT) and hidraw report `0x02` (the only
+    /// adaptive-trigger path). Two pads must have distinct pairing uniqs or SDL/Steam dedup them.
     #[test]
     #[ignore = "creates real /dev/uhid devices; needs hid-playstation, the input group, and the 60-punktfunk.rules hidraw rules"]
     fn feedback_flows_via_evdev_ff_and_hidraw() {
         let mut pad0 = DualSensePad::open(0, &DsUhidIdentity::dualsense()).expect("open pad 0");
         let mut pad1 = DualSensePad::open(1, &DsUhidIdentity::dualsense()).expect("open pad 1");
         let st = DsState::neutral();
-        // Let hid-playstation complete its GET_REPORT handshakes and register input devices.
+        // GET_REPORT handshake; hid-playstation registers nodes in ~1.5 s.
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(1500) {
             let _ = pad0.service(0);
@@ -609,8 +537,7 @@ mod tests {
             .find(|n| has_ff(n))
             .expect("no FF-capable evdev among the pad's input devices");
 
-        // Per-pad MAC: hid-playstation adopts the pairing-report MAC as HID_UNIQ; the two pads
-        // must differ (the SDL/Steam serial-dedup regression, see `ds_pairing_reply`).
+        // Pairing MAC becomes HID_UNIQ; SDL/Steam dedup on it (`ds_pairing_reply`).
         let hidraws = hidraw_devices();
         let uniq = |name: &str| {
             hidraws
@@ -625,21 +552,19 @@ mod tests {
             "pads share one pairing MAC — SDL/Steam will dedup them into one controller"
         );
 
-        // ---- Chain A: evdev force feedback ----
         let (ff_fd, _) = evdev_rumble(ff_node, 0xC000, 0x4000).expect("EVIOCSFF/play");
         let (levels, _) = collect(&mut pad0, &st, 1000);
         assert!(
             levels.iter().any(|&(l, h)| l > 0 || h > 0),
             "evdev FF rumble never surfaced as UHID_OUTPUT: {levels:?}"
         );
-        drop(ff_fd); // closing erases the effect: the stop must surface too
+        drop(ff_fd); // close erases the effect; the stop must surface
         let (levels, _) = collect(&mut pad0, &st, 800);
         assert!(
             levels.contains(&(0, 0)),
             "erase-on-close never produced a rumble stop: {levels:?}"
         );
 
-        // ---- Chain B: raw DS5 output report over hidraw ----
         let hr = hidraws
             .iter()
             .find(|(n, _, _)| n == "Punktfunk DualSense 0")

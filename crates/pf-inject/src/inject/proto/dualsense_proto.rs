@@ -1,34 +1,23 @@
-//! Transport-independent DualSense HID contract — shared by the Linux UHID backend
-//! ([`super::dualsense`]) and the Windows UMDF-driver backend ([`super::dualsense_windows`]).
+//! Transport-independent DualSense HID contract: report descriptor, feature blobs, the
+//! [`DsState`] model and GameStream mapper, input report `0x01`, output report `0x02`.
+//! Shared by [`super::dualsense`] (Linux UHID) and [`super::dualsense_windows`] (UMDF).
 //!
-//! This is the pure logic: the report descriptor, feature blobs, the [`DsState`] controller model
-//! and its `GameStream`/XInput mapper, the input-report serializer (report `0x01`) and the
-//! output-report parser (report `0x02`, a game's rumble / lightbar / player-LED / adaptive-trigger
-//! feedback). Neither half depends on a transport — the Linux backend writes `0x01` to `/dev/uhid`
-//! and reads `0x02` via `UHID_OUTPUT`; the Windows backend pushes `0x01` to the UMDF driver and
-//! pulls `0x02` back over its control channel — but both build/parse the exact same bytes.
+//! Layout is the inputtino DualSense descriptor (`games-on-whales/inputtino`
+//! `src/uhid/include/uhid/ps5.hpp`). `hid-playstation` and `hidclass` bind it as USB DualSense.
 //!
-//! The descriptor + field layout are the canonical inputtino ones (games-on-whales/inputtino
-//! `src/uhid/include/uhid/ps5.hpp`), so `hid-playstation` (Linux) and `hidclass` (Windows) bind the
-//! same as a real USB DualSense.
+//! Feature blobs must match `hid-playstation`'s request sizes (calibration 41, pairing 20,
+//! firmware 64). A USB backend rejects a longer reply as a malicious URB and drops the device.
+//! Tests pin sizes, field offsets, paddle bits, and valid-flag gating.
 
 use punktfunk_core::input::gamepad as gs;
 use punktfunk_core::quic::{HidOutput, RichInput};
 
-// Feature reports the host stack GET_REPORTs during init — without these replies the kernel
-// (`hid-playstation`) never finishes calibration and creates no input devices. Verbatim from
-// inputtino (each array's first byte is the report id). The pairing report carries a fixed
-// virtual MAC.
+// GET_REPORT during init. Without these hid-playstation never finishes calibration and
+// creates no input devices. First byte of each array is the report id.
 #[rustfmt::skip]
-// **41 bytes, and that is load-bearing** — the descriptor declares report 0x05 as a 40-byte feature
-// and `hid-playstation` asks for id + 40 = 41 (`DS_FEATURE_REPORT_CALIBRATION_SIZE`). This blob
-// carried one trailing pad byte too many until 2026-08-17. On uhid and on Windows that was
-// invisible, because hidraw and `hidclass` both truncate a feature reply to the declared length —
-// but a *USB* backend does not: `usbip_recv_xbuff()` compares the reply's `actual_length` against
-// the URB's `transfer_buffer_length` and, on 42 > 41, treats it as a malicious packet, logs
-// `recv xbuf, 0` and raises `VDEV_EVENT_ERROR_TCP` — which tears down the whole connection, not the
-// one URB. That killed the usbip pad's `hid-playstation` probe with -EPROTO and took the controller
-// with it. Keep this exactly 41 bytes. See [`crate::dualsense_usbip`].
+// 41 bytes: report 0x05 is a 40-byte feature; hid-playstation asks for id+40.
+// A USB backend (see [`crate::dualsense_usbip`]) rejects a longer reply as a
+// malicious URB and drops the device. hidraw/hidclass truncate, so extra pad hides.
 pub const DS_FEATURE_CALIBRATION: &[u8] = &[ // report 0x05 (motion calibration)
     0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x27, 0xF0, 0xD8, 0x10, 0x27, 0xF0, 0xD8, 0x10,
     0x27, 0xF0, 0xD8, 0xF4, 0x01, 0xF4, 0x01, 0x10, 0x27, 0xF0, 0xD8, 0x10, 0x27, 0xF0, 0xD8, 0x10,
@@ -40,22 +29,19 @@ pub const DS_FEATURE_PAIRING: &[u8] = &[ // report 0x09 (pairing info: MAC at by
     0x00, 0x00, 0x00, 0x00,
 ];
 #[rustfmt::skip]
-pub const DS_FEATURE_FIRMWARE: &[u8] = &[ // report 0x20 (firmware info / build date); bytes 44..46
-    // = update version, kept ABOVE Sony's real releases (0x0630 as of 2026-08) — an older value
-    // makes PlayStation Accessories and libScePad titles demand a firmware update the virtual pad
-    // cannot take ("can't complete the update"), and ≥ 0x0224 is what puts writers on the
-    // COMPATIBLE_VIBRATION2 convention parse_ds_output accepts alongside flag0.
+pub const DS_FEATURE_FIRMWARE: &[u8] = &[ // report 0x20; update version at bytes 44..46
+    // Above Sony's shipping fw (0x0630) so Accessories/libScePad skip an update the
+    // virtual pad cannot take. ≥ 0x0224 also selects COMPATIBLE_VIBRATION2, which
+    // parse_ds_output must accept alongside flag0.
     0x20, 0x4A, 0x75, 0x6E, 0x20, 0x31, 0x39, 0x20, 0x32, 0x30, 0x32, 0x33, 0x31, 0x34, 0x3A, 0x34,
     0x37, 0x3A, 0x33, 0x34, 0x03, 0x00, 0x44, 0x00, 0x08, 0x02, 0x00, 0x01, 0x36, 0x00, 0x00, 0x01,
     0xC1, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x99, 0x09, 0x00, 0x00,
     0x14, 0x00, 0x00, 0x00, 0x0B, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
-/// The pairing reply (report `0x09`) for wire pad `pad`: [`DS_FEATURE_PAIRING`] with the MAC's low
-/// octet offset by the pad index. The MAC must be **unique per pad**: `hid-playstation` adopts it
-/// as the HID `uniq` (replacing whatever uniq the device was created with), and SDL/Steam dedup
-/// controllers by that serial — with identical MACs a second virtual pad reads as the *first* pad
-/// re-appearing over another transport and is merged/ignored.
+/// Pairing reply (`0x09`) for pad `pad`: [`DS_FEATURE_PAIRING`] with the MAC low octet offset
+/// by the pad index. hid-playstation adopts the MAC as HID `uniq`; SDL/Steam dedup by that
+/// serial, so identical MACs merge two virtual pads into one.
 pub fn ds_pairing_reply(pad: u8) -> [u8; 20] {
     let mut r = [0u8; 20];
     r.copy_from_slice(DS_FEATURE_PAIRING);
@@ -63,8 +49,7 @@ pub fn ds_pairing_reply(pad: u8) -> [u8; 20] {
     r
 }
 
-/// Sony DualSense USB HID report descriptor (273 bytes), verbatim from inputtino — the exact
-/// descriptor `hid-playstation` (Linux) / `hidclass` (Windows) parses to bind a DualSense.
+/// USB DualSense HID report descriptor (273 bytes). `hid-playstation` / `hidclass` bind on this.
 #[rustfmt::skip]
 pub const DUALSENSE_RDESC: &[u8] = &[
     0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35,
@@ -87,13 +72,9 @@ pub const DUALSENSE_RDESC: &[u8] = &[
     0xC0,
 ];
 
-/// Sony DualSense **Edge** USB HID report descriptor (389 bytes) — a verbatim real-device
-/// capture (hid-recorder, hhd-dev/hwinfo `devices/ds5_edge`, cross-checked byte-for-byte against
-/// the raw usbmon pcap in the same repo and the descriptor Handheld Daemon ships for ITS virtual
-/// UHID Edge). vs the plain DS5 descriptor: output report `0x02` grows 47→63 bytes, feature
-/// `0xF2` 15→52, and 19 vendor feature reports (`0x60..=0x7B`, the Edge profile slots) are
-/// appended — input report `0x01` is bit-identical (the Edge's Fn/back buttons ride previously
-/// reserved bits of `buttons[2]`, see [`btn2`]).
+/// DualSense Edge USB HID report descriptor (389 bytes). Versus [`DUALSENSE_RDESC`]: output
+/// `0x02` is 47→63 bytes, feature `0xF2` 15→52, and profile slots `0x60..=0x7B` are appended.
+/// Input `0x01` is bit-identical; Edge Fn/back bits ride reserved `buttons[2]` (see [`btn2`]).
 #[rustfmt::skip]
 pub const DUALSENSE_EDGE_RDESC: &[u8] = &[
     0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35,
@@ -123,16 +104,16 @@ pub const DUALSENSE_EDGE_RDESC: &[u8] = &[
     0x09, 0x53, 0xB1, 0x02, 0xC0,
 ];
 
-pub const DS_VENDOR: u32 = 0x054C; // Sony Interactive Entertainment
-pub const DS_PRODUCT: u32 = 0x0CE6; // DualSense Wireless Controller
-pub const DS_EDGE_PRODUCT: u32 = 0x0DF2; // DualSense Edge Wireless Controller
-/// USB input report `0x01` is 64 bytes total (report id + 63-byte body).
+pub const DS_VENDOR: u32 = 0x054C;
+pub const DS_PRODUCT: u32 = 0x0CE6;
+pub const DS_EDGE_PRODUCT: u32 = 0x0DF2;
+/// Report `0x01` is id + 63-byte body.
 pub const DS_INPUT_REPORT_LEN: usize = 64;
-/// The DualSense touchpad's reported resolution (the kernel exposes it as ABS_MT 0..1920/1080).
+/// Touchpad extents the kernel advertises as ABS_MT (0..=W-1 / 0..=H-1).
 pub const DS_TOUCH_W: u16 = 1920;
 pub const DS_TOUCH_H: u16 = 1080;
 
-/// Bit positions inside the DualSense face/dpad button byte (`buttons[0]`, low nibble = hat).
+/// `buttons[0]`: face bits; low nibble is the hat (filled in `serialize_state`).
 pub mod btn0 {
     pub const SQUARE: u8 = 0x10;
     pub const CROSS: u8 = 0x20;
@@ -150,31 +131,22 @@ pub mod btn1 {
     pub const L3: u8 = 0x40;
     pub const R3: u8 = 0x80;
 }
-/// `buttons[2]`: PS, touchpad click, mute — plus, on the DualSense **Edge**, the two Fn and two
-/// back buttons in bits 4–7 (kernel `DS_EDGE_BUTTONS_*` / SDL `SDL_GAMEPAD_BUTTON_PS5_*`; the
-/// plain DS5 leaves those bits reserved). The kernel maps them to `BTN_TRIGGER_HAPPY1..4`
-/// (Fn-L, Fn-R, back-L, back-R) since 7.2; SDL/Steam read them off hidraw on any kernel.
+/// `buttons[2]`: PS, touchpad click, mute. Edge Fn/back occupy bits 4–7 (`DS_EDGE_BUTTONS_*` /
+/// SDL `SDL_GAMEPAD_BUTTON_PS5_*`); plain DS5 leaves those reserved. Kernel: `BTN_TRIGGER_HAPPY1..4`.
 pub mod btn2 {
     pub const PS: u8 = 0x01;
     pub const TOUCHPAD: u8 = 0x02;
-    /// Mic-mute / capture button — set from the wire `BTN_MISC1` in `DsState::from_gamepad`.
+    /// Mic-mute / capture — set from wire `BTN_MISC1` in `DsState::from_gamepad`.
     pub const MUTE: u8 = 0x04;
-    /// Edge left Fn button (below the left stick).
     pub const EDGE_FN_LEFT: u8 = 0x10;
-    /// Edge right Fn button.
     pub const EDGE_FN_RIGHT: u8 = 0x20;
-    /// Edge left back button (rear paddle).
     pub const EDGE_BACK_LEFT: u8 = 0x40;
-    /// Edge right back button (rear paddle).
     pub const EDGE_BACK_RIGHT: u8 = 0x80;
 }
 
-/// Map the wire back-grip bits onto the DualSense Edge's `buttons[2]` bits — the reason the Edge
-/// backend exists: all four client paddles (Deck grips L4/L5/R4/R5, Elite P1–P4) land on native
-/// slots instead of the fold/drop policy. Wire PADDLE1/2 = R4/L4 (the primary pair, Steam
-/// convention) → the Edge's right/left BACK buttons; PADDLE3/4 = R5/L5 → the right/left Fn
-/// buttons (real-HW Fn is profile-switch chrome, but on a virtual pad the bits reach consumers
-/// as ordinary buttons — kernel `BTN_TRIGGER_HAPPY1/2`, SDL `LEFT/RIGHT_FUNCTION`).
+/// Wire paddles → Edge `buttons[2]`: PADDLE1/2 (R4/L4, Steam primary pair) → BACK right/left;
+/// PADDLE3/4 (R5/L5) → Fn right/left. Lands on kernel `BTN_TRIGGER_HAPPY1..4` / SDL function
+/// buttons instead of the fold/drop policy used on a plain DualSense.
 pub fn edge_paddle_bits(buttons: u32) -> u8 {
     use punktfunk_core::input::gamepad as gs;
     let mut b = 0;
@@ -193,18 +165,15 @@ pub fn edge_paddle_bits(buttons: u32) -> u8 {
     b
 }
 
-/// One touchpad contact for the report.
 #[derive(Clone, Copy, Default)]
 pub struct Touch {
     pub active: bool,
     pub id: u8,
-    pub x: u16, // 0..DS_TOUCH_W
-    pub y: u16, // 0..DS_TOUCH_H
+    pub x: u16, // 0..=DS_TOUCH_W-1
+    pub y: u16, // 0..=DS_TOUCH_H-1
 }
 
-/// Full DualSense controller state to serialize into report `0x01`. Sticks/triggers are 8-bit
-/// (`0x80` neutral for sticks, `0x00` released for triggers); `dpad` is the 8-way hat (`8` =
-/// centered); `buttons[0..3]` are the packed DualSense button bytes; gyro/accel are raw i16.
+/// DualSense report-`0x01` state. Neutral stick is `0x80`; released trigger is `0x00`; hat `8` is centered.
 #[derive(Clone, Copy, Default)]
 pub struct DsState {
     pub lx: u8,
@@ -218,24 +187,15 @@ pub struct DsState {
     pub gyro: [i16; 3],
     pub accel: [i16; 3],
     pub touch: [Touch; 2],
-    /// Per-contact-slot click state from the rich plane (`TouchpadEx.click` — a Steam pad's
-    /// physical pad-click). The serializers OR any held slot into the touchpad-click button
-    /// bit: the DualSense has ONE clickable pad, so either Deck pad clicking counts. Lives
-    /// outside `buttons` because `from_gamepad` rebuilds those from every button frame —
-    /// managers must persist this across rebuilds like `touch`/`gyro`/`accel`.
+    /// Rich-plane pad-click per contact (`TouchpadEx.click`). Serializers OR any slot into the
+    /// one DualSense click bit. Lives outside `buttons`: `from_gamepad` rebuilds those every
+    /// frame, so managers must persist this with `touch`/`gyro`/`accel`.
     pub touch_click: [bool; 2],
 }
 
 impl DsState {
-    /// A centered, nothing-pressed state (sticks 0x80, dpad neutral) — and, crucially, a pad that
-    /// is sitting STILL rather than falling.
-    ///
-    /// Acceleration is 1 g up ([`gs::MOTION_NEUTRAL_ACCEL`]), not zero. `[0, 0, 0]` reads as free
-    /// fall to anything that interprets the accelerometer, which is a definite lie about the
-    /// physical world; a pad that has sent no motion yet — or has none at all — is on a desk or in
-    /// someone's hands, and both read 1 g up. This is what `switch_proto`'s neutral has always done
-    /// on its own up axis, and the DualSense family now does on the axis a real DualSense was
-    /// measured to use. The DS4 reuses this state, so it is covered by the same line.
+    /// Centered, nothing pressed (sticks `0x80`, hat 8). Accel is 1 g up
+    /// ([`gs::MOTION_NEUTRAL_ACCEL`]), not `[0, 0, 0]` — zero reads as free-fall.
     pub fn neutral() -> DsState {
         DsState {
             lx: 0x80,
@@ -248,18 +208,16 @@ impl DsState {
         }
     }
 
-    /// Zero angular velocity, keeping acceleration (gravity is legitimately persistent) and
-    /// everything else. Returns whether anything changed — the host's idle-motion watchdog,
-    /// `PadProto::neutralize_gyro`.
+    /// Zero gyro only (gravity on accel is persistent). Returns whether it changed —
+    /// `PadProto::neutralize_gyro` idle-motion watchdog.
     pub fn neutralize_gyro(&mut self) -> bool {
         let changed = self.gyro != [0; 3];
         self.gyro = [0; 3];
         changed
     }
 
-    /// Reset the rich-plane fields — touch contacts, pad clicks, motion — to a fresh pad's,
-    /// leaving buttons/sticks/triggers alone. `PadProto::clear_rich`: a controller that took over
-    /// this slot inside the replug grace must not inherit the last one's finger or rotation.
+    /// Reset touch, pad-click, and motion; leave buttons/sticks/triggers. `PadProto::clear_rich`:
+    /// a pad that takes this slot during replug grace must not inherit the last one's contacts.
     pub fn clear_rich(&mut self) {
         let fresh = DsState::neutral();
         self.touch = fresh.touch;
@@ -268,10 +226,8 @@ impl DsState {
         self.accel = fresh.accel;
     }
 
-    /// Map a GameStream/XInput pad frame (button bitmask + i16 sticks + u8 triggers) into the
-    /// DualSense report fields. Sticks are recentred to `0x80`; the Y axes are inverted (XInput
-    /// `+y = up`, DualSense `0 = up`). Triggers double as the L2/R2 buttons when pressed. Touchpad
-    /// + motion are filled separately from rich-input events.
+    /// GameStream/XInput frame → DualSense fields. Invert Y in i16 (XInput `+y` is up, DualSense
+    /// `0` is up) before the 8-bit quantise. Touch and motion come from rich-input, not this frame.
     pub fn from_gamepad(
         buttons: u32,
         lx: i16,
@@ -284,14 +240,9 @@ impl DsState {
         use punktfunk_core::input::gamepad as gs;
         let to_u8 = |v: i16| (((v as i32) + 32768) >> 8) as u8;
         let on = |bit: u32| buttons & bit != 0;
-        // Invert in i16 space, BEFORE the quantisation, rather than as `255 - to_u8(v)`.
-        // 0..=255 has no exact midpoint: `to_u8` puts centre at 0x80, which leaves 128 codes below
-        // it and 127 above, so mirroring the *output* (`255 - 0x80` = 0x7F) lands a centred stick
-        // one LSB off the 0x80 that `DsState::neutral` — and the pad's own resting report — use.
-        // Games idle-poll a centred stick constantly, so that off-by-one showed up as a permanent
-        // sub-deadzone tilt on the Y axes only. Negating first maps centre to centre by
-        // construction and keeps both extremes exact (+32767 → 0, -32768 → 255); the only cost is
-        // that i16::MIN and -32767 share the 255 code, one LSB at the very end of the travel.
+        // Invert in i16, then quantise. `255 - to_u8(v)` is wrong: 0..=255 has no midpoint, so
+        // `255 - 0x80` = 0x7F and a centred stick sits one LSB off `DsState::neutral`. Cost:
+        // i16::MIN and -32767 share 255.
         let mut s = DsState {
             lx: to_u8(lx),
             ly: to_u8(ly.saturating_neg()),
@@ -320,7 +271,7 @@ impl DsState {
         if on(gs::BTN_Y) {
             b0 |= btn0::TRIANGLE;
         }
-        s.buttons[0] = b0; // face buttons (high nibble); dpad merged in write_state
+        s.buttons[0] = b0; // face high nibble; serialize_state ORs the hat into the low nibble
         let mut b1 = 0;
         if on(gs::BTN_LB) {
             b1 |= btn1::L1;
@@ -353,16 +304,13 @@ impl DsState {
         if on(gs::BTN_TOUCHPAD) {
             s.buttons[2] |= btn2::TOUCHPAD;
         }
-        // The mic-mute / capture button (Deck '…' QAM on the Steam path). Clients send it as
-        // BTN_MISC1; without this the DualSense mute button was inert on every PlayStation-family
-        // virtual pad. Rebuilt from the wire bit each frame like PS/TOUCHPAD, so no persistence gap.
+        // BTN_MISC1 → mute. Rebuilt each frame like PS/TOUCHPAD (no persistence slot).
         if on(gs::BTN_MISC1) {
             s.buttons[2] |= btn2::MUTE;
         }
         s
     }
 
-    /// Set the dpad hat from the four GameStream dpad booleans (up/down/left/right).
     pub fn set_dpad(&mut self, up: bool, down: bool, left: bool, right: bool) {
         // DualSense hat: 0=N,1=NE,2=E,3=SE,4=S,5=SW,6=W,7=NW,8=neutral.
         self.dpad = match (up, right, down, left) {
@@ -378,24 +326,14 @@ impl DsState {
         };
     }
 
-    /// Apply one rich client→host event (touchpad contact / motion sample) into this state —
-    /// the ONE mapping shared by every DualSense-family backend (Linux UHID, Windows UMDF,
-    /// DS4 both ways; `touch_w`/`touch_h` are the pad's advertised extents, 1920×1080 vs
-    /// 1920×942).
+    /// One rich event into this state. Shared by every DualSense-family backend; `touch_w`/
+    /// `touch_h` are the advertised extents (1920×1080 vs DS4 1920×942).
     ///
-    /// Wire touch coordinates are screen convention (+x right, +y down) — same as the
-    /// DualSense pad's own (top-left origin), so no flip here.
-    ///
-    /// A Steam Deck / Steam Controller client sends TWO pads as `TouchpadEx` surfaces; the
-    /// DualSense has one pad with two contact slots, so the surfaces SPLIT it — left pad →
-    /// contact 0 on the left half, right pad → contact 1 on the right half. That mirrors the
-    /// physical thumb layout and lands exactly on the split-pad zones games and Steam Input
-    /// already use for the DS4/DualSense touchpad. Pad clicks ride `touch_click` (the
-    /// serializer ORs them into the touchpad-click button — one clickable pad, either
-    /// surface counts); dropping them was the "Deck pad click does nothing on a DualSense
-    /// host" gap.
+    /// Wire touch is screen convention (top-left, +y down), same as the DualSense pad — no flip.
+    /// Steam `TouchpadEx` surfaces split the one DualSense pad: left → contact 0 on the left
+    /// half, right → contact 1 on the right half. Clicks land in [`DsState::touch_click`].
     pub fn apply_rich(&mut self, rich: RichInput, touch_w: u16, touch_h: u16) {
-        // Normalized position → pad extents. The kernel/driver advertises 0..=W-1 / 0..=H-1.
+        // Normalized 0..=u16::MAX → 0..=extent-1 (kernel ABS_MT range).
         let scale = |n: u32, extent: u16| ((n * (extent - 1) as u32) / u16::MAX as u32) as u16;
         match rich {
             RichInput::Touchpad {
@@ -405,8 +343,7 @@ impl DsState {
                 y,
                 ..
             } => {
-                // The DualSense touchpad carries two contacts; clamp to a valid slot and keep
-                // the reported contact id consistent with it (the wire `finger` is untrusted).
+                // Two contacts. Clamp the untrusted wire `finger` and keep contact id = slot.
                 let slot = (finger as usize).min(1);
                 self.touch[slot] = Touch {
                     active,
@@ -452,8 +389,7 @@ impl DsState {
         }
     }
 
-    /// `buttons[2]` as serialized: the live button frame plus the touchpad-click bit when a
-    /// rich-plane pad click is held (see [`DsState::touch_click`]).
+    /// `buttons[2]` plus the touchpad-click bit if any [`DsState::touch_click`] slot is held.
     pub fn buttons2_with_click(&self) -> u8 {
         let mut b = self.buttons[2];
         if self.touch_click.iter().any(|c| *c) {
@@ -463,13 +399,11 @@ impl DsState {
     }
 }
 
-/// Serialize a full input report `0x01` (pure — unit-testable without a transport). Field
-/// offsets per the kernel's `struct dualsense_input_report`, this report's one consumer:
-/// x..rz 0-5, seq 6, buttons[4] 7-10, reserved[4] 11-14, gyro[3] 15-20, accel[3] 21-26,
-/// sensor_timestamp 27-30, reserved2 31, points[2] 32-39 (static_assert(sizeof == 63)).
-/// The report id occupies r[0], so struct offset N = r[N + 1].
+/// Report `0x01`. Offsets match kernel `struct dualsense_input_report` (id at `r[0]`, so
+/// struct offset N is `r[N + 1]`): x..rz 0–5, seq 6, buttons[4] 7–10, reserved[4] 11–14,
+/// gyro[3] 15–20, accel[3] 21–26, sensor_timestamp 27–30, reserved2 31, points[2] 32–39.
 pub fn serialize_state(r: &mut [u8; DS_INPUT_REPORT_LEN], st: &DsState, seq: u8, ts: u32) {
-    r[0] = 0x01; // report id; the struct fields follow (struct offset 0 == r[1])
+    r[0] = 0x01;
     r[1] = st.lx;
     r[2] = st.ly;
     r[3] = st.rx;
@@ -478,9 +412,9 @@ pub fn serialize_state(r: &mut [u8; DS_INPUT_REPORT_LEN], st: &DsState, seq: u8,
     r[6] = st.r2;
     r[7] = seq; // seq_number (struct off 6)
     r[8] = (st.dpad & 0x0F) | (st.buttons[0] & 0xF0); // off 7: dpad + face buttons
-    r[9] = st.buttons[1]; // off 8
-    r[10] = st.buttons2_with_click(); // off 9 (PS/touchpad-click/mute; rich pad clicks OR in)
-    r[11] = st.buttons[3]; // off 10
+    r[9] = st.buttons[1];
+    r[10] = st.buttons2_with_click(); // off 9: PS/touchpad-click/mute; rich pad clicks OR in
+    r[11] = st.buttons[3];
     for (i, v) in st.gyro.iter().enumerate() {
         r[16 + i * 2..18 + i * 2].copy_from_slice(&v.to_le_bytes()); // gyro at struct off 15
     }
@@ -490,10 +424,8 @@ pub fn serialize_state(r: &mut [u8; DS_INPUT_REPORT_LEN], st: &DsState, seq: u8,
     r[28..32].copy_from_slice(&ts.to_le_bytes()); // sensor_timestamp (struct off 27)
     pack_touch(&mut r[33..37], &st.touch[0]); // touch point 1 (struct off 32)
     pack_touch(&mut r[37..41], &st.touch[1]); // touch point 2
-                                              // status byte (struct off 52 → r[53]) — hid-playstation reads battery here: low nibble =
-                                              // capacity (×10+5 %), high nibble = charging state (0 = discharging). A virtual pad has no
-                                              // real cell, so report "discharging, full" (0x0A → 100 %); leaving it 0 makes SteamOS / the
-                                              // kernel see ~5 % and warn "low battery". (We don't forward the client pad's real charge yet.)
+    // Battery at struct off 52 → r[53]: low nibble = capacity (×10+5 %), high = charge state
+    // (0 = discharging). 0x0A = discharging/full (100 %). Zero reads as ~5 % and SteamOS warns.
     r[53] = 0x0A;
 }
 
@@ -507,43 +439,31 @@ fn pack_touch(dst: &mut [u8], t: &Touch) {
     dst[3] = ((y >> 4) & 0xFF) as u8;
 }
 
-/// What one service pass extracted from the device's HID output reports.
-/// Rich feedback (lightbar / player LEDs / adaptive triggers) rides the HID-output plane (0xCD);
-/// motor rumble rides the universal rumble plane (0xCA) so non-DualSense clients still feel it.
+/// One output-report pass. Lightbar / player LEDs / triggers ride HID-output 0xCD; rumble
+/// rides the universal 0xCA plane so a non-DualSense client still feels it.
 #[derive(Default)]
 pub struct DsFeedback {
     pub hidout: Vec<HidOutput>,
-    /// `(low, high)` motor levels, if a report carried them.
-    ///
-    /// This parser widens the device's 8-bit motor bytes by `<< 8`, so the values it produces are
-    /// `0..=0xFF00` in steps of 0x100 — NOT `0..=0xFFFF`, which is what this said before. The
-    /// Windows backend widens the same bytes by `× 257` and does reach 0xFFFF. Both are correct:
-    /// every consumer narrows with `>> 8`, and 0xFF00 and 0xFFFF both narrow back to 255. Do not
-    /// "fix" one to match the other — see [`crate::uhid_manager::PadFeedback::rumble`], which is
-    /// the type that sees both.
+    /// `(low, high)` motor levels when the report carried them. This parser widens 8-bit motors
+    /// by `<< 8` (`0..=0xFF00`). The Windows backend uses `× 257` and reaches `0xFFFF`. Both
+    /// narrow with `>> 8` to 255 — do not "fix" one to match the other
+    /// ([`crate::uhid_manager::PadFeedback::rumble`] sees both).
     pub rumble: Option<(u16, u16)>,
-    /// The driver's output-report ring overflowed this poll — pending reports were DISCARDED and
-    /// feedback state is unknown; the [`UhidManager`](crate::uhid_manager) must resync (silence +
-    /// re-armed dedups). Set by the backend's section drain, never by the parser.
+    /// Output-report ring overflowed this poll: pending reports were discarded and feedback is
+    /// unknown. The [`UhidManager`](crate::uhid_manager) must resync. Set by the backend drain,
+    /// never by this parser.
     pub resync: bool,
 }
 
-/// Field offsets in the DualSense **output** report, as indices into a whole USB report — i.e.
-/// including the leading report id at `[0]`. This is the one place in Rust the layout is written
-/// down; index off these rather than repeating the numbers.
+/// DualSense **output** report field offsets, including the leading report id at `[0]`.
+/// The payload block is shared; the header in front of it is not:
 ///
-/// **The same fields sit at different offsets per transport, and that is not drift.** Every writer
-/// lays out one common block; what changes is how much header precedes it:
+/// - USB (these constants, this parser): base 0, first payload byte `[1]`
+/// - SDL `DS5EffectsState_t` / `pf-client-core` `Ds5Feedback`: base −1, no report id
+/// - Bluetooth report `0x31`: base +2 (id, sequence, magic), CRC32 in the last 4 bytes
 ///
-/// | base | where | first payload byte |
-/// |---|---|---|
-/// | `0`  | USB report, id included — what these constants describe, and what this parser reads | `[1]` |
-/// | `−1` | SDL `DS5EffectsState_t` — a 47-byte payload with NO report id (`pf-client-core`'s `Ds5Feedback`) | `[0]` |
-/// | `+2` | Bluetooth report `0x31` — id, sequence, magic, then the block; CRC32 in the last 4 bytes | `[3]` |
-///
-/// Subtract or add the base to translate. Mirrors that cannot import this module — Kotlin
-/// (`DsDevice.kt`, USB base 0) and Swift (`DualSenseHID.swift`, which handles both the USB and
-/// Bluetooth bases) — carry a pointer back here; keep them in step by hand.
+/// Kotlin (`DsDevice.kt`) and Swift (`DualSenseHID.swift`) cannot import this module —
+/// keep those copies in step by hand.
 pub mod out_report {
     /// `valid_flag0`: BIT0 compat vibration, BIT1 haptics select, BIT2 R2, BIT3 L2.
     pub const VALID_FLAG0: usize = 1;
@@ -567,32 +487,21 @@ pub mod out_report {
     pub const LED_RGB: usize = 45;
 }
 
-/// Parse a DualSense USB output report (`0x02`) into a [`DsFeedback`], indexed off
-/// [`out_report`]. Only the well-understood fields (motor rumble, lightbar RGB, player LEDs) are
-/// surfaced — adaptive-trigger blocks and the audio-control region are forwarded raw for the client.
+/// Parse USB output report `0x02` into [`DsFeedback`], indexed off [`out_report`]. Rumble,
+/// lightbar, and player LEDs are typed; trigger blocks and audio-control are forwarded raw.
 ///
-/// Every field is gated on the report's valid-flags (`valid_flag0` at data[1], `valid_flag1`
-/// at data[2]) — writers only set the bits for fields they mean to change (the rest is zeroed),
-/// so an ungated parse would turn every plain rumble write into a lightbar-off + triggers-off
-/// broadcast.
+/// Gated on valid-flags: writers set only the bits they mean to change and zero the rest, so
+/// an ungated parse would turn a rumble write into lightbar-off + triggers-off.
 pub fn parse_ds_output(pad: u8, data: &[u8], fb: &mut DsFeedback) {
     use out_report as o;
-    // data[0] is the report id (0x02). Be defensive about short reports.
     if data.first() != Some(&0x02) || data.len() < 48 {
         return;
     }
-    let flag0 = data[o::VALID_FLAG0]; // BIT0 compat vibration, BIT1 haptics select, BIT2 R2, BIT3 L2
-    let flag1 = data[o::VALID_FLAG1]; // BIT2 lightbar, BIT4 player indicators
-                                      // Motor rumble: high-frequency (small/right) motor first, low-frequency (big/left) second.
-                                      // Widened 0..255 → 0..0xFF00 by `<< 8` (NOT 0xFFFF — see `DsFeedback::rumble`), same
-                                      // (low, high) convention as the uinput pad's mixer, and routed to the 0xCA plane.
-                                      // Writers on firmware ≥ 2.24 signal rumble via COMPATIBLE_VIBRATION2 in valid_flag2
-                                      // instead of flag0 BIT0. Our feature report advertises a version above 2.24
-                                      // (DS_FEATURE_FIRMWARE bytes 44..46, chosen to keep Sony's updater quiet), so the
-                                      // kernel and SDL write the v2 flag — while older writers, and any that never read the
-                                      // version, stay on flag0. Both conventions must land here: a rumble dropped on either
-                                      // — including stops — is silently ignored, and a missed stop buzzes for the rest of
-                                      // the session (the 500 ms refresh re-sends stale state forever).
+    let flag0 = data[o::VALID_FLAG0];
+    let flag1 = data[o::VALID_FLAG1];
+    // Rumble on flag0 BIT0/BIT1 or valid_flag2 COMPATIBLE_VIBRATION2 (fw ≥ 2.24). Both must
+    // land: a dropped stop is silent here and the 500 ms refresh then re-sends stale motors.
+    // Widen `<< 8` to 0..=0xFF00 (see `DsFeedback::rumble`); (low, high) = (left, right).
     if flag0 & 0x03 != 0 || data[o::VALID_FLAG2] & 0x04 != 0 {
         let high = (data[o::MOTOR_RIGHT] as u16) << 8;
         let low = (data[o::MOTOR_LEFT] as u16) << 8;
@@ -608,8 +517,7 @@ pub fn parse_ds_output(pad: u8, data: &[u8], fb: &mut DsFeedback) {
             bits: data[o::PLAYER_LEDS] & 0x1F,
         });
     }
-    // The RIGHT trigger block comes FIRST in the report — per SDL's DS5EffectsState_t /
-    // inputtino's ps5.hpp. Wire convention: which 0 = L2, 1 = R2.
+    // Right trigger block first (SDL `DS5EffectsState_t` / inputtino). Wire `which`: 0 = L2, 1 = R2.
     if data.len() >= o::LEFT_TRIGGER + o::TRIGGER_LEN {
         if flag0 & 0x04 != 0 {
             fb.hidout.push(HidOutput::Trigger {
@@ -626,12 +534,9 @@ pub fn parse_ds_output(pad: u8, data: &[u8], fb: &mut DsFeedback) {
             });
         }
     }
-    // The audio-control region (bytes 5..=10: headphone/speaker/mic volumes + routing), for the
-    // pad-audio path. The wire flags condense the report's audio bits: bit0 = haptics-select
-    // (flag0 BIT1 — set on every SDL rumble write too, which is why it alone never triggers an
-    // emission), bits1..4 = flag0 bits 4..7 (the audio-valid flags gating the region). Emitted
-    // whenever an audio-valid flag is present or the region carries data; downstream dedup
-    // ([`crate::hidout_dedup`]) reduces the per-report repeats to genuine changes.
+    // Audio region bytes 5..=10. Flags: bit0 = haptics-select (flag0 BIT1, also set on every
+    // SDL rumble — so it alone must not emit), bits1..4 = flag0 bits 4..7. Emit if an
+    // audio-valid bit is set or the region is non-zero; [`crate::hidout_dedup`] collapses repeats.
     let raw: [u8; 6] = data[5..11].try_into().unwrap();
     if flag0 & 0xF0 != 0 || raw != [0u8; 6] {
         let flags = ((flag0 >> 1) & 0x01) | ((flag0 >> 3) & 0x1E);
@@ -647,16 +552,8 @@ pub fn parse_ds_output(pad: u8, data: &[u8], fb: &mut DsFeedback) {
 mod tests {
     use super::*;
 
-    /// **Every feature report must be exactly the size the driver asks for.**
-    ///
-    /// `hid-playstation` requests these by fixed size (`DS_FEATURE_REPORT_*_SIZE`), and on a *USB*
-    /// backend a reply longer than the request is fatal to the whole transport, not to the URB:
-    /// `usbip_recv_xbuff()` sees `actual_length > transfer_buffer_length`, calls it a malicious
-    /// packet, and raises `VDEV_EVENT_ERROR_TCP`, which disconnects the device. Calibration was
-    /// 42 bytes against a 41-byte request until 2026-08-17 and killed the usbip pad outright —
-    /// invisibly on uhid and on Windows, because hidraw and `hidclass` both truncate.
-    ///
-    /// Sizes are `hid-playstation`'s own constants: calibration 41, pairing 20, firmware 64.
+    /// Feature blobs match hid-playstation request sizes: calibration 41, pairing 20, firmware 64.
+    /// A USB backend rejects a longer reply as a malicious URB and tears down the device.
     #[test]
     fn feature_reports_are_exactly_the_size_the_driver_requests() {
         assert_eq!(
@@ -668,16 +565,14 @@ mod tests {
         assert_eq!(DS_FEATURE_FIRMWARE.len(), 64, "firmware (report 0x20)");
         assert_eq!(ds_pairing_reply(0).len(), 20, "pairing reply");
 
-        // The first byte of a feature report is its id; a wrong one is answered to the wrong query.
+        // Report id is byte 0; a wrong id is answered to the wrong GET_REPORT.
         assert_eq!(DS_FEATURE_CALIBRATION[0], 0x05);
         assert_eq!(DS_FEATURE_PAIRING[0], 0x09);
         assert_eq!(DS_FEATURE_FIRMWARE[0], 0x20);
     }
 
-    /// The Steam dual-pad → DualSense touchpad SPLIT: left pad (surface 1) lands contact 0
-    /// on the left half, right pad (surface 2) contact 1 on the right half; y follows the
-    /// shared screen convention (top → 0) with no flip; pad clicks set the touchpad-click
-    /// button bit in the serialized report.
+    /// Steam surfaces split the DualSense pad: left → contact 0 / left half, right → contact 1
+    /// / right half; y is screen-top = 0 (no flip); a pad click sets the serialized click bit.
     #[test]
     fn steam_surfaces_split_the_touchpad() {
         let mut s = DsState::neutral();
@@ -719,13 +614,11 @@ mod tests {
         assert_eq!(s.touch[1].id, 1);
         assert_eq!(s.touch[1].x, DS_TOUCH_W - 1);
         assert_eq!(s.touch[1].y, 0);
-        // The right pad's click reaches the (single) touchpad-click button bit.
         assert!(s.touch_click[1]);
         assert_eq!(s.buttons2_with_click() & btn2::TOUCHPAD, btn2::TOUCHPAD);
         let mut r = [0u8; DS_INPUT_REPORT_LEN];
         serialize_state(&mut r, &s, 0, 0);
         assert_eq!(r[10] & btn2::TOUCHPAD, btn2::TOUCHPAD);
-        // Releasing the click clears the bit again.
         s.apply_rich(
             RichInput::TouchpadEx {
                 pad: 0,
@@ -743,8 +636,6 @@ mod tests {
         assert_eq!(s.buttons2_with_click() & btn2::TOUCHPAD, 0);
     }
 
-    /// The single-surface forms keep their full-pad mapping: unsigned `Touchpad` and
-    /// `TouchpadEx` surface 0 both span the whole touchpad, slot picked by finger.
     #[test]
     fn single_surface_spans_full_pad() {
         let mut s = DsState::neutral();
@@ -795,23 +686,22 @@ mod tests {
         assert_eq!(s.accel, [-1000, 2000, -3000]);
     }
 
-    /// A DualSense USB output report (`0x02`) with all valid-flags set parses into motor
-    /// rumble (0xCA), lightbar, player LEDs, and both adaptive-trigger blocks (0xCD) — with
-    /// the report's right-trigger-first layout mapped onto the wire's `which` (0 = L2).
+    /// Full valid-flags `0x02` → rumble, lightbar, player LEDs, both trigger blocks.
+    /// Report right-trigger-first maps to wire `which` 0 = L2, 1 = R2.
     #[test]
     fn parse_output_report() {
         let mut data = vec![0u8; 48];
-        data[0] = 0x02; // report id
-        data[1] = 0x0F; // valid_flag0: vibration + haptics + R2 + L2 triggers
+        data[0] = 0x02;
+        data[1] = 0x0F; // valid_flag0: vibration + haptics + R2 + L2
         data[2] = 0x14; // valid_flag1: lightbar + player indicators
         data[3] = 0x80; // right (high-freq) motor
         data[4] = 0x40; // left (low-freq) motor
-        data[11] = 0x21; // right-trigger block mode byte (report bytes 11..22)
-        data[22] = 0x26; // left-trigger block mode byte (report bytes 22..33)
-        data[44] = 0x03; // player LEDs (low 5 bits)
-        data[45] = 10; // R
-        data[46] = 20; // G
-        data[47] = 30; // B
+        data[11] = 0x21; // right-trigger mode
+        data[22] = 0x26; // left-trigger mode
+        data[44] = 0x03; // player LEDs
+        data[45] = 10;
+        data[46] = 20;
+        data[47] = 30;
         let mut fb = DsFeedback::default();
         parse_ds_output(0, &data, &mut fb);
         // (low, high) = (left<<8, right<<8).
@@ -837,12 +727,9 @@ mod tests {
         assert_eq!(triggers, vec![(1, 0x21), (0, 0x26)]);
     }
 
-    /// Writers set only the valid-flag bits for the fields they mean to change (the rest of the
-    /// report is zeroed) — a plain rumble write must NOT blank the lightbar / player LEDs /
-    /// triggers, and an LED-only write must not stop the motors.
+    /// Valid-flags gate: rumble-only must not emit hidout; LED-only must not surface rumble.
     #[test]
     fn parse_output_respects_valid_flags() {
-        // Rumble write: only the vibration flags set, everything else zero.
         let mut data = vec![0u8; 48];
         data[0] = 0x02;
         data[1] = 0x03; // compatible vibration + haptics select
@@ -853,7 +740,7 @@ mod tests {
         assert_eq!(fb.rumble, Some((0xFF00, 0xFF00)));
         assert!(fb.hidout.is_empty(), "rumble write must not emit hidout");
 
-        // Lightbar-only write: no rumble surfaced (would otherwise spam rumble-stops).
+        // Lightbar-only: no rumble (would otherwise spam rumble-stops).
         let mut data = vec![0u8; 48];
         data[0] = 0x02;
         data[2] = 0x04; // lightbar control enable
@@ -864,10 +751,9 @@ mod tests {
         assert_eq!(fb.hidout.len(), 1);
         assert!(matches!(fb.hidout[0], HidOutput::Led { r: 1, .. }));
 
-        // An explicit stop — vibration flag SET, motors zero — parses as `Some((0, 0))`, never as
-        // absence: this is what distinguishes "the game stopped the motors" from "this report says
-        // nothing about rumble", and what `rumble_drove` (the abandoned-rumble watchdog's activity
-        // signal) keys on.
+        // Vibration flag set, motors zero → `Some((0, 0))`, not absence. Distinguishes "game
+        // stopped the motors" from "this report says nothing about rumble"; `rumble_drove`
+        // keys on that.
         let mut data = vec![0u8; 48];
         data[0] = 0x02;
         data[1] = 0x03; // compatible vibration + haptics select
@@ -876,10 +762,8 @@ mod tests {
         assert_eq!(fb.rumble, Some((0, 0)));
     }
 
-    /// The input report's sensor/touch bytes must land exactly where the kernel's
-    /// `struct dualsense_input_report` reads them (gyro at struct offset 15, accel 21,
-    /// timestamp 27, touch points 32 — report byte = struct offset + 1). A one-byte slip
-    /// here turns client motion into noise and conjures phantom touch contacts.
+    /// Sensor/touch bytes match `struct dualsense_input_report` (gyro 15, accel 21, timestamp
+    /// 27, touch 32; report byte = struct offset + 1). A one-byte slip is noise / phantom touch.
     #[test]
     fn input_report_layout_matches_hid_playstation() {
         let mut st = DsState::neutral();
@@ -899,21 +783,18 @@ mod tests {
         assert_eq!(&r[16..22], &[0x22, 0x11, 0x44, 0x33, 0x66, 0x55]); // gyro LE
         assert_eq!(&r[22..28], &[0x78, 0x07, 0x9A, 0x09, 0xBC, 0x0B]); // accel LE
         assert_eq!(&r[28..32], &[0xDD, 0xCC, 0xBB, 0xAA]); // sensor_timestamp LE
-                                                           // Touch point 1 at struct off 32 = r[33..37]: contact byte (active → bit7 clear),
-                                                           // then 12-bit x / 12-bit y packed.
+        // Touch point 1 at struct off 32 = r[33..37]: contact byte (active → bit7 clear),
+        // then 12-bit x / 12-bit y packed.
         assert_eq!(r[33], 5);
         assert_eq!(r[34], 0x23);
         assert_eq!(r[35], 0x61); // x_hi nibble 0x1 | (y & 0xF) << 4 (y=0x356 → 0x6 << 4)
         assert_eq!(r[36], 0x35); // y >> 4
         assert_eq!(r[37] & 0x80, 0x80); // touch point 2 inactive
-                                        // status byte (struct off 52): discharging (high nibble 0) + full capacity (low nibble
-                                        // 0xA → 100 %), so SteamOS/hid-playstation never reports a false "low battery".
-        assert_eq!(r[53], 0x0A);
+        assert_eq!(r[53], 0x0A); // discharging + full (100 %), not the ~5 % zero reads as
     }
 
-    /// A centred stick must encode as the pad's own neutral on BOTH axes. Inverting the quantised
-    /// byte (`255 - v`) put Y one LSB below it, which games idle-poll constantly — a permanent
-    /// sub-deadzone tilt. Extremes must stay exact either way.
+    /// Centre encodes as `DsState::neutral` on both axes. `255 - v` after quantise puts Y at
+    /// 0x7F; invert in i16 first. Extremes stay exact.
     #[test]
     fn centred_sticks_encode_as_neutral_on_every_axis() {
         let n = DsState::neutral();
@@ -927,31 +808,26 @@ mod tests {
         let down = DsState::from_gamepad(0, 0, i16::MIN, 0, i16::MIN, 0, 0);
         assert_eq!((down.ly, down.ry), (255, 255), "full down = 255");
 
-        // X keeps its existing mapping.
         let right = DsState::from_gamepad(0, i16::MAX, 0, i16::MAX, 0, 0, 0);
         assert_eq!((right.lx, right.rx), (255, 255));
         let left = DsState::from_gamepad(0, i16::MIN, 0, i16::MIN, 0, 0, 0);
         assert_eq!((left.lx, left.rx), (0, 0));
     }
 
-    /// The wire touchpad-click / guide / mute bits (Moonlight's extended positions) land in
-    /// `buttons[2]`.
+    /// Wire touchpad-click / guide / mute land in `buttons[2]`.
     #[test]
     fn from_gamepad_maps_touchpad_click() {
         use punktfunk_core::input::gamepad as gs;
         let s = DsState::from_gamepad(gs::BTN_TOUCHPAD | gs::BTN_GUIDE, 0, 0, 0, 0, 0, 0);
         assert_eq!(s.buttons[2], btn2::PS | btn2::TOUCHPAD);
-        // BTN_MISC1 → the mic-mute / capture button (G6: was previously dropped entirely).
         let s = DsState::from_gamepad(gs::BTN_MISC1, 0, 0, 0, 0, 0, 0);
         assert_eq!(s.buttons[2], btn2::MUTE);
         let s = DsState::from_gamepad(gs::BTN_A, 0, 0, 0, 0, 0, 0);
         assert_eq!(s.buttons[2], 0);
     }
 
-    /// The Edge paddle map, pinned against hid-playstation's `DS_EDGE_BUTTONS_*` masks (bits
-    /// 4–7 of `buttons[2]`) and SDL's `SDL_GAMEPAD_BUTTON_PS5_*` (same byte off hidraw):
-    /// PADDLE1/2 (R4/L4) → right/left BACK, PADDLE3/4 (R5/L5) → right/left Fn — and the mapped
-    /// bits land in the serialized report's byte 10 next to the ordinary buttons[2] bits.
+    /// PADDLE1/2 (R4/L4) → BACK right/left, PADDLE3/4 (R5/L5) → Fn right/left
+    /// (`DS_EDGE_BUTTONS_*` / `SDL_GAMEPAD_BUTTON_PS5_*`). Serialized at report byte 10.
     #[test]
     fn edge_paddles_map_to_native_bits() {
         use punktfunk_core::input::gamepad as gs;
@@ -968,8 +844,7 @@ mod tests {
         // All four + a non-paddle bit: paddles map, the rest is ignored here.
         let all = gs::BTN_PADDLE1 | gs::BTN_PADDLE2 | gs::BTN_PADDLE3 | gs::BTN_PADDLE4 | gs::BTN_A;
         assert_eq!(edge_paddle_bits(all), 0xF0);
-        // Serialized: the Edge merge ORs into buttons[2]; byte 10 carries both the paddles and
-        // the ordinary bits (e.g. a simultaneous PS press).
+        // Merge ORs into buttons[2]; byte 10 carries paddles and PS together.
         let mut s = DsState::from_gamepad(gs::BTN_GUIDE, 0, 0, 0, 0, 0, 0);
         s.buttons[2] |= edge_paddle_bits(gs::BTN_PADDLE2 | gs::BTN_PADDLE3);
         let mut r = [0u8; DS_INPUT_REPORT_LEN];
@@ -977,26 +852,21 @@ mod tests {
         assert_eq!(r[10], btn2::PS | btn2::EDGE_BACK_LEFT | btn2::EDGE_FN_RIGHT);
     }
 
-    /// The Edge descriptor is the real-device capture: exact length, the three deltas vs the
-    /// plain DS5 descriptor (output 0x02 count 63, feature 0xF2 count 52, the appended profile
-    /// feature reports), and an unchanged input-report prefix (report 0x01 is bit-identical —
-    /// the serializer needs no Edge variant).
+    /// Edge descriptor length and the three deltas vs [`DUALSENSE_RDESC`]: output `0x02` count
+    /// 63, feature `0xF2` count 52, appended profile reports. Input `0x01` prefix is identical.
     #[test]
     fn edge_descriptor_shape() {
         assert_eq!(DUALSENSE_RDESC.len(), 273);
         assert_eq!(DUALSENSE_EDGE_RDESC.len(), 389);
-        // Identical through the input-report + output-report-id prefix; the first delta is the
-        // output report 0x02's Report Count at offset 109 (47 → 63 bytes of payload).
+        // First delta: output `0x02` Report Count at offset 109 (47 → 63 payload bytes).
         assert_eq!(DUALSENSE_EDGE_RDESC[..109], DUALSENSE_RDESC[..109]);
         assert_eq!(DUALSENSE_RDESC[109], 0x2F);
         assert_eq!(DUALSENSE_EDGE_RDESC[109], 0x3F);
         assert_eq!(*DUALSENSE_EDGE_RDESC.last().unwrap(), 0xC0);
     }
 
-    /// A 0x02 report driving the pad's audio (haptics-select + audio-valid flags + the volume/
-    /// routing bytes) surfaces an `AudioCtl` with the exact raw region and the condensed flags;
-    /// a plain rumble write (haptics-select but a silent audio region — every SDL rumble) does
-    /// NOT — that is what `parse_output_respects_valid_flags` pins with its `hidout.is_empty()`.
+    /// Audio-valid flags + volume bytes surface `AudioCtl` with condensed flags. A non-zero
+    /// region with no audio-valid bits still surfaces (dedup collapses repeats).
     #[test]
     fn parse_output_surfaces_audio_ctl() {
         let mut data = vec![0u8; 48];
@@ -1017,9 +887,8 @@ mod tests {
                 raw: [0x50, 0x60, 0x70, 0x05, 0x00, 0x00],
             }]
         );
-        // A non-zero audio region with NO audio-valid flags still surfaces (dedup collapses the
-        // repeats downstream) — some writers leave stale volumes gated off; the host side wants
-        // the honest bytes either way.
+        // Non-zero audio region, no audio-valid flags: still surface. Writers leave stale
+        // volumes gated off; the host wants the bytes. Dedup collapses repeats.
         let mut data = vec![0u8; 48];
         data[0] = 0x02;
         data[9] = 0x01;
@@ -1035,24 +904,22 @@ mod tests {
         );
     }
 
-    /// A short / wrong-id report yields nothing.
     #[test]
     fn parse_output_rejects_garbage() {
         let mut fb = DsFeedback::default();
-        parse_ds_output(0, &[0x01, 0, 0], &mut fb); // wrong report id, too short
+        parse_ds_output(0, &[0x01, 0, 0], &mut fb);
         assert!(fb.rumble.is_none());
         assert!(fb.hidout.is_empty());
     }
 
-    /// The pairing reply keeps the report id and differs across pads ONLY in the MAC low octet —
-    /// distinct serials so SDL/Steam never dedup two virtual pads into one controller.
+    /// Pairing replies keep report id `0x09` and differ only in the MAC low octet (SDL/Steam uniq).
     #[test]
     fn pairing_reply_mac_is_per_pad() {
         assert_eq!(ds_pairing_reply(0).as_slice(), DS_FEATURE_PAIRING);
         let (a, b) = (ds_pairing_reply(1), ds_pairing_reply(2));
-        assert_eq!(a[0], 0x09); // report id untouched
+        assert_eq!(a[0], 0x09);
         assert_eq!(a[1], DS_FEATURE_PAIRING[1].wrapping_add(1));
         assert_eq!(b[1], DS_FEATURE_PAIRING[1].wrapping_add(2));
-        assert_eq!(a[2..], b[2..]); // everything but the low octet identical
+        assert_eq!(a[2..], b[2..]);
     }
 }

@@ -1,25 +1,13 @@
-//! `audio-probe` devtest — the spike measurements behind the Windows audio-substrate decision
-//! (punktfunk-planning `design/windows-audio-endpoints-and-vbcable.md` §3), runnable over ssh
-//! with no game and no client:
+//! Devtest for the Windows audio substrate: mint Steam Streaming endpoints, prove a
+//! tone crosses render→capture or WASAPI loopback, restore parked defaults, then
+//! tear the probe nodes down.
 //!
-//! * `ssm` — **S3, the decision gate.** Mint a SECOND devnode of Valve's Steam Streaming
-//!   *Microphone* driver and prove the pair end to end: a tone rendered into the new
-//!   instance's render endpoint must come back out of its capture endpoint. Passing means a
-//!   punktfunk-owned virtual mic needs no VB-Cable on any box with Steam installed —
-//!   failing reverts the drop-VB-Cable decision to "cable stays, mic-only".
-//! * `sink` — **S2.** Mint a Steam Streaming *Speakers* instance, park the DEFAULT playback
-//!   device on it (the real product routing), render a tone through the *default* device, and
-//!   WASAPI-loopback the instance — the desktop-audio capture path minus the game.
-//! * `sss-primary` — **S1, informative.** Tone + loopback on the PRIMARY Steam Streaming
-//!   Speakers endpoint: the "loopback is silent (validated live)" verdict, re-measured, with
-//!   the endpoint's engine mix format and whether Steam is running recorded alongside.
-//! * `cleanup` — remove every devnode this probe ever minted.
+//! `ssm` / `sink` / `sss-primary` / `mint` / `plan` / `micpitch` / `micpins` /
+//! `cleanup`. Nodes stamp `PunktfunkAudioProbe=1` under `Device Parameters`
+//! because DeviceDesc dies at INF install; `cleanup` and
+//! [`devnode_cleanup`](super::devnode_cleanup) match that marker, not the name.
 //!
-//! Probe devnodes carry `PunktfunkAudioProbe=1` in their `Device Parameters` key so cleanup
-//! finds them without guessing by name (DeviceDesc only survives until the INF installs).
-//! Nothing here is product wiring: the wiring plan treats a minted instance like any other
-//! endpoint of that name, and the probe restores the default playback/recording devices it
-//! disturbed before exiting.
+//! Evidence: `design/windows-audio-endpoints-and-vbcable.md`.
 
 use super::pad_endpoint as pe;
 use super::{audio_control, SAMPLE_RATE};
@@ -38,18 +26,16 @@ use windows::Win32::System::Registry::{
     REG_VALUE_TYPE,
 };
 
-/// Marker value in a probe devnode's `Device Parameters` key — how `cleanup` finds what this
-/// devtest minted (and nothing else). pub(crate): the uninstall sweep
-/// ([`devnode_cleanup`](super::devnode_cleanup)) sweeps this family too, so a devtest run on an
-/// operator's box cannot outlive the product.
+/// `Device Parameters` stamp. `cleanup` and
+/// [`devnode_cleanup`](super::devnode_cleanup) match this so a probe node cannot
+/// outlive the product.
 pub(crate) const PROBE_MARKER: &str = "PunktfunkAudioProbe";
-/// DeviceDesc for probe devnodes (visible in Device Manager until the INF install renames it).
+/// Device Manager name until the INF install overwrites it.
 const PROBE_DESC: &str = "Punktfunk Audio Probe";
-/// How long to wait for audiosrv to register a minted endpoint.
 const ENDPOINT_WAIT: Duration = Duration::from_secs(15);
-/// Tone amplitude — matches `pad-endpoint tone`, so peaks compare across probes.
+/// Matches `pad-endpoint tone` so peaks compare across probes.
 const TONE_AMP: f32 = 0.5;
-/// A measured peak above this is "signal" (tone renders at 0.5; autoconvert may attenuate).
+/// Tone renders at 0.5; autoconvert may attenuate. Above this is signal.
 const SIGNAL_FLOOR: f32 = 0.05;
 
 pub(crate) fn run(args: &[String]) -> Result<()> {
@@ -69,12 +55,10 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             probe_sss_primary(secs)
         }
         Some("cleanup") => cleanup(),
-        // The provider's synchronous pass: mint (or re-find) "Punktfunk Speakers/Microphone"
-        // and publish them for THIS process — `plan` then shows the tier-0 pick.
+        // Mint into THIS process so a following `plan` can read the pick.
         Some("mint") => super::minted::devtest_mint(),
-        // One real wiring pass (no default parking) + the verdict, readiness included — the
-        // field-triage "what would the host do right now" command. Provisioning runs
-        // synchronously first: a fresh CLI process would otherwise race its own worker.
+        // No default parking. `ensure_blocking` first — a fresh CLI process
+        // would race its own worker.
         Some("plan") => {
             super::minted::ensure_blocking();
             let plan = super::audio_control::wire_now_full(false);
@@ -98,14 +82,11 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             );
             Ok(())
         }
-        // The pitch instrument for the LIVE minted mic pair (field report: voice through the
-        // minted microphone played back "way lower"): a 440 Hz tone into the minted mic's
-        // render side, frequency-measured off its capture side. ~440 Hz = the pair is honest;
-        // ~220 Hz = a link runs at half the declared rate (the octave-down voice).
+        // 440 Hz into the minted mic render, measured on capture. ~440 = honest;
+        // ~220 = some link is half the declared rate.
         Some("micpitch") => {
             super::minted::ensure_blocking();
-            // The RAW provisioning record: the wiring-facing `minted_ids` deliberately hides
-            // the mic pair (raw crossing, octave-low — this probe is how that was measured).
+            // `minted_ids` hides the mic pair (raw stereo→mono reads an octave low).
             let Some(m) = super::minted::provisioned() else {
                 bail!("nothing minted on this box — run `audio-probe mint` first");
             };
@@ -131,11 +112,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
-        // The driver-capability map for the minted mic pair: exclusive+shared
-        // IsFormatSupported across {1,2}ch × {16,32}bit × {44.1,48,96}kHz on BOTH pins —
-        // interrogates the DRIVER, bypassing every endpoint-store stamping question. What the
-        // pins truly accept decides whether the mic leg has any coherent configuration (and
-        // whether an exclusive-mode mono open is an escape hatch).
+        // Driver `IsFormatSupported`, not the endpoint store. Exclusive-mode
+        // mono is the escape hatch if shared configs disagree.
         Some("micpins") => {
             super::minted::ensure_blocking();
             let Some(m) = super::minted::provisioned() else {
@@ -184,8 +162,6 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
 }
 
-// --- S3: minted Steam Streaming Microphone instance ----------------------------------------
-
 fn probe_ssm(keep: bool) -> Result<()> {
     let (hwid, inf) = discover_driver("steamstreamingmicrophone", "SteamStreamingMicrophone.inf")?;
     println!("audio-probe ssm: hwid={hwid} inf={inf}");
@@ -200,8 +176,6 @@ fn probe_ssm(keep: bool) -> Result<()> {
     let capture_ep = match wait_endpoint(&inst, Dir::Capture) {
         Ok(ep) => ep,
         Err(e) => {
-            // The load-bearing failure shape: an instance that minted a render side but no
-            // capture side cannot be a virtual mic — say it precisely, then clean up.
             println!("audio-probe ssm: render endpoint {render_ep} appeared, but:");
             println!("  {e:#}");
             println!("  VERDICT: FAIL (S3) — the minted SSM instance has NO capture endpoint;");
@@ -217,8 +191,7 @@ fn probe_ssm(keep: bool) -> Result<()> {
     println!("audio-probe ssm: capture={capture_ep}");
     report_mix_format("render", &render_ep);
 
-    // E2E: tone into the instance's render side, recorded from its capture side. Concurrent —
-    // the driver only moves audio while both ends are open.
+    // Both ends must stay open; the driver only moves audio while they do.
     let (peak, hz) = tone_while(&Some(render_ep.clone()), 5, 440.0, || {
         record_peak(&capture_ep, 3)
     })??;
@@ -248,8 +221,6 @@ fn probe_ssm(keep: bool) -> Result<()> {
     Ok(())
 }
 
-// --- S2: minted Speakers instance as the parked default sink -------------------------------
-
 fn probe_sink(keep: bool) -> Result<()> {
     let (hwid, inf) = discover_driver("steamstreamingspeakers", "SteamStreamingSpeakers.inf")?;
     println!("audio-probe sink: hwid={hwid} inf={inf}");
@@ -263,9 +234,8 @@ fn probe_sink(keep: bool) -> Result<()> {
     println!("audio-probe sink: endpoint={ep}");
     report_mix_format("sink", &ep);
 
-    // The product routing, not a shortcut: default playback parked on the minted endpoint, the
-    // tone rendered through the DEFAULT device (as any app would), the loopback reading the
-    // minted endpoint. This is `wasapi_cap`'s Assert shape minus the game.
+    // Tone through the DEFAULT device (`None`), loopback on the parked sink —
+    // the product routing, not a direct open of the minted endpoint.
     audio_control::set_default_endpoint(&ep).context("park the default playback on the sink")?;
     let (peak, hz) = tone_while(&None, 5, 440.0, || loopback_peak(&ep, 3))??;
     println!(
@@ -294,11 +264,8 @@ fn probe_sink(keep: bool) -> Result<()> {
     Ok(())
 }
 
-// --- S1: the primary Steam Streaming Speakers loopback, re-measured ------------------------
-
 fn probe_sss_primary(secs: u32) -> Result<()> {
-    // The PRIMARY endpoint: name-matched, but never a devnode this probe minted (a leftover
-    // `--keep` instance would shadow the measurement).
+    // Name-match the primary Speakers; skip leftover `--keep` probe nodes.
     let probes = probe_devnodes()?;
     let en = wasapi::DeviceEnumerator::new().map_err(|e| anyhow!("DeviceEnumerator: {e}"))?;
     let coll = en
@@ -357,14 +324,9 @@ fn probe_sss_primary(secs: u32) -> Result<()> {
     Ok(())
 }
 
-// --- driver discovery — shared with the minted provider -------------------------------------
-
 use super::minted::discover_driver;
 
-// --- probe devnode marker + cleanup --------------------------------------------------------
-
-/// Write the probe marker into a fresh devnode's `Device Parameters` key (the `mark` callback
-/// of [`pe::create_media_devnode`]).
+/// `mark` callback of [`pe::create_media_devnode`]: stamp `PROBE_MARKER`.
 fn write_probe_marker(
     set: &pe::DevInfoSet,
     did: &mut windows::Win32::Devices::DeviceAndDriverInstallation::SP_DEVINFO_DATA,
@@ -419,7 +381,6 @@ fn write_probe_marker(
     rc.ok().context("write PunktfunkAudioProbe")
 }
 
-/// Every devnode carrying the probe marker, as `(instance_id, marker_value)`.
 fn probe_devnodes() -> Result<Vec<(String, u32)>> {
     let set = pe::media_class_devs()?;
     let mut out = Vec::new();
@@ -503,14 +464,11 @@ fn remove_devnode(inst: &str) {
     }
 }
 
-// --- endpoints ------------------------------------------------------------------------------
-
 enum Dir {
     Render,
     Capture,
 }
 
-/// Poll for the endpoint audiosrv registers for `inst` in the given direction.
 fn wait_endpoint(inst: &str, dir: Dir) -> Result<String> {
     let deadline = Instant::now() + ENDPOINT_WAIT;
     loop {
@@ -535,7 +493,7 @@ fn wait_endpoint(inst: &str, dir: Dir) -> Result<String> {
     }
 }
 
-/// The render endpoint id of a probe devnode, if it has one (best-effort — S1's exclusion).
+/// Render id of a probe node, if any — excludes leftovers from the primary match.
 fn endpoint_of(inst: &str) -> Option<String> {
     pe::find_endpoint_for_devnode(inst).ok().flatten()
 }
@@ -550,10 +508,6 @@ fn report_mix_format(label: &str, endpoint_id: &str) {
     }
 }
 
-// --- audio movement ------------------------------------------------------------------------
-
-/// Render a stereo tone into `target` (an endpoint id, or the DEFAULT render device for
-/// `None`) on a worker thread while `body` runs; the tone stops when `body` returns.
 fn tone_while<T>(
     target: &Option<String>,
     tone_secs: u32,
@@ -566,8 +520,7 @@ fn tone_while<T>(
         .name("pf-audio-probe-tone".into())
         .spawn(move || render_tone(target_t.as_deref(), tone_secs, hz, &stop_t))
         .context("spawn tone thread")?;
-    // Give the render stream a beat to open before measuring, so the measurement window is
-    // fully inside the tone.
+    // Render open takes a beat; without this the measurement window starts silent.
     thread::sleep(Duration::from_millis(500));
     let out = body();
     stop.store(true, Ordering::SeqCst);
@@ -578,8 +531,7 @@ fn tone_while<T>(
     }
 }
 
-/// Stereo 48 kHz tone, event-driven shared mode with autoconvert — the same open shape the
-/// virtual mic uses, so "the probe could render" transfers.
+/// Shared-mode stereo 48 kHz + autoconvert — same open the virtual mic uses.
 fn render_tone(target: Option<&str>, seconds: u32, hz: f32, stop: &AtomicBool) -> Result<()> {
     wasapi::initialize_mta()
         .ok()
@@ -644,16 +596,12 @@ fn render_tone(target: Option<&str>, seconds: u32, hz: f32, stop: &AtomicBool) -
     Ok(())
 }
 
-/// Peak |sample| AND estimated dominant frequency (zero crossings — a pitch-shift detector:
-/// a 440 Hz tone reading back as ~220 Hz means some link runs at half the declared rate, which
-/// peaks alone can never see) read from an endpoint for `seconds`. `loopback` taps a RENDER
-/// endpoint's mix (the desktop-audio capture shape); otherwise a normal record from a CAPTURE
-/// endpoint (the virtual-mic consumer shape).
+/// Peak |sample| and zero-crossing Hz from capture or loopback. Peaks miss an
+/// octave drop (440 Hz reading back as ~220).
 ///
-/// STEREO request, crossings counted on channel 0 — measured trap: a MONO ask made
-/// `Initialize` fail with 0x88890008 on the SSM endpoints even under `autoconvert` (this
-/// stack does not bridge channel counts on capture), and that probe artifact masqueraded as
-/// "the endpoint is unopenable" through an entire debugging round.
+/// Stereo request, crossings on ch 0. A MONO ask fails `Initialize` with
+/// `0x88890008` on SSM even under autoconvert — this stack does not bridge
+/// capture channel counts.
 fn measure_peak(endpoint_id: &str, seconds: u32, loopback: bool) -> Result<(f32, f32)> {
     let device = pe::open_wasapi_device(endpoint_id)?;
     let mut client = device.get_iaudioclient().context("IAudioClient")?;
@@ -684,8 +632,8 @@ fn measure_peak(endpoint_id: &str, seconds: u32, loopback: bool) -> Result<(f32,
     let mut frames = 0u64;
     let mut crossings = 0u64;
     let mut prev_positive: Option<bool> = None;
-    // Frequency = crossings over the SIGNAL span only (audio starts mid-window; counting the
-    // leading silence into the denominator reads every tone low).
+    // Crossings over the SIGNAL span only; leading silence in the denominator
+    // reads every tone low.
     let (mut first_signal, mut last_signal): (Option<u64>, Option<u64>) = (None, None);
     while Instant::now() < deadline {
         let _ = h_event.wait_for_event(100);
@@ -700,7 +648,6 @@ fn measure_peak(endpoint_id: &str, seconds: u32, loopback: bool) -> Result<(f32,
                 Err(e) => bail!("get_next_packet_size: {e}"),
             }
         }
-        // Whole stereo frames (8 bytes); peak over both channels, crossings on channel 0.
         let whole = (bytes.len() / 8) * 8;
         if whole > 0 {
             let raw: Vec<u8> = bytes.drain(..whole).collect();
@@ -744,8 +691,7 @@ fn record_peak(endpoint_id: &str, seconds: u32) -> Result<(f32, f32)> {
     measure_peak(endpoint_id, seconds, false)
 }
 
-/// Put back whatever default devices the minting disturbed (a fresh endpoint can grab either
-/// default — measured on the pad program). No-ops when nothing moved.
+/// A fresh endpoint can steal either default. No-op if nothing moved.
 fn restore_defaults(prev_render: Option<String>, prev_capture: Option<String>) {
     if let Some(prev) = prev_render {
         if audio_control::default_render_id().as_deref() != Some(prev.as_str()) {

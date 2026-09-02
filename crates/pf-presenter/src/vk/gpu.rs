@@ -5,10 +5,9 @@ use anyhow::{Context as _, Result};
 use ash::vk;
 
 impl Presenter {
-    /// Wait the in-flight fence: OUR command buffers are done (staging, video image,
-    /// old-swapchain images). Deliberately NOT `vkDeviceWaitIdle` — the pump thread
-    /// submits Vulkan decode work concurrently, and wait-idle's external-sync
-    /// rule over every device queue would race it (observed as a resize crash).
+    /// Wait our in-flight fence, not `vkDeviceWaitIdle`. The pump thread submits
+    /// decode work on other queues; wait-idle's external-sync over every queue
+    /// would race it.
     pub(super) fn quiesce_own(&mut self) -> Result<()> {
         // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
         // type and live for the call, and every builder struct is a local that outlives it.
@@ -48,7 +47,6 @@ impl Presenter {
     }
 }
 
-/// The Contain-fit letterbox: video (vw×vh) into the swapchain extent, centered.
 pub(super) fn letterbox(extent: vk::Extent2D, vw: u32, vh: u32) -> (vk::Offset3D, vk::Offset3D) {
     let (ew, eh) = (f64::from(extent.width), f64::from(extent.height));
     let scale = (ew / f64::from(vw.max(1))).min(eh / f64::from(vh.max(1)));
@@ -79,23 +77,13 @@ pub(super) fn subresource_range() -> vk::ImageSubresourceRange {
         .layer_count(1)
 }
 
-/// Layout round-trip for one LAYER of a native (pf-vkdecode) decode image: decode
-/// layout → SHADER_READ_ONLY before the CSC pass, and back after it. Layer-scoped —
-/// the pool is an image array and the other layers are live DPB state that must not
-/// be touched. No queue-family transfer: the pool is created CONCURRENT across the
-/// graphics+decode families.
+/// Layer-scoped: the pool is an image array; other layers are live DPB.
+/// No queue-family transfer: the pool is CONCURRENT across graphics+decode.
 ///
-/// Both scopes are FRAGMENT_SHADER, and that is load-bearing, not tidiness: the submit
-/// waits the frame's decode-complete timeline with `wait_dst_stage_mask =
-/// FRAGMENT_SHADER`, and a semaphore wait only orders operations whose first sync scope
-/// INTERSECTS that mask (the dependency-chain rule). With TOP_OF_PIPE the transition
-/// formed no chain with the wait and could execute while the decode queue was still
-/// writing the image. On RADV that transition physically touches the image
-/// (metadata/decompression), so the race showed as green/yellow block corruption exactly
-/// at freshly-decoded (damaged) regions — the Steam Deck cursor-trail artifact. NVIDIA
-/// treats the transition as a no-op, which is why the same code looked clean there.
-/// (Diagnosed on the FFmpeg-Vulkan rung's own acquire barrier, which is where the
-/// TOP_OF_PIPE was; that rung is gone, the rule is not.)
+/// Both stages are FRAGMENT_SHADER: the submit waits the decode-complete
+/// timeline with `wait_dst_stage_mask = FRAGMENT_SHADER`, and a semaphore wait
+/// only orders work whose first sync scope intersects that mask. TOP_OF_PIPE
+/// would form no chain and could run while decode is still writing the image.
 pub(super) fn native_layer_barrier(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
@@ -135,11 +123,9 @@ pub(super) fn native_layer_barrier(
     }
 }
 
-/// Acquire an imported D3D11 texture from the EXTERNAL queue family as a copy source.
-/// The keyed mutex on the submit is the actual cross-API ordering; per the
-/// external-memory rules an UNDEFINED-old-layout transition on externally-bound memory
-/// preserves the contents (unlike ordinary images), so this is purely the
-/// layout/ownership hop.
+/// The keyed mutex on the submit is the cross-API order. UNDEFINED old-layout
+/// on externally-bound memory preserves contents (unlike ordinary images);
+/// this is the layout/ownership hop only.
 #[cfg(windows)]
 pub(super) fn external_acquire_barrier(
     device: &ash::Device,
@@ -171,9 +157,8 @@ pub(super) fn external_acquire_barrier(
     }
 }
 
-/// Acquire a dmabuf plane image from its foreign owner (the VAAPI decoder): queue-family
-/// transfer FOREIGN → ours, UNDEFINED → SHADER_READ_ONLY (content is preserved across
-/// the transfer regardless of the UNDEFINED old-layout, per the external-memory rules).
+/// UNDEFINED old-layout still preserves contents on externally-bound memory
+/// (VAAPI dmabuf). The hop is FOREIGN → ours, not a discard.
 #[cfg(target_os = "linux")]
 pub(super) fn foreign_acquire_barrier(
     device: &ash::Device,
@@ -206,8 +191,7 @@ pub(super) fn foreign_acquire_barrier(
     }
 }
 
-/// A full-subresource layout transition with the conservative ALL_COMMANDS/TRANSFER
-/// scopes this transfer-only pipeline needs (per-frame granularity, not per-stage).
+/// ALL_COMMANDS both sides: this transfer pipeline is per-frame, not per-stage.
 pub(super) fn barrier(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
@@ -246,7 +230,6 @@ mod tests {
 
     #[test]
     fn letterbox_pillarboxes_a_wide_window() {
-        // 16:10 video in a 21:9-ish window: full height, centered horizontally.
         let (a, b) = letterbox(
             vk::Extent2D {
                 width: 3440,

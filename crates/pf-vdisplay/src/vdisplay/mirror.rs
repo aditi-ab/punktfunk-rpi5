@@ -1,43 +1,33 @@
-//! The monitor-mirror display backend: stream a **physical** head the compositor already has,
-//! instead of creating a virtual one. See `design/per-monitor-portal-capture.md`.
+//! Stream a physical head the compositor already has, not a virtual output.
+//! See `design/per-monitor-portal-capture.md`.
 //!
-//! It implements [`VirtualDisplay`] so it drops into the session machinery unchanged — but it
-//! creates nothing, and that difference is load-bearing:
+//! Implements [`VirtualDisplay`] so it drops into the session machinery, but
+//! creates nothing. [`DisplayOwnership::External`] is the contract: no keep-alive,
+//! no topology, no reuse — the registry must not disable, re-position, or restore
+//! a monitor the user is sitting in front of.
 //!
-//! * [`DisplayOwnership::External`] ("someone else's display, merely mirrored: no keep-alive, no
-//!   topology, no reuse") is exactly the contract for a head we don't own, so the registry's
-//!   pooling/linger/exclusive machinery passes it through. §7.1 of the design doc — never disable,
-//!   re-position or "restore" a monitor the user is sitting in front of — holds *by construction*
-//!   here rather than by everyone remembering it.
-//! * `create()` ignores the requested [`Mode`]. A panel runs at the mode the user set; the client
-//!   scales. Reconfiguring someone's physical display to match a phone would be the same class of
-//!   rudeness as blanking it (§7.3).
-//!
-//! Selection is a **host-level pin** (`PUNKTFUNK_CAPTURE_MONITOR`), not a per-session choice —
-//! the host-pinned decision of record (§5.3), which is also what makes the input anchor below
-//! sound: one pin for the whole host, so the shared injector can't be re-aimed per session.
+//! `create()` ignores the requested [`Mode`]. A panel runs at the mode the user
+//! set; the client scales. Selection is a host-level pin
+//! (`PUNKTFUNK_CAPTURE_MONITOR`), not a per-session choice: one pin for the whole
+//! host, so the shared injector cannot be re-aimed per session.
 
 use super::backend::{DisplayOwnership, VirtualDisplay, VirtualOutput};
 use super::monitors;
 use crate::{Compositor, Mode};
 use anyhow::{bail, Context, Result};
 
-/// What a backend hands back when it starts recording an existing head.
+/// An existing-head recording: PipeWire node plus optional remote fd.
 ///
-/// `remote_fd` is the split: KWin and Mutter publish the node on the user's own PipeWire daemon
-/// (nothing to carry), while the portal-based backends (sway/xdpw, Hyprland/xdph) hand back a
-/// sandboxed remote fd that the capturer must connect through — the same distinction their
-/// *virtual*-output paths already make.
+/// `remote_fd` is `None` when KWin/Mutter publish on the user's daemon. Portal
+/// backends (sway/xdpw, Hyprland/xdph) hand back a sandboxed fd the capturer
+/// must connect through — the same split their virtual-output paths already make.
 pub(crate) struct MirrorStream {
     pub node_id: u32,
     pub remote_fd: Option<std::os::fd::OwnedFd>,
-    /// The cursor mode the xdg ScreenCast portal NEGOTIATED for this recording, for the two
-    /// portal-based backends; `None` for the compositor-protocol ones (KWin/Mutter/gamescope),
-    /// which get what they ask for. Reported on to the host as
-    /// [`VirtualDisplay::last_portal_cursor_mode`] — same split as `remote_fd` above, and for the
-    /// same reason: only the portal path has an answer that can differ from the request.
+    /// Portal-negotiated cursor mode. Compositor-protocol backends (KWin/Mutter/gamescope)
+    /// get what they ask for, so they leave this `None`.
     pub cursor_mode: Option<crate::portal_cursor::Mode>,
-    /// Dropping this ends the recording. It never owns the monitor — we did not create it.
+    /// Dropping this ends the recording. Does not own the monitor.
     pub keepalive: Box<dyn Send>,
 }
 
@@ -46,8 +36,6 @@ pub struct MirrorDisplay {
     compositor: Compositor,
     connector: String,
     hw_cursor: bool,
-    /// What the portal gave the most recent [`create`](VirtualDisplay::create), when this mirror
-    /// delegated to a portal-based backend. See [`VirtualDisplay::last_portal_cursor_mode`].
     last_cursor_mode: Option<crate::portal_cursor::Mode>,
 }
 
@@ -80,19 +68,14 @@ impl VirtualDisplay for MirrorDisplay {
     }
 
     fn poolable_now(&self) -> bool {
-        // Never. `create` below always reports `DisplayOwnership::External` — we did not make this
-        // head and must not keep it — so the registry never pools a mirror, and the trait's `true`
-        // default was a claim this backend cannot honour on any request. It costs nothing today
-        // (the reuse lookup can only miss: no `"mirror"` entry ever enters the pool), but it is the
-        // answer the registry consults BEFORE `create` gets to declare ownership, so leaving it
-        // optimistic means the one pre-create statement of intent contradicts the post-create fact.
+        // Asked before `create` can declare `External`. Default `true` would claim
+        // a head we did not make and must not pool.
         false
     }
 
     fn create(&mut self, _mode: Mode) -> Result<VirtualOutput> {
-        // Resolve the pin against the live head list FIRST: it yields the geometry the input anchor
-        // needs, and it turns "that monitor is gone" into one clear error before any compositor
-        // call. `resolve` refuses to substitute a different head (see its doc).
+        // Resolve first: geometry for the input anchor, and "that monitor is gone"
+        // before any compositor call. `resolve` never substitutes another head.
         let monitors = monitors::list(self.compositor)
             .with_context(|| format!("enumerate monitors to mirror {:?}", self.connector))?;
         let target = monitors::resolve(&monitors, &self.connector)?;
@@ -117,21 +100,14 @@ impl VirtualDisplay for MirrorDisplay {
             Compositor::Hyprland => {
                 crate::hyprland::stream_existing_output(&target.connector, self.hw_cursor)?
             }
-            // gamescope on the DRM backend (a Bazzite/SteamOS Game Mode session) DOES drive a real
-            // head — `monitors::list` reports it, and mirroring it is an attach to the composited
-            // node this session already publishes. A nested or headless gamescope reports no heads,
-            // so `resolve` fails above and this arm is never reached for one.
+            // DRM gamescope drives a real head; nested/headless reports none, so
+            // `resolve` fails above and this arm is not reached for those.
             #[cfg(target_os = "linux")]
             Compositor::Gamescope => {
                 crate::gamescope::stream_existing_output(&target.connector, self.hw_cursor)?
             }
-            // Gated to non-Linux (`monitors::list`'s shape), NOT the bare `#[allow(unreachable_
-            // patterns)] other =>` this replaced: with it, a newly added `Compositor` variant fell
-            // through to a runtime bail on the very platform that would define it, silently, in the
-            // one place that decides which backends can mirror a head. Cfg'd out on Linux, the match
-            // is exhaustive and the new variant is a compile error here instead. The arm exists at
-            // all only because every arm above is itself `cfg(target_os = "linux")` — this module is
-            // Linux-only today, so it is a placeholder that keeps the shape honest if that changes.
+            // Linux match is exhaustive: a new `Compositor` is a compile error here.
+            // This arm exists because every arm above is `cfg(target_os = "linux")`.
             #[cfg(not(target_os = "linux"))]
             other => bail!(
                 "mirroring an existing monitor is not supported on the {} backend",
@@ -139,15 +115,8 @@ impl VirtualDisplay for MirrorDisplay {
             ),
         };
 
-        // Latched for `last_portal_cursor_mode` — the delegate's verdict is this mirror's verdict.
         self.last_cursor_mode = stream.cursor_mode;
 
-        // NOTE: aiming absolute input at this head is the HOST's job, not ours — this crate must
-        // not depend on pf-inject (see the crate doc: "never on capture/inject"). The host sets the
-        // anchor from the same pin at startup; §7.2 of the design doc explains why it is host-level
-        // rather than set here per session. We only CARRY the head's name out (`output_name`
-        // below), which is what the wlr injector needs to bind its virtual pointer to this head —
-        // the libei anchor above cannot serve it, because that backend selects by region.
         tracing::info!(
             connector = %target.connector,
             mode = %target.mode_label(),
@@ -156,23 +125,18 @@ impl VirtualDisplay for MirrorDisplay {
             "mirroring an existing monitor (no virtual display created)"
         );
 
-        // The keepalive IS the recording: dropping it stops the cast and leaves the monitor exactly
-        // as it was (we created nothing, so there is nothing to restore).
+        // Dropping the keepalive stops the cast; we created nothing to restore.
         let mut out = VirtualOutput::owned(stream.node_id, Some(dims), stream.keepalive);
-        // Portal-based backends (sway/xdpw, Hyprland/xdph) publish on a sandboxed remote the
-        // capturer must connect through; KWin/Mutter use the user's own daemon.
         out.remote_fd = stream.remote_fd;
-        // Never pooled, never lingered, never made primary/exclusive: we don't own this head.
         out.ownership = DisplayOwnership::External;
-        // The head absolute input maps into is the one we mirror — its connector IS its
-        // `wl_output.name` on the wlroots/Hyprland backends, where the injector matches on it.
+        // Host aims input; this crate must not depend on pf-inject. Connector equals
+        // `wl_output.name` on wlroots/Hyprland; libei selects by region and cannot use it.
         out.output_name = Some(target.connector.clone());
         Ok(out)
     }
 }
 
-/// Can this head be mirrored at all? Each rejection is something a compositor would otherwise
-/// answer with silence or a black stream, so it is caught here where the reason can be stated.
+/// Refuse heads a compositor would otherwise answer with silence or a black stream.
 fn check_mirrorable(target: &monitors::PhysicalMonitor, compositor: Compositor) -> Result<()> {
     if !target.enabled {
         bail!(
@@ -181,12 +145,8 @@ fn check_mirrorable(target: &monitors::PhysicalMonitor, compositor: Compositor) 
         );
     }
     if target.managed {
-        // `managed` is only *conclusive* where the name is ours by construction: KWin's
-        // `Virtual-punktfunk` prefix, Hyprland's `PF-N`. Sway names EVERY headless output
-        // `HEADLESS-N` — its own included — so refusing there would block a legitimate setup
-        // (a headless sway box whose outputs are all HEADLESS-N is exactly the remote case this
-        // feature serves). Warn and continue; a user who really did pin our own virtual display
-        // sees a mirror of it and the log says why.
+        // Only KWin `Virtual-punktfunk` and Hyprland `PF-N` names are ours by construction.
+        // Sway names every headless output `HEADLESS-N`, so a refuse would block a real pin.
         if names_ours_conclusively(compositor) {
             bail!(
                 "monitor {:?} is one of punktfunk's own virtual displays, not a physical head — \
@@ -211,33 +171,23 @@ fn check_mirrorable(target: &monitors::PhysicalMonitor, compositor: Compositor) 
     Ok(())
 }
 
-/// Does this compositor's `managed` flag mean "ours, for certain"?
+/// Whether `managed` means "ours, for certain".
 ///
-/// EXHAUSTIVE on purpose, unlike the `matches!` it used to be. This is the one table in the crate
-/// whose un-listed default is the UNSAFE direction: a `false` sends [`check_mirrorable`] down the
-/// warn-and-proceed branch, which for a backend that DOES name its managed outputs by construction
-/// (the KWin/Hyprland shape — i.e. both backends that have the property today) means streaming
-/// punktfunk's own virtual display back to the client, the capture loop
-/// `one_of_our_own_virtual_displays_is_refused` exists to forbid. Adding a `Compositor` variant must
-/// therefore be a compile error here rather than a silent opt-out. (Contrast
-/// [`Compositor::needs_live_session`], also a `matches!` — its omitted default is the safe one.)
+/// Exhaustive: warn-and-proceed is the wrong default — on KWin/Hyprland it
+/// streams our own virtual display. A new `Compositor` must fail to compile here.
 fn names_ours_conclusively(compositor: Compositor) -> bool {
     match compositor {
-        // Ours by construction: KWin outputs carry the `Virtual-punktfunk-<id>` name the identity
-        // module hands the backend, Hyprland's are `PF-N`. Nothing else mints those names.
+        // `Virtual-punktfunk-<id>` and `PF-N` are minted only by us.
         Compositor::Kwin | Compositor::Hyprland => true,
-        // Sway names EVERY headless output `HEADLESS-N`, its own included; Mutter's virtual monitors
-        // carry no distinguishing name at all (it won't take one from us); and gamescope's
-        // `list_monitors` only ever reports the real DRM head a Game Mode session drives, so
-        // `managed` is never even set there. A hint at most — refusing would break the legitimate
-        // headless-sway setup this feature serves.
+        // Sway's `HEADLESS-N` includes its own; Mutter has no distinguishing name;
+        // gamescope only reports the real DRM head. A hint at most.
         Compositor::Wlroots | Compositor::Mutter | Compositor::Gamescope => false,
     }
 }
 
-/// mHz → whole Hz for [`VirtualOutput::preferred_mode`], never 0 (the negotiation treats 0 as
-/// "unset", and a head that didn't report a refresh is still running at *some* rate — 60 is the
-/// same assumption KWin's own virtual outputs are born with).
+/// mHz → whole Hz for [`VirtualOutput::preferred_mode`]. Negotiation treats 0 as
+/// "unset", so an unreported refresh becomes 60 — the same default KWin virtual
+/// outputs are born with.
 fn refresh_hz(mhz: u32) -> u32 {
     let hz = (mhz as f64 / 1000.0).round() as u32;
     if hz == 0 {
@@ -272,7 +222,6 @@ mod tests {
         assert!(check_mirrorable(&head("DP-2"), Compositor::Kwin).is_ok());
     }
 
-    /// Streaming a dark head would be a black rectangle with no explanation — say why instead.
     #[test]
     fn a_disabled_head_is_refused_with_the_reason() {
         let mut m = head("DP-2");
@@ -283,8 +232,6 @@ mod tests {
         assert!(err.contains("disabled"), "{err}");
     }
 
-    /// Mirroring our OWN virtual display is a loop with extra steps; catch the misconfiguration
-    /// rather than streaming something confusing.
     #[test]
     fn one_of_our_own_virtual_displays_is_refused() {
         let mut m = head("Virtual-punktfunk-1");
@@ -295,23 +242,17 @@ mod tests {
         assert!(err.contains("virtual displays"), "{err}");
     }
 
-    /// Sway names every headless output `HEADLESS-N`, its own included, so the `managed` hint is
-    /// NOT proof there — refusing would block a headless sway box, which is exactly the remote
-    /// setup this feature serves. (Found on-glass: a two-output headless sway had both heads
-    /// flagged, and the KWin-strength rule would have refused to mirror either.)
+    /// Sway's `HEADLESS-N` is not proof of ours; refusing would block a headless sway pin.
     #[test]
     fn a_headless_sway_output_is_mirrored_despite_the_ambiguous_name() {
         let mut m = head("HEADLESS-2");
         m.managed = true;
         assert!(check_mirrorable(&m, Compositor::Wlroots).is_ok());
-        // Hyprland's `PF-N` IS our naming, so it stays conclusive.
+        // Hyprland treats `managed` as conclusive, so the same row is refused there.
         assert!(check_mirrorable(&m, Compositor::Hyprland).is_err());
     }
 
-    /// Pin the conclusive-naming table per variant. The answer is a safety decision whose wrong
-    /// direction is the SILENT one: a backend that mints punktfunk-named outputs but is missing
-    /// from the `true` arm takes the warn-and-proceed branch and streams our own virtual display
-    /// back to the client. Exhaustive `match` + this test = the new variant has to be considered.
+    /// Missing a naming backend from the `true` arm streams our own virtual display.
     #[test]
     fn the_conclusive_naming_table_is_pinned_per_backend() {
         assert!(names_ours_conclusively(Compositor::Kwin));
@@ -321,16 +262,14 @@ mod tests {
         assert!(!names_ours_conclusively(Compositor::Gamescope));
     }
 
-    /// The registry asks `poolable_now` BEFORE `create` gets to report ownership, so the two must
-    /// agree: a mirror's `create` always reports `External` (we did not make this head), therefore
-    /// no mirror request is ever poolable.
+    /// `poolable_now` is asked before `create` reports ownership; both must say External.
     #[test]
     fn a_mirrored_head_is_never_registry_poolable() {
         let vd = MirrorDisplay::new(Compositor::Kwin, "DP-2".into()).unwrap();
         assert!(!vd.poolable_now());
     }
 
-    /// A head listed but not driving a mode (enabled yet modeless) would negotiate a 0x0 stream.
+    /// Enabled but modeless would negotiate a 0x0 stream.
     #[test]
     fn a_head_with_no_current_mode_is_refused() {
         let mut m = head("DP-2");
@@ -347,7 +286,6 @@ mod tests {
         assert_eq!(refresh_hz(60000), 60);
         assert_eq!(refresh_hz(59940), 60);
         assert_eq!(refresh_hz(119_920), 120);
-        // An unreported refresh must not become a 0 Hz preferred mode.
         assert_eq!(refresh_hz(0), 60);
     }
 }

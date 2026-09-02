@@ -1,19 +1,15 @@
-//! Windows synthetic-pointer injection (design/pen-tablet-input.md §6): a per-session `PT_PEN`
-//! device carrying the pen plane's full fidelity — pressure (rescaled to Windows' 0..1024),
-//! polar tilt → tiltX/tiltY, barrel roll on `rotation` (0..359 — Windows Ink renders Pencil
-//! Pro roll natively), barrel button, eraser (`PEN_FLAG_INVERTED`/`ERASER`), hover — plus a
-//! `PT_TOUCH` device that closes the long-standing SendInput touch no-op for wire touches.
+//! Windows synthetic-pointer injection (`design/pen-tablet-input.md`): a per-session
+//! `PT_PEN` device with the pen plane's full fidelity — pressure (Windows 0..1024),
+//! polar tilt → tiltX/tiltY, barrel roll on `rotation` (0..359), barrel button, eraser
+//! (`PEN_FLAG_INVERTED`/`ERASER`), hover — plus a `PT_TOUCH` device for wire touches
+//! (`SendInput` touch is a no-op).
 //!
-//! Both follow Apollo's proven recipe (`design/apollo-comparison.md`): synthetic pointer state
-//! goes STALE if not re-injected (~100 ms), so each device runs a small refresh thread that
-//! re-asserts the last frame every [`REFRESH_MS`] while the pen is in range / contacts are
-//! held — a stationary stylus must not hover-out (and a held finger must not auto-lift) just
-//! because no new samples arrived. `CreateSyntheticPointerDevice` needs Win10 1809+;
-//! [`crate::pen_supported`] probes it, so older hosts simply never advertise pen.
+//! Synthetic pointer state goes stale in ~100 ms (`design/apollo-comparison.md`), so
+//! each device re-asserts the last frame every [`REFRESH_MS`] while in range / held.
+//! `CreateSyntheticPointerDevice` needs Win10 1809+; [`crate::pen_supported`] probes it.
 //!
-//! Frame grouping mirrors the Linux uinput backend: a proximity-enter is injected together
-//! with its position (never at a stale point), tip edges get their own DOWN/UP frames, and a
-//! range-leave is a final frame without `INRANGE`.
+//! Frame grouping matches Linux uinput: proximity-enter lands with its position, tip
+//! edges own DOWN/UP frames, range-leave is a final frame without `INRANGE`.
 
 use anyhow::{Context, Result};
 use punktfunk_core::input::{InputEvent, InputKind};
@@ -53,13 +49,12 @@ const DESKTOP_GENERIC_ALL: u32 = 0x1000_0000;
 
 /// This thread's binding to the input desktop, restored on drop.
 ///
-/// `SendInput` (`sendinput.rs`) solves the same problem by binding its DEDICATED injector thread
-/// once and keeping it. That can't be borrowed here: `inject_pen`/`inject_touch_frame` are driven
-/// from TWO threads — the caller's `apply_batch` and the `pf-pen-refresh`/`pf-touch-refresh`
-/// staleness threads — and the batch caller is a shared task thread, which must not be left parked
-/// on a `Winlogon` desktop that disappears when the prompt is dismissed. So the binding is scoped
-/// to the retry: `GetThreadDesktop` hands back a BORROWED handle (never closed), and only the
-/// `OpenInputDesktop` handle is closed, after the thread has moved back off it.
+/// `SendInput` binds a dedicated injector thread once. Here `inject_pen` /
+/// `inject_touch_frame` run on the batch caller *and* the refresh threads; the
+/// batch thread must not stay parked on a `Winlogon` desktop that vanishes when
+/// the prompt dismisses. Scope the bind to the retry: `GetThreadDesktop` is
+/// borrowed (never closed); only the `OpenInputDesktop` handle is closed after
+/// the thread moves back off it.
 struct InputDesktopBinding {
     previous: HDESK,
     input: HDESK,
@@ -101,25 +96,12 @@ impl Drop for InputDesktopBinding {
     }
 }
 
-/// Inject one synthetic-pointer frame, following the input desktop if Windows refuses it.
+/// Inject one synthetic-pointer frame, following the input desktop on ACCESS_DENIED.
 ///
-/// While a UAC consent prompt (or the lock / logon screen) owns input, the secure desktop does, and
-/// injection from the host's own `WinSta0\Default` thread comes back `ERROR_ACCESS_DENIED` — which
-/// is why pen and touch went dead on a prompt a user could SEE in the stream (capture already
-/// renders it, and `SendInput` mouse/keyboard already followed the switch, so only these two were
-/// left behind). Field-reported 2026-07-23; the exact rc reproduced in a probe the same night.
-///
-/// Measured then, with a real consent prompt up and a SYSTEM host in the console session:
-///
-/// ```text
-/// device created on Default, thread on Default        -> 0x80070005  (the field failure)
-/// device created on Default, thread on INPUT desktop   -> OK
-/// device created on INPUT,   thread on INPUT desktop   -> OK
-/// ```
-///
-/// The middle row is the load-bearing one: the synthetic pointer device is NOT desktop-affine, so
-/// rebinding the THREAD is sufficient and the device never has to be destroyed and recreated
-/// across a desktop switch (which would drop in-flight contacts and the pen's in-range state).
+/// A UAC / lock / logon desktop owns input; injection from `WinSta0\Default`
+/// returns `ERROR_ACCESS_DENIED`. The synthetic device is not desktop-affine, so
+/// rebinding the thread is enough — recreating the device would drop in-flight
+/// contacts and pen in-range state.
 ///
 /// # Safety
 /// `dev` must be a live synthetic-pointer device and `frame` a live slice for the call.
@@ -145,11 +127,9 @@ unsafe fn inject_following_desktop(
 /// Windows pen pressure is 0..1024 (vs the wire's full-scale u16).
 const WIN_PEN_PRESSURE_MAX: u32 = 1024;
 
-/// Map a normalized [0,1] coordinate pair onto desktop pixels over the STREAMED output's rect
-/// ([`crate::stream_target`]) — the surface the SendInput absolute mouse targets too, so pen,
-/// touch, and pointer all land identically. The wire normalizes over the streamed display's
-/// frame, not the desktop: mapping over the whole virtual desktop is only right when they
-/// coincide (Exclusive topology — the fallback when no stream target is live).
+/// Map a normalized [0,1] pair onto the STREAMED output's rect ([`crate::stream_target`])
+/// — the same surface SendInput absolute mouse uses. Mapping over the whole virtual
+/// desktop is only right when they coincide (Exclusive topology; the no-target fallback).
 fn to_screen(x: f32, y: f32) -> POINT {
     let (px, py) = crate::stream_target::map_normalized(x as f64, y as f64);
     POINT { x: px, y: py }
@@ -183,7 +163,6 @@ pub fn synthetic_pen_available() -> bool {
     }
 }
 
-/// The tracked pen state a refresh tick re-asserts.
 #[derive(Default)]
 struct PenState {
     in_range: bool,
@@ -201,13 +180,12 @@ struct PenState {
 struct PenShared {
     dev: Device,
     state: PenState,
-    /// First injection failure logs at WARN (see `TouchShared::fail_warned`).
+    /// First injection failure logs at WARN; repeats stay at trace.
     fail_warned: bool,
 }
 
-/// One per-session virtual pen (the Windows sibling of the Linux uinput tablet — same
-/// [`PenTransition`] consumer API). Wire barrel button 2 has no Windows pen equivalent
-/// (one barrel + eraser is the platform model) and is ignored here.
+/// Per-session virtual pen (Linux uinput tablet sibling — same [`PenTransition`] API).
+/// Wire barrel button 2 has no Windows equivalent (one barrel + eraser) and is ignored.
 pub struct VirtualPen {
     shared: Arc<Mutex<PenShared>>,
     stop: Arc<AtomicBool>,
@@ -231,8 +209,8 @@ impl VirtualPen {
             fail_warned: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
-        // The staleness guard: re-assert the last frame while in range so a stationary pen
-        // (native plane: between 100 ms heartbeats; GameStream: indefinitely) never hovers out.
+        // Re-assert the last frame while in range so a stationary pen never hovers out
+        // (native plane: between 100 ms heartbeats; GameStream: indefinitely).
         let refresher = {
             let shared = Arc::clone(&shared);
             let stop = Arc::clone(&stop);
@@ -262,10 +240,9 @@ impl VirtualPen {
         })
     }
 
-    /// Apply one batch of tracker transitions — same grouping contract as the Linux backend:
-    /// `[ProxIn, Motion, TipDown]` is ONE frame (entry lands at its position, in contact),
-    /// consecutive `Motion`s split, tip edges own their frames, range-leave is a final
-    /// no-`INRANGE` frame.
+    /// Apply one batch of tracker transitions — same grouping as the Linux backend:
+    /// `[ProxIn, Motion, TipDown]` is ONE frame, consecutive `Motion`s split, tip
+    /// edges own their frames, range-leave is a final no-`INRANGE` frame.
     pub fn apply_batch(&mut self, transitions: &[PenTransition]) {
         for t in transitions {
             match t {
@@ -354,8 +331,7 @@ impl Drop for VirtualPen {
         if let Some(h) = self.refresher.take() {
             let _ = h.join();
         }
-        // The device itself dies with `shared` (Device::drop) — Windows releases any held
-        // in-range/contact state when the synthetic device is destroyed.
+        // Device dies with `shared` — Windows releases held in-range/contact on destroy.
     }
 }
 
@@ -455,8 +431,7 @@ fn inject_pen(sh: &mut PenShared, edge: POINTER_FLAGS, is_new: bool) {
 /// One live wire-touch contact. `slot` is the SMALL, DENSE pointer id handed to Windows —
 /// synthetic-pointer injection rejects arbitrary large ids, and clients (Moonlight's
 /// `pointerId` especially) send exactly those, so wire ids compact into the lowest free slot
-/// for the contact's lifetime (Apollo's slot-contiguity rule; the on-glass symptom of passing
-/// wire ids through was pen working while every touch silently failed to inject).
+/// for the contact's lifetime.
 #[derive(Clone, Copy)]
 struct Contact {
     id: u32,
@@ -465,7 +440,6 @@ struct Contact {
     y: f32,
 }
 
-/// Lowest slot not held by a live contact.
 fn free_slot(contacts: &[Contact]) -> u32 {
     let mut slot = 0u32;
     while contacts.iter().any(|c| c.slot == slot) {
@@ -480,15 +454,13 @@ const MAX_CONTACTS: usize = 10;
 struct TouchShared {
     dev: Device,
     contacts: Vec<Contact>,
-    /// First injection failure logs at WARN (an on-glass "touch does nothing" must be
-    /// visible in the host log); repeats stay at trace.
+    /// First injection failure logs at WARN; repeats stay at trace.
     fail_warned: bool,
 }
 
-/// The `PT_TOUCH` device servicing wire `TouchDown/Move/Up` events — closes the SendInput
-/// touch no-op. Contacts are keyed by the wire's finger id; every frame re-injects the FULL
-/// active set (the synthetic-pointer contract), and a refresh thread re-asserts held contacts
-/// against the ~100 ms staleness auto-lift.
+/// `PT_TOUCH` for wire `TouchDown/Move/Up` — `SendInput` touch is a no-op. Contacts
+/// keyed by wire finger id; every frame re-injects the FULL active set, and a refresh
+/// thread re-asserts held contacts against the ~100 ms staleness auto-lift.
 pub struct SyntheticTouch {
     shared: Arc<Mutex<TouchShared>>,
     stop: Arc<AtomicBool>,

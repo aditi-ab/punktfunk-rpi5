@@ -1,34 +1,20 @@
-//! The audio data plane (UDP 48000). On RTSP PLAY we learn the client's audio endpoint from
-//! its port-learning ping, capture the default-sink monitor at the negotiated channel count,
-//! Opus-encode fixed frames (stereo: plain Opus; 5.1/7.1: libopus *multistream*), and send
-//! each as a GameStream RTP audio packet.
+//! GameStream audio data plane (UDP 48000). On RTSP PLAY we learn the client's
+//! endpoint from its port-learning ping, capture the default-sink monitor at the
+//! negotiated channel count, Opus-encode fixed frames, and send each as an RTP
+//! audio packet.
 //!
-//! Wire format (moonlight-common-c `AudioStream.c`/`RtpAudioQueue.c`, verified verbatim
-//! 2026-06-10): a 12-byte big-endian `RTP_PACKET` (`packetType = 97`, `sequenceNumber++`,
-//! `timestamp += packetDuration`, `ssrc = 0`) followed by the AES-128-CBC-encrypted Opus
-//! payload. Like the control stream, modern Moonlight always AES-CBC-decrypts audio (it
-//! reports "Failed to decrypt audio packet" on plaintext), so we encrypt the payload under
-//! the `/launch` `rikey` with a per-packet IV `BE32(rikeyid + seq)` (PKCS7 padding, RTP
-//! header left in the clear).
+//! Wire (moonlight-common-c `AudioStream.c` / `RtpAudioQueue.c`): 12-byte BE
+//! `RTP_PACKET` (`packetType = 97`, `sequenceNumber++`,
+//! `timestamp += packetDuration`, `ssrc = 0`) then AES-128-CBC Opus (PKCS7). IV
+//! is `BE32(rikeyid + seq)`; the RTP header stays clear. Modern Moonlight decrypts
+//! every packet, so we encrypt every packet. CBC has no auth tag — that is the
+//! protocol; do not append a GCM tag, no stock client can decode it. Authenticated
+//! audio is the native `punktfunk/1` AES-GCM plane.
 //!
-//! **CBC here is unauthenticated, and that is the protocol, not a gap to close.** An attacker who
-//! can inject at the audio port can flip ciphertext bits and the client will decrypt and play the
-//! result, because there is no tag to reject it. The instinct is to reach for `SS_ENC_AUDIO`
-//! (0x04) as the authenticated answer — but per the sanctioned wire reference `SS_ENC_AUDIO`
-//! **selects exactly this mode**: "if SS_ENC_AUDIO: AES-128-CBC encrypt the PKCS7-padded Opus
-//! frame with IV = BE32(avRiKeyId + seq)", noted there as "CBC, not GCM. No auth tag appended
-//! (unlike video/control GCM)", and negotiated by `x-nv-general.featureFlags` bit 0x20 rather
-//! than the `encryptionSupported` mask. So GameStream has no authenticated audio mode to
-//! advertise: offering the flag would change nothing on the wire, and adding a tag would be a
-//! private extension no client can decode. (We encrypt unconditionally rather than on the flag,
-//! because modern Moonlight decrypts unconditionally — see above.) A session that needs
-//! authenticated audio needs the native punktfunk/1 plane, whose audio is AES-GCM.
-//!
-//! Surround sessions additionally carry Sunshine-style audio FEC: every aligned block of 4
-//! data packets is followed by 2 Reed–Solomon parity packets (`packetType = 127`, an
-//! `AUDIO_FEC_HEADER` after the RTP header). FEC is opportunistic on the client — in-order
-//! data packets are consumed immediately and missing parity only costs loss recovery — so
-//! the validated stereo path stays byte-identical (data packets only, exactly as before).
+//! Stereo is one Opus stream; 5.1/7.1 is libopus multistream. Every layout then
+//! emits Sunshine-style FEC: each aligned block of 4 data packets is followed by
+//! 2 Reed–Solomon parity packets (`packetType = 127`). Clients consume in-order
+//! data immediately; missing parity only costs loss recovery.
 
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
 use crate::audio::SAMPLE_RATE;
@@ -47,36 +33,29 @@ use {
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 
-/// RTP payload types (moonlight-common-c `RtpAudioQueue.c`: `RTP_PAYLOAD_TYPE_AUDIO  97`,
-/// `RTP_PAYLOAD_TYPE_FEC  127`).
+/// moonlight-common-c `RtpAudioQueue.c`: `RTP_PAYLOAD_TYPE_AUDIO` / `RTP_PAYLOAD_TYPE_FEC`.
 const AUDIO_PACKET_TYPE: u8 = 97;
 const AUDIO_FEC_PACKET_TYPE: u8 = 127;
 
-/// Audio FEC geometry (moonlight-common-c `RtpAudioQueue.h`: `RTPA_DATA_SHARDS 4`,
-/// `RTPA_FEC_SHARDS 2`). Blocks are aligned: the client synthesizes the block base as
-/// `(seq / 4) * 4`, so parity always covers data seqs `[base, base+4)`.
+/// Aligned RS block. The client synthesizes the base as `(seq / 4) * 4`, so
+/// parity always covers `[base, base+4)`.
 const FEC_DATA_SHARDS: usize = 4;
 const FEC_PARITY_SHARDS: usize = 2;
-/// The RS(4,2) parity rows both ends hardcode (Sunshine `stream.cpp` and moonlight-common-c
-/// `RtpAudioQueue.c` patch their nanors context with these same bytes — the OpenFEC matrix
-/// NVIDIA used, NOT nanors' own Cauchy matrix). nanors `reed_solomon_encode` (gemm over the
-/// row-major `m×k` matrix, GF(2⁸) poly 0x11d) computes
-/// `parity[j] = XOR_i gfmul(M[j][i], data[i])` — replicated in [`audio_parity`].
+/// NVIDIA OpenFEC matrix both ends patch into nanors — not nanors' Cauchy matrix.
+/// `parity[j] = XOR_i gfmul(M[j][i], data[i])` (GF(2⁸) poly 0x11d).
 const FEC_MATRIX: [[u8; FEC_DATA_SHARDS]; FEC_PARITY_SHARDS] =
     [[0x77, 0x40, 0x38, 0x0e], [0xc7, 0xa7, 0x0d, 0x6c]];
 
-/// Per-session audio parameters from the RTSP ANNOUNCE (`x-nv-audio.surround.numChannels`,
-/// `x-nv-audio.surround.AudioQuality`, `x-nv-aqos.packetDuration` — the attribute set
-/// moonlight-common-c `SdpGenerator.c` emits). Defaults match Moonlight's: stereo, normal
-/// quality, 5 ms.
+/// RTSP ANNOUNCE audio: `x-nv-audio.surround.numChannels`,
+/// `x-nv-audio.surround.AudioQuality`, `x-nv-aqos.packetDuration`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioParams {
-    /// Negotiated channel count: 2, 6 (5.1) or 8 (7.1).
+    /// 2, 6 (5.1), or 8 (7.1).
     pub channels: u8,
-    /// `AudioQuality == 1` — uncoupled high-bitrate multistream (client opted in, only
-    /// offered when our DESCRIBE advertises a second surround-params line).
+    /// `AudioQuality == 1`: uncoupled high-bitrate. Offered only when DESCRIBE
+    /// advertises a second surround-params line.
     pub high_quality: bool,
-    /// Opus frame duration in ms; Moonlight sends 5 (default) or 10 (slow decoder/link).
+    /// Opus frame duration in ms. Moonlight sends 5, or 10 on a slow decoder/link.
     pub packet_duration_ms: u8,
 }
 
@@ -90,36 +69,26 @@ impl Default for AudioParams {
     }
 }
 
-// The Opus surround layout table (channel order FL FR FC LFE RL RR [SL SR], identity mapping,
-// Sunshine's per-config bitrates) now lives in `punktfunk_core::audio`, shared with the native
-// `punktfunk/1` path and every client decoder. Re-export the pieces the GameStream module + its
-// RTSP SDP (`rtsp.rs`) reference; the GFE-specific `surround_params` SDP rotation stays below.
 pub use punktfunk_core::audio::{
     OpusLayout, LAYOUT_51, LAYOUT_51_HQ, LAYOUT_71, LAYOUT_71_HQ, LAYOUT_STEREO,
 };
 
-/// Pick the encoder layout for the negotiated session parameters. Thin wrapper over the shared
-/// [`punktfunk_core::audio::layout_for`] keyed on this module's [`AudioParams`] (unknown channel
-/// counts fall back to stereo; the client can only request 2/6/8 — `AUDIO_CONFIGURATION_*` in
-/// Limelight.h).
+/// Shared [`punktfunk_core::audio::layout_for`]. Unknown channel counts fall back
+/// to stereo — clients may only request 2/6/8 (`AUDIO_CONFIGURATION_*`).
 pub fn layout_for(params: &AudioParams) -> &'static OpusLayout {
     punktfunk_core::audio::layout_for(params.channels, params.high_quality)
 }
 
-/// The `a=fmtp:97 surround-params=` digit string for a layout: channelCount, streams,
-/// coupledStreams, then one mapping digit per channel.
+/// `a=fmtp:97 surround-params=` digit string: channelCount, streams, coupledStreams,
+/// then one mapping digit per channel.
 ///
-/// moonlight-common-c (`RtspConnection.c parseOpusConfigurations`, verified verbatim
-/// 2026-06-10) post-processes the NORMAL-quality mapping it parses — GFE advertised the
-/// FL FR C RL RR SL SR LFE channel order, the client wants FL FR C LFE RL RR SL SR — by
-/// moving the *last* digit to index 3 and sliding the rest up. We therefore pre-rotate the
-/// encoder mapping (`adv[3..ch-1] = enc[4..ch]`, `adv[ch-1] = enc[3]`) so the client's
-/// post-swap decoder mapping equals our encoder mapping exactly. The HIGH-quality string
-/// (the second surround-params match for a channel count) is used verbatim — no swap.
+/// moonlight-common-c `parseOpusConfigurations` moves the last NORMAL-quality digit
+/// to index 3 (GFE advertised FL FR C RL RR SL SR LFE; the decoder wants LFE at 3).
+/// We pre-rotate `adv[3..ch-1] = enc[4..ch]`, `adv[ch-1] = enc[3]` so the post-swap
+/// mapping equals the encoder. HQ strings are used verbatim.
 ///
-/// NB: Sunshine pre-rotates only indices `[3, 6)` (`audio::MAX_STREAM_CONFIG`, a config
-/// count, not a channel index), which leaves 7.1 LFE/SL/SR scrambled after the client's
-/// swap; we rotate over `[3, channels)` so 7.1 round-trips correctly.
+/// Do not copy Sunshine's `[3, 6)` rotate — that is a config count, not a channel
+/// index, and it scrambles 7.1 LFE/SL/SR.
 pub fn surround_params(layout: &OpusLayout, high_quality: bool) -> String {
     let ch = layout.channels as usize;
     let mut mapping = layout.mapping.to_vec();
@@ -134,7 +103,7 @@ pub fn surround_params(layout: &OpusLayout, high_quality: bool) -> String {
     s
 }
 
-/// GF(2⁸) multiply, reduction poly 0x11d (the nanors/oblas field both wire ends use).
+/// GF(2⁸) multiply, reduction poly 0x11d (nanors/oblas on both wire ends).
 fn gf_mul(mut a: u8, mut b: u8) -> u8 {
     let mut p = 0u8;
     for _ in 0..8 {
@@ -151,10 +120,9 @@ fn gf_mul(mut a: u8, mut b: u8) -> u8 {
     p
 }
 
-/// RS(4,2) parity over one aligned block of 4 encrypted payloads, exactly as nanors
-/// `reed_solomon_encode` with the patched [`FEC_MATRIX`] computes it. Returns `None` if the
-/// shard lengths differ — impossible under hard-CBR Opus + PKCS7 of equal input, but FEC is
-/// opportunistic so skipping a block is always safe (the client just loses recovery for it).
+/// RS(4,2) over one aligned block of encrypted payloads, matching nanors
+/// `reed_solomon_encode` with [`FEC_MATRIX`]. Unequal shard lengths return `None`
+/// and skip the block — FEC is opportunistic, so that only costs recovery.
 fn audio_parity(data: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
     debug_assert_eq!(data.len(), FEC_DATA_SHARDS);
     let len = data[0].len();
@@ -173,22 +141,19 @@ fn audio_parity(data: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
     Some(parity)
 }
 
-/// Build a GameStream RTP audio data packet: 12-byte BE `RTP_PACKET` header + Opus payload.
 fn build_rtp(seq: u16, timestamp: u32, opus: &[u8]) -> Vec<u8> {
     let mut p = Vec::with_capacity(12 + opus.len());
-    p.push(0x80); // RTP version 2, no padding/extension/CSRC
+    p.push(0x80); // RTP v2, no padding/extension/CSRC
     p.push(AUDIO_PACKET_TYPE);
     p.extend_from_slice(&seq.to_be_bytes());
     p.extend_from_slice(&timestamp.to_be_bytes());
-    p.extend_from_slice(&0u32.to_be_bytes()); // ssrc
+    p.extend_from_slice(&0u32.to_be_bytes());
     p.extend_from_slice(opus);
     p
 }
 
-/// Build a GameStream audio FEC packet: 12-byte RTP header (`packetType = 127`,
-/// `timestamp = 0`, like Sunshine) + 12-byte `AUDIO_FEC_HEADER { fecShardIndex u8,
-/// payloadType = 97, baseSequenceNumber BE u16, baseTimestamp BE u32, ssrc = 0 }`
-/// (moonlight-common-c `RtpAudioQueue.h`) + the parity bytes.
+/// FEC datagram: RTP (`packetType = 127`, `timestamp = 0`) + `AUDIO_FEC_HEADER`
+/// + parity. moonlight-common-c `RtpAudioQueue.h`.
 fn build_fec_rtp(
     rtp_seq: u16,
     shard_index: u8,
@@ -200,29 +165,27 @@ fn build_fec_rtp(
     p.push(0x80);
     p.push(AUDIO_FEC_PACKET_TYPE);
     p.extend_from_slice(&rtp_seq.to_be_bytes());
-    p.extend_from_slice(&0u32.to_be_bytes()); // timestamp (Sunshine leaves it 0)
-    p.extend_from_slice(&0u32.to_be_bytes()); // ssrc
+    p.extend_from_slice(&0u32.to_be_bytes()); // timestamp: Sunshine leaves 0
+    p.extend_from_slice(&0u32.to_be_bytes());
     p.push(shard_index);
-    p.push(AUDIO_PACKET_TYPE); // fecHeader.payloadType — stamped onto recovered packets
+    p.push(AUDIO_PACKET_TYPE); // stamped onto recovered packets
     p.extend_from_slice(&base_seq.to_be_bytes());
     p.extend_from_slice(&base_ts.to_be_bytes());
-    p.extend_from_slice(&0u32.to_be_bytes()); // fecHeader.ssrc
+    p.extend_from_slice(&0u32.to_be_bytes());
     p.extend_from_slice(parity);
     p
 }
 
-/// Slot for the persistent audio capturer, reused across streams (no leaked PipeWire
-/// thread). A surround session that needs a different channel count drops the cached
-/// capturer (clean RAII teardown) and opens a fresh one.
+/// Persistent capturer, reused across streams so the PipeWire thread is not leaked.
+/// A different channel count drops the cache and opens a new one.
 #[cfg(target_os = "linux")]
 pub type AudioCapSlot = Arc<std::sync::Mutex<Option<Box<dyn AudioCapturer>>>>;
 #[cfg(not(target_os = "linux"))]
 pub type AudioCapSlot =
     std::sync::Arc<std::sync::Mutex<Option<Box<dyn crate::audio::AudioCapturer>>>>;
 
-/// Spawn the audio stream thread (idempotent via `running`). Stops when `running` clears.
-/// `gcm_key`/`rikeyid` come from `/launch` and key the AES-CBC payload encryption;
-/// `params` is the negotiated [`AudioParams`] from the RTSP ANNOUNCE.
+/// Spawn the audio thread (idempotent via `running`). `gcm_key`/`rikeyid` are the
+/// `/launch` AES-CBC payload key — the name is GCM because video uses GCM.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[allow(clippy::too_many_arguments)] // one construction site (RTSP PLAY)
 pub fn start(
@@ -233,10 +196,9 @@ pub fn start(
     audio_cap: AudioCapSlot,
     on_lost: super::OnSessionLost,
     owner_ip: Option<std::net::IpAddr>,
-    // This session's ping payload — the other half of the endpoint guard beside `owner_ip`.
+    // Other half of the endpoint guard beside `owner_ip`.
     av_ping: [u8; super::AV_PING_LEN],
-    // Bumped as this thread's LAST act — the teardown-complete signal `/resume`'s media
-    // restart waits on (see `AppState::media_exited`).
+    // Last act of this thread: `/resume` waits on `AppState::media_exited`.
     media_exited: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let _ = std::thread::Builder::new()
@@ -254,10 +216,8 @@ pub fn start(
         });
 }
 
-/// Stub — the audio plane needs an audio-capture backend (PipeWire on Linux, WASAPI on
-/// Windows) + libopus; this keeps the remaining targets (e.g. macOS) compiling (crate doc:
-/// "the crate compiles everywhere"). Reports failure the same way the real stream thread
-/// does: clears `running`.
+/// No capture backend on this target. Fail the same way the real thread exits:
+/// clear `running`, bump `media_exited`.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 #[allow(clippy::too_many_arguments)] // signature parity with the real implementation
 pub fn start(
@@ -289,36 +249,27 @@ fn run(
     av_ping: &[u8; super::AV_PING_LEN],
 ) -> Result<()> {
     let sock = UdpSocket::bind(("0.0.0.0", AUDIO_PORT)).context("bind audio UDP")?;
-    // Grow SO_SNDBUF/RCVBUF; the opt-in DSCP/QoS tag happens after connect below (Windows
-    // qWAVE derives the flow from the connected 5-tuple).
     punktfunk_core::transport::grow_socket_buffers(&sock);
-    // The client pings the audio port (~every 500ms) so we learn where to send.
     tracing::debug!(port = AUDIO_PORT, "audio: awaiting client ping");
-    // Same guard as the video plane, through the same shared helper: owner IP plus this session's
-    // ping payload. Capturing the audio endpoint is a DoS rather than a disclosure (the payload is
-    // AES-CBC under `rikey`), but it is the same race and deserves the same answer.
+    // Same owner-IP + session-ping guard as video. Hijacking the endpoint is a DoS
+    // (payload is AES-CBC), not a disclosure, but the race is the same.
     let client = super::learn_client_endpoint(&sock, "audio", owner_ip, av_ping)?;
     sock.connect(client)
         .context("connect client audio endpoint")?;
-    // Opt-in DSCP/QoS-tag this as the audio class (PUNKTFUNK_DSCP=1); the guard keeps the
-    // Windows qWAVE flow alive for the whole stream (this function's scope IS the stream).
+    // Keep `_qos_flow` for this function's lifetime — Windows qWAVE dies if the
+    // flow handle is dropped mid-stream. Applied after `connect` (5-tuple).
     let _qos_flow = punktfunk_core::transport::set_media_qos(
         &sock,
         punktfunk_core::transport::MediaClass::Audio,
     );
     tracing::debug!(%client, "audio: client endpoint learned");
 
-    // Reuse the persistent capturer when its channel count still matches (drain stale
-    // buffered audio); otherwise drop it (clean PipeWire teardown) and open at the new count.
     let want = layout_for(&params).channels as u32;
-    // Always [`SAMPLE_RATE`], and never a negotiated one: this is Moonlight's protocol, whose
-    // audio stream is Opus at 48 kHz by definition (moonlight-common-c has no rate field to
-    // carry anything else, and libopus tops out at 48 kHz anyway). The hi-res `0xD3` plane is
-    // native-only for exactly that reason — `design/hi-res-audio.md` §3 lists this plane as
-    // permanently out of scope rather than merely deferred.
+    // Always 48 kHz: GameStream Opus has no rate field, and libopus tops out here.
+    // Hi-res `0xD3` is native-only (`design/hi-res-audio.md`).
     let mut cap = match audio_cap.lock().unwrap().take() {
         Some(mut c) if c.channels() == want => {
-            c.drain();
+            c.drain(); // previous session's buffer would play first
             c
         }
         Some(c) => {
@@ -333,14 +284,11 @@ fn run(
         None => audio::open_audio_capture(want, SAMPLE_RATE).context("open audio capture")?,
     };
     let result = audio_body(&mut *cap, &sock, gcm_key, rikeyid, params, running, on_lost);
-    cap.idle(); // parked between sessions — release the routing claim (Linux stream sink)
-    audio::park_audio_capture(audio_cap, cap); // drop on Windows (restores the default), keep on Linux
+    cap.idle(); // release the Linux stream-sink routing claim between sessions
+    audio::park_audio_capture(audio_cap, cap); // drop on Windows (restores default); keep on Linux
     result
 }
 
-/// Opus encoder for one session: the plain stereo encoder (the live-validated path, byte
-/// identical) or the safe `opus::MSEncoder` multistream encoder for 5.1/7.1. Both are
-/// cross-platform (Linux + Windows) — surround no longer needs `audiopus_sys`.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 enum SessionEncoder {
     Stereo(opus::Encoder),
@@ -350,9 +298,8 @@ enum SessionEncoder {
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl SessionEncoder {
     fn new(layout: &'static OpusLayout) -> Result<SessionEncoder> {
-        // RESTRICTED_LOWDELAY (`opus::Application::LowDelay`) + hard CBR, matching Sunshine — CBR
-        // keeps the Opus packet size constant, which the GameStream audio FEC (equal-length shards)
-        // relies on, and the client asserts a constant per-stream TOC.
+        // LowDelay + hard CBR: FEC shards must be equal length, and the client
+        // asserts a constant per-stream TOC.
         if layout.channels == 2 {
             let mut enc = opus::Encoder::new(
                 SAMPLE_RATE,
@@ -378,8 +325,7 @@ impl SessionEncoder {
         }
     }
 
-    /// Encode one interleaved frame into `out`, returning the packet length. Both encoders infer
-    /// the per-channel sample count from `frame.len()` and their channel count.
+    /// Both encoders infer per-channel samples from `frame.len()` and their channel count.
     fn encode_float(&mut self, frame: &[f32], out: &mut [u8]) -> Result<usize> {
         match self {
             SessionEncoder::Stereo(enc) => enc.encode_float(frame, out).context("opus encode"),
@@ -399,45 +345,38 @@ fn audio_body(
     rikeyid: i32,
     params: AudioParams,
     running: &AtomicBool,
-    // Whole-session teardown for the client-unreachable send errors below — video would
-    // otherwise keep streaming at the dead endpoint (see `AppState::end_session`).
+    // Tear the whole session down on send failure; otherwise video keeps streaming
+    // at the dead endpoint (`AppState::end_session`).
     on_lost: &super::OnSessionLost,
 ) -> Result<()> {
     let layout = layout_for(&params);
     let mut enc = SessionEncoder::new(layout)?;
-    // Opus frame duration; Moonlight negotiates 5 ms (default) or 10 ms via
-    // `x-nv-aqos.packetDuration` and sizes its decoder at `48 * duration` samples.
-    // Already snapped to {5, 10} at parse time; guard here too so only legal Opus frame
-    // sizes (48 kHz × {5,10} ms = 240/480 samples) ever reach the encoder.
+    // Snap to a legal Opus frame (48 kHz × {5,10} ms = 240/480). Parse already
+    // clamps; a bad value here would reach the encoder.
     let frame_ms = if params.packet_duration_ms >= 10 {
         10
     } else {
         5
     } as usize;
     let samples_per_channel = SAMPLE_RATE as usize * frame_ms / 1000;
-    let frame_len = samples_per_channel * layout.channels as usize; // interleaved samples
+    let frame_len = samples_per_channel * layout.channels as usize;
     let mut acc: Vec<f32> = Vec::with_capacity(frame_len * 4);
     let mut out = vec![0u8; 1400];
     let mut seq: u16 = 0;
     let mut timestamp: u32 = 0;
     let mut sent: u64 = 0;
-    // RS(4,2) FEC on EVERY layout (WP5.5) — stereo included. The parity math is
-    // layout-agnostic (shards are opaque encrypted packets), and a stock client's audio
-    // depacketizer runs the same fixed RS(4,2) recovery regardless of channel count; the old
-    // `channels > 2` gate was bring-up caution, and it left the MOST COMMON configuration with
-    // zero audio loss protection — one lost packet was an audible dropout no parity could heal.
+    // FEC on every layout: shards are opaque ciphertext, and the client RS(4,2)
+    // path is not channel-gated.
     let fec = true;
     let mut fec_block: Vec<Vec<u8>> = Vec::with_capacity(FEC_DATA_SHARDS);
     let (mut fec_base_seq, mut fec_base_ts) = (0u16, 0u32);
     let mut fec_skipped = false;
-    // Pacing anchor: PipeWire hands us large capture buffers (~1024 frames), so we'd otherwise
-    // emit packets in bursts the client's low-latency jitter buffer hears as glitching. Emit
-    // each frame at its packet-duration slot instead. Production is real-time, so the backlog
-    // stays small.
+    // Pace to packet duration. PipeWire hands ~1024-frame chunks; bursting them
+    // glitches the client's low-latency jitter buffer.
     let start = Instant::now();
     let mut frame_no: u64 = 0;
-    // Optional gain for quiet capture sources (PUNKTFUNK_AUDIO_GAIN, default 1.0). Soft-limited
-    // rather than clamped — see `crate::audio::capture_gain`.
+    // Soft-limited capture gain (`PUNKTFUNK_AUDIO_GAIN`); do not clamp — see
+    // `crate::audio::capture_gain`.
     let gain = crate::audio::capture_gain();
     tracing::info!(
         channels = layout.channels,
@@ -458,8 +397,6 @@ fn audio_body(
                 punktfunk_core::audio::apply_gain(&mut frame, gain);
             }
             let n = enc.encode_float(&frame, &mut out)?;
-            // AES-128-CBC the Opus payload (RTP header stays plaintext). Per-packet IV =
-            // BE32(rikeyid + seq) in [0..4], zero elsewhere; PKCS7 padding.
             let iv_seq = (rikeyid as u32).wrapping_add(seq as u32);
             let mut iv = [0u8; 16];
             iv[0..4].copy_from_slice(&iv_seq.to_be_bytes());
@@ -471,9 +408,8 @@ fn audio_body(
                 on_lost();
                 return Ok(());
             }
-            // Surround FEC: accumulate the encrypted payloads of the aligned 4-packet block;
-            // close the block with 2 parity packets (RTP seqs continue past the block, like
-            // Sunshine — the client places parity by the FEC header, not the RTP seq).
+            // RTP seq continues through parity, like Sunshine; the client places
+            // shards by the FEC header, not the RTP seq.
             if fec {
                 if seq % FEC_DATA_SHARDS as u16 == 0 {
                     fec_block.clear();
@@ -500,7 +436,6 @@ fn audio_body(
                             }
                         }
                         None if !fec_skipped => {
-                            // Shouldn't happen under hard CBR; log once and keep streaming.
                             tracing::warn!("audio: unequal packet sizes — FEC block skipped");
                             fec_skipped = true;
                         }
@@ -510,14 +445,14 @@ fn audio_body(
                 }
             }
             seq = seq.wrapping_add(1);
-            // GameStream's audio RTP timestamp ticks by packetDuration (ms), not by samples.
+            // GameStream audio RTP timestamp ticks by packetDuration (ms), not samples.
             timestamp = timestamp.wrapping_add(frame_ms as u32);
             sent += 1;
             if sent % 400 == 0 {
                 tracing::debug!(sent, "audio: streaming");
             }
 
-            // Hold each frame to its packet-duration slot (skip if we've fallen behind a burst).
+            // Sleep only when ahead; a capture burst must not queue sleeps.
             frame_no += 1;
             let scheduled = start + Duration::from_millis(frame_ms as u64 * frame_no);
             let now = Instant::now();
@@ -538,38 +473,36 @@ mod tests {
         let p = build_rtp(0x0102, 0x03040506, &[0xaa, 0xbb]);
         assert_eq!(p[0], 0x80);
         assert_eq!(p[1], 97);
-        assert_eq!(&p[2..4], &[0x01, 0x02]); // seq BE
-        assert_eq!(&p[4..8], &[0x03, 0x04, 0x05, 0x06]); // timestamp BE
-        assert_eq!(&p[8..12], &[0, 0, 0, 0]); // ssrc
-        assert_eq!(&p[12..], &[0xaa, 0xbb]); // opus payload
+        assert_eq!(&p[2..4], &[0x01, 0x02]);
+        assert_eq!(&p[4..8], &[0x03, 0x04, 0x05, 0x06]);
+        assert_eq!(&p[8..12], &[0, 0, 0, 0]);
+        assert_eq!(&p[12..], &[0xaa, 0xbb]);
     }
 
     #[test]
     fn frame_sizing() {
-        // 48 kHz · 5 ms = 240 samples/channel (the validated stereo default).
         assert_eq!(SAMPLE_RATE as usize * 5 / 1000, 240);
         assert_eq!(SAMPLE_RATE as usize * 10 / 1000, 480);
     }
 
-    /// FEC datagram layout: RTP(12, packetType 127) + AUDIO_FEC_HEADER(12) + parity.
     #[test]
     fn fec_packet_layout() {
         let p = build_fec_rtp(0x1234, 1, 0x1230, 0xAABBCCDD, &[0xEE, 0xFF]);
         assert_eq!(p[0], 0x80);
-        assert_eq!(p[1], 127); // RTP_PAYLOAD_TYPE_FEC
-        assert_eq!(&p[2..4], &[0x12, 0x34]); // RTP seq BE
-        assert_eq!(&p[4..8], &[0, 0, 0, 0]); // RTP timestamp (Sunshine: 0)
-        assert_eq!(&p[8..12], &[0, 0, 0, 0]); // RTP ssrc
-        assert_eq!(p[12], 1); // fecShardIndex
-        assert_eq!(p[13], 97); // fecHeader.payloadType (stamped on recovered packets)
-        assert_eq!(&p[14..16], &[0x12, 0x30]); // baseSequenceNumber BE
-        assert_eq!(&p[16..20], &[0xAA, 0xBB, 0xCC, 0xDD]); // baseTimestamp BE
-        assert_eq!(&p[20..24], &[0, 0, 0, 0]); // fecHeader.ssrc
-        assert_eq!(&p[24..], &[0xEE, 0xFF]); // parity payload
+        assert_eq!(p[1], 127);
+        assert_eq!(&p[2..4], &[0x12, 0x34]);
+        assert_eq!(&p[4..8], &[0, 0, 0, 0]);
+        assert_eq!(&p[8..12], &[0, 0, 0, 0]);
+        assert_eq!(p[12], 1);
+        assert_eq!(p[13], 97);
+        assert_eq!(&p[14..16], &[0x12, 0x30]);
+        assert_eq!(&p[16..20], &[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(&p[20..24], &[0, 0, 0, 0]);
+        assert_eq!(&p[24..], &[0xEE, 0xFF]);
     }
 
-    /// The advertised surround-params strings, locked: any change breaks what stock
-    /// Moonlight clients derive their decoder mapping from.
+    /// Locked SDP strings. Changing a digit breaks the mapping stock Moonlight
+    /// derives for its decoder.
     #[test]
     fn surround_params_strings() {
         assert_eq!(surround_params(&LAYOUT_STEREO, false), "21101");
@@ -579,8 +512,8 @@ mod tests {
         assert_eq!(surround_params(&LAYOUT_71_HQ, true), "88001234567");
     }
 
-    /// moonlight-common-c's normal-quality mapping swap (RtspConnection.c: `mapping[3] =
-    /// old[ch-1]; mapping[4..] = old[3..ch-1]`), replicated byte-for-byte.
+    /// moonlight-common-c `RtspConnection.c` normal-quality swap:
+    /// `mapping[3] = old[ch-1]`; `mapping[4..] = old[3..ch-1]`.
     fn client_swap(adv: &[u8]) -> Vec<u8> {
         let ch = adv.len();
         let mut m = adv.to_vec();
@@ -589,9 +522,8 @@ mod tests {
         m
     }
 
-    /// Protocol math, end to end: the mapping a stock client computes from our advertised
-    /// surround-params must equal the mapping we encode with — for the normal-quality
-    /// layouts after the client's GFE-order swap, for HQ layouts verbatim.
+    /// Encoder mapping must equal what the client derives: GFE-swap for normal
+    /// quality, verbatim for HQ.
     #[test]
     fn client_derived_mapping_matches_encoder() {
         for (layout, hq) in [
@@ -615,15 +547,12 @@ mod tests {
         }
     }
 
-    /// GF(2⁸) inverse by brute force (test-only).
     fn gf_inv(a: u8) -> u8 {
         (1..=255u8).find(|&b| gf_mul(a, b) == 1).unwrap()
     }
 
-    /// Self-consistency of the RS(4,2) code: erase any 2 data shards, solve the remaining
-    /// 2×2 system over GF(2⁸) with the same matrix, and recover the originals. (Matrix bytes
-    /// and gemm semantics are from moonlight-common-c `RtpAudioQueue.c` and `nanors/rs.c`;
-    /// this proves our parity is consistent with that generator matrix.)
+    /// Erase any 2 data shards and recover them from the remaining 2×2 over GF(2⁸).
+    /// Matrix and gemm match moonlight-common-c `RtpAudioQueue.c` / `nanors/rs.c`.
     #[test]
     fn fec_parity_recovers_two_losses() {
         let data: Vec<Vec<u8>> = vec![
@@ -646,7 +575,7 @@ mod tests {
                     }
                 }
             }
-            // Cramer over GF(2⁸): det = a·d ^ b·c (addition = XOR).
+            // Cramer over GF(2⁸): det = a·d ^ b·c (addition is XOR).
             let (a, b) = (FEC_MATRIX[0][e0], FEC_MATRIX[0][e1]);
             let (c, d) = (FEC_MATRIX[1][e0], FEC_MATRIX[1][e1]);
             let det = gf_mul(a, d) ^ gf_mul(b, c);
@@ -662,25 +591,21 @@ mod tests {
         }
     }
 
-    /// Unequal shard sizes must skip the block, never panic or emit bogus parity.
+    /// Unequal shards return `None` — do not emit mixed-length parity.
     #[test]
     fn fec_parity_rejects_unequal_shards() {
         let data = vec![vec![0u8; 10], vec![0u8; 10], vec![0u8; 9], vec![0u8; 10]];
         assert!(audio_parity(&data).is_none());
     }
 
-    /// Real-codec proof of the 5.1 mapping math: encode with our encoder layout, decode with
-    /// the mapping a stock Moonlight client derives from our advertised surround-params
-    /// (parse → GFE swap), and verify a tone fed into each input channel comes out on the
-    /// same output channel. Cross-platform via the safe `opus` crate — this also guards the
-    /// (now un-gated) Windows GameStream surround build.
+    /// Encode with our layout, decode with the client's GFE-swapped mapping: a tone
+    /// on each input channel must come out on the same output channel.
     #[test]
     fn multistream_51_roundtrip_channel_identity() {
         let layout = &LAYOUT_51;
         let samples = 240; // 5 ms
         let ch = layout.channels as usize;
 
-        // Client-side decoder mapping derived exactly as moonlight-common-c does (GFE swap).
         let s = surround_params(layout, false);
         let digits: Vec<u8> = s.bytes().map(|b| b - b'0').collect();
         let client_mapping = client_swap(&digits[3..]);
@@ -700,7 +625,7 @@ mod tests {
             .expect("multistream encoder");
             let mut out = vec![0u8; 1400];
             let mut energy = vec![0f64; ch];
-            // A few frames so the codec converges past its startup transient.
+            // 8 frames: skip the first 4 so energy is measured past the codec transient.
             for f in 0..8 {
                 let mut frame = vec![0f32; samples * ch];
                 for t in 0..samples {
@@ -732,16 +657,14 @@ mod tests {
         }
     }
 
-    /// Live 5.1 capture → multistream encode → decode, against a real PipeWire session.
-    /// Manual validation (needs `pactl load-module module-null-sink sink_name=pf51
-    /// channels=6 rate=48000` as the default sink):
-    ///   cargo test -p punktfunk-host --lib -- --ignored surround_capture
+    /// Live 5.1 capture → encode → decode. Needs
+    /// `pactl load-module module-null-sink sink_name=pf51 channels=6 rate=48000`
+    /// as the default sink, then
+    /// `cargo test -p punktfunk-host --lib -- --ignored surround_capture`.
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore]
     fn surround_capture_live() {
-        // 48 kHz, like every other GameStream capture site — Moonlight's protocol (see the
-        // comment at the live open in `audio_stream`).
         let mut cap = crate::audio::open_audio_capture(6, SAMPLE_RATE).expect("open 6ch capture");
         let layout = &LAYOUT_51;
         let mut enc = opus::MSEncoder::new(
@@ -752,7 +675,7 @@ mod tests {
             opus::Application::LowDelay,
         )
         .unwrap();
-        enc.set_vbr(false).ok(); // hard CBR so packet sizes are constant (audio FEC relies on it)
+        enc.set_vbr(false).ok();
         let mut out = vec![0u8; 1400];
         let mut acc: Vec<f32> = Vec::new();
         let frame_len = 240 * 6;
@@ -768,9 +691,7 @@ mod tests {
                 packets += 1;
             }
         }
-        // Hard CBR: every multistream packet must be the same size (audio FEC relies on it).
         assert_eq!(sizes.len(), 1, "CBR sizes: {sizes:?}");
-        // And a stock client's GFE-derived decoder must accept them.
         let s = surround_params(layout, false);
         let digits: Vec<u8> = s.bytes().map(|b| b - b'0').collect();
         let client_mapping = client_swap(&digits[3..]);

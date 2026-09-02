@@ -1,27 +1,23 @@
-//! Tier-1 microbenchmarks for the punktfunk/1 hot path — GPU-free, so they run in normal CI.
+//! GPU-free microbenchmarks for the punktfunk/1 hot path; they run in ordinary CI.
 //!
-//! Two layers:
-//!  - `crypto/*`  — the isolated AEAD primitives (AES-128-GCM + the negotiated
-//!    ChaCha20-Poly1305) on one ~MTU shard.
-//!  - `pipeline/*`— a whole frame through the real per-frame path end to end over the in-process
-//!    loopback transport: FEC encode → AES-GCM seal → packetize → (loopback) → reassemble →
-//!    FEC decode → open. This is what a throughput/latency regression in the core would show up in.
+//! `crypto/*` — AES-128-GCM and ChaCha20-Poly1305 on one ~MTU shard.
+//! `pipeline/*` — one frame through FEC encode → seal → packetize → loopback → reassemble →
+//! FEC decode → open. A core throughput/latency regression shows up here.
 //!
-//! The GPU capture/NVENC encode path is deliberately out of scope here (no GPU in CI) — that's the
-//! Tier-3 stream benchmark on a self-hosted GPU runner. Run locally with `cargo bench -p punktfunk-core`.
+//! GPU capture / NVENC is out of scope (no GPU in CI). Run with
+//! `cargo bench -p punktfunk-core`.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use punktfunk_core::config::{Config, FecConfig, FecScheme, ProtocolPhase, Role};
 use punktfunk_core::crypto::{SessionCrypto, SessionKey};
 use punktfunk_core::session::Session;
 use punktfunk_core::transport::loopback_pair;
-// NOT `criterion::black_box`: it still exists in 0.8 but is deprecated, and now just forwards to
-// this one. Benches compile under `--all-targets -D warnings`, so importing criterion's would fail
-// the lint gate rather than merely warn.
+// Not `criterion::black_box`: deprecated in 0.8 (forwards here). Benches compile under
+// `--all-targets -D warnings`, so that import is an error, not a warning.
 use std::hint::black_box;
 
 const TAG_LEN: usize = 16; // AEAD authentication tag (GCM and Poly1305 share the size)
-const SHARD: usize = punktfunk_core::config::mtu1500_shard_payload(); // one MTU-safe data shard
+const SHARD: usize = punktfunk_core::config::mtu1500_shard_payload();
 
 fn cfg(role: Role, scheme: FecScheme) -> Config {
     Config {
@@ -33,8 +29,7 @@ fn cfg(role: Role, scheme: FecScheme) -> Config {
         fec: FecConfig {
             scheme,
             fec_percent: 25,
-            // GF(2^8) is capped at ≤255 shards/block (Moonlight-compatible); GF(2^16) Leopard goes
-            // far higher. Use a realistic, valid block size for each.
+            // GF(2^8) ≤255 shards/block (Moonlight); GF(2^16) Leopard goes higher.
             max_data_per_block: match scheme {
                 FecScheme::Gf8 => 128,
                 FecScheme::Gf16 => 4096,
@@ -52,10 +47,9 @@ fn cfg(role: Role, scheme: FecScheme) -> Config {
 fn bench_crypto(c: &mut Criterion) {
     let mut g = c.benchmark_group("crypto");
     g.throughput(Throughput::Bytes(SHARD as u64));
-    // Both negotiated session AEADs. On the x86 / Apple Silicon this runs on, both must be
-    // line-rate-trivial — the chacha20 series is the host-side sealing-cost check for the
-    // negotiated soft-AES-armv7 path (design/chacha20-session-cipher.md §7). The AES series
-    // keeps its unsuffixed names so the CI regression compare retains its history.
+    // Both negotiated AEADs. The `_chacha20` series is the host sealing-cost check for the
+    // soft-AES-armv7 path (`design/chacha20-session-cipher.md`). AES keeps unsuffixed names so
+    // the CI regression compare retains its history.
     for (suffix, key) in [
         ("", SessionKey::Aes128Gcm([7u8; 16])),
         ("_chacha20", SessionKey::ChaCha20Poly1305([7u8; 32])),
@@ -85,8 +79,7 @@ fn bench_crypto(c: &mut Criterion) {
             b.iter(|| black_box(client.open(0, black_box(&sealed)).unwrap()))
         });
         g.bench_function(format!("open_in_place{suffix}"), |b| {
-            // In-place open consumes the buffer, so each iteration restores the ciphertext first —
-            // one memcpy, mirroring what the recv ring does when the next datagram lands in the slot.
+            // In-place open consumes the buffer, so each iteration restores the ciphertext first.
             let mut buf = sealed.clone();
             b.iter(|| {
                 buf.copy_from_slice(black_box(&sealed));
@@ -99,8 +92,7 @@ fn bench_crypto(c: &mut Criterion) {
 
 fn bench_pipeline(c: &mut Criterion) {
     let mut g = c.benchmark_group("pipeline");
-    // 64 KB ≈ a steady-state P-frame; 1 MB ≈ a keyframe/scene-cut. Both FEC schemes (GF(2^8)
-    // GameStream-compat vs GF(2^16) Leopard, the wall-breaker).
+    // 64 KB ≈ a steady-state P-frame; 1 MB ≈ a keyframe / scene-cut.
     for scheme in [FecScheme::Gf8, FecScheme::Gf16] {
         let label = match scheme {
             FecScheme::Gf8 => "gf8",

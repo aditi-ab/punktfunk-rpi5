@@ -1,23 +1,20 @@
 //! Session⇄game lifetime settings (`<config>/session-settings.json`).
 //!
-//! Two operator choices, both about what a session and its game owe each other
-//! (design/session-game-lifetime.md §8):
+//! Two operator choices (`design/session-game-lifetime.md`):
 //!
-//! * [`SessionSettings::session_on_game_exit`] — end the streaming session when the launched game
-//!   exits, so the client returns to its library instead of a bare desktop. **On by default**: it is
-//!   what a player expects, and it is already the shipped behavior for dedicated game sessions.
-//! * [`SessionSettings::game_on_session_end`] — end the launched game when the session ends.
-//!   **Off by default** ([`GameOnSessionEnd::Keep`]), because ending a game can cost unsaved
-//!   progress. `Always` additionally waits out [`SessionSettings::disconnect_grace_seconds`] so a
-//!   network blip never costs a save.
+//! * [`SessionSettings::session_on_game_exit`] — end the session when the
+//!   launched game exits. **On** by default.
+//! * [`SessionSettings::game_on_session_end`] — end the launched game when the
+//!   session ends. **Off** by default ([`GameOnSessionEnd::Keep`]): ending a
+//!   game can cost unsaved progress. `Always` waits
+//!   [`SessionSettings::disconnect_grace_seconds`] so a blip never costs a save.
 //!
-//! Deliberately its own small store rather than more axes on the display policy: keep-alive is about
-//! how long a *display* survives a disconnect (default 10 s), while this is about a *game* and the
-//! player's unsaved progress (default 5 minutes). Sharing one number would force one of them wrong.
+//! Its own store, not a display-policy axis: keep-alive is how long a *display*
+//! survives a disconnect (default 10 s); this is a *game* (default 5 minutes).
 //!
-//! Storage follows the same shape as `DisplayPolicyStore` / `pf_gpu::GpuPrefStore`: a missing **or**
-//! corrupt file means "unconfigured" with a warning (a settings file must never fail host startup),
-//! writes are private-dir + temp + atomic rename, and the in-memory value changes only after the
+//! Same shape as `DisplayPolicyStore` / `pf_gpu::GpuPrefStore`: missing or
+//! corrupt means unconfigured with a warning (never fail host startup), writes
+//! are private-dir + temp + atomic rename, and memory changes only after the
 //! write lands.
 
 use anyhow::Result;
@@ -30,15 +27,14 @@ use utoipa::ToSchema;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GameOnSessionEnd {
-    /// Leave it running (the historical behavior, and the default — nothing is ever killed unless
-    /// the operator asks for it).
+    /// Default: nothing is killed unless the operator asks.
     #[default]
     Keep,
-    /// End it when the client stops the session deliberately, but leave it running if the client
-    /// merely vanished — so a dropped connection stays reconnectable.
+    /// End it when the client stops the session deliberately; leave it running if
+    /// the client vanished, so a drop stays reconnectable.
     OnQuit,
-    /// End it whenever the session ends. A deliberate stop ends it at once; a drop starts the
-    /// reconnect window and ends it only if nobody comes back.
+    /// End it whenever the session ends. A deliberate stop ends it at once; a drop
+    /// starts the reconnect window and ends it only if nobody comes back.
     Always,
 }
 
@@ -52,28 +48,24 @@ impl GameOnSessionEnd {
     }
 }
 
-/// What to do with a title this client already has running when it launches a **different** one.
+/// What to do with a title this client already has running when it launches a
+/// **different** one.
 ///
-/// The third axis rather than a fourth value on [`GameOnSessionEnd`], because it answers a different
-/// question at a different moment: that one is "this session is over, what about its game", this one
-/// is "the player asked for something else, what about the last thing". Folding them together would
-/// tie two unrelated choices to one switch — an operator who wants a game to survive a disconnect
-/// very plausibly still wants it closed when they pick another title.
+/// A third axis, not a fourth [`GameOnSessionEnd`] value: that one is "this
+/// session is over"; this one is "the player asked for something else". An
+/// operator who wants a game to survive a disconnect can still want it closed
+/// when they pick another title.
 ///
-/// Scoped to the **same client's own launches**, and only ever to launches this host performed
-/// itself ([`crate::launchreg`]). A game the player started at the machine was never recorded there,
-/// so it can never be closed by this; nor can another client's game, which would otherwise let one
-/// device end someone else's session mid-play.
+/// Scoped to this client's own launches, and only launches this host performed
+/// ([`crate::launchreg`]). A game the player started at the machine was never
+/// recorded, so this cannot close it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GameOnNewLaunch {
-    /// Leave it running — the shipped default, and the same posture as [`GameOnSessionEnd::Keep`]:
-    /// ending a game can cost unsaved progress, so nothing is ended unless the operator asked.
+    /// Same posture as [`GameOnSessionEnd::Keep`]: ending a game can cost unsaved progress.
     #[default]
     Keep,
-    /// Close it, politely first (`WM_CLOSE` / `SIGTERM`), before starting the new title. What a
-    /// player coming from Moonlight expects, and the top request from the 2026-08-16 field report:
-    /// "auto-closing the active game when launching a new one".
+    /// Close it, politely first (`WM_CLOSE` / `SIGTERM`), before starting the new title.
     End,
 }
 
@@ -86,12 +78,11 @@ impl GameOnNewLaunch {
     }
 }
 
-/// The default reconnect window before `Always` ends a game — long enough to cover a Wi-Fi
-/// roam, a client crash-and-restart, or a walk to another room, because the cost of being wrong is
-/// the player's unsaved progress.
+/// Default reconnect window before `Always` ends a game. 300 s covers a Wi-Fi
+/// roam or a client restart; being wrong costs unsaved progress.
 const DEFAULT_GRACE_SECS: u32 = 300;
-/// Clamp bounds for the window. The floor keeps a mis-typed `1` from making `Always` behave like an
-/// instant kill; the ceiling (24 h) keeps a stray large value from pinning a lease forever.
+/// Floor keeps a typed `1` from making `Always` an instant kill; ceiling (24 h)
+/// keeps a stray large value from pinning a lease forever.
 const MIN_GRACE_SECS: u32 = 10;
 const MAX_GRACE_SECS: u32 = 86_400;
 
@@ -107,22 +98,17 @@ fn one() -> u32 {
     1
 }
 
-/// The persisted settings.
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct SessionSettings {
     #[serde(default = "one")]
     pub version: u32,
-    /// End the launched game when the session ends. See [`GameOnSessionEnd`].
     #[serde(default)]
     pub game_on_session_end: GameOnSessionEnd,
-    /// End the streaming session when the launched game exits.
     #[serde(default = "default_true")]
     pub session_on_game_exit: bool,
-    /// End this client's previous game when it launches a different one. See [`GameOnNewLaunch`].
     #[serde(default)]
     pub game_on_new_launch: GameOnNewLaunch,
-    /// How long a vanished client has to reconnect before `Always` ends its game. Ignored by the
-    /// other two policies.
+    /// Ignored unless `game_on_session_end` is `Always`.
     #[serde(default = "default_grace")]
     pub disconnect_grace_seconds: u32,
 }
@@ -140,7 +126,7 @@ impl Default for SessionSettings {
 }
 
 impl SessionSettings {
-    /// Clamp anything a hand-edited file (or a plugin) could get wrong.
+    /// Clamp anything a hand-edited file or plugin could get wrong.
     pub fn sanitized(mut self) -> Self {
         self.version = 1;
         self.disconnect_grace_seconds = self
@@ -150,14 +136,13 @@ impl SessionSettings {
     }
 }
 
-/// The store: the loaded file value (`None` when no file exists) behind its path.
 pub struct SessionSettingsStore {
     path: PathBuf,
     cur: Mutex<Option<SessionSettings>>,
 }
 
 impl SessionSettingsStore {
-    /// Load from `path`. Missing ⇒ unconfigured; corrupt ⇒ unconfigured **with a warning**, never a
+    /// Missing ⇒ unconfigured; corrupt ⇒ unconfigured **with a warning**, never a
     /// startup failure.
     pub fn load_from(path: PathBuf) -> Self {
         let cur = match std::fs::read(&path) {
@@ -177,7 +162,6 @@ impl SessionSettingsStore {
         }
     }
 
-    /// The stored settings, or the defaults when unconfigured.
     pub fn get(&self) -> SessionSettings {
         self.cur
             .lock()
@@ -186,13 +170,13 @@ impl SessionSettingsStore {
             .unwrap_or_default()
     }
 
-    /// Whether an operator has ever configured this host (drives the console's "using defaults" hint).
+    /// Drives the console's "using defaults" hint.
     pub fn configured(&self) -> bool {
         self.cur.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
-    /// Persist + adopt (sanitized first). Memory changes only if the write lands, so a full disk
-    /// can't leave the running host disagreeing with its own file.
+    /// Persist then adopt (sanitized first). Memory changes only if the write lands,
+    /// so a full disk cannot leave the running host disagreeing with its file.
     pub fn set(&self, settings: SessionSettings) -> Result<()> {
         let settings = settings.sanitized();
         if let Some(dir) = self.path.parent() {
@@ -206,9 +190,9 @@ impl SessionSettingsStore {
     }
 }
 
-/// The process-wide store, loaded once on first access — the same global-accessor shape as
-/// `vdisplay::prefs()` / `pf_gpu::prefs()`, because the lifetime decisions happen deep in the session
-/// teardown path where no app state is threaded.
+/// Process-wide store, loaded once on first access. Same shape as
+/// `vdisplay::prefs()` / `pf_gpu::prefs()`: lifetime decisions happen in session
+/// teardown, where no app state is threaded.
 pub fn store() -> &'static SessionSettingsStore {
     static STORE: OnceLock<SessionSettingsStore> = OnceLock::new();
     STORE.get_or_init(|| {
@@ -216,13 +200,12 @@ pub fn store() -> &'static SessionSettingsStore {
     })
 }
 
-/// The effective settings (shorthand for `store().get()`).
 pub fn get() -> SessionSettings {
     store().get()
 }
 
-/// Which lifetime axes this build actually acts on, for the console to grey out the rest. Both
-/// directions need a launch path and a way to see processes; macOS has neither today.
+/// Lifetime axes this build acts on, for the console to grey out the rest.
+/// Both directions need a launch path and process visibility; macOS has neither.
 pub fn enforced() -> Vec<String> {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
@@ -246,8 +229,7 @@ mod tests {
     #[test]
     fn defaults_are_the_documented_ones() {
         let d = SessionSettings::default();
-        // End-session-on-game-exit ships ON; ending games ships OFF — on BOTH the axes that can
-        // end one, because both of them cost unsaved progress when they are wrong.
+        // session_on_game_exit ships on; both axes that can kill a game ship off.
         assert!(d.session_on_game_exit);
         assert_eq!(d.game_on_session_end, GameOnSessionEnd::Keep);
         assert_eq!(d.game_on_new_launch, GameOnNewLaunch::Keep);
@@ -256,8 +238,7 @@ mod tests {
 
     #[test]
     fn an_empty_object_decodes_to_the_defaults() {
-        // Every field is `#[serde(default)]`, so a file written by an older/partial writer keeps
-        // working instead of failing the load.
+        // Every field is `#[serde(default)]`, so a partial or older writer still loads.
         let s: SessionSettings = serde_json::from_str("{}").expect("empty object");
         assert!(s.session_on_game_exit);
         assert_eq!(s.game_on_session_end, GameOnSessionEnd::Keep);
@@ -319,7 +300,7 @@ mod tests {
                 game_on_session_end: GameOnSessionEnd::Always,
                 session_on_game_exit: false,
                 game_on_new_launch: GameOnNewLaunch::End,
-                disconnect_grace_seconds: 5, // below the floor
+                disconnect_grace_seconds: 5,
             })
             .expect("write");
         assert!(store.configured());
@@ -329,7 +310,6 @@ mod tests {
         assert_eq!(got.game_on_new_launch, GameOnNewLaunch::End);
         assert_eq!(got.disconnect_grace_seconds, MIN_GRACE_SECS);
         assert_eq!(got.version, 1, "version is normalized, not echoed");
-        // A fresh load sees the same thing, and no temp file is left behind.
         let reloaded = SessionSettingsStore::load_from(path.clone());
         assert_eq!(reloaded.get().game_on_session_end, GameOnSessionEnd::Always);
         assert!(!path.with_extension("json.tmp").exists());

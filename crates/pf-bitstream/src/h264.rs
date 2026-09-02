@@ -1,27 +1,20 @@
 // Copyright 2023 The ChromiumOS Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file (vendor/cros-codecs/LICENSE).
-//
-// Adapted from cros-codecs `decoder/stateless/h264.rs` (see
-// vendor/cros-codecs/PROVENANCE.md for the snapshot pin). The spec machinery — POC
-// computation (8.2.1), frame_num-gap handling (8.2.5.2), reference list initialization
-// and modification (8.2.4), sliding-window and adaptive MMCO marking (8.2.5), DPB
-// bumping/output (C.4.5.3) — is ported faithfully and keeps upstream's structure and
-// spec-section comments so future upstream diffs stay legible. Stripped: the
-// StatelessDecoder/backend trait plumbing, fd/event machinery, pooled-buffer handling,
-// and the interlaced field-splitting paths (the envelope gate below rejects interlaced
-// streams outright).
 
-//! Per-AU H.264 planning: [`H264Planner::plan_au`] turns one access unit exactly as the
-//! pump hands it to a decoder (Annex-B, parameter sets + the slices of one picture) into
-//! an [`AuPlan`] — everything a stateless hardware decoder needs before submission and
-//! nothing it has to re-derive: parsed headers, POC, per-slice reference lists (with
-//! long-term/MMCO state, which host RFI recovery leans on) and the DPB delta.
+// Port of vendor/cros-codecs `decoder/stateless/h264.rs` (PROVENANCE.md).
+// Spec 8.2.1–8.2.5 and C.4.5.3 keep upstream structure so diffs stay
+// legible. Stripped: decoder plumbing and interlaced field-split
+// (the envelope gate rejects those streams).
+
+//! Per-AU H.264 planning. [`H264Planner::plan_au`] turns one Annex-B
+//! access unit (parameter sets plus the slices of one picture) into an
+//! [`AuPlan`]: parsed headers, POC, per-slice reference lists
+//! (long-term/MMCO included), and the DPB delta.
 //!
-//! Concealment posture: a `frame_num` gap or a reference that is not in the DPB is a
-//! [`PlanWarning`], never an error — the session layer sees the warning and requests
-//! recovery while planning continues. [`PlanError`] is reserved for AUs that cannot be
-//! planned at all.
+//! A `frame_num` gap or a missing DPB reference is a [`PlanWarning`],
+//! not an error: planning continues and the session requests recovery.
+//! [`PlanError`] is only for AUs that cannot be planned at all.
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
@@ -60,67 +53,41 @@ pub use cros_codecs::codec::h264::parser::SliceHeader;
 use crate::sei;
 pub use crate::sei::RecoveryPoint;
 
-/// Stable identity of a stored picture, monotonically increasing per stored picture.
-///
-/// This is what backends map to hardware DPB slots. Indices into the live DPB `Vec`
-/// shift on bumping and must never be exposed; the `Dpb<PicId>` handle parameter carries
-/// this id instead.
+/// Backend DPB-slot identity. Live-DPB `Vec` indices shift on bumping; do not expose them.
 pub type PicId = u64;
 
-/// Everything a backend needs to submit one access unit.
 #[derive(Debug, Clone)]
 pub struct AuPlan {
     pub picture: PicturePlan,
     pub slices: Vec<SlicePlan>,
     pub dpb: DpbUpdate,
-    /// Every picture the DPB holds marked "used for reference" at the moment this AU
-    /// decodes — the MARKED DPB, not this AU's reference lists.
+    /// Marked DPB at begin-picture, not this AU's reference lists.
     ///
-    /// [`Self::dpb`] reports a delta (stored/outputs/removed) because that is what a
-    /// surface allocator needs. This is the other half: the STATE, which is what the
-    /// DXVA picture-parameters formats ask for. `DXVA_PicParams_H264::RefFrameList`
-    /// is spec-defined as the pictures currently marked used for reference — with
-    /// `UsedForReferenceFlags` a statement about the DPB, not about this access unit
-    /// — and libavcodec's DXVA path fills it by walking its whole DPB
-    /// (`short_ref` then `long_ref`), not the derived lists. Vulkan's
-    /// `pReferenceSlots` is the opposite: spec-defined as the slots THIS decode
-    /// operation uses, so a subset is correct there and the native Vulkan rung binds
-    /// the AU's own set.
+    /// Captured after 8.2.5.2 gap placeholders and any IDR drain, before this
+    /// AU's 8.2.5 marking. A picture named here may still appear in
+    /// [`DpbUpdate::removed`]: it was a valid reference for this decode and
+    /// unmarked at the end.
     ///
-    /// The difference bites on the long-term/RFI class: a long-term reference held
-    /// across pictures that none of them names is absent from every derived list yet
-    /// must stay in `RefFrameList`, because a driver keeping per-reference state is
-    /// entitled to read its absence as "no longer a reference" and discard it.
+    /// DXVA `RefFrameList` is the pictures currently marked used for
+    /// reference. A long-term picture that no slice names must stay here — a
+    /// driver may treat absence as "no longer a reference". Vulkan
+    /// `pReferenceSlots` is this operation's slots; the native rung binds the
+    /// AU's own set.
     ///
-    /// Captured at BEGIN-picture time — after 8.2.5.2 gap placeholders are inserted
-    /// and after any IDR drain, before this AU's own end-of-picture marking (8.2.5)
-    /// stores or evicts anything. That is exactly the DPB the hardware decodes this
-    /// picture against, and it is why a picture named here may still appear in
-    /// [`DpbUpdate::removed`] of the same plan: it was a valid reference for this
-    /// decode and stopped being one at its end.
-    ///
-    /// Order is the DPB's own (oldest stored first). DXVA imposes none — a driver
-    /// resolves an entry by its `FrameNumList`/`FieldOrderCntList` pair — so
-    /// backends are free to reorder, and pf-dxvadec does.
-    ///
-    /// 8.2.5.2 gap placeholders are ABSENT: they carry no [`PicId`], so there is no
-    /// surface a backend could name. A frame the DPB holds only for OUTPUT (already
-    /// unmarked) is absent too — it is not a reference.
+    /// 8.2.5.2 placeholders have no [`PicId`] and are omitted. Pictures held
+    /// only for output (already unmarked) are omitted. Order is DPB storage
+    /// order; backends may reorder.
     pub dpb_refs: Vec<RefPic>,
     pub warnings: Vec<PlanWarning>,
-    /// The SPS the planner activated for this AU — the one [`Self::picture`]'s
-    /// parameters derive from (the FIRST slice's PPS's SPS; a later slice may
-    /// legally reference another PPS, and that drift deliberately does not reach
-    /// here). Cloned out of the parser's table so backends build their parameter
-    /// objects from exactly what was activated, never by re-parsing the AU.
+    /// SPS activated for this AU: the first slice's PPS's SPS. A later slice
+    /// may name another PPS; that drift does not reach here. Cloned from the
+    /// parser table so backends never re-parse the AU.
     pub sps: Rc<Sps>,
-    /// The PPS the picture was begun with (the first slice's), same contract as
-    /// [`Self::sps`]. Its `sps` field is the same `Rc` as [`Self::sps`].
+    /// PPS the picture began with (first slice). Same `Rc` as [`Self::sps`].
     pub pps: Rc<Pps>,
 }
 
-/// Per-picture parameters, captured after 8.2.1 POC derivation and before end-of-picture
-/// marking (the values a hardware picture-parameters struct wants).
+/// Picture parameters after 8.2.1 POC and before end-of-picture marking.
 #[derive(Debug, Clone)]
 pub struct PicturePlan {
     pub is_idr: bool,
@@ -129,41 +96,31 @@ pub struct PicturePlan {
     pub frame_num: u16,
     pub top_field_order_cnt: i32,
     pub bottom_field_order_cnt: i32,
-    /// The final PicOrderCnt of the picture (min of top/bottom for a frame).
+    /// PicOrderCnt: min of top/bottom for a frame.
     pub pic_order_cnt: i32,
     pub coded_width: u32,
     pub coded_height: u32,
-    /// Conformance-window crop (7.4.2.1.1), in luma samples of the coded picture.
+    /// Conformance-window crop (7.4.2.1.1), luma samples of the coded picture.
     pub display_crop: DisplayCrop,
-    /// Colour signalling from the ACTIVE SPS's VUI (E.2.1 inference where absent).
-    /// Per picture, like [`Self::display_crop`], never latched at session start:
-    /// the Windows host switches an HDR desktop to PQ/BT.2020 IN-BAND with a new
-    /// SPS mid-stream, so a backend that captured the first AU's colour would
-    /// paint HDR frames washed out.
+    /// Colour from the active SPS VUI (E.2.1 inference when absent). Per
+    /// picture, never latched at session start: a new SPS can switch colour
+    /// mid-stream.
     pub colour: ColourDescription,
     pub profile_idc: u8,
     pub level_idc: Level,
     pub bit_depth_luma_minus8: u8,
     pub bit_depth_chroma_minus8: u8,
     pub chroma_format_idc: u8,
-    /// DPB size in frames per A.3.1 — backends size their slot pool from this.
+    /// DPB size in frames (A.3.1). Backends size their slot pool from this.
     pub max_dpb_frames: usize,
     pub recovery_point: Option<RecoveryPoint>,
-    /// Every picture this AU predicts from was itself decoded from a fully-available
-    /// reference chain — so a host claim that this AU is a clean re-anchor
-    /// (`USER_FLAG_RECOVERY_ANCHOR`) can be corroborated rather than taken on trust.
-    /// `true` for an IDR (nothing to predict from) and for any picture whose whole
-    /// reference chain is clean; `false` from the moment this AU — or anything it
-    /// descends from — needed concealment.
-    ///
-    /// Purely additive observation: nothing in the plan, the warnings or the DPB
-    /// changes because of it, and on a stream that never loses a reference it is
-    /// `true` on every picture forever. See [`crate::clean`] for why it propagates and
-    /// why every rule errs toward `false`.
+    /// Whether every picture this AU predicts from came off an intact chain.
+    /// `true` for an IDR and for a fully-clean chain; `false` once this AU or
+    /// an ancestor needed concealment. Observation only — does not change the
+    /// plan, warnings, or DPB. See [`crate::clean`].
     pub references_clean: bool,
 }
 
-/// The region of the coded picture that is actually displayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisplayCrop {
     pub x: u32,
@@ -172,13 +129,9 @@ pub struct DisplayCrop {
     pub height: u32,
 }
 
-/// One picture's colour signalling: raw H.273 code points off the active SPS's
-/// VUI. When the VUI (or its `video_signal_type`/`colour_description` blocks) is
-/// absent these hold E.2.1's INFERRED values — 2/2/2 ("unspecified") with limited
-/// range — never a raw struct-zero (0 is a reserved code point no real stream
-/// means). That matches the CICP libavcodec reports for such streams, so backends
-/// forward these untouched and the consumer's CSC resolves "unspecified" to its
-/// SDR default.
+/// H.273 code points from the active SPS VUI. Absent VUI (or its colour
+/// blocks) yields E.2.1 inference: 2/2/2 unspecified, limited range — never
+/// struct-zero (0 is a reserved code point).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColourDescription {
     pub colour_primaries: u8,
@@ -188,76 +141,59 @@ pub struct ColourDescription {
     pub video_full_range: bool,
 }
 
-/// One slice NALU of the picture, with its reference lists fully derived.
 #[derive(Debug, Clone)]
 pub struct SlicePlan {
-    /// Byte range of the slice NALU in the input AU, start code included — hardware
-    /// decoders take the raw bitstream, so the plan points instead of copying.
+    /// Byte range of the slice NALU in the AU, start code included. Points; does not copy.
     pub data: Range<usize>,
-    /// The parsed slice header, as the vendored parser produced it.
     pub header: SliceHeader,
     pub ref_list0: Vec<RefPic>,
     pub ref_list1: Vec<RefPic>,
 }
 
-/// A reference list entry: the minimum every backend picparams format needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefPic {
     pub id: PicId,
-    /// The stored picture's 8.2.1 field order counts. Equal for a progressive frame
-    /// UNLESS the PPS set `bottom_field_pic_order_in_frame_present_flag` and the
-    /// slice carried a nonzero `delta_pic_order_cnt_bottom` — backend picparams
-    /// formats want the pair, and collapsing to one value would fabricate the bottom
-    /// count. After an MMCO 5 these are the picture's REBASED values (8.2.5.4.5),
-    /// which is what later AUs reference it by — see [`PlanWarning::Mmco5Rebase`].
+    /// 8.2.1 field order counts. Keep the pair: a nonzero
+    /// `delta_pic_order_cnt_bottom` makes them differ even on a progressive
+    /// frame. After MMCO 5 these are the rebased values later AUs key by
+    /// (8.2.5.4.5).
     pub top_field_order_cnt: i32,
     pub bottom_field_order_cnt: i32,
     pub is_long_term: bool,
-    /// `frame_num` for short-term references, `LongTermFrameIdx` for long-term ones —
-    /// the pair DXVA and Vulkan both key reference pictures by.
+    /// `frame_num` (short-term) or `LongTermFrameIdx` (long-term). DXVA and Vulkan key by this pair.
     pub frame_num_or_lt_idx: u16,
 }
 
-/// The DPB delta of one planned AU: what to allocate, what is display-ready, what can
-/// be freed.
 #[derive(Debug, Clone, Default)]
 pub struct DpbUpdate {
-    /// The id assigned to this AU's picture — allocate a surface for it.
+    /// Id assigned to this AU's picture; allocate a surface for it.
     pub stored: Option<PicId>,
-    /// Display-ready pictures, in output (bumping) order.
+    /// Display-ready pictures, in C.4.5.3 bumping order.
     pub outputs: Vec<PicId>,
-    /// Pictures the planner will never reference again; free once displayed.
+    /// Never referenced again; free once displayed.
     pub removed: Vec<PicId>,
 }
 
-/// Concealment signals: planning continues, the session layer requests recovery.
+/// Concealment: planning continues; the session requests recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanWarning {
-    /// `frame_num` skipped a value — at least one reference AU was lost upstream.
+    /// `frame_num` skipped; at least one reference AU was lost.
     FrameNumGap { expected: u16, got: u16 },
-    /// A slice or MMCO named a reference picture the DPB does not hold.
     MissingReference {
         context: &'static str,
         detail: String,
     },
-    /// The AU's NALU walk stopped early — a malformed NALU with real data behind it,
-    /// or a slice belonging to another picture (mis-split AU). The plan covers only
-    /// the slices before the cut; `offset` is the byte position of the cut in the AU.
+    /// NALU walk stopped early (malformed NALU or a slice of another picture).
+    /// The plan covers only slices before the cut; `offset` is that byte.
     TruncatedAu { offset: usize },
-    /// The AU carried an MMCO 5 (8.2.5.4.5): the DPB was drained and the CURRENT
-    /// picture's stored frame_num/POC were rebased to zero AFTER its plan was
-    /// captured. Spec-legal and fully planned — the [`PicturePlan`] holds the
-    /// pre-rebase 8.2.1 values a decoder submits with, while later AUs reference the
-    /// picture by its rebased values ([`RefPic`] carries the stored pair). punktfunk
-    /// hosts never emit MMCO 5, so this warning is the field signal if that
-    /// assumption ever breaks.
+    /// MMCO 5 (8.2.5.4.5): DPB drained and the current picture's stored
+    /// frame_num/POC rebased to zero after the plan was captured.
+    /// [`PicturePlan`] holds the pre-rebase 8.2.1 values; later AUs key the
+    /// picture by the rebased pair on [`RefPic`].
     Mmco5Rebase,
-    /// The SPS carried no VUI `bitstream_restriction`, so the DPB had to be sized from
-    /// A.3.1's LEVEL ceiling — and that ceiling demands more hardware slots than a
-    /// mainstream decoder provides. See [`dpb_limit`] for why this is the H.264 shape
-    /// of the defect #96 fixed for HEVC, and why it is a warning here rather than a
-    /// clamp. Every H.264 encoder a punktfunk host can reach writes the restriction
-    /// (measured 2026-08-07), so this warning is the field signal if that ever breaks.
+    /// No VUI `bitstream_restriction`; DPB sized from A.3.1's level ceiling,
+    /// which can exceed what a mainstream decoder provides. Warning, not a
+    /// clamp: see [`dpb_limit`].
     LevelDerivedDpb {
         max_dpb_frames: usize,
         level_idc: u8,
@@ -265,30 +201,15 @@ pub enum PlanWarning {
 }
 
 impl PlanWarning {
-    /// Does this warning mean the PICTURE is damaged — the plan was completed with a
-    /// SUBSTITUTE in place of something that was lost — rather than reporting a
-    /// spec-legal fact about the stream's envelope?
+    /// Whether the picture is damaged (a substitute for something lost) rather
+    /// than a spec-legal envelope fact.
     ///
-    /// The distinction decides two things that must never disagree: whether a consumer
-    /// releases the AU's output unshown and asks for a re-anchor, and whether the
-    /// picture enters [`crate::clean::CleanLedger`] as unclean. It lives HERE, on the
-    /// enum, because those two consumers sit in different crates and a second copy of
-    /// the list would let one of them conceal damage the other reports — the exact
-    /// shape of the invisible-corruption failure the native-decode program exists to
-    /// end. `pf_vkdecode::is_integrity_warning` delegates to this.
+    /// `true` means conceal the output and mark the picture unclean in
+    /// [`crate::clean::CleanLedger`]. Lives on the enum so those two consumers
+    /// cannot disagree. `Mmco5Rebase` and `LevelDerivedDpb` are not damage.
     ///
-    /// `Mmco5Rebase` is not damage: the AU carried an MMCO 5 and this planner planned
-    /// it in full (the plan holds the pre-rebase 8.2.1 values; later AUs reference the
-    /// rebased ones). `LevelDerivedDpb` is not either: the picture is intact and fully
-    /// planned — it reports that the SPS never declared its DPB depth, so the plan had
-    /// to size from A.3.1's level ceiling, a property of the STREAM's signalling which
-    /// a backend answers by failing to open a session, not by showing a damaged frame.
-    ///
-    /// Written as an EXHAUSTIVE match with no wildcard, deliberately. A `matches!` (or
-    /// a `_ => false`) makes "damage" the opt-in and silence the default, so a variant
-    /// added later — by definition one nobody here has classified — would be reported
-    /// as clean and its picture shown. The compiler is the only reviewer guaranteed to
-    /// be present when that variant is written, so it gets the decision.
+    /// Exhaustive match, no wildcard: a new variant must be classified or the
+    /// build fails. A `_ => false` would report unclassified damage as clean.
     pub fn is_integrity(&self) -> bool {
         match self {
             PlanWarning::FrameNumGap { .. }
@@ -299,18 +220,15 @@ impl PlanWarning {
     }
 }
 
-/// The AU cannot be planned at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
     Parse(String),
-    /// Legal H.264, but outside what punktfunk hosts emit (clients only decode
-    /// punktfunk hosts, so this is a stream-integrity failure, not a feature gap).
+    /// Legal H.264 outside what punktfunk hosts emit. Stream-integrity failure, not a feature gap.
     OutsideEnvelope(&'static str),
     NoActiveParamSet {
         pps_id: u8,
     },
-    /// [`H264Planner::flush`] discarded the decoding state; planning resumes only at
-    /// an IDR (the port of upstream's `Reset` gating).
+    /// [`H264Planner::flush`] discarded decoding state; planning resumes only at an IDR.
     AwaitingIdr,
 }
 
@@ -333,7 +251,6 @@ impl std::fmt::Display for PlanError {
 
 impl std::error::Error for PlanError {}
 
-/// Keeps track of the last values seen for negotiation purposes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct NegotiationInfo {
     coded_resolution: Resolution,
@@ -359,62 +276,30 @@ impl From<&Sps> for NegotiationInfo {
     }
 }
 
-/// The hardware DPB slot count a mainstream decoder provides. NVIDIA's Vulkan Video
-/// reports `maxDpbSlots = 16` (RADV 17), and DXVA/D3D11VA's H.264 picture-parameter
-/// format indexes the DPB with a 16-entry array. Backends allocate one slot per DPB
-/// frame plus one for the picture in flight, so a stream whose DPB is sized at 16
-/// demands 17 and is refused outright — losing the codec, not merely a slower path.
+/// Mainstream hardware DPB slots: DXVA's H.264 picparams array is 16 entries;
+/// Vulkan Video reports the same. Backends need one extra slot for the picture
+/// in flight, so a 16-frame DPB demands 17 and is refused.
 const MAINSTREAM_MAX_DPB_SLOTS: usize = 16;
 
-/// DPB size in frames — the same question [`crate::h265::dpb_limit`] answers, and the
-/// same trap, but H.264 gets a different answer and it is worth writing down why.
+/// DPB size in frames. Same question as [`crate::h265::dpb_limit`], different
+/// answer: H.264 has no unconditional SPS field. The stream states its need
+/// only in the VUI `bitstream_restriction` (`max_dec_frame_buffering`, E.2.1).
+/// Absent that, A.3.1's level ceiling
+/// `min(MaxDpbMbs / (PicWidthInMbs * FrameHeightInMbs), 16)` is the spec
+/// inference — and it saturates at 16 whenever the picture is small relative
+/// to the level, which is [`MAINSTREAM_MAX_DPB_SLOTS`] + 1 hardware slots.
 ///
-/// HEVC's SPS states its own requirement outright (`sps_max_dec_pic_buffering_minus1`),
-/// so #96 could simply stop consulting equation A-2's level ceiling. H.264 has no such
-/// unconditional field: the stream declares its need ONLY in the VUI's
-/// `bitstream_restriction` (`max_dec_frame_buffering`, E.2.1). Absent that, A.3.1's
-/// level ceiling — `min(MaxDpbMbs / (PicWidthInMbs * FrameHeightInMbs), 16)` — is all
-/// the spec leaves, and it is genuinely the correct inference, not a bug. It is also
-/// what the stream MAY use rather than what it needs, which is exactly the shape that
-/// killed HEVC at 720p and 1080p.
-///
-/// The ceiling saturates at 16 — thus [`MAINSTREAM_MAX_DPB_SLOTS`] + 1 hardware slots,
-/// the fatal value — whenever the picture is small relative to its level's `MaxDpbMbs`:
-///
-/// | picture | ceiling by level |
-/// |---|---|
-/// | 720p (3600 MBs) | L3.2 → 5, L4.2 → 9, **L5.0+ → 16** |
-/// | 1080p (8160 MBs) | L4.2 → 4, L5.0 → 13, **L5.1+ → 16** |
-/// | 1440p (14400 MBs) | L5.1 → 12, **L6.0+ → 16** |
-/// | 2160p (32400 MBs) | L5.2 → 5, **L6.0+ → 16** |
-///
-/// So H.264 escaped #96 twice over rather than by one piece of luck, and BOTH escapes
-/// are properties of the encoders, not of the format. Measured 2026-08-07 by reading
-/// the SPS each encoder actually emitted, at 720p/1080p/1440p/2160p:
-///
-/// | encoder | level picked | `bitstream_restriction` | `max_dec_frame_buffering` |
-/// |---|---|---|---|
-/// | NVENC (RTX 5070 Ti, 610.57.04) | 3.2 / 4.2 / 5.1 / 5.2 | present | 3 |
-/// | VAAPI via libavcodec (RDNA3, Mesa 26.0.3) | 4.1 / 4.2 / 5.1 / 5.2 | present | 1 |
-/// | openh264 (software rung) | 3.2 / 4.2 / 5.1 / 5.2 | present | 1 |
-///
-/// Every one of them picks a level proportionate to the picture AND states its real
-/// need in the VUI, so the ceiling is never reached and never consulted. That is why
-/// this function does NOT clamp: with the restriction present the value below IS the
-/// stream's own statement, and clamping a stream that genuinely asked for a deep DPB
-/// would corrupt its output. Absent the restriction there is no honest smaller number
-/// to substitute — [`PlanWarning::LevelDerivedDpb`] names the situation instead, so the
-/// field tells us if a driver ever stops writing the VUI, rather than a user silently
-/// losing H.264 the way #96's users silently lost HEVC.
+/// Do not clamp. With the restriction present the value is the stream's own
+/// statement; clamping a deep DPB would corrupt output. Without it there is
+/// no honest smaller number — [`PlanWarning::LevelDerivedDpb`] names that
+/// case instead.
 fn dpb_limit(sps: &Sps) -> usize {
-    // A.3.1's cap, the VUI override and the `max_num_ref_frames` floor all live in the
-    // vendored parser; this is the one named place the RESULT is interpreted.
+    // A.3.1 cap, VUI override, and `max_num_ref_frames` floor live in the parser.
+    // This is the named place the result is interpreted.
     sps.max_dpb_frames()
 }
 
-/// Whether [`dpb_limit`] had to fall back to A.3.1's level ceiling because the SPS
-/// carried no VUI `bitstream_restriction` — i.e. whether the number is the stream's own
-/// statement of need or merely the largest DPB its level permits.
+/// True when [`dpb_limit`] used A.3.1's level ceiling, not a VUI `bitstream_restriction`.
 fn dpb_is_level_derived(sps: &Sps) -> bool {
     !(sps.vui_parameters_present_flag && sps.vui_parameters.bitstream_restriction_flag)
 }
@@ -425,7 +310,7 @@ enum RefPicList {
     RefPicList1,
 }
 
-/// Cached variables from the previous reference picture (8.2.1).
+/// Previous reference picture, for 8.2.1 POC.
 struct PrevReferencePicInfo {
     frame_num: u32,
     has_mmco_5: bool,
@@ -459,7 +344,7 @@ impl PrevReferencePicInfo {
     }
 }
 
-/// Cached variables from the previous picture (8.2.1).
+/// Previous picture, for 8.2.1 POC.
 #[derive(Default)]
 struct PrevPicInfo {
     frame_num: u32,
@@ -475,41 +360,31 @@ impl PrevPicInfo {
     }
 }
 
-/// Used to track that `first_mb_in_slice` increases monotonically (7.4.3).
-///
-/// Upstream tracks this too, but with an inverted comparison that fires on every
-/// well-formed slice; corrected here (strictly increasing across a picture's slices),
-/// and `None`/vacant marks "no slice seen yet" so the first slice never trips it.
+/// `first_mb_in_slice` must increase across a picture's slices (7.4.3).
+/// Upstream's comparison is inverted and fires on every well-formed slice.
+/// `None`/vacant means no slice seen yet, so the first never trips it.
 enum CurrentMacroblockTracking {
     SeparateColorPlane(BTreeMap<u8, u32>),
     NonSeparateColorPlane(Option<u32>),
 }
 
-/// State of the picture being planned, spanning the slices of one AU.
 struct CurrentPicState {
-    /// Data for the current picture as extracted from the stream.
     pic: PictureData,
-    /// PPS at the time of the current picture. Follows the slices — a later slice may
-    /// reference another PPS — and feeds end-of-picture marking, as upstream does.
+    /// PPS of the current slice. A later slice may name another PPS; this feeds end-of-picture marking.
     pps: Rc<Pps>,
-    /// The PPS the picture was BEGUN with. [`H264Planner::picture_plan`] reads this
-    /// snapshot, like upstream's `start_picture`, so per-picture parameters cannot
-    /// drift to a later slice's PPS.
+    /// PPS the picture began with. [`H264Planner::picture_plan`] reads this so
+    /// per-picture parameters cannot drift to a later slice's PPS.
     first_slice_pps: Rc<Pps>,
-    /// The id backends will know this picture by (upstream: the backend picture).
     id: PicId,
-    /// Reference picture lists, derived once per picture, indexed per slice.
+    /// Reference lists, derived once per picture and indexed per slice.
     ref_pic_lists: ReferencePicLists,
-    /// The marked DPB as it stands for THIS picture's decode, captured beside the
-    /// reference lists it was derived from — see [`AuPlan::dpb_refs`].
+    /// Marked DPB for this picture's decode, captured beside the lists; see [`AuPlan::dpb_refs`].
     dpb_refs: Vec<RefPic>,
     current_macroblock: CurrentMacroblockTracking,
 }
 
-/// Plans H.264 access units for stateless hardware decoders.
-///
-/// Owns the vendored parser and DPB plus the POC/marking state that upstream keeps in
-/// `H264DecoderState`. One instance per elementary stream; feed AUs in decode order.
+/// Plans H.264 access units for a stateless hardware decoder.
+/// One instance per elementary stream; feed AUs in decode order.
 #[derive(Default)]
 pub struct H264Planner {
     parser: Parser,
@@ -518,20 +393,17 @@ pub struct H264Planner {
     prev_ref_pic_info: PrevReferencePicInfo,
     prev_pic_info: PrevPicInfo,
     max_long_term_frame_idx: MaxLongTermFrameIdx,
-    /// Next [`PicId`] to hand out (upstream: the backend allocates here).
     next_pic_id: PicId,
-    /// Display-ready pictures accumulated while planning (upstream: the decoder's
-    /// ready queue). Not cleared on a failed AU — the next emitted [`DpbUpdate`]
-    /// carries them, so an error can never swallow a frame.
+    /// Display-ready pictures. Not cleared on a failed AU: the next [`DpbUpdate`]
+    /// carries them, so an error cannot swallow a frame.
     pending_outputs: Vec<PicId>,
-    /// Ids the last emitted [`DpbUpdate`] left alive: the baseline for `removed`.
-    /// Kept across failed AUs so interim evictions are reported, never dropped.
+    /// Ids the last [`DpbUpdate`] left alive; baseline for `removed`.
+    /// Kept across failed AUs so interim evictions are still reported.
     reported_live: BTreeSet<PicId>,
-    /// Set by [`Self::flush`]: planning resumes only at an IDR (upstream: `Reset`).
+    /// Set by [`Self::flush`]; planning resumes only at an IDR.
     awaiting_idr: bool,
-    /// Which resident pictures came off a BROKEN reference chain — the fact behind
-    /// [`PicturePlan::references_clean`]. Empty on a healthy stream; see
-    /// [`crate::clean::CleanLedger`] for the propagation rules.
+    /// Resident pictures off a broken chain; backs [`PicturePlan::references_clean`].
+    /// Empty on a healthy stream. See [`crate::clean::CleanLedger`].
     clean: crate::clean::CleanLedger,
 }
 
@@ -540,13 +412,9 @@ impl H264Planner {
         Default::default()
     }
 
-    /// Plan one access unit: Annex-B bytes containing SPS/PPS/SEI/AUD NALUs plus the
-    /// 1..N slice NALUs of exactly one picture.
-    ///
-    /// After a [`PlanError`] the planner state is best-effort; the session should
-    /// request an IDR before feeding more AUs. Outputs and removals queued by a failed
-    /// AU are retained and emitted with the next successful plan (or [`Self::flush`]) —
-    /// never discarded.
+    /// Plan one Annex-B access unit: parameter sets plus the slices of exactly one
+    /// picture. After [`PlanError`] state is best-effort; request an IDR. Outputs
+    /// and removals queued by a failed AU ride out on the next plan or [`Self::flush`].
     pub fn plan_au(&mut self, au: &[u8]) -> Result<AuPlan, PlanError> {
         let mut warnings = Vec::new();
         let mut slices = Vec::new();
@@ -559,12 +427,10 @@ impl H264Planner {
             let nalu = match Nalu::next(&mut cursor) {
                 Ok(nalu) => nalu,
                 Err(_) => {
-                    // End of the AU — or a NALU whose header failed to parse (reserved
-                    // type, truncated byte). A start code past the cursor means real
-                    // data was cut off: degrade to a concealment signal covering the
-                    // slices already planned. Without one this is benign trailing
-                    // padding — a NALU's own payload is emulation-prevented and cannot
-                    // contain a start code.
+                    // Header parse failed, or end of AU. A start code past the
+                    // cursor means data was cut off: warn and keep slices already
+                    // planned. No start code is trailing padding — emulation
+                    // prevention forbids 00 00 01 in a NALU payload.
                     let pos = (cursor.position() as usize).min(au.len());
                     if au[pos..].windows(3).any(|w| w == [0x00, 0x00, 0x01]) {
                         warnings.push(PlanWarning::TruncatedAu { offset: pos });
@@ -573,9 +439,8 @@ impl H264Planner {
                 }
             };
             saw_nalu = true;
-            // After `Nalu::next` the cursor sits on the NAL header byte; `offset` is the
-            // start-code length and `size` the NALU payload length, which pins the
-            // NALU's absolute byte range in the AU without copying.
+            // After `Nalu::next` the cursor is on the NAL header. `offset` is
+            // start-code length, `size` is payload length: range without a copy.
             let nalu_offset = cursor.position() as usize;
             let range = (nalu_offset - nalu.offset)..(nalu_offset + nalu.size);
             debug_assert_eq!(&au[range.clone()], nalu.data.as_ref());
@@ -597,8 +462,7 @@ impl H264Planner {
                     }
                 }
                 NaluType::Slice | NaluType::SliceIdr => {
-                    // Upstream's `Reset` gating: after a flush, only an IDR restarts
-                    // the decoding process.
+                    // After a flush, only an IDR restarts the decoding process.
                     if current.is_none() && self.awaiting_idr {
                         if !nalu.header.idr_pic_flag {
                             return Err(PlanError::AwaitingIdr);
@@ -611,19 +475,16 @@ impl H264Planner {
                     };
                     match &current {
                         None => current = Some(self.begin_picture(&slice, &mut warnings)?),
-                        // Upstream would finish the picture and begin another; our
-                        // contract is one picture per AU, so a second first-slice means
-                        // the pump upstream of us is broken.
+                        // One picture per AU: a second `first_mb_in_slice == 0` is a mis-split.
                         Some(_) if slice.header.first_mb_in_slice == 0 => {
                             return Err(PlanError::OutsideEnvelope(
                                 "more than one coded picture in one access unit",
                             ));
                         }
                         Some(cur) => {
-                            // Mis-split-AU guard: a continuation slice must belong to
-                            // the picture the first slice began (7.4.3: same frame_num,
-                            // same IDR-ness). A foreign slice and everything after it
-                            // are dropped behind a concealment signal.
+                            // Continuation slice must share frame_num and IDR-ness
+                            // with the first (7.4.3). A foreign slice and everything
+                            // after it are dropped as [`PlanWarning::TruncatedAu`].
                             if u32::from(slice.header.frame_num) != cur.pic.frame_num
                                 || slice.nalu.header.idr_pic_flag
                                     != matches!(cur.pic.is_idr, IsIdr::Yes { .. })
@@ -651,43 +512,34 @@ impl H264Planner {
         let cur = current
             .ok_or_else(|| PlanError::Parse("access unit contains no coded picture".into()))?;
 
-        // Was every picture this AU predicts from decoded off an intact chain? Asked
-        // over the SLICE reference lists rather than the DPB snapshot, because those
-        // are what this picture actually predicts from — a resident-but-unreferenced
-        // damaged picture says nothing about this one. An IDR references nothing, so
-        // this is vacuously true for it (`CleanLedger::references_clean`).
+        // Slice reference lists, not the DPB snapshot: a resident unreferenced
+        // damaged picture does not taint this AU. An IDR has an empty list.
         let references_clean = self.clean.references_clean(
             slices
                 .iter()
                 .flat_map(|s: &SlicePlan| s.ref_list0.iter().chain(&s.ref_list1))
                 .map(|r| r.id),
         );
-        // Captured before finish_picture: MMCO5 rewrites the stored POC afterwards, but
-        // backends submit the picture with its 8.2.1 values.
+        // Before `finish_picture`: MMCO 5 rewrites stored POC after this, but
+        // backends submit the 8.2.1 values.
         let picture = Self::picture_plan(&cur, recovery_point, references_clean);
-        // The activated parameter sets ride out with the plan (AuPlan field docs);
-        // cloned before finish_picture consumes `cur`.
+        // Clone before `finish_picture` consumes `cur`.
         let pps = Rc::clone(&cur.first_slice_pps);
         let sps = Rc::clone(&pps.sps);
         let dpb_refs = cur.dpb_refs.clone();
         let stored = self.finish_picture(cur, &mut warnings)?;
 
-        // `removed` is the delta against what the backend last SAW alive, not against
-        // this call's start — a failed AU in between may have evicted pictures, and
-        // those removals must still be reported here.
+        // Delta against the last reported live set, not this call's start: a
+        // failed AU in between may have evicted pictures that still need reporting.
         let live_after = self.live_ids();
         let mut previously_live = mem::take(&mut self.reported_live);
         previously_live.insert(stored);
         let removed = previously_live.difference(&live_after).copied().collect();
         self.reported_live = live_after;
 
-        // Fold this picture's verdict, then bound the ledger to DPB residency. Both
-        // AFTER `finish_picture`, so `stored` is the id the picture really got and
-        // `live_after` reflects the marking this AU performed — a mark written against
-        // a pre-marking view could survive an eviction it should have died with.
-        // `concealed` mirrors what a consumer conceals on, via the ONE classification
-        // (`PlanWarning::is_integrity`), so the ledger and the consumer can never
-        // disagree about whether this AU was damaged.
+        // After `finish_picture` so `stored` and `live_after` include this AU's
+        // marking. A pre-marking write could survive an eviction. `concealed`
+        // uses [`PlanWarning::is_integrity`] so ledger and consumer agree.
         self.clean.note_stored(
             stored,
             references_clean,
@@ -710,12 +562,8 @@ impl H264Planner {
         })
     }
 
-    /// Drain the DPB: every still-buffered picture becomes display-ready and every id is
-    /// released. The session calls this at teardown or a stream discontinuity.
-    ///
-    /// The 8.2.1/8.2.5 decoding state is discarded with the pictures; planning resumes
-    /// only at an IDR ([`PlanError::AwaitingIdr`] until then). Parameter sets survive —
-    /// per 7.4.1.2 they persist until replaced.
+    /// Drain the DPB and discard 8.2.1/8.2.5 state. Planning resumes only at
+    /// an IDR ([`PlanError::AwaitingIdr`]). Parameter sets survive (7.4.1.2).
     pub fn flush(&mut self) -> DpbUpdate {
         let mut removed = mem::take(&mut self.reported_live);
         removed.extend(self.live_ids());
@@ -726,8 +574,7 @@ impl H264Planner {
         self.max_long_term_frame_idx = Default::default();
         self.negotiation_info = Default::default();
         self.awaiting_idr = true;
-        // The DPB is drained, so no mark describes a resident picture any more — and
-        // planning resumes at an IDR, which is clean by construction.
+        // DPB empty; next picture is an IDR, clean by construction.
         self.clean.clear();
 
         DpbUpdate {
@@ -737,8 +584,7 @@ impl H264Planner {
         }
     }
 
-    /// The envelope gate: punktfunk clients only decode punktfunk hosts, and no host
-    /// ever emits interlaced video or separate-colour-plane coding.
+    /// Reject interlaced and separate-colour-plane streams; hosts never emit them.
     fn check_envelope(sps: &Sps) -> Result<(), PlanError> {
         if !sps.frame_mbs_only_flag {
             return Err(PlanError::OutsideEnvelope(
@@ -750,11 +596,9 @@ impl H264Planner {
                 "separate colour plane coding (separate_colour_plane_flag == 1)",
             ));
         }
-        // A.3.1 caps the DPB at 16 frames; the only route past the cap is the VUI's
-        // max_dec_frame_buffering, an unbounded ue(v) the vendored parser reads
-        // uncapped. No hardware decoder implements a deeper DPB — a larger value is a
-        // corrupt (or hostile) VUI, not a feature request — and backends size real
-        // slot pools from this number, so it is gated here, at SPS activation.
+        // A.3.1 caps at 16; the VUI `max_dec_frame_buffering` is an unbounded
+        // ue(v) the parser reads uncapped. Gate here at SPS activation: backends
+        // size slot pools from this number.
         if dpb_limit(sps) > MAINSTREAM_MAX_DPB_SLOTS {
             return Err(PlanError::OutsideEnvelope(
                 "DPB deeper than 16 frames (max_dec_frame_buffering)",
@@ -763,9 +607,8 @@ impl H264Planner {
         Ok(())
     }
 
-    /// Map a vendored slice-header parse failure, sniffing the missing-PPS message so it
-    /// surfaces as [`PlanError::NoActiveParamSet`]. The prefix match is best-effort: if
-    /// an upstream re-sync rewords it, the error degrades to `Parse`, not silence.
+    /// Map a missing-PPS parse string to [`PlanError::NoActiveParamSet`].
+    /// Prefix match is best-effort: a reworded upstream message becomes `Parse`.
     fn slice_parse_error(err: String) -> PlanError {
         match err.strip_prefix("Could not get PPS for pic_parameter_set_id ") {
             Some(id) => PlanError::NoActiveParamSet {
@@ -775,8 +618,7 @@ impl H264Planner {
         }
     }
 
-    /// Ids of every picture the DPB currently holds (non-existing gap placeholders carry
-    /// no id and are invisible to backends by design).
+    /// Ids currently in the DPB. 8.2.5.2 gap placeholders carry none.
     fn live_ids(&self) -> BTreeSet<PicId> {
         self.dpb
             .entries()
@@ -814,11 +656,9 @@ impl H264Planner {
 
                 let max_pic_order_cnt_lsb = 1 << (sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
 
-                // 8.2.1.1 compares against prevPicOrderCntLsb — the DERIVED value,
-                // which is 0 or the previous TopFieldOrderCnt after an MMCO5 — in BOTH
-                // wrap branches. Upstream reads the raw stored lsb in the first branch;
-                // deliberate divergence from upstream here, in favour of spec
-                // conformance.
+                // 8.2.1.1 compares against the derived prevPicOrderCntLsb (0 or
+                // previous TopFieldOrderCnt after MMCO 5) in both wrap branches.
+                // Upstream reads the raw stored lsb in the first; this follows the spec.
                 pic.pic_order_cnt_msb = if (pic.pic_order_cnt_lsb < prev_pic_order_cnt_lsb)
                     && (prev_pic_order_cnt_lsb - pic.pic_order_cnt_lsb >= max_pic_order_cnt_lsb / 2)
                 {
@@ -888,9 +728,9 @@ impl H264Planner {
 
                     assert!(frame_num_in_pic_order_cnt_cycle < 255);
 
-                    // NOTE: upstream sums the full cycle here where 8.2.1.2 sums
-                    // frame_num_in_pic_order_cnt_cycle + 1 entries; ported as-is —
-                    // punktfunk hosts emit pic_order_cnt_type 0 only.
+                    // Upstream sums the full cycle; 8.2.1.2 sums
+                    // `frame_num_in_pic_order_cnt_cycle + 1` entries. Ported as-is:
+                    // hosts emit pic_order_cnt_type 0 only.
                     let cycle = usize::from(sps.num_ref_frames_in_pic_order_cnt_cycle);
                     for offset in &sps.offset_for_ref_frame[..cycle] {
                         expected_pic_order_cnt += offset;
@@ -971,21 +811,19 @@ impl H264Planner {
         Ok(())
     }
 
-    /// Queue the frames that the C.4.5.3 bumping process declares ready for output.
+    /// Queue pictures C.4.5.3 bumping declares ready for output.
     fn bump_as_needed(&mut self, current_pic: &PictureData) {
         let bumped = self.dpb.bump_as_needed(current_pic);
         self.pending_outputs.extend(bumped.into_iter().flatten());
     }
 
-    /// Queue all frames still present in the DPB for output.
     fn drain_dpb(&mut self) {
         let pics = self.dpb.drain();
         self.pending_outputs.extend(pics.into_iter().flatten());
     }
 
-    /// Find the first field for the picture started by `hdr`, if any. Always `None`
-    /// under the envelope gate (the DPB never enters interlaced mode); kept as ported so
-    /// the upstream diff stays small.
+    /// Complementary first field, if any. Always `None` under the envelope
+    /// (DPB never goes interlaced); kept as ported so the upstream diff stays small.
     fn find_first_field(
         &self,
         hdr: &SliceHeader,
@@ -994,16 +832,12 @@ impl H264Planner {
 
         if self.dpb.interlaced() {
             if let Some(last_dpb_entry) = self.dpb.entries().last() {
-                // Use the last entry in the DPB
                 let last_pic = last_dpb_entry.pic.borrow();
 
-                // If the picture is interlaced but doesn't have its other field set yet,
-                // then it must be the first field.
                 if !matches!(last_pic.field, Field::Frame)
                     && matches!(last_pic.field_rank(), FieldRank::Single)
                 {
                     if let Some(id) = &last_dpb_entry.reference {
-                        // Still waiting for the second field
                         prev_field = Some((last_dpb_entry.pic.clone(), *id));
                     }
                 }
@@ -1229,10 +1063,9 @@ impl H264Planner {
         Ok(ref_pic_list)
     }
 
-    /// [`Self::modify_ref_pic_list`], degrading a failed modification to a
-    /// [`PlanWarning::MissingReference`] plus the unmodified 8.2.4.2 initial list —
-    /// upstream aborts the decode here, but a modification naming a lost picture is
-    /// punktfunk's cue to conceal and request recovery, not to kill the session.
+    /// Like [`Self::modify_ref_pic_list`], but a failed modification becomes
+    /// [`PlanWarning::MissingReference`] plus the unmodified 8.2.4.2 initial list.
+    /// Upstream aborts; a named-but-lost picture is concealment, not a session kill.
     fn modified_or_initial_list(
         &self,
         cur_pic: &PictureData,
@@ -1261,8 +1094,7 @@ impl H264Planner {
         }
     }
 
-    /// Generate RefPicList0 and RefPicList1 for one slice (8.2.4), already converted to
-    /// backend-facing [`RefPic`]s.
+    /// RefPicList0/1 for one slice (8.2.4), as backend [`RefPic`]s.
     fn create_ref_pic_lists(
         &self,
         cur_pic: &PictureData,
@@ -1305,19 +1137,13 @@ impl H264Planner {
         )
     }
 
-    /// Convert one reference list to backend-facing [`RefPic`]s, preserving list
-    /// positions: every ref_idx in the slice syntax indexes the returned Vec 1:1.
+    /// Convert a reference list to [`RefPic`]s, preserving `ref_idx` positions.
     ///
-    /// A non-existing picture (8.2.5.2 gap placeholder) has no id a backend could
-    /// resolve, so it is substituted IN PLACE by the nearest existing reference in
-    /// list order (the previous existing entry, else the first existing one) —
-    /// stable-but-wrong concealment, flagged via [`PlanWarning::MissingReference`].
-    /// Compacting instead would shift every subsequent ref_idx and make the decoder
-    /// predict from the wrong pictures. Only a list with no existing reference at all
-    /// collapses to empty (the caller warns on that separately).
+    /// An 8.2.5.2 gap placeholder has no id, so it is replaced in place by the
+    /// previous existing entry (else the first). Compacting would shift every
+    /// later `ref_idx`. An all-placeholder list collapses to empty (caller warns).
     fn to_ref_pics(list: &[&DpbEntry<PicId>], warnings: &mut Vec<PlanWarning>) -> Vec<RefPic> {
-        // Each slot: the resolvable entry plus its picture's frame_num (a long-term
-        // substitute is re-labelled short-term, so its frame_num is needed).
+        // Slot carries frame_num too: a long-term substitute is relabelled short-term.
         let mut slots: Vec<Option<(RefPic, u16)>> = Vec::with_capacity(list.len());
         for entry in list {
             let pic = entry.pic.borrow();
@@ -1325,10 +1151,8 @@ impl H264Planner {
                 Some(id) => {
                     let is_long_term = matches!(pic.reference(), Reference::LongTerm);
                     let frame_num_or_lt_idx = if is_long_term {
-                        // long_term_frame_idx is ue(v)-coded; the spec bounds it (<= 15
-                        // via max_long_term_frame_idx) but the parser does not, so
-                        // saturate rather than truncate — unreachable-in-practice
-                        // hardening.
+                        // `long_term_frame_idx` is ue(v); spec bounds it via
+                        // max_long_term_frame_idx, the parser does not. Saturate, do not truncate.
                         u16::try_from(pic.long_term_frame_idx).unwrap_or(u16::MAX)
                     } else {
                         pic.frame_num as u16
@@ -1364,9 +1188,8 @@ impl H264Planner {
                     out.push(real.0);
                 }
                 None => {
-                    // Index mapping preserved; the substituted entry is stable-but-
-                    // wrong concealment. Placeholders are short-term (8.2.5.2), so the
-                    // substitute is labelled short-term with its own frame_num.
+                    // Keep the index. Placeholders are short-term (8.2.5.2); label
+                    // the substitute short-term with its own frame_num.
                     if let Some((substitute, frame_num)) = prev_existing.or(first_existing) {
                         out.push(RefPic {
                             id: substitute.id,
@@ -1402,7 +1225,7 @@ impl H264Planner {
     }
 
     fn reference_pic_marking(&mut self, pic: &mut PictureData, sps: &Sps) -> Result<(), MmcoError> {
-        /* 8.2.5.1 */
+        // 8.2.5.1
         if matches!(pic.is_idr, IsIdr::Yes { .. }) {
             self.dpb.mark_all_as_unused_for_ref();
 
@@ -1427,14 +1250,12 @@ impl H264Planner {
         Ok(())
     }
 
-    // Apply the parameters of `sps` to the planning state.
     fn apply_sps(&mut self, sps: &Sps, warnings: &mut Vec<PlanWarning>) {
         self.negotiation_info = NegotiationInfo::from(sps);
 
         let max_dpb_frames = dpb_limit(sps);
-        // Sized from the level ceiling rather than the stream's own declaration, and
-        // large enough that backends will ask for more slots than they can get. See
-        // [`dpb_limit`]: warned, not clamped, because there is no honest smaller number.
+        // Level-derived and larger than mainstream slots. Warn, do not clamp;
+        // see [`dpb_limit`].
         if dpb_is_level_derived(sps) && max_dpb_frames + 1 > MAINSTREAM_MAX_DPB_SLOTS {
             warnings.push(PlanWarning::LevelDerivedDpb {
                 max_dpb_frames,
@@ -1465,8 +1286,7 @@ impl H264Planner {
     ) -> Result<(), PlanError> {
         if Self::negotiation_possible(sps, &self.negotiation_info) {
             Self::check_envelope(sps)?;
-            // Make sure all the frames planned so far are display-ready before the
-            // stream parameters change under them.
+            // Drain before SPS parameters change under pictures still in the DPB.
             self.drain_dpb();
             self.apply_sps(sps, warnings);
         }
@@ -1486,11 +1306,9 @@ impl H264Planner {
 
         trace!("frame_num gap detected");
 
-        // Upstream refuses the gap when gaps_in_frame_num_value_allowed_flag is unset.
-        // Here the caller has already emitted PlanWarning::FrameNumGap and the 8.2.5.2
-        // process runs regardless: losing a reference AU on the wire must degrade to
-        // concealment + recovery, and inserting the non-existing pictures keeps the
-        // frame_num/pic_num bookkeeping of everything that follows spec-true.
+        // Upstream refuses a gap when `gaps_in_frame_num_value_allowed_flag` is
+        // unset. The caller already warned; 8.2.5.2 still runs so later
+        // frame_num/pic_num bookkeeping stays spec-true.
         let mut unused_short_term_frame_num =
             (self.prev_ref_pic_info.frame_num + 1) % sps.max_frame_num();
         while unused_short_term_frame_num != frame_num {
@@ -1506,12 +1324,10 @@ impl H264Planner {
 
             self.bump_as_needed(&pic);
 
-            // Interlaced field-splitting dropped: the envelope gate keeps the DPB in
-            // progressive mode.
+            // Envelope keeps the DPB progressive; no interlaced field-split.
             if let Err(err) = self.dpb.store_picture(pic.into_rc(), None) {
-                // A full DPB must not error the AU (warnings-not-errors contract):
-                // stop inserting placeholders. The pic_num bookkeeping degrades from
-                // here, which the recovery the warning triggers will heal.
+                // Full DPB: stop inserting placeholders rather than error the AU.
+                // pic_num bookkeeping degrades; recovery from the warning heals it.
                 warnings.push(PlanWarning::MissingReference {
                     context: "frame_num gap placeholder dropped (DPB full)",
                     detail: err.to_string(),
@@ -1526,7 +1342,6 @@ impl H264Planner {
         Ok(())
     }
 
-    /// Init the current picture being planned.
     fn init_current_pic(
         &mut self,
         slice: &Slice,
@@ -1537,19 +1352,13 @@ impl H264Planner {
         self.compute_pic_order_count(&mut pic, sps)?;
 
         if matches!(pic.is_idr, IsIdr::Yes { .. }) {
-            // C.4.5.3 "Bumping process"
-            // The bumping process is invoked in the following cases:
-            // Clause 2:
-            // The current picture is an IDR picture and
-            // no_output_of_prior_pics_flag is not equal to 1 and is not
-            // inferred to be equal to 1, as specified in clause C.4.4.
+            // C.4.5.3 bumping, clause 2: IDR with no_output_of_prior_pics_flag != 1
+            // (and not inferred 1; C.4.4).
             if !pic.ref_pic_marking.no_output_of_prior_pics_flag {
                 self.drain_dpb();
             } else {
-                // C.4.4 When no_output_of_prior_pics_flag is equal to 1 or is
-                // inferred to be equal to 1, all frame buffers in the DPB are
-                // emptied without output of the pictures they contain, and DPB
-                // fullness is set to 0.
+                // C.4.4: no_output_of_prior_pics_flag == 1 (or inferred): empty
+                // the DPB without output.
                 self.dpb.clear();
             }
         }
@@ -1560,7 +1369,6 @@ impl H264Planner {
         Ok(pic)
     }
 
-    /// Called once per picture, on its first slice.
     fn begin_picture(
         &mut self,
         slice: &Slice,
@@ -1573,13 +1381,10 @@ impl H264Planner {
             },
         )?);
 
-        // A picture's SPS may require renegotiation.
         self.renegotiate_if_needed(&pps.sps, warnings)?;
 
         let first_field = self.find_first_field(hdr).map_err(PlanError::Parse)?;
 
-        // Upstream secures the backend picture here; the plan's equivalent is the id
-        // backends will allocate against.
         let id = self.next_pic_id;
         self.next_pic_id += 1;
 
@@ -1609,9 +1414,8 @@ impl H264Planner {
 
         let pic = self.init_current_pic(slice, &pps.sps, first_field.as_ref().map(|f| &f.0))?;
         let ref_pic_lists = self.dpb.build_ref_pic_lists(&pic);
-        // Taken here, beside the lists 8.2.4 derives from the same DPB state, and
-        // never later: `finish_picture` runs 8.2.5's marking and stores the picture,
-        // which is the DPB the NEXT AU decodes against, not this one.
+        // Snapshot now, beside the 8.2.4 lists. `finish_picture` runs 8.2.5
+        // marking; that DPB is what the next AU decodes against, not this one.
         let dpb_refs = self.dpb_snapshot();
 
         Ok(CurrentPicState {
@@ -1625,13 +1429,9 @@ impl H264Planner {
         })
     }
 
-    /// The marked DPB as [`AuPlan::dpb_refs`] reports it.
-    ///
-    /// The filter is the pair of conditions a backend needs to name a surface: the
-    /// picture is marked used for reference (short- or long-term — anything the
-    /// sliding window or an MMCO has unmarked is skipped, even while the DPB still
-    /// holds it for output), and it carries a [`PicId`], which 8.2.5.2's non-existing
-    /// gap placeholders deliberately do not.
+    /// Marked DPB as [`AuPlan::dpb_refs`]: used-for-reference and carrying a
+    /// [`PicId`]. Unmarked-but-held-for-output pictures and 8.2.5.2 placeholders
+    /// are omitted.
     fn dpb_snapshot(&self) -> Vec<RefPic> {
         self.dpb
             .entries()
@@ -1649,9 +1449,8 @@ impl H264Planner {
                     top_field_order_cnt: pic.top_field_order_cnt,
                     bottom_field_order_cnt: pic.bottom_field_order_cnt,
                     is_long_term,
-                    // The same pair-key derivation `to_ref_pics` makes, and for the
-                    // same reason: DXVA's `FrameNumList` carries `LongTermFrameIdx`
-                    // for a long-term reference and `frame_num` for a short-term one.
+                    // Same pair-key as `to_ref_pics`: DXVA `FrameNumList` is
+                    // LongTermFrameIdx for long-term, frame_num for short-term.
                     frame_num_or_lt_idx: if is_long_term {
                         u16::try_from(pic.long_term_frame_idx).unwrap_or(u16::MAX)
                     } else {
@@ -1662,8 +1461,7 @@ impl H264Planner {
             .collect()
     }
 
-    // Check whether first_mb_in_slice increases monotonically for the current
-    // picture as required by 7.4.3.
+    // 7.4.3: first_mb_in_slice increases monotonically across the picture.
     fn check_first_mb_in_slice(current_macroblock: &mut CurrentMacroblockTracking, slice: &Slice) {
         let first_mb_in_slice = slice.header.first_mb_in_slice;
         match current_macroblock {
@@ -1696,7 +1494,6 @@ impl H264Planner {
         }
     }
 
-    /// Handle one slice of the current picture (upstream: `handle_slice`).
     fn plan_slice(
         &self,
         cur: &mut CurrentPicState,
@@ -1706,7 +1503,6 @@ impl H264Planner {
     ) -> Result<SlicePlan, PlanError> {
         Self::check_first_mb_in_slice(&mut cur.current_macroblock, &slice);
 
-        // A slice can technically refer to another PPS.
         let pps = self
             .parser
             .get_pps(slice.header.pic_parameter_set_id)
@@ -1715,8 +1511,7 @@ impl H264Planner {
             })?;
         cur.pps = Rc::clone(pps);
 
-        // Make sure that no negotiation is possible mid-picture. How could it?
-        // We'd lose the context of the previous slices.
+        // No mid-picture renegotiation: it would drop the previous slices' context.
         if Self::negotiation_possible(&cur.pps.sps, &self.negotiation_info) {
             return Err(PlanError::Parse(
                 "invalid stream: inter-picture renegotiation requested".into(),
@@ -1726,10 +1521,8 @@ impl H264Planner {
         let (ref_list0, ref_list1) =
             self.create_ref_pic_lists(&cur.pic, &slice.header, &cur.ref_pic_lists, warnings);
 
-        // 8.2.4.2.1: an inter slice shall have at least one usable reference. Ending up
-        // empty (every candidate lost or a gap placeholder) is undecodable-as-intended,
-        // and it can happen without any per-entry warning when the DPB holds only
-        // non-existing pictures — flag it so the session requests recovery.
+        // 8.2.4.2.1: an inter slice needs a usable reference. An all-placeholder
+        // DPB yields an empty list with no per-entry warning; flag it here.
         let slice_type = slice.header.slice_type;
         if matches!(slice_type, SliceType::P | SliceType::Sp | SliceType::B) && ref_list0.is_empty()
         {
@@ -1753,7 +1546,6 @@ impl H264Planner {
         })
     }
 
-    /// Adds the picture to the output queue when it could not be added to the DPB.
     fn add_to_ready_queue(&mut self, pic: PictureData, id: PicId) {
         if matches!(pic.field, Field::Frame) {
             self.pending_outputs.push(id);
@@ -1772,8 +1564,8 @@ impl H264Planner {
         } = cur;
 
         if matches!(pic.reference(), Reference::ShortTerm | Reference::LongTerm) {
-            // Upstream aborts on a failed MMCO; an op naming a picture the DPB lost is
-            // a concealment signal here, and the remaining marking state stays usable.
+            // Upstream aborts on a failed MMCO; a named-but-lost picture is a
+            // warning here and the rest of the marking state stays usable.
             if let Err(err) = self.reference_pic_marking(&mut pic, &pps.sps) {
                 warnings.push(PlanWarning::MissingReference {
                     context: "reference picture marking (MMCO)",
@@ -1787,35 +1579,21 @@ impl H264Planner {
 
         if pic.has_mmco_5 {
             warnings.push(PlanWarning::Mmco5Rebase);
-            // C.4.5.3 "Bumping process"
-            // The bumping process is invoked in the following cases:
-            // Clause 3:
-            // The current picture has memory_management_control_operation equal
-            // to 5, as specified in clause C.4.4.
+            // C.4.5.3 bumping, clause 3: MMCO 5 (C.4.4).
             self.drain_dpb();
         }
 
-        // Bump the DPB as per C.4.5.3 to cover clauses 1, 4, 5 and 6.
+        // C.4.5.3 bumping, clauses 1, 4, 5, 6.
         self.bump_as_needed(&pic);
 
-        // C.4.5.1, C.4.5.2
-        // If the current decoded picture is the second field of a complementary
-        // reference field pair, add to DPB.
-        // C.4.5.1
-        // For a reference decoded picture, the "bumping" process is invoked
-        // repeatedly until there is an empty frame buffer, by which point it is
-        // added to the DPB. Notice that Dpb::needs_bumping already accounts for
-        // this.
-        // C.4.5.2
-        // For a non-reference decoded picture, if there is empty frame buffer
-        // after bumping the smaller POC, add to DPB. Otherwise, add it to the
-        // output queue.
+        // C.4.5.1 / C.4.5.2: store a complementary-ref second field, a
+        // reference picture, or a non-reference that still has an empty
+        // buffer after bumping; otherwise queue for output.
         if pic.is_second_field_of_complementary_ref_pair()
             || pic.is_ref()
             || self.dpb.has_empty_frame_buffer()
         {
-            // Upstream splits frames into complementary field pairs when the DPB is in
-            // interlaced mode; the envelope gate keeps that path unreachable.
+            // Upstream field-splits when interlaced; the envelope keeps that path unreachable.
             self.dpb
                 .store_picture(pic.into_rc(), Some(id))
                 .map_err(|err| PlanError::Parse(err.to_string()))?;
@@ -1832,8 +1610,7 @@ impl H264Planner {
         references_clean: bool,
     ) -> PicturePlan {
         let pic = &cur.pic;
-        // The first slice's PPS defines the picture's parameters (upstream's
-        // start_picture semantics); `cur.pps` may have drifted to a later slice's.
+        // First slice's PPS defines the picture; `cur.pps` may have drifted.
         let sps = &cur.first_slice_pps.sps;
         let rect = sps.visible_rectangle();
 
@@ -1847,20 +1624,17 @@ impl H264Planner {
             pic_order_cnt: pic.pic_order_cnt,
             coded_width: sps.width(),
             coded_height: sps.height(),
-            // The vendored `visible_rectangle()` returns the crop OFFSET in `min` and
-            // the visible SIZE in `max` (not an edge coordinate): subtracting would
-            // double-count the left/top crop and underflow on large offsets.
+            // Vendored `visible_rectangle()`: `min` is crop offset, `max` is
+            // visible size, not an edge. Subtracting double-counts and can underflow.
             display_crop: DisplayCrop {
                 x: rect.min.x,
                 y: rect.min.y,
                 width: rect.max.x,
                 height: rect.max.y,
             },
-            // Read unconditionally: the vendored parser builds every SPS from
-            // `Default`, whose `VuiParams` already holds E.2.1's inferred values
-            // (2/2/2, limited range), and parsing only overwrites them under the
-            // present flags — so this IS the spec inference whether or not the
-            // stream carried a VUI.
+            // Unconditional: the parser's `Default` VUI already holds E.2.1
+            // inference (2/2/2, limited range); parse only overwrites under the
+            // present flags.
             colour: ColourDescription {
                 colour_primaries: sps.vui_parameters.colour_primaries,
                 transfer_characteristics: sps.vui_parameters.transfer_characteristics,
@@ -1897,17 +1671,15 @@ mod tests {
 
     const TEST_25FPS: &[u8] =
         include_bytes!("../vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264");
-    // The plain 64x64-I-P-B-P.h264 is a constrained-baseline encode: x264 silently
-    // dropped the requested B frame (its slices parse as I, P, P). The -high variant of
-    // the same sequence carries the real B slice.
+    // The non-high 64x64-I-P-B-P.h264 is constrained-baseline: x264 dropped the B.
+    // This high variant actually carries the B slice.
     const TEST_64X64_I_P_B_P_HIGH: &[u8] =
         include_bytes!("../vendor/cros-codecs/src/codec/h264/test_data/64x64-I-P-B-P-high.h264");
 
-    /// Test-only AU splitter: the vendored vectors are raw Annex-B streams, while
-    /// `plan_au` takes the pre-split AUs punktfunk's pump produces. A new AU starts at a
-    /// non-slice NALU following slices, or at a slice with first_mb_in_slice == 0
-    /// (whose ue(v) encoding makes the first RBSP bit 1) when the current AU already
-    /// has slices.
+    /// Split a raw Annex-B vector into the AUs `plan_au` expects. A new AU
+    /// starts at a non-slice after slices, or at `first_mb_in_slice == 0`
+    /// (ue(v) encodes that as the first RBSP bit set) once the current AU
+    /// already has slices.
     fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
         let mut aus = Vec::new();
         let mut cursor = Cursor::new(stream);
@@ -1979,9 +1751,8 @@ mod tests {
             "bumping plus the final flush must output every picture"
         );
 
-        // Output ORDER, not just coverage: within each IDR period, ids must emerge in
-        // ascending POC — the invariant the C.4.5.3 bumping process exists to provide.
-        // (POC was recorded at plan time; an IDR resets it, hence the period key.)
+        // Order, not just coverage: within an IDR period, ids emerge in
+        // ascending POC (C.4.5.3). POC resets at IDR, hence the period key.
         let mut period = 0usize;
         let mut order_key: BTreeMap<PicId, (usize, i32)> = BTreeMap::new();
         for plan in &plans {
@@ -2040,11 +1811,9 @@ mod tests {
         assert!(b_slices_seen > 0, "the vector must contain B slices");
     }
 
-    /// Byte-level authoring for the MMCO/LTR test: parameter sets via the vendored
-    /// builders + synthesizer, slice headers written by hand with the vendored
-    /// `NaluWriter` (upstream has no slice-header synthesizer — its encoder packs
-    /// headers in hardware). The planner only reads headers, so no slice data follows
-    /// the rbsp stop bit.
+    /// Author parameter sets with the vendored synthesizer; write slice
+    /// headers by hand (`NaluWriter`). No slice-header synthesizer exists.
+    /// The planner reads headers only, so nothing follows the rbsp stop bit.
     fn base_sps() -> SpsBuilder {
         SpsBuilder::new()
             .seq_parameter_set_id(0)
@@ -2067,14 +1836,9 @@ mod tests {
         (sps, pps)
     }
 
-    /// The warnings a plan carries, minus the DPB-sizing signal.
-    ///
-    /// [`base_sps`]'s fixtures are 64x64 with no VUI bitstream restriction, so A.3.1's
-    /// ceiling saturates (`MaxDpbMbs(L1) = 396` over 16 macroblocks) and every plan
-    /// built on them carries [`PlanWarning::LevelDerivedDpb`]. That is the arithmetic
-    /// `the_level_ceiling_alone_would_reproduce_96_and_is_warned_about` exists to pin —
-    /// SMALL pictures saturate the ceiling most easily, not large ones — and it says
-    /// nothing about the picture, which is what the tests below are checking.
+    /// Picture-level warnings, dropping [`PlanWarning::LevelDerivedDpb`].
+    /// [`base_sps`] is 64×64 with no VUI restriction, so A.3.1 saturates
+    /// (`MaxDpbMbs(L1)=396` / 16 MBs) and every plan carries that warning.
     fn picture_warnings(plan: &AuPlan) -> Vec<&PlanWarning> {
         plan.warnings
             .iter()
@@ -2098,9 +1862,9 @@ mod tests {
         {
             let mut w = NaluWriter::new(&mut buf, true);
             w.write_header(3, NaluType::SliceIdr as u8).unwrap();
-            w.write_ue(first_mb).unwrap(); // first_mb_in_slice
+            w.write_ue(first_mb).unwrap();
             w.write_ue(2u32).unwrap(); // slice_type: I
-            w.write_ue(pps_id).unwrap(); // pic_parameter_set_id
+            w.write_ue(pps_id).unwrap();
             w.write_f(4, 0u32).unwrap(); // frame_num, u(4): log2_max_frame_num_minus4 = 0
             w.write_ue(0u32).unwrap(); // idr_pic_id
             w.write_f(4, 0u32).unwrap(); // pic_order_cnt_lsb, u(4)
@@ -2115,9 +1879,8 @@ mod tests {
         buf
     }
 
-    /// One P slice NALU. `mmco_ops` = `None` for sliding-window marking, `Some(ops)` for
-    /// adaptive marking with `(operation, single-argument)` pairs (ops 2/4/6 all take
-    /// exactly one) — the writer appends the terminating op 0.
+    /// One P-slice NALU. `None` is sliding-window; `Some` is adaptive MMCO
+    /// with `(op, arg)` pairs (ops 2/4/6 take one arg). Appends terminating op 0.
     fn write_p_slice(
         frame_num: u32,
         poc_lsb: u32,
@@ -2149,9 +1912,9 @@ mod tests {
         {
             let mut w = NaluWriter::new(&mut buf, true);
             w.write_header(ref_idc, NaluType::Slice as u8).unwrap();
-            w.write_ue(first_mb).unwrap(); // first_mb_in_slice
+            w.write_ue(first_mb).unwrap();
             w.write_ue(0u32).unwrap(); // slice_type: P
-            w.write_ue(pps_id).unwrap(); // pic_parameter_set_id
+            w.write_ue(pps_id).unwrap();
             w.write_f(4, frame_num).unwrap(); // frame_num, u(4)
             w.write_f(4, poc_lsb).unwrap(); // pic_order_cnt_lsb, u(4)
             w.write_f(1, 1u32).unwrap(); // num_ref_idx_active_override_flag
@@ -2187,12 +1950,10 @@ mod tests {
         Synthesizer::<'_, Pps, _>::synthesize(3, &pps, &mut au0, true).unwrap();
         au0.extend(write_idr_slice());
 
-        // AU1 marks itself long-term: MMCO 4 admits long-term index 0, MMCO 6 assigns
-        // it to the current picture.
+        // AU1 marks itself long-term: MMCO 4 admits index 0, MMCO 6 assigns it.
         let au1 = write_p_slice(1, 2, 1, 1, Some(&[(4, 1), (6, 0)]));
         let au2 = write_p_slice(2, 4, 1, 2, None);
-        // AU3 evicts it again: MMCO 2 unmarks long_term_pic_num 0. Its own list is
-        // 3 deep so the long-term picture's presence (or wrongful absence) is visible.
+        // AU3 MMCO 2 unmarks long_term_pic_num 0. List depth 3 so presence is visible.
         let au3 = write_p_slice(3, 6, 1, 3, Some(&[(2, 0)]));
         let au4 = write_p_slice(4, 8, 0, 3, None);
 
@@ -2214,8 +1975,8 @@ mod tests {
         let idr_id = p0.dpb.stored.unwrap();
         let lt_id = p1.dpb.stored.unwrap();
 
-        // After AU1's marking, AU2's list must be [short-term IDR, long-term AU1] —
-        // 8.2.4.2.1 puts long-term references after the short-term ones.
+        // After AU1's marking, AU2's list is [short-term IDR, long-term AU1]
+        // (8.2.4.2.1: long-term after short-term).
         let list0 = &p2.slices[0].ref_list0;
         assert_eq!(list0.len(), 2);
         assert!(!list0[0].is_long_term);
@@ -2227,10 +1988,8 @@ mod tests {
             "LongTermFrameIdx, not frame_num"
         );
 
-        // AU3 carries the MMCO 2, but marking is an end-of-picture process (8.2.5):
-        // its OWN list is built before the op applies and must still hold the
-        // long-term picture, after the short-terms in descending-PicNum order. An
-        // applied-marking-before-list-build ordering bug surfaces exactly here.
+        // Marking is end-of-picture (8.2.5): AU3's own list is built before
+        // MMCO 2 and must still hold the long-term picture.
         let p2_id = p2.dpb.stored.unwrap();
         let p3_id = p3.dpb.stored.unwrap();
         assert_eq!(
@@ -2243,8 +2002,7 @@ mod tests {
             "AU3 still sees the long-term ref; its own MMCO 2 applies only at finish"
         );
 
-        // AU4 must no longer see it: exactly the three short-terms, in descending
-        // PicNum order (8.2.4.2.1).
+        // AU4: three short-terms, descending PicNum (8.2.4.2.1); the unmarked picture is gone.
         assert_eq!(
             p4.slices[0]
                 .ref_list0
@@ -2255,7 +2013,6 @@ mod tests {
             "the unmarked picture must have left, short-terms sorted by PicNum"
         );
 
-        // Unmarked and displayed, the picture leaves the DPB for good.
         let flush = planner.flush();
         assert!(flush.outputs.contains(&lt_id));
         assert!(flush.removed.contains(&lt_id));
@@ -2263,18 +2020,16 @@ mod tests {
 
     #[test]
     fn the_dpb_snapshot_holds_a_marked_long_term_reference_no_slice_of_the_au_names() {
-        // The shape a DXVA `RefFrameList` built from the derived lists loses: an
-        // anchor pinned long-term, still marked in the DPB, that this picture's own
-        // reference list is too short to reach. A driver told it is gone is entitled
-        // to discard it — and RFI recovery then decodes against nothing.
+        // Long-term still marked, but this AU's list is too short to name it.
+        // A RefFrameList built from derived lists would drop it; a driver may discard it.
         let (sps, pps) = authored_sps_pps();
         let mut au0 = Vec::new();
         Synthesizer::<'_, Sps, _>::synthesize(3, &sps, &mut au0, true).unwrap();
         Synthesizer::<'_, Pps, _>::synthesize(3, &pps, &mut au0, true).unwrap();
         au0.extend(write_idr_slice());
-        // AU1 pins ITSELF long-term (MMCO 4 admits index 0, MMCO 6 assigns it).
+        // AU1 pins itself long-term (MMCO 4 admits index 0, MMCO 6 assigns it).
         let au1 = write_p_slice(1, 2, 1, 1, Some(&[(4, 1), (6, 0)]));
-        // AU2 activates ONE reference: 8.2.4.2.1 puts the short-term IDR first, so
+        // AU2 activates one reference: 8.2.4.2.1 puts the short-term IDR first, so
         // the truncated list never names the long-term picture.
         let au2 = write_p_slice(2, 4, 1, 1, None);
 
@@ -2300,8 +2055,7 @@ mod tests {
             vec![idr_id],
             "the AU's own list reaches only the short-term picture"
         );
-        // …and the snapshot still reports both, the long-term one marked as such and
-        // keyed by its LongTermFrameIdx rather than its frame_num.
+        // Snapshot still reports both; the long-term entry is keyed by LongTermFrameIdx.
         assert_eq!(
             p2.dpb_refs
                 .iter()
@@ -2310,8 +2064,7 @@ mod tests {
             vec![(idr_id, false, 0), (lt_id, true, 0)]
         );
 
-        // The opening IDR has an empty DPB behind it; AU1 sees only the IDR, still
-        // short-term (its own marking is an end-of-picture process).
+        // IDR sees an empty DPB; AU1 sees the IDR still short-term (marking is end-of-picture).
         assert!(p0.dpb_refs.is_empty());
         assert_eq!(
             p1.dpb_refs
@@ -2324,9 +2077,8 @@ mod tests {
 
     #[test]
     fn the_dpb_snapshot_matches_the_planners_own_live_ids_across_the_whole_vector() {
-        // Every picture the snapshot names must be one the planner considers live —
-        // a snapshot entry with no live id is a surface a backend cannot resolve.
-        // (The converse does not hold: the DPB holds unmarked pictures for output.)
+        // Every snapshot id must already be live; a nameless surface cannot be resolved.
+        // The converse is false: the DPB holds unmarked pictures for output.
         let mut planner = H264Planner::new();
         let mut plans = Vec::new();
         for au in split_into_aus(TEST_25FPS) {
@@ -2342,21 +2094,19 @@ mod tests {
                     r.id
                 );
             }
-            // Uniqueness: one picture, one surface, one marking.
             let mut ids: Vec<PicId> = plan.dpb_refs.iter().map(|r| r.id).collect();
             let count = ids.len();
             ids.sort_unstable();
             ids.dedup();
             assert_eq!(ids.len(), count, "the snapshot must not repeat a picture");
-            // The current picture is stored AFTER the snapshot is taken.
+            // Current picture is stored after the snapshot.
             assert!(!ids.contains(&plan.dpb.stored.unwrap()));
             live.insert(plan.dpb.stored.unwrap());
             for id in &plan.dpb.removed {
                 live.remove(id);
             }
         }
-        // The IPPP… vector keeps every reference until the DPB is full, so the
-        // snapshot must be non-empty for the great majority of its AUs.
+        // IPPP… keeps references until the DPB is full, so most AUs have a non-empty snapshot.
         let non_empty = plans.iter().filter(|p| !p.dpb_refs.is_empty()).count();
         assert!(non_empty >= 240, "only {non_empty} AUs carried a snapshot");
     }
@@ -2365,8 +2115,7 @@ mod tests {
     fn a_dropped_reference_au_degrades_to_gap_warnings_and_planning_continues() {
         let aus = split_into_aus(TEST_25FPS);
 
-        // Pass 1: find a droppable AU — a non-IDR reference picture not followed by an
-        // IDR (an IDR right after would reset the state and hide the gap).
+        // Find a non-IDR reference not followed by an IDR (an IDR would hide the gap).
         let mut planner = H264Planner::new();
         let mut plans = Vec::new();
         for au in &aus {
@@ -2382,9 +2131,7 @@ mod tests {
             })
             .expect("the vector contains a droppable reference picture");
 
-        // Pass 2: the same stream minus that AU must warn, not error — and every ref
-        // list entry it emits must still resolve to a picture the backend was told to
-        // store (substitution never leaks a placeholder).
+        // Drop that AU: warn, do not error. Every list entry must be a stored PicId.
         let mut planner = H264Planner::new();
         let mut gap_seen = false;
         let mut missing_seen = false;
@@ -2422,16 +2169,12 @@ mod tests {
             gap_seen,
             "the AU after the drop must report the frame_num gap"
         );
-        // The 8.2.5.2 placeholder is un-resolvable for backends, so planning around
-        // it must also have flagged it.
+        // 8.2.5.2 placeholders are unresolvable; planning around them must warn too.
         assert!(missing_seen);
     }
 
-    /// The clean bit, end to end through the real planner: a `frame_num` gap
-    /// concealed one picture, and EVERY picture descending from it reports
-    /// `references_clean == false` even though their own plans are spotless. That
-    /// propagation is the whole point — the concealed picture is rarely the one a host
-    /// recovery anchor names; the ordinary P-frames after it are.
+    /// A concealed `frame_num` gap taints every descendant's `references_clean`,
+    /// even when those later plans raise no warning of their own.
     #[test]
     fn a_concealed_picture_makes_every_descendant_report_unclean_references() {
         let (sps, pps) = authored_sps_pps();
@@ -2445,20 +2188,18 @@ mod tests {
             "an IDR references nothing, so it is clean by construction"
         );
 
-        // A healthy P off the IDR: still clean.
         let p1 = planner.plan_au(&write_p_slice(1, 2, 1, 1, None)).unwrap();
         assert!(picture_warnings(&p1).is_empty());
         assert!(p1.picture.references_clean);
 
-        // frame_num 2 never arrives — 8.2.5.2 fabricates a placeholder and the plan
-        // conceals. THIS picture's references were still intact; the damage is its own.
+        // frame_num 2 never arrives; 8.2.5.2 inserts a placeholder. This picture's
+        // references were intact; the damage is its own concealment.
         let p3 = planner.plan_au(&write_p_slice(3, 6, 1, 3, None)).unwrap();
         assert!(p3
             .warnings
             .iter()
             .any(|w| matches!(w, PlanWarning::FrameNumGap { .. })));
 
-        // …and every picture after it inherits the damage with a clean plan of its own.
         let p4 = planner.plan_au(&write_p_slice(4, 8, 1, 1, None)).unwrap();
         assert!(
             picture_warnings(&p4).is_empty(),
@@ -2474,9 +2215,6 @@ mod tests {
         assert!(!p5.picture.references_clean, "the rot keeps travelling");
     }
 
-    /// An IDR ends a damaged run: it predicts from nothing, so it reads clean however
-    /// broken the stream was before it. Without this a session could never recover a
-    /// trustworthy anchor.
     #[test]
     fn an_idr_reports_clean_references_however_damaged_the_run_before_it() {
         let (sps, pps) = authored_sps_pps();
@@ -2486,7 +2224,7 @@ mod tests {
         let mut planner = H264Planner::new();
         planner.plan_au(&au0).unwrap();
         planner.plan_au(&write_p_slice(1, 2, 1, 1, None)).unwrap();
-        // Gap: frame_num 2 lost.
+        // frame_num 2 lost.
         let p3 = planner.plan_au(&write_p_slice(3, 6, 1, 3, None)).unwrap();
         assert!(p3
             .warnings
@@ -2495,7 +2233,6 @@ mod tests {
         let p4 = planner.plan_au(&write_p_slice(4, 8, 1, 1, None)).unwrap();
         assert!(!p4.picture.references_clean);
 
-        // A fresh IDR re-anchors, and the pictures after it are clean again.
         let mut idr = param_set_au(&sps, &pps);
         idr.extend(write_idr_slice());
         let p5 = planner.plan_au(&idr).unwrap();
@@ -2507,8 +2244,6 @@ mod tests {
         );
     }
 
-    /// A stream that never loses a reference reports `references_clean` on every
-    /// picture, forever — the property that makes this free to carry in production.
     #[test]
     fn a_healthy_stream_reports_clean_references_on_every_picture() {
         let (sps, pps) = authored_sps_pps();
@@ -2539,8 +2274,7 @@ mod tests {
         Synthesizer::<'_, Pps, _>::synthesize(3, &pps, &mut au0, true).unwrap();
         au0.extend(write_idr_slice());
         let au1 = write_p_slice(1, 2, 1, 1, None);
-        // The reference picture with frame_num 2 is never fed (lost on the wire); the
-        // next AU's 3-deep list then holds the 8.2.5.2 placeholder at its HEAD.
+        // frame_num 2 never fed; AU3's 3-deep list holds the 8.2.5.2 placeholder at the head.
         let au3 = write_p_slice(3, 6, 1, 3, None);
 
         let mut planner = H264Planner::new();
@@ -2557,9 +2291,8 @@ mod tests {
             .iter()
             .any(|w| matches!(w, PlanWarning::MissingReference { .. })));
 
-        // Initial list by descending PicNum: [placeholder(2), P1(1), IDR(0)]. The
-        // placeholder heads the list, so its substitute is the first existing entry
-        // (P1) — and crucially the two real entries keep their ref_idx positions.
+        // Descending PicNum: [placeholder(2), P1(1), IDR(0)]. Head substitutes
+        // as P1; the two real entries keep their ref_idx.
         let id0 = p0.dpb.stored.unwrap();
         let id1 = p1.dpb.stored.unwrap();
         let list0 = &p3.slices[0].ref_list0;
@@ -2592,7 +2325,7 @@ mod tests {
             })
         );
 
-        // The following AU carries no SEI: the field must not stick.
+        // Next AU has no SEI; the field must not stick.
         let au1 = write_p_slice(1, 2, 1, 1, None);
         let plan = planner.plan_au(&au1).unwrap();
         assert_eq!(plan.picture.recovery_point, None);
@@ -2625,10 +2358,8 @@ mod tests {
 
     #[test]
     fn a_dpb_deeper_than_16_frames_is_rejected_as_outside_the_envelope() {
-        // The one route past the A.3.1 16-frame cap: the VUI bitstream restriction's
-        // max_dec_frame_buffering, an unbounded ue(v) that overrides the level-derived
-        // size in `Sps::max_dpb_frames`. The builder has no VUI-restriction setter, so
-        // the Sps is constructed directly (its fields are public).
+        // VUI `max_dec_frame_buffering` is the only path past A.3.1's 16-frame cap.
+        // SpsBuilder has no setter; fields are public so construct Sps directly.
         let sps = Sps {
             profile_idc: Profile::Main as u8,
             level_idc: Level::L4,
@@ -2653,17 +2384,15 @@ mod tests {
         );
     }
 
-    /// An SPS at a given picture size and level, with the VUI bitstream restriction
-    /// either absent (so [`dpb_limit`] must fall back to A.3.1's level ceiling) or
-    /// present with an explicit `max_dec_frame_buffering`.
+    /// SPS at `width`×`height` and `level`. `declared` None uses A.3.1; Some sets
+    /// VUI `max_dec_frame_buffering`.
     fn sps_at(width: u32, height: u32, level: Level, declared: Option<u32>) -> Sps {
         Sps {
             profile_idc: Profile::Main as u8,
             level_idc: level,
             frame_mbs_only_flag: true,
             direct_8x8_inference_flag: true,
-            // Every H.264 encoder measured below sits at or under this; it is the
-            // A.3.1 floor `max_dpb_frames` applies, never the value under test.
+            // A.3.1 floor `max_dpb_frames` applies; not the value under test.
             max_num_ref_frames: 3,
             pic_width_in_mbs_minus1: (width / 16 - 1) as u16,
             pic_height_in_map_units_minus1: (height / 16 - 1) as u16,
@@ -2677,25 +2406,16 @@ mod tests {
         }
     }
 
-    /// The H.264 half of `pf-encode`'s `rfi_dpb_fits_a_mainstream_vulkan_decoder`.
-    ///
-    /// That test guards the PRODUCER end for HEVC — that `RFI_DPB` never grows past
-    /// what a client can allocate. This is the CONSUMER end for H.264, where the
-    /// number is not ours to choose: the client derives it from whatever SPS arrives,
-    /// and #96 proved that deriving a DPB from a level's ceiling instead of a stream's
-    /// need costs the codec outright.
-    ///
-    /// Pinned here are the (picture, level) pairs a punktfunk host can actually reach,
-    /// with the level each shipping encoder was MEASURED to pick on 2026-08-07 (see
-    /// [`dpb_limit`] for the full table and the hardware). The property that has to
-    /// hold is the one the backends enforce: `dpb_limit + 1 <= 16` slots.
+    /// Consumer-side pin: `dpb_limit + 1 <= 16` for the (picture, level, VUI)
+    /// triples hosts actually emit. Producer-side HEVC equivalent:
+    /// `pf-encode`'s `rfi_dpb_fits_a_mainstream_vulkan_decoder`.
     #[test]
     fn every_reachable_h264_stream_fits_a_mainstream_slot_pool() {
-        // (picture, level measured on NVENC / VAAPI / openh264, their VUI declaration)
+        // (picture, level, VUI max_dec_frame_buffering)
         let measured = [
-            ((1280, 720), Level::L3_2, 3),  // NVENC, openh264
-            ((1280, 720), Level::L4_1, 1),  // VAAPI via libavcodec
-            ((1920, 1080), Level::L4_2, 3), // all three
+            ((1280, 720), Level::L3_2, 3),
+            ((1280, 720), Level::L4_1, 1),
+            ((1920, 1080), Level::L4_2, 3),
             ((2560, 1440), Level::L5_1, 3),
             ((3840, 2160), Level::L5_2, 3),
         ];
@@ -2716,13 +2436,8 @@ mod tests {
         }
     }
 
-    /// The cliff the measured encoders walk past, pinned so it stays visible.
-    ///
-    /// These are the SAME resolutions, at levels a host could legally pick, with no
-    /// VUI restriction to state the real need. Each computes a 16-frame DPB — 17
-    /// hardware slots — which is precisely the arithmetic that killed HEVC at 720p and
-    /// 1080p before #96. H.264 escapes it because every encoder both picks a
-    /// proportionate level AND writes the restriction, not because the format is safe.
+    /// Same resolutions at levels that saturate A.3.1 at 16 frames, with no VUI
+    /// restriction. The planner must warn rather than open a 17-slot session.
     #[test]
     fn the_level_ceiling_alone_would_reproduce_96_and_is_warned_about() {
         // (picture, a level that saturates A.3.1's ceiling for it)
@@ -2746,9 +2461,7 @@ mod tests {
                 "{w}x{h} L{level:?} is the #96 arithmetic and must be recognised as such"
             );
 
-            // ...and the planner must NAME it rather than let a user silently lose the
-            // codec. The SPS activates on the first slice, so the warning rides out on
-            // the IDR's plan.
+            // SPS activates on the first slice; the warning rides on the IDR plan.
             let sps = Rc::new(sps);
             let pps = PpsBuilder::new(Rc::clone(&sps))
                 .pic_parameter_set_id(0)
@@ -2771,9 +2484,6 @@ mod tests {
         }
     }
 
-    /// A proportionate level is the other half of the escape: at the levels the
-    /// encoders actually pick, the ceiling is small enough that even a stream with no
-    /// VUI at all fits — so neither escape is doing all the work alone.
     #[test]
     fn a_proportionate_level_fits_even_without_a_vui_restriction() {
         let proportionate = [
@@ -2791,17 +2501,15 @@ mod tests {
         }
     }
 
-    /// MMCO 5 writer: op 5 takes NO argument (Table 7-9), so the generic
-    /// [`write_p_slice`] — whose supported ops all take exactly one — cannot author
-    /// it.
+    /// MMCO 5 takes no argument (Table 7-9); [`write_p_slice`] ops all take one.
     fn write_p_slice_mmco5(frame_num: u32, poc_lsb: u32) -> Vec<u8> {
         let mut buf = Vec::new();
         {
             let mut w = NaluWriter::new(&mut buf, true);
             w.write_header(1, NaluType::Slice as u8).unwrap();
-            w.write_ue(0u32).unwrap(); // first_mb_in_slice
+            w.write_ue(0u32).unwrap();
             w.write_ue(0u32).unwrap(); // slice_type: P
-            w.write_ue(0u32).unwrap(); // pic_parameter_set_id
+            w.write_ue(0u32).unwrap();
             w.write_f(4, frame_num).unwrap(); // frame_num, u(4)
             w.write_f(4, poc_lsb).unwrap(); // pic_order_cnt_lsb, u(4)
             w.write_f(1, 1u32).unwrap(); // num_ref_idx_active_override_flag
@@ -2831,19 +2539,16 @@ mod tests {
         let p1 = planner.plan_au(&au1).unwrap();
 
         assert!(p1.warnings.contains(&PlanWarning::Mmco5Rebase));
-        // The plan carries the pre-rebase 8.2.1 values a decoder submits with; the
-        // zeroed frame_num/POC exist only in the STORED picture later AUs reference.
+        // Plan holds pre-rebase 8.2.1 values; stored frame_num/POC are zeroed for later AUs.
         assert_eq!(p1.picture.frame_num, 1);
         assert_eq!(p1.picture.pic_order_cnt, 2);
-        // And the op's C.4.5.3 clause-3 drain ran: the IDR is display-ready.
+        // C.4.5.3 clause 3 drain: the IDR is display-ready.
         assert!(p1.dpb.outputs.contains(&p0.dpb.stored.unwrap()));
     }
 
     #[test]
     fn a_separate_colour_plane_sps_is_rejected_as_outside_the_envelope() {
-        // SpsBuilder has no separate_colour_plane setter; construct the Sps directly
-        // (its fields are public) — the synthesizer writes the flag for High profile
-        // with chroma_format_idc 3.
+        // SpsBuilder has no setter; synthesizer writes the flag for High + chroma_format_idc 3.
         let sps = Sps {
             profile_idc: Profile::High as u8,
             chroma_format_idc: 3,
@@ -2863,9 +2568,8 @@ mod tests {
 
     #[test]
     fn display_crop_reports_the_conformance_window_offset_and_size() {
-        // chroma_format_idc 1 (inferred for Main) puts CropUnitX/Y at 2 with
-        // frame_mbs_only: offsets top 2 / bottom 2 / left 4 / right 2 are 4/4/8/4 in
-        // luma samples.
+        // chroma_format_idc 1 (Main) CropUnitX/Y = 2 with frame_mbs_only:
+        // offsets top 2 / bottom 2 / left 4 / right 2 → 4/4/8/4 luma samples.
         let sps = base_sps()
             .resolution(64, 64)
             .frame_crop_offsets(2, 2, 4, 2)
@@ -2887,9 +2591,8 @@ mod tests {
             }
         );
 
-        // The review's underflow shape: crop_left 100 (200 luma samples) on a
-        // 320-wide picture passes SPS validation; a max-minus-min derivation
-        // underflows on it.
+        // crop_left 100 = 200 luma samples on a 320-wide picture. A max-minus-min
+        // derivation underflows; the plan must report offset 200, size 120.
         let sps = base_sps()
             .resolution(320, 240)
             .frame_crop_offsets(0, 0, 100, 0)
@@ -2912,10 +2615,8 @@ mod tests {
         );
     }
 
-    /// A 64x64 SPS with the VUI colour fields set as given. SpsBuilder has no
-    /// colour setters, so the built Sps is unwrapped and mutated directly (the
-    /// separate_colour_plane test's idiom); the synthesizer writes the whole
-    /// `video_signal_type` block from the struct.
+    /// 64×64 SPS with VUI colour fields. SpsBuilder has no colour setters;
+    /// unwrap and mutate. The synthesizer writes `video_signal_type` from the struct.
     fn sps_with_vui_colour(
         signal_type: bool,
         full_range: bool,
@@ -2968,7 +2669,7 @@ mod tests {
 
     #[test]
     fn an_explicit_colour_description_rides_the_plan_and_follows_a_new_sps() {
-        // BT.2020/PQ HDR signalling — the in-band switch the Windows host emits.
+        // BT.2020 / PQ (primaries 9, transfer 16, matrix 9).
         let hdr = sps_with_vui_colour(true, false, Some((9, 16, 9)));
         let plan = plan_one_idr(&hdr);
         assert_eq!(
@@ -2981,11 +2682,9 @@ mod tests {
             }
         );
 
-        // The colour must track the SPS active for EACH picture, not the
-        // session's first: an SDR stream renegotiated to HDR mid-stream (same
-        // SPS id, new content, SPS+PPS in-band at the IDR — the parser's Pps
-        // snapshots its SPS at PPS-parse time, and hosts re-send both exactly
-        // so the new content activates) flips at the very next planned picture.
+        // Colour follows the SPS of each picture, not the session's first.
+        // Pps snapshots its SPS at PPS-parse time; hosts re-send SPS+PPS so
+        // the new content activates on the next IDR.
         let (sdr_sps, sdr_pps) = authored_sps_pps();
         let mut au0 = param_set_au(&sdr_sps, &sdr_pps);
         au0.extend(write_idr_slice());
@@ -3008,8 +2707,8 @@ mod tests {
 
     #[test]
     fn a_vui_without_colour_description_keeps_unspecified_but_honours_the_range_flag() {
-        // video_signal_type present, full-range set, but NO colour description:
-        // the code points stay E.2.1's "unspecified" while the range flag rides.
+        // video_signal_type present, full-range, no colour description:
+        // code points stay E.2.1 unspecified; the range flag rides.
         let plan = plan_one_idr(&sps_with_vui_colour(true, true, None));
         assert_eq!(
             plan.picture.colour,
@@ -3027,7 +2726,7 @@ mod tests {
         let (sps, pps) = authored_sps_pps();
         let mut au = param_set_au(&sps, &pps);
         au.extend(write_idr_slice());
-        // Reserved NAL type 24: the vendored header parser rejects it.
+        // NAL type 24 (reserved): the vendored header parser rejects it.
         au.extend([0x00, 0x00, 0x00, 0x01, 0x18, 0xAA, 0xBB]);
         au.extend(write_idr_slice()); // real data behind the cut, never reached
 
@@ -3048,8 +2747,7 @@ mod tests {
         let (sps, pps) = authored_sps_pps();
         let mut au = param_set_au(&sps, &pps);
         au.extend(write_idr_slice());
-        // A mis-split AU: continuation slices belonging to ANOTHER picture (non-IDR,
-        // frame_num 1). They and everything after them must be ignored.
+        // Continuation slices of another picture (non-IDR, frame_num 1); drop them.
         au.extend(write_p_slice_at(8, 0, 1, 2, 1, 1, None));
         au.extend(write_p_slice_at(9, 0, 1, 2, 1, 1, None));
 
@@ -3071,8 +2769,8 @@ mod tests {
         let mut planner = H264Planner::new();
         let id0 = planner.plan_au(&au0).unwrap().dpb.stored.unwrap();
 
-        // This AU errors AFTER its IDR begin drained the DPB (queueing id0 for
-        // output): the continuation slice references PPS 1, which was never sent.
+        // Errors after IDR begin already drained the DPB (id0 queued):
+        // continuation slice names PPS 1, which was never sent.
         let mut bad_au = write_idr_slice();
         bad_au.extend(write_p_slice_at(8, 1, 0, 0, 1, 1, None));
         assert!(matches!(
@@ -3080,7 +2778,6 @@ mod tests {
             Err(PlanError::NoActiveParamSet { pps_id: 1 })
         ));
 
-        // The queued output and the eviction must surface here, not vanish.
         let plan = planner.plan_au(&write_idr_slice()).unwrap();
         assert!(plan.dpb.outputs.contains(&id0));
         assert!(plan.dpb.removed.contains(&id0));
@@ -3105,19 +2802,17 @@ mod tests {
         assert!(flushed.outputs.contains(&id0) && flushed.outputs.contains(&id1));
         assert_eq!(flushed.removed, vec![id0, id1]);
 
-        // A non-IDR AU is refused until the next IDR.
         assert!(matches!(
             planner.plan_au(&write_p_slice(2, 4, 1, 1, None)),
             Err(PlanError::AwaitingIdr)
         ));
 
-        // The IDR restarts planning; parameter sets survived the flush (7.4.1.2).
+        // IDR restarts planning; parameter sets survived the flush (7.4.1.2).
         let plan = planner.plan_au(&write_idr_slice()).unwrap();
         assert!(plan.picture.is_idr);
         assert_eq!(plan.picture.pic_order_cnt, 0);
         assert!(picture_warnings(&plan).is_empty());
 
-        // And the stream continues cleanly on the reset state.
         let plan = planner.plan_au(&write_p_slice(1, 2, 1, 1, None)).unwrap();
         assert!(picture_warnings(&plan).is_empty());
         assert_eq!(plan.slices[0].ref_list0.len(), 1);
@@ -3125,8 +2820,7 @@ mod tests {
 
     #[test]
     fn picture_plan_parameters_come_from_the_first_slices_pps() {
-        // Two SPSes with identical negotiation parameters but different conformance
-        // windows; PPS 1 references the cropped one.
+        // Two SPS with the same negotiation size but different crops; PPS 1 uses the cropped one.
         let sps0 = base_sps().resolution(64, 64).build();
         let sps1 = base_sps()
             .seq_parameter_set_id(1)
@@ -3148,14 +2842,13 @@ mod tests {
         Synthesizer::<'_, Pps, _>::synthesize(3, &pps0, &mut au, true).unwrap();
         Synthesizer::<'_, Pps, _>::synthesize(3, &pps1, &mut au, true).unwrap();
         au.extend(write_idr_slice_at(0, 0));
-        // Legal but perverse: a continuation slice may reference another PPS.
+        // Continuation slice may legally name another PPS.
         au.extend(write_idr_slice_at(8, 1));
 
         let plan = H264Planner::new().plan_au(&au).unwrap();
         assert!(picture_warnings(&plan).is_empty());
         assert_eq!(plan.slices.len(), 2);
-        // The picture parameters come from the FIRST slice's PPS (the uncropped
-        // SPS 0); they must not drift to the last slice's.
+        // Picture parameters come from the first slice's PPS (uncropped SPS 0).
         assert_eq!(
             plan.picture.display_crop,
             DisplayCrop {
@@ -3165,9 +2858,7 @@ mod tests {
                 height: 64
             }
         );
-        // The accessor pair follows the same first-slice rule: backends build
-        // their parameter objects from these, so drifting to PPS 1 here would
-        // desynchronize them from `picture`.
+        // Accessors follow the first slice; drifting to PPS 1 would desync from `picture`.
         assert_eq!(plan.pps.pic_parameter_set_id, 0);
         assert_eq!(plan.sps.seq_parameter_set_id, 0);
         assert!(
@@ -3187,11 +2878,8 @@ mod tests {
         au0.extend(write_idr_slice());
 
         let plan = H264Planner::new().plan_au(&au0).unwrap();
-        // The parser re-parses the in-band parameter sets, so pointer identity
-        // with the authored `sps`/`pps` is not expected (and whole-struct
-        // equality would compare parser-side normalizations like the flat
-        // scaling-list fill); the contract is that the ACTIVATED content rides
-        // out. Spot-check the fields backends build parameter objects from.
+        // Parser re-parses in-band sets, so pointer identity with the authored
+        // structs is not expected. Spot-check the fields backends consume.
         assert_eq!(plan.sps.seq_parameter_set_id, sps.seq_parameter_set_id);
         assert_eq!(plan.sps.profile_idc, sps.profile_idc);
         assert_eq!(plan.sps.level_idc, sps.level_idc);

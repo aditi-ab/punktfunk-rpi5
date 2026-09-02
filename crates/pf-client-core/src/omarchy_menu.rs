@@ -1,25 +1,19 @@
-//! Punktfunk in the Omarchy menu (Super+Space): the CLIENT's rows.
+//! Punktfunk rows in the Omarchy menu (Super+Space).
 //!
-//! One managed block in `~/.config/omarchy/extensions/omarchy-menu.jsonc` — a root
-//! `punktfunk` submenu, "Open Punktfunk", the couch console, and one connect row per saved
-//! host (plus a wake row where a MAC is known), so typing a host's name in the menu's search
-//! and pressing enter starts the stream. Reusing the same `"punktfunk"` root id the HOST's
-//! `punktfunk-omarchy setup` writes is deliberate and documented by the extension format
-//! itself ("reuse an existing id to override/extend it"): on a box running both, the two
-//! blocks merge into one submenu.
+//! One managed block in `~/.config/omarchy/extensions/omarchy-menu.jsonc`: a
+//! `punktfunk` submenu, Open, couch console, and a connect (and wake) row per
+//! saved host. Reusing the host tool's `"punktfunk"` root id is the format's
+//! own override rule — both packages merge into one submenu.
 //!
-//! The menu cannot generate rows itself — its `provider` field resolves only against a map
-//! baked into the shell (verified in `Menu.qml`, Omarchy 4.0.1) — so the rows are STATIC and
-//! this module keeps them true instead: [`sync_if_enabled`] rewrites the block from the
-//! known-hosts store, and `trust::KnownHosts::save` calls it, so pairing a host in ANY of
-//! our binaries updates the menu, and `omarchy-menu refresh` repaints an open shell.
+//! The menu cannot generate rows (`provider` is a map baked into the shell),
+//! so rows are static. [`sync_if_enabled`] rewrites the block from the
+//! known-hosts store; `trust::KnownHosts::save` calls it.
 //!
-//! Opt-in, like every Omarchy edit we make: nothing is written until the operator flips the
-//! preferences switch or runs `punktfunk-client --omarchy-menu on`, and `off` removes exactly
-//! our block. The editing rules mirror `packaging/linux/omarchy/punktfunk-omarchy`'s
-//! `setup_menu`, traps included: the file is a SINGLE document where one parse error drops
-//! every row the user owns, so edits are validated on a copy and an unparsable file is left
-//! completely alone — it is not ours to repair.
+//! Opt-in: nothing is written until the preferences switch or
+//! `punktfunk-client --omarchy-menu on`. `off` removes only our block.
+//! The file is one document — a parse error drops every row the user owns —
+//! so edits validate on a copy and an unparsable file is left alone. Same
+//! traps as `packaging/linux/omarchy/punktfunk-omarchy`'s `setup_menu`.
 
 use crate::trust::KnownHosts;
 use std::path::{Path, PathBuf};
@@ -28,7 +22,6 @@ const BEGIN: &str =
     "// >>> punktfunk-client (managed by punktfunk-client --omarchy-menu — do not edit between these markers)";
 const END: &str = "// <<< punktfunk-client";
 
-/// Where the Omarchy menu reads extensions. `None` when no home is resolvable at all.
 fn menu_path() -> Option<PathBuf> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -37,20 +30,19 @@ fn menu_path() -> Option<PathBuf> {
     Some(config.join("omarchy/extensions/omarchy-menu.jsonc"))
 }
 
-/// Is our block installed? This is the consent bit everything else keys off.
+/// Consent bit `sync_if_enabled` keys off: our block is already in the file.
 pub fn enabled() -> bool {
     menu_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .is_some_and(|t| t.contains(BEGIN))
 }
 
-/// Install (or refresh) the block from the current known-hosts store.
 pub fn enable() -> Result<(), String> {
     let p = menu_path().ok_or("no home directory")?;
     write_rows(&p, Some(&rows_for(&KnownHosts::load())))
 }
 
-/// Remove exactly our block; everything else in the file is untouched.
+/// Remove our block only; the rest of the file is untouched.
 pub fn disable() -> Result<(), String> {
     let Some(p) = menu_path() else { return Ok(()) };
     if !p.exists() {
@@ -59,8 +51,7 @@ pub fn disable() -> Result<(), String> {
     write_rows(&p, None)
 }
 
-/// Bring the block in line with the store, when the operator opted in — the quiet form
-/// `trust::KnownHosts::save` calls, so a pairing made anywhere lands in the menu.
+/// Quiet form `trust::KnownHosts::save` calls, if the operator opted in.
 pub fn sync_if_enabled() {
     if !enabled() {
         return;
@@ -70,9 +61,8 @@ pub fn sync_if_enabled() {
     }
 }
 
-/// Rewrite the file with our block replaced by `rows` (removed, for `None`). Validated on a
-/// copy first, both before and after: a file that does not parse is not touched, and an edit
-/// that would not parse is not written.
+/// Replace our block with `rows` (`None` removes it). Validate the copy before
+/// and after: an unparsable file, or a bad edit, is not written.
 fn write_rows(path: &Path, rows: Option<&str>) -> Result<(), String> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -102,13 +92,11 @@ fn write_rows(path: &Path, rows: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-/// Repaint an open shell, best-effort. Headless (ssh) has no shell to answer, and a failed
-/// spawn is not an error: the file is the source of truth and the next shell start reads it.
+/// Best-effort repaint. A failed spawn is not an error: the file is truth.
 fn refresh() {
     let mut cmd = std::process::Command::new("omarchy-menu");
-    // The shell-IPC wrapper wants OMARCHY_PATH and a login session exports it; a plain shell
-    // (ssh, a bare TTY) does not, and the wrapper dies on the missing var rather than on the
-    // missing shell. Seed the packaged default so refresh works from anywhere the shell runs.
+    // Login sessions export OMARCHY_PATH; ssh and a bare TTY do not, and the
+    // wrapper dies on the missing var. Seed the packaged default.
     if std::env::var_os("OMARCHY_PATH").is_none() {
         cmd.env("OMARCHY_PATH", "/usr/share/omarchy");
     }
@@ -119,7 +107,6 @@ fn refresh() {
         .spawn();
 }
 
-/// Drop a previous block of ours — begin marker through end marker, inclusive.
 fn strip_block(text: &str) -> String {
     let mut out = Vec::new();
     let mut skip = false;
@@ -142,7 +129,7 @@ fn strip_block(text: &str) -> String {
     s
 }
 
-/// Insert the block before the document's LAST closing brace — same rule as the host tool.
+/// Insert before the document's last `}`. Same rule as the host tool.
 fn insert_block(text: &str, rows: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     let close = lines.iter().rposition(|l| l.trim() == "}")?;
@@ -157,27 +144,20 @@ fn insert_block(text: &str, rows: &str) -> Option<String> {
     Some(s)
 }
 
-/// Does the file parse as the JSONC the menu reads? Refusal is the safe direction: a file
-/// that fails here is left completely alone.
 fn jsonc_valid(text: &str) -> bool {
     jsonc_parse(text).is_some()
 }
 
-/// The parse behind [`jsonc_valid`]: strip `//` comments, forgive trailing commas, then
-/// `serde_json`. Both transforms are STRING-AWARE — a `//` inside a string is data, not a
-/// comment. That is not pedantry: the HOST's deployed menu block carries
-/// `… || echo https://localhost:47992` inside an action, and the first naive version of this
-/// validator refused that real file outright (as does `punktfunk-omarchy`'s original sed
-/// pipeline, fixed alongside this). Byte-level scan: every delimiter is ASCII, so multi-byte
-/// glyphs pass through untouched.
+/// Strip `//` comments and trailing commas, then `serde_json`. String-aware:
+/// `//` inside a string is data (actions carry URLs). Byte scan: delimiters
+/// are ASCII, so multi-byte glyphs pass through.
 fn jsonc_parse(text: &str) -> Option<serde_json::Value> {
     let b = text.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
     let mut in_str = false;
-    // A comma seen outside a string is HELD until the next significant byte: dropped if that
-    // byte closes a scope (the trailing comma being forgiven), emitted otherwise. Comments
-    // and whitespace between the comma and the brace fall out of this for free.
+    // Hold a comma until the next significant byte: drop it if that byte closes
+    // a scope, else emit. Comments and whitespace between fall out for free.
     let mut held_comma = false;
     while i < b.len() {
         let c = b[i];
@@ -231,7 +211,6 @@ fn jsonc_parse(text: &str) -> Option<serde_json::Value> {
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
 }
 
-/// A menu id fragment from a host's name: lowercase alphanumerics and dashes, collapsed.
 fn slug(name: &str) -> String {
     let mut out = String::new();
     for c in name.chars() {
@@ -249,16 +228,12 @@ fn slug(name: &str) -> String {
     }
 }
 
-/// The block's rows. Every value that came from the store passes through JSON escaping —
-/// a host is free to be named `"};evil`.
+/// Store values go through JSON escaping — a host may be named `"};evil`.
 fn rows_for(known: &KnownHosts) -> String {
-    // JSON string literal, quotes included.
     let j = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
     let mut out = String::new();
-    // The `punktfunk` root is the CLIENT's alone: the host tool writes its rows under its own
-    // `punktfunk-host` root ("Punktfunk Host"), the same split the desktop entries use. One
-    // merged submenu predates the client being installed by default, and mixed "connect to a
-    // host" with "administer this host" in a single grab bag.
+    // Client root. Host rows live under `punktfunk-host` — do not merge connect
+    // and administer into one submenu.
     out.push_str(
         "  \"punktfunk\": {\"icon\":\"\u{f0379}\",\"label\":\"Punktfunk\",\"aliases\":[\"stream\",\"connect\"]},\n",
     );
@@ -269,7 +244,6 @@ fn rows_for(known: &KnownHosts) -> String {
         "  \"punktfunk.couch\": {\"icon\":\"\u{f0eb5}\",\"label\":\"Game console\",\"description\":\"The couch UI — library, hosts, pairing\",\"action\":\"uwsm-app -- punktfunk-client --browse\"},\n",
     );
     let mut hosts: Vec<_> = known.hosts.iter().collect();
-    // Most recent first, so the menu's order is the reach-for-it order.
     hosts.sort_by_key(|h| std::cmp::Reverse(h.last_used.unwrap_or(0)));
     let mut taken = std::collections::HashSet::new();
     for h in hosts {
@@ -285,8 +259,7 @@ fn rows_for(known: &KnownHosts) -> String {
             j(&format!("Connect and stream — {target}")),
             j(&format!("uwsm-app -- punktfunk-client --connect '{target}'")),
         ));
-        // Wake without connecting: the "start the rig, then walk over" move. Only where a
-        // MAC was ever learned — a row that cannot work is worse than no row.
+        // Wake row only when a MAC is known: a row that cannot work is worse than none.
         if !h.mac.is_empty() {
             out.push_str(&format!(
                 "  \"punktfunk.wake-{id}\": {{\"icon\":\"\u{f0425}\",\"label\":{},\"description\":\"Send Wake-on-LAN\",\"action\":{}}},\n",
@@ -348,14 +321,11 @@ mod tests {
             !again.contains("punktfunk.connect-desk"),
             "the stale host is gone"
         );
-        // And removal restores their document exactly.
         assert_eq!(strip_block(&again), theirs);
     }
 
     #[test]
     fn a_hostile_host_name_cannot_escape_the_row() {
-        // Quotes and braces arrive escaped: the document parses, and the name comes back
-        // out as DATA, byte-identical, under the id its slug predicts.
         let spiky = "a\"b}c";
         let doc = insert_block(
             "{\n}\n",
@@ -365,8 +335,7 @@ mod tests {
         let v = jsonc_parse(&doc).expect("parses");
         assert_eq!(v["punktfunk.connect-a-b-c"]["label"].as_str(), Some(spiky));
 
-        // `//` and a comma inside a string are DATA — the string-aware strip must not eat
-        // them (the naive version did, and refused the box's real menu file over a URL).
+        // `//` and a comma inside a string are data; the strip must not eat them.
         let commenty = "x // y, }";
         let doc = insert_block(
             "{\n}\n",
@@ -379,8 +348,7 @@ mod tests {
 
     #[test]
     fn the_boxes_real_file_shapes_parse() {
-        // The exact row that broke the first validator on glass (2026-08-31): a URL inside
-        // an action string. Plus a trailing comma separated from its brace by a comment.
+        // URL inside an action, and a trailing comma separated from its brace by a comment.
         let real = concat!(
             "{\n",
             "  // header comment with an example: \"a\": {\"b\":1},\n",

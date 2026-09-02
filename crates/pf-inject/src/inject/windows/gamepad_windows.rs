@@ -1,16 +1,14 @@
-//! Windows virtual Xbox 360 gamepad via the punktfunk **XUSB companion** UMDF driver
-//! (`packaging/windows/drivers/pf-xusb`) — the in-tree replacement for ViGEmBus. One virtual Xbox 360
-//! controller per client pad index, visible to classic **XInput** (`XInputGetState`) with no kernel
-//! bus driver: each pad `SwDeviceCreate`s a `pf_xusb_<index>` devnode (the driver loads on it and
-//! registers `GUID_DEVINTERFACE_XUSB`) and the host pushes the XInput state into an **unnamed** shared
-//! DATA section the driver reaches over the **sealed channel** ([`PadChannel`] — handle duplicated
-//! into its WUDFHost, bootstrapped via `Global\pfxusb-boot-<index>`; see
-//! `design/gamepad-channel-sealing.md`). GameStream/Moonlight already speak the XInput conventions
-//! (low-16 button bits, sticks −32768..32767 +Y up, triggers 0..255), so the state copy is ~1:1.
+//! Windows virtual Xbox 360 pad via the XUSB companion UMDF driver
+//! (`packaging/windows/drivers/pf-xusb`). One pad per client index, visible to classic
+//! `XInputGetState` with no kernel bus: `SwDeviceCreate` a `pf_xusb_<index>` devnode
+//! (the driver registers `GUID_DEVINTERFACE_XUSB`) and push XInput state into an unnamed
+//! DATA section over the sealed channel ([`PadChannel`] — handle duplicated into WUDFHost,
+//! bootstrapped via `Global\pfxusb-boot-<index>`; `design/gamepad-channel-sealing.md`).
+//! GameStream/Moonlight already speak XInput (low-16 buttons, sticks −32768..32767 +Y up,
+//! triggers 0..255), so the copy is ~1:1.
 //!
-//! Rumble flows back the other way: a game writes force-feedback via `XInputSetState`, the driver
-//! parses the `SET_STATE` packet into the shared section, and [`GamepadManager::pump_rumble`] relays
-//! level changes to the client (the universal 0xCA plane), mirroring the Linux `EV_FF` read path.
+//! Rumble is the reverse path: `XInputSetState` → driver `SET_STATE` into the section →
+//! [`GamepadManager::pump_rumble`] onto the 0xCA plane, matching Linux `EV_FF`.
 
 use super::gamepad_raii::{sw_create_cb, PadChannel, SwCreateCtx};
 use crate::pad_slots::PadSlots;
@@ -26,9 +24,7 @@ use windows::Win32::Devices::Enumeration::Pnp::{
 use windows::Win32::Foundation::{CloseHandle, E_FAIL, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
-// Shared-section layout — the single source of truth is `pf_driver_proto::gamepad::XusbShm` (offset
-// asserts pin every field; the `pf_xusb` driver maps the same struct). Derive the size/offsets/magic from
-// it so a layout change is a compile error, not a hand-synced literal (audit §6.1).
+// Driver maps this same struct; `offset_of!` so a layout change is a compile error.
 use pf_driver_proto::gamepad::XusbShm;
 const SHM_SIZE: usize = core::mem::size_of::<XusbShm>();
 const SHM_MAGIC: u32 = pf_driver_proto::gamepad::XUSB_MAGIC; // "PFXU"
@@ -45,11 +41,10 @@ const OFF_RUMBLE: usize = core::mem::offset_of!(XusbShm, rumble_large); // large
 const OFF_DRIVER_PROTO: usize = core::mem::offset_of!(XusbShm, driver_proto);
 const OFF_PAD_INDEX: usize = core::mem::offset_of!(XusbShm, pad_index);
 
-/// Spawn the `pf_xusb_<index>` companion devnode (hardware id `pf_xusb`, enumerator `punktfunk`). The
-/// INF (System class) binds our UMDF driver, which registers the XUSB interface. Unlike the HID pads,
-/// no USB compatible-ids are needed — XInput finds the device by the interface GUID, not VID/PID — but
-/// we still pass a deterministic non-null `pContainerId` (the null-sentinel trips an `xinput1_4`
-/// slot-skip bug). `SwDeviceClose` removes it on drop.
+/// Spawn `pf_xusb_<index>` (hwid `pf_xusb`, enumerator `punktfunk`). XInput finds the
+/// device by `GUID_DEVINTERFACE_XUSB`, not VID/PID, so no USB compatible-ids — but
+/// `pContainerId` must be a deterministic non-null GUID: the null sentinel trips an
+/// `xinput1_4` slot-skip. `SwDeviceClose` on drop.
 fn create_swdevice(index: u8) -> Result<(HSWDEVICE, Option<String>)> {
     let hwids: Vec<u16> = "pf_xusb".encode_utf16().chain([0u16, 0u16]).collect();
     let instid: Vec<u16> = format!("pf_xusb_{index}")
@@ -60,8 +55,8 @@ fn create_swdevice(index: u8) -> Result<(HSWDEVICE, Option<String>)> {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    // The pad index, stamped into the device Location — the driver reads it to poll `pfxusb-boot-<index>`
-    // (multi-pad). The buffer must outlive the SwDeviceCreate call (it does; we wait on the event).
+    // Driver reads Location as the pad index so it can poll `pfxusb-boot-<index>`.
+    // Buffer must outlive `SwDeviceCreate` (it does: we wait on the event).
     let loc: Vec<u16> = format!("{index}")
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -80,12 +75,9 @@ fn create_swdevice(index: u8) -> Result<(HSWDEVICE, Option<String>)> {
 
     // SAFETY: a manual-reset, initially-unsignaled, unnamed event.
     let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
-    // `result` starts as E_FAIL, NOT S_OK: if the wait below times out, a zero-initialised HRESULT
-    // would read as success and mask the failure (found by the 2026-07 driver-health audit).
-    // HEAP-allocated for the same reason as the DualSense sibling: the callback writes through this
-    // pointer and SetEvents, and the wait below is bounded — a stack context would be popped while a
-    // late callback still holds it. On the timeout path the box is deliberately leaked and the event
-    // left open so a late write/SetEvent always targets live memory/handle.
+    // `result` starts as E_FAIL: a zeroed HRESULT is S_OK and would mask a wait timeout.
+    // Heap, not stack: a late callback after the 10 s wait must still write live memory.
+    // Timeout leaks the box and leaves the event open so that write/SetEvent is defined.
     let ctx = Box::into_raw(Box::new(SwCreateCtx {
         event,
         result: E_FAIL,
@@ -115,15 +107,15 @@ fn create_swdevice(index: u8) -> Result<(HSWDEVICE, Option<String>)> {
     // SAFETY: event valid; block until PnP finishes enumerating, then check the callback result.
     let wait = unsafe { WaitForSingleObject(event, 10_000) };
     if wait != WAIT_OBJECT_0 {
-        // Timed out — intentionally leak `ctx` and leave `event` open (see above).
+        // Timeout: leak `ctx` and leave `event` open (late callback).
         // SAFETY: hsw is the handle SwDeviceCreate returned.
         unsafe { SwDeviceClose(hsw) };
         return Err(anyhow!(
             "SwDeviceCreate(pf_xusb) enumeration callback never fired (10s) — PnP may be wedged"
         ));
     }
-    // The callback ran (it signalled the event), so nothing else will touch `ctx`/`event`.
-    // SAFETY: `ctx` came from `Box::into_raw` and is reclaimed exactly once here.
+    // SAFETY: the callback signalled, so nothing else will touch `ctx`/`event`;
+    // `ctx` came from `Box::into_raw` and is reclaimed exactly once here.
     let ctx = unsafe {
         let _ = CloseHandle(event);
         Box::from_raw(ctx)
@@ -139,39 +131,29 @@ fn create_swdevice(index: u8) -> Result<(HSWDEVICE, Option<String>)> {
     Ok((hsw, ctx.instance_id()))
 }
 
-/// A single virtual Xbox 360 pad: the `pf_xusb_<index>` devnode plus the sealed shared-memory channel.
+/// One virtual Xbox 360 pad: `pf_xusb_<index>` plus the sealed `XusbShm` channel.
 struct XusbWinPad {
-    /// Owns the `pf_xusb_<index>` devnode (dropped → `SwDeviceClose`). `None` if `SwDeviceCreate` failed.
     _sw: Option<super::gamepad_raii::SwDevice>,
-    /// The sealed channel: the unnamed DATA section (the `XusbShm`) + the bootstrap mailbox + the
-    /// handle-delivery state machine (drop closes both sections).
     channel: PadChannel,
-    /// Watches the section's `driver_proto` field and logs attach / never-attached diagnosis.
     attach: super::gamepad_raii::DriverAttach,
     packet: u32,
     last_rumble_seq: u32,
 }
 
 impl XusbWinPad {
-    /// Create the sealed channel (unnamed DATA section + `Global\pfxusb-boot-<index>` mailbox), stamp
-    /// the pad index then the magic LAST, spawn the devnode, and eagerly deliver the DATA handle once
-    /// the driver publishes its pid.
+    /// Unnamed DATA + `Global\pfxusb-boot-<index>` mailbox. Stamp pad index, then magic LAST
+    /// (the driver accepts the section only once magic is set).
     fn open(index: u8) -> Result<XusbWinPad> {
         let boot_name = pf_driver_proto::gamepad::xusb_boot_name(index);
         let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
         let base = channel.data_base();
-        // The section arrives zeroed; stamp the pad index (the driver validates it against its own
-        // devnode index on attach) then the magic LAST (the driver only accepts it once magic is set).
+        // Index first; magic LAST. The driver rejects the section until magic is set.
         // SAFETY: base points at SHM_SIZE writable bytes; OFF_PAD_INDEX is in range.
         unsafe {
             std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
             std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
         }
-        // Propagate a devnode-create failure instead of swallowing it: a swallowed failure left the
-        // pad with no devnode yet still reported success, so PadSlots latched a phantom pad (never
-        // re-created for the session's life) and the host logged a misleading "virtual Xbox 360
-        // created". Returning Err routes it through PadSlots' ERROR + capped-backoff retry — parity
-        // with the Linux uinput path, which self-heals for exactly this reason.
+        // `?` so PadSlots retries; a swallowed failure latched a phantom pad for the session.
         let (hsw, instance_id) = create_swdevice(index)?;
         channel.bind_devnode(
             index as u32,
@@ -179,9 +161,7 @@ impl XusbWinPad {
             super::gamepad_raii::ProofTransport::XusbIoctl,
         );
         let _sw = Some(super::gamepad_raii::SwDevice::new(hsw));
-        // Bounded eager delivery: the driver's EvtDeviceAdd publishes its pid right away; handing it
-        // the DATA handle before we return means the pad is live for the game's first XInput poll.
-        // On a missing/old driver this waits out the window once and the service pump takes over.
+        // 1500 ms: EvtDeviceAdd publishes the pid immediately; miss and `service` keeps pumping.
         channel.deliver_eager(Duration::from_millis(1500));
         Ok(XusbWinPad {
             _sw,
@@ -198,21 +178,15 @@ impl XusbWinPad {
         })
     }
 
-    /// Publish the XInput state to the section and bump the packet number (XInput uses it to detect
-    /// change). `buttons` is the XINPUT_GAMEPAD_* bitmap; sticks are i16, triggers u8.
+    /// Write XInput state; `packet` last so XInput sees a coherent snapshot.
     #[allow(clippy::too_many_arguments)]
     fn write_state(&mut self, buttons: u16, lt: u8, rt: u8, lx: i16, ly: i16, rx: i16, ry: i16) {
         self.packet = self.packet.wrapping_add(1);
         let base = self.channel.data_base();
-        // SAFETY: `base` is the start of the mapped section (`SHM_SIZE` bytes, owned by `Shm`); every
-        // `OFF_*` is a fixed in-range offset into it and `write_unaligned` handles the unaligned field
-        // writes. Single owner (`&mut self`), so no concurrent writer races these stores. `packet` (the
-        // field XInput reads to detect a new state) is published LAST: the `Release` fence orders the
-        // state-body stores above before the `Release` `AtomicU32` store of `packet`, so the driver —
-        // which `Acquire`-loads `packet` — never observes a bumped packet over a torn body on a
-        // weakly-ordered core (ARM64). On x86-TSO both are plain stores. `OFF_PACKET` (== 4) is
-        // 4-aligned off the page-aligned section base, so the `AtomicU32` view is valid (mirrors the
-        // seq-fenced publish in `gamepad_raii::PadChannel::create`).
+        // SAFETY: `base` is the mapped `SHM_SIZE` section; every `OFF_*` is in range.
+        // Single owner (`&mut self`). `packet` LAST: `Release` fence then `Release`
+        // store so an `Acquire` load never sees a torn body on ARM64 (x86-TSO: plain
+        // stores). `OFF_PACKET` (== 4) is 4-aligned off the page-aligned base.
         unsafe {
             std::ptr::write_unaligned(base.add(OFF_BUTTONS) as *mut u16, buttons);
             *base.add(OFF_LT) = lt;
@@ -226,10 +200,7 @@ impl XusbWinPad {
         }
     }
 
-    /// Poll the section for a game's rumble (the driver bumps `rumble_seq` on each SET_STATE). Returns
-    /// `(large, small)` motor levels (0..=255) when a new one arrived. Also ticks the sealed-channel
-    /// delivery (a late-binding driver gets its handle here) and feeds the driver-attach health
-    /// watcher (the driver stamps `driver_proto` once it maps the delivered section + per IOCTL).
+    /// New rumble `(large, small)` if `rumble_seq` moved. Also pumps handle delivery and attach.
     fn service(&mut self) -> Option<(u8, u8)> {
         self.channel.pump();
         let base = self.channel.data_base();
@@ -253,27 +224,15 @@ impl XusbWinPad {
     }
 }
 
-// The abandoned-rumble force-off window is shared with the UHID/UMDF pump —
-// `uhid_manager::rumble_idle_timeout()` (`PUNKTFUNK_RUMBLE_IDLE_MS` hatch, default 2.5 s). XInput
-// vibration is level-triggered — it persists until the game sets it to zero — so a game that
-// latches a rumble and then stops calling `XInputSetState` (a residual left at a menu / loading
-// screen, or a plain forgotten stop) would otherwise drone to the client forever (measured: a
-// stuck `(0,512)` resent every 500 ms for 5.5 minutes). A real controller stops when the app
-// stops driving it; the force-off mirrors that. Unlike the DualSense-family backends there are no
-// flag semantics to key on — every `SET_STATE` IS a rumble write — so this path's any-activity
-// keying is already rumble-keyed by construction. The shared window stays above SDL's ~2 s
-// internal rumble resend so an SDL-driven host game (which re-issues the same level every ~2 s)
-// refreshes the activity clock before it fires.
-/// All virtual Xbox 360 pads of a session — the Windows analogue of the Linux uinput-xpad manager,
-/// now backed by the XUSB companion driver. Same method surface (`new`/`handle`/`pump_rumble`) the
-/// session input thread already drives.
+// Shared with UHID (`uhid_manager::rumble_idle_timeout`, default 2.5 s). XInput
+// vibration is level-triggered and persists until the game writes zero, so a
+// latched rumble would drone forever. Window sits above SDL's ~2 s resend so
+// an SDL host refreshes the clock before force-off.
+/// Session Xbox 360 pads — Windows analogue of Linux uinput-xpad (`new`/`handle`/`pump_rumble`).
 pub struct GamepadManager {
     slots: PadSlots<XusbWinPad>,
     last_rumble: Vec<(u8, u8)>,
-    /// When the game last drove each pad (bumped `rumble_seq` via `SET_STATE`). A non-zero
-    /// `last_rumble` older than the shared idle window
-    /// ([`crate::uhid_manager::rumble_idle_timeout`]) against this is a stale residual — see the
-    /// comment above [`GamepadManager`].
+    /// Last `SET_STATE` per pad. Non-zero rumble older than `rumble_idle_timeout` is forced off.
     last_active: Vec<Instant>,
 }
 
@@ -296,9 +255,7 @@ impl GamepadManager {
         }
     }
 
-    /// How many virtual pads this manager has actually BUILT — the bring-up harness's
-    /// "did the create happen?" check; see [`crate::uhid_manager::UhidManager::live_pads`] for why
-    /// only a harness should ask.
+    /// Pads actually built. Harness-only; see [`crate::uhid_manager::UhidManager::live_pads`].
     pub fn live_pads(&self) -> usize {
         self.slots.live()
     }
@@ -325,9 +282,8 @@ impl GamepadManager {
                 if idx >= MAX_PADS {
                     return;
                 }
-                // Unplugs: arm the grace for any pad whose mask bit cleared (the drop itself lands
-                // on a later `pump_rumble` tick — this frame is the only one the producer sends).
-                // XUSB pads carry no rich plane, so a grace re-claim has nothing to clear.
+                // Mask bit cleared: arm grace here; the drop lands on a later `pump_rumble`.
+                // XUSB has no rich plane to clear on re-claim.
                 let swept = self.slots.sweep(f.active_mask).dropped;
                 self.reset_swept(swept);
                 if f.active_mask & (1 << idx) == 0 {
@@ -349,8 +305,7 @@ impl GamepadManager {
         }
     }
 
-    /// Reset the sibling state of every index a sweep or reap just dropped, so both halves of the
-    /// unplug clear the same things.
+    /// Clear rumble clocks for indices a sweep or reap just dropped.
     fn reset_swept(&mut self, swept: u16) {
         for i in 0..MAX_PADS {
             if swept & (1 << i) != 0 {
@@ -360,24 +315,16 @@ impl GamepadManager {
         }
     }
 
-    /// Relay any changed rumble level to the client. XUSB motors are 0..255; the wire carries
-    /// 0..65535, so scale by 257. `large` (low-frequency) → the datagram's `low`, `small`
-    /// (high-frequency) → `high` — matching the other backends.
-    ///
-    /// The two trigger levels `send` also takes are always zero here and always will be: the XUSB
-    /// `SET_STATE` packet this backend parses carries `rumble_large`/`rumble_small` and nothing
-    /// else, mirroring `XINPUT_VIBRATION`'s two members. Impulse-trigger rumble is only reachable
-    /// through the HID-visible Xbox identity (WGI / GameInput), never through the XUSB companion.
+    /// Relay changed rumble. Motors are 0..255, wire is 0..65535, so ×257.
+    /// `large` → `low`, `small` → `high`. Trigger args stay 0: `SET_STATE` is
+    /// `XINPUT_VIBRATION` (two motors); impulse rumble is HID/WGI only.
     pub fn pump_rumble(&mut self, mut send: impl FnMut(u16, u16, u16, u16, u16)) {
-        // Finish any unplug whose removal frame only armed the grace — the producer sends that
-        // frame once, so without this the XUSB devnode would outlive the controller.
+        // Reap unplugs whose removal frame only armed grace; else the devnode outlives the pad.
         let swept = self.slots.reap();
         self.reset_swept(swept);
         for (i, pad) in self.slots.iter_mut() {
             if let Some((large, small)) = pad.service() {
-                // The game drove the pad this poll (SET_STATE bumped the seq) — refresh the
-                // activity clock even when the level is unchanged, so a rumble it keeps asserting
-                // never trips the stale-residual timeout below.
+                // Seq moved: refresh even if the level is unchanged, so a held rumble stays live.
                 self.last_active[i] = Instant::now();
                 if self.last_rumble[i] != (large, small) {
                     self.last_rumble[i] = (large, small);
@@ -387,10 +334,7 @@ impl GamepadManager {
                 && crate::uhid_manager::rumble_idle_timeout()
                     .is_some_and(|t| self.last_active[i].elapsed() >= t)
             {
-                // A non-zero rumble is latched but the game has not driven the pad for the shared
-                // idle window — a residual it forgot to stop. Force it off (and forward the zero)
-                // so the resend loop stops droning it to the client. See the comment above
-                // `GamepadManager`.
+                // Latched rumble, no SET_STATE for the idle window — force off.
                 tracing::info!(
                     index = i,
                     prev_low = self.last_rumble[i].0 as u16 * 257,
